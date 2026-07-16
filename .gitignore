@@ -1,5 +1,6 @@
 /*
 !/.gitignore
+!/README.md
 !/Makefile
 !/linker-riscv64.ld
 !/arch/
