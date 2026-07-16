@@ -2,7 +2,7 @@
 
 #include "arch/riscv64/mmu/sv39_editor.hpp"
 
-namespace arch::backend {
+namespace arch {
 
 using PageEditor = riscv64::Editor;
 using PageEditError = riscv64::EditError;
@@ -16,4 +16,4 @@ using PagePerm = riscv64::PtePerm;
     return PagePerm::supervisor_rw();
 }
 
-} // namespace arch::backend
+} // namespace arch

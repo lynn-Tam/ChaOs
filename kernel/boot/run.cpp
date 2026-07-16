@@ -1,4 +1,4 @@
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
 #include <boot/cpu_topology.hpp>
@@ -38,8 +38,8 @@ namespace kernel::boot {
         libk::move(boot_info.memory_regions),
         kernel::mm::DirectMapLayout{
             .physical_base = kernel::mm::PhysAddr{0},
-            .virtual_base = kernel::mm::VirtAddr{arch::layout::direct_base},
-            .window_size = arch::layout::direct_size,
+            .virtual_base = kernel::mm::VirtAddr{kernel::mm::layout::DirectMapBegin},
+            .window_size = kernel::mm::layout::DirectMapSize,
         });
     KASSERT(initialized);
     kernel::KernelState& kernel = *kernel_storage;

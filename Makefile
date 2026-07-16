@@ -1,16 +1,11 @@
 ARCH ?= riscv64
-PLATFORM ?= riscv-virt
 PROFILE ?= kernel
 
 SUPPORTED_ARCHES := riscv64
-SUPPORTED_PLATFORMS_riscv64 := riscv-virt
 SUPPORTED_PROFILES := kernel test proof
 
 ifeq ($(filter $(ARCH),$(SUPPORTED_ARCHES)),)
 $(error Unsupported ARCH=$(ARCH); supported: $(SUPPORTED_ARCHES))
-endif
-ifeq ($(filter $(PLATFORM),$(SUPPORTED_PLATFORMS_$(ARCH))),)
-$(error Unsupported PLATFORM=$(PLATFORM) for ARCH=$(ARCH); supported: $(SUPPORTED_PLATFORMS_$(ARCH)))
 endif
 ifeq ($(filter $(PROFILE),$(SUPPORTED_PROFILES)),)
 $(error Unsupported PROFILE=$(PROFILE); supported: $(SUPPORTED_PROFILES))
@@ -85,12 +80,12 @@ RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
 BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)
-BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PLATFORM)-$(PROFILE)$(BUILD_VARIANT)
+BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
-BUILD_DIR := build/$(ARCH)/$(PLATFORM)/$(PROFILE)$(BUILD_VARIANT)
+BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
 TARGET    := $(BUILD_DIR)/kernel.elf
 MAPFILE   := $(BUILD_DIR)/kernel.map
-LINKER_SCRIPT := linker-riscv64.ld
+LINKER_SCRIPT := arch/$(ARCH)/linker.ld
 BOOT_STACK_FRAME_BUDGET := 1792
 
 COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 \
@@ -103,8 +98,7 @@ COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 \
                 -I . \
                 -I kernel \
                 -I kernel/include \
-                -I arch/$(ARCH)/include \
-                -I platform/$(PLATFORM)/include
+                -I arch/$(ARCH)/include
 
 CFLAGS   := $(COMMON_FLAGS) \
             -Werror=implicit-function-declaration
@@ -125,6 +119,8 @@ LDFLAGS  := $(RISCV_ARCH_FLAGS) \
 ARCH_SRCS := \
   arch/riscv64/boot/entry.S \
   arch/riscv64/boot/early_entry.S \
+  arch/riscv64/boot/high_entry.cpp \
+  arch/riscv64/boot/kernel_image.cpp \
   arch/riscv64/cpu/local_entry.cpp \
   arch/riscv64/cpu/ipi.cpp \
   arch/riscv64/cpu/start.cpp \
@@ -132,6 +128,8 @@ ARCH_SRCS := \
   arch/riscv64/context/kernel_context.cpp \
   arch/riscv64/context/kernel_context.S \
   arch/riscv64/sbi/call.cpp \
+  arch/riscv64/sbi/console.cpp \
+  arch/riscv64/sbi/system.cpp \
   arch/riscv64/time/clock.cpp \
   arch/riscv64/time/timer.cpp \
   arch/riscv64/mmu/sv39_builder.cpp \
@@ -144,12 +142,6 @@ ARCH_SRCS := \
   arch/riscv64/trap/event.cpp \
   arch/riscv64/trap/trap.cpp \
   arch/riscv64/trap/user.cpp
-
-PLATFORM_SRCS := \
-  platform/riscv-virt/boot.cpp \
-  platform/riscv-virt/console.cpp \
-  platform/riscv-virt/cpu.cpp \
-  platform/riscv-virt/system.cpp
 
 KERNEL_SRCS := \
   kernel/boot/boot.cpp \
@@ -223,7 +215,7 @@ TEST_SRCS := \
 
 PROOF_SRCS := user/initial.S
 
-SRCS := $(ARCH_SRCS) $(PLATFORM_SRCS) $(KERNEL_SRCS)
+SRCS := $(ARCH_SRCS) $(KERNEL_SRCS)
 ifeq ($(ENABLE_TESTS),1)
 SRCS += $(TEST_SRCS)
 endif

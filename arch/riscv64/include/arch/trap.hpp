@@ -1,5 +1,3 @@
-// Architecture-neutral trap contract implemented by the selected backend.
-
 #pragma once
 
 #include <core/types.hpp>
@@ -16,8 +14,8 @@ struct TrapSnapshot final {
     usize fault_address{};
 };
 
-// TrapContext 是一次 trap 期间对返回现场的非拥有视图。
-// kernel/trap 可以通过它读写返回状态，但不能构造 raw 架构现场。
+// Non-owning view of the return state for one active trap. Kernel trap policy
+// may inspect and update it but cannot construct a raw architecture frame.
 class TrapContext final {
 public:
     TrapContext(const TrapContext&) = delete;
@@ -26,8 +24,8 @@ public:
     [[nodiscard]] auto pc() const noexcept -> usize;
     void set_pc(usize pc) noexcept;
 
-    // Current kernel breakpoint support assumes 32-bit ebreak.
-// c.ebreak support requires instruction length decoding.
+    // Current kernel breakpoint support assumes 32-bit ebreak. Supporting
+    // c.ebreak requires instruction-length decoding.
     void complete_breakpoint() noexcept;
     void complete_syscall() noexcept;
 

@@ -1,17 +1,16 @@
-// Selected-architecture kernel execution context contract.
-
 #pragma once
 
-#include <arch/backend/context.hpp>
+#include "arch/riscv64/context/kernel_context.hpp"
+
+#include <core/types.hpp>
 
 namespace arch {
 
-using KernelContext = backend::KernelContext;
+using KernelContext = riscv64::KernelContext;
 using ContextEntry = void (*)(void*) noexcept;
 
 struct ContextStart final {
     usize stack_top{};
-    // The initial continuation owns its termination path and must not return.
     ContextEntry entry{};
     void* argument{};
 };

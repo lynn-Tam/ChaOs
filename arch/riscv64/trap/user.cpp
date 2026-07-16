@@ -3,7 +3,7 @@
 #include "arch/riscv64/cpu/csr.hpp"
 #include "arch/riscv64/trap/trapframe.hpp"
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <core/debug.hpp>
 #include <libk/memory.hpp>
 
@@ -22,10 +22,10 @@ namespace {
 } // namespace
 
 auto valid_user_start(UserStart start) noexcept -> bool {
-    return layout::is_user(start.entry)
+    return kernel::mm::layout::is_user(start.entry)
         && (start.entry.raw() & 0x1U) == 0
-        && start.stack.raw() >= layout::low_guard_end
-        && start.stack.raw() <= layout::user_end
+        && start.stack.raw() >= kernel::mm::layout::LowGuardEnd
+        && start.stack.raw() <= kernel::mm::layout::UserEnd
         && (start.stack.raw() & 0xfU) == 0;
 }
 
@@ -58,7 +58,7 @@ auto prepare_user_stack(
 
 [[noreturn]] void resume_user(usize home_stack_top) noexcept {
     riscv64::TrapFrame* const frame = frame_at(home_stack_top);
-    KASSERT(layout::is_user(kernel::mm::VirtAddr{frame->sepc}));
+    KASSERT(kernel::mm::layout::is_user(kernel::mm::VirtAddr{frame->sepc}));
     KASSERT(frame->sstatus == riscv64::Sstatus::SPIE);
     KASSERT((frame->sp & 0xfU) == 0);
     arch_riscv64_resume_user(frame);

@@ -1,5 +1,5 @@
 #include <core/kernel_state.hpp>
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <arch/interrupt.hpp>
 #include <cap/authority.hpp>
 #include <cap/rights.hpp>
@@ -10,7 +10,7 @@
 #include <mm/kernel_stack.hpp>
 #include <mm/memory_object.hpp>
 #include <mm/vspace.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 #include <sched/context.hpp>
 #include <sched/dispatcher.hpp>
 #include <thread/thread.hpp>
@@ -120,7 +120,7 @@ auto KernelState::start_first_user(kernel::CpuRuntime& runtime) noexcept
         return false;
     }
     const auto physical =
-        platform::memory::linked_physical(kernel::mm::VirtAddr{linked_start});
+        kernel::image::linked_physical(kernel::mm::VirtAddr{linked_start});
     const auto image_pages = physical
         ? kernel::mm::PageRange::from_aligned_bytes(
               *physical, linked_end - linked_start)
@@ -257,8 +257,8 @@ auto KernelState::start_first_user(kernel::CpuRuntime& runtime) noexcept
     const kernel::cap::VSpaceAuthority root_authority{
         .region = first_user_vspace_->root_key(),
         .range = kernel::mm::VirtRange{
-            kernel::mm::VirtAddr{arch::layout::low_guard_end},
-            arch::layout::user_end - arch::layout::low_guard_end},
+            kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd},
+            kernel::mm::layout::UserEnd - kernel::mm::layout::LowGuardEnd},
         .access = kernel::mm::AccessMask::of(
             kernel::mm::Access::Read, kernel::mm::Access::Write, kernel::mm::Access::Execute),
         .types = normal,

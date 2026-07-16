@@ -1,6 +1,5 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
 #include <arch/ipi.hpp>
 #include <boot/cpu_topology.hpp>
 #include <cpu/cpu_provisioner.hpp>
@@ -11,7 +10,7 @@
 #include <mm/pmm.hpp>
 #include <mm/kernel_stack.hpp>
 #include <mm/kernel_vspace.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 #include <object/object_store.hpp>
 #include <mm/vspace_work.hpp>
 #include <sched/context.hpp>
@@ -45,7 +44,7 @@ public:
         if (pages == 0 || pages > cpu_test_pages) {
             return false;
         }
-        const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
             reinterpret_cast<uintptr_t>(cpu_test_ram)});
         if (!physical) {
             return false;

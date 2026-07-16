@@ -1,13 +1,12 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
 #include <mm/kernel_stack.hpp>
 #include <mm/kernel_vspace.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_store.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 #include <mm/vspace_work.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
@@ -55,7 +54,7 @@ public:
     ~SchedStorageGuard() noexcept { reset(); }
 
     [[nodiscard]] auto initialize() noexcept -> bool {
-        const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
             reinterpret_cast<usize>(sched_test_ram)});
         if (!physical) {
             return false;

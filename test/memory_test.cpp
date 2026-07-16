@@ -1,6 +1,5 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/span.hpp>
@@ -8,7 +7,7 @@
 #include <mm/memory_object.hpp>
 #include <object/object_store.hpp>
 #include <mm/vspace_work.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 
 namespace {
 
@@ -26,7 +25,7 @@ constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_object{};
 
 [[nodiscard]] auto page_at(usize offset) noexcept -> kernel::mm::Page {
-    const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+    const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
         reinterpret_cast<usize>(memory_test_ram)});
     KASSERT(physical);
     const auto address = physical->checked_add(offset * kernel::mm::page_size);
@@ -43,7 +42,7 @@ public:
 
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
-        const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
             reinterpret_cast<usize>(memory_test_ram)});
         if (!physical) {
             return false;

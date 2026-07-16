@@ -1,6 +1,6 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <cap/cspace.hpp>
 #include <cap/grant_graph.hpp>
 #include <libk/manual_lifetime.hpp>
@@ -10,7 +10,7 @@
 #include <mm/vspace.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 #include <thread/execution.hpp>
 
 //Confirmatory experiment.
@@ -38,7 +38,7 @@ public:
     [[nodiscard]] auto initialize(bool eager, usize pages = 4) noexcept
         -> bool {
         reset();
-        const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
             reinterpret_cast<usize>(vspace_test_ram)});
         if (!physical) {
             return false;
@@ -58,8 +58,8 @@ public:
             map,
             kernel::mm::DirectMapLayout{
                 .physical_base = kernel::mm::PhysAddr{0},
-                .virtual_base = kernel::mm::VirtAddr{arch::layout::direct_base},
-                .window_size = arch::layout::direct_size,
+                .virtual_base = kernel::mm::VirtAddr{kernel::mm::layout::DirectMapBegin},
+                .window_size = kernel::mm::layout::DirectMapSize,
             });
         if (!direct
             || !kernel::mm::Pmm::initialize_in(
@@ -138,8 +138,8 @@ public:
         return kernel::cap::VSpaceAuthority{
             .region = space_->root_key(),
             .range = kernel::mm::VirtRange{
-                kernel::mm::VirtAddr{arch::layout::low_guard_end},
-                arch::layout::user_end - arch::layout::low_guard_end},
+                kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd},
+                kernel::mm::layout::UserEnd - kernel::mm::layout::LowGuardEnd},
             .access = kernel::mm::AccessMask::of(
                 kernel::mm::Access::Read,
                 kernel::mm::Access::Write,

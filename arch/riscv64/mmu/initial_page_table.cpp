@@ -3,7 +3,7 @@
 #include "arch/riscv64/cpu/csr.hpp"
 
 #include <core/debug.hpp>
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <libk/utility.hpp>
 #include <mm/pmm.hpp>
 
@@ -84,7 +84,7 @@ auto build_kernel_root(kernel::mm::Pmm& pmm) noexcept -> RootResult {
     constexpr usize root_span = usize{1} << 30;
     for (usize index = 256; index < 512; ++index) {
         const auto page = kernel::mm::VPage::from_base(kernel::mm::VirtAddr{
-            layout::direct_base + (index - 256) * root_span});
+            kernel::mm::layout::DirectMapBegin + (index - 256) * root_span});
         KASSERT(page);
         const auto ensured = builder.ensure_root_branch(*page);
         if (!ensured) {

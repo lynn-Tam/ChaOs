@@ -1,9 +1,13 @@
 #include "arch/riscv64/cpu/start_context.hpp"
 #include "arch/riscv64/mmu/root_access.hpp"
+#include "arch/riscv64/sbi/base.hpp"
+#include "arch/riscv64/sbi/hsm.hpp"
 
 #include <arch/cpu.hpp>
+#include <core/kernel_image.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <mm/direct_map.hpp>
 
 namespace arch::riscv64 {
 
@@ -37,6 +41,53 @@ auto CpuStartContext::ready() const noexcept -> bool {
 } // namespace arch::riscv64
 
 namespace arch {
+
+namespace {
+
+[[nodiscard]] constexpr auto start_error(isize error) noexcept
+    -> CpuStartError {
+    switch (error) {
+    case riscv64::sbi::not_supported:
+        return CpuStartError::NotSupported;
+    case riscv64::sbi::invalid_parameter:
+        return CpuStartError::InvalidHardwareId;
+    case riscv64::sbi::invalid_address:
+        return CpuStartError::InvalidEntryAddress;
+    case riscv64::sbi::already_started:
+    case riscv64::sbi::already_available:
+        return CpuStartError::AlreadyStarted;
+    default:
+        return CpuStartError::Rejected;
+    }
+}
+
+} // namespace
+
+auto secondary_start_available() noexcept -> bool {
+    return riscv64::sbi::extension_available(riscv64::sbi::hsm_extension_id);
+}
+
+auto start_secondary(
+    kernel::CpuHardwareId hardware_id,
+    CpuStartContext& context,
+    const kernel::mm::DirectMap& direct_map) noexcept
+    -> libk::Expected<void, CpuStartError> {
+    KASSERT(context.ready());
+
+    const usize entry = kernel::image::secondary_entry().first().base().raw();
+    const auto record = direct_map.unmap(
+        kernel::mm::VirtAddr{reinterpret_cast<usize>(&context)}, sizeof(context));
+    if (!record || (entry & 0x3U) != 0) {
+        return libk::unexpected(CpuStartError::InvalidEntryAddress);
+    }
+
+    const auto result = riscv64::sbi::hart_start(
+        hardware_id.raw, entry, record.value().raw());
+    if (result.error == riscv64::sbi::success) {
+        return libk::expected();
+    }
+    return libk::unexpected(start_error(result.error));
+}
 
 void wait_for_interrupt() noexcept {
     asm volatile("wfi" ::: "memory");

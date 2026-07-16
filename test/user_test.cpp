@@ -1,6 +1,7 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
+#include <core/kernel_image.hpp>
+#include <mm/virtual_layout.hpp>
 #include <arch/user.hpp>
 #include <cap/handle.hpp>
 #include <uapi/capability.h>
@@ -12,17 +13,17 @@ namespace {
 
 bool test_user_start_validates_privilege_inputs(const TestContext&) noexcept {
     const arch::UserStart valid{
-        .entry = kernel::mm::VirtAddr{arch::layout::low_guard_end},
-        .stack = kernel::mm::VirtAddr{arch::layout::user_end},
+        .entry = kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd},
+        .stack = kernel::mm::VirtAddr{kernel::mm::layout::UserEnd},
     };
     arch::UserStart low = valid;
-    low.entry = kernel::mm::VirtAddr{arch::layout::low_guard_end - 2};
+    low.entry = kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd - 2};
     arch::UserStart odd = valid;
-    odd.entry = kernel::mm::VirtAddr{arch::layout::low_guard_end + 1};
+    odd.entry = kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd + 1};
     arch::UserStart kernel = valid;
-    kernel.entry = kernel::mm::VirtAddr{arch::layout::kernel_base};
+    kernel.entry = kernel::image::virtual_begin();
     arch::UserStart unaligned_stack = valid;
-    unaligned_stack.stack = kernel::mm::VirtAddr{arch::layout::user_end - 1};
+    unaligned_stack.stack = kernel::mm::VirtAddr{kernel::mm::layout::UserEnd - 1};
     return arch::valid_user_start(valid)
         && !arch::valid_user_start(low)
         && !arch::valid_user_start(odd)
@@ -35,15 +36,15 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
     alignas(16) byte home[1024]{};
     const usize top = reinterpret_cast<usize>(home) + sizeof(home);
     const arch::UserStart valid{
-        .entry = kernel::mm::VirtAddr{arch::layout::low_guard_end},
-        .stack = kernel::mm::VirtAddr{arch::layout::low_guard_end + kernel::mm::page_size},
+        .entry = kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd},
+        .stack = kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd + kernel::mm::page_size},
         .arguments = {1, 2, 3, 4, 5, 6},
     };
     auto prepared = arch::prepare_user_stack(top, valid);
     auto rejected = arch::prepare_user_stack(
         top,
         arch::UserStart{
-            .entry = kernel::mm::VirtAddr{arch::layout::kernel_base},
+            .entry = kernel::image::virtual_begin(),
             .stack = valid.stack,
         });
     return prepared && *prepared >= reinterpret_cast<usize>(home)

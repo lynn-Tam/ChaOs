@@ -1,5 +1,3 @@
-// Architecture-neutral contract for constructing a stopped user state.
-
 #pragma once
 
 #include <core/types.hpp>

@@ -1,13 +1,10 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
 #include <boot/firmware/devicetree/fdt.hpp>
 #include <libk/utility.hpp>
 #include <mm/boot_map.hpp>
 #include <mm/pmm.hpp>
-#include <platform/memory_layout.hpp>
-
-extern "C" char kernel_img_end[];
+#include <core/kernel_image.hpp>
 
 namespace {
 
@@ -51,8 +48,15 @@ bool test_boot_map_is_ordered(const TestContext& ctx) noexcept {
 }
 
 bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
-    const uintptr_t high_end = reinterpret_cast<uintptr_t>(kernel_img_end)
-        - arch::layout::kernel_base + platform::memory::kernel_physical_base;
+    const auto boot_range = kernel::image::boot_entry();
+    const auto secondary_range = kernel::image::secondary_entry();
+    const auto image_range = kernel::image::physical_image();
+    const auto boot_end = boot_range.end_frame();
+    const auto secondary_end = secondary_range.end_frame();
+    const auto image_end = image_range.end_frame();
+    if (!boot_end || !secondary_end || !image_end) {
+        return false;
+    }
     bool boot_entry{};
     bool secondary{};
     bool high_image{};
@@ -66,18 +70,19 @@ bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
         }
         const uintptr_t first = region.range.first().base().raw();
         const uintptr_t last = end->raw() * kernel::mm::page_size;
-        boot_entry |= first == platform::memory::boot_physical_base
-            && last == first + platform::memory::boot_entry_size;
-        secondary |= first == platform::memory::secondary_entry_physical
-            && last == first + platform::memory::secondary_entry_size;
-        high_image |= first == platform::memory::kernel_physical_base
-            && last == high_end;
+        boot_entry |= first == boot_range.first().base().raw()
+            && last == boot_end->raw() * kernel::mm::page_size;
+        secondary |= first == secondary_range.first().base().raw()
+            && last == secondary_end->raw() * kernel::mm::page_size;
+        high_image |= first == image_range.first().base().raw()
+            && last == image_end->raw() * kernel::mm::page_size;
     }
     return boot_entry && secondary && high_image;
 }
 
 bool test_pre_kernel_ram_is_firmware_reserved(const TestContext& ctx) noexcept {
-    const uintptr_t kernel_start = platform::memory::boot_physical_base;
+    const uintptr_t kernel_start =
+        kernel::image::boot_entry().first().base().raw();
     for (const auto& region : ctx.boot.memory_regions) {
         if (region.kind != kernel::mm::RegionKind::FirmwareReserved) {
             continue;

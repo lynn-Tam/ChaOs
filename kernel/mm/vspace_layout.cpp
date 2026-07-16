@@ -3,7 +3,7 @@
 
 #include "vspace_internal.hpp"
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <cap/cspace.hpp>
 #include <cap/resolved.hpp>
 #include <core/debug.hpp>
@@ -21,8 +21,8 @@ auto VSpace::valid_user_range(VirtRange range) noexcept -> bool {
     return range.valid() && !range.empty() && end
         && (range.base().raw() & (page_size - 1)) == 0
         && (range.size() & (page_size - 1)) == 0
-        && range.base().raw() >= arch::layout::low_guard_end
-        && end->raw() <= arch::layout::user_end;
+        && range.base().raw() >= kernel::mm::layout::LowGuardEnd
+        && end->raw() <= kernel::mm::layout::UserEnd;
 }
 
 auto VSpace::overlap(AddressRegion& region, VirtRange range) noexcept

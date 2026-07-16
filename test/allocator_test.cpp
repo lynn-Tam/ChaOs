@@ -1,6 +1,6 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <arch/page_table.hpp>
 #include <arch/riscv64/cpu/csr.hpp>
 #include <arch/riscv64/mmu/range_map.hpp>
@@ -14,7 +14,7 @@
 #include <libk/utility.hpp>
 #include <mm/pmm.hpp>
 #include <mm/translation.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 
 namespace {
 
@@ -70,7 +70,7 @@ class PmmFixture : private libk::noncopyable_nonmovable {
             memory_map,
             kernel::mm::DirectMapLayout{
                 .physical_base = kernel::mm::PhysAddr{
-                    platform::memory::linked_physical(kernel::mm::VirtAddr{
+                    kernel::image::linked_physical(kernel::mm::VirtAddr{
                         reinterpret_cast<uintptr_t>(test_ram)})->raw()},
                 .virtual_base = kernel::mm::VirtAddr{
                     reinterpret_cast<uintptr_t>(test_ram)},
@@ -89,7 +89,7 @@ class PmmFixture : private libk::noncopyable_nonmovable {
 };
 
 [[nodiscard]] auto page_at(size_t offset) noexcept -> kernel::mm::Page {
-    const auto base = platform::memory::linked_physical(kernel::mm::VirtAddr{
+    const auto base = kernel::image::linked_physical(kernel::mm::VirtAddr{
         reinterpret_cast<uintptr_t>(test_ram)});
     KASSERT(base);
     const auto address = base->checked_add(offset * kernel::mm::page_size);
@@ -757,7 +757,7 @@ bool test_runtime_editor_owns_private_and_shared_tables(
         constexpr usize root_span = usize{1} << 30;
         for (usize index = 256; index < 512; ++index) {
             const auto page = kernel::mm::VPage::from_base(kernel::mm::VirtAddr{
-                arch::layout::direct_base + (index - 256) * root_span});
+                kernel::mm::layout::DirectMapBegin + (index - 256) * root_span});
             if (!page || !builder.ensure_root_branch(*page)) {
                 return false;
             }
@@ -772,7 +772,7 @@ bool test_runtime_editor_owns_private_and_shared_tables(
         kernel::mm::OwnedPage payload = libk::move(payload_result).value();
 
         const auto user_page = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{arch::layout::low_guard_end});
+            kernel::mm::VirtAddr{kernel::mm::layout::LowGuardEnd});
         if (!user_page) {
             return false;
         }
@@ -824,7 +824,7 @@ bool test_runtime_editor_owns_private_and_shared_tables(
         }
 
         const auto kernel_page = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{arch::layout::direct_base});
+            kernel::mm::VirtAddr{kernel::mm::layout::DirectMapBegin});
         if (!kernel_page) {
             return false;
         }
@@ -1373,7 +1373,7 @@ bool test_initial_page_table_unrepresentable_range_rolls_back(
             kernel::mm::RegionKind::AvailableRam})) {
         return false;
     }
-    const auto base = platform::memory::linked_physical(kernel::mm::VirtAddr{
+    const auto base = kernel::image::linked_physical(kernel::mm::VirtAddr{
         reinterpret_cast<uintptr_t>(test_ram)});
     KASSERT(base);
     const auto result = kernel::mm::DirectMap::initialize_in(

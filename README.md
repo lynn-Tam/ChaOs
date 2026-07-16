@@ -132,22 +132,30 @@ substrate includes typed fatal events, per-CPU panic snapshots, guarded runtime
 kernel stacks, bounded backtraces, and best-effort peer stopping that cannot
 wait forever for an unresponsive hart.
 
-### Architecture and platform are different layers
+### Architecture boundaries without wrapper stacks
 
-The kernel separates portable kernel contracts, architecture mechanisms, and
-machine policy:
+Architecture selection happens at the include path. Kernel code includes the
+same `<arch/...>` contract on every target, while each architecture provides
+that contract directly from `arch/<arch>/include/arch/`:
 
 ```text
-kernel/                  architecture-independent mechanisms and policy
-kernel/include/arch/     selected-architecture contract
-arch/<arch>/             ISA, trap, context, and MMU implementation
-kernel/include/platform/ selected-platform contract
-platform/<platform>/     machine boot, console, CPU control, and layout policy
+kernel/                         architecture-independent mechanisms and policy
+arch/<arch>/include/arch/       selected public architecture contract
+arch/<arch>/                    private ISA, firmware, trap, context, and MMU code
+platform/<board>/               future board-specific devices and drivers
 ```
 
-RISC-V and QEMU `virt` are the first implementation pair. The structure is
-intended to support additional architectures, including x86, without pretending
-that an ISA detail is a universal kernel abstraction.
+There is no generic wrapper header followed by an `arch::backend` alias layer.
+RISC-V-specific representations stay in `arch::riscv64`; the selected public
+surface uses the names and contracts a future x86 implementation must also
+provide.
+
+Address facts are split by ownership: Sv39 canonical-address rules belong to
+the architecture, the direct-map and user/kernel virtual layout belong to
+kernel MM policy, and physical/virtual image relations come from linker symbols.
+The `platform/` tree is intentionally unused for the current QEMU target; it is
+reserved for real board-level device differences instead of becoming a bucket
+for SBI calls or linker constants.
 
 ### AI-assisted, evidence-driven engineering
 
@@ -183,7 +191,7 @@ comes from combining:
 arch/       architecture-specific boot, trap, context, CPU, and MMU mechanisms
 kernel/     kernel objects, capabilities, scheduling, VM, traps, and syscalls
 libk/       audited freestanding C++ types, containers, formatting, and atomics
-platform/   machine/platform integration
+platform/   future board-specific devices and drivers
 uapi/       C, C++, and assembly-safe user/kernel ABI declarations
 user/       user-mode support and executable proof payloads
 servers/    future user-space system services
@@ -239,8 +247,8 @@ make audit-symbols
 make audit-clang
 ```
 
-Build composition is explicit through `ARCH`, `PLATFORM`, and `PROFILE`; build
-artifacts are isolated under `build/<arch>/<platform>/<profile>/`.
+Build composition is explicit through `ARCH` and `PROFILE`; build artifacts are
+isolated under `build/<arch>/<profile>/`.
 
 ## Who is this for?
 

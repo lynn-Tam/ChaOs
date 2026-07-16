@@ -2,7 +2,7 @@
 
 #include <core/types.hpp>
 
-namespace platform {
+namespace arch {
 
 enum class HaltReason : u8 {
     Panic,
@@ -16,8 +16,6 @@ enum class HaltAction : u8 {
 };
 
 [[noreturn]] void halt_current_cpu(HaltReason reason) noexcept;
-[[noreturn]] void halt_system(
-    HaltAction action,
-    HaltReason reason) noexcept;
+[[noreturn]] void halt_system(HaltAction action, HaltReason reason) noexcept;
 
-} // namespace platform
+} // namespace arch

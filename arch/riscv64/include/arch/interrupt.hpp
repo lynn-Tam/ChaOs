@@ -3,8 +3,7 @@
 namespace arch {
 
 // Captures only the local supervisor interrupt-enable bit. Restoring this
-// token never overwrites unrelated sstatus state changed inside the guarded
-// section.
+// token never overwrites unrelated sstatus state changed in the guarded scope.
 class InterruptState final {
 public:
     [[nodiscard]] constexpr auto enabled() const noexcept -> bool {

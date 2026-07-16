@@ -4,7 +4,7 @@
 #include "arch/riscv64/cpu/csr.hpp"
 #include "sv39_table.hpp"
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <core/debug.hpp>
 #include <libk/utility.hpp>
 
@@ -136,8 +136,8 @@ auto Editor::user(arch::UserRoot& root) noexcept -> Editor {
 auto Editor::accepts(kernel::mm::VPage page) const noexcept -> bool {
     const kernel::mm::VirtAddr address = page.base();
     return domain_ == Domain::Kernel
-        ? layout::is_kernel(address)
-        : layout::is_user(address);
+        ? kernel::mm::layout::is_kernel(address)
+        : kernel::mm::layout::is_user(address);
 }
 
 auto Editor::map(

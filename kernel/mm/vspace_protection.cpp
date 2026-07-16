@@ -3,7 +3,6 @@
 
 #include "vspace_internal.hpp"
 
-#include <arch/address_layout.hpp>
 #include <cap/cspace.hpp>
 #include <cap/resolved.hpp>
 #include <core/debug.hpp>

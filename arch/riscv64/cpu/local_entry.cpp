@@ -11,8 +11,8 @@
 namespace arch {
 namespace {
 
-[[nodiscard]] auto local_state() noexcept -> backend::CpuEntryState* {
-    return reinterpret_cast<backend::CpuEntryState*>(
+[[nodiscard]] auto local_state() noexcept -> CpuEntryState* {
+    return reinterpret_cast<CpuEntryState*>(
         riscv64::Sscratch::read());
 }
 

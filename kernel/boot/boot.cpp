@@ -1,16 +1,13 @@
 #include <boot/boot_info.hpp>
 #include <boot/firmware/devicetree/fdt.hpp>
 
-#include <arch/address_layout.hpp>
 #include <diag/console.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/limits.hpp>
 #include <libk/optional.hpp>
 #include <libk/utility.hpp>
 #include <mm/boot_map.hpp>
-#include <platform/memory_layout.hpp>
-
-extern "C" char kernel_img_end[];
+#include <core/kernel_image.hpp>
 
 namespace {
 
@@ -246,35 +243,19 @@ private:
 };
 
 [[nodiscard]] auto reserve_kernel(kernel::mm::BootMapBuilder& memory) noexcept -> bool {
-    const uintptr_t high_end = reinterpret_cast<uintptr_t>(kernel_img_end)
-        - arch::layout::kernel_base + platform::memory::kernel_physical_base;
-    if (high_end <= platform::memory::kernel_physical_base) {
-        return false;
-    }
-    const auto boot_entry = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::boot_physical_base},
-        platform::memory::boot_entry_size);
-    const auto secondary = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::secondary_entry_physical},
-        platform::memory::secondary_entry_size);
-    const auto transition = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::transition_physical_base},
-        platform::memory::transition_size);
-    const auto high_image = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::kernel_physical_base},
-        high_end - platform::memory::kernel_physical_base);
-    if (!boot_entry || !secondary || !transition || !high_image) {
-        return false;
-    }
+    const auto boot_entry = kernel::image::boot_entry();
+    const auto secondary = kernel::image::secondary_entry();
+    const auto transition = kernel::image::transition();
+    const auto high_image = kernel::image::physical_image();
 
     for (const auto& bank : memory.ram()) {
-        if (!bank.contains(*boot_entry)
-            || !bank.contains(*secondary)
-            || !bank.contains(*transition)
-            || !bank.contains(*high_image)) {
+        if (!bank.contains(boot_entry)
+            || !bank.contains(secondary)
+            || !bank.contains(transition)
+            || !bank.contains(high_image)) {
             continue;
         }
-        const size_t prefix_pages = boot_entry->first().frame().raw()
+        const size_t prefix_pages = boot_entry.first().frame().raw()
             - bank.first().frame().raw();
         if (prefix_pages != 0
             && !memory.reserve(
@@ -282,11 +263,11 @@ private:
                 kernel::mm::RegionKind::FirmwareReserved)) {
             return false;
         }
-        return memory.reserve(*boot_entry, kernel::mm::RegionKind::KernelImage)
-            && memory.reserve(*secondary, kernel::mm::RegionKind::KernelImage)
+        return memory.reserve(boot_entry, kernel::mm::RegionKind::KernelImage)
+            && memory.reserve(secondary, kernel::mm::RegionKind::KernelImage)
             && memory.reserve(
-                *transition, kernel::mm::RegionKind::ReclaimableBootData)
-            && memory.reserve(*high_image, kernel::mm::RegionKind::KernelImage);
+                transition, kernel::mm::RegionKind::ReclaimableBootData)
+            && memory.reserve(high_image, kernel::mm::RegionKind::KernelImage);
     }
     return false;
 }
@@ -350,13 +331,7 @@ auto build_boot_info_from_fdt(
         .size = static_cast<uint32_t>(view.size),
         .pages = *fdt_pages,
     };
-    const auto transition = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::transition_physical_base},
-        platform::memory::transition_size);
-    if (!transition) {
-        return libk::unexpected(BootInfoError::InvalidKernelRange);
-    }
-    info.transition = TransitionMemory{.pages = *transition};
+    info.transition = TransitionMemory{.pages = kernel::image::transition()};
 
     const auto stdout = collector.stdout_path();
     if (stdout) {

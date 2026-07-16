@@ -14,22 +14,25 @@ struct UnwindSeed final {
 
 using CallSiteSnapshot = UnwindSeed;
 
-} // namespace arch
-
-#include <arch/backend/diagnostics.hpp>
-
-namespace arch {
-
 [[nodiscard, gnu::always_inline]] inline auto capture_call_site() noexcept
     -> CallSiteSnapshot {
     CallSiteSnapshot snapshot{};
-    backend::capture_call_site(snapshot);
+    asm volatile("mv %0, sp" : "=r"(snapshot.sp));
+    asm volatile("mv %0, s0" : "=r"(snapshot.frame_pointer));
+    asm volatile("mv %0, ra" : "=r"(snapshot.return_address));
+    snapshot.pc = snapshot.return_address;
     return snapshot;
 }
 
 [[nodiscard]] constexpr auto unwind_seed(
     const TrapSnapshot& trap) noexcept -> UnwindSeed {
-    return backend::trap_unwind_seed<TrapSnapshot, UnwindSeed>(trap);
+    // TrapSnapshot GPR order is ra, sp, gp, tp, t0-t2, s0, ...
+    return UnwindSeed{
+        .pc = trap.pc,
+        .sp = trap.gpr[1],
+        .frame_pointer = trap.gpr[7],
+        .return_address = trap.gpr[0],
+    };
 }
 
 } // namespace arch

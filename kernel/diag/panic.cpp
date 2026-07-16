@@ -9,8 +9,8 @@
 #include <cpu/cpu_runtime.hpp>
 #include <libk/assert.hpp>
 #include <libk/fmt.hpp>
-#include <platform/console.hpp>
-#include <platform/system.hpp>
+#include <arch/console.hpp>
+#include <arch/system.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel::diag {
@@ -36,7 +36,7 @@ struct PanicCoordinator final {
 constinit PanicCoordinator coordinator{};
 
 void raw_char(char character) noexcept {
-    platform::console::write(character);
+    arch::console::write(character);
 }
 
 void raw_text(const char* text) noexcept {
@@ -72,12 +72,12 @@ void raw_hex(usize value) noexcept {
 class PanicSink final {
 public:
     auto write(char character) noexcept -> bool {
-        platform::console::write(character);
+        arch::console::write(character);
         return true;
     }
 
     auto write(const char* text, usize size) noexcept -> bool {
-        platform::console::write(libk::StrView{text, size});
+        arch::console::write(libk::StrView{text, size});
         return true;
     }
 };
@@ -110,7 +110,7 @@ void raw_source(const SourceLocation& source) noexcept {
     raw_text(" cause=");
     raw_hex(cause);
     raw_char('\n');
-    platform::halt_current_cpu(platform::HaltReason::Fatal);
+    arch::halt_current_cpu(arch::HaltReason::Fatal);
 }
 
 void capture_stack_bounds(
@@ -387,7 +387,7 @@ void print_peers(const PanicSlot& owner) noexcept {
             libk::MemoryOrder::AcqRel,
             libk::MemoryOrder::Acquire>(expected, PanicPhase::Claimed)) {
         slot.state.store<libk::MemoryOrder::Release>(PanicSlotState::Stopped);
-        platform::halt_current_cpu(platform::HaltReason::PeerStop);
+        arch::halt_current_cpu(arch::HaltReason::PeerStop);
     }
     coordinator.owner.store<libk::MemoryOrder::Release>(
         static_cast<u32>(slot.cpu.raw));
@@ -418,9 +418,9 @@ void print_peers(const PanicSlot& owner) noexcept {
     print_peers(slot);
     panic_print<"====================================================\n">();
     coordinator.phase.store<libk::MemoryOrder::Release>(PanicPhase::Halted);
-    platform::halt_system(
-        platform::HaltAction::Shutdown,
-        platform::HaltReason::Panic);
+    arch::halt_system(
+        arch::HaltAction::Shutdown,
+        arch::HaltReason::Panic);
 }
 
 } // namespace
@@ -437,9 +437,9 @@ auto stop_requested() noexcept -> bool {
     if (slot_pointer == nullptr || stack_top == 0) {
         raw_text("\nEARLY KERNEL PANIC\n");
         raw_source(request.source);
-        platform::halt_system(
-            platform::HaltAction::Shutdown,
-            platform::HaltReason::Fatal);
+        arch::halt_system(
+            arch::HaltAction::Shutdown,
+            arch::HaltReason::Fatal);
     }
     auto& slot = *static_cast<PanicSlot*>(slot_pointer);
     if (!arch::enter_emergency()) {

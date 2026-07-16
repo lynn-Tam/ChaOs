@@ -1,6 +1,6 @@
 #pragma once
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <arch/page_table.hpp>
 #include <arch/page_editor.hpp>
 #include <libk/expected.hpp>
@@ -84,7 +84,7 @@ public:
           pmm_(&pmm),
           stack_pages_(pmm.make_page_group()),
           next_stack_base_(
-              arch::layout::dynamic_base
+              kernel::mm::layout::DynamicBegin
               + KernelStackLayout::GuardPages * page_size) {}
 
     [[nodiscard]] auto token() const noexcept -> arch::RootToken {

@@ -14,7 +14,7 @@ enum class RootError : u8 {
     TranslationModeUnavailable,
 };
 
-// A CPU-consumable projection of one translation root.  It neither owns nor
+// A CPU-consumable projection of one translation root. It neither owns nor
 // extends the lifetime of the root from which it was minted.
 class RootToken final {
 public:
@@ -42,9 +42,8 @@ private:
     usize value_{};
 };
 
-// Architecture-owned resources behind the supervisor root.  KernelVSpace is
-// the semantic owner; user roots later borrow its shared supervisor branches
-// without acquiring authority to release them.
+// Architecture-owned resources behind the supervisor root. KernelVSpace is
+// the semantic owner; user roots borrow its shared supervisor branches.
 class KernelRoot final {
 public:
     KernelRoot(const KernelRoot&) = delete;
@@ -61,19 +60,22 @@ private:
     friend struct RootAccess;
     friend class UserRoot;
 
-    KernelRoot(kernel::mm::Page root_page, kernel::mm::OwnedPageGroup&& tables) noexcept;
+    KernelRoot(
+        kernel::mm::Page root_page,
+        kernel::mm::OwnedPageGroup&& tables) noexcept;
 
-    [[nodiscard]] static constexpr auto empty_root() noexcept -> kernel::mm::Page {
-        return kernel::mm::Page{kernel::mm::Pfn{libk::numeric_limits<usize>::max()}};
+    [[nodiscard]] static constexpr auto empty_root() noexcept
+        -> kernel::mm::Page {
+        return kernel::mm::Page{
+            kernel::mm::Pfn{libk::numeric_limits<usize>::max()}};
     }
 
     kernel::mm::Page root_page_{};
     kernel::mm::OwnedPageGroup tables_;
 };
 
-// A user root owns its root and all low-half table pages.  Its supervisor root
-// entries are borrowed pointers to KernelRoot-owned branches and are never
-// released by this owner.
+// A user root owns its root and all low-half table pages. Its supervisor root
+// entries borrow KernelRoot-owned branches and are never released here.
 class UserRoot final {
 public:
     UserRoot(const UserRoot&) = delete;
@@ -93,10 +95,14 @@ public:
 private:
     friend struct RootAccess;
 
-    UserRoot(kernel::mm::Page root_page, kernel::mm::OwnedPageGroup&& tables) noexcept;
+    UserRoot(
+        kernel::mm::Page root_page,
+        kernel::mm::OwnedPageGroup&& tables) noexcept;
 
-    [[nodiscard]] static constexpr auto empty_root() noexcept -> kernel::mm::Page {
-        return kernel::mm::Page{kernel::mm::Pfn{libk::numeric_limits<usize>::max()}};
+    [[nodiscard]] static constexpr auto empty_root() noexcept
+        -> kernel::mm::Page {
+        return kernel::mm::Page{
+            kernel::mm::Pfn{libk::numeric_limits<usize>::max()}};
     }
 
     kernel::mm::Page root_page_{};
@@ -105,10 +111,11 @@ private:
 
 using RootResult = libk::Expected<KernelRoot, RootError>;
 
-[[nodiscard]] auto build_kernel_root(kernel::mm::Pmm& pmm) noexcept -> RootResult;
+[[nodiscard]] auto build_kernel_root(
+    kernel::mm::Pmm& pmm) noexcept -> RootResult;
 
-// Installs a fully built root and performs the backend-required local fence.
-// The caller owns the activation/leave serialization.
+// Installs a fully built root and performs the required local fence. The
+// caller owns activation/leave serialization.
 void activate_root(RootToken token) noexcept;
 [[nodiscard]] auto root_active(RootToken token) noexcept -> bool;
 void flush_tlb_all() noexcept;

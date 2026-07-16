@@ -191,7 +191,7 @@ arch_riscv64_high_entry:
 
     la t0, .Lhigh_park
     csrw stvec, t0
-    call platform_riscv_virt_high_entry
+    call arch_riscv64_high_entry_cpp
 .Lhigh_park:
     csrci sstatus, 2
 1:

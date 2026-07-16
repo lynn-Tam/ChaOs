@@ -1,6 +1,5 @@
 #include <test/test.hpp>
 
-#include <arch/address_layout.hpp>
 #include <cap/cspace.hpp>
 #include <cap/grant_graph.hpp>
 #include <libk/manual_lifetime.hpp>
@@ -9,7 +8,7 @@
 #include <mm/pmm.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 #include <sched/context.hpp>
 #include <thread/thread.hpp>
 
@@ -56,7 +55,7 @@ public:
 
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
-        const auto physical = platform::memory::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
             reinterpret_cast<usize>(cap_test_ram)});
         if (!physical) {
             return false;

@@ -1,6 +1,7 @@
 #include <mm/kernel_vspace.hpp>
 
 #include <core/debug.hpp>
+#include <core/kernel_image.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <sync/irq_lock_guard.hpp>
 
@@ -71,7 +72,7 @@ auto KernelVSpace::acquire_stack() noexcept
     const auto slot_end = libk::checked_add(
         base - KernelStackLayout::GuardPages * page_size,
         KernelStackLayout::SlotBytes);
-    if (!slot_end || *slot_end > arch::layout::kernel_base) {
+    if (!slot_end || *slot_end > kernel::image::virtual_begin().raw()) {
         return libk::unexpected(StackError::AddressSpaceExhausted);
     }
 
@@ -147,7 +148,7 @@ auto KernelVSpace::acquire_stack() noexcept
 }
 
 void KernelVSpace::release_stack(usize base) noexcept {
-    KASSERT(base >= arch::layout::dynamic_base + page_size);
+    KASSERT(base >= kernel::mm::layout::DynamicBegin + page_size);
     KASSERT((base & (page_size - 1)) == 0);
     kernel::sync::IrqLockGuard guard{stack_lock_};
     KASSERT(stack_leases_ != 0);

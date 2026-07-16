@@ -3,12 +3,11 @@
 
 #include "initial_kernel_map.hpp"
 
-#include <arch/address_layout.hpp>
 #include <core/debug.hpp>
 #include <libk/optional.hpp>
 #include <mm/addr.hpp>
 #include <mm/pmm.hpp>
-#include <platform/memory_layout.hpp>
+#include <core/kernel_image.hpp>
 
 #include "range_map.hpp"
 #include "sv39_builder.hpp"
@@ -39,16 +38,8 @@ namespace {
 
 [[nodiscard]] auto physical_for(uintptr_t virtual_address) noexcept
     -> libk::optional<kernel::mm::PhysAddr> {
-    if (virtual_address < layout::kernel_base) {
-        return libk::nullopt;
-    }
-    const usize offset = virtual_address - layout::kernel_base;
-    const auto physical =
-        kernel::mm::PhysAddr{platform::memory::kernel_physical_base}.checked_add(offset);
-    if (!physical) {
-        return libk::nullopt;
-    }
-    return *physical;
+    return kernel::image::linked_physical(
+        kernel::mm::VirtAddr{virtual_address});
 }
 
 [[nodiscard]] auto map_at(
@@ -129,7 +120,8 @@ struct LinkedSection final {
 }
 
 auto validate_linker_layout() noexcept -> void {
-    KASSERT(address_of(kernel_img_start) == layout::kernel_base);
+    KASSERT(address_of(kernel_img_start)
+        == kernel::image::virtual_begin().raw());
     KASSERT(address_of(kernel_img_start) == address_of(kernel_text_start));
     KASSERT(address_of(kernel_text_end) == address_of(user_image_start));
     KASSERT(address_of(user_image_end) == address_of(kernel_rodata_start));
@@ -178,25 +170,20 @@ auto map_initial_kernel(Sv39Builder& builder, kernel::mm::Pmm& pmm) noexcept
     // Secondary harts enter with translation disabled.  This final-root alias
     // is the narrow bridge from their physical trampoline to the high entry;
     // D2 removes it after the last secondary acknowledges activation.
-    const auto boot_entry = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::boot_physical_base},
-        platform::memory::boot_entry_size);
-    const auto secondary = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{platform::memory::secondary_entry_physical},
-        platform::memory::secondary_entry_size);
-    KASSERT(boot_entry && secondary);
+    const auto boot_entry = kernel::image::boot_entry();
+    const auto secondary = kernel::image::secondary_entry();
     auto mapped = map_and_verify(
         builder,
-        kernel::mm::VirtAddr{platform::memory::boot_physical_base},
-        *boot_entry,
+        kernel::mm::VirtAddr{boot_entry.first().base().raw()},
+        boot_entry,
         PtePerm::supervisor_rx());
     if (!mapped) {
         return convert_mapping_error(mapped.error());
     }
     mapped = map_and_verify(
         builder,
-        kernel::mm::VirtAddr{platform::memory::secondary_entry_physical},
-        *secondary,
+        kernel::mm::VirtAddr{secondary.first().base().raw()},
+        secondary,
         PtePerm::supervisor_rx());
     if (!mapped) {
         return convert_mapping_error(mapped.error());

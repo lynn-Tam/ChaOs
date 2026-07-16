@@ -11,39 +11,39 @@
 #include <cpu/cpu_runtime.hpp>
 #include <libk/utility.hpp>
 #include <mm/direct_map.hpp>
-#include <platform/cpu.hpp>
+#include <arch/cpu.hpp>
 #include <sched/dispatcher.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel {
 namespace {
 
-[[nodiscard]] constexpr auto failure_from(platform::CpuStartError error) noexcept
+[[nodiscard]] constexpr auto failure_from(arch::CpuStartError error) noexcept
     -> CpuFailure {
     switch (error) {
-    case platform::CpuStartError::NotSupported:
+    case arch::CpuStartError::NotSupported:
         return CpuFailure::HsmUnavailable;
-    case platform::CpuStartError::InvalidHardwareId:
+    case arch::CpuStartError::InvalidHardwareId:
         return CpuFailure::InvalidHardwareId;
-    case platform::CpuStartError::InvalidEntryAddress:
+    case arch::CpuStartError::InvalidEntryAddress:
         return CpuFailure::InvalidEntryAddress;
-    case platform::CpuStartError::AlreadyStarted:
+    case arch::CpuStartError::AlreadyStarted:
         return CpuFailure::AlreadyStarted;
-    case platform::CpuStartError::Rejected:
+    case arch::CpuStartError::Rejected:
         return CpuFailure::FirmwareRejected;
     }
     __builtin_unreachable();
 }
 
-static_assert(failure_from(platform::CpuStartError::NotSupported)
+static_assert(failure_from(arch::CpuStartError::NotSupported)
     == CpuFailure::HsmUnavailable);
-static_assert(failure_from(platform::CpuStartError::InvalidHardwareId)
+static_assert(failure_from(arch::CpuStartError::InvalidHardwareId)
     == CpuFailure::InvalidHardwareId);
-static_assert(failure_from(platform::CpuStartError::InvalidEntryAddress)
+static_assert(failure_from(arch::CpuStartError::InvalidEntryAddress)
     == CpuFailure::InvalidEntryAddress);
-static_assert(failure_from(platform::CpuStartError::AlreadyStarted)
+static_assert(failure_from(arch::CpuStartError::AlreadyStarted)
     == CpuFailure::AlreadyStarted);
-static_assert(failure_from(platform::CpuStartError::Rejected)
+static_assert(failure_from(arch::CpuStartError::Rejected)
     == CpuFailure::FirmwareRejected);
 
 void install_local_entry(
@@ -65,7 +65,7 @@ void start_secondaries(
     CpuRegistry& cpus,
     const kernel::mm::DirectMap& direct_map) noexcept {
     const CpuId boot = cpus.boot_id();
-    if (!platform::secondary_start_available()) {
+    if (!arch::secondary_start_available()) {
         for (usize index = 0; index < cpus.count(); ++index) {
             const CpuId id{index};
             const CpuDescriptor* const cpu = cpus.descriptor(id);
@@ -92,7 +92,7 @@ void start_secondaries(
 
         CpuRuntime* const runtime = cpus.runtime(id);
         KASSERT(runtime != nullptr);
-        const auto started = platform::start_secondary(
+        const auto started = arch::start_secondary(
             cpu->hardware_id(), runtime->start_context, direct_map);
         if (!started) {
             KASSERT(cpus.fail_start(id, failure_from(started.error())));

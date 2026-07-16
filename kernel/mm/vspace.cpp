@@ -3,7 +3,7 @@
 
 #include "vspace_internal.hpp"
 
-#include <arch/address_layout.hpp>
+#include <mm/virtual_layout.hpp>
 #include <cap/cspace.hpp>
 #include <cap/resolved.hpp>
 #include <core/debug.hpp>
@@ -166,8 +166,8 @@ auto VSpace::initialize() noexcept -> libk::Expected<void, VSpaceError> {
         return libk::unexpected(VSpaceError::OutOfMemory);
     }
     const VirtRange range{
-        VirtAddr{arch::layout::low_guard_end},
-        arch::layout::user_end - arch::layout::low_guard_end};
+        VirtAddr{kernel::mm::layout::LowGuardEnd},
+        kernel::mm::layout::UserEnd - kernel::mm::layout::LowGuardEnd};
     const RegionPolicy policy{
         .access = AccessMask::of(
             Access::Read, Access::Write, Access::Execute),

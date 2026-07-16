@@ -1,21 +1,40 @@
-// Architecture-neutral CPU-local execution contract.
-
 #pragma once
 
-#include <arch/backend/cpu.hpp>
+#include "arch/riscv64/cpu/local_entry.hpp"
+#include "arch/riscv64/cpu/start_context.hpp"
 
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
+#include <libk/expected.hpp>
 
 namespace kernel {
 class KernelState;
 struct CpuRuntime;
 }
 
+namespace kernel::mm {
+class DirectMap;
+}
+
 namespace arch {
 
-using CpuEntryState = backend::CpuEntryState;
-using CpuStartContext = backend::CpuStartContext;
+using CpuEntryState = riscv64::CpuEntryBlock;
+using CpuStartContext = riscv64::CpuStartContext;
+
+enum class CpuStartError : u8 {
+    NotSupported,
+    InvalidHardwareId,
+    InvalidEntryAddress,
+    AlreadyStarted,
+    Rejected,
+};
+
+[[nodiscard]] auto secondary_start_available() noexcept -> bool;
+[[nodiscard]] auto start_secondary(
+    kernel::CpuHardwareId hardware_id,
+    CpuStartContext& context,
+    const kernel::mm::DirectMap& direct_map) noexcept
+    -> libk::Expected<void, CpuStartError>;
 
 void initialize_cpu_entry(CpuEntryState& state, void* owner) noexcept;
 [[nodiscard]] auto set_local_cpu_entry(CpuEntryState& state) noexcept -> bool;
