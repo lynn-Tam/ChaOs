@@ -12,6 +12,13 @@ namespace kernel::mm {
 class VSpace;
 }
 
+namespace kernel {
+class Vproc;
+namespace ipc {
+class Tunnel;
+}
+}
+
 namespace kernel::cap {
 
 struct MemoryAuthority final {
@@ -104,6 +111,34 @@ private:
     kernel::mm::RegionKey parent_{};
     kernel::mm::RegionKey child_{};
     kernel::mm::VirtRange range_{};
+};
+
+// Closed proof for the one semantic derivation that changes a Tunnel grant
+// from receiver-issued Connect authority into source-bound Tx authority.
+// Generic GrantGraph::derive remains strict rights attenuation.
+class TunnelConnectProof final {
+public:
+    [[nodiscard]] auto tunnel() const noexcept -> const kernel::ipc::Tunnel* {
+        return tunnel_;
+    }
+    [[nodiscard]] auto source() const noexcept -> const kernel::Vproc* {
+        return source_;
+    }
+    [[nodiscard]] auto claim() const noexcept -> u64 { return claim_; }
+
+private:
+    friend class kernel::ipc::Tunnel;
+    friend class GrantGraph;
+
+    constexpr TunnelConnectProof(
+        const kernel::ipc::Tunnel& tunnel,
+        const kernel::Vproc& source,
+        u64 claim) noexcept
+        : tunnel_(&tunnel), source_(&source), claim_(claim) {}
+
+    const kernel::ipc::Tunnel* tunnel_{};
+    const kernel::Vproc* source_{};
+    u64 claim_{};
 };
 
 } // namespace kernel::cap

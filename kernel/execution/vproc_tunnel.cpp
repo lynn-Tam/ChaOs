@@ -10,7 +10,7 @@
 namespace kernel {
 
 auto Vproc::attach_tunnel_source(ipc::TunnelLink& link) noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{tunnel_lock_};
+    kernel::sync::IrqLockGuard guard{state_lock_};
     if (tunnel_admission_closed_ || link.hook.is_linked()) {
         return false;
     }
@@ -25,7 +25,7 @@ auto Vproc::attach_tunnel_target(
     if (slot >= MYOS_VPROC_MAX_INGRESS) {
         return libk::nullopt;
     }
-    kernel::sync::IrqLockGuard guard{tunnel_lock_};
+    kernel::sync::IrqLockGuard guard{state_lock_};
     IngressSlot& ingress = ingresses_[slot];
     if (tunnel_admission_closed_ || ingress.link != nullptr
         || ingress.binding_generation == libk::numeric_limits<u64>::max()) {
@@ -34,13 +34,13 @@ auto Vproc::attach_tunnel_target(
     ++ingress.binding_generation;
     KASSERT(ingress.binding_generation != 0);
     ingress.link = &link;
-    ingress.delivery_generation = 0;
+    ingress.signal_sequence = 0;
     ingress.tag = tag;
     return ingress.binding_generation;
 }
 
 void Vproc::detach_tunnel_source(ipc::TunnelLink& link) noexcept {
-    kernel::sync::IrqLockGuard guard{tunnel_lock_};
+    kernel::sync::IrqLockGuard guard{state_lock_};
     if (link.hook.is_linked()) {
         outgoing_tunnels_.erase(link);
     }
@@ -53,15 +53,14 @@ void Vproc::detach_tunnel_target(
     if (slot >= MYOS_VPROC_MAX_INGRESS) {
         return;
     }
-    kernel::sync::IrqLockGuard tunnel_guard{tunnel_lock_};
+    kernel::sync::IrqLockGuard guard{state_lock_};
     IngressSlot& ingress = ingresses_[slot];
     if (ingress.link != &link
         || ingress.binding_generation != binding_generation) {
         return;
     }
-    kernel::sync::IrqLockGuard operation_guard{operation_lock_};
     ingress.link = nullptr;
-    ingress.delivery_generation = 0;
+    ingress.signal_sequence = 0;
     ingress.tag = 0;
     ingress_mask_ &= ~(u64{1} << slot);
     if (runtime_.events != nullptr) {
@@ -70,7 +69,7 @@ void Vproc::detach_tunnel_target(
             ~(u64{1} << slot),
             __ATOMIC_RELEASE);
         __atomic_store_n(
-            &runtime_.events->ingress_generation[slot],
+            &runtime_.events->ingress_sequence[slot],
             0,
             __ATOMIC_RELEASE);
         __atomic_store_n(
@@ -82,31 +81,31 @@ void Vproc::publish_tunnel(
     ipc::TunnelLink& link,
     usize slot,
     u64 binding_generation,
-    u64 delivery_generation,
+    u64 signal_sequence,
     usize tag,
     CpuRegistry& cpus) noexcept {
     if (slot >= MYOS_VPROC_MAX_INGRESS) {
         return;
     }
     {
-        kernel::sync::IrqLockGuard tunnel_guard{tunnel_lock_};
+        kernel::sync::IrqLockGuard guard{state_lock_};
         IngressSlot& ingress = ingresses_[slot];
         if (ingress.link != &link
             || ingress.binding_generation != binding_generation
             || ingress.tag != tag) {
             return;
         }
-        kernel::sync::IrqLockGuard operation_guard{operation_lock_};
-        ingress.delivery_generation = delivery_generation;
-        const u64 bit = u64{1} << slot;
-        if ((ingress_mask_ & bit) == 0) {
-            ++pending_sequence_;
-            KASSERT(pending_sequence_ != 0);
+        if (signal_sequence <= ingress.signal_sequence) {
+            return;
         }
+        ingress.signal_sequence = signal_sequence;
+        const u64 bit = u64{1} << slot;
+        ++pending_sequence_;
+        KASSERT(pending_sequence_ != 0);
         ingress_mask_ |= bit;
         __atomic_store_n(
-            &runtime_.events->ingress_generation[slot],
-            delivery_generation,
+            &runtime_.events->ingress_sequence[slot],
+            signal_sequence,
             __ATOMIC_RELEASE);
         __atomic_store_n(
             &runtime_.events->ingress_tag[slot], tag, __ATOMIC_RELEASE);
@@ -129,32 +128,31 @@ void Vproc::clear_tunnel(
     ipc::TunnelLink& link,
     usize slot,
     u64 binding_generation,
-    u64 delivery_generation) noexcept {
+    u64 signal_sequence) noexcept {
     if (slot >= MYOS_VPROC_MAX_INGRESS) {
         return;
     }
-    kernel::sync::IrqLockGuard tunnel_guard{tunnel_lock_};
+    kernel::sync::IrqLockGuard guard{state_lock_};
     IngressSlot& ingress = ingresses_[slot];
     if (ingress.link != &link
         || ingress.binding_generation != binding_generation
-        || ingress.delivery_generation > delivery_generation) {
+        || ingress.signal_sequence != signal_sequence) {
         return;
     }
-    kernel::sync::IrqLockGuard operation_guard{operation_lock_};
-    ingress.delivery_generation = 0;
+    ingress.signal_sequence = 0;
     const u64 bit = u64{1} << slot;
     ingress_mask_ &= ~bit;
     __atomic_fetch_and(
         &runtime_.events->ingress_mask, ~bit, __ATOMIC_RELEASE);
     __atomic_store_n(
-        &runtime_.events->ingress_generation[slot], 0, __ATOMIC_RELEASE);
+        &runtime_.events->ingress_sequence[slot], 0, __ATOMIC_RELEASE);
 }
 
 void Vproc::close_tunnels() noexcept {
     for (;;) {
         ipc::Tunnel* tunnel{};
         {
-            kernel::sync::IrqLockGuard guard{tunnel_lock_};
+            kernel::sync::IrqLockGuard guard{state_lock_};
             if (!outgoing_tunnels_.empty()) {
                 tunnel = outgoing_tunnels_.front().tunnel;
             } else {

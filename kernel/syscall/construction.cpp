@@ -16,6 +16,7 @@
 #include <object/object_store.hpp>
 #include <resource/traits.hpp>
 #include <sched/context.hpp>
+#include <sched/binding.hpp>
 #include <sched/domain.hpp>
 #include <thread/thread.hpp>
 #include <uapi/syscall.h>
@@ -271,7 +272,6 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         cap::Right::Delegate,
         cap::Right::Inspect,
         cap::Right::Control,
-        cap::Right::Bind,
         cap::Right::Destroy,
         cap::Right::Revoke);
 }
@@ -502,58 +502,6 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         });
 }
 
-template<typename Descriptor>
-[[nodiscard]] auto read_snapshot(
-    Invocation& invocation,
-    cap::CapHandle handle,
-    usize offset) noexcept -> libk::Expected<Descriptor, myos_status_t> {
-    auto resolved = invocation.cspace.resolve<kernel::mm::MemoryObject>(
-        handle, cap::Rights::of(cap::Right::Inspect));
-    if (!resolved) {
-        return libk::unexpected(cap_status(resolved.error()));
-    }
-    auto& source = resolved.value();
-    const cap::EffectiveAuthority effective = source.authority();
-    const auto* const authority = libk::get_if<cap::MemoryAuthority>(
-        &effective.data);
-    const auto end = libk::checked_add(offset, sizeof(Descriptor));
-    if (authority == nullptr || !end
-        || !authority->access.contains(kernel::mm::Access::Read)) {
-        return libk::unexpected(MYOS_STATUS_DENIED);
-    }
-    const auto rounded = libk::checked_add(
-        *end, kernel::mm::page_size - 1);
-    if (!rounded) {
-        return libk::unexpected(MYOS_STATUS_BAD_ARGS);
-    }
-    const usize first = offset / kernel::mm::page_size;
-    const usize last = *rounded / kernel::mm::page_size;
-    if (!authority->range.contains(kernel::mm::ObjectRange{
-            first, last - first})) {
-        return libk::unexpected(MYOS_STATUS_DENIED);
-    }
-
-    Descriptor descriptor{};
-    auto read = source->read(
-        offset,
-        libk::Span<byte>{
-            reinterpret_cast<byte*>(&descriptor), sizeof(descriptor)});
-    if (!read) {
-        switch (read.error()) {
-        case kernel::mm::MemoryError::OutOfMemory:
-        case kernel::mm::MemoryError::ResourceExhausted:
-            return libk::unexpected(MYOS_STATUS_NO_MEMORY);
-        case kernel::mm::MemoryError::BackingFailed:
-            return libk::unexpected(MYOS_STATUS_BACKING_FAILED);
-        case kernel::mm::MemoryError::Busy:
-            return libk::unexpected(MYOS_STATUS_BUSY);
-        default:
-            return libk::unexpected(MYOS_STATUS_BAD_ARGS);
-        }
-    }
-    return libk::expected(descriptor);
-}
-
 [[nodiscard]] auto start_snapshot(
     Invocation& invocation,
     cap::CapHandle handle,
@@ -779,7 +727,6 @@ template<typename Descriptor>
                 cap::Right::Inspect,
                 cap::Right::Signal,
                 cap::Right::Wait,
-                cap::Right::Bind,
                 cap::Right::Destroy,
                 cap::Right::Revoke);
             const cap::NotificationAuthority authority{badge};
@@ -789,27 +736,35 @@ template<typename Descriptor>
         });
 }
 
-[[gnu::noinline]] [[nodiscard]] auto create_tunnel(
+[[gnu::noinline]] [[nodiscard]] auto open_tunnel(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
     KASSERT(kernel != nullptr);
-    auto pool = resolve_pool(invocation, cap::Right::Create);
-    auto source = invocation.cspace.resolve<kernel::Vproc>(
-        handle_of(invocation.trap.arg(1)), cap::Rights::of(cap::Right::Bind));
-    auto target = invocation.cspace.resolve<kernel::Vproc>(
-        handle_of(invocation.trap.arg(2)), cap::Rights::of(cap::Right::Bind));
-    const usize slot = invocation.trap.arg(3);
-    const usize tag = invocation.trap.arg(4);
-    if (!pool || !source || !target) {
-        const cap::CSpaceError error = !pool
-            ? pool.error()
-            : !source ? source.error() : target.error();
-        return returned(cap_status(error));
+    Vproc* const target = invocation.target.vproc();
+    if (target == nullptr) {
+        return returned(MYOS_STATUS_DENIED);
     }
-    if (&source.value().object() == &target.value().object()
-        || slot >= MYOS_VPROC_MAX_INGRESS
-        || invocation.trap.arg(5) != MYOS_TUNNEL_FLAGS_NONE) {
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    if (!pool) {
+        return returned(cap_status(pool.error()));
+    }
+    const usize slot = invocation.trap.arg(1);
+    const usize tag = invocation.trap.arg(2);
+    if (slot >= MYOS_VPROC_MAX_INGRESS
+        || invocation.trap.arg(3) != MYOS_TUNNEL_FLAGS_NONE) {
         return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    sched::Binding* const binding = target->binding();
+    if (binding == nullptr) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto reference = binding->target_reference();
+    if (!reference) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto hold = libk::move(reference).value().into_hold<kernel::Vproc>();
+    if (!hold) {
+        return returned(MYOS_STATUS_BUSY);
     }
     return construct_with<kernel::ipc::Tunnel>(
         invocation,
@@ -820,13 +775,12 @@ template<typename Descriptor>
             return kernel->objects().create_tunnel_sponsored(
                 libk::move(sponsorship),
                 kernel->cpus(),
-                source.value().object(),
-                target.value().object(),
+                libk::move(hold).value(),
                 slot,
                 tag);
         },
         [&](kernel::ipc::Tunnel& tunnel) noexcept -> myos_status_t {
-            return tunnel.authorize(source.value(), target.value())
+            return tunnel.open()
                 ? MYOS_STATUS_OK
                 : MYOS_STATUS_BUSY;
         },
@@ -835,8 +789,8 @@ template<typename Descriptor>
                 cap::Right::Duplicate,
                 cap::Right::Delegate,
                 cap::Right::Inspect,
-                cap::Right::Signal,
-                cap::Right::Wait,
+                cap::Right::Ack,
+                cap::Right::Connect,
                 cap::Right::Close,
                 cap::Right::Destroy,
                 cap::Right::Revoke);
@@ -997,8 +951,8 @@ auto handle_construction(
         return create_notification(invocation);
     case MYOS_SYS_VPROC_CREATE:
         return create_vproc(invocation);
-    case MYOS_SYS_TUNNEL_CREATE:
-        return create_tunnel(invocation);
+    case MYOS_SYS_TUNNEL_OPEN:
+        return open_tunnel(invocation);
     default:
         break;
     }

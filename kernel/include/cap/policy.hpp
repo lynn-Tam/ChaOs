@@ -62,13 +62,14 @@ template<>
 struct CapabilityPolicy<object::ObjectKind::Vproc> final
     : RightsPolicy<
           Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control,
-          Right::Bind, Right::Destroy, Right::Revoke> {};
+          Right::Destroy, Right::Revoke> {};
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Tunnel> final
     : RightsPolicy<
           Right::Duplicate, Right::Delegate, Right::Inspect, Right::Signal,
-          Right::Wait, Right::Close, Right::Destroy, Right::Revoke> {};
+          Right::Connect, Right::Ack, Right::Close, Right::Destroy,
+          Right::Revoke> {};
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::SchedulingContext> final

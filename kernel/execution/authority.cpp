@@ -22,6 +22,8 @@ Authority::Authority(Thread& thread) noexcept
       cspace_(*this, ops_),
       control_(*this, ops_),
       events_(*this, ops_),
+      code_(*this, ops_),
+      stack_(*this, ops_),
       stop_(Stop::Notifier::bind<&Authority::stopped>(*this)) {}
 
 Authority::Authority(Vproc& vproc) noexcept
@@ -30,6 +32,8 @@ Authority::Authority(Vproc& vproc) noexcept
       cspace_(*this, ops_),
       control_(*this, ops_),
       events_(*this, ops_),
+      code_(*this, ops_),
+      stack_(*this, ops_),
       stop_(Stop::Notifier::bind<&Authority::stopped>(*this)) {}
 
 Authority::~Authority() noexcept {
@@ -76,11 +80,62 @@ auto Authority::attach_runtime(
     return libk::expected();
 }
 
+auto Authority::attach_arm(
+    const cap::Resolved<kernel::mm::MemoryObject>& code,
+    const cap::Resolved<kernel::mm::MemoryObject>& stack) noexcept
+    -> libk::Expected<void, cap::GrantError> {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!vspace_.attachment.attached() || !cspace_.attachment.attached()
+            || !control_.attachment.attached()
+            || !events_.attachment.attached()
+            || code_.attachment.attached() || stack_.attachment.attached()
+            || arm_attaching_ || start_armed_ || stop_.started() || ended_) {
+            return libk::unexpected(cap::GrantError::InvalidState);
+        }
+        arm_attaching_ = true;
+    }
+
+    auto attached = code.attach(code_.attachment);
+    if (attached) {
+        attached = stack.attach(stack_.attachment);
+    }
+
+    bool accepted{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(arm_attaching_);
+        arm_attaching_ = false;
+        accepted = attached && !ended_ && !start_armed_ && !stop_.started();
+    }
+    if (!attached || !accepted) {
+        detach_arm();
+    }
+    if (!attached) {
+        return attached;
+    }
+    if (!accepted) {
+        return libk::unexpected(cap::GrantError::InvalidState);
+    }
+    return libk::expected();
+}
+
+void Authority::detach_arm() noexcept {
+    if (code_.attachment.attached()) {
+        static_cast<void>(code_.attachment.detach());
+    }
+    if (stack_.attachment.attached()) {
+        static_cast<void>(stack_.attachment.detach());
+    }
+}
+
 auto Authority::active() const noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
     const auto live = [](const Link& link) noexcept {
         return link.attachment.attached() || link.attachment.busy();
     };
-    return live(vspace_) || live(cspace_) || live(control_) || live(events_);
+    return arm_attaching_ || live(vspace_) || live(cspace_) || live(control_)
+        || live(events_) || live(code_) || live(stack_);
 }
 
 void Authority::invalidate(
@@ -141,7 +196,8 @@ void Authority::target_stopped() noexcept {
         }
         ended_ = true;
     }
-    Link* const links[] = {&vspace_, &cspace_, &control_, &events_};
+    Link* const links[] = {
+        &vspace_, &cspace_, &control_, &events_, &code_, &stack_};
     for (Link* const link : links) {
         if (link->attachment.attached()) {
             static_cast<void>(link->attachment.detach());
@@ -164,6 +220,7 @@ void Authority::drain(Link& link) noexcept {
 void Authority::reset() noexcept {
     target_stopped();
     KASSERT(!stop_.started() || stop_.complete());
+    KASSERT(!arm_attaching_);
     KASSERT(!start_armed_);
 }
 

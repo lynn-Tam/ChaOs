@@ -17,18 +17,14 @@ public:
     void remove(Binding& binding, Urgency urgency) noexcept {
         ready_.remove(binding, urgency);
     }
-    [[nodiscard]] auto select() noexcept -> DispatchCandidate {
-        return DispatchCandidate{ready_.front()};
-    }
-    [[nodiscard]] auto select_activation() noexcept -> DispatchCandidate {
-        return DispatchCandidate{ready_.activation_front()};
-    }
+    [[nodiscard]] auto select() noexcept -> DispatchCandidate;
     [[nodiscard]] auto ready_count() const noexcept -> usize {
         return ready_.size();
     }
 
 private:
     ReadyQueue ready_{};
+    bool activation_turn_used_{};
 };
 
 } // namespace kernel::sched

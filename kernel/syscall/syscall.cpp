@@ -45,7 +45,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_VM_DESTROY_REGION) {
         outcome = handle_vm(operation, invocation);
     } else if (operation >= MYOS_SYS_RESOURCE_CREATE_CHILD
-        && operation <= MYOS_SYS_TUNNEL_CREATE) {
+        && operation <= MYOS_SYS_TUNNEL_OPEN) {
         outcome = handle_construction(operation, invocation);
     } else if (operation >= MYOS_SYS_MEMORY_SEAL
         && operation <= MYOS_SYS_RESOURCE_CLOSE) {
@@ -53,10 +53,10 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_NOTIFICATION_SIGNAL
         && operation <= MYOS_SYS_NOTIFICATION_WAIT) {
         outcome = handle_notification(operation, invocation);
-    } else if (operation >= MYOS_SYS_VPROC_RETURN
+    } else if (operation >= MYOS_SYS_VPROC_ARM
         && operation <= MYOS_SYS_OPERATION_TAKE) {
         outcome = handle_vproc(operation, invocation);
-    } else if (operation >= MYOS_SYS_TUNNEL_INVOKE
+    } else if (operation >= MYOS_SYS_TUNNEL_CONNECT
         && operation <= MYOS_SYS_TUNNEL_CLOSE) {
         outcome = handle_tunnel(operation, invocation);
     } else {

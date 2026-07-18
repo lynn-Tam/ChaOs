@@ -133,6 +133,25 @@ auto CSpace::reserve_grant() noexcept
     return libk::expected(libk::move(charged).value());
 }
 
+auto CSpace::reserve_derivation() noexcept
+    -> libk::Expected<DerivationReservation, CSpaceError> {
+    // User-visible semantic derivation must never create an uncharged Grant.
+    // Kernel bootstrap uses the lower-level construction path explicitly.
+    if (sponsor_ == nullptr) {
+        return libk::unexpected(CSpaceError::ResourceExhausted);
+    }
+    auto slot = reserve();
+    if (!slot) {
+        return libk::unexpected(slot.error());
+    }
+    auto grant = reserve_grant();
+    if (!grant) {
+        return libk::unexpected(grant.error());
+    }
+    return libk::expected(DerivationReservation{
+        libk::move(slot).value(), libk::move(grant).value()});
+}
+
 auto CSpace::insert(
     GrantRef&& grant,
     CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {

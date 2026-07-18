@@ -4,6 +4,7 @@
 #include <cap/cspace.hpp>
 #include <core/types.hpp>
 #include <libk/optional.hpp>
+#include <libk/span.hpp>
 #include <mm/vspace.hpp>
 #include <execution/target.hpp>
 #include <syscall/syscall.hpp>
@@ -38,6 +39,30 @@ struct Result final {
 
 [[nodiscard]] auto cap_status(cap::CSpaceError error) noexcept
     -> myos_status_t;
+
+[[nodiscard]] auto read_snapshot_bytes(
+    Invocation& invocation,
+    cap::CapHandle handle,
+    usize offset,
+    libk::Span<byte> destination) noexcept
+    -> libk::Expected<void, myos_status_t>;
+
+template<typename Descriptor>
+[[nodiscard]] auto read_snapshot(
+    Invocation& invocation,
+    cap::CapHandle handle,
+    usize offset) noexcept -> libk::Expected<Descriptor, myos_status_t> {
+    Descriptor descriptor{};
+    auto read = read_snapshot_bytes(
+        invocation,
+        handle,
+        offset,
+        libk::Span<byte>{reinterpret_cast<byte*>(&descriptor), sizeof(descriptor)});
+    if (!read) {
+        return libk::unexpected(read.error());
+    }
+    return libk::expected(descriptor);
+}
 [[nodiscard]] auto vm_status(kernel::mm::VSpaceError error) noexcept
     -> myos_status_t;
 [[nodiscard]] auto operation_status(kernel::mm::VmStatus status) noexcept

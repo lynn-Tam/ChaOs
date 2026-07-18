@@ -57,16 +57,20 @@ void RemoteQueue::complete(RemoteRequest& request) noexcept {
     request.pending_ = false;
 }
 
-void RemoteQueue::cancel(RemoteRequest& request) noexcept {
+auto RemoteQueue::cancel(RemoteRequest& request) noexcept -> RemoteCancel {
     kernel::sync::IrqLockGuard guard{lock_};
-    if (!request.pending_ || !request.hook_.is_linked()) {
-        return;
+    if (!request.pending_) {
+        return RemoteCancel::NotPending;
+    }
+    if (!request.hook_.is_linked()) {
+        return RemoteCancel::AlreadyClaimed;
     }
     queue_.erase(request);
     request.pending_ = false;
     if (queue_.empty()) {
         delivery_.consume();
     }
+    return RemoteCancel::CanceledQueued;
 }
 
 auto RemoteQueue::size() const noexcept -> usize {

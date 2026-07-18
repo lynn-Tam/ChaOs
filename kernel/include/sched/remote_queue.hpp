@@ -15,6 +15,12 @@ enum class RemoteKind : u8 {
     Stop,
 };
 
+enum class RemoteCancel : u8 {
+    CanceledQueued,
+    AlreadyClaimed,
+    NotPending,
+};
+
 // Embedded in the state owner whose home CPU must commit a remote request.
 // The pending bit spans queued and consumed work so producers can coalesce an
 // edge without reusing an intrusive hook that the dispatcher still owns.
@@ -53,7 +59,8 @@ public:
     void transport_failed(kernel::IpiDelivery::Token token) noexcept;
     [[nodiscard]] auto take() noexcept -> RemoteRequest*;
     void complete(RemoteRequest& request) noexcept;
-    void cancel(RemoteRequest& request) noexcept;
+    [[nodiscard]] auto cancel(RemoteRequest& request) noexcept
+        -> RemoteCancel;
     [[nodiscard]] auto size() const noexcept -> usize;
 
 private:

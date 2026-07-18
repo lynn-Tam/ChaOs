@@ -10,6 +10,7 @@
 #include <libk/inplace_vector.hpp>
 #include <libk/limits.hpp>
 #include <libk/optional.hpp>
+#include <libk/scope_guard.hpp>
 #include <libk/sync/atomic.hpp>
 #include <libk/utility.hpp>
 #include <libk/variant.hpp>
@@ -694,6 +695,25 @@ bool test_intrusive_tree_order_and_removal(const TestContext&) noexcept {
     return tree.size() == 0;
 }
 
+bool test_scope_exit_runs_once_and_can_release(const TestContext&) noexcept {
+    int calls{};
+    {
+        auto guard = libk::on_scope_exit([&calls]() noexcept { ++calls; });
+        auto moved = libk::move(guard);
+        static_cast<void>(moved);
+    }
+    if (calls != 1) {
+        return false;
+    }
+    {
+        auto guard = libk::on_scope_exit([&calls]() noexcept { ++calls; });
+        if (!guard.release() || guard.release()) {
+            return false;
+        }
+    }
+    return calls == 1;
+}
+
 } // namespace
 
 void register_libk_tests(TestRegistry& registry) noexcept {
@@ -753,4 +773,8 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         "libk",
         "intrusive AVL tree preserves ordered unique membership",
         test_intrusive_tree_order_and_removal);
+    (void)registry.add(
+        "libk",
+        "scope exit runs rollback once and supports explicit commit",
+        test_scope_exit_runs_once_and_can_release);
 }

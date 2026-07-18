@@ -6,6 +6,7 @@
 
 #define MYOS_VPROC_START_VERSION 1U
 #define MYOS_VPROC_RUNTIME_VERSION 1U
+#define MYOS_VPROC_ARM_VERSION 1U
 #define MYOS_VPROC_CONTEXT_WORDS 32U
 #define MYOS_VPROC_MAX_OPERATIONS 32U
 #define MYOS_VPROC_MAX_INGRESS 4U
@@ -40,6 +41,24 @@ struct myos_vproc_start {
     myos_word_t event_address;
 };
 
+// Submitted by the current Vproc after bootstrap has initialized its runtime.
+// The first implementation accepts one resident code page and one resident
+// stack page; the range fields keep the ABI explicit and extensible.
+struct myos_vproc_arm {
+    uint32_t version;
+    uint32_t flags;
+    myos_word_t entry;
+    myos_cap_t code_memory;
+    myos_word_t code_page;
+    myos_word_t code_address;
+    myos_word_t code_pages;
+    myos_cap_t stack_memory;
+    myos_word_t stack_page;
+    myos_word_t stack_address;
+    myos_word_t stack_pages;
+    myos_word_t stack_top;
+};
+
 // User-writable protocol page.  Atomic words are accessed with the acquire /
 // release rules documented by the Vproc ABI; none of these fields is trusted
 // as kernel-owned state.
@@ -62,7 +81,7 @@ struct myos_vproc_event_page {
     myos_word_t active_generation;
     uint64_t ready_mask;
     uint64_t ingress_mask;
-    uint64_t ingress_generation[MYOS_VPROC_MAX_INGRESS];
+    uint64_t ingress_sequence[MYOS_VPROC_MAX_INGRESS];
     myos_word_t ingress_tag[MYOS_VPROC_MAX_INGRESS];
     struct myos_user_context delivered;
 };

@@ -20,14 +20,20 @@ inline constexpr myos_word_t NotificationSlot = 8;
 inline constexpr myos_word_t VprocNotificationSlot = 9;
 inline constexpr myos_word_t VprocKeySlot = 10;
 inline constexpr myos_word_t VprocStateSlot = 11;
-inline constexpr myos_word_t TunnelSignalSlot = 12;
-inline constexpr myos_word_t TunnelWaitSlot = 13;
+inline constexpr myos_word_t PoolSlot = 12;
+inline constexpr myos_word_t CSpaceSlot = 13;
 inline constexpr myos_word_t TunnelSourceStateSlot = 14;
 inline constexpr myos_word_t TunnelTargetStateSlot = 15;
-inline constexpr myos_word_t TunnelSourceGenerationSlot = 16;
-inline constexpr myos_word_t TunnelTargetGenerationSlot = 17;
+inline constexpr myos_word_t TunnelSourceSequenceSlot = 16;
+inline constexpr myos_word_t TunnelTargetSequenceSlot = 17;
 inline constexpr myos_word_t TunnelHeartbeatSlot = 18;
+inline constexpr myos_word_t TunnelAdminSlot = 19;
+inline constexpr myos_word_t TunnelConnectSlot = 20;
+inline constexpr myos_word_t TunnelTxSlot = 21;
 inline constexpr myos_word_t SharedWords = 32;
+
+inline constexpr myos_word_t ArmDescriptorOffset = 512;
+inline constexpr myos_word_t ArmDescriptorStride = 128;
 
 inline constexpr myos_word_t NotificationBadge = 1U << 5;
 inline constexpr myos_word_t VprocBadge = 1U << 6;

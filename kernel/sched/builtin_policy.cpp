@@ -25,25 +25,32 @@ void ReadyQueue::remove(Binding& binding, Urgency urgency) noexcept {
     }
 }
 
-auto ReadyQueue::front() noexcept -> Binding* {
+auto ReadyQueue::front(bool prefer_activation) noexcept -> Binding* {
     if (bitmap_ == 0) {
         return nullptr;
     }
     const usize level =
         (sizeof(u32) * 8 - 1) - libk::countl_zero(bitmap_);
     KASSERT(level < Urgency::level_count);
+    // Activation is only a tie-breaker inside the highest effective urgency
+    // level. Once the policy has consumed its streak, prefer an ordinary
+    // peer so a producer cannot turn repeated signals into starvation.
+    for (Binding& binding : levels_[level]) {
+        if (binding.activation_credit_ == prefer_activation) {
+            return &binding;
+        }
+    }
     return &levels_[level].front();
 }
 
-auto ReadyQueue::activation_front() noexcept -> Binding* {
-    for (usize level = Urgency::level_count; level != 0; --level) {
-        for (Binding& binding : levels_[level - 1]) {
-            if (binding.activation_credit_) {
-                return &binding;
-            }
-        }
+auto BuiltinPolicy::select() noexcept -> DispatchCandidate {
+    Binding* const candidate = ready_.front(!activation_turn_used_);
+    if (candidate == nullptr) {
+        activation_turn_used_ = false;
+    } else {
+        activation_turn_used_ = candidate->activation_credit_;
     }
-    return nullptr;
+    return DispatchCandidate{candidate};
 }
 
 auto ReadyQueue::pop_front(Urgency urgency) noexcept -> Binding* {

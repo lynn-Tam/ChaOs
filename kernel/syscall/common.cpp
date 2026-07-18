@@ -1,8 +1,11 @@
+#include <object/memory_pool.hpp>
+
 #include "kernel/syscall/internal.hpp"
 
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <libk/checked_arithmetic.hpp>
 #include <libk/limits.hpp>
 
 namespace kernel::syscall {
@@ -28,6 +31,55 @@ auto cap_status(cap::CSpaceError error) noexcept -> myos_status_t {
         return MYOS_STATUS_BUSY;
     }
     return MYOS_STATUS_INTERNAL;
+}
+
+auto read_snapshot_bytes(
+    Invocation& invocation,
+    cap::CapHandle handle,
+    usize offset,
+    libk::Span<byte> destination) noexcept
+    -> libk::Expected<void, myos_status_t> {
+    auto resolved = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+        handle, cap::Rights::of(cap::Right::Inspect));
+    if (!resolved) {
+        return libk::unexpected(cap_status(resolved.error()));
+    }
+    auto& source = resolved.value();
+    const cap::EffectiveAuthority effective = source.authority();
+    const auto* const authority = libk::get_if<cap::MemoryAuthority>(
+        &effective.data);
+    const auto end = libk::checked_add(offset, destination.size());
+    if (authority == nullptr || !end
+        || !authority->access.contains(kernel::mm::Access::Read)) {
+        return libk::unexpected(MYOS_STATUS_DENIED);
+    }
+    const auto rounded = libk::checked_add(
+        *end, kernel::mm::page_size - 1);
+    if (!rounded) {
+        return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+    }
+    const usize first = offset / kernel::mm::page_size;
+    const usize last = *rounded / kernel::mm::page_size;
+    if (!authority->range.contains(kernel::mm::ObjectRange{
+            first, last - first})) {
+        return libk::unexpected(MYOS_STATUS_DENIED);
+    }
+
+    auto read = source->read(offset, destination);
+    if (read) {
+        return libk::expected();
+    }
+    switch (read.error()) {
+    case kernel::mm::MemoryError::OutOfMemory:
+    case kernel::mm::MemoryError::ResourceExhausted:
+        return libk::unexpected(MYOS_STATUS_NO_MEMORY);
+    case kernel::mm::MemoryError::BackingFailed:
+        return libk::unexpected(MYOS_STATUS_BACKING_FAILED);
+    case kernel::mm::MemoryError::Busy:
+        return libk::unexpected(MYOS_STATUS_BUSY);
+    default:
+        return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+    }
 }
 
 auto vm_status(kernel::mm::VSpaceError error) noexcept -> myos_status_t {

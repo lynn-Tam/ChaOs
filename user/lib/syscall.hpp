@@ -189,24 +189,32 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_VPROC_RETURN, generation);
 }
 
-[[nodiscard]] inline auto vproc_poll() noexcept -> SysResult {
-    return syscall(MYOS_SYS_VPROC_POLL);
+[[nodiscard]] inline auto vproc_arm(
+    myos_cap_t descriptor_memory,
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_VPROC_ARM, descriptor_memory, descriptor_offset);
 }
 
-[[nodiscard]] inline auto tunnel_create(
+[[nodiscard]] inline auto vproc_checkpoint() noexcept -> SysResult {
+    return syscall(MYOS_SYS_VPROC_CHECKPOINT);
+}
+
+[[nodiscard]] inline auto tunnel_open(
     myos_cap_t pool,
-    myos_cap_t source,
-    myos_cap_t target,
     myos_word_t slot,
     myos_word_t tag) noexcept -> SysResult {
     return syscall(
-        MYOS_SYS_TUNNEL_CREATE,
+        MYOS_SYS_TUNNEL_OPEN,
         pool,
-        source,
-        target,
         slot,
         tag,
         MYOS_TUNNEL_FLAGS_NONE);
+}
+
+[[nodiscard]] inline auto tunnel_connect(myos_cap_t connect) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_TUNNEL_CONNECT, connect);
 }
 
 [[nodiscard]] inline auto tunnel_invoke(myos_cap_t tunnel) noexcept
@@ -214,9 +222,11 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_TUNNEL_INVOKE, tunnel);
 }
 
-[[nodiscard]] inline auto tunnel_take(myos_cap_t tunnel) noexcept
+[[nodiscard]] inline auto tunnel_ack(
+    myos_cap_t tunnel,
+    myos_word_t observed_sequence) noexcept
     -> SysResult {
-    return syscall(MYOS_SYS_TUNNEL_TAKE, tunnel);
+    return syscall(MYOS_SYS_TUNNEL_ACK, tunnel, observed_sequence);
 }
 
 [[nodiscard]] inline auto tunnel_close(myos_cap_t tunnel) noexcept

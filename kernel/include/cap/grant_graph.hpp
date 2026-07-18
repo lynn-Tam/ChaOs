@@ -61,6 +61,13 @@ public:
         GrantCeiling ceiling,
         RegionDerivation proof) noexcept
         -> libk::Expected<GrantRef, GrantError>;
+    [[nodiscard]] auto derive_tunnel_tx(
+        kernel::resource::Reservation&& charge,
+        const GrantLease& source,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling,
+        TunnelConnectProof proof) noexcept
+        -> libk::Expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto ref(GrantKey key) noexcept
         -> libk::Expected<GrantRef, GrantError>;

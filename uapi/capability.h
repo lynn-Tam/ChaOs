@@ -26,4 +26,5 @@ typedef uint64_t myos_cap_t;
 #define MYOS_RIGHT_CLOSE         (MYOS_U64_C(1) << 14)
 #define MYOS_RIGHT_SIGNAL        (MYOS_U64_C(1) << 15)
 #define MYOS_RIGHT_WAIT          (MYOS_U64_C(1) << 16)
-#define MYOS_RIGHT_BIND          (MYOS_U64_C(1) << 17)
+#define MYOS_RIGHT_CONNECT       (MYOS_U64_C(1) << 17)
+#define MYOS_RIGHT_ACK           (MYOS_U64_C(1) << 18)

@@ -41,7 +41,6 @@ constexpr Rights notification_rights = Rights::of(
     Right::Inspect,
     Right::Signal,
     Right::Wait,
-    Right::Bind,
     Right::Destroy,
     Right::Revoke);
 

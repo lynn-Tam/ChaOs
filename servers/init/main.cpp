@@ -15,7 +15,7 @@ constexpr myos_word_t StackSize = 4 * PageSize;
 constexpr myos_word_t ChildMemory = 16 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
-constexpr myos_word_t MaxStacks = MaxThreads + 2 * VprocCount;
+constexpr myos_word_t MaxStacks = MaxThreads + 3 * VprocCount;
 constexpr myos_word_t VprocDescriptorOffset = 512;
 constexpr myos_word_t VprocDescriptorStride = 256;
 constexpr myos_word_t SuccessFault = 0xe100;
@@ -128,6 +128,7 @@ public:
             || proof.segment_count() > MaxSegments) {
             return false;
         }
+        entry_ = proof.entry();
 
         myos_word_t scratch_size{};
         for (myos_word_t index = 0; index < proof.segment_count(); ++index) {
@@ -358,6 +359,13 @@ private:
             return false;
         }
 
+        if (executable && entry_ >= segment.address
+            && entry_ - segment.address < size) {
+            code_memory_ = memory;
+            code_address_ = segment.address;
+            code_size_ = size;
+        }
+
         myos_cap_t region{};
         if (!make_region(
                 child_vspace_, segment.address, size, segment.access,
@@ -403,7 +411,7 @@ private:
     }
 
     [[nodiscard]] auto make_stacks() noexcept -> bool {
-        const myos_word_t count = thread_count_ + 2 * VprocCount;
+        const myos_word_t count = thread_count_ + 3 * VprocCount;
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -419,6 +427,8 @@ private:
                     MYOS_VM_READ | MYOS_VM_WRITE)) {
                 return false;
             }
+            stack_memory_[index] = memory;
+            stack_bases_[index] = address;
             stack_tops_[index] = address + StackSize;
         }
         return true;
@@ -521,7 +531,6 @@ private:
     [[nodiscard]] auto make_executions(myos_word_t entry) noexcept -> bool {
         stage_ = 110;
         myos_cap_t targets[MaxThreads + VprocCount]{};
-        myos_cap_t vprocs[VprocCount]{};
         myos_cap_t descriptors{};
         if (!create_memory(
                 PageSize, MYOS_VM_READ | MYOS_VM_WRITE, descriptors)
@@ -530,6 +539,40 @@ private:
                 MYOS_VM_READ | MYOS_VM_WRITE)) {
             return false;
         }
+
+        const auto child_pool = myos::cap_delegate(
+            pool_, child_cspace_, MYOS_RIGHT_CREATE);
+        const auto child_cspace = myos::cap_delegate(
+            child_cspace_, child_cspace_, MYOS_RIGHT_MANAGE);
+        const auto arm_memory = myos::cap_delegate(
+            shared_memory_, child_cspace_, MYOS_RIGHT_INSPECT);
+        const auto code = myos::cap_delegate(
+            code_memory_, child_cspace_, MYOS_RIGHT_MAP);
+        if (code_memory_ == 0 || code_size_ == 0
+            || entry < code_address_ || entry - code_address_ >= code_size_
+            || child_pool.status != MYOS_STATUS_OK
+            || child_cspace.status != MYOS_STATUS_OK
+            || arm_memory.status != MYOS_STATUS_OK
+            || code.status != MYOS_STATUS_OK) {
+            return false;
+        }
+        flags_[PoolSlot] = child_pool.value;
+        flags_[CSpaceSlot] = child_cspace.value;
+
+        myos_cap_t upcall_stacks[VprocCount]{};
+        for (myos_word_t index = 0; index < VprocCount; ++index) {
+            const myos_word_t stack_index =
+                thread_count_ + 3 * index + 2;
+            const auto delegated = myos::cap_delegate(
+                stack_memory_[stack_index],
+                child_cspace_,
+                MYOS_RIGHT_MAP);
+            if (delegated.status != MYOS_STATUS_OK) {
+                return false;
+            }
+            upcall_stacks[index] = delegated.value;
+        }
+
         auto* const starts = reinterpret_cast<volatile myos_thread_start*>(
             ScratchAddress);
         for (myos_word_t index = 0; index < thread_count_; ++index) {
@@ -551,18 +594,17 @@ private:
             vproc_start->version = MYOS_VPROC_START_VERSION;
             vproc_start->flags = 0;
             vproc_start->entry = entry;
-            vproc_start->stack = stack_tops_[thread_count_ + 2 * index];
-            vproc_start->arguments[0] = 0;
-            vproc_start->arguments[1] = index == TargetVproc
-                ? flags_[VprocNotificationSlot]
-                : 0;
+            vproc_start->stack = stack_tops_[thread_count_ + 3 * index];
+            vproc_start->arguments[0] = arm_memory.value;
+            vproc_start->arguments[1] =
+                ArmDescriptorOffset + index * ArmDescriptorStride;
             vproc_start->arguments[2] = SharedAddress;
             vproc_start->arguments[3] = index == TargetVproc
                 ? VprocMagic
                 : SourceVprocMagic;
             vproc_start->arguments[4] =
-                stack_tops_[thread_count_ + 2 * index + 1];
-            vproc_start->arguments[5] = SharedAddress;
+                stack_tops_[thread_count_ + 3 * index + 1];
+            vproc_start->arguments[5] = 0;
             vproc_start->control_memory = control_memory_[index];
             vproc_start->control_page = 0;
             vproc_start->control_address =
@@ -571,6 +613,27 @@ private:
             vproc_start->event_page = 0;
             vproc_start->event_address =
                 EventAddress + index * VprocRuntimeStride;
+
+            auto* const arm = reinterpret_cast<volatile myos_vproc_arm*>(
+                SharedAddress + ArmDescriptorOffset
+                + index * ArmDescriptorStride);
+            const myos_word_t code_page =
+                (entry - code_address_) / PageSize;
+            const myos_word_t upcall_stack =
+                thread_count_ + 3 * index + 2;
+            arm->version = MYOS_VPROC_ARM_VERSION;
+            arm->flags = 0;
+            arm->entry = entry;
+            arm->code_memory = code.value;
+            arm->code_page = code_page;
+            arm->code_address = code_address_ + code_page * PageSize;
+            arm->code_pages = 1;
+            arm->stack_memory = upcall_stacks[index];
+            arm->stack_page = StackSize / PageSize - 1;
+            arm->stack_address =
+                stack_bases_[upcall_stack] + StackSize - PageSize;
+            arm->stack_pages = 1;
+            arm->stack_top = stack_tops_[upcall_stack];
         }
         if (!committed(myos::vm_unmap(
                 scratch_region_, ScratchAddress, PageSize))) {
@@ -639,31 +702,8 @@ private:
                     != MYOS_STATUS_OK) {
                 return false;
             }
-            vprocs[index] = vproc.value;
             targets[thread_count_ + index] = vproc.value;
         }
-
-        stage_ = 151;
-        const auto tunnel = myos::tunnel_create(
-            pool_,
-            vprocs[SourceVproc],
-            vprocs[TargetVproc],
-            TunnelIngressSlot,
-            TunnelTag);
-        if (tunnel.status != MYOS_STATUS_OK
-            || !children_.add(tunnel.value)) {
-            return false;
-        }
-        const auto signal = myos::cap_delegate(
-            tunnel.value, child_cspace_, MYOS_RIGHT_SIGNAL);
-        const auto wait = myos::cap_delegate(
-            tunnel.value, child_cspace_, MYOS_RIGHT_WAIT);
-        if (signal.status != MYOS_STATUS_OK
-            || wait.status != MYOS_STATUS_OK) {
-            return false;
-        }
-        flags_[TunnelSignalSlot] = signal.value;
-        flags_[TunnelWaitSlot] = wait.value;
 
         for (myos_word_t index = 0;
              index < thread_count_ + VprocCount;
@@ -709,9 +749,9 @@ private:
             || flags_[TunnelTargetStateSlot] != TunnelDelivered) {
             myos::yield();
         }
-        return flags_[TunnelSourceGenerationSlot] != 0
-            && flags_[TunnelSourceGenerationSlot]
-                == flags_[TunnelTargetGenerationSlot]
+        return flags_[TunnelSourceSequenceSlot] != 0
+            && flags_[TunnelSourceSequenceSlot]
+                == flags_[TunnelTargetSequenceSlot]
             && flags_[TunnelHeartbeatSlot] != 0;
     }
 
@@ -742,7 +782,13 @@ private:
     myos_cap_t vproc_notification_{};
     myos_cap_t control_memory_[VprocCount]{};
     myos_cap_t event_memory_[VprocCount]{};
+    myos_cap_t code_memory_{};
+    myos_word_t code_address_{};
+    myos_word_t code_size_{};
+    myos_word_t entry_{};
     volatile myos_word_t* flags_{};
+    myos_cap_t stack_memory_[MaxStacks]{};
+    myos_word_t stack_bases_[MaxStacks]{};
     myos_word_t stack_tops_[MaxStacks]{};
     Handles children_{};
     bool closed_{};

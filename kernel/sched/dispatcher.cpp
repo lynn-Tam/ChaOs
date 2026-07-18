@@ -14,6 +14,7 @@
 #include <sched/domain.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <libk/checked_arithmetic.hpp>
+#include <libk/limits.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>
 
@@ -166,10 +167,15 @@ auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
 
 auto CpuDispatcher::accept_activation(Vproc& vproc) noexcept -> bool {
     KASSERT(!arch::interrupts_enabled());
+    kernel::sync::IrqLockGuard guard{vproc.state_lock_};
     Binding* const binding = vproc.execution_.scheduler_binding_;
     if (binding == nullptr || binding->home_cpu() != id_
-        || vproc.stop_requested_ || vproc.stopped_) {
+        || vproc.stop_requested_ || vproc.stopped_
+        || vproc.upcall_state_ == Vproc::UpcallState::Unarmed) {
         return false;
+    }
+    if (vproc.upcall_state_ == Vproc::UpcallState::Active) {
+        return true;
     }
     switch (vproc.execution_.state_) {
     case ExecutionState::Running:
@@ -204,27 +210,47 @@ auto CpuDispatcher::request_activation(
     Vproc& vproc) noexcept -> WakeResult {
     CpuId home{};
     {
-        kernel::sync::IrqLockGuard guard{vproc.stop_lock_};
+        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
         Binding* const binding = vproc.execution_.scheduler_binding_;
+        if (vproc.upcall_state_ != Vproc::UpcallState::Armed) {
+            return libk::expected();
+        }
         if (binding == nullptr || vproc.stop_requested_ || vproc.stopped_) {
             return libk::unexpected(WakeError::Unavailable);
         }
+        KASSERT(vproc.activation_publishers_
+            != libk::numeric_limits<usize>::max());
+        ++vproc.activation_publishers_;
         home = binding->home_cpu();
     }
     CpuRuntime* const target = cpus.runtime(home);
     if (target == nullptr
         || target->local.descriptor->state() != CpuState::Online) {
+        vproc.activation_publisher_done();
         return libk::unexpected(WakeError::Unavailable);
     }
     if (arch::current_cpu_owner() == &target->local) {
         const arch::InterruptState interrupts = arch::disable_interrupts();
         const bool accepted = target->dispatcher().accept_activation(vproc);
         arch::restore_interrupts(interrupts);
+        vproc.activation_publisher_done();
         return accepted
             ? WakeResult{libk::expected()}
             : WakeResult{libk::unexpected(WakeError::Unavailable)};
     }
-    return target->dispatcher().post_activation(vproc);
+    {
+        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
+        KASSERT(vproc.activation_publishers_ != 0);
+        --vproc.activation_publishers_;
+        if (vproc.activation_request_held_) {
+            return libk::expected();
+        }
+        vproc.activation_request_held_ = true;
+        vproc.activation_posting_ = true;
+    }
+    auto posted = target->dispatcher().post_activation(vproc);
+    vproc.activation_request_posted(static_cast<bool>(posted));
+    return posted;
 }
 
 auto CpuDispatcher::post_remote(RemoteRequest& request) noexcept -> WakeResult {
@@ -318,6 +344,9 @@ void CpuDispatcher::drain_remote() noexcept {
         case RemoteKind::Activation: {
             auto& vproc = *static_cast<Vproc*>(request->owner());
             static_cast<void>(accept_activation(vproc));
+            remote_.complete(*request);
+            vproc.activation_request_consumed();
+            continue;
             break;
         }
         case RemoteKind::Stop: {
@@ -500,10 +529,7 @@ void CpuDispatcher::dispatch(
         }
     }
 
-    Binding* candidate = policy_.select_activation().binding;
-    if (candidate == nullptr) {
-        candidate = policy_.select().binding;
-    }
+    Binding* const candidate = policy_.select().binding;
     if (candidate == nullptr && outgoing.idle()) {
         outgoing.execution().state_ = ExecutionState::Running;
         program_deadline(now);
@@ -664,13 +690,23 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
     KASSERT(target.owned_by(*this));
     Execution& execution = target.execution();
 
+    if (Vproc* const vproc = target.vproc()) {
+        const RemoteCancel canceled = remote_.cancel(vproc->activation_);
+        if (canceled == RemoteCancel::CanceledQueued) {
+            vproc->activation_request_consumed();
+        } else if (canceled == RemoteCancel::AlreadyClaimed) {
+            return StopDisposition::Deferred;
+        }
+    }
+
     if (execution.state_ == ExecutionState::Running) {
         KASSERT(current_ == target);
         request_reschedule(DispatchReason::Stop);
         return StopDisposition::Deferred;
     }
-    if (execution.state_ == ExecutionState::Blocked
-        && target.stop_deferred()) {
+    if ((target.vproc() != nullptr && target.stop_deferred())
+        || (execution.state_ == ExecutionState::Blocked
+            && target.stop_deferred())) {
         // The operation owns the continuation and may already be completing
         // on another CPU. Let its retained wake make the frame runnable; trap
         // exit consumes the result before the pending stop is committed.
@@ -686,9 +722,9 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
             timers_.remove(*binding);
         }
         binding->activation_credit_ = false;
-        remote_.cancel(binding->start_);
-        remote_.cancel(binding->wake_);
-        remote_.cancel(binding->stop_);
+        static_cast<void>(remote_.cancel(binding->start_));
+        static_cast<void>(remote_.cancel(binding->wake_));
+        static_cast<void>(remote_.cancel(binding->stop_));
     }
     execution.state_ = ExecutionState::Exited;
     return StopDisposition::Finalize;
@@ -703,11 +739,15 @@ void CpuDispatcher::finish_exit(execution::Target target) noexcept {
     if (execution.scheduler_binding_ != nullptr) {
         Binding& binding = *execution.scheduler_binding_;
         KASSERT(!binding.queued() && !binding.timer_queued());
-        remote_.cancel(binding.start_);
-        remote_.cancel(binding.wake_);
-        remote_.cancel(binding.stop_);
+        static_cast<void>(remote_.cancel(binding.start_));
+        static_cast<void>(remote_.cancel(binding.wake_));
+        static_cast<void>(remote_.cancel(binding.stop_));
         if (Vproc* const vproc = target.vproc()) {
-            remote_.cancel(vproc->activation_);
+            const RemoteCancel canceled = remote_.cancel(vproc->activation_);
+            if (canceled == RemoteCancel::CanceledQueued) {
+                vproc->activation_request_consumed();
+            }
+            KASSERT(canceled != RemoteCancel::AlreadyClaimed);
         }
         KASSERT(binding.context().unbind());
     }

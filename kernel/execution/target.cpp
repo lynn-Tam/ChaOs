@@ -52,7 +52,8 @@ auto Target::stop_deferred() const noexcept -> bool {
         return value->wait_ != nullptr;
     }
     Vproc* const value = vproc();
-    return value != nullptr && value->pending_operations();
+    return value != nullptr
+        && (value->pending_operations() || !value->activation_quiescent());
 }
 
 auto Target::stop_requested() const noexcept -> bool {
@@ -60,6 +61,9 @@ auto Target::stop_requested() const noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return true;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            return value->stop_requested_ || value->stopped_;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             return value->stop_requested_ || value->stopped_;
@@ -72,14 +76,23 @@ auto Target::stop_ready() const noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return false;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            if (!value->stop_requested_) {
+                return false;
+            }
+            for (const auto& slot : value->operations_) {
+                if (slot.state == Vproc::OperationState::Pending) {
+                    return false;
+                }
+            }
+            return value->activation_publishers_ == 0
+                && !value->activation_request_held_
+                && !value->activation_posting_
+                && !value->activation_.pending();
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
-            if constexpr (libk::SameAs<T, Thread*>) {
-                return value->stop_requested_ && value->wait_ == nullptr;
-            } else {
-                return value->stop_requested_
-                    && !value->pending_operations();
-            }
+            return value->stop_requested_ && value->wait_ == nullptr;
         }
     }, value_);
 }
@@ -89,6 +102,17 @@ auto Target::claim_home(sched::CpuDispatcher& home) const noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return false;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            Execution& execution = value->execution_;
+            if (execution.home_ != nullptr && execution.home_ != &home) {
+                return false;
+            }
+            if (value->stop_requested_ && execution.home_ == nullptr) {
+                return false;
+            }
+            execution.home_ = &home;
+            return true;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             Execution& execution = value->execution_;
@@ -109,6 +133,9 @@ auto Target::owned_by(const sched::CpuDispatcher& home) const noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return false;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            return value->stop_requested_ && value->execution_.home_ == &home;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             return value->stop_requested_ && value->execution_.home_ == &home;
@@ -121,6 +148,17 @@ auto Target::try_bind(sched::Binding& binding) const noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return false;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            Execution& execution = value->execution_;
+            if (execution.state_ != ExecutionState::Prepared
+                || execution.scheduler_binding_ != nullptr
+                || execution.home_ != nullptr || value->stop_requested_
+                || value->stopped_) {
+                return false;
+            }
+            execution.scheduler_binding_ = &binding;
+            return true;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             Execution& execution = value->execution_;
@@ -146,6 +184,10 @@ void Target::clear_binding(sched::Binding& binding) const noexcept {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             KASSERT(false);
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            KASSERT(value->execution_.scheduler_binding_ == &binding);
+            value->execution_.scheduler_binding_ = nullptr;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             KASSERT(value->execution_.scheduler_binding_ == &binding);
@@ -190,6 +232,19 @@ auto TargetHold::get() const noexcept -> Target {
             return Target{const_cast<Thread&>(value.get())};
         } else {
             return Target{const_cast<Vproc&>(value.get())};
+        }
+    }, value_);
+}
+
+auto TargetHold::reference() const noexcept
+    -> libk::Expected<object::ObjectRef, object::ObjectError> {
+    return libk::visit([](const auto& value) noexcept
+        -> libk::Expected<object::ObjectRef, object::ObjectError> {
+        using T = libk::remove_cvr_t<decltype(value)>;
+        if constexpr (libk::SameAs<T, libk::monostate>) {
+            return libk::unexpected(object::ObjectError::InvalidIdentity);
+        } else {
+            return value.ref();
         }
     }, value_);
 }

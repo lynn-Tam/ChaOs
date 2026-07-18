@@ -48,6 +48,15 @@ public:
         return lease_.derive_region(
             libk::move(charge), libk::move(target), ceiling, proof);
     }
+    [[nodiscard]] auto derive_tunnel_tx(
+        kernel::resource::Reservation&& charge,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling,
+        TunnelConnectProof proof) const noexcept
+        -> libk::Expected<GrantRef, GrantError> {
+        return lease_.derive_tunnel_tx(
+            libk::move(charge), libk::move(target), ceiling, proof);
+    }
     [[nodiscard]] auto source() const noexcept -> CSpace& { return *source_; }
 
 private:

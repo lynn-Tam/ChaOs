@@ -67,6 +67,8 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] auto get() noexcept -> Target;
     [[nodiscard]] auto get() const noexcept -> Target;
+    [[nodiscard]] auto reference() const noexcept
+        -> libk::Expected<object::ObjectRef, object::ObjectError>;
 
 private:
     using Value = libk::variant<

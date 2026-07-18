@@ -61,6 +61,18 @@ struct VprocRuntime final : private libk::noncopyable {
     kernel::mm::VirtAddr event_address{};
 };
 
+struct VprocArm final : private libk::noncopyable {
+    VprocArm() noexcept = default;
+    VprocArm(VprocArm&&) noexcept = default;
+    auto operator=(VprocArm&&) noexcept -> VprocArm& = default;
+
+    kernel::mm::UserView code_view{};
+    kernel::mm::UserView stack_view{};
+    kernel::mm::PageLease code_page{};
+    kernel::mm::PageLease stack_page{};
+    arch::UserStart entry{};
+};
+
 // A kernel-visible execution lane whose user continuations are owned by its
 // runtime.  The kernel owns only the lane, bounded operation table and one
 // non-reentrant upcall frame; user tasks are never kernel objects.
@@ -104,6 +116,11 @@ public:
     [[nodiscard]] auto take_operation(operation::Key key) noexcept
         -> libk::Expected<operation::Result, VprocError>;
     [[nodiscard]] auto pending_sequence() const noexcept -> u64;
+    [[nodiscard]] auto arm(
+        const cap::Resolved<kernel::mm::MemoryObject>& code,
+        const cap::Resolved<kernel::mm::MemoryObject>& stack,
+        VprocArm&& registration) noexcept
+        -> libk::Expected<void, VprocError>;
     void on_trap_exit(arch::TrapContext& trap) noexcept;
     [[nodiscard]] auto resume(
         arch::TrapContext& trap,
@@ -126,6 +143,12 @@ private:
         Ready,
     };
 
+    enum class UpcallState : u8 {
+        Unarmed,
+        Armed,
+        Active,
+    };
+
     struct OperationSlot final {
         operation::Completion* completion{};
         myos_status_t status{MYOS_STATUS_OK};
@@ -138,7 +161,7 @@ private:
     struct IngressSlot final {
         ipc::TunnelLink* link{};
         u64 binding_generation{};
-        u64 delivery_generation{};
+        u64 signal_sequence{};
         usize tag{};
     };
 
@@ -166,42 +189,51 @@ private:
         ipc::TunnelLink& link,
         usize slot,
         u64 binding_generation,
-        u64 delivery_generation,
+        u64 signal_sequence,
         usize tag,
         CpuRegistry& cpus) noexcept;
     void clear_tunnel(
         ipc::TunnelLink& link,
         usize slot,
         u64 binding_generation,
-        u64 delivery_generation) noexcept;
+        u64 signal_sequence) noexcept;
     void close_tunnels() noexcept;
     [[nodiscard]] auto pending_operations() const noexcept -> bool;
     [[nodiscard]] auto pending_events() const noexcept -> bool;
+    [[nodiscard]] auto activation_quiescent() const noexcept -> bool;
+    void activation_publisher_done() noexcept;
+    void activation_request_posted(bool posted) noexcept;
+    void activation_request_consumed() noexcept;
+    void retry_stop_if_ready() noexcept;
 
     using StopList = libk::IntrusiveList<
         execution::Stop, &execution::Stop::hook_>;
 
     Execution execution_;
     execution::Authority authority_;
-    arch::UserStart runtime_entry_{};
+    arch::UserStart bootstrap_entry_{};
     VprocRuntime runtime_{};
-    mutable libk::TicketSpinLock operation_lock_{};
+    VprocArm arm_{};
+    mutable libk::TicketSpinLock state_lock_{};
     OperationSlot operations_[max_operations]{};
     using TunnelLinks = libk::IntrusiveList<
         ipc::TunnelLink, &ipc::TunnelLink::hook>;
-    mutable libk::TicketSpinLock tunnel_lock_{};
     TunnelLinks outgoing_tunnels_{};
     IngressSlot ingresses_[MYOS_VPROC_MAX_INGRESS]{};
     mutable bool tunnel_admission_closed_{};
-    mutable libk::TicketSpinLock stop_lock_{};
     StopList stops_{};
     u64 pending_sequence_{};
     u64 ready_mask_{};
     u64 ingress_mask_{};
     u64 upcall_generation_{};
-    bool upcall_active_{};
+    UpcallState upcall_state_{UpcallState::Unarmed};
+    bool arm_attaching_{};
     bool stop_requested_{};
+    bool stop_dispatched_{};
     bool stopped_{};
+    usize activation_publishers_{};
+    bool activation_request_held_{};
+    bool activation_posting_{};
     sched::RemoteRequest activation_{sched::RemoteKind::Activation, this};
 };
 

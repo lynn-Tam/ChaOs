@@ -1,5 +1,7 @@
 #include <cap/grant_graph.hpp>
 
+#include <object/tunnel_pool.hpp>
+
 #include <cap/policy.hpp>
 #include <core/debug.hpp>
 #include <libk/limits.hpp>
@@ -252,6 +254,19 @@ auto GrantLease::derive_region(
         libk::move(charge), *this, libk::move(target), ceiling, proof);
 }
 
+auto GrantLease::derive_tunnel_tx(
+    kernel::resource::Reservation&& charge,
+    object::ObjectRef&& target,
+    GrantCeiling ceiling,
+    TunnelConnectProof proof) const noexcept
+    -> libk::Expected<GrantRef, GrantError> {
+    if (graph_ == nullptr) {
+        return libk::unexpected(GrantError::InvalidKey);
+    }
+    return graph_->derive_tunnel_tx(
+        libk::move(charge), *this, libk::move(target), ceiling, proof);
+}
+
 void GrantLease::reset() noexcept {
     GrantGraph* const graph = libk::exchange(graph_, nullptr);
     void* const node = libk::exchange(node_, nullptr);
@@ -448,6 +463,35 @@ auto GrantGraph::derive_region(
         || !parent_data->access.contains(child_data->access)
         || !parent_data->types.contains(child_data->types)
         || !parent->ceiling.rights.contains(ceiling.rights)) {
+        return libk::unexpected(GrantError::RightsViolation);
+    }
+    return create(
+        libk::move(charge), libk::move(target), ceiling, parent);
+}
+
+auto GrantGraph::derive_tunnel_tx(
+    kernel::resource::Reservation&& charge,
+    const GrantLease& source,
+    object::ObjectRef&& target,
+    GrantCeiling ceiling,
+    TunnelConnectProof proof) noexcept
+    -> libk::Expected<GrantRef, GrantError> {
+    const Rights connect = Rights::of(Right::Connect);
+    const Rights tx = Rights::of(
+        Right::Duplicate, Right::Inspect, Right::Signal, Right::Close);
+    if (source.graph_ != this || !target
+        || target.kind() != object::ObjectKind::Tunnel
+        || proof.tunnel_ == nullptr || proof.source_ == nullptr
+        || proof.claim_ == 0 || ceiling.rights != tx
+        || !libk::holds_alternative<libk::monostate>(ceiling.data)) {
+        return libk::unexpected(GrantError::InvalidKey);
+    }
+    auto* const parent = static_cast<Node*>(source.node_);
+    auto tunnel = target.pin<kernel::ipc::Tunnel>();
+    if (parent->target.kind() != object::ObjectKind::Tunnel
+        || !parent->ceiling.rights.contains(connect)
+        || target.id() != parent->target.id() || !tunnel
+        || &tunnel.value().get() != proof.tunnel_) {
         return libk::unexpected(GrantError::RightsViolation);
     }
     return create(

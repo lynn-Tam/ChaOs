@@ -2,6 +2,7 @@
 
 #include <cap/cspace.hpp>
 #include <cap/grant_graph.hpp>
+#include <cap/policy.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/utility.hpp>
@@ -980,6 +981,38 @@ bool test_destroy_authority_uses_object_anchor_retirement(
     return true;
 }
 
+bool test_tunnel_rights_keep_connect_and_tx_distinct(
+    const TestContext&) noexcept {
+    using kernel::cap::PolicyError;
+    using kernel::object::ObjectKind;
+
+    const Rights receiver = Rights::of(
+        Right::Duplicate,
+        Right::Delegate,
+        Right::Inspect,
+        Right::Ack,
+        Right::Connect,
+        Right::Close,
+        Right::Destroy,
+        Right::Revoke);
+    const Rights connect = Rights::of(Right::Connect);
+    const Rights tx = Rights::of(
+        Right::Duplicate, Right::Inspect, Right::Signal, Right::Close);
+    const auto forbidden_tx = kernel::cap::compose(
+        ObjectKind::Tunnel,
+        GrantCeiling{connect},
+        CapView{tx});
+
+    return kernel::cap::validate_ceiling(
+               ObjectKind::Tunnel, GrantCeiling{receiver})
+        && !kernel::cap::validate_ceiling(
+            ObjectKind::Vproc, GrantCeiling{connect})
+        && !kernel::cap::validate_ceiling(
+            ObjectKind::Notification, GrantCeiling{connect})
+        && !forbidden_tx
+        && forbidden_tx.error() == PolicyError::Amplification;
+}
+
 } // namespace
 
 void register_cap_tests(TestRegistry& registry) noexcept {
@@ -1035,4 +1068,8 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         "cap",
         "destroy authority enters the target ObjectAnchor retirement path",
         test_destroy_authority_uses_object_anchor_retirement);
+    (void)registry.add(
+        "cap",
+        "Tunnel Connect authority cannot attenuate into source Tx rights",
+        test_tunnel_rights_keep_connect_and_tx_distinct);
 }

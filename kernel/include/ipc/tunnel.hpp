@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cap/cspace.hpp>
 #include <cap/grant.hpp>
 #include <cap/resolved.hpp>
 #include <core/types.hpp>
@@ -21,15 +22,24 @@ namespace kernel::ipc {
 enum class TunnelError : u8 {
     Closed,
     Busy,
+    AlreadyConnected,
     WrongSource,
     WrongTarget,
     Empty,
+    BadSequence,
     InvalidSlot,
     GenerationExhausted,
+    ResourceExhausted,
 };
 
-// A capability-authorized virtual interrupt between two immutable Vprocs.
-// Tunnel owns delivery truth; the target slot and event page are projections.
+struct TunnelAck final {
+    u64 sequence{};
+    bool reasserted{};
+};
+
+// Receiver-opened, one-shot Vproc virtual interrupt. The same object owns the
+// listening offer, connected identity and pending signal truth; Vproc ingress
+// state and the event page are projections only.
 class Tunnel final : private libk::noncopyable_nonmovable {
     struct AuthorityLink final : private libk::noncopyable_nonmovable {
         AuthorityLink(Tunnel& owner, const cap::GrantAttachmentOps& ops) noexcept
@@ -43,26 +53,26 @@ class Tunnel final : private libk::noncopyable_nonmovable {
 public:
     Tunnel(
         CpuRegistry& cpus,
-        Vproc& source,
-        Vproc& target,
+        object::ObjectHold<Vproc>&& target,
         usize slot,
         usize tag) noexcept;
     ~Tunnel() noexcept;
 
-    [[nodiscard]] auto authorize(
-        const cap::Resolved<Vproc>& source,
-        const cap::Resolved<Vproc>& target) noexcept
-        -> libk::Expected<void, TunnelError>;
+    [[nodiscard]] auto open() noexcept -> libk::Expected<void, TunnelError>;
+    [[nodiscard]] auto connect(
+        Vproc& source,
+        cap::CSpace& cspace,
+        const cap::Resolved<Tunnel>& authority) noexcept
+        -> libk::Expected<cap::CapHandle, TunnelError>;
     [[nodiscard]] auto invoke(Vproc& caller) noexcept
         -> libk::Expected<u64, TunnelError>;
-    [[nodiscard]] auto take(Vproc& caller) noexcept
-        -> libk::Expected<u64, TunnelError>;
+    [[nodiscard]] auto ack(Vproc& caller, u64 observed) noexcept
+        -> libk::Expected<TunnelAck, TunnelError>;
+    [[nodiscard]] auto close_from(Vproc& caller, cap::Rights rights) noexcept
+        -> libk::Expected<void, TunnelError>;
     void close() noexcept;
     void retire(object::ObjectCleanup&& cleanup) noexcept;
 
-    // Vproc holds no owning pointer to Tunnel. A linked relation may acquire a
-    // short callback lease while holding its own lock; retirement detaches the
-    // relation before waiting for these leases.
     void retain_relation() noexcept;
     void release_relation() noexcept;
     void peer_stopped(Vproc& peer) noexcept;
@@ -70,7 +80,10 @@ public:
 private:
     enum class State : u8 {
         Constructing,
-        Open,
+        Listening,
+        Connecting,
+        Idle,
+        Pending,
         Closing,
         Closed,
     };
@@ -81,7 +94,7 @@ private:
         cap::GrantInvalidation reason) noexcept;
     static void released(void* context) noexcept;
     void invalidated(AuthorityLink& link, cap::GrantWork&& work) noexcept;
-    void finish_close() noexcept;
+    void try_finish_close() noexcept;
     void try_finish_retire() noexcept;
 
     static const cap::GrantAttachmentOps authority_ops_;
@@ -95,14 +108,14 @@ private:
     usize tag_{};
     u64 binding_generation_{};
     mutable libk::TicketSpinLock lock_{};
-    AuthorityLink source_authority_;
-    AuthorityLink target_authority_;
+    AuthorityLink connect_authority_;
     TunnelLink source_link_;
     TunnelLink target_link_;
     libk::Atomic<usize> relations_{};
     object::ObjectCleanup cleanup_{};
-    u64 delivery_generation_{};
-    bool pending_{};
+    u64 claim_generation_{};
+    u64 signal_sequence_{};
+    bool close_draining_{};
     State state_{State::Constructing};
 };
 

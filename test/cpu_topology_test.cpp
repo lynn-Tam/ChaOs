@@ -1102,7 +1102,7 @@ bool test_remote_queue_coalesces_without_losing_membership(
     queue.transport_failed(*first_signal);
     const auto stale_retry = queue.claim_transport();
     kernel::sched::RemoteRequest* const taken = queue.take();
-    queue.cancel(request);
+    const auto claimed_cancel = queue.cancel(request);
     const bool consumed_stays_pending = request.pending();
     queue.post(request);
     const auto during_signal = queue.claim_transport();
@@ -1113,14 +1113,21 @@ bool test_remote_queue_coalesces_without_losing_membership(
     kernel::sched::RemoteRequest* const final = queue.take();
     queue.complete(request);
     const bool final_drained = queue.take() == nullptr;
+    queue.post(request);
+    const auto queued_cancel = queue.cancel(request);
+    const bool canceled_drained = !request.pending() && queue.size() == 0;
 
     const bool protocol = first_signal && !duplicate_signal
         && retry_signal
         && retry_signal->generation != first_signal->generation
         && !stale_retry
-        && taken == &request && consumed_stays_pending && !during_signal
+        && taken == &request
+        && claimed_cancel == kernel::sched::RemoteCancel::AlreadyClaimed
+        && consumed_stays_pending && !during_signal
         && drained && after_drain_signal
-        && final == &request && final_drained;
+        && final == &request && final_drained
+        && queued_cancel == kernel::sched::RemoteCancel::CanceledQueued
+        && canceled_drained;
     return protocol;
 }
 

@@ -7,6 +7,8 @@
 #include <uapi/capability.h>
 #include <uapi/status.h>
 #include <uapi/syscall.h>
+#include <uapi/tunnel.h>
+#include <uapi/vproc.h>
 #include <uapi/vm.h>
 
 namespace {
@@ -57,9 +59,19 @@ bool test_uapi_values_are_stable_and_not_internal_pointers(
     static_assert(MYOS_SYS_YIELD != MYOS_SYS_EXIT);
     static_assert(MYOS_SYS_VM_MAP != MYOS_SYS_VM_PROTECT);
     static_assert(MYOS_RIGHT_REVOKE == (UINT64_C(1) << 11));
+    static_assert(MYOS_RIGHT_CONNECT == (UINT64_C(1) << 17));
+    static_assert(MYOS_RIGHT_ACK == (UINT64_C(1) << 18));
+    static_assert(MYOS_SYS_TUNNEL_OPEN == 56);
+    static_assert(MYOS_SYS_VPROC_ARM == 96);
+    static_assert(MYOS_SYS_TUNNEL_CONNECT == 104);
+    static_assert(MYOS_SYS_TUNNEL_ACK == 106);
     static_assert((MYOS_VM_WRITE & MYOS_VM_READ) == 0);
     static_assert(MYOS_STATUS_OK == 0 && MYOS_STATUS_INVALID_CAP == -1);
     static_assert(MYOS_STATUS_BUSY == -7 && MYOS_STATUS_PENDING == -9);
+    static_assert(MYOS_STATUS_REASSERTED == -14);
+    static_assert(MYOS_STATUS_ALREADY_CONNECTED == -15);
+    static_assert(MYOS_VPROC_ARM_VERSION == 1);
+    static_assert(MYOS_TUNNEL_FLAGS_NONE == 0);
     return !kernel::cap::CapHandle::from_raw(0)
         && !kernel::cap::CapHandle::from_raw(1);
 }

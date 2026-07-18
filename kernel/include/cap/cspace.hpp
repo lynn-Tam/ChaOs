@@ -22,6 +22,9 @@ namespace kernel {
 class CpuRegistry;
 class ExecutionBinding;
 class Thread;
+namespace ipc {
+class Tunnel;
+}
 namespace object {
 template<typename T>
 struct ObjectTraits;
@@ -82,12 +85,40 @@ public:
         kernel::resource::Reservation charge_{};
     };
 
+    // Reserves one destination capability slot and one sponsored Grant node
+    // as a single pre-publication unit. Type-specific derivation still lives
+    // in GrantGraph; this class only owns rollback-safe resource capacity.
+    class DerivationReservation final : private libk::noncopyable {
+    public:
+        DerivationReservation(DerivationReservation&&) noexcept = default;
+        auto operator=(DerivationReservation&&) noexcept
+            -> DerivationReservation& = default;
+
+        [[nodiscard]] auto handle() const noexcept -> CapHandle {
+            return slot_.handle();
+        }
+
+    private:
+        friend class CSpace;
+        friend class kernel::ipc::Tunnel;
+
+        DerivationReservation(
+            Reservation&& slot,
+            kernel::resource::Reservation&& grant) noexcept
+            : slot_(libk::move(slot)), grant_(libk::move(grant)) {}
+
+        Reservation slot_;
+        kernel::resource::Reservation grant_;
+    };
+
     explicit CSpace(kernel::mm::Pmm& pmm) noexcept;
     CSpace(kernel::mm::Pmm& pmm, Quota quota) noexcept;
     ~CSpace() noexcept;
 
     [[nodiscard]] auto reserve() noexcept
         -> libk::Expected<Reservation, CSpaceError>;
+    [[nodiscard]] auto reserve_derivation() noexcept
+        -> libk::Expected<DerivationReservation, CSpaceError>;
     [[nodiscard]] auto insert(
         GrantRef&& grant,
         CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;

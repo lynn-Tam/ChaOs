@@ -40,7 +40,7 @@
 #define MYOS_SYS_THREAD_CREATE         53 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
 #define MYOS_SYS_NOTIFICATION_CREATE   54 /* a1=immutable signal badge */
 #define MYOS_SYS_VPROC_CREATE          55 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
-#define MYOS_SYS_TUNNEL_CREATE         56 /* a1=source Vproc, a2=target Vproc, a3=slot, a4=tag */
+#define MYOS_SYS_TUNNEL_OPEN           56 /* a0=pool, a1=slot, a2=tag; target=current Vproc */
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
@@ -49,10 +49,12 @@
 #define MYOS_SYS_NOTIFICATION_TAKE     81 /* a0=Notification */
 #define MYOS_SYS_NOTIFICATION_WAIT     82 /* a0=Notification */
 
-#define MYOS_SYS_VPROC_RETURN          96 /* a0=active generation; resumes submitted context */
-#define MYOS_SYS_VPROC_POLL            97 /* returns pending sequence */
-#define MYOS_SYS_OPERATION_TAKE        98 /* a0=OperationKey */
+#define MYOS_SYS_VPROC_ARM             96 /* a0=descriptor MemoryObject, a1=byte offset */
+#define MYOS_SYS_VPROC_RETURN          97 /* a0=active generation; resumes submitted context */
+#define MYOS_SYS_VPROC_CHECKPOINT      98 /* safe delivery boundary; returns pending sequence */
+#define MYOS_SYS_OPERATION_TAKE        99 /* a0=OperationKey */
 
-#define MYOS_SYS_TUNNEL_INVOKE        104 /* a0=Tunnel; caller must be source Vproc */
-#define MYOS_SYS_TUNNEL_TAKE          105 /* a0=Tunnel; caller must be target Vproc */
-#define MYOS_SYS_TUNNEL_CLOSE         106 /* a0=Tunnel */
+#define MYOS_SYS_TUNNEL_CONNECT       104 /* a0=Connect authority; source=current Vproc */
+#define MYOS_SYS_TUNNEL_INVOKE        105 /* a0=Tunnel Tx; caller must be source Vproc */
+#define MYOS_SYS_TUNNEL_ACK           106 /* a0=receiver cap, a1=observed sequence */
+#define MYOS_SYS_TUNNEL_CLOSE         107 /* a0=Tunnel Admin or Tx */

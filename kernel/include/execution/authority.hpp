@@ -46,6 +46,11 @@ public:
         const cap::Resolved<kernel::mm::MemoryObject>& control,
         const cap::Resolved<kernel::mm::MemoryObject>& events) noexcept
         -> libk::Expected<void, cap::GrantError>;
+    [[nodiscard]] auto attach_arm(
+        const cap::Resolved<kernel::mm::MemoryObject>& code,
+        const cap::Resolved<kernel::mm::MemoryObject>& stack) noexcept
+        -> libk::Expected<void, cap::GrantError>;
+    void detach_arm() noexcept;
     [[nodiscard]] auto active() const noexcept -> bool;
 
     // Called only after the dispatcher has removed the target's scheduling
@@ -75,7 +80,10 @@ private:
     Link cspace_;
     Link control_;
     Link events_;
+    Link code_;
+    Link stack_;
     Stop stop_;
+    bool arm_attaching_{};
     bool start_armed_{};
     bool ended_{};
 };

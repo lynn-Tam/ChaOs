@@ -50,6 +50,10 @@ public:
     [[nodiscard]] auto home_cpu() const noexcept -> CpuId {
         return home_cpu_;
     }
+    [[nodiscard]] auto target_reference() const noexcept
+        -> libk::Expected<object::ObjectRef, object::ObjectError> {
+        return target_.reference();
+    }
     [[nodiscard]] auto queued() const noexcept -> bool {
         return ready_hook_.is_linked();
     }
@@ -59,6 +63,7 @@ public:
 
 private:
     friend class ReadyQueue;
+    friend class BuiltinPolicy;
     friend class TimerQueue;
     friend class RemoteQueue;
     friend class CpuDispatcher;
