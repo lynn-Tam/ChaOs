@@ -10,6 +10,12 @@
 #include <mm/pmm.hpp>
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
+#include <resource/sponsorship.hpp>
+
+namespace kernel::object {
+template<typename T>
+struct ObjectTraits;
+}
 
 namespace kernel::mm {
 
@@ -56,6 +62,7 @@ enum class MemoryError : u8 {
     InvalidMemoryType,
     InvalidState,
     OutOfMemory,
+    ResourceExhausted,
     GenerationExhausted,
     Busy,
     BackingFailed,
@@ -73,6 +80,19 @@ enum class MemoryState : u8 {
     Live,
     Stopping,
     Retired,
+};
+
+enum class SealState : u8 {
+    Loadable,
+    Sealing,
+    Executable,
+};
+
+struct ContentEpoch final {
+    u64 raw{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        ContentEpoch, ContentEpoch) noexcept -> bool = default;
 };
 
 class MemoryObject;
@@ -140,6 +160,7 @@ private:
     const MemoryAttachmentOps* ops_{};
     libk::Atomic<usize> work_{};
     libk::Atomic<u8> state_{static_cast<u8>(State::Idle)};
+    AccessMask access_{};
 };
 
 // Short backing borrow. Callers keep the MemoryObject operation pin or a
@@ -190,17 +211,28 @@ public:
     }
     [[nodiscard]] auto kind() const noexcept -> BackingKind;
     [[nodiscard]] auto state() const noexcept -> MemoryState;
+    [[nodiscard]] auto seal_state() const noexcept -> SealState;
+    [[nodiscard]] auto content_epoch() const noexcept -> ContentEpoch;
+    // Publishes immutable executable content. The synchronous E0 path only
+    // succeeds once no writable mapping attachment remains; later async
+    // callers use the same state transition after retiring those mappings.
+    [[nodiscard]] auto seal() noexcept -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto query(usize page_index) const noexcept
         -> libk::Expected<ContentState, MemoryError>;
     [[nodiscard]] auto materialize(usize page_index) noexcept
         -> libk::Expected<PageLease, MemoryError>;
+    [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept
+        -> libk::Expected<void, MemoryError>;
 
-    [[nodiscard]] auto attach(MemoryAttachment& attachment) noexcept
+    [[nodiscard]] auto attach(
+        MemoryAttachment& attachment,
+        AccessMask access) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
     void retire() noexcept;
 
 private:
+    friend struct kernel::object::ObjectTraits<MemoryObject>;
     friend class PageLease;
     friend class MemoryAttachment;
 
@@ -228,6 +260,9 @@ private:
     void drop_page() noexcept;
     void finish_retire() noexcept;
     void fail_build() noexcept;
+    void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept;
+    [[nodiscard]] auto reserve_dynamic(kernel::resource::Budget charge) noexcept
+        -> libk::Expected<kernel::resource::Reservation, MemoryError>;
 
     Pmm* pmm_{};
     usize logical_pages_{};
@@ -236,9 +271,14 @@ private:
     void* backing_{};
     const BackingOps* backing_ops_{};
     OwnedPage backing_page_{};
+    kernel::resource::Sponsorship backing_sponsorship_{};
     usize operations_{};
     MemoryState state_{MemoryState::Building};
+    SealState seal_{SealState::Loadable};
+    ContentEpoch content_epoch_{};
+    AccessMask access_{};
     bool releasing_{};
+    kernel::resource::Sponsorship* sponsor_{};
 };
 
 } // namespace kernel::mm

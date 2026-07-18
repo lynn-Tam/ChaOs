@@ -12,13 +12,11 @@ $(error Unsupported PROFILE=$(PROFILE); supported: $(SUPPORTED_PROFILES))
 endif
 
 ENABLE_TESTS := 0
-ENABLE_INITIAL_USER_PROOF := 0
 ifeq ($(PROFILE),test)
 ENABLE_TESTS := 1
 endif
 ifeq ($(PROFILE),proof)
 ENABLE_TESTS := 1
-ENABLE_INITIAL_USER_PROOF := 1
 endif
 
 # ---------- Toolchain selection ----------
@@ -48,8 +46,10 @@ CC      := $(CROSS)gcc
 CXX     := $(CROSS)g++
 OBJDUMP := $(CROSS)objdump
 NM      := $(CROSS)nm
+READELF := $(CROSS)readelf
 QEMU    ?= qemu-system-riscv64
 CLANGXX ?= clang++
+HOST_CXX ?= c++
 QEMU_SMP ?= 4
 PANIC_PROBE ?= 0
 GDB_HOST ?= 127.0.0.1
@@ -72,6 +72,10 @@ ifeq ($(shell command -v $(NM) 2>/dev/null),)
 $(error nm not found: $(NM))
 endif
 
+ifeq ($(shell command -v $(READELF) 2>/dev/null),)
+$(error readelf not found: $(READELF))
+endif
+
 VTABLE_ALLOWLIST_PREFIXES = $(BUILD_DIR)/kernel/object/
 
 RISCV_ARCH ?= rv64gc
@@ -88,10 +92,23 @@ MAPFILE   := $(BUILD_DIR)/kernel.map
 LINKER_SCRIPT := arch/$(ARCH)/linker.ld
 BOOT_STACK_FRAME_BUDGET := 1792
 
-COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 \
+USER_ARCH ?= rv64imac_zicsr_zifencei
+USER_ABI ?= lp64
+USER_ARCH_FLAGS := -march=$(USER_ARCH) -mabi=$(USER_ABI)
+USER_BUILD_DIR := build/$(ARCH)/user
+INIT_USER_TARGET := $(USER_BUILD_DIR)/init.elf
+INIT_USER_MAPFILE := $(USER_BUILD_DIR)/init.map
+PROOF_USER_TARGET := $(USER_BUILD_DIR)/proof.elf
+PROOF_USER_MAPFILE := $(USER_BUILD_DIR)/proof.map
+USER_LINKER_SCRIPT := user/$(ARCH)/linker.ld
+BOOT_BUNDLE := $(USER_BUILD_DIR)/boot.bundle
+PROOF_BOOT_BUNDLE := $(USER_BUILD_DIR)/proof.bundle
+HOST_BUILD_DIR := build/host
+BOOTPACK := $(HOST_BUILD_DIR)/bootpack
+
+COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
                 -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
                 -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
-                -DMYOS_INITIAL_USER_PROOF=$(ENABLE_INITIAL_USER_PROOF) \
                 -DMYOS_BUILD_ID=\"$(BUILD_ID)\" \
                 $(RISCV_ARCH_FLAGS) \
                 -mcmodel=medany -msmall-data-limit=0 \
@@ -111,6 +128,16 @@ CXXFLAGS := $(COMMON_FLAGS) -std=gnu++2b \
 
 ASFLAGS  := $(COMMON_FLAGS)
 
+USER_COMMON_FLAGS := -ffreestanding -Wall -Wextra -Werror -O2 -g3 \
+                $(USER_ARCH_FLAGS) -mcmodel=medany -msmall-data-limit=0 \
+                -I .
+USER_CXXFLAGS := $(USER_COMMON_FLAGS) -std=gnu++2b \
+                -fno-exceptions -fno-rtti \
+                -fno-threadsafe-statics -fno-use-cxa-atexit
+USER_ASFLAGS := $(USER_COMMON_FLAGS)
+USER_LDFLAGS := $(USER_ARCH_FLAGS) -nostdlib \
+                -Wl,-T,$(USER_LINKER_SCRIPT)
+
 LDFLAGS  := $(RISCV_ARCH_FLAGS) \
             -nostdlib \
             -Wl,-T,$(LINKER_SCRIPT) \
@@ -123,6 +150,7 @@ ARCH_SRCS := \
   arch/riscv64/boot/kernel_image.cpp \
   arch/riscv64/cpu/local_entry.cpp \
   arch/riscv64/cpu/ipi.cpp \
+  arch/riscv64/cpu/instruction.cpp \
   arch/riscv64/cpu/start.cpp \
   arch/riscv64/cpu/secondary_entry.S \
   arch/riscv64/context/kernel_context.cpp \
@@ -145,25 +173,31 @@ ARCH_SRCS := \
 
 KERNEL_SRCS := \
   kernel/boot/boot.cpp \
-  kernel/boot/entry.cpp \
-  kernel/boot/run.cpp \
   kernel/boot/cpu_topology.cpp \
   kernel/boot/timebase.cpp \
   kernel/boot/firmware/devicetree/fdt.cpp \
+  kernel/image/boot_bundle.cpp \
+  kernel/init/root_task.cpp \
+  kernel/init/run.cpp \
   kernel/diag/console.cpp \
   kernel/diag/panic.cpp \
   kernel/core/kernel_state.cpp \
   kernel/cap/policy.cpp \
   kernel/cap/grant_graph.cpp \
   kernel/cap/cspace.cpp \
+  kernel/ipc/notification.cpp \
+  kernel/ipc/tunnel.cpp \
   kernel/object/object_ref.cpp \
   kernel/object/object_store.cpp \
+	kernel/resource/pool.cpp \
+	kernel/resource/allocation.cpp \
 	kernel/sched/context.cpp \
+	kernel/sched/authority.cpp \
 	kernel/sched/refill_queue.cpp \
 	kernel/sched/domain.cpp \
 	kernel/sched/builtin_policy.cpp \
 	kernel/sched/timer_queue.cpp \
-	kernel/sched/wake_queue.cpp \
+	kernel/sched/remote_queue.cpp \
   kernel/sched/dispatcher.cpp \
   kernel/cpu/cpu_provisioner.cpp \
   kernel/cpu/cpu_registry.cpp \
@@ -171,12 +205,23 @@ KERNEL_SRCS := \
   kernel/cpu/ipi.cpp \
   kernel/cpu/start.cpp \
 	kernel/thread/thread.cpp \
-	kernel/thread/wait.cpp \
-  kernel/thread/execution.cpp \
+    kernel/execution/authority.cpp \
+    kernel/execution/target.cpp \
+    kernel/execution/vproc.cpp \
+    kernel/execution/vproc_tunnel.cpp \
+	kernel/execution/stop.cpp \
+  kernel/operation/completion.cpp \
+  kernel/execution/execution.cpp \
+  kernel/execution/binding.cpp \
   kernel/syscall/syscall.cpp \
   kernel/syscall/common.cpp \
-  kernel/syscall/thread.cpp \
+  kernel/syscall/execution.cpp \
   kernel/syscall/capability.cpp \
+  kernel/syscall/construction.cpp \
+  kernel/syscall/object.cpp \
+    kernel/syscall/notification.cpp \
+    kernel/syscall/vproc.cpp \
+    kernel/syscall/tunnel.cpp \
   kernel/syscall/vm.cpp \
   kernel/time/clock.cpp \
   kernel/mm/kernel_stack.cpp \
@@ -185,7 +230,7 @@ KERNEL_SRCS := \
 	kernel/mm/vspace.cpp \
 	kernel/mm/vspace_fault.cpp \
 	kernel/mm/vspace_invalidation.cpp \
-	kernel/mm/vspace_ipc.cpp \
+	kernel/mm/vspace_view.cpp \
 	kernel/mm/vspace_layout.cpp \
 	kernel/mm/vspace_mapping.cpp \
 	kernel/mm/vspace_protection.cpp \
@@ -205,22 +250,40 @@ TEST_SRCS := \
   test/libk_test.cpp \
   test/allocator_test.cpp \
   test/bootinfo_test.cpp \
+  test/boot_bundle_test.cpp \
   test/cpu_topology_test.cpp \
   test/sched_test.cpp \
   test/cap_test.cpp \
   test/memory_test.cpp \
   test/translation_test.cpp \
   test/vspace_test.cpp \
-  test/user_test.cpp
+  test/user_test.cpp \
+  test/ipc_test.cpp
 
-PROOF_SRCS := user/initial.S
+USER_RUNTIME_SRCS := \
+  user/lib/crt0.S \
+  user/lib/crt.cpp \
+  user/riscv64/context.S \
+  libk/mem.c
+INIT_USER_SRCS := servers/init/main.cpp
+PROOF_USER_SRCS := servers/proof/main.cpp
+USER_SRCS := $(USER_RUNTIME_SRCS) $(INIT_USER_SRCS) $(PROOF_USER_SRCS)
+
+USER_CPP_SRCS := $(filter %.cpp,$(USER_SRCS))
+USER_C_SRCS := $(filter %.c,$(USER_SRCS))
+USER_S_SRCS := $(filter %.S,$(USER_SRCS))
+USER_CPP_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(USER_CPP_SRCS:.cpp=.cpp.o))
+USER_C_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(USER_C_SRCS:.c=.c.o))
+USER_S_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(USER_S_SRCS:.S=.S.o))
+USER_OBJS := $(USER_S_OBJS) $(USER_C_OBJS) $(USER_CPP_OBJS)
+USER_DEPS := $(USER_OBJS:.o=.d)
+USER_RUNTIME_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(USER_RUNTIME_SRCS:=.o))
+INIT_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(INIT_USER_SRCS:=.o))
+PROOF_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(PROOF_USER_SRCS:=.o))
 
 SRCS := $(ARCH_SRCS) $(KERNEL_SRCS)
 ifeq ($(ENABLE_TESTS),1)
 SRCS += $(TEST_SRCS)
-endif
-ifeq ($(ENABLE_INITIAL_USER_PROOF),1)
-SRCS += $(PROOF_SRCS)
 endif
 
 C_SRCS   := $(filter %.c,$(SRCS))
@@ -237,6 +300,8 @@ CPP_STACK_USAGE := $(CPP_OBJS:.o=.su)
 CLANG_CPP_SRCS := $(filter-out test/%,$(CPP_SRCS))
 
 all: $(TARGET) audit-boot-stack
+
+bundle: $(BOOT_BUNDLE) $(PROOF_BOOT_BUNDLE) audit-user
 
 $(TARGET): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -258,6 +323,38 @@ $(BUILD_DIR)/test/%.cpp.o: CXXFLAGS += \
 $(BUILD_DIR)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(INIT_USER_TARGET): $(USER_RUNTIME_OBJS) $(INIT_USER_OBJS) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_LDFLAGS) -Wl,-Map,$(INIT_USER_MAPFILE) \
+		-o $@ $(USER_RUNTIME_OBJS) $(INIT_USER_OBJS)
+
+$(PROOF_USER_TARGET): $(USER_RUNTIME_OBJS) $(PROOF_USER_OBJS) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_LDFLAGS) -Wl,-Map,$(PROOF_USER_MAPFILE) \
+		-o $@ $(USER_RUNTIME_OBJS) $(PROOF_USER_OBJS)
+
+$(USER_BUILD_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(USER_BUILD_DIR)/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_COMMON_FLAGS) -MMD -MP -c $< -o $@
+
+$(USER_BUILD_DIR)/%.S.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_ASFLAGS) -MMD -MP -c $< -o $@
+
+$(BOOTPACK): tools/bootpack/main.cpp uapi/boot_bundle.h
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) -std=c++23 -O2 -Wall -Wextra -Werror -I . $< -o $@
+
+$(BOOT_BUNDLE): $(INIT_USER_TARGET) $(PROOF_USER_TARGET) $(BOOTPACK)
+	$(BOOTPACK) $@ init init=$(INIT_USER_TARGET) proof=$(PROOF_USER_TARGET)
+
+$(PROOF_BOOT_BUNDLE): $(PROOF_USER_TARGET) $(BOOTPACK)
+	$(BOOTPACK) $@ proof proof=$(PROOF_USER_TARGET)
 
 disasm: $(TARGET)
 	$(OBJDUMP) -d $(TARGET) > $(BUILD_DIR)/kernel.disasm
@@ -339,6 +436,26 @@ audit-clang:
 	done
 	@echo "[audit] OK: Clang syntax audit passed"
 
+audit-user: $(INIT_USER_TARGET) $(PROOF_USER_TARGET)
+	@echo "[audit] checking independent user ELFs..."
+	@set -e; \
+	for image in $(INIT_USER_TARGET) $(PROOF_USER_TARGET); do \
+		if $(NM) -u "$$image" | rg -n "."; then \
+			echo "[audit] FAIL: undefined user symbol(s) in $$image"; \
+			exit 1; \
+		fi; \
+		if $(NM) --defined-only -n "$$image" | rg -n "(_ZTI|_ZTS|_ZTV)"; then \
+			echo "[audit] FAIL: RTTI/vtable symbol(s) in $$image"; \
+			exit 1; \
+		fi; \
+		if $(READELF) -A "$$image" | rg -q 'Tag_RISCV_arch:.*(_f|_d|_v)[0-9]'; then \
+			echo "[audit] FAIL: $$image requires F/D/V state"; \
+			$(READELF) -A "$$image"; \
+			exit 1; \
+		fi; \
+	done
+	@echo "[audit] OK: freestanding integer-only user ELF"
+
 kernel:
 	$(MAKE) PROFILE=kernel all
 
@@ -346,7 +463,7 @@ test:
 	$(MAKE) PROFILE=test all
 
 proof:
-	$(MAKE) PROFILE=proof all
+	$(MAKE) PROFILE=proof all bundle
 
 panic:
 	$(MAKE) PROFILE=kernel PANIC_PROBE=1 all
@@ -389,10 +506,10 @@ run-proof-smp:
 
 run-smp-timeout: run-proof-smp
 
-_run-proof-smp: $(TARGET) audit-boot-stack
+_run-proof-smp: $(TARGET) $(PROOF_BOOT_BUNDLE) audit-boot-stack audit-user
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(PROOF_BOOT_BUNDLE) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 124 ]; then \
@@ -410,13 +527,51 @@ _run-proof-smp: $(TARGET) audit-boot-stack
 		rm -f "$$output"; \
 		exit 1; \
 	fi; \
-	if ! rg -q "user: contained fault after syscalls=5 active-vspace-cpus=2" "$$output"; then \
-		echo "[smp] FAIL: shared-VSpace user/shootdown proof did not complete"; \
+	if ! rg -q "root init: started" "$$output"; then \
+		echo "[smp] FAIL: external root init did not start"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if ! rg -q "user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1" "$$output"; then \
+		echo "[smp] FAIL: independent proof did not complete its continuation chain"; \
 		rm -f "$$output"; \
 		exit 1; \
 	fi; \
 	rm -f "$$output"; \
-	echo "[smp] OK: all $(QEMU_SMP) harts Online and shared-VSpace proof completed"
+	echo "[smp] OK: all $(QEMU_SMP) harts Online and external root init started"
+
+run-e1-smp:
+	$(MAKE) PROFILE=proof _run-e1-smp
+
+_run-e1-smp: $(TARGET) $(BOOT_BUNDLE) audit-boot-stack audit-user
+	@set +e; \
+	output=$$(mktemp); \
+	timeout --foreground 8s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(BOOT_BUNDLE) > "$$output" 2>&1; \
+	status=$$?; \
+	cat "$$output"; \
+	if [ $$status -ne 124 ]; then \
+		echo "[e1] FAIL: QEMU status $$status (expected timeout 124)"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if ! rg -q "cpu: discovered=$(QEMU_SMP) prepared=0 starting=0 online=$(QEMU_SMP) failed=0" "$$output"; then \
+		echo "[e1] FAIL: expected all $(QEMU_SMP) harts Online"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if ! rg -q '^failed=0\r?$$' "$$output"; then \
+		echo "[e1] FAIL: builtin tests did not complete cleanly"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if ! rg -q "boot bundle: root=init" "$$output" \
+		|| ! rg -q "user: contained fault address=0xe100" "$$output"; then \
+		echo "[e1] FAIL: init did not load, run, and reclaim the proof task"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	rm -f "$$output"; \
+	echo "[e1] OK: init loaded and reclaimed the proof task on $(QEMU_SMP) harts"
 
 run-panic-smp:
 	$(MAKE) PROFILE=kernel PANIC_PROBE=1 _run-panic-smp
@@ -479,6 +634,6 @@ debug: $(TARGET) audit-boot-stack
 clean:
 	rm -rf build kernel.elf kernel.map kernel.disasm kernel.sym
 
--include $(DEPS)
+-include $(DEPS) $(USER_DEPS)
 
-.PHONY: all kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp debug clean
+.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp debug clean

@@ -9,6 +9,7 @@
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
 #include <core/kernel_image.hpp>
+#include <resource/traits.hpp>
 #include <sched/context.hpp>
 #include <thread/thread.hpp>
 
@@ -146,6 +147,15 @@ public:
         -> kernel::sched::SchedulingContext& {
         return targets_[index].get();
     }
+    [[nodiscard]] auto target_ref(usize index) noexcept
+        -> libk::Expected<kernel::object::ObjectRef,
+            kernel::object::ObjectError> {
+        if (index >= 2 || !targets_[index]) {
+            return libk::unexpected(
+                kernel::object::ObjectError::InvalidIdentity);
+        }
+        return targets_[index].ref();
+    }
     [[nodiscard]] auto objects() noexcept
         -> kernel::object::ObjectStore& {
         return *cap_test_objects;
@@ -154,6 +164,16 @@ public:
         KASSERT(index < 2 && targets_[index]);
         targets_[index].reset();
         cap_test_objects->drain_reclaim();
+    }
+    [[nodiscard]] auto retire_target(usize index) noexcept -> bool {
+        KASSERT(index < 2 && targets_[index]);
+        const auto id = targets_[index].id();
+        if (!targets_[index].retire()) {
+            return false;
+        }
+        targets_[index].reset();
+        cap_test_objects->drain_reclaim();
+        return !cap_test_objects->hold_context(id);
     }
 
 private:
@@ -329,8 +349,8 @@ bool test_delegation_revoke_waits_for_existing_lease(
     }
     const auto child_state = fixture.graph().state(child_key);
     if (!completion.complete() || probe.signals != 1
-        || !child_state
-        || child_state.value() != kernel::cap::GrantState::Revoked) {
+        || child_state
+        || child_state.error() != kernel::cap::GrantError::InvalidKey) {
         return false;
     }
     return fixture.b().close(child.value())
@@ -501,6 +521,95 @@ bool test_cspace_retire_waits_for_reserved_operation(
         && cap_test_pmm->verify_invariants();
 }
 
+bool test_sponsored_cspace_refunds_reusable_capacity(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+
+    constexpr kernel::resource::Budget limit{
+        .memory = 8 * kernel::mm::page_size,
+        .caps = 8,
+    };
+    constexpr kernel::resource::Budget object_charge{
+        .memory = kernel::mm::page_size,
+    };
+    auto made_pool = fixture.objects().create_resource(limit);
+    if (!made_pool) {
+        return false;
+    }
+    auto pool = libk::move(made_pool).value().publish();
+    auto pool_ref = pool.ref();
+    if (!pool_ref) {
+        return false;
+    }
+    auto charged = pool->reserve(
+        libk::move(pool_ref).value(), object_charge);
+    if (!charged) {
+        return false;
+    }
+    auto made_space = fixture.objects().create_cspace_sponsored(
+        libk::move(charged).value(),
+        CSpace::Quota{.slots = 8, .pages = 3});
+    if (!made_space) {
+        return false;
+    }
+    auto space = libk::move(made_space).value().publish();
+
+    auto root = fixture.root(0);
+    if (!root) {
+        return false;
+    }
+    auto installed = space->insert(
+        libk::move(root).value(), CapView{basic_rights});
+    const kernel::resource::Budget after_install{
+        .memory = limit.memory - object_charge.memory
+            - 3 * kernel::mm::page_size,
+        .caps = limit.caps - 1,
+    };
+    if (!installed || pool->available() != after_install
+        || !space->delegate(
+            installed.value(), fixture.b(), inspect_rights)) {
+        return false;
+    }
+    const kernel::resource::Budget after_delegate{
+        .memory = after_install.memory - GrantGraph::node_charge().memory,
+        .caps = after_install.caps,
+    };
+    if (pool->available() != after_delegate) {
+        return false;
+    }
+    auto child = space->delegate(
+        installed.value(), fixture.b(), inspect_rights);
+    if (!child || !fixture.b().close(child.value())
+        || pool->available() != after_delegate) {
+        return false;
+    }
+    // The first delegated capability is intentionally found through the only
+    // live destination slot. Closing its CSpace releases the sponsored node.
+    fixture.b().retire();
+    if (pool->available() != after_install
+        || !space->close(installed.value())
+        || pool->available().caps != limit.caps) {
+        return false;
+    }
+
+    if (!space.retire()) {
+        return false;
+    }
+    space.reset();
+    fixture.objects().drain_reclaim();
+    if (pool->available() != limit || pool->sponsorship_count() != 0
+        || pool->close() != kernel::resource::PoolState::Closed
+        || !pool.retire()) {
+        return false;
+    }
+    pool.reset();
+    fixture.objects().drain_reclaim();
+    return cap_test_pmm->verify_invariants();
+}
+
 bool test_attenuated_operations_and_revoke_use_slot_authority(
     const TestContext&) noexcept {
     CapFixture fixture{};
@@ -541,6 +650,309 @@ bool test_attenuated_operations_and_revoke_use_slot_authority(
         && fixture.b().close(child.value())
         && fixture.b().close(duplicate.value())
         && fixture.a().close(source.value());
+}
+
+bool test_revoked_tombstones_do_not_retain_target(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    const Rights rights = Rights::of(
+        Right::Delegate, Right::Inspect, Right::Revoke);
+    auto root = fixture.root(0, rights);
+    if (!root) {
+        return false;
+    }
+    auto source = fixture.a().insert(
+        libk::move(root).value(), CapView{rights});
+    if (!source) {
+        return false;
+    }
+    auto child = fixture.a().delegate(
+        source.value(), fixture.b(), inspect_rights);
+    if (!child) {
+        return false;
+    }
+
+    kernel::cap::GrantRevoke completion{};
+    if (!fixture.a().revoke(source.value(), completion, true)
+        || !completion.complete()
+        || !fixture.retire_target(0)) {
+        return false;
+    }
+
+    // Both slots deliberately remain occupied while target reclamation is
+    // observed.  They are identity tombstones, not hidden object owners.
+    auto source_dead = fixture.a().resolve<kernel::sched::SchedulingContext>(
+        source.value(), inspect_rights);
+    auto child_dead = fixture.b().resolve<kernel::sched::SchedulingContext>(
+        child.value(), inspect_rights);
+    return !source_dead && !child_dead
+        && fixture.b().close(child.value())
+        && fixture.a().close(source.value())
+        && fixture.graph().live_count() == 0;
+}
+
+bool test_allocation_transaction_aborts_complete_lineage(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    constexpr kernel::resource::Budget limit{
+        .memory = 4 * kernel::mm::page_size,
+        .caps = 4,
+    };
+    auto pending_pool = fixture.objects().create_resource(limit);
+    if (!pending_pool) {
+        return false;
+    }
+    auto pool = libk::move(pending_pool).value().publish();
+    auto permit_ref = pool.ref();
+    if (!permit_ref) {
+        return false;
+    }
+    auto permit = pool->begin(libk::move(permit_ref).value());
+    auto root_pool_ref = pool.ref();
+    auto child_pool_ref = pool.ref();
+    if (!permit || !root_pool_ref || !child_pool_ref) {
+        return false;
+    }
+    auto root_reservation = pool->reserve(
+        libk::move(root_pool_ref).value(), GrantGraph::node_charge());
+    auto child_reservation = pool->reserve(
+        libk::move(child_pool_ref).value(), GrantGraph::node_charge());
+    auto target_ref = fixture.target_ref(0);
+    if (!root_reservation || !child_reservation || !target_ref) {
+        return false;
+    }
+    auto allocation = fixture.graph().create_allocation(
+        permit.value(),
+        libk::move(root_reservation).value(),
+        libk::move(target_ref).value(),
+        GrantCeiling{all_context_rights});
+    if (!allocation) {
+        return false;
+    }
+    auto root_lease = allocation.value().acquire();
+    auto child_target = fixture.target_ref(0);
+    if (!root_lease || !child_target) {
+        return false;
+    }
+    auto child = fixture.graph().derive(
+        libk::move(child_reservation).value(),
+        root_lease.value(),
+        libk::move(child_target).value(),
+        GrantCeiling{inspect_rights});
+    root_lease.value().reset();
+    if (!child) {
+        return false;
+    }
+
+    allocation.value().reset();
+    child.value().reset();
+    permit.value().reset();
+    fixture.drop_retired_target(0);
+    if (fixture.graph().live_count() != 0
+        || pool->available() != limit
+        || pool->sponsorship_count() != 0
+        || pool->close() != kernel::resource::PoolState::Closed
+        || !pool.retire()) {
+        return false;
+    }
+    pool.reset();
+    fixture.objects().drain_reclaim();
+    return cap_test_pmm->verify_invariants();
+}
+
+bool test_pool_close_revokes_hidden_allocation_root(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    constexpr kernel::resource::Budget limit{
+        .memory = 4 * kernel::mm::page_size,
+        .caps = 4,
+    };
+    auto pending_pool = fixture.objects().create_resource(limit);
+    if (!pending_pool) {
+        return false;
+    }
+    auto pool = libk::move(pending_pool).value().publish();
+    auto permit_ref = pool.ref();
+    auto root_pool_ref = pool.ref();
+    auto child_pool_ref = pool.ref();
+    if (!permit_ref || !root_pool_ref || !child_pool_ref) {
+        return false;
+    }
+    auto permit = pool->begin(libk::move(permit_ref).value());
+    auto root_reservation = pool->reserve(
+        libk::move(root_pool_ref).value(), GrantGraph::node_charge());
+    auto child_reservation = pool->reserve(
+        libk::move(child_pool_ref).value(), GrantGraph::node_charge());
+    auto target_ref = fixture.target_ref(0);
+    if (!permit || !root_reservation || !child_reservation || !target_ref) {
+        return false;
+    }
+    auto allocation = fixture.graph().create_allocation(
+        permit.value(),
+        libk::move(root_reservation).value(),
+        libk::move(target_ref).value(),
+        GrantCeiling{all_context_rights});
+    if (!allocation) {
+        return false;
+    }
+    auto root_lease = allocation.value().acquire();
+    auto child_target = fixture.target_ref(0);
+    if (!root_lease || !child_target) {
+        return false;
+    }
+    auto child = fixture.graph().derive(
+        libk::move(child_reservation).value(),
+        root_lease.value(),
+        libk::move(child_target).value(),
+        GrantCeiling{inspect_rights});
+    root_lease.value().reset();
+    if (!child) {
+        return false;
+    }
+    auto installed = fixture.a().insert(
+        libk::move(child).value(), CapView{inspect_rights});
+    if (!installed) {
+        return false;
+    }
+    allocation.value().commit();
+    permit.value().reset();
+
+    if (pool->close() != kernel::resource::PoolState::Closed
+        || pool->available() != limit
+        || pool->sponsorship_count() != 0
+        || fixture.graph().live_count() != 0) {
+        return false;
+    }
+    auto dead = fixture.a().resolve<kernel::sched::SchedulingContext>(
+        installed.value(), inspect_rights);
+    if (dead || !fixture.a().close(installed.value())) {
+        return false;
+    }
+    fixture.drop_retired_target(0);
+    if (!pool.retire()) {
+        return false;
+    }
+    pool.reset();
+    fixture.objects().drain_reclaim();
+    return cap_test_pmm->verify_invariants();
+}
+
+bool test_parent_close_recursively_closes_child_pool(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    constexpr kernel::resource::Budget parent_limit{
+        .memory = 16 * kernel::mm::page_size,
+        .caps = 16,
+    };
+    constexpr kernel::resource::Budget child_limit{
+        .memory = 4 * kernel::mm::page_size,
+        .caps = 4,
+    };
+    constexpr auto child_slot = kernel::resource::Traits<
+        kernel::resource::ResourcePool>::fixed();
+    constexpr kernel::resource::Budget child_charge{
+        .memory = child_slot.memory + child_limit.memory,
+        .caps = child_slot.caps + child_limit.caps,
+    };
+
+    auto pending_parent = fixture.objects().create_resource(parent_limit);
+    if (!pending_parent) {
+        return false;
+    }
+    auto parent = libk::move(pending_parent).value().publish();
+    auto permit_ref = parent.ref();
+    auto child_charge_ref = parent.ref();
+    auto root_charge_ref = parent.ref();
+    auto user_charge_ref = parent.ref();
+    if (!permit_ref || !child_charge_ref
+        || !root_charge_ref || !user_charge_ref) {
+        return false;
+    }
+    auto permit = parent->begin(libk::move(permit_ref).value());
+    auto object_reservation = parent->reserve(
+        libk::move(child_charge_ref).value(), child_charge);
+    auto root_reservation = parent->reserve(
+        libk::move(root_charge_ref).value(), GrantGraph::node_charge());
+    auto user_reservation = parent->reserve(
+        libk::move(user_charge_ref).value(), GrantGraph::node_charge());
+    if (!permit || !object_reservation
+        || !root_reservation || !user_reservation) {
+        return false;
+    }
+    auto pending_child = fixture.objects().create_resource_sponsored(
+        libk::move(object_reservation).value(), child_limit);
+    if (!pending_child) {
+        return false;
+    }
+    auto child = libk::move(pending_child).value().publish();
+    auto child_ref = child.ref();
+    if (!child_ref) {
+        return false;
+    }
+    const auto rights = Rights::of(
+        Right::Inspect, Right::Create, Right::Close, Right::Revoke);
+    const kernel::cap::ResourcePoolAuthority authority{
+        .budget = child_limit,
+        .object_kinds = u64{1} << static_cast<u16>(
+            kernel::object::ObjectKind::ResourcePool),
+    };
+    auto allocation = fixture.graph().create_allocation(
+        permit.value(),
+        libk::move(root_reservation).value(),
+        libk::move(child_ref).value(),
+        GrantCeiling{rights, authority});
+    if (!allocation) {
+        return false;
+    }
+    auto root_lease = allocation.value().acquire();
+    auto user_target = child.ref();
+    if (!root_lease || !user_target) {
+        return false;
+    }
+    auto user_grant = fixture.graph().derive(
+        libk::move(user_reservation).value(),
+        root_lease.value(),
+        libk::move(user_target).value(),
+        GrantCeiling{rights, authority});
+    root_lease.value().reset();
+    if (!user_grant) {
+        return false;
+    }
+    auto installed = fixture.a().insert(
+        libk::move(user_grant).value(), CapView{rights, authority});
+    if (!installed) {
+        return false;
+    }
+    allocation.value().commit();
+    permit.value().reset();
+    child.reset();
+
+    if (parent->close() != kernel::resource::PoolState::Reclaiming) {
+        return false;
+    }
+    fixture.objects().drain_reclaim();
+    if (parent->state() != kernel::resource::PoolState::Closed
+        || parent->available() != parent_limit
+        || fixture.graph().live_count() != 0
+        || !fixture.a().close(installed.value())
+        || !parent.retire()) {
+        return false;
+    }
+    parent.reset();
+    fixture.objects().drain_reclaim();
+    return cap_test_pmm->verify_invariants();
 }
 
 bool test_destroy_authority_uses_object_anchor_retirement(
@@ -597,8 +1009,28 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         test_cspace_retire_waits_for_reserved_operation);
     (void)registry.add(
         "cap",
+        "sponsored CSpace refunds selector and table capacity at reuse",
+        test_sponsored_cspace_refunds_reusable_capacity);
+    (void)registry.add(
+        "cap",
         "attenuated ABI operations and revoke use effective slot authority",
         test_attenuated_operations_and_revoke_use_slot_authority);
+    (void)registry.add(
+        "cap",
+        "revoked tombstones release their hidden target hold",
+        test_revoked_tombstones_do_not_retain_target);
+    (void)registry.add(
+        "cap",
+        "allocation transaction abort revokes its complete hidden lineage",
+        test_allocation_transaction_aborts_complete_lineage);
+    (void)registry.add(
+        "cap",
+        "ResourcePool close revokes hidden roots without scanning CSpaces",
+        test_pool_close_revokes_hidden_allocation_root);
+    (void)registry.add(
+        "cap",
+        "parent ResourcePool close recursively drains its child pool",
+        test_parent_close_recursively_closes_child_pool);
     (void)registry.add(
         "cap",
         "destroy authority enters the target ObjectAnchor retirement path",

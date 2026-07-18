@@ -22,6 +22,7 @@ public:
     void enqueue(Binding& binding, Urgency urgency) noexcept;
     void remove(Binding& binding, Urgency urgency) noexcept;
     [[nodiscard]] auto front() noexcept -> Binding*;
+    [[nodiscard]] auto activation_front() noexcept -> Binding*;
     [[nodiscard]] auto pop_front(Urgency urgency) noexcept -> Binding*;
 
 private:

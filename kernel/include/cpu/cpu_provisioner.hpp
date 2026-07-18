@@ -13,6 +13,9 @@ class Pmm;
 
 namespace kernel {
 
+class KernelStack;
+class KernelState;
+
 namespace object {
 class ObjectStore;
 }
@@ -38,22 +41,39 @@ public:
         CpuRegistry& registry,
         kernel::mm::Pmm& pmm,
         object::ObjectStore& objects,
-        time::Clock& clock) noexcept
+        time::Clock& clock,
+        KernelState* kernel = nullptr) noexcept
         : registry_(registry),
           pmm_(pmm),
           objects_(objects),
-          clock_(clock) {}
+          clock_(clock),
+          kernel_(kernel) {}
 
     [[nodiscard]] auto prepare(
         CpuId id,
         kernel::mm::KernelVSpace& vspace,
         Thread::Entry idle_entry) noexcept -> Result;
 
+    // The boot CPU is already executing on this stack. Ownership transfers
+    // only after every fallible provisioning step has succeeded.
+    [[nodiscard]] auto prepare_boot(
+        CpuId id,
+        kernel::mm::KernelVSpace& vspace,
+        KernelStack& init_stack,
+        Thread::Entry idle_entry) noexcept -> Result;
+
 private:
+    [[nodiscard]] auto prepare_impl(
+        CpuId id,
+        kernel::mm::KernelVSpace& vspace,
+        KernelStack* init_stack,
+        Thread::Entry idle_entry) noexcept -> Result;
+
     CpuRegistry& registry_;
     kernel::mm::Pmm& pmm_;
     object::ObjectStore& objects_;
     time::Clock& clock_;
+    KernelState* kernel_{};
 };
 
 } // namespace kernel

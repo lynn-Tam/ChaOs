@@ -9,6 +9,7 @@
 #include <libk/sync/ticket_spin_lock.hpp>
 #include <libk/utility.hpp>
 #include <mm/pmm.hpp>
+#include <resource/sponsorship.hpp>
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel::mm {
@@ -28,6 +29,7 @@ enum class NodePoolError : u8 {
     OutOfMemory,
     QuotaExceeded,
     GenerationExhausted,
+    ResourceExhausted,
 };
 
 // Stable page-backed storage for semantic nodes that are owned by a kernel
@@ -55,10 +57,17 @@ class NodePool final : private libk::noncopyable_nonmovable {
     };
 
     struct PageHeader final {
-        explicit PageHeader(OwnedPage&& page) noexcept
-            : backing(libk::move(page)) {}
+        PageHeader(
+            OwnedPage&& page,
+            kernel::resource::Reservation&& charge) noexcept
+            : backing(libk::move(page)) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
 
         OwnedPage backing;
+        kernel::resource::Sponsorship sponsorship{};
         PageHeader* next{};
         Slot* free_head{};
         usize live_count{};
@@ -97,6 +106,13 @@ public:
             release_page(*page);
         }
         KASSERT(page_count_ == 0);
+    }
+
+    void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(sponsor_ == nullptr && sponsor);
+        KASSERT(pages_ == nullptr && page_count_ == 0 && live_count_ == 0);
+        sponsor_ = &sponsor;
     }
 
     template<typename... Args>
@@ -269,6 +285,16 @@ private:
 
     [[nodiscard]] auto make_page() noexcept
         -> libk::Expected<PageHeader*, NodePoolError> {
+        kernel::resource::Reservation charge{};
+        if (sponsor_ != nullptr) {
+            auto reserved = sponsor_->reserve(kernel::resource::Budget{
+                .memory = page_size,
+            });
+            if (!reserved) {
+                return libk::unexpected(NodePoolError::ResourceExhausted);
+            }
+            charge = libk::move(reserved).value();
+        }
         auto allocated = pmm_->allocate_page();
         if (!allocated) {
             return libk::unexpected(NodePoolError::OutOfMemory);
@@ -276,7 +302,8 @@ private:
         OwnedPage backing = libk::move(allocated).value();
         auto* const page = libk::construct_at(
             reinterpret_cast<PageHeader*>(backing.bytes()),
-            libk::move(backing));
+            libk::move(backing),
+            libk::move(charge));
         Slot* const storage = slots(*page);
         for (usize index = slots_per_page; index > 0; --index) {
             Slot* const slot = libk::construct_at(&storage[index - 1]);
@@ -294,9 +321,11 @@ private:
             KASSERT(!storage[index].occupied);
             libk::destroy_at(&storage[index]);
         }
+        auto refund = page.sponsorship.detach();
         OwnedPage backing = libk::move(page.backing);
         libk::destroy_at(&page);
         backing.reset();
+        refund.complete();
     }
 
     Pmm* pmm_{};
@@ -307,6 +336,7 @@ private:
     usize live_count_{};
     usize quarantined_{};
     usize growing_{};
+    kernel::resource::Sponsorship* sponsor_{};
 };
 
 } // namespace kernel::mm

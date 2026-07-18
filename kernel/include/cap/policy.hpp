@@ -59,6 +59,18 @@ struct CapabilityPolicy<object::ObjectKind::Thread> final
           Right::Destroy, Right::Revoke> {};
 
 template<>
+struct CapabilityPolicy<object::ObjectKind::Vproc> final
+    : RightsPolicy<
+          Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control,
+          Right::Bind, Right::Destroy, Right::Revoke> {};
+
+template<>
+struct CapabilityPolicy<object::ObjectKind::Tunnel> final
+    : RightsPolicy<
+          Right::Duplicate, Right::Delegate, Right::Inspect, Right::Signal,
+          Right::Wait, Right::Close, Right::Destroy, Right::Revoke> {};
+
+template<>
 struct CapabilityPolicy<object::ObjectKind::SchedulingContext> final
     : RightsPolicy<
           Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control,
@@ -87,6 +99,24 @@ struct CapabilityPolicy<object::ObjectKind::MemoryObject> final {
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::VSpace> final {
+    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto compose(
+        GrantCeiling ceiling,
+        CapView view) noexcept
+        -> libk::Expected<EffectiveAuthority, PolicyError>;
+};
+
+template<>
+struct CapabilityPolicy<object::ObjectKind::ResourcePool> final {
+    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto compose(
+        GrantCeiling ceiling,
+        CapView view) noexcept
+        -> libk::Expected<EffectiveAuthority, PolicyError>;
+};
+
+template<>
+struct CapabilityPolicy<object::ObjectKind::Notification> final {
     [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
         GrantCeiling ceiling,

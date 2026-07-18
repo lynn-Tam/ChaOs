@@ -16,7 +16,8 @@ CSpace::CSpace(kernel::mm::Pmm& pmm, Quota quota) noexcept
 
 CSpace::Reservation::Reservation(Reservation&& other) noexcept
     : owner_(libk::exchange(other.owner_, nullptr)),
-      handle_(libk::exchange(other.handle_, CapHandle{})) {}
+      handle_(libk::exchange(other.handle_, CapHandle{})),
+      charge_(libk::move(other.charge_)) {}
 
 auto CSpace::Reservation::operator=(Reservation&& other) noexcept
     -> Reservation& {
@@ -24,6 +25,7 @@ auto CSpace::Reservation::operator=(Reservation&& other) noexcept
         reset();
         owner_ = libk::exchange(other.owner_, nullptr);
         handle_ = libk::exchange(other.handle_, CapHandle{});
+        charge_ = libk::move(other.charge_);
     }
     return *this;
 }
@@ -54,6 +56,14 @@ CSpace::~CSpace() noexcept {
 
 auto CSpace::reserve() noexcept
     -> libk::Expected<Reservation, CSpaceError> {
+    kernel::resource::Reservation slot_charge{};
+    if (sponsor_ != nullptr) {
+        auto charged = sponsor_->reserve(kernel::resource::Budget{.caps = 1});
+        if (!charged) {
+            return libk::unexpected(CSpaceError::ResourceExhausted);
+        }
+        slot_charge = libk::move(charged).value();
+    }
     for (;;) {
         {
             kernel::sync::IrqLockGuard guard{lock_};
@@ -84,7 +94,8 @@ auto CSpace::reserve() noexcept
                 const CapHandle handle = CapHandle::make(
                     index, available->generation);
                 KASSERT(handle);
-                return libk::expected(Reservation{*this, handle});
+                return libk::expected(Reservation{
+                    *this, handle, libk::move(slot_charge)});
             }
 
             const usize capacity = next_leaf_ * leaf_slots;
@@ -110,7 +121,31 @@ auto CSpace::reserve() noexcept
     }
 }
 
+auto CSpace::reserve_grant() noexcept
+    -> libk::Expected<kernel::resource::Reservation, CSpaceError> {
+    if (sponsor_ == nullptr) {
+        return libk::expected(kernel::resource::Reservation{});
+    }
+    auto charged = sponsor_->reserve(GrantGraph::node_charge());
+    if (!charged) {
+        return libk::unexpected(CSpaceError::ResourceExhausted);
+    }
+    return libk::expected(libk::move(charged).value());
+}
+
 auto CSpace::insert(
+    GrantRef&& grant,
+    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    auto reserved = reserve();
+    if (!reserved) {
+        return libk::unexpected(reserved.error());
+    }
+    return insert(
+        libk::move(reserved).value(), libk::move(grant), view);
+}
+
+auto CSpace::insert(
+    Reservation&& reserved,
     GrantRef&& grant,
     CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     if (!grant) {
@@ -126,17 +161,14 @@ auto CSpace::insert(
         return libk::unexpected(policy_error(effective.error()));
     }
 
-    auto reserved = reserve();
-    if (!reserved) {
-        return libk::unexpected(reserved.error());
-    }
-    Reservation reservation = libk::move(reserved).value();
+    Reservation reservation = libk::move(reserved);
     return commit(reservation, libk::move(grant), view);
 }
 
 auto CSpace::close(CapHandle handle) noexcept
     -> libk::Expected<void, CSpaceError> {
     GrantRef released{};
+    kernel::resource::Refund refund{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         Slot* const occupied = handle ? slot(handle.index()) : nullptr;
@@ -152,6 +184,7 @@ auto CSpace::close(CapHandle handle) noexcept
         unlink_occupied(handle.index(), *occupied);
         released = libk::move(capability.grant);
         libk::destroy_at(&capability);
+        refund = occupied->sponsorship.detach();
         occupied->state = SlotState::Empty;
         KASSERT(live_slots_ != 0);
         --live_slots_;
@@ -160,6 +193,7 @@ auto CSpace::close(CapHandle handle) noexcept
         }
     }
     released.reset();
+    refund.complete();
     finish_retire();
     return libk::expected();
 }
@@ -262,8 +296,19 @@ auto CSpace::delegate(
     if (!target) {
         return libk::unexpected(CSpaceError::GrantUnavailable);
     }
+    kernel::resource::Reservation grant_charge{};
+    if (sponsor_ != nullptr) {
+        auto charged = sponsor_->reserve(source.graph->node_charge());
+        if (!charged) {
+            return libk::unexpected(CSpaceError::ResourceExhausted);
+        }
+        grant_charge = libk::move(charged).value();
+    }
     auto child = source.graph->derive(
-        lease, libk::move(target).value(), ceiling);
+        libk::move(grant_charge),
+        lease,
+        libk::move(target).value(),
+        ceiling);
     if (!child) {
         return libk::unexpected(grant_error(child.error()));
     }
@@ -338,7 +383,7 @@ auto CSpace::revoke(
     Thread& thread,
     CpuRegistry& cpus,
     bool include_source) noexcept
-    -> libk::Expected<RevokeState, CSpaceError> {
+    -> libk::Expected<kernel::operation::State, CSpaceError> {
     auto copied = snapshot(source_handle);
     if (!copied) {
         return libk::unexpected(copied.error());
@@ -376,8 +421,8 @@ auto CSpace::revoke(
         return libk::unexpected(grant_error(started.error()));
     }
     return libk::expected(operation->arm()
-        ? RevokeState::Waiting
-        : RevokeState::Complete);
+        ? kernel::operation::State::Waiting
+        : kernel::operation::State::Complete);
 }
 
 auto CSpace::destroy(CapHandle source_handle) noexcept
@@ -418,6 +463,7 @@ auto CSpace::move(
     }
     Reservation reservation = libk::move(reserved).value();
     const CapHandle destination_handle = reservation.handle();
+    kernel::resource::Refund source_refund{};
 
     CSpace* first = this;
     CSpace* second = &destination;
@@ -454,6 +500,10 @@ auto CSpace::move(
             &target->storage.capability,
             libk::move(source->storage.capability));
         libk::destroy_at(&source->storage.capability);
+        if (reservation.charge_) {
+            target->sponsorship.commit(libk::move(reservation.charge_));
+        }
+        source_refund = source->sponsorship.detach();
         target->state = SlotState::Occupied;
         destination.link_occupied(destination_handle.index(), *target);
         unlink_occupied(source_handle.index(), *source);
@@ -470,6 +520,7 @@ auto CSpace::move(
     }
     first->lock_.unlock();
     arch::restore_interrupts(interrupts);
+    source_refund.complete();
 
     return transferred
         ? libk::Expected<CapHandle, CSpaceError>{
@@ -524,6 +575,9 @@ auto CSpace::commit_locked(
     libk::construct_at(
         &target->storage.capability,
         Capability{libk::move(grant), view});
+    if (reservation.charge_) {
+        target->sponsorship.commit(libk::move(reservation.charge_));
+    }
     target->state = SlotState::Occupied;
     link_occupied(handle.index(), *target);
     reservation.disarm();
@@ -573,6 +627,24 @@ auto CSpace::grow() noexcept -> libk::Expected<void, CSpaceError> {
         return libk::unexpected(CSpaceError::PageQuota);
     }
 
+    kernel::resource::Reservation charges[3]{};
+    if (sponsor_ != nullptr) {
+        for (usize index = 0; index < required; ++index) {
+            auto charged = sponsor_->reserve(kernel::resource::Budget{
+                .memory = kernel::mm::page_size});
+            if (!charged) {
+                {
+                    kernel::sync::IrqLockGuard guard{lock_};
+                    KASSERT(growing_);
+                    growing_ = false;
+                }
+                finish_retire();
+                return libk::unexpected(CSpaceError::ResourceExhausted);
+            }
+            charges[index] = libk::move(charged).value();
+        }
+    }
+
     DirPage* new_root{};
     DirPage* new_mid{};
     LeafPage* new_leaf{};
@@ -611,15 +683,21 @@ auto CSpace::grow() noexcept -> libk::Expected<void, CSpaceError> {
         if (allocated) {
             if (needs_root) {
                 new_root = libk::construct_at(
-                    reinterpret_cast<DirPage*>(extension.bytes(root_page)));
+                    reinterpret_cast<DirPage*>(extension.bytes(root_page)),
+                    root_page,
+                    libk::move(charges[0]));
             }
             if (needs_mid) {
                 new_mid = libk::construct_at(
-                    reinterpret_cast<DirPage*>(extension.bytes(mid_page)));
+                    reinterpret_cast<DirPage*>(extension.bytes(mid_page)),
+                    mid_page,
+                    libk::move(charges[static_cast<usize>(needs_root)]));
             }
             new_leaf = libk::construct_at(
                 reinterpret_cast<LeafPage*>(extension.bytes(leaf_page)),
-                static_cast<u32>(leaf_number * leaf_slots));
+                static_cast<u32>(leaf_number * leaf_slots),
+                leaf_page,
+                libk::move(charges[required - 1]));
             extension.commit();
         }
     }
@@ -752,6 +830,7 @@ void CSpace::retire() noexcept {
 
     for (;;) {
         GrantRef released{};
+        kernel::resource::Refund refund{};
         bool found{};
         {
             kernel::sync::IrqLockGuard guard{lock_};
@@ -764,6 +843,7 @@ void CSpace::retire() noexcept {
                 Capability& capability = current->storage.capability;
                 released = libk::move(capability.grant);
                 libk::destroy_at(&capability);
+                refund = current->sponsorship.detach();
                 current->state = SlotState::Empty;
                 KASSERT(live_slots_ != 0);
                 --live_slots_;
@@ -774,6 +854,7 @@ void CSpace::retire() noexcept {
             break;
         }
         released.reset();
+        refund.complete();
     }
 
     finish_retire();
@@ -802,6 +883,12 @@ void CSpace::detach_execution() noexcept {
     kernel::sync::IrqLockGuard guard{lock_};
     KASSERT(bindings_ != 0);
     --bindings_;
+}
+
+void CSpace::bind_sponsor(
+    kernel::resource::Sponsorship& sponsor) noexcept {
+    KASSERT(sponsor_ == nullptr && sponsor);
+    sponsor_ = &sponsor;
 }
 
 auto CSpace::binding_count() const noexcept -> usize {
@@ -839,12 +926,30 @@ void CSpace::finish_retire() noexcept {
                 auto* const leaf = static_cast<LeafPage*>(mid->children[low]);
                 if (leaf != nullptr) {
                     KASSERT((leaf->base_index >> leaf_bits) < leaves);
+                    auto refund = leaf->sponsorship.detach();
+                    const kernel::mm::Page page = leaf->page;
                     libk::destroy_at(leaf);
+                    auto backing = pages_.detach(page);
+                    KASSERT(backing);
+                    backing->reset();
+                    refund.complete();
                 }
             }
+            auto refund = mid->sponsorship.detach();
+            const kernel::mm::Page page = mid->page;
             libk::destroy_at(mid);
+            auto backing = pages_.detach(page);
+            KASSERT(backing);
+            backing->reset();
+            refund.complete();
         }
+        auto refund = root->sponsorship.detach();
+        const kernel::mm::Page page = root->page;
         libk::destroy_at(root);
+        auto backing = pages_.detach(page);
+        KASSERT(backing);
+        backing->reset();
+        refund.complete();
     }
     pages_.reset();
     {

@@ -18,7 +18,7 @@
 namespace kernel::mm {
 
 Mapping::~Mapping() noexcept {
-    KASSERT(ipc_relations_.empty());
+    KASSERT(views_.empty());
 }
 
 MappedPage::~MappedPage() noexcept {
@@ -41,11 +41,13 @@ MappingAuthority::MappingAuthority(
     object::ObjectRef&& memory,
     MemoryObject& object,
     cap::MemoryAuthority frozen,
+    AccessMask access,
     AuthoritySource source) noexcept
     : owner_(&owner),
       memory_ref_(libk::move(memory)),
       memory_(&object),
       frozen_(frozen),
+      access_(access),
       source_(source),
       memory_attachment_(this, memory_ops_) {}
 
@@ -62,7 +64,7 @@ MappingAuthority::~MappingAuthority() noexcept {
 
 auto MappingAuthority::attach_memory() noexcept
     -> libk::Expected<void, MemoryError> {
-    return memory_->attach(memory_attachment_);
+    return memory_->attach(memory_attachment_, access_);
 }
 
 auto MappingAuthority::attach_grant(
@@ -115,6 +117,7 @@ void MappingAuthority::invalidate_memory(
 void MappingAuthority::memory_released(void* context) noexcept {
     auto& authority = *static_cast<MappingAuthority*>(context);
     authority.release_notified_.store<libk::MemoryOrder::Release>(true);
+    authority.owner_->schedule_work();
 }
 
 void MappingAuthority::invalidate_grant(
@@ -128,6 +131,7 @@ void MappingAuthority::invalidate_grant(
 void MappingAuthority::grant_released(void* context) noexcept {
     auto& authority = *static_cast<MappingAuthority*>(context);
     authority.release_notified_.store<libk::MemoryOrder::Release>(true);
+    authority.owner_->schedule_work();
 }
 
 VSpace::VSpace(
@@ -143,7 +147,7 @@ VSpace::VSpace(
       guards_(pmm),
       authorities_(pmm),
       pages_(pmm),
-      ipc_relations_(pmm) {}
+      views_(pmm) {}
 
 VSpace::~VSpace() noexcept {
     KASSERT(state_ == VSpaceState::Quiescent);
@@ -154,17 +158,45 @@ VSpace::~VSpace() noexcept {
     KASSERT(pending_kind_ == PendingKind::None);
     KASSERT(!ticket_ && !retire_batch_ && !cleanup_);
     KASSERT(!work_hook_.is_linked());
+    KASSERT(!work_open_.load<libk::MemoryOrder::Acquire>());
     KASSERT(bindings_ == 0);
+    KASSERT(!table_charge_);
+}
+
+void VSpace::bind_sponsor(
+    kernel::resource::Sponsorship& sponsor) noexcept {
+    KASSERT(sponsor_ == nullptr && sponsor);
+    KASSERT(state_ == VSpaceState::Building && !root_);
+    sponsor_ = &sponsor;
+    regions_.bind_sponsor(sponsor);
+    mappings_.bind_sponsor(sponsor);
+    reservations_.bind_sponsor(sponsor);
+    guards_.bind_sponsor(sponsor);
+    authorities_.bind_sponsor(sponsor);
+    pages_.bind_sponsor(sponsor);
+    views_.bind_sponsor(sponsor);
 }
 
 auto VSpace::initialize() noexcept -> libk::Expected<void, VSpaceError> {
     if (state_ != VSpaceState::Building || root_) {
         return libk::unexpected(VSpaceError::InvalidState);
     }
+    kernel::resource::Charge root_charge{};
+    if (sponsor_ != nullptr) {
+        auto acquired = sponsor_->acquire(kernel::resource::Budget{
+            .memory = static_cast<u64>(arch::UserRoot::base_pages)
+                * page_size,
+        });
+        if (!acquired) {
+            return libk::unexpected(VSpaceError::ResourceExhausted);
+        }
+        root_charge = libk::move(acquired).value();
+    }
     auto root = kernel_->create_user_root(*pmm_);
     if (!root) {
         return libk::unexpected(VSpaceError::OutOfMemory);
     }
+    KASSERT(root.value().page_count() == arch::UserRoot::base_pages);
     const VirtRange range{
         VirtAddr{kernel::mm::layout::LowGuardEnd},
         kernel::mm::layout::UserEnd - kernel::mm::layout::LowGuardEnd};
@@ -180,10 +212,29 @@ auto VSpace::initialize() noexcept -> libk::Expected<void, VSpaceError> {
     }
     [[maybe_unused]] auto& installed_root =
         root_.emplace(libk::move(root).value());
+    table_charge_.merge(libk::move(root_charge));
     root_region_ = made.value().object;
     root_region_->key_ = RegionKey{made.value().key};
+    work_open_.store<libk::MemoryOrder::Release>(true);
     state_ = VSpaceState::Live;
     return libk::expected();
+}
+
+void VSpace::release_root() noexcept {
+    KASSERT(root_);
+    const usize pages = root_->page_count();
+    root_.reset();
+    if (!table_charge_) {
+        KASSERT(sponsor_ == nullptr);
+        return;
+    }
+    const kernel::resource::Budget expected{
+        .memory = static_cast<u64>(pages) * page_size,
+    };
+    KASSERT(table_charge_.budget() == expected);
+    // UserRoot released every owned table page above.  Capacity becomes
+    // available only after that physical ownership transition.
+    table_charge_.reset();
 }
 
 auto VSpace::state() const noexcept -> VSpaceState {
@@ -243,14 +294,15 @@ auto VSpace::translation() noexcept -> TranslationView {
 auto VSpace::commit_translation(
     TranslationState::Mutation&& mutation,
     ShootdownPlan&& plan,
-    RetireBatch& retire) noexcept
+    RetireBatch& retire,
+    bool instruction_sync) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
     KASSERT(pending_kind_ != PendingKind::None);
     auto& ticket = ticket_.emplace(
         kernel::sync::Completion::Notifier::bind<
             &VSpace::translation_ready>(*this));
     const ShootdownStatus status = mutation.commit(
-        libk::move(plan), ticket, &retire);
+        libk::move(plan), ticket, &retire, instruction_sync);
     if (status == ShootdownStatus::Complete) {
         KASSERT(finish_pending());
         return libk::expected(VmStatus::Complete);
@@ -284,7 +336,7 @@ void VSpace::queue_authority(MappingAuthority& authority) noexcept {
 }
 
 void VSpace::detach_mapping(Mapping& mapping) noexcept {
-    KASSERT(mapping.ipc_relations_.empty());
+    KASSERT(mapping.views_.empty());
     MappingAuthority& authority = *mapping.authority_;
     if (mapping.authority_hook_.is_linked()) {
         authority.mappings_.erase(mapping);
@@ -319,29 +371,60 @@ void VSpace::release_page(MappedPage& page) noexcept {
 }
 
 void VSpace::finish_authorities() noexcept {
-    MappingAuthority** link = &pending_authorities_;
-    while (*link != nullptr) {
-        MappingAuthority* const authority = *link;
-        KASSERT(authority->mappings_.empty());
-        KASSERT(authority->pages_.empty());
-        if (authority->invalidation_hook_.is_linked()) {
-            invalidations_.erase(*authority);
+    for (;;) {
+        MappingAuthority* authority{};
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            for (MappingAuthority* candidate = pending_authorities_;
+                 candidate != nullptr;
+                 candidate = candidate->pending_next_) {
+                if (!candidate->releasing_relations_) {
+                    authority = candidate;
+                    break;
+                }
+            }
+            if (authority == nullptr) {
+                try_finish_retire();
+                return;
+            }
+            KASSERT(authority->mappings_.empty());
+            KASSERT(authority->pages_.empty());
+            authority->releasing_relations_ = true;
+            if (authority->invalidation_hook_.is_linked()) {
+                invalidations_.erase(*authority);
+            }
+            authority->invalidation_requested_ = false;
         }
-        authority->invalidation_requested_ = false;
+
+        // Relation detach may synchronously complete a Grant revoke and drive
+        // ResourcePool retirement back into this same VSpace. It must never
+        // run under lock_. The authority remains stable in pending_authorities_
+        // and releasing_relations_ prevents a second service pass claiming it.
         const bool released = authority->detach_relations();
-        if (!released) {
-            link = &authority->pending_next_;
-            continue;
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            KASSERT(authority->releasing_relations_);
+            authority->releasing_relations_ = false;
+            if (!released) {
+                return;
+            }
+            MappingAuthority** link = &pending_authorities_;
+            while (*link != authority) {
+                KASSERT(*link != nullptr);
+                link = &(*link)->pending_next_;
+            }
+            *link = authority->pending_next_;
+            authority->pending_next_ = nullptr;
         }
-        *link = authority->pending_next_;
-        authority->pending_next_ = nullptr;
+        // Destroying sponsored node storage may refund ResourcePool capacity;
+        // that callback is another external edge and therefore also stays
+        // outside lock_.
         authorities_.destroy(*authority);
     }
 }
 
 auto VSpace::finish_pending() noexcept -> bool {
     if (pending_kind_ == PendingKind::None) {
-        finish_authorities();
         try_finish_retire();
         return true;
     }
@@ -375,7 +458,6 @@ auto VSpace::finish_pending() noexcept -> bool {
         static_cast<Mapping*>(node)->state_ = MappingState::Live;
     }
     pending_kind_ = PendingKind::None;
-    finish_authorities();
     try_finish_retire();
     return true;
 }

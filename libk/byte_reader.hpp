@@ -27,6 +27,9 @@ public:
     [[nodiscard]] constexpr auto remaining() const noexcept -> size_t {
         return size_ - offset_;
     }
+    [[nodiscard]] constexpr auto offset() const noexcept -> size_t {
+        return offset_;
+    }
 
     [[nodiscard]] constexpr auto skip(size_t count) noexcept -> bool {
         if (count > remaining()) {
@@ -72,6 +75,44 @@ public:
         uint64_t value{};
         for (size_t index = 0; index < sizeof(uint64_t); ++index) {
             value = (value << 8) | current[index];
+        }
+        offset_ += sizeof(uint64_t);
+        output = value;
+        return true;
+    }
+
+    [[nodiscard]] constexpr auto read_le16(uint16_t& output) noexcept -> bool {
+        if (remaining() < sizeof(uint16_t)) {
+            return false;
+        }
+        const uint8_t* const current = base_ + offset_;
+        output = static_cast<uint16_t>(current[0])
+            | static_cast<uint16_t>(current[1]) << 8;
+        offset_ += sizeof(uint16_t);
+        return true;
+    }
+
+    [[nodiscard]] constexpr auto read_le32(uint32_t& output) noexcept -> bool {
+        if (remaining() < sizeof(uint32_t)) {
+            return false;
+        }
+        const uint8_t* const current = base_ + offset_;
+        output = static_cast<uint32_t>(current[0])
+            | static_cast<uint32_t>(current[1]) << 8
+            | static_cast<uint32_t>(current[2]) << 16
+            | static_cast<uint32_t>(current[3]) << 24;
+        offset_ += sizeof(uint32_t);
+        return true;
+    }
+
+    [[nodiscard]] constexpr auto read_le64(uint64_t& output) noexcept -> bool {
+        if (remaining() < sizeof(uint64_t)) {
+            return false;
+        }
+        const uint8_t* const current = base_ + offset_;
+        uint64_t value{};
+        for (size_t index = 0; index < sizeof(uint64_t); ++index) {
+            value |= static_cast<uint64_t>(current[index]) << (index * 8);
         }
         offset_ += sizeof(uint64_t);
         output = value;

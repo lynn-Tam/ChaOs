@@ -13,6 +13,11 @@ template<>
 struct ObjectTraits<kernel::sched::SchedulingContext> final {
     static constexpr ObjectKind kind = ObjectKind::SchedulingContext;
 
+    [[nodiscard]] static auto prepare_retire(
+        kernel::sched::SchedulingContext& context) noexcept -> bool {
+        return context.prepare_retire();
+    }
+
     static void retire(
         [[maybe_unused]] kernel::sched::SchedulingContext& context) noexcept {
     }

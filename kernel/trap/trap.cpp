@@ -12,6 +12,7 @@
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
 #include <thread/thread.hpp>
+#include <execution/vproc.hpp>
 #include <trap/trap.hpp>
 
 namespace kernel::trap {
@@ -36,11 +37,15 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         const auto* exception = event.exception();
         KASSERT(exception != nullptr);
         kernel::CpuLocal& cpu = kernel::current_cpu();
+        kernel::Execution* const execution = cpu.current_execution();
         kernel::Thread* const thread = cpu.current_thread();
-        KASSERT(thread != nullptr && thread->execution().user_bound());
+        kernel::Vproc* const vproc = cpu.current_vproc();
+        KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr)
+            && execution->binding().user_bound());
         if (exception->cause == Exception::Syscall) {
             switch (kernel::syscall::handle(context)) {
             case kernel::syscall::Disposition::Return:
+            case kernel::syscall::Disposition::Resume:
                 return;
             case kernel::syscall::Disposition::Yield:
                 cpu.dispatcher()->request_reschedule(
@@ -69,12 +74,14 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 access = kernel::mm::Access::Execute;
                 break;
             case Access::None:
-                thread->record_user_fault(event);
+                if (thread != nullptr) {
+                    thread->record_user_fault(event);
+                }
                 cpu.dispatcher()->request_reschedule(
                     kernel::sched::DispatchReason::Exit);
                 return;
             }
-            auto fault = thread->execution().vspace()->fault(
+            auto fault = execution->binding().vspace()->fault(
                 kernel::mm::VmContext{
                     .cpus = cpu.runtime().owner_registry,
                     .local = cpu.descriptor->logical_id(),
@@ -84,14 +91,33 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             if (fault && fault.value().kind == kernel::mm::FaultKind::Materialized) {
                 return;
             }
+            if (fault && fault.value().kind == kernel::mm::FaultKind::Busy) {
+                // Another VSpace transaction or page materialization owns the
+                // canonical mutation slot. The faulting instruction has not
+                // completed and its TrapFrame remains intact, so reschedule
+                // and retry the same access after the owner makes progress.
+                cpu.dispatcher()->request_reschedule(
+                    kernel::sched::DispatchReason::Yield);
+                return;
+            }
             KASSERT(!fault || fault.value().kind != kernel::mm::FaultKind::Ready);
         }
-        KASSERT(thread->execution().fault_route() == kernel::FaultRoute::Terminate);
-        thread->record_user_fault(event);
-        kernel::diag::console::print<
-            "user: contained fault after syscalls={} active-vspace-cpus={}\n">(
-            thread->user_syscalls(),
-            thread->execution().vspace()->active_cpus().size());
+        KASSERT(execution->binding().fault_route()
+            == kernel::FaultRoute::Terminate);
+        if (thread != nullptr) {
+            thread->record_user_fault(event);
+            kernel::diag::console::print<
+                "user: contained fault address={:#x} after syscalls={} "
+                "active-vspace-cpus={}\n">(
+                event.fault_addr(), thread->user_syscalls(),
+                execution->binding().vspace()->active_cpus().size());
+        } else {
+            kernel::diag::console::print<
+                "vproc: contained fault address={:#x} "
+                "active-vspace-cpus={}\n">(
+                event.fault_addr(),
+                execution->binding().vspace()->active_cpus().size());
+        }
         cpu.dispatcher()->request_reschedule(
             kernel::sched::DispatchReason::Exit);
         return;
@@ -113,12 +139,35 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
 void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     kernel::CpuLocal& cpu = kernel::current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
-    cpu.dispatcher()->on_trap_exit();
     kernel::Thread* const thread = cpu.current_thread();
-    KASSERT(thread != nullptr);
+    kernel::Vproc* const vproc = cpu.current_vproc();
+    KASSERT(thread != nullptr || vproc != nullptr);
+    if (vproc != nullptr) {
+        cpu.dispatcher()->on_trap_exit();
+        KASSERT(cpu.current_vproc() == vproc);
+        vproc->on_trap_exit(context);
+        return;
+    }
     if (thread->wait_ready()) {
         thread->resume_wait(context);
     }
+    cpu.dispatcher()->on_trap_exit();
+    // A wake credit closes wake-before-block, but it is not evidence that the
+    // current subsystem operation has completed: an older credit may merely
+    // make the first block attempt a no-op. The canonical wait is the truth.
+    // Keep this continuation in the kernel until that relation is complete.
+    KASSERT(cpu.current_thread() == thread);
+    while (thread->waiting()) {
+        if (thread->wait_ready()) {
+            thread->resume_wait(context);
+            break;
+        }
+        cpu.dispatcher()->block_current();
+        KASSERT(cpu.current_thread() == thread);
+    }
+    // A stop request deliberately waits for the subsystem continuation. Once
+    // the relation is detached, give the dispatcher one final commit point.
+    cpu.dispatcher()->on_trap_exit();
 }
 
 } // namespace kernel::trap

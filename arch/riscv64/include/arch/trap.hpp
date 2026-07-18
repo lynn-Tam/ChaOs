@@ -1,10 +1,12 @@
 #pragma once
 
 #include <core/types.hpp>
+#include <uapi/vproc.h>
 
 namespace arch {
 
 struct TrapContextAccess;
+struct UserStart;
 
 struct TrapSnapshot final {
     usize gpr[31]{};
@@ -35,6 +37,11 @@ public:
 
     [[nodiscard]] auto fault_addr() const noexcept -> usize;
     [[nodiscard]] auto snapshot() const noexcept -> TrapSnapshot;
+    void save_user(myos_user_context& output) const noexcept;
+    [[nodiscard]] auto load_user(
+        const myos_user_context& input) noexcept -> bool;
+    [[nodiscard]] auto load_user_start(
+        const UserStart& start) noexcept -> bool;
 
 private:
     friend struct TrapContextAccess;

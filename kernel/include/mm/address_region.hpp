@@ -5,7 +5,7 @@
 #include <libk/intrusive_tree.hpp>
 #include <libk/noncopyable.hpp>
 #include <mm/addr.hpp>
-#include <mm/ipc_buffer.hpp>
+#include <mm/user_view.hpp>
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
 #include <mm/vm_key.hpp>
@@ -121,8 +121,8 @@ private:
 };
 
 class Mapping final : public LayoutNode {
-    using IpcRelations = libk::IntrusiveList<
-        IpcRelation, &IpcRelation::mapping_hook_>;
+    using UserViewRelations = libk::IntrusiveList<
+        UserViewRelation, &UserViewRelation::mapping_hook_>;
 public:
     Mapping(
         VirtRange range,
@@ -163,7 +163,7 @@ private:
     MappingAuthority* authority_{};
     MappingState state_{MappingState::Preparing};
     libk::IntrusiveListHook authority_hook_{};
-    IpcRelations ipc_relations_{};
+    UserViewRelations views_{};
 };
 
 class ReservedLeaf final : public LayoutNode {

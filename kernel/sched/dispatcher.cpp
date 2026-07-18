@@ -12,8 +12,10 @@
 #include <cpu/cpu_runtime.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
+#include <sync/irq_lock_guard.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <thread/thread.hpp>
+#include <execution/vproc.hpp>
 
 namespace kernel::sched {
 
@@ -25,7 +27,7 @@ CpuDispatcher::CpuDispatcher(
     : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock) {
     KASSERT(cpu_->dispatcher_ == nullptr);
     KASSERT(idle_->idle());
-    KASSERT(idle_->state_ == Thread::State::Prepared);
+    KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
     const auto quantum = clock_->duration_from_nanoseconds(4'000'000);
     KASSERT(quantum && !quantum->empty());
     quantum_ = *quantum;
@@ -34,43 +36,47 @@ CpuDispatcher::CpuDispatcher(
     cpu_->dispatcher_ = this;
 }
 
-void CpuDispatcher::publish(Thread& thread) noexcept {
+void CpuDispatcher::publish(execution::Target target) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::current_cpu_owner() == cpu_);
     KASSERT(arch::trap_depth() == 0);
-    const usize stack_top = thread.home_stack_top();
+    KASSERT(target);
+    Execution& execution = target.execution();
+    const usize stack_top = execution.stack_top();
     KASSERT(stack_top != 0 && (stack_top & 0xfU) == 0);
 
-    ExecutionBinding& execution = thread.execution_;
-    execution.translation().activate(*cpu_);
-    current_ = &thread;
-    cpu_->current_thread_ = &thread;
+    ExecutionBinding& roots = execution.binding();
+    roots.translation().activate(*cpu_);
+    current_ = target;
+    cpu_->current_execution_ = &execution;
     arch::publish_active_stack(cpu_->arch_state, stack_top);
 }
 
 [[noreturn]] void CpuDispatcher::enter_idle() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ == nullptr);
-    KASSERT(idle_->state_ == Thread::State::Prepared);
-    idle_->state_ = Thread::State::Running;
+    KASSERT(!current_);
+    KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
+    idle_->execution_.state_ = ExecutionState::Running;
     accounted_at_ = clock_->now();
-    publish(*idle_);
+    publish(execution::Target{*idle_});
     program_deadline(accounted_at_);
-    record_dispatch(*idle_, *idle_, DispatchReason::Start, accounted_at_);
-    arch::enter_context(idle_->context_);
+    const execution::Target idle{*idle_};
+    record_dispatch(idle, idle, DispatchReason::Start, accounted_at_);
+    arch::enter_context(idle_->execution_.context());
 }
 
 void CpuDispatcher::on_context_enter() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ != nullptr);
-    KASSERT(cpu_->current_thread_ == current_);
+    KASSERT(current_);
+    KASSERT(cpu_->current_execution_ == &current_.execution());
     KASSERT(arch::active_stack(cpu_->arch_state)
-        == current_->home_stack_top());
-    KASSERT(cpu_->kernel_vspace() == current_->execution_.kernel_vspace());
-    KASSERT(cpu_->vspace() == current_->execution_.vspace());
-    KASSERT(cpu_->cspace() == current_->execution_.cspace());
+        == current_.execution().stack_top());
+    ExecutionBinding& roots = current_.execution().binding();
+    KASSERT(cpu_->kernel_vspace() == roots.kernel_vspace());
+    KASSERT(cpu_->vspace() == roots.vspace());
+    KASSERT(cpu_->cspace() == roots.cspace());
     KASSERT(cpu_->active_translation_
-        == &current_->execution_.translation().state());
+        == &roots.translation().state());
     post_switch();
     if (ipi_available_) {
         arch::enable_ipi();
@@ -83,21 +89,25 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
     if (binding.home_cpu() != id_ || binding.queued()) {
         return false;
     }
-    Thread& thread = binding.thread();
+    execution::Target target = binding.target();
+    Execution& execution = target.execution();
     SchedulingContext& context = binding.context();
-    if (thread.binding_ != &binding
+    if (execution.scheduler_binding_ != &binding
         || context.binding() != &binding
         || !context.admitted()) {
         return false;
     }
-    if (thread.state_ != Thread::State::Prepared
-        && thread.state_ != Thread::State::Blocked
-        && thread.state_ != Thread::State::Throttled) {
+    if (execution.state_ != ExecutionState::Prepared
+        && execution.state_ != ExecutionState::Blocked
+        && execution.state_ != ExecutionState::Throttled) {
+        return false;
+    }
+    if (!target.claim_home(*this)) {
         return false;
     }
     const time::Instant now = clock_->now();
     if (binding.timer_queued()) {
-        if (thread.state_ != Thread::State::Throttled) {
+        if (execution.state_ != ExecutionState::Throttled) {
             return false;
         }
         if (!context.eligible(now)) {
@@ -106,7 +116,7 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
         timers_.remove(binding);
     }
     enqueue_or_throttle(binding, now);
-    if (thread.state_ == Thread::State::Throttled) {
+    if (execution.state_ == ExecutionState::Throttled) {
         program_deadline(now);
         return true;
     }
@@ -120,22 +130,22 @@ auto CpuDispatcher::accept_wake(Binding& binding) noexcept
     if (binding.home_cpu() != id_) {
         return WakeAcceptance::Rejected;
     }
-    Thread& thread = binding.thread();
-    if (thread.state_ == Thread::State::Blocked) {
+    Execution& execution = binding.execution();
+    if (execution.state_ == ExecutionState::Blocked) {
         if (!make_ready(binding)) {
             return WakeAcceptance::Rejected;
         }
-        return thread.state_ == Thread::State::Ready
+        return execution.state_ == ExecutionState::Ready
             ? WakeAcceptance::Readied
             : WakeAcceptance::Accepted;
     }
-    if (thread.state_ == Thread::State::Running
-        || thread.state_ == Thread::State::Ready
-        || thread.state_ == Thread::State::Prepared) {
+    if (execution.state_ == ExecutionState::Running
+        || execution.state_ == ExecutionState::Ready
+        || execution.state_ == ExecutionState::Prepared) {
         binding.wake_credit_ = true;
         return WakeAcceptance::Accepted;
     }
-    return thread.state_ == Thread::State::Throttled
+    return execution.state_ == ExecutionState::Throttled
         ? WakeAcceptance::Accepted
         : WakeAcceptance::Rejected;
 }
@@ -144,21 +154,94 @@ auto CpuDispatcher::post_wake(Binding& binding) noexcept -> WakeResult {
     if (binding.home_cpu() != id_) {
         return libk::unexpected(WakeError::WrongCpu);
     }
+    return post_remote(binding.wake_);
+}
+
+auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
+    if (binding.home_cpu() != id_) {
+        return libk::unexpected(WakeError::WrongCpu);
+    }
+    return post_remote(binding.start_);
+}
+
+auto CpuDispatcher::accept_activation(Vproc& vproc) noexcept -> bool {
+    KASSERT(!arch::interrupts_enabled());
+    Binding* const binding = vproc.execution_.scheduler_binding_;
+    if (binding == nullptr || binding->home_cpu() != id_
+        || vproc.stop_requested_ || vproc.stopped_) {
+        return false;
+    }
+    switch (vproc.execution_.state_) {
+    case ExecutionState::Running:
+        KASSERT(current_.vproc() == &vproc);
+        // The interrupt/syscall return itself is the requested safe boundary.
+        binding->activation_credit_ = false;
+        return true;
+    case ExecutionState::Ready:
+        binding->activation_credit_ = true;
+        request_reschedule(DispatchReason::Activation);
+        return true;
+    case ExecutionState::Prepared:
+    case ExecutionState::Blocked:
+    case ExecutionState::Throttled:
+        // Prepared targets still require explicit start. Blocked targets keep
+        // their existing continuation relation. Throttled targets wait for
+        // their own refill. None receives sender time.
+        binding->activation_credit_ = true;
+        return true;
+    case ExecutionState::Exited:
+        return false;
+    }
+    return false;
+}
+
+auto CpuDispatcher::post_activation(Vproc& vproc) noexcept -> WakeResult {
+    return post_remote(vproc.activation_);
+}
+
+auto CpuDispatcher::request_activation(
+    CpuRegistry& cpus,
+    Vproc& vproc) noexcept -> WakeResult {
+    CpuId home{};
+    {
+        kernel::sync::IrqLockGuard guard{vproc.stop_lock_};
+        Binding* const binding = vproc.execution_.scheduler_binding_;
+        if (binding == nullptr || vproc.stop_requested_ || vproc.stopped_) {
+            return libk::unexpected(WakeError::Unavailable);
+        }
+        home = binding->home_cpu();
+    }
+    CpuRuntime* const target = cpus.runtime(home);
+    if (target == nullptr
+        || target->local.descriptor->state() != CpuState::Online) {
+        return libk::unexpected(WakeError::Unavailable);
+    }
+    if (arch::current_cpu_owner() == &target->local) {
+        const arch::InterruptState interrupts = arch::disable_interrupts();
+        const bool accepted = target->dispatcher().accept_activation(vproc);
+        arch::restore_interrupts(interrupts);
+        return accepted
+            ? WakeResult{libk::expected()}
+            : WakeResult{libk::unexpected(WakeError::Unavailable)};
+    }
+    return target->dispatcher().post_activation(vproc);
+}
+
+auto CpuDispatcher::post_remote(RemoteRequest& request) noexcept -> WakeResult {
     if (!ipi_available_) {
         return libk::unexpected(WakeError::Unavailable);
     }
-    const WakeQueue::PostResult posted = wakes_.post(binding);
-    KASSERT(posted.accepted);
+    remote_.post(request);
     KASSERT(cpu_->descriptor != nullptr);
     for (usize attempt = 0; attempt < 8; ++attempt) {
-        const auto transport = wakes_.claim_transport();
+        const auto transport = remote_.claim_transport();
         if (!transport) {
             return libk::expected();
         }
         if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
             return libk::expected();
         }
-        wakes_.transport_failed(*transport);
+        remote_.transport_failed(*transport);
     }
     KPANIC((diag::FatalEvent{
         .facility = diag::Facility::Scheduler,
@@ -168,20 +251,110 @@ auto CpuDispatcher::post_wake(Binding& binding) noexcept -> WakeResult {
     }));
 }
 
+void CpuDispatcher::request_stop(Thread& thread) noexcept {
+    request_stop(execution::Target{thread});
+}
+
+void CpuDispatcher::request_stop(Vproc& vproc) noexcept {
+    request_stop(execution::Target{vproc});
+}
+
+void CpuDispatcher::request_stop(execution::Target target) noexcept {
+    Binding* const binding = target.execution().scheduler_binding_;
+    KASSERT(binding != nullptr && binding->target() == target);
+    if (arch::current_cpu_owner() == cpu_) {
+        const arch::InterruptState interrupts = arch::disable_interrupts();
+        if (stop(target) == StopDisposition::Finalize) {
+            finish_exit(target);
+        }
+        arch::restore_interrupts(interrupts);
+        return;
+    }
+
+    if (!ipi_available_) {
+        KPANIC((diag::FatalEvent{
+            .facility = diag::Facility::Scheduler,
+            .id = diag::EventId{0x40000002},
+            .arguments = {id_.raw},
+            .argument_count = 1,
+        }));
+    }
+    remote_.post(binding->stop_);
+    KASSERT(cpu_->descriptor != nullptr);
+    for (usize attempt = 0; attempt < 8; ++attempt) {
+        const auto transport = remote_.claim_transport();
+        if (!transport) {
+            return;
+        }
+        if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
+            return;
+        }
+        remote_.transport_failed(*transport);
+    }
+    KPANIC((diag::FatalEvent{
+        .facility = diag::Facility::Scheduler,
+        .id = diag::EventId{0x40000003},
+        .arguments = {id_.raw},
+        .argument_count = 1,
+    }));
+}
+
+void CpuDispatcher::drain_remote() noexcept {
+    KASSERT(!arch::interrupts_enabled());
+    bool made_ready{};
+    while (RemoteRequest* request = remote_.take()) {
+        switch (request->kind()) {
+        case RemoteKind::Start: {
+            auto& binding = *static_cast<Binding*>(request->owner());
+            made_ready = make_ready(binding) || made_ready;
+            break;
+        }
+        case RemoteKind::Wake: {
+            auto& binding = *static_cast<Binding*>(request->owner());
+            made_ready = accept_wake(binding) == WakeAcceptance::Readied
+                || made_ready;
+            break;
+        }
+        case RemoteKind::Activation: {
+            auto& vproc = *static_cast<Vproc*>(request->owner());
+            static_cast<void>(accept_activation(vproc));
+            break;
+        }
+        case RemoteKind::Stop: {
+            const execution::Target target =
+                static_cast<Binding*>(request->owner())->target();
+            const StopDisposition disposition = stop(target);
+            // stop() may make the Binding terminal, but the consumed request
+            // still owns its embedded storage until complete().  Release the
+            // queue protocol before final relation teardown destroys Binding.
+            remote_.complete(*request);
+            if (disposition == StopDisposition::Finalize) {
+                finish_exit(target);
+            }
+            continue;
+        }
+        }
+        remote_.complete(*request);
+    }
+    if (made_ready) {
+        request_reschedule(DispatchReason::RemoteWake);
+    }
+}
+
 void CpuDispatcher::enqueue_or_throttle(
     Binding& binding,
     time::Instant now) noexcept {
-    Thread& thread = binding.thread();
+    Execution& execution = binding.execution();
     SchedulingContext& context = binding.context();
     KASSERT(!binding.queued() && !binding.timer_queued());
     if (context.eligible(now)) {
-        thread.state_ = Thread::State::Ready;
+        execution.state_ = ExecutionState::Ready;
         policy_.enqueue(binding, context.urgency());
         return;
     }
     const auto deadline = context.next_refill();
     KASSERT(deadline && *deadline > now);
-    thread.state_ = Thread::State::Throttled;
+    execution.state_ = ExecutionState::Throttled;
     timers_.insert(binding, *deadline);
 }
 
@@ -194,7 +367,8 @@ void CpuDispatcher::process_timers(time::Instant now) noexcept {
         Binding* const binding = timers_.front();
         KASSERT(binding != nullptr);
         timers_.remove(*binding);
-        KASSERT(binding->thread().state_ == Thread::State::Throttled);
+        KASSERT(binding->execution().state_
+            == ExecutionState::Throttled);
         enqueue_or_throttle(*binding, now);
     }
 }
@@ -221,7 +395,7 @@ void CpuDispatcher::yield() noexcept {
 
 void CpuDispatcher::block_current() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ != nullptr && !current_->idle());
+    KASSERT(current_ && !current_.idle());
     KASSERT(current_binding_ != nullptr);
     if (current_binding_->wake_credit_) {
         current_binding_->wake_credit_ = false;
@@ -232,7 +406,7 @@ void CpuDispatcher::block_current() noexcept {
 
 [[noreturn]] void CpuDispatcher::exit_current() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ != nullptr && !current_->idle());
+    KASSERT(current_ && !current_.idle());
     dispatch(DispatchReason::Exit, clock_->now());
     KASSERT(false);
     __builtin_unreachable();
@@ -240,7 +414,8 @@ void CpuDispatcher::block_current() noexcept {
 
 void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
     if (!pending_ || reason == DispatchReason::Timer
-        || reason == DispatchReason::Exit) {
+        || reason == DispatchReason::Exit
+        || reason == DispatchReason::Stop) {
         pending_ = reason;
     }
 }
@@ -253,22 +428,12 @@ void CpuDispatcher::on_timer() noexcept {
     request_reschedule(DispatchReason::Timer);
 }
 
-void CpuDispatcher::drain_remote_wakes() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    bool made_ready{};
-    while (Binding* binding = wakes_.take()) {
-        made_ready = accept_wake(*binding) == WakeAcceptance::Readied
-            || made_ready;
-        wakes_.complete(*binding);
-    }
-    if (made_ready) {
-        request_reschedule(DispatchReason::RemoteWake);
-    }
-}
-
 void CpuDispatcher::on_trap_exit() noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::trap_depth() == 0);
+    if (current_.stop_ready()) {
+        request_reschedule(DispatchReason::Stop);
+    }
     if (!pending_ || preempt_depth_ != 0) {
         return;
     }
@@ -301,11 +466,11 @@ void CpuDispatcher::dispatch(
     time::Instant now) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::trap_depth() == 0);
-    KASSERT(current_ != nullptr);
+    KASSERT(current_);
     charge_to(now);
     process_timers(now);
 
-    Thread* const outgoing = current_;
+    const execution::Target outgoing = current_;
     Binding* const outgoing_binding = current_binding_;
     if (outgoing_binding != nullptr) {
         SchedulingContext& context = outgoing_binding->context();
@@ -314,17 +479,19 @@ void CpuDispatcher::dispatch(
 
         switch (reason) {
         case DispatchReason::Exit:
-            outgoing->state_ = Thread::State::Exited;
+        case DispatchReason::Stop:
+            outgoing.execution().state_ = ExecutionState::Exited;
             break;
         case DispatchReason::Block:
-            outgoing->state_ = Thread::State::Blocked;
+            outgoing.execution().state_ = ExecutionState::Blocked;
             break;
         case DispatchReason::Start:
         case DispatchReason::Yield:
         case DispatchReason::Timer:
         case DispatchReason::RemoteWake:
+        case DispatchReason::Activation:
             if (context.eligible(now)) {
-                outgoing->state_ = Thread::State::Ready;
+                outgoing.execution().state_ = ExecutionState::Ready;
                 policy_.enqueue(*outgoing_binding, context.urgency());
             } else {
                 enqueue_or_throttle(*outgoing_binding, now);
@@ -333,16 +500,19 @@ void CpuDispatcher::dispatch(
         }
     }
 
-    Binding* candidate = policy_.select().binding;
-    if (candidate == nullptr && outgoing->idle()) {
-        outgoing->state_ = Thread::State::Running;
+    Binding* candidate = policy_.select_activation().binding;
+    if (candidate == nullptr) {
+        candidate = policy_.select().binding;
+    }
+    if (candidate == nullptr && outgoing.idle()) {
+        outgoing.execution().state_ = ExecutionState::Running;
         program_deadline(now);
-        record_dispatch(*outgoing, *outgoing, reason, now);
+        record_dispatch(outgoing, outgoing, reason, now);
         return;
     }
     commit(candidate, reason, now);
 
-    if (reason == DispatchReason::Exit) {
+    if (reason == DispatchReason::Exit || reason == DispatchReason::Stop) {
         KASSERT(false);
         __builtin_unreachable();
     }
@@ -352,48 +522,51 @@ void CpuDispatcher::commit(
     Binding* candidate,
     DispatchReason reason,
     time::Instant now) noexcept {
-    Thread* const outgoing = current_;
-    Thread* incoming = idle_;
+    const execution::Target outgoing = current_;
+    execution::Target incoming{*idle_};
     Binding* incoming_binding{};
 
     if (candidate != nullptr) {
         SchedulingContext& context = candidate->context();
-        Thread& target = candidate->thread();
+        execution::Target target = candidate->target();
+        Execution& execution = target.execution();
         KASSERT(candidate->home_cpu() == id_);
         KASSERT(candidate->queued());
-        KASSERT(target.state_ == Thread::State::Ready);
-        KASSERT(target.binding_ == candidate);
+        KASSERT(execution.state_ == ExecutionState::Ready);
+        KASSERT(execution.scheduler_binding_ == candidate);
         KASSERT(context.binding() == candidate);
         KASSERT(context.domain_ != nullptr);
         KASSERT(context.domain_->allows(id_));
         KASSERT(context.eligible(now));
 
+        candidate->activation_credit_ = false;
         policy_.remove(*candidate, context.urgency());
         KASSERT(context.activate(id_));
-        target.state_ = Thread::State::Running;
-        incoming = &target;
+        execution.state_ = ExecutionState::Running;
+        incoming = target;
         incoming_binding = candidate;
     } else {
-        KASSERT(idle_->state_ == Thread::State::Prepared
-            || idle_->state_ == Thread::State::Running);
-        idle_->state_ = Thread::State::Running;
+        KASSERT(idle_->execution_.state_ == ExecutionState::Prepared
+            || idle_->execution_.state_ == ExecutionState::Running);
+        idle_->execution_.state_ = ExecutionState::Running;
     }
 
     current_binding_ = incoming_binding;
-    publish(*incoming);
+    publish(incoming);
     program_deadline(now);
-    record_dispatch(*outgoing, *incoming, reason, now);
+    record_dispatch(outgoing, incoming, reason, now);
 
     if (incoming == outgoing) {
         return;
     }
-    if (outgoing->idle()) {
-        outgoing->state_ = Thread::State::Prepared;
+    if (outgoing.idle()) {
+        outgoing.execution().state_ = ExecutionState::Prepared;
     }
 
-    KASSERT(handoff_outgoing_ == nullptr);
+    KASSERT(!handoff_outgoing_);
     handoff_outgoing_ = outgoing;
-    arch::switch_context(outgoing->context_, incoming->context_);
+    arch::switch_context(
+        outgoing.execution().context(), incoming.execution().context());
     post_switch();
 }
 
@@ -433,14 +606,14 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
 }
 
 void CpuDispatcher::record_dispatch(
-    Thread& outgoing,
-    Thread& incoming,
+    execution::Target outgoing,
+    execution::Target incoming,
     DispatchReason reason,
     time::Instant now) noexcept {
     trace_.push(DispatchRecord{
         .cpu = id_,
-        .outgoing = reinterpret_cast<usize>(&outgoing),
-        .incoming = reinterpret_cast<usize>(&incoming),
+        .outgoing = outgoing.identity(),
+        .incoming = incoming.identity(),
         .context = reinterpret_cast<usize>(current_binding_ == nullptr
             ? nullptr
             : &current_binding_->context()),
@@ -450,7 +623,7 @@ void CpuDispatcher::record_dispatch(
         .deadline = programmed_deadline_,
         .ready_count = policy_.ready_count(),
         .timer_count = timers_.size(),
-        .wake_count = wakes_.size(),
+            .remote_count = remote_.size(),
     });
     pending_charge_ = {};
 }
@@ -459,7 +632,7 @@ void CpuDispatcher::dump_trace() const noexcept {
     for (const DispatchRecord& record : trace_.records()) {
         diag::console::print<
             "dispatch cpu={} old={} new={} sc={} reason={} charged={} "
-            "deadline={} ready={} timers={} wakes={}\n">(
+            "deadline={} ready={} timers={} remote={}\n">(
             record.cpu.raw,
             record.outgoing,
             record.incoming,
@@ -469,15 +642,76 @@ void CpuDispatcher::dump_trace() const noexcept {
             record.deadline.ticks(),
             record.ready_count,
             record.timer_count,
-            record.wake_count);
+            record.remote_count);
     }
 }
 
 void CpuDispatcher::post_switch() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(cpu_->current_thread_ == current_);
-    KASSERT(current_ != nullptr);
-    handoff_outgoing_ = nullptr;
+    KASSERT(cpu_->current_execution_ == &current_.execution());
+    KASSERT(current_);
+    const execution::Target outgoing = handoff_outgoing_;
+    handoff_outgoing_ = {};
+    if (outgoing
+        && outgoing.execution().state_ == ExecutionState::Exited) {
+        finish_exit(outgoing);
+    }
+}
+
+auto CpuDispatcher::stop(execution::Target target) noexcept
+    -> StopDisposition {
+    KASSERT(!arch::interrupts_enabled());
+    KASSERT(target.owned_by(*this));
+    Execution& execution = target.execution();
+
+    if (execution.state_ == ExecutionState::Running) {
+        KASSERT(current_ == target);
+        request_reschedule(DispatchReason::Stop);
+        return StopDisposition::Deferred;
+    }
+    if (execution.state_ == ExecutionState::Blocked
+        && target.stop_deferred()) {
+        // The operation owns the continuation and may already be completing
+        // on another CPU. Let its retained wake make the frame runnable; trap
+        // exit consumes the result before the pending stop is committed.
+        return StopDisposition::Deferred;
+    }
+
+    Binding* const binding = execution.scheduler_binding_;
+    if (binding != nullptr) {
+        if (binding->queued()) {
+            policy_.remove(*binding, binding->context().urgency());
+        }
+        if (binding->timer_queued()) {
+            timers_.remove(*binding);
+        }
+        binding->activation_credit_ = false;
+        remote_.cancel(binding->start_);
+        remote_.cancel(binding->wake_);
+        remote_.cancel(binding->stop_);
+    }
+    execution.state_ = ExecutionState::Exited;
+    return StopDisposition::Finalize;
+}
+
+void CpuDispatcher::finish_exit(execution::Target target) noexcept {
+    KASSERT(!arch::interrupts_enabled());
+    Execution& execution = target.execution();
+    KASSERT(execution.state_ == ExecutionState::Exited);
+    KASSERT(current_ != target);
+    KASSERT(!target.stop_deferred());
+    if (execution.scheduler_binding_ != nullptr) {
+        Binding& binding = *execution.scheduler_binding_;
+        KASSERT(!binding.queued() && !binding.timer_queued());
+        remote_.cancel(binding.start_);
+        remote_.cancel(binding.wake_);
+        remote_.cancel(binding.stop_);
+        if (Vproc* const vproc = target.vproc()) {
+            remote_.cancel(vproc->activation_);
+        }
+        KASSERT(binding.context().unbind());
+    }
+    target.finish_stop();
 }
 
 void yield() noexcept {
@@ -515,6 +749,30 @@ auto wake(CpuRegistry& cpus, Binding& binding) noexcept
         return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
     }
     return target->dispatcher().post_wake(binding);
+}
+
+auto start(CpuRegistry& cpus, Binding& binding) noexcept
+    -> CpuDispatcher::WakeResult {
+    CpuRuntime* const target = cpus.runtime(binding.home_cpu());
+    if (target == nullptr
+        || target->local.descriptor->state() != CpuState::Online) {
+        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
+    }
+    if (arch::current_cpu_owner() == &target->local) {
+        const arch::InterruptState interrupts = arch::disable_interrupts();
+        const bool accepted = target->dispatcher().make_ready(binding);
+        arch::restore_interrupts(interrupts);
+        return accepted
+            ? CpuDispatcher::WakeResult{libk::expected()}
+            : CpuDispatcher::WakeResult{
+                  libk::unexpected(CpuDispatcher::WakeError::Unavailable)};
+    }
+    return target->dispatcher().post_start(binding);
+}
+
+auto activate(CpuRegistry& cpus, Vproc& vproc) noexcept
+    -> CpuDispatcher::WakeResult {
+    return CpuDispatcher::request_activation(cpus, vproc);
 }
 
 [[noreturn]] void exit_current() noexcept {

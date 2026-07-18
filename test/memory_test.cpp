@@ -427,7 +427,11 @@ bool test_reverse_attachment_drives_destroy_invalidation(
         resident = page.value().page().page;
     }
     FakeMapping mapping{};
-    if (!memory.attach(mapping.attachment)) {
+    if (!memory.attach(
+            mapping.attachment,
+            kernel::mm::AccessMask::of(
+                kernel::mm::Access::Read,
+                kernel::mm::Access::Write))) {
         return false;
     }
     memory.retire();
@@ -450,6 +454,56 @@ bool test_reverse_attachment_drives_destroy_invalidation(
     return mapping.releases == 1
         && !mapping.attachment.busy()
         && fixture.pmm().free_page_count() == free_before;
+}
+
+bool test_executable_seal_closes_writable_attachments(
+    const TestContext&) noexcept {
+    MemoryFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
+    if (!memory.initialize_anonymous(kernel::mm::AnonymousConfig{
+            .access = kernel::mm::AccessMask::of(
+                kernel::mm::Access::Read,
+                kernel::mm::Access::Write,
+                kernel::mm::Access::Execute),
+            .eager = true,
+        })) {
+        return false;
+    }
+    FakeMapping writer{};
+    if (!memory.attach(
+            writer.attachment,
+            kernel::mm::AccessMask::of(
+                kernel::mm::Access::Read, kernel::mm::Access::Write))) {
+        return false;
+    }
+    const auto busy = memory.seal();
+    if (busy || busy.error() != kernel::mm::MemoryError::Busy
+        || memory.seal_state() != kernel::mm::SealState::Loadable
+        || memory.content_epoch().raw != 0
+        || !writer.attachment.detach()) {
+        return false;
+    }
+    if (!memory.seal()
+        || memory.seal_state() != kernel::mm::SealState::Executable
+        || memory.content_epoch() != kernel::mm::ContentEpoch{1}) {
+        return false;
+    }
+    FakeMapping executable{};
+    FakeMapping late_writer{};
+    const auto mapped = memory.attach(
+        executable.attachment,
+        kernel::mm::AccessMask::of(
+            kernel::mm::Access::Read, kernel::mm::Access::Execute));
+    const auto rejected = memory.attach(
+        late_writer.attachment,
+        kernel::mm::AccessMask::of(
+            kernel::mm::Access::Read, kernel::mm::Access::Write));
+    return mapped && !rejected
+        && rejected.error() == kernel::mm::MemoryError::InvalidAccess
+        && executable.attachment.detach();
 }
 
 bool test_object_store_memory_lifecycle_waits_for_page_lease(
@@ -514,6 +568,10 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         "memory",
         "reverse attachment drives destroy invalidation completion",
         test_reverse_attachment_drives_destroy_invalidation);
+    (void)registry.add(
+        "memory",
+        "executable seal closes writable attachment admission",
+        test_executable_seal_closes_writable_attachments);
     (void)registry.add(
         "memory",
         "ObjectStore memory retirement waits for active page lease",

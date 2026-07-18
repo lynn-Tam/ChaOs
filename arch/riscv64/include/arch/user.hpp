@@ -3,6 +3,7 @@
 #include <core/types.hpp>
 #include <libk/optional.hpp>
 #include <mm/addr.hpp>
+#include <uapi/vproc.h>
 
 namespace arch {
 
@@ -13,6 +14,8 @@ struct UserStart final {
 };
 
 [[nodiscard]] auto valid_user_start(UserStart start) noexcept -> bool;
+[[nodiscard]] auto valid_user_context(
+    const myos_user_context& context) noexcept -> bool;
 
 // Constructs the synthetic first TrapFrame at the top of the Thread-owned
 // kernel stack. The returned address is the remaining kernel stack top.

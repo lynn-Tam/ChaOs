@@ -55,6 +55,9 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] auto token() const noexcept -> RootToken;
+    [[nodiscard]] auto page_count() const noexcept -> usize {
+        return tables_.page_count();
+    }
 
 private:
     friend struct RootAccess;
@@ -78,6 +81,8 @@ private:
 // entries borrow KernelRoot-owned branches and are never released here.
 class UserRoot final {
 public:
+    static constexpr usize base_pages = 1;
+
     UserRoot(const UserRoot&) = delete;
     auto operator=(const UserRoot&) -> UserRoot& = delete;
 
@@ -91,6 +96,9 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] auto token() const noexcept -> RootToken;
+    [[nodiscard]] auto page_count() const noexcept -> usize {
+        return tables_.page_count();
+    }
 
 private:
     friend struct RootAccess;

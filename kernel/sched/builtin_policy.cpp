@@ -35,6 +35,17 @@ auto ReadyQueue::front() noexcept -> Binding* {
     return &levels_[level].front();
 }
 
+auto ReadyQueue::activation_front() noexcept -> Binding* {
+    for (usize level = Urgency::level_count; level != 0; --level) {
+        for (Binding& binding : levels_[level - 1]) {
+            if (binding.activation_credit_) {
+                return &binding;
+            }
+        }
+    }
+    return nullptr;
+}
+
 auto ReadyQueue::pop_front(Urgency urgency) noexcept -> Binding* {
     const u8 level = urgency.value();
     auto& queue = levels_[level];

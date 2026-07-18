@@ -2,6 +2,7 @@
 
 #include <core/types.hpp>
 #include <object/object_id.hpp>
+#include <resource/sponsorship.hpp>
 
 namespace kernel::object {
 
@@ -28,6 +29,19 @@ template<typename T>
 class ObjectPin;
 template<typename T>
 class ObjectPool;
+
+} // namespace kernel::object
+
+namespace kernel::resource {
+class Reservation;
+class Permit;
+class Refund;
+class Charge;
+class Sponsorship;
+class ResourcePool;
+}
+
+namespace kernel::object {
 
 // Common storage header for every typed ObjectPool slot. It is deliberately
 // outside the payload: kernel objects do not inherit a lifecycle base and do
@@ -64,6 +78,12 @@ private:
     friend class ObjectPin;
     friend class ObjectRef;
     friend class ObjectCleanup;
+    friend class kernel::resource::Reservation;
+    friend class kernel::resource::Permit;
+    friend class kernel::resource::Refund;
+    friend class kernel::resource::Charge;
+    friend class kernel::resource::Sponsorship;
+    friend class kernel::resource::ResourcePool;
 
     void* owner_{};
     const Ops* ops_{};
@@ -74,6 +94,7 @@ private:
     ObjectLifecycle lifecycle_{ObjectLifecycle::Free};
     bool cleanup_complete_{};
     bool reclaim_queued_{};
+    kernel::resource::Sponsorship sponsorship_{};
 };
 
 } // namespace kernel::object

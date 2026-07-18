@@ -2,8 +2,11 @@
 // 实现 selected-arch TrapContext view 对 RISC-V TrapFrame 的受控访问。
 
 #include "arch/riscv64/trap/context.hpp"
+#include "arch/riscv64/cpu/csr.hpp"
 
+#include <arch/user.hpp>
 #include <core/debug.hpp>
+#include <libk/memory.hpp>
 
 namespace arch {
 
@@ -111,6 +114,48 @@ auto TrapContext::snapshot() const noexcept -> TrapSnapshot {
     result.cause = frame.scause;
     result.fault_address = frame.stval;
     return result;
+}
+
+void TrapContext::save_user(myos_user_context& output) const noexcept {
+    const auto& frame = frame_of(frame_);
+    output = {};
+    output.words[0] = frame.sepc;
+    const auto* const registers = &frame.ra;
+    for (usize index = 0; index < 31; ++index) {
+        output.words[index + 1] = registers[index];
+    }
+}
+
+auto TrapContext::load_user(const myos_user_context& input) noexcept -> bool {
+    if (!valid_user_context(input)) {
+        return false;
+    }
+    auto& frame = frame_of(frame_);
+    auto* const registers = &frame.ra;
+    for (usize index = 0; index < 31; ++index) {
+        registers[index] = input.words[index + 1];
+    }
+    frame.sepc = input.words[0];
+    // User memory never contributes supervisor-controlled status.
+    frame.sstatus = riscv64::Sstatus::SPIE;
+    frame.scause = 0;
+    frame.stval = 0;
+    frame.padding = 0;
+    return true;
+}
+
+auto TrapContext::load_user_start(const UserStart& start) noexcept -> bool {
+    if (!valid_user_start(start)) {
+        return false;
+    }
+    myos_user_context context{};
+    context.words[0] = start.entry.raw();
+    context.words[2] = start.stack.raw();
+    constexpr usize A0 = 10;
+    for (usize index = 0; index < 6; ++index) {
+        context.words[A0 + index] = start.arguments[index];
+    }
+    return load_user(context);
 }
 
 } // namespace arch

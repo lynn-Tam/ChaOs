@@ -12,6 +12,11 @@ enum class ObjectKind : u16 {
     CSpace,
     MemoryObject,
     VSpace,
+    ResourcePool,
+    Notification,
+    Vproc,
+    Tunnel,
+    Count,
 };
 
 // Kernel-internal stable identity. The address locates a typed store slot; the

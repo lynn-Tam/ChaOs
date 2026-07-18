@@ -36,7 +36,9 @@ enum class DispatchReason : u8 {
     Timer,
     Block,
     Exit,
+    Stop,
     RemoteWake,
+    Activation,
 };
 
 } // namespace kernel::sched

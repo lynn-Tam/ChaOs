@@ -10,6 +10,7 @@
 #include <mm/pmm.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
+#include <resource/pool.hpp>
 #include <sched/domain.hpp>
 #include <time/clock.hpp>
 
@@ -46,12 +47,10 @@ public:
         kernel::CpuTopologySummary summary) noexcept -> CpuBeginResult;
     [[nodiscard]] auto initialize_kernel_domain(usize cpu_count) noexcept
         -> bool;
+    [[nodiscard]] auto initialize_root_pool(
+        kernel::resource::Budget limit) noexcept -> bool;
     [[nodiscard]] auto start_reclaimer(kernel::CpuRuntime& runtime) noexcept
         -> bool;
-#if MYOS_INITIAL_USER_PROOF
-    [[nodiscard]] auto start_first_user(kernel::CpuRuntime& runtime) noexcept
-        -> bool;
-#endif
 
     [[nodiscard]] auto pmm(this auto& self) noexcept
         -> decltype(auto){
@@ -86,13 +85,23 @@ public:
         -> decltype(auto) {
         return self.kernel_domain_.get();
     }
+    [[nodiscard]] auto kernel_domain_ref() const noexcept {
+        return kernel_domain_.ref();
+    }
+    [[nodiscard]] auto root_pool(this auto& self) noexcept
+        -> decltype(auto) {
+        return self.root_pool_.get();
+    }
+    [[nodiscard]] auto root_pool_ref() const noexcept {
+        return root_pool_.ref();
+    }
+    [[nodiscard]] auto clone_root_pool() const noexcept {
+        return root_pool_.clone();
+    }
 private:
     [[noreturn]] static void reclaimer_entry(void* argument) noexcept;
     void wake_reclaimer() noexcept;
     void release_scheduler_objects() noexcept;
-#if MYOS_INITIAL_USER_PROOF
-    void release_first_user() noexcept;
-#endif
 
     libk::ManualLifetime<kernel::mm::DirectMap> direct_map_{};
     libk::ManualLifetime<kernel::mm::Pmm> pmm_{};
@@ -105,17 +114,7 @@ private:
     kernel::object::ObjectStore::SchedulingDomainHold kernel_domain_{};
     kernel::object::ObjectStore::SchedulingContextHold reclaimer_context_{};
     kernel::object::ObjectStore::ThreadHold reclaimer_thread_{};
-#if MYOS_INITIAL_USER_PROOF
-    kernel::object::ObjectStore::SchedulingContextHold first_user_context_{};
-    kernel::object::ObjectStore::ThreadHold first_user_thread_{};
-    kernel::object::ObjectStore::SchedulingContextHold user_peer_context_{};
-    kernel::object::ObjectStore::ThreadHold user_peer_thread_{};
-    kernel::object::ObjectStore::VSpaceHold first_user_vspace_{};
-    kernel::object::ObjectStore::CSpaceHold first_user_cspace_{};
-    kernel::object::ObjectStore::MemoryHold first_user_code_{};
-    kernel::object::ObjectStore::MemoryHold first_user_stack_{};
-    kernel::object::ObjectStore::MemoryHold user_peer_stack_{};
-#endif
+    kernel::object::ObjectStore::ResourceHold root_pool_{};
 };
 
 } // namespace kernel

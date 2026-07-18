@@ -16,8 +16,6 @@ extern "C" {
 extern char kernel_img_start[];
 extern char kernel_text_start[];
 extern char kernel_text_end[];
-extern char user_image_start[];
-extern char user_image_end[];
 extern char kernel_rodata_start[];
 extern char kernel_rodata_end[];
 extern char kernel_data_start[];
@@ -123,8 +121,7 @@ auto validate_linker_layout() noexcept -> void {
     KASSERT(address_of(kernel_img_start)
         == kernel::image::virtual_begin().raw());
     KASSERT(address_of(kernel_img_start) == address_of(kernel_text_start));
-    KASSERT(address_of(kernel_text_end) == address_of(user_image_start));
-    KASSERT(address_of(user_image_end) == address_of(kernel_rodata_start));
+    KASSERT(address_of(kernel_text_end) == address_of(kernel_rodata_start));
     KASSERT(address_of(kernel_rodata_end) == address_of(kernel_data_start));
     KASSERT(address_of(kernel_data_end) == address_of(kernel_bss_start));
     KASSERT(address_of(kernel_bss_end) == address_of(kernel_bootstack_start));
@@ -139,7 +136,6 @@ auto map_initial_kernel(Sv39Builder& builder, kernel::mm::Pmm& pmm) noexcept
 
     const LinkedSection linked_sections[] = {
         {kernel_text_start, kernel_text_end, PtePerm::supervisor_rx(), true},
-        {user_image_start, user_image_end, PtePerm::supervisor_ro(), false},
         {kernel_rodata_start, kernel_rodata_end, PtePerm::supervisor_ro(), false},
         {kernel_data_start, kernel_data_end, PtePerm::supervisor_rw(), false},
         {kernel_bss_start, kernel_bss_end, PtePerm::supervisor_rw(), false},

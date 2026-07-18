@@ -60,18 +60,8 @@ SECTIONS
     kernel_text_lma_start = LOADADDR(.text);
     kernel_text_lma_end = LOADADDR(.text) + SIZEOF(.text);
 
-    .user_image ALIGN(PAGE_SIZE) :
-        AT(kernel_text_lma_end) {
-        user_image_start = .;
-        KEEP(*(.user.image))
-        . = ALIGN(PAGE_SIZE);
-        user_image_end = .;
-    }
-    user_image_lma_start = LOADADDR(.user_image);
-    user_image_lma_end = LOADADDR(.user_image) + SIZEOF(.user_image);
-
     .rodata ALIGN(PAGE_SIZE) :
-        AT(user_image_lma_end) {
+        AT(kernel_text_lma_end) {
         kernel_rodata_start = .;
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
@@ -159,12 +149,6 @@ ASSERT(kernel_image_end_pfn <= 0x7fffffff,
 ASSERT(kernel_rodata_lma_start ==
        KERNEL_PHYS_BASE + (kernel_rodata_start - KERNEL_VIRT_BASE),
        "kernel VMA/LMA delta must remain affine")
-ASSERT(user_image_lma_start ==
-       KERNEL_PHYS_BASE + (user_image_start - KERNEL_VIRT_BASE),
-       "user image VMA/LMA delta must remain affine")
-ASSERT((user_image_end - user_image_start) == 0 ||
-       (user_image_end - user_image_start) == PAGE_SIZE,
-       "optional initial user image must be empty or exactly one page")
 ASSERT(kernel_data_lma_start ==
        KERNEL_PHYS_BASE + (kernel_data_start - KERNEL_VIRT_BASE),
        "kernel VMA/LMA delta must remain affine")

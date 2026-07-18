@@ -203,7 +203,7 @@ private:
             || !sink_(
                 CpuHardwareId{static_cast<usize>(raw_id)},
                 availability_)) {
-            return fail(CpuTopologyError::RegistryRejected);
+            return fail(CpuTopologyError::CapacityExceeded);
         }
         return true;
     }
@@ -238,48 +238,51 @@ template<typename Sink>
 
 } // namespace
 
-auto parse_fdt_cpus_summary(
+auto parse_fdt_cpus(
     const kernel::boot::fdt::FDT_View& view,
-    CpuHardwareId boot_hardware_id) noexcept -> CpuSummaryResult {
-    CpuTopologySummary summary{};
+    CpuHardwareId boot_hardware_id,
+    CpuHandoff& destination) noexcept
+    -> libk::Expected<void, CpuTopologyError> {
+    destination.cpus.clear();
+    destination.boot_index = 0;
     usize boot_matches{};
     bool boot_unavailable{};
 
     auto sink = [&](CpuHardwareId hardware_id, CpuAvailability availability) {
-        if (summary.count == libk::numeric_limits<usize>::max()) {
-            return false;
-        }
         if (hardware_id == boot_hardware_id) {
             ++boot_matches;
-            summary.boot_index = summary.count;
+            destination.boot_index = destination.cpus.size();
             boot_unavailable = availability != CpuAvailability::Enabled;
         }
-        ++summary.count;
-        return true;
+        return destination.cpus.try_push_back(BootCpu{
+            .hardware_id = hardware_id,
+            .availability = availability,
+        });
     };
     auto walked = walk_cpus(view, sink);
     if (!walked) {
         return libk::unexpected(walked.error());
     }
-    if (summary.count == 0 || boot_matches == 0) {
+    if (destination.cpus.empty() || boot_matches == 0) {
         return libk::unexpected(CpuTopologyError::BootCpuMissing);
     }
     if (boot_matches != 1) {
         return libk::unexpected(CpuTopologyError::DuplicateBootCpu);
     }
+    for (usize first = 0; first < destination.cpus.size(); ++first) {
+        for (usize second = first + 1;
+             second < destination.cpus.size();
+             ++second) {
+            if (destination.cpus[first].hardware_id
+                == destination.cpus[second].hardware_id) {
+                return libk::unexpected(CpuTopologyError::DuplicateCpu);
+            }
+        }
+    }
     if (boot_unavailable) {
         return libk::unexpected(CpuTopologyError::BootCpuUnavailable);
     }
-    return libk::expected(summary);
-}
-
-auto populate_fdt_cpus(
-    const kernel::boot::fdt::FDT_View& view,
-    CpuRegistry::Builder& builder) noexcept -> CpuPopulateResult {
-    auto sink = [&](CpuHardwareId hardware_id, CpuAvailability availability) {
-        return static_cast<bool>(builder.append(hardware_id, availability));
-    };
-    return walk_cpus(view, sink);
+    return libk::expected();
 }
 
 } // namespace kernel::boot

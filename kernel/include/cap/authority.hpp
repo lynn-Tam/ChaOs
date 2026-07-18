@@ -6,6 +6,7 @@
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
 #include <mm/vm_key.hpp>
+#include <resource/sponsorship.hpp>
 
 namespace kernel::mm {
 class VSpace;
@@ -32,10 +33,29 @@ struct VSpaceAuthority final {
         VSpaceAuthority, VSpaceAuthority) noexcept -> bool = default;
 };
 
+struct ResourcePoolAuthority final {
+    kernel::resource::Budget budget{};
+    u64 object_kinds{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        ResourcePoolAuthority, ResourcePoolAuthority) noexcept
+        -> bool = default;
+};
+
+struct NotificationAuthority final {
+    u64 badge{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        NotificationAuthority, NotificationAuthority) noexcept
+        -> bool = default;
+};
+
 using AuthorityData = libk::variant<
     libk::monostate,
     MemoryAuthority,
-    VSpaceAuthority>;
+    VSpaceAuthority,
+    ResourcePoolAuthority,
+    NotificationAuthority>;
 
 struct GrantCeiling final {
     Rights rights{};

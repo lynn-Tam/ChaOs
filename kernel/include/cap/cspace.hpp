@@ -12,6 +12,7 @@
 #include <libk/sync/ticket_spin_lock.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_traits.hpp>
+#include <resource/sponsorship.hpp>
 
 namespace kernel::mm {
 class VSpace;
@@ -41,11 +42,7 @@ enum class CSpaceError : u8 {
     GenerationExhausted,
     Contended,
     GrantUnavailable,
-};
-
-enum class RevokeState : u8 {
-    Complete,
-    Waiting,
+    ResourceExhausted,
 };
 
 class CSpace final : private libk::noncopyable_nonmovable {
@@ -67,8 +64,13 @@ public:
 
     private:
         friend class CSpace;
-        Reservation(CSpace& owner, CapHandle handle) noexcept
-            : owner_(&owner), handle_(handle) {}
+        Reservation(
+            CSpace& owner,
+            CapHandle handle,
+            kernel::resource::Reservation&& charge) noexcept
+            : owner_(&owner),
+              handle_(handle),
+              charge_(libk::move(charge)) {}
         void reset() noexcept;
         void disarm() noexcept {
             owner_ = nullptr;
@@ -77,6 +79,7 @@ public:
 
         CSpace* owner_{};
         CapHandle handle_{};
+        kernel::resource::Reservation charge_{};
     };
 
     explicit CSpace(kernel::mm::Pmm& pmm) noexcept;
@@ -86,6 +89,10 @@ public:
     [[nodiscard]] auto reserve() noexcept
         -> libk::Expected<Reservation, CSpaceError>;
     [[nodiscard]] auto insert(
+        GrantRef&& grant,
+        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+    [[nodiscard]] auto insert(
+        Reservation&& reservation,
         GrantRef&& grant,
         CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto close(CapHandle handle) noexcept
@@ -119,7 +126,7 @@ public:
         Thread& thread,
         CpuRegistry& cpus,
         bool include_source) noexcept
-        -> libk::Expected<RevokeState, CSpaceError>;
+        -> libk::Expected<kernel::operation::State, CSpaceError>;
     [[nodiscard]] auto destroy(CapHandle source) noexcept
         -> libk::Expected<void, CSpaceError>;
 
@@ -158,6 +165,7 @@ public:
             return libk::unexpected(CSpaceError::GrantUnavailable);
         }
         return libk::expected(Resolved<T>{
+            *this,
             libk::move(pin).value(),
             libk::move(lease),
             effective.value()});
@@ -172,8 +180,8 @@ private:
     friend class ::kernel::mm::VSpace;
     friend class kernel::ExecutionBinding;
     friend struct kernel::object::ObjectTraits<CSpace>;
-    static constexpr usize leaf_bits = 5;
-    static constexpr usize dir_bits = 9;
+    static constexpr usize leaf_bits = 3;
+    static constexpr usize dir_bits = 8;
     static constexpr usize leaf_slots = usize{1} << leaf_bits;
     static constexpr usize dir_entries = usize{1} << dir_bits;
     static constexpr u32 invalid_index = ~u32{};
@@ -203,22 +211,47 @@ private:
         u32 next{invalid_index};
         u32 previous{invalid_index};
         SlotState state{SlotState::Empty};
+        kernel::resource::Sponsorship sponsorship{};
 
-        ~Slot() noexcept { KASSERT(state != SlotState::Occupied); }
+        ~Slot() noexcept {
+            KASSERT(state != SlotState::Occupied);
+            KASSERT(!sponsorship);
+        }
     };
 
     struct DirPage final {
+        DirPage(
+            kernel::mm::Page physical,
+            kernel::resource::Reservation&& charge) noexcept
+            : page(physical) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
+
+        kernel::mm::Page page{};
+        kernel::resource::Sponsorship sponsorship{};
         void* children[dir_entries]{};
     };
 
     struct LeafPage final {
-        explicit LeafPage(u32 base) noexcept : base_index(base) {}
+        LeafPage(
+            u32 base,
+            kernel::mm::Page physical,
+            kernel::resource::Reservation&& charge) noexcept
+            : base_index(base), page(physical) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
         u32 base_index{};
         u32 padding{};
+        kernel::mm::Page page{};
+        kernel::resource::Sponsorship sponsorship{};
         Slot slots[leaf_slots]{};
     };
 
-    static_assert(sizeof(DirPage) == kernel::mm::page_size);
+    static_assert(sizeof(DirPage) <= kernel::mm::page_size);
     static_assert(sizeof(LeafPage) <= kernel::mm::page_size);
 
     struct Snapshot final {
@@ -241,9 +274,12 @@ private:
         CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     void rollback(CapHandle handle) noexcept;
     void finish_retire() noexcept;
+    [[nodiscard]] auto reserve_grant() noexcept
+        -> libk::Expected<kernel::resource::Reservation, CSpaceError>;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
+    void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept;
     [[nodiscard]] auto grow() noexcept -> libk::Expected<void, CSpaceError>;
     [[nodiscard]] auto slot(usize index) noexcept -> Slot*;
     [[nodiscard]] auto slot(usize index) const noexcept -> const Slot*;
@@ -271,6 +307,7 @@ private:
     bool releasing_{};
     bool retired_{};
     usize bindings_{};
+    kernel::resource::Sponsorship* sponsor_{};
 };
 
 } // namespace kernel::cap

@@ -14,6 +14,7 @@
 namespace kernel {
 
 class CpuRegistry;
+class KernelState;
 
 // Stable owner for every resource whose lifetime is tied to one CPU runtime.
 // Registry metadata only publishes a borrow to this object after construction.
@@ -53,6 +54,7 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     libk::ManualLifetime<sched::CpuDispatcher> dispatcher_storage{};
     arch::CpuStartContext start_context{};
     CpuRegistry* owner_registry{};
+    KernelState* kernel{};
 };
 
 static_assert(sizeof(CpuRuntime) <= kernel::mm::page_size,

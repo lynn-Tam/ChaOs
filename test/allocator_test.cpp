@@ -411,6 +411,42 @@ bool test_exact_boot_reservation_handoff(const TestContext&) noexcept {
         && memory.verify_invariants();
 }
 
+bool test_boot_reservation_adopts_owned_pages(const TestContext&) noexcept {
+    kernel::mm::RegionList map{};
+    if (!append_region(map, 0, 48, kernel::mm::RegionKind::AvailableRam)
+        || !append_region(
+            map, 48, 3, kernel::mm::RegionKind::ReclaimableBootData)
+        || !append_region(map, 51, 13, kernel::mm::RegionKind::AvailableRam)) {
+        return false;
+    }
+    PmmFixture fixture{primary_memory_storage, libk::move(map)};
+    if (!fixture) {
+        return false;
+    }
+    auto& memory = fixture.memory();
+    const size_t initial_free = memory.free_page_count();
+    auto reservation = memory.take_boot_reservation_for(page_range(48, 3));
+    if (!reservation) {
+        return false;
+    }
+    auto adopted = memory.adopt(libk::move(*reservation));
+    if (!adopted) {
+        return false;
+    }
+    auto pages = libk::move(adopted).value();
+    const auto state = memory.state_of(page_at(49));
+    if (!state || state.value() != kernel::mm::PageState::Allocated
+        || pages.page_count() != 3 || !pages.contains(page_at(48))
+        || !pages.contains(page_at(50))
+        || memory.free_page_count() != initial_free
+        || memory.take_boot_reservation_for(page_range(48, 3))) {
+        return false;
+    }
+    pages.reset();
+    return memory.free_page_count() == initial_free + 3
+        && memory.verify_invariants();
+}
+
 bool test_reservation_authority_is_bound_to_its_owner(const TestContext&) noexcept {
     kernel::mm::RegionList first_map{};
     kernel::mm::RegionList second_map{};
@@ -438,7 +474,7 @@ bool test_reservation_authority_is_bound_to_its_owner(const TestContext&) noexce
     }
     const auto reclaimed = second.reclaim(libk::move(*reservation));
     return !reclaimed
-        && reclaimed.error() == kernel::mm::BootReclaimError::WrongOwner
+        && reclaimed.error() == kernel::mm::BootReservationError::WrongOwner
         && first.verify_invariants()
         && second.verify_invariants();
 }
@@ -1453,6 +1489,7 @@ void register_allocator_tests(TestRegistry& registry) noexcept {
     (void)registry.add("pmm", "boot reservations require explicit consumption", test_boot_reservation_requires_explicit_consumption);
     (void)registry.add("pmm", "dropped reservation authority can be taken again", test_dropped_reservation_can_be_taken_again);
     (void)registry.add("pmm", "exact boot reservation handoff preserves other reservations", test_exact_boot_reservation_handoff);
+    (void)registry.add("pmm", "boot reservation adoption transfers frame ownership", test_boot_reservation_adopts_owned_pages);
     (void)registry.add("pmm", "reservation authority is bound to one owner", test_reservation_authority_is_bound_to_its_owner);
     (void)registry.add("pmm", "discontiguous RAM forms independent arenas", test_discontiguous_ram_forms_multiple_arenas);
     (void)registry.add("pmm", "foreign pages and MMIO stay unmanaged", test_foreign_page_and_mmio_are_not_managed);

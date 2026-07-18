@@ -6,17 +6,20 @@
 #include <cap/handle.hpp>
 #include <core/types.hpp>
 #include <libk/expected.hpp>
+#include <libk/sync/atomic.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/ticket_spin_lock.hpp>
+#include <libk/utility.hpp>
 #include <mm/address_region.hpp>
 #include <mm/kernel_vspace.hpp>
-#include <mm/ipc_buffer.hpp>
+#include <mm/user_view.hpp>
 #include <mm/mapping_authority.hpp>
 #include <mm/node_pool.hpp>
 #include <mm/translation.hpp>
 #include <object/object_cleanup.hpp>
+#include <resource/sponsorship.hpp>
 
 namespace kernel {
 class CpuRegistry;
@@ -62,6 +65,7 @@ enum class VSpaceError : u8 {
     GrantUnavailable,
     ShootdownUnavailable,
     TranslationCorrupt,
+    ResourceExhausted,
 };
 
 enum class VmStatus : u8 {
@@ -155,6 +159,12 @@ public:
     }
     [[nodiscard]] auto binding_count() const noexcept -> usize;
 
+    // Binds a trusted kernel consumer to the unique live Mapping covering the
+    // requested virtual/object ranges. MappingKey remains VSpace-internal;
+    // callers cannot manufacture a second mapping identity truth.
+    [[nodiscard]] auto bind_view(UserViewRequest&& request) noexcept
+        -> libk::Expected<UserView, VSpaceError>;
+
     [[nodiscard]] auto create_region(
         RegionKey parent,
         VirtRange range,
@@ -235,7 +245,7 @@ private:
     friend class VSpaceExecutor;
     friend class MappingAuthority;
     friend class kernel::ExecutionBinding;
-    friend class IpcBufferBinding;
+    friend class UserView;
     friend struct kernel::object::ObjectTraits<VSpace>;
 
     enum class PendingKind : u8 {
@@ -251,6 +261,22 @@ private:
     struct RangeClaim final {
         AddressRegion* region{};
         VirtRange range{};
+    };
+
+    // Transaction-local table capacity.  charge is declared before pages so
+    // physical ownership is released first during reverse destruction.
+    struct TableReserve final {
+        TableReserve(
+            kernel::resource::Charge&& table_charge,
+            OwnedPageGroup&& table_pages) noexcept
+            : charge(libk::move(table_charge)),
+              pages(libk::move(table_pages)) {}
+
+        TableReserve(TableReserve&&) noexcept = default;
+        auto operator=(TableReserve&&) noexcept -> TableReserve& = default;
+
+        kernel::resource::Charge charge{};
+        OwnedPageGroup pages{};
     };
 
     [[nodiscard]] auto map_impl(
@@ -299,7 +325,8 @@ private:
     [[nodiscard]] auto commit_translation(
         TranslationState::Mutation&& mutation,
         ShootdownPlan&& plan,
-        RetireBatch& retire) noexcept
+        RetireBatch& retire,
+        bool instruction_sync = false) noexcept
         -> libk::Expected<VmStatus, VSpaceError>;
     [[nodiscard]] auto finish_pending() noexcept -> bool;
     void queue_layout(LayoutNode& node) noexcept;
@@ -341,7 +368,10 @@ private:
         -> libk::Expected<FaultResult, VSpaceError>;
     [[nodiscard]] auto reserve_tables(
         MappedPage* pages) noexcept
-        -> libk::Expected<OwnedPageGroup, VSpaceError>;
+        -> libk::Expected<TableReserve, VSpaceError>;
+    void commit_tables(TableReserve& reserve) noexcept;
+    void retire_table(RetireBatch& retire, OwnedPage&& page) noexcept;
+    void release_root() noexcept;
 
     [[nodiscard]] auto start_region_destroy(
         VmContext context,
@@ -362,12 +392,11 @@ private:
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
-    [[nodiscard]] auto bind_ipc(IpcBufferRequest&& request) noexcept
-        -> libk::Expected<IpcBufferBinding, VSpaceError>;
-    void detach_ipc(IpcRelation& relation) noexcept;
-    [[nodiscard]] auto ipc_active(const IpcRelation& relation) const noexcept
+    void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept;
+    void detach_view(UserViewRelation& relation) noexcept;
+    [[nodiscard]] auto view_active(const UserViewRelation& relation) const noexcept
         -> bool;
-    void invalidate_ipc(Mapping& mapping) noexcept;
+    void invalidate_views(Mapping& mapping) noexcept;
 
     Pmm* pmm_{};
     KernelVSpace* kernel_{};
@@ -381,7 +410,7 @@ private:
     NodePool<Guard> guards_;
     NodePool<MappingAuthority> authorities_;
     NodePool<MappedPage> pages_;
-    NodePool<IpcRelation> ipc_relations_;
+    NodePool<UserViewRelation> views_;
     AddressRegion* root_region_{};
     RangeClaim claim_{};
     InvalidationList invalidations_{};
@@ -394,10 +423,13 @@ private:
     libk::ManualLifetime<RetireBatch> retire_batch_{};
     libk::ManualLifetime<object::ObjectCleanup> cleanup_{};
     libk::IntrusiveListHook work_hook_{};
+    libk::Atomic<bool> work_open_{false};
     VSpaceState state_{VSpaceState::Building};
     usize bindings_{};
     usize transport_retries_{};
     bool service_waiting_on_claim_{};
+    kernel::resource::Sponsorship* sponsor_{};
+    kernel::resource::Charge table_charge_{};
 };
 
 } // namespace kernel::mm

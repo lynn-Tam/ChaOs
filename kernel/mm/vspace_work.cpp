@@ -14,6 +14,9 @@ void VSpaceExecutor::submit(VSpace& space) noexcept {
     Notifier notifier{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
+        if (!space.work_open_.load<libk::MemoryOrder::Acquire>()) {
+            return;
+        }
         if (space.work_hook_.is_linked()) {
             return;
         }
@@ -28,6 +31,13 @@ void VSpaceExecutor::submit(VSpace& space) noexcept {
 auto VSpaceExecutor::take() noexcept -> VSpace* {
     kernel::sync::IrqLockGuard guard{lock_};
     return queue_.empty() ? nullptr : &queue_.pop_front();
+}
+
+void VSpaceExecutor::withdraw(VSpace& space) noexcept {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (space.work_hook_.is_linked()) {
+        queue_.erase(space);
+    }
 }
 
 auto VSpaceExecutor::run(VmContext context, usize budget) noexcept -> bool {

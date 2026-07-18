@@ -20,6 +20,7 @@ auto cap_status(cap::CSpaceError error) noexcept -> myos_status_t {
     case cap::CSpaceError::SlotQuota:
     case cap::CSpaceError::PageQuota:
     case cap::CSpaceError::GenerationExhausted:
+    case cap::CSpaceError::ResourceExhausted:
         return MYOS_STATUS_NO_MEMORY;
     case cap::CSpaceError::InvalidState:
     case cap::CSpaceError::Contended:
@@ -46,6 +47,7 @@ auto vm_status(kernel::mm::VSpaceError error) noexcept -> myos_status_t {
     case kernel::mm::VSpaceError::OutOfMemory:
     case kernel::mm::VSpaceError::QuotaExceeded:
     case kernel::mm::VSpaceError::GenerationExhausted:
+    case kernel::mm::VSpaceError::ResourceExhausted:
         return MYOS_STATUS_NO_MEMORY;
     case kernel::mm::VSpaceError::InvalidState:
     case kernel::mm::VSpaceError::Busy:

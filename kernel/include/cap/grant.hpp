@@ -9,7 +9,7 @@
 #include <object/object_id.hpp>
 #include <object/object_ref.hpp>
 #include <sync/completion.hpp>
-#include <thread/wait.hpp>
+#include <operation/completion.hpp>
 
 namespace kernel::cap {
 
@@ -135,6 +135,7 @@ public:
     [[nodiscard]] auto attach(GrantAttachment& attachment) const noexcept
         -> libk::Expected<void, GrantError>;
     [[nodiscard]] auto derive_region(
+        kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
         GrantCeiling ceiling,
         RegionDerivation proof) const noexcept
@@ -176,13 +177,11 @@ private:
     friend class GrantGraph;
     GrantRef(
         GrantGraph& graph,
-        void* node,
-        u64 generation) noexcept
-        : graph_(&graph), node_(node), generation_(generation) {}
+        GrantKey key) noexcept
+        : graph_(&graph), key_(key) {}
 
     GrantGraph* graph_{};
-    void* node_{};
-    u64 generation_{};
+    GrantKey key_{};
 };
 
 // Caller-owned completion for one lineage transition. Existing operation
@@ -212,7 +211,7 @@ private:
 
 // Capability-owned operation used only for a blocking invocation. GrantGraph
 // owns its stable storage; Thread observes it through the embedded generic
-// WaitRelation and never contains capability-specific state.
+// operation::Completion and never contains capability-specific state.
 class GrantRevokeWait final : private libk::noncopyable_nonmovable {
 public:
     explicit GrantRevokeWait(GrantGraph& graph) noexcept;
@@ -222,7 +221,7 @@ public:
         return completion_.complete();
     }
     [[nodiscard]] auto arm() noexcept -> bool { return completion_.arm(); }
-    [[nodiscard]] auto relation() noexcept -> kernel::WaitRelation& {
+    [[nodiscard]] auto relation() noexcept -> kernel::operation::Completion& {
         return relation_;
     }
 
@@ -231,12 +230,13 @@ private:
     friend class GrantGraph;
 
     void ready() noexcept;
-    void resume(arch::TrapContext&) noexcept;
-    void cancel() noexcept;
+    [[nodiscard]] auto read() noexcept -> kernel::operation::Result;
+    void release() noexcept;
+    [[nodiscard]] auto cancel() noexcept -> bool;
 
     GrantGraph* graph_{};
     GrantRevoke completion_;
-    kernel::WaitRelation relation_;
+    kernel::operation::Completion relation_;
 };
 
 } // namespace kernel::cap

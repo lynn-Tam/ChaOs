@@ -9,6 +9,12 @@ template<>
 struct ObjectTraits<kernel::cap::CSpace> final {
     static constexpr ObjectKind kind = ObjectKind::CSpace;
 
+    static void bind_sponsor(
+        kernel::cap::CSpace& space,
+        kernel::resource::Sponsorship& sponsor) noexcept {
+        space.bind_sponsor(sponsor);
+    }
+
     [[nodiscard]] static auto prepare_retire(
         kernel::cap::CSpace& space) noexcept -> bool {
         return space.prepare_retire();

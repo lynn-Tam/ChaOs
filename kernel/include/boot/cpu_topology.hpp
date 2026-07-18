@@ -1,8 +1,7 @@
 #pragma once
 
+#include <boot/boot_info.hpp>
 #include <boot/firmware/devicetree/fdt.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <cpu/topology.hpp>
 #include <libk/expected.hpp>
 
 namespace kernel::boot {
@@ -18,19 +17,14 @@ enum class CpuTopologyError : u8 {
     BootCpuMissing,
     BootCpuUnavailable,
     DuplicateBootCpu,
-    RegistryRejected,
+    DuplicateCpu,
+    CapacityExceeded,
 };
 
-using CpuSummaryResult =
-    libk::Expected<CpuTopologySummary, CpuTopologyError>;
-using CpuPopulateResult = libk::Expected<void, CpuTopologyError>;
-
-[[nodiscard]] auto parse_fdt_cpus_summary(
+[[nodiscard]] auto parse_fdt_cpus(
     const kernel::boot::fdt::FDT_View& view,
-    CpuHardwareId boot_hardware_id) noexcept -> CpuSummaryResult;
-
-[[nodiscard]] auto populate_fdt_cpus(
-    const kernel::boot::fdt::FDT_View& view,
-    CpuRegistry::Builder& builder) noexcept -> CpuPopulateResult;
+    CpuHardwareId boot_hardware_id,
+    CpuHandoff& destination) noexcept
+    -> libk::Expected<void, CpuTopologyError>;
 
 } // namespace kernel::boot

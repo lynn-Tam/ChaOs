@@ -14,10 +14,12 @@
 namespace kernel {
 
 class ExecutionBinding;
+class Execution;
 
 class CpuDescriptor;
 struct CpuRuntime;
 class Thread;
+class Vproc;
 struct CpuLocal;
 namespace sched {
 class CpuDispatcher;
@@ -52,19 +54,24 @@ struct CpuLocal final {
         CpuRuntime& runtime) noexcept {
         descriptor = &identity;
         runtime_ = &runtime;
-        current_thread_ = nullptr;
+        current_execution_ = nullptr;
         dispatcher_ = nullptr;
         active_translation_ = nullptr;
         active_root_ = {};
         observed_epoch_ = {};
+        observed_instruction_epoch_ = {};
         arch::initialize_cpu_entry(arch_state, this);
     }
 
-    [[nodiscard]] auto current_thread() noexcept -> Thread* {
-        return current_thread_;
+    [[nodiscard]] auto current_thread() noexcept -> Thread*;
+    [[nodiscard]] auto current_thread() const noexcept -> const Thread*;
+    [[nodiscard]] auto current_vproc() noexcept -> Vproc*;
+    [[nodiscard]] auto current_vproc() const noexcept -> const Vproc*;
+    [[nodiscard]] auto current_execution() noexcept -> Execution* {
+        return current_execution_;
     }
-    [[nodiscard]] auto current_thread() const noexcept -> const Thread* {
-        return current_thread_;
+    [[nodiscard]] auto current_execution() const noexcept -> const Execution* {
+        return current_execution_;
     }
     [[nodiscard]] auto dispatcher() noexcept -> sched::CpuDispatcher* {
         return dispatcher_;
@@ -91,12 +98,13 @@ struct CpuLocal final {
 
     // Dispatcher-owned runtime caches. Other CPUs observe execution through
     // explicit snapshots/events, never by mutating these fields.
-    Thread* current_thread_{};
+    Execution* current_execution_{};
     sched::CpuDispatcher* dispatcher_{};
     CpuRuntime* runtime_{};
     kernel::mm::TranslationState* active_translation_{};
     arch::RootToken active_root_{};
     kernel::mm::TranslationEpoch observed_epoch_{};
+    kernel::mm::InstructionEpoch observed_instruction_epoch_{};
 };
 
 static_assert(libk::is_standard_layout_v<CpuLocal>);

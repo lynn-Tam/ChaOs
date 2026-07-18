@@ -89,6 +89,7 @@ public:
         object::ObjectRef&& memory,
         MemoryObject& object,
         cap::MemoryAuthority frozen,
+        AccessMask access,
         AuthoritySource source) noexcept;
     ~MappingAuthority() noexcept;
 
@@ -129,6 +130,7 @@ private:
     object::ObjectRef memory_ref_{};
     MemoryObject* memory_{};
     cap::MemoryAuthority frozen_{};
+    AccessMask access_{};
     AuthoritySource source_{AuthoritySource::Kernel};
     MappingList mappings_{};
     PageTree pages_{};
@@ -139,6 +141,7 @@ private:
     libk::ManualLifetime<cap::GrantWork> grant_work_{};
     bool invalidation_requested_{};
     bool relations_detached_{};
+    bool releasing_relations_{};
     libk::Atomic<bool> release_notified_{};
     MappingAuthority* pending_next_{};
 };

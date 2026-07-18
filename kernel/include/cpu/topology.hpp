@@ -4,6 +4,10 @@
 
 namespace kernel {
 
+// Firmware IDs remain opaque and sparse, while every normalized topology is
+// bounded before it enters kernel initialization.
+inline constexpr usize max_cpu_count = 256;
+
 struct CpuId final {
     usize raw{};
 

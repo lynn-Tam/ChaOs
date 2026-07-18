@@ -6,9 +6,13 @@
 #include <libk/utility.hpp>
 #include <object/cspace_pool.hpp>
 #include <object/memory_pool.hpp>
+#include <object/notification_pool.hpp>
+#include <object/resource_pool.hpp>
 #include <object/sched_pool.hpp>
 #include <object/thread_pool.hpp>
+#include <object/tunnel_pool.hpp>
 #include <object/vspace_pool.hpp>
+#include <object/vproc_pool.hpp>
 
 namespace kernel::object {
 
@@ -42,6 +46,22 @@ public:
     using VSpacePending = object::VSpacePending;
     using VSpaceHold = object::VSpaceHold;
     using VSpacePin = object::VSpacePin;
+    using ResourcePool = object::ResourcePool;
+    using ResourcePending = object::ResourcePending;
+    using ResourceHold = object::ResourceHold;
+    using ResourcePin = object::ResourcePin;
+    using NotificationPool = object::NotificationPool;
+    using NotificationPending = object::NotificationPending;
+    using NotificationHold = object::NotificationHold;
+    using NotificationPin = object::NotificationPin;
+    using VprocPool = object::VprocPool;
+    using VprocPending = object::VprocPending;
+    using VprocHold = object::VprocHold;
+    using VprocPin = object::VprocPin;
+    using TunnelPool = object::TunnelPool;
+    using TunnelPending = object::TunnelPending;
+    using TunnelHold = object::TunnelHold;
+    using TunnelPin = object::TunnelPin;
 
     explicit ObjectStore(kernel::mm::Pmm& pmm, kernel::mm::VSpaceExecutor& vspace_work) noexcept;
     ~ObjectStore() noexcept;
@@ -53,11 +73,31 @@ public:
     }
 
     template<typename... Args>
+    [[nodiscard]] auto create_thread_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept
+        -> libk::Expected<ThreadPending, ThreadPool::Error> {
+        return threads_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
     [[nodiscard]] auto create_context(Args&&... args) noexcept
         -> libk::Expected<
             SchedulingContextPending,
             SchedulingContextPool::Error> {
         return contexts_.create(libk::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    [[nodiscard]] auto create_context_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept
+        -> libk::Expected<
+            SchedulingContextPending,
+            SchedulingContextPool::Error> {
+        return contexts_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
     }
 
     template<typename... Args>
@@ -85,12 +125,21 @@ public:
         -> libk::Expected<CSpacePending, CSpacePool::Error>;
     [[nodiscard]] auto create_cspace(cap::CSpace::Quota quota) noexcept
         -> libk::Expected<CSpacePending, CSpacePool::Error>;
+    [[nodiscard]] auto create_cspace_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        cap::CSpace::Quota quota = {}) noexcept
+        -> libk::Expected<CSpacePending, CSpacePool::Error>;
     [[nodiscard]] auto hold_cspace(ObjectId id) noexcept
         -> libk::Expected<CSpaceHold, CSpacePool::Error>;
     [[nodiscard]] auto pin_cspace(ObjectId id) noexcept
         -> libk::Expected<CSpacePin, CSpacePool::Error>;
 
     [[nodiscard]] auto create_anonymous(
+        usize byte_size,
+        kernel::mm::AnonymousConfig config = {}) noexcept
+        -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
+    [[nodiscard]] auto create_anonymous_sponsored(
+        kernel::resource::Reservation&& sponsorship,
         usize byte_size,
         kernel::mm::AnonymousConfig config = {}) noexcept
         -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
@@ -104,6 +153,13 @@ public:
         kernel::mm::BootOwnership ownership,
         kernel::mm::OwnedPageGroup&& pages = {}) noexcept
         -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
+    [[nodiscard]] auto create_boot_image_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        usize byte_size,
+        libk::Span<const kernel::mm::MemoryExtent> extents,
+        kernel::mm::BootOwnership ownership,
+        kernel::mm::OwnedPageGroup&& pages = {}) noexcept
+        -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
     [[nodiscard]] auto hold_memory(ObjectId id) noexcept
         -> libk::Expected<MemoryHold, MemoryPool::Error>;
     [[nodiscard]] auto pin_memory(ObjectId id) noexcept
@@ -111,10 +167,59 @@ public:
 
     [[nodiscard]] auto create_vspace(kernel::mm::KernelVSpace& kernel) noexcept
         -> libk::Expected<VSpacePending, kernel::mm::VSpaceError>;
+    [[nodiscard]] auto create_vspace_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        kernel::mm::KernelVSpace& kernel) noexcept
+        -> libk::Expected<VSpacePending, kernel::mm::VSpaceError>;
     [[nodiscard]] auto hold_vspace(ObjectId id) noexcept
         -> libk::Expected<VSpaceHold, VSpacePool::Error>;
     [[nodiscard]] auto pin_vspace(ObjectId id) noexcept
         -> libk::Expected<VSpacePin, VSpacePool::Error>;
+
+    [[nodiscard]] auto create_resource(kernel::resource::Budget limit) noexcept
+        -> libk::Expected<ResourcePending, ResourcePool::Error>;
+    [[nodiscard]] auto create_resource_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        kernel::resource::Budget limit) noexcept
+        -> libk::Expected<ResourcePending, ResourcePool::Error>;
+    [[nodiscard]] auto hold_resource(ObjectId id) noexcept
+        -> libk::Expected<ResourceHold, ResourcePool::Error>;
+    [[nodiscard]] auto pin_resource(ObjectId id) noexcept
+        -> libk::Expected<ResourcePin, ResourcePool::Error>;
+
+    [[nodiscard]] auto create_notification_sponsored(
+        kernel::resource::Reservation&& sponsorship) noexcept
+        -> libk::Expected<NotificationPending, NotificationPool::Error>;
+    [[nodiscard]] auto hold_notification(ObjectId id) noexcept
+        -> libk::Expected<NotificationHold, NotificationPool::Error>;
+    [[nodiscard]] auto pin_notification(ObjectId id) noexcept
+        -> libk::Expected<NotificationPin, NotificationPool::Error>;
+
+    template<typename... Args>
+    [[nodiscard]] auto create_vproc_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept
+        -> libk::Expected<VprocPending, VprocPool::Error> {
+        return vprocs_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
+    }
+    [[nodiscard]] auto hold_vproc(ObjectId id) noexcept
+        -> libk::Expected<VprocHold, VprocPool::Error>;
+    [[nodiscard]] auto pin_vproc(ObjectId id) noexcept
+        -> libk::Expected<VprocPin, VprocPool::Error>;
+
+    template<typename... Args>
+    [[nodiscard]] auto create_tunnel_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept
+        -> libk::Expected<TunnelPending, TunnelPool::Error> {
+        return tunnels_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
+    }
+    [[nodiscard]] auto hold_tunnel(ObjectId id) noexcept
+        -> libk::Expected<TunnelHold, TunnelPool::Error>;
+    [[nodiscard]] auto pin_tunnel(ObjectId id) noexcept
+        -> libk::Expected<TunnelPin, TunnelPool::Error>;
 
     // Runtime has exactly one drain executor. Tests and terminal teardown may
     // call this directly only while that executor is absent or stopped.
@@ -133,6 +238,11 @@ private:
     ReclaimNotifier reclaim_notify_{};
     kernel::mm::Pmm* pmm_{};
     kernel::mm::VSpaceExecutor* vspace_work_{};
+    // Sponsoring pools outlive every pool containing sponsored objects.
+    ResourcePool resources_;
+    TunnelPool tunnels_;
+    VprocPool vprocs_;
+    NotificationPool notifications_;
     ThreadPool threads_;
     SchedulingContextPool contexts_;
     SchedulingDomainPool domains_;

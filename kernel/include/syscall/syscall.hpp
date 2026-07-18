@@ -9,6 +9,7 @@ enum class Disposition : u8 {
     Yield,
     Block,
     Exit,
+    Resume,
 };
 
 [[nodiscard]] auto handle(arch::TrapContext& context) noexcept

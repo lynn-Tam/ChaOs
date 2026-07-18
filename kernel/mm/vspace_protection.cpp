@@ -80,7 +80,7 @@ auto VSpace::protect_impl(
 
     Mapping* left_source{};
     Mapping* right_source{};
-    bool ipc_conflict{};
+    bool view_conflict{};
     bool unsupported_type{};
     auto find_coverage = [&]() noexcept -> bool {
         LayoutNode* node = region.children_.lower_bound(range.base());
@@ -93,7 +93,7 @@ auto VSpace::protect_impl(
         const usize limit = range.end()->raw();
         left_source = nullptr;
         right_source = nullptr;
-        ipc_conflict = false;
+        view_conflict = false;
         unsupported_type = false;
         while (cursor < limit) {
             if (node == nullptr
@@ -107,8 +107,8 @@ auto VSpace::protect_impl(
                 || !mapping.ceiling_.contains(access)) {
                 return false;
             }
-            if (!mapping.ipc_relations_.empty()) {
-                ipc_conflict = true;
+            if (!mapping.views_.empty()) {
+                view_conflict = true;
                 return false;
             }
             MappingAuthority& authority = *mapping.authority_;
@@ -145,7 +145,7 @@ auto VSpace::protect_impl(
             || !find_coverage()) {
             release_claim();
             return libk::unexpected(
-                ipc_conflict ? VSpaceError::Busy
+                view_conflict ? VSpaceError::Busy
                 : unsupported_type ? VSpaceError::UnsupportedMemoryType
                 : VSpaceError::InvalidAccess);
         }
@@ -241,7 +241,7 @@ auto VSpace::protect_impl(
         lock_.unlock();
         arch::restore_interrupts(interrupts);
         discard_fragments();
-        return libk::unexpected(ipc_conflict
+        return libk::unexpected(view_conflict
             ? VSpaceError::Busy
             : unsupported_type ? VSpaceError::UnsupportedMemoryType
             : VSpaceError::InvalidAccess);
@@ -346,12 +346,16 @@ auto VSpace::protect_impl(
         KASSERT(finish_pending());
         lock_.unlock();
         arch::restore_interrupts(interrupts);
+        finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
     lock_.unlock();
     arch::restore_interrupts(interrupts);
+    if (committed && committed.value() == VmStatus::Complete) {
+        finish_authorities();
+    }
     return committed;
 }
 

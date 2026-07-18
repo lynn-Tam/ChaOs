@@ -58,9 +58,12 @@ auto VSpace::start_invalidation(
         }
         authority.invalidation_requested_ = false;
         queue_authority(authority);
-        finish_authorities();
         lock_.unlock();
         arch::restore_interrupts(interrupts);
+        // Relation detach and sponsored storage refund are external callbacks.
+        // The authority was published to pending_authorities_ above, so the
+        // unlocked drain can safely finish it without making lock_ reentrant.
+        finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
 
@@ -85,7 +88,7 @@ auto VSpace::start_invalidation(
     for (auto current = authority.mappings_.begin();
          current != authority.mappings_.end(); ++current) {
         Mapping& mapping = *current;
-        invalidate_ipc(mapping);
+        invalidate_views(mapping);
         if (mapping.layout_hook_.is_linked()) {
             mapping.parent_->children_.erase(mapping);
         }
@@ -105,7 +108,7 @@ auto VSpace::start_invalidation(
         auto unmapped = editor.unmap(*virtual_page);
         KASSERT(unmapped);
         while (auto table = unmapped.value().tables.take()) {
-            KASSERT(retire.adopt(libk::move(*table)));
+            retire_table(retire, libk::move(*table));
         }
         queue_page(*page);
     }
@@ -116,12 +119,16 @@ auto VSpace::start_invalidation(
         KASSERT(finish_pending());
         lock_.unlock();
         arch::restore_interrupts(interrupts);
+        finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
     lock_.unlock();
     arch::restore_interrupts(interrupts);
+    if (committed && committed.value() == VmStatus::Complete) {
+        finish_authorities();
+    }
     return committed;
 }
 
@@ -136,30 +143,8 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         if (pending_kind_ != PendingKind::None && !finish_pending()) {
             KASSERT(ticket_);
             waiting_ticket = &*ticket_;
-            waiting = true;
-        } else {
-            finish_authorities();
-            if (pending_kind_ != PendingKind::None
-                || claim_.region != nullptr) {
-                service_waiting_on_claim_ = claim_.region != nullptr;
-                waiting = true;
-            } else if (!invalidations_.empty()) {
-                next = &invalidations_.front();
-            } else if (state_ == VSpaceState::Stopping
-                && root_region_ != nullptr
-                && !root_region_->children_.empty()
-                && coherence_.active_cpus().empty()) {
-                retire_root = root_region_;
-            } else {
-                try_finish_retire();
-                settled = pending_kind_ == PendingKind::None
-                    && invalidations_.empty()
-                    && pending_authorities_ == nullptr
-                    && state_ != VSpaceState::Stopping;
-            }
         }
     }
-    complete_cleanup();
     if (waiting_ticket != nullptr) {
         KASSERT(context.cpus != nullptr);
         switch (retry_shootdowns(*context.cpus, *waiting_ticket)) {
@@ -177,6 +162,32 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         }
         __builtin_unreachable();
     }
+
+    // This drains external Memory/Grant relations and sponsored node storage.
+    // It owns its short internal lock sections and must be entered unlocked.
+    finish_authorities();
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (pending_kind_ != PendingKind::None
+            || claim_.region != nullptr) {
+            service_waiting_on_claim_ = claim_.region != nullptr;
+            waiting = true;
+        } else if (!invalidations_.empty()) {
+            next = &invalidations_.front();
+        } else if (state_ == VSpaceState::Stopping
+            && root_region_ != nullptr
+            && !root_region_->children_.empty()
+            && coherence_.active_cpus().empty()) {
+            retire_root = root_region_;
+        } else {
+            try_finish_retire();
+            settled = pending_kind_ == PendingKind::None
+                && invalidations_.empty()
+                && pending_authorities_ == nullptr
+                && state_ != VSpaceState::Stopping;
+        }
+    }
+    complete_cleanup();
     if (waiting || (next == nullptr && retire_root == nullptr)) {
         return libk::expected(settled
             ? VSpaceServiceState::Settled
@@ -193,6 +204,9 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
                 started.error() == VSpaceError::TranslationCorrupt
                     ? VSpaceServiceError::TranslationCorrupt
                     : VSpaceServiceError::ResourceExhausted);
+        }
+        if (started.value() == VmStatus::Complete) {
+            finish_authorities();
         }
         complete_cleanup();
         return libk::expected(
@@ -214,6 +228,12 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             started.error() == VSpaceError::TranslationCorrupt
                 ? VSpaceServiceError::TranslationCorrupt
                 : VSpaceServiceError::ResourceExhausted);
+    }
+    if (started.value() == VmStatus::Complete) {
+        // Preserve service()'s synchronous-settle contract when the complete
+        // translation made its last authority detachable.  The drain itself
+        // remains outside lock_.
+        finish_authorities();
     }
     complete_cleanup();
     return libk::expected(
@@ -269,17 +289,29 @@ void VSpace::try_finish_retire() noexcept {
     root_region_ = nullptr;
     root_region->state_ = RegionState::Dead;
     regions_.destroy(*root_region);
-    root_.reset();
+    release_root();
+    work_open_.store<libk::MemoryOrder::Release>(false);
     state_ = VSpaceState::Quiescent;
 }
 
 void VSpace::complete_cleanup() noexcept {
-    object::ObjectCleanup cleanup{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != VSpaceState::Quiescent || !cleanup_) {
             return;
         }
+        KASSERT(!work_open_.load<libk::MemoryOrder::Acquire>());
+    }
+    KASSERT(work_ != nullptr);
+    work_->withdraw(*this);
+
+    object::ObjectCleanup cleanup{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!cleanup_) {
+            return;
+        }
+        KASSERT(state_ == VSpaceState::Quiescent);
         cleanup = libk::move(*cleanup_);
         cleanup_.reset();
     }

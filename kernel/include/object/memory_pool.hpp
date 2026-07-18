@@ -9,6 +9,12 @@ template<>
 struct ObjectTraits<kernel::mm::MemoryObject> final {
     static constexpr ObjectKind kind = ObjectKind::MemoryObject;
 
+    static void bind_sponsor(
+        kernel::mm::MemoryObject& memory,
+        kernel::resource::Sponsorship& sponsor) noexcept {
+        memory.bind_sponsor(sponsor);
+    }
+
     static void retire(kernel::mm::MemoryObject& memory) noexcept {
         memory.retire();
     }

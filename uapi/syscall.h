@@ -8,6 +8,8 @@
 
 #define MYOS_SYS_YIELD               0
 #define MYOS_SYS_EXIT                1
+#define MYOS_SYS_SC_BIND             2 /* a0=SC, a1=Thread or Vproc */
+#define MYOS_SYS_EXECUTION_START     3 /* a0=Thread or Vproc */
 
 #define MYOS_SYS_CAP_CLOSE          16
 #define MYOS_SYS_CAP_DUPLICATE      17
@@ -23,3 +25,34 @@
 #define MYOS_SYS_VM_RESERVE         36
 #define MYOS_SYS_VM_GUARD           37
 #define MYOS_SYS_VM_DESTROY_REGION  38
+
+/*
+ * Typed construction ABI:
+ *   a0: ResourcePool capability
+ *   a1-a3: type-specific scalar configuration
+ * Returns a0=status and a1=new capability in the caller's CSpace.
+ */
+#define MYOS_SYS_RESOURCE_CREATE_CHILD 48 /* a1=memory, a2=caps, a3=kind mask */
+#define MYOS_SYS_MEMORY_CREATE         49 /* a1=bytes, a2=access bits */
+#define MYOS_SYS_VSPACE_CREATE         50
+#define MYOS_SYS_CSPACE_CREATE         51 /* a1=slot quota, a2=page quota */
+#define MYOS_SYS_SC_CREATE             52 /* a1=domain, a2=budget ns, a3=period ns, a4=urgency, a5=cpu */
+#define MYOS_SYS_THREAD_CREATE         53 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
+#define MYOS_SYS_NOTIFICATION_CREATE   54 /* a1=immutable signal badge */
+#define MYOS_SYS_VPROC_CREATE          55 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
+#define MYOS_SYS_TUNNEL_CREATE         56 /* a1=source Vproc, a2=target Vproc, a3=slot, a4=tag */
+
+#define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
+#define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
+
+#define MYOS_SYS_NOTIFICATION_SIGNAL   80 /* a0=Notification; badge is in cap */
+#define MYOS_SYS_NOTIFICATION_TAKE     81 /* a0=Notification */
+#define MYOS_SYS_NOTIFICATION_WAIT     82 /* a0=Notification */
+
+#define MYOS_SYS_VPROC_RETURN          96 /* a0=active generation; resumes submitted context */
+#define MYOS_SYS_VPROC_POLL            97 /* returns pending sequence */
+#define MYOS_SYS_OPERATION_TAKE        98 /* a0=OperationKey */
+
+#define MYOS_SYS_TUNNEL_INVOKE        104 /* a0=Tunnel; caller must be source Vproc */
+#define MYOS_SYS_TUNNEL_TAKE          105 /* a0=Tunnel; caller must be target Vproc */
+#define MYOS_SYS_TUNNEL_CLOSE         106 /* a0=Tunnel */

@@ -10,8 +10,10 @@
 #include <mm/vspace.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
+#include <resource/pool.hpp>
+#include <resource/traits.hpp>
 #include <core/kernel_image.hpp>
-#include <thread/execution.hpp>
+#include <execution/binding.hpp>
 
 //Confirmatory experiment.
 // Exit condition: retained as the permanent semantic/PTE/revocation contract
@@ -537,10 +539,9 @@ bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
         if (!vspace || !cspace || !memory) {
             return false;
         }
-        kernel::mm::IpcBufferRequest request{
+        kernel::mm::UserViewRequest request{
             .memory = libk::move(memory).value(),
             .object = kernel::mm::ObjectRange{0, 1},
-            .mapping = mapped.value().mapping,
             .virtual_range = kernel::mm::VirtRange{
                 whole.base(), kernel::mm::page_size},
             .access = kernel::mm::AccessMask::of(
@@ -550,7 +551,7 @@ bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
             libk::move(vspace).value(),
             libk::move(cspace).value(),
             kernel::FaultRoute::Terminate,
-            libk::optional<kernel::mm::IpcBufferRequest>{libk::move(request)});
+            libk::optional<kernel::mm::UserViewRequest>{libk::move(request)});
         if (!binding || binding.value().ipc_buffer() == nullptr
             || !binding.value().ipc_buffer()->valid()) {
             return false;
@@ -580,6 +581,102 @@ bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
     return invalidated
         && fixture.space().binding_count() == 0
         && fixture.cspace().binding_count() == 0;
+}
+
+bool test_sponsored_table_capacity_follows_retirement(
+    const TestContext&) noexcept {
+    VSpaceFixture fixture{};
+    if (!fixture.initialize(true, 1)) {
+        return false;
+    }
+
+    constexpr kernel::resource::Budget limit{
+        .memory = 16 * kernel::mm::page_size,
+    };
+    auto pending_pool = vspace_test_objects->create_resource(limit);
+    if (!pending_pool) {
+        return false;
+    }
+    auto pool = libk::move(pending_pool).value().publish();
+    auto pool_ref = pool.ref();
+    if (!pool_ref) {
+        return false;
+    }
+    constexpr auto fixed =
+        kernel::resource::Traits<kernel::mm::VSpace>::fixed();
+    auto reserved = pool->reserve(libk::move(pool_ref).value(), fixed);
+    if (!reserved) {
+        return false;
+    }
+    auto pending_space = vspace_test_objects->create_vspace_sponsored(
+        libk::move(reserved).value(), *vspace_test_kernel);
+    if (!pending_space) {
+        return false;
+    }
+    auto space = libk::move(pending_space).value().publish();
+
+    const kernel::resource::Budget root_baseline{
+        .memory = limit.memory - fixed.memory
+            - 2 * kernel::mm::page_size,
+    };
+    if (pool->available() != root_baseline
+        || pool->sponsorship_count() != 2) {
+        return false;
+    }
+
+    auto memory_ref = fixture.memory_ref();
+    if (!memory_ref) {
+        return false;
+    }
+    const kernel::mm::VirtRange range{
+        kernel::mm::VirtAddr{0xe0000},
+        kernel::mm::page_size,
+    };
+    auto mapped = space->map_kernel(
+        fixture.context(),
+        space->root_key(),
+        kernel::mm::MapRequest{
+            range,
+            kernel::mm::ObjectRange{0, 1},
+            kernel::mm::AccessMask::of(
+                kernel::mm::Access::Read,
+                kernel::mm::Access::Write),
+        },
+        libk::move(memory_ref).value(),
+        fixture.memory(),
+        fixture.memory_authority(1));
+    if (!mapped || mapped.value().status != kernel::mm::VmStatus::Complete
+        || pool->available().memory >= root_baseline.memory) {
+        return false;
+    }
+
+    auto unmapped = space->unmap_kernel(
+        fixture.context(), space->root_key(), range);
+    if (!unmapped || unmapped.value() != kernel::mm::VmStatus::Complete
+        || pool->available() != root_baseline
+        || pool->sponsorship_count() != 2) {
+        return false;
+    }
+
+    if (!space.retire()) {
+        return false;
+    }
+    while (space->state() != kernel::mm::VSpaceState::Quiescent) {
+        if (!space->service(fixture.context())) {
+            return false;
+        }
+    }
+    while (vspace_test_work->run(fixture.context(), 8)) {}
+    space.reset();
+    vspace_test_objects->drain_reclaim();
+    if (pool->available() != limit || pool->sponsorship_count() != 0
+        || pool->close() != kernel::resource::PoolState::Closed
+        || !pool.retire()) {
+        return false;
+    }
+    pool.reset();
+    vspace_test_objects->drain_reclaim();
+    return fixture.pmm().verify_invariants();
 }
 
 } // namespace
@@ -613,4 +710,8 @@ void register_vspace_tests(TestRegistry& registry) noexcept {
         "vspace",
         "IPC binding blocks normal edits and follows strong invalidation",
         test_ipc_binding_is_validated_and_invalidated_with_mapping);
+    (void)registry.add(
+        "vspace",
+        "sponsored table capacity follows physical retirement",
+        test_sponsored_table_capacity_follows_retirement);
 }

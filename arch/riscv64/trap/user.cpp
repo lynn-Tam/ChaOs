@@ -29,6 +29,17 @@ auto valid_user_start(UserStart start) noexcept -> bool {
         && (start.stack.raw() & 0xfU) == 0;
 }
 
+auto valid_user_context(const myos_user_context& context) noexcept -> bool {
+    constexpr usize Pc = 0;
+    constexpr usize Sp = 2;
+    return kernel::mm::layout::is_user(
+               kernel::mm::VirtAddr{context.words[Pc]})
+        && (context.words[Pc] & 0x1U) == 0
+        && context.words[Sp] >= kernel::mm::layout::LowGuardEnd
+        && context.words[Sp] <= kernel::mm::layout::UserEnd
+        && (context.words[Sp] & 0xfU) == 0;
+}
+
 auto prepare_user_stack(
     usize home_stack_top,
     UserStart start) noexcept -> libk::optional<usize> {

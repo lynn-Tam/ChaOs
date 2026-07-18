@@ -1,5 +1,7 @@
 #include <boot/boot_info.hpp>
+#include <boot/cpu_topology.hpp>
 #include <boot/firmware/devicetree/fdt.hpp>
+#include <boot/timebase.hpp>
 
 #include <diag/console.hpp>
 #include <libk/inplace_vector.hpp>
@@ -103,6 +105,24 @@ public:
         return set(bytes, size_cells_);
     }
 
+    [[nodiscard]] auto read_address(
+        kernel::boot::fdt::ByteSpan bytes,
+        uint64_t& value) const noexcept -> bool {
+        if (!valid() || bytes.size() != address_cells_ * sizeof(uint32_t)) {
+            return false;
+        }
+        kernel::boot::fdt::ByteReader reader{bytes.data(), bytes.size()};
+        value = 0;
+        for (uint32_t index = 0; index < address_cells_; ++index) {
+            uint32_t cell{};
+            if (!reader.read_be32(cell)) {
+                return false;
+            }
+            value = value << 32 | cell;
+        }
+        return true;
+    }
+
 private:
     [[nodiscard]] auto valid() const noexcept -> bool {
         return address_cells_ > 0 && address_cells_ <= 2
@@ -175,6 +195,24 @@ public:
             stdout_path_ = before_colon(*path);
             return true;
         }
+        if (depth == 1 && scope_ == Scope::Chosen
+            && name == "linux,initrd-start") {
+            uint64_t address{};
+            if (!root_format_.read_address(value, address)) {
+                return false;
+            }
+            initrd_start_ = address;
+            return true;
+        }
+        if (depth == 1 && scope_ == Scope::Chosen
+            && name == "linux,initrd-end") {
+            uint64_t address{};
+            if (!root_format_.read_address(value, address)) {
+                return false;
+            }
+            initrd_end_ = address;
+            return true;
+        }
         if (depth == 1 && scope_ == Scope::Memory && name == "reg") {
             return root_format_.visit(value, [this](Reg reg) {
                 const auto range = reg.contained_pages();
@@ -224,6 +262,40 @@ public:
         return libk::nullopt;
     }
 
+    [[nodiscard]] auto module() const noexcept
+        -> libk::Expected<
+            libk::optional<kernel::boot::BootModule>,
+            kernel::boot::BootInfoError> {
+        if (!initrd_start_ && !initrd_end_) {
+            return libk::expected(
+                libk::optional<kernel::boot::BootModule>{});
+        }
+        if (!initrd_start_ || !initrd_end_
+            || *initrd_start_ >= *initrd_end_
+            || *initrd_start_ > libk::numeric_limits<usize>::max()
+            || *initrd_end_ - *initrd_start_
+                > libk::numeric_limits<usize>::max()) {
+            return libk::unexpected(
+                kernel::boot::BootInfoError::InvalidModuleRange);
+        }
+        const kernel::mm::PhysAddr physical{
+            static_cast<usize>(*initrd_start_)};
+        const usize size = static_cast<usize>(*initrd_end_ - *initrd_start_);
+        const auto pages = kernel::mm::PageRange::covering_bytes(
+            physical, size);
+        if (!pages) {
+            return libk::unexpected(
+                kernel::boot::BootInfoError::InvalidModuleRange);
+        }
+        return libk::expected(libk::optional<kernel::boot::BootModule>{
+            kernel::boot::BootModule{
+                .physical = physical,
+                .size = size,
+                .pages = *pages,
+                .kind = kernel::boot::BootModuleKind::Bundle,
+            }});
+    }
+
 private:
     enum class Scope : uint8_t {
         Other,
@@ -240,6 +312,8 @@ private:
     bool in_reserved_child_{};
     libk::InplaceVector<Alias, 8> aliases_{};
     libk::optional<kernel::boot::fdt::StrView> stdout_path_{};
+    libk::optional<uint64_t> initrd_start_{};
+    libk::optional<uint64_t> initrd_end_{};
 };
 
 [[nodiscard]] auto reserve_kernel(kernel::mm::BootMapBuilder& memory) noexcept -> bool {
@@ -278,16 +352,30 @@ namespace kernel::boot {
 
 auto build_boot_info_from_fdt(
     BootInfo& info,
+    CpuHardwareId boot_cpu,
     kernel::mm::PhysAddr fdt_physical,
     const void* fdt_pointer) noexcept -> libk::Expected<void, BootInfoError> {
     info.fdt = {};
     info.transition = {};
+    info.module.reset();
+    info.cpu.cpus.clear();
+    info.cpu.boot_index = 0;
+    info.timebase_frequency = 0;
     info.memory_regions.clear();
 
     kernel::boot::fdt::FDT_View view{};
     if (!kernel::boot::fdt::init_view(view, fdt_pointer)) {
         return libk::unexpected(BootInfoError::InvalidFdt);
     }
+
+    if (!parse_fdt_cpus(view, boot_cpu, info.cpu)) {
+        return libk::unexpected(BootInfoError::InvalidCpuTopology);
+    }
+    const auto timebase = parse_timebase_frequency(view);
+    if (!timebase) {
+        return libk::unexpected(BootInfoError::InvalidTimebase);
+    }
+    info.timebase_frequency = timebase.value();
 
     kernel::mm::BootMapBuilder memory{};
     BootCollector collector{memory};
@@ -311,6 +399,17 @@ auto build_boot_info_from_fdt(
         return libk::unexpected(BootInfoError::InvalidKernelRange);
     }
 
+    auto module = collector.module();
+    if (!module) {
+        return libk::unexpected(module.error());
+    }
+    if (module.value()
+        && !memory.reserve(
+            module.value()->pages,
+            kernel::mm::RegionKind::ReclaimableBootData)) {
+        return libk::unexpected(BootInfoError::InvalidModuleRange);
+    }
+
     const auto fdt_pages = kernel::mm::PageRange::covering_bytes(
         fdt_physical,
         view.size);
@@ -332,6 +431,7 @@ auto build_boot_info_from_fdt(
         .pages = *fdt_pages,
     };
     info.transition = TransitionMemory{.pages = kernel::image::transition()};
+    info.module = libk::move(module).value();
 
     const auto stdout = collector.stdout_path();
     if (stdout) {

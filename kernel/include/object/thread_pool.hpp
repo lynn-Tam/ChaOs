@@ -12,6 +12,11 @@ template<>
 struct ObjectTraits<kernel::Thread> final {
     static constexpr ObjectKind kind = ObjectKind::Thread;
 
+    [[nodiscard]] static auto prepare_retire(
+        const kernel::Thread& thread) noexcept -> bool {
+        return thread.prepare_retire();
+    }
+
     static void retire([[maybe_unused]] kernel::Thread& thread) noexcept {
     }
 

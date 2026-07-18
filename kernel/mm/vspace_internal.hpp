@@ -13,6 +13,8 @@ namespace kernel::mm {
         return VSpaceError::QuotaExceeded;
     case NodePoolError::GenerationExhausted:
         return VSpaceError::GenerationExhausted;
+    case NodePoolError::ResourceExhausted:
+        return VSpaceError::ResourceExhausted;
     }
     return VSpaceError::OutOfMemory;
 }
@@ -21,6 +23,7 @@ namespace kernel::mm {
     -> VSpaceError {
     switch (error) {
     case MemoryError::OutOfMemory:
+    case MemoryError::ResourceExhausted:
         return VSpaceError::OutOfMemory;
     case MemoryError::GenerationExhausted:
         return VSpaceError::GenerationExhausted;

@@ -128,7 +128,7 @@ auto VSpace::unmap_impl(
     VirtRange range) noexcept -> libk::Expected<VmStatus, VSpaceError> {
     Mapping* left_source{};
     Mapping* right_source{};
-    bool ipc_conflict{};
+    bool view_conflict{};
     auto find_coverage = [&]() noexcept -> bool {
         LayoutNode* node = region.children_.lower_bound(range.base());
         if (node == nullptr || node->range_.base() > range.base()) {
@@ -140,7 +140,7 @@ auto VSpace::unmap_impl(
         const usize limit = range.end()->raw();
         left_source = nullptr;
         right_source = nullptr;
-        ipc_conflict = false;
+        view_conflict = false;
         while (cursor < limit) {
             if (node == nullptr
                 || node->kind_ != LayoutKind::Mapping
@@ -152,8 +152,8 @@ auto VSpace::unmap_impl(
             if (mapping.state_ != MappingState::Live) {
                 return false;
             }
-            if (!mapping.ipc_relations_.empty()) {
-                ipc_conflict = true;
+            if (!mapping.views_.empty()) {
+                view_conflict = true;
                 return false;
             }
             if (left_source == nullptr) {
@@ -172,7 +172,7 @@ auto VSpace::unmap_impl(
         if (claim_.region != &region || claim_.range != range
             || !find_coverage()) {
             release_claim();
-            return libk::unexpected(ipc_conflict
+            return libk::unexpected(view_conflict
                 ? VSpaceError::Busy
                 : VSpaceError::NotMapped);
         }
@@ -240,7 +240,7 @@ auto VSpace::unmap_impl(
         lock_.unlock();
         arch::restore_interrupts(interrupts);
         discard_fragments();
-        return libk::unexpected(ipc_conflict
+        return libk::unexpected(view_conflict
             ? VSpaceError::Busy
             : VSpaceError::NotMapped);
     }
@@ -313,7 +313,7 @@ auto VSpace::unmap_impl(
             auto unmapped = editor.unmap(*virtual_page);
             KASSERT(unmapped);
             while (auto table = unmapped.value().tables.take()) {
-                KASSERT(retire.adopt(libk::move(*table)));
+                retire_table(retire, libk::move(*table));
             }
             queue_page(*page);
             page = next_page;
@@ -327,12 +327,16 @@ auto VSpace::unmap_impl(
         KASSERT(finish_pending());
         lock_.unlock();
         arch::restore_interrupts(interrupts);
+        finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
     lock_.unlock();
     arch::restore_interrupts(interrupts);
+    if (committed && committed.value() == VmStatus::Complete) {
+        finish_authorities();
+    }
     return committed;
 }
 

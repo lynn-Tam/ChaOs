@@ -10,6 +10,17 @@
 namespace kernel::object {
 
 template<typename T>
+class ObjectHold;
+
+} // namespace kernel::object
+
+namespace kernel::resource {
+class ResourcePool;
+}
+
+namespace kernel::object {
+
+template<typename T>
 class ObjectPin final : private libk::noncopyable {
     static_assert(StorableObject<T>);
 
@@ -114,11 +125,16 @@ public:
             *anchor_, *static_cast<T*>(payload), generation_});
     }
 
+    template<typename T>
+    [[nodiscard]] auto into_hold() && noexcept
+        -> libk::Expected<ObjectHold<T>, ObjectError>;
+
     void reset() noexcept;
 
 private:
     template<typename T>
     friend class ObjectPool;
+    friend class kernel::resource::ResourcePool;
 
     ObjectRef(ObjectAnchor& anchor, u64 generation) noexcept
         : anchor_(&anchor), generation_(generation) {}
@@ -184,6 +200,7 @@ public:
     }
 
 private:
+    friend class ObjectRef;
     template<typename U>
     friend class ObjectPool;
 
@@ -193,5 +210,25 @@ private:
     ObjectRef ref_{};
     T* object_{};
 };
+
+template<typename T>
+auto ObjectRef::into_hold() && noexcept
+    -> libk::Expected<ObjectHold<T>, ObjectError> {
+    static_assert(StorableObject<T>);
+    if (anchor_ == nullptr) {
+        return libk::unexpected(ObjectError::InvalidIdentity);
+    }
+    if (anchor_->kind_ != ObjectTraits<T>::kind) {
+        return libk::unexpected(ObjectError::WrongKind);
+    }
+    void* const payload = anchor_->ops_->try_pin(
+        anchor_->owner_, *anchor_, generation_);
+    if (payload == nullptr) {
+        return libk::unexpected(ObjectError::InvalidLifecycle);
+    }
+    auto* const object = static_cast<T*>(payload);
+    anchor_->ops_->drop_pin(anchor_->owner_, *anchor_, generation_);
+    return libk::expected(ObjectHold<T>{libk::move(*this), *object});
+}
 
 } // namespace kernel::object

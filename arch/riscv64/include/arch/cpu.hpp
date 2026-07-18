@@ -58,15 +58,12 @@ void request_panic_stop(CpuEntryState& state) noexcept;
 
 void wait_for_interrupt() noexcept;
 
-using StackContinuation = void (*)(
-    kernel::KernelState&,
-    kernel::CpuRuntime&) noexcept;
+using StackContinuation = void (*)(void*) noexcept;
 using PanicContinuation = void (*)(void*) noexcept;
 
 [[noreturn]] auto switch_to_stack_and_call(
     usize stack_top,
-    kernel::KernelState& kernel,
-    kernel::CpuRuntime& runtime,
+    void* argument,
     StackContinuation continuation) noexcept -> void;
 
 [[noreturn]] auto switch_to_panic_stack(

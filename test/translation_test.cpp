@@ -9,7 +9,7 @@ bool test_activation_before_mutation_is_in_target_snapshot(
     const TestContext&) noexcept {
     kernel::mm::TranslationState state{};
     constexpr kernel::CpuId cpu{0};
-    if (state.enter(cpu).raw != 0) {
+    if (state.enter(cpu).translation.raw != 0) {
         return false;
     }
 
@@ -57,7 +57,8 @@ bool test_mutation_before_activation_publishes_new_epoch(
         || !ticket.complete()) {
         return false;
     }
-    const kernel::mm::TranslationEpoch observed = state.enter(cpu);
+    const kernel::mm::TranslationEpoch observed =
+        state.enter(cpu).translation;
     state.leave(cpu);
     return observed == ticket.epoch()
         && observed == kernel::mm::TranslationEpoch{1};
@@ -100,6 +101,53 @@ bool test_abort_and_distinct_mutations_preserve_versioning(
         && state.epoch() == second.epoch();
 }
 
+bool test_executable_mutation_publishes_instruction_epoch(
+    const TestContext&) noexcept {
+    kernel::mm::TranslationState state{};
+    constexpr kernel::CpuId cpu{0};
+    const auto entered = state.enter(cpu);
+    if (entered.instruction.raw != 0) {
+        return false;
+    }
+
+    kernel::mm::ShootdownTicket executable{};
+    auto mutation = state.begin();
+    if (!mutation) {
+        state.leave(cpu);
+        return false;
+    }
+    auto plan = kernel::mm::ShootdownPlan::local(
+        cpu, mutation.value().targets());
+    if (!plan
+        || mutation.value().commit(
+            libk::move(plan).value(), executable, nullptr, true)
+            != kernel::mm::ShootdownStatus::Complete) {
+        state.leave(cpu);
+        return false;
+    }
+
+    kernel::mm::ShootdownTicket ordinary{};
+    auto ordinary_mutation = state.begin();
+    if (!ordinary_mutation) {
+        state.leave(cpu);
+        return false;
+    }
+    auto ordinary_plan = kernel::mm::ShootdownPlan::local(
+        cpu, ordinary_mutation.value().targets());
+    const bool valid = ordinary_plan
+        && ordinary_mutation.value().commit(
+            libk::move(ordinary_plan).value(), ordinary)
+            == kernel::mm::ShootdownStatus::Complete
+        && executable.requires_instruction_sync()
+        && executable.instruction_epoch() == kernel::mm::InstructionEpoch{1}
+        && !ordinary.requires_instruction_sync()
+        && ordinary.instruction_epoch() == kernel::mm::InstructionEpoch{1}
+        && state.observation().instruction
+            == kernel::mm::InstructionEpoch{1};
+    state.leave(cpu);
+    return valid;
+}
+
 } // namespace
 
 void register_translation_tests(TestRegistry& registry) noexcept {
@@ -115,4 +163,8 @@ void register_translation_tests(TestRegistry& registry) noexcept {
         "translation",
         "aborts do not advance and tickets retain distinct epochs",
         test_abort_and_distinct_mutations_preserve_versioning);
+    (void)registry.add(
+        "translation",
+        "executable mutations retain an instruction visibility epoch",
+        test_executable_mutation_publishes_instruction_epoch);
 }

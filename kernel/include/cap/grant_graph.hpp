@@ -6,6 +6,13 @@
 #include <libk/sync/ticket_spin_lock.hpp>
 #include <mm/node_pool.hpp>
 #include <mm/pmm.hpp>
+#include <resource/allocation.hpp>
+#include <resource/sponsorship.hpp>
+
+namespace kernel {
+class CpuRegistry;
+class Thread;
+}
 
 namespace kernel::cap {
 
@@ -25,13 +32,30 @@ public:
     [[nodiscard]] auto create_root(
         object::ObjectRef&& target,
         GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+    [[nodiscard]] auto create_root(
+        kernel::resource::Reservation&& charge,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+
+    [[nodiscard]] auto create_allocation(
+        kernel::resource::Permit& permit,
+        kernel::resource::Reservation&& charge,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling) noexcept
+        -> libk::Expected<kernel::resource::AllocationTxn, GrantError>;
 
     [[nodiscard]] auto derive(
         const GrantLease& source,
         object::ObjectRef&& target,
         GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+    [[nodiscard]] auto derive(
+        kernel::resource::Reservation&& charge,
+        const GrantLease& source,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto derive_region(
+        kernel::resource::Reservation&& charge,
         const GrantLease& source,
         object::ObjectRef&& target,
         GrantCeiling ceiling,
@@ -57,6 +81,14 @@ public:
     [[nodiscard]] auto state(GrantKey key) const noexcept
         -> libk::Expected<GrantState, GrantError>;
     [[nodiscard]] auto live_count() const noexcept -> usize;
+    [[nodiscard]] auto close_pool(
+        kernel::resource::ResourcePool& pool,
+        const kernel::object::ObjectRef& self,
+        kernel::Thread& thread,
+        kernel::CpuRegistry& cpus) noexcept
+        -> libk::Expected<kernel::operation::State, GrantError>;
+    [[nodiscard]] static auto node_charge() noexcept
+        -> kernel::resource::Budget;
 
 private:
     friend class CSpace;
@@ -64,6 +96,9 @@ private:
     friend class GrantLease;
     friend class GrantAttachment;
     friend class GrantRevokeWait;
+    friend class kernel::resource::CloseWait;
+    friend class kernel::resource::AllocationTxn;
+    friend class kernel::resource::ResourcePool;
 
     struct Slot;
 
@@ -78,11 +113,16 @@ private:
             Slot& owner,
             object::ObjectRef&& target_ref,
             GrantCeiling authority,
-            Node* parent_node) noexcept
+            Node* parent_node,
+            kernel::resource::Reservation&& charge) noexcept
             : slot(&owner),
               target(libk::move(target_ref)),
               ceiling(authority),
-              parent(parent_node) {}
+              parent(parent_node) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
 
         Slot* slot{};
         object::ObjectRef target{};
@@ -95,6 +135,8 @@ private:
         usize operations{};
         GrantState state{GrantState::Live};
         bool reclaiming{};
+        kernel::resource::Sponsorship sponsorship{};
+        kernel::resource::Allocation allocation{};
     };
 
     struct PageHeader;
@@ -131,6 +173,7 @@ private:
         (kernel::mm::page_size - slot_offset) / sizeof(Slot);
 
     [[nodiscard]] auto create(
+        kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
         GrantCeiling ceiling,
         Node* parent) noexcept -> libk::Expected<GrantRef, GrantError>;
@@ -145,10 +188,15 @@ private:
         -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto try_acquire(Node& node) noexcept
         -> libk::Expected<GrantLease, GrantError>;
-    void drop_ref(void* node, u64 generation) noexcept;
+    void drop_ref(GrantKey key) noexcept;
     void drop_lease(void* node, u64 generation) noexcept;
     [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
-    void reclaim(void* node, u64 generation, bool drop_reference) noexcept;
+    void reclaim(GrantKey key, bool drop_reference) noexcept;
+    void commit_allocation(kernel::resource::Allocation& allocation) noexcept;
+    void abort_allocation(kernel::resource::Allocation& allocation) noexcept;
+    void revoke_allocation(kernel::resource::Allocation& allocation) noexcept;
+    void stop_allocation(kernel::resource::Allocation& allocation) noexcept;
+    void retire_allocation(kernel::resource::Allocation& allocation) noexcept;
     void release_page(PageHeader& page) noexcept;
     [[nodiscard]] auto revoke(
         GrantKey source,
@@ -157,6 +205,9 @@ private:
     [[nodiscard]] auto create_revoke_wait() noexcept
         -> libk::Expected<GrantRevokeWait*, GrantError>;
     void destroy_revoke_wait(GrantRevokeWait& operation) noexcept;
+    [[nodiscard]] auto create_close_wait() noexcept
+        -> libk::Expected<kernel::resource::CloseWait*, GrantError>;
+    void destroy_close_wait(kernel::resource::CloseWait& operation) noexcept;
     [[nodiscard]] static auto descendant_of(
         const Node& node,
         const Node& root) noexcept -> bool;
@@ -165,6 +216,7 @@ private:
     Quota quota_{};
     mutable libk::TicketSpinLock lock_{};
     kernel::mm::NodePool<GrantRevokeWait> revoke_waits_;
+    kernel::mm::NodePool<kernel::resource::CloseWait> close_waits_;
     PageHeader* pages_{};
     usize page_count_{};
     usize live_nodes_{};

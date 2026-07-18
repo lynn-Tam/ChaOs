@@ -64,6 +64,7 @@ TestStats TestRegistry::run(const TestContext& ctx) noexcept {
 
 void register_allocator_tests(TestRegistry& registry) noexcept;
 void register_bootinfo_tests(TestRegistry& registry) noexcept;
+void register_boot_bundle_tests(TestRegistry& registry) noexcept;
 void register_cpu_topology_tests(TestRegistry& registry) noexcept;
 void register_libk_tests(TestRegistry& registry) noexcept;
 void register_sched_tests(TestRegistry& registry) noexcept;
@@ -72,11 +73,13 @@ void register_memory_tests(TestRegistry& registry) noexcept;
 void register_translation_tests(TestRegistry& registry) noexcept;
 void register_vspace_tests(TestRegistry& registry) noexcept;
 void register_user_tests(TestRegistry& registry) noexcept;
+void register_ipc_tests(TestRegistry& registry) noexcept;
 
 void register_builtin_tests(TestRegistry& registry) noexcept {
     register_libk_tests(registry);
     register_allocator_tests(registry);
     register_bootinfo_tests(registry);
+    register_boot_bundle_tests(registry);
     register_cpu_topology_tests(registry);
     register_sched_tests(registry);
     register_cap_tests(registry);
@@ -84,6 +87,7 @@ void register_builtin_tests(TestRegistry& registry) noexcept {
     register_translation_tests(registry);
     register_vspace_tests(registry);
     register_user_tests(registry);
+    register_ipc_tests(registry);
 }
 
 auto run_builtin_tests(const kernel::boot::BootInfo& boot) noexcept

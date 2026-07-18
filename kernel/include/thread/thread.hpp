@@ -2,39 +2,41 @@
 
 #pragma once
 
-#include <arch/context.hpp>
 #include <arch/user.hpp>
 #include <core/types.hpp>
+#include <execution/execution.hpp>
+#include <execution/authority.hpp>
+#include <execution/stop.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/expected.hpp>
+#include <libk/intrusive_list.hpp>
 #include <libk/optional.hpp>
+#include <libk/sync/ticket_spin_lock.hpp>
 #include <libk/typetraits.hpp>
 #include <libk/variant.hpp>
-#include <mm/kernel_stack.hpp>
-#include <thread/execution.hpp>
+#include <sched/remote_queue.hpp>
 #include <trap/event.hpp>
 
 namespace kernel {
 
 class Thread;
 class CpuRegistry;
-class WaitRelation;
+namespace operation {
+class Completion;
+}
+namespace execution {
+class Target;
+}
 namespace sched {
 class Binding;
 class SchedulingContext;
 class CpuDispatcher;
+class RemoteQueue;
 }
 
 class Thread final : private libk::noncopyable_nonmovable {
 public:
-    enum class State : u8 {
-        Prepared,
-        Ready,
-        Running,
-        Throttled,
-        Blocked,
-        Exited,
-    };
+    using State = ExecutionState;
 
     enum class Kind : u8 {
         Normal,
@@ -50,11 +52,6 @@ public:
 
     using UserStart = arch::UserStart;
 
-    enum class RebindError : u8 {
-        Active,
-        Incompatible,
-    };
-
     Thread(
         KernelStack&& home_stack,
         ExecutionBinding&& execution,
@@ -65,9 +62,17 @@ public:
         ExecutionBinding&& execution,
         UserStart start,
         Kind kind = Kind::Normal) noexcept;
+    Thread(
+        kernel::resource::Charge&& stack_charge,
+        KernelStack&& home_stack,
+        ExecutionBinding&& execution,
+        UserStart start,
+        Kind kind = Kind::Normal) noexcept;
     ~Thread() noexcept;
 
-    [[nodiscard]] auto state() const noexcept -> State { return state_; }
+    [[nodiscard]] auto state() const noexcept -> State {
+        return execution_.state();
+    }
     [[nodiscard]] auto home_stack_base() const noexcept -> usize;
     [[nodiscard]] auto home_stack_top() const noexcept -> usize;
     [[nodiscard]] auto kind() const noexcept -> Kind { return kind_; }
@@ -75,19 +80,21 @@ public:
         return kind_ == Kind::Idle;
     }
     [[nodiscard]] auto binding() noexcept -> sched::Binding* {
-        return binding_;
+        return execution_.scheduler_binding();
     }
     [[nodiscard]] auto binding() const noexcept -> const sched::Binding* {
-        return binding_;
+        return execution_.scheduler_binding();
     }
-    [[nodiscard]] auto execution() noexcept -> ExecutionBinding& {
+    [[nodiscard]] auto execution() noexcept -> Execution& {
         return execution_;
     }
-    [[nodiscard]] auto execution() const noexcept -> const ExecutionBinding& {
+    [[nodiscard]] auto execution() const noexcept -> const Execution& {
         return execution_;
     }
-    [[nodiscard]] auto rebind(ExecutionBinding&& binding) noexcept
-        -> libk::Expected<void, RebindError>;
+    [[nodiscard]] auto authorize(
+        const cap::Resolved<kernel::mm::VSpace>& vspace,
+        const cap::Resolved<cap::CSpace>& cspace) noexcept
+        -> libk::Expected<void, cap::GrantError>;
     void record_user_fault(const kernel::trap::Event& event) noexcept {
         user_fault_ = event;
     }
@@ -102,27 +109,38 @@ public:
     }
     [[nodiscard]] auto wait_ready() const noexcept -> bool;
     [[nodiscard]] auto begin_wait(
-        WaitRelation& relation,
+        operation::Completion& relation,
         CpuRegistry& cpus) noexcept -> bool;
     void resume_wait(arch::TrapContext& trap) noexcept;
     void cancel_wait() noexcept;
+    [[nodiscard]] auto prepare_retire() const noexcept -> bool;
 
 private:
     friend class sched::Binding;
     friend class sched::SchedulingContext;
     friend class sched::CpuDispatcher;
+    friend class sched::RemoteQueue;
+    friend class execution::Stop;
+    friend class execution::Target;
 
     [[noreturn]] static void start(void* argument) noexcept;
-    KernelStack home_stack_;
-    arch::KernelContext context_{};
-    ExecutionBinding execution_;
+    void request_stop(execution::Stop& request) noexcept;
+    void finish_stop() noexcept;
+
+    using StopList = libk::IntrusiveList<
+        execution::Stop, &execution::Stop::hook_>;
+
+    Execution execution_;
+    execution::Authority authority_;
     libk::variant<KernelStart, UserStart> start_;
-    State state_{State::Prepared};
     Kind kind_{Kind::Normal};
-    sched::Binding* binding_{};
     libk::optional<kernel::trap::Event> user_fault_{};
-    WaitRelation* wait_{};
+    operation::Completion* wait_{};
     u64 user_syscalls_{};
+    mutable libk::TicketSpinLock stop_lock_{};
+    StopList stops_{};
+    bool stop_requested_{};
+    bool stopped_{};
 };
 
 static_assert(!libk::is_copy_constructible_v<Thread>);

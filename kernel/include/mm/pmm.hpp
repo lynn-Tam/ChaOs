@@ -40,7 +40,7 @@ enum class QueryError : uint8_t {
     NotManaged,
 };
 
-enum class BootReclaimError : uint8_t {
+enum class BootReservationError : uint8_t {
     WrongOwner,
     InvalidReservation,
 };
@@ -121,7 +121,8 @@ class Pmm {
     using AllocateResult = libk::Expected<OwnedPage, AllocError>;
     using GroupAllocateResult = libk::Expected<Page, AllocError>;
     using QueryResult = libk::Expected<PageState, QueryError>;
-    using ReclaimResult = libk::Expected<size_t, BootReclaimError>;
+    using ReclaimResult = libk::Expected<size_t, BootReservationError>;
+    using AdoptResult = libk::Expected<OwnedPageGroup, BootReservationError>;
 
     [[nodiscard]] static auto initialize_in(
         libk::ManualLifetime<Pmm>& storage,
@@ -146,6 +147,8 @@ class Pmm {
     [[nodiscard]] auto take_boot_reservation_for(PageRange range) noexcept
         -> libk::optional<BootReservation>;
     [[nodiscard]] auto reclaim(BootReservation&& reservation) noexcept -> ReclaimResult;
+    [[nodiscard]] auto adopt(BootReservation&& reservation) noexcept
+        -> AdoptResult;
 
     [[nodiscard]] auto contains(Page page) const noexcept -> bool;
     [[nodiscard]] auto state_of(Page page) const noexcept -> QueryResult;
@@ -302,7 +305,7 @@ class Pmm {
     enum class ReservationState : uint8_t {
         Available,
         Issued,
-        Reclaimed,
+        Consumed,
     };
 
     struct ReservationRecord {

@@ -62,6 +62,11 @@ class ObjectPool final : private libk::noncopyable_nonmovable {
 public:
     using Error = ObjectError;
 
+    [[nodiscard]] static constexpr auto slot_charge() noexcept
+        -> kernel::resource::Budget {
+        return kernel::resource::Budget{.memory = sizeof(Slot)};
+    }
+
 private:
     struct PendingRelease final {
         ObjectPool* pool{};
@@ -128,6 +133,27 @@ public:
         }
         Slot* const slot = claimed.value();
         libk::construct_at(slot->object(), libk::forward<Args>(args)...);
+        return libk::expected(Pending{*this, *slot});
+    }
+
+    template<typename... Args>
+    [[nodiscard]] auto create_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept -> libk::Expected<Pending, Error> {
+        KASSERT(sponsorship);
+        auto claimed = claim_slot();
+        if (!claimed) {
+            return libk::unexpected(claimed.error());
+        }
+        Slot* const slot = claimed.value();
+        libk::construct_at(slot->object(), libk::forward<Args>(args)...);
+        slot->anchor.sponsorship_.commit(libk::move(sponsorship));
+        if constexpr (requires(T& object, kernel::resource::Sponsorship& owner) {
+            ObjectTraits<T>::bind_sponsor(object, owner);
+        }) {
+            ObjectTraits<T>::bind_sponsor(
+                *slot->object(), slot->anchor.sponsorship_);
+        }
         return libk::expected(Pending{*this, *slot});
     }
 
@@ -225,7 +251,9 @@ public:
             }
 
             ObjectTraits<T>::destroy(*slot->object());
+            auto refund = slot->anchor.sponsorship_.detach();
             finalize_free(*slot);
+            refund.complete();
         }
     }
 
@@ -385,7 +413,9 @@ private:
             slot->anchor.lifecycle_ = ObjectLifecycle::Quiescent;
         }
         ObjectTraits<T>::destroy(*slot->object());
+        auto refund = slot->anchor.sponsorship_.detach();
         finalize_free(*slot);
+        refund.complete();
     }
 
     [[nodiscard]] static auto slot_of(ObjectAnchor& anchor) noexcept

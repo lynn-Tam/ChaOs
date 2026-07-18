@@ -425,6 +425,17 @@ bool test_byte_reader_failure_is_transactional(
         return false;
     }
 
+    libk::ByteReader little{bytes, sizeof(bytes)};
+    uint16_t half{};
+    uint32_t little_word{};
+    if (!little.read_le16(half)
+        || half != UINT16_C(0x2301)
+        || little.offset() != sizeof(uint16_t)
+        || !little.read_le32(little_word)
+        || little_word != UINT32_C(0x6b6f6745)) {
+        return false;
+    }
+
     libk::ByteReader short_reader{bytes, sizeof(uint32_t)};
     uint64_t wide = UINT64_C(0xfeedfacecafebeef);
     const uint8_t* const original_ptr = short_reader.ptr();

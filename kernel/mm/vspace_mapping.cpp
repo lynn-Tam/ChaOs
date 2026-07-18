@@ -3,6 +3,7 @@
 
 #include "vspace_internal.hpp"
 
+#include <libk/checked_arithmetic.hpp>
 #include <cap/cspace.hpp>
 #include <cap/resolved.hpp>
 #include <core/debug.hpp>
@@ -30,7 +31,7 @@ auto VSpace::prepare_plan(
 }
 
 auto VSpace::reserve_tables(MappedPage* pages) noexcept
-    -> libk::Expected<OwnedPageGroup, VSpaceError> {
+    -> libk::Expected<TableReserve, VSpaceError> {
     arch::PageEditor::Plan plan{};
     for (MappedPage* page = pages; page != nullptr;
          page = page->pending_next_) {
@@ -39,11 +40,63 @@ auto VSpace::reserve_tables(MappedPage* pages) noexcept
             return libk::unexpected(VSpaceError::TranslationCorrupt);
         }
     }
+    const usize count = plan.table_pages();
+    kernel::resource::Charge charge{};
+    if (sponsor_ != nullptr && count != 0) {
+        const auto bytes = libk::checked_multiply<u64>(
+            static_cast<u64>(count), static_cast<u64>(page_size));
+        if (!bytes) {
+            return libk::unexpected(VSpaceError::ResourceExhausted);
+        }
+        auto acquired = sponsor_->acquire(kernel::resource::Budget{
+            .memory = bytes.value(),
+        });
+        if (!acquired) {
+            return libk::unexpected(VSpaceError::ResourceExhausted);
+        }
+        charge = libk::move(acquired).value();
+    }
+
     OwnedPageGroup reserve = pmm_->make_page_group();
-    if (!reserve.try_extend(plan.table_pages())) {
+    if (!reserve.try_extend(count)) {
         return libk::unexpected(VSpaceError::OutOfMemory);
     }
-    return libk::expected(libk::move(reserve));
+    return libk::expected(TableReserve{
+        libk::move(charge),
+        libk::move(reserve),
+    });
+}
+
+void VSpace::commit_tables(TableReserve& reserve) noexcept {
+    if (reserve.charge) {
+        const kernel::resource::Budget charged = reserve.charge.budget();
+        KASSERT(charged.caps == 0 && charged.memory % page_size == 0);
+        const usize total = static_cast<usize>(charged.memory / page_size);
+        KASSERT(total >= reserve.pages.page_count());
+        const usize consumed = total - reserve.pages.page_count();
+        if (consumed != 0) {
+            table_charge_.merge(reserve.charge.split(
+                kernel::resource::Budget{
+                    .memory = static_cast<u64>(consumed) * page_size,
+                }));
+        }
+    }
+    // Unconsumed prepared pages return to PMM before their capacity token.
+    reserve.pages.reset();
+    reserve.charge.reset();
+}
+
+void VSpace::retire_table(
+    RetireBatch& retire,
+    OwnedPage&& page) noexcept {
+    if (!table_charge_) {
+        KASSERT(retire.adopt(libk::move(page)));
+        return;
+    }
+    auto charge = table_charge_.split(kernel::resource::Budget{
+        .memory = page_size,
+    });
+    KASSERT(retire.adopt(libk::move(page), libk::move(charge)));
 }
 
 auto VSpace::map_kernel(
@@ -173,6 +226,7 @@ auto VSpace::map_impl(
         libk::move(memory_ref),
         memory,
         memory_authority,
+        request.access,
         source);
     if (!authority_entry) {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -318,7 +372,7 @@ auto VSpace::map_impl(
     if (!table_reserve) {
         return fail(table_reserve.error());
     }
-    OwnedPageGroup tables = libk::move(table_reserve).value();
+    TableReserve tables = libk::move(table_reserve).value();
 
     const arch::InterruptState interrupts = arch::disable_interrupts();
     lock_.lock();
@@ -374,22 +428,28 @@ auto VSpace::map_impl(
             *virtual_page,
             page->page_,
             *permissions,
-            tables);
+            tables.pages);
         KASSERT(installed);
         page->alias_.commit();
         page->source_.reset();
         authority->pages_.insert(*page);
     }
-    tables.reset();
+    commit_tables(tables);
     pending_kind_ = PendingKind::Map;
     release_claim();
     auto& retire = retire_batch_.emplace(*pmm_);
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(),
+        libk::move(plan).value(),
+        retire,
+        request.access.contains(Access::Execute));
     lock_.unlock();
     arch::restore_interrupts(interrupts);
     if (!committed) {
         return libk::unexpected(committed.error());
+    }
+    if (committed.value() == VmStatus::Complete) {
+        finish_authorities();
     }
     return libk::expected(MapResult{mapping->key_, committed.value()});
 }

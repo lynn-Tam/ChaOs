@@ -20,6 +20,9 @@ public:
     [[nodiscard]] auto select() noexcept -> DispatchCandidate {
         return DispatchCandidate{ready_.front()};
     }
+    [[nodiscard]] auto select_activation() noexcept -> DispatchCandidate {
+        return DispatchCandidate{ready_.activation_front()};
+    }
     [[nodiscard]] auto ready_count() const noexcept -> usize {
         return ready_.size();
     }

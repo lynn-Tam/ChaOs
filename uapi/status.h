@@ -18,3 +18,4 @@
 #define MYOS_STATUS_RETRY          -10
 #define MYOS_STATUS_BACKING_FAILED -11
 #define MYOS_STATUS_INTERNAL       -12
+#define MYOS_STATUS_CLOSED         -13

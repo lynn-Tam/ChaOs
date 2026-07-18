@@ -128,8 +128,7 @@ void restore_interrupts(InterruptState state) noexcept {
 
 [[noreturn]] auto switch_to_stack_and_call(
     usize stack_top,
-    kernel::KernelState& kernel,
-    kernel::CpuRuntime& runtime,
+    void* argument,
     StackContinuation continuation) noexcept -> void {
     KASSERT(stack_top != 0);
     KASSERT((stack_top & 0xfU) == 0);
@@ -137,15 +136,13 @@ void restore_interrupts(InterruptState state) noexcept {
 
     asm volatile(
         "mv sp, %[stack]\n"
-        "mv a0, %[kernel]\n"
-        "mv a1, %[runtime]\n"
+        "mv a0, %[argument]\n"
         "jr %[target]\n"
         :
         : [stack] "r"(stack_top),
-          [kernel] "r"(&kernel),
-          [runtime] "r"(&runtime),
+          [argument] "r"(argument),
           [target] "r"(continuation)
-        : "a0", "a1", "memory");
+        : "a0", "memory");
     __builtin_unreachable();
 }
 

@@ -9,6 +9,12 @@ template<>
 struct ObjectTraits<kernel::mm::VSpace> final {
     static constexpr ObjectKind kind = ObjectKind::VSpace;
 
+    static void bind_sponsor(
+        kernel::mm::VSpace& space,
+        kernel::resource::Sponsorship& sponsor) noexcept {
+        space.bind_sponsor(sponsor);
+    }
+
     [[nodiscard]] static auto prepare_retire(kernel::mm::VSpace& space) noexcept
         -> bool {
         return space.prepare_retire();

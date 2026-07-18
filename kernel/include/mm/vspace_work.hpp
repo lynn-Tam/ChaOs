@@ -28,7 +28,10 @@ public:
     void unbind_notifier() noexcept;
 
 private:
+    friend class VSpace;
+
     [[nodiscard]] auto take() noexcept -> VSpace*;
+    void withdraw(VSpace& space) noexcept;
 
     mutable libk::TicketSpinLock lock_{};
     Queue queue_{};

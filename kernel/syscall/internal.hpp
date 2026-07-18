@@ -5,6 +5,7 @@
 #include <core/types.hpp>
 #include <libk/optional.hpp>
 #include <mm/vspace.hpp>
+#include <execution/target.hpp>
 #include <syscall/syscall.hpp>
 #include <uapi/status.h>
 
@@ -17,7 +18,7 @@ namespace kernel::syscall {
 
 struct Invocation final {
     CpuLocal& cpu;
-    Thread& thread;
+    execution::Target target;
     cap::CSpace& cspace;
     kernel::mm::VSpace& vspace;
     arch::TrapContext& trap;
@@ -52,13 +53,28 @@ struct Result final {
     -> libk::optional<kernel::mm::VirtRange>;
 [[nodiscard]] auto vm_context(CpuLocal& cpu) noexcept -> kernel::mm::VmContext;
 
-[[nodiscard]] auto handle_thread(
+[[nodiscard]] auto handle_execution(
     usize operation,
     Invocation& invocation) noexcept -> Result;
 [[nodiscard]] auto handle_capability(
     usize operation,
     Invocation& invocation) noexcept -> Result;
 [[nodiscard]] auto handle_vm(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_construction(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_object(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_notification(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_vproc(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_tunnel(
     usize operation,
     Invocation& invocation) noexcept -> Result;
 

@@ -15,7 +15,7 @@
 #include <mm/vspace_work.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
-#include <sched/wake_queue.hpp>
+#include <sched/remote_queue.hpp>
 #include <time/clock.hpp>
 
 #include "arch/riscv64/mmu/sv39_builder.hpp"
@@ -223,6 +223,22 @@ private:
 };
 
 constinit FdtStructureWriter fdt_writer{};
+constinit kernel::boot::CpuHandoff cpu_handoff_storage{};
+
+[[nodiscard]] auto parse_cpu_tree(
+    const kernel::boot::fdt::FDT_View& view,
+    kernel::CpuHardwareId boot_cpu) noexcept
+    -> libk::Expected<kernel::boot::CpuHandoff*,
+        kernel::boot::CpuTopologyError> {
+    cpu_handoff_storage.cpus.clear();
+    cpu_handoff_storage.boot_index = 0;
+    auto parsed = kernel::boot::parse_fdt_cpus(
+        view, boot_cpu, cpu_handoff_storage);
+    if (!parsed) {
+        return libk::unexpected(parsed.error());
+    }
+    return libk::expected(&cpu_handoff_storage);
+}
 
 auto begin_cpu_tree(
     uint32_t address_cells = 2,
@@ -264,11 +280,11 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
     add_cpu("cpu@400", 1024, "fail-selftest");
     const auto view = finish_cpu_tree();
 
-    const auto summary = kernel::boot::parse_fdt_cpus_summary(
+    const auto summary = parse_cpu_tree(
         view, kernel::CpuHardwareId{256});
     if (!summary
-        || summary.value().count != 3
-        || summary.value().boot_index != 1) {
+        || summary.value()->cpus.size() != 3
+        || summary.value()->boot_index != 1) {
         return false;
     }
 
@@ -279,13 +295,17 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
     auto begun = kernel::CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        summary.value());
+        summary.value()->summary());
     if (!begun) {
         return false;
     }
     auto builder = libk::move(begun).value();
-    if (!kernel::boot::populate_fdt_cpus(view, builder)
-        || !builder.finish()) {
+    for (const kernel::boot::BootCpu& cpu : summary.value()->cpus) {
+        if (!builder.append(cpu.hardware_id, cpu.availability)) {
+            return false;
+        }
+    }
+    if (!builder.finish()) {
         return false;
     }
 
@@ -311,7 +331,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.begin_node("");
     fdt_writer.end_node();
     fdt_writer.finish();
-    const auto missing_cpus = kernel::boot::parse_fdt_cpus_summary(
+    const auto missing_cpus = parse_cpu_tree(
         fdt_writer.view(), kernel::CpuHardwareId{0});
     if (missing_cpus
         || missing_cpus.error()
@@ -320,7 +340,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     }
 
     begin_cpu_tree();
-    const auto zero_cpus = kernel::boot::parse_fdt_cpus_summary(
+    const auto zero_cpus = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (zero_cpus
         || zero_cpus.error()
@@ -330,7 +350,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
 
     begin_cpu_tree(3, 0);
     add_cpu("cpu@0", 0);
-    const auto bad_cells = kernel::boot::parse_fdt_cpus_summary(
+    const auto bad_cells = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (bad_cells
         || bad_cells.error()
@@ -340,7 +360,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
 
     begin_cpu_tree(2, 1);
     add_cpu("cpu@0", 0);
-    const auto bad_size_cells = kernel::boot::parse_fdt_cpus_summary(
+    const auto bad_size_cells = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (bad_size_cells
         || bad_size_cells.error()
@@ -350,7 +370,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0, nullptr, false);
-    const auto missing_reg = kernel::boot::parse_fdt_cpus_summary(
+    const auto missing_reg = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (missing_reg
         || missing_reg.error()
@@ -362,7 +382,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.begin_node("cpu@0");
     fdt_writer.reg64(0);
     fdt_writer.end_node();
-    const auto missing_type = kernel::boot::parse_fdt_cpus_summary(
+    const auto missing_type = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (missing_type
         || missing_type.error()
@@ -376,7 +396,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.reg64(0);
     fdt_writer.reg64(1);
     fdt_writer.end_node();
-    const auto duplicate_reg = kernel::boot::parse_fdt_cpus_summary(
+    const auto duplicate_reg = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (duplicate_reg
         || duplicate_reg.error()
@@ -389,7 +409,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.string_property(device_type_offset, "cpu");
     fdt_writer.reg64_pair(0, 1);
     fdt_writer.end_node();
-    const auto multi_tuple_reg = kernel::boot::parse_fdt_cpus_summary(
+    const auto multi_tuple_reg = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (multi_tuple_reg
         || multi_tuple_reg.error()
@@ -399,7 +419,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0, "mystery");
-    const auto bad_status = kernel::boot::parse_fdt_cpus_summary(
+    const auto bad_status = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     return !bad_status
         && bad_status.error()
@@ -409,7 +429,7 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
 bool test_boot_hart_match_is_strict(const TestContext&) noexcept {
     begin_cpu_tree();
     add_cpu("cpu@0", 0, "disabled");
-    const auto disabled = kernel::boot::parse_fdt_cpus_summary(
+    const auto disabled = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     if (disabled
         || disabled.error()
@@ -419,7 +439,7 @@ bool test_boot_hart_match_is_strict(const TestContext&) noexcept {
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0);
-    const auto missing = kernel::boot::parse_fdt_cpus_summary(
+    const auto missing = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{7});
     if (missing
         || missing.error()
@@ -430,7 +450,7 @@ bool test_boot_hart_match_is_strict(const TestContext&) noexcept {
     begin_cpu_tree();
     add_cpu("cpu@0", 0);
     add_cpu("cpu@00", 0);
-    const auto duplicate = kernel::boot::parse_fdt_cpus_summary(
+    const auto duplicate = parse_cpu_tree(
         finish_cpu_tree(), kernel::CpuHardwareId{0});
     return !duplicate
         && duplicate.error()
@@ -1059,58 +1079,15 @@ bool test_object_ref_generation_and_pin_reclaim(
     return reclaimed;
 }
 
-bool test_wake_queue_coalesces_without_losing_membership(
+bool test_remote_queue_coalesces_without_losing_membership(
     const TestContext&) noexcept {
-    CpuStorageGuard storage{};
-    if (!storage.initialize(24)) {
-        return false;
-    }
-    auto capacity = kernel::sched::DomainCapacity::create(*cpu_test_pmm, 1);
-    if (!capacity) {
-        return false;
-    }
-    kernel::sched::SchedulingDomain domain{
-        libk::move(capacity).value(),
-        kernel::sched::SchedulingDomain::share_scale,
-        100'000};
-    auto kernel_vspace = make_test_root();
-    if (kernel_vspace == nullptr) {
-        return false;
-    }
-    auto stack = kernel::KernelStack::create(*kernel_vspace);
-    if (!stack) {
-        return false;
-    }
-    auto pending = cpu_test_objects->create_thread(
-        libk::move(stack).value(),
-        kernel::ExecutionBinding::kernel(*kernel_vspace),
-        kernel::Thread::KernelStart{unused_idle_entry, nullptr});
-    if (!pending) {
-        return false;
-    }
-    auto thread = libk::move(pending).value().publish();
-    const auto urgency = kernel::sched::Urgency::make(1);
-    if (!urgency) {
-        return false;
-    }
-    kernel::sched::SchedulingContext context{
-        kernel::sched::SchedulingContext::Config{
-            .budget = kernel::time::Duration::from_ticks(1),
-            .period = kernel::time::Duration::from_ticks(2),
-            .urgency = *urgency,
-        },
-        kernel::time::Instant::from_ticks(0)};
-    auto target = thread.clone();
-    if (!target || !domain.admit(context, kernel::CpuId{0})
-        || !context.bind(libk::move(target).value(), kernel::CpuId{0})) {
-        return false;
-    }
-
-    kernel::sched::WakeQueue queue{};
-    kernel::sched::Binding& binding = *context.binding();
-    const auto first = queue.post(binding);
+    usize owner{};
+    kernel::sched::RemoteRequest request{
+        kernel::sched::RemoteKind::Wake, &owner};
+    kernel::sched::RemoteQueue queue{};
+    queue.post(request);
     const auto first_signal = queue.claim_transport();
-    const auto duplicate = queue.post(binding);
+    queue.post(request);
     const auto duplicate_signal = queue.claim_transport();
     if (!first_signal) {
         return false;
@@ -1124,33 +1101,27 @@ bool test_wake_queue_coalesces_without_losing_membership(
     // replacement signal that now owns delivery.
     queue.transport_failed(*first_signal);
     const auto stale_retry = queue.claim_transport();
-    kernel::sched::Binding* const taken = queue.take();
-    const auto during_delivery = queue.post(binding);
+    kernel::sched::RemoteRequest* const taken = queue.take();
+    queue.cancel(request);
+    const bool consumed_stays_pending = request.pending();
+    queue.post(request);
     const auto during_signal = queue.claim_transport();
-    queue.complete(binding);
+    queue.complete(request);
     const bool drained = queue.take() == nullptr;
-    const auto after_drain = queue.post(binding);
+    queue.post(request);
     const auto after_drain_signal = queue.claim_transport();
-    kernel::sched::Binding* const final = queue.take();
-    queue.complete(binding);
+    kernel::sched::RemoteRequest* const final = queue.take();
+    queue.complete(request);
     const bool final_drained = queue.take() == nullptr;
 
-    const bool protocol = first.accepted && first_signal
-        && duplicate.accepted && !duplicate_signal
+    const bool protocol = first_signal && !duplicate_signal
         && retry_signal
         && retry_signal->generation != first_signal->generation
         && !stale_retry
-        && taken == &binding
-        && during_delivery.accepted && !during_signal
-        && drained && after_drain.accepted && after_drain_signal
-        && final == &binding && final_drained;
-    if (!context.unbind() || !domain.unadmit(context)
-        || !thread.retire()) {
-        return false;
-    }
-    thread.reset();
-    cpu_test_objects->drain_reclaim();
-    return protocol && cpu_test_pmm->verify_invariants();
+        && taken == &request && consumed_stays_pending && !during_signal
+        && drained && after_drain_signal
+        && final == &request && final_drained;
+    return protocol;
 }
 
 } // namespace
@@ -1169,5 +1140,5 @@ void register_cpu_topology_tests(TestRegistry& registry) noexcept {
     (void)registry.add("cpu-topology", "lifecycle publication and snapshots derive from canonical states", test_lifecycle_start_failure_and_snapshot_use_canonical_states);
     (void)registry.add("cpu-topology", "shootdown acknowledgement controls detached-page retirement", test_shootdown_ack_controls_retirement);
     (void)registry.add("cpu-topology", "ObjectRef and typed pins share canonical reclaim state", test_object_ref_generation_and_pin_reclaim);
-    (void)registry.add("cpu-topology", "WakeQueue retains failed kicks without stale-generation loss", test_wake_queue_coalesces_without_losing_membership);
+    (void)registry.add("cpu-topology", "RemoteQueue retains failed kicks without stale-generation loss", test_remote_queue_coalesces_without_losing_membership);
 }

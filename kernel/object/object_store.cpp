@@ -9,6 +9,10 @@ ObjectStore::ObjectStore(
     kernel::mm::VSpaceExecutor& vspace_work) noexcept
     : pmm_(&pmm),
       vspace_work_(&vspace_work),
+      resources_(pmm, reclaim_notify_),
+      tunnels_(pmm, reclaim_notify_),
+      vprocs_(pmm, reclaim_notify_),
+      notifications_(pmm, reclaim_notify_),
       threads_(pmm, reclaim_notify_),
       contexts_(pmm, reclaim_notify_),
       domains_(pmm, reclaim_notify_),
@@ -20,11 +24,15 @@ ObjectStore::~ObjectStore() noexcept {
     KASSERT(!reclaim_notify_);
     drain_reclaim();
     KASSERT(vspaces_.live_count() == 0);
+    KASSERT(tunnels_.live_count() == 0);
+    KASSERT(vprocs_.live_count() == 0);
+    KASSERT(notifications_.live_count() == 0);
     KASSERT(cspaces_.live_count() == 0);
     KASSERT(memories_.live_count() == 0);
     KASSERT(domains_.live_count() == 0);
     KASSERT(contexts_.live_count() == 0);
     KASSERT(threads_.live_count() == 0);
+    KASSERT(resources_.live_count() == 0);
 }
 
 auto ObjectStore::hold_thread(ObjectId id) noexcept
@@ -67,6 +75,14 @@ auto ObjectStore::create_cspace(cap::CSpace::Quota quota) noexcept
     return cspaces_.create(*pmm_, quota);
 }
 
+auto ObjectStore::create_cspace_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    cap::CSpace::Quota quota) noexcept
+    -> libk::Expected<CSpacePending, CSpacePool::Error> {
+    return cspaces_.create_sponsored(
+        libk::move(sponsorship), *pmm_, quota);
+}
+
 auto ObjectStore::hold_cspace(ObjectId id) noexcept
     -> libk::Expected<CSpaceHold, CSpacePool::Error> {
     return cspaces_.hold(id);
@@ -82,6 +98,24 @@ auto ObjectStore::create_anonymous(
     kernel::mm::AnonymousConfig config) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create(*pmm_, byte_size);
+    if (!pending) {
+        return libk::unexpected(memory_pool_error(pending.error()));
+    }
+    MemoryPending memory = libk::move(pending).value();
+    auto initialized = memory.get().initialize_anonymous(config);
+    if (!initialized) {
+        return libk::unexpected(initialized.error());
+    }
+    return libk::expected(libk::move(memory));
+}
+
+auto ObjectStore::create_anonymous_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    usize byte_size,
+    kernel::mm::AnonymousConfig config) noexcept
+    -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
+    auto pending = memories_.create_sponsored(
+        libk::move(sponsorship), *pmm_, byte_size);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -128,6 +162,27 @@ auto ObjectStore::create_boot_image(
     return libk::expected(libk::move(memory));
 }
 
+auto ObjectStore::create_boot_image_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    usize byte_size,
+    libk::Span<const kernel::mm::MemoryExtent> extents,
+    kernel::mm::BootOwnership ownership,
+    kernel::mm::OwnedPageGroup&& pages) noexcept
+    -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
+    auto pending = memories_.create_sponsored(
+        libk::move(sponsorship), *pmm_, byte_size);
+    if (!pending) {
+        return libk::unexpected(memory_pool_error(pending.error()));
+    }
+    MemoryPending memory = libk::move(pending).value();
+    auto initialized = memory.get().initialize_boot_image(
+        extents, ownership, libk::move(pages));
+    if (!initialized) {
+        return libk::unexpected(initialized.error());
+    }
+    return libk::expected(libk::move(memory));
+}
+
 auto ObjectStore::hold_memory(ObjectId id) noexcept
     -> libk::Expected<MemoryHold, MemoryPool::Error> {
     return memories_.hold(id);
@@ -152,6 +207,23 @@ auto ObjectStore::create_vspace(kernel::mm::KernelVSpace& kernel) noexcept
     return libk::expected(libk::move(space));
 }
 
+auto ObjectStore::create_vspace_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    kernel::mm::KernelVSpace& kernel) noexcept
+    -> libk::Expected<VSpacePending, kernel::mm::VSpaceError> {
+    auto pending = vspaces_.create_sponsored(
+        libk::move(sponsorship), *pmm_, kernel, *vspace_work_);
+    if (!pending) {
+        return libk::unexpected(vspace_pool_error(pending.error()));
+    }
+    VSpacePending space = libk::move(pending).value();
+    auto initialized = space.get().initialize();
+    if (!initialized) {
+        return libk::unexpected(initialized.error());
+    }
+    return libk::expected(libk::move(space));
+}
+
 auto ObjectStore::hold_vspace(ObjectId id) noexcept
     -> libk::Expected<VSpaceHold, VSpacePool::Error> {
     return vspaces_.hold(id);
@@ -162,13 +234,76 @@ auto ObjectStore::pin_vspace(ObjectId id) noexcept
     return vspaces_.pin(id);
 }
 
+auto ObjectStore::create_resource(kernel::resource::Budget limit) noexcept
+    -> libk::Expected<ResourcePending, ResourcePool::Error> {
+    return resources_.create(limit);
+}
+
+auto ObjectStore::create_resource_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    kernel::resource::Budget limit) noexcept
+    -> libk::Expected<ResourcePending, ResourcePool::Error> {
+    return resources_.create_sponsored(
+        libk::move(sponsorship), limit);
+}
+
+auto ObjectStore::hold_resource(ObjectId id) noexcept
+    -> libk::Expected<ResourceHold, ResourcePool::Error> {
+    return resources_.hold(id);
+}
+
+auto ObjectStore::pin_resource(ObjectId id) noexcept
+    -> libk::Expected<ResourcePin, ResourcePool::Error> {
+    return resources_.pin(id);
+}
+
+auto ObjectStore::create_notification_sponsored(
+    kernel::resource::Reservation&& sponsorship) noexcept
+    -> libk::Expected<NotificationPending, NotificationPool::Error> {
+    return notifications_.create_sponsored(libk::move(sponsorship));
+}
+
+auto ObjectStore::hold_notification(ObjectId id) noexcept
+    -> libk::Expected<NotificationHold, NotificationPool::Error> {
+    return notifications_.hold(id);
+}
+
+auto ObjectStore::pin_notification(ObjectId id) noexcept
+    -> libk::Expected<NotificationPin, NotificationPool::Error> {
+    return notifications_.pin(id);
+}
+
+auto ObjectStore::hold_vproc(ObjectId id) noexcept
+    -> libk::Expected<VprocHold, VprocPool::Error> {
+    return vprocs_.hold(id);
+}
+
+auto ObjectStore::pin_vproc(ObjectId id) noexcept
+    -> libk::Expected<VprocPin, VprocPool::Error> {
+    return vprocs_.pin(id);
+}
+
+auto ObjectStore::hold_tunnel(ObjectId id) noexcept
+    -> libk::Expected<TunnelHold, TunnelPool::Error> {
+    return tunnels_.hold(id);
+}
+
+auto ObjectStore::pin_tunnel(ObjectId id) noexcept
+    -> libk::Expected<TunnelPin, TunnelPool::Error> {
+    return tunnels_.pin(id);
+}
+
 void ObjectStore::drain_reclaim() noexcept {
+    tunnels_.drain_reclaim();
+    vprocs_.drain_reclaim();
+    notifications_.drain_reclaim();
     vspaces_.drain_reclaim();
     cspaces_.drain_reclaim();
     memories_.drain_reclaim();
     domains_.drain_reclaim();
     contexts_.drain_reclaim();
     threads_.drain_reclaim();
+    resources_.drain_reclaim();
 }
 
 void ObjectStore::bind_reclaim_notifier(ReclaimNotifier notifier) noexcept {

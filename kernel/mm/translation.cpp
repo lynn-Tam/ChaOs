@@ -1,5 +1,6 @@
 #include <mm/translation.hpp>
 
+#include <arch/instruction.hpp>
 #include <arch/ipi.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
@@ -24,6 +25,12 @@ auto ShootdownTicket::epoch() const noexcept -> TranslationEpoch {
     return epoch_;
 }
 
+auto ShootdownTicket::instruction_epoch() const noexcept
+    -> InstructionEpoch {
+    KASSERT(initialized());
+    return instruction_epoch_;
+}
+
 auto ShootdownTicket::targets() const noexcept -> const kernel::CpuSet& {
     KASSERT(initialized());
     return targets_;
@@ -43,6 +50,8 @@ auto ShootdownTicket::acknowledged(kernel::CpuId cpu) const noexcept -> bool {
 void ShootdownTicket::initialize(
     TranslationState& owner,
     TranslationEpoch epoch,
+    InstructionEpoch instruction_epoch,
+    bool instruction_sync,
     kernel::CpuSet targets) noexcept {
     KASSERT(!initialized());
     KASSERT(epoch.raw != 0);
@@ -50,6 +59,8 @@ void ShootdownTicket::initialize(
         word.store<libk::MemoryOrder::Relaxed>(0);
     }
     epoch_ = epoch;
+    instruction_epoch_ = instruction_epoch;
+    instruction_sync_ = instruction_sync;
     targets_ = targets;
     completion_.initialize(targets.size());
     owner_ = &owner;
@@ -77,6 +88,8 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
 
 RetireBatch::~RetireBatch() noexcept {
     KASSERT(ticket_ == nullptr || ticket_->complete());
+    pages_.reset();
+    charge_.reset();
     if (owner_ != nullptr) {
         const usize pending = owner_->pending_retires_.fetch_sub<
             libk::MemoryOrder::Release>(1);
@@ -102,6 +115,7 @@ auto RetireBatch::release() noexcept -> bool {
         return false;
     }
     pages_.reset();
+    charge_.reset();
     ticket_ = nullptr;
     if (owner_ != nullptr) {
         const usize pending = owner_->pending_retires_.fetch_sub<
@@ -290,7 +304,8 @@ void TranslationState::Mutation::unlock() noexcept {
 auto TranslationState::Mutation::commit(
     ShootdownPlan&& plan,
     ShootdownTicket& ticket,
-    RetireBatch* retire) noexcept -> ShootdownStatus {
+    RetireBatch* retire,
+    bool instruction_sync) noexcept -> ShootdownStatus {
     KASSERT(owner_ != nullptr);
     KASSERT(!ticket.initialized());
     KASSERT(plan.targets_ == targets_);
@@ -298,7 +313,14 @@ auto TranslationState::Mutation::commit(
 
     const TranslationEpoch issued{owner_->epoch_.raw + 1};
     owner_->epoch_ = issued;
-    ticket.initialize(*owner_, issued, targets_);
+    if (instruction_sync) {
+        KASSERT(owner_->instruction_epoch_.raw
+            != libk::numeric_limits<u64>::max());
+        owner_->instruction_epoch_ = InstructionEpoch{
+            owner_->instruction_epoch_.raw + 1};
+    }
+    ticket.initialize(
+        *owner_, issued, owner_->instruction_epoch_, instruction_sync, targets_);
     if (retire != nullptr) {
         retire->bind(ticket);
     }
@@ -306,6 +328,9 @@ auto TranslationState::Mutation::commit(
     const kernel::CpuSet kicks = plan.publish(ticket);
     if (targets_.contains(plan.local_)) {
         arch::flush_tlb_all();
+        if (instruction_sync) {
+            arch::sync_instruction_stream();
+        }
         ticket.acknowledge(plan.local_);
     }
 
@@ -324,14 +349,23 @@ auto TranslationState::Mutation::commit(
     return ShootdownStatus::Pending;
 }
 
-void TranslationState::Mutation::publish_fresh() noexcept {
+void TranslationState::Mutation::publish_fresh(bool instruction_sync) noexcept {
     KASSERT(owner_ != nullptr);
     KASSERT(owner_->epoch_.raw != libk::numeric_limits<u64>::max());
     owner_->epoch_ = TranslationEpoch{owner_->epoch_.raw + 1};
+    if (instruction_sync) {
+        KASSERT(owner_->instruction_epoch_.raw
+            != libk::numeric_limits<u64>::max());
+        owner_->instruction_epoch_ = InstructionEpoch{
+            owner_->instruction_epoch_.raw + 1};
+    }
 
     // The local hart may have speculatively cached an invalid walk. Remote
     // harts cannot have named this monotonically allocated range yet.
     arch::flush_tlb_all();
+    if (instruction_sync) {
+        arch::sync_instruction_stream();
+    }
     unlock();
 }
 
@@ -342,11 +376,11 @@ TranslationState::~TranslationState() noexcept {
 }
 
 auto TranslationState::enter(kernel::CpuId cpu) noexcept
-    -> TranslationEpoch {
+    -> TranslationObservation {
     kernel::sync::IrqLockGuard guard{lock_};
     KASSERT(cpu.raw < kernel::max_cpu_count);
     KASSERT(active_.insert(cpu));
-    return epoch_;
+    return TranslationObservation{epoch_, instruction_epoch_};
 }
 
 void TranslationState::leave(kernel::CpuId cpu) noexcept {
@@ -371,6 +405,12 @@ auto TranslationState::epoch() const noexcept -> TranslationEpoch {
     return epoch_;
 }
 
+auto TranslationState::observation() const noexcept
+    -> TranslationObservation {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return TranslationObservation{epoch_, instruction_epoch_};
+}
+
 auto TranslationState::active_cpus() const noexcept -> kernel::CpuSet {
     kernel::sync::IrqLockGuard guard{lock_};
     return active_;
@@ -383,15 +423,25 @@ void TranslationView::activate(kernel::CpuLocal& cpu) const noexcept {
     TranslationState* const outgoing = cpu.active_translation_;
     if (outgoing == state_) {
         KASSERT(cpu.active_root_ && cpu.active_root_ == root_);
-        cpu.observed_epoch_ = state_->epoch();
+        const TranslationObservation observed = state_->observation();
+        cpu.observed_epoch_ = observed.translation;
+        if (cpu.observed_instruction_epoch_.raw
+            < observed.instruction.raw) {
+            arch::sync_instruction_stream();
+            cpu.observed_instruction_epoch_ = observed.instruction;
+        }
         return;
     }
 
-    const TranslationEpoch observed = state_->enter(id);
+    const TranslationObservation observed = state_->enter(id);
     arch::activate_root(root_);
+    if (observed.instruction.raw != 0) {
+        arch::sync_instruction_stream();
+    }
     cpu.active_translation_ = state_;
     cpu.active_root_ = root_;
-    cpu.observed_epoch_ = observed;
+    cpu.observed_epoch_ = observed.translation;
+    cpu.observed_instruction_epoch_ = observed.instruction;
     if (outgoing != nullptr) {
         outgoing->leave(id);
     }
@@ -403,11 +453,15 @@ void TranslationView::adopt(kernel::CpuLocal& cpu) const noexcept {
     KASSERT(cpu.active_translation_ == nullptr);
     KASSERT(!cpu.active_root_);
     KASSERT(arch::root_active(root_));
-    const TranslationEpoch observed = state_->enter(
+    const TranslationObservation observed = state_->enter(
         cpu.descriptor->logical_id());
+    if (observed.instruction.raw != 0) {
+        arch::sync_instruction_stream();
+    }
     cpu.active_translation_ = state_;
     cpu.active_root_ = root_;
-    cpu.observed_epoch_ = observed;
+    cpu.observed_epoch_ = observed.translation;
+    cpu.observed_instruction_epoch_ = observed.instruction;
 }
 
 void drain_shootdowns(kernel::CpuRuntime& runtime) noexcept {
@@ -419,14 +473,25 @@ void drain_shootdowns(kernel::CpuRuntime& runtime) noexcept {
     }
 
     arch::flush_tlb_all();
+    bool instruction_synced{};
     while (!batch.empty()) {
         const ShootdownRequest request = batch.front();
         batch.pop_front();
         KASSERT(request.ticket != nullptr);
         KASSERT(request.target == runtime.local.descriptor->logical_id());
+        if (request.ticket->instruction_sync_ && !instruction_synced) {
+            arch::sync_instruction_stream();
+            instruction_synced = true;
+        }
         if (runtime.local.active_translation_ == request.ticket->owner_
             && runtime.local.observed_epoch_.raw < request.ticket->epoch_.raw) {
             runtime.local.observed_epoch_ = request.ticket->epoch_;
+        }
+        if (runtime.local.active_translation_ == request.ticket->owner_
+            && runtime.local.observed_instruction_epoch_.raw
+                < request.ticket->instruction_epoch_.raw) {
+            runtime.local.observed_instruction_epoch_ =
+                request.ticket->instruction_epoch_;
         }
         request.ticket->acknowledge(request.target);
     }

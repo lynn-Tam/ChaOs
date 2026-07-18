@@ -6,6 +6,7 @@
 #include <mm/kernel_vspace.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_store.hpp>
+#include <resource/pool.hpp>
 #include <core/kernel_image.hpp>
 #include <mm/vspace_work.hpp>
 #include <sched/context.hpp>
@@ -22,6 +23,7 @@ struct MissingObjectTraits final {};
 
 static_assert(!kernel::object::StorableObject<MissingObjectTraits>);
 static_assert(kernel::object::StorableObject<kernel::Thread>);
+static_assert(kernel::object::StorableObject<kernel::resource::ResourcePool>);
 static_assert(kernel::object::StorableObject<
     kernel::sched::SchedulingContext>);
 static_assert(kernel::object::StorableObject<
@@ -34,9 +36,9 @@ using kernel::time::Instant;
 constexpr usize sched_test_page_count = 40;
 alignas(kernel::mm::page_size) byte
     sched_test_ram[sched_test_page_count * kernel::mm::page_size]{};
-// Builtin tests still execute on the boot stack. The full boot-memory map is
-// PMM construction workspace, so the test fixture owns that storage and drops
-// it immediately after initialization instead of charging it to every test.
+// The full boot-memory map is PMM construction workspace, so the test fixture
+// owns that storage and drops it immediately after initialization instead of
+// charging it to every test.
 constinit libk::ManualLifetime<kernel::mm::RegionList> sched_test_memory_map{};
 constinit libk::ManualLifetime<kernel::mm::Pmm> sched_test_pmm{};
 constinit libk::ManualLifetime<kernel::mm::DirectMap> sched_test_direct{};
@@ -265,6 +267,281 @@ bool test_object_store_unpublished_construction_rolls_back(
         && sched_test_pmm->verify_invariants();
 }
 
+bool test_resource_pool_refunds_after_object_reclaim(
+    const TestContext&) noexcept {
+    SchedStorageGuard storage{};
+    if (!storage.initialize()) {
+        return false;
+    }
+
+    constexpr kernel::resource::Budget limit{
+        .memory = 4 * kernel::mm::page_size,
+        .caps = 4,
+    };
+    constexpr kernel::resource::Budget charge{
+        .memory = kernel::mm::page_size,
+        .caps = 1,
+    };
+    auto pending_pool = sched_test_objects->create_resource(limit);
+    if (!pending_pool) {
+        return false;
+    }
+    auto pool = libk::move(pending_pool).value().publish();
+
+    // An abandoned pre-commit reservation has created no resource and must
+    // restore the ledger immediately.
+    {
+        auto self = pool.ref();
+        if (!self) {
+            return false;
+        }
+        auto reserved = pool->reserve(libk::move(self).value(), charge);
+        if (!reserved
+            || pool->available()
+                != kernel::resource::Budget{
+                    .memory = limit.memory - charge.memory,
+                    .caps = limit.caps - charge.caps}) {
+            return false;
+        }
+    }
+    if (pool->available() != limit || pool->sponsorship_count() != 0) {
+        return false;
+    }
+
+    auto self = pool.ref();
+    if (!self) {
+        return false;
+    }
+    auto reserved = pool->reserve(libk::move(self).value(), charge);
+    if (!reserved) {
+        return false;
+    }
+    auto pending_memory = sched_test_objects->create_anonymous_sponsored(
+        libk::move(reserved).value(), 2 * kernel::mm::page_size);
+    if (!pending_memory) {
+        return false;
+    }
+    auto memory = libk::move(pending_memory).value().publish();
+    const kernel::resource::Budget after_backing{
+        .memory = limit.memory - charge.memory - kernel::mm::page_size,
+        .caps = limit.caps - charge.caps,
+    };
+    if (pool->sponsorship_count() != 2
+        || pool->available() != after_backing
+        || pool->can_retire()) {
+        return false;
+    }
+    auto first_result = memory.get().materialize(0);
+    if (!first_result
+        || pool->available().memory != 0
+        || pool->sponsorship_count() != 4) {
+        return false;
+    }
+    auto first_page = libk::move(first_result).value();
+    auto exhausted = memory.get().materialize(1);
+    if (exhausted
+        || exhausted.error() != kernel::mm::MemoryError::ResourceExhausted
+        || pool->available().memory != 0
+        || pool->sponsorship_count() != 4) {
+        return false;
+    }
+    first_page.reset();
+    if (!memory.retire()) {
+        return false;
+    }
+    memory.reset();
+
+    // Retire only requests cleanup. Capacity is dishonest if it returns
+    // before ObjectPool has made the slot and payload reusable.
+    if (pool->sponsorship_count() != 1 || pool->available() == limit) {
+        return false;
+    }
+    sched_test_objects->drain_reclaim();
+    if (pool->sponsorship_count() != 0
+        || pool->available() != limit
+        || pool->close() != kernel::resource::PoolState::Closed
+        || !pool->can_retire()
+        || !pool.retire()) {
+        return false;
+    }
+    pool.reset();
+    sched_test_objects->drain_reclaim();
+    return sched_test_pmm->verify_invariants();
+}
+
+bool test_resource_pool_child_returns_transferred_budget(
+    const TestContext&) noexcept {
+    SchedStorageGuard storage{};
+    if (!storage.initialize()) {
+        return false;
+    }
+
+    constexpr kernel::resource::Budget parent_limit{
+        .memory = 16 * kernel::mm::page_size,
+        .caps = 16,
+    };
+    constexpr kernel::resource::Budget child_limit{
+        .memory = 4 * kernel::mm::page_size,
+        .caps = 4,
+    };
+    // The child owns its delegated budget. Its ObjectPool capacity is a
+    // separate parent-funded cost and returns with the child object.
+    constexpr kernel::resource::Budget transfer{
+        .memory = child_limit.memory + kernel::mm::page_size,
+        .caps = child_limit.caps,
+    };
+    auto pending_parent = sched_test_objects->create_resource(parent_limit);
+    if (!pending_parent) {
+        return false;
+    }
+    auto parent = libk::move(pending_parent).value().publish();
+    auto parent_ref = parent.ref();
+    if (!parent_ref) {
+        return false;
+    }
+    auto child_charge = parent->reserve(
+        libk::move(parent_ref).value(), transfer);
+    if (!child_charge) {
+        return false;
+    }
+    auto pending_child = sched_test_objects->create_resource_sponsored(
+        libk::move(child_charge).value(), child_limit);
+    if (!pending_child) {
+        return false;
+    }
+    auto child = libk::move(pending_child).value().publish();
+
+    constexpr kernel::resource::Budget object_charge{
+        .memory = kernel::mm::page_size,
+        .caps = 1,
+    };
+    auto child_ref = child.ref();
+    if (!child_ref) {
+        return false;
+    }
+    auto reserved = child->reserve(
+        libk::move(child_ref).value(), object_charge);
+    if (!reserved) {
+        return false;
+    }
+    auto pending_memory = sched_test_objects->create_anonymous_sponsored(
+        libk::move(reserved).value(), kernel::mm::page_size);
+    if (!pending_memory) {
+        return false;
+    }
+    auto memory = libk::move(pending_memory).value().publish();
+    if (child.retire()
+        || child->sponsorship_count() != 2
+        || parent->sponsorship_count() != 1) {
+        return false;
+    }
+
+    if (!memory.retire()) {
+        return false;
+    }
+    memory.reset();
+    sched_test_objects->drain_reclaim();
+    if (child->close() != kernel::resource::PoolState::Closed
+        || !child->can_retire() || !child.retire()) {
+        return false;
+    }
+    child.reset();
+    sched_test_objects->drain_reclaim();
+    if (parent->available() != parent_limit
+        || parent->sponsorship_count() != 0
+        || parent->close() != kernel::resource::PoolState::Closed
+        || !parent.retire()) {
+        return false;
+    }
+    parent.reset();
+    sched_test_objects->drain_reclaim();
+    return sched_test_pmm->verify_invariants();
+}
+
+bool test_resource_pool_close_waits_for_open_transactions(
+    const TestContext&) noexcept {
+    SchedStorageGuard storage{};
+    if (!storage.initialize()) {
+        return false;
+    }
+
+    constexpr kernel::resource::Budget limit{
+        .memory = 2 * kernel::mm::page_size,
+        .caps = 2,
+    };
+    constexpr kernel::resource::Budget charge{
+        .memory = kernel::mm::page_size,
+        .caps = 1,
+    };
+
+    auto pending_permit_pool = sched_test_objects->create_resource(limit);
+    if (!pending_permit_pool) {
+        return false;
+    }
+    auto permit_pool = libk::move(pending_permit_pool).value().publish();
+    auto permit_ref = permit_pool.ref();
+    if (!permit_ref) {
+        return false;
+    }
+    auto permit = permit_pool->begin(libk::move(permit_ref).value());
+    if (!permit
+        || permit_pool->close() != kernel::resource::PoolState::Closing) {
+        return false;
+    }
+
+    // Closing is a linearization boundary: existing construction may finish,
+    // but no new construction epoch or budget reservation may enter.
+    auto rejected_permit_ref = permit_pool.ref();
+    auto rejected_reservation_ref = permit_pool.ref();
+    if (!rejected_permit_ref || !rejected_reservation_ref) {
+        return false;
+    }
+    auto rejected_permit = permit_pool->begin(
+        libk::move(rejected_permit_ref).value());
+    auto rejected_reservation = permit_pool->reserve(
+        libk::move(rejected_reservation_ref).value(), charge);
+    if (rejected_permit
+        || rejected_permit.error() != kernel::resource::PoolError::Closed
+        || rejected_reservation
+        || rejected_reservation.error()
+            != kernel::resource::PoolError::Closed) {
+        return false;
+    }
+    libk::move(permit).value().reset();
+    if (permit_pool->state() != kernel::resource::PoolState::Closed
+        || !permit_pool.retire()) {
+        return false;
+    }
+    permit_pool.reset();
+    sched_test_objects->drain_reclaim();
+
+    auto pending_reservation_pool = sched_test_objects->create_resource(limit);
+    if (!pending_reservation_pool) {
+        return false;
+    }
+    auto reservation_pool =
+        libk::move(pending_reservation_pool).value().publish();
+    auto reservation_ref = reservation_pool.ref();
+    if (!reservation_ref) {
+        return false;
+    }
+    auto reservation = reservation_pool->reserve(
+        libk::move(reservation_ref).value(), charge);
+    if (!reservation
+        || reservation_pool->close() != kernel::resource::PoolState::Closing) {
+        return false;
+    }
+    libk::move(reservation).value().reset();
+    if (reservation_pool->available() != limit
+        || reservation_pool->state() != kernel::resource::PoolState::Closed
+        || !reservation_pool.retire()) {
+        return false;
+    }
+    reservation_pool.reset();
+    sched_test_objects->drain_reclaim();
+    return sched_test_pmm->verify_invariants();
+}
+
 bool test_kernel_stack_uses_guarded_virtual_slot(
     const TestContext&) noexcept {
     SchedStorageGuard storage{};
@@ -443,8 +720,7 @@ bool test_ready_queue_orders_priority_and_fifo(
         auto target = threads[index].clone();
         if (!target
             || !domain->admit(contexts[index].get(), kernel::CpuId{0})
-            || !contexts[index]->bind(
-                libk::move(target).value(), kernel::CpuId{0})) {
+            || !contexts[index]->bind(libk::move(target).value())) {
             return false;
         }
     }
@@ -512,6 +788,18 @@ void register_sched_tests(TestRegistry& registry) noexcept {
         "sched",
         "ObjectStore unpublished construction rolls back slab and payload",
         test_object_store_unpublished_construction_rolls_back);
+    (void)registry.add(
+        "sched",
+        "ResourcePool refunds only after sponsored object reclaim",
+        test_resource_pool_refunds_after_object_reclaim);
+    (void)registry.add(
+        "sched",
+        "child ResourcePool returns its delegated budget after reclaim",
+        test_resource_pool_child_returns_transferred_budget);
+    (void)registry.add(
+        "sched",
+        "ResourcePool close waits for construction and budget transactions",
+        test_resource_pool_close_waits_for_open_transactions);
     (void)registry.add(
         "sched",
         "kernel stacks use guarded reusable virtual slots",

@@ -12,7 +12,7 @@ void handle_ipi(CpuRuntime& runtime) noexcept {
     KASSERT(!arch::interrupts_enabled());
     arch::acknowledge_ipi();
     kernel::mm::drain_shootdowns(runtime);
-    runtime.dispatcher().drain_remote_wakes();
+    runtime.dispatcher().drain_remote();
 }
 
 } // namespace kernel

@@ -3,6 +3,7 @@
 #include <cpu/cpu_runtime.hpp>
 #include <cpu/start.hpp>
 #include <libk/memory.hpp>
+#include <libk/optional.hpp>
 #include <libk/utility.hpp>
 #include <mm/kernel_stack.hpp>
 #include <mm/kernel_vspace.hpp>
@@ -15,6 +16,25 @@ namespace kernel {
 auto CpuProvisioner::prepare(
     CpuId id,
     kernel::mm::KernelVSpace& vspace,
+    Thread::Entry idle_entry) noexcept -> Result {
+    return prepare_impl(id, vspace, nullptr, idle_entry);
+}
+
+auto CpuProvisioner::prepare_boot(
+    CpuId id,
+    kernel::mm::KernelVSpace& vspace,
+    KernelStack& init_stack,
+    Thread::Entry idle_entry) noexcept -> Result {
+    if (init_stack.top() == 0) {
+        return libk::unexpected(Error::InvalidState);
+    }
+    return prepare_impl(id, vspace, &init_stack, idle_entry);
+}
+
+auto CpuProvisioner::prepare_impl(
+    CpuId id,
+    kernel::mm::KernelVSpace& vspace,
+    KernelStack* supplied_init,
     Thread::Entry idle_entry) noexcept -> Result {
     if (idle_entry == nullptr) {
         return libk::unexpected(Error::InvalidState);
@@ -34,14 +54,19 @@ auto CpuProvisioner::prepare(
     auto* const runtime = libk::construct_at(
         static_cast<CpuRuntime*>(target.storage));
 
-    auto init = KernelStack::create(vspace);
-    if (!init) {
-        libk::destroy_at(runtime);
-        registry_.fail_runtime(target, CpuFailure::StackAllocation);
-        return libk::unexpected(Error::StackAllocation);
+    libk::optional<KernelStack> created_init{};
+    if (supplied_init == nullptr) {
+        auto init = KernelStack::create(vspace);
+        if (!init) {
+            libk::destroy_at(runtime);
+            registry_.fail_runtime(target, CpuFailure::StackAllocation);
+            return libk::unexpected(Error::StackAllocation);
+        }
+        [[maybe_unused]] auto& owned =
+            created_init.emplace(libk::move(init).value());
+        [[maybe_unused]] KernelStack& init_stack =
+            runtime->stacks.init.emplace(libk::move(*created_init));
     }
-    [[maybe_unused]] KernelStack& init_stack =
-        runtime->stacks.init.emplace(libk::move(init).value());
 
     auto irq = KernelStack::create(vspace);
     if (!irq) {
@@ -96,6 +121,7 @@ auto CpuProvisioner::prepare(
     runtime->idle_thread = libk::move(pending_idle).value().publish();
 
     runtime->owner_registry = &registry_;
+    runtime->kernel = kernel_;
     runtime->local.initialize(*target.descriptor, *runtime);
     arch::publish_panic_state(
         runtime->local.arch_state,
@@ -108,12 +134,22 @@ auto CpuProvisioner::prepare(
         target.descriptor->logical_id(),
         runtime->idle(),
         clock_);
+    const usize init_top = supplied_init != nullptr
+        ? supplied_init->top()
+        : runtime->stacks.init->top();
     runtime->start_context.initialize(
         target.descriptor->hardware_id(),
         translation.root(),
-        runtime->stacks.init->top(),
+        init_top,
         *runtime,
         kernel_secondary_continue);
+
+    // No fallible work may follow this transfer: a failure must never unmap
+    // the stack on which the boot CPU is currently running.
+    if (supplied_init != nullptr) {
+        [[maybe_unused]] KernelStack& init_stack =
+            runtime->stacks.init.emplace(libk::move(*supplied_init));
+    }
 
     registry_.publish_runtime(target, *runtime);
     return libk::expected();

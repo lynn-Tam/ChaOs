@@ -2,6 +2,7 @@
 
 #include <core/debug.hpp>
 #include <libk/intrusive_tree.hpp>
+#include <libk/checked_arithmetic.hpp>
 #include <libk/limits.hpp>
 #include <libk/mem.h>
 #include <libk/memory.hpp>
@@ -111,20 +112,42 @@ namespace {
 
 class ExtentStore final : private libk::noncopyable_nonmovable {
     struct Block final {
+        Block(
+            OwnedPage&& page,
+            kernel::resource::Reservation&& charge) noexcept
+            : backing(libk::move(page)) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
+
+        OwnedPage backing{};
+        kernel::resource::Sponsorship sponsorship{};
         Block* next{};
         usize count{};
-        static constexpr usize capacity =
-            (page_size - sizeof(Block*) - sizeof(usize))
-            / sizeof(MemoryExtent);
-        MemoryExtent extents[capacity]{};
+
+        [[nodiscard]] auto extents() noexcept -> MemoryExtent* {
+            return reinterpret_cast<MemoryExtent*>(
+                reinterpret_cast<usize>(this) + extent_offset);
+        }
+        [[nodiscard]] auto extents() const noexcept -> const MemoryExtent* {
+            return reinterpret_cast<const MemoryExtent*>(
+                reinterpret_cast<usize>(this) + extent_offset);
+        }
     };
 
-    static_assert(Block::capacity != 0);
-    static_assert(sizeof(Block) <= page_size);
+    static constexpr usize extent_offset =
+        (sizeof(Block) + alignof(MemoryExtent) - 1)
+        & ~(alignof(MemoryExtent) - 1);
+    static constexpr usize extent_capacity =
+        (page_size - extent_offset) / sizeof(MemoryExtent);
+    static_assert(extent_capacity != 0);
 
 public:
-    explicit ExtentStore(Pmm& pmm) noexcept
-        : pages_(pmm.make_page_group()) {}
+    ExtentStore(
+        Pmm& pmm,
+        kernel::resource::Sponsorship* sponsor) noexcept
+        : pmm_(&pmm), sponsor_(sponsor) {}
 
     ~ExtentStore() noexcept { reset(); }
 
@@ -132,27 +155,31 @@ public:
         libk::Span<const MemoryExtent> extents) noexcept
         -> libk::Expected<void, MemoryError> {
         KASSERT(head_ == nullptr);
-        auto extension = pages_.extend();
         Block* tail{};
         usize copied{};
         while (copied < extents.size()) {
-            auto allocated = extension.allocate_page();
+            auto charge = reserve_page();
+            if (!charge) {
+                reset();
+                return libk::unexpected(charge.error());
+            }
+            auto allocated = pmm_->allocate_page();
             if (!allocated) {
-                while (head_ != nullptr) {
-                    Block* const block = head_;
-                    head_ = block->next;
-                    libk::destroy_at(block);
-                }
+                reset();
                 return libk::unexpected(MemoryError::OutOfMemory);
             }
+            OwnedPage page = libk::move(allocated).value();
             auto* const block = libk::construct_at(
-                reinterpret_cast<Block*>(extension.bytes(allocated.value())));
+                reinterpret_cast<Block*>(page.bytes()),
+                libk::move(page),
+                libk::move(charge).value());
             const usize remaining = extents.size() - copied;
-            block->count = remaining < Block::capacity
+            block->count = remaining < extent_capacity
                 ? remaining
-                : Block::capacity;
+                : extent_capacity;
             for (usize index = 0; index < block->count; ++index) {
-                block->extents[index] = extents[copied + index];
+                libk::construct_at(
+                    &block->extents()[index], extents[copied + index]);
             }
             copied += block->count;
             if (tail == nullptr) {
@@ -162,7 +189,6 @@ public:
             }
             tail = block;
         }
-        extension.commit();
         return libk::expected();
     }
 
@@ -172,7 +198,7 @@ public:
              block != nullptr;
              block = block->next) {
             for (usize index = 0; index < block->count; ++index) {
-                const MemoryExtent& extent = block->extents[index];
+                const MemoryExtent& extent = block->extents()[index];
                 const auto end = extent.object.end();
                 KASSERT(end);
                 if (page_index >= extent.object.first
@@ -188,13 +214,37 @@ public:
         while (head_ != nullptr) {
             Block* const block = head_;
             head_ = block->next;
+            for (usize index = 0; index < block->count; ++index) {
+                libk::destroy_at(&block->extents()[index]);
+            }
+            auto refund = block->sponsorship.detach();
+            OwnedPage backing = libk::move(block->backing);
             libk::destroy_at(block);
+            backing.reset();
+            refund.complete();
         }
-        pages_.reset();
     }
 
 private:
-    OwnedPageGroup pages_{};
+    [[nodiscard]] auto reserve_page() const noexcept
+        -> libk::Expected<kernel::resource::Reservation, MemoryError> {
+        if (sponsor_ == nullptr) {
+            return libk::expected(kernel::resource::Reservation{});
+        }
+        auto reserved = sponsor_->reserve(kernel::resource::Budget{
+            .memory = page_size,
+        });
+        if (!reserved) {
+            return libk::unexpected(
+                reserved.error() == kernel::resource::PoolError::Exhausted
+                    ? MemoryError::ResourceExhausted
+                    : MemoryError::InvalidState);
+        }
+        return libk::expected(libk::move(reserved).value());
+    }
+
+    Pmm* pmm_{};
+    kernel::resource::Sponsorship* sponsor_{};
     Block* head_{};
 };
 
@@ -209,6 +259,7 @@ class AnonymousBacking final : private libk::noncopyable_nonmovable {
         ContentState state{ContentState::Busy};
         libk::IntrusiveTreeHook tree_hook{};
         Slot* slot{};
+        kernel::resource::Sponsorship resident_sponsorship{};
     };
 
     struct Compare final {
@@ -244,10 +295,17 @@ class AnonymousBacking final : private libk::noncopyable_nonmovable {
     };
 
     struct PageHeader final {
-        explicit PageHeader(OwnedPage&& page) noexcept
-            : backing(libk::move(page)) {}
+        PageHeader(
+            OwnedPage&& page,
+            kernel::resource::Reservation&& charge) noexcept
+            : backing(libk::move(page)) {
+            if (charge) {
+                sponsorship.commit(libk::move(charge));
+            }
+        }
 
         OwnedPage backing{};
+        kernel::resource::Sponsorship sponsorship{};
         PageHeader* next{};
         Slot* free_head{};
         usize live_count{};
@@ -259,8 +317,11 @@ class AnonymousBacking final : private libk::noncopyable_nonmovable {
         (page_size - slot_offset) / sizeof(Slot);
 
 public:
-    AnonymousBacking(Pmm& pmm, AccessMask access) noexcept
-        : pmm_(&pmm), access_(access) {
+    AnonymousBacking(
+        Pmm& pmm,
+        AccessMask access,
+        kernel::resource::Sponsorship* sponsor) noexcept
+        : pmm_(&pmm), access_(access), sponsor_(sponsor) {
         static_assert(slots_per_page != 0);
     }
 
@@ -301,10 +362,14 @@ public:
                 continue;
             }
 
+            auto charge = reserve_page();
+            if (!charge) {
+                rollback(*candidate);
+                return libk::unexpected(charge.error());
+            }
             auto allocated = pmm_->allocate_page();
             if (!allocated) {
-                kernel::sync::IrqLockGuard guard{tree_lock_};
-                candidate->state = ContentState::Failed;
+                rollback(*candidate);
                 return libk::unexpected(MemoryError::OutOfMemory);
             }
             OwnedPage resident = libk::move(allocated).value();
@@ -314,6 +379,10 @@ public:
                 kernel::sync::IrqLockGuard guard{tree_lock_};
                 KASSERT(candidate->state == ContentState::Busy);
                 candidate->resident = libk::move(resident);
+                if (charge.value()) {
+                    candidate->resident_sponsorship.commit(
+                        libk::move(charge).value());
+                }
                 candidate->state = ContentState::Resident;
             }
             return libk::expected(MemoryPage{
@@ -337,7 +406,9 @@ public:
             if (node == nullptr) {
                 break;
             }
+            auto resident_refund = node->resident_sponsorship.detach();
             node->resident.reset();
+            resident_refund.complete();
             release(*node);
         }
 
@@ -352,9 +423,11 @@ public:
                 KASSERT(!slots[index].occupied);
                 libk::destroy_at(&slots[index]);
             }
+            auto refund = page->sponsorship.detach();
             OwnedPage backing = libk::move(page->backing);
             libk::destroy_at(page);
             backing.reset();
+            refund.complete();
         }
     }
 
@@ -405,6 +478,13 @@ private:
                 growing_ = true;
             }
 
+            auto charge = reserve_page();
+            if (!charge) {
+                kernel::sync::IrqLockGuard guard{storage_lock_};
+                KASSERT(growing_);
+                growing_ = false;
+                return libk::unexpected(charge.error());
+            }
             auto allocated = pmm_->allocate_page();
             if (!allocated) {
                 kernel::sync::IrqLockGuard guard{storage_lock_};
@@ -415,7 +495,8 @@ private:
             OwnedPage backing = libk::move(allocated).value();
             auto* const page = libk::construct_at(
                 reinterpret_cast<PageHeader*>(backing.bytes()),
-                libk::move(backing));
+                libk::move(backing),
+                libk::move(charge).value());
             auto* const slots = reinterpret_cast<Slot*>(
                 reinterpret_cast<usize>(page) + slot_offset);
             for (usize index = slots_per_page; index > 0; --index) {
@@ -447,6 +528,32 @@ private:
         --slot->page->live_count;
     }
 
+    void rollback(Node& node) noexcept {
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            KASSERT(tree_.find(node.index) == &node);
+            tree_.erase(node);
+        }
+        release(node);
+    }
+
+    [[nodiscard]] auto reserve_page() const noexcept
+        -> libk::Expected<kernel::resource::Reservation, MemoryError> {
+        if (sponsor_ == nullptr) {
+            return libk::expected(kernel::resource::Reservation{});
+        }
+        auto reserved = sponsor_->reserve(kernel::resource::Budget{
+            .memory = page_size,
+        });
+        if (!reserved) {
+            return libk::unexpected(
+                reserved.error() == kernel::resource::PoolError::Exhausted
+                    ? MemoryError::ResourceExhausted
+                    : MemoryError::InvalidState);
+        }
+        return libk::expected(libk::move(reserved).value());
+    }
+
     Pmm* pmm_{};
     AccessMask access_{};
     mutable libk::TicketSpinLock tree_lock_{};
@@ -454,12 +561,15 @@ private:
     Tree tree_{};
     PageHeader* pages_{};
     bool growing_{};
+    kernel::resource::Sponsorship* sponsor_{};
 };
 
 class ExtentBacking final : private libk::noncopyable_nonmovable {
 public:
-    explicit ExtentBacking(Pmm& pmm) noexcept
-        : extents_(pmm) {}
+    ExtentBacking(
+        Pmm& pmm,
+        kernel::resource::Sponsorship* sponsor) noexcept
+        : extents_(pmm, sponsor) {}
 
     ~ExtentBacking() noexcept { reset(); }
 
@@ -499,8 +609,10 @@ private:
 
 class BootBacking final : private libk::noncopyable_nonmovable {
 public:
-    explicit BootBacking(Pmm& pmm) noexcept
-        : extents_(pmm) {}
+    BootBacking(
+        Pmm& pmm,
+        kernel::resource::Sponsorship* sponsor) noexcept
+        : extents_(pmm, sponsor) {}
 
     ~BootBacking() noexcept { reset(); }
 
@@ -644,6 +756,28 @@ MemoryObject::MemoryObject(Pmm& pmm, usize byte_size) noexcept
     }
 }
 
+void MemoryObject::bind_sponsor(
+    kernel::resource::Sponsorship& sponsor) noexcept {
+    KASSERT(sponsor_ == nullptr && sponsor);
+    KASSERT(state_ == MemoryState::Building && backing_ == nullptr);
+    sponsor_ = &sponsor;
+}
+
+auto MemoryObject::reserve_dynamic(kernel::resource::Budget charge) noexcept
+    -> libk::Expected<kernel::resource::Reservation, MemoryError> {
+    if (sponsor_ == nullptr) {
+        return libk::expected(kernel::resource::Reservation{});
+    }
+    auto reserved = sponsor_->reserve(charge);
+    if (!reserved) {
+        return libk::unexpected(
+            reserved.error() == kernel::resource::PoolError::Exhausted
+                ? MemoryError::ResourceExhausted
+                : MemoryError::InvalidState);
+    }
+    return libk::expected(libk::move(reserved).value());
+}
+
 MemoryObject::~MemoryObject() noexcept {
     if (state_ == MemoryState::Building || state_ == MemoryState::Live) {
         retire();
@@ -653,6 +787,7 @@ MemoryObject::~MemoryObject() noexcept {
     KASSERT(backing_ == nullptr);
     KASSERT(backing_ops_ == nullptr);
     KASSERT(!backing_page_);
+    KASSERT(!backing_sponsorship_);
     KASSERT(operations_ == 0);
     KASSERT(attachments_.empty());
 }
@@ -703,9 +838,7 @@ auto MemoryObject::initialize_backing(
         return libk::unexpected(MemoryError::InvalidSize);
     }
     if (kind == BackingKind::Anonymous) {
-        if (!valid_access(anonymous.access)
-            || (anonymous.access.contains(Access::Execute)
-                && anonymous.access.contains(Access::Write))) {
+        if (!valid_access(anonymous.access)) {
             fail_build();
             return libk::unexpected(MemoryError::InvalidAccess);
         }
@@ -723,6 +856,13 @@ auto MemoryObject::initialize_backing(
         }
     }
 
+    auto backing_charge = reserve_dynamic(kernel::resource::Budget{
+        .memory = page_size,
+    });
+    if (!backing_charge) {
+        fail_build();
+        return libk::unexpected(backing_charge.error());
+    }
     auto allocated = pmm_->allocate_page();
     if (!allocated) {
         fail_build();
@@ -775,14 +915,15 @@ auto MemoryObject::initialize_backing(
         auto* const backing = libk::construct_at(
             static_cast<AnonymousBacking*>(backend),
             *pmm_,
-            anonymous.access);
+            anonymous.access,
+            sponsor_);
         ops = &anonymous_ops;
         backend = backing;
         break;
     }
     case BackingKind::Physical: {
         auto* const backing = libk::construct_at(
-            static_cast<ExtentBacking*>(backend), *pmm_);
+            static_cast<ExtentBacking*>(backend), *pmm_, sponsor_);
         ops = &physical_ops;
         backend = backing;
         initialized = backing->initialize(extents);
@@ -790,7 +931,7 @@ auto MemoryObject::initialize_backing(
     }
     case BackingKind::BootImage: {
         auto* const backing = libk::construct_at(
-            static_cast<BootBacking*>(backend), *pmm_);
+            static_cast<BootBacking*>(backend), *pmm_, sponsor_);
         ops = &boot_ops;
         backend = backing;
         initialized = backing->initialize(
@@ -810,7 +951,29 @@ auto MemoryObject::initialize_backing(
     backing_ = backend;
     backing_ops_ = ops;
     backing_page_ = libk::move(storage);
+    if (backing_charge.value()) {
+        backing_sponsorship_.commit(
+            libk::move(backing_charge).value());
+    }
     state_ = MemoryState::Live;
+    if (kind == BackingKind::Anonymous) {
+        access_ = anonymous.access;
+    } else {
+        u8 access_bits{};
+        for (const MemoryExtent& extent : extents) {
+            access_bits |= extent.access.raw();
+        }
+        access_ = AccessMask::from_raw(access_bits);
+    }
+    if (kind != BackingKind::Anonymous) {
+        for (const MemoryExtent& extent : extents) {
+            if (extent.access.contains(Access::Execute)) {
+                seal_ = SealState::Executable;
+                content_epoch_ = ContentEpoch{1};
+                break;
+            }
+        }
+    }
 
     if (kind == BackingKind::Anonymous && anonymous.eager) {
         for (usize index = 0; index < logical_pages_; ++index) {
@@ -834,6 +997,34 @@ auto MemoryObject::kind() const noexcept -> BackingKind {
 auto MemoryObject::state() const noexcept -> MemoryState {
     kernel::sync::IrqLockGuard guard{lock_};
     return state_;
+}
+
+auto MemoryObject::seal_state() const noexcept -> SealState {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return seal_;
+}
+
+auto MemoryObject::content_epoch() const noexcept -> ContentEpoch {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return content_epoch_;
+}
+
+auto MemoryObject::seal() noexcept -> libk::Expected<void, MemoryError> {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (state_ != MemoryState::Live || seal_ != SealState::Loadable) {
+        return libk::unexpected(MemoryError::InvalidState);
+    }
+    seal_ = SealState::Sealing;
+    for (const MemoryAttachment& attachment : attachments_) {
+        if (attachment.access_.contains(Access::Write)) {
+            seal_ = SealState::Loadable;
+            return libk::unexpected(MemoryError::Busy);
+        }
+    }
+    KASSERT(content_epoch_.raw != libk::numeric_limits<u64>::max());
+    content_epoch_ = ContentEpoch{content_epoch_.raw + 1};
+    seal_ = SealState::Executable;
+    return libk::expected();
 }
 
 auto MemoryObject::query(usize page_index) const noexcept
@@ -897,12 +1088,52 @@ auto MemoryObject::materialize(usize page_index) noexcept
     return libk::expected(PageLease{*this, result.value()});
 }
 
-auto MemoryObject::attach(MemoryAttachment& attachment) noexcept
+auto MemoryObject::read(usize offset, libk::Span<byte> output) noexcept
+    -> libk::Expected<void, MemoryError> {
+    const auto end = libk::checked_add(offset, output.size());
+    if (!end || *end > size()) {
+        return libk::unexpected(MemoryError::InvalidRange);
+    }
+    if (!access_.contains(Access::Read)) {
+        return libk::unexpected(MemoryError::InvalidAccess);
+    }
+
+    usize copied{};
+    while (copied < output.size()) {
+        const usize position = offset + copied;
+        const usize page_index = position / page_size;
+        const usize page_offset = position & (page_size - 1);
+        auto lease = materialize(page_index);
+        if (!lease) {
+            return libk::unexpected(lease.error());
+        }
+        const usize available = page_size - page_offset;
+        const usize remaining = output.size() - copied;
+        const usize amount = remaining < available ? remaining : available;
+        const byte* const source = pmm_->bytes(lease.value().page().page)
+            + page_offset;
+        memcpy(output.data() + copied, source, amount);
+        copied += amount;
+    }
+    return libk::expected();
+}
+
+auto MemoryObject::attach(
+    MemoryAttachment& attachment,
+    AccessMask access) noexcept
     -> libk::Expected<void, MemoryError> {
     kernel::sync::IrqLockGuard guard{lock_};
-    if (state_ != MemoryState::Live) {
+    if (state_ != MemoryState::Live || !valid_access(access)
+        || !access_.contains(access)) {
         return libk::unexpected(MemoryError::InvalidState);
     }
+    if ((access.contains(Access::Execute)
+            && seal_ != SealState::Executable)
+        || (access.contains(Access::Write)
+            && seal_ != SealState::Loadable)) {
+        return libk::unexpected(MemoryError::InvalidAccess);
+    }
+    KASSERT(!access.contains(Access::Execute) || content_epoch_.raw != 0);
     if (attachment.owner_ != nullptr
         || static_cast<MemoryAttachment::State>(
             attachment.state_.load<libk::MemoryOrder::Relaxed>())
@@ -913,6 +1144,7 @@ auto MemoryObject::attach(MemoryAttachment& attachment) noexcept
         return libk::unexpected(MemoryError::AttachmentState);
     }
     attachment.owner_ = this;
+    attachment.access_ = access;
     attachment.state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(MemoryAttachment::State::Attached));
     attachments_.push_back(attachment);
@@ -1030,7 +1262,9 @@ void MemoryObject::finish_retire() noexcept {
         KASSERT(ops != nullptr);
         ops->destroy(backing);
     }
+    auto backing_refund = backing_sponsorship_.detach();
     storage.reset();
+    backing_refund.complete();
 
     {
         kernel::sync::IrqLockGuard guard{lock_};

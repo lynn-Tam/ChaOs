@@ -45,7 +45,7 @@ auto handle_capability(
     Invocation& invocation) noexcept -> Result {
     cap::CSpace& cspace = invocation.cspace;
     arch::TrapContext& trap = invocation.trap;
-    Thread& thread = invocation.thread;
+    Thread* const thread = invocation.target.thread();
 
     if (operation == MYOS_SYS_CAP_CLOSE) {
         auto closed = cspace.close(handle_of(trap.arg(0)));
@@ -77,7 +77,10 @@ auto handle_capability(
         });
     }
     if (operation == MYOS_SYS_CAP_REVOKE) {
-        if (thread.waiting()) {
+        if (thread == nullptr) {
+            return returned(MYOS_STATUS_INVALID_OP);
+        }
+        if (thread->waiting()) {
             return returned(MYOS_STATUS_BUSY);
         }
         const cap::CapHandle source = handle_of(trap.arg(0));
@@ -87,15 +90,17 @@ auto handle_capability(
         KASSERT(invocation.cpu.runtime().owner_registry != nullptr);
         auto started = cspace.revoke(
             source,
-            thread,
+            *thread,
             *invocation.cpu.runtime().owner_registry,
             trap.arg(1) != 0);
         if (!started) {
             return returned(cap_status(started.error()));
         }
-        return started.value() == cap::RevokeState::Waiting
-            ? Result{MYOS_STATUS_OK, 0, Disposition::Block}
-            : returned(MYOS_STATUS_OK);
+        if (started.value() == kernel::operation::State::Waiting) {
+            return Result{MYOS_STATUS_OK, 0, Disposition::Block};
+        }
+        thread->resume_wait(trap);
+        return returned(MYOS_STATUS_OK);
     }
     if (operation == MYOS_SYS_OBJECT_DESTROY) {
         auto destroyed = cspace.destroy(handle_of(trap.arg(0)));

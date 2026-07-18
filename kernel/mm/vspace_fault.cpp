@@ -151,7 +151,7 @@ auto VSpace::materialize_fault(
         release_claim();
         return libk::unexpected(table_reserve.error());
     }
-    OwnedPageGroup tables = libk::move(table_reserve).value();
+    TableReserve tables = libk::move(table_reserve).value();
 
     const arch::InterruptState interrupts = arch::disable_interrupts();
     lock_.lock();
@@ -189,9 +189,9 @@ auto VSpace::materialize_fault(
     const auto virtual_page = VPage::from_base(page_address);
     KASSERT(virtual_page);
     auto installed = editor.map(
-        *virtual_page, page->page_, *permissions, tables);
+        *virtual_page, page->page_, *permissions, tables.pages);
     KASSERT(installed);
-    tables.reset();
+    commit_tables(tables);
     page->alias_.commit();
     page->source_.reset();
     page->pending_next_ = nullptr;
@@ -200,11 +200,17 @@ auto VSpace::materialize_fault(
     release_claim();
     auto& retire = retire_batch_.emplace(*pmm_);
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(),
+        libk::move(plan).value(),
+        retire,
+        mapping.access_.contains(Access::Execute));
     lock_.unlock();
     arch::restore_interrupts(interrupts);
     if (!committed) {
         return libk::unexpected(committed.error());
+    }
+    if (committed.value() == VmStatus::Complete) {
+        finish_authorities();
     }
     return libk::expected(FaultResult{
         .kind = FaultKind::Materialized,

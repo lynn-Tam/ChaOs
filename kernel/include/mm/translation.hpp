@@ -12,6 +12,7 @@
 #include <libk/sync/atomic.hpp>
 #include <libk/sync/ticket_spin_lock.hpp>
 #include <mm/pmm.hpp>
+#include <resource/sponsorship.hpp>
 #include <sync/completion.hpp>
 
 namespace kernel {
@@ -27,6 +28,20 @@ struct TranslationEpoch final {
 
     [[nodiscard]] friend constexpr auto operator==(
         TranslationEpoch, TranslationEpoch) noexcept -> bool = default;
+};
+
+// Per-address-space instruction visibility generation. It advances only when
+// executable PTEs become reachable; it is independent of ordinary TLB edits.
+struct InstructionEpoch final {
+    u64 raw{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        InstructionEpoch, InstructionEpoch) noexcept -> bool = default;
+};
+
+struct TranslationObservation final {
+    TranslationEpoch translation{};
+    InstructionEpoch instruction{};
 };
 
 enum class ShootdownError : u8 {
@@ -63,6 +78,10 @@ public:
     }
     [[nodiscard]] auto complete() const noexcept -> bool;
     [[nodiscard]] auto epoch() const noexcept -> TranslationEpoch;
+    [[nodiscard]] auto instruction_epoch() const noexcept -> InstructionEpoch;
+    [[nodiscard]] auto requires_instruction_sync() const noexcept -> bool {
+        return instruction_sync_;
+    }
     [[nodiscard]] auto targets() const noexcept -> const kernel::CpuSet&;
     [[nodiscard]] auto acknowledged(kernel::CpuId cpu) const noexcept -> bool;
 
@@ -75,6 +94,8 @@ private:
     void initialize(
         TranslationState& owner,
         TranslationEpoch epoch,
+        InstructionEpoch instruction_epoch,
+        bool instruction_sync,
         kernel::CpuSet targets) noexcept;
     void acknowledge(kernel::CpuId cpu) noexcept;
     [[nodiscard]] auto arm() noexcept -> bool { return completion_.arm(); }
@@ -84,6 +105,8 @@ private:
 
     TranslationState* owner_{};
     TranslationEpoch epoch_{};
+    InstructionEpoch instruction_epoch_{};
+    bool instruction_sync_{};
     kernel::CpuSet targets_{};
     libk::Atomic<u64> acknowledgements_[kernel::CpuSet::word_count]{};
     kernel::sync::Completion completion_;
@@ -100,6 +123,18 @@ public:
     [[nodiscard]] auto adopt(OwnedPage&& page) noexcept -> bool {
         return pages_.attach(libk::move(page));
     }
+    [[nodiscard]] auto adopt(
+        OwnedPage&& page,
+        kernel::resource::Charge&& charge) noexcept -> bool {
+        if (charge.budget() != kernel::resource::Budget{
+                .memory = page_size,
+            }
+            || !pages_.attach(libk::move(page))) {
+            return false;
+        }
+        charge_.merge(libk::move(charge));
+        return true;
+    }
     [[nodiscard]] auto empty() const noexcept -> bool {
         return pages_.page_count() == 0;
     }
@@ -113,6 +148,9 @@ private:
     friend class TranslationState;
     void bind(ShootdownTicket& ticket) noexcept;
 
+    // Declared before pages_ so reverse destruction frees physical pages
+    // before the corresponding capacity is refunded.
+    kernel::resource::Charge charge_{};
     OwnedPageGroup pages_;
     ShootdownTicket* ticket_{};
     TranslationState* owner_{};
@@ -209,11 +247,12 @@ public:
         [[nodiscard]] auto commit(
             ShootdownPlan&& plan,
             ShootdownTicket& ticket,
-            RetireBatch* retire = nullptr) noexcept -> ShootdownStatus;
+            RetireBatch* retire = nullptr,
+            bool instruction_sync = false) noexcept -> ShootdownStatus;
         // Publishes mappings at a virtual range that has never been visible
         // and will never be rebound to different backing. No remote CPU can
         // hold a stale translation for this operation.
-        void publish_fresh() noexcept;
+        void publish_fresh(bool instruction_sync = false) noexcept;
         void abort() noexcept { unlock(); }
 
     private:
@@ -234,12 +273,14 @@ public:
     TranslationState() noexcept = default;
     ~TranslationState() noexcept;
 
-    [[nodiscard]] auto enter(kernel::CpuId cpu) noexcept -> TranslationEpoch;
+    [[nodiscard]] auto enter(kernel::CpuId cpu) noexcept
+        -> TranslationObservation;
     void leave(kernel::CpuId cpu) noexcept;
     [[nodiscard]] auto begin() noexcept
         -> libk::Expected<Mutation, ShootdownError>;
 
     [[nodiscard]] auto epoch() const noexcept -> TranslationEpoch;
+    [[nodiscard]] auto observation() const noexcept -> TranslationObservation;
     [[nodiscard]] auto active_cpus() const noexcept -> kernel::CpuSet;
     [[nodiscard]] auto pending_tickets() const noexcept -> usize {
         return pending_tickets_.load<libk::MemoryOrder::Acquire>();
@@ -258,6 +299,7 @@ private:
     mutable libk::TicketSpinLock lock_{};
     kernel::CpuSet active_{};
     TranslationEpoch epoch_{};
+    InstructionEpoch instruction_epoch_{};
     libk::Atomic<usize> pending_tickets_{};
     libk::Atomic<usize> pending_retires_{};
 };

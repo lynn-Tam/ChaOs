@@ -20,7 +20,7 @@ struct DispatchRecord final {
     time::Instant deadline{time::Instant::max()};
     usize ready_count{};
     usize timer_count{};
-    usize wake_count{};
+    usize remote_count{};
 };
 
 // Per-CPU bounded diagnostic projection. CpuDispatcher is the only producer

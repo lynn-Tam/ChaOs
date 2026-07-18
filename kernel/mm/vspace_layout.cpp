@@ -201,7 +201,15 @@ auto VSpace::create_region(
         release_claim();
         return libk::unexpected(VSpaceError::InvalidState);
     }
+    auto grant_charge = source.source().reserve_grant();
+    if (!grant_charge) {
+        regions_.destroy(*child);
+        kernel::sync::IrqLockGuard guard{lock_};
+        release_claim();
+        return libk::unexpected(VSpaceError::ResourceExhausted);
+    }
     auto grant = source.derive_region(
+        libk::move(grant_charge).value(),
         libk::move(target).value(),
         ceiling,
         cap::RegionDerivation{
@@ -322,7 +330,7 @@ void VSpace::dismantle_region(
             current->children_.erase(*child);
             if (child->kind_ == LayoutKind::Mapping) {
                 auto& mapping = static_cast<Mapping&>(*child);
-                invalidate_ipc(mapping);
+                invalidate_views(mapping);
                 MappingAuthority& authority = *mapping.authority_;
                 MappedPage* page = authority.pages_.lower_bound(
                     mapping.range_.base());
@@ -335,7 +343,7 @@ void VSpace::dismantle_region(
                     auto unmapped = editor.unmap(*virtual_page);
                     KASSERT(unmapped);
                     while (auto table = unmapped.value().tables.take()) {
-                        KASSERT(retire.adopt(libk::move(*table)));
+                        retire_table(retire, libk::move(*table));
                     }
                     queue_page(*page);
                     page = next;
@@ -407,12 +415,16 @@ auto VSpace::start_region_destroy(
         KASSERT(finish_pending());
         lock_.unlock();
         arch::restore_interrupts(interrupts);
+        finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
     lock_.unlock();
     arch::restore_interrupts(interrupts);
+    if (committed && committed.value() == VmStatus::Complete) {
+        finish_authorities();
+    }
     return committed;
 }
 

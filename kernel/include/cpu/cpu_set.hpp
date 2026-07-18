@@ -5,11 +5,6 @@
 
 namespace kernel {
 
-// Stage D deliberately bounds the logical CPU namespace.  Firmware IDs may
-// remain sparse and arbitrarily large; only the dense logical IDs published by
-// CpuRegistry enter scheduler and translation state.
-inline constexpr usize max_cpu_count = 256;
-
 class CpuSet final {
 public:
     static constexpr usize word_bits = sizeof(u64) * 8;

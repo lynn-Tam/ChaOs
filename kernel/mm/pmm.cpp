@@ -889,23 +889,23 @@ auto Pmm::take_boot_reservation_for(PageRange range) noexcept
 auto Pmm::reclaim(BootReservation&& reservation) noexcept -> ReclaimResult {
     kernel::sync::IrqLockGuard guard{lock_};
     if (reservation.owner_.get() != this) {
-        return libk::unexpected(BootReclaimError::WrongOwner);
+        return libk::unexpected(BootReservationError::WrongOwner);
     }
     if (reservation.id_ >= reservations_.size()
         || reservations_[reservation.id_].state != ReservationState::Issued) {
-        return libk::unexpected(BootReclaimError::InvalidReservation);
+        return libk::unexpected(BootReservationError::InvalidReservation);
     }
 
     const ReservationId id{reservation.id_};
     for (const Page page : reservation.range_) {
         Arena* arena = find_arena(page);
         if (arena == nullptr) {
-            return libk::unexpected(BootReclaimError::InvalidReservation);
+            return libk::unexpected(BootReservationError::InvalidReservation);
         }
         const FrameDesc& descriptor = descriptor_at(*arena, index_of(*arena, page));
         if (descriptor.state != FrameDescState::Reserved
             || descriptor.data.reserved.reservation != id) {
-            return libk::unexpected(BootReclaimError::InvalidReservation);
+            return libk::unexpected(BootReservationError::InvalidReservation);
         }
     }
 
@@ -918,12 +918,61 @@ auto Pmm::reclaim(BootReservation&& reservation) noexcept -> ReclaimResult {
         push_free(arena, index);
     }
 
-    reservations_[reservation.id_].state = ReservationState::Reclaimed;
+    reservations_[reservation.id_].state = ReservationState::Consumed;
     --issued_reservations_;
     const size_t reclaimed = reservation.range_.page_count();
     reservation.disarm();
     KASSERT(verify_invariants_unlocked());
     return libk::expected(reclaimed);
+}
+
+auto Pmm::adopt(BootReservation&& reservation) noexcept -> AdoptResult {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (reservation.owner_.get() != this) {
+        return libk::unexpected(BootReservationError::WrongOwner);
+    }
+    if (reservation.id_ >= reservations_.size()
+        || reservations_[reservation.id_].state != ReservationState::Issued) {
+        return libk::unexpected(BootReservationError::InvalidReservation);
+    }
+
+    const ReservationId reservation_id{reservation.id_};
+    for (const Page page : reservation.range_) {
+        Arena* const arena = find_arena(page);
+        if (arena == nullptr) {
+            return libk::unexpected(
+                BootReservationError::InvalidReservation);
+        }
+        const FrameDesc& descriptor = descriptor_at(
+            *arena, index_of(*arena, page));
+        if (descriptor.state != FrameDescState::Reserved
+            || descriptor.data.reserved.reservation != reservation_id) {
+            return libk::unexpected(
+                BootReservationError::InvalidReservation);
+        }
+    }
+
+    const GroupId group_id = next_group_id();
+    OwnedPageGroup pages{*this, group_id};
+    ++outstanding_groups_;
+    for (const Page page : reservation.range_) {
+        Arena& arena = *find_arena(page);
+        FrameDesc& descriptor = descriptor_at(
+            arena, index_of(arena, page));
+        const uint32_t generation = descriptor.data.reserved.generation;
+        descriptor = FrameDesc::group(
+            group_id, pages.head_, generation);
+        pages.head_ = global_frame_id_of(page);
+        ++pages.page_count_;
+        ++outstanding_pages_;
+        ++outstanding_group_pages_;
+    }
+
+    reservations_[reservation.id_].state = ReservationState::Consumed;
+    --issued_reservations_;
+    reservation.disarm();
+    KASSERT(verify_invariants_unlocked());
+    return libk::expected(libk::move(pages));
 }
 
 auto Pmm::cancel(BootReservation& reservation) noexcept -> void {
@@ -1102,7 +1151,7 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
                     descriptor.data.reserved.reservation;
                 if (reservation.raw() >= reservations_.size()
                     || reservations_[reservation.raw()].state
-                        == ReservationState::Reclaimed) {
+                        == ReservationState::Consumed) {
                     return false;
                 }
             }
@@ -1125,7 +1174,7 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
         if (reservation.state == ReservationState::Issued) {
             ++issued;
         }
-        if (reservation.state == ReservationState::Reclaimed) {
+        if (reservation.state == ReservationState::Consumed) {
             continue;
         }
         for (const Page page : reservation.range) {
