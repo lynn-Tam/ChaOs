@@ -2,10 +2,11 @@
 
 #include <stdint.h>
 #include <uapi/capability.h>
+#include <uapi/ipc.h>
 #include <uapi/types.h>
 
-#define MYOS_VPROC_START_VERSION 1U
-#define MYOS_VPROC_RUNTIME_VERSION 1U
+#define MYOS_VPROC_START_VERSION 2U
+#define MYOS_VPROC_RUNTIME_VERSION 3U
 #define MYOS_VPROC_ARM_VERSION 1U
 #define MYOS_VPROC_CONTEXT_WORDS 32U
 #define MYOS_VPROC_MAX_OPERATIONS 32U
@@ -39,6 +40,7 @@ struct myos_vproc_start {
     myos_cap_t event_memory;
     myos_word_t event_page;
     myos_word_t event_address;
+    struct myos_ipc_binding ipc;
 };
 
 // Submitted by the current Vproc after bootstrap has initialized its runtime.
@@ -70,6 +72,8 @@ struct myos_vproc_control_page {
     myos_word_t resume_generation;
     myos_word_t resume_flags;
     struct myos_user_context resume;
+    myos_operation_key_t operation_key;
+    struct myos_user_context operation_context;
 };
 
 // User read-only projection.  Operation slots in the kernel remain canonical;
@@ -80,7 +84,14 @@ struct myos_vproc_event_page {
     myos_word_t pending_sequence;
     myos_word_t active_generation;
     uint64_t ready_mask;
+    uint64_t offer_mask;
+    // A set bit means delivered contains the caller continuation whose direct
+    // Endpoint call first became suspendable. It remains stable until the
+    // active generation is returned.
+    uint64_t handoff_mask;
     uint64_t ingress_mask;
+    myos_operation_key_t operation_key[MYOS_VPROC_MAX_OPERATIONS];
+    myos_word_t operation_cookie[MYOS_VPROC_MAX_OPERATIONS];
     uint64_t ingress_sequence[MYOS_VPROC_MAX_INGRESS];
     myos_word_t ingress_tag[MYOS_VPROC_MAX_INGRESS];
     struct myos_user_context delivered;

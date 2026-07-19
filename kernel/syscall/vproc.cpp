@@ -183,8 +183,22 @@ auto handle_vproc(usize operation, Invocation& invocation) noexcept -> Result {
     }
     case MYOS_SYS_VPROC_CHECKPOINT:
         return returned(MYOS_STATUS_OK, vproc->pending_sequence());
-    case MYOS_SYS_OPERATION_TAKE: {
-        auto result = vproc->take_operation(
+    case MYOS_SYS_OPERATION_POLL: {
+        auto result = vproc->poll_operation(
+            operation::Key{invocation.trap.arg(0)});
+        return result
+            ? returned(result.value().status, result.value().value)
+            : returned(error_status(result.error()));
+    }
+    case MYOS_SYS_OPERATION_CANCEL: {
+        auto canceled = vproc->cancel_operation(
+            operation::Key{invocation.trap.arg(0)});
+        return canceled
+            ? returned(MYOS_STATUS_OK)
+            : returned(error_status(canceled.error()));
+    }
+    case MYOS_SYS_OPERATION_FINISH: {
+        auto result = vproc->finish_operation(
             operation::Key{invocation.trap.arg(0)});
         return result
             ? returned(result.value().status, result.value().value)

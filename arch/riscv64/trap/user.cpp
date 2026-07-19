@@ -1,6 +1,8 @@
 #include <arch/user.hpp>
+#include <arch/trap.hpp>
 
 #include "arch/riscv64/cpu/csr.hpp"
+#include "arch/riscv64/trap/context.hpp"
 #include "arch/riscv64/trap/trapframe.hpp"
 
 #include <mm/virtual_layout.hpp>
@@ -65,6 +67,17 @@ auto prepare_user_stack(
     // field remain clear; user input never contributes raw status bits.
     frame->sstatus = riscv64::Sstatus::SPIE;
     return reinterpret_cast<usize>(frame);
+}
+
+auto prepare_user_frame(
+    usize kernel_stack_top,
+    UserStart start) noexcept -> libk::optional<UserFrame> {
+    const auto frame = prepare_user_stack(kernel_stack_top, start);
+    return frame
+        ? libk::optional<UserFrame>{
+              riscv64::make_user_frame(
+                  *reinterpret_cast<riscv64::TrapFrame*>(*frame))}
+        : libk::nullopt;
 }
 
 [[noreturn]] void resume_user(usize home_stack_top) noexcept {

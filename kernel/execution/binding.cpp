@@ -72,7 +72,7 @@ auto ExecutionBinding::user(
     object::ObjectRef&& vspace_ref,
     object::ObjectRef&& cspace_ref,
     FaultRoute route,
-    libk::optional<kernel::mm::UserViewRequest> ipc) noexcept
+    libk::optional<kernel::ipc::Buffer> ipc) noexcept
     -> libk::Expected<ExecutionBinding, ExecutionError> {
     if (!vspace_ref || !cspace_ref
         || vspace_ref.kind() != object::ObjectKind::VSpace
@@ -100,11 +100,10 @@ auto ExecutionBinding::user(
         cspace,
         route};
     if (ipc) {
-        auto bound = vspace.bind_view(libk::move(*ipc));
-        if (!bound) {
+        if (!ipc->valid()) {
             return libk::unexpected(ExecutionError::InvalidIpcBuffer);
         }
-        roots.ipc.emplace(libk::move(bound).value());
+        roots.ipc.emplace(libk::move(*ipc));
     }
     return libk::expected(ExecutionBinding{libk::move(roots)});
 }
@@ -153,8 +152,14 @@ auto ExecutionBinding::fault_route() const noexcept -> FaultRoute {
     return roots->fault;
 }
 
+auto ExecutionBinding::ipc_buffer() noexcept
+    -> kernel::ipc::Buffer* {
+    auto* const roots = libk::get_if<UserRoots>(&roots_);
+    return roots != nullptr && roots->ipc ? &*roots->ipc : nullptr;
+}
+
 auto ExecutionBinding::ipc_buffer() const noexcept
-    -> const kernel::mm::UserView* {
+    -> const kernel::ipc::Buffer* {
     const auto* const roots = libk::get_if<UserRoots>(&roots_);
     return roots != nullptr && roots->ipc ? &*roots->ipc : nullptr;
 }

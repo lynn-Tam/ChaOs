@@ -1,9 +1,10 @@
 #pragma once
 
 #include <stdint.h>
+#include <uapi/ipc.h>
 #include <uapi/types.h>
 
-#define MYOS_THREAD_START_VERSION 1U
+#define MYOS_THREAD_START_VERSION 2U
 
 // Immutable constructor snapshot read from an authorized MemoryObject. The
 // kernel never follows a transient user pointer while building a Thread.
@@ -13,4 +14,5 @@ struct myos_thread_start {
     myos_word_t entry;
     myos_word_t stack;
     myos_word_t arguments[6];
+    struct myos_ipc_binding ipc;
 };

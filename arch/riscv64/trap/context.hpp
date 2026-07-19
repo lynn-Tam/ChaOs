@@ -10,5 +10,8 @@
 namespace arch::riscv64 {
 
 [[nodiscard]] auto make_context(TrapFrame& frame) noexcept -> arch::TrapContext;
+[[nodiscard]] auto make_user_frame(TrapFrame& frame) noexcept
+    -> arch::UserFrame;
+[[nodiscard]] auto raw_frame(arch::UserFrame frame) noexcept -> TrapFrame*;
 
 } // namespace arch::riscv64

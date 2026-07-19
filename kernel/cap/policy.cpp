@@ -1,5 +1,7 @@
 #include <cap/policy.hpp>
 
+#include <uapi/endpoint.h>
+
 namespace kernel::cap {
 
 namespace {
@@ -44,6 +46,18 @@ constexpr Rights notification_rights = Rights::of(
     Right::Destroy,
     Right::Revoke);
 
+constexpr Rights endpoint_rights = Rights::of(
+    Right::Duplicate,
+    Right::Delegate,
+    Right::Inspect,
+    Right::Call,
+    Right::Close,
+    Right::Destroy,
+    Right::Revoke);
+
+constexpr u64 endpoint_modes = MYOS_ENDPOINT_MODE_BLOCK
+    | MYOS_ENDPOINT_MODE_ASYNC;
+
 [[nodiscard]] auto valid(MemoryAuthority authority) noexcept -> bool {
     return authority.range.end().has_value()
         && kernel::mm::valid_access(authority.access)
@@ -65,6 +79,13 @@ constexpr Rights notification_rights = Rights::of(
         ((u64{1} << static_cast<u16>(object::ObjectKind::Count)) - 1)
         & ~u64{1};
     return (authority.object_kinds & ~valid_kinds) == 0;
+}
+
+[[nodiscard]] auto valid(EndpointAuthority authority) noexcept -> bool {
+    return (authority.badge & ~authority.fixed) == 0
+        && authority.cap_limit <= MYOS_ENDPOINT_MAX_CAPS
+        && authority.modes != 0
+        && (authority.modes & ~endpoint_modes) == 0;
 }
 
 template<object::ObjectKind Kind>
@@ -203,6 +224,38 @@ auto CapabilityPolicy<object::ObjectKind::Notification>::compose(
         ceiling.rights.intersect(view.rights), *local});
 }
 
+auto CapabilityPolicy<object::ObjectKind::Endpoint>::validate(
+    GrantCeiling ceiling) noexcept -> bool {
+    const auto* const data = libk::get_if<EndpointAuthority>(&ceiling.data);
+    return endpoint_rights.contains(ceiling.rights)
+        && data != nullptr && valid(*data);
+}
+
+auto CapabilityPolicy<object::ObjectKind::Endpoint>::compose(
+    GrantCeiling ceiling,
+    CapView view) noexcept
+    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    if (!endpoint_rights.contains(ceiling.rights)
+        || !endpoint_rights.contains(view.rights)) {
+        return libk::unexpected(PolicyError::InvalidRights);
+    }
+    const auto* const upper = libk::get_if<EndpointAuthority>(&ceiling.data);
+    const auto* const local = libk::get_if<EndpointAuthority>(&view.data);
+    if (upper == nullptr || local == nullptr
+        || !valid(*upper) || !valid(*local)) {
+        return libk::unexpected(PolicyError::InvalidData);
+    }
+    if (!ceiling.rights.contains(view.rights)
+        || (local->fixed & upper->fixed) != upper->fixed
+        || (local->badge & upper->fixed) != upper->badge
+        || local->cap_limit > upper->cap_limit
+        || (local->modes & ~upper->modes) != 0) {
+        return libk::unexpected(PolicyError::Amplification);
+    }
+    return libk::expected(EffectiveAuthority{
+        ceiling.rights.intersect(view.rights), *local});
+}
+
 auto validate_ceiling(
     object::ObjectKind kind,
     GrantCeiling ceiling) noexcept -> bool {
@@ -232,6 +285,8 @@ auto validate_ceiling(
             object::ObjectKind::Notification>::validate(ceiling);
     case object::ObjectKind::Tunnel:
         return CapabilityPolicy<object::ObjectKind::Tunnel>::validate(ceiling);
+    case object::ObjectKind::Endpoint:
+        return CapabilityPolicy<object::ObjectKind::Endpoint>::validate(ceiling);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return false;
@@ -265,6 +320,8 @@ auto compose(
         return compose_as<object::ObjectKind::Notification>(ceiling, view);
     case object::ObjectKind::Tunnel:
         return compose_as<object::ObjectKind::Tunnel>(ceiling, view);
+    case object::ObjectKind::Endpoint:
+        return compose_as<object::ObjectKind::Endpoint>(ceiling, view);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return libk::unexpected(PolicyError::UnsupportedKind);

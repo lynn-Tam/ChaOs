@@ -8,6 +8,24 @@ namespace arch {
 struct TrapContextAccess;
 struct UserStart;
 
+// Opaque identity of a complete user return frame resident on a kernel-owned
+// stack.  The kernel may retain and later restore this token, but selected-arch
+// code remains the only layer that knows the frame layout.
+class UserFrame final {
+public:
+    UserFrame() noexcept = default;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return raw_ != nullptr;
+    }
+
+private:
+    friend struct TrapContextAccess;
+    explicit UserFrame(void* raw) noexcept : raw_(raw) {}
+
+    void* raw_{};
+};
+
 struct TrapSnapshot final {
     usize gpr[31]{};
     usize pc{};
@@ -42,6 +60,9 @@ public:
         const myos_user_context& input) noexcept -> bool;
     [[nodiscard]] auto load_user_start(
         const UserStart& start) noexcept -> bool;
+
+    [[nodiscard]] auto frame() const noexcept -> UserFrame;
+    void redirect(UserFrame frame) noexcept;
 
 private:
     friend struct TrapContextAccess;

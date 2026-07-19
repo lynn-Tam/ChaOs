@@ -49,6 +49,8 @@ public:
     [[nodiscard]] auto ready_count() const noexcept -> usize {
         return policy_.ready_count();
     }
+    [[nodiscard]] auto remaining_budget() const noexcept -> time::Duration;
+    [[nodiscard]] auto current_urgency() const noexcept -> Urgency;
 
     [[noreturn]] void enter_idle() noexcept;
     void on_context_enter() noexcept;
@@ -72,6 +74,9 @@ public:
     void request_reschedule(DispatchReason reason) noexcept;
     void on_timer() noexcept;
     void on_trap_exit() noexcept;
+    // Re-publishes the current Execution's derived effective stack and roots
+    // after an Activation push/pop. It does not change target or SC ownership.
+    void refresh() noexcept;
     void disable_preemption() noexcept;
     void enable_preemption() noexcept;
     void dump_trace() const noexcept;

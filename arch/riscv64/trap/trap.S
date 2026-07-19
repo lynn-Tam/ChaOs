@@ -127,6 +127,9 @@ arch_riscv64_trap_entry:
     */
     mv a0, sp
     call arch_riscv64_trap_exit
+    // The selected-arch exit hook may redirect this return to a synthetic
+    // frame on another guarded kernel stack (Endpoint Activation).
+    mv sp, a0
 
 .Lrestore_frame:
     //NOTE: sepc和sstatus要写回csr,因为sret真正依赖他们

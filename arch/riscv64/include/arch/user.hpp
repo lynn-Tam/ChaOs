@@ -7,6 +7,8 @@
 
 namespace arch {
 
+class UserFrame;
+
 struct UserStart final {
     kernel::mm::VirtAddr entry{};
     kernel::mm::VirtAddr stack{};
@@ -22,6 +24,13 @@ struct UserStart final {
 [[nodiscard]] auto prepare_user_stack(
     usize home_stack_top,
     UserStart start) noexcept -> libk::optional<usize>;
+
+// Constructs a return frame and exposes only its architecture-neutral token.
+// Unlike prepare_user_stack(), this is used by cross-domain activations whose
+// trap return must move to a different kernel stack.
+[[nodiscard]] auto prepare_user_frame(
+    usize kernel_stack_top,
+    UserStart start) noexcept -> libk::optional<UserFrame>;
 
 // Restores the synthetic frame at home_stack_top and enters U-mode. Later
 // traps use the same assembly restore path with a real frame in the same stack.

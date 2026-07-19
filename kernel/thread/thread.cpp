@@ -23,6 +23,7 @@ Thread::Thread(
     KASSERT(execution_.binding().kernel_bound());
     KASSERT(start.entry != nullptr);
     execution_.prepare(&Thread::start, this, execution_.stack_top());
+    execution_.bind_wait(wait_);
 }
 
 Thread::Thread(
@@ -56,12 +57,13 @@ Thread::Thread(
         execution_.stack_top(), start);
     KASSERT(kernel_stack_top);
     execution_.prepare(&Thread::start, this, *kernel_stack_top);
+    execution_.bind_wait(wait_);
 }
 
 Thread::~Thread() noexcept {
     KASSERT(execution_.state_ != State::Running);
     KASSERT(execution_.scheduler_binding_ == nullptr);
-    KASSERT(wait_ == nullptr);
+    KASSERT(!wait_.attached());
     KASSERT(stops_.empty() && execution_.home_ == nullptr);
 }
 
@@ -88,35 +90,29 @@ auto Thread::authorize(
 auto Thread::begin_wait(
     operation::Completion& relation,
     CpuRegistry& cpus) noexcept -> bool {
-    if (wait_ != nullptr || relation.attached()
-        || execution_.scheduler_binding_ == nullptr) {
+    if (execution_.scheduler_binding_ == nullptr) {
         return false;
     }
-    relation.attach(*this, cpus);
-    wait_ = &relation;
-    return true;
+    return wait_.begin(relation, cpus, *execution_.scheduler_binding_);
 }
 
 auto Thread::wait_ready() const noexcept -> bool {
-    return wait_ != nullptr && wait_->complete();
+    return wait_.ready();
 }
 
 void Thread::resume_wait(arch::TrapContext& trap) noexcept {
-    operation::Completion* const relation = libk::exchange(wait_, nullptr);
-    KASSERT(relation != nullptr && relation->complete());
-    relation->finish(trap);
+    wait_.finish(trap);
 }
 
 void Thread::cancel_wait() noexcept {
-    operation::Completion* const relation = libk::exchange(wait_, nullptr);
-    KASSERT(relation != nullptr && relation->cancel());
+    KASSERT(wait_.cancel());
 }
 
 auto Thread::prepare_retire() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{stop_lock_};
     return (execution_.state_ == State::Prepared
             || execution_.state_ == State::Exited)
-        && execution_.scheduler_binding_ == nullptr && wait_ == nullptr
+        && execution_.scheduler_binding_ == nullptr && !wait_.attached()
         && execution_.home_ == nullptr && !authority_.active()
         && (execution_.binding().kernel_bound()
             || execution_.binding().detached());

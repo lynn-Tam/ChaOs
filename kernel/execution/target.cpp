@@ -49,11 +49,14 @@ auto Target::identity() const noexcept -> usize {
 
 auto Target::stop_deferred() const noexcept -> bool {
     if (Thread* const value = thread()) {
-        return value->wait_ != nullptr;
+        operation::Wait* const wait = value->execution_.wait();
+        return value->execution_.active_frame() != nullptr
+            || (wait != nullptr && wait->attached());
     }
     Vproc* const value = vproc();
     return value != nullptr
-        && (value->pending_operations() || !value->activation_quiescent());
+        && (value->execution_.active_frame() != nullptr
+            || value->pending_operations() || !value->activation_quiescent());
 }
 
 auto Target::stop_requested() const noexcept -> bool {
@@ -87,12 +90,16 @@ auto Target::stop_ready() const noexcept -> bool {
                 }
             }
             return value->activation_publishers_ == 0
+                && value->execution_.active_frame() == nullptr
                 && !value->activation_request_held_
                 && !value->activation_posting_
                 && !value->activation_.pending();
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
-            return value->stop_requested_ && value->wait_ == nullptr;
+            operation::Wait* const wait = value->execution_.wait();
+            return value->stop_requested_
+                && value->execution_.active_frame() == nullptr
+                && (wait == nullptr || !wait->attached());
         }
     }, value_);
 }

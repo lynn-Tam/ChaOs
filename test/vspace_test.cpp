@@ -539,19 +539,22 @@ bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
         if (!vspace || !cspace || !memory) {
             return false;
         }
-        kernel::mm::UserViewRequest request{
-            .memory = libk::move(memory).value(),
-            .object = kernel::mm::ObjectRange{0, 1},
-            .virtual_range = kernel::mm::VirtRange{
-                whole.base(), kernel::mm::page_size},
-            .access = kernel::mm::AccessMask::of(
-                kernel::mm::Access::Read, kernel::mm::Access::Write),
-        };
+        auto ipc = kernel::ipc::Buffer::bind(
+            fixture.pmm(),
+            fixture.space(),
+            libk::move(memory).value(),
+            fixture.memory(),
+            kernel::mm::ObjectRange{0, 1},
+            kernel::mm::VirtRange{whole.base(), kernel::mm::page_size});
+        if (!ipc) {
+            return false;
+        }
         auto binding = kernel::ExecutionBinding::user(
             libk::move(vspace).value(),
             libk::move(cspace).value(),
             kernel::FaultRoute::Terminate,
-            libk::optional<kernel::mm::UserViewRequest>{libk::move(request)});
+            libk::optional<kernel::ipc::Buffer>{
+                libk::move(ipc).value()});
         if (!binding || binding.value().ipc_buffer() == nullptr
             || !binding.value().ipc_buffer()->valid()) {
             return false;

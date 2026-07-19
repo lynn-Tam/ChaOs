@@ -41,6 +41,7 @@
 #define MYOS_SYS_NOTIFICATION_CREATE   54 /* a1=immutable signal badge */
 #define MYOS_SYS_VPROC_CREATE          55 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
 #define MYOS_SYS_TUNNEL_OPEN           56 /* a0=pool, a1=slot, a2=tag; target=current Vproc */
+#define MYOS_SYS_ENDPOINT_CREATE        57 /* a1=VSpace, a2=CSpace, a3=descriptor memory, a4=offset */
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
@@ -52,9 +53,17 @@
 #define MYOS_SYS_VPROC_ARM             96 /* a0=descriptor MemoryObject, a1=byte offset */
 #define MYOS_SYS_VPROC_RETURN          97 /* a0=active generation; resumes submitted context */
 #define MYOS_SYS_VPROC_CHECKPOINT      98 /* safe delivery boundary; returns pending sequence */
-#define MYOS_SYS_OPERATION_TAKE        99 /* a0=OperationKey */
+#define MYOS_SYS_OPERATION_POLL        99 /* a0=OperationKey; non-consuming */
+#define MYOS_SYS_OPERATION_CANCEL     100 /* a0=OperationKey; pre-commit only */
+#define MYOS_SYS_OPERATION_FINISH     101 /* a0=OperationKey; consumes result */
 
 #define MYOS_SYS_TUNNEL_CONNECT       104 /* a0=Connect authority; source=current Vproc */
 #define MYOS_SYS_TUNNEL_INVOKE        105 /* a0=Tunnel Tx; caller must be source Vproc */
 #define MYOS_SYS_TUNNEL_ACK           106 /* a0=receiver cap, a1=observed sequence */
 #define MYOS_SYS_TUNNEL_CLOSE         107 /* a0=Tunnel Admin or Tx */
+
+#define MYOS_SYS_ENDPOINT_CALL        112 /* a0=Endpoint, a1=mode, a2=cookie, a3-a5=service words */
+#define MYOS_SYS_ENDPOINT_REPLY       113 /* a0=status, a1=value */
+#define MYOS_SYS_ENDPOINT_CLOSE       114 /* a0=Endpoint */
+#define MYOS_SYS_ENDPOINT_ENTER       115 /* a0=Endpoint, a1=offered OperationKey */
+#define MYOS_SYS_ENDPOINT_MINT        116 /* a0=root, a1=dest CSpace, a2=badge, a3=cap limit, a4=modes, a5=rights */

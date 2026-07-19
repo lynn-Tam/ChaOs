@@ -16,6 +16,7 @@
 #include <libk/variant.hpp>
 #include <sched/remote_queue.hpp>
 #include <trap/event.hpp>
+#include <operation/wait.hpp>
 
 namespace kernel {
 
@@ -105,7 +106,7 @@ public:
         return user_syscalls_;
     }
     [[nodiscard]] auto waiting() const noexcept -> bool {
-        return wait_ != nullptr;
+        return wait_.attached();
     }
     [[nodiscard]] auto wait_ready() const noexcept -> bool;
     [[nodiscard]] auto begin_wait(
@@ -135,7 +136,7 @@ private:
     libk::variant<KernelStart, UserStart> start_;
     Kind kind_{Kind::Normal};
     libk::optional<kernel::trap::Event> user_fault_{};
-    operation::Completion* wait_{};
+    operation::Wait wait_{};
     u64 user_syscalls_{};
     mutable libk::TicketSpinLock stop_lock_{};
     StopList stops_{};

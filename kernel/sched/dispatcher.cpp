@@ -17,6 +17,7 @@
 #include <libk/limits.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>
+#include <operation/wait.hpp>
 
 namespace kernel::sched {
 
@@ -35,6 +36,16 @@ CpuDispatcher::CpuDispatcher(
     timer_available_ = arch::timer_available();
     ipi_available_ = arch::ipi_available();
     cpu_->dispatcher_ = this;
+}
+
+auto CpuDispatcher::remaining_budget() const noexcept -> time::Duration {
+    KASSERT(current_binding_ != nullptr);
+    return current_binding_->context().available(clock_->now());
+}
+
+auto CpuDispatcher::current_urgency() const noexcept -> Urgency {
+    KASSERT(current_binding_ != nullptr);
+    return current_binding_->context().urgency();
 }
 
 void CpuDispatcher::publish(execution::Target target) noexcept {
@@ -83,6 +94,12 @@ void CpuDispatcher::on_context_enter() noexcept {
         arch::enable_ipi();
     }
     arch::enable_interrupts();
+}
+
+void CpuDispatcher::refresh() noexcept {
+    KASSERT(!arch::interrupts_enabled());
+    KASSERT(current_ && cpu_->current_execution_ == &current_.execution());
+    publish(current_);
 }
 
 auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
@@ -689,6 +706,19 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
     KASSERT(!arch::interrupts_enabled());
     KASSERT(target.owned_by(*this));
     Execution& execution = target.execution();
+
+    if (operation::Wait* const wait = execution.wait();
+        wait != nullptr && wait->attached()) {
+        if (!wait->cancel()) {
+            return StopDisposition::Deferred;
+        }
+        if (execution.state_ == ExecutionState::Blocked) {
+            Binding* const binding = execution.scheduler_binding_;
+            KASSERT(binding != nullptr);
+            static_cast<void>(accept_wake(*binding));
+            return StopDisposition::Deferred;
+        }
+    }
 
     if (Vproc* const vproc = target.vproc()) {
         const RemoteCancel canceled = remote_.cancel(vproc->activation_);

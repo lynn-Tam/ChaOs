@@ -6,6 +6,7 @@
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/utility.hpp>
+#include <ipc/transfer.hpp>
 #include <mm/pmm.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
@@ -38,6 +39,7 @@ constinit libk::ManualLifetime<GrantGraph> cap_test_graph{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_a{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_b{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_one{};
+constinit libk::ManualLifetime<kernel::ipc::Transfer> cap_test_transfer{};
 
 constexpr Rights inspect_rights = Rights::of(Right::Inspect);
 constexpr Rights basic_rights = Rights::of(
@@ -179,6 +181,7 @@ public:
 
 private:
     void reset() noexcept {
+        cap_test_transfer.reset();
         if (cap_test_space_one) {
             cap_test_space_one->retire();
             cap_test_space_one.reset();
@@ -459,6 +462,111 @@ bool test_move_is_transactional_across_cspaces(
         }
     }
     return fixture.one().close(moved.value())
+        && fixture.graph().live_count() == 0;
+}
+
+bool test_ipc_transfer_commits_copy_and_move_atomically(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    auto copy_root = fixture.root(0);
+    auto move_root = fixture.root(1);
+    if (!copy_root || !move_root) {
+        return false;
+    }
+    auto copy_source = fixture.a().insert(
+        libk::move(copy_root).value(), CapView{basic_rights});
+    auto move_source = fixture.a().insert(
+        libk::move(move_root).value(), CapView{inspect_rights});
+    if (!copy_source || !move_source) {
+        return false;
+    }
+
+    kernel::ipc::Transfer::Specs specs{};
+    if (!specs.try_emplace_back(kernel::ipc::TransferSpec{
+            .source = copy_source.value(),
+            .rights = inspect_rights,
+            .kind = kernel::ipc::TransferKind::Copy,
+        })
+        || !specs.try_emplace_back(kernel::ipc::TransferSpec{
+            .source = move_source.value(),
+            .kind = kernel::ipc::TransferKind::Move,
+        })) {
+        return false;
+    }
+    auto& transfer = cap_test_transfer.emplace();
+    if (!kernel::ipc::Transfer::prepare(
+            transfer, fixture.a(), fixture.b(), specs)) {
+        return false;
+    }
+    auto committed = transfer.commit();
+    cap_test_transfer.reset();
+    if (!committed || committed.value().size() != 2) {
+        return false;
+    }
+
+    {
+        auto copy_original = fixture.a().resolve<
+            kernel::sched::SchedulingContext>(
+                copy_source.value(), inspect_rights);
+        auto stale_move = fixture.a().resolve<
+            kernel::sched::SchedulingContext>(
+                move_source.value(), inspect_rights);
+        auto copied = fixture.b().resolve<kernel::sched::SchedulingContext>(
+            committed.value()[0], inspect_rights);
+        auto moved = fixture.b().resolve<kernel::sched::SchedulingContext>(
+            committed.value()[1], inspect_rights);
+        if (!copy_original || stale_move || !copied || !moved
+            || &copied.value().object() != &fixture.target(0)
+            || &moved.value().object() != &fixture.target(1)) {
+            return false;
+        }
+    }
+    return fixture.b().close(committed.value()[1])
+        && fixture.b().close(committed.value()[0])
+        && fixture.a().close(copy_source.value())
+        && fixture.graph().live_count() == 0;
+}
+
+bool test_ipc_transfer_rolls_back_when_move_source_changes(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    auto root = fixture.root(0);
+    if (!root) {
+        return false;
+    }
+    auto source = fixture.a().insert(
+        libk::move(root).value(), CapView{inspect_rights});
+    if (!source) {
+        return false;
+    }
+    kernel::ipc::Transfer::Specs specs{};
+    if (!specs.try_emplace_back(kernel::ipc::TransferSpec{
+            .source = source.value(),
+            .kind = kernel::ipc::TransferKind::Move,
+        })) {
+        return false;
+    }
+
+    auto& transfer = cap_test_transfer.emplace();
+    if (!kernel::ipc::Transfer::prepare(
+            transfer, fixture.a(), fixture.b(), specs)
+        || !fixture.a().close(source.value())) {
+        return false;
+    }
+    auto rejected = transfer.commit();
+    if (rejected
+        || rejected.error() != kernel::ipc::TransferError::SourceChanged
+        || fixture.b().live_slots() != 1) {
+        return false;
+    }
+    cap_test_transfer.reset();
+    return fixture.b().live_slots() == 0
         && fixture.graph().live_count() == 0;
 }
 
@@ -1036,6 +1144,14 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         "cap",
         "move preserves source when destination transaction fails",
         test_move_is_transactional_across_cspaces);
+    (void)registry.add(
+        "cap",
+        "IPC transfer publishes copy and move as one destination batch",
+        test_ipc_transfer_commits_copy_and_move_atomically);
+    (void)registry.add(
+        "cap",
+        "IPC transfer rolls back every reservation after source mutation",
+        test_ipc_transfer_rolls_back_when_move_source_changes);
     (void)registry.add(
         "cap",
         "CSpace retirement waits for reserved operations and pinned teardown",

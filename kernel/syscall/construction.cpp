@@ -6,7 +6,9 @@
 #include <cpu/cpu_runtime.hpp>
 #include <execution/vproc.hpp>
 #include <libk/checked_arithmetic.hpp>
+#include <libk/inplace_vector.hpp>
 #include <libk/utility.hpp>
+#include <ipc/endpoint.hpp>
 #include <ipc/notification.hpp>
 #include <ipc/tunnel.hpp>
 #include <mm/virtual_layout.hpp>
@@ -24,6 +26,7 @@
 #include <uapi/tunnel.h>
 #include <uapi/vproc.h>
 #include <uapi/resource.h>
+#include <uapi/endpoint.h>
 
 namespace kernel::syscall {
 namespace {
@@ -47,6 +50,8 @@ static_assert(MYOS_RESOURCE_VPROC
     == (u64{1} << static_cast<u16>(object::ObjectKind::Vproc)));
 static_assert(MYOS_RESOURCE_TUNNEL
     == (u64{1} << static_cast<u16>(object::ObjectKind::Tunnel)));
+static_assert(MYOS_RESOURCE_ENDPOINT
+    == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
 
 using kernel::object::ObjectKind;
 
@@ -276,6 +281,504 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         cap::Right::Revoke);
 }
 
+[[nodiscard]] auto memory_allows(
+    const cap::Resolved<kernel::mm::MemoryObject>& memory,
+    kernel::mm::ObjectRange range,
+    kernel::mm::AccessMask access) noexcept -> bool {
+    const cap::EffectiveAuthority effective = memory.authority();
+    const auto* const authority = libk::get_if<cap::MemoryAuthority>(
+        &effective.data);
+    return authority != nullptr && authority->range.contains(range)
+        && authority->access.contains(access)
+        && authority->types.contains(kernel::mm::MemoryType::Normal);
+}
+
+[[nodiscard]] auto ipc_error(kernel::ipc::BufferError error) noexcept
+    -> myos_status_t {
+    switch (error) {
+    case kernel::ipc::BufferError::Invalid:
+        return MYOS_STATUS_BAD_ARGS;
+    case kernel::ipc::BufferError::Unavailable:
+        return MYOS_STATUS_BUSY;
+    case kernel::ipc::BufferError::NoMemory:
+        return MYOS_STATUS_NO_MEMORY;
+    }
+    return MYOS_STATUS_INTERNAL;
+}
+
+[[nodiscard]] auto bind_ipc(
+    KernelState& kernel,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    cap::Resolved<kernel::mm::MemoryObject>& memory,
+    const myos_ipc_binding& descriptor) noexcept
+    -> libk::Expected<kernel::ipc::Buffer, myos_status_t> {
+    if (descriptor.pages == 0
+        || descriptor.pages > MYOS_IPC_BUFFER_MAX_PAGES) {
+        return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+    }
+    const auto bytes = libk::checked_multiply(
+        descriptor.pages, kernel::mm::page_size);
+    const kernel::mm::VirtAddr address{descriptor.address};
+    if (!bytes || !address.is_aligned(kernel::mm::page_size)) {
+        return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+    }
+    const auto rw = kernel::mm::AccessMask::of(
+        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    const kernel::mm::ObjectRange object{
+        descriptor.page, descriptor.pages};
+    if (!memory_allows(memory, object, rw)) {
+        return libk::unexpected(MYOS_STATUS_DENIED);
+    }
+    auto reference = memory.reference();
+    if (!reference) {
+        return libk::unexpected(MYOS_STATUS_BUSY);
+    }
+    auto buffer = kernel::ipc::Buffer::bind(
+        kernel.pmm(),
+        vspace.object(),
+        libk::move(reference).value(),
+        memory.object(),
+        object,
+        kernel::mm::VirtRange{address, *bytes});
+    return buffer
+        ? libk::Expected<kernel::ipc::Buffer, myos_status_t>{
+              libk::expected(libk::move(buffer).value())}
+        : libk::unexpected(ipc_error(buffer.error()));
+}
+
+[[nodiscard]] auto prepare_ipc(
+    Invocation& invocation,
+    KernelState& kernel,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    const myos_ipc_binding& descriptor) noexcept
+    -> libk::Expected<libk::optional<kernel::ipc::Buffer>, myos_status_t> {
+    if (descriptor.pages == 0) {
+        if (descriptor.memory != 0 || descriptor.page != 0
+            || descriptor.address != 0) {
+            return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+        }
+        return libk::expected(
+            libk::optional<kernel::ipc::Buffer>{libk::nullopt});
+    }
+    auto memory = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+        handle_of(descriptor.memory), cap::Rights::of(cap::Right::Map));
+    if (!memory) {
+        return libk::unexpected(cap_status(memory.error()));
+    }
+    auto buffer = bind_ipc(kernel, vspace, memory.value(), descriptor);
+    if (!buffer) {
+        return libk::unexpected(buffer.error());
+    }
+    return libk::expected(libk::optional<kernel::ipc::Buffer>{
+        libk::move(buffer).value()});
+}
+
+[[gnu::noinline]] [[nodiscard]] auto add_endpoint_slot(
+    kernel::ipc::Endpoint& endpoint,
+    KernelState& kernel,
+    cap::Resolved<kernel::resource::ResourcePool>& pool,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    cap::Resolved<kernel::mm::MemoryObject>& stack,
+    cap::Resolved<kernel::mm::MemoryObject>* ipc_memory,
+    const myos_endpoint_desc& descriptor,
+    usize stack_bytes,
+    usize index) noexcept -> myos_status_t {
+    auto capacity = reserve(pool, kernel::resource::Budget{
+        .memory = kernel::mm::KernelStackLayout::StackBytes});
+    auto kernel_stack = KernelStack::create(kernel.kernel_vspace());
+    const auto displacement = libk::checked_multiply(
+        index, descriptor.stack_stride);
+    const auto object_page = libk::checked_multiply(
+        index, descriptor.stack_pages);
+    if (!capacity || !kernel_stack || !displacement || !object_page) {
+        return !capacity
+            ? pool_error(capacity.error()) : MYOS_STATUS_NO_MEMORY;
+    }
+    const auto virtual_base = kernel::mm::VirtAddr{
+        descriptor.stack_address}.checked_add(*displacement);
+    const auto first_page = libk::checked_add(
+        descriptor.stack_page, *object_page);
+    if (!virtual_base || !first_page) {
+        return MYOS_STATUS_BAD_ARGS;
+    }
+    auto stack_ref = stack.reference();
+    if (!stack_ref) {
+        return MYOS_STATUS_BUSY;
+    }
+    const auto rw = kernel::mm::AccessMask::of(
+        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    auto user_stack = vspace->bind_view(kernel::mm::UserViewRequest{
+        .memory = libk::move(stack_ref).value(),
+        .object = kernel::mm::ObjectRange{
+            *first_page, descriptor.stack_pages},
+        .virtual_range = kernel::mm::VirtRange{*virtual_base, stack_bytes},
+        .access = rw,
+    });
+    if (!user_stack) {
+        return vm_status(user_stack.error());
+    }
+    kernel::ipc::StackPages resident{};
+    for (usize page = 0; page < descriptor.stack_pages; ++page) {
+        auto lease = stack->materialize(*first_page + page);
+        if (!lease || !resident.try_push_back(libk::move(lease).value())) {
+            return !lease
+                ? MYOS_STATUS_BACKING_FAILED : MYOS_STATUS_NO_MEMORY;
+        }
+    }
+    const auto top = virtual_base->checked_add(stack_bytes);
+    if (!top) {
+        return MYOS_STATUS_BAD_ARGS;
+    }
+    libk::optional<kernel::ipc::Buffer> ipc{};
+    if (ipc_memory != nullptr) {
+        const auto ipc_displacement = libk::checked_multiply(
+            index, descriptor.ipc_stride);
+        const auto ipc_page = libk::checked_multiply(
+            index, descriptor.ipc.pages);
+        const auto ipc_address = ipc_displacement
+            ? kernel::mm::VirtAddr{descriptor.ipc.address}.checked_add(
+                  *ipc_displacement)
+            : libk::nullopt;
+        const auto first_ipc_page = ipc_page
+            ? libk::checked_add(descriptor.ipc.page, *ipc_page)
+            : libk::nullopt;
+        if (!ipc_address || !first_ipc_page) {
+            return MYOS_STATUS_BAD_ARGS;
+        }
+        myos_ipc_binding binding = descriptor.ipc;
+        binding.address = ipc_address->raw();
+        binding.page = *first_ipc_page;
+        auto made = bind_ipc(kernel, vspace, *ipc_memory, binding);
+        if (!made) {
+            return made.error();
+        }
+        ipc.emplace(libk::move(made).value());
+    }
+    auto added = endpoint.add_activation(
+        libk::move(capacity).value().commit(),
+        libk::move(kernel_stack).value(),
+        libk::move(user_stack).value(),
+        libk::move(ipc),
+        libk::move(resident),
+        *top);
+    return added ? MYOS_STATUS_OK : MYOS_STATUS_BAD_ARGS;
+}
+
+[[gnu::noinline]] [[nodiscard]] auto finish_endpoint(
+    Invocation& invocation,
+    KernelState& kernel,
+    cap::Resolved<kernel::resource::ResourcePool>& pool,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    cap::Resolved<kernel::mm::MemoryObject>& stack,
+    cap::Resolved<kernel::mm::MemoryObject>* ipc_memory,
+    const myos_endpoint_desc& descriptor,
+    usize stack_bytes,
+    ExecutionBinding&& service,
+    kernel::mm::UserView&& code_view,
+    kernel::ipc::CodePages&& resident_code) noexcept -> Result {
+    const auto stack_capacity = libk::checked_multiply(
+        descriptor.activation_count,
+        kernel::mm::KernelStackLayout::StackBytes);
+    const auto call_capacity = libk::checked_add(
+        descriptor.activation_count, descriptor.queue_capacity);
+    const auto node_capacity = libk::checked_multiply(
+        call_capacity ? descriptor.activation_count + *call_capacity : 0,
+        kernel::mm::page_size);
+    const auto dynamic_capacity = stack_capacity && call_capacity
+        && node_capacity
+        ? add_budget(
+              kernel::resource::Budget{.memory = *stack_capacity},
+              kernel::resource::Budget{.memory = *node_capacity})
+        : libk::nullopt;
+    const auto total_charge = dynamic_capacity
+        ? add_budget(
+              kernel::resource::Traits<kernel::ipc::Endpoint>::fixed(),
+              *dynamic_capacity)
+        : libk::nullopt;
+    const auto stack_top = kernel::mm::VirtAddr{
+        descriptor.stack_address}.checked_add(stack_bytes);
+    if (!total_charge || !stack_top) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const auto budget_floor = kernel.clock().duration_from_nanoseconds(
+        descriptor.budget_floor_ns);
+    const auto urgency_ceiling = kernel::sched::Urgency::make(
+        descriptor.urgency_ceiling);
+    if (!budget_floor || !urgency_ceiling) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    kernel::ipc::EndpointConfig config{
+        .entry = arch::UserStart{
+            .entry = kernel::mm::VirtAddr{descriptor.entry},
+            .stack = *stack_top,
+        },
+        .capacity = descriptor.activation_count,
+        .call_capacity = *call_capacity,
+        .max_depth = descriptor.max_depth,
+        .budget_floor = *budget_floor,
+        .urgency_ceiling = *urgency_ceiling,
+    };
+    return construct_with<kernel::ipc::Endpoint>(
+        invocation,
+        pool,
+        kernel::resource::Traits<kernel::ipc::Endpoint>::fixed(),
+        *total_charge,
+        [&](kernel::resource::Reservation&& sponsorship) {
+            return kernel.objects().create_endpoint_sponsored(
+                libk::move(sponsorship),
+                libk::move(service),
+                libk::move(code_view),
+                libk::move(resident_code),
+                config);
+        },
+        [&](kernel::ipc::Endpoint& endpoint) noexcept -> myos_status_t {
+            for (usize index = 0;
+                 index < descriptor.activation_count;
+                 ++index) {
+                const myos_status_t added = add_endpoint_slot(
+                    endpoint,
+                    kernel,
+                    pool,
+                    vspace,
+                    stack,
+                    ipc_memory,
+                    descriptor,
+                    stack_bytes,
+                    index);
+                if (added != MYOS_STATUS_OK) {
+                    return added;
+                }
+            }
+            for (usize index = 0; index < *call_capacity; ++index) {
+                if (!endpoint.add_call()) {
+                    return MYOS_STATUS_NO_MEMORY;
+                }
+            }
+            return endpoint.open() ? MYOS_STATUS_OK : MYOS_STATUS_BAD_ARGS;
+        },
+        [](kernel::ipc::Endpoint&) {
+            const auto rights = cap::Rights::of(
+                cap::Right::Duplicate,
+                cap::Right::Delegate,
+                cap::Right::Inspect,
+                cap::Right::Call,
+                cap::Right::Close,
+                cap::Right::Destroy,
+                cap::Right::Revoke);
+            const cap::EndpointAuthority authority{
+                .badge = 0,
+                .fixed = 0,
+                .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
+                .modes = MYOS_ENDPOINT_MODE_BLOCK
+                    | MYOS_ENDPOINT_MODE_ASYNC,
+            };
+            return PublishedAuthority{
+                cap::GrantCeiling{rights, authority},
+                cap::CapView{rights, authority}};
+        });
+}
+
+[[gnu::noinline]] [[nodiscard]] auto publish_endpoint(
+    Invocation& invocation,
+    KernelState& kernel,
+    cap::Resolved<kernel::resource::ResourcePool>& pool,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    cap::Resolved<cap::CSpace>& cspace,
+    const myos_endpoint_desc& descriptor) noexcept -> Result {
+    if (descriptor.version != MYOS_ENDPOINT_VERSION
+        || descriptor.flags != MYOS_ENDPOINT_FLAGS_NONE
+        || descriptor.activation_count == 0
+        || descriptor.activation_count > MYOS_ENDPOINT_MAX_ACTIVATIONS
+        || descriptor.queue_capacity
+            > MYOS_ENDPOINT_MAX_CALLS - descriptor.activation_count
+        || descriptor.code_pages == 0
+        || descriptor.code_pages > MYOS_ENDPOINT_MAX_CODE_PAGES
+        || descriptor.stack_pages == 0
+        || descriptor.stack_pages > MYOS_ENDPOINT_MAX_STACK_PAGES
+        || descriptor.max_depth == 0
+        || descriptor.max_depth > MYOS_ENDPOINT_MAX_DEPTH
+        || descriptor.urgency_ceiling >= kernel::sched::Urgency::level_count
+        || descriptor.stack_stride % kernel::mm::page_size != 0
+        ) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const auto code_bytes = libk::checked_multiply(
+        descriptor.code_pages, kernel::mm::page_size);
+    const auto stack_bytes = libk::checked_multiply(
+        descriptor.stack_pages, kernel::mm::page_size);
+    const auto stack_span = libk::checked_multiply(
+        descriptor.activation_count - 1, descriptor.stack_stride);
+    const auto last_end = stack_span && stack_bytes
+        ? libk::checked_add(*stack_span, *stack_bytes)
+        : libk::nullopt;
+    const bool has_ipc = descriptor.ipc.pages != 0;
+    const bool empty_ipc = descriptor.ipc.memory == 0
+        && descriptor.ipc.page == 0 && descriptor.ipc.address == 0
+        && descriptor.ipc.pages == 0 && descriptor.ipc_stride == 0;
+    const auto ipc_bytes = has_ipc
+        ? libk::checked_multiply(
+              descriptor.ipc.pages, kernel::mm::page_size)
+        : libk::optional<usize>{};
+    const auto ipc_span = has_ipc
+        ? libk::checked_multiply(
+              descriptor.activation_count - 1, descriptor.ipc_stride)
+        : libk::optional<usize>{};
+    const auto ipc_end = has_ipc && ipc_span && ipc_bytes
+        ? libk::checked_add(*ipc_span, *ipc_bytes)
+        : libk::optional<usize>{};
+    if (!code_bytes || !stack_bytes || !last_end
+        || descriptor.stack_stride < *stack_bytes) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    if ((!has_ipc && !empty_ipc)
+        || (has_ipc && (descriptor.ipc.memory == 0
+            || descriptor.ipc.pages > MYOS_IPC_BUFFER_MAX_PAGES
+            || !ipc_bytes || !ipc_span || !ipc_end
+            || descriptor.ipc_stride < *ipc_bytes
+            || descriptor.ipc_stride % kernel::mm::page_size != 0))) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const kernel::mm::VirtAddr code_base{descriptor.code_address};
+    const kernel::mm::VirtAddr stack_base{descriptor.stack_address};
+    const kernel::mm::VirtRange code_range{code_base, *code_bytes};
+    const kernel::mm::VirtRange stack_extent{stack_base, *last_end};
+    const kernel::mm::VirtAddr ipc_base{descriptor.ipc.address};
+    const kernel::mm::VirtRange ipc_extent{
+        ipc_base, ipc_end ? *ipc_end : 0};
+    if (!code_base.is_aligned(kernel::mm::page_size)
+        || !stack_base.is_aligned(kernel::mm::page_size)
+        || !code_range.valid() || !stack_extent.valid()
+        || code_range.intersects(stack_extent)
+        || (has_ipc && (!ipc_base.is_aligned(kernel::mm::page_size)
+            || !ipc_extent.valid() || ipc_extent.empty()
+            || ipc_extent.intersects(code_range)
+            || ipc_extent.intersects(stack_extent)))
+        || !code_range.contains(kernel::mm::VirtAddr{descriptor.entry})) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+
+    auto code = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+        handle_of(descriptor.code_memory),
+        cap::Rights::of(cap::Right::Map));
+    auto stack = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+        handle_of(descriptor.stack_memory),
+        cap::Rights::of(cap::Right::Map));
+    if (!code || !stack) {
+        return returned(cap_status(!code ? code.error() : stack.error()));
+    }
+    libk::optional<cap::Resolved<kernel::mm::MemoryObject>> ipc_memory{};
+    if (has_ipc) {
+        auto resolved = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+            handle_of(descriptor.ipc.memory),
+            cap::Rights::of(cap::Right::Map));
+        if (!resolved) {
+            return returned(cap_status(resolved.error()));
+        }
+        ipc_memory.emplace(libk::move(resolved).value());
+    }
+    const auto rx = kernel::mm::AccessMask::of(
+        kernel::mm::Access::Read, kernel::mm::Access::Execute);
+    const auto rw = kernel::mm::AccessMask::of(
+        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    const kernel::mm::ObjectRange code_object{
+        descriptor.code_page, descriptor.code_pages};
+    const auto total_stack_pages = libk::checked_multiply(
+        descriptor.activation_count, descriptor.stack_pages);
+    const auto total_ipc_pages = has_ipc
+        ? libk::checked_multiply(
+              descriptor.activation_count, descriptor.ipc.pages)
+        : libk::optional<usize>{};
+    if (!total_stack_pages || !memory_allows(code.value(), code_object, rx)
+        || !memory_allows(
+            stack.value(),
+            kernel::mm::ObjectRange{
+                descriptor.stack_page, *total_stack_pages},
+            rw)
+        || (has_ipc && (!total_ipc_pages
+            || !memory_allows(
+                *ipc_memory,
+                kernel::mm::ObjectRange{
+                    descriptor.ipc.page, *total_ipc_pages},
+                rw)))) {
+        return returned(MYOS_STATUS_DENIED);
+    }
+
+    auto code_ref = code.value().reference();
+    if (!code_ref) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto code_view = vspace->bind_view(kernel::mm::UserViewRequest{
+        .memory = libk::move(code_ref).value(),
+        .object = code_object,
+        .virtual_range = code_range,
+        .access = rx,
+    });
+    if (!code_view) {
+        return returned(vm_status(code_view.error()));
+    }
+    kernel::ipc::CodePages resident_code{};
+    for (usize page = 0; page < descriptor.code_pages; ++page) {
+        auto lease = code.value()->materialize(descriptor.code_page + page);
+        if (!lease || !resident_code.try_push_back(libk::move(lease).value())) {
+            return returned(!lease
+                ? MYOS_STATUS_BACKING_FAILED : MYOS_STATUS_NO_MEMORY);
+        }
+    }
+
+    auto vspace_ref = vspace.reference();
+    auto cspace_ref = cspace.reference();
+    if (!vspace_ref || !cspace_ref) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto service = ExecutionBinding::user(
+        libk::move(vspace_ref).value(), libk::move(cspace_ref).value());
+    if (!service) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+
+    return finish_endpoint(
+        invocation,
+        kernel,
+        pool,
+        vspace,
+        stack.value(),
+        ipc_memory ? &*ipc_memory : nullptr,
+        descriptor,
+        *stack_bytes,
+        libk::move(service).value(),
+        libk::move(code_view).value(),
+        libk::move(resident_code));
+}
+
+[[gnu::noinline]] [[nodiscard]] auto create_endpoint(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    arch::TrapContext& trap = invocation.trap;
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    auto vspace = invocation.cspace.resolve<kernel::mm::VSpace>(
+        handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Manage));
+    auto cspace = invocation.cspace.resolve<cap::CSpace>(
+        handle_of(trap.arg(2)), cap::Rights::of(cap::Right::Manage));
+    if (!pool || !vspace || !cspace) {
+        const cap::CSpaceError error = !pool
+            ? pool.error()
+            : !vspace ? vspace.error() : cspace.error();
+        return returned(cap_status(error));
+    }
+    auto snapshot = read_snapshot<myos_endpoint_desc>(
+        invocation, handle_of(trap.arg(3)), trap.arg(4));
+    return snapshot
+        ? publish_endpoint(
+              invocation,
+              *kernel,
+              pool.value(),
+              vspace.value(),
+              cspace.value(),
+              snapshot.value())
+        : returned(snapshot.error());
+}
+
 [[gnu::noinline]] [[nodiscard]] auto create_child(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
@@ -502,10 +1005,15 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         });
 }
 
+struct ThreadStart final {
+    arch::UserStart user{};
+    myos_ipc_binding ipc{};
+};
+
 [[nodiscard]] auto start_snapshot(
     Invocation& invocation,
     cap::CapHandle handle,
-    usize offset) noexcept -> libk::Expected<arch::UserStart, myos_status_t> {
+    usize offset) noexcept -> libk::Expected<ThreadStart, myos_status_t> {
     auto snapshot = read_snapshot<myos_thread_start>(
         invocation, handle, offset);
     if (!snapshot) {
@@ -526,7 +1034,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     if (!arch::valid_user_start(start)) {
         return libk::unexpected(MYOS_STATUS_BAD_ARGS);
     }
-    return libk::expected(start);
+    return libk::expected(ThreadStart{start, descriptor.ipc});
 }
 
 [[nodiscard]] auto page_authorized(
@@ -627,6 +1135,65 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     return libk::expected(libk::move(runtime));
 }
 
+[[gnu::noinline]] [[nodiscard]] auto publish_thread(
+    Invocation& invocation,
+    KernelState& kernel,
+    cap::Resolved<kernel::resource::ResourcePool>& pool,
+    cap::Resolved<kernel::mm::VSpace>& vspace,
+    cap::Resolved<cap::CSpace>& cspace,
+    ThreadStart&& start,
+    libk::optional<kernel::ipc::Buffer>&& ipc) noexcept -> Result {
+    auto stack_reservation = reserve(pool, kernel::resource::Budget{
+        .memory = kernel::mm::KernelStackLayout::StackBytes});
+    if (!stack_reservation) {
+        return returned(pool_error(stack_reservation.error()));
+    }
+    auto stack_capacity = libk::move(stack_reservation).value();
+    auto home = kernel::KernelStack::create(kernel.kernel_vspace());
+    auto address_space = vspace.reference();
+    auto capability_space = cspace.reference();
+    if (!home || !address_space || !capability_space) {
+        return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    auto execution = kernel::ExecutionBinding::user(
+        libk::move(address_space).value(),
+        libk::move(capability_space).value(),
+        kernel::FaultRoute::Terminate,
+        libk::move(ipc));
+    if (!execution) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+
+    const auto total = add_budget(
+        kernel::resource::Traits<kernel::Thread>::fixed(),
+        kernel::resource::Budget{
+            .memory = kernel::mm::KernelStackLayout::StackBytes});
+    KASSERT(total);
+    return construct_with<kernel::Thread>(
+        invocation,
+        pool,
+        kernel::resource::Traits<kernel::Thread>::fixed(),
+        *total,
+        [&](kernel::resource::Reservation&& sponsorship) {
+            return kernel.objects().create_thread_sponsored(
+                libk::move(sponsorship),
+                libk::move(stack_capacity).commit(),
+                libk::move(home).value(),
+                libk::move(execution).value(),
+                start.user);
+        },
+        [&](kernel::Thread& thread) noexcept -> myos_status_t {
+            return thread.authorize(vspace, cspace)
+                ? MYOS_STATUS_OK
+                : MYOS_STATUS_BUSY;
+        },
+        [&](kernel::Thread&) {
+            const auto rights = basic_rights();
+            return PublishedAuthority{
+                cap::GrantCeiling{rights}, cap::CapView{rights}};
+        });
+}
+
 [[gnu::noinline]] [[nodiscard]] auto create_thread(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
@@ -649,54 +1216,19 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     if (!start || trap.arg(5) != 0) {
         return returned(start ? MYOS_STATUS_BAD_ARGS : start.error());
     }
-
-    auto stack_reservation = reserve(pool.value(), kernel::resource::Budget{
-        .memory = kernel::mm::KernelStackLayout::StackBytes});
-    if (!stack_reservation) {
-        return returned(pool_error(stack_reservation.error()));
+    auto ipc = prepare_ipc(
+        invocation, *kernel, vspace.value(), start.value().ipc);
+    if (!ipc) {
+        return returned(ipc.error());
     }
-    auto stack_capacity = libk::move(stack_reservation).value();
-    auto home = kernel::KernelStack::create(kernel->kernel_vspace());
-    auto address_space = vspace.value().reference();
-    auto capability_space = cspace.value().reference();
-    if (!home || !address_space || !capability_space) {
-        return returned(MYOS_STATUS_NO_MEMORY);
-    }
-    auto execution = kernel::ExecutionBinding::user(
-        libk::move(address_space).value(),
-        libk::move(capability_space).value());
-    if (!execution) {
-        return returned(MYOS_STATUS_BUSY);
-    }
-
-    const auto total = add_budget(
-        kernel::resource::Traits<kernel::Thread>::fixed(),
-        kernel::resource::Budget{
-            .memory = kernel::mm::KernelStackLayout::StackBytes});
-    KASSERT(total);
-    return construct_with<kernel::Thread>(
+    return publish_thread(
         invocation,
+        *kernel,
         pool.value(),
-        kernel::resource::Traits<kernel::Thread>::fixed(),
-        *total,
-        [&](kernel::resource::Reservation&& sponsorship) {
-            return kernel->objects().create_thread_sponsored(
-                libk::move(sponsorship),
-                libk::move(stack_capacity).commit(),
-                libk::move(home).value(),
-                libk::move(execution).value(),
-                start.value());
-        },
-        [&](kernel::Thread& thread) noexcept -> myos_status_t {
-            return thread.authorize(vspace.value(), cspace.value())
-                ? MYOS_STATUS_OK
-                : MYOS_STATUS_BUSY;
-        },
-        [&](kernel::Thread&) {
-            const auto rights = basic_rights();
-            return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
-        });
+        vspace.value(),
+        cspace.value(),
+        libk::move(start).value(),
+        libk::move(ipc).value());
 }
 
 [[gnu::noinline]] [[nodiscard]] auto create_notification(
@@ -808,7 +1340,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     cap::Resolved<kernel::mm::MemoryObject>& control,
     cap::Resolved<kernel::mm::MemoryObject>& events,
     arch::UserStart runtime_entry,
-    kernel::VprocRuntime&& runtime) noexcept -> Result {
+    kernel::VprocRuntime&& runtime,
+    libk::optional<kernel::ipc::Buffer>&& ipc) noexcept -> Result {
     auto stack_reservation = reserve(pool, kernel::resource::Budget{
         .memory = kernel::mm::KernelStackLayout::StackBytes});
     if (!stack_reservation) {
@@ -823,7 +1356,9 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     }
     auto execution = kernel::ExecutionBinding::user(
         libk::move(address_space).value(),
-        libk::move(capability_space).value());
+        libk::move(capability_space).value(),
+        kernel::FaultRoute::Terminate,
+        libk::move(ipc));
     if (!execution) {
         return returned(MYOS_STATUS_BUSY);
     }
@@ -916,6 +1451,16 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     if (!runtime) {
         return returned(runtime.error());
     }
+    auto ipc = prepare_ipc(
+        invocation, *kernel, vspace.value(), descriptor.ipc);
+    if (!ipc) {
+        return returned(ipc.error());
+    }
+    if (ipc.value()
+        && (ipc.value()->virtual_range().contains(control_address)
+            || ipc.value()->virtual_range().contains(event_address))) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
 
     return publish_vproc(
         invocation,
@@ -926,7 +1471,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         control.value(),
         events.value(),
         runtime_entry,
-        libk::move(runtime).value());
+        libk::move(runtime).value(),
+        libk::move(ipc).value());
 }
 
 } // namespace
@@ -953,6 +1499,8 @@ auto handle_construction(
         return create_vproc(invocation);
     case MYOS_SYS_TUNNEL_OPEN:
         return open_tunnel(invocation);
+    case MYOS_SYS_ENDPOINT_CREATE:
+        return create_endpoint(invocation);
     default:
         break;
     }

@@ -16,6 +16,7 @@ enum class ObjectKind : u16 {
     Notification,
     Vproc,
     Tunnel,
+    Endpoint,
     Count,
 };
 

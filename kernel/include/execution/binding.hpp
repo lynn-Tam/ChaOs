@@ -5,7 +5,7 @@
 #include <libk/noncopyable.hpp>
 #include <libk/variant.hpp>
 #include <libk/optional.hpp>
-#include <mm/user_view.hpp>
+#include <ipc/buffer.hpp>
 #include <mm/translation.hpp>
 #include <object/object_ref.hpp>
 
@@ -53,7 +53,7 @@ class ExecutionBinding final : private libk::noncopyable {
         kernel::mm::VSpace* vspace{};
         kernel::cap::CSpace* cspace{};
         FaultRoute fault{FaultRoute::Terminate};
-        libk::optional<kernel::mm::UserView> ipc{};
+        libk::optional<kernel::ipc::Buffer> ipc{};
 
     private:
         friend class ExecutionBinding;
@@ -79,7 +79,7 @@ public:
         kernel::object::ObjectRef&& vspace,
         kernel::object::ObjectRef&& cspace,
         FaultRoute route = FaultRoute::Terminate,
-        libk::optional<kernel::mm::UserViewRequest> ipc = libk::nullopt) noexcept
+        libk::optional<kernel::ipc::Buffer> ipc = libk::nullopt) noexcept
         -> libk::Expected<ExecutionBinding, ExecutionError>;
 
     [[nodiscard]] auto kernel_bound() const noexcept -> bool;
@@ -98,8 +98,10 @@ public:
     [[nodiscard]] auto vspace() const noexcept -> kernel::mm::VSpace*;
     [[nodiscard]] auto cspace() const noexcept -> kernel::cap::CSpace*;
     [[nodiscard]] auto fault_route() const noexcept -> FaultRoute;
+    [[nodiscard]] auto ipc_buffer() noexcept
+        -> kernel::ipc::Buffer*;
     [[nodiscard]] auto ipc_buffer() const noexcept
-        -> const kernel::mm::UserView*;
+        -> const kernel::ipc::Buffer*;
 
 private:
     explicit ExecutionBinding(KernelRoots roots) noexcept

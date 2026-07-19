@@ -234,9 +234,19 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_TUNNEL_CLOSE, tunnel);
 }
 
-[[nodiscard]] inline auto operation_take(
+[[nodiscard]] inline auto operation_poll(
     myos_operation_key_t key) noexcept -> SysResult {
-    return syscall(MYOS_SYS_OPERATION_TAKE, key);
+    return syscall(MYOS_SYS_OPERATION_POLL, key);
+}
+
+[[nodiscard]] inline auto operation_cancel(
+    myos_operation_key_t key) noexcept -> SysResult {
+    return syscall(MYOS_SYS_OPERATION_CANCEL, key);
+}
+
+[[nodiscard]] inline auto operation_finish(
+    myos_operation_key_t key) noexcept -> SysResult {
+    return syscall(MYOS_SYS_OPERATION_FINISH, key);
 }
 
 [[nodiscard]] inline auto cap_revoke(

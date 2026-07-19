@@ -27,12 +27,14 @@ extern "C" void arch_riscv64_trap_handler(TrapFrame* frame) noexcept {
     kernel::trap::handle(event, context);
 }
 
-extern "C" void arch_riscv64_trap_exit(TrapFrame* frame) noexcept {
+extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
+    -> TrapFrame* {
     KASSERT(frame != nullptr);
     KASSERT(arch::trap_depth() == 0);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
     kernel::trap::on_exit(context);
+    return arch::riscv64::raw_frame(context.frame());
 }
 
 

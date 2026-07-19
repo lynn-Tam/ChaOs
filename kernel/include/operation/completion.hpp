@@ -11,10 +11,11 @@
 namespace kernel {
 
 class CpuRegistry;
-class Thread;
 class Vproc;
 
 namespace operation {
+
+class Wait;
 
 enum class State : u8 {
     Complete,
@@ -56,6 +57,35 @@ public:
         return Completion{owner, operations};
     }
 
+    template<
+        typename Owner,
+        bool (Owner::*Complete)() const noexcept,
+        Result (Owner::*Read)() noexcept,
+        void (Owner::*Release)() noexcept,
+        bool (Owner::*Cancel)() noexcept,
+        void (Owner::*Resume)(arch::TrapContext&) noexcept>
+    [[nodiscard]] static auto bind_resume(Owner& owner) noexcept
+        -> Completion {
+        static constexpr Ops operations{
+            .complete = [](const void* context) noexcept {
+                return (static_cast<const Owner*>(context)->*Complete)();
+            },
+            .read = [](void* context) noexcept -> Result {
+                return (static_cast<Owner*>(context)->*Read)();
+            },
+            .release = [](void* context) noexcept {
+                (static_cast<Owner*>(context)->*Release)();
+            },
+            .cancel = [](void* context) noexcept -> bool {
+                return (static_cast<Owner*>(context)->*Cancel)();
+            },
+            .resume = [](void* context, arch::TrapContext& trap) noexcept {
+                (static_cast<Owner*>(context)->*Resume)(trap);
+            },
+        };
+        return Completion{owner, operations};
+    }
+
     ~Completion() noexcept;
 
     [[nodiscard]] auto attached() const noexcept -> bool {
@@ -69,23 +99,27 @@ public:
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
     void signal() noexcept;
+    // Publish a non-terminal Vproc operation offer. The operation and key stay
+    // attached; a later terminal signal publishes the final result.
+    [[nodiscard]] auto offer() noexcept -> bool;
 
 private:
-    friend class kernel::Thread;
     friend class kernel::Vproc;
+    friend class Wait;
 
     struct Ops final {
         bool (*complete)(const void*) noexcept;
         Result (*read)(void*) noexcept;
         void (*release)(void*) noexcept;
         bool (*cancel)(void*) noexcept;
+        void (*resume)(void*, arch::TrapContext&) noexcept{};
     };
 
     template<typename Owner>
     explicit Completion(Owner& owner, const Ops& ops) noexcept
         : owner_(&owner), ops_(&ops) {}
 
-    void attach(Thread& thread, CpuRegistry& cpus) noexcept;
+    void attach(Wait& wait) noexcept;
     void attach(
         Vproc& vproc,
         CpuRegistry& cpus,
@@ -100,25 +134,26 @@ private:
     enum class Delivery : u8 {
         Detached,
         Attached,
+        Offering,
         Claimed,
         Ready,
     };
 
     void* owner_{};
     const Ops* ops_{};
-    struct ThreadSink final {
-        Thread* thread{};
-        CpuRegistry* cpus{};
+    struct BlockingSink final {
+        Wait* wait{};
     };
     struct VprocSink final {
         Vproc* vproc{};
         CpuRegistry* cpus{};
         operation::Key key{};
     };
-    using Sink = libk::variant<libk::monostate, ThreadSink, VprocSink>;
+    using Sink = libk::variant<libk::monostate, BlockingSink, VprocSink>;
 
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
+    libk::Atomic<bool> signal_pending_{};
 };
 
 } // namespace operation

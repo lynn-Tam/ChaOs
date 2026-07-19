@@ -185,8 +185,11 @@ KERNEL_SRCS := \
   kernel/cap/policy.cpp \
   kernel/cap/grant_graph.cpp \
   kernel/cap/cspace.cpp \
-  kernel/ipc/notification.cpp \
-  kernel/ipc/tunnel.cpp \
+	kernel/ipc/notification.cpp \
+	kernel/ipc/buffer.cpp \
+	kernel/ipc/tunnel.cpp \
+  kernel/ipc/endpoint.cpp \
+  kernel/ipc/transfer.cpp \
   kernel/object/object_ref.cpp \
   kernel/object/object_store.cpp \
 	kernel/resource/pool.cpp \
@@ -211,6 +214,7 @@ KERNEL_SRCS := \
     kernel/execution/vproc_tunnel.cpp \
 	kernel/execution/stop.cpp \
   kernel/operation/completion.cpp \
+  kernel/operation/wait.cpp \
   kernel/execution/execution.cpp \
   kernel/execution/binding.cpp \
   kernel/syscall/syscall.cpp \
@@ -222,6 +226,7 @@ KERNEL_SRCS := \
     kernel/syscall/notification.cpp \
     kernel/syscall/vproc.cpp \
     kernel/syscall/tunnel.cpp \
+    kernel/syscall/endpoint.cpp \
   kernel/syscall/vm.cpp \
   kernel/time/clock.cpp \
   kernel/mm/kernel_stack.cpp \

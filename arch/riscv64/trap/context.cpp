@@ -26,6 +26,14 @@ struct TrapContextAccess final {
         -> TrapContext {
         return TrapContext{&frame};
     }
+
+    [[nodiscard]] static auto frame(void* raw) noexcept -> UserFrame {
+        return UserFrame{raw};
+    }
+
+    [[nodiscard]] static auto raw(UserFrame frame) noexcept -> void* {
+        return frame.raw_;
+    }
 };
 
 TrapContext::TrapContext(void* frame) noexcept
@@ -37,6 +45,14 @@ namespace riscv64 {
 
 auto make_context(TrapFrame& frame) noexcept -> arch::TrapContext {
     return TrapContextAccess::from_raw(frame);
+}
+
+auto make_user_frame(TrapFrame& frame) noexcept -> arch::UserFrame {
+    return TrapContextAccess::frame(&frame);
+}
+
+auto raw_frame(arch::UserFrame frame) noexcept -> TrapFrame* {
+    return static_cast<TrapFrame*>(TrapContextAccess::raw(frame));
 }
 
 } // namespace riscv64
@@ -156,6 +172,15 @@ auto TrapContext::load_user_start(const UserStart& start) noexcept -> bool {
         context.words[A0 + index] = start.arguments[index];
     }
     return load_user(context);
+}
+
+auto TrapContext::frame() const noexcept -> UserFrame {
+    return TrapContextAccess::frame(frame_);
+}
+
+void TrapContext::redirect(UserFrame frame) noexcept {
+    KASSERT(frame);
+    frame_ = TrapContextAccess::raw(frame);
 }
 
 } // namespace arch

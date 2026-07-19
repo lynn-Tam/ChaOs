@@ -6,7 +6,9 @@
 #include <cpu/cpu_registry.hpp>
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
+#include <ipc/endpoint.hpp>
 #include <operation/completion.hpp>
+#include <operation/wait.hpp>
 #include <sched/context.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync/irq_lock_guard.hpp>
@@ -76,7 +78,8 @@ Vproc::~Vproc() noexcept {
         KASSERT(ingress.link == nullptr);
     }
     for (const OperationSlot& slot : operations_) {
-        KASSERT(slot.state == OperationState::Free && slot.completion == nullptr);
+        KASSERT(slot.state == OperationState::Free && slot.completion == nullptr
+            && slot.continuation == nullptr);
     }
 }
 
@@ -106,8 +109,29 @@ auto Vproc::begin_operation(
     operation::Completion& completion,
     CpuRegistry& cpus,
     usize cookie) noexcept -> libk::Expected<operation::Key, VprocError> {
+    auto reserved = reserve_operation(cookie);
+    if (!reserved) {
+        return libk::unexpected(reserved.error());
+    }
+    if (!commit_operation(reserved.value(), completion, cpus)) {
+        release_operation(reserved.value());
+        return libk::unexpected(VprocError::InvalidState);
+    }
+    return reserved;
+}
+
+auto Vproc::endpoint_ready() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
-    if (stop_requested_ || stopped_ || execution_.state_ == State::Exited) {
+    return !stop_requested_ && !stopped_
+        && execution_.state_ != State::Exited
+        && upcall_state_ == UpcallState::Armed;
+}
+
+auto Vproc::reserve_operation(usize cookie) noexcept
+    -> libk::Expected<operation::Key, VprocError> {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    if (stop_requested_ || stopped_ || execution_.state_ == State::Exited
+        || upcall_state_ != UpcallState::Armed) {
         return libk::unexpected(VprocError::InvalidState);
     }
     for (usize index = 0; index < max_operations; ++index) {
@@ -124,15 +148,127 @@ auto Vproc::begin_operation(
         KASSERT(slot.generation != 0);
         const operation::Key key{
             (slot.generation << MYOS_OPERATION_SLOT_BITS) | index};
-        slot.completion = &completion;
+        slot.completion = nullptr;
         slot.status = MYOS_STATUS_PENDING;
         slot.value = 0;
         slot.cookie = cookie;
-        slot.state = OperationState::Pending;
-        completion.attach(*this, cpus, key);
+        slot.continuation = nullptr;
+        slot.state = OperationState::Reserved;
         return libk::expected(key);
     }
     return libk::unexpected(VprocError::TableFull);
+}
+
+auto Vproc::commit_operation(
+    operation::Key key,
+    operation::Completion& completion,
+    CpuRegistry& cpus,
+    ipc::Call* continuation) noexcept -> bool {
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (!key.valid() || key.slot() >= max_operations
+            || stop_requested_ || stopped_) {
+            return false;
+        }
+        OperationSlot& slot = operations_[key.slot()];
+        if (slot.generation != key.generation()
+            || slot.state != OperationState::Reserved
+            || slot.completion != nullptr || slot.continuation != nullptr) {
+            return false;
+        }
+        slot.completion = &completion;
+        slot.continuation = continuation;
+        slot.state = OperationState::Pending;
+        completion.attach(*this, cpus, key);
+    }
+    return true;
+}
+
+void Vproc::release_operation(operation::Key key) noexcept {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    KASSERT(key.valid() && key.slot() < max_operations);
+    OperationSlot& slot = operations_[key.slot()];
+    KASSERT(slot.generation == key.generation()
+        && slot.state == OperationState::Reserved
+        && slot.completion == nullptr && slot.continuation == nullptr);
+    slot.status = MYOS_STATUS_OK;
+    slot.value = 0;
+    slot.cookie = 0;
+    slot.state = OperationState::Free;
+}
+
+auto Vproc::offer_operation(
+    operation::Key key,
+    operation::Completion& completion,
+    CpuRegistry& cpus) noexcept -> bool {
+    bool activate{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (!key.valid() || key.slot() >= max_operations) {
+            return false;
+        }
+        OperationSlot& slot = operations_[key.slot()];
+        if (slot.generation != key.generation()
+            || slot.state != OperationState::Pending
+            || slot.completion != &completion || stop_requested_ || stopped_) {
+            return false;
+        }
+        slot.state = OperationState::Offered;
+        ++pending_sequence_;
+        KASSERT(pending_sequence_ != 0);
+        const u64 bit = u64{1} << key.slot();
+        ready_mask_ |= bit;
+        offered_mask_ |= bit;
+        __atomic_store_n(
+            &runtime_.events->operation_key[key.slot()],
+            key.raw,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_cookie[key.slot()],
+            slot.cookie,
+            __ATOMIC_RELEASE);
+        __atomic_fetch_or(&runtime_.events->offer_mask, bit, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&runtime_.events->ready_mask, bit, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->pending_sequence,
+            pending_sequence_,
+            __ATOMIC_RELEASE);
+        activate = true;
+    }
+    if (activate) {
+        static_cast<void>(sched::activate(cpus, *this));
+    }
+    return true;
+}
+
+auto Vproc::claim_operation(
+    operation::Key key,
+    operation::Completion& completion) noexcept
+    -> libk::Expected<myos_user_context, VprocError> {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    if (!key.valid() || key.slot() >= max_operations) {
+        return libk::unexpected(VprocError::InvalidKey);
+    }
+    OperationSlot& slot = operations_[key.slot()];
+    if (slot.generation != key.generation()
+        || slot.state != OperationState::Offered
+        || slot.completion != &completion
+        || __atomic_load_n(
+               &runtime_.control->operation_key,
+               __ATOMIC_ACQUIRE) != key.raw) {
+        return libk::unexpected(VprocError::InvalidKey);
+    }
+    const myos_user_context submitted = runtime_.control->operation_context;
+    if (!arch::valid_user_context(submitted)) {
+        return libk::unexpected(VprocError::InvalidRuntime);
+    }
+    slot.state = OperationState::Pending;
+    const u64 bit = u64{1} << key.slot();
+    ready_mask_ &= ~bit;
+    offered_mask_ &= ~bit;
+    __atomic_fetch_and(&runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
+    __atomic_fetch_and(&runtime_.events->offer_mask, ~bit, __ATOMIC_RELEASE);
+    return libk::expected(submitted);
 }
 
 void Vproc::publish_operation(
@@ -145,15 +281,31 @@ void Vproc::publish_operation(
         kernel::sync::IrqLockGuard guard{state_lock_};
         KASSERT(key.slot() < max_operations);
         OperationSlot& slot = operations_[key.slot()];
-        KASSERT(slot.state == OperationState::Pending
+        KASSERT((slot.state == OperationState::Pending
+                || slot.state == OperationState::Offered)
             && slot.generation == key.generation());
         slot.completion = nullptr;
+        slot.continuation = nullptr;
         slot.status = result.status;
         slot.value = result.value;
         slot.state = OperationState::Ready;
         ++pending_sequence_;
         KASSERT(pending_sequence_ != 0);
         ready_mask_ |= u64{1} << key.slot();
+        offered_mask_ &= ~(u64{1} << key.slot());
+        resume_mask_ &= ~(u64{1} << key.slot());
+        __atomic_store_n(
+            &runtime_.events->operation_key[key.slot()],
+            key.raw,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_cookie[key.slot()],
+            slot.cookie,
+            __ATOMIC_RELEASE);
+        __atomic_fetch_and(
+            &runtime_.events->offer_mask,
+            ~(u64{1} << key.slot()),
+            __ATOMIC_RELEASE);
         __atomic_fetch_or(
             &runtime_.events->ready_mask,
             u64{1} << key.slot(),
@@ -164,7 +316,8 @@ void Vproc::publish_operation(
             __ATOMIC_RELEASE);
         activate = !stop_requested_ && !stopped_;
         for (const OperationSlot& current : operations_) {
-            pending = pending || current.state == OperationState::Pending;
+            pending = pending || current.state == OperationState::Pending
+                || current.state == OperationState::Offered;
         }
     }
     if (!activate && !pending) {
@@ -185,7 +338,8 @@ void Vproc::cancel_operations() noexcept {
         {
             kernel::sync::IrqLockGuard guard{state_lock_};
             OperationSlot& slot = operations_[index];
-            if (slot.state != OperationState::Pending) {
+            if (slot.state != OperationState::Pending
+                && slot.state != OperationState::Offered) {
                 continue;
             }
             KASSERT(slot.completion != nullptr);
@@ -198,28 +352,105 @@ void Vproc::cancel_operations() noexcept {
         }
         kernel::sync::IrqLockGuard guard{state_lock_};
         OperationSlot& slot = operations_[index];
-        KASSERT(slot.state == OperationState::Pending
+        KASSERT((slot.state == OperationState::Pending
+                || slot.state == OperationState::Offered)
             && slot.generation == key.generation()
             && slot.completion == completion);
         slot.completion = nullptr;
+        slot.continuation = nullptr;
         slot.status = MYOS_STATUS_OK;
         slot.value = 0;
         slot.cookie = 0;
         slot.state = OperationState::Free;
+        const u64 bit = u64{1} << index;
+        ready_mask_ &= ~bit;
+        offered_mask_ &= ~bit;
+        __atomic_fetch_and(&runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&runtime_.events->offer_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_key[index], 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_cookie[index], 0, __ATOMIC_RELEASE);
     }
 }
 
 auto Vproc::pending_operations() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
     for (const OperationSlot& slot : operations_) {
-        if (slot.state == OperationState::Pending) {
+        if (slot.state == OperationState::Pending
+            || slot.state == OperationState::Offered) {
             return true;
         }
     }
     return false;
 }
 
-auto Vproc::take_operation(operation::Key key) noexcept
+auto Vproc::poll_operation(operation::Key key) const noexcept
+    -> libk::Expected<operation::Result, VprocError> {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    if (!key.valid() || key.slot() >= max_operations) {
+        return libk::unexpected(VprocError::InvalidKey);
+    }
+    const OperationSlot& slot = operations_[key.slot()];
+    if (slot.generation != key.generation()
+        || slot.state == OperationState::Free) {
+        return libk::unexpected(VprocError::InvalidKey);
+    }
+    return slot.state == OperationState::Ready
+        ? libk::Expected<operation::Result, VprocError>{
+              libk::expected(operation::Result{slot.status, slot.value})}
+        : libk::Expected<operation::Result, VprocError>{
+              libk::expected(operation::Result{MYOS_STATUS_PENDING, 0})};
+}
+
+auto Vproc::cancel_operation(operation::Key key) noexcept
+    -> libk::Expected<void, VprocError> {
+    operation::Completion* completion{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (!key.valid() || key.slot() >= max_operations) {
+            return libk::unexpected(VprocError::InvalidKey);
+        }
+        OperationSlot& slot = operations_[key.slot()];
+        if (slot.generation != key.generation()
+            || (slot.state != OperationState::Pending
+                && slot.state != OperationState::Offered)
+            || slot.completion == nullptr) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        completion = slot.completion;
+    }
+    if (!completion->cancel()) {
+        return libk::unexpected(VprocError::InvalidState);
+    }
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        OperationSlot& slot = operations_[key.slot()];
+        KASSERT(slot.generation == key.generation()
+            && (slot.state == OperationState::Pending
+                || slot.state == OperationState::Offered)
+            && slot.completion == completion);
+        slot.completion = nullptr;
+        slot.continuation = nullptr;
+        slot.status = MYOS_STATUS_OK;
+        slot.value = 0;
+        slot.cookie = 0;
+        slot.state = OperationState::Free;
+        const u64 bit = u64{1} << key.slot();
+        ready_mask_ &= ~bit;
+        offered_mask_ &= ~bit;
+        __atomic_fetch_and(&runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&runtime_.events->offer_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_key[key.slot()], 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->operation_cookie[key.slot()], 0, __ATOMIC_RELEASE);
+    }
+    retry_stop_if_ready();
+    return libk::expected();
+}
+
+auto Vproc::finish_operation(operation::Key key) noexcept
     -> libk::Expected<operation::Result, VprocError> {
     kernel::sync::IrqLockGuard guard{state_lock_};
     if (!key.valid() || key.slot() >= max_operations) {
@@ -234,12 +465,22 @@ auto Vproc::take_operation(operation::Key key) noexcept
     slot.status = MYOS_STATUS_OK;
     slot.value = 0;
     slot.cookie = 0;
+    slot.continuation = nullptr;
     slot.state = OperationState::Free;
     ready_mask_ &= ~(u64{1} << key.slot());
+    offered_mask_ &= ~(u64{1} << key.slot());
     __atomic_fetch_and(
         &runtime_.events->ready_mask,
         ~(u64{1} << key.slot()),
         __ATOMIC_RELEASE);
+    __atomic_fetch_and(
+        &runtime_.events->offer_mask,
+        ~(u64{1} << key.slot()),
+        __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &runtime_.events->operation_key[key.slot()], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &runtime_.events->operation_cookie[key.slot()], 0, __ATOMIC_RELEASE);
     return libk::expected(result);
 }
 
@@ -451,7 +692,8 @@ void Vproc::retry_stop_if_ready() noexcept {
             return;
         }
         for (const OperationSlot& slot : operations_) {
-            if (slot.state == OperationState::Pending) {
+            if (slot.state == OperationState::Pending
+                || slot.state == OperationState::Offered) {
                 return;
             }
         }
@@ -491,16 +733,23 @@ void Vproc::finish_stop() noexcept {
             && !activation_.pending());
         KASSERT(stop_requested_ && stop_dispatched_ && !stopped_);
         for (OperationSlot& slot : operations_) {
-            KASSERT(slot.state != OperationState::Pending);
+            KASSERT(slot.state != OperationState::Pending
+                && slot.state != OperationState::Offered);
             slot.completion = nullptr;
+            slot.continuation = nullptr;
             slot.status = MYOS_STATUS_OK;
             slot.value = 0;
             slot.cookie = 0;
             slot.state = OperationState::Free;
         }
         ready_mask_ = 0;
+        offered_mask_ = 0;
+        resume_mask_ = 0;
+        handoff_mask_ = 0;
         ingress_mask_ = 0;
         __atomic_store_n(&runtime_.events->ready_mask, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&runtime_.events->offer_mask, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&runtime_.events->handoff_mask, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&runtime_.events->ingress_mask, 0, __ATOMIC_RELEASE);
         KASSERT(execution_.state_ == State::Exited
             && execution_.scheduler_binding_ == nullptr);

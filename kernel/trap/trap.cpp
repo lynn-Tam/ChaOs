@@ -9,11 +9,13 @@
 #include <cpu/cpu_runtime.hpp>
 #include <diag/console.hpp>
 #include <mm/vspace.hpp>
+#include <operation/wait.hpp>
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>
 #include <trap/trap.hpp>
+#include <uapi/status.h>
 
 namespace kernel::trap {
 
@@ -104,6 +106,12 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         }
         KASSERT(execution->binding().fault_route()
             == kernel::FaultRoute::Terminate);
+        if (kernel::execution::Frame* const frame = execution->active_frame();
+            frame != nullptr) {
+            frame->unwind(
+                context, *cpu.dispatcher(), MYOS_STATUS_PEER_FAULT);
+            return;
+        }
         if (thread != nullptr) {
             thread->record_user_fault(event);
             kernel::diag::console::print<
@@ -141,33 +149,41 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     KASSERT(cpu.dispatcher() != nullptr);
     kernel::Thread* const thread = cpu.current_thread();
     kernel::Vproc* const vproc = cpu.current_vproc();
-    KASSERT(thread != nullptr || vproc != nullptr);
-    if (vproc != nullptr) {
-        cpu.dispatcher()->on_trap_exit();
-        KASSERT(cpu.current_vproc() == vproc);
-        vproc->on_trap_exit(context);
-        return;
+    kernel::Execution* const execution = cpu.current_execution();
+    KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
+    while (execution->active_frame() != nullptr
+        && (cpu.dispatcher()->current().stop_requested()
+            || execution->cancel_pending())) {
+        execution->active_frame()->unwind(
+            context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
     }
-    if (thread->wait_ready()) {
-        thread->resume_wait(context);
+    operation::Wait* wait = execution->wait();
+    if (wait != nullptr && wait->ready()) {
+        wait->finish(context);
     }
     cpu.dispatcher()->on_trap_exit();
     // A wake credit closes wake-before-block, but it is not evidence that the
     // current subsystem operation has completed: an older credit may merely
     // make the first block attempt a no-op. The canonical wait is the truth.
     // Keep this continuation in the kernel until that relation is complete.
-    KASSERT(cpu.current_thread() == thread);
-    while (thread->waiting()) {
-        if (thread->wait_ready()) {
-            thread->resume_wait(context);
+    KASSERT(cpu.current_execution() == execution);
+    wait = execution->wait();
+    while (wait != nullptr && wait->attached()) {
+        if (wait->ready()) {
+            wait->finish(context);
             break;
         }
         cpu.dispatcher()->block_current();
-        KASSERT(cpu.current_thread() == thread);
+        KASSERT(cpu.current_execution() == execution);
+        wait = execution->wait();
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.
     cpu.dispatcher()->on_trap_exit();
+    KASSERT(cpu.current_execution() == execution);
+    if (vproc != nullptr && execution->active_frame() == nullptr) {
+        vproc->on_trap_exit(context);
+    }
 }
 
 } // namespace kernel::trap

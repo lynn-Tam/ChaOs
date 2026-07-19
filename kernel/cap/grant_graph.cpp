@@ -1264,6 +1264,7 @@ void GrantGraph::stop_allocation(
     case object::ObjectKind::VSpace:
     case object::ObjectKind::Notification:
     case object::ObjectKind::Tunnel:
+    case object::ObjectKind::Endpoint:
         allocation.target_ready();
         return;
     }

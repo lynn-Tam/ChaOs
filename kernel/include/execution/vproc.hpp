@@ -24,8 +24,11 @@ namespace kernel {
 class CpuRegistry;
 namespace operation {
 class Completion;
+class Wait;
 }
 namespace ipc {
+class Call;
+class Endpoint;
 class Tunnel;
 }
 namespace execution {
@@ -113,7 +116,11 @@ public:
         operation::Completion& completion,
         CpuRegistry& cpus,
         usize cookie) noexcept -> libk::Expected<operation::Key, VprocError>;
-    [[nodiscard]] auto take_operation(operation::Key key) noexcept
+    [[nodiscard]] auto poll_operation(operation::Key key) const noexcept
+        -> libk::Expected<operation::Result, VprocError>;
+    [[nodiscard]] auto cancel_operation(operation::Key key) noexcept
+        -> libk::Expected<void, VprocError>;
+    [[nodiscard]] auto finish_operation(operation::Key key) noexcept
         -> libk::Expected<operation::Result, VprocError>;
     [[nodiscard]] auto pending_sequence() const noexcept -> u64;
     [[nodiscard]] auto arm(
@@ -135,11 +142,14 @@ private:
     friend class sched::RemoteQueue;
     friend class execution::Stop;
     friend class execution::Target;
+    friend class ipc::Endpoint;
     friend class ipc::Tunnel;
 
     enum class OperationState : u8 {
         Free,
+        Reserved,
         Pending,
+        Offered,
         Ready,
     };
 
@@ -151,6 +161,7 @@ private:
 
     struct OperationSlot final {
         operation::Completion* completion{};
+        ipc::Call* continuation{};
         myos_status_t status{MYOS_STATUS_OK};
         usize value{};
         usize cookie{};
@@ -167,12 +178,36 @@ private:
 
 
     [[noreturn]] static void start(void* argument) noexcept;
+    [[nodiscard]] auto endpoint_ready() const noexcept -> bool;
+    [[nodiscard]] auto reserve_operation(usize cookie) noexcept
+        -> libk::Expected<operation::Key, VprocError>;
+    [[nodiscard]] auto commit_operation(
+        operation::Key key,
+        operation::Completion& completion,
+        CpuRegistry& cpus,
+        ipc::Call* continuation = nullptr) noexcept -> bool;
+    void release_operation(operation::Key key) noexcept;
+    [[nodiscard]] auto park_endpoint(
+        ipc::Call& root,
+        operation::Wait& wait,
+        arch::TrapContext& trap,
+        sched::CpuDispatcher& dispatcher) noexcept -> bool;
+    void wake_endpoint(ipc::Call& root, CpuRegistry& cpus) noexcept;
+    void finish_endpoint_resume(ipc::Call& root, bool materialized) noexcept;
     void request_stop(execution::Stop& request) noexcept;
     void finish_stop() noexcept;
     void publish_operation(
         operation::Key key,
         operation::Result result,
         CpuRegistry& cpus) noexcept;
+    [[nodiscard]] auto offer_operation(
+        operation::Key key,
+        operation::Completion& completion,
+        CpuRegistry& cpus) noexcept -> bool;
+    [[nodiscard]] auto claim_operation(
+        operation::Key key,
+        operation::Completion& completion) noexcept
+        -> libk::Expected<myos_user_context, VprocError>;
     void cancel_operations() noexcept;
     [[nodiscard]] auto attach_tunnel_source(ipc::TunnelLink& link) noexcept
         -> bool;
@@ -224,7 +259,10 @@ private:
     StopList stops_{};
     u64 pending_sequence_{};
     u64 ready_mask_{};
+    u64 offered_mask_{};
     u64 ingress_mask_{};
+    u64 resume_mask_{};
+    u64 handoff_mask_{};
     u64 upcall_generation_{};
     UpcallState upcall_state_{UpcallState::Unarmed};
     bool arm_attaching_{};

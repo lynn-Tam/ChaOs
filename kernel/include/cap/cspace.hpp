@@ -23,6 +23,7 @@ class CpuRegistry;
 class ExecutionBinding;
 class Thread;
 namespace ipc {
+class Transfer;
 class Tunnel;
 }
 namespace object {
@@ -67,6 +68,7 @@ public:
 
     private:
         friend class CSpace;
+        friend class kernel::ipc::Transfer;
         Reservation(
             CSpace& owner,
             CapHandle handle,
@@ -210,6 +212,7 @@ public:
 private:
     friend class ::kernel::mm::VSpace;
     friend class kernel::ExecutionBinding;
+    friend class kernel::ipc::Transfer;
     friend struct kernel::object::ObjectTraits<CSpace>;
     static constexpr usize leaf_bits = 3;
     static constexpr usize dir_bits = 8;
