@@ -6,6 +6,7 @@
 #include <execution/execution.hpp>
 #include <execution/stop.hpp>
 #include <ipc/tunnel_link.hpp>
+#include <ipc/notification_link.hpp>
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
@@ -24,11 +25,9 @@ namespace kernel {
 class CpuRegistry;
 namespace operation {
 class Completion;
-class Wait;
 }
 namespace ipc {
-class Call;
-class Endpoint;
+class Notification;
 class Tunnel;
 }
 namespace execution {
@@ -123,6 +122,8 @@ public:
     [[nodiscard]] auto finish_operation(operation::Key key) noexcept
         -> libk::Expected<operation::Result, VprocError>;
     [[nodiscard]] auto pending_sequence() const noexcept -> u64;
+    [[nodiscard]] auto request_park(u64 observed_sequence) noexcept
+        -> libk::Expected<void, VprocError>;
     [[nodiscard]] auto arm(
         const cap::Resolved<kernel::mm::MemoryObject>& code,
         const cap::Resolved<kernel::mm::MemoryObject>& stack,
@@ -132,6 +133,7 @@ public:
     [[nodiscard]] auto resume(
         arch::TrapContext& trap,
         u64 generation) noexcept -> libk::Expected<void, VprocError>;
+    void request_exit() noexcept;
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
 
 private:
@@ -142,14 +144,12 @@ private:
     friend class sched::RemoteQueue;
     friend class execution::Stop;
     friend class execution::Target;
-    friend class ipc::Endpoint;
     friend class ipc::Tunnel;
+    friend class ipc::Notification;
 
     enum class OperationState : u8 {
         Free,
-        Reserved,
         Pending,
-        Offered,
         Ready,
     };
 
@@ -161,7 +161,6 @@ private:
 
     struct OperationSlot final {
         operation::Completion* completion{};
-        ipc::Call* continuation{};
         myos_status_t status{MYOS_STATUS_OK};
         usize value{};
         usize cookie{};
@@ -176,38 +175,21 @@ private:
         usize tag{};
     };
 
+    struct NotificationSlot final {
+        ipc::NotificationLink* link{};
+        u64 binding_generation{};
+        u64 signal_sequence{};
+        usize tag{};
+    };
+
 
     [[noreturn]] static void start(void* argument) noexcept;
-    [[nodiscard]] auto endpoint_ready() const noexcept -> bool;
-    [[nodiscard]] auto reserve_operation(usize cookie) noexcept
-        -> libk::Expected<operation::Key, VprocError>;
-    [[nodiscard]] auto commit_operation(
-        operation::Key key,
-        operation::Completion& completion,
-        CpuRegistry& cpus,
-        ipc::Call* continuation = nullptr) noexcept -> bool;
-    void release_operation(operation::Key key) noexcept;
-    [[nodiscard]] auto park_endpoint(
-        ipc::Call& root,
-        operation::Wait& wait,
-        arch::TrapContext& trap,
-        sched::CpuDispatcher& dispatcher) noexcept -> bool;
-    void wake_endpoint(ipc::Call& root, CpuRegistry& cpus) noexcept;
-    void finish_endpoint_resume(ipc::Call& root, bool materialized) noexcept;
     void request_stop(execution::Stop& request) noexcept;
     void finish_stop() noexcept;
     void publish_operation(
         operation::Key key,
         operation::Result result,
         CpuRegistry& cpus) noexcept;
-    [[nodiscard]] auto offer_operation(
-        operation::Key key,
-        operation::Completion& completion,
-        CpuRegistry& cpus) noexcept -> bool;
-    [[nodiscard]] auto claim_operation(
-        operation::Key key,
-        operation::Completion& completion) noexcept
-        -> libk::Expected<myos_user_context, VprocError>;
     void cancel_operations() noexcept;
     [[nodiscard]] auto attach_tunnel_source(ipc::TunnelLink& link) noexcept
         -> bool;
@@ -233,6 +215,27 @@ private:
         u64 binding_generation,
         u64 signal_sequence) noexcept;
     void close_tunnels() noexcept;
+    [[nodiscard]] auto attach_notification(
+        ipc::NotificationLink& link,
+        usize slot,
+        usize tag) noexcept -> libk::optional<u64>;
+    void detach_notification(
+        ipc::NotificationLink& link,
+        usize slot,
+        u64 binding_generation) noexcept;
+    void publish_notification(
+        ipc::NotificationLink& link,
+        usize slot,
+        u64 binding_generation,
+        u64 signal_sequence,
+        usize tag,
+        CpuRegistry& cpus) noexcept;
+    void clear_notification(
+        ipc::NotificationLink& link,
+        usize slot,
+        u64 binding_generation,
+        u64 signal_sequence) noexcept;
+    void close_notifications() noexcept;
     [[nodiscard]] auto pending_operations() const noexcept -> bool;
     [[nodiscard]] auto pending_events() const noexcept -> bool;
     [[nodiscard]] auto activation_quiescent() const noexcept -> bool;
@@ -255,20 +258,21 @@ private:
         ipc::TunnelLink, &ipc::TunnelLink::hook>;
     TunnelLinks outgoing_tunnels_{};
     IngressSlot ingresses_[MYOS_VPROC_MAX_INGRESS]{};
-    mutable bool tunnel_admission_closed_{};
+    NotificationSlot notifications_[MYOS_VPROC_MAX_NOTIFICATIONS]{};
+    mutable bool relation_admission_closed_{};
     StopList stops_{};
     u64 pending_sequence_{};
     u64 ready_mask_{};
-    u64 offered_mask_{};
     u64 ingress_mask_{};
-    u64 resume_mask_{};
-    u64 handoff_mask_{};
+    u64 notification_mask_{};
     u64 upcall_generation_{};
+    u64 park_sequence_{};
     UpcallState upcall_state_{UpcallState::Unarmed};
     bool arm_attaching_{};
     bool stop_requested_{};
     bool stop_dispatched_{};
     bool stopped_{};
+    bool park_requested_{};
     usize activation_publishers_{};
     bool activation_request_held_{};
     bool activation_posting_{};

@@ -50,6 +50,8 @@ public:
     void complete_syscall() noexcept;
 
     [[nodiscard]] auto arg(usize index) const noexcept -> usize;
+    // The architecture-neutral syscall ABI publishes status plus two bounded
+    // result words in a0-a2. Other indices are not writable through this view.
     void set_result(usize index, usize value) noexcept;
     void set_return(usize value) noexcept { set_result(0, value); }
 

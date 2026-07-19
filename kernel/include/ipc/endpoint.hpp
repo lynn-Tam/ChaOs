@@ -7,7 +7,6 @@
 #include <core/types.hpp>
 #include <execution/binding.hpp>
 #include <execution/frame.hpp>
-#include <execution/target.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
@@ -17,8 +16,10 @@
 #include <mm/node_pool.hpp>
 #include <mm/user_view.hpp>
 #include <object/object_cleanup.hpp>
+#include <object/thread_pool.hpp>
 #include <operation/completion.hpp>
 #include <operation/wait.hpp>
+#include <ipc/transfer.hpp>
 #include <resource/sponsorship.hpp>
 #include <sched/types.hpp>
 #include <time/time.hpp>
@@ -26,7 +27,7 @@
 
 namespace kernel {
 class CpuRegistry;
-class Vproc;
+class Thread;
 }
 
 namespace kernel::sched {
@@ -45,6 +46,7 @@ enum class EndpointError : u8 {
     QueueFull,
     BudgetTooLow,
     Denied,
+    TransferFailed,
 };
 
 struct EndpointConfig final {
@@ -134,29 +136,12 @@ public:
 
 private:
     friend class Endpoint;
-    friend class ::kernel::Vproc;
-
-    enum class CallerOwner : u8 {
-        None,
-        Direct,
-        Runtime,
-    };
-
-    enum class ContinuationState : u8 {
-        None,
-        Materialized,
-        Parking,
-        Parked,
-        ResumePending,
-        Resuming,
-    };
 
     [[nodiscard]] auto complete() const noexcept -> bool;
     [[nodiscard]] auto read() noexcept -> operation::Result;
     void release() noexcept;
     [[nodiscard]] auto cancel() noexcept -> bool;
     void resume(arch::TrapContext& trap) noexcept;
-    void wake_parked() noexcept;
     static void invalidate_authority(
         void* context,
         cap::GrantWork&& work,
@@ -168,13 +153,8 @@ private:
     Endpoint* endpoint_{};
     operation::Completion completion_;
     libk::ManualLifetime<cap::GrantAttachment> authority_{};
-    execution::TargetHold caller_{};
+    object::ThreadHold caller_{};
     arch::UserFrame caller_frame_{};
-    myos_user_context caller_context_{};
-    arch::UserFrame parked_frame_{};
-    arch::UserFrame base_frame_{};
-    myos_user_context base_context_{};
-    execution::Frame* parked_top_{};
     Activation* activation_{};
     usize arguments_[3]{};
     operation::Result result_{};
@@ -184,28 +164,24 @@ private:
     usize urgency_{};
     usize badge_{};
     usize cap_limit_{};
+    usize receive_limit_{};
+    Transfer::Specs request_caps_{};
+    Transfer::Handles installed_caps_{};
+    Transfer transfer_{};
     isize cancel_status_{MYOS_STATUS_CANCELED};
     CpuRegistry* cpus_{};
     usize publishers_{};
     bool cancel_pending_{};
-    bool async_{};
-    bool operation_committed_{};
-    operation::Key operation_{};
-    Vproc* vproc_{};
-    CallerOwner caller_owner_{CallerOwner::None};
-    ContinuationState continuation_{ContinuationState::None};
     State state_{State::Free};
 };
 
 enum class CallDisposition : u8 {
     Entered,
     Blocking,
-    Pending,
 };
 
 struct CallResult final {
     CallDisposition disposition{CallDisposition::Entered};
-    operation::Key operation{};
 };
 
 // Immutable protected-procedure entry plus a fixed, sponsor-paid Activation
@@ -236,33 +212,18 @@ public:
     [[nodiscard]] auto open() noexcept -> libk::Expected<void, EndpointError>;
     [[nodiscard]] auto call(
         const cap::Resolved<Endpoint>& authority,
-        execution::Target caller,
+        Thread& caller,
         arch::TrapContext& trap,
         sched::CpuDispatcher& dispatcher,
         CpuRegistry& cpus,
-        const usize (&arguments)[3],
-        bool async,
-        usize cookie) noexcept
+        const usize (&arguments)[3]) noexcept
         -> libk::Expected<CallResult, EndpointError>;
-    [[nodiscard]] auto enter(
-        Vproc& caller,
-        operation::Key operation,
-        arch::TrapContext& trap,
-        sched::CpuDispatcher& dispatcher) noexcept
-        -> libk::Expected<void, EndpointError>;
     [[nodiscard]] auto reply(
-        execution::Target caller,
+        Thread& caller,
         arch::TrapContext& trap,
         sched::CpuDispatcher& dispatcher,
         isize status,
         usize value) noexcept -> libk::Expected<void, EndpointError>;
-    // Called only from the common user trap-exit boundary. Returns true after
-    // the current Vproc Endpoint chain was detached and the trap return was
-    // redirected to its base runtime.
-    [[nodiscard]] auto park(
-        execution::Target caller,
-        arch::TrapContext& trap,
-        sched::CpuDispatcher& dispatcher) noexcept -> bool;
 
     void close() noexcept;
     void retire(object::ObjectCleanup&& cleanup) noexcept;
@@ -279,10 +240,9 @@ private:
         Closed,
     };
 
-    [[nodiscard]] static auto hold(execution::Target target) noexcept
-        -> libk::Expected<execution::TargetHold, EndpointError>;
-    [[nodiscard]] auto depth(const Execution& execution) const noexcept
-        -> usize;
+    [[nodiscard]] static auto hold(Thread& thread) noexcept
+        -> libk::Expected<object::ThreadHold, EndpointError>;
+    [[nodiscard]] auto depth(const Thread& thread) const noexcept -> usize;
     [[nodiscard]] auto call_complete(const Call& call) const noexcept -> bool;
     [[nodiscard]] auto read_call(Call& call) noexcept -> operation::Result;
     void release_call(Call& call) noexcept;
@@ -298,6 +258,19 @@ private:
         Call& call,
         arch::TrapContext& trap,
         sched::CpuDispatcher& dispatcher) noexcept -> bool;
+    [[nodiscard]] auto snapshot_caps(
+        const Buffer* buffer,
+        usize limit,
+        Transfer::Specs& specs,
+        usize& receive_limit) noexcept -> bool;
+    [[nodiscard]] auto commit_caps(
+        Transfer& transfer,
+        cap::CSpace& source,
+        cap::CSpace& destination,
+        const Transfer::Specs& specs,
+        Buffer* receiver,
+        Transfer::Handles& installed) noexcept -> bool;
+    void close_installed(Call& call) noexcept;
     static void unwind_frame(
         void* owner,
         arch::TrapContext& trap,
@@ -312,11 +285,6 @@ private:
         isize status,
         usize value,
         bool reply) noexcept -> bool;
-    [[nodiscard]] auto resume_parked(
-        Call& root,
-        Vproc& vproc,
-        arch::TrapContext& trap,
-        sched::CpuDispatcher& dispatcher) noexcept -> bool;
     [[nodiscard]] auto next_call_locked(Activation& slot) noexcept -> Call*;
     void reset_call_locked(Call& call) noexcept;
     void try_finish_retire() noexcept;

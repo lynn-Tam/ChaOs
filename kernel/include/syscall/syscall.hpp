@@ -8,6 +8,7 @@ enum class Disposition : u8 {
     Return,
     Yield,
     Block,
+    Park,
     Exit,
     Resume,
 };

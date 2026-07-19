@@ -1,6 +1,7 @@
 #pragma once
 
 #include <uapi/capability.h>
+#include <uapi/endpoint.h>
 #include <uapi/resource.h>
 #include <uapi/status.h>
 #include <uapi/syscall.h>
@@ -15,6 +16,7 @@ namespace myos {
 struct SysResult final {
     myos_status_t status{};
     myos_word_t value{};
+    myos_word_t value2{};
 };
 
 [[nodiscard]] inline auto syscall(
@@ -34,12 +36,13 @@ struct SysResult final {
     register myos_word_t a7 asm("a7") = operation;
     asm volatile(
         "ecall"
-        : "+r"(a0), "+r"(a1)
-        : "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+        : "+r"(a0), "+r"(a1), "+r"(a2)
+        : "r"(a3), "r"(a4), "r"(a5), "r"(a7)
         : "memory");
     return SysResult{
         .status = static_cast<myos_status_t>(a0),
         .value = a1,
+        .value2 = a2,
     };
 }
 
@@ -173,6 +176,61 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_NOTIFICATION_WAIT, notification, cookie);
 }
 
+[[nodiscard]] inline auto notification_bind_vproc(
+    myos_cap_t notification,
+    myos_word_t slot,
+    myos_word_t tag) noexcept -> SysResult {
+    return syscall(MYOS_SYS_NOTIFICATION_BIND_VPROC, notification, slot, tag);
+}
+
+[[nodiscard]] inline auto notification_unbind_vproc(
+    myos_cap_t notification) noexcept -> SysResult {
+    return syscall(MYOS_SYS_NOTIFICATION_UNBIND_VPROC, notification);
+}
+
+[[nodiscard]] inline auto endpoint_create(
+    myos_cap_t pool,
+    myos_cap_t vspace,
+    myos_cap_t cspace,
+    myos_cap_t descriptor_memory,
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_ENDPOINT_CREATE,
+        pool, vspace, cspace, descriptor_memory, descriptor_offset);
+}
+
+[[nodiscard]] inline auto endpoint_mint(
+    myos_cap_t endpoint,
+    myos_cap_t destination_cspace,
+    myos_word_t badge,
+    myos_word_t cap_limit,
+    myos_word_t rights) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_ENDPOINT_MINT,
+        endpoint, destination_cspace, badge, cap_limit, rights);
+}
+
+[[nodiscard]] inline auto endpoint_call(
+    myos_cap_t endpoint,
+    myos_word_t first = 0,
+    myos_word_t second = 0,
+    myos_word_t third = 0) noexcept -> SysResult {
+    return syscall(MYOS_SYS_ENDPOINT_CALL, endpoint, first, second, third);
+}
+
+[[nodiscard]] inline auto endpoint_reply(
+    myos_status_t status,
+    myos_word_t value = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_ENDPOINT_REPLY,
+        static_cast<myos_word_t>(status), value);
+}
+
+[[nodiscard]] inline auto endpoint_close(myos_cap_t endpoint) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_ENDPOINT_CLOSE, endpoint);
+}
+
 [[nodiscard]] inline auto vproc_create(
     myos_cap_t pool,
     myos_cap_t vspace,
@@ -198,6 +256,11 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto vproc_checkpoint() noexcept -> SysResult {
     return syscall(MYOS_SYS_VPROC_CHECKPOINT);
+}
+
+[[nodiscard]] inline auto vproc_park(
+    myos_word_t observed_sequence) noexcept -> SysResult {
+    return syscall(MYOS_SYS_VPROC_PARK, observed_sequence);
 }
 
 [[nodiscard]] inline auto tunnel_open(

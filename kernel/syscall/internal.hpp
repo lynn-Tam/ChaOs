@@ -29,12 +29,13 @@ struct Result final {
     myos_status_t status{MYOS_STATUS_OK};
     usize value{};
     Disposition disposition{Disposition::Return};
+    usize value2{};
 };
 
 [[nodiscard]] constexpr auto returned(
     myos_status_t status,
     usize value = 0) noexcept -> Result {
-    return Result{status, value, Disposition::Return};
+    return Result{status, value, Disposition::Return, 0};
 }
 
 [[nodiscard]] auto cap_status(cap::CSpaceError error) noexcept

@@ -11,7 +11,13 @@ class Binding;
 class CpuDispatcher;
 }
 
+namespace kernel::operation {
+class Wait;
+}
+
 namespace kernel::execution {
+
+class Frame;
 
 // Borrowed view of the closed schedulable target set. It carries no lifetime;
 // sched::Binding owns a typed hold while CpuDispatcher borrows the committed
@@ -30,6 +36,14 @@ public:
     [[nodiscard]] auto thread() const noexcept -> Thread*;
     [[nodiscard]] auto vproc() const noexcept -> Vproc*;
     [[nodiscard]] auto execution() const noexcept -> Execution&;
+    [[nodiscard]] auto stack_base() const noexcept -> usize;
+    [[nodiscard]] auto stack_top() const noexcept -> usize;
+    [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool;
+    [[nodiscard]] auto effective_binding() const noexcept -> ExecutionBinding&;
+    [[nodiscard]] auto ipc_buffer() const noexcept -> ipc::Buffer*;
+    [[nodiscard]] auto wait() const noexcept -> operation::Wait*;
+    [[nodiscard]] auto active_frame() const noexcept -> execution::Frame*;
+    [[nodiscard]] auto cancel_pending() const noexcept -> bool;
     [[nodiscard]] auto idle() const noexcept -> bool;
     [[nodiscard]] auto identity() const noexcept -> usize;
     [[nodiscard]] auto stop_deferred() const noexcept -> bool;

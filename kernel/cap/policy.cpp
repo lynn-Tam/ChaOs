@@ -42,7 +42,7 @@ constexpr Rights notification_rights = Rights::of(
     Right::Delegate,
     Right::Inspect,
     Right::Signal,
-    Right::Wait,
+    Right::Receive,
     Right::Destroy,
     Right::Revoke);
 
@@ -54,9 +54,6 @@ constexpr Rights endpoint_rights = Rights::of(
     Right::Close,
     Right::Destroy,
     Right::Revoke);
-
-constexpr u64 endpoint_modes = MYOS_ENDPOINT_MODE_BLOCK
-    | MYOS_ENDPOINT_MODE_ASYNC;
 
 [[nodiscard]] auto valid(MemoryAuthority authority) noexcept -> bool {
     return authority.range.end().has_value()
@@ -83,9 +80,7 @@ constexpr u64 endpoint_modes = MYOS_ENDPOINT_MODE_BLOCK
 
 [[nodiscard]] auto valid(EndpointAuthority authority) noexcept -> bool {
     return (authority.badge & ~authority.fixed) == 0
-        && authority.cap_limit <= MYOS_ENDPOINT_MAX_CAPS
-        && authority.modes != 0
-        && (authority.modes & ~endpoint_modes) == 0;
+        && authority.cap_limit <= MYOS_ENDPOINT_MAX_CAPS;
 }
 
 template<object::ObjectKind Kind>
@@ -248,8 +243,7 @@ auto CapabilityPolicy<object::ObjectKind::Endpoint>::compose(
     if (!ceiling.rights.contains(view.rights)
         || (local->fixed & upper->fixed) != upper->fixed
         || (local->badge & upper->fixed) != upper->badge
-        || local->cap_limit > upper->cap_limit
-        || (local->modes & ~upper->modes) != 0) {
+        || local->cap_limit > upper->cap_limit) {
         return libk::unexpected(PolicyError::Amplification);
     }
     return libk::expected(EffectiveAuthority{

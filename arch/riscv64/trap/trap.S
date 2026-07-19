@@ -110,9 +110,12 @@ arch_riscv64_trap_entry:
     csrr t0, stval
     sd t0, STVAL_OFFSET(sp)
 
-    // -> arch_riscv64_trap_handler(reinterpret_cast<TrapFrame*>(sp))
+    // The handler returns the selected user-return frame.  Cross-domain
+    // continuations may replace the interrupted frame before the common exit
+    // hook observes scheduler and wait state.
     mv a0, sp
     call arch_riscv64_trap_handler
+    mv sp, a0
     /*---- 恢复边界 ----*/
     // sscratch is restored to CpuEntryBlock before C++ runs, so return can update
     // trap_depth without depending on any frame-resident temporary register.
@@ -122,7 +125,7 @@ arch_riscv64_trap_entry:
     sd t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
 
     /*
-    The interrupted TrapFrame remains on its owning stack. A future context
+    The selected TrapFrame remains on its owning stack. A future context
     switch may resume at this call site before restoring this same frame.
     */
     mv a0, sp

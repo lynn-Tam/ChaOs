@@ -11,7 +11,7 @@ namespace kernel {
 
 auto Vproc::attach_tunnel_source(ipc::TunnelLink& link) noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
-    if (tunnel_admission_closed_ || link.hook.is_linked()) {
+    if (relation_admission_closed_ || link.hook.is_linked()) {
         return false;
     }
     outgoing_tunnels_.push_back(link);
@@ -27,7 +27,7 @@ auto Vproc::attach_tunnel_target(
     }
     kernel::sync::IrqLockGuard guard{state_lock_};
     IngressSlot& ingress = ingresses_[slot];
-    if (tunnel_admission_closed_ || ingress.link != nullptr
+    if (relation_admission_closed_ || ingress.link != nullptr
         || ingress.binding_generation == libk::numeric_limits<u64>::max()) {
         return libk::nullopt;
     }

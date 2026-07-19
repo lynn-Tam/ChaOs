@@ -23,7 +23,7 @@ enum class Right : u64 {
     Split = u64{1} << 13,
     Close = u64{1} << 14,
     Signal = u64{1} << 15,
-    Wait = u64{1} << 16,
+    Receive = u64{1} << 16,
     Connect = u64{1} << 17,
     Ack = u64{1} << 18,
     Call = u64{1} << 19,

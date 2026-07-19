@@ -10,8 +10,8 @@ class TrapContext;
 namespace kernel {
 
 class ExecutionBinding;
-class Execution;
 class KernelStack;
+class Thread;
 namespace sched {
 class CpuDispatcher;
 }
@@ -79,7 +79,7 @@ public:
     }
 
 private:
-    friend class ::kernel::Execution;
+    friend class ::kernel::Thread;
 
     KernelStack* stack_{};
     ExecutionBinding* binding_{};

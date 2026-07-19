@@ -12,13 +12,13 @@ namespace kernel::operation {
 Completion::~Completion() noexcept {
     KASSERT(owner_ != nullptr && ops_ != nullptr);
     KASSERT(!attached());
-    KASSERT(!signal_pending_.load<libk::MemoryOrder::Acquire>());
 }
 
 void Completion::attach(Wait& wait) noexcept {
     KASSERT(!attached());
-    KASSERT(!signal_pending_.load<libk::MemoryOrder::Acquire>());
-    KASSERT(wait.attached());
+    // Wait is the sole caller and publishes its completion_ edge while
+    // holding Wait::lock_. Do not call back into Wait here: attached() takes
+    // that same non-recursive lock and would self-deadlock the admission path.
     sink_.template emplace<BlockingSink>(BlockingSink{&wait});
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
@@ -28,7 +28,6 @@ void Completion::attach(
     CpuRegistry& cpus,
     operation::Key key) noexcept {
     KASSERT(!attached() && key.valid());
-    KASSERT(!signal_pending_.load<libk::MemoryOrder::Acquire>());
     KASSERT(vproc.binding() != nullptr);
     sink_.template emplace<VprocSink>(VprocSink{&vproc, &cpus, key});
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
@@ -39,10 +38,6 @@ void Completion::signal() noexcept {
     if (!delivery_.compare_exchange_strong<
             libk::MemoryOrder::AcqRel,
             libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
-        if (expected == Delivery::Offering) {
-            signal_pending_.store<libk::MemoryOrder::Release>(true);
-            return;
-        }
         KASSERT(expected == Delivery::Claimed
             || expected == Delivery::Ready
             || expected == Delivery::Detached);
@@ -65,25 +60,6 @@ void Completion::signal() noexcept {
     sink_.template emplace<libk::monostate>();
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
     ops_->release(owner_);
-}
-
-auto Completion::offer() noexcept -> bool {
-    Delivery expected = Delivery::Attached;
-    if (!delivery_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, Delivery::Offering)) {
-        return false;
-    }
-    auto* const target = libk::get_if<VprocSink>(&sink_);
-    KASSERT(target != nullptr && target->vproc != nullptr
-        && target->cpus != nullptr);
-    const bool offered = target->vproc->offer_operation(
-        target->key, *this, *target->cpus);
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
-    if (signal_pending_.exchange<libk::MemoryOrder::AcqRel>(false)) {
-        signal();
-    }
-    return offered;
 }
 
 void Completion::finish(arch::TrapContext& trap) noexcept {
@@ -109,8 +85,7 @@ auto Completion::cancel() noexcept -> bool {
     Delivery observed = delivery_.load<libk::MemoryOrder::Acquire>();
     for (;;) {
         if (observed == Delivery::Detached
-            || observed == Delivery::Claimed
-            || observed == Delivery::Offering) {
+            || observed == Delivery::Claimed) {
             return false;
         }
         KASSERT(observed == Delivery::Attached
@@ -143,7 +118,6 @@ void Completion::detach() noexcept {
     KASSERT(delivery_.load<libk::MemoryOrder::Acquire>()
         == Delivery::Claimed);
     sink_.template emplace<libk::monostate>();
-    KASSERT(!signal_pending_.load<libk::MemoryOrder::Acquire>());
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
 }
 

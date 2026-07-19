@@ -1,12 +1,21 @@
-#include <ipc/notification.hpp>
+#include <object/notification_pool.hpp>
 
 #include <core/debug.hpp>
+#include <cpu/cpu_registry.hpp>
+#include <libk/limits.hpp>
+#include <libk/scope_guard.hpp>
+#include <sched/binding.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>
 #include <uapi/status.h>
 
 namespace kernel::ipc {
+
+const cap::GrantAttachmentOps Notification::authority_ops_{
+    .invalidate = &Notification::invalidate,
+    .released = &Notification::released,
+};
 
 NotificationSource::~NotificationSource() noexcept {
     KASSERT(owner_ != nullptr && ops_ != nullptr);
@@ -19,8 +28,22 @@ auto NotificationSource::attached() const noexcept -> bool {
 }
 
 auto NotificationSource::signal() noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{lock_};
-    return notification_ != nullptr && notification_->signal(badge_);
+    Notification* target{};
+    u64 badge{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        target = notification_;
+        badge = badge_;
+        if (target != nullptr) {
+            target->retain_relation();
+        }
+    }
+    if (target == nullptr) {
+        return false;
+    }
+    const bool delivered = target->signal(badge);
+    target->release_relation();
+    return delivered;
 }
 
 void NotificationSource::reset() noexcept {
@@ -108,7 +131,8 @@ auto Notification::Wait::cancel() noexcept -> bool {
     return owner_->cancel_wait();
 }
 
-Notification::Notification() noexcept : wait_(*this) {}
+Notification::Notification() noexcept
+    : wait_(*this), target_link_(*this), authority_(*this, authority_ops_) {}
 
 Notification::~Notification() noexcept {
     const Life life = life_.load<libk::MemoryOrder::Acquire>();
@@ -118,6 +142,10 @@ Notification::~Notification() noexcept {
     KASSERT(signalers_.load<libk::MemoryOrder::Acquire>() == 0);
     KASSERT(relations_.load<libk::MemoryOrder::Acquire>() == 0);
     KASSERT(wait_.idle() && sources_.empty() && !cleanup_);
+    KASSERT(receiver_ == Receiver::None && target_ == nullptr
+        && !target_hold_ && async_publishers_ == 0);
+    KASSERT(!authority_.attachment.attached()
+        && !authority_.attachment.busy() && !authority_.work);
 }
 
 auto Notification::signal(u64 badge) noexcept -> bool {
@@ -137,8 +165,51 @@ auto Notification::signal(u64 badge) noexcept -> bool {
         return false;
     }
 
-    static_cast<void>(pending_.fetch_or<libk::MemoryOrder::Release>(badge));
-    if (!wait_.idle() && wait_.ready()) {
+    Vproc* target{};
+    CpuRegistry* cpus{};
+    usize slot{};
+    usize tag{};
+    u64 generation{};
+    u64 sequence{};
+    bool wake{};
+    bool rejected{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
+            rejected = true;
+        } else {
+            static_cast<void>(
+                pending_.fetch_or<libk::MemoryOrder::Release>(badge));
+            KASSERT(signal_sequence_ != libk::numeric_limits<u64>::max());
+            ++signal_sequence_;
+            sequence = signal_sequence_;
+            if (receiver_ == Receiver::Async) {
+                KASSERT(target_ != nullptr && cpus_ != nullptr);
+                ++async_publishers_;
+                target = target_;
+                cpus = cpus_;
+                slot = slot_;
+                tag = tag_;
+                generation = binding_generation_;
+            } else if (!wait_.idle()) {
+                wake = wait_.ready();
+            }
+        }
+    }
+    if (rejected) {
+        const usize previous =
+            signalers_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
+        KASSERT(previous != 0);
+        if (previous == 1) {
+            try_finish_retire();
+        }
+        return false;
+    }
+    if (target != nullptr) {
+        target->publish_notification(
+            target_link_, slot, generation, sequence, tag, *cpus);
+        async_publisher_done();
+    } else if (wake) {
         wait_.relation().signal();
     }
 
@@ -151,20 +222,41 @@ auto Notification::signal(u64 badge) noexcept -> bool {
     return true;
 }
 
-auto Notification::take() noexcept
-    -> libk::Expected<u64, NotificationError> {
-    kernel::sync::IrqLockGuard guard{receiver_lock_};
-    if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
-        return libk::unexpected(NotificationError::Closed);
+auto Notification::take(Vproc* current) noexcept
+    -> libk::Expected<NotificationTake, NotificationError> {
+    Vproc* target{};
+    usize slot{};
+    u64 generation{};
+    u64 sequence{};
+    u64 badges{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
+            return libk::unexpected(NotificationError::Closed);
+        }
+        if (!wait_.idle()
+            || (receiver_ != Receiver::None
+                && (receiver_ != Receiver::Async || current != target_))) {
+            return libk::unexpected(NotificationError::Busy);
+        }
+        badges = pending_.exchange<libk::MemoryOrder::AcqRel>(0);
+        if (badges == 0) {
+            return libk::unexpected(NotificationError::Empty);
+        }
+        sequence = signal_sequence_;
+        if (receiver_ == Receiver::Async) {
+            ++async_publishers_;
+            target = target_;
+            slot = slot_;
+            generation = binding_generation_;
+        }
     }
-    if (!wait_.idle()) {
-        return libk::unexpected(NotificationError::Busy);
+    if (target != nullptr) {
+        target->clear_notification(
+            target_link_, slot, generation, sequence);
+        async_publisher_done();
     }
-    const u64 badges = pending_.exchange<libk::MemoryOrder::AcqRel>(0);
-    return badges != 0
-        ? libk::Expected<u64, NotificationError>{libk::expected(badges)}
-        : libk::Expected<u64, NotificationError>{
-              libk::unexpected(NotificationError::Empty)};
+    return libk::expected(NotificationTake{badges, sequence});
 }
 
 auto Notification::wait(Thread& thread, CpuRegistry& cpus) noexcept
@@ -174,7 +266,7 @@ auto Notification::wait(Thread& thread, CpuRegistry& cpus) noexcept
         if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
             return libk::unexpected(NotificationError::Closed);
         }
-        if (!wait_.idle()) {
+        if (!wait_.idle() || receiver_ != Receiver::None) {
             return libk::unexpected(NotificationError::Busy);
         }
         const u64 badges = pending_.exchange<libk::MemoryOrder::AcqRel>(0);
@@ -194,38 +286,228 @@ auto Notification::wait(Thread& thread, CpuRegistry& cpus) noexcept
         {}});
 }
 
-auto Notification::wait(
+auto Notification::bind_vproc(
     Vproc& vproc,
     CpuRegistry& cpus,
-    usize cookie) noexcept
-    -> libk::Expected<NotificationWait, NotificationError> {
-    operation::Key key{};
+    const cap::Resolved<Notification>& authority,
+    usize slot,
+    usize tag) noexcept -> libk::Expected<void, NotificationError> {
+    if (&authority.object() != this
+        || &authority.source() != vproc.execution().binding().cspace()) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+    sched::Binding* const binding = vproc.binding();
+    if (binding == nullptr) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+    auto reference = binding->target_reference();
+    if (!reference) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+    auto hold = libk::move(reference).value().into_hold<Vproc>();
+    if (!hold) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+
     {
         kernel::sync::IrqLockGuard guard{receiver_lock_};
         if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
             return libk::unexpected(NotificationError::Closed);
         }
-        if (!wait_.idle()) {
+        if (!wait_.idle() || receiver_ != Receiver::None) {
             return libk::unexpected(NotificationError::Busy);
         }
-        const u64 badges = pending_.exchange<libk::MemoryOrder::AcqRel>(0);
-        if (badges != 0) {
-            return libk::expected(NotificationWait{
-                operation::State::Complete, badges, {}});
+        receiver_ = Receiver::Attaching;
+        retain_relation();
+    }
+
+    bool reverse_attached{};
+    bool authority_attached{};
+    u64 generation{};
+    auto rollback = libk::on_scope_exit([&]() noexcept {
+        if (authority_attached && authority_.attachment.attached()) {
+            static_cast<void>(authority_.attachment.detach());
         }
-        wait_.begin();
-        auto allocated = vproc.begin_operation(wait_.relation(), cpus, cookie);
-        if (!allocated) {
-            wait_.abort();
+        if (reverse_attached) {
+            vproc.detach_notification(target_link_, slot, generation);
+        }
+        {
+            kernel::sync::IrqLockGuard guard{receiver_lock_};
+            if (receiver_ == Receiver::Attaching
+                || receiver_ == Receiver::Detaching) {
+                receiver_ = Receiver::None;
+            }
+        }
+        release_relation();
+    });
+
+    const auto attached = vproc.attach_notification(target_link_, slot, tag);
+    if (!attached) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+    generation = *attached;
+    reverse_attached = true;
+    if (!authority.attach(authority_.attachment)) {
+        return libk::unexpected(NotificationError::Busy);
+    }
+    authority_attached = true;
+
+    u64 sequence{};
+    bool publish{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open
+            || receiver_ != Receiver::Attaching) {
+            return libk::unexpected(NotificationError::Closed);
+        }
+        target_ = &vproc;
+        target_hold_ = libk::move(hold).value();
+        cpus_ = &cpus;
+        slot_ = slot;
+        tag_ = tag;
+        binding_generation_ = generation;
+        receiver_ = Receiver::Async;
+        if (pending_.load<libk::MemoryOrder::Acquire>() != 0) {
+            ++async_publishers_;
+            sequence = signal_sequence_;
+            publish = true;
+        }
+    }
+    static_cast<void>(rollback.release());
+    release_relation();
+    if (publish) {
+        vproc.publish_notification(
+            target_link_, slot, generation, sequence, tag, cpus);
+        async_publisher_done();
+    }
+    return libk::expected();
+}
+
+auto Notification::unbind_vproc(Vproc& vproc) noexcept
+    -> libk::Expected<void, NotificationError> {
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (receiver_ == Receiver::None) {
+            return libk::expected();
+        }
+        if ((receiver_ != Receiver::Async
+                && receiver_ != Receiver::Detaching)
+            || target_ != &vproc) {
             return libk::unexpected(NotificationError::Busy);
         }
-        key = allocated.value();
+        receiver_ = Receiver::Detaching;
     }
-    if (!wait_.arm()) {
-        wait_.relation().signal();
+    try_finish_async_detach();
+    kernel::sync::IrqLockGuard guard{receiver_lock_};
+    return receiver_ == Receiver::None
+        ? libk::Expected<void, NotificationError>{libk::expected()}
+        : libk::Expected<void, NotificationError>{
+              libk::unexpected(NotificationError::Busy)};
+}
+
+void Notification::invalidate(
+    void* context,
+    cap::GrantWork&& work,
+    cap::GrantInvalidation reason) noexcept {
+    KASSERT(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    auto& authority = *static_cast<AuthorityLink*>(context);
+    authority.owner->invalidated(libk::move(work));
+}
+
+void Notification::released(void* context) noexcept {
+    KASSERT(context != nullptr);
+}
+
+void Notification::invalidated(cap::GrantWork&& work) noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        KASSERT(!authority_.work);
+        authority_.work = libk::move(work);
+        if (receiver_ == Receiver::Async
+            || receiver_ == Receiver::Attaching) {
+            receiver_ = Receiver::Detaching;
+        }
     }
-    return libk::expected(NotificationWait{
-        operation::State::Waiting, 0, key});
+    try_finish_async_detach();
+}
+
+void Notification::begin_async_detach() noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (receiver_ == Receiver::Async
+            || receiver_ == Receiver::Attaching) {
+            receiver_ = Receiver::Detaching;
+        }
+    }
+    try_finish_async_detach();
+}
+
+void Notification::try_finish_async_detach() noexcept {
+    Vproc* target{};
+    object::ObjectHold<Vproc> hold{};
+    usize slot{};
+    u64 generation{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (receiver_ != Receiver::Detaching || async_publishers_ != 0) {
+            return;
+        }
+        receiver_ = Receiver::Draining;
+        target = target_;
+        hold = libk::move(target_hold_);
+        slot = slot_;
+        generation = binding_generation_;
+    }
+
+    if (target != nullptr && generation != 0) {
+        target->detach_notification(target_link_, slot, generation);
+    }
+    if (authority_.attachment.attached()) {
+        static_cast<void>(authority_.attachment.detach());
+    }
+
+    cap::GrantWork work{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        KASSERT(receiver_ == Receiver::Draining);
+        work = libk::move(authority_.work);
+        target_ = nullptr;
+        cpus_ = nullptr;
+        slot_ = 0;
+        tag_ = 0;
+        binding_generation_ = 0;
+        receiver_ = Receiver::None;
+    }
+    work.reset();
+    hold.reset();
+    try_finish_retire();
+}
+
+void Notification::async_publisher_done() noexcept {
+    bool finish{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        KASSERT(async_publishers_ != 0);
+        --async_publishers_;
+        finish = async_publishers_ == 0
+            && receiver_ == Receiver::Detaching;
+    }
+    if (finish) {
+        try_finish_async_detach();
+    }
+}
+
+void Notification::peer_stopped(Vproc& vproc) noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        if (target_ != &vproc || receiver_ == Receiver::None) {
+            return;
+        }
+        if (receiver_ == Receiver::Async) {
+            receiver_ = Receiver::Detaching;
+        }
+    }
+    try_finish_async_detach();
 }
 
 auto Notification::bind(NotificationSource& source, u64 badge) noexcept
@@ -287,7 +569,7 @@ auto Notification::finish_wait() noexcept -> operation::Result {
         if (life_.load<libk::MemoryOrder::Acquire>() == Life::Closing
             && signalers_.load<libk::MemoryOrder::Acquire>() == 0
             && relations_.load<libk::MemoryOrder::Acquire>() == 0
-            && sources_.empty()) {
+            && sources_.empty() && receiver_ == Receiver::None) {
             life_.store<libk::MemoryOrder::Release>(Life::Closed);
             cleanup = libk::move(cleanup_);
         }
@@ -329,6 +611,7 @@ void Notification::retire(object::ObjectCleanup&& cleanup) noexcept {
             wait_.relation().signal();
         }
     }
+    begin_async_detach();
 
     for (;;) {
         void* owner{};
@@ -375,7 +658,9 @@ void Notification::try_finish_retire() noexcept {
         if (life_.load<libk::MemoryOrder::Acquire>() != Life::Closing
             || signalers_.load<libk::MemoryOrder::Acquire>() != 0
             || relations_.load<libk::MemoryOrder::Acquire>() != 0
-            || !wait_.idle() || !sources_.empty() || !cleanup_) {
+            || !wait_.idle() || !sources_.empty()
+            || receiver_ != Receiver::None || authority_.work
+            || !cleanup_) {
             return;
         }
         life_.store<libk::MemoryOrder::Release>(Life::Closed);

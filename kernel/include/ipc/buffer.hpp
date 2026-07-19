@@ -27,8 +27,28 @@ enum class BufferError : u8 {
 // PageLease only keeps already-authorized backing safe during an operation.
 class Buffer final : private libk::noncopyable {
 public:
-    using Pages = libk::InplaceVector<
+    using Leases = libk::InplaceVector<
         kernel::mm::PageLease, MYOS_IPC_BUFFER_MAX_PAGES>;
+
+    class Access final : private libk::noncopyable {
+    public:
+        Access(Access&&) noexcept = default;
+        auto operator=(Access&&) noexcept -> Access& = default;
+
+        [[nodiscard]] auto read(
+            usize offset, libk::Span<byte> output) const noexcept -> bool;
+        [[nodiscard]] auto write(
+            usize offset, libk::Span<const byte> input) noexcept -> bool;
+
+    private:
+        friend class Buffer;
+        Access(kernel::mm::Pmm& pmm, Leases&& pages, usize size) noexcept
+            : pmm_(&pmm), pages_(libk::move(pages)), size_(size) {}
+
+        kernel::mm::Pmm* pmm_{};
+        Leases pages_{};
+        usize size_{};
+    };
 
     Buffer() noexcept = default;
     Buffer(Buffer&&) noexcept = default;
@@ -46,28 +66,41 @@ public:
 
     [[nodiscard]] auto valid() const noexcept -> bool;
     [[nodiscard]] auto size() const noexcept -> usize {
-        return pages_.size() * kernel::mm::page_size;
+        return object_.page_count * kernel::mm::page_size;
     }
     [[nodiscard]] auto virtual_range() const noexcept
         -> kernel::mm::VirtRange {
-        return view_.virtual_range();
+        return virtual_;
     }
     [[nodiscard]] auto read(
         usize offset, libk::Span<byte> output) const noexcept -> bool;
     [[nodiscard]] auto write(
         usize offset, libk::Span<const byte> input) noexcept -> bool;
+    [[nodiscard]] auto access() const noexcept
+        -> libk::Expected<Access, BufferError>;
     void reset() noexcept;
 
 private:
     Buffer(
         kernel::mm::Pmm& pmm,
+        kernel::mm::MemoryObject& memory,
+        kernel::mm::ObjectRange object,
         kernel::mm::UserView&& view,
-        Pages&& pages) noexcept
-        : pmm_(&pmm), view_(libk::move(view)), pages_(libk::move(pages)) {}
+        kernel::mm::VirtRange virtual_range) noexcept
+        : pmm_(&pmm),
+          memory_(&memory),
+          object_(object),
+          virtual_(virtual_range),
+          view_(libk::move(view)) {}
+
+    [[nodiscard]] auto lease_pages() const noexcept
+        -> libk::Expected<Leases, kernel::mm::MemoryError>;
 
     kernel::mm::Pmm* pmm_{};
+    kernel::mm::MemoryObject* memory_{};
+    kernel::mm::ObjectRange object_{};
+    kernel::mm::VirtRange virtual_{};
     kernel::mm::UserView view_{};
-    Pages pages_{};
 };
 
 } // namespace kernel::ipc

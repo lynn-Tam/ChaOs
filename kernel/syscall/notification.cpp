@@ -53,35 +53,27 @@ namespace {
 }
 
 [[nodiscard]] auto take(Invocation& invocation) noexcept -> Result {
-    auto notification = resolve(invocation, cap::Right::Wait);
+    auto notification = resolve(invocation, cap::Right::Receive);
     if (!notification) {
         return returned(cap_status(notification.error()));
     }
-    auto badges = notification.value()->take();
+    auto badges = notification.value()->take(invocation.target.vproc());
     return badges
-        ? returned(MYOS_STATUS_OK, badges.value())
+        ? Result{
+              MYOS_STATUS_OK,
+              badges.value().badges,
+              Disposition::Return,
+              badges.value().sequence}
         : returned(status(badges.error()));
 }
 
 [[nodiscard]] auto wait(Invocation& invocation) noexcept -> Result {
-    auto notification = resolve(invocation, cap::Right::Wait);
+    auto notification = resolve(invocation, cap::Right::Receive);
     if (!notification) {
         return returned(cap_status(notification.error()));
     }
     CpuRegistry* const cpus = invocation.cpu.runtime().owner_registry;
     KASSERT(cpus != nullptr);
-    if (Vproc* const vproc = invocation.target.vproc()) {
-        auto started = notification.value()->wait(
-            *vproc, *cpus, invocation.trap.arg(1));
-        if (!started) {
-            return returned(status(started.error()));
-        }
-        if (started.value().state == operation::State::Complete) {
-            return returned(MYOS_STATUS_OK, started.value().badges);
-        }
-        return returned(MYOS_STATUS_PENDING, started.value().key.raw);
-    }
-
     Thread* const thread = invocation.target.thread();
     KASSERT(thread != nullptr);
     if (thread->waiting()) {
@@ -103,6 +95,35 @@ namespace {
     return returned(MYOS_STATUS_OK, started.value().badges);
 }
 
+[[nodiscard]] auto bind_vproc(Invocation& invocation) noexcept -> Result {
+    Vproc* const vproc = invocation.target.vproc();
+    KASSERT(vproc != nullptr);
+    auto notification = resolve(invocation, cap::Right::Receive);
+    if (!notification) {
+        return returned(cap_status(notification.error()));
+    }
+    CpuRegistry* const cpus = invocation.cpu.runtime().owner_registry;
+    KASSERT(cpus != nullptr);
+    auto bound = notification.value()->bind_vproc(
+        *vproc,
+        *cpus,
+        notification.value(),
+        invocation.trap.arg(1),
+        invocation.trap.arg(2));
+    return returned(bound ? MYOS_STATUS_OK : status(bound.error()));
+}
+
+[[nodiscard]] auto unbind_vproc(Invocation& invocation) noexcept -> Result {
+    Vproc* const vproc = invocation.target.vproc();
+    KASSERT(vproc != nullptr);
+    auto notification = resolve(invocation, cap::Right::Receive);
+    if (!notification) {
+        return returned(cap_status(notification.error()));
+    }
+    auto unbound = notification.value()->unbind_vproc(*vproc);
+    return returned(unbound ? MYOS_STATUS_OK : status(unbound.error()));
+}
+
 } // namespace
 
 auto handle_notification(
@@ -115,6 +136,10 @@ auto handle_notification(
         return take(invocation);
     case MYOS_SYS_NOTIFICATION_WAIT:
         return wait(invocation);
+    case MYOS_SYS_NOTIFICATION_BIND_VPROC:
+        return bind_vproc(invocation);
+    case MYOS_SYS_NOTIFICATION_UNBIND_VPROC:
+        return unbind_vproc(invocation);
     default:
         return returned(MYOS_STATUS_INVALID_OP);
     }

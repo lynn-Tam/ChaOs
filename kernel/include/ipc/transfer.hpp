@@ -50,6 +50,8 @@ public:
 
     [[nodiscard]] auto commit() noexcept
         -> libk::Expected<Handles, TransferError>;
+    [[nodiscard]] auto handles() const noexcept -> Handles;
+    void abort() noexcept { reset(); }
     [[nodiscard]] auto empty() const noexcept -> bool {
         return entries_.empty();
     }

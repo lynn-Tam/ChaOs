@@ -16,7 +16,8 @@ using arch::riscv64::TrapFrame;
 // trap.S 提供真实入口地址符号。
 extern "C" void arch_riscv64_trap_entry();
 
-extern "C" void arch_riscv64_trap_handler(TrapFrame* frame) noexcept {
+extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
+    -> TrapFrame* {
     KASSERT(frame != nullptr);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
@@ -25,6 +26,7 @@ extern "C" void arch_riscv64_trap_handler(TrapFrame* frame) noexcept {
     }
     const kernel::trap::Event event = arch::riscv64::make_event(*frame);
     kernel::trap::handle(event, context);
+    return arch::riscv64::raw_frame(context.frame());
 }
 
 extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept

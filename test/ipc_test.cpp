@@ -57,7 +57,8 @@ bool test_notification_badges_are_coalesced(const TestContext&) noexcept {
     }
     const auto first = notification.take();
     const auto second = notification.take();
-    return first && first.value() == 3
+    return first && first.value().badges == 3
+        && first.value().sequence == 3
         && !second
         && second.error() == kernel::ipc::NotificationError::Empty;
 }
@@ -72,7 +73,7 @@ bool test_notification_source_rearm_preserves_level(
 
     source.publish();
     const auto initial = notification.take();
-    if (!initial || initial.value() != 4) {
+    if (!initial || initial.value().badges != 4) {
         return false;
     }
 
@@ -83,7 +84,8 @@ bool test_notification_source_rearm_preserves_level(
     source.rearm(observed);
     const auto replayed = notification.take();
     source.binding().reset();
-    return replayed && replayed.value() == 4
+    return replayed && replayed.value().badges == 4
+        && replayed.value().sequence > initial.value().sequence
         && !source.binding().attached() && !source.was_closed();
 }
 
@@ -134,13 +136,11 @@ bool test_endpoint_authority_narrows_badge_and_limits(
         .badge = 0,
         .fixed = 0,
         .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
-        .modes = MYOS_ENDPOINT_MODE_BLOCK | MYOS_ENDPOINT_MODE_ASYNC,
     };
     const EndpointAuthority caller{
         .badge = 0x42,
         .fixed = ~u64{},
         .cap_limit = 2,
-        .modes = MYOS_ENDPOINT_MODE_BLOCK,
     };
     const auto narrowed = kernel::cap::compose(
         ObjectKind::Endpoint,
@@ -153,7 +153,6 @@ bool test_endpoint_authority_narrows_badge_and_limits(
             .badge = 0x42,
             .fixed = ~u64{},
             .cap_limit = 3,
-            .modes = MYOS_ENDPOINT_MODE_BLOCK,
         }});
     const auto changed_badge = kernel::cap::compose(
         ObjectKind::Endpoint,
@@ -162,7 +161,6 @@ bool test_endpoint_authority_narrows_badge_and_limits(
             .badge = 0x43,
             .fixed = ~u64{},
             .cap_limit = 2,
-            .modes = MYOS_ENDPOINT_MODE_BLOCK,
         }});
     return narrowed
         && libk::get<EndpointAuthority>(narrowed.value().data).callable()

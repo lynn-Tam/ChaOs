@@ -109,6 +109,9 @@ void TrapContext::set_result(usize index, usize value) noexcept {
     case 1:
         frame.a1 = value;
         return;
+    case 2:
+        frame.a2 = value;
+        return;
     default:
         KASSERT(false);
     }

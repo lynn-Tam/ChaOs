@@ -569,8 +569,6 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 .badge = 0,
                 .fixed = 0,
                 .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
-                .modes = MYOS_ENDPOINT_MODE_BLOCK
-                    | MYOS_ENDPOINT_MODE_ASYNC,
             };
             return PublishedAuthority{
                 cap::GrantCeiling{rights, authority},
@@ -1258,7 +1256,7 @@ struct ThreadStart final {
                 cap::Right::Delegate,
                 cap::Right::Inspect,
                 cap::Right::Signal,
-                cap::Right::Wait,
+                cap::Right::Receive,
                 cap::Right::Destroy,
                 cap::Right::Revoke);
             const cap::NotificationAuthority authority{badge};

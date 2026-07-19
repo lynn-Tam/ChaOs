@@ -23,7 +23,6 @@ Thread::Thread(
     KASSERT(execution_.binding().kernel_bound());
     KASSERT(start.entry != nullptr);
     execution_.prepare(&Thread::start, this, execution_.stack_top());
-    execution_.bind_wait(wait_);
 }
 
 Thread::Thread(
@@ -57,13 +56,13 @@ Thread::Thread(
         execution_.stack_top(), start);
     KASSERT(kernel_stack_top);
     execution_.prepare(&Thread::start, this, *kernel_stack_top);
-    execution_.bind_wait(wait_);
 }
 
 Thread::~Thread() noexcept {
     KASSERT(execution_.state_ != State::Running);
     KASSERT(execution_.scheduler_binding_ == nullptr);
     KASSERT(!wait_.attached());
+    KASSERT(active_ == nullptr);
     KASSERT(stops_.empty() && execution_.home_ == nullptr);
 }
 
@@ -73,6 +72,96 @@ auto Thread::home_stack_base() const noexcept -> usize {
 
 auto Thread::home_stack_top() const noexcept -> usize {
     return execution_.stack_top();
+}
+
+auto Thread::current_stack_base() const noexcept -> usize {
+    return active_ != nullptr ? active_->stack().base() : execution_.stack_base();
+}
+
+auto Thread::current_stack_top() const noexcept -> usize {
+    return active_ != nullptr ? active_->stack().top() : execution_.stack_top();
+}
+
+auto Thread::contains_stack(usize address) const noexcept -> bool {
+    if (execution_.contains(address)) {
+        return true;
+    }
+    for (execution::Frame* frame = active_; frame != nullptr;
+         frame = frame->previous()) {
+        if (frame->stack().contains(address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto Thread::effective_binding() noexcept -> ExecutionBinding& {
+    return active_ != nullptr ? active_->binding() : execution_.binding();
+}
+
+auto Thread::effective_binding() const noexcept -> const ExecutionBinding& {
+    return active_ != nullptr ? active_->binding() : execution_.binding();
+}
+
+auto Thread::ipc_buffer() noexcept -> ipc::Buffer* {
+    return active_ != nullptr ? active_->ipc_buffer() : execution_.ipc_buffer();
+}
+
+auto Thread::ipc_buffer() const noexcept -> const ipc::Buffer* {
+    return active_ != nullptr ? active_->ipc_buffer() : execution_.ipc_buffer();
+}
+
+auto Thread::current_wait() noexcept -> operation::Wait& {
+    return active_ != nullptr ? active_->wait() : wait_;
+}
+
+auto Thread::current_wait() const noexcept -> const operation::Wait& {
+    return active_ != nullptr ? active_->wait() : wait_;
+}
+
+auto Thread::frame_depth() const noexcept -> usize {
+    usize result{};
+    for (execution::Frame* frame = active_; frame != nullptr;
+         frame = frame->previous()) {
+        ++result;
+    }
+    return result;
+}
+
+auto Thread::cancel_pending() const noexcept -> bool {
+    for (execution::Frame* frame = active_; frame != nullptr;
+         frame = frame->previous()) {
+        if (frame->cancel_pending()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Thread::push(execution::Frame& frame) noexcept {
+    KASSERT(frame.previous_ == nullptr);
+    frame.previous_ = active_;
+    active_ = &frame;
+}
+
+void Thread::pop(execution::Frame& frame) noexcept {
+    KASSERT(active_ == &frame);
+    active_ = frame.previous_;
+    frame.previous_ = nullptr;
+}
+
+auto Thread::binding_before(
+    const execution::Frame& frame) noexcept -> ExecutionBinding& {
+    KASSERT(active_ == &frame);
+    return frame.previous_ != nullptr
+        ? frame.previous_->binding() : execution_.binding();
+}
+
+auto Thread::ipc_before(
+    const execution::Frame& frame) noexcept -> ipc::Buffer* {
+    KASSERT(active_ == &frame);
+    return frame.previous_ != nullptr
+        ? frame.previous_->ipc_buffer() : execution_.ipc_buffer();
 }
 
 auto Thread::authorize(
@@ -93,26 +182,28 @@ auto Thread::begin_wait(
     if (execution_.scheduler_binding_ == nullptr) {
         return false;
     }
-    return wait_.begin(relation, cpus, *execution_.scheduler_binding_);
+    return current_wait().begin(
+        relation, cpus, *execution_.scheduler_binding_);
 }
 
 auto Thread::wait_ready() const noexcept -> bool {
-    return wait_.ready();
+    return current_wait().ready();
 }
 
 void Thread::resume_wait(arch::TrapContext& trap) noexcept {
-    wait_.finish(trap);
+    current_wait().finish(trap);
 }
 
 void Thread::cancel_wait() noexcept {
-    KASSERT(wait_.cancel());
+    KASSERT(current_wait().cancel());
 }
 
 auto Thread::prepare_retire() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{stop_lock_};
     return (execution_.state_ == State::Prepared
             || execution_.state_ == State::Exited)
-        && execution_.scheduler_binding_ == nullptr && !wait_.attached()
+        && execution_.scheduler_binding_ == nullptr && !current_wait().attached()
+        && active_ == nullptr
         && execution_.home_ == nullptr && !authority_.active()
         && (execution_.binding().kernel_bound()
             || execution_.binding().detached());
@@ -198,7 +289,7 @@ void Thread::finish_stop() noexcept {
     cpu.dispatcher()->on_context_enter();
 
     volatile byte stack_marker{};
-    KASSERT(thread->execution_.contains(
+    KASSERT(thread->contains_stack(
         reinterpret_cast<usize>(&stack_marker)));
 
     if (auto* const kernel_start = libk::get_if<KernelStart>(&thread->start_)) {
@@ -212,7 +303,7 @@ void Thread::finish_stop() noexcept {
 
     KASSERT(libk::holds_alternative<UserStart>(thread->start_));
     thread->start_ = UserStart{};
-    arch::resume_user(thread->execution_.stack_top());
+    arch::resume_user(thread->current_stack_top());
 }
 
 } // namespace kernel

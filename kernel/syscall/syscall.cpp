@@ -6,6 +6,7 @@
 #include <sched/dispatcher.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>
+#include <syscall/policy.hpp>
 #include <uapi/status.h>
 #include <uapi/syscall.h>
 
@@ -16,6 +17,7 @@ void publish(arch::TrapContext& context, const Result& result) noexcept {
     context.set_result(
         0, static_cast<usize>(static_cast<isize>(result.status)));
     context.set_result(1, result.value);
+    context.set_result(2, result.value2);
 }
 
 } // namespace
@@ -35,6 +37,14 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     Invocation invocation{cpu, target, *cspace, *vspace, context};
     const usize operation = context.arg(7);
 
+    const Policy contract = policy(operation);
+    if (contract.continuation == Continuation::Invalid
+        || (target.thread() != nullptr && !contract.allows_thread())
+        || (target.vproc() != nullptr && !contract.allows_vproc())) {
+        publish(context, returned(MYOS_STATUS_INVALID_OP));
+        return Disposition::Return;
+    }
+
     Result outcome{};
     if (operation <= MYOS_SYS_EXECUTION_START) {
         outcome = handle_execution(operation, invocation);
@@ -51,10 +61,10 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_RESOURCE_CLOSE) {
         outcome = handle_object(operation, invocation);
     } else if (operation >= MYOS_SYS_NOTIFICATION_SIGNAL
-        && operation <= MYOS_SYS_NOTIFICATION_WAIT) {
+        && operation <= MYOS_SYS_NOTIFICATION_UNBIND_VPROC) {
         outcome = handle_notification(operation, invocation);
     } else if (operation >= MYOS_SYS_VPROC_ARM
-        && operation <= MYOS_SYS_OPERATION_FINISH) {
+        && operation <= MYOS_SYS_VPROC_PARK) {
         outcome = handle_vproc(operation, invocation);
     } else if (operation >= MYOS_SYS_TUNNEL_CONNECT
         && operation <= MYOS_SYS_TUNNEL_CLOSE) {

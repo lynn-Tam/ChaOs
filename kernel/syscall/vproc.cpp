@@ -204,6 +204,12 @@ auto handle_vproc(usize operation, Invocation& invocation) noexcept -> Result {
             ? returned(result.value().status, result.value().value)
             : returned(error_status(result.error()));
     }
+    case MYOS_SYS_VPROC_PARK: {
+        auto parked = vproc->request_park(invocation.trap.arg(0));
+        return parked
+            ? Result{MYOS_STATUS_OK, 0, Disposition::Park}
+            : returned(error_status(parked.error()));
+    }
     default:
         return returned(MYOS_STATUS_INVALID_OP);
     }

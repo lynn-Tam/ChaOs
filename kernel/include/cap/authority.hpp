@@ -60,12 +60,11 @@ struct NotificationAuthority final {
 // Endpoint capabilities carry the identity and admission limits presented to
 // the service. `fixed` describes the badge bits already chosen by an ancestor;
 // a fully fixed badge is callable, while a partial view is minting authority.
-// Descendants may only fix more bits and reduce modes/capacity.
+// Descendants may only fix more bits and reduce transfer capacity.
 struct EndpointAuthority final {
     u64 badge{};
     u64 fixed{};
     usize cap_limit{};
-    u64 modes{};
 
     [[nodiscard]] constexpr auto callable() const noexcept -> bool {
         return fixed == ~u64{};

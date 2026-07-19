@@ -70,6 +70,7 @@ public:
     void drain_remote() noexcept;
     void yield() noexcept;
     void block_current() noexcept;
+    void park_current() noexcept;
     [[noreturn]] void exit_current() noexcept;
     void request_reschedule(DispatchReason reason) noexcept;
     void on_timer() noexcept;

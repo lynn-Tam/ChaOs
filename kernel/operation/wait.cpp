@@ -33,32 +33,10 @@ auto Wait::begin(
         completion_ = &completion;
         cpus_ = &cpus;
         binding_ = &binding;
-        notifier_.reset();
         ready_.store<libk::MemoryOrder::Relaxed>(false);
         completion.attach(*this);
     }
     return true;
-}
-
-auto Wait::park(Notifier notifier) noexcept -> bool {
-    KASSERT(notifier);
-    kernel::sync::IrqLockGuard guard{lock_};
-    KASSERT(completion_ != nullptr && cpus_ != nullptr
-        && binding_ != nullptr && !notifier_);
-    if (ready_.load<libk::MemoryOrder::Acquire>()) {
-        return false;
-    }
-    binding_ = nullptr;
-    notifier_ = notifier;
-    return true;
-}
-
-void Wait::materialize(sched::Binding& binding) noexcept {
-    kernel::sync::IrqLockGuard guard{lock_};
-    KASSERT(completion_ != nullptr && cpus_ != nullptr
-        && binding_ == nullptr && notifier_);
-    binding_ = &binding;
-    notifier_.reset();
 }
 
 void Wait::finish(arch::TrapContext& trap) noexcept {
@@ -71,7 +49,6 @@ void Wait::finish(arch::TrapContext& trap) noexcept {
         completion_ = nullptr;
         cpus_ = nullptr;
         binding_ = nullptr;
-        notifier_.reset();
         ready_.store<libk::MemoryOrder::Relaxed>(false);
     }
     completion->finish(trap);
@@ -92,7 +69,6 @@ auto Wait::cancel() noexcept -> bool {
         completion_ = nullptr;
         cpus_ = nullptr;
         binding_ = nullptr;
-        notifier_.reset();
         ready_.store<libk::MemoryOrder::Relaxed>(false);
     }
     return true;
@@ -102,18 +78,12 @@ void Wait::wake() noexcept {
     ready_.store<libk::MemoryOrder::Release>(true);
     CpuRegistry* cpus{};
     sched::Binding* binding{};
-    Notifier notifier{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         KASSERT(completion_ != nullptr && cpus_ != nullptr);
         cpus = cpus_;
         binding = binding_;
-        notifier = notifier_;
-        KASSERT((binding != nullptr) != static_cast<bool>(notifier));
-    }
-    if (notifier) {
-        notifier();
-        return;
+        KASSERT(binding != nullptr);
     }
     KASSERT(binding != nullptr && sched::wake(*cpus, *binding));
 }

@@ -99,10 +99,6 @@ public:
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
     void signal() noexcept;
-    // Publish a non-terminal Vproc operation offer. The operation and key stay
-    // attached; a later terminal signal publishes the final result.
-    [[nodiscard]] auto offer() noexcept -> bool;
-
 private:
     friend class kernel::Vproc;
     friend class Wait;
@@ -119,6 +115,8 @@ private:
     explicit Completion(Owner& owner, const Ops& ops) noexcept
         : owner_(&owner), ops_(&ops) {}
 
+    // Called only by Wait::begin after its side of the edge is initialized and
+    // while the Wait lock is held. This function must not call back into Wait.
     void attach(Wait& wait) noexcept;
     void attach(
         Vproc& vproc,
@@ -134,7 +132,6 @@ private:
     enum class Delivery : u8 {
         Detached,
         Attached,
-        Offering,
         Claimed,
         Ready,
     };
@@ -153,7 +150,6 @@ private:
 
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
-    libk::Atomic<bool> signal_pending_{};
 };
 
 } // namespace operation

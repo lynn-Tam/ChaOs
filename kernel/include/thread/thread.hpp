@@ -6,6 +6,7 @@
 #include <core/types.hpp>
 #include <execution/execution.hpp>
 #include <execution/authority.hpp>
+#include <execution/frame.hpp>
 #include <execution/stop.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/expected.hpp>
@@ -92,6 +93,27 @@ public:
     [[nodiscard]] auto execution() const noexcept -> const Execution& {
         return execution_;
     }
+    [[nodiscard]] auto current_stack_base() const noexcept -> usize;
+    [[nodiscard]] auto current_stack_top() const noexcept -> usize;
+    [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool;
+    [[nodiscard]] auto effective_binding() noexcept -> ExecutionBinding&;
+    [[nodiscard]] auto effective_binding() const noexcept
+        -> const ExecutionBinding&;
+    [[nodiscard]] auto ipc_buffer() noexcept -> ipc::Buffer*;
+    [[nodiscard]] auto ipc_buffer() const noexcept -> const ipc::Buffer*;
+    [[nodiscard]] auto active_frame() const noexcept -> execution::Frame* {
+        return active_;
+    }
+    [[nodiscard]] auto current_wait() noexcept -> operation::Wait&;
+    [[nodiscard]] auto current_wait() const noexcept -> const operation::Wait&;
+    [[nodiscard]] auto frame_depth() const noexcept -> usize;
+    [[nodiscard]] auto cancel_pending() const noexcept -> bool;
+    void push(execution::Frame& frame) noexcept;
+    void pop(execution::Frame& frame) noexcept;
+    [[nodiscard]] auto binding_before(
+        const execution::Frame& frame) noexcept -> ExecutionBinding&;
+    [[nodiscard]] auto ipc_before(
+        const execution::Frame& frame) noexcept -> ipc::Buffer*;
     [[nodiscard]] auto authorize(
         const cap::Resolved<kernel::mm::VSpace>& vspace,
         const cap::Resolved<cap::CSpace>& cspace) noexcept
@@ -137,6 +159,7 @@ private:
     Kind kind_{Kind::Normal};
     libk::optional<kernel::trap::Event> user_fault_{};
     operation::Wait wait_{};
+    execution::Frame* active_{};
     u64 user_syscalls_{};
     mutable libk::TicketSpinLock stop_lock_{};
     StopList stops_{};

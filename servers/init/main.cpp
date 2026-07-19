@@ -9,15 +9,16 @@ using namespace myos::proof;
 
 constexpr myos_word_t BundleAddress = 0x1000'0000;
 constexpr myos_word_t ScratchAddress = 0x1800'0000;
-constexpr myos_word_t StackAddress = 0x2100'0000;
-constexpr myos_word_t StackStride = 0x0001'0000;
 constexpr myos_word_t StackSize = 4 * PageSize;
 constexpr myos_word_t ChildMemory = 16 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
-constexpr myos_word_t MaxStacks = MaxThreads + 3 * VprocCount;
+constexpr myos_word_t EndpointActivations = 1;
+constexpr myos_word_t MaxStacks =
+    MaxThreads + 3 * VprocCount + EndpointActivations;
 constexpr myos_word_t VprocDescriptorOffset = 512;
 constexpr myos_word_t VprocDescriptorStride = 256;
+constexpr myos_word_t EndpointDescriptorOffset = 2048;
 constexpr myos_word_t SuccessFault = 0xe100;
 constexpr myos_word_t FailureFault = 0xe000;
 
@@ -155,7 +156,7 @@ public:
 
         stage_ = 4;
         const auto child = myos::resource_create_child(
-            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E3_KINDS);
+            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E4_KINDS);
         if (child.status != MYOS_STATUS_OK || !children_.add(child.value)) {
             return false;
         }
@@ -411,7 +412,8 @@ private:
     }
 
     [[nodiscard]] auto make_stacks() noexcept -> bool {
-        const myos_word_t count = thread_count_ + 3 * VprocCount;
+        const myos_word_t count =
+            thread_count_ + 3 * VprocCount + EndpointActivations;
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -455,7 +457,9 @@ private:
             return false;
         }
         const auto delegated = myos::cap_delegate(
-            notification_, child_cspace_, MYOS_RIGHT_SIGNAL);
+            notification_, child_cspace_,
+            MYOS_RIGHT_SIGNAL | MYOS_RIGHT_DUPLICATE
+                | MYOS_RIGHT_DELEGATE);
         if (delegated.status != MYOS_STATUS_OK) {
             return false;
         }
@@ -468,7 +472,7 @@ private:
         }
         vproc_notification_ = vproc.value;
         const auto waiter = myos::cap_delegate(
-            vproc_notification_, child_cspace_, MYOS_RIGHT_WAIT);
+            vproc_notification_, child_cspace_, MYOS_RIGHT_RECEIVE);
         if (waiter.status != MYOS_STATUS_OK) {
             return false;
         }
@@ -585,6 +589,10 @@ private:
             for (myos_word_t argument = 2; argument < 6; ++argument) {
                 starts[index].arguments[argument] = 0;
             }
+            starts[index].ipc.memory = stack_memory_[index];
+            starts[index].ipc.page = 0;
+            starts[index].ipc.address = stack_bases_[index];
+            starts[index].ipc.pages = 1;
         }
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             auto* const vproc_start =
@@ -635,6 +643,67 @@ private:
             arm->stack_pages = 1;
             arm->stack_top = stack_tops_[upcall_stack];
         }
+
+        const myos_word_t endpoint_stack =
+            thread_count_ + 3 * VprocCount;
+        myos_cap_t endpoint_ipc_region{};
+        if (!create_memory(
+                PageSize, MYOS_VM_READ | MYOS_VM_WRITE, endpoint_ipc_memory_)
+            || !make_region(
+                child_vspace_, EndpointIpcAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP,
+                endpoint_ipc_region)
+            || !children_.add(endpoint_ipc_region)
+            || !map(
+                endpoint_ipc_region, endpoint_ipc_memory_,
+                EndpointIpcAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE)) {
+            return false;
+        }
+        auto* const endpoint_desc =
+            reinterpret_cast<volatile myos_endpoint_desc*>(
+                ScratchAddress + EndpointDescriptorOffset);
+        endpoint_desc->version = MYOS_ENDPOINT_VERSION;
+        endpoint_desc->flags = MYOS_ENDPOINT_FLAGS_NONE;
+        endpoint_desc->entry = entry;
+        endpoint_desc->code_memory = code_memory_;
+        endpoint_desc->code_page = 0;
+        endpoint_desc->code_address = code_address_;
+        endpoint_desc->code_pages = 1;
+        endpoint_desc->stack_memory = stack_memory_[endpoint_stack];
+        endpoint_desc->stack_page = 0;
+        endpoint_desc->stack_address = stack_bases_[endpoint_stack];
+        endpoint_desc->stack_pages = StackSize / PageSize;
+        endpoint_desc->stack_stride = StackSize;
+        endpoint_desc->ipc.memory = endpoint_ipc_memory_;
+        endpoint_desc->ipc.page = 0;
+        endpoint_desc->ipc.address = EndpointIpcAddress;
+        endpoint_desc->ipc.pages = 1;
+        endpoint_desc->ipc_stride = PageSize;
+        endpoint_desc->activation_count = EndpointActivations;
+        endpoint_desc->queue_capacity = 2;
+        endpoint_desc->max_depth = 4;
+        endpoint_desc->budget_floor_ns = 1'000;
+        endpoint_desc->urgency_ceiling = 30;
+
+        const auto endpoint = myos::endpoint_create(
+            pool_, child_vspace_, child_cspace_, descriptors,
+            EndpointDescriptorOffset);
+        if (endpoint.status != MYOS_STATUS_OK
+            || !children_.add(endpoint.value)) {
+            return false;
+        }
+        const auto caller = myos::endpoint_mint(
+            endpoint.value,
+            child_cspace_,
+            EndpointBadge,
+            1,
+            MYOS_RIGHT_CALL);
+        if (caller.status != MYOS_STATUS_OK) {
+            return false;
+        }
+        flags_[EndpointSlot] = caller.value;
+
         if (!committed(myos::vm_unmap(
                 scratch_region_, ScratchAddress, PageSize))) {
             return false;
@@ -726,7 +795,7 @@ private:
                 }
             }
             if (all_ready) {
-                return true;
+                return flags_[EndpointResultSlot] == EndpointTransfer;
             }
             myos::yield();
         }
@@ -736,8 +805,7 @@ private:
         while (flags_[VprocStateSlot] != VprocReady) {
             myos::yield();
         }
-        if (flags_[VprocKeySlot] == 0
-            || myos::notification_signal(vproc_notification_).status
+        if (myos::notification_signal(vproc_notification_).status
                 != MYOS_STATUS_OK) {
             return false;
         }
@@ -745,8 +813,9 @@ private:
         while (flags_[VprocStateSlot] != expected) {
             myos::yield();
         }
-        while (flags_[TunnelSourceStateSlot] != TunnelInvoked
-            || flags_[TunnelTargetStateSlot] != TunnelDelivered) {
+        while (flags_[ParkResultSlot] != ParkRejected
+            || flags_[ParkWakeSlot] != ParkCommitted
+            || flags_[TunnelDeliveryCountSlot] < 2) {
             myos::yield();
         }
         return flags_[TunnelSourceSequenceSlot] != 0
@@ -783,6 +852,7 @@ private:
     myos_cap_t control_memory_[VprocCount]{};
     myos_cap_t event_memory_[VprocCount]{};
     myos_cap_t code_memory_{};
+    myos_cap_t endpoint_ipc_memory_{};
     myos_word_t code_address_{};
     myos_word_t code_size_{};
     myos_word_t entry_{};

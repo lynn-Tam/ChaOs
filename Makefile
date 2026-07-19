@@ -211,6 +211,7 @@ KERNEL_SRCS := \
     kernel/execution/authority.cpp \
     kernel/execution/target.cpp \
     kernel/execution/vproc.cpp \
+    kernel/execution/vproc_notification.cpp \
     kernel/execution/vproc_tunnel.cpp \
 	kernel/execution/stop.cpp \
   kernel/operation/completion.cpp \

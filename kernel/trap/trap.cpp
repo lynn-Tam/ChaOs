@@ -57,9 +57,17 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 cpu.dispatcher()->request_reschedule(
                     kernel::sched::DispatchReason::Block);
                 return;
-            case kernel::syscall::Disposition::Exit:
+            case kernel::syscall::Disposition::Park:
                 cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Exit);
+                    kernel::sched::DispatchReason::Park);
+                return;
+            case kernel::syscall::Disposition::Exit:
+                if (vproc != nullptr) {
+                    vproc->request_exit();
+                } else {
+                    cpu.dispatcher()->request_reschedule(
+                        kernel::sched::DispatchReason::Exit);
+                }
                 return;
             }
         }
@@ -78,9 +86,11 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             case Access::None:
                 if (thread != nullptr) {
                     thread->record_user_fault(event);
+                    cpu.dispatcher()->request_reschedule(
+                        kernel::sched::DispatchReason::Exit);
+                } else {
+                    vproc->request_exit();
                 }
-                cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Exit);
                 return;
             }
             auto fault = execution->binding().vspace()->fault(
@@ -106,7 +116,8 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         }
         KASSERT(execution->binding().fault_route()
             == kernel::FaultRoute::Terminate);
-        if (kernel::execution::Frame* const frame = execution->active_frame();
+        if (kernel::execution::Frame* const frame =
+                thread != nullptr ? thread->active_frame() : nullptr;
             frame != nullptr) {
             frame->unwind(
                 context, *cpu.dispatcher(), MYOS_STATUS_PEER_FAULT);
@@ -126,8 +137,12 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 event.fault_addr(),
                 execution->binding().vspace()->active_cpus().size());
         }
-        cpu.dispatcher()->request_reschedule(
-            kernel::sched::DispatchReason::Exit);
+        if (vproc != nullptr) {
+            vproc->request_exit();
+        } else {
+            cpu.dispatcher()->request_reschedule(
+                kernel::sched::DispatchReason::Exit);
+        }
         return;
     }
 
@@ -151,13 +166,15 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     kernel::Vproc* const vproc = cpu.current_vproc();
     kernel::Execution* const execution = cpu.current_execution();
     KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
-    while (execution->active_frame() != nullptr
+    while (thread != nullptr && thread->active_frame() != nullptr
         && (cpu.dispatcher()->current().stop_requested()
-            || execution->cancel_pending())) {
-        execution->active_frame()->unwind(
+            || thread->cancel_pending())) {
+        thread->active_frame()->unwind(
             context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
     }
-    operation::Wait* wait = execution->wait();
+    operation::Wait* wait = thread != nullptr
+        ? &thread->current_wait()
+        : nullptr;
     if (wait != nullptr && wait->ready()) {
         wait->finish(context);
     }
@@ -167,7 +184,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     // make the first block attempt a no-op. The canonical wait is the truth.
     // Keep this continuation in the kernel until that relation is complete.
     KASSERT(cpu.current_execution() == execution);
-    wait = execution->wait();
+    wait = thread != nullptr ? &thread->current_wait() : nullptr;
     while (wait != nullptr && wait->attached()) {
         if (wait->ready()) {
             wait->finish(context);
@@ -175,13 +192,13 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
         }
         cpu.dispatcher()->block_current();
         KASSERT(cpu.current_execution() == execution);
-        wait = execution->wait();
+        wait = thread != nullptr ? &thread->current_wait() : nullptr;
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.
     cpu.dispatcher()->on_trap_exit();
     KASSERT(cpu.current_execution() == execution);
-    if (vproc != nullptr && execution->active_frame() == nullptr) {
+    if (vproc != nullptr) {
         vproc->on_trap_exit(context);
     }
 }

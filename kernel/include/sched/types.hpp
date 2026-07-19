@@ -35,6 +35,7 @@ enum class DispatchReason : u8 {
     Yield,
     Timer,
     Block,
+    Park,
     Exit,
     Stop,
     RemoteWake,

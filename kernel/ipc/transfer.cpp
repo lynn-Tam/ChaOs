@@ -138,6 +138,14 @@ void Transfer::reset() noexcept {
     destination_ = nullptr;
 }
 
+auto Transfer::handles() const noexcept -> Handles {
+    Handles result{};
+    for (const Entry& entry : entries_) {
+        KASSERT(result.try_push_back(entry.slot.handle()));
+    }
+    return result;
+}
+
 auto Transfer::commit() noexcept
     -> libk::Expected<Handles, TransferError> {
     if (source_ == nullptr || destination_ == nullptr) {

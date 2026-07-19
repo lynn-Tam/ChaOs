@@ -51,13 +51,12 @@ auto CpuDispatcher::current_urgency() const noexcept -> Urgency {
 void CpuDispatcher::publish(execution::Target target) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::current_cpu_owner() == cpu_);
-    KASSERT(arch::trap_depth() == 0);
     KASSERT(target);
     Execution& execution = target.execution();
-    const usize stack_top = execution.stack_top();
+    const usize stack_top = target.stack_top();
     KASSERT(stack_top != 0 && (stack_top & 0xfU) == 0);
 
-    ExecutionBinding& roots = execution.binding();
+    ExecutionBinding& roots = target.effective_binding();
     roots.translation().activate(*cpu_);
     current_ = target;
     cpu_->current_execution_ = &execution;
@@ -82,8 +81,8 @@ void CpuDispatcher::on_context_enter() noexcept {
     KASSERT(current_);
     KASSERT(cpu_->current_execution_ == &current_.execution());
     KASSERT(arch::active_stack(cpu_->arch_state)
-        == current_.execution().stack_top());
-    ExecutionBinding& roots = current_.execution().binding();
+        == current_.stack_top());
+    ExecutionBinding& roots = current_.effective_binding();
     KASSERT(cpu_->kernel_vspace() == roots.kernel_vspace());
     KASSERT(cpu_->vspace() == roots.vspace());
     KASSERT(cpu_->cspace() == roots.cspace());
@@ -98,6 +97,7 @@ void CpuDispatcher::on_context_enter() noexcept {
 
 void CpuDispatcher::refresh() noexcept {
     KASSERT(!arch::interrupts_enabled());
+    KASSERT(arch::trap_depth() == 1);
     KASSERT(current_ && cpu_->current_execution_ == &current_.execution());
     publish(current_);
 }
@@ -117,6 +117,7 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
     }
     if (execution.state_ != ExecutionState::Prepared
         && execution.state_ != ExecutionState::Blocked
+        && execution.state_ != ExecutionState::Parked
         && execution.state_ != ExecutionState::Throttled) {
         return false;
     }
@@ -184,38 +185,42 @@ auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
 
 auto CpuDispatcher::accept_activation(Vproc& vproc) noexcept -> bool {
     KASSERT(!arch::interrupts_enabled());
-    kernel::sync::IrqLockGuard guard{vproc.state_lock_};
-    Binding* const binding = vproc.execution_.scheduler_binding_;
-    if (binding == nullptr || binding->home_cpu() != id_
-        || vproc.stop_requested_ || vproc.stopped_
-        || vproc.upcall_state_ == Vproc::UpcallState::Unarmed) {
-        return false;
+    Binding* binding{};
+    bool wake_parked{};
+    {
+        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
+        binding = vproc.execution_.scheduler_binding_;
+        if (binding == nullptr || binding->home_cpu() != id_
+            || vproc.stop_requested_ || vproc.stopped_
+            || vproc.upcall_state_ == Vproc::UpcallState::Unarmed) {
+            return false;
+        }
+        if (vproc.upcall_state_ == Vproc::UpcallState::Active) {
+            return true;
+        }
+        switch (vproc.execution_.state_) {
+        case ExecutionState::Running:
+            KASSERT(current_.vproc() == &vproc);
+            binding->activation_credit_ = false;
+            return true;
+        case ExecutionState::Ready:
+            binding->activation_credit_ = true;
+            request_reschedule(DispatchReason::Activation);
+            return true;
+        case ExecutionState::Parked:
+            binding->activation_credit_ = true;
+            wake_parked = true;
+            break;
+        case ExecutionState::Prepared:
+        case ExecutionState::Blocked:
+        case ExecutionState::Throttled:
+            binding->activation_credit_ = true;
+            return true;
+        case ExecutionState::Exited:
+            return false;
+        }
     }
-    if (vproc.upcall_state_ == Vproc::UpcallState::Active) {
-        return true;
-    }
-    switch (vproc.execution_.state_) {
-    case ExecutionState::Running:
-        KASSERT(current_.vproc() == &vproc);
-        // The interrupt/syscall return itself is the requested safe boundary.
-        binding->activation_credit_ = false;
-        return true;
-    case ExecutionState::Ready:
-        binding->activation_credit_ = true;
-        request_reschedule(DispatchReason::Activation);
-        return true;
-    case ExecutionState::Prepared:
-    case ExecutionState::Blocked:
-    case ExecutionState::Throttled:
-        // Prepared targets still require explicit start. Blocked targets keep
-        // their existing continuation relation. Throttled targets wait for
-        // their own refill. None receives sender time.
-        binding->activation_credit_ = true;
-        return true;
-    case ExecutionState::Exited:
-        return false;
-    }
-    return false;
+    return wake_parked && make_ready(*binding);
 }
 
 auto CpuDispatcher::post_activation(Vproc& vproc) noexcept -> WakeResult {
@@ -450,6 +455,11 @@ void CpuDispatcher::block_current() noexcept {
     dispatch(DispatchReason::Block, clock_->now());
 }
 
+void CpuDispatcher::park_current() noexcept {
+    KASSERT(!arch::interrupts_enabled());
+    dispatch(DispatchReason::Park, clock_->now());
+}
+
 [[noreturn]] void CpuDispatcher::exit_current() noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(current_ && !current_.idle());
@@ -489,6 +499,10 @@ void CpuDispatcher::on_trap_exit() noexcept {
         block_current();
         return;
     }
+    if (reason == DispatchReason::Park) {
+        park_current();
+        return;
+    }
     dispatch(reason, clock_->now());
 }
 
@@ -518,7 +532,27 @@ void CpuDispatcher::dispatch(
 
     const execution::Target outgoing = current_;
     Binding* const outgoing_binding = current_binding_;
-    if (outgoing_binding != nullptr) {
+    bool parked{};
+    if (reason == DispatchReason::Park) {
+        Vproc* const vproc = outgoing.vproc();
+        KASSERT(vproc != nullptr && outgoing_binding != nullptr);
+        kernel::sync::IrqLockGuard guard{vproc->state_lock_};
+        if (!vproc->park_requested_
+            || vproc->park_sequence_ != vproc->pending_sequence_
+            || vproc->ready_mask_ != 0 || vproc->ingress_mask_ != 0
+            || vproc->notification_mask_ != 0
+            || vproc->stop_requested_
+            || vproc->execution_.state_ != ExecutionState::Running) {
+            vproc->park_requested_ = false;
+            return;
+        }
+        SchedulingContext& context = outgoing_binding->context();
+        context.deactivate(id_);
+        current_binding_ = nullptr;
+        vproc->park_requested_ = false;
+        vproc->execution_.state_ = ExecutionState::Parked;
+        parked = true;
+    } else if (outgoing_binding != nullptr) {
         SchedulingContext& context = outgoing_binding->context();
         context.deactivate(id_);
         current_binding_ = nullptr;
@@ -530,6 +564,9 @@ void CpuDispatcher::dispatch(
             break;
         case DispatchReason::Block:
             outgoing.execution().state_ = ExecutionState::Blocked;
+            break;
+        case DispatchReason::Park:
+            KASSERT(false);
             break;
         case DispatchReason::Start:
         case DispatchReason::Yield:
@@ -545,6 +582,7 @@ void CpuDispatcher::dispatch(
             break;
         }
     }
+    KASSERT(reason != DispatchReason::Park || parked);
 
     Binding* const candidate = policy_.select().binding;
     if (candidate == nullptr && outgoing.idle()) {
@@ -707,7 +745,7 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
     KASSERT(target.owned_by(*this));
     Execution& execution = target.execution();
 
-    if (operation::Wait* const wait = execution.wait();
+    if (operation::Wait* const wait = target.wait();
         wait != nullptr && wait->attached()) {
         if (!wait->cancel()) {
             return StopDisposition::Deferred;
