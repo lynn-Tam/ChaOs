@@ -11,7 +11,7 @@
 #include <libk/optional.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/boot_map.hpp>
 #include <mm/direct_map.hpp>
 
@@ -354,7 +354,7 @@ class Pmm {
     [[nodiscard]] auto verify(const Arena& arena) const noexcept -> bool;
     [[nodiscard]] auto verify_invariants_unlocked() const noexcept -> bool;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Pmm> lock_{};
     libk::observer_ptr<DirectMap> direct_map_{};
     libk::InplaceVector<Arena, max_regions> arenas_{};
     libk::InplaceVector<ReservationRecord, max_regions> reservations_{};

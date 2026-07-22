@@ -193,7 +193,7 @@ auto SchedulingDomain::unadmit(SchedulingContext& context) noexcept -> Result {
     if (context.domain_ != this) {
         return libk::unexpected(Error::InvalidContext);
     }
-    if (context.active_cpu_ || context.binding_) {
+    if (context.active() || context.binding_) {
         return libk::unexpected(Error::Busy);
     }
     auto* const record = capacity_.at(context.home_cpu_);

@@ -12,7 +12,7 @@
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/optional.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <libk/typetraits.hpp>
 #include <libk/variant.hpp>
 #include <sched/remote_queue.hpp>
@@ -161,7 +161,8 @@ private:
     operation::Wait wait_{};
     execution::Frame* active_{};
     u64 user_syscalls_{};
-    mutable libk::TicketSpinLock stop_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::ThreadStop>
+        stop_lock_{};
     StopList stops_{};
     bool stop_requested_{};
     bool stopped_{};

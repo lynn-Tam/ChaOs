@@ -153,8 +153,7 @@ auto VSpace::materialize_fault(
     }
     TableReserve tables = libk::move(table_reserve).value();
 
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken lock{lock_};
     Mapping* const current = mappings_.find(mapping.key_.node);
     if (current != &mapping
         || mapping.state_ != MappingState::Live
@@ -163,16 +162,14 @@ auto VSpace::materialize_fault(
         || authority.invalidation_requested_
         || authority.pages_.find(page_address) != nullptr) {
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::InvalidState);
     }
     auto mutation = coherence_.begin();
     if (!mutation) {
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
@@ -180,8 +177,7 @@ auto VSpace::materialize_fault(
     if (!plan) {
         mutation.value().abort();
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         pages_.destroy(*page);
         return libk::unexpected(plan.error());
     }
@@ -204,8 +200,7 @@ auto VSpace::materialize_fault(
         libk::move(plan).value(),
         retire,
         mapping.access_.contains(Access::Execute));
-    lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    lock.restore();
     if (!committed) {
         return libk::unexpected(committed.error());
     }

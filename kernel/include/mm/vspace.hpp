@@ -10,7 +10,7 @@
 #include <libk/intrusive_list.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <libk/utility.hpp>
 #include <mm/address_region.hpp>
 #include <mm/kernel_vspace.hpp>
@@ -401,7 +401,7 @@ private:
     Pmm* pmm_{};
     KernelVSpace* kernel_{};
     VSpaceExecutor* work_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::VSpace> lock_{};
     libk::ManualLifetime<arch::UserRoot> root_{};
     TranslationState coherence_{};
     NodePool<AddressRegion> regions_;

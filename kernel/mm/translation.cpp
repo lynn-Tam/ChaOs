@@ -285,7 +285,7 @@ void ShootdownPlan::cancel() noexcept {
 
 TranslationState::Mutation::Mutation(Mutation&& other) noexcept
     : owner_(libk::exchange(other.owner_, nullptr)),
-      interrupts_(other.interrupts_),
+      token_(libk::move(other.token_)),
       targets_(other.targets_) {}
 
 TranslationState::Mutation::~Mutation() noexcept {
@@ -296,8 +296,7 @@ void TranslationState::Mutation::unlock() noexcept {
     if (owner_ == nullptr) {
         return;
     }
-    owner_->lock_.unlock();
-    arch::restore_interrupts(interrupts_);
+    token_.restore();
     owner_ = nullptr;
 }
 
@@ -337,10 +336,10 @@ auto TranslationState::Mutation::commit(
     // Activation may now observe the new epoch. Interrupts remain masked until
     // every retained request is published and each required transport kick is
     // attempted, so a stack-resident ticket cannot be descheduled midway.
-    owner_->lock_.unlock();
+    token_.unlock();
     owner_ = nullptr;
     static_cast<void>(plan.kick(kicks));
-    arch::restore_interrupts(interrupts_);
+    token_.restore();
 
     if (ticket.complete()
         || (ticket.notifiable() && !ticket.arm())) {
@@ -390,14 +389,11 @@ void TranslationState::leave(kernel::CpuId cpu) noexcept {
 
 auto TranslationState::begin() noexcept
     -> libk::Expected<Mutation, ShootdownError> {
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken token{lock_};
     if (epoch_.raw == libk::numeric_limits<u64>::max()) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(ShootdownError::EpochExhausted);
     }
-    return libk::expected(Mutation{*this, interrupts, active_});
+    return libk::expected(Mutation{*this, libk::move(token), active_});
 }
 
 auto TranslationState::epoch() const noexcept -> TranslationEpoch {

@@ -672,6 +672,7 @@ void ResourcePool::refund(Charge& charge) noexcept {
 }
 
 auto ResourcePool::closed_locked() const noexcept -> bool {
+    kernel::sync::LockAccess::assert_held(lock_);
     return root_count_ == 0 && roots_ == nullptr
         && sponsorship_count_ == 0 && sponsorships_ == nullptr
         && reservation_count_ == 0 && construction_count_ == 0

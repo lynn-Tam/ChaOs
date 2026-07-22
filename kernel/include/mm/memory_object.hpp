@@ -6,7 +6,7 @@
 #include <libk/noncopyable.hpp>
 #include <libk/span.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/pmm.hpp>
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
@@ -266,7 +266,8 @@ private:
 
     Pmm* pmm_{};
     usize logical_pages_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::MemoryObject>
+        lock_{};
     AttachmentList attachments_{};
     void* backing_{};
     const BackingOps* backing_ops_{};

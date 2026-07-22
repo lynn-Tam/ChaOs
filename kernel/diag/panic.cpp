@@ -354,6 +354,204 @@ void wait_for_peers(const PanicSlot& owner) noexcept {
     }
 }
 
+#if MYOS_LOCK_DIAG >= 1
+void print_lock_trace(CpuId id, const sync::CpuLockTrace& trace) noexcept {
+    const u32 context = trace.context.load<libk::MemoryOrder::Acquire>();
+    const u32 held_count = trace.held_count.load<libk::MemoryOrder::Acquire>();
+    panic_print<
+        "  cpu {} sync: context={} held={} degraded={} "
+        "trap-irq-depth={} trap-max={} explicit-max={}\n">(
+        id.raw,
+        context,
+        held_count,
+        trace.degraded.load<libk::MemoryOrder::Acquire>(),
+        trace.hardware_irq_depth.load<libk::MemoryOrder::Acquire>(),
+        trace.hardware_irq_max.load<libk::MemoryOrder::Acquire>(),
+        trace.explicit_irq_max.load<libk::MemoryOrder::Acquire>());
+
+    for (usize attempt = 0; attempt < 3; ++attempt) {
+        const u64 first =
+            trace.waiting.sequence.load<libk::MemoryOrder::Acquire>();
+        if ((first & 1U) != 0) {
+            continue;
+        }
+        const bool active =
+            trace.waiting.active.load<libk::MemoryOrder::Relaxed>();
+        const usize address =
+            trace.waiting.address.load<libk::MemoryOrder::Relaxed>();
+        const u32 lock_class =
+            trace.waiting.lock_class.load<libk::MemoryOrder::Relaxed>();
+        const u32 line =
+            trace.waiting.line.load<libk::MemoryOrder::Relaxed>();
+        const u64 generation =
+            trace.waiting.generation.load<libk::MemoryOrder::Relaxed>();
+        const u64 last =
+            trace.waiting.sequence.load<libk::MemoryOrder::Acquire>();
+        if (first == last && (last & 1U) == 0) {
+            if (active) {
+                panic_print<
+                    "    waiting: lock={:#018x} class={} line={} gen={}\n">(
+                    address,
+                    sync::lock_class_name(
+                        static_cast<sync::LockClass>(lock_class)),
+                    line,
+                    generation);
+            }
+            break;
+        }
+        if (attempt == 2) {
+            panic_print<"    waiting: unstable\n">();
+        }
+    }
+
+    const usize bounded = held_count < sync::remote_held_capacity
+        ? held_count : sync::remote_held_capacity;
+    for (usize index = 0; index < bounded; ++index) {
+        const sync::RemoteHeld& held = trace.held[index];
+        bool printed{};
+        for (usize attempt = 0; attempt < 3; ++attempt) {
+            const u64 first = held.sequence.load<libk::MemoryOrder::Acquire>();
+            if ((first & 1U) != 0) {
+                continue;
+            }
+            const usize address =
+                held.address.load<libk::MemoryOrder::Relaxed>();
+            const u32 lock_class =
+                held.lock_class.load<libk::MemoryOrder::Relaxed>();
+            const u32 line = held.line.load<libk::MemoryOrder::Relaxed>();
+            const u64 last = held.sequence.load<libk::MemoryOrder::Acquire>();
+            if (first == last && (last & 1U) == 0) {
+                panic_print<"    held[{}]: {:#018x} class={} line={}\n">(
+                    index,
+                    address,
+                    sync::lock_class_name(
+                        static_cast<sync::LockClass>(lock_class)),
+                    line);
+                printed = true;
+                break;
+            }
+        }
+        if (!printed) {
+            panic_print<"    held[{}]: unstable\n">(index);
+        }
+    }
+
+    const u64 event_head =
+        trace.event_head.load<libk::MemoryOrder::Acquire>();
+    const usize event_count = event_head < sync::lock_event_capacity
+        ? static_cast<usize>(event_head) : sync::lock_event_capacity;
+    for (usize age = 0; age < event_count; ++age) {
+        const usize index = static_cast<usize>(
+            (event_head - event_count + age) % sync::lock_event_capacity);
+        const sync::RemoteEvent& event = trace.events[index];
+        bool printed{};
+        for (usize attempt = 0; attempt < 3; ++attempt) {
+            const u64 first =
+                event.sequence.load<libk::MemoryOrder::Acquire>();
+            if ((first & 1U) != 0) {
+                continue;
+            }
+            const u64 tick = event.tick.load<libk::MemoryOrder::Relaxed>();
+            const usize address =
+                event.address.load<libk::MemoryOrder::Relaxed>();
+            const u32 data = event.data.load<libk::MemoryOrder::Relaxed>();
+            const u64 last =
+                event.sequence.load<libk::MemoryOrder::Acquire>();
+            if (first == last && (last & 1U) == 0) {
+                panic_print<
+                    "    event[{}]: tick={} lock={:#018x} data={:#010x}\n">(
+                    age, tick, address, data);
+                printed = true;
+                break;
+            }
+        }
+        if (!printed) {
+            panic_print<"    event[{}]: unstable\n">(age);
+        }
+    }
+
+    const usize cycle_size = trace.cycle_size.load<libk::MemoryOrder::Acquire>();
+    if (cycle_size != 0) {
+        panic_print<"    wait-cycle: {} links\n">(cycle_size);
+        const usize cycle_bound = cycle_size < sync::wait_cycle_capacity
+            ? cycle_size : sync::wait_cycle_capacity;
+        for (usize index = 0; index < cycle_bound; ++index) {
+            const sync::WaitLink& link = trace.cycle[index];
+            bool printed{};
+            for (usize attempt = 0; attempt < 3; ++attempt) {
+                const u64 first =
+                    link.sequence.load<libk::MemoryOrder::Acquire>();
+                if ((first & 1U) != 0) {
+                    continue;
+                }
+                const u32 cpu =
+                    link.cpu.load<libk::MemoryOrder::Relaxed>();
+                const usize lock =
+                    link.lock.load<libk::MemoryOrder::Relaxed>();
+                const u64 owner =
+                    link.owner_word.load<libk::MemoryOrder::Relaxed>();
+                const u64 last =
+                    link.sequence.load<libk::MemoryOrder::Acquire>();
+                if (first == last && (last & 1U) == 0) {
+                    panic_print<
+                        "      cpu={} lock={:#018x} owner={:#018x}\n">(
+                        cpu, lock, owner);
+                    printed = true;
+                    break;
+                }
+            }
+            if (!printed) {
+                panic_print<"      link[{}]: unstable\n">(index);
+            }
+        }
+    }
+
+    const usize dep_cycle_size =
+        trace.dep_cycle_size.load<libk::MemoryOrder::Acquire>();
+    if (dep_cycle_size != 0) {
+        panic_print<"    dependency-cycle: {} edges\n">(dep_cycle_size);
+        const usize bound = dep_cycle_size < sync::dep_cycle_capacity
+            ? dep_cycle_size : sync::dep_cycle_capacity;
+        for (usize index = 0; index < bound; ++index) {
+            const sync::DepLink& link = trace.dep_cycle[index];
+            bool printed{};
+            for (usize attempt = 0; attempt < 3; ++attempt) {
+                const u64 first =
+                    link.sequence.load<libk::MemoryOrder::Acquire>();
+                if ((first & 1U) != 0) {
+                    continue;
+                }
+                const char* const from_file =
+                    link.from_file.load<libk::MemoryOrder::Relaxed>();
+                const char* const to_file =
+                    link.to_file.load<libk::MemoryOrder::Relaxed>();
+                const u64 lines =
+                    link.lines.load<libk::MemoryOrder::Relaxed>();
+                const u32 classes =
+                    link.classes.load<libk::MemoryOrder::Relaxed>();
+                const u64 last =
+                    link.sequence.load<libk::MemoryOrder::Acquire>();
+                if (first == last && (last & 1U) == 0) {
+                    panic_print<
+                        "      {} ({}:{}) -> {} ({}:{})\n">(
+                        sync::lock_class_name(
+                            static_cast<sync::LockClass>(classes & 0xffU)),
+                        from_file, static_cast<u32>(lines),
+                        sync::lock_class_name(static_cast<sync::LockClass>(
+                            (classes >> 8) & 0xffU)),
+                        to_file, static_cast<u32>(lines >> 32));
+                    printed = true;
+                    break;
+                }
+            }
+            if (!printed) {
+                panic_print<"      edge[{}]: unstable\n">(index);
+            }
+        }
+    }
+}
+#endif
+
 void print_peers(const PanicSlot& owner) noexcept {
     CpuRegistry* const registry = owner.registry;
     if (registry == nullptr) {
@@ -377,6 +575,9 @@ void print_peers(const PanicSlot& owner) noexcept {
         } else {
             panic_print<"  cpu {}: no acknowledgement\n">(id.raw);
         }
+#if MYOS_LOCK_DIAG >= 1
+        print_lock_trace(id, runtime->diagnostics->locks);
+#endif
     }
 }
 
@@ -432,6 +633,9 @@ auto stop_requested() noexcept -> bool {
 [[noreturn]] void panic(PanicRequest request) noexcept {
     const arch::CallSiteSnapshot call_site = arch::capture_call_site();
     const arch::InterruptState interrupts = arch::disable_interrupts();
+    if constexpr (sync::lock_verify) {
+        sync::panic_enter();
+    }
     void* const slot_pointer = arch::panic_slot();
     const usize stack_top = arch::emergency_stack();
     if (slot_pointer == nullptr || stack_top == 0) {

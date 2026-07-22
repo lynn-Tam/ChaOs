@@ -10,7 +10,7 @@
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/direct_map.hpp>
 #include <mm/memory_object.hpp>
 #include <mm/user_view.hpp>
@@ -260,7 +260,8 @@ private:
     arch::UserStart bootstrap_entry_{};
     VprocRuntime runtime_{};
     VprocArm arm_{};
-    mutable libk::TicketSpinLock state_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Vproc>
+        state_lock_{};
     OperationSlot operations_[max_operations]{};
     using TunnelLinks = libk::IntrusiveList<
         ipc::TunnelLink, &ipc::TunnelLink::hook>;

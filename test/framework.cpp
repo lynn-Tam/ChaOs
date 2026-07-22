@@ -67,6 +67,7 @@ void register_bootinfo_tests(TestRegistry& registry) noexcept;
 void register_boot_bundle_tests(TestRegistry& registry) noexcept;
 void register_cpu_topology_tests(TestRegistry& registry) noexcept;
 void register_libk_tests(TestRegistry& registry) noexcept;
+void register_sync_tests(TestRegistry& registry) noexcept;
 void register_sched_tests(TestRegistry& registry) noexcept;
 void register_cap_tests(TestRegistry& registry) noexcept;
 void register_memory_tests(TestRegistry& registry) noexcept;
@@ -77,6 +78,7 @@ void register_ipc_tests(TestRegistry& registry) noexcept;
 
 void register_builtin_tests(TestRegistry& registry) noexcept {
     register_libk_tests(registry);
+    register_sync_tests(registry);
     register_allocator_tests(registry);
     register_bootinfo_tests(registry);
     register_boot_bundle_tests(registry);

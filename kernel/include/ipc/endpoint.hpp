@@ -10,7 +10,7 @@
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/kernel_stack.hpp>
 #include <mm/memory_object.hpp>
 #include <mm/node_pool.hpp>
@@ -299,7 +299,7 @@ private:
     void reset_call_locked(Call& call) noexcept;
     void try_finish_retire() noexcept;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Endpoint> lock_{};
     ExecutionBinding service_;
     kernel::mm::UserView code_;
     CodePages resident_code_{};

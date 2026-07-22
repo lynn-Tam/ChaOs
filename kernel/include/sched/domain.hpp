@@ -4,7 +4,7 @@
 #include <cpu/topology.hpp>
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/pmm.hpp>
 
 namespace kernel::sched {
@@ -87,7 +87,8 @@ private:
     [[nodiscard]] static auto share_of(const SchedulingContext& context) noexcept
         -> libk::Expected<u32, Error>;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::SchedDomain>
+        lock_{};
     DomainCapacity capacity_;
 };
 

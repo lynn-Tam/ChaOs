@@ -4,7 +4,7 @@
 #include <cap/resolved.hpp>
 #include <execution/stop.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <libk/variant.hpp>
 
 namespace kernel {
@@ -75,7 +75,8 @@ private:
     static const cap::GrantAttachmentOps ops_;
 
     Target target_;
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<
+        kernel::sync::LockClass::ExecutionAuthority> lock_{};
     Link vspace_;
     Link cspace_;
     Link control_;

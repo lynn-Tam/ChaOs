@@ -1,8 +1,10 @@
 ARCH ?= riscv64
 PROFILE ?= kernel
+LOCK_DIAG ?= $(if $(filter kernel,$(PROFILE)),off,trace)
 
 SUPPORTED_ARCHES := riscv64
 SUPPORTED_PROFILES := kernel test proof
+SUPPORTED_LOCK_DIAG := off verify trace profile
 
 ifeq ($(filter $(ARCH),$(SUPPORTED_ARCHES)),)
 $(error Unsupported ARCH=$(ARCH); supported: $(SUPPORTED_ARCHES))
@@ -10,6 +12,15 @@ endif
 ifeq ($(filter $(PROFILE),$(SUPPORTED_PROFILES)),)
 $(error Unsupported PROFILE=$(PROFILE); supported: $(SUPPORTED_PROFILES))
 endif
+ifeq ($(filter $(LOCK_DIAG),$(SUPPORTED_LOCK_DIAG)),)
+$(error Unsupported LOCK_DIAG=$(LOCK_DIAG); supported: $(SUPPORTED_LOCK_DIAG))
+endif
+
+LOCK_DIAG_LEVEL_off := 0
+LOCK_DIAG_LEVEL_verify := 1
+LOCK_DIAG_LEVEL_trace := 2
+LOCK_DIAG_LEVEL_profile := 3
+LOCK_DIAG_LEVEL := $(LOCK_DIAG_LEVEL_$(LOCK_DIAG))
 
 ENABLE_TESTS := 0
 ifeq ($(PROFILE),test)
@@ -52,6 +63,7 @@ CLANGXX ?= clang++
 HOST_CXX ?= c++
 QEMU_SMP ?= 4
 PANIC_PROBE ?= 0
+LOCK_PROBE ?= 0
 GDB_HOST ?= 127.0.0.1
 GDB_PORT ?= 1237
 
@@ -83,14 +95,18 @@ RISCV_ABI  ?= lp64d
 RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
-BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)
+BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)-lock$(LOCK_DIAG)
 BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
 BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
 TARGET    := $(BUILD_DIR)/kernel.elf
 MAPFILE   := $(BUILD_DIR)/kernel.map
 LINKER_SCRIPT := arch/$(ARCH)/linker.ld
-BOOT_STACK_FRAME_BUDGET := 1792
+# Trace builds deliberately add one owner word to every tracked lock. Built-in
+# tests construct dense object fixtures on their private kernel stacks, so
+# audit that instrumentation profile against its own explicit bound while the
+# production kernel keeps the original limit.
+BOOT_STACK_FRAME_BUDGET := $(if $(filter 1,$(ENABLE_TESTS)),2048,1792)
 
 USER_ARCH ?= rv64imac_zicsr_zifencei
 USER_ABI ?= lp64
@@ -108,7 +124,9 @@ BOOTPACK := $(HOST_BUILD_DIR)/bootpack
 
 COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
                 -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
+                -DMYOS_LOCK_PROBE=$(LOCK_PROBE) \
                 -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
+                -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
                 -DMYOS_BUILD_ID=\"$(BUILD_ID)\" \
                 $(RISCV_ARCH_FLAGS) \
                 -mcmodel=medany -msmall-data-limit=0 \
@@ -251,9 +269,14 @@ KERNEL_SRCS := \
   kernel/mm/pmm.cpp \
   libk/mem.c
 
+ifneq ($(LOCK_DIAG_LEVEL),0)
+KERNEL_SRCS += kernel/sync/lock.cpp
+endif
+
 TEST_SRCS := \
   test/framework.cpp \
   test/libk_test.cpp \
+  test/sync_test.cpp \
   test/allocator_test.cpp \
   test/bootinfo_test.cpp \
   test/boot_bundle_test.cpp \
@@ -633,6 +656,32 @@ _run-panic-degraded-smp: $(TARGET) audit-boot-stack
 	rm -f "$$output"; \
 	echo "[panic-degraded] OK: transport failure produced a bounded partial dump"
 
+run-lock-probe:
+	$(MAKE) PROFILE=kernel LOCK_DIAG=trace _run-lock-probe
+
+_run-lock-probe: $(TARGET) audit-boot-stack
+	@case "$(LOCK_PROBE)" in \
+		1) event=90000001;; 2) event=90000004;; 3) event=90000003;; \
+		4) event=90000005;; 5) event=90000006;; 6) event=90000002;; \
+		7) event=90000007;; 8) event=90000008;; 9) event=90000009;; \
+		*) echo "[lock-probe] LOCK_PROBE must be 1..9"; exit 1;; \
+	esac; \
+	set +e; \
+	output=$$(mktemp); \
+	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	status=$$?; \
+	cat "$$output"; \
+	if [ $$status -ne 0 ] \
+		|| ! rg -q "MYOS KERNEL PANIC" "$$output" \
+		|| ! rg -qi "event: 0x$$event" "$$output" \
+		|| ! rg -q "cpu [0-9]+ sync:" "$$output"; then \
+		echo "[lock-probe] FAIL: probe $(LOCK_PROBE) lacks its stable event/evidence"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	rm -f "$$output"; \
+	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
+
 debug: $(TARGET) audit-boot-stack
 	@echo "debug: waiting for GDB on $(GDB_HOST):$(GDB_PORT)"
 	$(QEMU) -machine virt -nographic -bios default -kernel $(TARGET) -S -gdb tcp:$(GDB_HOST):$(GDB_PORT)
@@ -642,4 +691,4 @@ clean:
 
 -include $(DEPS) $(USER_DEPS)
 
-.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp debug clean
+.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe debug clean

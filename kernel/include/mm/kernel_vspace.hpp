@@ -9,7 +9,7 @@
 #include <mm/translation.hpp>
 #include <mm/physical_alias.hpp>
 #include <mm/kernel_stack_layout.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 
 namespace kernel {
 class KernelStack;
@@ -130,7 +130,7 @@ private:
     PhysicalAliasRegistry aliases_;
     Pmm* pmm_{};
     OwnedPageGroup stack_pages_;
-    libk::TicketSpinLock stack_lock_{};
+    kernel::sync::SpinLock<kernel::sync::LockClass::KernelStack> stack_lock_{};
     usize next_stack_base_{};
     usize free_stack_{};
     usize stack_leases_{};

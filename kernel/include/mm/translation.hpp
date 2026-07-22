@@ -10,10 +10,11 @@
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/pmm.hpp>
 #include <resource/sponsorship.hpp>
 #include <sync/completion.hpp>
+#include <sync/irq_lock_guard.hpp>
 
 namespace kernel {
 class CpuRegistry;
@@ -180,7 +181,7 @@ private:
     void transport_failed(kernel::IpiDelivery::Token token) noexcept;
     void take_all(libk::InplaceRing<ShootdownRequest, capacity>& batch) noexcept;
 
-    libk::TicketSpinLock lock_{};
+    kernel::sync::SpinLock<kernel::sync::LockClass::Shootdown> lock_{};
     libk::InplaceRing<ShootdownRequest, capacity> requests_{};
     usize reserved_{};
     kernel::IpiDelivery delivery_{};
@@ -231,6 +232,9 @@ private:
 };
 
 class TranslationState final : private libk::noncopyable_nonmovable {
+    using StateLock =
+        kernel::sync::SpinLock<kernel::sync::LockClass::Translation>;
+
 public:
     class Mutation final {
     public:
@@ -259,14 +263,14 @@ public:
         friend class TranslationState;
         Mutation(
             TranslationState& owner,
-            arch::InterruptState interrupts,
+            kernel::sync::IrqLockToken<StateLock>&& token,
             kernel::CpuSet targets) noexcept
-            : owner_(&owner), interrupts_(interrupts), targets_(targets) {}
+            : owner_(&owner), token_(libk::move(token)), targets_(targets) {}
 
         void unlock() noexcept;
 
         TranslationState* owner_{};
-        arch::InterruptState interrupts_;
+        kernel::sync::IrqLockToken<StateLock> token_;
         kernel::CpuSet targets_{};
     };
 
@@ -296,7 +300,7 @@ private:
     friend class RetireBatch;
     friend void drain_shootdowns(kernel::CpuRuntime& runtime) noexcept;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable StateLock lock_{};
     kernel::CpuSet active_{};
     TranslationEpoch epoch_{};
     InstructionEpoch instruction_epoch_{};

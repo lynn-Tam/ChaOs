@@ -2,7 +2,7 @@
 
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <object/object_ref.hpp>
 #include <resource/allocation.hpp>
 #include <resource/sponsorship.hpp>
@@ -82,7 +82,8 @@ private:
     void service() noexcept;
     [[nodiscard]] auto closed_locked() const noexcept -> bool;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::ResourcePool>
+        lock_{};
     Budget limit_{};
     Budget available_{};
     PoolState state_{PoolState::Open};

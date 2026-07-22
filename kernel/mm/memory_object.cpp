@@ -556,8 +556,10 @@ private:
 
     Pmm* pmm_{};
     AccessMask access_{};
-    mutable libk::TicketSpinLock tree_lock_{};
-    libk::TicketSpinLock storage_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::BackingTree>
+        tree_lock_{};
+    kernel::sync::SpinLock<kernel::sync::LockClass::BackingStorage>
+        storage_lock_{};
     Tree tree_{};
     PageHeader* pages_{};
     bool growing_{};

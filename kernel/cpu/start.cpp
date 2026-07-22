@@ -13,6 +13,7 @@
 #include <mm/direct_map.hpp>
 #include <arch/cpu.hpp>
 #include <sched/dispatcher.hpp>
+#include <sync/trace.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel {
@@ -131,9 +132,19 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
         == runtime.idle().home_stack_top());
     KASSERT(runtime.owner_registry->publish_online(runtime));
 
+#if MYOS_LOCK_PROBE
+    //Confirmatory experiment.
+    // Exit condition: each fatal remains reproducible through run-lock-probe;
+    // the whole call is absent from normal builds.
+    sync::run_probe(MYOS_LOCK_PROBE);
+#endif
+
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
         print_snapshot(*runtime.owner_registry);
+        if constexpr (sync::lock_trace) {
+            sync::dump_diagnostics();
+        }
         diag::console::print<"runtime: entered\n">();
 #if MYOS_PANIC_PROBE
         //Confirmatory experiment.

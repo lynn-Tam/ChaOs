@@ -8,7 +8,7 @@
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <object/object_cleanup.hpp>
 #include <object/vproc_pool.hpp>
 #include <operation/completion.hpp>
@@ -74,7 +74,8 @@ private:
     explicit NotificationSource(Owner& owner, const Ops& ops) noexcept
         : owner_(&owner), ops_(&ops) {}
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<
+        kernel::sync::LockClass::NotificationSource> lock_{};
     libk::IntrusiveListHook hook_{};
     void* owner_{};
     const Ops* ops_{};
@@ -197,7 +198,8 @@ private:
     libk::Atomic<Life> life_{Life::Open};
     libk::Atomic<usize> signalers_{};
     libk::Atomic<usize> relations_{};
-    mutable libk::TicketSpinLock receiver_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Notification>
+        receiver_lock_{};
     Sources sources_{};
     Wait wait_;
     Receiver receiver_{Receiver::None};

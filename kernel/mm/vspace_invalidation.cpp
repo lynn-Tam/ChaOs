@@ -45,11 +45,8 @@ auto VSpace::start_invalidation(
     MappingAuthority& authority,
     PendingKind kind) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken lock{lock_};
     if (pending_kind_ != PendingKind::None || claim_.region != nullptr) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(VSpaceError::Busy);
     }
     if (authority.mappings_.empty()) {
@@ -58,8 +55,7 @@ auto VSpace::start_invalidation(
         }
         authority.invalidation_requested_ = false;
         queue_authority(authority);
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         // Relation detach and sponsored storage refund are external callbacks.
         // The authority was published to pending_authorities_ above, so the
         // unlocked drain can safely finish it without making lock_ reentrant.
@@ -69,15 +65,11 @@ auto VSpace::start_invalidation(
 
     auto mutation = coherence_.begin();
     if (!mutation) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
     auto plan = prepare_plan(context, mutation.value().targets());
     if (!plan) {
         mutation.value().abort();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(plan.error());
     }
 
@@ -117,15 +109,13 @@ auto VSpace::start_invalidation(
         mutation.value().abort();
         retire_batch_.reset();
         KASSERT(finish_pending());
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
-    lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    lock.restore();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }

@@ -48,6 +48,31 @@ public:
         atomic_thread_fence<MemoryOrder::Acquire>();
     }
 
+    // A queued waiter is otherwise invisible to higher-level diagnostics.
+    // The observer overload keeps that policy outside libk while placing the
+    // observation point inside the only loop guaranteed to run in an all-CPU
+    // lock cycle. The ordinary lock() path remains a separate implementation
+    // so production code has no callback or conditional seam.
+    template<typename Observer>
+        requires requires(
+            Observer& observer, ticket_type ticket, ticket_type serving) {
+            { observer(ticket, serving) } noexcept;
+        }
+    void lock(Observer& observer) noexcept {
+        const ticket_type ticket =
+            next_ticket_.fetch_add<MemoryOrder::Relaxed>(ticket_type{1});
+        for (;;) {
+            const ticket_type serving =
+                serving_ticket_.load<MemoryOrder::Relaxed>();
+            if (serving == ticket) {
+                break;
+            }
+            observer(ticket, serving);
+            spin_lock_detail::wait_hint();
+        }
+        atomic_thread_fence<MemoryOrder::Acquire>();
+    }
+
     [[nodiscard]] auto try_lock() noexcept -> bool {
         const ticket_type serving =
             serving_ticket_.load<MemoryOrder::Acquire>();

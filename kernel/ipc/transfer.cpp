@@ -150,17 +150,8 @@ auto Transfer::commit() noexcept
         return libk::unexpected(TransferError::InvalidSpec);
     }
 
-    cap::CSpace* first = source_;
-    cap::CSpace* second = destination_;
-    if (reinterpret_cast<usize>(first) > reinterpret_cast<usize>(second)) {
-        libk::swap(first, second);
-    }
-
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    first->lock_.lock();
-    if (second != first) {
-        second->lock_.lock();
-    }
+    kernel::sync::OrderedIrqLockPair locks{
+        source_->lock_, destination_->lock_};
 
     bool valid = true;
     for (Entry& entry : entries_) {
@@ -225,11 +216,7 @@ auto Transfer::commit() noexcept
         }
     }
 
-    if (second != first) {
-        second->lock_.unlock();
-    }
-    first->lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    locks.release();
 
     for (usize index = 0; index < refund_count; ++index) {
         refunds[index]->complete();

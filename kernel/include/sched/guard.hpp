@@ -5,6 +5,7 @@
 #include <cpu/cpu_local.hpp>
 #include <libk/noncopyable.hpp>
 #include <sched/dispatcher.hpp>
+#include <sync/irq_lock_guard.hpp>
 
 namespace kernel::sched {
 
@@ -14,17 +15,15 @@ namespace kernel::sched {
 class PreemptGuard final : private libk::noncopyable_nonmovable {
 public:
     PreemptGuard() noexcept {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         dispatcher_ = current_cpu().dispatcher();
         KASSERT(dispatcher_ != nullptr);
         dispatcher_->disable_preemption();
-        arch::restore_interrupts(interrupts);
     }
 
     ~PreemptGuard() noexcept {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         dispatcher_->enable_preemption();
-        arch::restore_interrupts(interrupts);
     }
 
 private:

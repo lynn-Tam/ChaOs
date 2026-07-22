@@ -4,7 +4,7 @@
 #include <libk/expected.hpp>
 #include <libk/intrusive_tree.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/node_pool.hpp>
 #include <mm/permissions.hpp>
 #include <mm/pmm.hpp>
@@ -99,7 +99,8 @@ public:
 private:
     friend class AliasLease;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::PhysicalAlias>
+        lock_{};
     NodePool<Claim> claims_;
     Tree tree_{};
 };

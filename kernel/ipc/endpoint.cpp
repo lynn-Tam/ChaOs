@@ -1062,6 +1062,7 @@ void Endpoint::invalidate_call(Call& call) noexcept {
 }
 
 auto Endpoint::next_call_locked(Activation& slot) noexcept -> Call* {
+    kernel::sync::LockAccess::assert_held(lock_);
     KASSERT(slot.state_ == Activation::State::Free && slot.call_ == nullptr);
     Call* selected{};
     for (usize index = 0; index < call_count_; ++index) {
@@ -1086,6 +1087,7 @@ auto Endpoint::next_call_locked(Activation& slot) noexcept -> Call* {
 }
 
 void Endpoint::reset_call_locked(Call& call) noexcept {
+    kernel::sync::LockAccess::assert_held(lock_);
     KASSERT(!call.caller_ && !call.caller_frame_
         && call.activation_ == nullptr && !call.completion_.attached()
         && !call.authority_ && !call.deadline_.armed());

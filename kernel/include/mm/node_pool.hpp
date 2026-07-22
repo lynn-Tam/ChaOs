@@ -6,7 +6,7 @@
 #include <libk/noncopyable.hpp>
 #include <libk/limits.hpp>
 #include <libk/memory.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <libk/utility.hpp>
 #include <mm/pmm.hpp>
 #include <resource/sponsorship.hpp>
@@ -330,7 +330,7 @@ private:
 
     Pmm* pmm_{};
     Quota quota_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::NodePool> lock_{};
     PageHeader* pages_{};
     usize page_count_{};
     usize live_count_{};

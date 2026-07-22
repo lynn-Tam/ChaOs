@@ -279,9 +279,8 @@ auto CpuDispatcher::request_activation(
         return libk::unexpected(WakeError::Unavailable);
     }
     if (arch::current_cpu_owner() == &target->local) {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         const bool accepted = target->dispatcher().accept_activation(vproc);
-        arch::restore_interrupts(interrupts);
         vproc.activation_publisher_done();
         return accepted
             ? WakeResult{libk::expected()}
@@ -353,18 +352,16 @@ void CpuDispatcher::request_stop(Vproc& vproc) noexcept {
 
 void CpuDispatcher::request_stop(execution::Target target) noexcept {
     if (arch::current_cpu_owner() == cpu_) {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         // A target may finish its ordinary exit after the stop owner publishes
         // the terminal transaction but before this owner-CPU call is entered.
         // The queued Stop has already been completed by finish_stop() then.
         if (target.stopped()) {
-            arch::restore_interrupts(interrupts);
             return;
         }
         if (stop(target) == StopDisposition::Finalize) {
             finish_exit(target);
         }
-        arch::restore_interrupts(interrupts);
         return;
     }
 
@@ -738,6 +735,9 @@ void CpuDispatcher::commit(
 
     KASSERT(!handoff_outgoing_);
     handoff_outgoing_ = outgoing;
+    if constexpr (kernel::sync::lock_verify) {
+        kernel::sync::assert_no_locks();
+    }
     arch::switch_context(
         outgoing.execution().context(), incoming.execution().context());
     post_switch();
@@ -914,19 +914,17 @@ void CpuDispatcher::finish_exit(execution::Target target) noexcept {
 }
 
 void yield() noexcept {
-    const arch::InterruptState interrupts = arch::disable_interrupts();
+    kernel::sync::IrqToken irq{};
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->yield();
-    arch::restore_interrupts(interrupts);
 }
 
 void block() noexcept {
-    const arch::InterruptState interrupts = arch::disable_interrupts();
+    kernel::sync::IrqToken irq{};
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->block_current();
-    arch::restore_interrupts(interrupts);
 }
 
 auto wake(CpuRegistry& cpus, Binding& binding) noexcept
@@ -938,10 +936,9 @@ auto wake(CpuRegistry& cpus, Binding& binding) noexcept
     }
 
     if (arch::current_cpu_owner() == &target->local) {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         const CpuDispatcher::WakeAcceptance accepted =
             target->dispatcher().accept_wake(binding);
-        arch::restore_interrupts(interrupts);
         if (accepted != CpuDispatcher::WakeAcceptance::Rejected) {
             return libk::expected();
         }
@@ -958,9 +955,8 @@ auto start(CpuRegistry& cpus, Binding& binding) noexcept
         return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
     }
     if (arch::current_cpu_owner() == &target->local) {
-        const arch::InterruptState interrupts = arch::disable_interrupts();
+        kernel::sync::IrqToken irq{};
         const bool accepted = target->dispatcher().make_ready(binding);
-        arch::restore_interrupts(interrupts);
         return accepted
             ? CpuDispatcher::WakeResult{libk::expected()}
             : CpuDispatcher::WakeResult{

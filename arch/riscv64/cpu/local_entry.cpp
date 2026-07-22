@@ -55,6 +55,11 @@ auto trap_depth() noexcept -> usize {
     return trap_depth(*state);
 }
 
+auto trap_entry_tick() noexcept -> u64 {
+    const auto* const state = local_state();
+    return state != nullptr ? state->trap_entry_tick : 0;
+}
+
 void publish_panic_state(
     CpuEntryState& state,
     usize emergency_stack_top,

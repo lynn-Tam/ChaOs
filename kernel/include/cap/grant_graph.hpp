@@ -4,7 +4,7 @@
 #include <libk/intrusive_list.hpp>
 #include <libk/delegate.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/node_pool.hpp>
 #include <mm/pmm.hpp>
 #include <resource/allocation.hpp>
@@ -249,8 +249,9 @@ private:
 
     kernel::mm::Pmm* pmm_{};
     Quota quota_{};
-    mutable libk::TicketSpinLock lock_{};
-    mutable libk::TicketSpinLock work_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::GrantGraph> lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::GrantWork>
+        work_lock_{};
     WorkQueue work_{};
     WorkNotifier work_notifier_{};
     kernel::mm::NodePool<GrantRevokeWait> revoke_waits_;

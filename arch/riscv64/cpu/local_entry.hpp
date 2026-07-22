@@ -36,7 +36,8 @@
 #define RISCV64_CPU_ENTRY_PANIC_SLOT_OFFSET 64
 #define RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET 72
 #define RISCV64_CPU_ENTRY_PANIC_STOP_OFFSET 80
-#define RISCV64_CPU_ENTRY_BLOCK_SIZE 88
+#define RISCV64_CPU_ENTRY_TRAP_TICK_OFFSET 88
+#define RISCV64_CPU_ENTRY_BLOCK_SIZE 96
 
 #if !defined(__ASSEMBLER__)
 namespace arch::riscv64 {
@@ -61,6 +62,7 @@ struct CpuEntryBlock final {
     void* panic_slot{};
     usize emergency_depth{};
     usize panic_stop_requested{};
+    u64 trap_entry_tick{};
 
     void initialize(void* owner) noexcept {
         scratch = {};
@@ -71,6 +73,7 @@ struct CpuEntryBlock final {
         panic_slot = nullptr;
         emergency_depth = 0;
         panic_stop_requested = 0;
+        trap_entry_tick = 0;
     }
 
     void publish_active_stack(usize stack_top) noexcept {
@@ -119,6 +122,8 @@ static_assert(offsetof(CpuEntryBlock, emergency_depth)
     == RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET);
 static_assert(offsetof(CpuEntryBlock, panic_stop_requested)
     == RISCV64_CPU_ENTRY_PANIC_STOP_OFFSET);
+static_assert(offsetof(CpuEntryBlock, trap_entry_tick)
+    == RISCV64_CPU_ENTRY_TRAP_TICK_OFFSET);
 
 } // namespace arch::riscv64
 #endif

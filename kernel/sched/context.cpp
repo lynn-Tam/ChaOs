@@ -24,7 +24,7 @@ SchedulingContext::SchedulingContext(Config config, time::Instant now) noexcept
 }
 
 SchedulingContext::~SchedulingContext() noexcept {
-    KASSERT(!active_cpu_);
+    KASSERT(!active());
     KASSERT(!binding_);
     KASSERT(!binding_authority_);
     KASSERT(domain_ == nullptr);
@@ -166,7 +166,7 @@ auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept -> Result {
     if (!binding_) {
         return libk::unexpected(Error::NotBound);
     }
-    if (active_cpu_ || binding_->queued()) {
+    if (active() || binding_->queued()) {
         return libk::unexpected(Error::Active);
     }
     execution::Target target = binding_->target();
@@ -183,7 +183,7 @@ auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept -> Result {
 auto SchedulingContext::prepare_retire() noexcept -> bool {
     {
         kernel::sync::IrqLockGuard guard{authority_lock_};
-        if (active_cpu_ || binding_) {
+        if (active() || binding_) {
             return false;
         }
         withdrawing_ = true;
@@ -254,7 +254,7 @@ void SchedulingContext::finish_domain() noexcept {
     SchedulingDomain* domain{};
     {
         kernel::sync::IrqLockGuard guard{authority_lock_};
-        KASSERT(withdrawing_ && !binding_ && !active_cpu_);
+        KASSERT(withdrawing_ && !binding_ && !active());
         domain = domain_;
     }
     if (domain != nullptr) {
@@ -268,20 +268,22 @@ void SchedulingContext::finish_domain() noexcept {
 
 auto SchedulingContext::activate(CpuId cpu) noexcept -> bool {
     kernel::sync::IrqLockGuard guard{authority_lock_};
-    if (active_cpu_ || cpu != home_cpu_ || domain_ == nullptr
+    if (active() || cpu != home_cpu_ || domain_ == nullptr
         || withdrawing_) {
         return false;
     }
-    active_cpu_ = cpu;
+    active_cpu_.store<libk::MemoryOrder::Release>(cpu.raw);
     ++activation_count_;
     KASSERT(activation_count_ != 0);
     return true;
 }
 
 void SchedulingContext::deactivate(CpuId cpu) noexcept {
-    kernel::sync::IrqLockGuard guard{authority_lock_};
-    KASSERT(active_cpu_ && *active_cpu_ == cpu);
-    active_cpu_.reset();
+    usize expected = cpu.raw;
+    const bool deactivated = active_cpu_.compare_exchange_strong<
+        libk::MemoryOrder::AcqRel,
+        libk::MemoryOrder::Acquire>(expected, max_cpu_count);
+    KASSERT(deactivated);
 }
 
 void SchedulingContext::charge(

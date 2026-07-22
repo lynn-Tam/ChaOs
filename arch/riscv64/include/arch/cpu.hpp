@@ -43,6 +43,7 @@ void publish_active_stack(CpuEntryState& state, usize stack_top) noexcept;
 [[nodiscard]] auto active_stack(const CpuEntryState& state) noexcept -> usize;
 [[nodiscard]] auto trap_depth(const CpuEntryState& state) noexcept -> usize;
 [[nodiscard]] auto trap_depth() noexcept -> usize;
+[[nodiscard]] auto trap_entry_tick() noexcept -> u64;
 void publish_panic_state(
     CpuEntryState& state,
     usize emergency_stack_top,

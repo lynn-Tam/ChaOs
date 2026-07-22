@@ -8,7 +8,7 @@
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <object/object_cleanup.hpp>
 #include <object/object_ref.hpp>
 
@@ -107,7 +107,7 @@ private:
     usize slot_{};
     usize tag_{};
     u64 binding_generation_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Tunnel> lock_{};
     AuthorityLink connect_authority_;
     TunnelLink source_link_;
     TunnelLink target_link_;

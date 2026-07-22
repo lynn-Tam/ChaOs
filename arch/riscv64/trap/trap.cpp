@@ -6,10 +6,12 @@
 #include "arch/riscv64/trap/trapframe.hpp"
 
 #include <arch/trap.hpp>
+#include <arch/time.hpp>
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
 #include <diag/panic.hpp>
 #include <trap/trap.hpp>
+#include <sync/trace.hpp>
 
 using arch::riscv64::TrapFrame;
 
@@ -25,6 +27,11 @@ extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
         kernel::diag::stop_peer(context);
     }
     const kernel::trap::Event event = arch::riscv64::make_event(*frame);
+    if constexpr (kernel::sync::lock_verify) {
+        kernel::sync::trap_enter(
+            event,
+            kernel::sync::lock_profile ? arch::trap_entry_tick() : 0);
+    }
     kernel::trap::handle(event, context);
     return arch::riscv64::raw_frame(context.frame());
 }
@@ -35,7 +42,15 @@ extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
     KASSERT(arch::trap_depth() == 0);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
+    if constexpr (kernel::sync::lock_verify) {
+        kernel::sync::trap_exiting();
+    }
     kernel::trap::on_exit(context);
+    if constexpr (kernel::sync::lock_verify) {
+        kernel::sync::assert_no_locks();
+        kernel::sync::trap_exit(
+            kernel::sync::lock_profile ? arch::read_clock().ticks() : 0);
+    }
     return arch::riscv64::raw_frame(context.frame());
 }
 

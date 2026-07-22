@@ -4,7 +4,7 @@
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 
 namespace kernel::sched {
 
@@ -63,7 +63,8 @@ public:
     [[nodiscard]] auto size() const noexcept -> usize;
 
 private:
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::RemoteQueue>
+        lock_{};
     Queue queue_{};
     kernel::IpiDelivery delivery_{};
 };

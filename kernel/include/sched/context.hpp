@@ -8,7 +8,8 @@
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <libk/sync/atomic.hpp>
+#include <sync/lock.hpp>
 #include <object/object_ref.hpp>
 #include <object/vproc_pool.hpp>
 #include <sched/binding.hpp>
@@ -124,15 +125,20 @@ private:
     [[nodiscard]] auto bind_target(
         execution::TargetHold&& target) noexcept -> Result;
     [[nodiscard]] auto unbind(CpuDispatcher* owner) noexcept -> Result;
+    [[nodiscard]] auto active() const noexcept -> bool {
+        return active_cpu_.load<libk::MemoryOrder::Acquire>()
+            != max_cpu_count;
+    }
 
     Config config_{};
     RefillQueue refills_;
-    mutable libk::TicketSpinLock authority_lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::SchedContext>
+        authority_lock_{};
     libk::ManualLifetime<Binding> binding_{};
     libk::ManualLifetime<BindingAuthority> binding_authority_{};
     SchedulingDomain* domain_{};
     CpuId home_cpu_{};
-    libk::optional<CpuId> active_cpu_{};
+    libk::Atomic<usize> active_cpu_{max_cpu_count};
     time::Duration overrun_{};
     u64 activation_count_{};
     cap::GrantAttachment domain_authority_{this, domain_ops_};

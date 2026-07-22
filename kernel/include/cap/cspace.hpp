@@ -9,7 +9,7 @@
 #include <core/debug.hpp>
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_traits.hpp>
 #include <resource/sponsorship.hpp>
@@ -337,7 +337,9 @@ private:
     kernel::mm::Pmm* pmm_{};
     kernel::mm::OwnedPageGroup pages_;
     Quota quota_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<
+        kernel::sync::LockClass::CSpace,
+        kernel::sync::SameClassPolicy::AddressAscending> lock_{};
     DirPage* root_{};
     u32 free_head_{invalid_index};
     u32 occupied_head_{invalid_index};

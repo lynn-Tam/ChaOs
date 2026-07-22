@@ -233,9 +233,8 @@ auto VSpace::create_region(
     // Cross-root publication uses one fixed lock order. Readers of either
     // root cannot observe a published Region without its capability slot, or
     // a slot naming a Region that is still unpublished.
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    destination.lock_.lock();
-    lock_.lock();
+    kernel::sync::IrqLockToken cspace_lock{destination.lock_};
+    kernel::sync::IrqLockToken vspace_lock{lock_};
     KASSERT(claim_.region == parent && claim_.range == range);
     KASSERT(overlap(*parent, range) == nullptr);
     auto installed = destination.commit_locked(
@@ -244,9 +243,8 @@ auto VSpace::create_region(
         parent->children_.insert(*child);
     }
     release_claim();
-    lock_.unlock();
-    destination.lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    vspace_lock.restore();
+    cspace_lock.restore();
     if (!installed) {
         child_grant.reset();
         regions_.destroy(*child);
@@ -378,8 +376,7 @@ auto VSpace::start_region_destroy(
     bool remove_root,
     PendingKind kind) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken lock{lock_};
     const bool permitted_state = state_ == VSpaceState::Live
         || (state_ == VSpaceState::Stopping && !remove_root);
     if (!permitted_state
@@ -387,21 +384,15 @@ auto VSpace::start_region_destroy(
         || claim_.region != nullptr
         || region.state_ == RegionState::Dead
         || (remove_root && &region == root_region_)) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(VSpaceError::Busy);
     }
     auto mutation = coherence_.begin();
     if (!mutation) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
     auto plan = prepare_plan(context, mutation.value().targets());
     if (!plan) {
         mutation.value().abort();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::unexpected(plan.error());
     }
     region.state_ = RegionState::Retiring;
@@ -413,15 +404,13 @@ auto VSpace::start_region_destroy(
         mutation.value().abort();
         retire_batch_.reset();
         KASSERT(finish_pending());
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
-    lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    lock.restore();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }

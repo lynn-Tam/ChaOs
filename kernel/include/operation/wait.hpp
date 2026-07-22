@@ -2,7 +2,7 @@
 
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 
 namespace arch {
 class TrapContext;
@@ -45,7 +45,7 @@ private:
     Completion* completion_{};
     CpuRegistry* cpus_{};
     sched::Binding* binding_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::Wait> lock_{};
     libk::Atomic<bool> ready_{};
 };
 

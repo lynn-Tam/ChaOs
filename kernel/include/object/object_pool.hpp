@@ -8,7 +8,7 @@
 #include <libk/unique_handle.hpp>
 #include <libk/limits.hpp>
 #include <libk/memory.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <libk/utility.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_anchor.hpp>
@@ -426,6 +426,7 @@ private:
     [[nodiscard]] auto add_ref_locked(
         ObjectAnchor& anchor,
         u64 generation) noexcept -> bool {
+        kernel::sync::LockAccess::assert_held(lock_);
         KASSERT(anchor.owner_ == this);
         if (anchor.generation_ != generation
             || anchor.lifecycle_ != ObjectLifecycle::Live) {
@@ -440,6 +441,7 @@ private:
     [[nodiscard]] auto pin_locked(
         ObjectAnchor& anchor,
         u64 generation) noexcept -> void* {
+        kernel::sync::LockAccess::assert_held(lock_);
         KASSERT(anchor.owner_ == this);
         if (anchor.generation_ != generation
             || anchor.lifecycle_ != ObjectLifecycle::Live) {
@@ -637,7 +639,7 @@ private:
 
     kernel::mm::Pmm* pmm_{};
     libk::delegate<void() noexcept>* reclaim_notify_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::ObjectPool> lock_{};
     PageHeader* pages_head_{};
     Slot* reclaim_head_{};
     u64 next_generation_{1};

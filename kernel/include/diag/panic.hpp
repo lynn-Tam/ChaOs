@@ -5,6 +5,7 @@
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
 #include <libk/sync/atomic.hpp>
+#include <sync/trace.hpp>
 
 namespace kernel {
 class CpuRegistry;
@@ -28,6 +29,7 @@ enum class Facility : u8 {
     Capability,
     Memory,
     Syscall,
+    Synchronization,
 };
 
 struct EventId final {
@@ -82,6 +84,9 @@ struct PanicSlot final {
 
 struct CpuDiagnostics final {
     PanicSlot panic{};
+#if MYOS_LOCK_DIAG >= 1
+    sync::CpuLockTrace locks{};
+#endif
 };
 
 static_assert(sizeof(CpuDiagnostics) <= 4096);

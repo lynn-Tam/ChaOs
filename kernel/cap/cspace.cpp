@@ -456,19 +456,7 @@ auto CSpace::move(
     const CapHandle destination_handle = reservation.handle();
     kernel::resource::Refund source_refund{};
 
-    CSpace* first = this;
-    CSpace* second = &destination;
-    if (reinterpret_cast<usize>(first) > reinterpret_cast<usize>(second)) {
-        CSpace* const swapped = first;
-        first = second;
-        second = swapped;
-    }
-
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    first->lock_.lock();
-    if (second != first) {
-        second->lock_.lock();
-    }
+    kernel::sync::OrderedIrqLockPair locks{lock_, destination.lock_};
 
     Slot* const source = source_handle ? slot(source_handle.index()) : nullptr;
     Slot* const target = destination.slot(destination_handle.index());
@@ -506,11 +494,7 @@ auto CSpace::move(
         transferred = true;
     }
 
-    if (second != first) {
-        second->lock_.unlock();
-    }
-    first->lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    locks.release();
     source_refund.complete();
 
     return transferred
@@ -558,6 +542,7 @@ auto CSpace::commit_locked(
     Reservation& reservation,
     GrantRef&& grant,
     CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    kernel::sync::LockAccess::assert_held(lock_);
     if (reservation.owner_ != this || !grant || !accepting_) {
         return libk::unexpected(CSpaceError::InvalidState);
     }

@@ -3,7 +3,7 @@
 #include <cap/grant.hpp>
 #include <cap/resolved.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <execution/stop.hpp>
 #include <execution/target.hpp>
 
@@ -58,7 +58,8 @@ private:
     static const cap::GrantAttachmentOps ops_;
 
     execution::Target target_{};
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::SchedAuthority>
+        lock_{};
     Link context_;
     Link target_cap_;
     execution::Stop stop_;

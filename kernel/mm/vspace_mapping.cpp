@@ -374,15 +374,12 @@ auto VSpace::map_impl(
     }
     TableReserve tables = libk::move(table_reserve).value();
 
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken lock{lock_};
     if (state_ != VSpaceState::Live
         || claim_.region != &region
         || claim_.range != request.virtual_range
         || authority->invalidation_requested_
         || overlap(region, request.virtual_range) != nullptr) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return fail(VSpaceError::InvalidState);
     }
 
@@ -392,22 +389,16 @@ auto VSpace::map_impl(
         region.children_.insert(*mapping);
         release_claim();
         const MappingKey key = mapping->key_;
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return libk::expected(MapResult{key, VmStatus::Complete});
     }
 
     auto mutation = coherence_.begin();
     if (!mutation) {
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return fail(VSpaceError::ShootdownUnavailable);
     }
     auto plan = prepare_plan(context, mutation.value().targets());
     if (!plan) {
         mutation.value().abort();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
         return fail(plan.error());
     }
 
@@ -443,8 +434,7 @@ auto VSpace::map_impl(
         libk::move(plan).value(),
         retire,
         request.access.contains(Access::Execute));
-    lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    lock.restore();
     if (!committed) {
         return libk::unexpected(committed.error());
     }

@@ -4,7 +4,7 @@
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync/lock.hpp>
 #include <mm/vspace.hpp>
 
 namespace kernel::mm {
@@ -33,7 +33,8 @@ private:
     [[nodiscard]] auto take() noexcept -> VSpace*;
     void withdraw(VSpace& space) noexcept;
 
-    mutable libk::TicketSpinLock lock_{};
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::VSpaceWork>
+        lock_{};
     Queue queue_{};
     Notifier notifier_{};
 };

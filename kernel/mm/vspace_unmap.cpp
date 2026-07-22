@@ -232,13 +232,11 @@ auto VSpace::unmap_impl(
         }
     };
 
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    lock_.lock();
+    kernel::sync::IrqLockToken lock{lock_};
     if (claim_.region != &region || claim_.range != range
         || !find_coverage()) {
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         discard_fragments();
         return libk::unexpected(view_conflict
             ? VSpaceError::Busy
@@ -247,8 +245,7 @@ auto VSpace::unmap_impl(
     auto mutation = coherence_.begin();
     if (!mutation) {
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         discard_fragments();
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
@@ -256,8 +253,7 @@ auto VSpace::unmap_impl(
     if (!plan) {
         mutation.value().abort();
         release_claim();
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         discard_fragments();
         return libk::unexpected(plan.error());
     }
@@ -325,15 +321,13 @@ auto VSpace::unmap_impl(
         mutation.value().abort();
         retire_batch_.reset();
         KASSERT(finish_pending());
-        lock_.unlock();
-        arch::restore_interrupts(interrupts);
+        lock.restore();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
         libk::move(mutation).value(), libk::move(plan).value(), retire);
-    lock_.unlock();
-    arch::restore_interrupts(interrupts);
+    lock.restore();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }
