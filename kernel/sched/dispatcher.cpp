@@ -48,6 +48,29 @@ auto CpuDispatcher::current_urgency() const noexcept -> Urgency {
     return current_binding_->context().urgency();
 }
 
+auto CpuDispatcher::arm(
+    Deadline& deadline,
+    time::Instant when) noexcept -> bool {
+    KASSERT(!arch::interrupts_enabled());
+    KASSERT(arch::current_cpu_owner() == cpu_);
+    if (!timer_available_ || deadline.armed() || !deadline.callback_) {
+        return false;
+    }
+    deadlines_.insert(deadline, when);
+    deadline.owner_ = this;
+    program_deadline(clock_->now());
+    return true;
+}
+
+void CpuDispatcher::disarm(Deadline& deadline) noexcept {
+    KASSERT(!arch::interrupts_enabled());
+    KASSERT(arch::current_cpu_owner() == cpu_);
+    KASSERT(deadline.owner_ == this);
+    deadlines_.remove(deadline);
+    deadline.owner_ = nullptr;
+    program_deadline(clock_->now());
+}
+
 void CpuDispatcher::publish(execution::Target target) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::current_cpu_owner() == cpu_);
@@ -97,7 +120,11 @@ void CpuDispatcher::on_context_enter() noexcept {
 
 void CpuDispatcher::refresh() noexcept {
     KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::trap_depth() == 1);
+    // Endpoint frames change synchronously in the trap handler (depth 1) or
+    // while an asynchronous terminal cause is committed by the common
+    // trap-exit hook (depth 0). Both are owner-CPU, interrupts-off points
+    // before the selected user frame is restored.
+    KASSERT(arch::trap_depth() <= 1);
     KASSERT(current_ && cpu_->current_execution_ == &current_.execution());
     publish(current_);
 }
@@ -264,15 +291,25 @@ auto CpuDispatcher::request_activation(
         kernel::sync::IrqLockGuard guard{vproc.state_lock_};
         KASSERT(vproc.activation_publishers_ != 0);
         --vproc.activation_publishers_;
-        if (vproc.activation_request_held_) {
+        if (vproc.activation_post_ != Vproc::ActivationPost::Idle) {
+            // A publication concurrent with an already consumed request must
+            // receive another home-CPU admission pass. Publications that race
+            // an unconsumed request may be folded into that pass, but treating
+            // all coalescing as dirty keeps the ordering proof local.
+            vproc.activation_dirty_ = true;
             return libk::expected();
         }
-        vproc.activation_request_held_ = true;
-        vproc.activation_posting_ = true;
+        KASSERT(!vproc.activation_dirty_);
+        vproc.activation_post_ = Vproc::ActivationPost::Posting;
     }
-    auto posted = target->dispatcher().post_activation(vproc);
-    vproc.activation_request_posted(static_cast<bool>(posted));
-    return posted;
+    for (;;) {
+        auto posted = target->dispatcher().post_activation(vproc);
+        const bool repost = vproc.activation_request_posted(
+            static_cast<bool>(posted));
+        if (!posted || !repost) {
+            return posted;
+        }
+    }
 }
 
 auto CpuDispatcher::post_remote(RemoteRequest& request) noexcept -> WakeResult {
@@ -280,6 +317,13 @@ auto CpuDispatcher::post_remote(RemoteRequest& request) noexcept -> WakeResult {
         return libk::unexpected(WakeError::Unavailable);
     }
     remote_.post(request);
+    return kick_remote();
+}
+
+auto CpuDispatcher::kick_remote() noexcept -> WakeResult {
+    if (!ipi_available_) {
+        return libk::unexpected(WakeError::Unavailable);
+    }
     KASSERT(cpu_->descriptor != nullptr);
     for (usize attempt = 0; attempt < 8; ++attempt) {
         const auto transport = remote_.claim_transport();
@@ -308,10 +352,15 @@ void CpuDispatcher::request_stop(Vproc& vproc) noexcept {
 }
 
 void CpuDispatcher::request_stop(execution::Target target) noexcept {
-    Binding* const binding = target.execution().scheduler_binding_;
-    KASSERT(binding != nullptr && binding->target() == target);
     if (arch::current_cpu_owner() == cpu_) {
         const arch::InterruptState interrupts = arch::disable_interrupts();
+        // A target may finish its ordinary exit after the stop owner publishes
+        // the terminal transaction but before this owner-CPU call is entered.
+        // The queued Stop has already been completed by finish_stop() then.
+        if (target.stopped()) {
+            arch::restore_interrupts(interrupts);
+            return;
+        }
         if (stop(target) == StopDisposition::Finalize) {
             finish_exit(target);
         }
@@ -327,24 +376,50 @@ void CpuDispatcher::request_stop(execution::Target target) noexcept {
             .argument_count = 1,
         }));
     }
-    remote_.post(binding->stop_);
-    KASSERT(cpu_->descriptor != nullptr);
-    for (usize attempt = 0; attempt < 8; ++attempt) {
-        const auto transport = remote_.claim_transport();
-        if (!transport) {
-            return;
+
+    bool queued{};
+    bool owned{};
+    if (Vproc* const vproc = target.vproc()) {
+        kernel::sync::IrqLockGuard guard{vproc->state_lock_};
+        Binding* const binding = vproc->execution_.scheduler_binding_;
+        owned = vproc->execution_.home_ == this;
+        if (binding != nullptr) {
+            KASSERT(owned && binding->target() == target);
+            remote_.post(binding->stop_);
+            queued = true;
+        } else if (vproc->stopped_) {
+            KASSERT(vproc->execution_.home_ == nullptr
+                && vproc->execution_.state_ == ExecutionState::Exited);
+        } else {
+            KASSERT(owned && vproc->execution_.state_ == ExecutionState::Exited
+                && vproc->stop_requested_ && vproc->stop_dispatched_);
         }
-        if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
-            return;
+    } else {
+        Thread* const thread = target.thread();
+        KASSERT(thread != nullptr);
+        kernel::sync::IrqLockGuard guard{thread->stop_lock_};
+        Binding* const binding = thread->execution_.scheduler_binding_;
+        owned = thread->execution_.home_ == this;
+        if (binding != nullptr) {
+            KASSERT(owned && binding->target() == target);
+            remote_.post(binding->stop_);
+            queued = true;
+        } else if (thread->stopped_) {
+            KASSERT(thread->execution_.home_ == nullptr
+                && thread->execution_.state_ == ExecutionState::Exited);
+        } else {
+            KASSERT(owned && thread->execution_.state_ == ExecutionState::Exited
+                && thread->stop_requested_);
         }
-        remote_.transport_failed(*transport);
     }
-    KPANIC((diag::FatalEvent{
-        .facility = diag::Facility::Scheduler,
-        .id = diag::EventId{0x40000003},
-        .arguments = {id_.raw},
-        .argument_count = 1,
-    }));
+    if (queued && !kick_remote()) {
+        KPANIC((diag::FatalEvent{
+            .facility = diag::Facility::Scheduler,
+            .id = diag::EventId{0x40000003},
+            .arguments = {id_.raw},
+            .argument_count = 1,
+        }));
+    }
 }
 
 void CpuDispatcher::drain_remote() noexcept {
@@ -365,11 +440,11 @@ void CpuDispatcher::drain_remote() noexcept {
         }
         case RemoteKind::Activation: {
             auto& vproc = *static_cast<Vproc*>(request->owner());
-            static_cast<void>(accept_activation(vproc));
             remote_.complete(*request);
-            vproc.activation_request_consumed();
+            do {
+                static_cast<void>(accept_activation(vproc));
+            } while (vproc.activation_request_consumed());
             continue;
-            break;
         }
         case RemoteKind::Stop: {
             const execution::Target target =
@@ -421,6 +496,22 @@ void CpuDispatcher::process_timers(time::Instant now) noexcept {
         KASSERT(binding->execution().state_
             == ExecutionState::Throttled);
         enqueue_or_throttle(*binding, now);
+    }
+}
+
+void CpuDispatcher::process_deadlines(time::Instant now) noexcept {
+    for (;;) {
+        const auto when = deadlines_.deadline();
+        if (!when || *when > now) {
+            return;
+        }
+        Deadline* const deadline = deadlines_.front();
+        KASSERT(deadline != nullptr && deadline->owner_ == this);
+        deadlines_.remove(*deadline);
+        deadline->owner_ = nullptr;
+        const Deadline::Callback callback = deadline->callback_;
+        KASSERT(callback);
+        callback();
     }
 }
 
@@ -481,6 +572,7 @@ void CpuDispatcher::on_timer() noexcept {
     const time::Instant now = clock_->now();
     charge_to(now);
     arch::mask_timer();
+    process_deadlines(now);
     request_reschedule(DispatchReason::Timer);
 }
 
@@ -676,6 +768,10 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
         timer_deadline && *timer_deadline < deadline) {
         deadline = *timer_deadline;
     }
+    if (const auto call_deadline = deadlines_.deadline();
+        call_deadline && *call_deadline < deadline) {
+        deadline = *call_deadline;
+    }
     const auto programmed = arch::program_timer(deadline);
     if (!programmed) {
         timer_available_ = false;
@@ -760,11 +856,9 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
 
     if (Vproc* const vproc = target.vproc()) {
         const RemoteCancel canceled = remote_.cancel(vproc->activation_);
-        if (canceled == RemoteCancel::CanceledQueued) {
-            vproc->activation_request_consumed();
-        } else if (canceled == RemoteCancel::AlreadyClaimed) {
-            return StopDisposition::Deferred;
-        }
+        // stop_ready() is derived from the Vproc-owned post state. Reaching
+        // the home dispatcher therefore implies that queue ownership is gone.
+        KASSERT(canceled == RemoteCancel::NotPending);
     }
 
     if (execution.state_ == ExecutionState::Running) {
@@ -812,12 +906,9 @@ void CpuDispatcher::finish_exit(execution::Target target) noexcept {
         static_cast<void>(remote_.cancel(binding.stop_));
         if (Vproc* const vproc = target.vproc()) {
             const RemoteCancel canceled = remote_.cancel(vproc->activation_);
-            if (canceled == RemoteCancel::CanceledQueued) {
-                vproc->activation_request_consumed();
-            }
-            KASSERT(canceled != RemoteCancel::AlreadyClaimed);
+            KASSERT(canceled == RemoteCancel::NotPending);
         }
-        KASSERT(binding.context().unbind());
+        KASSERT(binding.context().unbind(this));
     }
     target.finish_stop();
 }

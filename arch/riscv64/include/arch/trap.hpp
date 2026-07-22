@@ -44,8 +44,8 @@ public:
     [[nodiscard]] auto pc() const noexcept -> usize;
     void set_pc(usize pc) noexcept;
 
-    // Current kernel breakpoint support assumes 32-bit ebreak. Supporting
-    // c.ebreak requires instruction-length decoding.
+    // Breakpoint completion is currently supervisor-only. User breakpoints
+    // remain fault-policy events and are never fetched through a raw user VA.
     void complete_breakpoint() noexcept;
     void complete_syscall() noexcept;
 

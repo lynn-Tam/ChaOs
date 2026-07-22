@@ -123,6 +123,7 @@ private:
     void charge(time::Instant now, time::Duration elapsed) noexcept;
     [[nodiscard]] auto bind_target(
         execution::TargetHold&& target) noexcept -> Result;
+    [[nodiscard]] auto unbind(CpuDispatcher* owner) noexcept -> Result;
 
     Config config_{};
     RefillQueue refills_;

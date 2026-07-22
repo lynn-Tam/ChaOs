@@ -167,6 +167,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     kernel::Execution* const execution = cpu.current_execution();
     KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
     while (thread != nullptr && thread->active_frame() != nullptr
+        && !thread->current_wait().attached()
         && (cpu.dispatcher()->current().stop_requested()
             || thread->cancel_pending())) {
         thread->active_frame()->unwind(
@@ -193,6 +194,16 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
         cpu.dispatcher()->block_current();
         KASSERT(cpu.current_execution() == execution);
         wait = thread != nullptr ? &thread->current_wait() : nullptr;
+    }
+    // A canceled Endpoint frame cannot be popped while its leaf Wait still
+    // owns the continuation. Once that relation has completed or canceled,
+    // this same owning CPU performs the pending chain unwind.
+    while (thread != nullptr && thread->active_frame() != nullptr
+        && !thread->current_wait().attached()
+        && (cpu.dispatcher()->current().stop_requested()
+            || thread->cancel_pending())) {
+        thread->active_frame()->unwind(
+            context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.

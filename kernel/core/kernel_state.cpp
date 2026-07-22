@@ -42,6 +42,9 @@ KernelState::~KernelState() noexcept {
     if (objects_) {
         objects().unbind_reclaim_notifier();
     }
+    if (grants_) {
+        grants().unbind_work_notifier();
+    }
     vspace_work_.unbind_notifier();
     cpus_.reset();
     release_scheduler_objects();
@@ -156,6 +159,9 @@ auto KernelState::start_reclaimer(
     vspace_work_.bind_notifier(
         kernel::mm::VSpaceExecutor::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
+    grants().bind_work_notifier(
+        kernel::cap::GrantGraph::WorkNotifier::bind<
+            &KernelState::wake_reclaimer>(*this));
 
     return true;
 }
@@ -166,13 +172,14 @@ auto KernelState::start_reclaimer(
         kernel.objects().drain_reclaim();
         kernel::CpuLocal& cpu = kernel::current_cpu();
         KASSERT(cpu.runtime().owner_registry != nullptr);
-        const bool more = kernel.vspace_work_.run(
+        const bool grant_more = kernel.grants().service(8);
+        const bool vspace_more = kernel.vspace_work_.run(
             kernel::mm::VmContext{
                 .cpus = cpu.runtime().owner_registry,
                 .local = cpu.descriptor->logical_id(),
             },
             8);
-        if (more) {
+        if (grant_more || vspace_more) {
             kernel::sched::yield();
         } else {
             kernel::sched::block();

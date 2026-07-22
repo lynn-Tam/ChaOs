@@ -663,6 +663,20 @@ bool test_atomic_scalar_and_compare_exchange_contract(
         && phase.load<libk::MemoryOrder::Relaxed>() == AtomicPhase::Empty;
 }
 
+bool test_atomic_ref_uses_borrowed_storage(const TestContext&) noexcept {
+    uint64_t storage{7};
+    libk::AtomicRef value{storage};
+    value.store<libk::MemoryOrder::Release>(11);
+    const uint64_t previous =
+        value.fetch_add<libk::MemoryOrder::Relaxed>(5);
+    uint64_t expected = 16;
+    const bool exchanged = value.compare_exchange_strong<
+        libk::MemoryOrder::AcqRel,
+        libk::MemoryOrder::Acquire>(expected, 23);
+    return previous == 11 && exchanged && storage == 23
+        && value.load<libk::MemoryOrder::Acquire>() == 23;
+}
+
 bool test_intrusive_tree_order_and_removal(const TestContext&) noexcept {
     TreeNode nodes[] = {
         {7, 0}, {2, 0}, {9, 0}, {1, 0}, {5, 0}, {8, 0},
@@ -769,6 +783,10 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         "libk",
         "atomic scalar operations preserve compare-exchange contract",
         test_atomic_scalar_and_compare_exchange_contract);
+    (void)registry.add(
+        "libk",
+        "atomic ref synchronizes borrowed scalar storage",
+        test_atomic_ref_uses_borrowed_storage);
     (void)registry.add(
         "libk",
         "intrusive AVL tree preserves ordered unique membership",

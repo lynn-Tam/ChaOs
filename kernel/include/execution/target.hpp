@@ -48,6 +48,7 @@ public:
     [[nodiscard]] auto identity() const noexcept -> usize;
     [[nodiscard]] auto stop_deferred() const noexcept -> bool;
     [[nodiscard]] auto stop_requested() const noexcept -> bool;
+    [[nodiscard]] auto stopped() const noexcept -> bool;
     [[nodiscard]] auto stop_ready() const noexcept -> bool;
     [[nodiscard]] auto claim_home(sched::CpuDispatcher& home) const noexcept
         -> bool;
@@ -55,7 +56,9 @@ public:
         const sched::CpuDispatcher& home) const noexcept -> bool;
     [[nodiscard]] auto try_bind(sched::Binding& binding) const noexcept
         -> bool;
-    void clear_binding(sched::Binding& binding) const noexcept;
+    [[nodiscard]] auto release_binding(
+        sched::Binding& binding,
+        sched::CpuDispatcher* owner) const noexcept -> bool;
     void finish_stop() const noexcept;
 
     [[nodiscard]] friend auto operator==(

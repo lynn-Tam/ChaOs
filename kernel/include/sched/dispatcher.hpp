@@ -51,6 +51,10 @@ public:
     }
     [[nodiscard]] auto remaining_budget() const noexcept -> time::Duration;
     [[nodiscard]] auto current_urgency() const noexcept -> Urgency;
+    [[nodiscard]] auto arm(
+        Deadline& deadline,
+        time::Instant when) noexcept -> bool;
+    void disarm(Deadline& deadline) noexcept;
 
     [[noreturn]] void enter_idle() noexcept;
     void on_context_enter() noexcept;
@@ -91,6 +95,7 @@ private:
     void charge_to(time::Instant now) noexcept;
     void enqueue_or_throttle(Binding& binding, time::Instant now) noexcept;
     void process_timers(time::Instant now) noexcept;
+    void process_deadlines(time::Instant now) noexcept;
     void dispatch(DispatchReason reason, time::Instant now) noexcept;
     void commit(
         Binding* candidate,
@@ -109,6 +114,7 @@ private:
         time::Instant now) noexcept;
     [[nodiscard]] auto post_remote(RemoteRequest& request) noexcept
         -> WakeResult;
+    [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
     void request_stop(execution::Target target) noexcept;
 
     CpuLocal* cpu_{};
@@ -124,6 +130,7 @@ private:
     execution::Target handoff_outgoing_{};
     BuiltinPolicy policy_{};
     TimerQueue timers_{};
+    DeadlineQueue deadlines_{};
     RemoteQueue remote_{};
     bool timer_available_{};
     bool ipi_available_{};

@@ -155,6 +155,21 @@ auto Target::stop_requested() const noexcept -> bool {
     }, value_);
 }
 
+auto Target::stopped() const noexcept -> bool {
+    return libk::visit([](auto value) noexcept -> bool {
+        using T = libk::remove_cvr_t<decltype(value)>;
+        if constexpr (libk::SameAs<T, libk::monostate>) {
+            return true;
+        } else if constexpr (libk::SameAs<T, Vproc*>) {
+            kernel::sync::IrqLockGuard guard{value->state_lock_};
+            return value->stopped_;
+        } else {
+            kernel::sync::IrqLockGuard guard{value->stop_lock_};
+            return value->stopped_;
+        }
+    }, value_);
+}
+
 auto Target::stop_ready() const noexcept -> bool {
     return libk::visit([](auto value) noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
@@ -162,7 +177,10 @@ auto Target::stop_ready() const noexcept -> bool {
             return false;
         } else if constexpr (libk::SameAs<T, Vproc*>) {
             kernel::sync::IrqLockGuard guard{value->state_lock_};
-            if (!value->stop_requested_) {
+            // stop_requested_ closes admission; stop_dispatched_ records that
+            // the Vproc owner has handed the terminal transaction to its home
+            // dispatcher. Queue transport state is not lifecycle truth.
+            if (!value->stop_requested_ || !value->stop_dispatched_) {
                 return false;
             }
             for (const auto& slot : value->operations_) {
@@ -171,9 +189,8 @@ auto Target::stop_ready() const noexcept -> bool {
                 }
             }
             return value->activation_publishers_ == 0
-                && !value->activation_request_held_
-                && !value->activation_posting_
-                && !value->activation_.pending();
+                && value->activation_post_ == Vproc::ActivationPost::Idle
+                && !value->activation_dirty_;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
             return value->stop_requested_
@@ -265,19 +282,41 @@ auto Target::try_bind(sched::Binding& binding) const noexcept -> bool {
     }, value_);
 }
 
-void Target::clear_binding(sched::Binding& binding) const noexcept {
-    libk::visit([&binding](auto value) noexcept {
+auto Target::release_binding(
+    sched::Binding& binding,
+    sched::CpuDispatcher* owner) const noexcept -> bool {
+    return libk::visit([&](auto value) noexcept -> bool {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
-            KASSERT(false);
+            return false;
         } else if constexpr (libk::SameAs<T, Vproc*>) {
             kernel::sync::IrqLockGuard guard{value->state_lock_};
-            KASSERT(value->execution_.scheduler_binding_ == &binding);
-            value->execution_.scheduler_binding_ = nullptr;
+            Execution& execution = value->execution_;
+            if (execution.scheduler_binding_ != &binding
+                || execution.home_ != owner
+                || execution.state_ == ExecutionState::Running
+                || execution.state_ == ExecutionState::Ready
+                || execution.state_ == ExecutionState::Throttled
+                || (owner != nullptr
+                    && execution.state_ != ExecutionState::Exited)) {
+                return false;
+            }
+            execution.scheduler_binding_ = nullptr;
+            return true;
         } else {
             kernel::sync::IrqLockGuard guard{value->stop_lock_};
-            KASSERT(value->execution_.scheduler_binding_ == &binding);
-            value->execution_.scheduler_binding_ = nullptr;
+            Execution& execution = value->execution_;
+            if (execution.scheduler_binding_ != &binding
+                || execution.home_ != owner
+                || execution.state_ == ExecutionState::Running
+                || execution.state_ == ExecutionState::Ready
+                || execution.state_ == ExecutionState::Throttled
+                || (owner != nullptr
+                    && execution.state_ != ExecutionState::Exited)) {
+                return false;
+            }
+            execution.scheduler_binding_ = nullptr;
+            return true;
         }
     }, value_);
 }

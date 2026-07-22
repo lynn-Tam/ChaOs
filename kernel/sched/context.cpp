@@ -158,6 +158,10 @@ auto SchedulingContext::bind_authorized(
 }
 
 auto SchedulingContext::unbind() noexcept -> Result {
+    return unbind(nullptr);
+}
+
+auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept -> Result {
     kernel::sync::IrqLockGuard authority_guard{authority_lock_};
     if (!binding_) {
         return libk::unexpected(Error::NotBound);
@@ -166,14 +170,9 @@ auto SchedulingContext::unbind() noexcept -> Result {
         return libk::unexpected(Error::Active);
     }
     execution::Target target = binding_->target();
-    const ExecutionState state = target.execution().state_;
-    if (state == ExecutionState::Running
-        || state == ExecutionState::Ready
-        || state == ExecutionState::Throttled) {
+    if (!target.release_binding(*binding_, owner)) {
         return libk::unexpected(Error::Active);
     }
-    KASSERT(target.execution().scheduler_binding_ == &*binding_);
-    target.clear_binding(*binding_);
     binding_.reset();
     if (binding_authority_) {
         binding_authority_->release();

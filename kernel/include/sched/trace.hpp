@@ -31,7 +31,7 @@ public:
     // Kept intentionally compact because CpuDispatcher is part of one
     // page-bounded CpuRuntime metadata object. A future mapped debug stream
     // can drain this recent-history window without changing scheduler truth.
-    static constexpr usize capacity = 15;
+    static constexpr usize capacity = 14;
 
     void push(DispatchRecord record) noexcept {
         if (records_.full()) {

@@ -239,6 +239,79 @@ private:
     alignas(sizeof(storage_type)) storage_type value_{};
 };
 
+// Non-owning atomic access to an existing scalar object. This is the
+// freestanding counterpart of std::atomic_ref: the referenced object remains
+// the sole storage truth, while every concurrent access must use AtomicRef for
+// the duration of the protocol.
+template<typename T>
+concept AtomicRefValue = !is_volatile_v<T>
+    && AtomicValue<remove_const_t<T>>;
+
+template<AtomicRefValue T>
+class AtomicRef final {
+public:
+    using value_type = remove_const_t<T>;
+    static constexpr bool is_always_lock_free = true;
+
+    constexpr explicit AtomicRef(T& value) noexcept : value_(&value) {
+        static_assert(alignof(T) >= sizeof(T));
+    }
+
+    template<MemoryOrder order>
+        requires(atomic_detail::ValidLoadOrder<order>)
+    [[nodiscard]] auto load() const noexcept -> value_type {
+        return __atomic_load_n(value_, atomic_detail::builtin_order<order>());
+    }
+
+    template<MemoryOrder order>
+        requires(!is_const_v<T> && atomic_detail::ValidStoreOrder<order>)
+    void store(value_type desired) noexcept {
+        __atomic_store_n(
+            value_, desired, atomic_detail::builtin_order<order>());
+    }
+
+    template<MemoryOrder order>
+        requires(!is_const_v<T>)
+    [[nodiscard]] auto exchange(value_type desired) noexcept -> value_type {
+        return __atomic_exchange_n(
+            value_, desired, atomic_detail::builtin_order<order>());
+    }
+
+    template<MemoryOrder order>
+        requires(!is_const_v<T>
+            && atomic_detail::IsRmwIntegral<value_type>)
+    [[nodiscard]] auto fetch_add(value_type operand) noexcept -> value_type {
+        return __atomic_fetch_add(
+            value_, operand, atomic_detail::builtin_order<order>());
+    }
+
+    template<MemoryOrder order>
+        requires(!is_const_v<T>
+            && atomic_detail::IsRmwIntegral<value_type>)
+    [[nodiscard]] auto fetch_sub(value_type operand) noexcept -> value_type {
+        return __atomic_fetch_sub(
+            value_, operand, atomic_detail::builtin_order<order>());
+    }
+
+    template<MemoryOrder success, MemoryOrder failure>
+        requires(!is_const_v<T>
+            && atomic_detail::ValidCompareExchangeOrders<success, failure>)
+    [[nodiscard]] auto compare_exchange_strong(
+        value_type& expected,
+        value_type desired) noexcept -> bool {
+        return __atomic_compare_exchange_n(
+            value_, &expected, desired, false,
+            atomic_detail::builtin_order<success>(),
+            atomic_detail::builtin_order<failure>());
+    }
+
+private:
+    T* value_{};
+};
+
+template<typename T>
+AtomicRef(T&) -> AtomicRef<T>;
+
 template<MemoryOrder order>
 inline void atomic_thread_fence() noexcept {
     __atomic_thread_fence(atomic_detail::builtin_order<order>());

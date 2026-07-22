@@ -69,9 +69,9 @@ Vproc::~Vproc() noexcept {
     KASSERT(execution_.scheduler_binding_ == nullptr);
     KASSERT(execution_.home_ == nullptr);
     KASSERT(stops_.empty());
-    KASSERT(outgoing_tunnels_.empty() && !activation_.pending());
+    KASSERT(outgoing_tunnels_.empty());
     KASSERT(!arm_attaching_ && activation_publishers_ == 0
-        && !activation_request_held_ && !activation_posting_);
+        && activation_post_ == ActivationPost::Idle && !activation_dirty_);
     for (const IngressSlot& ingress : ingresses_) {
         KASSERT(ingress.link == nullptr);
     }
@@ -473,8 +473,7 @@ auto Vproc::prepare_retire() const noexcept -> bool {
         }
     }
     if (arm_attaching_ || activation_publishers_ != 0
-        || activation_request_held_
-        || activation_posting_ || activation_.pending()) {
+        || activation_post_ != ActivationPost::Idle || activation_dirty_) {
         return false;
     }
     // ObjectPool changes lifecycle to Retiring before this callback. Closing
@@ -482,6 +481,11 @@ auto Vproc::prepare_retire() const noexcept -> bool {
     // new relation after the empty-list check has linearized.
     relation_admission_closed_ = true;
     return true;
+}
+
+auto Vproc::in_upcall() const noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    return upcall_state_ == UpcallState::Active;
 }
 
 void Vproc::request_stop(execution::Stop& request) noexcept {
@@ -523,8 +527,8 @@ void Vproc::request_exit() noexcept {
 
 auto Vproc::activation_quiescent() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
-    return activation_publishers_ == 0 && !activation_request_held_
-        && !activation_posting_ && !activation_.pending();
+    return activation_publishers_ == 0
+        && activation_post_ == ActivationPost::Idle && !activation_dirty_;
 }
 
 void Vproc::activation_publisher_done() noexcept {
@@ -536,25 +540,47 @@ void Vproc::activation_publisher_done() noexcept {
     retry_stop_if_ready();
 }
 
-void Vproc::activation_request_posted(bool posted) noexcept {
+auto Vproc::activation_request_posted(bool posted) noexcept -> bool {
+    bool repost{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
-        KASSERT(activation_posting_ && activation_request_held_);
-        activation_posting_ = false;
         if (!posted) {
-            activation_request_held_ = false;
+            KASSERT(activation_post_ == ActivationPost::Posting);
+            activation_post_ = ActivationPost::Idle;
+            activation_dirty_ = false;
+        } else if (activation_post_ == ActivationPost::Posting) {
+            activation_post_ = ActivationPost::Pending;
+        } else {
+            KASSERT(activation_post_ == ActivationPost::Consumed);
+            if (activation_dirty_) {
+                activation_dirty_ = false;
+                activation_post_ = ActivationPost::Posting;
+                repost = true;
+            } else {
+                activation_post_ = ActivationPost::Idle;
+            }
         }
     }
     retry_stop_if_ready();
+    return repost;
 }
 
-void Vproc::activation_request_consumed() noexcept {
+auto Vproc::activation_request_consumed() noexcept -> bool {
+    bool retry{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
-        KASSERT(activation_request_held_ && !activation_posting_);
-        activation_request_held_ = false;
+        KASSERT(activation_post_ == ActivationPost::Posting
+            || activation_post_ == ActivationPost::Pending);
+        if (activation_dirty_) {
+            activation_dirty_ = false;
+            retry = true;
+        } else {
+            activation_post_ = activation_post_ == ActivationPost::Posting
+                ? ActivationPost::Consumed : ActivationPost::Idle;
+        }
     }
     retry_stop_if_ready();
+    return retry;
 }
 
 void Vproc::retry_stop_if_ready() noexcept {
@@ -572,8 +598,8 @@ void Vproc::retry_stop_if_ready() noexcept {
             }
         }
         if (arm_attaching_ || activation_publishers_ != 0
-            || activation_request_held_
-            || activation_posting_ || activation_.pending()) {
+            || activation_post_ != ActivationPost::Idle
+            || activation_dirty_) {
             return;
         }
         home = execution_.home_;
@@ -603,8 +629,8 @@ void Vproc::finish_stop() noexcept {
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
         KASSERT(!arm_attaching_ && activation_publishers_ == 0
-            && !activation_request_held_ && !activation_posting_
-            && !activation_.pending());
+            && activation_post_ == ActivationPost::Idle
+            && !activation_dirty_);
         KASSERT(stop_requested_ && stop_dispatched_ && !stopped_);
         for (OperationSlot& slot : operations_) {
             KASSERT(slot.state != OperationState::Pending);

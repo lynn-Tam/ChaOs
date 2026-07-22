@@ -13,6 +13,7 @@
 #include <sched/domain.hpp>
 #include <sched/ready_queue.hpp>
 #include <sched/refill_queue.hpp>
+#include <sched/timer_queue.hpp>
 #include <thread/thread.hpp>
 
 #include "arch/riscv64/mmu/sv39_builder.hpp"
@@ -49,6 +50,46 @@ constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
 constinit libk::ManualLifetime<kernel::mm::KernelVSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
+
+struct DeadlineProbe final {
+    void fire() noexcept { ++fires; }
+    usize fires{};
+};
+
+bool test_deadline_queue_orders_and_removes_fixed_relations(
+    const TestContext&) noexcept {
+    DeadlineProbe probe{};
+    kernel::sched::Deadline first{
+        kernel::sched::Deadline::Callback::bind<
+            &DeadlineProbe::fire>(probe)};
+    kernel::sched::Deadline second{
+        kernel::sched::Deadline::Callback::bind<
+            &DeadlineProbe::fire>(probe)};
+    kernel::sched::Deadline later{
+        kernel::sched::Deadline::Callback::bind<
+            &DeadlineProbe::fire>(probe)};
+    kernel::sched::DeadlineQueue queue{};
+    queue.insert(later, Instant::from_ticks(30));
+    queue.insert(first, Instant::from_ticks(10));
+    queue.insert(second, Instant::from_ticks(10));
+    if (!queue.deadline() || queue.deadline()->ticks() != 10) {
+        return false;
+    }
+    auto* head = queue.front();
+    if (head == nullptr || head == &later) {
+        return false;
+    }
+    queue.remove(*head);
+    if (!queue.deadline() || queue.deadline()->ticks() != 10) {
+        return false;
+    }
+    queue.remove(*queue.front());
+    if (!queue.deadline() || queue.deadline()->ticks() != 30) {
+        return false;
+    }
+    queue.remove(later);
+    return !queue.deadline() && probe.fires == 0;
+}
 
 class SchedStorageGuard final {
 public:
@@ -768,6 +809,10 @@ bool test_ready_queue_orders_priority_and_fifo(
 } // namespace
 
 void register_sched_tests(TestRegistry& registry) noexcept {
+    (void)registry.add(
+        "sched",
+        "deadline queue orders fixed one-shot relations",
+        test_deadline_queue_orders_and_removes_fixed_relations);
     (void)registry.add(
         "sched",
         "refill ledger conserves budget and reports overrun",

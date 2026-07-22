@@ -354,7 +354,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
     const auto child_state = fixture.graph().state(child_key);
     if (!completion.complete() || probe.signals != 1
         || child_state
-        || child_state.error() != kernel::cap::GrantError::InvalidKey) {
+        || child_state.error() != GrantError::InvalidKey) {
         return false;
     }
     return fixture.b().close(child.value())

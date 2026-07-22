@@ -48,13 +48,11 @@ auto Transfer::prepare(
             return libk::unexpected(
                 !reserved ? reserved.error() : snapshot.error());
         }
-        auto acquired = snapshot.value().graph->acquire(snapshot.value().key);
-        if (!acquired) {
-            return libk::unexpected(cap::CSpace::grant_error(acquired.error()));
-        }
-        cap::GrantLease lease = libk::move(acquired).value();
+        cap::CSpace::Snapshot source_snapshot =
+            libk::move(snapshot).value();
+        cap::GrantLease lease = libk::move(source_snapshot.lease);
         auto effective = cap::compose(
-            lease.kind(), lease.ceiling(), snapshot.value().view);
+            lease.kind(), lease.ceiling(), source_snapshot.view);
         if (!effective) {
             return libk::unexpected(
                 cap::CSpace::policy_error(effective.error()));
@@ -71,7 +69,7 @@ auto Transfer::prepare(
                 spec.rights, effective.value().data};
             auto valid = cap::compose(
                 lease.kind(), effective.value().ceiling(), destination_view);
-            auto cloned = snapshot.value().graph->ref(snapshot.value().key);
+            auto cloned = source_snapshot.graph->ref(source_snapshot.key);
             if (!valid || !cloned) {
                 return libk::unexpected(!valid
                     ? cap::CSpace::policy_error(valid.error())
@@ -81,7 +79,7 @@ auto Transfer::prepare(
             break;
         }
         case TransferKind::Move:
-            destination_view = snapshot.value().view;
+            destination_view = source_snapshot.view;
             break;
         case TransferKind::Delegate: {
             if (!effective.value().rights.contains(cap::Right::Delegate)) {
@@ -104,7 +102,7 @@ auto Transfer::prepare(
                     : !charge ? charge.error()
                     : cap::CSpaceError::GrantUnavailable);
             }
-            auto child = snapshot.value().graph->derive(
+            auto child = source_snapshot.graph->derive(
                 libk::move(charge).value(),
                 lease,
                 libk::move(target).value(),
@@ -123,8 +121,8 @@ auto Transfer::prepare(
             libk::move(lease),
             libk::move(prepared),
             spec.source,
-            snapshot.value().key,
-            snapshot.value().view,
+            source_snapshot.key,
+            source_snapshot.view,
             destination_view,
             spec.kind));
     }

@@ -20,6 +20,16 @@ void publish(arch::TrapContext& context, const Result& result) noexcept {
     context.set_result(2, result.value2);
 }
 
+[[nodiscard]] auto locus_of(execution::Target target) noexcept -> Locus {
+    if (Thread* const thread = target.thread()) {
+        return thread->active_frame() == nullptr
+            ? Locus::ThreadBase : Locus::EndpointLeaf;
+    }
+    Vproc* const vproc = target.vproc();
+    KASSERT(vproc != nullptr);
+    return vproc->in_upcall() ? Locus::VprocUpcall : Locus::VprocBase;
+}
+
 } // namespace
 
 auto handle(arch::TrapContext& context) noexcept -> Disposition {
@@ -40,7 +50,8 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     const Policy contract = policy(operation);
     if (contract.continuation == Continuation::Invalid
         || (target.thread() != nullptr && !contract.allows_thread())
-        || (target.vproc() != nullptr && !contract.allows_vproc())) {
+        || (target.vproc() != nullptr && !contract.allows_vproc())
+        || !contract.allows(locus_of(target))) {
         publish(context, returned(MYOS_STATUS_INVALID_OP));
         return Disposition::Return;
     }
@@ -70,7 +81,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_TUNNEL_CLOSE) {
         outcome = handle_tunnel(operation, invocation);
     } else if (operation >= MYOS_SYS_ENDPOINT_CALL
-        && operation <= MYOS_SYS_ENDPOINT_MINT) {
+        && operation <= MYOS_SYS_ENDPOINT_ABORT) {
         outcome = handle_endpoint(operation, invocation);
     } else {
         outcome = returned(MYOS_STATUS_INVALID_OP);

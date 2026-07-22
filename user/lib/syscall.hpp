@@ -214,8 +214,11 @@ inline void yield() noexcept {
     myos_cap_t endpoint,
     myos_word_t first = 0,
     myos_word_t second = 0,
-    myos_word_t third = 0) noexcept -> SysResult {
-    return syscall(MYOS_SYS_ENDPOINT_CALL, endpoint, first, second, third);
+    myos_word_t third = 0,
+    myos_word_t timeout_ns = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_ENDPOINT_CALL,
+        endpoint, first, second, third, timeout_ns);
 }
 
 [[nodiscard]] inline auto endpoint_reply(
@@ -224,6 +227,11 @@ inline void yield() noexcept {
     return syscall(
         MYOS_SYS_ENDPOINT_REPLY,
         static_cast<myos_word_t>(status), value);
+}
+
+[[nodiscard]] inline auto endpoint_abort(
+    myos_word_t detail = 0) noexcept -> SysResult {
+    return syscall(MYOS_SYS_ENDPOINT_ABORT, detail);
 }
 
 [[nodiscard]] inline auto endpoint_close(myos_cap_t endpoint) noexcept

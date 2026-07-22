@@ -32,7 +32,6 @@ public:
 
     [[nodiscard]] auto kind() const noexcept -> RemoteKind { return kind_; }
     [[nodiscard]] auto owner() const noexcept -> void* { return owner_; }
-    [[nodiscard]] auto pending() const noexcept -> bool { return pending_; }
 
 private:
     friend class RemoteQueue;

@@ -1,11 +1,68 @@
 #pragma once
 
 #include <core/types.hpp>
+#include <libk/delegate.hpp>
 #include <libk/intrusive_tree.hpp>
+#include <libk/noncopyable.hpp>
 #include <sched/binding.hpp>
 #include <time/time.hpp>
 
 namespace kernel::sched {
+
+class CpuDispatcher;
+
+// Fixed-storage one-shot deadline owned by exactly one CpuDispatcher while
+// armed. The callback runs on that CPU with interrupts disabled; remote
+// producers publish subsystem state and wake the owner instead of mutating
+// this queue.
+class Deadline final : private libk::noncopyable_nonmovable {
+public:
+    using Callback = libk::delegate<void() noexcept>;
+
+    explicit Deadline(Callback callback) noexcept : callback_(callback) {}
+    ~Deadline() noexcept;
+
+    [[nodiscard]] auto armed() const noexcept -> bool {
+        return owner_ != nullptr;
+    }
+
+private:
+    friend class CpuDispatcher;
+    friend class DeadlineQueue;
+
+    libk::IntrusiveTreeHook hook_{};
+    Callback callback_{};
+    CpuDispatcher* owner_{};
+    time::Instant when_{};
+};
+
+class DeadlineQueue final {
+    struct Earlier final {
+        [[nodiscard]] auto operator()(
+            const Deadline& lhs,
+            const Deadline& rhs) const noexcept -> bool {
+            if (lhs.when_ != rhs.when_) {
+                return lhs.when_ < rhs.when_;
+            }
+            return reinterpret_cast<usize>(&lhs)
+                < reinterpret_cast<usize>(&rhs);
+        }
+    };
+    using Tree = libk::IntrusiveTree<
+        Deadline, &Deadline::hook_, Earlier>;
+
+public:
+    [[nodiscard]] auto deadline() const noexcept
+        -> libk::optional<time::Instant>;
+    [[nodiscard]] auto front() noexcept -> Deadline* {
+        return tree_.minimum();
+    }
+    void insert(Deadline& deadline, time::Instant when) noexcept;
+    void remove(Deadline& deadline) noexcept;
+
+private:
+    Tree tree_{};
+};
 
 // CpuDispatcher-owned ordered index of throttled Bindings.
 // Only the owning CPU mutates it with interrupts disabled. Ordering is by the

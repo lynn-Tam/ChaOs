@@ -64,7 +64,17 @@ void Completion::signal() noexcept {
 
 void Completion::finish(arch::TrapContext& trap) noexcept {
     KASSERT(complete());
-    Delivery expected = Delivery::Ready;
+    // Blocking publication deliberately wakes the scheduler while retaining
+    // Claimed: the producer must keep the operation alive until it has stopped
+    // touching the Wait and its Binding.  The resumed owner can observe the
+    // Wait's ready bit in that narrow interval, so wait for the producer's
+    // final release publication before claiming the result.
+    Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
+    while (expected == Delivery::Claimed) {
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        expected = delivery_.load<libk::MemoryOrder::Acquire>();
+    }
+    KASSERT(expected == Delivery::Ready);
     KASSERT((delivery_.compare_exchange_strong<
         libk::MemoryOrder::AcqRel,
         libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)));

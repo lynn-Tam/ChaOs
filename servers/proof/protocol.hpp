@@ -1,5 +1,6 @@
 #pragma once
 
+#include <libk/sync/atomic.hpp>
 #include <uapi/types.h>
 
 //Confirmatory experiment.
@@ -64,8 +65,57 @@ inline constexpr myos_word_t TunnelSecondInvoked = 0x5455'4e53'4947'4e00;
 inline constexpr myos_word_t ParkRejected = 0x5041'524b'5245'4a00;
 inline constexpr myos_word_t ParkCommitted = 0x5041'524b'574f'4b00;
 inline constexpr myos_word_t EndpointMagic = 0x454e'4450'4f49'4e54;
+inline constexpr myos_word_t EndpointAbortMagic = 0x454e'4441'424f'5254;
+inline constexpr myos_word_t EndpointTimeoutMagic = 0x454e'4454'494d'454f;
+inline constexpr myos_word_t EndpointFaultMagic = 0x454e'4446'4155'4c54;
+inline constexpr myos_word_t EndpointAbortDetail = 0x4142'4f52'5400'0042;
 inline constexpr myos_word_t EndpointBadge = 0x45;
 inline constexpr myos_word_t EndpointResult = 0x4550'4341'4c4c'4f4b;
 inline constexpr myos_word_t EndpointTransfer = 0x4550'4341'5053'4f4b;
+
+// Both proof ELFs share this page across harts. Release publication and
+// acquire observation are part of the protocol; volatile is not synchronization
+// on RISC-V. Heartbeat is deliberately only a relaxed liveness observation.
+class Shared final {
+public:
+    Shared() noexcept = default;
+    explicit Shared(myos_word_t address) noexcept
+        : words_(reinterpret_cast<myos_word_t*>(address)) {}
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return words_ != nullptr;
+    }
+
+    void bind(myos_word_t address) noexcept {
+        words_ = reinterpret_cast<myos_word_t*>(address);
+    }
+
+    [[nodiscard]] auto load(myos_word_t slot) const noexcept -> myos_word_t {
+        return libk::AtomicRef{words_[slot]}
+            .load<libk::MemoryOrder::Acquire>();
+    }
+
+    void store(myos_word_t slot, myos_word_t value) const noexcept {
+        libk::AtomicRef{words_[slot]}
+            .store<libk::MemoryOrder::Release>(value);
+    }
+
+    [[nodiscard]] auto add_relaxed(
+        myos_word_t slot,
+        myos_word_t value = 1) const noexcept -> myos_word_t {
+        return libk::AtomicRef{words_[slot]}
+            .fetch_add<libk::MemoryOrder::Relaxed>(value) + value;
+    }
+
+    [[nodiscard]] auto add_release(
+        myos_word_t slot,
+        myos_word_t value = 1) const noexcept -> myos_word_t {
+        return libk::AtomicRef{words_[slot]}
+            .fetch_add<libk::MemoryOrder::Release>(value) + value;
+    }
+
+private:
+    myos_word_t* words_{};
+};
 
 } // namespace myos::proof

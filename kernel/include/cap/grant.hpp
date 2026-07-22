@@ -183,11 +183,13 @@ private:
     friend class GrantGraph;
     GrantRef(
         GrantGraph& graph,
-        GrantKey key) noexcept
-        : graph_(&graph), key_(key) {}
+        void* slot,
+        u64 generation) noexcept
+        : graph_(&graph), slot_(slot), generation_(generation) {}
 
     GrantGraph* graph_{};
-    GrantKey key_{};
+    void* slot_{};
+    u64 generation_{};
 };
 
 // Caller-owned completion for one lineage transition. Existing operation

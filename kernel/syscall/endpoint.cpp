@@ -31,7 +31,7 @@ namespace {
     case ipc::EndpointError::GenerationExhausted:
         return MYOS_STATUS_INTERNAL;
     case ipc::EndpointError::TransferFailed:
-        return MYOS_STATUS_BAD_ARGS;
+        return MYOS_STATUS_TRANSFER_FAILED;
     }
     return MYOS_STATUS_INTERNAL;
 }
@@ -52,13 +52,25 @@ namespace {
         invocation.trap.arg(2),
         invocation.trap.arg(3),
     };
+    libk::optional<time::Instant> deadline{};
+    if (const u64 timeout_ns = invocation.trap.arg(4); timeout_ns != 0) {
+        auto& clock = invocation.cpu.runtime().kernel->clock();
+        const auto duration = clock.duration_from_nanoseconds(timeout_ns);
+        const auto expires = duration
+            ? clock.now().checked_add(*duration) : libk::nullopt;
+        if (!expires) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        deadline = *expires;
+    }
     auto entered = endpoint.value()->call(
         endpoint.value(),
         *thread,
         invocation.trap,
         *invocation.cpu.dispatcher(),
         invocation.cpu.runtime().kernel->cpus(),
-        arguments);
+        arguments,
+        deadline);
     if (!entered) {
         return returned(endpoint_status(entered.error()));
     }
@@ -73,14 +85,10 @@ namespace {
 
 [[nodiscard]] auto reply(Invocation& invocation) noexcept -> Result {
     Thread* const thread = invocation.target.thread();
-    if (thread == nullptr) {
-        return returned(MYOS_STATUS_INVALID_OP);
-    }
+    KASSERT(thread != nullptr);
     execution::Frame* const frame = thread->active_frame();
-    if (frame == nullptr
-        || frame->kind() != execution::Frame::Kind::Endpoint) {
-        return returned(MYOS_STATUS_INVALID_OP);
-    }
+    KASSERT(frame != nullptr
+        && frame->kind() == execution::Frame::Kind::Endpoint);
     auto& activation = *static_cast<ipc::Activation*>(frame->owner());
     const isize status = static_cast<isize>(invocation.trap.arg(0));
     const usize value = invocation.trap.arg(1);
@@ -93,6 +101,23 @@ namespace {
     return replied
         ? Result{MYOS_STATUS_OK, 0, Disposition::Resume}
         : returned(endpoint_status(replied.error()));
+}
+
+[[nodiscard]] auto abort(Invocation& invocation) noexcept -> Result {
+    Thread* const thread = invocation.target.thread();
+    KASSERT(thread != nullptr);
+    execution::Frame* const frame = thread->active_frame();
+    KASSERT(frame != nullptr
+        && frame->kind() == execution::Frame::Kind::Endpoint);
+    auto& activation = *static_cast<ipc::Activation*>(frame->owner());
+    auto aborted = activation.endpoint().abort(
+        *thread,
+        invocation.trap,
+        *invocation.cpu.dispatcher(),
+        static_cast<isize>(invocation.trap.arg(0)));
+    return aborted
+        ? Result{MYOS_STATUS_OK, 0, Disposition::Resume}
+        : returned(endpoint_status(aborted.error()));
 }
 
 [[nodiscard]] auto close(Invocation& invocation) noexcept -> Result {
@@ -157,6 +182,8 @@ auto handle_endpoint(usize operation, Invocation& invocation) noexcept
         return close(invocation);
     case MYOS_SYS_ENDPOINT_MINT:
         return mint(invocation);
+    case MYOS_SYS_ENDPOINT_ABORT:
+        return abort(invocation);
     default:
         return returned(MYOS_STATUS_INVALID_OP);
     }

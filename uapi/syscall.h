@@ -65,7 +65,8 @@
 #define MYOS_SYS_TUNNEL_ACK           106 /* a0=receiver cap, a1=observed sequence */
 #define MYOS_SYS_TUNNEL_CLOSE         107 /* a0=Tunnel Admin or Tx */
 
-#define MYOS_SYS_ENDPOINT_CALL        112 /* a0=Endpoint, a1-a3=service words */
+#define MYOS_SYS_ENDPOINT_CALL        112 /* a0=Endpoint, a1-a3=service words, a4=relative timeout ns (0=infinite) */
 #define MYOS_SYS_ENDPOINT_REPLY       113 /* a0=status, a1=value */
 #define MYOS_SYS_ENDPOINT_CLOSE       114 /* a0=Endpoint */
 #define MYOS_SYS_ENDPOINT_MINT        115 /* a0=root, a1=dest CSpace, a2=badge, a3=cap limit, a4=rights */
+#define MYOS_SYS_ENDPOINT_ABORT       116 /* a0=callee-defined abort detail */

@@ -4,15 +4,16 @@
 #include "arch/riscv64/trap/context.hpp"
 #include "arch/riscv64/cpu/csr.hpp"
 
+#include <arch/instruction.hpp>
 #include <arch/user.hpp>
 #include <core/debug.hpp>
+#include <libk/mem.h>
 #include <libk/memory.hpp>
 
 namespace arch {
 
 namespace {
 
-constexpr usize ebreak_size = 4;
 constexpr usize ecall_size = 4;
 
 [[nodiscard]] auto frame_of(void* frame) noexcept -> riscv64::TrapFrame& {
@@ -66,8 +67,13 @@ void TrapContext::set_pc(usize pc) noexcept {
 }
 
 void TrapContext::complete_breakpoint() noexcept {
-    // RISC-V leaves sepc on ebreak; compressed c.ebreak needs width decode later.
-    frame_of(frame_).sepc += ebreak_size;
+    auto& frame = frame_of(frame_);
+    // The common trap policy calls this only for a supervisor-origin trap, so
+    // sepc names the mapped instruction the hart just executed. Copying the
+    // first parcel avoids an aliasing load and handles both ebreak/c.ebreak.
+    u16 first{};
+    memcpy(&first, reinterpret_cast<const void*>(frame.sepc), sizeof(first));
+    frame.sepc += instruction_size(first);
 }
 
 void TrapContext::complete_syscall() noexcept {

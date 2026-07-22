@@ -54,12 +54,14 @@ Call::Call(Endpoint& endpoint) noexcept
           &Call::read,
           &Call::release,
           &Call::cancel,
-          &Call::resume>(*this)) {}
+          &Call::resume>(*this)),
+      deadline_(sched::Deadline::Callback::bind<&Call::expire>(*this)) {}
 
 Call::~Call() noexcept {
     KASSERT(state_ == State::Free);
     KASSERT(!caller_ && !caller_frame_ && activation_ == nullptr);
     KASSERT(!authority_);
+    KASSERT(!deadline_.armed());
 }
 
 auto Call::complete() const noexcept -> bool {
@@ -80,6 +82,10 @@ auto Call::cancel() noexcept -> bool {
 
 void Call::resume(arch::TrapContext& trap) noexcept {
     endpoint_->resume_call(*this, trap);
+}
+
+void Call::expire() noexcept {
+    endpoint_->expire_call(*this);
 }
 
 void Call::invalidate_authority(
@@ -350,7 +356,8 @@ auto Endpoint::call(
     arch::TrapContext& trap,
     sched::CpuDispatcher& dispatcher,
     CpuRegistry& cpus,
-    const usize (&arguments)[3]) noexcept
+    const usize (&arguments)[3],
+    libk::optional<time::Instant> deadline) noexcept
     -> libk::Expected<CallResult, EndpointError> {
     if (&authority.object() != this
         || dispatcher.current().thread() != &caller) {
@@ -425,7 +432,6 @@ auto Endpoint::call(
         call->urgency_ = caller_urgency < ceiling
             ? caller_urgency : ceiling;
         call->badge_ = endpoint_authority->badge;
-        call->cap_limit_ = endpoint_authority->cap_limit;
         call->receive_limit_ = receive_limit;
         call->request_caps_ = libk::move(request_caps);
         call->cpus_ = &cpus;
@@ -435,7 +441,6 @@ auto Endpoint::call(
             activation->state_ = Activation::State::Preparing;
             activation->call_ = call;
             call->activation_ = activation;
-            call->state_ = Call::State::Admitted;
         }
         ++outstanding_;
     }
@@ -457,6 +462,18 @@ auto Endpoint::call(
         publisher_done(*call);
         return libk::unexpected(EndpointError::Closed);
     }
+    if (deadline && !dispatcher.arm(call->deadline_, *deadline)) {
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            call->result_ = operation::Result{MYOS_STATUS_INTERNAL, 0};
+            call->state_ = Call::State::Complete;
+            if (activation != nullptr) {
+                activation->state_ = Activation::State::Complete;
+            }
+        }
+        publisher_done(*call);
+        return libk::unexpected(EndpointError::Busy);
+    }
 
     if (activation == nullptr) {
         sched::Binding* const binding = caller.binding();
@@ -468,6 +485,9 @@ auto Endpoint::call(
                 call->result_ = operation::Result{
                     MYOS_STATUS_WOULD_BLOCK, 0};
                 call->state_ = Call::State::Complete;
+            }
+            if (call->deadline_.armed()) {
+                dispatcher.disarm(call->deadline_);
             }
             publisher_done(*call);
             return libk::unexpected(EndpointError::Busy);
@@ -499,7 +519,21 @@ auto Endpoint::call(
         return libk::expected(CallResult{CallDisposition::Blocking});
     }
 
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != State::Open || call->cancel_pending_) {
+            if (!call->cancel_pending_) {
+                call->result_ = operation::Result{MYOS_STATUS_CLOSED, 0};
+            }
+            call->state_ = Call::State::Complete;
+            activation->state_ = Activation::State::Complete;
+        } else {
+            call->state_ = Call::State::Ready;
+        }
+    }
+
     if (!enter(*call, trap, dispatcher)) {
+        EndpointError error{EndpointError::Closed};
         {
             kernel::sync::IrqLockGuard guard{lock_};
             if (call->state_ != Call::State::Complete) {
@@ -507,9 +541,15 @@ auto Endpoint::call(
                 call->state_ = Call::State::Complete;
                 activation->state_ = Activation::State::Complete;
             }
+            if (call->result_.status == MYOS_STATUS_TRANSFER_FAILED) {
+                error = EndpointError::TransferFailed;
+            }
+        }
+        if (call->deadline_.armed()) {
+            dispatcher.disarm(call->deadline_);
         }
         publisher_done(*call);
-        return libk::unexpected(EndpointError::Closed);
+        return libk::unexpected(error);
     }
     publisher_done(*call);
     return libk::expected(CallResult{CallDisposition::Entered});
@@ -525,6 +565,17 @@ auto Endpoint::enter(
         || &call.caller_.get() != caller) {
         return false;
     }
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != State::Open || call.cancel_pending_
+            || call.state_ != Call::State::Ready
+            || activation->state_ != Activation::State::Preparing
+            || activation->call_ != &call) {
+            return false;
+        }
+        call.state_ = Call::State::Committing;
+        activation->state_ = Activation::State::Committing;
+    }
     arch::UserStart entry = config_.entry;
     entry.stack = activation->user_stack_top_;
     for (usize index = 0; index < 3; ++index) {
@@ -535,33 +586,50 @@ auto Endpoint::enter(
     entry.arguments[5] = call.generation_;
     auto callee = arch::prepare_user_frame(
         activation->kernel_stack_.top(), entry);
-    if (!callee) {
-        return false;
-    }
     cap::CSpace* const source = caller->effective_binding().cspace();
     cap::CSpace* const destination = service_.cspace();
-    if (source == nullptr || destination == nullptr
-        || !commit_caps(
-            call.transfer_,
-            *source, *destination, call.request_caps_,
+    const bool transferred = callee && source != nullptr
+        && destination != nullptr
+        && commit_caps(
+            call.transfer_, *source, *destination, call.request_caps_,
             activation->ipc_ ? &*activation->ipc_ : nullptr,
-            call.installed_caps_)) {
+            call.installed_caps_);
+    if (!transferred) {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(call.state_ == Call::State::Committing
+            && activation->state_ == Activation::State::Committing);
+        call.result_ = operation::Result{MYOS_STATUS_TRANSFER_FAILED, 0};
+        call.state_ = Call::State::Complete;
+        activation->state_ = Activation::State::Complete;
         return false;
     }
     call.caller_frame_ = trap.frame();
     activation->generation_ = call.generation_;
     activation->depth_ = call.depth_;
+    bool entered{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != State::Open || call.cancel_pending_
-            || call.state_ != Call::State::Admitted
-            || activation->state_ != Activation::State::Preparing
+            || call.state_ != Call::State::Committing
+            || activation->state_ != Activation::State::Committing
             || activation->call_ != &call) {
+            call.result_ = operation::Result{
+                call.cancel_pending_
+                    ? static_cast<myos_status_t>(call.cancel_status_)
+                    : MYOS_STATUS_CLOSED,
+                0};
+            call.state_ = Call::State::Complete;
+            activation->state_ = Activation::State::Complete;
             call.caller_frame_ = {};
-            return false;
+        } else {
+            call.state_ = Call::State::Active;
+            activation->state_ = Activation::State::Active;
+            entered = true;
         }
-        call.state_ = Call::State::Active;
-        activation->state_ = Activation::State::Active;
+    }
+    if (!entered) {
+        close_installed(call);
+        return false;
     }
     caller->push(activation->frame_);
     trap.redirect(*callee);
@@ -590,6 +658,38 @@ auto Endpoint::reply(
     }
     return finish_active(
                activation, trap, dispatcher, status, value, true)
+        ? libk::Expected<void, EndpointError>{libk::expected()}
+        : libk::Expected<void, EndpointError>{
+              libk::unexpected(EndpointError::Busy)};
+}
+
+auto Endpoint::abort(
+    Thread& caller,
+    arch::TrapContext& trap,
+    sched::CpuDispatcher& dispatcher,
+    isize status) noexcept -> libk::Expected<void, EndpointError> {
+    if (dispatcher.current().thread() != &caller) {
+        return libk::unexpected(EndpointError::InvalidCaller);
+    }
+    execution::Frame* const top = caller.active_frame();
+    if (top == nullptr || top->kind() != execution::Frame::Kind::Endpoint) {
+        return libk::unexpected(EndpointError::InvalidCaller);
+    }
+    auto& activation = *static_cast<Activation*>(top->owner());
+    Call* const call = activation.call_;
+    if (activation.endpoint_ != this || call == nullptr
+        || &call->caller_.get() != &caller) {
+        return libk::unexpected(EndpointError::InvalidCaller);
+    }
+    // The callee detail is returned in value; the status remains a stable
+    // kernel reason and cannot impersonate success or another terminal cause.
+    return finish_active(
+               activation,
+               trap,
+               dispatcher,
+               MYOS_STATUS_PEER_ABORTED,
+               static_cast<usize>(status),
+               false)
         ? libk::Expected<void, EndpointError>{libk::expected()}
         : libk::Expected<void, EndpointError>{
               libk::unexpected(EndpointError::Busy)};
@@ -652,6 +752,9 @@ auto Endpoint::finish_active(
         activation.state_ = reply
             ? Activation::State::Replying : Activation::State::Canceling;
     }
+    if (call->deadline_.armed()) {
+        dispatcher.disarm(call->deadline_);
+    }
 
     Transfer::Specs reply_caps{};
     usize ignored_receive_limit{};
@@ -669,7 +772,7 @@ auto Endpoint::finish_active(
             call->transfer_,
             *source, *destination, reply_caps,
             caller_buffer, reply_handles))) {
-        status = MYOS_STATUS_BAD_ARGS;
+        status = MYOS_STATUS_TRANSFER_FAILED;
         value = 0;
     }
 
@@ -692,7 +795,7 @@ auto Endpoint::finish_active(
 
 auto Endpoint::call_complete(const Call& call) const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{lock_};
-    return call.state_ == Call::State::Admitted
+    return call.state_ == Call::State::Ready
         || call.state_ == Call::State::Complete;
 }
 
@@ -710,6 +813,7 @@ void Endpoint::release_call(Call& call) noexcept {
             return;
         }
         KASSERT(call.state_ == Call::State::Complete);
+        KASSERT(!call.deadline_.armed());
         if (call.publishers_ != 0) {
             return;
         }
@@ -798,42 +902,58 @@ void Endpoint::publisher_done(Call& call) noexcept {
 }
 
 auto Endpoint::cancel_call(Call& call) noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{lock_};
-    if (call.state_ == Call::State::Complete) {
-        return true;
+    bool complete{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (call.state_ == Call::State::Complete) {
+            complete = true;
+        } else if (call.state_ == Call::State::Committing) {
+            call.cancel_pending_ = true;
+            call.cancel_status_ = MYOS_STATUS_CANCELED;
+            return false;
+        } else if (call.state_ == Call::State::Queued
+            || call.state_ == Call::State::Ready) {
+            call.result_ = operation::Result{MYOS_STATUS_CANCELED, 0};
+            call.state_ = Call::State::Complete;
+            complete = true;
+        } else {
+            return false;
+        }
     }
-    if (call.state_ != Call::State::Queued
-        && call.state_ != Call::State::Admitted) {
-        return false;
+    if (complete && call.deadline_.armed()) {
+        CpuLocal& cpu = current_cpu();
+        KASSERT(cpu.dispatcher() != nullptr);
+        cpu.dispatcher()->disarm(call.deadline_);
     }
-    call.result_ = operation::Result{MYOS_STATUS_CANCELED, 0};
-    call.state_ = Call::State::Complete;
-    return true;
+    return complete;
 }
 
 void Endpoint::resume_call(Call& call, arch::TrapContext& trap) noexcept {
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
-    bool admitted{};
+    bool ready{};
     operation::Result terminal{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        admitted = call.state_ == Call::State::Admitted;
-        if (!admitted) {
+        ready = call.state_ == Call::State::Ready;
+        if (!ready) {
             KASSERT(call.state_ == Call::State::Complete);
             terminal = call.result_;
         }
     }
-    if (admitted && enter(call, trap, *cpu.dispatcher())) {
+    if (ready && enter(call, trap, *cpu.dispatcher())) {
         return;
     }
-    if (admitted) {
+    if (ready) {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (call.state_ == Call::State::Admitted) {
+        if (call.state_ == Call::State::Ready) {
             call.result_ = operation::Result{MYOS_STATUS_CLOSED, 0};
             call.state_ = Call::State::Complete;
         }
         terminal = call.result_;
+    }
+    if (call.deadline_.armed()) {
+        cpu.dispatcher()->disarm(call.deadline_);
     }
     trap.set_result(0, static_cast<usize>(
         static_cast<isize>(terminal.status)));
@@ -850,6 +970,45 @@ void Endpoint::publish_cancel(Call& call) noexcept {
         call.caller_.get().binding();
     if (binding != nullptr) {
         static_cast<void>(sched::wake(*call.cpus_, *binding));
+    }
+}
+
+void Endpoint::expire_call(Call& call) noexcept {
+    bool ready{};
+    bool cancel{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        switch (call.state_) {
+        case Call::State::Preparing:
+        case Call::State::Committing:
+            call.cancel_pending_ = true;
+            call.cancel_status_ = MYOS_STATUS_TIMED_OUT;
+            call.result_ = operation::Result{MYOS_STATUS_TIMED_OUT, 0};
+            break;
+        case Call::State::Queued:
+        case Call::State::Ready:
+            call.result_ = operation::Result{MYOS_STATUS_TIMED_OUT, 0};
+            call.state_ = Call::State::Complete;
+            ready = call.completion_.attached();
+            break;
+        case Call::State::Active:
+            call.cancel_pending_ = true;
+            call.cancel_status_ = MYOS_STATUS_TIMED_OUT;
+            cancel = true;
+            break;
+        case Call::State::Replying:
+        case Call::State::Canceling:
+        case Call::State::Reaping:
+        case Call::State::Complete:
+        case Call::State::Free:
+            break;
+        }
+    }
+    if (ready) {
+        call.completion_.signal();
+    }
+    if (cancel) {
+        publish_cancel(call);
     }
 }
 
@@ -871,7 +1030,7 @@ void Endpoint::invalidate_call(Call& call) noexcept {
             call.result_ = operation::Result{MYOS_STATUS_DENIED, 0};
             break;
         case Call::State::Queued:
-        case Call::State::Admitted:
+        case Call::State::Ready:
             call.result_ = operation::Result{MYOS_STATUS_DENIED, 0};
             call.state_ = Call::State::Complete;
             ready = call.completion_.attached();
@@ -880,6 +1039,11 @@ void Endpoint::invalidate_call(Call& call) noexcept {
             call.cancel_pending_ = true;
             call.cancel_status_ = MYOS_STATUS_DENIED;
             cancel = true;
+            break;
+        case Call::State::Committing:
+            call.cancel_pending_ = true;
+            call.cancel_status_ = MYOS_STATUS_DENIED;
+            call.result_ = operation::Result{MYOS_STATUS_DENIED, 0};
             break;
         case Call::State::Replying:
         case Call::State::Canceling:
@@ -917,14 +1081,14 @@ auto Endpoint::next_call_locked(Activation& slot) noexcept -> Call* {
     slot.call_ = selected;
     slot.state_ = Activation::State::Preparing;
     selected->activation_ = &slot;
-    selected->state_ = Call::State::Admitted;
+    selected->state_ = Call::State::Ready;
     return selected;
 }
 
 void Endpoint::reset_call_locked(Call& call) noexcept {
     KASSERT(!call.caller_ && !call.caller_frame_
         && call.activation_ == nullptr && !call.completion_.attached()
-        && !call.authority_);
+        && !call.authority_ && !call.deadline_.armed());
     for (usize& argument : call.arguments_) {
         argument = 0;
     }
@@ -934,7 +1098,6 @@ void Endpoint::reset_call_locked(Call& call) noexcept {
     call.depth_ = 0;
     call.urgency_ = 0;
     call.badge_ = 0;
-    call.cap_limit_ = 0;
     call.receive_limit_ = 0;
     call.request_caps_.clear();
     KASSERT(call.installed_caps_.empty());
@@ -959,12 +1122,14 @@ void Endpoint::close() noexcept {
         for (usize index = 0; index < call_count_; ++index) {
             Call& call = *call_slots_[index];
             if ((call.state_ == Call::State::Queued
-                    || call.state_ == Call::State::Admitted)
+                    || call.state_ == Call::State::Ready)
                 && call.completion_.attached()) {
                 call.result_ = operation::Result{MYOS_STATUS_CLOSED, 0};
                 call.state_ = Call::State::Complete;
                 KASSERT(ready.try_push_back(&call));
-            } else if (call.state_ == Call::State::Preparing) {
+            } else if (call.state_ == Call::State::Preparing
+                || call.state_ == Call::State::Committing
+                || call.state_ == Call::State::Ready) {
                 call.cancel_pending_ = true;
                 call.cancel_status_ = MYOS_STATUS_CLOSED;
                 call.result_ = operation::Result{MYOS_STATUS_CLOSED, 0};

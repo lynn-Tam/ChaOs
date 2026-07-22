@@ -225,12 +225,8 @@ auto CSpace::duplicate(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = libk::move(acquired).value();
+    Snapshot source = libk::move(copied).value();
+    GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -265,12 +261,8 @@ auto CSpace::duplicate(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    const GrantLease& lease = acquired.value();
+    Snapshot source = libk::move(copied).value();
+    const GrantLease& lease = source.lease;
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -290,12 +282,8 @@ auto CSpace::delegate(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = libk::move(acquired).value();
+    Snapshot source = libk::move(copied).value();
+    GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -348,12 +336,8 @@ auto CSpace::delegate(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    const GrantLease& lease = acquired.value();
+    Snapshot source = libk::move(copied).value();
+    const GrantLease& lease = source.lease;
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -374,12 +358,8 @@ auto CSpace::revoke(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = libk::move(acquired).value();
+    Snapshot source = libk::move(copied).value();
+    GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -407,12 +387,8 @@ auto CSpace::revoke(
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = libk::move(acquired).value();
+    Snapshot source = libk::move(copied).value();
+    GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -450,12 +426,8 @@ auto CSpace::destroy(CapHandle source_handle) noexcept
     if (!copied) {
         return libk::unexpected(copied.error());
     }
-    const Snapshot source = copied.value();
-    auto acquired = source.graph->acquire(source.key);
-    if (!acquired) {
-        return libk::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = libk::move(acquired).value();
+    Snapshot source = libk::move(copied).value();
+    GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
@@ -562,10 +534,15 @@ auto CSpace::snapshot(CapHandle handle) noexcept
         return libk::unexpected(CSpaceError::InvalidState);
     }
     const Capability& capability = occupied->storage.capability;
+    auto acquired = capability.grant.acquire();
+    if (!acquired) {
+        return libk::unexpected(grant_error(acquired.error()));
+    }
     return libk::expected(Snapshot{
-        &capability.grant.graph(),
+        capability.grant.graph(),
         capability.grant.key(),
         capability.view,
+        libk::move(acquired).value(),
     });
 }
 

@@ -2,6 +2,7 @@
 
 #include <core/kernel_image.hpp>
 #include <mm/virtual_layout.hpp>
+#include <arch/instruction.hpp>
 #include <arch/user.hpp>
 #include <cap/handle.hpp>
 #include <uapi/capability.h>
@@ -12,6 +13,11 @@
 #include <uapi/vm.h>
 
 namespace {
+
+bool test_riscv_instruction_size(const TestContext&) noexcept {
+    return arch::instruction_size(0x9002) == 2 // c.ebreak
+        && arch::instruction_size(0x0073) == 4; // ebreak/ecall parcel
+}
 
 bool test_user_start_validates_privilege_inputs(const TestContext&) noexcept {
     const arch::UserStart valid{
@@ -79,6 +85,10 @@ bool test_uapi_values_are_stable_and_not_internal_pointers(
 } // namespace
 
 void register_user_tests(TestRegistry& registry) noexcept {
+    (void)registry.add(
+        "user",
+        "RISC-V instruction parcels distinguish compressed completion",
+        test_riscv_instruction_size);
     (void)registry.add(
         "user",
         "UserStart rejects privilege and canonical-address forgery",

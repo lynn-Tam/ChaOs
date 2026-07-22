@@ -22,6 +22,7 @@
 #include <ipc/transfer.hpp>
 #include <resource/sponsorship.hpp>
 #include <sched/types.hpp>
+#include <sched/timer_queue.hpp>
 #include <time/time.hpp>
 #include <uapi/endpoint.h>
 
@@ -73,6 +74,7 @@ public:
     enum class State : u8 {
         Free,
         Preparing,
+        Committing,
         Active,
         Replying,
         Canceling,
@@ -108,7 +110,6 @@ private:
     operation::Wait wait_{};
     execution::Frame frame_;
     Call* call_{};
-    Call* root_{};
     kernel::mm::VirtAddr user_stack_top_{};
     u64 generation_{};
     usize depth_{};
@@ -123,7 +124,8 @@ public:
         Free,
         Preparing,
         Queued,
-        Admitted,
+        Ready,
+        Committing,
         Active,
         Replying,
         Canceling,
@@ -147,11 +149,13 @@ private:
         cap::GrantWork&& work,
         cap::GrantInvalidation reason) noexcept;
     static void authority_released(void* context) noexcept;
+    void expire() noexcept;
 
     static const cap::GrantAttachmentOps authority_ops_;
 
     Endpoint* endpoint_{};
     operation::Completion completion_;
+    sched::Deadline deadline_;
     libk::ManualLifetime<cap::GrantAttachment> authority_{};
     object::ThreadHold caller_{};
     arch::UserFrame caller_frame_{};
@@ -163,7 +167,6 @@ private:
     usize depth_{};
     usize urgency_{};
     usize badge_{};
-    usize cap_limit_{};
     usize receive_limit_{};
     Transfer::Specs request_caps_{};
     Transfer::Handles installed_caps_{};
@@ -216,7 +219,8 @@ public:
         arch::TrapContext& trap,
         sched::CpuDispatcher& dispatcher,
         CpuRegistry& cpus,
-        const usize (&arguments)[3]) noexcept
+        const usize (&arguments)[3],
+        libk::optional<time::Instant> deadline) noexcept
         -> libk::Expected<CallResult, EndpointError>;
     [[nodiscard]] auto reply(
         Thread& caller,
@@ -224,6 +228,11 @@ public:
         sched::CpuDispatcher& dispatcher,
         isize status,
         usize value) noexcept -> libk::Expected<void, EndpointError>;
+    [[nodiscard]] auto abort(
+        Thread& caller,
+        arch::TrapContext& trap,
+        sched::CpuDispatcher& dispatcher,
+        isize status) noexcept -> libk::Expected<void, EndpointError>;
 
     void close() noexcept;
     void retire(object::ObjectCleanup&& cleanup) noexcept;
@@ -249,6 +258,7 @@ private:
     [[nodiscard]] auto cancel_call(Call& call) noexcept -> bool;
     void resume_call(Call& call, arch::TrapContext& trap) noexcept;
     void invalidate_call(Call& call) noexcept;
+    void expire_call(Call& call) noexcept;
     void authority_quiesced(Call& call) noexcept;
     void publish_cancel(Call& call) noexcept;
     void publisher_done(Call& call) noexcept;

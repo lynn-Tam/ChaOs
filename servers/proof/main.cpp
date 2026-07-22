@@ -45,64 +45,67 @@ using namespace myos::proof;
 [[noreturn]] void target_task(
     myos_word_t notification,
     myos_word_t shared_address) noexcept {
-    auto* const flags = reinterpret_cast<volatile myos_word_t*>(
-        shared_address);
+    const Shared shared{shared_address};
+    // Vproc has no kernel-owned blocking continuation. The common syscall
+    // policy must reject Endpoint call before touching Endpoint admission.
+    if (myos::endpoint_call(shared.load(EndpointSlot)).status
+        != MYOS_STATUS_INVALID_OP) {
+        fail();
+    }
     const auto bound = myos::notification_bind_vproc(
         notification, VprocNotificationIngress, VprocNotificationTag);
     if (bound.status != MYOS_STATUS_OK) {
         fail();
     }
-    flags[VprocStateSlot] = VprocReady;
+    shared.store(VprocStateSlot, VprocReady);
     const auto tunnel = myos::tunnel_open(
-        flags[PoolSlot], TunnelIngressSlot, TunnelTag);
+        shared.load(PoolSlot), TunnelIngressSlot, TunnelTag);
     if (tunnel.status != MYOS_STATUS_OK) {
         fail();
     }
     const auto connect = myos::cap_delegate(
-        tunnel.value, flags[CSpaceSlot], MYOS_RIGHT_CONNECT);
+        tunnel.value, shared.load(CSpaceSlot), MYOS_RIGHT_CONNECT);
     if (connect.status != MYOS_STATUS_OK) {
         fail();
     }
-    flags[TunnelAdminSlot] = tunnel.value;
-    flags[TunnelConnectSlot] = connect.value;
+    shared.store(TunnelAdminSlot, tunnel.value);
+    shared.store(TunnelConnectSlot, connect.value);
     auto* const control = reinterpret_cast<myos_vproc_control_page*>(
         ControlAddress + TargetVproc * VprocRuntimeStride);
 
     // First let the ordinary Notification activation complete.  The runtime
     // remains interruptible while bootstrapping its ingress relations.
-    while (flags[VprocStateSlot] != (VprocComplete | VprocBadge)) {
-        __atomic_add_fetch(
-            &flags[TunnelHeartbeatSlot], myos_word_t{1}, __ATOMIC_RELAXED);
+    while (shared.load(VprocStateSlot) != (VprocComplete | VprocBadge)) {
+        static_cast<void>(shared.add_relaxed(TunnelHeartbeatSlot));
         myos::yield();
     }
 
     // Producer-before-park: take an empty checkpoint, prevent upcalls, then
     // let the source publish.  Park must reject the stale observation instead
     // of losing the already-published level.
-    __atomic_store_n(
-        &control->upcall_disable_depth, myos_word_t{1}, __ATOMIC_RELEASE);
+    libk::AtomicRef{control->upcall_disable_depth}
+        .store<libk::MemoryOrder::Release>(1);
     const auto observed = myos::vproc_checkpoint();
     if (observed.status != MYOS_STATUS_OK) {
         fail();
     }
-    flags[ParkObservedSlot] = observed.value;
-    flags[ParkProbeSlot] = TunnelFirstReady;
-    while (flags[TunnelSourceStateSlot] != TunnelFirstInvoked) {
-        __atomic_add_fetch(
-            &flags[TunnelHeartbeatSlot], myos_word_t{1}, __ATOMIC_RELAXED);
+    shared.store(ParkObservedSlot, observed.value);
+    shared.store(ParkProbeSlot, TunnelFirstReady);
+    while (shared.load(TunnelSourceStateSlot) != TunnelFirstInvoked) {
+        static_cast<void>(shared.add_relaxed(TunnelHeartbeatSlot));
         myos::yield();
     }
     const auto rejected = myos::vproc_park(observed.value);
     if (rejected.status != MYOS_STATUS_BUSY) {
         fail();
     }
-    flags[ParkResultSlot] = ParkRejected;
-    __atomic_store_n(
-        &control->upcall_disable_depth, myos_word_t{0}, __ATOMIC_RELEASE);
+    shared.store(ParkResultSlot, ParkRejected);
+    libk::AtomicRef{control->upcall_disable_depth}
+        .store<libk::MemoryOrder::Release>(0);
     if (myos::vproc_checkpoint().status != MYOS_STATUS_OK) {
         fail();
     }
-    while (flags[TunnelDeliveryCountSlot] < 1) {
+    while (shared.load(TunnelDeliveryCountSlot) < 1) {
         myos::yield();
     }
 
@@ -110,28 +113,27 @@ using namespace myos::proof;
     // syscall are adjacent.  On one hart the ordering is exact; on SMP the
     // source yields before publishing so the target can commit Parked.  The
     // syscall returns only after the retained activation makes the lane ready.
-    __atomic_store_n(
-        &control->upcall_disable_depth, myos_word_t{1}, __ATOMIC_RELEASE);
+    libk::AtomicRef{control->upcall_disable_depth}
+        .store<libk::MemoryOrder::Release>(1);
     const auto stable = myos::vproc_checkpoint();
     if (stable.status != MYOS_STATUS_OK) {
         fail();
     }
-    flags[ParkObservedSlot] = stable.value;
-    flags[ParkProbeSlot] = TunnelSecondReady;
+    shared.store(ParkObservedSlot, stable.value);
+    shared.store(ParkProbeSlot, TunnelSecondReady);
     const auto parked = myos::vproc_park(stable.value);
     if (parked.status != MYOS_STATUS_OK) {
         fail();
     }
-    flags[ParkWakeSlot] = ParkCommitted;
-    __atomic_store_n(
-        &control->upcall_disable_depth, myos_word_t{0}, __ATOMIC_RELEASE);
+    shared.store(ParkWakeSlot, ParkCommitted);
+    libk::AtomicRef{control->upcall_disable_depth}
+        .store<libk::MemoryOrder::Release>(0);
     if (myos::vproc_checkpoint().status != MYOS_STATUS_OK) {
         fail();
     }
     for (;;) {
-        __atomic_add_fetch(
-            &flags[TunnelHeartbeatSlot], myos_word_t{1}, __ATOMIC_RELAXED);
-        if (flags[TunnelDeliveryCountSlot] >= 2) {
+        static_cast<void>(shared.add_relaxed(TunnelHeartbeatSlot));
+        if (shared.load(TunnelDeliveryCountSlot) >= 2) {
             myos::yield();
         }
     }
@@ -140,29 +142,28 @@ using namespace myos::proof;
 [[noreturn]] void source_task(
     myos_word_t,
     myos_word_t shared_address) noexcept {
-    auto* const flags = reinterpret_cast<volatile myos_word_t*>(
-        shared_address);
-    flags[TunnelSourceStateSlot] = TunnelSourceReady;
-    while (flags[VprocStateSlot] != (VprocComplete | VprocBadge)
-        || flags[TunnelHeartbeatSlot] == 0) {
+    const Shared shared{shared_address};
+    shared.store(TunnelSourceStateSlot, TunnelSourceReady);
+    while (shared.load(VprocStateSlot) != (VprocComplete | VprocBadge)
+        || shared.load(TunnelHeartbeatSlot) == 0) {
         myos::yield();
     }
 
-    while (flags[TunnelConnectSlot] == 0) {
+    while (shared.load(TunnelConnectSlot) == 0) {
         myos::yield();
     }
     const auto connected = myos::tunnel_connect(
-        flags[TunnelConnectSlot]);
+        shared.load(TunnelConnectSlot));
     if (connected.status != MYOS_STATUS_OK || connected.value == 0) {
         fail();
     }
-    flags[TunnelTxSlot] = connected.value;
+    shared.store(TunnelTxSlot, connected.value);
     if (myos::tunnel_ack(connected.value, 1).status
         != MYOS_STATUS_BAD_RIGHTS) {
         fail();
     }
 
-    while (flags[ParkProbeSlot] != TunnelFirstReady) {
+    while (shared.load(ParkProbeSlot) != TunnelFirstReady) {
         myos::yield();
     }
     // Both invokes occur in one pending epoch.  Tunnel sequencing must retain
@@ -174,10 +175,10 @@ using namespace myos::proof;
         || second.value != first.value + 1) {
         fail();
     }
-    flags[TunnelSourceSequenceSlot] = second.value;
-    flags[TunnelSourceStateSlot] = TunnelFirstInvoked;
-    while (flags[TunnelDeliveryCountSlot] < 1
-        || flags[ParkProbeSlot] != TunnelSecondReady) {
+    shared.store(TunnelSourceSequenceSlot, second.value);
+    shared.store(TunnelSourceStateSlot, TunnelFirstInvoked);
+    while (shared.load(TunnelDeliveryCountSlot) < 1
+        || shared.load(ParkProbeSlot) != TunnelSecondReady) {
         myos::yield();
     }
 
@@ -188,11 +189,11 @@ using namespace myos::proof;
     }
     const auto wake = myos::tunnel_invoke(connected.value);
     if (wake.status != MYOS_STATUS_OK
-        || wake.value <= flags[TunnelSourceSequenceSlot]) {
+        || wake.value <= shared.load(TunnelSourceSequenceSlot)) {
         fail();
     }
-    flags[TunnelSourceSequenceSlot] = wake.value;
-    flags[TunnelSourceStateSlot] = TunnelSecondInvoked;
+    shared.store(TunnelSourceSequenceSlot, wake.value);
+    shared.store(TunnelSourceStateSlot, TunnelSecondInvoked);
     for (;;) {
         myos::yield();
     }
@@ -203,8 +204,7 @@ using namespace myos::proof;
     myos_word_t event_address,
     myos_word_t control_address,
     myos_word_t pending_sequence) noexcept {
-    auto* const flags = reinterpret_cast<volatile myos_word_t*>(
-        SharedAddress);
+    const Shared shared{SharedAddress};
     if (generation == 0 || pending_sequence == 0) {
         fail();
     }
@@ -213,45 +213,47 @@ using namespace myos::proof;
         reinterpret_cast<const myos_vproc_event_page*>(event_address);
     auto* const control =
         reinterpret_cast<myos_vproc_control_page*>(control_address);
-    const uint64_t ready_mask = __atomic_load_n(
-        &events->ready_mask, __ATOMIC_ACQUIRE);
-    const uint64_t ingress_mask = __atomic_load_n(
-        &events->ingress_mask, __ATOMIC_ACQUIRE);
-    const uint64_t notification_mask = __atomic_load_n(
-        &events->notification_mask, __ATOMIC_ACQUIRE);
+    const uint64_t ready_mask = libk::AtomicRef{events->ready_mask}
+        .load<libk::MemoryOrder::Acquire>();
+    const uint64_t ingress_mask = libk::AtomicRef{events->ingress_mask}
+        .load<libk::MemoryOrder::Acquire>();
+    const uint64_t notification_mask =
+        libk::AtomicRef{events->notification_mask}
+            .load<libk::MemoryOrder::Acquire>();
     if (ready_mask != 0) {
         fail();
     }
     if ((notification_mask
             & (uint64_t{1} << VprocNotificationIngress)) != 0) {
-        const uint64_t sequence = __atomic_load_n(
-            &events->notification_sequence[VprocNotificationIngress],
-            __ATOMIC_ACQUIRE);
-        const myos_word_t tag = __atomic_load_n(
-            &events->notification_tag[VprocNotificationIngress],
-            __ATOMIC_ACQUIRE);
+        const uint64_t sequence = libk::AtomicRef{
+            events->notification_sequence[VprocNotificationIngress]}
+                .load<libk::MemoryOrder::Acquire>();
+        const myos_word_t tag = libk::AtomicRef{
+            events->notification_tag[VprocNotificationIngress]}
+                .load<libk::MemoryOrder::Acquire>();
         const auto completed = myos::notification_take(
-            flags[VprocNotificationSlot]);
+            shared.load(VprocNotificationSlot));
         if (sequence == 0 || tag != VprocNotificationTag
             || completed.status != MYOS_STATUS_OK
             || completed.value != VprocBadge
             || completed.value2 != sequence) {
             fail();
         }
-        flags[VprocKeySlot] = sequence;
-        flags[VprocStateSlot] = VprocComplete | completed.value;
+        shared.store(VprocKeySlot, sequence);
+        shared.store(VprocStateSlot, VprocComplete | completed.value);
     }
     if ((ingress_mask & (uint64_t{1} << TunnelIngressSlot)) != 0) {
         const uint64_t bit = uint64_t{1} << TunnelIngressSlot;
-        const uint64_t ingress = __atomic_load_n(
-            &events->ingress_mask, __ATOMIC_ACQUIRE);
-        const uint64_t sequence = __atomic_load_n(
-            &events->ingress_sequence[TunnelIngressSlot],
-            __ATOMIC_ACQUIRE);
-        const myos_word_t tag = __atomic_load_n(
-            &events->ingress_tag[TunnelIngressSlot], __ATOMIC_ACQUIRE);
-        const myos_cap_t admin = flags[TunnelAdminSlot];
-        const myos_cap_t tx = flags[TunnelTxSlot];
+        const uint64_t ingress = libk::AtomicRef{events->ingress_mask}
+            .load<libk::MemoryOrder::Acquire>();
+        const uint64_t sequence = libk::AtomicRef{
+            events->ingress_sequence[TunnelIngressSlot]}
+                .load<libk::MemoryOrder::Acquire>();
+        const myos_word_t tag = libk::AtomicRef{
+            events->ingress_tag[TunnelIngressSlot]}
+                .load<libk::MemoryOrder::Acquire>();
+        const myos_cap_t admin = shared.load(TunnelAdminSlot);
+        const myos_cap_t tx = shared.load(TunnelTxSlot);
         if ((ingress & bit) == 0 || sequence == 0 || tag != TunnelTag
             || admin == 0 || tx == 0
             || myos::tunnel_invoke(admin).status != MYOS_STATUS_BAD_RIGHTS) {
@@ -264,16 +266,16 @@ using namespace myos::proof;
             || stale.status != MYOS_STATUS_RETRY) {
             fail();
         }
-        flags[TunnelTargetSequenceSlot] = acknowledged.value;
-        __atomic_add_fetch(
-            &flags[TunnelDeliveryCountSlot], myos_word_t{1}, __ATOMIC_RELEASE);
+        shared.store(TunnelTargetSequenceSlot, acknowledged.value);
+        // The acknowledged sequence is published before the count marker.
+        static_cast<void>(shared.add_release(TunnelDeliveryCountSlot));
     }
 
     for (myos_word_t index = 0; index < MYOS_VPROC_CONTEXT_WORDS; ++index) {
         control->resume.words[index] = events->delivered.words[index];
     }
-    __atomic_store_n(
-        &control->resume_generation, generation, __ATOMIC_RELEASE);
+    libk::AtomicRef{control->resume_generation}
+        .store<libk::MemoryOrder::Release>(generation);
     (void)myos::vproc_return(generation);
     fail();
 }
@@ -290,6 +292,18 @@ extern "C" void myos_main(
     myos_word_t vproc_magic,
     myos_word_t vproc_task_stack,
     myos_word_t) noexcept {
+    if (bootstrap_address == EndpointAbortMagic) {
+        (void)myos::endpoint_abort(EndpointAbortDetail);
+        fail();
+    }
+    if (bootstrap_address == EndpointTimeoutMagic) {
+        for (;;) {
+            asm volatile("" ::: "memory");
+        }
+    }
+    if (bootstrap_address == EndpointFaultMagic) {
+        fail();
+    }
     if (bootstrap_address == EndpointMagic) {
         auto* const caps = reinterpret_cast<myos_ipc_caps*>(
             EndpointIpcAddress);
@@ -325,13 +339,12 @@ extern "C" void myos_main(
             }
             myos::yield();
         }
-        auto* const flags = reinterpret_cast<volatile myos_word_t*>(
-            SharedAddress);
+        const Shared shared{SharedAddress};
         if (vproc_magic == VprocMagic) {
             myos::user_enter(
                 &target_task,
                 vproc_task_stack,
-                flags[VprocNotificationSlot],
+                shared.load(VprocNotificationSlot),
                 SharedAddress);
         }
         myos::user_enter(
@@ -353,16 +366,20 @@ extern "C" void myos_main(
         // service protocol after Endpoint IPC exists. The registered start
         // descriptor passes a bounded shared result page and lane index.
         if (bootstrap_address >= 64 * 1024 && bootstrap_size < 2) {
-            auto* const flags = reinterpret_cast<volatile myos_word_t*>(
-                bootstrap_address);
-            const myos_cap_t notification = flags[NotificationSlot];
+            const Shared shared{bootstrap_address};
+            const myos_cap_t notification = shared.load(NotificationSlot);
             if (notification == 0
                 || myos::notification_signal(notification).status
                     != MYOS_STATUS_OK) {
                 fail();
             }
             if (bootstrap_size == 0) {
-                const myos_cap_t endpoint = flags[EndpointSlot];
+                const myos_cap_t endpoint = shared.load(EndpointSlot);
+                if (myos::endpoint_abort().status != MYOS_STATUS_INVALID_OP
+                    || myos::endpoint_reply(MYOS_STATUS_OK).status
+                        != MYOS_STATUS_INVALID_OP) {
+                    fail();
+                }
                 auto* const caps = reinterpret_cast<myos_ipc_caps*>(
                     StackAddress);
                 *caps = {};
@@ -383,9 +400,27 @@ extern "C" void myos_main(
                         != MYOS_STATUS_OK) {
                     fail();
                 }
-                flags[EndpointResultSlot] = EndpointTransfer;
+                *caps = {};
+                caps->version = MYOS_IPC_CAPS_VERSION;
+                const auto aborted = myos::endpoint_call(
+                    endpoint, EndpointAbortMagic, 0, 0);
+                if (aborted.status != MYOS_STATUS_PEER_ABORTED
+                    || aborted.value != EndpointAbortDetail) {
+                    fail();
+                }
+                const auto timed_out = myos::endpoint_call(
+                    endpoint, EndpointTimeoutMagic, 0, 0, 1'000'000);
+                if (timed_out.status != MYOS_STATUS_TIMED_OUT) {
+                    fail();
+                }
+                const auto faulted = myos::endpoint_call(
+                    endpoint, EndpointFaultMagic, 0, 0);
+                if (faulted.status != MYOS_STATUS_PEER_FAULT) {
+                    fail();
+                }
+                shared.store(EndpointResultSlot, EndpointTransfer);
             }
-            flags[bootstrap_size] = ChildReady + bootstrap_size;
+            shared.store(bootstrap_size, ChildReady + bootstrap_size);
             for (;;) {
                 myos::yield();
             }

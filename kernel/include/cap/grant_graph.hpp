@@ -2,6 +2,7 @@
 
 #include <cap/grant.hpp>
 #include <libk/intrusive_list.hpp>
+#include <libk/delegate.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/ticket_spin_lock.hpp>
 #include <mm/node_pool.hpp>
@@ -20,6 +21,8 @@ class CSpace;
 
 class GrantGraph final : private libk::noncopyable_nonmovable {
 public:
+    using WorkNotifier = libk::delegate<void() noexcept>;
+
     struct Quota final {
         usize nodes{4096};
         usize pages{64};
@@ -88,6 +91,10 @@ public:
     [[nodiscard]] auto state(GrantKey key) const noexcept
         -> libk::Expected<GrantState, GrantError>;
     [[nodiscard]] auto live_count() const noexcept -> usize;
+    [[nodiscard]] auto service(usize budget) noexcept -> bool;
+    [[nodiscard]] auto work_pending() const noexcept -> bool;
+    void bind_work_notifier(WorkNotifier notifier) noexcept;
+    void unbind_work_notifier() noexcept;
     [[nodiscard]] auto close_pool(
         kernel::resource::ResourcePool& pool,
         const kernel::object::ObjectRef& self,
@@ -139,9 +146,6 @@ private:
         AttachmentList attachments{};
         GrantRevoke* revoke{};
         usize refs{};
-        usize operations{};
-        GrantState state{GrantState::Live};
-        bool reclaiming{};
         kernel::resource::Sponsorship sponsorship{};
         kernel::resource::Allocation allocation{};
     };
@@ -150,8 +154,12 @@ private:
     struct Slot final {
         PageHeader* page{};
         Slot* next_free{};
-        u64 generation{};
-        bool occupied{};
+        libk::IntrusiveListHook work_hook{};
+        libk::Atomic<u64> generation{};
+        libk::Atomic<usize> operations{};
+        libk::Atomic<GrantState> state{GrantState::Revoked};
+        libk::Atomic<bool> work_retained{};
+        libk::Atomic<bool> occupied{};
         bool quarantined{};
         alignas(Node) byte storage[sizeof(Node)]{};
 
@@ -162,6 +170,19 @@ private:
             return reinterpret_cast<const Node*>(storage);
         }
     };
+
+    static constexpr usize operation_closed =
+        usize{1} << (sizeof(usize) * 8 - 1);
+    [[nodiscard]] static constexpr auto operation_count(usize value) noexcept
+        -> usize {
+        return value & ~operation_closed;
+    }
+    [[nodiscard]] static constexpr auto admission_closed(usize value) noexcept
+        -> bool {
+        return (value & operation_closed) != 0;
+    }
+
+    using WorkQueue = libk::IntrusiveList<Slot, &Slot::work_hook>;
 
     struct PageHeader final {
         explicit PageHeader(kernel::mm::OwnedPage&& page) noexcept
@@ -188,15 +209,22 @@ private:
         -> libk::Expected<Slot*, GrantError>;
     [[nodiscard]] auto make_page() noexcept
         -> libk::Expected<PageHeader*, GrantError>;
+    [[nodiscard]] auto locate(GrantKey key) noexcept -> Node*;
+    [[nodiscard]] auto locate(GrantKey key) const noexcept -> const Node*;
     [[nodiscard]] auto find(GrantKey key) noexcept -> Node*;
     [[nodiscard]] auto find(GrantKey key) const noexcept -> const Node*;
     [[nodiscard]] static auto key_of(const Node& node) noexcept -> GrantKey;
     [[nodiscard]] auto try_ref(Node& node) noexcept
         -> libk::Expected<GrantRef, GrantError>;
-    [[nodiscard]] auto try_acquire(Node& node) noexcept
+    [[nodiscard]] auto try_acquire(Slot& slot, u64 generation) noexcept
         -> libk::Expected<GrantLease, GrantError>;
-    void drop_ref(GrantKey key) noexcept;
+    void drop_ref(void* node, u64 generation) noexcept;
     void drop_lease(void* node, u64 generation) noexcept;
+    void release_operation(Slot& slot) noexcept;
+    void enqueue(Slot& slot) noexcept;
+    void kick_work() noexcept;
+    [[nodiscard]] auto take_work() noexcept -> Slot*;
+    void service_slot(Slot& slot) noexcept;
     [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
     void reclaim(GrantKey key, bool drop_reference) noexcept;
     void commit_allocation(kernel::resource::Allocation& allocation) noexcept;
@@ -222,6 +250,9 @@ private:
     kernel::mm::Pmm* pmm_{};
     Quota quota_{};
     mutable libk::TicketSpinLock lock_{};
+    mutable libk::TicketSpinLock work_lock_{};
+    WorkQueue work_{};
+    WorkNotifier work_notifier_{};
     kernel::mm::NodePool<GrantRevokeWait> revoke_waits_;
     kernel::mm::NodePool<kernel::resource::CloseWait> close_waits_;
     PageHeader* pages_{};

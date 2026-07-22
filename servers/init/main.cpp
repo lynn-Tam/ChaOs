@@ -124,8 +124,13 @@ public:
         const auto package = myos::boot::Bundle::parse(
             reinterpret_cast<const void*>(BundleAddress), bundle_size_);
         myos::boot::Module proof{};
-        if (!package || !package.find("proof", proof)
-            || proof.segment_count() == 0
+        if (!package) {
+            return false;
+        }
+        if (!package.find("proof", proof)) {
+            return false;
+        }
+        if (proof.segment_count() == 0
             || proof.segment_count() > MaxSegments) {
             return false;
         }
@@ -320,7 +325,7 @@ private:
                 MYOS_VM_READ | MYOS_VM_WRITE)) {
             return false;
         }
-        auto* const destination = reinterpret_cast<volatile uint8_t*>(
+        auto* const destination = reinterpret_cast<uint8_t*>(
             ScratchAddress);
         for (myos_word_t index = 0; index < source_size; ++index) {
             destination[index] = source[index];
@@ -404,9 +409,9 @@ private:
                 MYOS_VM_READ | MYOS_VM_WRITE)) {
             return false;
         }
-        flags_ = reinterpret_cast<volatile myos_word_t*>(SharedAddress);
+        shared_.bind(SharedAddress);
         for (myos_word_t index = 0; index < SharedWords; ++index) {
-            flags_[index] = 0;
+            shared_.store(index, 0);
         }
         return true;
     }
@@ -463,7 +468,7 @@ private:
         if (delegated.status != MYOS_STATUS_OK) {
             return false;
         }
-        flags_[NotificationSlot] = delegated.value;
+        shared_.store(NotificationSlot, delegated.value);
 
         const auto vproc = myos::notification_create(pool_, VprocBadge);
         if (vproc.status != MYOS_STATUS_OK
@@ -476,9 +481,9 @@ private:
         if (waiter.status != MYOS_STATUS_OK) {
             return false;
         }
-        flags_[VprocNotificationSlot] = waiter.value;
-        flags_[VprocKeySlot] = 0;
-        flags_[VprocStateSlot] = 0;
+        shared_.store(VprocNotificationSlot, waiter.value);
+        shared_.store(VprocKeySlot, 0);
+        shared_.store(VprocStateSlot, 0);
         return true;
     }
 
@@ -560,8 +565,8 @@ private:
             || code.status != MYOS_STATUS_OK) {
             return false;
         }
-        flags_[PoolSlot] = child_pool.value;
-        flags_[CSpaceSlot] = child_cspace.value;
+        shared_.store(PoolSlot, child_pool.value);
+        shared_.store(CSpaceSlot, child_cspace.value);
 
         myos_cap_t upcall_stacks[VprocCount]{};
         for (myos_word_t index = 0; index < VprocCount; ++index) {
@@ -577,7 +582,7 @@ private:
             upcall_stacks[index] = delegated.value;
         }
 
-        auto* const starts = reinterpret_cast<volatile myos_thread_start*>(
+        auto* const starts = reinterpret_cast<myos_thread_start*>(
             ScratchAddress);
         for (myos_word_t index = 0; index < thread_count_; ++index) {
             starts[index].version = MYOS_THREAD_START_VERSION;
@@ -596,7 +601,7 @@ private:
         }
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             auto* const vproc_start =
-                reinterpret_cast<volatile myos_vproc_start*>(
+                reinterpret_cast<myos_vproc_start*>(
                     ScratchAddress + VprocDescriptorOffset
                     + index * VprocDescriptorStride);
             vproc_start->version = MYOS_VPROC_START_VERSION;
@@ -622,7 +627,7 @@ private:
             vproc_start->event_address =
                 EventAddress + index * VprocRuntimeStride;
 
-            auto* const arm = reinterpret_cast<volatile myos_vproc_arm*>(
+            auto* const arm = reinterpret_cast<myos_vproc_arm*>(
                 SharedAddress + ArmDescriptorOffset
                 + index * ArmDescriptorStride);
             const myos_word_t code_page =
@@ -661,7 +666,7 @@ private:
             return false;
         }
         auto* const endpoint_desc =
-            reinterpret_cast<volatile myos_endpoint_desc*>(
+            reinterpret_cast<myos_endpoint_desc*>(
                 ScratchAddress + EndpointDescriptorOffset);
         endpoint_desc->version = MYOS_ENDPOINT_VERSION;
         endpoint_desc->flags = MYOS_ENDPOINT_FLAGS_NONE;
@@ -702,7 +707,7 @@ private:
         if (caller.status != MYOS_STATUS_OK) {
             return false;
         }
-        flags_[EndpointSlot] = caller.value;
+        shared_.store(EndpointSlot, caller.value);
 
         if (!committed(myos::vm_unmap(
                 scratch_region_, ScratchAddress, PageSize))) {
@@ -790,19 +795,19 @@ private:
         for (;;) {
             bool all_ready{true};
             for (myos_word_t index = 0; index < thread_count_; ++index) {
-                if (flags_[index] != ChildReady + index) {
+                if (shared_.load(index) != ChildReady + index) {
                     all_ready = false;
                 }
             }
             if (all_ready) {
-                return flags_[EndpointResultSlot] == EndpointTransfer;
+                return shared_.load(EndpointResultSlot) == EndpointTransfer;
             }
             myos::yield();
         }
     }
 
     [[nodiscard]] auto exercise_vproc() noexcept -> bool {
-        while (flags_[VprocStateSlot] != VprocReady) {
+        while (shared_.load(VprocStateSlot) != VprocReady) {
             myos::yield();
         }
         if (myos::notification_signal(vproc_notification_).status
@@ -810,18 +815,24 @@ private:
             return false;
         }
         const myos_word_t expected = VprocComplete | VprocBadge;
-        while (flags_[VprocStateSlot] != expected) {
+        while (shared_.load(VprocStateSlot) != expected) {
             myos::yield();
         }
-        while (flags_[ParkResultSlot] != ParkRejected
-            || flags_[ParkWakeSlot] != ParkCommitted
-            || flags_[TunnelDeliveryCountSlot] < 2) {
+        while (shared_.load(ParkResultSlot) != ParkRejected
+            || shared_.load(ParkWakeSlot) != ParkCommitted
+            || shared_.load(TunnelDeliveryCountSlot) < 2
+            || shared_.load(TunnelSourceStateSlot)
+                != TunnelSecondInvoked) {
             myos::yield();
         }
-        return flags_[TunnelSourceSequenceSlot] != 0
-            && flags_[TunnelSourceSequenceSlot]
-                == flags_[TunnelTargetSequenceSlot]
-            && flags_[TunnelHeartbeatSlot] != 0;
+        // The target may acknowledge the second kernel publication before the
+        // source returns from tunnel_invoke().  SourceState is published after
+        // SourceSequence, so its acquire observation closes that SMP ordering
+        // before the two user-visible sequence values are compared.
+        return shared_.load(TunnelSourceSequenceSlot) != 0
+            && shared_.load(TunnelSourceSequenceSlot)
+                == shared_.load(TunnelTargetSequenceSlot)
+            && shared_.load(TunnelHeartbeatSlot) != 0;
     }
 
     [[nodiscard]] auto close_child() noexcept -> bool {
@@ -856,7 +867,7 @@ private:
     myos_word_t code_address_{};
     myos_word_t code_size_{};
     myos_word_t entry_{};
-    volatile myos_word_t* flags_{};
+    Shared shared_{};
     myos_cap_t stack_memory_[MaxStacks]{};
     myos_word_t stack_bases_[MaxStacks]{};
     myos_word_t stack_tops_[MaxStacks]{};

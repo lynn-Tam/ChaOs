@@ -133,6 +133,7 @@ public:
     [[nodiscard]] auto resume(
         arch::TrapContext& trap,
         u64 generation) noexcept -> libk::Expected<void, VprocError>;
+    [[nodiscard]] auto in_upcall() const noexcept -> bool;
     void request_exit() noexcept;
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
 
@@ -157,6 +158,13 @@ private:
         Unarmed,
         Armed,
         Active,
+    };
+
+    enum class ActivationPost : u8 {
+        Idle,
+        Posting,
+        Pending,
+        Consumed,
     };
 
     struct OperationSlot final {
@@ -240,8 +248,8 @@ private:
     [[nodiscard]] auto pending_events() const noexcept -> bool;
     [[nodiscard]] auto activation_quiescent() const noexcept -> bool;
     void activation_publisher_done() noexcept;
-    void activation_request_posted(bool posted) noexcept;
-    void activation_request_consumed() noexcept;
+    [[nodiscard]] auto activation_request_posted(bool posted) noexcept -> bool;
+    [[nodiscard]] auto activation_request_consumed() noexcept -> bool;
     void retry_stop_if_ready() noexcept;
 
     using StopList = libk::IntrusiveList<
@@ -274,8 +282,8 @@ private:
     bool stopped_{};
     bool park_requested_{};
     usize activation_publishers_{};
-    bool activation_request_held_{};
-    bool activation_posting_{};
+    ActivationPost activation_post_{ActivationPost::Idle};
+    bool activation_dirty_{};
     sched::RemoteRequest activation_{sched::RemoteKind::Activation, this};
 };
 

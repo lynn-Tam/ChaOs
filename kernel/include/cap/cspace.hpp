@@ -172,12 +172,8 @@ public:
         if (!copied) {
             return libk::unexpected(copied.error());
         }
-        Snapshot source = copied.value();
-        auto acquired = source.graph->acquire(source.key);
-        if (!acquired) {
-            return libk::unexpected(CSpaceError::GrantUnavailable);
-        }
-        GrantLease lease = libk::move(acquired).value();
+        Snapshot source = libk::move(copied).value();
+        GrantLease lease = libk::move(source.lease);
         if (lease.kind() != object::ObjectTraits<T>::kind) {
             return libk::unexpected(CSpaceError::WrongKind);
         }
@@ -288,10 +284,23 @@ private:
     static_assert(sizeof(DirPage) <= kernel::mm::page_size);
     static_assert(sizeof(LeafPage) <= kernel::mm::page_size);
 
-    struct Snapshot final {
+    struct Snapshot final : private libk::noncopyable {
+        Snapshot(
+            GrantGraph& owner,
+            GrantKey identity,
+            CapView cap_view,
+            GrantLease&& admission) noexcept
+            : graph(&owner),
+              key(identity),
+              view(cap_view),
+              lease(libk::move(admission)) {}
+        Snapshot(Snapshot&&) noexcept = default;
+        auto operator=(Snapshot&&) noexcept -> Snapshot& = default;
+
         GrantGraph* graph{};
         GrantKey key{};
         CapView view{};
+        GrantLease lease{};
     };
 
     [[nodiscard]] auto snapshot(CapHandle handle) noexcept
