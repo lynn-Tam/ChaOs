@@ -6,24 +6,8 @@ namespace {
 
 constinit TestRegistry builtin_registry{};
 
-bool same_cstr(const char* lhs, const char* rhs) noexcept {
-    if (lhs == rhs) {
-        return true;
-    }
-    if (lhs == nullptr || rhs == nullptr) {
-        return false;
-    }
-    for (; *lhs != '\0' && *rhs != '\0'; ++lhs, ++rhs) {
-        if (*lhs != *rhs) {
-            return false;
-        }
-    }
-    return *lhs == *rhs;
-}
-
-void report_case(const char* group, const char* name, bool ok) noexcept {
-    kernel::diag::console::print<"  [{}] {}: {}\n">(
-        ok ? "PASS" : "FAIL", group, name);
+void report_failure(const char* group, const char* name) noexcept {
+    kernel::diag::console::print<"[FAIL] {}: {}\n">(group, name);
 }
 
 } // namespace
@@ -38,21 +22,15 @@ bool TestRegistry::add(const char* group, const char* name, TestFn fn) noexcept 
 
 TestStats TestRegistry::run(const TestContext& ctx) noexcept {
     TestStats stats{};
-    const char* current_group = nullptr;
 
     for (size_t i = 0; i < count_; ++i) {
         const Entry& entry = entries_[i];
-        if (!same_cstr(current_group, entry.group)) {
-            current_group = entry.group;
-            kernel::diag::console::print<"\n[test] {}\n">(current_group);
-        }
-
         const bool ok = entry.fn(ctx);
-        report_case(entry.group, entry.name, ok);
         if (ok) {
             ++stats.passed;
         } else {
             ++stats.failed;
+            report_failure(entry.group, entry.name);
         }
     }
 
