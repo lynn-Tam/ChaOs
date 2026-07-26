@@ -375,9 +375,10 @@ private:
 
     [[nodiscard]] auto start_region_destroy(
         VmContext context,
-        AddressRegion& region,
+        RegionKey key,
         bool remove_root,
-        PendingKind kind) noexcept
+        PendingKind kind,
+        bool root_target = false) noexcept
         -> libk::Expected<VmStatus, VSpaceError>;
     void dismantle_region(
         AddressRegion& region,

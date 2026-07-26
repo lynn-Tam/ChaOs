@@ -124,7 +124,7 @@ auto VSpace::start_invalidation(
 
 auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
     MappingAuthority* next{};
-    AddressRegion* retire_root{};
+    bool retire_root{};
     ShootdownTicket* waiting_ticket{};
     bool settled{};
     bool waiting{};
@@ -168,7 +168,10 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             && root_region_ != nullptr
             && !root_region_->children_.empty()
             && coherence_.active_cpus().empty()) {
-            retire_root = root_region_;
+            // The root is resolved again by start_region_destroy() under the
+            // VSpace lock.  Do not carry its address through this unlocked
+            // service handoff.
+            retire_root = true;
         } else {
             try_finish_retire();
             settled = pending_kind_ == PendingKind::None
@@ -178,14 +181,14 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         }
     }
     complete_cleanup();
-    if (waiting || (next == nullptr && retire_root == nullptr)) {
+    if (waiting || (next == nullptr && !retire_root)) {
         return libk::expected(settled
             ? VSpaceServiceState::Settled
             : VSpaceServiceState::Waiting);
     }
-    if (retire_root != nullptr) {
+    if (retire_root) {
         auto started = start_region_destroy(
-            context, *retire_root, false, PendingKind::Retire);
+            context, RegionKey{}, false, PendingKind::Retire, true);
         if (!started) {
             if (started.error() == VSpaceError::Busy) {
                 return libk::expected(VSpaceServiceState::Waiting);

@@ -13,9 +13,11 @@ constexpr myos_word_t StackSize = 4 * PageSize;
 constexpr myos_word_t ChildMemory = 16 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
+constexpr myos_word_t ChannelThreadCount = 2;
 constexpr myos_word_t EndpointActivations = 1;
 constexpr myos_word_t MaxStacks =
-    MaxThreads + 3 * VprocCount + EndpointActivations;
+    MaxThreads + 3 * VprocCount + EndpointActivations
+    + ChannelThreadCount;
 constexpr myos_word_t VprocDescriptorOffset = 512;
 constexpr myos_word_t VprocDescriptorStride = 256;
 constexpr myos_word_t EndpointDescriptorOffset = 2048;
@@ -91,7 +93,7 @@ public:
     }
 
 private:
-    static constexpr myos_word_t Capacity = 64;
+    static constexpr myos_word_t Capacity = 128;
     myos_cap_t values_[Capacity]{};
     myos_word_t size_{};
 };
@@ -161,7 +163,7 @@ public:
 
         stage_ = 4;
         const auto child = myos::resource_create_child(
-            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E4_KINDS);
+            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E6_KINDS);
         if (child.status != MYOS_STATUS_OK || !children_.add(child.value)) {
             return false;
         }
@@ -195,32 +197,59 @@ public:
             return false;
         }
         stage_ = 9;
-        if (!make_stacks()) {
+        if (!make_channel()) {
             return false;
         }
         stage_ = 10;
-        if (!make_vproc_runtime()) {
+        if (!make_stacks()) {
             return false;
         }
         stage_ = 11;
-        if (!make_executions(proof.entry())) {
+        if (!make_vproc_runtime()) {
             return false;
         }
         stage_ = 12;
+        if (!make_executions(proof.entry())) {
+            return false;
+        }
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::Boot,
+            ProgressWait::Notification);
+        stage_ = 13;
         const auto notified = myos::notification_wait(notification_);
         if (notified.status != MYOS_STATUS_OK
             || (notified.value & NotificationBadge) == 0) {
             return false;
         }
-        stage_ = 13;
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::ChannelBound,
+            ProgressWait::Children);
+        stage_ = 14;
         if (!await_children()) {
             return false;
         }
-        stage_ = 14;
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::FirstReceive,
+            ProgressWait::VprocReady);
+        stage_ = 15;
         if (!exercise_vproc()) {
             return false;
         }
-        stage_ = 15;
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::VprocDone,
+            ProgressWait::ChannelReady);
+        stage_ = 16;
+        if (!await_channel()) {
+            return false;
+        }
+        stage_ = 17;
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::Complete);
         if (!close_child()) {
             return false;
         }
@@ -230,6 +259,10 @@ public:
 
     [[nodiscard]] auto stage() const noexcept -> myos_word_t {
         return stage_;
+    }
+
+    [[nodiscard]] auto failure_code() const noexcept -> myos_word_t {
+        return diagnostic_code_ != 0 ? diagnostic_code_ : stage_;
     }
 
     void cleanup() noexcept {
@@ -249,6 +282,8 @@ public:
 
 private:
     static constexpr myos_word_t MaxSegments = 16;
+    static constexpr myos_word_t max_word =
+        static_cast<myos_word_t>(-1);
 
     [[nodiscard]] auto make_region(
         myos_cap_t vspace,
@@ -385,6 +420,15 @@ private:
     }
 
     [[nodiscard]] auto make_shared_page() noexcept -> bool {
+        const auto clock0 = myos::clock_now();
+        const auto clock1 = myos::clock_now();
+        const auto frequency = myos::clock_frequency();
+        if (clock0.status != MYOS_STATUS_OK
+            || clock1.status != MYOS_STATUS_OK
+            || frequency.status != MYOS_STATUS_OK
+            || clock1.value < clock0.value || frequency.value == 0) {
+            return false;
+        }
         if (!create_memory(
                 PageSize, MYOS_VM_READ | MYOS_VM_WRITE, shared_memory_)) {
             return false;
@@ -413,12 +457,18 @@ private:
         for (myos_word_t index = 0; index < SharedWords; ++index) {
             shared_.store(index, 0);
         }
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::Boot,
+            ProgressWait::Notification);
+        observe_start();
         return true;
     }
 
     [[nodiscard]] auto make_stacks() noexcept -> bool {
         const myos_word_t count =
-            thread_count_ + 3 * VprocCount + EndpointActivations;
+            thread_count_ + 3 * VprocCount + EndpointActivations
+            + ChannelThreadCount;
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -487,14 +537,79 @@ private:
         return true;
     }
 
+    [[nodiscard]] auto make_channel() noexcept -> bool {
+        const auto created = myos::channel_create(
+            pool_, 1, MYOS_CHANNEL_MAX_WORDS, 1, MYOS_CHANNEL_MAX_RELATIONS);
+        if (created.status != MYOS_STATUS_OK
+            || created.value == 0 || created.value2 == 0
+            || !children_.add(created.value)
+            || !children_.add(created.value2)) {
+            return false;
+        }
+        const auto sender = myos::channel_mint(
+            created.value,
+            child_cspace_,
+            10,
+            MYOS_RIGHT_SEND | MYOS_RIGHT_CLOSE);
+        const auto sender_alt = myos::channel_mint(
+            created.value,
+            child_cspace_,
+            20,
+            MYOS_RIGHT_SEND | MYOS_RIGHT_CLOSE);
+        const auto receiver = myos::channel_mint(
+            created.value2,
+            child_cspace_,
+            30,
+            MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE);
+        if (sender.status != MYOS_STATUS_OK
+            || sender_alt.status != MYOS_STATUS_OK
+            || receiver.status != MYOS_STATUS_OK) {
+            return false;
+        }
+        shared_.store(ChannelSenderSlot, sender.value);
+        shared_.store(ChannelSenderAltSlot, sender_alt.value);
+        shared_.store(ChannelReceiverSlot, receiver.value);
+
+        const auto notify_r = myos::notification_create(
+            pool_, ChannelNotifyRBadge);
+        const auto notify_s = myos::notification_create(
+            pool_, ChannelNotifySBadge);
+        if (notify_r.status != MYOS_STATUS_OK
+            || notify_s.status != MYOS_STATUS_OK
+            || !children_.add(notify_r.value)
+            || !children_.add(notify_s.value)) {
+            return false;
+        }
+        const auto notify_r_child = myos::cap_delegate(
+            notify_r.value,
+            child_cspace_,
+            MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE
+                | MYOS_RIGHT_DUPLICATE);
+        const auto notify_s_child = myos::cap_delegate(
+            notify_s.value,
+            child_cspace_,
+            MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE
+                | MYOS_RIGHT_DUPLICATE);
+        if (notify_r_child.status != MYOS_STATUS_OK
+            || notify_s_child.status != MYOS_STATUS_OK) {
+            return false;
+        }
+        shared_.store(ChannelNotifyRSlot, notify_r_child.value);
+        shared_.store(ChannelNotifySSlot, notify_s_child.value);
+        return true;
+    }
+
     [[nodiscard]] auto make_vproc_runtime() noexcept -> bool {
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             myos_cap_t control_region{};
             myos_cap_t event_region{};
+            myos_cap_t ipc_region{};
             const myos_word_t control_address =
                 ControlAddress + index * VprocRuntimeStride;
             const myos_word_t event_address =
                 EventAddress + index * VprocRuntimeStride;
+            const myos_word_t ipc_address =
+                ChannelVprocIpcAddress + index * PageSize;
             if (!create_memory(
                     PageSize,
                     MYOS_VM_READ | MYOS_VM_WRITE,
@@ -503,6 +618,10 @@ private:
                     PageSize,
                     MYOS_VM_READ | MYOS_VM_WRITE,
                     event_memory_[index])
+                || !create_memory(
+                    PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE,
+                    ipc_memory_[index])
                 || !make_region(
                     child_vspace_,
                     control_address,
@@ -519,6 +638,14 @@ private:
                     MYOS_RIGHT_MAP,
                     event_region)
                 || !children_.add(event_region)
+                || !make_region(
+                    child_vspace_,
+                    ipc_address,
+                    PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE,
+                    MYOS_RIGHT_MAP,
+                    ipc_region)
+                || !children_.add(ipc_region)
                 || !map(
                     control_region,
                     control_memory_[index],
@@ -530,7 +657,13 @@ private:
                     event_memory_[index],
                     event_address,
                     PageSize,
-                    MYOS_VM_READ)) {
+                    MYOS_VM_READ)
+                || !map(
+                    ipc_region,
+                    ipc_memory_[index],
+                    ipc_address,
+                    PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE)) {
                 return false;
             }
         }
@@ -539,7 +672,8 @@ private:
 
     [[nodiscard]] auto make_executions(myos_word_t entry) noexcept -> bool {
         stage_ = 110;
-        myos_cap_t targets[MaxThreads + VprocCount]{};
+        myos_cap_t targets[
+            MaxThreads + ChannelThreadCount + VprocCount]{};
         myos_cap_t descriptors{};
         if (!create_memory(
                 PageSize, MYOS_VM_READ | MYOS_VM_WRITE, descriptors)
@@ -599,6 +733,28 @@ private:
             starts[index].ipc.address = stack_bases_[index];
             starts[index].ipc.pages = 1;
         }
+        const myos_word_t channel_stack_base =
+            thread_count_ + 3 * VprocCount + EndpointActivations;
+        for (myos_word_t index = 0; index < ChannelThreadCount; ++index) {
+            const myos_word_t descriptor_index = thread_count_ + index;
+            const myos_word_t stack_index = channel_stack_base + index;
+            starts[descriptor_index].version = MYOS_THREAD_START_VERSION;
+            starts[descriptor_index].flags = 0;
+            starts[descriptor_index].entry = entry;
+            starts[descriptor_index].stack = stack_tops_[stack_index];
+            starts[descriptor_index].arguments[0] = SharedAddress;
+            starts[descriptor_index].arguments[1] = index == 0
+                ? ChannelSenderMagic
+                : ChannelReceiverMagic;
+            starts[descriptor_index].arguments[2] = stack_bases_[stack_index];
+            for (myos_word_t argument = 3; argument < 6; ++argument) {
+                starts[descriptor_index].arguments[argument] = 0;
+            }
+            starts[descriptor_index].ipc.memory = stack_memory_[stack_index];
+            starts[descriptor_index].ipc.page = 0;
+            starts[descriptor_index].ipc.address = stack_bases_[stack_index];
+            starts[descriptor_index].ipc.pages = 1;
+        }
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             auto* const vproc_start =
                 reinterpret_cast<myos_vproc_start*>(
@@ -617,7 +773,8 @@ private:
                 : SourceVprocMagic;
             vproc_start->arguments[4] =
                 stack_tops_[thread_count_ + 3 * index + 1];
-            vproc_start->arguments[5] = 0;
+            vproc_start->arguments[5] =
+                ChannelVprocIpcAddress + index * PageSize;
             vproc_start->control_memory = control_memory_[index];
             vproc_start->control_page = 0;
             vproc_start->control_address =
@@ -626,6 +783,11 @@ private:
             vproc_start->event_page = 0;
             vproc_start->event_address =
                 EventAddress + index * VprocRuntimeStride;
+            vproc_start->ipc.memory = ipc_memory_[index];
+            vproc_start->ipc.page = 0;
+            vproc_start->ipc.address =
+                ChannelVprocIpcAddress + index * PageSize;
+            vproc_start->ipc.pages = 1;
 
             auto* const arm = reinterpret_cast<myos_vproc_arm*>(
                 SharedAddress + ArmDescriptorOffset
@@ -742,6 +904,38 @@ private:
             targets[index] = thread.value;
         }
 
+        for (myos_word_t index = 0; index < ChannelThreadCount; ++index) {
+            const myos_word_t step = 130 + index * 5;
+            const myos_word_t descriptor_index = thread_count_ + index;
+            stage_ = step;
+            const auto thread = myos::thread_create(
+                pool_, child_vspace_, child_cspace_, descriptors,
+                descriptor_index * sizeof(myos_thread_start));
+            if (thread.status != MYOS_STATUS_OK) {
+                return false;
+            }
+            stage_ = step + 1;
+            const myos_word_t home = index == 1 && thread_count_ > 1
+                ? 1
+                : 0;
+            const auto context = myos::sc_create(
+                pool_, domain_, 1'000'000, 10'000'000, 30, home);
+            if (context.status != MYOS_STATUS_OK) {
+                return false;
+            }
+            stage_ = step + 2;
+            if (!children_.add(thread.value)
+                || !children_.add(context.value)) {
+                return false;
+            }
+            stage_ = step + 3;
+            if (myos::sc_bind(context.value, thread.value).status
+                != MYOS_STATUS_OK) {
+                return false;
+            }
+            targets[descriptor_index] = thread.value;
+        }
+
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             stage_ = 140 + index * 5;
             myos::SysResult vproc{};
@@ -776,11 +970,11 @@ private:
                     != MYOS_STATUS_OK) {
                 return false;
             }
-            targets[thread_count_ + index] = vproc.value;
+            targets[thread_count_ + ChannelThreadCount + index] = vproc.value;
         }
 
         for (myos_word_t index = 0;
-             index < thread_count_ + VprocCount;
+             index < thread_count_ + ChannelThreadCount + VprocCount;
              ++index) {
             stage_ = 160 + index;
             if (myos::execution_start(targets[index]).status
@@ -789,6 +983,65 @@ private:
             }
         }
         return true;
+    }
+
+    void observe_start() noexcept {
+        const auto frequency = myos::clock_frequency();
+        const auto now = myos::clock_now();
+        if (frequency.status != MYOS_STATUS_OK
+            || now.status != MYOS_STATUS_OK || frequency.value == 0) {
+            return;
+        }
+        observe_frequency_ = frequency.value;
+        observe_last_tick_ = now.value;
+        observe_last_epoch_ = shared_.load(ProgressEpochSlot);
+        observe_hard_ticks_ = observe_frequency_ > max_word / 8
+            ? max_word : observe_frequency_ * 8;
+        observe_enabled_ = true;
+    }
+
+    [[nodiscard]] auto observe() noexcept -> bool {
+        if (!observe_enabled_) {
+            return true;
+        }
+        const auto now = myos::clock_now();
+        if (now.status != MYOS_STATUS_OK) {
+            return true;
+        }
+        const myos_word_t epoch = shared_.load(ProgressEpochSlot);
+        if (epoch != observe_last_epoch_) {
+            observe_last_epoch_ = epoch;
+            observe_last_tick_ = now.value;
+            return true;
+        }
+        if (now.value < observe_last_tick_
+            || now.value - observe_last_tick_ < observe_hard_ticks_) {
+            return true;
+        }
+
+        myos_word_t actor_code{};
+        myos_word_t best_sequence = max_word;
+        for (myos_word_t index = 0;
+             index < ProgressActorCount; ++index) {
+            ProgressSnapshot snapshot{};
+            const auto actor = static_cast<ProgressActor>(index);
+            if (!shared_.progress_read(actor, snapshot)) {
+                continue;
+            }
+            if (snapshot.wait != 0 && snapshot.sequence < best_sequence) {
+                best_sequence = snapshot.sequence;
+                actor_code = (index << 16)
+                    | ((snapshot.stage & 0xff) << 8)
+                    | (snapshot.wait & 0xff);
+            }
+        }
+        diagnostic_code_ = 0x4000'0000 | actor_code;
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::Failed,
+            ProgressWait::None,
+            diagnostic_code_);
+        return false;
     }
 
     [[nodiscard]] auto await_children() noexcept -> bool {
@@ -802,12 +1055,18 @@ private:
             if (all_ready) {
                 return shared_.load(EndpointResultSlot) == EndpointTransfer;
             }
+            if (!observe()) {
+                return false;
+            }
             myos::yield();
         }
     }
 
     [[nodiscard]] auto exercise_vproc() noexcept -> bool {
         while (shared_.load(VprocStateSlot) != VprocReady) {
+            if (!observe()) {
+                return false;
+            }
             myos::yield();
         }
         if (myos::notification_signal(vproc_notification_).status
@@ -816,6 +1075,9 @@ private:
         }
         const myos_word_t expected = VprocComplete | VprocBadge;
         while (shared_.load(VprocStateSlot) != expected) {
+            if (!observe()) {
+                return false;
+            }
             myos::yield();
         }
         while (shared_.load(ParkResultSlot) != ParkRejected
@@ -823,6 +1085,9 @@ private:
             || shared_.load(TunnelDeliveryCountSlot) < 2
             || shared_.load(TunnelSourceStateSlot)
                 != TunnelSecondInvoked) {
+            if (!observe()) {
+                return false;
+            }
             myos::yield();
         }
         // The target may acknowledge the second kernel publication before the
@@ -833,6 +1098,25 @@ private:
             && shared_.load(TunnelSourceSequenceSlot)
                 == shared_.load(TunnelTargetSequenceSlot)
             && shared_.load(TunnelHeartbeatSlot) != 0;
+    }
+
+    [[nodiscard]] auto await_channel() noexcept -> bool {
+        for (;;) {
+            const myos_word_t failure = shared_.load(ChannelFailureSlot);
+            if (failure == ChannelFailure) {
+                return false;
+            }
+            if (shared_.load(ChannelCompleteSlot) == ChannelComplete) {
+                return shared_.load(ChannelVprocSentSlot) == ChannelVprocSent
+                    && shared_.load(ChannelVprocDoneSlot) == ChannelVprocDone
+                    && shared_.load(ChannelSecondSentSlot) == ChannelSecondSent
+                    && shared_.load(ChannelDrainReceivedSlot) == ChannelReady;
+            }
+            if (!observe()) {
+                return false;
+            }
+            myos::yield();
+        }
     }
 
     [[nodiscard]] auto close_child() noexcept -> bool {
@@ -862,6 +1146,7 @@ private:
     myos_cap_t vproc_notification_{};
     myos_cap_t control_memory_[VprocCount]{};
     myos_cap_t event_memory_[VprocCount]{};
+    myos_cap_t ipc_memory_[VprocCount]{};
     myos_cap_t code_memory_{};
     myos_cap_t endpoint_ipc_memory_{};
     myos_word_t code_address_{};
@@ -874,6 +1159,12 @@ private:
     Handles children_{};
     bool closed_{};
     myos_word_t stage_{};
+    bool observe_enabled_{};
+    myos_word_t observe_frequency_{};
+    myos_word_t observe_last_tick_{};
+    myos_word_t observe_last_epoch_{};
+    myos_word_t observe_hard_ticks_{};
+    myos_word_t diagnostic_code_{};
 };
 
 } // namespace
@@ -898,5 +1189,5 @@ extern "C" void myos_main(
     Loader loader{*bootstrap, parent_pool};
     const bool complete = loader.run();
     loader.cleanup();
-    fault(complete ? SuccessFault : FailureFault + loader.stage());
+    fault(complete ? SuccessFault : FailureFault + loader.failure_code());
 }

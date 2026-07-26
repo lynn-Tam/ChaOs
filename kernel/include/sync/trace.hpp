@@ -52,6 +52,7 @@ enum class LockClass : u8 {
     NotificationSource,
     Notification,
     Tunnel,
+    Channel,
 #if MYOS_LOCK_PROBE
     ProbeA,
     ProbeB,

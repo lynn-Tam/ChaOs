@@ -42,10 +42,273 @@ using namespace myos::proof;
     myos::exit();
 }
 
+[[noreturn]] void channel_fail(const Shared& shared) noexcept {
+    shared.store(ChannelFailureSlot, ChannelFailure);
+    fail();
+}
+
+[[noreturn]] void channel_sender_task(
+    myos_word_t shared_address,
+    myos_word_t ipc_address) noexcept {
+    const Shared shared{shared_address};
+    auto* const message = reinterpret_cast<myos_channel_message*>(ipc_address);
+    if (!shared || message == nullptr) {
+        fail();
+    }
+    shared.progress(
+        ProgressActor::Sender,
+        ProgressStage::Boot,
+        ProgressWait::ChannelReady);
+    while (shared.load(ChannelReadySlot) != ChannelReady) {
+        myos::yield();
+    }
+
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x1001;
+    message->tag = 0x5345'4e44'0001;
+    message->word_count = 1;
+    message->words[0] = 0x1111;
+    message->cap_count = 1;
+    message->caps[0].source = shared.load(ChannelNotifyRSlot);
+    message->caps[0].rights = MYOS_RIGHT_SIGNAL;
+    message->caps[0].operation = MYOS_CAP_COPY;
+    if (myos::channel_send(shared.load(ChannelSenderSlot)).status
+        != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelFirstSentSlot, ChannelFirstSent);
+    shared.progress(
+        ProgressActor::Sender,
+        ProgressStage::FirstSend,
+        ProgressWait::FirstReceive);
+
+    while (shared.load(ChannelFirstReceivedSlot) != ChannelFirstReceived) {
+        myos::yield();
+    }
+
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x2001;
+    message->tag = 0x5345'4e44'0002;
+    message->word_count = 1;
+    message->words[0] = 0x2221;
+    if (myos::channel_try_send(shared.load(ChannelSenderSlot)).status
+        != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelBlockedSlot, ChannelBlocked);
+    shared.progress(
+        ProgressActor::Sender,
+        ProgressStage::QueueFull,
+        ProgressWait::Space);
+
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x2002;
+    message->tag = 0x5345'4e44'0003;
+    message->word_count = 1;
+    message->words[0] = 0x2222;
+    if (myos::channel_send(shared.load(ChannelSenderAltSlot)).status
+        != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelSecondSentSlot, ChannelSecondSent);
+    shared.progress(ProgressActor::Sender, ProgressStage::BlockingSend);
+
+    while (shared.load(ChannelClosedSlot) != ChannelClosed) {
+        myos::yield();
+    }
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x3001;
+    if (myos::channel_try_send(shared.load(ChannelSenderSlot)).status
+        != MYOS_STATUS_PEER_CLOSED) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelCompleteSlot, ChannelComplete);
+    shared.progress(ProgressActor::Sender, ProgressStage::Complete);
+    for (;;) {
+        myos::yield();
+    }
+}
+
+[[noreturn]] void channel_receiver_task(
+    myos_word_t shared_address,
+    myos_word_t ipc_address) noexcept {
+    const Shared shared{shared_address};
+    auto* const message = reinterpret_cast<myos_channel_message*>(ipc_address);
+    if (!shared || message == nullptr) {
+        fail();
+    }
+
+    const auto readable = myos::channel_bind(
+        shared.load(ChannelReceiverSlot),
+        shared.load(ChannelNotifyRSlot),
+        MYOS_CHANNEL_READABLE);
+    const auto readable_second = myos::channel_bind(
+        shared.load(ChannelReceiverSlot),
+        shared.load(ChannelNotifySSlot),
+        MYOS_CHANNEL_READABLE);
+    if (readable.status != MYOS_STATUS_OK
+        || readable_second.status != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelRelationRSlot, readable.value);
+    shared.store(ChannelRelationSSlot, readable_second.value);
+    shared.progress(ProgressActor::Receiver, ProgressStage::ChannelBound);
+    shared.store(ChannelReadySlot, ChannelReady);
+    shared.progress(
+        ProgressActor::Receiver,
+        ProgressStage::ChannelBound,
+        ProgressWait::FirstReceive);
+
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->receive_limit = 1;
+    if (myos::channel_recv(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_OK
+        || message->transaction != 0x1001
+        || message->tag != 0x5345'4e44'0001
+        || message->word_count != 1 || message->words[0] != 0x1111
+        || message->cap_count != 1 || message->received_count != 1
+        || message->sender_badge != 10 || message->received[0] == 0) {
+        channel_fail(shared);
+    }
+    shared.progress(ProgressActor::Receiver, ProgressStage::FirstReceive);
+    const auto first_r = myos::notification_take(
+        shared.load(ChannelNotifyRSlot));
+    const auto first_s = myos::notification_take(
+        shared.load(ChannelNotifySSlot));
+    if (first_r.status != MYOS_STATUS_OK
+        || first_r.value != ChannelNotifyRBadge
+        || first_s.status != MYOS_STATUS_OK
+        || first_s.value != ChannelNotifySBadge
+        || myos::notification_signal(message->received[0]).status
+            != MYOS_STATUS_OK
+        || myos::notification_take(shared.load(ChannelNotifyRSlot)).status
+            != MYOS_STATUS_OK
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationRSlot), message->sequence).status
+            != MYOS_STATUS_OK
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationSSlot), message->sequence).status
+            != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelFirstReceivedSlot, ChannelFirstReceived);
+    shared.progress(
+        ProgressActor::Receiver,
+        ProgressStage::FirstReceive,
+        ProgressWait::Space);
+
+    while (shared.load(ChannelBlockedSlot) != ChannelBlocked) {
+        myos::yield();
+    }
+    for (myos_word_t index = 0; index < 64; ++index) {
+        myos::yield();
+    }
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    if (myos::channel_recv(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_OK
+        || message->transaction != 0x2001
+        || message->sender_badge != 10
+        || myos::notification_take(shared.load(ChannelNotifyRSlot)).status
+            != MYOS_STATUS_OK
+        || myos::notification_take(shared.load(ChannelNotifySSlot)).status
+            != MYOS_STATUS_OK
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationRSlot), message->sequence).status
+            != MYOS_STATUS_OK
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationSSlot), message->sequence).status
+            != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.progress(ProgressActor::Receiver, ProgressStage::SecondReceive);
+
+    shared.progress(
+        ProgressActor::Receiver,
+        ProgressStage::SecondReceive,
+        ProgressWait::Space);
+    const auto next = myos::notification_wait(
+        shared.load(ChannelNotifyRSlot));
+    const auto next_s = myos::notification_take(
+        shared.load(ChannelNotifySSlot));
+    if (next.status != MYOS_STATUS_OK
+        || (next.value & ChannelNotifyRBadge) == 0
+        || next_s.status != MYOS_STATUS_OK
+        || next_s.value != ChannelNotifySBadge) {
+        channel_fail(shared);
+    }
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    if (myos::channel_try_recv(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_OK
+        || message->transaction != 0x2002
+        || message->sender_badge != 20
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationRSlot), message->sequence).status
+            != MYOS_STATUS_OK
+        || myos::channel_arm(
+               shared.load(ChannelReceiverSlot),
+               shared.load(ChannelRelationSSlot), message->sequence).status
+            != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelVprocBindSlot, ChannelReady);
+    shared.progress(
+        ProgressActor::Receiver,
+        ProgressStage::BindRequested,
+        ProgressWait::VprocReady);
+    while (shared.load(ChannelVprocReadySlot) != ChannelVprocReady) {
+        myos::yield();
+    }
+    shared.store(ChannelVprocGoSlot, ChannelReady);
+    shared.progress(
+        ProgressActor::Receiver,
+        ProgressStage::GoPublished,
+        ProgressWait::VprocEvent);
+    while (shared.load(ChannelVprocDoneSlot) != ChannelVprocDone) {
+        myos::yield();
+    }
+    while (shared.load(ChannelDrainSentSlot) != ChannelReady) {
+        myos::yield();
+    }
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    if (myos::channel_close(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    if (myos::channel_try_recv(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_OK
+        || message->transaction != 0x5001
+        || message->sender_badge != 10) {
+        channel_fail(shared);
+    }
+    shared.store(ChannelDrainReceivedSlot, ChannelReady);
+    shared.store(ChannelClosedSlot, ChannelClosed);
+    shared.progress(ProgressActor::Receiver, ProgressStage::Complete);
+    for (;;) {
+        myos::yield();
+    }
+}
+
 [[noreturn]] void target_task(
     myos_word_t notification,
     myos_word_t shared_address) noexcept {
     const Shared shared{shared_address};
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::Boot,
+        ProgressWait::Notification);
     // Vproc has no kernel-owned blocking continuation. The common syscall
     // policy must reject Endpoint call before touching Endpoint admission.
     if (myos::endpoint_call(shared.load(EndpointSlot)).status
@@ -79,6 +342,31 @@ using namespace myos::proof;
         static_cast<void>(shared.add_relaxed(TunnelHeartbeatSlot));
         myos::yield();
     }
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::BindRequested,
+        ProgressWait::ChannelBind);
+
+    // Channel readiness is a second receiver on ChannelNotifyR, not a
+    // replacement for the ordinary Vproc notification.  The receiver
+    // publishes the dependency first; this lane commits the binding and only
+    // then releases the receiver to publish ChannelVprocGo.
+    while (shared.load(ChannelVprocBindSlot) != ChannelReady) {
+        myos::yield();
+    }
+    const auto channel_bound = myos::notification_bind_vproc(
+        shared.load(ChannelNotifyRSlot),
+        ChannelVprocIngress,
+        ChannelVprocTag);
+    if (channel_bound.status != MYOS_STATUS_OK) {
+        fail();
+    }
+    shared.progress(ProgressActor::TargetVproc, ProgressStage::BindCommitted);
+    shared.store(ChannelVprocReadySlot, ChannelVprocReady);
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::ReadyPublished,
+        ProgressWait::Tunnel);
 
     // Producer-before-park: take an empty checkpoint, prevent upcalls, then
     // let the source publish.  Park must reject the stale observation instead
@@ -100,6 +388,11 @@ using namespace myos::proof;
         fail();
     }
     shared.store(ParkResultSlot, ParkRejected);
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::VprocDone,
+        ProgressWait::VprocEvent,
+        ParkRejected);
     libk::AtomicRef{control->upcall_disable_depth}
         .store<libk::MemoryOrder::Release>(0);
     if (myos::vproc_checkpoint().status != MYOS_STATUS_OK) {
@@ -126,6 +419,11 @@ using namespace myos::proof;
         fail();
     }
     shared.store(ParkWakeSlot, ParkCommitted);
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::Complete,
+        ProgressWait::VprocEvent,
+        ParkCommitted);
     libk::AtomicRef{control->upcall_disable_depth}
         .store<libk::MemoryOrder::Release>(0);
     if (myos::vproc_checkpoint().status != MYOS_STATUS_OK) {
@@ -140,9 +438,17 @@ using namespace myos::proof;
 }
 
 [[noreturn]] void source_task(
-    myos_word_t,
+    myos_word_t ipc_address,
     myos_word_t shared_address) noexcept {
     const Shared shared{shared_address};
+    auto* const message = reinterpret_cast<myos_channel_message*>(ipc_address);
+    if (!shared || message == nullptr) {
+        fail();
+    }
+    shared.progress(
+        ProgressActor::SourceVproc,
+        ProgressStage::Boot,
+        ProgressWait::VprocReady);
     shared.store(TunnelSourceStateSlot, TunnelSourceReady);
     while (shared.load(VprocStateSlot) != (VprocComplete | VprocBadge)
         || shared.load(TunnelHeartbeatSlot) == 0) {
@@ -163,6 +469,29 @@ using namespace myos::proof;
         fail();
     }
 
+    while (shared.load(ChannelVprocGoSlot) != ChannelReady) {
+        myos::yield();
+    }
+    shared.progress(
+        ProgressActor::SourceVproc,
+        ProgressStage::GoPublished,
+        ProgressWait::ChannelGo);
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x4001;
+    message->tag = ChannelVprocTag;
+    message->word_count = 1;
+    message->words[0] = 0x4441;
+    if (myos::channel_try_send(shared.load(ChannelSenderSlot)).status
+        != MYOS_STATUS_OK) {
+        fail();
+    }
+    shared.store(ChannelVprocSentSlot, ChannelVprocSent);
+    shared.progress(
+        ProgressActor::SourceVproc,
+        ProgressStage::VprocSend,
+        ProgressWait::Tunnel);
+
     while (shared.load(ParkProbeSlot) != TunnelFirstReady) {
         myos::yield();
     }
@@ -177,10 +506,33 @@ using namespace myos::proof;
     }
     shared.store(TunnelSourceSequenceSlot, second.value);
     shared.store(TunnelSourceStateSlot, TunnelFirstInvoked);
+    shared.progress(
+        ProgressActor::SourceVproc,
+        ProgressStage::VprocDone,
+        ProgressWait::Tunnel,
+        TunnelFirstInvoked);
     while (shared.load(TunnelDeliveryCountSlot) < 1
         || shared.load(ParkProbeSlot) != TunnelSecondReady) {
         myos::yield();
     }
+
+    while (shared.load(ChannelVprocDoneSlot) != ChannelVprocDone) {
+        myos::yield();
+    }
+    *message = {};
+    message->version = MYOS_CHANNEL_VERSION;
+    message->transaction = 0x5001;
+    message->tag = 0x5345'4e44'0005;
+    message->word_count = 1;
+    message->words[0] = 0x5551;
+    // Vproc lanes never enter the kernel's blocking Wait path; the queue is
+    // empty after the first Vproc message was consumed, so a retryable send is
+    // the correct non-blocking drain publication.
+    if (myos::channel_try_send(shared.load(ChannelSenderSlot)).status
+        != MYOS_STATUS_OK) {
+        fail();
+    }
+    shared.store(ChannelDrainSentSlot, ChannelReady);
 
     // Give the target a scheduling boundary after it publishes the marker.
     // This is required only by the confirmatory test, not by the park ABI.
@@ -194,6 +546,11 @@ using namespace myos::proof;
     }
     shared.store(TunnelSourceSequenceSlot, wake.value);
     shared.store(TunnelSourceStateSlot, TunnelSecondInvoked);
+    shared.progress(
+        ProgressActor::SourceVproc,
+        ProgressStage::Complete,
+        ProgressWait::None,
+        TunnelSecondInvoked);
     for (;;) {
         myos::yield();
     }
@@ -241,6 +598,38 @@ using namespace myos::proof;
         }
         shared.store(VprocKeySlot, sequence);
         shared.store(VprocStateSlot, VprocComplete | completed.value);
+    }
+    if ((notification_mask
+            & (uint64_t{1} << ChannelVprocIngress)) != 0) {
+        const uint64_t sequence = libk::AtomicRef{
+            events->notification_sequence[ChannelVprocIngress]}
+                .load<libk::MemoryOrder::Acquire>();
+        const myos_word_t tag = libk::AtomicRef{
+            events->notification_tag[ChannelVprocIngress]}
+                .load<libk::MemoryOrder::Acquire>();
+        const auto taken = myos::notification_take(
+            shared.load(ChannelNotifyRSlot));
+        auto* const message = reinterpret_cast<myos_channel_message*>(
+            ChannelVprocIpcAddress + TargetVproc * PageSize);
+        *message = {};
+        message->version = MYOS_CHANNEL_VERSION;
+        if (sequence == 0 || tag != ChannelVprocTag
+            || taken.status != MYOS_STATUS_OK
+            || (taken.value & ChannelNotifyRBadge) == 0
+            || myos::channel_try_recv(shared.load(ChannelReceiverSlot)).status
+                != MYOS_STATUS_OK
+            || message->transaction != 0x4001
+            || message->tag != ChannelVprocTag
+            || message->word_count != 1 || message->words[0] != 0x4441
+            || message->sender_badge != 10) {
+            fail();
+        }
+        shared.store(ChannelVprocDoneSlot, ChannelVprocDone);
+        shared.progress(
+            ProgressActor::TargetVproc,
+            ProgressStage::VprocDone,
+            ProgressWait::Tunnel,
+            sequence);
     }
     if ((ingress_mask & (uint64_t{1} << TunnelIngressSlot)) != 0) {
         const uint64_t bit = uint64_t{1} << TunnelIngressSlot;
@@ -291,7 +680,15 @@ extern "C" void myos_main(
     myos_word_t vproc_shared,
     myos_word_t vproc_magic,
     myos_word_t vproc_task_stack,
-    myos_word_t) noexcept {
+    myos_word_t vproc_ipc) noexcept {
+    if (bootstrap_address == SharedAddress
+        && (bootstrap_size == ChannelSenderMagic
+            || bootstrap_size == ChannelReceiverMagic)) {
+        if (bootstrap_size == ChannelSenderMagic) {
+            channel_sender_task(SharedAddress, vproc_shared);
+        }
+        channel_receiver_task(SharedAddress, vproc_shared);
+    }
     if (bootstrap_address == EndpointAbortMagic) {
         (void)myos::endpoint_abort(EndpointAbortDetail);
         fail();
@@ -327,6 +724,7 @@ extern "C" void myos_main(
     if (vproc_task_stack != 0
         && (vproc_magic == VprocMagic
             || vproc_magic == SourceVprocMagic)) {
+        const Shared shared{SharedAddress};
         for (;;) {
             const auto armed = myos::vproc_arm(
                 bootstrap_address, bootstrap_size);
@@ -339,7 +737,6 @@ extern "C" void myos_main(
             }
             myos::yield();
         }
-        const Shared shared{SharedAddress};
         if (vproc_magic == VprocMagic) {
             myos::user_enter(
                 &target_task,
@@ -350,7 +747,7 @@ extern "C" void myos_main(
         myos::user_enter(
             &source_task,
             vproc_task_stack,
-            0,
+            vproc_ipc,
             SharedAddress);
     }
     if (bootstrap_address != 0 && bootstrap_size != 0

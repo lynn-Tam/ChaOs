@@ -55,6 +55,16 @@ constexpr Rights endpoint_rights = Rights::of(
     Right::Destroy,
     Right::Revoke);
 
+constexpr Rights channel_rights = Rights::of(
+    Right::Duplicate,
+    Right::Delegate,
+    Right::Inspect,
+    Right::Send,
+    Right::Receive,
+    Right::Close,
+    Right::Destroy,
+    Right::Revoke);
+
 [[nodiscard]] auto valid(MemoryAuthority authority) noexcept -> bool {
     return authority.range.end().has_value()
         && kernel::mm::valid_access(authority.access)
@@ -81,6 +91,16 @@ constexpr Rights endpoint_rights = Rights::of(
 [[nodiscard]] auto valid(EndpointAuthority authority) noexcept -> bool {
     return (authority.badge & ~authority.fixed) == 0
         && authority.cap_limit <= MYOS_ENDPOINT_MAX_CAPS;
+}
+
+[[nodiscard]] auto valid(ChannelAuthority authority) noexcept -> bool {
+    const bool side = authority.side == ChannelSide::A
+        || authority.side == ChannelSide::B
+        || authority.side == ChannelSide::Any;
+    const bool unbound = authority.fixed == 0 && authority.badge == 0;
+    const bool exact = authority.fixed == ~u64{} && authority.badge != 0;
+    return side && (unbound || exact)
+        && (authority.side != ChannelSide::Any || unbound);
 }
 
 template<object::ObjectKind Kind>
@@ -250,6 +270,43 @@ auto CapabilityPolicy<object::ObjectKind::Endpoint>::compose(
         ceiling.rights.intersect(view.rights), *local});
 }
 
+auto CapabilityPolicy<object::ObjectKind::Channel>::validate(
+    GrantCeiling ceiling) noexcept -> bool {
+    const auto* const data = libk::get_if<ChannelAuthority>(&ceiling.data);
+    return channel_rights.contains(ceiling.rights)
+        && data != nullptr && valid(*data);
+}
+
+auto CapabilityPolicy<object::ObjectKind::Channel>::compose(
+    GrantCeiling ceiling,
+    CapView view) noexcept
+    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    if (!channel_rights.contains(ceiling.rights)
+        || !channel_rights.contains(view.rights)) {
+        return libk::unexpected(PolicyError::InvalidRights);
+    }
+    const auto* const upper = libk::get_if<ChannelAuthority>(&ceiling.data);
+    const auto* const local = libk::get_if<ChannelAuthority>(&view.data);
+    if (upper == nullptr || local == nullptr
+        || !valid(*upper) || !valid(*local)) {
+        return libk::unexpected(PolicyError::InvalidData);
+    }
+    if (!ceiling.rights.contains(view.rights)) {
+        return libk::unexpected(PolicyError::Amplification);
+    }
+    const bool same_side = upper->side == local->side;
+    const bool root_issuer = upper->side == ChannelSide::Any
+        && upper->unbound();
+    if ((!root_issuer && !same_side)
+        || (upper->unbound() && !local->unbound())
+        || (upper->exact() && *upper != *local)
+        || (root_issuer && local->side == ChannelSide::Any)) {
+        return libk::unexpected(PolicyError::Amplification);
+    }
+    return libk::expected(EffectiveAuthority{
+        ceiling.rights.intersect(view.rights), *local});
+}
+
 auto validate_ceiling(
     object::ObjectKind kind,
     GrantCeiling ceiling) noexcept -> bool {
@@ -281,6 +338,8 @@ auto validate_ceiling(
         return CapabilityPolicy<object::ObjectKind::Tunnel>::validate(ceiling);
     case object::ObjectKind::Endpoint:
         return CapabilityPolicy<object::ObjectKind::Endpoint>::validate(ceiling);
+    case object::ObjectKind::Channel:
+        return CapabilityPolicy<object::ObjectKind::Channel>::validate(ceiling);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return false;
@@ -316,6 +375,8 @@ auto compose(
         return compose_as<object::ObjectKind::Tunnel>(ceiling, view);
     case object::ObjectKind::Endpoint:
         return compose_as<object::ObjectKind::Endpoint>(ceiling, view);
+    case object::ObjectKind::Channel:
+        return compose_as<object::ObjectKind::Channel>(ceiling, view);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return libk::unexpected(PolicyError::UnsupportedKind);

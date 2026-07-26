@@ -1,6 +1,7 @@
 #pragma once
 
 #include <uapi/capability.h>
+#include <uapi/channel.h>
 #include <uapi/endpoint.h>
 #include <uapi/resource.h>
 #include <uapi/status.h>
@@ -237,6 +238,81 @@ inline void yield() noexcept {
 [[nodiscard]] inline auto endpoint_close(myos_cap_t endpoint) noexcept
     -> SysResult {
     return syscall(MYOS_SYS_ENDPOINT_CLOSE, endpoint);
+}
+
+[[nodiscard]] inline auto channel_create(
+    myos_cap_t pool,
+    myos_word_t queue_capacity,
+    myos_word_t max_words,
+    myos_word_t max_caps,
+    myos_word_t relation_capacity) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_CHANNEL_CREATE,
+        pool,
+        queue_capacity,
+        max_words,
+        max_caps,
+        relation_capacity);
+}
+
+[[nodiscard]] inline auto channel_try_send(myos_cap_t channel) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_TRY_SEND, channel);
+}
+
+[[nodiscard]] inline auto channel_try_recv(myos_cap_t channel) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_TRY_RECV, channel);
+}
+
+[[nodiscard]] inline auto channel_send(myos_cap_t channel) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_SEND, channel);
+}
+
+[[nodiscard]] inline auto channel_recv(myos_cap_t channel) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_RECV, channel);
+}
+
+[[nodiscard]] inline auto channel_close(myos_cap_t channel) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_CLOSE, channel);
+}
+
+[[nodiscard]] inline auto channel_bind(
+    myos_cap_t channel,
+    myos_cap_t notification,
+    myos_word_t condition) noexcept -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_BIND, channel, notification, condition);
+}
+
+[[nodiscard]] inline auto channel_arm(
+    myos_cap_t channel,
+    myos_word_t relation,
+    myos_word_t observed) noexcept -> SysResult {
+    return syscall(MYOS_SYS_CHANNEL_ARM, channel, relation, observed);
+}
+
+[[nodiscard]] inline auto channel_mint(
+    myos_cap_t root,
+    myos_cap_t destination_cspace,
+    myos_word_t badge,
+    myos_word_t rights) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_CHANNEL_MINT,
+        root,
+        destination_cspace,
+        badge,
+        rights);
+}
+
+[[nodiscard]] inline auto clock_now() noexcept -> SysResult {
+    return syscall(MYOS_SYS_CLOCK_NOW);
+}
+
+[[nodiscard]] inline auto clock_frequency() noexcept -> SysResult {
+    return syscall(MYOS_SYS_CLOCK_FREQUENCY);
 }
 
 [[nodiscard]] inline auto vproc_create(

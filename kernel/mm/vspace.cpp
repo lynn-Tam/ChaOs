@@ -481,9 +481,10 @@ void VSpace::retire(object::ObjectCleanup&& cleanup) noexcept {
     if (can_start) {
         static_cast<void>(start_region_destroy(
             VmContext{.local = kernel::CpuId{0}},
-            *root_region_,
+            RegionKey{},
             false,
-            PendingKind::Retire));
+            PendingKind::Retire,
+            true));
     } else {
         schedule_work();
     }

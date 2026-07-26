@@ -17,6 +17,7 @@ enum class ObjectKind : u16 {
     Vproc,
     Tunnel,
     Endpoint,
+    Channel,
     Count,
 };
 

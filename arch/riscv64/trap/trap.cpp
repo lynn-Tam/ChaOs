@@ -44,13 +44,15 @@ extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
     arch::TrapContext context = arch::riscv64::make_context(*frame);
     if constexpr (kernel::sync::lock_verify) {
         kernel::sync::trap_exiting();
-    }
-    kernel::trap::on_exit(context);
-    if constexpr (kernel::sync::lock_verify) {
         kernel::sync::assert_no_locks();
+        // The trap's CPU-local diagnostic frame must be retired before
+        // on_exit may dispatch another execution.  A scheduler switch can
+        // return through this hook much later; keeping the old frame live
+        // would make unrelated user traps look recursively nested.
         kernel::sync::trap_exit(
             kernel::sync::lock_profile ? arch::read_clock().ticks() : 0);
     }
+    kernel::trap::on_exit(context);
     return arch::riscv64::raw_frame(context.frame());
 }
 

@@ -2,13 +2,31 @@
 
 #include "kernel/syscall/internal.hpp"
 
+#include <core/kernel_state.hpp>
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/limits.hpp>
+#include <uapi/syscall.h>
 
 namespace kernel::syscall {
+
+auto handle_clock(
+    usize operation,
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    switch (operation) {
+    case MYOS_SYS_CLOCK_NOW:
+        return returned(MYOS_STATUS_OK, kernel->clock().now().ticks());
+    case MYOS_SYS_CLOCK_FREQUENCY:
+        return returned(
+            MYOS_STATUS_OK, kernel->clock().ticks_per_second());
+    default:
+        return returned(MYOS_STATUS_INVALID_OP);
+    }
+}
 
 auto cap_status(cap::CSpaceError error) noexcept -> myos_status_t {
     switch (error) {

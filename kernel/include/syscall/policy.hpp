@@ -73,6 +73,8 @@ struct Policy final {
     case MYOS_SYS_RESOURCE_CLOSE:
     case MYOS_SYS_NOTIFICATION_WAIT:
     case MYOS_SYS_ENDPOINT_CALL:
+    case MYOS_SYS_CHANNEL_SEND:
+    case MYOS_SYS_CHANNEL_RECV:
         return {Continuation::ThreadBlocking, TargetMask::Thread,
             LocusMask::Thread};
     case MYOS_SYS_VPROC_RETURN:
@@ -123,11 +125,20 @@ struct Policy final {
     case MYOS_SYS_NOTIFICATION_CREATE:
     case MYOS_SYS_VPROC_CREATE:
     case MYOS_SYS_ENDPOINT_CREATE:
+    case MYOS_SYS_CHANNEL_CREATE:
     case MYOS_SYS_MEMORY_SEAL:
     case MYOS_SYS_NOTIFICATION_SIGNAL:
     case MYOS_SYS_NOTIFICATION_TAKE:
     case MYOS_SYS_ENDPOINT_CLOSE:
     case MYOS_SYS_ENDPOINT_MINT:
+    case MYOS_SYS_CHANNEL_TRY_SEND:
+    case MYOS_SYS_CHANNEL_TRY_RECV:
+    case MYOS_SYS_CHANNEL_CLOSE:
+    case MYOS_SYS_CHANNEL_BIND:
+    case MYOS_SYS_CHANNEL_ARM:
+    case MYOS_SYS_CHANNEL_MINT:
+    case MYOS_SYS_CLOCK_NOW:
+    case MYOS_SYS_CLOCK_FREQUENCY:
         return {Continuation::Immediate, TargetMask::Both, LocusMask::All};
     case MYOS_SYS_TUNNEL_OPEN:
         return {Continuation::Immediate, TargetMask::Vproc,

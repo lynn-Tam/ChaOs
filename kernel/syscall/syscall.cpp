@@ -66,7 +66,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_VM_DESTROY_REGION) {
         outcome = handle_vm(operation, invocation);
     } else if (operation >= MYOS_SYS_RESOURCE_CREATE_CHILD
-        && operation <= MYOS_SYS_ENDPOINT_CREATE) {
+        && operation <= MYOS_SYS_CHANNEL_CREATE) {
         outcome = handle_construction(operation, invocation);
     } else if (operation >= MYOS_SYS_MEMORY_SEAL
         && operation <= MYOS_SYS_RESOURCE_CLOSE) {
@@ -83,6 +83,12 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_ENDPOINT_CALL
         && operation <= MYOS_SYS_ENDPOINT_ABORT) {
         outcome = handle_endpoint(operation, invocation);
+    } else if (operation >= MYOS_SYS_CHANNEL_TRY_SEND
+        && operation <= MYOS_SYS_CHANNEL_MINT) {
+        outcome = handle_channel(operation, invocation);
+    } else if (operation >= MYOS_SYS_CLOCK_NOW
+        && operation <= MYOS_SYS_CLOCK_FREQUENCY) {
+        outcome = handle_clock(operation, invocation);
     } else {
         outcome = returned(MYOS_STATUS_INVALID_OP);
     }

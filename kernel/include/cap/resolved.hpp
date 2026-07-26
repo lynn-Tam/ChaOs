@@ -57,6 +57,15 @@ public:
         return lease_.derive_tunnel_tx(
             libk::move(charge), libk::move(target), ceiling, proof);
     }
+    [[nodiscard]] auto derive_channel_badge(
+        kernel::resource::Reservation&& charge,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling,
+        ChannelBadgeDerivation proof) const noexcept
+        -> libk::Expected<GrantRef, GrantError> {
+        return lease_.derive_channel_badge(
+            libk::move(charge), libk::move(target), ceiling, proof);
+    }
     [[nodiscard]] auto source() const noexcept -> CSpace& { return *source_; }
 
 private:

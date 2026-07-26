@@ -27,6 +27,7 @@ enum class Right : u64 {
     Connect = u64{1} << 17,
     Ack = u64{1} << 18,
     Call = u64{1} << 19,
+    Send = u64{1} << 20,
 };
 
 class Rights final {
@@ -56,7 +57,7 @@ public:
     [[nodiscard]] constexpr auto raw() const noexcept -> u64 { return bits_; }
     [[nodiscard]] static constexpr auto from_raw(u64 bits) noexcept
         -> libk::optional<Rights> {
-        constexpr u64 valid = (u64{1} << 20) - 1;
+        constexpr u64 valid = (u64{1} << 21) - 1;
         return (bits & ~valid) == 0
             ? libk::optional<Rights>{Rights{bits}}
             : libk::nullopt;

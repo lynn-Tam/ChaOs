@@ -29,3 +29,4 @@ typedef uint64_t myos_cap_t;
 #define MYOS_RIGHT_CONNECT       (MYOS_U64_C(1) << 17)
 #define MYOS_RIGHT_ACK           (MYOS_U64_C(1) << 18)
 #define MYOS_RIGHT_CALL          (MYOS_U64_C(1) << 19)
+#define MYOS_RIGHT_SEND          (MYOS_U64_C(1) << 20)

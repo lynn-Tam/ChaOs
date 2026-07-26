@@ -372,18 +372,29 @@ void VSpace::dismantle_region(
 
 auto VSpace::start_region_destroy(
     VmContext context,
-    AddressRegion& region,
+    RegionKey key,
     bool remove_root,
-    PendingKind kind) noexcept
+    PendingKind kind,
+    bool root_target) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
     kernel::sync::IrqLockToken lock{lock_};
+    // Resolve the target only while the VSpace transaction lock is held.  A
+    // RegionKey is generation-stable across the unlocked admission window;
+    // the internal root is re-read here instead of being handed across that
+    // window as a raw pointer.
+    AddressRegion* const region = root_target
+        ? root_region_
+        : regions_.find(key.node);
     const bool permitted_state = state_ == VSpaceState::Live
         || (state_ == VSpaceState::Stopping && !remove_root);
+    if (region == nullptr || (!root_target && region->key_ != key)) {
+        return libk::unexpected(VSpaceError::InvalidRegion);
+    }
     if (!permitted_state
         || pending_kind_ != PendingKind::None
         || claim_.region != nullptr
-        || region.state_ == RegionState::Dead
-        || (remove_root && &region == root_region_)) {
+        || region->state_ == RegionState::Dead
+        || (remove_root && region == root_region_)) {
         return libk::unexpected(VSpaceError::Busy);
     }
     auto mutation = coherence_.begin();
@@ -395,11 +406,11 @@ auto VSpace::start_region_destroy(
         mutation.value().abort();
         return libk::unexpected(plan.error());
     }
-    region.state_ = RegionState::Retiring;
+    region->state_ = RegionState::Retiring;
     pending_kind_ = kind;
     auto& retire = retire_batch_.emplace(*pmm_);
     arch::PageEditor editor = arch::PageEditor::user(*root_);
-    dismantle_region(region, editor, retire, remove_root);
+    dismantle_region(*region, editor, retire, remove_root);
     if (pending_pages_ == nullptr) {
         mutation.value().abort();
         retire_batch_.reset();
@@ -420,20 +431,8 @@ auto VSpace::start_region_destroy(
 auto VSpace::destroy_region(
     VmContext context,
     RegionKey key) noexcept -> libk::Expected<VmStatus, VSpaceError> {
-    AddressRegion* region{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        region = regions_.find(key.node);
-        if (state_ != VSpaceState::Live
-            || region == nullptr
-            || region->key_ != key
-            || region == root_region_
-            || region->state_ != RegionState::Live) {
-            return libk::unexpected(VSpaceError::InvalidRegion);
-        }
-    }
     return start_region_destroy(
-        context, *region, true, PendingKind::DestroyRegion);
+        context, key, true, PendingKind::DestroyRegion);
 }
 
 } // namespace kernel::mm

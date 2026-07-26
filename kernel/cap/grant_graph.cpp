@@ -1,6 +1,7 @@
 #include <cap/grant_graph.hpp>
 
 #include <object/tunnel_pool.hpp>
+#include <object/channel_pool.hpp>
 
 #include <cap/policy.hpp>
 #include <core/debug.hpp>
@@ -56,6 +57,16 @@ auto GrantAttachment::attached() const noexcept -> bool {
 
 auto GrantAttachment::busy() const noexcept -> bool {
     return work_.load<libk::MemoryOrder::Acquire>() != 0;
+}
+
+void GrantAttachment::reset() noexcept {
+    KASSERT(graph_ == nullptr && node_ == nullptr);
+    KASSERT(work_.load<libk::MemoryOrder::Acquire>() == 0);
+    const State current = static_cast<State>(
+        state_.load<libk::MemoryOrder::Acquire>());
+    KASSERT(current == State::Detached || current == State::Idle);
+    state_.store<libk::MemoryOrder::Release>(
+        static_cast<u8>(State::Idle));
 }
 
 auto GrantAttachment::detach() noexcept -> bool {
@@ -265,6 +276,19 @@ auto GrantLease::derive_tunnel_tx(
         return libk::unexpected(GrantError::InvalidKey);
     }
     return graph_->derive_tunnel_tx(
+        libk::move(charge), *this, libk::move(target), ceiling, proof);
+}
+
+auto GrantLease::derive_channel_badge(
+    kernel::resource::Reservation&& charge,
+    object::ObjectRef&& target,
+    GrantCeiling ceiling,
+    ChannelBadgeDerivation proof) const noexcept
+    -> libk::Expected<GrantRef, GrantError> {
+    if (graph_ == nullptr) {
+        return libk::unexpected(GrantError::InvalidKey);
+    }
+    return graph_->derive_channel_badge(
         libk::move(charge), *this, libk::move(target), ceiling, proof);
 }
 
@@ -499,6 +523,44 @@ auto GrantGraph::derive_tunnel_tx(
         || !parent->ceiling.rights.contains(connect)
         || target.id() != parent->target.id() || !tunnel
         || &tunnel.value().get() != proof.tunnel_) {
+        return libk::unexpected(GrantError::RightsViolation);
+    }
+    return create(
+        libk::move(charge), libk::move(target), ceiling, parent);
+}
+
+auto GrantGraph::derive_channel_badge(
+    kernel::resource::Reservation&& charge,
+    const GrantLease& source,
+    object::ObjectRef&& target,
+    GrantCeiling ceiling,
+    ChannelBadgeDerivation proof) noexcept
+    -> libk::Expected<GrantRef, GrantError> {
+    if (source.graph_ != this || !target
+        || target.kind() != object::ObjectKind::Channel
+        || proof.channel_ == nullptr || proof.badge_ == 0
+        || !validate_ceiling(target.kind(), ceiling)) {
+        return libk::unexpected(GrantError::InvalidKey);
+    }
+    auto* const parent = static_cast<Node*>(source.node_);
+    auto channel = target.pin<kernel::ipc::Channel>();
+    if (parent->target.kind() != object::ObjectKind::Channel
+        || target.id() != parent->target.id() || !channel
+        || &channel.value().get() != proof.channel_) {
+        return libk::unexpected(GrantError::RightsViolation);
+    }
+    const auto* const parent_data =
+        libk::get_if<ChannelAuthority>(&parent->ceiling.data);
+    const auto* const child_data =
+        libk::get_if<ChannelAuthority>(&ceiling.data);
+    if (parent_data == nullptr || child_data == nullptr
+        || !parent_data->unbound()
+        || (parent_data->side != ChannelSide::Any
+            && parent_data->side != proof.side_)
+        || child_data->side != proof.side_
+        || !child_data->exact()
+        || child_data->badge != proof.badge_
+        || !parent->ceiling.rights.contains(ceiling.rights)) {
         return libk::unexpected(GrantError::RightsViolation);
     }
     return create(
@@ -1377,6 +1439,14 @@ void GrantGraph::stop_allocation(
     case object::ObjectKind::Endpoint:
         allocation.target_ready();
         return;
+    case object::ObjectKind::Channel: {
+        auto channel = allocation.target_.pin<kernel::ipc::Channel>();
+        KASSERT(channel);
+        static_cast<void>(channel.value()->close(ChannelSide::A));
+        static_cast<void>(channel.value()->close(ChannelSide::B));
+        allocation.target_ready();
+        return;
+    }
     }
     KASSERT(false);
 }

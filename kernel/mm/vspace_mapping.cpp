@@ -380,6 +380,11 @@ auto VSpace::map_impl(
         || claim_.range != request.virtual_range
         || authority->invalidation_requested_
         || overlap(region, request.virtual_range) != nullptr) {
+        // `fail()` performs the unlocked relation/authority cleanup and
+        // reacquires VSpace::lock_ only to release the range claim.  End the
+        // transaction token first; otherwise a post-lock validation failure
+        // recursively acquires this same non-recursive lock.
+        lock.restore();
         return fail(VSpaceError::InvalidState);
     }
 
@@ -394,11 +399,13 @@ auto VSpace::map_impl(
 
     auto mutation = coherence_.begin();
     if (!mutation) {
+        lock.restore();
         return fail(VSpaceError::ShootdownUnavailable);
     }
     auto plan = prepare_plan(context, mutation.value().targets());
     if (!plan) {
         mutation.value().abort();
+        lock.restore();
         return fail(plan.error());
     }
 

@@ -65,6 +65,9 @@ public:
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto busy() const noexcept -> bool;
     [[nodiscard]] auto detach() noexcept -> bool;
+    // A detached attachment is a reusable relation cell. The graph edge must
+    // already be gone and all invalidation work drained before resetting it.
+    void reset() noexcept;
 
 private:
     friend class GrantGraph;
@@ -145,6 +148,12 @@ public:
         object::ObjectRef&& target,
         GrantCeiling ceiling,
         TunnelConnectProof proof) const noexcept
+        -> libk::Expected<GrantRef, GrantError>;
+    [[nodiscard]] auto derive_channel_badge(
+        kernel::resource::Reservation&& charge,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling,
+        ChannelBadgeDerivation proof) const noexcept
         -> libk::Expected<GrantRef, GrantError>;
     void reset() noexcept;
 

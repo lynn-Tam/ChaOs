@@ -71,6 +71,13 @@ public:
         GrantCeiling ceiling,
         TunnelConnectProof proof) noexcept
         -> libk::Expected<GrantRef, GrantError>;
+    [[nodiscard]] auto derive_channel_badge(
+        kernel::resource::Reservation&& charge,
+        const GrantLease& source,
+        object::ObjectRef&& target,
+        GrantCeiling ceiling,
+        ChannelBadgeDerivation proof) noexcept
+        -> libk::Expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto ref(GrantKey key) noexcept
         -> libk::Expected<GrantRef, GrantError>;

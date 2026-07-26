@@ -42,6 +42,7 @@
 #define MYOS_SYS_VPROC_CREATE          55 /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
 #define MYOS_SYS_TUNNEL_OPEN           56 /* a0=pool, a1=slot, a2=tag; target=current Vproc */
 #define MYOS_SYS_ENDPOINT_CREATE        57 /* a1=VSpace, a2=CSpace, a3=descriptor memory, a4=offset */
+#define MYOS_SYS_CHANNEL_CREATE         58 /* a1=queue, a2=max words, a3=max caps, a4=relations */
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
@@ -70,3 +71,16 @@
 #define MYOS_SYS_ENDPOINT_CLOSE       114 /* a0=Endpoint */
 #define MYOS_SYS_ENDPOINT_MINT        115 /* a0=root, a1=dest CSpace, a2=badge, a3=cap limit, a4=rights */
 #define MYOS_SYS_ENDPOINT_ABORT       116 /* a0=callee-defined abort detail */
+
+#define MYOS_SYS_CHANNEL_TRY_SEND     120 /* a0=Channel, message in IPC buffer */
+#define MYOS_SYS_CHANNEL_TRY_RECV     121 /* a0=Channel, message in IPC buffer */
+#define MYOS_SYS_CHANNEL_SEND         122 /* ThreadBlocking send */
+#define MYOS_SYS_CHANNEL_RECV         123 /* ThreadBlocking receive */
+#define MYOS_SYS_CHANNEL_CLOSE        124 /* a0=Channel */
+#define MYOS_SYS_CHANNEL_BIND         125 /* a0=Channel, a1=Notification, a2=condition */
+#define MYOS_SYS_CHANNEL_ARM          126 /* a0=Channel, a1=relation, a2=sequence */
+#define MYOS_SYS_CHANNEL_MINT         127 /* a0=side root, a1=dest CSpace, a2=badge, a3=rights */
+
+/* Canonical kernel monotonic clock; returns ticks or ticks/second. */
+#define MYOS_SYS_CLOCK_NOW             128
+#define MYOS_SYS_CLOCK_FREQUENCY       129

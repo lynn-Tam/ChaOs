@@ -51,6 +51,7 @@ CSpace::~CSpace() noexcept {
     KASSERT(page_count_ == 0);
     KASSERT(live_slots_ == 0);
     KASSERT(bindings_ == 0);
+    KASSERT(escrows_ == 0);
     KASSERT(!pages_);
 }
 
@@ -843,7 +844,8 @@ void CSpace::retire() noexcept {
 
 auto CSpace::prepare_retire() noexcept -> bool {
     kernel::sync::IrqLockGuard guard{lock_};
-    if (!accepting_ || retired_ || releasing_ || bindings_ != 0) {
+    if (!accepting_ || retired_ || releasing_ || bindings_ != 0
+        || escrows_ != 0) {
         return false;
     }
     accepting_ = false;
@@ -866,6 +868,93 @@ void CSpace::detach_execution() noexcept {
     --bindings_;
 }
 
+auto CSpace::escrow_move(
+    CapHandle source_handle,
+    GrantRef& grant,
+    CapView& view,
+    Reservation& reservation) noexcept
+    -> libk::Expected<void, CSpaceError> {
+    kernel::sync::IrqLockGuard guard{lock_};
+    Slot* const source = source_handle
+        ? slot(source_handle.index()) : nullptr;
+    if (!accepting_) {
+        return libk::unexpected(CSpaceError::InvalidState);
+    }
+    if (source == nullptr || source->generation != source_handle.generation()) {
+        return libk::unexpected(CSpaceError::InvalidHandle);
+    }
+    if (source->state != SlotState::Occupied) {
+        return libk::unexpected(CSpaceError::InvalidState);
+    }
+    unlink_occupied(source_handle.index(), *source);
+    Capability capability = libk::move(source->storage.capability);
+    libk::destroy_at(&source->storage.capability);
+    grant = libk::move(capability.grant);
+    view = capability.view;
+    source->state = SlotState::Reserved;
+    reservation = Reservation{*this, source_handle, {}};
+    retain_escrow();
+    return libk::expected();
+}
+
+auto CSpace::escrow_restore(
+    Reservation& reservation,
+    GrantRef&& grant,
+    CapView view) noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (reservation.owner_ != this || !grant) {
+        return false;
+    }
+    const CapHandle handle = reservation.handle_;
+    Slot* const target = handle ? slot(handle.index()) : nullptr;
+    if (target == nullptr || target->generation != handle.generation()
+        || target->state != SlotState::Reserved) {
+        return false;
+    }
+    libk::construct_at(
+        &target->storage.capability, Capability{libk::move(grant), view});
+    target->state = SlotState::Occupied;
+    link_occupied(handle.index(), *target);
+    reservation.disarm();
+    release_escrow();
+    return true;
+}
+
+auto CSpace::escrow_drop(
+    Reservation& reservation) noexcept -> kernel::resource::Refund {
+    kernel::resource::Refund refund{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(reservation.owner_ == this);
+        const CapHandle handle = reservation.handle_;
+        Slot* const target = handle ? slot(handle.index()) : nullptr;
+        KASSERT(target != nullptr
+            && target->generation == handle.generation()
+            && target->state == SlotState::Reserved);
+        refund = target->sponsorship.detach();
+        target->state = SlotState::Empty;
+        KASSERT(live_slots_ != 0);
+        --live_slots_;
+        if (accepting_) {
+            push_free(handle.index(), *target);
+        }
+        reservation.disarm();
+        release_escrow();
+    }
+    finish_retire();
+    return refund;
+}
+
+void CSpace::retain_escrow() noexcept {
+    KASSERT(escrows_ != libk::numeric_limits<usize>::max());
+    ++escrows_;
+}
+
+void CSpace::release_escrow() noexcept {
+    KASSERT(escrows_ != 0);
+    --escrows_;
+}
+
 void CSpace::bind_sponsor(
     kernel::resource::Sponsorship& sponsor) noexcept {
     KASSERT(sponsor_ == nullptr && sponsor);
@@ -883,6 +972,7 @@ void CSpace::finish_retire() noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (accepting_ || growing_ || live_slots_ != 0 || bindings_ != 0
+            || escrows_ != 0
             || releasing_ || retired_) {
             return;
         }

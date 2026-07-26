@@ -62,6 +62,7 @@ QEMU    ?= qemu-system-riscv64
 CLANGXX ?= clang++
 HOST_CXX ?= c++
 QEMU_SMP ?= 4
+QEMU_TIMEOUT ?= 10s
 PANIC_PROBE ?= 0
 LOCK_PROBE ?= 0
 GDB_HOST ?= 127.0.0.1
@@ -206,6 +207,7 @@ KERNEL_SRCS := \
 	kernel/ipc/notification.cpp \
 	kernel/ipc/buffer.cpp \
 	kernel/ipc/tunnel.cpp \
+	kernel/ipc/channel.cpp \
   kernel/ipc/endpoint.cpp \
   kernel/ipc/transfer.cpp \
   kernel/object/object_ref.cpp \
@@ -246,6 +248,7 @@ KERNEL_SRCS := \
     kernel/syscall/vproc.cpp \
     kernel/syscall/tunnel.cpp \
     kernel/syscall/endpoint.cpp \
+    kernel/syscall/channel.cpp \
   kernel/syscall/vm.cpp \
   kernel/time/clock.cpp \
   kernel/mm/kernel_stack.cpp \
@@ -509,7 +512,7 @@ run-test-smp:
 _run-test-smp: $(TARGET) audit-boot-stack
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 124 ]; then \
@@ -538,7 +541,7 @@ run-smp-timeout: run-proof-smp
 _run-proof-smp: $(TARGET) $(PROOF_BOOT_BUNDLE) audit-boot-stack audit-user
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(PROOF_BOOT_BUNDLE) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(PROOF_BOOT_BUNDLE) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 124 ]; then \
@@ -575,7 +578,7 @@ run-e1-smp:
 _run-e1-smp: $(TARGET) $(BOOT_BUNDLE) audit-boot-stack audit-user
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 8s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(BOOT_BUNDLE) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) -initrd $(BOOT_BUNDLE) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 124 ]; then \
@@ -608,7 +611,7 @@ run-panic-smp:
 _run-panic-smp: $(TARGET) audit-boot-stack
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 0 ]; then \
@@ -639,7 +642,7 @@ run-panic-degraded-smp:
 _run-panic-degraded-smp: $(TARGET) audit-boot-stack
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 0 ]; then \
@@ -668,7 +671,7 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	esac; \
 	set +e; \
 	output=$$(mktemp); \
-	timeout --foreground 5s $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 0 ] \

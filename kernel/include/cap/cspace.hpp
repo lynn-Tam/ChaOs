@@ -25,6 +25,7 @@ class Thread;
 namespace ipc {
 class Transfer;
 class Tunnel;
+class Channel;
 }
 namespace object {
 template<typename T>
@@ -58,6 +59,7 @@ public:
 
     class Reservation final : private libk::noncopyable {
     public:
+        Reservation() noexcept = default;
         Reservation(Reservation&& other) noexcept;
         auto operator=(Reservation&& other) noexcept -> Reservation&;
         ~Reservation() noexcept;
@@ -103,6 +105,7 @@ public:
     private:
         friend class CSpace;
         friend class kernel::ipc::Tunnel;
+        friend class kernel::ipc::Channel;
 
         DerivationReservation(
             Reservation&& slot,
@@ -209,6 +212,7 @@ private:
     friend class ::kernel::mm::VSpace;
     friend class kernel::ExecutionBinding;
     friend class kernel::ipc::Transfer;
+    friend class kernel::ipc::Channel;
     friend struct kernel::object::ObjectTraits<CSpace>;
     static constexpr usize leaf_bits = 3;
     static constexpr usize dir_bits = 8;
@@ -320,6 +324,20 @@ private:
     [[nodiscard]] auto reserve_grant() noexcept
         -> libk::Expected<kernel::resource::Reservation, CSpaceError>;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
+    [[nodiscard]] auto escrow_move(
+        CapHandle source,
+        GrantRef& grant,
+        CapView& view,
+        Reservation& reservation) noexcept
+        -> libk::Expected<void, CSpaceError>;
+    [[nodiscard]] auto escrow_restore(
+        Reservation& reservation,
+        GrantRef&& grant,
+        CapView view) noexcept -> bool;
+    [[nodiscard]] auto escrow_drop(
+        Reservation& reservation) noexcept -> kernel::resource::Refund;
+    void retain_escrow() noexcept;
+    void release_escrow() noexcept;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
     void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept;
@@ -352,6 +370,7 @@ private:
     bool releasing_{};
     bool retired_{};
     usize bindings_{};
+    usize escrows_{};
     kernel::resource::Sponsorship* sponsor_{};
 };
 

@@ -5,6 +5,7 @@
 #include <libk/noncopyable.hpp>
 #include <libk/utility.hpp>
 #include <object/cspace_pool.hpp>
+#include <object/channel_pool.hpp>
 #include <object/endpoint_pool.hpp>
 #include <object/memory_pool.hpp>
 #include <object/notification_pool.hpp>
@@ -67,6 +68,10 @@ public:
     using EndpointPending = object::EndpointPending;
     using EndpointHold = object::EndpointHold;
     using EndpointPin = object::EndpointPin;
+    using ChannelPool = object::ChannelPool;
+    using ChannelPending = object::ChannelPending;
+    using ChannelHold = object::ChannelHold;
+    using ChannelPin = object::ChannelPin;
 
     explicit ObjectStore(kernel::mm::Pmm& pmm, kernel::mm::VSpaceExecutor& vspace_work) noexcept;
     ~ObjectStore() noexcept;
@@ -239,6 +244,19 @@ public:
     [[nodiscard]] auto pin_endpoint(ObjectId id) noexcept
         -> libk::Expected<EndpointPin, EndpointPool::Error>;
 
+    template<typename... Args>
+    [[nodiscard]] auto create_channel_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept
+        -> libk::Expected<ChannelPending, ChannelPool::Error> {
+        return channels_.create_sponsored(
+            libk::move(sponsorship), *pmm_, libk::forward<Args>(args)...);
+    }
+    [[nodiscard]] auto hold_channel(ObjectId id) noexcept
+        -> libk::Expected<ChannelHold, ChannelPool::Error>;
+    [[nodiscard]] auto pin_channel(ObjectId id) noexcept
+        -> libk::Expected<ChannelPin, ChannelPool::Error>;
+
     // Runtime has exactly one drain executor. Tests and terminal teardown may
     // call this directly only while that executor is absent or stopped.
     void drain_reclaim() noexcept;
@@ -259,6 +277,7 @@ private:
     // Sponsoring pools outlive every pool containing sponsored objects.
     ResourcePool resources_;
     EndpointPool endpoints_;
+    ChannelPool channels_;
     TunnelPool tunnels_;
     VprocPool vprocs_;
     NotificationPool notifications_;

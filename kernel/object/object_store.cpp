@@ -11,6 +11,7 @@ ObjectStore::ObjectStore(
       vspace_work_(&vspace_work),
       resources_(pmm, reclaim_notify_),
       endpoints_(pmm, reclaim_notify_),
+      channels_(pmm, reclaim_notify_),
       tunnels_(pmm, reclaim_notify_),
       vprocs_(pmm, reclaim_notify_),
       notifications_(pmm, reclaim_notify_),
@@ -26,6 +27,7 @@ ObjectStore::~ObjectStore() noexcept {
     drain_reclaim();
     KASSERT(vspaces_.live_count() == 0);
     KASSERT(endpoints_.live_count() == 0);
+    KASSERT(channels_.live_count() == 0);
     KASSERT(tunnels_.live_count() == 0);
     KASSERT(vprocs_.live_count() == 0);
     KASSERT(notifications_.live_count() == 0);
@@ -305,8 +307,19 @@ auto ObjectStore::pin_endpoint(ObjectId id) noexcept
     return endpoints_.pin(id);
 }
 
+auto ObjectStore::hold_channel(ObjectId id) noexcept
+    -> libk::Expected<ChannelHold, ChannelPool::Error> {
+    return channels_.hold(id);
+}
+
+auto ObjectStore::pin_channel(ObjectId id) noexcept
+    -> libk::Expected<ChannelPin, ChannelPool::Error> {
+    return channels_.pin(id);
+}
+
 void ObjectStore::drain_reclaim() noexcept {
     endpoints_.drain_reclaim();
+    channels_.drain_reclaim();
     tunnels_.drain_reclaim();
     vprocs_.drain_reclaim();
     notifications_.drain_reclaim();

@@ -9,6 +9,8 @@
 #include <libk/inplace_vector.hpp>
 #include <libk/utility.hpp>
 #include <ipc/endpoint.hpp>
+#include <object/channel_pool.hpp>
+#include <uapi/channel.h>
 #include <ipc/notification.hpp>
 #include <ipc/tunnel.hpp>
 #include <mm/virtual_layout.hpp>
@@ -52,6 +54,8 @@ static_assert(MYOS_RESOURCE_TUNNEL
     == (u64{1} << static_cast<u16>(object::ObjectKind::Tunnel)));
 static_assert(MYOS_RESOURCE_ENDPOINT
     == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
+static_assert(MYOS_RESOURCE_CHANNEL
+    == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
 
 using kernel::object::ObjectKind;
 
@@ -746,6 +750,190 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         libk::move(service).value(),
         libk::move(code_view).value(),
         libk::move(resident_code));
+}
+
+[[nodiscard]] auto create_channel(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    if (!pool) {
+        return returned(cap_status(pool.error()));
+    }
+    const auto config = kernel::ipc::ChannelConfig{
+        .queue_capacity = invocation.trap.arg(1),
+        .max_words = invocation.trap.arg(2),
+        .max_caps = invocation.trap.arg(3),
+        .waiter_capacity = MYOS_CHANNEL_MAX_WAITERS,
+        .relation_capacity = invocation.trap.arg(4),
+    };
+    if (config.queue_capacity == 0
+        || config.queue_capacity > MYOS_CHANNEL_MAX_QUEUE
+        || config.max_words == 0 || config.max_words > MYOS_CHANNEL_MAX_WORDS
+        || config.max_caps > MYOS_CHANNEL_MAX_CAPS
+        || config.relation_capacity == 0
+        || config.relation_capacity > MYOS_CHANNEL_MAX_RELATIONS) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const auto allowed = pool_authority(pool.value());
+    const auto object_charge = kernel::resource::Traits<
+        kernel::ipc::Channel>::fixed();
+    const auto message_pages = libk::checked_multiply(
+        config.queue_capacity * 2, kernel::mm::page_size);
+    const auto channel_charge = message_pages
+        ? add_budget(object_charge,
+              kernel::resource::Budget{.memory = *message_pages})
+        : libk::optional<kernel::resource::Budget>{libk::nullopt};
+    const auto node_charge = kernel->grants().node_charge();
+    const auto two_nodes = add_budget(node_charge, node_charge);
+    const auto total_authority = two_nodes
+        ? add_budget(node_charge, *two_nodes)
+        : libk::optional<kernel::resource::Budget>{libk::nullopt};
+    if (!allowed
+        || (allowed->object_kinds & kind_bit(object::ObjectKind::Channel)) == 0
+        || !channel_charge || !within(*channel_charge, allowed->budget)
+        || !total_authority || !within(*total_authority, allowed->budget)) {
+        return returned(MYOS_STATUS_DENIED);
+    }
+    auto permit = begin(pool.value());
+    if (!permit) {
+        return returned(pool_error(permit.error()));
+    }
+    auto first_slot = invocation.cspace.reserve();
+    auto second_slot = invocation.cspace.reserve();
+    if (!first_slot || !second_slot) {
+        return returned(!first_slot
+            ? cap_status(first_slot.error())
+            : cap_status(second_slot.error()));
+    }
+    auto object_reservation = reserve(pool.value(), *channel_charge);
+    auto root_charge = reserve(pool.value(), node_charge);
+    auto first_charge = reserve(pool.value(), node_charge);
+    auto second_charge = reserve(pool.value(), node_charge);
+    if (!object_reservation || !root_charge || !first_charge || !second_charge) {
+        const auto error = !object_reservation ? pool_error(object_reservation.error())
+            : !root_charge ? pool_error(root_charge.error())
+            : !first_charge ? pool_error(first_charge.error())
+            : pool_error(second_charge.error());
+        return returned(error);
+    }
+    auto pending = kernel->objects().create_channel_sponsored(
+        libk::move(object_reservation).value(), config);
+    if (!pending) {
+        return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    auto opened = pending.value().get().open();
+    if (!opened) {
+        return returned(opened.error() == kernel::ipc::ChannelError::ResourceExhausted
+            ? MYOS_STATUS_NO_MEMORY : MYOS_STATUS_BAD_ARGS);
+    }
+    auto object = libk::move(pending).value().publish();
+    const cap::Rights rights = cap::Rights::of(
+        cap::Right::Duplicate,
+        cap::Right::Delegate,
+        cap::Right::Inspect,
+        cap::Right::Send,
+        cap::Right::Receive,
+        cap::Right::Close,
+        cap::Right::Destroy,
+        cap::Right::Revoke);
+    const cap::ChannelAuthority root_authority{
+        .side = cap::ChannelSide::Any,
+        .badge = 0,
+        .fixed = 0,
+    };
+    auto reference = object.ref();
+    if (!reference) {
+        KASSERT(object.retire());
+        object.reset();
+        return returned(MYOS_STATUS_INTERNAL);
+    }
+    auto allocation = kernel->grants().create_allocation(
+        permit.value(),
+        libk::move(root_charge).value(),
+        libk::move(reference).value(),
+        cap::GrantCeiling{rights, root_authority});
+    if (!allocation) {
+        KASSERT(object.retire());
+        object.reset();
+        return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    auto root = allocation.value().acquire();
+    auto first_target = object.ref();
+    auto second_target = object.ref();
+    if (!root || !first_target || !second_target) {
+        allocation.value().reset();
+        object.reset();
+        return returned(MYOS_STATUS_INTERNAL);
+    }
+    const cap::ChannelAuthority first_authority{
+        .side = cap::ChannelSide::A,
+        .badge = 0,
+        .fixed = 0,
+    };
+    const cap::ChannelAuthority second_authority{
+        .side = cap::ChannelSide::B,
+        .badge = 0,
+        .fixed = 0,
+    };
+    auto first_grant = kernel->grants().derive(
+        libk::move(first_charge).value(), root.value(),
+        libk::move(first_target).value(),
+        cap::GrantCeiling{rights, first_authority});
+    if (!first_grant) {
+        allocation.value().reset();
+        object.reset();
+        return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    if (!object.get().bind_side_root(
+            first_grant.value(), cap::ChannelSide::A)) {
+        allocation.value().reset();
+        object.reset();
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto first_installed = invocation.cspace.insert(
+        libk::move(first_slot).value(),
+        libk::move(first_grant).value(),
+        cap::CapView{rights, first_authority});
+    if (!first_installed) {
+        allocation.value().reset();
+        object.reset();
+        return returned(cap_status(first_installed.error()));
+    }
+    auto second_grant = kernel->grants().derive(
+        libk::move(second_charge).value(), root.value(),
+        libk::move(second_target).value(),
+        cap::GrantCeiling{rights, second_authority});
+    if (!second_grant) {
+        static_cast<void>(invocation.cspace.close(first_installed.value()));
+        allocation.value().reset();
+        object.reset();
+        return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    if (!object.get().bind_side_root(
+            second_grant.value(), cap::ChannelSide::B)) {
+        static_cast<void>(invocation.cspace.close(first_installed.value()));
+        allocation.value().reset();
+        object.reset();
+        return returned(MYOS_STATUS_BUSY);
+    }
+    auto second_installed = invocation.cspace.insert(
+        libk::move(second_slot).value(),
+        libk::move(second_grant).value(),
+        cap::CapView{rights, second_authority});
+    if (!second_installed) {
+        static_cast<void>(invocation.cspace.close(first_installed.value()));
+        allocation.value().reset();
+        object.reset();
+        return returned(cap_status(second_installed.error()));
+    }
+    allocation.value().commit();
+    object.reset();
+    return Result{
+        MYOS_STATUS_OK,
+        first_installed.value().raw(),
+        Disposition::Return,
+        second_installed.value().raw()};
 }
 
 [[gnu::noinline]] [[nodiscard]] auto create_endpoint(
@@ -1499,6 +1687,8 @@ auto handle_construction(
         return open_tunnel(invocation);
     case MYOS_SYS_ENDPOINT_CREATE:
         return create_endpoint(invocation);
+    case MYOS_SYS_CHANNEL_CREATE:
+        return create_channel(invocation);
     default:
         break;
     }

@@ -2,6 +2,7 @@
 
 #include <cap/policy.hpp>
 #include <ipc/notification.hpp>
+#include <uapi/channel.h>
 #include <uapi/endpoint.h>
 
 namespace {
@@ -168,6 +169,88 @@ bool test_endpoint_authority_narrows_badge_and_limits(
         && !changed_badge && changed_badge.error() == PolicyError::Amplification;
 }
 
+bool test_channel_root_cannot_fix_badge_generically(
+    const TestContext&) noexcept {
+    using kernel::cap::CapView;
+    using kernel::cap::ChannelAuthority;
+    using kernel::cap::ChannelSide;
+    using kernel::cap::GrantCeiling;
+    using kernel::cap::PolicyError;
+    using kernel::cap::Right;
+    using kernel::cap::Rights;
+    using kernel::object::ObjectKind;
+
+    const auto rights = Rights::of(
+        Right::Duplicate, Right::Delegate, Right::Inspect,
+        Right::Send, Right::Receive, Right::Close, Right::Revoke);
+    const ChannelAuthority root{
+        .side = ChannelSide::Any,
+        .badge = 0,
+        .fixed = 0,
+    };
+    const auto side = kernel::cap::compose(
+        ObjectKind::Channel,
+        GrantCeiling{rights, root},
+        CapView{rights, ChannelAuthority{
+            .side = ChannelSide::A,
+            .badge = 0,
+            .fixed = 0,
+        }});
+    const auto exact = kernel::cap::compose(
+        ObjectKind::Channel,
+        GrantCeiling{rights, root},
+        CapView{rights, ChannelAuthority{
+            .side = ChannelSide::A,
+            .badge = 0x55,
+            .fixed = ~u64{},
+        }});
+    return side && !exact && exact.error() == PolicyError::Amplification;
+}
+
+bool test_channel_badge_and_side_are_immutable(
+    const TestContext&) noexcept {
+    using kernel::cap::CapView;
+    using kernel::cap::ChannelAuthority;
+    using kernel::cap::ChannelSide;
+    using kernel::cap::GrantCeiling;
+    using kernel::cap::PolicyError;
+    using kernel::cap::Right;
+    using kernel::cap::Rights;
+    using kernel::object::ObjectKind;
+
+    const auto rights = Rights::of(
+        Right::Duplicate, Right::Delegate, Right::Inspect,
+        Right::Send, Right::Receive, Right::Close, Right::Revoke);
+    const ChannelAuthority exact{
+        .side = ChannelSide::A,
+        .badge = 0x55,
+        .fixed = ~u64{},
+    };
+    const auto same = kernel::cap::compose(
+        ObjectKind::Channel,
+        GrantCeiling{rights, exact}, CapView{rights, exact});
+    const auto changed_badge = kernel::cap::compose(
+        ObjectKind::Channel,
+        GrantCeiling{rights, exact},
+        CapView{rights, ChannelAuthority{
+            .side = ChannelSide::A,
+            .badge = 0x56,
+            .fixed = ~u64{},
+        }});
+    const auto changed_side = kernel::cap::compose(
+        ObjectKind::Channel,
+        GrantCeiling{rights, exact},
+        CapView{rights, ChannelAuthority{
+            .side = ChannelSide::B,
+            .badge = 0x55,
+            .fixed = ~u64{},
+        }});
+    return same && !changed_badge
+        && changed_badge.error() == PolicyError::Amplification
+        && !changed_side
+        && changed_side.error() == PolicyError::Amplification;
+}
+
 } // namespace
 
 void register_ipc_tests(TestRegistry& registry) noexcept {
@@ -191,4 +274,12 @@ void register_ipc_tests(TestRegistry& registry) noexcept {
         "ipc",
         "Endpoint authority fixes caller badge and only narrows admission",
         test_endpoint_authority_narrows_badge_and_limits);
+    (void)registry.add(
+        "ipc",
+        "Channel side root cannot generically choose a sender badge",
+        test_channel_root_cannot_fix_badge_generically);
+    (void)registry.add(
+        "ipc",
+        "Channel badge and side remain immutable after mint",
+        test_channel_badge_and_side_are_immutable);
 }

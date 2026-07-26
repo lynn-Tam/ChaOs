@@ -312,8 +312,11 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
     const auto* cpu0 = cpu_test_registry->descriptor(kernel::CpuId{0});
     const auto* cpu1 = cpu_test_registry->descriptor(kernel::CpuId{1});
     const auto* cpu2 = cpu_test_registry->descriptor(kernel::CpuId{2});
-    return cpu0 && cpu1 && cpu2
-        && cpu0->hardware_id() == kernel::CpuHardwareId{0}
+    if (cpu0 == nullptr || cpu1 == nullptr || cpu2 == nullptr) {
+        return false;
+    }
+    const auto failure = cpu2->failure();
+    return cpu0->hardware_id() == kernel::CpuHardwareId{0}
         && cpu0->availability() == kernel::CpuAvailability::Disabled
         && cpu1->hardware_id() == kernel::CpuHardwareId{256}
         && cpu1->availability() == kernel::CpuAvailability::Enabled
@@ -322,8 +325,8 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
         && cpu0->state() == kernel::CpuState::Possible
         && cpu1->state() == kernel::CpuState::Present
         && cpu2->state() == kernel::CpuState::Failed
-        && cpu2->failure()
-        && *cpu2->failure() == kernel::CpuFailure::FirmwareReported;
+        && failure
+        && *failure == kernel::CpuFailure::FirmwareReported;
 }
 
 bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {

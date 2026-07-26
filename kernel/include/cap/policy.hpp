@@ -81,6 +81,15 @@ struct CapabilityPolicy<object::ObjectKind::Endpoint> final {
 };
 
 template<>
+struct CapabilityPolicy<object::ObjectKind::Channel> final {
+    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto compose(
+        GrantCeiling ceiling,
+        CapView view) noexcept
+        -> libk::Expected<EffectiveAuthority, PolicyError>;
+};
+
+template<>
 struct CapabilityPolicy<object::ObjectKind::SchedulingContext> final
     : RightsPolicy<
           Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control,

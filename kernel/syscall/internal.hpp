@@ -106,5 +106,11 @@ template<typename Descriptor>
 [[nodiscard]] auto handle_endpoint(
     usize operation,
     Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_channel(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_clock(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
 
 } // namespace kernel::syscall

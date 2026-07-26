@@ -16,6 +16,7 @@ namespace kernel {
 class Vproc;
 namespace ipc {
 class Tunnel;
+class Channel;
 }
 }
 
@@ -74,13 +75,37 @@ struct EndpointAuthority final {
         EndpointAuthority, EndpointAuthority) noexcept -> bool = default;
 };
 
+enum class ChannelSide : u8 {
+    A,
+    B,
+    Any,
+};
+
+struct ChannelAuthority final {
+    ChannelSide side{ChannelSide::A};
+    u64 badge{};
+    // zero means an unbound side-root; all bits set means an exact badge.
+    u64 fixed{};
+
+    [[nodiscard]] constexpr auto unbound() const noexcept -> bool {
+        return fixed == 0 && badge == 0;
+    }
+    [[nodiscard]] constexpr auto exact() const noexcept -> bool {
+        return fixed == ~u64{} && badge != 0;
+    }
+
+    [[nodiscard]] friend constexpr auto operator==(
+        ChannelAuthority, ChannelAuthority) noexcept -> bool = default;
+};
+
 using AuthorityData = libk::variant<
     libk::monostate,
     MemoryAuthority,
     VSpaceAuthority,
     ResourcePoolAuthority,
     NotificationAuthority,
-    EndpointAuthority>;
+    EndpointAuthority,
+    ChannelAuthority>;
 
 struct GrantCeiling final {
     Rights rights{};
@@ -157,6 +182,31 @@ private:
     const kernel::ipc::Tunnel* tunnel_{};
     const kernel::Vproc* source_{};
     u64 claim_{};
+};
+
+class ChannelBadgeDerivation final {
+public:
+    [[nodiscard]] auto channel() const noexcept -> const kernel::ipc::Channel* {
+        return channel_;
+    }
+    [[nodiscard]] constexpr auto side() const noexcept -> ChannelSide {
+        return side_;
+    }
+    [[nodiscard]] constexpr auto badge() const noexcept -> u64 { return badge_; }
+
+private:
+    friend class kernel::ipc::Channel;
+    friend class GrantGraph;
+
+    constexpr ChannelBadgeDerivation(
+        const kernel::ipc::Channel& channel,
+        ChannelSide side,
+        u64 badge) noexcept
+        : channel_(&channel), side_(side), badge_(badge) {}
+
+    const kernel::ipc::Channel* channel_{};
+    ChannelSide side_{ChannelSide::A};
+    u64 badge_{};
 };
 
 } // namespace kernel::cap
