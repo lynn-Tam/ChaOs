@@ -26,6 +26,11 @@ struct Leaf final {
     PtePerm permissions{PtePerm::supervisor_ro()};
 };
 
+struct Usage final {
+    bool accessed{};
+    bool dirty{};
+};
+
 class DetachedTables final {
 public:
     DetachedTables() noexcept = default;
@@ -114,6 +119,16 @@ public:
 
     [[nodiscard]] auto query(kernel::mm::VPage page) const noexcept
         -> libk::Expected<Leaf, EditError>;
+
+    [[nodiscard]] auto usage(kernel::mm::VPage page) const noexcept
+        -> libk::Expected<Usage, EditError>;
+
+    // Clear only hardware A/D state and retain the mapping identity. The
+    // caller owns the surrounding translation/TLB serialization.
+    [[nodiscard]] auto clear_usage(
+        kernel::mm::VPage page,
+        bool accessed,
+        bool dirty) noexcept -> libk::Expected<Usage, EditError>;
 
 private:
     enum class Domain : u8 { User, Kernel };

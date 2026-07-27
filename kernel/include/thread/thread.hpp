@@ -18,11 +18,18 @@
 #include <sched/remote_queue.hpp>
 #include <trap/event.hpp>
 #include <operation/wait.hpp>
+#include <fault/terminal.hpp>
 
 namespace kernel {
 
 class Thread;
 class CpuRegistry;
+namespace fault {
+class TerminalObservation;
+}
+namespace ipc {
+class Notification;
+}
 namespace operation {
 class Completion;
 }
@@ -127,6 +134,16 @@ public:
     [[nodiscard]] auto user_syscalls() const noexcept -> u64 {
         return user_syscalls_;
     }
+    [[nodiscard]] auto terminal() const noexcept -> const fault::TerminalRecord& {
+        return terminal_;
+    }
+    [[nodiscard]] auto terminal() noexcept -> fault::TerminalRecord& {
+        return terminal_;
+    }
+    [[nodiscard]] auto observe_terminal(
+        ipc::Notification& notification,
+        u64 badge) noexcept -> bool;
+    void clear_terminal_observation() noexcept;
     [[nodiscard]] auto waiting() const noexcept -> bool {
         return wait_.attached();
     }
@@ -161,6 +178,8 @@ private:
     operation::Wait wait_{};
     execution::Frame* active_{};
     u64 user_syscalls_{};
+    fault::TerminalRecord terminal_{};
+    fault::TerminalObservation* terminal_observation_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::ThreadStop>
         stop_lock_{};
     StopList stops_{};

@@ -4,8 +4,10 @@
 #include "initial_kernel_map.hpp"
 
 #include <core/debug.hpp>
+#include <arch/uart.hpp>
 #include <libk/optional.hpp>
 #include <mm/addr.hpp>
+#include <mm/virtual_layout.hpp>
 #include <mm/pmm.hpp>
 #include <core/kernel_image.hpp>
 
@@ -163,12 +165,42 @@ auto map_initial_kernel(Sv39Builder& builder, kernel::mm::Pmm& pmm) noexcept
         }
     }
 
+    // The interrupt controller and bootstrap UART are kernel-owned device
+    // windows.  They are not part of DirectMap (which admits RAM only), so
+    // give the trap/IRQ path an explicit high-half alias. User roots borrow
+    // these supervisor branches; kernel IRQ code therefore remains mapped
+    // while a user address space is active.
+    const auto uart = kernel::mm::PageRange::from_aligned_bytes(
+        kernel::mm::PhysAddr{virt_uart_base}, kernel::mm::page_size);
+    KASSERT(uart);
+    auto mapped = map_and_verify(
+        builder,
+        kernel::mm::VirtAddr{
+            kernel::mm::layout::DirectMapBegin + virt_uart_base},
+        *uart,
+        PtePerm::supervisor_rw());
+    if (!mapped) {
+        return convert_mapping_error(mapped.error());
+    }
+    const auto plic = kernel::mm::PageRange::from_aligned_bytes(
+        kernel::mm::PhysAddr{virt_plic_base}, virt_plic_size);
+    KASSERT(plic);
+    mapped = map_and_verify(
+        builder,
+        kernel::mm::VirtAddr{
+            kernel::mm::layout::DirectMapBegin + virt_plic_base},
+        *plic,
+        PtePerm::supervisor_rw());
+    if (!mapped) {
+        return convert_mapping_error(mapped.error());
+    }
+
     // Secondary harts enter with translation disabled.  This final-root alias
     // is the narrow bridge from their physical trampoline to the high entry;
     // D2 removes it after the last secondary acknowledges activation.
     const auto boot_entry = kernel::image::boot_entry();
     const auto secondary = kernel::image::secondary_entry();
-    auto mapped = map_and_verify(
+    mapped = map_and_verify(
         builder,
         kernel::mm::VirtAddr{boot_entry.first().base().raw()},
         boot_entry,

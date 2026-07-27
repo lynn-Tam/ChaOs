@@ -874,7 +874,8 @@ auto lock_class_name(LockClass value) noexcept -> const char* {
         "physical-alias", "execution-authority", "sched-authority",
         "sched-context", "sched-domain", "remote-queue", "thread-stop",
         "vproc", "wait", "endpoint", "notification-source",
-        "notification", "tunnel",
+        "notification", "tunnel", "channel", "pager", "irq",
+        "irq-registry", "terminal",
 #if MYOS_LOCK_PROBE
         "probe-a", "probe-b",
 #endif

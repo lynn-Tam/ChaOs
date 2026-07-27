@@ -2,9 +2,12 @@
 
 #include <object/tunnel_pool.hpp>
 #include <object/channel_pool.hpp>
+#include <object/pager_pool.hpp>
+#include <object/irq_pool.hpp>
 
 #include <cap/policy.hpp>
 #include <core/debug.hpp>
+#include <diag/console.hpp>
 #include <libk/limits.hpp>
 #include <libk/memory.hpp>
 #include <libk/utility.hpp>
@@ -1447,6 +1450,20 @@ void GrantGraph::stop_allocation(
         allocation.target_ready();
         return;
     }
+    case object::ObjectKind::Pager: {
+        auto pager = allocation.target_.pin<kernel::pager::Pager>();
+        KASSERT(pager);
+        static_cast<void>(pager.value()->close(true));
+        allocation.target_ready();
+        return;
+    }
+    case object::ObjectKind::Irq: {
+        auto irq = allocation.target_.pin<kernel::irq::Irq>();
+        KASSERT(irq);
+        static_cast<void>(irq.value()->close());
+        allocation.target_ready();
+        return;
+    }
     }
     KASSERT(false);
 }
@@ -1472,8 +1489,9 @@ void GrantGraph::retire_allocation(
     // explicit stop/dependency adapter; waiting silently would deadlock the
     // pool in Retiring with no event capable of re-driving it.
     const object::ObjectId target = allocation.target_.id();
+    const bool retired = allocation.target_.retire();
     KASSERT_EVENT(
-        allocation.target_.retire(),
+        retired,
         (diag::FatalEvent{
             .facility = diag::Facility::Capability,
             .id = diag::EventId{0x30000001},

@@ -53,6 +53,10 @@ enum class LockClass : u8 {
     Notification,
     Tunnel,
     Channel,
+    Pager,
+    Irq,
+    IrqRegistry,
+    Terminal,
 #if MYOS_LOCK_PROBE
     ProbeA,
     ProbeB,

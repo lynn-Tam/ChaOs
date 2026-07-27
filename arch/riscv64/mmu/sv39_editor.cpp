@@ -105,7 +105,14 @@ auto Editor::Plan::include(kernel::mm::VPage virtual_page) noexcept -> bool {
 auto Editor::user_permissions(
     kernel::mm::AccessMask access,
     kernel::mm::MemoryType type) noexcept -> libk::optional<PtePerm> {
-    if (type != kernel::mm::MemoryType::Normal || !kernel::mm::valid_access(access)
+    // Sv39 has no cacheability/type bits in a leaf PTE.  PMA supplies the
+    // platform memory semantics, so Normal, Uncached, and Device all use the
+    // same user permission encoding here; the VSpace/MemoryObject authority
+    // intersection remains the type gate.
+    if ((type != kernel::mm::MemoryType::Normal
+            && type != kernel::mm::MemoryType::Uncached
+            && type != kernel::mm::MemoryType::Device)
+        || !kernel::mm::valid_access(access)
         || (access.contains(kernel::mm::Access::Write)
             && access.contains(kernel::mm::Access::Execute))) {
         return libk::nullopt;
@@ -183,7 +190,7 @@ auto Editor::map(
     kernel::mm::OwnedPageGroup& prepared) noexcept
     -> libk::Expected<void, EditError> {
     const auto page = Sv39VPage::from(virtual_page);
-    const auto leaf = Pte::leaf_4k(physical_page, permissions);
+    const auto leaf = Pte::leaf_4k_cold(physical_page, permissions);
     if (!page || !accepts(virtual_page)) {
         return libk::unexpected(EditError::BadAddress);
     }
@@ -264,6 +271,68 @@ auto Editor::query(kernel::mm::VPage virtual_page) const noexcept
     return leaf_from(entry);
 }
 
+auto Editor::usage(kernel::mm::VPage virtual_page) const noexcept
+    -> libk::Expected<Usage, EditError> {
+    const auto page = Sv39VPage::from(virtual_page);
+    if (!page || !accepts(virtual_page)) {
+        return libk::unexpected(EditError::BadAddress);
+    }
+    const auto root = TableView::open(*tables_, root_);
+    const auto level1_page =
+        root.entry(page->level2_index()).next_table_page();
+    if (!level1_page) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    const auto level1 = TableView::open(*tables_, *level1_page);
+    const auto level0_page =
+        level1.entry(page->level1_index()).next_table_page();
+    if (!level0_page) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    const auto level0 = TableView::open(*tables_, *level0_page);
+    const Pte entry = level0.entry(page->level0_index());
+    if (!entry.leaf_page() || !entry.permissions()) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    return libk::expected(Usage{
+        .accessed = entry.accessed(),
+        .dirty = entry.dirty(),
+    });
+}
+
+auto Editor::clear_usage(
+    kernel::mm::VPage virtual_page,
+    bool accessed,
+    bool dirty) noexcept -> libk::Expected<Usage, EditError> {
+    const auto page = Sv39VPage::from(virtual_page);
+    if (!page || !accepts(virtual_page)) {
+        return libk::unexpected(EditError::BadAddress);
+    }
+    auto root = TableRef::open(*tables_, root_);
+    const auto level1_page =
+        root.entry(page->level2_index()).next_table_page();
+    if (!level1_page) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    auto level1 = TableRef::open(*tables_, *level1_page);
+    const auto level0_page =
+        level1.entry(page->level1_index()).next_table_page();
+    if (!level0_page) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    auto level0 = TableRef::open(*tables_, *level0_page);
+    Pte& entry = level0.entry(page->level0_index());
+    if (!entry.leaf_page() || !entry.permissions()) {
+        return libk::unexpected(EditError::NotMapped);
+    }
+    const Usage previous{
+        .accessed = entry.accessed(),
+        .dirty = entry.dirty(),
+    };
+    entry = entry.with_usage(accessed, dirty);
+    return libk::expected(previous);
+}
+
 auto Editor::protect(
     kernel::mm::VPage virtual_page,
     PtePerm permissions) noexcept -> libk::Expected<Leaf, EditError> {
@@ -282,11 +351,8 @@ auto Editor::protect(
         level1.entry(page->level1_index()).next_table_page();
     KASSERT(level0_page);
     auto level0 = TableRef::open(*tables_, *level0_page);
-    const auto replacement = Pte::leaf_4k(current.value().page, permissions);
-    if (!replacement) {
-        return libk::unexpected(EditError::BadPhysicalAddress);
-    }
-    level0.entry(page->level0_index()) = *replacement;
+    level0.entry(page->level0_index()) =
+        level0.entry(page->level0_index()).with_permissions(permissions);
     return current;
 }
 

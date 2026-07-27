@@ -46,7 +46,6 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     context.complete_syscall();
     Invocation invocation{cpu, target, *cspace, *vspace, context};
     const usize operation = context.arg(7);
-
     const Policy contract = policy(operation);
     if (contract.continuation == Continuation::Invalid
         || (target.thread() != nullptr && !contract.allows_thread())
@@ -66,7 +65,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_VM_DESTROY_REGION) {
         outcome = handle_vm(operation, invocation);
     } else if (operation >= MYOS_SYS_RESOURCE_CREATE_CHILD
-        && operation <= MYOS_SYS_CHANNEL_CREATE) {
+        && operation <= MYOS_SYS_MEMORY_CREATE_PAGER) {
         outcome = handle_construction(operation, invocation);
     } else if (operation >= MYOS_SYS_MEMORY_SEAL
         && operation <= MYOS_SYS_RESOURCE_CLOSE) {
@@ -89,6 +88,13 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_CLOCK_NOW
         && operation <= MYOS_SYS_CLOCK_FREQUENCY) {
         outcome = handle_clock(operation, invocation);
+    } else if ((operation >= MYOS_SYS_PAGER_REQUEST
+            && operation <= MYOS_SYS_PAGER_SUPPLY)
+        || operation == MYOS_SYS_PAGER_BIND) {
+        outcome = handle_pager_irq(operation, invocation);
+    } else if (operation >= MYOS_SYS_TERMINAL_QUERY
+        && operation <= MYOS_SYS_TERMINAL_OBSERVE_BIND) {
+        outcome = handle_terminal(operation, invocation);
     } else {
         outcome = returned(MYOS_STATUS_INVALID_OP);
     }

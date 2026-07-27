@@ -53,6 +53,7 @@ void register_translation_tests(TestRegistry& registry) noexcept;
 void register_vspace_tests(TestRegistry& registry) noexcept;
 void register_user_tests(TestRegistry& registry) noexcept;
 void register_ipc_tests(TestRegistry& registry) noexcept;
+void register_e7_tests(TestRegistry& registry) noexcept;
 
 void register_builtin_tests(TestRegistry& registry) noexcept {
     register_libk_tests(registry);
@@ -68,6 +69,7 @@ void register_builtin_tests(TestRegistry& registry) noexcept {
     register_vspace_tests(registry);
     register_user_tests(registry);
     register_ipc_tests(registry);
+    register_e7_tests(registry);
 }
 
 auto run_builtin_tests(const kernel::boot::BootInfo& boot) noexcept

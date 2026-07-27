@@ -300,6 +300,9 @@ auto VSpace::map_impl(
             MappedPage* const page = prepared_head;
             prepared_head = page->pending_next_;
             page->pending_next_ = nullptr;
+            if (page->page_mapping_.attached()) {
+                KASSERT(memory.unbind_mapping(page->page_mapping_));
+            }
             pages_.destroy(*page);
         }
     };
@@ -354,12 +357,19 @@ auto VSpace::map_impl(
             request.virtual_range.base().raw() + index * page_size};
         auto page_entry = pages_.create(
             address,
+            object_page,
             libk::move(source_page),
             libk::move(alias).value());
         if (!page_entry) {
             return fail(node_error(page_entry.error()));
         }
         MappedPage* const page = page_entry.value().object;
+        auto linked = memory.bind_mapping(
+            page->page_mapping_, object_page);
+        if (!linked) {
+            pages_.destroy(*page);
+            return fail(memory_error(linked.error()));
+        }
         if (prepared_tail != nullptr) {
             prepared_tail->pending_next_ = page;
         } else {

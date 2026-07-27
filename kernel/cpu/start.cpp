@@ -5,6 +5,7 @@
 #include <arch/ipi.hpp>
 #include <arch/trap.hpp>
 #include <diag/console.hpp>
+#include <irq/irq.hpp>
 #include <core/kernel_state.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_registry.hpp>
@@ -168,6 +169,7 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     KASSERT(runtime.local.descriptor->logical_id()
         == kernel.cpus().boot_id());
     install_local_entry(runtime, runtime.local.descriptor->hardware_id());
+    kernel::irq::initialize_platform();
     diag::console::print<"trap install ok\n">();
 
     auto allocation = kernel.pmm().allocate_page();

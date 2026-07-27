@@ -117,6 +117,8 @@ INIT_USER_TARGET := $(USER_BUILD_DIR)/init.elf
 INIT_USER_MAPFILE := $(USER_BUILD_DIR)/init.map
 PROOF_USER_TARGET := $(USER_BUILD_DIR)/proof.elf
 PROOF_USER_MAPFILE := $(USER_BUILD_DIR)/proof.map
+UART_USER_TARGET := $(USER_BUILD_DIR)/uart.elf
+UART_USER_MAPFILE := $(USER_BUILD_DIR)/uart.map
 USER_LINKER_SCRIPT := user/$(ARCH)/linker.ld
 BOOT_BUNDLE := $(USER_BUILD_DIR)/boot.bundle
 PROOF_BOOT_BUNDLE := $(USER_BUILD_DIR)/proof.bundle
@@ -179,6 +181,7 @@ ARCH_SRCS := \
   arch/riscv64/sbi/system.cpp \
   arch/riscv64/time/clock.cpp \
   arch/riscv64/time/timer.cpp \
+  arch/riscv64/uart/uart.cpp \
   arch/riscv64/mmu/sv39_builder.cpp \
   arch/riscv64/mmu/sv39_editor.cpp \
   arch/riscv64/mmu/range_map.cpp \
@@ -208,6 +211,8 @@ KERNEL_SRCS := \
 	kernel/ipc/buffer.cpp \
 	kernel/ipc/tunnel.cpp \
 	kernel/ipc/channel.cpp \
+  kernel/pager/pager.cpp \
+  kernel/irq/irq.cpp \
   kernel/ipc/endpoint.cpp \
   kernel/ipc/transfer.cpp \
   kernel/object/object_ref.cpp \
@@ -248,9 +253,14 @@ KERNEL_SRCS := \
     kernel/syscall/vproc.cpp \
     kernel/syscall/tunnel.cpp \
     kernel/syscall/endpoint.cpp \
-    kernel/syscall/channel.cpp \
+  kernel/syscall/channel.cpp \
+  kernel/syscall/pager_irq.cpp \
+  kernel/syscall/terminal.cpp \
   kernel/syscall/vm.cpp \
   kernel/time/clock.cpp \
+  kernel/mm/page_state.cpp \
+  kernel/fault/terminal.cpp \
+  kernel/fault/observation.cpp \
   kernel/mm/kernel_stack.cpp \
 	kernel/mm/memory_object.cpp \
 	kernel/mm/physical_alias.cpp \
@@ -290,7 +300,8 @@ TEST_SRCS := \
   test/translation_test.cpp \
   test/vspace_test.cpp \
   test/user_test.cpp \
-  test/ipc_test.cpp
+  test/ipc_test.cpp \
+  test/e7_test.cpp
 
 USER_RUNTIME_SRCS := \
   user/lib/crt0.S \
@@ -299,7 +310,8 @@ USER_RUNTIME_SRCS := \
   libk/mem.c
 INIT_USER_SRCS := servers/init/main.cpp
 PROOF_USER_SRCS := servers/proof/main.cpp
-USER_SRCS := $(USER_RUNTIME_SRCS) $(INIT_USER_SRCS) $(PROOF_USER_SRCS)
+UART_USER_SRCS := servers/uart/main.cpp
+USER_SRCS := $(USER_RUNTIME_SRCS) $(INIT_USER_SRCS) $(PROOF_USER_SRCS) $(UART_USER_SRCS)
 
 USER_CPP_SRCS := $(filter %.cpp,$(USER_SRCS))
 USER_C_SRCS := $(filter %.c,$(USER_SRCS))
@@ -312,6 +324,7 @@ USER_DEPS := $(USER_OBJS:.o=.d)
 USER_RUNTIME_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(USER_RUNTIME_SRCS:=.o))
 INIT_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(INIT_USER_SRCS:=.o))
 PROOF_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(PROOF_USER_SRCS:=.o))
+UART_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(UART_USER_SRCS:=.o))
 
 SRCS := $(ARCH_SRCS) $(KERNEL_SRCS)
 ifeq ($(ENABLE_TESTS),1)
@@ -333,7 +346,7 @@ CLANG_CPP_SRCS := $(filter-out test/%,$(CPP_SRCS))
 
 all: $(TARGET) audit-boot-stack
 
-bundle: $(BOOT_BUNDLE) $(PROOF_BOOT_BUNDLE) audit-user
+bundle: $(BOOT_BUNDLE) $(PROOF_BOOT_BUNDLE) $(UART_USER_TARGET) audit-user
 
 $(TARGET): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -366,6 +379,11 @@ $(PROOF_USER_TARGET): $(USER_RUNTIME_OBJS) $(PROOF_USER_OBJS) $(USER_LINKER_SCRI
 	$(CC) $(USER_LDFLAGS) -Wl,-Map,$(PROOF_USER_MAPFILE) \
 		-o $@ $(USER_RUNTIME_OBJS) $(PROOF_USER_OBJS)
 
+$(UART_USER_TARGET): $(USER_RUNTIME_OBJS) $(UART_USER_OBJS) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_LDFLAGS) -Wl,-Map,$(UART_USER_MAPFILE) \
+		-o $@ $(USER_RUNTIME_OBJS) $(UART_USER_OBJS)
+
 $(USER_BUILD_DIR)/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(USER_CXXFLAGS) -MMD -MP -c $< -o $@
@@ -382,8 +400,8 @@ $(BOOTPACK): tools/bootpack/main.cpp uapi/boot_bundle.h
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) -std=c++23 -O2 -Wall -Wextra -Werror -I . $< -o $@
 
-$(BOOT_BUNDLE): $(INIT_USER_TARGET) $(PROOF_USER_TARGET) $(BOOTPACK)
-	$(BOOTPACK) $@ init init=$(INIT_USER_TARGET) proof=$(PROOF_USER_TARGET)
+$(BOOT_BUNDLE): $(INIT_USER_TARGET) $(PROOF_USER_TARGET) $(UART_USER_TARGET) $(BOOTPACK)
+	$(BOOTPACK) $@ init init=$(INIT_USER_TARGET) proof=$(PROOF_USER_TARGET) uart=$(UART_USER_TARGET)
 
 $(PROOF_BOOT_BUNDLE): $(PROOF_USER_TARGET) $(BOOTPACK)
 	$(BOOTPACK) $@ proof proof=$(PROOF_USER_TARGET)
@@ -468,10 +486,10 @@ audit-clang:
 	done
 	@echo "[audit] OK: Clang syntax audit passed"
 
-audit-user: $(INIT_USER_TARGET) $(PROOF_USER_TARGET)
+audit-user: $(INIT_USER_TARGET) $(PROOF_USER_TARGET) $(UART_USER_TARGET)
 	@echo "[audit] checking independent user ELFs..."
 	@set -e; \
-	for image in $(INIT_USER_TARGET) $(PROOF_USER_TARGET); do \
+	for image in $(INIT_USER_TARGET) $(PROOF_USER_TARGET) $(UART_USER_TARGET); do \
 		if $(NM) -u "$$image" | rg -n "."; then \
 			echo "[audit] FAIL: undefined user symbol(s) in $$image"; \
 			exit 1; \

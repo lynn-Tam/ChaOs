@@ -29,6 +29,9 @@
 #include <uapi/vproc.h>
 #include <uapi/resource.h>
 #include <uapi/endpoint.h>
+#include <object/pager_pool.hpp>
+#include <object/irq_pool.hpp>
+#include <arch/uart.hpp>
 
 namespace kernel::syscall {
 namespace {
@@ -56,6 +59,10 @@ static_assert(MYOS_RESOURCE_ENDPOINT
     == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
 static_assert(MYOS_RESOURCE_CHANNEL
     == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
+static_assert(MYOS_RESOURCE_PAGER
+    == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
+static_assert(MYOS_RESOURCE_IRQ
+    == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
 
 using kernel::object::ObjectKind;
 
@@ -271,6 +278,17 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         cap::Right::Delegate,
         cap::Right::Inspect,
         cap::Right::Control,
+        cap::Right::Observe,
+        cap::Right::Destroy,
+        cap::Right::Revoke);
+}
+
+[[nodiscard]] constexpr auto context_rights() noexcept -> cap::Rights {
+    return cap::Rights::of(
+        cap::Right::Duplicate,
+        cap::Right::Delegate,
+        cap::Right::Inspect,
+        cap::Right::Control,
         cap::Right::Destroy,
         cap::Right::Revoke);
 }
@@ -281,6 +299,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         cap::Right::Delegate,
         cap::Right::Inspect,
         cap::Right::Control,
+        cap::Right::Observe,
         cap::Right::Destroy,
         cap::Right::Revoke);
 }
@@ -936,6 +955,75 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         second_installed.value().raw()};
 }
 
+[[gnu::noinline]] [[nodiscard]] auto create_pager(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    const u64 backing_key = invocation.trap.arg(1);
+    const usize max_pages = invocation.trap.arg(2);
+    if (!pool || backing_key == 0 || max_pages == 0
+        || max_pages > kernel::pager::max_request_pages) {
+        return returned(!pool ? cap_status(pool.error()) : MYOS_STATUS_BAD_ARGS);
+    }
+    return construct<kernel::pager::Pager>(
+        invocation,
+        pool.value(),
+        kernel::resource::Traits<kernel::pager::Pager>::fixed(),
+        kernel::resource::Traits<kernel::pager::Pager>::fixed(),
+        [&](kernel::resource::Reservation&& sponsorship) {
+            return kernel->objects().create_pager_sponsored(
+                libk::move(sponsorship));
+        },
+        [&](kernel::pager::Pager&) {
+            const auto rights = cap::Rights::of(
+                cap::Right::Duplicate, cap::Right::Delegate,
+                cap::Right::Inspect, cap::Right::Attach, cap::Right::Serve,
+                cap::Right::Supply,
+                cap::Right::Fail, cap::Right::WritebackAck,
+                cap::Right::Close, cap::Right::Destroy, cap::Right::Revoke);
+            const cap::PagerAuthority data{backing_key, max_pages};
+            return PublishedAuthority{
+                cap::GrantCeiling{rights, data},
+                cap::CapView{rights, data}};
+        });
+}
+
+[[gnu::noinline]] [[nodiscard]] auto create_irq(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    const u32 source = static_cast<u32>(invocation.trap.arg(1));
+    const bool level = invocation.trap.arg(2) != 0;
+    // E7 has one platform source only.  The integer is a bootstrap-selected
+    // device identity, not a user-chosen interrupt authority.
+    if (!pool || source != arch::riscv64::virt_uart_irq) {
+        return returned(!pool ? cap_status(pool.error()) : MYOS_STATUS_BAD_ARGS);
+    }
+    return construct<kernel::irq::Irq>(
+        invocation,
+        pool.value(),
+        kernel::resource::Traits<kernel::irq::Irq>::fixed(),
+        kernel::resource::Traits<kernel::irq::Irq>::fixed(),
+        [&](kernel::resource::Reservation&& sponsorship) {
+            return kernel->objects().create_irq_sponsored(
+                libk::move(sponsorship),
+                kernel::irq::SourceToken::from_bootstrap(source, level));
+        },
+        [&](kernel::irq::Irq&) {
+            const auto rights = cap::Rights::of(
+                cap::Right::Duplicate, cap::Right::Delegate,
+                cap::Right::Inspect, cap::Right::Route, cap::Right::Ack,
+                cap::Right::Control, cap::Right::Close,
+                cap::Right::Destroy, cap::Right::Revoke);
+            const cap::IrqAuthority data{source, level};
+            return PublishedAuthority{
+                cap::GrantCeiling{rights, data},
+                cap::CapView{rights, data}};
+        });
+}
+
 [[gnu::noinline]] [[nodiscard]] auto create_endpoint(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
@@ -1059,6 +1147,63 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         });
 }
 
+[[gnu::noinline]] [[nodiscard]] auto create_pager_memory(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    arch::TrapContext& trap = invocation.trap;
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    if (!pool) {
+        return returned(cap_status(pool.error()));
+    }
+    auto pager = invocation.cspace.resolve<kernel::pager::Pager>(
+        handle_of(trap.arg(3)), cap::Rights::of(cap::Right::Attach));
+    const usize size = trap.arg(1);
+    const auto access = access_of(trap.arg(2));
+    if (!pager) {
+        return returned(cap_status(pager.error()));
+    }
+    auto pager_reference = pager.value().reference();
+    if (!pager_reference) {
+        return returned(MYOS_STATUS_BUSY);
+    }
+    if (size == 0 || size % kernel::mm::page_size != 0 || !access) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    return construct<kernel::mm::MemoryObject>(
+        invocation,
+        pool.value(),
+        kernel::resource::Traits<kernel::mm::MemoryObject>::fixed(),
+        kernel::resource::Traits<kernel::mm::MemoryObject>::fixed(),
+        [&, pager_reference = libk::move(pager_reference).value()]
+        (kernel::resource::Reservation&& sponsorship) mutable {
+            return kernel->objects().create_pager_memory_sponsored(
+                libk::move(sponsorship),
+                size,
+                libk::move(pager_reference),
+                *access);
+        },
+        [&](kernel::mm::MemoryObject& memory) {
+            const kernel::mm::MemoryTypes types =
+                kernel::mm::MemoryTypes::of(kernel::mm::MemoryType::Normal);
+            const cap::MemoryAuthority data{
+                kernel::mm::ObjectRange{0, memory.page_count()},
+                *access,
+                types};
+            const auto rights = cap::Rights::of(
+                cap::Right::Duplicate,
+                cap::Right::Delegate,
+                cap::Right::Inspect,
+                cap::Right::Map,
+                cap::Right::Destroy,
+                cap::Right::Manage,
+                cap::Right::Revoke);
+            return PublishedAuthority{
+                cap::GrantCeiling{rights, data},
+                cap::CapView{rights, data}};
+        });
+}
+
 [[gnu::noinline]] [[nodiscard]] auto create_vspace(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
@@ -1087,7 +1232,10 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                     kernel::mm::Access::Read,
                     kernel::mm::Access::Write,
                     kernel::mm::Access::Execute),
-                kernel::mm::MemoryTypes::of(kernel::mm::MemoryType::Normal)};
+                kernel::mm::MemoryTypes::of(
+                    kernel::mm::MemoryType::Normal,
+                    kernel::mm::MemoryType::Uncached,
+                    kernel::mm::MemoryType::Device)};
             const auto rights = cap::Rights::of(
                 cap::Right::Duplicate,
                 cap::Right::Delegate,
@@ -1164,7 +1312,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     if (!kernel::sched::SchedulingContext::valid_config(config)) {
         return returned(MYOS_STATUS_BAD_ARGS);
     }
-    const auto rights = basic_rights();
+    const auto rights = context_rights();
     return construct_with<kernel::sched::SchedulingContext>(
         invocation,
         pool.value(),
@@ -1671,6 +1819,8 @@ auto handle_construction(
         return create_child(invocation);
     case MYOS_SYS_MEMORY_CREATE:
         return create_memory(invocation);
+    case MYOS_SYS_MEMORY_CREATE_PAGER:
+        return create_pager_memory(invocation);
     case MYOS_SYS_VSPACE_CREATE:
         return create_vspace(invocation);
     case MYOS_SYS_CSPACE_CREATE:
@@ -1689,6 +1839,10 @@ auto handle_construction(
         return create_endpoint(invocation);
     case MYOS_SYS_CHANNEL_CREATE:
         return create_channel(invocation);
+    case MYOS_SYS_PAGER_CREATE:
+        return create_pager(invocation);
+    case MYOS_SYS_IRQ_CREATE:
+        return create_irq(invocation);
     default:
         break;
     }

@@ -107,8 +107,51 @@ public:
             return Pte{*encoded | permissions.pte_bits() | valid_bit | accessed_bit_ |dirty_bit_};
     }
 
+    // User mappings start cold so hardware A/D updates remain observable;
+    // the legacy constructor above keeps the early boot builder's eager
+    // materialization contract explicit.
+    [[nodiscard]] static constexpr auto leaf_4k_cold(
+        kernel::mm::Page page,
+        PtePerm permissions) noexcept -> libk::optional<Pte> {
+        const auto encoded = encode_ppn(page);
+        if (!encoded) {
+            return libk::nullopt;
+        }
+        return Pte{*encoded | permissions.pte_bits() | valid_bit};
+    }
+
     [[nodiscard]] constexpr auto raw() const noexcept -> uint64_t {
         return bits_;
+    }
+
+    [[nodiscard]] constexpr auto accessed() const noexcept -> bool {
+        return (bits_ & accessed_bit_) != 0;
+    }
+
+    [[nodiscard]] constexpr auto dirty() const noexcept -> bool {
+        return (bits_ & dirty_bit_) != 0;
+    }
+
+    // Preserve the leaf identity and permissions while changing only the
+    // hardware usage bits. This is the narrow A/D observation boundary used
+    // by a future reclaimer; callers cannot manufacture a new PPN here.
+    [[nodiscard]] constexpr auto with_usage(
+        bool accessed,
+        bool dirty) const noexcept -> Pte {
+        uint64_t bits = bits_ & ~(accessed_bit_ | dirty_bit_);
+        if (accessed) {
+            bits |= accessed_bit_;
+        }
+        if (dirty) {
+            bits |= dirty_bit_;
+        }
+        return Pte{bits};
+    }
+
+    [[nodiscard]] constexpr auto with_permissions(
+        PtePerm permissions) const noexcept -> Pte {
+        return Pte{
+            (bits_ & ~perm_mask_) | permissions.pte_bits()};
     }
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {

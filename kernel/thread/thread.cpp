@@ -1,5 +1,7 @@
 #include <thread/thread.hpp>
 
+#include <fault/observation.hpp>
+
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
@@ -10,6 +12,32 @@
 #include <operation/completion.hpp>
 
 namespace kernel {
+
+auto Thread::observe_terminal(
+    ipc::Notification& notification,
+    u64 badge) noexcept -> bool {
+    if (terminal_observation_ != nullptr) {
+        return false;
+    }
+    auto* const observation = fault::allocate_observation();
+    if (observation == nullptr
+        || !observation->bind(terminal_, notification, badge)) {
+        if (observation != nullptr) {
+            fault::release_observation(*observation);
+        }
+        return false;
+    }
+    terminal_observation_ = observation;
+    return true;
+}
+
+void Thread::clear_terminal_observation() noexcept {
+    auto* const observation = libk::exchange(terminal_observation_, nullptr);
+    if (observation != nullptr) {
+        observation->reset();
+        fault::release_observation(*observation);
+    }
+}
 
 Thread::Thread(
     KernelStack&& home_stack,
@@ -59,6 +87,7 @@ Thread::Thread(
 }
 
 Thread::~Thread() noexcept {
+    clear_terminal_observation();
     KASSERT(execution_.state_ != State::Running);
     KASSERT(execution_.scheduler_binding_ == nullptr);
     KASSERT(!wait_.attached());
@@ -263,6 +292,8 @@ void Thread::finish_stop() noexcept {
     }
     authority_.target_stopped();
     execution_.binding().detach_user();
+    static_cast<void>(terminal_.claim(
+        fault::Reason::Stop, MYOS_STATUS_CANCELED));
 
     for (;;) {
         execution::Stop* request{};

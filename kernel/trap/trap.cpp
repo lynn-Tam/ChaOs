@@ -7,8 +7,11 @@
 #include <cpu/ipi.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <arch/uart.hpp>
 #include <diag/console.hpp>
+#include <irq/irq.hpp>
 #include <mm/vspace.hpp>
+#include <mm/virtual_layout.hpp>
 #include <operation/wait.hpp>
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
@@ -30,6 +33,17 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         case Interrupt::Software:
             kernel::handle_ipi(cpu.runtime());
             return;
+        case Interrupt::External: {
+            static arch::riscv64::Plic plic{
+                kernel::mm::layout::DirectMapBegin
+                + arch::riscv64::virt_plic_base};
+            const u32 source = plic.claim();
+            if (source != 0) {
+                kernel::irq::Irq::dispatch(source);
+                plic.complete(source);
+            }
+            return;
+        }
         default:
             panic_unhandled(event, context);
         }
@@ -103,7 +117,8 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             if (fault && fault.value().kind == kernel::mm::FaultKind::Materialized) {
                 return;
             }
-            if (fault && fault.value().kind == kernel::mm::FaultKind::Busy) {
+            if (fault && (fault.value().kind == kernel::mm::FaultKind::Busy
+                    || fault.value().kind == kernel::mm::FaultKind::Pending)) {
                 // Another VSpace transaction or page materialization owns the
                 // canonical mutation slot. The faulting instruction has not
                 // completed and its TrapFrame remains intact, so reschedule
@@ -125,12 +140,24 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         }
         if (thread != nullptr) {
             thread->record_user_fault(event);
+            static_cast<void>(thread->terminal().claim(
+                kernel::fault::Reason::Fault,
+                MYOS_STATUS_PEER_FAULT,
+                0,
+                event.pc(),
+                event.fault_addr()));
             kernel::diag::console::print<
                 "user: contained fault address={:#x} after syscalls={} "
                 "active-vspace-cpus={}\n">(
                 event.fault_addr(), thread->user_syscalls(),
                 execution->binding().vspace()->active_cpus().size());
         } else {
+            static_cast<void>(vproc->terminal().claim(
+                kernel::fault::Reason::Fault,
+                MYOS_STATUS_PEER_FAULT,
+                0,
+                event.pc(),
+                event.fault_addr()));
             kernel::diag::console::print<
                 "vproc: contained fault address={:#x} "
                 "active-vspace-cpus={}\n">(

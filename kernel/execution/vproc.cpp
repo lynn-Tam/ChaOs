@@ -1,5 +1,6 @@
 #include <execution/vproc.hpp>
 
+#include <fault/observation.hpp>
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
@@ -12,6 +13,33 @@
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel {
+
+auto Vproc::observe_terminal(
+    ipc::Notification& notification,
+    u64 badge) noexcept -> bool {
+    if (terminal_observation_ != nullptr) {
+        return false;
+    }
+    auto* const observation = fault::allocate_observation();
+    if (observation == nullptr
+        || !observation->bind(terminal_, notification, badge)) {
+        if (observation != nullptr) {
+            fault::release_observation(*observation);
+        }
+        return false;
+    }
+    terminal_observation_ = observation;
+    return true;
+}
+
+void Vproc::clear_terminal_observation() noexcept {
+    auto* const observation = libk::exchange(terminal_observation_, nullptr);
+    if (observation != nullptr) {
+        observation->reset();
+        fault::release_observation(*observation);
+    }
+}
+
 namespace {
 
 [[nodiscard]] auto valid_runtime(const VprocRuntime& runtime) noexcept -> bool {
@@ -65,6 +93,7 @@ Vproc::Vproc(
 }
 
 Vproc::~Vproc() noexcept {
+    clear_terminal_observation();
     KASSERT(execution_.state_ != State::Running);
     KASSERT(execution_.scheduler_binding_ == nullptr);
     KASSERT(execution_.home_ == nullptr);
@@ -657,6 +686,8 @@ void Vproc::finish_stop() noexcept {
     }
     execution_.binding().detach_user();
     authority_.target_stopped();
+    static_cast<void>(terminal_.claim(
+        fault::Reason::Stop, MYOS_STATUS_CANCELED));
     arm_ = {};
     runtime_.control_page.reset();
     runtime_.event_page.reset();

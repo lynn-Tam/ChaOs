@@ -98,6 +98,22 @@ struct ChannelAuthority final {
         ChannelAuthority, ChannelAuthority) noexcept -> bool = default;
 };
 
+struct PagerAuthority final {
+    u64 backing_key{};
+    usize max_pages{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        PagerAuthority, PagerAuthority) noexcept -> bool = default;
+};
+
+struct IrqAuthority final {
+    u32 source{};
+    bool level{};
+
+    [[nodiscard]] friend constexpr auto operator==(
+        IrqAuthority, IrqAuthority) noexcept -> bool = default;
+};
+
 using AuthorityData = libk::variant<
     libk::monostate,
     MemoryAuthority,
@@ -105,7 +121,9 @@ using AuthorityData = libk::variant<
     ResourcePoolAuthority,
     NotificationAuthority,
     EndpointAuthority,
-    ChannelAuthority>;
+    ChannelAuthority,
+    PagerAuthority,
+    IrqAuthority>;
 
 struct GrantCeiling final {
     Rights rights{};

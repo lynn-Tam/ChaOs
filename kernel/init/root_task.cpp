@@ -2,7 +2,9 @@
 #include <cap/authority.hpp>
 #include <cap/cspace.hpp>
 #include <cap/rights.hpp>
+#include <arch/uart.hpp>
 #include <core/kernel_state.hpp>
+#include <diag/console.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/mem.h>
@@ -295,6 +297,10 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
         kernel::cap::Right::Revoke);
     const kernel::mm::MemoryTypes normal = kernel::mm::MemoryTypes::of(
         kernel::mm::MemoryType::Normal);
+    const kernel::mm::MemoryTypes bootstrap_types = kernel::mm::MemoryTypes::of(
+        kernel::mm::MemoryType::Normal,
+        kernel::mm::MemoryType::Uncached,
+        kernel::mm::MemoryType::Device);
     const kernel::cap::VSpaceAuthority vspace_authority{
         .region = vspace_->root_key(),
         .range = kernel::mm::VirtRange{
@@ -304,7 +310,11 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
             kernel::mm::Access::Read,
             kernel::mm::Access::Write,
             kernel::mm::Access::Execute),
-        .types = normal,
+        // Root init is the trusted bootstrap supervisor.  Its VSpace
+        // authority must include the platform memory classes so it can hand
+        // a device mapping to a user service without manufacturing a second
+        // physical-memory path.
+        .types = bootstrap_types,
     };
     const kernel::cap::MemoryAuthority bundle_authority{
         .range = kernel::mm::ObjectRange{0, image_->page_count()},
@@ -319,6 +329,93 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
         .budget = pool_->limit(),
         .object_kinds = resource_kinds,
     };
+
+    // The platform owns the UART identity.  Root init receives these exact
+    // resources as bootstrap capabilities; it must delegate them to the UART
+    // service instead of manufacturing a source number or physical mapping.
+    const auto uart_physical = kernel::mm::PageRange::from_aligned_bytes(
+        kernel::mm::PhysAddr{arch::riscv64::virt_uart_base},
+        kernel::mm::page_size);
+    KASSERT(uart_physical);
+    const kernel::mm::MemoryExtent uart_extent{
+        .object = kernel::mm::ObjectRange{0, 1},
+        .physical = *uart_physical,
+        .access = kernel::mm::AccessMask::of(
+            kernel::mm::Access::Read, kernel::mm::Access::Write),
+        .type = kernel::mm::MemoryType::Device,
+    };
+    auto uart_memory_charge = reserve(
+        kernel::resource::Traits<kernel::mm::MemoryObject>::fixed());
+    auto uart_memory = uart_memory_charge
+        ? kernel.objects().create_physical_sponsored(
+              libk::move(uart_memory_charge).value(),
+              kernel::mm::page_size,
+              libk::Span<const kernel::mm::MemoryExtent>{&uart_extent, 1})
+        : libk::Expected<kernel::object::ObjectStore::MemoryPending,
+              kernel::mm::MemoryError>{
+              libk::unexpected(kernel::mm::MemoryError::OutOfMemory)};
+    if (!uart_memory) {
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    }
+    uart_memory_ = libk::move(uart_memory).value().publish();
+
+    auto uart_irq_charge = reserve(
+        kernel::resource::Traits<kernel::irq::Irq>::fixed());
+    auto uart_irq = uart_irq_charge
+        ? kernel.objects().create_irq_sponsored(
+              libk::move(uart_irq_charge).value(),
+              kernel::irq::SourceToken::from_bootstrap(
+                  arch::riscv64::virt_uart_irq))
+        : libk::Expected<kernel::object::ObjectStore::IrqPending,
+              kernel::object::IrqPool::Error>{
+              libk::unexpected(kernel::object::ObjectError::OutOfMemory)};
+    if (!uart_irq) {
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    }
+    uart_irq_ = libk::move(uart_irq).value().publish();
+
+    auto uart_notification_charge = reserve(
+        kernel::resource::Traits<kernel::ipc::Notification>::fixed());
+    auto uart_notification = uart_notification_charge
+        ? kernel.objects().create_notification_sponsored(
+              libk::move(uart_notification_charge).value())
+        : libk::Expected<kernel::object::ObjectStore::NotificationPending,
+              kernel::object::NotificationPool::Error>{
+              libk::unexpected(kernel::object::ObjectError::OutOfMemory)};
+    if (!uart_notification) {
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    }
+    uart_notification_ = libk::move(uart_notification).value().publish();
+
+    const kernel::mm::MemoryTypes device = kernel::mm::MemoryTypes::of(
+        kernel::mm::MemoryType::Device);
+    const kernel::cap::MemoryAuthority uart_memory_authority{
+        .range = kernel::mm::ObjectRange{0, 1},
+        .access = kernel::mm::AccessMask::of(
+            kernel::mm::Access::Read, kernel::mm::Access::Write),
+        .types = device,
+    };
+    const auto uart_memory_rights = kernel::cap::Rights::of(
+        kernel::cap::Right::Duplicate,
+        kernel::cap::Right::Delegate,
+        kernel::cap::Right::Map,
+        kernel::cap::Right::Inspect,
+        kernel::cap::Right::Revoke);
+    const auto uart_irq_rights = kernel::cap::Rights::of(
+        kernel::cap::Right::Duplicate,
+        kernel::cap::Right::Delegate,
+        kernel::cap::Right::Route,
+        kernel::cap::Right::Ack,
+        kernel::cap::Right::Inspect,
+        kernel::cap::Right::Close,
+        kernel::cap::Right::Revoke);
+    const auto uart_notification_rights = kernel::cap::Rights::of(
+        kernel::cap::Right::Duplicate,
+        kernel::cap::Right::Delegate,
+        kernel::cap::Right::Signal,
+        kernel::cap::Right::Receive,
+        kernel::cap::Right::Inspect,
+        kernel::cap::Right::Revoke);
     if (!add_cap(
             MYOS_BOOTSTRAP_CAP_VSPACE, vspace_.ref(), vspace_rights,
             vspace_authority)
@@ -339,7 +436,23 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
             MYOS_BOOTSTRAP_CAP_RESOURCE_POOL,
             pool_.ref(),
             pool_rights,
-            pool_authority)) {
+            pool_authority)
+        || !add_cap(
+            MYOS_BOOTSTRAP_CAP_UART_MEMORY,
+            uart_memory_.ref(),
+            uart_memory_rights,
+            uart_memory_authority)
+        || !add_cap(
+            MYOS_BOOTSTRAP_CAP_UART_IRQ,
+            uart_irq_.ref(),
+            uart_irq_rights,
+            kernel::cap::IrqAuthority{
+                arch::riscv64::virt_uart_irq, true})
+        || !add_cap(
+            MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION,
+            uart_notification_.ref(),
+            uart_notification_rights,
+            kernel::cap::NotificationAuthority{1})) {
         return libk::unexpected(RootTaskError::CapabilityFailed);
     }
 
@@ -577,6 +690,10 @@ void RootTask::rollback(kernel::KernelState& kernel) noexcept {
         context_.reset();
     }
     if (thread_) {
+        // The user binding is attached before bootstrap capabilities are
+        // installed.  A failed preparation path therefore has to release the
+        // execution relation before the Thread object can retire.
+        thread_->execution().binding().detach_user();
         KASSERT(thread_.retire());
         thread_.reset();
     }
@@ -585,6 +702,9 @@ void RootTask::rollback(kernel::KernelState& kernel) noexcept {
         KASSERT(cspace_.retire());
         cspace_.reset();
     }
+    uart_notification_.reset();
+    uart_irq_.reset();
+    uart_memory_.reset();
     if (vspace_) {
         KASSERT(vspace_.retire());
         vspace_.reset();

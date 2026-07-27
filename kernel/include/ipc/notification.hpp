@@ -4,6 +4,7 @@
 #include <cap/grant.hpp>
 #include <cap/resolved.hpp>
 #include <ipc/notification_link.hpp>
+#include <ipc/notification_source.hpp>
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
@@ -39,48 +40,6 @@ struct NotificationWait final {
 struct NotificationTake final {
     u64 badges{};
     u64 sequence{};
-};
-
-// A source owns this relation and its canonical readiness state. Notification
-// stores only the non-owning aggregation edge. Source teardown must unbind;
-// Notification teardown invokes the statically bound closed callback.
-class NotificationSource final : private libk::noncopyable_nonmovable {
-public:
-    template<typename Owner, void (Owner::*Closed)() noexcept>
-    [[nodiscard]] static auto bind(Owner& owner) noexcept
-        -> NotificationSource {
-        static constexpr Ops operations{
-            .closed = [](void* context) noexcept {
-                (static_cast<Owner*>(context)->*Closed)();
-            },
-        };
-        return NotificationSource{owner, operations};
-    }
-
-    ~NotificationSource() noexcept;
-
-    [[nodiscard]] auto attached() const noexcept -> bool;
-    [[nodiscard]] auto signal() noexcept -> bool;
-    void reset() noexcept;
-
-private:
-    friend class Notification;
-
-    struct Ops final {
-        void (*closed)(void*) noexcept;
-    };
-
-    template<typename Owner>
-    explicit NotificationSource(Owner& owner, const Ops& ops) noexcept
-        : owner_(&owner), ops_(&ops) {}
-
-    mutable kernel::sync::SpinLock<
-        kernel::sync::LockClass::NotificationSource> lock_{};
-    libk::IntrusiveListHook hook_{};
-    void* owner_{};
-    const Ops* ops_{};
-    Notification* notification_{};
-    u64 badge_{};
 };
 
 class Notification final : private libk::noncopyable_nonmovable {

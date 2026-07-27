@@ -65,6 +65,17 @@ constexpr Rights channel_rights = Rights::of(
     Right::Destroy,
     Right::Revoke);
 
+constexpr Rights pager_rights = Rights::of(
+    Right::Duplicate, Right::Delegate, Right::Inspect, Right::Attach,
+    Right::Serve,
+    Right::Supply, Right::Fail, Right::WritebackAck, Right::Close,
+    Right::Destroy, Right::Revoke);
+
+constexpr Rights irq_rights = Rights::of(
+    Right::Duplicate, Right::Delegate, Right::Inspect, Right::Route,
+    Right::Ack, Right::Control, Right::Close, Right::Destroy,
+    Right::Revoke);
+
 [[nodiscard]] auto valid(MemoryAuthority authority) noexcept -> bool {
     return authority.range.end().has_value()
         && kernel::mm::valid_access(authority.access)
@@ -101,6 +112,14 @@ constexpr Rights channel_rights = Rights::of(
     const bool exact = authority.fixed == ~u64{} && authority.badge != 0;
     return side && (unbound || exact)
         && (authority.side != ChannelSide::Any || unbound);
+}
+
+[[nodiscard]] auto valid(PagerAuthority authority) noexcept -> bool {
+    return authority.backing_key != 0 && authority.max_pages != 0;
+}
+
+[[nodiscard]] auto valid(IrqAuthority authority) noexcept -> bool {
+    return authority.source != 0;
 }
 
 template<object::ObjectKind Kind>
@@ -239,6 +258,62 @@ auto CapabilityPolicy<object::ObjectKind::Notification>::compose(
         ceiling.rights.intersect(view.rights), *local});
 }
 
+auto CapabilityPolicy<object::ObjectKind::Pager>::validate(
+    GrantCeiling ceiling) noexcept -> bool {
+    const auto* const data = libk::get_if<PagerAuthority>(&ceiling.data);
+    return pager_rights.contains(ceiling.rights)
+        && data != nullptr && valid(*data);
+}
+
+auto CapabilityPolicy<object::ObjectKind::Pager>::compose(
+    GrantCeiling ceiling,
+    CapView view) noexcept
+    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    const auto* const upper = libk::get_if<PagerAuthority>(&ceiling.data);
+    const auto* const local = libk::get_if<PagerAuthority>(&view.data);
+    if (!pager_rights.contains(ceiling.rights)
+        || !pager_rights.contains(view.rights)
+        || upper == nullptr || local == nullptr
+        || !valid(*upper) || !valid(*local)) {
+        return libk::unexpected(PolicyError::InvalidData);
+    }
+    if (!ceiling.rights.contains(view.rights)
+        || upper->backing_key != local->backing_key
+        || local->max_pages > upper->max_pages) {
+        return libk::unexpected(PolicyError::Amplification);
+    }
+    return libk::expected(EffectiveAuthority{
+        ceiling.rights.intersect(view.rights), *local});
+}
+
+auto CapabilityPolicy<object::ObjectKind::Irq>::validate(
+    GrantCeiling ceiling) noexcept -> bool {
+    const auto* const data = libk::get_if<IrqAuthority>(&ceiling.data);
+    return irq_rights.contains(ceiling.rights)
+        && data != nullptr && valid(*data);
+}
+
+auto CapabilityPolicy<object::ObjectKind::Irq>::compose(
+    GrantCeiling ceiling,
+    CapView view) noexcept
+    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    const auto* const upper = libk::get_if<IrqAuthority>(&ceiling.data);
+    const auto* const local = libk::get_if<IrqAuthority>(&view.data);
+    if (!irq_rights.contains(ceiling.rights)
+        || !irq_rights.contains(view.rights)
+        || upper == nullptr || local == nullptr
+        || !valid(*upper) || !valid(*local)) {
+        return libk::unexpected(PolicyError::InvalidData);
+    }
+    if (!ceiling.rights.contains(view.rights)
+        || upper->source != local->source
+        || upper->level != local->level) {
+        return libk::unexpected(PolicyError::Amplification);
+    }
+    return libk::expected(EffectiveAuthority{
+        ceiling.rights.intersect(view.rights), *local});
+}
+
 auto CapabilityPolicy<object::ObjectKind::Endpoint>::validate(
     GrantCeiling ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<EndpointAuthority>(&ceiling.data);
@@ -340,6 +415,10 @@ auto validate_ceiling(
         return CapabilityPolicy<object::ObjectKind::Endpoint>::validate(ceiling);
     case object::ObjectKind::Channel:
         return CapabilityPolicy<object::ObjectKind::Channel>::validate(ceiling);
+    case object::ObjectKind::Pager:
+        return CapabilityPolicy<object::ObjectKind::Pager>::validate(ceiling);
+    case object::ObjectKind::Irq:
+        return CapabilityPolicy<object::ObjectKind::Irq>::validate(ceiling);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return false;
@@ -377,6 +456,10 @@ auto compose(
         return compose_as<object::ObjectKind::Endpoint>(ceiling, view);
     case object::ObjectKind::Channel:
         return compose_as<object::ObjectKind::Channel>(ceiling, view);
+    case object::ObjectKind::Pager:
+        return compose_as<object::ObjectKind::Pager>(ceiling, view);
+    case object::ObjectKind::Irq:
+        return compose_as<object::ObjectKind::Irq>(ceiling, view);
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return libk::unexpected(PolicyError::UnsupportedKind);

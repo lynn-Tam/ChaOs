@@ -8,13 +8,19 @@
 #include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
 #include <mm/pmm.hpp>
+#include <mm/page_state.hpp>
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
+#include <object/object_ref.hpp>
 #include <resource/sponsorship.hpp>
 
 namespace kernel::object {
 template<typename T>
 struct ObjectTraits;
+}
+
+namespace kernel::pager {
+class Pager;
 }
 
 namespace kernel::mm {
@@ -40,6 +46,7 @@ enum class BackingKind : u8 {
     Anonymous,
     Physical,
     BootImage,
+    Pager,
 };
 
 enum class ContentState : u8 {
@@ -55,6 +62,36 @@ struct MemoryPage final {
     MemoryType type{MemoryType::Normal};
 };
 
+class MemoryObject;
+
+// A materialized PTE is a reverse relation of the MemoryObject page. The
+// mapping owns this node; the backing only indexes it while the mapping is
+// live. It carries no page ownership or PTE state.
+class PageMapping final : private libk::noncopyable_nonmovable {
+public:
+    PageMapping() noexcept = default;
+    ~PageMapping() noexcept;
+
+    [[nodiscard]] auto attached() const noexcept -> bool {
+        return owner_ != nullptr;
+    }
+    [[nodiscard]] auto page_index() const noexcept -> usize {
+        return page_index_;
+    }
+    [[nodiscard]] auto owner() const noexcept -> MemoryObject* {
+        return owner_;
+    }
+
+    // Public only so an owner-local intrusive index can name the hook.
+    libk::IntrusiveListHook backing_hook_{};
+
+private:
+    friend class MemoryObject;
+
+    MemoryObject* owner_{};
+    usize page_index_{};
+};
+
 enum class MemoryError : u8 {
     InvalidSize,
     InvalidRange,
@@ -65,6 +102,7 @@ enum class MemoryError : u8 {
     ResourceExhausted,
     GenerationExhausted,
     Busy,
+    Pending,
     BackingFailed,
     NotBacked,
     AttachmentState,
@@ -95,8 +133,42 @@ struct ContentEpoch final {
         ContentEpoch, ContentEpoch) noexcept -> bool = default;
 };
 
-class MemoryObject;
 class MemoryAttachment;
+
+// A source page remains owned by its staging MemoryObject until the target
+// pager backing accepts it.  Destruction aborts the transfer and restores the
+// source slot, so a failed supply cannot leave two owners or no owner.
+class PageTransfer final : private libk::noncopyable {
+public:
+    PageTransfer() noexcept = default;
+    PageTransfer(PageTransfer&& other) noexcept;
+    auto operator=(PageTransfer&& other) noexcept -> PageTransfer&;
+    ~PageTransfer() noexcept;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return owner_ != nullptr;
+    }
+    [[nodiscard]] auto page() const noexcept -> Page {
+        return page_.page();
+    }
+    [[nodiscard]] auto take_page() noexcept -> OwnedPage {
+        return libk::move(page_);
+    }
+    void commit() noexcept;
+    void abort() noexcept;
+
+private:
+    friend class MemoryObject;
+    PageTransfer(
+        MemoryObject& owner,
+        usize index,
+        OwnedPage&& page) noexcept
+        : owner_(&owner), index_(index), page_(libk::move(page)) {}
+
+    MemoryObject* owner_{};
+    usize index_{};
+    OwnedPage page_{};
+};
 
 class MemoryWork final : private libk::noncopyable {
 public:
@@ -202,6 +274,17 @@ public:
         BootOwnership ownership,
         OwnedPageGroup&& owned = {}) noexcept
         -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto initialize_pager(
+        kernel::pager::Pager& pager,
+        AccessMask access) noexcept
+        -> libk::Expected<void, MemoryError>;
+    // The structural reference keeps the Pager payload alive for the whole
+    // backing lifetime. The raw overload above is retained for stack-owned
+    // unit-test pagers and is intentionally non-owning.
+    [[nodiscard]] auto initialize_pager(
+        object::ObjectRef&& pager,
+        AccessMask access) noexcept
+        -> libk::Expected<void, MemoryError>;
 
     [[nodiscard]] auto size() const noexcept -> usize {
         return logical_pages_ * page_size;
@@ -221,6 +304,49 @@ public:
         -> libk::Expected<ContentState, MemoryError>;
     [[nodiscard]] auto materialize(usize page_index) noexcept
         -> libk::Expected<PageLease, MemoryError>;
+    [[nodiscard]] auto begin_transfer(usize page_index) noexcept
+        -> libk::Expected<PageTransfer, MemoryError>;
+    [[nodiscard]] auto pager_supply(
+        usize page_index,
+        u64 request_generation,
+        u64 claim_generation,
+        OwnedPage&& page,
+        u64 content_epoch) noexcept
+        -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto pager_supply_transfer(
+        PageTransfer&& transfer,
+        usize page_index,
+        u64 request_generation,
+        u64 claim_generation,
+        u64 content_epoch) noexcept
+        -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto pager_fail(
+        usize page_index,
+        u64 request_generation,
+        u64 claim_generation) noexcept
+        -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto bind_mapping(
+        PageMapping& mapping,
+        usize page_index) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto unbind_mapping(
+        PageMapping& mapping) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto page_state(usize page_index) const noexcept
+        -> libk::Expected<PageSlotState, MemoryError>;
+    [[nodiscard]] auto observe_usage(
+        usize page_index,
+        bool accessed,
+        bool dirty) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto queue_writeback(usize page_index) noexcept
+        -> libk::Expected<u64, MemoryError>;
+    [[nodiscard]] auto begin_writeback(
+        usize page_index,
+        u64 epoch) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto complete_writeback(
+        usize page_index,
+        u64 epoch,
+        bool clean) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto evict_page(usize page_index) noexcept
+        -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept
         -> libk::Expected<void, MemoryError>;
 
@@ -234,6 +360,7 @@ public:
 private:
     friend struct kernel::object::ObjectTraits<MemoryObject>;
     friend class PageLease;
+    friend class PageTransfer;
     friend class MemoryAttachment;
 
     using AttachmentList = libk::IntrusiveList<
@@ -246,6 +373,62 @@ private:
         libk::Expected<MemoryPage, MemoryError> (*materialize)(
             void* backing,
             usize page_index) noexcept;
+        libk::Expected<OwnedPage, MemoryError> (*begin_transfer)(
+            void* backing,
+            usize page_index) noexcept;
+        libk::Expected<void, MemoryError> (*restore_transfer)(
+            void* backing,
+            usize page_index,
+            OwnedPage&& page) noexcept;
+        libk::Expected<void, MemoryError> (*commit_transfer)(
+            void* backing,
+            usize page_index) noexcept;
+        libk::Expected<void, MemoryError> (*supply)(
+            void* backing,
+            usize page_index,
+            u64 request_generation,
+            u64 claim_generation,
+            OwnedPage&& page,
+            u64 content_epoch) noexcept;
+        libk::Expected<void, MemoryError> (*fail)(
+            void* backing,
+            usize page_index,
+            u64 request_generation,
+            u64 claim_generation) noexcept;
+        libk::Expected<void, MemoryError> (*bind_mapping)(
+            void* backing,
+            usize page_index,
+            PageMapping& mapping) noexcept;
+        libk::Expected<void, MemoryError> (*unbind_mapping)(
+            void* backing,
+            PageMapping& mapping) noexcept;
+        libk::Expected<void, MemoryError> (*lease_acquire)(
+            void* backing,
+            usize page_index) noexcept;
+        void (*lease_release)(void* backing, Page page) noexcept;
+        libk::Expected<PageSlotState, MemoryError> (*page_state)(
+            const void* backing,
+            usize page_index) noexcept;
+        libk::Expected<void, MemoryError> (*observe_usage)(
+            void* backing,
+            usize page_index,
+            bool accessed,
+            bool dirty) noexcept;
+        libk::Expected<u64, MemoryError> (*queue_writeback)(
+            void* backing,
+            usize page_index) noexcept;
+        libk::Expected<void, MemoryError> (*begin_writeback)(
+            void* backing,
+            usize page_index,
+            u64 epoch) noexcept;
+        libk::Expected<void, MemoryError> (*complete_writeback)(
+            void* backing,
+            usize page_index,
+            u64 epoch,
+            bool clean) noexcept;
+        libk::Expected<void, MemoryError> (*evict_page)(
+            void* backing,
+            usize page_index) noexcept;
         void (*destroy)(void* backing) noexcept;
     };
 
@@ -254,15 +437,23 @@ private:
         libk::Span<const MemoryExtent> extents,
         AnonymousConfig anonymous,
         BootOwnership boot_ownership,
-        OwnedPageGroup&& boot_pages) noexcept
+        OwnedPageGroup&& boot_pages,
+        kernel::pager::Pager* pager,
+        AccessMask pager_access,
+        object::ObjectRef&& pager_ref) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto detach(MemoryAttachment& attachment) noexcept -> bool;
     void drop_page() noexcept;
+    void finish_transfer(
+        usize page_index,
+        OwnedPage&& page,
+        bool commit) noexcept;
     void finish_retire() noexcept;
     void fail_build() noexcept;
     void bind_sponsor(kernel::resource::Sponsorship& sponsor) noexcept;
     [[nodiscard]] auto reserve_dynamic(kernel::resource::Budget charge) noexcept
         -> libk::Expected<kernel::resource::Reservation, MemoryError>;
+    void release_lease(Page page) noexcept;
 
     Pmm* pmm_{};
     usize logical_pages_{};
@@ -278,7 +469,9 @@ private:
     SealState seal_{SealState::Loadable};
     ContentEpoch content_epoch_{};
     AccessMask access_{};
+    object::ObjectRef pager_ref_{};
     bool releasing_{};
+    usize mapping_count_{};
     kernel::resource::Sponsorship* sponsor_{};
 };
 

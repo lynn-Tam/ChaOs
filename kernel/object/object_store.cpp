@@ -12,6 +12,8 @@ ObjectStore::ObjectStore(
       resources_(pmm, reclaim_notify_),
       endpoints_(pmm, reclaim_notify_),
       channels_(pmm, reclaim_notify_),
+      pagers_(pmm, reclaim_notify_),
+      irqs_(pmm, reclaim_notify_),
       tunnels_(pmm, reclaim_notify_),
       vprocs_(pmm, reclaim_notify_),
       notifications_(pmm, reclaim_notify_),
@@ -28,6 +30,8 @@ ObjectStore::~ObjectStore() noexcept {
     KASSERT(vspaces_.live_count() == 0);
     KASSERT(endpoints_.live_count() == 0);
     KASSERT(channels_.live_count() == 0);
+    KASSERT(pagers_.live_count() == 0);
+    KASSERT(irqs_.live_count() == 0);
     KASSERT(tunnels_.live_count() == 0);
     KASSERT(vprocs_.live_count() == 0);
     KASSERT(notifications_.live_count() == 0);
@@ -131,11 +135,49 @@ auto ObjectStore::create_anonymous_sponsored(
     return libk::expected(libk::move(memory));
 }
 
+auto ObjectStore::create_pager_memory_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    usize byte_size,
+    object::ObjectRef&& pager,
+    kernel::mm::AccessMask access) noexcept
+    -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
+    auto pending = memories_.create_sponsored(
+        libk::move(sponsorship), *pmm_, byte_size);
+    if (!pending) {
+        return libk::unexpected(memory_pool_error(pending.error()));
+    }
+    MemoryPending memory = libk::move(pending).value();
+    auto initialized = memory.get().initialize_pager(
+        libk::move(pager), access);
+    if (!initialized) {
+        return libk::unexpected(initialized.error());
+    }
+    return libk::expected(libk::move(memory));
+}
+
 auto ObjectStore::create_physical(
     usize byte_size,
     libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create(*pmm_, byte_size);
+    if (!pending) {
+        return libk::unexpected(memory_pool_error(pending.error()));
+    }
+    MemoryPending memory = libk::move(pending).value();
+    auto initialized = memory.get().initialize_physical(extents);
+    if (!initialized) {
+        return libk::unexpected(initialized.error());
+    }
+    return libk::expected(libk::move(memory));
+}
+
+auto ObjectStore::create_physical_sponsored(
+    kernel::resource::Reservation&& sponsorship,
+    usize byte_size,
+    libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
+    -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
+    auto pending = memories_.create_sponsored(
+        libk::move(sponsorship), *pmm_, byte_size);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -317,9 +359,31 @@ auto ObjectStore::pin_channel(ObjectId id) noexcept
     return channels_.pin(id);
 }
 
+auto ObjectStore::hold_pager(ObjectId id) noexcept
+    -> libk::Expected<PagerHold, PagerPool::Error> {
+    return pagers_.hold(id);
+}
+
+auto ObjectStore::pin_pager(ObjectId id) noexcept
+    -> libk::Expected<PagerPin, PagerPool::Error> {
+    return pagers_.pin(id);
+}
+
+auto ObjectStore::hold_irq(ObjectId id) noexcept
+    -> libk::Expected<IrqHold, IrqPool::Error> {
+    return irqs_.hold(id);
+}
+
+auto ObjectStore::pin_irq(ObjectId id) noexcept
+    -> libk::Expected<IrqPin, IrqPool::Error> {
+    return irqs_.pin(id);
+}
+
 void ObjectStore::drain_reclaim() noexcept {
     endpoints_.drain_reclaim();
     channels_.drain_reclaim();
+    pagers_.drain_reclaim();
+    irqs_.drain_reclaim();
     tunnels_.drain_reclaim();
     vprocs_.drain_reclaim();
     notifications_.drain_reclaim();

@@ -15,6 +15,8 @@
 #include <object/tunnel_pool.hpp>
 #include <object/vspace_pool.hpp>
 #include <object/vproc_pool.hpp>
+#include <object/pager_pool.hpp>
+#include <object/irq_pool.hpp>
 
 namespace kernel::object {
 
@@ -72,6 +74,14 @@ public:
     using ChannelPending = object::ChannelPending;
     using ChannelHold = object::ChannelHold;
     using ChannelPin = object::ChannelPin;
+    using PagerPool = object::PagerPool;
+    using PagerPending = object::PagerPending;
+    using PagerHold = object::PagerHold;
+    using PagerPin = object::PagerPin;
+    using IrqPool = object::IrqPool;
+    using IrqPending = object::IrqPending;
+    using IrqHold = object::IrqHold;
+    using IrqPin = object::IrqPin;
 
     explicit ObjectStore(kernel::mm::Pmm& pmm, kernel::mm::VSpaceExecutor& vspace_work) noexcept;
     ~ObjectStore() noexcept;
@@ -153,7 +163,18 @@ public:
         usize byte_size,
         kernel::mm::AnonymousConfig config = {}) noexcept
         -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
+    [[nodiscard]] auto create_pager_memory_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        usize byte_size,
+        object::ObjectRef&& pager,
+        kernel::mm::AccessMask access) noexcept
+        -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
     [[nodiscard]] auto create_physical(
+        usize byte_size,
+        libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
+        -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
+    [[nodiscard]] auto create_physical_sponsored(
+        kernel::resource::Reservation&& sponsorship,
         usize byte_size,
         libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
         -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
@@ -256,6 +277,38 @@ public:
         -> libk::Expected<ChannelHold, ChannelPool::Error>;
     [[nodiscard]] auto pin_channel(ObjectId id) noexcept
         -> libk::Expected<ChannelPin, ChannelPool::Error>;
+    template<typename... Args>
+    [[nodiscard]] auto create_pager(Args&&... args) noexcept
+        -> libk::Expected<PagerPending, PagerPool::Error> {
+        return pagers_.create(libk::forward<Args>(args)...);
+    }
+    template<typename... Args>
+    [[nodiscard]] auto create_pager_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept -> libk::Expected<PagerPending, PagerPool::Error> {
+        return pagers_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
+    }
+    [[nodiscard]] auto hold_pager(ObjectId id) noexcept
+        -> libk::Expected<PagerHold, PagerPool::Error>;
+    [[nodiscard]] auto pin_pager(ObjectId id) noexcept
+        -> libk::Expected<PagerPin, PagerPool::Error>;
+    template<typename... Args>
+    [[nodiscard]] auto create_irq(Args&&... args) noexcept
+        -> libk::Expected<IrqPending, IrqPool::Error> {
+        return irqs_.create(libk::forward<Args>(args)...);
+    }
+    template<typename... Args>
+    [[nodiscard]] auto create_irq_sponsored(
+        kernel::resource::Reservation&& sponsorship,
+        Args&&... args) noexcept -> libk::Expected<IrqPending, IrqPool::Error> {
+        return irqs_.create_sponsored(
+            libk::move(sponsorship), libk::forward<Args>(args)...);
+    }
+    [[nodiscard]] auto hold_irq(ObjectId id) noexcept
+        -> libk::Expected<IrqHold, IrqPool::Error>;
+    [[nodiscard]] auto pin_irq(ObjectId id) noexcept
+        -> libk::Expected<IrqPin, IrqPool::Error>;
 
     // Runtime has exactly one drain executor. Tests and terminal teardown may
     // call this directly only while that executor is absent or stopped.
@@ -278,6 +331,8 @@ private:
     ResourcePool resources_;
     EndpointPool endpoints_;
     ChannelPool channels_;
+    PagerPool pagers_;
+    IrqPool irqs_;
     TunnelPool tunnels_;
     VprocPool vprocs_;
     NotificationPool notifications_;

@@ -18,6 +18,8 @@ enum class ObjectKind : u16 {
     Tunnel,
     Endpoint,
     Channel,
+    Pager,
+    Irq,
     Count,
 };
 

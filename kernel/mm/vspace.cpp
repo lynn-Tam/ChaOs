@@ -24,6 +24,7 @@ Mapping::~Mapping() noexcept {
 MappedPage::~MappedPage() noexcept {
     KASSERT(!tree_hook_.is_linked());
     KASSERT(!source_ && !alias_);
+    KASSERT(!page_mapping_.attached());
 }
 
 const MemoryAttachmentOps MappingAuthority::memory_ops_{
@@ -366,6 +367,9 @@ void VSpace::destroy_layout(LayoutNode& node) noexcept {
 }
 
 void VSpace::release_page(MappedPage& page) noexcept {
+    if (MemoryObject* const memory = page.page_mapping_.owner()) {
+        KASSERT(memory->unbind_mapping(page.page_mapping_));
+    }
     kernel_->aliases().release(page.page_, page.type_);
     pages_.destroy(page);
 }

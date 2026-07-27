@@ -98,6 +98,9 @@ auto VSpace::materialize_fault(
     };
     auto resident = authority.memory().materialize(object_page);
     if (!resident) {
+        if (resident.error() == MemoryError::Pending) {
+            return fail(FaultKind::Pending);
+        }
         if (resident.error() == MemoryError::Busy) {
             return fail(FaultKind::Busy);
         }
@@ -137,15 +140,27 @@ auto VSpace::materialize_fault(
             : VSpaceError::OutOfMemory);
     }
     auto made = pages_.create(
-        page_address, libk::move(source), libk::move(alias).value());
+        page_address,
+        object_page,
+        libk::move(source),
+        libk::move(alias).value());
     if (!made) {
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
         return libk::unexpected(node_error(made.error()));
     }
     MappedPage* const page = made.value().object;
+    auto linked = authority.memory().bind_mapping(
+        page->page_mapping_, object_page);
+    if (!linked) {
+        pages_.destroy(*page);
+        kernel::sync::IrqLockGuard guard{lock_};
+        release_claim();
+        return libk::unexpected(memory_error(linked.error()));
+    }
     auto table_reserve = reserve_tables(page);
     if (!table_reserve) {
+        KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
         pages_.destroy(*page);
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
@@ -163,6 +178,7 @@ auto VSpace::materialize_fault(
         || authority.pages_.find(page_address) != nullptr) {
         release_claim();
         lock.restore();
+        KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::InvalidState);
     }
@@ -170,6 +186,7 @@ auto VSpace::materialize_fault(
     if (!mutation) {
         release_claim();
         lock.restore();
+        KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
@@ -178,6 +195,7 @@ auto VSpace::materialize_fault(
         mutation.value().abort();
         release_claim();
         lock.restore();
+        KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
         pages_.destroy(*page);
         return libk::unexpected(plan.error());
     }
@@ -213,6 +231,116 @@ auto VSpace::materialize_fault(
         .object_page = object_page,
         .status = committed.value(),
     });
+}
+
+auto VSpace::sample_usage(
+    VmContext context,
+    VirtAddr address,
+    bool clear) noexcept -> libk::Expected<PageUsage, VSpaceError> {
+    const usize aligned = address.raw() & ~(page_size - 1);
+    const VirtRange page_range{VirtAddr{aligned}, page_size};
+    if (!valid_user_range(page_range)) {
+        return libk::unexpected(VSpaceError::InvalidRange);
+    }
+
+    kernel::sync::IrqLockToken lock{lock_};
+    auto fail = [&](VSpaceError error)
+        -> libk::Expected<PageUsage, VSpaceError> {
+        lock.restore();
+        return libk::unexpected(error);
+    };
+    if (state_ != VSpaceState::Live
+        || pending_kind_ != PendingKind::None
+        || claim_.region != nullptr) {
+        return fail(VSpaceError::Busy);
+    }
+
+    Mapping* mapping{};
+    AddressRegion* region = root_region_;
+    while (region != nullptr) {
+        LayoutNode* node = region->children_.lower_bound(page_range.base());
+        if (node == nullptr || node->range_.base() > page_range.base()) {
+            node = node != nullptr
+                ? region->children_.previous(*node)
+                : region->children_.maximum();
+        }
+        if (node == nullptr || !node->range_.contains(page_range)) {
+            return fail(VSpaceError::NotMapped);
+        }
+        if (node->kind_ == LayoutKind::Region) {
+            region = static_cast<AddressRegion*>(node);
+            continue;
+        }
+        if (node->kind_ != LayoutKind::Mapping) {
+            return fail(VSpaceError::NotMapped);
+        }
+        mapping = static_cast<Mapping*>(node);
+        break;
+    }
+    if (mapping == nullptr || mapping->state_ != MappingState::Live) {
+        return fail(VSpaceError::NotMapped);
+    }
+    const auto offset = mapping->range_.page_offset(page_range.base());
+    if (!offset) {
+        return fail(VSpaceError::InvalidRange);
+    }
+    const usize object_page = mapping->object_.first + *offset;
+    MappingAuthority& authority = *mapping->authority_;
+    MappedPage* const mapped = authority.pages_.find(page_range.base());
+    if (mapped == nullptr) {
+        return fail(VSpaceError::NotMapped);
+    }
+    const auto virtual_page = VPage::from_base(page_range.base());
+    if (!virtual_page) {
+        return fail(VSpaceError::InvalidRange);
+    }
+    arch::PageEditor editor = arch::PageEditor::user(*root_);
+    const auto observed = editor.usage(*virtual_page);
+    if (!observed) {
+        return fail(VSpaceError::NotMapped);
+    }
+    const PageUsage usage{
+        .accessed = observed.value().accessed,
+        .dirty = observed.value().dirty,
+    };
+    auto folded = authority.memory().observe_usage(
+        object_page, usage.accessed, usage.dirty);
+    if (!folded) {
+        return fail(memory_error(folded.error()));
+    }
+    if (!clear) {
+        lock.restore();
+        return libk::expected(usage);
+    }
+
+    auto mutation = coherence_.begin();
+    if (!mutation) {
+        return fail(VSpaceError::ShootdownUnavailable);
+    }
+    auto plan = prepare_plan(context, mutation.value().targets());
+    if (!plan) {
+        mutation.value().abort();
+        return fail(plan.error());
+    }
+    const auto cleared = editor.clear_usage(*virtual_page, false, false);
+    if (!cleared) {
+        mutation.value().abort();
+        return fail(VSpaceError::TranslationCorrupt);
+    }
+    pending_kind_ = PendingKind::Protect;
+    auto& retire = retire_batch_.emplace(*pmm_);
+    auto committed = commit_translation(
+        libk::move(mutation).value(),
+        libk::move(plan).value(),
+        retire);
+    lock.restore();
+    if (!committed) {
+        return libk::unexpected(committed.error());
+    }
+    if (committed.value() != VmStatus::Complete) {
+        return libk::unexpected(VSpaceError::Busy);
+    }
+    return libk::expected(usage);
 }
 
 auto VSpace::inspect(MappingKey key) const noexcept

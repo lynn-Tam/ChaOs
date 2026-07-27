@@ -10,7 +10,10 @@ using namespace myos::proof;
 constexpr myos_word_t BundleAddress = 0x1000'0000;
 constexpr myos_word_t ScratchAddress = 0x1800'0000;
 constexpr myos_word_t StackSize = 4 * PageSize;
-constexpr myos_word_t ChildMemory = 16 * 1024 * 1024;
+// E7 adds terminal state and pager/IRQ grant metadata to each execution and
+// object slot. Keep the proof workload's budget explicit instead of letting a
+// late scheduling-context construction fail after the address-space work.
+constexpr myos_word_t ChildMemory = 32 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
 constexpr myos_word_t ChannelThreadCount = 2;
@@ -1167,6 +1170,413 @@ private:
     myos_word_t diagnostic_code_{};
 };
 
+// A service deployment has one owner for the child address space and one
+// explicit capability handoff.  It deliberately does not reuse the proof
+// loader's shared-memory protocol: UART only needs an ELF image, a stack, and
+// the platform resources delegated by root init.
+class UartLoader final {
+public:
+    UartLoader(
+        const myos_bootstrap_info& bootstrap,
+        myos_cap_t parent_pool) noexcept
+        : root_vspace_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_VSPACE)),
+          domain_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN)),
+          bundle_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE)),
+          parent_pool_(parent_pool),
+          bundle_size_(bootstrap.boot_bundle_size),
+          uart_memory_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_UART_MEMORY)),
+          uart_irq_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_UART_IRQ)),
+          uart_notification_(capability(
+              bootstrap, MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION)) {}
+
+    [[nodiscard]] auto run() noexcept -> bool {
+        stage_ = 1;
+        if (root_vspace_ == 0 || domain_ == 0 || bundle_ == 0
+            || parent_pool_ == 0 || uart_memory_ == 0 || uart_irq_ == 0
+            || uart_notification_ == 0) {
+            return false;
+        }
+        if (!map_bundle()) {
+            return false;
+        }
+
+        const auto package = myos::boot::Bundle::parse(
+            reinterpret_cast<const void*>(UartBundleAddress), bundle_size_);
+        myos::boot::Module module{};
+        if (!package || !package.find("uart", module)
+            || module.segment_count() == 0
+            || module.segment_count() > MaxSegments) {
+            return false;
+        }
+        entry_ = module.entry();
+        for (myos_word_t index = 0; index < module.segment_count(); ++index) {
+            myos::boot::Segment segment{};
+            if (!module.segment(index, segment)) {
+                return false;
+            }
+            const myos_word_t rounded = page_round(segment.memory_size);
+            if (segment.memory_size != 0 && rounded == 0) {
+                return false;
+            }
+            if (rounded > scratch_size_) {
+                scratch_size_ = rounded;
+            }
+        }
+        if (scratch_size_ < PageSize
+            || !make_region(
+                root_vspace_, UartScratchAddress, scratch_size_,
+                MYOS_VM_READ | MYOS_VM_WRITE,
+                MYOS_VM_NORMAL,
+                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP,
+                scratch_region_)) {
+            return false;
+        }
+
+        stage_ = 2;
+        const auto child = myos::resource_create_child(
+            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E7_KINDS);
+        if (child.status != MYOS_STATUS_OK || !children_.add(child.value)) {
+            return false;
+        }
+        pool_ = child.value;
+
+        const auto vspace = myos::vspace_create(pool_);
+        const auto cspace = myos::cspace_create(pool_, 64, 8);
+        if (vspace.status != MYOS_STATUS_OK
+            || cspace.status != MYOS_STATUS_OK
+            || !children_.add(vspace.value)
+            || !children_.add(cspace.value)) {
+            return false;
+        }
+        child_vspace_ = vspace.value;
+        child_cspace_ = cspace.value;
+
+        stage_ = 3;
+        for (myos_word_t index = 0; index < module.segment_count(); ++index) {
+            myos::boot::Segment segment{};
+            if (!module.segment(index, segment) || !load_segment(segment)) {
+                return false;
+            }
+        }
+        if (!make_stack() || !make_info() || !make_start()) {
+            return false;
+        }
+        stage_ = 4;
+        if (!start()) {
+            return false;
+        }
+
+        // The child owns all live mappings and caps.  Only the temporary root
+        // views used to copy the bundle and start record are closed here.
+        (void)myos::cap_close(scratch_region_);
+        (void)myos::cap_close(bundle_region_);
+        scratch_region_ = 0;
+        bundle_region_ = 0;
+        stage_ = 0;
+        return true;
+    }
+
+    [[nodiscard]] auto failure_code() const noexcept -> myos_word_t {
+        return stage_;
+    }
+
+private:
+    static constexpr myos_word_t MaxSegments = 16;
+    static constexpr myos_word_t ChildMemory = 2 * 1024 * 1024;
+    static constexpr myos_word_t ChildCaps = 128;
+    static constexpr myos_word_t UartBundleAddress = 0x1400'0000;
+    static constexpr myos_word_t UartScratchAddress = 0x1900'0000;
+    static constexpr myos_word_t UartInfoAddress = 0x3000'0000;
+    static constexpr myos_word_t UartMapAddress = 0x3001'0000;
+    static constexpr myos_word_t UartStackAddress = 0x3002'0000;
+
+    [[nodiscard]] auto make_region(
+        myos_cap_t vspace,
+        myos_word_t address,
+        myos_word_t size,
+        myos_word_t access,
+        myos_word_t types,
+        myos_word_t rights,
+        myos_cap_t& result) noexcept -> bool {
+        for (;;) {
+            const auto region = myos::vm_create_region(
+                vspace, address, size, access, types, rights);
+            if (region.status == MYOS_STATUS_OK) {
+                result = region.value;
+                return true;
+            }
+            if (!retryable(region.status)) {
+                return false;
+            }
+            myos::yield();
+        }
+    }
+
+    [[nodiscard]] auto map(
+        myos_cap_t region,
+        myos_cap_t memory,
+        myos_word_t address,
+        myos_word_t size,
+        myos_word_t access) noexcept -> bool {
+        for (;;) {
+            const auto mapped = myos::vm_map(
+                region, memory, address, size, 0, access);
+            if (committed(mapped)) {
+                return true;
+            }
+            if (!retryable(mapped.status)) {
+                return false;
+            }
+            myos::yield();
+        }
+    }
+
+    [[nodiscard]] auto map_bundle() noexcept -> bool {
+        const myos_word_t mapped_size = page_round(bundle_size_);
+        return mapped_size != 0
+            && make_region(
+                root_vspace_, UartBundleAddress, mapped_size, MYOS_VM_READ,
+                MYOS_VM_NORMAL, MYOS_RIGHT_MAP, bundle_region_)
+            && map(
+                bundle_region_, bundle_, UartBundleAddress, mapped_size,
+                MYOS_VM_READ);
+    }
+
+    [[nodiscard]] auto create_memory(
+        myos_word_t size,
+        myos_word_t access,
+        myos_cap_t& result) noexcept -> bool {
+        const auto memory = myos::memory_create(pool_, size, access);
+        if (memory.status != MYOS_STATUS_OK
+            || !children_.add(memory.value)) {
+            return false;
+        }
+        result = memory.value;
+        return true;
+    }
+
+    [[nodiscard]] auto write_memory(
+        myos_cap_t memory,
+        myos_word_t size,
+        const uint8_t* source,
+        myos_word_t source_size) noexcept -> bool {
+        if (source_size > size
+            || !map(
+                scratch_region_, memory, UartScratchAddress, size,
+                MYOS_VM_READ | MYOS_VM_WRITE)) {
+            return false;
+        }
+        auto* const destination = reinterpret_cast<uint8_t*>(
+            UartScratchAddress);
+        for (myos_word_t index = 0; index < source_size; ++index) {
+            destination[index] = source[index];
+        }
+        for (myos_word_t index = source_size; index < size; ++index) {
+            destination[index] = 0;
+        }
+        return committed(myos::vm_unmap(
+            scratch_region_, UartScratchAddress, size));
+    }
+
+    [[nodiscard]] auto seal(myos_cap_t memory) noexcept -> bool {
+        for (;;) {
+            const auto sealed = myos::memory_seal(memory);
+            if (sealed.status == MYOS_STATUS_OK) {
+                return true;
+            }
+            if (!retryable(sealed.status)) {
+                return false;
+            }
+            myos::yield();
+        }
+    }
+
+    [[nodiscard]] auto load_segment(
+        const myos::boot::Segment& segment) noexcept -> bool {
+        const myos_word_t size = page_round(segment.memory_size);
+        if (segment.memory_size == 0) {
+            return true;
+        }
+        const bool executable = (segment.access & MYOS_VM_EXECUTE) != 0;
+        const myos_word_t load_access = segment.access
+            | MYOS_VM_READ | MYOS_VM_WRITE;
+        myos_cap_t memory{};
+        if (size == 0
+            || !create_memory(size, load_access, memory)
+            || !write_memory(memory, size, segment.file, segment.file_size)
+            || (executable && !seal(memory))) {
+            return false;
+        }
+        myos_cap_t region{};
+        return make_region(
+                   child_vspace_, segment.address, size, segment.access,
+                   MYOS_VM_NORMAL, MYOS_RIGHT_MAP, region)
+            && children_.add(region)
+            && map(region, memory, segment.address, size, segment.access);
+    }
+
+    [[nodiscard]] auto make_stack() noexcept -> bool {
+        if (!create_memory(
+                StackSize, MYOS_VM_READ | MYOS_VM_WRITE, stack_memory_)) {
+            return false;
+        }
+        return make_region(
+                   child_vspace_, UartStackAddress, StackSize,
+                   MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL,
+                   MYOS_RIGHT_MAP, stack_region_)
+            && children_.add(stack_region_)
+            && map(
+                stack_region_, stack_memory_, UartStackAddress, StackSize,
+                MYOS_VM_READ | MYOS_VM_WRITE);
+    }
+
+    [[nodiscard]] auto make_info() noexcept -> bool {
+        if (!create_memory(
+                PageSize, MYOS_VM_READ | MYOS_VM_WRITE, info_memory_)) {
+            return false;
+        }
+        myos_cap_t child_info_region{};
+        if (!make_region(
+                child_vspace_, UartInfoAddress, PageSize, MYOS_VM_READ,
+                MYOS_VM_NORMAL, MYOS_RIGHT_MAP, child_info_region)
+            || !children_.add(child_info_region)
+            || !map(
+                scratch_region_, info_memory_, UartScratchAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE)
+            || !map(
+                child_info_region, info_memory_, UartInfoAddress, PageSize,
+                MYOS_VM_READ)) {
+            return false;
+        }
+
+        const auto vspace = myos::cap_delegate(
+            child_vspace_, child_cspace_,
+            MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP
+                | MYOS_RIGHT_UNMAP | MYOS_RIGHT_INSPECT);
+        const auto memory = myos::cap_delegate(
+            uart_memory_, child_cspace_,
+            MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT);
+        const auto irq = myos::cap_delegate(
+            uart_irq_, child_cspace_,
+            MYOS_RIGHT_ROUTE | MYOS_RIGHT_ACK | MYOS_RIGHT_INSPECT);
+        const auto notification = myos::cap_delegate(
+            uart_notification_, child_cspace_,
+            MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE
+                | MYOS_RIGHT_INSPECT);
+        if (vspace.status != MYOS_STATUS_OK
+            || memory.status != MYOS_STATUS_OK
+            || irq.status != MYOS_STATUS_OK
+            || notification.status != MYOS_STATUS_OK) {
+            return false;
+        }
+
+        myos_bootstrap_info info{};
+        info.magic = MYOS_BOOTSTRAP_MAGIC;
+        info.major = MYOS_BOOTSTRAP_MAJOR;
+        info.minor = MYOS_BOOTSTRAP_MINOR;
+        info.size = sizeof(info);
+        info.cap_count = 4;
+        info.cpu_count = 1;
+        info.stack_base = UartStackAddress;
+        info.stack_size = StackSize;
+        info.boot_bundle_size = bundle_size_;
+        info.caps[0] = myos_bootstrap_cap{
+            .kind = MYOS_BOOTSTRAP_CAP_VSPACE,
+            .flags = 0,
+            .handle = vspace.value,
+        };
+        info.caps[1] = myos_bootstrap_cap{
+            .kind = MYOS_BOOTSTRAP_CAP_UART_MEMORY,
+            .flags = 0,
+            .handle = memory.value,
+        };
+        info.caps[2] = myos_bootstrap_cap{
+            .kind = MYOS_BOOTSTRAP_CAP_UART_IRQ,
+            .flags = 0,
+            .handle = irq.value,
+        };
+        info.caps[3] = myos_bootstrap_cap{
+            .kind = MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION,
+            .flags = 0,
+            .handle = notification.value,
+        };
+        auto* const destination = reinterpret_cast<myos_bootstrap_info*>(
+            UartScratchAddress);
+        *destination = info;
+        return committed(myos::vm_unmap(
+            scratch_region_, UartScratchAddress, PageSize));
+    }
+
+    [[nodiscard]] auto make_start() noexcept -> bool {
+        if (!create_memory(
+                PageSize, MYOS_VM_READ | MYOS_VM_WRITE, start_memory_)
+            || !map(
+                scratch_region_, start_memory_, UartScratchAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE)) {
+            return false;
+        }
+        auto* const start = reinterpret_cast<myos_thread_start*>(
+            UartScratchAddress);
+        start->version = MYOS_THREAD_START_VERSION;
+        start->flags = 0;
+        start->entry = entry_;
+        start->stack = UartStackAddress + StackSize;
+        start->arguments[0] = UartInfoAddress;
+        start->arguments[1] = sizeof(myos_bootstrap_info);
+        for (myos_word_t index = 2; index < 6; ++index) {
+            start->arguments[index] = 0;
+        }
+        start->ipc = myos_ipc_binding{};
+        return committed(myos::vm_unmap(
+            scratch_region_, UartScratchAddress, PageSize));
+    }
+
+    [[nodiscard]] auto start() noexcept -> bool {
+        const auto thread = myos::thread_create(
+            pool_, child_vspace_, child_cspace_, start_memory_);
+        if (thread.status != MYOS_STATUS_OK
+            || !children_.add(thread.value)) {
+            return false;
+        }
+        const auto context = myos::sc_create(
+            pool_, domain_, 1'000'000, 10'000'000, 20, 0);
+        if (context.status != MYOS_STATUS_OK
+            || !children_.add(context.value)
+            || myos::sc_bind(context.value, thread.value).status
+                != MYOS_STATUS_OK) {
+            return false;
+        }
+        return myos::execution_start(thread.value).status == MYOS_STATUS_OK;
+    }
+
+    myos_cap_t root_vspace_{};
+    myos_cap_t domain_{};
+    myos_cap_t bundle_{};
+    myos_cap_t parent_pool_{};
+    myos_word_t bundle_size_{};
+    myos_cap_t uart_memory_{};
+    myos_cap_t uart_irq_{};
+    myos_cap_t uart_notification_{};
+    myos_cap_t pool_{};
+    myos_cap_t child_vspace_{};
+    myos_cap_t child_cspace_{};
+    myos_cap_t bundle_region_{};
+    myos_cap_t scratch_region_{};
+    myos_cap_t stack_region_{};
+    myos_cap_t stack_memory_{};
+    myos_cap_t info_memory_{};
+    myos_cap_t start_memory_{};
+    myos_word_t scratch_size_{PageSize};
+    myos_word_t entry_{};
+    Handles children_{};
+    myos_word_t stage_{};
+};
+
 } // namespace
 
 //Confirmatory experiment.
@@ -1189,5 +1599,12 @@ extern "C" void myos_main(
     Loader loader{*bootstrap, parent_pool};
     const bool complete = loader.run();
     loader.cleanup();
-    fault(complete ? SuccessFault : FailureFault + loader.failure_code());
+    if (!complete) {
+        fault(FailureFault + loader.failure_code());
+    }
+    UartLoader uart{*bootstrap, parent_pool};
+    if (!uart.run()) {
+        fault(FailureFault + 0x100 + uart.failure_code());
+    }
+    fault(SuccessFault);
 }

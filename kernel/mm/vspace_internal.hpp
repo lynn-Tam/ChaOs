@@ -29,6 +29,8 @@ namespace kernel::mm {
         return VSpaceError::GenerationExhausted;
     case MemoryError::Busy:
         return VSpaceError::Busy;
+    case MemoryError::Pending:
+        return VSpaceError::Busy;
     case MemoryError::BackingFailed:
     case MemoryError::NotBacked:
         return VSpaceError::BackingFailed;

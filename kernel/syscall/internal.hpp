@@ -38,6 +38,13 @@ struct Result final {
     return Result{status, value, Disposition::Return, 0};
 }
 
+[[nodiscard]] constexpr auto returned(
+    myos_status_t status,
+    usize value,
+    usize value2) noexcept -> Result {
+    return Result{status, value, Disposition::Return, value2};
+}
+
 [[nodiscard]] auto cap_status(cap::CSpaceError error) noexcept
     -> myos_status_t;
 
@@ -110,6 +117,12 @@ template<typename Descriptor>
     usize operation,
     Invocation& invocation) noexcept -> Result;
 [[nodiscard]] auto handle_clock(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_pager_irq(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_terminal(
     usize operation,
     Invocation& invocation) noexcept -> Result;
 

@@ -116,6 +116,7 @@ enum class FaultKind : u8 {
     Guard,
     AccessDenied,
     Busy,
+    Pending,
     BackingFailed,
     Ready,
     Materialized,
@@ -126,6 +127,11 @@ struct FaultResult final {
     MappingKey mapping{};
     usize object_page{};
     VmStatus status{VmStatus::Complete};
+};
+
+struct PageUsage final {
+    bool accessed{};
+    bool dirty{};
 };
 
 struct MappingInfo final {
@@ -229,6 +235,14 @@ public:
         VmContext context,
         VirtAddr address,
         Access access) noexcept -> libk::Expected<FaultResult, VSpaceError>;
+    // Samples the architecture projection of one materialized PTE and folds
+    // it into the MemoryObject page truth. When clear is true the selected
+    // A/D bits are cleared through the normal translation/shootdown path.
+    [[nodiscard]] auto sample_usage(
+        VmContext context,
+        VirtAddr address,
+        bool clear = false) noexcept
+        -> libk::Expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto inspect(MappingKey key) const noexcept
         -> libk::Expected<MappingInfo, VSpaceError>;
 

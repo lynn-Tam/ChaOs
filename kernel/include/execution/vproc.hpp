@@ -19,8 +19,13 @@
 #include <sched/remote_queue.hpp>
 #include <uapi/status.h>
 #include <uapi/vproc.h>
+#include <fault/terminal.hpp>
 
 namespace kernel {
+
+namespace fault {
+class TerminalObservation;
+}
 
 class CpuRegistry;
 namespace operation {
@@ -136,6 +141,16 @@ public:
     [[nodiscard]] auto in_upcall() const noexcept -> bool;
     void request_exit() noexcept;
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
+    [[nodiscard]] auto terminal() const noexcept -> const fault::TerminalRecord& {
+        return terminal_;
+    }
+    [[nodiscard]] auto terminal() noexcept -> fault::TerminalRecord& {
+        return terminal_;
+    }
+    [[nodiscard]] auto observe_terminal(
+        ipc::Notification& notification,
+        u64 badge) noexcept -> bool;
+    void clear_terminal_observation() noexcept;
 
 private:
     friend class operation::Completion;
@@ -257,6 +272,8 @@ private:
 
     Execution execution_;
     execution::Authority authority_;
+    fault::TerminalRecord terminal_{};
+    fault::TerminalObservation* terminal_observation_{};
     arch::UserStart bootstrap_entry_{};
     VprocRuntime runtime_{};
     VprocArm arm_{};

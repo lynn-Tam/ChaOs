@@ -202,6 +202,10 @@ consteval auto sv39_pte_representation_contract() noexcept -> bool {
         && *leaf_page == page
         && leaf->has_permissions(
             riscv64::PtePerm::supervisor_rw())
+        && leaf->accessed()
+        && leaf->dirty()
+        && !leaf->with_usage(false, false).accessed()
+        && !leaf->with_usage(false, false).dirty()
         && !leaf->has_permissions(
             riscv64::PtePerm::supervisor_ro())
         && user_rx

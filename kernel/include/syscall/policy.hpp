@@ -118,6 +118,7 @@ struct Policy final {
     case MYOS_SYS_VM_DESTROY_REGION:
     case MYOS_SYS_RESOURCE_CREATE_CHILD:
     case MYOS_SYS_MEMORY_CREATE:
+    case MYOS_SYS_MEMORY_CREATE_PAGER:
     case MYOS_SYS_VSPACE_CREATE:
     case MYOS_SYS_CSPACE_CREATE:
     case MYOS_SYS_SC_CREATE:
@@ -126,6 +127,8 @@ struct Policy final {
     case MYOS_SYS_VPROC_CREATE:
     case MYOS_SYS_ENDPOINT_CREATE:
     case MYOS_SYS_CHANNEL_CREATE:
+    case MYOS_SYS_PAGER_CREATE:
+    case MYOS_SYS_IRQ_CREATE:
     case MYOS_SYS_MEMORY_SEAL:
     case MYOS_SYS_NOTIFICATION_SIGNAL:
     case MYOS_SYS_NOTIFICATION_TAKE:
@@ -139,6 +142,19 @@ struct Policy final {
     case MYOS_SYS_CHANNEL_MINT:
     case MYOS_SYS_CLOCK_NOW:
     case MYOS_SYS_CLOCK_FREQUENCY:
+        return {Continuation::Immediate, TargetMask::Both, LocusMask::All};
+    case MYOS_SYS_PAGER_REQUEST:
+    case MYOS_SYS_PAGER_CLAIM:
+    case MYOS_SYS_PAGER_REQUEUE:
+    case MYOS_SYS_PAGER_COMPLETE:
+    case MYOS_SYS_PAGER_FAIL:
+    case MYOS_SYS_IRQ_BIND:
+    case MYOS_SYS_IRQ_OBSERVE:
+    case MYOS_SYS_IRQ_ACK:
+    case MYOS_SYS_PAGER_SUPPLY:
+    case MYOS_SYS_PAGER_BIND:
+    case MYOS_SYS_TERMINAL_QUERY:
+    case MYOS_SYS_TERMINAL_OBSERVE_BIND:
         return {Continuation::Immediate, TargetMask::Both, LocusMask::All};
     case MYOS_SYS_TUNNEL_OPEN:
         return {Continuation::Immediate, TargetMask::Vproc,

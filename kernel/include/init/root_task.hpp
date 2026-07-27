@@ -92,6 +92,11 @@ private:
     kernel::object::ObjectStore::CSpaceHold cspace_{};
     kernel::object::ObjectStore::ThreadHold thread_{};
     kernel::object::ObjectStore::SchedulingContextHold context_{};
+    // Platform-owned UART resources are retained here and delegated to the
+    // user UART service through explicit bootstrap caps.
+    kernel::object::ObjectStore::MemoryHold uart_memory_{};
+    kernel::object::ObjectStore::IrqHold uart_irq_{};
+    kernel::object::ObjectStore::NotificationHold uart_notification_{};
     bool started_{};
 };
 

@@ -27,9 +27,11 @@ class MappedPage final : private libk::noncopyable_nonmovable {
 public:
     MappedPage(
         VirtAddr address,
+        usize object_page,
         PageLease&& source,
         AliasLease&& alias) noexcept
         : address_(address),
+          object_page_(object_page),
           page_(source.page().page),
           access_(source.page().access),
           type_(source.page().type),
@@ -42,6 +44,9 @@ public:
         return address_;
     }
     [[nodiscard]] auto page() const noexcept -> Page { return page_; }
+    [[nodiscard]] auto object_page() const noexcept -> usize {
+        return object_page_;
+    }
     [[nodiscard]] auto access() const noexcept -> AccessMask { return access_; }
     [[nodiscard]] auto type() const noexcept -> MemoryType { return type_; }
 
@@ -50,11 +55,13 @@ private:
     friend class MappingAuthority;
 
     VirtAddr address_{};
+    usize object_page_{};
     Page page_{};
     AccessMask access_{};
     MemoryType type_{MemoryType::Normal};
     PageLease source_{};
     AliasLease alias_{};
+    PageMapping page_mapping_{};
     libk::IntrusiveTreeHook tree_hook_{};
     MappedPage* pending_next_{};
 };

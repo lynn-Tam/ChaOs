@@ -101,6 +101,124 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_MEMORY_CREATE, pool, size, access);
 }
 
+[[nodiscard]] inline auto memory_create_pager(
+    myos_cap_t pool,
+    myos_word_t size,
+    myos_word_t access,
+    myos_cap_t pager) noexcept -> SysResult {
+    return syscall(MYOS_SYS_MEMORY_CREATE_PAGER, pool, size, access, pager);
+}
+
+[[nodiscard]] inline auto pager_create(
+    myos_cap_t pool,
+    myos_word_t backing_key,
+    myos_word_t max_pages) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_CREATE, pool, backing_key, max_pages);
+}
+
+[[nodiscard]] inline auto irq_create(
+    myos_cap_t pool,
+    myos_word_t source,
+    myos_word_t level = 1) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IRQ_CREATE, pool, source, level);
+}
+
+[[nodiscard]] inline auto pager_request(
+    myos_cap_t pager,
+    myos_word_t page_generation,
+    myos_word_t first,
+    myos_word_t count,
+    myos_word_t backing_epoch,
+    myos_word_t urgency = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_PAGER_REQUEST,
+        pager,
+        page_generation,
+        first,
+        count,
+        backing_epoch,
+        urgency);
+}
+
+[[nodiscard]] inline auto pager_claim(myos_cap_t pager) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_CLAIM, pager);
+}
+
+[[nodiscard]] inline auto pager_complete(
+    myos_cap_t pager,
+    myos_word_t slot,
+    myos_word_t generation) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_COMPLETE, pager, slot, generation);
+}
+
+[[nodiscard]] inline auto pager_fail(
+    myos_cap_t pager,
+    myos_word_t slot,
+    myos_word_t generation) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_FAIL, pager, slot, generation);
+}
+
+[[nodiscard]] inline auto pager_requeue(
+    myos_cap_t pager,
+    myos_word_t slot,
+    myos_word_t generation) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_REQUEUE, pager, slot, generation);
+}
+
+[[nodiscard]] inline auto pager_supply(
+    myos_cap_t pager,
+    myos_cap_t target_memory,
+    myos_cap_t staging_memory,
+    myos_word_t page,
+    myos_word_t request_generation,
+    myos_word_t claim_generation) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_PAGER_SUPPLY,
+        pager,
+        target_memory,
+        staging_memory,
+        page,
+        request_generation,
+        claim_generation);
+}
+
+[[nodiscard]] inline auto irq_bind(
+    myos_cap_t irq,
+    myos_cap_t notification,
+    myos_word_t badge) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IRQ_BIND, irq, notification, badge);
+}
+
+[[nodiscard]] inline auto irq_observe(myos_cap_t irq) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IRQ_OBSERVE, irq);
+}
+
+[[nodiscard]] inline auto irq_ack(
+    myos_cap_t irq,
+    myos_word_t sequence) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IRQ_ACK, irq, sequence);
+}
+
+[[nodiscard]] inline auto terminal_query(myos_cap_t target) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_TERMINAL_QUERY, target);
+}
+
+[[nodiscard]] inline auto terminal_observe_bind(
+    myos_cap_t target,
+    myos_cap_t notification,
+    myos_word_t badge) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_TERMINAL_OBSERVE_BIND, target, notification, badge);
+}
+
+[[nodiscard]] inline auto pager_bind(
+    myos_cap_t pager,
+    myos_cap_t notification,
+    myos_word_t badge) noexcept -> SysResult {
+    return syscall(MYOS_SYS_PAGER_BIND, pager, notification, badge);
+}
+
 [[nodiscard]] inline auto memory_seal(myos_cap_t memory) noexcept
     -> SysResult {
     return syscall(MYOS_SYS_MEMORY_SEAL, memory);

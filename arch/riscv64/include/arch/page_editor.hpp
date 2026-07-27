@@ -7,6 +7,7 @@ namespace arch {
 using PageEditor = riscv64::Editor;
 using PageEditError = riscv64::EditError;
 using PageLeaf = riscv64::Leaf;
+using PageUsage = riscv64::Usage;
 using DetachedTables = riscv64::DetachedTables;
 using UnmappedPage = riscv64::Unmapped;
 using PagePerm = riscv64::PtePerm;

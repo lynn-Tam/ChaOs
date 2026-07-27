@@ -43,6 +43,9 @@
 #define MYOS_SYS_TUNNEL_OPEN           56 /* a0=pool, a1=slot, a2=tag; target=current Vproc */
 #define MYOS_SYS_ENDPOINT_CREATE        57 /* a1=VSpace, a2=CSpace, a3=descriptor memory, a4=offset */
 #define MYOS_SYS_CHANNEL_CREATE         58 /* a1=queue, a2=max words, a3=max caps, a4=relations */
+#define MYOS_SYS_PAGER_CREATE           59 /* a1=backing key, a2=max pages */
+#define MYOS_SYS_IRQ_CREATE             60 /* a1=platform source, a2=level */
+#define MYOS_SYS_MEMORY_CREATE_PAGER    61 /* a1=bytes, a2=access, a3=pager */
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
@@ -84,3 +87,16 @@
 /* Canonical kernel monotonic clock; returns ticks or ticks/second. */
 #define MYOS_SYS_CLOCK_NOW             128
 #define MYOS_SYS_CLOCK_FREQUENCY       129
+
+#define MYOS_SYS_PAGER_REQUEST         130 /* a0=pager, a1=page gen, a2=first, a3=count, a4=epoch */
+#define MYOS_SYS_PAGER_CLAIM           131 /* a0=pager */
+#define MYOS_SYS_PAGER_REQUEUE         132 /* a0=pager, a1=slot, a2=generation */
+#define MYOS_SYS_PAGER_COMPLETE        133 /* a0=pager, a1=slot, a2=generation */
+#define MYOS_SYS_PAGER_FAIL            134 /* a0=pager, a1=slot, a2=generation */
+#define MYOS_SYS_IRQ_BIND              135 /* a0=irq, a1=notification, a2=badge */
+#define MYOS_SYS_IRQ_OBSERVE           136 /* a0=irq */
+#define MYOS_SYS_IRQ_ACK               137 /* a0=irq, a1=sequence */
+#define MYOS_SYS_PAGER_SUPPLY          138 /* a0=pager, a1=target memory, a2=staging memory, a3=page, a4=req gen, a5=claim gen */
+#define MYOS_SYS_TERMINAL_QUERY        139 /* a0=Thread or Vproc; returns sequence/status */
+#define MYOS_SYS_TERMINAL_OBSERVE_BIND 140 /* a0=Thread or Vproc, a1=Notification, a2=badge */
+#define MYOS_SYS_PAGER_BIND             141 /* a0=pager, a1=Notification, a2=badge */
