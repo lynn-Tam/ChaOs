@@ -10,6 +10,7 @@
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
 #include <diag/panic.hpp>
+#include <diag/concurrency.hpp>
 #include <trap/trap.hpp>
 #include <sync/trace.hpp>
 
@@ -27,10 +28,17 @@ extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
         kernel::diag::stop_peer(context);
     }
     const kernel::trap::Event event = arch::riscv64::make_event(*frame);
+    const u64 entry_tick = (kernel::sync::lock_profile
+        || MYOS_CONCURRENCY_DIAG >= 1)
+        ? arch::trap_entry_tick() : 0;
     if constexpr (kernel::sync::lock_verify) {
         kernel::sync::trap_enter(
             event,
-            kernel::sync::lock_profile ? arch::trap_entry_tick() : 0);
+            kernel::sync::lock_profile ? entry_tick : 0);
+    }
+    if constexpr (MYOS_CONCURRENCY_DIAG >= 1) {
+        kernel::diag::concurrency::trap_enter(
+            entry_tick, static_cast<u32>(event.origin()));
     }
     kernel::trap::handle(event, context);
     return arch::riscv64::raw_frame(context.frame());
@@ -51,6 +59,9 @@ extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
         // would make unrelated user traps look recursively nested.
         kernel::sync::trap_exit(
             kernel::sync::lock_profile ? arch::read_clock().ticks() : 0);
+    }
+    if constexpr (MYOS_CONCURRENCY_DIAG >= 1) {
+        kernel::diag::concurrency::trap_exit(arch::read_clock().ticks());
     }
     kernel::trap::on_exit(context);
     return arch::riscv64::raw_frame(context.frame());

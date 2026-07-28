@@ -1,5 +1,6 @@
 #pragma once
 
+#include <diag/concurrency.hpp>
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
 #include <sync/lock.hpp>
@@ -80,6 +81,7 @@ private:
     void refund(Refund& refund) noexcept;
     void refund(Charge& charge) noexcept;
     void service() noexcept;
+    void publish_observation() noexcept;
     [[nodiscard]] auto closed_locked() const noexcept -> bool;
 
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::ResourcePool>
@@ -97,6 +99,7 @@ private:
     bool service_pending_{};
     Allocation* parent_{};
     bool parent_notified_{};
+    diag::concurrency::ObservationLease close_observation_{};
 };
 
 } // namespace kernel::resource

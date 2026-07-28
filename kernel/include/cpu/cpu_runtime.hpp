@@ -27,6 +27,18 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
             idle_thread.reset();
         }
         if (diagnostics != nullptr) {
+#if MYOS_CONCURRENCY_DIAG >= 2
+            if (diagnostics->concurrency.flight != nullptr) {
+                libk::destroy_at(diagnostics->concurrency.flight);
+                diagnostics->concurrency.flight = nullptr;
+            }
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 1
+            if (diagnostics->concurrency.observations != nullptr) {
+                libk::destroy_at(diagnostics->concurrency.observations);
+                diagnostics->concurrency.observations = nullptr;
+            }
+#endif
             libk::destroy_at(diagnostics);
             diagnostics = nullptr;
         }
@@ -50,6 +62,12 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     CpuStackSet stacks{};
     kernel::mm::OwnedPage diagnostics_page{};
     diag::CpuDiagnostics* diagnostics{};
+#if MYOS_CONCURRENCY_DIAG >= 1
+    kernel::mm::OwnedPage concurrency_observation_page{};
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 2
+    kernel::mm::OwnedPage concurrency_flight_page{};
+#endif
     object::ObjectStore::ThreadHold idle_thread{};
     libk::ManualLifetime<sched::CpuDispatcher> dispatcher_storage{};
     arch::CpuStartContext start_context{};

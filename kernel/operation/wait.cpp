@@ -35,15 +35,22 @@ auto Wait::begin(
         binding_ = &binding;
         ready_.store<libk::MemoryOrder::Relaxed>(false);
         completion.attach(*this);
+        binding_->link_wait(
+            completion.observation_key(),
+            diag::concurrency::WaitKind::OperationCompletion,
+            diag::concurrency::NodeRef::observation(
+                completion.observation_key()));
     }
     return true;
 }
 
 void Wait::finish(arch::TrapContext& trap) noexcept {
     Completion* completion{};
+    sched::Binding* binding{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         completion = completion_;
+        binding = binding_;
         KASSERT(completion != nullptr
             && ready_.load<libk::MemoryOrder::Acquire>());
         completion_ = nullptr;
@@ -51,18 +58,26 @@ void Wait::finish(arch::TrapContext& trap) noexcept {
         binding_ = nullptr;
         ready_.store<libk::MemoryOrder::Relaxed>(false);
     }
+    if (binding != nullptr) {
+        binding->clear_wait();
+    }
     completion->finish(trap);
 }
 
 auto Wait::cancel() noexcept -> bool {
     Completion* completion{};
+    sched::Binding* binding{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         completion = completion_;
+        binding = binding_;
     }
     KASSERT(completion != nullptr);
     if (!completion->cancel()) {
         return false;
+    }
+    if (binding != nullptr) {
+        binding->clear_wait();
     }
     {
         kernel::sync::IrqLockGuard guard{lock_};

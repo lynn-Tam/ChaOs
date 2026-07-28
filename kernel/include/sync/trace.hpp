@@ -9,6 +9,9 @@
 #ifndef MYOS_LOCK_PROBE
 #define MYOS_LOCK_PROBE 0
 #endif
+#ifndef MYOS_CONCURRENCY_DIAG
+#define MYOS_CONCURRENCY_DIAG 0
+#endif
 
 namespace kernel {
 namespace trap {
@@ -20,8 +23,11 @@ namespace kernel::sync {
 
 inline constexpr usize lock_diag_level = MYOS_LOCK_DIAG;
 inline constexpr bool lock_verify = lock_diag_level >= 1;
-inline constexpr bool lock_trace = lock_diag_level >= 2;
+inline constexpr bool lock_trace = lock_diag_level >= 2
+    || MYOS_CONCURRENCY_DIAG >= 1;
 inline constexpr bool lock_profile = lock_diag_level >= 3;
+inline constexpr bool lock_runtime = lock_diag_level >= 1
+    || MYOS_CONCURRENCY_DIAG >= 1;
 
 enum class LockClass : u8 {
     Pmm,
@@ -123,7 +129,6 @@ enum class ExecContext : u8 {
 
 inline constexpr usize local_held_capacity = 12;
 inline constexpr usize remote_held_capacity = local_held_capacity;
-inline constexpr usize lock_event_capacity = 7;
 inline constexpr usize wait_cycle_capacity = 8;
 inline constexpr usize dep_cycle_capacity = 2;
 inline constexpr usize context_capacity = 8;
@@ -161,14 +166,8 @@ struct RemoteWait final {
     libk::Atomic<u32> lock_class{};
     libk::Atomic<u32> line{};
     libk::Atomic<u64> generation{};
+    libk::Atomic<u64> wait_started{};
     libk::Atomic<bool> active{};
-};
-
-struct RemoteEvent final {
-    libk::Atomic<u64> sequence{};
-    libk::Atomic<u64> tick{};
-    libk::Atomic<usize> address{};
-    libk::Atomic<u32> data{};
 };
 
 struct WaitLink final {
@@ -201,10 +200,8 @@ struct CpuLockTrace final {
     LocalLockState local{};
     RemoteWait waiting{};
     RemoteHeld held[remote_held_capacity]{};
-    RemoteEvent events[lock_event_capacity]{};
     WaitLink cycle[wait_cycle_capacity]{};
     DepLink dep_cycle[dep_cycle_capacity]{};
-    libk::Atomic<u64> event_head{};
     libk::Atomic<u64> wait_generation{};
     libk::Atomic<u64> cycle_size{};
     libk::Atomic<u64> dep_cycle_size{};

@@ -17,7 +17,7 @@
 
 namespace kernel::sync {
 
-#if MYOS_LOCK_DIAG >= 1
+#if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
 namespace {
 
 constexpr usize class_count = static_cast<usize>(LockClass::Count);
@@ -102,7 +102,7 @@ void atomic_add_sat(libk::Atomic<u64>& target, u64 value) noexcept {
 #endif
 
 [[nodiscard]] auto now() noexcept -> u64 {
-#if MYOS_LOCK_DIAG >= 3
+#if MYOS_LOCK_DIAG >= 3 || MYOS_CONCURRENCY_DIAG >= 1
     return arch::read_clock().ticks();
 #else
     return 0;
@@ -151,8 +151,22 @@ void publish_wait(
         active ? static_cast<u32>(lock.lock_class) : 0);
     trace.waiting.line.store<libk::MemoryOrder::Relaxed>(active ? site.line : 0);
     trace.waiting.generation.store<libk::MemoryOrder::Relaxed>(generation);
+    trace.waiting.wait_started.store<libk::MemoryOrder::Relaxed>(
+        active ? now() : 0);
     trace.waiting.active.store<libk::MemoryOrder::Relaxed>(active);
     end_record(trace.waiting.sequence, odd);
+    if (active) {
+        diag::concurrency::set_wait(
+            diag::concurrency::WaitKind::SpinLock,
+            {},
+            diag::concurrency::NodeRef::external(
+                reinterpret_cast<u64>(lock.address), generation),
+            diag::concurrency::NodeRef::external(
+                reinterpret_cast<u64>(lock.owner)),
+            diag::concurrency::SourceSite{site.file, site.function, site.line});
+    } else {
+        diag::concurrency::clear_wait();
+    }
 }
 
 void publish_held(CpuLockTrace& trace) noexcept {
@@ -190,28 +204,33 @@ void publish_event(
     CpuLockTrace& trace,
     LockEvent event,
     LockRef lock,
-    u32 extra = 0) noexcept {
-    const u64 head = trace.event_head.load<libk::MemoryOrder::Relaxed>();
-    if (head == libk::numeric_limits<u64>::max()) {
-        trace.degraded.store<libk::MemoryOrder::Release>(1);
-        return;
-    }
-    trace.event_head.store<libk::MemoryOrder::Release>(head + 1);
-    RemoteEvent& record = trace.events[head % lock_event_capacity];
-    u64 odd{};
-    begin_record(record.sequence, odd);
-    if (odd == 0) {
-        trace.degraded.store<libk::MemoryOrder::Release>(1);
-        return;
-    }
-    record.tick.store<libk::MemoryOrder::Relaxed>(now());
-    record.address.store<libk::MemoryOrder::Relaxed>(
-        reinterpret_cast<usize>(lock.address));
-    record.data.store<libk::MemoryOrder::Relaxed>(
-        static_cast<u32>(event)
-            | (static_cast<u32>(lock.lock_class) << 8)
-            | (extra << 16));
-    end_record(record.sequence, odd);
+    u32 extra,
+    LockSite site) noexcept {
+    static_cast<void>(trace);
+    const auto translated = [&]() noexcept {
+        switch (event) {
+        case LockEvent::Acquire:
+            return diag::concurrency::FlightEvent::LockAcquire;
+        case LockEvent::Release:
+            return diag::concurrency::FlightEvent::LockRelease;
+        case LockEvent::Contended:
+            return diag::concurrency::FlightEvent::LockContended;
+        case LockEvent::IrqOff:
+            return diag::concurrency::FlightEvent::IrqOff;
+        case LockEvent::IrqOn:
+            return diag::concurrency::FlightEvent::IrqOn;
+        }
+        return diag::concurrency::FlightEvent::ObservationDegraded;
+    }();
+    diag::concurrency::record(
+        diag::concurrency::FlightDomain::Lock,
+        translated,
+        0,
+        reinterpret_cast<u64>(lock.address),
+        static_cast<u64>(lock.lock_class),
+        extra,
+        0,
+        diag::concurrency::SourceSite{site.file, site.function, site.line});
 }
 
 struct EdgeWitness final {
@@ -538,7 +557,11 @@ void publish_cycle(
 
 void push_context(CpuLockTrace& trace, ExecContext context) noexcept {
     if (trace.local.context_depth == context_capacity) {
-        fail(Violation::IrqImbalance, LockSite::current(), context_capacity);
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current(), context_capacity);
+        }
+        trace.degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
     trace.local.contexts[trace.local.context_depth++] = context;
     trace.context.store<libk::MemoryOrder::Release>(
@@ -547,7 +570,11 @@ void push_context(CpuLockTrace& trace, ExecContext context) noexcept {
 
 void pop_context(CpuLockTrace& trace) noexcept {
     if (trace.local.context_depth <= 1) {
-        fail(Violation::IrqImbalance, LockSite::current());
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current());
+        }
+        trace.degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
     --trace.local.context_depth;
     trace.context.store<libk::MemoryOrder::Release>(static_cast<u32>(
@@ -561,8 +588,10 @@ auto before_acquire(LockRef lock, LockSite site) noexcept -> LockCookie {
     if (current.trace == nullptr) {
         return {};
     }
-    validate_local(current.trace->local, lock, site);
-    validate_graph(*current.trace, lock, site);
+    if constexpr (lock_verify) {
+        validate_local(current.trace->local, lock, site);
+        validate_graph(*current.trace, lock, site);
+    }
     if constexpr (lock_trace) {
         publish_wait(*current.trace, lock, site, true);
     }
@@ -575,7 +604,9 @@ auto before_wait_probe(LockRef lock, LockSite site) noexcept -> LockCookie {
     if (current.trace == nullptr) {
         return {};
     }
-    validate_local(current.trace->local, lock, site);
+    if constexpr (lock_verify) {
+        validate_local(current.trace->local, lock, site);
+    }
     publish_wait(*current.trace, lock, site, true);
     return LockCookie{true, true, now(), false};
 }
@@ -595,8 +626,12 @@ auto after_acquire(LockRef lock, LockSite site, LockCookie cookie) noexcept
         KASSERT(lock.owner != nullptr);
         const u64 old = lock.owner->load<libk::MemoryOrder::Acquire>();
         if (OwnerWord::cpu(old) != max_cpu_count) {
-            fail(Violation::WrongOwner, site,
-                reinterpret_cast<usize>(lock.address), old);
+            if constexpr (lock_verify) {
+                fail(Violation::WrongOwner, site,
+                    reinterpret_cast<usize>(lock.address), old);
+            }
+            current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+            cookie.owner_tracked = false;
         }
         const u64 generation = OwnerWord::generation(old);
         if (generation == OwnerWord::max_generation) {
@@ -608,10 +643,17 @@ auto after_acquire(LockRef lock, LockSite site, LockCookie cookie) noexcept
         }
     }
     LocalLockState& local = current.trace->local;
+    if (local.held_count >= local_held_capacity) {
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        if constexpr (lock_verify) {
+            fail(Violation::HeldOverflow, site, local.held_count);
+        }
+        return cookie;
+    }
     local.held[local.held_count++] = HeldEntry{lock, site, now()};
     if constexpr (lock_trace) {
         publish_held(*current.trace);
-        publish_event(*current.trace, LockEvent::Acquire, lock);
+        publish_event(*current.trace, LockEvent::Acquire, lock, 0, site);
     }
 #if MYOS_LOCK_DIAG >= 3
     auto& stats = current.trace->stats[class_index(lock.lock_class)];
@@ -632,7 +674,9 @@ auto before_try(LockRef lock, LockSite site) noexcept -> LockCookie {
     if (current.trace == nullptr) {
         return {};
     }
-    validate_local(current.trace->local, lock, site);
+    if constexpr (lock_verify) {
+        validate_local(current.trace->local, lock, site);
+    }
     return LockCookie{true, lock_trace, 0, false};
 }
 
@@ -641,7 +685,9 @@ auto after_try(LockRef lock, LockSite site, LockCookie cookie) noexcept
     if (cookie.tracked) {
         CurrentTrace current = current_trace();
         if (current.trace != nullptr) {
-            validate_graph(*current.trace, lock, site);
+            if constexpr (lock_verify) {
+                validate_graph(*current.trace, lock, site);
+            }
         }
     }
     return after_acquire(lock, site, cookie);
@@ -660,8 +706,12 @@ void before_release(LockRef lock, LockSite site, LockCookie cookie) noexcept {
     LocalLockState& local = current.trace->local;
     if (local.held_count == 0
         || local.held[local.held_count - 1].lock.address != lock.address) {
-        fail(Violation::NonLifo, site,
-            reinterpret_cast<usize>(lock.address), local.held_count);
+        if constexpr (lock_verify) {
+            fail(Violation::NonLifo, site,
+                reinterpret_cast<usize>(lock.address), local.held_count);
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
 #if MYOS_LOCK_DIAG >= 3
     const HeldEntry held = local.held[local.held_count - 1];
@@ -670,8 +720,11 @@ void before_release(LockRef lock, LockSite site, LockCookie cookie) noexcept {
         KASSERT(lock.owner != nullptr);
         const u64 word = lock.owner->load<libk::MemoryOrder::Acquire>();
         if (cookie.owner_tracked && OwnerWord::cpu(word) != current.cpu.raw) {
-            fail(Violation::WrongOwner, site,
-                reinterpret_cast<usize>(lock.address), word, current.cpu.raw);
+            if constexpr (lock_verify) {
+                fail(Violation::WrongOwner, site,
+                    reinterpret_cast<usize>(lock.address), word, current.cpu.raw);
+            }
+            current.trace->degraded.store<libk::MemoryOrder::Release>(1);
         }
         --local.held_count;
         publish_held(*current.trace);
@@ -679,7 +732,7 @@ void before_release(LockRef lock, LockSite site, LockCookie cookie) noexcept {
             lock.owner->store<libk::MemoryOrder::Release>(
                 OwnerWord::none(OwnerWord::generation(word)));
         }
-        publish_event(*current.trace, LockEvent::Release, lock);
+        publish_event(*current.trace, LockEvent::Release, lock, 0, site);
 #if MYOS_LOCK_DIAG >= 3
         if (held.acquired_at != 0) {
             auto& stats =
@@ -705,7 +758,7 @@ void on_spin(
         return;
     }
     if (polls == 1) {
-        publish_event(*current.trace, LockEvent::Contended, lock);
+        publish_event(*current.trace, LockEvent::Contended, lock, 0, site);
 #if MYOS_LOCK_DIAG >= 3
         auto& stats = current.trace->stats[class_index(lock.lock_class)];
         atomic_add_sat(stats.contentions, 1);
@@ -717,8 +770,10 @@ void on_spin(
     usize count{};
     if (stable_cycle(current, steps, count)) {
         publish_cycle(*current.trace, steps, count);
-        fail(Violation::WaitCycle, site, count,
-            reinterpret_cast<usize>(lock.address));
+        if constexpr (lock_verify) {
+            fail(Violation::WaitCycle, site, count,
+                reinterpret_cast<usize>(lock.address));
+        }
     }
 }
 
@@ -729,13 +784,17 @@ auto irq_disabled(LockSite site) noexcept -> IrqCookie {
     }
     LocalLockState& local = current.trace->local;
     if (local.explicit_irq_depth == libk::numeric_limits<u16>::max()) {
-        fail(Violation::IrqImbalance, site, local.explicit_irq_depth);
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, site, local.explicit_irq_depth);
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return {};
     }
     if (local.explicit_irq_depth++ == 0) {
         local.explicit_irq_start = now();
         local.explicit_irq_site = site;
         if constexpr (lock_trace) {
-            publish_event(*current.trace, LockEvent::IrqOff, {});
+            publish_event(*current.trace, LockEvent::IrqOff, {}, 0, site);
         }
     }
     return IrqCookie{current.cpu.raw, true};
@@ -750,12 +809,20 @@ void irq_restoring(IrqCookie cookie) noexcept {
         return;
     }
     if (cookie.cpu != current.cpu.raw) {
-        fail(Violation::IrqImbalance, LockSite::current(),
-            cookie.cpu, current.cpu.raw);
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current(),
+                cookie.cpu, current.cpu.raw);
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
     LocalLockState& local = current.trace->local;
     if (local.explicit_irq_depth == 0) {
-        fail(Violation::IrqImbalance, LockSite::current());
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current());
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
     if (--local.explicit_irq_depth == 0) {
 #if MYOS_LOCK_DIAG >= 3
@@ -765,7 +832,8 @@ void irq_restoring(IrqCookie cookie) noexcept {
         }
 #endif
         if constexpr (lock_trace) {
-            publish_event(*current.trace, LockEvent::IrqOn, {});
+            publish_event(*current.trace, LockEvent::IrqOn, {}, 0,
+                LockSite::current());
         }
         local.explicit_irq_start = 0;
     }
@@ -798,7 +866,11 @@ void trap_exiting() noexcept {
     }
     auto& local = current.trace->local;
     if (local.context_depth == 0) {
-        fail(Violation::IrqImbalance, LockSite::current());
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current());
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
     local.contexts[local.context_depth - 1] = ExecContext::TrapExit;
     current.trace->context.store<libk::MemoryOrder::Release>(
@@ -813,7 +885,11 @@ void trap_exit(u64 exit_tick) noexcept {
     const u32 old = current.trace->hardware_irq_depth.fetch_sub<
         libk::MemoryOrder::AcqRel>(1);
     if (old == 0) {
-        fail(Violation::IrqImbalance, LockSite::current());
+        if constexpr (lock_verify) {
+            fail(Violation::IrqImbalance, LockSite::current());
+        }
+        current.trace->degraded.store<libk::MemoryOrder::Release>(1);
+        return;
     }
 #if MYOS_LOCK_DIAG < 3
     static_cast<void>(exit_tick);

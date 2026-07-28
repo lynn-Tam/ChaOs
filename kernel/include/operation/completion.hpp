@@ -2,6 +2,7 @@
 
 #include <arch/trap.hpp>
 #include <core/types.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
 #include <libk/variant.hpp>
@@ -95,6 +96,10 @@ public:
     [[nodiscard]] auto complete() const noexcept -> bool {
         return ops_->complete(owner_);
     }
+    [[nodiscard]] auto observation_key() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return observation_.key();
+    }
 
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
@@ -150,6 +155,7 @@ private:
 
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
+    diag::concurrency::ObservationLease observation_{};
 };
 
 } // namespace operation

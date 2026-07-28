@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arch/context.hpp>
+#include <diag/concurrency.hpp>
 #include <execution/binding.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/utility.hpp>
@@ -82,6 +83,14 @@ public:
         -> const sched::Binding* {
         return scheduler_binding_;
     }
+
+    // The state word remains the scheduler's canonical truth.  All writers
+    // pass through this linearization point so the actor projection cannot
+    // silently miss a transition.
+    void set_state(
+        ExecutionState state,
+        diag::concurrency::SourceSite site =
+            diag::concurrency::SourceSite::current()) noexcept;
 
     void prepare(
         arch::ContextEntry entry,

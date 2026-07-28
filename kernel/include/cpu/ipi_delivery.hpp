@@ -14,6 +14,13 @@ namespace kernel {
 // or signaled by a newer kick.
 class IpiDelivery final {
 public:
+    enum class State : u8 {
+        Idle,
+        NeedsKick,
+        InFlight,
+        Retry,
+    };
+
     struct Token final {
         u64 generation{};
 
@@ -61,14 +68,12 @@ public:
         return state_ == State::Retry;
     }
 
-private:
-    enum class State : u8 {
-        Idle,
-        NeedsKick,
-        InFlight,
-        Retry,
-    };
+    [[nodiscard]] auto state() const noexcept -> State { return state_; }
+    [[nodiscard]] auto generation() const noexcept -> u64 {
+        return generation_;
+    }
 
+private:
     State state_{State::Idle};
     u64 generation_{};
 };

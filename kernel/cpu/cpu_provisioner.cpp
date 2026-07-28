@@ -101,6 +101,74 @@ auto CpuProvisioner::prepare_impl(
     runtime->diagnostics->panic.hardware =
         target.descriptor->hardware_id();
     runtime->diagnostics->panic.registry = &registry_;
+#if MYOS_CONCURRENCY_DIAG >= 1
+    runtime->diagnostics->concurrency.live.current_actor.store<
+        libk::MemoryOrder::Relaxed>(0);
+    runtime->diagnostics->concurrency.status.flags.store<
+        libk::MemoryOrder::Relaxed>(0);
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 1
+    // Diagnostic pages are independent optional resources.  A tracing-page
+    // failure must degrade observation only; it must never abort CPU bring-up
+    // or share PMM extension state with a subsystem allocation.
+    if (auto observation_page = pmm_.allocate_page(); observation_page) {
+        runtime->concurrency_observation_page =
+            libk::move(observation_page).value();
+        auto* const observations = libk::construct_at(
+            reinterpret_cast<diag::concurrency::ObservationShard*>(
+                runtime->concurrency_observation_page.bytes()));
+        observations->initialize(
+            id, &runtime->diagnostics->concurrency.profile);
+        runtime->diagnostics->concurrency.observations = observations;
+    } else {
+        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+            libk::MemoryOrder::Release>(
+                diag::concurrency::DiagnosticStatus::StorageMissing));
+    }
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 2
+    if (auto flight_page = pmm_.allocate_page(); flight_page) {
+        runtime->concurrency_flight_page = libk::move(flight_page).value();
+        auto* const flight = libk::construct_at(
+            reinterpret_cast<diag::concurrency::FlightRecorder*>(
+                runtime->concurrency_flight_page.bytes()));
+        flight->initialize(id);
+        runtime->diagnostics->concurrency.flight = flight;
+    } else {
+        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+            libk::MemoryOrder::Release>(
+                diag::concurrency::DiagnosticStatus::StorageMissing));
+    }
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 3
+    const auto ticks_for = [this](u64 nanoseconds) noexcept -> u64 {
+        const auto duration = clock_.duration_from_nanoseconds(nanoseconds);
+        return duration ? duration->ticks() : 0;
+    };
+    runtime->diagnostics->concurrency.policy =
+        diag::concurrency::WatchdogPolicy{
+            .critical_soft = ticks_for(1'000'000),
+            .critical_hard = ticks_for(100'000'000),
+            .transport_soft = ticks_for(10'000'000),
+            .transport_hard = ticks_for(1'000'000'000),
+            .service_soft = ticks_for(100'000'000),
+            .service_hard = ticks_for(5'000'000'000),
+            .scheduler_soft = ticks_for(100'000'000),
+            .scheduler_hard = ticks_for(2'000'000'000),
+        };
+    if (runtime->diagnostics->concurrency.policy.critical_soft == 0
+        || runtime->diagnostics->concurrency.policy.critical_hard == 0
+        || runtime->diagnostics->concurrency.policy.transport_soft == 0
+        || runtime->diagnostics->concurrency.policy.transport_hard == 0
+        || runtime->diagnostics->concurrency.policy.service_soft == 0
+        || runtime->diagnostics->concurrency.policy.service_hard == 0
+        || runtime->diagnostics->concurrency.policy.scheduler_soft == 0
+        || runtime->diagnostics->concurrency.policy.scheduler_hard == 0) {
+        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+            libk::MemoryOrder::Release>(
+                diag::concurrency::DiagnosticStatus::ClockUnavailable));
+    }
+#endif
 
     auto home = KernelStack::create(vspace);
     if (!home) {

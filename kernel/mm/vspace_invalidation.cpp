@@ -123,6 +123,21 @@ auto VSpace::start_invalidation(
 }
 
 auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
+    ensure_observation();
+    if (observation_ready_.load<libk::MemoryOrder::Acquire>()) {
+        // The phase is intentionally coarse here.  pending_kind_ belongs to
+        // the VSpace state guarded below; publishing it needs the same
+        // snapshot as the other service fields.
+        observation_.attempt(
+            0,
+            diag::concurrency::WaitKind::VSpaceWork,
+            diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)));
+    }
+    const auto traced = [this](VSpaceServiceState result) noexcept
+        -> VSpaceServiceResult {
+        publish_observation(result);
+        return libk::expected(result);
+    };
     MappingAuthority* next{};
     bool retire_root{};
     ShootdownTicket* waiting_ticket{};
@@ -141,14 +156,15 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         case ShootdownRetry::Idle:
         case ShootdownRetry::Delivered:
             transport_retries_ = 0;
-            return libk::expected(VSpaceServiceState::Waiting);
+            return traced(VSpaceServiceState::Waiting);
         case ShootdownRetry::TransportFailure:
             ++transport_retries_;
             if (transport_retries_ >= 8) {
+                publish_observation(VSpaceServiceState::Retry);
                 return libk::unexpected(
                     VSpaceServiceError::InvariantViolation);
             }
-            return libk::expected(VSpaceServiceState::Retry);
+            return traced(VSpaceServiceState::Retry);
         }
         __builtin_unreachable();
     }
@@ -182,7 +198,7 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
     }
     complete_cleanup();
     if (waiting || (next == nullptr && !retire_root)) {
-        return libk::expected(settled
+        return traced(settled
             ? VSpaceServiceState::Settled
             : VSpaceServiceState::Waiting);
     }
@@ -191,8 +207,9 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             context, RegionKey{}, false, PendingKind::Retire, true);
         if (!started) {
             if (started.error() == VSpaceError::Busy) {
-                return libk::expected(VSpaceServiceState::Waiting);
+                return traced(VSpaceServiceState::Waiting);
             }
+            publish_observation(VSpaceServiceState::Retry);
             return libk::unexpected(
                 started.error() == VSpaceError::TranslationCorrupt
                     ? VSpaceServiceError::TranslationCorrupt
@@ -202,7 +219,7 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             finish_authorities();
         }
         complete_cleanup();
-        return libk::expected(
+        return traced(
             started.value() == VmStatus::Complete && !pending()
                 ? VSpaceServiceState::Settled
                 : VSpaceServiceState::Progress);
@@ -212,11 +229,13 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         if (started.error() == VSpaceError::Busy) {
             kernel::sync::IrqLockGuard guard{lock_};
             service_waiting_on_claim_ = claim_.region != nullptr;
-            return libk::expected(VSpaceServiceState::Waiting);
+            return traced(VSpaceServiceState::Waiting);
         }
         if (started.error() == VSpaceError::BackingFailed) {
+            publish_observation(VSpaceServiceState::Retry);
             return libk::unexpected(VSpaceServiceError::BackingFailed);
         }
+        publish_observation(VSpaceServiceState::Retry);
         return libk::unexpected(
             started.error() == VSpaceError::TranslationCorrupt
                 ? VSpaceServiceError::TranslationCorrupt
@@ -229,7 +248,7 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         finish_authorities();
     }
     complete_cleanup();
-    return libk::expected(
+    return traced(
         started.value() == VmStatus::Complete && !pending()
             ? VSpaceServiceState::Settled
             : VSpaceServiceState::Progress);
@@ -250,7 +269,86 @@ void VSpace::translation_ready() noexcept {
 
 void VSpace::schedule_work() noexcept {
     KASSERT(work_ != nullptr);
+    ensure_observation();
+    if (observation_ready_.load<libk::MemoryOrder::Acquire>()) {
+        observation_.touch();
+    }
     work_->submit(*this);
+}
+
+void VSpace::ensure_observation() noexcept {
+    bool expected = false;
+    if (!observation_reserved_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, true)) {
+        return;
+    }
+    observation_ = diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::RecordKind::VSpaceWork,
+        reinterpret_cast<u64>(this),
+        1,
+        diag::concurrency::Expectation::InternalFinite);
+    observation_.watch(true);
+    observation_ready_.store<libk::MemoryOrder::Release>(true);
+}
+
+void VSpace::publish_observation(VSpaceServiceState result) noexcept {
+    if (!observation_ready_.load<libk::MemoryOrder::Acquire>()
+        || !observation_) {
+        return;
+    }
+    VSpaceState state{};
+    PendingKind pending{};
+    bool claim{};
+    bool invalidations{};
+    bool authorities{};
+    usize active{};
+    usize retries{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        state = state_;
+        pending = pending_kind_;
+        claim = claim_.region != nullptr;
+        invalidations = !invalidations_.empty();
+        authorities = pending_authorities_ != nullptr;
+        active = coherence_.active_cpus().size();
+        retries = transport_retries_;
+    }
+    using Wait = diag::concurrency::WaitKind;
+    const Wait wait = pending != PendingKind::None
+        ? (active != 0 ? Wait::VSpaceShootdown : Wait::VSpaceWork)
+        : claim
+            ? Wait::VSpaceClaim
+            : authorities
+                ? Wait::VSpaceAuthorityDrain
+                : active != 0
+                    ? Wait::VSpaceActiveCpus
+                    : (invalidations ? Wait::VSpaceWork : Wait::None);
+    u64 stamp = static_cast<u64>(state);
+    stamp = stamp * 17 + static_cast<u64>(pending);
+    stamp = stamp * 17 + claim;
+    stamp = stamp * 17 + invalidations;
+    stamp = stamp * 17 + authorities;
+    stamp = stamp * 17 + active;
+    stamp = stamp * 17 + retries;
+    observation_.transition(
+        static_cast<u32>(result),
+        stamp,
+        wait,
+        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)),
+        active == 0
+            ? diag::concurrency::NodeRef{}
+            : diag::concurrency::NodeRef::external(
+                  reinterpret_cast<u64>(this), active));
+    observation_.detail(0, active);
+    observation_.detail(1, retries);
+    observation_.detail(2, static_cast<u64>(pending));
+    observation_.detail(3, claim || invalidations || authorities);
+    if (state == VSpaceState::Quiescent) {
+        observation_.finish(static_cast<u32>(VSpaceServiceState::Settled));
+    } else {
+        observation_.watch(true);
+    }
 }
 
 auto VSpace::work_ready() const noexcept -> bool {

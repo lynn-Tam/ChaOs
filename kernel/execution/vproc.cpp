@@ -636,7 +636,7 @@ void Vproc::retry_stop_if_ready() noexcept {
         if (home == nullptr) {
             KASSERT(execution_.state_ == State::Prepared
                 || execution_.state_ == State::Exited);
-            execution_.state_ = State::Exited;
+            execution_.set_state(State::Exited);
             if (execution_.scheduler_binding_ != nullptr) {
                 context = &execution_.scheduler_binding_->context();
             } else {

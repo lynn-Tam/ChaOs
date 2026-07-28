@@ -5,6 +5,7 @@
 #include <core/types.hpp>
 #include <cpu/cpu_set.hpp>
 #include <cpu/ipi_delivery.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/expected.hpp>
 #include <libk/inplace_ring.hpp>
 #include <libk/noncopyable.hpp>
@@ -85,6 +86,10 @@ public:
     }
     [[nodiscard]] auto targets() const noexcept -> const kernel::CpuSet&;
     [[nodiscard]] auto acknowledged(kernel::CpuId cpu) const noexcept -> bool;
+    [[nodiscard]] auto observation_key() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return observation_.key();
+    }
 
 private:
     friend class TranslationState;
@@ -111,6 +116,7 @@ private:
     kernel::CpuSet targets_{};
     libk::Atomic<u64> acknowledgements_[kernel::CpuSet::word_count]{};
     kernel::sync::Completion completion_;
+    diag::concurrency::ObservationLease observation_{};
 };
 
 // Detached hardware resources remain owned here until the associated ticket
@@ -166,6 +172,23 @@ class ShootdownQueue final : private libk::noncopyable_nonmovable {
 public:
     static constexpr usize capacity = 64;
 
+    struct Summary final {
+        libk::Atomic<u64> queued{};
+        libk::Atomic<u64> reserved{};
+        libk::Atomic<u64> publish_epoch{};
+        libk::Atomic<u64> take_epoch{};
+        libk::Atomic<u64> transport_epoch{};
+        libk::Atomic<u64> last_publish{};
+        libk::Atomic<u64> last_take{};
+        libk::Atomic<u64> last_transport{};
+        libk::Atomic<u32> delivery_state{};
+        libk::Atomic<u64> delivery_generation{};
+    };
+
+    [[nodiscard]] auto summary() const noexcept -> const Summary& {
+        return summary_;
+    }
+
 private:
     friend class ShootdownPlan;
     friend void drain_shootdowns(kernel::CpuRuntime& runtime) noexcept;
@@ -180,11 +203,13 @@ private:
         -> libk::optional<kernel::IpiDelivery::Token>;
     void transport_failed(kernel::IpiDelivery::Token token) noexcept;
     void take_all(libk::InplaceRing<ShootdownRequest, capacity>& batch) noexcept;
+    void publish_summary() noexcept;
 
     kernel::sync::SpinLock<kernel::sync::LockClass::Shootdown> lock_{};
     libk::InplaceRing<ShootdownRequest, capacity> requests_{};
     usize reserved_{};
     kernel::IpiDelivery delivery_{};
+    Summary summary_{};
 };
 
 // Capacity is reserved on every remote target before the caller edits a PTE.

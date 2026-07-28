@@ -1,10 +1,12 @@
 ARCH ?= riscv64
 PROFILE ?= kernel
 LOCK_DIAG ?= $(if $(filter kernel,$(PROFILE)),off,trace)
+CONCURRENCY_DIAG ?= $(if $(filter kernel,$(PROFILE)),off,trace)
 
 SUPPORTED_ARCHES := riscv64
 SUPPORTED_PROFILES := kernel test proof
 SUPPORTED_LOCK_DIAG := off verify trace profile
+SUPPORTED_CONCURRENCY_DIAG := off snapshot trace watch profile
 
 ifeq ($(filter $(ARCH),$(SUPPORTED_ARCHES)),)
 $(error Unsupported ARCH=$(ARCH); supported: $(SUPPORTED_ARCHES))
@@ -15,12 +17,22 @@ endif
 ifeq ($(filter $(LOCK_DIAG),$(SUPPORTED_LOCK_DIAG)),)
 $(error Unsupported LOCK_DIAG=$(LOCK_DIAG); supported: $(SUPPORTED_LOCK_DIAG))
 endif
+ifeq ($(filter $(CONCURRENCY_DIAG),$(SUPPORTED_CONCURRENCY_DIAG)),)
+$(error Unsupported CONCURRENCY_DIAG=$(CONCURRENCY_DIAG); supported: $(SUPPORTED_CONCURRENCY_DIAG))
+endif
 
 LOCK_DIAG_LEVEL_off := 0
 LOCK_DIAG_LEVEL_verify := 1
 LOCK_DIAG_LEVEL_trace := 2
 LOCK_DIAG_LEVEL_profile := 3
 LOCK_DIAG_LEVEL := $(LOCK_DIAG_LEVEL_$(LOCK_DIAG))
+
+CONCURRENCY_DIAG_LEVEL_off := 0
+CONCURRENCY_DIAG_LEVEL_snapshot := 1
+CONCURRENCY_DIAG_LEVEL_trace := 2
+CONCURRENCY_DIAG_LEVEL_watch := 3
+CONCURRENCY_DIAG_LEVEL_profile := 4
+CONCURRENCY_DIAG_LEVEL := $(CONCURRENCY_DIAG_LEVEL_$(CONCURRENCY_DIAG))
 
 ENABLE_TESTS := 0
 ifeq ($(PROFILE),test)
@@ -96,7 +108,7 @@ RISCV_ABI  ?= lp64d
 RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
-BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)-lock$(LOCK_DIAG)
+BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
 BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
 BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
@@ -130,6 +142,7 @@ COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
                 -DMYOS_LOCK_PROBE=$(LOCK_PROBE) \
                 -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
                 -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
+                -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) \
                 -DMYOS_BUILD_ID=\"$(BUILD_ID)\" \
                 $(RISCV_ARCH_FLAGS) \
                 -mcmodel=medany -msmall-data-limit=0 \
@@ -203,6 +216,7 @@ KERNEL_SRCS := \
   kernel/init/run.cpp \
   kernel/diag/console.cpp \
   kernel/diag/panic.cpp \
+  kernel/diag/concurrency.cpp \
   kernel/core/kernel_state.cpp \
   kernel/cap/policy.cpp \
   kernel/cap/grant_graph.cpp \
@@ -282,7 +296,7 @@ KERNEL_SRCS := \
   kernel/mm/pmm.cpp \
   libk/mem.c
 
-ifneq ($(LOCK_DIAG_LEVEL),0)
+ifneq ($(filter-out 0,$(LOCK_DIAG_LEVEL) $(CONCURRENCY_DIAG_LEVEL)),)
 KERNEL_SRCS += kernel/sync/lock.cpp
 endif
 

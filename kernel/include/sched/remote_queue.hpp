@@ -2,8 +2,10 @@
 
 #include <cpu/ipi_delivery.hpp>
 #include <libk/intrusive_list.hpp>
+#include <libk/limits.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
+#include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
 
 namespace kernel::sched {
@@ -19,6 +21,23 @@ enum class RemoteCancel : u8 {
     CanceledQueued,
     AlreadyClaimed,
     NotPending,
+};
+
+// A one-way projection of RemoteQueue.  The queue and request pending bits
+// remain canonical under lock_; these atomics are only evidence for a
+// watchdog or panic reader and may be stale or internally inconsistent.
+struct RemoteSummary final {
+    libk::Atomic<u64> queue_count{};
+    libk::Atomic<u32> oldest_kind{};
+    libk::Atomic<u64> oldest_owner{};
+    libk::Atomic<u64> post_epoch{};
+    libk::Atomic<u64> take_epoch{};
+    libk::Atomic<u64> complete_epoch{};
+    libk::Atomic<u64> last_post{};
+    libk::Atomic<u64> last_take{};
+    libk::Atomic<u64> last_transport{};
+    libk::Atomic<u32> delivery_state{};
+    libk::Atomic<u64> delivery_generation{};
 };
 
 // Embedded in the state owner whose home CPU must commit a remote request.
@@ -61,12 +80,18 @@ public:
     [[nodiscard]] auto cancel(RemoteRequest& request) noexcept
         -> RemoteCancel;
     [[nodiscard]] auto size() const noexcept -> usize;
+    [[nodiscard]] auto summary() const noexcept -> const RemoteSummary& {
+        return summary_;
+    }
 
 private:
+    void publish_summary() noexcept;
+
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::RemoteQueue>
         lock_{};
     Queue queue_{};
     kernel::IpiDelivery delivery_{};
+    RemoteSummary summary_{};
 };
 
 } // namespace kernel::sched

@@ -21,6 +21,14 @@
 
 namespace kernel::cap {
 
+namespace {
+
+constexpr u32 grant_published = 1;
+constexpr u32 grant_servicing = 2;
+constexpr u32 grant_complete = 3;
+
+} // namespace
+
 GrantWork::GrantWork(GrantWork&& other) noexcept
     : attachment_(libk::exchange(other.attachment_, nullptr)) {}
 
@@ -362,10 +370,39 @@ void GrantRef::reset() noexcept {
 
 void GrantRevoke::initialize(usize pending) noexcept {
     completion_.initialize(pending);
+    observation_ = diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::RecordKind::GrantRevoke,
+        reinterpret_cast<u64>(this),
+        pending == 0 ? 1 : pending,
+        diag::concurrency::Expectation::InternalFinite);
+    observation_.transition(
+        grant_published,
+        pending,
+        diag::concurrency::WaitKind::GrantWork,
+        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)));
+    observation_.detail(0, pending);
+    observation_.watch(pending != 0);
 }
 
 void GrantRevoke::acknowledge() noexcept {
     completion_.acknowledge();
+    observation_.advance();
+    if (completion_.complete()) {
+        observation_.finish(grant_complete);
+    }
+}
+
+void GrantRevoke::progress(
+    u32 phase,
+    u64 semantic_stamp,
+    diag::concurrency::NodeRef driver,
+    diag::concurrency::NodeRef blocker) noexcept {
+    observation_.transition(
+        phase,
+        semantic_stamp,
+        diag::concurrency::WaitKind::GrantOperations,
+        driver,
+        blocker);
 }
 
 GrantGraph::~GrantGraph() noexcept {
@@ -981,6 +1018,9 @@ void GrantGraph::service_slot(Slot& slot) noexcept {
     GrantRevoke* completion{};
     GrantAttachment* attachment{};
     GrantWork work{};
+    u64 progress_stamp{};
+    diag::concurrency::NodeRef progress_driver{};
+    diag::concurrency::NodeRef progress_blocker{};
     bool reclaimable{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -993,6 +1033,15 @@ void GrantGraph::service_slot(Slot& slot) noexcept {
             slot.state.load<libk::MemoryOrder::Acquire>();
         const usize operations =
             slot.operations.load<libk::MemoryOrder::Acquire>();
+        progress_stamp = static_cast<u64>(slot.state.load<
+            libk::MemoryOrder::Relaxed>())
+            << 56;
+        progress_stamp |= static_cast<u64>(operation_count(operations));
+        progress_driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(this));
+        progress_blocker = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&slot),
+            slot.generation.load<libk::MemoryOrder::Relaxed>());
         if (state == GrantState::Live && admission_closed(operations)) {
             KASSERT(operation_count(operations) == 0
                 && node.refs == 0 && node.attachments.empty()
@@ -1035,6 +1084,13 @@ void GrantGraph::service_slot(Slot& slot) noexcept {
     }
 
     target_ref.reset();
+    if (completion != nullptr) {
+        completion->progress(
+            grant_servicing,
+            progress_stamp,
+            progress_driver,
+            progress_blocker);
+    }
     if (completion != nullptr) {
         completion->acknowledge();
     }

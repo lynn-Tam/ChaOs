@@ -201,6 +201,24 @@ public:
             ++slot->anchor.active_pins_;
         }
 
+#if MYOS_CONCURRENCY_DIAG >= 1
+        auto observation =
+            kernel::diag::concurrency::ObservationLease::reserve(
+                kernel::diag::concurrency::RecordKind::ObjectRetire,
+                reinterpret_cast<u64>(&slot->anchor),
+                slot->anchor.generation_,
+                kernel::diag::concurrency::Expectation::InternalFinite);
+        observation.transition(
+            1,
+            slot->anchor.generation_,
+            kernel::diag::concurrency::WaitKind::ObjectCleanup,
+            kernel::diag::concurrency::NodeRef::external(
+                reinterpret_cast<u64>(&slot->anchor),
+                slot->anchor.generation_));
+        observation.watch(true);
+        static_cast<void>(observation.detach_key());
+#endif
+
         if constexpr (requires(T& object) {
             ObjectTraits<T>::prepare_retire(object);
         }) {
@@ -210,6 +228,11 @@ public:
                 KASSERT(slot->anchor.active_pins_ != 0);
                 --slot->anchor.active_pins_;
                 slot->anchor.lifecycle_ = ObjectLifecycle::Live;
+#if MYOS_CONCURRENCY_DIAG >= 1
+                auto active = retire_observation(
+                    slot->anchor, slot->anchor.generation_);
+                active.finish(5);
+#endif
                 return false;
             }
         }
@@ -230,14 +253,15 @@ public:
 
     // Finalizers run outside the pool lock. Only the designated reclaimer (or
     // exclusive test/teardown code) may drain; never hard interrupt or commit.
-    void drain_reclaim() noexcept {
+    auto drain_reclaim() noexcept -> usize {
+        usize drained{};
         for (;;) {
             Slot* slot{};
             {
                 kernel::sync::IrqLockGuard guard{lock_};
                 slot = reclaim_head_;
                 if (slot == nullptr) {
-                    return;
+                    return drained;
                 }
                 reclaim_head_ = slot->next_reclaim;
                 slot->next_reclaim = nullptr;
@@ -250,10 +274,19 @@ public:
                 slot->anchor.lifecycle_ = ObjectLifecycle::Quiescent;
             }
 
+#if MYOS_CONCURRENCY_DIAG >= 1
+            auto active = retire_observation(
+                slot->anchor, slot->anchor.generation_);
+            active.phase(4, slot->anchor.generation_);
+#endif
             ObjectTraits<T>::destroy(*slot->object());
             auto refund = slot->anchor.sponsorship_.detach();
+#if MYOS_CONCURRENCY_DIAG >= 1
+            active.finish(5);
+#endif
             finalize_free(*slot);
             refund.complete();
+            ++drained;
         }
     }
 
@@ -263,6 +296,18 @@ public:
     }
 
 private:
+#if MYOS_CONCURRENCY_DIAG >= 1
+    [[nodiscard]] static auto retire_observation(
+        ObjectAnchor& anchor,
+        u64 generation) noexcept
+        -> kernel::diag::concurrency::ObservationLease {
+        return kernel::diag::concurrency::ObservationLease::find(
+            kernel::diag::concurrency::RecordKind::ObjectRetire,
+            reinterpret_cast<u64>(&anchor),
+            generation);
+    }
+#endif
+
     [[nodiscard]] static auto slots(PageHeader& page) noexcept -> Slot* {
         return reinterpret_cast<Slot*>(
             reinterpret_cast<usize>(&page) + slot_offset);
@@ -475,6 +520,10 @@ private:
             KASSERT(anchor.generation_ == generation);
             KASSERT(anchor.strong_refs_ != 0);
             --anchor.strong_refs_;
+#if MYOS_CONCURRENCY_DIAG >= 1
+            auto active = retire_observation(anchor, generation);
+            active.advance();
+#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -490,6 +539,10 @@ private:
             KASSERT(anchor.generation_ == generation);
             KASSERT(anchor.active_pins_ != 0);
             --anchor.active_pins_;
+#if MYOS_CONCURRENCY_DIAG >= 1
+            auto active = retire_observation(anchor, generation);
+            active.advance();
+#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -508,6 +561,13 @@ private:
             KASSERT(anchor.active_pins_ != 0);
             anchor.cleanup_complete_ = true;
             --anchor.active_pins_;
+#if MYOS_CONCURRENCY_DIAG >= 1
+            auto active = retire_observation(anchor, generation);
+            active.phase(
+                2,
+                anchor.generation_,
+                kernel::diag::concurrency::SourceSite::current());
+#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -586,6 +646,14 @@ private:
         anchor.reclaim_queued_ = true;
         slot.next_reclaim = reclaim_head_;
         reclaim_head_ = &slot;
+#if MYOS_CONCURRENCY_DIAG >= 1
+        auto active = retire_observation(anchor, anchor.generation_);
+        active.phase(
+            3,
+            anchor.generation_,
+            kernel::diag::concurrency::SourceSite::current());
+        active.watch(true);
+#endif
         return true;
     }
 

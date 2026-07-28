@@ -2,6 +2,7 @@
 
 #include <cap/grant_graph.hpp>
 #include <core/debug.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
 #include <object/resource_pool.hpp>
@@ -425,11 +426,21 @@ auto ResourcePool::state() const noexcept -> PoolState {
 }
 
 auto ResourcePool::close() noexcept -> PoolState {
+    bool started{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ == PoolState::Open) {
             state_ = PoolState::Closing;
+            started = true;
         }
+    }
+    if (started && !close_observation_) {
+        close_observation_ = diag::concurrency::ObservationLease::reserve(
+            diag::concurrency::RecordKind::ResourceClose,
+            reinterpret_cast<u64>(this),
+            1,
+            diag::concurrency::Expectation::InternalFinite);
+        close_observation_.watch(true);
     }
     service();
     return state();
@@ -684,6 +695,7 @@ void ResourcePool::service() noexcept {
         kernel::sync::IrqLockGuard guard{lock_};
         if (servicing_) {
             service_pending_ = true;
+            close_observation_.touch();
             return;
         }
         servicing_ = true;
@@ -694,6 +706,7 @@ void ResourcePool::service() noexcept {
         Allocation* stop{};
         Allocation* retire{};
         Allocation* notify_parent{};
+        bool done{};
         {
             kernel::sync::IrqLockGuard guard{lock_};
             service_pending_ = false;
@@ -823,8 +836,13 @@ void ResourcePool::service() noexcept {
                     continue;
                 }
                 servicing_ = false;
-                return;
+                done = true;
             }
+        }
+
+        if (done) {
+            publish_observation();
+            return;
         }
 
         if (revoke != nullptr) {
@@ -840,6 +858,66 @@ void ResourcePool::service() noexcept {
             KASSERT(notify_parent != nullptr);
             notify_parent->child_closed();
         }
+    }
+}
+
+void ResourcePool::publish_observation() noexcept {
+    PoolState state{};
+    usize reservations{};
+    usize constructions{};
+    usize roots{};
+    usize sponsorships{};
+    Allocation* blocker{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        state = state_;
+        reservations = reservation_count_;
+        constructions = construction_count_;
+        roots = root_count_;
+        sponsorships = sponsorship_count_;
+        blocker = roots_;
+    }
+    if (!close_observation_) {
+        return;
+    }
+    using Wait = diag::concurrency::WaitKind;
+    const Wait wait = [&]() noexcept {
+        switch (state) {
+        case PoolState::Closing:
+            return Wait::ResourceReservations;
+        case PoolState::Revoking:
+            return Wait::GrantWork;
+        case PoolState::Stopping:
+            return Wait::SchedulerActivation;
+        case PoolState::Reclaiming:
+            return Wait::ObjectReclaim;
+        case PoolState::Open:
+        case PoolState::Closed:
+            return Wait::None;
+        }
+        return Wait::Unknown;
+    }();
+    u64 stamp = static_cast<u64>(state);
+    stamp = stamp * 131 + reservations;
+    stamp = stamp * 131 + constructions;
+    stamp = stamp * 131 + roots;
+    stamp = stamp * 131 + sponsorships;
+    close_observation_.transition(
+        static_cast<u32>(state),
+        stamp,
+        wait,
+        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)),
+        blocker == nullptr
+            ? diag::concurrency::NodeRef{}
+            : diag::concurrency::NodeRef::external(
+                  reinterpret_cast<u64>(blocker)));
+    close_observation_.detail(0, reservations);
+    close_observation_.detail(1, constructions);
+    close_observation_.detail(2, roots);
+    close_observation_.detail(3, sponsorships);
+    close_observation_.watch(state != PoolState::Closed);
+    if (state == PoolState::Closed) {
+        close_observation_.finish(static_cast<u32>(state));
     }
 }
 

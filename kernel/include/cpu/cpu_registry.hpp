@@ -74,6 +74,14 @@ public:
             : libk::nullopt;
     }
 
+    // Runtime-backed diagnostic leases use this stable descriptor as their
+    // lifetime witness.  The registry clears runtime_ after destroying the
+    // runtime, so late lease destruction can become a harmless no-op instead
+    // of touching a released diagnostics page.
+    [[nodiscard]] auto runtime_alive() const noexcept -> bool {
+        return runtime_ != nullptr;
+    }
+
 private:
     friend class CpuRegistry;
 

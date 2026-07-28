@@ -258,7 +258,7 @@ void Thread::request_stop(execution::Stop& request) noexcept {
             if (home == nullptr) {
                 KASSERT(execution_.state_ == State::Prepared
                     || execution_.state_ == State::Exited);
-                execution_.state_ = State::Exited;
+                execution_.set_state(State::Exited);
                 if (execution_.scheduler_binding_ == nullptr) {
                     stopped_ = true;
                     stops_.erase(request);

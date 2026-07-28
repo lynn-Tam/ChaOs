@@ -2,15 +2,29 @@
 
 #include <arch/instruction.hpp>
 #include <arch/ipi.hpp>
+#include <arch/time.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel::mm {
+
+namespace {
+
+constexpr u32 shootdown_published = 1;
+constexpr u32 shootdown_waiting = 2;
+constexpr u32 shootdown_complete = 3;
+
+[[nodiscard]] auto now() noexcept -> u64 {
+    return arch::read_clock().ticks();
+}
+
+} // namespace
 
 ShootdownTicket::~ShootdownTicket() noexcept {
     KASSERT(!initialized() || complete());
@@ -64,6 +78,38 @@ void ShootdownTicket::initialize(
     targets_ = targets;
     completion_.initialize(targets.size());
     owner_ = &owner;
+    observation_ = diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::RecordKind::Shootdown,
+        reinterpret_cast<u64>(this),
+        epoch.raw,
+        diag::concurrency::Expectation::InternalFinite);
+    observation_.transition(
+        shootdown_published,
+        epoch.raw,
+        diag::concurrency::WaitKind::ShootdownAck,
+        targets.size() == 1
+            ? [&]() noexcept {
+                  diag::concurrency::NodeRef result{};
+                  targets.for_each([&](kernel::CpuId cpu) noexcept {
+                      result = diag::concurrency::NodeRef::cpu(cpu);
+                  });
+                  return result;
+              }()
+            : diag::concurrency::NodeRef::external(
+                  reinterpret_cast<u64>(this), epoch.raw));
+    for (usize index = 0; index < kernel::CpuSet::word_count; ++index) {
+        // CpuSet is intentionally opaque; build the witness one bit at a
+        // time so the diagnostic copy remains independent of its lock-free
+        // acknowledgement atomics.
+        u64 word{};
+        targets.for_each([&](kernel::CpuId cpu) noexcept {
+            if (cpu.raw / kernel::CpuSet::word_bits == index) {
+                word |= u64{1} << (cpu.raw % kernel::CpuSet::word_bits);
+            }
+        });
+        observation_.detail(index, word);
+    }
+    observation_.watch(!targets.empty());
     if (!targets.empty()) {
         static_cast<void>(owner.pending_tickets_.fetch_add<
             libk::MemoryOrder::Relaxed>(1));
@@ -78,11 +124,21 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
     const u64 previous = acknowledgements_[word].fetch_or<
         libk::MemoryOrder::AcqRel>(bit);
     if ((previous & bit) == 0) {
+        observation_.detail_and(word, ~bit);
+        observation_.advance();
         completion_.acknowledge([&]() noexcept {
             const usize owner_pending = owner_->pending_tickets_.fetch_sub<
                 libk::MemoryOrder::Release>(1);
             KASSERT(owner_pending != 0);
         });
+        if (completion_.complete()) {
+            observation_.finish(shootdown_complete, epoch_.raw);
+        } else {
+            observation_.phase(
+                shootdown_waiting,
+                epoch_.raw + acknowledgements_[word].load<
+                    libk::MemoryOrder::Acquire>());
+        }
     }
 }
 
@@ -132,6 +188,7 @@ auto ShootdownQueue::reserve() noexcept -> bool {
         return false;
     }
     ++reserved_;
+    publish_summary();
     return true;
 }
 
@@ -139,6 +196,7 @@ void ShootdownQueue::cancel() noexcept {
     kernel::sync::IrqLockGuard guard{lock_};
     KASSERT(reserved_ != 0);
     --reserved_;
+    publish_summary();
 }
 
 void ShootdownQueue::publish(ShootdownRequest request) noexcept {
@@ -148,19 +206,32 @@ void ShootdownQueue::publish(ShootdownRequest request) noexcept {
     --reserved_;
     KASSERT(requests_.try_push_back(request));
     delivery_.publish();
+    static_cast<void>(summary_.publish_epoch.fetch_add<
+        libk::MemoryOrder::Relaxed>(1));
+    summary_.last_publish.store<libk::MemoryOrder::Release>(now());
+    publish_summary();
 }
 
 auto ShootdownQueue::claim_transport() noexcept
     -> libk::optional<kernel::IpiDelivery::Token> {
     kernel::sync::IrqLockGuard guard{lock_};
     KASSERT(!requests_.empty() || !delivery_.pending());
-    return delivery_.claim();
+    auto result = delivery_.claim();
+    if (result) {
+        static_cast<void>(summary_.transport_epoch.fetch_add<
+            libk::MemoryOrder::Relaxed>(1));
+        summary_.last_transport.store<libk::MemoryOrder::Release>(now());
+    }
+    publish_summary();
+    return result;
 }
 
 void ShootdownQueue::transport_failed(
     kernel::IpiDelivery::Token token) noexcept {
     kernel::sync::IrqLockGuard guard{lock_};
     delivery_.fail(token);
+    summary_.last_transport.store<libk::MemoryOrder::Release>(now());
+    publish_summary();
 }
 
 void ShootdownQueue::take_all(
@@ -172,6 +243,19 @@ void ShootdownQueue::take_all(
         requests_.pop_front();
     }
     delivery_.consume();
+    static_cast<void>(summary_.take_epoch.fetch_add<
+        libk::MemoryOrder::Relaxed>(1));
+    summary_.last_take.store<libk::MemoryOrder::Release>(now());
+    publish_summary();
+}
+
+void ShootdownQueue::publish_summary() noexcept {
+    summary_.queued.store<libk::MemoryOrder::Release>(requests_.size());
+    summary_.reserved.store<libk::MemoryOrder::Release>(reserved_);
+    summary_.delivery_state.store<libk::MemoryOrder::Release>(
+        static_cast<u32>(delivery_.state()));
+    summary_.delivery_generation.store<libk::MemoryOrder::Release>(
+        delivery_.generation());
 }
 
 ShootdownPlan::ShootdownPlan(ShootdownPlan&& other) noexcept
@@ -265,6 +349,17 @@ auto ShootdownPlan::kick(const kernel::CpuSet& targets) noexcept -> bool {
         if (!arch::send_ipi(descriptor->hardware_id())) {
             runtime->shootdowns.transport_failed(*transport);
             success = false;
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Shootdown,
+                diag::concurrency::FlightEvent::RemoteTransportFailure,
+                target.raw,
+                transport->generation);
+        } else {
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Shootdown,
+                diag::concurrency::FlightEvent::RemoteIpiSent,
+                target.raw,
+                transport->generation);
         }
     });
     return success;
@@ -325,6 +420,12 @@ auto TranslationState::Mutation::commit(
     }
 
     const kernel::CpuSet kicks = plan.publish(ticket);
+    diag::concurrency::record(
+        diag::concurrency::FlightDomain::Shootdown,
+        diag::concurrency::FlightEvent::RemotePost,
+        reinterpret_cast<u64>(&ticket),
+        issued.raw,
+        kicks.size());
     if (targets_.contains(plan.local_)) {
         arch::flush_tlb_all();
         if (instruction_sync) {
@@ -490,6 +591,11 @@ void drain_shootdowns(kernel::CpuRuntime& runtime) noexcept {
                 request.ticket->instruction_epoch_;
         }
         request.ticket->acknowledge(request.target);
+        diag::concurrency::record(
+            diag::concurrency::FlightDomain::Shootdown,
+            diag::concurrency::FlightEvent::RemoteComplete,
+            request.target.raw,
+            request.ticket->epoch_.raw);
     }
 }
 
@@ -514,6 +620,17 @@ auto retry_shootdowns(
         if (!arch::send_ipi(descriptor->hardware_id())) {
             runtime->shootdowns.transport_failed(*transport);
             delivered = false;
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Shootdown,
+                diag::concurrency::FlightEvent::RemoteTransportFailure,
+                target.raw,
+                ticket.epoch().raw);
+        } else {
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Shootdown,
+                diag::concurrency::FlightEvent::RemoteIpiSent,
+                target.raw,
+                ticket.epoch().raw);
         }
     });
     if (!attempted) {

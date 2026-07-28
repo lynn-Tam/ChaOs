@@ -379,21 +379,23 @@ auto ObjectStore::pin_irq(ObjectId id) noexcept
     return irqs_.pin(id);
 }
 
-void ObjectStore::drain_reclaim() noexcept {
-    endpoints_.drain_reclaim();
-    channels_.drain_reclaim();
-    pagers_.drain_reclaim();
-    irqs_.drain_reclaim();
-    tunnels_.drain_reclaim();
-    vprocs_.drain_reclaim();
-    notifications_.drain_reclaim();
-    vspaces_.drain_reclaim();
-    cspaces_.drain_reclaim();
-    memories_.drain_reclaim();
-    domains_.drain_reclaim();
-    contexts_.drain_reclaim();
-    threads_.drain_reclaim();
-    resources_.drain_reclaim();
+auto ObjectStore::drain_reclaim() noexcept -> usize {
+    usize drained{};
+    drained += endpoints_.drain_reclaim();
+    drained += channels_.drain_reclaim();
+    drained += pagers_.drain_reclaim();
+    drained += irqs_.drain_reclaim();
+    drained += tunnels_.drain_reclaim();
+    drained += vprocs_.drain_reclaim();
+    drained += notifications_.drain_reclaim();
+    drained += vspaces_.drain_reclaim();
+    drained += cspaces_.drain_reclaim();
+    drained += memories_.drain_reclaim();
+    drained += domains_.drain_reclaim();
+    drained += contexts_.drain_reclaim();
+    drained += threads_.drain_reclaim();
+    drained += resources_.drain_reclaim();
+    return drained;
 }
 
 void ObjectStore::bind_reclaim_notifier(ReclaimNotifier notifier) noexcept {

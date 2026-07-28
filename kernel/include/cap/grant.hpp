@@ -2,6 +2,7 @@
 
 #include <cap/authority.hpp>
 #include <core/types.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
@@ -216,14 +217,24 @@ public:
     [[nodiscard]] auto complete() const noexcept -> bool {
         return completion_.complete();
     }
+    [[nodiscard]] auto observation_key() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return observation_.key();
+    }
     [[nodiscard]] auto arm() noexcept -> bool { return completion_.arm(); }
 
 private:
     friend class GrantGraph;
     void initialize(usize pending) noexcept;
     void acknowledge() noexcept;
+    void progress(
+        u32 phase,
+        u64 semantic_stamp,
+        diag::concurrency::NodeRef driver,
+        diag::concurrency::NodeRef blocker) noexcept;
 
     kernel::sync::Completion completion_;
+    diag::concurrency::ObservationLease observation_{};
 };
 
 // Capability-owned operation used only for a blocking invocation. GrantGraph

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cpu/topology.hpp>
+#include <diag/concurrency.hpp>
 #include <execution/target.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/intrusive_tree.hpp>
@@ -61,12 +62,92 @@ public:
         return timer_hook_.is_linked();
     }
 
+    [[nodiscard]] auto actor_key() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return actor_.key();
+    }
+
+    [[nodiscard]] auto actor_ref() noexcept -> diag::concurrency::NodeRef {
+        ensure_actor(diag::concurrency::SourceSite::current());
+        return diag::concurrency::NodeRef::observation(actor_.key());
+    }
+
+    void publish_state(
+        ExecutionState state,
+        diag::concurrency::SourceSite site =
+            diag::concurrency::SourceSite::current()) noexcept {
+        ensure_actor(site);
+        actor_.phase(static_cast<u32>(state), static_cast<u64>(state), site);
+        actor_.watch(
+            state == ExecutionState::Ready
+            || state == ExecutionState::Throttled
+            || state == ExecutionState::Blocked);
+        diag::concurrency::record(
+            diag::concurrency::FlightDomain::Scheduler,
+            state_event(state),
+            actor_.key().raw,
+            reinterpret_cast<u64>(this),
+            static_cast<u64>(state),
+            home_cpu_.raw,
+            0,
+            site);
+    }
+
+    void link_wait(
+        diag::concurrency::ObservationKey wait,
+        diag::concurrency::WaitKind kind,
+        diag::concurrency::NodeRef driver,
+        diag::concurrency::SourceSite site =
+            diag::concurrency::SourceSite::current()) noexcept {
+        ensure_actor(site);
+        actor_.link_wait(wait, kind, driver, site);
+    }
+
+    void clear_wait(
+        diag::concurrency::SourceSite site =
+            diag::concurrency::SourceSite::current()) noexcept {
+        actor_.clear_wait(site);
+    }
+
 private:
     friend class ReadyQueue;
     friend class BuiltinPolicy;
     friend class TimerQueue;
     friend class RemoteQueue;
     friend class CpuDispatcher;
+
+    void ensure_actor(diag::concurrency::SourceSite site) noexcept {
+        if (!actor_) {
+            actor_ = diag::concurrency::ObservationLease::reserve(
+                diag::concurrency::RecordKind::ExecutionActor,
+                reinterpret_cast<u64>(this),
+                1,
+                diag::concurrency::Expectation::SchedulerControlled,
+                site);
+        }
+    }
+
+    [[nodiscard]] static auto state_event(ExecutionState state) noexcept
+        -> diag::concurrency::FlightEvent {
+        using Event = diag::concurrency::FlightEvent;
+        switch (state) {
+        case ExecutionState::Prepared:
+            return Event::Start;
+        case ExecutionState::Ready:
+            return Event::Ready;
+        case ExecutionState::Running:
+            return Event::Dispatch;
+        case ExecutionState::Throttled:
+            return Event::Throttle;
+        case ExecutionState::Blocked:
+            return Event::Block;
+        case ExecutionState::Parked:
+            return Event::Park;
+        case ExecutionState::Exited:
+            return Event::Exit;
+        }
+        return Event::ObservationDegraded;
+    }
 
     SchedulingContext* context_{};
     execution::TargetHold target_{};
@@ -81,6 +162,7 @@ private:
     // race without allowing a remote producer to modify Thread state.
     bool wake_credit_{};
     bool activation_credit_{};
+    diag::concurrency::ObservationLease actor_{};
 };
 
 } // namespace kernel::sched

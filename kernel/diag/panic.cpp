@@ -354,7 +354,7 @@ void wait_for_peers(const PanicSlot& owner) noexcept {
     }
 }
 
-#if MYOS_LOCK_DIAG >= 1
+#if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
 void print_lock_trace(CpuId id, const sync::CpuLockTrace& trace) noexcept {
     const u32 context = trace.context.load<libk::MemoryOrder::Acquire>();
     const u32 held_count = trace.held_count.load<libk::MemoryOrder::Acquire>();
@@ -385,17 +385,21 @@ void print_lock_trace(CpuId id, const sync::CpuLockTrace& trace) noexcept {
             trace.waiting.line.load<libk::MemoryOrder::Relaxed>();
         const u64 generation =
             trace.waiting.generation.load<libk::MemoryOrder::Relaxed>();
+        const u64 wait_started =
+            trace.waiting.wait_started.load<libk::MemoryOrder::Relaxed>();
         const u64 last =
             trace.waiting.sequence.load<libk::MemoryOrder::Acquire>();
         if (first == last && (last & 1U) == 0) {
             if (active) {
                 panic_print<
-                    "    waiting: lock={:#018x} class={} line={} gen={}\n">(
+                    "    waiting: lock={:#018x} class={} line={} gen={} "
+                    "since={}\n">(
                     address,
                     sync::lock_class_name(
                         static_cast<sync::LockClass>(lock_class)),
                     line,
-                    generation);
+                    generation,
+                    wait_started);
             }
             break;
         }
@@ -419,54 +423,24 @@ void print_lock_trace(CpuId id, const sync::CpuLockTrace& trace) noexcept {
             const u32 lock_class =
                 held.lock_class.load<libk::MemoryOrder::Relaxed>();
             const u32 line = held.line.load<libk::MemoryOrder::Relaxed>();
+            const u64 acquired_at =
+                held.acquired_at.load<libk::MemoryOrder::Relaxed>();
             const u64 last = held.sequence.load<libk::MemoryOrder::Acquire>();
             if (first == last && (last & 1U) == 0) {
-                panic_print<"    held[{}]: {:#018x} class={} line={}\n">(
+                panic_print<
+                    "    held[{}]: {:#018x} class={} line={} since={}\n">(
                     index,
                     address,
                     sync::lock_class_name(
                         static_cast<sync::LockClass>(lock_class)),
-                    line);
+                    line,
+                    acquired_at);
                 printed = true;
                 break;
             }
         }
         if (!printed) {
             panic_print<"    held[{}]: unstable\n">(index);
-        }
-    }
-
-    const u64 event_head =
-        trace.event_head.load<libk::MemoryOrder::Acquire>();
-    const usize event_count = event_head < sync::lock_event_capacity
-        ? static_cast<usize>(event_head) : sync::lock_event_capacity;
-    for (usize age = 0; age < event_count; ++age) {
-        const usize index = static_cast<usize>(
-            (event_head - event_count + age) % sync::lock_event_capacity);
-        const sync::RemoteEvent& event = trace.events[index];
-        bool printed{};
-        for (usize attempt = 0; attempt < 3; ++attempt) {
-            const u64 first =
-                event.sequence.load<libk::MemoryOrder::Acquire>();
-            if ((first & 1U) != 0) {
-                continue;
-            }
-            const u64 tick = event.tick.load<libk::MemoryOrder::Relaxed>();
-            const usize address =
-                event.address.load<libk::MemoryOrder::Relaxed>();
-            const u32 data = event.data.load<libk::MemoryOrder::Relaxed>();
-            const u64 last =
-                event.sequence.load<libk::MemoryOrder::Acquire>();
-            if (first == last && (last & 1U) == 0) {
-                panic_print<
-                    "    event[{}]: tick={} lock={:#018x} data={:#010x}\n">(
-                    age, tick, address, data);
-                printed = true;
-                break;
-            }
-        }
-        if (!printed) {
-            panic_print<"    event[{}]: unstable\n">(age);
         }
     }
 
@@ -552,11 +526,219 @@ void print_lock_trace(CpuId id, const sync::CpuLockTrace& trace) noexcept {
 }
 #endif
 
+#if MYOS_CONCURRENCY_DIAG >= 1
+void print_concurrency(
+    CpuId id,
+    const concurrency::CpuDiagnosticsCore& core,
+    concurrency::WaitGraphScratch* graph) noexcept {
+    const concurrency::CpuLive& live = core.live;
+    panic_print<
+        "  cpu {} concurrency: actor={:#x} wait={:#x} driver={:#x} "
+        "driver-gen={} subject={:#x} subject-gen={}"
+        " obligation={:#x} context={} wait-kind={} "
+        "wait-at={} dispatch={} timer={} trap-depth={} trap-at={} "
+        "irq-depth={} irq-at={} degraded={:#x}\n">(
+        id.raw,
+        live.current_actor.load<libk::MemoryOrder::Acquire>(),
+        live.current_wait.load<libk::MemoryOrder::Acquire>(),
+        live.current_driver.load<libk::MemoryOrder::Acquire>(),
+        live.current_driver_generation.load<libk::MemoryOrder::Acquire>(),
+        live.current_subject.load<libk::MemoryOrder::Acquire>(),
+        live.current_subject_generation.load<libk::MemoryOrder::Acquire>(),
+        live.current_obligation.load<libk::MemoryOrder::Acquire>(),
+        live.context.load<libk::MemoryOrder::Acquire>(),
+        live.wait_kind.load<libk::MemoryOrder::Acquire>(),
+        live.wait_since.load<libk::MemoryOrder::Acquire>(),
+        live.dispatch_epoch.load<libk::MemoryOrder::Acquire>(),
+        live.timer_epoch.load<libk::MemoryOrder::Acquire>(),
+        live.trap_depth.load<libk::MemoryOrder::Acquire>(),
+        live.trap_entered_at.load<libk::MemoryOrder::Acquire>(),
+        live.irq_depth.load<libk::MemoryOrder::Acquire>(),
+        live.irq_disabled_since.load<libk::MemoryOrder::Acquire>(),
+        live.degraded.load<libk::MemoryOrder::Acquire>());
+    panic_print<"    wait-site={}:{} function={}\n">(
+        reinterpret_cast<const char*>(live.wait_site_file.load<
+            libk::MemoryOrder::Acquire>()),
+        live.wait_site_line.load<libk::MemoryOrder::Acquire>(),
+        reinterpret_cast<const char*>(live.wait_site_function.load<
+            libk::MemoryOrder::Acquire>()));
+    panic_print<"    status={:#x}\n">(
+        core.status.flags.load<libk::MemoryOrder::Acquire>());
+    const auto candidate_state = core.candidate.state.load<
+        libk::MemoryOrder::Acquire>();
+    if (candidate_state != static_cast<u32>(
+            concurrency::WatchdogCandidate::State::Clear)) {
+        concurrency::StallFingerprint fingerprint{};
+        const bool fingerprint_valid = core.candidate.read(fingerprint);
+        if (!fingerprint_valid) {
+            panic_print<"    watchdog: state={} fingerprint=unstable\n">(
+                candidate_state);
+        } else {
+            panic_print<
+                "    watchdog: state={} key={:#x} phase={} progress={} "
+                "activity={} first={} driver={:#x} blocker={:#x}\n">(
+                candidate_state,
+                fingerprint.key.raw,
+                fingerprint.phase,
+                fingerprint.progress_epoch,
+                fingerprint.activity_epoch,
+                core.candidate.first_seen.load<libk::MemoryOrder::Acquire>(),
+                fingerprint.driver.identity,
+                fingerprint.blocker.identity);
+        }
+    }
+
+    if (core.observations != nullptr) {
+        const u64 watched = core.observations->watched();
+        for (usize index = 0; index < concurrency::ObservationShard::slot_count;
+             ++index) {
+            if ((watched & (u64{1} << index)) == 0) {
+                continue;
+            }
+            const concurrency::ObservationKey key =
+                core.observations->key_at(index);
+            concurrency::ObservationSnapshot snapshot{};
+            if (!key || !core.observations->snapshot(key, snapshot)) {
+                panic_print<"    observation[{}]: unstable\n">(index);
+                continue;
+            }
+            panic_print<
+                "    observation[{}] key={:#x} kind={} phase={} wait={} "
+                "activity={} progress={} driver={:#x} blocker={:#x} "
+                "d0={:#x} d1={:#x} d2={:#x} d3={:#x}\n">(
+                index,
+                key.raw,
+                static_cast<u32>(snapshot.record_kind),
+                snapshot.phase,
+                static_cast<u32>(snapshot.wait_kind),
+                snapshot.activity_epoch,
+                snapshot.progress_epoch,
+                snapshot.driver.identity,
+                snapshot.blocker.identity,
+                snapshot.detail[0],
+                snapshot.detail[1],
+                snapshot.detail[2],
+                snapshot.detail[3]);
+        }
+    }
+
+#if MYOS_CONCURRENCY_DIAG >= 4
+    if (core.observations != nullptr) {
+        core.observations->profile_current(arch::read_clock().ticks());
+    }
+    for (usize index = 0;
+         index < static_cast<usize>(concurrency::RecordKind::Count);
+         ++index) {
+        const concurrency::LatencyStats& stats = core.profile.records[index];
+        const u64 completed = stats.completed.load<
+            libk::MemoryOrder::Acquire>();
+        const u64 total = stats.total.load<libk::MemoryOrder::Acquire>();
+        const u64 maximum = stats.max.load<libk::MemoryOrder::Acquire>();
+        const u64 current = stats.current.load<libk::MemoryOrder::Acquire>();
+        if (completed == 0 && total == 0 && maximum == 0 && current == 0) {
+            continue;
+        }
+        panic_print<
+            "    profile[{}]: completed={} total={} max={} current={} "
+            "hist={},{},{},{},{},{},{},{}\n">(
+            index,
+            completed,
+            total,
+            maximum,
+            current,
+            stats.buckets[0].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[1].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[2].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[3].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[4].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[5].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[6].load<libk::MemoryOrder::Acquire>(),
+            stats.buckets[7].load<libk::MemoryOrder::Acquire>());
+    }
+#endif
+
+#if MYOS_CONCURRENCY_DIAG >= 2
+    if (core.flight != nullptr) {
+        const u64 head = core.flight->head();
+        const usize count = head < concurrency::FlightRecorder::capacity
+            ? static_cast<usize>(head)
+            : concurrency::FlightRecorder::capacity;
+        concurrency::FlightRecordValue record{};
+        for (usize index = 0; index < count; ++index) {
+            if (!core.flight->read(index, record)) {
+                panic_print<"    flight[{}]: unstable\n">(index);
+                continue;
+            }
+            panic_print<
+                "    flight[{}] t={} d={} e={} actor={:#x} subject={:#x} "
+                "a0={:#x} a1={:#x}\n">(
+                index,
+                record.tick,
+                static_cast<u32>(record.domain),
+                static_cast<u32>(record.event),
+                record.actor,
+                record.subject,
+                record.arg0,
+                record.arg1);
+        }
+    }
+#endif
+
+    if (graph != nullptr) {
+        concurrency::ObservationKey root{};
+        const auto candidate_state = core.candidate.state.load<
+            libk::MemoryOrder::Acquire>();
+        if (candidate_state != static_cast<u32>(
+                concurrency::WatchdogCandidate::State::Clear)) {
+            concurrency::StallFingerprint fingerprint{};
+            if (core.candidate.read(fingerprint)) {
+                root = fingerprint.key;
+            }
+        }
+        if (!root) {
+            root = concurrency::ObservationKey{
+                live.current_wait.load<libk::MemoryOrder::Acquire>()};
+        }
+        if (!root && core.observations != nullptr) {
+            const u64 watched = core.observations->watched();
+            for (usize index = 0;
+                 index < concurrency::ObservationShard::slot_count;
+                 ++index) {
+                if ((watched & (u64{1} << index)) != 0) {
+                    root = core.observations->key_at(index);
+                    if (root) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (root && concurrency::analyze(root, *graph)) {
+            panic_print<
+                "    wait-graph class={} nodes={}{}\n">(
+                concurrency::stall_class_name(graph->classification),
+                graph->count,
+                graph->truncated ? " truncated" : "");
+            for (usize index = 0; index < graph->count; ++index) {
+                panic_print<"      [{}] key={:#x}\n">(
+                    index, graph->path[index].raw);
+            }
+        }
+    }
+}
+#endif
+
 void print_peers(const PanicSlot& owner) noexcept {
     CpuRegistry* const registry = owner.registry;
     if (registry == nullptr) {
         return;
     }
+#if MYOS_CONCURRENCY_DIAG >= 1
+    concurrency::WaitGraphScratch* graph = nullptr;
+    const CpuRuntime* const owner_runtime = registry->runtime(owner.cpu);
+    if (owner_runtime != nullptr && owner_runtime->diagnostics != nullptr) {
+        graph = &owner_runtime->diagnostics->concurrency.graph;
+    }
+#endif
     panic_print<"peer cpus:\n">();
     for (usize index = 0; index < registry->count(); ++index) {
         const CpuId id{index};
@@ -575,8 +757,11 @@ void print_peers(const PanicSlot& owner) noexcept {
         } else {
             panic_print<"  cpu {}: no acknowledgement\n">(id.raw);
         }
-#if MYOS_LOCK_DIAG >= 1
+#if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
         print_lock_trace(id, runtime->diagnostics->locks);
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 1
+        print_concurrency(id, runtime->diagnostics->concurrency, graph);
 #endif
     }
 }

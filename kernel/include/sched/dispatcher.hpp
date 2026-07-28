@@ -7,7 +7,7 @@
 #include <libk/optional.hpp>
 #include <sched/builtin_policy.hpp>
 #include <sched/timer_queue.hpp>
-#include <sched/trace.hpp>
+#include <diag/concurrency.hpp>
 #include <sched/remote_queue.hpp>
 #include <sched/types.hpp>
 #include <time/clock.hpp>
@@ -136,7 +136,6 @@ private:
     bool ipi_available_{};
     time::Duration pending_charge_{};
     time::Instant programmed_deadline_{time::Instant::max()};
-    DispatchTrace trace_{};
 };
 
 void yield() noexcept;

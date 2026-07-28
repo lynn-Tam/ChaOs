@@ -3,6 +3,7 @@
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/manual_lifetime.hpp>
+#include <diag/concurrency.hpp>
 #include <cap/grant_graph.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <mm/direct_map.hpp>
@@ -115,6 +116,7 @@ private:
     kernel::object::ObjectStore::SchedulingContextHold reclaimer_context_{};
     kernel::object::ObjectStore::ThreadHold reclaimer_thread_{};
     kernel::object::ObjectStore::ResourceHold root_pool_{};
+    diag::concurrency::ObservationLease reclaimer_observation_{};
 };
 
 } // namespace kernel

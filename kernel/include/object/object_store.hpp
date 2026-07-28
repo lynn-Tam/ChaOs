@@ -312,7 +312,7 @@ public:
 
     // Runtime has exactly one drain executor. Tests and terminal teardown may
     // call this directly only while that executor is absent or stopped.
-    void drain_reclaim() noexcept;
+    auto drain_reclaim() noexcept -> usize;
     void bind_reclaim_notifier(ReclaimNotifier notifier) noexcept;
     void unbind_reclaim_notifier() noexcept;
 

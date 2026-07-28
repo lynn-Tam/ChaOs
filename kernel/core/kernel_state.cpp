@@ -153,6 +153,13 @@ auto KernelState::start_reclaimer(
     KASSERT(runtime.dispatcher().make_ready(*context->binding()));
     reclaimer_thread_ = libk::move(thread);
     reclaimer_context_ = libk::move(context);
+    reclaimer_observation_ =
+        diag::concurrency::ObservationLease::reserve(
+            diag::concurrency::RecordKind::ServiceActor,
+            reinterpret_cast<u64>(this),
+            1,
+            diag::concurrency::Expectation::SchedulerControlled);
+    reclaimer_observation_.watch(true);
     objects().bind_reclaim_notifier(
         kernel::object::ObjectStore::ReclaimNotifier::bind<
             &KernelState::wake_reclaimer>(*this));
@@ -168,20 +175,57 @@ auto KernelState::start_reclaimer(
 
 [[noreturn]] void KernelState::reclaimer_entry(void* argument) noexcept {
     auto& kernel = *static_cast<KernelState*>(argument);
+    u64 last_stamp{};
     for (;;) {
-        kernel.objects().drain_reclaim();
         kernel::CpuLocal& cpu = kernel::current_cpu();
         KASSERT(cpu.runtime().owner_registry != nullptr);
+        const auto driver = kernel.reclaimer_context_
+            && kernel.reclaimer_context_->binding() != nullptr
+            ? kernel.reclaimer_context_->binding()->actor_ref()
+            : diag::concurrency::NodeRef::cpu(
+                  cpu.descriptor->logical_id());
+        kernel.reclaimer_observation_.transition(
+            1,
+            last_stamp,
+            diag::concurrency::WaitKind::ObjectReclaim,
+            driver);
+        const usize object_count = kernel.objects().drain_reclaim();
+        diag::concurrency::record(
+            diag::concurrency::FlightDomain::Object,
+            diag::concurrency::FlightEvent::Reclaim,
+            driver.identity,
+            object_count);
+        kernel.reclaimer_observation_.phase(
+            2,
+            object_count,
+            diag::concurrency::SourceSite::current());
         const bool grant_more = kernel.grants().service(8);
+        kernel.reclaimer_observation_.phase(
+            3,
+            grant_more ? 1 : 0,
+            diag::concurrency::SourceSite::current());
         const bool vspace_more = kernel.vspace_work_.run(
             kernel::mm::VmContext{
                 .cpus = cpu.runtime().owner_registry,
                 .local = cpu.descriptor->logical_id(),
             },
             8);
+        kernel.reclaimer_observation_.phase(
+            4,
+            vspace_more ? 1 : 0,
+            diag::concurrency::SourceSite::current());
+        last_stamp = static_cast<u64>(object_count)
+            + (grant_more ? 1 : 0)
+            + (vspace_more ? 1 : 0);
         if (grant_more || vspace_more) {
+            kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();
         } else {
+            kernel.reclaimer_observation_.phase(
+                5,
+                last_stamp,
+                diag::concurrency::SourceSite::current());
+            kernel.reclaimer_observation_.watch(false);
             kernel::sched::block();
         }
     }

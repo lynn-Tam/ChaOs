@@ -56,7 +56,7 @@ struct LockAccess final {
     [[nodiscard]] static auto acquire(
         SpinLock<Class, SameClass>& lock, LockSite site) noexcept
         -> LockCookie {
-        if constexpr (!lock_verify) {
+        if constexpr (!lock_runtime) {
             lock.raw_.lock();
             return {};
         } else {
@@ -90,7 +90,7 @@ struct LockAccess final {
         SpinLock<Class, SameClass>& lock,
         LockSite site,
         LockCookie& cookie) noexcept -> bool {
-        if constexpr (!lock_verify) {
+        if constexpr (!lock_runtime) {
             return lock.raw_.try_lock();
         } else {
             const LockRef identity = ref(lock);
@@ -139,7 +139,7 @@ struct LockAccess final {
         SpinLock<Class, SameClass>& lock,
         LockSite site,
         LockCookie cookie) noexcept {
-        if constexpr (lock_verify) {
+        if constexpr (lock_runtime) {
             before_release(ref(lock), site, cookie);
         }
         lock.raw_.unlock();
@@ -155,7 +155,7 @@ struct LockAccess final {
     }
 };
 
-#if MYOS_LOCK_DIAG == 0
+#if MYOS_LOCK_DIAG == 0 && MYOS_CONCURRENCY_DIAG == 0
 static_assert(sizeof(SpinLock<LockClass::Pmm>)
     == sizeof(libk::TicketSpinLock));
 static_assert(alignof(SpinLock<LockClass::Pmm>)

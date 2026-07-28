@@ -4,6 +4,7 @@
 #include <arch/diagnostics.hpp>
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/sync/atomic.hpp>
 #include <sync/trace.hpp>
 
@@ -30,6 +31,7 @@ enum class Facility : u8 {
     Memory,
     Syscall,
     Synchronization,
+    Concurrency,
 };
 
 struct EventId final {
@@ -84,8 +86,11 @@ struct PanicSlot final {
 
 struct CpuDiagnostics final {
     PanicSlot panic{};
-#if MYOS_LOCK_DIAG >= 1
+#if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
     sync::CpuLockTrace locks{};
+#endif
+#if MYOS_CONCURRENCY_DIAG >= 1
+    concurrency::CpuDiagnosticsCore concurrency{};
 #endif
 };
 

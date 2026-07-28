@@ -402,6 +402,8 @@ private:
     void try_finish_retire() noexcept;
     void complete_cleanup() noexcept;
     void translation_ready() noexcept;
+    void ensure_observation() noexcept;
+    void publish_observation(VSpaceServiceState result) noexcept;
     void schedule_work() noexcept;
     [[nodiscard]] auto work_ready() const noexcept -> bool;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
@@ -439,12 +441,15 @@ private:
     libk::ManualLifetime<object::ObjectCleanup> cleanup_{};
     libk::IntrusiveListHook work_hook_{};
     libk::Atomic<bool> work_open_{false};
+    libk::Atomic<bool> observation_reserved_{false};
+    libk::Atomic<bool> observation_ready_{false};
     VSpaceState state_{VSpaceState::Building};
     usize bindings_{};
     usize transport_retries_{};
     bool service_waiting_on_claim_{};
     kernel::resource::Sponsorship* sponsor_{};
     kernel::resource::Charge table_charge_{};
+    diag::concurrency::ObservationLease observation_{};
 };
 
 } // namespace kernel::mm

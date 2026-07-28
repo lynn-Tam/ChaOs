@@ -90,7 +90,7 @@ void CpuDispatcher::publish(execution::Target target) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(!current_);
     KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
-    idle_->execution_.state_ = ExecutionState::Running;
+    idle_->execution_.set_state(ExecutionState::Running);
     accounted_at_ = clock_->now();
     publish(execution::Target{*idle_});
     program_deadline(accounted_at_);
@@ -330,8 +330,19 @@ auto CpuDispatcher::kick_remote() noexcept -> WakeResult {
             return libk::expected();
         }
         if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Remote,
+                diag::concurrency::FlightEvent::RemoteIpiSent,
+                id_.raw,
+                cpu_->descriptor->hardware_id().raw);
             return libk::expected();
         }
+        diag::concurrency::record(
+            diag::concurrency::FlightDomain::Remote,
+            diag::concurrency::FlightEvent::RemoteTransportFailure,
+            id_.raw,
+            cpu_->descriptor->hardware_id().raw,
+            attempt);
         remote_.transport_failed(*transport);
     }
     KPANIC((diag::FatalEvent{
@@ -471,13 +482,13 @@ void CpuDispatcher::enqueue_or_throttle(
     SchedulingContext& context = binding.context();
     KASSERT(!binding.queued() && !binding.timer_queued());
     if (context.eligible(now)) {
-        execution.state_ = ExecutionState::Ready;
+        execution.set_state(ExecutionState::Ready);
         policy_.enqueue(binding, context.urgency());
         return;
     }
     const auto deadline = context.next_refill();
     KASSERT(deadline && *deadline > now);
-    execution.state_ = ExecutionState::Throttled;
+    execution.set_state(ExecutionState::Throttled);
     timers_.insert(binding, *deadline);
 }
 
@@ -567,6 +578,10 @@ void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
 void CpuDispatcher::on_timer() noexcept {
     KASSERT(!arch::interrupts_enabled());
     const time::Instant now = clock_->now();
+    diag::concurrency::timer(id_, now.ticks());
+#if MYOS_CONCURRENCY_DIAG >= 3
+    diag::concurrency::watchdog_tick(id_, now.ticks());
+#endif
     charge_to(now);
     arch::mask_timer();
     process_deadlines(now);
@@ -639,7 +654,7 @@ void CpuDispatcher::dispatch(
         context.deactivate(id_);
         current_binding_ = nullptr;
         vproc->park_requested_ = false;
-        vproc->execution_.state_ = ExecutionState::Parked;
+        vproc->execution_.set_state(ExecutionState::Parked);
         parked = true;
     } else if (outgoing_binding != nullptr) {
         SchedulingContext& context = outgoing_binding->context();
@@ -649,10 +664,10 @@ void CpuDispatcher::dispatch(
         switch (reason) {
         case DispatchReason::Exit:
         case DispatchReason::Stop:
-            outgoing.execution().state_ = ExecutionState::Exited;
+            outgoing.execution().set_state(ExecutionState::Exited);
             break;
         case DispatchReason::Block:
-            outgoing.execution().state_ = ExecutionState::Blocked;
+            outgoing.execution().set_state(ExecutionState::Blocked);
             break;
         case DispatchReason::Park:
             KASSERT(false);
@@ -663,7 +678,7 @@ void CpuDispatcher::dispatch(
         case DispatchReason::RemoteWake:
         case DispatchReason::Activation:
             if (context.eligible(now)) {
-                outgoing.execution().state_ = ExecutionState::Ready;
+                outgoing.execution().set_state(ExecutionState::Ready);
                 policy_.enqueue(*outgoing_binding, context.urgency());
             } else {
                 enqueue_or_throttle(*outgoing_binding, now);
@@ -675,7 +690,7 @@ void CpuDispatcher::dispatch(
 
     Binding* const candidate = policy_.select().binding;
     if (candidate == nullptr && outgoing.idle()) {
-        outgoing.execution().state_ = ExecutionState::Running;
+        outgoing.execution().set_state(ExecutionState::Running);
         program_deadline(now);
         record_dispatch(outgoing, outgoing, reason, now);
         return;
@@ -712,13 +727,13 @@ void CpuDispatcher::commit(
         candidate->activation_credit_ = false;
         policy_.remove(*candidate, context.urgency());
         KASSERT(context.activate(id_));
-        execution.state_ = ExecutionState::Running;
+        execution.set_state(ExecutionState::Running);
         incoming = target;
         incoming_binding = candidate;
     } else {
         KASSERT(idle_->execution_.state_ == ExecutionState::Prepared
             || idle_->execution_.state_ == ExecutionState::Running);
-        idle_->execution_.state_ = ExecutionState::Running;
+        idle_->execution_.set_state(ExecutionState::Running);
     }
 
     current_binding_ = incoming_binding;
@@ -730,7 +745,7 @@ void CpuDispatcher::commit(
         return;
     }
     if (outgoing.idle()) {
-        outgoing.execution().state_ = ExecutionState::Prepared;
+        outgoing.execution().set_state(ExecutionState::Prepared);
     }
 
     KASSERT(!handoff_outgoing_);
@@ -787,40 +802,61 @@ void CpuDispatcher::record_dispatch(
     execution::Target incoming,
     DispatchReason reason,
     time::Instant now) noexcept {
-    trace_.push(DispatchRecord{
-        .cpu = id_,
-        .outgoing = outgoing.identity(),
-        .incoming = incoming.identity(),
-        .context = reinterpret_cast<usize>(current_binding_ == nullptr
-            ? nullptr
-            : &current_binding_->context()),
-        .reason = reason,
-        .observed_at = now,
-        .charged = pending_charge_,
-        .deadline = programmed_deadline_,
-        .ready_count = policy_.ready_count(),
-        .timer_count = timers_.size(),
-            .remote_count = remote_.size(),
-    });
+    const u64 context = reinterpret_cast<usize>(current_binding_ == nullptr
+        ? nullptr
+        : &current_binding_->context());
+    const u64 actor = current_binding_ == nullptr
+        ? incoming.identity()
+        : current_binding_->actor_key().raw;
+    diag::concurrency::dispatch(
+        id_, actor, context, now.ticks());
+    const auto event = [&]() noexcept {
+        switch (reason) {
+        case DispatchReason::Start:
+            return diag::concurrency::FlightEvent::Start;
+        case DispatchReason::Yield:
+            return diag::concurrency::FlightEvent::Yield;
+        case DispatchReason::Timer:
+            return diag::concurrency::FlightEvent::Timer;
+        case DispatchReason::Block:
+            return diag::concurrency::FlightEvent::Block;
+        case DispatchReason::Park:
+            return diag::concurrency::FlightEvent::Park;
+        case DispatchReason::Exit:
+            return diag::concurrency::FlightEvent::Exit;
+        case DispatchReason::Stop:
+            return diag::concurrency::FlightEvent::StopRequested;
+        case DispatchReason::RemoteWake:
+            return diag::concurrency::FlightEvent::WakeAccepted;
+        case DispatchReason::Activation:
+            return diag::concurrency::FlightEvent::Activation;
+        }
+        return diag::concurrency::FlightEvent::ObservationDegraded;
+    }();
+    diag::concurrency::record(
+        diag::concurrency::FlightDomain::Scheduler,
+        event,
+        actor,
+        outgoing.identity(),
+        context,
+        pending_charge_.ticks(),
+        programmed_deadline_.ticks());
     pending_charge_ = {};
 }
 
 void CpuDispatcher::dump_trace() const noexcept {
-    for (const DispatchRecord& record : trace_.records()) {
-        diag::console::print<
-            "dispatch cpu={} old={} new={} sc={} reason={} charged={} "
-            "deadline={} ready={} timers={} remote={}\n">(
-            record.cpu.raw,
-            record.outgoing,
-            record.incoming,
-            record.context,
-            static_cast<u64>(record.reason),
-            record.charged.ticks(),
-            record.deadline.ticks(),
-            record.ready_count,
-            record.timer_count,
-            record.remote_count);
+#if MYOS_CONCURRENCY_DIAG >= 2
+    if (cpu_ == nullptr || cpu_->runtime_ == nullptr
+        || cpu_->runtime_->diagnostics == nullptr) {
+        return;
     }
+    const auto* const flight = cpu_->runtime_->diagnostics->concurrency.flight;
+    if (flight != nullptr) {
+        diag::concurrency::dump_flight(id_, *flight);
+    }
+#else
+    static_cast<void>(this);
+#endif
 }
 
 void CpuDispatcher::post_switch() noexcept {
@@ -888,7 +924,7 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
         static_cast<void>(remote_.cancel(binding->wake_));
         static_cast<void>(remote_.cancel(binding->stop_));
     }
-    execution.state_ = ExecutionState::Exited;
+    execution.set_state(ExecutionState::Exited);
     return StopDisposition::Finalize;
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <diag/concurrency.hpp>
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>

@@ -2,6 +2,7 @@
 
 #include <core/debug.hpp>
 #include <mm/kernel_stack_layout.hpp>
+#include <sched/binding.hpp>
 
 namespace kernel {
 
@@ -33,6 +34,15 @@ void Execution::prepare(
         .argument = owner,
     });
     prepared_ = true;
+}
+
+void Execution::set_state(
+    ExecutionState state,
+    diag::concurrency::SourceSite site) noexcept {
+    state_ = state;
+    if (scheduler_binding_ != nullptr) {
+        scheduler_binding_->publish_state(state, site);
+    }
 }
 
 } // namespace kernel
