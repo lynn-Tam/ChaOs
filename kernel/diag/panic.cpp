@@ -564,7 +564,7 @@ void print_concurrency(
         has_wait ? wait.site.line : 0,
         has_wait ? wait.site.function : nullptr);
     panic_print<"    status={:#x}\n">(
-        core.status.flags.load<libk::MemoryOrder::Acquire>());
+        core.status().flags.load<libk::MemoryOrder::Acquire>());
     const auto candidate_state = core.candidate.state.load<
         libk::MemoryOrder::Acquire>();
     if (candidate_state != static_cast<u32>(
@@ -624,37 +624,42 @@ void print_concurrency(
     }
 
 #if MYOS_CONCURRENCY_DIAG >= 4
-    if (core.observations != nullptr) {
+    if (core.observations != nullptr && core.profile != nullptr) {
         core.observations->profile_current(arch::read_clock().ticks());
     }
-    for (usize index = 0;
-         index < static_cast<usize>(concurrency::RecordKind::Count);
-         ++index) {
-        const concurrency::LatencyStats& stats = core.profile.records[index];
-        const u64 completed = stats.completed.load<
-            libk::MemoryOrder::Acquire>();
-        const u64 total = stats.total.load<libk::MemoryOrder::Acquire>();
-        const u64 maximum = stats.max.load<libk::MemoryOrder::Acquire>();
-        const u64 current = stats.current.load<libk::MemoryOrder::Acquire>();
-        if (completed == 0 && total == 0 && maximum == 0 && current == 0) {
-            continue;
+    if (core.profile != nullptr) {
+        for (usize index = 0;
+             index < static_cast<usize>(concurrency::RecordKind::Count);
+             ++index) {
+            const concurrency::LatencyStats& stats =
+                core.profile->records[index];
+            const u64 completed = stats.completed.load<
+                libk::MemoryOrder::Acquire>();
+            const u64 total = stats.total.load<libk::MemoryOrder::Acquire>();
+            const u64 maximum = stats.max.load<libk::MemoryOrder::Acquire>();
+            const u64 current = stats.current.load<
+                libk::MemoryOrder::Acquire>();
+            if (completed == 0 && total == 0
+                && maximum == 0 && current == 0) {
+                continue;
+            }
+            panic_print<
+                "    profile[{}]: completed={} total={} max={} current={} "
+                "hist={},{},{},{},{},{},{},{}\n">(
+                index,
+                completed,
+                total,
+                maximum,
+                current,
+                stats.buckets[0].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[1].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[2].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[3].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[4].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[5].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[6].load<libk::MemoryOrder::Acquire>(),
+                stats.buckets[7].load<libk::MemoryOrder::Acquire>());
         }
-        panic_print<
-            "    profile[{}]: completed={} total={} max={} current={} "
-            "hist={},{},{},{},{},{},{},{}\n">(
-            index,
-            completed,
-            total,
-            maximum,
-            current,
-            stats.buckets[0].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[1].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[2].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[3].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[4].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[5].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[6].load<libk::MemoryOrder::Acquire>(),
-            stats.buckets[7].load<libk::MemoryOrder::Acquire>());
     }
 #endif
 

@@ -155,7 +155,7 @@ void publish_wait(
     trace.waiting.active.store<libk::MemoryOrder::Relaxed>(active);
     end_record(trace.waiting.sequence, odd);
     if (active) {
-        diag::concurrency::set_wait(
+        const auto token = diag::concurrency::set_wait(
             diag::concurrency::WaitKind::SpinLock,
             {},
             diag::concurrency::NodeRef::external(
@@ -163,8 +163,13 @@ void publish_wait(
             diag::concurrency::NodeRef::external(
                 reinterpret_cast<u64>(lock.owner)),
             diag::concurrency::SourceSite{site.file, site.function, site.line});
+        trace.waiting.concurrency_token.store<libk::MemoryOrder::Release>(
+            token.raw);
     } else {
-        diag::concurrency::clear_wait();
+        const u64 token = trace.waiting.concurrency_token.exchange<
+            libk::MemoryOrder::AcqRel>(0);
+        diag::concurrency::clear_wait(
+            diag::concurrency::WaitToken{token});
     }
 }
 

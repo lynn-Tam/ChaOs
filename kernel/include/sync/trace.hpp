@@ -167,6 +167,7 @@ struct RemoteWait final {
     libk::Atomic<u32> line{};
     libk::Atomic<u64> generation{};
     libk::Atomic<u64> wait_started{};
+    libk::Atomic<u64> concurrency_token{};
     libk::Atomic<bool> active{};
 };
 

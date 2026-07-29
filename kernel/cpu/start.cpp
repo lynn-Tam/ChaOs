@@ -139,6 +139,12 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     // the whole call is absent from normal builds.
     sync::run_probe(MYOS_LOCK_PROBE);
 #endif
+#if MYOS_CONCURRENCY_PROBE
+    //Confirmatory experiment.
+    // Exit condition: remove the in-kernel rendezvous when an external
+    // scheduler/fault harness can force the same slot interleavings.
+    diag::concurrency::run_probe(MYOS_CONCURRENCY_PROBE);
+#endif
 
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
@@ -182,6 +188,42 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     page.reset();
     KASSERT(kernel.pmm().verify_invariants());
     KASSERT(arch_boot_stack_guard_intact());
+
+#if MYOS_CONCURRENCY_PROBE == 2
+    //Confirmatory experiment.
+    // Exit condition: remove when the normal CPU-offline path is available to
+    // the external concurrency scenario harness.
+    bool storage_ok{};
+    for (usize index = 0; index < kernel.cpus().count(); ++index) {
+        const CpuId id{index};
+        if (id == kernel.cpus().boot_id()) {
+            continue;
+        }
+        auto lease = diag::concurrency::ObservationLease::reserve_on(
+            id,
+            diag::concurrency::RecordKind::ExecutionActor,
+            0x5a5a,
+            1,
+            diag::concurrency::Expectation::SchedulerControlled);
+        if (!lease) {
+            break;
+        }
+        const auto key = lease.detach_key();
+        if (!kernel.cpus().drop_runtime_for_probe(id)) {
+            break;
+        }
+        auto surviving =
+            diag::concurrency::ObservationLease::borrow(key);
+        diag::concurrency::ObservationSnapshot snapshot{};
+        storage_ok = surviving.snapshot(snapshot)
+            && snapshot.subject_identity == 0x5a5a;
+        surviving.finish(1);
+        break;
+    }
+    diag::console::print<
+        "concurrency-probe: stage-a storage-{} cpus={}\n">(
+        storage_ok ? "ok" : "fail", kernel.cpus().count());
+#endif
 
     start_secondaries(kernel.cpus(), kernel.direct_map());
     runtime.dispatcher().enter_idle();

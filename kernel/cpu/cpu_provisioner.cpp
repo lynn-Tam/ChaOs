@@ -104,7 +104,7 @@ auto CpuProvisioner::prepare_impl(
 #if MYOS_CONCURRENCY_DIAG >= 1
     runtime->diagnostics->concurrency.live.current_actor.store<
         libk::MemoryOrder::Relaxed>(0);
-    runtime->diagnostics->concurrency.status.flags.store<
+    runtime->diagnostics->concurrency.status().flags.store<
         libk::MemoryOrder::Relaxed>(0);
 #endif
 #if MYOS_CONCURRENCY_DIAG >= 1
@@ -112,11 +112,12 @@ auto CpuProvisioner::prepare_impl(
     // failure must degrade observation only; it must never abort CPU bring-up
     // or share PMM extension state with a subsystem allocation.
     if (auto observation_page = pmm_.allocate_page(); observation_page) {
-        runtime->concurrency_observation_page =
-            libk::move(observation_page).value();
-        auto* const observations = libk::construct_at(
-            reinterpret_cast<diag::concurrency::ObservationShard*>(
-                runtime->concurrency_observation_page.bytes()));
+        auto owned_shard = libk::move(observation_page).value();
+        auto* const store = libk::construct_at(
+            reinterpret_cast<diag::concurrency::ObservationStore*>(
+                owned_shard.bytes()));
+        registry_.own_observation_store(
+            *target.descriptor, libk::move(owned_shard), *store);
         diag::concurrency::ObservationPage* storage[
             diag::concurrency::ObservationShard::pages]{};
         usize storage_count{};
@@ -126,27 +127,31 @@ auto CpuProvisioner::prepare_impl(
             if (!page) {
                 break;
             }
-            runtime->concurrency_observation_slots[storage_count] =
-                libk::move(page).value();
+            auto owned_slots = libk::move(page).value();
             storage[storage_count] = libk::construct_at(
                 reinterpret_cast<diag::concurrency::ObservationPage*>(
-                    runtime->concurrency_observation_slots[storage_count]
-                        .bytes()));
+                    owned_slots.bytes()));
+            registry_.own_observation_page(
+                *target.descriptor,
+                storage_count,
+                libk::move(owned_slots));
         }
-        observations->initialize(
+        store->shard.initialize(
             id,
-            &runtime->diagnostics->concurrency.profile,
+            &store->profile,
             storage,
             storage_count,
-            &runtime->diagnostics->concurrency.status);
-        runtime->diagnostics->concurrency.observations = observations;
+            &store->status);
+        runtime->diagnostics->concurrency.status_store = &store->status;
+        runtime->diagnostics->concurrency.profile = &store->profile;
+        runtime->diagnostics->concurrency.observations = &store->shard;
         if (storage_count != diag::concurrency::ObservationShard::pages) {
-            static_cast<void>(runtime->diagnostics->concurrency.status.flags
+            static_cast<void>(runtime->diagnostics->concurrency.status().flags
                 .fetch_or<libk::MemoryOrder::Release>(
                     diag::concurrency::DiagnosticStatus::ObservationCapacity));
         }
     } else {
-        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
             libk::MemoryOrder::Release>(
                 diag::concurrency::DiagnosticStatus::StorageMissing));
     }
@@ -160,7 +165,7 @@ auto CpuProvisioner::prepare_impl(
         flight->initialize(id);
         runtime->diagnostics->concurrency.flight = flight;
     } else {
-        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
             libk::MemoryOrder::Release>(
                 diag::concurrency::DiagnosticStatus::StorageMissing));
     }
@@ -189,7 +194,7 @@ auto CpuProvisioner::prepare_impl(
         || runtime->diagnostics->concurrency.policy.service_hard == 0
         || runtime->diagnostics->concurrency.policy.scheduler_soft == 0
         || runtime->diagnostics->concurrency.policy.scheduler_hard == 0) {
-        static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
+        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
             libk::MemoryOrder::Release>(
                 diag::concurrency::DiagnosticStatus::ClockUnavailable));
     }

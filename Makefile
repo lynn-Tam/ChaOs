@@ -77,6 +77,7 @@ QEMU_SMP ?= 4
 QEMU_TIMEOUT ?= 10s
 PANIC_PROBE ?= 0
 LOCK_PROBE ?= 0
+CONCURRENCY_PROBE ?= 0
 GDB_HOST ?= 127.0.0.1
 GDB_PORT ?= 1237
 
@@ -108,7 +109,7 @@ RISCV_ABI  ?= lp64d
 RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
-BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
+BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)$(if $(filter-out 0,$(CONCURRENCY_PROBE)),-concprobe$(CONCURRENCY_PROBE),)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
 BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
 BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
@@ -140,6 +141,7 @@ BOOTPACK := $(HOST_BUILD_DIR)/bootpack
 COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
                 -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
                 -DMYOS_LOCK_PROBE=$(LOCK_PROBE) \
+                -DMYOS_CONCURRENCY_PROBE=$(CONCURRENCY_PROBE) \
                 -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
                 -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
                 -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) \
@@ -719,6 +721,33 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	rm -f "$$output"; \
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
+run-concurrency-probe:
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=trace _run-concurrency-probe
+
+# The trace profile currently has a baseline 1984-byte validate_graph frame
+# against the production 1792-byte audit bound. Runtime evidence remains
+# independently runnable while that pre-existing audit failure stays visible.
+_run-concurrency-probe: $(TARGET)
+	@case "$(CONCURRENCY_PROBE)" in \
+		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
+		2) evidence="concurrency-probe: stage-a storage-ok cpus=$(QEMU_SMP)";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1 or 2"; exit 1;; \
+	esac; \
+	set +e; \
+	output=$$(mktemp); \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	status=$$?; \
+	cat "$$output"; \
+	if [ $$status -ne 124 ] \
+		|| ! rg -q "$$evidence" "$$output" \
+		|| rg -q "concurrency-probe: stage-a fail" "$$output"; then \
+		echo "[concurrency-probe] FAIL: Stage A scenario evidence missing"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	rm -f "$$output"; \
+	echo "[concurrency-probe] OK: Stage A scenarios passed on $(QEMU_SMP) harts"
+
 debug: $(TARGET) audit-boot-stack
 	@echo "debug: waiting for GDB on $(GDB_HOST):$(GDB_PORT)"
 	$(QEMU) -machine virt -nographic -bios default -kernel $(TARGET) -S -gdb tcp:$(GDB_HOST):$(GDB_PORT)
@@ -728,4 +757,4 @@ clean:
 
 -include $(DEPS) $(USER_DEPS)
 
-.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe debug clean
+.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe run-concurrency-probe _run-concurrency-probe debug clean

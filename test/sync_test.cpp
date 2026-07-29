@@ -15,6 +15,9 @@ constinit libk::ManualLifetime<kernel::diag::concurrency::ObservationShard>
     concurrency_test_shard{};
 constinit libk::ManualLifetime<kernel::diag::concurrency::FlightRecorder>
     concurrency_test_flight{};
+constinit kernel::diag::concurrency::ObservationPage
+    concurrency_capacity_pages[
+        kernel::diag::concurrency::ObservationShard::pages]{};
 
 [[nodiscard]] auto test_dep_graph_finds_paths_across_words(
     [[maybe_unused]] const TestContext& context) noexcept -> bool {
@@ -277,6 +280,114 @@ constinit libk::ManualLifetime<kernel::diag::concurrency::FlightRecorder>
     return result;
 }
 
+[[maybe_unused, nodiscard]] auto test_observation_stale_owner_cannot_reopen_slot(
+    [[maybe_unused]] const TestContext& context) noexcept -> bool {
+    using namespace kernel::diag::concurrency;
+    bool result = false;
+    {
+        ObservationShard& shard = concurrency_test_shard.emplace();
+        shard.initialize(kernel::CpuId{250});
+        ObservationLease first = shard.reserve(
+            RecordKind::Operation,
+            0x1100,
+            1,
+            Expectation::InternalFinite,
+            SourceSite::current());
+        do {
+            if (!first) {
+                break;
+            }
+            const ObservationKey old_key = first.key();
+            ObservationLease stale = ObservationLease::borrow(old_key);
+            first.finish(7, 0xaa);
+
+            ObservationLease current = shard.reserve(
+                RecordKind::Operation,
+                0x2200,
+                2,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            if (!current || current.key().slot() != old_key.slot()
+                || current.key().generation() != old_key.generation() + 1) {
+                break;
+            }
+
+            stale.transition(
+                9,
+                0xbb,
+                WaitKind::Unknown,
+                NodeRef::external(0x33));
+            stale.finish(10, 0xcc);
+            ObservationSnapshot snapshot{};
+            result = current.snapshot(snapshot)
+                && snapshot.phase == 0
+                && snapshot.semantic_stamp == 0
+                && snapshot.subject_identity == 0x2200;
+            current.finish(11);
+        } while (false);
+    }
+    concurrency_test_shard.reset();
+    return result;
+}
+
+[[maybe_unused, nodiscard]] auto test_observation_actor_capacity_is_reserved(
+    [[maybe_unused]] const TestContext& context) noexcept -> bool {
+    using namespace kernel::diag::concurrency;
+    bool result = false;
+    {
+        ObservationShard& shard = concurrency_test_shard.emplace();
+        ObservationPage* pages[ObservationShard::pages]{};
+        for (usize index = 0; index < ObservationShard::pages; ++index) {
+            pages[index] = &concurrency_capacity_pages[index];
+        }
+        shard.initialize(
+            kernel::CpuId{251}, nullptr, pages, ObservationShard::pages);
+
+        ObservationLease operations[ObservationShard::slot_count / 2]{};
+        bool filled = true;
+        for (usize index = 0;
+             index < ObservationShard::slot_count / 2;
+             ++index) {
+            operations[index] = shard.reserve(
+                RecordKind::Operation,
+                index + 1,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            if (!operations[index]) {
+                filled = false;
+                break;
+            }
+        }
+        if (filled) {
+            ObservationLease overflow = shard.reserve(
+                RecordKind::Operation,
+                0xffff,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            ObservationLease actor = shard.reserve(
+                RecordKind::ExecutionActor,
+                0x4400,
+                1,
+                Expectation::SchedulerControlled,
+                SourceSite::current());
+            result = !overflow && actor
+                && actor.key().slot() < ObservationShard::slot_count / 2;
+            if (actor) {
+                actor.finish(1);
+            }
+        }
+        for (auto& operation : operations) {
+            if (operation) {
+                operation.finish(1);
+            }
+        }
+    }
+    concurrency_test_shard.reset();
+    return result;
+}
+
 [[maybe_unused, nodiscard]] auto test_wait_graph_is_bounded_and_generation_checked(
     [[maybe_unused]] const TestContext& context) noexcept -> bool {
     using namespace kernel::diag::concurrency;
@@ -460,6 +571,14 @@ void register_sync_tests(TestRegistry& registry) noexcept {
         "concurrency",
         "activity attempts do not masquerade as semantic progress",
         test_observation_activity_is_not_progress);
+    (void)registry.add(
+        "concurrency",
+        "stale owners cannot mutate or release a reused observation slot",
+        test_observation_stale_owner_cannot_reopen_slot);
+    (void)registry.add(
+        "concurrency",
+        "ephemeral observations cannot consume actor capacity",
+        test_observation_actor_capacity_is_reserved);
     (void)registry.add(
         "concurrency",
         "bounded wait graph detects cycles and orphan obligations",

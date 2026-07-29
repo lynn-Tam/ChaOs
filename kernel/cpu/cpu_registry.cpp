@@ -98,6 +98,9 @@ CpuRegistry::~CpuRegistry() noexcept {
             libk::destroy_at(cpu->runtime_);
             cpu->runtime_ = nullptr;
         }
+#if MYOS_CONCURRENCY_DIAG >= 1
+        release_observations(*cpu);
+#endif
     }
     for (CpuRecordBlock* block = first_block_; block != nullptr;) {
         CpuRecordBlock* const next = block->next;
@@ -332,6 +335,39 @@ auto CpuRegistry::runtime_by_hardware_id(
     return cpu == nullptr ? nullptr : runtime(cpu->logical_id_);
 }
 
+#if MYOS_CONCURRENCY_DIAG >= 1
+auto CpuRegistry::observations(CpuId id) noexcept
+    -> diag::concurrency::ObservationShard* {
+    CpuDescriptor* const cpu = mutable_descriptor(id);
+    return cpu == nullptr || cpu->observation_store_ == nullptr
+        ? nullptr : &cpu->observation_store_->shard;
+}
+
+auto CpuRegistry::observations(CpuId id) const noexcept
+    -> const diag::concurrency::ObservationShard* {
+    const CpuDescriptor* const cpu = descriptor(id);
+    return cpu == nullptr || cpu->observation_store_ == nullptr
+        ? nullptr : &cpu->observation_store_->shard;
+}
+#endif
+
+#if MYOS_CONCURRENCY_PROBE
+auto CpuRegistry::drop_runtime_for_probe(CpuId id) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when the normal CPU-offline path can be driven by
+    // the external concurrency scenario harness.
+    CpuDescriptor* const cpu = mutable_descriptor(id);
+    if (cpu == nullptr || id == boot_id()
+        || cpu->state() != CpuState::Prepared || cpu->runtime_ == nullptr
+        || !fail_start(id, CpuFailure::FirmwareRejected)) {
+        return false;
+    }
+    libk::destroy_at(cpu->runtime_);
+    cpu->runtime_ = nullptr;
+    return cpu->observation_store_ != nullptr;
+}
+#endif
+
 void CpuRegistry::fail_unpublished(
     CpuDescriptor& cpu,
     CpuFailure failure) noexcept {
@@ -369,8 +405,49 @@ void CpuRegistry::fail_runtime(
     KASSERT(target.descriptor != nullptr);
     KASSERT(target.storage != nullptr);
     KASSERT(failure != CpuFailure::None);
+#if MYOS_CONCURRENCY_DIAG >= 1
+    release_observations(*target.descriptor);
+#endif
     fail_unpublished(*target.descriptor, failure);
 }
+
+#if MYOS_CONCURRENCY_DIAG >= 1
+void CpuRegistry::own_observation_store(
+    CpuDescriptor& cpu,
+    kernel::mm::OwnedPage&& page,
+    diag::concurrency::ObservationStore& store) noexcept {
+    KASSERT(!cpu.observation_shard_page_);
+    KASSERT(cpu.observation_store_ == nullptr);
+    KASSERT(page);
+    cpu.observation_shard_page_ = libk::move(page);
+    cpu.observation_store_ = &store;
+}
+
+void CpuRegistry::own_observation_page(
+    CpuDescriptor& cpu,
+    usize index,
+    kernel::mm::OwnedPage&& page) noexcept {
+    KASSERT(index < diag::concurrency::ObservationShard::pages);
+    KASSERT(!cpu.observation_pages_[index]);
+    KASSERT(page);
+    cpu.observation_pages_[index] = libk::move(page);
+}
+
+void CpuRegistry::release_observations(CpuDescriptor& cpu) noexcept {
+    if (cpu.observation_store_ != nullptr) {
+        libk::destroy_at(cpu.observation_store_);
+        cpu.observation_store_ = nullptr;
+    }
+    for (auto& page : cpu.observation_pages_) {
+        if (page) {
+            libk::destroy_at(reinterpret_cast<
+                diag::concurrency::ObservationPage*>(page.bytes()));
+            page.reset();
+        }
+    }
+    cpu.observation_shard_page_.reset();
+}
+#endif
 
 void CpuRegistry::publish_runtime(
     RuntimeTarget target,

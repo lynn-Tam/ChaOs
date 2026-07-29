@@ -10,6 +10,10 @@
 #define MYOS_CONCURRENCY_DIAG 0
 #endif
 
+#ifndef MYOS_CONCURRENCY_PROBE
+#define MYOS_CONCURRENCY_PROBE 0
+#endif
+
 namespace kernel::diag::concurrency {
 
 struct DiagnosticStatus;
@@ -325,13 +329,11 @@ struct WaitGraphScratch final {
 };
 
 struct ObservationRecord final {
+    // The slot state is the sole allocation/lifetime truth. It packs the
+    // generation, lifecycle and diagnostic pin count in one atomic word.
+    // Directory masks below are scan hints only.
+    libk::Atomic<u64> slot_state{};
     libk::Atomic<u64> sequence{};
-    libk::Atomic<u64> generation{};
-    libk::Atomic<u64> flags{};
-    // Low bits count short-lived diagnostic pins; the high bit is a
-    // non-blocking release request.  A slot cannot be reused while a pin is
-    // present, so borrowed keys remain generation-safe across CPUs.
-    libk::Atomic<u64> lease_state{};
     libk::Atomic<u64> activity_epoch{};
     libk::Atomic<u64> progress_epoch{};
     libk::Atomic<u64> started_at{};
@@ -368,10 +370,6 @@ struct ObservationRecord final {
 struct ObservationPage final {
     static constexpr usize slot_count = 16;
 
-    libk::Atomic<u64> allocated{};
-    libk::Atomic<u64> watched{};
-    libk::Atomic<u32> degraded{};
-    libk::Atomic<u64> generations[slot_count]{};
     ObservationRecord records[slot_count]{};
 };
 
@@ -379,7 +377,6 @@ static_assert(sizeof(ObservationPage) <= 4096);
 
 struct ObservationSnapshot final {
     u64 generation{};
-    u64 flags{};
     u64 activity_epoch{};
     u64 progress_epoch{};
     u64 started_at{};
@@ -599,6 +596,9 @@ public:
 
 private:
     friend class ObservationLease;
+#if MYOS_CONCURRENCY_PROBE
+    friend void run_probe(u32 probe) noexcept;
+#endif
 
     [[nodiscard]] auto valid(ObservationKey key) const noexcept
         -> ObservationRecord*;
@@ -609,6 +609,15 @@ private:
         ObservationKey key,
         ObservationRecord*& record) const noexcept -> bool;
     void unpin(ObservationKey key, ObservationRecord& record) const noexcept;
+    [[nodiscard]] auto retire(
+        ObservationKey key,
+        ObservationRecord& record) noexcept -> bool;
+    void reclaim(
+        ObservationKey key,
+        ObservationRecord& record) noexcept;
+    [[nodiscard]] auto active(
+        ObservationKey key,
+        const ObservationRecord& record) const noexcept -> bool;
     void finish(
         ObservationKey key,
         u32 terminal_phase,
@@ -638,6 +647,8 @@ private:
         u64 semantic_stamp) noexcept -> bool;
     void update_activity(ObservationKey key, u64 delta) noexcept;
     void advance(ObservationKey key, u64 delta) noexcept;
+    void write_detail(ObservationKey key, usize index, u64 value) noexcept;
+    void and_detail(ObservationKey key, usize index, u64 mask) noexcept;
     [[nodiscard]] auto update_phase(
         ObservationKey key,
         u32 phase,
@@ -739,6 +750,7 @@ struct CpuLive final {
     libk::Atomic<u64> irq_disabled_since{};
     libk::Atomic<u64> current_actor{};
     libk::Atomic<u32> wait_depth{};
+    libk::Atomic<u64> wait_generation{};
     libk::Atomic<u64> wait_activity_epoch{};
     libk::Atomic<u64> wait_progress_epoch{};
     libk::Atomic<u64> wait_semantic_stamp{};
@@ -754,6 +766,7 @@ struct CpuLive final {
     libk::Atomic<bool> interrupts_disabled{};
     struct WaitFrame final {
         libk::Atomic<u64> sequence{};
+        libk::Atomic<u64> token{};
         libk::Atomic<u64> wait{};
         libk::Atomic<u64> subject_identity{};
         libk::Atomic<u64> subject_generation{};
@@ -855,15 +868,37 @@ struct DiagnosticStatus final {
     };
 };
 
+struct WaitToken final {
+    u64 raw{};
+
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+        return raw != 0;
+    }
+};
+
+struct ObservationStore final {
+    LatencyProfile profile{};
+    DiagnosticStatus status{};
+    ObservationShard shard{};
+};
+
+static_assert(sizeof(ObservationStore) <= 4096);
+
 struct CpuDiagnosticsCore final {
     CpuLive live{};
     WatchdogCandidate candidate{};
     WaitGraphScratch graph{};
     WatchdogPolicy policy{};
-    LatencyProfile profile{};
-    DiagnosticStatus status{};
+    DiagnosticStatus fallback_status{};
+    DiagnosticStatus* status_store{};
+    LatencyProfile* profile{};
     FlightRecorder* flight{};
     ObservationShard* observations{};
+
+    [[nodiscard]] auto status(this auto& self) noexcept -> decltype(auto) {
+        return self.status_store == nullptr
+            ? (self.fallback_status) : (*self.status_store);
+    }
 };
 
 // These functions are the only route from hot kernel paths into the current
@@ -901,14 +936,18 @@ void trap_exit(u64 tick) noexcept;
 void watchdog_tick(CpuId cpu, u64 tick) noexcept;
 [[nodiscard]] auto irq_disabled(SourceSite site) noexcept -> u64;
 void irq_restoring(u64 cookie) noexcept;
-void set_wait(
+[[nodiscard]] auto set_wait(
     WaitKind kind,
     ObservationKey wait,
     NodeRef subject,
     NodeRef driver,
-    SourceSite site = SourceSite::current()) noexcept;
-void clear_wait() noexcept;
-void observe_wait(u64 semantic_stamp) noexcept;
+    SourceSite site = SourceSite::current()) noexcept -> WaitToken;
+void clear_wait(WaitToken token) noexcept;
+[[nodiscard]] auto retarget_wait(
+    WaitToken token,
+    NodeRef driver,
+    SourceSite site = SourceSite::current()) noexcept -> bool;
+void observe_wait(WaitToken token, u64 semantic_stamp) noexcept;
 void mark_degraded(DiagnosticStatus::Flag flag) noexcept;
 void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
 [[nodiscard]] auto analyze(
@@ -919,6 +958,9 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
     WaitGraphScratch& scratch) noexcept -> bool;
 [[nodiscard]] auto stall_class_name(StallClass value) noexcept
     -> const char*;
+#if MYOS_CONCURRENCY_PROBE
+void run_probe(u32 probe) noexcept;
+#endif
 
 class CpuWaitScope final {
 public:
@@ -953,7 +995,7 @@ private:
     SourceSite site_{};
     u64 last_stamp_{};
     bool observed_{};
-    bool linked_{};
+    WaitToken wait_token_{};
 };
 
 } // namespace kernel::diag::concurrency
