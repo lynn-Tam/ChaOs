@@ -28,6 +28,7 @@ enum class RemoteCancel : u8 {
 // watchdog or panic reader and may be stale or internally inconsistent.
 struct RemoteSummary final {
     libk::Atomic<u64> queue_count{};
+    libk::Atomic<u64> pending_count{};
     libk::Atomic<u32> oldest_kind{};
     libk::Atomic<u64> oldest_owner{};
     libk::Atomic<u64> post_epoch{};
@@ -51,6 +52,12 @@ public:
 
     [[nodiscard]] auto kind() const noexcept -> RemoteKind { return kind_; }
     [[nodiscard]] auto owner() const noexcept -> void* { return owner_; }
+    // A diagnostic projection of the queue-owned pending bit.  Queue
+    // mutation remains serialized by RemoteQueue; this read is intentionally
+    // relaxed and may lag by one publication.
+    [[nodiscard]] auto pending() const noexcept -> bool {
+        return pending_.load<libk::MemoryOrder::Acquire>();
+    }
 
 private:
     friend class RemoteQueue;
@@ -58,7 +65,7 @@ private:
     libk::IntrusiveListHook hook_{};
     void* owner_{};
     RemoteKind kind_{};
-    bool pending_{};
+    libk::Atomic<bool> pending_{};
 };
 
 // One retained software-IPI edge for all scheduler work addressed to a CPU.
@@ -92,6 +99,7 @@ private:
     Queue queue_{};
     kernel::IpiDelivery delivery_{};
     RemoteSummary summary_{};
+    usize pending_count_{};
 };
 
 } // namespace kernel::sched

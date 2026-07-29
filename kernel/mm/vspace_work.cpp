@@ -1,9 +1,27 @@
 #include <mm/vspace_work.hpp>
 
 #include <core/debug.hpp>
+#include <libk/limits.hpp>
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel::mm {
+namespace {
+
+void advance_epoch(libk::Atomic<u64>& epoch) noexcept {
+    u64 current = epoch.load<libk::MemoryOrder::Relaxed>();
+    for (;;) {
+        if (current == libk::numeric_limits<u64>::max()) {
+            return;
+        }
+        if (epoch.compare_exchange_weak<
+                libk::MemoryOrder::Relaxed,
+                libk::MemoryOrder::Relaxed>(current, current + 1)) {
+            return;
+        }
+    }
+}
+
+} // namespace
 
 VSpaceExecutor::~VSpaceExecutor() noexcept {
     KASSERT(!notifier_);
@@ -40,8 +58,11 @@ void VSpaceExecutor::withdraw(VSpace& space) noexcept {
     }
 }
 
-auto VSpaceExecutor::run(VmContext context, usize budget) noexcept -> bool {
+auto VSpaceExecutor::run(
+    VmContext context,
+    usize budget) noexcept -> VSpaceServiceBatch {
     KASSERT(budget != 0);
+    usize processed{};
     for (usize completed = 0; completed < budget; ++completed) {
         VSpace* const space = take();
         if (space == nullptr) {
@@ -64,8 +85,13 @@ auto VSpaceExecutor::run(VmContext context, usize budget) noexcept -> bool {
             || space->work_ready()) {
             submit(*space);
         }
+        ++processed;
+        advance_epoch(service_epoch_);
     }
-    return pending();
+    return VSpaceServiceBatch{
+        processed,
+        pending(),
+        service_epoch_.load<libk::MemoryOrder::Acquire>()};
 }
 
 auto VSpaceExecutor::pending() const noexcept -> bool {

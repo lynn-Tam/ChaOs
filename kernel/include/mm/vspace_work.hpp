@@ -4,10 +4,17 @@
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
+#include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
 #include <mm/vspace.hpp>
 
 namespace kernel::mm {
+
+struct VSpaceServiceBatch final {
+    usize processed{};
+    bool more{};
+    u64 epoch{};
+};
 
 // Bounded executor index for VSpace continuations. VSpace pending state is the
 // work truth; this queue only says that the state is currently actionable.
@@ -21,7 +28,9 @@ public:
     ~VSpaceExecutor() noexcept;
 
     void submit(VSpace& space) noexcept;
-    [[nodiscard]] auto run(VmContext context, usize budget) noexcept -> bool;
+    [[nodiscard]] auto run(
+        VmContext context,
+        usize budget) noexcept -> VSpaceServiceBatch;
     [[nodiscard]] auto pending() const noexcept -> bool;
 
     void bind_notifier(Notifier notifier) noexcept;
@@ -37,6 +46,7 @@ private:
         lock_{};
     Queue queue_{};
     Notifier notifier_{};
+    libk::Atomic<u64> service_epoch_{};
 };
 
 } // namespace kernel::mm

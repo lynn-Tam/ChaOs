@@ -55,7 +55,14 @@ Call::Call(Endpoint& endpoint) noexcept
           &Call::release,
           &Call::cancel,
           &Call::resume>(*this)),
-      deadline_(sched::Deadline::Callback::bind<&Call::expire>(*this)) {}
+      deadline_(sched::Deadline::Callback::bind<&Call::expire>(*this)) {
+    completion_.set_policy(
+        diag::concurrency::WaitKind::EndpointReply,
+        diag::concurrency::Expectation::DeadlineBound,
+        true,
+        diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&endpoint), 1));
+}
 
 Call::~Call() noexcept {
     KASSERT(state_ == State::Free);

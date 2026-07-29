@@ -23,11 +23,18 @@ namespace {
         : diag::concurrency::NodeRef::cpu(cpu.descriptor->logical_id());
 }
 
-constexpr u32 operation_attached = 1;
-constexpr u32 operation_claimed = 2;
-constexpr u32 operation_ready = 3;
-constexpr u32 operation_finished = 4;
-constexpr u32 operation_cancelled = 5;
+constexpr u32 operation_attached = static_cast<u32>(
+    diag::concurrency::OperationPhase::Attached);
+constexpr u32 operation_claimed = static_cast<u32>(
+    diag::concurrency::OperationPhase::Claimed);
+constexpr u32 operation_wake_issued = static_cast<u32>(
+    diag::concurrency::OperationPhase::WakeIssued);
+constexpr u32 operation_ready = static_cast<u32>(
+    diag::concurrency::OperationPhase::ReadyPublished);
+constexpr u32 operation_finished = static_cast<u32>(
+    diag::concurrency::OperationPhase::Finished);
+constexpr u32 operation_cancelled = static_cast<u32>(
+    diag::concurrency::OperationPhase::Cancelled);
 
 } // namespace
 
@@ -42,20 +49,25 @@ void Completion::attach(Wait& wait) noexcept {
     // holding Wait::lock_. Do not call back into Wait here: attached() takes
     // that same non-recursive lock and would self-deadlock the admission path.
     sink_.template emplace<BlockingSink>(BlockingSink{&wait});
-    const auto driver = wait.binding_ != nullptr
-        ? wait.binding_->actor_ref()
-        : current_cpu_node();
+    // The waiter is a consumer edge.  It cannot also be the operation's
+    // producer without manufacturing an Execution -> Operation -> Execution
+    // cycle. The configured producer/service edge is replaced by the
+    // producer CPU once delivery is claimed.
+    const auto driver = initial_driver_
+        ? initial_driver_
+        : diag::concurrency::NodeRef::external(
+              reinterpret_cast<u64>(owner_), 1);
     observation_ = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         1,
-        diag::concurrency::Expectation::InternalFinite);
+        expectation_);
     observation_.transition(
         operation_attached,
         static_cast<u64>(operation_attached),
-        diag::concurrency::WaitKind::None,
+        wait_kind_,
         driver);
-    observation_.watch(true);
+    observation_.watch(watch_);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -66,19 +78,21 @@ void Completion::attach(
     KASSERT(!attached() && key.valid());
     KASSERT(vproc.binding() != nullptr);
     sink_.template emplace<VprocSink>(VprocSink{&vproc, &cpus, key});
-    const auto driver = vproc.binding() != nullptr
-        ? vproc.binding()->actor_ref()
-        : current_cpu_node();
+    const auto driver = initial_driver_
+        ? initial_driver_
+        : diag::concurrency::NodeRef::external(
+              reinterpret_cast<u64>(owner_), key.generation());
     observation_ = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         key.generation(),
-        diag::concurrency::Expectation::ExternalUnbounded);
+        expectation_);
     observation_.transition(
         operation_attached,
         static_cast<u64>(operation_attached),
-        diag::concurrency::WaitKind::None,
+        wait_kind_,
         driver);
+    observation_.watch(watch_);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -111,6 +125,15 @@ void Completion::signal() noexcept {
         KASSERT(blocking->wait != nullptr);
         blocking->wait->wake();
         observation_.transition(
+            operation_wake_issued,
+            static_cast<u64>(operation_wake_issued),
+            diag::concurrency::WaitKind::CompletionPublication,
+            cpu);
+        // Delivery is the canonical Completion state.  Only after this
+        // release may the diagnostic projection claim that readiness was
+        // published.
+        delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
+        observation_.transition(
             operation_ready,
             static_cast<u64>(operation_ready),
             diag::concurrency::WaitKind::None,
@@ -120,7 +143,6 @@ void Completion::signal() noexcept {
             diag::concurrency::FlightEvent::OperationReady,
             cpu.identity,
             observation_.key().raw);
-        delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
         return;
     }
     const VprocSink target = *libk::get_if<VprocSink>(&sink_);

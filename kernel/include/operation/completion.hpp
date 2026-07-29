@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arch/trap.hpp>
+#include <core/debug.hpp>
 #include <core/types.hpp>
 #include <diag/concurrency.hpp>
 #include <libk/noncopyable.hpp>
@@ -101,6 +102,21 @@ public:
         return observation_.key();
     }
 
+    // Diagnostic policy is configured by the operation owner, not inferred
+    // from the sink.  A BlockingSink says how delivery reaches a waiter; it
+    // does not say whether the underlying obligation is finite or external.
+    void set_policy(
+        diag::concurrency::WaitKind wait,
+        diag::concurrency::Expectation expectation,
+        bool watch,
+        diag::concurrency::NodeRef driver = {}) noexcept {
+        KASSERT(!attached());
+        wait_kind_ = wait;
+        expectation_ = expectation;
+        watch_ = watch;
+        initial_driver_ = driver;
+    }
+
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
     void signal() noexcept;
@@ -156,6 +172,12 @@ private:
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
     diag::concurrency::ObservationLease observation_{};
+    diag::concurrency::WaitKind wait_kind_
+        = diag::concurrency::WaitKind::External;
+    diag::concurrency::Expectation expectation_
+        = diag::concurrency::Expectation::ExternalUnbounded;
+    diag::concurrency::NodeRef initial_driver_{};
+    bool watch_{};
 };
 
 } // namespace operation

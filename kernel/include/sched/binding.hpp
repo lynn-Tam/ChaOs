@@ -82,6 +82,7 @@ public:
             state == ExecutionState::Ready
             || state == ExecutionState::Throttled
             || state == ExecutionState::Blocked);
+        publish_projection();
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Scheduler,
             state_event(state),
@@ -116,9 +117,28 @@ private:
     friend class RemoteQueue;
     friend class CpuDispatcher;
 
+    // Scheduler state remains canonical in Execution/queues.  These bits are
+    // only the bounded projection consumed by the wait-graph analyzer:
+    // queued, refill-timer queued, retained wake, retained activation.
+    void publish_projection() noexcept {
+        ensure_actor(diag::concurrency::SourceSite::current());
+        u64 projection = (queued() ? 1U : 0U)
+            | (timer_queued() ? 2U : 0U)
+            | (wake_credit_ ? 4U : 0U)
+            | (activation_credit_ ? 8U : 0U);
+        actor_.detail(0, projection);
+        actor_.detail(1, static_cast<u64>(execution().state()));
+        const u64 remote = (start_.pending() ? 1U : 0U)
+            | (wake_.pending() ? 2U : 0U)
+            | (stop_.pending() ? 4U : 0U);
+        actor_.detail(2, remote);
+        actor_.detail(3, home_cpu_.raw);
+    }
+
     void ensure_actor(diag::concurrency::SourceSite site) noexcept {
         if (!actor_) {
-            actor_ = diag::concurrency::ObservationLease::reserve(
+            actor_ = diag::concurrency::ObservationLease::reserve_on(
+                home_cpu_,
                 diag::concurrency::RecordKind::ExecutionActor,
                 reinterpret_cast<u64>(this),
                 1,

@@ -35,8 +35,15 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
 #endif
 #if MYOS_CONCURRENCY_DIAG >= 1
             if (diagnostics->concurrency.observations != nullptr) {
+                KASSERT(diagnostics->concurrency.observations->allocated() == 0);
                 libk::destroy_at(diagnostics->concurrency.observations);
                 diagnostics->concurrency.observations = nullptr;
+            }
+            for (auto& page : concurrency_observation_slots) {
+                if (page) {
+                    libk::destroy_at(reinterpret_cast<
+                        diag::concurrency::ObservationPage*>(page.bytes()));
+                }
             }
 #endif
             libk::destroy_at(diagnostics);
@@ -64,6 +71,8 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     diag::CpuDiagnostics* diagnostics{};
 #if MYOS_CONCURRENCY_DIAG >= 1
     kernel::mm::OwnedPage concurrency_observation_page{};
+    kernel::mm::OwnedPage concurrency_observation_slots[
+        diag::concurrency::ObservationShard::pages]{};
 #endif
 #if MYOS_CONCURRENCY_DIAG >= 2
     kernel::mm::OwnedPage concurrency_flight_page{};

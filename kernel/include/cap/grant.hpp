@@ -232,6 +232,11 @@ private:
         u64 semantic_stamp,
         diag::concurrency::NodeRef driver,
         diag::concurrency::NodeRef blocker) noexcept;
+    void witness(
+        usize operations,
+        usize attachments,
+        bool retained,
+        u64 slot) noexcept;
 
     kernel::sync::Completion completion_;
     diag::concurrency::ObservationLease observation_{};

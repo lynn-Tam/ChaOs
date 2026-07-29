@@ -95,8 +95,7 @@ void ShootdownTicket::initialize(
                   });
                   return result;
               }()
-            : diag::concurrency::NodeRef::external(
-                  reinterpret_cast<u64>(this), epoch.raw));
+            : diag::concurrency::NodeRef::cpu_set(observation_.key()));
     for (usize index = 0; index < kernel::CpuSet::word_count; ++index) {
         // CpuSet is intentionally opaque; build the witness one bit at a
         // time so the diagnostic copy remains independent of its lock-free

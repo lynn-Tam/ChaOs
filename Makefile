@@ -296,7 +296,9 @@ KERNEL_SRCS := \
   kernel/mm/pmm.cpp \
   libk/mem.c
 
-ifneq ($(filter-out 0,$(LOCK_DIAG_LEVEL) $(CONCURRENCY_DIAG_LEVEL)),)
+# Built-in tests call the lock facade even when both diagnostics are disabled;
+# keep its no-op definitions in that profile as well.
+ifneq ($(filter-out 0,$(LOCK_DIAG_LEVEL) $(CONCURRENCY_DIAG_LEVEL) $(ENABLE_TESTS)),)
 KERNEL_SRCS += kernel/sync/lock.cpp
 endif
 

@@ -117,9 +117,34 @@ auto CpuProvisioner::prepare_impl(
         auto* const observations = libk::construct_at(
             reinterpret_cast<diag::concurrency::ObservationShard*>(
                 runtime->concurrency_observation_page.bytes()));
+        diag::concurrency::ObservationPage* storage[
+            diag::concurrency::ObservationShard::pages]{};
+        usize storage_count{};
+        for (; storage_count < diag::concurrency::ObservationShard::pages;
+             ++storage_count) {
+            auto page = pmm_.allocate_page();
+            if (!page) {
+                break;
+            }
+            runtime->concurrency_observation_slots[storage_count] =
+                libk::move(page).value();
+            storage[storage_count] = libk::construct_at(
+                reinterpret_cast<diag::concurrency::ObservationPage*>(
+                    runtime->concurrency_observation_slots[storage_count]
+                        .bytes()));
+        }
         observations->initialize(
-            id, &runtime->diagnostics->concurrency.profile);
+            id,
+            &runtime->diagnostics->concurrency.profile,
+            storage,
+            storage_count,
+            &runtime->diagnostics->concurrency.status);
         runtime->diagnostics->concurrency.observations = observations;
+        if (storage_count != diag::concurrency::ObservationShard::pages) {
+            static_cast<void>(runtime->diagnostics->concurrency.status.flags
+                .fetch_or<libk::MemoryOrder::Release>(
+                    diag::concurrency::DiagnosticStatus::ObservationCapacity));
+        }
     } else {
         static_cast<void>(runtime->diagnostics->concurrency.status.flags.fetch_or<
             libk::MemoryOrder::Release>(

@@ -3,6 +3,7 @@
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
 #include <diag/concurrency.hpp>
+#include <execution/execution.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
@@ -213,7 +214,7 @@ constinit libk::ManualLifetime<kernel::diag::concurrency::FlightRecorder>
                 break;
             }
             lease.attempt(
-                1,
+                0,
                 WaitKind::Unknown,
                 NodeRef::cpu(kernel::CpuId{0}));
             ObservationSnapshot attempted{};
@@ -295,42 +296,103 @@ constinit libk::ManualLifetime<kernel::diag::concurrency::FlightRecorder>
             1,
             Expectation::InternalFinite,
             SourceSite::current());
+        ObservationLease peer = shard.reserve(
+            RecordKind::ExecutionActor,
+            0x30,
+            1,
+            Expectation::InternalFinite,
+            SourceSite::current());
+        ObservationLease peer_operation = shard.reserve(
+            RecordKind::Operation,
+            0x40,
+            1,
+            Expectation::InternalFinite,
+            SourceSite::current());
         do {
-            if (!actor || !operation) {
+            if (!actor || !operation || !peer || !peer_operation) {
                 break;
             }
+            // A normal waiter edge terminates at an external producer. It is
+            // not a cycle merely because the operation is blocking.
             actor.link_wait(
                 operation.key(),
                 WaitKind::OperationCompletion,
                 NodeRef::observation(actor.key()));
             operation.transition(
-                1,
+                static_cast<u32>(OperationPhase::Attached),
                 1,
                 WaitKind::CompletionPublication,
-                NodeRef::observation(actor.key()));
+                NodeRef::external(0x55, 1));
             actor.watch(true);
             operation.watch(true);
             WaitGraphScratch scratch{};
             if (!analyze(actor.key(), scratch)
+                || scratch.classification == StallClass::DeadlockCycle
+                || scratch.count != 3) {
+                break;
+            }
+
+            // A real cycle has two distinct actors and two operations.
+            actor.link_wait(
+                operation.key(),
+                WaitKind::OperationCompletion,
+                NodeRef::observation(peer.key()));
+            operation.phase(
+                static_cast<u32>(OperationPhase::Attached),
+                2,
+                SourceSite::current());
+            operation.transition(
+                static_cast<u32>(OperationPhase::Attached),
+                2,
+                WaitKind::OperationCompletion,
+                NodeRef::observation(peer.key()));
+            peer.link_wait(
+                peer_operation.key(),
+                WaitKind::OperationCompletion,
+                NodeRef::observation(actor.key()));
+            peer_operation.transition(
+                static_cast<u32>(OperationPhase::Attached),
+                1,
+                WaitKind::OperationCompletion,
+                NodeRef::observation(actor.key()));
+            peer.watch(true);
+            peer_operation.watch(true);
+            scratch = {};
+            if (!analyze(actor.key(), scratch)
                 || scratch.classification != StallClass::DeadlockCycle
-                || scratch.count != 2) {
+                || scratch.count != 4) {
                 break;
             }
 
             // Canonical ExecutionState::Blocked and Completion::Ready are
             // correlated only for diagnosis; the analyzer must not repair
-            // the scheduler's wake credit.
-            actor.phase(4, 4);
-            operation.phase(3, 3);
+            // the scheduler's wake credit. A retained wake credit suppresses
+            // LostWake, while the same stable graph without it is evidence.
+            actor.phase(
+                static_cast<u32>(kernel::ExecutionState::Blocked), 4);
+            actor.detail(0, 4);
+            actor.detail(2, 0);
+            operation.phase(
+                static_cast<u32>(OperationPhase::ReadyPublished), 3);
+            scratch = {};
+            if (!analyze(actor.key(), scratch)
+                || scratch.classification == StallClass::LostWake) {
+                break;
+            }
+            actor.detail(0, 0);
             scratch = {};
             if (!analyze(actor.key(), scratch)
                 || scratch.classification != StallClass::LostWake) {
                 break;
             }
 
-            operation.finish(2);
+            operation.finish(static_cast<u32>(OperationPhase::Finished), 2);
+            peer_operation.finish(
+                static_cast<u32>(OperationPhase::Finished), 2);
             actor.clear_wait();
-            actor.finish(2);
+            peer.clear_wait();
+            actor.finish(static_cast<u32>(kernel::ExecutionState::Exited));
+            peer.finish(static_cast<u32>(kernel::ExecutionState::Exited));
             ObservationLease orphan = shard.reserve(
                 RecordKind::ServiceWork,
                 0x30,

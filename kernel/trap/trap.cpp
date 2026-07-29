@@ -9,6 +9,7 @@
 #include <cpu/cpu_runtime.hpp>
 #include <arch/uart.hpp>
 #include <diag/console.hpp>
+#include <diag/concurrency.hpp>
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
 #include <mm/virtual_layout.hpp>
@@ -193,6 +194,21 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     kernel::Vproc* const vproc = cpu.current_vproc();
     kernel::Execution* const execution = cpu.current_execution();
     KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
+    auto continuation = diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::RecordKind::ServiceWork,
+        reinterpret_cast<u64>(execution),
+        1,
+        diag::concurrency::Expectation::InternalFinite);
+    const auto driver = execution->scheduler_binding() != nullptr
+        ? execution->scheduler_binding()->actor_ref()
+        : diag::concurrency::NodeRef::cpu(
+              cpu.descriptor->logical_id());
+    continuation.transition(
+        1,
+        1,
+        diag::concurrency::WaitKind::External,
+        driver);
+    continuation.watch(true);
     while (thread != nullptr && thread->active_frame() != nullptr
         && !thread->current_wait().attached()
         && (cpu.dispatcher()->current().stop_requested()
@@ -239,6 +255,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     if (vproc != nullptr) {
         vproc->on_trap_exit(context);
     }
+    continuation.finish(2);
 }
 
 } // namespace kernel::trap

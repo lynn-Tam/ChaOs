@@ -26,7 +26,12 @@ CpuDispatcher::CpuDispatcher(
     CpuId id,
     Thread& idle,
     time::Clock& clock) noexcept
-    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock) {
+    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock)
+#if MYOS_CONCURRENCY_DIAG >= 3
+      , watchdog_deadline_(
+            Deadline::Callback::bind<&CpuDispatcher::watchdog_fire>(*this))
+#endif
+{
     KASSERT(cpu_->dispatcher_ == nullptr);
     KASSERT(idle_->idle());
     KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
@@ -35,7 +40,25 @@ CpuDispatcher::CpuDispatcher(
     quantum_ = *quantum;
     timer_available_ = arch::timer_available();
     ipi_available_ = arch::ipi_available();
+#if MYOS_CONCURRENCY_DIAG >= 3
+    const auto watchdog_period =
+        clock_->duration_from_nanoseconds(10'000'000);
+    watchdog_period_ = watchdog_period
+        ? *watchdog_period : time::Duration{};
+#endif
     cpu_->dispatcher_ = this;
+}
+
+CpuDispatcher::~CpuDispatcher() noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    if (watchdog_deadline_.armed()) {
+        deadlines_.remove(watchdog_deadline_);
+        watchdog_deadline_.owner_ = nullptr;
+    }
+#endif
+    if (cpu_ != nullptr && cpu_->dispatcher_ == this) {
+        cpu_->dispatcher_ = nullptr;
+    }
 }
 
 auto CpuDispatcher::remaining_budget() const noexcept -> time::Duration {
@@ -162,6 +185,7 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
         timers_.remove(binding);
     }
     enqueue_or_throttle(binding, now);
+    binding.publish_projection();
     if (execution.state_ == ExecutionState::Throttled) {
         program_deadline(now);
         return true;
@@ -189,11 +213,14 @@ auto CpuDispatcher::accept_wake(Binding& binding) noexcept
         || execution.state_ == ExecutionState::Ready
         || execution.state_ == ExecutionState::Prepared) {
         binding.wake_credit_ = true;
+        binding.publish_projection();
         return WakeAcceptance::Accepted;
     }
-    return execution.state_ == ExecutionState::Throttled
-        ? WakeAcceptance::Accepted
-        : WakeAcceptance::Rejected;
+    if (execution.state_ == ExecutionState::Throttled) {
+        binding.publish_projection();
+        return WakeAcceptance::Accepted;
+    }
+    return WakeAcceptance::Rejected;
 }
 
 auto CpuDispatcher::post_wake(Binding& binding) noexcept -> WakeResult {
@@ -229,19 +256,23 @@ auto CpuDispatcher::accept_activation(Vproc& vproc) noexcept -> bool {
         case ExecutionState::Running:
             KASSERT(current_.vproc() == &vproc);
             binding->activation_credit_ = false;
+            binding->publish_projection();
             return true;
         case ExecutionState::Ready:
             binding->activation_credit_ = true;
+            binding->publish_projection();
             request_reschedule(DispatchReason::Activation);
             return true;
         case ExecutionState::Parked:
             binding->activation_credit_ = true;
+            binding->publish_projection();
             wake_parked = true;
             break;
         case ExecutionState::Prepared:
         case ExecutionState::Blocked:
         case ExecutionState::Throttled:
             binding->activation_credit_ = true;
+            binding->publish_projection();
             return true;
         case ExecutionState::Exited:
             return false;
@@ -504,6 +535,7 @@ void CpuDispatcher::process_timers(time::Instant now) noexcept {
         KASSERT(binding->execution().state_
             == ExecutionState::Throttled);
         enqueue_or_throttle(*binding, now);
+        binding->publish_projection();
     }
 }
 
@@ -549,6 +581,7 @@ void CpuDispatcher::block_current() noexcept {
     KASSERT(current_binding_ != nullptr);
     if (current_binding_->wake_credit_) {
         current_binding_->wake_credit_ = false;
+        current_binding_->publish_projection();
         return;
     }
     dispatch(DispatchReason::Block, clock_->now());
@@ -579,9 +612,6 @@ void CpuDispatcher::on_timer() noexcept {
     KASSERT(!arch::interrupts_enabled());
     const time::Instant now = clock_->now();
     diag::concurrency::timer(id_, now.ticks());
-#if MYOS_CONCURRENCY_DIAG >= 3
-    diag::concurrency::watchdog_tick(id_, now.ticks());
-#endif
     charge_to(now);
     arch::mask_timer();
     process_deadlines(now);
@@ -680,8 +710,10 @@ void CpuDispatcher::dispatch(
             if (context.eligible(now)) {
                 outgoing.execution().set_state(ExecutionState::Ready);
                 policy_.enqueue(*outgoing_binding, context.urgency());
+                outgoing_binding->publish_projection();
             } else {
                 enqueue_or_throttle(*outgoing_binding, now);
+                outgoing_binding->publish_projection();
             }
             break;
         }
@@ -726,6 +758,7 @@ void CpuDispatcher::commit(
 
         candidate->activation_credit_ = false;
         policy_.remove(*candidate, context.urgency());
+        candidate->publish_projection();
         KASSERT(context.activate(id_));
         execution.set_state(ExecutionState::Running);
         incoming = target;
@@ -759,6 +792,9 @@ void CpuDispatcher::commit(
 }
 
 void CpuDispatcher::program_deadline(time::Instant now) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    arm_watchdog(now);
+#endif
     if (!timer_available_) {
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
@@ -796,6 +832,38 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
         programmed_deadline_ = deadline;
     }
 }
+
+#if MYOS_CONCURRENCY_DIAG >= 3
+void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
+    if (!timer_available_) {
+        diag::concurrency::mark_degraded(
+            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+        return;
+    }
+    if (watchdog_deadline_.armed()) {
+        return;
+    }
+    if (watchdog_period_.empty()) {
+        diag::concurrency::mark_degraded(
+            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+        return;
+    }
+    const auto when = now.checked_add(watchdog_period_);
+    if (!when) {
+        diag::concurrency::mark_degraded(
+            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+        return;
+    }
+    deadlines_.insert(watchdog_deadline_, *when);
+    watchdog_deadline_.owner_ = this;
+}
+
+void CpuDispatcher::watchdog_fire() noexcept {
+    const time::Instant now = clock_->now();
+    diag::concurrency::watchdog_tick(id_, now.ticks());
+    arm_watchdog(now);
+}
+#endif
 
 void CpuDispatcher::record_dispatch(
     execution::Target outgoing,
@@ -920,6 +988,7 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
             timers_.remove(*binding);
         }
         binding->activation_credit_ = false;
+        binding->publish_projection();
         static_cast<void>(remote_.cancel(binding->start_));
         static_cast<void>(remote_.cancel(binding->wake_));
         static_cast<void>(remote_.cancel(binding->stop_));
@@ -950,17 +1019,25 @@ void CpuDispatcher::finish_exit(execution::Target target) noexcept {
 }
 
 void yield() noexcept {
-    kernel::sync::IrqToken irq{};
+    // The call may switch away before it returns.  An IrqToken's diagnostic
+    // lifetime is stack-bound, so carrying it across that handoff would make
+    // the next execution look as if this CPU still owned a disabled-IRQ
+    // section.  Keep this scheduler boundary raw; the dispatcher itself
+    // already requires interrupts to be masked.
+    const arch::InterruptState interrupts = arch::disable_interrupts();
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->yield();
+    arch::restore_interrupts(interrupts);
 }
 
 void block() noexcept {
-    kernel::sync::IrqToken irq{};
+    // See yield(): block_current() can hand the stack to another execution.
+    const arch::InterruptState interrupts = arch::disable_interrupts();
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->block_current();
+    arch::restore_interrupts(interrupts);
 }
 
 auto wake(CpuRegistry& cpus, Binding& binding) noexcept

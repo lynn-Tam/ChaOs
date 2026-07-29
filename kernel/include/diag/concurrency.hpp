@@ -12,6 +12,8 @@
 
 namespace kernel::diag::concurrency {
 
+struct DiagnosticStatus;
+
 inline constexpr usize level = MYOS_CONCURRENCY_DIAG;
 inline constexpr bool snapshot_enabled = level >= 1;
 inline constexpr bool trace_enabled = level >= 2;
@@ -67,6 +69,7 @@ struct NodeRef final {
         None,
         Cpu,
         Observation,
+        CpuSet,
         External,
     };
 
@@ -88,6 +91,12 @@ struct NodeRef final {
                    : NodeRef{};
     }
 
+    [[nodiscard]] static constexpr auto cpu_set(
+        ObservationKey key) noexcept -> NodeRef {
+        return key ? NodeRef{Kind::CpuSet, key.raw, key.generation()}
+                   : NodeRef{};
+    }
+
     [[nodiscard]] static constexpr auto external(
         u64 identity,
         u64 generation = 0) noexcept -> NodeRef {
@@ -95,6 +104,8 @@ struct NodeRef final {
             ? NodeRef{}
             : NodeRef{Kind::External, identity, generation};
     }
+
+    friend constexpr auto operator==(NodeRef, NodeRef) noexcept -> bool = default;
 };
 
 struct SourceSite final {
@@ -171,6 +182,18 @@ enum class Expectation : u8 {
     SchedulerControlled,
     Idle,
     ObserveOnly,
+};
+
+// Operation delivery is the diagnostic projection of Completion's canonical
+// delivery word.  The intermediate publication phase is intentional: a wake
+// request may be issued before the producer publishes the operation as ready.
+enum class OperationPhase : u32 {
+    Attached = 1,
+    Claimed = 2,
+    WakeIssued = 3,
+    ReadyPublished = 4,
+    Finished = 5,
+    Cancelled = 6,
 };
 
 enum class DriverKind : u8 {
@@ -266,13 +289,39 @@ enum class StallClass : u8 {
     Truncated,
 };
 
-inline constexpr usize graph_capacity = 32;
+inline constexpr usize graph_capacity = 12;
 
 struct WaitGraphScratch final {
     StallClass classification{StallClass::None};
     u8 count{};
     bool truncated{};
-    ObservationKey path[graph_capacity]{};
+    // Keep the panic-page representation compact: the low byte of path_meta
+    // stores NodeRef::Kind and the remaining 56 bits store generation.  All
+    // diagnostic generations currently fit in that width (observation keys
+    // use 40 bits), while identity remains lossless.
+    u64 path[graph_capacity]{};
+    u64 path_meta[graph_capacity]{};
+    u64 fingerprints[graph_capacity]{};
+
+    [[nodiscard]] auto node(usize index) const noexcept -> NodeRef {
+        if (index >= graph_capacity) {
+            return {};
+        }
+        const u64 meta = path_meta[index];
+        return NodeRef{
+            static_cast<NodeRef::Kind>(meta & 0xffU),
+            path[index],
+            meta >> 8};
+    }
+    void set_node(usize index, NodeRef value) noexcept {
+        if (index >= graph_capacity) {
+            return;
+        }
+        path[index] = value.identity;
+        path_meta[index] = static_cast<u64>(
+                static_cast<u8>(value.kind))
+            | (value.generation << 8);
+    }
 };
 
 struct ObservationRecord final {
@@ -311,6 +360,22 @@ struct ObservationRecord final {
     libk::Atomic<u32> site_line{};
     libk::Atomic<u64> detail[4]{};
 };
+
+// Records deliberately live in their own PMM pages.  A shard is only a
+// directory and publication coordinator; it must remain cheap to embed in a
+// CPU diagnostics page.  Sixteen records per page keeps the bitmaps and
+// record array page-bounded without inflating Vproc/ObjectPool slots.
+struct ObservationPage final {
+    static constexpr usize slot_count = 16;
+
+    libk::Atomic<u64> allocated{};
+    libk::Atomic<u64> watched{};
+    libk::Atomic<u32> degraded{};
+    libk::Atomic<u64> generations[slot_count]{};
+    ObservationRecord records[slot_count]{};
+};
+
+static_assert(sizeof(ObservationPage) <= 4096);
 
 struct ObservationSnapshot final {
     u64 generation{};
@@ -389,6 +454,16 @@ public:
     [[nodiscard]] auto key() const noexcept -> ObservationKey;
 
     [[nodiscard]] static auto reserve(
+        RecordKind kind,
+        u64 subject_identity = 0,
+        u64 subject_generation = 0,
+        Expectation expectation = Expectation::InternalFinite,
+        SourceSite site = SourceSite::current()) noexcept -> ObservationLease;
+    // Reserve on the execution's home CPU.  Binding publication can run on a
+    // remote CPU, but the observation owner must remain with the home shard so
+    // teardown and watchdog scans have one stable ownership path.
+    [[nodiscard]] static auto reserve_on(
+        CpuId cpu,
         RecordKind kind,
         u64 subject_identity = 0,
         u64 subject_generation = 0,
@@ -479,14 +554,21 @@ private:
 
 class ObservationShard final {
 public:
-    static constexpr usize slot_count = 16;
+    static constexpr usize pages = 4;
+    static constexpr usize slots_per_page = ObservationPage::slot_count;
+    static constexpr usize slot_count = pages * slots_per_page;
 
     ObservationShard() noexcept = default;
     ~ObservationShard() noexcept;
     ObservationShard(const ObservationShard&) = delete;
     auto operator=(const ObservationShard&) -> ObservationShard& = delete;
 
-    void initialize(CpuId id, LatencyProfile* profile = nullptr) noexcept;
+    void initialize(
+        CpuId id,
+        LatencyProfile* profile = nullptr,
+        ObservationPage* const* storage = nullptr,
+        usize page_count = 0,
+        DiagnosticStatus* status = nullptr) noexcept;
     [[nodiscard]] auto reserve(
         RecordKind kind,
         u64 subject_identity,
@@ -497,7 +579,7 @@ public:
         ObservationKey key,
         ObservationSnapshot& result) const noexcept -> bool;
     void release(ObservationKey key) noexcept;
-    void mark_degraded() noexcept;
+    void mark_degraded(u32 flag = 1U << 7) noexcept;
 
     [[nodiscard]] auto allocated() const noexcept -> u64 {
         return allocated_.load<libk::MemoryOrder::Acquire>();
@@ -520,6 +602,9 @@ private:
 
     [[nodiscard]] auto valid(ObservationKey key) const noexcept
         -> ObservationRecord*;
+    [[nodiscard]] auto page_for(
+        usize index,
+        usize& local) const noexcept -> ObservationPage*;
     [[nodiscard]] auto pin(
         ObservationKey key,
         ObservationRecord*& record) const noexcept -> bool;
@@ -535,6 +620,8 @@ private:
         WaitKind wait,
         NodeRef driver,
         NodeRef blocker,
+        u64 semantic_stamp,
+        bool update_progress,
         SourceSite site) noexcept -> bool;
     [[nodiscard]] auto write_wait(
         ObservationKey key,
@@ -546,28 +633,34 @@ private:
         ObservationKey key,
         u64 semantic_stamp,
         bool force) noexcept -> bool;
+    [[nodiscard]] auto observe(
+        ObservationKey key,
+        u64 semantic_stamp) noexcept -> bool;
     void update_activity(ObservationKey key, u64 delta) noexcept;
     void advance(ObservationKey key, u64 delta) noexcept;
     [[nodiscard]] auto update_phase(
         ObservationKey key,
         u32 phase,
+        u64 semantic_stamp,
         SourceSite site) noexcept -> bool;
     void set_watched(ObservationKey key, bool watched) noexcept;
     void profile_finish(RecordKind kind, u64 duration) noexcept;
 
     CpuId id_{};
     LatencyProfile* profile_{};
+    DiagnosticStatus* status_{};
+    ObservationPage* storage_[pages]{};
+    u8 page_count_{};
     libk::Atomic<u64> allocated_{};
     libk::Atomic<u64> watched_{};
     libk::Atomic<u32> degraded_{};
-    libk::Atomic<u64> generations[slot_count]{};
-    ObservationRecord records[slot_count]{};
 };
 
 static_assert(sizeof(ObservationShard) <= 4096);
 
 struct FlightRecordValue final {
     u64 sequence{};
+    u64 absolute_id{};
     u64 tick{};
     FlightDomain domain{};
     FlightEvent event{};
@@ -581,6 +674,7 @@ struct FlightRecordValue final {
 
 struct FlightRecord final {
     libk::Atomic<u64> sequence{};
+    libk::Atomic<u64> absolute_id{};
     libk::Atomic<u64> tick{};
     libk::Atomic<u32> domain{};
     libk::Atomic<u32> event{};
@@ -637,28 +731,54 @@ private:
 static_assert(sizeof(FlightRecorder) <= 4096);
 
 struct CpuLive final {
+    static constexpr usize wait_capacity = 4;
+
     libk::Atomic<u64> dispatch_epoch{};
     libk::Atomic<u64> timer_epoch{};
     libk::Atomic<u64> trap_entered_at{};
     libk::Atomic<u64> irq_disabled_since{};
     libk::Atomic<u64> current_actor{};
-    libk::Atomic<u64> current_wait{};
-    libk::Atomic<u64> current_subject{};
-    libk::Atomic<u64> current_subject_generation{};
-    libk::Atomic<u64> current_driver{};
-    libk::Atomic<u64> current_driver_generation{};
-    libk::Atomic<u64> current_obligation{};
-    libk::Atomic<u64> wait_since{};
-    libk::Atomic<usize> wait_site_file{};
-    libk::Atomic<usize> wait_site_function{};
-    libk::Atomic<u32> wait_site_line{};
+    libk::Atomic<u32> wait_depth{};
+    libk::Atomic<u64> wait_activity_epoch{};
+    libk::Atomic<u64> wait_progress_epoch{};
+    libk::Atomic<u64> wait_semantic_stamp{};
     libk::Atomic<u64> last_event_at{};
     libk::Atomic<u32> context{};
     libk::Atomic<u32> trap_depth{};
     libk::Atomic<u32> irq_depth{};
-    libk::Atomic<u32> wait_kind{};
+    // Scopes that arrive after the bounded frame stack is full still need a
+    // matching close. Keep them as a count so clear_wait() cannot pop a real
+    // outer frame on behalf of an overflowed inner scope.
+    libk::Atomic<u32> wait_overflow{};
     libk::Atomic<u32> degraded{};
     libk::Atomic<bool> interrupts_disabled{};
+    struct WaitFrame final {
+        libk::Atomic<u64> sequence{};
+        libk::Atomic<u64> wait{};
+        libk::Atomic<u64> subject_identity{};
+        libk::Atomic<u64> subject_generation{};
+        libk::Atomic<u64> driver_identity{};
+        libk::Atomic<u64> driver_generation{};
+        libk::Atomic<u64> obligation{};
+        libk::Atomic<u64> since{};
+        libk::Atomic<usize> site_file{};
+        libk::Atomic<u32> site_line{};
+        // low byte subject kind, next byte driver kind, next byte wait kind
+        libk::Atomic<u64> kinds{};
+    };
+    WaitFrame waits[wait_capacity]{};
+
+    struct WaitSnapshot final {
+        u64 wait{};
+        NodeRef subject{};
+        NodeRef driver{};
+        u64 obligation{};
+        u64 since{};
+        WaitKind kind{WaitKind::None};
+        SourceSite site{};
+    };
+
+    [[nodiscard]] auto top_wait(WaitSnapshot& result) const noexcept -> bool;
 };
 
 struct StallFingerprint final {
@@ -667,6 +787,7 @@ struct StallFingerprint final {
     u32 phase{};
     u64 progress_epoch{};
     u64 activity_epoch{};
+    u64 state_hash{};
     NodeRef driver{};
     NodeRef blocker{};
 };
@@ -686,6 +807,7 @@ struct WatchdogCandidate final {
     libk::Atomic<u32> fingerprint_phase{};
     libk::Atomic<u64> fingerprint_progress{};
     libk::Atomic<u64> fingerprint_activity{};
+    libk::Atomic<u64> fingerprint_hash{};
     libk::Atomic<u64> driver_identity{};
     libk::Atomic<u32> driver_kind{};
     libk::Atomic<u64> driver_generation{};
@@ -715,13 +837,21 @@ struct DiagnosticStatus final {
     libk::Atomic<u32> flags{};
     enum Flag : u32 {
         None = 0,
-        ObservationFull = 1U << 0,
         SnapshotUnstable = 1U << 1,
         FlightWrapped = 1U << 2,
         StorageMissing = 1U << 3,
         ClockUnavailable = 1U << 4,
         IrqStall = 1U << 5,
         TrapStall = 1U << 6,
+        ObservationCapacity = 1U << 7,
+        ObservationGenerationExhausted = 1U << 8,
+        ObservationWriterCollision = 1U << 9,
+        FlightGap = 1U << 10,
+        WatchdogUnavailable = 1U << 11,
+        StallReported = 1U << 12,
+        WaitStackOverflow = 1U << 13,
+        ObservationLeaseCorrupt = 1U << 14,
+        RemoteShardUnavailable = 1U << 15,
     };
 };
 
@@ -741,6 +871,13 @@ struct CpuDiagnosticsCore final {
 [[nodiscard]] auto current_core() noexcept -> CpuDiagnosticsCore*;
 [[nodiscard]] auto current_shard() noexcept -> ObservationShard*;
 [[nodiscard]] auto reserve(
+    RecordKind kind,
+    u64 subject_identity = 0,
+    u64 subject_generation = 0,
+    Expectation expectation = Expectation::InternalFinite,
+    SourceSite site = SourceSite::current()) noexcept -> ObservationLease;
+[[nodiscard]] auto reserve_on(
+    CpuId cpu,
     RecordKind kind,
     u64 subject_identity = 0,
     u64 subject_generation = 0,
@@ -771,8 +908,12 @@ void set_wait(
     NodeRef driver,
     SourceSite site = SourceSite::current()) noexcept;
 void clear_wait() noexcept;
+void observe_wait(u64 semantic_stamp) noexcept;
 void mark_degraded(DiagnosticStatus::Flag flag) noexcept;
 void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
+[[nodiscard]] auto analyze(
+    NodeRef root,
+    WaitGraphScratch& scratch) noexcept -> bool;
 [[nodiscard]] auto analyze(
     ObservationKey root,
     WaitGraphScratch& scratch) noexcept -> bool;

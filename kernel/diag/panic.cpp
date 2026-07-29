@@ -532,6 +532,8 @@ void print_concurrency(
     const concurrency::CpuDiagnosticsCore& core,
     concurrency::WaitGraphScratch* graph) noexcept {
     const concurrency::CpuLive& live = core.live;
+    concurrency::CpuLive::WaitSnapshot wait{};
+    const bool has_wait = live.top_wait(wait);
     panic_print<
         "  cpu {} concurrency: actor={:#x} wait={:#x} driver={:#x} "
         "driver-gen={} subject={:#x} subject-gen={}"
@@ -540,15 +542,16 @@ void print_concurrency(
         "irq-depth={} irq-at={} degraded={:#x}\n">(
         id.raw,
         live.current_actor.load<libk::MemoryOrder::Acquire>(),
-        live.current_wait.load<libk::MemoryOrder::Acquire>(),
-        live.current_driver.load<libk::MemoryOrder::Acquire>(),
-        live.current_driver_generation.load<libk::MemoryOrder::Acquire>(),
-        live.current_subject.load<libk::MemoryOrder::Acquire>(),
-        live.current_subject_generation.load<libk::MemoryOrder::Acquire>(),
-        live.current_obligation.load<libk::MemoryOrder::Acquire>(),
+        has_wait ? wait.wait : 0,
+        has_wait ? wait.driver.identity : 0,
+        has_wait ? wait.driver.generation : 0,
+        has_wait ? wait.subject.identity : 0,
+        has_wait ? wait.subject.generation : 0,
+        has_wait ? wait.obligation : 0,
         live.context.load<libk::MemoryOrder::Acquire>(),
-        live.wait_kind.load<libk::MemoryOrder::Acquire>(),
-        live.wait_since.load<libk::MemoryOrder::Acquire>(),
+        has_wait ? static_cast<u32>(wait.kind)
+                 : static_cast<u32>(concurrency::WaitKind::None),
+        has_wait ? wait.since : 0,
         live.dispatch_epoch.load<libk::MemoryOrder::Acquire>(),
         live.timer_epoch.load<libk::MemoryOrder::Acquire>(),
         live.trap_depth.load<libk::MemoryOrder::Acquire>(),
@@ -557,11 +560,9 @@ void print_concurrency(
         live.irq_disabled_since.load<libk::MemoryOrder::Acquire>(),
         live.degraded.load<libk::MemoryOrder::Acquire>());
     panic_print<"    wait-site={}:{} function={}\n">(
-        reinterpret_cast<const char*>(live.wait_site_file.load<
-            libk::MemoryOrder::Acquire>()),
-        live.wait_site_line.load<libk::MemoryOrder::Acquire>(),
-        reinterpret_cast<const char*>(live.wait_site_function.load<
-            libk::MemoryOrder::Acquire>()));
+        has_wait ? wait.site.file : nullptr,
+        has_wait ? wait.site.line : 0,
+        has_wait ? wait.site.function : nullptr);
     panic_print<"    status={:#x}\n">(
         core.status.flags.load<libk::MemoryOrder::Acquire>());
     const auto candidate_state = core.candidate.state.load<
@@ -697,7 +698,7 @@ void print_concurrency(
         }
         if (!root) {
             root = concurrency::ObservationKey{
-                live.current_wait.load<libk::MemoryOrder::Acquire>()};
+                has_wait ? wait.wait : 0};
         }
         if (!root && core.observations != nullptr) {
             const u64 watched = core.observations->watched();
@@ -719,8 +720,12 @@ void print_concurrency(
                 graph->count,
                 graph->truncated ? " truncated" : "");
             for (usize index = 0; index < graph->count; ++index) {
-                panic_print<"      [{}] key={:#x}\n">(
-                    index, graph->path[index].raw);
+                const concurrency::NodeRef node = graph->node(index);
+                panic_print<"      [{}] kind={} node={:#x} gen={}\n">(
+                    index,
+                    static_cast<u32>(node.kind),
+                    node.identity,
+                    node.generation);
             }
         }
     }

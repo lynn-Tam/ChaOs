@@ -134,7 +134,14 @@ Channel::Waiter::Waiter(Channel& channel) noexcept
           &Waiter::read,
           &Waiter::release,
           &Waiter::cancel,
-          &Waiter::resume>(*this)) {}
+          &Waiter::resume>(*this)) {
+    completion.set_policy(
+        diag::concurrency::WaitKind::ChannelReceive,
+        diag::concurrency::Expectation::ExternalUnbounded,
+        false,
+        diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&channel), 1));
+}
 
 Channel::Waiter::~Waiter() noexcept {
     KASSERT(state == State::Idle);

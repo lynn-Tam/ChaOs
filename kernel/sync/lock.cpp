@@ -10,7 +10,6 @@
 #include <diag/panic.hpp>
 #include <diag/console.hpp>
 #include <libk/limits.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
 #include <sync/model.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <trap/event.hpp>
@@ -239,9 +238,58 @@ struct EdgeWitness final {
 };
 
 struct GraphState final {
-    libk::TicketSpinLock lock{};
-    DepGraph<class_count> graph{};
+    static constexpr usize word_bits = sizeof(u64) * 8;
+    static constexpr usize word_count =
+        (class_count + word_bits - 1) / word_bits;
+
+    libk::Atomic<u32> writer{};
+    libk::Atomic<u64> rows[class_count][word_count]{};
     EdgeWitness witnesses[class_count][class_count]{};
+
+    [[nodiscard]] auto check_insert(
+        usize from,
+        usize to) noexcept -> DepGraph<class_count>::Result {
+        DepGraph<class_count> snapshot{};
+        for (usize row = 0; row < class_count; ++row) {
+            for (usize word = 0; word < word_count; ++word) {
+                const u64 bits = rows[row][word].load<
+                    libk::MemoryOrder::Relaxed>();
+                for (usize bit = 0; bit < word_bits; ++bit) {
+                    if ((bits & (u64{1} << bit)) != 0) {
+                        const usize target = word * word_bits + bit;
+                        if (target < class_count) {
+                            snapshot.insert(row, target);
+                        }
+                    }
+                }
+            }
+        }
+        const auto result = snapshot.check_insert(from, to);
+        if (result.status == DepStatus::Added) {
+            static_cast<void>(rows[from][to / word_bits].fetch_or<
+                libk::MemoryOrder::Release>(u64{1} << (to % word_bits)));
+        }
+        return result;
+    }
+
+    [[nodiscard]] auto snapshot() const noexcept -> DepGraph<class_count> {
+        DepGraph<class_count> result{};
+        for (usize row = 0; row < class_count; ++row) {
+            for (usize word = 0; word < word_count; ++word) {
+                const u64 bits = rows[row][word].load<
+                    libk::MemoryOrder::Acquire>();
+                for (usize bit = 0; bit < word_bits; ++bit) {
+                    if ((bits & (u64{1} << bit)) != 0) {
+                        const usize target = word * word_bits + bit;
+                        if (target < class_count) {
+                            result.insert(row, target);
+                        }
+                    }
+                }
+            }
+        }
+        return result;
+    }
 };
 
 constinit GraphState graph_state{};
@@ -249,10 +297,15 @@ constinit GraphState graph_state{};
 class GraphGuard final {
 public:
     GraphGuard() noexcept : interrupts_(arch::disable_interrupts()) {
-        graph_state.lock.lock();
+        u32 expected = 0;
+        while (!graph_state.writer.compare_exchange_weak<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, 1)) {
+            expected = 0;
+        }
     }
     ~GraphGuard() noexcept {
-        graph_state.lock.unlock();
+        graph_state.writer.store<libk::MemoryOrder::Release>(0);
         arch::restore_interrupts(interrupts_);
     }
     GraphGuard(const GraphGuard&) = delete;
@@ -290,7 +343,7 @@ struct GraphCycle final {
         if (from == to) {
             continue;
         }
-        const auto result = graph_state.graph.check_insert(from, to);
+        const auto result = graph_state.check_insert(from, to);
         if (result.status == DepStatus::Cycle) {
             cycle.found = true;
             cycle.from = held.lock.lock_class;
@@ -1086,7 +1139,7 @@ void dump_diagnostics() noexcept {
     DepGraph<class_count> graph{};
     {
         GraphGuard guard{};
-        graph = graph_state.graph;
+        graph = graph_state.snapshot();
     }
     diag::console::print<"\n[sync] observed dependencies\n">();
     usize edges{};

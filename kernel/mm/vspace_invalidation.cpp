@@ -283,11 +283,19 @@ void VSpace::ensure_observation() noexcept {
             libk::MemoryOrder::Acquire>(expected, true)) {
         return;
     }
-    observation_ = diag::concurrency::ObservationLease::reserve(
+    auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::VSpaceWork,
         reinterpret_cast<u64>(this),
         1,
         diag::concurrency::Expectation::InternalFinite);
+    if (!observation) {
+        // Capacity is optional diagnostic state.  A failed first attempt must
+        // not become a permanent one-shot decision; a later schedule after a
+        // slot is released may still establish the observation.
+        observation_reserved_.store<libk::MemoryOrder::Release>(false);
+        return;
+    }
+    observation_ = libk::move(observation);
     observation_.watch(true);
     observation_ready_.store<libk::MemoryOrder::Release>(true);
 }

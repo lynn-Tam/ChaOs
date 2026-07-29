@@ -6,6 +6,8 @@
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <diag/console.hpp>
+#include <diag/panic.hpp>
+#include <execution/execution.hpp>
 #include <libk/utility.hpp>
 
 #ifndef MYOS_BUILTIN_TESTS
@@ -31,6 +33,7 @@ constexpr u64 lease_generation_mask = generation_mask << lease_generation_shift;
 // publication. Live kernel leases always resolve through CpuRegistry; this
 // bounded fallback keeps those tests on the same lease implementation.
 libk::Atomic<ObservationShard*> standalone_shards[256]{};
+ObservationPage standalone_page{};
 #endif
 
 [[nodiscard]] auto now() noexcept -> u64 {
@@ -54,6 +57,42 @@ libk::Atomic<ObservationShard*> standalone_shards[256]{};
     return right > limit - left ? limit : left + right;
 }
 
+#if MYOS_CONCURRENCY_DIAG >= 1
+[[nodiscard]] constexpr auto mix_hash(u64 hash, u64 value) noexcept -> u64 {
+    hash ^= value + u64{0x9e3779b97f4a7c15}
+        + (hash << 6) + (hash >> 2);
+    return hash;
+}
+
+[[nodiscard]] auto snapshot_hash(
+    const ObservationSnapshot& snapshot) noexcept -> u64 {
+    u64 hash = u64{0x243f6a8885a308d3};
+    hash = mix_hash(hash, snapshot.generation);
+    hash = mix_hash(hash, snapshot.flags);
+    hash = mix_hash(hash, snapshot.activity_epoch);
+    hash = mix_hash(hash, snapshot.progress_epoch);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.record_kind));
+    hash = mix_hash(hash, snapshot.phase);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.wait_kind));
+    hash = mix_hash(hash, static_cast<u64>(snapshot.expectation));
+    hash = mix_hash(hash, snapshot.subject_identity);
+    hash = mix_hash(hash, snapshot.subject_generation);
+    hash = mix_hash(hash, snapshot.parent_key.raw);
+    hash = mix_hash(hash, snapshot.waiter_key.raw);
+    hash = mix_hash(hash, snapshot.driver.identity);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.driver.kind));
+    hash = mix_hash(hash, snapshot.driver.generation);
+    hash = mix_hash(hash, snapshot.blocker.identity);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.blocker.kind));
+    hash = mix_hash(hash, snapshot.blocker.generation);
+    hash = mix_hash(hash, snapshot.semantic_stamp);
+    for (const u64 value : snapshot.detail) {
+        hash = mix_hash(hash, value);
+    }
+    return hash;
+}
+#endif
+
 void increment_sat(libk::Atomic<u64>& value, u64 delta) noexcept {
     u64 current = value.load<libk::MemoryOrder::Relaxed>();
     for (;;) {
@@ -76,12 +115,94 @@ struct WatchdogThresholds final {
     }
 };
 
+constinit libk::Atomic<u64> stall_owner{
+    libk::numeric_limits<u64>::max()};
+
+[[nodiscard]] auto report_stall(
+    CpuId watcher,
+    CpuId target,
+    ObservationKey key,
+    WatchdogCandidate::State state,
+    u64 age) noexcept -> bool {
+    u64 token = mix_hash(u64{0x42}, target.raw);
+    token = mix_hash(token, key.raw);
+    token = mix_hash(token, static_cast<u64>(state));
+    if (token == libk::numeric_limits<u64>::max()) {
+        token = 0;
+    }
+    u64 expected = libk::numeric_limits<u64>::max();
+    if (stall_owner.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, token)) {
+        diag::console::print<
+            "[concurrency] watchdog confirmed cpu={} target={} key={:#x} "
+            "state={} age={}\n">(
+            watcher.raw,
+            target.raw,
+            key.raw,
+            static_cast<u32>(state),
+            age);
+        diag::fatal(diag::FatalEvent{
+            .facility = diag::Facility::Concurrency,
+            .id = diag::EventId{0x70000001},
+            .arguments = {
+                watcher.raw,
+                target.raw,
+                key.raw,
+                static_cast<u64>(state),
+                age,
+            },
+            .argument_count = 5,
+        });
+    }
+    return false;
+}
+
+[[nodiscard]] auto report_cpu_stall(
+    CpuId watcher,
+    CpuId target,
+    u64 kind,
+    u64 age) noexcept -> bool {
+    // CPU-live roots have no ObservationKey. Keep their coordinator token in
+    // a disjoint high-bit namespace so a stalled CPU cannot alias a slot key.
+    u64 token = mix_hash(u64{0x7e}, target.raw);
+    token = mix_hash(token, kind);
+    if (token == libk::numeric_limits<u64>::max()) {
+        token = 0;
+    }
+    u64 expected = libk::numeric_limits<u64>::max();
+    if (stall_owner.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, token)) {
+        diag::console::print<
+            "[concurrency] watchdog confirmed cpu-live cpu={} target={} "
+            "kind={} age={}\n">(
+            watcher.raw, target.raw, kind, age);
+        diag::fatal(diag::FatalEvent{
+            .facility = diag::Facility::Concurrency,
+            .id = diag::EventId{0x70000002},
+            .arguments = {watcher.raw, target.raw, kind, age},
+            .argument_count = 4,
+        });
+    }
+    return false;
+}
+
 [[nodiscard]] auto thresholds_for(
     const WatchdogPolicy& policy,
     const ObservationSnapshot& snapshot) noexcept -> WatchdogThresholds {
     if (snapshot.expectation == Expectation::ExternalUnbounded
         || snapshot.expectation == Expectation::Idle
         || snapshot.expectation == Expectation::ObserveOnly) {
+        return {};
+    }
+
+    // A watched bit is a cheap directory hint, not proof that an actor is
+    // still waiting.  Binding keeps the bit while an execution is in a
+    // schedulable state, and Completion can publish Ready before its waiter
+    // consumes the result.  Without an active wait edge those states are
+    // normal terminal/projection windows, not watchdog obligations.
+    if (snapshot.wait_kind == WaitKind::None && !snapshot.waiter_key) {
         return {};
     }
 
@@ -150,6 +271,16 @@ void clear_record(ObservationRecord& record) noexcept {
     record.site_line.store<libk::MemoryOrder::Relaxed>(0);
     for (auto& detail : record.detail) {
         detail.store<libk::MemoryOrder::Relaxed>(0);
+    }
+}
+
+void clear_page(ObservationPage& page) noexcept {
+    page.allocated.store<libk::MemoryOrder::Relaxed>(0);
+    page.watched.store<libk::MemoryOrder::Relaxed>(0);
+    page.degraded.store<libk::MemoryOrder::Relaxed>(0);
+    for (usize index = 0; index < ObservationPage::slot_count; ++index) {
+        page.generations[index].store<libk::MemoryOrder::Relaxed>(0);
+        clear_record(page.records[index]);
     }
 }
 
@@ -223,6 +354,7 @@ void WatchdogCandidate::publish(const StallFingerprint& value) noexcept {
         value.progress_epoch);
     fingerprint_activity.store<libk::MemoryOrder::Relaxed>(
         value.activity_epoch);
+    fingerprint_hash.store<libk::MemoryOrder::Relaxed>(value.state_hash);
     driver_identity.store<libk::MemoryOrder::Relaxed>(value.driver.identity);
     driver_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(value.driver.kind));
@@ -252,6 +384,8 @@ auto WatchdogCandidate::read(StallFingerprint& value) const noexcept -> bool {
             libk::MemoryOrder::Relaxed>();
         candidate.activity_epoch = fingerprint_activity.load<
             libk::MemoryOrder::Relaxed>();
+        candidate.state_hash = fingerprint_hash.load<
+            libk::MemoryOrder::Relaxed>();
         candidate.driver = NodeRef{
             static_cast<NodeRef::Kind>(driver_kind.load<
                 libk::MemoryOrder::Relaxed>()),
@@ -272,12 +406,38 @@ auto WatchdogCandidate::read(StallFingerprint& value) const noexcept -> bool {
 
 void ObservationShard::initialize(
     CpuId id,
-    LatencyProfile* profile) noexcept {
+    LatencyProfile* profile,
+    ObservationPage* const* storage,
+    usize page_count,
+    DiagnosticStatus* status) noexcept {
     id_ = id;
     profile_ = profile;
+    status_ = status;
     if (profile_ != nullptr) {
         profile_->initialize();
     }
+    page_count_ = 0;
+    for (auto& page : storage_) {
+        page = nullptr;
+    }
+    if (storage != nullptr) {
+        page_count = page_count > pages ? pages : page_count;
+        for (usize index = 0; index < page_count; ++index) {
+            if (storage[index] == nullptr) {
+                break;
+            }
+            storage_[index] = storage[index];
+            clear_page(*storage_[index]);
+            ++page_count_;
+        }
+    }
+#if MYOS_BUILTIN_TESTS
+    if (page_count_ == 0) {
+        clear_page(standalone_page);
+        storage_[0] = &standalone_page;
+        page_count_ = 1;
+    }
+#endif
 #if MYOS_BUILTIN_TESTS
     if (id_.raw < 256) {
         standalone_shards[id_.raw].store<libk::MemoryOrder::Release>(this);
@@ -286,10 +446,6 @@ void ObservationShard::initialize(
     allocated_.store<libk::MemoryOrder::Relaxed>(0);
     watched_.store<libk::MemoryOrder::Relaxed>(0);
     degraded_.store<libk::MemoryOrder::Relaxed>(0);
-    for (usize index = 0; index < slot_count; ++index) {
-        generations[index].store<libk::MemoryOrder::Relaxed>(0);
-        clear_record(records[index]);
-    }
 }
 
 void LatencyProfile::initialize() noexcept {
@@ -340,8 +496,13 @@ void ObservationShard::profile_current(u64 tick) const noexcept {
         if ((allocated & bit(index)) == 0) {
             continue;
         }
+        usize local{};
+        ObservationPage* const page = page_for(index, local);
+        if (page == nullptr) {
+            continue;
+        }
         ObservationSnapshot snapshot{};
-        const u64 generation = records[index].generation.load<
+        const u64 generation = page->records[local].generation.load<
             libk::MemoryOrder::Acquire>();
         const ObservationKey key = ObservationKey::make(
             id_, static_cast<u16>(index), generation);
@@ -368,6 +529,7 @@ void ObservationShard::profile_current(u64 tick) const noexcept {
 }
 
 ObservationShard::~ObservationShard() noexcept {
+    KASSERT(allocated() == 0);
 #if MYOS_BUILTIN_TESTS
     if (id_.raw < 256) {
         ObservationShard* expected = this;
@@ -378,17 +540,32 @@ ObservationShard::~ObservationShard() noexcept {
 #endif
 }
 
+auto ObservationShard::page_for(
+    usize index,
+    usize& local) const noexcept -> ObservationPage* {
+    if (index >= slot_count) {
+        return nullptr;
+    }
+    const usize page_index = index / slots_per_page;
+    local = index % slots_per_page;
+    return page_index < page_count_ ? storage_[page_index] : nullptr;
+}
+
 auto ObservationShard::valid(ObservationKey key) const noexcept
     -> ObservationRecord* {
     const usize index = key.slot();
     if (!key || key.shard() != id_ || index >= slot_count) {
         return nullptr;
     }
-    const u64 allocated = allocated_.load<libk::MemoryOrder::Acquire>();
-    if ((allocated & bit(index)) == 0) {
+    usize local{};
+    ObservationPage* const page = page_for(index, local);
+    if (page == nullptr
+        || (page->allocated.load<libk::MemoryOrder::Acquire>()
+                & bit(local))
+            == 0) {
         return nullptr;
     }
-    ObservationRecord& record = const_cast<ObservationRecord&>(records[index]);
+    ObservationRecord& record = page->records[local];
     if (record.generation.load<libk::MemoryOrder::Acquire>()
             != key.generation()
         || (record.flags.load<libk::MemoryOrder::Acquire>() & active_flag)
@@ -431,7 +608,8 @@ void ObservationShard::unpin(
     if ((state & pin_count_mask) == 0
         || (state & lease_generation_mask) != lease_generation(
                key.generation())) {
-        const_cast<ObservationShard*>(this)->mark_degraded();
+        const_cast<ObservationShard*>(this)->mark_degraded(
+            DiagnosticStatus::ObservationLeaseCorrupt);
         return;
     }
     if ((state & pin_count_mask) != 1
@@ -448,12 +626,18 @@ void ObservationShard::unpin(
         return;
     }
     const usize index = key.slot();
-    if (index >= slot_count) {
+    usize local{};
+    ObservationPage* const page = page_for(index, local);
+    if (page == nullptr) {
         return;
     }
+    static_cast<void>(page->watched.fetch_and<libk::MemoryOrder::Release>(
+        ~bit(local)));
     static_cast<void>(const_cast<ObservationShard*>(this)->watched_.fetch_and<
         libk::MemoryOrder::Release>(~bit(index)));
     record.flags.store<libk::MemoryOrder::Release>(0);
+    static_cast<void>(page->allocated.fetch_and<libk::MemoryOrder::Release>(
+        ~bit(local)));
     static_cast<void>(const_cast<ObservationShard*>(this)->allocated_.fetch_and<
         libk::MemoryOrder::Release>(~bit(index)));
 }
@@ -465,35 +649,43 @@ auto ObservationShard::reserve(
     Expectation expectation,
     SourceSite site) noexcept -> ObservationLease {
     for (usize index = 0; index < slot_count; ++index) {
-        const u64 mask = bit(index);
-        u64 observed = allocated_.load<libk::MemoryOrder::Relaxed>();
-        if ((observed & mask) != 0) {
+        usize local{};
+        ObservationPage* const page = page_for(index, local);
+        if (page == nullptr) {
             continue;
         }
-        if (!allocated_.compare_exchange_weak<
+        const u64 local_mask = bit(local);
+        const u64 mask = bit(index);
+        u64 observed = page->allocated.load<libk::MemoryOrder::Relaxed>();
+        if ((observed & local_mask) != 0) {
+            continue;
+        }
+        if (!page->allocated.compare_exchange_weak<
                 libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(observed, observed | mask)) {
+                libk::MemoryOrder::Acquire>(
+                    observed, observed | local_mask)) {
             if (index != 0) {
                 --index;
             }
             continue;
         }
+        static_cast<void>(allocated_.fetch_or<libk::MemoryOrder::AcqRel>(mask));
 
-        u64 generation = generations[index].load<libk::MemoryOrder::Relaxed>();
+        u64 generation = page->generations[local].load<
+            libk::MemoryOrder::Relaxed>();
         if (generation >= generation_mask) {
-            static_cast<void>(allocated_.fetch_and<libk::MemoryOrder::Release>(~mask));
-            degraded_.store<libk::MemoryOrder::Release>(1);
+            page->degraded.store<libk::MemoryOrder::Release>(1);
+            mark_degraded(DiagnosticStatus::ObservationGenerationExhausted);
             continue;
         }
         ++generation;
-        generations[index].store<libk::MemoryOrder::Release>(generation);
+        page->generations[local].store<libk::MemoryOrder::Release>(generation);
 
-        ObservationRecord& record = records[index];
+        ObservationRecord& record = page->records[local];
         clear_record(record);
         record.generation.store<libk::MemoryOrder::Relaxed>(generation);
         record.lease_state.store<libk::MemoryOrder::Release>(
             lease_generation(generation));
-        record.flags.store<libk::MemoryOrder::Release>(active_flag);
         record.record_kind.store<libk::MemoryOrder::Relaxed>(
             static_cast<u32>(kind));
         record.expectation.store<libk::MemoryOrder::Relaxed>(
@@ -511,18 +703,27 @@ auto ObservationShard::reserve(
         record.started_at.store<libk::MemoryOrder::Release>(tick);
         record.last_activity_at.store<libk::MemoryOrder::Release>(tick);
         record.last_progress_at.store<libk::MemoryOrder::Release>(tick);
+        // Active is the publication flag.  Every field above is visible to an
+        // Acquire reader before this store makes the record discoverable.
+        record.flags.store<libk::MemoryOrder::Release>(active_flag);
         return ObservationLease{ObservationKey::make(
             id_, static_cast<u16>(index), generation)};
     }
-    mark_degraded();
+    degraded_.store<libk::MemoryOrder::Release>(1);
+    mark_degraded(DiagnosticStatus::ObservationCapacity);
     return {};
 }
 
-void ObservationShard::mark_degraded() noexcept {
+void ObservationShard::mark_degraded(u32 flag) noexcept {
     degraded_.store<libk::MemoryOrder::Release>(1);
+    if (status_ != nullptr) {
+        static_cast<void>(status_->flags.fetch_or<libk::MemoryOrder::Release>(
+            flag));
+        return;
+    }
     if (CpuDiagnosticsCore* const core = current_core(); core != nullptr) {
         static_cast<void>(core->status.flags.fetch_or<libk::MemoryOrder::Release>(
-            DiagnosticStatus::ObservationFull));
+            flag));
     }
 }
 
@@ -530,16 +731,23 @@ auto ObservationShard::key_at(usize index) const noexcept -> ObservationKey {
     if (index >= slot_count) {
         return {};
     }
+    usize local{};
+    ObservationPage* const page = page_for(index, local);
+    if (page == nullptr) {
+        return {};
+    }
     const u64 mask = bit(index);
     if ((allocated_.load<libk::MemoryOrder::Acquire>() & mask) == 0) {
         return {};
     }
-    if ((records[index].lease_state.load<libk::MemoryOrder::Acquire>()
+    const ObservationRecord& record = page->records[local];
+    if ((record.flags.load<libk::MemoryOrder::Acquire>() & active_flag) == 0
+        || (record.lease_state.load<libk::MemoryOrder::Acquire>()
             & release_requested)
         != 0) {
         return {};
     }
-    const u64 generation = generations[index].load<libk::MemoryOrder::Acquire>();
+    const u64 generation = record.generation.load<libk::MemoryOrder::Acquire>();
     return ObservationKey::make(id_, static_cast<u16>(index), generation);
 }
 
@@ -553,7 +761,12 @@ auto ObservationShard::find(
         if ((allocated & mask) == 0) {
             continue;
         }
-        const ObservationRecord& record = records[index];
+        usize local{};
+        ObservationPage* const page = page_for(index, local);
+        if (page == nullptr) {
+            continue;
+        }
+        const ObservationRecord& record = page->records[local];
         if ((record.flags.load<libk::MemoryOrder::Acquire>() & active_flag)
                 == 0
             || (record.lease_state.load<libk::MemoryOrder::Acquire>()
@@ -581,11 +794,16 @@ void ObservationShard::release(ObservationKey key) noexcept {
     if (!key || key.shard() != id_ || index >= slot_count) {
         return;
     }
+    usize local{};
+    ObservationPage* const page = page_for(index, local);
+    if (page == nullptr) {
+        return;
+    }
     const u64 mask = bit(index);
     if ((allocated_.load<libk::MemoryOrder::Acquire>() & mask) == 0) {
         return;
     }
-    ObservationRecord& record = records[index];
+    ObservationRecord& record = page->records[local];
     if (record.generation.load<libk::MemoryOrder::Acquire>()
         != key.generation()) {
         return;
@@ -603,6 +821,8 @@ void ObservationShard::release(ObservationKey key) noexcept {
                 libk::MemoryOrder::Acquire>(state, next)) {
             static_cast<void>(watched_.fetch_and<libk::MemoryOrder::Release>(
                 ~mask));
+            static_cast<void>(page->watched.fetch_and<
+                libk::MemoryOrder::Release>(~bit(local)));
             if ((state & pin_count_mask) != 0) {
                 return;
             }
@@ -611,6 +831,8 @@ void ObservationShard::release(ObservationKey key) noexcept {
     }
     record.flags.store<libk::MemoryOrder::Release>(0);
     static_cast<void>(allocated_.fetch_and<libk::MemoryOrder::Release>(~mask));
+    static_cast<void>(page->allocated.fetch_and<libk::MemoryOrder::Release>(
+        ~bit(local)));
 }
 
 auto ObservationShard::write_metadata(
@@ -619,19 +841,27 @@ auto ObservationShard::write_metadata(
     WaitKind wait,
     NodeRef driver,
     NodeRef blocker,
+    u64 semantic_stamp,
+    bool update_progress,
     SourceSite site) noexcept -> bool {
     ObservationRecord* record{};
     if (!pin(key, record)) {
         return false;
     }
-    increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(now());
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded();
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
         return false;
     }
+    const u64 tick = now();
+    const u32 previous_phase = record->phase.load<
+        libk::MemoryOrder::Relaxed>();
+    const u64 previous_semantic = record->semantic_stamp.load<
+        libk::MemoryOrder::Relaxed>();
+    increment_sat(record->activity_epoch, 1);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
     record->phase.store<libk::MemoryOrder::Relaxed>(phase);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(wait));
@@ -650,6 +880,16 @@ auto ObservationShard::write_metadata(
     record->site_function.store<libk::MemoryOrder::Relaxed>(
         reinterpret_cast<usize>(site.function));
     record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+    const bool progressed = previous_phase != phase
+        || (update_progress && previous_semantic != semantic_stamp);
+    if (update_progress) {
+        record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
+            semantic_stamp);
+    }
+    if (progressed) {
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+    }
     AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
     return true;
@@ -665,14 +905,16 @@ auto ObservationShard::write_wait(
     if (!pin(key, record)) {
         return false;
     }
-    increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(now());
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded();
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
         return false;
     }
+    const u64 tick = now();
+    increment_sat(record->activity_epoch, 1);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
     record->waiter_key.store<libk::MemoryOrder::Relaxed>(wait.raw);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(kind));
@@ -699,11 +941,22 @@ void ObservationShard::set_watched(
         return;
     }
     const usize index = key.slot();
+    usize local{};
+    ObservationPage* const page = page_for(index, local);
+    if (page == nullptr) {
+        unpin(key, *record);
+        return;
+    }
     const u64 mask = bit(index);
+    const u64 local_mask = bit(local);
     if (watched) {
         static_cast<void>(watched_.fetch_or<libk::MemoryOrder::Release>(mask));
+        static_cast<void>(page->watched.fetch_or<libk::MemoryOrder::Release>(
+            local_mask));
     } else {
         static_cast<void>(watched_.fetch_and<libk::MemoryOrder::Release>(~mask));
+        static_cast<void>(page->watched.fetch_and<libk::MemoryOrder::Release>(
+            ~local_mask));
     }
     unpin(key, *record);
 }
@@ -711,25 +964,37 @@ void ObservationShard::set_watched(
 auto ObservationShard::update_phase(
     ObservationKey key,
     u32 phase,
+    u64 semantic_stamp,
     SourceSite site) noexcept -> bool {
     ObservationRecord* record{};
     if (!pin(key, record)) {
         return false;
     }
-    increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(now());
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded();
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
         return false;
     }
+    const u64 tick = now();
+    const u32 previous_phase = record->phase.load<
+        libk::MemoryOrder::Relaxed>();
+    const u64 previous_semantic = record->semantic_stamp.load<
+        libk::MemoryOrder::Relaxed>();
+    increment_sat(record->activity_epoch, 1);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
     record->phase.store<libk::MemoryOrder::Relaxed>(phase);
     record->site_file.store<libk::MemoryOrder::Relaxed>(
         reinterpret_cast<usize>(site.file));
     record->site_function.store<libk::MemoryOrder::Relaxed>(
         reinterpret_cast<usize>(site.function));
     record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+    record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(semantic_stamp);
+    if (previous_phase != phase || previous_semantic != semantic_stamp) {
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+    }
     AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
     return true;
@@ -743,27 +1008,55 @@ auto ObservationShard::update_progress(
     if (!pin(key, record)) {
         return false;
     }
-    u64 previous = record->semantic_stamp.load<libk::MemoryOrder::Acquire>();
-    if (!force) {
-        for (;;) {
-            if (previous == semantic_stamp) {
-                unpin(key, *record);
-                return false;
-            }
-            if (record->semantic_stamp.compare_exchange_weak<
-                    libk::MemoryOrder::AcqRel,
-                    libk::MemoryOrder::Acquire>(previous, semantic_stamp)) {
-                break;
-            }
-        }
-    } else {
-        record->semantic_stamp.store<libk::MemoryOrder::Release>(
-            semantic_stamp);
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return false;
     }
-    increment_sat(record->progress_epoch, 1);
-    record->last_progress_at.store<libk::MemoryOrder::Release>(now());
+    const u64 previous = record->semantic_stamp.load<
+        libk::MemoryOrder::Relaxed>();
+    const bool changed = force || previous != semantic_stamp;
+    if (changed) {
+        record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
+            semantic_stamp);
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(now());
+    }
+    AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
-    return true;
+    return changed;
+}
+
+auto ObservationShard::observe(
+    ObservationKey key,
+    u64 semantic_stamp) noexcept -> bool {
+    ObservationRecord* record{};
+    if (!pin(key, record)) {
+        return false;
+    }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return false;
+    }
+    const u64 tick = now();
+    const u64 previous = record->semantic_stamp.load<
+        libk::MemoryOrder::Relaxed>();
+    increment_sat(record->activity_epoch, 1);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    if (previous != semantic_stamp) {
+        record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
+            semantic_stamp);
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+    }
+    AtomicSnapshotWriter::end(record->sequence, odd);
+    unpin(key, *record);
+    return previous != semantic_stamp;
 }
 
 void ObservationShard::update_activity(
@@ -773,8 +1066,16 @@ void ObservationShard::update_activity(
     if (delta == 0 || !pin(key, record)) {
         return;
     }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return;
+    }
     increment_sat(record->activity_epoch, delta);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(now());
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(now());
+    AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
 }
 
@@ -785,11 +1086,19 @@ void ObservationShard::advance(
     if (delta == 0 || !pin(key, record)) {
         return;
     }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return;
+    }
     const u64 tick = now();
     increment_sat(record->activity_epoch, delta);
     increment_sat(record->progress_epoch, delta);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(tick);
-    record->last_progress_at.store<libk::MemoryOrder::Release>(tick);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+    AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
 }
 
@@ -853,6 +1162,8 @@ auto ObservationShard::snapshot(
         }
     }
     unpin(key, *record);
+    const_cast<ObservationShard*>(this)->mark_degraded(
+        DiagnosticStatus::SnapshotUnstable);
     return false;
 }
 
@@ -870,10 +1181,10 @@ void ObservationShard::finish(
     const RecordKind kind = static_cast<RecordKind>(record->record_kind.load<
         libk::MemoryOrder::Acquire>());
     const u64 started = record->started_at.load<libk::MemoryOrder::Acquire>();
-    increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Release>(tick);
     u64 odd{};
     if (AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        increment_sat(record->activity_epoch, 1);
+        record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
         record->phase.store<libk::MemoryOrder::Relaxed>(terminal_phase);
         record->wait_kind.store<libk::MemoryOrder::Relaxed>(
             static_cast<u32>(WaitKind::None));
@@ -893,14 +1204,22 @@ void ObservationShard::finish(
         record->site_function.store<libk::MemoryOrder::Relaxed>(
             reinterpret_cast<usize>(site.function));
         record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+        record->detail[0].store<libk::MemoryOrder::Relaxed>(result);
+        record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(result);
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
         AtomicSnapshotWriter::end(record->sequence, odd);
     } else {
-        mark_degraded();
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        // Do not strand an owned slot when its terminal publication loses a
+        // non-blocking writer race.  release() sets the release request and
+        // either retires the slot immediately or lets the competing writer's
+        // final unpin retire it safely.
+        release(key);
+        return;
     }
-    record->detail[0].store<libk::MemoryOrder::Release>(result);
-    record->semantic_stamp.store<libk::MemoryOrder::Release>(result);
-    increment_sat(record->progress_epoch, 1);
-    record->last_progress_at.store<libk::MemoryOrder::Release>(tick);
     unpin(key, *record);
     profile_finish(kind, started != 0 ? elapsed(tick, started) : 0);
     release(key);
@@ -1034,6 +1353,22 @@ auto ObservationLease::reserve(
         kind, subject_identity, subject_generation, expectation, site);
 }
 
+auto ObservationLease::reserve_on(
+    CpuId cpu,
+    RecordKind kind,
+    u64 subject_identity,
+    u64 subject_generation,
+    Expectation expectation,
+    SourceSite site) noexcept -> ObservationLease {
+    return concurrency::reserve_on(
+        cpu,
+        kind,
+        subject_identity,
+        subject_generation,
+        expectation,
+        site);
+}
+
 auto ObservationLease::borrow(ObservationKey key) noexcept
     -> ObservationLease {
 #if MYOS_CONCURRENCY_DIAG >= 1
@@ -1143,7 +1478,7 @@ void ObservationLease::attempt(
         return;
     }
     static_cast<void>(shard->write_metadata(
-        key_, phase, wait, driver, blocker, site));
+        key_, phase, wait, driver, blocker, 0, false, site));
 #else
     static_cast<void>(phase);
     static_cast<void>(wait);
@@ -1160,15 +1495,20 @@ void ObservationLease::transition(
     NodeRef driver,
     NodeRef blocker,
     SourceSite site) noexcept {
-    attempt(phase, wait, driver, blocker, site);
 #if MYOS_CONCURRENCY_DIAG >= 1
     ObservationShard* shard{};
     ObservationRecord* record{};
     if (resolve(shard, record)) {
-        static_cast<void>(shard->update_progress(key_, semantic_stamp, false));
+        static_cast<void>(shard->write_metadata(
+            key_, phase, wait, driver, blocker, semantic_stamp, true, site));
     }
 #else
+    static_cast<void>(phase);
     static_cast<void>(semantic_stamp);
+    static_cast<void>(wait);
+    static_cast<void>(driver);
+    static_cast<void>(blocker);
+    static_cast<void>(site);
 #endif
 }
 
@@ -1182,8 +1522,7 @@ void ObservationLease::phase(
     if (!resolve(shard, record)) {
         return;
     }
-    static_cast<void>(shard->update_phase(key_, phase, site));
-    static_cast<void>(shard->update_progress(key_, semantic_stamp, false));
+    static_cast<void>(shard->update_phase(key_, phase, semantic_stamp, site));
 #else
     static_cast<void>(phase);
     static_cast<void>(semantic_stamp);
@@ -1198,8 +1537,7 @@ void ObservationLease::observe(u64 semantic_stamp) noexcept {
     if (!resolve(shard, record)) {
         return;
     }
-    shard->update_activity(key_, 1);
-    static_cast<void>(shard->update_progress(key_, semantic_stamp, false));
+    static_cast<void>(shard->observe(key_, semantic_stamp));
 #else
     static_cast<void>(semantic_stamp);
 #endif
@@ -1367,6 +1705,8 @@ void FlightRecorder::initialize(CpuId id) noexcept {
     wrapped_.store<libk::MemoryOrder::Relaxed>(0);
     for (auto& record : records) {
         record.sequence.store<libk::MemoryOrder::Relaxed>(0);
+        record.absolute_id.store<libk::MemoryOrder::Relaxed>(
+            libk::numeric_limits<u64>::max());
     }
 }
 
@@ -1402,6 +1742,7 @@ void FlightRecorder::push(
         degraded_.store<libk::MemoryOrder::Release>(1);
         return;
     }
+    record.absolute_id.store<libk::MemoryOrder::Relaxed>(head);
     record.tick.store<libk::MemoryOrder::Relaxed>(tick);
     record.domain.store<libk::MemoryOrder::Relaxed>(static_cast<u32>(domain));
     record.event.store<libk::MemoryOrder::Relaxed>(static_cast<u32>(event));
@@ -1435,6 +1776,8 @@ auto FlightRecorder::read(
         }
         FlightRecordValue value{};
         value.sequence = first;
+        value.absolute_id = record.absolute_id.load<
+            libk::MemoryOrder::Relaxed>();
         value.tick = record.tick.load<libk::MemoryOrder::Relaxed>();
         value.domain = static_cast<FlightDomain>(
             record.domain.load<libk::MemoryOrder::Relaxed>());
@@ -1450,7 +1793,8 @@ auto FlightRecorder::read(
         value.site.function = reinterpret_cast<const char*>(
             record.site_function.load<libk::MemoryOrder::Relaxed>());
         value.site.line = record.site_line.load<libk::MemoryOrder::Relaxed>();
-        if (AtomicSnapshotReader::valid(record.sequence, first)) {
+        if (value.absolute_id == absolute
+            && AtomicSnapshotReader::valid(record.sequence, first)) {
             result = value;
             return true;
         }
@@ -1507,6 +1851,54 @@ auto reserve(
 #endif
 }
 
+auto reserve_on(
+    CpuId cpu,
+    RecordKind kind,
+    u64 subject_identity,
+    u64 subject_generation,
+    Expectation expectation,
+    SourceSite site) noexcept -> ObservationLease {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    void* const owner = arch::current_cpu_owner();
+    if (owner == nullptr) {
+        mark_degraded(DiagnosticStatus::StorageMissing);
+        return {};
+    }
+    auto& local = *static_cast<CpuLocal*>(owner);
+    CpuRegistry* const registry = local.runtime_ == nullptr
+        ? nullptr : local.runtime_->owner_registry;
+    if (registry == nullptr) {
+        const CpuId current = local.descriptor == nullptr
+            ? CpuId{} : local.descriptor->logical_id();
+        if (current != cpu) {
+            mark_degraded(DiagnosticStatus::RemoteShardUnavailable);
+            return {};
+        }
+        return reserve(
+            kind, subject_identity, subject_generation, expectation, site);
+    }
+    const CpuDescriptor* const descriptor = registry->descriptor(cpu);
+    CpuRuntime* const runtime = registry->runtime(cpu);
+    if (descriptor == nullptr || runtime == nullptr
+        || !descriptor->runtime_alive()
+        || runtime->diagnostics == nullptr
+        || runtime->diagnostics->concurrency.observations == nullptr) {
+        mark_degraded(DiagnosticStatus::RemoteShardUnavailable);
+        return {};
+    }
+    return runtime->diagnostics->concurrency.observations->reserve(
+        kind, subject_identity, subject_generation, expectation, site);
+#else
+    static_cast<void>(cpu);
+    static_cast<void>(kind);
+    static_cast<void>(subject_identity);
+    static_cast<void>(subject_generation);
+    static_cast<void>(expectation);
+    static_cast<void>(site);
+    return {};
+#endif
+}
+
 void record(
     FlightDomain domain,
     FlightEvent event,
@@ -1528,6 +1920,10 @@ void record(
     if (core->flight->wrapped()) {
         static_cast<void>(core->status.flags.fetch_or<
             libk::MemoryOrder::Release>(DiagnosticStatus::FlightWrapped));
+    }
+    if (core->flight->degraded()) {
+        static_cast<void>(core->status.flags.fetch_or<
+            libk::MemoryOrder::Release>(DiagnosticStatus::FlightGap));
     }
 #else
     static_cast<void>(domain);
@@ -1563,6 +1959,43 @@ void timer(CpuId cpu, u64 tick) noexcept {
     record(FlightDomain::Cpu, FlightEvent::Timer, 0, 0, cpu.raw, tick);
 }
 
+auto CpuLive::top_wait(WaitSnapshot& result) const noexcept -> bool {
+    const u32 depth = wait_depth.load<libk::MemoryOrder::Acquire>();
+    if (depth == 0 || depth > wait_capacity) {
+        return false;
+    }
+    const WaitFrame& frame = waits[depth - 1];
+    for (usize attempt = 0; attempt < 3; ++attempt) {
+        const u64 first = AtomicSnapshotReader::begin(frame.sequence);
+        if ((first & 1U) != 0) {
+            continue;
+        }
+        WaitSnapshot value{};
+        value.wait = frame.wait.load<libk::MemoryOrder::Relaxed>();
+        const u64 kinds = frame.kinds.load<libk::MemoryOrder::Relaxed>();
+        value.subject = read_node(
+            frame.subject_identity.load<libk::MemoryOrder::Relaxed>(),
+            static_cast<u32>(kinds & 0xffU),
+            frame.subject_generation.load<libk::MemoryOrder::Relaxed>());
+        value.driver = read_node(
+            frame.driver_identity.load<libk::MemoryOrder::Relaxed>(),
+            static_cast<u32>((kinds >> 8) & 0xffU),
+            frame.driver_generation.load<libk::MemoryOrder::Relaxed>());
+        value.obligation = frame.obligation.load<libk::MemoryOrder::Relaxed>();
+        value.since = frame.since.load<libk::MemoryOrder::Relaxed>();
+        value.kind = static_cast<WaitKind>((kinds >> 16) & 0xffU);
+        value.site.file = reinterpret_cast<const char*>(
+            frame.site_file.load<libk::MemoryOrder::Relaxed>());
+        value.site.line = frame.site_line.load<libk::MemoryOrder::Relaxed>();
+        if (AtomicSnapshotReader::valid(frame.sequence, first)
+            && wait_depth.load<libk::MemoryOrder::Acquire>() == depth) {
+            result = value;
+            return true;
+        }
+    }
+    return false;
+}
+
 void watchdog_tick(CpuId cpu, u64 tick) noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 3
     CpuDiagnosticsCore* const watcher = current_core();
@@ -1575,6 +2008,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     // the local shard; this also covers single-hart systems.
     CpuDiagnosticsCore* target_core = watcher;
     ObservationShard* shard = current_shard();
+    CpuId target_cpu = cpu;
     void* const owner = arch::current_cpu_owner();
     if (owner != nullptr) {
         auto& local = *static_cast<CpuLocal*>(owner);
@@ -1592,6 +2026,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                     && runtime->diagnostics->concurrency.observations != nullptr) {
                     target_core = &runtime->diagnostics->concurrency;
                     shard = target_core->observations;
+                    target_cpu = target;
                     break;
                 }
                 target = CpuId{(target.raw + 1) % registry->count()};
@@ -1605,6 +2040,8 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     }
     const u64 live_hard = target_core->policy.critical_hard;
     const u64 live_soft = target_core->policy.critical_soft;
+    CpuLive::WaitSnapshot live_wait{};
+    const bool live_wait_valid = target_core->live.top_wait(live_wait);
     const auto inspect_live = [&](libk::Atomic<u64>& since,
                                   DiagnosticStatus::Flag flag,
                                   u64 kind) noexcept {
@@ -1620,12 +2057,15 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                     FlightEvent::WatchdogConfirmed,
                     target_core->live.current_actor.load<
                         libk::MemoryOrder::Acquire>(),
-                    target_core->live.current_obligation.load<
-                        libk::MemoryOrder::Acquire>(),
+                    live_wait_valid ? live_wait.obligation : 0,
                     kind,
                     elapsed(tick, entered),
                     target_core->live.context.load<
                         libk::MemoryOrder::Acquire>());
+                static_cast<void>(target_core->status.flags.fetch_or<
+                    libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
+                static_cast<void>(report_cpu_stall(
+                    cpu, target_cpu, kind, elapsed(tick, entered)));
             }
         } else if (entered == 0
             || live_soft == 0
@@ -1634,14 +2074,22 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 libk::MemoryOrder::AcqRel>(~static_cast<u32>(flag)));
         }
     };
-    inspect_live(
-        target_core->live.irq_disabled_since,
-        DiagnosticStatus::IrqStall,
-        1);
-    inspect_live(
-        target_core->live.trap_entered_at,
-        DiagnosticStatus::TrapStall,
-        2);
+    // The local watchdog runs from the timer trap with interrupts masked and
+    // trap_depth/irq_depth elevated by that very callback.  It cannot be
+    // evidence that this CPU is wedged: if local interrupts were genuinely
+    // disabled, no later timer callback could observe the condition.  CPU-live
+    // roots therefore require a peer; the local shard is still inspected for
+    // ordinary observation obligations below.
+    if (target_core != watcher) {
+        inspect_live(
+            target_core->live.irq_disabled_since,
+            DiagnosticStatus::IrqStall,
+            1);
+        inspect_live(
+            target_core->live.trap_entered_at,
+            DiagnosticStatus::TrapStall,
+            2);
+    }
 
     const u64 watched = shard->watched();
     ObservationKey key{};
@@ -1686,6 +2134,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         && previous.generation == snapshot.generation
         && previous.phase == snapshot.phase
         && previous.progress_epoch == snapshot.progress_epoch
+        && previous.state_hash == snapshot_hash(snapshot)
         && previous.driver.kind == snapshot.driver.kind
         && previous.driver.identity == snapshot.driver.identity
         && previous.driver.generation == snapshot.driver.generation
@@ -1701,6 +2150,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             snapshot.phase,
             snapshot.progress_epoch,
             snapshot.activity_epoch,
+            snapshot_hash(snapshot),
             snapshot.driver,
             snapshot.blocker});
         candidate.first_seen.store<libk::MemoryOrder::Release>(0);
@@ -1709,10 +2159,18 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         return;
     }
 
-    const bool active = snapshot.activity_epoch
-        != previous.activity_epoch;
-    previous.activity_epoch = snapshot.activity_epoch;
-    candidate.publish(previous);
+    const u64 current_hash = snapshot_hash(snapshot);
+    const bool active = snapshot.activity_epoch != previous.activity_epoch
+        && snapshot.progress_epoch == previous.progress_epoch;
+    candidate.publish(StallFingerprint{
+        key,
+        snapshot.generation,
+        snapshot.phase,
+        snapshot.progress_epoch,
+        snapshot.activity_epoch,
+        current_hash,
+        snapshot.driver,
+        snapshot.blocker});
     if (age < thresholds.soft) {
         return;
     }
@@ -1742,6 +2200,10 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             key.raw,
             static_cast<u64>(confirmed),
             age);
+        if (report_stall(cpu, target_cpu, key, confirmed, age)) {
+            static_cast<void>(target_core->status.flags.fetch_or<
+                libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
+        }
     } else if (state == WatchdogCandidate::State::Confirmed && active) {
         candidate.state.store<libk::MemoryOrder::Release>(
             static_cast<u32>(WatchdogCandidate::State::ConfirmedLivelock));
@@ -1752,6 +2214,15 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             key.raw,
             static_cast<u64>(WatchdogCandidate::State::ConfirmedLivelock),
             age);
+        if (report_stall(
+                cpu,
+                target_cpu,
+                key,
+                WatchdogCandidate::State::ConfirmedLivelock,
+                age)) {
+            static_cast<void>(target_core->status.flags.fetch_or<
+                libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
+        }
     }
 #else
     static_cast<void>(cpu);
@@ -1846,25 +2317,56 @@ void set_wait(
 #if MYOS_CONCURRENCY_DIAG >= 1
     if (CpuDiagnosticsCore* const core = current_core(); core != nullptr) {
         const u64 tick = now();
-        core->live.current_wait.store<libk::MemoryOrder::Release>(wait.raw);
-        core->live.current_subject.store<libk::MemoryOrder::Release>(
-            subject.identity);
-        core->live.current_subject_generation.store<
-            libk::MemoryOrder::Release>(subject.generation);
-        core->live.current_driver.store<libk::MemoryOrder::Release>(
-            driver.identity);
-        core->live.current_driver_generation.store<
-            libk::MemoryOrder::Release>(driver.generation);
-        core->live.current_obligation.store<libk::MemoryOrder::Release>(
-            wait ? wait.raw : subject.identity);
-        core->live.wait_kind.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(kind));
-        core->live.wait_since.store<libk::MemoryOrder::Release>(tick);
-        core->live.wait_site_file.store<libk::MemoryOrder::Release>(
-            reinterpret_cast<usize>(site.file));
-        core->live.wait_site_function.store<libk::MemoryOrder::Release>(
-            reinterpret_cast<usize>(site.function));
-        core->live.wait_site_line.store<libk::MemoryOrder::Release>(site.line);
+        u32 depth = core->live.wait_depth.load<libk::MemoryOrder::Relaxed>();
+        if (depth >= CpuLive::wait_capacity) {
+            u32 overflow = core->live.wait_overflow.load<
+                libk::MemoryOrder::Relaxed>();
+            while (overflow != libk::numeric_limits<u32>::max()
+                && !core->live.wait_overflow.compare_exchange_weak<
+                    libk::MemoryOrder::AcqRel,
+                    libk::MemoryOrder::Relaxed>(overflow, overflow + 1)) {}
+            static_cast<void>(core->live.degraded.fetch_or<
+                libk::MemoryOrder::Release>(DiagnosticStatus::WaitStackOverflow));
+            static_cast<void>(core->status.flags.fetch_or<
+                libk::MemoryOrder::Release>(DiagnosticStatus::WaitStackOverflow));
+        } else {
+            CpuLive::WaitFrame& frame = core->live.waits[depth];
+            u64 odd{};
+            if (AtomicSnapshotWriter::begin(frame.sequence, odd)) {
+                frame.wait.store<libk::MemoryOrder::Relaxed>(wait.raw);
+                frame.subject_identity.store<libk::MemoryOrder::Relaxed>(
+                    subject.identity);
+                frame.subject_generation.store<libk::MemoryOrder::Relaxed>(
+                    subject.generation);
+                frame.driver_identity.store<libk::MemoryOrder::Relaxed>(
+                    driver.identity);
+                frame.driver_generation.store<libk::MemoryOrder::Relaxed>(
+                    driver.generation);
+                frame.kinds.store<libk::MemoryOrder::Relaxed>(
+                    static_cast<u64>(static_cast<u8>(subject.kind))
+                    | (static_cast<u64>(static_cast<u8>(driver.kind)) << 8)
+                    | (static_cast<u64>(static_cast<u8>(kind)) << 16));
+                frame.obligation.store<libk::MemoryOrder::Relaxed>(
+                    wait ? wait.raw : subject.identity);
+                frame.since.store<libk::MemoryOrder::Relaxed>(tick);
+                frame.site_file.store<libk::MemoryOrder::Relaxed>(
+                    reinterpret_cast<usize>(site.file));
+                frame.site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+                AtomicSnapshotWriter::end(frame.sequence, odd);
+                core->live.wait_activity_epoch.store<
+                    libk::MemoryOrder::Release>(0);
+                core->live.wait_progress_epoch.store<
+                    libk::MemoryOrder::Release>(0);
+                core->live.wait_semantic_stamp.store<
+                    libk::MemoryOrder::Release>(0);
+                core->live.wait_depth.store<libk::MemoryOrder::Release>(
+                    depth + 1);
+            } else {
+                static_cast<void>(core->status.flags.fetch_or<
+                    libk::MemoryOrder::Release>(
+                    DiagnosticStatus::ObservationWriterCollision));
+            }
+        }
     }
 #endif
     const bool lock_wait = kind == WaitKind::SpinLock;
@@ -1882,21 +2384,63 @@ void set_wait(
 void clear_wait() noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 1
     if (CpuDiagnosticsCore* const core = current_core(); core != nullptr) {
-        core->live.current_wait.store<libk::MemoryOrder::Release>(0);
-        core->live.current_subject.store<libk::MemoryOrder::Release>(0);
-        core->live.current_subject_generation.store<
-            libk::MemoryOrder::Release>(0);
-        core->live.current_driver.store<libk::MemoryOrder::Release>(0);
-        core->live.current_driver_generation.store<
-            libk::MemoryOrder::Release>(0);
-        core->live.current_obligation.store<libk::MemoryOrder::Release>(0);
-        core->live.wait_kind.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WaitKind::None));
-        core->live.wait_since.store<libk::MemoryOrder::Release>(0);
-        core->live.wait_site_file.store<libk::MemoryOrder::Release>(0);
-        core->live.wait_site_function.store<libk::MemoryOrder::Release>(0);
-        core->live.wait_site_line.store<libk::MemoryOrder::Release>(0);
+        u32 overflow = core->live.wait_overflow.load<
+            libk::MemoryOrder::Acquire>();
+        while (overflow != 0
+            && !core->live.wait_overflow.compare_exchange_weak<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(overflow, overflow - 1)) {}
+        if (overflow != 0) {
+            return;
+        }
+        const u32 depth = core->live.wait_depth.load<
+            libk::MemoryOrder::Acquire>();
+        if (depth == 0 || depth > CpuLive::wait_capacity) {
+            static_cast<void>(core->status.flags.fetch_or<
+                libk::MemoryOrder::Release>(DiagnosticStatus::SnapshotUnstable));
+        } else {
+            CpuLive::WaitFrame& frame = core->live.waits[depth - 1];
+            u64 odd{};
+            if (AtomicSnapshotWriter::begin(frame.sequence, odd)) {
+                frame.wait.store<libk::MemoryOrder::Relaxed>(0);
+                frame.subject_identity.store<libk::MemoryOrder::Relaxed>(0);
+                frame.subject_generation.store<libk::MemoryOrder::Relaxed>(0);
+                frame.driver_identity.store<libk::MemoryOrder::Relaxed>(0);
+                frame.driver_generation.store<libk::MemoryOrder::Relaxed>(0);
+                frame.obligation.store<libk::MemoryOrder::Relaxed>(0);
+                frame.since.store<libk::MemoryOrder::Relaxed>(0);
+                frame.site_file.store<libk::MemoryOrder::Relaxed>(0);
+                frame.site_line.store<libk::MemoryOrder::Relaxed>(0);
+                frame.kinds.store<libk::MemoryOrder::Relaxed>(
+                    static_cast<u64>(static_cast<u8>(WaitKind::None)) << 16);
+                AtomicSnapshotWriter::end(frame.sequence, odd);
+                core->live.wait_depth.store<libk::MemoryOrder::Release>(
+                    depth - 1);
+            }
+        }
     }
+#endif
+}
+
+void observe_wait(u64 semantic_stamp) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    CpuDiagnosticsCore* const core = current_core();
+    if (core == nullptr || core->live.wait_depth.load<
+            libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    static_cast<void>(core->live.wait_activity_epoch.fetch_add<
+        libk::MemoryOrder::Relaxed>(1));
+    const u64 previous = core->live.wait_semantic_stamp.load<
+        libk::MemoryOrder::Acquire>();
+    if (previous != semantic_stamp) {
+        core->live.wait_semantic_stamp.store<libk::MemoryOrder::Release>(
+            semantic_stamp);
+        static_cast<void>(core->live.wait_progress_epoch.fetch_add<
+            libk::MemoryOrder::Relaxed>(1));
+    }
+#else
+    static_cast<void>(semantic_stamp);
 #endif
 }
 
@@ -1997,10 +2541,12 @@ namespace {
 // These values are the canonical ExecutionState and Completion delivery
 // values.  They are kept local to the analyzer: diagnostics interprets the
 // published projection but never becomes a second state owner.
-constexpr u32 execution_ready_phase = 1;
-constexpr u32 execution_throttled_phase = 3;
-constexpr u32 execution_blocked_phase = 4;
-constexpr u32 operation_ready_phase = 3;
+constexpr u32 execution_ready_phase = static_cast<u32>(
+    ExecutionState::Ready);
+constexpr u32 execution_throttled_phase = static_cast<u32>(
+    ExecutionState::Throttled);
+constexpr u32 execution_blocked_phase = static_cast<u32>(
+    ExecutionState::Blocked);
 
 [[nodiscard]] auto terminal_class(
     const ObservationSnapshot& snapshot,
@@ -2059,86 +2605,252 @@ constexpr u32 operation_ready_phase = 3;
 #endif
 
 auto analyze(
-    ObservationKey root,
+    NodeRef root,
     WaitGraphScratch& scratch) noexcept -> bool {
 #if MYOS_CONCURRENCY_DIAG >= 1
     scratch.classification = StallClass::None;
     scratch.count = 0;
     scratch.truncated = false;
-    for (auto& key : scratch.path) {
-        key = {};
+    for (usize index = 0; index < graph_capacity; ++index) {
+        scratch.set_node(index, {});
+        scratch.path_meta[index] = 0;
+        scratch.fingerprints[index] = 0;
     }
     if (!root) {
         scratch.classification = StallClass::Inconclusive;
         return false;
     }
 
-    ObservationKey current = root;
-    bool livelock = false;
-    for (usize depth = 0; depth < graph_capacity; ++depth) {
-        for (usize index = 0; index < scratch.count; ++index) {
-            if (scratch.path[index] == current) {
-                scratch.classification = StallClass::DeadlockCycle;
+    const auto read_cpu = [&](NodeRef node,
+                              CpuLive::WaitSnapshot& result) noexcept -> bool {
+        void* const owner = arch::current_cpu_owner();
+        if (owner == nullptr) {
+            return false;
+        }
+        auto& local = *static_cast<CpuLocal*>(owner);
+        CpuRegistry* const registry = local.runtime_ == nullptr
+            ? nullptr : local.runtime_->owner_registry;
+        if (registry == nullptr) {
+            return false;
+        }
+        const CpuDescriptor* const descriptor = registry->descriptor(
+            CpuId{static_cast<usize>(node.identity)});
+        CpuRuntime* const runtime = registry->runtime(
+            CpuId{static_cast<usize>(node.identity)});
+        if (descriptor == nullptr || runtime == nullptr
+            || !descriptor->runtime_alive()
+            || runtime->diagnostics == nullptr) {
+            return false;
+        }
+        return runtime->diagnostics->concurrency.live.top_wait(result);
+    };
+
+    const auto read_node = [&](NodeRef node,
+                               ObservationSnapshot& observation,
+                               CpuLive::WaitSnapshot& cpu,
+                               u64& fingerprint) noexcept -> bool {
+        if (node.kind == NodeRef::Kind::Observation) {
+            ObservationLease lease = ObservationLease::borrow(
+                ObservationKey{node.identity});
+            if (!lease || !lease.snapshot(observation)) {
+                return false;
+            }
+            fingerprint = snapshot_hash(observation);
+            return true;
+        }
+        if (node.kind == NodeRef::Kind::Cpu) {
+            if (!read_cpu(node, cpu)) {
+                return false;
+            }
+            fingerprint = u64{0x517cc1b727220a95};
+            fingerprint = mix_hash(fingerprint, cpu.wait);
+            fingerprint = mix_hash(fingerprint, cpu.subject.identity);
+            fingerprint = mix_hash(fingerprint,
+                static_cast<u64>(cpu.subject.kind));
+            fingerprint = mix_hash(fingerprint, cpu.subject.generation);
+            fingerprint = mix_hash(fingerprint, cpu.driver.identity);
+            fingerprint = mix_hash(fingerprint,
+                static_cast<u64>(cpu.driver.kind));
+            fingerprint = mix_hash(fingerprint, cpu.driver.generation);
+            fingerprint = mix_hash(fingerprint, cpu.obligation);
+            fingerprint = mix_hash(fingerprint, cpu.since);
+            fingerprint = mix_hash(fingerprint, static_cast<u64>(cpu.kind));
+            return true;
+        }
+        if (node.kind == NodeRef::Kind::CpuSet) {
+            ObservationLease lease = ObservationLease::borrow(
+                ObservationKey{node.identity});
+            if (!lease || !lease.snapshot(observation)
+                || observation.generation != node.generation) {
+                return false;
+            }
+            u64 pending{};
+            CpuId selected{};
+            bool found{};
+            for (usize word = 0; word < 4 && !found; ++word) {
+                pending = observation.detail[word];
+                for (usize bit_index = 0; bit_index < 64; ++bit_index) {
+                    if ((pending & (u64{1} << bit_index)) != 0) {
+                        selected = CpuId{word * 64 + bit_index};
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found || !read_cpu(NodeRef::cpu(selected), cpu)) {
+                fingerprint = mix_hash(snapshot_hash(observation), 0);
                 return true;
             }
+            fingerprint = mix_hash(snapshot_hash(observation), selected.raw);
+            fingerprint = mix_hash(fingerprint, cpu.wait);
+            fingerprint = mix_hash(fingerprint, cpu.subject.identity);
+            fingerprint = mix_hash(fingerprint, cpu.driver.identity);
+            fingerprint = mix_hash(fingerprint, cpu.since);
+            return true;
         }
-        scratch.path[scratch.count++] = current;
+        fingerprint = mix_hash(
+            mix_hash(static_cast<u64>(node.kind), node.identity),
+            node.generation);
+        return true;
+    };
 
-        ObservationLease observation = ObservationLease::borrow(current);
+    NodeRef current = root;
+    bool done{};
+    bool lost_wake{};
+    ObservationSnapshot last_observation{};
+    bool have_last_observation{};
+    for (usize depth = 0; depth < graph_capacity; ++depth) {
+        for (usize index = 0; index < scratch.count; ++index) {
+            if (scratch.node(index) == current) {
+                // Keep the operation in the evidence path, but let the
+                // already-correlated wake publication win over the ordinary
+                // back-edge classification.  The second snapshot pass below
+                // still validates both nodes before reporting LostWake.
+                scratch.classification = lost_wake
+                    ? StallClass::LostWake
+                    : StallClass::DeadlockCycle;
+                done = true;
+                break;
+            }
+        }
+        if (done) {
+            break;
+        }
         ObservationSnapshot snapshot{};
-        if (!observation || !observation.snapshot(snapshot)) {
+        CpuLive::WaitSnapshot cpu{};
+        u64 fingerprint{};
+        if (!read_node(current, snapshot, cpu, fingerprint)) {
             scratch.classification = StallClass::Inconclusive;
             return false;
         }
-        if (snapshot.activity_epoch > snapshot.progress_epoch
-            && snapshot.activity_epoch > 1
-            && snapshot.last_activity_at != snapshot.last_progress_at) {
-            livelock = true;
+        if (current.kind == NodeRef::Kind::Observation
+            || current.kind == NodeRef::Kind::CpuSet) {
+            last_observation = snapshot;
+            have_last_observation = true;
         }
+        if (scratch.count >= graph_capacity) {
+            scratch.truncated = true;
+            scratch.classification = StallClass::Truncated;
+            done = true;
+            break;
+        }
+        scratch.set_node(scratch.count, current);
+        scratch.fingerprints[scratch.count] = fingerprint;
+        ++scratch.count;
 
-        // A blocked execution whose operation is already ready is the
-        // observable half of the lost-wake proof.  The scheduler's wake
-        // credit remains canonical in Binding; this check only correlates
-        // the two stable diagnostic projections and never repairs state.
-        if (snapshot.record_kind == RecordKind::ExecutionActor
-            && snapshot.phase == execution_blocked_phase
-            && snapshot.waiter_key) {
-            ObservationLease wake = ObservationLease::borrow(
-                snapshot.waiter_key);
-            ObservationSnapshot operation{};
-            if (!wake || !wake.snapshot(operation)) {
-                scratch.classification = StallClass::Inconclusive;
-                return false;
+        NodeRef next{};
+        if (current.kind == NodeRef::Kind::Observation) {
+            // A blocked actor and a ReadyPublished operation are only a lost
+            // wake when the scheduler projection has no queued/timer/credit
+            // witness.  The canonical wake path remains authoritative.
+            if (snapshot.record_kind == RecordKind::ExecutionActor
+                && snapshot.phase == execution_blocked_phase
+                && snapshot.waiter_key) {
+                ObservationLease wake = ObservationLease::borrow(
+                    snapshot.waiter_key);
+                ObservationSnapshot operation{};
+                if (!wake || !wake.snapshot(operation)) {
+                    scratch.classification = StallClass::Inconclusive;
+                    return false;
+                }
+                const bool scheduler_pending = (snapshot.detail[0] & 0xfU) != 0
+                    || (snapshot.detail[2] & 0x7U) != 0;
+                if (operation.record_kind == RecordKind::Operation
+                    && operation.phase == static_cast<u32>(
+                        OperationPhase::ReadyPublished)
+                    && !scheduler_pending) {
+                    scratch.classification = StallClass::LostWake;
+                    lost_wake = true;
+                }
             }
-            if (operation.record_kind == RecordKind::Operation
-                && operation.phase == operation_ready_phase) {
-                scratch.classification = StallClass::LostWake;
-                return true;
+            next = snapshot.waiter_key
+                ? NodeRef::observation(snapshot.waiter_key)
+                : snapshot.driver;
+            if (!next && snapshot.blocker.kind != NodeRef::Kind::None) {
+                next = snapshot.blocker;
             }
+        } else if (current.kind == NodeRef::Kind::Cpu
+            || current.kind == NodeRef::Kind::CpuSet) {
+            next = cpu.wait ? NodeRef::observation(
+                ObservationKey{cpu.wait}) : cpu.driver;
         }
-
-        ObservationKey next = snapshot.waiter_key;
-        if (!next && snapshot.driver.kind == NodeRef::Kind::Observation) {
-            next = ObservationKey{snapshot.driver.identity};
-            if (!next || next.generation() != snapshot.driver.generation) {
-                scratch.classification = StallClass::Inconclusive;
-                return false;
+        if (done || !next) {
+            if (!done && !lost_wake
+                && (current.kind == NodeRef::Kind::Observation
+                    || current.kind == NodeRef::Kind::CpuSet)) {
+                scratch.classification = terminal_class(snapshot, false);
+            } else if (!done && !lost_wake
+                && current.kind == NodeRef::Kind::External) {
+                // An external node is a terminal driver, not a classification
+                // by itself. Preserve the obligation's policy and wait kind;
+                // otherwise every finite Grant/Resource operation would be
+                // mislabeled as an unbounded external wait merely because its
+                // service actor is outside the bounded graph.
+                scratch.classification = have_last_observation
+                    ? terminal_class(last_observation, false)
+                    : StallClass::ExternalWait;
+            } else if (!done && !lost_wake
+                && current.kind != NodeRef::Kind::Cpu) {
+                scratch.classification = StallClass::ExternalWait;
+            } else if (!done && !lost_wake) {
+                scratch.classification = StallClass::UnclassifiedCpuStall;
             }
-        }
-        if (!next) {
-            scratch.classification = terminal_class(snapshot, livelock);
-            return true;
+            done = true;
+            break;
         }
         current = next;
     }
-    scratch.truncated = true;
-    scratch.classification = StallClass::Truncated;
-    return true;
+
+    if (!done) {
+        scratch.truncated = true;
+        scratch.classification = StallClass::Truncated;
+    }
+
+    // Re-read every node after the path is built.  A graph is evidence only
+    // when all nodes survived one coherent diagnostic era.
+    for (usize index = 0; index < scratch.count; ++index) {
+        ObservationSnapshot observation{};
+        CpuLive::WaitSnapshot cpu{};
+        u64 fingerprint{};
+        if (!read_node(
+                scratch.node(index), observation, cpu, fingerprint)
+            || fingerprint != scratch.fingerprints[index]) {
+            scratch.classification = StallClass::Inconclusive;
+            return false;
+        }
+    }
+    return scratch.classification != StallClass::Inconclusive;
 #else
     static_cast<void>(root);
     static_cast<void>(scratch);
     return false;
 #endif
+}
+
+auto analyze(
+    ObservationKey root,
+    WaitGraphScratch& scratch) noexcept -> bool {
+    return analyze(NodeRef::observation(root), scratch);
 }
 
 auto stall_class_name(StallClass value) noexcept -> const char* {
@@ -2223,11 +2935,23 @@ void CpuWaitScope::observe(u64 semantic_stamp) noexcept {
         return;
     }
     if (!observed_ || semantic_stamp != last_stamp_) {
-        observation_->observe(semantic_stamp);
+        // The borrowed observation belongs to the operation/service owner.
+        // Polling this CPU-local wait must not advance that owner's semantic
+        // progress or make its published phase look newer than canonical
+        // state.  An owned scope is itself the observation owner.
+        if (observation_ == &owned_) {
+            observation_->observe(semantic_stamp);
+        } else {
+            observe_wait(semantic_stamp);
+        }
         last_stamp_ = semantic_stamp;
         observed_ = true;
     } else {
-        observation_->touch(site_);
+        if (observation_ == &owned_) {
+            observation_->touch(site_);
+        } else {
+            observe_wait(semantic_stamp);
+        }
     }
 }
 

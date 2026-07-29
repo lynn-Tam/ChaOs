@@ -19,6 +19,12 @@ namespace kernel::cap {
 
 class CSpace;
 
+struct GrantServiceResult final {
+    usize processed{};
+    bool more{};
+    u64 epoch{};
+};
+
 class GrantGraph final : private libk::noncopyable_nonmovable {
 public:
     using WorkNotifier = libk::delegate<void() noexcept>;
@@ -98,7 +104,7 @@ public:
     [[nodiscard]] auto state(GrantKey key) const noexcept
         -> libk::Expected<GrantState, GrantError>;
     [[nodiscard]] auto live_count() const noexcept -> usize;
-    [[nodiscard]] auto service(usize budget) noexcept -> bool;
+    [[nodiscard]] auto service(usize budget) noexcept -> GrantServiceResult;
     [[nodiscard]] auto work_pending() const noexcept -> bool;
     void bind_work_notifier(WorkNotifier notifier) noexcept;
     void unbind_work_notifier() noexcept;
@@ -267,6 +273,7 @@ private:
     usize page_count_{};
     usize live_nodes_{};
     usize quarantined_slots_{};
+    libk::Atomic<u64> service_epoch_{};
 };
 
 static_assert(GrantGraph::Quota{}.nodes != 0);

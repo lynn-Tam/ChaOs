@@ -16,10 +16,24 @@ namespace {
     return static_cast<u32>(kind);
 }
 
+void increment_sat(libk::Atomic<u64>& value) noexcept {
+    u64 current = value.load<libk::MemoryOrder::Relaxed>();
+    for (;;) {
+        if (current == libk::numeric_limits<u64>::max()) {
+            return;
+        }
+        if (value.compare_exchange_weak<
+                libk::MemoryOrder::Relaxed,
+                libk::MemoryOrder::Relaxed>(current, current + 1)) {
+            return;
+        }
+    }
+}
+
 } // namespace
 
 RemoteRequest::~RemoteRequest() noexcept {
-    KASSERT(!pending_ && !hook_.is_linked());
+    KASSERT(!pending() && !hook_.is_linked());
     KASSERT(owner_ != nullptr);
 }
 
@@ -28,14 +42,13 @@ void RemoteQueue::post(RemoteRequest& request) noexcept {
     u64 generation{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (request.pending_) {
+        if (request.pending()) {
             publish_summary();
         } else {
-            request.pending_ = true;
+            request.pending_.store<libk::MemoryOrder::Release>(true);
+            increment_sat(summary_.post_epoch);
             generation = summary_.post_epoch.load<libk::MemoryOrder::Relaxed>();
-            generation = generation == libk::numeric_limits<u64>::max()
-                ? 1 : generation + 1;
-            summary_.post_epoch.store<libk::MemoryOrder::Relaxed>(generation);
+            ++pending_count_;
             const u64 tick = now();
             queue_.push_back(request);
             delivery_.publish();
@@ -111,8 +124,7 @@ auto RemoteQueue::take() noexcept -> RemoteRequest* {
             if (queue_.empty()) {
                 delivery_.consume();
             }
-            static_cast<void>(summary_.take_epoch.fetch_add<
-                libk::MemoryOrder::Relaxed>(1));
+            increment_sat(summary_.take_epoch);
             summary_.last_take.store<libk::MemoryOrder::Release>(now());
         }
         publish_summary();
@@ -132,10 +144,11 @@ auto RemoteQueue::take() noexcept -> RemoteRequest* {
 void RemoteQueue::complete(RemoteRequest& request) noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        KASSERT(request.pending_ && !request.hook_.is_linked());
-        request.pending_ = false;
-        static_cast<void>(summary_.complete_epoch.fetch_add<
-            libk::MemoryOrder::Relaxed>(1));
+        KASSERT(request.pending() && !request.hook_.is_linked());
+        request.pending_.store<libk::MemoryOrder::Release>(false);
+        KASSERT(pending_count_ != 0);
+        --pending_count_;
+        increment_sat(summary_.complete_epoch);
         publish_summary();
     }
     diag::concurrency::record(
@@ -151,13 +164,15 @@ auto RemoteQueue::cancel(RemoteRequest& request) noexcept -> RemoteCancel {
     RemoteCancel result{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (!request.pending_) {
+        if (!request.pending()) {
             result = RemoteCancel::NotPending;
         } else if (!request.hook_.is_linked()) {
             result = RemoteCancel::AlreadyClaimed;
         } else {
             queue_.erase(request);
-            request.pending_ = false;
+            request.pending_.store<libk::MemoryOrder::Release>(false);
+            KASSERT(pending_count_ != 0);
+            --pending_count_;
             if (queue_.empty()) {
                 delivery_.consume();
             }
@@ -186,6 +201,7 @@ auto RemoteQueue::size() const noexcept -> usize {
 
 void RemoteQueue::publish_summary() noexcept {
     summary_.queue_count.store<libk::MemoryOrder::Release>(queue_.size());
+    summary_.pending_count.store<libk::MemoryOrder::Release>(pending_count_);
     if (queue_.empty()) {
         summary_.oldest_kind.store<libk::MemoryOrder::Release>(0);
         summary_.oldest_owner.store<libk::MemoryOrder::Release>(0);

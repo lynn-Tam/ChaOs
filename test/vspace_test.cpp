@@ -187,7 +187,7 @@ public:
         return vspace_test_kernel->aliases();
     }
     void run_work() noexcept {
-        while (vspace_test_work->run(context(), 8)) {}
+        while (vspace_test_work->run(context(), 8).more) {}
     }
 
 private:
@@ -202,7 +202,7 @@ private:
                 auto serviced = space_->service(context());
                 KASSERT(serviced);
             }
-            while (vspace_test_work->run(context(), 8)) {}
+            while (vspace_test_work->run(context(), 8).more) {}
             space_.reset();
         }
         if (memory_) {
@@ -669,7 +669,7 @@ bool test_sponsored_table_capacity_follows_retirement(
             return false;
         }
     }
-    while (vspace_test_work->run(fixture.context(), 8)) {}
+    while (vspace_test_work->run(fixture.context(), 8).more) {}
     space.reset();
     vspace_test_objects->drain_reclaim();
     if (pool->available() != limit || pool->sponsorship_count() != 0

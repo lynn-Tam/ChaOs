@@ -70,7 +70,14 @@ Notification::Wait::Wait(Notification& owner) noexcept
           &Wait::complete,
           &Wait::read,
           &Wait::release,
-          &Wait::cancel>(*this)) {}
+          &Wait::cancel>(*this)) {
+    relation_.set_policy(
+        diag::concurrency::WaitKind::Notification,
+        diag::concurrency::Expectation::ExternalUnbounded,
+        false,
+        diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&owner), 1));
+}
 
 auto Notification::Wait::idle() const noexcept -> bool {
     return state_.load<libk::MemoryOrder::Acquire>() == State::Idle;
