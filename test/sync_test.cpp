@@ -388,6 +388,86 @@ constinit kernel::diag::concurrency::ObservationPage
     return result;
 }
 
+[[maybe_unused, nodiscard]] auto test_operation_policy_follows_delivery_phase(
+    [[maybe_unused]] const TestContext& context) noexcept -> bool {
+    using namespace kernel::diag::concurrency;
+    bool result = false;
+    {
+        ObservationShard& shard = concurrency_test_shard.emplace();
+        shard.initialize(kernel::CpuId{3});
+        ObservationLease operation = shard.reserve(
+            RecordKind::Operation,
+            0x5050,
+            7,
+            Expectation::ExternalUnbounded,
+            SourceSite::current());
+        do {
+            if (!operation) {
+                break;
+            }
+            const OperationPolicy policy{
+                .kind = WaitKind::ChannelReceive,
+                .expectation = Expectation::ExternalUnbounded,
+                .driver = NodeRef::external(0x77, 7),
+                .deadline = 1234,
+                .grace = 55,
+                .action = StallAction::Report,
+            };
+            operation.set_policy(policy);
+            operation.publish(OperationPhase::Attached, policy.driver);
+
+            const u64 mask = u64{1} << operation.key().slot();
+            ObservationSnapshot snapshot{};
+            if (!operation.snapshot(snapshot)
+                || snapshot.phase
+                    != static_cast<u32>(OperationPhase::Attached)
+                || snapshot.wait_kind != WaitKind::ChannelReceive
+                || snapshot.expectation != Expectation::ExternalUnbounded
+                || snapshot.policy.kind != policy.kind
+                || snapshot.policy.deadline != policy.deadline
+                || snapshot.policy.grace != policy.grace
+                || snapshot.policy.action != policy.action
+                || snapshot.driver != policy.driver
+                || (shard.watched() & mask) != 0) {
+                break;
+            }
+
+            const NodeRef producer = NodeRef::cpu(kernel::CpuId{1});
+            operation.publish(OperationPhase::Claimed, producer);
+            if (!operation.snapshot(snapshot)
+                || snapshot.wait_kind != WaitKind::CompletionPublication
+                || snapshot.expectation != Expectation::InternalFinite
+                || snapshot.driver != producer
+                || (shard.watched() & mask) == 0) {
+                break;
+            }
+
+            operation.publish(OperationPhase::WakeIssued, producer);
+            if (!operation.snapshot(snapshot)
+                || snapshot.wait_kind != WaitKind::CompletionDelivery
+                || snapshot.expectation != Expectation::InternalFinite
+                || (shard.watched() & mask) == 0) {
+                break;
+            }
+
+            const NodeRef actor = NodeRef::observation(
+                ObservationKey::make(kernel::CpuId{2}, 4, 9));
+            operation.publish(OperationPhase::ReadyPublished, actor);
+            result = operation.snapshot(snapshot)
+                && snapshot.wait_kind == WaitKind::SchedulerReady
+                && snapshot.expectation == Expectation::SchedulerControlled
+                && snapshot.driver == actor
+                && snapshot.policy.kind == policy.kind
+                && snapshot.policy.deadline == policy.deadline
+                && (shard.watched() & mask) != 0;
+            operation.finish(
+                static_cast<u32>(OperationPhase::Finished), 0);
+        } while (false);
+    }
+    concurrency_test_shard.reset();
+    return result;
+}
+
 [[maybe_unused, nodiscard]] auto test_wait_graph_is_bounded_and_generation_checked(
     [[maybe_unused]] const TestContext& context) noexcept -> bool {
     using namespace kernel::diag::concurrency;
@@ -579,6 +659,10 @@ void register_sync_tests(TestRegistry& registry) noexcept {
         "concurrency",
         "ephemeral observations cannot consume actor capacity",
         test_observation_actor_capacity_is_reserved);
+    (void)registry.add(
+        "concurrency",
+        "operation policy follows canonical delivery phases",
+        test_operation_policy_follows_delivery_phase);
     (void)registry.add(
         "concurrency",
         "bounded wait graph detects cycles and orphan obligations",

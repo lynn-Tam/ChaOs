@@ -135,12 +135,12 @@ Channel::Waiter::Waiter(Channel& channel) noexcept
           &Waiter::release,
           &Waiter::cancel,
           &Waiter::resume>(*this)) {
-    completion.set_policy(
-        diag::concurrency::WaitKind::ChannelReceive,
-        diag::concurrency::Expectation::ExternalUnbounded,
-        false,
-        diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&channel), 1));
+    completion.set_policy(diag::concurrency::OperationPolicy{
+        .kind = diag::concurrency::WaitKind::ChannelReceive,
+        .expectation = diag::concurrency::Expectation::ExternalUnbounded,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&channel), 1),
+    });
 }
 
 Channel::Waiter::~Waiter() noexcept {

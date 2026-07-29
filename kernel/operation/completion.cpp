@@ -23,14 +23,6 @@ namespace {
         : diag::concurrency::NodeRef::cpu(cpu.descriptor->logical_id());
 }
 
-constexpr u32 operation_attached = static_cast<u32>(
-    diag::concurrency::OperationPhase::Attached);
-constexpr u32 operation_claimed = static_cast<u32>(
-    diag::concurrency::OperationPhase::Claimed);
-constexpr u32 operation_wake_issued = static_cast<u32>(
-    diag::concurrency::OperationPhase::WakeIssued);
-constexpr u32 operation_ready = static_cast<u32>(
-    diag::concurrency::OperationPhase::ReadyPublished);
 constexpr u32 operation_finished = static_cast<u32>(
     diag::concurrency::OperationPhase::Finished);
 constexpr u32 operation_cancelled = static_cast<u32>(
@@ -43,31 +35,32 @@ Completion::~Completion() noexcept {
     KASSERT(!attached());
 }
 
-void Completion::attach(Wait& wait) noexcept {
+void Completion::attach(Wait& wait, sched::Binding& binding) noexcept {
     KASSERT(!attached());
     // Wait is the sole caller and publishes its completion_ edge while
     // holding Wait::lock_. Do not call back into Wait here: attached() takes
     // that same non-recursive lock and would self-deadlock the admission path.
-    sink_.template emplace<BlockingSink>(BlockingSink{&wait});
+    sink_.template emplace<BlockingSink>(BlockingSink{&wait, &binding});
     // The waiter is a consumer edge.  It cannot also be the operation's
     // producer without manufacturing an Execution -> Operation -> Execution
     // cycle. The configured producer/service edge is replaced by the
     // producer CPU once delivery is claimed.
-    const auto driver = initial_driver_
-        ? initial_driver_
+    const auto driver = policy_.driver
+        ? policy_.driver
         : diag::concurrency::NodeRef::external(
               reinterpret_cast<u64>(owner_), 1);
+    if (policy_.grace == 0) {
+        policy_.grace =
+            diag::concurrency::default_grace(policy_.expectation);
+    }
     observation_ = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         1,
-        expectation_);
-    observation_.transition(
-        operation_attached,
-        static_cast<u64>(operation_attached),
-        wait_kind_,
-        driver);
-    observation_.watch(watch_);
+        policy_.expectation);
+    observation_.set_policy(policy_);
+    observation_.publish(
+        diag::concurrency::OperationPhase::Attached, driver);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -78,21 +71,22 @@ void Completion::attach(
     KASSERT(!attached() && key.valid());
     KASSERT(vproc.binding() != nullptr);
     sink_.template emplace<VprocSink>(VprocSink{&vproc, &cpus, key});
-    const auto driver = initial_driver_
-        ? initial_driver_
+    const auto driver = policy_.driver
+        ? policy_.driver
         : diag::concurrency::NodeRef::external(
               reinterpret_cast<u64>(owner_), key.generation());
+    if (policy_.grace == 0) {
+        policy_.grace =
+            diag::concurrency::default_grace(policy_.expectation);
+    }
     observation_ = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         key.generation(),
-        expectation_);
-    observation_.transition(
-        operation_attached,
-        static_cast<u64>(operation_attached),
-        wait_kind_,
-        driver);
-    observation_.watch(watch_);
+        policy_.expectation);
+    observation_.set_policy(policy_);
+    observation_.publish(
+        diag::concurrency::OperationPhase::Attached, driver);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -107,11 +101,7 @@ void Completion::signal() noexcept {
         return;
     }
     const auto cpu = current_cpu_node();
-    observation_.transition(
-        operation_claimed,
-        static_cast<u64>(operation_claimed),
-        diag::concurrency::WaitKind::CompletionPublication,
-        cpu);
+    observation_.publish(diag::concurrency::OperationPhase::Claimed, cpu);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationClaimed,
@@ -124,20 +114,17 @@ void Completion::signal() noexcept {
     if (auto* const blocking = libk::get_if<BlockingSink>(&sink_)) {
         KASSERT(blocking->wait != nullptr);
         blocking->wait->wake();
-        observation_.transition(
-            operation_wake_issued,
-            static_cast<u64>(operation_wake_issued),
-            diag::concurrency::WaitKind::CompletionPublication,
-            cpu);
+        observation_.publish(
+            diag::concurrency::OperationPhase::WakeIssued, cpu);
         // Delivery is the canonical Completion state.  Only after this
         // release may the diagnostic projection claim that readiness was
         // published.
         delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
-        observation_.transition(
-            operation_ready,
-            static_cast<u64>(operation_ready),
-            diag::concurrency::WaitKind::None,
-            cpu);
+        const auto driver = blocking->binding != nullptr
+            ? blocking->binding->actor_ref()
+            : diag::concurrency::NodeRef{};
+        observation_.publish(
+            diag::concurrency::OperationPhase::ReadyPublished, driver);
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Operation,
             diag::concurrency::FlightEvent::OperationReady,
@@ -165,6 +152,23 @@ void Completion::signal() noexcept {
         cpu.identity,
         observation);
 }
+
+#if MYOS_CONCURRENCY_PROBE
+auto Completion::claim_for_probe() noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when the external fault harness can pause
+    // signal() immediately after the canonical Claimed transition.
+    Delivery expected = Delivery::Attached;
+    if (!delivery_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+        return false;
+    }
+    const auto cpu = current_cpu_node();
+    observation_.publish(diag::concurrency::OperationPhase::Claimed, cpu);
+    return true;
+}
+#endif
 
 void Completion::finish(arch::TrapContext& trap) noexcept {
     KASSERT(complete());

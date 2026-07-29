@@ -134,12 +134,12 @@ GrantRevokeWait::GrantRevokeWait(GrantGraph& graph) noexcept
           &GrantRevokeWait::read,
           &GrantRevokeWait::release,
           &GrantRevokeWait::cancel>(*this)) {
-    relation_.set_policy(
-        diag::concurrency::WaitKind::GrantWork,
-        diag::concurrency::Expectation::InternalFinite,
-        true,
-        diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&graph), 1));
+    relation_.set_policy(diag::concurrency::OperationPolicy{
+        .kind = diag::concurrency::WaitKind::GrantWork,
+        .expectation = diag::concurrency::Expectation::InternalFinite,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&graph), 1),
+    });
 }
 
 void GrantRevokeWait::ready() noexcept {

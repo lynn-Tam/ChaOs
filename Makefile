@@ -722,31 +722,50 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=trace _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
 # The trace profile currently has a baseline 1984-byte validate_graph frame
 # against the production 1792-byte audit bound. Runtime evidence remains
 # independently runnable while that pre-existing audit failure stays visible.
-_run-concurrency-probe: $(TARGET)
+_run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
 	@case "$(CONCURRENCY_PROBE)" in \
 		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
 		2) evidence="concurrency-probe: stage-a storage-ok cpus=$(QEMU_SMP)";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1 or 2"; exit 1;; \
+		3) evidence="concurrency-probe: stage-b external-ok";; \
+		4) evidence="concurrency-probe: stage-b claimed-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1, 2, 3 or 4"; exit 1;; \
 	esac; \
+	initrd=""; \
+	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
+		|| [ "$(CONCURRENCY_PROBE)" = 4 ]; then \
+		initrd="-initrd $(BOOT_BUNDLE)"; \
+	fi; \
 	set +e; \
 	output=$$(mktemp); \
-	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) $$initrd > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
 	if [ $$status -ne 124 ] \
 		|| ! rg -q "$$evidence" "$$output" \
 		|| rg -q "concurrency-probe: stage-a fail" "$$output"; then \
-		echo "[concurrency-probe] FAIL: Stage A scenario evidence missing"; \
+		echo "[concurrency-probe] FAIL: scenario evidence missing"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
+		&& rg -q "\\[concurrency\\] watchdog confirmed" "$$output"; then \
+		echo "[concurrency-probe] FAIL: external Attached was reported"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 4 ] \
+		&& ! rg -q "\\[concurrency\\] watchdog confirmed" "$$output"; then \
+		echo "[concurrency-probe] FAIL: Claimed publication was not reported"; \
 		rm -f "$$output"; \
 		exit 1; \
 	fi; \
 	rm -f "$$output"; \
-	echo "[concurrency-probe] OK: Stage A scenarios passed on $(QEMU_SMP) harts"
+	echo "[concurrency-probe] OK: scenario $(CONCURRENCY_PROBE) passed on $(QEMU_SMP) harts"
 
 debug: $(TARGET) audit-boot-stack
 	@echo "debug: waiting for GDB on $(GDB_HOST):$(GDB_PORT)"

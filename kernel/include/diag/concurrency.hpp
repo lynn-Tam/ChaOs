@@ -144,6 +144,7 @@ enum class WaitKind : u8 {
     None,
     SpinLock,
     CompletionPublication,
+    CompletionDelivery,
     OperationCompletion,
     RemoteRequest,
     IpiDelivery,
@@ -186,6 +187,24 @@ enum class Expectation : u8 {
     SchedulerControlled,
     Idle,
     ObserveOnly,
+};
+
+enum class StallAction : u8 {
+    Record,
+    Report,
+    Fatal,
+};
+
+// Immutable policy projected by one attached Completion generation.
+// Completion owns the descriptor; observations retain only a bounded copy
+// for cross-CPU analysis after the producer has left the call site.
+struct OperationPolicy final {
+    WaitKind kind{WaitKind::External};
+    Expectation expectation{Expectation::ExternalUnbounded};
+    NodeRef driver{};
+    u64 deadline{};
+    u64 grace{};
+    StallAction action{StallAction::Report};
 };
 
 // Operation delivery is the diagnostic projection of Completion's canonical
@@ -344,6 +363,10 @@ struct ObservationRecord final {
     libk::Atomic<u32> phase{};
     libk::Atomic<u32> wait_kind{};
     libk::Atomic<u32> expectation{};
+    // low bytes: operation kind, attached expectation, action, driver kind.
+    libk::Atomic<u32> policy_kinds{};
+    libk::Atomic<u64> policy_driver_key{};
+    libk::Atomic<u64> policy_driver_generation{};
 
     libk::Atomic<u64> subject_identity{};
     libk::Atomic<u64> subject_generation{};
@@ -356,6 +379,8 @@ struct ObservationRecord final {
     libk::Atomic<u32> blocker_kind{};
     libk::Atomic<u64> blocker_generation{};
     libk::Atomic<u64> semantic_stamp{};
+    libk::Atomic<u64> deadline{};
+    libk::Atomic<u64> grace{};
 
     libk::Atomic<usize> site_file{};
     libk::Atomic<usize> site_function{};
@@ -386,6 +411,7 @@ struct ObservationSnapshot final {
     u32 phase{};
     WaitKind wait_kind{};
     Expectation expectation{};
+    OperationPolicy policy{};
     u64 subject_identity{};
     u64 subject_generation{};
     ObservationKey parent_key{};
@@ -494,6 +520,18 @@ public:
         WaitKind wait,
         NodeRef driver,
         NodeRef blocker = {},
+        SourceSite site = SourceSite::current()) noexcept;
+    void set_policy(
+        OperationPolicy policy,
+        SourceSite site = SourceSite::current()) noexcept;
+    void publish(
+        OperationPhase phase,
+        NodeRef driver,
+        NodeRef blocker = {},
+        SourceSite site = SourceSite::current()) noexcept;
+    void deadline(
+        u64 absolute,
+        u64 grace = 0,
         SourceSite site = SourceSite::current()) noexcept;
     // Update only the phase and semantic progress.  Existing wait/driver
     // metadata remains intact, which lets an actor change scheduler state
@@ -638,6 +676,21 @@ private:
         WaitKind kind,
         NodeRef driver,
         SourceSite site) noexcept -> bool;
+    [[nodiscard]] auto write_policy(
+        ObservationKey key,
+        OperationPolicy policy,
+        SourceSite site) noexcept -> bool;
+    [[nodiscard]] auto publish_operation(
+        ObservationKey key,
+        OperationPhase phase,
+        NodeRef driver,
+        NodeRef blocker,
+        SourceSite site) noexcept -> bool;
+    void write_deadline(
+        ObservationKey key,
+        u64 absolute,
+        u64 grace,
+        SourceSite site) noexcept;
     [[nodiscard]] auto update_progress(
         ObservationKey key,
         u64 semantic_stamp,
@@ -865,6 +918,7 @@ struct DiagnosticStatus final {
         WaitStackOverflow = 1U << 13,
         ObservationLeaseCorrupt = 1U << 14,
         RemoteShardUnavailable = 1U << 15,
+        PolicyMissing = 1U << 16,
     };
 };
 
@@ -948,6 +1002,7 @@ void clear_wait(WaitToken token) noexcept;
     NodeRef driver,
     SourceSite site = SourceSite::current()) noexcept -> bool;
 void observe_wait(WaitToken token, u64 semantic_stamp) noexcept;
+[[nodiscard]] auto default_grace(Expectation expectation) noexcept -> u64;
 void mark_degraded(DiagnosticStatus::Flag flag) noexcept;
 void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
 [[nodiscard]] auto analyze(

@@ -2,6 +2,7 @@
 
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
+#include <arch/interrupt.hpp>
 #include <arch/ipi.hpp>
 #include <arch/trap.hpp>
 #include <diag/console.hpp>
@@ -10,6 +11,7 @@
 #include <core/debug.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <init/run.hpp>
 #include <libk/utility.hpp>
 #include <mm/direct_map.hpp>
 #include <arch/cpu.hpp>
@@ -148,11 +150,27 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
 
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+        //Confirmatory experiment.
+        // Exit condition: remove with the Stage B operation fault probes.
+        KASSERT(init::run_concurrency_probe(
+            *runtime.owner_registry, MYOS_CONCURRENCY_PROBE));
+#endif
         print_snapshot(*runtime.owner_registry);
         if constexpr (sync::lock_trace) {
             sync::dump_diagnostics();
         }
         diag::console::print<"runtime: entered\n">();
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+        //Confirmatory experiment.
+        // Exit condition: remove with the Stage B operation fault probes.
+        // Their synthetic Wait edge is intentionally non-resumable, so keep
+        // the root task out of normal execution for the observation window.
+        static_cast<void>(arch::disable_interrupts());
+        for (;;) {
+            arch::wait_for_interrupt();
+        }
+#endif
 #if MYOS_PANIC_PROBE
         //Confirmatory experiment.
         // Exit condition: remove once panic-owner/peer-stop behavior is

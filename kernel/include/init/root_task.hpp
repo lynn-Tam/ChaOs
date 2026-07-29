@@ -71,6 +71,14 @@ public:
         -> const kernel::object::ObjectStore::MemoryHold& {
         return image_;
     }
+#if MYOS_CONCURRENCY_PROBE
+    //Confirmatory experiment.
+    // Exit condition: remove when the external scenario runner can create a
+    // real blocked syscall operation and pause its producer.
+    [[nodiscard]] auto run_concurrency_probe(
+        kernel::CpuRegistry& cpus,
+        u32 probe) noexcept -> bool;
+#endif
 
 private:
     [[nodiscard]] auto reserve(kernel::resource::Budget charge) noexcept

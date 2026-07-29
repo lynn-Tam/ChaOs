@@ -13,6 +13,8 @@
 #include <mm/memory_object.hpp>
 #include <mm/object_range.hpp>
 #include <mm/virtual_layout.hpp>
+#include <operation/completion.hpp>
+#include <operation/wait.hpp>
 #include <mm/vspace.hpp>
 #include <resource/traits.hpp>
 #include <sched/context.hpp>
@@ -31,6 +33,42 @@ constexpr kernel::mm::VirtAddr root_info_address{
     kernel::mm::layout::UserEnd - 2 * kernel::mm::page_size};
 constexpr kernel::mm::VirtAddr root_stack_address{
     root_info_address.raw() - kernel::mm::page_size - root_stack_size};
+
+#if MYOS_CONCURRENCY_PROBE
+//Confirmatory experiment.
+// Exit condition: remove this owner/wait storage with
+// RootTask::run_concurrency_probe() when the external scenario runner can
+// pause a real syscall Completion after claim.
+struct CompletionProbe final {
+    CompletionProbe() noexcept
+        : completion(kernel::operation::Completion::bind<
+              CompletionProbe,
+              &CompletionProbe::complete,
+              &CompletionProbe::read,
+              &CompletionProbe::release,
+              &CompletionProbe::cancel>(*this)) {
+        completion.set_policy(kernel::diag::concurrency::OperationPolicy{
+            .kind = kernel::diag::concurrency::WaitKind::ChannelReceive,
+            .expectation =
+                kernel::diag::concurrency::Expectation::ExternalUnbounded,
+            .driver = kernel::diag::concurrency::NodeRef::external(
+                reinterpret_cast<u64>(this), 1),
+        });
+    }
+
+    [[nodiscard]] auto complete() const noexcept -> bool { return false; }
+    [[nodiscard]] auto read() noexcept -> kernel::operation::Result {
+        return {};
+    }
+    void release() noexcept {}
+    [[nodiscard]] auto cancel() noexcept -> bool { return false; }
+
+    kernel::operation::Completion completion;
+};
+
+constinit libk::ManualLifetime<CompletionProbe> completion_probe{};
+constinit libk::ManualLifetime<kernel::operation::Wait> completion_probe_wait{};
+#endif
 
 [[nodiscard]] constexpr auto charge_pages(
     usize pages,
@@ -677,6 +715,80 @@ auto RootTask::start(
     started_ = true;
     return libk::expected();
 }
+
+#if MYOS_CONCURRENCY_PROBE
+auto RootTask::run_concurrency_probe(
+    kernel::CpuRegistry& cpus,
+    u32 probe) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when the external scenario runner can create a
+    // real blocked syscall operation and pause its producer.
+    if ((probe != 3 && probe != 4) || !started_ || !thread_
+        || completion_probe || completion_probe_wait) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=1\n">();
+        return false;
+    }
+    sched::Binding* const binding = thread_->binding();
+    if (binding == nullptr) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=2\n">();
+        return false;
+    }
+    CompletionProbe& owner = completion_probe.emplace();
+    operation::Wait& wait = completion_probe_wait.emplace();
+    if (!wait.begin(owner.completion, cpus, *binding)) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=3\n">();
+        return false;
+    }
+
+    if (probe == 4 && !owner.completion.claim_for_probe()) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=4\n">();
+        return false;
+    }
+    diag::concurrency::ObservationLease observation =
+        diag::concurrency::ObservationLease::borrow(
+            owner.completion.observation_key());
+    diag::concurrency::ObservationSnapshot snapshot{};
+    if (!observation || !observation.snapshot(snapshot)) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=5\n">();
+        return false;
+    }
+    const bool claimed = probe == 4;
+    const bool phase_ok = snapshot.phase == static_cast<u32>(
+        claimed ? diag::concurrency::OperationPhase::Claimed
+                : diag::concurrency::OperationPhase::Attached);
+    const bool policy_ok = snapshot.policy.kind
+            == diag::concurrency::WaitKind::ChannelReceive
+        && snapshot.policy.expectation
+            == diag::concurrency::Expectation::ExternalUnbounded
+        && snapshot.expectation
+            == (claimed
+                ? diag::concurrency::Expectation::InternalFinite
+                : diag::concurrency::Expectation::ExternalUnbounded)
+        && snapshot.wait_kind
+            == (claimed
+                ? diag::concurrency::WaitKind::CompletionPublication
+                : diag::concurrency::WaitKind::ChannelReceive);
+    const auto* const shard = cpus.observations(
+        owner.completion.observation_key().shard());
+    const u64 mask = u64{1} << owner.completion.observation_key().slot();
+    const bool watched = shard != nullptr && (shard->watched() & mask) != 0;
+    if (!phase_ok || !policy_ok || watched != claimed) {
+        diag::console::print<
+            "concurrency-probe: stage-b setup-fail=6 phase={} policy={} watched={}\n">(
+            phase_ok, policy_ok, watched);
+        return false;
+    }
+    // The probe permanently owns this binding's synthetic Wait edge and stops
+    // before first dispatch. Exclude that deliberately frozen Ready actor so
+    // the observation window measures only the operation policy under test.
+    binding->suppress_actor_for_probe();
+    diag::console::print<
+        "concurrency-probe: stage-b {}-ok key={:#x}\n">(
+        claimed ? "claimed" : "external",
+        owner.completion.observation_key().raw);
+    return true;
+}
+#endif
 
 void RootTask::rollback(kernel::KernelState& kernel) noexcept {
     if (context_) {

@@ -77,11 +77,6 @@ public:
         diag::concurrency::SourceSite site =
             diag::concurrency::SourceSite::current()) noexcept {
         ensure_actor(site);
-        actor_.phase(static_cast<u32>(state), static_cast<u64>(state), site);
-        actor_.watch(
-            state == ExecutionState::Ready
-            || state == ExecutionState::Throttled
-            || state == ExecutionState::Blocked);
         publish_projection();
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Scheduler,
@@ -108,7 +103,17 @@ public:
         diag::concurrency::SourceSite site =
             diag::concurrency::SourceSite::current()) noexcept {
         actor_.clear_wait(site);
+        publish_actor();
     }
+
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+    //Confirmatory experiment.
+    // Exit condition: remove when operation fault injection no longer borrows
+    // a real Ready binding before its first dispatch.
+    void suppress_actor_for_probe() noexcept {
+        actor_.watch(false);
+    }
+#endif
 
 private:
     friend class ReadyQueue;
@@ -133,6 +138,61 @@ private:
             | (stop_.pending() ? 4U : 0U);
         actor_.detail(2, remote);
         actor_.detail(3, home_cpu_.raw);
+        publish_actor();
+    }
+
+    void publish_actor() noexcept {
+        using diag::concurrency::Expectation;
+        using diag::concurrency::NodeRef;
+        using diag::concurrency::WaitKind;
+
+        const ExecutionState state = execution().state();
+        const auto site = diag::concurrency::SourceSite::current();
+        const auto home = NodeRef::cpu(home_cpu_);
+        const u32 phase = static_cast<u32>(state);
+        const u64 stamp = static_cast<u64>(state);
+        switch (state) {
+        case ExecutionState::Ready:
+            actor_.deadline(0);
+            actor_.transition(
+                phase, stamp, WaitKind::SchedulerReady, home, {}, site);
+            actor_.watch(true);
+            return;
+        case ExecutionState::Throttled:
+            actor_.deadline(
+                timer_queued() ? timer_deadline_.ticks() : 0,
+                diag::concurrency::default_grace(
+                    Expectation::SchedulerControlled),
+                site);
+            actor_.transition(
+                phase, stamp, WaitKind::SchedulerRefill, home, {}, site);
+            actor_.watch(timer_queued());
+            return;
+        case ExecutionState::Blocked:
+            actor_.phase(phase, stamp, site);
+            actor_.watch(true);
+            return;
+        case ExecutionState::Parked:
+            actor_.deadline(0);
+            actor_.transition(
+                phase,
+                stamp,
+                activation_credit_ ? WaitKind::SchedulerActivation
+                                   : WaitKind::None,
+                activation_credit_ ? home : NodeRef{},
+                {},
+                site);
+            actor_.watch(activation_credit_);
+            return;
+        case ExecutionState::Prepared:
+        case ExecutionState::Running:
+        case ExecutionState::Exited:
+            actor_.deadline(0);
+            actor_.transition(
+                phase, stamp, WaitKind::None, {}, {}, site);
+            actor_.watch(false);
+            return;
+        }
     }
 
     void ensure_actor(diag::concurrency::SourceSite site) noexcept {

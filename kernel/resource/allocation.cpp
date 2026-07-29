@@ -39,12 +39,12 @@ CloseWait::CloseWait(kernel::cap::GrantGraph& graph) noexcept
           &CloseWait::read,
           &CloseWait::release,
           &CloseWait::cancel>(*this)) {
-    relation_.set_policy(
-        diag::concurrency::WaitKind::ResourceChildren,
-        diag::concurrency::Expectation::InternalFinite,
-        true,
-        diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&graph), 1));
+    relation_.set_policy(diag::concurrency::OperationPolicy{
+        .kind = diag::concurrency::WaitKind::ResourceChildren,
+        .expectation = diag::concurrency::Expectation::InternalFinite,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&graph), 1),
+    });
     completion_.initialize(1);
 }
 

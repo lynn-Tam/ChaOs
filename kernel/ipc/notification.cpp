@@ -71,12 +71,12 @@ Notification::Wait::Wait(Notification& owner) noexcept
           &Wait::read,
           &Wait::release,
           &Wait::cancel>(*this)) {
-    relation_.set_policy(
-        diag::concurrency::WaitKind::Notification,
-        diag::concurrency::Expectation::ExternalUnbounded,
-        false,
-        diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&owner), 1));
+    relation_.set_policy(diag::concurrency::OperationPolicy{
+        .kind = diag::concurrency::WaitKind::Notification,
+        .expectation = diag::concurrency::Expectation::ExternalUnbounded,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&owner), 1),
+    });
 }
 
 auto Notification::Wait::idle() const noexcept -> bool {

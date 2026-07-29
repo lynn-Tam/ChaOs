@@ -5,15 +5,20 @@
 #include <core/types.hpp>
 #include <diag/concurrency.hpp>
 #include <libk/noncopyable.hpp>
+#include <libk/optional.hpp>
 #include <libk/sync/atomic.hpp>
 #include <libk/variant.hpp>
 #include <operation/key.hpp>
+#include <time/time.hpp>
 #include <uapi/status.h>
 
 namespace kernel {
 
 class CpuRegistry;
 class Vproc;
+namespace sched {
+class Binding;
+}
 
 namespace operation {
 
@@ -102,24 +107,29 @@ public:
         return observation_.key();
     }
 
-    // Diagnostic policy is configured by the operation owner, not inferred
-    // from the sink.  A BlockingSink says how delivery reaches a waiter; it
-    // does not say whether the underlying obligation is finite or external.
-    void set_policy(
-        diag::concurrency::WaitKind wait,
-        diag::concurrency::Expectation expectation,
-        bool watch,
-        diag::concurrency::NodeRef driver = {}) noexcept {
+    // The operation owns one policy descriptor. A sink says how completion
+    // reaches a consumer; it does not own timeout or producer policy.
+    void set_policy(diag::concurrency::OperationPolicy policy) noexcept {
         KASSERT(!attached());
-        wait_kind_ = wait;
-        expectation_ = expectation;
-        watch_ = watch;
-        initial_driver_ = driver;
+        policy_ = policy;
+    }
+    void set_deadline(libk::optional<time::Instant> deadline) noexcept {
+        KASSERT(!attached());
+        policy_.deadline = deadline ? deadline->ticks() : 0;
+        policy_.expectation = deadline
+            ? diag::concurrency::Expectation::DeadlineBound
+            : diag::concurrency::Expectation::ExternalUnbounded;
     }
 
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
     void signal() noexcept;
+#if MYOS_CONCURRENCY_PROBE
+    //Confirmatory experiment.
+    // Exit condition: remove when the external fault harness can pause
+    // signal() immediately after the canonical Claimed transition.
+    [[nodiscard]] auto claim_for_probe() noexcept -> bool;
+#endif
 private:
     friend class kernel::Vproc;
     friend class Wait;
@@ -138,7 +148,7 @@ private:
 
     // Called only by Wait::begin after its side of the edge is initialized and
     // while the Wait lock is held. This function must not call back into Wait.
-    void attach(Wait& wait) noexcept;
+    void attach(Wait& wait, sched::Binding& binding) noexcept;
     void attach(
         Vproc& vproc,
         CpuRegistry& cpus,
@@ -161,6 +171,7 @@ private:
     const Ops* ops_{};
     struct BlockingSink final {
         Wait* wait{};
+        sched::Binding* binding{};
     };
     struct VprocSink final {
         Vproc* vproc{};
@@ -172,12 +183,7 @@ private:
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
     diag::concurrency::ObservationLease observation_{};
-    diag::concurrency::WaitKind wait_kind_
-        = diag::concurrency::WaitKind::External;
-    diag::concurrency::Expectation expectation_
-        = diag::concurrency::Expectation::ExternalUnbounded;
-    diag::concurrency::NodeRef initial_driver_{};
-    bool watch_{};
+    diag::concurrency::OperationPolicy policy_{};
 };
 
 } // namespace operation

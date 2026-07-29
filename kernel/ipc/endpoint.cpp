@@ -56,12 +56,12 @@ Call::Call(Endpoint& endpoint) noexcept
           &Call::cancel,
           &Call::resume>(*this)),
       deadline_(sched::Deadline::Callback::bind<&Call::expire>(*this)) {
-    completion_.set_policy(
-        diag::concurrency::WaitKind::EndpointReply,
-        diag::concurrency::Expectation::DeadlineBound,
-        true,
-        diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&endpoint), 1));
+    completion_.set_policy(diag::concurrency::OperationPolicy{
+        .kind = diag::concurrency::WaitKind::EndpointReply,
+        .expectation = diag::concurrency::Expectation::DeadlineBound,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&endpoint), 1),
+    });
 }
 
 Call::~Call() noexcept {
@@ -481,6 +481,7 @@ auto Endpoint::call(
         publisher_done(*call);
         return libk::unexpected(EndpointError::Busy);
     }
+    call->completion_.set_deadline(deadline);
 
     if (activation == nullptr) {
         sched::Binding* const binding = caller.binding();

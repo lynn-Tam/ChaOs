@@ -133,6 +133,14 @@ ObservationKey probe_fillers[ObservationShard::slot_count / 2]{};
     hash = mix_hash(hash, snapshot.phase);
     hash = mix_hash(hash, static_cast<u64>(snapshot.wait_kind));
     hash = mix_hash(hash, static_cast<u64>(snapshot.expectation));
+    hash = mix_hash(hash, static_cast<u64>(snapshot.policy.kind));
+    hash = mix_hash(hash, static_cast<u64>(snapshot.policy.expectation));
+    hash = mix_hash(hash, snapshot.policy.driver.identity);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.policy.driver.kind));
+    hash = mix_hash(hash, snapshot.policy.driver.generation);
+    hash = mix_hash(hash, snapshot.policy.deadline);
+    hash = mix_hash(hash, snapshot.policy.grace);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.policy.action));
     hash = mix_hash(hash, snapshot.subject_identity);
     hash = mix_hash(hash, snapshot.subject_generation);
     hash = mix_hash(hash, snapshot.parent_key.raw);
@@ -165,11 +173,12 @@ void increment_sat(libk::Atomic<u64>& value, u64 delta) noexcept {
 
 #if MYOS_CONCURRENCY_DIAG >= 3
 struct WatchdogThresholds final {
-    u64 soft{};
-    u64 hard{};
+    u64 anchor{};
+    u64 soft_at{};
+    u64 hard_at{};
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
-        return soft != 0 && hard >= soft;
+        return soft_at != 0 && hard_at >= soft_at;
     }
 };
 
@@ -200,18 +209,7 @@ constinit libk::Atomic<u64> stall_owner{
             key.raw,
             static_cast<u32>(state),
             age);
-        diag::fatal(diag::FatalEvent{
-            .facility = diag::Facility::Concurrency,
-            .id = diag::EventId{0x70000001},
-            .arguments = {
-                watcher.raw,
-                target.raw,
-                key.raw,
-                static_cast<u64>(state),
-                age,
-            },
-            .argument_count = 5,
-        });
+        return true;
     }
     return false;
 }
@@ -236,55 +234,112 @@ constinit libk::Atomic<u64> stall_owner{
             "[concurrency] watchdog confirmed cpu-live cpu={} target={} "
             "kind={} age={}\n">(
             watcher.raw, target.raw, kind, age);
-        diag::fatal(diag::FatalEvent{
-            .facility = diag::Facility::Concurrency,
-            .id = diag::EventId{0x70000002},
-            .arguments = {watcher.raw, target.raw, kind, age},
-            .argument_count = 4,
-        });
+        return true;
     }
     return false;
 }
 
 [[nodiscard]] auto thresholds_for(
     const WatchdogPolicy& policy,
-    const ObservationSnapshot& snapshot) noexcept -> WatchdogThresholds {
+    const ObservationSnapshot& snapshot,
+    const ObservationSnapshot* wait_target = nullptr) noexcept
+    -> WatchdogThresholds {
+    if (snapshot.record_kind == RecordKind::ExecutionActor) {
+        const auto state = static_cast<ExecutionState>(snapshot.phase);
+        switch (state) {
+        case ExecutionState::Ready:
+            return {
+                snapshot.last_progress_at,
+                add_sat(snapshot.last_progress_at, policy.scheduler_soft),
+                add_sat(snapshot.last_progress_at, policy.scheduler_hard),
+            };
+        case ExecutionState::Throttled: {
+            const u64 deadline = snapshot.policy.deadline;
+            if (deadline == 0) {
+                return {};
+            }
+            const u64 grace = snapshot.policy.grace != 0
+                ? snapshot.policy.grace : policy.scheduler_hard;
+            return {deadline, deadline, add_sat(deadline, grace)};
+        }
+        case ExecutionState::Blocked:
+            return wait_target == nullptr
+                ? WatchdogThresholds{}
+                : thresholds_for(policy, *wait_target);
+        case ExecutionState::Parked:
+            if (snapshot.wait_kind != WaitKind::SchedulerActivation) {
+                return {};
+            }
+            return {
+                snapshot.last_progress_at,
+                add_sat(snapshot.last_progress_at, policy.scheduler_soft),
+                add_sat(snapshot.last_progress_at, policy.scheduler_hard),
+            };
+        case ExecutionState::Prepared:
+        case ExecutionState::Running:
+        case ExecutionState::Exited:
+            return {};
+        }
+    }
+
     if (snapshot.expectation == Expectation::ExternalUnbounded
         || snapshot.expectation == Expectation::Idle
         || snapshot.expectation == Expectation::ObserveOnly) {
         return {};
     }
 
-    // A watched bit is a cheap directory hint, not proof that an actor is
-    // still waiting.  Binding keeps the bit while an execution is in a
-    // schedulable state, and Completion can publish Ready before its waiter
-    // consumes the result.  Without an active wait edge those states are
-    // normal terminal/projection windows, not watchdog obligations.
-    if (snapshot.wait_kind == WaitKind::None && !snapshot.waiter_key) {
+    if (snapshot.expectation == Expectation::DeadlineBound) {
+        const u64 deadline = snapshot.policy.deadline;
+        if (deadline == 0) {
+            return {};
+        }
+        const u64 grace = snapshot.policy.grace != 0
+            ? snapshot.policy.grace : policy.critical_hard;
+        return {deadline, deadline, add_sat(deadline, grace)};
+    }
+
+    if (snapshot.wait_kind == WaitKind::None
+        || snapshot.wait_kind == WaitKind::OperationCompletion) {
         return {};
     }
 
+    u64 soft{};
+    u64 hard{};
     switch (snapshot.wait_kind) {
     case WaitKind::SpinLock:
     case WaitKind::CompletionPublication:
-    case WaitKind::OperationCompletion:
-        return {policy.critical_soft, policy.critical_hard};
+        soft = policy.critical_soft;
+        hard = policy.critical_hard;
+        break;
+    case WaitKind::CompletionDelivery:
     case WaitKind::RemoteRequest:
     case WaitKind::IpiDelivery:
     case WaitKind::ShootdownAck:
-        return {policy.transport_soft, policy.transport_hard};
+        soft = policy.transport_soft;
+        hard = policy.transport_hard;
+        break;
     case WaitKind::SchedulerReady:
     case WaitKind::SchedulerRefill:
     case WaitKind::SchedulerWake:
     case WaitKind::SchedulerActivation:
-        return {policy.scheduler_soft, policy.scheduler_hard};
+        soft = policy.scheduler_soft;
+        hard = policy.scheduler_hard;
+        break;
     default:
         break;
     }
-    if (snapshot.expectation == Expectation::SchedulerControlled) {
-        return {policy.scheduler_soft, policy.scheduler_hard};
+    if (soft == 0 && snapshot.expectation == Expectation::SchedulerControlled) {
+        soft = policy.scheduler_soft;
+        hard = policy.scheduler_hard;
+    } else if (soft == 0) {
+        soft = policy.service_soft;
+        hard = policy.service_hard;
     }
-    return {policy.service_soft, policy.service_hard};
+    return {
+        snapshot.last_progress_at,
+        add_sat(snapshot.last_progress_at, soft),
+        add_sat(snapshot.last_progress_at, hard),
+    };
 }
 
 #endif
@@ -311,6 +366,9 @@ void clear_record(ObservationRecord& record) noexcept {
     record.phase.store<libk::MemoryOrder::Relaxed>(0);
     record.wait_kind.store<libk::MemoryOrder::Relaxed>(0);
     record.expectation.store<libk::MemoryOrder::Relaxed>(0);
+    record.policy_kinds.store<libk::MemoryOrder::Relaxed>(0);
+    record.policy_driver_key.store<libk::MemoryOrder::Relaxed>(0);
+    record.policy_driver_generation.store<libk::MemoryOrder::Relaxed>(0);
     record.subject_identity.store<libk::MemoryOrder::Relaxed>(0);
     record.subject_generation.store<libk::MemoryOrder::Relaxed>(0);
     record.parent_key.store<libk::MemoryOrder::Relaxed>(0);
@@ -322,6 +380,8 @@ void clear_record(ObservationRecord& record) noexcept {
     record.blocker_kind.store<libk::MemoryOrder::Relaxed>(0);
     record.blocker_generation.store<libk::MemoryOrder::Relaxed>(0);
     record.semantic_stamp.store<libk::MemoryOrder::Relaxed>(0);
+    record.deadline.store<libk::MemoryOrder::Relaxed>(0);
+    record.grace.store<libk::MemoryOrder::Relaxed>(0);
     record.site_file.store<libk::MemoryOrder::Relaxed>(0);
     record.site_function.store<libk::MemoryOrder::Relaxed>(0);
     record.site_line.store<libk::MemoryOrder::Relaxed>(0);
@@ -1007,6 +1067,176 @@ auto ObservationShard::write_wait(
     return true;
 }
 
+auto ObservationShard::write_policy(
+    ObservationKey key,
+    OperationPolicy policy,
+    SourceSite site) noexcept -> bool {
+    ObservationRecord* record{};
+    if (!pin(key, record)) {
+        return false;
+    }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return false;
+    }
+    if (!active(key, *record)) {
+        AtomicSnapshotWriter::end(record->sequence, odd);
+        unpin(key, *record);
+        return false;
+    }
+    const u32 kinds = static_cast<u32>(policy.kind)
+        | (static_cast<u32>(policy.expectation) << 8)
+        | (static_cast<u32>(policy.action) << 16)
+        | (static_cast<u32>(policy.driver.kind) << 24);
+    record->policy_kinds.store<libk::MemoryOrder::Relaxed>(kinds);
+    record->policy_driver_key.store<libk::MemoryOrder::Relaxed>(
+        policy.driver.identity);
+    record->policy_driver_generation.store<libk::MemoryOrder::Relaxed>(
+        policy.driver.generation);
+    record->deadline.store<libk::MemoryOrder::Relaxed>(policy.deadline);
+    record->grace.store<libk::MemoryOrder::Relaxed>(policy.grace);
+    record->site_file.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(site.file));
+    record->site_function.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(site.function));
+    record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+    AtomicSnapshotWriter::end(record->sequence, odd);
+    unpin(key, *record);
+    return true;
+}
+
+auto ObservationShard::publish_operation(
+    ObservationKey key,
+    OperationPhase phase,
+    NodeRef driver,
+    NodeRef blocker,
+    SourceSite site) noexcept -> bool {
+    ObservationRecord* record{};
+    if (!pin(key, record)) {
+        return false;
+    }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return false;
+    }
+    if (!active(key, *record)) {
+        AtomicSnapshotWriter::end(record->sequence, odd);
+        unpin(key, *record);
+        return false;
+    }
+
+    WaitKind wait{};
+    Expectation expectation{};
+    bool watched{true};
+    switch (phase) {
+    case OperationPhase::Attached: {
+        const u32 policy =
+            record->policy_kinds.load<libk::MemoryOrder::Relaxed>();
+        wait = static_cast<WaitKind>(policy & 0xffU);
+        expectation = static_cast<Expectation>((policy >> 8) & 0xffU);
+        watched = expectation != Expectation::ExternalUnbounded
+            && expectation != Expectation::Idle
+            && expectation != Expectation::ObserveOnly;
+        break;
+    }
+    case OperationPhase::Claimed:
+        wait = WaitKind::CompletionPublication;
+        expectation = Expectation::InternalFinite;
+        break;
+    case OperationPhase::WakeIssued:
+        wait = WaitKind::CompletionDelivery;
+        expectation = Expectation::InternalFinite;
+        break;
+    case OperationPhase::ReadyPublished:
+        wait = WaitKind::SchedulerReady;
+        expectation = Expectation::SchedulerControlled;
+        break;
+    case OperationPhase::Finished:
+    case OperationPhase::Cancelled:
+        AtomicSnapshotWriter::end(record->sequence, odd);
+        unpin(key, *record);
+        return false;
+    }
+
+    const u64 tick = now();
+    const u32 encoded_phase = static_cast<u32>(phase);
+    const u32 previous_phase =
+        record->phase.load<libk::MemoryOrder::Relaxed>();
+    increment_sat(record->activity_epoch, 1);
+    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    record->phase.store<libk::MemoryOrder::Relaxed>(encoded_phase);
+    record->wait_kind.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u32>(wait));
+    record->expectation.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u32>(expectation));
+    publish_node(
+        record->driver_key,
+        record->driver_kind,
+        record->driver_generation,
+        driver);
+    publish_node(
+        record->blocker_key,
+        record->blocker_kind,
+        record->blocker_generation,
+        blocker);
+    record->site_file.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(site.file));
+    record->site_function.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(site.function));
+    record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+    record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(encoded_phase);
+    if (previous_phase != encoded_phase) {
+        increment_sat(record->progress_epoch, 1);
+        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+    }
+    AtomicSnapshotWriter::end(record->sequence, odd);
+
+    const u64 mask = bit(key.slot());
+    if (watched) {
+        static_cast<void>(watched_.fetch_or<libk::MemoryOrder::Release>(mask));
+    } else {
+        static_cast<void>(watched_.fetch_and<libk::MemoryOrder::Release>(
+            ~mask));
+    }
+    unpin(key, *record);
+    return true;
+}
+
+void ObservationShard::write_deadline(
+    ObservationKey key,
+    u64 absolute,
+    u64 grace,
+    SourceSite site) noexcept {
+    ObservationRecord* record{};
+    if (!pin(key, record)) {
+        return;
+    }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return;
+    }
+    if (active(key, *record)) {
+        record->deadline.store<libk::MemoryOrder::Relaxed>(absolute);
+        record->grace.store<libk::MemoryOrder::Relaxed>(grace);
+        record->site_file.store<libk::MemoryOrder::Relaxed>(
+            reinterpret_cast<usize>(site.file));
+        record->site_function.store<libk::MemoryOrder::Relaxed>(
+            reinterpret_cast<usize>(site.function));
+        record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
+    }
+    AtomicSnapshotWriter::end(record->sequence, odd);
+    unpin(key, *record);
+}
+
 void ObservationShard::set_watched(
     ObservationKey key,
     bool watched) noexcept {
@@ -1267,6 +1497,22 @@ auto ObservationShard::snapshot(
             record->wait_kind.load<libk::MemoryOrder::Relaxed>());
         value.expectation = static_cast<Expectation>(
             record->expectation.load<libk::MemoryOrder::Relaxed>());
+        const u32 policy =
+            record->policy_kinds.load<libk::MemoryOrder::Relaxed>();
+        value.policy.kind = static_cast<WaitKind>(policy & 0xffU);
+        value.policy.expectation =
+            static_cast<Expectation>((policy >> 8) & 0xffU);
+        value.policy.action =
+            static_cast<StallAction>((policy >> 16) & 0xffU);
+        value.policy.driver = read_node(
+            record->policy_driver_key.load<libk::MemoryOrder::Relaxed>(),
+            (policy >> 24) & 0xffU,
+            record->policy_driver_generation.load<
+                libk::MemoryOrder::Relaxed>());
+        value.policy.deadline =
+            record->deadline.load<libk::MemoryOrder::Relaxed>();
+        value.policy.grace =
+            record->grace.load<libk::MemoryOrder::Relaxed>();
         value.subject_identity = record->subject_identity.load<libk::MemoryOrder::Relaxed>();
         value.subject_generation = record->subject_generation.load<libk::MemoryOrder::Relaxed>();
         value.parent_key = ObservationKey{
@@ -1637,6 +1883,58 @@ void ObservationLease::transition(
     static_cast<void>(wait);
     static_cast<void>(driver);
     static_cast<void>(blocker);
+    static_cast<void>(site);
+#endif
+}
+
+void ObservationLease::set_policy(
+    OperationPolicy policy,
+    SourceSite site) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    ObservationShard* shard{};
+    ObservationRecord* record{};
+    if (resolve(shard, record)) {
+        static_cast<void>(shard->write_policy(key_, policy, site));
+    }
+#else
+    static_cast<void>(policy);
+    static_cast<void>(site);
+#endif
+}
+
+void ObservationLease::publish(
+    OperationPhase phase,
+    NodeRef driver,
+    NodeRef blocker,
+    SourceSite site) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    ObservationShard* shard{};
+    ObservationRecord* record{};
+    if (resolve(shard, record)) {
+        static_cast<void>(shard->publish_operation(
+            key_, phase, driver, blocker, site));
+    }
+#else
+    static_cast<void>(phase);
+    static_cast<void>(driver);
+    static_cast<void>(blocker);
+    static_cast<void>(site);
+#endif
+}
+
+void ObservationLease::deadline(
+    u64 absolute,
+    u64 grace,
+    SourceSite site) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    ObservationShard* shard{};
+    ObservationRecord* record{};
+    if (resolve(shard, record)) {
+        shard->write_deadline(key_, absolute, grace, site);
+    }
+#else
+    static_cast<void>(absolute);
+    static_cast<void>(grace);
     static_cast<void>(site);
 #endif
 }
@@ -2219,6 +2517,8 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     const u64 watched = shard->watched();
     ObservationKey key{};
     ObservationSnapshot snapshot{};
+    WatchdogThresholds selected_thresholds{};
+    u64 selected_hash{};
     u64 selected_age{};
     bool selected{};
     for (usize index = 0; index < ObservationShard::slot_count; ++index) {
@@ -2230,21 +2530,51 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         if (!candidate_key || !shard->snapshot(candidate_key, candidate_snapshot)) {
             continue;
         }
-        if (!thresholds_for(target_core->policy, candidate_snapshot)) {
+        ObservationSnapshot wait_target{};
+        const ObservationSnapshot* delegated{};
+        if (candidate_snapshot.record_kind == RecordKind::ExecutionActor
+            && candidate_snapshot.phase == static_cast<u32>(
+                ExecutionState::Blocked)) {
+            if (!candidate_snapshot.waiter_key) {
+                static_cast<void>(target_core->status().flags.fetch_or<
+                    libk::MemoryOrder::Release>(
+                        DiagnosticStatus::PolicyMissing));
+                continue;
+            }
+            ObservationLease lease = ObservationLease::borrow(
+                candidate_snapshot.waiter_key);
+            if (!lease || !lease.snapshot(wait_target)) {
+                static_cast<void>(target_core->status().flags.fetch_or<
+                    libk::MemoryOrder::Release>(
+                        DiagnosticStatus::PolicyMissing));
+                continue;
+            }
+            delegated = &wait_target;
+        }
+        const WatchdogThresholds candidate_thresholds = thresholds_for(
+            target_core->policy, candidate_snapshot, delegated);
+        if (!candidate_thresholds) {
             continue;
         }
-        const u64 candidate_age = elapsed(
-            tick, candidate_snapshot.last_progress_at);
+        // An absolute business/refill deadline may still be in the future.
+        // Unsigned elapsed() would wrap and let that legitimate future
+        // obligation outrank every already-mature stall candidate.
+        const u64 candidate_age = tick >= candidate_thresholds.anchor
+            ? elapsed(tick, candidate_thresholds.anchor) : 0;
         if (!selected || candidate_age > selected_age) {
             key = candidate_key;
             snapshot = candidate_snapshot;
+            selected_thresholds = candidate_thresholds;
+            selected_hash = snapshot_hash(candidate_snapshot);
+            if (delegated != nullptr) {
+                selected_hash = mix_hash(
+                    selected_hash, snapshot_hash(*delegated));
+            }
             selected_age = candidate_age;
             selected = true;
         }
     }
-    const WatchdogThresholds thresholds = thresholds_for(
-        target_core->policy, snapshot);
-    if (!selected || !key || !thresholds) {
+    if (!selected || !key || !selected_thresholds) {
         watcher->candidate.state.store<libk::MemoryOrder::Release>(
             static_cast<u32>(WatchdogCandidate::State::Clear));
         return;
@@ -2259,7 +2589,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         && previous.generation == snapshot.generation
         && previous.phase == snapshot.phase
         && previous.progress_epoch == snapshot.progress_epoch
-        && previous.state_hash == snapshot_hash(snapshot)
+        && previous.state_hash == selected_hash
         && previous.driver.kind == snapshot.driver.kind
         && previous.driver.identity == snapshot.driver.identity
         && previous.driver.generation == snapshot.driver.generation
@@ -2267,7 +2597,8 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         && previous.blocker.identity == snapshot.blocker.identity
         && previous.blocker.generation == snapshot.blocker.generation;
 
-    const u64 age = elapsed(tick, snapshot.last_progress_at);
+    const u64 age = tick >= selected_thresholds.anchor
+        ? elapsed(tick, selected_thresholds.anchor) : 0;
     if (!same) {
         candidate.publish(StallFingerprint{
             key,
@@ -2275,7 +2606,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             snapshot.phase,
             snapshot.progress_epoch,
             snapshot.activity_epoch,
-            snapshot_hash(snapshot),
+            selected_hash,
             snapshot.driver,
             snapshot.blocker});
         candidate.first_seen.store<libk::MemoryOrder::Release>(0);
@@ -2284,7 +2615,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         return;
     }
 
-    const u64 current_hash = snapshot_hash(snapshot);
+    const u64 current_hash = selected_hash;
     const bool active = snapshot.activity_epoch != previous.activity_epoch
         && snapshot.progress_epoch == previous.progress_epoch;
     candidate.publish(StallFingerprint{
@@ -2296,7 +2627,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         current_hash,
         snapshot.driver,
         snapshot.blocker});
-    if (age < thresholds.soft) {
+    if (tick < selected_thresholds.soft_at) {
         return;
     }
     if (state == WatchdogCandidate::State::Clear) {
@@ -2311,7 +2642,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             static_cast<u64>(snapshot.wait_kind),
             age);
     } else if (state == WatchdogCandidate::State::Suspected
-        && age >= thresholds.hard) {
+        && tick >= selected_thresholds.hard_at) {
         const auto confirmed = active
             ? WatchdogCandidate::State::ConfirmedLivelock
             : WatchdogCandidate::State::Confirmed;
@@ -2430,6 +2761,20 @@ void irq_restoring(u64 cookie) noexcept {
     }
 #else
     static_cast<void>(cookie);
+#endif
+}
+
+auto default_grace(Expectation expectation) noexcept -> u64 {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    const CpuDiagnosticsCore* const core = current_core();
+    if (core == nullptr) {
+        return 0;
+    }
+    return expectation == Expectation::SchedulerControlled
+        ? core->policy.scheduler_hard : core->policy.critical_hard;
+#else
+    static_cast<void>(expectation);
+    return 0;
 #endif
 }
 
@@ -2740,6 +3085,7 @@ namespace {
 
 [[nodiscard]] auto is_transport_wait(WaitKind kind) noexcept -> bool {
     switch (kind) {
+    case WaitKind::CompletionDelivery:
     case WaitKind::RemoteRequest:
     case WaitKind::IpiDelivery:
     case WaitKind::ShootdownAck:

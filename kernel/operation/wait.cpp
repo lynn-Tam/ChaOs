@@ -34,7 +34,7 @@ auto Wait::begin(
         cpus_ = &cpus;
         binding_ = &binding;
         ready_.store<libk::MemoryOrder::Relaxed>(false);
-        completion.attach(*this);
+        completion.attach(*this, binding);
         binding_->link_wait(
             completion.observation_key(),
             diag::concurrency::WaitKind::OperationCompletion,

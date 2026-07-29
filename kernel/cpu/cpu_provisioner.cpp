@@ -170,7 +170,7 @@ auto CpuProvisioner::prepare_impl(
                 diag::concurrency::DiagnosticStatus::StorageMissing));
     }
 #endif
-#if MYOS_CONCURRENCY_DIAG >= 3
+#if MYOS_CONCURRENCY_DIAG >= 1
     const auto ticks_for = [this](u64 nanoseconds) noexcept -> u64 {
         const auto duration = clock_.duration_from_nanoseconds(nanoseconds);
         return duration ? duration->ticks() : 0;
