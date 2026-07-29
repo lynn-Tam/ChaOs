@@ -1,5 +1,6 @@
 #pragma once
 
+#include <diag/concurrency.hpp>
 #include <libk/delegate.hpp>
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
@@ -25,7 +26,8 @@ namespace kernel::object {
 // concrete pool set and is the sole cross-type reclaim boundary.
 class ObjectStore final : private libk::noncopyable_nonmovable {
 public:
-    using ReclaimNotifier = libk::delegate<void() noexcept>;
+    using ReclaimNotifier = libk::delegate<
+        diag::concurrency::ObservationKey() noexcept>;
     using ThreadPool = object::ThreadPool;
     using ThreadPending = object::ThreadPending;
     using ThreadHold = object::ThreadHold;

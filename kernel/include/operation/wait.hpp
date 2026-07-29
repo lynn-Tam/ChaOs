@@ -31,6 +31,8 @@ public:
 
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto ready() const noexcept -> bool;
+    [[nodiscard]] auto observation_key() const noexcept
+        -> diag::concurrency::ObservationKey;
     [[nodiscard]] auto begin(
         Completion& completion,
         CpuRegistry& cpus,

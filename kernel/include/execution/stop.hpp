@@ -4,10 +4,10 @@
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/variant.hpp>
 
 namespace kernel {
 
+class Execution;
 class Thread;
 class Vproc;
 
@@ -26,6 +26,10 @@ public:
 
     [[nodiscard]] auto started() const noexcept -> bool { return started_; }
     [[nodiscard]] auto complete() const noexcept -> bool { return complete_; }
+    [[nodiscard]] auto observation_key() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return observation_;
+    }
     void start(Thread& thread) noexcept;
     void start(Vproc& vproc) noexcept;
 
@@ -36,11 +40,10 @@ private:
     void finish(Thread& thread) noexcept;
     void finish(Vproc& vproc) noexcept;
 
-    using Target = libk::variant<libk::monostate, Thread*, Vproc*>;
-
     Notifier notifier_{};
-    Target target_{};
+    Execution* target_{};
     libk::IntrusiveListHook hook_{};
+    diag::concurrency::ObservationKey observation_{};
     bool started_{};
     bool complete_{};
 };

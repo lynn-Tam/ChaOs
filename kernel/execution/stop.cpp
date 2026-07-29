@@ -14,16 +14,16 @@ constexpr u32 stop_finished = 2;
 } // namespace
 
 Stop::~Stop() noexcept {
-    KASSERT(libk::holds_alternative<libk::monostate>(target_));
+    KASSERT(target_ == nullptr);
     KASSERT(!hook_.is_linked());
     KASSERT(!started_ || complete_);
 }
 
 void Stop::start(Thread& thread) noexcept {
     KASSERT(!started_ && !complete_);
-    KASSERT(libk::holds_alternative<libk::monostate>(target_));
+    KASSERT(target_ == nullptr);
     started_ = true;
-    target_.template emplace<Thread*>(&thread);
+    target_ = &thread.execution();
     // The Stop object is the obligation identity. A target may have several
     // simultaneous stop requests, so target address alone is not unique.
     auto observation = diag::concurrency::ObservationLease::reserve(
@@ -37,21 +37,19 @@ void Stop::start(Thread& thread) noexcept {
         diag::concurrency::WaitKind::SchedulerActivation,
         diag::concurrency::NodeRef::external(reinterpret_cast<u64>(&thread)));
     observation.watch(true);
-    static_cast<void>(observation.detach_key());
+    observation_ = observation.detach_key();
     thread.request_stop(*this);
 }
 
 void Stop::finish(Thread& thread) noexcept {
-    auto** const target = libk::get_if<Thread*>(&target_);
-    KASSERT(started_ && !complete_ && target != nullptr
-        && *target == &thread && !hook_.is_linked());
-    target_.template emplace<libk::monostate>();
+    KASSERT(started_ && !complete_
+        && target_ == &thread.execution() && !hook_.is_linked());
+    target_ = nullptr;
     complete_ = true;
-    auto observation = diag::concurrency::ObservationLease::find(
-        diag::concurrency::RecordKind::ExecutionStop,
-        reinterpret_cast<u64>(this),
-        1);
+    auto observation =
+        diag::concurrency::ObservationLease::borrow(observation_);
     observation.finish(stop_finished);
+    observation_ = {};
     const Notifier notify = notifier_;
     if (notify) {
         notify();
@@ -60,9 +58,9 @@ void Stop::finish(Thread& thread) noexcept {
 
 void Stop::start(Vproc& vproc) noexcept {
     KASSERT(!started_ && !complete_);
-    KASSERT(libk::holds_alternative<libk::monostate>(target_));
+    KASSERT(target_ == nullptr);
     started_ = true;
-    target_.template emplace<Vproc*>(&vproc);
+    target_ = &vproc.execution();
     auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::ExecutionStop,
         reinterpret_cast<u64>(this),
@@ -74,21 +72,19 @@ void Stop::start(Vproc& vproc) noexcept {
         diag::concurrency::WaitKind::SchedulerActivation,
         diag::concurrency::NodeRef::external(reinterpret_cast<u64>(&vproc)));
     observation.watch(true);
-    static_cast<void>(observation.detach_key());
+    observation_ = observation.detach_key();
     vproc.request_stop(*this);
 }
 
 void Stop::finish(Vproc& vproc) noexcept {
-    auto** const target = libk::get_if<Vproc*>(&target_);
-    KASSERT(started_ && !complete_ && target != nullptr
-        && *target == &vproc && !hook_.is_linked());
-    target_.template emplace<libk::monostate>();
+    KASSERT(started_ && !complete_
+        && target_ == &vproc.execution() && !hook_.is_linked());
+    target_ = nullptr;
     complete_ = true;
-    auto observation = diag::concurrency::ObservationLease::find(
-        diag::concurrency::RecordKind::ExecutionStop,
-        reinterpret_cast<u64>(this),
-        1);
+    auto observation =
+        diag::concurrency::ObservationLease::borrow(observation_);
     observation.finish(stop_finished);
+    observation_ = {};
     const Notifier notify = notifier_;
     if (notify) {
         notify();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cap/grant.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/delegate.hpp>
 #include <libk/noncopyable.hpp>
@@ -21,13 +22,15 @@ class CSpace;
 
 struct GrantServiceResult final {
     usize processed{};
+    usize progressed{};
     bool more{};
     u64 epoch{};
 };
 
 class GrantGraph final : private libk::noncopyable_nonmovable {
 public:
-    using WorkNotifier = libk::delegate<void() noexcept>;
+    using WorkNotifier = libk::delegate<
+        diag::concurrency::ObservationKey() noexcept>;
 
     struct Quota final {
         usize nodes{4096};
@@ -235,9 +238,10 @@ private:
     void drop_lease(void* node, u64 generation) noexcept;
     void release_operation(Slot& slot) noexcept;
     void enqueue(Slot& slot) noexcept;
-    void kick_work() noexcept;
+    [[nodiscard]] auto kick_work() noexcept
+        -> diag::concurrency::ObservationKey;
     [[nodiscard]] auto take_work() noexcept -> Slot*;
-    void service_slot(Slot& slot) noexcept;
+    [[nodiscard]] auto service_slot(Slot& slot) noexcept -> bool;
     [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
     void reclaim(GrantKey key, bool drop_reference) noexcept;
     void commit_allocation(kernel::resource::Allocation& allocation) noexcept;

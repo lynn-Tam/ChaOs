@@ -21,6 +21,14 @@ auto Wait::ready() const noexcept -> bool {
     return ready_.load<libk::MemoryOrder::Acquire>();
 }
 
+auto Wait::observation_key() const noexcept
+    -> diag::concurrency::ObservationKey {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return completion_ == nullptr
+        ? diag::concurrency::ObservationKey{}
+        : completion_->observation_key();
+}
+
 auto Wait::begin(
     Completion& completion,
     CpuRegistry& cpus,

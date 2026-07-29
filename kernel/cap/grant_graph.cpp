@@ -413,6 +413,14 @@ void GrantRevoke::acknowledge() noexcept {
     }
 }
 
+void GrantRevoke::service(
+    diag::concurrency::ObservationKey key) noexcept {
+    observation_.attempt(
+        grant_published,
+        diag::concurrency::WaitKind::GrantWork,
+        diag::concurrency::NodeRef::observation(key));
+}
+
 void GrantRevoke::progress(
     u32 phase,
     u64 semantic_stamp,
@@ -969,6 +977,7 @@ void GrantGraph::release_operation(Slot& slot) noexcept {
     }
 
     bool schedule{};
+    GrantRevoke* completion{};
     {
         // Once admission is closed, the graph lock is the lifetime barrier
         // between the final lease and node destruction. work_retained means
@@ -982,11 +991,18 @@ void GrantGraph::release_operation(Slot& slot) noexcept {
         if (operation_count(previous) == 1
             && !slot.work_retained.exchange<libk::MemoryOrder::AcqRel>(true)) {
             schedule = true;
+            completion = slot.node()->revoke;
         }
     }
     if (schedule) {
+        if (completion != nullptr) {
+            completion->service({});
+        }
         enqueue(slot);
-        kick_work();
+        const auto service = kick_work();
+        if (completion != nullptr) {
+            completion->service(service);
+        }
     }
 }
 
@@ -1003,33 +1019,36 @@ auto GrantGraph::take_work() noexcept -> Slot* {
     return work_.empty() ? nullptr : &work_.pop_front();
 }
 
-void GrantGraph::kick_work() noexcept {
+auto GrantGraph::kick_work() noexcept
+    -> diag::concurrency::ObservationKey {
     WorkNotifier notifier{};
     {
         kernel::sync::IrqLockGuard guard{work_lock_};
         notifier = work_notifier_;
     }
     if (notifier) {
-        notifier();
-        return;
+        return notifier();
     }
     while (service(quota_.nodes).more) {}
+    return {};
 }
 
 auto GrantGraph::service(usize budget) noexcept -> GrantServiceResult {
     KASSERT(budget != 0);
     usize processed{};
+    usize progressed{};
     for (usize completed = 0; completed < budget; ++completed) {
         Slot* const slot = take_work();
         if (slot == nullptr) {
             break;
         }
-        service_slot(*slot);
+        progressed += service_slot(*slot) ? 1 : 0;
         ++processed;
         advance_epoch(service_epoch_);
     }
     return GrantServiceResult{
         processed,
+        progressed,
         work_pending(),
         service_epoch_.load<libk::MemoryOrder::Acquire>()};
 }
@@ -1051,7 +1070,7 @@ void GrantGraph::unbind_work_notifier() noexcept {
     work_notifier_.reset();
 }
 
-void GrantGraph::service_slot(Slot& slot) noexcept {
+auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
     object::ObjectRef target_ref{};
     GrantRevoke* operation{};
     GrantRevoke* completed{};
@@ -1066,8 +1085,8 @@ void GrantGraph::service_slot(Slot& slot) noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (!slot.occupied.load<libk::MemoryOrder::Acquire>()) {
-            slot.work_retained.store<libk::MemoryOrder::Release>(false);
-            return;
+            return slot.work_retained.exchange<
+                libk::MemoryOrder::AcqRel>(false);
         }
         Node& node = *slot.node();
         const GrantState state =
@@ -1160,6 +1179,10 @@ void GrantGraph::service_slot(Slot& slot) noexcept {
             reinterpret_cast<usize>(&slot),
             slot.generation.load<libk::MemoryOrder::Relaxed>()}, false);
     }
+    // Taking a retained slot always commits one canonical handoff: an
+    // attachment enters invalidation, revoke reaches terminal state, or the
+    // worker releases the retained obligation to its current blocker.
+    return true;
 }
 
 auto GrantGraph::detach(GrantAttachment& attachment) noexcept -> bool {
@@ -1416,7 +1439,8 @@ auto GrantGraph::revoke(
         }
     }
 
-    kick_work();
+    completion.service({});
+    completion.service(kick_work());
     completion.acknowledge();
     return libk::expected();
 }

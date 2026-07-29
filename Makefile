@@ -722,7 +722,7 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
 # The trace profile currently has a baseline 1984-byte validate_graph frame
 # against the production 1792-byte audit bound. Runtime evidence remains
@@ -736,7 +736,8 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 		5) evidence="concurrency-probe: stage-c analyzer-ok";; \
 		6) evidence="concurrency-probe: stage-c watchdog-ok";; \
 		7) evidence="concurrency-probe: stage-d delivery-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..7"; exit 1;; \
+		8) evidence="concurrency-probe: stage-e analyzer-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..8"; exit 1;; \
 	esac; \
 	initrd=""; \
 	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
@@ -764,6 +765,12 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 	if [ "$(CONCURRENCY_PROBE)" = 4 ] \
 		&& ! rg -q "\\[concurrency\\] watchdog confirmed" "$$output"; then \
 		echo "[concurrency-probe] FAIL: Claimed publication was not reported"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 8 ] \
+		&& ! rg -q "concurrency-probe: stage-e interval-ok" "$$output"; then \
+		echo "[concurrency-probe] FAIL: service interval evidence missing"; \
 		rm -f "$$output"; \
 		exit 1; \
 	fi; \

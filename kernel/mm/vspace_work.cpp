@@ -41,8 +41,20 @@ void VSpaceExecutor::submit(VSpace& space) noexcept {
         queue_.push_back(space);
         notifier = notifier_;
     }
+    if (space.observation_ready_.load<libk::MemoryOrder::Acquire>()) {
+        space.observation_.attempt(
+            static_cast<u32>(VSpaceServiceState::Waiting),
+            diag::concurrency::WaitKind::VSpaceWork,
+            {});
+    }
     if (notifier) {
-        notifier();
+        const auto service = notifier();
+        if (space.observation_ready_.load<libk::MemoryOrder::Acquire>()) {
+            space.observation_.attempt(
+                static_cast<u32>(VSpaceServiceState::Waiting),
+                diag::concurrency::WaitKind::VSpaceWork,
+                diag::concurrency::NodeRef::observation(service));
+        }
     }
 }
 
@@ -63,6 +75,7 @@ auto VSpaceExecutor::run(
     usize budget) noexcept -> VSpaceServiceBatch {
     KASSERT(budget != 0);
     usize processed{};
+    usize progressed{};
     for (usize completed = 0; completed < budget; ++completed) {
         VSpace* const space = take();
         if (space == nullptr) {
@@ -80,8 +93,13 @@ auto VSpaceExecutor::run(
                 .argument_count = 2,
             }));
         }
-        if (result.value() == VSpaceServiceState::Retry
-            || result.value() == VSpaceServiceState::Progress
+        const VSpaceServiceState state = result.value();
+        if (state == VSpaceServiceState::Progress
+            || state == VSpaceServiceState::Settled) {
+            ++progressed;
+        }
+        if (state == VSpaceServiceState::Retry
+            || state == VSpaceServiceState::Progress
             || space->work_ready()) {
             submit(*space);
         }
@@ -90,6 +108,7 @@ auto VSpaceExecutor::run(
     }
     return VSpaceServiceBatch{
         processed,
+        progressed,
         pending(),
         service_epoch_.load<libk::MemoryOrder::Acquire>()};
 }

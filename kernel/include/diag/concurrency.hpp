@@ -139,6 +139,7 @@ enum class RecordKind : u8 {
     VSpaceWork,
     RemoteDelivery,
     ServiceWork,
+    TrapContinuation,
     Count,
 };
 
@@ -233,6 +234,13 @@ enum class RemotePhase : u32 {
     Accepted = 6,
     Completed = 7,
     Cancelled = 8,
+};
+
+enum class ServicePhase : u32 {
+    Queued = 1,
+    WakeIssued = 2,
+    Running = 3,
+    Completed = 4,
 };
 
 enum class DriverKind : u8 {

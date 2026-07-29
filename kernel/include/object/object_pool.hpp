@@ -2,6 +2,7 @@
 
 #include <core/debug.hpp>
 #include <core/types.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/delegate.hpp>
 #include <libk/expected.hpp>
 #include <libk/noncopyable.hpp>
@@ -111,7 +112,9 @@ public:
 
     explicit ObjectPool(
         kernel::mm::Pmm& pmm,
-        libk::delegate<void() noexcept>& reclaim_notify) noexcept
+        libk::delegate<
+            diag::concurrency::ObservationKey() noexcept>&
+            reclaim_notify) noexcept
         : pmm_(&pmm), reclaim_notify_(&reclaim_notify) {
         static_assert(slots_per_page != 0);
         static_assert(alignof(T) <= kernel::mm::page_size);
@@ -602,7 +605,7 @@ private:
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
-            notify_reclaimer();
+            notify_reclaimer(anchor, generation);
         }
     }
 
@@ -627,7 +630,7 @@ private:
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
-            notify_reclaimer();
+            notify_reclaimer(anchor, generation);
         }
     }
 
@@ -658,7 +661,7 @@ private:
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
-            notify_reclaimer();
+            notify_reclaimer(anchor, generation);
         }
     }
 
@@ -736,19 +739,31 @@ private:
 #if MYOS_CONCURRENCY_DIAG >= 1
         auto active = retire_observation(anchor, anchor.generation_);
         publish_retire_witness(active, true, 0, 0, true);
-        active.phase(
+        active.transition(
             3,
             anchor.generation_,
-            kernel::diag::concurrency::SourceSite::current());
+            kernel::diag::concurrency::WaitKind::ObjectReclaim,
+            {});
         active.watch(true);
 #endif
         return true;
     }
 
-    void notify_reclaimer() noexcept {
+    void notify_reclaimer(
+        ObjectAnchor& anchor,
+        u64 generation) noexcept {
         KASSERT(reclaim_notify_ != nullptr);
         if (*reclaim_notify_) {
-            (*reclaim_notify_)();
+            const auto service = (*reclaim_notify_)();
+#if MYOS_CONCURRENCY_DIAG >= 1
+            auto active = retire_observation(anchor, generation);
+            active.attempt(
+                3,
+                kernel::diag::concurrency::WaitKind::ObjectReclaim,
+                kernel::diag::concurrency::NodeRef::observation(service));
+#else
+            static_cast<void>(service);
+#endif
         }
     }
 
@@ -794,7 +809,8 @@ private:
     }
 
     kernel::mm::Pmm* pmm_{};
-    libk::delegate<void() noexcept>* reclaim_notify_{};
+    libk::delegate<
+        diag::concurrency::ObservationKey() noexcept>* reclaim_notify_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::ObjectPool> lock_{};
     PageHeader* pages_head_{};
     Slot* reclaim_head_{};

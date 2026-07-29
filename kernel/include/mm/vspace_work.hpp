@@ -1,6 +1,7 @@
 #pragma once
 
 #include <core/types.hpp>
+#include <diag/concurrency.hpp>
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
@@ -12,6 +13,7 @@ namespace kernel::mm {
 
 struct VSpaceServiceBatch final {
     usize processed{};
+    usize progressed{};
     bool more{};
     u64 epoch{};
 };
@@ -22,7 +24,8 @@ class VSpaceExecutor final : private libk::noncopyable_nonmovable {
     using Queue = libk::IntrusiveList<VSpace, &VSpace::work_hook_>;
 
 public:
-    using Notifier = libk::delegate<void() noexcept>;
+    using Notifier = libk::delegate<
+        diag::concurrency::ObservationKey() noexcept>;
 
     VSpaceExecutor() noexcept = default;
     ~VSpaceExecutor() noexcept;

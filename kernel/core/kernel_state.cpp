@@ -1,6 +1,7 @@
 #include <core/kernel_state.hpp>
 #include <arch/interrupt.hpp>
 #include <cpu/cpu_runtime.hpp>
+#include <diag/console.hpp>
 #include <libk/utility.hpp>
 #include <libk/limits.hpp>
 #include <mm/kernel_stack.hpp>
@@ -10,6 +11,26 @@
 #include <thread/thread.hpp>
 
 namespace kernel {
+namespace {
+
+constexpr u64 reclaimer_closing = 1;
+constexpr u64 reclaimer_reopen = 2;
+
+[[nodiscard]] auto advance_sat(libk::Atomic<u64>& value) noexcept -> u64 {
+    u64 current = value.load<libk::MemoryOrder::Relaxed>();
+    for (;;) {
+        if (current == libk::numeric_limits<u64>::max()) {
+            return current;
+        }
+        if (value.compare_exchange_weak<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Relaxed>(current, current + 1)) {
+            return current + 1;
+        }
+    }
+}
+
+} // namespace
 
 auto KernelState::initialize_in(
     libk::ManualLifetime<KernelState>& storage,
@@ -155,7 +176,8 @@ auto KernelState::start_reclaimer(
     reclaimer_thread_ = libk::move(thread);
     reclaimer_context_ = libk::move(context);
     reclaimer_observation_ =
-        diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::ObservationLease::reserve_on(
+            runtime.local.descriptor->logical_id(),
             diag::concurrency::RecordKind::ServiceActor,
             reinterpret_cast<u64>(this),
             1,
@@ -174,11 +196,58 @@ auto KernelState::start_reclaimer(
     return true;
 }
 
+#if MYOS_CONCURRENCY_PROBE == 8
+void KernelState::run_reclaimer_probe() noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove when the external service-fault harness can
+    // pause and reopen the real reclaimer close protocol deterministically.
+    const auto first = retain_reclaimer_work();
+    const auto coalesced = retain_reclaimer_work();
+    const u64 admitted_epoch =
+        reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>();
+    const bool first_closed =
+        first && first.raw == coalesced.raw
+        && close_reclaimer_work(first, admitted_epoch);
+    const auto next = retain_reclaimer_work();
+    const bool next_closed =
+        next && next.raw != first.raw
+        && close_reclaimer_work(next, admitted_epoch);
+    diag::console::print<
+        "concurrency-probe: stage-e interval-{} "
+        "first={:#x} coalesced={:#x} next={:#x} "
+        "first-closed={} next-closed={} state={:#x}\n">(
+        first_closed && next_closed ? "ok" : "fail",
+        first.raw,
+        coalesced.raw,
+        next.raw,
+        first_closed,
+        next_closed,
+        reclaimer_work_.load<libk::MemoryOrder::Acquire>());
+}
+#endif
+
 [[noreturn]] void KernelState::reclaimer_entry(void* argument) noexcept {
     auto& kernel = *static_cast<KernelState*>(argument);
     u64 cycle{};
     u64 object_total{};
+    u64 grant_total{};
+    u64 vspace_total{};
+    const auto add_progress = [](
+                                  u64& total,
+                                  usize delta) noexcept {
+        const u64 amount = static_cast<u64>(delta);
+        total = total > libk::numeric_limits<u64>::max() - amount
+            ? libk::numeric_limits<u64>::max()
+            : total + amount;
+    };
     for (;;) {
+        const u64 admitted = kernel.reclaimer_enqueues_.load<
+            libk::MemoryOrder::Acquire>();
+        const u64 work_state =
+            kernel.reclaimer_work_.load<libk::MemoryOrder::Acquire>();
+        const auto work = work_state > reclaimer_reopen
+            ? diag::concurrency::ObservationKey{work_state}
+            : diag::concurrency::ObservationKey{};
         if (cycle != libk::numeric_limits<u64>::max()) {
             ++cycle;
         }
@@ -189,16 +258,20 @@ auto KernelState::start_reclaimer(
             ? kernel.reclaimer_context_->binding()->actor_ref()
             : diag::concurrency::NodeRef::cpu(
                   cpu.descriptor->logical_id());
-        kernel.reclaimer_observation_.transition(
+        kernel.reclaimer_observation_.attempt(
             1,
-            cycle,
+            diag::concurrency::WaitKind::ObjectReclaim,
+            driver);
+        auto work_observation =
+            diag::concurrency::ObservationLease::borrow(work);
+        work_observation.attempt(
+            static_cast<u32>(diag::concurrency::ServicePhase::Running),
             diag::concurrency::WaitKind::ObjectReclaim,
             driver);
         const usize object_count = kernel.objects().drain_reclaim();
-        object_total = object_total > libk::numeric_limits<u64>::max()
-            - object_count
-            ? libk::numeric_limits<u64>::max()
-            : object_total + object_count;
+        add_progress(object_total, object_count);
+        kernel.reclaimer_observation_.advance(object_count);
+        work_observation.advance(object_count);
         kernel.reclaimer_observation_.detail(0, cycle);
         kernel.reclaimer_observation_.detail(1, object_total);
         diag::concurrency::record(
@@ -206,42 +279,151 @@ auto KernelState::start_reclaimer(
             diag::concurrency::FlightEvent::Reclaim,
             driver.identity,
             object_count);
-        kernel.reclaimer_observation_.phase(
+        kernel.reclaimer_observation_.attempt(
             2,
-            cycle,
-            diag::concurrency::SourceSite::current());
+            diag::concurrency::WaitKind::GrantWork,
+            driver);
         const auto grant = kernel.grants().service(8);
-        kernel.reclaimer_observation_.phase(
+        add_progress(grant_total, grant.progressed);
+        kernel.reclaimer_observation_.advance(grant.progressed);
+        work_observation.advance(grant.progressed);
+        kernel.reclaimer_observation_.attempt(
             3,
-            cycle,
-            diag::concurrency::SourceSite::current());
-        kernel.reclaimer_observation_.detail(2, grant.epoch);
+            diag::concurrency::WaitKind::VSpaceWork,
+            driver);
+        kernel.reclaimer_observation_.detail(2, grant_total);
         const auto vspace = kernel.vspace_work_.run(
             kernel::mm::VmContext{
                 .cpus = cpu.runtime().owner_registry,
                 .local = cpu.descriptor->logical_id(),
             },
             8);
-        kernel.reclaimer_observation_.phase(
+        add_progress(vspace_total, vspace.progressed);
+        kernel.reclaimer_observation_.advance(vspace.progressed);
+        work_observation.advance(vspace.progressed);
+        kernel.reclaimer_observation_.attempt(
             4,
-            cycle,
-            diag::concurrency::SourceSite::current());
-        kernel.reclaimer_observation_.detail(3, vspace.epoch);
-        if (grant.more || vspace.more) {
+            diag::concurrency::WaitKind::SchedulerReady,
+            driver);
+        kernel.reclaimer_observation_.detail(3, vspace_total);
+        if (grant.more || vspace.more
+            || !kernel.close_reclaimer_work(work, admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();
         } else {
-            kernel.reclaimer_observation_.phase(
+            kernel.reclaimer_observation_.attempt(
                 5,
-                cycle,
-                diag::concurrency::SourceSite::current());
+                diag::concurrency::WaitKind::SchedulerWake,
+                driver);
             kernel.reclaimer_observation_.watch(false);
             kernel::sched::block();
         }
     }
 }
 
-void KernelState::wake_reclaimer() noexcept {
+auto KernelState::retain_reclaimer_work() noexcept
+    -> diag::concurrency::ObservationKey {
+    for (;;) {
+        u64 state =
+            reclaimer_work_.load<libk::MemoryOrder::Acquire>();
+        if (state > reclaimer_reopen) {
+            return diag::concurrency::ObservationKey{state};
+        }
+        if (state == reclaimer_closing) {
+            if (reclaimer_work_.compare_exchange_weak<
+                    libk::MemoryOrder::AcqRel,
+                    libk::MemoryOrder::Acquire>(
+                    state, reclaimer_reopen)) {
+                return {};
+            }
+            continue;
+        }
+        if (state == reclaimer_reopen) {
+            return {};
+        }
+
+        const u64 generation = advance_sat(reclaimer_work_generation_);
+        auto observation = diag::concurrency::ObservationLease::reserve(
+            diag::concurrency::RecordKind::ServiceWork,
+            reinterpret_cast<u64>(this),
+            generation,
+            diag::concurrency::Expectation::InternalFinite);
+        const auto driver = reclaimer_context_
+                && reclaimer_context_->binding() != nullptr
+            ? reclaimer_context_->binding()->actor_ref()
+            : diag::concurrency::NodeRef{};
+        observation.attempt(
+            static_cast<u32>(diag::concurrency::ServicePhase::Queued),
+            diag::concurrency::WaitKind::SchedulerWake,
+            driver);
+        observation.watch(true);
+        const auto key = observation.detach_key();
+        if (!key) {
+            return {};
+        }
+        KASSERT(key.raw > reclaimer_reopen);
+        state = 0;
+        if (reclaimer_work_.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(state, key.raw)) {
+            return key;
+        }
+        diag::concurrency::ObservationLease::borrow(key).finish(
+            static_cast<u32>(diag::concurrency::ServicePhase::Completed));
+    }
+}
+
+auto KernelState::close_reclaimer_work(
+    diag::concurrency::ObservationKey work,
+    u64 admitted) noexcept -> bool {
+    if (!work) {
+        // Diagnostic capacity loss must not keep the functional reclaimer
+        // runnable. A concurrent enqueue still carries the ordinary wake
+        // credit through Binding.
+        return reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
+            == admitted;
+    }
+    if (reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
+        != admitted) {
+        return false;
+    }
+
+    u64 state = work.raw;
+    if (!reclaimer_work_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(
+            state, reclaimer_closing)) {
+        return false;
+    }
+    if (reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
+        != admitted) {
+        state = reclaimer_closing;
+        if (!reclaimer_work_.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(state, work.raw)) {
+            KASSERT(state == reclaimer_reopen);
+            reclaimer_work_.store<libk::MemoryOrder::Release>(work.raw);
+        }
+        return false;
+    }
+
+    state = reclaimer_closing;
+    if (!reclaimer_work_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(state, 0)) {
+        KASSERT(state == reclaimer_reopen);
+        reclaimer_work_.store<libk::MemoryOrder::Release>(work.raw);
+        return false;
+    }
+    diag::concurrency::ObservationLease::borrow(work).finish(
+        static_cast<u32>(diag::concurrency::ServicePhase::Completed));
+    return true;
+}
+
+auto KernelState::wake_reclaimer() noexcept
+    -> diag::concurrency::ObservationKey {
+    static_cast<void>(advance_sat(reclaimer_enqueues_));
+    const auto work = retain_reclaimer_work();
     KASSERT(reclaimer_context_);
     kernel::sched::Binding* const binding = reclaimer_context_->binding();
     KASSERT(binding != nullptr);
@@ -252,9 +434,19 @@ void KernelState::wake_reclaimer() noexcept {
     if (target->state() != kernel::CpuState::Online) {
         // Before the first dispatch the already-Ready reclaimer will observe
         // all queued work without a wake. Teardown removes the notifier first.
-        return;
+        return work;
     }
-    KASSERT(kernel::sched::wake(cpus(), *binding));
+    diag::concurrency::ObservationKey delivery{};
+    KASSERT(kernel::sched::wake(cpus(), *binding, work, &delivery));
+    auto observation =
+        diag::concurrency::ObservationLease::borrow(work);
+    observation.attempt(
+        static_cast<u32>(diag::concurrency::ServicePhase::WakeIssued),
+        diag::concurrency::WaitKind::SchedulerWake,
+        delivery
+            ? diag::concurrency::NodeRef::observation(delivery)
+            : binding->actor_ref());
+    return work;
 }
 
 void KernelState::release_scheduler_objects() noexcept {

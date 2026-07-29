@@ -868,6 +868,7 @@ void ResourcePool::publish_observation() noexcept {
     usize roots{};
     usize sponsorships{};
     Allocation* blocker{};
+    diag::concurrency::ObservationKey blocker_key{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         state = state_;
@@ -875,7 +876,27 @@ void ResourcePool::publish_observation() noexcept {
         constructions = construction_count_;
         roots = root_count_;
         sponsorships = sponsorship_count_;
-        blocker = roots_;
+        for (Allocation* allocation = roots_;
+             allocation != nullptr;
+             allocation = allocation->next_) {
+            const bool matches =
+                (state == PoolState::Revoking
+                    && allocation->state_ == AllocationState::Revoking)
+                || (state == PoolState::Stopping
+                    && allocation->state_ == AllocationState::Stopping)
+                || (state == PoolState::Reclaiming
+                    && allocation->state_ == AllocationState::Retiring);
+            if (!matches) {
+                continue;
+            }
+            blocker = allocation;
+            if (state == PoolState::Revoking) {
+                blocker_key = allocation->revoke_.observation_key();
+            } else if (state == PoolState::Stopping) {
+                blocker_key = allocation->stop_.observation_key();
+            }
+            break;
+        }
     }
     if (!close_observation_) {
         return;
@@ -907,10 +928,13 @@ void ResourcePool::publish_observation() noexcept {
         stamp,
         wait,
         diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)),
-        blocker == nullptr
-            ? diag::concurrency::NodeRef{}
-            : diag::concurrency::NodeRef::external(
-                  reinterpret_cast<u64>(blocker)));
+        blocker_key
+            ? diag::concurrency::NodeRef::observation(blocker_key)
+            : blocker == nullptr
+                ? diag::concurrency::NodeRef{}
+                : diag::concurrency::NodeRef::external(
+                      reinterpret_cast<u64>(blocker),
+                      blocker->root_.generation));
     close_observation_.detail(0, reservations);
     close_observation_.detail(1, constructions);
     close_observation_.detail(2, roots);

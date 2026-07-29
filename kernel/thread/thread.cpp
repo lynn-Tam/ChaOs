@@ -245,8 +245,7 @@ void Thread::request_stop(execution::Stop& request) noexcept {
     bool initiate{};
     {
         kernel::sync::IrqLockGuard guard{stop_lock_};
-        auto** const target = libk::get_if<Thread*>(&request.target_);
-        KASSERT(request.started_ && target != nullptr && *target == this);
+        KASSERT(request.started_ && request.target_ == &execution_);
         stops_.push_back(request);
         if (stopped_) {
             stops_.erase(request);

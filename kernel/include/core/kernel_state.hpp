@@ -52,6 +52,11 @@ public:
         kernel::resource::Budget limit) noexcept -> bool;
     [[nodiscard]] auto start_reclaimer(kernel::CpuRuntime& runtime) noexcept
         -> bool;
+#if MYOS_CONCURRENCY_PROBE == 8
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage E reclaimer interval probe.
+    void run_reclaimer_probe() noexcept;
+#endif
 
     [[nodiscard]] auto pmm(this auto& self) noexcept
         -> decltype(auto){
@@ -101,7 +106,13 @@ public:
     }
 private:
     [[noreturn]] static void reclaimer_entry(void* argument) noexcept;
-    void wake_reclaimer() noexcept;
+    [[nodiscard]] auto wake_reclaimer() noexcept
+        -> diag::concurrency::ObservationKey;
+    [[nodiscard]] auto retain_reclaimer_work() noexcept
+        -> diag::concurrency::ObservationKey;
+    [[nodiscard]] auto close_reclaimer_work(
+        diag::concurrency::ObservationKey work,
+        u64 admitted) noexcept -> bool;
     void release_scheduler_objects() noexcept;
 
     libk::ManualLifetime<kernel::mm::DirectMap> direct_map_{};
@@ -117,6 +128,11 @@ private:
     kernel::object::ObjectStore::ThreadHold reclaimer_thread_{};
     kernel::object::ObjectStore::ResourceHold root_pool_{};
     diag::concurrency::ObservationLease reclaimer_observation_{};
+    // Zero is idle, one is closing, two records a concurrent reopen request,
+    // and every other value is the detached ServiceWork observation key.
+    libk::Atomic<u64> reclaimer_work_{};
+    libk::Atomic<u64> reclaimer_work_generation_{};
+    libk::Atomic<u64> reclaimer_enqueues_{};
 };
 
 } // namespace kernel

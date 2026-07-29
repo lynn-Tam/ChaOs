@@ -195,7 +195,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     kernel::Execution* const execution = cpu.current_execution();
     KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
     auto continuation = diag::concurrency::ObservationLease::reserve(
-        diag::concurrency::RecordKind::ServiceWork,
+        diag::concurrency::RecordKind::TrapContinuation,
         reinterpret_cast<u64>(execution),
         1,
         diag::concurrency::Expectation::InternalFinite);
@@ -203,12 +203,6 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
         ? execution->scheduler_binding()->actor_ref()
         : diag::concurrency::NodeRef::cpu(
               cpu.descriptor->logical_id());
-    continuation.transition(
-        1,
-        1,
-        diag::concurrency::WaitKind::External,
-        driver);
-    continuation.watch(true);
     while (thread != nullptr && thread->active_frame() != nullptr
         && !thread->current_wait().attached()
         && (cpu.dispatcher()->current().stop_requested()
@@ -219,6 +213,18 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     operation::Wait* wait = thread != nullptr
         ? &thread->current_wait()
         : nullptr;
+    const auto operation = wait != nullptr
+        ? wait->observation_key()
+        : diag::concurrency::ObservationKey{};
+    continuation.transition(
+        1,
+        1,
+        operation
+            ? diag::concurrency::WaitKind::OperationCompletion
+            : diag::concurrency::WaitKind::SchedulerActivation,
+        driver,
+        diag::concurrency::NodeRef::observation(operation));
+    continuation.watch(true);
     if (wait != nullptr && wait->ready()) {
         wait->finish(context);
     }

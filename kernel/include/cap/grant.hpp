@@ -227,6 +227,7 @@ private:
     friend class GrantGraph;
     void initialize(usize pending) noexcept;
     void acknowledge() noexcept;
+    void service(diag::concurrency::ObservationKey key) noexcept;
     void progress(
         u32 phase,
         u64 semantic_stamp,

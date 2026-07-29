@@ -193,6 +193,11 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     KASSERT(runtime.local.descriptor->logical_id()
         == kernel.cpus().boot_id());
     install_local_entry(runtime, runtime.local.descriptor->hardware_id());
+#if MYOS_CONCURRENCY_PROBE == 8
+    //Confirmatory experiment.
+    // Exit condition: remove with KernelState::run_reclaimer_probe().
+    kernel.run_reclaimer_probe();
+#endif
     kernel::irq::initialize_platform();
     diag::console::print<"trap install ok\n">();
 

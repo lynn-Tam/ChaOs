@@ -217,12 +217,13 @@ constinit kernel::diag::concurrency::ObservationPage
                 break;
             }
             lease.attempt(
-                0,
+                7,
                 WaitKind::Unknown,
                 NodeRef::cpu(kernel::CpuId{0}));
             ObservationSnapshot attempted{};
             if (!lease.snapshot(attempted)
                 || attempted.activity_epoch <= before.activity_epoch
+                || attempted.phase != 7
                 || attempted.progress_epoch != before.progress_epoch) {
                 break;
             }

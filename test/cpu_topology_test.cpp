@@ -1047,8 +1047,10 @@ bool test_object_ref_generation_and_pin_reclaim(
     auto active_cold_pin = libk::move(cold_pin).value();
     auto active_ref_pin = libk::move(ref_pin).value();
     usize notifications{};
-    auto notify = [&notifications]() noexcept {
+    auto notify = [&notifications]() noexcept
+        -> kernel::diag::concurrency::ObservationKey {
         ++notifications;
+        return {};
     };
     cpu_test_objects->bind_reclaim_notifier(
         kernel::object::ObjectStore::ReclaimNotifier::bind(notify));

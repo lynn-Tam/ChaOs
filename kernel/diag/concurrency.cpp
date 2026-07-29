@@ -1008,8 +1008,9 @@ auto ObservationShard::write_metadata(
     record->site_function.store<libk::MemoryOrder::Relaxed>(
         reinterpret_cast<usize>(site.function));
     record->site_line.store<libk::MemoryOrder::Relaxed>(site.line);
-    const bool progressed = previous_phase != phase
-        || (update_progress && previous_semantic != semantic_stamp);
+    const bool progressed = update_progress
+        && (previous_phase != phase
+            || previous_semantic != semantic_stamp);
     if (update_progress) {
         record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
             semantic_stamp);
@@ -3379,6 +3380,20 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
         || is_external_wait(snapshot.wait_kind)) {
         return StallClass::ExternalWait;
     }
+    const bool service_unlinked =
+        snapshot.driver.kind == NodeRef::Kind::None
+        && (
+            (snapshot.record_kind == RecordKind::ServiceWork
+                && snapshot.phase == static_cast<u32>(
+                    ServicePhase::Queued))
+            || snapshot.wait_kind == WaitKind::GrantWork
+            || (snapshot.record_kind == RecordKind::ObjectRetire
+                && snapshot.wait_kind == WaitKind::ObjectReclaim)
+            || (snapshot.record_kind == RecordKind::VSpaceWork
+                && snapshot.wait_kind == WaitKind::VSpaceWork));
+    if (service_unlinked) {
+        return StallClass::LostServiceKick;
+    }
     if (snapshot.driver.kind == NodeRef::Kind::None
         && snapshot.expectation == Expectation::InternalFinite) {
         return StallClass::OrphanObligation;
@@ -3850,7 +3865,8 @@ void run_probe(u32 probe) noexcept {
     //Confirmatory experiment.
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
-    if (probe != 1 && probe != 5 && probe != 6 && probe != 7) {
+    if (probe != 1 && probe != 5 && probe != 6 && probe != 7
+        && probe != 8) {
         return;
     }
 
@@ -3868,6 +3884,90 @@ void run_probe(u32 probe) noexcept {
 
     const CpuId cpu = local.descriptor->logical_id();
     const CpuId boot = registry->boot_id();
+    if (probe == 8) {
+        //Confirmatory experiment.
+        // Exit condition: remove when the external service-fault harness can
+        // withhold the real notifier and scheduler acceptance independently.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu != boot) {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            return;
+        }
+
+        ObservationShard* const shard = registry->observations(boot);
+        bool ok = shard != nullptr;
+        u32 errors = ok ? 0 : 1U;
+        ObservationLease service{};
+        ObservationLease actor{};
+        if (ok) {
+            service = shard->reserve(
+                RecordKind::ServiceWork,
+                0xe801,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            actor = shard->reserve(
+                RecordKind::ExecutionActor,
+                0xe802,
+                1,
+                Expectation::SchedulerControlled,
+                SourceSite::current());
+            ok = service && actor;
+            if (!ok) {
+                errors |= 1U << 1;
+            }
+        }
+        if (ok) {
+            service.attempt(
+                static_cast<u32>(ServicePhase::Queued),
+                WaitKind::SchedulerWake,
+                {});
+            service.watch(true);
+            WaitGraphScratch graph{};
+            const bool lost = analyze(service.key(), graph)
+                && graph.classification == StallClass::LostServiceKick
+                && graph.count == 1;
+            if (!lost) {
+                errors |= 1U << 2;
+            }
+
+            actor.transition(
+                execution_ready_phase,
+                execution_ready_phase,
+                WaitKind::SchedulerReady,
+                NodeRef::external(0xe8ee, 1));
+            service.attempt(
+                static_cast<u32>(ServicePhase::WakeIssued),
+                WaitKind::SchedulerWake,
+                NodeRef::observation(actor.key()));
+            graph = {};
+            const bool ready = analyze(service.key(), graph)
+                && graph.classification == StallClass::RunnableStarvation
+                && graph.count == 3;
+            if (!ready) {
+                errors |= 1U << 3;
+            }
+            ok = lost && ready;
+        }
+        if (service) {
+            service.finish(static_cast<u32>(ServicePhase::Completed));
+        }
+        if (actor) {
+            actor.finish(execution_ready_phase);
+        }
+        diag::console::print<
+            "concurrency-probe: stage-e analyzer-{} errors=0x{:x}\n">(
+            ok ? "ok" : "fail", errors);
+        probe_phase.store<libk::MemoryOrder::Release>(2);
+        return;
+    }
     if (probe == 7) {
         //Confirmatory experiment.
         // Exit condition: remove when the external kernel fault harness can
