@@ -781,7 +781,9 @@ auto RootTask::run_concurrency_probe(
     // The probe permanently owns this binding's synthetic Wait edge and stops
     // before first dispatch. Exclude that deliberately frozen Ready actor so
     // the observation window measures only the operation policy under test.
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
     binding->suppress_actor_for_probe();
+#endif
     diag::console::print<
         "concurrency-probe: stage-b {}-ok key={:#x}\n">(
         claimed ? "claimed" : "external",

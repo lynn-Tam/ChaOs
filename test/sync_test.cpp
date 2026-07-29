@@ -555,10 +555,10 @@ constinit kernel::diag::concurrency::ObservationPage
                 break;
             }
 
-            // Canonical ExecutionState::Blocked and Completion::Ready are
-            // correlated only for diagnosis; the analyzer must not repair
-            // the scheduler's wake credit. A retained wake credit suppresses
-            // LostWake, while the same stable graph without it is evidence.
+            // Stage C does not infer LostWake from generic Binding detail
+            // bits.  Scheduler publication/consumption witnesses are added
+            // in Stage D; until then both variants retain the graph's
+            // ordinary cycle classification.
             actor.phase(
                 static_cast<u32>(kernel::ExecutionState::Blocked), 4);
             actor.detail(0, 4);
@@ -573,7 +573,7 @@ constinit kernel::diag::concurrency::ObservationPage
             actor.detail(0, 0);
             scratch = {};
             if (!analyze(actor.key(), scratch)
-                || scratch.classification != StallClass::LostWake) {
+                || scratch.classification == StallClass::LostWake) {
                 break;
             }
 

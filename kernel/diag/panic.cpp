@@ -565,27 +565,36 @@ void print_concurrency(
         has_wait ? wait.site.function : nullptr);
     panic_print<"    status={:#x}\n">(
         core.status().flags.load<libk::MemoryOrder::Acquire>());
-    const auto candidate_state = core.candidate.state.load<
-        libk::MemoryOrder::Acquire>();
-    if (candidate_state != static_cast<u32>(
-            concurrency::WatchdogCandidate::State::Clear)) {
-        concurrency::StallFingerprint fingerprint{};
-        const bool fingerprint_valid = core.candidate.read(fingerprint);
-        if (!fingerprint_valid) {
-            panic_print<"    watchdog: state={} fingerprint=unstable\n">(
-                candidate_state);
-        } else {
-            panic_print<
-                "    watchdog: state={} key={:#x} phase={} progress={} "
-                "activity={} first={} driver={:#x} blocker={:#x}\n">(
-                candidate_state,
-                fingerprint.key.raw,
-                fingerprint.phase,
-                fingerprint.progress_epoch,
-                fingerprint.activity_epoch,
-                core.candidate.first_seen.load<libk::MemoryOrder::Acquire>(),
-                fingerprint.driver.identity,
-                fingerprint.blocker.identity);
+    for (usize slot = 0;
+         slot < concurrency::CpuDiagnosticsCore::candidate_capacity;
+         ++slot) {
+        const auto& candidate = core.candidates[slot];
+        const auto candidate_state = candidate.state.load<
+            libk::MemoryOrder::Acquire>();
+        if (candidate_state != static_cast<u32>(
+                concurrency::WatchdogCandidate::State::Clear)) {
+            concurrency::StallFingerprint fingerprint{};
+            const bool fingerprint_valid = candidate.read(fingerprint);
+            if (!fingerprint_valid) {
+                panic_print<
+                    "    watchdog[{}]: state={} fingerprint=unstable\n">(
+                    slot, candidate_state);
+            } else {
+                panic_print<
+                    "    watchdog[{}]: state={} root-kind={} root={:#x} "
+                    "phase={} progress={} activity={} first={} "
+                    "driver={:#x} blocker={:#x}\n">(
+                    slot,
+                    candidate_state,
+                    static_cast<u32>(fingerprint.root.kind),
+                    fingerprint.root.identity,
+                    fingerprint.phase,
+                    fingerprint.progress_epoch,
+                    fingerprint.activity_epoch,
+                    candidate.first_seen.load<libk::MemoryOrder::Acquire>(),
+                    fingerprint.driver.identity,
+                    fingerprint.blocker.identity);
+            }
         }
     }
 
@@ -691,19 +700,26 @@ void print_concurrency(
 #endif
 
     if (graph != nullptr) {
-        concurrency::ObservationKey root{};
-        const auto candidate_state = core.candidate.state.load<
-            libk::MemoryOrder::Acquire>();
-        if (candidate_state != static_cast<u32>(
-                concurrency::WatchdogCandidate::State::Clear)) {
+        concurrency::NodeRef root{};
+        for (usize slot = 0;
+             slot < concurrency::CpuDiagnosticsCore::candidate_capacity;
+             ++slot) {
+            const auto& candidate = core.candidates[slot];
+            const auto candidate_state = candidate.state.load<
+                libk::MemoryOrder::Acquire>();
+            if (candidate_state == static_cast<u32>(
+                    concurrency::WatchdogCandidate::State::Clear)) {
+                continue;
+            }
             concurrency::StallFingerprint fingerprint{};
-            if (core.candidate.read(fingerprint)) {
-                root = fingerprint.key;
+            if (candidate.read(fingerprint)) {
+                root = fingerprint.root;
+                break;
             }
         }
         if (!root) {
-            root = concurrency::ObservationKey{
-                has_wait ? wait.wait : 0};
+            root = concurrency::NodeRef::observation(
+                concurrency::ObservationKey{has_wait ? wait.wait : 0});
         }
         if (!root && core.observations != nullptr) {
             const u64 watched = core.observations->watched();
@@ -711,7 +727,8 @@ void print_concurrency(
                  index < concurrency::ObservationShard::slot_count;
                  ++index) {
                 if ((watched & (u64{1} << index)) != 0) {
-                    root = core.observations->key_at(index);
+                    root = concurrency::NodeRef::observation(
+                        core.observations->key_at(index));
                     if (root) {
                         break;
                     }

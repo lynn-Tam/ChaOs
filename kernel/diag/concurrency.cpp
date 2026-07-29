@@ -117,18 +117,40 @@ ObservationKey probe_fillers[ObservationShard::slot_count / 2]{};
 }
 
 #if MYOS_CONCURRENCY_DIAG >= 1
+enum class HashMode : u8 {
+    Coherent,
+    Relation,
+};
+
 [[nodiscard]] constexpr auto mix_hash(u64 hash, u64 value) noexcept -> u64 {
     hash ^= value + u64{0x9e3779b97f4a7c15}
         + (hash << 6) + (hash >> 2);
     return hash;
 }
 
+[[nodiscard]] constexpr auto cpu_stall_generation(
+    u64 entered,
+    u32 phase) noexcept -> u64 {
+    constexpr u64 mask = (u64{1} << 56) - 1;
+    const u64 generation =
+        mix_hash(mix_hash(u64{0x7e92d8a153}, entered), phase) & mask;
+    return generation <= NodeRef::cpu_generation
+        ? generation + 2 : generation;
+}
+
 [[nodiscard]] auto snapshot_hash(
-    const ObservationSnapshot& snapshot) noexcept -> u64 {
+    const ObservationSnapshot& snapshot,
+    HashMode mode = HashMode::Coherent) noexcept -> u64 {
     u64 hash = u64{0x243f6a8885a308d3};
     hash = mix_hash(hash, snapshot.generation);
-    hash = mix_hash(hash, snapshot.activity_epoch);
-    hash = mix_hash(hash, snapshot.progress_epoch);
+    // Coherent graph fingerprints include both counters so a second snapshot
+    // notices any concurrent update. Stall candidates compare semantic state;
+    // their activity interval is checked below and progress is compared
+    // separately.
+    if (mode == HashMode::Coherent) {
+        hash = mix_hash(hash, snapshot.activity_epoch);
+        hash = mix_hash(hash, snapshot.progress_epoch);
+    }
     hash = mix_hash(hash, static_cast<u64>(snapshot.record_kind));
     hash = mix_hash(hash, snapshot.phase);
     hash = mix_hash(hash, static_cast<u64>(snapshot.wait_kind));
@@ -151,9 +173,11 @@ ObservationKey probe_fillers[ObservationShard::slot_count / 2]{};
     hash = mix_hash(hash, snapshot.blocker.identity);
     hash = mix_hash(hash, static_cast<u64>(snapshot.blocker.kind));
     hash = mix_hash(hash, snapshot.blocker.generation);
-    hash = mix_hash(hash, snapshot.semantic_stamp);
-    for (const u64 value : snapshot.detail) {
-        hash = mix_hash(hash, value);
+    if (mode == HashMode::Coherent) {
+        hash = mix_hash(hash, snapshot.semantic_stamp);
+        for (const u64 value : snapshot.detail) {
+            hash = mix_hash(hash, value);
+        }
     }
     return hash;
 }
@@ -182,61 +206,27 @@ struct WatchdogThresholds final {
     }
 };
 
-constinit libk::Atomic<u64> stall_owner{
-    libk::numeric_limits<u64>::max()};
-
 [[nodiscard]] auto report_stall(
     CpuId watcher,
     CpuId target,
-    ObservationKey key,
+    NodeRef root,
     WatchdogCandidate::State state,
-    u64 age) noexcept -> bool {
-    u64 token = mix_hash(u64{0x42}, target.raw);
-    token = mix_hash(token, key.raw);
-    token = mix_hash(token, static_cast<u64>(state));
-    if (token == libk::numeric_limits<u64>::max()) {
-        token = 0;
-    }
-    u64 expected = libk::numeric_limits<u64>::max();
-    if (stall_owner.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, token)) {
-        diag::console::print<
-            "[concurrency] watchdog confirmed cpu={} target={} key={:#x} "
-            "state={} age={}\n">(
-            watcher.raw,
-            target.raw,
-            key.raw,
-            static_cast<u32>(state),
-            age);
-        return true;
-    }
-    return false;
-}
-
-[[nodiscard]] auto report_cpu_stall(
-    CpuId watcher,
-    CpuId target,
-    u64 kind,
-    u64 age) noexcept -> bool {
-    // CPU-live roots have no ObservationKey. Keep their coordinator token in
-    // a disjoint high-bit namespace so a stalled CPU cannot alias a slot key.
-    u64 token = mix_hash(u64{0x7e}, target.raw);
-    token = mix_hash(token, kind);
-    if (token == libk::numeric_limits<u64>::max()) {
-        token = 0;
-    }
-    u64 expected = libk::numeric_limits<u64>::max();
-    if (stall_owner.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, token)) {
-        diag::console::print<
-            "[concurrency] watchdog confirmed cpu-live cpu={} target={} "
-            "kind={} age={}\n">(
-            watcher.raw, target.raw, kind, age);
-        return true;
-    }
-    return false;
+    StallClass classification,
+    EvidenceGrade evidence,
+    u64 age) noexcept {
+    diag::console::print<
+        "[concurrency] watchdog confirmed cpu={} target={} "
+        "root-kind={} root={:#x} "
+        "state={} class={} evidence={} age={}\n">(
+        watcher.raw,
+        target.raw,
+        static_cast<u32>(root.kind),
+        root.identity,
+        static_cast<u32>(state),
+        stall_class_name(classification),
+        static_cast<u32>(evidence),
+        age);
+    return true;
 }
 
 [[nodiscard]] auto thresholds_for(
@@ -461,14 +451,17 @@ void WatchdogCandidate::publish(const StallFingerprint& value) noexcept {
     if (!AtomicSnapshotWriter::begin(fingerprint_sequence, odd)) {
         return;
     }
-    fingerprint_key.store<libk::MemoryOrder::Relaxed>(value.key.raw);
-    fingerprint_generation.store<libk::MemoryOrder::Relaxed>(value.generation);
+    root_identity.store<libk::MemoryOrder::Relaxed>(value.root.identity);
+    root_kind.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u32>(value.root.kind));
+    root_generation.store<libk::MemoryOrder::Relaxed>(
+        value.root.generation);
     fingerprint_phase.store<libk::MemoryOrder::Relaxed>(value.phase);
     fingerprint_progress.store<libk::MemoryOrder::Relaxed>(
         value.progress_epoch);
     fingerprint_activity.store<libk::MemoryOrder::Relaxed>(
         value.activity_epoch);
-    fingerprint_hash.store<libk::MemoryOrder::Relaxed>(value.state_hash);
+    relation_hash.store<libk::MemoryOrder::Relaxed>(value.relation_hash);
     driver_identity.store<libk::MemoryOrder::Relaxed>(value.driver.identity);
     driver_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(value.driver.kind));
@@ -489,16 +482,17 @@ auto WatchdogCandidate::read(StallFingerprint& value) const noexcept -> bool {
             continue;
         }
         StallFingerprint candidate{};
-        candidate.key = ObservationKey{
-            fingerprint_key.load<libk::MemoryOrder::Relaxed>()};
-        candidate.generation = fingerprint_generation.load<
-            libk::MemoryOrder::Relaxed>();
+        candidate.root = NodeRef{
+            static_cast<NodeRef::Kind>(
+                root_kind.load<libk::MemoryOrder::Relaxed>()),
+            root_identity.load<libk::MemoryOrder::Relaxed>(),
+            root_generation.load<libk::MemoryOrder::Relaxed>()};
         candidate.phase = fingerprint_phase.load<libk::MemoryOrder::Relaxed>();
         candidate.progress_epoch = fingerprint_progress.load<
             libk::MemoryOrder::Relaxed>();
         candidate.activity_epoch = fingerprint_activity.load<
             libk::MemoryOrder::Relaxed>();
-        candidate.state_hash = fingerprint_hash.load<
+        candidate.relation_hash = relation_hash.load<
             libk::MemoryOrder::Relaxed>();
         candidate.driver = NodeRef{
             static_cast<NodeRef::Kind>(driver_kind.load<
@@ -2419,6 +2413,140 @@ auto CpuLive::top_wait(WaitSnapshot& result) const noexcept -> bool {
     return false;
 }
 
+auto CpuLive::snapshot(
+    Snapshot& result,
+    SnapshotMode mode) const noexcept -> bool {
+#if MYOS_CONCURRENCY_PROBE == 4
+    Snapshot debug_first{};
+    Snapshot debug_second{};
+    u32 debug_depth{};
+    u32 debug_second_depth{};
+#endif
+    const auto read_scalars = [&](Snapshot& value) noexcept -> u32 {
+        value.dispatch_epoch =
+            dispatch_epoch.load<libk::MemoryOrder::Acquire>();
+        value.timer_epoch = timer_epoch.load<libk::MemoryOrder::Acquire>();
+        value.trap_entered_at =
+            trap_entered_at.load<libk::MemoryOrder::Acquire>();
+        value.irq_disabled_since =
+            irq_disabled_since.load<libk::MemoryOrder::Acquire>();
+        value.current_actor =
+            current_actor.load<libk::MemoryOrder::Acquire>();
+        value.activity_epoch =
+            wait_activity_epoch.load<libk::MemoryOrder::Acquire>();
+        value.progress_epoch =
+            wait_progress_epoch.load<libk::MemoryOrder::Acquire>();
+        value.semantic_stamp =
+            wait_semantic_stamp.load<libk::MemoryOrder::Acquire>();
+        value.last_event_at =
+            last_event_at.load<libk::MemoryOrder::Acquire>();
+        value.context = context.load<libk::MemoryOrder::Acquire>();
+        value.trap_depth = trap_depth.load<libk::MemoryOrder::Acquire>();
+        value.irq_depth = irq_depth.load<libk::MemoryOrder::Acquire>();
+        value.degraded = degraded.load<libk::MemoryOrder::Acquire>();
+        if (wait_overflow.load<libk::MemoryOrder::Acquire>() != 0) {
+            value.degraded |= DiagnosticStatus::WaitStackOverflow;
+        }
+        value.interrupts_disabled =
+            interrupts_disabled.load<libk::MemoryOrder::Acquire>();
+        return wait_depth.load<libk::MemoryOrder::Acquire>();
+    };
+    const auto same_scalars = [mode](const Snapshot& left,
+                                     const Snapshot& right) noexcept {
+        return left.dispatch_epoch == right.dispatch_epoch
+            && left.trap_entered_at == right.trap_entered_at
+            && left.irq_disabled_since == right.irq_disabled_since
+            && left.current_actor == right.current_actor
+            && left.progress_epoch == right.progress_epoch
+            && left.semantic_stamp == right.semantic_stamp
+            && left.context == right.context
+            && left.trap_depth == right.trap_depth
+            && left.irq_depth == right.irq_depth
+            && left.degraded == right.degraded
+            && left.interrupts_disabled == right.interrupts_disabled
+            && (mode == SnapshotMode::Relation
+                || (left.timer_epoch == right.timer_epoch
+                    && left.activity_epoch == right.activity_epoch
+                    && left.last_event_at == right.last_event_at));
+    };
+    const auto same_wait = [](const WaitSnapshot& left,
+                              const WaitSnapshot& right) noexcept {
+        return left.wait == right.wait
+            && left.subject == right.subject
+            && left.driver == right.driver
+            && left.obligation == right.obligation
+            && left.since == right.since
+            && left.kind == right.kind
+            && left.site.file == right.site.file
+            && left.site.line == right.site.line;
+    };
+    for (usize attempt = 0; attempt < 3; ++attempt) {
+        Snapshot first{};
+        const u32 depth = read_scalars(first);
+        if (depth > wait_capacity) {
+            continue;
+        }
+        first.has_wait = depth != 0;
+        if (first.has_wait && !top_wait(first.wait)) {
+            continue;
+        }
+        Snapshot second{};
+        const u32 second_depth = read_scalars(second);
+#if MYOS_CONCURRENCY_PROBE == 4
+        debug_first = first;
+        debug_second = second;
+        debug_depth = depth;
+        debug_second_depth = second_depth;
+#endif
+        second.has_wait = second_depth != 0;
+        if (second.has_wait && !top_wait(second.wait)) {
+            continue;
+        }
+        if (depth != second_depth
+            || !same_scalars(first, second)
+            || (first.has_wait && !same_wait(first.wait, second.wait))) {
+            continue;
+        }
+        result = first;
+        return true;
+    }
+#if MYOS_CONCURRENCY_PROBE == 4
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage B claimed-operation probe after
+    // relation snapshot instability is externally observable.
+    if (mode == SnapshotMode::Relation) {
+        const u32 previous =
+            probe_errors.fetch_or<libk::MemoryOrder::AcqRel>(1U << 29);
+        if ((previous & (1U << 29)) == 0) {
+            diag::console::print<
+                "concurrency-probe: stage-c cpu-snapshot-rejected "
+                "depth={}/{} dispatch={}/{} trap={}/{} irq={}/{} "
+                "actor={:#x}/{:#x} progress={}/{} semantic={}/{} "
+                "context={}/{} degraded={:#x}/{:#x}\n">(
+                debug_depth,
+                debug_second_depth,
+                debug_first.dispatch_epoch,
+                debug_second.dispatch_epoch,
+                debug_first.trap_depth,
+                debug_second.trap_depth,
+                debug_first.irq_depth,
+                debug_second.irq_depth,
+                debug_first.current_actor,
+                debug_second.current_actor,
+                debug_first.progress_epoch,
+                debug_second.progress_epoch,
+                debug_first.semantic_stamp,
+                debug_second.semantic_stamp,
+                debug_first.context,
+                debug_second.context,
+                debug_first.degraded,
+                debug_second.degraded);
+        }
+    }
+#endif
+    return false;
+}
+
 void watchdog_tick(CpuId cpu, u64 tick) noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 3
     CpuDiagnosticsCore* const watcher = current_core();
@@ -2456,93 +2584,300 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             }
         }
     }
-    if (shard == nullptr) {
-        watcher->candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WatchdogCandidate::State::Clear));
-        return;
-    }
-    const u64 live_hard = target_core->policy.critical_hard;
-    const u64 live_soft = target_core->policy.critical_soft;
-    CpuLive::WaitSnapshot live_wait{};
-    const bool live_wait_valid = target_core->live.top_wait(live_wait);
-    const auto inspect_live = [&](libk::Atomic<u64>& since,
-                                  DiagnosticStatus::Flag flag,
-                                  u64 kind) noexcept {
-        const u64 entered = since.load<libk::MemoryOrder::Acquire>();
-        const bool stalled = live_hard != 0 && entered != 0
-            && elapsed(tick, entered) >= live_hard;
-        if (stalled) {
-            const u32 previous = target_core->status().flags.fetch_or<
-                libk::MemoryOrder::AcqRel>(flag);
-            if ((previous & flag) == 0) {
-                record(
-                    FlightDomain::Watchdog,
-                    FlightEvent::WatchdogConfirmed,
-                    target_core->live.current_actor.load<
-                        libk::MemoryOrder::Acquire>(),
-                    live_wait_valid ? live_wait.obligation : 0,
-                    kind,
-                    elapsed(tick, entered),
-                    target_core->live.context.load<
-                        libk::MemoryOrder::Acquire>());
-                static_cast<void>(target_core->status().flags.fetch_or<
-                    libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
-                static_cast<void>(report_cpu_stall(
-                    cpu, target_cpu, kind, elapsed(tick, entered)));
+    const auto process = [&](StallFingerprint sample,
+                             WatchdogThresholds thresholds,
+                             StallAction action,
+                             WaitKind wait_kind) noexcept {
+        WatchdogCandidate* slot{};
+        for (WatchdogCandidate& candidate : watcher->candidates) {
+            StallFingerprint existing{};
+            if (candidate.read(existing) && existing.root == sample.root) {
+                slot = &candidate;
+                break;
             }
-        } else if (entered == 0
-            || live_soft == 0
-            || elapsed(tick, entered) < live_soft) {
-            static_cast<void>(target_core->status().flags.fetch_and<
-                libk::MemoryOrder::AcqRel>(~static_cast<u32>(flag)));
         }
+        if (slot == nullptr) {
+            const usize replacement = watcher->candidate_cursor.fetch_add<
+                libk::MemoryOrder::AcqRel>(1)
+                % CpuDiagnosticsCore::candidate_capacity;
+            slot = &watcher->candidates[replacement];
+            slot->state.store<libk::MemoryOrder::Release>(
+                static_cast<u32>(WatchdogCandidate::State::Clear));
+        }
+
+        StallFingerprint previous{};
+        const bool valid = slot->read(previous);
+        auto state = static_cast<WatchdogCandidate::State>(
+            slot->state.load<libk::MemoryOrder::Acquire>());
+        const bool same = valid
+            && previous.root == sample.root
+            && previous.phase == sample.phase
+            && previous.progress_epoch == sample.progress_epoch
+            && previous.relation_hash == sample.relation_hash
+            && previous.driver == sample.driver
+            && previous.blocker == sample.blocker;
+        if (!same) {
+            slot->publish(sample);
+            slot->first_seen.store<libk::MemoryOrder::Release>(0);
+            slot->state.store<libk::MemoryOrder::Release>(
+                static_cast<u32>(WatchdogCandidate::State::Clear));
+            return;
+        }
+
+        const bool active =
+            sample.activity_epoch != previous.activity_epoch;
+        slot->publish(sample);
+        if (tick < thresholds.soft_at) {
+            return;
+        }
+        const u64 age = tick >= thresholds.anchor
+            ? elapsed(tick, thresholds.anchor) : 0;
+        if (state == WatchdogCandidate::State::Clear) {
+            slot->first_seen.store<libk::MemoryOrder::Release>(tick);
+            state = active
+                ? WatchdogCandidate::State::SuspectedActive
+                : WatchdogCandidate::State::Suspected;
+            slot->state.store<libk::MemoryOrder::Release>(
+                static_cast<u32>(state));
+            record(
+                FlightDomain::Watchdog,
+                FlightEvent::WatchdogSuspected,
+                cpu.raw,
+                sample.root.identity,
+                static_cast<u64>(wait_kind),
+                age);
+            return;
+        }
+        if (state == WatchdogCandidate::State::Suspected && active) {
+            state = WatchdogCandidate::State::SuspectedActive;
+            slot->state.store<libk::MemoryOrder::Release>(
+                static_cast<u32>(state));
+        }
+        if ((state != WatchdogCandidate::State::Suspected
+                && state != WatchdogCandidate::State::SuspectedActive)
+            || tick < thresholds.hard_at) {
+            return;
+        }
+
+        u64 report_signature{};
+        bool owns_report{};
+        if (action != StallAction::Record) {
+            report_signature = mix_hash(
+                mix_hash(
+                    mix_hash(
+                        mix_hash(
+                            mix_hash(u64{0x27d4eb2f165667c5},
+                                static_cast<u64>(sample.root.kind)),
+                            sample.root.identity),
+                        sample.root.generation),
+                    sample.progress_epoch),
+                sample.relation_hash);
+            report_signature = mix_hash(
+                report_signature, thresholds.anchor);
+            if (report_signature == 0) {
+                report_signature = 1;
+            }
+            u64 expected{};
+            const u64 owner_token = cpu.raw + 1;
+            if (!target_core->coordinator.owner.compare_exchange_strong<
+                    libk::MemoryOrder::AcqRel,
+                    libk::MemoryOrder::Acquire>(
+                        expected, owner_token)) {
+                return;
+            }
+            owns_report = true;
+            bool duplicate_report{};
+            for (const libk::Atomic<u64>& signature
+                 : target_core->coordinator.signatures) {
+                duplicate_report = duplicate_report
+                    || signature.load<libk::MemoryOrder::Acquire>()
+                        == report_signature;
+            }
+            if (duplicate_report) {
+                const auto duplicate = state
+                        == WatchdogCandidate::State::SuspectedActive
+                    ? WatchdogCandidate::State::ConfirmedLivelock
+                    : WatchdogCandidate::State::Confirmed;
+                slot->state.store<libk::MemoryOrder::Release>(
+                    static_cast<u32>(duplicate));
+                target_core->coordinator.owner.store<
+                    libk::MemoryOrder::Release>(0);
+                return;
+            }
+        }
+        const auto release_report = [&]() noexcept {
+            if (owns_report) {
+                target_core->coordinator.owner.store<
+                    libk::MemoryOrder::Release>(0);
+            }
+        };
+
+        WaitGraphScratch& graph = watcher->graph;
+        if (!analyze(sample.root, graph)
+            || graph.evidence != EvidenceGrade::Confirmed) {
+            record(
+                FlightDomain::Watchdog,
+                FlightEvent::ObservationDegraded,
+                cpu.raw,
+                sample.root.identity,
+                static_cast<u64>(graph.evidence),
+                static_cast<u64>(graph.classification));
+#if MYOS_CONCURRENCY_PROBE == 4
+            //Confirmatory experiment.
+            // Exit condition: remove with the Stage B claimed-operation
+            // fault probe once an external runner captures analyzer evidence.
+            const u32 previous =
+                probe_errors.fetch_or<libk::MemoryOrder::AcqRel>(1U << 31);
+            if ((previous & (1U << 31)) == 0) {
+                diag::console::print<
+                    "concurrency-probe: stage-c analyzer-rejected "
+                    "root={:#x} evidence={} class={} count={}\n">(
+                    sample.root.identity,
+                    static_cast<u32>(graph.evidence),
+                    static_cast<u32>(graph.classification),
+                    graph.count);
+            }
+#endif
+            release_report();
+            return;
+        }
+        const bool livelock =
+            state == WatchdogCandidate::State::SuspectedActive;
+        const auto confirmed = livelock
+            ? WatchdogCandidate::State::ConfirmedLivelock
+            : WatchdogCandidate::State::Confirmed;
+        if (livelock) {
+            graph.classification = StallClass::Livelock;
+        }
+        slot->state.store<libk::MemoryOrder::Release>(
+            static_cast<u32>(confirmed));
+        record(
+            FlightDomain::Watchdog,
+            livelock ? FlightEvent::WatchdogLivelock
+                     : FlightEvent::WatchdogConfirmed,
+            cpu.raw,
+            sample.root.identity,
+            static_cast<u64>(confirmed),
+            age);
+        if (owns_report) {
+            const usize signature_index =
+                target_core->coordinator.signature_cursor.fetch_add<
+                    libk::MemoryOrder::AcqRel>(1)
+                % StallCoordinator::signature_capacity;
+            target_core->coordinator.signatures[signature_index].store<
+                libk::MemoryOrder::Release>(report_signature);
+        }
+        if (action != StallAction::Record
+            && report_stall(
+                cpu,
+                target_cpu,
+                sample.root,
+                confirmed,
+                graph.classification,
+                graph.evidence,
+                age)) {
+            static_cast<void>(target_core->status().flags.fetch_or<
+                libk::MemoryOrder::Release>(
+                DiagnosticStatus::StallReported));
+        }
+        release_report();
     };
-    // The local watchdog runs from the timer trap with interrupts masked and
-    // trap_depth/irq_depth elevated by that very callback.  It cannot be
-    // evidence that this CPU is wedged: if local interrupts were genuinely
-    // disabled, no later timer callback could observe the condition.  CPU-live
-    // roots therefore require a peer; the local shard is still inspected for
-    // ordinary observation obligations below.
+
+    // A local timer callback cannot prove that its own interrupts or trap
+    // return are wedged. CPU-live roots therefore require an independent peer.
     if (target_core != watcher) {
-        inspect_live(
-            target_core->live.irq_disabled_since,
-            DiagnosticStatus::IrqStall,
-            1);
-        inspect_live(
-            target_core->live.trap_entered_at,
-            DiagnosticStatus::TrapStall,
-            2);
+        CpuLive::Snapshot live{};
+        if (target_core->live.snapshot(live)) {
+            const auto inspect_live = [&](u64 entered,
+                                          DiagnosticStatus::Flag flag,
+                                          u32 phase) noexcept {
+                if (entered == 0
+                    || target_core->policy.critical_soft == 0
+                    || target_core->policy.critical_hard == 0) {
+                    static_cast<void>(target_core->status().flags.fetch_and<
+                        libk::MemoryOrder::AcqRel>(
+                            ~static_cast<u32>(flag)));
+                    return;
+                }
+                const u64 soft_at = add_sat(
+                    entered, target_core->policy.critical_soft);
+                if (tick >= soft_at) {
+                    static_cast<void>(target_core->status().flags.fetch_or<
+                        libk::MemoryOrder::Release>(flag));
+                } else {
+                    static_cast<void>(target_core->status().flags.fetch_and<
+                        libk::MemoryOrder::AcqRel>(
+                            ~static_cast<u32>(flag)));
+                }
+                u64 relation = mix_hash(
+                    u64{0x7e92d8a153}, target_cpu.raw);
+                relation = mix_hash(relation, phase);
+                relation = mix_hash(relation, entered);
+                relation = mix_hash(relation, live.current_actor);
+                relation = mix_hash(relation, live.context);
+                process(
+                    StallFingerprint{
+                        NodeRef{
+                            NodeRef::Kind::Cpu,
+                            target_cpu.raw,
+                            cpu_stall_generation(entered, phase)},
+                        phase,
+                        0,
+                        live.last_event_at,
+                        relation,
+                        live.has_wait ? live.wait.driver : NodeRef{},
+                        {}},
+                    WatchdogThresholds{
+                        entered,
+                        soft_at,
+                        add_sat(
+                            entered,
+                            target_core->policy.critical_hard)},
+                    StallAction::Report,
+                    phase == 1 ? WaitKind::Irq : WaitKind::Unknown);
+            };
+            inspect_live(
+                live.irq_disabled_since, DiagnosticStatus::IrqStall, 1);
+            inspect_live(
+                live.trap_entered_at, DiagnosticStatus::TrapStall, 2);
+        }
     }
 
+    if (shard == nullptr) {
+        return;
+    }
     const u64 watched = shard->watched();
-    ObservationKey key{};
-    ObservationSnapshot snapshot{};
-    WatchdogThresholds selected_thresholds{};
-    u64 selected_hash{};
-    u64 selected_age{};
-    bool selected{};
-    for (usize index = 0; index < ObservationShard::slot_count; ++index) {
+    const usize start = watcher->scan_cursor.fetch_add<
+        libk::MemoryOrder::AcqRel>(1)
+        % ObservationShard::slot_count;
+    usize accepted{};
+    for (usize offset = 0;
+         offset < ObservationShard::slot_count
+             && accepted < CpuDiagnosticsCore::candidate_capacity;
+         ++offset) {
+        const usize index =
+            (start + offset) % ObservationShard::slot_count;
         if ((watched & bit(index)) == 0) {
             continue;
         }
-        const ObservationKey candidate_key = shard->key_at(index);
-        ObservationSnapshot candidate_snapshot{};
-        if (!candidate_key || !shard->snapshot(candidate_key, candidate_snapshot)) {
+        const ObservationKey key = shard->key_at(index);
+        ObservationSnapshot snapshot{};
+        if (!key || !shard->snapshot(key, snapshot)) {
             continue;
         }
         ObservationSnapshot wait_target{};
         const ObservationSnapshot* delegated{};
-        if (candidate_snapshot.record_kind == RecordKind::ExecutionActor
-            && candidate_snapshot.phase == static_cast<u32>(
+        if (snapshot.record_kind == RecordKind::ExecutionActor
+            && snapshot.phase == static_cast<u32>(
                 ExecutionState::Blocked)) {
-            if (!candidate_snapshot.waiter_key) {
+            if (!snapshot.waiter_key) {
                 static_cast<void>(target_core->status().flags.fetch_or<
                     libk::MemoryOrder::Release>(
                         DiagnosticStatus::PolicyMissing));
                 continue;
             }
-            ObservationLease lease = ObservationLease::borrow(
-                candidate_snapshot.waiter_key);
+            ObservationLease lease =
+                ObservationLease::borrow(snapshot.waiter_key);
             if (!lease || !lease.snapshot(wait_target)) {
                 static_cast<void>(target_core->status().flags.fetch_or<
                     libk::MemoryOrder::Release>(
@@ -2551,134 +2886,34 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             }
             delegated = &wait_target;
         }
-        const WatchdogThresholds candidate_thresholds = thresholds_for(
-            target_core->policy, candidate_snapshot, delegated);
-        if (!candidate_thresholds) {
+        const WatchdogThresholds thresholds = thresholds_for(
+            target_core->policy, snapshot, delegated);
+        if (!thresholds) {
             continue;
         }
-        // An absolute business/refill deadline may still be in the future.
-        // Unsigned elapsed() would wrap and let that legitimate future
-        // obligation outrank every already-mature stall candidate.
-        const u64 candidate_age = tick >= candidate_thresholds.anchor
-            ? elapsed(tick, candidate_thresholds.anchor) : 0;
-        if (!selected || candidate_age > selected_age) {
-            key = candidate_key;
-            snapshot = candidate_snapshot;
-            selected_thresholds = candidate_thresholds;
-            selected_hash = snapshot_hash(candidate_snapshot);
-            if (delegated != nullptr) {
-                selected_hash = mix_hash(
-                    selected_hash, snapshot_hash(*delegated));
-            }
-            selected_age = candidate_age;
-            selected = true;
+        u64 relation = snapshot_hash(snapshot, HashMode::Relation);
+        u64 progress = snapshot.progress_epoch;
+        u64 activity = snapshot.activity_epoch;
+        if (delegated != nullptr) {
+            relation = mix_hash(
+                relation,
+                snapshot_hash(*delegated, HashMode::Relation));
+            progress = mix_hash(progress, delegated->progress_epoch);
+            activity = mix_hash(activity, delegated->activity_epoch);
         }
-    }
-    if (!selected || !key || !selected_thresholds) {
-        watcher->candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WatchdogCandidate::State::Clear));
-        return;
-    }
-
-    WatchdogCandidate& candidate = watcher->candidate;
-    StallFingerprint previous{};
-    const bool previous_valid = candidate.read(previous);
-    const auto state = static_cast<WatchdogCandidate::State>(
-        candidate.state.load<libk::MemoryOrder::Acquire>());
-    const bool same = previous_valid && previous.key == key
-        && previous.generation == snapshot.generation
-        && previous.phase == snapshot.phase
-        && previous.progress_epoch == snapshot.progress_epoch
-        && previous.state_hash == selected_hash
-        && previous.driver.kind == snapshot.driver.kind
-        && previous.driver.identity == snapshot.driver.identity
-        && previous.driver.generation == snapshot.driver.generation
-        && previous.blocker.kind == snapshot.blocker.kind
-        && previous.blocker.identity == snapshot.blocker.identity
-        && previous.blocker.generation == snapshot.blocker.generation;
-
-    const u64 age = tick >= selected_thresholds.anchor
-        ? elapsed(tick, selected_thresholds.anchor) : 0;
-    if (!same) {
-        candidate.publish(StallFingerprint{
-            key,
-            snapshot.generation,
-            snapshot.phase,
-            snapshot.progress_epoch,
-            snapshot.activity_epoch,
-            selected_hash,
-            snapshot.driver,
-            snapshot.blocker});
-        candidate.first_seen.store<libk::MemoryOrder::Release>(0);
-        candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WatchdogCandidate::State::Clear));
-        return;
-    }
-
-    const u64 current_hash = selected_hash;
-    const bool active = snapshot.activity_epoch != previous.activity_epoch
-        && snapshot.progress_epoch == previous.progress_epoch;
-    candidate.publish(StallFingerprint{
-        key,
-        snapshot.generation,
-        snapshot.phase,
-        snapshot.progress_epoch,
-        snapshot.activity_epoch,
-        current_hash,
-        snapshot.driver,
-        snapshot.blocker});
-    if (tick < selected_thresholds.soft_at) {
-        return;
-    }
-    if (state == WatchdogCandidate::State::Clear) {
-        candidate.first_seen.store<libk::MemoryOrder::Release>(tick);
-        candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WatchdogCandidate::State::Suspected));
-        record(
-            FlightDomain::Watchdog,
-            FlightEvent::WatchdogSuspected,
-            cpu.raw,
-            key.raw,
-            static_cast<u64>(snapshot.wait_kind),
-            age);
-    } else if (state == WatchdogCandidate::State::Suspected
-        && tick >= selected_thresholds.hard_at) {
-        const auto confirmed = active
-            ? WatchdogCandidate::State::ConfirmedLivelock
-            : WatchdogCandidate::State::Confirmed;
-        candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(confirmed));
-        record(
-            FlightDomain::Watchdog,
-            active ? FlightEvent::WatchdogLivelock
-                   : FlightEvent::WatchdogConfirmed,
-            cpu.raw,
-            key.raw,
-            static_cast<u64>(confirmed),
-            age);
-        if (report_stall(cpu, target_cpu, key, confirmed, age)) {
-            static_cast<void>(target_core->status().flags.fetch_or<
-                libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
-        }
-    } else if (state == WatchdogCandidate::State::Confirmed && active) {
-        candidate.state.store<libk::MemoryOrder::Release>(
-            static_cast<u32>(WatchdogCandidate::State::ConfirmedLivelock));
-        record(
-            FlightDomain::Watchdog,
-            FlightEvent::WatchdogLivelock,
-            cpu.raw,
-            key.raw,
-            static_cast<u64>(WatchdogCandidate::State::ConfirmedLivelock),
-            age);
-        if (report_stall(
-                cpu,
-                target_cpu,
-                key,
-                WatchdogCandidate::State::ConfirmedLivelock,
-                age)) {
-            static_cast<void>(target_core->status().flags.fetch_or<
-                libk::MemoryOrder::Release>(DiagnosticStatus::StallReported));
-        }
+        process(
+            StallFingerprint{
+                NodeRef::observation(key),
+                snapshot.phase,
+                progress,
+                activity,
+                relation,
+                snapshot.driver,
+                snapshot.blocker},
+            thresholds,
+            snapshot.policy.action,
+            snapshot.wait_kind);
+        ++accepted;
     }
 #else
     static_cast<void>(cpu);
@@ -3148,6 +3383,10 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
         || snapshot.record_kind == RecordKind::Shootdown) {
         return StallClass::TransportStall;
     }
+    if (snapshot.record_kind == RecordKind::ServiceWork
+        || snapshot.wait_kind == WaitKind::GrantWork) {
+        return StallClass::LostServiceKick;
+    }
     if (is_drain_wait(snapshot.wait_kind)
         || snapshot.record_kind == RecordKind::GrantRevoke
         || snapshot.record_kind == RecordKind::ResourceClose
@@ -3171,10 +3410,6 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
     if (snapshot.wait_kind == WaitKind::SchedulerRefill) {
         return StallClass::TimerStall;
     }
-    if (snapshot.record_kind == RecordKind::ServiceWork
-        || snapshot.wait_kind == WaitKind::GrantWork) {
-        return StallClass::LostServiceKick;
-    }
     if (snapshot.driver.kind == NodeRef::Kind::Cpu
         || snapshot.wait_kind == WaitKind::SpinLock) {
         return StallClass::OpenOwnerStall;
@@ -3190,27 +3425,33 @@ auto analyze(
     WaitGraphScratch& scratch) noexcept -> bool {
 #if MYOS_CONCURRENCY_DIAG >= 1
     scratch.classification = StallClass::None;
+    scratch.evidence = EvidenceGrade::None;
     scratch.count = 0;
     scratch.truncated = false;
     for (usize index = 0; index < graph_capacity; ++index) {
         scratch.set_node(index, {});
         scratch.path_meta[index] = 0;
         scratch.fingerprints[index] = 0;
+        scratch.parents[index] = 0xffU;
     }
     if (!root) {
         scratch.classification = StallClass::Inconclusive;
+        scratch.evidence = EvidenceGrade::Inconclusive;
         return false;
     }
 
-    const auto read_cpu = [&](NodeRef node,
-                              CpuLive::WaitSnapshot& result) noexcept -> bool {
+    const auto registry = [&]() noexcept -> CpuRegistry* {
         void* const owner = arch::current_cpu_owner();
         if (owner == nullptr) {
-            return false;
+            return nullptr;
         }
         auto& local = *static_cast<CpuLocal*>(owner);
-        CpuRegistry* const registry = local.runtime_ == nullptr
+        return local.runtime_ == nullptr
             ? nullptr : local.runtime_->owner_registry;
+    }();
+    const auto read_cpu = [&](NodeRef node,
+                              CpuLive::Snapshot& result,
+                              bool& degraded) noexcept -> bool {
         if (registry == nullptr) {
             return false;
         }
@@ -3223,39 +3464,89 @@ auto analyze(
             || runtime->diagnostics == nullptr) {
             return false;
         }
-        return runtime->diagnostics->concurrency.live.top_wait(result);
+        const auto mode = node.generation == NodeRef::cpu_generation
+            ? CpuLive::SnapshotMode::Relation
+            : CpuLive::SnapshotMode::Strict;
+        if (!runtime->diagnostics->concurrency.live.snapshot(result, mode)) {
+            return false;
+        }
+        degraded = result.degraded != 0;
+        return true;
+    };
+
+    const auto cpu_hash = [&](const CpuLive::Snapshot& cpu,
+                              bool strict_live) noexcept -> u64 {
+        u64 hash = u64{0x517cc1b727220a95};
+        hash = mix_hash(hash, cpu.dispatch_epoch);
+        hash = mix_hash(hash, cpu.trap_entered_at);
+        hash = mix_hash(hash, cpu.irq_disabled_since);
+        hash = mix_hash(hash, cpu.current_actor);
+        hash = mix_hash(hash, cpu.progress_epoch);
+        hash = mix_hash(hash, cpu.semantic_stamp);
+        hash = mix_hash(hash, cpu.context);
+        hash = mix_hash(hash, cpu.trap_depth);
+        hash = mix_hash(hash, cpu.irq_depth);
+        hash = mix_hash(hash, cpu.degraded);
+        hash = mix_hash(hash, cpu.interrupts_disabled);
+        if (strict_live) {
+            hash = mix_hash(hash, cpu.timer_epoch);
+            hash = mix_hash(hash, cpu.activity_epoch);
+            hash = mix_hash(hash, cpu.last_event_at);
+        }
+        hash = mix_hash(hash, cpu.has_wait);
+        if (cpu.has_wait) {
+            hash = mix_hash(hash, cpu.wait.wait);
+            hash = mix_hash(hash, cpu.wait.subject.identity);
+            hash = mix_hash(hash, static_cast<u64>(cpu.wait.subject.kind));
+            hash = mix_hash(hash, cpu.wait.subject.generation);
+            hash = mix_hash(hash, cpu.wait.driver.identity);
+            hash = mix_hash(hash, static_cast<u64>(cpu.wait.driver.kind));
+            hash = mix_hash(hash, cpu.wait.driver.generation);
+            hash = mix_hash(hash, cpu.wait.obligation);
+            hash = mix_hash(hash, cpu.wait.since);
+            hash = mix_hash(hash, static_cast<u64>(cpu.wait.kind));
+        }
+        return hash;
     };
 
     const auto read_node = [&](NodeRef node,
                                ObservationSnapshot& observation,
-                               CpuLive::WaitSnapshot& cpu,
-                               u64& fingerprint) noexcept -> bool {
+                               CpuLive::Snapshot& cpu,
+                               u64& fingerprint,
+                               bool& degraded) noexcept -> bool {
+        degraded = false;
         if (node.kind == NodeRef::Kind::Observation) {
             ObservationLease lease = ObservationLease::borrow(
                 ObservationKey{node.identity});
-            if (!lease || !lease.snapshot(observation)) {
+            if (!lease || !lease.snapshot(observation)
+                || observation.generation != node.generation) {
                 return false;
             }
             fingerprint = snapshot_hash(observation);
+            if (registry != nullptr) {
+                const ObservationShard* const shard =
+                    registry->observations(
+                        ObservationKey{node.identity}.shard());
+                degraded = shard != nullptr && shard->degraded();
+            }
             return true;
         }
         if (node.kind == NodeRef::Kind::Cpu) {
-            if (!read_cpu(node, cpu)) {
+            if (!read_cpu(node, cpu, degraded)) {
                 return false;
             }
-            fingerprint = u64{0x517cc1b727220a95};
-            fingerprint = mix_hash(fingerprint, cpu.wait);
-            fingerprint = mix_hash(fingerprint, cpu.subject.identity);
-            fingerprint = mix_hash(fingerprint,
-                static_cast<u64>(cpu.subject.kind));
-            fingerprint = mix_hash(fingerprint, cpu.subject.generation);
-            fingerprint = mix_hash(fingerprint, cpu.driver.identity);
-            fingerprint = mix_hash(fingerprint,
-                static_cast<u64>(cpu.driver.kind));
-            fingerprint = mix_hash(fingerprint, cpu.driver.generation);
-            fingerprint = mix_hash(fingerprint, cpu.obligation);
-            fingerprint = mix_hash(fingerprint, cpu.since);
-            fingerprint = mix_hash(fingerprint, static_cast<u64>(cpu.kind));
+            if (node.generation != NodeRef::cpu_generation
+                && !(
+                    (cpu.irq_disabled_since != 0
+                        && node.generation == cpu_stall_generation(
+                            cpu.irq_disabled_since, 1))
+                    || (cpu.trap_entered_at != 0
+                        && node.generation == cpu_stall_generation(
+                            cpu.trap_entered_at, 2)))) {
+                return false;
+            }
+            fingerprint = cpu_hash(
+                cpu, node.generation != NodeRef::cpu_generation);
             return true;
         }
         if (node.kind == NodeRef::Kind::CpuSet) {
@@ -3265,28 +3556,13 @@ auto analyze(
                 || observation.generation != node.generation) {
                 return false;
             }
-            u64 pending{};
-            CpuId selected{};
-            bool found{};
-            for (usize word = 0; word < 4 && !found; ++word) {
-                pending = observation.detail[word];
-                for (usize bit_index = 0; bit_index < 64; ++bit_index) {
-                    if ((pending & (u64{1} << bit_index)) != 0) {
-                        selected = CpuId{word * 64 + bit_index};
-                        found = true;
-                        break;
-                    }
-                }
+            fingerprint = snapshot_hash(observation);
+            if (registry != nullptr) {
+                const ObservationShard* const shard =
+                    registry->observations(
+                        ObservationKey{node.identity}.shard());
+                degraded = shard != nullptr && shard->degraded();
             }
-            if (!found || !read_cpu(NodeRef::cpu(selected), cpu)) {
-                fingerprint = mix_hash(snapshot_hash(observation), 0);
-                return true;
-            }
-            fingerprint = mix_hash(snapshot_hash(observation), selected.raw);
-            fingerprint = mix_hash(fingerprint, cpu.wait);
-            fingerprint = mix_hash(fingerprint, cpu.subject.identity);
-            fingerprint = mix_hash(fingerprint, cpu.driver.identity);
-            fingerprint = mix_hash(fingerprint, cpu.since);
             return true;
         }
         fingerprint = mix_hash(
@@ -3295,132 +3571,169 @@ auto analyze(
         return true;
     };
 
-    NodeRef current = root;
-    bool done{};
-    bool lost_wake{};
-    ObservationSnapshot last_observation{};
-    bool have_last_observation{};
-    for (usize depth = 0; depth < graph_capacity; ++depth) {
+    const auto append = [&](NodeRef node, u8 parent) noexcept -> bool {
+        if (!node) {
+            return true;
+        }
         for (usize index = 0; index < scratch.count; ++index) {
-            if (scratch.node(index) == current) {
-                // Keep the operation in the evidence path, but let the
-                // already-correlated wake publication win over the ordinary
-                // back-edge classification.  The second snapshot pass below
-                // still validates both nodes before reporting LostWake.
-                scratch.classification = lost_wake
-                    ? StallClass::LostWake
-                    : StallClass::DeadlockCycle;
-                done = true;
-                break;
+            if (scratch.node(index) == node) {
+                for (u8 ancestor = parent;
+                     ancestor != 0xffU;
+                     ancestor = scratch.parents[ancestor]) {
+                    if (ancestor == index) {
+                        scratch.classification =
+                            StallClass::DeadlockCycle;
+                        break;
+                    }
+                }
+                return true;
             }
-        }
-        if (done) {
-            break;
-        }
-        ObservationSnapshot snapshot{};
-        CpuLive::WaitSnapshot cpu{};
-        u64 fingerprint{};
-        if (!read_node(current, snapshot, cpu, fingerprint)) {
-            scratch.classification = StallClass::Inconclusive;
-            return false;
-        }
-        if (current.kind == NodeRef::Kind::Observation
-            || current.kind == NodeRef::Kind::CpuSet) {
-            last_observation = snapshot;
-            have_last_observation = true;
         }
         if (scratch.count >= graph_capacity) {
             scratch.truncated = true;
             scratch.classification = StallClass::Truncated;
-            done = true;
-            break;
+            return false;
         }
-        scratch.set_node(scratch.count, current);
-        scratch.fingerprints[scratch.count] = fingerprint;
+        scratch.set_node(scratch.count, node);
+        scratch.parents[scratch.count] = parent;
         ++scratch.count;
+        return true;
+    };
 
+    if (!append(root, 0xffU)) {
+        scratch.evidence = EvidenceGrade::Inconclusive;
+        return false;
+    }
+    bool degraded_graph{};
+    for (usize cursor = 0; cursor < scratch.count; ++cursor) {
+        const NodeRef current = scratch.node(cursor);
+        ObservationSnapshot snapshot{};
+        CpuLive::Snapshot cpu{};
+        u64 fingerprint{};
+        bool degraded{};
+        if (!read_node(
+                current, snapshot, cpu, fingerprint, degraded)) {
+#if MYOS_CONCURRENCY_PROBE == 4
+            //Confirmatory experiment.
+            // Exit condition: remove with the Stage B claimed-operation
+            // fault probe after first-pass node rejection is externally
+            // observable.
+            const u32 previous =
+                probe_errors.fetch_or<libk::MemoryOrder::AcqRel>(1U << 28);
+            if ((previous & (1U << 28)) == 0) {
+                diag::console::print<
+                    "concurrency-probe: stage-c node-rejected "
+                    "index={} kind={} identity={:#x} generation={}\n">(
+                    cursor,
+                    static_cast<u32>(current.kind),
+                    current.identity,
+                    current.generation);
+            }
+#endif
+            scratch.classification = StallClass::Inconclusive;
+            scratch.evidence = EvidenceGrade::Inconclusive;
+            return false;
+        }
+        degraded_graph = degraded_graph || degraded;
+        scratch.fingerprints[cursor] = fingerprint;
         NodeRef next{};
         if (current.kind == NodeRef::Kind::Observation) {
-            // A blocked actor and a ReadyPublished operation are only a lost
-            // wake when the scheduler projection has no queued/timer/credit
-            // witness.  The canonical wake path remains authoritative.
-            if (snapshot.record_kind == RecordKind::ExecutionActor
-                && snapshot.phase == execution_blocked_phase
-                && snapshot.waiter_key) {
-                ObservationLease wake = ObservationLease::borrow(
-                    snapshot.waiter_key);
-                ObservationSnapshot operation{};
-                if (!wake || !wake.snapshot(operation)) {
-                    scratch.classification = StallClass::Inconclusive;
-                    return false;
-                }
-                const bool scheduler_pending = (snapshot.detail[0] & 0xfU) != 0
-                    || (snapshot.detail[2] & 0x7U) != 0;
-                if (operation.record_kind == RecordKind::Operation
-                    && operation.phase == static_cast<u32>(
-                        OperationPhase::ReadyPublished)
-                    && !scheduler_pending) {
-                    scratch.classification = StallClass::LostWake;
-                    lost_wake = true;
-                }
-            }
             next = snapshot.waiter_key
                 ? NodeRef::observation(snapshot.waiter_key)
                 : snapshot.driver;
             if (!next && snapshot.blocker.kind != NodeRef::Kind::None) {
                 next = snapshot.blocker;
             }
-        } else if (current.kind == NodeRef::Kind::Cpu
-            || current.kind == NodeRef::Kind::CpuSet) {
-            next = cpu.wait ? NodeRef::observation(
-                ObservationKey{cpu.wait}) : cpu.driver;
-        }
-        if (done || !next) {
-            if (!done && !lost_wake
-                && (current.kind == NodeRef::Kind::Observation
-                    || current.kind == NodeRef::Kind::CpuSet)) {
+            if (!next && scratch.classification == StallClass::None) {
                 scratch.classification = terminal_class(snapshot, false);
-            } else if (!done && !lost_wake
-                && current.kind == NodeRef::Kind::External) {
-                // An external node is a terminal driver, not a classification
-                // by itself. Preserve the obligation's policy and wait kind;
-                // otherwise every finite Grant/Resource operation would be
-                // mislabeled as an unbounded external wait merely because its
-                // service actor is outside the bounded graph.
-                scratch.classification = have_last_observation
-                    ? terminal_class(last_observation, false)
-                    : StallClass::ExternalWait;
-            } else if (!done && !lost_wake
-                && current.kind != NodeRef::Kind::Cpu) {
-                scratch.classification = StallClass::ExternalWait;
-            } else if (!done && !lost_wake) {
-                scratch.classification = StallClass::UnclassifiedCpuStall;
+            } else if (next.kind == NodeRef::Kind::External
+                && scratch.classification == StallClass::None) {
+                scratch.classification = terminal_class(snapshot, false);
             }
-            done = true;
-            break;
+        } else if (current.kind == NodeRef::Kind::Cpu) {
+            if (cpu.has_wait) {
+                next = cpu.wait.wait
+                    ? NodeRef::observation(
+                          ObservationKey{cpu.wait.wait})
+                    : cpu.wait.driver;
+            } else if (scratch.classification == StallClass::None) {
+                scratch.classification = StallClass::OpenOwnerStall;
+            }
+        } else if (current.kind == NodeRef::Kind::CpuSet) {
+            bool any{};
+            for (usize word = 0; word < 4; ++word) {
+                const u64 pending = snapshot.detail[word];
+                for (usize bit_index = 0; bit_index < 64; ++bit_index) {
+                    if ((pending & (u64{1} << bit_index)) == 0) {
+                        continue;
+                    }
+                    any = true;
+                    if (!append(
+                            NodeRef::cpu(
+                                CpuId{word * 64 + bit_index}),
+                            static_cast<u8>(cursor))) {
+                        scratch.evidence = EvidenceGrade::Inconclusive;
+                        return false;
+                    }
+                }
+            }
+            if (!any && scratch.classification == StallClass::None) {
+                scratch.classification = terminal_class(snapshot, false);
+            }
+        } else if (current.kind == NodeRef::Kind::External) {
+            if (scratch.classification == StallClass::None) {
+                scratch.classification = StallClass::ExternalWait;
+            }
         }
-        current = next;
-    }
-
-    if (!done) {
-        scratch.truncated = true;
-        scratch.classification = StallClass::Truncated;
+        if (next && !append(next, static_cast<u8>(cursor))) {
+            scratch.evidence = EvidenceGrade::Inconclusive;
+            return false;
+        }
     }
 
     // Re-read every node after the path is built.  A graph is evidence only
     // when all nodes survived one coherent diagnostic era.
     for (usize index = 0; index < scratch.count; ++index) {
         ObservationSnapshot observation{};
-        CpuLive::WaitSnapshot cpu{};
+        CpuLive::Snapshot cpu{};
         u64 fingerprint{};
-        if (!read_node(
-                scratch.node(index), observation, cpu, fingerprint)
-            || fingerprint != scratch.fingerprints[index]) {
+        bool degraded{};
+        const bool read = read_node(
+            scratch.node(index), observation, cpu, fingerprint, degraded);
+        if (!read || fingerprint != scratch.fingerprints[index]) {
+#if MYOS_CONCURRENCY_PROBE == 4
+            //Confirmatory experiment.
+            // Exit condition: remove with the Stage B claimed-operation
+            // fault probe after its graph-reread boundary is externally
+            // observable.
+            const u32 previous =
+                probe_errors.fetch_or<libk::MemoryOrder::AcqRel>(1U << 30);
+            if ((previous & (1U << 30)) == 0) {
+                diag::console::print<
+                    "concurrency-probe: stage-c reread-rejected "
+                    "index={} kind={} read={} expected={:#x} actual={:#x}\n">(
+                    index,
+                    static_cast<u32>(scratch.node(index).kind),
+                    read,
+                    scratch.fingerprints[index],
+                    fingerprint);
+            }
+#endif
             scratch.classification = StallClass::Inconclusive;
+            scratch.evidence = EvidenceGrade::Inconclusive;
             return false;
         }
+        degraded_graph = degraded_graph || degraded;
     }
-    return scratch.classification != StallClass::Inconclusive;
+    if (scratch.classification == StallClass::None) {
+        scratch.classification = StallClass::UnclassifiedCpuStall;
+    }
+    scratch.evidence = degraded_graph
+        ? EvidenceGrade::Degraded
+        : root.kind == NodeRef::Kind::External
+            ? EvidenceGrade::External
+            : EvidenceGrade::Confirmed;
+    return scratch.evidence == EvidenceGrade::Confirmed;
 #else
     static_cast<void>(root);
     static_cast<void>(scratch);
@@ -3475,7 +3788,7 @@ void run_probe(u32 probe) noexcept {
     //Confirmatory experiment.
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
-    if (probe != 1) {
+    if (probe != 1 && probe != 5 && probe != 6) {
         return;
     }
 
@@ -3493,6 +3806,339 @@ void run_probe(u32 probe) noexcept {
 
     const CpuId cpu = local.descriptor->logical_id();
     const CpuId boot = registry->boot_id();
+    if (probe == 6) {
+        //Confirmatory experiment.
+        // Exit condition: remove when an external scenario runner can drive
+        // multiple real watchdog roots through stable, active and progressing
+        // intervals while retaining the per-CPU flight evidence.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu != boot) {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            return;
+        }
+
+        CpuId target = boot;
+        if (registry->count() > 1) {
+            CpuId candidate{(boot.raw + 1) % registry->count()};
+            for (usize attempt = 0; attempt < registry->count(); ++attempt) {
+                const CpuDescriptor* const descriptor =
+                    registry->descriptor(candidate);
+                CpuRuntime* const candidate_runtime =
+                    registry->runtime(candidate);
+                if (descriptor != nullptr
+                    && candidate_runtime != nullptr
+                    && descriptor->state() == CpuState::Online
+                    && candidate_runtime->diagnostics != nullptr
+                    && candidate_runtime->diagnostics->concurrency.observations
+                        != nullptr) {
+                    target = candidate;
+                    break;
+                }
+                candidate =
+                    CpuId{(candidate.raw + 1) % registry->count()};
+            }
+        }
+        CpuRuntime* const target_runtime = registry->runtime(target);
+        CpuDiagnosticsCore* const watcher = current_core();
+        CpuDiagnosticsCore* const target_core =
+            target_runtime == nullptr || target_runtime->diagnostics == nullptr
+            ? nullptr : &target_runtime->diagnostics->concurrency;
+        ObservationShard* const shard = registry->observations(target);
+        bool ok = watcher != nullptr && target_core != nullptr
+            && shard != nullptr && watcher->flight != nullptr;
+        u32 errors = ok ? 0 : 1U;
+        constexpr usize roots = 6;
+        ObservationLease leases[roots]{};
+        ObservationKey keys[roots]{};
+        u64 anchor{};
+        WatchdogPolicy saved_policy{};
+        if (ok) {
+            saved_policy = target_core->policy;
+            target_core->policy.service_soft = 2;
+            target_core->policy.service_hard = 4;
+            for (usize index = 0; index < roots; ++index) {
+                leases[index] = shard->reserve(
+                    RecordKind::ServiceWork,
+                    0xc600 + index,
+                    1,
+                    Expectation::InternalFinite,
+                    SourceSite::current());
+                if (!leases[index]) {
+                    ok = false;
+                    errors |= 1U << 1;
+                    break;
+                }
+                leases[index].set_policy(OperationPolicy{
+                    .kind = WaitKind::GrantWork,
+                    .expectation = Expectation::InternalFinite,
+                    .driver = NodeRef::external(0xc6ee, 1),
+                    .action = StallAction::Record,
+                });
+                leases[index].transition(
+                    1,
+                    1,
+                    WaitKind::GrantWork,
+                    NodeRef::external(0xc6ee, 1));
+                leases[index].watch(true);
+                keys[index] = leases[index].key();
+                ObservationSnapshot snapshot{};
+                if (!leases[index].snapshot(snapshot)) {
+                    ok = false;
+                    errors |= 1U << 2;
+                    break;
+                }
+                if (snapshot.last_progress_at > anchor) {
+                    anchor = snapshot.last_progress_at;
+                }
+            }
+        }
+
+        u32 confirmed{};
+        bool livelock{};
+        bool noisy_confirmed{};
+        if (ok) {
+            watcher->scan_cursor.store<libk::MemoryOrder::Release>(0);
+            watcher->candidate_cursor.store<libk::MemoryOrder::Release>(0);
+            for (WatchdogCandidate& candidate : watcher->candidates) {
+                candidate.state.store<libk::MemoryOrder::Release>(
+                    static_cast<u32>(WatchdogCandidate::State::Clear));
+            }
+            for (usize iteration = 0; iteration < 160; ++iteration) {
+                leases[4].touch(SourceSite::current());
+                leases[5].advance();
+                watchdog_tick(boot, anchor + 10 + iteration);
+                const u64 flight_head = watcher->flight->head();
+                const usize flight_count =
+                    flight_head < FlightRecorder::capacity
+                    ? static_cast<usize>(flight_head)
+                    : FlightRecorder::capacity;
+                for (usize record_index = 0;
+                     record_index < flight_count;
+                     ++record_index) {
+                    FlightRecordValue record{};
+                    if (!watcher->flight->read(record_index, record)) {
+                        continue;
+                    }
+                    for (usize root_index = 0;
+                         root_index < roots;
+                         ++root_index) {
+                        if (record.subject != keys[root_index].raw) {
+                            continue;
+                        }
+                        if (record.event == FlightEvent::WatchdogConfirmed) {
+                            confirmed |= 1U << root_index;
+                            noisy_confirmed =
+                                noisy_confirmed || root_index == 5;
+                        } else if (
+                            record.event == FlightEvent::WatchdogLivelock
+                            && root_index == 4) {
+                            livelock = true;
+                        }
+                    }
+                }
+            }
+            const bool stable_ok = (confirmed & 0xfU) == 0xfU;
+            const bool interval_ok = livelock && !noisy_confirmed;
+            if (!stable_ok) {
+                errors |= 1U << 3;
+            }
+            if (!interval_ok) {
+                errors |= 1U << 4;
+            }
+            ok = ok && stable_ok && interval_ok;
+
+            WaitGraphScratch graph{};
+            const bool external_ok =
+                !analyze(NodeRef::external(0xc6ff, 1), graph)
+                && graph.evidence == EvidenceGrade::External
+                && graph.classification == StallClass::ExternalWait;
+            graph = {};
+            const bool stale_cpu_ok =
+                !analyze(
+                    NodeRef{
+                        NodeRef::Kind::Cpu,
+                        target.raw,
+                        cpu_stall_generation(123, 1)},
+                    graph)
+                && graph.evidence == EvidenceGrade::Inconclusive;
+            if (!external_ok) {
+                errors |= 1U << 5;
+            }
+            if (!stale_cpu_ok) {
+                errors |= 1U << 6;
+            }
+            ok = ok && external_ok && stale_cpu_ok;
+        }
+        if (target_core != nullptr) {
+            target_core->policy = saved_policy;
+        }
+        if (!ok && watcher != nullptr) {
+            StallFingerprint seen[CpuDiagnosticsCore::candidate_capacity]{};
+            for (usize index = 0;
+                 index < CpuDiagnosticsCore::candidate_capacity;
+                 ++index) {
+                static_cast<void>(
+                    watcher->candidates[index].read(seen[index]));
+            }
+            diag::console::print<
+                "concurrency-probe: stage-c watchdog-debug watched={:#x} "
+                "scan={} roots={:#x},{:#x},{:#x},{:#x} "
+                "states={},{},{},{}\n">(
+                shard == nullptr ? 0 : shard->watched(),
+                watcher->scan_cursor.load<libk::MemoryOrder::Acquire>(),
+                seen[0].root.identity,
+                seen[1].root.identity,
+                seen[2].root.identity,
+                seen[3].root.identity,
+                watcher->candidates[0].state.load<
+                    libk::MemoryOrder::Acquire>(),
+                watcher->candidates[1].state.load<
+                    libk::MemoryOrder::Acquire>(),
+                watcher->candidates[2].state.load<
+                    libk::MemoryOrder::Acquire>(),
+                watcher->candidates[3].state.load<
+                    libk::MemoryOrder::Acquire>());
+        }
+        for (ObservationLease& lease : leases) {
+            if (lease) {
+                lease.finish(1);
+            }
+        }
+        diag::console::print<
+            "concurrency-probe: stage-c watchdog-{} errors=0x{:x} "
+            "confirmed=0x{:x} livelock={}\n">(
+            ok ? "ok" : "fail",
+            errors,
+            confirmed,
+            livelock);
+        probe_phase.store<libk::MemoryOrder::Release>(2);
+        return;
+    }
+    if (probe == 5) {
+        //Confirmatory experiment.
+        // Exit condition: remove when an external kernel scenario can hold
+        // producer CPUs at open leaves and publish a multi-member CpuSet.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu != boot) {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            return;
+        }
+
+        ObservationShard* const shard = registry->observations(boot);
+        bool ok = shard != nullptr;
+        u32 errors = ok ? 0 : 1U;
+        ObservationLease external{};
+        ObservationLease set{};
+        if (ok) {
+            external = shard->reserve(
+                RecordKind::ServiceWork,
+                0xc501,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            set = shard->reserve(
+                RecordKind::Shootdown,
+                0xc502,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            ok = external && set;
+            if (!ok) {
+                errors |= 1U << 1;
+            }
+        }
+        if (ok) {
+            external.transition(
+                1,
+                1,
+                WaitKind::GrantWork,
+                NodeRef::external(0xc5ee, 1));
+            u64 pending[4]{};
+            for (usize index = 0; index < registry->count(); ++index) {
+                pending[index / 64] |= u64{1} << (index % 64);
+            }
+            for (usize word = 0; word < 4; ++word) {
+                set.detail(word, pending[word]);
+            }
+
+            WaitGraphScratch graph{};
+            CpuId producer = registry->count() > 1
+                ? CpuId{(boot.raw + 1) % registry->count()} : boot;
+            const bool cpu_ok = analyze(NodeRef::cpu(producer), graph)
+                && graph.evidence == EvidenceGrade::Confirmed
+                && graph.classification == StallClass::OpenOwnerStall
+                && graph.count == 1;
+            if (!cpu_ok) {
+                errors |= 1U << 2;
+            }
+            ok = ok && cpu_ok;
+            graph = {};
+            const bool external_ok = analyze(external.key(), graph)
+                && graph.evidence == EvidenceGrade::Confirmed
+                && graph.classification == StallClass::LostServiceKick
+                && graph.count == 2;
+            if (!external_ok) {
+                errors |= 1U << 3;
+                diag::console::print<
+                    "concurrency-probe: stage-c external "
+                    "class={} evidence={} count={} degraded={}\n">(
+                    static_cast<u32>(graph.classification),
+                    static_cast<u32>(graph.evidence),
+                    graph.count,
+                    shard->degraded());
+            }
+            ok = ok && external_ok;
+            graph = {};
+            const bool set_ok = analyze(
+                    NodeRef::cpu_set(set.key()), graph)
+                && graph.evidence == EvidenceGrade::Confirmed
+                && graph.count == registry->count() + 1;
+            if (!set_ok) {
+                errors |= 1U << 4;
+            }
+            ok = ok && set_ok;
+
+            ObservationSnapshot before{};
+            ObservationSnapshot after{};
+            ok = ok && external.snapshot(before);
+            external.touch(SourceSite::current());
+            const bool hash_ok = external.snapshot(after)
+                && snapshot_hash(before, HashMode::Coherent)
+                    != snapshot_hash(after, HashMode::Coherent)
+                && snapshot_hash(before, HashMode::Relation)
+                    == snapshot_hash(after, HashMode::Relation);
+            if (!hash_ok) {
+                errors |= 1U << 5;
+            }
+            ok = ok && hash_ok;
+        }
+        if (external) {
+            external.finish(1);
+        }
+        if (set) {
+            set.finish(1);
+        }
+        diag::console::print<
+            "concurrency-probe: stage-c analyzer-{} errors=0x{:x}\n">(
+            ok ? "ok" : "fail", errors);
+        probe_phase.store<libk::MemoryOrder::Release>(2);
+        return;
+    }
+
     bool peer_role{};
     if (cpu != boot) {
         usize expected = max_cpu_count;

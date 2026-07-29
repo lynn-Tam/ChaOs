@@ -69,6 +69,8 @@ struct ObservationKey final {
 };
 
 struct NodeRef final {
+    static constexpr u64 cpu_generation = 1;
+
     enum class Kind : u8 {
         None,
         Cpu,
@@ -86,7 +88,7 @@ struct NodeRef final {
     }
 
     [[nodiscard]] static constexpr auto cpu(CpuId id) noexcept -> NodeRef {
-        return NodeRef{Kind::Cpu, id.raw, 1};
+        return NodeRef{Kind::Cpu, id.raw, cpu_generation};
     }
 
     [[nodiscard]] static constexpr auto observation(
@@ -312,10 +314,20 @@ enum class StallClass : u8 {
     Truncated,
 };
 
+enum class EvidenceGrade : u8 {
+    None,
+    Suspected,
+    Confirmed,
+    Inconclusive,
+    Degraded,
+    External,
+};
+
 inline constexpr usize graph_capacity = 12;
 
 struct WaitGraphScratch final {
     StallClass classification{StallClass::None};
+    EvidenceGrade evidence{EvidenceGrade::None};
     u8 count{};
     bool truncated{};
     // Keep the panic-page representation compact: the low byte of path_meta
@@ -325,6 +337,7 @@ struct WaitGraphScratch final {
     u64 path[graph_capacity]{};
     u64 path_meta[graph_capacity]{};
     u64 fingerprints[graph_capacity]{};
+    u8 parents[graph_capacity]{};
 
     [[nodiscard]] auto node(usize index) const noexcept -> NodeRef {
         if (index >= graph_capacity) {
@@ -797,6 +810,11 @@ static_assert(sizeof(FlightRecorder) <= 4096);
 struct CpuLive final {
     static constexpr usize wait_capacity = 4;
 
+    enum class SnapshotMode : u8 {
+        Relation,
+        Strict,
+    };
+
     libk::Atomic<u64> dispatch_epoch{};
     libk::Atomic<u64> timer_epoch{};
     libk::Atomic<u64> trap_entered_at{};
@@ -844,16 +862,37 @@ struct CpuLive final {
         SourceSite site{};
     };
 
+    struct Snapshot final {
+        u64 dispatch_epoch{};
+        u64 timer_epoch{};
+        u64 trap_entered_at{};
+        u64 irq_disabled_since{};
+        u64 current_actor{};
+        u64 activity_epoch{};
+        u64 progress_epoch{};
+        u64 semantic_stamp{};
+        u64 last_event_at{};
+        u32 context{};
+        u32 trap_depth{};
+        u32 irq_depth{};
+        u32 degraded{};
+        bool interrupts_disabled{};
+        bool has_wait{};
+        WaitSnapshot wait{};
+    };
+
     [[nodiscard]] auto top_wait(WaitSnapshot& result) const noexcept -> bool;
+    [[nodiscard]] auto snapshot(
+        Snapshot& result,
+        SnapshotMode mode = SnapshotMode::Strict) const noexcept -> bool;
 };
 
 struct StallFingerprint final {
-    ObservationKey key{};
-    u64 generation{};
+    NodeRef root{};
     u32 phase{};
     u64 progress_epoch{};
     u64 activity_epoch{};
-    u64 state_hash{};
+    u64 relation_hash{};
     NodeRef driver{};
     NodeRef blocker{};
 };
@@ -862,18 +901,20 @@ struct WatchdogCandidate final {
     enum class State : u32 {
         Clear,
         Suspected,
+        SuspectedActive,
         Confirmed,
         ConfirmedLivelock,
     };
 
     libk::Atomic<u32> state{};
     libk::Atomic<u64> fingerprint_sequence{};
-    libk::Atomic<u64> fingerprint_key{};
-    libk::Atomic<u64> fingerprint_generation{};
+    libk::Atomic<u64> root_identity{};
+    libk::Atomic<u32> root_kind{};
+    libk::Atomic<u64> root_generation{};
     libk::Atomic<u32> fingerprint_phase{};
     libk::Atomic<u64> fingerprint_progress{};
     libk::Atomic<u64> fingerprint_activity{};
-    libk::Atomic<u64> fingerprint_hash{};
+    libk::Atomic<u64> relation_hash{};
     libk::Atomic<u64> driver_identity{};
     libk::Atomic<u32> driver_kind{};
     libk::Atomic<u64> driver_generation{};
@@ -884,6 +925,16 @@ struct WatchdogCandidate final {
 
     void publish(const StallFingerprint& value) noexcept;
     [[nodiscard]] auto read(StallFingerprint& value) const noexcept -> bool;
+};
+
+struct StallCoordinator final {
+    static constexpr usize signature_capacity = 4;
+
+    // owner is a transient CPU token. The bounded signature cache suppresses
+    // another watcher reporting the same confirmed diagnostic interval.
+    libk::Atomic<u64> owner{};
+    libk::Atomic<usize> signature_cursor{};
+    libk::Atomic<u64> signatures[signature_capacity]{};
 };
 
 // Thresholds are provisioned from the kernel clock. They are observation
@@ -939,8 +990,13 @@ struct ObservationStore final {
 static_assert(sizeof(ObservationStore) <= 4096);
 
 struct CpuDiagnosticsCore final {
+    static constexpr usize candidate_capacity = 4;
+
     CpuLive live{};
-    WatchdogCandidate candidate{};
+    WatchdogCandidate candidates[candidate_capacity]{};
+    libk::Atomic<usize> candidate_cursor{};
+    libk::Atomic<usize> scan_cursor{};
+    StallCoordinator coordinator{};
     WaitGraphScratch graph{};
     WatchdogPolicy policy{};
     DiagnosticStatus fallback_status{};
