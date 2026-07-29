@@ -238,8 +238,13 @@ void publish_event(
 }
 
 struct EdgeWitness final {
-    LockSite from{};
-    LockSite to{};
+    libk::Atomic<u64> sequence{};
+    libk::Atomic<const char*> from_file{};
+    libk::Atomic<const char*> from_function{};
+    libk::Atomic<const char*> to_file{};
+    libk::Atomic<const char*> to_function{};
+    libk::Atomic<u32> from_line{};
+    libk::Atomic<u32> to_line{};
 };
 
 struct GraphState final {
@@ -247,34 +252,99 @@ struct GraphState final {
     static constexpr usize word_count =
         (class_count + word_bits - 1) / word_bits;
 
-    libk::Atomic<u32> writer{};
     libk::Atomic<u64> rows[class_count][word_count]{};
     EdgeWitness witnesses[class_count][class_count]{};
 
+    [[nodiscard]] auto publish_witness(
+        usize from,
+        usize to,
+        LockSite from_site,
+        LockSite to_site) noexcept -> bool {
+        EdgeWitness& witness = witnesses[from][to];
+        u64 expected{};
+        if (!witness.sequence.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(expected, 1)) {
+            // A completed witness is immutable. If its first writer is still
+            // active, that writer also owns the later adjacency publication.
+            return (expected & 1U) == 0;
+        }
+        witness.from_file.store<libk::MemoryOrder::Relaxed>(from_site.file);
+        witness.from_function.store<libk::MemoryOrder::Relaxed>(
+            from_site.function);
+        witness.to_file.store<libk::MemoryOrder::Relaxed>(to_site.file);
+        witness.to_function.store<libk::MemoryOrder::Relaxed>(
+            to_site.function);
+        witness.from_line.store<libk::MemoryOrder::Relaxed>(from_site.line);
+        witness.to_line.store<libk::MemoryOrder::Relaxed>(to_site.line);
+        witness.sequence.store<libk::MemoryOrder::Release>(2);
+        return true;
+    }
+
+    [[nodiscard]] auto read_witness(
+        usize from,
+        usize to,
+        LockSite& from_site,
+        LockSite& to_site) const noexcept -> bool {
+        const EdgeWitness& witness = witnesses[from][to];
+        for (usize attempt = 0; attempt < 3; ++attempt) {
+            const u64 first =
+                witness.sequence.load<libk::MemoryOrder::Acquire>();
+            if ((first & 1U) != 0 || first == 0) {
+                continue;
+            }
+            LockSite read_from{
+                witness.from_file.load<libk::MemoryOrder::Relaxed>(),
+                witness.from_function.load<libk::MemoryOrder::Relaxed>(),
+                witness.from_line.load<libk::MemoryOrder::Relaxed>()};
+            LockSite read_to{
+                witness.to_file.load<libk::MemoryOrder::Relaxed>(),
+                witness.to_function.load<libk::MemoryOrder::Relaxed>(),
+                witness.to_line.load<libk::MemoryOrder::Relaxed>()};
+            if (witness.sequence.load<libk::MemoryOrder::Acquire>() == first) {
+                from_site = read_from;
+                to_site = read_to;
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] auto check_insert(
         usize from,
-        usize to) noexcept -> DepGraph<class_count>::Result {
-        DepGraph<class_count> snapshot{};
+        usize to,
+        LockSite from_site,
+        LockSite to_site) noexcept -> DepGraph<class_count>::Result {
+        if (!publish_witness(from, to, from_site, to_site)) {
+            return {DepStatus::Exists, {}};
+        }
+        const u64 mask = u64{1} << (to % word_bits);
+        const u64 old = rows[from][to / word_bits]
+            .fetch_or<libk::MemoryOrder::SeqCst>(mask);
+        if ((old & mask) != 0) {
+            return {DepStatus::Exists, {}};
+        }
+
+        DepGraph<class_count> graph{};
         for (usize row = 0; row < class_count; ++row) {
             for (usize word = 0; word < word_count; ++word) {
-                const u64 bits = rows[row][word].load<
-                    libk::MemoryOrder::Relaxed>();
+                const u64 bits =
+                    rows[row][word].load<libk::MemoryOrder::SeqCst>();
                 for (usize bit = 0; bit < word_bits; ++bit) {
                     if ((bits & (u64{1} << bit)) != 0) {
                         const usize target = word * word_bits + bit;
                         if (target < class_count) {
-                            snapshot.insert(row, target);
+                            graph.insert(row, target);
                         }
                     }
                 }
             }
         }
-        const auto result = snapshot.check_insert(from, to);
-        if (result.status == DepStatus::Added) {
-            static_cast<void>(rows[from][to / word_bits].fetch_or<
-                libk::MemoryOrder::Release>(u64{1} << (to % word_bits)));
+        DepGraph<class_count>::Path reverse{};
+        if (graph.path(to, from, reverse)) {
+            return {DepStatus::Cycle, reverse};
         }
-        return result;
+        return {DepStatus::Added, {}};
     }
 
     [[nodiscard]] auto snapshot() const noexcept -> DepGraph<class_count> {
@@ -299,48 +369,46 @@ struct GraphState final {
 
 constinit GraphState graph_state{};
 
-class GraphGuard final {
-public:
-    GraphGuard() noexcept : interrupts_(arch::disable_interrupts()) {
-        u32 expected = 0;
-        while (!graph_state.writer.compare_exchange_weak<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, 1)) {
-            expected = 0;
-        }
-    }
-    ~GraphGuard() noexcept {
-        graph_state.writer.store<libk::MemoryOrder::Release>(0);
-        arch::restore_interrupts(interrupts_);
-    }
-    GraphGuard(const GraphGuard&) = delete;
-    auto operator=(const GraphGuard&) -> GraphGuard& = delete;
-private:
-    arch::InterruptState interrupts_;
-};
-
 struct GraphCycle final {
-    struct Step final {
-        LockClass from{};
-        LockClass to{};
-        LockSite from_site{};
-        LockSite to_site{};
-    };
-
     bool found{};
     LockClass from{};
     LockClass to{};
-    DepGraph<class_count>::Path path{};
-    Step steps[dep_cycle_capacity]{};
-    usize step_count{};
+    usize path_size{};
 };
 
+void publish_dependency(
+    CpuLockTrace& trace,
+    usize index,
+    LockClass from,
+    LockClass to,
+    LockSite from_site,
+    LockSite to_site) noexcept {
+    DepLink& remote = trace.dep_cycle[index];
+    u64 odd{};
+    begin_record(remote.sequence, odd);
+    if (odd == 0) {
+        trace.degraded.store<libk::MemoryOrder::Release>(1);
+        return;
+    }
+    remote.from_file.store<libk::MemoryOrder::Relaxed>(from_site.file);
+    remote.to_file.store<libk::MemoryOrder::Relaxed>(to_site.file);
+    remote.lines.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u64>(from_site.line)
+            | (static_cast<u64>(to_site.line) << 32));
+    remote.classes.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u32>(from) | (static_cast<u32>(to) << 8));
+    end_record(remote.sequence, odd);
+}
+
+// Keep the bounded graph snapshot off the acquisition caller's frame. The
+// kernel stack audit verifies this boundary in every enabled diagnostic mode.
+[[gnu::noinline]]
 [[nodiscard]] auto add_dependencies(
+    CpuLockTrace& trace,
     const LocalLockState& local,
     LockClass target,
     LockSite target_site) noexcept -> GraphCycle {
     GraphCycle cycle{};
-    GraphGuard guard{};
     const usize to = class_index(target);
     for (usize index = 0; index < local.held_count; ++index) {
         const HeldEntry& held = local.held[index];
@@ -348,61 +416,44 @@ struct GraphCycle final {
         if (from == to) {
             continue;
         }
-        const auto result = graph_state.check_insert(from, to);
+        const auto result =
+            graph_state.check_insert(from, to, held.site, target_site);
         if (result.status == DepStatus::Cycle) {
             cycle.found = true;
             cycle.from = held.lock.lock_class;
             cycle.to = target;
-            cycle.path = result.path;
+            cycle.path_size = result.path.size;
+            usize step_count{};
             for (usize path_index = 1;
                 path_index < result.path.size
-                    && cycle.step_count + 1 < dep_cycle_capacity;
+                    && step_count + 1 < dep_cycle_capacity;
                 ++path_index) {
                 const usize edge_from = result.path.nodes[path_index - 1];
                 const usize edge_to = result.path.nodes[path_index];
-                const EdgeWitness& witness =
-                    graph_state.witnesses[edge_from][edge_to];
-                cycle.steps[cycle.step_count++] = GraphCycle::Step{
+                LockSite from_site{};
+                LockSite to_site{};
+                static_cast<void>(graph_state.read_witness(
+                    edge_from, edge_to, from_site, to_site));
+                publish_dependency(
+                    trace,
+                    step_count++,
                     static_cast<LockClass>(edge_from),
                     static_cast<LockClass>(edge_to),
-                    witness.from,
-                    witness.to,
-                };
+                    from_site,
+                    to_site);
             }
-            cycle.steps[cycle.step_count++] = GraphCycle::Step{
-                held.lock.lock_class, target, held.site, target_site};
+            publish_dependency(
+                trace,
+                step_count++,
+                held.lock.lock_class,
+                target,
+                held.site,
+                target_site);
+            trace.dep_cycle_size.store<libk::MemoryOrder::Release>(step_count);
             break;
-        }
-        if (result.status == DepStatus::Added) {
-            graph_state.witnesses[from][to] =
-                EdgeWitness{held.site, target_site};
         }
     }
     return cycle;
-}
-
-void publish_dependency(CpuLockTrace& trace, const GraphCycle& cycle) noexcept {
-    for (usize index = 0; index < cycle.step_count; ++index) {
-        const GraphCycle::Step& step = cycle.steps[index];
-        DepLink& remote = trace.dep_cycle[index];
-        u64 odd{};
-        begin_record(remote.sequence, odd);
-        if (odd == 0) {
-            trace.degraded.store<libk::MemoryOrder::Release>(1);
-            continue;
-        }
-        remote.from_file.store<libk::MemoryOrder::Relaxed>(
-            step.from_site.file);
-        remote.to_file.store<libk::MemoryOrder::Relaxed>(step.to_site.file);
-        remote.lines.store<libk::MemoryOrder::Relaxed>(
-            static_cast<u64>(step.from_site.line)
-                | (static_cast<u64>(step.to_site.line) << 32));
-        remote.classes.store<libk::MemoryOrder::Relaxed>(
-            static_cast<u32>(step.from)
-                | (static_cast<u32>(step.to) << 8));
-        end_record(remote.sequence, odd);
-    }
-    trace.dep_cycle_size.store<libk::MemoryOrder::Release>(cycle.step_count);
 }
 
 void validate_local(
@@ -437,11 +488,10 @@ void validate_graph(
     LockRef lock,
     LockSite site) noexcept {
     const GraphCycle cycle =
-        add_dependencies(trace.local, lock.lock_class, site);
+        add_dependencies(trace, trace.local, lock.lock_class, site);
     if (cycle.found) {
-        publish_dependency(trace, cycle);
         fail(Violation::DependencyCycle, site,
-            class_index(cycle.from), class_index(cycle.to), cycle.path.size);
+            class_index(cycle.from), class_index(cycle.to), cycle.path_size);
     }
 }
 
@@ -714,14 +764,19 @@ auto after_acquire(LockRef lock, LockSite site, LockCookie cookie) noexcept
         publish_event(*current.trace, LockEvent::Acquire, lock, 0, site);
     }
 #if MYOS_LOCK_DIAG >= 3
-    auto& stats = current.trace->stats[class_index(lock.lock_class)];
-    atomic_add_sat(stats.acquisitions, 1);
-    static_cast<void>(stats.context_mask.fetch_or<libk::MemoryOrder::Relaxed>(
-        u64{1} << current.trace->context.load<libk::MemoryOrder::Relaxed>()));
-    if (cookie.contended && cookie.wait_started != 0) {
-        const u64 elapsed = now() - cookie.wait_started;
-        atomic_add_sat(stats.wait_ticks, elapsed);
-        atomic_max(stats.max_wait, elapsed);
+    if (current.trace->profile != nullptr) {
+        auto& stats =
+            current.trace->profile->stats[class_index(lock.lock_class)];
+        atomic_add_sat(stats.acquisitions, 1);
+        static_cast<void>(stats.context_mask.fetch_or<
+            libk::MemoryOrder::Relaxed>(
+                u64{1} << current.trace->context.load<
+                    libk::MemoryOrder::Relaxed>()));
+        if (cookie.contended && cookie.wait_started != 0) {
+            const u64 elapsed = now() - cookie.wait_started;
+            atomic_add_sat(stats.wait_ticks, elapsed);
+            atomic_max(stats.max_wait, elapsed);
+        }
     }
 #endif
     return cookie;
@@ -792,9 +847,9 @@ void before_release(LockRef lock, LockSite site, LockCookie cookie) noexcept {
         }
         publish_event(*current.trace, LockEvent::Release, lock, 0, site);
 #if MYOS_LOCK_DIAG >= 3
-        if (held.acquired_at != 0) {
-            auto& stats =
-                current.trace->stats[class_index(lock.lock_class)];
+        if (held.acquired_at != 0 && current.trace->profile != nullptr) {
+            auto& stats = current.trace->profile
+                ->stats[class_index(lock.lock_class)];
             const u64 elapsed = now() - held.acquired_at;
             atomic_add_sat(stats.hold_ticks, elapsed);
             atomic_max(stats.max_hold, elapsed);
@@ -818,10 +873,13 @@ void on_spin(
     if (polls == 1) {
         publish_event(*current.trace, LockEvent::Contended, lock, 0, site);
 #if MYOS_LOCK_DIAG >= 3
-        auto& stats = current.trace->stats[class_index(lock.lock_class)];
-        atomic_add_sat(stats.contentions, 1);
-        atomic_max(stats.max_ticket_distance,
-            static_cast<u32>(ticket - serving));
+        if (current.trace->profile != nullptr) {
+            auto& stats =
+                current.trace->profile->stats[class_index(lock.lock_class)];
+            atomic_add_sat(stats.contentions, 1);
+            atomic_max(stats.max_ticket_distance,
+                static_cast<u32>(ticket - serving));
+        }
 #endif
     }
     CycleStep steps[wait_cycle_capacity]{};
@@ -1032,12 +1090,68 @@ void run_probe(u32 probe) noexcept {
     static OrderedProbe ordered[2]{};
     static libk::Atomic<usize> peer{max_cpu_count};
     static libk::Atomic<u32> ready{};
+    static libk::Atomic<usize> writer_peer{max_cpu_count};
+    static libk::Atomic<u32> writer_ready{};
+    static libk::Atomic<u32> writer_done{};
+    static libk::Atomic<u32> writer_cycles{};
 
     CurrentTrace current = current_trace();
     if (current.trace == nullptr || current.registry == nullptr) {
         return;
     }
     const CpuId boot = current.registry->boot_id();
+
+    if (probe == 10) {
+        //Confirmatory experiment.
+        // Exit condition: remove when an external multi-hart harness can
+        // pause two lockdep writers immediately before monotonic publication.
+        const bool boot_role = current.cpu.raw == boot.raw;
+        bool peer_role{};
+        if (!boot_role) {
+            usize expected = max_cpu_count;
+            peer_role = writer_peer.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(expected, current.cpu.raw)
+                || expected == current.cpu.raw;
+        }
+        if (!boot_role && !peer_role) {
+            return;
+        }
+        static_cast<void>(
+            writer_ready.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (writer_ready.load<libk::MemoryOrder::Acquire>() != 2) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        const usize a_class = class_index(LockClass::ProbeA);
+        const usize b_class = class_index(LockClass::ProbeB);
+        const auto result = boot_role
+            ? graph_state.check_insert(
+                a_class, b_class, LockSite::current(), LockSite::current())
+            : graph_state.check_insert(
+                b_class, a_class, LockSite::current(), LockSite::current());
+        if (result.status == DepStatus::Cycle) {
+            static_cast<void>(
+                writer_cycles.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        }
+        static_cast<void>(
+            writer_done.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (writer_done.load<libk::MemoryOrder::Acquire>() != 2) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (boot_role) {
+            const auto graph = graph_state.snapshot();
+            const u32 cycles =
+                writer_cycles.load<libk::MemoryOrder::Acquire>();
+            diag::console::print<
+                "lock-probe: stage-f writer-{} cycles={}\n">(
+                graph.has(a_class, b_class)
+                        && graph.has(b_class, a_class)
+                        && cycles != 0
+                    ? "ok" : "fail",
+                cycles);
+        }
+        return;
+    }
 
     if (probe == 9) {
         const bool boot_role = current.cpu.raw == boot.raw;
@@ -1141,11 +1255,7 @@ void dump_diagnostics() noexcept {
         return;
     }
 
-    DepGraph<class_count> graph{};
-    {
-        GraphGuard guard{};
-        graph = graph_state.snapshot();
-    }
+    const DepGraph<class_count> graph = graph_state.snapshot();
     diag::console::print<"\n[sync] observed dependencies\n">();
     usize edges{};
     for (usize from = 0; from < class_count; ++from) {
@@ -1183,7 +1293,10 @@ void dump_diagnostics() noexcept {
                 if (trace == nullptr) {
                     continue;
                 }
-                const ClassStats& stats = trace->stats[index];
+                if (trace->profile == nullptr) {
+                    continue;
+                }
+                const ClassStats& stats = trace->profile->stats[index];
                 const auto add = [](u64 left, u64 right) noexcept {
                     const u64 limit = libk::numeric_limits<u64>::max();
                     return right > limit - left ? limit : left + right;

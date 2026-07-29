@@ -931,11 +931,24 @@ void CpuDispatcher::record_dispatch(
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Scheduler,
         event,
-        actor,
         outgoing.identity(),
+        incoming.identity(),
         context,
         pending_charge_.ticks(),
         programmed_deadline_.ticks());
+#if MYOS_STAGE_F_PROBE
+    //Confirmatory experiment.
+    // Exit condition: remove when the external recorder harness correlates
+    // one real switch commit with its absolute flight record.
+    diag::concurrency::confirm_dispatch(
+        id_,
+        event,
+        outgoing.identity(),
+        incoming.identity(),
+        context,
+        pending_charge_.ticks(),
+        programmed_deadline_.ticks());
+#endif
     pending_charge_ = {};
 }
 

@@ -197,6 +197,12 @@ struct ClassStats final {
     libk::Atomic<u64> context_mask{};
 };
 
+struct LockProfile final {
+    ClassStats stats[static_cast<usize>(LockClass::Count)]{};
+};
+
+static_assert(sizeof(LockProfile) <= 4096);
+
 struct CpuLockTrace final {
     LocalLockState local{};
     RemoteWait waiting{};
@@ -214,7 +220,7 @@ struct CpuLockTrace final {
     libk::Atomic<u64> hardware_irq_max{};
     libk::Atomic<u64> explicit_irq_max{};
 #if MYOS_LOCK_DIAG >= 3
-    ClassStats stats[static_cast<usize>(LockClass::Count)]{};
+    LockProfile* profile{};
 #endif
 };
 

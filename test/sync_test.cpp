@@ -15,6 +15,8 @@ constinit libk::ManualLifetime<kernel::diag::concurrency::ObservationShard>
     concurrency_test_shard{};
 constinit libk::ManualLifetime<kernel::diag::concurrency::FlightRecorder>
     concurrency_test_flight{};
+constinit kernel::diag::concurrency::FlightPage concurrency_test_flight_pages[
+    kernel::diag::concurrency::FlightRecorder::page_count]{};
 constinit kernel::diag::concurrency::ObservationPage
     concurrency_capacity_pages[
         kernel::diag::concurrency::ObservationShard::pages]{};
@@ -259,7 +261,11 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         FlightRecorder& flight = concurrency_test_flight.emplace();
-        flight.initialize(kernel::CpuId{1});
+        FlightPage* storage[FlightRecorder::page_count]{};
+        for (usize page = 0; page < FlightRecorder::page_count; ++page) {
+            storage[page] = &concurrency_test_flight_pages[page];
+        }
+        flight.initialize(kernel::CpuId{1}, storage);
         for (usize index = 0; index < FlightRecorder::capacity + 3; ++index) {
             flight.push(
                 index,

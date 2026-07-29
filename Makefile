@@ -78,6 +78,7 @@ QEMU_TIMEOUT ?= 10s
 PANIC_PROBE ?= 0
 LOCK_PROBE ?= 0
 CONCURRENCY_PROBE ?= 0
+STAGE_F_PROBE ?= 0
 GDB_HOST ?= 127.0.0.1
 GDB_PORT ?= 1237
 
@@ -109,7 +110,7 @@ RISCV_ABI  ?= lp64d
 RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
-BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)$(if $(filter-out 0,$(CONCURRENCY_PROBE)),-concprobe$(CONCURRENCY_PROBE),)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
+BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)$(if $(filter-out 0,$(CONCURRENCY_PROBE)),-concprobe$(CONCURRENCY_PROBE),)$(if $(filter-out 0,$(STAGE_F_PROBE)),-stagefprobe,)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
 BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
 BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
@@ -142,6 +143,7 @@ COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
                 -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
                 -DMYOS_LOCK_PROBE=$(LOCK_PROBE) \
                 -DMYOS_CONCURRENCY_PROBE=$(CONCURRENCY_PROBE) \
+                -DMYOS_STAGE_F_PROBE=$(STAGE_F_PROBE) \
                 -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
                 -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
                 -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) \
@@ -452,6 +454,16 @@ audit-symbols: $(TARGET)
 	else \
 		echo "[audit] OK: no forbidden defined RTTI symbols"; \
 	fi
+	@if [ "$(CONCURRENCY_DIAG_LEVEL)" -eq 0 ]; then \
+		echo "[audit] checking disabled concurrency recorder symbols..."; \
+		if $(NM) -C --defined-only -n $(TARGET) \
+			| rg -n "kernel::diag::concurrency::(FlightRecorder::|dump_flight\\()"; then \
+			echo "[audit] FAIL: disabled recorder implementation remains linked"; \
+			exit 1; \
+		else \
+			echo "[audit] OK: disabled recorder has no linked implementation"; \
+		fi; \
+	fi
 	@echo "[audit] checking vtable whitelist..."
 	@set -e; \
 	violations=0; \
@@ -724,9 +736,6 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 run-concurrency-probe:
 	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
-# The trace profile currently has a baseline 1984-byte validate_graph frame
-# against the production 1792-byte audit bound. Runtime evidence remains
-# independently runnable while that pre-existing audit failure stays visible.
 _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
 	@case "$(CONCURRENCY_PROBE)" in \
 		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
@@ -777,6 +786,26 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 	rm -f "$$output"; \
 	echo "[concurrency-probe] OK: scenario $(CONCURRENCY_PROBE) passed on $(QEMU_SMP) harts"
 
+run-stage-f-probe:
+	$(MAKE) PROFILE=kernel LOCK_DIAG=profile CONCURRENCY_DIAG=profile \
+		LOCK_PROBE=10 STAGE_F_PROBE=1 _run-stage-f-probe
+
+_run-stage-f-probe: $(TARGET) audit-boot-stack
+	@set +e; \
+	output=$$(mktemp); \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	status=$$?; \
+	cat "$$output"; \
+	if [ $$status -ne 124 ] \
+		|| ! rg -q "lock-probe: stage-f writer-ok" "$$output" \
+		|| ! rg -q "concurrency-probe: stage-f flight-ok capacity=128" "$$output"; then \
+		echo "[stage-f-probe] FAIL: profile/profile writer or flight evidence missing"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	rm -f "$$output"; \
+	echo "[stage-f-probe] OK: profile/profile storage, writer and flight paths passed"
+
 debug: $(TARGET) audit-boot-stack
 	@echo "debug: waiting for GDB on $(GDB_HOST):$(GDB_PORT)"
 	$(QEMU) -machine virt -nographic -bios default -kernel $(TARGET) -S -gdb tcp:$(GDB_HOST):$(GDB_PORT)
@@ -786,4 +815,4 @@ clean:
 
 -include $(DEPS) $(USER_DEPS)
 
-.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe run-concurrency-probe _run-concurrency-probe debug clean
+.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe run-concurrency-probe _run-concurrency-probe run-stage-f-probe _run-stage-f-probe debug clean

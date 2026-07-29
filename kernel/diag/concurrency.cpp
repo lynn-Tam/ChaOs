@@ -100,6 +100,15 @@ constinit libk::ManualLifetime<sched::RemoteRequest> probe_remote_request{};
 alignas(8) usize probe_remote_owner{};
 #endif
 
+#if MYOS_STAGE_F_PROBE
+//Confirmatory experiment.
+// Exit condition: remove with confirm_dispatch() when an external recorder
+// harness can correlate one real dispatcher commit with its flight identity.
+libk::Atomic<u64> probe_dispatch_head[max_cpu_count]{};
+libk::Atomic<u32> probe_flight_errors{};
+libk::Atomic<u32> probe_flight_reported{};
+#endif
+
 [[nodiscard]] auto now() noexcept -> u64 {
     return arch::read_clock().ticks();
 }
@@ -2120,15 +2129,21 @@ void ObservationLease::reset() noexcept {
 #endif
 }
 
-void FlightRecorder::initialize(CpuId id) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 2
+void FlightRecorder::initialize(
+    CpuId id,
+    FlightPage* const (&storage)[page_count]) noexcept {
     id_ = id;
     head_.store<libk::MemoryOrder::Relaxed>(0);
     degraded_.store<libk::MemoryOrder::Relaxed>(0);
     wrapped_.store<libk::MemoryOrder::Relaxed>(0);
-    for (auto& record : records) {
-        record.sequence.store<libk::MemoryOrder::Relaxed>(0);
-        record.absolute_id.store<libk::MemoryOrder::Relaxed>(
-            libk::numeric_limits<u64>::max());
+    for (usize page = 0; page < page_count; ++page) {
+        pages_[page] = storage[page];
+        for (auto& record : pages_[page]->records) {
+            record.sequence.store<libk::MemoryOrder::Relaxed>(0);
+            record.absolute_id.store<libk::MemoryOrder::Relaxed>(
+                libk::numeric_limits<u64>::max());
+        }
     }
 }
 
@@ -2158,7 +2173,10 @@ void FlightRecorder::push(
     if (head >= capacity) {
         wrapped_.store<libk::MemoryOrder::Release>(1);
     }
-    FlightRecord& record = records[head % capacity];
+    const usize slot = static_cast<usize>(head % capacity);
+    FlightRecord& record =
+        pages_[slot / FlightPage::capacity]
+            ->records[slot % FlightPage::capacity];
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record.sequence, odd)) {
         degraded_.store<libk::MemoryOrder::Release>(1);
@@ -2190,7 +2208,10 @@ auto FlightRecorder::read(
         return false;
     }
     const u64 absolute = head - count + logical_index;
-    const FlightRecord& record = records[absolute % capacity];
+    const usize slot = static_cast<usize>(absolute % capacity);
+    const FlightRecord& record =
+        pages_[slot / FlightPage::capacity]
+            ->records[slot % FlightPage::capacity];
     for (usize attempt = 0; attempt < 3; ++attempt) {
         const u64 first = AtomicSnapshotReader::begin(record.sequence);
         if ((first & 1U) != 0) {
@@ -2223,6 +2244,7 @@ auto FlightRecorder::read(
     }
     return false;
 }
+#endif
 
 auto current_core() noexcept -> CpuDiagnosticsCore* {
 #if MYOS_CONCURRENCY_DIAG >= 1
@@ -2358,14 +2380,79 @@ void record(
 void dispatch(CpuId cpu, u64 actor, u64 context, u64 tick) noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 1
     if (CpuDiagnosticsCore* const core = current_core(); core != nullptr) {
+#if MYOS_STAGE_F_PROBE
+        if (cpu.raw < max_cpu_count && core->flight != nullptr) {
+            probe_dispatch_head[cpu.raw].store<libk::MemoryOrder::Release>(
+                core->flight->head());
+        }
+#endif
         core->live.current_actor.store<libk::MemoryOrder::Release>(actor);
         static_cast<void>(core->live.dispatch_epoch.fetch_add<libk::MemoryOrder::Release>(1));
         core->live.last_event_at.store<libk::MemoryOrder::Release>(tick);
     }
 #endif
-    record(FlightDomain::Scheduler, FlightEvent::Dispatch,
-        actor, context, cpu.raw, tick);
+    static_cast<void>(cpu);
+    static_cast<void>(context);
 }
+
+#if MYOS_STAGE_F_PROBE
+void confirm_dispatch(
+    CpuId cpu,
+    FlightEvent event,
+    u64 outgoing,
+    u64 incoming,
+    u64 context,
+    u64 charge,
+    u64 deadline) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external recorder harness can correlate
+    // one real dispatcher commit with its absolute flight identity.
+    CpuDiagnosticsCore* const core = current_core();
+    if (core == nullptr || core->flight == nullptr
+        || cpu.raw >= max_cpu_count) {
+        return;
+    }
+    FlightRecorder& flight = *core->flight;
+    const u64 head = flight.head();
+    const u64 before =
+        probe_dispatch_head[cpu.raw].load<libk::MemoryOrder::Acquire>();
+    const usize count = head < FlightRecorder::capacity
+        ? static_cast<usize>(head) : FlightRecorder::capacity;
+    FlightRecordValue record{};
+    const bool valid = head == before + 1
+        && count != 0
+        && flight.read(count - 1, record)
+        && record.absolute_id == head - 1
+        && record.domain == FlightDomain::Scheduler
+        && record.event == event
+        && record.actor == outgoing
+        && record.subject == incoming
+        && record.arg0 == context
+        && record.arg1 == charge
+        && record.arg2 == deadline;
+    if (!valid) {
+        static_cast<void>(
+            probe_flight_errors.fetch_add<libk::MemoryOrder::AcqRel>(1));
+    }
+
+    void* const owner = arch::current_cpu_owner();
+    auto* const local = static_cast<CpuLocal*>(owner);
+    CpuRegistry* const registry =
+        local == nullptr || local->runtime_ == nullptr
+        ? nullptr : local->runtime_->owner_registry;
+    if (registry != nullptr && cpu == registry->boot_id()
+        && head > FlightRecorder::capacity && flight.wrapped()
+        && probe_flight_reported.exchange<libk::MemoryOrder::AcqRel>(1) == 0) {
+        const u32 errors =
+            probe_flight_errors.load<libk::MemoryOrder::Acquire>();
+        diag::console::print<
+            "concurrency-probe: stage-f flight-{} capacity={} head={}\n">(
+                errors == 0 ? "ok" : "fail",
+                FlightRecorder::capacity,
+                head);
+    }
+}
+#endif
 
 void timer(CpuId cpu, u64 tick) noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 1
@@ -3276,8 +3363,8 @@ void mark_degraded(DiagnosticStatus::Flag flag) noexcept {
 #endif
 }
 
-void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
 #if MYOS_CONCURRENCY_DIAG >= 2
+void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
     diag::console::print<"[concurrency] cpu {} flight\n">(id.raw);
     FlightRecordValue record_value{};
     const u64 head = flight.head();
@@ -3302,11 +3389,8 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
             record_value.site.file,
             record_value.site.line);
     }
-#else
-    static_cast<void>(id);
-    static_cast<void>(flight);
-#endif
 }
+#endif
 
 #if MYOS_CONCURRENCY_DIAG >= 1
 namespace {

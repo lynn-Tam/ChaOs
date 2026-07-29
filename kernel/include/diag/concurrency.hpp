@@ -14,6 +14,10 @@
 #define MYOS_CONCURRENCY_PROBE 0
 #endif
 
+#ifndef MYOS_STAGE_F_PROBE
+#define MYOS_STAGE_F_PROBE 0
+#endif
+
 namespace kernel::diag::concurrency {
 
 struct DiagnosticStatus;
@@ -787,15 +791,25 @@ struct FlightRecord final {
     libk::Atomic<u32> site_line{};
 };
 
+struct FlightPage final {
+    static constexpr usize capacity = 32;
+    FlightRecord records[capacity]{};
+};
+
+static_assert(sizeof(FlightPage) <= 4096);
+
 class FlightRecorder final {
 public:
-    static constexpr usize capacity = profile_enabled ? 40 : 32;
+    static constexpr usize page_count = 4;
+    static constexpr usize capacity = page_count * FlightPage::capacity;
 
     FlightRecorder() noexcept = default;
     FlightRecorder(const FlightRecorder&) = delete;
     auto operator=(const FlightRecorder&) -> FlightRecorder& = delete;
 
-    void initialize(CpuId id) noexcept;
+    void initialize(
+        CpuId id,
+        FlightPage* const (&storage)[page_count]) noexcept;
     void push(
         u64 tick,
         FlightDomain domain,
@@ -824,7 +838,7 @@ private:
     libk::Atomic<u64> head_{};
     libk::Atomic<u32> degraded_{};
     libk::Atomic<u32> wrapped_{};
-    FlightRecord records[capacity]{};
+    FlightPage* pages_[page_count]{};
 };
 
 static_assert(sizeof(FlightRecorder) <= 4096);
@@ -1062,6 +1076,18 @@ void record(
     SourceSite site = SourceSite::current()) noexcept;
 
 void dispatch(CpuId cpu, u64 actor, u64 context, u64 tick) noexcept;
+#if MYOS_STAGE_F_PROBE
+//Confirmatory experiment.
+// Exit condition: remove with the Stage F dispatch correlation probe.
+void confirm_dispatch(
+    CpuId cpu,
+    FlightEvent event,
+    u64 outgoing,
+    u64 incoming,
+    u64 context,
+    u64 charge,
+    u64 deadline) noexcept;
+#endif
 void timer(CpuId cpu, u64 tick) noexcept;
 void trap_enter(u64 tick, u32 context) noexcept;
 void trap_exit(u64 tick) noexcept;
@@ -1082,7 +1108,9 @@ void clear_wait(WaitToken token) noexcept;
 void observe_wait(WaitToken token, u64 semantic_stamp) noexcept;
 [[nodiscard]] auto default_grace(Expectation expectation) noexcept -> u64;
 void mark_degraded(DiagnosticStatus::Flag flag) noexcept;
+#if MYOS_CONCURRENCY_DIAG >= 2
 void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
+#endif
 [[nodiscard]] auto analyze(
     NodeRef root,
     WaitGraphScratch& scratch) noexcept -> bool;
