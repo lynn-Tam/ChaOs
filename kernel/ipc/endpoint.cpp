@@ -481,7 +481,11 @@ auto Endpoint::call(
         publisher_done(*call);
         return libk::unexpected(EndpointError::Busy);
     }
-    call->completion_.set_deadline(deadline);
+    call->completion_.set_deadline(
+        deadline,
+        deadline
+            ? diag::concurrency::NodeRef::cpu(dispatcher.id())
+            : diag::concurrency::NodeRef{});
 
     if (activation == nullptr) {
         sched::Binding* const binding = caller.binding();

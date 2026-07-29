@@ -190,7 +190,8 @@ void run_tests(const kernel::boot::BootInfo& boot_info) noexcept {
 
 namespace kernel::init {
 
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
 auto run_concurrency_probe(
     kernel::CpuRegistry& cpus,
     u32 probe) noexcept -> bool {

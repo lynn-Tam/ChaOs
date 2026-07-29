@@ -734,9 +734,9 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
-_run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
+_run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
 	@case "$(CONCURRENCY_PROBE)" in \
 		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
 		2) evidence="concurrency-probe: stage-a storage-ok cpus=$(QEMU_SMP)";; \
@@ -746,11 +746,18 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 		6) evidence="concurrency-probe: stage-c watchdog-ok";; \
 		7) evidence="concurrency-probe: stage-d delivery-ok";; \
 		8) evidence="concurrency-probe: stage-e analyzer-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..8"; exit 1;; \
+		9) evidence="concurrency-probe: stage-g ready-ok";; \
+		10) evidence="concurrency-probe: stage-g throttled-ok";; \
+		11) evidence="concurrency-probe: stage-g deadline-ok";; \
+		12) evidence="concurrency-probe: stage-g cpu-live-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..12"; exit 1;; \
 	esac; \
 	initrd=""; \
 	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 4 ]; then \
+		|| [ "$(CONCURRENCY_PROBE)" = 4 ] \
+		|| [ "$(CONCURRENCY_PROBE)" = 9 ] \
+		|| [ "$(CONCURRENCY_PROBE)" = 10 ] \
+		|| [ "$(CONCURRENCY_PROBE)" = 11 ]; then \
 		initrd="-initrd $(BOOT_BUNDLE)"; \
 	fi; \
 	set +e; \
@@ -782,6 +789,33 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 		echo "[concurrency-probe] FAIL: service interval evidence missing"; \
 		rm -f "$$output"; \
 		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 9 ] \
+		&& ! rg -q "class=runnable-starvation" "$$output"; then \
+		echo "[concurrency-probe] FAIL: real Ready starvation was not reported"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 10 ] \
+		&& ! rg -q "class=timer-stall" "$$output"; then \
+		echo "[concurrency-probe] FAIL: real Throttled refill stall was not reported"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 11 ] \
+		&& ! rg -q "class=deadline-delivery-stall" "$$output"; then \
+		echo "[concurrency-probe] FAIL: overdue timeout publication was not reported"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	if [ "$(CONCURRENCY_PROBE)" = 12 ]; then \
+		live_reports=$$(rg -c "class=open-owner-stall" "$$output" || true); \
+		if ! rg -q "stage-g trap-stall-armed" "$$output" \
+			|| [ "$$live_reports" -lt 2 ]; then \
+			echo "[concurrency-probe] FAIL: peer IRQ/trap stalls lacked two reports"; \
+			rm -f "$$output"; \
+			exit 1; \
+		fi; \
 	fi; \
 	rm -f "$$output"; \
 	echo "[concurrency-probe] OK: scenario $(CONCURRENCY_PROBE) passed on $(QEMU_SMP) harts"

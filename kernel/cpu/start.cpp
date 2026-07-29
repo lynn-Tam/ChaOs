@@ -150,9 +150,11 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
 
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
         //Confirmatory experiment.
-        // Exit condition: remove with the Stage B operation fault probes.
+        // Exit condition: remove with the Stage B/Stage G operation and
+        // scheduler fault probes.
         KASSERT(init::run_concurrency_probe(
             *runtime.owner_registry, MYOS_CONCURRENCY_PROBE));
 #endif
@@ -161,9 +163,11 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
             sync::dump_diagnostics();
         }
         diag::console::print<"runtime: entered\n">();
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
         //Confirmatory experiment.
-        // Exit condition: remove with the Stage B operation fault probes.
+        // Exit condition: remove with the Stage B/Stage G operation and
+        // scheduler fault probes.
         // Their synthetic Wait edge is intentionally non-resumable, so keep
         // the root task out of normal execution for the observation window.
         static_cast<void>(arch::disable_interrupts());

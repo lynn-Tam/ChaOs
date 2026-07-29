@@ -106,7 +106,8 @@ public:
         publish_actor();
     }
 
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
+    || MYOS_CONCURRENCY_PROBE == 11
     //Confirmatory experiment.
     // Exit condition: remove when operation fault injection no longer borrows
     // a real Ready binding before its first dispatch.

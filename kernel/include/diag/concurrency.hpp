@@ -209,6 +209,10 @@ struct OperationPolicy final {
     WaitKind kind{WaitKind::External};
     Expectation expectation{Expectation::ExternalUnbounded};
     NodeRef driver{};
+    // Canonical owner of timeout publication.  This is distinct from the
+    // ordinary operation producer: after the absolute deadline, the
+    // dispatcher/timer path owns the obligation to publish completion.
+    NodeRef deadline_driver{};
     u64 deadline{};
     u64 grace{};
     StallAction action{StallAction::Report};
@@ -245,18 +249,6 @@ enum class ServicePhase : u32 {
     WakeIssued = 2,
     Running = 3,
     Completed = 4,
-};
-
-enum class DriverKind : u8 {
-    None,
-    Actor,
-    Observation,
-    Cpu,
-    CpuSet,
-    Service,
-    Deadline,
-    External,
-    Unknown,
 };
 
 enum class FlightDomain : u8 {
@@ -331,6 +323,7 @@ enum class StallClass : u8 {
     LostServiceKick,
     RunnableStarvation,
     TimerStall,
+    DeadlineDeliveryStall,
     DrainStall,
     Livelock,
     OrphanObligation,
@@ -409,8 +402,7 @@ struct ObservationRecord final {
 
     libk::Atomic<u64> subject_identity{};
     libk::Atomic<u64> subject_generation{};
-    libk::Atomic<u64> parent_key{};
-    libk::Atomic<u64> waiter_key{};
+    libk::Atomic<u64> wait_target{};
     libk::Atomic<u64> driver_key{};
     libk::Atomic<u32> driver_kind{};
     libk::Atomic<u64> driver_generation{};
@@ -453,8 +445,7 @@ struct ObservationSnapshot final {
     OperationPolicy policy{};
     u64 subject_identity{};
     u64 subject_generation{};
-    ObservationKey parent_key{};
-    ObservationKey waiter_key{};
+    ObservationKey wait_target{};
     NodeRef driver{};
     NodeRef blocker{};
     u64 semantic_stamp{};
@@ -536,13 +527,6 @@ public:
     // observation when its temporary scope ends.
     [[nodiscard]] static auto borrow(ObservationKey key) noexcept
         -> ObservationLease;
-    // Locate a live observation by its canonical subject identity.  The
-    // result is a borrowed view; the subject owns the lifecycle, not this
-    // temporary diagnostic handle.
-    [[nodiscard]] static auto find(
-        RecordKind kind,
-        u64 subject_identity,
-        u64 subject_generation) noexcept -> ObservationLease;
     // Transfer slot ownership to the caller as a key-only handle.  The slot
     // remains active until a later borrowed lease calls finish().
     [[nodiscard]] auto detach_key() noexcept -> ObservationKey;
@@ -665,10 +649,6 @@ public:
         return degraded_.load<libk::MemoryOrder::Acquire>() != 0;
     }
     [[nodiscard]] auto key_at(usize index) const noexcept -> ObservationKey;
-    [[nodiscard]] auto find(
-        RecordKind kind,
-        u64 subject_identity,
-        u64 subject_generation) const noexcept -> ObservationKey;
     void profile_current(u64 tick) const noexcept;
 
 private:
@@ -1122,6 +1102,11 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
 #if MYOS_CONCURRENCY_PROBE
 void run_probe(u32 probe) noexcept;
 #endif
+#if MYOS_CONCURRENCY_PROBE == 12
+//Confirmatory experiment.
+// Exit condition: remove with the Stage G peer trap-exit fault hook.
+[[nodiscard]] auto trap_exit_stall_for_probe() noexcept -> bool;
+#endif
 
 class CpuWaitScope final {
 public:
@@ -1136,7 +1121,6 @@ public:
         WaitKind kind,
         NodeRef subject,
         NodeRef driver,
-        Expectation expectation,
         SourceSite site = SourceSite::current()) noexcept;
     CpuWaitScope(const CpuWaitScope&) = delete;
     auto operator=(const CpuWaitScope&) -> CpuWaitScope& = delete;
@@ -1152,7 +1136,6 @@ private:
     WaitKind kind_{};
     NodeRef subject_{};
     NodeRef driver_{};
-    Expectation expectation_{};
     SourceSite site_{};
     u64 last_stamp_{};
     bool observed_{};

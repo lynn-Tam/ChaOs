@@ -9,6 +9,7 @@
 #include <arch/time.hpp>
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
+#include <diag/console.hpp>
 #include <diag/panic.hpp>
 #include <diag/concurrency.hpp>
 #include <trap/trap.hpp>
@@ -41,6 +42,18 @@ extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
             entry_tick, static_cast<u32>(event.origin()));
     }
     kernel::trap::handle(event, context);
+#if MYOS_CONCURRENCY_PROBE == 12
+    //Confirmatory experiment.
+    // Exit condition: remove when an external harness can stop a selected
+    // peer after real trap handling and before the trap-exit publication.
+    if (kernel::diag::concurrency::trap_exit_stall_for_probe()) {
+        kernel::diag::console::print<
+            "concurrency-probe: stage-g trap-stall-armed\n">();
+        while (kernel::diag::concurrency::trap_exit_stall_for_probe()) {
+            arch::wait_for_interrupt();
+        }
+    }
+#endif
     return arch::riscv64::raw_frame(context.frame());
 }
 

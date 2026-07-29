@@ -11,6 +11,7 @@
 #include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
 #include <sched/remote_queue.hpp>
+#include <sync/irq_lock_guard.hpp>
 
 #ifndef MYOS_BUILTIN_TESTS
 #define MYOS_BUILTIN_TESTS 0
@@ -174,13 +175,16 @@ enum class HashMode : u8 {
     hash = mix_hash(hash, snapshot.policy.driver.identity);
     hash = mix_hash(hash, static_cast<u64>(snapshot.policy.driver.kind));
     hash = mix_hash(hash, snapshot.policy.driver.generation);
+    hash = mix_hash(hash, snapshot.policy.deadline_driver.identity);
+    hash = mix_hash(
+        hash, static_cast<u64>(snapshot.policy.deadline_driver.kind));
+    hash = mix_hash(hash, snapshot.policy.deadline_driver.generation);
     hash = mix_hash(hash, snapshot.policy.deadline);
     hash = mix_hash(hash, snapshot.policy.grace);
     hash = mix_hash(hash, static_cast<u64>(snapshot.policy.action));
     hash = mix_hash(hash, snapshot.subject_identity);
     hash = mix_hash(hash, snapshot.subject_generation);
-    hash = mix_hash(hash, snapshot.parent_key.raw);
-    hash = mix_hash(hash, snapshot.waiter_key.raw);
+    hash = mix_hash(hash, snapshot.wait_target.raw);
     hash = mix_hash(hash, snapshot.driver.identity);
     hash = mix_hash(hash, static_cast<u64>(snapshot.driver.kind));
     hash = mix_hash(hash, snapshot.driver.generation);
@@ -375,8 +379,7 @@ void clear_record(ObservationRecord& record) noexcept {
     record.policy_driver_generation.store<libk::MemoryOrder::Relaxed>(0);
     record.subject_identity.store<libk::MemoryOrder::Relaxed>(0);
     record.subject_generation.store<libk::MemoryOrder::Relaxed>(0);
-    record.parent_key.store<libk::MemoryOrder::Relaxed>(0);
-    record.waiter_key.store<libk::MemoryOrder::Relaxed>(0);
+    record.wait_target.store<libk::MemoryOrder::Relaxed>(0);
     record.driver_key.store<libk::MemoryOrder::Relaxed>(0);
     record.driver_kind.store<libk::MemoryOrder::Relaxed>(0);
     record.driver_generation.store<libk::MemoryOrder::Relaxed>(0);
@@ -845,6 +848,8 @@ auto ObservationShard::reserve(
                 static_cast<u32>(kind));
             record.expectation.store<libk::MemoryOrder::Relaxed>(
                 static_cast<u32>(expectation));
+            record.policy_kinds.store<libk::MemoryOrder::Relaxed>(
+                static_cast<u32>(StallAction::Report) << 16);
             record.subject_identity.store<libk::MemoryOrder::Relaxed>(
                 subject_identity);
             record.subject_generation.store<libk::MemoryOrder::Relaxed>(
@@ -909,40 +914,6 @@ auto ObservationShard::key_at(usize index) const noexcept -> ObservationKey {
     }
     const u64 generation = slot_generation(state);
     return ObservationKey::make(id_, static_cast<u16>(index), generation);
-}
-
-auto ObservationShard::find(
-    RecordKind kind,
-    u64 subject_identity,
-    u64 subject_generation) const noexcept -> ObservationKey {
-    const u64 allocated = allocated_.load<libk::MemoryOrder::Acquire>();
-    for (usize index = 0; index < slot_count; ++index) {
-        const u64 mask = bit(index);
-        if ((allocated & mask) == 0) {
-            continue;
-        }
-        usize local{};
-        ObservationPage* const page = page_for(index, local);
-        if (page == nullptr) {
-            continue;
-        }
-        const ObservationRecord& record = page->records[local];
-        const u64 state = record.slot_state.load<libk::MemoryOrder::Acquire>();
-        if (slot_kind(state) != SlotKind::Active
-            || static_cast<RecordKind>(record.record_kind.load<
-                   libk::MemoryOrder::Acquire>())
-                != kind
-            || record.subject_identity.load<libk::MemoryOrder::Acquire>()
-                != subject_identity
-            || record.subject_generation.load<libk::MemoryOrder::Acquire>()
-                != subject_generation) {
-            continue;
-        }
-        const u64 generation = slot_generation(state);
-        return ObservationKey::make(
-            id_, static_cast<u16>(index), generation);
-    }
-    return {};
 }
 
 void ObservationShard::release(ObservationKey key) noexcept {
@@ -1058,7 +1029,7 @@ auto ObservationShard::write_wait(
     const u64 tick = now();
     increment_sat(record->activity_epoch, 1);
     record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
-    record->waiter_key.store<libk::MemoryOrder::Relaxed>(wait.raw);
+    record->wait_target.store<libk::MemoryOrder::Relaxed>(wait.raw);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(kind));
     publish_node(
@@ -1524,14 +1495,18 @@ auto ObservationShard::snapshot(
             record->grace.load<libk::MemoryOrder::Relaxed>();
         value.subject_identity = record->subject_identity.load<libk::MemoryOrder::Relaxed>();
         value.subject_generation = record->subject_generation.load<libk::MemoryOrder::Relaxed>();
-        value.parent_key = ObservationKey{
-            record->parent_key.load<libk::MemoryOrder::Relaxed>()};
-        value.waiter_key = ObservationKey{
-            record->waiter_key.load<libk::MemoryOrder::Relaxed>()};
+        value.wait_target = ObservationKey{
+            record->wait_target.load<libk::MemoryOrder::Relaxed>()};
         value.driver = read_node(
             record->driver_key.load<libk::MemoryOrder::Relaxed>(),
             record->driver_kind.load<libk::MemoryOrder::Relaxed>(),
             record->driver_generation.load<libk::MemoryOrder::Relaxed>());
+        if (value.expectation == Expectation::DeadlineBound) {
+            // Completion owns the full immutable policy.  While that policy
+            // is active, the live Attached relation is the timeout source;
+            // deriving it here avoids a second copy in every observation.
+            value.policy.deadline_driver = value.driver;
+        }
         value.blocker = read_node(
             record->blocker_key.load<libk::MemoryOrder::Relaxed>(),
             record->blocker_kind.load<libk::MemoryOrder::Relaxed>(),
@@ -1585,7 +1560,7 @@ void ObservationShard::finish(
         record->phase.store<libk::MemoryOrder::Relaxed>(terminal_phase);
         record->wait_kind.store<libk::MemoryOrder::Relaxed>(
             static_cast<u32>(WaitKind::None));
-        record->waiter_key.store<libk::MemoryOrder::Relaxed>(0);
+        record->wait_target.store<libk::MemoryOrder::Relaxed>(0);
         publish_node(
             record->driver_key,
             record->driver_kind,
@@ -1767,70 +1742,6 @@ auto ObservationLease::borrow(ObservationKey key) noexcept
     return result ? libk::move(result) : ObservationLease{};
 #else
     static_cast<void>(key);
-    return {};
-#endif
-}
-
-auto ObservationLease::find(
-    RecordKind kind,
-    u64 subject_identity,
-    u64 subject_generation) noexcept -> ObservationLease {
-#if MYOS_CONCURRENCY_DIAG >= 1
-#if MYOS_BUILTIN_TESTS
-    const auto find_standalone = [&]() noexcept -> ObservationLease {
-        for (usize index = 0; index < 256; ++index) {
-            ObservationShard* const shard = standalone_shards[index].load<
-                libk::MemoryOrder::Acquire>();
-            if (shard == nullptr) {
-                continue;
-            }
-            const ObservationKey key = shard->find(
-                kind, subject_identity, subject_generation);
-            if (key) {
-                return borrow(key);
-            }
-        }
-        return {};
-    };
-#endif
-    void* const owner = arch::current_cpu_owner();
-    if (owner == nullptr) {
-#if MYOS_BUILTIN_TESTS
-        return find_standalone();
-#else
-        return {};
-#endif
-    }
-    auto& cpu = *static_cast<CpuLocal*>(owner);
-    if (cpu.runtime_ == nullptr || cpu.runtime_->owner_registry == nullptr) {
-#if MYOS_BUILTIN_TESTS
-        return find_standalone();
-#else
-        return {};
-#endif
-    }
-    CpuRegistry* const registry = cpu.runtime_->owner_registry;
-    for (usize index = 0; index < registry->count(); ++index) {
-        const CpuId id{index};
-        ObservationShard* const shard = registry->observations(id);
-        if (shard == nullptr) {
-            continue;
-        }
-        const ObservationKey key = shard->find(
-            kind, subject_identity, subject_generation);
-        if (key) {
-            return borrow(key);
-        }
-    }
-#if MYOS_BUILTIN_TESTS
-    return find_standalone();
-#else
-    return {};
-#endif
-#else
-    static_cast<void>(kind);
-    static_cast<void>(subject_identity);
-    static_cast<void>(subject_generation);
     return {};
 #endif
 }
@@ -2646,7 +2557,6 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     if (watcher == nullptr) {
         return;
     }
-
     // A fixed ring assignment gives every CPU one peer to inspect while
     // keeping the candidate single-writer. If a peer is unavailable, inspect
     // the local shard; this also covers single-hart systems.
@@ -2677,26 +2587,48 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             }
         }
     }
+    u64 touched_candidates{};
     const auto process = [&](StallFingerprint sample,
                              WatchdogThresholds thresholds,
                              StallAction action,
-                             WaitKind wait_kind) noexcept {
+                             WaitKind wait_kind) noexcept -> bool {
         WatchdogCandidate* slot{};
-        for (WatchdogCandidate& candidate : watcher->candidates) {
+        usize slot_index{};
+        for (usize index = 0;
+             index < CpuDiagnosticsCore::candidate_capacity;
+             ++index) {
+            WatchdogCandidate& candidate = watcher->candidates[index];
             StallFingerprint existing{};
             if (candidate.read(existing) && existing.root == sample.root) {
                 slot = &candidate;
+                slot_index = index;
                 break;
             }
         }
+        if (slot != nullptr && (touched_candidates & bit(slot_index)) != 0) {
+            return false;
+        }
         if (slot == nullptr) {
-            const usize replacement = watcher->candidate_cursor.fetch_add<
-                libk::MemoryOrder::AcqRel>(1)
-                % CpuDiagnosticsCore::candidate_capacity;
-            slot = &watcher->candidates[replacement];
+            const usize start = watcher->candidate_cursor.fetch_add<
+                libk::MemoryOrder::AcqRel>(1);
+            for (usize offset = 0;
+                 offset < CpuDiagnosticsCore::candidate_capacity;
+                 ++offset) {
+                const usize candidate =
+                    (start + offset) % CpuDiagnosticsCore::candidate_capacity;
+                if ((touched_candidates & bit(candidate)) == 0) {
+                    slot_index = candidate;
+                    slot = &watcher->candidates[candidate];
+                    break;
+                }
+            }
+            if (slot == nullptr) {
+                return false;
+            }
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(WatchdogCandidate::State::Clear));
         }
+        touched_candidates |= bit(slot_index);
 
         StallFingerprint previous{};
         const bool valid = slot->read(previous);
@@ -2714,14 +2646,14 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             slot->first_seen.store<libk::MemoryOrder::Release>(0);
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(WatchdogCandidate::State::Clear));
-            return;
+            return true;
         }
 
         const bool active =
             sample.activity_epoch != previous.activity_epoch;
         slot->publish(sample);
         if (tick < thresholds.soft_at) {
-            return;
+            return true;
         }
         const u64 age = tick >= thresholds.anchor
             ? elapsed(tick, thresholds.anchor) : 0;
@@ -2739,7 +2671,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 sample.root.identity,
                 static_cast<u64>(wait_kind),
                 age);
-            return;
+            return true;
         }
         if (state == WatchdogCandidate::State::Suspected && active) {
             state = WatchdogCandidate::State::SuspectedActive;
@@ -2749,7 +2681,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         if ((state != WatchdogCandidate::State::Suspected
                 && state != WatchdogCandidate::State::SuspectedActive)
             || tick < thresholds.hard_at) {
-            return;
+            return true;
         }
 
         u64 report_signature{};
@@ -2776,7 +2708,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                     libk::MemoryOrder::AcqRel,
                     libk::MemoryOrder::Acquire>(
                         expected, owner_token)) {
-                return;
+                return true;
             }
             owns_report = true;
             bool duplicate_report{};
@@ -2795,7 +2727,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                     static_cast<u32>(duplicate));
                 target_core->coordinator.owner.store<
                     libk::MemoryOrder::Release>(0);
-                return;
+                return true;
             }
         }
         const auto release_report = [&]() noexcept {
@@ -2832,7 +2764,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             }
 #endif
             release_report();
-            return;
+            return true;
         }
         const bool livelock =
             state == WatchdogCandidate::State::SuspectedActive;
@@ -2873,7 +2805,19 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 libk::MemoryOrder::Release>(
                 DiagnosticStatus::StallReported));
         }
+#if MYOS_CONCURRENCY_PROBE == 12
+        //Confirmatory experiment.
+        // Exit condition: remove when an external fault controller can
+        // release the IRQ-off peer after the watchdog confirms it.
+        if (sample.root.kind == NodeRef::Kind::Cpu && sample.phase == 1) {
+            u32 expected = 1;
+            static_cast<void>(probe_phase.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(expected, 2));
+        }
+#endif
         release_report();
+        return true;
     };
 
     // A local timer callback cannot prove that its own interrupts or trap
@@ -2963,14 +2907,14 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         if (snapshot.record_kind == RecordKind::ExecutionActor
             && snapshot.phase == static_cast<u32>(
                 ExecutionState::Blocked)) {
-            if (!snapshot.waiter_key) {
+            if (!snapshot.wait_target) {
                 static_cast<void>(target_core->status().flags.fetch_or<
                     libk::MemoryOrder::Release>(
                         DiagnosticStatus::PolicyMissing));
                 continue;
             }
             ObservationLease lease =
-                ObservationLease::borrow(snapshot.waiter_key);
+                ObservationLease::borrow(snapshot.wait_target);
             if (!lease || !lease.snapshot(wait_target)) {
                 static_cast<void>(target_core->status().flags.fetch_or<
                     libk::MemoryOrder::Release>(
@@ -2994,7 +2938,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             progress = mix_hash(progress, delegated->progress_epoch);
             activity = mix_hash(activity, delegated->activity_epoch);
         }
-        process(
+        if (process(
             StallFingerprint{
                 NodeRef::observation(key),
                 snapshot.phase,
@@ -3005,8 +2949,9 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 snapshot.blocker},
             thresholds,
             snapshot.policy.action,
-            snapshot.wait_kind);
-        ++accepted;
+            snapshot.wait_kind)) {
+            ++accepted;
+        }
     }
 #else
     static_cast<void>(cpu);
@@ -3460,6 +3405,9 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
     if (livelock) {
         return StallClass::Livelock;
     }
+    if (snapshot.expectation == Expectation::DeadlineBound) {
+        return StallClass::DeadlineDeliveryStall;
+    }
     if (snapshot.expectation == Expectation::ExternalUnbounded
         || is_external_wait(snapshot.wait_kind)) {
         return StallClass::ExternalWait;
@@ -3750,11 +3698,25 @@ auto analyze(
                     snapshot.record_kind == RecordKind::Operation
                     && snapshot.phase == static_cast<u32>(
                         OperationPhase::ReadyPublished);
+                const bool scheduler_root =
+                    snapshot.record_kind == RecordKind::ExecutionActor
+                    && (snapshot.phase == execution_ready_phase
+                        || snapshot.phase == execution_throttled_phase);
+                if (scheduler_root
+                    || snapshot.expectation
+                        == Expectation::DeadlineBound) {
+                    // Classify the root obligation before following its
+                    // concrete owner.  The owner node grades the evidence;
+                    // it must not replace Ready/refill/deadline semantics
+                    // with the generic open-CPU endpoint class.
+                    scratch.classification =
+                        terminal_class(snapshot, false);
+                }
             }
             if (ready_publication && cursor != 0
                 && snapshot.record_kind == RecordKind::ExecutionActor
                 && snapshot.phase == execution_blocked_phase
-                && snapshot.waiter_key
+                && snapshot.wait_target
                     == ObservationKey{root.identity}) {
                 const bool queued = (snapshot.detail[0] & 1U) != 0;
                 const bool wake_credit = (snapshot.detail[0] & 4U) != 0;
@@ -3793,8 +3755,8 @@ auto analyze(
                     next = {};
                 }
             } else {
-                next = snapshot.waiter_key
-                    ? NodeRef::observation(snapshot.waiter_key)
+                next = snapshot.wait_target
+                    ? NodeRef::observation(snapshot.wait_target)
                     : snapshot.driver;
                 if (!next
                     && snapshot.blocker.kind != NodeRef::Kind::None) {
@@ -3926,6 +3888,8 @@ auto stall_class_name(StallClass value) noexcept -> const char* {
         return "runnable-starvation";
     case StallClass::TimerStall:
         return "timer-stall";
+    case StallClass::DeadlineDeliveryStall:
+        return "deadline-delivery-stall";
     case StallClass::DrainStall:
         return "drain-stall";
     case StallClass::Livelock:
@@ -3950,7 +3914,7 @@ void run_probe(u32 probe) noexcept {
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
     if (probe != 1 && probe != 5 && probe != 6 && probe != 7
-        && probe != 8) {
+        && probe != 8 && (probe < 9 || probe > 12)) {
         return;
     }
 
@@ -3968,6 +3932,70 @@ void run_probe(u32 probe) noexcept {
 
     const CpuId cpu = local.descriptor->logical_id();
     const CpuId boot = registry->boot_id();
+    if (probe >= 9 && probe <= 11) {
+        //Confirmatory experiment.
+        // Exit condition: remove when the external scheduler harness can
+        // hold the real root Binding at Ready/Throttled/deadline boundaries.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu == boot) {
+            probe_phase.store<libk::MemoryOrder::Release>(1);
+        } else {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 1) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+        }
+        return;
+    }
+    if (probe == 12) {
+        //Confirmatory experiment.
+        // Exit condition: remove when an external fault harness can
+        // sequentially hold peers at the IrqToken and trap-exit boundaries.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (registry->count() < 4) {
+            if (cpu == boot) {
+                diag::console::print<
+                    "concurrency-probe: stage-g cpu-live-fail cpus={}\n">(
+                    registry->count());
+            }
+            return;
+        }
+        const CpuId irq_target{
+            (boot.raw + 1) % registry->count()};
+        const CpuId trap_target{
+            (boot.raw + 3) % registry->count()};
+        if (cpu == boot) {
+            diag::console::print<
+                "concurrency-probe: stage-g cpu-live-ok irq={} trap={}\n">(
+                irq_target.raw, trap_target.raw);
+            probe_phase.store<libk::MemoryOrder::Release>(1);
+            return;
+        }
+        while (probe_phase.load<libk::MemoryOrder::Acquire>() == 0) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu == irq_target) {
+            kernel::sync::IrqToken token{};
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() == 1) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+        }
+        if (cpu == trap_target) {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+        }
+        return;
+    }
     if (probe == 8) {
         //Confirmatory experiment.
         // Exit condition: remove when the external service-fault harness can
@@ -4835,6 +4863,31 @@ void run_probe(u32 probe) noexcept {
 }
 #endif
 
+#if MYOS_CONCURRENCY_PROBE == 12
+auto trap_exit_stall_for_probe() noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external fault harness can stop a peer
+    // after trap handling while preserving its live trap-enter publication.
+    if (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+        return false;
+    }
+    void* const owner = arch::current_cpu_owner();
+    if (owner == nullptr) {
+        return false;
+    }
+    const auto& local = *static_cast<const CpuLocal*>(owner);
+    const CpuRegistry* const registry =
+        local.runtime_ == nullptr ? nullptr : local.runtime_->owner_registry;
+    if (registry == nullptr || registry->count() < 4
+        || local.descriptor == nullptr) {
+        return false;
+    }
+    const CpuId trap_target{
+        (registry->boot_id().raw + 3) % registry->count()};
+    return local.descriptor->logical_id() == trap_target;
+}
+#endif
+
 CpuWaitScope::CpuWaitScope(
     WaitKind kind,
     NodeRef subject,
@@ -4848,7 +4901,7 @@ CpuWaitScope::CpuWaitScope(
           expectation,
           site)),
       observation_(&owned_), kind_(kind), subject_(subject), driver_(driver),
-      expectation_(expectation), site_(site) {
+      site_(site) {
     if (*observation_) {
         observation_->attempt(0, kind_, driver_);
         observation_->watch(true);
@@ -4863,10 +4916,9 @@ CpuWaitScope::CpuWaitScope(
     WaitKind kind,
     NodeRef subject,
     NodeRef driver,
-    Expectation expectation,
     SourceSite site) noexcept
     : observation_(&observation), kind_(kind), subject_(subject),
-      driver_(driver), expectation_(expectation), site_(site) {
+      driver_(driver), site_(site) {
     wait_token_ = set_wait(
         kind_, observation ? observation.key() : ObservationKey{},
         subject_, driver_, site_);

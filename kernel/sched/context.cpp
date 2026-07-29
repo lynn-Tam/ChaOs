@@ -213,6 +213,18 @@ auto SchedulingContext::startable() const noexcept -> bool {
     return domain_ != nullptr && binding_ && !withdrawing_;
 }
 
+#if MYOS_CONCURRENCY_PROBE == 10
+void SchedulingContext::exhaust_for_probe(time::Instant now) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove when the external scheduler harness can consume
+    // a real context budget before its first admission to the ready queue.
+    const time::Duration budget = available(now);
+    KASSERT(!budget.empty());
+    static_cast<void>(refills_.charge(now, budget));
+    KASSERT(!eligible(now) && next_refill());
+}
+#endif
+
 void SchedulingContext::invalidate_domain(
     void* context,
     cap::GrantWork&& work,

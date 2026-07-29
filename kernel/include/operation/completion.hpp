@@ -113,12 +113,17 @@ public:
         KASSERT(!attached());
         policy_ = policy;
     }
-    void set_deadline(libk::optional<time::Instant> deadline) noexcept {
+    void set_deadline(
+        libk::optional<time::Instant> deadline,
+        diag::concurrency::NodeRef timeout_driver = {}) noexcept {
         KASSERT(!attached());
         policy_.deadline = deadline ? deadline->ticks() : 0;
         policy_.expectation = deadline
             ? diag::concurrency::Expectation::DeadlineBound
             : diag::concurrency::Expectation::ExternalUnbounded;
+        policy_.deadline_driver = deadline ? timeout_driver
+                                           : diag::concurrency::NodeRef{};
+        KASSERT(!deadline || policy_.deadline_driver);
     }
 
     // Publication is narrower than scheduling. It may request a retained wake

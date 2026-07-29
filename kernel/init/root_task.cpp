@@ -3,6 +3,7 @@
 #include <cap/cspace.hpp>
 #include <cap/rights.hpp>
 #include <arch/uart.hpp>
+#include <arch/time.hpp>
 #include <core/kernel_state.hpp>
 #include <diag/console.hpp>
 #include <cpu/cpu_runtime.hpp>
@@ -709,6 +710,11 @@ auto RootTask::start(
         || !context_->bind(libk::move(target).value())) {
         return fail(RootTaskError::SchedulingFailed);
     }
+#if MYOS_CONCURRENCY_PROBE == 10
+    //Confirmatory experiment.
+    // Exit condition: remove with SchedulingContext::exhaust_for_probe().
+    context_->exhaust_for_probe(kernel.clock().now());
+#endif
     if (!runtime.dispatcher().make_ready(*context_->binding())) {
         return fail(RootTaskError::SchedulingFailed);
     }
@@ -722,9 +728,10 @@ auto RootTask::run_concurrency_probe(
     u32 probe) noexcept -> bool {
     //Confirmatory experiment.
     // Exit condition: remove when the external scenario runner can create a
-    // real blocked syscall operation and pause its producer.
-    if ((probe != 3 && probe != 4) || !started_ || !thread_
-        || completion_probe || completion_probe_wait) {
+    // real operation/scheduler obligation and pause its canonical driver.
+    if ((probe != 3 && probe != 4 && probe != 9 && probe != 10
+            && probe != 11)
+        || !started_ || !thread_) {
         diag::console::print<"concurrency-probe: stage-b setup-fail=1\n">();
         return false;
     }
@@ -733,8 +740,73 @@ auto RootTask::run_concurrency_probe(
         diag::console::print<"concurrency-probe: stage-b setup-fail=2\n">();
         return false;
     }
+    if (probe == 9 || probe == 10) {
+        // The root Binding was made Ready before install_local_entry(), when
+        // no CPU-local diagnostic owner existed.  Re-publish the same
+        // canonical scheduler state now that the real home CPU is installed;
+        // this is the first observable linearization point for the probe.
+        binding->publish_state(thread_->execution().state());
+        diag::concurrency::ObservationLease actor =
+            diag::concurrency::ObservationLease::borrow(
+                binding->actor_key());
+        diag::concurrency::ObservationSnapshot snapshot{};
+        const auto expected = probe == 9 ? ExecutionState::Ready
+                                         : ExecutionState::Throttled;
+        const auto* const shard = cpus.observations(
+            binding->actor_key().shard());
+        const u64 mask = u64{1} << binding->actor_key().slot();
+        const bool watched =
+            shard != nullptr && (shard->watched() & mask) != 0;
+        const bool state_ok = actor && actor.snapshot(snapshot)
+            && thread_->execution().state() == expected
+            && snapshot.phase == static_cast<u32>(expected)
+            && watched;
+        const bool queue_ok = probe == 9
+            ? binding->queued()
+                && snapshot.wait_kind
+                    == diag::concurrency::WaitKind::SchedulerReady
+            : binding->timer_queued()
+                && snapshot.wait_kind
+                    == diag::concurrency::WaitKind::SchedulerRefill
+                && snapshot.policy.deadline != 0
+                && (snapshot.detail[0] & 2U) != 0;
+        const bool ok = state_ok && queue_ok;
+        diag::console::print<
+            "concurrency-probe: stage-g {}-{} key={:#x} deadline={}\n">(
+            probe == 9 ? "ready" : "throttled",
+            ok ? "ok" : "fail",
+            binding->actor_key().raw,
+            snapshot.policy.deadline);
+        return ok;
+    }
+    if (completion_probe || completion_probe_wait) {
+        diag::console::print<"concurrency-probe: stage-b setup-fail=7\n">();
+        return false;
+    }
     CompletionProbe& owner = completion_probe.emplace();
     operation::Wait& wait = completion_probe_wait.emplace();
+    if (probe == 11) {
+        CpuRuntime* const runtime = cpus.runtime(cpus.boot_id());
+        if (runtime == nullptr || runtime->diagnostics == nullptr) {
+            diag::console::print<
+                "concurrency-probe: stage-g deadline-fail runtime=0\n">();
+            return false;
+        }
+        const u64 now = arch::read_clock().ticks();
+        const u64 delay =
+            runtime->diagnostics->concurrency.policy.critical_hard;
+        if (delay == 0) {
+            return false;
+        }
+        const auto deadline = time::Instant::from_ticks(now).checked_add(
+            time::Duration::from_ticks(delay));
+        if (!deadline) {
+            return false;
+        }
+        owner.completion.set_deadline(
+            *deadline,
+            diag::concurrency::NodeRef::cpu(cpus.boot_id()));
+    }
     if (!wait.begin(owner.completion, cpus, *binding)) {
         diag::console::print<"concurrency-probe: stage-b setup-fail=3\n">();
         return false;
@@ -756,23 +828,31 @@ auto RootTask::run_concurrency_probe(
     const bool phase_ok = snapshot.phase == static_cast<u32>(
         claimed ? diag::concurrency::OperationPhase::Claimed
                 : diag::concurrency::OperationPhase::Attached);
+    const bool deadline = probe == 11;
+    const auto attached_expectation = deadline
+        ? diag::concurrency::Expectation::DeadlineBound
+        : diag::concurrency::Expectation::ExternalUnbounded;
     const bool policy_ok = snapshot.policy.kind
             == diag::concurrency::WaitKind::ChannelReceive
-        && snapshot.policy.expectation
-            == diag::concurrency::Expectation::ExternalUnbounded
+        && snapshot.policy.expectation == attached_expectation
         && snapshot.expectation
             == (claimed
                 ? diag::concurrency::Expectation::InternalFinite
-                : diag::concurrency::Expectation::ExternalUnbounded)
+                : attached_expectation)
         && snapshot.wait_kind
             == (claimed
                 ? diag::concurrency::WaitKind::CompletionPublication
-                : diag::concurrency::WaitKind::ChannelReceive);
+                : diag::concurrency::WaitKind::ChannelReceive)
+        && (!deadline
+            || (snapshot.policy.deadline > arch::read_clock().ticks()
+                && snapshot.policy.deadline_driver
+                    == diag::concurrency::NodeRef::cpu(cpus.boot_id())
+                && snapshot.driver == snapshot.policy.deadline_driver));
     const auto* const shard = cpus.observations(
         owner.completion.observation_key().shard());
     const u64 mask = u64{1} << owner.completion.observation_key().slot();
     const bool watched = shard != nullptr && (shard->watched() & mask) != 0;
-    if (!phase_ok || !policy_ok || watched != claimed) {
+    if (!phase_ok || !policy_ok || watched != (claimed || deadline)) {
         diag::console::print<
             "concurrency-probe: stage-b setup-fail=6 phase={} policy={} watched={}\n">(
             phase_ok, policy_ok, watched);
@@ -781,9 +861,19 @@ auto RootTask::run_concurrency_probe(
     // The probe permanently owns this binding's synthetic Wait edge and stops
     // before first dispatch. Exclude that deliberately frozen Ready actor so
     // the observation window measures only the operation policy under test.
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4
+#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
+    || MYOS_CONCURRENCY_PROBE == 11
     binding->suppress_actor_for_probe();
 #endif
+    if (deadline) {
+        diag::console::print<
+            "concurrency-probe: stage-g deadline-ok key={:#x} "
+            "deadline={} driver={}\n">(
+            owner.completion.observation_key().raw,
+            snapshot.policy.deadline,
+            snapshot.policy.deadline_driver.identity);
+        return true;
+    }
     diag::console::print<
         "concurrency-probe: stage-b {}-ok key={:#x}\n">(
         claimed ? "claimed" : "external",

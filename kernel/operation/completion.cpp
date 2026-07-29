@@ -49,6 +49,10 @@ void Completion::attach(Wait& wait, sched::Binding& binding) noexcept {
         ? policy_.driver
         : diag::concurrency::NodeRef::external(
               reinterpret_cast<u64>(owner_), 1);
+    const auto attached_driver =
+        policy_.expectation == diag::concurrency::Expectation::DeadlineBound
+            ? policy_.deadline_driver : driver;
+    KASSERT(attached_driver);
     if (policy_.grace == 0) {
         policy_.grace =
             diag::concurrency::default_grace(policy_.expectation);
@@ -60,7 +64,7 @@ void Completion::attach(Wait& wait, sched::Binding& binding) noexcept {
         policy_.expectation);
     observation_.set_policy(policy_);
     observation_.publish(
-        diag::concurrency::OperationPhase::Attached, driver);
+        diag::concurrency::OperationPhase::Attached, attached_driver);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -75,6 +79,10 @@ void Completion::attach(
         ? policy_.driver
         : diag::concurrency::NodeRef::external(
               reinterpret_cast<u64>(owner_), key.generation());
+    const auto attached_driver =
+        policy_.expectation == diag::concurrency::Expectation::DeadlineBound
+            ? policy_.deadline_driver : driver;
+    KASSERT(attached_driver);
     if (policy_.grace == 0) {
         policy_.grace =
             diag::concurrency::default_grace(policy_.expectation);
@@ -86,7 +94,7 @@ void Completion::attach(
         policy_.expectation);
     observation_.set_policy(policy_);
     observation_.publish(
-        diag::concurrency::OperationPhase::Attached, driver);
+        diag::concurrency::OperationPhase::Attached, attached_driver);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -188,8 +196,7 @@ void Completion::finish(arch::TrapContext& trap) noexcept {
         observation_,
         diag::concurrency::WaitKind::CompletionPublication,
         diag::concurrency::NodeRef::observation(observation_.key()),
-        current_cpu_node(),
-        diag::concurrency::Expectation::InternalFinite};
+        current_cpu_node()};
     Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
     while (expected == Delivery::Claimed) {
         libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
