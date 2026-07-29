@@ -133,12 +133,17 @@ private:
             | (activation_credit_ ? 8U : 0U);
         actor_.detail(0, projection);
         actor_.detail(1, static_cast<u64>(execution().state()));
-        const u64 remote = (start_.pending() ? 1U : 0U)
-            | (wake_.pending() ? 2U : 0U)
-            | (stop_.pending() ? 4U : 0U);
-        actor_.detail(2, remote);
-        actor_.detail(3, home_cpu_.raw);
         publish_actor();
+    }
+
+    void publish_accept(
+        diag::concurrency::ObservationKey operation,
+        diag::concurrency::ObservationKey delivery) noexcept {
+        ensure_actor(diag::concurrency::SourceSite::current());
+        // Exact home-CPU acceptance witness. Generic wakes publish zero.
+        // Subsequent state projections deliberately preserve these slots.
+        actor_.detail(2, operation.raw);
+        actor_.detail(3, delivery.raw);
     }
 
     void publish_actor() noexcept {

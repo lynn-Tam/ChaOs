@@ -1,5 +1,6 @@
 #pragma once
 
+#include <diag/concurrency.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
@@ -40,7 +41,8 @@ public:
 private:
     friend class Completion;
 
-    void wake() noexcept;
+    [[nodiscard]] auto wake() noexcept
+        -> diag::concurrency::ObservationKey;
 
     Completion* completion_{};
     CpuRegistry* cpus_{};

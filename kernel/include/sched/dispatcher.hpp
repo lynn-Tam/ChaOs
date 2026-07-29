@@ -26,6 +26,7 @@ public:
     enum class WakeError : u8 {
         WrongCpu,
         Unavailable,
+        CauseConflict,
     };
     enum class WakeAcceptance : u8 {
         Rejected,
@@ -61,9 +62,16 @@ public:
     void on_context_enter() noexcept;
 
     [[nodiscard]] auto make_ready(Binding& binding) noexcept -> bool;
-    [[nodiscard]] auto accept_wake(Binding& binding) noexcept
+    [[nodiscard]] auto accept_wake(
+        Binding& binding,
+        diag::concurrency::ObservationKey cause = {},
+        diag::concurrency::ObservationKey delivery = {}) noexcept
         -> WakeAcceptance;
-    [[nodiscard]] auto post_wake(Binding& binding) noexcept -> WakeResult;
+    [[nodiscard]] auto post_wake(
+        Binding& binding,
+        diag::concurrency::ObservationKey cause = {},
+        diag::concurrency::ObservationKey* delivery = nullptr) noexcept
+        -> WakeResult;
     [[nodiscard]] auto post_start(Binding& binding) noexcept -> WakeResult;
     [[nodiscard]] auto accept_activation(Vproc& vproc) noexcept -> bool;
     [[nodiscard]] auto post_activation(Vproc& vproc) noexcept -> WakeResult;
@@ -117,7 +125,10 @@ private:
         execution::Target incoming,
         DispatchReason reason,
         time::Instant now) noexcept;
-    [[nodiscard]] auto post_remote(RemoteRequest& request) noexcept
+    [[nodiscard]] auto post_remote(
+        RemoteRequest& request,
+        diag::concurrency::ObservationKey cause = {},
+        diag::concurrency::ObservationKey* delivery = nullptr) noexcept
         -> WakeResult;
     [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
     void request_stop(execution::Target target) noexcept;
@@ -136,7 +147,7 @@ private:
     BuiltinPolicy policy_{};
     TimerQueue timers_{};
     DeadlineQueue deadlines_{};
-    RemoteQueue remote_{};
+    RemoteQueue remote_;
     bool timer_available_{};
     bool ipi_available_{};
     time::Duration pending_charge_{};
@@ -151,7 +162,10 @@ void yield() noexcept;
 void block() noexcept;
 [[nodiscard]] auto wake(
     CpuRegistry& cpus,
-    Binding& binding) noexcept -> CpuDispatcher::WakeResult;
+    Binding& binding,
+    diag::concurrency::ObservationKey cause = {},
+    diag::concurrency::ObservationKey* delivery = nullptr) noexcept
+    -> CpuDispatcher::WakeResult;
 [[nodiscard]] auto start(
     CpuRegistry& cpus,
     Binding& binding) noexcept -> CpuDispatcher::WakeResult;

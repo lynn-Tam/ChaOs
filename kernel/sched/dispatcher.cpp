@@ -26,7 +26,7 @@ CpuDispatcher::CpuDispatcher(
     CpuId id,
     Thread& idle,
     time::Clock& clock) noexcept
-    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock)
+    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock), remote_(id)
 #if MYOS_CONCURRENCY_DIAG >= 3
       , watchdog_deadline_(
             Deadline::Callback::bind<&CpuDispatcher::watchdog_fire>(*this))
@@ -194,7 +194,10 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
     return true;
 }
 
-auto CpuDispatcher::accept_wake(Binding& binding) noexcept
+auto CpuDispatcher::accept_wake(
+    Binding& binding,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey delivery) noexcept
     -> WakeAcceptance {
     KASSERT(!arch::interrupts_enabled());
     if (binding.home_cpu() != id_) {
@@ -205,6 +208,8 @@ auto CpuDispatcher::accept_wake(Binding& binding) noexcept
         if (!make_ready(binding)) {
             return WakeAcceptance::Rejected;
         }
+        binding.publish_accept(cause, delivery);
+        binding.publish_projection();
         return execution.state_ == ExecutionState::Ready
             ? WakeAcceptance::Readied
             : WakeAcceptance::Accepted;
@@ -213,21 +218,26 @@ auto CpuDispatcher::accept_wake(Binding& binding) noexcept
         || execution.state_ == ExecutionState::Ready
         || execution.state_ == ExecutionState::Prepared) {
         binding.wake_credit_ = true;
+        binding.publish_accept(cause, delivery);
         binding.publish_projection();
         return WakeAcceptance::Accepted;
     }
     if (execution.state_ == ExecutionState::Throttled) {
+        binding.publish_accept(cause, delivery);
         binding.publish_projection();
         return WakeAcceptance::Accepted;
     }
     return WakeAcceptance::Rejected;
 }
 
-auto CpuDispatcher::post_wake(Binding& binding) noexcept -> WakeResult {
+auto CpuDispatcher::post_wake(
+    Binding& binding,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
     if (binding.home_cpu() != id_) {
         return libk::unexpected(WakeError::WrongCpu);
     }
-    return post_remote(binding.wake_);
+    return post_remote(binding.wake_, cause, delivery);
 }
 
 auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
@@ -342,11 +352,20 @@ auto CpuDispatcher::request_activation(
     }
 }
 
-auto CpuDispatcher::post_remote(RemoteRequest& request) noexcept -> WakeResult {
+auto CpuDispatcher::post_remote(
+    RemoteRequest& request,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
     if (!ipi_available_) {
         return libk::unexpected(WakeError::Unavailable);
     }
-    remote_.post(request);
+    const RemotePostResult posted = remote_.post(request, cause);
+    if (delivery != nullptr) {
+        *delivery = posted.delivery;
+    }
+    if (posted.disposition == RemotePost::CauseConflict) {
+        return libk::unexpected(WakeError::CauseConflict);
+    }
     return kick_remote();
 }
 
@@ -424,7 +443,7 @@ void CpuDispatcher::request_stop(execution::Target target) noexcept {
         owned = vproc->execution_.home_ == this;
         if (binding != nullptr) {
             KASSERT(owned && binding->target() == target);
-            remote_.post(binding->stop_);
+            static_cast<void>(remote_.post(binding->stop_));
             queued = true;
         } else if (vproc->stopped_) {
             KASSERT(vproc->execution_.home_ == nullptr
@@ -441,7 +460,7 @@ void CpuDispatcher::request_stop(execution::Target target) noexcept {
         owned = thread->execution_.home_ == this;
         if (binding != nullptr) {
             KASSERT(owned && binding->target() == target);
-            remote_.post(binding->stop_);
+            static_cast<void>(remote_.post(binding->stop_));
             queued = true;
         } else if (thread->stopped_) {
             KASSERT(thread->execution_.home_ == nullptr
@@ -468,17 +487,24 @@ void CpuDispatcher::drain_remote() noexcept {
         switch (request->kind()) {
         case RemoteKind::Start: {
             auto& binding = *static_cast<Binding*>(request->owner());
-            made_ready = make_ready(binding) || made_ready;
+            const bool accepted = make_ready(binding);
+            remote_.accepted(*request, accepted);
+            made_ready = accepted || made_ready;
             break;
         }
         case RemoteKind::Wake: {
             auto& binding = *static_cast<Binding*>(request->owner());
-            made_ready = accept_wake(binding) == WakeAcceptance::Readied
-                || made_ready;
+            const WakeAcceptance acceptance =
+                accept_wake(
+                    binding, request->cause(), request->delivery());
+            remote_.accepted(
+                *request, acceptance != WakeAcceptance::Rejected);
+            made_ready = acceptance == WakeAcceptance::Readied || made_ready;
             break;
         }
         case RemoteKind::Activation: {
             auto& vproc = *static_cast<Vproc*>(request->owner());
+            remote_.accepted(*request, true);
             remote_.complete(*request);
             do {
                 static_cast<void>(accept_activation(vproc));
@@ -489,6 +515,7 @@ void CpuDispatcher::drain_remote() noexcept {
             const execution::Target target =
                 static_cast<Binding*>(request->owner())->target();
             const StopDisposition disposition = stop(target);
+            remote_.accepted(*request, true);
             // stop() may make the Binding terminal, but the consumed request
             // still owns its embedded storage until complete().  Release the
             // queue protocol before final relation teardown destroys Binding.
@@ -1040,7 +1067,11 @@ void block() noexcept {
     arch::restore_interrupts(interrupts);
 }
 
-auto wake(CpuRegistry& cpus, Binding& binding) noexcept
+auto wake(
+    CpuRegistry& cpus,
+    Binding& binding,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept
     -> CpuDispatcher::WakeResult {
     CpuRuntime* const target = cpus.runtime(binding.home_cpu());
     if (target == nullptr
@@ -1051,13 +1082,16 @@ auto wake(CpuRegistry& cpus, Binding& binding) noexcept
     if (arch::current_cpu_owner() == &target->local) {
         kernel::sync::IrqToken irq{};
         const CpuDispatcher::WakeAcceptance accepted =
-            target->dispatcher().accept_wake(binding);
+            target->dispatcher().accept_wake(binding, cause);
+        if (delivery != nullptr) {
+            *delivery = {};
+        }
         if (accepted != CpuDispatcher::WakeAcceptance::Rejected) {
             return libk::expected();
         }
         return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
     }
-    return target->dispatcher().post_wake(binding);
+    return target->dispatcher().post_wake(binding, cause, delivery);
 }
 
 auto start(CpuRegistry& cpus, Binding& binding) noexcept

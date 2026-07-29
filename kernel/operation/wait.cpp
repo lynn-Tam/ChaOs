@@ -89,18 +89,26 @@ auto Wait::cancel() noexcept -> bool {
     return true;
 }
 
-void Wait::wake() noexcept {
+auto Wait::wake() noexcept -> diag::concurrency::ObservationKey {
     ready_.store<libk::MemoryOrder::Release>(true);
     CpuRegistry* cpus{};
     sched::Binding* binding{};
+    Completion* completion{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         KASSERT(completion_ != nullptr && cpus_ != nullptr);
+        completion = completion_;
         cpus = cpus_;
         binding = binding_;
         KASSERT(binding != nullptr);
     }
-    KASSERT(binding != nullptr && sched::wake(*cpus, *binding));
+    diag::concurrency::ObservationKey delivery{};
+    KASSERT(binding != nullptr && sched::wake(
+        *cpus,
+        *binding,
+        completion->observation_key(),
+        &delivery));
+    return delivery;
 }
 
 } // namespace kernel::operation

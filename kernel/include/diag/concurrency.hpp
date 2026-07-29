@@ -221,6 +221,20 @@ enum class OperationPhase : u32 {
     Cancelled = 6,
 };
 
+// Projection of one canonical sched::RemoteRequest generation. The request
+// owns the lease across both its linked and consumer-owned pending intervals;
+// RemoteQueue owns only the queue and shared IPI transport state.
+enum class RemotePhase : u32 {
+    Posted = 1,
+    NeedsKick = 2,
+    InFlight = 3,
+    Retry = 4,
+    Taken = 5,
+    Accepted = 6,
+    Completed = 7,
+    Cancelled = 8,
+};
+
 enum class DriverKind : u8 {
     None,
     Actor,

@@ -113,9 +113,12 @@ void Completion::signal() noexcept {
     KASSERT(complete());
     if (auto* const blocking = libk::get_if<BlockingSink>(&sink_)) {
         KASSERT(blocking->wait != nullptr);
-        blocking->wait->wake();
+        const auto delivery = blocking->wait->wake();
         observation_.publish(
-            diag::concurrency::OperationPhase::WakeIssued, cpu);
+            diag::concurrency::OperationPhase::WakeIssued,
+            delivery
+                ? diag::concurrency::NodeRef::observation(delivery)
+                : cpu);
         // Delivery is the canonical Completion state.  Only after this
         // release may the diagnostic projection claim that readiness was
         // published.
@@ -124,7 +127,11 @@ void Completion::signal() noexcept {
             ? blocking->binding->actor_ref()
             : diag::concurrency::NodeRef{};
         observation_.publish(
-            diag::concurrency::OperationPhase::ReadyPublished, driver);
+            diag::concurrency::OperationPhase::ReadyPublished,
+            driver,
+            delivery
+                ? diag::concurrency::NodeRef::observation(delivery)
+                : diag::concurrency::NodeRef{});
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Operation,
             diag::concurrency::FlightEvent::OperationReady,

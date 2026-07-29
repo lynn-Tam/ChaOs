@@ -722,7 +722,7 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
 # The trace profile currently has a baseline 1984-byte validate_graph frame
 # against the production 1792-byte audit bound. Runtime evidence remains
@@ -735,7 +735,8 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4,$(CONCURRENCY_PROBE)),$(BOOT
 		4) evidence="concurrency-probe: stage-b claimed-ok";; \
 		5) evidence="concurrency-probe: stage-c analyzer-ok";; \
 		6) evidence="concurrency-probe: stage-c watchdog-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1, 2, 3, 4, 5 or 6"; exit 1;; \
+		7) evidence="concurrency-probe: stage-d delivery-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..7"; exit 1;; \
 	esac; \
 	initrd=""; \
 	if [ "$(CONCURRENCY_PROBE)" = 3 ] \

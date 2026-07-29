@@ -1087,10 +1087,10 @@ bool test_remote_queue_coalesces_without_losing_membership(
     usize owner{};
     kernel::sched::RemoteRequest request{
         kernel::sched::RemoteKind::Wake, &owner};
-    kernel::sched::RemoteQueue queue{};
-    queue.post(request);
+    kernel::sched::RemoteQueue queue{kernel::CpuId{0}};
+    const auto first_post = queue.post(request);
     const auto first_signal = queue.claim_transport();
-    queue.post(request);
+    const auto coalesced = queue.post(request);
     const auto duplicate_signal = queue.claim_transport();
     if (!first_signal) {
         return false;
@@ -1106,21 +1106,27 @@ bool test_remote_queue_coalesces_without_losing_membership(
     const auto stale_retry = queue.claim_transport();
     kernel::sched::RemoteRequest* const taken = queue.take();
     const auto claimed_cancel = queue.cancel(request);
-    queue.post(request);
+    const auto second_post = queue.post(request);
     const auto during_signal = queue.claim_transport();
     queue.complete(request);
     const bool drained = queue.take() == nullptr;
-    queue.post(request);
+    const auto third_post = queue.post(request);
     const auto after_drain_signal = queue.claim_transport();
     kernel::sched::RemoteRequest* const final = queue.take();
     queue.complete(request);
     const bool final_drained = queue.take() == nullptr;
-    queue.post(request);
+    const auto fourth_post = queue.post(request);
     const auto queued_cancel = queue.cancel(request);
     const auto canceled_again = queue.cancel(request);
     const bool canceled_drained = queue.size() == 0;
 
-    const bool protocol = first_signal && !duplicate_signal
+    const bool protocol =
+        first_post.disposition == kernel::sched::RemotePost::Inserted
+        && coalesced.disposition == kernel::sched::RemotePost::Coalesced
+        && second_post.disposition == kernel::sched::RemotePost::Coalesced
+        && third_post.disposition == kernel::sched::RemotePost::Inserted
+        && fourth_post.disposition == kernel::sched::RemotePost::Inserted
+        && first_signal && !duplicate_signal
         && retry_signal
         && retry_signal->generation != first_signal->generation
         && !stale_retry

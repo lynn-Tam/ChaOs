@@ -8,7 +8,9 @@
 #include <diag/console.hpp>
 #include <diag/panic.hpp>
 #include <execution/execution.hpp>
+#include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
+#include <sched/remote_queue.hpp>
 
 #ifndef MYOS_BUILTIN_TESTS
 #define MYOS_BUILTIN_TESTS 0
@@ -93,6 +95,9 @@ libk::Atomic<u32> probe_phase{};
 libk::Atomic<u32> probe_errors{};
 libk::Atomic<u64> probe_key{};
 ObservationKey probe_fillers[ObservationShard::slot_count / 2]{};
+constinit libk::ManualLifetime<sched::RemoteQueue> probe_remote_queue{};
+constinit libk::ManualLifetime<sched::RemoteRequest> probe_remote_request{};
+alignas(8) usize probe_remote_owner{};
 #endif
 
 [[nodiscard]] auto now() noexcept -> u64 {
@@ -3604,6 +3609,8 @@ auto analyze(
         scratch.evidence = EvidenceGrade::Inconclusive;
         return false;
     }
+    ObservationSnapshot root_observation{};
+    bool ready_publication{};
     bool degraded_graph{};
     for (usize cursor = 0; cursor < scratch.count; ++cursor) {
         const NodeRef current = scratch.node(cursor);
@@ -3638,17 +3645,72 @@ auto analyze(
         scratch.fingerprints[cursor] = fingerprint;
         NodeRef next{};
         if (current.kind == NodeRef::Kind::Observation) {
-            next = snapshot.waiter_key
-                ? NodeRef::observation(snapshot.waiter_key)
-                : snapshot.driver;
-            if (!next && snapshot.blocker.kind != NodeRef::Kind::None) {
-                next = snapshot.blocker;
+            if (cursor == 0) {
+                root_observation = snapshot;
+                ready_publication =
+                    snapshot.record_kind == RecordKind::Operation
+                    && snapshot.phase == static_cast<u32>(
+                        OperationPhase::ReadyPublished);
             }
-            if (!next && scratch.classification == StallClass::None) {
-                scratch.classification = terminal_class(snapshot, false);
-            } else if (next.kind == NodeRef::Kind::External
-                && scratch.classification == StallClass::None) {
-                scratch.classification = terminal_class(snapshot, false);
+            if (ready_publication && cursor != 0
+                && snapshot.record_kind == RecordKind::ExecutionActor
+                && snapshot.phase == execution_blocked_phase
+                && snapshot.waiter_key
+                    == ObservationKey{root.identity}) {
+                const bool queued = (snapshot.detail[0] & 1U) != 0;
+                const bool wake_credit = (snapshot.detail[0] & 4U) != 0;
+                const bool accepted =
+                    snapshot.detail[2] == root.identity
+                    && (root_observation.blocker.kind
+                            != NodeRef::Kind::Observation
+                        || snapshot.detail[3]
+                            == root_observation.blocker.identity);
+                bool delivery_pending{};
+                if (root_observation.blocker.kind
+                    == NodeRef::Kind::Observation) {
+                    ObservationSnapshot delivery{};
+                    auto lease = ObservationLease::borrow(
+                        ObservationKey{
+                            root_observation.blocker.identity});
+                    delivery_pending = lease
+                        && lease.snapshot(delivery)
+                        && delivery.record_kind
+                            == RecordKind::RemoteDelivery
+                        && delivery.generation
+                            == root_observation.blocker.generation
+                        && delivery.detail[0] == root.identity;
+                }
+                if (delivery_pending) {
+                    scratch.classification =
+                        StallClass::TransportStall;
+                    next = root_observation.blocker;
+                } else if (queued || wake_credit || accepted) {
+                    scratch.classification =
+                        StallClass::RunnableStarvation;
+                } else {
+                    scratch.classification = StallClass::LostWake;
+                }
+                if (!delivery_pending) {
+                    next = {};
+                }
+            } else {
+                next = snapshot.waiter_key
+                    ? NodeRef::observation(snapshot.waiter_key)
+                    : snapshot.driver;
+                if (!next
+                    && snapshot.blocker.kind != NodeRef::Kind::None) {
+                    next = snapshot.blocker;
+                }
+                if (!next
+                    && scratch.classification == StallClass::None) {
+                    scratch.classification =
+                        terminal_class(snapshot, false);
+                } else if (
+                    next.kind == NodeRef::Kind::External
+                    && scratch.classification == StallClass::None) {
+                    scratch.classification =
+                        terminal_class(snapshot, false);
+                }
             }
         } else if (current.kind == NodeRef::Kind::Cpu) {
             if (cpu.has_wait) {
@@ -3788,7 +3850,7 @@ void run_probe(u32 probe) noexcept {
     //Confirmatory experiment.
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
-    if (probe != 1 && probe != 5 && probe != 6) {
+    if (probe != 1 && probe != 5 && probe != 6 && probe != 7) {
         return;
     }
 
@@ -3806,6 +3868,219 @@ void run_probe(u32 probe) noexcept {
 
     const CpuId cpu = local.descriptor->logical_id();
     const CpuId boot = registry->boot_id();
+    if (probe == 7) {
+        //Confirmatory experiment.
+        // Exit condition: remove when the external kernel fault harness can
+        // stop the real remote scheduler path at every transport phase and
+        // inspect exact operation/request generations.
+        static_cast<void>(
+            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        while (probe_joined.load<libk::MemoryOrder::Acquire>()
+            != registry->count()) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (cpu != boot) {
+            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            return;
+        }
+
+        ObservationShard* const shard = registry->observations(boot);
+        bool ok = shard != nullptr;
+        u32 errors = ok ? 0 : 1U;
+        ObservationLease operation{};
+        ObservationLease other{};
+        ObservationLease actor{};
+        if (ok) {
+            operation = shard->reserve(
+                RecordKind::Operation,
+                0xd701,
+                7,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            other = shard->reserve(
+                RecordKind::Operation,
+                0xd702,
+                8,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            actor = shard->reserve(
+                RecordKind::ExecutionActor,
+                0xd703,
+                1,
+                Expectation::SchedulerControlled,
+                SourceSite::current());
+            ok = operation && other && actor;
+            if (!ok) {
+                errors |= 1U << 1;
+            }
+        }
+
+        auto& queue = probe_remote_queue.emplace(boot);
+        auto& request = probe_remote_request.emplace(
+            sched::RemoteKind::Wake, &probe_remote_owner);
+        sched::RemotePostResult posted{};
+        kernel::IpiDelivery::Token first{};
+        if (ok) {
+            posted = queue.post(request, operation.key());
+            ObservationSnapshot delivery{};
+            auto delivery_lease =
+                ObservationLease::borrow(posted.delivery);
+            const bool posted_ok =
+                posted.disposition == sched::RemotePost::Inserted
+                && request.pending()
+                && request.cause() == operation.key()
+                && delivery_lease.snapshot(delivery)
+                && delivery.record_kind == RecordKind::RemoteDelivery
+                && delivery.phase
+                    == static_cast<u32>(RemotePhase::NeedsKick)
+                && delivery.detail[0] == operation.key().raw
+                && delivery.detail[1]
+                    == reinterpret_cast<u64>(&probe_remote_owner)
+                && delivery.detail[2] == boot.raw;
+            if (!posted_ok) {
+                errors |= 1U << 2;
+            }
+            ok = ok && posted_ok;
+
+            const auto same = queue.post(request, operation.key());
+            const auto conflict = queue.post(request, other.key());
+            const bool coalesce_ok =
+                same.disposition == sched::RemotePost::Coalesced
+                && same.delivery == posted.delivery
+                && conflict.disposition
+                    == sched::RemotePost::CauseConflict;
+            if (!coalesce_ok) {
+                errors |= 1U << 3;
+            }
+            ok = ok && coalesce_ok;
+
+            const auto claimed = queue.claim_transport();
+            if (claimed) {
+                first = *claimed;
+            }
+            delivery = {};
+            const bool flight_ok = claimed
+                && delivery_lease.snapshot(delivery)
+                && delivery.phase == static_cast<u32>(
+                    RemotePhase::InFlight)
+                && delivery.detail[3] == claimed->generation;
+            if (!flight_ok) {
+                errors |= 1U << 4;
+            }
+            ok = ok && flight_ok;
+
+            queue.transport_failed(first);
+            delivery = {};
+            const bool retry_ok = delivery_lease.snapshot(delivery)
+                && delivery.phase == static_cast<u32>(
+                    RemotePhase::Retry);
+            const auto retry = queue.claim_transport();
+            if (!retry_ok || !retry
+                || retry->generation == first.generation) {
+                errors |= 1U << 5;
+                ok = false;
+            }
+
+            sched::RemoteRequest* const taken = queue.take();
+            delivery = {};
+            const bool taken_ok = taken == &request
+                && delivery_lease.snapshot(delivery)
+                && delivery.phase == static_cast<u32>(
+                    RemotePhase::Taken);
+            if (!taken_ok) {
+                errors |= 1U << 6;
+            }
+            ok = ok && taken_ok;
+            queue.accepted(request, true);
+            delivery = {};
+            const bool accepted_ok = delivery_lease.snapshot(delivery)
+                && delivery.phase == static_cast<u32>(
+                    RemotePhase::Accepted);
+            if (!accepted_ok) {
+                errors |= 1U << 7;
+            }
+            ok = ok && accepted_ok;
+        }
+
+        if (request.pending()) {
+            queue.complete(request);
+        }
+        if (posted.delivery
+            && ObservationLease::borrow(posted.delivery)) {
+            errors |= 1U << 8;
+            ok = false;
+        }
+
+        if (operation && actor) {
+            actor.transition(
+                execution_blocked_phase,
+                execution_blocked_phase,
+                WaitKind::OperationCompletion,
+                NodeRef::observation(operation.key()));
+            actor.link_wait(
+                operation.key(),
+                WaitKind::OperationCompletion,
+                NodeRef::observation(operation.key()));
+            operation.publish(
+                OperationPhase::ReadyPublished,
+                NodeRef::observation(actor.key()));
+            WaitGraphScratch graph{};
+            const bool lost = analyze(operation.key(), graph)
+                && graph.evidence == EvidenceGrade::Confirmed
+                && graph.classification == StallClass::LostWake;
+            if (!lost) {
+                errors |= 1U << 9;
+            }
+            ok = ok && lost;
+
+            actor.detail(2, operation.key().raw);
+            graph = {};
+            const bool accepted = analyze(operation.key(), graph)
+                && graph.classification
+                    == StallClass::RunnableStarvation;
+            if (!accepted) {
+                errors |= 1U << 10;
+            }
+            ok = ok && accepted;
+
+            actor.detail(2, 0);
+            const auto transport = queue.post(
+                request, operation.key());
+            operation.publish(
+                OperationPhase::ReadyPublished,
+                NodeRef::observation(actor.key()),
+                NodeRef::observation(transport.delivery));
+            graph = {};
+            const bool pending = analyze(operation.key(), graph)
+                && graph.classification == StallClass::TransportStall;
+            if (!pending) {
+                errors |= 1U << 11;
+            }
+            ok = ok && pending;
+            static_cast<void>(queue.cancel(request));
+        }
+
+        if (operation) {
+            operation.finish(
+                static_cast<u32>(OperationPhase::Finished));
+        }
+        if (other) {
+            other.finish(
+                static_cast<u32>(OperationPhase::Finished));
+        }
+        if (actor) {
+            actor.finish(1);
+        }
+        probe_remote_request.reset();
+        probe_remote_queue.reset();
+        diag::console::print<
+            "concurrency-probe: stage-d delivery-{} errors=0x{:x}\n">(
+            ok ? "ok" : "fail", errors);
+        probe_phase.store<libk::MemoryOrder::Release>(2);
+        return;
+    }
     if (probe == 6) {
         //Confirmatory experiment.
         // Exit condition: remove when an external scenario runner can drive
