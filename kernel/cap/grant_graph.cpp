@@ -402,13 +402,19 @@ void GrantRevoke::initialize(usize pending) noexcept {
         reinterpret_cast<u64>(this),
         pending == 0 ? 1 : pending,
         diag::concurrency::Expectation::InternalFinite);
-    observation.transition(
-        grant_published,
-        pending,
-        diag::concurrency::WaitKind::GrantWork,
-        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)));
-    observation.detail(0, pending);
-    observation.watch(pending != 0);
+    diag::concurrency::ObservationBatch update{
+        .phase = grant_published,
+        .semantic_stamp = pending,
+        .wait = diag::concurrency::WaitKind::GrantWork,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(this)),
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 1U,
+        .update_progress = true,
+        .update_watched = true,
+        .watched = pending != 0};
+    update.detail[0] = pending;
+    observation.publish(update);
     if (pending != 0) {
         observation_key_.store<libk::MemoryOrder::Release>(
             observation.detach_key().raw);
@@ -454,28 +460,27 @@ void GrantRevoke::progress(
     u32 phase,
     u64 semantic_stamp,
     diag::concurrency::NodeRef driver,
-    diag::concurrency::NodeRef blocker) noexcept {
-    const auto key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(key);
-    observation.transition(
-        phase,
-        semantic_stamp,
-        diag::concurrency::WaitKind::GrantOperations,
-        driver,
-        blocker);
-}
-
-void GrantRevoke::witness(
+    diag::concurrency::NodeRef blocker,
     usize operations,
     usize attachments,
     bool retained,
     u64 slot) noexcept {
     const auto key = observation_key();
     auto observation = diag::concurrency::ObservationLease::borrow(key);
-    observation.detail(0, operations);
-    observation.detail(1, attachments);
-    observation.detail(2, retained ? 1 : 0);
-    observation.detail(3, slot);
+    diag::concurrency::ObservationBatch update{
+        .phase = phase,
+        .semantic_stamp = semantic_stamp,
+        .wait = diag::concurrency::WaitKind::GrantOperations,
+        .driver = driver,
+        .blocker = blocker,
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 0xfU,
+        .update_progress = true};
+    update.detail[0] = operations;
+    update.detail[1] = attachments;
+    update.detail[2] = retained ? 1 : 0;
+    update.detail[3] = slot;
+    observation.publish(update);
 }
 
 GrantGraph::~GrantGraph() noexcept {
@@ -1187,16 +1192,16 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
 
     target_ref.reset();
     if (operation != nullptr) {
-        operation->witness(
-            operation_count(slot.operations.load<libk::MemoryOrder::Acquire>()),
-            attachment_count,
-            work_retained,
-            reinterpret_cast<u64>(&slot));
         operation->progress(
             grant_servicing,
             progress_stamp,
             progress_driver,
-            progress_blocker);
+            progress_blocker,
+            operation_count(slot.operations.load<
+                libk::MemoryOrder::Acquire>()),
+            attachment_count,
+            work_retained,
+            reinterpret_cast<u64>(&slot));
     }
     if (completed != nullptr) {
         completed->acknowledge();

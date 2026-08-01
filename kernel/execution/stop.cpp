@@ -31,12 +31,17 @@ void Stop::start(Thread& thread) noexcept {
         reinterpret_cast<u64>(this),
         1,
         diag::concurrency::Expectation::InternalFinite);
-    observation.transition(
-        stop_started,
-        stop_started,
-        diag::concurrency::WaitKind::SchedulerActivation,
-        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(&thread)));
-    observation.watch(true);
+    diag::concurrency::ObservationBatch update{
+        .phase = stop_started,
+        .semantic_stamp = stop_started,
+        .wait = diag::concurrency::WaitKind::SchedulerActivation,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&thread)),
+        .site = diag::concurrency::SourceSite::current(),
+        .update_progress = true,
+        .update_watched = true,
+        .watched = true};
+    observation.publish(update);
     observation_ = observation.detach_key();
     thread.request_stop(*this);
 }
@@ -66,12 +71,17 @@ void Stop::start(Vproc& vproc) noexcept {
         reinterpret_cast<u64>(this),
         1,
         diag::concurrency::Expectation::InternalFinite);
-    observation.transition(
-        stop_started,
-        stop_started,
-        diag::concurrency::WaitKind::SchedulerActivation,
-        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(&vproc)));
-    observation.watch(true);
+    diag::concurrency::ObservationBatch update{
+        .phase = stop_started,
+        .semantic_stamp = stop_started,
+        .wait = diag::concurrency::WaitKind::SchedulerActivation,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(&vproc)),
+        .site = diag::concurrency::SourceSite::current(),
+        .update_progress = true,
+        .update_watched = true,
+        .watched = true};
+    observation.publish(update);
     observation_ = observation.detach_key();
     vproc.request_stop(*this);
 }

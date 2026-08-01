@@ -13,6 +13,12 @@
 #include <sched/remote_queue.hpp>
 #include <sync/irq_lock_guard.hpp>
 
+#if MYOS_CONCURRENCY_PROBE == 14
+#include <core/kernel_state.hpp>
+#include <mm/translation.hpp>
+#include <resource/pool.hpp>
+#endif
+
 #ifndef MYOS_BUILTIN_TESTS
 #define MYOS_BUILTIN_TESTS 0
 #endif
@@ -102,6 +108,26 @@ constinit libk::ManualLifetime<sched::RemoteRequest> probe_remote_request{};
 [[maybe_unused]] alignas(8) usize probe_remote_owner{};
 #endif
 
+#if MYOS_CONCURRENCY_PROBE == 14
+//Confirmatory experiment.
+// Exit condition: remove when an external shootdown harness can pause the
+// acknowledgement callback at the same writer boundary.
+libk::Atomic<u32> probe14_boot_cpu{};
+libk::Atomic<u32> probe14_ack_gate{};
+libk::Atomic<u32> probe14_ack_reached{};
+libk::Atomic<u32> probe14_ack_written{};
+libk::Atomic<u32> probe14_writer_release{};
+libk::Atomic<u32> probe14_batch_done{};
+libk::Atomic<u32> probe14_collision_seen{};
+libk::Atomic<u64> probe14_aux_key{};
+libk::Atomic<u64> probe14_resource_pool{};
+libk::Atomic<u32> probe14_resource_gate{};
+libk::Atomic<u32> probe14_resource_reached{};
+libk::Atomic<u32> probe14_resource_release{};
+libk::Atomic<u32> probe14_resource_accepted{};
+libk::Atomic<u32> probe14_resource_bad{};
+#endif
+
 #if MYOS_CONCURRENCY_PROBE == 13
 //Confirmatory experiment.
 // Exit condition: remove when the external fault harness can deny real
@@ -179,6 +205,7 @@ enum class HashMode : u8 {
     HashMode mode = HashMode::Coherent) noexcept -> u64 {
     u64 hash = u64{0x243f6a8885a308d3};
     hash = mix_hash(hash, snapshot.generation);
+    hash = mix_hash(hash, static_cast<u64>(snapshot.evidence));
     // Coherent graph fingerprints include both counters so a second snapshot
     // notices any concurrent update. Stall candidates compare semantic state;
     // their activity interval is checked below and progress is compared
@@ -391,6 +418,8 @@ void clear_record(ObservationRecord& record) noexcept {
     record.started_at.store<libk::MemoryOrder::Relaxed>(0);
     record.last_activity_at.store<libk::MemoryOrder::Relaxed>(0);
     record.last_progress_at.store<libk::MemoryOrder::Relaxed>(0);
+    record.evidence.store<libk::MemoryOrder::Relaxed>(
+        static_cast<u32>(EvidenceGrade::None));
     record.record_kind.store<libk::MemoryOrder::Relaxed>(0);
     record.phase.store<libk::MemoryOrder::Relaxed>(0);
     record.wait_kind.store<libk::MemoryOrder::Relaxed>(0);
@@ -442,6 +471,11 @@ void publish_node(
     u64 generation) noexcept -> NodeRef {
     return NodeRef{
         static_cast<NodeRef::Kind>(kind), identity, generation};
+}
+
+void degrade_record(ObservationRecord& record) noexcept {
+    record.evidence.store<libk::MemoryOrder::Release>(
+        static_cast<u32>(EvidenceGrade::Degraded));
 }
 
 } // namespace
@@ -979,6 +1013,7 @@ auto ObservationShard::write_metadata(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -995,7 +1030,7 @@ auto ObservationShard::write_metadata(
     const u64 previous_semantic = record->semantic_stamp.load<
         libk::MemoryOrder::Relaxed>();
     increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    libk::atomic_max(record->last_activity_at, tick);
     record->phase.store<libk::MemoryOrder::Relaxed>(phase);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(wait));
@@ -1023,9 +1058,96 @@ auto ObservationShard::write_metadata(
     }
     if (progressed) {
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_progress_at, tick);
     }
     AtomicSnapshotWriter::end(record->sequence, odd);
+    unpin(key, *record);
+    return true;
+}
+
+auto ObservationShard::write_batch(
+    ObservationKey key,
+    const ObservationBatch& update) noexcept -> bool {
+    ObservationRecord* record{};
+    if (!pin(key, record)) {
+        return false;
+    }
+    u64 odd{};
+    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
+        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
+        degraded_.store<libk::MemoryOrder::Release>(1);
+        unpin(key, *record);
+        return false;
+    }
+    if (!active(key, *record)) {
+        AtomicSnapshotWriter::end(record->sequence, odd);
+        unpin(key, *record);
+        return false;
+    }
+    const u64 tick = now();
+    const u32 previous_phase = record->phase.load<
+        libk::MemoryOrder::Relaxed>();
+    const u64 previous_semantic = record->semantic_stamp.load<
+        libk::MemoryOrder::Relaxed>();
+    if (update.update_activity) {
+        increment_sat(record->activity_epoch, 1);
+        libk::atomic_max(record->last_activity_at, tick);
+    }
+    record->phase.store<libk::MemoryOrder::Relaxed>(update.phase);
+    if (update.update_relation) {
+        record->wait_kind.store<libk::MemoryOrder::Relaxed>(
+            static_cast<u32>(update.wait));
+        publish_node(
+            record->driver_key,
+            record->driver_kind,
+            record->driver_generation,
+            update.driver);
+        publish_node(
+            record->blocker_key,
+            record->blocker_kind,
+            record->blocker_generation,
+            update.blocker);
+    }
+    if (update.update_deadline) {
+        record->deadline.store<libk::MemoryOrder::Relaxed>(update.deadline);
+        record->grace.store<libk::MemoryOrder::Relaxed>(update.grace);
+    }
+    record->site_file.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(update.site.file));
+    record->site_function.store<libk::MemoryOrder::Relaxed>(
+        reinterpret_cast<usize>(update.site.function));
+    record->site_line.store<libk::MemoryOrder::Relaxed>(update.site.line);
+    // The semantic stamp is part of the coherent projection even when this
+    // batch only republishes metadata after an independent witness advance.
+    // update_progress controls the progress counter/timestamp, not whether
+    // the new semantic state is visible.
+    record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
+        update.semantic_stamp);
+    if (update.update_progress
+        && (previous_phase != update.phase
+            || previous_semantic != update.semantic_stamp)) {
+        increment_sat(record->progress_epoch, 1);
+        libk::atomic_max(record->last_progress_at, tick);
+    }
+    for (usize index = 0; index < 4; ++index) {
+        if ((update.detail_mask & bit(index)) != 0) {
+            record->detail[index].store<libk::MemoryOrder::Relaxed>(
+                update.detail[index]);
+        }
+    }
+    AtomicSnapshotWriter::end(record->sequence, odd);
+
+    if (update.update_watched) {
+        const u64 mask = bit(key.slot());
+        if (update.watched) {
+            static_cast<void>(watched_.fetch_or<libk::MemoryOrder::Release>(
+                mask));
+        } else {
+            static_cast<void>(watched_.fetch_and<libk::MemoryOrder::Release>(
+                ~mask));
+        }
+    }
     unpin(key, *record);
     return true;
 }
@@ -1042,6 +1164,7 @@ auto ObservationShard::write_wait(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1054,7 +1177,7 @@ auto ObservationShard::write_wait(
     }
     const u64 tick = now();
     increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    libk::atomic_max(record->last_activity_at, tick);
     record->wait_target.store<libk::MemoryOrder::Relaxed>(wait.raw);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(kind));
@@ -1083,6 +1206,7 @@ auto ObservationShard::write_policy(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1126,6 +1250,7 @@ auto ObservationShard::publish_operation(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1175,7 +1300,7 @@ auto ObservationShard::publish_operation(
     const u32 previous_phase =
         record->phase.load<libk::MemoryOrder::Relaxed>();
     increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    libk::atomic_max(record->last_activity_at, tick);
     record->phase.store<libk::MemoryOrder::Relaxed>(encoded_phase);
     record->wait_kind.store<libk::MemoryOrder::Relaxed>(
         static_cast<u32>(wait));
@@ -1199,7 +1324,7 @@ auto ObservationShard::publish_operation(
     record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(encoded_phase);
     if (previous_phase != encoded_phase) {
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_progress_at, tick);
     }
     AtomicSnapshotWriter::end(record->sequence, odd);
 
@@ -1225,6 +1350,7 @@ void ObservationShard::write_deadline(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1277,6 +1403,7 @@ auto ObservationShard::update_phase(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1293,7 +1420,7 @@ auto ObservationShard::update_phase(
     const u64 previous_semantic = record->semantic_stamp.load<
         libk::MemoryOrder::Relaxed>();
     increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    libk::atomic_max(record->last_activity_at, tick);
     record->phase.store<libk::MemoryOrder::Relaxed>(phase);
     record->site_file.store<libk::MemoryOrder::Relaxed>(
         reinterpret_cast<usize>(site.file));
@@ -1303,7 +1430,7 @@ auto ObservationShard::update_phase(
     record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(semantic_stamp);
     if (previous_phase != phase || previous_semantic != semantic_stamp) {
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_progress_at, tick);
     }
     AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
@@ -1320,6 +1447,7 @@ auto ObservationShard::update_progress(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1337,7 +1465,7 @@ auto ObservationShard::update_progress(
         record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
             semantic_stamp);
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(now());
+        libk::atomic_max(record->last_progress_at, now());
     }
     AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
@@ -1353,6 +1481,7 @@ auto ObservationShard::observe(
     }
     u64 odd{};
     if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         unpin(key, *record);
@@ -1367,12 +1496,12 @@ auto ObservationShard::observe(
     const u64 previous = record->semantic_stamp.load<
         libk::MemoryOrder::Relaxed>();
     increment_sat(record->activity_epoch, 1);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+    libk::atomic_max(record->last_activity_at, tick);
     if (previous != semantic_stamp) {
         record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(
             semantic_stamp);
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_progress_at, tick);
     }
     AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
@@ -1386,21 +1515,12 @@ void ObservationShard::update_activity(
     if (delta == 0 || !pin(key, record)) {
         return;
     }
-    u64 odd{};
-    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
-        degraded_.store<libk::MemoryOrder::Release>(1);
-        unpin(key, *record);
-        return;
-    }
     if (!active(key, *record)) {
-        AtomicSnapshotWriter::end(record->sequence, odd);
         unpin(key, *record);
         return;
     }
     increment_sat(record->activity_epoch, delta);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(now());
-    AtomicSnapshotWriter::end(record->sequence, odd);
+    libk::atomic_max(record->last_activity_at, now());
     unpin(key, *record);
 }
 
@@ -1411,24 +1531,17 @@ void ObservationShard::advance(
     if (delta == 0 || !pin(key, record)) {
         return;
     }
-    u64 odd{};
-    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
-        degraded_.store<libk::MemoryOrder::Release>(1);
-        unpin(key, *record);
-        return;
-    }
     if (!active(key, *record)) {
-        AtomicSnapshotWriter::end(record->sequence, odd);
         unpin(key, *record);
         return;
     }
+    // A direct advance is a progress-only witness. Progress changes reset
+    // the watchdog candidate; metadata transactions may publish activity and
+    // progress together, but no split pair can be manufactured here because
+    // this direct path does not write activity_epoch.
     const u64 tick = now();
-    increment_sat(record->activity_epoch, delta);
     increment_sat(record->progress_epoch, delta);
-    record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
-    record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
-    AtomicSnapshotWriter::end(record->sequence, odd);
+    libk::atomic_max(record->last_progress_at, tick);
     unpin(key, *record);
 }
 
@@ -1440,17 +1553,9 @@ void ObservationShard::write_detail(
     if (index >= 4 || !pin(key, record)) {
         return;
     }
-    u64 odd{};
-    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
-        degraded_.store<libk::MemoryOrder::Release>(1);
-        unpin(key, *record);
-        return;
-    }
     if (active(key, *record)) {
         record->detail[index].store<libk::MemoryOrder::Relaxed>(value);
     }
-    AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
 }
 
@@ -1462,18 +1567,10 @@ void ObservationShard::and_detail(
     if (index >= 4 || !pin(key, record)) {
         return;
     }
-    u64 odd{};
-    if (!AtomicSnapshotWriter::begin(record->sequence, odd)) {
-        mark_degraded(DiagnosticStatus::ObservationWriterCollision);
-        degraded_.store<libk::MemoryOrder::Release>(1);
-        unpin(key, *record);
-        return;
-    }
     if (active(key, *record)) {
         static_cast<void>(record->detail[index].fetch_and<
             libk::MemoryOrder::Relaxed>(mask));
     }
-    AtomicSnapshotWriter::end(record->sequence, odd);
     unpin(key, *record);
 }
 
@@ -1496,6 +1593,8 @@ auto ObservationShard::snapshot(
         value.started_at = record->started_at.load<libk::MemoryOrder::Relaxed>();
         value.last_activity_at = record->last_activity_at.load<libk::MemoryOrder::Relaxed>();
         value.last_progress_at = record->last_progress_at.load<libk::MemoryOrder::Relaxed>();
+        value.evidence = static_cast<EvidenceGrade>(record->evidence.load<
+            libk::MemoryOrder::Acquire>());
         value.record_kind = static_cast<RecordKind>(
             record->record_kind.load<libk::MemoryOrder::Relaxed>());
         value.phase = record->phase.load<libk::MemoryOrder::Relaxed>();
@@ -1555,6 +1654,9 @@ auto ObservationShard::snapshot(
         }
     }
     unpin(key, *record);
+    // A failed reader sample is inconclusive for this generation; retain only
+    // cumulative shard health. Generation-local degradation belongs to writer
+    // publication loss, not transient reader overlap.
     const_cast<ObservationShard*>(this)->mark_degraded(
         DiagnosticStatus::SnapshotUnstable);
     return false;
@@ -1582,7 +1684,7 @@ void ObservationShard::finish(
             return;
         }
         increment_sat(record->activity_epoch, 1);
-        record->last_activity_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_activity_at, tick);
         record->phase.store<libk::MemoryOrder::Relaxed>(terminal_phase);
         record->wait_kind.store<libk::MemoryOrder::Relaxed>(
             static_cast<u32>(WaitKind::None));
@@ -1605,10 +1707,11 @@ void ObservationShard::finish(
         record->detail[0].store<libk::MemoryOrder::Relaxed>(result);
         record->semantic_stamp.store<libk::MemoryOrder::Relaxed>(result);
         increment_sat(record->progress_epoch, 1);
-        record->last_progress_at.store<libk::MemoryOrder::Relaxed>(tick);
+        libk::atomic_max(record->last_progress_at, tick);
         AtomicSnapshotWriter::end(record->sequence, odd);
         profile_finish(kind, started != 0 ? elapsed(tick, started) : 0);
     } else {
+        degrade_record(*record);
         mark_degraded(DiagnosticStatus::ObservationWriterCollision);
         degraded_.store<libk::MemoryOrder::Release>(1);
         // A colliding writer already holds a pin and may complete its
@@ -1968,6 +2071,18 @@ void ObservationLease::detail_and(usize index, u64 mask) noexcept {
 #else
     static_cast<void>(index);
     static_cast<void>(mask);
+#endif
+}
+
+void ObservationLease::publish(const ObservationBatch& update) noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 1
+    ObservationShard* shard{};
+    ObservationRecord* record{};
+    if (resolve(shard, record)) {
+        static_cast<void>(shard->write_batch(key_, update));
+    }
+#else
+    static_cast<void>(update);
 #endif
 }
 
@@ -2675,6 +2790,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             }
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(WatchdogCandidate::State::Clear));
+            slot->active_intervals.store<libk::MemoryOrder::Release>(0);
         }
         touched_candidates |= bit(slot_index);
 
@@ -2692,6 +2808,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         if (!same) {
             slot->publish(sample);
             slot->first_seen.store<libk::MemoryOrder::Release>(0);
+            slot->active_intervals.store<libk::MemoryOrder::Release>(0);
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(WatchdogCandidate::State::Clear));
             return true;
@@ -2703,13 +2820,22 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         if (tick < thresholds.soft_at) {
             return true;
         }
+        u32 active_intervals = slot->active_intervals.load<
+            libk::MemoryOrder::Relaxed>();
+        if (active) {
+            if (active_intervals != libk::numeric_limits<u32>::max()) {
+                ++active_intervals;
+            }
+        } else {
+            active_intervals = 0;
+        }
+        slot->active_intervals.store<libk::MemoryOrder::Release>(
+            active_intervals);
         const u64 age = tick >= thresholds.anchor
             ? elapsed(tick, thresholds.anchor) : 0;
         if (state == WatchdogCandidate::State::Clear) {
             slot->first_seen.store<libk::MemoryOrder::Release>(tick);
-            state = active
-                ? WatchdogCandidate::State::SuspectedActive
-                : WatchdogCandidate::State::Suspected;
+            state = WatchdogCandidate::State::Suspected;
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(state));
             record(
@@ -2721,16 +2847,11 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 age);
             return true;
         }
-        if (state == WatchdogCandidate::State::Suspected && active) {
-            state = WatchdogCandidate::State::SuspectedActive;
-            slot->state.store<libk::MemoryOrder::Release>(
-                static_cast<u32>(state));
-        }
-        if ((state != WatchdogCandidate::State::Suspected
-                && state != WatchdogCandidate::State::SuspectedActive)
+        if (state != WatchdogCandidate::State::Suspected
             || tick < thresholds.hard_at) {
             return true;
         }
+        const bool livelock = active_intervals >= 2;
 
         u64 report_signature{};
         bool owns_report{};
@@ -2767,8 +2888,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                         == report_signature;
             }
             if (duplicate_report) {
-                const auto duplicate = state
-                        == WatchdogCandidate::State::SuspectedActive
+                const auto duplicate = livelock
                     ? WatchdogCandidate::State::ConfirmedLivelock
                     : WatchdogCandidate::State::Confirmed;
                 slot->state.store<libk::MemoryOrder::Release>(
@@ -2814,8 +2934,6 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             release_report();
             return true;
         }
-        const bool livelock =
-            state == WatchdogCandidate::State::SuspectedActive;
         const auto confirmed = livelock
             ? WatchdogCandidate::State::ConfirmedLivelock
             : WatchdogCandidate::State::Confirmed;
@@ -3356,6 +3474,84 @@ void mark_degraded(DiagnosticStatus::Flag flag) noexcept {
 #endif
 }
 
+#if MYOS_CONCURRENCY_PROBE == 14
+void probe14_shootdown_ack_before() noexcept {
+    void* const owner = arch::current_cpu_owner();
+    if (owner == nullptr) {
+        return;
+    }
+    const auto& local = *static_cast<const CpuLocal*>(owner);
+    if (local.descriptor == nullptr
+        || local.descriptor->logical_id().raw
+            == probe14_boot_cpu.load<libk::MemoryOrder::Acquire>()
+        || probe14_ack_gate.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    static_cast<void>(probe14_ack_reached.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    constexpr u64 spin_limit = 1U << 24;
+    for (u64 spin = 0;
+         probe14_ack_gate.load<libk::MemoryOrder::Acquire>() != 0;
+         ++spin) {
+        if (spin == spin_limit) {
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 20));
+            probe14_ack_gate.store<libk::MemoryOrder::Release>(0);
+            break;
+        }
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+}
+
+void probe14_shootdown_ack_after() noexcept {
+    void* const owner = arch::current_cpu_owner();
+    if (owner == nullptr) {
+        return;
+    }
+    const auto& local = *static_cast<const CpuLocal*>(owner);
+    if (local.descriptor == nullptr
+        || local.descriptor->logical_id().raw
+            == probe14_boot_cpu.load<libk::MemoryOrder::Acquire>()) {
+        return;
+    }
+    static_cast<void>(probe14_ack_written.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    constexpr u64 spin_limit = 1U << 24;
+    for (u64 spin = 0;
+         probe14_writer_release.load<libk::MemoryOrder::Acquire>() == 0;
+         ++spin) {
+        if (spin == spin_limit) {
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 21));
+            probe14_writer_release.store<libk::MemoryOrder::Release>(1);
+            break;
+        }
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+}
+
+void probe14_resource_batch_after(u64 subject_identity) noexcept {
+    if (subject_identity
+            != probe14_resource_pool.load<libk::MemoryOrder::Acquire>()
+        || probe14_resource_gate.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    probe14_resource_reached.store<libk::MemoryOrder::Release>(1);
+    constexpr u64 spin_limit = 1U << 24;
+    for (u64 spin = 0;
+         probe14_resource_release.load<libk::MemoryOrder::Acquire>() == 0;
+         ++spin) {
+        if (spin == spin_limit) {
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 26));
+            probe14_resource_release.store<libk::MemoryOrder::Release>(1);
+            break;
+        }
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+}
+#endif
+
 #if MYOS_CONCURRENCY_DIAG >= 2
 void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
     diag::console::print<"[concurrency] cpu {} flight\n">(id.raw);
@@ -3623,12 +3819,7 @@ auto analyze(
                 return false;
             }
             fingerprint = snapshot_hash(observation);
-            if (registry != nullptr) {
-                const ObservationShard* const shard =
-                    registry->observations(
-                        ObservationKey{node.identity}.shard());
-                degraded = shard != nullptr && shard->degraded();
-            }
+            degraded = observation.evidence == EvidenceGrade::Degraded;
             return true;
         }
         if (node.kind == NodeRef::Kind::Cpu) {
@@ -3657,12 +3848,7 @@ auto analyze(
                 return false;
             }
             fingerprint = snapshot_hash(observation);
-            if (registry != nullptr) {
-                const ObservationShard* const shard =
-                    registry->observations(
-                        ObservationKey{node.identity}.shard());
-                degraded = shard != nullptr && shard->degraded();
-            }
+            degraded = observation.evidence == EvidenceGrade::Degraded;
             return true;
         }
         fingerprint = mix_hash(
@@ -3956,6 +4142,87 @@ auto stall_class_name(StallClass value) noexcept -> const char* {
     return "unknown";
 }
 
+#if MYOS_CONCURRENCY_PROBE == 14
+[[nodiscard]] auto probe14_progress_negative(
+    CpuId boot,
+    CpuDiagnosticsCore& watcher,
+    ObservationShard& target_shard) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when the direct progress witness has a
+    // production harness that can prove candidate reset under concurrent
+    // writers.  advance() is intentionally progress-only, so this negative
+    // has no cross-field pause: every progress delta must reset the candidate
+    // before activity-only classification can run.
+    ObservationLease progress = target_shard.reserve(
+        RecordKind::ServiceWork,
+        0x14f,
+        1,
+        Expectation::InternalFinite,
+        SourceSite::current());
+    if (!progress) {
+        return false;
+    }
+    progress.set_policy(OperationPolicy{
+        .kind = WaitKind::GrantWork,
+        .expectation = Expectation::InternalFinite,
+        .driver = NodeRef::external(0x14f0, 1),
+        .action = StallAction::Record});
+    progress.transition(
+        1,
+        1,
+        WaitKind::GrantWork,
+        NodeRef::external(0x14f0, 1));
+    progress.watch(true);
+
+    ObservationSnapshot initial{};
+    bool valid = progress.snapshot(initial);
+    if (valid) {
+        watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+            progress.key().slot());
+        watchdog_tick(boot, initial.last_progress_at + 2);
+        auto peer = ObservationLease::borrow(progress.key());
+        bool seen{};
+        bool livelock{};
+        for (u32 iteration = 0; iteration < 64; ++iteration) {
+            ObservationSnapshot before{};
+            ObservationSnapshot after{};
+            const bool before_ok = progress.snapshot(before);
+            const u64 expected_activity = before.activity_epoch;
+            const u64 expected_progress = before.progress_epoch;
+            progress.advance();
+            if (peer) {
+                peer.advance();
+            }
+            const bool after_ok = progress.snapshot(after);
+            valid = valid && before_ok && after_ok
+                && after.activity_epoch == expected_activity
+                && after.last_activity_at == before.last_activity_at
+                && after.progress_epoch >= expected_progress + 2
+                && after.last_progress_at >= before.last_progress_at;
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                progress.key().slot());
+            watchdog_tick(boot, initial.last_progress_at + 8 + iteration);
+            for (WatchdogCandidate& candidate : watcher.candidates) {
+                StallFingerprint fingerprint{};
+                if (!candidate.read(fingerprint)
+                    || fingerprint.root != NodeRef::observation(progress.key())) {
+                    continue;
+                }
+                seen = true;
+                livelock = livelock
+                    || static_cast<WatchdogCandidate::State>(
+                        candidate.state.load<libk::MemoryOrder::Acquire>())
+                        == WatchdogCandidate::State::ConfirmedLivelock;
+            }
+        }
+        valid = valid && seen && !livelock;
+    }
+    progress.finish(3);
+    return valid;
+}
+
+#endif
+
 #if MYOS_CONCURRENCY_PROBE
 #if MYOS_CONCURRENCY_PROBE == 13
 void run_probe(u32) noexcept {}
@@ -3965,7 +4232,7 @@ void run_probe(u32 probe) noexcept {
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
     if (probe != 1 && probe != 5 && probe != 6 && probe != 7
-        && probe != 8 && (probe < 9 || probe > 12)) {
+        && probe != 8 && probe != 14 && (probe < 9 || probe > 12)) {
         return;
     }
 
@@ -3983,6 +4250,639 @@ void run_probe(u32 probe) noexcept {
 
     const CpuId cpu = local.descriptor->logical_id();
     const CpuId boot = registry->boot_id();
+#if MYOS_CONCURRENCY_PROBE == 14
+    if (probe == 14) {
+        //Confirmatory experiment.
+        // Exit condition: remove when an external four-hart scenario runner
+        // can pause the real ShootdownTicket acknowledgement and the
+        // production Observation/Watchdog boundaries independently.
+        constexpr u32 done_phase = 99;
+        constexpr u32 batch_phase = 10;
+        constexpr u32 production_phase = 15;
+        constexpr u32 collision_phase = 20;
+        constexpr u32 resume_phase = 21;
+        constexpr u32 spin_limit = 1U << 24;
+        const auto wait_phase = [&](u32 wanted) noexcept -> bool {
+            for (u32 spin = 0; spin < spin_limit; ++spin) {
+                if (probe_phase.load<libk::MemoryOrder::Acquire>() == wanted) {
+                    return true;
+                }
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 22));
+            return false;
+        };
+
+        static_cast<void>(probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+        bool joined = false;
+        for (u32 spin = 0; spin < spin_limit; ++spin) {
+            if (probe_joined.load<libk::MemoryOrder::Acquire>()
+                == registry->count()) {
+                joined = true;
+                break;
+            }
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        if (!joined) {
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 23));
+            if (cpu == boot) {
+                probe_phase.store<libk::MemoryOrder::Release>(done_phase);
+            }
+            return;
+        }
+
+        CpuId target{(boot.raw + 1) % registry->count()};
+        for (usize attempt = 0; attempt < registry->count(); ++attempt) {
+            const CpuDescriptor* const descriptor =
+                registry->descriptor(target);
+            const CpuRuntime* const target_runtime = registry->runtime(target);
+            if (descriptor != nullptr && target_runtime != nullptr
+                && descriptor->state() == CpuState::Online
+                && target_runtime->diagnostics != nullptr
+                && target_runtime->diagnostics->concurrency.observations
+                    != nullptr) {
+                break;
+            }
+            target = CpuId{(target.raw + 1) % registry->count()};
+        }
+
+        if (cpu != boot) {
+            if (cpu != target) {
+                static_cast<void>(wait_phase(done_phase));
+                return;
+            }
+            // The target CPU is the concurrent production publisher.  It
+            // remains in this bounded loop so the boot CPU can snapshot its
+            // shard and force a writer collision without synthetic storage.
+            for (u32 spin = 0; spin < spin_limit * 8U; ++spin) {
+                const u32 phase = probe_phase.load<libk::MemoryOrder::Acquire>();
+                if (phase == batch_phase) {
+                    const ObservationKey key{
+                        probe_key.load<libk::MemoryOrder::Acquire>()};
+                    auto observation = ObservationLease::borrow(key);
+                    if (!observation) {
+                        static_cast<void>(probe_errors.fetch_or<
+                            libk::MemoryOrder::AcqRel>(1U << 24));
+                        probe14_batch_done.store<libk::MemoryOrder::Release>(1);
+                        continue;
+                    }
+                    for (u64 epoch = 1; epoch <= 128; ++epoch) {
+                        ObservationBatch update{
+                            .phase = static_cast<u32>(epoch),
+                            .semantic_stamp = epoch,
+                            .wait = WaitKind::GrantWork,
+                            .driver = NodeRef::external(0x14b0, 1),
+                            .blocker = NodeRef::external(0x14b1, 1),
+                            .site = SourceSite::current(),
+                            .detail_mask = 0xfU,
+                            .update_progress = true,
+                            .update_watched = true,
+                            .watched = true};
+                        update.detail[0] = epoch;
+                        update.detail[1] = epoch ^ 0xa5a5U;
+                        update.detail[2] = epoch + 17;
+                        update.detail[3] = update.detail[0]
+                            ^ update.detail[1] ^ update.detail[2];
+                        observation.publish(update);
+                        for (u32 pause = 0; pause < 32; ++pause) {
+                            libk::atomic_signal_fence<
+                                libk::MemoryOrder::SeqCst>();
+                        }
+                    }
+                    probe14_batch_done.store<libk::MemoryOrder::Release>(1);
+                    while (probe_phase.load<libk::MemoryOrder::Acquire>()
+                        == batch_phase) {
+                        libk::atomic_signal_fence<
+                            libk::MemoryOrder::SeqCst>();
+                    }
+                    continue;
+                }
+                if (phase == production_phase) {
+                    const u64 pool_raw = probe14_resource_pool.load<
+                        libk::MemoryOrder::Acquire>();
+                    const auto* pool = reinterpret_cast<
+                        const kernel::resource::ResourcePool*>(pool_raw);
+                    if (pool != nullptr) {
+                        const ObservationKey key =
+                            pool->close_observation_key_for_probe();
+                        auto observation = ObservationLease::borrow(key);
+                        ObservationSnapshot snapshot{};
+                        if (observation && observation.snapshot(snapshot)) {
+                            u64 stamp = snapshot.phase;
+                            stamp = stamp * 131 + snapshot.detail[0];
+                            stamp = stamp * 131 + snapshot.detail[1];
+                            stamp = stamp * 131 + snapshot.detail[2];
+                            stamp = stamp * 131 + snapshot.detail[3];
+                            const bool coherent =
+                                snapshot.record_kind
+                                    == RecordKind::ResourceClose
+                                && snapshot.subject_identity == pool_raw
+                                && snapshot.generation != 0
+                                && snapshot.phase
+                                    <= static_cast<u32>(
+                                        kernel::resource::PoolState::Closed)
+                                && snapshot.semantic_stamp == stamp
+                                && snapshot.evidence
+                                    != EvidenceGrade::Degraded;
+                            if (!coherent) {
+                                static_cast<void>(probe14_resource_bad.fetch_add<
+                                    libk::MemoryOrder::AcqRel>(1));
+                            } else {
+                                const u32 accepted =
+                                    probe14_resource_accepted.fetch_add<
+                                        libk::MemoryOrder::AcqRel>(1) + 1;
+                                if (accepted >= 16) {
+                                    probe14_resource_release.store<
+                                        libk::MemoryOrder::Release>(1);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (phase == collision_phase) {
+                    const ObservationKey key{
+                        probe14_aux_key.load<libk::MemoryOrder::Acquire>()};
+                    auto observation = ObservationLease::borrow(key);
+                    if (observation) {
+                        observation.transition(
+                            2,
+                            2,
+                            WaitKind::GrantWork,
+                            NodeRef::external(0x14c0, 1));
+                    }
+                    probe14_collision_seen.store<libk::MemoryOrder::Release>(1);
+                    while (probe_phase.load<libk::MemoryOrder::Acquire>()
+                        == collision_phase) {
+                        libk::atomic_signal_fence<
+                            libk::MemoryOrder::SeqCst>();
+                    }
+                    continue;
+                }
+                if (phase == done_phase) {
+                    return;
+                }
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            static_cast<void>(probe_errors.fetch_or<
+                libk::MemoryOrder::AcqRel>(1U << 25));
+            return;
+        }
+
+        probe14_boot_cpu.store<libk::MemoryOrder::Release>(boot.raw);
+        probe_joined.store<libk::MemoryOrder::Release>(registry->count());
+        probe_phase.store<libk::MemoryOrder::Release>(0);
+        probe_errors.store<libk::MemoryOrder::Release>(0);
+        probe14_ack_gate.store<libk::MemoryOrder::Release>(1);
+        probe14_ack_reached.store<libk::MemoryOrder::Release>(0);
+        probe14_ack_written.store<libk::MemoryOrder::Release>(0);
+        probe14_writer_release.store<libk::MemoryOrder::Release>(0);
+
+        CpuDiagnosticsCore* const watcher = current_core();
+        CpuRuntime* const target_runtime = registry->runtime(target);
+        CpuDiagnosticsCore* const target_core =
+            target_runtime == nullptr || target_runtime->diagnostics == nullptr
+            ? nullptr : &target_runtime->diagnostics->concurrency;
+        ObservationShard* const boot_shard = registry->observations(boot);
+        ObservationShard* const target_shard = registry->observations(target);
+        bool ok = registry->count() >= 4 && watcher != nullptr
+            && watcher->flight != nullptr && target_core != nullptr
+            && boot_shard != nullptr && target_shard != nullptr;
+        u32 errors = ok ? 0 : 1U;
+        u32 resource_final_state{};
+
+        // Exercise the actual TranslationState -> ShootdownPlan ->
+        // ShootdownTicket path.  Every online CPU enters the temporary state,
+        // so the published target set is the live four-hart set rather than a
+        // synthetic observation key.
+        mm::TranslationState translation{};
+        CpuSet shootdown_targets{};
+        if (ok) {
+            for (usize index = 0; index < registry->count(); ++index) {
+                const CpuId id{index};
+                static_cast<void>(shootdown_targets.insert(id));
+                static_cast<void>(translation.enter(id));
+            }
+            auto mutation = translation.begin();
+            auto plan = mm::ShootdownPlan::prepare(
+                *registry, boot, shootdown_targets);
+            mm::ShootdownTicket ticket{};
+            if (!mutation || !plan) {
+                ok = false;
+                errors |= 1U << 1;
+                probe14_ack_gate.store<libk::MemoryOrder::Release>(0);
+                probe14_writer_release.store<libk::MemoryOrder::Release>(1);
+            } else {
+                static_cast<void>(mutation.value().commit(
+                    libk::move(plan).value(), ticket));
+                const u32 remote_count =
+                    static_cast<u32>(registry->count() - 1);
+                bool reached = false;
+                for (u32 spin = 0; spin < spin_limit; ++spin) {
+                    if (probe14_ack_reached.load<
+                            libk::MemoryOrder::Acquire>() >= remote_count) {
+                        reached = true;
+                        break;
+                    }
+                    libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+                }
+                if (!reached) {
+                    ok = false;
+                    errors |= 1U << 2;
+                }
+                const ObservationKey key{ticket.observation_key()};
+                ObservationRecord* pinned{};
+                u64 odd{};
+                const bool held = reached && boot_shard->pin(key, pinned)
+                    && AtomicSnapshotWriter::begin(pinned->sequence, odd);
+                if (!held) {
+                    ok = false;
+                    errors |= 1U << 3;
+                }
+                probe14_ack_gate.store<libk::MemoryOrder::Release>(0);
+                bool written = false;
+                for (u32 spin = 0; spin < spin_limit; ++spin) {
+                    if (probe14_ack_written.load<
+                            libk::MemoryOrder::Acquire>() >= remote_count) {
+                        written = true;
+                        break;
+                    }
+                    libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+                }
+                if (!written) {
+                    ok = false;
+                    errors |= 1U << 4;
+                }
+                if (held) {
+                    bool equal = true;
+                    for (usize word = 0; word < CpuSet::word_count; ++word) {
+                        u64 expected{};
+                        for (usize index = 0; index < registry->count(); ++index) {
+                            const CpuId id{index};
+                            if (shootdown_targets.contains(id)
+                                && !ticket.acknowledged(id)) {
+                                expected |= u64{1} << (id.raw % CpuSet::word_bits);
+                            }
+                        }
+                        equal = equal
+                            && pinned->detail[word].load<
+                                libk::MemoryOrder::Acquire>() == expected;
+                    }
+                    if (!equal) {
+                        ok = false;
+                        errors |= 1U << 5;
+                    }
+                    AtomicSnapshotWriter::end(pinned->sequence, odd);
+                    boot_shard->unpin(key, *pinned);
+                }
+                probe14_writer_release.store<libk::MemoryOrder::Release>(1);
+                bool complete = false;
+                for (u32 spin = 0; spin < spin_limit; ++spin) {
+                    if (ticket.complete()) {
+                        complete = true;
+                        break;
+                    }
+                    static_cast<void>(mm::retry_shootdowns(*registry, ticket));
+                    libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+                }
+                if (!complete) {
+                    ok = false;
+                    errors |= 1U << 6;
+                }
+            }
+            for (usize index = 0; index < registry->count(); ++index) {
+                translation.leave(CpuId{index});
+            }
+        }
+
+        // Batch coherence is driven by the same diagnostics batch contract
+        // used by ResourcePool/VSpace writers.  The target hart publishes a
+        // complete epoch while this hart accepts snapshots; any mixed tuple
+        // is a failed observation even if the sample itself is rejected.
+        ObservationLease batch{};
+        ObservationKey batch_key{};
+        if (ok) {
+            batch = target_shard->reserve(
+                RecordKind::ResourceClose,
+                0x14b,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            batch_key = batch.detach_key();
+            probe_key.store<libk::MemoryOrder::Release>(batch_key.raw);
+            probe14_batch_done.store<libk::MemoryOrder::Release>(0);
+            probe_phase.store<libk::MemoryOrder::Release>(batch_phase);
+            usize accepted{};
+            usize rejected{};
+            for (u32 spin = 0; spin < spin_limit; ++spin) {
+                ObservationSnapshot snapshot{};
+                if (target_shard->snapshot(batch_key, snapshot)) {
+                    const u64 epoch = snapshot.detail[0];
+                    // A newly reserved record has an all-zero reset state.
+                    // It is not one of the worker's published epochs and
+                    // must not be classified as a mixed batch.
+                    if (epoch == 0) {
+                        libk::atomic_signal_fence<
+                            libk::MemoryOrder::SeqCst>();
+                        continue;
+                    }
+                    ++accepted;
+                    const bool coherent = snapshot.phase == epoch
+                        && snapshot.semantic_stamp == epoch
+                        && snapshot.detail[1] == (epoch ^ 0xa5a5U)
+                        && snapshot.detail[2] == epoch + 17
+                        && snapshot.detail[3] == (snapshot.detail[0]
+                            ^ snapshot.detail[1] ^ snapshot.detail[2]);
+                    if (!coherent) {
+                        ok = false;
+                        errors |= 1U << 7;
+                    }
+                } else {
+                    ++rejected;
+                }
+                if (probe14_batch_done.load<libk::MemoryOrder::Acquire>() != 0
+                    && accepted >= 16) {
+                    break;
+                }
+                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            }
+            if (probe14_batch_done.load<libk::MemoryOrder::Acquire>() == 0
+                || accepted < 16 || rejected > spin_limit) {
+                ok = false;
+                errors |= 1U << 8;
+            }
+            probe_phase.store<libk::MemoryOrder::Release>(resume_phase);
+            ObservationLease::borrow(batch_key).finish(1);
+        }
+
+        // Exercise the real ResourcePool close publisher.  The production
+        // method captures state and all four counters under its lifecycle
+        // lock, then emits one ObservationBatch.  Its probe-only hook pauses
+        // immediately after that publication so the target hart can read the
+        // canonical epoch, rather than publishing a second synthetic record.
+        if (ok) {
+            bool production_ok = false;
+            if (runtime->kernel != nullptr) {
+                auto made = runtime->kernel->objects().create_resource(
+                    kernel::resource::Budget{
+                        .memory = kernel::mm::page_size,
+                        .caps = 1});
+                if (made) {
+                    auto production_hold =
+                        libk::move(made).value().publish();
+                    auto& production_pool = production_hold.get();
+                    probe14_resource_pool.store<libk::MemoryOrder::Release>(
+                        reinterpret_cast<u64>(&production_pool));
+                    probe14_resource_gate.store<libk::MemoryOrder::Release>(
+                        1);
+                    probe14_resource_reached.store<
+                        libk::MemoryOrder::Release>(0);
+                    probe14_resource_release.store<
+                        libk::MemoryOrder::Release>(0);
+                    probe14_resource_accepted.store<
+                        libk::MemoryOrder::Release>(0);
+                    probe14_resource_bad.store<libk::MemoryOrder::Release>(0);
+                    probe_phase.store<libk::MemoryOrder::Release>(
+                        production_phase);
+                    const auto final_state = production_pool.close();
+                    resource_final_state = static_cast<u32>(final_state);
+                    probe14_resource_gate.store<libk::MemoryOrder::Release>(
+                        0);
+                    const u32 accepted =
+                        probe14_resource_accepted.load<
+                            libk::MemoryOrder::Acquire>();
+                    production_ok =
+                        probe14_resource_reached.load<
+                            libk::MemoryOrder::Acquire>() != 0
+                        && accepted >= 16
+                        && probe14_resource_bad.load<
+                            libk::MemoryOrder::Acquire>() == 0
+                        && final_state == kernel::resource::PoolState::Closed;
+                    if (!production_ok) {
+                        errors |= 1U << 15;
+                    }
+                    probe_phase.store<libk::MemoryOrder::Release>(
+                        resume_phase);
+                    probe14_resource_pool.store<
+                        libk::MemoryOrder::Release>(0);
+                } else {
+                    errors |= 1U << 15;
+                }
+            } else {
+                errors |= 1U << 15;
+            }
+            if (!production_ok) {
+                ok = false;
+            }
+        }
+
+        // Force one real sequence collision on the target shard, retire that
+        // generation, then prove a later generation is graded from its own
+        // evidence rather than the shard's sticky health bit.
+        ObservationLease collision{};
+        ObservationKey collision_key{};
+        if (ok) {
+            collision = target_shard->reserve(
+                RecordKind::ServiceWork,
+                0x14c,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            collision_key = collision.detach_key();
+            probe14_aux_key.store<libk::MemoryOrder::Release>(collision_key.raw);
+            ObservationRecord* pinned{};
+            u64 odd{};
+            const bool held = target_shard->pin(collision_key, pinned)
+                && AtomicSnapshotWriter::begin(pinned->sequence, odd);
+            if (!held) {
+                ok = false;
+                errors |= 1U << 9;
+            } else {
+                probe14_collision_seen.store<libk::MemoryOrder::Release>(0);
+                probe_phase.store<libk::MemoryOrder::Release>(collision_phase);
+                bool collided = false;
+                for (u32 spin = 0; spin < spin_limit; ++spin) {
+                    if (probe14_collision_seen.load<
+                            libk::MemoryOrder::Acquire>() != 0) {
+                        collided = true;
+                        break;
+                    }
+                    libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+                }
+                if (!collided) {
+                    ok = false;
+                    errors |= 1U << 10;
+                }
+                AtomicSnapshotWriter::end(pinned->sequence, odd);
+                target_shard->unpin(collision_key, *pinned);
+            }
+            probe_phase.store<libk::MemoryOrder::Release>(resume_phase);
+            ObservationSnapshot degraded_snapshot{};
+            const bool degraded_snapshot_ok =
+                target_shard->snapshot(collision_key, degraded_snapshot)
+                && degraded_snapshot.evidence == EvidenceGrade::Degraded
+                && target_shard->degraded();
+            if (!degraded_snapshot_ok) {
+                ok = false;
+                errors |= 1U << 11;
+            }
+            ObservationLease::borrow(collision_key).finish(2);
+        }
+
+        ObservationLease recovery{};
+        ObservationLease positive{};
+        WatchdogPolicy saved_policy{};
+        bool recovery_confirmed{};
+        bool recovery_livelock{};
+        bool positive_livelock{};
+        bool progress_only_ok{};
+        if (ok) {
+            saved_policy = target_core->policy;
+            target_core->policy.critical_soft = 2;
+            target_core->policy.critical_hard = 4;
+            target_core->policy.transport_soft = 2;
+            target_core->policy.transport_hard = 4;
+            target_core->policy.service_soft = 2;
+            target_core->policy.service_hard = 4;
+            target_core->policy.scheduler_soft = 2;
+            target_core->policy.scheduler_hard = 4;
+            watcher->scan_cursor.store<libk::MemoryOrder::Release>(0);
+            watcher->candidate_cursor.store<libk::MemoryOrder::Release>(0);
+            for (WatchdogCandidate& candidate : watcher->candidates) {
+                candidate.state.store<libk::MemoryOrder::Release>(
+                    static_cast<u32>(WatchdogCandidate::State::Clear));
+                candidate.active_intervals.store<
+                    libk::MemoryOrder::Release>(0);
+            }
+            recovery = target_shard->reserve(
+                RecordKind::ServiceWork,
+                0x14d,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            positive = target_shard->reserve(
+                RecordKind::ServiceWork,
+                0x14e,
+                1,
+                Expectation::InternalFinite,
+                SourceSite::current());
+            const auto prepare = [](ObservationLease& observation,
+                                    u64 identity) noexcept {
+                observation.set_policy(OperationPolicy{
+                    .kind = WaitKind::GrantWork,
+                    .expectation = Expectation::InternalFinite,
+                    .driver = NodeRef::external(identity, 1),
+                    .action = StallAction::Record});
+                observation.transition(
+                    1,
+                    1,
+                    WaitKind::GrantWork,
+                    NodeRef::external(identity, 1));
+                observation.watch(true);
+            };
+            progress_only_ok = probe14_progress_negative(
+                boot, *watcher, *target_shard);
+            if (!progress_only_ok) {
+                errors |= 1U << 16;
+            }
+            if (!recovery || !positive) {
+                ok = false;
+                errors |= 1U << 12;
+            } else {
+                prepare(recovery, 0x14d0);
+                prepare(positive, 0x14e0);
+                ObservationSnapshot recovery_before{};
+                const bool clean = recovery.snapshot(recovery_before)
+                    && recovery_before.evidence != EvidenceGrade::Degraded
+                    && target_shard->degraded();
+                if (!clean) {
+                    ok = false;
+                    errors |= 1U << 13;
+                }
+                const u64 recovery_anchor = recovery_before.last_progress_at;
+                watchdog_tick(boot, recovery_anchor + 2);
+                recovery.touch(); // exactly one activity blip
+                for (u32 tick = 0; tick < 96; ++tick) {
+                    watchdog_tick(boot, recovery_anchor + 8 + tick);
+                }
+                const u64 positive_anchor = [&]() noexcept -> u64 {
+                    ObservationSnapshot snapshot{};
+                    return positive.snapshot(snapshot)
+                        ? snapshot.last_progress_at : 0;
+                }();
+                for (u32 tick = 0; tick < 96; ++tick) {
+                    positive.touch();
+                    watchdog_tick(boot, positive_anchor + 2 + tick);
+                }
+                const u64 head = watcher->flight->head();
+                const usize count = head < FlightRecorder::capacity
+                    ? static_cast<usize>(head) : FlightRecorder::capacity;
+                for (usize index = 0; index < count; ++index) {
+                    FlightRecordValue event{};
+                    if (!watcher->flight->read(index, event)) {
+                        continue;
+                    }
+                    if (event.subject == recovery.key().raw) {
+                        recovery_confirmed = recovery_confirmed
+                            || event.event == FlightEvent::WatchdogConfirmed;
+                        recovery_livelock = recovery_livelock
+                            || event.event == FlightEvent::WatchdogLivelock;
+                    }
+                    if (event.subject == positive.key().raw) {
+                        positive_livelock = positive_livelock
+                            || event.event == FlightEvent::WatchdogLivelock;
+                    }
+                }
+                WaitGraphScratch graph{};
+                const bool analyzed = analyze(recovery.key(), graph)
+                    && graph.evidence == EvidenceGrade::Confirmed;
+                if (!recovery_confirmed || recovery_livelock
+                    || !positive_livelock || !analyzed) {
+                    ok = false;
+                    errors |= 1U << 14;
+                }
+            }
+            target_core->policy = saved_policy;
+        }
+        if (recovery) {
+            recovery.finish(3);
+        }
+        if (positive) {
+            positive.finish(3);
+        }
+        ok = ok && progress_only_ok;
+        probe_phase.store<libk::MemoryOrder::Release>(done_phase);
+        const u32 global_errors = probe_errors.load<libk::MemoryOrder::Acquire>();
+        errors |= global_errors;
+        const u32 resource_reached =
+            probe14_resource_reached.load<libk::MemoryOrder::Acquire>();
+        const u32 resource_accepted =
+            probe14_resource_accepted.load<libk::MemoryOrder::Acquire>();
+        const u32 resource_bad =
+            probe14_resource_bad.load<libk::MemoryOrder::Acquire>();
+        diag::console::print<
+            "concurrency-probe: stage-c evidence-{} errors=0x{:x} "
+            "batch={} resource={} reached={} accepted={} bad={} "
+            "final_state={} progress-only={} degraded-recovery={} "
+            "one-blip={} persistent={}\n">(
+            ok ? "ok" : "fail",
+            errors,
+            probe14_batch_done.load<libk::MemoryOrder::Acquire>(),
+            resource_accepted,
+            resource_reached,
+            resource_accepted,
+            resource_bad,
+            resource_final_state,
+            progress_only_ok,
+            target_shard != nullptr && target_shard->degraded(),
+            recovery_confirmed && !recovery_livelock,
+            positive_livelock);
+        return;
+    }
+#endif
+#if MYOS_CONCURRENCY_PROBE != 14
     if (probe >= 9 && probe <= 11) {
         //Confirmatory experiment.
         // Exit condition: remove when the external scheduler harness can
@@ -4924,6 +5824,7 @@ void run_probe(u32 probe) noexcept {
             "concurrency-probe: stage-a fail errors=0x{:x} cpus={}\n">(
             errors, registry->count());
     }
+#endif
 }
 #endif
 #endif

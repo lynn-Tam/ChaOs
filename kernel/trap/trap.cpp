@@ -216,15 +216,19 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     const auto operation = wait != nullptr
         ? wait->observation_key()
         : diag::concurrency::ObservationKey{};
-    continuation.transition(
-        1,
-        1,
-        operation
+    diag::concurrency::ObservationBatch update{
+        .phase = 1,
+        .semantic_stamp = 1,
+        .wait = operation
             ? diag::concurrency::WaitKind::OperationCompletion
             : diag::concurrency::WaitKind::SchedulerActivation,
-        driver,
-        diag::concurrency::NodeRef::observation(operation));
-    continuation.watch(true);
+        .driver = driver,
+        .blocker = diag::concurrency::NodeRef::observation(operation),
+        .site = diag::concurrency::SourceSite::current(),
+        .update_progress = true,
+        .update_watched = true,
+        .watched = true};
+    continuation.publish(update);
     if (wait != nullptr && wait->ready()) {
         wait->finish(context);
     }

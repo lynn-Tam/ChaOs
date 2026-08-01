@@ -48,9 +48,10 @@ public:
         const kernel::object::ObjectRef& self,
         RefundNotifier notifier) noexcept -> bool;
     [[nodiscard]] auto can_retire() const noexcept -> bool;
-#if MYOS_CONCURRENCY_PROBE == 13
+#if MYOS_CONCURRENCY_PROBE == 13 || MYOS_CONCURRENCY_PROBE == 14
     //Confirmatory experiment.
-    // Exit condition: remove with the Stage B pool ownership rendezvous.
+    // Exit condition: remove with the Stage B/Stage C pool ownership
+    // rendezvous.
     [[nodiscard]] auto close_observation_key_for_probe() const noexcept
         -> diag::concurrency::ObservationKey {
         return diag::concurrency::ObservationKey{

@@ -128,10 +128,22 @@ auto RemoteQueue::post(
                     reinterpret_cast<u64>(&request),
                     generation,
                     diag::concurrency::Expectation::InternalFinite);
-            observation.detail(0, cause.raw);
-            observation.detail(
-                1, reinterpret_cast<u64>(request.owner()));
-            observation.detail(2, home_.raw);
+            diag::concurrency::ObservationBatch initial{
+                .phase = static_cast<u32>(
+                    diag::concurrency::RemotePhase::Posted),
+                .semantic_stamp = (generation << 8)
+                    | static_cast<u32>(
+                        diag::concurrency::RemotePhase::Posted),
+                .wait = diag::concurrency::WaitKind::RemoteRequest,
+                .driver = diag::concurrency::NodeRef::cpu(home_),
+                .site = diag::concurrency::SourceSite::current(),
+                .detail_mask = 0xfU,
+                .update_progress = true};
+            initial.detail[0] = cause.raw;
+            initial.detail[1] = reinterpret_cast<u64>(request.owner());
+            initial.detail[2] = home_.raw;
+            initial.detail[3] = 0;
+            observation.publish(initial);
             request.delivery_.store<libk::MemoryOrder::Release>(
                 observation.detach_key().raw);
             request.state_.store<libk::MemoryOrder::Release>(
@@ -139,10 +151,6 @@ auto RemoteQueue::post(
             ++pending_count_;
             const u64 tick = now();
             queue_.push_back(request);
-            publish(
-                request,
-                diag::concurrency::RemotePhase::Posted,
-                diag::concurrency::WaitKind::RemoteRequest);
             delivery_.publish();
             publish(
                 request,
@@ -388,12 +396,17 @@ void RemoteQueue::publish(
     u64 transport_generation) noexcept {
     auto observation =
         diag::concurrency::ObservationLease::borrow(request.delivery());
-    observation.detail(3, transport_generation);
-    observation.transition(
-        static_cast<u32>(phase),
-        (request.generation() << 8) | static_cast<u32>(phase),
-        wait,
-        diag::concurrency::NodeRef::cpu(home_));
+    diag::concurrency::ObservationBatch update{
+        .phase = static_cast<u32>(phase),
+        .semantic_stamp = (request.generation() << 8)
+            | static_cast<u32>(phase),
+        .wait = wait,
+        .driver = diag::concurrency::NodeRef::cpu(home_),
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 1U << 3,
+        .update_progress = true};
+    update.detail[3] = transport_generation;
+    observation.publish(update);
 }
 
 void RemoteQueue::publish_queued(

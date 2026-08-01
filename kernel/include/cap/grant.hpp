@@ -233,13 +233,11 @@ private:
         u32 phase,
         u64 semantic_stamp,
         diag::concurrency::NodeRef driver,
-        diag::concurrency::NodeRef blocker) noexcept;
-    void witness(
+        diag::concurrency::NodeRef blocker,
         usize operations,
         usize attachments,
         bool retained,
         u64 slot) noexcept;
-
     kernel::sync::Completion completion_;
     // Revoke is acknowledged by several CPUs and the reclaimer.  A stable
     // key lets each writer borrow independently; the final countdown owner

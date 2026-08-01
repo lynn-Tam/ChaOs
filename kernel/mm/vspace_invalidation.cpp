@@ -354,19 +354,26 @@ void VSpace::publish_observation(VSpaceServiceState result) noexcept {
     stamp = stamp * 17 + authorities;
     stamp = stamp * 17 + active;
     stamp = stamp * 17 + retries;
-    observation.transition(
-        static_cast<u32>(result),
-        stamp,
-        wait,
-        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)),
-        active == 0
+    diag::concurrency::ObservationBatch update{
+        .phase = static_cast<u32>(result),
+        .semantic_stamp = stamp,
+        .wait = wait,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(this)),
+        .blocker = active == 0
             ? diag::concurrency::NodeRef{}
             : diag::concurrency::NodeRef::external(
-                  reinterpret_cast<u64>(this), active));
-    observation.detail(0, active);
-    observation.detail(1, retries);
-    observation.detail(2, static_cast<u64>(pending));
-    observation.detail(3, claim || invalidations || authorities);
+                  reinterpret_cast<u64>(this), active),
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 0xfU,
+        .update_progress = true,
+        .update_watched = true,
+        .watched = state != VSpaceState::Quiescent};
+    update.detail[0] = active;
+    update.detail[1] = retries;
+    update.detail[2] = static_cast<u64>(pending);
+    update.detail[3] = claim || invalidations || authorities;
+    observation.publish(update);
     if (state == VSpaceState::Quiescent) {
 #if MYOS_CONCURRENCY_PROBE == 13
         //Confirmatory experiment.

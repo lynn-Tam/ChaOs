@@ -231,20 +231,25 @@ public:
                     reinterpret_cast<u64>(&slot->anchor),
                     generation,
                     kernel::diag::concurrency::Expectation::InternalFinite);
-        observation.transition(
-            1,
-            generation,
-            kernel::diag::concurrency::WaitKind::ObjectCleanup,
-            kernel::diag::concurrency::NodeRef::external(
+        kernel::diag::concurrency::ObservationBatch update{
+            .phase = 1,
+            .semantic_stamp = generation,
+            .wait = kernel::diag::concurrency::WaitKind::ObjectCleanup,
+            .driver = kernel::diag::concurrency::NodeRef::external(
                 reinterpret_cast<u64>(&slot->anchor),
-                generation));
+                generation),
+            .site = kernel::diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = true,
+            .update_watched = true,
+            .watched = true};
         publish_retire_witness(
-            observation,
+            update,
             cleanup_complete,
             strong_refs,
             active_pins,
             reclaim_queued);
-        observation.watch(true);
+        observation.publish(update);
         retire_key = observation.detach_key();
         {
             kernel::sync::IrqLockGuard guard{lock_};
@@ -326,8 +331,15 @@ public:
 
 #if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(retire_key);
-            publish_retire_witness(active, true, 0, 0, false);
-            active.phase(4, slot->anchor.generation_);
+            kernel::diag::concurrency::ObservationBatch update{
+                .phase = 4,
+                .semantic_stamp = slot->anchor.generation_,
+                .site = kernel::diag::concurrency::SourceSite::current(),
+                .detail_mask = 0xfU,
+                .update_progress = true,
+                .update_relation = false};
+            publish_retire_witness(update, true, 0, 0, false);
+            active.publish(update);
 #endif
             ObjectTraits<T>::destroy(*slot->object());
             auto refund = slot->anchor.sponsorship_.detach();
@@ -352,15 +364,16 @@ public:
 private:
 #if MYOS_CONCURRENCY_DIAG >= 1
     static void publish_retire_witness(
-        kernel::diag::concurrency::ObservationLease& observation,
+        kernel::diag::concurrency::ObservationBatch& update,
         bool cleanup_complete,
         usize strong_refs,
         usize active_pins,
         bool reclaim_queued) noexcept {
-        observation.detail(0, cleanup_complete ? 1 : 0);
-        observation.detail(1, strong_refs);
-        observation.detail(2, active_pins);
-        observation.detail(3, reclaim_queued ? 1 : 0);
+        update.detail_mask = 0xfU;
+        update.detail[0] = cleanup_complete ? 1 : 0;
+        update.detail[1] = strong_refs;
+        update.detail[2] = active_pins;
+        update.detail[3] = reclaim_queued ? 1 : 0;
     }
 
     [[nodiscard]] static auto retire_observation(
@@ -594,12 +607,32 @@ private:
             --anchor.strong_refs_;
 #if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
+            const bool reclaim_queued = anchor.reclaim_queued_;
+            const bool cleanup_complete = anchor.cleanup_complete_;
+            const u32 phase = reclaim_queued
+                ? 3U : cleanup_complete ? 2U : 1U;
+            kernel::diag::concurrency::ObservationBatch update{
+                .phase = phase,
+                .semantic_stamp = anchor.generation_,
+                .wait = reclaim_queued
+                    ? kernel::diag::concurrency::WaitKind::ObjectReclaim
+                    : kernel::diag::concurrency::WaitKind::ObjectCleanup,
+                .driver = reclaim_queued
+                    ? kernel::diag::concurrency::NodeRef{}
+                    : kernel::diag::concurrency::NodeRef::external(
+                          reinterpret_cast<u64>(&anchor),
+                          anchor.generation_),
+                .site = kernel::diag::concurrency::SourceSite::current(),
+                .detail_mask = 0xfU,
+                .update_progress = false,
+                .update_activity = false};
             publish_retire_witness(
-                active,
+                update,
                 anchor.cleanup_complete_,
                 anchor.strong_refs_,
                 anchor.active_pins_,
                 anchor.reclaim_queued_);
+            active.publish(update);
             active.advance();
 #endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
@@ -619,12 +652,32 @@ private:
             --anchor.active_pins_;
 #if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
+            const bool reclaim_queued = anchor.reclaim_queued_;
+            const bool cleanup_complete = anchor.cleanup_complete_;
+            const u32 phase = reclaim_queued
+                ? 3U : cleanup_complete ? 2U : 1U;
+            kernel::diag::concurrency::ObservationBatch update{
+                .phase = phase,
+                .semantic_stamp = anchor.generation_,
+                .wait = reclaim_queued
+                    ? kernel::diag::concurrency::WaitKind::ObjectReclaim
+                    : kernel::diag::concurrency::WaitKind::ObjectCleanup,
+                .driver = reclaim_queued
+                    ? kernel::diag::concurrency::NodeRef{}
+                    : kernel::diag::concurrency::NodeRef::external(
+                          reinterpret_cast<u64>(&anchor),
+                          anchor.generation_),
+                .site = kernel::diag::concurrency::SourceSite::current(),
+                .detail_mask = 0xfU,
+                .update_progress = false,
+                .update_activity = false};
             publish_retire_witness(
-                active,
+                update,
                 anchor.cleanup_complete_,
                 anchor.strong_refs_,
                 anchor.active_pins_,
                 anchor.reclaim_queued_);
+            active.publish(update);
             active.advance();
 #endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
@@ -647,16 +700,20 @@ private:
             --anchor.active_pins_;
 #if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
+            kernel::diag::concurrency::ObservationBatch update{
+                .phase = 2,
+                .semantic_stamp = anchor.generation_,
+                .site = kernel::diag::concurrency::SourceSite::current(),
+                .detail_mask = 0xfU,
+                .update_progress = true,
+                .update_relation = false};
             publish_retire_witness(
-                active,
+                update,
                 anchor.cleanup_complete_,
                 anchor.strong_refs_,
                 anchor.active_pins_,
                 anchor.reclaim_queued_);
-            active.phase(
-                2,
-                anchor.generation_,
-                kernel::diag::concurrency::SourceSite::current());
+            active.publish(update);
 #endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
@@ -738,13 +795,17 @@ private:
         reclaim_head_ = &slot;
 #if MYOS_CONCURRENCY_DIAG >= 1
         auto active = retire_observation(anchor, anchor.generation_);
-        publish_retire_witness(active, true, 0, 0, true);
-        active.transition(
-            3,
-            anchor.generation_,
-            kernel::diag::concurrency::WaitKind::ObjectReclaim,
-            {});
-        active.watch(true);
+        kernel::diag::concurrency::ObservationBatch update{
+            .phase = 3,
+            .semantic_stamp = anchor.generation_,
+            .wait = kernel::diag::concurrency::WaitKind::ObjectReclaim,
+            .site = kernel::diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = true,
+            .update_watched = true,
+            .watched = true};
+        publish_retire_witness(update, true, 0, 0, true);
+        active.publish(update);
 #endif
         return true;
     }

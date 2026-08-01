@@ -385,11 +385,20 @@ struct ObservationRecord final {
     // Directory masks below are scan hints only.
     libk::Atomic<u64> slot_state{};
     libk::Atomic<u64> sequence{};
+    // Activity is the exercise witness used for activity-without-progress
+    // intervals. Metadata transactions may publish activity together with
+    // progress under sequence; a direct progress witness uses progress_epoch
+    // alone because its progress delta already resets the candidate.
     libk::Atomic<u64> activity_epoch{};
     libk::Atomic<u64> progress_epoch{};
     libk::Atomic<u64> started_at{};
+    // These timestamps follow their corresponding witnesses. Direct progress
+    // uses last_progress_at; it does not fabricate an activity timestamp.
     libk::Atomic<u64> last_activity_at{};
     libk::Atomic<u64> last_progress_at{};
+    // Evidence is generation-local.  Shard status keeps historical
+    // operational health, while this field describes only the active record.
+    libk::Atomic<u32> evidence{};
 
     libk::Atomic<u32> record_kind{};
     libk::Atomic<u32> phase{};
@@ -438,6 +447,7 @@ struct ObservationSnapshot final {
     u64 started_at{};
     u64 last_activity_at{};
     u64 last_progress_at{};
+    EvidenceGrade evidence{EvidenceGrade::None};
     RecordKind record_kind{};
     u32 phase{};
     WaitKind wait_kind{};
@@ -451,6 +461,36 @@ struct ObservationSnapshot final {
     u64 semantic_stamp{};
     SourceSite site{};
     u64 detail[4]{};
+};
+
+// One projection publisher owns this metadata and may optionally publish all
+// four details and the directory watch hint in the same bounded transaction.
+// Multi-writer witness updates use detail()/detail_and()/advance() instead;
+// detail_mask selects only the values captured by this epoch.
+struct ObservationBatch final {
+    u32 phase{};
+    u64 semantic_stamp{};
+    WaitKind wait{WaitKind::None};
+    NodeRef driver{};
+    NodeRef blocker{};
+    SourceSite site{};
+    u32 detail_mask{};
+    u64 detail[4]{};
+    // The semantic stamp is always published with the batch.  This flag only
+    // controls whether the progress epoch/timestamp is advanced; callers that
+    // already accounted independent work can keep the counters unchanged.
+    bool update_progress{true};
+    // A batch normally counts one metadata observation as activity.  A caller
+    // that will immediately publish an independent witness (for example an
+    // ObjectPool reference decrement) can leave activity accounting to that
+    // witness so the canonical event is counted exactly once.
+    bool update_activity{true};
+    bool update_relation{true};
+    bool update_deadline{};
+    u64 deadline{};
+    u64 grace{};
+    bool update_watched{};
+    bool watched{};
 };
 
 inline constexpr usize profile_bucket_count = 8;
@@ -566,12 +606,16 @@ public:
     void observe(u64 semantic_stamp) noexcept;
     // Keep polling visible as activity without changing the semantic phase.
     void touch(SourceSite site = SourceSite::current()) noexcept;
+    // Publish an independent progress witness. This deliberately does not
+    // increment activity_epoch: progress itself resets the watchdog candidate,
+    // while touch() and no-progress metadata remain activity-only witnesses.
     void advance(u64 delta = 1) noexcept;
     // Witness slots are diagnostic projections only.  They are deliberately
     // bounded and independently atomic so multi-CPU acknowledgements can
     // update a pending mask without taking a subsystem lock.
     void detail(usize index, u64 value) noexcept;
     void detail_and(usize index, u64 mask) noexcept;
+    void publish(const ObservationBatch& update) noexcept;
     void link_wait(
         ObservationKey wait,
         WaitKind kind,
@@ -689,6 +733,9 @@ private:
         u64 semantic_stamp,
         bool update_progress,
         SourceSite site) noexcept -> bool;
+    [[nodiscard]] auto write_batch(
+        ObservationKey key,
+        const ObservationBatch& update) noexcept -> bool;
     [[nodiscard]] auto write_wait(
         ObservationKey key,
         ObservationKey wait,
@@ -917,7 +964,6 @@ struct WatchdogCandidate final {
     enum class State : u32 {
         Clear,
         Suspected,
-        SuspectedActive,
         Confirmed,
         ConfirmedLivelock,
     };
@@ -938,6 +984,7 @@ struct WatchdogCandidate final {
     libk::Atomic<u32> blocker_kind{};
     libk::Atomic<u64> blocker_generation{};
     libk::Atomic<u64> first_seen{};
+    libk::Atomic<u32> active_intervals{};
 
     void publish(const StallFingerprint& value) noexcept;
     [[nodiscard]] auto read(StallFingerprint& value) const noexcept -> bool;
@@ -1108,6 +1155,17 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
     -> const char*;
 #if MYOS_CONCURRENCY_PROBE
 void run_probe(u32 probe) noexcept;
+#endif
+#if MYOS_CONCURRENCY_PROBE == 14
+//Confirmatory experiment.
+// Exit condition: remove when an external shootdown harness can pause the
+// acknowledgement callback at the same writer boundary.
+void probe14_shootdown_ack_before() noexcept;
+void probe14_shootdown_ack_after() noexcept;
+//Confirmatory experiment.
+// Exit condition: remove when an external ResourcePool harness can pause the
+// real compound publisher at the same observation boundary.
+void probe14_resource_batch_after(u64 subject_identity) noexcept;
 #endif
 #if MYOS_CONCURRENCY_PROBE == 12
 //Confirmatory experiment.

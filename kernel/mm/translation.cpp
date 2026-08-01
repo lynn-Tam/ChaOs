@@ -90,11 +90,11 @@ void ShootdownTicket::initialize(
         epoch.raw,
         diag::concurrency::Expectation::InternalFinite);
     const auto key = observation.key();
-    observation.transition(
-        shootdown_published,
-        epoch.raw,
-        diag::concurrency::WaitKind::ShootdownAck,
-        targets.size() == 1
+    diag::concurrency::ObservationBatch update{
+        .phase = shootdown_published,
+        .semantic_stamp = epoch.raw,
+        .wait = diag::concurrency::WaitKind::ShootdownAck,
+        .driver = targets.size() == 1
             ? [&]() noexcept {
                   diag::concurrency::NodeRef result{};
                   targets.for_each([&](kernel::CpuId cpu) noexcept {
@@ -102,7 +102,12 @@ void ShootdownTicket::initialize(
                   });
                   return result;
               }()
-            : diag::concurrency::NodeRef::cpu_set(key));
+            : diag::concurrency::NodeRef::cpu_set(key),
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 0xfU,
+        .update_progress = true,
+        .update_watched = true,
+        .watched = !targets.empty()};
     for (usize index = 0; index < kernel::CpuSet::word_count; ++index) {
         // CpuSet is intentionally opaque; build the witness one bit at a
         // time so the diagnostic copy remains independent of its lock-free
@@ -113,9 +118,9 @@ void ShootdownTicket::initialize(
                 word |= u64{1} << (cpu.raw % kernel::CpuSet::word_bits);
             }
         });
-        observation.detail(index, word);
+        update.detail[index] = word;
     }
-    observation.watch(!targets.empty());
+    observation.publish(update);
     if (!targets.empty()) {
         observation_key_.store<libk::MemoryOrder::Release>(
             observation.detach_key().raw);
@@ -136,8 +141,20 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
     const u64 previous = acknowledgements_[word].fetch_or<
         libk::MemoryOrder::AcqRel>(bit);
     if ((previous & bit) == 0) {
+#if MYOS_CONCURRENCY_PROBE == 14
+        //Confirmatory experiment.
+        // Exit condition: remove when an external shootdown harness can
+        // pause the acknowledgement callback at this writer boundary.
+        diag::concurrency::probe14_shootdown_ack_before();
+#endif
         observation.detail_and(word, ~bit);
         observation.advance();
+#if MYOS_CONCURRENCY_PROBE == 14
+        //Confirmatory experiment.
+        // Exit condition: remove when an external shootdown harness can
+        // pause the acknowledgement callback at this writer boundary.
+        diag::concurrency::probe14_shootdown_ack_after();
+#endif
         // Publish this CPU's non-final diagnostic state before joining the
         // canonical countdown.  The final RMW acquires prior acknowledgements
         // and its callback alone exchanges/finishes the terminal key.

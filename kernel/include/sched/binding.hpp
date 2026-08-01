@@ -103,7 +103,7 @@ public:
         diag::concurrency::SourceSite site =
             diag::concurrency::SourceSite::current()) noexcept {
         actor_.clear_wait(site);
-        publish_actor();
+        publish_projection();
     }
 
 #if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
@@ -132,9 +132,7 @@ private:
             | (timer_queued() ? 2U : 0U)
             | (wake_credit_ ? 4U : 0U)
             | (activation_credit_ ? 8U : 0U);
-        actor_.detail(0, projection);
-        actor_.detail(1, static_cast<u64>(execution().state()));
-        publish_actor();
+        publish_actor(projection, static_cast<u64>(execution().state()));
     }
 
     void publish_accept(
@@ -147,7 +145,7 @@ private:
         actor_.detail(3, delivery.raw);
     }
 
-    void publish_actor() noexcept {
+    void publish_actor(u64 projection, u64 state_value) noexcept {
         using diag::concurrency::Expectation;
         using diag::concurrency::NodeRef;
         using diag::concurrency::WaitKind;
@@ -157,48 +155,51 @@ private:
         const auto home = NodeRef::cpu(home_cpu_);
         const u32 phase = static_cast<u32>(state);
         const u64 stamp = static_cast<u64>(state);
+        diag::concurrency::ObservationBatch update{
+            .phase = phase,
+            .semantic_stamp = stamp,
+            .site = site,
+            .detail_mask = 0x3U,
+            .update_progress = true};
+        update.detail[0] = projection;
+        update.detail[1] = state_value;
         switch (state) {
         case ExecutionState::Ready:
-            actor_.deadline(0);
-            actor_.transition(
-                phase, stamp, WaitKind::SchedulerReady, home, {}, site);
-            actor_.watch(true);
-            return;
+            update.wait = WaitKind::SchedulerReady;
+            update.driver = home;
+            update.update_deadline = true;
+            update.watched = true;
+            break;
         case ExecutionState::Throttled:
-            actor_.deadline(
-                timer_queued() ? timer_deadline_.ticks() : 0,
-                diag::concurrency::default_grace(
-                    Expectation::SchedulerControlled),
-                site);
-            actor_.transition(
-                phase, stamp, WaitKind::SchedulerRefill, home, {}, site);
-            actor_.watch(timer_queued());
-            return;
+            update.wait = WaitKind::SchedulerRefill;
+            update.driver = home;
+            update.update_deadline = true;
+            update.deadline = timer_queued() ? timer_deadline_.ticks() : 0;
+            update.grace = diag::concurrency::default_grace(
+                Expectation::SchedulerControlled);
+            update.watched = timer_queued();
+            break;
         case ExecutionState::Blocked:
-            actor_.phase(phase, stamp, site);
-            actor_.watch(true);
-            return;
+            update.update_relation = false;
+            update.watched = true;
+            break;
         case ExecutionState::Parked:
-            actor_.deadline(0);
-            actor_.transition(
-                phase,
-                stamp,
-                activation_credit_ ? WaitKind::SchedulerActivation
-                                   : WaitKind::None,
-                activation_credit_ ? home : NodeRef{},
-                {},
-                site);
-            actor_.watch(activation_credit_);
-            return;
+            update.wait = activation_credit_
+                ? WaitKind::SchedulerActivation : WaitKind::None;
+            update.driver = activation_credit_ ? home : NodeRef{};
+            update.update_deadline = true;
+            update.watched = activation_credit_;
+            break;
         case ExecutionState::Prepared:
         case ExecutionState::Running:
         case ExecutionState::Exited:
-            actor_.deadline(0);
-            actor_.transition(
-                phase, stamp, WaitKind::None, {}, {}, site);
-            actor_.watch(false);
-            return;
+            update.wait = WaitKind::None;
+            update.update_deadline = true;
+            update.watched = false;
+            break;
         }
+        update.update_watched = true;
+        actor_.publish(update);
     }
 
     void ensure_actor(diag::concurrency::SourceSite site) noexcept {

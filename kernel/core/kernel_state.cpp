@@ -267,8 +267,19 @@ void KernelState::run_reclaimer_probe() noexcept {
         add_progress(object_total, object_count);
         kernel.reclaimer_observation_.advance(object_count);
         work_observation.advance(object_count);
-        kernel.reclaimer_observation_.detail(0, cycle);
-        kernel.reclaimer_observation_.detail(1, object_total);
+        diag::concurrency::ObservationBatch object_update{
+            .phase = 1,
+            .semantic_stamp = 1,
+            .wait = diag::concurrency::WaitKind::ObjectReclaim,
+            .driver = driver,
+            .site = diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = false};
+        object_update.detail[0] = cycle;
+        object_update.detail[1] = object_total;
+        object_update.detail[2] = grant_total;
+        object_update.detail[3] = vspace_total;
+        kernel.reclaimer_observation_.publish(object_update);
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Object,
             diag::concurrency::FlightEvent::Reclaim,
@@ -282,11 +293,19 @@ void KernelState::run_reclaimer_probe() noexcept {
         add_progress(grant_total, grant.progressed);
         kernel.reclaimer_observation_.advance(grant.progressed);
         work_observation.advance(grant.progressed);
-        kernel.reclaimer_observation_.attempt(
-            3,
-            diag::concurrency::WaitKind::VSpaceWork,
-            driver);
-        kernel.reclaimer_observation_.detail(2, grant_total);
+        diag::concurrency::ObservationBatch grant_update{
+            .phase = 3,
+            .semantic_stamp = 3,
+            .wait = diag::concurrency::WaitKind::VSpaceWork,
+            .driver = driver,
+            .site = diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = false};
+        grant_update.detail[0] = cycle;
+        grant_update.detail[1] = object_total;
+        grant_update.detail[2] = grant_total;
+        grant_update.detail[3] = vspace_total;
+        kernel.reclaimer_observation_.publish(grant_update);
         const auto vspace = kernel.vspace_work_.run(
             kernel::mm::VmContext{
                 .cpus = cpu.runtime().owner_registry,
@@ -296,11 +315,19 @@ void KernelState::run_reclaimer_probe() noexcept {
         add_progress(vspace_total, vspace.progressed);
         kernel.reclaimer_observation_.advance(vspace.progressed);
         work_observation.advance(vspace.progressed);
-        kernel.reclaimer_observation_.attempt(
-            4,
-            diag::concurrency::WaitKind::SchedulerReady,
-            driver);
-        kernel.reclaimer_observation_.detail(3, vspace_total);
+        diag::concurrency::ObservationBatch vspace_update{
+            .phase = 4,
+            .semantic_stamp = 4,
+            .wait = diag::concurrency::WaitKind::SchedulerReady,
+            .driver = driver,
+            .site = diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = false};
+        vspace_update.detail[0] = cycle;
+        vspace_update.detail[1] = object_total;
+        vspace_update.detail[2] = grant_total;
+        vspace_update.detail[3] = vspace_total;
+        kernel.reclaimer_observation_.publish(vspace_update);
         if (grant.more || vspace.more
             || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
@@ -336,11 +363,16 @@ auto KernelState::retain_reclaimer_work() noexcept
                 && reclaimer_context_->binding() != nullptr
             ? reclaimer_context_->binding()->actor_ref()
             : diag::concurrency::NodeRef{};
-        observation.attempt(
-            static_cast<u32>(diag::concurrency::ServicePhase::Queued),
-            diag::concurrency::WaitKind::SchedulerWake,
-            driver);
-        observation.watch(true);
+        diag::concurrency::ObservationBatch update{
+            .phase = static_cast<u32>(diag::concurrency::ServicePhase::Queued),
+            .semantic_stamp = 0,
+            .wait = diag::concurrency::WaitKind::SchedulerWake,
+            .driver = driver,
+            .site = diag::concurrency::SourceSite::current(),
+            .update_progress = false,
+            .update_watched = true,
+            .watched = true};
+        observation.publish(update);
         const auto key = observation.detach_key();
         if (!key) {
             return {};

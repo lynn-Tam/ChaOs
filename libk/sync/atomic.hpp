@@ -239,6 +239,22 @@ private:
     alignas(sizeof(storage_type)) storage_type value_{};
 };
 
+// Publish the greatest value observed by a set of writers.  This is useful
+// for diagnostic timestamps and other monotonic witnesses whose writers do
+// not share the metadata sequence.  The atomic remains the sole state owner;
+// a stale writer can only lose the compare-exchange and retry with the newer
+// value.
+template<MemoryOrder success = MemoryOrder::Relaxed,
+         MemoryOrder failure = MemoryOrder::Relaxed,
+         AtomicValue T>
+void atomic_max(Atomic<T>& value, T desired) noexcept {
+    T current = value.template load<MemoryOrder::Relaxed>();
+    while (current < desired
+        && !value.template compare_exchange_weak<success, failure>(
+            current, desired)) {
+    }
+}
+
 // Non-owning atomic access to an existing scalar object. This is the
 // freestanding counterpart of std::atomic_ref: the referenced object remains
 // the sole storage truth, while every concurrent access must use AtomicRef for

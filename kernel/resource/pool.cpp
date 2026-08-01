@@ -955,23 +955,33 @@ void ResourcePool::publish_observation() noexcept {
     stamp = stamp * 131 + constructions;
     stamp = stamp * 131 + roots;
     stamp = stamp * 131 + sponsorships;
-    observation.transition(
-        static_cast<u32>(state),
-        stamp,
-        wait,
-        diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)),
-        blocker_key
+    diag::concurrency::ObservationBatch update{
+        .phase = static_cast<u32>(state),
+        .semantic_stamp = stamp,
+        .wait = wait,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(this)),
+        .blocker = blocker_key
             ? diag::concurrency::NodeRef::observation(blocker_key)
             : blocker == nullptr
                 ? diag::concurrency::NodeRef{}
                 : diag::concurrency::NodeRef::external(
                       reinterpret_cast<u64>(blocker),
-                      blocker->root_.generation));
-    observation.detail(0, reservations);
-    observation.detail(1, constructions);
-    observation.detail(2, roots);
-    observation.detail(3, sponsorships);
-    observation.watch(state != PoolState::Closed);
+                      blocker->root_.generation),
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 0xfU,
+        .update_progress = true,
+        .update_watched = true,
+        .watched = state != PoolState::Closed};
+    update.detail[0] = reservations;
+    update.detail[1] = constructions;
+    update.detail[2] = roots;
+    update.detail[3] = sponsorships;
+    observation.publish(update);
+#if MYOS_CONCURRENCY_PROBE == 14
+    diag::concurrency::probe14_resource_batch_after(
+        reinterpret_cast<u64>(this));
+#endif
     if (state == PoolState::Closed) {
         const auto terminal = diag::concurrency::ObservationKey{
             close_observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
