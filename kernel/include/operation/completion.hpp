@@ -104,9 +104,9 @@ public:
     }
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey {
-        return observation_.key();
+        return diag::concurrency::ObservationKey{
+            observation_key_.load<libk::MemoryOrder::Acquire>()};
     }
-
     // The operation owns one policy descriptor. A sink says how completion
     // reaches a consumer; it does not own timeout or producer policy.
     void set_policy(diag::concurrency::OperationPolicy policy) noexcept {
@@ -187,7 +187,10 @@ private:
 
     Sink sink_{};
     libk::Atomic<Delivery> delivery_{Delivery::Detached};
-    diag::concurrency::ObservationLease observation_{};
+    // Shared writers publish only this immutable generation identity.  Each
+    // writer borrows it for its update; the terminal Delivery owner exchanges
+    // it before releasing owner_ so no member is touched after release.
+    libk::Atomic<u64> observation_key_{};
     diag::concurrency::OperationPolicy policy_{};
 };
 

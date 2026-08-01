@@ -54,7 +54,7 @@ auto CloseWait::notifier() noexcept -> RefundNotifier {
 
 void CloseWait::refunded() noexcept {
     if (!completion_.complete()) {
-        completion_.acknowledge();
+        static_cast<void>(completion_.acknowledge());
         return;
     }
     relation_.signal();
@@ -75,7 +75,7 @@ auto CloseWait::cancel() noexcept -> bool {
     if (committed_ || complete()) {
         return false;
     }
-    completion_.acknowledge();
+    static_cast<void>(completion_.acknowledge());
     return true;
 }
 

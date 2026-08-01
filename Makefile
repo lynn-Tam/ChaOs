@@ -217,6 +217,7 @@ KERNEL_SRCS := \
   kernel/boot/firmware/devicetree/fdt.cpp \
   kernel/image/boot_bundle.cpp \
   kernel/init/root_task.cpp \
+  kernel/init/stage_b_probe.cpp \
   kernel/init/run.cpp \
   kernel/diag/console.cpp \
   kernel/diag/panic.cpp \
@@ -734,9 +735,9 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12 13,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
-_run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
+_run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11 13,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
 	@case "$(CONCURRENCY_PROBE)" in \
 		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
 		2) evidence="concurrency-probe: stage-a storage-ok cpus=$(QEMU_SMP)";; \
@@ -750,14 +751,16 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11,$(CONCURRENCY_PROBE)
 		10) evidence="concurrency-probe: stage-g throttled-ok";; \
 		11) evidence="concurrency-probe: stage-g deadline-ok";; \
 		12) evidence="concurrency-probe: stage-g cpu-live-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..12"; exit 1;; \
+		13) evidence="concurrency-probe: stage-b ownership-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..13"; exit 1;; \
 	esac; \
 	initrd=""; \
 	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
 		|| [ "$(CONCURRENCY_PROBE)" = 4 ] \
 		|| [ "$(CONCURRENCY_PROBE)" = 9 ] \
 		|| [ "$(CONCURRENCY_PROBE)" = 10 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 11 ]; then \
+		|| [ "$(CONCURRENCY_PROBE)" = 11 ] \
+		|| [ "$(CONCURRENCY_PROBE)" = 13 ]; then \
 		initrd="-initrd $(BOOT_BUNDLE)"; \
 	fi; \
 	set +e; \

@@ -9,6 +9,7 @@
 #include <cpu/cpu_runtime.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/mem.h>
+#include <libk/sync/atomic.hpp>
 #include <libk/utility.hpp>
 #include <mm/kernel_stack.hpp>
 #include <mm/memory_object.hpp>
@@ -57,14 +58,21 @@ struct CompletionProbe final {
         });
     }
 
-    [[nodiscard]] auto complete() const noexcept -> bool { return false; }
+    [[nodiscard]] auto complete() const noexcept -> bool {
+        return completed_.load<libk::MemoryOrder::Acquire>();
+    }
+    void complete_for_stage_b() noexcept {
+        completed_.store<libk::MemoryOrder::Release>(true);
+    }
     [[nodiscard]] auto read() noexcept -> kernel::operation::Result {
         return {};
     }
-    void release() noexcept {}
+    void release() noexcept { ++release_count; }
     [[nodiscard]] auto cancel() noexcept -> bool { return false; }
 
     kernel::operation::Completion completion;
+    usize release_count{};
+    libk::Atomic<bool> completed_{};
 };
 
 constinit libk::ManualLifetime<CompletionProbe> completion_probe{};
@@ -879,6 +887,66 @@ auto RootTask::run_concurrency_probe(
         claimed ? "claimed" : "external",
         owner.completion.observation_key().raw);
     return true;
+}
+#endif
+
+#if MYOS_CONCURRENCY_PROBE == 13
+auto RootTask::prepare_stage_b_operation(
+    kernel::CpuRegistry& cpus,
+    bool deny_observation) noexcept -> bool {
+    if (!started_ || !thread_ || completion_probe || completion_probe_wait) {
+        return false;
+    }
+    auto* const binding = thread_->binding();
+    if (binding == nullptr) {
+        return false;
+    }
+    CompletionProbe& owner = completion_probe.emplace();
+    operation::Wait& wait = completion_probe_wait.emplace();
+#if MYOS_CONCURRENCY_PROBE == 13
+    if (deny_observation) {
+        //Confirmatory experiment.
+        // Exit condition: remove with the external Stage B reserve fault
+        // harness once it can deny this production reservation directly.
+        diag::concurrency::deny_reserves(
+            diag::concurrency::RecordKind::Operation,
+            reinterpret_cast<u64>(&owner));
+    }
+#else
+    static_cast<void>(deny_observation);
+#endif
+    if (!wait.begin(owner.completion, cpus, *binding)) {
+        completion_probe_wait.reset();
+        completion_probe.reset();
+        return false;
+    }
+    return true;
+}
+
+auto RootTask::stage_b_operation() noexcept -> kernel::operation::Completion& {
+    KASSERT(completion_probe);
+    return completion_probe->completion;
+}
+
+void RootTask::stage_b_complete_operation() noexcept {
+    KASSERT(completion_probe);
+    completion_probe->complete_for_stage_b();
+}
+
+auto RootTask::stage_b_wait() noexcept -> kernel::operation::Wait& {
+    KASSERT(completion_probe_wait);
+    return *completion_probe_wait;
+}
+
+auto RootTask::stage_b_release_count() const noexcept -> usize {
+    return completion_probe ? completion_probe->release_count : 0;
+}
+
+void RootTask::finish_stage_b_operation() noexcept {
+    KASSERT(completion_probe && completion_probe_wait);
+    KASSERT(!completion_probe_wait->attached());
+    completion_probe_wait.reset();
+    completion_probe.reset();
 }
 #endif
 

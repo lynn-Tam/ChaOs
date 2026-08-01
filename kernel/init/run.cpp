@@ -2,6 +2,9 @@
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
 #include <init/root_task.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 #include <init/run.hpp>
 #include <diag/console.hpp>
 #include <boot/boot_info.hpp>
@@ -191,12 +194,20 @@ void run_tests(const kernel::boot::BootInfo& boot_info) noexcept {
 namespace kernel::init {
 
 #if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
+    || MYOS_CONCURRENCY_PROBE == 13
 auto run_concurrency_probe(
     kernel::CpuRegistry& cpus,
     u32 probe) noexcept -> bool {
     //Confirmatory experiment.
     // Exit condition: remove with the Stage B operation fault probes.
+#if MYOS_CONCURRENCY_PROBE == 13
+    if (probe == 13) {
+        return kernel_storage && root_task_storage
+            && stage_b::run(
+                *kernel_storage, cpus, *root_task_storage);
+    }
+#endif
     return root_task_storage
         && root_task_storage->run_concurrency_probe(cpus, probe);
 }

@@ -95,10 +95,31 @@ libk::Atomic<usize> probe_peer{max_cpu_count};
 libk::Atomic<u32> probe_phase{};
 libk::Atomic<u32> probe_errors{};
 libk::Atomic<u64> probe_key{};
-ObservationKey probe_fillers[ObservationShard::slot_count / 2]{};
+[[maybe_unused]] ObservationKey
+    probe_fillers[ObservationShard::slot_count / 2]{};
 constinit libk::ManualLifetime<sched::RemoteQueue> probe_remote_queue{};
 constinit libk::ManualLifetime<sched::RemoteRequest> probe_remote_request{};
-alignas(8) usize probe_remote_owner{};
+[[maybe_unused]] alignas(8) usize probe_remote_owner{};
+#endif
+
+#if MYOS_CONCURRENCY_PROBE == 13
+//Confirmatory experiment.
+// Exit condition: remove when the external fault harness can deny real
+// reservations at each reviewed Stage B production point.
+libk::Atomic<u32> stage_b_deny_kind{
+    static_cast<u32>(RecordKind::Count)};
+libk::Atomic<u64> stage_b_deny_identity{};
+libk::Atomic<bool> stage_b_deny_active{};
+
+[[nodiscard]] auto denies_stage_b_reserve(
+    RecordKind kind,
+    u64 subject_identity) noexcept -> bool {
+    return stage_b_deny_active.load<libk::MemoryOrder::Acquire>()
+        && stage_b_deny_kind.load<libk::MemoryOrder::Acquire>()
+            == static_cast<u32>(kind)
+        && stage_b_deny_identity.load<libk::MemoryOrder::Acquire>()
+            == subject_identity;
+}
 #endif
 
 #if MYOS_STAGE_F_PROBE
@@ -803,6 +824,11 @@ auto ObservationShard::reserve(
     u64 subject_generation,
     Expectation expectation,
     SourceSite site) noexcept -> ObservationLease {
+#if MYOS_CONCURRENCY_PROBE == 13
+    if (denies_stage_b_reserve(kind, subject_identity)) {
+        return {};
+    }
+#endif
     const usize available = static_cast<usize>(page_count_) * slots_per_page;
     const usize dedicated = page_count_ >= 2
         ? (static_cast<usize>(page_count_) / 2) * slots_per_page : 0;
@@ -2249,6 +2275,28 @@ auto reserve_on(
     return {};
 #endif
 }
+
+#if MYOS_CONCURRENCY_PROBE == 13
+void deny_reserves(
+    RecordKind kind,
+    u64 subject_identity) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the external Stage B fault harness once it
+    // can deny the same reviewed reservation scope without this hook.
+    stage_b_deny_identity.store<libk::MemoryOrder::Relaxed>(
+        subject_identity);
+    stage_b_deny_kind.store<libk::MemoryOrder::Release>(
+        static_cast<u32>(kind));
+    stage_b_deny_active.store<libk::MemoryOrder::Release>(true);
+}
+
+void clear_reserve_denial() noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the external Stage B fault harness once it
+    // can deny the same reviewed reservation scope without this hook.
+    stage_b_deny_active.store<libk::MemoryOrder::Release>(false);
+}
+#endif
 
 void record(
     FlightDomain domain,
@@ -3909,6 +3957,9 @@ auto stall_class_name(StallClass value) noexcept -> const char* {
 }
 
 #if MYOS_CONCURRENCY_PROBE
+#if MYOS_CONCURRENCY_PROBE == 13
+void run_probe(u32) noexcept {}
+#else
 void run_probe(u32 probe) noexcept {
     //Confirmatory experiment.
     // Exit condition: remove after an external kernel scenario runner can
@@ -4874,6 +4925,7 @@ void run_probe(u32 probe) noexcept {
             errors, registry->count());
     }
 }
+#endif
 #endif
 
 #if MYOS_CONCURRENCY_PROBE == 12

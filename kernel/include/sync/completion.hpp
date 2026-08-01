@@ -52,17 +52,22 @@ public:
         }
     }
 
-    void acknowledge() noexcept {
-        acknowledge([]() noexcept {});
+    [[nodiscard]] auto acknowledge() noexcept -> bool {
+        return acknowledge([]() noexcept {});
     }
 
     template<typename BeforeComplete>
-    void acknowledge(BeforeComplete&& before_complete) noexcept {
+    [[nodiscard]] auto acknowledge(BeforeComplete&& before_complete) noexcept
+        -> bool {
         KASSERT(initialized_);
-        const usize previous = pending_.fetch_sub<libk::MemoryOrder::Release>(1);
+        // Every acknowledgement publishes its before-complete work with
+        // Release.  The final RMW must acquire that release sequence before
+        // invoking the unique terminal owner; this is part of the generic
+        // countdown contract, not a diagnostics-only ordering.
+        const usize previous = pending_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
         KASSERT(previous != 0);
         if (previous != 1) {
-            return;
+            return false;
         }
 
         before_complete();
@@ -77,6 +82,7 @@ public:
             KASSERT(notifier);
             notifier();
         }
+        return true;
     }
 
 private:

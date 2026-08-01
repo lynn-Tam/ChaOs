@@ -11,6 +11,9 @@
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 
 namespace kernel::mm {
 
@@ -69,6 +72,9 @@ void ShootdownTicket::initialize(
     kernel::CpuSet targets) noexcept {
     KASSERT(!initialized());
     KASSERT(epoch.raw != 0);
+    // Ticket storage can be reused after the preceding terminal exchange.
+    // Start each optional diagnostic generation from an explicit empty key.
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
     for (auto& word : acknowledgements_) {
         word.store<libk::MemoryOrder::Relaxed>(0);
     }
@@ -78,12 +84,13 @@ void ShootdownTicket::initialize(
     targets_ = targets;
     completion_.initialize(targets.size());
     owner_ = &owner;
-    observation_ = diag::concurrency::ObservationLease::reserve(
+    auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Shootdown,
         reinterpret_cast<u64>(this),
         epoch.raw,
         diag::concurrency::Expectation::InternalFinite);
-    observation_.transition(
+    const auto key = observation.key();
+    observation.transition(
         shootdown_published,
         epoch.raw,
         diag::concurrency::WaitKind::ShootdownAck,
@@ -95,7 +102,7 @@ void ShootdownTicket::initialize(
                   });
                   return result;
               }()
-            : diag::concurrency::NodeRef::cpu_set(observation_.key()));
+            : diag::concurrency::NodeRef::cpu_set(key));
     for (usize index = 0; index < kernel::CpuSet::word_count; ++index) {
         // CpuSet is intentionally opaque; build the witness one bit at a
         // time so the diagnostic copy remains independent of its lock-free
@@ -106,12 +113,16 @@ void ShootdownTicket::initialize(
                 word |= u64{1} << (cpu.raw % kernel::CpuSet::word_bits);
             }
         });
-        observation_.detail(index, word);
+        observation.detail(index, word);
     }
-    observation_.watch(!targets.empty());
+    observation.watch(!targets.empty());
     if (!targets.empty()) {
+        observation_key_.store<libk::MemoryOrder::Release>(
+            observation.detach_key().raw);
         static_cast<void>(owner.pending_tickets_.fetch_add<
             libk::MemoryOrder::Relaxed>(1));
+    } else {
+        observation.finish(shootdown_complete, epoch.raw);
     }
 }
 
@@ -120,24 +131,40 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
     KASSERT(targets_.contains(cpu));
     const usize word = cpu.raw / kernel::CpuSet::word_bits;
     const u64 bit = u64{1} << (cpu.raw % kernel::CpuSet::word_bits);
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
     const u64 previous = acknowledgements_[word].fetch_or<
         libk::MemoryOrder::AcqRel>(bit);
     if ((previous & bit) == 0) {
-        observation_.detail_and(word, ~bit);
-        observation_.advance();
-        completion_.acknowledge([&]() noexcept {
+        observation.detail_and(word, ~bit);
+        observation.advance();
+        // Publish this CPU's non-final diagnostic state before joining the
+        // canonical countdown.  The final RMW acquires prior acknowledgements
+        // and its callback alone exchanges/finishes the terminal key.
+        observation.phase(
+            shootdown_waiting,
+            epoch_.raw + acknowledgements_[word].load<
+                libk::MemoryOrder::Acquire>());
+        static_cast<void>(completion_.acknowledge([&]() noexcept {
+#if MYOS_CONCURRENCY_PROBE == 13
+            //Confirmatory experiment.
+            // Exit condition: remove when a remote-shootdown harness can
+            // pause the final target acknowledgement at this callback.
+            static_cast<void>(init::stage_b::pause(
+                init::stage_b::Gate::ShootdownFinal,
+                reinterpret_cast<u64>(this)));
+#endif
             const usize owner_pending = owner_->pending_tickets_.fetch_sub<
                 libk::MemoryOrder::Release>(1);
             KASSERT(owner_pending != 0);
-        });
-        if (completion_.complete()) {
-            observation_.finish(shootdown_complete, epoch_.raw);
-        } else {
-            observation_.phase(
-                shootdown_waiting,
-                epoch_.raw + acknowledgements_[word].load<
-                    libk::MemoryOrder::Acquire>());
-        }
+            const auto terminal = diag::concurrency::ObservationKey{
+                observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+            if (terminal) {
+                auto finished =
+                    diag::concurrency::ObservationLease::borrow(terminal);
+                finished.finish(shootdown_complete, epoch_.raw);
+            }
+        }));
     }
 }
 

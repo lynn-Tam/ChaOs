@@ -219,7 +219,8 @@ public:
     }
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey {
-        return observation_.key();
+        return diag::concurrency::ObservationKey{
+            observation_key_.load<libk::MemoryOrder::Acquire>()};
     }
     [[nodiscard]] auto arm() noexcept -> bool { return completion_.arm(); }
 
@@ -240,7 +241,10 @@ private:
         u64 slot) noexcept;
 
     kernel::sync::Completion completion_;
-    diag::concurrency::ObservationLease observation_{};
+    // Revoke is acknowledged by several CPUs and the reclaimer.  A stable
+    // key lets each writer borrow independently; the final countdown owner
+    // exchanges it before publishing terminal diagnostic state.
+    libk::Atomic<u64> observation_key_{};
 };
 
 // Capability-owned operation used only for a blocking invocation. GrantGraph

@@ -29,6 +29,9 @@ VSpaceExecutor::~VSpaceExecutor() noexcept {
 }
 
 void VSpaceExecutor::submit(VSpace& space) noexcept {
+    const auto key = diag::concurrency::ObservationKey{
+        space.observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
     Notifier notifier{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -41,16 +44,16 @@ void VSpaceExecutor::submit(VSpace& space) noexcept {
         queue_.push_back(space);
         notifier = notifier_;
     }
-    if (space.observation_ready_.load<libk::MemoryOrder::Acquire>()) {
-        space.observation_.attempt(
+    if (observation) {
+        observation.attempt(
             static_cast<u32>(VSpaceServiceState::Waiting),
             diag::concurrency::WaitKind::VSpaceWork,
             {});
     }
     if (notifier) {
         const auto service = notifier();
-        if (space.observation_ready_.load<libk::MemoryOrder::Acquire>()) {
-            space.observation_.attempt(
+        if (observation) {
+            observation.attempt(
                 static_cast<u32>(VSpaceServiceState::Waiting),
                 diag::concurrency::WaitKind::VSpaceWork,
                 diag::concurrency::NodeRef::observation(service));

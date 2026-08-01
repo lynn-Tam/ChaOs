@@ -18,6 +18,9 @@
 #include <resource/pool.hpp>
 #include <thread/thread.hpp>
 #include <sync/irq_lock_guard.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 
 namespace kernel::cap {
 
@@ -390,32 +393,58 @@ void GrantRef::reset() noexcept {
 }
 
 void GrantRevoke::initialize(usize pending) noexcept {
+    // Revoke objects are caller-owned and may be re-emplaced over a retired
+    // generation. Never carry the previous diagnostic key into this one.
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
     completion_.initialize(pending);
-    observation_ = diag::concurrency::ObservationLease::reserve(
+    auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::GrantRevoke,
         reinterpret_cast<u64>(this),
         pending == 0 ? 1 : pending,
         diag::concurrency::Expectation::InternalFinite);
-    observation_.transition(
+    observation.transition(
         grant_published,
         pending,
         diag::concurrency::WaitKind::GrantWork,
         diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)));
-    observation_.detail(0, pending);
-    observation_.watch(pending != 0);
+    observation.detail(0, pending);
+    observation.watch(pending != 0);
+    if (pending != 0) {
+        observation_key_.store<libk::MemoryOrder::Release>(
+            observation.detach_key().raw);
+    } else {
+        observation.finish(grant_complete);
+    }
 }
 
 void GrantRevoke::acknowledge() noexcept {
-    completion_.acknowledge();
-    observation_.advance();
-    if (completion_.complete()) {
-        observation_.finish(grant_complete);
-    }
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.advance();
+    static_cast<void>(completion_.acknowledge([&]() noexcept {
+#if MYOS_CONCURRENCY_PROBE == 13
+        //Confirmatory experiment.
+        // Exit condition: remove when the revoke service harness can pause
+        // the final node acknowledgement at this callback.
+        static_cast<void>(init::stage_b::pause(
+            init::stage_b::Gate::GrantFinal,
+            reinterpret_cast<u64>(this)));
+#endif
+        const auto terminal = diag::concurrency::ObservationKey{
+            observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+        if (terminal) {
+            auto finished =
+                diag::concurrency::ObservationLease::borrow(terminal);
+            finished.finish(grant_complete);
+        }
+    }));
 }
 
 void GrantRevoke::service(
     diag::concurrency::ObservationKey key) noexcept {
-    observation_.attempt(
+    const auto own_key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(own_key);
+    observation.attempt(
         grant_published,
         diag::concurrency::WaitKind::GrantWork,
         diag::concurrency::NodeRef::observation(key));
@@ -426,7 +455,9 @@ void GrantRevoke::progress(
     u64 semantic_stamp,
     diag::concurrency::NodeRef driver,
     diag::concurrency::NodeRef blocker) noexcept {
-    observation_.transition(
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.transition(
         phase,
         semantic_stamp,
         diag::concurrency::WaitKind::GrantOperations,
@@ -439,10 +470,12 @@ void GrantRevoke::witness(
     usize attachments,
     bool retained,
     u64 slot) noexcept {
-    observation_.detail(0, operations);
-    observation_.detail(1, attachments);
-    observation_.detail(2, retained ? 1 : 0);
-    observation_.detail(3, slot);
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.detail(0, operations);
+    observation.detail(1, attachments);
+    observation.detail(2, retained ? 1 : 0);
+    observation.detail(3, slot);
 }
 
 GrantGraph::~GrantGraph() noexcept {

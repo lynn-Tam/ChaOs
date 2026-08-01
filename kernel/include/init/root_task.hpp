@@ -19,7 +19,12 @@ class RootTask;
 
 namespace kernel {
 class KernelState;
+class CpuRegistry;
 struct CpuRuntime;
+namespace operation {
+class Completion;
+class Wait;
+}
 }
 
 namespace kernel::init {
@@ -78,6 +83,17 @@ public:
     [[nodiscard]] auto run_concurrency_probe(
         kernel::CpuRegistry& cpus,
         u32 probe) noexcept -> bool;
+#if MYOS_CONCURRENCY_PROBE == 13
+    [[nodiscard]] auto prepare_stage_b_operation(
+        kernel::CpuRegistry& cpus,
+        bool deny_observation = false) noexcept -> bool;
+    [[nodiscard]] auto stage_b_operation() noexcept
+        -> kernel::operation::Completion&;
+    [[nodiscard]] auto stage_b_wait() noexcept -> kernel::operation::Wait&;
+    void stage_b_complete_operation() noexcept;
+    [[nodiscard]] auto stage_b_release_count() const noexcept -> usize;
+    void finish_stage_b_operation() noexcept;
+#endif
 #endif
 
 private:

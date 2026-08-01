@@ -1044,6 +1044,13 @@ struct CpuDiagnosticsCore final {
     u64 subject_generation = 0,
     Expectation expectation = Expectation::InternalFinite,
     SourceSite site = SourceSite::current()) noexcept -> ObservationLease;
+#if MYOS_CONCURRENCY_PROBE == 13
+//Confirmatory experiment.
+// Exit condition: remove when the external fault harness can deny real
+// reservations at each reviewed Stage B production point.
+void deny_reserves(RecordKind kind, u64 subject_identity) noexcept;
+void clear_reserve_denial() noexcept;
+#endif
 
 void record(
     FlightDomain domain,

@@ -7,6 +7,9 @@
 #include <sched/dispatcher.hpp>
 #include <execution/vproc.hpp>
 #include <operation/wait.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 
 namespace kernel::operation {
 namespace {
@@ -37,6 +40,10 @@ Completion::~Completion() noexcept {
 
 void Completion::attach(Wait& wait, sched::Binding& binding) noexcept {
     KASSERT(!attached());
+    // Re-emplacement of the owning operation may reuse storage whose previous
+    // diagnostic generation has already retired. Clear the publication slot
+    // before attempting this generation's optional reservation.
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
     // Wait is the sole caller and publishes its completion_ edge while
     // holding Wait::lock_. Do not call back into Wait here: attached() takes
     // that same non-recursive lock and would self-deadlock the admission path.
@@ -57,14 +64,16 @@ void Completion::attach(Wait& wait, sched::Binding& binding) noexcept {
         policy_.grace =
             diag::concurrency::default_grace(policy_.expectation);
     }
-    observation_ = diag::concurrency::ObservationLease::reserve(
+    auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         1,
         policy_.expectation);
-    observation_.set_policy(policy_);
-    observation_.publish(
+    observation.set_policy(policy_);
+    observation.publish(
         diag::concurrency::OperationPhase::Attached, attached_driver);
+    observation_key_.store<libk::MemoryOrder::Release>(
+        observation.detach_key().raw);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -74,6 +83,7 @@ void Completion::attach(
     operation::Key key) noexcept {
     KASSERT(!attached() && key.valid());
     KASSERT(vproc.binding() != nullptr);
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
     sink_.template emplace<VprocSink>(VprocSink{&vproc, &cpus, key});
     const auto driver = policy_.driver
         ? policy_.driver
@@ -87,14 +97,16 @@ void Completion::attach(
         policy_.grace =
             diag::concurrency::default_grace(policy_.expectation);
     }
-    observation_ = diag::concurrency::ObservationLease::reserve(
+    auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::Operation,
         reinterpret_cast<u64>(owner_),
         key.generation(),
         policy_.expectation);
-    observation_.set_policy(policy_);
-    observation_.publish(
+    observation.set_policy(policy_);
+    observation.publish(
         diag::concurrency::OperationPhase::Attached, attached_driver);
+    observation_key_.store<libk::MemoryOrder::Release>(
+        observation.detach_key().raw);
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
 }
 
@@ -109,32 +121,45 @@ void Completion::signal() noexcept {
         return;
     }
     const auto cpu = current_cpu_node();
-    observation_.publish(diag::concurrency::OperationPhase::Claimed, cpu);
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.publish(diag::concurrency::OperationPhase::Claimed, cpu);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationClaimed,
         cpu.identity,
-        observation_.key().raw);
-    // Claim the delivery edge before touching the operation owner. A cancel
-    // may otherwise detach and reclaim the owner after publication was
-    // decided but before this producer reaches signal().
+        key.raw);
+    // The delivery claim keeps the operation owner and sink live while this
+    // producer prepares Ready.  A consumer may clear the sink and release the
+    // owner immediately after Ready, so every sink-derived diagnostic value
+    // must be captured before that publication.
     KASSERT(complete());
     if (auto* const blocking = libk::get_if<BlockingSink>(&sink_)) {
         KASSERT(blocking->wait != nullptr);
-        const auto delivery = blocking->wait->wake();
-        observation_.publish(
-            diag::concurrency::OperationPhase::WakeIssued,
-            delivery
-                ? diag::concurrency::NodeRef::observation(delivery)
-                : cpu);
-        // Delivery is the canonical Completion state.  Only after this
-        // release may the diagnostic projection claim that readiness was
-        // published.
-        delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
         const auto driver = blocking->binding != nullptr
             ? blocking->binding->actor_ref()
             : diag::concurrency::NodeRef{};
-        observation_.publish(
+        const auto delivery = blocking->wait->wake();
+        const auto delivery_node = delivery
+            ? diag::concurrency::NodeRef::observation(delivery)
+            : cpu;
+        observation.publish(
+            diag::concurrency::OperationPhase::WakeIssued,
+            delivery_node);
+        // Delivery is the canonical Completion state.  Only after this
+        // release may the diagnostic projection claim that readiness was
+        // published.  No sink, binding or owner-derived value is read after
+        // this store: Wait::finish/cancel may release them concurrently.
+        delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
+#if MYOS_CONCURRENCY_PROBE == 13
+        //Confirmatory experiment.
+        // Exit condition: remove when an external scheduler/fault harness can
+        // pause the producer after canonical Ready publication.
+        static_cast<void>(init::stage_b::pause(
+            init::stage_b::Gate::CompletionReady,
+            reinterpret_cast<u64>(this)));
+#endif
+        observation.publish(
             diag::concurrency::OperationPhase::ReadyPublished,
             driver,
             delivery
@@ -144,7 +169,7 @@ void Completion::signal() noexcept {
             diag::concurrency::FlightDomain::Operation,
             diag::concurrency::FlightEvent::OperationReady,
             cpu.identity,
-            observation_.key().raw);
+            key.raw);
         return;
     }
     const VprocSink target = *libk::get_if<VprocSink>(&sink_);
@@ -153,19 +178,21 @@ void Completion::signal() noexcept {
     target.vproc->publish_operation(target.key, result, *target.cpus);
     sink_.template emplace<libk::monostate>();
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
-    const u64 observation = observation_.key().raw;
+    const auto terminal = diag::concurrency::ObservationKey{
+        observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
         cpu.identity,
-        observation);
+        terminal.raw);
     ops_->release(owner_);
-    observation_.finish(operation_finished, static_cast<u64>(result.status));
+    auto finished = diag::concurrency::ObservationLease::borrow(terminal);
+    finished.finish(operation_finished, static_cast<u64>(result.status));
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationFinish,
         cpu.identity,
-        observation);
+        terminal.raw);
 }
 
 #if MYOS_CONCURRENCY_PROBE
@@ -180,22 +207,26 @@ auto Completion::claim_for_probe() noexcept -> bool {
         return false;
     }
     const auto cpu = current_cpu_node();
-    observation_.publish(diag::concurrency::OperationPhase::Claimed, cpu);
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.publish(diag::concurrency::OperationPhase::Claimed, cpu);
     return true;
 }
 #endif
 
 void Completion::finish(arch::TrapContext& trap) noexcept {
     KASSERT(complete());
+    const auto key = observation_key();
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
     // Blocking publication deliberately wakes the scheduler while retaining
     // Claimed: the producer must keep the operation alive until it has stopped
     // touching the Wait and its Binding.  The resumed owner can observe the
     // Wait's ready bit in that narrow interval, so wait for the producer's
     // final release publication before claiming the result.
     diag::concurrency::CpuWaitScope wait_scope{
-        observation_,
+        observation,
         diag::concurrency::WaitKind::CompletionPublication,
-        diag::concurrency::NodeRef::observation(observation_.key()),
+        diag::concurrency::NodeRef::observation(key),
         current_cpu_node()};
     Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
     while (expected == Delivery::Claimed) {
@@ -210,38 +241,44 @@ void Completion::finish(arch::TrapContext& trap) noexcept {
     detach();
     if (ops_->resume != nullptr) {
         ops_->resume(owner_, trap);
-        const u64 observation = observation_.key().raw;
+        const auto terminal = diag::concurrency::ObservationKey{
+            observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+        const u64 cpu = current_cpu_node().identity;
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Operation,
             diag::concurrency::FlightEvent::OperationRelease,
-            current_cpu_node().identity,
-            observation);
+            cpu,
+            terminal.raw);
         ops_->release(owner_);
-        observation_.finish(operation_finished);
+        auto finished = diag::concurrency::ObservationLease::borrow(terminal);
+        finished.finish(operation_finished);
         diag::concurrency::record(
             diag::concurrency::FlightDomain::Operation,
             diag::concurrency::FlightEvent::OperationFinish,
-            current_cpu_node().identity,
-            observation);
+            cpu,
+            terminal.raw);
         return;
     }
     const Result result = ops_->read(owner_);
     trap.set_result(
         0, static_cast<usize>(static_cast<isize>(result.status)));
     trap.set_result(1, result.value);
-    const u64 observation = observation_.key().raw;
+    const auto terminal = diag::concurrency::ObservationKey{
+        observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+    const u64 cpu = current_cpu_node().identity;
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
-        current_cpu_node().identity,
-        observation);
+        cpu,
+        terminal.raw);
     ops_->release(owner_);
-    observation_.finish(operation_finished, static_cast<u64>(result.status));
+    auto finished = diag::concurrency::ObservationLease::borrow(terminal);
+    finished.finish(operation_finished, static_cast<u64>(result.status));
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationFinish,
-        current_cpu_node().identity,
-        observation);
+        cpu,
+        terminal.raw);
 }
 
 auto Completion::cancel() noexcept -> bool {
@@ -273,19 +310,22 @@ auto Completion::cancel() noexcept -> bool {
     }
     sink_.template emplace<libk::monostate>();
     delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
-    const u64 observation = observation_.key().raw;
+    const auto terminal = diag::concurrency::ObservationKey{
+        observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+    const u64 cpu = current_cpu_node().identity;
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
-        current_cpu_node().identity,
-        observation);
+        cpu,
+        terminal.raw);
     ops_->release(owner_);
-    observation_.finish(operation_cancelled);
+    auto finished = diag::concurrency::ObservationLease::borrow(terminal);
+    finished.finish(operation_cancelled);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationCancel,
-        current_cpu_node().identity,
-        observation);
+        cpu,
+        terminal.raw);
     return true;
 }
 

@@ -5,6 +5,9 @@
 #include <cpu/cpu_registry.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 
 namespace kernel::mm {
 
@@ -124,11 +127,14 @@ auto VSpace::start_invalidation(
 
 auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
     ensure_observation();
-    if (observation_ready_.load<libk::MemoryOrder::Acquire>()) {
+    const auto key = diag::concurrency::ObservationKey{
+        observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    if (observation) {
         // The phase is intentionally coarse here.  pending_kind_ belongs to
         // the VSpace state guarded below; publishing it needs the same
         // snapshot as the other service fields.
-        observation_.attempt(
+        observation.attempt(
             0,
             diag::concurrency::WaitKind::VSpaceWork,
             diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this)));
@@ -270,9 +276,10 @@ void VSpace::translation_ready() noexcept {
 void VSpace::schedule_work() noexcept {
     KASSERT(work_ != nullptr);
     ensure_observation();
-    if (observation_ready_.load<libk::MemoryOrder::Acquire>()) {
-        observation_.touch();
-    }
+    const auto key = diag::concurrency::ObservationKey{
+        observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    observation.touch();
     work_->submit(*this);
 }
 
@@ -283,6 +290,11 @@ void VSpace::ensure_observation() noexcept {
             libk::MemoryOrder::Acquire>(expected, true)) {
         return;
     }
+    // VSpace storage can be recycled after a previous terminal generation.
+    // The reservation gate is local ownership; the published key is reset
+    // independently before this attempt so capacity loss cannot expose stale
+    // identity.
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
     auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::VSpaceWork,
         reinterpret_cast<u64>(this),
@@ -293,16 +305,19 @@ void VSpace::ensure_observation() noexcept {
         // not become a permanent one-shot decision; a later schedule after a
         // slot is released may still establish the observation.
         observation_reserved_.store<libk::MemoryOrder::Release>(false);
+        observation_key_.store<libk::MemoryOrder::Release>(0);
         return;
     }
-    observation_ = libk::move(observation);
-    observation_.watch(true);
-    observation_ready_.store<libk::MemoryOrder::Release>(true);
+    observation.watch(true);
+    observation_key_.store<libk::MemoryOrder::Release>(
+        observation.detach_key().raw);
 }
 
 void VSpace::publish_observation(VSpaceServiceState result) noexcept {
-    if (!observation_ready_.load<libk::MemoryOrder::Acquire>()
-        || !observation_) {
+    const auto key = diag::concurrency::ObservationKey{
+        observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    if (!observation) {
         return;
     }
     VSpaceState state{};
@@ -339,7 +354,7 @@ void VSpace::publish_observation(VSpaceServiceState result) noexcept {
     stamp = stamp * 17 + authorities;
     stamp = stamp * 17 + active;
     stamp = stamp * 17 + retries;
-    observation_.transition(
+    observation.transition(
         static_cast<u32>(result),
         stamp,
         wait,
@@ -348,14 +363,28 @@ void VSpace::publish_observation(VSpaceServiceState result) noexcept {
             ? diag::concurrency::NodeRef{}
             : diag::concurrency::NodeRef::external(
                   reinterpret_cast<u64>(this), active));
-    observation_.detail(0, active);
-    observation_.detail(1, retries);
-    observation_.detail(2, static_cast<u64>(pending));
-    observation_.detail(3, claim || invalidations || authorities);
+    observation.detail(0, active);
+    observation.detail(1, retries);
+    observation.detail(2, static_cast<u64>(pending));
+    observation.detail(3, claim || invalidations || authorities);
     if (state == VSpaceState::Quiescent) {
-        observation_.finish(static_cast<u32>(VSpaceServiceState::Settled));
+#if MYOS_CONCURRENCY_PROBE == 13
+        //Confirmatory experiment.
+        // Exit condition: remove when a VSpace service harness can pause the
+        // Quiescent publication before diagnostic terminal exchange.
+        static_cast<void>(init::stage_b::pause(
+            init::stage_b::Gate::VSpaceQuiescent,
+            reinterpret_cast<u64>(this)));
+#endif
+        const auto terminal = diag::concurrency::ObservationKey{
+            observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+        if (terminal) {
+            auto finished =
+                diag::concurrency::ObservationLease::borrow(terminal);
+            finished.finish(static_cast<u32>(VSpaceServiceState::Settled));
+        }
     } else {
-        observation_.watch(true);
+        observation.watch(true);
     }
 }
 

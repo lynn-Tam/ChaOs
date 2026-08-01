@@ -7,6 +7,9 @@
 #include <libk/utility.hpp>
 #include <object/resource_pool.hpp>
 #include <sync/irq_lock_guard.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 
 namespace kernel::resource {
 namespace {
@@ -434,13 +437,18 @@ auto ResourcePool::close() noexcept -> PoolState {
             started = true;
         }
     }
-    if (started && !close_observation_) {
-        close_observation_ = diag::concurrency::ObservationLease::reserve(
+    if (started) {
+        // A close is one terminal generation even when the object storage is
+        // reused by the object store. Publish from an explicit empty key.
+        close_observation_key_.store<libk::MemoryOrder::Relaxed>(0);
+        auto observation = diag::concurrency::ObservationLease::reserve(
             diag::concurrency::RecordKind::ResourceClose,
             reinterpret_cast<u64>(this),
             1,
             diag::concurrency::Expectation::InternalFinite);
-        close_observation_.watch(true);
+        observation.watch(true);
+        close_observation_key_.store<libk::MemoryOrder::Release>(
+            observation.detach_key().raw);
     }
     service();
     return state();
@@ -695,11 +703,32 @@ void ResourcePool::service() noexcept {
         kernel::sync::IrqLockGuard guard{lock_};
         if (servicing_) {
             service_pending_ = true;
-            close_observation_.touch();
+#if MYOS_CONCURRENCY_PROBE == 13
+            //Confirmatory experiment.
+            // Exit condition: remove when an external pool-service harness
+            // can force the reentrant service_pending_ path.
+            init::stage_b::mark(
+                init::stage_b::Gate::PoolReentrant,
+                reinterpret_cast<u64>(this));
+#endif
+            const auto key = diag::concurrency::ObservationKey{
+                close_observation_key_.load<libk::MemoryOrder::Acquire>()};
+            auto observation =
+                diag::concurrency::ObservationLease::borrow(key);
+            observation.touch();
             return;
         }
         servicing_ = true;
     }
+
+#if MYOS_CONCURRENCY_PROBE == 13
+    //Confirmatory experiment.
+    // Exit condition: remove when the external harness can pause the first
+    // service invocation before a reentrant caller enters.
+    static_cast<void>(init::stage_b::pause(
+        init::stage_b::Gate::PoolFirstService,
+        reinterpret_cast<u64>(this)));
+#endif
 
     for (;;) {
         Allocation* revoke{};
@@ -898,7 +927,10 @@ void ResourcePool::publish_observation() noexcept {
             break;
         }
     }
-    if (!close_observation_) {
+    const auto key = diag::concurrency::ObservationKey{
+        close_observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    if (!observation) {
         return;
     }
     using Wait = diag::concurrency::WaitKind;
@@ -923,7 +955,7 @@ void ResourcePool::publish_observation() noexcept {
     stamp = stamp * 131 + constructions;
     stamp = stamp * 131 + roots;
     stamp = stamp * 131 + sponsorships;
-    close_observation_.transition(
+    observation.transition(
         static_cast<u32>(state),
         stamp,
         wait,
@@ -935,13 +967,19 @@ void ResourcePool::publish_observation() noexcept {
                 : diag::concurrency::NodeRef::external(
                       reinterpret_cast<u64>(blocker),
                       blocker->root_.generation));
-    close_observation_.detail(0, reservations);
-    close_observation_.detail(1, constructions);
-    close_observation_.detail(2, roots);
-    close_observation_.detail(3, sponsorships);
-    close_observation_.watch(state != PoolState::Closed);
+    observation.detail(0, reservations);
+    observation.detail(1, constructions);
+    observation.detail(2, roots);
+    observation.detail(3, sponsorships);
+    observation.watch(state != PoolState::Closed);
     if (state == PoolState::Closed) {
-        close_observation_.finish(static_cast<u32>(state));
+        const auto terminal = diag::concurrency::ObservationKey{
+            close_observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+        if (terminal) {
+            auto finished =
+                diag::concurrency::ObservationLease::borrow(terminal);
+            finished.finish(static_cast<u32>(state));
+        }
     }
 }
 

@@ -12,6 +12,9 @@
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <init/run.hpp>
+#if MYOS_CONCURRENCY_PROBE == 13
+#include <init/stage_b_probe.hpp>
+#endif
 #include <libk/utility.hpp>
 #include <mm/direct_map.hpp>
 #include <arch/cpu.hpp>
@@ -145,13 +148,21 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     //Confirmatory experiment.
     // Exit condition: remove the in-kernel rendezvous when an external
     // scheduler/fault harness can force the same slot interleavings.
+#if MYOS_CONCURRENCY_PROBE == 13
+    if (runtime.local.descriptor->logical_id()
+        != runtime.owner_registry->boot_id()) {
+        init::stage_b::worker();
+    }
+#else
     diag::concurrency::run_probe(MYOS_CONCURRENCY_PROBE);
+#endif
 #endif
 
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
 #if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
+    || MYOS_CONCURRENCY_PROBE == 13
         //Confirmatory experiment.
         // Exit condition: remove with the Stage B/Stage G operation and
         // scheduler fault probes.
@@ -164,7 +175,8 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
         }
         diag::console::print<"runtime: entered\n">();
 #if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11)
+    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
+    || MYOS_CONCURRENCY_PROBE == 13
         //Confirmatory experiment.
         // Exit condition: remove with the Stage B/Stage G operation and
         // scheduler fault probes.

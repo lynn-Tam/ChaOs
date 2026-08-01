@@ -48,6 +48,15 @@ public:
         const kernel::object::ObjectRef& self,
         RefundNotifier notifier) noexcept -> bool;
     [[nodiscard]] auto can_retire() const noexcept -> bool;
+#if MYOS_CONCURRENCY_PROBE == 13
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage B pool ownership rendezvous.
+    [[nodiscard]] auto close_observation_key_for_probe() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return diag::concurrency::ObservationKey{
+            close_observation_key_.load<libk::MemoryOrder::Acquire>()};
+    }
+#endif
 
 private:
     friend class Reservation;
@@ -99,7 +108,10 @@ private:
     bool service_pending_{};
     Allocation* parent_{};
     bool parent_notified_{};
-    diag::concurrency::ObservationLease close_observation_{};
+    // Closing service invocations publish one stable diagnostic generation.
+    // Writers borrow it locally; whichever invocation observes canonical
+    // Closed exchanges the key and retires the record exactly once.
+    libk::Atomic<u64> close_observation_key_{};
 };
 
 } // namespace kernel::resource

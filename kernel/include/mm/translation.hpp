@@ -88,7 +88,8 @@ public:
     [[nodiscard]] auto acknowledged(kernel::CpuId cpu) const noexcept -> bool;
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey {
-        return observation_.key();
+        return diag::concurrency::ObservationKey{
+            observation_key_.load<libk::MemoryOrder::Acquire>()};
     }
 
 private:
@@ -116,7 +117,10 @@ private:
     kernel::CpuSet targets_{};
     libk::Atomic<u64> acknowledgements_[kernel::CpuSet::word_count]{};
     kernel::sync::Completion completion_;
-    diag::concurrency::ObservationLease observation_{};
+    // The ticket is shared by target CPUs.  Publish only an immutable
+    // generation key; each acknowledgement borrows it locally and the final
+    // acknowledgement exchanges it before completing the diagnostic record.
+    libk::Atomic<u64> observation_key_{};
 };
 
 // Detached hardware resources remain owned here until the associated ticket

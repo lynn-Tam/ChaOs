@@ -254,6 +254,21 @@ public:
     [[nodiscard]] auto pending() const noexcept -> bool;
 
     void retire(object::ObjectCleanup&& cleanup) noexcept;
+#if MYOS_CONCURRENCY_PROBE == 13
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage B VSpace ownership rendezvous.
+    [[nodiscard]] auto enter_cpu_for_probe(kernel::CpuId cpu) noexcept -> bool {
+        static_cast<void>(coherence_.enter(cpu));
+        return true;
+    }
+    void leave_cpu_for_probe(kernel::CpuId cpu) noexcept { coherence_.leave(cpu); }
+    void schedule_for_probe() noexcept { schedule_work(); }
+    [[nodiscard]] auto observation_key_for_probe() const noexcept
+        -> diag::concurrency::ObservationKey {
+        return diag::concurrency::ObservationKey{
+            observation_key_.load<libk::MemoryOrder::Acquire>()};
+    }
+#endif
 
 private:
     friend class VSpaceExecutor;
@@ -441,15 +456,16 @@ private:
     libk::ManualLifetime<object::ObjectCleanup> cleanup_{};
     libk::IntrusiveListHook work_hook_{};
     libk::Atomic<bool> work_open_{false};
+    // Reservation is a narrow gate for slot allocation.  Once installed,
+    // writers share only this immutable key and borrow it per invocation.
     libk::Atomic<bool> observation_reserved_{false};
-    libk::Atomic<bool> observation_ready_{false};
+    libk::Atomic<u64> observation_key_{};
     VSpaceState state_{VSpaceState::Building};
     usize bindings_{};
     usize transport_retries_{};
     bool service_waiting_on_claim_{};
     kernel::resource::Sponsorship* sponsor_{};
     kernel::resource::Charge table_charge_{};
-    diag::concurrency::ObservationLease observation_{};
 };
 
 } // namespace kernel::mm
