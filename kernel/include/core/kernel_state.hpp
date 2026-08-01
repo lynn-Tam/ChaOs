@@ -110,9 +110,7 @@ private:
         -> diag::concurrency::ObservationKey;
     [[nodiscard]] auto retain_reclaimer_work() noexcept
         -> diag::concurrency::ObservationKey;
-    [[nodiscard]] auto close_reclaimer_work(
-        diag::concurrency::ObservationKey work,
-        u64 admitted) noexcept -> bool;
+    [[nodiscard]] auto close_reclaimer_work(u64 admitted) noexcept -> bool;
     void release_scheduler_objects() noexcept;
 
     libk::ManualLifetime<kernel::mm::DirectMap> direct_map_{};
@@ -128,10 +126,11 @@ private:
     kernel::object::ObjectStore::ThreadHold reclaimer_thread_{};
     kernel::object::ObjectStore::ResourceHold root_pool_{};
     diag::concurrency::ObservationLease reclaimer_observation_{};
-    // Zero is idle, one is closing, two records a concurrent reopen request,
-    // and every other value is the detached ServiceWork observation key.
-    libk::Atomic<u64> reclaimer_work_{};
-    libk::Atomic<u64> reclaimer_work_generation_{};
+    // Diagnostic service identity only. Canonical readiness is owned by the
+    // enqueue epoch and the reclaimer Binding's retained wake credit. The key
+    // never participates in close, reopen, retry or blocking decisions.
+    libk::Atomic<u64> reclaimer_observation_key_{};
+    libk::Atomic<u64> reclaimer_observation_generation_{};
     libk::Atomic<u64> reclaimer_enqueues_{};
 };
 

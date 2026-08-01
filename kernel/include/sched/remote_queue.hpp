@@ -28,8 +28,6 @@ enum class RemoteCancel : u8 {
 enum class RemotePost : u8 {
     Inserted,
     Coalesced,
-    CauseAttached,
-    CauseConflict,
 };
 
 struct RemotePostResult final {
@@ -69,29 +67,46 @@ public:
     [[nodiscard]] auto owner() const noexcept -> void* {
         return reinterpret_cast<void*>(owner_kind_ & ~kind_mask);
     }
-    // A diagnostic projection of the queue-owned pending bit.  Queue
-    // mutation remains serialized by RemoteQueue; this read is intentionally
-    // relaxed and may lag by one publication.
+    // The low bit is the canonical pending state and the upper bits retain
+    // the request generation across terminal completion.  Queue mutation is
+    // serialized by RemoteQueue; the atomic read also lets destruction assert
+    // that no consumer still owns the request.
     [[nodiscard]] auto pending() const noexcept -> bool {
-        return pending_delivery_.load<libk::MemoryOrder::Acquire>() != 0;
+        return (state_.load<libk::MemoryOrder::Acquire>() & 1U) != 0;
     }
     [[nodiscard]] auto generation() const noexcept -> u64;
-    [[nodiscard]] auto cause() const noexcept
-        -> diag::concurrency::ObservationKey;
     [[nodiscard]] auto delivery() const noexcept
+        -> diag::concurrency::ObservationKey;
+    // Best-effort diagnostic projection of the single cause recorded in the
+    // delivery observation. The returned key is never a queue or scheduler
+    // token; callers capture delivery() once while pending and may pass this
+    // value only to another diagnostic publication.
+    [[nodiscard]] auto diagnostic_cause(
+        diag::concurrency::ObservationKey delivery) const noexcept
         -> diag::concurrency::ObservationKey;
 
 private:
     friend class RemoteQueue;
 
+    // Retain only the first concrete cause in the optional delivery
+    // projection. Coalesced causes remain visible in flight records but must
+    // not rewrite the provenance of the retained delivery edge.
+    void retain_diagnostic_cause(
+        diag::concurrency::ObservationKey delivery,
+        diag::concurrency::ObservationKey cause) const noexcept;
+
     static constexpr usize kind_mask = 0x3;
     libk::IntrusiveListHook hook_{};
     usize owner_kind_{};
-    // Zero is idle, one is a diagnostics-degraded pending request, and every
-    // other value is the detached RemoteDelivery observation key. Packing the
-    // diagnostic handle into the canonical pending word keeps embedded
-    // scheduler objects size-neutral.
-    libk::Atomic<u64> pending_delivery_{};
+    // Canonical request lifecycle.  state = (generation << 1) | pending.
+    // Keeping the generation after completion prevents a new post from
+    // reusing the previous request identity even when diagnostics are off.
+    libk::Atomic<u64> state_{};
+    // Optional one-way diagnostic projections.  They are never consulted by
+    // queue admission, coalescing, or terminal decisions.  Keep the raw key
+    // atomic because a consumer may retain a request after take() while a
+    // producer prepares its next generation under the queue lock.
+    libk::Atomic<u64> delivery_{};
 };
 
 // One retained software-IPI edge for all scheduler work addressed to a CPU.

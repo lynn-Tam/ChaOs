@@ -26,7 +26,6 @@ public:
     enum class WakeError : u8 {
         WrongCpu,
         Unavailable,
-        CauseConflict,
     };
     enum class WakeAcceptance : u8 {
         Rejected,

@@ -8,6 +8,9 @@
 namespace kernel::sched {
 namespace {
 
+constexpr u64 max_request_generation =
+    libk::numeric_limits<u64>::max() >> 1;
+
 [[nodiscard]] auto now() noexcept -> u64 {
     return arch::read_clock().ticks();
 }
@@ -47,28 +50,46 @@ RemoteRequest::~RemoteRequest() noexcept {
 
 auto RemoteRequest::delivery() const noexcept
     -> diag::concurrency::ObservationKey {
-    const u64 raw =
-        pending_delivery_.load<libk::MemoryOrder::Acquire>();
-    return raw > 1 ? diag::concurrency::ObservationKey{raw}
-                   : diag::concurrency::ObservationKey{};
+    return diag::concurrency::ObservationKey{
+        delivery_.load<libk::MemoryOrder::Acquire>()};
+}
+
+auto RemoteRequest::diagnostic_cause(
+    diag::concurrency::ObservationKey delivery) const noexcept
+    -> diag::concurrency::ObservationKey {
+    auto observation =
+        diag::concurrency::ObservationLease::borrow(delivery);
+    diag::concurrency::ObservationSnapshot snapshot{};
+    if (!observation.snapshot(snapshot)
+        || snapshot.record_kind
+            != diag::concurrency::RecordKind::RemoteDelivery
+        || snapshot.subject_identity != reinterpret_cast<u64>(this)) {
+        return {};
+    }
+    return diag::concurrency::ObservationKey{snapshot.detail[0]};
+}
+
+void RemoteRequest::retain_diagnostic_cause(
+    diag::concurrency::ObservationKey delivery,
+    diag::concurrency::ObservationKey cause) const noexcept {
+    if (!cause) {
+        return;
+    }
+    auto observation =
+        diag::concurrency::ObservationLease::borrow(delivery);
+    diag::concurrency::ObservationSnapshot snapshot{};
+    if (!observation.snapshot(snapshot)
+        || snapshot.record_kind
+            != diag::concurrency::RecordKind::RemoteDelivery
+        || snapshot.subject_identity != reinterpret_cast<u64>(this)
+        || snapshot.detail[0] != 0) {
+        return;
+    }
+    observation.detail(0, cause.raw);
 }
 
 auto RemoteRequest::generation() const noexcept -> u64 {
-    diag::concurrency::ObservationSnapshot snapshot{};
-    auto observation =
-        diag::concurrency::ObservationLease::borrow(delivery());
-    return observation.snapshot(snapshot)
-        ? snapshot.subject_generation : 0;
-}
-
-auto RemoteRequest::cause() const noexcept
-    -> diag::concurrency::ObservationKey {
-    diag::concurrency::ObservationSnapshot snapshot{};
-    auto observation =
-        diag::concurrency::ObservationLease::borrow(delivery());
-    return observation.snapshot(snapshot)
-        ? diag::concurrency::ObservationKey{snapshot.detail[0]}
-        : diag::concurrency::ObservationKey{};
+    return state_.load<libk::MemoryOrder::Acquire>() >> 1;
 }
 
 auto RemoteQueue::post(
@@ -79,35 +100,26 @@ auto RemoteQueue::post(
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (request.pending()) {
-            const auto retained_cause = request.cause();
-            if (cause && retained_cause && cause != retained_cause) {
-                result = {RemotePost::CauseConflict, request.delivery()};
-                publish_summary();
-            } else {
-                if (cause && !retained_cause) {
-                    auto observation =
-                        diag::concurrency::ObservationLease::borrow(
-                            request.delivery());
-                    observation.detail(0, cause.raw);
-                    result.disposition = RemotePost::CauseAttached;
-                } else {
-                    result.disposition = RemotePost::Coalesced;
-                }
-                result.delivery = request.delivery();
-                auto observation =
-                    diag::concurrency::ObservationLease::borrow(
-                        result.delivery);
-                observation.touch();
-                publish_summary();
-            }
+            // Coalescing is a canonical pending-edge decision.  A wake cause
+            // is only explanatory; retaining the first nonzero projection
+            // cannot reject or alter the already retained request. A later
+            // cause remains available in the flight record below.
+            const auto delivery = request.delivery();
+            request.retain_diagnostic_cause(delivery, cause);
+            result.disposition = RemotePost::Coalesced;
+            result.delivery = delivery;
+            auto observation =
+                diag::concurrency::ObservationLease::borrow(result.delivery);
+            observation.touch();
+            publish_summary();
         } else {
             increment_sat(summary_.post_epoch);
-            u64 generation =
-                summary_.post_epoch.load<libk::MemoryOrder::Relaxed>();
+            u64 generation = request.generation();
+            if (generation != max_request_generation) {
+                ++generation;
+            }
             if (generation == 0) {
-                increment_sat(summary_.post_epoch);
-                generation =
-                    summary_.post_epoch.load<libk::MemoryOrder::Relaxed>();
+                generation = 1;
             }
             auto observation =
                 diag::concurrency::ObservationLease::reserve_on(
@@ -120,9 +132,10 @@ auto RemoteQueue::post(
             observation.detail(
                 1, reinterpret_cast<u64>(request.owner()));
             observation.detail(2, home_.raw);
-            const auto delivery = observation.detach_key();
-            request.pending_delivery_.store<libk::MemoryOrder::Release>(
-                delivery ? delivery.raw : 1);
+            request.delivery_.store<libk::MemoryOrder::Release>(
+                observation.detach_key().raw);
+            request.state_.store<libk::MemoryOrder::Release>(
+                (generation << 1) | 1U);
             ++pending_count_;
             const u64 tick = now();
             queue_.push_back(request);
@@ -139,7 +152,7 @@ auto RemoteQueue::post(
             summary_.last_post.store<libk::MemoryOrder::Release>(tick);
             publish_summary();
             inserted = true;
-            result = {RemotePost::Inserted, delivery};
+            result = {RemotePost::Inserted, request.delivery()};
         }
     }
     diag::concurrency::record(
@@ -235,8 +248,7 @@ auto RemoteQueue::take() noexcept -> RemoteRequest* {
             reinterpret_cast<u64>(result),
             reinterpret_cast<u64>(result->owner()),
             request_kind(result->kind()),
-            result->generation(),
-            result->cause().raw);
+            result->generation());
     }
     return result;
 }
@@ -266,7 +278,7 @@ void RemoteQueue::complete(RemoteRequest& request) noexcept {
         kernel::sync::IrqLockGuard guard{lock_};
         KASSERT(request.pending() && !request.hook_.is_linked());
         generation = request.generation();
-        cause = request.cause();
+        cause = {};
         publish(
             request,
             diag::concurrency::RemotePhase::Completed,
@@ -274,10 +286,11 @@ void RemoteQueue::complete(RemoteRequest& request) noexcept {
             delivery_.generation());
         auto observation =
             diag::concurrency::ObservationLease::borrow(request.delivery());
-        request.pending_delivery_.store<libk::MemoryOrder::Release>(0);
+        request.state_.store<libk::MemoryOrder::Release>(generation << 1);
         observation.finish(
             static_cast<u32>(diag::concurrency::RemotePhase::Completed),
             cause.raw);
+        request.delivery_.store<libk::MemoryOrder::Release>(0);
         KASSERT(pending_count_ != 0);
         --pending_count_;
         increment_sat(summary_.complete_epoch);
@@ -306,7 +319,7 @@ auto RemoteQueue::cancel(RemoteRequest& request) noexcept -> RemoteCancel {
         } else {
             queue_.erase(request);
             generation = request.generation();
-            cause = request.cause();
+            cause = {};
             publish(
                 request,
                 diag::concurrency::RemotePhase::Cancelled,
@@ -315,10 +328,11 @@ auto RemoteQueue::cancel(RemoteRequest& request) noexcept -> RemoteCancel {
             auto observation =
                 diag::concurrency::ObservationLease::borrow(
                     request.delivery());
-            request.pending_delivery_.store<libk::MemoryOrder::Release>(0);
+            request.state_.store<libk::MemoryOrder::Release>(generation << 1);
             observation.finish(
                 static_cast<u32>(diag::concurrency::RemotePhase::Cancelled),
                 cause.raw);
+            request.delivery_.store<libk::MemoryOrder::Release>(0);
             KASSERT(pending_count_ != 0);
             --pending_count_;
             if (queue_.empty()) {

@@ -13,9 +13,6 @@
 namespace kernel {
 namespace {
 
-constexpr u64 reclaimer_closing = 1;
-constexpr u64 reclaimer_reopen = 2;
-
 [[nodiscard]] auto advance_sat(libk::Atomic<u64>& value) noexcept -> u64 {
     u64 current = value.load<libk::MemoryOrder::Relaxed>();
     for (;;) {
@@ -207,11 +204,11 @@ void KernelState::run_reclaimer_probe() noexcept {
         reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>();
     const bool first_closed =
         first && first.raw == coalesced.raw
-        && close_reclaimer_work(first, admitted_epoch);
+        && close_reclaimer_work(admitted_epoch);
     const auto next = retain_reclaimer_work();
     const bool next_closed =
         next && next.raw != first.raw
-        && close_reclaimer_work(next, admitted_epoch);
+        && close_reclaimer_work(admitted_epoch);
     diag::console::print<
         "concurrency-probe: stage-e interval-{} "
         "first={:#x} coalesced={:#x} next={:#x} "
@@ -222,7 +219,7 @@ void KernelState::run_reclaimer_probe() noexcept {
         next.raw,
         first_closed,
         next_closed,
-        reclaimer_work_.load<libk::MemoryOrder::Acquire>());
+        reclaimer_observation_key_.load<libk::MemoryOrder::Acquire>());
 }
 #endif
 
@@ -243,11 +240,9 @@ void KernelState::run_reclaimer_probe() noexcept {
     for (;;) {
         const u64 admitted = kernel.reclaimer_enqueues_.load<
             libk::MemoryOrder::Acquire>();
-        const u64 work_state =
-            kernel.reclaimer_work_.load<libk::MemoryOrder::Acquire>();
-        const auto work = work_state > reclaimer_reopen
-            ? diag::concurrency::ObservationKey{work_state}
-            : diag::concurrency::ObservationKey{};
+        const auto work = diag::concurrency::ObservationKey{
+            kernel.reclaimer_observation_key_.load<
+                libk::MemoryOrder::Acquire>()};
         if (cycle != libk::numeric_limits<u64>::max()) {
             ++cycle;
         }
@@ -307,7 +302,7 @@ void KernelState::run_reclaimer_probe() noexcept {
             driver);
         kernel.reclaimer_observation_.detail(3, vspace_total);
         if (grant.more || vspace.more
-            || !kernel.close_reclaimer_work(work, admitted)) {
+            || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();
         } else {
@@ -324,25 +319,14 @@ void KernelState::run_reclaimer_probe() noexcept {
 auto KernelState::retain_reclaimer_work() noexcept
     -> diag::concurrency::ObservationKey {
     for (;;) {
-        u64 state =
-            reclaimer_work_.load<libk::MemoryOrder::Acquire>();
-        if (state > reclaimer_reopen) {
+        const u64 state = reclaimer_observation_key_.load<
+            libk::MemoryOrder::Acquire>();
+        if (state != 0) {
             return diag::concurrency::ObservationKey{state};
         }
-        if (state == reclaimer_closing) {
-            if (reclaimer_work_.compare_exchange_weak<
-                    libk::MemoryOrder::AcqRel,
-                    libk::MemoryOrder::Acquire>(
-                    state, reclaimer_reopen)) {
-                return {};
-            }
-            continue;
-        }
-        if (state == reclaimer_reopen) {
-            return {};
-        }
 
-        const u64 generation = advance_sat(reclaimer_work_generation_);
+        const u64 generation = advance_sat(
+            reclaimer_observation_generation_);
         auto observation = diag::concurrency::ObservationLease::reserve(
             diag::concurrency::RecordKind::ServiceWork,
             reinterpret_cast<u64>(this),
@@ -361,11 +345,10 @@ auto KernelState::retain_reclaimer_work() noexcept
         if (!key) {
             return {};
         }
-        KASSERT(key.raw > reclaimer_reopen);
-        state = 0;
-        if (reclaimer_work_.compare_exchange_strong<
+        u64 expected = 0;
+        if (reclaimer_observation_key_.compare_exchange_strong<
                 libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(state, key.raw)) {
+                libk::MemoryOrder::Acquire>(expected, key.raw)) {
             return key;
         }
         diag::concurrency::ObservationLease::borrow(key).finish(
@@ -374,50 +357,24 @@ auto KernelState::retain_reclaimer_work() noexcept
 }
 
 auto KernelState::close_reclaimer_work(
-    diag::concurrency::ObservationKey work,
     u64 admitted) noexcept -> bool {
-    if (!work) {
-        // Diagnostic capacity loss must not keep the functional reclaimer
-        // runnable. A concurrent enqueue still carries the ordinary wake
-        // credit through Binding.
-        return reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
-            == admitted;
-    }
+    // The epoch is the only canonical close predicate. Binding::wake_credit
+    // retains an enqueue that races the final epoch sample, so a diagnostic
+    // key must not be exchanged into a closing/reopen protocol here.
     if (reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
         != admitted) {
         return false;
     }
 
-    u64 state = work.raw;
-    if (!reclaimer_work_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(
-            state, reclaimer_closing)) {
-        return false;
+    const auto work = diag::concurrency::ObservationKey{
+        reclaimer_observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+    if (work) {
+        diag::concurrency::ObservationLease::borrow(work)
+            .finish(static_cast<u32>(diag::concurrency::ServicePhase::Completed));
     }
-    if (reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>()
-        != admitted) {
-        state = reclaimer_closing;
-        if (!reclaimer_work_.compare_exchange_strong<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(state, work.raw)) {
-            KASSERT(state == reclaimer_reopen);
-            reclaimer_work_.store<libk::MemoryOrder::Release>(work.raw);
-        }
-        return false;
-    }
-
-    state = reclaimer_closing;
-    if (!reclaimer_work_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(state, 0)) {
-        KASSERT(state == reclaimer_reopen);
-        reclaimer_work_.store<libk::MemoryOrder::Release>(work.raw);
-        return false;
-    }
-    diag::concurrency::ObservationLease::borrow(work).finish(
-        static_cast<u32>(diag::concurrency::ServicePhase::Completed));
-    return true;
+    // A concurrent enqueue after the final sample leaves canonical wake credit
+    // on the Binding and forces the caller to run another service pass.
+    return reclaimer_enqueues_.load<libk::MemoryOrder::Acquire>() == admitted;
 }
 
 auto KernelState::wake_reclaimer() noexcept

@@ -4134,15 +4134,16 @@ void run_probe(u32 probe) noexcept {
             sched::RemoteKind::Wake, &probe_remote_owner);
         sched::RemotePostResult posted{};
         kernel::IpiDelivery::Token first{};
+        ObservationKey projected_cause{};
         if (ok) {
             posted = queue.post(request, operation.key());
             ObservationSnapshot delivery{};
             auto delivery_lease =
                 ObservationLease::borrow(posted.delivery);
+            projected_cause = request.diagnostic_cause(posted.delivery);
             const bool posted_ok =
                 posted.disposition == sched::RemotePost::Inserted
                 && request.pending()
-                && request.cause() == operation.key()
                 && delivery_lease.snapshot(delivery)
                 && delivery.record_kind == RecordKind::RemoteDelivery
                 && delivery.phase
@@ -4150,19 +4151,29 @@ void run_probe(u32 probe) noexcept {
                 && delivery.detail[0] == operation.key().raw
                 && delivery.detail[1]
                     == reinterpret_cast<u64>(&probe_remote_owner)
-                && delivery.detail[2] == boot.raw;
+                && delivery.detail[2] == boot.raw
+                // The home-CPU drain path uses this same bounded projection
+                // as Binding::publish_accept(); a single cause must survive
+                // the delivery snapshot even though it is not canonical.
+                && projected_cause == operation.key();
             if (!posted_ok) {
                 errors |= 1U << 2;
             }
             ok = ok && posted_ok;
 
             const auto same = queue.post(request, operation.key());
-            const auto conflict = queue.post(request, other.key());
+            const auto other_post = queue.post(request, other.key());
+            const auto coalesced_cause = request.diagnostic_cause(
+                posted.delivery);
             const bool coalesce_ok =
                 same.disposition == sched::RemotePost::Coalesced
                 && same.delivery == posted.delivery
-                && conflict.disposition
-                    == sched::RemotePost::CauseConflict;
+                && other_post.disposition == sched::RemotePost::Coalesced
+                && other_post.delivery == posted.delivery
+                // The bounded projection retains the first concrete cause.
+                // Later causes remain flight evidence; no per-request
+                // multi-cause truth feeds the analyzer yet.
+                && coalesced_cause == operation.key();
             if (!coalesce_ok) {
                 errors |= 1U << 3;
             }
@@ -4247,7 +4258,9 @@ void run_probe(u32 probe) noexcept {
             }
             ok = ok && lost;
 
-            actor.detail(2, operation.key().raw);
+            // Feed the projected cause into the same witness slot that
+            // Binding::publish_accept() updates after a remote drain.
+            actor.detail(2, projected_cause.raw);
             graph = {};
             const bool accepted = analyze(operation.key(), graph)
                 && graph.classification

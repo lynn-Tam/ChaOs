@@ -285,7 +285,6 @@ private:
     TunnelLinks outgoing_tunnels_{};
     IngressSlot ingresses_[MYOS_VPROC_MAX_INGRESS]{};
     NotificationSlot notifications_[MYOS_VPROC_MAX_NOTIFICATIONS]{};
-    mutable bool relation_admission_closed_{};
     StopList stops_{};
     u64 pending_sequence_{};
     u64 ready_mask_{};
@@ -302,6 +301,7 @@ private:
     usize activation_publishers_{};
     ActivationPost activation_post_{ActivationPost::Idle};
     bool activation_dirty_{};
+    mutable bool relation_admission_closed_{};
     sched::RemoteRequest activation_{sched::RemoteKind::Activation, this};
 };
 

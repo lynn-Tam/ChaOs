@@ -363,9 +363,6 @@ auto CpuDispatcher::post_remote(
     if (delivery != nullptr) {
         *delivery = posted.delivery;
     }
-    if (posted.disposition == RemotePost::CauseConflict) {
-        return libk::unexpected(WakeError::CauseConflict);
-    }
     return kick_remote();
 }
 
@@ -494,9 +491,16 @@ void CpuDispatcher::drain_remote() noexcept {
         }
         case RemoteKind::Wake: {
             auto& binding = *static_cast<Binding*>(request->owner());
+            // Capture the delivery identity before acceptance while the
+            // request is still pending. A single cause is copied from the
+            // delivery observation for the Binding's diagnostic witness;
+            // neither value participates in wake admission or coalescing.
+            const auto delivery = request->delivery();
+            const auto diagnostic_cause =
+                request->diagnostic_cause(delivery);
             const WakeAcceptance acceptance =
                 accept_wake(
-                    binding, request->cause(), request->delivery());
+                    binding, diagnostic_cause, delivery);
             remote_.accepted(
                 *request, acceptance != WakeAcceptance::Rejected);
             made_ready = acceptance == WakeAcceptance::Readied || made_ready;
