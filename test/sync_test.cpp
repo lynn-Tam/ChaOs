@@ -511,11 +511,14 @@ constinit kernel::diag::concurrency::ObservationPage
                 break;
             }
             // A normal waiter edge terminates at an external producer. It is
-            // not a cycle merely because the operation is blocking.
+            // not a cycle merely because the operation is blocking.  Keep
+            // the wait and driver relations on the same operation: Stage D
+            // now retains every published relation, so a synthetic
+            // self-driver would correctly be diagnosed as a one-node cycle.
             actor.link_wait(
                 operation.key(),
                 WaitKind::OperationCompletion,
-                NodeRef::observation(actor.key()));
+                NodeRef::observation(operation.key()));
             operation.transition(
                 static_cast<u32>(OperationPhase::Attached),
                 1,
@@ -534,7 +537,7 @@ constinit kernel::diag::concurrency::ObservationPage
             actor.link_wait(
                 operation.key(),
                 WaitKind::OperationCompletion,
-                NodeRef::observation(peer.key()));
+                NodeRef::observation(operation.key()));
             operation.phase(
                 static_cast<u32>(OperationPhase::Attached),
                 2,

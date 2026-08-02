@@ -1,6 +1,7 @@
 #include <diag/concurrency.hpp>
 
 #include <arch/cpu.hpp>
+#include <arch/interrupt.hpp>
 #include <arch/time.hpp>
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_registry.hpp>
@@ -10,6 +11,7 @@
 #include <execution/execution.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
+#include <sched/dispatcher.hpp>
 #include <sched/remote_queue.hpp>
 #include <sync/irq_lock_guard.hpp>
 
@@ -92,6 +94,533 @@ libk::Atomic<ObservationShard*> standalone_shards[256]{};
 ObservationPage standalone_page{};
 #endif
 
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+// Definitions are kept with the other probe rendezvous state below; these
+// declarations let the split helpers stay outside run_probe's boot-stack
+// frame.
+extern libk::Atomic<u32> probe_joined;
+extern libk::Atomic<u32> probe_phase;
+extern libk::Atomic<u32> probe15_active;
+extern libk::Atomic<u32> probe15_graph_ok;
+extern libk::Atomic<u32> probe15_set_ok;
+extern libk::Atomic<u32> probe15_report_ok;
+extern libk::Atomic<u32> probe15_timer_path;
+extern libk::Atomic<u32> probe15_stage_started;
+extern libk::Atomic<u32> probe15_boot_cpu;
+extern libk::Atomic<u32> probe15_target_cpu;
+extern libk::Atomic<u64> probe15_pending_before;
+extern libk::Atomic<u32> probe15_wakes_before;
+extern libk::Atomic<u32> probe15_record_ok;
+extern libk::Atomic<u32> probe15_loss_ok;
+extern libk::Atomic<u32> probe15_producer_irq_off;
+extern libk::Atomic<u32> probe15_consumer_irq_on;
+extern libk::Atomic<u32> probe15_consumed;
+extern libk::Atomic<u32> probe15_wakes;
+extern libk::Atomic<u32> probe15_hold_consumer;
+extern libk::Atomic<u32> probe15_summary;
+extern libk::Atomic<u32> probe15_root_queue_attempts;
+extern libk::Atomic<u32> probe15_root_queue_ok;
+extern libk::Atomic<u32> probe15_root_queue_lost;
+extern libk::Atomic<u64> probe15_root_key;
+extern libk::Atomic<u64> probe15_blocker_key;
+extern libk::Atomic<u64> probe15_observe_at;
+extern libk::Atomic<u32> probe15_ready_fires;
+extern libk::Atomic<u32> probe15_root_passes;
+extern libk::Atomic<u32> probe15_root_state;
+extern libk::Atomic<u32> probe15_debug_once;
+extern libk::Atomic<u32> probe15_retry_cpu;
+extern libk::Atomic<u32> probe15_retry_armed;
+extern libk::Atomic<u32> probe15_retry_first_fail;
+extern libk::Atomic<u32> probe15_retry_attempts;
+extern libk::Atomic<u32> probe15_retry_success;
+
+[[nodiscard]] auto probe15_cpu(CpuId cpu) noexcept -> Probe15CpuState* {
+    return cpu.raw < max_cpu_count ? &probe15_cpu_state[cpu.raw] : nullptr;
+}
+
+[[nodiscard]] auto add_sat(u64 left, u64 right) noexcept -> u64;
+
+[[nodiscard]] auto probe15_is_root(NodeRef value) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage D external timer harness once it
+    // can identify the probe-owned ReportRecord without this hook.
+    const ObservationKey key{
+        probe15_root_key.load<libk::MemoryOrder::Acquire>()};
+    return key && value == NodeRef::observation(key);
+}
+
+[[gnu::noinline, nodiscard]] auto probe15_graph_stage(
+    CpuRegistry& registry,
+    ObservationShard& shard,
+    u64 deadline,
+    u64 grace) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external four-hart harness owns the
+    // graph and CpuSet evidence checks used by this stage.
+    ObservationLease root = shard.reserve(
+        RecordKind::ServiceWork,
+        0x1501,
+        1,
+        Expectation::DeadlineBound,
+        SourceSite::current());
+    ObservationLease blocker = shard.reserve(
+        RecordKind::ServiceWork,
+        0x1502,
+        1,
+        Expectation::InternalFinite,
+        SourceSite::current());
+    ObservationLease set = shard.reserve(
+        RecordKind::Shootdown,
+        0x1503,
+        1,
+        Expectation::InternalFinite,
+        SourceSite::current());
+    if (!root || !blocker || !set) {
+        if (root) {
+            root.finish(3);
+        }
+        if (blocker) {
+            blocker.finish(3);
+        }
+        if (set) {
+            set.finish(3);
+        }
+        return false;
+    }
+
+    const NodeRef driver = NodeRef::external(0x1501d, 1);
+    const NodeRef blocker_driver = NodeRef::external(0x1502d, 1);
+    blocker.transition(1, 1, WaitKind::GrantWork, blocker_driver);
+    root.transition(
+        1,
+        1,
+        WaitKind::GrantWork,
+        driver,
+        NodeRef::observation(blocker.key()));
+    root.watch(false);
+    blocker.watch(false);
+
+    WaitGraphScratch graph{};
+    const bool analyzed = analyze(root.key(), graph);
+    bool driver_edge{};
+    bool blocker_edge{};
+    bool blocker_subtree{};
+    for (usize index = 0; index < graph.count; ++index) {
+        const NodeRef node = graph.node(index);
+        driver_edge = driver_edge
+            || (graph.edge(index) == EdgeKind::Driver && node == driver);
+        blocker_edge = blocker_edge
+            || (graph.edge(index) == EdgeKind::Blocker
+                && node == NodeRef::observation(blocker.key()));
+        const u8 parent = graph.parents[index];
+        blocker_subtree = blocker_subtree
+            || (parent < graph.count
+                && graph.node(parent)
+                    == NodeRef::observation(blocker.key())
+                && graph.edge(index) == EdgeKind::Driver
+                && node == blocker_driver);
+    }
+    const bool graph_ok = analyzed
+        && graph.evidence == EvidenceGrade::Confirmed
+        && driver_edge && blocker_edge && blocker_subtree;
+    probe15_graph_ok.store<libk::MemoryOrder::Release>(graph_ok ? 1 : 0);
+
+    for (usize word = 0; word < 4; ++word) {
+        set.detail(word, libk::numeric_limits<u64>::max());
+    }
+    set.transition(
+        1,
+        1,
+        WaitKind::ShootdownAck,
+        NodeRef::external(0x1503d, 1));
+    WaitGraphScratch set_graph{};
+    const bool set_analyzed = analyze(
+        NodeRef::cpu_set(set.key()),
+        set_graph);
+    usize expected_shown{};
+    for (usize raw = 0; raw < registry.count(); ++raw) {
+        const CpuId member{raw};
+        const CpuDescriptor* const descriptor = registry.descriptor(member);
+        const CpuRuntime* const runtime = registry.runtime(member);
+        const bool available = descriptor != nullptr
+            && runtime != nullptr
+            && descriptor->state() == CpuState::Online
+            && descriptor->runtime_alive()
+            && runtime->diagnostics != nullptr;
+        if (!available || expected_shown >= graph_capacity - 1) {
+            continue;
+        }
+        bool found{};
+        for (usize index = 0; index < set_graph.count; ++index) {
+            found = found
+                || (set_graph.edge(index) == EdgeKind::Member
+                    && set_graph.node(index) == NodeRef::cpu(member));
+        }
+        if (!found) {
+            expected_shown = libk::numeric_limits<usize>::max();
+            break;
+        }
+        ++expected_shown;
+    }
+    const bool set_ok = set_analyzed
+        && set_graph.evidence == EvidenceGrade::Confirmed
+        && set_graph.truncated
+        && set_graph.pending_total == 256
+        && expected_shown != libk::numeric_limits<usize>::max()
+        && set_graph.pending_shown == expected_shown
+        && set_graph.pending_omitted
+            == set_graph.pending_total - set_graph.pending_shown;
+    probe15_set_ok.store<libk::MemoryOrder::Release>(set_ok ? 1 : 0);
+    set.watch(false);
+    set.finish(3);
+
+    if (!graph_ok || !set_ok) {
+        root.finish(3);
+        blocker.finish(3);
+        return false;
+    }
+
+    root.set_policy(OperationPolicy{
+        .kind = WaitKind::GrantWork,
+        .expectation = Expectation::DeadlineBound,
+        .driver = driver,
+        .deadline = deadline,
+        .grace = grace,
+        .action = StallAction::Report});
+    root.watch(true);
+    const ObservationKey root_key = root.detach_key();
+    const ObservationKey blocker_key = blocker.detach_key();
+    probe15_root_key.store<libk::MemoryOrder::Release>(root_key.raw);
+    probe15_blocker_key.store<libk::MemoryOrder::Release>(blocker_key.raw);
+    return graph_ok && set_ok;
+}
+
+[[gnu::noinline, nodiscard]] auto probe15_report_stage(
+    CpuId boot,
+    CpuDiagnosticsCore& watcher,
+    ObservationShard& shard) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external watchdog harness owns the
+    // producer/consumer and bounded-loss checks used by this stage.
+    const ObservationKey root_key{
+        probe15_root_key.load<libk::MemoryOrder::Acquire>()};
+    auto root = ObservationLease::borrow(root_key);
+    if (!root) {
+        probe15_report_ok.store<libk::MemoryOrder::Release>(0);
+        return false;
+    }
+
+    ObservationSnapshot initial{};
+    const bool initial_ok = root.snapshot(initial);
+    KASSERT(!arch::interrupts_enabled());
+    const u64 pending_before = probe15_pending_before.load<
+        libk::MemoryOrder::Acquire>();
+    const u64 wakes_before = probe15_wakes_before.load<
+        libk::MemoryOrder::Acquire>();
+    const u64 pending_after = watcher.reports.pending();
+    const u64 wakes_after = probe15_wakes.load<libk::MemoryOrder::Acquire>();
+    const u32 root_attempts = probe15_root_queue_attempts.load<
+        libk::MemoryOrder::Acquire>();
+    const u32 root_queued = probe15_root_queue_ok.load<
+        libk::MemoryOrder::Acquire>();
+    const u32 root_lost = probe15_root_queue_lost.load<
+        libk::MemoryOrder::Acquire>();
+    const bool report_ok = initial_ok
+        && probe15_timer_path.load<libk::MemoryOrder::Acquire>() != 0
+        && pending_before == 0
+        && pending_after
+        && wakes_after == wakes_before + 1
+        && probe15_retry_first_fail.load<libk::MemoryOrder::Acquire>() != 0
+        && probe15_retry_attempts.load<libk::MemoryOrder::Acquire>() != 0
+        && probe15_retry_success.load<libk::MemoryOrder::Acquire>() != 0
+        && root_attempts == 1
+        && root_queued == 1
+        && root_lost == 0;
+    probe15_report_ok.store<libk::MemoryOrder::Release>(report_ok ? 1 : 0);
+
+    ObservationLease record_only = shard.reserve(
+        RecordKind::ServiceWork,
+        0x1504,
+        1,
+        Expectation::DeadlineBound,
+        SourceSite::current());
+    bool record_ok = false;
+    if (record_only) {
+        record_only.set_policy(OperationPolicy{
+            .kind = WaitKind::GrantWork,
+            .expectation = Expectation::DeadlineBound,
+            .driver = NodeRef::external(0x1504d, 1),
+            .deadline = arch::read_clock().ticks(),
+            .grace = 1,
+            .action = StallAction::Record});
+        record_only.transition(
+            1,
+            1,
+            WaitKind::GrantWork,
+            NodeRef::external(0x1504d, 1));
+        record_only.watch(true);
+        ObservationSnapshot record_snapshot{};
+        const bool record_initial = record_only.snapshot(record_snapshot);
+        const arch::InterruptState record_irq = arch::disable_interrupts();
+        if (record_initial) {
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                record_only.key().slot());
+            watchdog_tick(boot, record_snapshot.last_progress_at + 2);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                record_only.key().slot());
+            watchdog_tick(boot, record_snapshot.last_progress_at + 3);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                record_only.key().slot());
+            watchdog_tick(boot, record_snapshot.last_progress_at + 8);
+        }
+        arch::restore_interrupts(record_irq);
+        record_ok = record_initial
+            && watcher.reports.pending()
+            && probe15_wakes.load<libk::MemoryOrder::Acquire>() == wakes_after;
+        record_only.watch(false);
+        record_only.finish(3);
+    }
+    probe15_record_ok.store<libk::MemoryOrder::Release>(record_ok ? 1 : 0);
+
+    ObservationLease loss_one = shard.reserve(
+        RecordKind::ServiceWork,
+        0x1505,
+        1,
+        Expectation::DeadlineBound,
+        SourceSite::current());
+    ObservationLease loss_two = shard.reserve(
+        RecordKind::ServiceWork,
+        0x1506,
+        1,
+        Expectation::DeadlineBound,
+        SourceSite::current());
+    bool loss_ok = false;
+    if (loss_one && loss_two) {
+        const auto prepare_report = [](ObservationLease& observation,
+                                       u64 identity) noexcept {
+            observation.set_policy(OperationPolicy{
+                .kind = WaitKind::GrantWork,
+                .expectation = Expectation::DeadlineBound,
+                .driver = NodeRef::external(identity, 1),
+                .deadline = arch::read_clock().ticks(),
+                .grace = 1,
+                .action = StallAction::Report});
+            observation.transition(
+                1,
+                1,
+                WaitKind::GrantWork,
+                NodeRef::external(identity, 1));
+            observation.watch(true);
+        };
+        prepare_report(loss_one, 0x1505d);
+        prepare_report(loss_two, 0x1506d);
+        const arch::InterruptState loss_irq = arch::disable_interrupts();
+        ObservationSnapshot one{};
+        ObservationSnapshot two{};
+        if (loss_one.snapshot(one)) {
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_one.key().slot());
+            watchdog_tick(boot, one.last_progress_at + 2);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_one.key().slot());
+            watchdog_tick(boot, one.last_progress_at + 3);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_one.key().slot());
+            watchdog_tick(boot, one.last_progress_at + 8);
+        }
+        if (loss_two.snapshot(two)) {
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_two.key().slot());
+            watchdog_tick(boot, two.last_progress_at + 2);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_two.key().slot());
+            watchdog_tick(boot, two.last_progress_at + 3);
+            watcher.scan_cursor.store<libk::MemoryOrder::Release>(
+                loss_two.key().slot());
+            watchdog_tick(boot, two.last_progress_at + 8);
+        }
+        arch::restore_interrupts(loss_irq);
+        loss_ok = watcher.reports.lost() >= 2
+            && (watcher.status().flags.load<libk::MemoryOrder::Acquire>()
+                & DiagnosticStatus::ReportDropped) != 0;
+        loss_one.watch(false);
+        loss_two.watch(false);
+        loss_one.finish(3);
+        loss_two.finish(3);
+    }
+    probe15_loss_ok.store<libk::MemoryOrder::Release>(loss_ok ? 1 : 0);
+    root.watch(false);
+    root.finish(3);
+    const ObservationKey blocker_key{
+        probe15_blocker_key.load<libk::MemoryOrder::Acquire>()};
+    ObservationLease::borrow(blocker_key).finish(3);
+    return report_ok && record_ok && loss_ok;
+}
+
+[[gnu::noinline]] void run_probe15(
+    CpuId cpu,
+    CpuId boot,
+    CpuRegistry& registry) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external four-hart harness owns the
+    // rendezvous and deferred-report assertions.
+    constexpr u32 done_phase = 0x1500;
+    constexpr u32 ready_phase = 0x1501;
+    constexpr u32 spin_limit = 1U << 24;
+    static_cast<void>(probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+    bool joined = false;
+    for (u32 spin = 0; spin < spin_limit; ++spin) {
+        if (probe_joined.load<libk::MemoryOrder::Acquire>()
+            == registry.count()) {
+            joined = true;
+            break;
+        }
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+    if (!joined) {
+        if (cpu == boot) {
+            probe15_active.store<libk::MemoryOrder::Release>(1);
+            probe_phase.store<libk::MemoryOrder::Release>(done_phase);
+        }
+        return;
+    }
+    if (cpu != boot) {
+        for (u32 spin = 0; spin < spin_limit; ++spin) {
+            const u32 phase = probe_phase.load<libk::MemoryOrder::Acquire>();
+            if (phase == ready_phase || phase == done_phase) {
+                return;
+            }
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        return;
+    }
+
+    CpuId target{boot.raw};
+    for (usize attempt = 0; attempt < registry.count(); ++attempt) {
+        const CpuId candidate{
+            (boot.raw + 1 + attempt) % registry.count()};
+        const CpuDescriptor* const descriptor = registry.descriptor(candidate);
+        const CpuRuntime* const candidate_runtime = registry.runtime(candidate);
+        if (descriptor != nullptr && candidate_runtime != nullptr
+            && descriptor->state() == CpuState::Online
+            && candidate_runtime->diagnostics != nullptr
+            && candidate_runtime->diagnostics->concurrency.observations
+                != nullptr) {
+            target = candidate;
+            break;
+        }
+    }
+    CpuDiagnosticsCore* const watcher = current_core();
+    CpuRuntime* const target_runtime = registry.runtime(target);
+    CpuDiagnosticsCore* const target_core =
+        target_runtime == nullptr || target_runtime->diagnostics == nullptr
+        ? nullptr : &target_runtime->diagnostics->concurrency;
+    ObservationShard* const shard = registry.observations(target);
+    const bool available = registry.count() >= 4 && watcher != nullptr
+        && target_core != nullptr && shard != nullptr
+        && watcher->flight != nullptr;
+    if (!available) {
+        probe15_graph_ok.store<libk::MemoryOrder::Release>(0);
+        probe15_set_ok.store<libk::MemoryOrder::Release>(0);
+        probe15_report_ok.store<libk::MemoryOrder::Release>(0);
+        probe15_record_ok.store<libk::MemoryOrder::Release>(0);
+        probe15_loss_ok.store<libk::MemoryOrder::Release>(0);
+        probe_phase.store<libk::MemoryOrder::Release>(done_phase);
+        return;
+    }
+
+    const arch::InterruptState setup_irq = arch::disable_interrupts();
+    probe15_active.store<libk::MemoryOrder::Release>(0);
+    probe15_boot_cpu.store<libk::MemoryOrder::Release>(boot.raw);
+    probe15_target_cpu.store<libk::MemoryOrder::Release>(target.raw);
+    // Reset the complete marker state before the held production deadline is
+    // armed.  In particular, these counters must not inherit a previous
+    // probe invocation or pre-probe notifier/consumer activity.
+    probe15_graph_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_set_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_report_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_timer_path.store<libk::MemoryOrder::Release>(0);
+    probe15_stage_started.store<libk::MemoryOrder::Release>(0);
+    probe15_pending_before.store<libk::MemoryOrder::Release>(0);
+    probe15_wakes_before.store<libk::MemoryOrder::Release>(0);
+    probe15_record_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_loss_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_producer_irq_off.store<libk::MemoryOrder::Release>(0);
+    probe15_consumer_irq_on.store<libk::MemoryOrder::Release>(0);
+    probe15_consumed.store<libk::MemoryOrder::Release>(0);
+    probe15_wakes.store<libk::MemoryOrder::Release>(0);
+    probe15_summary.store<libk::MemoryOrder::Release>(0);
+    probe15_root_queue_attempts.store<libk::MemoryOrder::Release>(0);
+    probe15_root_queue_ok.store<libk::MemoryOrder::Release>(0);
+    probe15_root_queue_lost.store<libk::MemoryOrder::Release>(0);
+    probe15_root_key.store<libk::MemoryOrder::Release>(0);
+    probe15_blocker_key.store<libk::MemoryOrder::Release>(0);
+    probe15_observe_at.store<libk::MemoryOrder::Release>(0);
+    probe15_ready_fires.store<libk::MemoryOrder::Release>(0);
+    probe15_root_passes.store<libk::MemoryOrder::Release>(0);
+    probe15_root_state.store<libk::MemoryOrder::Release>(0);
+    probe15_debug_once.store<libk::MemoryOrder::Release>(0);
+    probe15_retry_cpu.store<libk::MemoryOrder::Release>(max_cpu_count);
+    probe15_retry_armed.store<libk::MemoryOrder::Release>(0);
+    probe15_retry_first_fail.store<libk::MemoryOrder::Release>(0);
+    probe15_retry_attempts.store<libk::MemoryOrder::Release>(0);
+    probe15_retry_success.store<libk::MemoryOrder::Release>(0);
+    for (usize index = 0; index < registry.count(); ++index) {
+        Probe15CpuState& state = probe15_cpu_state[index];
+        state.program_count.store<libk::MemoryOrder::Release>(0);
+        state.program_now.store<libk::MemoryOrder::Release>(0);
+        state.requested_deadline.store<libk::MemoryOrder::Release>(0);
+        state.programmed_deadline.store<libk::MemoryOrder::Release>(0);
+        state.watchdog_deadline.store<libk::MemoryOrder::Release>(0);
+        state.program_ok.store<libk::MemoryOrder::Release>(0);
+        state.timer_available.store<libk::MemoryOrder::Release>(0);
+        state.watchdog_armed.store<libk::MemoryOrder::Release>(0);
+        state.timer_enter_count.store<libk::MemoryOrder::Release>(0);
+        state.timer_now.store<libk::MemoryOrder::Release>(0);
+        state.timer_irq_off.store<libk::MemoryOrder::Release>(0);
+        state.watchdog_fire_count.store<libk::MemoryOrder::Release>(0);
+        state.watchdog_now.store<libk::MemoryOrder::Release>(0);
+        state.watchdog_phase.store<libk::MemoryOrder::Release>(0);
+        state.idle_enter_count.store<libk::MemoryOrder::Release>(0);
+        state.idle_enter_now.store<libk::MemoryOrder::Release>(0);
+        state.idle_enter_phase.store<libk::MemoryOrder::Release>(0);
+        state.idle_return_count.store<libk::MemoryOrder::Release>(0);
+        state.idle_return_now.store<libk::MemoryOrder::Release>(0);
+        state.idle_return_phase.store<libk::MemoryOrder::Release>(0);
+    }
+    probe15_active.store<libk::MemoryOrder::Release>(1);
+    watcher->scan_cursor.store<libk::MemoryOrder::Release>(0);
+    watcher->candidate_cursor.store<libk::MemoryOrder::Release>(0);
+    for (WatchdogCandidate& candidate : watcher->candidates) {
+        candidate.state.store<libk::MemoryOrder::Release>(
+            static_cast<u32>(WatchdogCandidate::State::Clear));
+        candidate.active_intervals.store<libk::MemoryOrder::Release>(0);
+    }
+    probe15_hold_consumer.store<libk::MemoryOrder::Release>(1);
+    const u64 root_deadline = arch::read_clock().ticks();
+    const u64 root_grace = watcher->policy.critical_soft;
+    probe15_observe_at.store<libk::MemoryOrder::Release>(
+        add_sat(root_deadline, watcher->policy.service_soft));
+    const bool graph_ok = root_deadline != 0 && root_grace != 0
+        && probe15_graph_stage(
+            registry, *shard, root_deadline, root_grace);
+    if (!graph_ok) {
+        probe15_hold_consumer.store<libk::MemoryOrder::Release>(0);
+        probe_phase.store<libk::MemoryOrder::Release>(done_phase);
+        arch::restore_interrupts(setup_irq);
+        return;
+    }
+
+    // Publish ready while the boot hart still has interrupts masked. This
+    // keeps the boot candidate set and deferred-report gate untouched until
+    // the graph/set fixture and root key are fully visible; secondary harts
+    // can still run their production watchdogs, but probe15_after_timer()
+    // rejects them before this phase.
+    probe_phase.store<libk::MemoryOrder::Release>(ready_phase);
+    arch::restore_interrupts(setup_irq);
+}
+#endif
+
 #if MYOS_CONCURRENCY_PROBE
 //Confirmatory experiment.
 // Exit condition: remove these rendezvous variables with run_probe() when an
@@ -128,6 +657,45 @@ libk::Atomic<u32> probe14_resource_accepted{};
 libk::Atomic<u32> probe14_resource_bad{};
 #endif
 
+#if MYOS_CONCURRENCY_PROBE == 15
+//Confirmatory experiment.
+// Exit condition: remove when an external watchdog harness can force the
+// graph/report boundaries and observe the same producer/consumer contexts.
+libk::Atomic<u32> probe15_active{};
+libk::Atomic<u32> probe15_graph_ok{};
+libk::Atomic<u32> probe15_set_ok{};
+libk::Atomic<u32> probe15_report_ok{};
+libk::Atomic<u32> probe15_timer_path{};
+libk::Atomic<u32> probe15_stage_started{};
+libk::Atomic<u32> probe15_boot_cpu{};
+libk::Atomic<u32> probe15_target_cpu{};
+libk::Atomic<u64> probe15_pending_before{};
+libk::Atomic<u32> probe15_wakes_before{};
+libk::Atomic<u32> probe15_record_ok{};
+libk::Atomic<u32> probe15_loss_ok{};
+libk::Atomic<u32> probe15_producer_irq_off{};
+libk::Atomic<u32> probe15_consumer_irq_on{};
+libk::Atomic<u32> probe15_consumed{};
+libk::Atomic<u32> probe15_wakes{};
+libk::Atomic<u32> probe15_hold_consumer{};
+libk::Atomic<u32> probe15_summary{};
+libk::Atomic<u32> probe15_root_queue_attempts{};
+libk::Atomic<u32> probe15_root_queue_ok{};
+libk::Atomic<u32> probe15_root_queue_lost{};
+libk::Atomic<u64> probe15_root_key{};
+libk::Atomic<u64> probe15_blocker_key{};
+libk::Atomic<u64> probe15_observe_at{};
+libk::Atomic<u32> probe15_ready_fires{};
+libk::Atomic<u32> probe15_root_passes{};
+libk::Atomic<u32> probe15_root_state{};
+libk::Atomic<u32> probe15_debug_once{};
+libk::Atomic<u32> probe15_retry_cpu{max_cpu_count};
+libk::Atomic<u32> probe15_retry_armed{};
+libk::Atomic<u32> probe15_retry_first_fail{};
+libk::Atomic<u32> probe15_retry_attempts{};
+libk::Atomic<u32> probe15_retry_success{};
+#endif
+
 #if MYOS_CONCURRENCY_PROBE == 13
 //Confirmatory experiment.
 // Exit condition: remove when the external fault harness can deny real
@@ -155,6 +723,10 @@ libk::Atomic<bool> stage_b_deny_active{};
 libk::Atomic<u64> probe_dispatch_head[max_cpu_count]{};
 libk::Atomic<u32> probe_flight_errors{};
 libk::Atomic<u32> probe_flight_reported{};
+#endif
+
+#if MYOS_CONCURRENCY_DIAG >= 3
+ReportNotifier report_notifier{};
 #endif
 
 [[nodiscard]] auto now() noexcept -> u64 {
@@ -272,26 +844,72 @@ struct WatchdogThresholds final {
     }
 };
 
-[[nodiscard]] auto report_stall(
+[[nodiscard]] auto queue_report(
     CpuId watcher,
     CpuId target,
     NodeRef root,
     WatchdogCandidate::State state,
     StallClass classification,
     EvidenceGrade evidence,
-    u64 age) noexcept {
-    diag::console::print<
-        "[concurrency] watchdog confirmed cpu={} target={} "
-        "root-kind={} root={:#x} "
-        "state={} class={} evidence={} age={}\n">(
-        watcher.raw,
-        target.raw,
-        static_cast<u32>(root.kind),
-        root.identity,
-        static_cast<u32>(state),
-        stall_class_name(classification),
-        static_cast<u32>(evidence),
-        age);
+    u64 age,
+    const WaitGraphScratch& graph) noexcept -> bool {
+    CpuDiagnosticsCore* const core = current_core();
+    if (core == nullptr) {
+        return false;
+    }
+#if MYOS_CONCURRENCY_PROBE == 15
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage D external report harness once it
+    // can correlate queue publication with the probe-owned root.
+    const bool probe_root = probe15_is_root(root);
+    if (probe_root) {
+        static_cast<void>(probe15_root_queue_attempts.fetch_add<
+            libk::MemoryOrder::AcqRel>(1));
+    }
+#endif
+    const bool queued = core->reports.publish(ReportRecord{
+        watcher,
+        target,
+        root,
+        state,
+        classification,
+        evidence,
+        age,
+        graph});
+    if (!queued) {
+#if MYOS_CONCURRENCY_PROBE == 15
+        if (probe_root) {
+            static_cast<void>(probe15_root_queue_lost.fetch_add<
+                libk::MemoryOrder::AcqRel>(1));
+        }
+#endif
+        static_cast<void>(core->status().flags.fetch_or<
+            libk::MemoryOrder::Release>(DiagnosticStatus::ReportDropped));
+        return false;
+    }
+#if MYOS_CONCURRENCY_PROBE == 15
+    if (probe_root) {
+        static_cast<void>(probe15_root_queue_ok.fetch_add<
+            libk::MemoryOrder::AcqRel>(1));
+    }
+#endif
+    // A wake is only a scheduling hint. The queue owns the report payload and
+    // remains correct if no consumer has registered yet.  notify() is a
+    // bounded publication/read attempt; it never waits for the scheduler or
+    // notifier teardown.
+#if MYOS_CONCURRENCY_PROBE == 15
+    if (probe_root) {
+        //Confirmatory experiment.
+        // Exit condition: remove with the external deferred-report harness
+        // once it can reject the first callback at this exact boundary.
+        probe15_arm_report_retry(watcher);
+    }
+#endif
+    if (report_notifier.notify()) {
+#if MYOS_CONCURRENCY_PROBE == 15
+        static_cast<void>(probe15_wakes.fetch_add<libk::MemoryOrder::AcqRel>(1));
+#endif
+    }
     return true;
 }
 
@@ -479,6 +1097,55 @@ void degrade_record(ObservationRecord& record) noexcept {
 }
 
 } // namespace
+
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+//Confirmatory experiment.
+// Exit condition: remove after one stop-world investigation attributes the
+// ready-phase timeout to timer programming, trap delivery, or watchdog
+// candidate progression without this state snapshot.
+//
+// This is the single external definition matching the declaration in
+// concurrency.hpp.  The probe helpers above may remain anonymous, but the
+// snapshot itself is read by public diagnostic code and must not have hidden
+// linkage.
+Probe15CpuState probe15_cpu_state[max_cpu_count]{};
+#endif
+
+#if MYOS_CONCURRENCY_DIAG >= 3
+auto ReportQueue::publish(const ReportRecord& value) noexcept -> bool {
+    const u64 head = head_.load<libk::MemoryOrder::Relaxed>();
+    const u64 tail = tail_.load<libk::MemoryOrder::Acquire>();
+    if (head - tail >= capacity) {
+        // ReportQueue is SPSC, so the sole watchdog writer can saturate the
+        // loss counter with one load/store pair.  Do not turn this diagnostic
+        // hint into a CAS retry loop on the IRQ-off producer path.
+        const u64 current = lost_.load<libk::MemoryOrder::Relaxed>();
+        lost_.store<libk::MemoryOrder::Relaxed>(
+            current == libk::numeric_limits<u64>::max()
+                ? current : current + 1);
+        return false;
+    }
+    records_[head % capacity] = value;
+    head_.store<libk::MemoryOrder::Release>(head + 1);
+    return true;
+}
+
+auto ReportQueue::consume(ReportRecord& value) noexcept -> bool {
+    const u64 tail = tail_.load<libk::MemoryOrder::Relaxed>();
+    const u64 head = head_.load<libk::MemoryOrder::Acquire>();
+    if (tail == head) {
+        return false;
+    }
+    value = records_[tail % capacity];
+    tail_.store<libk::MemoryOrder::Release>(tail + 1);
+    return true;
+}
+
+auto ReportQueue::pending() const noexcept -> bool {
+    return tail_.load<libk::MemoryOrder::Acquire>()
+        != head_.load<libk::MemoryOrder::Acquire>();
+}
+#endif
 
 auto AtomicSnapshotWriter::begin(
     libk::Atomic<u64>& sequence,
@@ -2314,6 +2981,566 @@ auto current_core() noexcept -> CpuDiagnosticsCore* {
 #endif
 }
 
+auto ReportNotifier::install(Callback notifier) noexcept -> bool {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    if (state_.load<libk::MemoryOrder::Acquire>() != 0) {
+        // Binding is an initialization operation, not a callback swap.  A
+        // repeated bind must leave both the live callback and any teardown
+        // readers untouched.
+        return false;
+    }
+    callback_ = notifier;
+    state_.store<libk::MemoryOrder::Release>(bound_bit);
+    return true;
+#else
+    static_cast<void>(notifier);
+    return false;
+#endif
+}
+
+void ReportNotifier::unbind() noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    static_cast<void>(state_.fetch_and<libk::MemoryOrder::AcqRel>(
+        reader_mask));
+    while ((state_.load<libk::MemoryOrder::Acquire>() & reader_mask) != 0) {
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+    callback_.reset();
+#endif
+}
+
+auto ReportNotifier::notify() noexcept -> bool {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    u64 observed = state_.load<libk::MemoryOrder::Acquire>();
+    if ((observed & bound_bit) == 0
+        || (observed & reader_mask) == reader_mask) {
+        return false;
+    }
+    // A single strong CAS is intentional.  The producer's contract is
+    // best-effort; contention or an unbind is surfaced as a false result
+    // rather than turned into a hidden spin.
+    if (!state_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(
+                observed, observed + reader_bit)) {
+        return false;
+    }
+    const bool notified = callback_ && callback_();
+    static_cast<void>(state_.fetch_sub<libk::MemoryOrder::Release>(
+        reader_bit));
+    return notified;
+#else
+    return false;
+#endif
+}
+
+auto bind_report_notifier(ReportNotifier::Callback notifier) noexcept -> bool {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    return report_notifier.install(notifier);
+#else
+    static_cast<void>(notifier);
+    return false;
+#endif
+}
+
+void unbind_report_notifier() noexcept {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    report_notifier.unbind();
+#endif
+}
+
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+void probe15_program(
+    CpuId cpu,
+    u64 now_tick,
+    u64 requested_deadline,
+    u64 programmed_deadline,
+    bool timer_available,
+    bool program_ok,
+    bool watchdog_armed,
+    u64 watchdog_deadline) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after one stop-world investigation attributes
+    // the ready-phase timeout to timer programming or deadline ownership.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr) {
+        return;
+    }
+    static_cast<void>(state->program_count.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    state->program_now.store<libk::MemoryOrder::Release>(now_tick);
+    state->requested_deadline.store<libk::MemoryOrder::Release>(
+        requested_deadline);
+    state->programmed_deadline.store<libk::MemoryOrder::Release>(
+        programmed_deadline);
+    state->program_ok.store<libk::MemoryOrder::Release>(
+        program_ok ? 1U : 0U);
+    state->timer_available.store<libk::MemoryOrder::Release>(
+        timer_available ? 1U : 0U);
+    state->watchdog_armed.store<libk::MemoryOrder::Release>(
+        watchdog_armed ? 1U : 0U);
+    state->watchdog_deadline.store<libk::MemoryOrder::Release>(
+        watchdog_deadline);
+    state->idle_enter_phase.store<libk::MemoryOrder::Release>(
+        probe_phase.load<libk::MemoryOrder::Acquire>());
+}
+
+void probe15_timer_enter(CpuId cpu, u64 now_tick) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after one stop-world investigation attributes
+    // the timeout to timer delivery or lack of trap entry.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr) {
+        return;
+    }
+    static_cast<void>(state->timer_enter_count.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    state->timer_now.store<libk::MemoryOrder::Release>(now_tick);
+    state->timer_irq_off.store<libk::MemoryOrder::Release>(
+        arch::interrupts_enabled() ? 0U : 1U);
+}
+
+void probe15_timer_fire(CpuId cpu, u64 now_tick) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage D external timer harness once it
+    // can independently identify the watchdog deadline callback.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() != 0) {
+        if (Probe15CpuState* const state = probe15_cpu(cpu);
+            state != nullptr) {
+            static_cast<void>(state->watchdog_fire_count.fetch_add<
+                libk::MemoryOrder::AcqRel>(1));
+            state->watchdog_now.store<libk::MemoryOrder::Release>(now_tick);
+            state->watchdog_phase.store<libk::MemoryOrder::Release>(
+                probe_phase.load<libk::MemoryOrder::Acquire>());
+        }
+    }
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    const bool boot =
+        cpu.raw == probe15_boot_cpu.load<libk::MemoryOrder::Acquire>();
+    if (probe15_hold_consumer.load<libk::MemoryOrder::Acquire>() == 0
+        || !boot
+        || probe_phase.load<libk::MemoryOrder::Acquire>() != 0x1501) {
+        return;
+    }
+    const u32 prior_ready_fires = probe15_ready_fires.fetch_add<
+        libk::MemoryOrder::AcqRel>(1);
+    probe15_timer_path.store<libk::MemoryOrder::Release>(1);
+    probe15_producer_irq_off.store<libk::MemoryOrder::Release>(
+        arch::interrupts_enabled() ? 0U : 1U);
+    // The first ready fire is the publication baseline. A destructive retry
+    // deliberately keeps the mailbox pending through a later tick, so
+    // rewriting this sample on every tick would turn a valid retry into a
+    // false `pending_before` failure.
+    if (prior_ready_fires == 0) {
+        if (CpuDiagnosticsCore* const core = current_core(); core != nullptr) {
+            probe15_pending_before.store<libk::MemoryOrder::Release>(
+                core->reports.pending() ? 1U : 0U);
+            probe15_wakes_before.store<libk::MemoryOrder::Release>(
+                probe15_wakes.load<libk::MemoryOrder::Acquire>());
+        }
+    }
+}
+
+void probe15_after_timer(CpuId cpu) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage D external timer harness once the
+    // real deadline callback can own the report/overflow continuation.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0
+        || probe15_hold_consumer.load<libk::MemoryOrder::Acquire>() == 0
+        || cpu.raw != probe15_boot_cpu.load<libk::MemoryOrder::Acquire>()
+        || probe_phase.load<libk::MemoryOrder::Acquire>() != 0x1501) {
+        return;
+    }
+    CpuDiagnosticsCore* const watcher = current_core();
+    void* const owner = arch::current_cpu_owner();
+    if (watcher == nullptr || owner == nullptr) {
+        return;
+    }
+    auto& local = *static_cast<CpuLocal*>(owner);
+    CpuRegistry* const registry = local.runtime_ == nullptr
+        ? nullptr : local.runtime_->owner_registry;
+    if (registry == nullptr || !watcher->reports.pending()) {
+        return;
+    }
+    //Confirmatory experiment.
+    // Exit condition: remove with the external deferred-report harness once
+    // it can force one failed observer wake and the following real retry.
+    // Keep the mailbox pending until a later watchdog tick proves the retry;
+    // otherwise this helper would consume the report before the retry path.
+    if (probe15_retry_first_fail.load<libk::MemoryOrder::Acquire>() != 0
+        && probe15_retry_success.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    u32 expected{};
+    if (!probe15_stage_started.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, 1)) {
+        return;
+    }
+    const CpuId target{
+        probe15_target_cpu.load<libk::MemoryOrder::Acquire>()};
+    ObservationShard* const shard = registry->observations(target);
+    if (shard == nullptr) {
+        probe15_report_ok.store<libk::MemoryOrder::Release>(0);
+    } else {
+        static_cast<void>(probe15_report_stage(cpu, *watcher, *shard));
+    }
+    probe15_hold_consumer.store<libk::MemoryOrder::Release>(0);
+    probe_phase.store<libk::MemoryOrder::Release>(0x1500);
+}
+
+void probe15_idle_enter(CpuId cpu) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after the stop-world snapshot proves whether the
+    // normal context reached the WFI boundary independently of a WFI return.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr) {
+        return;
+    }
+    static_cast<void>(state->idle_enter_count.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    state->idle_enter_now.store<libk::MemoryOrder::Release>(
+        arch::read_clock().ticks());
+    state->idle_enter_phase.store<libk::MemoryOrder::Release>(
+        probe_phase.load<libk::MemoryOrder::Acquire>());
+}
+
+void probe15_idle_observe(CpuId cpu) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove once the ready-phase timeout is attributed to
+    // timer delivery or root-candidate progression.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() != 0) {
+        if (Probe15CpuState* const state = probe15_cpu(cpu);
+            state != nullptr) {
+            static_cast<void>(state->idle_return_count.fetch_add<
+                libk::MemoryOrder::AcqRel>(1));
+            state->idle_return_now.store<libk::MemoryOrder::Release>(
+                arch::read_clock().ticks());
+            state->idle_return_phase.store<libk::MemoryOrder::Release>(
+                probe_phase.load<libk::MemoryOrder::Acquire>());
+        }
+    }
+    if (Probe15CpuState* const state = probe15_cpu(
+            CpuId{probe15_boot_cpu.load<libk::MemoryOrder::Acquire>()});
+        state != nullptr
+        && state->wake_credit_active.load<libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_state_throttled.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_timer_queued.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_accepts.load<
+               libk::MemoryOrder::Acquire>() == 2
+        && state->wake_credit_repeated.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_consumed.load<
+               libk::MemoryOrder::Acquire>() == 1
+        && state->wake_credit_real_blocks.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_blocked_attempted.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_blocked_throttled.load<
+               libk::MemoryOrder::Acquire>() != 0
+        && state->wake_credit_blocked_credit.load<
+               libk::MemoryOrder::Acquire>() == 0
+        && state->wake_credit_reported.exchange<
+               libk::MemoryOrder::AcqRel>(1) == 0) {
+        diag::console::print<
+            "concurrency-probe: stage-d wake-credit-ok "
+            "throttled={} timer={} accepts={} repeated={} consumed={} "
+            "real-blocks={} blocked-throttled={} blocked-credit={}\n">(
+            state->wake_credit_state_throttled.load<
+                libk::MemoryOrder::Acquire>(),
+            state->wake_credit_timer_queued.load<
+                libk::MemoryOrder::Acquire>(),
+            state->wake_credit_accepts.load<libk::MemoryOrder::Acquire>(),
+            state->wake_credit_repeated.load<libk::MemoryOrder::Acquire>(),
+            state->wake_credit_consumed.load<libk::MemoryOrder::Acquire>(),
+            state->wake_credit_real_blocks.load<
+                libk::MemoryOrder::Acquire>(),
+            state->wake_credit_blocked_throttled.load<
+                libk::MemoryOrder::Acquire>(),
+            state->wake_credit_blocked_credit.load<
+                libk::MemoryOrder::Acquire>());
+    }
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0
+        || probe_phase.load<libk::MemoryOrder::Acquire>() != 0x1501) {
+        return;
+    }
+    const u64 observe_at = probe15_observe_at.load<libk::MemoryOrder::Acquire>();
+    if (observe_at == 0 || arch::read_clock().ticks() < observe_at
+        || probe15_debug_once.exchange<libk::MemoryOrder::AcqRel>(1) != 0) {
+        return;
+    }
+    diag::console::print<
+        "concurrency-probe: stage-d ready-debug observer={} boot={} "
+        "fires={} root-passes={} "
+        "root-state={} attempts={} queued={} lost={} phase={:#x}\n">(
+        cpu.raw,
+        probe15_boot_cpu.load<libk::MemoryOrder::Acquire>(),
+        probe15_ready_fires.load<libk::MemoryOrder::Acquire>(),
+        probe15_root_passes.load<libk::MemoryOrder::Acquire>(),
+        probe15_root_state.load<libk::MemoryOrder::Acquire>(),
+        probe15_root_queue_attempts.load<libk::MemoryOrder::Acquire>(),
+        probe15_root_queue_ok.load<libk::MemoryOrder::Acquire>(),
+        probe15_root_queue_lost.load<libk::MemoryOrder::Acquire>(),
+        probe_phase.load<libk::MemoryOrder::Acquire>());
+}
+
+void probe15_wake_credit_arm(
+    CpuId cpu,
+    u64 binding,
+    bool throttled,
+    bool timer_queued,
+    bool first_accepted,
+    bool repeated_accepted) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the same reclaimer Binding through these state transitions.
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr) {
+        return;
+    }
+    state->wake_credit_binding.store<libk::MemoryOrder::Release>(binding);
+    state->wake_credit_state_throttled.store<libk::MemoryOrder::Release>(
+        throttled ? 1U : 0U);
+    state->wake_credit_timer_queued.store<libk::MemoryOrder::Release>(
+        timer_queued ? 1U : 0U);
+    state->wake_credit_accepts.store<libk::MemoryOrder::Release>(
+        (first_accepted ? 1U : 0U) + (repeated_accepted ? 1U : 0U));
+    state->wake_credit_repeated.store<libk::MemoryOrder::Release>(
+        repeated_accepted ? 1U : 0U);
+    state->wake_credit_active.store<libk::MemoryOrder::Release>(1);
+}
+
+void probe15_wake_credit_block(
+    CpuId cpu,
+    u64 binding,
+    bool had_credit) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the same reclaimer Binding through these state transitions.
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr
+        || state->wake_credit_active.load<libk::MemoryOrder::Acquire>() == 0
+        || state->wake_credit_binding.load<libk::MemoryOrder::Acquire>()
+            != binding) {
+        return;
+    }
+    if (had_credit) {
+        static_cast<void>(state->wake_credit_consumed.fetch_add<
+            libk::MemoryOrder::AcqRel>(1));
+    } else {
+        static_cast<void>(state->wake_credit_real_blocks.fetch_add<
+            libk::MemoryOrder::AcqRel>(1));
+    }
+}
+
+auto probe15_wake_credit_prepare_blocked(
+    CpuId cpu,
+    u64 binding) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the same reclaimer Binding through these state transitions.
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr
+        || state->wake_credit_active.load<libk::MemoryOrder::Acquire>() == 0
+        || state->wake_credit_binding.load<libk::MemoryOrder::Acquire>()
+            != binding
+        || state->wake_credit_consumed.load<libk::MemoryOrder::Acquire>()
+            == 0
+        || state->wake_credit_real_blocks.load<libk::MemoryOrder::Acquire>()
+            == 0) {
+        return false;
+    }
+    u32 expected{};
+    return state->wake_credit_blocked_attempted.compare_exchange_strong<
+        libk::MemoryOrder::AcqRel,
+        libk::MemoryOrder::Acquire>(expected, 1);
+}
+
+void probe15_wake_credit_blocked(
+    CpuId cpu,
+    u64 binding,
+    bool accepted,
+    bool throttled,
+    bool had_credit) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the same reclaimer Binding through these state transitions.
+    Probe15CpuState* const state = probe15_cpu(cpu);
+    if (state == nullptr
+        || state->wake_credit_binding.load<libk::MemoryOrder::Acquire>()
+            != binding) {
+        return;
+    }
+    state->wake_credit_blocked_throttled.store<libk::MemoryOrder::Release>(
+        accepted && throttled ? 1U : 0U);
+    state->wake_credit_blocked_credit.store<libk::MemoryOrder::Release>(
+        had_credit ? 1U : 0U);
+}
+
+void probe15_arm_report_retry(CpuId cpu) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the external deferred-report harness once
+    // it can reject the first callback at the production report boundary.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0) {
+        return;
+    }
+    probe15_retry_cpu.store<libk::MemoryOrder::Release>(cpu.raw);
+    probe15_retry_armed.store<libk::MemoryOrder::Release>(1);
+}
+
+auto probe15_report_retry_gate(CpuId cpu) noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove with the external deferred-report harness once
+    // it can reject the first callback at the production report boundary.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0
+        || probe15_retry_cpu.load<libk::MemoryOrder::Acquire>() != cpu.raw) {
+        return false;
+    }
+    u32 expected = 1;
+    if (!probe15_retry_armed.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, 0)) {
+        return false;
+    }
+    probe15_retry_first_fail.store<libk::MemoryOrder::Release>(1);
+    return true;
+}
+
+void probe15_report_retry_tick(bool notified) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove with the external deferred-report harness once
+    // it can observe the retry from the mailbox without this hook.
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() == 0
+        || probe15_retry_first_fail.load<libk::MemoryOrder::Acquire>() == 0
+        || probe15_retry_success.load<libk::MemoryOrder::Acquire>() != 0) {
+        return;
+    }
+    static_cast<void>(probe15_retry_attempts.fetch_add<
+        libk::MemoryOrder::AcqRel>(1));
+    if (notified) {
+        probe15_retry_success.store<libk::MemoryOrder::Release>(1);
+        // `probe15_wakes` counts successful scheduler notifications, not
+        // publish attempts. The forced first callback rejection therefore
+        // leaves the count unchanged until this retry succeeds.
+        static_cast<void>(probe15_wakes.fetch_add<libk::MemoryOrder::AcqRel>(1));
+    }
+}
+
+#endif
+
+auto drain_reports(CpuRegistry& registry) noexcept -> usize {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    // Report output is deliberately restricted to a normal kernel-thread
+    // context. The watchdog producer is IRQ-off and never calls this path.
+    if (!arch::interrupts_enabled()) {
+        return 0;
+    }
+#if MYOS_CONCURRENCY_PROBE == 15
+    if (probe15_hold_consumer.load<libk::MemoryOrder::Acquire>() != 0) {
+        return 0;
+    }
+#endif
+    usize drained{};
+    for (usize index = 0; index < registry.count(); ++index) {
+        const CpuRuntime* const runtime = registry.runtime(CpuId{index});
+        if (runtime == nullptr || runtime->diagnostics == nullptr) {
+            continue;
+        }
+        auto& queue = runtime->diagnostics->concurrency.reports;
+        ReportRecord report{};
+        while (queue.consume(report)) {
+            ++drained;
+#if MYOS_CONCURRENCY_PROBE == 15
+            static_cast<void>(probe15_consumed.fetch_add<
+                libk::MemoryOrder::AcqRel>(1));
+            probe15_consumer_irq_on.store<libk::MemoryOrder::Release>(
+                arch::interrupts_enabled() ? 1U : 0U);
+#endif
+            diag::console::print<
+                "[concurrency] report watcher={} target={} "
+                "root-kind={} root={:#x} state={} class={} evidence={} "
+                "age={} nodes={} truncated={} pending={}/{} omitted={}\n">(
+                report.watcher.raw,
+                report.target.raw,
+                static_cast<u32>(report.root.kind),
+                report.root.identity,
+                static_cast<u32>(report.state),
+                stall_class_name(report.classification),
+                static_cast<u32>(report.evidence),
+                report.age,
+                report.graph.count,
+                report.graph.truncated,
+                report.graph.pending_shown,
+                report.graph.pending_total,
+                report.graph.pending_omitted);
+            for (usize node = 0; node < report.graph.count; ++node) {
+                const NodeRef value = report.graph.node(node);
+                diag::console::print<
+                    "  graph[{}] parent={} edge={} kind={} node={:#x} "
+                    "gen={}\n">(
+                    node,
+                    report.graph.parents[node],
+                    static_cast<u32>(report.graph.edge(node)),
+                    static_cast<u32>(value.kind),
+                    value.identity,
+                    value.generation);
+            }
+        }
+    }
+#if MYOS_CONCURRENCY_PROBE == 15
+    if (probe15_active.load<libk::MemoryOrder::Acquire>() != 0
+        && probe15_consumed.load<libk::MemoryOrder::Acquire>() != 0
+        && probe15_summary.exchange<libk::MemoryOrder::AcqRel>(1) == 0) {
+        const bool ok = probe15_graph_ok.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_set_ok.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_report_ok.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_record_ok.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_loss_ok.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_timer_path.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_producer_irq_off.load<libk::MemoryOrder::Acquire>() != 0
+            && probe15_consumer_irq_on.load<libk::MemoryOrder::Acquire>() != 0;
+        diag::console::print<
+            "concurrency-probe: stage-d report-{} graph={} set={} "
+            "timer-path={} producer-irq-off={} consumer-irq-on={} "
+            "record={} loss={} "
+            "queued={} wakes={} retry-first-fail={} retry-attempts={} "
+            "retry-success={} consumed={}\n">(
+            ok ? "ok" : "fail",
+            probe15_graph_ok.load<libk::MemoryOrder::Acquire>(),
+            probe15_set_ok.load<libk::MemoryOrder::Acquire>(),
+            probe15_timer_path.load<libk::MemoryOrder::Acquire>(),
+            probe15_producer_irq_off.load<libk::MemoryOrder::Acquire>(),
+            probe15_consumer_irq_on.load<libk::MemoryOrder::Acquire>(),
+            probe15_record_ok.load<libk::MemoryOrder::Acquire>(),
+            probe15_loss_ok.load<libk::MemoryOrder::Acquire>(),
+            probe15_report_ok.load<libk::MemoryOrder::Acquire>(),
+            probe15_wakes.load<libk::MemoryOrder::Acquire>(),
+            probe15_retry_first_fail.load<libk::MemoryOrder::Acquire>(),
+            probe15_retry_attempts.load<libk::MemoryOrder::Acquire>(),
+            probe15_retry_success.load<libk::MemoryOrder::Acquire>(),
+            probe15_consumed.load<libk::MemoryOrder::Acquire>());
+    }
+#endif
+    return drained;
+#else
+    static_cast<void>(registry);
+    return 0;
+#endif
+}
+
 auto current_shard() noexcept -> ObservationShard* {
 #if MYOS_CONCURRENCY_DIAG >= 1
     CpuDiagnosticsCore* const core = current_core();
@@ -2720,6 +3947,17 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     if (watcher == nullptr) {
         return;
     }
+    // The mailbox is the only durable report-pending truth.  A failed
+    // observer wake (Busy, Unavailable, Retained, or notifier contention) is
+    // retried from the next watchdog tick without a second pending registry;
+    // the attempt remains one bounded notify and the RemoteRequest coalesces
+    // any already-retained wake edge.
+    if (watcher->reports.pending()) {
+        const bool notified = report_notifier.notify();
+#if MYOS_CONCURRENCY_PROBE == 15
+        probe15_report_retry_tick(notified);
+#endif
+    }
     // A fixed ring assignment gives every CPU one peer to inspect while
     // keeping the candidate single-writer. If a peer is unavailable, inspect
     // the local shard; this also covers single-hart systems.
@@ -2755,6 +3993,16 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                              WatchdogThresholds thresholds,
                              StallAction action,
                              WaitKind wait_kind) noexcept -> bool {
+#if MYOS_CONCURRENCY_PROBE == 15
+        //Confirmatory experiment.
+        // Exit condition: remove once the ready-phase timeout is attributed
+        // to timer delivery or root-candidate progression.
+        const bool probe_root = probe15_is_root(sample.root);
+        if (probe_root) {
+            static_cast<void>(probe15_root_passes.fetch_add<
+                libk::MemoryOrder::AcqRel>(1));
+        }
+#endif
         WatchdogCandidate* slot{};
         usize slot_index{};
         for (usize index = 0;
@@ -2811,6 +4059,12 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             slot->active_intervals.store<libk::MemoryOrder::Release>(0);
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(WatchdogCandidate::State::Clear));
+#if MYOS_CONCURRENCY_PROBE == 15
+            if (probe_root) {
+                probe15_root_state.store<libk::MemoryOrder::Release>(
+                    static_cast<u32>(WatchdogCandidate::State::Clear));
+            }
+#endif
             return true;
         }
 
@@ -2838,6 +4092,12 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             state = WatchdogCandidate::State::Suspected;
             slot->state.store<libk::MemoryOrder::Release>(
                 static_cast<u32>(state));
+#if MYOS_CONCURRENCY_PROBE == 15
+            if (probe_root) {
+                probe15_root_state.store<libk::MemoryOrder::Release>(
+                    static_cast<u32>(state));
+            }
+#endif
             record(
                 FlightDomain::Watchdog,
                 FlightEvent::WatchdogSuspected,
@@ -2942,6 +4202,12 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
         }
         slot->state.store<libk::MemoryOrder::Release>(
             static_cast<u32>(confirmed));
+#if MYOS_CONCURRENCY_PROBE == 15
+        if (probe_root) {
+            probe15_root_state.store<libk::MemoryOrder::Release>(
+                static_cast<u32>(confirmed));
+        }
+#endif
         record(
             FlightDomain::Watchdog,
             livelock ? FlightEvent::WatchdogLivelock
@@ -2958,18 +4224,20 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
             target_core->coordinator.signatures[signature_index].store<
                 libk::MemoryOrder::Release>(report_signature);
         }
-        if (action != StallAction::Record
-            && report_stall(
-                cpu,
-                target_cpu,
-                sample.root,
-                confirmed,
-                graph.classification,
-                graph.evidence,
-                age)) {
-            static_cast<void>(target_core->status().flags.fetch_or<
-                libk::MemoryOrder::Release>(
-                DiagnosticStatus::StallReported));
+        if (action == StallAction::Report) {
+            if (queue_report(
+                    cpu,
+                    target_cpu,
+                    sample.root,
+                    confirmed,
+                    graph.classification,
+                    graph.evidence,
+                    age,
+                    graph)) {
+                static_cast<void>(target_core->status().flags.fetch_or<
+                    libk::MemoryOrder::Release>(
+                    DiagnosticStatus::StallReported));
+            }
         }
 #if MYOS_CONCURRENCY_PROBE == 12
         //Confirmatory experiment.
@@ -3724,11 +4992,15 @@ auto analyze(
     scratch.evidence = EvidenceGrade::None;
     scratch.count = 0;
     scratch.truncated = false;
+    scratch.pending_total = 0;
+    scratch.pending_shown = 0;
+    scratch.pending_omitted = 0;
     for (usize index = 0; index < graph_capacity; ++index) {
         scratch.set_node(index, {});
         scratch.path_meta[index] = 0;
         scratch.fingerprints[index] = 0;
         scratch.parents[index] = 0xffU;
+        scratch.edges[index] = EdgeKind::None;
     }
     if (!root) {
         scratch.classification = StallClass::Inconclusive;
@@ -3857,7 +5129,9 @@ auto analyze(
         return true;
     };
 
-    const auto append = [&](NodeRef node, u8 parent) noexcept -> bool {
+    const auto append = [&](NodeRef node,
+                            u8 parent,
+                            EdgeKind edge) noexcept -> bool {
         if (!node) {
             return true;
         }
@@ -3877,16 +5151,16 @@ auto analyze(
         }
         if (scratch.count >= graph_capacity) {
             scratch.truncated = true;
-            scratch.classification = StallClass::Truncated;
-            return false;
+            return true;
         }
         scratch.set_node(scratch.count, node);
         scratch.parents[scratch.count] = parent;
+        scratch.edges[scratch.count] = edge;
         ++scratch.count;
         return true;
     };
 
-    if (!append(root, 0xffU)) {
+    if (!append(root, 0xffU, EdgeKind::None)) {
         scratch.evidence = EvidenceGrade::Inconclusive;
         return false;
     }
@@ -3924,7 +5198,10 @@ auto analyze(
         }
         degraded_graph = degraded_graph || degraded;
         scratch.fingerprints[cursor] = fingerprint;
-        NodeRef next{};
+        const auto append_relation = [&](NodeRef node,
+                                         EdgeKind edge) noexcept {
+            return append(node, static_cast<u8>(cursor), edge);
+        };
         if (current.kind == NodeRef::Kind::Observation) {
             if (cursor == 0) {
                 root_observation = snapshot;
@@ -3946,6 +5223,26 @@ auto analyze(
                     scratch.classification =
                         terminal_class(snapshot, false);
                 }
+            }
+            // A coherent observation may publish all three relations. Keep
+            // each edge explicit even when the operation-specific classifier
+            // below decides which relation is the immediate cause.
+            if (snapshot.wait_target
+                && !append_relation(
+                    NodeRef::observation(snapshot.wait_target),
+                    EdgeKind::Wait)) {
+                scratch.evidence = EvidenceGrade::Inconclusive;
+                return false;
+            }
+            if (snapshot.driver
+                && !append_relation(snapshot.driver, EdgeKind::Driver)) {
+                scratch.evidence = EvidenceGrade::Inconclusive;
+                return false;
+            }
+            if (snapshot.blocker
+                && !append_relation(snapshot.blocker, EdgeKind::Blocker)) {
+                scratch.evidence = EvidenceGrade::Inconclusive;
+                return false;
             }
             if (ready_publication && cursor != 0
                 && snapshot.record_kind == RecordKind::ExecutionActor
@@ -3978,41 +5275,32 @@ auto analyze(
                 if (delivery_pending) {
                     scratch.classification =
                         StallClass::TransportStall;
-                    next = root_observation.blocker;
                 } else if (queued || wake_credit || accepted) {
                     scratch.classification =
                         StallClass::RunnableStarvation;
                 } else {
                     scratch.classification = StallClass::LostWake;
                 }
-                if (!delivery_pending) {
-                    next = {};
-                }
-            } else {
-                next = snapshot.wait_target
-                    ? NodeRef::observation(snapshot.wait_target)
-                    : snapshot.driver;
-                if (!next
-                    && snapshot.blocker.kind != NodeRef::Kind::None) {
-                    next = snapshot.blocker;
-                }
-                if (!next
-                    && scratch.classification == StallClass::None) {
-                    scratch.classification =
-                        terminal_class(snapshot, false);
-                } else if (
-                    next.kind == NodeRef::Kind::External
-                    && scratch.classification == StallClass::None) {
-                    scratch.classification =
-                        terminal_class(snapshot, false);
-                }
+            } else if (scratch.classification == StallClass::None
+                       && ((!snapshot.wait_target && !snapshot.driver
+                            && !snapshot.blocker)
+                           || snapshot.driver.kind == NodeRef::Kind::External)) {
+                scratch.classification = terminal_class(snapshot, false);
             }
         } else if (current.kind == NodeRef::Kind::Cpu) {
             if (cpu.has_wait) {
-                next = cpu.wait.wait
-                    ? NodeRef::observation(
-                          ObservationKey{cpu.wait.wait})
-                    : cpu.wait.driver;
+                if (cpu.wait.wait
+                    && !append_relation(
+                        NodeRef::observation(ObservationKey{cpu.wait.wait}),
+                        EdgeKind::Wait)) {
+                    scratch.evidence = EvidenceGrade::Inconclusive;
+                    return false;
+                }
+                if (cpu.wait.driver
+                    && !append_relation(cpu.wait.driver, EdgeKind::Driver)) {
+                    scratch.evidence = EvidenceGrade::Inconclusive;
+                    return false;
+                }
             } else if (scratch.classification == StallClass::None) {
                 scratch.classification = StallClass::OpenOwnerStall;
             }
@@ -4025,14 +5313,34 @@ auto analyze(
                         continue;
                     }
                     any = true;
-                    if (!append(
-                            NodeRef::cpu(
-                                CpuId{word * 64 + bit_index}),
-                            static_cast<u8>(cursor))) {
+                    ++scratch.pending_total;
+                    const CpuId member{word * 64 + bit_index};
+                    const CpuDescriptor* descriptor = registry == nullptr
+                        ? nullptr : registry->descriptor(member);
+                    const CpuRuntime* runtime = registry == nullptr
+                        ? nullptr : registry->runtime(member);
+                    const bool available = descriptor != nullptr
+                        && runtime != nullptr
+                        && descriptor->state() == CpuState::Online
+                        && descriptor->runtime_alive()
+                        && runtime->diagnostics != nullptr;
+                    if (!available || scratch.count >= graph_capacity) {
+                        ++scratch.pending_omitted;
+                        scratch.truncated = true;
+                        continue;
+                    }
+                    const u8 before = scratch.count;
+                    if (!append_relation(NodeRef::cpu(member), EdgeKind::Member)) {
                         scratch.evidence = EvidenceGrade::Inconclusive;
                         return false;
                     }
+                    if (scratch.count != before) {
+                        ++scratch.pending_shown;
+                    }
                 }
+            }
+            if (any && scratch.classification == StallClass::None) {
+                scratch.classification = terminal_class(snapshot, false);
             }
             if (!any && scratch.classification == StallClass::None) {
                 scratch.classification = terminal_class(snapshot, false);
@@ -4041,10 +5349,6 @@ auto analyze(
             if (scratch.classification == StallClass::None) {
                 scratch.classification = StallClass::ExternalWait;
             }
-        }
-        if (next && !append(next, static_cast<u8>(cursor))) {
-            scratch.evidence = EvidenceGrade::Inconclusive;
-            return false;
         }
     }
 
@@ -4136,8 +5440,6 @@ auto stall_class_name(StallClass value) noexcept -> const char* {
         return "unclassified-cpu-stall";
     case StallClass::Inconclusive:
         return "inconclusive";
-    case StallClass::Truncated:
-        return "truncated";
     }
     return "unknown";
 }
@@ -4223,6 +5525,278 @@ auto stall_class_name(StallClass value) noexcept -> const char* {
 
 #endif
 
+#if MYOS_CONCURRENCY_PROBE == 7
+[[gnu::noinline, nodiscard]] auto probe7_transport_aba() noexcept -> bool {
+    //Confirmatory experiment.
+    // Exit condition: remove when an external transport harness can pause an
+    // old sender between token capture and failure.
+    kernel::IpiDelivery transport{};
+    transport.publish();
+    const auto old_token = transport.claim();
+    const bool old_claim_ok = old_token
+        && transport.state() == kernel::IpiDelivery::State::InFlight
+        && transport.generation() == old_token->generation;
+
+    transport.consume();
+    transport.publish();
+    const bool republish_ok = old_token
+        && transport.state() == kernel::IpiDelivery::State::NeedsKick
+        && transport.generation() == old_token->generation;
+    const auto new_token = transport.claim();
+    const bool new_claim_ok = new_token
+        && old_token
+        && new_token->generation != old_token->generation
+        && transport.state() == kernel::IpiDelivery::State::InFlight;
+
+    // Model an old sender paused after capturing old_token: completing that
+    // edge and claiming a newer one must leave the newer InFlight word
+    // untouched when the old token is finally failed.
+    const bool stale_failure_ignored = old_token
+        && !transport.fail_if_inflight(*old_token)
+        && new_token
+        && transport.state() == kernel::IpiDelivery::State::InFlight
+        && transport.generation() == new_token->generation;
+    const bool current_failure_retries = new_token
+        && transport.fail_if_inflight(*new_token)
+        && transport.retry_needed()
+        && transport.generation() == new_token->generation;
+
+    transport.consume();
+    const bool transport_idle = transport.state()
+            == kernel::IpiDelivery::State::Idle
+        && !transport.pending()
+        && transport.generation()
+            == (new_token ? new_token->generation : 0);
+    return old_claim_ok && republish_ok && new_claim_ok
+        && stale_failure_ignored && current_failure_retries
+        && transport_idle;
+}
+
+[[gnu::noinline]] void run_probe7(
+    CpuRegistry* registry,
+    CpuId cpu,
+    CpuId boot) noexcept {
+    //Confirmatory experiment.
+    // Exit condition: remove when the external kernel fault harness can stop
+    // the real remote scheduler path at every transport phase and inspect
+    // exact operation/request generations.
+    static_cast<void>(
+        probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
+    while (probe_joined.load<libk::MemoryOrder::Acquire>()
+        != registry->count()) {
+        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    }
+    if (cpu != boot) {
+        while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
+            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        }
+        return;
+    }
+
+    ObservationShard* const shard = registry->observations(boot);
+    bool ok = shard != nullptr;
+    u32 errors = ok ? 0 : 1U;
+    ObservationLease operation{};
+    ObservationLease other{};
+    ObservationLease actor{};
+    if (ok) {
+        operation = shard->reserve(
+            RecordKind::Operation,
+            0xd701,
+            7,
+            Expectation::InternalFinite,
+            SourceSite::current());
+        other = shard->reserve(
+            RecordKind::Operation,
+            0xd702,
+            8,
+            Expectation::InternalFinite,
+            SourceSite::current());
+        actor = shard->reserve(
+            RecordKind::ExecutionActor,
+            0xd703,
+            1,
+            Expectation::SchedulerControlled,
+            SourceSite::current());
+        ok = operation && other && actor;
+        if (!ok) {
+            errors |= 1U << 1;
+        }
+    }
+    const bool transport_aba_ok = probe7_transport_aba();
+    if (!transport_aba_ok) {
+        errors |= 1U << 12;
+    }
+    ok = ok && transport_aba_ok;
+
+    auto& queue = probe_remote_queue.emplace(boot);
+    auto& request = probe_remote_request.emplace(
+        sched::RemoteKind::Wake, &probe_remote_owner);
+    sched::RemotePostResult posted{};
+    kernel::IpiDelivery::Token first{};
+    ObservationKey projected_cause{};
+    if (ok) {
+        posted = queue.post(request, operation.key());
+        ObservationSnapshot delivery{};
+        auto delivery_lease = ObservationLease::borrow(posted.delivery);
+        projected_cause = request.diagnostic_cause(posted.delivery);
+        const bool posted_ok =
+            posted.disposition == sched::RemotePost::Inserted
+            && request.pending()
+            && delivery_lease.snapshot(delivery)
+            && delivery.record_kind == RecordKind::RemoteDelivery
+            && delivery.phase == static_cast<u32>(RemotePhase::NeedsKick)
+            && delivery.detail[0] == operation.key().raw
+            && delivery.detail[1]
+                == reinterpret_cast<u64>(&probe_remote_owner)
+            && delivery.detail[2] == boot.raw
+            // The home-CPU drain path uses this same bounded projection
+            // as Binding::publish_accept(); a single cause must survive
+            // the delivery snapshot even though it is not canonical.
+            && projected_cause == operation.key();
+        if (!posted_ok) {
+            errors |= 1U << 2;
+        }
+        ok = ok && posted_ok;
+
+        const auto same = queue.post(request, operation.key());
+        const auto other_post = queue.post(request, other.key());
+        const auto coalesced_cause = request.diagnostic_cause(
+            posted.delivery);
+        const bool coalesce_ok =
+            same.disposition == sched::RemotePost::Coalesced
+            && same.delivery == posted.delivery
+            && other_post.disposition == sched::RemotePost::Coalesced
+            && other_post.delivery == posted.delivery
+            // The bounded projection retains the first concrete cause.
+            // Later causes remain flight evidence; no per-request
+            // multi-cause truth feeds the analyzer yet.
+            && coalesced_cause == operation.key();
+        if (!coalesce_ok) {
+            errors |= 1U << 3;
+        }
+        ok = ok && coalesce_ok;
+
+        const auto claimed = queue.claim_transport();
+        if (claimed) {
+            first = *claimed;
+        }
+        delivery = {};
+        const bool flight_ok = claimed
+            && delivery_lease.snapshot(delivery)
+            && delivery.phase == static_cast<u32>(RemotePhase::InFlight)
+            && delivery.detail[3] == claimed->generation;
+        if (!flight_ok) {
+            errors |= 1U << 4;
+        }
+        ok = ok && flight_ok;
+
+        queue.transport_failed(first);
+        delivery = {};
+        const bool retry_ok = delivery_lease.snapshot(delivery)
+            && delivery.phase == static_cast<u32>(RemotePhase::Retry);
+        const auto retry = queue.claim_transport();
+        if (!retry_ok || !retry
+            || retry->generation == first.generation) {
+            errors |= 1U << 5;
+            ok = false;
+        }
+
+        sched::RemoteRequest* const taken = queue.take();
+        delivery = {};
+        const bool taken_ok = taken == &request
+            && delivery_lease.snapshot(delivery)
+            && delivery.phase == static_cast<u32>(RemotePhase::Taken);
+        if (!taken_ok) {
+            errors |= 1U << 6;
+        }
+        ok = ok && taken_ok;
+        queue.accepted(request, true);
+        delivery = {};
+        const bool accepted_ok = delivery_lease.snapshot(delivery)
+            && delivery.phase == static_cast<u32>(RemotePhase::Accepted);
+        if (!accepted_ok) {
+            errors |= 1U << 7;
+        }
+        ok = ok && accepted_ok;
+    }
+
+    if (request.pending()) {
+        queue.complete(request);
+    }
+    if (posted.delivery
+        && ObservationLease::borrow(posted.delivery)) {
+        errors |= 1U << 8;
+        ok = false;
+    }
+
+    if (operation && actor) {
+        actor.transition(
+            execution_blocked_phase,
+            execution_blocked_phase,
+            WaitKind::OperationCompletion,
+            NodeRef::observation(operation.key()));
+        actor.link_wait(
+            operation.key(),
+            WaitKind::OperationCompletion,
+            NodeRef::observation(operation.key()));
+        operation.publish(
+            OperationPhase::ReadyPublished,
+            NodeRef::observation(actor.key()));
+        WaitGraphScratch graph{};
+        const bool lost = analyze(operation.key(), graph)
+            && graph.evidence == EvidenceGrade::Confirmed
+            && graph.classification == StallClass::LostWake;
+        if (!lost) {
+            errors |= 1U << 9;
+        }
+        ok = ok && lost;
+
+        // Feed the projected cause into the same witness slot that
+        // Binding::publish_accept() updates after a remote drain.
+        actor.detail(2, projected_cause.raw);
+        graph = {};
+        const bool accepted = analyze(operation.key(), graph)
+            && graph.classification == StallClass::RunnableStarvation;
+        if (!accepted) {
+            errors |= 1U << 10;
+        }
+        ok = ok && accepted;
+
+        actor.detail(2, 0);
+        const auto transport = queue.post(request, operation.key());
+        operation.publish(
+            OperationPhase::ReadyPublished,
+            NodeRef::observation(actor.key()),
+            NodeRef::observation(transport.delivery));
+        graph = {};
+        const bool pending = analyze(operation.key(), graph)
+            && graph.classification == StallClass::TransportStall;
+        if (!pending) {
+            errors |= 1U << 11;
+        }
+        ok = ok && pending;
+        static_cast<void>(queue.cancel(request));
+    }
+
+    if (operation) {
+        operation.finish(static_cast<u32>(OperationPhase::Finished));
+    }
+    if (other) {
+        other.finish(static_cast<u32>(OperationPhase::Finished));
+    }
+    if (actor) {
+        actor.finish(1);
+    }
+    probe_remote_request.reset();
+    probe_remote_queue.reset();
+    diag::console::print<
+        "concurrency-probe: stage-d delivery-{} errors=0x{:x}\n">(
+        ok ? "ok" : "fail", errors);
+    probe_phase.store<libk::MemoryOrder::Release>(2);
+}
+#endif
+
 #if MYOS_CONCURRENCY_PROBE
 #if MYOS_CONCURRENCY_PROBE == 13
 void run_probe(u32) noexcept {}
@@ -4232,7 +5806,8 @@ void run_probe(u32 probe) noexcept {
     // Exit condition: remove after an external kernel scenario runner can
     // deterministically pause a borrower at pin and writer boundaries.
     if (probe != 1 && probe != 5 && probe != 6 && probe != 7
-        && probe != 8 && probe != 14 && (probe < 9 || probe > 12)) {
+        && probe != 8 && probe != 14 && probe != 15
+        && (probe < 9 || probe > 12)) {
         return;
     }
 
@@ -4882,6 +6457,19 @@ void run_probe(u32 probe) noexcept {
         return;
     }
 #endif
+#if MYOS_CONCURRENCY_PROBE == 15
+    if (probe == 15) {
+#if MYOS_CONCURRENCY_DIAG >= 3
+        run_probe15(cpu, boot, *registry);
+#else
+        static_cast<void>(cpu);
+        static_cast<void>(boot);
+        static_cast<void>(registry);
+#endif
+        return;
+    }
+#endif
+#if MYOS_CONCURRENCY_PROBE != 15
 #if MYOS_CONCURRENCY_PROBE != 14
     if (probe >= 9 && probe <= 11) {
         //Confirmatory experiment.
@@ -5031,232 +6619,12 @@ void run_probe(u32 probe) noexcept {
         probe_phase.store<libk::MemoryOrder::Release>(2);
         return;
     }
+#if MYOS_CONCURRENCY_PROBE == 7
     if (probe == 7) {
-        //Confirmatory experiment.
-        // Exit condition: remove when the external kernel fault harness can
-        // stop the real remote scheduler path at every transport phase and
-        // inspect exact operation/request generations.
-        static_cast<void>(
-            probe_joined.fetch_add<libk::MemoryOrder::AcqRel>(1));
-        while (probe_joined.load<libk::MemoryOrder::Acquire>()
-            != registry->count()) {
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        }
-        if (cpu != boot) {
-            while (probe_phase.load<libk::MemoryOrder::Acquire>() != 2) {
-                libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-            }
-            return;
-        }
-
-        ObservationShard* const shard = registry->observations(boot);
-        bool ok = shard != nullptr;
-        u32 errors = ok ? 0 : 1U;
-        ObservationLease operation{};
-        ObservationLease other{};
-        ObservationLease actor{};
-        if (ok) {
-            operation = shard->reserve(
-                RecordKind::Operation,
-                0xd701,
-                7,
-                Expectation::InternalFinite,
-                SourceSite::current());
-            other = shard->reserve(
-                RecordKind::Operation,
-                0xd702,
-                8,
-                Expectation::InternalFinite,
-                SourceSite::current());
-            actor = shard->reserve(
-                RecordKind::ExecutionActor,
-                0xd703,
-                1,
-                Expectation::SchedulerControlled,
-                SourceSite::current());
-            ok = operation && other && actor;
-            if (!ok) {
-                errors |= 1U << 1;
-            }
-        }
-
-        auto& queue = probe_remote_queue.emplace(boot);
-        auto& request = probe_remote_request.emplace(
-            sched::RemoteKind::Wake, &probe_remote_owner);
-        sched::RemotePostResult posted{};
-        kernel::IpiDelivery::Token first{};
-        ObservationKey projected_cause{};
-        if (ok) {
-            posted = queue.post(request, operation.key());
-            ObservationSnapshot delivery{};
-            auto delivery_lease =
-                ObservationLease::borrow(posted.delivery);
-            projected_cause = request.diagnostic_cause(posted.delivery);
-            const bool posted_ok =
-                posted.disposition == sched::RemotePost::Inserted
-                && request.pending()
-                && delivery_lease.snapshot(delivery)
-                && delivery.record_kind == RecordKind::RemoteDelivery
-                && delivery.phase
-                    == static_cast<u32>(RemotePhase::NeedsKick)
-                && delivery.detail[0] == operation.key().raw
-                && delivery.detail[1]
-                    == reinterpret_cast<u64>(&probe_remote_owner)
-                && delivery.detail[2] == boot.raw
-                // The home-CPU drain path uses this same bounded projection
-                // as Binding::publish_accept(); a single cause must survive
-                // the delivery snapshot even though it is not canonical.
-                && projected_cause == operation.key();
-            if (!posted_ok) {
-                errors |= 1U << 2;
-            }
-            ok = ok && posted_ok;
-
-            const auto same = queue.post(request, operation.key());
-            const auto other_post = queue.post(request, other.key());
-            const auto coalesced_cause = request.diagnostic_cause(
-                posted.delivery);
-            const bool coalesce_ok =
-                same.disposition == sched::RemotePost::Coalesced
-                && same.delivery == posted.delivery
-                && other_post.disposition == sched::RemotePost::Coalesced
-                && other_post.delivery == posted.delivery
-                // The bounded projection retains the first concrete cause.
-                // Later causes remain flight evidence; no per-request
-                // multi-cause truth feeds the analyzer yet.
-                && coalesced_cause == operation.key();
-            if (!coalesce_ok) {
-                errors |= 1U << 3;
-            }
-            ok = ok && coalesce_ok;
-
-            const auto claimed = queue.claim_transport();
-            if (claimed) {
-                first = *claimed;
-            }
-            delivery = {};
-            const bool flight_ok = claimed
-                && delivery_lease.snapshot(delivery)
-                && delivery.phase == static_cast<u32>(
-                    RemotePhase::InFlight)
-                && delivery.detail[3] == claimed->generation;
-            if (!flight_ok) {
-                errors |= 1U << 4;
-            }
-            ok = ok && flight_ok;
-
-            queue.transport_failed(first);
-            delivery = {};
-            const bool retry_ok = delivery_lease.snapshot(delivery)
-                && delivery.phase == static_cast<u32>(
-                    RemotePhase::Retry);
-            const auto retry = queue.claim_transport();
-            if (!retry_ok || !retry
-                || retry->generation == first.generation) {
-                errors |= 1U << 5;
-                ok = false;
-            }
-
-            sched::RemoteRequest* const taken = queue.take();
-            delivery = {};
-            const bool taken_ok = taken == &request
-                && delivery_lease.snapshot(delivery)
-                && delivery.phase == static_cast<u32>(
-                    RemotePhase::Taken);
-            if (!taken_ok) {
-                errors |= 1U << 6;
-            }
-            ok = ok && taken_ok;
-            queue.accepted(request, true);
-            delivery = {};
-            const bool accepted_ok = delivery_lease.snapshot(delivery)
-                && delivery.phase == static_cast<u32>(
-                    RemotePhase::Accepted);
-            if (!accepted_ok) {
-                errors |= 1U << 7;
-            }
-            ok = ok && accepted_ok;
-        }
-
-        if (request.pending()) {
-            queue.complete(request);
-        }
-        if (posted.delivery
-            && ObservationLease::borrow(posted.delivery)) {
-            errors |= 1U << 8;
-            ok = false;
-        }
-
-        if (operation && actor) {
-            actor.transition(
-                execution_blocked_phase,
-                execution_blocked_phase,
-                WaitKind::OperationCompletion,
-                NodeRef::observation(operation.key()));
-            actor.link_wait(
-                operation.key(),
-                WaitKind::OperationCompletion,
-                NodeRef::observation(operation.key()));
-            operation.publish(
-                OperationPhase::ReadyPublished,
-                NodeRef::observation(actor.key()));
-            WaitGraphScratch graph{};
-            const bool lost = analyze(operation.key(), graph)
-                && graph.evidence == EvidenceGrade::Confirmed
-                && graph.classification == StallClass::LostWake;
-            if (!lost) {
-                errors |= 1U << 9;
-            }
-            ok = ok && lost;
-
-            // Feed the projected cause into the same witness slot that
-            // Binding::publish_accept() updates after a remote drain.
-            actor.detail(2, projected_cause.raw);
-            graph = {};
-            const bool accepted = analyze(operation.key(), graph)
-                && graph.classification
-                    == StallClass::RunnableStarvation;
-            if (!accepted) {
-                errors |= 1U << 10;
-            }
-            ok = ok && accepted;
-
-            actor.detail(2, 0);
-            const auto transport = queue.post(
-                request, operation.key());
-            operation.publish(
-                OperationPhase::ReadyPublished,
-                NodeRef::observation(actor.key()),
-                NodeRef::observation(transport.delivery));
-            graph = {};
-            const bool pending = analyze(operation.key(), graph)
-                && graph.classification == StallClass::TransportStall;
-            if (!pending) {
-                errors |= 1U << 11;
-            }
-            ok = ok && pending;
-            static_cast<void>(queue.cancel(request));
-        }
-
-        if (operation) {
-            operation.finish(
-                static_cast<u32>(OperationPhase::Finished));
-        }
-        if (other) {
-            other.finish(
-                static_cast<u32>(OperationPhase::Finished));
-        }
-        if (actor) {
-            actor.finish(1);
-        }
-        probe_remote_request.reset();
-        probe_remote_queue.reset();
-        diag::console::print<
-            "concurrency-probe: stage-d delivery-{} errors=0x{:x}\n">(
-            ok ? "ok" : "fail", errors);
-        probe_phase.store<libk::MemoryOrder::Release>(2);
+        run_probe7(registry, cpu, boot);
         return;
     }
+#endif
     if (probe == 6) {
         //Confirmatory experiment.
         // Exit condition: remove when an external scenario runner can drive
@@ -5824,6 +7192,7 @@ void run_probe(u32 probe) noexcept {
             "concurrency-probe: stage-a fail errors=0x{:x} cpus={}\n">(
             errors, registry->count());
     }
+#endif
 #endif
 }
 #endif

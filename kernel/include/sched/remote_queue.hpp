@@ -35,6 +35,15 @@ struct RemotePostResult final {
     diag::concurrency::ObservationKey delivery{};
 };
 
+// The best-effort path either acquires the queue and records the request, or
+// reports Busy without touching request ownership.  When a request is
+// admitted, the queue claims the transport token before releasing its lock;
+// therefore a successful admission never depends on a second, racy kick pass.
+struct RemoteTryPostResult final {
+    RemotePostResult post{};
+    libk::optional<kernel::IpiDelivery::Token> transport{};
+};
+
 // A one-way projection of RemoteQueue.  The queue and request pending bits
 // remain canonical under lock_; these atomics are only evidence for a
 // watchdog or panic reader and may be stale or internally inconsistent.
@@ -125,6 +134,12 @@ public:
         RemoteRequest& request,
         diag::concurrency::ObservationKey cause = {}) noexcept
         -> RemotePostResult;
+    [[nodiscard]] auto try_post(
+        RemoteRequest& request,
+        diag::concurrency::ObservationKey cause = {}) noexcept
+        -> libk::optional<RemoteTryPostResult>;
+    [[nodiscard]] auto try_transport_failed(
+        kernel::IpiDelivery::Token token) noexcept -> bool;
     [[nodiscard]] auto claim_transport() noexcept
         -> libk::optional<kernel::IpiDelivery::Token>;
     void transport_failed(kernel::IpiDelivery::Token token) noexcept;
@@ -139,6 +154,11 @@ public:
     }
 
 private:
+    [[nodiscard]] auto post_locked(
+        RemoteRequest& request,
+        diag::concurrency::ObservationKey cause,
+        bool diagnostics,
+        bool& inserted) noexcept -> RemotePostResult;
     void publish_summary() noexcept;
     void publish(
         RemoteRequest& request,

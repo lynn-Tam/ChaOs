@@ -106,6 +106,7 @@ public:
     }
 private:
     [[noreturn]] static void reclaimer_entry(void* argument) noexcept;
+    [[nodiscard]] auto wake_report_consumer() noexcept -> bool;
     [[nodiscard]] auto wake_reclaimer() noexcept
         -> diag::concurrency::ObservationKey;
     [[nodiscard]] auto retain_reclaimer_work() noexcept

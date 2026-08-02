@@ -735,7 +735,7 @@ _run-lock-probe: $(TARGET) audit-boot-stack
 	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
 
 run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12 13 14,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
+	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12 13 14 15,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
 
 _run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11 13,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
 	@case "$(CONCURRENCY_PROBE)" in \
@@ -753,7 +753,8 @@ _run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11 13,$(CONCURRENCY_PRO
 		12) evidence="concurrency-probe: stage-g cpu-live-ok";; \
 		13) evidence="concurrency-probe: stage-b ownership-ok";; \
 		14) evidence="concurrency-probe: stage-c evidence-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..14"; exit 1;; \
+		15) evidence="concurrency-probe: stage-d report-ok";; \
+		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..15"; exit 1;; \
 	esac; \
 	initrd=""; \
 	if [ "$(CONCURRENCY_PROBE)" = 3 ] \

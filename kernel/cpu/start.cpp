@@ -199,7 +199,21 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     }
     sched::yield();
     for (;;) {
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+        //Confirmatory experiment.
+        // Exit condition: remove after the stop-world snapshot proves whether
+        // the ready-phase timeout reaches the normal WFI boundary.
+        diag::concurrency::probe15_idle_enter(
+            runtime.local.descriptor->logical_id());
+#endif
         arch::wait_for_interrupt();
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+        //Confirmatory experiment.
+        // Exit condition: remove once Probe 15's ready-phase timeout is
+        // attributed to timer delivery or root-candidate progression.
+        diag::concurrency::probe15_idle_observe(
+            runtime.local.descriptor->logical_id());
+#endif
     }
 }
 

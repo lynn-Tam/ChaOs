@@ -3,6 +3,7 @@
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
 #include <libk/array.hpp>
+#include <libk/delegate.hpp>
 #include <libk/limits.hpp>
 #include <libk/sync/atomic.hpp>
 
@@ -17,6 +18,10 @@
 #ifndef MYOS_STAGE_F_PROBE
 #define MYOS_STAGE_F_PROBE 0
 #endif
+
+namespace kernel {
+class CpuRegistry;
+}
 
 namespace kernel::diag::concurrency {
 
@@ -199,7 +204,6 @@ enum class Expectation : u8 {
 enum class StallAction : u8 {
     Record,
     Report,
-    Fatal,
 };
 
 // Immutable policy projected by one attached Completion generation.
@@ -330,7 +334,6 @@ enum class StallClass : u8 {
     ExternalWait,
     UnclassifiedCpuStall,
     Inconclusive,
-    Truncated,
 };
 
 enum class EvidenceGrade : u8 {
@@ -342,6 +345,17 @@ enum class EvidenceGrade : u8 {
     External,
 };
 
+// The edge is part of the evidence, not a property inferred from the target
+// node. A node may expose several relations in one coherent observation, and
+// the first retained parent/edge is the stable explanation used by reports.
+enum class EdgeKind : u8 {
+    None,
+    Wait,
+    Driver,
+    Blocker,
+    Member,
+};
+
 inline constexpr usize graph_capacity = 12;
 
 struct WaitGraphScratch final {
@@ -349,6 +363,9 @@ struct WaitGraphScratch final {
     EvidenceGrade evidence{EvidenceGrade::None};
     u8 count{};
     bool truncated{};
+    u16 pending_total{};
+    u8 pending_shown{};
+    u16 pending_omitted{};
     // Keep the panic-page representation compact: the low byte of path_meta
     // stores NodeRef::Kind and the remaining 56 bits store generation.  All
     // diagnostic generations currently fit in that width (observation keys
@@ -357,6 +374,7 @@ struct WaitGraphScratch final {
     u64 path_meta[graph_capacity]{};
     u64 fingerprints[graph_capacity]{};
     u8 parents[graph_capacity]{};
+    EdgeKind edges[graph_capacity]{};
 
     [[nodiscard]] auto node(usize index) const noexcept -> NodeRef {
         if (index >= graph_capacity) {
@@ -376,6 +394,10 @@ struct WaitGraphScratch final {
         path_meta[index] = static_cast<u64>(
                 static_cast<u8>(value.kind))
             | (value.generation << 8);
+    }
+
+    [[nodiscard]] auto edge(usize index) const noexcept -> EdgeKind {
+        return index < graph_capacity ? edges[index] : EdgeKind::None;
     }
 };
 
@@ -990,6 +1012,42 @@ struct WatchdogCandidate final {
     [[nodiscard]] auto read(StallFingerprint& value) const noexcept -> bool;
 };
 
+// A report owns a copy of the bounded graph. The producer may overwrite its
+// per-CPU scratch on the next watchdog pass, so the queue payload is the sole
+// truth for deferred output.
+struct ReportRecord final {
+    CpuId watcher{};
+    CpuId target{};
+    NodeRef root{};
+    WatchdogCandidate::State state{};
+    StallClass classification{StallClass::None};
+    EvidenceGrade evidence{EvidenceGrade::None};
+    u64 age{};
+    WaitGraphScratch graph{};
+};
+
+class ReportQueue final {
+public:
+    // This is an SPSC mailbox: the owning CPU's watchdog is the sole
+    // publisher for this per-CPU queue, and the single reclaimer thread is the
+    // sole consumer. One fixed slot keeps the diagnostics page bounded;
+    // overflow is explicit diagnostic loss and never blocks canonical state.
+    static constexpr usize capacity = 1;
+
+    [[nodiscard]] auto publish(const ReportRecord& value) noexcept -> bool;
+    [[nodiscard]] auto consume(ReportRecord& value) noexcept -> bool;
+    [[nodiscard]] auto pending() const noexcept -> bool;
+    [[nodiscard]] auto lost() const noexcept -> u64 {
+        return lost_.load<libk::MemoryOrder::Acquire>();
+    }
+
+private:
+    libk::Atomic<u64> head_{};
+    libk::Atomic<u64> tail_{};
+    libk::Atomic<u64> lost_{};
+    ReportRecord records_[capacity]{};
+};
+
 struct StallCoordinator final {
     static constexpr usize signature_capacity = 4;
 
@@ -1033,6 +1091,7 @@ struct DiagnosticStatus final {
         ObservationLeaseCorrupt = 1U << 14,
         RemoteShardUnavailable = 1U << 15,
         PolicyMissing = 1U << 16,
+        ReportDropped = 1U << 17,
     };
 };
 
@@ -1061,6 +1120,9 @@ struct CpuDiagnosticsCore final {
     libk::Atomic<usize> scan_cursor{};
     StallCoordinator coordinator{};
     WaitGraphScratch graph{};
+#if MYOS_CONCURRENCY_DIAG >= 3
+    ReportQueue reports{};
+#endif
     WatchdogPolicy policy{};
     DiagnosticStatus fallback_status{};
     DiagnosticStatus* status_store{};
@@ -1073,6 +1135,42 @@ struct CpuDiagnosticsCore final {
             ? (self.fallback_status) : (*self.status_store);
     }
 };
+
+// A report producer runs with interrupts masked and cannot wait for a
+// scheduler lock.  The endpoint therefore publishes one callback under a
+// single atomic word: bit zero is the bound bit and the remaining bits are a
+// reader count.  A producer takes one reader reference with one CAS; a failed
+// CAS is an explicit lost wake hint, never a spin.  Teardown clears the bound
+// bit first and waits only for callbacks that already entered the endpoint.
+class ReportNotifier final {
+public:
+    using Callback = libk::delegate<bool() noexcept>;
+
+    template<auto Method, typename C>
+    [[nodiscard]] static constexpr auto bind(C& object) noexcept -> Callback {
+        return Callback::template bind<Method>(object);
+    }
+
+    // Returns false when an endpoint is already bound or teardown readers are
+    // still draining; the existing callback is never replaced in that case.
+    [[nodiscard]] auto install(Callback callback) noexcept -> bool;
+    void unbind() noexcept;
+    [[nodiscard]] auto notify() noexcept -> bool;
+
+private:
+    static constexpr u64 bound_bit = 1;
+    static constexpr u64 reader_bit = 2;
+    static constexpr u64 reader_mask =
+        libk::numeric_limits<u64>::max() & ~u64{1};
+
+    Callback callback_{};
+    libk::Atomic<u64> state_{};
+};
+
+[[nodiscard]] auto bind_report_notifier(
+    ReportNotifier::Callback notifier) noexcept -> bool;
+void unbind_report_notifier() noexcept;
+[[nodiscard]] auto drain_reports(CpuRegistry& registry) noexcept -> usize;
 
 // These functions are the only route from hot kernel paths into the current
 // CPU diagnostic projection.  They are no-ops in the off profile.
@@ -1155,6 +1253,110 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
     -> const char*;
 #if MYOS_CONCURRENCY_PROBE
 void run_probe(u32 probe) noexcept;
+#endif
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+//Confirmatory experiment.
+// Exit condition: remove after one stop-world investigation attributes the
+// ready-phase timeout to timer programming, trap delivery, or watchdog
+// candidate progression without this state snapshot.
+struct Probe15CpuState final {
+    libk::Atomic<u64> program_count{};
+    libk::Atomic<u64> program_now{};
+    libk::Atomic<u64> requested_deadline{};
+    libk::Atomic<u64> programmed_deadline{};
+    libk::Atomic<u64> watchdog_deadline{};
+    libk::Atomic<u64> program_ok{};
+    libk::Atomic<u64> timer_available{};
+    libk::Atomic<u64> watchdog_armed{};
+    libk::Atomic<u64> timer_enter_count{};
+    libk::Atomic<u64> timer_now{};
+    libk::Atomic<u64> timer_irq_off{};
+    libk::Atomic<u64> watchdog_fire_count{};
+    libk::Atomic<u64> watchdog_now{};
+    libk::Atomic<u64> watchdog_phase{};
+    libk::Atomic<u64> idle_enter_count{};
+    libk::Atomic<u64> idle_enter_now{};
+    libk::Atomic<u64> idle_enter_phase{};
+    libk::Atomic<u64> idle_return_count{};
+    libk::Atomic<u64> idle_return_now{};
+    libk::Atomic<u64> idle_return_phase{};
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the wake-before-block and Blocked-to-Throttled windows externally.
+    libk::Atomic<u64> wake_credit_binding{};
+    libk::Atomic<u32> wake_credit_active{};
+    libk::Atomic<u32> wake_credit_state_throttled{};
+    libk::Atomic<u32> wake_credit_timer_queued{};
+    libk::Atomic<u32> wake_credit_accepts{};
+    libk::Atomic<u32> wake_credit_repeated{};
+    libk::Atomic<u32> wake_credit_consumed{};
+    libk::Atomic<u32> wake_credit_real_blocks{};
+    libk::Atomic<u32> wake_credit_blocked_attempted{};
+    libk::Atomic<u32> wake_credit_blocked_throttled{};
+    libk::Atomic<u32> wake_credit_blocked_credit{};
+    libk::Atomic<u32> wake_credit_reported{};
+};
+
+extern Probe15CpuState probe15_cpu_state[max_cpu_count];
+
+//Confirmatory experiment.
+// Exit condition: remove with the Stage D external timer harness once it can
+// independently mark the production watchdog deadline callback.
+void probe15_program(
+    CpuId cpu,
+    u64 now,
+    u64 requested_deadline,
+    u64 programmed_deadline,
+    bool timer_available,
+    bool program_ok,
+    bool watchdog_armed,
+    u64 watchdog_deadline) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove with the Stage D external timer harness once it can
+// independently mark timer-trap entry and watchdog callback delivery.
+void probe15_timer_enter(CpuId cpu, u64 now) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove with the Stage D external timer harness once it can
+// independently mark the production watchdog deadline callback.
+void probe15_timer_fire(CpuId cpu, u64 now) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove with the Stage D external timer harness once the
+// real deadline callback can own the report/overflow continuation.
+void probe15_after_timer(CpuId cpu) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove after the stop-world snapshot proves normal context
+// reached the idle wait boundary independently of a WFI return.
+void probe15_idle_enter(CpuId cpu) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove once the ready-phase timeout is attributed to timer
+// delivery or root-candidate progression.
+void probe15_idle_observe(CpuId cpu) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove after an external scheduler harness can force the
+// same reclaimer Binding through these state transitions.
+void probe15_wake_credit_arm(
+    CpuId cpu,
+    u64 binding,
+    bool throttled,
+    bool timer_queued,
+    bool first_accepted,
+    bool repeated_accepted) noexcept;
+void probe15_wake_credit_block(CpuId cpu, u64 binding, bool had_credit) noexcept;
+[[nodiscard]] auto probe15_wake_credit_prepare_blocked(
+    CpuId cpu,
+    u64 binding) noexcept -> bool;
+void probe15_wake_credit_blocked(
+    CpuId cpu,
+    u64 binding,
+    bool accepted,
+    bool throttled,
+    bool had_credit) noexcept;
+//Confirmatory experiment.
+// Exit condition: remove when an external watchdog harness can deterministically
+// reject the first report wake and observe the later mailbox retry.
+void probe15_arm_report_retry(CpuId cpu) noexcept;
+[[nodiscard]] auto probe15_report_retry_gate(CpuId cpu) noexcept -> bool;
+void probe15_report_retry_tick(bool notified) noexcept;
 #endif
 #if MYOS_CONCURRENCY_PROBE == 14
 //Confirmatory experiment.

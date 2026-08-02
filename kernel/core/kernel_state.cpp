@@ -58,6 +58,7 @@ auto KernelState::initialize_in(
 }
 
 KernelState::~KernelState() noexcept {
+    diag::concurrency::unbind_report_notifier();
     if (objects_) {
         objects().unbind_reclaim_notifier();
     }
@@ -169,7 +170,31 @@ auto KernelState::start_reclaimer(
         return false;
     }
 
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    //Confirmatory experiment.
+    // Exit condition: remove once an external scheduler harness can force a
+    // real continuation through state-at-entry Throttled before its first
+    // dispatch.  The context is exhausted before admission so make_ready()
+    // takes the production refill path rather than a synthetic state write.
+    context->exhaust_for_probe(clock().now());
+#endif
     KASSERT(runtime.dispatcher().make_ready(*context->binding()));
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    //Confirmatory experiment.
+    // Exit condition: remove with the external scheduler wake-credit
+    // interleaving harness.
+    sched::Binding& probe_binding = *context->binding();
+    const auto first_wake = runtime.dispatcher().accept_wake(probe_binding);
+    const auto repeated_wake =
+        runtime.dispatcher().accept_wake(probe_binding);
+    diag::concurrency::probe15_wake_credit_arm(
+        runtime.local.descriptor->logical_id(),
+        reinterpret_cast<u64>(&probe_binding),
+        probe_binding.execution().state() == ExecutionState::Throttled,
+        probe_binding.timer_queued(),
+        first_wake == sched::CpuDispatcher::WakeAcceptance::Accepted,
+        repeated_wake == sched::CpuDispatcher::WakeAcceptance::Accepted);
+#endif
     reclaimer_thread_ = libk::move(thread);
     reclaimer_context_ = libk::move(context);
     reclaimer_observation_ =
@@ -189,6 +214,11 @@ auto KernelState::start_reclaimer(
     grants().bind_work_notifier(
         kernel::cap::GrantGraph::WorkNotifier::bind<
             &KernelState::wake_reclaimer>(*this));
+#if MYOS_CONCURRENCY_DIAG >= 3
+    KASSERT(diag::concurrency::bind_report_notifier(
+        diag::concurrency::ReportNotifier::bind<
+            &KernelState::wake_report_consumer>(*this)));
+#endif
 
     return true;
 }
@@ -248,6 +278,9 @@ void KernelState::run_reclaimer_probe() noexcept {
         }
         kernel::CpuLocal& cpu = kernel::current_cpu();
         KASSERT(cpu.runtime().owner_registry != nullptr);
+#if MYOS_CONCURRENCY_DIAG >= 3
+        static_cast<void>(diag::concurrency::drain_reports(kernel.cpus()));
+#endif
         const auto driver = kernel.reclaimer_context_
             && kernel.reclaimer_context_->binding() != nullptr
             ? kernel.reclaimer_context_->binding()->actor_ref()
@@ -341,6 +374,37 @@ void KernelState::run_reclaimer_probe() noexcept {
             kernel::sched::block();
         }
     }
+}
+
+auto KernelState::wake_report_consumer() noexcept -> bool {
+#if MYOS_CONCURRENCY_DIAG >= 3
+    if (!reclaimer_context_ || !cpus_) {
+        return false;
+    }
+    kernel::sched::Binding* const binding = reclaimer_context_->binding();
+    if (binding == nullptr) {
+        return false;
+    }
+    const kernel::CpuDescriptor* const target =
+        cpus().descriptor(binding->home_cpu());
+    if (target == nullptr || target->state() != kernel::CpuState::Online) {
+        return false;
+    }
+#if MYOS_CONCURRENCY_PROBE == 15
+    //Confirmatory experiment.
+    // Exit condition: remove once an external deferred-report harness can
+    // force one callback rejection without touching the RemoteQueue lock.
+    if (diag::concurrency::probe15_report_retry_gate(
+            current_cpu().descriptor->logical_id())) {
+        return false;
+    }
+#endif
+    // This is only a scheduler wake hint. It does not retain reclaimer work,
+    // increment the canonical enqueue epoch, or publish a diagnostic key.
+    return static_cast<bool>(kernel::sched::try_wake(cpus(), *binding));
+#else
+    return false;
+#endif
 }
 
 auto KernelState::retain_reclaimer_work() noexcept

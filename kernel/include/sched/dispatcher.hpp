@@ -26,6 +26,12 @@ public:
     enum class WakeError : u8 {
         WrongCpu,
         Unavailable,
+        Busy,
+        // The request was retained in the canonical remote queue, but its
+        // best-effort IPI kick failed. A later normal scheduler wake may
+        // claim the retained Retry edge; this is distinct from admission
+        // failure (Busy/Unavailable).
+        Retained,
     };
     enum class WakeAcceptance : u8 {
         Rejected,
@@ -67,6 +73,15 @@ public:
         diag::concurrency::ObservationKey delivery = {}) noexcept
         -> WakeAcceptance;
     [[nodiscard]] auto post_wake(
+        Binding& binding,
+        diag::concurrency::ObservationKey cause = {},
+        diag::concurrency::ObservationKey* delivery = nullptr) noexcept
+        -> WakeResult;
+    // IRQ-off diagnostic producers may request only a bounded wake attempt.
+    // This path never waits for the remote queue lock and never allocates a
+    // RemoteDelivery observation; normal sched::wake remains the blocking,
+    // fully traced path.
+    [[nodiscard]] auto post_wake_if_available(
         Binding& binding,
         diag::concurrency::ObservationKey cause = {},
         diag::concurrency::ObservationKey* delivery = nullptr) noexcept
@@ -129,6 +144,11 @@ private:
         diag::concurrency::ObservationKey cause = {},
         diag::concurrency::ObservationKey* delivery = nullptr) noexcept
         -> WakeResult;
+    [[nodiscard]] auto try_post_remote(
+        RemoteRequest& request,
+        diag::concurrency::ObservationKey cause = {},
+        diag::concurrency::ObservationKey* delivery = nullptr) noexcept
+        -> WakeResult;
     [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
     void request_stop(execution::Target target) noexcept;
 
@@ -160,6 +180,13 @@ private:
 void yield() noexcept;
 void block() noexcept;
 [[nodiscard]] auto wake(
+    CpuRegistry& cpus,
+    Binding& binding,
+    diag::concurrency::ObservationKey cause = {},
+    diag::concurrency::ObservationKey* delivery = nullptr) noexcept
+    -> CpuDispatcher::WakeResult;
+// Observer-internal boundary: caller must already have IRQs disabled.
+[[nodiscard]] auto try_wake(
     CpuRegistry& cpus,
     Binding& binding,
     diag::concurrency::ObservationKey cause = {},

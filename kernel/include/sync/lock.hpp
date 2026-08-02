@@ -1,6 +1,7 @@
 #pragma once
 
 #include <libk/sync/ticket_spin_lock.hpp>
+#include <libk/utility.hpp>
 #include <sync/trace.hpp>
 
 namespace kernel::sync {
@@ -42,6 +43,42 @@ concept KernelLock = requires {
 };
 
 struct LockAccess final {
+    // This token is deliberately narrower than IrqLockToken. It is for an
+    // observer-internal IRQ-off notification that may try a lock exactly once
+    // without entering lock graph, flight, or profile accounting. The caller
+    // must already have interrupts disabled; it owns no IRQ state and cannot
+    // be used as a general lock guard.
+    template<KernelLock Lock>
+    class [[nodiscard("an ignored observer try-lock token leaks the lock")]]
+    ObserverTryLockToken final {
+    public:
+        explicit ObserverTryLockToken(Lock& lock) noexcept
+            : lock_(&lock), owns_(lock.raw_.try_lock()) {}
+
+        ObserverTryLockToken(const ObserverTryLockToken&) = delete;
+        auto operator=(const ObserverTryLockToken&)
+            -> ObserverTryLockToken& = delete;
+        ObserverTryLockToken(ObserverTryLockToken&& other) noexcept
+            : lock_(libk::exchange(other.lock_, nullptr)),
+              owns_(libk::exchange(other.owns_, false)) {}
+        auto operator=(ObserverTryLockToken&&)
+            -> ObserverTryLockToken& = delete;
+
+        ~ObserverTryLockToken() noexcept {
+            if (owns_) {
+                lock_->raw_.unlock();
+            }
+        }
+
+        [[nodiscard]] auto owns_lock() const noexcept -> bool {
+            return owns_;
+        }
+
+    private:
+        Lock* lock_{};
+        bool owns_{};
+    };
+
     template<LockClass Class, SameClassPolicy SameClass>
     [[nodiscard]] static auto ref(SpinLock<Class, SameClass>& lock) noexcept
         -> LockRef {

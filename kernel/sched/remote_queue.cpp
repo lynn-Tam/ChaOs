@@ -1,5 +1,6 @@
 #include <sched/remote_queue.hpp>
 
+#include <arch/cpu.hpp>
 #include <arch/time.hpp>
 #include <core/debug.hpp>
 #include <diag/concurrency.hpp>
@@ -92,6 +93,96 @@ auto RemoteRequest::generation() const noexcept -> u64 {
     return state_.load<libk::MemoryOrder::Acquire>() >> 1;
 }
 
+auto RemoteQueue::post_locked(
+    RemoteRequest& request,
+    diag::concurrency::ObservationKey cause,
+    bool diagnostics,
+    bool& inserted) noexcept -> RemotePostResult {
+    RemotePostResult result{};
+    if (request.pending()) {
+        // Coalescing is a canonical pending-edge decision.  A wake cause is
+        // only explanatory; retaining the first nonzero projection cannot
+        // reject or alter the already retained request.  The best-effort
+        // producer deliberately skips this diagnostic read/write path.
+        const auto delivery = request.delivery();
+        if (diagnostics) {
+            request.retain_diagnostic_cause(delivery, cause);
+        }
+        result.disposition = RemotePost::Coalesced;
+        result.delivery = delivery;
+        if (diagnostics) {
+            auto observation =
+                diag::concurrency::ObservationLease::borrow(result.delivery);
+            observation.touch();
+        }
+        return result;
+    }
+
+    // The IRQ-off try path has no retrying diagnostic counters.  The queue
+    // projection below remains visible; the full post epoch is reserved for
+    // the ordinary traced scheduler path.
+    if (diagnostics) {
+        increment_sat(summary_.post_epoch);
+    }
+    u64 generation = request.generation();
+    if (generation != max_request_generation) {
+        ++generation;
+    }
+    if (generation == 0) {
+        generation = 1;
+    }
+    if (diagnostics) {
+        auto observation =
+            diag::concurrency::ObservationLease::reserve_on(
+                home_,
+                diag::concurrency::RecordKind::RemoteDelivery,
+                reinterpret_cast<u64>(&request),
+                generation,
+                diag::concurrency::Expectation::InternalFinite);
+        diag::concurrency::ObservationBatch initial{
+            .phase = static_cast<u32>(
+                diag::concurrency::RemotePhase::Posted),
+            .semantic_stamp = (generation << 8)
+                | static_cast<u32>(
+                    diag::concurrency::RemotePhase::Posted),
+            .wait = diag::concurrency::WaitKind::RemoteRequest,
+            .driver = diag::concurrency::NodeRef::cpu(home_),
+            .site = diag::concurrency::SourceSite::current(),
+            .detail_mask = 0xfU,
+            .update_progress = true};
+        initial.detail[0] = cause.raw;
+        initial.detail[1] = reinterpret_cast<u64>(request.owner());
+        initial.detail[2] = home_.raw;
+        initial.detail[3] = 0;
+        observation.publish(initial);
+        request.delivery_.store<libk::MemoryOrder::Release>(
+            observation.detach_key().raw);
+    } else {
+        // A silent request still follows the canonical pending/queue
+        // protocol.  It simply has no diagnostic lease for a producer that
+        // is running from an IRQ-off watchdog callback.
+        request.delivery_.store<libk::MemoryOrder::Release>(0);
+    }
+    request.state_.store<libk::MemoryOrder::Release>(
+        (generation << 1) | 1U);
+    ++pending_count_;
+    queue_.push_back(request);
+    delivery_.publish();
+    if (diagnostics) {
+        publish(
+            request,
+            diag::concurrency::RemotePhase::NeedsKick,
+            diag::concurrency::WaitKind::IpiDelivery,
+            delivery_.generation());
+    }
+    if (diagnostics) {
+        summary_.last_post.store<libk::MemoryOrder::Release>(now());
+    }
+    inserted = true;
+    result = {RemotePost::Inserted, request.delivery()};
+    return result;
+}
+
 auto RemoteQueue::post(
     RemoteRequest& request,
     diag::concurrency::ObservationKey cause) noexcept -> RemotePostResult {
@@ -99,69 +190,8 @@ auto RemoteQueue::post(
     RemotePostResult result{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (request.pending()) {
-            // Coalescing is a canonical pending-edge decision.  A wake cause
-            // is only explanatory; retaining the first nonzero projection
-            // cannot reject or alter the already retained request. A later
-            // cause remains available in the flight record below.
-            const auto delivery = request.delivery();
-            request.retain_diagnostic_cause(delivery, cause);
-            result.disposition = RemotePost::Coalesced;
-            result.delivery = delivery;
-            auto observation =
-                diag::concurrency::ObservationLease::borrow(result.delivery);
-            observation.touch();
-            publish_summary();
-        } else {
-            increment_sat(summary_.post_epoch);
-            u64 generation = request.generation();
-            if (generation != max_request_generation) {
-                ++generation;
-            }
-            if (generation == 0) {
-                generation = 1;
-            }
-            auto observation =
-                diag::concurrency::ObservationLease::reserve_on(
-                    home_,
-                    diag::concurrency::RecordKind::RemoteDelivery,
-                    reinterpret_cast<u64>(&request),
-                    generation,
-                    diag::concurrency::Expectation::InternalFinite);
-            diag::concurrency::ObservationBatch initial{
-                .phase = static_cast<u32>(
-                    diag::concurrency::RemotePhase::Posted),
-                .semantic_stamp = (generation << 8)
-                    | static_cast<u32>(
-                        diag::concurrency::RemotePhase::Posted),
-                .wait = diag::concurrency::WaitKind::RemoteRequest,
-                .driver = diag::concurrency::NodeRef::cpu(home_),
-                .site = diag::concurrency::SourceSite::current(),
-                .detail_mask = 0xfU,
-                .update_progress = true};
-            initial.detail[0] = cause.raw;
-            initial.detail[1] = reinterpret_cast<u64>(request.owner());
-            initial.detail[2] = home_.raw;
-            initial.detail[3] = 0;
-            observation.publish(initial);
-            request.delivery_.store<libk::MemoryOrder::Release>(
-                observation.detach_key().raw);
-            request.state_.store<libk::MemoryOrder::Release>(
-                (generation << 1) | 1U);
-            ++pending_count_;
-            const u64 tick = now();
-            queue_.push_back(request);
-            delivery_.publish();
-            publish(
-                request,
-                diag::concurrency::RemotePhase::NeedsKick,
-                diag::concurrency::WaitKind::IpiDelivery,
-                delivery_.generation());
-            summary_.last_post.store<libk::MemoryOrder::Release>(tick);
-            publish_summary();
-            inserted = true;
-            result = {RemotePost::Inserted, request.delivery()};
-        }
+        result = post_locked(request, cause, true, inserted);
+        publish_summary();
     }
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Remote,
@@ -173,6 +203,48 @@ auto RemoteQueue::post(
         request.generation(),
         cause.raw);
     return result;
+}
+
+auto RemoteQueue::try_post(
+    RemoteRequest& request,
+    diag::concurrency::ObservationKey cause) noexcept
+    -> libk::optional<RemoteTryPostResult> {
+    // This is an observer-internal path. The caller already owns the IRQ-off
+    // boundary; use one raw try-lock without lock graph/flight/profile work.
+    KASSERT(!arch::interrupts_enabled());
+    kernel::sync::LockAccess::ObserverTryLockToken guard{lock_};
+    if (!guard.owns_lock()) {
+        return libk::nullopt;
+    }
+
+    bool inserted{};
+    RemoteTryPostResult result{
+        post_locked(request, cause, false, inserted),
+        {}};
+    // Claim while holding the same lock that admitted the request.  This
+    // closes the only gap in which a producer could leave NeedsKick behind a
+    // concurrent consumer that is already draining the queue.
+    result.transport = queue_.empty()
+        ? libk::optional<kernel::IpiDelivery::Token>{}
+        : delivery_.claim();
+    publish_summary();
+    return result;
+}
+
+auto RemoteQueue::try_transport_failed(
+    kernel::IpiDelivery::Token token) noexcept -> bool {
+    const bool retry = delivery_.fail_if_inflight(token);
+    if (retry) {
+        // The queue projection is intentionally partial here: the canonical
+        // IpiDelivery state changed locklessly, while queue ownership itself
+        // remains protected by lock_.  A later ordinary queue pass republishes
+        // the complete summary and diagnostic phases.
+        summary_.delivery_state.store<libk::MemoryOrder::Release>(
+            static_cast<u32>(delivery_.state()));
+        summary_.delivery_generation.store<libk::MemoryOrder::Release>(
+            delivery_.generation());
+    }
+    return retry;
 }
 
 auto RemoteQueue::claim_transport() noexcept

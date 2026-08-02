@@ -223,6 +223,11 @@ auto CpuDispatcher::accept_wake(
         return WakeAcceptance::Accepted;
     }
     if (execution.state_ == ExecutionState::Throttled) {
+        // A wake accepted while the continuation is budget-throttled must
+        // survive the refill and the resumed stack until block_current().
+        // The Blocked arm above deliberately does not set this bit: its
+        // make_ready() transition already consumes that wake.
+        binding.wake_credit_ = true;
         binding.publish_accept(cause, delivery);
         binding.publish_projection();
         return WakeAcceptance::Accepted;
@@ -238,6 +243,16 @@ auto CpuDispatcher::post_wake(
         return libk::unexpected(WakeError::WrongCpu);
     }
     return post_remote(binding.wake_, cause, delivery);
+}
+
+auto CpuDispatcher::post_wake_if_available(
+    Binding& binding,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
+    if (binding.home_cpu() != id_) {
+        return libk::unexpected(WakeError::WrongCpu);
+    }
+    return try_post_remote(binding.wake_, cause, delivery);
 }
 
 auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
@@ -364,6 +379,49 @@ auto CpuDispatcher::post_remote(
         *delivery = posted.delivery;
     }
     return kick_remote();
+}
+
+auto CpuDispatcher::try_post_remote(
+    RemoteRequest& request,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
+    if (!ipi_available_) {
+        return libk::unexpected(WakeError::Unavailable);
+    }
+    const auto posted = remote_.try_post(request, cause);
+    if (!posted) {
+        // No request was admitted, so the canonical pending bit and
+        // intrusive hook remain untouched.  A later ordinary scheduler event
+        // may retry without having to repair a half-posted request.
+        return libk::unexpected(WakeError::Busy);
+    }
+    if (delivery != nullptr) {
+        *delivery = posted->post.delivery;
+    }
+    if (!posted->transport) {
+        // An existing transport already owns the edge, or the consumer
+        // drained the queue between admission and this observation.
+        return libk::expected();
+    }
+    KASSERT(cpu_->descriptor != nullptr);
+    // This path is used by IRQ-off diagnostic producers.  Flight recording
+    // is deliberately left to the ordinary scheduler wake path: the
+    // recorder has a bounded storage target but its reservation loop is not a
+    // fixed-step producer operation.
+    if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
+        return libk::expected();
+    }
+    const bool retry = remote_.try_transport_failed(*posted->transport);
+    if (retry) {
+        // Admission succeeded and the request remains pending.  Surface the
+        // retained-but-not-kicked state instead of collapsing it into the
+        // admission-level Unavailable error.
+        return libk::unexpected(WakeError::Retained);
+    }
+    // A consumer or a newer transport advanced the delivery generation while
+    // this send was in flight.  No retry is owed by this token, so the wake
+    // edge is already consumed or owned by the newer transport.
+    return libk::expected();
 }
 
 auto CpuDispatcher::kick_remote() noexcept -> WakeResult {
@@ -610,6 +668,15 @@ void CpuDispatcher::block_current() noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(current_ && !current_.idle());
     KASSERT(current_binding_ != nullptr);
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    //Confirmatory experiment.
+    // Exit condition: remove after an external scheduler harness can force
+    // the same wake-before-block sequence on a real continuation.
+    diag::concurrency::probe15_wake_credit_block(
+        id_,
+        reinterpret_cast<u64>(current_binding_),
+        current_binding_->wake_credit_);
+#endif
     if (current_binding_->wake_credit_) {
         current_binding_->wake_credit_ = false;
         current_binding_->publish_projection();
@@ -642,6 +709,12 @@ void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
 void CpuDispatcher::on_timer() noexcept {
     KASSERT(!arch::interrupts_enabled());
     const time::Instant now = clock_->now();
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    //Confirmatory experiment.
+    // Exit condition: remove after the bounded Probe 15 timer snapshot has
+    // separated timer-trap entry from watchdog callback delivery.
+    diag::concurrency::probe15_timer_enter(id_, now.ticks());
+#endif
     diag::concurrency::timer(id_, now.ticks());
     charge_to(now);
     arch::mask_timer();
@@ -729,6 +802,19 @@ void CpuDispatcher::dispatch(
             break;
         case DispatchReason::Block:
             outgoing.execution().set_state(ExecutionState::Blocked);
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+            if (diag::concurrency::probe15_wake_credit_prepare_blocked(
+                    id_, reinterpret_cast<u64>(outgoing_binding))) {
+                outgoing_binding->context().exhaust_for_probe(now);
+                const auto acceptance = accept_wake(*outgoing_binding);
+                diag::concurrency::probe15_wake_credit_blocked(
+                    id_,
+                    reinterpret_cast<u64>(outgoing_binding),
+                    acceptance != WakeAcceptance::Rejected,
+                    outgoing.execution().state() == ExecutionState::Throttled,
+                    outgoing_binding->wake_credit_);
+            }
+#endif
             break;
         case DispatchReason::Park:
             KASSERT(false);
@@ -829,6 +915,20 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
     if (!timer_available_) {
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+        //Confirmatory experiment.
+        // Exit condition: remove after one stop-world snapshot attributes the
+        // timeout to timer availability or programming.
+        diag::concurrency::probe15_program(
+            id_,
+            now.ticks(),
+            time::Instant::max().ticks(),
+            programmed_deadline_.ticks(),
+            timer_available_,
+            false,
+            watchdog_deadline_.armed(),
+            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
+#endif
         return;
     }
 
@@ -859,8 +959,36 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
         timer_available_ = false;
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+        //Confirmatory experiment.
+        // Exit condition: remove after one stop-world snapshot attributes the
+        // timeout to timer availability or programming.
+        diag::concurrency::probe15_program(
+            id_,
+            now.ticks(),
+            deadline.ticks(),
+            programmed_deadline_.ticks(),
+            timer_available_,
+            false,
+            watchdog_deadline_.armed(),
+            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
+#endif
     } else {
         programmed_deadline_ = deadline;
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+        //Confirmatory experiment.
+        // Exit condition: remove after one stop-world snapshot attributes the
+        // timeout to timer availability or programming.
+        diag::concurrency::probe15_program(
+            id_,
+            now.ticks(),
+            deadline.ticks(),
+            programmed_deadline_.ticks(),
+            timer_available_,
+            true,
+            watchdog_deadline_.armed(),
+            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
+#endif
     }
 }
 
@@ -891,7 +1019,16 @@ void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
 
 void CpuDispatcher::watchdog_fire() noexcept {
     const time::Instant now = clock_->now();
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    //Confirmatory experiment.
+    // Exit condition: remove with the Stage D external timer harness once it
+    // can independently identify the production watchdog deadline callback.
+    diag::concurrency::probe15_timer_fire(id_, now.ticks());
+#endif
     diag::concurrency::watchdog_tick(id_, now.ticks());
+#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
+    diag::concurrency::probe15_after_timer(id_);
+#endif
     arm_watchdog(now);
 }
 #endif
@@ -1109,6 +1246,30 @@ auto wake(
         return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
     }
     return target->dispatcher().post_wake(binding, cause, delivery);
+}
+
+auto try_wake(
+    CpuRegistry& cpus,
+    Binding& binding,
+    diag::concurrency::ObservationKey cause,
+    diag::concurrency::ObservationKey* delivery) noexcept
+    -> CpuDispatcher::WakeResult {
+    // The only caller is the IRQ-off diagnostic report producer. Keep this
+    // boundary explicit so the bounded path cannot silently grow an IRQ
+    // instrumentation/restore sequence when reused elsewhere.
+    KASSERT(!arch::interrupts_enabled());
+    CpuRuntime* const target = cpus.runtime(binding.home_cpu());
+    if (target == nullptr
+        || target->local.descriptor->state() != CpuState::Online) {
+        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
+    }
+
+    // Keep the observer path uniform even for a home CPU equal to the
+    // producer: the self-IPI is a scheduling hint, while the home CPU's
+    // normal software-interrupt consumer remains the sole owner of
+    // accept_wake/make_ready and its canonical scheduler mutations.
+    return target->dispatcher().post_wake_if_available(
+        binding, cause, delivery);
 }
 
 auto start(CpuRegistry& cpus, Binding& binding) noexcept

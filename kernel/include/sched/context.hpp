@@ -104,7 +104,7 @@ public:
     [[nodiscard]] auto unbind() noexcept -> Result;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto startable() const noexcept -> bool;
-#if MYOS_CONCURRENCY_PROBE == 10
+#if MYOS_CONCURRENCY_PROBE == 10 || MYOS_CONCURRENCY_PROBE == 15
     //Confirmatory experiment.
     // Exit condition: remove when the external scheduler harness can consume
     // a real context budget before its first admission to the ready queue.

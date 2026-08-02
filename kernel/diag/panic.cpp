@@ -737,14 +737,22 @@ void print_concurrency(
         }
         if (root && concurrency::analyze(root, *graph)) {
             panic_print<
-                "    wait-graph class={} nodes={}{}\n">(
+                "    wait-graph class={} nodes={}{} pending={}/{} "
+                "omitted={}\n">(
                 concurrency::stall_class_name(graph->classification),
                 graph->count,
-                graph->truncated ? " truncated" : "");
+                graph->truncated ? " truncated" : "",
+                graph->pending_shown,
+                graph->pending_total,
+                graph->pending_omitted);
             for (usize index = 0; index < graph->count; ++index) {
                 const concurrency::NodeRef node = graph->node(index);
-                panic_print<"      [{}] kind={} node={:#x} gen={}\n">(
+                panic_print<
+                    "      [{}] parent={} edge={} kind={} node={:#x} "
+                    "gen={}\n">(
                     index,
+                    graph->parents[index],
+                    static_cast<u32>(graph->edge(index)),
                     static_cast<u32>(node.kind),
                     node.identity,
                     node.generation);
