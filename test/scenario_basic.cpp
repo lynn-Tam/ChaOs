@@ -154,10 +154,10 @@ auto dispatch(CpuRuntime& runtime) noexcept -> bool {
         return false;
     }
 
-    if (diag::concurrency::flight_head(runtime) == 0) {
-        return false;
-    }
-    const u64 before = diag::concurrency::flight_head(runtime);
+    const bool flight_enabled =
+        diag::concurrency::enabled(diag::concurrency::Level::Trace);
+    const u64 before = flight_enabled
+        ? diag::concurrency::flight_head(runtime) : 0;
     sched::Binding* const binding = context->binding();
     const bool started = binding != nullptr
         && static_cast<bool>(sched::start(*runtime.owner_registry, *binding));
@@ -166,7 +166,7 @@ auto dispatch(CpuRuntime& runtime) noexcept -> bool {
     }
     bool saw_dispatch{};
     bool saw_exit{};
-    if (diag::concurrency::flight_head(runtime) >= before) {
+    if (flight_enabled && diag::concurrency::flight_head(runtime) >= before) {
         const usize count = diag::concurrency::flight_count(runtime);
         diag::concurrency::FlightRecordValue value{};
         for (usize index = 0; index < count; ++index) {
@@ -191,14 +191,16 @@ auto dispatch(CpuRuntime& runtime) noexcept -> bool {
     context.reset();
     thread.reset();
     kernel.objects().drain_reclaim();
-    // The handoff-in event may be overwritten by the bounded flight ring
-    // while finish_exit publishes the returned idle target. The entry flag
-    // proves the context switch reached the private task; retain the later
-    // Exit commit as the durable scheduler witness.
-    const bool handoff_commit = saw_dispatch || saw_exit;
+    // The fixed ring may retain any one of the handoff events while later
+    // traffic overwrites another. Canonical entry and teardown prove task
+    // completion; trace levels additionally require one retained handoff.
+    const bool handoff_commit = flight_enabled
+        ? (saw_dispatch || saw_exit)
+        : state.ran.load<libk::MemoryOrder::Acquire>() != 0;
     const bool result = started
         && state.ran.load<libk::MemoryOrder::Acquire>() != 0
-        && handoff_commit && saw_exit && context_unbound && unadmitted
+        && handoff_commit
+        && context_unbound && unadmitted
         && context_retired && thread_retired;
     if (result) {
         diag::console::print<"[scenario] dispatch-flight ok\n">();

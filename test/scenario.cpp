@@ -23,6 +23,7 @@ auto run(
     case diag::scenario::Id::Publication:
     case diag::scenario::Id::ReportRetry:
     case diag::scenario::Id::Dispatch:
+    case diag::scenario::Id::Observer:
         // These scenarios need a published CpuRuntime and run from the
         // runtime hook below. Selection itself is validated before bring-up.
         return true;
@@ -40,6 +41,8 @@ auto run_runtime(
         return detail::report(runtime);
     case diag::scenario::Id::Dispatch:
         return detail::dispatch(runtime);
+    case diag::scenario::Id::Observer:
+        return detail::observer(runtime);
     case diag::scenario::Id::Trap:
         return detail::trap(runtime);
     case diag::scenario::Id::RemoteDelivery:

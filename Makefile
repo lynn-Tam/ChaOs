@@ -122,10 +122,11 @@ SCENARIO_ID_remote := 4
 SCENARIO_ID_publication := 5
 SCENARIO_ID_report := 6
 SCENARIO_ID_dispatch := 7
+SCENARIO_ID_observer := 8
 SCENARIO_ID := $(SCENARIO_ID_$(SCENARIO_KEY))
-SUPPORTED_SCENARIOS := off ordinary initrd trap remote publication report dispatch
+SUPPORTED_SCENARIOS := off ordinary initrd trap remote publication report dispatch observer
 ifeq ($(filter $(SCENARIO_KEY),$(SUPPORTED_SCENARIOS)),)
-$(error Unsupported scenario selector $(SCENARIO_KEY); use off/ordinary/initrd/trap/remote/publication/report/dispatch)
+$(error Unsupported scenario selector $(SCENARIO_KEY); use off/ordinary/initrd/trap/remote/publication/report/dispatch/observer)
 endif
 
 # Verify tools exist early.
@@ -409,6 +410,7 @@ TEST_SRCS := \
   test/scenario_remote.cpp \
   test/scenario_publication.cpp \
   test/scenario_report.cpp \
+  test/scenario_observer.cpp \
   test/libk_test.cpp \
   test/sync_test.cpp \
   test/allocator_test.cpp \
@@ -930,6 +932,7 @@ _run-scenario: $(TARGET) $(if $(filter initrd,$(SCENARIO_KEY)),$(BOOT_BUNDLE))
 		publication) marker="\\[scenario\\] publication ok";; \
 		report) marker="\\[scenario\\] report-retry wake-credit ok";; \
 		dispatch) marker="\\[scenario\\] dispatch-flight ok";; \
+		observer) marker="\\[scenario\\] observer ok";; \
 		esac; \
 	if [ -n "$$marker" ] && ! rg -q "$$marker" "$$output"; then \
 		echo "[scenario] FAIL: marker missing for $(SCENARIO_KEY)"; \

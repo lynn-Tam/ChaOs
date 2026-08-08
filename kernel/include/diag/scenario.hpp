@@ -17,6 +17,7 @@ enum class Id : u16 {
     Publication = 5,
     ReportRetry = 6,
     Dispatch = 7,
+    Observer = 8,
 };
 
 extern const Id selected;

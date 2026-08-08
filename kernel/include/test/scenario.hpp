@@ -29,6 +29,7 @@ namespace detail {
 [[nodiscard]] auto initrd(const boot::BootInfo& boot) noexcept -> bool;
 [[nodiscard]] auto trap(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto dispatch(CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto observer(CpuRuntime& runtime) noexcept -> bool;
 } // namespace detail
 
 } // namespace kernel::test::scenario
