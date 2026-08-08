@@ -193,14 +193,12 @@ public:
 
     [[nodiscard]] auto request_retire(ObjectId id) noexcept -> bool {
         Slot* slot{};
-#if MYOS_CONCURRENCY_DIAG >= 1
         u64 generation{};
         kernel::diag::concurrency::ObservationKey retire_key{};
         bool cleanup_complete{};
         usize strong_refs{};
         usize active_pins{};
         bool reclaim_queued{};
-#endif
         {
             kernel::sync::IrqLockGuard guard{lock_};
             slot = find_slot(id);
@@ -209,22 +207,17 @@ public:
                 return false;
             }
             slot->anchor.lifecycle_ = ObjectLifecycle::Retiring;
-#if MYOS_CONCURRENCY_DIAG >= 1
             generation = slot->anchor.generation_;
-#endif
             KASSERT(
                 slot->anchor.active_pins_
                 != libk::numeric_limits<usize>::max());
             ++slot->anchor.active_pins_;
-#if MYOS_CONCURRENCY_DIAG >= 1
             cleanup_complete = slot->anchor.cleanup_complete_;
             strong_refs = slot->anchor.strong_refs_;
             active_pins = slot->anchor.active_pins_;
             reclaim_queued = slot->anchor.reclaim_queued_;
-#endif
         }
 
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto observation =
                 kernel::diag::concurrency::ObservationLease::reserve(
                     kernel::diag::concurrency::RecordKind::ObjectRetire,
@@ -257,7 +250,6 @@ public:
             KASSERT(slot->anchor.generation_ == generation);
             slot->retire_key = retire_key.raw;
         }
-#endif
 
         if constexpr (requires(T& object) {
             ObjectTraits<T>::prepare_retire(object);
@@ -271,7 +263,6 @@ public:
                     --slot->anchor.active_pins_;
                     slot->anchor.lifecycle_ = ObjectLifecycle::Live;
                 }
-#if MYOS_CONCURRENCY_DIAG >= 1
                 auto active = retire_observation(retire_key);
                 active.finish(5);
                 {
@@ -280,7 +271,6 @@ public:
                         slot->retire_key = 0;
                     }
                 }
-#endif
                 return false;
             }
         }
@@ -305,9 +295,7 @@ public:
         usize drained{};
         for (;;) {
             Slot* slot{};
-#if MYOS_CONCURRENCY_DIAG >= 1
             kernel::diag::concurrency::ObservationKey retire_key{};
-#endif
             {
                 kernel::sync::IrqLockGuard guard{lock_};
                 slot = reclaim_head_;
@@ -322,14 +310,11 @@ public:
                 KASSERT(slot->anchor.cleanup_complete_);
                 KASSERT(slot->anchor.strong_refs_ == 0);
                 KASSERT(slot->anchor.active_pins_ == 0);
-#if MYOS_CONCURRENCY_DIAG >= 1
                 retire_key = kernel::diag::concurrency::ObservationKey{
                     slot->retire_key};
-#endif
                 slot->anchor.lifecycle_ = ObjectLifecycle::Quiescent;
             }
 
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(retire_key);
             kernel::diag::concurrency::ObservationBatch update{
                 .phase = 4,
@@ -340,16 +325,13 @@ public:
                 .update_relation = false};
             publish_retire_witness(update, true, 0, 0, false);
             active.publish(update);
-#endif
             ObjectTraits<T>::destroy(*slot->object());
             auto refund = slot->anchor.sponsorship_.detach();
-#if MYOS_CONCURRENCY_DIAG >= 1
             active.finish(5);
             {
                 kernel::sync::IrqLockGuard guard{lock_};
                 slot->retire_key = 0;
             }
-#endif
             finalize_free(*slot);
             refund.complete();
             ++drained;
@@ -362,7 +344,6 @@ public:
     }
 
 private:
-#if MYOS_CONCURRENCY_DIAG >= 1
     static void publish_retire_witness(
         kernel::diag::concurrency::ObservationBatch& update,
         bool cleanup_complete,
@@ -391,7 +372,6 @@ private:
         -> kernel::diag::concurrency::ObservationLease {
         return kernel::diag::concurrency::ObservationLease::borrow(key);
     }
-#endif
 
     [[nodiscard]] static auto slots(PageHeader& page) noexcept -> Slot* {
         return reinterpret_cast<Slot*>(
@@ -605,7 +585,6 @@ private:
             KASSERT(anchor.generation_ == generation);
             KASSERT(anchor.strong_refs_ != 0);
             --anchor.strong_refs_;
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
             const bool reclaim_queued = anchor.reclaim_queued_;
             const bool cleanup_complete = anchor.cleanup_complete_;
@@ -634,7 +613,6 @@ private:
                 anchor.reclaim_queued_);
             active.publish(update);
             active.advance();
-#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -650,7 +628,6 @@ private:
             KASSERT(anchor.generation_ == generation);
             KASSERT(anchor.active_pins_ != 0);
             --anchor.active_pins_;
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
             const bool reclaim_queued = anchor.reclaim_queued_;
             const bool cleanup_complete = anchor.cleanup_complete_;
@@ -679,7 +656,6 @@ private:
                 anchor.reclaim_queued_);
             active.publish(update);
             active.advance();
-#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -698,7 +674,6 @@ private:
             KASSERT(anchor.active_pins_ != 0);
             anchor.cleanup_complete_ = true;
             --anchor.active_pins_;
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
             kernel::diag::concurrency::ObservationBatch update{
                 .phase = 2,
@@ -714,7 +689,6 @@ private:
                 anchor.active_pins_,
                 anchor.reclaim_queued_);
             active.publish(update);
-#endif
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
         if (queued) {
@@ -793,7 +767,6 @@ private:
         anchor.reclaim_queued_ = true;
         slot.next_reclaim = reclaim_head_;
         reclaim_head_ = &slot;
-#if MYOS_CONCURRENCY_DIAG >= 1
         auto active = retire_observation(anchor, anchor.generation_);
         kernel::diag::concurrency::ObservationBatch update{
             .phase = 3,
@@ -806,7 +779,6 @@ private:
             .watched = true};
         publish_retire_witness(update, true, 0, 0, true);
         active.publish(update);
-#endif
         return true;
     }
 
@@ -816,15 +788,11 @@ private:
         KASSERT(reclaim_notify_ != nullptr);
         if (*reclaim_notify_) {
             const auto service = (*reclaim_notify_)();
-#if MYOS_CONCURRENCY_DIAG >= 1
             auto active = retire_observation(anchor, generation);
             active.attempt(
                 3,
                 kernel::diag::concurrency::WaitKind::ObjectReclaim,
                 kernel::diag::concurrency::NodeRef::observation(service));
-#else
-            static_cast<void>(service);
-#endif
         }
     }
 

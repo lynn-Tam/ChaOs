@@ -30,7 +30,10 @@ private:
     struct DebugOwner final {
         libk::Atomic<u64> word{};
     };
-    using Owner = libk::conditional_t<lock_trace, DebugOwner, EmptyOwner>;
+    // Keep the owner word in every build.  Diagnostic providers may be
+    // selected at link time, so lock consumers must not change their layout
+    // with provider policy.
+    using Owner = DebugOwner;
 
     libk::TicketSpinLock raw_{};
     [[no_unique_address]] Owner owner_{};
@@ -82,76 +85,15 @@ struct LockAccess final {
     template<LockClass Class, SameClassPolicy SameClass>
     [[nodiscard]] static auto ref(SpinLock<Class, SameClass>& lock) noexcept
         -> LockRef {
-        libk::Atomic<u64>* owner{};
-        if constexpr (lock_trace) {
-            owner = &lock.owner_.word;
-        }
-        return LockRef{&lock, owner, Class, SameClass};
+        return LockRef{&lock, &lock.owner_.word, Class, SameClass};
     }
 
     template<LockClass Class, SameClassPolicy SameClass>
     [[nodiscard]] static auto acquire(
         SpinLock<Class, SameClass>& lock, LockSite site) noexcept
         -> LockCookie {
-        if constexpr (!lock_runtime) {
-            lock.raw_.lock();
-            return {};
-        } else {
-            const LockRef identity = ref(lock);
-            LockCookie cookie = before_acquire(identity, site);
-            if constexpr (lock_trace) {
-                struct Observer final {
-                    LockRef lock;
-                    LockSite site;
-                    LockCookie* cookie;
-                    u32 polls{};
-
-                    void operator()(u32 ticket, u32 serving) noexcept {
-                        ++polls;
-                        cookie->contended = true;
-                        if (polls == 1 || (polls & 0x3ffU) == 0) {
-                            on_spin(lock, site, ticket, serving, polls);
-                        }
-                    }
-                } observer{identity, site, &cookie};
-                lock.raw_.lock(observer);
-            } else {
-                lock.raw_.lock();
-            }
-            return after_acquire(identity, site, cookie);
-        }
-    }
-
-    template<LockClass Class, SameClassPolicy SameClass>
-    [[nodiscard]] static auto try_acquire(
-        SpinLock<Class, SameClass>& lock,
-        LockSite site,
-        LockCookie& cookie) noexcept -> bool {
-        if constexpr (!lock_runtime) {
-            return lock.raw_.try_lock();
-        } else {
-            const LockRef identity = ref(lock);
-            cookie = before_try(identity, site);
-            if (!lock.raw_.try_lock()) {
-                cancel_try(cookie);
-                cookie = {};
-                return false;
-            }
-            cookie = after_try(identity, site, cookie);
-            return true;
-        }
-    }
-
-#if MYOS_LOCK_PROBE
-    //Confirmatory experiment.
-    // Only the stable wait-cycle probe bypasses structural graph insertion;
-    // normal builds do not contain this entry point.
-    template<LockClass Class, SameClassPolicy SameClass>
-    [[nodiscard]] static auto acquire_wait_probe(
-        SpinLock<Class, SameClass>& lock, LockSite site) noexcept
-        -> LockCookie {
         const LockRef identity = ref(lock);
-        LockCookie cookie = before_wait_probe(identity, site);
+        LockCookie cookie = before_acquire(identity, site);
         struct Observer final {
             LockRef lock;
             LockSite site;
@@ -169,16 +111,29 @@ struct LockAccess final {
         lock.raw_.lock(observer);
         return after_acquire(identity, site, cookie);
     }
-#endif
+
+    template<LockClass Class, SameClassPolicy SameClass>
+    [[nodiscard]] static auto try_acquire(
+        SpinLock<Class, SameClass>& lock,
+        LockSite site,
+        LockCookie& cookie) noexcept -> bool {
+        const LockRef identity = ref(lock);
+        cookie = before_try(identity, site);
+        if (!lock.raw_.try_lock()) {
+            cancel_try(cookie);
+            cookie = {};
+            return false;
+        }
+        cookie = after_try(identity, site, cookie);
+        return true;
+    }
 
     template<LockClass Class, SameClassPolicy SameClass>
     static void release(
         SpinLock<Class, SameClass>& lock,
         LockSite site,
         LockCookie cookie) noexcept {
-        if constexpr (lock_runtime) {
-            before_release(ref(lock), site, cookie);
-        }
+        before_release(ref(lock), site, cookie);
         lock.raw_.unlock();
     }
 
@@ -186,17 +141,11 @@ struct LockAccess final {
     static void assert_held(
         SpinLock<Class, SameClass>& lock,
         LockSite site = LockSite::current()) noexcept {
-        if constexpr (lock_verify) {
-            sync::assert_held(ref(lock), site);
-        }
+        sync::assert_held(ref(lock), site);
     }
 };
 
-#if MYOS_LOCK_DIAG == 0 && MYOS_CONCURRENCY_DIAG == 0
 static_assert(sizeof(SpinLock<LockClass::Pmm>)
-    == sizeof(libk::TicketSpinLock));
-static_assert(alignof(SpinLock<LockClass::Pmm>)
-    == alignof(libk::TicketSpinLock));
-#endif
+    == sizeof(libk::TicketSpinLock) + sizeof(libk::Atomic<u64>));
 
 } // namespace kernel::sync

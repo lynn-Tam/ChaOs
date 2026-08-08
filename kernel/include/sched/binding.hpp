@@ -67,6 +67,11 @@ public:
         return actor_.key();
     }
 
+    //Confirmatory experiment.
+    // Exit condition: remove when the external scheduler scenario can observe
+    // the retained credit through a public continuation contract.
+    [[nodiscard]] auto wake_credit() const noexcept -> bool;
+
     [[nodiscard]] auto actor_ref() noexcept -> diag::concurrency::NodeRef {
         ensure_actor(diag::concurrency::SourceSite::current());
         return diag::concurrency::NodeRef::observation(actor_.key());
@@ -106,15 +111,6 @@ public:
         publish_projection();
     }
 
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || MYOS_CONCURRENCY_PROBE == 11
-    //Confirmatory experiment.
-    // Exit condition: remove when operation fault injection no longer borrows
-    // a real Ready binding before its first dispatch.
-    void suppress_actor_for_probe() noexcept {
-        actor_.watch(false);
-    }
-#endif
 
 private:
     friend class ReadyQueue;

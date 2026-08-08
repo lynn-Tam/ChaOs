@@ -76,11 +76,57 @@ HOST_CXX ?= c++
 QEMU_SMP ?= 4
 QEMU_TIMEOUT ?= 10s
 PANIC_PROBE ?= 0
-LOCK_PROBE ?= 0
 CONCURRENCY_PROBE ?= 0
 STAGE_F_PROBE ?= 0
+SCENARIO ?=
 GDB_HOST ?= 127.0.0.1
 GDB_PORT ?= 1237
+
+ifneq ($(filter-out 0,$(CONCURRENCY_PROBE)),)
+ifneq ($(filter-out 0,$(STAGE_F_PROBE)),)
+$(error CONCURRENCY_PROBE and STAGE_F_PROBE are exclusive scenario selectors)
+endif
+LEGACY_SCENARIO_1 := ordinary
+LEGACY_SCENARIO_2 := ordinary
+LEGACY_SCENARIO_3 := initrd
+LEGACY_SCENARIO_4 := initrd
+LEGACY_SCENARIO_5 := publication
+LEGACY_SCENARIO_6 := report
+LEGACY_SCENARIO_7 := remote
+LEGACY_SCENARIO_8 := publication
+LEGACY_SCENARIO_9 := dispatch
+LEGACY_SCENARIO_10 := dispatch
+LEGACY_SCENARIO_11 := dispatch
+LEGACY_SCENARIO_12 := trap
+LEGACY_SCENARIO_13 := remote
+LEGACY_SCENARIO_14 := publication
+LEGACY_SCENARIO_15 := report
+else ifneq ($(filter-out 0,$(STAGE_F_PROBE)),)
+# Legacy Stage-F CLI maps to the mechanism scenario ``dispatch``.
+LEGACY_SCENARIO_STAGE_F := dispatch
+else
+LEGACY_SCENARIO_STAGE_F := off
+endif
+
+ifneq ($(strip $(SCENARIO)),)
+ifneq ($(filter-out 0,$(CONCURRENCY_PROBE) $(STAGE_F_PROBE)),)
+$(error SCENARIO cannot be combined with legacy probe selectors)
+endif
+endif
+SCENARIO_KEY := $(or $(strip $(SCENARIO)),$(if $(filter 0,$(CONCURRENCY_PROBE)),$(or $(LEGACY_SCENARIO_STAGE_F),off),$(or $(LEGACY_SCENARIO_$(CONCURRENCY_PROBE)),invalid)))
+SCENARIO_ID_off := 0
+SCENARIO_ID_ordinary := 1
+SCENARIO_ID_initrd := 2
+SCENARIO_ID_trap := 3
+SCENARIO_ID_remote := 4
+SCENARIO_ID_publication := 5
+SCENARIO_ID_report := 6
+SCENARIO_ID_dispatch := 7
+SCENARIO_ID := $(SCENARIO_ID_$(SCENARIO_KEY))
+SUPPORTED_SCENARIOS := off ordinary initrd trap remote publication report dispatch
+ifeq ($(filter $(SCENARIO_KEY),$(SUPPORTED_SCENARIOS)),)
+$(error Unsupported scenario selector $(SCENARIO_KEY); use off/ordinary/initrd/trap/remote/publication/report/dispatch)
+endif
 
 # Verify tools exist early.
 ifeq ($(shell command -v $(CC) 2>/dev/null),)
@@ -103,19 +149,35 @@ ifeq ($(shell command -v $(READELF) 2>/dev/null),)
 $(error readelf not found: $(READELF))
 endif
 
-VTABLE_ALLOWLIST_PREFIXES = $(BUILD_DIR)/kernel/object/
-
 RISCV_ARCH ?= rv64gc
 RISCV_ABI  ?= lp64d
 RISCV_ARCH_FLAGS := -march=$(RISCV_ARCH) -mabi=$(RISCV_ABI)
 BUILD_REVISION := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DIRTY := $(if $(shell git status --porcelain 2>/dev/null),dirty,clean)
-BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)$(if $(filter-out 0,$(LOCK_PROBE)),-lockprobe$(LOCK_PROBE),)$(if $(filter-out 0,$(CONCURRENCY_PROBE)),-concprobe$(CONCURRENCY_PROBE),)$(if $(filter-out 0,$(STAGE_F_PROBE)),-stagefprobe,)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
+BUILD_VARIANT := $(if $(filter-out 0,$(PANIC_PROBE)),-panic$(PANIC_PROBE),)-lock$(LOCK_DIAG)-conc$(CONCURRENCY_DIAG)
 BUILD_ID := $(BUILD_REVISION)-$(BUILD_DIRTY)-$(ARCH)-$(PROFILE)$(BUILD_VARIANT)
 
-BUILD_DIR := build/$(ARCH)/$(PROFILE)$(BUILD_VARIANT)
+# BUILD_DIR names the image output only.  Core and module objects are keyed
+# independently so profile/diagnostic/scenario changes do not create another
+# complete object tree.
+BUILD_DIR ?= build/$(ARCH)/$(PROFILE)
 TARGET    := $(BUILD_DIR)/kernel.elf
 MAPFILE   := $(BUILD_DIR)/kernel.map
+IMAGE_ID_FILE := $(BUILD_DIR)/image.id
+# Make's timestamp graph cannot observe a command-line BUILD_ID change by
+# itself.  Give each identity a distinct prerequisite instead of forcing the
+# metadata object on every invocation; the stamp recipe updates the readable
+# image.id only when this identity has not been seen in this build directory.
+IMAGE_ID_KEY := $(subst /,_,$(subst :,_,$(BUILD_ID)))
+IMAGE_ID_STAMP := $(BUILD_DIR)/.image-id-$(IMAGE_ID_KEY)
+# The image target is reused while a selector/module key changes.  Keep one
+# image-local composition state file whose content is compared on every make
+# invocation; this forces a relink only when the selected module set or image
+# identity actually changes, including switching back to an older selector.
+IMAGE_LINK_INPUTS = build=$(BUILD_ID)|profile=$(PROFILE)|scenario=$(SCENARIO_KEY)|tests=$(ENABLE_TESTS)|toolchain=$(TOOLCHAIN_ID)|objs=$(OBJS)|ldflags=$(LDFLAGS)|script=$(LINKER_SCRIPT)
+IMAGE_LINK_KEY = $(shell printf '%s' "$(IMAGE_LINK_INPUTS)" | sha256sum | cut -c1-16)
+IMAGE_LINK_STATE := $(BUILD_DIR)/image.link
+IMAGE_LINK_MANIFEST := $(BUILD_DIR)/image.link.config
 LINKER_SCRIPT := arch/$(ARCH)/linker.ld
 # Trace builds deliberately add one owner word to every tracked lock. Built-in
 # tests construct dense object fixtures on their private kernel stacks, so
@@ -140,14 +202,6 @@ HOST_BUILD_DIR := build/host
 BOOTPACK := $(HOST_BUILD_DIR)/bootpack
 
 COMMON_FLAGS := -ffreestanding -Wall -Wextra -O2 -g3 \
-                -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
-                -DMYOS_LOCK_PROBE=$(LOCK_PROBE) \
-                -DMYOS_CONCURRENCY_PROBE=$(CONCURRENCY_PROBE) \
-                -DMYOS_STAGE_F_PROBE=$(STAGE_F_PROBE) \
-                -DMYOS_BUILTIN_TESTS=$(ENABLE_TESTS) \
-                -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
-                -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) \
-                -DMYOS_BUILD_ID=\"$(BUILD_ID)\" \
                 $(RISCV_ARCH_FLAGS) \
                 -mcmodel=medany -msmall-data-limit=0 \
                 -I . \
@@ -164,7 +218,45 @@ CXXFLAGS := $(COMMON_FLAGS) -std=gnu++2b \
             -fno-omit-frame-pointer -fno-optimize-sibling-calls \
             -fstack-usage
 
+# Build identity is image metadata, not a common code-generation input. Only
+# the dedicated metadata TU receives this define; changing PROFILE/build ID
+# therefore does not invalidate compatible kernel objects.
+IMAGE_BUILD_INFO_OBJ := $(BUILD_DIR)/kernel/image/build_info-$(IMAGE_ID_KEY).cpp.o
+$(IMAGE_BUILD_INFO_OBJ): kernel/image/build_info.cpp $(IMAGE_ID_STAMP)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DMYOS_BUILD_ID=\"$(BUILD_ID)\" -MMD -MP -c $< -o $@
+$(IMAGE_ID_STAMP):
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(BUILD_ID)' > $(IMAGE_ID_FILE)
+	@printf '%s\n' '$(BUILD_ID)' > $@
+
 ASFLAGS  := $(COMMON_FLAGS)
+
+# Object identity is a content key over the effective common commands, not a
+# profile/stage label. Include compiler executable/version and every language
+# flag which can change generated core code or ABI. Keep a short readable
+# prefix while the full command inputs are recorded in the per-store config.
+TOOLCHAIN_ID := CC=$(shell command -v $(CC));$(shell $(CC) -dumpmachine);$(shell $(CC) -dumpfullversion)|CXX=$(shell command -v $(CXX));$(shell $(CXX) -dumpmachine);$(shell $(CXX) -dumpfullversion)|AS=$(shell command -v $(CC))
+CORE_INPUTS := arch=$(ARCH)|isa=$(RISCV_ARCH)|abi=$(RISCV_ABI)|toolchain=$(TOOLCHAIN_ID)|cflags=$(CFLAGS)|cxxflags=$(CXXFLAGS)|asflags=$(ASFLAGS)
+CORE_HASH := $(shell printf '%s' "$(CORE_INPUTS)" | sha256sum | cut -c1-16)
+CORE_KEY := $(ARCH)-$(CORE_HASH)
+CORE_DIR := build/core/$(CORE_KEY)
+DIAG_INPUTS := core=$(CORE_INPUTS)|lock=$(LOCK_DIAG_LEVEL)|conc=$(CONCURRENCY_DIAG_LEVEL)|panic=$(PANIC_PROBE)|cxxflags=$(CXXFLAGS) -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) -DMYOS_PANIC_PROBE=$(PANIC_PROBE)
+DIAG_HASH := $(shell printf '%s' "$(DIAG_INPUTS)" | sha256sum | cut -c1-16)
+DIAG_KEY := $(subst /,_,$(subst :,_,$(LOCK_DIAG)-$(CONCURRENCY_DIAG)-panic$(PANIC_PROBE)-$(DIAG_HASH)))
+DIAG_DIR := build/module/diag/$(CORE_KEY)-$(DIAG_KEY)
+SCENARIO_INPUTS := core=$(CORE_INPUTS)|cxxflags=$(CXXFLAGS)|selector-source=kernel/diag/scenario_real.cpp
+SCENARIO_HASH := $(shell printf '%s' "$(SCENARIO_INPUTS)" | sha256sum | cut -c1-16)
+SCENARIO_DIR := build/module/scenario/$(CORE_KEY)-$(SCENARIO_HASH)
+TEST_INPUTS := core=$(CORE_INPUTS)|cxxflags=$(CXXFLAGS) -fomit-frame-pointer -foptimize-sibling-calls|tests=$(ENABLE_TESTS)
+TEST_HASH := $(shell printf '%s' "$(TEST_INPUTS)" | sha256sum | cut -c1-16)
+TEST_DIR := build/module/test/$(CORE_KEY)-$(TEST_HASH)
+CORE_CONFIG := $(CORE_DIR)/config
+DIAG_CONFIG := $(DIAG_DIR)/config
+SCENARIO_CONFIG := $(SCENARIO_DIR)/config
+TEST_CONFIG := $(TEST_DIR)/config
+MODULE_CONFIGS := $(CORE_CONFIG) $(DIAG_CONFIG) $(SCENARIO_CONFIG) $(TEST_CONFIG)
+VTABLE_ALLOWLIST_PREFIXES = $(CORE_DIR)/kernel/object/
 
 USER_COMMON_FLAGS := -ffreestanding -Wall -Wextra -Werror -O2 -g3 \
                 $(USER_ARCH_FLAGS) -mcmodel=medany -msmall-data-limit=0 \
@@ -216,13 +308,18 @@ KERNEL_SRCS := \
   kernel/boot/timebase.cpp \
   kernel/boot/firmware/devicetree/fdt.cpp \
   kernel/image/boot_bundle.cpp \
+  kernel/image/build_info.cpp \
   kernel/init/root_task.cpp \
-  kernel/init/stage_b_probe.cpp \
   kernel/init/run.cpp \
   kernel/diag/console.cpp \
   kernel/diag/panic.cpp \
+  kernel/diag/config.cpp \
   kernel/diag/concurrency.cpp \
+  kernel/diag/flight.cpp \
+  kernel/diag/report.cpp \
+  kernel/diag/watch.cpp \
   kernel/core/kernel_state.cpp \
+  kernel/cpu/cpu_runtime.cpp \
   kernel/cap/policy.cpp \
   kernel/cap/grant_graph.cpp \
   kernel/cap/cspace.cpp \
@@ -301,14 +398,17 @@ KERNEL_SRCS := \
   kernel/mm/pmm.cpp \
   libk/mem.c
 
-# Built-in tests call the lock facade even when both diagnostics are disabled;
-# keep its no-op definitions in that profile as well.
-ifneq ($(filter-out 0,$(LOCK_DIAG_LEVEL) $(CONCURRENCY_DIAG_LEVEL) $(ENABLE_TESTS)),)
+# The lock facade is a diagnostic module provider.  It is linked in every
+# image, including off/off, so callers use one stable out-of-line contract.
 KERNEL_SRCS += kernel/sync/lock.cpp
-endif
 
 TEST_SRCS := \
   test/framework.cpp \
+  test/scenario.cpp \
+  test/scenario_basic.cpp \
+  test/scenario_remote.cpp \
+  test/scenario_publication.cpp \
+  test/scenario_report.cpp \
   test/libk_test.cpp \
   test/sync_test.cpp \
   test/allocator_test.cpp \
@@ -347,48 +447,133 @@ INIT_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(INIT_USER_SRCS:=.o))
 PROOF_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(PROOF_USER_SRCS:=.o))
 UART_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(UART_USER_SRCS:=.o))
 
-SRCS := $(ARCH_SRCS) $(KERNEL_SRCS)
+IMAGE_SRCS := $(filter kernel/image/build_info.cpp,$(KERNEL_SRCS))
+DIAG_SRCS := $(filter-out kernel/diag/scenario_%.cpp,$(filter kernel/diag/%.cpp kernel/sync/lock.cpp,$(KERNEL_SRCS)))
+SCENARIO_SRCS :=
+CORE_KERNEL_SRCS := $(filter-out $(IMAGE_SRCS) $(DIAG_SRCS) $(SCENARIO_SRCS),$(KERNEL_SRCS))
+CORE_SRCS := $(ARCH_SRCS) $(CORE_KERNEL_SRCS)
 ifeq ($(ENABLE_TESTS),1)
-SRCS += $(TEST_SRCS)
+TEST_IMAGE_SRCS := $(TEST_SRCS)
+else
+TEST_IMAGE_SRCS :=
 endif
 
-C_SRCS   := $(filter %.c,$(SRCS))
-CPP_SRCS := $(filter %.cpp,$(SRCS))
-S_SRCS   := $(filter %.S,$(SRCS))
+CORE_C_SRCS := $(filter %.c,$(CORE_SRCS))
+CORE_CPP_SRCS := $(filter %.cpp,$(CORE_SRCS))
+CORE_S_SRCS := $(filter %.S,$(CORE_SRCS))
+DIAG_CPP_SRCS := $(filter %.cpp,$(DIAG_SRCS))
+SCENARIO_CPP_SRCS := $(filter %.cpp,$(SCENARIO_SRCS))
+IMAGE_CPP_SRCS := $(filter %.cpp,$(IMAGE_SRCS))
+TEST_CPP_SRCS := $(filter %.cpp,$(TEST_IMAGE_SRCS))
 
-C_OBJS   := $(addprefix $(BUILD_DIR)/,$(C_SRCS:.c=.c.o))
-CPP_OBJS := $(addprefix $(BUILD_DIR)/,$(CPP_SRCS:.cpp=.cpp.o))
-S_OBJS   := $(addprefix $(BUILD_DIR)/,$(S_SRCS:.S=.S.o))
+CORE_C_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_C_SRCS:.c=.c.o))
+CORE_CPP_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_CPP_SRCS:.cpp=.cpp.o))
+CORE_S_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_S_SRCS:.S=.S.o))
+DIAG_CPP_OBJS := $(addprefix $(DIAG_DIR)/,$(DIAG_CPP_SRCS:.cpp=.cpp.o))
+SCENARIO_CPP_OBJS := $(addprefix $(SCENARIO_DIR)/,$(SCENARIO_CPP_SRCS:.cpp=.cpp.o))
+SCENARIO_SELECTOR_OBJ := $(SCENARIO_DIR)/selector-$(SCENARIO_KEY).cpp.o
+IMAGE_CPP_OBJS := $(IMAGE_BUILD_INFO_OBJ)
+TEST_CPP_OBJS := $(addprefix $(TEST_DIR)/,$(TEST_CPP_SRCS:.cpp=.cpp.o))
+TEST_PROVIDER_SRC := $(if $(filter 1,$(ENABLE_TESTS)),test/boot.cpp,kernel/diag/test_off.cpp)
+TEST_PROVIDER_OBJ := $(TEST_DIR)/test_boot_provider-$(ENABLE_TESTS).cpp.o
+REPORT_GATE_SRC := $(if $(filter 1,$(ENABLE_TESTS)),test/scenario_gate.cpp,kernel/diag/scenario_gate_off.cpp)
+REPORT_GATE_OBJ := $(if $(filter 1,$(ENABLE_TESTS)),$(TEST_DIR)/scenario_gate.cpp.o,$(DIAG_DIR)/scenario_gate_off.cpp.o)
 
-OBJS := $(S_OBJS) $(C_OBJS) $(CPP_OBJS)
+CORE_OBJS := $(CORE_S_OBJS) $(CORE_C_OBJS) $(CORE_CPP_OBJS)
+MODULE_OBJS := $(DIAG_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(SCENARIO_SELECTOR_OBJ) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(REPORT_GATE_OBJ) $(TEST_CPP_OBJS)
+OBJS := $(CORE_OBJS) $(MODULE_OBJS)
 DEPS := $(OBJS:.o=.d)
+CPP_OBJS := $(CORE_CPP_OBJS) $(DIAG_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(TEST_CPP_OBJS)
 CPP_STACK_USAGE := $(CPP_OBJS:.o=.su)
-CLANG_CPP_SRCS := $(filter-out test/%,$(CPP_SRCS))
+CLANG_CPP_SRCS := $(CORE_CPP_SRCS) $(DIAG_CPP_SRCS) $(SCENARIO_CPP_SRCS) $(IMAGE_CPP_SRCS)
 
 all: $(TARGET) audit-boot-stack
 
 bundle: $(BOOT_BUNDLE) $(PROOF_BOOT_BUNDLE) $(UART_USER_TARGET) audit-user
 
-$(TARGET): $(OBJS) $(LINKER_SCRIPT)
-	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+$(TARGET): $(OBJS) $(LINKER_SCRIPT) FORCE | $(MODULE_CONFIGS)
+	@key='$(IMAGE_LINK_KEY)'; old=''; newer='$(filter-out FORCE,$?)'; \
+	if test -f "$(IMAGE_LINK_STATE)"; then old=$$(cat "$(IMAGE_LINK_STATE)"); fi; \
+	if test "$$old" = "$$key" && test -z "$$newer"; then exit 0; fi; \
+	mkdir -p $(dir $@); \
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) && { printf '%s\n' "$$key" > "$(IMAGE_LINK_STATE)"; printf '%s\n' "$(IMAGE_LINK_INPUTS)" > "$(IMAGE_LINK_MANIFEST)"; }
 
-$(BUILD_DIR)/%.c.o: %.c
+FORCE:
+
+$(CORE_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(CORE_INPUTS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(DIAG_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(DIAG_INPUTS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(SCENARIO_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(SCENARIO_INPUTS)|selected=$(SCENARIO_KEY)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(TEST_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(TEST_INPUTS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(CORE_DIR)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(CORE_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(CORE_DIR)/%.S.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+# Diagnostic providers are the only objects that receive level policy.  Core
+# callers compile against the stable ABI with no provider-selection macro.
+$(DIAG_DIR)/%.cpp.o: CXXFLAGS += \
+            -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
+            -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
+            -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+$(DIAG_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(SCENARIO_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+ifeq ($(SCENARIO_KEY),off)
+SCENARIO_SELECTOR_SRC := kernel/diag/scenario_off.cpp
+$(SCENARIO_SELECTOR_OBJ): $(SCENARIO_SELECTOR_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+else
+SCENARIO_SELECTOR_SRC := kernel/diag/scenario_real.cpp
+$(SCENARIO_SELECTOR_OBJ): $(SCENARIO_SELECTOR_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DMYOS_SCENARIO_ID=$(SCENARIO_ID) -MMD -MP -c $< -o $@
+endif
 
 $(BUILD_DIR)/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-# Built-in tests do not participate in panic backtraces and keep the original
-# frame budget; runtime kernel code retains auditable frame chains.
-$(BUILD_DIR)/test/%.cpp.o: CXXFLAGS += \
+# Built-in tests are a link-selected module and do not alter core frames.
+$(TEST_DIR)/%.cpp.o: CXXFLAGS += \
             -fomit-frame-pointer -foptimize-sibling-calls
-
-$(BUILD_DIR)/%.S.o: %.S
+$(TEST_DIR)/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CC) $(ASFLAGS) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(TEST_PROVIDER_OBJ): $(TEST_PROVIDER_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fomit-frame-pointer -foptimize-sibling-calls \
+		-MMD -MP -c $< -o $@
+
+$(REPORT_GATE_OBJ): $(REPORT_GATE_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fomit-frame-pointer -foptimize-sibling-calls \
+		-MMD -MP -c $< -o $@
 
 $(INIT_USER_TARGET): $(USER_RUNTIME_OBJS) $(INIT_USER_OBJS) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -456,14 +641,23 @@ audit-symbols: $(TARGET)
 		echo "[audit] OK: no forbidden defined RTTI symbols"; \
 	fi
 	@if [ "$(CONCURRENCY_DIAG_LEVEL)" -eq 0 ]; then \
-		echo "[audit] checking disabled concurrency recorder symbols..."; \
-		if $(NM) -C --defined-only -n $(TARGET) \
-			| rg -n "kernel::diag::concurrency::(FlightRecorder::|dump_flight\\()"; then \
-			echo "[audit] FAIL: disabled recorder implementation remains linked"; \
+		echo "[audit] checking bounded off concurrency provider..."; \
+		if ! $(NM) -C --defined-only -n $(TARGET) \
+			| rg -q "kernel::diag::concurrency::FlightRecorder::(initialize|push|read)"; then \
+			echo "[audit] FAIL: off recorder ABI stubs are not linked"; \
 			exit 1; \
-		else \
-			echo "[audit] OK: disabled recorder has no linked implementation"; \
 		fi; \
+		if $(NM) -u -C $(TARGET) \
+			| rg -q "kernel::diag::concurrency::FlightRecorder::"; then \
+			echo "[audit] FAIL: off recorder ABI remains unresolved"; \
+			exit 1; \
+		fi; \
+		if $(NM) -C --defined-only $(TARGET) \
+			| rg -q "kernel::test::scenario::detail::"; then \
+			echo "[audit] FAIL: scenario driver/state linked into off image"; \
+			exit 1; \
+		fi; \
+		echo "[audit] OK: off recorder resolves to bounded ABI stubs"; \
 	fi
 	@echo "[audit] checking vtable whitelist..."
 	@set -e; \
@@ -708,142 +902,55 @@ _run-panic-degraded-smp: $(TARGET) audit-boot-stack
 	rm -f "$$output"; \
 	echo "[panic-degraded] OK: transport failure produced a bounded partial dump"
 
-run-lock-probe:
-	$(MAKE) PROFILE=kernel LOCK_DIAG=trace _run-lock-probe
+run-scenario:
+	$(MAKE) PROFILE=test SCENARIO=$(SCENARIO_KEY) \
+		CONCURRENCY_DIAG=$(if $(filter publication report,$(SCENARIO_KEY)),watch,trace) \
+		_run-scenario
 
-_run-lock-probe: $(TARGET) audit-boot-stack
-	@case "$(LOCK_PROBE)" in \
-		1) event=90000001;; 2) event=90000004;; 3) event=90000003;; \
-		4) event=90000005;; 5) event=90000006;; 6) event=90000002;; \
-		7) event=90000007;; 8) event=90000008;; 9) event=90000009;; \
-		*) echo "[lock-probe] LOCK_PROBE must be 1..9"; exit 1;; \
-	esac; \
-	set +e; \
-	output=$$(mktemp); \
-	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
-	status=$$?; \
-	cat "$$output"; \
-	if [ $$status -ne 0 ] \
-		|| ! rg -q "MYOS KERNEL PANIC" "$$output" \
-		|| ! rg -qi "event: 0x$$event" "$$output" \
-		|| ! rg -q "cpu [0-9]+ sync:" "$$output"; then \
-		echo "[lock-probe] FAIL: probe $(LOCK_PROBE) lacks its stable event/evidence"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	rm -f "$$output"; \
-	echo "[lock-probe] OK: probe $(LOCK_PROBE) produced event 0x$$event"
-
-run-concurrency-probe:
-	$(MAKE) PROFILE=kernel CONCURRENCY_DIAG=$(if $(filter 3 4 6 7 8 9 10 11 12 13 14 15,$(CONCURRENCY_PROBE)),watch,trace) _run-concurrency-probe
-
-_run-concurrency-probe: $(TARGET) $(if $(filter 3 4 9 10 11 13,$(CONCURRENCY_PROBE)),$(BOOT_BUNDLE))
-	@case "$(CONCURRENCY_PROBE)" in \
-		1) evidence="concurrency-probe: stage-a ok cpus=$(QEMU_SMP)";; \
-		2) evidence="concurrency-probe: stage-a storage-ok cpus=$(QEMU_SMP)";; \
-		3) evidence="concurrency-probe: stage-b external-ok";; \
-		4) evidence="concurrency-probe: stage-b claimed-ok";; \
-		5) evidence="concurrency-probe: stage-c analyzer-ok";; \
-		6) evidence="concurrency-probe: stage-c watchdog-ok";; \
-		7) evidence="concurrency-probe: stage-d delivery-ok";; \
-		8) evidence="concurrency-probe: stage-e analyzer-ok";; \
-		9) evidence="concurrency-probe: stage-g ready-ok";; \
-		10) evidence="concurrency-probe: stage-g throttled-ok";; \
-		11) evidence="concurrency-probe: stage-g deadline-ok";; \
-		12) evidence="concurrency-probe: stage-g cpu-live-ok";; \
-		13) evidence="concurrency-probe: stage-b ownership-ok";; \
-		14) evidence="concurrency-probe: stage-c evidence-ok";; \
-		15) evidence="concurrency-probe: stage-d report-ok";; \
-		*) echo "[concurrency-probe] CONCURRENCY_PROBE must be 1..15"; exit 1;; \
-	esac; \
-	initrd=""; \
-	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 4 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 9 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 10 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 11 ] \
-		|| [ "$(CONCURRENCY_PROBE)" = 13 ]; then \
-		initrd="-initrd $(BOOT_BUNDLE)"; \
-	fi; \
-	set +e; \
-	output=$$(mktemp); \
-	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) $$initrd > "$$output" 2>&1; \
-	status=$$?; \
-	cat "$$output"; \
-	if [ $$status -ne 124 ] \
-		|| ! rg -q "$$evidence" "$$output" \
-		|| rg -q "concurrency-probe: stage-a fail" "$$output"; then \
-		echo "[concurrency-probe] FAIL: scenario evidence missing"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 3 ] \
-		&& rg -q "\\[concurrency\\] watchdog confirmed" "$$output"; then \
-		echo "[concurrency-probe] FAIL: external Attached was reported"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 4 ] \
-		&& ! rg -q "\\[concurrency\\] watchdog confirmed" "$$output"; then \
-		echo "[concurrency-probe] FAIL: Claimed publication was not reported"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 8 ] \
-		&& ! rg -q "concurrency-probe: stage-e interval-ok" "$$output"; then \
-		echo "[concurrency-probe] FAIL: service interval evidence missing"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 9 ] \
-		&& ! rg -q "class=runnable-starvation" "$$output"; then \
-		echo "[concurrency-probe] FAIL: real Ready starvation was not reported"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 10 ] \
-		&& ! rg -q "class=timer-stall" "$$output"; then \
-		echo "[concurrency-probe] FAIL: real Throttled refill stall was not reported"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 11 ] \
-		&& ! rg -q "class=deadline-delivery-stall" "$$output"; then \
-		echo "[concurrency-probe] FAIL: overdue timeout publication was not reported"; \
-		rm -f "$$output"; \
-		exit 1; \
-	fi; \
-	if [ "$(CONCURRENCY_PROBE)" = 12 ]; then \
-		live_reports=$$(rg -c "class=open-owner-stall" "$$output" || true); \
-		if ! rg -q "stage-g trap-stall-armed" "$$output" \
-			|| [ "$$live_reports" -lt 2 ]; then \
-			echo "[concurrency-probe] FAIL: peer IRQ/trap stalls lacked two reports"; \
-			rm -f "$$output"; \
-			exit 1; \
-		fi; \
-	fi; \
-	rm -f "$$output"; \
-	echo "[concurrency-probe] OK: scenario $(CONCURRENCY_PROBE) passed on $(QEMU_SMP) harts"
-
-run-stage-f-probe:
-	$(MAKE) PROFILE=kernel LOCK_DIAG=profile CONCURRENCY_DIAG=profile \
-		LOCK_PROBE=10 STAGE_F_PROBE=1 _run-stage-f-probe
-
-_run-stage-f-probe: $(TARGET) audit-boot-stack
+_run-scenario: $(TARGET) $(if $(filter initrd,$(SCENARIO_KEY)),$(BOOT_BUNDLE))
 	@set +e; \
 	output=$$(mktemp); \
-	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) -nographic -bios default -kernel $(TARGET) > "$$output" 2>&1; \
+	initrd=""; \
+	if [ "$(SCENARIO_KEY)" = initrd ]; then initrd="-initrd $(BOOT_BUNDLE)"; fi; \
+	timeout --foreground $(QEMU_TIMEOUT) $(QEMU) -machine virt -smp $(QEMU_SMP) \
+		-nographic -bios default -kernel $(TARGET) $$initrd > "$$output" 2>&1; \
 	status=$$?; \
 	cat "$$output"; \
-	if [ $$status -ne 124 ] \
-		|| ! rg -q "lock-probe: stage-f writer-ok" "$$output" \
-		|| ! rg -q "concurrency-probe: stage-f flight-ok capacity=128" "$$output"; then \
-		echo "[stage-f-probe] FAIL: profile/profile writer or flight evidence missing"; \
+	if [ $$status -ne 124 ]; then \
+		echo "[scenario] FAIL: QEMU status $$status"; \
+		rm -f "$$output"; \
+		exit 1; \
+	fi; \
+	case "$(SCENARIO_KEY)" in \
+		off) ;; \
+		ordinary) marker="\\[scenario\\] ordinary ok";; \
+		initrd) marker="\\[scenario\\] initrd ok";; \
+		trap) marker="\\[scenario\\] trap ok";; \
+		remote) marker="\\[scenario\\] remote-delivery ok";; \
+		publication) marker="\\[scenario\\] publication ok";; \
+		report) marker="\\[scenario\\] report-retry wake-credit ok";; \
+		dispatch) marker="\\[scenario\\] dispatch-flight ok";; \
+		esac; \
+	if [ -n "$$marker" ] && ! rg -q "$$marker" "$$output"; then \
+		echo "[scenario] FAIL: marker missing for $(SCENARIO_KEY)"; \
 		rm -f "$$output"; \
 		exit 1; \
 	fi; \
 	rm -f "$$output"; \
-	echo "[stage-f-probe] OK: profile/profile storage, writer and flight paths passed"
+	echo "[scenario] OK: $(SCENARIO_KEY) on $(QEMU_SMP) harts"
+
+# Legacy wrapper: numeric selectors are translated by the Make-level mapping
+# and no longer select a kernel production image or old stage marker.
+run-concurrency-probe:
+	$(MAKE) CONCURRENCY_PROBE=0 STAGE_F_PROBE=0 \
+		SCENARIO=$(SCENARIO_KEY) run-scenario
+
+# Compatibility wrapper for the former Stage-F command.  The retained
+# mechanism is the semantic dispatch/flight scenario; the old stage name is
+# intentionally confined to this Make target.
+run-stage-f-probe:
+	$(MAKE) CONCURRENCY_PROBE=0 STAGE_F_PROBE=0 \
+		SCENARIO=dispatch run-scenario
 
 debug: $(TARGET) audit-boot-stack
 	@echo "debug: waiting for GDB on $(GDB_HOST):$(GDB_PORT)"
@@ -854,4 +961,4 @@ clean:
 
 -include $(DEPS) $(USER_DEPS)
 
-.PHONY: all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-lock-probe _run-lock-probe run-concurrency-probe _run-concurrency-probe run-stage-f-probe _run-stage-f-probe debug clean
+.PHONY: FORCE all bundle kernel test proof panic disasm symbols audit-symbols audit-boot-stack audit-clang audit-user run run-timeout run-test-smp _run-test-smp run-proof-smp run-smp-timeout _run-proof-smp run-e1-smp _run-e1-smp run-panic-smp _run-panic-smp run-panic-degraded-smp _run-panic-degraded-smp run-scenario _run-scenario run-concurrency-probe _run-concurrency-probe run-stage-f-probe debug clean

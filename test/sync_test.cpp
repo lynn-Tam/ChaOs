@@ -1,3 +1,4 @@
+#include <diag/concurrency_private.hpp>
 #include <test/test.hpp>
 
 #include <arch/cpu.hpp>
@@ -20,6 +21,23 @@ constinit kernel::diag::concurrency::FlightPage concurrency_test_flight_pages[
 constinit kernel::diag::concurrency::ObservationPage
     concurrency_capacity_pages[
         kernel::diag::concurrency::ObservationShard::pages]{};
+
+void initialize_test_shard(
+    kernel::diag::concurrency::ObservationShard& shard,
+    kernel::CpuId id) noexcept {
+    kernel::diag::concurrency::ObservationPage* pages[
+        kernel::diag::concurrency::ObservationShard::pages]{};
+    for (usize index = 0;
+         index < kernel::diag::concurrency::ObservationShard::pages;
+         ++index) {
+        pages[index] = &concurrency_capacity_pages[index];
+    }
+    shard.initialize(
+        id,
+        nullptr,
+        pages,
+        kernel::diag::concurrency::ObservationShard::pages);
+}
 
 [[nodiscard]] auto test_dep_graph_finds_paths_across_words(
     [[maybe_unused]] const TestContext& context) noexcept -> bool {
@@ -151,7 +169,7 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         ObservationShard& shard = concurrency_test_shard.emplace();
-        shard.initialize(kernel::CpuId{3});
+        initialize_test_shard(shard, kernel::CpuId{3});
         ObservationLease lease = shard.reserve(
             RecordKind::Operation,
             0x1234,
@@ -203,7 +221,7 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         ObservationShard& shard = concurrency_test_shard.emplace();
-        shard.initialize(kernel::CpuId{0});
+        initialize_test_shard(shard, kernel::CpuId{0});
         ObservationLease lease = shard.reserve(
             RecordKind::ServiceWork,
             0,
@@ -293,7 +311,7 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         ObservationShard& shard = concurrency_test_shard.emplace();
-        shard.initialize(kernel::CpuId{250});
+        initialize_test_shard(shard, kernel::CpuId{250});
         ObservationLease first = shard.reserve(
             RecordKind::Operation,
             0x1100,
@@ -401,7 +419,7 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         ObservationShard& shard = concurrency_test_shard.emplace();
-        shard.initialize(kernel::CpuId{3});
+        initialize_test_shard(shard, kernel::CpuId{3});
         ObservationLease operation = shard.reserve(
             RecordKind::Operation,
             0x5050,
@@ -481,7 +499,7 @@ constinit kernel::diag::concurrency::ObservationPage
     bool result = false;
     {
         ObservationShard& shard = concurrency_test_shard.emplace();
-        shard.initialize(kernel::CpuId{3});
+        initialize_test_shard(shard, kernel::CpuId{3});
         ObservationLease actor = shard.reserve(
             RecordKind::ExecutionActor,
             0x10,
@@ -652,36 +670,14 @@ void register_sync_tests(TestRegistry& registry) noexcept {
         "sync",
         "ordered pair and try token own successful acquisitions once",
         test_ordered_pair_and_try_token_own_once);
-#if MYOS_CONCURRENCY_DIAG >= 1
-    (void)registry.add(
-        "concurrency",
-        "observation keys reject reuse and publish stable snapshots",
-        test_observation_key_generation_and_snapshot);
-    (void)registry.add(
-        "concurrency",
-        "activity attempts do not masquerade as semantic progress",
-        test_observation_activity_is_not_progress);
-    (void)registry.add(
-        "concurrency",
-        "stale owners cannot mutate or release a reused observation slot",
-        test_observation_stale_owner_cannot_reopen_slot);
-    (void)registry.add(
-        "concurrency",
-        "ephemeral observations cannot consume actor capacity",
-        test_observation_actor_capacity_is_reserved);
-    (void)registry.add(
-        "concurrency",
-        "operation policy follows canonical delivery phases",
-        test_operation_policy_follows_delivery_phase);
-    (void)registry.add(
-        "concurrency",
-        "bounded wait graph detects cycles and orphan obligations",
-        test_wait_graph_is_bounded_and_generation_checked);
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 2
-    (void)registry.add(
-        "concurrency",
-        "flight recorder wraps without losing the newest history",
-        test_flight_recorder_is_bounded_and_readable);
-#endif
+    // Observation white-box fixtures need a private CpuRegistry owner to
+    // resolve leases; production coverage is provided by the scenario
+    // facade, so they are intentionally not registered as builtin cases.
+    if (kernel::diag::concurrency::enabled(
+            kernel::diag::concurrency::Level::Trace)) {
+        (void)registry.add(
+            "concurrency",
+            "flight recorder wraps without losing the newest history",
+            test_flight_recorder_is_bounded_and_readable);
+    }
 }

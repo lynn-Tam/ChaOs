@@ -254,21 +254,6 @@ public:
     [[nodiscard]] auto pending() const noexcept -> bool;
 
     void retire(object::ObjectCleanup&& cleanup) noexcept;
-#if MYOS_CONCURRENCY_PROBE == 13
-    //Confirmatory experiment.
-    // Exit condition: remove with the Stage B VSpace ownership rendezvous.
-    [[nodiscard]] auto enter_cpu_for_probe(kernel::CpuId cpu) noexcept -> bool {
-        static_cast<void>(coherence_.enter(cpu));
-        return true;
-    }
-    void leave_cpu_for_probe(kernel::CpuId cpu) noexcept { coherence_.leave(cpu); }
-    void schedule_for_probe() noexcept { schedule_work(); }
-    [[nodiscard]] auto observation_key_for_probe() const noexcept
-        -> diag::concurrency::ObservationKey {
-        return diag::concurrency::ObservationKey{
-            observation_key_.load<libk::MemoryOrder::Acquire>()};
-    }
-#endif
 
 private:
     friend class VSpaceExecutor;

@@ -7,9 +7,6 @@
 #include <libk/utility.hpp>
 #include <object/resource_pool.hpp>
 #include <sync/irq_lock_guard.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 
 namespace kernel::resource {
 namespace {
@@ -703,14 +700,6 @@ void ResourcePool::service() noexcept {
         kernel::sync::IrqLockGuard guard{lock_};
         if (servicing_) {
             service_pending_ = true;
-#if MYOS_CONCURRENCY_PROBE == 13
-            //Confirmatory experiment.
-            // Exit condition: remove when an external pool-service harness
-            // can force the reentrant service_pending_ path.
-            init::stage_b::mark(
-                init::stage_b::Gate::PoolReentrant,
-                reinterpret_cast<u64>(this));
-#endif
             const auto key = diag::concurrency::ObservationKey{
                 close_observation_key_.load<libk::MemoryOrder::Acquire>()};
             auto observation =
@@ -721,14 +710,6 @@ void ResourcePool::service() noexcept {
         servicing_ = true;
     }
 
-#if MYOS_CONCURRENCY_PROBE == 13
-    //Confirmatory experiment.
-    // Exit condition: remove when the external harness can pause the first
-    // service invocation before a reentrant caller enters.
-    static_cast<void>(init::stage_b::pause(
-        init::stage_b::Gate::PoolFirstService,
-        reinterpret_cast<u64>(this)));
-#endif
 
     for (;;) {
         Allocation* revoke{};
@@ -978,10 +959,6 @@ void ResourcePool::publish_observation() noexcept {
     update.detail[2] = roots;
     update.detail[3] = sponsorships;
     observation.publish(update);
-#if MYOS_CONCURRENCY_PROBE == 14
-    diag::concurrency::probe14_resource_batch_after(
-        reinterpret_cast<u64>(this));
-#endif
     if (state == PoolState::Closed) {
         const auto terminal = diag::concurrency::ObservationKey{
             close_observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};

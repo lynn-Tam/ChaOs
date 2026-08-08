@@ -26,11 +26,9 @@ CpuDispatcher::CpuDispatcher(
     CpuId id,
     Thread& idle,
     time::Clock& clock) noexcept
-    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock), remote_(id)
-#if MYOS_CONCURRENCY_DIAG >= 3
-      , watchdog_deadline_(
-            Deadline::Callback::bind<&CpuDispatcher::watchdog_fire>(*this))
-#endif
+    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock), remote_(id),
+      watchdog_deadline_(
+          Deadline::Callback::bind<&CpuDispatcher::watchdog_fire>(*this))
 {
     KASSERT(cpu_->dispatcher_ == nullptr);
     KASSERT(idle_->idle());
@@ -40,22 +38,18 @@ CpuDispatcher::CpuDispatcher(
     quantum_ = *quantum;
     timer_available_ = arch::timer_available();
     ipi_available_ = arch::ipi_available();
-#if MYOS_CONCURRENCY_DIAG >= 3
     const auto watchdog_period =
         clock_->duration_from_nanoseconds(10'000'000);
     watchdog_period_ = watchdog_period
         ? *watchdog_period : time::Duration{};
-#endif
     cpu_->dispatcher_ = this;
 }
 
 CpuDispatcher::~CpuDispatcher() noexcept {
-#if MYOS_CONCURRENCY_DIAG >= 3
     if (watchdog_deadline_.armed()) {
         deadlines_.remove(watchdog_deadline_);
         watchdog_deadline_.owner_ = nullptr;
     }
-#endif
     if (cpu_ != nullptr && cpu_->dispatcher_ == this) {
         cpu_->dispatcher_ = nullptr;
     }
@@ -233,6 +227,10 @@ auto CpuDispatcher::accept_wake(
         return WakeAcceptance::Accepted;
     }
     return WakeAcceptance::Rejected;
+}
+
+auto Binding::wake_credit() const noexcept -> bool {
+    return wake_credit_;
 }
 
 auto CpuDispatcher::post_wake(
@@ -668,15 +666,6 @@ void CpuDispatcher::block_current() noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(current_ && !current_.idle());
     KASSERT(current_binding_ != nullptr);
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-    //Confirmatory experiment.
-    // Exit condition: remove after an external scheduler harness can force
-    // the same wake-before-block sequence on a real continuation.
-    diag::concurrency::probe15_wake_credit_block(
-        id_,
-        reinterpret_cast<u64>(current_binding_),
-        current_binding_->wake_credit_);
-#endif
     if (current_binding_->wake_credit_) {
         current_binding_->wake_credit_ = false;
         current_binding_->publish_projection();
@@ -709,12 +698,6 @@ void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
 void CpuDispatcher::on_timer() noexcept {
     KASSERT(!arch::interrupts_enabled());
     const time::Instant now = clock_->now();
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-    //Confirmatory experiment.
-    // Exit condition: remove after the bounded Probe 15 timer snapshot has
-    // separated timer-trap entry from watchdog callback delivery.
-    diag::concurrency::probe15_timer_enter(id_, now.ticks());
-#endif
     diag::concurrency::timer(id_, now.ticks());
     charge_to(now);
     arch::mask_timer();
@@ -802,19 +785,6 @@ void CpuDispatcher::dispatch(
             break;
         case DispatchReason::Block:
             outgoing.execution().set_state(ExecutionState::Blocked);
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-            if (diag::concurrency::probe15_wake_credit_prepare_blocked(
-                    id_, reinterpret_cast<u64>(outgoing_binding))) {
-                outgoing_binding->context().exhaust_for_probe(now);
-                const auto acceptance = accept_wake(*outgoing_binding);
-                diag::concurrency::probe15_wake_credit_blocked(
-                    id_,
-                    reinterpret_cast<u64>(outgoing_binding),
-                    acceptance != WakeAcceptance::Rejected,
-                    outgoing.execution().state() == ExecutionState::Throttled,
-                    outgoing_binding->wake_credit_);
-            }
-#endif
             break;
         case DispatchReason::Park:
             KASSERT(false);
@@ -900,7 +870,7 @@ void CpuDispatcher::commit(
 
     KASSERT(!handoff_outgoing_);
     handoff_outgoing_ = outgoing;
-    if constexpr (kernel::sync::lock_verify) {
+    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
         kernel::sync::assert_no_locks();
     }
     arch::switch_context(
@@ -909,26 +879,12 @@ void CpuDispatcher::commit(
 }
 
 void CpuDispatcher::program_deadline(time::Instant now) noexcept {
-#if MYOS_CONCURRENCY_DIAG >= 3
-    arm_watchdog(now);
-#endif
+    if (diag::concurrency::enabled(diag::concurrency::Level::Watch)) {
+        arm_watchdog(now);
+    }
     if (!timer_available_) {
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-        //Confirmatory experiment.
-        // Exit condition: remove after one stop-world snapshot attributes the
-        // timeout to timer availability or programming.
-        diag::concurrency::probe15_program(
-            id_,
-            now.ticks(),
-            time::Instant::max().ticks(),
-            programmed_deadline_.ticks(),
-            timer_available_,
-            false,
-            watchdog_deadline_.armed(),
-            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
-#endif
         return;
     }
 
@@ -959,44 +915,15 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
         timer_available_ = false;
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-        //Confirmatory experiment.
-        // Exit condition: remove after one stop-world snapshot attributes the
-        // timeout to timer availability or programming.
-        diag::concurrency::probe15_program(
-            id_,
-            now.ticks(),
-            deadline.ticks(),
-            programmed_deadline_.ticks(),
-            timer_available_,
-            false,
-            watchdog_deadline_.armed(),
-            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
-#endif
     } else {
         programmed_deadline_ = deadline;
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-        //Confirmatory experiment.
-        // Exit condition: remove after one stop-world snapshot attributes the
-        // timeout to timer availability or programming.
-        diag::concurrency::probe15_program(
-            id_,
-            now.ticks(),
-            deadline.ticks(),
-            programmed_deadline_.ticks(),
-            timer_available_,
-            true,
-            watchdog_deadline_.armed(),
-            watchdog_deadline_.armed() ? watchdog_deadline_.when_.ticks() : 0);
-#endif
     }
 }
 
-#if MYOS_CONCURRENCY_DIAG >= 3
 void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
     if (!timer_available_) {
         diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
         return;
     }
     if (watchdog_deadline_.armed()) {
@@ -1004,13 +931,13 @@ void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
     }
     if (watchdog_period_.empty()) {
         diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
         return;
     }
     const auto when = now.checked_add(watchdog_period_);
     if (!when) {
         diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticStatus::WatchdogUnavailable);
+            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
         return;
     }
     deadlines_.insert(watchdog_deadline_, *when);
@@ -1019,19 +946,9 @@ void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
 
 void CpuDispatcher::watchdog_fire() noexcept {
     const time::Instant now = clock_->now();
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-    //Confirmatory experiment.
-    // Exit condition: remove with the Stage D external timer harness once it
-    // can independently identify the production watchdog deadline callback.
-    diag::concurrency::probe15_timer_fire(id_, now.ticks());
-#endif
     diag::concurrency::watchdog_tick(id_, now.ticks());
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-    diag::concurrency::probe15_after_timer(id_);
-#endif
     arm_watchdog(now);
 }
-#endif
 
 void CpuDispatcher::record_dispatch(
     execution::Target outgoing,
@@ -1077,35 +994,17 @@ void CpuDispatcher::record_dispatch(
         context,
         pending_charge_.ticks(),
         programmed_deadline_.ticks());
-#if MYOS_STAGE_F_PROBE
-    //Confirmatory experiment.
-    // Exit condition: remove when the external recorder harness correlates
-    // one real switch commit with its absolute flight record.
-    diag::concurrency::confirm_dispatch(
-        id_,
-        event,
-        outgoing.identity(),
-        incoming.identity(),
-        context,
-        pending_charge_.ticks(),
-        programmed_deadline_.ticks());
-#endif
     pending_charge_ = {};
 }
 
 void CpuDispatcher::dump_trace() const noexcept {
-#if MYOS_CONCURRENCY_DIAG >= 2
-    if (cpu_ == nullptr || cpu_->runtime_ == nullptr
-        || cpu_->runtime_->diagnostics == nullptr) {
+    if (!diag::concurrency::enabled(diag::concurrency::Level::Trace)) {
         return;
     }
-    const auto* const flight = cpu_->runtime_->diagnostics->concurrency.flight;
-    if (flight != nullptr) {
-        diag::concurrency::dump_flight(id_, *flight);
+    if (cpu_ == nullptr || cpu_->runtime_ == nullptr) {
+        return;
     }
-#else
-    static_cast<void>(this);
-#endif
+    diag::concurrency::dump_flight(id_, *cpu_->runtime_);
 }
 
 void CpuDispatcher::post_switch() noexcept {

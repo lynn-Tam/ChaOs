@@ -5,9 +5,6 @@
 #include <cpu/cpu_registry.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 
 namespace kernel::mm {
 
@@ -375,14 +372,6 @@ void VSpace::publish_observation(VSpaceServiceState result) noexcept {
     update.detail[3] = claim || invalidations || authorities;
     observation.publish(update);
     if (state == VSpaceState::Quiescent) {
-#if MYOS_CONCURRENCY_PROBE == 13
-        //Confirmatory experiment.
-        // Exit condition: remove when a VSpace service harness can pause the
-        // Quiescent publication before diagnostic terminal exchange.
-        static_cast<void>(init::stage_b::pause(
-            init::stage_b::Gate::VSpaceQuiescent,
-            reinterpret_cast<u64>(this)));
-#endif
         const auto terminal = diag::concurrency::ObservationKey{
             observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
         if (terminal) {

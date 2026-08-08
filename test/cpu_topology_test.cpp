@@ -1,3 +1,4 @@
+#include <diag/owner.hpp>
 #include <test/test.hpp>
 
 #include <arch/ipi.hpp>

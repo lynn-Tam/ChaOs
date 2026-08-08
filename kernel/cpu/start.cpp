@@ -3,7 +3,6 @@
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
-#include <arch/ipi.hpp>
 #include <arch/trap.hpp>
 #include <diag/console.hpp>
 #include <irq/irq.hpp>
@@ -12,14 +11,12 @@
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <init/run.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 #include <libk/utility.hpp>
 #include <mm/direct_map.hpp>
 #include <arch/cpu.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync/trace.hpp>
+#include <test/boot.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel {
@@ -138,82 +135,17 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
         == runtime.idle().home_stack_top());
     KASSERT(runtime.owner_registry->publish_online(runtime));
 
-#if MYOS_LOCK_PROBE
-    //Confirmatory experiment.
-    // Exit condition: each fatal remains reproducible through run-lock-probe;
-    // the whole call is absent from normal builds.
-    sync::run_probe(MYOS_LOCK_PROBE);
-#endif
-#if MYOS_CONCURRENCY_PROBE
-    //Confirmatory experiment.
-    // Exit condition: remove the in-kernel rendezvous when an external
-    // scheduler/fault harness can force the same slot interleavings.
-#if MYOS_CONCURRENCY_PROBE == 13
-    if (runtime.local.descriptor->logical_id()
-        != runtime.owner_registry->boot_id()) {
-        init::stage_b::worker();
-    }
-#else
-    diag::concurrency::run_probe(MYOS_CONCURRENCY_PROBE);
-#endif
-#endif
-
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
-    || MYOS_CONCURRENCY_PROBE == 13
-        //Confirmatory experiment.
-        // Exit condition: remove with the Stage B/Stage G operation and
-        // scheduler fault probes.
-        KASSERT(init::run_concurrency_probe(
-            *runtime.owner_registry, MYOS_CONCURRENCY_PROBE));
-#endif
         print_snapshot(*runtime.owner_registry);
-        if constexpr (sync::lock_trace) {
-            sync::dump_diagnostics();
-        }
+        sync::dump_diagnostics();
+        kernel::test::runtime(runtime);
         diag::console::print<"runtime: entered\n">();
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
-    || MYOS_CONCURRENCY_PROBE == 13
-        //Confirmatory experiment.
-        // Exit condition: remove with the Stage B/Stage G operation and
-        // scheduler fault probes.
-        // Their synthetic Wait edge is intentionally non-resumable, so keep
-        // the root task out of normal execution for the observation window.
-        static_cast<void>(arch::disable_interrupts());
-        for (;;) {
-            arch::wait_for_interrupt();
-        }
-#endif
-#if MYOS_PANIC_PROBE
-        //Confirmatory experiment.
-        // Exit condition: remove once panic-owner/peer-stop behavior is
-        // exercised by an external QEMU diagnostics harness.
-#if MYOS_PANIC_PROBE == 2
-        arch::inject_ipi_failures_for_test(max_cpu_count);
-#endif
-        KASSERT(false);
-#endif
+        diag::panic_probe(KERNEL_SOURCE_LOCATION("false"));
     }
     sched::yield();
     for (;;) {
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-        //Confirmatory experiment.
-        // Exit condition: remove after the stop-world snapshot proves whether
-        // the ready-phase timeout reaches the normal WFI boundary.
-        diag::concurrency::probe15_idle_enter(
-            runtime.local.descriptor->logical_id());
-#endif
         arch::wait_for_interrupt();
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-        //Confirmatory experiment.
-        // Exit condition: remove once Probe 15's ready-phase timeout is
-        // attributed to timer delivery or root-candidate progression.
-        diag::concurrency::probe15_idle_observe(
-            runtime.local.descriptor->logical_id());
-#endif
     }
 }
 
@@ -223,11 +155,6 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     KASSERT(runtime.local.descriptor->logical_id()
         == kernel.cpus().boot_id());
     install_local_entry(runtime, runtime.local.descriptor->hardware_id());
-#if MYOS_CONCURRENCY_PROBE == 8
-    //Confirmatory experiment.
-    // Exit condition: remove with KernelState::run_reclaimer_probe().
-    kernel.run_reclaimer_probe();
-#endif
     kernel::irq::initialize_platform();
     diag::console::print<"trap install ok\n">();
 
@@ -242,41 +169,6 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     KASSERT(kernel.pmm().verify_invariants());
     KASSERT(arch_boot_stack_guard_intact());
 
-#if MYOS_CONCURRENCY_PROBE == 2
-    //Confirmatory experiment.
-    // Exit condition: remove when the normal CPU-offline path is available to
-    // the external concurrency scenario harness.
-    bool storage_ok{};
-    for (usize index = 0; index < kernel.cpus().count(); ++index) {
-        const CpuId id{index};
-        if (id == kernel.cpus().boot_id()) {
-            continue;
-        }
-        auto lease = diag::concurrency::ObservationLease::reserve_on(
-            id,
-            diag::concurrency::RecordKind::ExecutionActor,
-            0x5a5a,
-            1,
-            diag::concurrency::Expectation::SchedulerControlled);
-        if (!lease) {
-            break;
-        }
-        const auto key = lease.detach_key();
-        if (!kernel.cpus().drop_runtime_for_probe(id)) {
-            break;
-        }
-        auto surviving =
-            diag::concurrency::ObservationLease::borrow(key);
-        diag::concurrency::ObservationSnapshot snapshot{};
-        storage_ok = surviving.snapshot(snapshot)
-            && snapshot.subject_identity == 0x5a5a;
-        surviving.finish(1);
-        break;
-    }
-    diag::console::print<
-        "concurrency-probe: stage-a storage-{} cpus={}\n">(
-        storage_ok ? "ok" : "fail", kernel.cpus().count());
-#endif
 
     start_secondaries(kernel.cpus(), kernel.direct_map());
     runtime.dispatcher().enter_idle();

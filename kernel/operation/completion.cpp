@@ -7,9 +7,6 @@
 #include <sched/dispatcher.hpp>
 #include <execution/vproc.hpp>
 #include <operation/wait.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 
 namespace kernel::operation {
 namespace {
@@ -151,14 +148,6 @@ void Completion::signal() noexcept {
         // published.  No sink, binding or owner-derived value is read after
         // this store: Wait::finish/cancel may release them concurrently.
         delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
-#if MYOS_CONCURRENCY_PROBE == 13
-        //Confirmatory experiment.
-        // Exit condition: remove when an external scheduler/fault harness can
-        // pause the producer after canonical Ready publication.
-        static_cast<void>(init::stage_b::pause(
-            init::stage_b::Gate::CompletionReady,
-            reinterpret_cast<u64>(this)));
-#endif
         observation.publish(
             diag::concurrency::OperationPhase::ReadyPublished,
             driver,
@@ -195,24 +184,6 @@ void Completion::signal() noexcept {
         terminal.raw);
 }
 
-#if MYOS_CONCURRENCY_PROBE
-auto Completion::claim_for_probe() noexcept -> bool {
-    //Confirmatory experiment.
-    // Exit condition: remove when the external fault harness can pause
-    // signal() immediately after the canonical Claimed transition.
-    Delivery expected = Delivery::Attached;
-    if (!delivery_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
-        return false;
-    }
-    const auto cpu = current_cpu_node();
-    const auto key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(key);
-    observation.publish(diag::concurrency::OperationPhase::Claimed, cpu);
-    return true;
-}
-#endif
 
 void Completion::finish(arch::TrapContext& trap) noexcept {
     KASSERT(complete());

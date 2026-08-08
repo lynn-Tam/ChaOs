@@ -1,3 +1,4 @@
+#include <diag/owner.hpp>
 #include <sync/trace.hpp>
 
 #include <arch/cpu.hpp>
@@ -10,14 +11,35 @@
 #include <diag/panic.hpp>
 #include <diag/console.hpp>
 #include <libk/limits.hpp>
+#include <mm/pmm.hpp>
 #include <sync/model.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <trap/event.hpp>
 
 namespace kernel::sync {
 
+#ifndef MYOS_LOCK_DIAG
+#define MYOS_LOCK_DIAG 0
+#endif
+#ifndef MYOS_CONCURRENCY_DIAG
+#define MYOS_CONCURRENCY_DIAG 0
+#endif
+
+#if MYOS_LOCK_DIAG == 0 && MYOS_CONCURRENCY_DIAG == 0
+auto provision(CpuRuntime& runtime, mm::Pmm& pmm) noexcept -> bool {
+    static_cast<void>(runtime);
+    static_cast<void>(pmm);
+    return true;
+}
+#endif
+
 #if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
 namespace {
+
+constexpr bool lock_verify = MYOS_LOCK_DIAG >= 1;
+constexpr bool lock_trace = MYOS_LOCK_DIAG >= 2
+    || MYOS_CONCURRENCY_DIAG >= 1;
+constexpr bool lock_profile = MYOS_LOCK_DIAG >= 3;
 
 constexpr usize class_count = static_cast<usize>(LockClass::Count);
 enum class Violation : u32 {
@@ -691,6 +713,32 @@ void pop_context(CpuLockTrace& trace) noexcept {
 
 } // namespace
 
+auto provision(CpuRuntime& runtime, mm::Pmm& pmm) noexcept -> bool {
+#if MYOS_LOCK_DIAG == 0 && MYOS_CONCURRENCY_DIAG == 0
+    static_cast<void>(runtime);
+    static_cast<void>(pmm);
+    return true;
+#else
+    if (runtime.diagnostics == nullptr) {
+        return runtime.diagnostics != nullptr;
+    }
+#if MYOS_LOCK_DIAG >= 3
+    auto* const trace = &runtime.diagnostics->locks;
+    if (auto profile_page = pmm.allocate_page(); profile_page) {
+        runtime.diagnostics->lock_profile_page =
+            libk::move(profile_page).value();
+        trace->profile = libk::construct_at(reinterpret_cast<LockProfile*>(
+            runtime.diagnostics->lock_profile_page.bytes()));
+    } else {
+        trace->degraded.store<libk::MemoryOrder::Release>(1);
+    }
+#else
+    static_cast<void>(pmm);
+#endif
+    return true;
+#endif
+}
+
 auto before_acquire(LockRef lock, LockSite site) noexcept -> LockCookie {
     CurrentTrace current = current_trace();
     if (current.trace == nullptr) {
@@ -705,20 +753,6 @@ auto before_acquire(LockRef lock, LockSite site) noexcept -> LockCookie {
     }
     return LockCookie{true, lock_trace, now(), false};
 }
-
-#if MYOS_LOCK_PROBE
-auto before_wait_probe(LockRef lock, LockSite site) noexcept -> LockCookie {
-    CurrentTrace current = current_trace();
-    if (current.trace == nullptr) {
-        return {};
-    }
-    if constexpr (lock_verify) {
-        validate_local(current.trace->local, lock, site);
-    }
-    publish_wait(*current.trace, lock, site, true);
-    return LockCookie{true, true, now(), false};
-}
-#endif
 
 auto after_acquire(LockRef lock, LockSite site, LockCookie cookie) noexcept
     -> LockCookie {
@@ -1068,186 +1102,9 @@ auto lock_class_name(LockClass value) noexcept -> const char* {
         "vproc", "wait", "endpoint", "notification-source",
         "notification", "tunnel", "channel", "pager", "irq",
         "irq-registry", "terminal",
-#if MYOS_LOCK_PROBE
-        "probe-a", "probe-b",
-#endif
     };
     const usize index = class_index(value);
     return index < class_count ? names[index] : "invalid";
-}
-
-void run_probe(u32 probe) noexcept {
-#if MYOS_LOCK_PROBE
-    //Confirmatory experiment.
-    // Exit condition: remove with the build-time harness if an external
-    // fault injector can reproduce the same structural and wait-cycle paths.
-    using ProbeA = SpinLock<LockClass::ProbeA>;
-    using ProbeB = SpinLock<LockClass::ProbeB>;
-    using OrderedProbe = SpinLock<
-        LockClass::ProbeA, SameClassPolicy::AddressAscending>;
-    static ProbeA a{};
-    static ProbeB b{};
-    static OrderedProbe ordered[2]{};
-    static libk::Atomic<usize> peer{max_cpu_count};
-    static libk::Atomic<u32> ready{};
-    static libk::Atomic<usize> writer_peer{max_cpu_count};
-    static libk::Atomic<u32> writer_ready{};
-    static libk::Atomic<u32> writer_done{};
-    static libk::Atomic<u32> writer_cycles{};
-
-    CurrentTrace current = current_trace();
-    if (current.trace == nullptr || current.registry == nullptr) {
-        return;
-    }
-    const CpuId boot = current.registry->boot_id();
-
-    if (probe == 10) {
-        //Confirmatory experiment.
-        // Exit condition: remove when an external multi-hart harness can
-        // pause two lockdep writers immediately before monotonic publication.
-        const bool boot_role = current.cpu.raw == boot.raw;
-        bool peer_role{};
-        if (!boot_role) {
-            usize expected = max_cpu_count;
-            peer_role = writer_peer.compare_exchange_strong<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(expected, current.cpu.raw)
-                || expected == current.cpu.raw;
-        }
-        if (!boot_role && !peer_role) {
-            return;
-        }
-        static_cast<void>(
-            writer_ready.fetch_add<libk::MemoryOrder::AcqRel>(1));
-        while (writer_ready.load<libk::MemoryOrder::Acquire>() != 2) {
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        }
-        const usize a_class = class_index(LockClass::ProbeA);
-        const usize b_class = class_index(LockClass::ProbeB);
-        const auto result = boot_role
-            ? graph_state.check_insert(
-                a_class, b_class, LockSite::current(), LockSite::current())
-            : graph_state.check_insert(
-                b_class, a_class, LockSite::current(), LockSite::current());
-        if (result.status == DepStatus::Cycle) {
-            static_cast<void>(
-                writer_cycles.fetch_add<libk::MemoryOrder::AcqRel>(1));
-        }
-        static_cast<void>(
-            writer_done.fetch_add<libk::MemoryOrder::AcqRel>(1));
-        while (writer_done.load<libk::MemoryOrder::Acquire>() != 2) {
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        }
-        if (boot_role) {
-            const auto graph = graph_state.snapshot();
-            const u32 cycles =
-                writer_cycles.load<libk::MemoryOrder::Acquire>();
-            diag::console::print<
-                "lock-probe: stage-f writer-{} cycles={}\n">(
-                graph.has(a_class, b_class)
-                        && graph.has(b_class, a_class)
-                        && cycles != 0
-                    ? "ok" : "fail",
-                cycles);
-        }
-        return;
-    }
-
-    if (probe == 9) {
-        const bool boot_role = current.cpu.raw == boot.raw;
-        bool peer_role{};
-        if (!boot_role) {
-            usize expected = max_cpu_count;
-            peer_role = peer.compare_exchange_strong<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(expected, current.cpu.raw)
-                || expected == current.cpu.raw;
-        }
-        if (!boot_role && !peer_role) {
-            return;
-        }
-        IrqToken irq{};
-        LockCookie own = boot_role
-            ? LockAccess::acquire(a, LockSite::current())
-            : LockAccess::acquire(b, LockSite::current());
-        static_cast<void>(own);
-        static_cast<void>(ready.fetch_add<libk::MemoryOrder::AcqRel>(1));
-        while (ready.load<libk::MemoryOrder::Acquire>() != 2) {
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        }
-        if (boot_role) {
-            static_cast<void>(
-                LockAccess::acquire_wait_probe(b, LockSite::current()));
-        } else {
-            static_cast<void>(
-                LockAccess::acquire_wait_probe(a, LockSite::current()));
-        }
-        fail(Violation::WaitCycle, LockSite::current());
-    }
-
-    if (current.cpu.raw != boot.raw) {
-        return;
-    }
-    const LockSite site = LockSite::current();
-    if (probe == 8) {
-        IrqCookie fake{current.cpu.raw, true};
-        irq_restoring(fake);
-    }
-    IrqToken irq{};
-    if (probe == 1) {
-        static_cast<void>(LockAccess::acquire(a, site));
-        static_cast<void>(LockAccess::acquire(a, site));
-    }
-    if (probe == 2) {
-        LockCookie a_cookie = LockAccess::acquire(a, site);
-        LockCookie b_cookie = LockAccess::acquire(b, site);
-        LockAccess::release(b, site, b_cookie);
-        LockAccess::release(a, site, a_cookie);
-        b_cookie = LockAccess::acquire(b, site);
-        static_cast<void>(b_cookie);
-        static_cast<void>(LockAccess::acquire(a, site));
-    }
-    if (probe == 3) {
-        OrderedProbe* low = &ordered[0];
-        OrderedProbe* high = &ordered[1];
-        if (reinterpret_cast<usize>(low) > reinterpret_cast<usize>(high)) {
-            libk::swap(low, high);
-        }
-        static_cast<void>(LockAccess::acquire(*high, site));
-        static_cast<void>(LockAccess::acquire(*low, site));
-    }
-    if (probe == 4) {
-        LockCookie cookie = LockAccess::acquire(a, site);
-        LockRef ref = LockAccess::ref(a);
-        const u64 word = ref.owner->load<libk::MemoryOrder::Acquire>();
-        ref.owner->store<libk::MemoryOrder::Release>(
-            OwnerWord::none(OwnerWord::generation(word)));
-        LockAccess::release(a, site, cookie);
-    }
-    if (probe == 5) {
-        LockCookie a_cookie = LockAccess::acquire(a, site);
-        static_cast<void>(LockAccess::acquire(b, site));
-        LockAccess::release(a, site, a_cookie);
-    }
-    if (probe == 6) {
-        static u64 addresses[local_held_capacity + 1]{};
-        static libk::Atomic<u64> owners[local_held_capacity + 1]{};
-        for (usize index = 0; index <= local_held_capacity; ++index) {
-            LockRef ref{
-                &addresses[index], &owners[index],
-                static_cast<LockClass>(index),
-                SameClassPolicy::Forbidden};
-            LockCookie cookie = before_acquire(ref, site);
-            static_cast<void>(after_acquire(ref, site, cookie));
-        }
-    }
-    if (probe == 7) {
-        static_cast<void>(LockAccess::acquire(a, site));
-        assert_no_locks(site);
-    }
-#else
-    static_cast<void>(probe);
-#endif
 }
 
 void dump_diagnostics() noexcept {
@@ -1357,7 +1214,6 @@ void assert_no_locks(LockSite) noexcept {}
 void assert_held(LockRef, LockSite) noexcept {}
 auto lock_class_name(LockClass) noexcept -> const char* { return "off"; }
 void dump_diagnostics() noexcept {}
-void run_probe(u32) noexcept {}
 
 #endif
 

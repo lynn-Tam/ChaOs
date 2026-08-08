@@ -29,31 +29,23 @@ extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
         kernel::diag::stop_peer(context);
     }
     const kernel::trap::Event event = arch::riscv64::make_event(*frame);
-    const u64 entry_tick = (kernel::sync::lock_profile
-        || MYOS_CONCURRENCY_DIAG >= 1)
+    const u64 entry_tick = (kernel::sync::enabled(
+        kernel::sync::Level::Profile)
+        || kernel::diag::concurrency::enabled(
+            kernel::diag::concurrency::Level::Snapshot))
         ? arch::trap_entry_tick() : 0;
-    if constexpr (kernel::sync::lock_verify) {
+    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
         kernel::sync::trap_enter(
             event,
-            kernel::sync::lock_profile ? entry_tick : 0);
+            kernel::sync::enabled(kernel::sync::Level::Profile)
+                ? entry_tick : 0);
     }
-    if constexpr (MYOS_CONCURRENCY_DIAG >= 1) {
+    if (kernel::diag::concurrency::enabled(
+            kernel::diag::concurrency::Level::Snapshot)) {
         kernel::diag::concurrency::trap_enter(
             entry_tick, static_cast<u32>(event.origin()));
     }
     kernel::trap::handle(event, context);
-#if MYOS_CONCURRENCY_PROBE == 12
-    //Confirmatory experiment.
-    // Exit condition: remove when an external harness can stop a selected
-    // peer after real trap handling and before the trap-exit publication.
-    if (kernel::diag::concurrency::trap_exit_stall_for_probe()) {
-        kernel::diag::console::print<
-            "concurrency-probe: stage-g trap-stall-armed\n">();
-        while (kernel::diag::concurrency::trap_exit_stall_for_probe()) {
-            arch::wait_for_interrupt();
-        }
-    }
-#endif
     return arch::riscv64::raw_frame(context.frame());
 }
 
@@ -63,7 +55,7 @@ extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
     KASSERT(arch::trap_depth() == 0);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
-    if constexpr (kernel::sync::lock_verify) {
+    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
         kernel::sync::trap_exiting();
         kernel::sync::assert_no_locks();
         // The trap's CPU-local diagnostic frame must be retired before
@@ -71,9 +63,11 @@ extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
         // return through this hook much later; keeping the old frame live
         // would make unrelated user traps look recursively nested.
         kernel::sync::trap_exit(
-            kernel::sync::lock_profile ? arch::read_clock().ticks() : 0);
+            kernel::sync::enabled(kernel::sync::Level::Profile)
+                ? arch::read_clock().ticks() : 0);
     }
-    if constexpr (MYOS_CONCURRENCY_DIAG >= 1) {
+    if (kernel::diag::concurrency::enabled(
+            kernel::diag::concurrency::Level::Snapshot)) {
         kernel::diag::concurrency::trap_exit(arch::read_clock().ticks());
     }
     kernel::trap::on_exit(context);

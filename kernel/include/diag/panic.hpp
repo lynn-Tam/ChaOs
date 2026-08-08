@@ -4,7 +4,6 @@
 #include <arch/diagnostics.hpp>
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
-#include <diag/concurrency.hpp>
 #include <libk/sync/atomic.hpp>
 #include <sync/trace.hpp>
 
@@ -84,17 +83,7 @@ struct PanicSlot final {
     bool interrupts_enabled{};
 };
 
-struct CpuDiagnostics final {
-    PanicSlot panic{};
-#if MYOS_LOCK_DIAG >= 1 || MYOS_CONCURRENCY_DIAG >= 1
-    sync::CpuLockTrace locks{};
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 1
-    concurrency::CpuDiagnosticsCore concurrency{};
-#endif
-};
-
-static_assert(sizeof(CpuDiagnostics) <= 4096);
+struct CpuDiagnostics;
 
 [[noreturn]] void panic(PanicRequest request) noexcept;
 [[noreturn]] void assert_fail(
@@ -108,6 +97,12 @@ static_assert(sizeof(CpuDiagnostics) <= 4096);
 [[noreturn]] void panic_unhandled(
     FatalEvent event,
     const arch::TrapContext& trap) noexcept;
+
+// Image-selected confirmatory fault hook.  The core supplies the source
+// location, while the diagnostic provider decides whether this image should
+// exercise panic owner/peer-stop handling.  The off provider is a bounded
+// no-op and does not carry scenario state.
+void panic_probe(SourceLocation source) noexcept;
 
 [[nodiscard]] auto stop_requested() noexcept -> bool;
 [[noreturn]] void stop_peer(const arch::TrapContext& trap) noexcept;

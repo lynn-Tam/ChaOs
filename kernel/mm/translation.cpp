@@ -11,9 +11,6 @@
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 
 namespace kernel::mm {
 
@@ -141,20 +138,8 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
     const u64 previous = acknowledgements_[word].fetch_or<
         libk::MemoryOrder::AcqRel>(bit);
     if ((previous & bit) == 0) {
-#if MYOS_CONCURRENCY_PROBE == 14
-        //Confirmatory experiment.
-        // Exit condition: remove when an external shootdown harness can
-        // pause the acknowledgement callback at this writer boundary.
-        diag::concurrency::probe14_shootdown_ack_before();
-#endif
         observation.detail_and(word, ~bit);
         observation.advance();
-#if MYOS_CONCURRENCY_PROBE == 14
-        //Confirmatory experiment.
-        // Exit condition: remove when an external shootdown harness can
-        // pause the acknowledgement callback at this writer boundary.
-        diag::concurrency::probe14_shootdown_ack_after();
-#endif
         // Publish this CPU's non-final diagnostic state before joining the
         // canonical countdown.  The final RMW acquires prior acknowledgements
         // and its callback alone exchanges/finishes the terminal key.
@@ -163,14 +148,6 @@ void ShootdownTicket::acknowledge(kernel::CpuId cpu) noexcept {
             epoch_.raw + acknowledgements_[word].load<
                 libk::MemoryOrder::Acquire>());
         static_cast<void>(completion_.acknowledge([&]() noexcept {
-#if MYOS_CONCURRENCY_PROBE == 13
-            //Confirmatory experiment.
-            // Exit condition: remove when a remote-shootdown harness can
-            // pause the final target acknowledgement at this callback.
-            static_cast<void>(init::stage_b::pause(
-                init::stage_b::Gate::ShootdownFinal,
-                reinterpret_cast<u64>(this)));
-#endif
             const usize owner_pending = owner_->pending_tickets_.fetch_sub<
                 libk::MemoryOrder::Release>(1);
             KASSERT(owner_pending != 0);

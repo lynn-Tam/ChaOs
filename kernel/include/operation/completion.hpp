@@ -129,12 +129,6 @@ public:
     // Publication is narrower than scheduling. It may request a retained wake
     // on the target CPU, but it cannot mutate Thread state itself.
     void signal() noexcept;
-#if MYOS_CONCURRENCY_PROBE
-    //Confirmatory experiment.
-    // Exit condition: remove when the external fault harness can pause
-    // signal() immediately after the canonical Claimed transition.
-    [[nodiscard]] auto claim_for_probe() noexcept -> bool;
-#endif
 private:
     friend class kernel::Vproc;
     friend class Wait;

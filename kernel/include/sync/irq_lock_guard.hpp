@@ -12,13 +12,9 @@ public:
     explicit IrqToken(
         LockSite site = LockSite::current()) noexcept
         : interrupts_(arch::disable_interrupts()), active_(true) {
-        if constexpr (lock_verify) {
-            cookie_ = irq_disabled(site);
-        }
-#if MYOS_CONCURRENCY_DIAG >= 1
+        cookie_ = irq_disabled(site);
         concurrency_cookie_ = diag::concurrency::irq_disabled(
             diag::concurrency::SourceSite{site.file, site.function, site.line});
-#endif
     }
 
     IrqToken(const IrqToken&) = delete;
@@ -27,15 +23,11 @@ public:
     IrqToken(IrqToken&& other) noexcept
         : interrupts_(other.interrupts_),
           active_(libk::exchange(other.active_, false)),
-          cookie_(other.cookie_)
-#if MYOS_CONCURRENCY_DIAG >= 1
-          , concurrency_cookie_(other.concurrency_cookie_)
-#endif
+          cookie_(other.cookie_),
+          concurrency_cookie_(other.concurrency_cookie_)
     {
         other.cookie_ = {};
-#if MYOS_CONCURRENCY_DIAG >= 1
         other.concurrency_cookie_ = 0;
-#endif
     }
     auto operator=(IrqToken&&) -> IrqToken& = delete;
 
@@ -45,12 +37,8 @@ public:
         if (!active_) {
             return;
         }
-        if constexpr (lock_verify) {
-            irq_restoring(cookie_);
-        }
-#if MYOS_CONCURRENCY_DIAG >= 1
+        irq_restoring(cookie_);
         diag::concurrency::irq_restoring(concurrency_cookie_);
-#endif
         arch::restore_interrupts(interrupts_);
         active_ = false;
     }
@@ -61,9 +49,7 @@ private:
     arch::InterruptState interrupts_;
     bool active_{};
     IrqCookie cookie_{};
-#if MYOS_CONCURRENCY_DIAG >= 1
     u64 concurrency_cookie_{};
-#endif
 };
 
 template<KernelLock Lock>

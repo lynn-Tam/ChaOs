@@ -9,6 +9,7 @@
 #include <mm/kernel_vspace.hpp>
 #include <mm/pmm.hpp>
 #include <object/object_store.hpp>
+#include <sync/trace.hpp>
 #include <time/clock.hpp>
 
 namespace kernel {
@@ -87,149 +88,34 @@ auto CpuProvisioner::prepare_impl(
         runtime->stacks.emergency.emplace(
             libk::move(emergency).value());
 
-    auto diagnostics_page = pmm_.allocate_page();
-    if (!diagnostics_page) {
-        libk::destroy_at(runtime);
-        registry_.fail_runtime(target, CpuFailure::MetadataAllocation);
-        return libk::unexpected(Error::MetadataAllocation);
-    }
-    runtime->diagnostics_page = libk::move(diagnostics_page).value();
-    runtime->diagnostics = libk::construct_at(
-        reinterpret_cast<diag::CpuDiagnostics*>(
-            runtime->diagnostics_page.bytes()));
-    runtime->diagnostics->panic.cpu = id;
-    runtime->diagnostics->panic.hardware =
-        target.descriptor->hardware_id();
-    runtime->diagnostics->panic.registry = &registry_;
-#if MYOS_LOCK_DIAG >= 3
-    if (auto profile_page = pmm_.allocate_page(); profile_page) {
-        runtime->lock_profile_page = libk::move(profile_page).value();
-        runtime->diagnostics->locks.profile = libk::construct_at(
-            reinterpret_cast<sync::LockProfile*>(
-                runtime->lock_profile_page.bytes()));
-    } else {
-        runtime->diagnostics->locks.degraded.store<
-            libk::MemoryOrder::Release>(1);
-    }
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 1
-    runtime->diagnostics->concurrency.live.current_actor.store<
-        libk::MemoryOrder::Relaxed>(0);
-    runtime->diagnostics->concurrency.status().flags.store<
-        libk::MemoryOrder::Relaxed>(0);
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 1
-    // Diagnostic pages are independent optional resources.  A tracing-page
-    // failure must degrade observation only; it must never abort CPU bring-up
-    // or share PMM extension state with a subsystem allocation.
-    if (auto observation_page = pmm_.allocate_page(); observation_page) {
-        auto owned_shard = libk::move(observation_page).value();
-        auto* const store = libk::construct_at(
-            reinterpret_cast<diag::concurrency::ObservationStore*>(
-                owned_shard.bytes()));
-        registry_.own_observation_store(
-            *target.descriptor, libk::move(owned_shard), *store);
-        diag::concurrency::ObservationPage* storage[
-            diag::concurrency::ObservationShard::pages]{};
-        usize storage_count{};
-        for (; storage_count < diag::concurrency::ObservationShard::pages;
-             ++storage_count) {
-            auto page = pmm_.allocate_page();
-            if (!page) {
-                break;
-            }
-            auto owned_slots = libk::move(page).value();
-            storage[storage_count] = libk::construct_at(
-                reinterpret_cast<diag::concurrency::ObservationPage*>(
-                    owned_slots.bytes()));
-            registry_.own_observation_page(
-                *target.descriptor,
-                storage_count,
-                libk::move(owned_slots));
-        }
-        store->shard.initialize(
-            id,
-            &store->profile,
-            storage,
-            storage_count,
-            &store->status);
-        runtime->diagnostics->concurrency.status_store = &store->status;
-        runtime->diagnostics->concurrency.profile = &store->profile;
-        runtime->diagnostics->concurrency.observations = &store->shard;
-        if (storage_count != diag::concurrency::ObservationShard::pages) {
-            static_cast<void>(runtime->diagnostics->concurrency.status().flags
-                .fetch_or<libk::MemoryOrder::Release>(
-                    diag::concurrency::DiagnosticStatus::ObservationCapacity));
-        }
-    } else {
-        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
-            libk::MemoryOrder::Release>(
-                diag::concurrency::DiagnosticStatus::StorageMissing));
-    }
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 2
-    if (auto flight_page = pmm_.allocate_page(); flight_page) {
-        runtime->concurrency_flight_page = libk::move(flight_page).value();
-        diag::concurrency::FlightPage* storage[
-            diag::concurrency::FlightRecorder::page_count]{};
-        usize page{};
-        for (; page < diag::concurrency::FlightRecorder::page_count; ++page) {
-            auto records = pmm_.allocate_page();
-            if (!records) {
-                break;
-            }
-            runtime->concurrency_flight_records[page] =
-                libk::move(records).value();
-            storage[page] = libk::construct_at(
-                reinterpret_cast<diag::concurrency::FlightPage*>(
-                    runtime->concurrency_flight_records[page].bytes()));
-        }
-        if (page == diag::concurrency::FlightRecorder::page_count) {
-            auto* const flight = libk::construct_at(
-                reinterpret_cast<diag::concurrency::FlightRecorder*>(
-                    runtime->concurrency_flight_page.bytes()));
-            flight->initialize(id, storage);
-            runtime->diagnostics->concurrency.flight = flight;
-        } else {
-            static_cast<void>(runtime->diagnostics->concurrency.status().flags
-                .fetch_or<libk::MemoryOrder::Release>(
-                    diag::concurrency::DiagnosticStatus::StorageMissing));
-        }
-    } else {
-        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
-            libk::MemoryOrder::Release>(
-                diag::concurrency::DiagnosticStatus::StorageMissing));
-    }
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 1
     const auto ticks_for = [this](u64 nanoseconds) noexcept -> u64 {
         const auto duration = clock_.duration_from_nanoseconds(nanoseconds);
         return duration ? duration->ticks() : 0;
     };
-    runtime->diagnostics->concurrency.policy =
-        diag::concurrency::WatchdogPolicy{
-            .critical_soft = ticks_for(1'000'000),
-            .critical_hard = ticks_for(100'000'000),
-            .transport_soft = ticks_for(10'000'000),
-            .transport_hard = ticks_for(1'000'000'000),
-            .service_soft = ticks_for(100'000'000),
-            .service_hard = ticks_for(5'000'000'000),
-            .scheduler_soft = ticks_for(100'000'000),
-            .scheduler_hard = ticks_for(2'000'000'000),
-        };
-    if (runtime->diagnostics->concurrency.policy.critical_soft == 0
-        || runtime->diagnostics->concurrency.policy.critical_hard == 0
-        || runtime->diagnostics->concurrency.policy.transport_soft == 0
-        || runtime->diagnostics->concurrency.policy.transport_hard == 0
-        || runtime->diagnostics->concurrency.policy.service_soft == 0
-        || runtime->diagnostics->concurrency.policy.service_hard == 0
-        || runtime->diagnostics->concurrency.policy.scheduler_soft == 0
-        || runtime->diagnostics->concurrency.policy.scheduler_hard == 0) {
-        static_cast<void>(runtime->diagnostics->concurrency.status().flags.fetch_or<
-            libk::MemoryOrder::Release>(
-                diag::concurrency::DiagnosticStatus::ClockUnavailable));
+    const diag::concurrency::WatchdogPolicy policy{
+        .critical_soft = ticks_for(1'000'000),
+        .critical_hard = ticks_for(100'000'000),
+        .transport_soft = ticks_for(10'000'000),
+        .transport_hard = ticks_for(1'000'000'000),
+        .service_soft = ticks_for(100'000'000),
+        .service_hard = ticks_for(5'000'000'000),
+        .scheduler_soft = ticks_for(100'000'000),
+        .scheduler_hard = ticks_for(2'000'000'000),
+    };
+    if (!diag::concurrency::provision(*runtime, id, pmm_, policy)) {
+        libk::destroy_at(runtime);
+        registry_.fail_runtime(target, CpuFailure::MetadataAllocation);
+        return libk::unexpected(Error::MetadataAllocation);
     }
-#endif
+    diag::PanicSlot* const panic = diag::concurrency::panic_slot(*runtime);
+    KASSERT(panic != nullptr);
+    panic->cpu = id;
+    panic->hardware = target.descriptor->hardware_id();
+    panic->registry = &registry_;
+
+    // Child provider allocation is diagnostic-owned and may degrade
+    // independently; CPU bring-up remains on the canonical success path.
+    static_cast<void>(sync::provision(*runtime, pmm_));
 
     auto home = KernelStack::create(vspace);
     if (!home) {
@@ -255,7 +141,7 @@ auto CpuProvisioner::prepare_impl(
     arch::publish_panic_state(
         runtime->local.arch_state,
         runtime->stacks.emergency->top(),
-        &runtime->diagnostics->panic);
+        panic);
     const kernel::mm::TranslationView translation = vspace.translation();
     runtime->initial_translation.emplace(translation);
     [[maybe_unused]] auto& dispatcher = runtime->dispatcher_storage.emplace(

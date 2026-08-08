@@ -2,9 +2,6 @@
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
 #include <init/root_task.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 #include <init/run.hpp>
 #include <diag/console.hpp>
 #include <boot/boot_info.hpp>
@@ -17,9 +14,7 @@
 #include <libk/manual_lifetime.hpp>
 #include <libk/utility.hpp>
 #include <mm/kernel_stack.hpp>
-#if MYOS_BUILTIN_TESTS
-#include <test/test.hpp>
-#endif
+#include <test/boot.hpp>
 
 namespace {
 constinit libk::ManualLifetime<kernel::KernelState> kernel_storage{};
@@ -54,21 +49,11 @@ public:
 };
 
 constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
-#if MYOS_BUILTIN_TESTS
-void run_tests(const kernel::boot::BootInfo& boot_info) noexcept {
-    const TestStats tests = run_builtin_tests(boot_info);
-    KASSERT(arch_boot_stack_guard_intact());
-    KASSERT(tests.failed == 0);
-}
-#endif
-
 [[noreturn]] void continue_init(void* argument) noexcept {
     auto& state = *static_cast<ContinuationState*>(argument);
     kernel::KernelState& kernel = *state.kernel;
     kernel::boot::BootInfo& boot_info = *state.boot;
-#if MYOS_BUILTIN_TESTS
-    run_tests(boot_info);
-#endif
+    kernel::test::run(boot_info);
 
     KASSERT(kernel.initialize_object_store());
     KASSERT(kernel.initialize_grants());
@@ -193,25 +178,6 @@ void run_tests(const kernel::boot::BootInfo& boot_info) noexcept {
 
 namespace kernel::init {
 
-#if MYOS_CONCURRENCY_PROBE == 3 || MYOS_CONCURRENCY_PROBE == 4 \
-    || (MYOS_CONCURRENCY_PROBE >= 9 && MYOS_CONCURRENCY_PROBE <= 11) \
-    || MYOS_CONCURRENCY_PROBE == 13
-auto run_concurrency_probe(
-    kernel::CpuRegistry& cpus,
-    u32 probe) noexcept -> bool {
-    //Confirmatory experiment.
-    // Exit condition: remove with the Stage B operation fault probes.
-#if MYOS_CONCURRENCY_PROBE == 13
-    if (probe == 13) {
-        return kernel_storage && root_task_storage
-            && stage_b::run(
-                *kernel_storage, cpus, *root_task_storage);
-    }
-#endif
-    return root_task_storage
-        && root_task_storage->run_concurrency_probe(cpus, probe);
-}
-#endif
 
 [[noreturn]] void run(
     libk::ManualLifetime<kernel::boot::BootInfo>& source) noexcept {

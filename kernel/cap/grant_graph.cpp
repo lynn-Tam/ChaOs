@@ -18,9 +18,6 @@
 #include <resource/pool.hpp>
 #include <thread/thread.hpp>
 #include <sync/irq_lock_guard.hpp>
-#if MYOS_CONCURRENCY_PROBE == 13
-#include <init/stage_b_probe.hpp>
-#endif
 
 namespace kernel::cap {
 
@@ -428,14 +425,6 @@ void GrantRevoke::acknowledge() noexcept {
     auto observation = diag::concurrency::ObservationLease::borrow(key);
     observation.advance();
     static_cast<void>(completion_.acknowledge([&]() noexcept {
-#if MYOS_CONCURRENCY_PROBE == 13
-        //Confirmatory experiment.
-        // Exit condition: remove when the revoke service harness can pause
-        // the final node acknowledgement at this callback.
-        static_cast<void>(init::stage_b::pause(
-            init::stage_b::Gate::GrantFinal,
-            reinterpret_cast<u64>(this)));
-#endif
         const auto terminal = diag::concurrency::ObservationKey{
             observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
         if (terminal) {

@@ -1,4 +1,5 @@
-#include <diag/panic.hpp>
+#include <diag/owner.hpp>
+#include <diag/concurrency_private.hpp>
 
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
@@ -11,6 +12,7 @@
 #include <libk/fmt.hpp>
 #include <arch/console.hpp>
 #include <arch/system.hpp>
+#include <core/kernel_image.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel::diag {
@@ -771,7 +773,7 @@ void print_peers(const PanicSlot& owner) noexcept {
     concurrency::WaitGraphScratch* graph = nullptr;
     const CpuRuntime* const owner_runtime = registry->runtime(owner.cpu);
     if (owner_runtime != nullptr && owner_runtime->diagnostics != nullptr) {
-        graph = &owner_runtime->diagnostics->concurrency.graph;
+        graph = &owner_runtime->diagnostics->concurrency->graph;
     }
 #endif
     panic_print<"peer cpus:\n">();
@@ -796,7 +798,7 @@ void print_peers(const PanicSlot& owner) noexcept {
         print_lock_trace(id, runtime->diagnostics->locks);
 #endif
 #if MYOS_CONCURRENCY_DIAG >= 1
-        print_concurrency(id, runtime->diagnostics->concurrency, graph);
+        print_concurrency(id, *runtime->diagnostics->concurrency, graph);
 #endif
     }
 }
@@ -824,7 +826,7 @@ void print_peers(const PanicSlot& owner) noexcept {
         "\n================ MYOS KERNEL PANIC ================\n"
         "build: {}\nsequence: {}\n"
         "event: {:#010x} kind={} facility={}\n">(
-        MYOS_BUILD_ID,
+        libk::StrView::from_cstr(image::build_id),
         sequence,
         slot.request.event.id.raw,
         static_cast<u8>(slot.request.kind),
@@ -846,6 +848,24 @@ void print_peers(const PanicSlot& owner) noexcept {
 
 } // namespace
 
+void panic_probe(SourceLocation source) noexcept {
+#if MYOS_PANIC_PROBE
+    //Confirmatory experiment.
+    // Exit condition: remove when the panic owner/peer-stop behavior is
+    // covered by a permanent image-level fault harness.
+#if MYOS_PANIC_PROBE == 2
+    arch::inject_ipi_failures_for_test(max_cpu_count);
+#endif
+    assert_fail(
+        source.expression != nullptr ? source.expression : "false",
+        source.file,
+        source.function,
+        source.line);
+#else
+    static_cast<void>(source);
+#endif
+}
+
 auto stop_requested() noexcept -> bool {
     return arch::panic_stop_requested();
 }
@@ -853,7 +873,7 @@ auto stop_requested() noexcept -> bool {
 [[noreturn]] void panic(PanicRequest request) noexcept {
     const arch::CallSiteSnapshot call_site = arch::capture_call_site();
     const arch::InterruptState interrupts = arch::disable_interrupts();
-    if constexpr (sync::lock_verify) {
+    if (sync::enabled(sync::Level::Verify)) {
         sync::panic_enter();
     }
     void* const slot_pointer = arch::panic_slot();

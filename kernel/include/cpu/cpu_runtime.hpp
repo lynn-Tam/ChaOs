@@ -20,34 +20,7 @@ class KernelState;
 // Registry metadata only publishes a borrow to this object after construction.
 struct CpuRuntime final : private libk::noncopyable_nonmovable {
     CpuRuntime() noexcept = default;
-    ~CpuRuntime() noexcept {
-        dispatcher_storage.reset();
-        if (idle_thread) {
-            KASSERT(idle_thread.retire());
-            idle_thread.reset();
-        }
-        if (diagnostics != nullptr) {
-#if MYOS_CONCURRENCY_DIAG >= 2
-            if (diagnostics->concurrency.flight != nullptr) {
-                libk::destroy_at(diagnostics->concurrency.flight);
-                diagnostics->concurrency.flight = nullptr;
-            }
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 1
-            if (diagnostics->concurrency.observations != nullptr) {
-                diagnostics->concurrency.observations = nullptr;
-            }
-#endif
-            libk::destroy_at(diagnostics);
-            diagnostics = nullptr;
-        }
-#if MYOS_LOCK_DIAG >= 3
-        if (lock_profile_page) {
-            libk::destroy_at(reinterpret_cast<sync::LockProfile*>(
-                lock_profile_page.bytes()));
-        }
-#endif
-    }
+    ~CpuRuntime() noexcept;
 
     [[nodiscard]] auto idle() noexcept -> Thread& { return idle_thread.get(); }
     [[nodiscard]] auto idle() const noexcept -> const Thread& {
@@ -67,14 +40,6 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     CpuStackSet stacks{};
     kernel::mm::OwnedPage diagnostics_page{};
     diag::CpuDiagnostics* diagnostics{};
-#if MYOS_LOCK_DIAG >= 3
-    kernel::mm::OwnedPage lock_profile_page{};
-#endif
-#if MYOS_CONCURRENCY_DIAG >= 2
-    kernel::mm::OwnedPage concurrency_flight_page{};
-    kernel::mm::OwnedPage concurrency_flight_records[
-        diag::concurrency::FlightRecorder::page_count]{};
-#endif
     object::ObjectStore::ThreadHold idle_thread{};
     libk::ManualLifetime<sched::CpuDispatcher> dispatcher_storage{};
     arch::CpuStartContext start_context{};

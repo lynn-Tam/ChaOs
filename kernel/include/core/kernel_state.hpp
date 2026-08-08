@@ -52,11 +52,6 @@ public:
         kernel::resource::Budget limit) noexcept -> bool;
     [[nodiscard]] auto start_reclaimer(kernel::CpuRuntime& runtime) noexcept
         -> bool;
-#if MYOS_CONCURRENCY_PROBE == 8
-    //Confirmatory experiment.
-    // Exit condition: remove with the Stage E reclaimer interval probe.
-    void run_reclaimer_probe() noexcept;
-#endif
 
     [[nodiscard]] auto pmm(this auto& self) noexcept
         -> decltype(auto){

@@ -2,7 +2,6 @@
 
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
-#include <diag/concurrency.hpp>
 #include <libk/expected.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
@@ -92,12 +91,6 @@ private:
     libk::Atomic<CpuState> state_{CpuState::Possible};
     CpuFailure failure_{CpuFailure::None};
     CpuRuntime* runtime_{};
-#if MYOS_CONCURRENCY_DIAG >= 1
-    kernel::mm::OwnedPage observation_shard_page_{};
-    kernel::mm::OwnedPage observation_pages_[
-        diag::concurrency::ObservationShard::pages]{};
-    diag::concurrency::ObservationStore* observation_store_{};
-#endif
 };
 
 class CpuRegistry final : private libk::noncopyable_nonmovable {
@@ -163,16 +156,6 @@ public:
     [[nodiscard]] auto runtime(CpuId id) const noexcept -> const CpuRuntime*;
     [[nodiscard]] auto runtime_by_hardware_id(
         CpuHardwareId hardware_id) noexcept -> CpuRuntime*;
-#if MYOS_CONCURRENCY_DIAG >= 1
-    [[nodiscard]] auto observations(CpuId id) noexcept
-        -> diag::concurrency::ObservationShard*;
-    [[nodiscard]] auto observations(CpuId id) const noexcept
-        -> const diag::concurrency::ObservationShard*;
-#endif
-#if MYOS_CONCURRENCY_PROBE
-    [[nodiscard]] auto drop_runtime_for_probe(CpuId id) noexcept -> bool;
-#endif
-
     // AcqRel consumes Prepared publication and commits one start authority.
     [[nodiscard]] auto begin_start(CpuId id) noexcept -> bool;
     [[nodiscard]] auto fail_start(CpuId id, CpuFailure failure) noexcept
@@ -226,17 +209,6 @@ private:
     void publish_runtime(
         RuntimeTarget target,
         CpuRuntime& runtime) noexcept;
-#if MYOS_CONCURRENCY_DIAG >= 1
-    void own_observation_store(
-        CpuDescriptor& cpu,
-        kernel::mm::OwnedPage&& page,
-        diag::concurrency::ObservationStore& store) noexcept;
-    void own_observation_page(
-        CpuDescriptor& cpu,
-        usize index,
-        kernel::mm::OwnedPage&& page) noexcept;
-    void release_observations(CpuDescriptor& cpu) noexcept;
-#endif
 
     // Registry-private monotonic storage keeps published descriptor/runtime
     // addresses stable. The complete page group is reclaimed with the registry.

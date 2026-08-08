@@ -5,33 +5,47 @@
 #include <libk/array.hpp>
 #include <libk/delegate.hpp>
 #include <libk/limits.hpp>
-#include <libk/sync/atomic.hpp>
-
-#ifndef MYOS_CONCURRENCY_DIAG
-#define MYOS_CONCURRENCY_DIAG 0
-#endif
-
-#ifndef MYOS_CONCURRENCY_PROBE
-#define MYOS_CONCURRENCY_PROBE 0
-#endif
-
-#ifndef MYOS_STAGE_F_PROBE
-#define MYOS_STAGE_F_PROBE 0
-#endif
 
 namespace kernel {
 class CpuRegistry;
+class CpuRuntime;
+namespace diag {
+struct PanicSlot;
+}
+namespace mm {
+class Pmm;
+}
 }
 
 namespace kernel::diag::concurrency {
 
-struct DiagnosticStatus;
+struct WatchdogPolicy;
 
-inline constexpr usize level = MYOS_CONCURRENCY_DIAG;
-inline constexpr bool snapshot_enabled = level >= 1;
-inline constexpr bool trace_enabled = level >= 2;
-inline constexpr bool watch_enabled = level >= 3;
-inline constexpr bool profile_enabled = level >= 4;
+// Diagnostic enablement is an out-of-line module boundary. Callers must not
+// select a recorder policy in their own code-generation unit; the linked
+// provider owns the selected level and returns the same typed value in real
+// and off images.
+enum class Level : u8 {
+    Off,
+    Snapshot,
+    Trace,
+    Watch,
+    Profile,
+};
+
+extern const Level level;
+
+[[nodiscard]] auto enabled(Level required) noexcept -> bool;
+
+// Provisioning is owned by this module.  The off provider leaves the runtime
+// owner pointers empty; real providers allocate only their private pages and
+// publish typed borrows after construction.
+[[nodiscard]] auto provision(
+    CpuRuntime& runtime,
+    CpuId id,
+    mm::Pmm& pmm,
+    const WatchdogPolicy& policy) noexcept -> bool;
+[[nodiscard]] auto panic_slot(CpuRuntime& runtime) noexcept -> diag::PanicSlot*;
 
 // A diagnostic key is an opaque identity, not a pointer.  The shard and slot
 // locate a record only while its generation is active; consumers must validate
@@ -358,110 +372,6 @@ enum class EdgeKind : u8 {
 
 inline constexpr usize graph_capacity = 12;
 
-struct WaitGraphScratch final {
-    StallClass classification{StallClass::None};
-    EvidenceGrade evidence{EvidenceGrade::None};
-    u8 count{};
-    bool truncated{};
-    u16 pending_total{};
-    u8 pending_shown{};
-    u16 pending_omitted{};
-    // Keep the panic-page representation compact: the low byte of path_meta
-    // stores NodeRef::Kind and the remaining 56 bits store generation.  All
-    // diagnostic generations currently fit in that width (observation keys
-    // use 40 bits), while identity remains lossless.
-    u64 path[graph_capacity]{};
-    u64 path_meta[graph_capacity]{};
-    u64 fingerprints[graph_capacity]{};
-    u8 parents[graph_capacity]{};
-    EdgeKind edges[graph_capacity]{};
-
-    [[nodiscard]] auto node(usize index) const noexcept -> NodeRef {
-        if (index >= graph_capacity) {
-            return {};
-        }
-        const u64 meta = path_meta[index];
-        return NodeRef{
-            static_cast<NodeRef::Kind>(meta & 0xffU),
-            path[index],
-            meta >> 8};
-    }
-    void set_node(usize index, NodeRef value) noexcept {
-        if (index >= graph_capacity) {
-            return;
-        }
-        path[index] = value.identity;
-        path_meta[index] = static_cast<u64>(
-                static_cast<u8>(value.kind))
-            | (value.generation << 8);
-    }
-
-    [[nodiscard]] auto edge(usize index) const noexcept -> EdgeKind {
-        return index < graph_capacity ? edges[index] : EdgeKind::None;
-    }
-};
-
-struct ObservationRecord final {
-    // The slot state is the sole allocation/lifetime truth. It packs the
-    // generation, lifecycle and diagnostic pin count in one atomic word.
-    // Directory masks below are scan hints only.
-    libk::Atomic<u64> slot_state{};
-    libk::Atomic<u64> sequence{};
-    // Activity is the exercise witness used for activity-without-progress
-    // intervals. Metadata transactions may publish activity together with
-    // progress under sequence; a direct progress witness uses progress_epoch
-    // alone because its progress delta already resets the candidate.
-    libk::Atomic<u64> activity_epoch{};
-    libk::Atomic<u64> progress_epoch{};
-    libk::Atomic<u64> started_at{};
-    // These timestamps follow their corresponding witnesses. Direct progress
-    // uses last_progress_at; it does not fabricate an activity timestamp.
-    libk::Atomic<u64> last_activity_at{};
-    libk::Atomic<u64> last_progress_at{};
-    // Evidence is generation-local.  Shard status keeps historical
-    // operational health, while this field describes only the active record.
-    libk::Atomic<u32> evidence{};
-
-    libk::Atomic<u32> record_kind{};
-    libk::Atomic<u32> phase{};
-    libk::Atomic<u32> wait_kind{};
-    libk::Atomic<u32> expectation{};
-    // low bytes: operation kind, attached expectation, action, driver kind.
-    libk::Atomic<u32> policy_kinds{};
-    libk::Atomic<u64> policy_driver_key{};
-    libk::Atomic<u64> policy_driver_generation{};
-
-    libk::Atomic<u64> subject_identity{};
-    libk::Atomic<u64> subject_generation{};
-    libk::Atomic<u64> wait_target{};
-    libk::Atomic<u64> driver_key{};
-    libk::Atomic<u32> driver_kind{};
-    libk::Atomic<u64> driver_generation{};
-    libk::Atomic<u64> blocker_key{};
-    libk::Atomic<u32> blocker_kind{};
-    libk::Atomic<u64> blocker_generation{};
-    libk::Atomic<u64> semantic_stamp{};
-    libk::Atomic<u64> deadline{};
-    libk::Atomic<u64> grace{};
-
-    libk::Atomic<usize> site_file{};
-    libk::Atomic<usize> site_function{};
-    libk::Atomic<u32> site_line{};
-    libk::Atomic<u64> detail[4]{};
-};
-
-// Records deliberately live in their own PMM pages.  A shard is only a
-// directory and publication coordinator; it must remain cheap to embed in a
-// CPU diagnostics page.  Sixteen records per page keeps the bitmaps and
-// record array page-bounded without inflating Vproc/ObjectPool slots.
-struct ObservationPage final {
-    static constexpr usize slot_count = 16;
-
-    ObservationRecord records[slot_count]{};
-};
-
-static_assert(sizeof(ObservationPage) <= 4096);
-
 struct ObservationSnapshot final {
     u64 generation{};
     u64 activity_epoch{};
@@ -517,43 +427,7 @@ struct ObservationBatch final {
 
 inline constexpr usize profile_bucket_count = 8;
 
-// Profile data is a diagnostic projection.  It is deliberately keyed by the
-// same RecordKind used by observations, so it cannot become a second source
-// of lifecycle state.  All counters saturate in the implementation.
-struct LatencyStats final {
-    libk::Atomic<u64> completed{};
-    libk::Atomic<u64> total{};
-    libk::Atomic<u64> max{};
-    libk::Atomic<u64> current{};
-    libk::Atomic<u64> buckets[profile_bucket_count]{};
-};
-
-struct LatencyProfile final {
-    LatencyStats records[static_cast<usize>(RecordKind::Count)]{};
-
-    void initialize() noexcept;
-};
-
-// Common sequence protocol used by both observation metadata and flight
-// records.  Writers never wait: a concurrent writer marks the diagnostic
-// projection degraded and leaves canonical kernel state untouched.
-class AtomicSnapshotWriter final {
-public:
-    [[nodiscard]] static auto begin(
-        libk::Atomic<u64>& sequence,
-        u64& odd) noexcept -> bool;
-    static void end(libk::Atomic<u64>& sequence, u64 odd) noexcept;
-};
-
-class AtomicSnapshotReader final {
-public:
-    [[nodiscard]] static auto begin(
-        const libk::Atomic<u64>& sequence) noexcept -> u64;
-    [[nodiscard]] static auto valid(
-        const libk::Atomic<u64>& sequence,
-        u64 first) noexcept -> bool;
-};
-
+struct ObservationRecord;
 class ObservationShard;
 
 class ObservationLease final {
@@ -656,159 +530,18 @@ public:
 private:
     friend class ObservationShard;
 
-#if MYOS_CONCURRENCY_DIAG >= 1
     ObservationLease(
         ObservationKey key,
         bool owned = true) noexcept
         : key_(key), owned_(owned) {}
-#else
-    explicit ObservationLease(ObservationKey) noexcept {}
-#endif
-
     [[nodiscard]] auto resolve(
         ObservationShard*& shard,
         ObservationRecord*& record) const noexcept -> bool;
     void reset() noexcept;
 
-#if MYOS_CONCURRENCY_DIAG >= 1
     ObservationKey key_{};
     bool owned_{};
-#endif
 };
-
-class ObservationShard final {
-public:
-    static constexpr usize pages = 4;
-    static constexpr usize slots_per_page = ObservationPage::slot_count;
-    static constexpr usize slot_count = pages * slots_per_page;
-
-    ObservationShard() noexcept = default;
-    ~ObservationShard() noexcept;
-    ObservationShard(const ObservationShard&) = delete;
-    auto operator=(const ObservationShard&) -> ObservationShard& = delete;
-
-    void initialize(
-        CpuId id,
-        LatencyProfile* profile = nullptr,
-        ObservationPage* const* storage = nullptr,
-        usize page_count = 0,
-        DiagnosticStatus* status = nullptr) noexcept;
-    [[nodiscard]] auto reserve(
-        RecordKind kind,
-        u64 subject_identity,
-        u64 subject_generation,
-        Expectation expectation,
-        SourceSite site) noexcept -> ObservationLease;
-    [[nodiscard]] auto snapshot(
-        ObservationKey key,
-        ObservationSnapshot& result) const noexcept -> bool;
-    void release(ObservationKey key) noexcept;
-    void mark_degraded(u32 flag = 1U << 7) noexcept;
-
-    [[nodiscard]] auto allocated() const noexcept -> u64 {
-        return allocated_.load<libk::MemoryOrder::Acquire>();
-    }
-    [[nodiscard]] auto watched() const noexcept -> u64 {
-        return watched_.load<libk::MemoryOrder::Acquire>();
-    }
-    [[nodiscard]] auto degraded() const noexcept -> bool {
-        return degraded_.load<libk::MemoryOrder::Acquire>() != 0;
-    }
-    [[nodiscard]] auto key_at(usize index) const noexcept -> ObservationKey;
-    void profile_current(u64 tick) const noexcept;
-
-private:
-    friend class ObservationLease;
-#if MYOS_CONCURRENCY_PROBE
-    friend void run_probe(u32 probe) noexcept;
-#endif
-
-    [[nodiscard]] auto valid(ObservationKey key) const noexcept
-        -> ObservationRecord*;
-    [[nodiscard]] auto page_for(
-        usize index,
-        usize& local) const noexcept -> ObservationPage*;
-    [[nodiscard]] auto pin(
-        ObservationKey key,
-        ObservationRecord*& record) const noexcept -> bool;
-    void unpin(ObservationKey key, ObservationRecord& record) const noexcept;
-    [[nodiscard]] auto retire(
-        ObservationKey key,
-        ObservationRecord& record) noexcept -> bool;
-    void reclaim(
-        ObservationKey key,
-        ObservationRecord& record) noexcept;
-    [[nodiscard]] auto active(
-        ObservationKey key,
-        const ObservationRecord& record) const noexcept -> bool;
-    void finish(
-        ObservationKey key,
-        u32 terminal_phase,
-        u64 result,
-        SourceSite site) noexcept;
-    [[nodiscard]] auto write_metadata(
-        ObservationKey key,
-        u32 phase,
-        WaitKind wait,
-        NodeRef driver,
-        NodeRef blocker,
-        u64 semantic_stamp,
-        bool update_progress,
-        SourceSite site) noexcept -> bool;
-    [[nodiscard]] auto write_batch(
-        ObservationKey key,
-        const ObservationBatch& update) noexcept -> bool;
-    [[nodiscard]] auto write_wait(
-        ObservationKey key,
-        ObservationKey wait,
-        WaitKind kind,
-        NodeRef driver,
-        SourceSite site) noexcept -> bool;
-    [[nodiscard]] auto write_policy(
-        ObservationKey key,
-        OperationPolicy policy,
-        SourceSite site) noexcept -> bool;
-    [[nodiscard]] auto publish_operation(
-        ObservationKey key,
-        OperationPhase phase,
-        NodeRef driver,
-        NodeRef blocker,
-        SourceSite site) noexcept -> bool;
-    void write_deadline(
-        ObservationKey key,
-        u64 absolute,
-        u64 grace,
-        SourceSite site) noexcept;
-    [[nodiscard]] auto update_progress(
-        ObservationKey key,
-        u64 semantic_stamp,
-        bool force) noexcept -> bool;
-    [[nodiscard]] auto observe(
-        ObservationKey key,
-        u64 semantic_stamp) noexcept -> bool;
-    void update_activity(ObservationKey key, u64 delta) noexcept;
-    void advance(ObservationKey key, u64 delta) noexcept;
-    void write_detail(ObservationKey key, usize index, u64 value) noexcept;
-    void and_detail(ObservationKey key, usize index, u64 mask) noexcept;
-    [[nodiscard]] auto update_phase(
-        ObservationKey key,
-        u32 phase,
-        u64 semantic_stamp,
-        SourceSite site) noexcept -> bool;
-    void set_watched(ObservationKey key, bool watched) noexcept;
-    void profile_finish(RecordKind kind, u64 duration) noexcept;
-
-    CpuId id_{};
-    LatencyProfile* profile_{};
-    DiagnosticStatus* status_{};
-    ObservationPage* storage_[pages]{};
-    u8 page_count_{};
-    libk::Atomic<u64> allocated_{};
-    libk::Atomic<u64> watched_{};
-    libk::Atomic<u32> degraded_{};
-};
-
-static_assert(sizeof(ObservationShard) <= 4096);
 
 struct FlightRecordValue final {
     u64 sequence{};
@@ -824,240 +557,6 @@ struct FlightRecordValue final {
     SourceSite site{};
 };
 
-struct FlightRecord final {
-    libk::Atomic<u64> sequence{};
-    libk::Atomic<u64> absolute_id{};
-    libk::Atomic<u64> tick{};
-    libk::Atomic<u32> domain{};
-    libk::Atomic<u32> event{};
-    libk::Atomic<u64> actor{};
-    libk::Atomic<u64> subject{};
-    libk::Atomic<u64> arg0{};
-    libk::Atomic<u64> arg1{};
-    libk::Atomic<u64> arg2{};
-    libk::Atomic<usize> site_file{};
-    libk::Atomic<usize> site_function{};
-    libk::Atomic<u32> site_line{};
-};
-
-struct FlightPage final {
-    static constexpr usize capacity = 32;
-    FlightRecord records[capacity]{};
-};
-
-static_assert(sizeof(FlightPage) <= 4096);
-
-class FlightRecorder final {
-public:
-    static constexpr usize page_count = 4;
-    static constexpr usize capacity = page_count * FlightPage::capacity;
-
-    FlightRecorder() noexcept = default;
-    FlightRecorder(const FlightRecorder&) = delete;
-    auto operator=(const FlightRecorder&) -> FlightRecorder& = delete;
-
-    void initialize(
-        CpuId id,
-        FlightPage* const (&storage)[page_count]) noexcept;
-    void push(
-        u64 tick,
-        FlightDomain domain,
-        FlightEvent event,
-        u64 actor = 0,
-        u64 subject = 0,
-        u64 arg0 = 0,
-        u64 arg1 = 0,
-        u64 arg2 = 0,
-        SourceSite site = SourceSite::current()) noexcept;
-    [[nodiscard]] auto read(
-        usize logical_index,
-        FlightRecordValue& result) const noexcept -> bool;
-    [[nodiscard]] auto head() const noexcept -> u64 {
-        return head_.load<libk::MemoryOrder::Acquire>();
-    }
-    [[nodiscard]] auto degraded() const noexcept -> bool {
-        return degraded_.load<libk::MemoryOrder::Acquire>() != 0;
-    }
-    [[nodiscard]] auto wrapped() const noexcept -> bool {
-        return wrapped_.load<libk::MemoryOrder::Acquire>() != 0;
-    }
-
-private:
-    CpuId id_{};
-    libk::Atomic<u64> head_{};
-    libk::Atomic<u32> degraded_{};
-    libk::Atomic<u32> wrapped_{};
-    FlightPage* pages_[page_count]{};
-};
-
-static_assert(sizeof(FlightRecorder) <= 4096);
-
-struct CpuLive final {
-    static constexpr usize wait_capacity = 4;
-
-    enum class SnapshotMode : u8 {
-        Relation,
-        Strict,
-    };
-
-    libk::Atomic<u64> dispatch_epoch{};
-    libk::Atomic<u64> timer_epoch{};
-    libk::Atomic<u64> trap_entered_at{};
-    libk::Atomic<u64> irq_disabled_since{};
-    libk::Atomic<u64> current_actor{};
-    libk::Atomic<u32> wait_depth{};
-    libk::Atomic<u64> wait_generation{};
-    libk::Atomic<u64> wait_activity_epoch{};
-    libk::Atomic<u64> wait_progress_epoch{};
-    libk::Atomic<u64> wait_semantic_stamp{};
-    libk::Atomic<u64> last_event_at{};
-    libk::Atomic<u32> context{};
-    libk::Atomic<u32> trap_depth{};
-    libk::Atomic<u32> irq_depth{};
-    // Scopes that arrive after the bounded frame stack is full still need a
-    // matching close. Keep them as a count so clear_wait() cannot pop a real
-    // outer frame on behalf of an overflowed inner scope.
-    libk::Atomic<u32> wait_overflow{};
-    libk::Atomic<u32> degraded{};
-    libk::Atomic<bool> interrupts_disabled{};
-    struct WaitFrame final {
-        libk::Atomic<u64> sequence{};
-        libk::Atomic<u64> token{};
-        libk::Atomic<u64> wait{};
-        libk::Atomic<u64> subject_identity{};
-        libk::Atomic<u64> subject_generation{};
-        libk::Atomic<u64> driver_identity{};
-        libk::Atomic<u64> driver_generation{};
-        libk::Atomic<u64> obligation{};
-        libk::Atomic<u64> since{};
-        libk::Atomic<usize> site_file{};
-        libk::Atomic<u32> site_line{};
-        // low byte subject kind, next byte driver kind, next byte wait kind
-        libk::Atomic<u64> kinds{};
-    };
-    WaitFrame waits[wait_capacity]{};
-
-    struct WaitSnapshot final {
-        u64 wait{};
-        NodeRef subject{};
-        NodeRef driver{};
-        u64 obligation{};
-        u64 since{};
-        WaitKind kind{WaitKind::None};
-        SourceSite site{};
-    };
-
-    struct Snapshot final {
-        u64 dispatch_epoch{};
-        u64 timer_epoch{};
-        u64 trap_entered_at{};
-        u64 irq_disabled_since{};
-        u64 current_actor{};
-        u64 activity_epoch{};
-        u64 progress_epoch{};
-        u64 semantic_stamp{};
-        u64 last_event_at{};
-        u32 context{};
-        u32 trap_depth{};
-        u32 irq_depth{};
-        u32 degraded{};
-        bool interrupts_disabled{};
-        bool has_wait{};
-        WaitSnapshot wait{};
-    };
-
-    [[nodiscard]] auto top_wait(WaitSnapshot& result) const noexcept -> bool;
-    [[nodiscard]] auto snapshot(
-        Snapshot& result,
-        SnapshotMode mode = SnapshotMode::Strict) const noexcept -> bool;
-};
-
-struct StallFingerprint final {
-    NodeRef root{};
-    u32 phase{};
-    u64 progress_epoch{};
-    u64 activity_epoch{};
-    u64 relation_hash{};
-    NodeRef driver{};
-    NodeRef blocker{};
-};
-
-struct WatchdogCandidate final {
-    enum class State : u32 {
-        Clear,
-        Suspected,
-        Confirmed,
-        ConfirmedLivelock,
-    };
-
-    libk::Atomic<u32> state{};
-    libk::Atomic<u64> fingerprint_sequence{};
-    libk::Atomic<u64> root_identity{};
-    libk::Atomic<u32> root_kind{};
-    libk::Atomic<u64> root_generation{};
-    libk::Atomic<u32> fingerprint_phase{};
-    libk::Atomic<u64> fingerprint_progress{};
-    libk::Atomic<u64> fingerprint_activity{};
-    libk::Atomic<u64> relation_hash{};
-    libk::Atomic<u64> driver_identity{};
-    libk::Atomic<u32> driver_kind{};
-    libk::Atomic<u64> driver_generation{};
-    libk::Atomic<u64> blocker_identity{};
-    libk::Atomic<u32> blocker_kind{};
-    libk::Atomic<u64> blocker_generation{};
-    libk::Atomic<u64> first_seen{};
-    libk::Atomic<u32> active_intervals{};
-
-    void publish(const StallFingerprint& value) noexcept;
-    [[nodiscard]] auto read(StallFingerprint& value) const noexcept -> bool;
-};
-
-// A report owns a copy of the bounded graph. The producer may overwrite its
-// per-CPU scratch on the next watchdog pass, so the queue payload is the sole
-// truth for deferred output.
-struct ReportRecord final {
-    CpuId watcher{};
-    CpuId target{};
-    NodeRef root{};
-    WatchdogCandidate::State state{};
-    StallClass classification{StallClass::None};
-    EvidenceGrade evidence{EvidenceGrade::None};
-    u64 age{};
-    WaitGraphScratch graph{};
-};
-
-class ReportQueue final {
-public:
-    // This is an SPSC mailbox: the owning CPU's watchdog is the sole
-    // publisher for this per-CPU queue, and the single reclaimer thread is the
-    // sole consumer. One fixed slot keeps the diagnostics page bounded;
-    // overflow is explicit diagnostic loss and never blocks canonical state.
-    static constexpr usize capacity = 1;
-
-    [[nodiscard]] auto publish(const ReportRecord& value) noexcept -> bool;
-    [[nodiscard]] auto consume(ReportRecord& value) noexcept -> bool;
-    [[nodiscard]] auto pending() const noexcept -> bool;
-    [[nodiscard]] auto lost() const noexcept -> u64 {
-        return lost_.load<libk::MemoryOrder::Acquire>();
-    }
-
-private:
-    libk::Atomic<u64> head_{};
-    libk::Atomic<u64> tail_{};
-    libk::Atomic<u64> lost_{};
-    ReportRecord records_[capacity]{};
-};
-
-struct StallCoordinator final {
-    static constexpr usize signature_capacity = 4;
-
-    // owner is a transient CPU token. The bounded signature cache suppresses
-    // another watcher reporting the same confirmed diagnostic interval.
-    libk::Atomic<u64> owner{};
-    libk::Atomic<usize> signature_cursor{};
-    libk::Atomic<u64> signatures[signature_capacity]{};
-};
-
 // Thresholds are provisioned from the kernel clock. They are observation
 // policy only; no functional path consults them.
 struct WatchdogPolicy final {
@@ -1071,28 +570,25 @@ struct WatchdogPolicy final {
     u64 scheduler_hard{};
 };
 
-struct DiagnosticStatus final {
-    libk::Atomic<u32> flags{};
-    enum Flag : u32 {
-        None = 0,
-        SnapshotUnstable = 1U << 1,
-        FlightWrapped = 1U << 2,
-        StorageMissing = 1U << 3,
-        ClockUnavailable = 1U << 4,
-        IrqStall = 1U << 5,
-        TrapStall = 1U << 6,
-        ObservationCapacity = 1U << 7,
-        ObservationGenerationExhausted = 1U << 8,
-        ObservationWriterCollision = 1U << 9,
-        FlightGap = 1U << 10,
-        WatchdogUnavailable = 1U << 11,
-        StallReported = 1U << 12,
-        WaitStackOverflow = 1U << 13,
-        ObservationLeaseCorrupt = 1U << 14,
-        RemoteShardUnavailable = 1U << 15,
-        PolicyMissing = 1U << 16,
-        ReportDropped = 1U << 17,
-    };
+struct DiagnosticFlag final {
+    static constexpr u32 None = 0;
+    static constexpr u32 SnapshotUnstable = 1U << 1;
+    static constexpr u32 FlightWrapped = 1U << 2;
+    static constexpr u32 StorageMissing = 1U << 3;
+    static constexpr u32 ClockUnavailable = 1U << 4;
+    static constexpr u32 IrqStall = 1U << 5;
+    static constexpr u32 TrapStall = 1U << 6;
+    static constexpr u32 ObservationCapacity = 1U << 7;
+    static constexpr u32 ObservationGenerationExhausted = 1U << 8;
+    static constexpr u32 ObservationWriterCollision = 1U << 9;
+    static constexpr u32 FlightGap = 1U << 10;
+    static constexpr u32 WatchdogUnavailable = 1U << 11;
+    static constexpr u32 StallReported = 1U << 12;
+    static constexpr u32 WaitStackOverflow = 1U << 13;
+    static constexpr u32 ObservationLeaseCorrupt = 1U << 14;
+    static constexpr u32 RemoteShardUnavailable = 1U << 15;
+    static constexpr u32 PolicyMissing = 1U << 16;
+    static constexpr u32 ReportDropped = 1U << 17;
 };
 
 struct WaitToken final {
@@ -1103,79 +599,38 @@ struct WaitToken final {
     }
 };
 
-struct ObservationStore final {
-    LatencyProfile profile{};
-    DiagnosticStatus status{};
-    ObservationShard shard{};
-};
-
-static_assert(sizeof(ObservationStore) <= 4096);
-
-struct CpuDiagnosticsCore final {
-    static constexpr usize candidate_capacity = 4;
-
-    CpuLive live{};
-    WatchdogCandidate candidates[candidate_capacity]{};
-    libk::Atomic<usize> candidate_cursor{};
-    libk::Atomic<usize> scan_cursor{};
-    StallCoordinator coordinator{};
-    WaitGraphScratch graph{};
-#if MYOS_CONCURRENCY_DIAG >= 3
-    ReportQueue reports{};
-#endif
-    WatchdogPolicy policy{};
-    DiagnosticStatus fallback_status{};
-    DiagnosticStatus* status_store{};
-    LatencyProfile* profile{};
-    FlightRecorder* flight{};
-    ObservationShard* observations{};
-
-    [[nodiscard]] auto status(this auto& self) noexcept -> decltype(auto) {
-        return self.status_store == nullptr
-            ? (self.fallback_status) : (*self.status_store);
-    }
-};
-
-// A report producer runs with interrupts masked and cannot wait for a
-// scheduler lock.  The endpoint therefore publishes one callback under a
-// single atomic word: bit zero is the bound bit and the remaining bits are a
-// reader count.  A producer takes one reader reference with one CAS; a failed
-// CAS is an explicit lost wake hint, never a spin.  Teardown clears the bound
-// bit first and waits only for callbacks that already entered the endpoint.
-class ReportNotifier final {
-public:
-    using Callback = libk::delegate<bool() noexcept>;
-
-    template<auto Method, typename C>
-    [[nodiscard]] static constexpr auto bind(C& object) noexcept -> Callback {
-        return Callback::template bind<Method>(object);
-    }
-
-    // Returns false when an endpoint is already bound or teardown readers are
-    // still draining; the existing callback is never replaced in that case.
-    [[nodiscard]] auto install(Callback callback) noexcept -> bool;
-    void unbind() noexcept;
-    [[nodiscard]] auto notify() noexcept -> bool;
-
-private:
-    static constexpr u64 bound_bit = 1;
-    static constexpr u64 reader_bit = 2;
-    static constexpr u64 reader_mask =
-        libk::numeric_limits<u64>::max() & ~u64{1};
-
-    Callback callback_{};
-    libk::Atomic<u64> state_{};
-};
+using ReportCallback = libk::delegate<bool() noexcept>;
 
 [[nodiscard]] auto bind_report_notifier(
-    ReportNotifier::Callback notifier) noexcept -> bool;
+    ReportCallback notifier) noexcept -> bool;
 void unbind_report_notifier() noexcept;
 [[nodiscard]] auto drain_reports(CpuRegistry& registry) noexcept -> usize;
 
+// Opaque owner lifetime and read-only evidence facade.  These functions keep
+// provider pages, recorders, and report mailboxes out of common/public layout.
+void destroy(CpuRuntime& runtime) noexcept;
+void dump_flight(CpuId id, const CpuRuntime& runtime) noexcept;
+[[nodiscard]] auto flight_head(const CpuRuntime& runtime) noexcept -> u64;
+[[nodiscard]] auto flight_count(const CpuRuntime& runtime) noexcept -> usize;
+[[nodiscard]] auto flight_read(
+    const CpuRuntime& runtime,
+    usize index,
+    FlightRecordValue& result) noexcept -> bool;
+[[nodiscard]] auto observation_snapshot(
+    const CpuRuntime& runtime,
+    ObservationKey key,
+    ObservationSnapshot& result) noexcept -> bool;
+[[nodiscard]] auto observation_key_at(
+    const CpuRuntime& runtime,
+    usize index) noexcept -> ObservationKey;
+[[nodiscard]] auto observation_slot_count() noexcept -> usize;
+[[nodiscard]] auto observation_watched(const CpuRuntime& runtime) noexcept
+    -> u64;
+[[nodiscard]] auto status_flags(const CpuRuntime& runtime) noexcept -> u32;
+[[nodiscard]] auto report_pending(const CpuRuntime& runtime) noexcept -> bool;
+
 // These functions are the only route from hot kernel paths into the current
 // CPU diagnostic projection.  They are no-ops in the off profile.
-[[nodiscard]] auto current_core() noexcept -> CpuDiagnosticsCore*;
-[[nodiscard]] auto current_shard() noexcept -> ObservationShard*;
 [[nodiscard]] auto reserve(
     RecordKind kind,
     u64 subject_identity = 0,
@@ -1189,13 +644,6 @@ void unbind_report_notifier() noexcept;
     u64 subject_generation = 0,
     Expectation expectation = Expectation::InternalFinite,
     SourceSite site = SourceSite::current()) noexcept -> ObservationLease;
-#if MYOS_CONCURRENCY_PROBE == 13
-//Confirmatory experiment.
-// Exit condition: remove when the external fault harness can deny real
-// reservations at each reviewed Stage B production point.
-void deny_reserves(RecordKind kind, u64 subject_identity) noexcept;
-void clear_reserve_denial() noexcept;
-#endif
 
 void record(
     FlightDomain domain,
@@ -1208,18 +656,6 @@ void record(
     SourceSite site = SourceSite::current()) noexcept;
 
 void dispatch(CpuId cpu, u64 actor, u64 context, u64 tick) noexcept;
-#if MYOS_STAGE_F_PROBE
-//Confirmatory experiment.
-// Exit condition: remove with the Stage F dispatch correlation probe.
-void confirm_dispatch(
-    CpuId cpu,
-    FlightEvent event,
-    u64 outgoing,
-    u64 incoming,
-    u64 context,
-    u64 charge,
-    u64 deadline) noexcept;
-#endif
 void timer(CpuId cpu, u64 tick) noexcept;
 void trap_enter(u64 tick, u32 context) noexcept;
 void trap_exit(u64 tick) noexcept;
@@ -1239,142 +675,9 @@ void clear_wait(WaitToken token) noexcept;
     SourceSite site = SourceSite::current()) noexcept -> bool;
 void observe_wait(WaitToken token, u64 semantic_stamp) noexcept;
 [[nodiscard]] auto default_grace(Expectation expectation) noexcept -> u64;
-void mark_degraded(DiagnosticStatus::Flag flag) noexcept;
-#if MYOS_CONCURRENCY_DIAG >= 2
-void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
-#endif
-[[nodiscard]] auto analyze(
-    NodeRef root,
-    WaitGraphScratch& scratch) noexcept -> bool;
-[[nodiscard]] auto analyze(
-    ObservationKey root,
-    WaitGraphScratch& scratch) noexcept -> bool;
+void mark_degraded(u32 flag) noexcept;
 [[nodiscard]] auto stall_class_name(StallClass value) noexcept
     -> const char*;
-#if MYOS_CONCURRENCY_PROBE
-void run_probe(u32 probe) noexcept;
-#endif
-#if MYOS_CONCURRENCY_PROBE == 15 && MYOS_CONCURRENCY_DIAG >= 3
-//Confirmatory experiment.
-// Exit condition: remove after one stop-world investigation attributes the
-// ready-phase timeout to timer programming, trap delivery, or watchdog
-// candidate progression without this state snapshot.
-struct Probe15CpuState final {
-    libk::Atomic<u64> program_count{};
-    libk::Atomic<u64> program_now{};
-    libk::Atomic<u64> requested_deadline{};
-    libk::Atomic<u64> programmed_deadline{};
-    libk::Atomic<u64> watchdog_deadline{};
-    libk::Atomic<u64> program_ok{};
-    libk::Atomic<u64> timer_available{};
-    libk::Atomic<u64> watchdog_armed{};
-    libk::Atomic<u64> timer_enter_count{};
-    libk::Atomic<u64> timer_now{};
-    libk::Atomic<u64> timer_irq_off{};
-    libk::Atomic<u64> watchdog_fire_count{};
-    libk::Atomic<u64> watchdog_now{};
-    libk::Atomic<u64> watchdog_phase{};
-    libk::Atomic<u64> idle_enter_count{};
-    libk::Atomic<u64> idle_enter_now{};
-    libk::Atomic<u64> idle_enter_phase{};
-    libk::Atomic<u64> idle_return_count{};
-    libk::Atomic<u64> idle_return_now{};
-    libk::Atomic<u64> idle_return_phase{};
-    //Confirmatory experiment.
-    // Exit condition: remove after an external scheduler harness can force
-    // the wake-before-block and Blocked-to-Throttled windows externally.
-    libk::Atomic<u64> wake_credit_binding{};
-    libk::Atomic<u32> wake_credit_active{};
-    libk::Atomic<u32> wake_credit_state_throttled{};
-    libk::Atomic<u32> wake_credit_timer_queued{};
-    libk::Atomic<u32> wake_credit_accepts{};
-    libk::Atomic<u32> wake_credit_repeated{};
-    libk::Atomic<u32> wake_credit_consumed{};
-    libk::Atomic<u32> wake_credit_real_blocks{};
-    libk::Atomic<u32> wake_credit_blocked_attempted{};
-    libk::Atomic<u32> wake_credit_blocked_throttled{};
-    libk::Atomic<u32> wake_credit_blocked_credit{};
-    libk::Atomic<u32> wake_credit_reported{};
-};
-
-extern Probe15CpuState probe15_cpu_state[max_cpu_count];
-
-//Confirmatory experiment.
-// Exit condition: remove with the Stage D external timer harness once it can
-// independently mark the production watchdog deadline callback.
-void probe15_program(
-    CpuId cpu,
-    u64 now,
-    u64 requested_deadline,
-    u64 programmed_deadline,
-    bool timer_available,
-    bool program_ok,
-    bool watchdog_armed,
-    u64 watchdog_deadline) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove with the Stage D external timer harness once it can
-// independently mark timer-trap entry and watchdog callback delivery.
-void probe15_timer_enter(CpuId cpu, u64 now) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove with the Stage D external timer harness once it can
-// independently mark the production watchdog deadline callback.
-void probe15_timer_fire(CpuId cpu, u64 now) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove with the Stage D external timer harness once the
-// real deadline callback can own the report/overflow continuation.
-void probe15_after_timer(CpuId cpu) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove after the stop-world snapshot proves normal context
-// reached the idle wait boundary independently of a WFI return.
-void probe15_idle_enter(CpuId cpu) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove once the ready-phase timeout is attributed to timer
-// delivery or root-candidate progression.
-void probe15_idle_observe(CpuId cpu) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove after an external scheduler harness can force the
-// same reclaimer Binding through these state transitions.
-void probe15_wake_credit_arm(
-    CpuId cpu,
-    u64 binding,
-    bool throttled,
-    bool timer_queued,
-    bool first_accepted,
-    bool repeated_accepted) noexcept;
-void probe15_wake_credit_block(CpuId cpu, u64 binding, bool had_credit) noexcept;
-[[nodiscard]] auto probe15_wake_credit_prepare_blocked(
-    CpuId cpu,
-    u64 binding) noexcept -> bool;
-void probe15_wake_credit_blocked(
-    CpuId cpu,
-    u64 binding,
-    bool accepted,
-    bool throttled,
-    bool had_credit) noexcept;
-//Confirmatory experiment.
-// Exit condition: remove when an external watchdog harness can deterministically
-// reject the first report wake and observe the later mailbox retry.
-void probe15_arm_report_retry(CpuId cpu) noexcept;
-[[nodiscard]] auto probe15_report_retry_gate(CpuId cpu) noexcept -> bool;
-void probe15_report_retry_tick(bool notified) noexcept;
-#endif
-#if MYOS_CONCURRENCY_PROBE == 14
-//Confirmatory experiment.
-// Exit condition: remove when an external shootdown harness can pause the
-// acknowledgement callback at the same writer boundary.
-void probe14_shootdown_ack_before() noexcept;
-void probe14_shootdown_ack_after() noexcept;
-//Confirmatory experiment.
-// Exit condition: remove when an external ResourcePool harness can pause the
-// real compound publisher at the same observation boundary.
-void probe14_resource_batch_after(u64 subject_identity) noexcept;
-#endif
-#if MYOS_CONCURRENCY_PROBE == 12
-//Confirmatory experiment.
-// Exit condition: remove with the Stage G peer trap-exit fault hook.
-[[nodiscard]] auto trap_exit_stall_for_probe() noexcept -> bool;
-#endif
-
 class CpuWaitScope final {
 public:
     CpuWaitScope(

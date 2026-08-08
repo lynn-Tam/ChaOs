@@ -213,30 +213,6 @@ auto SchedulingContext::startable() const noexcept -> bool {
     return domain_ != nullptr && binding_ && !withdrawing_;
 }
 
-#if MYOS_CONCURRENCY_PROBE == 10
-void SchedulingContext::exhaust_for_probe(time::Instant now) noexcept {
-    //Confirmatory experiment.
-    // Exit condition: remove when the external scheduler harness can consume
-    // a real context budget before its first admission to the ready queue.
-    const time::Duration budget = available(now);
-    KASSERT(!budget.empty());
-    static_cast<void>(refills_.charge(now, budget));
-    KASSERT(!eligible(now) && next_refill());
-}
-#elif MYOS_CONCURRENCY_PROBE == 15
-void SchedulingContext::exhaust_for_probe(time::Instant now) noexcept {
-    //Confirmatory experiment.
-    // Exit condition: remove once an external scheduler harness can force a
-    // real continuation through state-at-entry Throttled before dispatch.
-    // Probe15 may observe an already exhausted context after production
-    // admission; preserve that state instead of widening Probe10's contract.
-    const time::Duration budget = available(now);
-    if (!budget.empty()) {
-        static_cast<void>(refills_.charge(now, budget));
-    }
-    KASSERT(!eligible(now) && next_refill());
-}
-#endif
 
 void SchedulingContext::invalidate_domain(
     void* context,

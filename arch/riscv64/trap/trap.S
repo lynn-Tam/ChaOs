@@ -26,10 +26,8 @@ arch_riscv64_trap_entry:
     // Lock profiling and concurrency CPU-live tracking share this one entry
     // timestamp. Capture after borrowed registers are safe, before stack
     // selection and TrapFrame construction add latency.
-#if MYOS_LOCK_DIAG >= 3 || MYOS_CONCURRENCY_DIAG >= 1
     rdtime t1
     sd t1, RISCV64_CPU_ENTRY_TRAP_TICK_OFFSET(t0)
-#endif
 
     ld t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
     addi t1, t1, 1

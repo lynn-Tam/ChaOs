@@ -3,17 +3,11 @@
 #include <core/types.hpp>
 #include <libk/sync/atomic.hpp>
 
-#ifndef MYOS_LOCK_DIAG
-#define MYOS_LOCK_DIAG 0
-#endif
-#ifndef MYOS_LOCK_PROBE
-#define MYOS_LOCK_PROBE 0
-#endif
-#ifndef MYOS_CONCURRENCY_DIAG
-#define MYOS_CONCURRENCY_DIAG 0
-#endif
-
 namespace kernel {
+class CpuRuntime;
+namespace mm {
+class Pmm;
+}
 namespace trap {
 class Event;
 }
@@ -21,13 +15,21 @@ class Event;
 
 namespace kernel::sync {
 
-inline constexpr usize lock_diag_level = MYOS_LOCK_DIAG;
-inline constexpr bool lock_verify = lock_diag_level >= 1;
-inline constexpr bool lock_trace = lock_diag_level >= 2
-    || MYOS_CONCURRENCY_DIAG >= 1;
-inline constexpr bool lock_profile = lock_diag_level >= 3;
-inline constexpr bool lock_runtime = lock_diag_level >= 1
-    || MYOS_CONCURRENCY_DIAG >= 1;
+enum class Level : u8 {
+    Off,
+    Verify,
+    Trace,
+    Profile,
+};
+
+// The selected provider owns this value. Consumers only cross this stable
+// typed boundary; provider policy must not alter common object layout.
+extern const Level level;
+[[nodiscard]] auto enabled(Level required) noexcept -> bool;
+
+[[nodiscard]] auto provision(
+    CpuRuntime& runtime,
+    mm::Pmm& pmm) noexcept -> bool;
 
 enum class LockClass : u8 {
     Pmm,
@@ -63,10 +65,6 @@ enum class LockClass : u8 {
     Irq,
     IrqRegistry,
     Terminal,
-#if MYOS_LOCK_PROBE
-    ProbeA,
-    ProbeB,
-#endif
     Count,
 };
 
@@ -219,17 +217,11 @@ struct CpuLockTrace final {
     libk::Atomic<u64> hardware_irq_start{};
     libk::Atomic<u64> hardware_irq_max{};
     libk::Atomic<u64> explicit_irq_max{};
-#if MYOS_LOCK_DIAG >= 3
     LockProfile* profile{};
-#endif
 };
 
 [[nodiscard]] auto before_acquire(LockRef lock, LockSite site) noexcept
     -> LockCookie;
-#if MYOS_LOCK_PROBE
-[[nodiscard]] auto before_wait_probe(LockRef lock, LockSite site) noexcept
-    -> LockCookie;
-#endif
 [[nodiscard]] auto after_acquire(
     LockRef lock, LockSite site, LockCookie cookie) noexcept -> LockCookie;
 [[nodiscard]] auto before_try(LockRef lock, LockSite site) noexcept
@@ -250,7 +242,6 @@ void panic_enter() noexcept;
 void assert_no_locks(LockSite site = LockSite::current()) noexcept;
 void assert_held(LockRef lock, LockSite site = LockSite::current()) noexcept;
 void dump_diagnostics() noexcept;
-void run_probe(u32 probe) noexcept;
 
 [[nodiscard]] auto lock_class_name(LockClass lock_class) noexcept
     -> const char*;

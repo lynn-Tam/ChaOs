@@ -126,10 +126,8 @@ private:
         time::Instant now) noexcept;
     void publish(execution::Target target) noexcept;
     void program_deadline(time::Instant now) noexcept;
-#if MYOS_CONCURRENCY_DIAG >= 3
     void arm_watchdog(time::Instant now) noexcept;
     void watchdog_fire() noexcept;
-#endif
     void post_switch() noexcept;
     [[nodiscard]] auto stop(execution::Target target) noexcept
         -> StopDisposition;
@@ -171,10 +169,8 @@ private:
     bool ipi_available_{};
     time::Duration pending_charge_{};
     time::Instant programmed_deadline_{time::Instant::max()};
-#if MYOS_CONCURRENCY_DIAG >= 3
     time::Duration watchdog_period_{};
     Deadline watchdog_deadline_;
-#endif
 };
 
 void yield() noexcept;

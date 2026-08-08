@@ -76,26 +76,6 @@ public:
         -> const kernel::object::ObjectStore::MemoryHold& {
         return image_;
     }
-#if MYOS_CONCURRENCY_PROBE
-    //Confirmatory experiment.
-    // Exit condition: remove when the external scenario runner can create a
-    // real blocked syscall operation and pause its producer.
-    [[nodiscard]] auto run_concurrency_probe(
-        kernel::CpuRegistry& cpus,
-        u32 probe) noexcept -> bool;
-#if MYOS_CONCURRENCY_PROBE == 13
-    [[nodiscard]] auto prepare_stage_b_operation(
-        kernel::CpuRegistry& cpus,
-        bool deny_observation = false) noexcept -> bool;
-    [[nodiscard]] auto stage_b_operation() noexcept
-        -> kernel::operation::Completion&;
-    [[nodiscard]] auto stage_b_wait() noexcept -> kernel::operation::Wait&;
-    void stage_b_complete_operation() noexcept;
-    [[nodiscard]] auto stage_b_release_count() const noexcept -> usize;
-    void finish_stage_b_operation() noexcept;
-#endif
-#endif
-
 private:
     [[nodiscard]] auto reserve(kernel::resource::Budget charge) noexcept
         -> libk::Expected<kernel::resource::Reservation, RootTaskError>;
