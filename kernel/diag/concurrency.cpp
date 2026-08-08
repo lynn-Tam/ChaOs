@@ -219,20 +219,26 @@ struct WatchdogThresholds final {
     StallClass classification,
     EvidenceGrade evidence,
     u64 age,
+    const ObservationSnapshot* root_snapshot,
     const WaitGraphScratch& graph) noexcept -> bool {
     CpuDiagnosticsCore* const core = current_core();
     if (core == nullptr) {
         return false;
     }
-    const bool queued = core->reports.publish(ReportRecord{
-        watcher,
-        target,
-        root,
-        state,
-        classification,
-        evidence,
-        age,
-        graph});
+    ReportRecord report{
+        .watcher = watcher,
+        .target = target,
+        .root = root,
+        .state = state,
+        .classification = classification,
+        .evidence = evidence,
+        .age = age,
+        .root_snapshot = root_snapshot != nullptr ? *root_snapshot
+                                                    : ObservationSnapshot{},
+        .root_snapshot_valid = root_snapshot != nullptr,
+        .graph = graph,
+    };
+    const bool queued = core->reports.publish(report);
     if (!queued) {
         static_cast<void>(core->status().flags.fetch_or<
             libk::MemoryOrder::Release>(DiagnosticStatus::ReportDropped));
@@ -2369,6 +2375,65 @@ auto drain_reports(CpuRegistry& registry) noexcept -> usize {
                 report.graph.pending_shown,
                 report.graph.pending_total,
                 report.graph.pending_omitted);
+            if (report.root_snapshot_valid) {
+                const auto& snapshot = report.root_snapshot;
+                diag::console::print<
+                    "  root-snapshot gen={} kind={} phase={} wait={} "
+                    "expectation={} subject={:#x} subject-gen={} "
+                    "activity={} progress={} started={} last-activity={} "
+                    "last-progress={} evidence={} semantic={}\n">(
+                    snapshot.generation,
+                    static_cast<u32>(snapshot.record_kind),
+                    snapshot.phase,
+                    static_cast<u32>(snapshot.wait_kind),
+                    static_cast<u32>(snapshot.expectation),
+                    snapshot.subject_identity,
+                    snapshot.subject_generation,
+                    snapshot.activity_epoch,
+                    snapshot.progress_epoch,
+                    snapshot.started_at,
+                    snapshot.last_activity_at,
+                    snapshot.last_progress_at,
+                    static_cast<u32>(snapshot.evidence),
+                    snapshot.semantic_stamp);
+                diag::console::print<
+                    "  root-relation wait-key={:#x} driver-kind={} "
+                    "driver={:#x} driver-gen={} blocker-kind={} "
+                    "blocker={:#x} blocker-gen={} site={}:{} function={} "
+                    "detail={:#x},{:#x},{:#x},{:#x}\n">(
+                    snapshot.wait_target.raw,
+                    static_cast<u32>(snapshot.driver.kind),
+                    snapshot.driver.identity,
+                    snapshot.driver.generation,
+                    static_cast<u32>(snapshot.blocker.kind),
+                    snapshot.blocker.identity,
+                    snapshot.blocker.generation,
+                    snapshot.site.file,
+                    snapshot.site.line,
+                    snapshot.site.function,
+                    snapshot.detail[0],
+                    snapshot.detail[1],
+                    snapshot.detail[2],
+                    snapshot.detail[3]);
+                diag::console::print<
+                    "  root-policy kind={} expectation={} action={} "
+                    "driver-kind={} driver={:#x} driver-gen={} "
+                    "deadline-driver-kind={} deadline-driver={:#x} "
+                    "deadline-driver-gen={} deadline={} grace={}\n">(
+                    static_cast<u32>(snapshot.policy.kind),
+                    static_cast<u32>(snapshot.policy.expectation),
+                    static_cast<u32>(snapshot.policy.action),
+                    static_cast<u32>(snapshot.policy.driver.kind),
+                    snapshot.policy.driver.identity,
+                    snapshot.policy.driver.generation,
+                    static_cast<u32>(snapshot.policy.deadline_driver.kind),
+                    snapshot.policy.deadline_driver.identity,
+                    snapshot.policy.deadline_driver.generation,
+                    snapshot.policy.deadline,
+                    snapshot.policy.grace);
+            } else {
+                diag::console::print<"  root-snapshot unavailable\n">();
+            }
             for (usize node = 0; node < report.graph.count; ++node) {
                 const NodeRef value = report.graph.node(node);
                 diag::console::print<
@@ -2713,7 +2778,9 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
     const auto process = [&](StallFingerprint sample,
                              WatchdogThresholds thresholds,
                              StallAction action,
-                             WaitKind wait_kind) noexcept -> bool {
+                             WaitKind wait_kind,
+                             const ObservationSnapshot* root_snapshot = nullptr)
+        noexcept -> bool {
         WatchdogCandidate* slot{};
         usize slot_index{};
         for (usize index = 0;
@@ -2910,6 +2977,7 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                     graph.classification,
                     graph.evidence,
                     age,
+                    root_snapshot,
                     graph)) {
                 static_cast<void>(target_core->status().flags.fetch_or<
                     libk::MemoryOrder::Release>(
@@ -3049,7 +3117,8 @@ void watchdog_tick(CpuId cpu, u64 tick) noexcept {
                 snapshot.blocker},
             thresholds,
             snapshot.policy.action,
-            snapshot.wait_kind)) {
+            snapshot.wait_kind,
+            &snapshot)) {
             ++accepted;
         }
     }
@@ -3423,9 +3492,12 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
             continue;
         }
         diag::console::print<
-            "  {} tick={} domain={} event={} actor={:#x} subject={:#x} "
-            "a0={:#x} a1={:#x} a2={:#x} site={}:{}\n">(
+            "  index={} sequence={} absolute={} tick={} domain={} event={} "
+            "actor={:#x} subject={:#x} a0={:#x} a1={:#x} a2={:#x} "
+            "site={}:{} function={}\n">(
             index,
+            record_value.sequence,
+            record_value.absolute_id,
             record_value.tick,
             static_cast<u32>(record_value.domain),
             static_cast<u32>(record_value.event),
@@ -3435,7 +3507,8 @@ void dump_flight(CpuId id, const FlightRecorder& flight) noexcept {
             record_value.arg1,
             record_value.arg2,
             record_value.site.file,
-            record_value.site.line);
+            record_value.site.line,
+            record_value.site.function);
     }
 }
 

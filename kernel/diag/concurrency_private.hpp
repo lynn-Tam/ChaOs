@@ -403,6 +403,10 @@ struct ReportRecord final {
     StallClass classification{StallClass::None};
     EvidenceGrade evidence{EvidenceGrade::None};
     u64 age{};
+    // Bounded root evidence captured by watchdog analysis. Report consumers
+    // must not reread canonical state and reconstruct a cross-epoch view.
+    ObservationSnapshot root_snapshot{};
+    bool root_snapshot_valid{};
     WaitGraphScratch graph{};
 };
 

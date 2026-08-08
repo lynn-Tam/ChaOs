@@ -601,10 +601,12 @@ void print_concurrency(
     }
 
     if (core.observations != nullptr) {
-        const u64 watched = core.observations->watched();
+        // Panic consumes every still-active bounded record.  `watched` is a
+        // watchdog scan hint, not the retained-artifact directory.
+        const u64 allocated = core.observations->allocated();
         for (usize index = 0; index < concurrency::ObservationShard::slot_count;
              ++index) {
-            if ((watched & (u64{1} << index)) == 0) {
+            if ((allocated & (u64{1} << index)) == 0) {
                 continue;
             }
             const concurrency::ObservationKey key =
@@ -615,22 +617,61 @@ void print_concurrency(
                 continue;
             }
             panic_print<
-                "    observation[{}] key={:#x} kind={} phase={} wait={} "
-                "activity={} progress={} driver={:#x} blocker={:#x} "
-                "d0={:#x} d1={:#x} d2={:#x} d3={:#x}\n">(
+                "    observation[{}] key={:#x} gen={} kind={} phase={} "
+                "wait={} expectation={} subject={:#x} subject-gen={} "
+                "activity={} progress={} started={} last-activity={} "
+                "last-progress={} evidence={} semantic={} wait-key={:#x}\n">(
                 index,
                 key.raw,
+                snapshot.generation,
                 static_cast<u32>(snapshot.record_kind),
                 snapshot.phase,
                 static_cast<u32>(snapshot.wait_kind),
+                static_cast<u32>(snapshot.expectation),
+                snapshot.subject_identity,
+                snapshot.subject_generation,
                 snapshot.activity_epoch,
                 snapshot.progress_epoch,
+                snapshot.started_at,
+                snapshot.last_activity_at,
+                snapshot.last_progress_at,
+                static_cast<u32>(snapshot.evidence),
+                snapshot.semantic_stamp,
+                snapshot.wait_target.raw);
+            panic_print<
+                "      driver-kind={} driver={:#x} driver-gen={} "
+                "blocker-kind={} blocker={:#x} blocker-gen={} "
+                "site={}:{} function={} detail={:#x},{:#x},{:#x},{:#x}\n">(
+                static_cast<u32>(snapshot.driver.kind),
                 snapshot.driver.identity,
+                snapshot.driver.generation,
+                static_cast<u32>(snapshot.blocker.kind),
                 snapshot.blocker.identity,
+                snapshot.blocker.generation,
+                snapshot.site.file,
+                snapshot.site.line,
+                snapshot.site.function,
                 snapshot.detail[0],
                 snapshot.detail[1],
                 snapshot.detail[2],
                 snapshot.detail[3]);
+            panic_print<
+                "      policy-kind={} policy-expectation={} action={} "
+                "policy-driver-kind={} policy-driver={:#x} "
+                "policy-driver-gen={} deadline-driver-kind={} "
+                "deadline-driver={:#x} deadline-driver-gen={} "
+                "deadline={} grace={}\n">(
+                static_cast<u32>(snapshot.policy.kind),
+                static_cast<u32>(snapshot.policy.expectation),
+                static_cast<u32>(snapshot.policy.action),
+                static_cast<u32>(snapshot.policy.driver.kind),
+                snapshot.policy.driver.identity,
+                snapshot.policy.driver.generation,
+                static_cast<u32>(snapshot.policy.deadline_driver.kind),
+                snapshot.policy.deadline_driver.identity,
+                snapshot.policy.deadline_driver.generation,
+                snapshot.policy.deadline,
+                snapshot.policy.grace);
         }
     }
 
@@ -687,16 +728,23 @@ void print_concurrency(
                 continue;
             }
             panic_print<
-                "    flight[{}] t={} d={} e={} actor={:#x} subject={:#x} "
-                "a0={:#x} a1={:#x}\n">(
+                "    flight[{}] sequence={} absolute={} t={} d={} e={} "
+                "actor={:#x} subject={:#x} a0={:#x} a1={:#x} a2={:#x} "
+                "site={}:{} function={}\n">(
                 index,
+                record.sequence,
+                record.absolute_id,
                 record.tick,
                 static_cast<u32>(record.domain),
                 static_cast<u32>(record.event),
                 record.actor,
                 record.subject,
                 record.arg0,
-                record.arg1);
+                record.arg1,
+                record.arg2,
+                record.site.file,
+                record.site.line,
+                record.site.function);
         }
     }
 #endif
@@ -788,9 +836,19 @@ void print_peers(const PanicSlot& owner) noexcept {
         if (id == owner.cpu) {
             panic_print<"  cpu {}: owner\n">(id.raw);
         } else if (state == PanicSlotState::Stopped) {
-            panic_print<"  cpu {}: stopped pc={:#018x}\n">(
+            const arch::UnwindSeed seed = slot.has_full_trap
+                ? arch::unwind_seed(slot.trap)
+                : slot.call_site;
+            panic_print<
+                "  cpu {}: stopped pc={:#018x} sp={:#018x} "
+                "fp={:#018x} ra={:#018x}\n">(
                 id.raw,
-                slot.has_full_trap ? slot.trap.pc : slot.call_site.pc);
+                seed.pc,
+                seed.sp,
+                seed.frame_pointer,
+                seed.return_address);
+            print_snapshot(slot);
+            print_backtrace(slot);
         } else {
             panic_print<"  cpu {}: no acknowledgement\n">(id.raw);
         }
