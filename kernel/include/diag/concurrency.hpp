@@ -609,7 +609,6 @@ void unbind_report_notifier() noexcept;
 // Opaque owner lifetime and read-only evidence facade.  These functions keep
 // provider pages, recorders, and report mailboxes out of common/public layout.
 void destroy(CpuRuntime& runtime) noexcept;
-void dump_flight(CpuId id, const CpuRuntime& runtime) noexcept;
 [[nodiscard]] auto flight_head(const CpuRuntime& runtime) noexcept -> u64;
 [[nodiscard]] auto flight_count(const CpuRuntime& runtime) noexcept -> usize;
 [[nodiscard]] auto flight_read(

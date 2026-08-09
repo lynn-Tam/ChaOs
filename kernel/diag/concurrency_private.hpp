@@ -461,7 +461,6 @@ struct CpuDiagnosticsCore final {
     }
 };
 
-void dump_flight(CpuId id, const FlightRecorder& flight) noexcept;
 [[nodiscard]] auto analyze(NodeRef root, WaitGraphScratch& scratch) noexcept
     -> bool;
 [[nodiscard]] auto analyze(ObservationKey root,

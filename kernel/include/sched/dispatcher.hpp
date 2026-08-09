@@ -107,7 +107,6 @@ public:
     void refresh() noexcept;
     void disable_preemption() noexcept;
     void enable_preemption() noexcept;
-    void dump_trace() const noexcept;
 
 private:
     enum class StopDisposition : u8 {

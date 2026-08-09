@@ -242,10 +242,21 @@ CORE_INPUTS := arch=$(ARCH)|isa=$(RISCV_ARCH)|abi=$(RISCV_ABI)|toolchain=$(TOOLC
 CORE_HASH := $(shell printf '%s' "$(CORE_INPUTS)" | sha256sum | cut -c1-16)
 CORE_KEY := $(ARCH)-$(CORE_HASH)
 CORE_DIR := build/core/$(CORE_KEY)
-DIAG_INPUTS := core=$(CORE_INPUTS)|lock=$(LOCK_DIAG_LEVEL)|conc=$(CONCURRENCY_DIAG_LEVEL)|panic=$(PANIC_PROBE)|cxxflags=$(CXXFLAGS) -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) -DMYOS_PANIC_PROBE=$(PANIC_PROBE)
-DIAG_HASH := $(shell printf '%s' "$(DIAG_INPUTS)" | sha256sum | cut -c1-16)
-DIAG_KEY := $(subst /,_,$(subst :,_,$(LOCK_DIAG)-$(CONCURRENCY_DIAG)-panic$(PANIC_PROBE)-$(DIAG_HASH)))
-DIAG_DIR := build/module/diag/$(CORE_KEY)-$(DIAG_KEY)
+CONCURRENCY_INPUTS := core=$(CORE_INPUTS)|conc=$(CONCURRENCY_DIAG_LEVEL)|cxxflags=$(CXXFLAGS) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+CONCURRENCY_HASH := $(shell printf '%s' "$(CONCURRENCY_INPUTS)" | sha256sum | cut -c1-16)
+CONCURRENCY_KEY := $(subst /,_,$(subst :,_,$(CONCURRENCY_DIAG)-$(CONCURRENCY_HASH)))
+CONCURRENCY_DIR := build/module/concurrency/$(CORE_KEY)-$(CONCURRENCY_KEY)
+LOCK_INPUTS := core=$(CORE_INPUTS)|lock=$(LOCK_DIAG_LEVEL)|conc=$(CONCURRENCY_DIAG_LEVEL)|cxxflags=$(CXXFLAGS) -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+LOCK_HASH := $(shell printf '%s' "$(LOCK_INPUTS)" | sha256sum | cut -c1-16)
+LOCK_KEY := $(subst /,_,$(subst :,_,$(LOCK_DIAG)-$(CONCURRENCY_DIAG)-$(LOCK_HASH)))
+LOCK_DIR := build/module/lock/$(CORE_KEY)-$(LOCK_KEY)
+CONSUMER_DIR := build/module/consumer/$(CORE_KEY)
+REPORT_INPUTS := core=$(CORE_INPUTS)|conc=$(CONCURRENCY_DIAG_LEVEL)|cxxflags=$(CXXFLAGS) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+REPORT_HASH := $(shell printf '%s' "$(REPORT_INPUTS)" | sha256sum | cut -c1-16)
+REPORT_DIR := build/module/report/$(CORE_KEY)-$(CONCURRENCY_DIAG)-$(REPORT_HASH)
+PANIC_INPUTS := core=$(CORE_INPUTS)|lock=$(LOCK_DIAG_LEVEL)|conc=$(CONCURRENCY_DIAG_LEVEL)|panic=$(PANIC_PROBE)|cxxflags=$(CXXFLAGS) -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL) -DMYOS_PANIC_PROBE=$(PANIC_PROBE)
+PANIC_HASH := $(shell printf '%s' "$(PANIC_INPUTS)" | sha256sum | cut -c1-16)
+PANIC_DIR := build/module/panic/$(CORE_KEY)-$(PANIC_PROBE)-$(PANIC_HASH)
 SCENARIO_INPUTS := core=$(CORE_INPUTS)|cxxflags=$(CXXFLAGS)|selector-source=kernel/diag/scenario_real.cpp
 SCENARIO_HASH := $(shell printf '%s' "$(SCENARIO_INPUTS)" | sha256sum | cut -c1-16)
 SCENARIO_DIR := build/module/scenario/$(CORE_KEY)-$(SCENARIO_HASH)
@@ -253,10 +264,14 @@ TEST_INPUTS := core=$(CORE_INPUTS)|cxxflags=$(CXXFLAGS) -fomit-frame-pointer -fo
 TEST_HASH := $(shell printf '%s' "$(TEST_INPUTS)" | sha256sum | cut -c1-16)
 TEST_DIR := build/module/test/$(CORE_KEY)-$(TEST_HASH)
 CORE_CONFIG := $(CORE_DIR)/config
-DIAG_CONFIG := $(DIAG_DIR)/config
+CONCURRENCY_CONFIG := $(CONCURRENCY_DIR)/config
+LOCK_CONFIG := $(LOCK_DIR)/config
+CONSUMER_CONFIG := $(CONSUMER_DIR)/config
+REPORT_CONFIG := $(REPORT_DIR)/config
+PANIC_CONFIG := $(PANIC_DIR)/config
 SCENARIO_CONFIG := $(SCENARIO_DIR)/config
 TEST_CONFIG := $(TEST_DIR)/config
-MODULE_CONFIGS := $(CORE_CONFIG) $(DIAG_CONFIG) $(SCENARIO_CONFIG) $(TEST_CONFIG)
+MODULE_CONFIGS := $(CORE_CONFIG) $(CONCURRENCY_CONFIG) $(LOCK_CONFIG) $(CONSUMER_CONFIG) $(REPORT_CONFIG) $(PANIC_CONFIG) $(SCENARIO_CONFIG) $(TEST_CONFIG)
 VTABLE_ALLOWLIST_PREFIXES = $(CORE_DIR)/kernel/object/
 
 USER_COMMON_FLAGS := -ffreestanding -Wall -Wextra -Werror -O2 -g3 \
@@ -450,9 +465,13 @@ PROOF_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(PROOF_USER_SRCS:=.o))
 UART_USER_OBJS := $(addprefix $(USER_BUILD_DIR)/,$(UART_USER_SRCS:=.o))
 
 IMAGE_SRCS := $(filter kernel/image/build_info.cpp,$(KERNEL_SRCS))
-DIAG_SRCS := $(filter-out kernel/diag/scenario_%.cpp,$(filter kernel/diag/%.cpp kernel/sync/lock.cpp,$(KERNEL_SRCS)))
+CONSUMER_SRCS := kernel/diag/console.cpp
+REPORT_SRCS := kernel/diag/report_drain.cpp
+PANIC_SRCS := kernel/diag/panic.cpp
+CONCURRENCY_SRCS := $(filter-out kernel/diag/scenario_%.cpp $(CONSUMER_SRCS) $(REPORT_SRCS) $(PANIC_SRCS),$(filter kernel/diag/%.cpp,$(KERNEL_SRCS)))
+LOCK_SRCS := $(filter kernel/sync/lock.cpp,$(KERNEL_SRCS))
 SCENARIO_SRCS :=
-CORE_KERNEL_SRCS := $(filter-out $(IMAGE_SRCS) $(DIAG_SRCS) $(SCENARIO_SRCS),$(KERNEL_SRCS))
+CORE_KERNEL_SRCS := $(filter-out $(IMAGE_SRCS) $(CONCURRENCY_SRCS) $(LOCK_SRCS) $(CONSUMER_SRCS) $(REPORT_SRCS) $(PANIC_SRCS) $(SCENARIO_SRCS),$(KERNEL_SRCS))
 CORE_SRCS := $(ARCH_SRCS) $(CORE_KERNEL_SRCS)
 ifeq ($(ENABLE_TESTS),1)
 TEST_IMAGE_SRCS := $(TEST_SRCS)
@@ -463,7 +482,11 @@ endif
 CORE_C_SRCS := $(filter %.c,$(CORE_SRCS))
 CORE_CPP_SRCS := $(filter %.cpp,$(CORE_SRCS))
 CORE_S_SRCS := $(filter %.S,$(CORE_SRCS))
-DIAG_CPP_SRCS := $(filter %.cpp,$(DIAG_SRCS))
+CONCURRENCY_CPP_SRCS := $(filter %.cpp,$(CONCURRENCY_SRCS))
+LOCK_CPP_SRCS := $(filter %.cpp,$(LOCK_SRCS))
+CONSUMER_CPP_SRCS := $(filter %.cpp,$(CONSUMER_SRCS))
+REPORT_CPP_SRCS := $(filter %.cpp,$(REPORT_SRCS))
+PANIC_CPP_SRCS := $(filter %.cpp,$(PANIC_SRCS))
 SCENARIO_CPP_SRCS := $(filter %.cpp,$(SCENARIO_SRCS))
 IMAGE_CPP_SRCS := $(filter %.cpp,$(IMAGE_SRCS))
 TEST_CPP_SRCS := $(filter %.cpp,$(TEST_IMAGE_SRCS))
@@ -471,7 +494,11 @@ TEST_CPP_SRCS := $(filter %.cpp,$(TEST_IMAGE_SRCS))
 CORE_C_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_C_SRCS:.c=.c.o))
 CORE_CPP_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_CPP_SRCS:.cpp=.cpp.o))
 CORE_S_OBJS := $(addprefix $(CORE_DIR)/,$(CORE_S_SRCS:.S=.S.o))
-DIAG_CPP_OBJS := $(addprefix $(DIAG_DIR)/,$(DIAG_CPP_SRCS:.cpp=.cpp.o))
+CONCURRENCY_CPP_OBJS := $(addprefix $(CONCURRENCY_DIR)/,$(CONCURRENCY_CPP_SRCS:.cpp=.cpp.o))
+LOCK_CPP_OBJS := $(addprefix $(LOCK_DIR)/,$(LOCK_CPP_SRCS:.cpp=.cpp.o))
+CONSUMER_CPP_OBJS := $(addprefix $(CONSUMER_DIR)/,$(CONSUMER_CPP_SRCS:.cpp=.cpp.o))
+REPORT_CPP_OBJS := $(addprefix $(REPORT_DIR)/,$(REPORT_CPP_SRCS:.cpp=.cpp.o))
+PANIC_CPP_OBJS := $(addprefix $(PANIC_DIR)/,$(PANIC_CPP_SRCS:.cpp=.cpp.o))
 SCENARIO_CPP_OBJS := $(addprefix $(SCENARIO_DIR)/,$(SCENARIO_CPP_SRCS:.cpp=.cpp.o))
 SCENARIO_SELECTOR_OBJ := $(SCENARIO_DIR)/selector-$(SCENARIO_KEY).cpp.o
 IMAGE_CPP_OBJS := $(IMAGE_BUILD_INFO_OBJ)
@@ -479,15 +506,15 @@ TEST_CPP_OBJS := $(addprefix $(TEST_DIR)/,$(TEST_CPP_SRCS:.cpp=.cpp.o))
 TEST_PROVIDER_SRC := $(if $(filter 1,$(ENABLE_TESTS)),test/boot.cpp,kernel/diag/test_off.cpp)
 TEST_PROVIDER_OBJ := $(TEST_DIR)/test_boot_provider-$(ENABLE_TESTS).cpp.o
 REPORT_GATE_SRC := $(if $(filter 1,$(ENABLE_TESTS)),test/scenario_gate.cpp,kernel/diag/scenario_gate_off.cpp)
-REPORT_GATE_OBJ := $(if $(filter 1,$(ENABLE_TESTS)),$(TEST_DIR)/scenario_gate.cpp.o,$(DIAG_DIR)/scenario_gate_off.cpp.o)
+REPORT_GATE_OBJ := $(TEST_DIR)/scenario_gate-$(ENABLE_TESTS).cpp.o
 
 CORE_OBJS := $(CORE_S_OBJS) $(CORE_C_OBJS) $(CORE_CPP_OBJS)
-MODULE_OBJS := $(DIAG_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(SCENARIO_SELECTOR_OBJ) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(REPORT_GATE_OBJ) $(TEST_CPP_OBJS)
+MODULE_OBJS := $(CONCURRENCY_CPP_OBJS) $(LOCK_CPP_OBJS) $(CONSUMER_CPP_OBJS) $(REPORT_CPP_OBJS) $(PANIC_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(SCENARIO_SELECTOR_OBJ) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(REPORT_GATE_OBJ) $(TEST_CPP_OBJS)
 OBJS := $(CORE_OBJS) $(MODULE_OBJS)
 DEPS := $(OBJS:.o=.d)
-CPP_OBJS := $(CORE_CPP_OBJS) $(DIAG_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(TEST_CPP_OBJS)
+CPP_OBJS := $(CORE_CPP_OBJS) $(CONCURRENCY_CPP_OBJS) $(LOCK_CPP_OBJS) $(CONSUMER_CPP_OBJS) $(REPORT_CPP_OBJS) $(PANIC_CPP_OBJS) $(SCENARIO_CPP_OBJS) $(IMAGE_CPP_OBJS) $(TEST_PROVIDER_OBJ) $(TEST_CPP_OBJS)
 CPP_STACK_USAGE := $(CPP_OBJS:.o=.su)
-CLANG_CPP_SRCS := $(CORE_CPP_SRCS) $(DIAG_CPP_SRCS) $(SCENARIO_CPP_SRCS) $(IMAGE_CPP_SRCS)
+CLANG_CPP_SRCS := $(CORE_CPP_SRCS) $(CONCURRENCY_CPP_SRCS) $(LOCK_CPP_SRCS) $(CONSUMER_CPP_SRCS) $(REPORT_CPP_SRCS) $(PANIC_CPP_SRCS) $(SCENARIO_CPP_SRCS) $(IMAGE_CPP_SRCS)
 
 all: $(TARGET) audit-boot-stack
 
@@ -506,8 +533,24 @@ $(CORE_CONFIG): FORCE
 	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(CORE_INPUTS)' > "$$tmp"; \
 	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
 
-$(DIAG_CONFIG): FORCE
-	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(DIAG_INPUTS)' > "$$tmp"; \
+$(CONCURRENCY_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(CONCURRENCY_INPUTS)|sources=$(CONCURRENCY_SRCS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(LOCK_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(LOCK_INPUTS)|sources=$(LOCK_SRCS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(CONSUMER_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(CORE_INPUTS)|consumer=$(CONSUMER_SRCS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(REPORT_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(REPORT_INPUTS)|sources=$(REPORT_SRCS)' > "$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
+
+$(PANIC_CONFIG): FORCE
+	@mkdir -p $(dir $@); tmp="$@.tmp"; printf '%s\n' '$(PANIC_INPUTS)|sources=$(PANIC_SRCS)' > "$$tmp"; \
 	if test -r "$@" && cmp -s "$$tmp" "$@"; then rm -f "$$tmp"; else mv -f "$$tmp" "$@"; fi
 
 $(SCENARIO_CONFIG): FORCE
@@ -530,13 +573,36 @@ $(CORE_DIR)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -MMD -MP -c $< -o $@
 
-# Diagnostic providers are the only objects that receive level policy.  Core
-# callers compile against the stable ABI with no provider-selection macro.
-$(DIAG_DIR)/%.cpp.o: CXXFLAGS += \
+# Concurrency providers receive only the concurrency level. Core callers
+# compile against the stable ABI with no provider-selection macro.
+$(CONCURRENCY_DIR)/%.cpp.o: CXXFLAGS += \
+            -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+$(CONCURRENCY_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(LOCK_DIR)/%.cpp.o: CXXFLAGS += \
+            -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
+            -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+$(LOCK_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(CONSUMER_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(REPORT_DIR)/%.cpp.o: CXXFLAGS += \
+            -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
+$(REPORT_DIR)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(PANIC_DIR)/%.cpp.o: CXXFLAGS += \
             -DMYOS_PANIC_PROBE=$(PANIC_PROBE) \
             -DMYOS_LOCK_DIAG=$(LOCK_DIAG_LEVEL) \
             -DMYOS_CONCURRENCY_DIAG=$(CONCURRENCY_DIAG_LEVEL)
-$(DIAG_DIR)/%.cpp.o: %.cpp
+$(PANIC_DIR)/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 

@@ -997,16 +997,6 @@ void CpuDispatcher::record_dispatch(
     pending_charge_ = {};
 }
 
-void CpuDispatcher::dump_trace() const noexcept {
-    if (!diag::concurrency::enabled(diag::concurrency::Level::Trace)) {
-        return;
-    }
-    if (cpu_ == nullptr || cpu_->runtime_ == nullptr) {
-        return;
-    }
-    diag::concurrency::dump_flight(id_, *cpu_->runtime_);
-}
-
 void CpuDispatcher::post_switch() noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(cpu_->current_execution_ == &current_.execution());
