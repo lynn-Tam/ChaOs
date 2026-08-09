@@ -1,7 +1,12 @@
 /*
 !/.gitignore
 !/README.md
-!/Makefile
+!/meson.build
+!/meson.options
+!/cross/
+!/cross/**
+!/tools/
+!/tools/**
 !/arch/
 !/arch/**
 !/kernel/

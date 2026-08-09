@@ -1,0 +1,301 @@
+project(
+  'myos',
+  ['c', 'cpp'],
+  version: '0.1.0',
+  default_options: ['c_std=gnu11', 'cpp_std=gnu++23', 'buildtype=plain', 'b_ndebug=true', 'b_pie=false', 'b_staticpic=false'],
+)
+
+profile = get_option('profile')
+enable_tests = profile != 'kernel'
+
+lock_diag_name = get_option('lock_diag')
+if lock_diag_name == 'auto'
+  lock_diag_name = profile == 'kernel' ? 'off' : 'trace'
+endif
+lock_diag_level = 0
+if lock_diag_name == 'verify'
+  lock_diag_level = 1
+elif lock_diag_name == 'trace'
+  lock_diag_level = 2
+elif lock_diag_name == 'profile'
+  lock_diag_level = 3
+endif
+
+concurrency_diag_name = get_option('concurrency_diag')
+if concurrency_diag_name == 'auto'
+  concurrency_diag_name = profile == 'kernel' ? 'off' : 'trace'
+endif
+concurrency_diag_level = 0
+if concurrency_diag_name == 'snapshot'
+  concurrency_diag_level = 1
+elif concurrency_diag_name == 'trace'
+  concurrency_diag_level = 2
+elif concurrency_diag_name == 'watch'
+  concurrency_diag_level = 3
+elif concurrency_diag_name == 'profile'
+  concurrency_diag_level = 4
+endif
+
+scenario_name = get_option('scenario')
+scenario_id = 0
+if scenario_name == 'ordinary'
+  scenario_id = 1
+elif scenario_name == 'initrd'
+  scenario_id = 2
+elif scenario_name == 'trap'
+  scenario_id = 3
+elif scenario_name == 'remote'
+  scenario_id = 4
+elif scenario_name == 'publication'
+  scenario_id = 5
+elif scenario_name == 'report'
+  scenario_id = 6
+elif scenario_name == 'dispatch'
+  scenario_id = 7
+elif scenario_name == 'observer'
+  scenario_id = 8
+endif
+
+root = meson.project_source_root()
+kernel_common_args = [
+  '-ffreestanding', '-Wall', '-Wextra', '-O2', '-g3',
+  '-march=rv64gc', '-mabi=lp64d', '-mcmodel=medany', '-msmall-data-limit=0',
+  '-I' + root, '-I' + join_paths(root, 'kernel'), '-I' + join_paths(root, 'kernel/include'),
+  '-I' + join_paths(root, 'arch/riscv64/include'),
+]
+kernel_c_args = kernel_common_args + ['-Werror=implicit-function-declaration']
+kernel_cpp_args = kernel_common_args + [
+  '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit',
+  '-fno-omit-frame-pointer', '-fno-optimize-sibling-calls', '-fstack-usage',
+]
+kernel_link_args = [
+  '-march=rv64gc', '-mabi=lp64d', '-nostdlib',
+  '-Wl,-T,' + join_paths(root, 'arch/riscv64/linker.ld'),
+  '-Wl,-Map,' + join_paths(meson.current_build_dir(), 'kernel.map'),
+]
+
+arch_sources = files(
+  'arch/riscv64/boot/entry.S', 'arch/riscv64/boot/early_entry.S',
+  'arch/riscv64/boot/high_entry.cpp', 'arch/riscv64/boot/kernel_image.cpp',
+  'arch/riscv64/cpu/local_entry.cpp', 'arch/riscv64/cpu/ipi.cpp',
+  'arch/riscv64/cpu/instruction.cpp', 'arch/riscv64/cpu/start.cpp',
+  'arch/riscv64/cpu/secondary_entry.S', 'arch/riscv64/context/kernel_context.cpp',
+  'arch/riscv64/context/kernel_context.S', 'arch/riscv64/sbi/call.cpp',
+  'arch/riscv64/sbi/console.cpp', 'arch/riscv64/sbi/system.cpp',
+  'arch/riscv64/time/clock.cpp', 'arch/riscv64/time/timer.cpp',
+  'arch/riscv64/uart/uart.cpp', 'arch/riscv64/mmu/sv39_builder.cpp',
+  'arch/riscv64/mmu/sv39_editor.cpp', 'arch/riscv64/mmu/range_map.cpp',
+  'arch/riscv64/mmu/initial_kernel_map.cpp', 'arch/riscv64/mmu/initial_page_table.cpp',
+  'arch/riscv64/trap/trap.S', 'arch/riscv64/trap/context.cpp',
+  'arch/riscv64/trap/event.cpp', 'arch/riscv64/trap/trap.cpp', 'arch/riscv64/trap/user.cpp',
+)
+
+core_kernel_sources = files(
+  'kernel/boot/boot.cpp', 'kernel/boot/cpu_topology.cpp', 'kernel/boot/timebase.cpp',
+  'kernel/boot/firmware/devicetree/fdt.cpp', 'kernel/image/boot_bundle.cpp',
+  'kernel/init/root_task.cpp', 'kernel/init/run.cpp', 'kernel/core/kernel_state.cpp',
+  'kernel/cpu/cpu_runtime.cpp', 'kernel/cap/policy.cpp', 'kernel/cap/grant_graph.cpp',
+  'kernel/cap/cspace.cpp', 'kernel/ipc/notification.cpp', 'kernel/ipc/buffer.cpp',
+  'kernel/ipc/tunnel.cpp', 'kernel/ipc/channel.cpp', 'kernel/pager/pager.cpp',
+  'kernel/irq/irq.cpp', 'kernel/ipc/endpoint.cpp', 'kernel/ipc/transfer.cpp',
+  'kernel/object/object_ref.cpp', 'kernel/object/object_store.cpp',
+  'kernel/resource/pool.cpp', 'kernel/resource/allocation.cpp',
+  'kernel/sched/context.cpp', 'kernel/sched/authority.cpp', 'kernel/sched/refill_queue.cpp',
+  'kernel/sched/domain.cpp', 'kernel/sched/builtin_policy.cpp',
+  'kernel/sched/timer_queue.cpp', 'kernel/sched/remote_queue.cpp',
+  'kernel/sched/dispatcher.cpp', 'kernel/cpu/cpu_provisioner.cpp',
+  'kernel/cpu/cpu_registry.cpp', 'kernel/cpu/cpu_local.cpp', 'kernel/cpu/ipi.cpp',
+  'kernel/cpu/start.cpp', 'kernel/thread/thread.cpp',
+  'kernel/execution/authority.cpp', 'kernel/execution/target.cpp',
+  'kernel/execution/vproc.cpp', 'kernel/execution/vproc_notification.cpp',
+  'kernel/execution/vproc_tunnel.cpp', 'kernel/execution/stop.cpp',
+  'kernel/operation/completion.cpp', 'kernel/operation/wait.cpp',
+  'kernel/execution/execution.cpp', 'kernel/execution/binding.cpp',
+  'kernel/syscall/syscall.cpp', 'kernel/syscall/common.cpp', 'kernel/syscall/execution.cpp',
+  'kernel/syscall/capability.cpp', 'kernel/syscall/construction.cpp',
+  'kernel/syscall/object.cpp', 'kernel/syscall/notification.cpp',
+  'kernel/syscall/vproc.cpp', 'kernel/syscall/tunnel.cpp', 'kernel/syscall/endpoint.cpp',
+  'kernel/syscall/channel.cpp', 'kernel/syscall/pager_irq.cpp', 'kernel/syscall/terminal.cpp',
+  'kernel/syscall/vm.cpp', 'kernel/time/clock.cpp', 'kernel/mm/page_state.cpp',
+  'kernel/fault/terminal.cpp', 'kernel/fault/observation.cpp', 'kernel/mm/kernel_stack.cpp',
+  'kernel/mm/memory_object.cpp', 'kernel/mm/physical_alias.cpp', 'kernel/mm/vspace.cpp',
+  'kernel/mm/vspace_fault.cpp', 'kernel/mm/vspace_invalidation.cpp', 'kernel/mm/vspace_view.cpp',
+  'kernel/mm/vspace_layout.cpp', 'kernel/mm/vspace_mapping.cpp',
+  'kernel/mm/vspace_protection.cpp', 'kernel/mm/vspace_unmap.cpp', 'kernel/mm/vspace_work.cpp',
+  'kernel/mm/kernel_vspace.cpp', 'kernel/mm/translation.cpp', 'kernel/mm/direct_map.cpp',
+  'kernel/trap/dump.cpp', 'kernel/trap/trap.cpp', 'kernel/mm/boot_map.cpp', 'kernel/mm/pmm.cpp',
+  'libk/mem.c',
+)
+
+core = static_library('kernel-core', arch_sources + core_kernel_sources, c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
+concurrency = static_library(
+  'kernel-concurrency',
+  files('kernel/diag/config.cpp', 'kernel/diag/concurrency.cpp', 'kernel/diag/flight.cpp', 'kernel/diag/report.cpp', 'kernel/diag/watch.cpp'),
+  c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false,
+)
+lock = static_library(
+  'kernel-lock', files('kernel/sync/lock.cpp'), c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + ['-DMYOS_LOCK_DIAG=' + lock_diag_level.to_string(), '-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false,
+)
+console = static_library('kernel-console', files('kernel/diag/console.cpp'), c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
+report = static_library(
+  'kernel-report', files('kernel/diag/report_drain.cpp'), c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false,
+)
+panic = static_library(
+  'kernel-panic', files('kernel/diag/panic.cpp'), c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + [
+    '-DMYOS_PANIC_PROBE=' + get_option('panic_probe').to_string(),
+    '-DMYOS_LOCK_DIAG=' + lock_diag_level.to_string(),
+    '-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string(),
+  ], pic: false,
+)
+
+scenario_source = files('kernel/diag/scenario_off.cpp')
+scenario_args = kernel_cpp_args
+if scenario_name != 'off'
+  scenario_source = files('kernel/diag/scenario_real.cpp')
+  scenario_args += ['-DMYOS_SCENARIO_ID=' + scenario_id.to_string()]
+endif
+scenario = static_library('kernel-scenario', scenario_source, c_args: kernel_c_args, cpp_args: scenario_args, pic: false)
+
+test_sources = files('kernel/diag/test_off.cpp', 'kernel/diag/scenario_gate_off.cpp')
+if enable_tests
+  test_sources = files(
+    'test/boot.cpp', 'test/scenario_gate.cpp', 'test/framework.cpp', 'test/scenario.cpp',
+    'test/scenario_basic.cpp', 'test/scenario_remote.cpp', 'test/scenario_publication.cpp',
+    'test/scenario_report.cpp', 'test/scenario_observer.cpp', 'test/libk_test.cpp',
+    'test/sync_test.cpp', 'test/allocator_test.cpp', 'test/bootinfo_test.cpp',
+    'test/boot_bundle_test.cpp', 'test/cpu_topology_test.cpp', 'test/sched_test.cpp',
+    'test/cap_test.cpp', 'test/memory_test.cpp', 'test/translation_test.cpp',
+    'test/vspace_test.cpp', 'test/user_test.cpp', 'test/ipc_test.cpp', 'test/e7_test.cpp',
+  )
+endif
+test_module = static_library(
+  'kernel-test', test_sources, c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + ['-fomit-frame-pointer', '-foptimize-sibling-calls'], pic: false,
+)
+
+sh = find_program('sh')
+image_suffix = '-riscv64-' + profile + '-lock' + lock_diag_name + '-conc' + concurrency_diag_name
+build_info_source = files('kernel/image/build_info.cpp')
+build_info_args = kernel_cpp_args + ['-DMYOS_BUILD_ID="' + get_option('build_id') + '"']
+if get_option('build_id') == 'auto'
+  build_info_source = vcs_tag(
+    command: [sh, files('tools/build/build-id.sh'), root],
+    input: 'tools/build/build_info.cpp.in', output: 'build_info_auto.cpp',
+    replace_string: '@VCS_TAG@', fallback: 'unknown-clean',
+  )
+  build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="' + image_suffix + '"']
+endif
+kernel = executable(
+  'kernel.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: build_info_args,
+  link_whole: [core, concurrency, lock, console, report, panic, scenario, test_module],
+  link_args: kernel_link_args, link_language: 'c',
+)
+
+user_common_args = [
+  '-ffreestanding', '-Wall', '-Wextra', '-Werror', '-O2', '-g3',
+  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + root,
+]
+user_cpp_args = user_common_args + ['-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit']
+user_link_args = ['-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-Wl,-T,' + join_paths(root, 'user/riscv64/linker.ld')]
+user_runtime = static_library(
+  'user-runtime', files('user/lib/crt0.S', 'user/lib/crt.cpp', 'user/riscv64/context.S', 'libk/mem.c'),
+  c_args: user_common_args, cpp_args: user_cpp_args, pic: false, build_by_default: false,
+)
+init_user = executable(
+  'init.elf', files('servers/init/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'init.map')], link_language: 'c', build_by_default: false,
+)
+proof_user = executable(
+  'proof.elf', files('servers/proof/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'proof.map')], link_language: 'c', build_by_default: false,
+)
+uart_user = executable(
+  'uart.elf', files('servers/uart/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'uart.map')], link_language: 'c', build_by_default: false,
+)
+
+bootpack = executable(
+  'bootpack', files('tools/bootpack/main.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+boot_bundle = custom_target(
+  'boot-bundle', input: [init_user, proof_user, uart_user], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+)
+proof_bundle = custom_target(
+  'proof-bundle', input: proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
+)
+
+nm = find_program('riscv64-unknown-elf-nm')
+ar = find_program('riscv64-unknown-elf-ar')
+readelf = find_program('riscv64-unknown-elf-readelf')
+clangxx = find_program('clang++')
+audit_symbols = files('tools/build/audit-symbols.sh')
+audit_stack = files('tools/build/audit-boot-stack.sh')
+audit_user = files('tools/build/audit-user.sh')
+audit_clang = files('tools/build/audit-clang.sh')
+run_qemu = files('tools/build/run-qemu.sh')
+artifact = files('tools/build/artifact.sh')
+
+run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel, concurrency_diag_level.to_string(), core, concurrency, lock, console, report, panic, scenario, test_module])
+stack_budget = enable_tests ? '2048' : '1792'
+run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), stack_budget, kernel])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, proof_user, uart_user])
+run_target('audit-clang', command: [sh, audit_clang, clangxx, root, concurrency_diag_level.to_string(), lock_diag_level.to_string(), get_option('panic_probe').to_string()])
+objdump = find_program('riscv64-unknown-elf-objdump')
+run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])
+run_target('symbols', command: [sh, artifact, nm, 'symbols', kernel, join_paths(meson.current_build_dir(), 'kernel.sym')])
+
+qemu = find_program('qemu-system-riscv64')
+timeout = get_option('qemu_timeout')
+smp = get_option('qemu_smp').to_string()
+run_target('run', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel])
+run_target('run-timeout', command: [sh, run_qemu, qemu, '3s', '1', kernel, 'timeout'])
+run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel, '-S', '-gdb', 'tcp:' + get_option('gdb_host') + ':' + get_option('gdb_port').to_string()])
+if enable_tests
+  run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0'])
+endif
+if profile == 'proof'
+  run_target('run-proof-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'root init: started', 'user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1', '--initrd', proof_bundle])
+  run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', boot_bundle])
+endif
+if get_option('panic_probe') == 1
+  run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'MYOS KERNEL PANIC', 'context: call-site', 'expression: false'])
+elif get_option('panic_probe') == 2
+  run_target('run-panic-degraded-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel, 'shutdown', 'MYOS KERNEL PANIC', 'no acknowledgement'])
+endif
+scenario_marker = ''
+if scenario_name == 'ordinary'
+  scenario_marker = '[scenario] ordinary ok'
+elif scenario_name == 'initrd'
+  scenario_marker = '[scenario] initrd ok'
+elif scenario_name == 'trap'
+  scenario_marker = '[scenario] trap ok'
+elif scenario_name == 'remote'
+  scenario_marker = '[scenario] remote-delivery ok'
+elif scenario_name == 'publication'
+  scenario_marker = '[scenario] publication ok'
+elif scenario_name == 'report'
+  scenario_marker = '[scenario] report-retry wake-credit ok'
+elif scenario_name == 'dispatch'
+  scenario_marker = '[scenario] dispatch-flight ok'
+elif scenario_name == 'observer'
+  scenario_marker = '[scenario] observer ok'
+endif
+scenario_args_qemu = [sh, run_qemu, qemu, timeout, smp, kernel, 'timeout']
+if scenario_marker != ''
+  scenario_args_qemu += [scenario_marker]
+endif
+if scenario_name == 'initrd'
+  scenario_args_qemu += ['--initrd', boot_bundle]
+endif
+if enable_tests and scenario_name != 'off'
+  run_target('run-scenario', command: scenario_args_qemu)
+endif
+
+alias_target('kernel', kernel)
+alias_target('bundle', [boot_bundle, proof_bundle, uart_user])

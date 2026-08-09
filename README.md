@@ -12,6 +12,47 @@ Rather than making a Unix-style `Process` the implicit owner of an address space
 
 The project is also an experiment in using freestanding C++23 to express low-level ownership, state machines, and hardware-visible invariants without exceptions, RTTI, or a hosted runtime.
 
+## Build and run
+
+Meson and Ninja are the canonical build system. Configure one persistent build
+directory for the RISC-V toolchain, then reconfigure that same directory when
+selecting a profile, diagnostic provider, panic probe, or scenario:
+
+```sh
+meson setup build/riscv64 --cross-file cross/riscv64-gcc.ini -Dbuildtype=plain -Db_ndebug=true
+meson compile -C build/riscv64
+```
+
+`profile` is `kernel`, `test`, or `proof`; diagnostics are independently chosen
+with `lock_diag` and `concurrency_diag`. Plain compilation builds only the
+kernel image. Use explicit targets for the remaining developer surfaces:
+
+```sh
+meson compile -C build/riscv64 bundle audit-symbols audit-boot-stack audit-user audit-clang
+meson compile -C build/riscv64 symbols disasm
+
+meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
+meson compile -C build/riscv64 run-test-smp
+
+meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=watch -Dscenario=report -Dpanic_probe=0
+meson compile -C build/riscv64 run-scenario
+
+meson setup --reconfigure build/riscv64 -Dprofile=proof -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
+meson compile -C build/riscv64 run-proof-smp run-e1-smp
+
+meson setup --reconfigure build/riscv64 -Dprofile=kernel -Dlock_diag=off -Dconcurrency_diag=off -Dscenario=off -Dpanic_probe=1
+meson compile -C build/riscv64 run-panic-smp
+meson setup --reconfigure build/riscv64 -Dpanic_probe=2
+meson compile -C build/riscv64 run-panic-degraded-smp
+meson compile -C build/riscv64 debug
+```
+
+`qemu_smp`, `qemu_timeout`, `gdb_host`, and `gdb_port` are typed Meson options.
+Use `meson compile -C build/riscv64 --clean` to remove generated artifacts
+while retaining its configuration. Use `meson setup --wipe build/riscv64
+--cross-file cross/riscv64-gcc.ini` only when intentionally discarding that
+generated build directory; ordinary option changes use `--reconfigure`.
+
 ---
 
 ## Design goals
@@ -268,133 +309,6 @@ Advanced language features are used when they make ownership or invariants clear
 | Filesystem, network stack, production drivers, pager service, and stable public ABI | Not yet implemented |
 
 The current milestone is closing the final Vproc activation-to-upcall trap-return continuation under SMP, strengthening remote-request lifetime rules, and turning the proof workload into smaller focused integration tests.
-
----
-
-## Build profiles
-
-ChaOs has three explicit build profiles:
-
-| Profile | Purpose |
-|---|---|
-| `kernel` | Base kernel image |
-| `test` | Kernel image with built-in test suites |
-| `proof` | Built-in tests plus independent user-space `init` and proof payloads |
-
-Build products are isolated under:
-
-```text
-build/<arch>/<profile>/
-```
-
-The only supported architecture is currently:
-
-```text
-ARCH=riscv64
-```
-
----
-
-## Prerequisites
-
-You need:
-
-- GNU Make;
-- `qemu-system-riscv64`;
-- either `riscv-none-elf-*` or `riscv64-unknown-elf-*` GCC/binutils;
-- Clang for the optional independent syntax audit;
-- GDB or `gdb-multiarch` for interactive debugging.
-
-The Makefile searches for the xPack `riscv-none-elf` toolchain first, then compatible toolchains in `PATH`. A prefix can be selected explicitly:
-
-```sh
-make CROSS=riscv64-unknown-elf-
-```
-
----
-
-## Build and run
-
-Build the base kernel:
-
-```sh
-make
-```
-
-Run it under QEMU:
-
-```sh
-make run
-```
-
-Build the test profile and run its SMP checks:
-
-```sh
-make test
-make run-test-smp
-```
-
-Build the external user-space proof bundle and run it:
-
-```sh
-make proof
-make run-proof-smp
-```
-
-Exercise the external `init` loader and task-reclamation path:
-
-```sh
-make run-e1-smp
-```
-
-Change the number of QEMU harts:
-
-```sh
-make run-test-smp QEMU_SMP=8
-```
-
-Start a GDB-compatible QEMU session:
-
-```sh
-make debug
-```
-
-Generate disassembly or inspect symbols:
-
-```sh
-make disasm
-make symbols
-```
-
----
-
-## Audits and failure probes
-
-The build includes several checks intended to keep freestanding assumptions visible.
-
-```sh
-make audit-symbols
-make audit-clang
-```
-
-The audits check for:
-
-- non-lock-free atomic runtime fallbacks;
-- unexpected exception/unwind dependencies;
-- RTTI symbols;
-- virtual dispatch outside the narrow object-store whitelist;
-- oversized or dynamic C++ stack frames;
-- invalid user-ELF dependencies;
-- accidental floating-point or vector-state requirements in user payloads.
-
-Panic paths can be exercised under normal and degraded SMP conditions:
-
-```sh
-make run-panic-smp
-make run-panic-degraded-smp
-```
-
-These probes are part of the architecture: a panic path must not assume that every remote hart, lock owner, stack, or diagnostic component remains healthy.
 
 ---
 

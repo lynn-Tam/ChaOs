@@ -1,0 +1,2 @@
+#define MYOS_BUILD_ID "@VCS_TAG@" MYOS_IMAGE_SUFFIX
+#include <kernel/image/build_info.cpp>
