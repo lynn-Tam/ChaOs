@@ -13,6 +13,7 @@
 #include <arch/console.hpp>
 #include <arch/system.hpp>
 #include <core/kernel_image.hpp>
+#include <sched/dispatcher.hpp>
 #include <thread/thread.hpp>
 
 namespace kernel::diag {
@@ -104,13 +105,41 @@ void raw_source(const SourceLocation& source) noexcept {
     raw_char('\n');
 }
 
-[[noreturn]] void double_panic(usize cpu, usize pc, usize cause) noexcept {
+/*luna change: extend double-panic projection with entry and canonical target stack facts, reason: distinguish stale target stack state from active-stack publication corruption without changing panic control*/
+[[noreturn]] void double_panic(
+    usize cpu,
+    const arch::TrapSnapshot& snapshot) noexcept {
+    auto& local = current_cpu();
+    const auto* const dispatcher = local.dispatcher();
+    const execution::Target target = dispatcher != nullptr
+        ? dispatcher->current() : execution::Target{};
+    const usize entry_top = arch::active_stack(local.arch_state);
     raw_text("\nDOUBLE PANIC cpu=");
     raw_decimal(cpu);
     raw_text(" pc=");
-    raw_hex(pc);
+    raw_hex(snapshot.pc);
     raw_text(" cause=");
-    raw_hex(cause);
+    raw_hex(snapshot.cause);
+    raw_text(" addr=");
+    raw_hex(snapshot.fault_address);
+    raw_text(" entry_top=");
+    raw_hex(entry_top);
+    raw_text(" target_kind=");
+    if (!target) {
+        raw_text("none");
+    } else if (target.vproc() != nullptr) {
+        raw_text("vproc");
+    } else if (target.thread() != nullptr) {
+        raw_text("thread");
+    } else {
+        raw_text("unknown");
+    }
+    raw_text(" target_id=");
+    raw_hex(target ? target.identity() : 0);
+    raw_text(" stack_base=");
+    raw_hex(target ? target.stack_base() : 0);
+    raw_text(" stack_top=");
+    raw_hex(target ? target.stack_top() : 0);
     raw_char('\n');
     arch::halt_current_cpu(arch::HaltReason::Fatal);
 }
@@ -152,11 +181,10 @@ void capture(
             libk::MemoryOrder::AcqRel,
             libk::MemoryOrder::Acquire>(
             expected, PanicSlotState::Capturing)) {
-        const usize pc = request.trap != nullptr ? request.trap->pc() : 0;
-        const usize cause = request.trap != nullptr
-            ? request.trap->snapshot().cause
-            : 0;
-        double_panic(slot.cpu.raw, pc, cause);
+        /*luna change: project cause and fault address from the existing TrapSnapshot on slot collision, reason: double-panic reporting must retain the canonical second-fault facts without adding state*/
+        const auto snapshot = request.trap != nullptr
+            ? request.trap->snapshot() : arch::TrapSnapshot{};
+        double_panic(slot.cpu.raw, snapshot);
     }
 
     slot.request = request;
@@ -945,8 +973,10 @@ auto stop_requested() noexcept -> bool {
     }
     auto& slot = *static_cast<PanicSlot*>(slot_pointer);
     if (!arch::enter_emergency()) {
-        const usize pc = request.trap != nullptr ? request.trap->pc() : 0;
-        double_panic(slot.cpu.raw, pc, 0);
+        /*luna change: project the emergency-entry fault from the canonical TrapSnapshot, reason: preserve the real cause/address instead of hardcoding an uninformative zero*/
+        const auto snapshot = request.trap != nullptr
+            ? request.trap->snapshot() : arch::TrapSnapshot{};
+        double_panic(slot.cpu.raw, snapshot);
     }
     capture(slot, request, call_site, interrupts.enabled());
     arch::switch_to_panic_stack(

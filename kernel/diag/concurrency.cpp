@@ -3393,8 +3393,10 @@ namespace {
     case WaitKind::VSpaceClaim:
     case WaitKind::VSpaceShootdown:
     case WaitKind::VSpaceAuthorityDrain:
+    /*luna change: classify MemoryExecutor records as drain waits and lost-kick candidates, reason: the bounded queue is retained service work*/
     case WaitKind::VSpaceActiveCpus:
     case WaitKind::VSpaceWork:
+    case WaitKind::MemoryWork:
         return true;
     default:
         return false;
@@ -3434,7 +3436,9 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
             || (snapshot.record_kind == RecordKind::ObjectRetire
                 && snapshot.wait_kind == WaitKind::ObjectReclaim)
             || (snapshot.record_kind == RecordKind::VSpaceWork
-                && snapshot.wait_kind == WaitKind::VSpaceWork));
+                && snapshot.wait_kind == WaitKind::VSpaceWork)
+            || (snapshot.record_kind == RecordKind::MemoryWork
+                && snapshot.wait_kind == WaitKind::MemoryWork));
     if (service_unlinked) {
         return StallClass::LostServiceKick;
     }
@@ -3455,7 +3459,8 @@ constexpr u32 execution_blocked_phase = static_cast<u32>(
         || snapshot.record_kind == RecordKind::GrantRevoke
         || snapshot.record_kind == RecordKind::ResourceClose
         || snapshot.record_kind == RecordKind::ObjectRetire
-        || snapshot.record_kind == RecordKind::VSpaceWork) {
+        || snapshot.record_kind == RecordKind::VSpaceWork
+        || snapshot.record_kind == RecordKind::MemoryWork) {
         return StallClass::DrainStall;
     }
     if (snapshot.record_kind == RecordKind::ExecutionActor) {

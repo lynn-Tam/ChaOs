@@ -42,6 +42,15 @@ auto valid_user_context(const myos_user_context& context) noexcept -> bool {
         && (context.words[Sp] & 0xfU) == 0;
 }
 
+/*luna change: derive the Vproc active stack top from the raw mapped top, reason: one architecture-sized cell remains reserved for a fault frame*/
+auto vproc_stack_top(usize raw_stack_top) noexcept -> usize {
+    if (raw_stack_top < sizeof(riscv64::TrapFrame)
+        || (raw_stack_top & 0xfU) != 0) {
+        return 0;
+    }
+    return raw_stack_top - sizeof(riscv64::TrapFrame);
+}
+
 auto prepare_user_stack(
     usize home_stack_top,
     UserStart start) noexcept -> libk::optional<usize> {

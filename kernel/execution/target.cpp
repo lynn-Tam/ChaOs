@@ -54,7 +54,8 @@ auto Target::stack_top() const noexcept -> usize {
         } else if constexpr (libk::SameAs<T, Thread*>) {
             return value->current_stack_top();
         } else {
-            return value->execution().stack_top();
+            /*luna change: publish the Vproc active top below its reserved frame cell, reason: trap entry must leave one exact return frame available to FaultSlot*/
+            return arch::vproc_stack_top(value->execution().stack_top());
         }
     }, value_);
 }
@@ -187,6 +188,11 @@ auto Target::stop_ready() const noexcept -> bool {
                 if (slot.state == Vproc::OperationState::Pending) {
                     return false;
                 }
+            }
+            /*luna change: keep scheduler stop behind the fixed fault continuation, reason: callback and pin settlement are part of Vproc reuse ownership*/
+            if (value->fault_slot_.state != FaultSlot::State::Free
+                || value->fault_slot_.publishers != 0) {
+                return false;
             }
             return value->activation_publishers_ == 0
                 && value->activation_post_ == Vproc::ActivationPost::Idle

@@ -64,9 +64,21 @@ inline constexpr myos_word_t ChannelVprocBindSlot = 48;
 inline constexpr myos_word_t ChannelDrainSentSlot = 49;
 inline constexpr myos_word_t ProgressEpochSlot = 50;
 inline constexpr myos_word_t ChannelDrainReceivedSlot = 51;
-inline constexpr myos_word_t ProgressCellBase = 56;
+/*luna change: collapse Pager proof state to three single-writer actor cells, reason: Thread, worker, and Vproc lanes each own one canonical validation sequence*/
+inline constexpr myos_word_t PagerThreadSlot = 52;
+inline constexpr myos_word_t PagerWorkerSlot = 53;
+inline constexpr myos_word_t PagerVprocSlot = 54;
+/*luna change: add one compact TargetVproc fault detail cell, reason: proof-only diagnostics must identify the first failed gate without touching barrier truth or progress epochs*/
+inline constexpr myos_word_t PagerDetailSlot = 55;
+/*luna change: shorten pager capability handoff cells, reason: scope already identifies the worker and each cell has one direct authority role*/
+inline constexpr myos_word_t PagerCapSlot = 58;
+inline constexpr myos_word_t PagerTargetCapSlot = 59;
+inline constexpr myos_word_t PagerSourceCapSlot = 60;
+inline constexpr myos_word_t PagerNotifyCapSlot = 61;
+inline constexpr myos_word_t ProgressCellBase = 64;
 inline constexpr myos_word_t ProgressCellStride = 5;
-inline constexpr myos_word_t ProgressActorCount = 5;
+/*luna change: extend the existing progress projection with one Pager actor and lane wait, reason: diagnostics must identify worker stalls while remaining a one-way view*/
+inline constexpr myos_word_t ProgressActorCount = 6;
 inline constexpr myos_word_t SharedWords =
     ProgressCellBase + ProgressCellStride * ProgressActorCount;
 
@@ -85,6 +97,7 @@ enum class ProgressActor : myos_word_t {
     Receiver = 2,
     TargetVproc = 3,
     SourceVproc = 4,
+    Pager = 5,
 };
 
 enum class ProgressStage : myos_word_t {
@@ -103,6 +116,7 @@ enum class ProgressStage : myos_word_t {
     VprocDone = 13,
     Complete = 14,
     Failed = 15,
+    Pager = 16,
 };
 
 enum class ProgressWait : myos_word_t {
@@ -117,6 +131,7 @@ enum class ProgressWait : myos_word_t {
     ChannelGo = 8,
     VprocEvent = 9,
     Tunnel = 10,
+    Pager = 11,
 };
 
 struct ProgressSnapshot final {
@@ -171,6 +186,31 @@ inline constexpr myos_word_t ChannelClosed = 0x4348'434c'4f53'4501;
 inline constexpr myos_word_t ChannelComplete = 0x4348'434f'4d50'4c01;
 inline constexpr myos_word_t ChannelFailure = 0x4348'4641'494c'0001;
 inline constexpr myos_word_t ChannelVprocIpcAddress = 0x2400'0000;
+/*luna change: name the pager-shaped proof lane and target page, reason: the happy path must exercise production Pager and Vproc fault ABIs at a fixed userspace address*/
+inline constexpr myos_word_t PagerAddress = 0x2500'0000;
+inline constexpr myos_word_t PagerValue = 0x5041'4745'525f'4f4b;
+inline constexpr myos_word_t PagerBackingKey = 1;
+inline constexpr myos_word_t PagerBadge = 1U << 9;
+inline constexpr myos_word_t PagerWorkerMagic = 0x5041'4745'5257'4f52;
+inline constexpr myos_word_t PagerThreadFaulting = 0x5041'4745'5254'464c;
+inline constexpr myos_word_t PagerThreadDone = 0x5041'4745'5254'444e;
+inline constexpr myos_word_t PagerWorkerQueued = 0x5041'4745'5251'5545;
+inline constexpr myos_word_t PagerWorkerClaimed = 0x5041'4745'5243'4c4d;
+inline constexpr myos_word_t PagerWorkerSupplied = 0x5041'4745'5253'5550;
+inline constexpr myos_word_t PagerVprocFaulting = 0x5041'4745'5246'4c54;
+inline constexpr myos_word_t PagerVprocPending = 0x5041'4745'5250'454e;
+inline constexpr myos_word_t PagerVprocDone = 0x5041'4745'5256'444e;
+/*luna change: define compact one-shot TargetVproc fault detail codes, reason: proof diagnostics must identify the first failed gate without creating another state machine*/
+inline constexpr myos_word_t PagerDetailGeneration = 1;
+inline constexpr myos_word_t PagerDetailPending = 2;
+inline constexpr myos_word_t PagerDetailReady = 3;
+inline constexpr myos_word_t PagerDetailKind = 4;
+inline constexpr myos_word_t PagerDetailAccess = 5;
+inline constexpr myos_word_t PagerDetailAddress = 6;
+inline constexpr myos_word_t PagerDetailClaimStatus = 7;
+inline constexpr myos_word_t PagerDetailClaimKind = 8;
+inline constexpr myos_word_t PagerDetailDuplicate = 9;
+inline constexpr myos_word_t PagerDetailResume = 10;
 
 // Both proof ELFs share this page across harts. Release publication and
 // acquire observation are part of the protocol; volatile is not synchronization

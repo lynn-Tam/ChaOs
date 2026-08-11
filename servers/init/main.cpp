@@ -17,12 +17,20 @@ constexpr myos_word_t ChildMemory = 32 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
 constexpr myos_word_t ChannelThreadCount = 2;
+/*luna change: reserve one stack and execution slot for the Pager worker, reason: the proof adds a real blocking service Thread without reducing existing Vproc/channel capacity*/
+constexpr myos_word_t PagerWorkerCount = 1;
 constexpr myos_word_t EndpointActivations = 1;
 constexpr myos_word_t MaxStacks =
     MaxThreads + 3 * VprocCount + EndpointActivations
-    + ChannelThreadCount;
-constexpr myos_word_t VprocDescriptorOffset = 512;
+    + ChannelThreadCount + PagerWorkerCount;
+constexpr myos_word_t ThreadDescriptorCount =
+    MaxThreads + ChannelThreadCount + PagerWorkerCount;
 constexpr myos_word_t VprocDescriptorStride = 256;
+constexpr myos_word_t VprocDescriptorOffset =
+    ((ThreadDescriptorCount * sizeof(myos_thread_start)
+         + VprocDescriptorStride - 1)
+        / VprocDescriptorStride)
+    * VprocDescriptorStride;
 constexpr myos_word_t EndpointDescriptorOffset = 2048;
 constexpr myos_word_t SuccessFault = 0xe100;
 constexpr myos_word_t FailureFault = 0xe000;
@@ -30,6 +38,12 @@ constexpr myos_word_t FailureFault = 0xe000;
 static_assert(MYOS_BOOT_SEGMENT_READ == MYOS_VM_READ);
 static_assert(MYOS_BOOT_SEGMENT_WRITE == MYOS_VM_WRITE);
 static_assert(MYOS_BOOT_SEGMENT_EXECUTE == MYOS_VM_EXECUTE);
+/*luna change: align Vproc descriptors after the complete Thread descriptor block, reason: five thread starts occupy 520 bytes and must not overlap the former 512-byte Vproc offset*/
+static_assert(
+    ThreadDescriptorCount * sizeof(myos_thread_start) <= VprocDescriptorOffset);
+static_assert(
+    VprocDescriptorOffset + VprocCount * VprocDescriptorStride
+    <= EndpointDescriptorOffset);
 
 [[nodiscard]] constexpr auto page_round(myos_word_t size) noexcept
     -> myos_word_t {
@@ -165,8 +179,10 @@ public:
         }
 
         stage_ = 4;
+        /*luna change: admit Pager objects in the proof child pool without IRQ authority, reason: make_pager owns Pager creation while the E6 proof remains otherwise unchanged*/
         const auto child = myos::resource_create_child(
-            parent_pool_, ChildMemory, ChildCaps, MYOS_RESOURCE_E6_KINDS);
+            parent_pool_, ChildMemory, ChildCaps,
+            MYOS_RESOURCE_E6_KINDS | MYOS_RESOURCE_PAGER);
         if (child.status != MYOS_STATUS_OK || !children_.add(child.value)) {
             return false;
         }
@@ -196,22 +212,27 @@ public:
             return false;
         }
         stage_ = 8;
-        if (!make_notification()) {
+        /*luna change: place Pager construction before child execution setup, reason: the target mapping and notification must exist before descriptors and workers are started*/
+        if (!make_pager()) {
             return false;
         }
         stage_ = 9;
-        if (!make_channel()) {
+        if (!make_notification()) {
             return false;
         }
         stage_ = 10;
-        if (!make_stacks()) {
+        if (!make_channel()) {
             return false;
         }
         stage_ = 11;
-        if (!make_vproc_runtime()) {
+        if (!make_stacks()) {
             return false;
         }
         stage_ = 12;
+        if (!make_vproc_runtime()) {
+            return false;
+        }
+        stage_ = 13;
         if (!make_executions(proof.entry())) {
             return false;
         }
@@ -220,10 +241,20 @@ public:
             ProgressStage::Boot,
             ProgressWait::Notification);
         stage_ = 13;
-        const auto notified = myos::notification_wait(notification_);
-        if (notified.status != MYOS_STATUS_OK
-            || (notified.value & NotificationBadge) == 0) {
-            return false;
+        /*luna change: bound the coordinator notification observation, reason: a missing child signal must remain visible to the existing progress watchdog*/
+        for (;;) {
+            const auto notified = myos::notification_take(notification_);
+            if (notified.status == MYOS_STATUS_OK) {
+                if ((notified.value & NotificationBadge) == 0) {
+                    return false;
+                }
+                break;
+            }
+            if (notified.status != MYOS_STATUS_RETRY
+                || !observe()) {
+                return false;
+            }
+            myos::yield();
         }
         shared_.progress(
             ProgressActor::Coordinator,
@@ -233,11 +264,20 @@ public:
         if (!await_children()) {
             return false;
         }
+        /*luna change: project the Pager wait through the existing coordinator trace, reason: init must explain the worker lane without using diagnostics as a barrier*/
+        shared_.progress(
+            ProgressActor::Coordinator,
+            ProgressStage::Pager,
+            ProgressWait::Pager);
+        stage_ = 15;
+        if (!exercise_pager()) {
+            return false;
+        }
         shared_.progress(
             ProgressActor::Coordinator,
             ProgressStage::FirstReceive,
             ProgressWait::VprocReady);
-        stage_ = 15;
+        stage_ = 16;
         if (!exercise_vproc()) {
             return false;
         }
@@ -245,11 +285,11 @@ public:
             ProgressActor::Coordinator,
             ProgressStage::VprocDone,
             ProgressWait::ChannelReady);
-        stage_ = 16;
+        stage_ = 17;
         if (!await_channel()) {
             return false;
         }
-        stage_ = 17;
+        stage_ = 18;
         shared_.progress(
             ProgressActor::Coordinator,
             ProgressStage::Complete);
@@ -469,9 +509,10 @@ private:
     }
 
     [[nodiscard]] auto make_stacks() noexcept -> bool {
+        /*luna change: include the dedicated Pager worker in stack allocation, reason: each registered IPC page belongs to its own blocking Thread stack*/
         const myos_word_t count =
             thread_count_ + 3 * VprocCount + EndpointActivations
-            + ChannelThreadCount;
+            + ChannelThreadCount + PagerWorkerCount;
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -492,6 +533,57 @@ private:
             stack_tops_[index] = address + StackSize;
         }
         return true;
+    }
+
+    /*luna change: construct one Pager-backed target and a resident staging page, reason: the proof must drive the existing request/claim/supply path rather than a test-only mapping*/
+    [[nodiscard]] auto make_pager() noexcept -> bool {
+        const auto pager = myos::pager_create(
+            pool_, PagerBackingKey, 1);
+        if (pager.status != MYOS_STATUS_OK
+            || !children_.add(pager.value)) {
+            return false;
+        }
+        pager_ = pager.value;
+        if (!create_memory(
+                PageSize, MYOS_VM_READ | MYOS_VM_WRITE, staging_memory_)) {
+            return false;
+        }
+        const myos_word_t value = PagerValue;
+        if (!write_memory(
+                staging_memory_, PageSize,
+                reinterpret_cast<const uint8_t*>(&value), sizeof(value))) {
+            return false;
+        }
+        const auto target = myos::memory_create_pager(
+            pool_, PageSize, MYOS_VM_READ | MYOS_VM_WRITE, pager_);
+        if (target.status != MYOS_STATUS_OK
+            || !children_.add(target.value)) {
+            return false;
+        }
+        target_memory_ = target.value;
+
+        myos_cap_t target_region{};
+        if (!make_region(
+                child_vspace_, PagerAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE,
+                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP,
+                target_region)
+            || !children_.add(target_region)
+            || !map(
+                target_region, target_memory_, PagerAddress, PageSize,
+                MYOS_VM_READ | MYOS_VM_WRITE)) {
+            return false;
+        }
+
+        const auto notification = myos::notification_create(
+            pool_, PagerBadge);
+        if (notification.status != MYOS_STATUS_OK
+            || !children_.add(notification.value)) {
+            return false;
+        }
+        pager_notification_ = notification.value;
+        return myos::pager_bind(
+            pager_, pager_notification_, PagerBadge).status == MYOS_STATUS_OK;
     }
 
     [[nodiscard]] auto make_notification() noexcept -> bool {
@@ -675,8 +767,9 @@ private:
 
     [[nodiscard]] auto make_executions(myos_word_t entry) noexcept -> bool {
         stage_ = 110;
+        /*luna change: extend execution targets for the Pager worker, reason: descriptor and start order must cover every created Thread and Vproc exactly once*/
         myos_cap_t targets[
-            MaxThreads + ChannelThreadCount + VprocCount]{};
+            MaxThreads + ChannelThreadCount + PagerWorkerCount + VprocCount]{};
         myos_cap_t descriptors{};
         if (!create_memory(
                 PageSize, MYOS_VM_READ | MYOS_VM_WRITE, descriptors)
@@ -694,16 +787,33 @@ private:
             shared_memory_, child_cspace_, MYOS_RIGHT_INSPECT);
         const auto code = myos::cap_delegate(
             code_memory_, child_cspace_, MYOS_RIGHT_MAP);
+        const auto pager = myos::cap_delegate(
+            pager_, child_cspace_, MYOS_RIGHT_SERVE | MYOS_RIGHT_SUPPLY);
+        const auto target = myos::cap_delegate(
+            target_memory_, child_cspace_, MYOS_RIGHT_MANAGE);
+        const auto staging = myos::cap_delegate(
+            staging_memory_, child_cspace_, MYOS_RIGHT_MANAGE);
+        const auto pager_notification = myos::cap_delegate(
+            pager_notification_, child_cspace_, MYOS_RIGHT_RECEIVE);
         if (code_memory_ == 0 || code_size_ == 0
             || entry < code_address_ || entry - code_address_ >= code_size_
             || child_pool.status != MYOS_STATUS_OK
             || child_cspace.status != MYOS_STATUS_OK
             || arm_memory.status != MYOS_STATUS_OK
-            || code.status != MYOS_STATUS_OK) {
+            || code.status != MYOS_STATUS_OK
+            || pager.status != MYOS_STATUS_OK
+            || target.status != MYOS_STATUS_OK
+            || staging.status != MYOS_STATUS_OK
+            || pager_notification.status != MYOS_STATUS_OK) {
             return false;
         }
         shared_.store(PoolSlot, child_pool.value);
         shared_.store(CSpaceSlot, child_cspace.value);
+        /*luna change: delegate only the pager service capabilities needed by the worker, reason: capability authority stays explicit while the shared page carries stable child handles*/
+        shared_.store(PagerCapSlot, pager.value);
+        shared_.store(PagerTargetCapSlot, target.value);
+        shared_.store(PagerSourceCapSlot, staging.value);
+        shared_.store(PagerNotifyCapSlot, pager_notification.value);
 
         myos_cap_t upcall_stacks[VprocCount]{};
         for (myos_word_t index = 0; index < VprocCount; ++index) {
@@ -758,6 +868,25 @@ private:
             starts[descriptor_index].ipc.address = stack_bases_[stack_index];
             starts[descriptor_index].ipc.pages = 1;
         }
+        /*luna change: add one ordinary proof worker with its own registered IPC page, reason: Pager service calls must be exercised by a real blocking Thread and never by a Vproc runtime stack*/
+        const myos_word_t worker_descriptor = thread_count_
+            + ChannelThreadCount;
+        const myos_word_t worker_stack = thread_count_
+            + 3 * VprocCount + EndpointActivations + ChannelThreadCount;
+        starts[worker_descriptor].version = MYOS_THREAD_START_VERSION;
+        starts[worker_descriptor].flags = 0;
+        starts[worker_descriptor].entry = entry;
+        starts[worker_descriptor].stack = stack_tops_[worker_stack];
+        starts[worker_descriptor].arguments[0] = SharedAddress;
+        starts[worker_descriptor].arguments[1] = PagerWorkerMagic;
+        starts[worker_descriptor].arguments[2] = 0;
+        starts[worker_descriptor].arguments[3] = 0;
+        starts[worker_descriptor].arguments[4] = 0;
+        starts[worker_descriptor].arguments[5] = stack_bases_[worker_stack];
+        starts[worker_descriptor].ipc.memory = stack_memory_[worker_stack];
+        starts[worker_descriptor].ipc.page = 0;
+        starts[worker_descriptor].ipc.address = stack_bases_[worker_stack];
+        starts[worker_descriptor].ipc.pages = 1;
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             auto* const vproc_start =
                 reinterpret_cast<myos_vproc_start*>(
@@ -939,6 +1068,25 @@ private:
             targets[descriptor_index] = thread.value;
         }
 
+        /*luna change: reuse the single worker descriptor index for creation, reason: descriptor layout and execution creation share one canonical index*/
+        stage_ = 138;
+        const auto worker = myos::thread_create(
+            pool_, child_vspace_, child_cspace_, descriptors,
+            worker_descriptor * sizeof(myos_thread_start));
+        if (worker.status != MYOS_STATUS_OK) {
+            return false;
+        }
+        const auto worker_context = myos::sc_create(
+            pool_, domain_, 1'000'000, 10'000'000, 30, 0);
+        if (worker_context.status != MYOS_STATUS_OK
+            || !children_.add(worker.value)
+            || !children_.add(worker_context.value)
+            || myos::sc_bind(worker_context.value, worker.value).status
+                != MYOS_STATUS_OK) {
+            return false;
+        }
+        targets[worker_descriptor] = worker.value;
+
         for (myos_word_t index = 0; index < VprocCount; ++index) {
             stage_ = 140 + index * 5;
             myos::SysResult vproc{};
@@ -973,11 +1121,14 @@ private:
                     != MYOS_STATUS_OK) {
                 return false;
             }
-            targets[thread_count_ + ChannelThreadCount + index] = vproc.value;
+            targets[
+                thread_count_ + ChannelThreadCount + PagerWorkerCount + index]
+                = vproc.value;
         }
 
         for (myos_word_t index = 0;
-             index < thread_count_ + ChannelThreadCount + VprocCount;
+             index < thread_count_ + ChannelThreadCount + PagerWorkerCount
+                 + VprocCount;
              ++index) {
             stage_ = 160 + index;
             if (myos::execution_start(targets[index]).status
@@ -1065,6 +1216,25 @@ private:
         }
     }
 
+    /*luna change: wait on the pager proof's published barriers, reason: init observes the real Thread/Vproc completion edges without steering Pager state*/
+    [[nodiscard]] auto exercise_pager() noexcept -> bool {
+        while (shared_.load(PagerThreadSlot) != PagerThreadDone
+            || shared_.load(PagerWorkerSlot) != PagerWorkerSupplied
+            || shared_.load(PagerVprocSlot) != PagerVprocDone) {
+            /*luna change: surface the first proof-only TargetVproc gate failure immediately, reason: a compact detail code is diagnostic projection and must not wait for the watchdog*/
+            const myos_word_t detail = shared_.load(PagerDetailSlot);
+            if (detail != 0) {
+                diagnostic_code_ = 0x4000'0000 | (detail & 0xff);
+                return false;
+            }
+            if (!observe()) {
+                return false;
+            }
+            myos::yield();
+        }
+        return true;
+    }
+
     [[nodiscard]] auto exercise_vproc() noexcept -> bool {
         while (shared_.load(VprocStateSlot) != VprocReady) {
             if (!observe()) {
@@ -1145,6 +1315,11 @@ private:
     myos_cap_t bundle_region_{};
     myos_cap_t scratch_region_{};
     myos_cap_t shared_memory_{};
+    /*luna change: retain only source Pager capabilities and keep target region local, reason: child delegation is explicit while region lifetime remains in the existing Handles reverse-close path*/
+    myos_cap_t pager_{};
+    myos_cap_t target_memory_{};
+    myos_cap_t staging_memory_{};
+    myos_cap_t pager_notification_{};
     myos_cap_t notification_{};
     myos_cap_t vproc_notification_{};
     myos_cap_t control_memory_[VprocCount]{};

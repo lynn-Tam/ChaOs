@@ -64,6 +64,9 @@ public:
         const UserStart& start) noexcept -> bool;
 
     [[nodiscard]] auto frame() const noexcept -> UserFrame;
+    /*luna change: copy the complete return frame into the reserved Vproc cell, reason: FaultSlot retains only an opaque architecture frame token*/
+    [[nodiscard]] auto save_frame(usize raw_stack_top) const noexcept
+        -> UserFrame;
     void redirect(UserFrame frame) noexcept;
 
 private:

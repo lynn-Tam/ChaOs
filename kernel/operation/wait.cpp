@@ -1,15 +1,17 @@
 #include <operation/wait.hpp>
 
 #include <core/debug.hpp>
-#include <libk/utility.hpp>
-#include <operation/completion.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel::operation {
 
+Wait::Wait() noexcept = default;
+
 Wait::~Wait() noexcept {
     KASSERT(!attached());
+    KASSERT(!page_fault_.relation().attached());
+    KASSERT(!page_fault_.active());
 }
 
 auto Wait::attached() const noexcept -> bool {
@@ -54,10 +56,12 @@ auto Wait::begin(
 
 void Wait::finish(arch::TrapContext& trap) noexcept {
     Completion* completion{};
+    CpuRegistry* cpus{};
     sched::Binding* binding{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         completion = completion_;
+        cpus = cpus_;
         binding = binding_;
         KASSERT(completion != nullptr
             && ready_.load<libk::MemoryOrder::Acquire>());
@@ -69,7 +73,14 @@ void Wait::finish(arch::TrapContext& trap) noexcept {
     if (binding != nullptr) {
         binding->clear_wait();
     }
-    completion->finish(trap);
+    const Completion::ResumeResult result = completion->finish(trap);
+    if (result == Completion::ResumeResult::Rearm) {
+        KASSERT(cpus != nullptr && binding != nullptr);
+        KASSERT(begin(*completion, *cpus, *binding));
+        if (completion->complete()) {
+            completion->signal();
+        }
+    }
 }
 
 auto Wait::cancel() noexcept -> bool {

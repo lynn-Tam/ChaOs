@@ -185,7 +185,8 @@ void Completion::signal() noexcept {
 }
 
 
-void Completion::finish(arch::TrapContext& trap) noexcept {
+/*luna change: let finish return a closed rearm result, reason: Wait must reattach the same Completion only after the old generation is fully retired*/
+auto Completion::finish(arch::TrapContext& trap) noexcept -> ResumeResult {
     KASSERT(complete());
     const auto key = observation_key();
     auto observation = diag::concurrency::ObservationLease::borrow(key);
@@ -211,16 +212,19 @@ void Completion::finish(arch::TrapContext& trap) noexcept {
         libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)));
     detach();
     if (ops_->resume != nullptr) {
-        ops_->resume(owner_, trap);
+        const ResumeResult resume = ops_->resume(owner_, trap);
         const auto terminal = diag::concurrency::ObservationKey{
             observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
         const u64 cpu = current_cpu_node().identity;
-        diag::concurrency::record(
-            diag::concurrency::FlightDomain::Operation,
-            diag::concurrency::FlightEvent::OperationRelease,
-            cpu,
-            terminal.raw);
-        ops_->release(owner_);
+        if (resume == ResumeResult::Done) {
+            /*luna change: publish OperationRelease only with terminal owner release, reason: Rearm retires diagnostics but keeps the same operation owner alive*/
+            diag::concurrency::record(
+                diag::concurrency::FlightDomain::Operation,
+                diag::concurrency::FlightEvent::OperationRelease,
+                cpu,
+                terminal.raw);
+            ops_->release(owner_);
+        }
         auto finished = diag::concurrency::ObservationLease::borrow(terminal);
         finished.finish(operation_finished);
         diag::concurrency::record(
@@ -228,7 +232,7 @@ void Completion::finish(arch::TrapContext& trap) noexcept {
             diag::concurrency::FlightEvent::OperationFinish,
             cpu,
             terminal.raw);
-        return;
+        return resume;
     }
     const Result result = ops_->read(owner_);
     trap.set_result(
@@ -250,6 +254,7 @@ void Completion::finish(arch::TrapContext& trap) noexcept {
         diag::concurrency::FlightEvent::OperationFinish,
         cpu,
         terminal.raw);
+    return ResumeResult::Done;
 }
 
 auto Completion::cancel() noexcept -> bool {

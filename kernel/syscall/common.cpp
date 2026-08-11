@@ -91,6 +91,10 @@ auto read_snapshot_bytes(
     case kernel::mm::MemoryError::OutOfMemory:
     case kernel::mm::MemoryError::ResourceExhausted:
         return libk::unexpected(MYOS_STATUS_NO_MEMORY);
+    case kernel::mm::MemoryError::Pressure:
+        return libk::unexpected(MYOS_STATUS_RETRY);
+    case kernel::mm::MemoryError::Pending:
+        return libk::unexpected(MYOS_STATUS_WOULD_BLOCK);
     case kernel::mm::MemoryError::BackingFailed:
         return libk::unexpected(MYOS_STATUS_BACKING_FAILED);
     case kernel::mm::MemoryError::Busy:
@@ -119,6 +123,8 @@ auto vm_status(kernel::mm::VSpaceError error) noexcept -> myos_status_t {
     case kernel::mm::VSpaceError::GenerationExhausted:
     case kernel::mm::VSpaceError::ResourceExhausted:
         return MYOS_STATUS_NO_MEMORY;
+    case kernel::mm::VSpaceError::Pressure:
+        return MYOS_STATUS_RETRY;
     case kernel::mm::VSpaceError::InvalidState:
     case kernel::mm::VSpaceError::Busy:
     case kernel::mm::VSpaceError::GrantUnavailable:

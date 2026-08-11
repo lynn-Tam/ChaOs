@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arch/user.hpp>
+#include <arch/trap.hpp>
 #include <core/types.hpp>
 #include <execution/authority.hpp>
 #include <execution/execution.hpp>
@@ -22,6 +23,10 @@
 #include <fault/terminal.hpp>
 
 namespace kernel {
+
+namespace mm {
+enum class FaultKind : u8;
+}
 
 namespace fault {
 class TerminalObservation;
@@ -80,6 +85,49 @@ struct VprocArm final : private libk::noncopyable {
     arch::UserStart entry{};
 };
 
+/*luna change: give the fixed Vproc fault continuation its sole lifecycle and pin identity, reason: one slot must cover admission, callback and stop races without duplicating PageRequest truth*/
+struct FaultSlot final : private libk::noncopyable {
+    enum class State : u8 {
+        Free,
+        Attaching,
+        PendingPage,
+        PageReady,
+        PageFailed,
+        Claimed,
+        Resuming,
+        Dropping,
+    };
+
+    mm::WaitRelation page_wait{};
+    arch::UserFrame frame{};
+    mm::MemoryObject* memory{};
+    CpuRegistry* cpus{};
+    mm::VirtAddr address{};
+    mm::Access access{mm::Access::Read};
+    u64 generation{};
+    u64 relation_generation{};
+    usize pc{};
+    u8 kind{};
+    u8 publishers{};
+    State state{State::Free};
+
+    /*luna change: centralize FaultSlot teardown while preserving lane generation, reason: relation detachment and pin release must precede any slot reuse*/
+    void reset() noexcept {
+        KASSERT(!page_wait.attached());
+        KASSERT(memory == nullptr && publishers == 0);
+        /*luna change: forbid reset with a live relation owner, reason: generation zero is the only reusable FaultSlot boundary*/
+        KASSERT(relation_generation == 0);
+        frame = {};
+        cpus = nullptr;
+        address = {};
+        access = mm::Access::Read;
+        relation_generation = 0;
+        pc = 0;
+        kind = 0;
+        state = State::Free;
+    }
+};
+
 // A kernel-visible execution lane whose user continuations are owned by its
 // runtime.  The kernel owns only the lane, bounded operation table and one
 // non-reentrant upcall frame; user tasks are never kernel objects.
@@ -135,6 +183,21 @@ public:
         VprocArm&& registration) noexcept
         -> libk::Expected<void, VprocError>;
     void on_trap_exit(arch::TrapContext& trap) noexcept;
+    /*luna change: route Vproc faults through the fixed FaultSlot adapter, reason: Pending preserves the exact frame while runtime entry owns execution*/
+    [[nodiscard]] auto fault(
+        arch::TrapContext& trap,
+        CpuRegistry& cpus,
+        CpuId local,
+        mm::VirtAddr address,
+        mm::Access access) noexcept -> mm::FaultKind;
+    /*luna change: expose the sole FaultKey claim/resume/drop edges, reason: runtime control must consume one fixed continuation without duplicating slot state*/
+    [[nodiscard]] auto claim_fault(u64 key) noexcept
+        -> libk::Expected<mm::FaultKind, VprocError>;
+    [[nodiscard]] auto resume_fault(
+        arch::TrapContext& trap,
+        u64 key) noexcept -> libk::Expected<mm::FaultKind, VprocError>;
+    [[nodiscard]] auto drop_fault(u64 key) noexcept
+        -> libk::Expected<void, VprocError>;
     [[nodiscard]] auto resume(
         arch::TrapContext& trap,
         u64 generation) noexcept -> libk::Expected<void, VprocError>;
@@ -184,10 +247,10 @@ private:
 
     struct OperationSlot final {
         operation::Completion* completion{};
-        myos_status_t status{MYOS_STATUS_OK};
         usize value{};
         usize cookie{};
         u64 generation{};
+        myos_status_t status{MYOS_STATUS_OK};
         OperationState state{OperationState::Free};
     };
 
@@ -259,6 +322,16 @@ private:
         u64 binding_generation,
         u64 signal_sequence) noexcept;
     void close_notifications() noexcept;
+    /*luna change: serialize runtime entry and optional frame capture in one owner lock, reason: pending delivery and Armed->Active must share one linearization*/
+    [[nodiscard]] auto enter_runtime(
+        arch::TrapContext& trap,
+        bool capture) noexcept -> bool;
+    /*luna change: deliver finalized page outcomes through Vproc state ownership, reason: callback lifetime and event projection must share one generation check*/
+    static void publish_fault(void* owner, mm::PageWaitResult result) noexcept;
+    void publish_fault(mm::PageWaitResult result) noexcept;
+    void project_fault_locked() noexcept;
+    /*luna change: close an admitted fault on stop without holding Vproc lock across MemoryObject operations, reason: foreign cancellation must race callback by state and publisher count*/
+    void close_fault() noexcept;
     [[nodiscard]] auto pending_operations() const noexcept -> bool;
     [[nodiscard]] auto pending_events() const noexcept -> bool;
     [[nodiscard]] auto activation_quiescent() const noexcept -> bool;
@@ -277,6 +350,7 @@ private:
     arch::UserStart bootstrap_entry_{};
     VprocRuntime runtime_{};
     VprocArm arm_{};
+    FaultSlot fault_slot_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Vproc>
         state_lock_{};
     OperationSlot operations_[max_operations]{};

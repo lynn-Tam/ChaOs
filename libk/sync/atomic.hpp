@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include <libk/concepts.hpp>
 #include <libk/typetraits.hpp>
 
 namespace libk {
@@ -252,6 +253,20 @@ void atomic_max(Atomic<T>& value, T desired) noexcept {
     while (current < desired
         && !value.template compare_exchange_weak<success, failure>(
             current, desired)) {
+    }
+}
+
+/*luna change: add a shared saturating unsigned atomic increment, reason: epoch witnesses must advance without wrapping across independent kernel owners*/
+template<MemoryOrder success = MemoryOrder::Relaxed,
+         MemoryOrder failure = MemoryOrder::Relaxed,
+         typename T>
+    requires AtomicValue<T> && UnsignedIntegral<T>
+void atomic_inc_sat(Atomic<T>& value) noexcept {
+    constexpr T max = static_cast<T>(-1);
+    T current = value.template load<MemoryOrder::Relaxed>();
+    while (current != max
+        && !value.template compare_exchange_weak<success, failure>(
+            current, static_cast<T>(current + 1))) {
     }
 }
 

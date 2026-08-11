@@ -9,6 +9,7 @@
 #include <mm/kernel_vspace.hpp>
 #include <mm/vspace.hpp>
 #include <mm/vspace_work.hpp>
+#include <mm/memory_work.hpp>
 #include <object/object_store.hpp>
 #include <resource/pool.hpp>
 #include <resource/traits.hpp>
@@ -31,6 +32,7 @@ constinit libk::ManualLifetime<kernel::mm::KernelVSpace> vspace_test_kernel{};
 constinit libk::ManualLifetime<kernel::object::ObjectStore>
     vspace_test_objects{};
 constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor> vspace_test_work{};
+constinit libk::ManualLifetime<kernel::mm::MemoryExecutor> vspace_test_memory_work{};
 
 class VSpaceFixture final : private libk::noncopyable_nonmovable {
 public:
@@ -78,8 +80,10 @@ public:
             return false;
         }
         auto& work = vspace_test_work.emplace();
+        auto& memory_work = vspace_test_memory_work.emplace();
+        /*luna change: give VSpace focused objects the shared bounded memory executor, reason: test construction must match runtime ObjectStore ownership*/
         auto& objects = vspace_test_objects.emplace(
-            *vspace_test_pmm, work);
+            *vspace_test_pmm, work, memory_work);
         auto memory = objects.create_anonymous(
             pages * kernel::mm::page_size,
             kernel::mm::AnonymousConfig{
@@ -218,6 +222,7 @@ private:
             vspace_test_objects->drain_reclaim();
         }
         vspace_test_objects.reset();
+        vspace_test_memory_work.reset();
         vspace_test_work.reset();
         vspace_test_kernel.reset();
         vspace_test_pmm.reset();

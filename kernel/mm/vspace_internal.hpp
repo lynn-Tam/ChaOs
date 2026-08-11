@@ -25,6 +25,8 @@ namespace kernel::mm {
     case MemoryError::OutOfMemory:
     case MemoryError::ResourceExhausted:
         return VSpaceError::OutOfMemory;
+    case MemoryError::Pressure:
+        return VSpaceError::Pressure;
     case MemoryError::GenerationExhausted:
         return VSpaceError::GenerationExhausted;
     case MemoryError::Busy:

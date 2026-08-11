@@ -19,11 +19,29 @@ template<typename T>
 struct ObjectTraits;
 }
 
+namespace kernel {
+class Vproc;
+}
+
 namespace kernel::pager {
 class Pager;
+struct ClaimKey;
+}
+
+namespace kernel::operation {
+class PageFault;
 }
 
 namespace kernel::mm {
+
+class MemoryExecutor;
+
+/*luna change: return bounded backing progress as a transport result, reason: executor scheduling must not duplicate PageSlot semantic state*/
+struct MemoryServiceBatch final {
+    usize processed{};
+    usize progressed{};
+    bool more{};
+};
 
 struct MemoryExtent final {
     ObjectRange object{};
@@ -100,6 +118,7 @@ enum class MemoryError : u8 {
     InvalidState,
     OutOfMemory,
     ResourceExhausted,
+    Pressure,
     GenerationExhausted,
     Busy,
     Pending,
@@ -261,7 +280,7 @@ private:
 
 class MemoryObject final : private libk::noncopyable_nonmovable {
 public:
-    MemoryObject(Pmm& pmm, usize byte_size) noexcept;
+    MemoryObject(Pmm& pmm, usize byte_size, MemoryExecutor& work) noexcept;
     ~MemoryObject() noexcept;
 
     [[nodiscard]] auto initialize_anonymous(AnonymousConfig config) noexcept
@@ -304,26 +323,36 @@ public:
         -> libk::Expected<ContentState, MemoryError>;
     [[nodiscard]] auto materialize(usize page_index) noexcept
         -> libk::Expected<PageLease, MemoryError>;
+    /*luna change: retain the existing operation pin while a caller relation is attached, reason: Thread cancellation must own one exact MemoryObject lifetime without a parallel lease*/
+    [[nodiscard]] auto materialize(
+        usize page_index,
+        WaitRelation* relation,
+        void* owner,
+        WaitRelation::Publish publish) noexcept
+        -> libk::Expected<PageLease, MemoryError>;
     [[nodiscard]] auto begin_transfer(usize page_index) noexcept
         -> libk::Expected<PageTransfer, MemoryError>;
     [[nodiscard]] auto pager_supply(
+        pager::Pager& pager,
         usize page_index,
-        u64 request_generation,
-        u64 claim_generation,
+        PageKey page_key,
+        pager::ClaimKey claim,
         OwnedPage&& page,
         u64 content_epoch) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto pager_supply_transfer(
+        pager::Pager& pager,
         PageTransfer&& transfer,
         usize page_index,
-        u64 request_generation,
-        u64 claim_generation,
+        PageKey page_key,
+        pager::ClaimKey claim,
         u64 content_epoch) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto pager_fail(
+        pager::Pager& pager,
         usize page_index,
-        u64 request_generation,
-        u64 claim_generation) noexcept
+        PageKey page_key,
+        pager::ClaimKey claim) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto bind_mapping(
         PageMapping& mapping,
@@ -336,15 +365,28 @@ public:
         usize page_index,
         bool accessed,
         bool dirty) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto drain_page_waiters(
+        usize capacity) noexcept -> usize;
     [[nodiscard]] auto queue_writeback(usize page_index) noexcept
-        -> libk::Expected<u64, MemoryError>;
-    [[nodiscard]] auto begin_writeback(
+        -> libk::Expected<WritebackKey, MemoryError>;
+    [[nodiscard]] auto publish_writeback(
         usize page_index,
-        u64 epoch) noexcept -> libk::Expected<void, MemoryError>;
+        WritebackKey key) noexcept
+        -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto complete_writeback(
+        pager::Pager& pager,
         usize page_index,
-        u64 epoch,
-        bool clean) noexcept -> libk::Expected<void, MemoryError>;
+        WritebackKey key,
+        u64 delivery_generation,
+        u64 claim_generation) noexcept -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto fail_writeback(
+        pager::Pager& pager,
+        usize page_index,
+        WritebackKey key,
+        u64 delivery_generation,
+        u64 claim_generation,
+        WritebackFailure failure) noexcept
+        -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto evict_page(usize page_index) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept
@@ -356,12 +398,16 @@ public:
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
     void retire() noexcept;
-
 private:
     friend struct kernel::object::ObjectTraits<MemoryObject>;
     friend class PageLease;
     friend class PageTransfer;
     friend class MemoryAttachment;
+    friend class MemoryExecutor;
+    friend class PagerBacking;
+    friend class kernel::operation::PageFault;
+    /*luna change: let the fixed Vproc continuation settle the existing fault pin, reason: Vproc shares MemoryObject lifetime ownership without a second lease API*/
+    friend class kernel::Vproc;
 
     using AttachmentList = libk::IntrusiveList<
         MemoryAttachment,
@@ -372,7 +418,14 @@ private:
         ContentState (*query)(const void* backing, usize page_index) noexcept;
         libk::Expected<MemoryPage, MemoryError> (*materialize)(
             void* backing,
-            usize page_index) noexcept;
+            usize page_index,
+            WaitRelation* relation,
+            void* owner,
+            WaitRelation::Publish publish) noexcept;
+        bool (*cancel_fault)(
+            void* backing,
+            WaitRelation& relation,
+            u64 generation) noexcept;
         libk::Expected<OwnedPage, MemoryError> (*begin_transfer)(
             void* backing,
             usize page_index) noexcept;
@@ -385,16 +438,18 @@ private:
             usize page_index) noexcept;
         libk::Expected<void, MemoryError> (*supply)(
             void* backing,
+            pager::Pager& pager,
             usize page_index,
-            u64 request_generation,
-            u64 claim_generation,
+            PageKey page_key,
+            pager::ClaimKey claim,
             OwnedPage&& page,
             u64 content_epoch) noexcept;
         libk::Expected<void, MemoryError> (*fail)(
             void* backing,
+            pager::Pager& pager,
             usize page_index,
-            u64 request_generation,
-            u64 claim_generation) noexcept;
+            PageKey page_key,
+            pager::ClaimKey claim) noexcept;
         libk::Expected<void, MemoryError> (*bind_mapping)(
             void* backing,
             usize page_index,
@@ -414,22 +469,26 @@ private:
             usize page_index,
             bool accessed,
             bool dirty) noexcept;
-        libk::Expected<u64, MemoryError> (*queue_writeback)(
+        usize (*drain_page_waiters)(
+            void* backing,
+            usize capacity) noexcept;
+        /*luna change: expose one bounded backing service hook, reason: MemoryExecutor invokes canonical PageRequest/PageSlot transitions through MemoryObject*/
+        MemoryServiceBatch (*service)(
+            void* backing,
+            usize capacity) noexcept;
+        libk::Expected<WritebackKey, MemoryError> (*queue_writeback)(
             void* backing,
             usize page_index) noexcept;
-        libk::Expected<void, MemoryError> (*begin_writeback)(
+        libk::Expected<void, MemoryError> (*writeback)(
             void* backing,
+            pager::Pager* pager,
             usize page_index,
-            u64 epoch) noexcept;
-        libk::Expected<void, MemoryError> (*complete_writeback)(
-            void* backing,
-            usize page_index,
-            u64 epoch,
-            bool clean) noexcept;
+            WritebackTxn txn) noexcept;
         libk::Expected<void, MemoryError> (*evict_page)(
             void* backing,
             usize page_index) noexcept;
         void (*destroy)(void* backing) noexcept;
+        void (*stop)(void* backing) noexcept;
     };
 
     [[nodiscard]] auto initialize_backing(
@@ -442,6 +501,17 @@ private:
         AccessMask pager_access,
         object::ObjectRef&& pager_ref) noexcept
         -> libk::Expected<void, MemoryError>;
+    [[nodiscard]] auto materialize_impl(
+        usize page_index,
+        WaitRelation* relation,
+        void* owner,
+        WaitRelation::Publish publish) noexcept
+        -> libk::Expected<PageLease, MemoryError>;
+    /*luna change: settle the single fault pin only through its owner, reason: PageFault cancellation and terminal release must not become public lifetime APIs*/
+    void release_fault() noexcept;
+    [[nodiscard]] auto cancel_fault(
+        WaitRelation& relation,
+        u64 generation) noexcept -> bool;
     [[nodiscard]] auto detach(MemoryAttachment& attachment) noexcept -> bool;
     void drop_page() noexcept;
     void finish_transfer(
@@ -454,8 +524,15 @@ private:
     [[nodiscard]] auto reserve_dynamic(kernel::resource::Budget charge) noexcept
         -> libk::Expected<kernel::resource::Reservation, MemoryError>;
     void release_lease(Page page) noexcept;
+    void release_backing_hold() noexcept;
+    void schedule_work() noexcept;
+    void finish_work() noexcept;
+    [[nodiscard]] auto service(usize capacity) noexcept -> MemoryServiceBatch;
+    void ensure_work_observation() noexcept;
+    void publish_work_observation(const MemoryServiceBatch& batch) noexcept;
 
     Pmm* pmm_{};
+    MemoryExecutor* work_{};
     usize logical_pages_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::MemoryObject>
         lock_{};
@@ -471,6 +548,13 @@ private:
     AccessMask access_{};
     object::ObjectRef pager_ref_{};
     bool releasing_{};
+    /*luna change: retain one intrusive work node and one operations pin gate, reason: queue membership, admission, and lifetime remain separate canonical concerns*/
+    libk::IntrusiveListHook work_hook_{};
+    /*luna change: make admission and pin visibility atomic across owner/executor locks, reason: retire and submit cross lock domains without a data race*/
+    libk::Atomic<bool> work_open_{true};
+    libk::Atomic<bool> work_active_{false};
+    libk::Atomic<bool> observation_reserved_{false};
+    libk::Atomic<u64> observation_key_{};
     usize mapping_count_{};
     kernel::resource::Sponsorship* sponsor_{};
 };

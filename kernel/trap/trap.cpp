@@ -13,6 +13,7 @@
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
 #include <mm/virtual_layout.hpp>
+#include <operation/page_fault.hpp>
 #include <operation/wait.hpp>
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
@@ -22,6 +23,83 @@
 #include <uapi/status.h>
 
 namespace kernel::trap {
+
+namespace {
+
+/*luna change: share initial and resumed Thread page-fault terminal handling, reason: one PageFault owns retry outcome while trap policy owns yield, unwind, and exit decisions*/
+void finish_thread_page_fault(
+    Thread& thread,
+    operation::PageFault& page_fault,
+    arch::TrapContext& context,
+    sched::CpuDispatcher& dispatcher) noexcept {
+    KASSERT(page_fault.terminal());
+    const mm::FaultKind kind = page_fault.kind();
+    const mm::VirtAddr address = page_fault.address();
+    const mm::Access access = page_fault.access();
+    page_fault.reset();
+    myos_status_t status{MYOS_STATUS_PEER_FAULT};
+    switch (kind) {
+    case mm::FaultKind::Ready:
+    case mm::FaultKind::Materialized:
+        return;
+    case mm::FaultKind::Busy:
+        dispatcher.request_reschedule(sched::DispatchReason::Yield);
+        return;
+    case mm::FaultKind::Pressure:
+        dispatcher.request_reschedule(sched::DispatchReason::Yield);
+        return;
+    case mm::FaultKind::Pending:
+        KASSERT(false);
+        return;
+    case mm::FaultKind::ResourceExhausted:
+    case mm::FaultKind::OutOfMemory: {
+        status = MYOS_STATUS_NO_MEMORY;
+        break;
+    }
+    default:
+        break;
+    }
+    KASSERT(thread.effective_binding().fault_route()
+        == FaultRoute::Terminate);
+    if (execution::Frame* const frame = thread.active_frame();
+        frame != nullptr) {
+        frame->unwind(context, dispatcher, status);
+        return;
+    }
+    Access trap_access{Access::None};
+    switch (access) {
+    case mm::Access::Read:
+        trap_access = Access::Read;
+        break;
+    case mm::Access::Write:
+        trap_access = Access::Write;
+        break;
+    case mm::Access::Execute:
+        trap_access = Access::Execute;
+        break;
+    }
+    const Event event = Event::exception(
+        Origin::User,
+        Exception::PageFault,
+        trap_access,
+        context.pc(),
+        address.raw());
+    thread.record_user_fault(event);
+    static_cast<void>(thread.terminal().claim(
+        fault::Reason::Fault,
+        status,
+        0,
+        event.pc(),
+        event.fault_addr()));
+    kernel::diag::console::print<
+        "user: contained fault address={:#x} after syscalls={} "
+        "active-vspace-cpus={}\n">(
+        event.fault_addr(), thread.user_syscalls(),
+        thread.effective_binding().vspace()->active_cpus().size());
+    dispatcher.request_reschedule(sched::DispatchReason::Exit);
+}
+
+} // namespace
 
 void handle(const Event& event, arch::TrapContext& context) noexcept {
     if (const auto* interrupt = event.interrupt()) {
@@ -108,27 +186,53 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 }
                 return;
             }
-            auto fault = execution->binding().vspace()->fault(
-                kernel::mm::VmContext{
-                    .cpus = cpu.runtime().owner_registry,
-                    .local = cpu.descriptor->logical_id(),
-                },
-                kernel::mm::VirtAddr{event.fault_addr()},
+            /*luna change: route Thread faults through the leaf PageFault continuation, reason: Pager Pending must block on one Wait/Completion instead of polling Yield while Vproc keeps its existing adapter*/
+            if (thread != nullptr) {
+                KASSERT(cpu.runtime().owner_registry != nullptr);
+                auto& page_fault = thread->current_wait().page_fault();
+                const mm::FaultKind result = page_fault.start(
+                    *execution->binding().vspace(),
+                    *cpu.runtime().owner_registry,
+                    cpu.descriptor->logical_id(),
+                    mm::VirtAddr{event.fault_addr()},
+                    access);
+                if (result == mm::FaultKind::Pending) {
+                    KASSERT(thread->begin_wait(
+                        page_fault.completion(),
+                        *cpu.runtime().owner_registry));
+                    if (page_fault.completion().complete()) {
+                        page_fault.completion().signal();
+                    }
+                    cpu.dispatcher()->request_reschedule(
+                        sched::DispatchReason::Block);
+                    return;
+                }
+                finish_thread_page_fault(
+                    *thread, page_fault, context, *cpu.dispatcher());
+                return;
+            }
+            /*luna change: route Vproc faults through the durable FaultSlot adapter, reason: Pending must retain the exact return frame while the runtime continues*/
+            KASSERT(vproc != nullptr && cpu.runtime().owner_registry != nullptr);
+            const mm::FaultKind fault = vproc->fault(
+                context,
+                *cpu.runtime().owner_registry,
+                cpu.descriptor->logical_id(),
+                mm::VirtAddr{event.fault_addr()},
                 access);
-            if (fault && fault.value().kind == kernel::mm::FaultKind::Materialized) {
+            switch (fault) {
+            case mm::FaultKind::Ready:
+            case mm::FaultKind::Materialized:
                 return;
-            }
-            if (fault && (fault.value().kind == kernel::mm::FaultKind::Busy
-                    || fault.value().kind == kernel::mm::FaultKind::Pending)) {
-                // Another VSpace transaction or page materialization owns the
-                // canonical mutation slot. The faulting instruction has not
-                // completed and its TrapFrame remains intact, so reschedule
-                // and retry the same access after the owner makes progress.
+            case mm::FaultKind::Pending:
+                return;
+            case mm::FaultKind::Busy:
+            case mm::FaultKind::Pressure:
                 cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Yield);
+                    sched::DispatchReason::Yield);
                 return;
+            default:
+                break;
             }
-            KASSERT(!fault || fault.value().kind != kernel::mm::FaultKind::Ready);
         }
         KASSERT(execution->binding().fault_route()
             == kernel::FaultRoute::Terminate);
@@ -247,6 +351,17 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
         cpu.dispatcher()->block_current();
         KASSERT(cpu.current_execution() == execution);
         wait = thread != nullptr ? &thread->current_wait() : nullptr;
+    }
+    /*luna change: consume a resumed terminal PageFault after serial Wait delivery, reason: Rearm remains attached while Done leaves the result for the shared trap policy*/
+    if (thread != nullptr) {
+        wait = &thread->current_wait();
+        if (wait->page_fault().terminal()) {
+            finish_thread_page_fault(
+                *thread,
+                wait->page_fault(),
+                context,
+                *cpu.dispatcher());
+        }
     }
     // A canceled Endpoint frame cannot be popped while its leaf Wait still
     // owns the continuation. Once that relation has completed or canceled,

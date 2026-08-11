@@ -19,6 +19,10 @@
 #include <object/pager_pool.hpp>
 #include <object/irq_pool.hpp>
 
+namespace kernel::mm {
+class MemoryExecutor;
+}
+
 namespace kernel::object {
 
 // Typed construction and lookup façade for capability-addressable kernel
@@ -85,7 +89,10 @@ public:
     using IrqHold = object::IrqHold;
     using IrqPin = object::IrqPin;
 
-    explicit ObjectStore(kernel::mm::Pmm& pmm, kernel::mm::VSpaceExecutor& vspace_work) noexcept;
+    explicit ObjectStore(
+        kernel::mm::Pmm& pmm,
+        kernel::mm::VSpaceExecutor& vspace_work,
+        kernel::mm::MemoryExecutor& memory_work) noexcept;
     ~ObjectStore() noexcept;
 
     template<typename... Args>
@@ -329,6 +336,7 @@ private:
     ReclaimNotifier reclaim_notify_{};
     kernel::mm::Pmm* pmm_{};
     kernel::mm::VSpaceExecutor* vspace_work_{};
+    kernel::mm::MemoryExecutor* memory_work_{};
     // Sponsoring pools outlive every pool containing sponsored objects.
     ResourcePool resources_;
     EndpointPool endpoints_;

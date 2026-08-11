@@ -109,7 +109,9 @@ core_kernel_sources = files(
   'kernel/execution/authority.cpp', 'kernel/execution/target.cpp',
   'kernel/execution/vproc.cpp', 'kernel/execution/vproc_notification.cpp',
   'kernel/execution/vproc_tunnel.cpp', 'kernel/execution/stop.cpp',
-  'kernel/operation/completion.cpp', 'kernel/operation/wait.cpp',
+  # /*luna change: link the standalone PageFault continuation owner, reason: Wait only transports one page-specific edge*/
+  'kernel/operation/completion.cpp', 'kernel/operation/page_fault.cpp',
+  'kernel/operation/wait.cpp',
   'kernel/execution/execution.cpp', 'kernel/execution/binding.cpp',
   'kernel/syscall/syscall.cpp', 'kernel/syscall/common.cpp', 'kernel/syscall/execution.cpp',
   'kernel/syscall/capability.cpp', 'kernel/syscall/construction.cpp',
@@ -118,6 +120,9 @@ core_kernel_sources = files(
   'kernel/syscall/channel.cpp', 'kernel/syscall/pager_irq.cpp', 'kernel/syscall/terminal.cpp',
   'kernel/syscall/vm.cpp', 'kernel/time/clock.cpp', 'kernel/mm/page_state.cpp',
   'kernel/fault/terminal.cpp', 'kernel/fault/observation.cpp', 'kernel/mm/kernel_stack.cpp',
+  'kernel/mm/reclaim.cpp',
+  # /*luna change: build the bounded MemoryExecutor production service, reason: MemoryObject page work must be linked into the runtime executor*/
+  'kernel/mm/memory_work.cpp',
   'kernel/mm/memory_object.cpp', 'kernel/mm/physical_alias.cpp', 'kernel/mm/vspace.cpp',
   'kernel/mm/vspace_fault.cpp', 'kernel/mm/vspace_invalidation.cpp', 'kernel/mm/vspace_view.cpp',
   'kernel/mm/vspace_layout.cpp', 'kernel/mm/vspace_mapping.cpp',

@@ -160,6 +160,8 @@ enum class RecordKind : u8 {
     ResourceClose,
     ObjectRetire,
     VSpaceWork,
+    /*luna change: expose MemoryExecutor service records, reason: diagnostics must project its retained queue distinctly*/
+    MemoryWork,
     RemoteDelivery,
     ServiceWork,
     TrapContinuation,
@@ -191,6 +193,8 @@ enum class WaitKind : u8 {
     VSpaceAuthorityDrain,
     VSpaceActiveCpus,
     VSpaceWork,
+    /*luna change: classify MemoryExecutor waits as bounded drain work, reason: stall policy must retain service visibility*/
+    MemoryWork,
     SchedulerReady,
     SchedulerRefill,
     SchedulerWake,

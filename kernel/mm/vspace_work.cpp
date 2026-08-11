@@ -1,27 +1,10 @@
 #include <mm/vspace_work.hpp>
 
 #include <core/debug.hpp>
-#include <libk/limits.hpp>
 #include <sync/irq_lock_guard.hpp>
 
 namespace kernel::mm {
-namespace {
-
-void advance_epoch(libk::Atomic<u64>& epoch) noexcept {
-    u64 current = epoch.load<libk::MemoryOrder::Relaxed>();
-    for (;;) {
-        if (current == libk::numeric_limits<u64>::max()) {
-            return;
-        }
-        if (epoch.compare_exchange_weak<
-                libk::MemoryOrder::Relaxed,
-                libk::MemoryOrder::Relaxed>(current, current + 1)) {
-            return;
-        }
-    }
-}
-
-} // namespace
+/*luna change: use the libk saturating epoch primitive, reason: this executor's observation epoch shares the common no-wrap atomic contract*/
 
 VSpaceExecutor::~VSpaceExecutor() noexcept {
     KASSERT(!notifier_);
@@ -107,7 +90,8 @@ auto VSpaceExecutor::run(
             submit(*space);
         }
         ++processed;
-        advance_epoch(service_epoch_);
+        /*luna change: advance the service epoch through the shared primitive, reason: keep diagnostic epochs monotonic without a business-local CAS loop*/
+        libk::atomic_inc_sat(service_epoch_);
     }
     return VSpaceServiceBatch{
         processed,

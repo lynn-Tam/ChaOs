@@ -4,11 +4,14 @@
 
 namespace kernel::object {
 
+/*luna change: thread MemoryExecutor through MemoryObject construction, reason: every backing uses the single bounded service owner without a parallel pool path*/
 ObjectStore::ObjectStore(
     kernel::mm::Pmm& pmm,
-    kernel::mm::VSpaceExecutor& vspace_work) noexcept
+    kernel::mm::VSpaceExecutor& vspace_work,
+    kernel::mm::MemoryExecutor& memory_work) noexcept
     : pmm_(&pmm),
       vspace_work_(&vspace_work),
+      memory_work_(&memory_work),
       resources_(pmm, reclaim_notify_),
       endpoints_(pmm, reclaim_notify_),
       channels_(pmm, reclaim_notify_),
@@ -105,7 +108,7 @@ auto ObjectStore::create_anonymous(
     usize byte_size,
     kernel::mm::AnonymousConfig config) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
-    auto pending = memories_.create(*pmm_, byte_size);
+    auto pending = memories_.create(*pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -123,7 +126,7 @@ auto ObjectStore::create_anonymous_sponsored(
     kernel::mm::AnonymousConfig config) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create_sponsored(
-        libk::move(sponsorship), *pmm_, byte_size);
+        libk::move(sponsorship), *pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -142,7 +145,7 @@ auto ObjectStore::create_pager_memory_sponsored(
     kernel::mm::AccessMask access) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create_sponsored(
-        libk::move(sponsorship), *pmm_, byte_size);
+        libk::move(sponsorship), *pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -159,7 +162,7 @@ auto ObjectStore::create_physical(
     usize byte_size,
     libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
-    auto pending = memories_.create(*pmm_, byte_size);
+    auto pending = memories_.create(*pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -177,7 +180,7 @@ auto ObjectStore::create_physical_sponsored(
     libk::Span<const kernel::mm::MemoryExtent> extents) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create_sponsored(
-        libk::move(sponsorship), *pmm_, byte_size);
+        libk::move(sponsorship), *pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -195,7 +198,7 @@ auto ObjectStore::create_boot_image(
     kernel::mm::BootOwnership ownership,
     kernel::mm::OwnedPageGroup&& pages) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
-    auto pending = memories_.create(*pmm_, byte_size);
+    auto pending = memories_.create(*pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }
@@ -216,7 +219,7 @@ auto ObjectStore::create_boot_image_sponsored(
     kernel::mm::OwnedPageGroup&& pages) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create_sponsored(
-        libk::move(sponsorship), *pmm_, byte_size);
+        libk::move(sponsorship), *pmm_, byte_size, *memory_work_);
     if (!pending) {
         return libk::unexpected(memory_pool_error(pending.error()));
     }

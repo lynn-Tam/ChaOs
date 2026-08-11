@@ -4,6 +4,8 @@
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
+#include <operation/completion.hpp>
+#include <operation/page_fault.hpp>
 
 namespace arch {
 class TrapContext;
@@ -26,13 +28,21 @@ class Completion;
 // The operation still owns Completion and the dispatcher still owns run state.
 class Wait final : private libk::noncopyable_nonmovable {
 public:
-    Wait() noexcept = default;
+    Wait() noexcept;
     ~Wait() noexcept;
 
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto ready() const noexcept -> bool;
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey;
+    // PageFault owns its relation and Completion; Wait only exposes the
+    // continuation object that can be attached to this blocking edge.
+    [[nodiscard]] auto page_fault() noexcept -> PageFault& {
+        return page_fault_;
+    }
+    [[nodiscard]] auto page_fault() const noexcept -> const PageFault& {
+        return page_fault_;
+    }
     [[nodiscard]] auto begin(
         Completion& completion,
         CpuRegistry& cpus,
@@ -51,6 +61,7 @@ private:
     sched::Binding* binding_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Wait> lock_{};
     libk::Atomic<bool> ready_{};
+    PageFault page_fault_{};
 };
 
 } // namespace operation

@@ -27,21 +27,9 @@ constexpr u32 grant_published = 1;
 constexpr u32 grant_servicing = 2;
 constexpr u32 grant_complete = 3;
 
-void advance_epoch(libk::Atomic<u64>& epoch) noexcept {
-    u64 current = epoch.load<libk::MemoryOrder::Relaxed>();
-    for (;;) {
-        if (current == libk::numeric_limits<u64>::max()) {
-            return;
-        }
-        if (epoch.compare_exchange_weak<
-                libk::MemoryOrder::Relaxed,
-                libk::MemoryOrder::Relaxed>(current, current + 1)) {
-            return;
-        }
-    }
-}
-
 } // namespace
+
+/*luna change: use the libk saturating epoch primitive, reason: grant service diagnostics share the common no-wrap epoch contract*/
 
 GrantWork::GrantWork(GrantWork&& other) noexcept
     : attachment_(libk::exchange(other.attachment_, nullptr)) {}
@@ -1071,7 +1059,8 @@ auto GrantGraph::service(usize budget) noexcept -> GrantServiceResult {
         }
         progressed += service_slot(*slot) ? 1 : 0;
         ++processed;
-        advance_epoch(service_epoch_);
+        /*luna change: advance the service epoch through the shared primitive, reason: keep grant diagnostics monotonic without a business-local CAS loop*/
+        libk::atomic_inc_sat(service_epoch_);
     }
     return GrantServiceResult{
         processed,

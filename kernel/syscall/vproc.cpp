@@ -28,7 +28,12 @@ namespace {
     switch (error) {
     case kernel::mm::MemoryError::OutOfMemory:
     case kernel::mm::MemoryError::ResourceExhausted:
+    case kernel::mm::MemoryError::GenerationExhausted:
         return MYOS_STATUS_NO_MEMORY;
+    case kernel::mm::MemoryError::Pressure:
+        return MYOS_STATUS_RETRY;
+    case kernel::mm::MemoryError::Pending:
+        return MYOS_STATUS_WOULD_BLOCK;
     case kernel::mm::MemoryError::BackingFailed:
         return MYOS_STATUS_BACKING_FAILED;
     case kernel::mm::MemoryError::Busy:
@@ -180,6 +185,62 @@ auto handle_vproc(usize operation, Invocation& invocation) noexcept -> Result {
         return resumed
             ? Result{MYOS_STATUS_OK, 0, Disposition::Resume}
             : returned(error_status(resumed.error()));
+    }
+    /*luna change: expose the three FaultKey owner edges through the existing Vproc syscall locus, reason: the key is lane-local and no capability or OperationKey lookup belongs in this path*/
+    case MYOS_SYS_VPROC_FAULT_CLAIM: {
+        auto claimed = vproc->claim_fault(invocation.trap.arg(0));
+        if (!claimed) {
+            return returned(error_status(claimed.error()));
+        }
+        usize kind{};
+        switch (claimed.value()) {
+        case mm::FaultKind::Ready:
+        case mm::FaultKind::Materialized:
+            kind = MYOS_VPROC_FAULT_KIND_PAGE_READY;
+            break;
+        case mm::FaultKind::BackingFailed:
+            kind = MYOS_VPROC_FAULT_KIND_BACKING_FAILED;
+            break;
+        default:
+            KASSERT(false);
+            return returned(MYOS_STATUS_INTERNAL);
+        }
+        return returned(MYOS_STATUS_OK, kind);
+    }
+    case MYOS_SYS_VPROC_FAULT_RESUME: {
+        auto resumed = vproc->resume_fault(
+            invocation.trap, invocation.trap.arg(0));
+        if (!resumed) {
+            return returned(error_status(resumed.error()));
+        }
+        switch (resumed.value()) {
+        case mm::FaultKind::Ready:
+        case mm::FaultKind::Materialized:
+            return Result{MYOS_STATUS_OK, 0, Disposition::Resume};
+        case mm::FaultKind::Pending:
+        case mm::FaultKind::Busy:
+        case mm::FaultKind::Pressure:
+            return returned(MYOS_STATUS_RETRY);
+        case mm::FaultKind::ResourceExhausted:
+        case mm::FaultKind::OutOfMemory:
+            return returned(MYOS_STATUS_NO_MEMORY);
+        case mm::FaultKind::BackingFailed:
+        case mm::FaultKind::NoMapping:
+        case mm::FaultKind::Guard:
+        case mm::FaultKind::AccessDenied:
+            return returned(
+                resumed.value() == mm::FaultKind::BackingFailed
+                    ? MYOS_STATUS_BACKING_FAILED
+                    : MYOS_STATUS_PEER_FAULT);
+        }
+        KASSERT(false);
+        return returned(MYOS_STATUS_INTERNAL);
+    }
+    case MYOS_SYS_VPROC_FAULT_DROP: {
+        auto dropped = vproc->drop_fault(invocation.trap.arg(0));
+        return dropped
+            ? returned(MYOS_STATUS_OK)
+            : returned(error_status(dropped.error()));
     }
     case MYOS_SYS_VPROC_CHECKPOINT:
         return returned(MYOS_STATUS_OK, vproc->pending_sequence());

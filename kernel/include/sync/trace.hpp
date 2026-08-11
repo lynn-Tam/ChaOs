@@ -44,6 +44,8 @@ enum class LockClass : u8 {
     ResourcePool,
     VSpace,
     VSpaceWork,
+    /*luna change: add a distinct bounded-memory executor lock class, reason: lock tracing must identify the new owner without conflating VSpace work*/
+    MemoryWork,
     MemoryObject,
     BackingTree,
     BackingStorage,
@@ -62,6 +64,8 @@ enum class LockClass : u8 {
     Tunnel,
     Channel,
     Pager,
+    /*luna change: distinguish bounded reclaim ownership in lock traces, reason: the new reclaimer lock must remain visible to existing lock diagnostics*/
+    Reclaimer,
     Irq,
     IrqRegistry,
     Terminal,

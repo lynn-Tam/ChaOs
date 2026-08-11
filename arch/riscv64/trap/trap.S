@@ -181,6 +181,9 @@ arch_riscv64_trap_entry:
     NOTE: sp 必须很晚恢复。因为现在的 sp 是 TrapFrame 基址
           t0 也要很晚恢复。因为它在恢复 CSR 时还被当 scratch 用
     */
+    /*luna change: clear the emergency latch with the still-scratch t0 after trap exit and register restore, reason: preserve every restored user GPR through sret*/
+    csrr t0, sscratch
+    sd zero, RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET(t0)
     ld t0, T0_OFFSET(sp)
     ld sp, SP_OFFSET(sp)
     sret

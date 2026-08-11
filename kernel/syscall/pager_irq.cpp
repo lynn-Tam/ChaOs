@@ -8,6 +8,7 @@
 #include <mm/memory_object.hpp>
 #include <ipc/notification.hpp>
 #include <uapi/syscall.h>
+#include <uapi/pager.h>
 
 namespace kernel::syscall {
 namespace {
@@ -53,6 +54,8 @@ namespace {
     case mm::MemoryError::ResourceExhausted:
     case mm::MemoryError::GenerationExhausted:
         return MYOS_STATUS_NO_MEMORY;
+    case mm::MemoryError::Pressure:
+        return MYOS_STATUS_RETRY;
     case mm::MemoryError::Busy:
         return MYOS_STATUS_BUSY;
     case mm::MemoryError::Pending:
@@ -73,6 +76,52 @@ namespace {
     return MYOS_STATUS_INTERNAL;
 }
 
+[[nodiscard]] auto pager_descriptor(
+    const kernel::pager::Request& request) noexcept -> myos_pager_request {
+    myos_pager_request descriptor{};
+    descriptor.version = MYOS_PAGER_REQUEST_VERSION;
+    descriptor.kind = request.kind == kernel::pager::DeliveryKind::PageIn
+        ? MYOS_PAGER_REQUEST_PAGE_IN : MYOS_PAGER_REQUEST_WRITEBACK;
+    descriptor.flags = MYOS_PAGER_REQUEST_FLAGS_NONE;
+    descriptor.urgency = request.urgency;
+    descriptor.delivery_slot = request.key.slot;
+    descriptor.delivery_generation = request.key.generation;
+    descriptor.claim_generation = request.claim.generation;
+    descriptor.page_generation = request.page_key.generation;
+    descriptor.page_index = request.page_key.index;
+    if (request.kind == kernel::pager::DeliveryKind::PageIn) {
+        descriptor.payload.page_in.first = request.first;
+        descriptor.payload.page_in.count = request.count;
+        descriptor.payload.page_in.backing_epoch = request.backing_epoch;
+    } else {
+        descriptor.payload.writeback.writeback_generation =
+            request.writeback_generation;
+        descriptor.payload.writeback.dirty_epoch = request.dirty_epoch;
+    }
+    return descriptor;
+}
+
+[[nodiscard]] auto read_ipc_descriptor(
+    Invocation& invocation,
+    usize offset) noexcept -> libk::Expected<myos_pager_request, myos_status_t> {
+    auto* const buffer = invocation.target.ipc_buffer();
+    if (buffer == nullptr) {
+        return libk::unexpected(MYOS_STATUS_WOULD_BLOCK);
+    }
+    auto access = buffer->access();
+    if (!access) {
+        return libk::unexpected(MYOS_STATUS_RETRY);
+    }
+    myos_pager_request descriptor{};
+    if (!access.value().read(
+            offset,
+            libk::Span<byte>{
+                reinterpret_cast<byte*>(&descriptor), sizeof(descriptor)})) {
+        return libk::unexpected(MYOS_STATUS_RETRY);
+    }
+    return libk::expected(descriptor);
+}
+
 auto handle_pager_request(Invocation& invocation) noexcept -> Result {
     auto resolved = invocation.cspace.resolve<kernel::pager::Pager>(
         handle_of(invocation.trap.arg(0)),
@@ -87,7 +136,8 @@ auto handle_pager_request(Invocation& invocation) noexcept -> Result {
     const usize count = invocation.trap.arg(3);
     if (authority == nullptr || invocation.trap.arg(1) == 0
         || invocation.trap.arg(4) == 0 || count == 0
-        || count > authority->max_pages) {
+        || count > authority->max_pages
+        || invocation.trap.arg(5) > libk::numeric_limits<u8>::max()) {
         return returned(MYOS_STATUS_BAD_ARGS);
     }
     const auto request = resolved.value()->publish(
@@ -112,11 +162,30 @@ auto handle_pager_claim(Invocation& invocation) noexcept -> Result {
     if (!resolved) {
         return returned(cap_status(resolved.error()));
     }
+    auto* const buffer = invocation.target.ipc_buffer();
+    if (buffer == nullptr) {
+        return returned(MYOS_STATUS_WOULD_BLOCK);
+    }
+    auto access = buffer->access();
+    if (!access) {
+        return returned(MYOS_STATUS_RETRY);
+    }
     const auto request = resolved.value()->try_claim();
-    return request
-        ? returned(MYOS_STATUS_OK, request.value().key.slot,
-            request.value().key.generation)
-        : returned(pager_error(request.error()));
+    if (!request) {
+        return returned(pager_error(request.error()));
+    }
+    const auto descriptor = pager_descriptor(request.value());
+    if (!access.value().write(
+            0,
+            libk::Span<const byte>{
+                reinterpret_cast<const byte*>(&descriptor),
+                sizeof(descriptor)})) {
+        static_cast<void>(resolved.value()->requeue(
+            request.value().claim, request.value()));
+        return returned(MYOS_STATUS_RETRY);
+    }
+    return returned(MYOS_STATUS_OK, request.value().key.slot,
+        request.value().key.generation);
 }
 
 auto handle_pager_finish(
@@ -129,17 +198,114 @@ auto handle_pager_finish(
     if (!resolved) {
         return returned(cap_status(resolved.error()));
     }
-    const kernel::pager::RequestKey key{
-        .slot = static_cast<u16>(invocation.trap.arg(1)),
-        .generation = invocation.trap.arg(2),
+    auto descriptor = read_ipc_descriptor(
+        invocation, invocation.trap.arg(4));
+    if (!descriptor) {
+        return returned(descriptor.error());
+    }
+    if (descriptor.value().version != MYOS_PAGER_REQUEST_VERSION
+        || descriptor.value().flags != MYOS_PAGER_REQUEST_FLAGS_NONE
+        || descriptor.value().delivery_slot
+            > libk::numeric_limits<u16>::max()
+        || descriptor.value().delivery_generation == 0
+        || descriptor.value().claim_generation == 0
+        || descriptor.value().page_generation == 0
+        || descriptor.value().urgency > libk::numeric_limits<u8>::max()) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const kernel::pager::ClaimKey key{
+        .delivery = kernel::pager::RequestKey{
+            .slot = static_cast<u16>(descriptor.value().delivery_slot),
+            .generation = descriptor.value().delivery_generation},
+        .generation = descriptor.value().claim_generation,
     };
-    auto result = operation == MYOS_SYS_PAGER_REQUEUE
-        ? resolved.value()->requeue(key)
-        : operation == MYOS_SYS_PAGER_COMPLETE
-            ? resolved.value()->complete(key)
-            : resolved.value()->fail(key);
+    if (operation == MYOS_SYS_PAGER_REQUEUE) {
+        if (descriptor.value().flags != MYOS_PAGER_REQUEST_FLAGS_NONE) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        kernel::pager::Request expected{
+            .key = key.delivery,
+            .claim = key,
+            .kind = descriptor.value().kind
+                == MYOS_PAGER_REQUEST_PAGE_IN
+                ? kernel::pager::DeliveryKind::PageIn
+                : descriptor.value().kind == MYOS_PAGER_REQUEST_WRITEBACK
+                    ? kernel::pager::DeliveryKind::Writeback
+                    : kernel::pager::DeliveryKind::PageIn,
+            .page_key = mm::PageKey{
+                descriptor.value().page_generation,
+                descriptor.value().page_index},
+            .urgency = static_cast<u8>(descriptor.value().urgency),
+        };
+        if (descriptor.value().kind == MYOS_PAGER_REQUEST_PAGE_IN) {
+            expected.first = descriptor.value().payload.page_in.first;
+            expected.count = descriptor.value().payload.page_in.count;
+            expected.backing_epoch =
+                descriptor.value().payload.page_in.backing_epoch;
+        } else if (descriptor.value().kind
+            == MYOS_PAGER_REQUEST_WRITEBACK) {
+            expected.first = descriptor.value().page_index;
+            expected.count = 1;
+            expected.backing_epoch =
+                descriptor.value().payload.writeback.dirty_epoch;
+            expected.writeback_generation =
+                descriptor.value().payload.writeback.writeback_generation;
+            expected.dirty_epoch =
+                descriptor.value().payload.writeback.dirty_epoch;
+        } else {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        if (expected.page_key.generation == 0 || expected.count == 0
+            || (expected.kind == kernel::pager::DeliveryKind::Writeback
+                && (!expected.writeback_generation
+                    || !expected.dirty_epoch))) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        const auto result = resolved.value()->requeue(key, expected);
+        return result ? returned(MYOS_STATUS_OK)
+                      : returned(pager_error(result.error()));
+    }
+    auto target = invocation.cspace.resolve<kernel::mm::MemoryObject>(
+        handle_of(invocation.trap.arg(1)), cap::Rights::of(cap::Right::Manage));
+    if (!target) {
+        return returned(cap_status(target.error()));
+    }
+    const usize page = descriptor.value().page_index;
+    const mm::PageKey page_key{
+        descriptor.value().page_generation, page};
+    libk::Expected<void, mm::MemoryError> result{
+        libk::unexpected(mm::MemoryError::InvalidState)};
+    if (descriptor.value().kind == MYOS_PAGER_REQUEST_PAGE_IN) {
+        if (operation != MYOS_SYS_PAGER_FAIL
+            || descriptor.value().flags != MYOS_PAGER_REQUEST_FLAGS_NONE) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        result = target.value().object().pager_fail(
+            resolved.value().object(), page, page_key, key);
+    } else if (descriptor.value().kind == MYOS_PAGER_REQUEST_WRITEBACK) {
+        if (descriptor.value().payload.writeback.writeback_generation == 0
+            || descriptor.value().payload.writeback.dirty_epoch == 0) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        const mm::WritebackKey writeback_key{
+            page_key,
+            descriptor.value().payload.writeback.writeback_generation,
+            descriptor.value().payload.writeback.dirty_epoch};
+        if (operation == MYOS_SYS_PAGER_COMPLETE) {
+            result = target.value().object().complete_writeback(
+                resolved.value().object(), page, writeback_key,
+                key.delivery.generation, key.generation);
+        } else {
+            result = target.value().object().fail_writeback(
+                resolved.value().object(), page, writeback_key,
+                key.delivery.generation, key.generation,
+                mm::WritebackFailure::Io);
+        }
+    } else {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
     return result ? returned(MYOS_STATUS_OK)
-                  : returned(pager_error(result.error()));
+                  : returned(memory_error(result.error()));
 }
 
 auto handle_pager_supply(Invocation& invocation) noexcept -> Result {
@@ -154,18 +320,36 @@ auto handle_pager_supply(Invocation& invocation) noexcept -> Result {
             : !target ? target.error() : source.error()));
     }
     const usize page = invocation.trap.arg(3);
-    const u64 request_generation = invocation.trap.arg(4);
-    const u64 claim_generation = invocation.trap.arg(5);
-    if (request_generation == 0 || claim_generation == 0) {
+    auto descriptor = read_ipc_descriptor(
+        invocation, invocation.trap.arg(4));
+    if (!descriptor) {
+        return returned(descriptor.error());
+    }
+    if (descriptor.value().version != MYOS_PAGER_REQUEST_VERSION
+        || descriptor.value().kind != MYOS_PAGER_REQUEST_PAGE_IN
+        || descriptor.value().flags != MYOS_PAGER_REQUEST_FLAGS_NONE
+        || descriptor.value().page_generation == 0
+        || descriptor.value().claim_generation == 0
+        || descriptor.value().delivery_generation == 0
+        || descriptor.value().delivery_slot
+            > libk::numeric_limits<u16>::max()
+        || descriptor.value().payload.page_in.content_epoch == 0) {
         return returned(MYOS_STATUS_BAD_ARGS);
     }
     auto transfer = source.value().object().begin_transfer(page);
     if (!transfer) {
         return returned(memory_error(transfer.error()));
     }
+    const usize target_page = descriptor.value().page_index;
     auto supplied = target.value().object().pager_supply_transfer(
-        libk::move(transfer).value(), page, request_generation,
-        claim_generation, request_generation);
+        pager.value().object(), libk::move(transfer).value(), target_page,
+        mm::PageKey{descriptor.value().page_generation, target_page},
+        kernel::pager::ClaimKey{
+            kernel::pager::RequestKey{
+                static_cast<u16>(descriptor.value().delivery_slot),
+                descriptor.value().delivery_generation},
+            descriptor.value().claim_generation},
+        descriptor.value().payload.page_in.content_epoch);
     return supplied ? returned(MYOS_STATUS_OK)
                     : returned(memory_error(supplied.error()));
 }

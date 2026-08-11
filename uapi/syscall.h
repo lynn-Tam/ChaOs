@@ -69,6 +69,11 @@
 #define MYOS_SYS_TUNNEL_ACK           106 /* a0=receiver cap, a1=observed sequence */
 #define MYOS_SYS_TUNNEL_CLOSE         107 /* a0=Tunnel Admin or Tx */
 
+/*luna change: reserve the Vproc fault continuation syscall range, reason: FaultKey operations stay separate from ordinary upcall return and transport identities*/
+#define MYOS_SYS_VPROC_FAULT_CLAIM     108 /* a0=FaultKey */
+#define MYOS_SYS_VPROC_FAULT_RESUME    109 /* a0=FaultKey */
+#define MYOS_SYS_VPROC_FAULT_DROP      110 /* a0=FaultKey */
+
 #define MYOS_SYS_ENDPOINT_CALL        112 /* a0=Endpoint, a1-a3=service words, a4=relative timeout ns (0=infinite) */
 #define MYOS_SYS_ENDPOINT_REPLY       113 /* a0=status, a1=value */
 #define MYOS_SYS_ENDPOINT_CLOSE       114 /* a0=Endpoint */
@@ -89,14 +94,14 @@
 #define MYOS_SYS_CLOCK_FREQUENCY       129
 
 #define MYOS_SYS_PAGER_REQUEST         130 /* a0=pager, a1=page gen, a2=first, a3=count, a4=epoch */
-#define MYOS_SYS_PAGER_CLAIM           131 /* a0=pager */
-#define MYOS_SYS_PAGER_REQUEUE         132 /* a0=pager, a1=slot, a2=generation */
-#define MYOS_SYS_PAGER_COMPLETE        133 /* a0=pager, a1=slot, a2=generation */
-#define MYOS_SYS_PAGER_FAIL            134 /* a0=pager, a1=slot, a2=generation */
+#define MYOS_SYS_PAGER_CLAIM           131 /* a0=pager; writes the tagged request to the registered IPC buffer */
+#define MYOS_SYS_PAGER_REQUEUE         132 /* a0=pager, a4=registered IPC-buffer descriptor offset */
+#define MYOS_SYS_PAGER_COMPLETE        133 /* a0=pager, a1=target memory, a4=registered IPC-buffer descriptor offset */
+#define MYOS_SYS_PAGER_FAIL            134 /* a0=pager, a1=target memory, a4=registered IPC-buffer descriptor offset */
 #define MYOS_SYS_IRQ_BIND              135 /* a0=irq, a1=notification, a2=badge */
 #define MYOS_SYS_IRQ_OBSERVE           136 /* a0=irq */
 #define MYOS_SYS_IRQ_ACK               137 /* a0=irq, a1=sequence */
-#define MYOS_SYS_PAGER_SUPPLY          138 /* a0=pager, a1=target memory, a2=staging memory, a3=page, a4=req gen, a5=claim gen */
+#define MYOS_SYS_PAGER_SUPPLY          138 /* a0=pager, a1=target memory, a2=staging memory, a3=page, a4=registered IPC-buffer descriptor offset */
 #define MYOS_SYS_TERMINAL_QUERY        139 /* a0=Thread or Vproc; returns sequence/status */
 #define MYOS_SYS_TERMINAL_OBSERVE_BIND 140 /* a0=Thread or Vproc, a1=Notification, a2=badge */
 #define MYOS_SYS_PAGER_BIND             141 /* a0=pager, a1=Notification, a2=badge */

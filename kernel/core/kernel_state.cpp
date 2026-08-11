@@ -66,6 +66,7 @@ KernelState::~KernelState() noexcept {
         grants().unbind_work_notifier();
     }
     vspace_work_.unbind_notifier();
+    memory_work_.unbind_notifier();
     cpus_.reset();
     release_scheduler_objects();
     grants_.reset();
@@ -184,6 +185,9 @@ auto KernelState::start_reclaimer(
     objects().bind_reclaim_notifier(
         kernel::object::ObjectStore::ReclaimNotifier::bind<
             &KernelState::wake_reclaimer>(*this));
+    memory_work_.bind_notifier(
+        kernel::mm::MemoryExecutor::Notifier::bind<
+            &KernelState::wake_reclaimer>(*this));
     vspace_work_.bind_notifier(
         kernel::mm::VSpaceExecutor::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
@@ -206,6 +210,7 @@ auto KernelState::start_reclaimer(
     u64 object_total{};
     u64 grant_total{};
     u64 vspace_total{};
+    u64 memory_total{};
     const auto add_progress = [](
                                   u64& total,
                                   usize delta) noexcept {
@@ -244,6 +249,20 @@ auto KernelState::start_reclaimer(
         const usize object_count = kernel.objects().drain_reclaim();
         add_progress(object_total, object_count);
         kernel.reclaimer_observation_.advance(object_count);
+        mm::WaitClaim pressure_ready[mm::PageReclaimer::pass_budget]{};
+        const usize ready_count = kernel.pressure_work_.wake(
+            kernel.pmm().frame_progress_generation(),
+            pressure_ready,
+            mm::PageReclaimer::pass_budget);
+        /*luna change: consume already-finalized pressure claims without a relation callback unlink, reason: PageReclaimer closes relation reuse before publishing readiness*/
+        for (usize index = 0; index < ready_count; ++index) {
+            mm::WaitClaim claim = libk::move(pressure_ready[index]);
+            /*luna change: assert finalized pressure claim delivery, reason: wake already completed host unlink and cannot leave an unconsumed snapshot*/
+            KASSERT(claim);
+            KASSERT(claim.publish());
+            KASSERT(claim.release());
+            claim.reset();
+        }
         work_observation.advance(object_count);
         diag::concurrency::ObservationBatch object_update{
             .phase = 1,
@@ -306,7 +325,11 @@ auto KernelState::start_reclaimer(
         vspace_update.detail[2] = grant_total;
         vspace_update.detail[3] = vspace_total;
         kernel.reclaimer_observation_.publish(vspace_update);
-        if (grant.more || vspace.more
+        const auto memory = kernel.memory_work_.run(8);
+        add_progress(memory_total, memory.progressed);
+        kernel.reclaimer_observation_.advance(memory.progressed);
+        work_observation.advance(memory.progressed);
+        if (grant.more || vspace.more || memory.more
             || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();
@@ -463,7 +486,9 @@ auto KernelState::initialize_object_store() noexcept -> bool {
     if (objects_) {
         return false;
     }
-    [[maybe_unused]] auto& store = objects_.emplace(pmm(), vspace_work_);
+    /*luna change: construct ObjectStore with the shared MemoryExecutor, reason: MemoryObject admission must use one runtime service owner*/
+    [[maybe_unused]] auto& store = objects_.emplace(
+        pmm(), vspace_work_, memory_work_);
     return true;
 }
 

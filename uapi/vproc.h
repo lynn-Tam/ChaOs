@@ -6,7 +6,8 @@
 #include <uapi/types.h>
 
 #define MYOS_VPROC_START_VERSION 2U
-#define MYOS_VPROC_RUNTIME_VERSION 4U
+/*luna change: bump the runtime page ABI for fault projection fields, reason: userspace must validate the expanded event page contract*/
+#define MYOS_VPROC_RUNTIME_VERSION 5U
 #define MYOS_VPROC_ARM_VERSION 1U
 #define MYOS_VPROC_CONTEXT_WORDS 32U
 #define MYOS_VPROC_MAX_OPERATIONS 32U
@@ -14,6 +15,23 @@
 #define MYOS_VPROC_MAX_NOTIFICATIONS 8U
 
 typedef uint64_t myos_operation_key_t;
+/*luna change: publish one lane-local fault identity, reason: a Vproc fault continuation must not reuse operation or ingress identities*/
+typedef uint64_t myos_fault_key_t;
+
+/*luna change: expose only durable Vproc fault outcomes, reason: internal retry and materialization phases are not ABI event states*/
+#define MYOS_VPROC_FAULT_KIND_NONE              0U
+#define MYOS_VPROC_FAULT_KIND_PAGE_READY        1U
+#define MYOS_VPROC_FAULT_KIND_NO_MAPPING        2U
+#define MYOS_VPROC_FAULT_KIND_GUARD             3U
+#define MYOS_VPROC_FAULT_KIND_ACCESS_DENIED     4U
+#define MYOS_VPROC_FAULT_KIND_RESOURCE_EXHAUSTED 5U
+#define MYOS_VPROC_FAULT_KIND_OUT_OF_MEMORY     6U
+#define MYOS_VPROC_FAULT_KIND_BACKING_FAILED    7U
+
+#define MYOS_VPROC_FAULT_ACCESS_NONE            0U
+#define MYOS_VPROC_FAULT_ACCESS_READ            1U
+#define MYOS_VPROC_FAULT_ACCESS_WRITE           2U
+#define MYOS_VPROC_FAULT_ACCESS_EXECUTE         3U
 
 #define MYOS_OPERATION_SLOT_BITS 8U
 #define MYOS_OPERATION_SLOT_MASK UINT64_C(0xff)
@@ -91,5 +109,10 @@ struct myos_vproc_event_page {
     myos_word_t ingress_tag[MYOS_VPROC_MAX_INGRESS];
     uint64_t notification_sequence[MYOS_VPROC_MAX_NOTIFICATIONS];
     myos_word_t notification_tag[MYOS_VPROC_MAX_NOTIFICATIONS];
+    myos_fault_key_t fault_key;
+    uint32_t fault_kind;
+    uint32_t fault_access;
+    myos_word_t fault_address;
+    myos_word_t fault_pc;
     struct myos_user_context delivered;
 };

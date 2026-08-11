@@ -187,6 +187,20 @@ auto TrapContext::frame() const noexcept -> UserFrame {
     return TrapContextAccess::frame(frame_);
 }
 
+/*luna change: preserve the interrupted frame in the Vproc-reserved cell, reason: runtime entry may rewrite the ordinary trap frame while FaultSlot owns the exact return token*/
+auto TrapContext::save_frame(usize raw_stack_top) const noexcept -> UserFrame {
+    if (raw_stack_top < sizeof(riscv64::TrapFrame)
+        || (raw_stack_top & 0xfU) != 0) {
+        return {};
+    }
+    auto* const source = static_cast<riscv64::TrapFrame*>(frame_);
+    auto* const reserved = reinterpret_cast<riscv64::TrapFrame*>(
+        raw_stack_top - sizeof(riscv64::TrapFrame));
+    KASSERT(source != nullptr && source != reserved);
+    *reserved = *source;
+    return TrapContextAccess::frame(reserved);
+}
+
 void TrapContext::redirect(UserFrame frame) noexcept {
     KASSERT(frame);
     frame_ = TrapContextAccess::raw(frame);

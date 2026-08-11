@@ -8,10 +8,33 @@
 
 namespace kernel::mm {
 
+/*luna change: centralize VSpaceError to FaultKind mapping, reason: Thread and Vproc continuations consume one canonical fault classification*/
+auto fault_kind(VSpaceError error) noexcept -> FaultKind {
+    switch (error) {
+    case VSpaceError::Busy:
+        return FaultKind::Busy;
+    case VSpaceError::Pressure:
+        return FaultKind::Pressure;
+    case VSpaceError::OutOfMemory:
+        return FaultKind::OutOfMemory;
+    case VSpaceError::ResourceExhausted:
+    case VSpaceError::QuotaExceeded:
+        return FaultKind::ResourceExhausted;
+    case VSpaceError::BackingFailed:
+        return FaultKind::BackingFailed;
+    default:
+        return FaultKind::BackingFailed;
+    }
+}
+
 auto VSpace::fault(
     VmContext context,
     VirtAddr address,
-    Access access) noexcept -> libk::Expected<FaultResult, VSpaceError> {
+    Access access,
+    WaitRelation* relation,
+    void* owner,
+    WaitRelation::Publish publish) noexcept
+    -> libk::Expected<FaultResult, VSpaceError> {
     const usize aligned = address.raw() & ~(page_size - 1);
     const VirtRange page_range{VirtAddr{aligned}, page_size};
     if (!valid_user_range(page_range)) {
@@ -76,14 +99,23 @@ auto VSpace::fault(
     }
     KASSERT(mapping != nullptr);
     return materialize_fault(
-        context, *mapping, page_range.base(), object_page);
+        context,
+        *mapping,
+        page_range.base(),
+        object_page,
+        relation,
+        owner,
+        publish);
 }
 
 auto VSpace::materialize_fault(
     VmContext context,
     Mapping& mapping,
     VirtAddr page_address,
-    usize object_page) noexcept
+    usize object_page,
+    WaitRelation* relation,
+    void* owner,
+    WaitRelation::Publish publish) noexcept
     -> libk::Expected<FaultResult, VSpaceError> {
     MappingAuthority& authority = *mapping.authority_;
     auto fail = [&](FaultKind kind)
@@ -96,10 +128,17 @@ auto VSpace::materialize_fault(
             .object_page = object_page,
         });
     };
-    auto resident = authority.memory().materialize(object_page);
+    MemoryObject* const memory = &authority.memory();
+    auto resident = memory->materialize(
+        object_page, relation, owner, publish);
     if (!resident) {
         if (resident.error() == MemoryError::Pending) {
-            return fail(FaultKind::Pending);
+            auto pending = fail(FaultKind::Pending);
+            /*luna change: preserve the pinned MemoryObject identity after Pending handoff, reason: an early callback may finalize the relation before this function returns*/
+            if (pending && relation != nullptr) {
+                pending.value().memory = memory;
+            }
+            return pending;
         }
         if (resident.error() == MemoryError::Busy) {
             return fail(FaultKind::Busy);

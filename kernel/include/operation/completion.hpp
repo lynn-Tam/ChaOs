@@ -40,6 +40,12 @@ struct Result final {
 // the home dispatcher remains the sole owner of run-state transitions.
 class Completion final : private libk::noncopyable_nonmovable {
 public:
+    /*luna change: add a private resume disposition for serial rearm, reason: a page continuation must retain its owner without attaching a new Completion inside finish*/
+    enum class ResumeResult : u8 {
+        Done,
+        Rearm,
+    };
+
     template<
         typename Owner,
         bool (Owner::*Complete)() const noexcept,
@@ -88,6 +94,36 @@ public:
             },
             .resume = [](void* context, arch::TrapContext& trap) noexcept {
                 (static_cast<Owner*>(context)->*Resume)(trap);
+                return ResumeResult::Done;
+            },
+        };
+        return Completion{owner, operations};
+    }
+
+    template<
+        typename Owner,
+        bool (Owner::*Complete)() const noexcept,
+        Result (Owner::*Read)() noexcept,
+        void (Owner::*Release)() noexcept,
+        bool (Owner::*Cancel)() noexcept,
+        ResumeResult (Owner::*Resume)(arch::TrapContext&) noexcept>
+    [[nodiscard]] static auto bind_resume(Owner& owner) noexcept
+        -> Completion {
+        static constexpr Ops operations{
+            .complete = [](const void* context) noexcept {
+                return (static_cast<const Owner*>(context)->*Complete)();
+            },
+            .read = [](void* context) noexcept -> Result {
+                return (static_cast<Owner*>(context)->*Read)();
+            },
+            .release = [](void* context) noexcept {
+                (static_cast<Owner*>(context)->*Release)();
+            },
+            .cancel = [](void* context) noexcept -> bool {
+                return (static_cast<Owner*>(context)->*Cancel)();
+            },
+            .resume = [](void* context, arch::TrapContext& trap) noexcept {
+                return (static_cast<Owner*>(context)->*Resume)(trap);
             },
         };
         return Completion{owner, operations};
@@ -138,7 +174,7 @@ private:
         Result (*read)(void*) noexcept;
         void (*release)(void*) noexcept;
         bool (*cancel)(void*) noexcept;
-        void (*resume)(void*, arch::TrapContext&) noexcept{};
+        ResumeResult (*resume)(void*, arch::TrapContext&) noexcept{};
     };
 
     template<typename Owner>
@@ -152,7 +188,8 @@ private:
         Vproc& vproc,
         CpuRegistry& cpus,
         operation::Key key) noexcept;
-    void finish(arch::TrapContext& trap) noexcept;
+    [[nodiscard]] auto finish(arch::TrapContext& trap) noexcept
+        -> ResumeResult;
     // Returns true when this call detached and drained the operation. False
     // means completion publication already owns the edge or the operation is
     // committed and must reach its normal terminal event.

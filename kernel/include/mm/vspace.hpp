@@ -66,6 +66,7 @@ enum class VSpaceError : u8 {
     ShootdownUnavailable,
     TranslationCorrupt,
     ResourceExhausted,
+    Pressure,
 };
 
 enum class VmStatus : u8 {
@@ -117,16 +118,25 @@ enum class FaultKind : u8 {
     AccessDenied,
     Busy,
     Pending,
+    /*luna change: preserve pressure classes through the page continuation, reason: Stage C resource policy must not collapse into pager failure*/
+    Pressure,
+    ResourceExhausted,
+    OutOfMemory,
     BackingFailed,
     Ready,
     Materialized,
 };
+
+/*luna change: share VSpace error classification at the fault boundary, reason: continuation adapters must not duplicate resource policy mapping*/
+[[nodiscard]] auto fault_kind(VSpaceError error) noexcept -> FaultKind;
 
 struct FaultResult final {
     FaultKind kind{FaultKind::NoMapping};
     MappingKey mapping{};
     usize object_page{};
     VmStatus status{VmStatus::Complete};
+    /*luna change: return the pinned MemoryObject identity for Pending faults, reason: PageFault owns cancellation through the retained operations pin*/
+    MemoryObject* memory{};
 };
 
 struct PageUsage final {
@@ -234,7 +244,11 @@ public:
     [[nodiscard]] auto fault(
         VmContext context,
         VirtAddr address,
-        Access access) noexcept -> libk::Expected<FaultResult, VSpaceError>;
+        Access access,
+        WaitRelation* relation = nullptr,
+        void* owner = nullptr,
+        WaitRelation::Publish publish = nullptr) noexcept
+        -> libk::Expected<FaultResult, VSpaceError>;
     // Samples the architecture projection of one materialized PTE and folds
     // it into the MemoryObject page truth. When clear is true the selected
     // A/D bits are cleared through the normal translation/shootdown path.
@@ -378,7 +392,10 @@ private:
         VmContext context,
         Mapping& mapping,
         VirtAddr page_address,
-        usize object_page) noexcept
+        usize object_page,
+        WaitRelation* relation,
+        void* owner,
+        WaitRelation::Publish publish) noexcept
         -> libk::Expected<FaultResult, VSpaceError>;
     [[nodiscard]] auto reserve_tables(
         MappedPage* pages) noexcept

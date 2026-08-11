@@ -1,4 +1,5 @@
 #include <mm/memory_object.hpp>
+#include <mm/memory_work.hpp>
 
 #include <object/pager_pool.hpp>
 #include <pager/pager.hpp>
@@ -169,7 +170,7 @@ public:
             auto allocated = pmm_->allocate_page();
             if (!allocated) {
                 reset();
-                return libk::unexpected(MemoryError::OutOfMemory);
+                return libk::unexpected(MemoryError::Pressure);
             }
             OwnedPage page = libk::move(allocated).value();
             auto* const block = libk::construct_at(
@@ -373,7 +374,7 @@ public:
             auto allocated = pmm_->allocate_page();
             if (!allocated) {
                 rollback(*candidate);
-                return libk::unexpected(MemoryError::OutOfMemory);
+                return libk::unexpected(MemoryError::Pressure);
             }
             OwnedPage resident = libk::move(allocated).value();
             memset(resident.bytes(), 0, page_size);
@@ -543,7 +544,7 @@ private:
                 kernel::sync::IrqLockGuard guard{storage_lock_};
                 KASSERT(growing_);
                 growing_ = false;
-                return libk::unexpected(MemoryError::OutOfMemory);
+                return libk::unexpected(MemoryError::Pressure);
             }
             OwnedPage backing = libk::move(allocated).value();
             auto* const page = libk::construct_at(
@@ -619,6 +620,8 @@ private:
     kernel::resource::Sponsorship* sponsor_{};
 };
 
+} // namespace
+
 class PagerBacking final : private libk::noncopyable_nonmovable {
     struct Slot;
     struct PageHeader;
@@ -631,6 +634,9 @@ class PagerBacking final : private libk::noncopyable_nonmovable {
         OwnedPage resident{};
         Slot* owner{};
         Node* next{};
+        /*luna change: replace hand-linked work and ready metadata with intrusive hooks, reason: libk owns membership and O(1) erase without parallel flags*/
+        libk::IntrusiveListHook work_hook_{};
+        libk::IntrusiveListHook ready_hook_{};
         using MappingList = libk::IntrusiveList<
             PageMapping, &PageMapping::backing_hook_>;
         MappingList mappings{};
@@ -675,37 +681,245 @@ class PagerBacking final : private libk::noncopyable_nonmovable {
 
 public:
     PagerBacking(
+        MemoryObject& owner,
         Pmm& pmm,
         kernel::pager::Pager& pager,
         AccessMask access,
         kernel::resource::Sponsorship* sponsor) noexcept
-        : pmm_(&pmm), pager_(&pager), access_(access), sponsor_(sponsor) {
+        : owner_(&owner), pmm_(&pmm), pager_(&pager), access_(access),
+          sponsor_(sponsor) {
         static_assert(slots_per_page != 0);
+        attachment_ = kernel::pager::PagerAttachment{
+            .context = this,
+            .transition = &PagerBacking::request_transition,
+            .drained = &PagerBacking::request_drained,
+        };
+    }
+
+    [[nodiscard]] auto init() noexcept -> libk::Expected<void, MemoryError> {
+        return pager_->attach(attachment_)
+            ? libk::expected()
+            : libk::Expected<void, MemoryError>{
+                  libk::unexpected(MemoryError::AttachmentState)};
     }
 
     ~PagerBacking() noexcept { reset(); }
 
-    static void request_finished(
+    void stop() noexcept {
+        if (attachment_.state != kernel::pager::PagerAttachment::State::Detached) {
+            static_cast<void>(pager_->detach(attachment_));
+        }
+    }
+
+    static auto request_transition(
         void* context,
-        PageKey key,
-        bool failed) noexcept {
+        const kernel::pager::Request& request,
+        kernel::pager::PagerAttachment::Event event) noexcept -> bool {
         auto& self = *static_cast<PagerBacking*>(context);
         kernel::sync::IrqLockGuard guard{self.tree_lock_};
-        Node* const node = self.find_locked(key.index);
-        if (node == nullptr || node->slot.generation != key.generation) {
-            return;
+        Node* const node = self.find_locked(request.page_key.index);
+        if (node == nullptr || node->slot.request.key.generation
+                != request.page_key.generation) {
+            return false;
         }
-        // A Pager completion is only a transport edge.  A target page must
-        // already be Resident before a successful completion can be
-        // accepted; otherwise turn the protocol violation into the same
-        // generation-checked failure as an explicit pager_fail.
-        if (node->slot.state != PageSlotState::Requested
-            && node->slot.state != PageSlotState::Filling) {
-            return;
+        if (request.kind == kernel::pager::DeliveryKind::Writeback) {
+            const WritebackKey key{
+                request.page_key,
+                request.writeback_generation,
+                request.dirty_epoch};
+            switch (event) {
+            case kernel::pager::PagerAttachment::Event::Claim:
+                return static_cast<bool>(node->slot.claim_writeback(
+                    key, request.key.generation, request.claim.generation));
+            case kernel::pager::PagerAttachment::Event::Requeue:
+                return static_cast<bool>(node->slot.requeue_writeback(
+                    key, request.key.generation, request.claim.generation));
+            case kernel::pager::PagerAttachment::Event::Forced:
+                return static_cast<bool>(node->slot.fail_writeback(
+                    key, request.key.generation,
+                    node->slot.state == PageSlotState::WritebackPublished
+                        ? 0 : request.claim.generation,
+                    WritebackFailure::BackingUnavailable));
+            }
+            return false;
         }
-        const u64 claim = node->slot.request.claim_generation;
-        static_cast<void>(node->slot.fail(claim));
-        (void)failed;
+        // Page-in supply/fail owns the target semantic transition. Claim is
+        // transport admission only; forced close invalidates the request.
+        if (event == kernel::pager::PagerAttachment::Event::Forced) {
+            const u64 claim = node->slot.request.claim_generation;
+            const bool failed = static_cast<bool>(node->slot.fail(claim));
+            if (!node->slot.request.waiters.empty()) {
+                self.index_ready_locked(*node);
+            }
+            return failed;
+        }
+        return true;
+    }
+
+    static void request_drained(void* context) noexcept {
+        auto& self = *static_cast<PagerBacking*>(context);
+        self.owner_->release_backing_hold();
+    }
+
+
+    [[nodiscard]] auto drain_page_waiters(
+        usize capacity) noexcept -> usize {
+        if (capacity == 0) {
+            return 0;
+        }
+        constexpr usize budget = 8;
+        const usize limit = capacity < budget ? capacity : budget;
+        WaitClaim batch[budget]{};
+        usize claimed_count{};
+        usize inspected{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            for (auto it = ready_.begin();
+                 it != ready_.end() && inspected < limit;) {
+                Node& node = *it++;
+                ++inspected;
+                if ((node.slot.state == PageSlotState::ResidentClean
+                        || node.slot.state == PageSlotState::ResidentDirty
+                        || node.slot.state == PageSlotState::Failed)
+                    && !node.slot.request.waiters.empty()) {
+                    const PageWaitResult result =
+                        node.slot.request.terminal_result();
+                    claimed_count += node.slot.request.claim_waiters(
+                        batch + claimed_count, limit - claimed_count, result);
+                }
+                if (node.slot.request.waiters.empty()) {
+                    unindex_ready_locked(node);
+                }
+            }
+            /*luna change: finalize waiter relations before callbacks, reason: PageRequest host ownership must close the reuse window before waking Thread/Vproc*/
+            for (usize index = 0; index < claimed_count; ++index) {
+                PageRequest* const request = batch[index].request();
+                KASSERT(request != nullptr
+                    && request->finish_claim(batch[index]));
+            }
+        }
+        /*luna change: reset finalized waiter tokens directly after callback, reason: host ownership already updated the ready index and no PageRequest address scan is safe*/
+        usize published{};
+        for (usize index = 0; index < claimed_count; ++index) {
+            KASSERT(batch[index].publish());
+            KASSERT(batch[index].release());
+            ++published;
+            batch[index].reset();
+        }
+        return published;
+    }
+
+    /*luna change: publish retained requests through an explicit bounded transport phase, reason: Pager is only transport while PageRequest remains semantic truth and slot zero stays valid*/
+    [[nodiscard]] auto service(usize capacity) noexcept -> MemoryServiceBatch {
+        if (capacity == 0) {
+            return {};
+        }
+        usize processed{};
+        usize progressed{};
+        while (processed < capacity) {
+            Node* node{};
+            PageKey page_key{};
+            usize first{};
+            usize count{};
+            {
+                kernel::sync::IrqLockGuard guard{tree_lock_};
+                auto it = work_.begin();
+                while (it != work_.end()) {
+                    Node& candidate = *it++;
+                    ++processed;
+                    if (candidate.slot.state == PageSlotState::Requested
+                        && candidate.slot.request.state
+                            == PageRequestState::Queued) {
+                        node = &candidate;
+                        break;
+                    }
+                    unindex_work_locked(candidate);
+                    if (processed == capacity) {
+                        break;
+                    }
+                }
+                if (node == nullptr) {
+                    break;
+                }
+                if (!node->slot.request.begin_publish()) {
+                    unindex_work_locked(*node);
+                    continue;
+                }
+                page_key = node->slot.request.key;
+                first = node->slot.request.first;
+                count = node->slot.request.count;
+            }
+
+            const auto published = pager_->publish(
+                attachment_, page_key, first, count, page_key.generation);
+            if (!published) {
+                bool terminal{};
+                {
+                    kernel::sync::IrqLockGuard guard{tree_lock_};
+                    Node* const current = find_locked(page_key.index);
+                    if (current != nullptr
+                        && current->slot.request.key == page_key
+                        && current->slot.request.state
+                            == PageRequestState::Publishing) {
+                        KASSERT(current->slot.request.abort_publish());
+                        if (published.error() != kernel::pager::Error::Full) {
+                            if (current->slot.fail(0)) {
+                                unindex_work_locked(*current);
+                                if (!current->slot.request.waiters.empty()) {
+                                    index_ready_locked(*current);
+                                }
+                                terminal = true;
+                            }
+                        }
+                    }
+                }
+                if (published.error() == kernel::pager::Error::Full) {
+                    break;
+                }
+                if (terminal) {
+                    ++progressed;
+                }
+                continue;
+            }
+
+            bool committed{};
+            {
+                kernel::sync::IrqLockGuard guard{tree_lock_};
+                Node* const current = find_locked(page_key.index);
+                if (current != nullptr
+                    && current->slot.request.key == page_key
+                        && current->slot.state == PageSlotState::Requested
+                        && current->slot.request.publish()) {
+                    unindex_work_locked(*current);
+                    committed = true;
+                }
+            }
+            if (!committed) {
+                static_cast<void>(pager_->cancel(published.value().key));
+                kernel::sync::IrqLockGuard guard{tree_lock_};
+                Node* const current = find_locked(page_key.index);
+                if (current != nullptr
+                    && current->slot.request.key == page_key
+                    && current->slot.request.state
+                        == PageRequestState::Publishing) {
+                    KASSERT(current->slot.request.abort_publish());
+                }
+                continue;
+            }
+            ++progressed;
+        }
+
+        const usize remaining = capacity - processed;
+        progressed += drain_page_waiters(remaining);
+        bool more{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            more = !work_.empty() || !ready_.empty();
+        }
+        return MemoryServiceBatch{
+            .processed = processed,
+            .progressed = progressed,
+            .more = more};
     }
 
     [[nodiscard]] auto query(usize page_index) const noexcept -> ContentState {
@@ -730,7 +944,11 @@ public:
         }
     }
 
-    [[nodiscard]] auto materialize(usize page_index) noexcept
+    [[nodiscard]] auto materialize(
+        usize page_index,
+        WaitRelation* relation,
+        void* owner,
+        WaitRelation::Publish publish) noexcept
         -> libk::Expected<MemoryPage, MemoryError> {
         Node* node{};
         {
@@ -748,12 +966,23 @@ public:
                 if (node->slot.state == PageSlotState::Failed) {
                     return libk::unexpected(MemoryError::BackingFailed);
                 }
+                if (relation != nullptr
+                    && !node->slot.request.attach(
+                        *relation, owner, publish)) {
+                    return libk::unexpected(MemoryError::Busy);
+                }
                 return libk::unexpected(MemoryError::Pending);
             }
-            node = claim();
-            if (node == nullptr) {
-                return libk::unexpected(MemoryError::OutOfMemory);
+            auto claimed = claim();
+            if (!claimed) {
+                /*luna change: reject pre-attach storage contention for relation callers, reason: transient growth has no durable waiter or wakeup to receive the operations pin*/
+                if (relation != nullptr
+                    && claimed.error() == MemoryError::Pending) {
+                    return libk::unexpected(MemoryError::Busy);
+                }
+                return libk::unexpected(claimed.error());
             }
+            node = claimed.value();
             node->index = page_index;
             node->next = nodes_;
             nodes_ = node;
@@ -768,45 +997,42 @@ public:
                 release(*node);
                 return libk::unexpected(MemoryError::GenerationExhausted);
             }
+            if (relation != nullptr
+                && !node->slot.request.attach(*relation, owner, publish)) {
+                unlink_locked(*node);
+                release(*node);
+                return libk::unexpected(MemoryError::Busy);
+            }
+            index_work_locked(*node);
         }
-
-        const auto published = pager_->publish(
-            node->slot.request.key,
-            page_index,
-            1,
-            node->slot.request.key.generation,
-            0,
-            kernel::pager::RequestLink{
-                .context = this,
-                .finish = &PagerBacking::request_finished,
-            });
-        if (!published) {
-            kernel::sync::IrqLockGuard guard{tree_lock_};
-            node->slot.cancel_request();
-            unlink_locked(*node);
-            release(*node);
-            return libk::unexpected(published.error() == pager::Error::Full
-                ? MemoryError::ResourceExhausted
-                : published.error() == pager::Error::Closed
-                    ? MemoryError::BackingFailed
-                    : MemoryError::InvalidState);
-        }
-        {
-            kernel::sync::IrqLockGuard guard{tree_lock_};
-            node->slot.request.transport_slot = published.value().key.slot;
-        }
+        /*luna change: retain queued page work for MemoryExecutor service, reason: Pager admission must occur outside the PageRequest owner lock and survive queue pressure*/
+        owner_->schedule_work();
         return libk::unexpected(MemoryError::Pending);
     }
 
+    [[nodiscard]] auto cancel_fault(
+        WaitRelation& relation,
+        u64 generation) noexcept -> bool {
+        kernel::sync::IrqLockGuard guard{tree_lock_};
+        PageRequest* const request = relation.request;
+        if (request == nullptr || !request->detach(relation, generation)) {
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] auto supply(
+        kernel::pager::Pager& pager,
         usize page_index,
-        u64 request_generation,
-        u64 claim_generation,
+        PageKey page_key,
+        kernel::pager::ClaimKey claim,
         OwnedPage&& page,
         u64 content_epoch) noexcept
         -> libk::Expected<void, MemoryError> {
-        if (!page || request_generation == 0 || claim_generation == 0
-            || content_epoch == 0) {
+        if (&pager != pager_) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        if (!page || !page_key || !claim || content_epoch == 0) {
             return libk::unexpected(MemoryError::InvalidRange);
         }
         // The service must have claimed the exact Pager record before it can
@@ -814,43 +1040,69 @@ public:
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             Node* const node = find_locked(page_index);
-            if (node == nullptr
-                || node->slot.request.key.generation != request_generation) {
+            if (node == nullptr || node->slot.request.key != page_key) {
                 return libk::unexpected(MemoryError::OwnershipMismatch);
             }
         }
-        if (!pager_->claimed(
-                PageKey{request_generation, page_index}, claim_generation)) {
+        auto reply = pager_->begin_reply(claim);
+        if (!reply) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        const auto& claimed = reply.value().request();
+        if (reply.value().attachment() != &attachment_
+            || claimed.kind != kernel::pager::DeliveryKind::PageIn
+            || claimed.key != claim.delivery
+            || claimed.claim != claim
+            || claimed.page_key != page_key
+            || page_index < claimed.first
+            || page_index - claimed.first >= claimed.count) {
+            static_cast<void>(reply.value().abort());
             return libk::unexpected(MemoryError::OwnershipMismatch);
         }
         auto charge = reserve_page();
         if (!charge) {
+            static_cast<void>(reply.value().abort());
             return libk::unexpected(charge.error());
         }
+        MemoryError commit_error = MemoryError::InvalidState;
+        bool committed{};
+        bool notify{};
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             Node* const node = find_locked(page_index);
-            if (node == nullptr
-                || node->slot.request.key.generation != request_generation) {
-                return libk::unexpected(MemoryError::GenerationExhausted);
-            }
-            if (!node->slot.begin_fill(claim_generation)) {
-                return libk::unexpected(MemoryError::Busy);
-            }
-            auto supplied = node->slot.supply(
-                claim_generation, content_epoch);
-            if (!supplied) {
-                return libk::unexpected(MemoryError::InvalidState);
-            }
-            node->resident = libk::move(page);
-            if (charge.value()) {
-                node->resident_sponsorship.commit(libk::move(charge).value());
+            if (node == nullptr || node->slot.request.key != page_key) {
+                commit_error = MemoryError::GenerationExhausted;
+            } else if (!node->slot.begin_fill(claim.generation)) {
+                commit_error = MemoryError::Busy;
+            } else {
+                auto supplied = node->slot.supply(
+                    claim.generation, content_epoch);
+                if (!supplied) {
+                    commit_error = MemoryError::InvalidState;
+                } else {
+                    node->resident = libk::move(page);
+                    if (charge.value()) {
+                        node->resident_sponsorship.commit(
+                            libk::move(charge).value());
+                    }
+                    if (!node->slot.request.waiters.empty()) {
+                        index_ready_locked(*node);
+                        notify = true;
+                    }
+                    committed = true;
+                }
             }
         }
-        // Supply and transport completion remain separate linearization
-        // points. The service may still publish a completion/failure result
-        // after this ownership commit, while a late reply is checked against
-        // the same PageKey and cannot revive a newer request.
+        /*luna change: keep the transfer payload for pre-commit abort and make Completing commit terminal, reason: PageTransfer must own rollback until PageSlot and resident ownership commit*/
+        if (!committed) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(commit_error);
+        }
+        const auto finished = reply.value().commit();
+        KASSERT(finished);
+        if (notify) {
+            owner_->schedule_work();
+        }
         return libk::expected();
     }
 
@@ -870,56 +1122,65 @@ public:
     }
 
     [[nodiscard]] auto fail(
+        kernel::pager::Pager& pager,
         usize page_index,
-        u64 request_generation,
-        u64 claim_generation) noexcept
+        PageKey page_key,
+        kernel::pager::ClaimKey claim) noexcept
         -> libk::Expected<void, MemoryError> {
-        if (request_generation == 0 || claim_generation == 0) {
+        if (&pager != pager_) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        if (!page_key || !claim) {
             return libk::unexpected(MemoryError::InvalidRange);
         }
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             Node* const node = find_locked(page_index);
-            if (node == nullptr
-                || node->slot.request.key.generation != request_generation
+            if (node == nullptr || node->slot.request.key != page_key
                 || (node->slot.state != PageSlotState::Requested
                     && node->slot.state != PageSlotState::Filling)) {
                 return libk::unexpected(MemoryError::OwnershipMismatch);
             }
         }
 
-        // Finish the exact claimed transport record.  Pager owns the
-        // completion linearization and invokes request_finished(), which
-        // transitions this PageSlot under the backing lock.  Looking up by
-        // PageKey avoids trusting the cached transport slot across reuse.
-        const auto finished = pager_->fail(
-            PageKey{request_generation, page_index}, claim_generation);
-        if (!finished) {
-            switch (finished.error()) {
-            case kernel::pager::Error::Closed:
-                return libk::unexpected(MemoryError::BackingFailed);
-            case kernel::pager::Error::InvalidRange:
-                return libk::unexpected(MemoryError::InvalidRange);
-            case kernel::pager::Error::GenerationExhausted:
-                return libk::unexpected(MemoryError::GenerationExhausted);
-            case kernel::pager::Error::Full:
-            case kernel::pager::Error::InvalidKey:
-            case kernel::pager::Error::Busy:
-            case kernel::pager::Error::Stale:
-                return libk::unexpected(MemoryError::OwnershipMismatch);
+        auto reply = pager_->begin_reply(claim);
+        if (!reply) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        const auto& claimed = reply.value().request();
+        if (reply.value().attachment() != &attachment_
+            || claimed.kind != kernel::pager::DeliveryKind::PageIn
+            || claimed.key != claim.delivery
+            || claimed.claim != claim
+            || claimed.page_key != page_key) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        MemoryError error = MemoryError::OwnershipMismatch;
+        bool committed{};
+        bool notify{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node == nullptr || node->slot.request.key != page_key) {
+                error = MemoryError::GenerationExhausted;
+            } else if (node->slot.fail(claim.generation)) {
+                if (!node->slot.request.waiters.empty()) {
+                    index_ready_locked(*node);
+                    notify = true;
+                }
+                committed = true;
             }
         }
-
-        kernel::sync::IrqLockGuard guard{tree_lock_};
-        Node* const node = find_locked(page_index);
-        if (node == nullptr || node->slot.generation != request_generation) {
-            return libk::unexpected(MemoryError::GenerationExhausted);
+        if (!committed) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(error);
         }
-        if (node->slot.state != PageSlotState::Failed) {
-            // A successful transport failure must have a corresponding page
-            // failure.  A concurrent supply/retry therefore reports a
-            // checked ownership race instead of silently claiming success.
-            return libk::unexpected(MemoryError::OwnershipMismatch);
+        /*luna change: make the Completing reply commit an invariant after page failure, reason: PageSlot::fail is terminal before Pager transport can release its exact ticket*/
+        const auto finished = reply.value().commit();
+        KASSERT(finished);
+        if (notify) {
+            owner_->schedule_work();
         }
         return libk::expected();
     }
@@ -1017,7 +1278,10 @@ public:
         if (node->slot.state != PageSlotState::ResidentClean
             && node->slot.state != PageSlotState::ResidentDirty
             && node->slot.state != PageSlotState::WritebackQueued
-            && node->slot.state != PageSlotState::WritebackActive) {
+            && node->slot.state != PageSlotState::WritebackPublishing
+            && node->slot.state != PageSlotState::WritebackPublished
+            && node->slot.state != PageSlotState::WritebackActive
+            && node->slot.state != PageSlotState::WritebackCompleting) {
             return libk::unexpected(
                 node->slot.state == PageSlotState::Failed
                     ? MemoryError::BackingFailed
@@ -1047,7 +1311,7 @@ public:
     }
 
     [[nodiscard]] auto queue_writeback(usize page_index) noexcept
-        -> libk::Expected<u64, MemoryError> {
+        -> libk::Expected<WritebackKey, MemoryError> {
         kernel::sync::IrqLockGuard guard{tree_lock_};
         Node* const node = find_locked(page_index);
         if (node == nullptr) {
@@ -1060,35 +1324,197 @@ public:
         return libk::expected(queued.value());
     }
 
-    [[nodiscard]] auto begin_writeback(
+    [[nodiscard]] auto publish_writeback(
         usize page_index,
-        u64 epoch) noexcept -> libk::Expected<void, MemoryError> {
-        kernel::sync::IrqLockGuard guard{tree_lock_};
-        Node* const node = find_locked(page_index);
-        if (node == nullptr) {
-            return libk::unexpected(MemoryError::NotBacked);
+        WritebackKey key) noexcept
+        -> libk::Expected<void, MemoryError> {
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node == nullptr) {
+                return libk::unexpected(MemoryError::NotBacked);
+            }
+            if (!node->slot.begin_writeback_publish(key)) {
+                return libk::unexpected(MemoryError::OwnershipMismatch);
+            }
         }
-        auto begun = node->slot.begin_writeback(epoch);
-        return begun
-            ? libk::Expected<void, MemoryError>{libk::expected()}
-            : libk::Expected<void, MemoryError>{
-                  libk::unexpected(MemoryError::OwnershipMismatch)};
+        const auto published = pager_->publish_writeback(
+            attachment_,
+            key.page, key.generation, key.dirty_epoch);
+        if (!published) {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node != nullptr) {
+                static_cast<void>(node->slot.abort_writeback_publish(key));
+            }
+            return libk::unexpected(
+                published.error() == pager::Error::Full
+                    ? MemoryError::Pending
+                    : published.error() == pager::Error::Closed
+                        ? MemoryError::BackingFailed
+                        : MemoryError::OwnershipMismatch);
+        }
+        bool committed{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node != nullptr && node->slot.request.key == key.page
+                && node->slot.publish_writeback(
+                    key, published.value().key.generation)) {
+                node->slot.writeback.transport_slot = published.value().key.slot;
+                committed = true;
+            }
+        }
+        if (!committed) {
+            static_cast<void>(pager_->cancel(published.value().key));
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node != nullptr) {
+                static_cast<void>(node->slot.abort_writeback_publish(key));
+            }
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        return libk::expected();
+    }
+
+    [[nodiscard]] auto writeback(
+        kernel::pager::Pager* pager,
+        usize page_index,
+        WritebackTxn txn) noexcept -> libk::Expected<void, MemoryError> {
+        switch (txn.action) {
+        case WritebackAction::Publish:
+            return publish_writeback(page_index, txn.key);
+        case WritebackAction::Complete:
+            return pager == nullptr
+                ? libk::Expected<void, MemoryError>{
+                      libk::unexpected(MemoryError::OwnershipMismatch)}
+                : complete_writeback(
+                    *pager,
+                page_index, txn.key, txn.delivery_generation,
+                txn.claim_generation);
+        case WritebackAction::Fail:
+            return pager == nullptr
+                ? libk::Expected<void, MemoryError>{
+                      libk::unexpected(MemoryError::OwnershipMismatch)}
+                : fail_writeback(
+                    *pager, page_index, txn.key, txn.delivery_generation,
+                    txn.claim_generation, txn.failure);
+        }
+        return libk::unexpected(MemoryError::InvalidState);
     }
 
     [[nodiscard]] auto complete_writeback(
+        kernel::pager::Pager& pager,
         usize page_index,
-        u64 epoch,
-        bool clean) noexcept -> libk::Expected<void, MemoryError> {
-        kernel::sync::IrqLockGuard guard{tree_lock_};
-        Node* const node = find_locked(page_index);
-        if (node == nullptr) {
-            return libk::unexpected(MemoryError::NotBacked);
+        WritebackKey key,
+        u64 delivery_generation,
+        u64 claim_generation) noexcept -> libk::Expected<void, MemoryError> {
+        if (&pager != pager_) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
         }
-        auto completed = node->slot.complete_writeback(epoch, clean);
-        return completed
-            ? libk::Expected<void, MemoryError>{libk::expected()}
-            : libk::Expected<void, MemoryError>{
-                  libk::unexpected(MemoryError::OwnershipMismatch)};
+        u16 transport_slot{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node == nullptr) {
+                return libk::unexpected(MemoryError::NotBacked);
+            }
+            transport_slot = node->slot.writeback.transport_slot;
+        }
+        auto reply = pager_->begin_reply(kernel::pager::ClaimKey{
+            kernel::pager::RequestKey{
+                transport_slot, delivery_generation}, claim_generation});
+        if (!reply) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        const auto claim = reply.value().key();
+        const auto& claimed = reply.value().request();
+        if (reply.value().attachment() != &attachment_
+            || claimed.kind != kernel::pager::DeliveryKind::Writeback
+            || claimed.key != claim.delivery
+            || claimed.claim != claim
+            || claimed.page_key != key.page
+            || claimed.writeback_generation != key.generation
+            || claimed.dirty_epoch != key.dirty_epoch) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        bool committed{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node != nullptr) {
+                auto begun = node->slot.begin_writeback_complete(
+                    key, delivery_generation, claim_generation);
+                if (begun) {
+                    committed = static_cast<bool>(node->slot.complete_writeback(
+                        key, delivery_generation, claim_generation));
+                }
+            }
+        }
+        if (!committed) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        /*luna change: make writeback completion's Pager commit terminal, reason: the PageSlot writeback state is already committed before the exact Completing ticket is released*/
+        const auto finished = reply.value().commit();
+        KASSERT(finished);
+        return libk::expected();
+    }
+
+    [[nodiscard]] auto fail_writeback(
+        kernel::pager::Pager& pager,
+        usize page_index,
+        WritebackKey key,
+        u64 delivery_generation,
+        u64 claim_generation,
+        WritebackFailure failure) noexcept -> libk::Expected<void, MemoryError> {
+        if (&pager != pager_) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        u16 transport_slot{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node == nullptr) {
+                return libk::unexpected(MemoryError::NotBacked);
+            }
+            transport_slot = node->slot.writeback.transport_slot;
+        }
+        auto reply = pager_->begin_reply(kernel::pager::ClaimKey{
+            kernel::pager::RequestKey{
+                transport_slot, delivery_generation}, claim_generation});
+        if (!reply) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        const auto& claimed = reply.value().request();
+        if (reply.value().attachment() != &attachment_
+            || claimed.kind != kernel::pager::DeliveryKind::Writeback
+            || claimed.page_key != key.page
+            || claimed.writeback_generation != key.generation
+            || claimed.dirty_epoch != key.dirty_epoch) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        bool committed{};
+        {
+            kernel::sync::IrqLockGuard guard{tree_lock_};
+            Node* const node = find_locked(page_index);
+            if (node != nullptr
+                && node->slot.begin_writeback_complete(
+                    key, delivery_generation, claim_generation)) {
+                committed = static_cast<bool>(node->slot.fail_writeback(
+                    key, delivery_generation, claim_generation, failure));
+            }
+        }
+        if (!committed) {
+            static_cast<void>(reply.value().abort());
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
+        /*luna change: make writeback failure's Pager commit terminal, reason: the PageSlot failure state is already committed before the exact Completing ticket is released*/
+        const auto finished = reply.value().commit();
+        KASSERT(finished);
+        return libk::expected();
     }
 
     [[nodiscard]] auto evict_page(usize page_index) noexcept
@@ -1122,12 +1548,18 @@ public:
     }
 
     void reset() noexcept {
-        pager_->detach_links(this);
+        KASSERT(attachment_.state
+            == kernel::pager::PagerAttachment::State::Detached);
+        work_.clear();
+        ready_.clear();
         while (nodes_ != nullptr) {
             Node* const node = nodes_;
             nodes_ = node->next;
             KASSERT(node->mappings.empty() && node->leases == 0);
+            /*luna change: settle each resident sponsorship before releasing its Node, reason: successful supply commits the charge to the resident owner*/
+            auto refund = node->resident_sponsorship.detach();
             node->resident.reset();
+            refund.complete();
             release(*node);
         }
         KASSERT(!growing_);
@@ -1149,6 +1581,38 @@ public:
     }
 
 private:
+    using WorkList = libk::IntrusiveList<Node, &Node::work_hook_>;
+    using ReadyList = libk::IntrusiveList<Node, &Node::ready_hook_>;
+
+    /*luna change: use libk intrusive indexes for retained requests and ready waiters, reason: queue membership must be O(1) and cannot duplicate list links with business flags*/
+    void index_work_locked(Node& node) noexcept {
+        if (node.work_hook_.is_linked()) {
+            return;
+        }
+        work_.push_back(node);
+    }
+
+    void unindex_work_locked(Node& target) noexcept {
+        if (!target.work_hook_.is_linked()) {
+            return;
+        }
+        work_.erase(target);
+    }
+
+    void index_ready_locked(Node& node) noexcept {
+        if (node.ready_hook_.is_linked()) {
+            return;
+        }
+        ready_.push_back(node);
+    }
+
+    void unindex_ready_locked(Node& target) noexcept {
+        if (!target.ready_hook_.is_linked()) {
+            return;
+        }
+        ready_.erase(target);
+    }
+
     [[nodiscard]] auto find_locked(usize index) noexcept -> Node* {
         for (Node* node = nodes_; node != nullptr; node = node->next) {
             if (node->index == index) {
@@ -1158,7 +1622,8 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] auto claim() noexcept -> Node* {
+    [[nodiscard]] auto claim() noexcept
+        -> libk::Expected<Node*, MemoryError> {
         for (;;) {
             {
                 kernel::sync::IrqLockGuard guard{storage_lock_};
@@ -1170,10 +1635,10 @@ private:
                     ++pages_->live_count;
                     Node* const node = libk::construct_at(slot->node(), 0);
                     node->owner = slot;
-                    return node;
+                    return libk::expected(node);
                 }
                 if (growing_) {
-                    return nullptr;
+                    return libk::unexpected(MemoryError::Pending);
                 }
                 growing_ = true;
             }
@@ -1181,13 +1646,13 @@ private:
             if (!charge) {
                 kernel::sync::IrqLockGuard guard{storage_lock_};
                 growing_ = false;
-                return nullptr;
+                return libk::unexpected(charge.error());
             }
             auto allocated = pmm_->allocate_page();
             if (!allocated) {
                 kernel::sync::IrqLockGuard guard{storage_lock_};
                 growing_ = false;
-                return nullptr;
+                return libk::unexpected(MemoryError::Pressure);
             }
             OwnedPage backing = libk::move(allocated).value();
             auto* const page = libk::construct_at(
@@ -1246,6 +1711,7 @@ private:
         return libk::expected(libk::move(reserved).value());
     }
 
+    MemoryObject* owner_{};
     Pmm* pmm_{};
     kernel::pager::Pager* pager_{};
     AccessMask access_{};
@@ -1254,10 +1720,15 @@ private:
     kernel::sync::SpinLock<kernel::sync::LockClass::BackingStorage>
         storage_lock_{};
     Node* nodes_{};
+    WorkList work_{};
+    ReadyList ready_{};
     PageHeader* pages_{};
     bool growing_{};
     kernel::resource::Sponsorship* sponsor_{};
+    kernel::pager::PagerAttachment attachment_{};
 };
+
+namespace {
 
 class ExtentBacking final : private libk::noncopyable_nonmovable {
 public:
@@ -1485,8 +1956,11 @@ void PageTransfer::abort() noexcept {
     page_.reset();
 }
 
-MemoryObject::MemoryObject(Pmm& pmm, usize byte_size) noexcept
-    : pmm_(&pmm) {
+MemoryObject::MemoryObject(
+    Pmm& pmm,
+    usize byte_size,
+    MemoryExecutor& work) noexcept
+    : pmm_(&pmm), work_(&work) {
     if (byte_size != 0 && byte_size % page_size == 0) {
         logical_pages_ = byte_size / page_size;
     }
@@ -1655,7 +2129,7 @@ auto MemoryObject::initialize_backing(
     auto allocated = pmm_->allocate_page();
     if (!allocated) {
         fail_build();
-        return libk::unexpected(MemoryError::OutOfMemory);
+        return libk::unexpected(MemoryError::Pressure);
     }
     OwnedPage storage = libk::move(allocated).value();
 
@@ -1664,9 +2138,11 @@ auto MemoryObject::initialize_backing(
         .query = [](const void* backing, usize index) noexcept {
             return static_cast<const AnonymousBacking*>(backing)->query(index);
         },
-        .materialize = [](void* backing, usize index) noexcept {
+        .materialize = [](void* backing, usize index, WaitRelation*, void*,
+                          WaitRelation::Publish) noexcept {
             return static_cast<AnonymousBacking*>(backing)->materialize(index);
         },
+        .cancel_fault = nullptr,
         .begin_transfer = [](void* backing, usize index) noexcept {
             return static_cast<AnonymousBacking*>(backing)->begin_transfer(index);
         },
@@ -1685,22 +2161,26 @@ auto MemoryObject::initialize_backing(
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
+        .drain_page_waiters = nullptr,
+        .service = nullptr,
         .queue_writeback = nullptr,
-        .begin_writeback = nullptr,
-        .complete_writeback = nullptr,
+        .writeback = nullptr,
         .evict_page = nullptr,
         .destroy = [](void* backing) noexcept {
             libk::destroy_at(static_cast<AnonymousBacking*>(backing));
         },
+        .stop = nullptr,
     };
     static const BackingOps physical_ops{
         .kind = BackingKind::Physical,
         .query = [](const void* backing, usize index) noexcept {
             return static_cast<const ExtentBacking*>(backing)->query(index);
         },
-        .materialize = [](void* backing, usize index) noexcept {
+        .materialize = [](void* backing, usize index, WaitRelation*, void*,
+                          WaitRelation::Publish) noexcept {
             return static_cast<ExtentBacking*>(backing)->materialize(index);
         },
+        .cancel_fault = nullptr,
         .begin_transfer = [](void*, usize) noexcept
             -> libk::Expected<OwnedPage, MemoryError> {
             return libk::unexpected(MemoryError::OwnershipMismatch);
@@ -1721,22 +2201,26 @@ auto MemoryObject::initialize_backing(
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
+        .drain_page_waiters = nullptr,
+        .service = nullptr,
         .queue_writeback = nullptr,
-        .begin_writeback = nullptr,
-        .complete_writeback = nullptr,
+        .writeback = nullptr,
         .evict_page = nullptr,
         .destroy = [](void* backing) noexcept {
             libk::destroy_at(static_cast<ExtentBacking*>(backing));
         },
+        .stop = nullptr,
     };
     static const BackingOps boot_ops{
         .kind = BackingKind::BootImage,
         .query = [](const void* backing, usize index) noexcept {
             return static_cast<const BootBacking*>(backing)->query(index);
         },
-        .materialize = [](void* backing, usize index) noexcept {
+        .materialize = [](void* backing, usize index, WaitRelation*, void*,
+                          WaitRelation::Publish) noexcept {
             return static_cast<BootBacking*>(backing)->materialize(index);
         },
+        .cancel_fault = nullptr,
         .begin_transfer = [](void*, usize) noexcept
             -> libk::Expected<OwnedPage, MemoryError> {
             return libk::unexpected(MemoryError::OwnershipMismatch);
@@ -1757,21 +2241,31 @@ auto MemoryObject::initialize_backing(
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
+        .drain_page_waiters = nullptr,
+        .service = nullptr,
         .queue_writeback = nullptr,
-        .begin_writeback = nullptr,
-        .complete_writeback = nullptr,
+        .writeback = nullptr,
         .evict_page = nullptr,
         .destroy = [](void* backing) noexcept {
             libk::destroy_at(static_cast<BootBacking*>(backing));
         },
+        .stop = nullptr,
     };
     static const BackingOps pager_ops{
         .kind = BackingKind::Pager,
         .query = [](const void* backing, usize index) noexcept {
             return static_cast<const PagerBacking*>(backing)->query(index);
         },
-        .materialize = [](void* backing, usize index) noexcept {
-            return static_cast<PagerBacking*>(backing)->materialize(index);
+        .materialize = [](void* backing, usize index, WaitRelation* relation,
+                          void* owner,
+                          WaitRelation::Publish publish) noexcept {
+            return static_cast<PagerBacking*>(backing)->materialize(
+                index, relation, owner, publish);
+        },
+        .cancel_fault = [](void* backing, WaitRelation& relation,
+                           u64 generation) noexcept {
+            return static_cast<PagerBacking*>(backing)->cancel_fault(
+                relation, generation);
         },
         .begin_transfer = [](void* backing, usize index) noexcept {
             return static_cast<PagerBacking*>(backing)->begin_transfer(index);
@@ -1783,17 +2277,19 @@ auto MemoryObject::initialize_backing(
         .commit_transfer = [](void* backing, usize index) noexcept {
             return static_cast<PagerBacking*>(backing)->commit_transfer(index);
         },
-        .supply = [](void* backing, usize index, u64 request_generation,
-                     u64 claim_generation, OwnedPage&& page,
+        .supply = [](void* backing, kernel::pager::Pager& pager,
+                     usize index, PageKey page_key,
+                     kernel::pager::ClaimKey claim, OwnedPage&& page,
                      u64 content_epoch) noexcept {
             return static_cast<PagerBacking*>(backing)->supply(
-                index, request_generation, claim_generation,
+                pager, index, page_key, claim,
                 libk::move(page), content_epoch);
         },
-        .fail = [](void* backing, usize index, u64 request_generation,
-                   u64 claim_generation) noexcept {
+        .fail = [](void* backing, kernel::pager::Pager& pager,
+                   usize index, PageKey page_key,
+                   kernel::pager::ClaimKey claim) noexcept {
             return static_cast<PagerBacking*>(backing)->fail(
-                index, request_generation, claim_generation);
+                pager, index, page_key, claim);
         },
         .bind_mapping = [](void* backing, usize index,
                            PageMapping& mapping) noexcept {
@@ -1817,23 +2313,30 @@ auto MemoryObject::initialize_backing(
             return static_cast<PagerBacking*>(backing)->observe_usage(
                 index, accessed, dirty);
         },
+        .drain_page_waiters = [](void* backing, usize capacity) noexcept {
+            return static_cast<PagerBacking*>(backing)->drain_page_waiters(
+                capacity);
+        },
+        .service = [](void* backing, usize capacity) noexcept {
+            return static_cast<PagerBacking*>(backing)->service(capacity);
+        },
         .queue_writeback = [](void* backing, usize index) noexcept {
             return static_cast<PagerBacking*>(backing)->queue_writeback(index);
         },
-        .begin_writeback = [](void* backing, usize index, u64 epoch) noexcept {
-            return static_cast<PagerBacking*>(backing)->begin_writeback(
-                index, epoch);
-        },
-        .complete_writeback = [](void* backing, usize index,
-                                 u64 epoch, bool clean) noexcept {
-            return static_cast<PagerBacking*>(backing)->complete_writeback(
-                index, epoch, clean);
+        .writeback = [](void* backing, kernel::pager::Pager* pager,
+                        usize index,
+                        WritebackTxn txn) noexcept {
+            return static_cast<PagerBacking*>(backing)->writeback(
+                pager, index, txn);
         },
         .evict_page = [](void* backing, usize index) noexcept {
             return static_cast<PagerBacking*>(backing)->evict_page(index);
         },
         .destroy = [](void* backing) noexcept {
             libk::destroy_at(static_cast<PagerBacking*>(backing));
+        },
+        .stop = [](void* backing) noexcept {
+            static_cast<PagerBacking*>(backing)->stop();
         },
     };
 
@@ -1869,16 +2372,23 @@ auto MemoryObject::initialize_backing(
         break;
     }
     case BackingKind::Pager: {
+        KASSERT(operations_ != libk::numeric_limits<usize>::max());
+        ++operations_;
         auto* const backing = libk::construct_at(
             static_cast<PagerBacking*>(backend),
-            *pmm_, *pager, pager_access, sponsor_);
+            *this, *pmm_, *pager, pager_access, sponsor_);
         ops = &pager_ops;
         backend = backing;
+        initialized = backing->init();
         break;
     }
     }
 
     if (!initialized) {
+        if (kind == BackingKind::Pager) {
+            KASSERT(operations_ != 0);
+            --operations_;
+        }
         ops->destroy(backend);
         storage.reset();
         const MemoryError error = initialized.error();
@@ -1992,6 +2502,25 @@ auto MemoryObject::query(usize page_index) const noexcept
 
 auto MemoryObject::materialize(usize page_index) noexcept
     -> libk::Expected<PageLease, MemoryError> {
+    return materialize_impl(page_index, nullptr, nullptr, nullptr);
+}
+
+auto MemoryObject::materialize(
+    usize page_index,
+    WaitRelation* relation,
+    void* owner,
+    WaitRelation::Publish publish) noexcept
+    -> libk::Expected<PageLease, MemoryError> {
+    return materialize_impl(page_index, relation, owner, publish);
+}
+
+/*luna change: retain Pending's existing operations pin only after relation admission, reason: ordinary materialize remains synchronous while PageFault owns the durable pin*/
+auto MemoryObject::materialize_impl(
+    usize page_index,
+    WaitRelation* relation,
+    void* owner,
+    WaitRelation::Publish publish) noexcept
+    -> libk::Expected<PageLease, MemoryError> {
     const BackingOps* ops{};
     void* backing{};
     {
@@ -2008,23 +2537,29 @@ auto MemoryObject::materialize(usize page_index) noexcept
         backing = backing_;
     }
 
-    auto result = ops->materialize(backing, page_index);
+    auto result = ops->materialize(
+        backing, page_index, relation, owner, publish);
+    /*luna change: classify only Pending as a transferred fault pin, reason: relation-aware admission may fail before attach with Busy or a resource error*/
+    const bool retained = relation != nullptr && !result
+        && result.error() == MemoryError::Pending;
     bool live{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         live = state_ == MemoryState::Live;
-        if (!result || !live) {
+        if ((!result && !retained) || (live == false && !retained)) {
             KASSERT(operations_ != 0);
             --operations_;
         }
     }
+    if (retained) {
+        return libk::unexpected(MemoryError::Pending);
+    }
     if (!result || !live) {
         finish_retire();
-        return !live
-            ? libk::Expected<PageLease, MemoryError>{
-                  libk::unexpected(MemoryError::InvalidState)}
-            : libk::Expected<PageLease, MemoryError>{
-                  libk::unexpected(result.error())};
+        if (!live) {
+            return libk::unexpected(MemoryError::InvalidState);
+        }
+        return libk::unexpected(result.error());
     }
     if (ops->lease_acquire != nullptr) {
         auto acquired = ops->lease_acquire(backing, page_index);
@@ -2074,9 +2609,10 @@ auto MemoryObject::begin_transfer(usize page_index) noexcept
 }
 
 auto MemoryObject::pager_supply(
+    pager::Pager& pager,
     usize page_index,
-    u64 request_generation,
-    u64 claim_generation,
+    PageKey page_key,
+    pager::ClaimKey claim,
     OwnedPage&& page,
     u64 content_epoch) noexcept
     -> libk::Expected<void, MemoryError> {
@@ -2094,7 +2630,7 @@ auto MemoryObject::pager_supply(
         backing = backing_;
     }
     auto result = ops->supply(
-        backing, page_index, request_generation, claim_generation,
+        backing, pager, page_index, page_key, claim,
         libk::move(page), content_epoch);
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -2106,10 +2642,11 @@ auto MemoryObject::pager_supply(
 }
 
 auto MemoryObject::pager_supply_transfer(
+    pager::Pager& pager,
     PageTransfer&& transfer,
     usize page_index,
-    u64 request_generation,
-    u64 claim_generation,
+    PageKey page_key,
+    pager::ClaimKey claim,
     u64 content_epoch) noexcept
     -> libk::Expected<void, MemoryError> {
     if (!transfer || !transfer.page().valid()) {
@@ -2129,7 +2666,7 @@ auto MemoryObject::pager_supply_transfer(
         backing = backing_;
     }
     auto result = ops->supply(
-        backing, page_index, request_generation, claim_generation,
+        backing, pager, page_index, page_key, claim,
         libk::move(transfer.page_), content_epoch);
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -2146,9 +2683,10 @@ auto MemoryObject::pager_supply_transfer(
 }
 
 auto MemoryObject::pager_fail(
+    pager::Pager& pager,
     usize page_index,
-    u64 request_generation,
-    u64 claim_generation) noexcept
+    PageKey page_key,
+    pager::ClaimKey claim) noexcept
     -> libk::Expected<void, MemoryError> {
     const BackingOps* ops{};
     void* backing{};
@@ -2164,7 +2702,7 @@ auto MemoryObject::pager_fail(
         backing = backing_;
     }
     auto result = ops->fail(
-        backing, page_index, request_generation, claim_generation);
+        backing, pager, page_index, page_key, claim);
     {
         kernel::sync::IrqLockGuard guard{lock_};
         KASSERT(operations_ != 0);
@@ -2308,8 +2846,155 @@ auto MemoryObject::observe_usage(
     return result;
 }
 
+auto MemoryObject::drain_page_waiters(
+    usize capacity) noexcept -> usize {
+    if (capacity == 0) {
+        return 0;
+    }
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != MemoryState::Live || backing_ops_ == nullptr
+            || backing_ops_->drain_page_waiters == nullptr) {
+            return 0;
+        }
+        ++operations_;
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    const usize result = ops->drain_page_waiters(backing, capacity);
+    drop_page();
+    return result;
+}
+
+/*luna change: reserve and drop a pin only for fresh admission, reason: an already-active runner owns settle and a racing kick must not release it*/
+void MemoryObject::schedule_work() noexcept {
+    KASSERT(work_ != nullptr);
+    bool fresh{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!work_open_.load<libk::MemoryOrder::Acquire>()
+            || state_ != MemoryState::Live) {
+            return;
+        }
+        if (!work_active_.load<libk::MemoryOrder::Acquire>()) {
+            KASSERT(operations_ != libk::numeric_limits<usize>::max());
+            ++operations_;
+            work_active_.store<libk::MemoryOrder::Release>(true);
+            fresh = true;
+        }
+    }
+    ensure_work_observation();
+    auto observation = diag::concurrency::ObservationLease::borrow(
+        diag::concurrency::ObservationKey{
+            observation_key_.load<libk::MemoryOrder::Acquire>()});
+    observation.watch(true);
+    observation.touch();
+    if (!work_->submit(*this) && fresh) {
+        finish_work();
+    }
+}
+
+/*luna change: settle the single work pin after executor handoff, reason: MemoryExecutor owns queue rearm while MemoryObject only releases operations lifetime*/
+void MemoryObject::finish_work() noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!work_active_.load<libk::MemoryOrder::Acquire>()) {
+            return;
+        }
+        work_active_.store<libk::MemoryOrder::Release>(false);
+        KASSERT(operations_ != 0);
+        --operations_;
+    }
+    finish_retire();
+}
+
+/*luna change: dispatch bounded backing service through the canonical object, reason: MemoryExecutor transports work while PageSlot/PageRequest own semantic state*/
+auto MemoryObject::service(usize capacity) noexcept -> MemoryServiceBatch {
+    if (capacity == 0) {
+        return {};
+    }
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!work_active_.load<libk::MemoryOrder::Acquire>()
+            || state_ != MemoryState::Live
+            || backing_ops_ == nullptr || backing_ops_->service == nullptr) {
+            return {};
+        }
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    return ops->service(backing, capacity);
+}
+
+/*luna change: project MemoryExecutor progress through the existing observation lease, reason: diagnostics must remain a one-way view of canonical work state*/
+void MemoryObject::ensure_work_observation() noexcept {
+    bool expected = false;
+    if (!observation_reserved_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, true)) {
+        return;
+    }
+    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
+    auto observation = diag::concurrency::ObservationLease::reserve(
+        diag::concurrency::RecordKind::MemoryWork,
+        reinterpret_cast<u64>(this),
+        1,
+        diag::concurrency::Expectation::InternalFinite);
+    if (!observation) {
+        observation_reserved_.store<libk::MemoryOrder::Release>(false);
+        return;
+    }
+    observation.watch(true);
+    observation_key_.store<libk::MemoryOrder::Release>(
+        observation.detach_key().raw);
+}
+
+void MemoryObject::publish_work_observation(
+    const MemoryServiceBatch& batch) noexcept {
+    const auto key = diag::concurrency::ObservationKey{
+        observation_key_.load<libk::MemoryOrder::Acquire>()};
+    auto observation = diag::concurrency::ObservationLease::borrow(key);
+    if (!observation) {
+        return;
+    }
+    MemoryState state{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        state = state_;
+    }
+    u64 stamp = static_cast<u64>(state);
+    stamp = stamp * 17 + batch.processed;
+    stamp = stamp * 17 + batch.progressed;
+    stamp = stamp * 17 + batch.more;
+    diag::concurrency::ObservationBatch update{
+        .phase = static_cast<u32>(batch.more
+            ? diag::concurrency::ServicePhase::Running
+            : diag::concurrency::ServicePhase::Completed),
+        .semantic_stamp = stamp,
+        .wait = batch.more
+            ? diag::concurrency::WaitKind::MemoryWork
+            : diag::concurrency::WaitKind::None,
+        .driver = diag::concurrency::NodeRef::external(
+            reinterpret_cast<u64>(this)),
+        .blocker = {},
+        .site = diag::concurrency::SourceSite::current(),
+        .detail_mask = 0xfU,
+        .update_progress = batch.progressed != 0,
+        .update_watched = true,
+        .watched = batch.more};
+    update.detail[0] = batch.processed;
+    update.detail[1] = batch.progressed;
+    update.detail[2] = batch.more;
+    update.detail[3] = static_cast<u64>(state);
+    observation.publish(update);
+}
+
 auto MemoryObject::queue_writeback(usize page_index) noexcept
-    -> libk::Expected<u64, MemoryError> {
+    -> libk::Expected<WritebackKey, MemoryError> {
     const BackingOps* ops{};
     void* backing{};
     {
@@ -2328,46 +3013,86 @@ auto MemoryObject::queue_writeback(usize page_index) noexcept
     return result;
 }
 
-auto MemoryObject::begin_writeback(
+auto MemoryObject::publish_writeback(
     usize page_index,
-    u64 epoch) noexcept -> libk::Expected<void, MemoryError> {
+    WritebackKey key) noexcept -> libk::Expected<void, MemoryError> {
     const BackingOps* ops{};
     void* backing{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != MemoryState::Live || page_index >= logical_pages_
             || backing_ops_ == nullptr
-            || backing_ops_->begin_writeback == nullptr) {
+            || backing_ops_->writeback == nullptr) {
             return libk::unexpected(MemoryError::NotBacked);
         }
         ++operations_;
         ops = backing_ops_;
         backing = backing_;
     }
-    auto result = ops->begin_writeback(backing, page_index, epoch);
+    auto result = ops->writeback(
+        backing, nullptr, page_index, WritebackTxn{
+            .action = WritebackAction::Publish,
+            .key = key});
     drop_page();
     return result;
 }
 
 auto MemoryObject::complete_writeback(
+    pager::Pager& pager,
     usize page_index,
-    u64 epoch,
-    bool clean) noexcept -> libk::Expected<void, MemoryError> {
+    WritebackKey key,
+    u64 delivery_generation,
+    u64 claim_generation) noexcept -> libk::Expected<void, MemoryError> {
     const BackingOps* ops{};
     void* backing{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != MemoryState::Live || page_index >= logical_pages_
             || backing_ops_ == nullptr
-            || backing_ops_->complete_writeback == nullptr) {
+            || backing_ops_->writeback == nullptr) {
             return libk::unexpected(MemoryError::NotBacked);
         }
         ++operations_;
         ops = backing_ops_;
         backing = backing_;
     }
-    auto result = ops->complete_writeback(
-        backing, page_index, epoch, clean);
+    auto result = ops->writeback(
+        backing, &pager, page_index, WritebackTxn{
+            .action = WritebackAction::Complete,
+            .key = key,
+            .delivery_generation = delivery_generation,
+            .claim_generation = claim_generation});
+    drop_page();
+    return result;
+}
+
+auto MemoryObject::fail_writeback(
+    pager::Pager& pager,
+    usize page_index,
+    WritebackKey key,
+    u64 delivery_generation,
+    u64 claim_generation,
+    WritebackFailure failure) noexcept -> libk::Expected<void, MemoryError> {
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != MemoryState::Live || page_index >= logical_pages_
+            || backing_ops_ == nullptr
+            || backing_ops_->writeback == nullptr) {
+            return libk::unexpected(MemoryError::NotBacked);
+        }
+        ++operations_;
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    auto result = ops->writeback(
+        backing, &pager, page_index, WritebackTxn{
+            .action = WritebackAction::Fail,
+            .key = key,
+            .delivery_generation = delivery_generation,
+            .claim_generation = claim_generation,
+            .failure = failure});
     drop_page();
     return result;
 }
@@ -2485,6 +3210,7 @@ auto MemoryObject::detach(MemoryAttachment& attachment) noexcept -> bool {
     return quiescent;
 }
 
+/*luna change: close work admission before backing stop and withdraw queued work, reason: retire must preserve one operations pin for any in-flight service without publishing new work*/
 void MemoryObject::retire() noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -2498,6 +3224,11 @@ void MemoryObject::retire() noexcept {
             KASSERT(state_ == MemoryState::Live);
             state_ = MemoryState::Stopping;
         }
+        work_open_.store<libk::MemoryOrder::Release>(false);
+    }
+
+    if (work_->withdraw(*this)) {
+        finish_work();
     }
 
     for (;;) {
@@ -2530,10 +3261,56 @@ void MemoryObject::retire() noexcept {
         target->ops_->invalidate(
             target->context_, libk::move(work), MemoryInvalidation::Destroy);
     }
+    void* stopped_backing{};
+    const BackingOps* stopped_ops{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        stopped_backing = backing_;
+        stopped_ops = backing_ops_;
+    }
+    if (stopped_ops != nullptr && stopped_ops->stop != nullptr) {
+        stopped_ops->stop(stopped_backing);
+    }
     finish_retire();
 }
 
 void MemoryObject::drop_page() noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(operations_ != 0);
+        --operations_;
+    }
+    finish_retire();
+}
+
+/*luna change: settle the retained fault pin through the MemoryObject owner, reason: one operation count must cover foreign Pager detach and terminal release*/
+void MemoryObject::release_fault() noexcept {
+    drop_page();
+}
+
+auto MemoryObject::cancel_fault(
+    WaitRelation& relation,
+    u64 generation) noexcept -> bool {
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (backing_ops_ == nullptr || backing_ == nullptr
+            || state_ == MemoryState::Retired
+            || backing_ops_->cancel_fault == nullptr) {
+            return false;
+        }
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    if (!ops->cancel_fault(backing, relation, generation)) {
+        return false;
+    }
+    drop_page();
+    return true;
+}
+
+void MemoryObject::release_backing_hold() noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
         KASSERT(operations_ != 0);
@@ -2581,10 +3358,12 @@ void MemoryObject::finish_transfer(
     finish_retire();
 }
 
+/*luna change: keep work observations through idle and finish only at object retirement, reason: diagnostics must span service cycles without steering executor control*/
 void MemoryObject::finish_retire() noexcept {
     void* backing{};
     const BackingOps* ops{};
     OwnedPage storage{};
+    u64 terminal_key{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != MemoryState::Stopping
@@ -2615,12 +3394,23 @@ void MemoryObject::finish_retire() noexcept {
         KASSERT(releasing_);
         releasing_ = false;
         state_ = MemoryState::Retired;
+        terminal_key = observation_key_.exchange<
+            libk::MemoryOrder::AcqRel>(0);
+        observation_reserved_.store<libk::MemoryOrder::Release>(false);
+    }
+    if (terminal_key != 0) {
+        auto observation = diag::concurrency::ObservationLease::borrow(
+            diag::concurrency::ObservationKey{terminal_key});
+        observation.finish(static_cast<u32>(
+            diag::concurrency::ServicePhase::Completed));
     }
 }
 
+/*luna change: seal failed construction against executor admission, reason: a non-live object has no backing service to drain*/
 void MemoryObject::fail_build() noexcept {
     KASSERT(state_ == MemoryState::Building);
     KASSERT(backing_ == nullptr && backing_ops_ == nullptr);
+    work_open_.store<libk::MemoryOrder::Release>(false);
     state_ = MemoryState::Retired;
 }
 

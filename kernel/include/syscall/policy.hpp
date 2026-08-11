@@ -80,6 +80,14 @@ struct Policy final {
     case MYOS_SYS_VPROC_RETURN:
         return {Continuation::Resume, TargetMask::Vproc,
             LocusMask::VprocUpcall};
+    /*luna change: bind FaultKey controls to the active Vproc upcall, reason: claim/drop are immediate and resume alone may consume the saved frame*/
+    case MYOS_SYS_VPROC_FAULT_CLAIM:
+    case MYOS_SYS_VPROC_FAULT_DROP:
+        return {Continuation::Immediate, TargetMask::Vproc,
+            LocusMask::VprocUpcall};
+    case MYOS_SYS_VPROC_FAULT_RESUME:
+        return {Continuation::Resume, TargetMask::Vproc,
+            LocusMask::VprocUpcall};
     case MYOS_SYS_VPROC_PARK:
         return {Continuation::LanePark, TargetMask::Vproc,
             LocusMask::VprocBase};
@@ -179,6 +187,15 @@ static_assert(policy(MYOS_SYS_VPROC_RETURN).allows_vproc());
 static_assert(!policy(MYOS_SYS_VPROC_RETURN).allows_thread());
 static_assert(policy(MYOS_SYS_VPROC_RETURN).allows(Locus::VprocUpcall));
 static_assert(!policy(MYOS_SYS_VPROC_RETURN).allows(Locus::VprocBase));
+static_assert(policy(MYOS_SYS_VPROC_FAULT_CLAIM).continuation
+    == Continuation::Immediate);
+static_assert(policy(MYOS_SYS_VPROC_FAULT_CLAIM).allows(Locus::VprocUpcall));
+static_assert(policy(MYOS_SYS_VPROC_FAULT_RESUME).continuation
+    == Continuation::Resume);
+static_assert(policy(MYOS_SYS_VPROC_FAULT_RESUME).allows(Locus::VprocUpcall));
+static_assert(policy(MYOS_SYS_VPROC_FAULT_DROP).continuation
+    == Continuation::Immediate);
+static_assert(policy(MYOS_SYS_VPROC_FAULT_DROP).allows(Locus::VprocUpcall));
 static_assert(policy(MYOS_SYS_VPROC_PARK).allows(Locus::VprocBase));
 static_assert(!policy(MYOS_SYS_VPROC_PARK).allows(Locus::VprocUpcall));
 static_assert(policy(MYOS_SYS_EXIT).allows(Locus::ThreadBase));

@@ -8,6 +8,7 @@
 #include <libk/checked_arithmetic.hpp>
 #include <libk/fmt.hpp>
 #include <libk/inplace_vector.hpp>
+#include <libk/inplace_ring.hpp>
 #include <libk/limits.hpp>
 #include <libk/optional.hpp>
 #include <libk/scope_guard.hpp>
@@ -533,6 +534,41 @@ bool test_inplace_vector_handles_aliasing_and_zero_capacity(
         && moved[1].value == 9;
 }
 
+bool test_inplace_ring_erase_preserves_logical_order(
+    const TestContext&) noexcept {
+    libk::InplaceRing<int, 4> plain{};
+    plain.emplace_back(1);
+    plain.emplace_back(2);
+    plain.emplace_back(3);
+    auto plain_position = plain.begin();
+    ++plain_position;
+    auto plain_next = plain.erase(plain_position);
+    if (plain.size() != 2
+        || plain[0] != 1
+        || plain[1] != 3
+        || plain_next == plain.end()
+        || *plain_next != 3) {
+        return false;
+    }
+
+    libk::InplaceRing<int, 4> wrapped{};
+    wrapped.emplace_back(1);
+    wrapped.emplace_back(2);
+    wrapped.emplace_back(3);
+    wrapped.pop_front();
+    wrapped.pop_front();
+    wrapped.emplace_back(4);
+    wrapped.emplace_back(5);
+    auto wrapped_position = wrapped.begin();
+    ++wrapped_position;
+    auto wrapped_next = wrapped.erase(wrapped_position);
+    return wrapped.size() == 2
+        && wrapped[0] == 3
+        && wrapped[1] == 5
+        && wrapped_next != wrapped.end()
+        && *wrapped_next == 5;
+}
+
 bool test_align_and_single_variant_contracts(const TestContext&) noexcept {
     constexpr size_t max = libk::numeric_limits<size_t>::max();
     const auto overflow = libk::checked_align_up(max, size_t{8});
@@ -663,6 +699,18 @@ bool test_atomic_scalar_and_compare_exchange_contract(
         && phase.load<libk::MemoryOrder::Relaxed>() == AtomicPhase::Empty;
 }
 
+/*luna change: test the shared saturating atomic increment contract, reason: normal epoch progress and max stability are the only focused invariants needed here*/
+bool test_atomic_inc_sat_contract(const TestContext&) noexcept {
+    libk::Atomic<uint64_t> value{};
+    libk::atomic_inc_sat(value);
+    if (value.load<libk::MemoryOrder::Relaxed>() != 1) {
+        return false;
+    }
+    value.store<libk::MemoryOrder::Relaxed>(UINT64_MAX);
+    libk::atomic_inc_sat(value);
+    return value.load<libk::MemoryOrder::Relaxed>() == UINT64_MAX;
+}
+
 bool test_atomic_ref_uses_borrowed_storage(const TestContext&) noexcept {
     uint64_t storage{7};
     libk::AtomicRef value{storage};
@@ -761,6 +809,10 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         test_inplace_vector_handles_aliasing_and_zero_capacity);
     (void)registry.add(
         "libk",
+        "inplace ring erase preserves order across wrapped storage",
+        test_inplace_ring_erase_preserves_logical_order);
+    (void)registry.add(
+        "libk",
         "alignment and single-alternative variant contracts hold",
         test_align_and_single_variant_contracts);
     (void)registry.add(
@@ -783,6 +835,11 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         "libk",
         "atomic scalar operations preserve compare-exchange contract",
         test_atomic_scalar_and_compare_exchange_contract);
+    /*luna change: register the saturating atomic increment focused test, reason: keep the generic no-wrap contract executable without concurrency pressure*/
+    (void)registry.add(
+        "libk",
+        "atomic increment saturates at the unsigned maximum",
+        test_atomic_inc_sat_contract);
     (void)registry.add(
         "libk",
         "atomic ref synchronizes borrowed scalar storage",

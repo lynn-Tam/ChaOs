@@ -9,6 +9,7 @@
 #include <resource/pool.hpp>
 #include <core/kernel_image.hpp>
 #include <mm/vspace_work.hpp>
+#include <mm/memory_work.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
 #include <sched/ready_queue.hpp>
@@ -47,6 +48,8 @@ constinit libk::ManualLifetime<kernel::object::ObjectStore>
     sched_test_objects{};
 constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
     sched_test_vspace_work{};
+constinit libk::ManualLifetime<kernel::mm::MemoryExecutor>
+    sched_test_memory_work{};
 constinit libk::ManualLifetime<kernel::mm::KernelVSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
@@ -145,14 +148,18 @@ public:
             return false;
         }
         auto& vspace_work = sched_test_vspace_work.emplace();
+        auto& memory_work = sched_test_memory_work.emplace();
+        /*luna change: use the shared bounded executor in scheduler object fixtures, reason: ObjectStore MemoryObject construction must match runtime ownership*/
         [[maybe_unused]] auto& objects =
-            sched_test_objects.emplace(*sched_test_pmm, vspace_work);
+            sched_test_objects.emplace(
+                *sched_test_pmm, vspace_work, memory_work);
         return true;
     }
 
 private:
     static void reset() noexcept {
         sched_test_objects.reset();
+        sched_test_memory_work.reset();
         sched_test_vspace_work.reset();
         sched_test_kernel.reset();
         sched_test_pmm.reset();

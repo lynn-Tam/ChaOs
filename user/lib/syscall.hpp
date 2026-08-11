@@ -146,23 +146,27 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto pager_complete(
     myos_cap_t pager,
-    myos_word_t slot,
-    myos_word_t generation) noexcept -> SysResult {
-    return syscall(MYOS_SYS_PAGER_COMPLETE, pager, slot, generation);
+    myos_cap_t target_memory,
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_PAGER_COMPLETE, pager, target_memory, 0, 0,
+        descriptor_offset);
 }
 
 [[nodiscard]] inline auto pager_fail(
     myos_cap_t pager,
-    myos_word_t slot,
-    myos_word_t generation) noexcept -> SysResult {
-    return syscall(MYOS_SYS_PAGER_FAIL, pager, slot, generation);
+    myos_cap_t target_memory,
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_PAGER_FAIL, pager, target_memory, 0, 0,
+        descriptor_offset);
 }
 
 [[nodiscard]] inline auto pager_requeue(
     myos_cap_t pager,
-    myos_word_t slot,
-    myos_word_t generation) noexcept -> SysResult {
-    return syscall(MYOS_SYS_PAGER_REQUEUE, pager, slot, generation);
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_PAGER_REQUEUE, pager, 0, 0, 0, descriptor_offset);
 }
 
 [[nodiscard]] inline auto pager_supply(
@@ -170,16 +174,14 @@ inline void yield() noexcept {
     myos_cap_t target_memory,
     myos_cap_t staging_memory,
     myos_word_t page,
-    myos_word_t request_generation,
-    myos_word_t claim_generation) noexcept -> SysResult {
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
     return syscall(
         MYOS_SYS_PAGER_SUPPLY,
         pager,
         target_memory,
         staging_memory,
         page,
-        request_generation,
-        claim_generation);
+        descriptor_offset);
 }
 
 [[nodiscard]] inline auto irq_bind(
@@ -463,6 +465,22 @@ inline void yield() noexcept {
 [[nodiscard]] inline auto vproc_park(
     myos_word_t observed_sequence) noexcept -> SysResult {
     return syscall(MYOS_SYS_VPROC_PARK, observed_sequence);
+}
+
+/*luna change: keep FaultKey wrappers to one key argument, reason: the current Vproc and saved frame are kernel-owned identities*/
+[[nodiscard]] inline auto vproc_fault_claim(
+    myos_fault_key_t key) noexcept -> SysResult {
+    return syscall(MYOS_SYS_VPROC_FAULT_CLAIM, key);
+}
+
+[[nodiscard]] inline auto vproc_fault_resume(
+    myos_fault_key_t key) noexcept -> SysResult {
+    return syscall(MYOS_SYS_VPROC_FAULT_RESUME, key);
+}
+
+[[nodiscard]] inline auto vproc_fault_drop(
+    myos_fault_key_t key) noexcept -> SysResult {
+    return syscall(MYOS_SYS_VPROC_FAULT_DROP, key);
 }
 
 [[nodiscard]] inline auto tunnel_open(

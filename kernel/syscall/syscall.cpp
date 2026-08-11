@@ -73,8 +73,11 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_NOTIFICATION_SIGNAL
         && operation <= MYOS_SYS_NOTIFICATION_UNBIND_VPROC) {
         outcome = handle_notification(operation, invocation);
-    } else if (operation >= MYOS_SYS_VPROC_ARM
-        && operation <= MYOS_SYS_VPROC_PARK) {
+    } else if ((operation >= MYOS_SYS_VPROC_ARM
+            && operation <= MYOS_SYS_VPROC_PARK)
+        || (operation >= MYOS_SYS_VPROC_FAULT_CLAIM
+            && operation <= MYOS_SYS_VPROC_FAULT_DROP)) {
+        /*luna change: route the non-contiguous FaultKey ABI through the Vproc handler, reason: syscall 111 remains reserved while 108-110 sit outside the legacy Vproc range*/
         outcome = handle_vproc(operation, invocation);
     } else if (operation >= MYOS_SYS_TUNNEL_CONNECT
         && operation <= MYOS_SYS_TUNNEL_CLOSE) {

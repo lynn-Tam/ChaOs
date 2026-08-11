@@ -2,6 +2,8 @@
 #include <user/lib/context.hpp>
 #include <user/lib/syscall.hpp>
 #include <uapi/bootstrap.h>
+/*luna change: expose the registered pager descriptor to the proof worker, reason: pager_claim/supply validation is part of the userspace ABI evidence*/
+#include <uapi/pager.h>
 
 namespace {
 
@@ -301,6 +303,74 @@ using namespace myos::proof;
     }
 }
 
+/*luna change: service one production PageIn request from a blocking Thread, reason: the proof must cover notification admission, descriptor identity, WOULD_BLOCK re-claim, and pager_supply with a real registered IPC page*/
+[[noreturn]] void pager_worker_task(
+    myos_word_t shared_address,
+    myos_word_t ipc_address) noexcept {
+    const Shared shared{shared_address};
+    auto* const request = reinterpret_cast<myos_pager_request*>(ipc_address);
+    if (!shared || request == nullptr) {
+        fail();
+    }
+    const myos_cap_t pager = shared.load(PagerCapSlot);
+    const myos_cap_t target = shared.load(PagerTargetCapSlot);
+    const myos_cap_t staging = shared.load(PagerSourceCapSlot);
+    const myos_cap_t notification =
+        shared.load(PagerNotifyCapSlot);
+    if (pager == 0 || target == 0 || staging == 0 || notification == 0) {
+        fail();
+    }
+    /*luna change: project worker admission and wait through the existing trace, reason: a Pager stall must identify its actor and wait edge without steering the protocol*/
+    shared.progress(
+        ProgressActor::Pager,
+        ProgressStage::Pager,
+        ProgressWait::Notification);
+    const auto woke = myos::notification_wait(notification);
+    if (woke.status != MYOS_STATUS_OK
+        || (woke.value & PagerBadge) == 0) {
+        fail();
+    }
+    shared.store(PagerWorkerSlot, PagerWorkerQueued);
+    shared.progress(
+        ProgressActor::Pager,
+        ProgressStage::Pager,
+        ProgressWait::Pager);
+    while (shared.load(PagerVprocSlot) != PagerVprocPending) {
+        myos::yield();
+    }
+
+    const auto claimed = myos::pager_claim(pager);
+    if (claimed.status != MYOS_STATUS_OK
+        || request->version != MYOS_PAGER_REQUEST_VERSION
+        || request->kind != MYOS_PAGER_REQUEST_PAGE_IN
+        || request->flags != MYOS_PAGER_REQUEST_FLAGS_NONE
+        || request->page_index != 0
+        || request->payload.page_in.first != 0
+        || request->payload.page_in.count != 1
+        || request->payload.page_in.backing_epoch == 0
+        || request->delivery_generation == 0
+        || request->page_generation == 0
+        || request->claim_generation == 0) {
+        fail();
+    }
+    request->payload.page_in.content_epoch = 1;
+    shared.store(PagerWorkerSlot, PagerWorkerClaimed);
+    const auto repeated = myos::pager_claim(pager);
+    if (repeated.status != MYOS_STATUS_WOULD_BLOCK) {
+        fail();
+    }
+    const auto supplied = myos::pager_supply(
+        pager, target, staging, request->page_index);
+    if (supplied.status != MYOS_STATUS_OK) {
+        fail();
+    }
+    shared.store(PagerWorkerSlot, PagerWorkerSupplied);
+    shared.progress(ProgressActor::Pager, ProgressStage::Complete);
+    for (;;) {
+        myos::yield();
+    }
+}
+
 [[noreturn]] void target_task(
     myos_word_t notification,
     myos_word_t shared_address) noexcept {
@@ -321,6 +391,27 @@ using namespace myos::proof;
         fail();
     }
     shared.store(VprocStateSlot, VprocReady);
+    /*luna change: drive the target Vproc through the same Pager-backed VA as Thread0, reason: the runtime fault frame and resumed instruction must be proven on the real Vproc path*/
+    while (shared.load(PagerWorkerSlot) != PagerWorkerQueued) {
+        myos::yield();
+    }
+    shared.store(PagerVprocSlot, PagerVprocFaulting);
+    /*luna change: project target Vproc fault admission and completion in its existing actor trace, reason: diagnostics must expose the fault lane without becoming its synchronization source*/
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::Pager,
+        ProgressWait::Pager);
+    const auto value = *reinterpret_cast<volatile const myos_word_t*>(
+        PagerAddress);
+    if (value != PagerValue) {
+        fail();
+    }
+    shared.store(PagerVprocSlot, PagerVprocDone);
+    shared.progress(
+        ProgressActor::TargetVproc,
+        ProgressStage::Pager,
+        ProgressWait::None,
+        PagerVprocDone);
     const auto tunnel = myos::tunnel_open(
         shared.load(PoolSlot), TunnelIngressSlot, TunnelTag);
     if (tunnel.status != MYOS_STATUS_OK) {
@@ -562,9 +653,6 @@ using namespace myos::proof;
     myos_word_t control_address,
     myos_word_t pending_sequence) noexcept {
     const Shared shared{SharedAddress};
-    if (generation == 0 || pending_sequence == 0) {
-        fail();
-    }
 
     const auto* const events =
         reinterpret_cast<const myos_vproc_event_page*>(event_address);
@@ -577,6 +665,81 @@ using namespace myos::proof;
     const uint64_t notification_mask =
         libk::AtomicRef{events->notification_mask}
             .load<libk::MemoryOrder::Acquire>();
+    const bool faulting =
+        shared.load(PagerVprocSlot) == PagerVprocFaulting;
+    /*luna change: publish one-shot TargetVproc fault detail before proof failure, reason: init must report the first failed gate without changing barrier truth or progress epochs*/
+    if (generation == 0) {
+        shared.store(PagerDetailSlot, PagerDetailGeneration);
+        fail();
+    }
+    if (!faulting && pending_sequence == 0) {
+        shared.store(PagerDetailSlot, PagerDetailPending);
+        fail();
+    }
+    /*luna change: keep the initial fault-key-zero runtime in the same Vproc policy as resumed delivery, reason: pending_sequence is intentionally not yet committed when the reserved fault frame first redirects execution*/
+    if (faulting) {
+        if (ready_mask != 0) {
+            shared.store(PagerDetailSlot, PagerDetailReady);
+            fail();
+        }
+        /*luna change: publish the pending fault edge once before waiting, reason: unchanged fault state must not advance diagnostic progress on each yield*/
+        shared.store(PagerVprocSlot, PagerVprocPending);
+        shared.progress(
+            ProgressActor::TargetVproc,
+            ProgressStage::Pager,
+            ProgressWait::Pager);
+        myos_fault_key_t key{};
+        for (;;) {
+            key = libk::AtomicRef{events->fault_key}
+                .load<libk::MemoryOrder::Acquire>();
+            if (key != 0) {
+                break;
+            }
+            myos::yield();
+        }
+        const auto kind = libk::AtomicRef{events->fault_kind}
+            .load<libk::MemoryOrder::Acquire>();
+        const auto access = libk::AtomicRef{events->fault_access}
+            .load<libk::MemoryOrder::Acquire>();
+        const auto address = libk::AtomicRef{events->fault_address}
+            .load<libk::MemoryOrder::Acquire>();
+        if (kind != MYOS_VPROC_FAULT_KIND_PAGE_READY) {
+            shared.store(PagerDetailSlot, PagerDetailKind);
+            fail();
+        }
+        if (access != MYOS_VPROC_FAULT_ACCESS_READ) {
+            shared.store(PagerDetailSlot, PagerDetailAccess);
+            fail();
+        }
+        if (address != PagerAddress) {
+            shared.store(PagerDetailSlot, PagerDetailAddress);
+            fail();
+        }
+        const auto claimed = myos::vproc_fault_claim(key);
+        if (claimed.status != MYOS_STATUS_OK) {
+            shared.store(PagerDetailSlot, PagerDetailClaimStatus);
+            fail();
+        }
+        if (claimed.value != MYOS_VPROC_FAULT_KIND_PAGE_READY) {
+            shared.store(PagerDetailSlot, PagerDetailClaimKind);
+            fail();
+        }
+        const auto duplicate = myos::vproc_fault_claim(key);
+        if (duplicate.status != MYOS_STATUS_BUSY) {
+            shared.store(PagerDetailSlot, PagerDetailDuplicate);
+            fail();
+        }
+        /*luna change: retry resume only across the published RETRY disposition, reason: a callback publisher may still own the previous fault slot generation*/
+        for (;;) {
+            const auto resumed = myos::vproc_fault_resume(key);
+            if (resumed.status == MYOS_STATUS_RETRY) {
+                myos::yield();
+                continue;
+            }
+            shared.store(PagerDetailSlot, PagerDetailResume);
+            fail();
+        }
+    }
     if (ready_mask != 0) {
         fail();
     }
@@ -688,6 +851,11 @@ extern "C" void myos_main(
             channel_sender_task(SharedAddress, vproc_shared);
         }
         channel_receiver_task(SharedAddress, vproc_shared);
+    }
+    /*luna change: route the extra ordinary start descriptor to the Pager worker, reason: the service lane must not enter Vproc arm/upcall ownership*/
+    if (bootstrap_address == SharedAddress
+        && bootstrap_size == PagerWorkerMagic) {
+        pager_worker_task(SharedAddress, vproc_ipc);
     }
     if (bootstrap_address == EndpointAbortMagic) {
         (void)myos::endpoint_abort(EndpointAbortDetail);
@@ -816,8 +984,19 @@ extern "C" void myos_main(
                     fail();
                 }
                 shared.store(EndpointResultSlot, EndpointTransfer);
+                shared.store(bootstrap_size, ChildReady + bootstrap_size);
+                /*luna change: let Thread0 own its faulting-to-done cell, reason: the three actor cells must not be reset or written by another lane*/
+                shared.store(PagerThreadSlot, PagerThreadFaulting);
+                const auto value = *reinterpret_cast<volatile const myos_word_t*>(
+                    PagerAddress);
+                if (value != PagerValue) {
+                    fail();
+                }
+                shared.store(PagerThreadSlot, PagerThreadDone);
             }
-            shared.store(bootstrap_size, ChildReady + bootstrap_size);
+            if (bootstrap_size != 0) {
+                shared.store(bootstrap_size, ChildReady + bootstrap_size);
+            }
             for (;;) {
                 myos::yield();
             }

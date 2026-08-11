@@ -1117,12 +1117,12 @@ auto lock_class_name(LockClass value) noexcept -> const char* {
     constexpr const char* names[] = {
         "pmm", "kernel-stack", "shootdown", "translation",
         "object-pool", "node-pool", "grant-graph", "grant-work",
-        "cspace", "resource-pool", "vspace", "vspace-work",
+        "cspace", "resource-pool", "vspace", "vspace-work", "memory-work",
         "memory-object", "backing-tree", "backing-storage",
         "physical-alias", "execution-authority", "sched-authority",
         "sched-context", "sched-domain", "remote-queue", "thread-stop",
         "vproc", "wait", "endpoint", "notification-source",
-        "notification", "tunnel", "channel", "pager", "irq",
+        "notification", "tunnel", "channel", "pager", "reclaimer", "irq",
         "irq-registry", "terminal",
     };
     const usize index = class_index(value);

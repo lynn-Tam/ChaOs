@@ -19,6 +19,9 @@ struct UserStart final {
 [[nodiscard]] auto valid_user_context(
     const myos_user_context& context) noexcept -> bool;
 
+/*luna change: reserve one Vproc frame cell below the raw stack top, reason: user traps need a stable active top without adding a second stack*/
+[[nodiscard]] auto vproc_stack_top(usize raw_stack_top) noexcept -> usize;
+
 // Constructs the synthetic first TrapFrame at the top of the Thread-owned
 // kernel stack. The returned address is the remaining kernel stack top.
 [[nodiscard]] auto prepare_user_stack(

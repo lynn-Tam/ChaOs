@@ -583,6 +583,9 @@ auto Pmm::push_free(Arena& arena, FrameIndex index) noexcept -> void {
     descriptor.data.free.next = arena.free_head;
     arena.free_head = index;
     ++arena.free_count;
+    if (frame_progress_generation_ != libk::numeric_limits<u64>::max()) {
+        ++frame_progress_generation_;
+    }
 }
 
 auto Pmm::pop_free(Arena& arena) noexcept -> FrameIndex {
@@ -618,7 +621,7 @@ auto Pmm::allocate_page() noexcept -> AllocateResult {
             generation,
         });
     }
-    return libk::unexpected(AllocError::OutOfMemory);
+    return libk::unexpected(AllocError::Pressure);
 }
 
 auto Pmm::make_page_group() noexcept -> OwnedPageGroup {
@@ -652,7 +655,7 @@ auto Pmm::allocate_page_into(OwnedPageGroup& group) noexcept
         return libk::expected(page);
     }
 
-    return libk::unexpected(AllocError::OutOfMemory);
+    return libk::unexpected(AllocError::Pressure);
 }
 
 auto Pmm::detach_page(
@@ -1008,6 +1011,11 @@ auto Pmm::free_page_count() const noexcept -> size_t {
         count += arena.free_count;
     }
     return count;
+}
+
+auto Pmm::frame_progress_generation() const noexcept -> u64 {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return frame_progress_generation_;
 }
 
 auto Pmm::arena_count() const noexcept -> size_t {

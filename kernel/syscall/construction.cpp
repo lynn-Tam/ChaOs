@@ -1389,7 +1389,12 @@ struct ThreadStart final {
     switch (error) {
     case kernel::mm::MemoryError::OutOfMemory:
     case kernel::mm::MemoryError::ResourceExhausted:
+    case kernel::mm::MemoryError::GenerationExhausted:
         return MYOS_STATUS_NO_MEMORY;
+    case kernel::mm::MemoryError::Pressure:
+        return MYOS_STATUS_RETRY;
+    case kernel::mm::MemoryError::Pending:
+        return MYOS_STATUS_WOULD_BLOCK;
     case kernel::mm::MemoryError::BackingFailed:
         return MYOS_STATUS_BACKING_FAILED;
     case kernel::mm::MemoryError::Busy:

@@ -33,7 +33,7 @@ enum class PmmInitError : uint8_t {
 };
 
 enum class AllocError : uint8_t {
-    OutOfMemory,
+    Pressure,
 };
 
 enum class QueryError : uint8_t {
@@ -153,6 +153,9 @@ class Pmm {
     [[nodiscard]] auto contains(Page page) const noexcept -> bool;
     [[nodiscard]] auto state_of(Page page) const noexcept -> QueryResult;
     [[nodiscard]] auto free_page_count() const noexcept -> size_t;
+    // Monotonic semantic progress edge.  It advances only when a frame is
+    // returned to the free list; allocation/retry activity never changes it.
+    [[nodiscard]] auto frame_progress_generation() const noexcept -> u64;
     [[nodiscard]] auto arena_count() const noexcept -> size_t;
     [[nodiscard]] auto metadata_page_count() const noexcept -> size_t;
     [[nodiscard]] auto direct_map(this auto& self) noexcept
@@ -363,6 +366,7 @@ class Pmm {
     size_t outstanding_groups_{};
     size_t next_group_id_{};
     size_t issued_reservations_{};
+    u64 frame_progress_generation_{};
 };
 
 class OwnedPageGroup {

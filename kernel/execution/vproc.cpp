@@ -7,6 +7,7 @@
 #include <cpu/cpu_registry.hpp>
 #include <libk/limits.hpp>
 #include <libk/utility.hpp>
+#include <mm/vspace.hpp>
 #include <operation/completion.hpp>
 #include <sched/context.hpp>
 #include <sched/dispatcher.hpp>
@@ -86,9 +87,15 @@ Vproc::Vproc(
     *runtime_.events = {};
     runtime_.events->version = MYOS_VPROC_RUNTIME_VERSION;
 
+    /*luna change: build the Vproc bootstrap frame below the reserved cell, reason: startup and user-trap entry share one adjusted active top*/
+    const usize active_stack_top = arch::vproc_stack_top(
+        execution_.stack_top());
+    KASSERT(active_stack_top != 0
+        && active_stack_top > execution_.stack_base());
     const auto kernel_stack_top = arch::prepare_user_stack(
-        execution_.stack_top(), bootstrap_entry_);
+        active_stack_top, bootstrap_entry_);
     KASSERT(kernel_stack_top);
+    KASSERT(*kernel_stack_top >= execution_.stack_base());
     execution_.prepare(&Vproc::start, this, *kernel_stack_top);
 }
 
@@ -101,6 +108,9 @@ Vproc::~Vproc() noexcept {
     KASSERT(outgoing_tunnels_.empty());
     KASSERT(!arm_attaching_ && activation_publishers_ == 0
         && activation_post_ == ActivationPost::Idle && !activation_dirty_);
+    /*luna change: require the fault continuation to be fully settled before destruction, reason: ObjectPool reuse cannot race a retained frame or callback publisher*/
+    KASSERT(fault_slot_.state == FaultSlot::State::Free
+        && fault_slot_.publishers == 0);
     for (const IngressSlot& ingress : ingresses_) {
         KASSERT(ingress.link == nullptr);
     }
@@ -369,7 +379,10 @@ auto Vproc::request_park(u64 observed_sequence) noexcept
         || upcall_state_ != UpcallState::Armed
         || observed_sequence != pending_sequence_
         || ready_mask_ != 0 || ingress_mask_ != 0
-        || notification_mask_ != 0) {
+        || notification_mask_ != 0
+        /*luna change: keep ready fault projection in canonical park admission, reason: event-page fields are only a view of FaultSlot state*/
+        || fault_slot_.state == FaultSlot::State::PageReady
+        || fault_slot_.state == FaultSlot::State::PageFailed) {
         return libk::unexpected(VprocError::InvalidState);
     }
     park_sequence_ = observed_sequence;
@@ -379,8 +392,11 @@ auto Vproc::request_park(u64 observed_sequence) noexcept
 
 auto Vproc::pending_events() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
+    /*luna change: derive pending events from PageReady/PageFailed state, reason: runtime projection must not become a second wake truth*/
     return ready_mask_ != 0 || ingress_mask_ != 0
-        || notification_mask_ != 0;
+        || notification_mask_ != 0
+        || fault_slot_.state == FaultSlot::State::PageReady
+        || fault_slot_.state == FaultSlot::State::PageFailed;
 }
 
 auto Vproc::arm(
@@ -419,22 +435,29 @@ auto Vproc::arm(
     return libk::expected();
 }
 
-void Vproc::on_trap_exit(arch::TrapContext& trap) noexcept {
+auto Vproc::enter_runtime(
+    arch::TrapContext& trap,
+    bool capture) noexcept -> bool {
     const myos_word_t disabled = __atomic_load_n(
         &runtime_.control->upcall_disable_depth, __ATOMIC_ACQUIRE);
     if (disabled != 0) {
-        return;
+        return false;
     }
     arch::UserStart entry{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
-        if (upcall_state_ != UpcallState::Armed
-            || (ready_mask_ == 0 && ingress_mask_ == 0
-                && notification_mask_ == 0)
-            || stop_requested_) {
-            return;
+        if (upcall_state_ != UpcallState::Armed || stop_requested_ || stopped_
+            || (capture
+                && ready_mask_ == 0 && ingress_mask_ == 0
+                && notification_mask_ == 0
+                && fault_slot_.state != FaultSlot::State::PageReady
+                && fault_slot_.state != FaultSlot::State::PageFailed)) {
+            return false;
         }
-        trap.save_user(runtime_.events->delivered);
+        if (capture) {
+            /*luna change: capture only the ordinary return frame under the entry lock, reason: a stop winner must not invalidate a prechecked Armed state*/
+            trap.save_user(runtime_.events->delivered);
+        }
         ++upcall_generation_;
         KASSERT(upcall_generation_ != 0);
         upcall_state_ = UpcallState::Active;
@@ -449,6 +472,611 @@ void Vproc::on_trap_exit(arch::TrapContext& trap) noexcept {
         entry.arguments[3] = pending_sequence_;
     }
     KASSERT(trap.load_user_start(entry));
+    return true;
+}
+
+void Vproc::on_trap_exit(arch::TrapContext& trap) noexcept {
+    /*luna change: let the shared entry operation decide the losing race, reason: ordinary delivery must not precheck state before Armed->Active claim*/
+    static_cast<void>(enter_runtime(trap, true));
+}
+
+/*luna change: publish a finalized fault projection from canonical FaultSlot state, reason: the event page is a one-way ABI view and never admission truth*/
+void Vproc::project_fault_locked() noexcept {
+    KASSERT(fault_slot_.state == FaultSlot::State::PageReady
+        || fault_slot_.state == FaultSlot::State::PageFailed);
+    const auto kind = static_cast<mm::FaultKind>(fault_slot_.kind);
+    u32 public_kind = MYOS_VPROC_FAULT_KIND_NONE;
+    switch (kind) {
+    case mm::FaultKind::NoMapping:
+        public_kind = MYOS_VPROC_FAULT_KIND_NO_MAPPING;
+        break;
+    case mm::FaultKind::Guard:
+        public_kind = MYOS_VPROC_FAULT_KIND_GUARD;
+        break;
+    case mm::FaultKind::AccessDenied:
+        public_kind = MYOS_VPROC_FAULT_KIND_ACCESS_DENIED;
+        break;
+    case mm::FaultKind::ResourceExhausted:
+        public_kind = MYOS_VPROC_FAULT_KIND_RESOURCE_EXHAUSTED;
+        break;
+    case mm::FaultKind::OutOfMemory:
+        public_kind = MYOS_VPROC_FAULT_KIND_OUT_OF_MEMORY;
+        break;
+    case mm::FaultKind::BackingFailed:
+        public_kind = MYOS_VPROC_FAULT_KIND_BACKING_FAILED;
+        break;
+    case mm::FaultKind::Ready:
+    case mm::FaultKind::Materialized:
+        public_kind = MYOS_VPROC_FAULT_KIND_PAGE_READY;
+        break;
+    case mm::FaultKind::Busy:
+    case mm::FaultKind::Pressure:
+    case mm::FaultKind::Pending:
+        KASSERT(false);
+        break;
+    }
+    u32 public_access = MYOS_VPROC_FAULT_ACCESS_NONE;
+    switch (fault_slot_.access) {
+    case mm::Access::Read:
+        public_access = MYOS_VPROC_FAULT_ACCESS_READ;
+        break;
+    case mm::Access::Write:
+        public_access = MYOS_VPROC_FAULT_ACCESS_WRITE;
+        break;
+    case mm::Access::Execute:
+        public_access = MYOS_VPROC_FAULT_ACCESS_EXECUTE;
+        break;
+    }
+    /*luna change: publish fault payload before releasing its key and sequence, reason: readers must never observe a durable identity for half-written facts*/
+    __atomic_store_n(
+        &runtime_.events->fault_kind, public_kind, __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_access, public_access, __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_address,
+        fault_slot_.address.raw(),
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_pc,
+        fault_slot_.pc,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_key,
+        static_cast<myos_fault_key_t>(fault_slot_.generation),
+        __ATOMIC_RELEASE);
+    ++pending_sequence_;
+    KASSERT(pending_sequence_ != 0);
+    __atomic_store_n(
+        &runtime_.events->pending_sequence,
+        pending_sequence_,
+        __ATOMIC_RELEASE);
+}
+
+void Vproc::publish_fault(
+    void* owner,
+    mm::PageWaitResult result) noexcept {
+    KASSERT(owner != nullptr);
+    static_cast<Vproc*>(owner)->publish_fault(result);
+}
+
+void Vproc::publish_fault(mm::PageWaitResult result) noexcept {
+    CpuRegistry* cpus{};
+    bool activate{};
+    bool claimed{};
+    bool callback_owner{};
+    bool relation_owner{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& slot = fault_slot_;
+        const FaultSlot::State before = slot.state;
+        /*luna change: reject callbacks outside the retained admission states, reason: a stale callback must never be mistaken for a new slot generation*/
+        KASSERT(before == FaultSlot::State::Attaching
+            || before == FaultSlot::State::PendingPage
+            || before == FaultSlot::State::Resuming
+            || before == FaultSlot::State::Dropping);
+        /*luna change: hold a callback publisher before inspecting the slot, reason: a finalized foreign callback must not enter after Free can be reused*/
+        KASSERT(slot.publishers != libk::numeric_limits<u8>::max());
+        ++slot.publishers;
+        callback_owner = true;
+        relation_owner = before == FaultSlot::State::PendingPage
+            || (before == FaultSlot::State::Dropping
+                && slot.relation_generation != 0);
+        if (before == FaultSlot::State::Dropping) {
+            /*luna change: identify the Dropping relation owner by generation, reason: close_fault now owns and clears the sole MemoryObject pin before callback entry*/
+            KASSERT(slot.relation_generation != 0
+                && slot.page_wait.generation == slot.relation_generation);
+        } else {
+            const u64 relation_generation = slot.page_wait.generation;
+            /*luna change: keep the generation zero until relation-publisher handoff, reason: early Attaching/Resuming callbacks have no retained relation owner*/
+            KASSERT(before == FaultSlot::State::PendingPage
+                ? relation_generation != 0
+                    && slot.relation_generation == relation_generation
+                : slot.relation_generation == 0);
+            slot.kind = static_cast<u8>(
+                result == mm::PageWaitResult::Ready
+                    ? mm::FaultKind::Ready
+                    : mm::FaultKind::BackingFailed);
+            slot.state = result == mm::PageWaitResult::Ready
+                ? FaultSlot::State::PageReady
+                : FaultSlot::State::PageFailed;
+            claimed = true;
+            if (before == FaultSlot::State::PendingPage) {
+                project_fault_locked();
+                cpus = slot.cpus;
+                activate = !stop_requested_ && !stopped_;
+            }
+        }
+    }
+    if (claimed && activate && cpus != nullptr) {
+        static_cast<void>(sched::activate(*cpus, *this));
+    }
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& slot = fault_slot_;
+        /*luna change: retire callback and relation publishers only after foreign work returns, reason: exactly one winner releases the retained pin and enables reset*/
+        if (callback_owner) {
+            KASSERT(slot.publishers != 0);
+            --slot.publishers;
+        }
+        if (relation_owner) {
+            KASSERT(slot.publishers != 0);
+            /*luna change: retire relation ownership with its generation, reason: nonzero relation_generation is the sole publisher ownership fact*/
+            slot.relation_generation = 0;
+            --slot.publishers;
+        }
+        if (slot.state == FaultSlot::State::Dropping
+            && slot.publishers == 0) {
+            slot.reset();
+        }
+    }
+    retry_stop_if_ready();
+}
+
+/*luna change: use the shared mm fault classifier, reason: Vproc and PageFault must preserve identical resource outcomes*/
+auto Vproc::fault(
+    arch::TrapContext& trap,
+    CpuRegistry& cpus,
+    CpuId local,
+    mm::VirtAddr address,
+    mm::Access access) noexcept -> mm::FaultKind {
+    mm::VSpace* const vspace = execution_.binding().vspace();
+    FaultSlot* slot = &fault_slot_;
+    bool sync{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (vspace == nullptr || stop_requested_ || stopped_
+            || relation_admission_closed_) {
+            return mm::FaultKind::BackingFailed;
+        }
+        /*luna change: resolve control-context faults synchronously without FaultSlot ownership, reason: only Armed admits a managed continuation while Unarmed and Active cannot poll relation-free Pending*/
+        if (upcall_state_ == UpcallState::Unarmed
+            || upcall_state_ == UpcallState::Active) {
+            sync = true;
+        } else if (upcall_state_ != UpcallState::Armed
+            || slot->state != FaultSlot::State::Free
+            || slot->generation == libk::numeric_limits<u64>::max()) {
+            return mm::FaultKind::BackingFailed;
+        }
+        if (!sync) {
+            const usize raw_top = execution_.stack_top();
+            const usize active_top = arch::vproc_stack_top(raw_top);
+            const usize frame_bytes = raw_top >= active_top
+                ? raw_top - active_top : 0;
+            if (active_top == 0 || active_top <= execution_.stack_base()
+                || active_top - execution_.stack_base() < frame_bytes) {
+                return mm::FaultKind::BackingFailed;
+            }
+            const arch::UserFrame frame = trap.save_frame(raw_top);
+            if (!frame) {
+                return mm::FaultKind::BackingFailed;
+            }
+            ++slot->generation;
+            KASSERT(slot->generation != 0);
+            slot->frame = frame;
+            slot->memory = nullptr;
+            slot->cpus = &cpus;
+            slot->address = address;
+            slot->access = access;
+            slot->pc = trap.pc();
+            slot->kind = static_cast<u8>(mm::FaultKind::Pending);
+            slot->relation_generation = 0;
+            slot->publishers = 1;
+            slot->state = FaultSlot::State::Attaching;
+        }
+    }
+
+    if (sync) {
+        const auto result = vspace->fault(
+            mm::VmContext{.cpus = &cpus, .local = local},
+            address,
+            access);
+        if (!result) {
+            return mm::fault_kind(result.error());
+        }
+        return result.value().kind == mm::FaultKind::Pending
+            ? mm::FaultKind::BackingFailed
+            : result.value().kind;
+    }
+
+    const auto result = vspace->fault(
+        mm::VmContext{.cpus = &cpus, .local = local},
+        address,
+        access,
+        &slot->page_wait,
+        this,
+        &Vproc::publish_fault);
+    mm::FaultKind outcome = result
+        ? result.value().kind : mm::fault_kind(result.error());
+    bool enter{};
+    bool stop_fault{};
+    mm::MemoryObject* drop_memory{};
+    if (result && result.value().kind == mm::FaultKind::Pending) {
+        KASSERT(result.value().memory != nullptr);
+        {
+            kernel::sync::IrqLockGuard guard{state_lock_};
+            FaultSlot& current = fault_slot_;
+            const bool stopping = stop_requested_ || stopped_
+                || relation_admission_closed_;
+            current.memory = result.value().memory;
+            if (current.state == FaultSlot::State::Attaching) {
+                /*luna change: install relation generation only with the retained publisher, reason: early callback results must not leave a phantom relation owner*/
+                KASSERT(current.page_wait.generation != 0);
+                current.relation_generation = current.page_wait.generation;
+                current.state = FaultSlot::State::PendingPage;
+                KASSERT(current.publishers
+                    != libk::numeric_limits<u8>::max());
+                /*luna change: retain the attached relation publisher across admission return, reason: callback entry and stop/reuse must share one protected handoff*/
+                ++current.publishers;
+                stop_fault = stopping;
+                enter = !stopping;
+            } else if (current.state == FaultSlot::State::PageReady
+                || current.state == FaultSlot::State::PageFailed) {
+                KASSERT(current.relation_generation == 0);
+                project_fault_locked();
+                enter = true;
+            } else {
+                KASSERT(current.state == FaultSlot::State::Dropping);
+                KASSERT(current.relation_generation == 0);
+                /*luna change: settle an early-ready pin after stop won before admission returned, reason: no relation publisher remains once the callback has finalized and returned*/
+                drop_memory = current.memory;
+                current.memory = nullptr;
+                stop_fault = true;
+            }
+        }
+    } else {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& current = fault_slot_;
+        KASSERT(current.state == FaultSlot::State::Attaching);
+        current.kind = static_cast<u8>(outcome);
+        current.state = FaultSlot::State::Dropping;
+        KASSERT(current.publishers == 1);
+    }
+    if (drop_memory != nullptr) {
+        drop_memory->release_fault();
+    }
+    if (stop_fault) {
+        close_fault();
+        outcome = mm::FaultKind::BackingFailed;
+    } else if (enter) {
+        if (!enter_runtime(trap, false)) {
+            close_fault();
+            outcome = mm::FaultKind::BackingFailed;
+        }
+    }
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& current = fault_slot_;
+        KASSERT(current.publishers != 0);
+        --current.publishers;
+        if (current.state == FaultSlot::State::Dropping
+            && current.publishers == 0) {
+            current.reset();
+        }
+    }
+    retry_stop_if_ready();
+    return outcome;
+}
+
+auto Vproc::claim_fault(u64 key) noexcept
+    -> libk::Expected<mm::FaultKind, VprocError> {
+    kernel::sync::IrqLockGuard guard{state_lock_};
+    if (upcall_state_ != UpcallState::Active) {
+        return libk::unexpected(VprocError::InvalidState);
+    }
+    if (key == 0 || key != fault_slot_.generation) {
+        return libk::unexpected(VprocError::InvalidKey);
+    }
+    if (fault_slot_.state != FaultSlot::State::PageReady
+        && fault_slot_.state != FaultSlot::State::PageFailed) {
+        return libk::unexpected(VprocError::InvalidState);
+    }
+    /*luna change: accept a terminal snapshot while callback retirement is still published, reason: PageReady/Claimed may briefly retain a detached relation publisher*/
+    if (fault_slot_.relation_generation != 0) {
+        KASSERT(fault_slot_.publishers != 0
+            && !fault_slot_.page_wait.attached());
+    }
+    KASSERT(fault_slot_.memory != nullptr);
+    KASSERT(__atomic_load_n(
+                &runtime_.events->fault_key, __ATOMIC_ACQUIRE)
+        == static_cast<myos_fault_key_t>(key));
+    const auto kind = static_cast<mm::FaultKind>(fault_slot_.kind);
+    fault_slot_.state = FaultSlot::State::Claimed;
+    /*luna change: acknowledge only the matching fault identity, reason: claim consumes the projected edge without rewinding the monotonic event sequence*/
+    __atomic_store_n(
+        &runtime_.events->fault_key, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &runtime_.events->fault_kind,
+        MYOS_VPROC_FAULT_KIND_NONE,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_access,
+        MYOS_VPROC_FAULT_ACCESS_NONE,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_address, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &runtime_.events->fault_pc, 0, __ATOMIC_RELAXED);
+    return libk::expected(kind);
+}
+
+auto Vproc::resume_fault(
+    arch::TrapContext& trap,
+    u64 key) noexcept -> libk::Expected<mm::FaultKind, VprocError> {
+    mm::VSpace* vspace{};
+    CpuRegistry* cpus{};
+    CpuId local{};
+    mm::VirtAddr address{};
+    mm::Access access{mm::Access::Read};
+    mm::MemoryObject* old_memory{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (upcall_state_ != UpcallState::Active) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        if (key == 0 || key != fault_slot_.generation) {
+            return libk::unexpected(VprocError::InvalidKey);
+        }
+        if (fault_slot_.state != FaultSlot::State::Claimed) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        vspace = execution_.binding().vspace();
+        if (vspace == nullptr || stop_requested_ || stopped_
+            || relation_admission_closed_) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        /*luna change: defer resume while an earlier callback publisher still owns the slot, reason: the new admission must linearize only after callback and relation publishers drain*/
+        if (fault_slot_.publishers != 0) {
+            return libk::expected(mm::FaultKind::Busy);
+        }
+        /*luna change: rearm only after terminal callback publishers drain, reason: a new relation generation must be installed from a detached state*/
+        KASSERT(fault_slot_.relation_generation == 0);
+        KASSERT(!fault_slot_.page_wait.attached()
+            && fault_slot_.cpus != nullptr
+            && current_cpu().descriptor != nullptr);
+        cpus = fault_slot_.cpus;
+        local = current_cpu().descriptor->logical_id();
+        address = fault_slot_.address;
+        access = fault_slot_.access;
+        old_memory = fault_slot_.memory;
+        fault_slot_.memory = nullptr;
+        /*luna change: retire the previous relation generation before a new admission, reason: callback validation must accept only the new embedded WaitRelation generation*/
+        fault_slot_.relation_generation = 0;
+        KASSERT(fault_slot_.publishers != libk::numeric_limits<u8>::max());
+        ++fault_slot_.publishers; // resume publisher
+        fault_slot_.state = FaultSlot::State::Resuming;
+    }
+    /*luna change: release the old claimed pin before revalidation, reason: retry must transfer exactly one existing operations_ hold rather than accumulate pins*/
+    if (old_memory != nullptr) {
+        old_memory->release_fault();
+    }
+
+    const auto result = vspace->fault(
+        mm::VmContext{.cpus = cpus, .local = local},
+        address,
+        access,
+        &fault_slot_.page_wait,
+        this,
+        &Vproc::publish_fault);
+    mm::FaultKind outcome = result
+        ? result.value().kind : mm::fault_kind(result.error());
+    bool stop_fault{};
+    bool consume{};
+    mm::MemoryObject* drop_memory{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& current = fault_slot_;
+        const bool stopping = stop_requested_ || stopped_
+            || relation_admission_closed_;
+        if (result && result.value().kind == mm::FaultKind::Pending) {
+            KASSERT(result.value().memory != nullptr);
+            current.memory = result.value().memory;
+            if (current.state == FaultSlot::State::Resuming) {
+                /*luna change: install the new relation generation only after publisher handoff, reason: an early callback must leave no historical relation owner*/
+                KASSERT(current.page_wait.generation != 0);
+                current.relation_generation = current.page_wait.generation;
+                current.state = FaultSlot::State::PendingPage;
+                KASSERT(current.publishers
+                    != libk::numeric_limits<u8>::max());
+                /*luna change: transfer the new relation publisher only after Pending attach returns, reason: Resuming remains protected while VSpace runs foreign code*/
+                ++current.publishers;
+                stop_fault = stopping;
+            } else if (current.state == FaultSlot::State::PageReady
+                || current.state == FaultSlot::State::PageFailed) {
+                KASSERT(current.relation_generation == 0);
+                project_fault_locked();
+                stop_fault = stopping;
+            } else {
+                KASSERT(current.state == FaultSlot::State::Dropping);
+                KASSERT(current.relation_generation == 0);
+                drop_memory = current.memory;
+                current.memory = nullptr;
+                stop_fault = true;
+            }
+        } else {
+            KASSERT(current.state == FaultSlot::State::Resuming);
+            if (stopping) {
+                current.state = FaultSlot::State::Dropping;
+                outcome = mm::FaultKind::BackingFailed;
+            } else if (outcome == mm::FaultKind::Ready
+                || outcome == mm::FaultKind::Materialized) {
+                /*luna change: consume the exact frame only after the revalidation winner, reason: a successful resume is the sole path that redirects and frees FaultSlot*/
+                trap.redirect(current.frame);
+                KASSERT(current.publishers == 1);
+                --current.publishers; // resume publisher
+                current.reset();
+                upcall_state_ = UpcallState::Armed;
+                __atomic_store_n(
+                    &runtime_.events->active_generation, 0, __ATOMIC_RELEASE);
+                consume = true;
+            } else {
+                current.state = FaultSlot::State::Claimed;
+            }
+        }
+    }
+    if (drop_memory != nullptr) {
+        drop_memory->release_fault();
+    }
+    if (stop_fault) {
+        close_fault();
+        outcome = mm::FaultKind::BackingFailed;
+    }
+    if (!consume) {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& current = fault_slot_;
+        KASSERT(current.publishers != 0);
+        --current.publishers; // resume publisher
+        if (current.state == FaultSlot::State::Dropping
+            && current.publishers == 0) {
+            current.reset();
+        }
+    }
+    retry_stop_if_ready();
+    return libk::expected(outcome);
+}
+
+auto Vproc::drop_fault(u64 key) noexcept
+    -> libk::Expected<void, VprocError> {
+    mm::MemoryObject* memory{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        if (upcall_state_ != UpcallState::Active) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        if (key == 0 || key != fault_slot_.generation) {
+            return libk::unexpected(VprocError::InvalidKey);
+        }
+        if (fault_slot_.state != FaultSlot::State::Claimed) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        /*luna change: let drop settle a claimed pin while callback retirement is live, reason: the callback owns only the detached relation publisher until it clears its generation*/
+        if (fault_slot_.relation_generation != 0) {
+            KASSERT(fault_slot_.publishers != 0
+                && !fault_slot_.page_wait.attached());
+        }
+        fault_slot_.state = FaultSlot::State::Dropping;
+        KASSERT(fault_slot_.publishers != libk::numeric_limits<u8>::max());
+        ++fault_slot_.publishers;
+        memory = fault_slot_.memory;
+        fault_slot_.memory = nullptr;
+    }
+    /*luna change: settle the claimed continuation outside Vproc ownership, reason: MemoryObject lifetime release must never run under state_lock_*/
+    if (memory != nullptr) {
+        memory->release_fault();
+    }
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& slot = fault_slot_;
+        KASSERT(slot.state == FaultSlot::State::Dropping
+            && slot.publishers != 0);
+        --slot.publishers;
+        if (slot.publishers == 0) {
+            slot.reset();
+        }
+    }
+    retry_stop_if_ready();
+    return libk::expected();
+}
+
+void Vproc::close_fault() noexcept {
+    mm::MemoryObject* memory{};
+    u64 generation{};
+    bool cancelable{};
+    bool relation_live{};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& slot = fault_slot_;
+        if (slot.state == FaultSlot::State::Free
+            || slot.state == FaultSlot::State::Attaching
+            || slot.state == FaultSlot::State::Resuming
+            || slot.state == FaultSlot::State::Dropping) {
+            return;
+        }
+        relation_live = slot.relation_generation != 0;
+        cancelable = slot.state == FaultSlot::State::PendingPage
+            && relation_live
+            && slot.page_wait.generation == slot.relation_generation
+            && slot.page_wait.attached();
+        /*luna change: separate cancel eligibility from relation publisher life, reason: terminal callback retirement may keep a detached generation after PageReady or Claimed*/
+        if (relation_live) {
+            KASSERT(slot.publishers != 0);
+        }
+        if (slot.state == FaultSlot::State::PendingPage) {
+            KASSERT(relation_live
+                && slot.page_wait.generation == slot.relation_generation);
+        }
+        slot.state = FaultSlot::State::Dropping;
+        KASSERT(slot.publishers != libk::numeric_limits<u8>::max());
+        ++slot.publishers;
+        /*luna change: move the sole fault pin before foreign cancellation, reason: callback races must not invalidate close's MemoryObject lifetime owner*/
+        memory = slot.memory;
+        slot.memory = nullptr;
+        generation = slot.relation_generation;
+        KASSERT(!cancelable || memory != nullptr);
+        /*luna change: withdraw the ready fault projection when stop wins, reason: a closed lane cannot leave a stale FaultKey visible across reuse*/
+        __atomic_store_n(
+            &runtime_.events->fault_key, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->fault_kind,
+            MYOS_VPROC_FAULT_KIND_NONE,
+            __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_access,
+            MYOS_VPROC_FAULT_ACCESS_NONE,
+            __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_address, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_pc, 0, __ATOMIC_RELAXED);
+    }
+    bool canceled{};
+    if (cancelable) {
+        canceled = memory->cancel_fault(fault_slot_.page_wait, generation);
+        if (!canceled) {
+            /*luna change: settle the moved pin when cancel loses, reason: the callback retains only relation publisher ownership after host detach*/
+            memory->release_fault();
+        }
+    } else if (memory != nullptr) {
+        memory->release_fault();
+    }
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        FaultSlot& slot = fault_slot_;
+        if (slot.state == FaultSlot::State::Dropping) {
+            KASSERT(slot.publishers != 0);
+            /*luna change: settle stop and relation owners by cancellation outcome, reason: a losing cancel must wait for the terminal callback instead of freeing early*/
+            --slot.publishers; // close publisher
+            if (canceled) {
+                KASSERT(slot.publishers != 0);
+                /*luna change: clear the relation owner only when cancel wins, reason: a failed cancel leaves publisher retirement to the finalized callback*/
+                slot.relation_generation = 0;
+                --slot.publishers; // relation publisher
+            }
+            if (slot.publishers == 0) {
+                slot.reset();
+            }
+        }
+    }
+    retry_stop_if_ready();
 }
 
 auto Vproc::resume(
@@ -501,8 +1129,11 @@ auto Vproc::prepare_retire() const noexcept -> bool {
             return false;
         }
     }
+    /*luna change: block retire until FaultSlot and its callback publishers drain, reason: stop/reuse must not release an admitted MemoryObject pin*/
     if (arm_attaching_ || activation_publishers_ != 0
-        || activation_post_ != ActivationPost::Idle || activation_dirty_) {
+        || activation_post_ != ActivationPost::Idle || activation_dirty_
+        || fault_slot_.state != FaultSlot::State::Free
+        || fault_slot_.publishers != 0) {
         return false;
     }
     // ObjectPool changes lifecycle to Retiring before this callback. Closing
@@ -549,6 +1180,8 @@ void Vproc::request_exit() noexcept {
         cancel_operations();
         close_tunnels();
         close_notifications();
+        /*luna change: settle the fixed fault continuation during stop, reason: relation cancellation and pin release must precede Vproc reuse*/
+        close_fault();
     }
     retry_stop_if_ready();
 }
@@ -627,7 +1260,9 @@ void Vproc::retry_stop_if_ready() noexcept {
         }
         if (arm_attaching_ || activation_publishers_ != 0
             || activation_post_ != ActivationPost::Idle
-            || activation_dirty_) {
+            || activation_dirty_
+            || fault_slot_.state != FaultSlot::State::Free
+            || fault_slot_.publishers != 0) {
             return;
         }
         home = execution_.home_;
@@ -659,6 +1294,8 @@ void Vproc::finish_stop() noexcept {
         KASSERT(!arm_attaching_ && activation_publishers_ == 0
             && activation_post_ == ActivationPost::Idle
             && !activation_dirty_);
+        KASSERT(fault_slot_.state == FaultSlot::State::Free
+            && fault_slot_.publishers == 0);
         KASSERT(stop_requested_ && stop_dispatched_ && !stopped_);
         for (OperationSlot& slot : operations_) {
             KASSERT(slot.state != OperationState::Pending);
@@ -677,6 +1314,21 @@ void Vproc::finish_stop() noexcept {
         __atomic_store_n(&runtime_.events->ingress_mask, 0, __ATOMIC_RELEASE);
         __atomic_store_n(
             &runtime_.events->notification_mask, 0, __ATOMIC_RELEASE);
+        /*luna change: clear the fault projection with its canonical slot, reason: a stopped Vproc must not expose a stale generation to a reused runtime page*/
+        __atomic_store_n(
+            &runtime_.events->fault_key, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &runtime_.events->fault_kind,
+            MYOS_VPROC_FAULT_KIND_NONE,
+            __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_access,
+            MYOS_VPROC_FAULT_ACCESS_NONE,
+            __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_address, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &runtime_.events->fault_pc, 0, __ATOMIC_RELAXED);
         KASSERT(execution_.state_ == State::Exited
             && execution_.scheduler_binding_ == nullptr);
         execution_.home_ = nullptr;
@@ -714,7 +1366,11 @@ void Vproc::finish_stop() noexcept {
     CpuLocal& cpu = current_cpu();
     KASSERT(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->on_context_enter();
-    arch::resume_user(vproc->execution_.stack_top());
+    /*luna change: resume the ordinary Vproc frame below the reserved cell, reason: the top cell is retained exclusively for FaultSlot*/
+    const usize active_stack_top = arch::vproc_stack_top(
+        vproc->execution_.stack_top());
+    KASSERT(active_stack_top != 0);
+    arch::resume_user(active_stack_top);
 }
 
 } // namespace kernel

@@ -328,6 +328,27 @@ public:
         return iterator(this, size_);
     }
 
+    // Erase one logical element while preserving order. Move the shorter
+    // side so bounded queues avoid rebuilding their entire storage.
+    constexpr iterator erase(iterator position) noexcept
+        requires AssignableFrom<T&, T&&> {
+        libk_assert(position.ring_ == this);
+        libk_assert(position.logical_index_ < size_);
+        const size_t index = position.logical_index_;
+        if (index < size_ / 2) {
+            for (size_t current = index; current != 0; --current) {
+                (*this)[current] = libk::move((*this)[current - 1]);
+            }
+            pop_front();
+        } else {
+            for (size_t current = index; current + 1 < size_; ++current) {
+                (*this)[current] = libk::move((*this)[current + 1]);
+            }
+            pop_back();
+        }
+        return iterator(this, index < size_ ? index : size_);
+    }
+
     [[nodiscard]] constexpr const_iterator end() const noexcept {
         return const_iterator(this, size_);
     }

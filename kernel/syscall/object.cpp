@@ -25,6 +25,7 @@ namespace {
     case kernel::mm::MemoryError::AttachmentState:
         return MYOS_STATUS_BUSY;
     case kernel::mm::MemoryError::Pending:
+    case kernel::mm::MemoryError::Pressure:
         return MYOS_STATUS_WOULD_BLOCK;
     case kernel::mm::MemoryError::BackingFailed:
         return MYOS_STATUS_BACKING_FAILED;

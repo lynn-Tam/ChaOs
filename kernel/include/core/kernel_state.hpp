@@ -9,6 +9,8 @@
 #include <mm/direct_map.hpp>
 #include <mm/kernel_vspace.hpp>
 #include <mm/pmm.hpp>
+#include <mm/reclaim.hpp>
+#include <mm/memory_work.hpp>
 #include <mm/vspace_work.hpp>
 #include <object/object_store.hpp>
 #include <resource/pool.hpp>
@@ -114,6 +116,8 @@ private:
     libk::ManualLifetime<kernel::mm::KernelVSpace> kernel_vspace_{};
     libk::ManualLifetime<kernel::time::Clock> clock_{};
     kernel::mm::VSpaceExecutor vspace_work_{};
+    kernel::mm::MemoryExecutor memory_work_{};
+    kernel::mm::PageReclaimer pressure_work_{};
     libk::ManualLifetime<kernel::object::ObjectStore> objects_{};
     libk::ManualLifetime<kernel::cap::GrantGraph> grants_{};
     libk::ManualLifetime<kernel::CpuRegistry> cpus_{};
