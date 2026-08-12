@@ -14,44 +14,54 @@ The project is also an experiment in using freestanding C++23 to express low-lev
 
 ## Build and run
 
-Meson and Ninja are the canonical build system. Configure one persistent build
-directory for the RISC-V toolchain, then reconfigure that same directory when
-selecting a profile, diagnostic provider, panic probe, or scenario:
+Meson and Ninja are the canonical build system. Configure one persistent
+RISC-V build directory. The project build wrapper always reuses that directory
+and stores ccache data in `build/ccache`:
 
 ```sh
 meson setup build/riscv64 --cross-file cross/riscv64-gcc.ini -Dbuildtype=plain -Db_ndebug=true
-meson compile -C build/riscv64
+tools/build/ninja.sh kernel.elf
 ```
 
-`profile` is `kernel`, `test`, or `proof`; diagnostics are independently chosen
-with `lock_diag` and `concurrency_diag`. Plain compilation builds only the
-kernel image. Use explicit targets for the remaining developer surfaces:
+Two images coexist in the same object graph. `kernel.elf` is the fixed normal
+image with off providers and no builtin tests. `kernel_debug.elf` shares the
+same `kernel-core` archive and links the selected diagnostics, builtin tests,
+scenario, and panic probe. Reconfiguring `profile`, `lock_diag`,
+`concurrency_diag`, `scenario`, or `panic_probe` therefore rebuilds only the
+affected debug modules and relinks `kernel_debug.elf`; it does not create or
+recompile a parallel core object tree.
+
+Always request explicit targets. Ordinary development should not invoke the
+default all-target graph:
 
 ```sh
-meson compile -C build/riscv64 bundle audit-symbols audit-boot-stack audit-user audit-clang
-meson compile -C build/riscv64 symbols disasm
+tools/build/ninja.sh kernel.elf
+tools/build/ninja.sh kernel_debug.elf
+tools/build/ninja.sh bundle
+tools/build/ninja.sh audit-kernel-symbols audit-kernel-stack
+tools/build/ninja.sh audit-symbols audit-boot-stack audit-user audit-clang
+tools/build/ninja.sh symbols disasm debug-symbols debug-disasm
 
 meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
-meson compile -C build/riscv64 run-test-smp
+tools/build/ninja.sh run-test-smp
 
 meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=watch -Dscenario=report -Dpanic_probe=0
-meson compile -C build/riscv64 run-scenario
+tools/build/ninja.sh run-scenario
 
 meson setup --reconfigure build/riscv64 -Dprofile=proof -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
-meson compile -C build/riscv64 run-proof-smp run-e1-smp
+tools/build/ninja.sh run-proof-smp run-e1-smp
 
-meson setup --reconfigure build/riscv64 -Dprofile=kernel -Dlock_diag=off -Dconcurrency_diag=off -Dscenario=off -Dpanic_probe=1
-meson compile -C build/riscv64 run-panic-smp
+meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=1
+tools/build/ninja.sh run-panic-smp
 meson setup --reconfigure build/riscv64 -Dpanic_probe=2
-meson compile -C build/riscv64 run-panic-degraded-smp
-meson compile -C build/riscv64 debug
+tools/build/ninja.sh run-panic-degraded-smp
+tools/build/ninja.sh debug
 ```
 
 `qemu_smp`, `qemu_timeout`, `gdb_host`, and `gdb_port` are typed Meson options.
-Use `meson compile -C build/riscv64 --clean` to remove generated artifacts
-while retaining its configuration. Use `meson setup --wipe build/riscv64
---cross-file cross/riscv64-gcc.ini` only when intentionally discarding that
-generated build directory; ordinary option changes use `--reconfigure`.
+`--clean` and `--wipe` intentionally discard reusable work and require broad
+recompilation; do not use them during ordinary development. Normal option
+changes use `--reconfigure` in the same `build/riscv64` directory.
 
 ---
 
