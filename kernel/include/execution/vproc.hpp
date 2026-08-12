@@ -14,6 +14,7 @@
 #include <sync/lock.hpp>
 #include <mm/direct_map.hpp>
 #include <mm/memory_object.hpp>
+#include <mm/reclaim.hpp>
 #include <mm/user_view.hpp>
 #include <operation/completion.hpp>
 #include <operation/key.hpp>
@@ -99,6 +100,9 @@ struct FaultSlot final : private libk::noncopyable {
     };
 
     mm::WaitRelation page_wait{};
+    /*luna change: keep pressure retry payload in the same fixed FaultSlot,
+      reason: Vproc has no heap/table lane for a second continuation owner*/
+    mm::FrameDemand demand{};
     arch::UserFrame frame{};
     mm::MemoryObject* memory{};
     CpuRegistry* cpus{};
@@ -115,6 +119,7 @@ struct FaultSlot final : private libk::noncopyable {
     void reset() noexcept {
         KASSERT(!page_wait.attached());
         KASSERT(memory == nullptr && publishers == 0);
+        KASSERT(!demand);
         /*luna change: forbid reset with a live relation owner, reason: generation zero is the only reusable FaultSlot boundary*/
         KASSERT(relation_generation == 0);
         frame = {};

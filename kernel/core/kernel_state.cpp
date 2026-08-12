@@ -486,9 +486,10 @@ auto KernelState::initialize_object_store() noexcept -> bool {
     if (objects_) {
         return false;
     }
-    /*luna change: construct ObjectStore with the shared MemoryExecutor, reason: MemoryObject admission must use one runtime service owner*/
+    /*luna change: pass the shared reclaimer by reference, reason: runtime
+      Pager membership has one mandatory admission owner*/
     [[maybe_unused]] auto& store = objects_.emplace(
-        pmm(), vspace_work_, memory_work_);
+        pmm(), vspace_work_, memory_work_, pressure_work_);
     return true;
 }
 

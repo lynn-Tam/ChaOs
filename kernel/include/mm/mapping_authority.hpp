@@ -64,6 +64,12 @@ private:
     PageMapping page_mapping_{};
     libk::IntrusiveTreeHook tree_hook_{};
     MappedPage* pending_next_{};
+    /*luna change: retain the authority route for one exact page, reason:
+      MappingAuthority owns the sole VSpace identity for publication*/
+    MappingAuthority* authority_{};
+    /*luna change: keep the claimed relation token with the mapped page,
+      reason: release follows exact PTE teardown rather than authority destroy*/
+    libk::ManualLifetime<MemoryWork> reclaim_work_{};
 };
 
 struct MappedPageCompare final {
@@ -146,6 +152,9 @@ private:
     libk::ManualLifetime<cap::GrantAttachment> grant_attachment_{};
     libk::ManualLifetime<MemoryWork> memory_work_{};
     libk::ManualLifetime<cap::GrantWork> grant_work_{};
+    /*luna change: index one queued exact page on the authority, reason:
+      VSpace service must consume the relation without a second page queue*/
+    MappedPage* reclaim_page_{};
     bool invalidation_requested_{};
     bool relations_detached_{};
     bool releasing_relations_{};

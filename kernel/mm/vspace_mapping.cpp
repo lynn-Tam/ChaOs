@@ -303,6 +303,9 @@ auto VSpace::map_impl(
             if (page->page_mapping_.attached()) {
                 KASSERT(memory.unbind_mapping(page->page_mapping_));
             }
+            /*luna change: discard the authority route with its node, reason:
+              failed map preparation must not leave a callback context*/
+            page->authority_ = nullptr;
             pages_.destroy(*page);
         }
     };
@@ -364,9 +367,16 @@ auto VSpace::map_impl(
             return fail(node_error(page_entry.error()));
         }
         MappedPage* const page = page_entry.value().object;
+        /*luna change: arm each mapped page with its authority route, reason:
+          MappingAuthority owns the sole VSpace identity*/
+        page->authority_ = authority;
+        page->page_mapping_.arm(page, &VSpace::invalidate_page);
         auto linked = memory.bind_mapping(
             page->page_mapping_, object_page);
         if (!linked) {
+            /*luna change: clear the failed map route before recycle, reason:
+              backing unlink precedes exact page destruction*/
+            page->authority_ = nullptr;
             pages_.destroy(*page);
             return fail(memory_error(linked.error()));
         }

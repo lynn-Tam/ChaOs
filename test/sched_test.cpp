@@ -10,6 +10,7 @@
 #include <core/kernel_image.hpp>
 #include <mm/vspace_work.hpp>
 #include <mm/memory_work.hpp>
+#include <mm/reclaim.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
 #include <sched/ready_queue.hpp>
@@ -50,6 +51,8 @@ constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
     sched_test_vspace_work{};
 constinit libk::ManualLifetime<kernel::mm::MemoryExecutor>
     sched_test_memory_work{};
+constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
+    sched_test_reclaimer{};
 constinit libk::ManualLifetime<kernel::mm::KernelVSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
@@ -149,16 +152,19 @@ public:
         }
         auto& vspace_work = sched_test_vspace_work.emplace();
         auto& memory_work = sched_test_memory_work.emplace();
-        /*luna change: use the shared bounded executor in scheduler object fixtures, reason: ObjectStore MemoryObject construction must match runtime ownership*/
+        /*luna change: construct a real reclaimer for scheduler objects,
+          reason: ObjectStore requires one mandatory Pager owner*/
+        auto& reclaimer = sched_test_reclaimer.emplace();
         [[maybe_unused]] auto& objects =
             sched_test_objects.emplace(
-                *sched_test_pmm, vspace_work, memory_work);
+                *sched_test_pmm, vspace_work, memory_work, reclaimer);
         return true;
     }
 
 private:
     static void reset() noexcept {
         sched_test_objects.reset();
+        sched_test_reclaimer.reset();
         sched_test_memory_work.reset();
         sched_test_vspace_work.reset();
         sched_test_kernel.reset();

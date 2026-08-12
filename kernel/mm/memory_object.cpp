@@ -1216,8 +1216,49 @@ public:
         if (node == nullptr || !mapping.backing_hook_.is_linked()) {
             return libk::unexpected(MemoryError::AttachmentState);
         }
+        if (mapping.invalidating()) {
+            return libk::unexpected(MemoryError::Busy);
+        }
+        node->mappings.erase(mapping);
+        /*luna change: detach the relation after backing unlink, reason: the
+          atomic relation state must outlive the intrusive hook removal*/
+        mapping.mark_detached();
+        return libk::expected();
+    }
+
+    /*luna change: unlink only with the exact claimed token, reason: normal
+      teardown must leave an unpublished PageMapping alive*/
+    [[nodiscard]] auto unbind_claimed_mapping(
+        PageMapping& mapping,
+        MemoryWork& work) noexcept
+        -> libk::Expected<void, MemoryError> {
+        kernel::sync::IrqLockGuard guard{tree_lock_};
+        Node* const node = find_locked(mapping.page_index());
+        if (node == nullptr || !mapping.backing_hook_.is_linked()) {
+            return libk::unexpected(MemoryError::AttachmentState);
+        }
+        if (!mapping.owns(work)) {
+            return libk::unexpected(MemoryError::OwnershipMismatch);
+        }
         node->mappings.erase(mapping);
         return libk::expected();
+    }
+
+    /*luna change: claim one Pager mapping under its owner tree lock, reason:
+      exact invalidation must release the backing lock before VSpace work*/
+    [[nodiscard]] auto claim_mapping(
+        PageMapping& mapping) noexcept
+        -> libk::Expected<MemoryWork, MemoryError> {
+        kernel::sync::IrqLockGuard guard{tree_lock_};
+        Node* const node = find_locked(mapping.page_index());
+        if (node == nullptr || !mapping.backing_hook_.is_linked()) {
+            return libk::unexpected(MemoryError::AttachmentState);
+        }
+        auto work = mapping.claim();
+        if (!work) {
+            return libk::unexpected(MemoryError::Busy);
+        }
+        return libk::expected(libk::move(work));
     }
 
     [[nodiscard]] auto lease_acquire(usize page_index) noexcept
@@ -1533,10 +1574,13 @@ public:
             if (!node->mappings.empty() || node->leases != 0) {
                 return libk::unexpected(MemoryError::Busy);
             }
+            /*luna change: admit direct clean eviction through PageSlot intent,
+              reason: begin_evict requires an owned loss obligation even when
+              no candidate queue supplied this page*/
+            auto retained = node->slot.retain_reclaim();
+            KASSERT(retained);
             auto begun = node->slot.begin_evict();
-            if (!begun) {
-                return libk::unexpected(MemoryError::InvalidState);
-            }
+            KASSERT(begun);
             page = libk::move(node->resident);
             refund = node->resident_sponsorship.detach();
             auto finished = node->slot.finish_evict();
@@ -1825,13 +1869,17 @@ static_assert(sizeof(BootBacking) <= page_size);
 
 } // namespace
 
+/*luna change: move only the release token pair, reason: publication belongs
+  to each relation owner and must not become MemoryWork state*/
 MemoryWork::MemoryWork(MemoryWork&& other) noexcept
-    : attachment_(libk::exchange(other.attachment_, nullptr)) {}
+    : context_(libk::exchange(other.context_, nullptr)),
+      release_(libk::exchange(other.release_, nullptr)) {}
 
 auto MemoryWork::operator=(MemoryWork&& other) noexcept -> MemoryWork& {
     if (this != &other) {
         reset();
-        attachment_ = libk::exchange(other.attachment_, nullptr);
+        context_ = libk::exchange(other.context_, nullptr);
+        release_ = libk::exchange(other.release_, nullptr);
     }
     return *this;
 }
@@ -1841,15 +1889,89 @@ MemoryWork::~MemoryWork() noexcept {
 }
 
 void MemoryWork::reset() noexcept {
-    MemoryAttachment* const attachment =
-        libk::exchange(attachment_, nullptr);
-    if (attachment != nullptr) {
-        attachment->drop_work();
+    void* const context = libk::exchange(context_, nullptr);
+    Release const release = libk::exchange(release_, nullptr);
+    if (context != nullptr) {
+        KASSERT(release != nullptr);
+        release(context);
     }
+}
+
+MemoryWork::MemoryWork(MemoryAttachment& attachment) noexcept
+    : context_(&attachment),
+      release_([](void* context) noexcept {
+          static_cast<MemoryAttachment*>(context)->drop_work();
+      }) {}
+
+void PageMapping::arm(void* context, Publish publish) noexcept {
+    KASSERT(static_cast<State>(state_.load<libk::MemoryOrder::Acquire>())
+        == State::Detached);
+    KASSERT(context != nullptr && publish != nullptr);
+    context_ = context;
+    publish_ = publish;
+}
+
+/*luna change: validate the token's exact relation callback and context,
+  reason: a non-empty MemoryWork cannot prove PageMapping ownership*/
+auto PageMapping::owns(const MemoryWork& work) const noexcept -> bool {
+    return static_cast<State>(state_.load<libk::MemoryOrder::Acquire>())
+            == State::Invalidating
+        && work.context_ == this
+        && work.release_ == &PageMapping::release_work;
+}
+
+/*luna change: transition the exact relation once before foreign publication,
+  reason: backing membership and VSpace detach share one winner state*/
+auto PageMapping::claim() noexcept -> MemoryWork {
+    u8 attached = static_cast<u8>(State::Attached);
+    if (!state_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(
+            attached,
+            static_cast<u8>(State::Invalidating))) {
+        return {};
+    }
+    return MemoryWork{this, &PageMapping::release_work};
+}
+
+/*luna change: publish the claimed relation through PageMapping-owned context,
+  reason: the release token remains independent of publication protocol*/
+void PageMapping::publish(MemoryWork&& work) noexcept {
+    KASSERT(context_ != nullptr && publish_ != nullptr && owns(work));
+    publish_(context_, libk::move(work));
+}
+
+void PageMapping::mark_attached() noexcept {
+    KASSERT(owner_ != nullptr);
+    state_.store<libk::MemoryOrder::Release>(
+        static_cast<u8>(State::Attached));
+}
+
+void PageMapping::mark_detached() noexcept {
+    const State current = static_cast<State>(
+        state_.load<libk::MemoryOrder::Acquire>());
+    if (current == State::Attached) {
+        state_.store<libk::MemoryOrder::Release>(
+            static_cast<u8>(State::Detached));
+    }
+}
+
+void PageMapping::release_work(void* context) noexcept {
+    static_cast<PageMapping*>(context)->finish_work();
+}
+
+void PageMapping::finish_work() noexcept {
+    KASSERT(static_cast<State>(state_.load<libk::MemoryOrder::Acquire>())
+        == State::Invalidating);
+    KASSERT(owner_ == nullptr && !backing_hook_.is_linked());
+    state_.store<libk::MemoryOrder::Release>(
+        static_cast<u8>(State::Detached));
 }
 
 PageMapping::~PageMapping() noexcept {
     KASSERT(owner_ == nullptr && !backing_hook_.is_linked());
+    KASSERT(static_cast<State>(state_.load<libk::MemoryOrder::Acquire>())
+        == State::Detached);
 }
 
 MemoryAttachment::~MemoryAttachment() noexcept {
@@ -1959,8 +2081,9 @@ void PageTransfer::abort() noexcept {
 MemoryObject::MemoryObject(
     Pmm& pmm,
     usize byte_size,
-    MemoryExecutor& work) noexcept
-    : pmm_(&pmm), work_(&work) {
+    MemoryExecutor& work,
+    PageReclaimer& reclaimer) noexcept
+    : pmm_(&pmm), work_(&work), reclaimer_(reclaimer) {
     if (byte_size != 0 && byte_size % page_size == 0) {
         logical_pages_ = byte_size / page_size;
     }
@@ -1999,6 +2122,7 @@ MemoryObject::~MemoryObject() noexcept {
     KASSERT(!backing_page_);
     KASSERT(!backing_sponsorship_);
     KASSERT(operations_ == 0);
+    KASSERT(!reclaim_entry_.hook.is_linked() && reclaim_entry_.object == nullptr);
     KASSERT(attachments_.empty());
 }
 
@@ -2157,6 +2281,8 @@ auto MemoryObject::initialize_backing(
         .fail = nullptr,
         .bind_mapping = nullptr,
         .unbind_mapping = nullptr,
+        .unbind_claimed_mapping = nullptr,
+        .claim_mapping = nullptr,
         .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
@@ -2197,6 +2323,8 @@ auto MemoryObject::initialize_backing(
         .fail = nullptr,
         .bind_mapping = nullptr,
         .unbind_mapping = nullptr,
+        .unbind_claimed_mapping = nullptr,
+        .claim_mapping = nullptr,
         .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
@@ -2237,6 +2365,8 @@ auto MemoryObject::initialize_backing(
         .fail = nullptr,
         .bind_mapping = nullptr,
         .unbind_mapping = nullptr,
+        .unbind_claimed_mapping = nullptr,
+        .claim_mapping = nullptr,
         .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
@@ -2298,6 +2428,16 @@ auto MemoryObject::initialize_backing(
         },
         .unbind_mapping = [](void* backing, PageMapping& mapping) noexcept {
             return static_cast<PagerBacking*>(backing)->unbind_mapping(mapping);
+        },
+        .unbind_claimed_mapping = [](
+            void* backing,
+            PageMapping& mapping,
+            MemoryWork& work) noexcept {
+            return static_cast<PagerBacking*>(backing)->unbind_claimed_mapping(
+                mapping, work);
+        },
+        .claim_mapping = [](void* backing, PageMapping& mapping) noexcept {
+            return static_cast<PagerBacking*>(backing)->claim_mapping(mapping);
         },
         .lease_acquire = [](void* backing, usize index) noexcept {
             return static_cast<PagerBacking*>(backing)->lease_acquire(index);
@@ -2415,6 +2555,11 @@ auto MemoryObject::initialize_backing(
             access_bits |= extent.access.raw();
         }
         access_ = AccessMask::from_raw(access_bits);
+    }
+    if (kind == BackingKind::Pager) {
+        /*luna change: publish Pager membership only after Live state, reason:
+          the derived index must never admit a building object*/
+        KASSERT(reclaimer_.register_memory(*this));
     }
     if (kind != BackingKind::Anonymous && kind != BackingKind::Pager) {
         for (const MemoryExtent& extent : extents) {
@@ -2751,6 +2896,9 @@ auto MemoryObject::bind_mapping(
         accepted = state_ == MemoryState::Live && mapping.owner_ == nullptr;
         if (accepted) {
             mapping.owner_ = this;
+            /*luna change: publish attachment state after backing admission,
+              reason: PageMapping has one exact attached winner*/
+            mapping.mark_attached();
             KASSERT(mapping_count_ != libk::numeric_limits<usize>::max());
             ++mapping_count_;
         }
@@ -2791,6 +2939,9 @@ auto MemoryObject::unbind_mapping(
         mapping.owner_ = nullptr;
         mapping.page_index_ = 0;
         --mapping_count_;
+        /*luna change: complete normal unbind through the same relation state,
+          reason: reclaim and teardown cannot retain parallel attachment truth*/
+        mapping.mark_detached();
     }
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -2799,6 +2950,64 @@ auto MemoryObject::unbind_mapping(
     }
     finish_retire();
     return unlinked;
+}
+
+/*luna change: complete claimed mapping unlink only with matching token,
+  reason: PageMapping storage stays live until VSpace finishes its PTE*/
+auto MemoryObject::unbind_mapping(
+    PageMapping& mapping,
+    MemoryWork& work) noexcept -> libk::Expected<void, MemoryError> {
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (mapping.owner_ != this || backing_ops_ == nullptr
+            || backing_ops_->unbind_claimed_mapping == nullptr) {
+            return libk::unexpected(MemoryError::AttachmentState);
+        }
+        ++operations_;
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    auto unlinked = ops->unbind_claimed_mapping(backing, mapping, work);
+    if (unlinked) {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(mapping.owner_ == this && mapping_count_ != 0);
+        mapping.owner_ = nullptr;
+        mapping.page_index_ = 0;
+        --mapping_count_;
+    }
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(operations_ != 0);
+        --operations_;
+    }
+    finish_retire();
+    return unlinked;
+}
+
+/*luna change: claim one reverse mapping through the existing operation pin,
+  reason: page invalidation must cross the backing lock without extending it*/
+auto MemoryObject::claim_mapping(PageMapping& mapping) noexcept
+    -> libk::Expected<MemoryWork, MemoryError> {
+    const BackingOps* ops{};
+    void* backing{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != MemoryState::Live) {
+            return libk::unexpected(MemoryError::InvalidState);
+        }
+        if (mapping.owner_ != this || backing_ops_ == nullptr
+            || backing_ops_->claim_mapping == nullptr) {
+            return libk::unexpected(MemoryError::AttachmentState);
+        }
+        ++operations_;
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    auto result = ops->claim_mapping(backing, mapping);
+    drop_page();
+    return result;
 }
 
 auto MemoryObject::page_state(usize page_index) const noexcept
@@ -3227,6 +3436,8 @@ void MemoryObject::retire() noexcept {
         work_open_.store<libk::MemoryOrder::Release>(false);
     }
 
+    static_cast<void>(reclaimer_.withdraw(*this));
+
     if (work_->withdraw(*this)) {
         finish_work();
     }
@@ -3272,6 +3483,23 @@ void MemoryObject::retire() noexcept {
         stopped_ops->stop(stopped_backing);
     }
     finish_retire();
+}
+
+/*luna change: take a bounded reclaim operation pin through the MemoryObject
+  owner, reason: the derived index must not call backing code after retire*/
+auto MemoryObject::try_reclaim_pin() noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (!reclaim_entry_.hook.is_linked() || state_ != MemoryState::Live
+        || backing_ops_ == nullptr) {
+        return false;
+    }
+    KASSERT(operations_ != libk::numeric_limits<usize>::max());
+    ++operations_;
+    return true;
+}
+
+void MemoryObject::finish_reclaim_pin() noexcept {
+    drop_page();
 }
 
 void MemoryObject::drop_page() noexcept {

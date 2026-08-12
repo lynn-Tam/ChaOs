@@ -10,6 +10,7 @@
 #include <mm/vspace.hpp>
 #include <mm/vspace_work.hpp>
 #include <mm/memory_work.hpp>
+#include <mm/reclaim.hpp>
 #include <object/object_store.hpp>
 #include <resource/pool.hpp>
 #include <resource/traits.hpp>
@@ -33,6 +34,8 @@ constinit libk::ManualLifetime<kernel::object::ObjectStore>
     vspace_test_objects{};
 constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor> vspace_test_work{};
 constinit libk::ManualLifetime<kernel::mm::MemoryExecutor> vspace_test_memory_work{};
+constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
+    vspace_test_reclaimer{};
 
 class VSpaceFixture final : private libk::noncopyable_nonmovable {
 public:
@@ -81,9 +84,11 @@ public:
         }
         auto& work = vspace_test_work.emplace();
         auto& memory_work = vspace_test_memory_work.emplace();
-        /*luna change: give VSpace focused objects the shared bounded memory executor, reason: test construction must match runtime ObjectStore ownership*/
+        /*luna change: construct a real reclaimer for VSpace objects, reason:
+          focused fixtures share the mandatory Pager membership owner*/
+        auto& reclaimer = vspace_test_reclaimer.emplace();
         auto& objects = vspace_test_objects.emplace(
-            *vspace_test_pmm, work, memory_work);
+            *vspace_test_pmm, work, memory_work, reclaimer);
         auto memory = objects.create_anonymous(
             pages * kernel::mm::page_size,
             kernel::mm::AnonymousConfig{
@@ -222,6 +227,7 @@ private:
             vspace_test_objects->drain_reclaim();
         }
         vspace_test_objects.reset();
+        vspace_test_reclaimer.reset();
         vspace_test_memory_work.reset();
         vspace_test_work.reset();
         vspace_test_kernel.reset();

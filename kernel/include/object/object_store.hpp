@@ -21,6 +21,7 @@
 
 namespace kernel::mm {
 class MemoryExecutor;
+class PageReclaimer;
 }
 
 namespace kernel::object {
@@ -92,7 +93,10 @@ public:
     explicit ObjectStore(
         kernel::mm::Pmm& pmm,
         kernel::mm::VSpaceExecutor& vspace_work,
-        kernel::mm::MemoryExecutor& memory_work) noexcept;
+        kernel::mm::MemoryExecutor& memory_work,
+        /*luna change: require one shared reclaimer owner, reason: Pager
+          MemoryObjects cannot have nullable pressure semantics*/
+        kernel::mm::PageReclaimer& reclaimer) noexcept;
     ~ObjectStore() noexcept;
 
     template<typename... Args>
@@ -337,6 +341,9 @@ private:
     kernel::mm::Pmm* pmm_{};
     kernel::mm::VSpaceExecutor* vspace_work_{};
     kernel::mm::MemoryExecutor* memory_work_{};
+    /*luna change: retain the mandatory policy owner by reference, reason:
+      all pooled MemoryObjects share one derived membership index*/
+    kernel::mm::PageReclaimer& reclaimer_;
     // Sponsoring pools outlive every pool containing sponsored objects.
     ResourcePool resources_;
     EndpointPool endpoints_;

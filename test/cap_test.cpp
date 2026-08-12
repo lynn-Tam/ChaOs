@@ -10,6 +10,7 @@
 #include <mm/pmm.hpp>
 #include <mm/vspace_work.hpp>
 #include <mm/memory_work.hpp>
+#include <mm/reclaim.hpp>
 #include <object/object_store.hpp>
 #include <core/kernel_image.hpp>
 #include <resource/traits.hpp>
@@ -37,6 +38,8 @@ constinit libk::ManualLifetime<kernel::object::ObjectStore>
     cap_test_objects{};
 constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor> cap_test_vspace_work{};
 constinit libk::ManualLifetime<kernel::mm::MemoryExecutor> cap_test_memory_work{};
+constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
+    cap_test_reclaimer{};
 constinit libk::ManualLifetime<GrantGraph> cap_test_graph{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_a{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_b{};
@@ -97,10 +100,12 @@ public:
         cap_test_map.reset();
         auto& vspace_work = cap_test_vspace_work.emplace();
         auto& memory_work = cap_test_memory_work.emplace();
-        /*luna change: pass the shared bounded executor into capability test objects, reason: ObjectStore construction must preserve runtime MemoryObject ownership*/
+        /*luna change: construct a real reclaimer for capability objects,
+          reason: ObjectStore requires one mandatory Pager owner*/
+        auto& reclaimer = cap_test_reclaimer.emplace();
         [[maybe_unused]] auto& objects =
             cap_test_objects.emplace(
-                *cap_test_pmm, vspace_work, memory_work);
+                *cap_test_pmm, vspace_work, memory_work, reclaimer);
         [[maybe_unused]] auto& graph =
             cap_test_graph.emplace(*cap_test_pmm);
         [[maybe_unused]] auto& space_a =
@@ -210,6 +215,7 @@ private:
             cap_test_objects->drain_reclaim();
         }
         cap_test_objects.reset();
+        cap_test_reclaimer.reset();
         cap_test_memory_work.reset();
         cap_test_vspace_work.reset();
         cap_test_pmm.reset();

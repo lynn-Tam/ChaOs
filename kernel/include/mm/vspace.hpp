@@ -282,6 +282,10 @@ private:
         Unmap,
         Protect,
         Invalidate,
+        /*luna change: represent one exact page PTE operation in the existing
+          VSpace pending lane, reason: shootdown completion already owns the
+          bounded translation lifecycle*/
+        PageInvalidate,
         DestroyRegion,
         Retire,
     };
@@ -362,7 +366,9 @@ private:
     void queue_authority(MappingAuthority& authority) noexcept;
     void destroy_layout(LayoutNode& node) noexcept;
     void detach_mapping(Mapping& mapping) noexcept;
-    void release_page(MappedPage& page) noexcept;
+    /*luna change: retain pending pages until exact reclaim unlink, reason:
+      unpublished PageMapping claims still own embedded storage*/
+    [[nodiscard]] auto release_page(MappedPage& page) noexcept -> bool;
     void finish_authorities() noexcept;
 
     void request_invalidation(
@@ -371,6 +377,16 @@ private:
     void request_invalidation(
         MappingAuthority& authority,
         cap::GrantWork&& work) noexcept;
+    /*luna change: route exact mapping claims through the existing VSpace
+      service, reason: page removal must preserve MappingAuthority layout*/
+    static void invalidate_page(void* context, MemoryWork&& work) noexcept;
+    void request_page_invalidation(
+        MappedPage& page,
+        MemoryWork&& work) noexcept;
+    [[nodiscard]] auto start_page_invalidation(
+        VmContext context,
+        MappingAuthority& authority) noexcept
+        -> libk::Expected<VmStatus, VSpaceError>;
     [[nodiscard]] auto start_invalidation(
         VmContext context,
         MappingAuthority& authority,

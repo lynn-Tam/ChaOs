@@ -40,6 +40,94 @@ void VSpace::request_invalidation(
     schedule_work();
 }
 
+/*luna change: route one claimed PageMapping through the existing VSpace
+  executor, reason: exact PTE removal must stay with its layout owner*/
+void VSpace::invalidate_page(void* context, MemoryWork&& work) noexcept {
+    auto& page = *static_cast<MappedPage*>(context);
+    KASSERT(page.authority_ != nullptr && page.authority_->owner_ != nullptr);
+    page.authority_->owner_->request_page_invalidation(
+        page, libk::move(work));
+}
+
+/*luna change: retain one exact page token on its authority, reason: the
+  existing invalidation list is the sole bounded VSpace work membership*/
+void VSpace::request_page_invalidation(
+    MappedPage& page,
+    MemoryWork&& work) noexcept {
+    MappingAuthority* const authority = page.authority_;
+    KASSERT(authority != nullptr && authority->owner_ == this);
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(!page.reclaim_work_);
+        if (authority->pages_.find(page.address_) == &page) {
+            KASSERT(authority->reclaim_page_ == nullptr);
+            [[maybe_unused]] auto& retained =
+                page.reclaim_work_.emplace(libk::move(work));
+            authority->reclaim_page_ = &page;
+            if (!authority->invalidation_hook_.is_linked()) {
+                invalidations_.push_back(*authority);
+            }
+        } else {
+            KASSERT(pending_kind_ != PendingKind::None);
+            KASSERT(authority->reclaim_page_ == nullptr
+                || authority->reclaim_page_ == &page);
+            [[maybe_unused]] auto& retained =
+                page.reclaim_work_.emplace(libk::move(work));
+            authority->reclaim_page_ = &page;
+            if (!authority->invalidation_requested_
+                && authority->invalidation_hook_.is_linked()) {
+                invalidations_.erase(*authority);
+            }
+        }
+    }
+    schedule_work();
+}
+
+/*luna change: remove only the claimed page PTE, reason: MappingAuthority and
+  layout remain live for later rematerialization*/
+auto VSpace::start_page_invalidation(
+    VmContext context,
+    MappingAuthority& authority) noexcept
+    -> libk::Expected<VmStatus, VSpaceError> {
+    kernel::sync::IrqLockToken lock{lock_};
+    if (pending_kind_ != PendingKind::None || claim_.region != nullptr
+        || authority.reclaim_page_ == nullptr) {
+        return libk::unexpected(VSpaceError::Busy);
+    }
+    MappedPage& page = *authority.reclaim_page_;
+    if (authority.pages_.find(page.address_) != &page) {
+        return libk::unexpected(VSpaceError::Busy);
+    }
+    auto mutation = coherence_.begin();
+    if (!mutation) {
+        return libk::unexpected(VSpaceError::ShootdownUnavailable);
+    }
+    auto plan = prepare_plan(context, mutation.value().targets());
+    if (!plan) {
+        mutation.value().abort();
+        return libk::unexpected(plan.error());
+    }
+    if (authority.invalidation_hook_.is_linked()) {
+        invalidations_.erase(authority);
+    }
+    authority.pages_.erase(page);
+    const auto virtual_page = VPage::from_base(page.address_);
+    KASSERT(virtual_page);
+    auto& retire = retire_batch_.emplace(*pmm_);
+    arch::PageEditor editor = arch::PageEditor::user(*root_);
+    auto unmapped = editor.unmap(*virtual_page);
+    KASSERT(unmapped);
+    while (auto table = unmapped.value().tables.take()) {
+        retire_table(retire, libk::move(*table));
+    }
+    pending_kind_ = PendingKind::PageInvalidate;
+    queue_page(page);
+    auto committed = commit_translation(
+        libk::move(mutation).value(), libk::move(plan).value(), retire);
+    lock.restore();
+    return committed;
+}
+
 auto VSpace::start_invalidation(
     VmContext context,
     MappingAuthority& authority,
@@ -146,11 +234,17 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
     ShootdownTicket* waiting_ticket{};
     bool settled{};
     bool waiting{};
+    /*luna change: select exact-page work from relation membership, reason:
+      no convenience reclaim flag may become a second invalidation truth*/
+    bool page_invalidate{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (pending_kind_ != PendingKind::None && !finish_pending()) {
-            KASSERT(ticket_);
-            waiting_ticket = &*ticket_;
+            if (ticket_) {
+                waiting_ticket = &*ticket_;
+            } else {
+                waiting = true;
+            }
         }
     }
     if (waiting_ticket != nullptr) {
@@ -171,6 +265,12 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
         }
         __builtin_unreachable();
     }
+    if (waiting) {
+        /*luna change: keep pending authority storage alive until the claim
+          publisher wakes this service, reason: finish_authorities cannot run
+          while pending_pages_ still owns the MappedPage*/
+        return traced(VSpaceServiceState::Waiting);
+    }
 
     // This drains external Memory/Grant relations and sponsored node storage.
     // It owns its short internal lock sections and must be entered unlocked.
@@ -183,6 +283,8 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             waiting = true;
         } else if (!invalidations_.empty()) {
             next = &invalidations_.front();
+            page_invalidate = next->reclaim_page_ != nullptr
+                && !next->invalidation_requested_;
         } else if (state_ == VSpaceState::Stopping
             && root_region_ != nullptr
             && !root_region_->children_.empty()
@@ -227,7 +329,9 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
                 ? VSpaceServiceState::Settled
                 : VSpaceServiceState::Progress);
     }
-    auto started = start_invalidation(context, *next);
+    auto started = page_invalidate
+        ? start_page_invalidation(context, *next)
+        : start_invalidation(context, *next);
     if (!started) {
         if (started.error() == VSpaceError::Busy) {
             kernel::sync::IrqLockGuard guard{lock_};

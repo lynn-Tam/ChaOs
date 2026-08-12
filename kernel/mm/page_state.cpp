@@ -349,6 +349,9 @@ auto PageSlot::retry() noexcept -> libk::Expected<void, PageStateError> {
     }
     ++generation;
     request.key.generation = generation;
+    /*luna change: clear intent when a new PageKey starts, reason: reclaim
+      obligations belong to the retired generation only*/
+    reclaim_intent = false;
     state = PageSlotState::Missing;
     return libk::expected();
 }
@@ -546,9 +549,34 @@ auto PageSlot::complete_writeback(
     return libk::expected();
 }
 
+/*luna change: make reclaim intent a PageSlot transition, reason: queue or
+  diagnostic membership cannot represent an obligation that spans passes*/
+auto PageSlot::retain_reclaim() noexcept
+    -> libk::Expected<void, PageStateError> {
+    switch (state) {
+    case PageSlotState::ResidentClean:
+    case PageSlotState::ResidentDirty:
+    case PageSlotState::WritebackQueued:
+    case PageSlotState::WritebackPublishing:
+    case PageSlotState::WritebackPublished:
+    case PageSlotState::WritebackActive:
+    case PageSlotState::WritebackCompleting:
+    case PageSlotState::WritebackFailed:
+        reclaim_intent = true;
+        return libk::expected();
+    default:
+        return libk::unexpected(PageStateError::InvalidTransition);
+    }
+}
+
 auto PageSlot::begin_evict() noexcept
     -> libk::Expected<void, PageStateError> {
+    /*luna change: require an explicit retained intent before clean eviction,
+      reason: queue or diagnostic membership cannot authorize page loss*/
     if (state != PageSlotState::ResidentClean) {
+        return libk::unexpected(PageStateError::InvalidTransition);
+    }
+    if (!reclaim_intent) {
         return libk::unexpected(PageStateError::InvalidTransition);
     }
     state = PageSlotState::Evicting;
@@ -564,6 +592,9 @@ auto PageSlot::finish_evict() noexcept
         return libk::unexpected(PageStateError::Busy);
     }
     writeback.reset();
+    /*luna change: retire reclaim intent with the exact missing transition,
+      reason: a new generation must not inherit a stale eviction obligation*/
+    reclaim_intent = false;
     state = PageSlotState::Missing;
     return libk::expected();
 }
@@ -578,6 +609,9 @@ auto PageSlot::detach() noexcept
     }
     state = PageSlotState::Detaching;
     writeback.reset();
+    /*luna change: retire reclaim intent on detach, reason: terminal teardown
+      owns the slot transition instead of any queue-derived flag*/
+    reclaim_intent = false;
     return libk::expected();
 }
 

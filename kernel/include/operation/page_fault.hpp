@@ -5,6 +5,7 @@
 #include <libk/sync/atomic.hpp>
 #include <mm/addr.hpp>
 #include <mm/page_state.hpp>
+#include <mm/reclaim.hpp>
 #include <mm/permissions.hpp>
 #include <operation/completion.hpp>
 
@@ -80,6 +81,10 @@ private:
     libk::Atomic<u8> kind_{};
     libk::Atomic<Phase> phase_{Phase::Idle};
     mm::WaitRelation relation_{};
+    /*luna change: reserve one owner-fixed pressure payload beside PageFault,
+      reason: a Pressure retry cannot reuse PageRequest storage before its
+      relation is terminal and unlinked*/
+    mm::FrameDemand demand_{};
     Completion completion_;
 };
 

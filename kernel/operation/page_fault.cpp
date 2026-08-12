@@ -28,6 +28,7 @@ PageFault::~PageFault() noexcept {
     KASSERT(!completion_.attached());
     KASSERT(!relation_.attached());
     KASSERT(memory_.load<libk::MemoryOrder::Acquire>() == nullptr);
+    KASSERT(!demand_);
     KASSERT(phase_.load<libk::MemoryOrder::Acquire>() == Phase::Idle
         || phase_.load<libk::MemoryOrder::Acquire>() == Phase::Terminal
         || phase_.load<libk::MemoryOrder::Acquire>() == Phase::Canceled);
@@ -193,6 +194,7 @@ auto PageFault::cancel() noexcept -> bool {
 void PageFault::reset() noexcept {
     KASSERT(!completion_.attached() && !relation_.attached());
     KASSERT(memory_.load<libk::MemoryOrder::Acquire>() == nullptr);
+    KASSERT(!demand_);
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
     vspace_ = nullptr;
     cpus_ = nullptr;

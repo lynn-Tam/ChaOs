@@ -274,6 +274,9 @@ struct PageSlot final {
     u64 dirty_epoch{};
     PageRequest request{};
     WritebackRequest writeback{};
+    /*luna change: retain reclaim intent independently of writeback transport,
+      reason: candidate policy survives queue, mapping and worker passes*/
+    bool reclaim_intent{};
 
     [[nodiscard]] auto begin_request(
         PageKey key,
@@ -327,6 +330,8 @@ struct PageSlot final {
         WritebackKey key,
         u64 delivery_generation,
         u64 claim_generation) noexcept
+        -> libk::Expected<void, PageStateError>;
+    [[nodiscard]] auto retain_reclaim() noexcept
         -> libk::Expected<void, PageStateError>;
     [[nodiscard]] auto begin_evict() noexcept
         -> libk::Expected<void, PageStateError>;

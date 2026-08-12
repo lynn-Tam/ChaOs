@@ -189,9 +189,16 @@ auto VSpace::materialize_fault(
         return libk::unexpected(node_error(made.error()));
     }
     MappedPage* const page = made.value().object;
+    /*luna change: arm each materialized page with its authority route,
+      reason: MappingAuthority owns the sole VSpace identity*/
+    page->authority_ = &authority;
+    page->page_mapping_.arm(page, &VSpace::invalidate_page);
     auto linked = authority.memory().bind_mapping(
         page->page_mapping_, object_page);
     if (!linked) {
+        /*luna change: clear the failed page route before recycle, reason:
+          PageMapping context is valid only while the MappedPage is live*/
+        page->authority_ = nullptr;
         pages_.destroy(*page);
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
@@ -200,6 +207,9 @@ auto VSpace::materialize_fault(
     auto table_reserve = reserve_tables(page);
     if (!table_reserve) {
         KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
+        /*luna change: clear the rejected page route before recycle, reason:
+          backing unlink precedes MappedPage destruction*/
+        page->authority_ = nullptr;
         pages_.destroy(*page);
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
@@ -218,6 +228,9 @@ auto VSpace::materialize_fault(
         release_claim();
         lock.restore();
         KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
+        /*luna change: clear the failed translation route before recycle,
+          reason: no detached page may retain a VSpace callback context*/
+        page->authority_ = nullptr;
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::InvalidState);
     }
@@ -226,6 +239,9 @@ auto VSpace::materialize_fault(
         release_claim();
         lock.restore();
         KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
+        /*luna change: clear the failed shootdown route before recycle,
+          reason: callback context ends with the exact page node*/
+        page->authority_ = nullptr;
         pages_.destroy(*page);
         return libk::unexpected(VSpaceError::ShootdownUnavailable);
     }
@@ -235,6 +251,9 @@ auto VSpace::materialize_fault(
         release_claim();
         lock.restore();
         KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
+        /*luna change: clear the failed plan route before recycle, reason:
+          page ownership is not retained after transaction abort*/
+        page->authority_ = nullptr;
         pages_.destroy(*page);
         return libk::unexpected(plan.error());
     }

@@ -25,6 +25,10 @@ MappedPage::~MappedPage() noexcept {
     KASSERT(!tree_hook_.is_linked());
     KASSERT(!source_ && !alias_);
     KASSERT(!page_mapping_.attached());
+    /*luna change: require authority route and token quiescence before
+      recycle, reason: the authority owns the sole VSpace identity*/
+    KASSERT(authority_ == nullptr);
+    KASSERT(!reclaim_work_);
 }
 
 const MemoryAttachmentOps MappingAuthority::memory_ops_{
@@ -55,6 +59,9 @@ MappingAuthority::MappingAuthority(
 MappingAuthority::~MappingAuthority() noexcept {
     KASSERT(mappings_.empty());
     KASSERT(pages_.empty());
+    /*luna change: require the exact-page index to drain before authority
+      recycle, reason: page invalidation never destroys layout authority*/
+    KASSERT(reclaim_page_ == nullptr);
     KASSERT(!invalidation_hook_.is_linked());
     KASSERT(relations_released());
     KASSERT(!memory_work_ && !grant_work_);
@@ -305,8 +312,13 @@ auto VSpace::commit_translation(
     const ShootdownStatus status = mutation.commit(
         libk::move(plan), ticket, &retire, instruction_sync);
     if (status == ShootdownStatus::Complete) {
-        KASSERT(finish_pending());
-        return libk::expected(VmStatus::Complete);
+        /*luna change: report Pending while an unpublished exact claim keeps
+          its page in the pending lane, reason: shootdown completion is not
+          page-storage completion*/
+        if (finish_pending()) {
+            return libk::expected(VmStatus::Complete);
+        }
+        return libk::expected(VmStatus::Pending);
     }
     schedule_work();
     return libk::expected(VmStatus::Pending);
@@ -366,12 +378,40 @@ void VSpace::destroy_layout(LayoutNode& node) noexcept {
     }
 }
 
-void VSpace::release_page(MappedPage& page) noexcept {
-    if (MemoryObject* const memory = page.page_mapping_.owner()) {
-        KASSERT(memory->unbind_mapping(page.page_mapping_));
+/*luna change: retain a pending page when normal unbind loses to a claim,
+  reason: the existing pending lane pins embedded PageMapping storage*/
+auto VSpace::release_page(MappedPage& page) noexcept -> bool {
+    MemoryObject* const memory = page.page_mapping_.owner();
+    if (page.reclaim_work_) {
+        KASSERT(memory != nullptr);
+        const auto unlinked = memory->unbind_mapping(
+            page.page_mapping_, *page.reclaim_work_);
+        KASSERT(unlinked);
+        if (!unlinked) {
+            return false;
+        }
+    } else if (memory != nullptr
+        && !memory->unbind_mapping(page.page_mapping_)) {
+        return false;
     }
+    /*luna change: release exact invalidation state with the PTE node, reason:
+      token retirement and reverse unlink must share page destruction order*/
+    if (page.reclaim_work_) {
+        page.reclaim_work_.reset();
+    }
+    if (page.authority_ != nullptr
+        && page.authority_->reclaim_page_ == &page) {
+        MappingAuthority& authority = *page.authority_;
+        authority.reclaim_page_ = nullptr;
+        if (!authority.invalidation_requested_
+            && authority.invalidation_hook_.is_linked()) {
+            invalidations_.erase(authority);
+        }
+    }
+    page.authority_ = nullptr;
     kernel_->aliases().release(page.page_, page.type_);
     pages_.destroy(page);
+    return true;
 }
 
 void VSpace::finish_authorities() noexcept {
@@ -444,9 +484,11 @@ auto VSpace::finish_pending() noexcept -> bool {
     }
     while (pending_pages_ != nullptr) {
         MappedPage* const page = pending_pages_;
-        pending_pages_ = page->pending_next_;
-        page->pending_next_ = nullptr;
-        release_page(*page);
+        MappedPage* const next = page->pending_next_;
+        if (!release_page(*page)) {
+            return false;
+        }
+        pending_pages_ = next;
     }
     while (pending_layout_ != nullptr) {
         LayoutNode* const node = pending_layout_;

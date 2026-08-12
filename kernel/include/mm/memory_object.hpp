@@ -9,6 +9,7 @@
 #include <sync/lock.hpp>
 #include <mm/pmm.hpp>
 #include <mm/page_state.hpp>
+#include <mm/reclaim.hpp>
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
 #include <object/object_ref.hpp>
@@ -81,12 +82,17 @@ struct MemoryPage final {
 };
 
 class MemoryObject;
+class MemoryWork;
 
 // A materialized PTE is a reverse relation of the MemoryObject page. The
 // mapping owns this node; the backing only indexes it while the mapping is
 // live. It carries no page ownership or PTE state.
+/*luna change: add one exact reverse-relation claim state, reason: reclaim
+  invalidates a single PTE without destroying MappingAuthority layout*/
 class PageMapping final : private libk::noncopyable_nonmovable {
 public:
+    using Publish = void (*)(void*, MemoryWork&&) noexcept;
+
     PageMapping() noexcept = default;
     ~PageMapping() noexcept;
 
@@ -99,6 +105,19 @@ public:
     [[nodiscard]] auto owner() const noexcept -> MemoryObject* {
         return owner_;
     }
+    /*luna change: expose only relation-state checks needed by exact teardown,
+      reason: token ownership is canonical in PageMapping state and context*/
+    [[nodiscard]] auto invalidating() const noexcept -> bool {
+        return static_cast<State>(state_.load<libk::MemoryOrder::Acquire>())
+            == State::Invalidating;
+    }
+    [[nodiscard]] auto owns(const MemoryWork& work) const noexcept -> bool;
+
+    void arm(void* context, Publish publish) noexcept;
+    [[nodiscard]] auto claim() noexcept -> MemoryWork;
+    void publish(MemoryWork&& work) noexcept;
+    void mark_attached() noexcept;
+    void mark_detached() noexcept;
 
     // Public only so an owner-local intrusive index can name the hook.
     libk::IntrusiveListHook backing_hook_{};
@@ -106,8 +125,20 @@ public:
 private:
     friend class MemoryObject;
 
+    enum class State : u8 {
+        Detached,
+        Attached,
+        Invalidating,
+    };
+
+    static void release_work(void* context) noexcept;
+    void finish_work() noexcept;
+
     MemoryObject* owner_{};
     usize page_index_{};
+    void* context_{};
+    Publish publish_{};
+    libk::Atomic<u8> state_{static_cast<u8>(State::Detached)};
 };
 
 enum class MemoryError : u8 {
@@ -189,6 +220,8 @@ private:
     OwnedPage page_{};
 };
 
+/*luna change: make MemoryWork a move-only exact-release token, reason:
+  MemoryAttachment and PageMapping share lifetime release without a parallel lease*/
 class MemoryWork final : private libk::noncopyable {
 public:
     MemoryWork() noexcept = default;
@@ -197,16 +230,22 @@ public:
     ~MemoryWork() noexcept;
 
     [[nodiscard]] explicit operator bool() const noexcept {
-        return attachment_ != nullptr;
+        return context_ != nullptr && release_ != nullptr;
     }
     void reset() noexcept;
 
 private:
     friend class MemoryObject;
-    explicit MemoryWork(MemoryAttachment& attachment) noexcept
-        : attachment_(&attachment) {}
+    friend class MemoryAttachment;
+    friend class PageMapping;
 
-    MemoryAttachment* attachment_{};
+    using Release = void (*)(void*) noexcept;
+    MemoryWork(void* context, Release release) noexcept
+        : context_(context), release_(release) {}
+    explicit MemoryWork(MemoryAttachment& attachment) noexcept;
+
+    void* context_{};
+    Release release_{};
 };
 
 struct MemoryAttachmentOps final {
@@ -280,7 +319,13 @@ private:
 
 class MemoryObject final : private libk::noncopyable_nonmovable {
 public:
-    MemoryObject(Pmm& pmm, usize byte_size, MemoryExecutor& work) noexcept;
+    /*luna change: require the kernel-private reclaim policy owner, reason:
+      every MemoryObject shares one explicit Pager membership boundary*/
+    MemoryObject(
+        Pmm& pmm,
+        usize byte_size,
+        MemoryExecutor& work,
+        PageReclaimer& reclaimer) noexcept;
     ~MemoryObject() noexcept;
 
     [[nodiscard]] auto initialize_anonymous(AnonymousConfig config) noexcept
@@ -359,6 +404,15 @@ public:
         usize page_index) noexcept -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto unbind_mapping(
         PageMapping& mapping) noexcept -> libk::Expected<void, MemoryError>;
+    /*luna change: finish a claimed unlink with its exact relation token,
+      reason: backing hook removal must precede token release*/
+    [[nodiscard]] auto unbind_mapping(
+        PageMapping& mapping,
+        MemoryWork& work) noexcept -> libk::Expected<void, MemoryError>;
+    /*luna change: expose the existing exact relation claim to bounded
+      reclaimer service, reason: callers publish immediately after unlock*/
+    [[nodiscard]] auto claim_mapping(PageMapping& mapping) noexcept
+        -> libk::Expected<MemoryWork, MemoryError>;
     [[nodiscard]] auto page_state(usize page_index) const noexcept
         -> libk::Expected<PageSlotState, MemoryError>;
     [[nodiscard]] auto observe_usage(
@@ -404,6 +458,7 @@ private:
     friend class PageTransfer;
     friend class MemoryAttachment;
     friend class MemoryExecutor;
+    friend class PageReclaimer;
     friend class PagerBacking;
     friend class kernel::operation::PageFault;
     /*luna change: let the fixed Vproc continuation settle the existing fault pin, reason: Vproc shares MemoryObject lifetime ownership without a second lease API*/
@@ -455,6 +510,17 @@ private:
             usize page_index,
             PageMapping& mapping) noexcept;
         libk::Expected<void, MemoryError> (*unbind_mapping)(
+            void* backing,
+            PageMapping& mapping) noexcept;
+        /*luna change: expose exact claimed unlink separately from normal
+          teardown, reason: Invalidating mappings reject a non-token unbind*/
+        libk::Expected<void, MemoryError> (*unbind_claimed_mapping)(
+            void* backing,
+            PageMapping& mapping,
+            MemoryWork& work) noexcept;
+        /*luna change: expose one exact mapping claim hook, reason: backing
+          ownership selects a relation before VSpace performs foreign work*/
+        libk::Expected<MemoryWork, MemoryError> (*claim_mapping)(
             void* backing,
             PageMapping& mapping) noexcept;
         libk::Expected<void, MemoryError> (*lease_acquire)(
@@ -527,12 +593,15 @@ private:
     void release_backing_hold() noexcept;
     void schedule_work() noexcept;
     void finish_work() noexcept;
+    [[nodiscard]] auto try_reclaim_pin() noexcept -> bool;
+    void finish_reclaim_pin() noexcept;
     [[nodiscard]] auto service(usize capacity) noexcept -> MemoryServiceBatch;
     void ensure_work_observation() noexcept;
     void publish_work_observation(const MemoryServiceBatch& batch) noexcept;
 
     Pmm* pmm_{};
     MemoryExecutor* work_{};
+    PageReclaimer& reclaimer_;
     usize logical_pages_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::MemoryObject>
         lock_{};
@@ -556,6 +625,7 @@ private:
     libk::Atomic<bool> observation_reserved_{false};
     libk::Atomic<u64> observation_key_{};
     usize mapping_count_{};
+    ReclaimEntry reclaim_entry_{};
     kernel::resource::Sponsorship* sponsor_{};
 };
 

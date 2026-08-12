@@ -6,6 +6,7 @@
 #include <libk/span.hpp>
 #include <libk/utility.hpp>
 #include <mm/memory_object.hpp>
+#include <mm/reclaim.hpp>
 #include <pager/pager.hpp>
 #include <object/object_store.hpp>
 #include <mm/vspace_work.hpp>
@@ -27,6 +28,8 @@ constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
     memory_test_vspace_work{};
 constinit libk::ManualLifetime<kernel::mm::MemoryExecutor>
     memory_test_memory_work{};
+constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
+    memory_test_reclaimer{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_object{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_peer{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_staging{};
@@ -103,10 +106,12 @@ public:
         memory_test_map.reset();
         auto& vspace_work = memory_test_vspace_work.emplace();
         auto& memory_work = memory_test_memory_work.emplace();
-        /*luna change: give test MemoryObjects the production bounded executor, reason: focused tests must exercise the same ownership path as runtime objects*/
+        /*luna change: construct a real reclaimer for focused objects, reason:
+          tests must exercise the mandatory Pager membership owner*/
+        auto& reclaimer = memory_test_reclaimer.emplace();
         [[maybe_unused]] auto& objects =
             memory_test_objects.emplace(
-                *memory_test_pmm, vspace_work, memory_work);
+                *memory_test_pmm, vspace_work, memory_work, reclaimer);
         return true;
     }
 
@@ -116,7 +121,10 @@ public:
             memory_test_object.reset();
         }
         return memory_test_object.emplace(
-            *memory_test_pmm, byte_size, *memory_test_memory_work);
+            *memory_test_pmm,
+            byte_size,
+            *memory_test_memory_work,
+            *memory_test_reclaimer);
     }
 
     [[nodiscard]] auto make_peer(usize byte_size) noexcept
@@ -126,7 +134,10 @@ public:
             memory_test_peer.reset();
         }
         return memory_test_peer.emplace(
-            *memory_test_pmm, byte_size, *memory_test_memory_work);
+            *memory_test_pmm,
+            byte_size,
+            *memory_test_memory_work,
+            *memory_test_reclaimer);
     }
 
     [[nodiscard]] auto pmm() noexcept -> kernel::mm::Pmm& {
@@ -168,6 +179,7 @@ private:
             memory_test_objects->drain_reclaim();
         }
         memory_test_objects.reset();
+        memory_test_reclaimer.reset();
         memory_test_memory_work.reset();
         memory_test_vspace_work.reset();
         memory_test_pmm.reset();
@@ -672,7 +684,10 @@ bool test_pager_supply_moves_staging_owner(
     }
     /*luna change: route the staging object through the same bounded executor, reason: pager supply tests must not bypass MemoryObject work ownership*/
     auto& staging = memory_test_staging.emplace(
-        fixture.pmm(), kernel::mm::page_size, *memory_test_memory_work);
+        fixture.pmm(),
+        kernel::mm::page_size,
+        *memory_test_memory_work,
+        *memory_test_reclaimer);
     if (!staging.initialize_anonymous(
             kernel::mm::AnonymousConfig{.access = access})) {
         return false;
@@ -1003,18 +1018,47 @@ bool test_pager_reverse_mapping_usage_and_eviction(
     lease.value().reset();
 
     kernel::mm::PageMapping mapping{};
+    kernel::mm::PageMapping sibling{};
     if (!memory.bind_mapping(mapping, 0)
+        || !memory.bind_mapping(sibling, 0)
         || !mapping.attached()
+        || !sibling.attached()
         || memory.evict_page(0).error() != kernel::mm::MemoryError::InvalidState) {
+        return false;
+    }
+    /*luna change: exercise claim-first teardown, stale claim and exact token
+      rejection through production relation operations, reason: embedded
+      PageMapping storage must survive the owner race*/
+    auto mapping_work = memory.claim_mapping(mapping);
+    auto sibling_work = memory.claim_mapping(sibling);
+    if (!mapping_work || !sibling_work
+        || memory.unbind_mapping(mapping).error()
+            != kernel::mm::MemoryError::Busy
+        || memory.unbind_mapping(mapping, sibling_work.value()).error()
+            != kernel::mm::MemoryError::OwnershipMismatch
+        || !memory.unbind_mapping(sibling, sibling_work.value())) {
+        return false;
+    }
+    sibling_work.value().reset();
+    if (!memory.unbind_mapping(mapping, mapping_work.value())) {
+        return false;
+    }
+    mapping_work.value().reset();
+    if (mapping.attached()
+        || sibling.attached()
+        || memory.evict_page(0).error() != kernel::mm::MemoryError::InvalidState) {
+        return false;
+    }
+    kernel::mm::PageMapping stale{};
+    if (!memory.bind_mapping(stale, 0)
+        || !memory.unbind_mapping(stale)
+        || stale.attached()
+        || memory.claim_mapping(stale).error()
+            != kernel::mm::MemoryError::AttachmentState) {
         return false;
     }
     // A dirty resident page cannot be evicted merely because its mapping is
     // removed; writeback owns the clean transition.
-    if (!memory.unbind_mapping(mapping)
-        || mapping.attached()
-        || memory.evict_page(0).error() != kernel::mm::MemoryError::InvalidState) {
-        return false;
-    }
     const auto writeback = memory.queue_writeback(0);
     if (!writeback || !memory.publish_writeback(0, writeback.value())) {
         return false;

@@ -15,6 +15,7 @@
 #include <object/object_store.hpp>
 #include <mm/vspace_work.hpp>
 #include <mm/memory_work.hpp>
+#include <mm/reclaim.hpp>
 #include <sched/context.hpp>
 #include <sched/domain.hpp>
 #include <sched/remote_queue.hpp>
@@ -31,6 +32,8 @@ constinit libk::ManualLifetime<kernel::mm::DirectMap> cpu_test_direct{};
 constinit libk::ManualLifetime<kernel::object::ObjectStore> cpu_test_objects{};
 constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor> cpu_test_vspace_work{};
 constinit libk::ManualLifetime<kernel::mm::MemoryExecutor> cpu_test_memory_work{};
+constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
+    cpu_test_reclaimer{};
 constinit libk::ManualLifetime<kernel::time::Clock> cpu_test_clock{};
 constinit libk::ManualLifetime<kernel::CpuRegistry> cpu_test_registry{};
 constinit libk::ManualLifetime<kernel::mm::KernelVSpace> cpu_test_kernel{};
@@ -81,10 +84,12 @@ public:
         }
         auto& vspace_work = cpu_test_vspace_work.emplace();
         auto& memory_work = cpu_test_memory_work.emplace();
-        /*luna change: pass MemoryExecutor into CPU fixture ObjectStore, reason: all pooled MemoryObjects require the bounded service owner*/
+        /*luna change: construct a real reclaimer for CPU objects, reason:
+          pooled MemoryObjects require one mandatory Pager owner*/
+        auto& reclaimer = cpu_test_reclaimer.emplace();
         [[maybe_unused]] auto& objects =
             cpu_test_objects.emplace(
-                *cpu_test_pmm, vspace_work, memory_work);
+                *cpu_test_pmm, vspace_work, memory_work, reclaimer);
         [[maybe_unused]] auto& clock = cpu_test_clock.emplace(10'000'000);
         return true;
     }
@@ -93,6 +98,7 @@ private:
     static auto reset() noexcept -> void {
         cpu_test_registry.reset();
         cpu_test_objects.reset();
+        cpu_test_reclaimer.reset();
         cpu_test_memory_work.reset();
         cpu_test_vspace_work.reset();
         cpu_test_clock.reset();
