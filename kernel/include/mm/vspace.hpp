@@ -38,6 +38,7 @@ class Resolved;
 namespace kernel::mm {
 
 class VSpaceExecutor;
+struct FrameDemand;
 
 enum class VSpaceState : u8 {
     Building,
@@ -247,7 +248,8 @@ public:
         Access access,
         WaitRelation* relation = nullptr,
         void* owner = nullptr,
-        WaitRelation::Publish publish = nullptr) noexcept
+        WaitRelation::Publish publish = nullptr,
+        FrameDemand* demand = nullptr) noexcept
         -> libk::Expected<FaultResult, VSpaceError>;
     // Samples the architecture projection of one materialized PTE and folds
     // it into the MemoryObject page truth. When clear is true the selected
@@ -411,7 +413,8 @@ private:
         usize object_page,
         WaitRelation* relation,
         void* owner,
-        WaitRelation::Publish publish) noexcept
+        WaitRelation::Publish publish,
+        FrameDemand* demand) noexcept
         -> libk::Expected<FaultResult, VSpaceError>;
     [[nodiscard]] auto reserve_tables(
         MappedPage* pages) noexcept

@@ -592,10 +592,15 @@ void Vproc::publish_fault(mm::PageWaitResult result) noexcept {
                 ? relation_generation != 0
                     && slot.relation_generation == relation_generation
                 : slot.relation_generation == 0);
+            /*luna change: turn a pressure wake into the existing retry-ready
+              projection, reason: the ABI exposes no pressure event state and
+              resume_fault revalidates the canonical VSpace relation*/
             slot.kind = static_cast<u8>(
-                result == mm::PageWaitResult::Ready
-                    ? mm::FaultKind::Ready
-                    : mm::FaultKind::BackingFailed);
+                result == mm::PageWaitResult::OutOfMemory
+                    ? mm::FaultKind::OutOfMemory
+                    : result == mm::PageWaitResult::Ready
+                        ? mm::FaultKind::Ready
+                        : mm::FaultKind::BackingFailed);
             slot.state = result == mm::PageWaitResult::Ready
                 ? FaultSlot::State::PageReady
                 : FaultSlot::State::PageFailed;
@@ -704,13 +709,15 @@ auto Vproc::fault(
         access,
         &slot->page_wait,
         this,
-        &Vproc::publish_fault);
+        &Vproc::publish_fault,
+        &slot->demand);
     mm::FaultKind outcome = result
         ? result.value().kind : mm::fault_kind(result.error());
     bool enter{};
     bool stop_fault{};
     mm::MemoryObject* drop_memory{};
-    if (result && result.value().kind == mm::FaultKind::Pending) {
+    if (result && (result.value().kind == mm::FaultKind::Pending
+                   || result.value().kind == mm::FaultKind::Pressure)) {
         KASSERT(result.value().memory != nullptr);
         {
             kernel::sync::IrqLockGuard guard{state_lock_};
@@ -719,13 +726,17 @@ auto Vproc::fault(
                 || relation_admission_closed_;
             current.memory = result.value().memory;
             if (current.state == FaultSlot::State::Attaching) {
-                /*luna change: install relation generation only with the retained publisher, reason: early callback results must not leave a phantom relation owner*/
+                /*luna change: consume the backing-owned relation handoff for
+                  Pending or Pressure, reason: materialize_impl already
+                  attached durable pressure before returning*/
+                if (result.value().kind == mm::FaultKind::Pressure) {
+                    current.kind = static_cast<u8>(mm::FaultKind::Pressure);
+                }
                 KASSERT(current.page_wait.generation != 0);
                 current.relation_generation = current.page_wait.generation;
                 current.state = FaultSlot::State::PendingPage;
                 KASSERT(current.publishers
                     != libk::numeric_limits<u8>::max());
-                /*luna change: retain the attached relation publisher across admission return, reason: callback entry and stop/reuse must share one protected handoff*/
                 ++current.publishers;
                 stop_fault = stopping;
                 enter = !stopping;
@@ -737,7 +748,9 @@ auto Vproc::fault(
             } else {
                 KASSERT(current.state == FaultSlot::State::Dropping);
                 KASSERT(current.relation_generation == 0);
-                /*luna change: settle an early-ready pin after stop won before admission returned, reason: no relation publisher remains once the callback has finalized and returned*/
+                /*luna change: settle an early-ready pin after stop won before
+                  admission returned, reason: no relation publisher remains
+                  once the callback finalized the handoff*/
                 drop_memory = current.memory;
                 current.memory = nullptr;
                 stop_fault = true;
@@ -876,7 +889,8 @@ auto Vproc::resume_fault(
         access,
         &fault_slot_.page_wait,
         this,
-        &Vproc::publish_fault);
+        &Vproc::publish_fault,
+        &fault_slot_.demand);
     mm::FaultKind outcome = result
         ? result.value().kind : mm::fault_kind(result.error());
     bool stop_fault{};
@@ -887,17 +901,22 @@ auto Vproc::resume_fault(
         FaultSlot& current = fault_slot_;
         const bool stopping = stop_requested_ || stopped_
             || relation_admission_closed_;
-        if (result && result.value().kind == mm::FaultKind::Pending) {
+        if (result && (result.value().kind == mm::FaultKind::Pending
+                       || result.value().kind == mm::FaultKind::Pressure)) {
             KASSERT(result.value().memory != nullptr);
             current.memory = result.value().memory;
             if (current.state == FaultSlot::State::Resuming) {
-                /*luna change: install the new relation generation only after publisher handoff, reason: an early callback must leave no historical relation owner*/
+                /*luna change: consume the backing-owned relation handoff for
+                  Pending or Pressure, reason: materialize_impl already
+                  attached durable pressure before returning*/
+                if (result.value().kind == mm::FaultKind::Pressure) {
+                    current.kind = static_cast<u8>(mm::FaultKind::Pressure);
+                }
                 KASSERT(current.page_wait.generation != 0);
                 current.relation_generation = current.page_wait.generation;
                 current.state = FaultSlot::State::PendingPage;
                 KASSERT(current.publishers
                     != libk::numeric_limits<u8>::max());
-                /*luna change: transfer the new relation publisher only after Pending attach returns, reason: Resuming remains protected while VSpace runs foreign code*/
                 ++current.publishers;
                 stop_fault = stopping;
             } else if (current.state == FaultSlot::State::PageReady
@@ -919,14 +938,18 @@ auto Vproc::resume_fault(
                 outcome = mm::FaultKind::BackingFailed;
             } else if (outcome == mm::FaultKind::Ready
                 || outcome == mm::FaultKind::Materialized) {
-                /*luna change: consume the exact frame only after the revalidation winner, reason: a successful resume is the sole path that redirects and frees FaultSlot*/
+                /*luna change: consume the exact frame only after the
+                  revalidation winner, reason: a successful resume is the
+                  sole path that redirects and frees FaultSlot*/
                 trap.redirect(current.frame);
                 KASSERT(current.publishers == 1);
                 --current.publishers; // resume publisher
                 current.reset();
                 upcall_state_ = UpcallState::Armed;
                 __atomic_store_n(
-                    &runtime_.events->active_generation, 0, __ATOMIC_RELEASE);
+                    &runtime_.events->active_generation,
+                    0,
+                    __ATOMIC_RELEASE);
                 consume = true;
             } else {
                 current.state = FaultSlot::State::Claimed;
@@ -988,6 +1011,7 @@ auto Vproc::drop_fault(u64 key) noexcept
         FaultSlot& slot = fault_slot_;
         KASSERT(slot.state == FaultSlot::State::Dropping
             && slot.publishers != 0);
+        slot.demand.reset();
         --slot.publishers;
         if (slot.publishers == 0) {
             slot.reset();
@@ -1002,6 +1026,7 @@ void Vproc::close_fault() noexcept {
     u64 generation{};
     bool cancelable{};
     bool relation_live{};
+    bool pressure{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
         FaultSlot& slot = fault_slot_;
@@ -1012,6 +1037,8 @@ void Vproc::close_fault() noexcept {
             return;
         }
         relation_live = slot.relation_generation != 0;
+        pressure = static_cast<mm::FaultKind>(slot.kind)
+            == mm::FaultKind::Pressure;
         cancelable = slot.state == FaultSlot::State::PendingPage
             && relation_live
             && slot.page_wait.generation == slot.relation_generation
@@ -1030,6 +1057,7 @@ void Vproc::close_fault() noexcept {
         /*luna change: move the sole fault pin before foreign cancellation, reason: callback races must not invalidate close's MemoryObject lifetime owner*/
         memory = slot.memory;
         slot.memory = nullptr;
+        slot.demand.reset();
         generation = slot.relation_generation;
         KASSERT(!cancelable || memory != nullptr);
         /*luna change: withdraw the ready fault projection when stop wins, reason: a closed lane cannot leave a stale FaultKey visible across reuse*/
@@ -1050,7 +1078,14 @@ void Vproc::close_fault() noexcept {
     }
     bool canceled{};
     if (cancelable) {
-        canceled = memory->cancel_fault(fault_slot_.page_wait, generation);
+        canceled = pressure
+            ? memory->release_pressure(fault_slot_.page_wait, generation)
+            : memory->cancel_fault(fault_slot_.page_wait, generation);
+        if (pressure && canceled) {
+            /*luna change: drop the pressure pin after relation unlink wins,
+              reason: PageReclaimer release owns no MemoryObject operation*/
+            memory->release_fault();
+        }
         if (!canceled) {
             /*luna change: settle the moved pin when cancel loses, reason: the callback retains only relation publisher ownership after host detach*/
             memory->release_fault();

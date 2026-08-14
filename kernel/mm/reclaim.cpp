@@ -55,22 +55,44 @@ auto PageReclaimer::retain(
     u64 observed_progress,
     void* owner,
     WaitRelation::Publish publish) noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{lock_};
-    if (relation.attached() || publish == nullptr
-        || relation.generation == libk::numeric_limits<u64>::max()) {
-        return false;
+    Notifier notifier{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (relation.attached() || publish == nullptr
+            || relation.generation == libk::numeric_limits<u64>::max()) {
+            return false;
+        }
+        ++relation.generation;
+        relation.owner = owner;
+        relation.publish = publish;
+        relation.observed_progress = observed_progress;
+        relation.state_.store<libk::MemoryOrder::Release>(
+            static_cast<u8>(PageWaitState::Attached));
+        relations_.push_back(relation);
+        if (cursor_ == nullptr) {
+            cursor_ = &relation;
+        }
+        notifier = notifier_;
     }
-    ++relation.generation;
-    relation.owner = owner;
-    relation.publish = publish;
-    relation.observed_progress = observed_progress;
-    relation.state_.store<libk::MemoryOrder::Release>(
-        static_cast<u8>(PageWaitState::Attached));
-    relations_.push_back(relation);
-    if (cursor_ == nullptr) {
-        cursor_ = &relation;
+    /*luna change: wake the existing reclaimer executor after relation admission,
+      reason: the intrusive relation index is canonical while the callback only
+      supplies scheduler wake credit*/
+    if (notifier) {
+        static_cast<void>(notifier());
     }
     return true;
+}
+
+void PageReclaimer::bind_notifier(Notifier notifier) noexcept {
+    KASSERT(notifier);
+    kernel::sync::IrqLockGuard guard{lock_};
+    KASSERT(!notifier_);
+    notifier_ = notifier;
+}
+
+void PageReclaimer::unbind_notifier() noexcept {
+    kernel::sync::IrqLockGuard guard{lock_};
+    notifier_.reset();
 }
 
 auto PageReclaimer::release(
@@ -96,6 +118,38 @@ auto PageReclaimer::release(
     relation.state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(PageWaitState::Detached));
     return true;
+}
+
+/*luna change: pin one derived object before bounded candidate work, reason:
+  reclaimer selection owns only the index while MemoryObject owns lifetime*/
+auto PageReclaimer::service(usize capacity) noexcept -> ReclaimResult {
+    if (capacity == 0) {
+        return ReclaimResult::Exhausted;
+    }
+    MemoryObject* object{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        /*luna change: admit candidate work only for retained pressure,
+          reason: the derived object index must not drive relation-free scans*/
+        if (objects_.empty() || relations_.empty()) {
+            return ReclaimResult::Exhausted;
+        }
+        if (object_cursor_ == nullptr) {
+            object_cursor_ = &objects_.front();
+        }
+        ReclaimEntry& entry = *object_cursor_;
+        auto next = objects_.iterator_to(entry);
+        ++next;
+        object_cursor_ = next == objects_.end()
+            ? &objects_.front() : &*next;
+        object = entry.object;
+        if (object == nullptr || !object->try_reclaim_pin()) {
+            return ReclaimResult::Exhausted;
+        }
+    }
+    const ReclaimResult result = object->reclaim(capacity);
+    object->finish_reclaim_pin();
+    return result;
 }
 
 auto PageReclaimer::wake(

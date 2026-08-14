@@ -33,7 +33,8 @@ auto VSpace::fault(
     Access access,
     WaitRelation* relation,
     void* owner,
-    WaitRelation::Publish publish) noexcept
+    WaitRelation::Publish publish,
+    FrameDemand* demand) noexcept
     -> libk::Expected<FaultResult, VSpaceError> {
     const usize aligned = address.raw() & ~(page_size - 1);
     const VirtRange page_range{VirtAddr{aligned}, page_size};
@@ -84,6 +85,12 @@ auto VSpace::fault(
             KASSERT(mapping_offset);
             object_page = mapping->object_.first + *mapping_offset;
             if (mapping->authority_->pages_.find(page_range.base()) != nullptr) {
+                /*luna change: refund a retry demand when the mapping winner
+                  already supplied the page, reason: PageAuthority truth makes
+                  the continuation reservation unnecessary*/
+                if (demand != nullptr) {
+                    demand->reset();
+                }
                 return libk::expected(FaultResult{
                     .kind = FaultKind::Ready,
                     .mapping = mapping->key_,
@@ -105,7 +112,8 @@ auto VSpace::fault(
         object_page,
         relation,
         owner,
-        publish);
+        publish,
+        demand);
 }
 
 auto VSpace::materialize_fault(
@@ -115,7 +123,8 @@ auto VSpace::materialize_fault(
     usize object_page,
     WaitRelation* relation,
     void* owner,
-    WaitRelation::Publish publish) noexcept
+    WaitRelation::Publish publish,
+    FrameDemand* demand) noexcept
     -> libk::Expected<FaultResult, VSpaceError> {
     MappingAuthority& authority = *mapping.authority_;
     auto fail = [&](FaultKind kind)
@@ -130,7 +139,7 @@ auto VSpace::materialize_fault(
     };
     MemoryObject* const memory = &authority.memory();
     auto resident = memory->materialize(
-        object_page, relation, owner, publish);
+        object_page, relation, owner, publish, demand);
     if (!resident) {
         if (resident.error() == MemoryError::Pending) {
             auto pending = fail(FaultKind::Pending);
@@ -142,6 +151,17 @@ auto VSpace::materialize_fault(
         }
         if (resident.error() == MemoryError::Busy) {
             return fail(FaultKind::Busy);
+        }
+        if (resident.error() == MemoryError::Pressure
+            && relation != nullptr && demand != nullptr && *demand) {
+            kernel::sync::IrqLockGuard guard{lock_};
+            release_claim();
+            return libk::expected(FaultResult{
+                .kind = FaultKind::Pressure,
+                .mapping = mapping.key_,
+                .object_page = object_page,
+                .memory = memory,
+            });
         }
         if (resident.error() == MemoryError::BackingFailed
             || resident.error() == MemoryError::NotBacked) {

@@ -373,7 +373,8 @@ public:
         usize page_index,
         WaitRelation* relation,
         void* owner,
-        WaitRelation::Publish publish) noexcept
+        WaitRelation::Publish publish,
+        FrameDemand* demand = nullptr) noexcept
         -> libk::Expected<PageLease, MemoryError>;
     [[nodiscard]] auto begin_transfer(usize page_index) noexcept
         -> libk::Expected<PageTransfer, MemoryError>;
@@ -474,6 +475,7 @@ private:
         libk::Expected<MemoryPage, MemoryError> (*materialize)(
             void* backing,
             usize page_index,
+            FrameDemand* demand,
             WaitRelation* relation,
             void* owner,
             WaitRelation::Publish publish) noexcept;
@@ -542,6 +544,12 @@ private:
         MemoryServiceBatch (*service)(
             void* backing,
             usize capacity) noexcept;
+        /*luna change: expose one bounded candidate pass beside transport
+          service, reason: PageReclaimer selects backing policy while PageSlot
+          remains the sole page-state owner*/
+        ReclaimResult (*reclaim)(
+            void* backing,
+            usize capacity) noexcept;
         libk::Expected<WritebackKey, MemoryError> (*queue_writeback)(
             void* backing,
             usize page_index) noexcept;
@@ -569,12 +577,16 @@ private:
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto materialize_impl(
         usize page_index,
+        FrameDemand* demand,
         WaitRelation* relation,
         void* owner,
         WaitRelation::Publish publish) noexcept
         -> libk::Expected<PageLease, MemoryError>;
     /*luna change: settle the single fault pin only through its owner, reason: PageFault cancellation and terminal release must not become public lifetime APIs*/
     void release_fault() noexcept;
+    [[nodiscard]] auto release_pressure(
+        WaitRelation& relation,
+        u64 generation) noexcept -> bool;
     [[nodiscard]] auto cancel_fault(
         WaitRelation& relation,
         u64 generation) noexcept -> bool;
@@ -595,6 +607,7 @@ private:
     void finish_work() noexcept;
     [[nodiscard]] auto try_reclaim_pin() noexcept -> bool;
     void finish_reclaim_pin() noexcept;
+    [[nodiscard]] auto reclaim(usize capacity) noexcept -> ReclaimResult;
     [[nodiscard]] auto service(usize capacity) noexcept -> MemoryServiceBatch;
     void ensure_work_observation() noexcept;
     void publish_work_observation(const MemoryServiceBatch& batch) noexcept;

@@ -2,8 +2,11 @@
 
 #include <core/debug.hpp>
 #include <core/types.hpp>
+#include <diag/concurrency.hpp>
+#include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/limits.hpp>
+#include <libk/optional.hpp>
 #include <libk/utility.hpp>
 #include <mm/page_state.hpp>
 #include <resource/sponsorship.hpp>
@@ -14,66 +17,62 @@ namespace kernel::mm {
 
 class MemoryObject;
 
-/*luna change: keep one complete-or-empty demand with exchange-clearing moves,
-  reason: continuation pins and progress snapshots own remaining identity*/
+/*luna change: retain one explicit pressure lifetime, reason: continuation
+  identity already supplies the retry target and unsponsored allocations have
+  an empty Reservation*/
 struct FrameDemand final : private libk::noncopyable {
     FrameDemand() noexcept = default;
     FrameDemand(FrameDemand&& other) noexcept
-        : reservation_(libk::move(other.reservation_)),
-          page_(libk::exchange(other.page_, {})) {
-        KASSERT(invariant());
+        : reservation_(libk::move(other.reservation_)) {
+        other.reservation_.reset();
     }
     auto operator=(FrameDemand&& other) noexcept -> FrameDemand& {
         if (this != &other) {
-            KASSERT(invariant());
-            KASSERT(other.invariant());
             reset();
             reservation_ = libk::move(other.reservation_);
-            page_ = libk::exchange(other.page_, {});
-            KASSERT(invariant());
+            other.reservation_.reset();
         }
         return *this;
     }
-    ~FrameDemand() noexcept {
-        KASSERT(invariant());
-    }
+    ~FrameDemand() noexcept = default;
 
     [[nodiscard]] explicit operator bool() const noexcept {
-        KASSERT(invariant());
-        return static_cast<bool>(reservation_);
+        return reservation_.has_value();
     }
 
-    /*luna change: enforce one empty-or-complete demand boundary, reason:
-      pressure retry must never expose a half-owned reservation/key pair*/
-    [[nodiscard]] static auto make(
-        kernel::resource::Reservation&& reservation,
-        PageKey page) noexcept -> FrameDemand {
-        KASSERT(static_cast<bool>(reservation) && static_cast<bool>(page));
-        return FrameDemand{libk::move(reservation), page};
+    /*luna change: make demand engagement the sole retained-work truth,
+      reason: an empty Reservation is valid for unsponsored pressure*/
+    void emplace(kernel::resource::Reservation&& reservation) noexcept {
+        KASSERT(!reservation_.has_value());
+        reservation_.emplace(libk::move(reservation));
+    }
+
+    [[nodiscard]] auto take() noexcept
+        -> libk::optional<kernel::resource::Reservation> {
+        if (!reservation_.has_value()) {
+            return {};
+        }
+        libk::optional<kernel::resource::Reservation> result{
+            libk::optional_in_place, libk::move(*reservation_)};
+        reservation_.reset();
+        return result;
     }
 
     void reset() noexcept {
-        KASSERT(invariant());
         reservation_.reset();
-        page_ = {};
     }
 
 private:
-    [[nodiscard]] auto invariant() const noexcept -> bool {
-        return static_cast<bool>(reservation_)
-            == static_cast<bool>(page_);
-    }
+    libk::optional<kernel::resource::Reservation> reservation_{};
+};
 
-    FrameDemand(
-        kernel::resource::Reservation&& reservation,
-        PageKey page) noexcept
-        : reservation_(libk::move(reservation)), page_(page) {
-        KASSERT(static_cast<bool>(reservation_)
-            && static_cast<bool>(page_));
-    }
-
-    kernel::resource::Reservation reservation_{};
-    PageKey page_{};
+/*luna change: classify one bounded reclaim pass, reason: scheduler activity
+  cannot stand in for a candidate or real frame progress fact*/
+enum class ReclaimResult : u8 {
+    Exhausted,
+    Candidate,
+    InFlight,
+    Progress,
 };
 
 /*luna change: retain only the incomplete-type relation link, reason: the
@@ -88,8 +87,13 @@ struct ReclaimEntry final {
 class PageReclaimer final {
 public:
     static constexpr usize pass_budget = 8;
+    using Notifier = libk::delegate<
+        diag::concurrency::ObservationKey() noexcept>;
 
     PageReclaimer() noexcept = default;
+
+    void bind_notifier(Notifier notifier) noexcept;
+    void unbind_notifier() noexcept;
 
     [[nodiscard]] auto register_memory(MemoryObject& object) noexcept -> bool;
     [[nodiscard]] auto withdraw(MemoryObject& object) noexcept -> bool;
@@ -102,6 +106,7 @@ public:
     [[nodiscard]] auto release(
         WaitRelation& relation,
         u64 expected_generation) noexcept -> bool;
+    [[nodiscard]] auto service(usize capacity) noexcept -> ReclaimResult;
     /*luna change: report only retained relations as pressure work, reason: finalized claims have no publisher lease after host unlink*/
     [[nodiscard]] auto pending() const noexcept -> usize {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -127,6 +132,7 @@ private:
     ReclaimEntry* object_cursor_{};
     RelationList relations_{};
     WaitRelation* cursor_{};
+    Notifier notifier_{};
 };
 
 } // namespace kernel::mm

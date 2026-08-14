@@ -67,6 +67,7 @@ KernelState::~KernelState() noexcept {
     }
     vspace_work_.unbind_notifier();
     memory_work_.unbind_notifier();
+    pressure_work_.unbind_notifier();
     cpus_.reset();
     release_scheduler_objects();
     grants_.reset();
@@ -188,6 +189,12 @@ auto KernelState::start_reclaimer(
     memory_work_.bind_notifier(
         kernel::mm::MemoryExecutor::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
+    /*luna change: wake the shared reclaimer for retained pressure relations,
+      reason: relation admission is canonical in PageReclaimer while this
+      callback only delivers existing scheduler credit*/
+    pressure_work_.bind_notifier(
+        kernel::mm::PageReclaimer::Notifier::bind<
+            &KernelState::wake_reclaimer>(*this));
     vspace_work_.bind_notifier(
         kernel::mm::VSpaceExecutor::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
@@ -249,20 +256,6 @@ auto KernelState::start_reclaimer(
         const usize object_count = kernel.objects().drain_reclaim();
         add_progress(object_total, object_count);
         kernel.reclaimer_observation_.advance(object_count);
-        mm::WaitClaim pressure_ready[mm::PageReclaimer::pass_budget]{};
-        const usize ready_count = kernel.pressure_work_.wake(
-            kernel.pmm().frame_progress_generation(),
-            pressure_ready,
-            mm::PageReclaimer::pass_budget);
-        /*luna change: consume already-finalized pressure claims without a relation callback unlink, reason: PageReclaimer closes relation reuse before publishing readiness*/
-        for (usize index = 0; index < ready_count; ++index) {
-            mm::WaitClaim claim = libk::move(pressure_ready[index]);
-            /*luna change: assert finalized pressure claim delivery, reason: wake already completed host unlink and cannot leave an unconsumed snapshot*/
-            KASSERT(claim);
-            KASSERT(claim.publish());
-            KASSERT(claim.release());
-            claim.reset();
-        }
         work_observation.advance(object_count);
         diag::concurrency::ObservationBatch object_update{
             .phase = 1,
@@ -329,7 +322,32 @@ auto KernelState::start_reclaimer(
         add_progress(memory_total, memory.progressed);
         kernel.reclaimer_observation_.advance(memory.progressed);
         work_observation.advance(memory.progressed);
-        if (grant.more || vspace.more || memory.more
+        /*luna change: drain existing VM and memory work before candidate
+          selection and pressure wake, reason: same-cycle completions must be
+          visible before retained pressure is revisited*/
+        const mm::ReclaimResult candidate = kernel.pressure_work_.service(
+            mm::PageReclaimer::pass_budget);
+        const bool candidate_more =
+            candidate == mm::ReclaimResult::Candidate
+            || candidate == mm::ReclaimResult::Progress;
+        mm::WaitClaim pressure_ready[mm::PageReclaimer::pass_budget]{};
+        const usize ready_count = kernel.pressure_work_.wake(
+            kernel.pmm().frame_progress_generation(),
+            pressure_ready,
+            mm::PageReclaimer::pass_budget);
+        /*luna change: consume finalized pressure claims after candidate work,
+          reason: relation reuse closes before its callback is published*/
+        for (usize index = 0; index < ready_count; ++index) {
+            mm::WaitClaim claim = libk::move(pressure_ready[index]);
+            /*luna change: assert finalized pressure claim delivery, reason:
+              wake already completed host unlink and cannot leave an
+              unconsumed snapshot*/
+            KASSERT(claim);
+            KASSERT(claim.publish());
+            KASSERT(claim.release());
+            claim.reset();
+        }
+        if (candidate_more || grant.more || vspace.more || memory.more
             || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();

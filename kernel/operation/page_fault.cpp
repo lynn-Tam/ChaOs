@@ -52,10 +52,15 @@ auto PageFault::complete() const noexcept -> bool {
 
 auto PageFault::read() noexcept -> Result {
     const auto kind = this->kind();
+    /*luna change: expose terminal memory pressure failures as no-memory,
+      reason: completion reads must preserve ResourceExhausted/OOM classes*/
     return Result{
         .status = kind == mm::FaultKind::Ready
                 || kind == mm::FaultKind::Materialized
             ? MYOS_STATUS_OK
+            : kind == mm::FaultKind::OutOfMemory
+                || kind == mm::FaultKind::ResourceExhausted
+                ? MYOS_STATUS_NO_MEMORY
             : kind == mm::FaultKind::BackingFailed
                 ? MYOS_STATUS_PEER_FAULT
                 : MYOS_STATUS_CANCELED,
@@ -74,7 +79,11 @@ void PageFault::drop_pin() noexcept {
 void PageFault::release() noexcept {
     drop_pin();
     const Phase phase = phase_.load<libk::MemoryOrder::Acquire>();
-    if (phase == Phase::Ready || phase == Phase::Canceled) {
+    /*luna change: refund retained demand at terminal completion, reason:
+      pressure retry keeps it only across a Rearm handoff*/
+    if (phase == Phase::Ready || phase == Phase::Canceled
+        || phase == Phase::Terminal) {
+        demand_.reset();
         phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
     }
 }
@@ -83,9 +92,15 @@ void PageFault::publish(
     void* owner,
     mm::PageWaitResult result) noexcept {
     auto& fault = *static_cast<PageFault*>(owner);
-    const mm::FaultKind kind = result == mm::PageWaitResult::Ready
-        ? mm::FaultKind::Ready
-        : mm::FaultKind::BackingFailed;
+    const mm::FaultKind previous = fault.kind();
+    const mm::FaultKind kind = result == mm::PageWaitResult::OutOfMemory
+        ? mm::FaultKind::OutOfMemory
+        : result == mm::PageWaitResult::Ready
+            && previous == mm::FaultKind::Pressure
+            ? mm::FaultKind::Pressure
+            : result == mm::PageWaitResult::Ready
+                ? mm::FaultKind::Ready
+                : mm::FaultKind::BackingFailed;
     fault.kind_.store<libk::MemoryOrder::Release>(static_cast<u8>(kind));
     Phase expected = fault.phase_.load<libk::MemoryOrder::Acquire>();
     for (;;) {
@@ -118,21 +133,37 @@ auto PageFault::admit() noexcept -> mm::FaultKind {
         access_,
         &relation_,
         this,
-        &PageFault::publish);
+        &PageFault::publish,
+        &demand_);
     if (!result) {
         kind_.store<libk::MemoryOrder::Release>(
             static_cast<u8>(mm::fault_kind(result.error())));
+        demand_.reset();
         phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
         return kind();
     }
     const mm::FaultKind next = result.value().kind;
-    if (next == mm::FaultKind::Pending) {
+    if (next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure) {
         if (result.value().memory == nullptr) {
             kind_.store<libk::MemoryOrder::Release>(
                 static_cast<u8>(mm::FaultKind::BackingFailed));
+            demand_.reset();
             phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
             return kind();
         }
+        if (next == mm::FaultKind::Pressure) {
+            /*luna change: mark Pressure only while the attaching kind is
+              still canonical, reason: an early callback's terminal kind must
+              never be overwritten after MemoryObject relation admission*/
+            u8 expected = static_cast<u8>(mm::FaultKind::Pending);
+            static_cast<void>(kind_.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(
+                expected,
+                static_cast<u8>(mm::FaultKind::Pressure)));
+        }
+        /*luna change: consume the backing-owned relation handoff, reason:
+          MemoryObject attached PageReclaimer before returning Pressure*/
         /*luna change: accept the pin handoff even after an early callback, reason: Attaching may already have published Ready before VSpace returns Pending*/
         memory_.store<libk::MemoryOrder::Release>(result.value().memory);
         generation_.store<libk::MemoryOrder::Release>(relation_.generation);
@@ -142,9 +173,10 @@ auto PageFault::admit() noexcept -> mm::FaultKind {
                 libk::MemoryOrder::Acquire>(expected, Phase::Pending)) {
             KASSERT(expected == Phase::Ready);
         }
-        return mm::FaultKind::Pending;
+        return next;
     }
     kind_.store<libk::MemoryOrder::Release>(static_cast<u8>(next));
+    demand_.reset();
     phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
     return next;
 }
@@ -166,6 +198,7 @@ auto PageFault::start(
     address_ = address;
     access_ = access;
     generation_.store<libk::MemoryOrder::Relaxed>(0);
+    demand_.reset();
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
     return admit();
 }
@@ -181,10 +214,17 @@ auto PageFault::cancel() noexcept -> bool {
         || relation_.generation != generation) {
         return false;
     }
-    if (!memory->cancel_fault(relation_, generation)) {
+    const bool canceled = kind() == mm::FaultKind::Pressure
+        ? memory->release_pressure(relation_, generation)
+        : memory->cancel_fault(relation_, generation);
+    if (!canceled) {
         return false;
     }
+    if (kind() == mm::FaultKind::Pressure) {
+        memory->release_fault();
+    }
     memory_.store<libk::MemoryOrder::Release>(nullptr);
+    demand_.reset();
     kind_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(mm::FaultKind::BackingFailed));
     phase_.store<libk::MemoryOrder::Release>(Phase::Canceled);
@@ -211,8 +251,16 @@ auto PageFault::resume(arch::TrapContext& trap) noexcept
     static_cast<void>(trap);
     KASSERT(phase_.load<libk::MemoryOrder::Acquire>() == Phase::Ready);
     drop_pin();
+    if (kind() == mm::FaultKind::OutOfMemory
+        || kind() == mm::FaultKind::ResourceExhausted
+        || kind() == mm::FaultKind::BackingFailed) {
+        demand_.reset();
+        phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
+        return Completion::ResumeResult::Done;
+    }
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
-    return admit() == mm::FaultKind::Pending
+    const mm::FaultKind next = admit();
+    return next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure
         ? Completion::ResumeResult::Rearm
         : Completion::ResumeResult::Done;
 }

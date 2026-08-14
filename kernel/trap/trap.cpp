@@ -196,7 +196,10 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                     cpu.descriptor->logical_id(),
                     mm::VirtAddr{event.fault_addr()},
                     access);
-                if (result == mm::FaultKind::Pending) {
+                /*luna change: block both pager and retained-pressure waits,
+                  reason: pressure wake owns the same Completion rearm lane*/
+                if (result == mm::FaultKind::Pending
+                    || result == mm::FaultKind::Pressure) {
                     KASSERT(thread->begin_wait(
                         page_fault.completion(),
                         *cpu.runtime().owner_registry));
