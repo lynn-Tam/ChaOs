@@ -23,6 +23,9 @@ meson setup build/riscv64 --cross-file cross/riscv64-gcc.ini -Dbuildtype=plain -
 tools/build/ninja.sh kernel.elf
 ```
 
+The wrapper defaults to four concurrent Ninja jobs. Pass an explicit `-jN`
+when a particular validation run needs a different limit.
+
 Two images coexist in the same object graph. `kernel.elf` is the fixed normal
 image with off providers and no builtin tests. `kernel_debug.elf` shares the
 same `kernel-core` archive and links the selected diagnostics, builtin tests,
