@@ -9,6 +9,7 @@
 #include <object/object_cleanup.hpp>
 #include <mm/page_state.hpp>
 #include <ipc/notification.hpp>
+#include <pager/claim.hpp>
 
 namespace kernel::pager {
 
@@ -173,6 +174,11 @@ class Pager final : private libk::noncopyable_nonmovable {
         u32 leases{};
         PagerAttachment* attachment{};
         u64 attachment_generation{};
+        /*luna change: bind the live claim to its claiming execution index,
+          reason: execution terminal must invalidate the claim through the
+          requeue owner edge without a Pager->Thread dependency*/
+        ClaimIndex* claim_index{};
+        u16 claim_ticket{};
         union Payload final {
             struct PageIn final {
                 usize first{};
@@ -270,6 +276,17 @@ public:
     [[nodiscard]] auto detach(PagerAttachment& attachment) noexcept -> bool;
     [[nodiscard]] auto try_claim() noexcept
         -> libk::Expected<Request, Error>;
+    // Publishes a just-claimed delivery into the claiming execution's index.
+    // Revalidates the exact slot identity under the Pager lock so a forced
+    // close in the claim window cannot leak a stale registration.
+    [[nodiscard]] auto register_claim(
+        ClaimKey key,
+        ClaimIndex& index) noexcept -> libk::Expected<void, Error>;
+    // Terminal-edge invalidation for the claiming execution: the exact claim
+    // returns to Published through the ordinary requeue owner path (never a
+    // page terminal winner) and the index entry is released.
+    [[nodiscard]] auto invalidate_claim(
+        const ClaimIndex::Entry& entry) noexcept -> bool;
     [[nodiscard]] auto begin_reply(ClaimKey key) noexcept
         -> libk::Expected<Reply, Error>;
     [[nodiscard]] auto bind(
@@ -301,6 +318,17 @@ private:
     [[nodiscard]] auto find_locked(RequestKey key) noexcept -> Slot*;
     [[nodiscard]] auto find_claim_locked(ClaimKey key) noexcept -> Slot*;
     [[nodiscard]] auto find_free_locked() noexcept -> Slot*;
+    /*luna change: let the terminal edge reuse the exact requeue owner path,
+      reason: writeback obligations must return to Published through the
+      attachment event instead of a second invalidation mechanism*/
+    [[nodiscard]] auto requeue(
+        ClaimKey key,
+        const Request* expected,
+        PagerAttachment* expected_attachment) noexcept
+        -> libk::Expected<void, Error>;
+    // Caller holds lock_. Releases the claim's execution binding and clears
+    // the index entry with an exact ticket match.
+    void release_claim_locked(Slot& slot) noexcept;
     [[nodiscard]] auto finish_locked(
         Slot& slot,
         PagerAttachment*& attachment,

@@ -782,6 +782,16 @@ void CpuDispatcher::dispatch(
         case DispatchReason::Exit:
         case DispatchReason::Stop:
             outgoing.execution().set_state(ExecutionState::Exited);
+            /*luna change: settle service claims at the Thread terminal,
+              reason: a dying worker must release its Pager claims so
+              redelivery and graceful close can proceed*/
+            if (Thread* const thread = outgoing.thread();
+                thread != nullptr) {
+                thread->release_pager_claims();
+            } else if (Vproc* const vproc = outgoing.vproc();
+                       vproc != nullptr) {
+                vproc->release_pager_claims();
+            }
             break;
         case DispatchReason::Block:
             outgoing.execution().set_state(ExecutionState::Blocked);

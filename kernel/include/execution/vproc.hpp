@@ -11,6 +11,7 @@
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
+#include <pager/claim.hpp>
 #include <sync/lock.hpp>
 #include <mm/direct_map.hpp>
 #include <mm/memory_object.hpp>
@@ -208,6 +209,12 @@ public:
         u64 generation) noexcept -> libk::Expected<void, VprocError>;
     [[nodiscard]] auto in_upcall() const noexcept -> bool;
     void request_exit() noexcept;
+    // Terminal edge: every outstanding Pager service claim registered by this
+    // lane returns to Published through the requeue owner path. Idempotent.
+    void release_pager_claims() noexcept;
+    [[nodiscard]] auto pager_claims() noexcept -> pager::ClaimIndex& {
+        return pager_claims_;
+    }
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
     [[nodiscard]] auto terminal() const noexcept -> const fault::TerminalRecord& {
         return terminal_;
@@ -356,6 +363,7 @@ private:
     VprocRuntime runtime_{};
     VprocArm arm_{};
     FaultSlot fault_slot_{};
+    pager::ClaimIndex pager_claims_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Vproc>
         state_lock_{};
     OperationSlot operations_[max_operations]{};

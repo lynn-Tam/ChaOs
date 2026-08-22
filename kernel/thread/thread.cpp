@@ -1,6 +1,7 @@
 #include <thread/thread.hpp>
 
 #include <fault/observation.hpp>
+#include <pager/pager.hpp>
 
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
@@ -227,8 +228,25 @@ void Thread::cancel_wait() noexcept {
     KASSERT(current_wait().cancel());
 }
 
+void Thread::release_pager_claims() noexcept {
+    for (usize ticket = 0; ticket < pager::claims_per_execution; ++ticket) {
+        const pager::ClaimIndex::Entry entry = pager_claims_.entries[ticket];
+        if (entry.pager == nullptr) {
+            continue;
+        }
+        /*luna change: invalidate through the exact requeue owner edge,
+          reason: terminal claim release must never become a page terminal
+          winner and the entry clears regardless of the outcome*/
+        static_cast<void>(entry.pager->invalidate_claim(entry));
+        pager_claims_.clear(ticket);
+    }
+}
+
 auto Thread::prepare_retire() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{stop_lock_};
+    if (!pager_claims_.empty()) {
+        return false;
+    }
     return (execution_.state_ == State::Prepared
             || execution_.state_ == State::Exited)
         && execution_.scheduler_binding_ == nullptr && !current_wait().attached()
@@ -289,6 +307,10 @@ void Thread::finish_stop() noexcept {
         execution_.home_ = nullptr;
         stopped_ = true;
     }
+    /*luna change: settle service claims at the stop terminal, reason: a
+      stopped worker must not hold a Pager claim hostage against graceful
+      close*/
+    release_pager_claims();
     authority_.target_stopped();
     execution_.binding().detach_user();
     static_cast<void>(terminal_.claim(

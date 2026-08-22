@@ -12,6 +12,7 @@
 #include <libk/expected.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/optional.hpp>
+#include <pager/claim.hpp>
 #include <sync/lock.hpp>
 #include <libk/typetraits.hpp>
 #include <libk/variant.hpp>
@@ -153,6 +154,13 @@ public:
         CpuRegistry& cpus) noexcept -> bool;
     void resume_wait(arch::TrapContext& trap) noexcept;
     void cancel_wait() noexcept;
+    // Terminal edge: every outstanding Pager service claim registered by this
+    // Thread returns to Published through the requeue owner path. Safe to
+    // call more than once; entries clear as they are invalidated.
+    void release_pager_claims() noexcept;
+    [[nodiscard]] auto pager_claims() noexcept -> pager::ClaimIndex& {
+        return pager_claims_;
+    }
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
 
 private:
@@ -177,6 +185,7 @@ private:
     libk::optional<kernel::trap::Event> user_fault_{};
     operation::Wait wait_{};
     execution::Frame* active_{};
+    pager::ClaimIndex pager_claims_{};
     u64 user_syscalls_{};
     fault::TerminalRecord terminal_{};
     fault::TerminalObservation* terminal_observation_{};

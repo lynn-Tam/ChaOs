@@ -272,6 +272,7 @@ auto Pager::detach(PagerAttachment& attachment) noexcept -> bool {
                         slot, static_cast<u16>(&slot - slots_));
                     KASSERT(claimed_ != 0);
                     --claimed_;
+                    release_claim_locked(slot);
                     slot.state = TransportState::Free;
                     slot.attachment = nullptr;
                     slot.attachment_generation = 0;
@@ -493,16 +494,17 @@ auto Pager::try_claim() noexcept -> libk::Expected<Request, Error> {
         {
             kernel::sync::IrqLockGuard guard{lock_};
             Slot* const slot = find_locked(request.key);
-            if (slot != nullptr && slot->state == TransportState::Claimed
-                && slot->claim_generation == request.claim.generation
-                && slot->attachment == attachment) {
-                KASSERT(slot->leases != 0 && claimed_ != 0);
-                --slot->leases;
-                --claimed_;
-                slot->state = TransportState::Free;
-                slot->attachment = nullptr;
-                slot->attachment_generation = 0;
-            }
+        if (slot != nullptr && slot->state == TransportState::Claimed
+            && slot->claim_generation == request.claim.generation
+            && slot->attachment == attachment) {
+            KASSERT(slot->leases != 0 && claimed_ != 0);
+            --slot->leases;
+            --claimed_;
+            release_claim_locked(*slot);
+            slot->state = TransportState::Free;
+            slot->attachment = nullptr;
+            slot->attachment_generation = 0;
+        }
             if (attachment != nullptr) {
                 KASSERT(attachment->leases != 0);
                 --attachment->leases;
@@ -532,6 +534,55 @@ auto Pager::try_claim() noexcept -> libk::Expected<Request, Error> {
         return libk::expected(request);
     }
     return libk::unexpected(Error::Stale);
+}
+
+void Pager::release_claim_locked(Slot& slot) noexcept {
+    if (slot.claim_index != nullptr) {
+        slot.claim_index->clear(slot.claim_ticket);
+        slot.claim_index = nullptr;
+        slot.claim_ticket = 0;
+    }
+}
+
+auto Pager::register_claim(
+    ClaimKey key,
+    ClaimIndex& index) noexcept -> libk::Expected<void, Error> {
+    const usize ticket = index.free_ticket();
+    if (ticket == claims_per_execution) {
+        return libk::unexpected(Error::Full);
+    }
+    kernel::sync::IrqLockGuard guard{lock_};
+    Slot* const slot = find_claim_locked(key);
+    if (slot == nullptr || slot->leases != 0) {
+        return libk::unexpected(Error::Stale);
+    }
+    /*luna change: publish the binding under the Pager lock, reason: a forced
+      close in the claim window must never leave a registered stale entry*/
+    slot->claim_index = &index;
+    slot->claim_ticket = static_cast<u16>(ticket);
+    index.entries[ticket] = ClaimIndex::Entry{
+        this,
+        static_cast<u16>(slot - slots_),
+        slot->generation,
+        slot->claim_generation};
+    return libk::expected();
+}
+
+auto Pager::invalidate_claim(
+    const ClaimIndex::Entry& entry) noexcept -> bool {
+    if (entry.pager != this || entry.slot >= max_requests
+        || entry.delivery_generation == 0 || entry.claim_generation == 0) {
+        return false;
+    }
+    /*luna change: reuse the exact requeue owner edge from the terminal walk,
+      reason: a writeback obligation must return to Published through the
+      attachment event and the next claim must advance the generation*/
+    const ClaimKey key{
+        .delivery = RequestKey{entry.slot, entry.delivery_generation},
+        .generation = entry.claim_generation};
+    const auto released = requeue(key, nullptr, nullptr);
+    KASSERT(released || released.error() != Error::Busy);
+    return static_cast<bool>(released);
 }
 
 auto Pager::begin_reply(ClaimKey key) noexcept
@@ -644,7 +695,15 @@ auto Pager::cancel(RequestKey key) noexcept
 
 auto Pager::requeue(
     ClaimKey key,
-    const Request& expected,
+    const Request& request,
+    PagerAttachment* expected_attachment) noexcept
+    -> libk::Expected<void, Error> {
+    return requeue(key, &request, expected_attachment);
+}
+
+auto Pager::requeue(
+    ClaimKey key,
+    const Request* expected,
     PagerAttachment* expected_attachment) noexcept
     -> libk::Expected<void, Error> {
     PagerAttachment* attachment{};
@@ -668,9 +727,11 @@ auto Pager::requeue(
         attachment = slot->attachment;
         attachment_generation = slot->attachment_generation;
         request = view(*slot, key.delivery.slot);
-        if (request != expected
-            || (expected_attachment != nullptr
-                && slot->attachment != expected_attachment)) {
+        if ((expected != nullptr
+                && (request != *expected
+                    || (expected_attachment != nullptr
+                        && slot->attachment != expected_attachment)))
+            || (expected == nullptr && expected_attachment != nullptr)) {
             return libk::unexpected(Error::Stale);
         }
         if (slot->leases != 0) {
@@ -709,6 +770,7 @@ auto Pager::requeue(
         if (owner && live) {
             KASSERT(slot->leases != 0);
             --slot->leases;
+            release_claim_locked(*slot);
             slot->state = TransportState::Queued;
             KASSERT(claimed_ != 0);
             --claimed_;
@@ -754,6 +816,7 @@ auto Pager::requeue(
             KASSERT(slot->leases != 0 && claimed_ != 0);
             --slot->leases;
             --claimed_;
+            release_claim_locked(*slot);
             slot->state = TransportState::Free;
             slot->attachment = nullptr;
             slot->attachment_generation = 0;
@@ -795,6 +858,7 @@ auto Pager::finish_locked(
     attachment = slot.attachment;
     request = view(slot, static_cast<u16>(&slot - slots_));
     drained = false;
+    release_claim_locked(slot);
     slot.state = TransportState::Free;
     if (slot.leases != 0) {
         --slot.leases;
@@ -1027,6 +1091,7 @@ auto Pager::close(bool force) noexcept -> bool {
                         ++attachment->leases;
                         held = true;
                     }
+                    release_claim_locked(slot);
                     slot.state = TransportState::Free;
                     slot.attachment = nullptr;
                     slot.attachment_generation = 0;

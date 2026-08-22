@@ -1,6 +1,7 @@
 #include <execution/vproc.hpp>
 
 #include <fault/observation.hpp>
+#include <pager/pager.hpp>
 #include <arch/cpu.hpp>
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
@@ -1168,7 +1169,7 @@ auto Vproc::prepare_retire() const noexcept -> bool {
     if (arm_attaching_ || activation_publishers_ != 0
         || activation_post_ != ActivationPost::Idle || activation_dirty_
         || fault_slot_.state != FaultSlot::State::Free
-        || fault_slot_.publishers != 0) {
+        || fault_slot_.publishers != 0 || !pager_claims_.empty()) {
         return false;
     }
     // ObjectPool changes lifecycle to Retiring before this callback. Closing
@@ -1201,6 +1202,20 @@ void Vproc::request_stop(execution::Stop& request) noexcept {
     request_exit();
 }
 
+void Vproc::release_pager_claims() noexcept {
+    for (usize ticket = 0; ticket < pager::claims_per_execution; ++ticket) {
+        const pager::ClaimIndex::Entry entry = pager_claims_.entries[ticket];
+        if (entry.pager == nullptr) {
+            continue;
+        }
+        /*luna change: invalidate through the exact requeue owner edge,
+          reason: terminal claim release must never become a page terminal
+          winner and the entry clears regardless of the outcome*/
+        static_cast<void>(entry.pager->invalidate_claim(entry));
+        pager_claims_.clear(ticket);
+    }
+}
+
 void Vproc::request_exit() noexcept {
     bool initiate{};
     {
@@ -1217,6 +1232,10 @@ void Vproc::request_exit() noexcept {
         close_notifications();
         /*luna change: settle the fixed fault continuation during stop, reason: relation cancellation and pin release must precede Vproc reuse*/
         close_fault();
+        /*luna change: settle service claims at the lane terminal, reason: a
+          stopped worker lane must not hold a Pager claim hostage against
+          graceful close*/
+        release_pager_claims();
     }
     retry_stop_if_ready();
 }

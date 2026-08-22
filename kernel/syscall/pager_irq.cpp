@@ -184,6 +184,26 @@ auto handle_pager_claim(Invocation& invocation) noexcept -> Result {
             request.value().claim, request.value()));
         return returned(MYOS_STATUS_RETRY);
     }
+    /*luna change: bind the claim to the claiming execution's index, reason:
+      execution terminal must invalidate the claim through the requeue owner
+      edge so worker death cannot strand the record in Claimed*/
+    kernel::pager::ClaimIndex* claims{};
+    if (kernel::Thread* const thread = invocation.target.thread();
+        thread != nullptr) {
+        claims = &thread->pager_claims();
+    } else if (kernel::Vproc* const vproc = invocation.target.vproc();
+               vproc != nullptr) {
+        claims = &vproc->pager_claims();
+    }
+    if (claims != nullptr) {
+        const auto registered = resolved.value()->register_claim(
+            request.value().claim, *claims);
+        if (!registered) {
+            static_cast<void>(resolved.value()->requeue(
+                request.value().claim, request.value()));
+            return returned(pager_error(registered.error()));
+        }
+    }
     return returned(MYOS_STATUS_OK, request.value().key.slot,
         request.value().key.generation);
 }

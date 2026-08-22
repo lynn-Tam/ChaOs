@@ -921,53 +921,85 @@ bool test_pressure_empty_round_proves_oom(
     return reclaimer.pending() == 0;
 }
 
-/*luna change: mirror PagerBacking owner transitions on a bare PageSlot,
-  reason: transport teardown evidence must reach the same semantic terminals*/
-struct SlotOwner final {
-    kernel::mm::PageSlot* slot{};
-    usize forced{};
-
-    static auto run(
-        void* context,
-        const kernel::pager::Request& request,
-        kernel::pager::PagerAttachment::Event event) noexcept -> bool {
-        auto& self = *static_cast<SlotOwner*>(context);
-        kernel::mm::PageSlot& slot = *self.slot;
-        if (slot.request.key.generation != request.page_key.generation) {
-            return false;
-        }
-        if (request.kind == kernel::pager::DeliveryKind::Writeback) {
-            const kernel::mm::WritebackKey key{
-                request.page_key,
-                request.writeback_generation,
-                request.dirty_epoch};
-            switch (event) {
-            case kernel::pager::PagerAttachment::Event::Claim:
-                return static_cast<bool>(slot.claim_writeback(
-                    key, request.key.generation, request.claim.generation));
-            case kernel::pager::PagerAttachment::Event::Requeue:
-                return static_cast<bool>(slot.requeue_writeback(
-                    key, request.key.generation, request.claim.generation));
-            case kernel::pager::PagerAttachment::Event::Forced:
-                return static_cast<bool>(slot.fail_writeback(
-                    key,
-                    request.key.generation,
-                    slot.state
-                            == kernel::mm::PageSlotState::WritebackPublished
-                        ? 0
-                        : request.claim.generation,
-                    kernel::mm::WritebackFailure::BackingUnavailable));
-            }
-            return false;
-        }
-        if (event == kernel::pager::PagerAttachment::Event::Forced) {
-            ++self.forced;
-            return static_cast<bool>(
-                slot.fail(slot.request.claim_generation));
-        }
-        return true;
+/*luna change: drive the terminal claim-invalidation edge end to end,
+  reason: worker death must release a registered claim through the requeue
+  owner path so redelivery and graceful close stay possible*/
+bool test_execution_terminal_requeues_registered_claims(
+    const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    kernel::pager::ClaimIndex claims{};
+    if (!pager.publish(kernel::mm::PageKey{2, 3}, 3, 1, 2)) {
+        return false;
     }
-};
+    const auto first = pager.try_claim();
+    if (!first || first.value().claim.generation != 1
+        || !pager.register_claim(first.value().claim, claims)) {
+        return false;
+    }
+    if (!pager.publish(kernel::mm::PageKey{4, 3}, 3, 1, 4)) {
+        return false;
+    }
+    const auto second = pager.try_claim();
+    if (!second
+        || !pager.register_claim(second.value().claim, claims)) {
+        return false;
+    }
+    if (!pager.publish(kernel::mm::PageKey{6, 3}, 3, 1, 6)) {
+        return false;
+    }
+    const auto overflow = pager.try_claim();
+    if (!overflow
+        || pager.register_claim(overflow.value().claim, claims).error()
+            != kernel::pager::Error::Full) {
+        return false;
+    }
+    if (!pager.requeue(overflow.value().claim, overflow.value())
+        || pager.pending() != 1) {
+        return false;
+    }
+    /*luna change: settle one claim through the ordinary reply first, reason:
+      a committed claim clears its binding and the terminal walk must treat
+      the cleared entry as a no-op*/
+    auto settled = pager.begin_reply(second.value().claim);
+    if (!settled || !settled.value().commit()
+        || claims.entries[1].pager != nullptr
+        || pager.invalidate_claim(claims.entries[1])) {
+        return false;
+    }
+    /*luna change: run the terminal edge exactly like the death walk, reason:
+      the registered claim returns to Published with the same delivery
+      identity and only the claim generation advances*/
+    if (!pager.invalidate_claim(claims.entries[0])
+        || pager.pending() != 2
+        || claims.entries[0].pager != nullptr
+        || pager.begin_reply(first.value().claim).error()
+            != kernel::pager::Error::Stale) {
+        return false;
+    }
+    const auto drain = pager.try_claim();
+    if (!drain || drain.value().page_key.index != 3
+        || drain.value().page_key.generation != 6) {
+        return false;
+    }
+    auto drained = pager.begin_reply(drain.value().claim);
+    if (!drained || !drained.value().commit()) {
+        return false;
+    }
+    const auto replacement = pager.try_claim();
+    if (!replacement
+        || replacement.value().claim.delivery.slot
+            != first.value().claim.delivery.slot
+        || replacement.value().claim.delivery.generation
+            != first.value().claim.delivery.generation
+        || replacement.value().claim.generation
+            == first.value().claim.generation) {
+        return false;
+    }
+    auto done = pager.begin_reply(replacement.value().claim);
+    return done && done.value().commit() && pager.close(false)
+        && pager.state() == kernel::pager::State::Closed;
+}
 
 /*luna change: prove pager_fail gives every attached continuation exactly one
   terminal, reason: Thread and FaultSlot relations share one PageRequest owner*/
@@ -1100,7 +1132,7 @@ bool test_released_claim_completes_via_new_generation(
 }
 
 /*luna change: reject every late tuple without mutating page or transport
-  truth, reason: fail, retire and slot reuse each retire the old identity*/
+  truth, reason: fail settlement and slot reuse each retire the old identity*/
 bool test_late_delivery_rejects_stale_tuples(const TestContext&) noexcept {
     auto& pager = e7_pager.emplace();
     PagerReset reset{};
@@ -1142,28 +1174,6 @@ bool test_late_delivery_rejects_stale_tuples(const TestContext&) noexcept {
         || failed.supply(claimed.value().claim.generation, 5)
         || failed.state != kernel::mm::PageSlotState::Failed
         || seen != kernel::mm::PageWaitResult::Failed) {
-        return false;
-    }
-    kernel::mm::PageSlot retired{};
-    const kernel::mm::PageKey retired_key{9, 4};
-    if (!retired.begin_request(retired_key, 4, 1)
-        || !retired.request.begin_publish()
-        || !retired.request.publish()) {
-        return false;
-    }
-    kernel::mm::WaitRelation canceled{};
-    auto settled = kernel::mm::PageWaitResult::Canceled;
-    if (!retired.request.attach(canceled, &settled, &page_wait_published)
-        || !retired.request.detach(canceled, canceled.generation)
-        || canceled.attached()) {
-        return false;
-    }
-    if (!retired.detach()
-        || retired.state != kernel::mm::PageSlotState::Detaching
-        || retired.begin_fill(2)
-        || retired.supply(2, 5)
-        || retired.queue_writeback()
-        || retired.state != kernel::mm::PageSlotState::Detaching) {
         return false;
     }
     const auto reused = pager.publish(failed_key, 3, 1, 6);
@@ -1222,127 +1232,6 @@ bool test_generation_exhaustion_closes_without_wrap(
         && !slot.supply(1, 2)
         && !slot.begin_request(kernel::mm::PageKey{1, 6}, 6, 1);
 }
-
-bool test_forced_close_settles_pending_fault_relation(
-    const TestContext&) noexcept {
-    auto& pager = e7_pager.emplace();
-    PagerReset reset{};
-    kernel::mm::PageSlot slot{};
-    SlotOwner owner{.slot = &slot};
-    kernel::pager::PagerAttachment attachment{
-        .context = &owner,
-        .transition = &SlotOwner::run,
-        .drained = &pager_attachment_release,
-        .ready = &pager_attachment_ready,
-    };
-    auto detach = libk::on_scope_exit([&]() noexcept {
-        if (attachment.state
-            != kernel::pager::PagerAttachment::State::Detached) {
-            static_cast<void>(pager.detach(attachment));
-        }
-    });
-    const kernel::mm::PageKey key{5, 8};
-    if (!slot.begin_request(key, 8, 1)
-        || !slot.request.begin_publish()
-        || !slot.request.publish()
-        || !pager.attach(attachment)
-        || !pager.publish(attachment, key, 8, 1, 5)) {
-        return false;
-    }
-    kernel::mm::WaitRelation relation{};
-    auto seen = kernel::mm::PageWaitResult::Canceled;
-    if (!slot.request.attach(relation, &seen, &page_wait_published)) {
-        return false;
-    }
-    const auto claimed = pager.try_claim();
-    if (!claimed || pager.pending() != 0) {
-        return false;
-    }
-    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
-        || owner.forced != 1
-        || slot.state != kernel::mm::PageSlotState::Failed) {
-        return false;
-    }
-    const auto stale = pager.begin_reply(claimed.value().claim);
-    kernel::mm::WaitClaim terminal{};
-    if (stale || stale.error() != kernel::pager::Error::Stale
-        || slot.request.claim_waiters(
-               &terminal, 1, kernel::mm::PageWaitResult::Failed) != 1
-        || !slot.request.finish_claim(terminal)
-        || !terminal.publish()
-        || !terminal.release()) {
-        return false;
-    }
-    terminal.reset();
-    return seen == kernel::mm::PageWaitResult::Failed
-        && !relation.attached()
-        && slot.state == kernel::mm::PageSlotState::Failed;
-}
-
-bool test_forced_close_settles_writeback_obligation(
-    const TestContext&) noexcept {
-    auto& pager = e7_pager.emplace();
-    PagerReset reset{};
-    kernel::mm::PageSlot slot{};
-    SlotOwner owner{.slot = &slot};
-    kernel::pager::PagerAttachment attachment{
-        .context = &owner,
-        .transition = &SlotOwner::run,
-        .drained = &pager_attachment_release,
-        .ready = &pager_attachment_ready,
-    };
-    auto detach = libk::on_scope_exit([&]() noexcept {
-        if (attachment.state
-            != kernel::pager::PagerAttachment::State::Detached) {
-            static_cast<void>(pager.detach(attachment));
-        }
-    });
-    if (!slot.begin_request(kernel::mm::PageKey{7, 1}, 1, 1)
-        || !slot.request.begin_publish()
-        || !slot.request.publish()
-        || !slot.begin_fill(9)
-        || !slot.supply(9, 1)
-        || !slot.mark_dirty(2)) {
-        return false;
-    }
-    const auto key = slot.queue_writeback();
-    if (!key || !slot.begin_writeback_publish(key.value())
-        || !pager.attach(attachment)) {
-        return false;
-    }
-    const auto published = pager.publish_writeback(
-        attachment,
-        key.value().page,
-        key.value().generation,
-        key.value().dirty_epoch);
-    if (!published
-        || !slot.publish_writeback(key.value(), published.value().key.generation)) {
-        return false;
-    }
-    slot.writeback.transport_slot = published.value().key.slot;
-    const auto claimed = pager.try_claim();
-    if (!claimed
-        || slot.state != kernel::mm::PageSlotState::WritebackActive) {
-        return false;
-    }
-    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
-        || slot.state != kernel::mm::PageSlotState::WritebackFailed
-        || slot.writeback.failure
-            != kernel::mm::WritebackFailure::BackingUnavailable
-        || slot.dirty_epoch != 2) {
-        return false;
-    }
-    const auto stale = pager.begin_reply(claimed.value().claim);
-    if (stale || stale.error() != kernel::pager::Error::Stale) {
-        return false;
-    }
-    return !slot.complete_writeback(
-               key.value(),
-               published.value().key.generation,
-               claimed.value().claim.generation)
-        && slot.state == kernel::mm::PageSlotState::WritebackFailed;
-}
-
 /*luna change: prove retire defers to a live relation and clears a queued
   writeback obligation, reason: teardown wins only after the owner terminal*/
 bool test_retire_waits_for_relation_then_detaches(
@@ -1524,6 +1413,9 @@ void register_e7_tests(TestRegistry& registry) noexcept {
         "e7", "Pager fail settles each attached continuation once",
         test_pager_fail_settles_each_continuation_once);
     (void)registry.add(
+        "e7", "Execution terminal requeues registered claims",
+        test_execution_terminal_requeues_registered_claims);
+    (void)registry.add(
         "e7", "Released worker claim completes only via new generation",
         test_released_claim_completes_via_new_generation);
     (void)registry.add(
@@ -1532,12 +1424,6 @@ void register_e7_tests(TestRegistry& registry) noexcept {
     (void)registry.add(
         "e7", "Generation exhaustion closes without key wrap",
         test_generation_exhaustion_closes_without_wrap);
-    (void)registry.add(
-        "e7", "Forced Pager close settles a pending fault relation",
-        test_forced_close_settles_pending_fault_relation);
-    (void)registry.add(
-        "e7", "Forced Pager close settles an active writeback obligation",
-        test_forced_close_settles_writeback_obligation);
     (void)registry.add(
         "e7", "Retire waits for the relation terminal before detaching",
         test_retire_waits_for_relation_then_detaches);

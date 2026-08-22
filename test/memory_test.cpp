@@ -1098,6 +1098,103 @@ bool test_pager_reverse_mapping_usage_and_eviction(
     return memory.state() == kernel::mm::MemoryState::Retired;
 }
 
+/*luna change: prove forced close through the real PagerBacking owner path,
+  reason: a PageSlot mirror cannot cover tree locking, node identity
+  matching or the attachment lifecycle the production forced transitions
+  exercise*/
+bool test_pager_forced_close_settles_backing_obligations(
+    const TestContext&) noexcept {
+    PagerReset pager_reset{};
+    MemoryFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    auto& pager = memory_test_pager.emplace();
+    kernel::mm::MemoryObject& memory =
+        fixture.make(2 * kernel::mm::page_size);
+    auto cleanup = libk::on_scope_exit([&memory]() noexcept {
+        memory.retire();
+    });
+    const auto access = kernel::mm::AccessMask::of(
+        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    if (!memory.initialize_pager(pager, access)
+        || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        return false;
+    }
+    const auto work = memory_test_memory_work->run(1);
+    if (work.processed != 1 || work.progressed != 1 || pager.pending() != 1) {
+        return false;
+    }
+    const auto request = pager.try_claim();
+    auto page = fixture.pmm().allocate_page();
+    if (!request || !page
+        || !memory.pager_supply(
+            pager,
+            0,
+            request.value().page_key,
+            request.value().claim,
+            libk::move(page).value(),
+            1)
+        || !memory.observe_usage(0, true, true)
+        || memory.page_state(0).value()
+            != kernel::mm::PageSlotState::ResidentDirty) {
+        return false;
+    }
+    const auto writeback = memory.queue_writeback(0);
+    if (!writeback || !memory.publish_writeback(0, writeback.value())
+        || pager.pending() != 1) {
+        return false;
+    }
+    // A second page stays published-but-unclaimed so forced close also walks
+    // the real page-in Forced branch, not only the writeback edge.
+    if (memory.materialize(1).error() != kernel::mm::MemoryError::Pending) {
+        return false;
+    }
+    const auto pending = memory_test_memory_work->run(1);
+    if (pending.processed != 1 || pending.progressed != 1
+        || pager.pending() != 2) {
+        return false;
+    }
+    const auto active = pager.try_claim();
+    if (!active
+        || active.value().kind != kernel::pager::DeliveryKind::Writeback
+        || memory.page_state(0).value()
+            != kernel::mm::PageSlotState::WritebackActive) {
+        return false;
+    }
+    const auto queued = pager.try_claim();
+    if (!queued
+        || queued.value().kind != kernel::pager::DeliveryKind::PageIn) {
+        return false;
+    }
+    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
+        || memory.page_state(0).value()
+            != kernel::mm::PageSlotState::WritebackFailed
+        || memory.page_state(1).value() != kernel::mm::PageSlotState::Failed
+        || pager.begin_reply(active.value().claim).error()
+            != kernel::pager::Error::Stale
+        || pager.begin_reply(queued.value().claim).error()
+            != kernel::pager::Error::Stale
+        || memory.complete_writeback(
+               pager,
+               0,
+               writeback.value(),
+               active.value().key.generation,
+               active.value().claim.generation)
+               .has_value()
+        || memory.pager_fail(
+               pager,
+               1,
+               queued.value().page_key,
+               queued.value().claim)
+               .has_value()) {
+        return false;
+    }
+    memory.retire();
+    return memory.state() == kernel::mm::MemoryState::Retired
+        && pager.state() == kernel::pager::State::Closed;
+}
+
 } // namespace
 
 void register_memory_tests(TestRegistry& registry) noexcept {
@@ -1157,4 +1254,8 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         "memory",
         "pager backing tracks mappings, usage, writeback, and eviction",
         test_pager_reverse_mapping_usage_and_eviction);
+    (void)registry.add(
+        "memory",
+        "forced pager close settles active writeback and pending page-in",
+        test_pager_forced_close_settles_backing_obligations);
 }
