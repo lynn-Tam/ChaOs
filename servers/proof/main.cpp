@@ -717,9 +717,15 @@ using namespace myos::proof;
         /*luna change: park the pressure target at its canonical completion,
           reason: unrelated tunnel and channel setup must not allocate after
           the scenario owns every remaining PMM frame*/
-        for (;;) {
-            myos::yield();
+        const auto observed = myos::vproc_checkpoint();
+        if (observed.status != MYOS_STATUS_OK) {
+            fail();
         }
+        const auto parked = myos::vproc_park(observed.value);
+        static_cast<void>(parked);
+        // No later pressure event targets this completed lane. ResourcePool
+        // close stops it from Parked; a userspace return is therefore invalid.
+        fail();
     }
     const auto tunnel = myos::tunnel_open(
         shared.load(PoolSlot), TunnelIngressSlot, TunnelTag);
