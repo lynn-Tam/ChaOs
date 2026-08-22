@@ -7,6 +7,7 @@
 #include <mm/reclaim.hpp>
 #include <pager/pager.hpp>
 #include <ipc/notification.hpp>
+#include <libk/limits.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/scope_guard.hpp>
 #include <uapi/status.h>
@@ -920,6 +921,487 @@ bool test_pressure_empty_round_proves_oom(
     return reclaimer.pending() == 0;
 }
 
+/*luna change: mirror PagerBacking owner transitions on a bare PageSlot,
+  reason: transport teardown evidence must reach the same semantic terminals*/
+struct SlotOwner final {
+    kernel::mm::PageSlot* slot{};
+    usize forced{};
+
+    static auto run(
+        void* context,
+        const kernel::pager::Request& request,
+        kernel::pager::PagerAttachment::Event event) noexcept -> bool {
+        auto& self = *static_cast<SlotOwner*>(context);
+        kernel::mm::PageSlot& slot = *self.slot;
+        if (slot.request.key.generation != request.page_key.generation) {
+            return false;
+        }
+        if (request.kind == kernel::pager::DeliveryKind::Writeback) {
+            const kernel::mm::WritebackKey key{
+                request.page_key,
+                request.writeback_generation,
+                request.dirty_epoch};
+            switch (event) {
+            case kernel::pager::PagerAttachment::Event::Claim:
+                return static_cast<bool>(slot.claim_writeback(
+                    key, request.key.generation, request.claim.generation));
+            case kernel::pager::PagerAttachment::Event::Requeue:
+                return static_cast<bool>(slot.requeue_writeback(
+                    key, request.key.generation, request.claim.generation));
+            case kernel::pager::PagerAttachment::Event::Forced:
+                return static_cast<bool>(slot.fail_writeback(
+                    key,
+                    request.key.generation,
+                    slot.state
+                            == kernel::mm::PageSlotState::WritebackPublished
+                        ? 0
+                        : request.claim.generation,
+                    kernel::mm::WritebackFailure::BackingUnavailable));
+            }
+            return false;
+        }
+        if (event == kernel::pager::PagerAttachment::Event::Forced) {
+            ++self.forced;
+            return static_cast<bool>(
+                slot.fail(slot.request.claim_generation));
+        }
+        return true;
+    }
+};
+
+/*luna change: prove pager_fail gives every attached continuation exactly one
+  terminal, reason: Thread and FaultSlot relations share one PageRequest owner*/
+bool test_pager_fail_settles_each_continuation_once(
+    const TestContext&) noexcept {
+    kernel::mm::PageSlot slot{};
+    if (!slot.begin_request(kernel::mm::PageKey{7, 2}, 2, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()) {
+        return false;
+    }
+    kernel::mm::WaitRelation relations[2]{};
+    kernel::mm::PageWaitResult seen[2]{
+        kernel::mm::PageWaitResult::Canceled,
+        kernel::mm::PageWaitResult::Canceled,
+    };
+    for (usize index = 0; index < 2; ++index) {
+        if (!slot.request.attach(
+                relations[index], &seen[index], &page_wait_published)) {
+            return false;
+        }
+    }
+    /*luna change: fail from the claimed transport like PagerBacking::fail,
+      reason: the semantic terminal follows transport reply authority*/
+    if (!slot.fail(11)
+        || slot.state != kernel::mm::PageSlotState::Failed
+        || slot.request.state != kernel::mm::PageRequestState::Failed
+        || slot.request.terminal_result()
+            != kernel::mm::PageWaitResult::Failed) {
+        return false;
+    }
+    for (usize pass = 0; pass < 2; ++pass) {
+        kernel::mm::WaitClaim claim{};
+        if (slot.request.claim_waiters(
+                &claim, 1, kernel::mm::PageWaitResult::Failed) != 1
+            || !slot.request.finish_claim(claim)
+            || !claim
+            || claim.relation() != nullptr
+            || !claim.publish()
+            || !claim.release()) {
+            return false;
+        }
+        claim.reset();
+    }
+    kernel::mm::WaitClaim none{};
+    /*luna change: prove the failed page admits no refill or refault spin,
+      reason: only an explicit backing-epoch change may re-request*/
+    if (slot.request.claim_waiters(
+            &none, 1, kernel::mm::PageWaitResult::Failed) != 0
+        || slot.supply(11, 3)
+        || slot.begin_fill(11)
+        || slot.begin_request(kernel::mm::PageKey{7, 2}, 2, 1)
+        || seen[0] != kernel::mm::PageWaitResult::Failed
+        || seen[1] != kernel::mm::PageWaitResult::Failed) {
+        return false;
+    }
+    return slot.retry()
+        && slot.generation == 8
+        && slot.state == kernel::mm::PageSlotState::Missing
+        && slot.begin_request(kernel::mm::PageKey{8, 2}, 2, 1)
+        && !relations[0].attached()
+        && !relations[1].attached();
+}
+
+/*luna change: prove a released worker claim keeps one live continuation,
+  reason: only a new claim generation may complete the waiting page*/
+bool test_released_claim_completes_via_new_generation(
+    const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    kernel::mm::PageSlot slot{};
+    if (!slot.begin_request(kernel::mm::PageKey{4, 5}, 5, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()
+        || !pager.publish(kernel::mm::PageKey{4, 5}, 5, 1, 4)) {
+        return false;
+    }
+    kernel::mm::WaitRelation relation{};
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    if (!slot.request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    const auto first = pager.try_claim();
+    if (!first || first.value().page_key.index != 5) {
+        return false;
+    }
+    const auto old_claim = first.value().claim;
+    /*luna change: release the claim through the transport requeue edge,
+      reason: execution terminal and service-Grant revoke share this owner*/
+    if (!pager.requeue(old_claim, first.value()) || pager.pending() != 1) {
+        return false;
+    }
+    const auto stale = pager.begin_reply(old_claim);
+    if (stale || stale.error() != kernel::pager::Error::Stale
+        || slot.supply(old_claim.generation, 3)
+        || slot.state != kernel::mm::PageSlotState::Requested) {
+        return false;
+    }
+    const auto second = pager.try_claim();
+    if (!second
+        || second.value().claim.generation == old_claim.generation) {
+        return false;
+    }
+    /*luna change: mirror the PagerBacking::supply order, reason: the semantic
+      fill commits under an open Completing reply that must then finish*/
+    auto reply = pager.begin_reply(second.value().claim);
+    if (!reply
+        || !slot.begin_fill(second.value().claim.generation)
+        || !slot.supply(second.value().claim.generation, 6)
+        || slot.state != kernel::mm::PageSlotState::ResidentClean
+        || slot.request.state != kernel::mm::PageRequestState::Ready
+        || !reply.value().commit()) {
+        return false;
+    }
+    kernel::mm::WaitClaim claim{};
+    if (slot.request.claim_waiters(
+            &claim, 1, kernel::mm::PageWaitResult::Ready) != 1
+        || claim.relation() != &relation
+        || !slot.request.finish_claim(claim)
+        || !claim
+        || relation.attached()
+        || !claim.publish()
+        || !claim.release()) {
+        return false;
+    }
+    claim.reset();
+    return seen == kernel::mm::PageWaitResult::Ready
+        && pager.close(false)
+        && pager.state() == kernel::pager::State::Closed;
+}
+
+/*luna change: reject every late tuple without mutating page or transport
+  truth, reason: fail, retire and slot reuse each retire the old identity*/
+bool test_late_delivery_rejects_stale_tuples(const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    kernel::mm::PageSlot failed{};
+    const kernel::mm::PageKey failed_key{6, 3};
+    if (!failed.begin_request(failed_key, 3, 1)
+        || !failed.request.begin_publish()
+        || !failed.request.publish()
+        || !pager.publish(failed_key, 3, 1, 6)) {
+        return false;
+    }
+    kernel::mm::WaitRelation relation{};
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    if (!failed.request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    const auto claimed = pager.try_claim();
+    if (!claimed) {
+        return false;
+    }
+    /*luna change: mirror the PagerBacking::fail order, reason: transport
+      Completing precedes the semantic terminal and its commit is terminal*/
+    auto reply = pager.begin_reply(claimed.value().claim);
+    if (!reply || !failed.fail(claimed.value().claim.generation)
+        || !reply.value().commit()) {
+        return false;
+    }
+    kernel::mm::WaitClaim terminal{};
+    if (failed.request.claim_waiters(
+            &terminal, 1, kernel::mm::PageWaitResult::Failed) != 1
+        || !failed.request.finish_claim(terminal)
+        || !terminal.publish()
+        || !terminal.release()) {
+        return false;
+    }
+    terminal.reset();
+    const auto late = pager.begin_reply(claimed.value().claim);
+    if (late || late.error() != kernel::pager::Error::Stale
+        || failed.supply(claimed.value().claim.generation, 5)
+        || failed.state != kernel::mm::PageSlotState::Failed
+        || seen != kernel::mm::PageWaitResult::Failed) {
+        return false;
+    }
+    kernel::mm::PageSlot retired{};
+    const kernel::mm::PageKey retired_key{9, 4};
+    if (!retired.begin_request(retired_key, 4, 1)
+        || !retired.request.begin_publish()
+        || !retired.request.publish()) {
+        return false;
+    }
+    kernel::mm::WaitRelation canceled{};
+    auto settled = kernel::mm::PageWaitResult::Canceled;
+    if (!retired.request.attach(canceled, &settled, &page_wait_published)
+        || !retired.request.detach(canceled, canceled.generation)
+        || canceled.attached()) {
+        return false;
+    }
+    if (!retired.detach()
+        || retired.state != kernel::mm::PageSlotState::Detaching
+        || retired.begin_fill(2)
+        || retired.supply(2, 5)
+        || retired.queue_writeback()
+        || retired.state != kernel::mm::PageSlotState::Detaching) {
+        return false;
+    }
+    const auto reused = pager.publish(failed_key, 3, 1, 6);
+    if (!reused
+        || reused.value().key.slot != claimed.value().key.slot
+        || reused.value().key.generation
+            == claimed.value().key.generation) {
+        return false;
+    }
+    const auto revived = pager.begin_reply(claimed.value().claim);
+    const auto old_key = pager.cancel(claimed.value().key);
+    if (revived || revived.error() != kernel::pager::Error::Stale
+        || old_key || old_key.error() != kernel::pager::Error::Stale
+        || pager.pending() != 1) {
+        return false;
+    }
+    const auto replacement = pager.try_claim();
+    if (!replacement) {
+        return false;
+    }
+    auto done = pager.begin_reply(replacement.value().claim);
+    return done && done.value().commit()
+        && pager.state() == kernel::pager::State::Open;
+}
+
+/*luna change: close exhausted generations without silent wrap, reason: an old
+  relation or page key must never become valid again*/
+bool test_generation_exhaustion_closes_without_wrap(
+    const TestContext&) noexcept {
+    kernel::mm::PageRequest request{
+        .key = kernel::mm::PageKey{3, 1},
+        .first = 1,
+        .count = 1,
+        .state = kernel::mm::PageRequestState::Published,
+    };
+    kernel::mm::WaitRelation exhausted{};
+    exhausted.generation = libk::numeric_limits<u64>::max();
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    if (request.attach(exhausted, &seen, &page_wait_published)
+        || exhausted.attached()) {
+        return false;
+    }
+    kernel::mm::PageSlot slot{};
+    const u64 limit = libk::numeric_limits<u64>::max();
+    if (!slot.begin_request(kernel::mm::PageKey{limit, 6}, 6, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()
+        || !slot.fail(1)) {
+        return false;
+    }
+    const auto refused = slot.retry();
+    return !refused
+        && refused.error() == kernel::mm::PageStateError::StaleGeneration
+        && slot.generation == limit
+        && slot.state == kernel::mm::PageSlotState::Failed
+        && !slot.supply(1, 2)
+        && !slot.begin_request(kernel::mm::PageKey{1, 6}, 6, 1);
+}
+
+bool test_forced_close_settles_pending_fault_relation(
+    const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    kernel::mm::PageSlot slot{};
+    SlotOwner owner{.slot = &slot};
+    kernel::pager::PagerAttachment attachment{
+        .context = &owner,
+        .transition = &SlotOwner::run,
+        .drained = &pager_attachment_release,
+        .ready = &pager_attachment_ready,
+    };
+    auto detach = libk::on_scope_exit([&]() noexcept {
+        if (attachment.state
+            != kernel::pager::PagerAttachment::State::Detached) {
+            static_cast<void>(pager.detach(attachment));
+        }
+    });
+    const kernel::mm::PageKey key{5, 8};
+    if (!slot.begin_request(key, 8, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()
+        || !pager.attach(attachment)
+        || !pager.publish(attachment, key, 8, 1, 5)) {
+        return false;
+    }
+    kernel::mm::WaitRelation relation{};
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    if (!slot.request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    const auto claimed = pager.try_claim();
+    if (!claimed || pager.pending() != 0) {
+        return false;
+    }
+    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
+        || owner.forced != 1
+        || slot.state != kernel::mm::PageSlotState::Failed) {
+        return false;
+    }
+    const auto stale = pager.begin_reply(claimed.value().claim);
+    kernel::mm::WaitClaim terminal{};
+    if (stale || stale.error() != kernel::pager::Error::Stale
+        || slot.request.claim_waiters(
+               &terminal, 1, kernel::mm::PageWaitResult::Failed) != 1
+        || !slot.request.finish_claim(terminal)
+        || !terminal.publish()
+        || !terminal.release()) {
+        return false;
+    }
+    terminal.reset();
+    return seen == kernel::mm::PageWaitResult::Failed
+        && !relation.attached()
+        && slot.state == kernel::mm::PageSlotState::Failed;
+}
+
+bool test_forced_close_settles_writeback_obligation(
+    const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    kernel::mm::PageSlot slot{};
+    SlotOwner owner{.slot = &slot};
+    kernel::pager::PagerAttachment attachment{
+        .context = &owner,
+        .transition = &SlotOwner::run,
+        .drained = &pager_attachment_release,
+        .ready = &pager_attachment_ready,
+    };
+    auto detach = libk::on_scope_exit([&]() noexcept {
+        if (attachment.state
+            != kernel::pager::PagerAttachment::State::Detached) {
+            static_cast<void>(pager.detach(attachment));
+        }
+    });
+    if (!slot.begin_request(kernel::mm::PageKey{7, 1}, 1, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()
+        || !slot.begin_fill(9)
+        || !slot.supply(9, 1)
+        || !slot.mark_dirty(2)) {
+        return false;
+    }
+    const auto key = slot.queue_writeback();
+    if (!key || !slot.begin_writeback_publish(key.value())
+        || !pager.attach(attachment)) {
+        return false;
+    }
+    const auto published = pager.publish_writeback(
+        attachment,
+        key.value().page,
+        key.value().generation,
+        key.value().dirty_epoch);
+    if (!published
+        || !slot.publish_writeback(key.value(), published.value().key.generation)) {
+        return false;
+    }
+    slot.writeback.transport_slot = published.value().key.slot;
+    const auto claimed = pager.try_claim();
+    if (!claimed
+        || slot.state != kernel::mm::PageSlotState::WritebackActive) {
+        return false;
+    }
+    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
+        || slot.state != kernel::mm::PageSlotState::WritebackFailed
+        || slot.writeback.failure
+            != kernel::mm::WritebackFailure::BackingUnavailable
+        || slot.dirty_epoch != 2) {
+        return false;
+    }
+    const auto stale = pager.begin_reply(claimed.value().claim);
+    if (stale || stale.error() != kernel::pager::Error::Stale) {
+        return false;
+    }
+    return !slot.complete_writeback(
+               key.value(),
+               published.value().key.generation,
+               claimed.value().claim.generation)
+        && slot.state == kernel::mm::PageSlotState::WritebackFailed;
+}
+
+/*luna change: prove retire defers to a live relation and clears a queued
+  writeback obligation, reason: teardown wins only after the owner terminal*/
+bool test_retire_waits_for_relation_then_detaches(
+    const TestContext&) noexcept {
+    kernel::mm::PageSlot slot{};
+    if (!slot.begin_request(kernel::mm::PageKey{3, 2}, 2, 1)
+        || !slot.request.begin_publish()
+        || !slot.request.publish()) {
+        return false;
+    }
+    kernel::mm::WaitRelation relation{};
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    if (!slot.request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    const auto blocked = slot.detach();
+    if (blocked || blocked.error() != kernel::mm::PageStateError::Busy
+        || !relation.attached()) {
+        return false;
+    }
+    if (!slot.fail(1)) {
+        return false;
+    }
+    kernel::mm::WaitClaim terminal{};
+    if (slot.request.claim_waiters(
+            &terminal, 1, kernel::mm::PageWaitResult::Failed) != 1
+        || !slot.request.finish_claim(terminal)
+        || !terminal.publish()
+        || !terminal.release()) {
+        return false;
+    }
+    terminal.reset();
+    if (!slot.detach()
+        || slot.state != kernel::mm::PageSlotState::Detaching
+        || slot.supply(1, 4)
+        || seen != kernel::mm::PageWaitResult::Failed) {
+        return false;
+    }
+    kernel::mm::PageSlot dirty{};
+    if (!dirty.begin_request(kernel::mm::PageKey{4, 0}, 0, 1)
+        || !dirty.request.begin_publish()
+        || !dirty.request.publish()
+        || !dirty.begin_fill(3)
+        || !dirty.supply(3, 1)
+        || !dirty.mark_dirty(2)) {
+        return false;
+    }
+    const auto obligation = dirty.queue_writeback();
+    if (!obligation
+        || !dirty.writeback.retained
+        || !dirty.detach()
+        || dirty.state != kernel::mm::PageSlotState::Detaching
+        || dirty.writeback.retained
+        || dirty.begin_writeback_publish(obligation.value())) {
+        return false;
+    }
+    return true;
+}
+
 bool test_irq_sequence_reassert_requires_latest_ack(
     const TestContext&) noexcept {
     kernel::ipc::Notification notification{};
@@ -1038,6 +1520,27 @@ void register_e7_tests(TestRegistry& registry) noexcept {
     (void)registry.add(
         "e7", "Empty reclaim round proves equal-generation OOM",
         test_pressure_empty_round_proves_oom);
+    (void)registry.add(
+        "e7", "Pager fail settles each attached continuation once",
+        test_pager_fail_settles_each_continuation_once);
+    (void)registry.add(
+        "e7", "Released worker claim completes only via new generation",
+        test_released_claim_completes_via_new_generation);
+    (void)registry.add(
+        "e7", "Late delivery stays stale after fail retire and reuse",
+        test_late_delivery_rejects_stale_tuples);
+    (void)registry.add(
+        "e7", "Generation exhaustion closes without key wrap",
+        test_generation_exhaustion_closes_without_wrap);
+    (void)registry.add(
+        "e7", "Forced Pager close settles a pending fault relation",
+        test_forced_close_settles_pending_fault_relation);
+    (void)registry.add(
+        "e7", "Forced Pager close settles an active writeback obligation",
+        test_forced_close_settles_writeback_obligation);
+    (void)registry.add(
+        "e7", "Retire waits for the relation terminal before detaching",
+        test_retire_waits_for_relation_then_detaches);
     (void)registry.add(
         "e7", "Irq sequence prevents stale acknowledgement",
         test_irq_sequence_reassert_requires_latest_ack);
