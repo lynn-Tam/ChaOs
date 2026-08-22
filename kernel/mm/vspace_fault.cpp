@@ -194,9 +194,19 @@ auto VSpace::materialize_fault(
             kernel::sync::IrqLockGuard guard{lock_};
             release_claim();
         }
-        return libk::unexpected(alias.error() == AliasError::ConflictingType
-            ? VSpaceError::AliasConflict
-            : VSpaceError::OutOfMemory);
+        VSpaceError error{VSpaceError::AliasConflict};
+        switch (alias.error()) {
+        case AliasError::ConflictingType:
+            error = VSpaceError::AliasConflict;
+            break;
+        case AliasError::OutOfMemory:
+            error = VSpaceError::OutOfMemory;
+            break;
+        case AliasError::QuotaExceeded:
+            error = VSpaceError::QuotaExceeded;
+            break;
+        }
+        return libk::unexpected(error);
     }
     auto made = pages_.create(
         page_address,
@@ -204,8 +214,10 @@ auto VSpace::materialize_fault(
         libk::move(source),
         libk::move(alias).value());
     if (!made) {
-        kernel::sync::IrqLockGuard guard{lock_};
-        release_claim();
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            release_claim();
+        }
         return libk::unexpected(node_error(made.error()));
     }
     MappedPage* const page = made.value().object;
@@ -231,8 +243,10 @@ auto VSpace::materialize_fault(
           backing unlink precedes MappedPage destruction*/
         page->authority_ = nullptr;
         pages_.destroy(*page);
-        kernel::sync::IrqLockGuard guard{lock_};
-        release_claim();
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            release_claim();
+        }
         return libk::unexpected(table_reserve.error());
     }
     TableReserve tables = libk::move(table_reserve).value();
@@ -362,7 +376,6 @@ auto VSpace::sample_usage(
     if (!offset) {
         return fail(VSpaceError::InvalidRange);
     }
-    const usize object_page = mapping->object_.first + *offset;
     MappingAuthority& authority = *mapping->authority_;
     MappedPage* const mapped = authority.pages_.find(page_range.base());
     if (mapped == nullptr) {
@@ -373,22 +386,13 @@ auto VSpace::sample_usage(
         return fail(VSpaceError::InvalidRange);
     }
     arch::PageEditor editor = arch::PageEditor::user(*root_);
-    const auto observed = editor.usage(*virtual_page);
-    if (!observed) {
-        return fail(VSpaceError::NotMapped);
-    }
-    const PageUsage usage{
-        .accessed = observed.value().accessed,
-        .dirty = observed.value().dirty,
-    };
-    auto folded = authority.memory().observe_usage(
-        object_page, usage.accessed, usage.dirty);
-    if (!folded) {
-        return fail(memory_error(folded.error()));
+    auto usage = fold_usage(*mapped, editor);
+    if (!usage) {
+        return fail(usage.error());
     }
     if (!clear) {
         lock.restore();
-        return libk::expected(usage);
+        return libk::expected(usage.value());
     }
 
     auto mutation = coherence_.begin();
@@ -418,7 +422,35 @@ auto VSpace::sample_usage(
     if (committed.value() != VmStatus::Complete) {
         return libk::unexpected(VSpaceError::Busy);
     }
-    return libk::expected(usage);
+    /*luna change: keep usage sampling flat after folding once, reason:
+      return the observed page value instead of nesting Expected wrappers*/
+    return libk::expected(usage.value());
+}
+
+/*luna change: fold one mapped page through its exact relation, reason:
+  stopping teardown must retain the PageMapping owner proof across A/D fold*/
+auto VSpace::fold_usage(
+    MappedPage& page,
+    const arch::PageEditor& editor) noexcept
+    -> libk::Expected<PageUsage, VSpaceError> {
+    KASSERT(page.authority_ != nullptr);
+    const auto virtual_page = VPage::from_base(page.address_);
+    if (!virtual_page) {
+        return libk::unexpected(VSpaceError::InvalidRange);
+    }
+    const auto observed = editor.usage(*virtual_page);
+    if (!observed) {
+        return libk::unexpected(VSpaceError::NotMapped);
+    }
+    auto folded = page.authority_->memory().observe_usage(
+        page.page_mapping_, observed.value().accessed, observed.value().dirty);
+    if (!folded) {
+        return libk::unexpected(memory_error(folded.error()));
+    }
+    return libk::expected(PageUsage{
+        .accessed = observed.value().accessed,
+        .dirty = observed.value().dirty,
+    });
 }
 
 auto VSpace::inspect(MappingKey key) const noexcept

@@ -81,6 +81,7 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
         + system_pages_per_cpu * summary.count;
     const usize free_pages = kernel.pmm().free_page_count();
     KASSERT(free_pages > system_pages);
+    /*luna change: remove the one-shot pressure capacity probe, reason: the 48M root-budget sample is recorded and the temporary diagnostic must not remain in admission*/
     KASSERT(kernel.initialize_root_pool(kernel::resource::Budget{
         .memory = static_cast<u64>(free_pages - system_pages)
             * kernel::mm::page_size,

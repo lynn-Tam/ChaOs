@@ -328,6 +328,10 @@ auto VSpace::protect_impl(
             const auto permissions = arch::PageEditor::user_permissions(
                 access, page->type_);
             KASSERT(permissions);
+            /*luna change: fold usage before permission projection change,
+              reason: semantic A/D state must not depend on PTE rewrite order*/
+            auto folded = fold_usage(*page, editor);
+            KASSERT(folded);
             auto changed = editor.protect(*virtual_page, *permissions);
             KASSERT(changed);
             changed_pte = true;

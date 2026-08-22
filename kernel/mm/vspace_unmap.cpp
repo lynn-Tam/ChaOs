@@ -306,6 +306,10 @@ auto VSpace::unmap_impl(
             authority.pages_.erase(*page);
             const auto virtual_page = VPage::from_base(page->address_);
             KASSERT(virtual_page);
+            /*luna change: fold unmap usage before removing each PTE,
+              reason: semantic dirty state outlives layout teardown*/
+            auto folded = fold_usage(*page, editor);
+            KASSERT(folded);
             auto unmapped = editor.unmap(*virtual_page);
             KASSERT(unmapped);
             while (auto table = unmapped.value().tables.take()) {

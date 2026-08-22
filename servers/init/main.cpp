@@ -14,6 +14,10 @@ constexpr myos_word_t StackSize = 4 * PageSize;
 // object slot. Keep the proof workload's budget explicit instead of letting a
 // late scheduling-context construction fail after the address-space work.
 constexpr myos_word_t ChildMemory = 32 * 1024 * 1024;
+/*luna change: keep pressure child sponsorship below the 25MiB root ceiling,
+  reason: 11MiB admits the proof child and does not manufacture PMM pressure;
+  the fault-boundary OwnedPageGroup drain is the sole pressure mechanism*/
+constexpr myos_word_t PressureMemory = 11 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
 constexpr myos_word_t ChannelThreadCount = 2;
@@ -146,6 +150,13 @@ public:
         if (!package) {
             return false;
         }
+        /*luna change: freeze the manifest-selected pressure mode, reason: only the bundle root role may authorize pressure-only construction*/
+        pressure_ = package.root_is("pressure");
+        // Pressure is a focused reclaim proof. Its sole ordinary Thread owns
+        // the tested fault sequence; the second CPU Thread belongs to E1.
+        if (pressure_) {
+            thread_count_ = 1;
+        }
         if (!package.find("proof", proof)) {
             return false;
         }
@@ -179,9 +190,8 @@ public:
         }
 
         stage_ = 4;
-        /*luna change: admit Pager objects in the proof child pool without IRQ authority, reason: make_pager owns Pager creation while the E6 proof remains otherwise unchanged*/
         const auto child = myos::resource_create_child(
-            parent_pool_, ChildMemory, ChildCaps,
+            parent_pool_, pressure_ ? PressureMemory : ChildMemory, ChildCaps,
             MYOS_RESOURCE_E6_KINDS | MYOS_RESOURCE_PAGER);
         if (child.status != MYOS_STATUS_OK || !children_.add(child.value)) {
             return false;
@@ -211,6 +221,8 @@ public:
         if (!make_shared_page()) {
             return false;
         }
+        /*luna change: publish the frozen mode before any child descriptor exists, reason: proof actors must gate workload phases from configuration rather than runtime observations*/
+        shared_.store(PressureModeSlot, pressure_ ? 1 : 0);
         stage_ = 8;
         /*luna change: place Pager construction before child execution setup, reason: the target mapping and notification must exist before descriptors and workers are started*/
         if (!make_pager()) {
@@ -221,7 +233,7 @@ public:
             return false;
         }
         stage_ = 10;
-        if (!make_channel()) {
+        if (!pressure_ && !make_channel()) {
             return false;
         }
         stage_ = 11;
@@ -273,21 +285,26 @@ public:
         if (!exercise_pager()) {
             return false;
         }
-        shared_.progress(
-            ProgressActor::Coordinator,
-            ProgressStage::FirstReceive,
-            ProgressWait::VprocReady);
-        stage_ = 16;
-        if (!exercise_vproc()) {
-            return false;
-        }
-        shared_.progress(
-            ProgressActor::Coordinator,
-            ProgressStage::VprocDone,
-            ProgressWait::ChannelReady);
-        stage_ = 17;
-        if (!await_channel()) {
-            return false;
+        /*luna change: terminate pressure mode at the completed Pager proof,
+          reason: ordinary Vproc, tunnel and channel exercise must not create
+          post-drain demand and both modes can share the existing close tail*/
+        if (!pressure_) {
+            shared_.progress(
+                ProgressActor::Coordinator,
+                ProgressStage::FirstReceive,
+                ProgressWait::VprocReady);
+            stage_ = 16;
+            if (!exercise_vproc()) {
+                return false;
+            }
+            shared_.progress(
+                ProgressActor::Coordinator,
+                ProgressStage::VprocDone,
+                ProgressWait::ChannelReady);
+            stage_ = 17;
+            if (!await_channel()) {
+                return false;
+            }
         }
         stage_ = 18;
         shared_.progress(
@@ -327,6 +344,18 @@ private:
     static constexpr myos_word_t MaxSegments = 16;
     static constexpr myos_word_t max_word =
         static_cast<myos_word_t>(-1);
+
+    [[nodiscard]] auto vproc_count() const noexcept -> myos_word_t {
+        return pressure_ ? 1 : VprocCount;
+    }
+
+    [[nodiscard]] auto channel_count() const noexcept -> myos_word_t {
+        return pressure_ ? 0 : ChannelThreadCount;
+    }
+
+    [[nodiscard]] auto endpoint_count() const noexcept -> myos_word_t {
+        return pressure_ ? 0 : EndpointActivations;
+    }
 
     [[nodiscard]] auto make_region(
         myos_cap_t vspace,
@@ -511,8 +540,8 @@ private:
     [[nodiscard]] auto make_stacks() noexcept -> bool {
         /*luna change: include the dedicated Pager worker in stack allocation, reason: each registered IPC page belongs to its own blocking Thread stack*/
         const myos_word_t count =
-            thread_count_ + 3 * VprocCount + EndpointActivations
-            + ChannelThreadCount + PagerWorkerCount;
+            thread_count_ + 3 * vproc_count() + endpoint_count()
+            + channel_count() + PagerWorkerCount;
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -554,6 +583,19 @@ private:
                 reinterpret_cast<const uint8_t*>(&value), sizeof(value))) {
             return false;
         }
+        /*luna change: reserve the staging rematerialization route only in pressure mode,
+          reason: ordinary E1 transfers the seed once and must not allocate an
+          unused VSpace mutation capability*/
+        if (pressure_
+            && (!make_region(
+                    child_vspace_, StagingAddress, PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE,
+                    /*luna change: retain parent delegation on the staging region, reason: pressure mode must attenuate this source into the child CSpace without widening the child view*/
+                    MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DELEGATE,
+                    staging_region_)
+                || !children_.add(staging_region_))) {
+            return false;
+        }
         const auto target = myos::memory_create_pager(
             pool_, PageSize, MYOS_VM_READ | MYOS_VM_WRITE, pager_);
         if (target.status != MYOS_STATUS_OK
@@ -562,17 +604,43 @@ private:
         }
         target_memory_ = target.value;
 
-        myos_cap_t target_region{};
+        const myos_word_t pager_size = pressure_ ? 2 * PageSize : PageSize;
         if (!make_region(
-                child_vspace_, PagerAddress, PageSize,
+                child_vspace_, PagerAddress, pager_size,
                 MYOS_VM_READ | MYOS_VM_WRITE,
-                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP,
-                target_region)
-            || !children_.add(target_region)
+                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_PROTECT
+                    | MYOS_RIGHT_DELEGATE,
+                pager_region_)
+            || !children_.add(pager_region_)
             || !map(
-                target_region, target_memory_, PagerAddress, PageSize,
+                pager_region_, target_memory_, PagerAddress, PageSize,
                 MYOS_VM_READ | MYOS_VM_WRITE)) {
             return false;
+        }
+        /*luna change: retain PagerAddress's L0 table with the existing shared
+          page only in pressure mode, reason: exact Pager invalidation must
+          return only the resident candidate frame to a Pressure relation*/
+        if (pressure_ && !map(
+                pager_region_, shared_memory_, PagerAddress + PageSize,
+                PageSize, MYOS_VM_READ | MYOS_VM_WRITE)) {
+            return false;
+        }
+
+        /*luna change: keep one four-page lazy pressure object, reason: two
+          tested faults isolate clean and dirty reclaim, page two prewarms
+          metadata, and page three acknowledges fixture release*/
+        if (pressure_) {
+            if (!create_memory(
+                    StressSize, MYOS_VM_READ | MYOS_VM_WRITE, stress_memory_)
+                || !make_region(
+                    child_vspace_, StressAddress,
+                    StressSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE,
+                    MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DELEGATE,
+                    stress_region_)
+                || !children_.add(stress_region_)) {
+                return false;
+            }
         }
 
         const auto notification = myos::notification_create(
@@ -614,6 +682,11 @@ private:
             return false;
         }
         shared_.store(NotificationSlot, delegated.value);
+
+        // The focused pressure graph has no ordinary notification exercise.
+        if (pressure_) {
+            return true;
+        }
 
         const auto vproc = myos::notification_create(pool_, VprocBadge);
         if (vproc.status != MYOS_STATUS_OK
@@ -695,7 +768,7 @@ private:
     }
 
     [[nodiscard]] auto make_vproc_runtime() noexcept -> bool {
-        for (myos_word_t index = 0; index < VprocCount; ++index) {
+        for (myos_word_t index = 0; index < vproc_count(); ++index) {
             myos_cap_t control_region{};
             myos_cap_t event_region{};
             myos_cap_t ipc_region{};
@@ -767,6 +840,9 @@ private:
 
     [[nodiscard]] auto make_executions(myos_word_t entry) noexcept -> bool {
         stage_ = 110;
+        const myos_word_t active_vprocs = vproc_count();
+        const myos_word_t active_channels = channel_count();
+        const myos_word_t active_endpoints = endpoint_count();
         /*luna change: extend execution targets for the Pager worker, reason: descriptor and start order must cover every created Thread and Vproc exactly once*/
         myos_cap_t targets[
             MaxThreads + ChannelThreadCount + PagerWorkerCount + VprocCount]{};
@@ -791,10 +867,38 @@ private:
             pager_, child_cspace_, MYOS_RIGHT_SERVE | MYOS_RIGHT_SUPPLY);
         const auto target = myos::cap_delegate(
             target_memory_, child_cspace_, MYOS_RIGHT_MANAGE);
+        /*luna change: gate the worker's source-map authority on pressure mode,
+          reason: only the extended sequence rematerializes staging through
+          ordinary VSpace operations*/
         const auto staging = myos::cap_delegate(
-            staging_memory_, child_cspace_, MYOS_RIGHT_MANAGE);
+            staging_memory_, child_cspace_,
+            MYOS_RIGHT_MANAGE | (pressure_ ? MYOS_RIGHT_MAP : 0));
+        /*luna change: retain optional pressure delegation results in the existing execution setup, reason: capability validation must stay local without adding shared state or a second handoff path*/
+        myos::SysResult staging_region{};
+        myos::SysResult stress_memory{};
+        myos::SysResult stress_region{};
+        myos::SysResult pager_region{};
+        if (pressure_) {
+            staging_region = myos::cap_delegate(
+                staging_region_, child_cspace_,
+                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
+            /*luna change: attenuate the pressure authorities for Thread0, reason: the parent owns logical-object creation while the child only remaps and accesses its fixed working set*/
+            stress_memory = myos::cap_delegate(
+                stress_memory_, child_cspace_, MYOS_RIGHT_MAP);
+            stress_region = myos::cap_delegate(
+                stress_region_, child_cspace_,
+                MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
+        }
         const auto pager_notification = myos::cap_delegate(
             pager_notification_, child_cspace_, MYOS_RIGHT_RECEIVE);
+        /*luna change: delegate only Protect on the exact Pager region,
+          reason: VSpace mutation authority names one AddressRegion and does
+          not recursively traverse nested regions*/
+        if (pressure_) {
+            pager_region = myos::cap_delegate(
+                pager_region_, child_cspace_,
+                MYOS_RIGHT_PROTECT);
+        }
         if (code_memory_ == 0 || code_size_ == 0
             || entry < code_address_ || entry - code_address_ >= code_size_
             || child_pool.status != MYOS_STATUS_OK
@@ -804,7 +908,11 @@ private:
             || pager.status != MYOS_STATUS_OK
             || target.status != MYOS_STATUS_OK
             || staging.status != MYOS_STATUS_OK
-            || pager_notification.status != MYOS_STATUS_OK) {
+            || pager_notification.status != MYOS_STATUS_OK
+            || (pressure_ && (staging_region.status != MYOS_STATUS_OK
+                || stress_memory.status != MYOS_STATUS_OK
+                || stress_region.status != MYOS_STATUS_OK
+                || pager_region.status != MYOS_STATUS_OK))) {
             return false;
         }
         shared_.store(PoolSlot, child_pool.value);
@@ -814,9 +922,13 @@ private:
         shared_.store(PagerTargetCapSlot, target.value);
         shared_.store(PagerSourceCapSlot, staging.value);
         shared_.store(PagerNotifyCapSlot, pager_notification.value);
+        if (pressure_) {
+            shared_.store(PagerStagingRegionSlot, staging_region.value);
+            shared_.store(PagerRegionSlot, pager_region.value);
+        }
 
         myos_cap_t upcall_stacks[VprocCount]{};
-        for (myos_word_t index = 0; index < VprocCount; ++index) {
+        for (myos_word_t index = 0; index < active_vprocs; ++index) {
             const myos_word_t stack_index =
                 thread_count_ + 3 * index + 2;
             const auto delegated = myos::cap_delegate(
@@ -841,14 +953,19 @@ private:
             for (myos_word_t argument = 2; argument < 6; ++argument) {
                 starts[index].arguments[argument] = 0;
             }
+            /*luna change: pass pressure authorities through Thread0's existing actor-local arguments, reason: the handoff avoids new shared capability slots or ABI fields and is not worker state*/
+            if (pressure_ && index == 0) {
+                starts[index].arguments[2] = stress_region.value;
+                starts[index].arguments[3] = stress_memory.value;
+            }
             starts[index].ipc.memory = stack_memory_[index];
             starts[index].ipc.page = 0;
             starts[index].ipc.address = stack_bases_[index];
             starts[index].ipc.pages = 1;
         }
         const myos_word_t channel_stack_base =
-            thread_count_ + 3 * VprocCount + EndpointActivations;
-        for (myos_word_t index = 0; index < ChannelThreadCount; ++index) {
+            thread_count_ + 3 * active_vprocs + active_endpoints;
+        for (myos_word_t index = 0; index < active_channels; ++index) {
             const myos_word_t descriptor_index = thread_count_ + index;
             const myos_word_t stack_index = channel_stack_base + index;
             starts[descriptor_index].version = MYOS_THREAD_START_VERSION;
@@ -870,9 +987,9 @@ private:
         }
         /*luna change: add one ordinary proof worker with its own registered IPC page, reason: Pager service calls must be exercised by a real blocking Thread and never by a Vproc runtime stack*/
         const myos_word_t worker_descriptor = thread_count_
-            + ChannelThreadCount;
+            + active_channels;
         const myos_word_t worker_stack = thread_count_
-            + 3 * VprocCount + EndpointActivations + ChannelThreadCount;
+            + 3 * active_vprocs + active_endpoints + active_channels;
         starts[worker_descriptor].version = MYOS_THREAD_START_VERSION;
         starts[worker_descriptor].flags = 0;
         starts[worker_descriptor].entry = entry;
@@ -887,7 +1004,7 @@ private:
         starts[worker_descriptor].ipc.page = 0;
         starts[worker_descriptor].ipc.address = stack_bases_[worker_stack];
         starts[worker_descriptor].ipc.pages = 1;
-        for (myos_word_t index = 0; index < VprocCount; ++index) {
+        for (myos_word_t index = 0; index < active_vprocs; ++index) {
             auto* const vproc_start =
                 reinterpret_cast<myos_vproc_start*>(
                     ScratchAddress + VprocDescriptorOffset
@@ -943,65 +1060,69 @@ private:
             arm->stack_top = stack_tops_[upcall_stack];
         }
 
-        const myos_word_t endpoint_stack =
-            thread_count_ + 3 * VprocCount;
-        myos_cap_t endpoint_ipc_region{};
-        if (!create_memory(
-                PageSize, MYOS_VM_READ | MYOS_VM_WRITE, endpoint_ipc_memory_)
-            || !make_region(
-                child_vspace_, EndpointIpcAddress, PageSize,
-                MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP,
-                endpoint_ipc_region)
-            || !children_.add(endpoint_ipc_region)
-            || !map(
-                endpoint_ipc_region, endpoint_ipc_memory_,
-                EndpointIpcAddress, PageSize,
-                MYOS_VM_READ | MYOS_VM_WRITE)) {
-            return false;
-        }
-        auto* const endpoint_desc =
-            reinterpret_cast<myos_endpoint_desc*>(
-                ScratchAddress + EndpointDescriptorOffset);
-        endpoint_desc->version = MYOS_ENDPOINT_VERSION;
-        endpoint_desc->flags = MYOS_ENDPOINT_FLAGS_NONE;
-        endpoint_desc->entry = entry;
-        endpoint_desc->code_memory = code_memory_;
-        endpoint_desc->code_page = 0;
-        endpoint_desc->code_address = code_address_;
-        endpoint_desc->code_pages = 1;
-        endpoint_desc->stack_memory = stack_memory_[endpoint_stack];
-        endpoint_desc->stack_page = 0;
-        endpoint_desc->stack_address = stack_bases_[endpoint_stack];
-        endpoint_desc->stack_pages = StackSize / PageSize;
-        endpoint_desc->stack_stride = StackSize;
-        endpoint_desc->ipc.memory = endpoint_ipc_memory_;
-        endpoint_desc->ipc.page = 0;
-        endpoint_desc->ipc.address = EndpointIpcAddress;
-        endpoint_desc->ipc.pages = 1;
-        endpoint_desc->ipc_stride = PageSize;
-        endpoint_desc->activation_count = EndpointActivations;
-        endpoint_desc->queue_capacity = 2;
-        endpoint_desc->max_depth = 4;
-        endpoint_desc->budget_floor_ns = 1'000;
-        endpoint_desc->urgency_ceiling = 30;
+        if (!pressure_) {
+            const myos_word_t endpoint_stack =
+                thread_count_ + 3 * active_vprocs;
+            myos_cap_t endpoint_ipc_region{};
+            if (!create_memory(
+                    PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE,
+                    endpoint_ipc_memory_)
+                || !make_region(
+                    child_vspace_, EndpointIpcAddress, PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP,
+                    endpoint_ipc_region)
+                || !children_.add(endpoint_ipc_region)
+                || !map(
+                    endpoint_ipc_region, endpoint_ipc_memory_,
+                    EndpointIpcAddress, PageSize,
+                    MYOS_VM_READ | MYOS_VM_WRITE)) {
+                return false;
+            }
+            auto* const endpoint_desc =
+                reinterpret_cast<myos_endpoint_desc*>(
+                    ScratchAddress + EndpointDescriptorOffset);
+            endpoint_desc->version = MYOS_ENDPOINT_VERSION;
+            endpoint_desc->flags = MYOS_ENDPOINT_FLAGS_NONE;
+            endpoint_desc->entry = entry;
+            endpoint_desc->code_memory = code_memory_;
+            endpoint_desc->code_page = 0;
+            endpoint_desc->code_address = code_address_;
+            endpoint_desc->code_pages = 1;
+            endpoint_desc->stack_memory = stack_memory_[endpoint_stack];
+            endpoint_desc->stack_page = 0;
+            endpoint_desc->stack_address = stack_bases_[endpoint_stack];
+            endpoint_desc->stack_pages = StackSize / PageSize;
+            endpoint_desc->stack_stride = StackSize;
+            endpoint_desc->ipc.memory = endpoint_ipc_memory_;
+            endpoint_desc->ipc.page = 0;
+            endpoint_desc->ipc.address = EndpointIpcAddress;
+            endpoint_desc->ipc.pages = 1;
+            endpoint_desc->ipc_stride = PageSize;
+            endpoint_desc->activation_count = EndpointActivations;
+            endpoint_desc->queue_capacity = 2;
+            endpoint_desc->max_depth = 4;
+            endpoint_desc->budget_floor_ns = 1'000;
+            endpoint_desc->urgency_ceiling = 30;
 
-        const auto endpoint = myos::endpoint_create(
-            pool_, child_vspace_, child_cspace_, descriptors,
-            EndpointDescriptorOffset);
-        if (endpoint.status != MYOS_STATUS_OK
-            || !children_.add(endpoint.value)) {
-            return false;
+            const auto endpoint = myos::endpoint_create(
+                pool_, child_vspace_, child_cspace_, descriptors,
+                EndpointDescriptorOffset);
+            if (endpoint.status != MYOS_STATUS_OK
+                || !children_.add(endpoint.value)) {
+                return false;
+            }
+            const auto caller = myos::endpoint_mint(
+                endpoint.value,
+                child_cspace_,
+                EndpointBadge,
+                1,
+                MYOS_RIGHT_CALL);
+            if (caller.status != MYOS_STATUS_OK) {
+                return false;
+            }
+            shared_.store(EndpointSlot, caller.value);
         }
-        const auto caller = myos::endpoint_mint(
-            endpoint.value,
-            child_cspace_,
-            EndpointBadge,
-            1,
-            MYOS_RIGHT_CALL);
-        if (caller.status != MYOS_STATUS_OK) {
-            return false;
-        }
-        shared_.store(EndpointSlot, caller.value);
 
         if (!committed(myos::vm_unmap(
                 scratch_region_, ScratchAddress, PageSize))) {
@@ -1036,7 +1157,7 @@ private:
             targets[index] = thread.value;
         }
 
-        for (myos_word_t index = 0; index < ChannelThreadCount; ++index) {
+        for (myos_word_t index = 0; index < active_channels; ++index) {
             const myos_word_t step = 130 + index * 5;
             const myos_word_t descriptor_index = thread_count_ + index;
             stage_ = step;
@@ -1087,7 +1208,7 @@ private:
         }
         targets[worker_descriptor] = worker.value;
 
-        for (myos_word_t index = 0; index < VprocCount; ++index) {
+        for (myos_word_t index = 0; index < active_vprocs; ++index) {
             stage_ = 140 + index * 5;
             myos::SysResult vproc{};
             for (;;) {
@@ -1122,13 +1243,13 @@ private:
                 return false;
             }
             targets[
-                thread_count_ + ChannelThreadCount + PagerWorkerCount + index]
+                thread_count_ + active_channels + PagerWorkerCount + index]
                 = vproc.value;
         }
 
         for (myos_word_t index = 0;
-             index < thread_count_ + ChannelThreadCount + PagerWorkerCount
-                 + VprocCount;
+             index < thread_count_ + active_channels + PagerWorkerCount
+                 + active_vprocs;
              ++index) {
             stage_ = 160 + index;
             if (myos::execution_start(targets[index]).status
@@ -1207,7 +1328,8 @@ private:
                 }
             }
             if (all_ready) {
-                return shared_.load(EndpointResultSlot) == EndpointTransfer;
+                return pressure_
+                    || shared_.load(EndpointResultSlot) == EndpointTransfer;
             }
             if (!observe()) {
                 return false;
@@ -1218,16 +1340,117 @@ private:
 
     /*luna change: wait on the pager proof's published barriers, reason: init observes the real Thread/Vproc completion edges without steering Pager state*/
     [[nodiscard]] auto exercise_pager() noexcept -> bool {
-        while (shared_.load(PagerThreadSlot) != PagerThreadDone
-            || shared_.load(PagerWorkerSlot) != PagerWorkerSupplied
-            || shared_.load(PagerVprocSlot) != PagerVprocDone) {
+        /*luna change: select completion barriers from the frozen mode,
+          reason: ordinary E1 waits only for its original PageIn/coalesce lane
+          while pressure mode additionally waits for reclaim and writeback*/
+        const myos_word_t thread_done = pressure_
+            ? PagerThreadPressureReleased
+            : PagerThreadDone;
+        const myos_word_t worker_done = pressure_
+            ? PagerWorkerWritebackDone
+            : PagerWorkerSupplied;
+        const myos_word_t vproc_done = pressure_
+            ? PagerVprocDirtyRetryDone
+            : PagerVprocDone;
+        /*luna change: snapshot the Pager lane before pressure waiting, reason: a local actor-cell clock must ignore unrelated aggregate progress while ordinary E1 keeps its generic observer*/
+        myos_word_t pager_thread{};
+        myos_word_t pager_worker{};
+        myos_word_t pager_vproc{};
+        myos_word_t pager_last_tick{};
+        bool pager_clock_ready{};
+        if (pressure_) {
+            pager_thread = shared_.load(PagerThreadSlot);
+            pager_worker = shared_.load(PagerWorkerSlot);
+            pager_vproc = shared_.load(PagerVprocSlot);
+            if (observe_enabled_) {
+                const auto now = myos::clock_now();
+                if (now.status == MYOS_STATUS_OK) {
+                    pager_last_tick = now.value;
+                    pager_clock_ready = true;
+                }
+            }
+        }
+        while (shared_.load(PagerThreadSlot) != thread_done
+            || shared_.load(PagerWorkerSlot) != worker_done
+            || shared_.load(PagerVprocSlot) != vproc_done) {
             /*luna change: surface the first proof-only TargetVproc gate failure immediately, reason: a compact detail code is diagnostic projection and must not wait for the watchdog*/
             const myos_word_t detail = shared_.load(PagerDetailSlot);
             if (detail != 0) {
                 diagnostic_code_ = 0x4000'0000 | (detail & 0xff);
                 return false;
             }
-            if (!observe()) {
+            bool stalled{};
+            if (pressure_) {
+                const myos_word_t thread_state =
+                    shared_.load(PagerThreadSlot);
+                const myos_word_t worker_state =
+                    shared_.load(PagerWorkerSlot);
+                const myos_word_t vproc_state =
+                    shared_.load(PagerVprocSlot);
+                const bool progressed = thread_state != pager_thread
+                    || worker_state != pager_worker
+                    || vproc_state != pager_vproc;
+                if (progressed) {
+                    pager_thread = thread_state;
+                    pager_worker = worker_state;
+                    pager_vproc = vproc_state;
+                }
+                const auto now = myos::clock_now();
+                if (now.status != MYOS_STATUS_OK || !observe_enabled_) {
+                    pager_clock_ready = false;
+                    stalled = !observe();
+                } else if (!pager_clock_ready || progressed) {
+                    pager_last_tick = now.value;
+                    pager_clock_ready = true;
+                } else if (now.value >= pager_last_tick
+                    && now.value - pager_last_tick >= observe_hard_ticks_) {
+                    stalled = true;
+                }
+            } else {
+                stalled = !observe();
+            }
+            if (stalled) {
+                /*luna change: pack the three Pager actor phases into the local
+                  timeout projection, reason: the single-writer cells locate
+                  pressure progress without changing waits or generic diagnostics*/
+                const myos_word_t thread_state =
+                    shared_.load(PagerThreadSlot);
+                const myos_word_t worker_state =
+                    shared_.load(PagerWorkerSlot);
+                const myos_word_t vproc_state =
+                    shared_.load(PagerVprocSlot);
+                const myos_word_t thread_phase =
+                    thread_state == PagerThreadFaulting ? 1
+                    : thread_state == PagerThreadDone ? 2
+                    : thread_state == PagerThreadCleanRetryDone ? 3
+                    : thread_state == PagerThreadDirtyReady ? 4
+                    : thread_state == PagerThreadPressureReleased ? 5
+                    : 0;
+                const myos_word_t worker_phase =
+                    worker_state == PagerWorkerQueued ? 1
+                    : worker_state == PagerWorkerClaimed ? 2
+                    : worker_state == PagerWorkerSupplied ? 3
+                    : worker_state == PagerWorkerMapAccepted ? 4
+                    : worker_state == PagerWorkerWritten ? 5
+                    : worker_state == PagerWorkerPrepared ? 6
+                    : worker_state == PagerWorkerWritebackClaimed ? 7
+                    : worker_state == PagerWorkerWritebackDone ? 8
+                    : 0;
+                const myos_word_t vproc_phase =
+                    vproc_state == PagerVprocFaulting ? 1
+                    : vproc_state == PagerVprocPending ? 2
+                    : vproc_state == PagerVprocDone ? 3
+                    : vproc_state == PagerVprocDirtyRetryDone ? 4
+                    : 0;
+                diagnostic_code_ = 0x5000'0000
+                    | (thread_phase << 16)
+                    | (worker_phase << 8)
+                    | vproc_phase;
+                shared_.progress(
+                    ProgressActor::Coordinator,
+                    ProgressStage::Failed,
+                    ProgressWait::None,
+                    diagnostic_code_);
                 return false;
             }
             myos::yield();
@@ -1309,16 +1532,28 @@ private:
     myos_cap_t parent_pool_{};
     myos_word_t bundle_size_{};
     myos_word_t thread_count_{};
+    /*luna change: retain the parsed root-role mode for one-way construction gates, reason: init must not infer pressure semantics from child progress*/
+    bool pressure_{};
     myos_cap_t pool_{};
     myos_cap_t child_vspace_{};
     myos_cap_t child_cspace_{};
     myos_cap_t bundle_region_{};
     myos_cap_t scratch_region_{};
     myos_cap_t shared_memory_{};
-    /*luna change: retain only source Pager capabilities and keep target region local, reason: child delegation is explicit while region lifetime remains in the existing Handles reverse-close path*/
+    /*luna change: retain Pager transport and exact region capabilities,
+      reason: child delegation must preserve the AddressRegion authority that
+      directly owns PagerAddress while Handles retains reverse-close lifetime*/
     myos_cap_t pager_{};
     myos_cap_t target_memory_{};
+    myos_cap_t pager_region_{};
     myos_cap_t staging_memory_{};
+    /*luna change: retain the worker's initially-unmapped source region,
+      reason: children_ must keep its capability alive across later formal
+      staging rematerialization*/
+    myos_cap_t staging_region_{};
+    /*luna change: retain the pressure Region and anonymous object for the existing Thread start handoff, reason: one child-owned authority pair must survive every bounded remap without a second truth source*/
+    myos_cap_t stress_memory_{};
+    myos_cap_t stress_region_{};
     myos_cap_t pager_notification_{};
     myos_cap_t notification_{};
     myos_cap_t vproc_notification_{};

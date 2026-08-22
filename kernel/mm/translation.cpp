@@ -541,6 +541,13 @@ void TranslationView::activate(kernel::CpuLocal& cpu) const noexcept {
     if (outgoing == state_) {
         KASSERT(cpu.active_root_ && cpu.active_root_ == root_);
         const TranslationObservation observed = state_->observation();
+        KASSERT(cpu.observed_epoch_.raw <= observed.translation.raw);
+        /*luna change: flush before advancing a same-root observation, reason:
+          a CPU absent from active targets may retain an evicted PTE until its
+          next activation observes the committed translation epoch*/
+        if (cpu.observed_epoch_.raw < observed.translation.raw) {
+            arch::flush_tlb_all();
+        }
         cpu.observed_epoch_ = observed.translation;
         if (cpu.observed_instruction_epoch_.raw
             < observed.instruction.raw) {

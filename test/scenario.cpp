@@ -24,6 +24,8 @@ auto run(
     case diag::scenario::Id::ReportRetry:
     case diag::scenario::Id::Dispatch:
     case diag::scenario::Id::Observer:
+    /*luna change: keep pressure selection runtime-only, reason: frame holding must occur after root-pool admission rather than during boot validation*/
+    case diag::scenario::Id::Pressure:
         // These scenarios need a published CpuRuntime and run from the
         // runtime hook below. Selection itself is validated before bring-up.
         return true;
@@ -43,6 +45,9 @@ auto run_runtime(
         return detail::dispatch(runtime);
     case diag::scenario::Id::Observer:
         return detail::observer(runtime);
+    /*luna change: route pressure selection through the existing runtime hook, reason: frame holding must happen after root admission and before user execution*/
+    case diag::scenario::Id::Pressure:
+        return detail::pressure(runtime);
     case diag::scenario::Id::Trap:
         return detail::trap(runtime);
     case diag::scenario::Id::RemoteDelivery:
@@ -53,6 +58,13 @@ auto run_runtime(
         return true;
     }
     return false;
+}
+
+auto page_fault(CpuRuntime& runtime, mm::VirtAddr address) noexcept -> bool {
+    if (diag::scenario::selected != diag::scenario::Id::Pressure) {
+        return true;
+    }
+    return detail::page_fault(runtime, address);
 }
 
 } // namespace kernel::test::scenario

@@ -338,6 +338,10 @@ void VSpace::dismantle_region(
                     authority.pages_.erase(*page);
                     const auto virtual_page = VPage::from_base(page->address_);
                     KASSERT(virtual_page);
+                    /*luna change: fold region teardown usage before PTE loss,
+                      reason: PageSlot remains the sole dirty truth*/
+                    auto folded = fold_usage(*page, editor);
+                    KASSERT(folded);
                     auto unmapped = editor.unmap(*virtual_page);
                     KASSERT(unmapped);
                     while (auto table = unmapped.value().tables.take()) {

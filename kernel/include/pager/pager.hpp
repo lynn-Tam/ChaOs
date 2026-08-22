@@ -54,12 +54,22 @@ struct PagerAttachment final {
     // the transport edge.  It reports only the MemoryObject owner edge.
     using Transition = bool (*)(void*, const Request&, Event) noexcept;
     using Drained = void (*)(void*) noexcept;
+    /*luna change: expose one narrow producer-ready edge, reason: kernel
+      transport capacity must wake the existing owner executor without using
+      the userspace notification*/
+    using Ready = void (*)(void*) noexcept;
 
     libk::IntrusiveListHook hook_{};
+    /*luna change: index one producer waiting for transport capacity, reason:
+      Pager is the sole slot-capacity owner and can wake MemoryExecutor O(1)*/
+    libk::IntrusiveListHook capacity_hook_{};
 
     void* context{};
     Transition transition{};
     Drained drained{};
+    /*luna change: keep the producer callback on the existing attachment,
+      reason: capacity waiters borrow the established attachment lifetime*/
+    Ready ready{};
     u64 generation{};
     u32 leases{};
     enum class State : u8 {
@@ -69,7 +79,10 @@ struct PagerAttachment final {
     } state{State::Detached};
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
-        return context != nullptr && transition != nullptr && drained != nullptr;
+        /*luna change: require an exact producer wake edge for attachment
+          admission, reason: a Full publication must never strand owner work*/
+        return context != nullptr && transition != nullptr
+            && drained != nullptr && ready != nullptr;
     }
 };
 
@@ -299,6 +312,9 @@ private:
         -> libk::Expected<void, Error>;
     [[nodiscard]] auto view(const Slot& slot, u16 index) const noexcept
         -> Request;
+    /*luna change: wake one capacity waiter through an attachment lease,
+      reason: producer retry is bounded and foreign callbacks stay lock-free*/
+    void wake_capacity() noexcept;
 
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Pager>
         lock_{};
@@ -312,6 +328,11 @@ private:
     using Attachments = libk::IntrusiveList<
         PagerAttachment, &PagerAttachment::hook_>;
     Attachments attachments_{};
+    using CapacityWaiters = libk::IntrusiveList<
+        PagerAttachment, &PagerAttachment::capacity_hook_>;
+    /*luna change: derive capacity waiters from attachment ownership, reason:
+      slot capacity needs O(1) wake without a second request record*/
+    CapacityWaiters capacity_waiters_{};
     object::ObjectCleanup cleanup_{};
 };
 

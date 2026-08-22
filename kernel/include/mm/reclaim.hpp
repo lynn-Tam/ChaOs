@@ -69,9 +69,9 @@ private:
 /*luna change: classify one bounded reclaim pass, reason: scheduler activity
   cannot stand in for a candidate or real frame progress fact*/
 enum class ReclaimResult : u8 {
-    Exhausted,
-    Candidate,
-    InFlight,
+    Idle,
+    More,
+    Wait,
     Progress,
 };
 
@@ -118,8 +118,8 @@ public:
         usize capacity) noexcept -> usize;
 private:
     using RelationList = libk::IntrusiveList<WaitRelation, &WaitRelation::hook_>;
-    /*luna change: keep one round-robin object relation beside pressure
-      relations, reason: candidate admission must remain a derived index*/
+    /*luna change: delimit one object pass with its cursor anchor, reason:
+      terminal exhaustion is valid only after every retained object is idle*/
     using ObjectList = libk::IntrusiveList<
         ReclaimEntry, &ReclaimEntry::hook>;
 
@@ -130,6 +130,8 @@ private:
         lock_{};
     ObjectList objects_{};
     ReclaimEntry* object_cursor_{};
+    ReclaimEntry* round_start_{};
+    bool round_done_{};
     RelationList relations_{};
     WaitRelation* cursor_{};
     Notifier notifier_{};

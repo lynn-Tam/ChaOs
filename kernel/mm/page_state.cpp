@@ -358,13 +358,17 @@ auto PageSlot::retry() noexcept -> libk::Expected<void, PageStateError> {
 
 auto PageSlot::mark_dirty(u64 epoch) noexcept
     -> libk::Expected<void, PageStateError> {
+    /*luna change: preserve terminal writeback failure while advancing dirty
+      epoch, reason: later A/D fold updates canonical usage without inventing
+      a retryable ResidentDirty state*/
     if ((state != PageSlotState::ResidentClean
             && state != PageSlotState::ResidentDirty
             && state != PageSlotState::WritebackQueued
             && state != PageSlotState::WritebackPublishing
             && state != PageSlotState::WritebackPublished
             && state != PageSlotState::WritebackActive
-            && state != PageSlotState::WritebackCompleting)
+            && state != PageSlotState::WritebackCompleting
+            && state != PageSlotState::WritebackFailed)
         || epoch == 0) {
         return libk::unexpected(PageStateError::InvalidTransition);
     }

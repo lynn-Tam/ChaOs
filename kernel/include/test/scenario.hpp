@@ -2,6 +2,8 @@
 
 #include <boot/boot_info.hpp>
 #include <diag/scenario.hpp>
+#include <mm/addr.hpp>
+#include <uapi/test_scenario.h>
 
 namespace kernel {
 struct CpuRuntime;
@@ -17,6 +19,8 @@ namespace kernel::test::scenario {
 [[nodiscard]] auto run_runtime(
     diag::scenario::Id selected,
     CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto page_fault(CpuRuntime& runtime, mm::VirtAddr address) noexcept
+    -> bool;
 
 namespace detail {
 [[nodiscard]] auto remote(CpuRuntime& runtime) noexcept -> bool;
@@ -30,6 +34,10 @@ namespace detail {
 [[nodiscard]] auto trap(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto dispatch(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto observer(CpuRuntime& runtime) noexcept -> bool;
+/*luna change: expose the pressure-only PMM fixture entry, reason: runtime setup must remain a scenario-owned test boundary*/
+[[nodiscard]] auto pressure(CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto page_fault(CpuRuntime& runtime, mm::VirtAddr address) noexcept
+    -> bool;
 } // namespace detail
 
 } // namespace kernel::test::scenario

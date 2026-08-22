@@ -45,6 +45,22 @@ public:
             ? Bytes{data_ + offset, size}
             : Bytes{};
     }
+    /*luna change: centralize bounded manifest-name comparison, reason: root-role and module lookup must share one exact C-string name invariant*/
+    [[nodiscard]] auto equals(const char* name) const noexcept -> bool {
+        size_t length{};
+        while (name[length] != '\0') {
+            ++length;
+        }
+        if (size_ != length) {
+            return false;
+        }
+        for (size_t index = 0; index < length; ++index) {
+            if (data_[index] != static_cast<uint8_t>(name[index])) {
+                return false;
+            }
+        }
+        return true;
+    }
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
         return data_ != nullptr;
     }
@@ -186,6 +202,11 @@ public:
     [[nodiscard]] auto root_index() const noexcept -> size_t {
         return root_index_;
     }
+    /*luna change: compare the selected root role without Loader byte parsing, reason: pressure mode is encoded by the existing bundle root role*/
+    [[nodiscard]] auto root_is(const char* name) const noexcept -> bool {
+        Module root{};
+        return module(root_index_, root) && root.name().equals(name);
+    }
     [[nodiscard]] auto module(size_t index, Module& out) const noexcept
         -> bool {
         if (index >= module_count_) {
@@ -235,27 +256,16 @@ public:
         out = decoded;
         return true;
     }
+    /*luna change: reuse the manifest-name comparison for module lookup, reason: all role selection must enforce the same exact bounded name rule*/
     [[nodiscard]] auto find(const char* name, Module& out) const noexcept
         -> bool {
-        size_t length{};
-        while (name[length] != '\0') {
-            ++length;
-        }
         for (size_t index = 0; index < module_count_; ++index) {
             Module candidate{};
-            if (!module(index, candidate) || candidate.name().size() != length) {
+            if (!module(index, candidate) || !candidate.name().equals(name)) {
                 continue;
             }
-            size_t position{};
-            while (position < length
-                && candidate.name().data()[position]
-                    == static_cast<uint8_t>(name[position])) {
-                ++position;
-            }
-            if (position == length) {
-                out = candidate;
-                return true;
-            }
+            out = candidate;
+            return true;
         }
         return false;
     }

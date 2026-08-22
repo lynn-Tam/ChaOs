@@ -1004,6 +1004,15 @@ auto Pmm::state_of(Page page) const noexcept -> QueryResult {
         descriptor_at(*arena, index_of(*arena, page)).state));
 }
 
+auto Pmm::page_count() const noexcept -> size_t {
+    kernel::sync::IrqLockGuard guard{lock_};
+    size_t count = 0;
+    for (const auto& arena : arenas_) {
+        count += arena.range.page_count();
+    }
+    return count;
+}
+
 auto Pmm::free_page_count() const noexcept -> size_t {
     kernel::sync::IrqLockGuard guard{lock_};
     size_t count = 0;

@@ -131,17 +131,31 @@ core_kernel_sources = files(
 )
 
 core = static_library('kernel-core', arch_sources + core_kernel_sources, c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
+concurrency_sources = files(
+  'kernel/diag/config.cpp', 'kernel/diag/concurrency.cpp',
+  'kernel/diag/flight.cpp', 'kernel/diag/report.cpp',
+  'kernel/diag/watch.cpp',
+)
 concurrency_off = static_library(
   'kernel-concurrency-off',
-  files('kernel/diag/config.cpp', 'kernel/diag/concurrency.cpp', 'kernel/diag/flight.cpp', 'kernel/diag/report.cpp', 'kernel/diag/watch.cpp'),
+  concurrency_sources,
   c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=0'], pic: false,
 )
 concurrency = concurrency_off
 if concurrency_diag_level != 0
   concurrency = static_library(
     'kernel-concurrency',
-    files('kernel/diag/config.cpp', 'kernel/diag/concurrency.cpp', 'kernel/diag/flight.cpp', 'kernel/diag/report.cpp', 'kernel/diag/watch.cpp'),
+    concurrency_sources,
     c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false, build_by_default: false,
+  )
+endif
+concurrency_trace = concurrency
+if concurrency_diag_level != 2
+  concurrency_trace = static_library(
+    'kernel-concurrency-trace', concurrency_sources,
+    c_args: kernel_c_args,
+    cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=2'],
+    pic: false, build_by_default: false,
   )
 endif
 lock_off = static_library(
@@ -155,6 +169,16 @@ if lock_diag_level != 0 or concurrency_diag_level != 0
     cpp_args: kernel_cpp_args + ['-DMYOS_LOCK_DIAG=' + lock_diag_level.to_string(), '-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false, build_by_default: false,
   )
 endif
+lock_trace = lock
+if lock_diag_level != 2 or concurrency_diag_level != 2
+  lock_trace = static_library(
+    'kernel-lock-trace', files('kernel/sync/lock.cpp'),
+    c_args: kernel_c_args,
+    cpp_args: kernel_cpp_args
+      + ['-DMYOS_LOCK_DIAG=2', '-DMYOS_CONCURRENCY_DIAG=2'],
+    pic: false, build_by_default: false,
+  )
+endif
 console = static_library('kernel-console', files('kernel/diag/console.cpp'), c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 report_off = static_library(
   'kernel-report-off', files('kernel/diag/report_drain.cpp'), c_args: kernel_c_args,
@@ -165,6 +189,15 @@ if concurrency_diag_level != 0
   report = static_library(
     'kernel-report', files('kernel/diag/report_drain.cpp'), c_args: kernel_c_args,
     cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string()], pic: false, build_by_default: false,
+  )
+endif
+report_trace = report
+if concurrency_diag_level != 2
+  report_trace = static_library(
+    'kernel-report-trace', files('kernel/diag/report_drain.cpp'),
+    c_args: kernel_c_args,
+    cpp_args: kernel_cpp_args + ['-DMYOS_CONCURRENCY_DIAG=2'],
+    pic: false, build_by_default: false,
   )
 endif
 panic_off = static_library(
@@ -183,6 +216,18 @@ if get_option('panic_probe') != 0 or lock_diag_level != 0 or concurrency_diag_le
       '-DMYOS_PANIC_PROBE=' + get_option('panic_probe').to_string(),
       '-DMYOS_LOCK_DIAG=' + lock_diag_level.to_string(),
       '-DMYOS_CONCURRENCY_DIAG=' + concurrency_diag_level.to_string(),
+    ], pic: false, build_by_default: false,
+  )
+endif
+panic_trace = panic
+if lock_diag_level != 2 or concurrency_diag_level != 2
+  panic_trace = static_library(
+    'kernel-panic-trace', files('kernel/diag/panic.cpp'),
+    c_args: kernel_c_args,
+    cpp_args: kernel_cpp_args + [
+      '-DMYOS_PANIC_PROBE=' + get_option('panic_probe').to_string(),
+      '-DMYOS_LOCK_DIAG=2',
+      '-DMYOS_CONCURRENCY_DIAG=2',
     ], pic: false, build_by_default: false,
   )
 endif
@@ -211,7 +256,9 @@ test_off = static_library(
 test_sources = files(
   'test/boot.cpp', 'test/scenario_gate.cpp', 'test/framework.cpp', 'test/scenario.cpp',
   'test/scenario_basic.cpp', 'test/scenario_remote.cpp', 'test/scenario_publication.cpp',
-  'test/scenario_report.cpp', 'test/scenario_observer.cpp', 'test/libk_test.cpp',
+  'test/scenario_report.cpp', 'test/scenario_observer.cpp',
+  # /*luna change: compile the pressure fixture with the existing test module, reason: ordinary images keep the dormant storage while only the pressure image selects it*/
+  'test/scenario_pressure.cpp', 'test/libk_test.cpp',
   'test/sync_test.cpp', 'test/allocator_test.cpp', 'test/bootinfo_test.cpp',
   'test/boot_bundle_test.cpp', 'test/cpu_topology_test.cpp', 'test/sched_test.cpp',
   'test/cap_test.cpp', 'test/memory_test.cpp', 'test/translation_test.cpp',
@@ -237,6 +284,13 @@ if get_option('build_id') == 'auto'
   build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="-riscv64-kernel-lockoff-concoff"']
   debug_build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="' + image_suffix + '"']
 endif
+# /*luna change: give the pressure image its own concise build identity, reason: the selected provider is a separate image while explicit build IDs remain shared*/
+pressure_build_info_args = build_info_args
+pressure_trace_build_info_args = debug_build_info_args
+if get_option('build_id') == 'auto'
+  pressure_build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="-riscv64-pressure-lockoff-concoff"']
+  pressure_trace_build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="-riscv64-pressure-trace-locktrace-conctrace"']
+endif
 kernel = executable(
   'kernel.elf', build_info_source,
   c_args: kernel_c_args, cpp_args: build_info_args,
@@ -249,6 +303,31 @@ kernel_debug = executable(
   c_args: kernel_c_args, cpp_args: debug_build_info_args,
   link_whole: [core, concurrency, lock, console, report, panic, scenario, test_module],
   link_args: kernel_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'kernel_debug.map')],
+  link_language: 'c', build_by_default: false,
+)
+# /*luna change: compile the pressure selector as a separate provider, reason: kernel_debug keeps its existing scenario provider and link graph*/
+pressure_scenario = static_library(
+  'kernel-scenario-pressure', files('kernel/diag/scenario_real.cpp'),
+  c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + ['-DMYOS_SCENARIO_ID=9'],
+  pic: false, build_by_default: false,
+)
+# /*luna change: link a pressure-only image from shared core and test objects, reason: the physical fixture must not alter ordinary kernel_debug scenario selection or duplicate the object tree*/
+# The functional pressure gate keeps panic/assert, console, tests and the exact
+# pressure scenario while avoiding full recorder cost. The trace image below
+# changes providers only; both executables consume the same semantic archives.
+kernel_pressure = executable(
+  'kernel_pressure.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: pressure_build_info_args,
+  link_whole: [core, concurrency_off, lock_off, console, report_off, panic_off, pressure_scenario, test_module],
+  link_args: kernel_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'kernel_pressure.map')],
+  link_language: 'c', build_by_default: false,
+)
+kernel_pressure_trace = executable(
+  'kernel_pressure_trace.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: pressure_trace_build_info_args,
+  link_whole: [core, concurrency_trace, lock_trace, console, report_trace, panic_trace, pressure_scenario, test_module],
+  link_args: kernel_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'kernel_pressure_trace.map')],
   link_language: 'c', build_by_default: false,
 )
 
@@ -283,6 +362,11 @@ boot_bundle = custom_target(
   'boot-bundle', input: [init_user, proof_user, uart_user], output: 'boot.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
+# /*luna change: encode pressure mode in the existing root module role, reason: the same user images and kernel composition need an explicit guest-visible run condition*/
+pressure_bundle = custom_target(
+  'pressure-bundle', input: [init_user, proof_user, uart_user], output: 'pressure.bundle',
+  command: [bootpack, '@OUTPUT@', 'pressure', 'pressure=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+)
 proof_bundle = custom_target(
   'proof-bundle', input: proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
 )
@@ -298,10 +382,14 @@ audit_clang = files('tools/build/audit-clang.sh')
 run_qemu = files('tools/build/run-qemu.sh')
 artifact = files('tools/build/artifact.sh')
 
-run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, '0', core, concurrency_off, lock_off, console, report_off, panic_off, scenario_off, test_off])
-run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, concurrency_diag_level.to_string(), core, concurrency, lock, console, report, panic, scenario, test_module])
+run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, '0', 'none', core, concurrency_off, lock_off, console, report_off, panic_off, scenario_off, test_off])
+run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, concurrency_diag_level.to_string(), 'any', core, concurrency, lock, console, report, panic, scenario, test_module])
+run_target('audit-pressure-symbols', command: [sh, audit_symbols, nm, ar, kernel_pressure, '0', 'pressure', core, concurrency_off, lock_off, console, report_off, panic_off, pressure_scenario, test_module])
+run_target('audit-pressure-trace-symbols', command: [sh, audit_symbols, nm, ar, kernel_pressure_trace, '2', 'pressure', core, concurrency_trace, lock_trace, console, report_trace, panic_trace, pressure_scenario, test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
+run_target('audit-pressure-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure])
+run_target('audit-pressure-trace-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure_trace])
 run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, proof_user, uart_user])
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, concurrency_diag_level.to_string(), lock_diag_level.to_string(), get_option('panic_probe').to_string()])
 objdump = find_program('riscv64-unknown-elf-objdump')
@@ -312,7 +400,9 @@ run_target('debug-symbols', command: [sh, artifact, nm, 'symbols', kernel_debug,
 
 qemu = find_program('qemu-system-riscv64')
 timeout = get_option('qemu_timeout')
+pressure_timeout = get_option('qemu_pressure_timeout')
 smp = get_option('qemu_smp').to_string()
+pressure_memory = get_option('qemu_pressure_memory')
 run_target('run', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel])
 run_target('run-timeout', command: [sh, run_qemu, qemu, '3s', '1', kernel, 'timeout'])
 run_target('run-debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug])
@@ -321,6 +411,10 @@ run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_de
 if profile == 'proof'
   run_target('run-proof-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'root init: started', 'user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1', '--initrd', proof_bundle])
   run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', boot_bundle])
+  # /*luna change: route pressure through its root role, watchdog and fixture image, reason: one explicit A-to-A' run condition keeps ordinary E1 unchanged while exercising the physical PMM floor*/
+  run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'timeout', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', 'user: contained fault address=0xe100', '--initrd', pressure_bundle])
+  # Full trace is an explicit diagnostic observation, not the functional gate.
+  run_target('run-pressure-trace-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure_trace, 'timeout', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--initrd', pressure_bundle])
 endif
 if get_option('panic_probe') == 1
   run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'MYOS KERNEL PANIC', 'context: call-site', 'expression: false'])
@@ -358,4 +452,7 @@ endif
 
 alias_target('kernel', kernel)
 alias_target('kernel-debug', kernel_debug)
-alias_target('bundle', [boot_bundle, proof_bundle, uart_user])
+# /*luna change: expose the pressure image without changing ordinary aliases, reason: build and audit selection must remain explicit for the physical fixture*/
+alias_target('kernel-pressure', kernel_pressure)
+alias_target('kernel-pressure-trace', kernel_pressure_trace)
+alias_target('bundle', [boot_bundle, pressure_bundle, proof_bundle, uart_user])

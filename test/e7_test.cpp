@@ -155,6 +155,17 @@ bool pager_attachment_finish(
 
 void pager_attachment_release(void*) noexcept {}
 
+/*luna change: make focused Pager attachments satisfy producer admission,
+  reason: every attached producer must expose the exact capacity wake edge*/
+void pager_attachment_ready(void*) noexcept {}
+
+/*luna change: count one producer-ready delivery in the focused capacity test,
+  reason: the derived waiter must wake exactly once after one real slot frees*/
+void pager_capacity_ready(void* context) noexcept {
+    auto* const count = static_cast<usize*>(context);
+    ++*count;
+}
+
 struct PagerTransition final {
     kernel::pager::Pager* pager{};
     kernel::pager::PagerAttachment* attachment{};
@@ -199,12 +210,16 @@ struct PagerTransition final {
 
 bool test_pager_admitted_claim_completes_while_closing(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager, .close_claim = true};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -227,13 +242,17 @@ bool test_pager_admitted_claim_completes_while_closing(
 
 bool test_pager_claim_owner_rejection_stays_queued(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager, .reject_claim = true};
     kernel::ipc::Notification notification{};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -251,12 +270,16 @@ bool test_pager_claim_owner_rejection_stays_queued(
 
 bool test_pager_force_during_claim_compensates_owner(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager, .force_claim = true};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -274,12 +297,16 @@ bool test_pager_force_during_claim_compensates_owner(
 
 bool test_pager_force_during_requeue_compensates_owner(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager, .force_requeue = true};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -300,7 +327,8 @@ bool test_pager_force_during_requeue_compensates_owner(
 
 bool test_pager_requeue_rescans_late_forced(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{
         .pager = &pager,
         .detach_requeue = true,
@@ -310,6 +338,9 @@ bool test_pager_requeue_rescans_late_forced(
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -331,12 +362,16 @@ bool test_pager_requeue_rescans_late_forced(
 
 bool test_pager_detach_aborts_exact_reply(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -360,12 +395,16 @@ bool test_pager_detach_aborts_exact_reply(
 
 bool test_pager_force_drains_unleased_claims(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     PagerTransition transition{.pager = &pager};
     kernel::pager::PagerAttachment attachment{
         .context = &transition,
         .transition = &PagerTransition::run,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -496,7 +535,8 @@ bool test_typed_writeback_delivery_rejects_stale_claim(
 
 bool test_pager_force_close_waits_for_claim_lease(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     const auto published = pager.publish(
         kernel::mm::PageKey{4, 2}, 2, 1, 1);
     if (!published) {
@@ -525,12 +565,16 @@ bool test_pager_force_close_waits_for_claim_lease(
 
 bool test_pager_detach_invalidates_new_claim_leases(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     u8 context{};
     kernel::pager::PagerAttachment attachment{
         .context = &context,
         .transition = &pager_attachment_finish,
         .drained = &pager_attachment_release,
+        /*luna change: provide the mandatory capacity callback in this fixture,
+          reason: Full publication must never create an un-wakeable producer*/
+        .ready = &pager_attachment_ready,
     };
     auto detach = libk::on_scope_exit([&]() noexcept {
         if (attachment.state != kernel::pager::PagerAttachment::State::Detached) {
@@ -712,7 +756,8 @@ bool test_page_request_bounded_multiwaiter_drain(
 
 bool test_writeback_queue_full_retains_obligation(
     const TestContext&) noexcept {
-    kernel::pager::Pager pager{};
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
     for (usize index = 0; index < kernel::pager::max_requests; ++index) {
         if (!pager.publish(
                 kernel::mm::PageKey{index + 1, index}, index, 1, index + 1)) {
@@ -747,6 +792,48 @@ bool test_writeback_queue_full_retains_obligation(
         return false;
     }
     return true;
+}
+
+/*luna change: cover the Pager capacity waiter lifetime, reason: a Full
+  producer must link once and receive one exact wake after queued cancellation*/
+bool test_pager_capacity_waiter_wakes_once(
+    const TestContext&) noexcept {
+    auto& pager = e7_pager.emplace();
+    PagerReset reset{};
+    usize wakes{};
+    kernel::pager::PagerAttachment attachment{
+        .context = &wakes,
+        .transition = &pager_attachment_finish,
+        .drained = &pager_attachment_release,
+        .ready = &pager_capacity_ready,
+    };
+    if (!pager.attach(attachment)) {
+        return false;
+    }
+    kernel::pager::RequestKey first{};
+    for (usize index = 0; index < kernel::pager::max_requests; ++index) {
+        auto published = pager.publish(
+            kernel::mm::PageKey{index + 1, index}, index, 1, index + 1);
+        if (!published) {
+            return false;
+        }
+        if (index == 0) {
+            first = published.value().key;
+        }
+    }
+    const auto full = pager.publish(
+        attachment, kernel::mm::PageKey{100, 100}, 100, 1, 100);
+    const auto duplicate = pager.publish(
+        attachment, kernel::mm::PageKey{101, 101}, 101, 1, 101);
+    if (full || full.error() != kernel::pager::Error::Full
+        || duplicate || duplicate.error() != kernel::pager::Error::Full
+        || wakes != 0 || !pager.cancel(first) || wakes != 1) {
+        return false;
+    }
+    if (!pager.detach(attachment) || !pager.close(true)) {
+        return false;
+    }
+    return wakes == 1;
 }
 
 bool test_pressure_result_and_frame_progress_are_distinct(
@@ -803,6 +890,34 @@ bool test_pressure_result_and_frame_progress_are_distinct(
         && ready[0].publish()
         && ready[0].release()
         && (ready[0].reset(), reclaimer.pending() == 0);
+}
+
+/*luna change: prove equal-generation OutOfMemory only after an empty object round, reason: terminal pressure must follow reclaimer-owned completion and exact claim publication*/
+bool test_pressure_empty_round_proves_oom(
+    const TestContext&) noexcept {
+    kernel::mm::PageReclaimer reclaimer{};
+    kernel::mm::WaitRelation relation{};
+    auto seen = kernel::mm::PageWaitResult::Canceled;
+    /*luna change: bind the focused OOM callback to its local result, reason: claim publication must never dereference a null test context*/
+    if (!reclaimer.retain(
+            relation, 7, &seen, &page_wait_published)
+        || reclaimer.service(kernel::mm::PageReclaimer::pass_budget)
+            != kernel::mm::ReclaimResult::Idle
+        || reclaimer.pending() != 1) {
+        return false;
+    }
+    kernel::mm::WaitClaim claim{};
+    if (reclaimer.wake(7, &claim, 1) != 1
+        || !claim
+        || claim.relation() != nullptr
+        || relation.attached()
+        || !claim.publish()
+        || seen != kernel::mm::PageWaitResult::OutOfMemory
+        || !claim.release()) {
+        return false;
+    }
+    claim.reset();
+    return reclaimer.pending() == 0;
 }
 
 bool test_irq_sequence_reassert_requires_latest_ack(
@@ -915,8 +1030,14 @@ void register_e7_tests(TestRegistry& registry) noexcept {
         "e7", "Writeback queue-full retains semantic obligation",
         test_writeback_queue_full_retains_obligation);
     (void)registry.add(
+        "e7", "Pager capacity waiter wakes one producer",
+        test_pager_capacity_waiter_wakes_once);
+    (void)registry.add(
         "e7", "Pressure and frame progress remain distinct",
         test_pressure_result_and_frame_progress_are_distinct);
+    (void)registry.add(
+        "e7", "Empty reclaim round proves equal-generation OOM",
+        test_pressure_empty_round_proves_oom);
     (void)registry.add(
         "e7", "Irq sequence prevents stale acknowledgement",
         test_irq_sequence_reassert_requires_latest_ack);

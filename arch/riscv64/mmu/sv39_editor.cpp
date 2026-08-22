@@ -80,7 +80,10 @@ namespace {
 
 auto Editor::Plan::include(kernel::mm::VPage virtual_page) noexcept -> bool {
     const auto page = Sv39VPage::from(virtual_page);
-    if (!page) {
+    if (!page || tables_ == nullptr
+        || (domain_ == Domain::Kernel
+            ? !kernel::mm::layout::is_kernel(virtual_page.base())
+            : !kernel::mm::layout::is_user(virtual_page.base()))) {
         return false;
     }
     const usize vpn = virtual_page.number().raw();
@@ -90,10 +93,42 @@ auto Editor::Plan::include(kernel::mm::VPage virtual_page) noexcept -> bool {
     const usize level2 = vpn >> 18;
     const usize level1 = vpn >> 9;
     if (empty_ || level2 != previous_level2_) {
-        ++table_pages_;
-    }
-    if (empty_ || level1 != previous_level1_) {
-        ++table_pages_;
+        const auto root = TableView::open(*tables_, root_);
+        const Pte level2_entry = root.entry(page->level2_index());
+        level2_planned_ = !level2_entry.valid();
+        if (level2_planned_) {
+            table_pages_ += 2;
+        } else {
+            const auto level1_page = level2_entry.next_table_page();
+            if (!level1_page) {
+                return false;
+            }
+            const auto level1_table = TableView::open(*tables_, *level1_page);
+            const Pte level1_entry = level1_table.entry(page->level1_index());
+            if (!level1_entry.valid()) {
+                ++table_pages_;
+            } else if (!level1_entry.next_table_page()) {
+                return false;
+            }
+        }
+    } else if (level1 != previous_level1_) {
+        if (level2_planned_) {
+            ++table_pages_;
+        } else {
+            const auto root = TableView::open(*tables_, root_);
+            const auto level1_page =
+                root.entry(page->level2_index()).next_table_page();
+            if (!level1_page) {
+                return false;
+            }
+            const auto level1_table = TableView::open(*tables_, *level1_page);
+            const Pte level1_entry = level1_table.entry(page->level1_index());
+            if (!level1_entry.valid()) {
+                ++table_pages_;
+            } else if (!level1_entry.next_table_page()) {
+                return false;
+            }
+        }
     }
     previous_vpn_ = vpn;
     previous_level2_ = level2;

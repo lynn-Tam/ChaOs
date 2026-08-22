@@ -34,9 +34,11 @@ constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_object{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_peer{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_staging{};
 constinit libk::ManualLifetime<kernel::pager::Pager> memory_test_pager{};
+constinit libk::ManualLifetime<kernel::pager::Pager> memory_test_wrong_pager{};
 
 struct PagerReset final {
     ~PagerReset() noexcept {
+        memory_test_wrong_pager.reset();
         memory_test_pager.reset();
     }
 };
@@ -896,7 +898,7 @@ bool test_pager_backing_rejects_wrong_pager(
         return false;
     }
     auto& pager = memory_test_pager.emplace();
-    kernel::pager::Pager wrong{};
+    auto& wrong = memory_test_wrong_pager.emplace();
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
@@ -925,11 +927,12 @@ bool test_pager_backing_rejects_wrong_pager(
 
 bool test_pager_backing_attach_failure_rolls_back(
     const TestContext&) noexcept {
+    PagerReset pager_reset{};
     MemoryFixture fixture{};
     if (!fixture.initialize()) {
         return false;
     }
-    kernel::pager::Pager pager{};
+    auto& pager = memory_test_pager.emplace();
     if (!pager.close(false)) {
         return false;
     }

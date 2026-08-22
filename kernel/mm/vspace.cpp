@@ -23,7 +23,9 @@ Mapping::~Mapping() noexcept {
 
 MappedPage::~MappedPage() noexcept {
     KASSERT(!tree_hook_.is_linked());
-    KASSERT(!source_ && !alias_);
+    /*luna change: allow pre-commit lease owners to roll back through member
+      RAII after structural relations detach, reason: abort paths must share
+      one ownership cleanup instead of duplicating resets across every branch*/
     KASSERT(!page_mapping_.attached());
     /*luna change: require authority route and token quiescence before
       recycle, reason: the authority owns the sole VSpace identity*/

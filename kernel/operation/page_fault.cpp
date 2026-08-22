@@ -81,10 +81,20 @@ void PageFault::release() noexcept {
     const Phase phase = phase_.load<libk::MemoryOrder::Acquire>();
     /*luna change: refund retained demand at terminal completion, reason:
       pressure retry keeps it only across a Rearm handoff*/
-    if (phase == Phase::Ready || phase == Phase::Canceled
-        || phase == Phase::Terminal) {
+    switch (phase) {
+    case Phase::Terminal:
+        demand_.reset();
+        return;
+    case Phase::Ready:
+    case Phase::Canceled:
         demand_.reset();
         phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
+        return;
+    case Phase::Idle:
+    case Phase::Attaching:
+    case Phase::Pending:
+        KASSERT(false);
+        return;
     }
 }
 
@@ -260,9 +270,11 @@ auto PageFault::resume(arch::TrapContext& trap) noexcept
     }
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
     const mm::FaultKind next = admit();
-    return next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure
+    const Completion::ResumeResult result =
+        next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure
         ? Completion::ResumeResult::Rearm
         : Completion::ResumeResult::Done;
+    return result;
 }
 
 } // namespace kernel::operation

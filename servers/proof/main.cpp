@@ -315,59 +315,141 @@ using namespace myos::proof;
     const myos_cap_t pager = shared.load(PagerCapSlot);
     const myos_cap_t target = shared.load(PagerTargetCapSlot);
     const myos_cap_t staging = shared.load(PagerSourceCapSlot);
+    /*luna change: read the frozen root-role mode once per worker, reason: only pressure bundles own the extra staging remap authority*/
+    const bool pressure = shared.load(PressureModeSlot) != 0;
+    /*luna change: consume the exact staging Region authority in the worker,
+      reason: only Thread's later dirty fold needs the shared Protect-only
+      VSpace authority*/
+    const myos_cap_t staging_region =
+        shared.load(PagerStagingRegionSlot);
     const myos_cap_t notification =
         shared.load(PagerNotifyCapSlot);
-    if (pager == 0 || target == 0 || staging == 0 || notification == 0) {
+    if (pager == 0 || target == 0 || staging == 0
+        || notification == 0
+        || (pressure && staging_region == 0)) {
         fail();
     }
-    /*luna change: project worker admission and wait through the existing trace, reason: a Pager stall must identify its actor and wait edge without steering the protocol*/
-    shared.progress(
-        ProgressActor::Pager,
-        ProgressStage::Pager,
-        ProgressWait::Notification);
-    const auto woke = myos::notification_wait(notification);
-    if (woke.status != MYOS_STATUS_OK
-        || (woke.value & PagerBadge) == 0) {
-        fail();
-    }
-    shared.store(PagerWorkerSlot, PagerWorkerQueued);
-    shared.progress(
-        ProgressActor::Pager,
-        ProgressStage::Pager,
-        ProgressWait::Pager);
-    while (shared.load(PagerVprocSlot) != PagerVprocPending) {
-        myos::yield();
-    }
-
-    const auto claimed = myos::pager_claim(pager);
-    if (claimed.status != MYOS_STATUS_OK
-        || request->version != MYOS_PAGER_REQUEST_VERSION
-        || request->kind != MYOS_PAGER_REQUEST_PAGE_IN
-        || request->flags != MYOS_PAGER_REQUEST_FLAGS_NONE
-        || request->page_index != 0
-        || request->payload.page_in.first != 0
-        || request->payload.page_in.count != 1
-        || request->payload.page_in.backing_epoch == 0
-        || request->delivery_generation == 0
-        || request->page_generation == 0
-        || request->claim_generation == 0) {
-        fail();
-    }
-    request->payload.page_in.content_epoch = 1;
-    shared.store(PagerWorkerSlot, PagerWorkerClaimed);
-    const auto repeated = myos::pager_claim(pager);
-    if (repeated.status != MYOS_STATUS_WOULD_BLOCK) {
-        fail();
-    }
-    const auto supplied = myos::pager_supply(
-        pager, target, staging, request->page_index);
-    if (supplied.status != MYOS_STATUS_OK) {
-        fail();
-    }
-    shared.store(PagerWorkerSlot, PagerWorkerSupplied);
-    shared.progress(ProgressActor::Pager, ProgressStage::Complete);
+    bool seed_page = true;
+    /*luna change: keep one Pager worker loop for PageIn and Writeback, reason: the existing actor and ABI already carry both descriptor kinds and no parallel service state is needed*/
     for (;;) {
-        myos::yield();
+        shared.progress(
+            ProgressActor::Pager,
+            ProgressStage::Pager,
+            ProgressWait::Notification);
+        const auto woke = myos::notification_wait(notification);
+        if (woke.status != MYOS_STATUS_OK
+            || (woke.value & PagerBadge) == 0) {
+            fail();
+        }
+        shared.store(PagerWorkerSlot, PagerWorkerQueued);
+        shared.progress(
+            ProgressActor::Pager,
+            ProgressStage::Pager,
+            ProgressWait::Pager);
+        if (seed_page) {
+            while (shared.load(PagerVprocSlot) != PagerVprocPending) {
+                myos::yield();
+            }
+        }
+
+        const auto claimed = myos::pager_claim(pager);
+        if (claimed.status != MYOS_STATUS_OK
+            || request->version != MYOS_PAGER_REQUEST_VERSION
+            || request->flags != MYOS_PAGER_REQUEST_FLAGS_NONE
+            || request->delivery_generation == 0
+            || request->page_generation == 0
+            || request->claim_generation == 0) {
+            fail();
+        }
+        if (request->kind == MYOS_PAGER_REQUEST_PAGE_IN) {
+            if (request->page_index != 0
+                || request->payload.page_in.first != 0
+                || request->payload.page_in.count != 1
+                || request->payload.page_in.backing_epoch == 0) {
+                fail();
+            }
+            request->payload.page_in.content_epoch = 1;
+            shared.store(PagerWorkerSlot, PagerWorkerClaimed);
+            const auto repeated = myos::pager_claim(pager);
+            if (repeated.status != MYOS_STATUS_WOULD_BLOCK) {
+                fail();
+            }
+            myos::SysResult supplied{};
+            for (;;) {
+                supplied = myos::pager_supply(
+                    pager, target, staging, request->page_index);
+                if (supplied.status == MYOS_STATUS_OK) {
+                    break;
+                }
+                if (supplied.status != MYOS_STATUS_BUSY) {
+                    fail();
+                }
+                myos::yield();
+            }
+            shared.store(PagerWorkerSlot, PagerWorkerSupplied);
+            /*luna change: prepare one reusable source only in pressure mode,
+              reason: the later PageIn must not allocate its source while the
+              clean-pressure retry consumes the returned frame*/
+            if (pressure && seed_page) {
+                /*luna change: retry staging map on the formal transient VM
+                  statuses, reason: PageIn continuations share VSpace claim
+                  ownership and only OK/PENDING commits the next phase*/
+                for (;;) {
+                    const auto mapped = myos::vm_map(
+                        staging_region,
+                        staging,
+                        StagingAddress,
+                        PageSize,
+                        0,
+                        MYOS_VM_READ | MYOS_VM_WRITE);
+                    if (completed(mapped)) {
+                        break;
+                    }
+                    if (mapped.status != MYOS_STATUS_BUSY
+                        && mapped.status != MYOS_STATUS_RETRY) {
+                        fail();
+                    }
+                    myos::yield();
+                }
+                /*luna change: publish MapAccepted before staging access, reason: the worker cell must distinguish vm_map acceptance from zero-page materialization*/
+                shared.store(PagerWorkerSlot, PagerWorkerMapAccepted);
+                *reinterpret_cast<volatile myos_word_t*>(StagingAddress) =
+                    PagerValue;
+                /*luna change: publish the completed staging write before detach, reason: timeout evidence must separate source materialization from asynchronous unmap drain*/
+                shared.store(PagerWorkerSlot, PagerWorkerWritten);
+                /*luna change: retry exact-region unmap on the same transient
+                  statuses, reason: teardown must wait for the shared VSpace
+                  claim lane without weakening non-retry failures*/
+                for (;;) {
+                    const auto unmapped = myos::vm_unmap(
+                        staging_region, StagingAddress, PageSize);
+                    if (completed(unmapped)) {
+                        break;
+                    }
+                    if (unmapped.status != MYOS_STATUS_BUSY
+                        && unmapped.status != MYOS_STATUS_RETRY) {
+                        fail();
+                    }
+                    myos::yield();
+                }
+                shared.store(PagerWorkerSlot, PagerWorkerPrepared);
+            }
+            seed_page = false;
+        } else if (request->kind == MYOS_PAGER_REQUEST_WRITEBACK) {
+            if (request->payload.writeback.writeback_generation == 0
+                || request->payload.writeback.dirty_epoch == 0) {
+                fail();
+            }
+            shared.store(PagerWorkerSlot, PagerWorkerWritebackClaimed);
+            const auto complete = myos::pager_complete(pager, target);
+            if (complete.status != MYOS_STATUS_OK) {
+                fail();
+            }
+            shared.store(PagerWorkerSlot, PagerWorkerWritebackDone);
+        } else {
+            fail();
+        }
+        shared.progress(ProgressActor::Pager, ProgressStage::Complete);
     }
 }
 
@@ -375,22 +457,26 @@ using namespace myos::proof;
     myos_word_t notification,
     myos_word_t shared_address) noexcept {
     const Shared shared{shared_address};
+    /*luna change: gate the extended target fault from frozen manifest mode, reason: ordinary E1 must stop after the original Pager PageIn completion*/
+    const bool pressure = shared.load(PressureModeSlot) != 0;
     shared.progress(
         ProgressActor::TargetVproc,
         ProgressStage::Boot,
         ProgressWait::Notification);
-    // Vproc has no kernel-owned blocking continuation. The common syscall
-    // policy must reject Endpoint call before touching Endpoint admission.
-    if (myos::endpoint_call(shared.load(EndpointSlot)).status
-        != MYOS_STATUS_INVALID_OP) {
-        fail();
+    if (!pressure) {
+        // Vproc has no kernel-owned blocking continuation. The common syscall
+        // policy must reject Endpoint call before touching Endpoint admission.
+        if (myos::endpoint_call(shared.load(EndpointSlot)).status
+            != MYOS_STATUS_INVALID_OP) {
+            fail();
+        }
+        const auto bound = myos::notification_bind_vproc(
+            notification, VprocNotificationIngress, VprocNotificationTag);
+        if (bound.status != MYOS_STATUS_OK) {
+            fail();
+        }
+        shared.store(VprocStateSlot, VprocReady);
     }
-    const auto bound = myos::notification_bind_vproc(
-        notification, VprocNotificationIngress, VprocNotificationTag);
-    if (bound.status != MYOS_STATUS_OK) {
-        fail();
-    }
-    shared.store(VprocStateSlot, VprocReady);
     /*luna change: drive the target Vproc through the same Pager-backed VA as Thread0, reason: the runtime fault frame and resumed instruction must be proven on the real Vproc path*/
     while (shared.load(PagerWorkerSlot) != PagerWorkerQueued) {
         myos::yield();
@@ -412,6 +498,43 @@ using namespace myos::proof;
         ProgressStage::Pager,
         ProgressWait::None,
         PagerVprocDone);
+    /*luna change: run the dirty-pressure edge only in pressure mode,
+      reason: ordinary E1 has no stress span or writeback barrier to await*/
+    if (pressure) {
+        /*luna change: wait for Thread clean retry and Pager rematerialization,
+          reason: the dirty Vproc fault must observe a resident, dirty Pager page
+          rather than outrunning the second PageIn*/
+        while (shared.load(PagerThreadSlot) != PagerThreadDirtyReady) {
+            myos::yield();
+        }
+        /*luna change: rearm the existing Vproc fault proof lane before the
+          pressure access, reason: the second retained FaultSlot must follow
+          the same claim/resume protocol as the seed Pager fault*/
+        shared.store(PagerVprocSlot, PagerVprocFaulting);
+        shared.progress(
+            ProgressActor::TargetVproc,
+            ProgressStage::Pager,
+            ProgressWait::Pager);
+        /*luna change: drive the target Vproc through the dirty-pressure edge,
+          reason: this final anonymous page follows the production Pager write and
+          A/D fold rather than consuming the clean winner*/
+        /*luna change: keep the dirty target at page one of the fixed Region,
+          reason: Thread owns clean page zero and no remap authority is needed*/
+        static_cast<void>(*reinterpret_cast<volatile const myos_word_t*>(
+            StressAddress + PageSize));
+        shared.store(PagerVprocSlot, PagerVprocDirtyRetryDone);
+        shared.progress(
+            ProgressActor::TargetVproc,
+            ProgressStage::Pager,
+            ProgressWait::None,
+            PagerVprocDirtyRetryDone);
+        /*luna change: park the pressure target at its canonical completion,
+          reason: unrelated tunnel and channel setup must not allocate after
+          the scenario owns every remaining PMM frame*/
+        for (;;) {
+            myos::yield();
+        }
+    }
     const auto tunnel = myos::tunnel_open(
         shared.load(PoolSlot), TunnelIngressSlot, TunnelTag);
     if (tunnel.status != MYOS_STATUS_OK) {
@@ -653,6 +776,7 @@ using namespace myos::proof;
     myos_word_t control_address,
     myos_word_t pending_sequence) noexcept {
     const Shared shared{SharedAddress};
+    const bool pressure = shared.load(PressureModeSlot) != 0;
 
     const auto* const events =
         reinterpret_cast<const myos_vproc_event_page*>(event_address);
@@ -711,7 +835,11 @@ using namespace myos::proof;
             shared.store(PagerDetailSlot, PagerDetailAccess);
             fail();
         }
-        if (address != PagerAddress) {
+        const bool dirty_fault = pressure
+            && shared.load(PagerThreadSlot) == PagerThreadDirtyReady;
+        const myos_word_t expected_address = dirty_fault
+            ? StressAddress + PageSize : PagerAddress;
+        if (address != expected_address) {
             shared.store(PagerDetailSlot, PagerDetailAddress);
             fail();
         }
@@ -932,6 +1060,8 @@ extern "C" void myos_main(
         // descriptor passes a bounded shared result page and lane index.
         if (bootstrap_address >= 64 * 1024 && bootstrap_size < 2) {
             const Shared shared{bootstrap_address};
+            /*luna change: gate the stress continuation from frozen manifest mode, reason: ordinary E1 retains its original PageIn/coalesce completion path*/
+            const bool pressure = shared.load(PressureModeSlot) != 0;
             const myos_cap_t notification = shared.load(NotificationSlot);
             if (notification == 0
                 || myos::notification_signal(notification).status
@@ -939,51 +1069,53 @@ extern "C" void myos_main(
                 fail();
             }
             if (bootstrap_size == 0) {
-                const myos_cap_t endpoint = shared.load(EndpointSlot);
-                if (myos::endpoint_abort().status != MYOS_STATUS_INVALID_OP
-                    || myos::endpoint_reply(MYOS_STATUS_OK).status
-                        != MYOS_STATUS_INVALID_OP) {
-                    fail();
+                if (!pressure) {
+                    const myos_cap_t endpoint = shared.load(EndpointSlot);
+                    if (myos::endpoint_abort().status != MYOS_STATUS_INVALID_OP
+                        || myos::endpoint_reply(MYOS_STATUS_OK).status
+                            != MYOS_STATUS_INVALID_OP) {
+                        fail();
+                    }
+                    auto* const caps = reinterpret_cast<myos_ipc_caps*>(
+                        StackAddress);
+                    *caps = {};
+                    caps->version = MYOS_IPC_CAPS_VERSION;
+                    caps->send_count = 1;
+                    caps->receive_limit = 1;
+                    caps->send[0].source = notification;
+                    caps->send[0].rights =
+                        MYOS_RIGHT_SIGNAL | MYOS_RIGHT_DUPLICATE;
+                    caps->send[0].operation = MYOS_CAP_DELEGATE;
+                    const auto called = myos::endpoint_call(
+                        endpoint, EndpointMagic, 19, 23);
+                    if (endpoint == 0 || called.status != MYOS_STATUS_OK
+                        || called.value != 42
+                        || caps->received_count != 1
+                        || caps->received[0] == 0
+                        || myos::notification_signal(caps->received[0]).status
+                            != MYOS_STATUS_OK) {
+                        fail();
+                    }
+                    *caps = {};
+                    caps->version = MYOS_IPC_CAPS_VERSION;
+                    const auto aborted = myos::endpoint_call(
+                        endpoint, EndpointAbortMagic, 0, 0);
+                    if (aborted.status != MYOS_STATUS_PEER_ABORTED
+                        || aborted.value != EndpointAbortDetail) {
+                        fail();
+                    }
+                    const auto timed_out = myos::endpoint_call(
+                        endpoint, EndpointTimeoutMagic, 0, 0, 1'000'000);
+                    if (timed_out.status != MYOS_STATUS_TIMED_OUT) {
+                        fail();
+                    }
+                    const auto faulted = myos::endpoint_call(
+                        endpoint, EndpointFaultMagic, 0, 0);
+                    if (faulted.status != MYOS_STATUS_PEER_FAULT) {
+                        fail();
+                    }
+                    shared.store(EndpointResultSlot, EndpointTransfer);
                 }
-                auto* const caps = reinterpret_cast<myos_ipc_caps*>(
-                    StackAddress);
-                *caps = {};
-                caps->version = MYOS_IPC_CAPS_VERSION;
-                caps->send_count = 1;
-                caps->receive_limit = 1;
-                caps->send[0].source = notification;
-                caps->send[0].rights =
-                    MYOS_RIGHT_SIGNAL | MYOS_RIGHT_DUPLICATE;
-                caps->send[0].operation = MYOS_CAP_DELEGATE;
-                const auto called = myos::endpoint_call(
-                    endpoint, EndpointMagic, 19, 23);
-                if (endpoint == 0 || called.status != MYOS_STATUS_OK
-                    || called.value != 42
-                    || caps->received_count != 1
-                    || caps->received[0] == 0
-                    || myos::notification_signal(caps->received[0]).status
-                        != MYOS_STATUS_OK) {
-                    fail();
-                }
-                *caps = {};
-                caps->version = MYOS_IPC_CAPS_VERSION;
-                const auto aborted = myos::endpoint_call(
-                    endpoint, EndpointAbortMagic, 0, 0);
-                if (aborted.status != MYOS_STATUS_PEER_ABORTED
-                    || aborted.value != EndpointAbortDetail) {
-                    fail();
-                }
-                const auto timed_out = myos::endpoint_call(
-                    endpoint, EndpointTimeoutMagic, 0, 0, 1'000'000);
-                if (timed_out.status != MYOS_STATUS_TIMED_OUT) {
-                    fail();
-                }
-                const auto faulted = myos::endpoint_call(
-                    endpoint, EndpointFaultMagic, 0, 0);
-                if (faulted.status != MYOS_STATUS_PEER_FAULT) {
-                    fail();
-                }
-                shared.store(EndpointResultSlot, EndpointTransfer);
                 shared.store(bootstrap_size, ChildReady + bootstrap_size);
                 /*luna change: let Thread0 own its faulting-to-done cell, reason: the three actor cells must not be reset or written by another lane*/
                 shared.store(PagerThreadSlot, PagerThreadFaulting);
@@ -993,6 +1125,102 @@ extern "C" void myos_main(
                     fail();
                 }
                 shared.store(PagerThreadSlot, PagerThreadDone);
+                /*luna change: run clean and dirty pressure phases only when
+                  the root role authorizes them, reason: ordinary E1 has no
+                  stress span, rematerialization source or writeback barrier*/
+                if (pressure) {
+                    /*luna change: consume the existing Thread0 authority handoff,
+                      reason: one Region and one anonymous object must survive
+                      every bounded remap without a new shared capability slot*/
+                    const myos_cap_t stress_region =
+                        static_cast<myos_cap_t>(vproc_shared);
+                    const myos_cap_t stress_memory =
+                        static_cast<myos_cap_t>(vproc_magic);
+                    if (stress_region == 0 || stress_memory == 0) {
+                        fail();
+                    }
+                    /*luna change: wait for the worker's one prepared source,
+                      reason: stress pressure must not force a second PageIn to
+                      allocate staging while the PMM is already exhausted*/
+                    while (shared.load(PagerWorkerSlot)
+                        != PagerWorkerPrepared) {
+                        myos::yield();
+                    }
+                    /*luna change: map one four-page Region once, reason: page
+                      two prewarms metadata before page zero drains capacity
+                      and page three remains lazy for post-proof release*/
+                    for (;;) {
+                        const auto mapped = myos::vm_map(
+                            stress_region, stress_memory, StressAddress,
+                            StressSize, 0, MYOS_VM_READ | MYOS_VM_WRITE);
+                        if (completed(mapped)) {
+                            break;
+                        }
+                        if (mapped.status != MYOS_STATUS_BUSY
+                            && mapped.status != MYOS_STATUS_RETRY) {
+                            fail();
+                        }
+                        myos::yield();
+                    }
+                    /*luna change: prewarm page two before fixture drain,
+                      reason: this capacity invariant establishes anonymous,
+                      alias, MappedPage and same-leaf table metadata without
+                      becoming success truth or control*/
+                    static_cast<void>(*reinterpret_cast<
+                        volatile const myos_word_t*>(StressAddress + 2 * PageSize));
+                    // Target has consumed the seed PageIn and is parked at the
+                    // dirty-pressure barrier; no unrelated E1 actor exists in
+                    // the pressure role.
+                    while (shared.load(PagerVprocSlot) != PagerVprocDone) {
+                        myos::yield();
+                    }
+                    static_cast<void>(*reinterpret_cast<
+                        volatile const myos_word_t*>(StressAddress));
+                    if (*reinterpret_cast<volatile const myos_word_t*>(
+                            PagerAddress) != PagerValue) {
+                        fail();
+                    }
+                    while (shared.load(PagerWorkerSlot)
+                        != PagerWorkerSupplied) {
+                        myos::yield();
+                    }
+                    shared.store(PagerThreadSlot, PagerThreadCleanRetryDone);
+                    *reinterpret_cast<volatile myos_word_t*>(PagerAddress) =
+                        PagerValue + 1;
+                    for (;;) {
+                        const auto folded = myos::vm_protect(
+                            shared.load(PagerRegionSlot),
+                            PagerAddress,
+                            PageSize,
+                            MYOS_VM_READ);
+                        if (completed(folded)) {
+                            break;
+                        }
+                        if (folded.status != MYOS_STATUS_BUSY
+                            && folded.status != MYOS_STATUS_RETRY) {
+                            fail();
+                        }
+                        myos::yield();
+                    }
+                    /*luna change: release the dirty-pressure Vproc edge only
+                      after the ordinary Pager write and A/D fold, reason: the
+                      next fault must race a canonical dirty PageSlot candidate*/
+                    shared.store(PagerThreadSlot, PagerThreadDirtyReady);
+                    while (shared.load(PagerWorkerSlot)
+                            != PagerWorkerWritebackDone
+                        || shared.load(PagerVprocSlot)
+                            != PagerVprocDirtyRetryDone) {
+                        myos::yield();
+                    }
+                    // All production pressure barriers precede this lazy-page
+                    // fault. The scenario releases its PMM owner before the
+                    // post-proof PageFault is created, and this returning load
+                    // is the fixture-lifetime acknowledgement seen by init.
+                    static_cast<void>(*reinterpret_cast<
+                        volatile const myos_word_t*>(PressureReleaseAddress));
+                    shared.store(
+                        PagerThreadSlot, PagerThreadPressureReleased);
+                }
             }
             if (bootstrap_size != 0) {
                 shared.store(bootstrap_size, ChildReady + bootstrap_size);

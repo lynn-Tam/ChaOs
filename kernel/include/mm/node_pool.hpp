@@ -85,6 +85,18 @@ public:
         usize pages{64};
     };
 
+    [[nodiscard]] static constexpr auto quota_for(usize nodes) noexcept
+        -> Quota {
+        return Quota{
+            .nodes = nodes,
+            .pages = nodes / slots_per_page
+                + (nodes % slots_per_page != 0 ? 1 : 0),
+        };
+    }
+
+    static_assert(quota_for(0).pages == 0);
+    static_assert(quota_for(slots_per_page).pages == 1);
+
     struct Entry final {
         T* object{};
         StableNodeKey key{};

@@ -327,14 +327,20 @@ auto KernelState::start_reclaimer(
           visible before retained pressure is revisited*/
         const mm::ReclaimResult candidate = kernel.pressure_work_.service(
             mm::PageReclaimer::pass_budget);
+        /*luna change: yield only for runnable reclaim work, reason: Wait relies
+          on VSpace/Memory/Pager notifiers instead of service spin*/
         const bool candidate_more =
-            candidate == mm::ReclaimResult::Candidate
+            candidate == mm::ReclaimResult::More
             || candidate == mm::ReclaimResult::Progress;
         mm::WaitClaim pressure_ready[mm::PageReclaimer::pass_budget]{};
         const usize ready_count = kernel.pressure_work_.wake(
             kernel.pmm().frame_progress_generation(),
             pressure_ready,
             mm::PageReclaimer::pass_budget);
+        /*luna change: keep a full pressure claim batch runnable, reason:
+          wake is bounded and a saturated batch may leave relations attached*/
+        const bool pressure_more =
+            ready_count == mm::PageReclaimer::pass_budget;
         /*luna change: consume finalized pressure claims after candidate work,
           reason: relation reuse closes before its callback is published*/
         for (usize index = 0; index < ready_count; ++index) {
@@ -347,7 +353,8 @@ auto KernelState::start_reclaimer(
             KASSERT(claim.release());
             claim.reset();
         }
-        if (candidate_more || grant.more || vspace.more || memory.more
+        if (candidate_more || pressure_more || grant.more || vspace.more
+            || memory.more
             || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();

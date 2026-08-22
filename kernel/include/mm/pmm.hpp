@@ -152,6 +152,8 @@ class Pmm {
 
     [[nodiscard]] auto contains(Page page) const noexcept -> bool;
     [[nodiscard]] auto state_of(Page page) const noexcept -> QueryResult;
+    // All managed frames, including free, allocated and reserved pages.
+    [[nodiscard]] auto page_count() const noexcept -> size_t;
     [[nodiscard]] auto free_page_count() const noexcept -> size_t;
     // Monotonic semantic progress edge.  It advances only when a frame is
     // returned to the free list; allocation/retry activity never changes it.

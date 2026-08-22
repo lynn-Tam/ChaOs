@@ -420,6 +420,12 @@ public:
         usize page_index,
         bool accessed,
         bool dirty) noexcept -> libk::Expected<void, MemoryError>;
+    /*luna change: fold usage through the exact mapped relation during stop,
+      reason: retire keeps the PageMapping owner proof after Live admission closes*/
+    [[nodiscard]] auto observe_usage(
+        PageMapping& mapping,
+        bool accessed,
+        bool dirty) noexcept -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto drain_page_waiters(
         usize capacity) noexcept -> usize;
     [[nodiscard]] auto queue_writeback(usize page_index) noexcept

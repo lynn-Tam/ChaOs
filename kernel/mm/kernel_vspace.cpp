@@ -90,7 +90,8 @@ auto KernelVSpace::acquire_stack() noexcept
         extension.commit();
     }
 
-    arch::PageEditor::Plan plan{};
+    auto editor = arch::PageEditor::kernel(root_);
+    auto plan = editor.plan();
     for (usize index = 0; index < KernelStackLayout::StackPages; ++index) {
         const auto virtual_page = VPage::from_base(
             VirtAddr{base + index * page_size});
@@ -106,7 +107,6 @@ auto KernelVSpace::acquire_stack() noexcept
         return libk::unexpected(StackError::MappingFailed);
     }
     auto edit = libk::move(mutation).value();
-    auto editor = arch::PageEditor::kernel(root_);
     usize mapped{};
     for (; mapped < KernelStackLayout::StackPages; ++mapped) {
         const auto virtual_page = VPage::from_base(

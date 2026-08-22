@@ -18,6 +18,7 @@
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
 #include <thread/thread.hpp>
+#include <test/scenario.hpp>
 #include <execution/vproc.hpp>
 #include <trap/trap.hpp>
 #include <uapi/status.h>
@@ -91,11 +92,13 @@ void finish_thread_page_fault(
         0,
         event.pc(),
         event.fault_addr()));
+    // One-way diagnostic projection; it must never participate in fault policy.
     kernel::diag::console::print<
         "user: contained fault address={:#x} after syscalls={} "
-        "active-vspace-cpus={}\n">(
+        "active-vspace-cpus={} fault-kind={}\n">(
         event.fault_addr(), thread.user_syscalls(),
-        thread.effective_binding().vspace()->active_cpus().size());
+        thread.effective_binding().vspace()->active_cpus().size(),
+        static_cast<u8>(kind));
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
 
@@ -189,6 +192,8 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             /*luna change: route Thread faults through the leaf PageFault continuation, reason: Pager Pending must block on one Wait/Completion instead of polling Yield while Vproc keeps its existing adapter*/
             if (thread != nullptr) {
                 KASSERT(cpu.runtime().owner_registry != nullptr);
+                KASSERT(test::scenario::page_fault(
+                    cpu.runtime(), mm::VirtAddr{event.fault_addr()}));
                 auto& page_fault = thread->current_wait().page_fault();
                 const mm::FaultKind result = page_fault.start(
                     *execution->binding().vspace(),

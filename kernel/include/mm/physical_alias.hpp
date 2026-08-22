@@ -85,7 +85,8 @@ class PhysicalAliasRegistry final : private libk::noncopyable_nonmovable {
     using Tree = libk::IntrusiveTree<Claim, &Claim::hook, Compare>;
 
 public:
-    explicit PhysicalAliasRegistry(Pmm& pmm) noexcept : claims_(pmm) {}
+    explicit PhysicalAliasRegistry(Pmm& pmm) noexcept
+        : claims_(pmm, NodePool<Claim>::quota_for(pmm.page_count())) {}
     ~PhysicalAliasRegistry() noexcept;
 
     [[nodiscard]] auto acquire(Page page, MemoryType type) noexcept

@@ -5,7 +5,8 @@ nm=$1
 ar=$2
 image=$3
 concurrency_level=$4
-shift 4
+scenario_policy=$5
+shift 5
 
 fail() {
   printf '%s\n' "[audit] FAIL: $*" >&2
@@ -25,16 +26,42 @@ if "$nm" --defined-only -n "$image" | rg -n '(_ZTI|_ZTS)'; then
   fail 'forbidden defined RTTI symbols found'
 fi
 
+printf '%s\n' '[audit] checking panic/assert and console providers...'
+"$nm" -C --defined-only -n "$image" \
+  | rg -q 'kernel::diag::panic\(kernel::diag::PanicRequest\)' \
+  || fail 'kernel panic provider is not linked'
+"$nm" -C --defined-only -n "$image" \
+  | rg -q 'kernel::diag::assert_fail\(' \
+  || fail 'KASSERT terminal provider is not linked'
+"$nm" -C --defined-only -n "$image" \
+  | rg -q 'kernel::diag::console::write\(' \
+  || fail 'kernel console provider is not linked'
+
 if [ "$concurrency_level" -eq 0 ]; then
   printf '%s\n' '[audit] checking bounded off concurrency provider...'
   "$nm" -C --defined-only -n "$image" | rg -q 'kernel::diag::concurrency::FlightRecorder::(initialize|push|read)' || fail 'off recorder ABI stubs are not linked'
   if "$nm" -u -C "$image" | rg -q 'kernel::diag::concurrency::FlightRecorder::'; then
     fail 'off recorder ABI remains unresolved'
   fi
-  if "$nm" -C --defined-only "$image" | rg -q 'kernel::test::scenario::detail::'; then
-    fail 'scenario driver/state linked into off image'
-  fi
 fi
+
+case "$scenario_policy" in
+  none)
+    if "$nm" -C --defined-only "$image" | rg -q 'kernel::test::scenario::detail::'; then
+      fail 'scenario driver/state linked into scenario-free image'
+    fi
+    ;;
+  pressure)
+    "$nm" -C --defined-only "$image" \
+      | rg -q 'kernel::test::scenario::detail::pressure\(' \
+      || fail 'pressure scenario provider is not linked'
+    "$nm" -C --defined-only "$image" \
+      | rg -q 'kernel::test::scenario::detail::page_fault\(' \
+      || fail 'pressure PageFault fixture is not linked'
+    ;;
+  any) ;;
+  *) fail "unknown scenario policy: $scenario_policy" ;;
+esac
 
 # The core archive is the only target allowed to contain object vtables; the
 # module graph keeps diagnostics and test providers free of polymorphic state.

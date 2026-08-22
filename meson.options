@@ -6,5 +6,10 @@ option('scenario', type: 'combo', choices: ['off', 'ordinary', 'initrd', 'trap',
 option('build_id', type: 'string', value: 'auto', description: 'Image metadata only; does not select module objects')
 option('qemu_smp', type: 'integer', value: 4, min: 1, description: 'Harts used by Meson QEMU run targets')
 option('qemu_timeout', type: 'string', value: '10s', description: 'Host timeout used by Meson QEMU run targets')
+# /*luna change: give the pressure proof its own watchdog budget, reason: the reduced eight-MiB page-fault workload must not share the ordinary E1 timeout*/
+# The 2040-page stress pass needs a host observation window independent of E1.
+option('qemu_pressure_timeout', type: 'string', value: '45s', description: 'Host timeout used by the proof pressure run')
+# /*luna change: scale the pressure proof memory with its reduced fault workload, reason: the fixed boot footprint and child sponsorship spacing remain the same candidate while the run fits the existing watchdog*/
+option('qemu_pressure_memory', type: 'string', value: '25M', description: 'QEMU RAM for the proof pressure run')
 option('gdb_host', type: 'string', value: '127.0.0.1', description: 'GDB listener host for the debug run target')
 option('gdb_port', type: 'integer', value: 1237, min: 1, max: 65535, description: 'GDB listener port for the debug run target')

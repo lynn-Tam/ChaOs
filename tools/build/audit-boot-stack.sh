@@ -3,10 +3,11 @@ set -eu
 
 build_dir=$1
 budget=$2
+image=${3##*/}
 
 sources=$(mktemp)
 trap 'rm -f "$sources"' EXIT
-ninja -C "$build_dir" -t inputs kernel.elf | sed -n 's#^\.\./\.\./\.\./##; /\.cpp$/p' > "$sources"
+ninja -C "$build_dir" -t inputs "$image" | sed -n 's#^\(\.\./\)*##; /\.cpp$/p' > "$sources"
 found=0
 failed=0
 while IFS= read -r source; do

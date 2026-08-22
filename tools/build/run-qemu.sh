@@ -12,6 +12,7 @@ output=$(mktemp)
 markers=$(mktemp)
 trap 'rm -f "$output" "$markers"' EXIT
 initrd=''
+memory=''
 exact_failed=0
 forbid=''
 count_pattern=''
@@ -19,6 +20,12 @@ count_expected=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = '--initrd' ]; then
     initrd=$2
+    shift 2
+    continue
+  fi
+  # /*luna change: carry an explicit QEMU RAM condition, reason: pressure proof must exercise PMM exhaustion without altering ordinary targets*/
+  if [ "$1" = '--memory' ]; then
+    memory=$2
     shift 2
     continue
   fi
@@ -35,8 +42,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 set +e
-if [ -n "$initrd" ]; then
+# /*luna change: apply RAM only on the opted-in run, reason: one wrapper keeps all build and runtime ownership while normal QEMU invocations remain unchanged*/
+if [ -n "$initrd" ] && [ -n "$memory" ]; then
+  timeout --foreground "$timeout" "$qemu" -machine virt -m "$memory" -smp "$smp" -nographic -bios default -kernel "$image" -initrd "$initrd" >"$output" 2>&1
+elif [ -n "$initrd" ]; then
   timeout --foreground "$timeout" "$qemu" -machine virt -smp "$smp" -nographic -bios default -kernel "$image" -initrd "$initrd" >"$output" 2>&1
+elif [ -n "$memory" ]; then
+  timeout --foreground "$timeout" "$qemu" -machine virt -m "$memory" -smp "$smp" -nographic -bios default -kernel "$image" >"$output" 2>&1
 else
   timeout --foreground "$timeout" "$qemu" -machine virt -smp "$smp" -nographic -bios default -kernel "$image" >"$output" 2>&1
 fi

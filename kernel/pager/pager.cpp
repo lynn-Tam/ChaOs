@@ -55,10 +55,12 @@ Pager::Pager() noexcept
           &Pager::notification_closed>(*this)) {}
 
 Pager::~Pager() noexcept {
+    /*luna change: include producer waiter unlink in Pager teardown,
+      reason: attachment capacity hooks must be empty before storage dies*/
     KASSERT(state_ == State::Open || state_ == State::Closed);
     KASSERT(claimed_ == 0 && !cleanup_);
     KASSERT(notification_ == nullptr && attachments_.empty()
-        && !source_link_.attached());
+        && capacity_waiters_.empty() && !source_link_.attached());
 }
 
 auto Pager::state() const noexcept -> State {
@@ -138,12 +140,66 @@ auto Pager::find_free_locked() noexcept -> Slot* {
     return nullptr;
 }
 
+/*luna change: deliver one producer-ready callback under an attachment lease,
+  reason: Pager owns capacity while MemoryObject owns the retained obligation
+  and callbacks must run without the Pager lock*/
+void Pager::wake_capacity() noexcept {
+    PagerAttachment* attachment{};
+    PagerAttachment::Ready ready{};
+    void* context{};
+    u64 generation{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != State::Open || capacity_waiters_.empty()
+            || find_free_locked() == nullptr || ready_.full()) {
+            return;
+        }
+        auto it = capacity_waiters_.begin();
+        attachment = &*it;
+        KASSERT(attachment->state == PagerAttachment::State::Attached);
+        KASSERT(attachment->hook_.is_linked()
+            && attachment->capacity_hook_.is_linked()
+            && attachment->ready != nullptr);
+        KASSERT(attachment->leases
+            != libk::numeric_limits<u32>::max());
+        capacity_waiters_.erase(*attachment);
+        ++attachment->leases;
+        generation = attachment->generation;
+        ready = attachment->ready;
+        context = attachment->context;
+    }
+
+    ready(context);
+
+    bool drained{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(attachment->leases != 0);
+        --attachment->leases;
+        KASSERT(attachment->state == PagerAttachment::State::Attached
+            || attachment->state == PagerAttachment::State::Retiring);
+        KASSERT(attachment->state == PagerAttachment::State::Retiring
+            || attachment->generation == generation);
+        if (attachment->state == PagerAttachment::State::Retiring
+            && attachment->leases == 0) {
+            attachment->state = PagerAttachment::State::Detached;
+            drained = true;
+        }
+    }
+    if (drained && attachment->drained != nullptr) {
+        attachment->drained(context);
+    }
+}
+
 auto Pager::attach(PagerAttachment& attachment) noexcept -> bool {
     if (!attachment) {
         return false;
     }
     kernel::sync::IrqLockGuard guard{lock_};
+    /*luna change: reject stale derived capacity membership on attach,
+      reason: a reused attachment must begin with both hooks detached*/
     if (state_ != State::Open || attachment.hook_.is_linked()
+        || attachment.capacity_hook_.is_linked()
         || attachment.state != PagerAttachment::State::Detached
         || attachment.generation == libk::numeric_limits<u64>::max()) {
         return false;
@@ -169,6 +225,12 @@ auto Pager::detach(PagerAttachment& attachment) noexcept -> bool {
         }
         attachment.state = PagerAttachment::State::Retiring;
         attachments_.erase(attachment);
+        /*luna change: unlink capacity admission at retirement, reason:
+          detached attachment storage cannot remain in the derived waiter
+          index while existing leases drain*/
+        if (attachment.capacity_hook_.is_linked()) {
+            capacity_waiters_.erase(attachment);
+        }
         old_generation = attachment.generation;
         if (attachment.generation != libk::numeric_limits<u64>::max()) {
             ++attachment.generation;
@@ -237,6 +299,7 @@ auto Pager::detach(PagerAttachment& attachment) noexcept -> bool {
         }
         static_cast<void>(attachment.transition(
             attachment.context, forced, PagerAttachment::Event::Forced));
+        wake_capacity();
     }
     if (drained && attachment.drained != nullptr) {
         attachment.drained(attachment.context);
@@ -278,7 +341,19 @@ auto Pager::publish(
         }
         Slot* const slot = find_free_locked();
         if (slot == nullptr || ready_.full()) {
+            /*luna change: retain one derived capacity waiter on Full,
+              reason: the PageSlot obligation waits for an exact Pager slot
+              release instead of requeueing runnable work*/
+            if (attachment != nullptr && attachment->ready != nullptr
+                && !attachment->capacity_hook_.is_linked()) {
+                capacity_waiters_.push_back(*attachment);
+            }
             return libk::unexpected(Error::Full);
+        }
+        if (attachment != nullptr && attachment->capacity_hook_.is_linked()) {
+            /*luna change: consume a satisfied capacity waiter on publish,
+              reason: one successful producer admission needs no stale wake*/
+            capacity_waiters_.erase(*attachment);
         }
         if (slot->generation == libk::numeric_limits<u64>::max()) {
             return libk::unexpected(Error::GenerationExhausted);
@@ -449,6 +524,10 @@ auto Pager::try_claim() noexcept -> libk::Expected<Request, Error> {
     if (signal) {
         static_cast<void>(source_link_.signal());
     }
+    /*luna change: wake one producer after ready-ring consumption,
+      reason: claim frees queue admission only when a transport slot also
+      remains available*/
+    wake_capacity();
     if (accepted) {
         return libk::expected(request);
     }
@@ -533,28 +612,33 @@ void Pager::notification_closed() noexcept {
 
 auto Pager::cancel(RequestKey key) noexcept
     -> libk::Expected<void, Error> {
-    kernel::sync::IrqLockGuard guard{lock_};
-    Slot* const slot = find_locked(key);
-    if (slot == nullptr) {
-        return libk::unexpected(Error::Stale);
-    }
-    if (slot->state != TransportState::Queued) {
-        return libk::unexpected(Error::Busy);
-    }
-    bool found{};
-    for (auto it = ready_.begin(); it != ready_.end(); ++it) {
-        if (*it == key.slot) {
-            ready_.erase(it);
-            found = true;
-            break;
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        Slot* const slot = find_locked(key);
+        if (slot == nullptr) {
+            return libk::unexpected(Error::Stale);
         }
+        if (slot->state != TransportState::Queued) {
+            return libk::unexpected(Error::Busy);
+        }
+        bool found{};
+        for (auto it = ready_.begin(); it != ready_.end(); ++it) {
+            if (*it == key.slot) {
+                ready_.erase(it);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return libk::unexpected(Error::Busy);
+        }
+        slot->state = TransportState::Free;
+        slot->attachment = nullptr;
+        slot->attachment_generation = 0;
     }
-    if (!found) {
-        return libk::unexpected(Error::Busy);
-    }
-    slot->state = TransportState::Free;
-    slot->attachment = nullptr;
-    slot->attachment_generation = 0;
+    /*luna change: wake a producer after queued cancellation frees a slot,
+      reason: capacity release must rearm retained owner work exactly once*/
+    wake_capacity();
     return libk::expected();
 }
 
@@ -694,6 +778,9 @@ auto Pager::requeue(
     if (signal) {
         static_cast<void>(source_link_.signal());
     }
+    /*luna change: cover requeue compensation slot release, reason:
+      a forced owner transition can free transport capacity while Open*/
+    wake_capacity();
     return accepted ? libk::Expected<void, Error>{libk::expected()}
                     : libk::Expected<void, Error>{
                           libk::unexpected(Error::Stale)};
@@ -758,11 +845,17 @@ auto Pager::finish_reply(Reply& reply) noexcept
             state_ = State::Closed;
         }
     }
-    if (close && cleanup_) {
-        cleanup_.complete();
-    }
     if (drained && attachment != nullptr && attachment->drained != nullptr) {
         attachment->drained(attachment->context);
+    }
+    /*luna change: wake one producer after reply commit frees the slot,
+      reason: Pager capacity release is the exact retry edge for Full*/
+    wake_capacity();
+    /*luna change: complete Pager cleanup after all Pager accesses,
+      reason: cleanup may release the owning object and no callback may touch
+      this transport afterward*/
+    if (close && cleanup_) {
+        cleanup_.complete();
     }
     return libk::expected();
 }
@@ -825,14 +918,21 @@ auto Pager::abort_reply(Reply& reply) noexcept
             }
         }
     }
-    if (close && cleanup_) {
-        cleanup_.complete();
-    }
     if (drained && attachment != nullptr && attachment->drained != nullptr) {
         attachment->drained(attachment->context);
     }
     if (drain) {
         static_cast<void>(this->close(true));
+    }
+    if (terminal && !drain) {
+        /*luna change: wake a producer after terminal reply abort frees a slot,
+          reason: only Open transport can admit a retained Full publication*/
+        wake_capacity();
+    }
+    /*luna change: defer cleanup until terminal callbacks and capacity access
+      finish, reason: ObjectCleanup may release Pager storage immediately*/
+    if (!drain && close && cleanup_) {
+        cleanup_.complete();
     }
     return libk::expected();
 }
@@ -842,6 +942,12 @@ auto Pager::close(bool force) noexcept -> bool {
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ == State::Closed) {
+            /*luna change: clear any stale capacity hook on repeated close,
+              reason: Closed transport cannot retain producer admission*/
+            while (!capacity_waiters_.empty()) {
+                auto it = capacity_waiters_.begin();
+                capacity_waiters_.erase(*it);
+            }
             return true;
         }
         if (state_ == State::Forced) {
@@ -850,6 +956,13 @@ auto Pager::close(bool force) noexcept -> bool {
             state_ = State::Forced;
         } else if (state_ == State::Open) {
             state_ = State::Closing;
+        }
+        /*luna change: unlink all producer waiters when admission closes,
+          reason: forced/graceful teardown cannot publish new work or invoke
+          callbacks against retiring attachment storage*/
+        while (!capacity_waiters_.empty()) {
+            auto it = capacity_waiters_.begin();
+            capacity_waiters_.erase(*it);
         }
         detach_notification = notification_ != nullptr;
         notification_ = nullptr;

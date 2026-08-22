@@ -728,6 +728,7 @@ public:
             .context = this,
             .transition = &PagerBacking::request_transition,
             .drained = &PagerBacking::request_drained,
+            .ready = &PagerBacking::capacity_ready,
         };
     }
 
@@ -796,6 +797,14 @@ public:
         self.owner_->release_backing_hold();
     }
 
+    static void capacity_ready(void* context) noexcept {
+        auto& self = *static_cast<PagerBacking*>(context);
+        /*luna change: rearm the existing MemoryExecutor on Pager capacity,
+          reason: the callback is only a producer wake and PageSlot retains
+          the actual writeback/page obligation*/
+        self.owner_->schedule_work();
+    }
+
 
     [[nodiscard]] auto drain_page_waiters(
         usize capacity) noexcept -> usize {
@@ -851,6 +860,7 @@ public:
         }
         usize processed{};
         usize progressed{};
+        bool capacity_wait{};
         while (processed < capacity) {
             Node* node{};
             PageKey page_key{};
@@ -909,6 +919,18 @@ public:
                     }
                 }
                 if (published.error() == kernel::pager::Error::Full) {
+                    /*luna change: reindex the queued PageRequest on Pager
+                      Full, reason: the attachment callback re-arms this
+                      canonical work index after capacity returns*/
+                    kernel::sync::IrqLockGuard guard{tree_lock_};
+                    Node* const current = find_locked(page_key.index);
+                    if (current != nullptr
+                        && current->slot.request.key == page_key
+                        && current->slot.request.state
+                            == PageRequestState::Queued) {
+                        index_work_locked(*current);
+                    }
+                    capacity_wait = true;
                     break;
                 }
                 if (terminal) {
@@ -946,7 +968,6 @@ public:
 
         const usize remaining = capacity - processed;
         progressed += drain_page_waiters(remaining);
-        bool writeback_more{};
         if (remaining != 0) {
             usize page_index{};
             WritebackKey key{};
@@ -984,7 +1005,8 @@ public:
                   lock, reason: Pager transport is foreign and PageSlot keeps
                   the obligation through Full/requeue/failure*/
                 auto published = publish_writeback(page_index, key);
-                writeback_more = true;
+                capacity_wait = !published
+                    && published.error() == MemoryError::Pending;
                 if (published) {
                     ++progressed;
                 }
@@ -993,7 +1015,7 @@ public:
         bool more{};
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
-            more = !work_.empty() || !ready_.empty() || writeback_more;
+            more = !capacity_wait && (!work_.empty() || !ready_.empty());
         }
         return MemoryServiceBatch{
             .processed = processed,
@@ -1028,27 +1050,27 @@ public:
       PageMapping owns exact invalidation publication*/
     [[nodiscard]] auto reclaim(usize capacity) noexcept -> ReclaimResult {
         if (capacity == 0) {
-            return ReclaimResult::Exhausted;
+            return ReclaimResult::Idle;
         }
         PageMapping* mapping{};
         MemoryWork work{};
         usize evict_page_index{};
-        ReclaimResult result = ReclaimResult::Exhausted;
+        ReclaimResult result = ReclaimResult::Idle;
         bool evict{};
         bool writeback{};
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             if (nodes_ == nullptr) {
-                return ReclaimResult::Exhausted;
-            }
-            if (reclaim_cursor_ == nullptr) {
-                reclaim_cursor_ = nodes_;
-            }
-            Node* const start = reclaim_cursor_;
-            Node* node = start;
-            usize inspected{};
-            bool complete{};
-            for (; node != nullptr && inspected < capacity; ++inspected) {
+                return ReclaimResult::Idle;
+            } else {
+                if (reclaim_cursor_ == nullptr) {
+                    reclaim_cursor_ = nodes_;
+                }
+                Node* const start = reclaim_cursor_;
+                Node* node = start;
+                usize inspected{};
+                bool complete{};
+                for (; node != nullptr && inspected < capacity; ++inspected) {
                 Node* const next = node->next != nullptr
                     ? node->next : nodes_;
                 reclaim_cursor_ = next;
@@ -1071,24 +1093,24 @@ public:
                         work = candidate.claim();
                         if (work) {
                             mapping = &candidate;
-                            result = ReclaimResult::InFlight;
+                            result = ReclaimResult::Wait;
                         } else {
-                            result = ReclaimResult::InFlight;
+                            result = ReclaimResult::Wait;
                         }
                     } else if (node->leases != 0) {
-                        result = ReclaimResult::InFlight;
+                        result = ReclaimResult::Wait;
                     } else if (node->slot.state == PageSlotState::ResidentDirty) {
                         auto queued = node->slot.queue_writeback();
                         if (queued) {
                             writeback = true;
-                            result = ReclaimResult::InFlight;
+                            result = ReclaimResult::Wait;
                         } else {
-                            result = ReclaimResult::Candidate;
+                            result = ReclaimResult::More;
                         }
                     } else {
                         evict_page_index = node->index;
                         evict = true;
-                        result = ReclaimResult::Candidate;
+                        result = ReclaimResult::More;
                     }
                     node = nullptr;
                     break;
@@ -1099,51 +1121,47 @@ public:
                 case PageSlotState::WritebackActive:
                 case PageSlotState::WritebackCompleting:
                     result = node->slot.reclaim_intent
-                        ? ReclaimResult::InFlight
-                        : ReclaimResult::Exhausted;
+                        ? ReclaimResult::Wait
+                        : ReclaimResult::Idle;
                     node = nullptr;
                     break;
                 case PageSlotState::WritebackFailed:
-                    result = node->slot.reclaim_intent
-                        ? ReclaimResult::Candidate
-                        : ReclaimResult::Exhausted;
+                    result = ReclaimResult::Idle;
                     node = nullptr;
                     break;
                 default:
                     node = next;
                     break;
                 }
-            }
+                }
             /*luna change: anchor cycle completion to this pass cursor,
               reason: reaching the list head does not prove a full scan*/
             if (node != nullptr && inspected == capacity && !complete) {
-                result = ReclaimResult::Candidate;
+                result = ReclaimResult::More;
+            }
             }
         }
+        ReclaimResult final = result;
         if (mapping != nullptr) {
             /*luna change: publish an exact mapping claim immediately after the
               tree lock, reason: no fallible policy may strand PageMapping*/
             mapping->publish(libk::move(work));
-            return result;
-        }
-        if (writeback) {
+        } else if (writeback) {
             owner_->schedule_work();
-            return result;
-        }
-        if (evict) {
+        } else if (evict) {
             auto finished = evict_page(evict_page_index);
             if (finished) {
-                return ReclaimResult::Progress;
+                final = ReclaimResult::Progress;
+            } else {
+                final = finished.error() == MemoryError::Busy
+                    ? ReclaimResult::Wait : ReclaimResult::More;
             }
-            return finished.error() == MemoryError::Busy
-                ? ReclaimResult::InFlight
-                : ReclaimResult::Candidate;
         }
-        return result;
+        return final;
     }
 
-    /*luna change: pass demand only at Pager metadata materialization,
-      reason: PageRequest creates PageKey after metadata growth succeeds*/
+    /*luna change: A -> A', reason: an evicted Missing Node retains metadata
+      but must re-enter the same PageRequest lifecycle as a newly grown Node*/
     [[nodiscard]] auto materialize(
         usize page_index,
         FrameDemand* demand,
@@ -1152,6 +1170,8 @@ public:
         WaitRelation::Publish publish) noexcept
         -> libk::Expected<MemoryPage, MemoryError> {
         Node* node{};
+        bool fresh{};
+        bool queued{};
         {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             node = find_locked(page_index);
@@ -1170,29 +1190,33 @@ public:
                 if (node->slot.state == PageSlotState::Failed) {
                     return libk::unexpected(MemoryError::BackingFailed);
                 }
-                if (relation != nullptr
-                    && !node->slot.request.attach(
-                        *relation, owner, publish)) {
-                    return libk::unexpected(MemoryError::Busy);
+                if (node->slot.state != PageSlotState::Missing) {
+                    if (relation != nullptr
+                        && !node->slot.request.attach(
+                            *relation, owner, publish)) {
+                        return libk::unexpected(MemoryError::Busy);
+                    }
+                    return libk::unexpected(MemoryError::Pending);
                 }
-                return libk::unexpected(MemoryError::Pending);
-            }
-            auto claimed = claim(demand);
-            if (!claimed) {
-                /*luna change: reject pre-attach storage contention for relation callers, reason: transient growth has no durable waiter or wakeup to receive the operations pin*/
-                if (relation != nullptr
-                    && claimed.error() == MemoryError::Pending) {
-                    return libk::unexpected(MemoryError::Busy);
+            } else {
+                auto claimed = claim(demand);
+                if (!claimed) {
+                    /*luna change: reject pre-attach storage contention for relation callers, reason: transient growth has no durable waiter or wakeup to receive the operations pin*/
+                    if (relation != nullptr
+                        && claimed.error() == MemoryError::Pending) {
+                        return libk::unexpected(MemoryError::Busy);
+                    }
+                    return libk::unexpected(claimed.error());
                 }
-                return libk::unexpected(claimed.error());
+                node = claimed.value();
+                fresh = true;
+                if (demand != nullptr) {
+                    demand->reset();
+                }
+                node->index = page_index;
+                node->next = nodes_;
+                nodes_ = node;
             }
-            node = claimed.value();
-            if (demand != nullptr) {
-                demand->reset();
-            }
-            node->index = page_index;
-            node->next = nodes_;
-            nodes_ = node;
             const u64 generation = node->slot.generation ==
                     libk::numeric_limits<u64>::max()
                 ? 0
@@ -1200,20 +1224,28 @@ public:
             if (generation == 0
                 || !node->slot.begin_request(
                     PageKey{generation, page_index}, page_index, 1)) {
-                unlink_locked(*node);
-                release(*node);
+                if (fresh) {
+                    unlink_locked(*node);
+                    release(*node);
+                }
                 return libk::unexpected(MemoryError::GenerationExhausted);
             }
             if (relation != nullptr
                 && !node->slot.request.attach(*relation, owner, publish)) {
-                unlink_locked(*node);
-                release(*node);
+                node->slot.cancel_request();
+                if (fresh) {
+                    unlink_locked(*node);
+                    release(*node);
+                }
                 return libk::unexpected(MemoryError::Busy);
             }
             index_work_locked(*node);
+            queued = true;
         }
-        /*luna change: retain queued page work for MemoryExecutor service, reason: Pager admission must occur outside the PageRequest owner lock and survive queue pressure*/
-        owner_->schedule_work();
+        if (queued) {
+            /*luna change: retain queued page work for MemoryExecutor service, reason: Pager admission must occur outside the PageRequest owner lock and survive queue pressure*/
+            owner_->schedule_work();
+        }
         return libk::unexpected(MemoryError::Pending);
     }
 
@@ -1523,13 +1555,17 @@ public:
         if (node == nullptr) {
             return libk::unexpected(MemoryError::NotBacked);
         }
+        /*luna change: fold usage through terminal writeback failure,
+          reason: PageSlot remains the sole failure and dirty truth while
+          later A/D observations still age the resident candidate*/
         if (node->slot.state != PageSlotState::ResidentClean
             && node->slot.state != PageSlotState::ResidentDirty
             && node->slot.state != PageSlotState::WritebackQueued
             && node->slot.state != PageSlotState::WritebackPublishing
             && node->slot.state != PageSlotState::WritebackPublished
             && node->slot.state != PageSlotState::WritebackActive
-            && node->slot.state != PageSlotState::WritebackCompleting) {
+            && node->slot.state != PageSlotState::WritebackCompleting
+            && node->slot.state != PageSlotState::WritebackFailed) {
             return libk::unexpected(
                 node->slot.state == PageSlotState::Failed
                     ? MemoryError::BackingFailed
@@ -1592,8 +1628,19 @@ public:
         if (!published) {
             kernel::sync::IrqLockGuard guard{tree_lock_};
             Node* const node = find_locked(page_index);
-            if (node != nullptr) {
-                static_cast<void>(node->slot.abort_writeback_publish(key));
+            if (node != nullptr && node->slot.request.key == key.page
+                && node->slot.state == PageSlotState::WritebackPublishing) {
+                if (published.error() == pager::Error::Full) {
+                    static_cast<void>(node->slot.abort_writeback_publish(key));
+                } else {
+                    /*luna change: terminalize non-Full writeback transport
+                      errors at the exact PageSlot key, reason: a dead Pager
+                      must not leave a retryable queued obligation spinning*/
+                    auto failed = node->slot.fail_writeback(
+                        key, 0, 0,
+                        WritebackFailure::BackingUnavailable);
+                    KASSERT(failed);
+                }
             }
             return libk::unexpected(
                 published.error() == pager::Error::Full
@@ -1707,6 +1754,10 @@ public:
         /*luna change: make writeback completion's Pager commit terminal, reason: the PageSlot writeback state is already committed before the exact Completing ticket is released*/
         const auto finished = reply.value().commit();
         KASSERT(finished);
+        /*luna change: wake retained reclaim after writeback completion,
+          reason: MemoryExecutor is the existing kernel retry edge after both
+          PageSlot and Pager ownership have committed*/
+        owner_->schedule_work();
         return libk::expected();
     }
 
@@ -1762,6 +1813,9 @@ public:
         /*luna change: make writeback failure's Pager commit terminal, reason: the PageSlot failure state is already committed before the exact Completing ticket is released*/
         const auto finished = reply.value().commit();
         KASSERT(finished);
+        /*luna change: wake terminal writeback observation, reason: failure is
+          not runnable More but the owner must revisit retained reclaim intent*/
+        owner_->schedule_work();
         return libk::expected();
     }
 
@@ -3321,6 +3375,37 @@ auto MemoryObject::observe_usage(
     return result;
 }
 
+/*luna change: retain a stopping-safe exact mapping operation pin, reason:
+  VSpace teardown must fold A/D state before the relation is unbound*/
+auto MemoryObject::observe_usage(
+    PageMapping& mapping,
+    bool accessed,
+    bool dirty) noexcept -> libk::Expected<void, MemoryError> {
+    const BackingOps* ops{};
+    void* backing{};
+    usize page_index{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if ((state_ != MemoryState::Live && state_ != MemoryState::Stopping)
+            || backing_ops_ == nullptr || backing_ == nullptr) {
+            return libk::unexpected(MemoryError::InvalidState);
+        }
+        if (mapping.owner_ != this || mapping.page_index_ >= logical_pages_) {
+            return libk::unexpected(MemoryError::AttachmentState);
+        }
+        KASSERT(operations_ != libk::numeric_limits<usize>::max());
+        ++operations_;
+        page_index = mapping.page_index_;
+        ops = backing_ops_;
+        backing = backing_;
+    }
+    auto result = ops->observe_usage != nullptr
+        ? ops->observe_usage(backing, page_index, accessed, dirty)
+        : libk::Expected<void, MemoryError>{libk::expected()};
+    drop_page();
+    return result;
+}
+
 auto MemoryObject::drain_page_waiters(
     usize capacity) noexcept -> usize {
     if (capacity == 0) {
@@ -3777,7 +3862,7 @@ auto MemoryObject::reclaim(usize capacity) noexcept -> ReclaimResult {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != MemoryState::Live || backing_ops_ == nullptr
             || backing_ops_->reclaim == nullptr) {
-            return ReclaimResult::Exhausted;
+            return ReclaimResult::Idle;
         }
         ops = backing_ops_;
         backing = backing_;

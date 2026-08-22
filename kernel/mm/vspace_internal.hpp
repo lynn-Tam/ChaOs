@@ -23,8 +23,11 @@ namespace kernel::mm {
     -> VSpaceError {
     switch (error) {
     case MemoryError::OutOfMemory:
-    case MemoryError::ResourceExhausted:
         return VSpaceError::OutOfMemory;
+    /*luna change: preserve budget exhaustion at the VSpace boundary,
+      reason: ResourceExhausted is distinct from PMM pressure and proven OOM*/
+    case MemoryError::ResourceExhausted:
+        return VSpaceError::ResourceExhausted;
     case MemoryError::Pressure:
         return VSpaceError::Pressure;
     case MemoryError::GenerationExhausted:

@@ -2,6 +2,7 @@
 
 #include <libk/sync/atomic.hpp>
 #include <uapi/types.h>
+#include <uapi/test_scenario.h>
 
 //Confirmatory experiment.
 // Exit condition: remove this shared-memory proof protocol when Endpoint-based
@@ -75,6 +76,12 @@ inline constexpr myos_word_t PagerCapSlot = 58;
 inline constexpr myos_word_t PagerTargetCapSlot = 59;
 inline constexpr myos_word_t PagerSourceCapSlot = 60;
 inline constexpr myos_word_t PagerNotifyCapSlot = 61;
+/*luna change: expose the exact Pager-region mutation authority to proof actors, reason: vm_protect operates on the region that directly owns the mapping rather than traversing root authority*/
+inline constexpr myos_word_t PagerRegionSlot = 62;
+/*luna change: expose one unmapped staging region to the Pager worker, reason: each later PageIn must rematerialize and detach its source through ordinary VSpace operations before pager_supply transfer*/
+inline constexpr myos_word_t PagerStagingRegionSlot = 63;
+/*luna change: project the boot manifest's pressure role before child start, reason: proof actors must gate the extended workload from frozen configuration rather than runtime outcomes*/
+inline constexpr myos_word_t PressureModeSlot = 57;
 inline constexpr myos_word_t ProgressCellBase = 64;
 inline constexpr myos_word_t ProgressCellStride = 5;
 /*luna change: extend the existing progress projection with one Pager actor and lane wait, reason: diagnostics must identify worker stalls while remaining a one-way view*/
@@ -188,6 +195,16 @@ inline constexpr myos_word_t ChannelFailure = 0x4348'4641'494c'0001;
 inline constexpr myos_word_t ChannelVprocIpcAddress = 0x2400'0000;
 /*luna change: name the pager-shaped proof lane and target page, reason: the happy path must exercise production Pager and Vproc fault ABIs at a fixed userspace address*/
 inline constexpr myos_word_t PagerAddress = 0x2500'0000;
+/*luna change: keep three tested pressure pages in one Sv39 leaf, reason: page two prewarms metadata, page zero is clean retry and page one is dirty retry*/
+inline constexpr myos_word_t StressAddress = MYOS_TEST_PRESSURE_STRESS_ADDRESS;
+inline constexpr myos_word_t PressureReleaseAddress =
+    MYOS_TEST_PRESSURE_RELEASE_ADDRESS;
+/*luna change: keep the staging rematerialization outside the stress span, reason: the worker needs a stable formal mapping address without overlapping pressure pages*/
+inline constexpr myos_word_t StagingAddress = 0x2a00'0000;
+// Page three is a lazy post-proof acknowledgement page. Its fault enters the
+// existing pressure-scenario lifecycle only after all production barriers.
+inline constexpr myos_word_t StressPages = 4;
+inline constexpr myos_word_t StressSize = StressPages * PageSize;
 inline constexpr myos_word_t PagerValue = 0x5041'4745'525f'4f4b;
 inline constexpr myos_word_t PagerBackingKey = 1;
 inline constexpr myos_word_t PagerBadge = 1U << 9;
@@ -197,9 +214,21 @@ inline constexpr myos_word_t PagerThreadDone = 0x5041'4745'5254'444e;
 inline constexpr myos_word_t PagerWorkerQueued = 0x5041'4745'5251'5545;
 inline constexpr myos_word_t PagerWorkerClaimed = 0x5041'4745'5243'4c4d;
 inline constexpr myos_word_t PagerWorkerSupplied = 0x5041'4745'5253'5550;
+/*luna change: add map-accepted and written staging phases, reason: timeout projection must distinguish source preparation from the initial Pager supply without adding state*/
+inline constexpr myos_word_t PagerWorkerMapAccepted = 0x5041'4745'5250'4d41;
+inline constexpr myos_word_t PagerWorkerWritten = 0x5041'4745'5250'5752;
+/*luna change: sequence source preparation, clean retry, rematerialization and dirty admission in the existing actor cells, reason: the proof must not let a Vproc fault outrun the Pager page's prepared second supply*/
+inline constexpr myos_word_t PagerWorkerPrepared = 0x5041'4745'5250'5250;
+inline constexpr myos_word_t PagerThreadCleanRetryDone = 0x5041'4745'5253'4344;
+inline constexpr myos_word_t PagerThreadDirtyReady = 0x5041'4745'5252'4452;
+inline constexpr myos_word_t PagerThreadPressureReleased =
+    0x5041'4745'5252'454c;
+inline constexpr myos_word_t PagerWorkerWritebackClaimed = 0x5041'4745'5257'434c;
+inline constexpr myos_word_t PagerWorkerWritebackDone = 0x5041'4745'5257'444e;
 inline constexpr myos_word_t PagerVprocFaulting = 0x5041'4745'5246'4c54;
 inline constexpr myos_word_t PagerVprocPending = 0x5041'4745'5250'454e;
 inline constexpr myos_word_t PagerVprocDone = 0x5041'4745'5256'444e;
+inline constexpr myos_word_t PagerVprocDirtyRetryDone = 0x5041'4745'5256'4452;
 /*luna change: define compact one-shot TargetVproc fault detail codes, reason: proof diagnostics must identify the first failed gate without creating another state machine*/
 inline constexpr myos_word_t PagerDetailGeneration = 1;
 inline constexpr myos_word_t PagerDetailPending = 2;

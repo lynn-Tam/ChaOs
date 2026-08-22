@@ -65,23 +65,38 @@ struct Unmapped final {
 };
 
 class Editor final : private libk::noncopyable {
+    enum class Domain : u8 { User, Kernel };
+
 public:
-    // Architecture-owned upper bound for table resources consumed by one
-    // ordered mapping transaction. Existing tables may leave pages unused;
-    // the caller retains those pages for rollback.
+    // Exact table capacity for one ordered transaction. The caller keeps
+    // translation serialization stable while this plan reads the root.
     class Plan final {
     public:
+        Plan() = delete;
+
         [[nodiscard]] auto include(kernel::mm::VPage page) noexcept -> bool;
         [[nodiscard]] auto table_pages() const noexcept -> usize {
             return table_pages_;
         }
 
     private:
+        friend class Editor;
+
+        Plan(
+            kernel::mm::Page root,
+            const kernel::mm::OwnedPageGroup& tables,
+            Domain domain) noexcept
+            : root_(root), tables_(&tables), domain_(domain) {}
+
+        kernel::mm::Page root_{};
+        const kernel::mm::OwnedPageGroup* tables_{};
+        Domain domain_{Domain::User};
         usize previous_vpn_{};
         usize previous_level2_{};
         usize previous_level1_{};
         usize table_pages_{};
         bool empty_{true};
+        bool level2_planned_{};
     };
 
     Editor(Editor&&) noexcept = default;
@@ -91,6 +106,9 @@ public:
         -> Editor;
     [[nodiscard]] static auto user(arch::UserRoot& root) noexcept
         -> Editor;
+    [[nodiscard]] auto plan() const noexcept -> Plan {
+        return Plan{root_, *tables_, domain_};
+    }
     [[nodiscard]] static auto user_permissions(
         kernel::mm::AccessMask access,
         kernel::mm::MemoryType type) noexcept -> libk::optional<PtePerm>;
@@ -131,7 +149,6 @@ public:
         bool dirty) noexcept -> libk::Expected<Usage, EditError>;
 
 private:
-    enum class Domain : u8 { User, Kernel };
     struct NewTable final {
         kernel::mm::Page page;
         Pte parent;

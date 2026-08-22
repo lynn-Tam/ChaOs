@@ -32,7 +32,8 @@ auto VSpace::prepare_plan(
 
 auto VSpace::reserve_tables(MappedPage* pages) noexcept
     -> libk::Expected<TableReserve, VSpaceError> {
-    arch::PageEditor::Plan plan{};
+    arch::PageEditor editor = arch::PageEditor::user(*root_);
+    auto plan = editor.plan();
     for (MappedPage* page = pages; page != nullptr;
          page = page->pending_next_) {
         const auto virtual_page = VPage::from_base(page->address_);
@@ -352,9 +353,19 @@ auto VSpace::map_impl(
         }
         auto alias = kernel_->aliases().acquire(physical.page, physical.type);
         if (!alias) {
-            return fail(alias.error() == AliasError::ConflictingType
-                ? VSpaceError::AliasConflict
-                : VSpaceError::OutOfMemory);
+            VSpaceError error{VSpaceError::AliasConflict};
+            switch (alias.error()) {
+            case AliasError::ConflictingType:
+                error = VSpaceError::AliasConflict;
+                break;
+            case AliasError::OutOfMemory:
+                error = VSpaceError::OutOfMemory;
+                break;
+            case AliasError::QuotaExceeded:
+                error = VSpaceError::QuotaExceeded;
+                break;
+            }
+            return fail(error);
         }
         const VirtAddr address{
             request.virtual_range.base().raw() + index * page_size};

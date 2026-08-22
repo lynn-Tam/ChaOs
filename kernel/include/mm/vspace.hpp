@@ -416,6 +416,12 @@ private:
         WaitRelation::Publish publish,
         FrameDemand* demand) noexcept
         -> libk::Expected<FaultResult, VSpaceError>;
+    /*luna change: fold hardware A/D before PTE mutation, reason: VSpace owns
+      the projection while MemoryObject owns semantic usage truth*/
+    [[nodiscard]] auto fold_usage(
+        MappedPage& page,
+        const arch::PageEditor& editor) noexcept
+        -> libk::Expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto reserve_tables(
         MappedPage* pages) noexcept
         -> libk::Expected<TableReserve, VSpaceError>;

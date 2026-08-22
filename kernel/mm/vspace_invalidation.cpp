@@ -115,6 +115,10 @@ auto VSpace::start_page_invalidation(
     KASSERT(virtual_page);
     auto& retire = retire_batch_.emplace(*pmm_);
     arch::PageEditor editor = arch::PageEditor::user(*root_);
+    /*luna change: fold exact-page usage before reclaim PTE removal,
+      reason: PageSlot dirty truth must survive invalidation*/
+    auto folded = fold_usage(page, editor);
+    KASSERT(folded);
     auto unmapped = editor.unmap(*virtual_page);
     KASSERT(unmapped);
     while (auto table = unmapped.value().tables.take()) {
@@ -185,6 +189,10 @@ auto VSpace::start_invalidation(
         authority.pages_.erase(*page);
         const auto virtual_page = VPage::from_base(page->address_);
         KASSERT(virtual_page);
+        /*luna change: fold authority teardown usage before PTE removal,
+          reason: whole invalidation must preserve PageSlot A/D truth*/
+        auto folded = fold_usage(*page, editor);
+        KASSERT(folded);
         auto unmapped = editor.unmap(*virtual_page);
         KASSERT(unmapped);
         while (auto table = unmapped.value().tables.take()) {
