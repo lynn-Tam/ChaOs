@@ -6,6 +6,8 @@ option('scenario', type: 'combo', choices: ['off', 'ordinary', 'initrd', 'trap',
 option('build_id', type: 'string', value: 'auto', description: 'Image metadata only; does not select module objects')
 option('qemu_smp', type: 'integer', value: 4, min: 1, description: 'Harts used by Meson QEMU run targets')
 option('qemu_timeout', type: 'string', value: '10s', description: 'Host timeout used by Meson QEMU run targets')
+# /*luna change: give the resilience proof its own host budget, reason: worker-terminal and child-close teardown may complete beyond the ordinary E1 boundary while the guest watchdog remains unchanged*/
+option('qemu_resilience_timeout', type: 'string', value: '15s', description: 'Host timeout used by the resilience proof run')
 # /*luna change: give the pressure proof its own watchdog budget, reason: the reduced eight-MiB page-fault workload must not share the ordinary E1 timeout*/
 # The 2040-page stress pass needs a host observation window independent of E1.
 option('qemu_pressure_timeout', type: 'string', value: '45s', description: 'Host timeout used by the proof pressure run')

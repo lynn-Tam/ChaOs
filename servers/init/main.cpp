@@ -21,14 +21,15 @@ constexpr myos_word_t PressureMemory = 11 * 1024 * 1024;
 constexpr myos_word_t ChildCaps = 512;
 constexpr myos_word_t MaxThreads = 2;
 constexpr myos_word_t ChannelThreadCount = 2;
-/*luna change: reserve one stack and execution slot for the Pager worker, reason: the proof adds a real blocking service Thread without reducing existing Vproc/channel capacity*/
+/*luna change: reserve stacks and execution slots for the Pager workers, reason: the proof adds real blocking service Threads and the resilience role pre-creates a replacement without reducing existing Vproc/channel capacity*/
 constexpr myos_word_t PagerWorkerCount = 1;
+constexpr myos_word_t MaxPagerWorkers = 2;
 constexpr myos_word_t EndpointActivations = 1;
 constexpr myos_word_t MaxStacks =
     MaxThreads + 3 * VprocCount + EndpointActivations
-    + ChannelThreadCount + PagerWorkerCount;
+    + ChannelThreadCount + MaxPagerWorkers;
 constexpr myos_word_t ThreadDescriptorCount =
-    MaxThreads + ChannelThreadCount + PagerWorkerCount;
+    MaxThreads + ChannelThreadCount + MaxPagerWorkers;
 constexpr myos_word_t VprocDescriptorStride = 256;
 constexpr myos_word_t VprocDescriptorOffset =
     ((ThreadDescriptorCount * sizeof(myos_thread_start)
@@ -150,11 +151,14 @@ public:
         if (!package) {
             return false;
         }
-        /*luna change: freeze the manifest-selected pressure mode, reason: only the bundle root role may authorize pressure-only construction*/
+        /*luna change: freeze the manifest-selected run mode, reason: only the
+          bundle root role may authorize mode-only construction*/
         pressure_ = package.root_is("pressure");
-        // Pressure is a focused reclaim proof. Its sole ordinary Thread owns
-        // the tested fault sequence; the second CPU Thread belongs to E1.
-        if (pressure_) {
+        resilience_ = package.root_is("resilience");
+        // Pressure and resilience are focused proofs. The sole ordinary
+        // Thread owns the tested fault sequence; the second CPU Thread
+        // belongs to E1.
+        if (pressure_ || resilience_) {
             thread_count_ = 1;
         }
         if (!package.find("proof", proof)) {
@@ -222,7 +226,7 @@ public:
             return false;
         }
         /*luna change: publish the frozen mode before any child descriptor exists, reason: proof actors must gate workload phases from configuration rather than runtime observations*/
-        shared_.store(PressureModeSlot, pressure_ ? 1 : 0);
+        shared_.store(RunModeSlot, run_mode());
         stage_ = 8;
         /*luna change: place Pager construction before child execution setup, reason: the target mapping and notification must exist before descriptors and workers are started*/
         if (!make_pager()) {
@@ -233,7 +237,7 @@ public:
             return false;
         }
         stage_ = 10;
-        if (!pressure_ && !make_channel()) {
+        if (!pressure_ && !resilience_ && !make_channel()) {
             return false;
         }
         stage_ = 11;
@@ -254,19 +258,29 @@ public:
             ProgressWait::Notification);
         stage_ = 13;
         /*luna change: bound the coordinator notification observation, reason: a missing child signal must remain visible to the existing progress watchdog*/
+        /*luna change: also wait for the doomed worker terminal badge in the
+          resilience role, reason: TerminalObservation delivery is evidence
+          and precedes any barrier judgement*/
+        const myos_word_t required_badges = resilience_
+            ? (NotificationBadge | WorkerDeathBadge)
+            : NotificationBadge;
+        myos_word_t observed_badges{};
         for (;;) {
             const auto notified = myos::notification_take(notification_);
             if (notified.status == MYOS_STATUS_OK) {
-                if ((notified.value & NotificationBadge) == 0) {
-                    return false;
+                observed_badges |= notified.value;
+                if ((observed_badges & required_badges) == required_badges) {
+                    break;
                 }
-                break;
-            }
-            if (notified.status != MYOS_STATUS_RETRY
+            } else if (notified.status != MYOS_STATUS_RETRY
                 || !observe()) {
                 return false;
             }
             myos::yield();
+        }
+        if (resilience_
+            && myos::terminal_query(worker_a_).status != MYOS_STATUS_OK) {
+            return false;
         }
         shared_.progress(
             ProgressActor::Coordinator,
@@ -288,7 +302,7 @@ public:
         /*luna change: terminate pressure mode at the completed Pager proof,
           reason: ordinary Vproc, tunnel and channel exercise must not create
           post-drain demand and both modes can share the existing close tail*/
-        if (!pressure_) {
+        if (!pressure_ && !resilience_) {
             shared_.progress(
                 ProgressActor::Coordinator,
                 ProgressStage::FirstReceive,
@@ -346,15 +360,28 @@ private:
         static_cast<myos_word_t>(-1);
 
     [[nodiscard]] auto vproc_count() const noexcept -> myos_word_t {
-        return pressure_ ? 1 : VprocCount;
+        return (pressure_ || resilience_) ? 1 : VprocCount;
     }
 
     [[nodiscard]] auto channel_count() const noexcept -> myos_word_t {
-        return pressure_ ? 0 : ChannelThreadCount;
+        return (pressure_ || resilience_) ? 0 : ChannelThreadCount;
     }
 
     [[nodiscard]] auto endpoint_count() const noexcept -> myos_word_t {
-        return pressure_ ? 0 : EndpointActivations;
+        return (pressure_ || resilience_) ? 0 : EndpointActivations;
+    }
+
+    /*luna change: pre-create two workers only for the resilience role,
+      reason: worker replacement is a deployment fact fixed by the bundle
+      root, not a runtime supervision decision*/
+    [[nodiscard]] auto worker_count() const noexcept -> myos_word_t {
+        return resilience_ ? MaxPagerWorkers : PagerWorkerCount;
+    }
+
+    [[nodiscard]] auto run_mode() const noexcept -> myos_word_t {
+        return pressure_
+            ? ModePressure
+            : (resilience_ ? ModeResilience : ModeOrdinary);
     }
 
     [[nodiscard]] auto make_region(
@@ -538,10 +565,10 @@ private:
     }
 
     [[nodiscard]] auto make_stacks() noexcept -> bool {
-        /*luna change: include the dedicated Pager worker in stack allocation, reason: each registered IPC page belongs to its own blocking Thread stack*/
+        /*luna change: include every Pager worker in stack allocation, reason: each registered IPC page belongs to its own blocking Thread stack*/
         const myos_word_t count =
             thread_count_ + 3 * vproc_count() + endpoint_count()
-            + channel_count() + PagerWorkerCount;
+            + channel_count() + worker_count();
         for (myos_word_t index = 0; index < count; ++index) {
             myos_cap_t memory{};
             myos_cap_t region{};
@@ -596,15 +623,20 @@ private:
                 || !children_.add(staging_region_))) {
             return false;
         }
+        /*luna change: size the pager target from the frozen run mode, reason:
+          resilience needs one supplied page and one failed page while the
+          other roles keep their original extent*/
+        const myos_word_t target_size =
+            resilience_ ? 2 * PageSize : PageSize;
         const auto target = myos::memory_create_pager(
-            pool_, PageSize, MYOS_VM_READ | MYOS_VM_WRITE, pager_);
+            pool_, target_size, MYOS_VM_READ | MYOS_VM_WRITE, pager_);
         if (target.status != MYOS_STATUS_OK
             || !children_.add(target.value)) {
             return false;
         }
         target_memory_ = target.value;
 
-        const myos_word_t pager_size = pressure_ ? 2 * PageSize : PageSize;
+        const myos_word_t pager_size = pressure_ ? 2 * PageSize : target_size;
         if (!make_region(
                 child_vspace_, PagerAddress, pager_size,
                 MYOS_VM_READ | MYOS_VM_WRITE,
@@ -613,7 +645,7 @@ private:
                 pager_region_)
             || !children_.add(pager_region_)
             || !map(
-                pager_region_, target_memory_, PagerAddress, PageSize,
+                pager_region_, target_memory_, PagerAddress, target_size,
                 MYOS_VM_READ | MYOS_VM_WRITE)) {
             return false;
         }
@@ -683,8 +715,9 @@ private:
         }
         shared_.store(NotificationSlot, delegated.value);
 
-        // The focused pressure graph has no ordinary notification exercise.
-        if (pressure_) {
+        // The focused pressure and resilience graphs have no ordinary
+        // notification exercise.
+        if (pressure_ || resilience_) {
             return true;
         }
 
@@ -845,7 +878,8 @@ private:
         const myos_word_t active_endpoints = endpoint_count();
         /*luna change: extend execution targets for the Pager worker, reason: descriptor and start order must cover every created Thread and Vproc exactly once*/
         myos_cap_t targets[
-            MaxThreads + ChannelThreadCount + PagerWorkerCount + VprocCount]{};
+            MaxThreads + ChannelThreadCount + MaxPagerWorkers
+            + VprocCount]{};
         myos_cap_t descriptors{};
         if (!create_memory(
                 PageSize, MYOS_VM_READ | MYOS_VM_WRITE, descriptors)
@@ -1004,6 +1038,28 @@ private:
         starts[worker_descriptor].ipc.page = 0;
         starts[worker_descriptor].ipc.address = stack_bases_[worker_stack];
         starts[worker_descriptor].ipc.pages = 1;
+        /*luna change: pre-create the replacement worker beside the doomed
+          one, reason: replacement is a deployment fact of the resilience
+          role and the peer IPC address hands over the stale identity
+          without new shared state*/
+        for (myos_word_t index = 1; index < worker_count(); ++index) {
+            const myos_word_t descriptor = worker_descriptor + index;
+            const myos_word_t stack = worker_stack + index;
+            starts[descriptor].version = MYOS_THREAD_START_VERSION;
+            starts[descriptor].flags = 0;
+            starts[descriptor].entry = entry;
+            starts[descriptor].stack = stack_tops_[stack];
+            starts[descriptor].arguments[0] = SharedAddress;
+            starts[descriptor].arguments[1] = PagerWorkerBMagic;
+            starts[descriptor].arguments[2] = 0;
+            starts[descriptor].arguments[3] = 0;
+            starts[descriptor].arguments[4] = stack_bases_[worker_stack];
+            starts[descriptor].arguments[5] = stack_bases_[stack];
+            starts[descriptor].ipc.memory = stack_memory_[stack];
+            starts[descriptor].ipc.page = 0;
+            starts[descriptor].ipc.address = stack_bases_[stack];
+            starts[descriptor].ipc.pages = 1;
+        }
         for (myos_word_t index = 0; index < active_vprocs; ++index) {
             auto* const vproc_start =
                 reinterpret_cast<myos_vproc_start*>(
@@ -1060,7 +1116,7 @@ private:
             arm->stack_top = stack_tops_[upcall_stack];
         }
 
-        if (!pressure_) {
+        if (!pressure_ && !resilience_) {
             const myos_word_t endpoint_stack =
                 thread_count_ + 3 * active_vprocs;
             myos_cap_t endpoint_ipc_region{};
@@ -1189,24 +1245,36 @@ private:
             targets[descriptor_index] = thread.value;
         }
 
-        /*luna change: reuse the single worker descriptor index for creation, reason: descriptor layout and execution creation share one canonical index*/
-        stage_ = 138;
-        const auto worker = myos::thread_create(
-            pool_, child_vspace_, child_cspace_, descriptors,
-            worker_descriptor * sizeof(myos_thread_start));
-        if (worker.status != MYOS_STATUS_OK) {
-            return false;
+        /*luna change: create every worker through its canonical descriptor index, reason: descriptor layout and execution creation share one index and the doomed worker binds terminal observation first*/
+        for (myos_word_t index = 0; index < worker_count(); ++index) {
+            stage_ = 138 + index;
+            const auto worker = myos::thread_create(
+                pool_, child_vspace_, child_cspace_, descriptors,
+                (worker_descriptor + index) * sizeof(myos_thread_start));
+            if (worker.status != MYOS_STATUS_OK) {
+                return false;
+            }
+            const auto worker_context = myos::sc_create(
+                pool_, domain_, 1'000'000, 10'000'000, 30, 0);
+            if (worker_context.status != MYOS_STATUS_OK
+                || !children_.add(worker.value)
+                || !children_.add(worker_context.value)
+                || myos::sc_bind(worker_context.value, worker.value).status
+                    != MYOS_STATUS_OK) {
+                return false;
+            }
+            if (index == 0) {
+                worker_a_ = worker.value;
+            }
+            targets[worker_descriptor + index] = worker.value;
         }
-        const auto worker_context = myos::sc_create(
-            pool_, domain_, 1'000'000, 10'000'000, 30, 0);
-        if (worker_context.status != MYOS_STATUS_OK
-            || !children_.add(worker.value)
-            || !children_.add(worker_context.value)
-            || myos::sc_bind(worker_context.value, worker.value).status
+        /*luna change: bind terminal observation on the doomed worker, reason: the coordinator's badge is the evidence that execution terminal delivery works without supervision machinery*/
+        if (resilience_
+            && myos::terminal_observe_bind(
+                   worker_a_, notification_, WorkerDeathBadge).status
                 != MYOS_STATUS_OK) {
             return false;
         }
-        targets[worker_descriptor] = worker.value;
 
         for (myos_word_t index = 0; index < active_vprocs; ++index) {
             stage_ = 140 + index * 5;
@@ -1243,12 +1311,12 @@ private:
                 return false;
             }
             targets[
-                thread_count_ + active_channels + PagerWorkerCount + index]
+                thread_count_ + active_channels + worker_count() + index]
                 = vproc.value;
         }
 
         for (myos_word_t index = 0;
-             index < thread_count_ + active_channels + PagerWorkerCount
+             index < thread_count_ + active_channels + worker_count()
                  + active_vprocs;
              ++index) {
             stage_ = 160 + index;
@@ -1328,7 +1396,7 @@ private:
                 }
             }
             if (all_ready) {
-                return pressure_
+                return pressure_ || resilience_
                     || shared_.load(EndpointResultSlot) == EndpointTransfer;
             }
             if (!observe()) {
@@ -1340,6 +1408,22 @@ private:
 
     /*luna change: wait on the pager proof's published barriers, reason: init observes the real Thread/Vproc completion edges without steering Pager state*/
     [[nodiscard]] auto exercise_pager() noexcept -> bool {
+        /*luna change: wait the resilience phases through the same actor cells,
+          reason: worker redelivery and pager_fail settlement are one proof
+          sequence without a second barrier truth*/
+        if (resilience_) {
+            // WorkerFailed causally follows the replacement supply, Thread0's
+            // value check and second fault. Intermediate actor-cell values are
+            // projections and may advance before the coordinator samples them.
+            while (shared_.load(PagerWorkerSlot) != PagerWorkerFailed
+                || shared_.load(PagerVprocSlot) != PagerVprocDropped) {
+                if (shared_.load(PagerDetailSlot) != 0 || !observe()) {
+                    return false;
+                }
+                myos::yield();
+            }
+            return true;
+        }
         /*luna change: select completion barriers from the frozen mode,
           reason: ordinary E1 waits only for its original PageIn/coalesce lane
           while pressure mode additionally waits for reclaim and writeback*/
@@ -1532,8 +1616,11 @@ private:
     myos_cap_t parent_pool_{};
     myos_word_t bundle_size_{};
     myos_word_t thread_count_{};
-    /*luna change: retain the parsed root-role mode for one-way construction gates, reason: init must not infer pressure semantics from child progress*/
+    /*luna change: retain the parsed root-role modes for one-way construction gates, reason: init must not infer run-mode semantics from child progress*/
     bool pressure_{};
+    bool resilience_{};
+    /*luna change: keep the doomed worker's capability for terminal evidence, reason: TerminalObservation needs the exact target across the child lifetime*/
+    myos_cap_t worker_a_{};
     myos_cap_t pool_{};
     myos_cap_t child_vspace_{};
     myos_cap_t child_cspace_{};

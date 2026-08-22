@@ -80,8 +80,11 @@ inline constexpr myos_word_t PagerNotifyCapSlot = 61;
 inline constexpr myos_word_t PagerRegionSlot = 62;
 /*luna change: expose one unmapped staging region to the Pager worker, reason: each later PageIn must rematerialize and detach its source through ordinary VSpace operations before pager_supply transfer*/
 inline constexpr myos_word_t PagerStagingRegionSlot = 63;
-/*luna change: project the boot manifest's pressure role before child start, reason: proof actors must gate the extended workload from frozen configuration rather than runtime outcomes*/
-inline constexpr myos_word_t PressureModeSlot = 57;
+/*luna change: project the boot manifest's run role before child start, reason: proof actors must gate the workload from frozen configuration rather than runtime outcomes*/
+inline constexpr myos_word_t RunModeSlot = 57;
+inline constexpr myos_word_t ModeOrdinary = 0;
+inline constexpr myos_word_t ModePressure = 1;
+inline constexpr myos_word_t ModeResilience = 2;
 inline constexpr myos_word_t ProgressCellBase = 64;
 inline constexpr myos_word_t ProgressCellStride = 5;
 /*luna change: extend the existing progress projection with one Pager actor and lane wait, reason: diagnostics must identify worker stalls while remaining a one-way view*/
@@ -208,7 +211,9 @@ inline constexpr myos_word_t StressSize = StressPages * PageSize;
 inline constexpr myos_word_t PagerValue = 0x5041'4745'525f'4f4b;
 inline constexpr myos_word_t PagerBackingKey = 1;
 inline constexpr myos_word_t PagerBadge = 1U << 9;
+inline constexpr myos_word_t WorkerDeathBadge = 1U << 10;
 inline constexpr myos_word_t PagerWorkerMagic = 0x5041'4745'5257'4f52;
+inline constexpr myos_word_t PagerWorkerBMagic = 0x5041'4745'5257'4f4b;
 inline constexpr myos_word_t PagerThreadFaulting = 0x5041'4745'5254'464c;
 inline constexpr myos_word_t PagerThreadDone = 0x5041'4745'5254'444e;
 inline constexpr myos_word_t PagerWorkerQueued = 0x5041'4745'5251'5545;
@@ -229,6 +234,11 @@ inline constexpr myos_word_t PagerVprocFaulting = 0x5041'4745'5246'4c54;
 inline constexpr myos_word_t PagerVprocPending = 0x5041'4745'5250'454e;
 inline constexpr myos_word_t PagerVprocDone = 0x5041'4745'5256'444e;
 inline constexpr myos_word_t PagerVprocDirtyRetryDone = 0x5041'4745'5256'4452;
+/*luna change: name the resilience proof phases in the same actor cells, reason: worker death redelivery and pager_fail supervision reuse the Pager lane without a second state machine*/
+inline constexpr myos_word_t PagerThreadFaulting2 = 0x5041'4745'5246'4c32;
+inline constexpr myos_word_t PagerWorkerDoomedClaimed = 0x5041'4745'5244'4f4d;
+inline constexpr myos_word_t PagerWorkerFailed = 0x5041'4745'5246'4149;
+inline constexpr myos_word_t PagerVprocDropped = 0x5041'4745'5256'4450;
 /*luna change: define compact one-shot TargetVproc fault detail codes, reason: proof diagnostics must identify the first failed gate without creating another state machine*/
 inline constexpr myos_word_t PagerDetailGeneration = 1;
 inline constexpr myos_word_t PagerDetailPending = 2;

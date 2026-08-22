@@ -364,8 +364,13 @@ boot_bundle = custom_target(
 )
 # /*luna change: encode pressure mode in the existing root module role, reason: the same user images and kernel composition need an explicit guest-visible run condition*/
 pressure_bundle = custom_target(
-  'pressure-bundle', input: [init_user, proof_user, uart_user], output: 'pressure.bundle',
-  command: [bootpack, '@OUTPUT@', 'pressure', 'pressure=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+    'pressure-bundle', input: [init_user, proof_user, uart_user], output: 'pressure.bundle',
+    command: [bootpack, '@OUTPUT@', 'pressure', 'pressure=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+)
+# /*luna change: encode resilience mode in its own root module role, reason: worker-death redelivery and pager_fail supervision are a separate run condition of the same images*/
+resilience_bundle = custom_target(
+    'resilience-bundle', input: [init_user, proof_user, uart_user], output: 'resilience.bundle',
+    command: [bootpack, '@OUTPUT@', 'resilience', 'resilience=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
 proof_bundle = custom_target(
   'proof-bundle', input: proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
@@ -400,6 +405,7 @@ run_target('debug-symbols', command: [sh, artifact, nm, 'symbols', kernel_debug,
 
 qemu = find_program('qemu-system-riscv64')
 timeout = get_option('qemu_timeout')
+resilience_timeout = get_option('qemu_resilience_timeout')
 pressure_timeout = get_option('qemu_pressure_timeout')
 smp = get_option('qemu_smp').to_string()
 pressure_memory = get_option('qemu_pressure_memory')
@@ -415,6 +421,8 @@ if profile == 'proof'
   run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'timeout', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', 'user: contained fault address=0xe100', '--initrd', pressure_bundle])
   # Full trace is an explicit diagnostic observation, not the functional gate.
   run_target('run-pressure-trace-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure_trace, 'timeout', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--initrd', pressure_bundle])
+  # /*luna change: gate the resilience condition on the default memory size, reason: worker death and pager_fail supervision do not manufacture PMM pressure*/
+  run_target('run-resilience-smp', command: [sh, run_qemu, qemu, resilience_timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=resilience', 'user: contained fault address=0x25001000', 'user: contained fault address=0xe100', '--initrd', resilience_bundle])
 endif
 if get_option('panic_probe') == 1
   run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'MYOS KERNEL PANIC', 'context: call-site', 'expression: false'])
@@ -455,4 +463,4 @@ alias_target('kernel-debug', kernel_debug)
 # /*luna change: expose the pressure image without changing ordinary aliases, reason: build and audit selection must remain explicit for the physical fixture*/
 alias_target('kernel-pressure', kernel_pressure)
 alias_target('kernel-pressure-trace', kernel_pressure_trace)
-alias_target('bundle', [boot_bundle, pressure_bundle, proof_bundle, uart_user])
+alias_target('bundle', [boot_bundle, pressure_bundle, resilience_bundle, proof_bundle, uart_user])
