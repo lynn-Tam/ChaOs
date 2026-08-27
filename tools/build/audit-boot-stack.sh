@@ -5,7 +5,10 @@ build_dir=$1
 budget=$2
 image=${3##*/}
 
-sources=$(mktemp)
+repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+project_tmp="$repo_root/.tmp/project"
+mkdir -p "$project_tmp"
+sources=$(mktemp "$project_tmp/audit-boot-stack.XXXXXX")
 trap 'rm -f "$sources"' EXIT
 ninja -C "$build_dir" -t inputs "$image" | sed -n 's#^\(\.\./\)*##; /\.cpp$/p' > "$sources"
 found=0

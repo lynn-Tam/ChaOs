@@ -19,7 +19,7 @@ RISC-V build directory. The project build wrapper always reuses that directory
 and stores ccache data in `build/ccache`:
 
 ```sh
-meson setup build/riscv64 --cross-file cross/riscv64-gcc.ini -Dbuildtype=plain -Db_ndebug=true
+CCACHE_DIR=build/ccache meson setup build/riscv64 --cross-file cross/riscv64-gcc.ini -Dbuildtype=plain -Db_ndebug=true
 tools/build/ninja.sh kernel.elf
 ```
 
@@ -45,18 +45,18 @@ tools/build/ninja.sh audit-kernel-symbols audit-kernel-stack
 tools/build/ninja.sh audit-symbols audit-boot-stack audit-user audit-clang
 tools/build/ninja.sh symbols disasm debug-symbols debug-disasm
 
-meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
+CCACHE_DIR=build/ccache meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
 tools/build/ninja.sh run-test-smp
 
-meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=watch -Dscenario=report -Dpanic_probe=0
+CCACHE_DIR=build/ccache meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=watch -Dscenario=report -Dpanic_probe=0
 tools/build/ninja.sh run-scenario
 
-meson setup --reconfigure build/riscv64 -Dprofile=proof -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
+CCACHE_DIR=build/ccache meson setup --reconfigure build/riscv64 -Dprofile=proof -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=0
 tools/build/ninja.sh run-proof-smp run-e1-smp
 
-meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=1
+CCACHE_DIR=build/ccache meson setup --reconfigure build/riscv64 -Dprofile=test -Dlock_diag=trace -Dconcurrency_diag=trace -Dscenario=off -Dpanic_probe=1
 tools/build/ninja.sh run-panic-smp
-meson setup --reconfigure build/riscv64 -Dpanic_probe=2
+CCACHE_DIR=build/ccache meson setup --reconfigure build/riscv64 -Dpanic_probe=2
 tools/build/ninja.sh run-panic-degraded-smp
 tools/build/ninja.sh debug
 ```

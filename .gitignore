@@ -1,4 +1,6 @@
 /*
+# Project-local ephemeral diagnostics and non-graph probes.
+/.tmp/
 !/.gitignore
 !/README.md
 !/meson.build

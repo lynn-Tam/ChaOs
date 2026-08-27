@@ -1,3 +1,4 @@
+#include <user/lib/bootstrap.hpp>
 #include <user/lib/context.hpp>
 #include <user/lib/syscall.hpp>
 #include <user/lib/uart.hpp>
@@ -11,41 +12,17 @@ constexpr myos_word_t UartAddress = 0x3001'0000;
 constexpr myos_word_t PageSize = 4096;
 constexpr myos_word_t IrqBadge = 1;
 
-[[nodiscard]] auto valid(
-    const myos_bootstrap_info* info,
-    myos_word_t size) noexcept -> bool {
-    return info != nullptr
-        && size >= sizeof(myos_bootstrap_info)
-        && info->magic == MYOS_BOOTSTRAP_MAGIC
-        && info->major == MYOS_BOOTSTRAP_MAJOR
-        && info->minor >= MYOS_BOOTSTRAP_MINOR
-        && info->size == sizeof(myos_bootstrap_info)
-        && info->cap_count <= MYOS_BOOTSTRAP_MAX_CAPS
-        && info->cpu_count != 0;
-}
-
-[[nodiscard]] auto capability(
-    const myos_bootstrap_info& info,
-    uint32_t kind) noexcept -> myos_cap_t {
-    for (uint32_t index = 0; index < info.cap_count; ++index) {
-        if (info.caps[index].kind == kind) {
-            return info.caps[index].handle;
-        }
-    }
-    return 0;
-}
-
 [[noreturn]] void stop() noexcept {
     myos::exit();
 }
 
-[[noreturn]] void run(const myos_bootstrap_info& info) noexcept {
-    const myos_cap_t vspace = capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
-    const myos_cap_t memory = capability(
-        info, MYOS_BOOTSTRAP_CAP_UART_MEMORY);
-    const myos_cap_t irq = capability(info, MYOS_BOOTSTRAP_CAP_UART_IRQ);
-    const myos_cap_t notification = capability(
-        info, MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION);
+[[noreturn]] void run(
+    const myos::bootstrap::BootstrapView& info) noexcept {
+    const myos_cap_t vspace = info.selector(MYOS_BOOTSTRAP_CAP_VSPACE);
+    const myos_cap_t memory = info.selector(MYOS_BOOTSTRAP_CAP_UART_MEMORY);
+    const myos_cap_t irq = info.selector(MYOS_BOOTSTRAP_CAP_UART_IRQ);
+    const myos_cap_t notification = info.selector(
+        MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION);
     if (vspace == 0 || memory == 0 || irq == 0 || notification == 0) {
         stop();
     }
@@ -119,9 +96,9 @@ constexpr myos_word_t IrqBadge = 1;
 extern "C" [[noreturn]] void myos_main(
     const void* bootstrap,
     myos_word_t bootstrap_size) noexcept {
-    const auto* const info = static_cast<const myos_bootstrap_info*>(
-        bootstrap);
-    if (!valid(info, bootstrap_size)) {
+    const auto info = myos::bootstrap::BootstrapView::parse(
+        bootstrap, bootstrap_size);
+    if (!info || info->cpu_count() == 0) {
         stop();
     }
     run(*info);

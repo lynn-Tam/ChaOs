@@ -11,12 +11,13 @@
 #define MYOS_SYS_SC_BIND             2 /* a0=SC, a1=Thread or Vproc */
 #define MYOS_SYS_EXECUTION_START     3 /* a0=Thread or Vproc */
 
-#define MYOS_SYS_CAP_CLOSE          16
+#define MYOS_SYS_CAP_CLOSE          16 /* a0=selector, a1=destination CSpace (0=current) */
 #define MYOS_SYS_CAP_DUPLICATE      17
 #define MYOS_SYS_CAP_DELEGATE       18
 #define MYOS_SYS_CAP_MOVE           19
 #define MYOS_SYS_CAP_REVOKE         20
 #define MYOS_SYS_OBJECT_DESTROY     21
+#define MYOS_SYS_CAP_TYPED_DELEGATE 22 /* a0=source, a1=destination CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset */
 
 #define MYOS_SYS_VM_MAP             32
 #define MYOS_SYS_VM_UNMAP           33

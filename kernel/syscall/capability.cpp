@@ -1,5 +1,6 @@
 #include "kernel/syscall/internal.hpp"
 
+#include <cap/attenuation.hpp>
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <object/object_store.hpp>
@@ -48,9 +49,66 @@ auto handle_capability(
     Thread* const thread = invocation.target.thread();
 
     if (operation == MYOS_SYS_CAP_CLOSE) {
-        auto closed = cspace.close(handle_of(trap.arg(0)));
+        const cap::CapHandle source = handle_of(trap.arg(0));
+        const usize destination_raw = trap.arg(1);
+        if (!source) {
+            return returned(MYOS_STATUS_INVALID_CAP);
+        }
+        if (destination_raw == 0) {
+            auto closed = cspace.close(source);
+            return returned(
+                closed ? MYOS_STATUS_OK : cap_status(closed.error()));
+        }
+
+        const cap::CapHandle target = handle_of(destination_raw);
+        if (!target) {
+            return returned(MYOS_STATUS_INVALID_CAP);
+        }
+        auto resolved = destination(cspace, target);
+        if (!resolved) {
+            return returned(cap_status(resolved.error()));
+        }
+        auto closed = resolved.value().object().close(source);
         return returned(
             closed ? MYOS_STATUS_OK : cap_status(closed.error()));
+    }
+    if (operation == MYOS_SYS_CAP_TYPED_DELEGATE) {
+        const cap::CapHandle source = handle_of(trap.arg(0));
+        const cap::CapHandle target = handle_of(trap.arg(1));
+        const cap::CapHandle descriptor = handle_of(trap.arg(2));
+        if (!source || !descriptor) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
+        auto read = read_snapshot_bytes(
+            invocation,
+            descriptor,
+            trap.arg(3),
+            libk::Span<byte>{bytes, sizeof(bytes)});
+        if (!read) {
+            return returned(read.error());
+        }
+        auto decoded = cap::decode_attenuation(
+            libk::Span<const byte>{bytes, sizeof(bytes)});
+        if (!decoded) {
+            return returned(MYOS_STATUS_BAD_ARGS);
+        }
+        if (!target) {
+            auto delegated = cspace.typed_delegate(
+                source, cspace, decoded.value());
+            return returned(
+                delegated ? MYOS_STATUS_OK : cap_status(delegated.error()),
+                delegated ? delegated.value().raw() : 0);
+        }
+        auto resolved = destination(cspace, target);
+        if (!resolved) {
+            return returned(cap_status(resolved.error()));
+        }
+        auto delegated = cspace.typed_delegate(
+            source, resolved.value().object(), decoded.value());
+        return returned(
+            delegated ? MYOS_STATUS_OK : cap_status(delegated.error()),
+            delegated ? delegated.value().raw() : 0);
     }
     if (operation == MYOS_SYS_CAP_DUPLICATE
         || operation == MYOS_SYS_CAP_DELEGATE) {

@@ -3,6 +3,7 @@
 #include <core/types.hpp>
 #include <libk/concepts.hpp>
 #include <libk/optional.hpp>
+#include <uapi/capability.h>
 
 namespace kernel::cap {
 
@@ -64,8 +65,7 @@ public:
     [[nodiscard]] constexpr auto raw() const noexcept -> u64 { return bits_; }
     [[nodiscard]] static constexpr auto from_raw(u64 bits) noexcept
         -> libk::optional<Rights> {
-        constexpr u64 valid = (u64{1} << 28) - 1;
-        return (bits & ~valid) == 0
+        return (bits & ~static_cast<u64>(MYOS_RIGHT_MASK)) == 0
             ? libk::optional<Rights>{Rights{bits}}
             : libk::nullopt;
     }

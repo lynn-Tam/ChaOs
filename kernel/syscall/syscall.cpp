@@ -59,7 +59,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     if (operation <= MYOS_SYS_EXECUTION_START) {
         outcome = handle_execution(operation, invocation);
     } else if (operation >= MYOS_SYS_CAP_CLOSE
-        && operation <= MYOS_SYS_OBJECT_DESTROY) {
+        && operation <= MYOS_SYS_CAP_TYPED_DELEGATE) {
         outcome = handle_capability(operation, invocation);
     } else if (operation >= MYOS_SYS_VM_MAP
         && operation <= MYOS_SYS_VM_DESTROY_REGION) {

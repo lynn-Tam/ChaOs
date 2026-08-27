@@ -1,5 +1,6 @@
 #include <test/test.hpp>
 
+#include <cap/attenuation.hpp>
 #include <cap/cspace.hpp>
 #include <cap/grant_graph.hpp>
 #include <cap/policy.hpp>
@@ -16,11 +17,15 @@
 #include <resource/traits.hpp>
 #include <sched/context.hpp>
 #include <thread/thread.hpp>
+#include <uapi/vm.h>
 
 namespace {
 
 using kernel::cap::CapView;
 using kernel::cap::CSpace;
+using kernel::cap::Attenuation;
+using kernel::cap::AttenuationError;
+using kernel::cap::EffectiveAuthority;
 using kernel::cap::GrantCeiling;
 using kernel::cap::GrantError;
 using kernel::cap::GrantGraph;
@@ -51,6 +56,41 @@ constexpr Rights basic_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect);
 constexpr Rights all_context_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control);
+
+constexpr Rights attenuation_rights = Rights::of(
+    Right::Duplicate, Right::Delegate, Right::Inspect);
+
+void put16(byte* bytes, usize offset, u16 value) noexcept {
+    bytes[offset] = static_cast<byte>(value);
+    bytes[offset + 1] = static_cast<byte>(value >> 8);
+}
+
+void put32(byte* bytes, usize offset, u32 value) noexcept {
+    for (usize index = 0; index < sizeof(value); ++index) {
+        bytes[offset + index] = static_cast<byte>(value >> (index * 8));
+    }
+}
+
+void put64(byte* bytes, usize offset, u64 value) noexcept {
+    for (usize index = 0; index < sizeof(value); ++index) {
+        bytes[offset + index] = static_cast<byte>(value >> (index * 8));
+    }
+}
+
+void attenuation_bytes(
+    byte (&bytes)[MYOS_CAP_ATTENUATION_SIZE],
+    u16 kind,
+    u64 rights = attenuation_rights.raw()) noexcept {
+    for (byte& value : bytes) {
+        value = 0;
+    }
+    put16(bytes, MYOS_CAP_ATTENUATION_VERSION_OFFSET,
+        MYOS_CAP_ATTENUATION_VERSION_CURRENT);
+    put16(bytes, MYOS_CAP_ATTENUATION_KIND_OFFSET, kind);
+    put32(bytes, MYOS_CAP_ATTENUATION_SIZE_OFFSET,
+        MYOS_CAP_ATTENUATION_SIZE);
+    put64(bytes, MYOS_CAP_ATTENUATION_RIGHTS_OFFSET, rights);
+}
 
 struct RevokeProbe final {
     void ready() noexcept { ++signals; }
@@ -225,6 +265,295 @@ private:
 
     kernel::object::ObjectStore::SchedulingContextHold targets_[2]{};
 };
+
+[[nodiscard]] auto decode_and_check(
+    kernel::object::ObjectKind kind,
+    const EffectiveAuthority& source,
+    byte (&bytes)[MYOS_CAP_ATTENUATION_SIZE]) noexcept -> bool {
+    auto decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded) {
+        return false;
+    }
+    auto ceiling = kernel::cap::make_attenuation_ceiling(
+        kind, source, decoded.value());
+    return ceiling
+        && kernel::cap::validate_ceiling(kind, ceiling.value())
+        && kernel::cap::attenuates(kind, source, ceiling.value());
+}
+
+bool test_typed_attenuation_covers_all_families(
+    const TestContext&) noexcept {
+    using kernel::cap::ChannelAuthority;
+    using kernel::cap::ChannelSide;
+    using kernel::cap::EndpointAuthority;
+    using kernel::cap::IrqAuthority;
+    using kernel::cap::MemoryAuthority;
+    using kernel::cap::NotificationAuthority;
+    using kernel::cap::PagerAuthority;
+    using kernel::cap::ResourcePoolAuthority;
+    using kernel::cap::VSpaceAuthority;
+    using kernel::object::ObjectKind;
+
+    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
+    const EffectiveAuthority simple{attenuation_rights, libk::monostate{}};
+    const ObjectKind simple_kinds[] = {
+        ObjectKind::Thread,
+        ObjectKind::Vproc,
+        ObjectKind::SchedulingContext,
+        ObjectKind::SchedulingDomain,
+        ObjectKind::CSpace};
+    for (const ObjectKind kind : simple_kinds) {
+        attenuation_bytes(bytes, static_cast<u16>(kind));
+        if (!decode_and_check(kind, simple, bytes)) {
+            return false;
+        }
+    }
+
+    const EffectiveAuthority memory{
+        attenuation_rights,
+        MemoryAuthority{
+            kernel::mm::ObjectRange{0, 16},
+            kernel::mm::AccessMask::of(kernel::mm::Access::Read),
+            kernel::mm::MemoryTypes::of(kernel::mm::MemoryType::Normal)}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_MEMORY);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 1);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET,
+        static_cast<u64>(MYOS_VM_READ));
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET,
+        static_cast<u64>(MYOS_VM_NORMAL));
+    if (!decode_and_check(ObjectKind::MemoryObject, memory, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority vspace{
+        attenuation_rights,
+        VSpaceAuthority{
+            kernel::mm::RegionKey{kernel::mm::StableNodeKey{1, 1}},
+            kernel::mm::VirtRange{kernel::mm::VirtAddr{0x1000}, 0x10000},
+            kernel::mm::AccessMask::of(kernel::mm::Access::Read),
+            kernel::mm::MemoryTypes::of(kernel::mm::MemoryType::Normal)}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_VSPACE);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 0x2000);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 0x2000);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET, MYOS_VM_NORMAL);
+    if (!decode_and_check(ObjectKind::VSpace, vspace, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority pool{
+        attenuation_rights,
+        ResourcePoolAuthority{
+            kernel::resource::Budget{1024 * 1024, 16},
+            (u64{1} << MYOS_OBJECT_KIND_COUNT) - 2}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_RESOURCE_POOL);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 4096);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 4);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET,
+        (u64{1} << MYOS_OBJECT_KIND_MEMORY));
+    if (!decode_and_check(ObjectKind::ResourcePool, pool, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority notification{
+        attenuation_rights, NotificationAuthority{7}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_NOTIFICATION);
+    if (!decode_and_check(ObjectKind::Notification, notification, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority endpoint{
+        attenuation_rights, EndpointAuthority{3, 3, 8}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_ENDPOINT);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 3);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 3);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, 4);
+    if (!decode_and_check(ObjectKind::Endpoint, endpoint, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority channel{
+        attenuation_rights, ChannelAuthority{ChannelSide::Any, 0, 0}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_CHANNEL);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET,
+        MYOS_CAP_CHANNEL_SIDE_A);
+    if (!decode_and_check(ObjectKind::Channel, channel, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority pager{
+        attenuation_rights, PagerAuthority{9, 8}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_PAGER);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 2);
+    if (!decode_and_check(ObjectKind::Pager, pager, bytes)) {
+        return false;
+    }
+
+    const EffectiveAuthority irq{
+        attenuation_rights, IrqAuthority{4, true}};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_IRQ);
+    return decode_and_check(ObjectKind::Irq, irq, bytes);
+}
+
+bool test_typed_attenuation_rejects_malformed_and_amplifying(
+    const TestContext&) noexcept {
+    using kernel::cap::ChannelAuthority;
+    using kernel::cap::ChannelSide;
+    using kernel::cap::MemoryAuthority;
+    using kernel::object::ObjectKind;
+
+    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
+    bytes[MYOS_CAP_ATTENUATION_VERSION_OFFSET] = 2;
+    if (kernel::cap::decode_attenuation(
+            libk::Span<const byte>{bytes, sizeof(bytes)})) {
+        return false;
+    }
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_TUNNEL);
+    if (kernel::cap::decode_attenuation(
+            libk::Span<const byte>{bytes, sizeof(bytes)})) {
+        return false;
+    }
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD5_OFFSET, 1);
+    auto decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded) {
+        return false;
+    }
+    const EffectiveAuthority simple{attenuation_rights, libk::monostate{}};
+    if (kernel::cap::make_attenuation_ceiling(
+            ObjectKind::Thread, simple, decoded.value())) {
+        return false;
+    }
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_MEMORY);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, ~u64{});
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET, MYOS_VM_NORMAL);
+    decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    const EffectiveAuthority memory{
+        attenuation_rights,
+        MemoryAuthority{
+            kernel::mm::ObjectRange{0, 16},
+            kernel::mm::AccessMask::of(kernel::mm::Access::Read),
+            kernel::mm::MemoryTypes::of(kernel::mm::MemoryType::Normal)}};
+    if (!decoded || kernel::cap::make_attenuation_ceiling(
+                         ObjectKind::MemoryObject, memory, decoded.value())) {
+        return false;
+    }
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_CHANNEL);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET,
+        MYOS_CAP_CHANNEL_SIDE_A);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 1);
+    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, ~u64{});
+    decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    const EffectiveAuthority channel{
+        attenuation_rights, ChannelAuthority{ChannelSide::Any, 0, 0}};
+    if (!decoded) {
+        return false;
+    }
+    auto channel_ceiling = kernel::cap::make_attenuation_ceiling(
+        ObjectKind::Channel, channel, decoded.value());
+    return channel_ceiling
+        && !kernel::cap::attenuates(
+            ObjectKind::Channel, channel, channel_ceiling.value());
+}
+
+bool test_typed_delegate_transaction_rolls_back(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    auto root = fixture.root(0);
+    if (!root) {
+        return false;
+    }
+    auto source = fixture.a().insert(
+        libk::move(root).value(), CapView{basic_rights});
+    if (!source) {
+        return false;
+    }
+    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT);
+    auto decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded) {
+        return false;
+    }
+    const usize before_slots = fixture.b().live_slots();
+    const usize before_grants = fixture.graph().live_count();
+    auto child = fixture.a().typed_delegate(
+        source.value(), fixture.b(), decoded.value());
+    if (!child || fixture.b().live_slots() != before_slots + 1
+        || fixture.graph().live_count() != before_grants + 1) {
+        return false;
+    }
+    {
+        auto resolved = fixture.b().resolve<
+            kernel::sched::SchedulingContext>(child.value(), inspect_rights);
+        if (!resolved) {
+            return false;
+        }
+    }
+    if (!fixture.b().close(child.value())) {
+        return false;
+    }
+    const usize stable_slots = fixture.b().live_slots();
+    const usize stable_grants = fixture.graph().live_count();
+
+    // Fill the bounded destination so the production transaction derives its
+    // child Grant before destination reservation fails.  GrantGraph and CSpace
+    // must return to the exact pre-call counts, not merely reject early.
+    auto occupied = fixture.a().duplicate(
+        source.value(), fixture.one(), basic_rights);
+    if (!occupied || fixture.one().live_slots() != 1) {
+        return false;
+    }
+    const usize full_slots = fixture.one().live_slots();
+    const usize full_grants = fixture.graph().live_count();
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT);
+    decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded
+        || fixture.a().typed_delegate(
+               source.value(), fixture.one(), decoded.value())
+        || fixture.one().live_slots() != full_slots
+        || fixture.graph().live_count() != full_grants
+        || !fixture.one().close(occupied.value())) {
+        return false;
+    }
+
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
+    decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded
+        || fixture.a().typed_delegate(
+               source.value(), fixture.b(), decoded.value())
+        || fixture.b().live_slots() != stable_slots
+        || fixture.graph().live_count() != stable_grants) {
+        return false;
+    }
+    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT,
+        static_cast<u64>(MYOS_RIGHT_CONTROL));
+    decoded = kernel::cap::decode_attenuation(
+        libk::Span<const byte>{bytes, sizeof(bytes)});
+    if (!decoded
+        || fixture.a().typed_delegate(
+               source.value(), fixture.b(), decoded.value())
+        || fixture.b().live_slots() != stable_slots
+        || fixture.graph().live_count() != stable_grants) {
+        return false;
+    }
+    return fixture.a().close(source.value())
+        && !fixture.a().typed_delegate(
+            source.value(), fixture.b(), decoded.value());
+}
 
 bool test_resolve_composes_authority_and_pins_kind(
     const TestContext&) noexcept {
@@ -425,6 +754,36 @@ bool test_handles_are_local_and_stale_generation_stays_dead(
     }
     return fixture.a().close(replacement.value())
         && fixture.b().close(handle_b.value())
+        && fixture.graph().live_count() == 0;
+}
+
+bool test_remote_selector_close_is_cspace_exact(
+    const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) {
+        return false;
+    }
+    auto root = fixture.root(0);
+    if (!root) {
+        return false;
+    }
+    auto installed = fixture.b().insert(
+        libk::move(root).value(), CapView{inspect_rights});
+    if (!installed) {
+        return false;
+    }
+    const auto selector = installed.value();
+    auto wrong_space = fixture.a().close(selector);
+    if (wrong_space
+        || wrong_space.error() != kernel::cap::CSpaceError::InvalidHandle) {
+        return false;
+    }
+    if (!fixture.b().close(selector)) {
+        return false;
+    }
+    auto stale = fixture.b().close(selector);
+    return !stale
+        && stale.error() == kernel::cap::CSpaceError::InvalidState
         && fixture.graph().live_count() == 0;
 }
 
@@ -1138,6 +1497,18 @@ bool test_tunnel_rights_keep_connect_and_tx_distinct(
 void register_cap_tests(TestRegistry& registry) noexcept {
     (void)registry.add(
         "cap",
+        "typed attenuation decodes every supported capability family",
+        test_typed_attenuation_covers_all_families);
+    (void)registry.add(
+        "cap",
+        "typed attenuation rejects malformed and amplifying descriptors",
+        test_typed_attenuation_rejects_malformed_and_amplifying);
+    (void)registry.add(
+        "cap",
+        "typed delegation commits atomically and rolls back on rejection",
+        test_typed_delegate_transaction_rolls_back);
+    (void)registry.add(
+        "cap",
         "resolve composes authority and pins the typed target",
         test_resolve_composes_authority_and_pins_kind);
     (void)registry.add(
@@ -1152,6 +1523,10 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         "cap",
         "handles are CSpace-local and stale generations stay dead",
         test_handles_are_local_and_stale_generation_stays_dead);
+    (void)registry.add(
+        "cap",
+        "remote selector close targets the exact CSpace",
+        test_remote_selector_close_is_cspace_exact);
     (void)registry.add(
         "cap",
         "move preserves source when destination transaction fails",

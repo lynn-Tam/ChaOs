@@ -40,6 +40,7 @@ constexpr u64 kRelationGenerationMax = static_cast<u64>(
         return ChannelError::ResourceExhausted;
     case cap::CSpaceError::InvalidHandle:
     case cap::CSpaceError::WrongKind:
+    case cap::CSpaceError::InvalidDescriptor:
     case cap::CSpaceError::GrantUnavailable:
         return ChannelError::Invalid;
     case cap::CSpaceError::InvalidState:

@@ -8,9 +8,12 @@ image=$4
 status_contract=$5
 shift 5
 
-output=$(mktemp)
-markers=$(mktemp)
-stop_markers=$(mktemp)
+repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+project_tmp="$repo_root/.tmp/project"
+mkdir -p "$project_tmp"
+output=$(mktemp "$project_tmp/run-qemu-output.XXXXXX")
+markers=$(mktemp "$project_tmp/run-qemu-markers.XXXXXX")
+stop_markers=$(mktemp "$project_tmp/run-qemu-stop-markers.XXXXXX")
 runner=''
 cleanup() {
   if [ -n "$runner" ] && kill -0 "$runner" 2>/dev/null; then

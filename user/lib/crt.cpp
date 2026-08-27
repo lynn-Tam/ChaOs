@@ -1,5 +1,8 @@
 #include <stddef.h>
 
+#include <libk/assert.hpp>
+#include <user/lib/syscall.hpp>
+
 namespace {
 using Constructor = void (*)();
 }
@@ -14,3 +17,9 @@ extern "C" void __myos_init() noexcept {
         (*constructor)();
     }
 }
+
+namespace libk {
+[[noreturn]] void assert_fail(const AssertInfo&) noexcept {
+    myos::exit();
+}
+} // namespace libk

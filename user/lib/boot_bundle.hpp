@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <uapi/arch/riscv64/address_space.h>
 #include <uapi/boot_bundle.h>
 
 namespace myos::boot {
@@ -45,17 +46,25 @@ public:
             ? Bytes{data_ + offset, size}
             : Bytes{};
     }
-    /*luna change: centralize bounded manifest-name comparison, reason: root-role and module lookup must share one exact C-string name invariant*/
-    [[nodiscard]] auto equals(const char* name) const noexcept -> bool {
-        size_t length{};
-        while (name[length] != '\0') {
-            ++length;
-        }
-        if (size_ != length) {
+    template<size_t N>
+    [[nodiscard]] auto equals(const char (&name)[N]) const noexcept -> bool {
+        static_assert(N != 0);
+        if (size_ != N - 1) {
             return false;
         }
-        for (size_t index = 0; index < length; ++index) {
+        for (size_t index = 0; index < N - 1; ++index) {
             if (data_[index] != static_cast<uint8_t>(name[index])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    [[nodiscard]] constexpr auto equals(Bytes other) const noexcept -> bool {
+        if (size_ != other.size_) {
+            return false;
+        }
+        for (size_t index = 0; index < size_; ++index) {
+            if (data_[index] != other.data_[index]) {
                 return false;
             }
         }
@@ -84,8 +93,17 @@ public:
         if (index >= segment_count_) {
             return false;
         }
+        if (segment_first_ > segment_table_count_
+            || index > segment_table_count_ - segment_first_) {
+            return false;
+        }
+        const size_t relative = segment_first_ + index;
+        if (relative > (bytes_.size() - segments_offset_)
+                / MYOS_BOOT_SEGMENT_SIZE) {
+            return false;
+        }
         const size_t offset = segments_offset_
-            + (segment_first_ + index) * MYOS_BOOT_SEGMENT_SIZE;
+            + relative * MYOS_BOOT_SEGMENT_SIZE;
         uint64_t address{};
         uint64_t file_offset{};
         uint64_t file_size{};
@@ -102,11 +120,36 @@ public:
             || !bytes_.read(offset + 44, 4, reserved)
             || reserved != 0 || memory_size == 0
             || file_size > memory_size
+            || alignment == 0 || (alignment & (alignment - 1)) != 0
+            || alignment < 4096
+            || alignment > MYOS_RISCV64_LOWER_CANONICAL_END
+            || (address & 4095) != 0
+            || address < MYOS_RISCV64_LOW_GUARD_END
+            || address >= MYOS_RISCV64_LOWER_CANONICAL_END
+            || memory_size > MYOS_RISCV64_LOWER_CANONICAL_END - address
+            || (access & ~static_cast<uint64_t>(
+                MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_WRITE
+                    | MYOS_BOOT_SEGMENT_EXECUTE)) != 0
+            || access == 0
+            || ((access & MYOS_BOOT_SEGMENT_WRITE) != 0
+                && (access & MYOS_BOOT_SEGMENT_READ) == 0)
+            || ((access & MYOS_BOOT_SEGMENT_WRITE) != 0
+                && (access & MYOS_BOOT_SEGMENT_EXECUTE) != 0)
             || file_offset > bytes_.size()
             || file_size > bytes_.size() - file_offset
             || file_offset < image_offset_
             || file_offset - image_offset_ > image_size_
             || file_size > image_size_ - (file_offset - image_offset_)) {
+            return false;
+        }
+        const uint64_t rounded_memory =
+            (memory_size + UINT64_C(4095)) / UINT64_C(4096)
+            * UINT64_C(4096);
+        if (rounded_memory > MYOS_RISCV64_LOWER_CANONICAL_END - address) {
+            return false;
+        }
+        if ((address % alignment)
+            != ((file_offset - image_offset_) % alignment)) {
             return false;
         }
         out = Segment{
@@ -130,6 +173,7 @@ private:
     size_t segments_offset_{};
     size_t segment_first_{};
     size_t segment_count_{};
+    size_t segment_table_count_{};
 };
 
 class Bundle final {
@@ -138,6 +182,9 @@ public:
         -> Bundle {
         Bundle result{};
         const Bytes bytes{data, size};
+        if (data == nullptr && size != 0) {
+            return result;
+        }
         uint64_t magic{};
         uint64_t major{};
         uint64_t minor{};
@@ -190,6 +237,9 @@ public:
         result.root_index_ = static_cast<size_t>(root_index);
         result.segments_offset_ = static_cast<size_t>(segments_offset);
         result.segment_count_ = static_cast<size_t>(segments_count);
+        if (!result.validate_modules()) {
+            return {};
+        }
         return result;
     }
 
@@ -202,8 +252,8 @@ public:
     [[nodiscard]] auto root_index() const noexcept -> size_t {
         return root_index_;
     }
-    /*luna change: compare the selected root role without Loader byte parsing, reason: pressure mode is encoded by the existing bundle root role*/
-    [[nodiscard]] auto root_is(const char* name) const noexcept -> bool {
+    template<size_t N>
+    [[nodiscard]] auto root_is(const char (&name)[N]) const noexcept -> bool {
         Module root{};
         return module(root_index_, root) && root.name().equals(name);
     }
@@ -244,6 +294,11 @@ public:
             || segment_count > segment_count_ - segment_first) {
             return false;
         }
+        for (size_t byte = 0; byte < name_size; ++byte) {
+            if (bytes_.data()[name_offset + byte] == 0) {
+                return false;
+            }
+        }
         Module decoded{};
         decoded.bytes_ = bytes_;
         decoded.name_ = bytes_.slice(name_offset, name_size);
@@ -253,12 +308,27 @@ public:
         decoded.segments_offset_ = segments_offset_;
         decoded.segment_first_ = static_cast<size_t>(segment_first);
         decoded.segment_count_ = static_cast<size_t>(segment_count);
+        decoded.segment_table_count_ = segment_count_;
         out = decoded;
         return true;
     }
-    /*luna change: reuse the manifest-name comparison for module lookup, reason: all role selection must enforce the same exact bounded name rule*/
-    [[nodiscard]] auto find(const char* name, Module& out) const noexcept
+    template<size_t N>
+    [[nodiscard]] auto find(const char (&name)[N], Module& out) const noexcept
         -> bool {
+        for (size_t index = 0; index < module_count_; ++index) {
+            Module candidate{};
+            if (!module(index, candidate) || !candidate.name().equals(name)) {
+                continue;
+            }
+            out = candidate;
+            return true;
+        }
+        return false;
+    }
+    [[nodiscard]] auto find(Bytes name, Module& out) const noexcept -> bool {
+        if (!name) {
+            return false;
+        }
         for (size_t index = 0; index < module_count_; ++index) {
             Module candidate{};
             if (!module(index, candidate) || !candidate.name().equals(name)) {
@@ -271,6 +341,47 @@ public:
     }
 
 private:
+    [[nodiscard]] auto validate_modules() const noexcept -> bool {
+        size_t expected_segment{};
+        for (size_t module_index = 0; module_index < module_count_;
+             ++module_index) {
+            Module candidate{};
+            if (!module(module_index, candidate)
+                || candidate.segment_count() == 0
+                || candidate.segment_count() > 32
+                || candidate.segment_count()
+                    > segment_count_ - expected_segment
+                || candidate.segment_first_ != expected_segment) {
+                return false;
+            }
+            expected_segment += candidate.segment_count();
+            size_t previous_end{};
+            bool entry_covered{};
+            for (size_t index = 0; index < candidate.segment_count(); ++index) {
+                Segment segment{};
+                if (!candidate.segment(index, segment)) {
+                    return false;
+                }
+                const size_t rounded =
+                    (segment.memory_size + 4095) & ~size_t{4095};
+                if (index != 0 && segment.address < previous_end) {
+                    return false;
+                }
+                previous_end = segment.address + rounded;
+                if (candidate.entry() >= segment.address
+                    && candidate.entry() - segment.address
+                        < segment.memory_size
+                    && (segment.access & MYOS_BOOT_SEGMENT_EXECUTE) != 0) {
+                    entry_covered = true;
+                }
+            }
+            if (!entry_covered) {
+                return false;
+            }
+        }
+        return expected_segment == segment_count_;
+    }
+
     Bytes bytes_{};
     size_t modules_offset_{};
     size_t module_count_{};

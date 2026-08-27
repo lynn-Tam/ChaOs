@@ -92,7 +92,7 @@ core_kernel_sources = files(
   'kernel/boot/boot.cpp', 'kernel/boot/cpu_topology.cpp', 'kernel/boot/timebase.cpp',
   'kernel/boot/firmware/devicetree/fdt.cpp', 'kernel/image/boot_bundle.cpp',
   'kernel/init/root_task.cpp', 'kernel/init/run.cpp', 'kernel/core/kernel_state.cpp',
-  'kernel/cpu/cpu_runtime.cpp', 'kernel/cap/policy.cpp', 'kernel/cap/grant_graph.cpp',
+  'kernel/cpu/cpu_runtime.cpp', 'kernel/cap/policy.cpp', 'kernel/cap/attenuation.cpp', 'kernel/cap/grant_graph.cpp',
   'kernel/cap/cspace.cpp', 'kernel/ipc/notification.cpp', 'kernel/ipc/buffer.cpp',
   'kernel/ipc/tunnel.cpp', 'kernel/ipc/channel.cpp', 'kernel/pager/pager.cpp',
   'kernel/irq/irq.cpp', 'kernel/ipc/endpoint.cpp', 'kernel/ipc/transfer.cpp',
@@ -358,6 +358,76 @@ bootpack = executable(
   'bootpack', files('tools/bootpack/main.cpp'), native: true,
   cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
 )
+deploypack = executable(
+  'deploypack', files('tools/deploypack/main.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+task_builder_test_manifest = executable(
+  'task-builder-test-manifest', files('test/user/task_builder/manifest.cpp'),
+  native: true, cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+task_builder_test_manifest_source = custom_target(
+  'task-builder-test-manifest-source', output: 'task_builder_test_manifest.cpp',
+  command: [task_builder_test_manifest, '@OUTPUT@'], build_by_default: false,
+)
+task_builder_test_user = executable(
+  'task-builder-test.elf', [files('test/user/task_builder/main.cpp'), task_builder_test_manifest_source],
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime,
+  link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'task-builder-test.map')],
+  link_language: 'c', build_by_default: false,
+)
+task_builder_test_child = executable(
+  'task-builder-test-child.elf', files('test/user/task_builder/child.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime,
+  link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'task-builder-test-child.map')],
+  link_language: 'c', build_by_default: false,
+)
+deploy_manifest_test = executable(
+  'deploy-manifest-test', files('tools/deploy_manifest_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+boot_bundle_test = executable(
+  'boot-bundle-test', files('tools/boot_bundle_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+capability_owner_test = executable(
+  'capability-owner-test', files('tools/capability_owner_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+deployment_test = executable(
+  'deployment-test', files('tools/deployment_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+syscall_dependency_test = executable(
+  'syscall-dependency-test', files('tools/syscall_dependency_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+image_materializer_test = executable(
+  'image-materializer-test', files('tools/image_materializer_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+task_transaction_test = executable(
+  'task-transaction-test', files('tools/task_transaction_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+task_authority_test = executable(
+  'task-authority-test', files('tools/task_authority_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
+)
+deploy_fixture = custom_target(
+  'deploy-fixture', output: 'deployment.fixture',
+  command: [deploypack, '@OUTPUT@'], build_by_default: false,
+)
+run_target('test-deploy-manifest', command: [deploy_manifest_test, deploy_fixture])
+run_target('test-boot-bundle', command: [boot_bundle_test])
+run_target('test-capability-owner', command: [capability_owner_test])
+run_target('test-deployment', command: [deployment_test])
+run_target('test-syscall-dependency', command: [syscall_dependency_test])
+run_target('test-image-materializer', command: [image_materializer_test])
+run_target('test-task-transaction', command: [task_transaction_test])
+run_target('test-task-authority', command: [task_authority_test])
 boot_bundle = custom_target(
   'boot-bundle', input: [init_user, proof_user, uart_user], output: 'boot.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
@@ -375,6 +445,11 @@ resilience_bundle = custom_target(
 proof_bundle = custom_target(
   'proof-bundle', input: proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
 )
+task_builder_test_bundle = custom_target(
+  'task-builder-test.bundle', input: [task_builder_test_user, task_builder_test_child], output: 'task-builder-test.bundle',
+  command: [bootpack, '@OUTPUT@', 'task-builder-test', 'task-builder-test=@INPUT0@', 'child=@INPUT1@'],
+  build_by_default: false,
+)
 
 nm = find_program('riscv64-unknown-elf-nm')
 ar = find_program('riscv64-unknown-elf-ar')
@@ -383,6 +458,10 @@ clangxx = find_program('clang++')
 audit_symbols = files('tools/build/audit-symbols.sh')
 audit_stack = files('tools/build/audit-boot-stack.sh')
 audit_user = files('tools/build/audit-user.sh')
+audit_uart_cleanup = files('tools/build/audit-uart-cleanup.sh')
+audit_proof_ownership = files('tools/build/audit-proof-ownership.sh')
+audit_task_transaction = files('tools/build/audit-task-transaction.sh')
+audit_task_authority = files('tools/build/audit-task-authority.sh')
 audit_clang = files('tools/build/audit-clang.sh')
 run_qemu = files('tools/build/run-qemu.sh')
 artifact = files('tools/build/artifact.sh')
@@ -396,6 +475,12 @@ run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_di
 run_target('audit-pressure-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure])
 run_target('audit-pressure-trace-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure_trace])
 run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, proof_user, uart_user])
+run_target('audit-uart-cleanup', command: [sh, audit_uart_cleanup, join_paths(root, 'servers/init/main.cpp')])
+run_target('audit-proof-ownership', command: [sh, audit_proof_ownership, join_paths(root, 'servers/init/main.cpp')])
+run_target('audit-task-transaction', command: [sh, audit_task_transaction, join_paths(root, 'user/lib/task_transaction.hpp')])
+run_target('audit-task-authority', command: [sh, audit_task_authority,
+  join_paths(root, 'user/lib/task_authority.hpp'),
+  join_paths(root, 'user/lib/deploy_manifest.hpp')])
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, concurrency_diag_level.to_string(), lock_diag_level.to_string(), get_option('panic_probe').to_string()])
 objdump = find_program('riscv64-unknown-elf-objdump')
 run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])
@@ -418,11 +503,13 @@ if profile == 'proof'
   run_target('run-proof-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'root init: started', 'user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1', '--initrd', proof_bundle])
   run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', boot_bundle])
   # /*luna change: route pressure through its root role, watchdog and fixture image, reason: one explicit A-to-A' run condition keeps ordinary E1 unchanged while exercising the physical PMM floor*/
-  run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'marker', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'uart: online', '--stop-when', 'user: contained fault address=0xe0', '--stop-when', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', 'user: contained fault address=0xe100', 'uart: online', '--initrd', pressure_bundle])
+  run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'marker', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'uart: online', '--stop-when', 'user: contained fault address=0xe0', '--stop-when', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--regex', 'user: contained.*fault address=0xe100', 'uart: online', '--initrd', pressure_bundle])
   # Full trace is an explicit diagnostic observation, not the functional gate.
   run_target('run-pressure-trace-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure_trace, 'timeout', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--initrd', pressure_bundle])
   # /*luna change: gate the resilience condition on the default memory size, reason: worker death and pager_fail supervision do not manufacture PMM pressure*/
   run_target('run-resilience-smp', command: [sh, run_qemu, qemu, resilience_timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=resilience', 'user: contained fault address=0x25001000', 'user: contained fault address=0xe100', '--initrd', resilience_bundle])
+  run_target('run-task-builder-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--forbid', 'MYOS KERNEL PANIC', 'task-builder-test: boot-root', 'task-builder-test: manifest-decoded', 'task-builder-test: cuts-ok', 'task-builder-test: passed', '--initrd', task_builder_test_bundle])
+  run_target('audit-task-builder-test-user', command: [sh, audit_user, nm, readelf, task_builder_test_user, task_builder_test_child])
 endif
 if get_option('panic_probe') == 1
   run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'MYOS KERNEL PANIC', 'context: call-site', 'expression: false'])

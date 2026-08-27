@@ -296,6 +296,7 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
         kernel::cap::Right::CreateRegion,
         kernel::cap::Right::Map,
         kernel::cap::Right::Unmap,
+        kernel::cap::Right::Destroy,
         kernel::cap::Right::Protect,
         kernel::cap::Right::Inspect,
         kernel::cap::Right::Manage,

@@ -119,6 +119,7 @@ struct Policy final {
     case MYOS_SYS_CAP_DUPLICATE:
     case MYOS_SYS_CAP_DELEGATE:
     case MYOS_SYS_CAP_MOVE:
+    case MYOS_SYS_CAP_TYPED_DELEGATE:
     case MYOS_SYS_OBJECT_DESTROY:
     case MYOS_SYS_VM_CREATE_REGION:
     case MYOS_SYS_VM_RESERVE:

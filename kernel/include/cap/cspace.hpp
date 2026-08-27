@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arch/interrupt.hpp>
+#include <cap/attenuation.hpp>
 #include <cap/authority.hpp>
 #include <cap/grant_graph.hpp>
 #include <cap/handle.hpp>
@@ -48,6 +49,7 @@ enum class CSpaceError : u8 {
     Contended,
     GrantUnavailable,
     ResourceExhausted,
+    InvalidDescriptor,
 };
 
 class CSpace final : private libk::noncopyable_nonmovable {
@@ -150,6 +152,11 @@ public:
         CapHandle source,
         CSpace& destination,
         Rights rights) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+    [[nodiscard]] auto typed_delegate(
+        CapHandle source,
+        CSpace& destination,
+        const Attenuation& descriptor) noexcept
+        -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto move(
         CapHandle source,
         CSpace& destination) noexcept -> libk::Expected<CapHandle, CSpaceError>;
@@ -309,6 +316,12 @@ private:
 
     [[nodiscard]] auto snapshot(CapHandle handle) noexcept
         -> libk::Expected<Snapshot, CSpaceError>;
+    [[nodiscard]] auto delegate_snapshot(
+        Snapshot&& source,
+        CSpace& destination,
+        GrantCeiling ceiling,
+        CapView view) noexcept
+        -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto commit(
         Reservation& reservation,
         GrantRef&& grant,

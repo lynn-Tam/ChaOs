@@ -33,6 +33,8 @@ auto cap_status(cap::CSpaceError error) noexcept -> myos_status_t {
     case cap::CSpaceError::InvalidHandle:
     case cap::CSpaceError::WrongKind:
         return MYOS_STATUS_INVALID_CAP;
+    case cap::CSpaceError::InvalidDescriptor:
+        return MYOS_STATUS_BAD_ARGS;
     case cap::CSpaceError::Denied:
         return MYOS_STATUS_BAD_RIGHTS;
     case cap::CSpaceError::Amplification:

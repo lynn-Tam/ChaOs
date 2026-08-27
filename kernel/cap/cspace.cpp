@@ -274,16 +274,11 @@ auto CSpace::duplicate(
         CapView{rights, effective.value().data});
 }
 
-auto CSpace::delegate(
-    CapHandle source_handle,
+auto CSpace::delegate_snapshot(
+    Snapshot&& source,
     CSpace& destination,
     GrantCeiling ceiling,
     CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return libk::unexpected(copied.error());
-    }
-    Snapshot source = libk::move(copied).value();
     GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
@@ -332,6 +327,19 @@ auto CSpace::delegate(
 auto CSpace::delegate(
     CapHandle source_handle,
     CSpace& destination,
+    GrantCeiling ceiling,
+    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    auto copied = snapshot(source_handle);
+    if (!copied) {
+        return libk::unexpected(copied.error());
+    }
+    return delegate_snapshot(
+        libk::move(copied).value(), destination, ceiling, view);
+}
+
+auto CSpace::delegate(
+    CapHandle source_handle,
+    CSpace& destination,
     Rights rights) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     auto copied = snapshot(source_handle);
     if (!copied) {
@@ -344,11 +352,45 @@ auto CSpace::delegate(
         return libk::unexpected(policy_error(effective.error()));
     }
     const GrantCeiling ceiling{rights, effective.value().data};
-    return delegate(
-        source_handle,
+    return delegate_snapshot(
+        libk::move(source),
         destination,
         ceiling,
         CapView{rights, effective.value().data});
+}
+
+auto CSpace::typed_delegate(
+    CapHandle source_handle,
+    CSpace& destination,
+    const Attenuation& descriptor) noexcept
+    -> libk::Expected<CapHandle, CSpaceError> {
+    auto copied = snapshot(source_handle);
+    if (!copied) {
+        return libk::unexpected(copied.error());
+    }
+    Snapshot source = libk::move(copied).value();
+    const GrantLease& lease = source.lease;
+    auto effective = compose(lease.kind(), lease.ceiling(), source.view);
+    if (!effective) {
+        return libk::unexpected(policy_error(effective.error()));
+    }
+    if (!effective.value().rights.contains(Right::Delegate)) {
+        return libk::unexpected(CSpaceError::Denied);
+    }
+    auto ceiling = make_attenuation_ceiling(
+        lease.kind(), effective.value(), descriptor);
+    if (!ceiling) {
+        return libk::unexpected(CSpaceError::InvalidDescriptor);
+    }
+    if (!validate_ceiling(lease.kind(), ceiling.value())
+        || !attenuates(lease.kind(), effective.value(), ceiling.value())) {
+        return libk::unexpected(CSpaceError::Amplification);
+    }
+    return delegate_snapshot(
+        libk::move(source),
+        destination,
+        ceiling.value(),
+        CapView{ceiling.value().rights, ceiling.value().data});
 }
 
 auto CSpace::revoke(

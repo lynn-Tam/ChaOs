@@ -3,11 +3,59 @@
 #ifdef __ASSEMBLER__
 #define MYOS_U64_C(value) value
 #else
+#include <stddef.h>
 #include <stdint.h>
 
 typedef uint64_t myos_cap_t;
 #define MYOS_U64_C(value) UINT64_C(value)
 #endif
+
+/*
+ * A fixed-width, naturally aligned source-relative attenuation descriptor.
+ * This is an ABI shape only: syscall consumers snapshot and decode each
+ * field explicitly as little-endian bytes rather than treating a user buffer
+ * as a native C object.
+ */
+#ifndef __ASSEMBLER__
+#ifdef __cplusplus
+struct alignas(8) myos_cap_attenuation {
+#else
+struct myos_cap_attenuation {
+#endif
+    uint16_t version;
+    uint16_t kind;
+    uint32_t size;
+    uint64_t rights;
+    uint64_t words[6];
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_cap_attenuation) == 64);
+static_assert(alignof(myos_cap_attenuation) == 8);
+static_assert(offsetof(myos_cap_attenuation, version) == 0);
+static_assert(offsetof(myos_cap_attenuation, kind) == 2);
+static_assert(offsetof(myos_cap_attenuation, size) == 4);
+static_assert(offsetof(myos_cap_attenuation, rights) == 8);
+static_assert(offsetof(myos_cap_attenuation, words) == 16);
+#endif
+#endif
+
+#define MYOS_CAP_ATTENUATION_VERSION_OFFSET 0U
+#define MYOS_CAP_ATTENUATION_KIND_OFFSET 2U
+#define MYOS_CAP_ATTENUATION_SIZE_OFFSET 4U
+#define MYOS_CAP_ATTENUATION_RIGHTS_OFFSET 8U
+#define MYOS_CAP_ATTENUATION_WORD0_OFFSET 16U
+#define MYOS_CAP_ATTENUATION_WORD1_OFFSET 24U
+#define MYOS_CAP_ATTENUATION_WORD2_OFFSET 32U
+#define MYOS_CAP_ATTENUATION_WORD3_OFFSET 40U
+#define MYOS_CAP_ATTENUATION_WORD4_OFFSET 48U
+#define MYOS_CAP_ATTENUATION_WORD5_OFFSET 56U
+#define MYOS_CAP_ATTENUATION_SIZE 64U
+#define MYOS_CAP_ATTENUATION_VERSION_CURRENT 1U
+
+/* Capability-family fields with a stable public encoding. */
+#define MYOS_CAP_CHANNEL_SIDE_A 0U
+#define MYOS_CAP_CHANNEL_SIDE_B 1U
 
 #define MYOS_RIGHT_DUPLICATE     (MYOS_U64_C(1) << 0)
 #define MYOS_RIGHT_DELEGATE      (MYOS_U64_C(1) << 1)
@@ -37,3 +85,4 @@ typedef uint64_t myos_cap_t;
 #define MYOS_RIGHT_ROUTE         (MYOS_U64_C(1) << 25)
 #define MYOS_RIGHT_OBSERVE       (MYOS_U64_C(1) << 26)
 #define MYOS_RIGHT_ATTACH        (MYOS_U64_C(1) << 27)
+#define MYOS_RIGHT_MASK          ((MYOS_U64_C(1) << 28) - 1)

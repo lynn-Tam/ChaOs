@@ -1,23 +1,37 @@
 #pragma once
 
-#include <stdint.h>
+#include <uapi/object.h>
 
 // Typed constructor authority mask. These values are ABI identifiers, not
 // generic object_create tags: each admitted kind still has a distinct syscall.
-#define MYOS_RESOURCE_THREAD            (UINT64_C(1) << 1)
-#define MYOS_RESOURCE_SCHED_CONTEXT     (UINT64_C(1) << 2)
-#define MYOS_RESOURCE_SCHED_DOMAIN      (UINT64_C(1) << 3)
-#define MYOS_RESOURCE_CSPACE            (UINT64_C(1) << 4)
-#define MYOS_RESOURCE_MEMORY            (UINT64_C(1) << 5)
-#define MYOS_RESOURCE_VSPACE            (UINT64_C(1) << 6)
-#define MYOS_RESOURCE_POOL              (UINT64_C(1) << 7)
-#define MYOS_RESOURCE_NOTIFICATION      (UINT64_C(1) << 8)
-#define MYOS_RESOURCE_VPROC             (UINT64_C(1) << 9)
-#define MYOS_RESOURCE_TUNNEL            (UINT64_C(1) << 10)
-#define MYOS_RESOURCE_ENDPOINT          (UINT64_C(1) << 11)
-#define MYOS_RESOURCE_CHANNEL           (UINT64_C(1) << 12)
-#define MYOS_RESOURCE_PAGER             (UINT64_C(1) << 13)
-#define MYOS_RESOURCE_IRQ               (UINT64_C(1) << 14)
+#define MYOS_RESOURCE_THREAD \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_THREAD)
+#define MYOS_RESOURCE_SCHED_CONTEXT \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_SCHED_CONTEXT)
+#define MYOS_RESOURCE_SCHED_DOMAIN \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_SCHED_DOMAIN)
+#define MYOS_RESOURCE_CSPACE \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_CSPACE)
+#define MYOS_RESOURCE_MEMORY \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_MEMORY)
+#define MYOS_RESOURCE_VSPACE \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_VSPACE)
+#define MYOS_RESOURCE_POOL \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_RESOURCE_POOL)
+#define MYOS_RESOURCE_NOTIFICATION \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_NOTIFICATION)
+#define MYOS_RESOURCE_VPROC \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_VPROC)
+#define MYOS_RESOURCE_TUNNEL \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_TUNNEL)
+#define MYOS_RESOURCE_ENDPOINT \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_ENDPOINT)
+#define MYOS_RESOURCE_CHANNEL \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_CHANNEL)
+#define MYOS_RESOURCE_PAGER \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_PAGER)
+#define MYOS_RESOURCE_IRQ \
+    (UINT64_C(1) << MYOS_OBJECT_KIND_IRQ)
 
 #define MYOS_RESOURCE_E1_KINDS ( \
     MYOS_RESOURCE_THREAD | MYOS_RESOURCE_SCHED_CONTEXT | \

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <user/lib/capability.hpp>
+#include <user/lib/sys_result.hpp>
+
 #include <uapi/capability.h>
 #include <uapi/channel.h>
 #include <uapi/endpoint.h>
@@ -13,12 +16,6 @@
 #include <uapi/vm.h>
 
 namespace myos {
-
-struct SysResult final {
-    myos_status_t status{};
-    myos_word_t value{};
-    myos_word_t value2{};
-};
 
 [[nodiscard]] inline auto syscall(
     myos_word_t operation,
@@ -64,7 +61,13 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto cap_close(myos_cap_t capability) noexcept
     -> SysResult {
-    return syscall(MYOS_SYS_CAP_CLOSE, capability);
+    return syscall(MYOS_SYS_CAP_CLOSE, capability, 0);
+}
+
+[[nodiscard]] inline auto cap_close(
+    myos_cap_t capability,
+    myos_cap_t destination_cspace) noexcept -> SysResult {
+    return syscall(MYOS_SYS_CAP_CLOSE, capability, destination_cspace);
 }
 
 [[nodiscard]] inline auto cap_duplicate(
@@ -81,6 +84,19 @@ inline void yield() noexcept {
     myos_word_t rights) noexcept -> SysResult {
     return syscall(
         MYOS_SYS_CAP_DELEGATE, source, destination_cspace, rights);
+}
+
+[[nodiscard]] inline auto cap_typed_delegate(
+    myos_cap_t source,
+    myos_cap_t destination_cspace,
+    myos_cap_t descriptor_memory,
+    myos_word_t descriptor_offset = 0) noexcept -> SysResult {
+    return syscall(
+        MYOS_SYS_CAP_TYPED_DELEGATE,
+        source,
+        destination_cspace,
+        descriptor_memory,
+        descriptor_offset);
 }
 
 [[nodiscard]] inline auto cap_move(
@@ -576,6 +592,11 @@ inline void yield() noexcept {
     myos_word_t address,
     myos_word_t size) noexcept -> SysResult {
     return syscall(MYOS_SYS_VM_UNMAP, vspace, address, size);
+}
+
+[[nodiscard]] inline auto vm_destroy_region(myos_cap_t region) noexcept
+    -> SysResult {
+    return syscall(MYOS_SYS_VM_DESTROY_REGION, region);
 }
 
 [[noreturn]] inline void exit() noexcept {

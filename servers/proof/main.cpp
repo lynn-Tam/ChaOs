@@ -1,4 +1,5 @@
 #include <servers/proof/protocol.hpp>
+#include <user/lib/bootstrap.hpp>
 #include <user/lib/context.hpp>
 #include <user/lib/syscall.hpp>
 #include <uapi/bootstrap.h>
@@ -9,30 +10,6 @@ namespace {
 
 constexpr myos_word_t ProofAddress = 0x600000;
 using namespace myos::proof;
-
-[[nodiscard]] auto valid(
-    const myos_bootstrap_info* bootstrap,
-    myos_word_t size) noexcept -> bool {
-    return bootstrap != nullptr
-        && size >= sizeof(myos_bootstrap_info)
-        && bootstrap->magic == MYOS_BOOTSTRAP_MAGIC
-        && bootstrap->major == MYOS_BOOTSTRAP_MAJOR
-        && bootstrap->minor >= MYOS_BOOTSTRAP_MINOR
-        && bootstrap->size == sizeof(myos_bootstrap_info)
-        && bootstrap->cap_count <= MYOS_BOOTSTRAP_MAX_CAPS
-        && bootstrap->stack_size >= PageSize;
-}
-
-[[nodiscard]] auto capability(
-    const myos_bootstrap_info& bootstrap,
-    uint32_t kind) noexcept -> myos_cap_t {
-    for (uint32_t index = 0; index < bootstrap.cap_count; ++index) {
-        if (bootstrap.caps[index].kind == kind) {
-            return bootstrap.caps[index].handle;
-        }
-    }
-    return 0;
-}
 
 [[nodiscard]] auto completed(myos::SysResult result) noexcept -> bool {
     return result.status == MYOS_STATUS_OK
@@ -1331,9 +1308,9 @@ extern "C" void myos_main(
         vproc_upcall(
             bootstrap_address, bootstrap_size, vproc_shared, vproc_magic);
     }
-    const auto* const bootstrap =
-        reinterpret_cast<const myos_bootstrap_info*>(bootstrap_address);
-    if (!valid(bootstrap, bootstrap_size)) {
+    const auto bootstrap = myos::bootstrap::BootstrapView::parse(
+        reinterpret_cast<const void*>(bootstrap_address), bootstrap_size);
+    if (!bootstrap || bootstrap->stack_size() < PageSize) {
         //Confirmatory experiment.
         // Exit condition: the Stage E1 child proof is replaced by a real
         // service protocol after Endpoint IPC exists. The registered start
@@ -1521,10 +1498,10 @@ extern "C" void myos_main(
         }
         fail();
     }
-    const myos_cap_t vspace = capability(
-        *bootstrap, MYOS_BOOTSTRAP_CAP_VSPACE);
-    const myos_cap_t bundle = capability(
-        *bootstrap, MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE);
+    const myos_cap_t vspace = bootstrap->selector(
+        MYOS_BOOTSTRAP_CAP_VSPACE);
+    const myos_cap_t bundle = bootstrap->selector(
+        MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE);
     if (vspace == 0 || bundle == 0) {
         fail();
     }
@@ -1549,7 +1526,7 @@ extern "C" void myos_main(
         || myos::cap_revoke(bundle, true).status != MYOS_STATUS_OK
         || !completed(myos::vm_protect(
             vspace,
-            bootstrap->stack_base,
+            bootstrap->stack_base(),
             PageSize,
             MYOS_VM_READ | MYOS_VM_WRITE))) {
         fail();

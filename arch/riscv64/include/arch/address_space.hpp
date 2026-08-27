@@ -2,12 +2,14 @@
 
 #include <core/types.hpp>
 #include <mm/addr.hpp>
+#include <uapi/arch/riscv64/address_space.h>
 
 namespace arch::address_space {
 
 // Sv39 sign-extends bit 38. These bounds describe what the translation mode
 // can represent; the kernel's use of each canonical half belongs to MM policy.
-inline constexpr usize LowerCanonicalEnd = 0x0000004000000000ULL;
+inline constexpr usize LowGuardEnd = MYOS_RISCV64_LOW_GUARD_END;
+inline constexpr usize LowerCanonicalEnd = MYOS_RISCV64_LOWER_CANONICAL_END;
 inline constexpr usize UpperCanonicalBegin = 0xffffffc000000000ULL;
 
 [[nodiscard]] constexpr auto is_lower(
@@ -26,6 +28,7 @@ inline constexpr usize UpperCanonicalBegin = 0xffffffc000000000ULL;
 }
 
 static_assert(LowerCanonicalEnd == usize{1} << 38);
+static_assert(LowGuardEnd < LowerCanonicalEnd);
 static_assert(UpperCanonicalBegin
     == ~static_cast<usize>(LowerCanonicalEnd - 1));
 

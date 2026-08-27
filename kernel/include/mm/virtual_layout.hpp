@@ -6,7 +6,7 @@
 
 namespace kernel::mm::layout {
 
-inline constexpr usize LowGuardEnd = 64 * 1024;
+inline constexpr usize LowGuardEnd = arch::address_space::LowGuardEnd;
 inline constexpr usize UserEnd = arch::address_space::LowerCanonicalEnd;
 
 inline constexpr usize DirectMapBegin = arch::address_space::UpperCanonicalBegin;
@@ -23,6 +23,7 @@ inline constexpr usize DynamicBegin = DirectMapEnd;
 }
 
 static_assert(LowGuardEnd < UserEnd);
+static_assert(UserEnd == arch::address_space::LowerCanonicalEnd);
 static_assert(DirectMapEnd > DirectMapBegin);
 static_assert(arch::address_space::is_upper(VirtAddr{DirectMapBegin}));
 static_assert(arch::address_space::is_upper(VirtAddr{DirectMapEnd}));
