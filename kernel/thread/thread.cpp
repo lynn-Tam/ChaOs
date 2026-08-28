@@ -220,8 +220,8 @@ auto Thread::wait_ready() const noexcept -> bool {
     return current_wait().ready();
 }
 
-void Thread::resume_wait(arch::TrapContext& trap) noexcept {
-    current_wait().finish(trap);
+auto Thread::resume_wait(arch::TrapContext& trap) noexcept -> bool {
+    return current_wait().finish(trap);
 }
 
 void Thread::cancel_wait() noexcept {

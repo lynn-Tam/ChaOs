@@ -5,6 +5,7 @@
 #include <cpu/cpu_registry.hpp>
 #include <sched/binding.hpp>
 #include <sched/dispatcher.hpp>
+#include <sched/guard.hpp>
 #include <execution/vproc.hpp>
 #include <operation/wait.hpp>
 
@@ -108,13 +109,33 @@ void Completion::attach(
 }
 
 void Completion::signal() noexcept {
-    Delivery expected = Delivery::Attached;
-    if (!delivery_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+    // Claim publication with one atomic state.  Cancellation owns the edge
+    // while it decides whether the operation can be canceled; a producer that
+    // meets that owner records a durable race.  If cancellation wins its
+    // reopen CAS first, this loop simply claims the reattached generation.
+    for (;;) {
+        Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
+        if (expected == Delivery::Attached) {
+            if (delivery_.compare_exchange_strong<
+                    libk::MemoryOrder::AcqRel,
+                    libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+                break;
+            }
+            continue;
+        }
+        if (expected == Delivery::Cancelling) {
+            if (delivery_.compare_exchange_strong<
+                    libk::MemoryOrder::AcqRel,
+                    libk::MemoryOrder::Acquire>(
+                        expected, Delivery::CancelRaced)) {
+                return;
+            }
+            continue;
+        }
         KASSERT(expected == Delivery::Claimed
             || expected == Delivery::Ready
-            || expected == Delivery::Detached);
+            || expected == Delivery::Detached
+            || expected == Delivery::CancelRaced);
         return;
     }
     const auto cpu = current_cpu_node();
@@ -133,10 +154,18 @@ void Completion::signal() noexcept {
     KASSERT(complete());
     if (auto* const blocking = libk::get_if<BlockingSink>(&sink_)) {
         KASSERT(blocking->wait != nullptr);
+        Wait* const wait = blocking->wait;
         const auto driver = blocking->binding != nullptr
             ? blocking->binding->actor_ref()
             : diag::concurrency::NodeRef{};
-        const auto delivery = blocking->wait->wake();
+        // Wake-before-Ready is the established operation protocol.  Pin the
+        // producer on its current CPU only across the interval in which the
+        // waiter becomes runnable and the canonical Delivery state is
+        // release-published.  Interrupt delivery remains enabled; the guard
+        // only defers a local dispatcher switch until the producer has ceased
+        // touching the Wait, Binding and sink-derived values.
+        sched::PreemptGuard preempt{};
+        const auto delivery = wait->wake();
         const auto delivery_node = delivery
             ? diag::concurrency::NodeRef::observation(delivery)
             : cpu;
@@ -163,18 +192,27 @@ void Completion::signal() noexcept {
     }
     const VprocSink target = *libk::get_if<VprocSink>(&sink_);
     KASSERT(target.vproc != nullptr && target.cpus != nullptr);
-    const Result result = ops_->read(owner_);
-    target.vproc->publish_operation(target.key, result, *target.cpus);
-    sink_.template emplace<libk::monostate>();
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    // Retire the old diagnostic generation and snapshot every member needed
+    // by the terminal path before invoking owner/publish callbacks.  Delivery
+    // remains Claimed until the sink is cleared, so no new generation can
+    // attach while these locals are being consumed.
+    const Ops* const ops = ops_;
+    void* const owner = owner_;
     const auto terminal = diag::concurrency::ObservationKey{
         observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+    const Result result = ops->read(owner);
+    target.vproc->publish_operation(target.key, result, *target.cpus);
+    sink_.template emplace<libk::monostate>();
+    // This is the final Completion member access in the Vproc terminal path.
+    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    // Release may destroy the embedded Completion; all following diagnostics
+    // use only captured locals.
+    ops->release(owner);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
         cpu.identity,
         terminal.raw);
-    ops_->release(owner_);
     auto finished = diag::concurrency::ObservationLease::borrow(terminal);
     finished.finish(operation_finished, static_cast<u64>(result.status));
     diag::concurrency::record(
@@ -185,45 +223,84 @@ void Completion::signal() noexcept {
 }
 
 
-/*luna change: let finish return a closed rearm result, reason: Wait must reattach the same Completion only after the old generation is fully retired*/
-auto Completion::finish(arch::TrapContext& trap) noexcept -> ResumeResult {
-    KASSERT(complete());
-    const auto key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(key);
-    // Blocking publication deliberately wakes the scheduler while retaining
-    // Claimed: the producer must keep the operation alive until it has stopped
-    // touching the Wait and its Binding.  The resumed owner can observe the
-    // Wait's ready bit in that narrow interval, so wait for the producer's
-    // final release publication before claiming the result.
-    diag::concurrency::CpuWaitScope wait_scope{
-        observation,
-        diag::concurrency::WaitKind::CompletionPublication,
-        diag::concurrency::NodeRef::observation(key),
-        current_cpu_node()};
+auto Completion::try_claim_finish() noexcept -> FinishClaim {
     Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
-    while (expected == Delivery::Claimed) {
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        wait_scope.observe(static_cast<u64>(expected));
-        expected = delivery_.load<libk::MemoryOrder::Acquire>();
+    if (expected == Delivery::Claimed) {
+        return FinishClaim::Publishing;
     }
-    KASSERT(expected == Delivery::Ready);
-    KASSERT((delivery_.compare_exchange_strong<
+    if (expected != Delivery::Ready) {
+        return FinishClaim::Unavailable;
+    }
+    if (delivery_.compare_exchange_strong<
+            libk::MemoryOrder::AcqRel,
+            libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+        return FinishClaim::Claimed;
+    }
+    return expected == Delivery::Claimed
+        ? FinishClaim::Publishing : FinishClaim::Unavailable;
+}
+
+auto Completion::try_claim_cancel() noexcept -> bool {
+    const Delivery observed = delivery_.load<libk::MemoryOrder::Acquire>();
+    if (observed != Delivery::Attached && observed != Delivery::Ready) {
+        return false;
+    }
+    Delivery expected = observed;
+    return delivery_.compare_exchange_strong<
         libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)));
-    detach();
-    if (ops_->resume != nullptr) {
-        const ResumeResult resume = ops_->resume(owner_, trap);
-        const auto terminal = diag::concurrency::ObservationKey{
-            observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
-        const u64 cpu = current_cpu_node().identity;
+        libk::MemoryOrder::Acquire>(expected, Delivery::Cancelling);
+}
+
+auto Completion::resolve_cancel() noexcept -> CancelResult {
+    if (complete()) {
+        return CancelResult::Completed;
+    }
+    if (ops_->cancel(owner_)) {
+        return CancelResult::Canceled;
+    }
+    return complete() ? CancelResult::Completed : CancelResult::Reopen;
+}
+
+auto Completion::try_reopen_cancel() noexcept -> bool {
+    Delivery expected = Delivery::Cancelling;
+    const bool reopened = delivery_.compare_exchange_strong<
+        libk::MemoryOrder::AcqRel,
+        libk::MemoryOrder::Acquire>(expected, Delivery::Attached);
+    if (!reopened) {
+        KASSERT(expected == Delivery::CancelRaced);
+    }
+    return reopened;
+}
+
+/*luna change: let finish return a closed rearm result, reason: Wait must reattach the same Completion only after the old generation is fully retired*/
+auto Completion::finish_claimed(arch::TrapContext& trap) noexcept
+    -> ResumeResult {
+    KASSERT(complete());
+    KASSERT(delivery_.load<libk::MemoryOrder::Acquire>()
+        == Delivery::Claimed);
+    // Snapshot the immutable callback table, owner and old diagnostic key
+    // while the Claimed state still excludes reattachment.  The callbacks
+    // then finish the old generation before its sink is cleared.
+    const Ops* const ops = ops_;
+    void* const owner = owner_;
+    const auto terminal = diag::concurrency::ObservationKey{
+        observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
+    const u64 cpu = current_cpu_node().identity;
+    if (ops->resume != nullptr) {
+        const ResumeResult resume = ops->resume(owner, trap);
+        sink_.template emplace<libk::monostate>();
+        // The final Completion member access precedes the captured release.
+        delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
         if (resume == ResumeResult::Done) {
+            // Release may destroy the embedded Completion.  No Completion
+            // member is accessed after this callback.
+            ops->release(owner);
             /*luna change: publish OperationRelease only with terminal owner release, reason: Rearm retires diagnostics but keeps the same operation owner alive*/
             diag::concurrency::record(
                 diag::concurrency::FlightDomain::Operation,
                 diag::concurrency::FlightEvent::OperationRelease,
                 cpu,
                 terminal.raw);
-            ops_->release(owner_);
         }
         auto finished = diag::concurrency::ObservationLease::borrow(terminal);
         finished.finish(operation_finished);
@@ -234,19 +311,21 @@ auto Completion::finish(arch::TrapContext& trap) noexcept -> ResumeResult {
             terminal.raw);
         return resume;
     }
-    const Result result = ops_->read(owner_);
+    const Result result = ops->read(owner);
     trap.set_result(
         0, static_cast<usize>(static_cast<isize>(result.status)));
     trap.set_result(1, result.value);
-    const auto terminal = diag::concurrency::ObservationKey{
-        observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
-    const u64 cpu = current_cpu_node().identity;
+    sink_.template emplace<libk::monostate>();
+    // The release store is the final Completion member access in this path.
+    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    // Release may destroy the embedded Completion; diagnostics below use only
+    // captured locals.
+    ops->release(owner);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
         cpu,
         terminal.raw);
-    ops_->release(owner_);
     auto finished = diag::concurrency::ObservationLease::borrow(terminal);
     finished.finish(operation_finished, static_cast<u64>(result.status));
     diag::concurrency::record(
@@ -257,44 +336,34 @@ auto Completion::finish(arch::TrapContext& trap) noexcept -> ResumeResult {
     return ResumeResult::Done;
 }
 
-auto Completion::cancel() noexcept -> bool {
-    Delivery observed = delivery_.load<libk::MemoryOrder::Acquire>();
-    for (;;) {
-        if (observed == Delivery::Detached
-            || observed == Delivery::Claimed) {
-            return false;
-        }
-        KASSERT(observed == Delivery::Attached
-            || observed == Delivery::Ready);
-        if (delivery_.compare_exchange_weak<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(observed, Delivery::Claimed)) {
-            break;
-        }
-    }
-
-    bool drain = observed == Delivery::Ready || complete();
-    if (!drain && !ops_->cancel(owner_)) {
-        drain = complete();
-        if (!drain) {
-            delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
-            return false;
-        }
-    }
-    if (drain) {
-        static_cast<void>(ops_->read(owner_));
-    }
-    sink_.template emplace<libk::monostate>();
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+void Completion::finalize_cancel(CancelResult result) noexcept {
+    KASSERT(result != CancelResult::Reopen);
+    KASSERT(delivery_.load<libk::MemoryOrder::Acquire>()
+        == Delivery::Cancelling
+        || delivery_.load<libk::MemoryOrder::Acquire>()
+            == Delivery::CancelRaced);
+    // Cancellation owns the terminal state, so capture the callback table,
+    // owner and old diagnostic key before any owner callback.  No new attach
+    // can pass while Delivery remains Cancelling/CancelRaced.
+    const Ops* const ops = ops_;
+    void* const owner = owner_;
     const auto terminal = diag::concurrency::ObservationKey{
         observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
     const u64 cpu = current_cpu_node().identity;
+    if (result == CancelResult::Completed) {
+        static_cast<void>(ops->read(owner));
+    }
+    sink_.template emplace<libk::monostate>();
+    // The release store is the final Completion member access in this path.
+    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    // Release may destroy the embedded Completion; diagnostics below use only
+    // captured locals.
+    ops->release(owner);
     diag::concurrency::record(
         diag::concurrency::FlightDomain::Operation,
         diag::concurrency::FlightEvent::OperationRelease,
         cpu,
         terminal.raw);
-    ops_->release(owner_);
     auto finished = diag::concurrency::ObservationLease::borrow(terminal);
     finished.finish(operation_cancelled);
     diag::concurrency::record(
@@ -302,14 +371,6 @@ auto Completion::cancel() noexcept -> bool {
         diag::concurrency::FlightEvent::OperationCancel,
         cpu,
         terminal.raw);
-    return true;
-}
-
-void Completion::detach() noexcept {
-    KASSERT(delivery_.load<libk::MemoryOrder::Acquire>()
-        == Delivery::Claimed);
-    sink_.template emplace<libk::monostate>();
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
 }
 
 } // namespace kernel::operation

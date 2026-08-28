@@ -157,7 +157,7 @@ auto handle_capability(
         if (started.value() == kernel::operation::State::Waiting) {
             return Result{MYOS_STATUS_OK, 0, Disposition::Block};
         }
-        thread->resume_wait(trap);
+        static_cast<void>(thread->resume_wait(trap));
         return returned(MYOS_STATUS_OK);
     }
     if (operation == MYOS_SYS_OBJECT_DESTROY) {

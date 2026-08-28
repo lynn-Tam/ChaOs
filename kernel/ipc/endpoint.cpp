@@ -975,9 +975,10 @@ void Endpoint::resume_call(Call& call, arch::TrapContext& trap) noexcept {
 void Endpoint::publish_cancel(Call& call) noexcept {
     KASSERT(call.activation_ != nullptr && call.cpus_ != nullptr);
     operation::Wait& wait = call.activation_->wait_;
-    if (wait.attached()) {
-        static_cast<void>(wait.cancel());
-    }
+    // Cancellation itself is the atomic edge authority.  A separate
+    // attached() precheck would reopen the finish/cancel TOCTOU window; a
+    // false result is the normal producer/finisher race outcome.
+    static_cast<void>(wait.cancel());
     sched::Binding* const binding =
         call.caller_.get().binding();
     if (binding != nullptr) {

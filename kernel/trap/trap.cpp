@@ -342,7 +342,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
         .watched = true};
     continuation.publish(update);
     if (wait != nullptr && wait->ready()) {
-        wait->finish(context);
+        static_cast<void>(wait->finish(context));
     }
     cpu.dispatcher()->on_trap_exit();
     // A wake credit closes wake-before-block, but it is not evidence that the
@@ -352,8 +352,7 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     KASSERT(cpu.current_execution() == execution);
     wait = thread != nullptr ? &thread->current_wait() : nullptr;
     while (wait != nullptr && wait->attached()) {
-        if (wait->ready()) {
-            wait->finish(context);
+        if (wait->ready() && wait->finish(context)) {
             break;
         }
         cpu.dispatcher()->block_current();

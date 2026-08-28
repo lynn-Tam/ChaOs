@@ -101,14 +101,19 @@ auto Notification::Wait::arm() noexcept -> bool {
             libk::MemoryOrder::Acquire>(expected, State::Armed)) {
         return true;
     }
-    KASSERT(expected == State::Ready);
+    // A remote terminal cancel may complete release_wait() before this
+    // post-attach arm CAS runs.  Idle proves that this generation is already
+    // detached; it does not publish a new result.
+    KASSERT(expected == State::Ready || expected == State::Done
+        || expected == State::Idle);
     return false;
 }
 
 auto Notification::Wait::ready() noexcept -> bool {
     State observed = state_.load<libk::MemoryOrder::Acquire>();
     for (;;) {
-        if (observed == State::Ready || observed == State::Idle) {
+        if (observed == State::Ready || observed == State::Done
+            || observed == State::Idle) {
             return false;
         }
         KASSERT(observed == State::Awaiting || observed == State::Armed);
@@ -132,6 +137,7 @@ auto Notification::Wait::read() noexcept -> operation::Result {
 }
 
 void Notification::Wait::release() noexcept {
+    owner_->release_wait();
 }
 
 auto Notification::Wait::cancel() noexcept -> bool {
@@ -560,7 +566,6 @@ void Notification::detach_source(
 }
 
 auto Notification::finish_wait() noexcept -> operation::Result {
-    object::ObjectCleanup cleanup{};
     myos_status_t status{MYOS_STATUS_OK};
     u64 badges{};
     {
@@ -572,6 +577,23 @@ auto Notification::finish_wait() noexcept -> operation::Result {
         } else {
             status = MYOS_STATUS_CLOSED;
         }
+        // Keep the owner non-admissible until Completion invokes the release
+        // callback.  Reopening Idle here would let a new wait overwrite this
+        // embedded Completion while the old terminal path still owns it.
+        wait_.state_.store<libk::MemoryOrder::Release>(Wait::State::Done);
+    }
+    return operation::Result{status, badges};
+}
+
+void Notification::release_wait() noexcept {
+    object::ObjectCleanup cleanup{};
+    {
+        kernel::sync::IrqLockGuard guard{receiver_lock_};
+        KASSERT(wait_.state_.load<libk::MemoryOrder::Acquire>()
+            == Wait::State::Done);
+        // Completion has detached the old generation and will not touch this
+        // owner again after the release callback returns.  Only now may a new
+        // wait attach and a Closing notification become Closed.
         wait_.state_.store<libk::MemoryOrder::Release>(Wait::State::Idle);
         if (life_.load<libk::MemoryOrder::Acquire>() == Life::Closing
             && signalers_.load<libk::MemoryOrder::Acquire>() == 0
@@ -584,7 +606,6 @@ auto Notification::finish_wait() noexcept -> operation::Result {
     if (cleanup) {
         cleanup.complete();
     }
-    return operation::Result{status, badges};
 }
 
 auto Notification::cancel_wait() noexcept -> bool {
@@ -599,7 +620,7 @@ auto Notification::cancel_wait() noexcept -> bool {
             || observed == Wait::State::Armed);
         if (wait_.state_.compare_exchange_weak<
                 libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(observed, Wait::State::Idle)) {
+                libk::MemoryOrder::Acquire>(observed, Wait::State::Done)) {
             return true;
         }
     }

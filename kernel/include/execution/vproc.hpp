@@ -288,6 +288,9 @@ private:
         operation::Key key,
         operation::Result result,
         CpuRegistry& cpus) noexcept;
+    // state_lock_ owner only: clear one exact operation generation and its
+    // user event projection before the Completion owner is released.
+    void clear_operation_locked(usize index) noexcept;
     void cancel_operations() noexcept;
     [[nodiscard]] auto attach_tunnel_source(ipc::TunnelLink& link) noexcept
         -> bool;

@@ -188,19 +188,52 @@ private:
         Vproc& vproc,
         CpuRegistry& cpus,
         operation::Key key) noexcept;
-    [[nodiscard]] auto finish(arch::TrapContext& trap) noexcept
+    // Delivery claims are callback-free and only transfer the Completion's
+    // terminal ownership.  Callers hold their container lock while claiming
+    // and keep the returned owner live until the corresponding terminal
+    // method has completed.
+    enum class FinishClaim : u8 {
+        Claimed,
+        Publishing,
+        Unavailable,
+    };
+
+    [[nodiscard]] auto try_claim_finish() noexcept -> FinishClaim;
+    [[nodiscard]] auto try_claim_cancel() noexcept -> bool;
+
+    enum class CancelResult : u8 {
+        Reopen,
+        Canceled,
+        Completed,
+    };
+
+    // Resolve policy only after the container has granted cancellation
+    // ownership.  No sink, container, scheduler or owner-release callbacks
+    // occur here.
+    [[nodiscard]] auto resolve_cancel() noexcept -> CancelResult;
+    // A cancellation owner may reopen only when this CAS proves no producer
+    // recorded CancelRaced.  The caller restores its container edge before
+    // publishing Attached.
+    [[nodiscard]] auto try_reopen_cancel() noexcept -> bool;
+    [[nodiscard]] auto finish_claimed(arch::TrapContext& trap) noexcept
         -> ResumeResult;
-    // Returns true when this call detached and drained the operation. False
-    // means completion publication already owns the edge or the operation is
-    // committed and must reach its normal terminal event.
-    [[nodiscard]] auto cancel() noexcept -> bool;
-    void detach() noexcept;
+    // Finalize a cancellation after the container has unlinked its pointer
+    // and projection.  This is the sole cancellation drain/release path.
+    void finalize_cancel(CancelResult result) noexcept;
 
     enum class Delivery : u8 {
         Detached,
         Attached,
+        // The delivery owner is publishing a completion or consuming the
+        // published result.  Cancellation has its own states below so a
+        // producer cannot disappear behind an undifferentiated claim.
         Claimed,
         Ready,
+        // A cancellation owner temporarily holds the delivery edge.  A
+        // producer racing this state records that race in CancelRaced rather
+        // than returning with no durable handoff.
+        Cancelling,
+        CancelRaced,
     };
 
     void* owner_{};

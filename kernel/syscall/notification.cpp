@@ -87,7 +87,7 @@ namespace {
         return Result{MYOS_STATUS_OK, 0, Disposition::Block};
     }
     if (thread->waiting()) {
-        thread->resume_wait(invocation.trap);
+        static_cast<void>(thread->resume_wait(invocation.trap));
         return returned(
             static_cast<myos_status_t>(invocation.trap.arg(0)),
             invocation.trap.arg(1));

@@ -462,6 +462,7 @@ audit_uart_cleanup = files('tools/build/audit-uart-cleanup.sh')
 audit_proof_ownership = files('tools/build/audit-proof-ownership.sh')
 audit_task_transaction = files('tools/build/audit-task-transaction.sh')
 audit_task_authority = files('tools/build/audit-task-authority.sh')
+audit_operation_completion = files('tools/build/audit-operation-completion.sh')
 audit_clang = files('tools/build/audit-clang.sh')
 run_qemu = files('tools/build/run-qemu.sh')
 artifact = files('tools/build/artifact.sh')
@@ -481,6 +482,7 @@ run_target('audit-task-transaction', command: [sh, audit_task_transaction, join_
 run_target('audit-task-authority', command: [sh, audit_task_authority,
   join_paths(root, 'user/lib/task_authority.hpp'),
   join_paths(root, 'user/lib/deploy_manifest.hpp')])
+run_target('audit-operation-completion', command: [sh, audit_operation_completion])
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, concurrency_diag_level.to_string(), lock_diag_level.to_string(), get_option('panic_probe').to_string()])
 objdump = find_program('riscv64-unknown-elf-objdump')
 run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])

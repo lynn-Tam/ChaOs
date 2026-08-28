@@ -152,7 +152,7 @@ public:
     [[nodiscard]] auto begin_wait(
         operation::Completion& relation,
         CpuRegistry& cpus) noexcept -> bool;
-    void resume_wait(arch::TrapContext& trap) noexcept;
+    [[nodiscard]] auto resume_wait(arch::TrapContext& trap) noexcept -> bool;
     void cancel_wait() noexcept;
     // Terminal edge: every outstanding Pager service claim registered by this
     // Thread returns to Published through the requeue owner path. Safe to

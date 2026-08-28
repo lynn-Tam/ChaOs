@@ -47,7 +47,7 @@ public:
         Completion& completion,
         CpuRegistry& cpus,
         sched::Binding& binding) noexcept -> bool;
-    void finish(arch::TrapContext& trap) noexcept;
+    [[nodiscard]] auto finish(arch::TrapContext& trap) noexcept -> bool;
     [[nodiscard]] auto cancel() noexcept -> bool;
 
 private:
@@ -56,11 +56,19 @@ private:
     [[nodiscard]] auto wake() noexcept
         -> diag::concurrency::ObservationKey;
 
+    enum class EdgePhase : u8 {
+        Detached,
+        Attached,
+        CancelOwned,
+        FinishOwned,
+    };
+
     Completion* completion_{};
     CpuRegistry* cpus_{};
     sched::Binding* binding_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Wait> lock_{};
     libk::Atomic<bool> ready_{};
+    EdgePhase phase_{EdgePhase::Detached};
     PageFault page_fault_{};
 };
 

@@ -121,6 +121,7 @@ private:
             Awaiting,
             Armed,
             Ready,
+            Done,
         };
 
         [[nodiscard]] auto read() noexcept -> operation::Result;
@@ -136,6 +137,7 @@ private:
         NotificationSource, &NotificationSource::hook_>;
 
     [[nodiscard]] auto finish_wait() noexcept -> operation::Result;
+    void release_wait() noexcept;
     [[nodiscard]] auto cancel_wait() noexcept -> bool;
     void detach_source(NotificationSource& source, bool notify) noexcept;
     static void invalidate(

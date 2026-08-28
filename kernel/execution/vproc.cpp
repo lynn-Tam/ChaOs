@@ -180,6 +180,24 @@ auto Vproc::begin_operation(
     return libk::unexpected(VprocError::TableFull);
 }
 
+void Vproc::clear_operation_locked(usize index) noexcept {
+    KASSERT(index < max_operations);
+    OperationSlot& slot = operations_[index];
+    slot.completion = nullptr;
+    slot.status = MYOS_STATUS_OK;
+    slot.value = 0;
+    slot.cookie = 0;
+    slot.state = OperationState::Free;
+    const u64 bit = u64{1} << index;
+    ready_mask_ &= ~bit;
+    __atomic_fetch_and(
+        &runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &runtime_.events->operation_key[index], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &runtime_.events->operation_cookie[index], 0, __ATOMIC_RELEASE);
+}
+
 void Vproc::publish_operation(
     operation::Key key,
     operation::Result result,
@@ -245,27 +263,45 @@ void Vproc::cancel_operations() noexcept {
             completion = slot.completion;
             key = operation::Key{
                 (slot.generation << MYOS_OPERATION_SLOT_BITS) | index};
+            // Claim Delivery while the slot pointer and generation are
+            // stable.  A producer that already owns publication leaves this
+            // operation for its normal Ready path.
+            if (!completion->try_claim_cancel()) {
+                continue;
+            }
         }
-        if (!completion->cancel()) {
-            continue;
+
+        operation::Completion::CancelResult resolution =
+            completion->resolve_cancel();
+        if (resolution == operation::Completion::CancelResult::Reopen) {
+            bool reopened{};
+            {
+                kernel::sync::IrqLockGuard guard{state_lock_};
+                OperationSlot& slot = operations_[index];
+                KASSERT(slot.state == OperationState::Pending
+                    && slot.generation == key.generation()
+                    && slot.completion == completion);
+                // The Pending slot is the complete Vproc edge projection;
+                // restore it before publishing Delivery::Attached.
+                reopened = completion->try_reopen_cancel();
+            }
+            if (reopened) {
+                continue;
+            }
+            // CancelRaced is the producer's durable handoff.  Cancellation
+            // remains the terminal owner and drains the completed result.
+            resolution = operation::Completion::CancelResult::Completed;
         }
-        kernel::sync::IrqLockGuard guard{state_lock_};
-        OperationSlot& slot = operations_[index];
-        KASSERT(slot.state == OperationState::Pending
-            && slot.generation == key.generation()
-            && slot.completion == completion);
-        slot.completion = nullptr;
-        slot.status = MYOS_STATUS_OK;
-        slot.value = 0;
-        slot.cookie = 0;
-        slot.state = OperationState::Free;
-        const u64 bit = u64{1} << index;
-        ready_mask_ &= ~bit;
-        __atomic_fetch_and(&runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
-        __atomic_store_n(
-            &runtime_.events->operation_key[index], 0, __ATOMIC_RELEASE);
-        __atomic_store_n(
-            &runtime_.events->operation_cookie[index], 0, __ATOMIC_RELEASE);
+
+        {
+            kernel::sync::IrqLockGuard guard{state_lock_};
+            OperationSlot& slot = operations_[index];
+            KASSERT(slot.state == OperationState::Pending
+                && slot.generation == key.generation()
+                && slot.completion == completion);
+            clear_operation_locked(index);
+        }
+        completion->finalize_cancel(resolution);
     }
 }
 
@@ -312,9 +348,25 @@ auto Vproc::cancel_operation(operation::Key key) noexcept
             return libk::unexpected(VprocError::InvalidState);
         }
         completion = slot.completion;
+        if (!completion->try_claim_cancel()) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
     }
-    if (!completion->cancel()) {
-        return libk::unexpected(VprocError::InvalidState);
+
+    operation::Completion::CancelResult resolution =
+        completion->resolve_cancel();
+    if (resolution == operation::Completion::CancelResult::Reopen) {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        OperationSlot& slot = operations_[key.slot()];
+        KASSERT(slot.generation == key.generation()
+            && slot.state == OperationState::Pending
+            && slot.completion == completion);
+        if (completion->try_reopen_cancel()) {
+            return libk::unexpected(VprocError::InvalidState);
+        }
+        // The only legal CAS loser is CancelRaced.  Keep the exact Pending
+        // edge and let this cancellation owner drain the completed result.
+        resolution = operation::Completion::CancelResult::Completed;
     }
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
@@ -322,19 +374,9 @@ auto Vproc::cancel_operation(operation::Key key) noexcept
         KASSERT(slot.generation == key.generation()
             && slot.state == OperationState::Pending
             && slot.completion == completion);
-        slot.completion = nullptr;
-        slot.status = MYOS_STATUS_OK;
-        slot.value = 0;
-        slot.cookie = 0;
-        slot.state = OperationState::Free;
-        const u64 bit = u64{1} << key.slot();
-        ready_mask_ &= ~bit;
-        __atomic_fetch_and(&runtime_.events->ready_mask, ~bit, __ATOMIC_RELEASE);
-        __atomic_store_n(
-            &runtime_.events->operation_key[key.slot()], 0, __ATOMIC_RELEASE);
-        __atomic_store_n(
-            &runtime_.events->operation_cookie[key.slot()], 0, __ATOMIC_RELEASE);
+        clear_operation_locked(key.slot());
     }
+    completion->finalize_cancel(resolution);
     retry_stop_if_ready();
     return libk::expected();
 }
@@ -351,19 +393,7 @@ auto Vproc::finish_operation(operation::Key key) noexcept
         return libk::unexpected(VprocError::InvalidKey);
     }
     const operation::Result result{slot.status, slot.value};
-    slot.status = MYOS_STATUS_OK;
-    slot.value = 0;
-    slot.cookie = 0;
-    slot.state = OperationState::Free;
-    ready_mask_ &= ~(u64{1} << key.slot());
-    __atomic_fetch_and(
-        &runtime_.events->ready_mask,
-        ~(u64{1} << key.slot()),
-        __ATOMIC_RELEASE);
-    __atomic_store_n(
-        &runtime_.events->operation_key[key.slot()], 0, __ATOMIC_RELEASE);
-    __atomic_store_n(
-        &runtime_.events->operation_cookie[key.slot()], 0, __ATOMIC_RELEASE);
+    clear_operation_locked(key.slot());
     return libk::expected(result);
 }
 

@@ -99,7 +99,7 @@ namespace {
     if (closed.value() == kernel::operation::State::Waiting) {
         return Result{MYOS_STATUS_OK, 0, Disposition::Block};
     }
-    thread->resume_wait(invocation.trap);
+    static_cast<void>(thread->resume_wait(invocation.trap));
     return returned(MYOS_STATUS_OK);
 }
 
