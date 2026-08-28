@@ -7,6 +7,7 @@ repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 project_tmp="$repo_root/.tmp/project/paged-memory-and-task-supervision/stage-e/unit3-cut-b"
 policy=$(CDPATH= cd -- "$(dirname "$source")" && pwd)/cap_attenuation.hpp
 task_source="$repo_root/user/lib/task_transaction.hpp"
+space_source="$repo_root/user/lib/deployment.hpp"
 mkdir -p "$project_tmp"
 
 audit_one() {
@@ -68,14 +69,28 @@ audit_task_source() {
     input=$1
     # TaskBuilder/TaskRecord no longer expose an arbitrary LocalSlot,
     # identity and ceiling registration seam.  Stage F owns the sole Task
-    # publication registration path; Cut D only needs the construction
-    # adoption path below.
+    # publication registration path; construction must not grow a second
+    # registration owner.
     if rg -q 'auto register_source\(' "$input" \
         || rg -q 'reservation_->record\(\)\.register_source' "$input"; then
         return 1
     fi
-    rg -q 'auto adopt_local\(' "$input" || return 1
     if rg -q 'registration_journal' "$input"; then return 1; fi
+}
+
+audit_task_space_source() {
+    input=$1
+    # Local selectors are adopted only by the TaskSpace that owns their
+    # aggregate.  Keep this gate on the actual definition rather than on a
+    # caller's use-site or a removed Builder wrapper.
+    block=$(sed -n '/\[\[nodiscard\]\] auto adopt_local(/,/^    }$/p' "$input")
+    [ -n "$block" ] || return 1
+    printf '%s\n' "$block" | rg -q 'phase_ != Phase::Open' || return 1
+    printf '%s\n' "$block" | rg -q 'owner\.cspace\(\) != 0' || return 1
+    printf '%s\n' "$block" \
+        | rg -q 'caps_\.adopt_local_slot\(libk::move\(owner\)\)' \
+        || return 1
+    printf '%s\n' "$block" | rg -q 'if \(!index\)' || return 1
 }
 
 audit_policy() {
@@ -99,6 +114,7 @@ audit_policy() {
 
 audit_one "$source"
 audit_task_source "$task_source"
+audit_task_space_source "$space_source"
 if [ -n "$manifest" ]; then
     rg -q 'mode >= MYOS_DEPLOY_IMPORT_MOVE' "$manifest"
 fi
@@ -150,9 +166,9 @@ expect_reject missing-bootstrap-open-check \
 
 task_mutation_dir="$mutation_dir/task"
 mkdir -p "$task_mutation_dir"
-mutated_task="$task_mutation_dir/task_transaction.hpp"
-sed '/auto adopt_local(/d' "$task_source" > "$mutated_task"
-if audit_task_source "$mutated_task" >/dev/null 2>&1; then
+mutated_task="$task_mutation_dir/deployment.hpp"
+sed '/caps_\.adopt_local_slot(libk::move(owner))/d' "$space_source" > "$mutated_task"
+if audit_task_space_source "$mutated_task" >/dev/null 2>&1; then
     printf '%s\n' '[audit] FAIL: mutation accepted: task adoption owner path' >&2
     exit 1
 fi

@@ -436,45 +436,55 @@ Runtime runtime{};
         || (text.access & MYOS_BOOT_SEGMENT_WRITE) != 0
         || (data.access & MYOS_BOOT_SEGMENT_WRITE) == 0
         || (data.access & MYOS_BOOT_SEGMENT_EXECUTE) != 0
-        || data.file_size >= data.memory_size
+        || text.file_size == 0 || text.memory_size == 0
+        || text.memory_size > PageSize
+        || data.file_size != sizeof(uint64_t)
+        || data.memory_size != 3 * PageSize
         || data.memory_size - data.file_size < 2 * PageSize) {
         return libk::nullopt;
     }
     const myos::deploy::PlanTask* const row = runtime.plan.task(task_index);
-    if (row == nullptr || row->mappings.count == 0) {
+    if (row == nullptr
+        || row->mappings.count != (task_index == 3 ? 4U : 5U)) {
         return libk::nullopt;
     }
-    uint64_t total{};
-    for (uint32_t local = 0; local < row->mappings.count; ++local) {
-        const myos::deploy::PlanMapping* const mapping = runtime.plan.mapping(
-            row->mappings.first + local);
-        if (mapping == nullptr
-            || mapping->critical == MYOS_DEPLOY_CRITICAL_NONE) {
-            continue;
-        }
-        myos_word_t size = static_cast<myos_word_t>(mapping->size);
-        if (mapping->source == MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT) {
-            if (mapping->image != row->images.first
-                || mapping->segment >= child.segment_count()) {
-                return libk::nullopt;
-            }
-            myos::boot::Segment segment{};
-            if (!child.segment(mapping->segment, segment)) {
-                return libk::nullopt;
-            }
-            size = static_cast<myos_word_t>(segment.memory_size);
-        }
-        const myos_word_t rounded = page_round(size);
-        if (rounded == 0
-            || total > UINT64_MAX - static_cast<uint64_t>(rounded)) {
+    const auto mapping = [&](uint32_t local) noexcept
+        -> const myos::deploy::PlanMapping* {
+        return runtime.plan.mapping(row->mappings.first + local);
+    };
+    const auto* const code = mapping(0);
+    const auto* const data_mapping = mapping(1);
+    const auto* const stack = mapping(2);
+    const auto* const bootstrap = mapping(3);
+    if (code == nullptr || data_mapping == nullptr || stack == nullptr
+        || bootstrap == nullptr
+        || code->source != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+        || code->segment != 0 || code->critical != MYOS_DEPLOY_CRITICAL_CODE
+        || data_mapping->source
+            != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+        || data_mapping->segment != 1
+        || data_mapping->critical != MYOS_DEPLOY_CRITICAL_NONE
+        || stack->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
+        || stack->critical
+            != (task_index == 4 ? MYOS_DEPLOY_CRITICAL_STACK
+                                 : MYOS_DEPLOY_CRITICAL_NONE)
+        || bootstrap->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
+        || bootstrap->critical != MYOS_DEPLOY_CRITICAL_BOOTSTRAP) {
+        return libk::nullopt;
+    }
+    if (task_index == 4) {
+        const auto* const descriptor = mapping(4);
+        if (descriptor == nullptr
+            || descriptor->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
+            || descriptor->critical != MYOS_DEPLOY_CRITICAL_NONE) {
             return libk::nullopt;
         }
-        total += rounded;
     }
-    if (total > row->critical_bytes) {
+    const uint64_t expected = task_index == 3 ? 2 * PageSize : 3 * PageSize;
+    if (row->critical_bytes != expected) {
         return libk::nullopt;
     }
-    return total;
+    return expected;
 }
 
 [[nodiscard]] auto run_cut(uint32_t task_index) noexcept -> bool {
@@ -680,22 +690,27 @@ Runtime runtime{};
     return false;
 }
 
-[[nodiscard]] auto cleanup() noexcept -> bool {
-    bool success = true;
+[[nodiscard]] auto cleanup(bool publish_success) noexcept -> bool {
     if (runtime.source_open) {
         runtime.console.text("task-builder-test: diag-cleanup-source-start\n");
-        success = close_source_with_lease() && success;
+        if (!close_source_with_lease()) {
+            return false;
+        }
         runtime.console.text("task-builder-test: diag-cleanup-source-done\n");
     }
     if (runtime.scratch_open) {
         runtime.console.text("task-builder-test: diag-cleanup-scratch-start\n");
-        success = runtime.scratch.close() == MYOS_STATUS_OK && success;
+        if (runtime.scratch.close() != MYOS_STATUS_OK) {
+            return false;
+        }
         runtime.scratch_open = false;
         runtime.console.text("task-builder-test: diag-cleanup-scratch-done\n");
     }
     if (runtime.bundle_open) {
         runtime.console.text("task-builder-test: diag-cleanup-bundle-start\n");
-        success = runtime.bundle.close() == MYOS_STATUS_OK && success;
+        if (runtime.bundle.close() != MYOS_STATUS_OK) {
+            return false;
+        }
         runtime.bundle_open = false;
         runtime.console.text("task-builder-test: diag-cleanup-bundle-done\n");
     }
@@ -703,15 +718,26 @@ Runtime runtime{};
         runtime.console.text("task-builder-test: diag-cleanup-parent-start\n");
         const myos_status_t closed = Backend::resource_close(
             runtime.parent.reference());
-        success = closed == MYOS_STATUS_OK && success;
+        if (closed != MYOS_STATUS_OK) {
+            return false;
+        }
         runtime.console.text("task-builder-test: diag-cleanup-parent-close\n");
-        success = runtime.parent.close() == MYOS_STATUS_OK && success;
+        if (runtime.parent.close() != MYOS_STATUS_OK) {
+            return false;
+        }
         runtime.parent_open = false;
         runtime.console.text("task-builder-test: diag-cleanup-parent-done\n");
     }
+    if (publish_success) {
+        /* This is the sole success marker.  All non-console owners above are
+         * exact-closed while the UART borrow is still valid. */
+        runtime.console.text("task-builder-test: passed\n");
+    }
+    if (!runtime.console.port.valid()) {
+        return runtime.console.close();
+    }
     runtime.console.text("task-builder-test: diag-cleanup-console-start\n");
-    success = runtime.console.close() && success;
-    return success;
+    return runtime.console.close();
 }
 
 [[nodiscard]] auto run(
@@ -738,11 +764,11 @@ Runtime runtime{};
     }
     if (complete) {
         runtime.console.text("task-builder-test: cuts-ok\n");
-        runtime.console.text("task-builder-test: passed\n");
-    } else {
+    } else if (runtime.console.phase != myos::deploy::LeasePhase::Empty
+               && runtime.console.phase != myos::deploy::LeasePhase::Closed) {
         runtime.console.text("task-builder-test: failed\n");
     }
-    return cleanup() && complete;
+    return cleanup(complete) && complete;
 }
 
 } // namespace
@@ -755,6 +781,8 @@ extern "C" [[noreturn]] void myos_main(
     if (!info || info->bundle_size() == 0) {
         myos::exit();
     }
-    static_cast<void>(run(*info));
+    if (!run(*info)) {
+        Backend::ownership_fault(MYOS_STATUS_INTERNAL);
+    }
     myos::exit();
 }
