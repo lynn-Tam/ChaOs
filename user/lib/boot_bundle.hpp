@@ -84,7 +84,20 @@ class Bundle;
 class Module final {
 public:
     [[nodiscard]] auto name() const noexcept -> Bytes { return name_; }
+    [[nodiscard]] constexpr auto flags() const noexcept -> uint32_t {
+        return flags_;
+    }
+    [[nodiscard]] constexpr auto bootable() const noexcept -> bool {
+        return flags_ == MYOS_BOOT_MODULE_BOOTABLE;
+    }
+    [[nodiscard]] constexpr auto data_module() const noexcept -> bool {
+        return flags_ == MYOS_BOOT_MODULE_DATA;
+    }
     [[nodiscard]] auto entry() const noexcept -> uintptr_t { return entry_; }
+    [[nodiscard]] auto data() const noexcept -> Bytes {
+        return data_module() ? bytes_.slice(image_offset_, image_size_)
+                             : Bytes{};
+    }
     [[nodiscard]] auto segment_count() const noexcept -> size_t {
         return segment_count_;
     }
@@ -167,6 +180,7 @@ private:
     friend class Bundle;
     Bytes bytes_{};
     Bytes name_{};
+    uint32_t flags_{};
     size_t image_offset_{};
     size_t image_size_{};
     uintptr_t entry_{};
@@ -237,6 +251,7 @@ public:
         result.root_index_ = static_cast<size_t>(root_index);
         result.segments_offset_ = static_cast<size_t>(segments_offset);
         result.segment_count_ = static_cast<size_t>(segments_count);
+        result.minor_ = static_cast<uint16_t>(minor);
         if (!result.validate_modules()) {
             return {};
         }
@@ -284,11 +299,13 @@ public:
             || !bytes_.read(offset + 44, 4, segment_count)
             || !bytes_.read(offset + 48, 8, tls_offset)
             || !bytes_.read(offset + 56, 8, tls_size)
-            || flags != MYOS_BOOT_MODULE_BOOTABLE
+            || (flags != MYOS_BOOT_MODULE_BOOTABLE
+                && flags != MYOS_BOOT_MODULE_DATA)
             || name_size == 0 || tls_offset != 0 || tls_size != 0
             || name_offset > bytes_.size()
             || name_size > bytes_.size() - name_offset
             || image_offset > bytes_.size()
+            || image_size == 0
             || image_size > bytes_.size() - image_offset
             || segment_first > segment_count_
             || segment_count > segment_count_ - segment_first) {
@@ -302,6 +319,7 @@ public:
         Module decoded{};
         decoded.bytes_ = bytes_;
         decoded.name_ = bytes_.slice(name_offset, name_size);
+        decoded.flags_ = static_cast<uint32_t>(flags);
         decoded.image_offset_ = static_cast<size_t>(image_offset);
         decoded.image_size_ = static_cast<size_t>(image_size);
         decoded.entry_ = static_cast<uintptr_t>(entry);
@@ -343,11 +361,26 @@ public:
 private:
     [[nodiscard]] auto validate_modules() const noexcept -> bool {
         size_t expected_segment{};
+        size_t data_modules{};
         for (size_t module_index = 0; module_index < module_count_;
              ++module_index) {
             Module candidate{};
-            if (!module(module_index, candidate)
-                || candidate.segment_count() == 0
+            if (!module(module_index, candidate)) {
+                return false;
+            }
+            if (candidate.data_module()) {
+                if (minor_ == 0) {
+                    return false;
+                }
+                ++data_modules;
+                if (candidate.entry() != 0 || candidate.segment_count() != 0
+                    || candidate.segment_first_ != expected_segment
+                    || candidate.data().size() == 0) {
+                    return false;
+                }
+                continue;
+            }
+            if (candidate.segment_count() == 0
                 || candidate.segment_count() > 32
                 || candidate.segment_count()
                     > segment_count_ - expected_segment
@@ -379,7 +412,9 @@ private:
                 return false;
             }
         }
-        return expected_segment == segment_count_;
+        Module root{};
+        return expected_segment == segment_count_ && data_modules <= 1
+            && module(root_index_, root) && root.bootable();
     }
 
     Bytes bytes_{};
@@ -388,6 +423,7 @@ private:
     size_t root_index_{};
     size_t segments_offset_{};
     size_t segment_count_{};
+    uint16_t minor_{};
 };
 
 } // namespace myos::boot

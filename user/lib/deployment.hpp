@@ -39,9 +39,23 @@ enum class LeasePhase : uint8_t {
     return status == MYOS_STATUS_OK || status == MYOS_STATUS_PENDING;
 }
 
+[[nodiscard]] constexpr auto retryable(myos_status_t status) noexcept -> bool {
+    return status == MYOS_STATUS_BUSY || status == MYOS_STATUS_RETRY;
+}
+
 struct Window final {
     myos_word_t address{};
     myos_word_t size{};
+
+    /* Mapping callers use this checked rounding operation before constructing
+     * a page-aligned window.  Zero represents overflow or an empty request. */
+    [[nodiscard]] static constexpr auto round_size(myos_word_t value) noexcept
+        -> myos_word_t {
+        constexpr myos_word_t page_size = MYOS_DEPLOY_PAGE_SIZE;
+        return value <= static_cast<myos_word_t>(-1) - (page_size - 1)
+            ? (value + page_size - 1) & ~(page_size - 1)
+            : 0;
+    }
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
         return address != 0 && size != 0
@@ -450,6 +464,7 @@ public:
     MappedBundle(MappedBundle&& other) noexcept
         : root_(other.root_),
           window_(other.window_),
+          size_(other.size_),
           region_(libk::move(other.region_)),
           view_(other.view_),
           phase_(other.phase_) {
@@ -466,6 +481,7 @@ public:
         }
         root_ = other.root_;
         window_ = other.window_;
+        size_ = other.size_;
         region_ = libk::move(other.region_);
         view_ = other.view_;
         phase_ = other.phase_;
@@ -501,6 +517,7 @@ public:
         reset_empty();
         root_ = root_vspace;
         window_ = window;
+        size_ = bundle_size;
         const SysResult created = B::vm_create_region(
             root_,
             window.address,
@@ -574,6 +591,10 @@ public:
             : nullptr;
     }
 
+    [[nodiscard]] constexpr auto size() const noexcept -> size_t {
+        return phase_ == LeasePhase::Mapped ? size_ : 0;
+    }
+
     [[nodiscard]] constexpr auto phase() const noexcept -> LeasePhase {
         return phase_;
     }
@@ -582,6 +603,7 @@ private:
     void reset_empty() noexcept {
         root_ = {};
         window_ = {};
+        size_ = 0;
         region_ = {};
         view_ = {};
         phase_ = LeasePhase::Empty;
@@ -589,6 +611,7 @@ private:
 
     cap::CapRef root_{};
     Window window_{};
+    size_t size_{};
     owner_type region_{};
     boot::Bundle view_{};
     LeasePhase phase_{LeasePhase::Empty};

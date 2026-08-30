@@ -345,9 +345,34 @@ init_user = executable(
   'init.elf', files('servers/init/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'init.map')], link_language: 'c', build_by_default: false,
 )
+process_server_user = executable(
+  'process_server.elf', files('servers/process_server/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'process_server.map')], link_language: 'c', build_by_default: false,
+)
 proof_user = executable(
-  'proof.elf', files('servers/proof/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'proof.elf', files('programs/proof/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'proof.map')], link_language: 'c', build_by_default: false,
+)
+ # The supervised-failure workload is test-owned, but it enters the same
+ # production packer and ordinary init/process_server lifecycle as proof.elf.
+supervised_failure_user = executable(
+  'supervised-failure.elf', files('test/user/supervised_failure/failing_proof.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime,
+  link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'supervised-failure.map')],
+  link_language: 'c', build_by_default: false,
+)
+# The broad channel/pager/pressure/resilience fixture remains a
+# test-owned workload.  It is deliberately built as independent ELFs so the
+# production init/process-server/proof roles cannot silently inherit its
+# coordinator state or intentional-fault markers.
+e7_init_user = executable(
+  'e7-init-test.elf', files('test/user/e7/init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'e7-init-test.map')], link_language: 'c', build_by_default: false,
+)
+e7_proof_user = executable(
+  'e7-proof-test.elf', files('test/user/e7/proof.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'e7-proof-test.map')], link_language: 'c', build_by_default: false,
 )
 uart_user = executable(
   'uart.elf', files('servers/uart/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
@@ -420,8 +445,25 @@ deploy_fixture = custom_target(
   'deploy-fixture', output: 'deployment.fixture',
   command: [deploypack, '@OUTPUT@'], build_by_default: false,
 )
-run_target('test-deploy-manifest', command: [deploy_manifest_test, deploy_fixture])
+production_manifest = custom_target(
+  'production-manifest', input: [process_server_user, proof_user],
+  output: 'deployment.manifest',
+  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@'],
+  build_by_default: false,
+)
+supervised_failure_manifest = custom_target(
+  'supervised-failure-manifest',
+  input: [process_server_user, supervised_failure_user],
+  output: 'supervised-failure.manifest',
+  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@'],
+  build_by_default: false,
+)
+run_target('test-deploy-manifest',
+  command: [deploy_manifest_test, deploy_fixture, production_manifest])
 run_target('test-boot-bundle', command: [boot_bundle_test])
+run_target('test-bootpack-root-role', command: [sh, '-c',
+  '"$1" /dev/null manifest "data:manifest=$2"; status=$?; test "$status" -eq 1',
+  'test-bootpack-root-role', bootpack, production_manifest])
 run_target('test-capability-owner', command: [capability_owner_test])
 run_target('test-deployment', command: [deployment_test])
 run_target('test-syscall-dependency', command: [syscall_dependency_test])
@@ -429,21 +471,30 @@ run_target('test-image-materializer', command: [image_materializer_test])
 run_target('test-task-transaction', command: [task_transaction_test])
 run_target('test-task-authority', command: [task_authority_test])
 boot_bundle = custom_target(
-  'boot-bundle', input: [init_user, proof_user, uart_user], output: 'boot.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+  'boot-bundle', input: [init_user, process_server_user, proof_user, production_manifest], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'process_server=@INPUT1@', 'proof=@INPUT2@', 'data:manifest=@INPUT3@'], build_by_default: false,
+)
+supervised_failure_bundle = custom_target(
+  'supervised-failure-bundle',
+  input: [init_user, process_server_user, supervised_failure_user, supervised_failure_manifest],
+  output: 'supervised-failure.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@',
+    'process_server=@INPUT1@', 'proof=@INPUT2@',
+    'data:manifest=@INPUT3@'],
+  build_by_default: false,
 )
 # /*luna change: encode pressure mode in the existing root module role, reason: the same user images and kernel composition need an explicit guest-visible run condition*/
 pressure_bundle = custom_target(
-    'pressure-bundle', input: [init_user, proof_user, uart_user], output: 'pressure.bundle',
+    'pressure-bundle', input: [e7_init_user, e7_proof_user, uart_user], output: 'pressure.bundle',
     command: [bootpack, '@OUTPUT@', 'pressure', 'pressure=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
 # /*luna change: encode resilience mode in its own root module role, reason: worker-death redelivery and pager_fail supervision are a separate run condition of the same images*/
 resilience_bundle = custom_target(
-    'resilience-bundle', input: [init_user, proof_user, uart_user], output: 'resilience.bundle',
+    'resilience-bundle', input: [e7_init_user, e7_proof_user, uart_user], output: 'resilience.bundle',
     command: [bootpack, '@OUTPUT@', 'resilience', 'resilience=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
 proof_bundle = custom_target(
-  'proof-bundle', input: proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
+  'proof-bundle', input: e7_proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
 )
 task_builder_test_bundle = custom_target(
   'task-builder-test.bundle', input: [task_builder_test_user, task_builder_test_child], output: 'task-builder-test.bundle',
@@ -458,8 +509,6 @@ clangxx = find_program('clang++')
 audit_symbols = files('tools/build/audit-symbols.sh')
 audit_stack = files('tools/build/audit-boot-stack.sh')
 audit_user = files('tools/build/audit-user.sh')
-audit_uart_cleanup = files('tools/build/audit-uart-cleanup.sh')
-audit_proof_ownership = files('tools/build/audit-proof-ownership.sh')
 audit_task_transaction = files('tools/build/audit-task-transaction.sh')
 audit_task_authority = files('tools/build/audit-task-authority.sh')
 audit_operation_completion = files('tools/build/audit-operation-completion.sh')
@@ -475,9 +524,8 @@ run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
 run_target('audit-pressure-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure])
 run_target('audit-pressure-trace-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure_trace])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, proof_user, uart_user])
-run_target('audit-uart-cleanup', command: [sh, audit_uart_cleanup, join_paths(root, 'servers/init/main.cpp')])
-run_target('audit-proof-ownership', command: [sh, audit_proof_ownership, join_paths(root, 'servers/init/main.cpp')])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, process_server_user, proof_user, uart_user])
+run_target('audit-e7-user', command: [sh, audit_user, nm, readelf, e7_init_user, e7_proof_user])
 run_target('audit-task-transaction', command: [sh, audit_task_transaction, join_paths(root, 'user/lib/task_transaction.hpp')])
 run_target('audit-task-authority', command: [sh, audit_task_authority,
   join_paths(root, 'user/lib/task_authority.hpp'),
@@ -503,7 +551,8 @@ run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', '
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0'])
 if profile == 'proof'
   run_target('run-proof-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'root init: started', 'user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1', '--initrd', proof_bundle])
-  run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', boot_bundle])
+  run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--forbid', 'user: contained fault address=', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'init: boot-root', 'init: manifest-decoded', 'init: process-server-prepared', 'init: process-server-running', 'init: process-server-terminal', 'init: authorities-retired', 'init: bundle-views-closed', 'init: complete', '--initrd', boot_bundle])
+  run_target('run-supervised-failure-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--forbid', 'MYOS KERNEL PANIC', '--forbid', 'init: process-server-terminal', '--forbid', 'init: complete', '--forbid', 'user: contained fault', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'init: boot-root', 'init: manifest-decoded', 'init: process-server-prepared', 'init: process-server-running', 'init: authorities-retired', 'init: bundle-views-closed', '--initrd', supervised_failure_bundle])
   # /*luna change: route pressure through its root role, watchdog and fixture image, reason: one explicit A-to-A' run condition keeps ordinary E1 unchanged while exercising the physical PMM floor*/
   run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'marker', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'uart: online', '--stop-when', 'user: contained fault address=0xe0', '--stop-when', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--regex', 'user: contained.*fault address=0xe100', 'uart: online', '--initrd', pressure_bundle])
   # Full trace is an explicit diagnostic observation, not the functional gate.
@@ -552,4 +601,4 @@ alias_target('kernel-debug', kernel_debug)
 # /*luna change: expose the pressure image without changing ordinary aliases, reason: build and audit selection must remain explicit for the physical fixture*/
 alias_target('kernel-pressure', kernel_pressure)
 alias_target('kernel-pressure-trace', kernel_pressure_trace)
-alias_target('bundle', [boot_bundle, pressure_bundle, resilience_bundle, proof_bundle, uart_user])
+alias_target('bundle', [boot_bundle, production_manifest, pressure_bundle, resilience_bundle, proof_bundle, uart_user, e7_init_user, e7_proof_user])

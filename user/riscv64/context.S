@@ -10,6 +10,8 @@ user_enter:
     jr t0
 
 .Luser_entry_returned:
+    /* An entry routine that returns reports normal completion explicitly. */
+    li a0, 0 /* MYOS_STATUS_OK */
     li a7, 1 /* MYOS_SYS_EXIT */
     ecall
 1:

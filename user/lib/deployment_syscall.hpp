@@ -309,6 +309,22 @@ struct SyscallBackend final {
             target.selector, notification.selector, badge).status;
     }
 
+    [[nodiscard]] static auto execution_start(CapRef target) noexcept
+        -> SysResult {
+        if (!current(target)) {
+            return bad_args();
+        }
+        return ::myos::execution_start(target.selector);
+    }
+
+    [[nodiscard]] static auto terminal_query(CapRef target) noexcept
+        -> SysResult {
+        if (!current(target)) {
+            return bad_args();
+        }
+        return ::myos::terminal_query(target.selector);
+    }
+
 private:
     [[nodiscard]] static constexpr auto current(CapRef reference) noexcept
         -> bool {

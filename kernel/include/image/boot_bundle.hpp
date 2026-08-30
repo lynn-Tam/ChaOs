@@ -5,6 +5,7 @@
 #include <libk/span.hpp>
 #include <libk/string_view.hpp>
 #include <mm/permissions.hpp>
+#include <uapi/boot_bundle.h>
 
 namespace kernel::image {
 
@@ -21,6 +22,7 @@ enum class BundleError : u8 {
     InvalidModule,
     InvalidSegment,
     InvalidEntry,
+    InvalidRole,
 };
 
 struct BundleSegment final {
@@ -41,6 +43,13 @@ public:
     [[nodiscard]] auto image() const noexcept -> libk::ByteSpan {
         return image_;
     }
+    [[nodiscard]] auto flags() const noexcept -> u32 { return flags_; }
+    [[nodiscard]] auto bootable() const noexcept -> bool {
+        return flags_ == MYOS_BOOT_MODULE_BOOTABLE;
+    }
+    [[nodiscard]] auto data_module() const noexcept -> bool {
+        return flags_ == MYOS_BOOT_MODULE_DATA;
+    }
     [[nodiscard]] auto entry() const noexcept -> usize { return entry_; }
     [[nodiscard]] auto segment_count() const noexcept -> usize {
         return segment_count_;
@@ -59,6 +68,7 @@ private:
         libk::ByteSpan bytes,
         libk::StrView name,
         libk::ByteSpan image,
+        u32 flags,
         usize entry,
         usize segments_offset,
         usize segment_first,
@@ -66,6 +76,7 @@ private:
         : bytes_(bytes),
           name_(name),
           image_(image),
+          flags_(flags),
           entry_(entry),
           segments_offset_(segments_offset),
           segment_first_(segment_first),
@@ -78,6 +89,7 @@ private:
     libk::ByteSpan bytes_{};
     libk::StrView name_{};
     libk::ByteSpan image_{};
+    u32 flags_{};
     usize entry_{};
     usize segments_offset_{};
     usize segment_first_{};

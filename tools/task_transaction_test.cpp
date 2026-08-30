@@ -23,6 +23,12 @@ struct FakeBackend final {
     static inline myos_status_t next_resource_close{MYOS_STATUS_OK};
     static inline size_t resource_close_busy_count{};
     static inline myos_status_t next_vspace_status{MYOS_STATUS_OK};
+    static inline myos_status_t next_execution_start{MYOS_STATUS_OK};
+    static inline size_t execution_start_count{};
+    static inline uint64_t terminal_sequence{1};
+    static inline myos_status_t terminal_status{MYOS_STATUS_OK};
+    static inline bool terminal_visible{};
+    static inline bool publish_terminal_on_start{};
     static inline myos_cap_t next_cap{100};
 
     static void reset() noexcept {
@@ -30,6 +36,12 @@ struct FakeBackend final {
         next_resource_close = MYOS_STATUS_OK;
         resource_close_busy_count = 0;
         next_vspace_status = MYOS_STATUS_OK;
+        next_execution_start = MYOS_STATUS_OK;
+        execution_start_count = 0;
+        terminal_sequence = 1;
+        terminal_status = MYOS_STATUS_OK;
+        terminal_visible = false;
+        publish_terminal_on_start = false;
         next_cap = 100;
     }
 
@@ -240,6 +252,21 @@ struct FakeBackend final {
         myos::cap::CapRef,
         myos_word_t) noexcept -> myos_status_t {
         return MYOS_STATUS_OK;
+    }
+
+    [[nodiscard]] static auto execution_start(
+        myos::cap::CapRef) noexcept -> myos::SysResult {
+        ++execution_start_count;
+        if (publish_terminal_on_start) {
+            terminal_visible = true;
+        }
+        return {next_execution_start, 0, 0};
+    }
+
+    [[nodiscard]] static auto terminal_query(
+        myos::cap::CapRef) noexcept -> myos::SysResult {
+        return {MYOS_STATUS_OK, terminal_visible ? terminal_sequence : 0,
+                static_cast<myos_word_t>(terminal_status)};
     }
 };
 
@@ -528,10 +555,10 @@ void put_manifest(
         2,
         4);
     const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
-        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410,
+        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410, 0,
     };
     for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
-         table < MYOS_DEPLOY_TABLE_COUNT;
+         table <= MYOS_DEPLOY_TABLE_STRING;
          ++table) {
         const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
             + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
@@ -1605,19 +1632,100 @@ void put_manifest(
         || table.record(task)->state() != myos::deploy::TaskState::Prepared) {
         return false;
     }
+    FakeBackend::reset();
+    if (table.start(task) != MYOS_STATUS_OK
+        || table.record(task) == nullptr
+        || table.record(task)->state() != myos::deploy::TaskState::Running
+        || !table.record(task)->ready()
+        || FakeBackend::execution_start_count != 1) {
+        return false;
+    }
+    FakeBackend::terminal_visible = true;
+    const auto observation = table.observe_terminal(task);
+    if (observation.status != MYOS_STATUS_OK
+        || observation.value != FakeBackend::terminal_sequence
+        || table.consume_terminal(task, observation) != MYOS_STATUS_OK
+        || table.record(task) == nullptr
+        || table.record(task)->state()
+            != myos::deploy::TaskState::Terminating
+        || table.record(task)->ready()) {
+        return false;
+    }
     auto receiver = builder->take_receiver();
     if (!receiver
         || !table.begin_close(
-            task, myos::deploy::CloseReason::ConstructionFailure,
+            task, myos::deploy::CloseReason::Terminal,
             MYOS_STATUS_OK)
         || table.continue_close(task) != MYOS_STATUS_OK) {
         return false;
     }
     const auto result = receiver->take();
     if (!result || result->task != task
-        || result->reason
-            != myos::deploy::CloseReason::ConstructionFailure
+        || result->reason != myos::deploy::CloseReason::Terminal
         || result->status != MYOS_STATUS_OK) {
+        return false;
+    }
+
+    /* A terminal published from execution_start is an ordinary runtime
+     * terminal because the start submission was accepted.  The record first
+     * publishes Running; the canonical observation/consumption path then
+     * records and closes that terminal. */
+    auto early_terminal_plan = fixture.plan.lease();
+    if (!early_terminal_plan) {
+        return false;
+    }
+    auto early_terminal_builder = ConstructionBuilder::begin(
+        completions, table, libk::move(*early_terminal_plan), 0);
+    if (!early_terminal_builder
+        || early_terminal_builder->record() == nullptr) {
+        return false;
+    }
+    const myos::deploy::TaskId early_terminal_task =
+        early_terminal_builder->record()->id();
+    FakeBackend::terminal_visible = false;
+    FakeBackend::publish_terminal_on_start = true;
+    FakeBackend::terminal_sequence = 2;
+    FakeBackend::terminal_status = MYOS_STATUS_OK;
+    if (early_terminal_builder->construct(input, authorities)
+            != MYOS_STATUS_OK
+        || !early_terminal_builder->commit_prepared()) {
+        return false;
+    }
+    auto early_terminal_receiver = early_terminal_builder->take_receiver();
+    if (!early_terminal_receiver
+        || table.start(early_terminal_task) != MYOS_STATUS_OK
+        || table.record(early_terminal_task) == nullptr
+        || table.record(early_terminal_task)->state()
+            != myos::deploy::TaskState::Running
+        || table.record(early_terminal_task)->terminal_sequence() != 0) {
+        return false;
+    }
+    const auto early_observation = table.observe_terminal(early_terminal_task);
+    if (early_observation.status != MYOS_STATUS_OK
+        || early_observation.value != 2
+        || table.consume_terminal(early_terminal_task, early_observation)
+            != MYOS_STATUS_OK
+        || table.record(early_terminal_task) == nullptr
+        || table.record(early_terminal_task)->state()
+            != myos::deploy::TaskState::Terminating
+        || table.record(early_terminal_task)->terminal_sequence() != 2
+        || table.record(early_terminal_task)->terminal_status()
+            != MYOS_STATUS_OK) {
+        return false;
+    }
+    if (!table.begin_close(
+            early_terminal_task,
+            myos::deploy::CloseReason::Terminal,
+            MYOS_STATUS_OK)
+        || table.continue_close(early_terminal_task) != MYOS_STATUS_OK) {
+        return false;
+    }
+    const auto early_terminal_result = early_terminal_receiver->take();
+    if (!early_terminal_result
+        || early_terminal_result->task != early_terminal_task
+        || early_terminal_result->reason
+            != myos::deploy::CloseReason::Terminal
+        || early_terminal_result->status != MYOS_STATUS_OK) {
         return false;
     }
 

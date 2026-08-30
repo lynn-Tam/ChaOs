@@ -203,14 +203,10 @@ public:
         return Capacity;
     }
 
-private:
-    [[nodiscard]] auto adopt(Registration&& registration) noexcept -> bool {
-        if (!registration.valid() || entries_.size() == Capacity) {
-            return false;
-        }
-        return entries_.try_push_back(libk::move(registration));
-    }
-
+    /* Register an external source and retain its reciprocal Registration in
+     * this journal.  The AuthoritySet's raw registration remains private;
+     * callers must use the journal so source-owner lifetime is explicit and
+     * shutdown can retire every entry before the source CSpace is closed. */
     template<typename Set>
     [[nodiscard]] auto register_source(
         Set& authorities,
@@ -237,6 +233,14 @@ private:
             return libk::nullopt;
         }
         return id;
+    }
+
+private:
+    [[nodiscard]] auto adopt(Registration&& registration) noexcept -> bool {
+        if (!registration.valid() || entries_.size() == Capacity) {
+            return false;
+        }
+        return entries_.try_push_back(libk::move(registration));
     }
 
     template<size_t, size_t, uint32_t>
@@ -723,16 +727,20 @@ struct ImportBinding final {
     AuthorityId authority{};
     LocalSlot descriptor{};
     myos_word_t descriptor_offset{};
+    /* Borrowed current-CSpace source for a TaskKey import.  It is valid only
+     * until ImportTransaction adopts the destination into the child space. */
+    cap::CapRef source{};
 };
 
 struct ImportProjection final {
     AuthorityId authority{};
+    bool task_key{};
     size_t remote_index{static_cast<size_t>(-1)};
     myos_cap_t manager{};
     myos_object_kind_t kind{MYOS_OBJECT_KIND_INVALID};
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
-        return authority.valid()
+        return (authority.valid() || task_key)
             && remote_index != static_cast<size_t>(-1)
             && manager != 0
             && kind > MYOS_OBJECT_KIND_INVALID
@@ -797,7 +805,12 @@ public:
             const PlanImport* import = task.import(first + index);
             if (import == nullptr || !valid_import(*import)
                 || import->mode == MYOS_DEPLOY_IMPORT_MOVE
-                || !bindings[index].authority.valid()) {
+                || (import->source_class
+                        == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
+                    ? !bindings[index].authority.valid()
+                    : import->source_class
+                            != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY
+                        || !bindings[index].source)) {
                 return MYOS_STATUS_BAD_ARGS;
             }
         }
@@ -815,16 +828,33 @@ public:
          * in preflight and their destructors release local counters. */
         for (uint32_t index = 0; index < count; ++index) {
             const PlanImport& import = *task.import(first + index);
-            auto lease = authorities.lease(bindings[index].authority);
-            if (!lease) {
-                return MYOS_STATUS_BUSY;
-            }
-            const cap::CapRef source = lease->source();
-            const myos_cap_attenuation ceiling = lease->ceiling();
-            if (!source || source.cspace != 0
-                || !attenuation_within_ceiling(
-                    import.attenuation, ceiling, import.mode)) {
-                return MYOS_STATUS_DENIED;
+            cap::CapRef source{};
+            if (import.source_class == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY) {
+                auto lease = authorities.lease(bindings[index].authority);
+                if (!lease) {
+                    return MYOS_STATUS_BUSY;
+                }
+                source = lease->source();
+                const myos_cap_attenuation ceiling = lease->ceiling();
+                if (!source || source.cspace != 0
+                    || !attenuation_within_ceiling(
+                        import.attenuation, ceiling, import.mode)) {
+                    return MYOS_STATUS_DENIED;
+                }
+                leases[index] = libk::move(*lease);
+            } else {
+                source = bindings[index].source;
+                /* TaskBuilder resolves a TaskKey to a capability that this
+                 * construction transaction already owns in the caller's
+                 * current CSpace.  The destination is the child CSpace;
+                 * remote selectors cannot be used as syscall sources without
+                 * introducing a second source-authority ABI. */
+                if (!source || source.cspace != 0) {
+                    return MYOS_STATUS_BAD_ARGS;
+                }
+                /* No external Authority lease is fabricated for a TaskKey;
+                 * its attenuation is still applied by the kernel import
+                 * syscall. */
             }
             if (import.mode == MYOS_DEPLOY_IMPORT_TYPED_DELEGATE) {
                 if (!bindings[index].descriptor.valid()
@@ -847,14 +877,16 @@ public:
                 && import.attenuation.words[1] == 0) {
                 return MYOS_STATUS_BAD_ARGS;
             }
-            leases[index] = libk::move(*lease);
         }
 
         size_t adopted = 0;
         size_t remote_indices[BatchMax]{};
         for (uint32_t index = 0; index < count; ++index) {
             const PlanImport& import = *task.import(first + index);
-            const cap::CapRef source = leases[index]->source();
+            const cap::CapRef source = import.source_class
+                    == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
+                ? leases[index]->source()
+                : bindings[index].source;
             SysResult result{};
             switch (static_cast<ImportMode>(import.mode)) {
             case ImportMode::Duplicate:
@@ -924,7 +956,11 @@ public:
             }
             remote_indices[adopted] = remote.value();
             outputs[adopted] = ImportProjection{
-                .authority = leases[index]->id(),
+                .authority = import.source_class
+                        == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
+                    ? leases[index]->id() : AuthorityId{},
+                .task_key = import.source_class
+                    == MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY,
                 .remote_index = remote.value(),
                 .manager = manager->selector,
                 .kind = static_cast<myos_object_kind_t>(
@@ -933,7 +969,9 @@ public:
         }
 
         for (uint32_t index = 0; index < count; ++index) {
-            if (!leases[index]->valid()) {
+            if (task.import(first + index)->source_class
+                    == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
+                && !leases[index]->valid()) {
                 return rollback(
                     space, remote_indices, adopted, outputs,
                     MYOS_STATUS_INVALID_CAP);

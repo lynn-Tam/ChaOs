@@ -10,6 +10,8 @@
 #include <user/lib/deployment_syscall.hpp>
 #include <user/lib/image_materializer.hpp>
 
+#include "deploypack/golden_fixture.hpp"
+
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
     __builtin_trap();
@@ -315,7 +317,87 @@ using Image = Materializer::Image;
 static_assert(myos::deploy::MaterializerBackend<FakeBackend>);
 
 alignas(4096) uint8_t bundle_bytes[8192]{};
-alignas(4096) uint8_t scratch_bytes[0x4000]{};
+alignas(4096) uint8_t scratch_bytes[0x10000]{};
+
+struct PlanFixture final {
+    uint8_t raw[myos::deploy::host::kGoldenSize]{};
+    myos::deploy::ManifestWorkspace workspace{};
+    myos::deploy::PlanSet<1> plans{};
+    myos::deploy::DeploymentPlan plan{};
+};
+
+void put_plan(
+    uint8_t* bytes,
+    size_t offset,
+    uint64_t value,
+    size_t width) noexcept {
+    for (size_t index = 0; index < width; ++index) {
+        bytes[offset + index] = static_cast<uint8_t>(
+            value >> (index * 8));
+    }
+}
+
+[[nodiscard]] auto read_plan(
+    const uint8_t* bytes,
+    size_t offset,
+    size_t width) noexcept -> uint64_t {
+    uint64_t value = 0;
+    for (size_t index = 0; index < width; ++index) {
+        value |= static_cast<uint64_t>(bytes[offset + index])
+            << (index * 8);
+    }
+    return value;
+}
+
+[[nodiscard]] auto make_query_plan(
+    PlanFixture& fixture,
+    uint64_t stack_size = 0x10000) noexcept -> bool {
+    for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
+        fixture.raw[index] = myos::deploy::host::kGolden[index];
+    }
+    const size_t task_table = static_cast<size_t>(read_plan(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_TABLES
+            + MYOS_DEPLOY_TABLE_TASK * MYOS_DEPLOY_TABLE_DESC_SIZE
+            + MYOS_DEPLOY_TABLE_OFFSET,
+        8));
+    const size_t mapping_table = static_cast<size_t>(read_plan(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_TABLES
+            + MYOS_DEPLOY_TABLE_MAPPING * MYOS_DEPLOY_TABLE_DESC_SIZE
+            + MYOS_DEPLOY_TABLE_OFFSET,
+        8));
+    put_plan(
+        fixture.raw,
+        task_table + MYOS_DEPLOY_TASK_POOL_MEMORY,
+        0x20000,
+        8);
+    put_plan(
+        fixture.raw,
+        task_table + MYOS_DEPLOY_TASK_CRITICAL_BYTES,
+        0x12000,
+        8);
+    put_plan(
+        fixture.raw,
+        mapping_table + MYOS_DEPLOY_MAPPING_STRIDE
+            + MYOS_DEPLOY_MAPPING_SIZE,
+        stack_size,
+        8);
+    auto parsed = myos::deploy::ManifestView::parse(
+        fixture.raw, sizeof(fixture.raw), fixture.workspace);
+    if (!parsed) {
+        return false;
+    }
+    auto decoded = myos::deploy::DeploymentPlan::decode(
+        parsed.value(), fixture.plans);
+    if (!decoded) {
+        return false;
+    }
+    fixture.plan = libk::move(decoded.value());
+    return fixture.plan.task_count() == 1
+        && fixture.plan.image_count() == 1
+        && fixture.plan.mapping_count() == 3;
+}
 
 void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
     for (size_t index = 0; index < width; ++index) {
@@ -376,6 +458,22 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
     bundle_bytes[image + 0x1000] = 0xb1;
     bundle_bytes[image + 0x1001] = 0xb2;
     bundle_bytes[image + 0x1002] = 0xb3;
+    return total;
+}
+
+[[nodiscard]] auto make_query_bundle() noexcept -> size_t {
+    const size_t total = make_bundle();
+    constexpr size_t module = MYOS_BOOT_HEADER_SIZE;
+    constexpr size_t name = module + MYOS_BOOT_MODULE_SIZE
+        + 2 * MYOS_BOOT_SEGMENT_SIZE;
+    put_bundle(64, 1, 4);
+    put_bundle(module + 8, 4, 4);
+    put_bundle(module + 44, 1, 4);
+    bundle_bytes[name + 0] = 'i';
+    bundle_bytes[name + 1] = 'n';
+    bundle_bytes[name + 2] = 'i';
+    bundle_bytes[name + 3] = 't';
+    bundle_bytes[name + 4] = 0;
     return total;
 }
 
@@ -447,7 +545,8 @@ template<typename Task>
     Task& task,
     Bundle& bundle,
     Scratch& scratch,
-    size_t bundle_size) noexcept -> bool {
+    size_t bundle_size,
+    myos_word_t scratch_size = sizeof(scratch_bytes)) noexcept -> bool {
     FakeBackend::reset();
     FakeBackend::scratch_address = reinterpret_cast<myos_word_t>(scratch_bytes);
     if (task.open({1, 0}, 8192, 64, MYOS_RESOURCE_E7_KINDS, 32, 8)
@@ -459,7 +558,7 @@ template<typename Task>
     const myos::deploy::Window bundle_window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x2000};
     const myos::deploy::Window scratch_window{
-        reinterpret_cast<myos_word_t>(scratch_bytes), sizeof(scratch_bytes)};
+        reinterpret_cast<myos_word_t>(scratch_bytes), scratch_size};
     return vspace.has_value()
         && bundle.open(vspace.value(), {2, 0}, bundle_window, bundle_size)
             == MYOS_STATUS_OK
@@ -933,6 +1032,98 @@ template<typename Task>
         && has_close_selector(103) && has_close_selector(102);
 }
 
+[[nodiscard]] auto test_plan_scratch_requirement() noexcept -> bool {
+    PlanFixture fixture{};
+    if (!make_query_plan(fixture, 0x10000)) {
+        return false;
+    }
+    const size_t bundle_size = make_query_bundle();
+    const myos::boot::Bundle parsed = myos::boot::Bundle::parse(
+        bundle_bytes, bundle_size);
+    auto lease = fixture.plan.lease();
+    if (!parsed || !lease) {
+        return false;
+    }
+    const auto task = lease->task(0);
+    const auto requirement = myos::deploy::required_scratch_size(
+        task, parsed);
+    if (!requirement || *requirement != 0x10000) {
+        return false;
+    }
+    if (myos::deploy::required_scratch_size(
+            myos::deploy::TaskPlanView{}, parsed)
+        || myos::deploy::required_scratch_size(task, myos::boot::Bundle{})) {
+        return false;
+    }
+
+    PlanFixture minimum{};
+    if (!make_query_plan(minimum, MYOS_DEPLOY_PAGE_SIZE)) {
+        return false;
+    }
+    auto minimum_lease = minimum.plan.lease();
+    if (!minimum_lease
+        || !myos::deploy::required_scratch_size(
+            minimum_lease->task(0), parsed)
+        || *myos::deploy::required_scratch_size(
+               minimum_lease->task(0), parsed) != MYOS_DEPLOY_PAGE_SIZE) {
+        return false;
+    }
+    minimum_lease.reset();
+
+    PlanFixture overflow{};
+    if (make_query_plan(overflow, UINT64_MAX)) {
+        return false;
+    }
+
+    Space task_space{};
+    Bundle bundle{};
+    Scratch scratch{};
+    if (!open_environment(
+            task_space, bundle, scratch, bundle_size, *requirement)) {
+        return false;
+    }
+    Materializer materializer{task_space, bundle, scratch};
+    Image image{};
+    Image::Mapping zero{};
+    const bool materialized =
+        materializer.materialize("init", image) == MYOS_STATUS_OK
+        && image.segments.size() == 1
+        && materializer.materialize_zero(
+               0x400000, *requirement,
+               MYOS_VM_READ | MYOS_VM_WRITE, zero) == MYOS_STATUS_OK
+        && zero.size == *requirement
+        && FakeBackend::snapshot_size == sizeof(FakeBackend::snapshots[0]);
+    const bool retired = materialized
+        && materializer.retire_sources(image) == MYOS_STATUS_OK;
+    const bool closed = close_environment(task_space, bundle, scratch);
+    if (!materialized || !retired || !closed || !environment_roots_closed()
+        || !materializer_caps_closed()) {
+        return false;
+    }
+
+    Space undersized_task{};
+    Bundle undersized_bundle{};
+    Scratch undersized_scratch{};
+    if (!open_environment(
+            undersized_task, undersized_bundle, undersized_scratch,
+            bundle_size, MYOS_DEPLOY_PAGE_SIZE)) {
+        return false;
+    }
+    Materializer undersized_materializer{
+        undersized_task, undersized_bundle, undersized_scratch};
+    Image::Mapping rejected{};
+    const bool rejected_zero =
+        undersized_materializer.materialize_zero(
+            0x400000, *requirement,
+            MYOS_VM_READ | MYOS_VM_WRITE, rejected)
+            == MYOS_STATUS_BAD_ARGS
+        && undersized_scratch.phase() == myos::deploy::LeasePhase::Ready;
+    const bool undersized_closed = close_environment(
+        undersized_task, undersized_bundle, undersized_scratch);
+    return rejected_zero && undersized_closed
+        && environment_roots_closed() && materializer_caps_closed();
+}
+
 struct Test final {
     const char* name;
     bool (*run)() noexcept;
@@ -947,6 +1138,7 @@ constexpr Test tests[] = {
     {"nonzero result ownership", test_nonzero_results_are_closed},
     {"write failure unmaps scratch", test_write_failure_unmaps_scratch},
     {"segment failure matrix", test_segment_failures},
+    {"plan scratch requirement", test_plan_scratch_requirement},
 };
 
 } // namespace

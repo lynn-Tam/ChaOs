@@ -8,6 +8,7 @@
 #include <libk/optional.hpp>
 #include <uapi/capability.h>
 #include <uapi/channel.h>
+#include <uapi/bootstrap.h>
 #include <uapi/deploy.h>
 #include <uapi/endpoint.h>
 #include <uapi/object.h>
@@ -106,6 +107,8 @@ struct ManifestTaskRow final {
     uint16_t terminal{};
     uint16_t restart{};
     uint64_t readiness_value{};
+    uint32_t bootstrap_first{};
+    uint32_t bootstrap_count{};
 };
 
 struct ManifestImageRow final {
@@ -167,6 +170,12 @@ struct ManifestImportRow final {
     uint16_t selector{};
     uint32_t flags{};
     myos_cap_attenuation attenuation{};
+    uint16_t source_class{};
+};
+
+struct ManifestBootstrapRow final {
+    uint32_t kind{};
+    StringRef destination{};
 };
 
 struct ManifestDependencyRow final {
@@ -302,6 +311,9 @@ public:
     [[nodiscard]] constexpr auto export_count() const noexcept -> uint32_t {
         return tables_[MYOS_DEPLOY_TABLE_EXPORT].count;
     }
+    [[nodiscard]] constexpr auto bootstrap_count() const noexcept -> uint32_t {
+        return tables_[MYOS_DEPLOY_TABLE_BOOTSTRAP].count;
+    }
 
     [[nodiscard]] auto string(StringRef ref) const noexcept -> ByteView {
         const Table strings = tables_[MYOS_DEPLOY_TABLE_STRING];
@@ -379,6 +391,9 @@ public:
     [[nodiscard]] auto export_row(
         uint32_t index,
         ManifestExportRow& output) const noexcept -> bool;
+    [[nodiscard]] auto bootstrap_row(
+        uint32_t index,
+        ManifestBootstrapRow& output) const noexcept -> bool;
 
 private:
     constexpr ManifestView(const void* data, size_t size) noexcept
@@ -419,10 +434,21 @@ private:
         if (magic != MYOS_DEPLOY_MAGIC) {
             return fail(Error::BadMagic);
         }
+        const bool legacy = header_size == 208U && table_count == 9U;
+        const bool current = header_size == MYOS_DEPLOY_HEADER_SIZE
+            && table_count == MYOS_DEPLOY_TABLE_COUNT;
+        /* Deployment minor versions bind the complete envelope shape.  A
+         * legacy v0 header is exactly the nine-table/208-byte form; v1 is
+         * exactly the ten-table/current form.  Accepting either minor with
+         * the other shape creates a hybrid wire contract that readers cannot
+         * interpret consistently. */
         if (major != MYOS_DEPLOY_MAJOR || minor > MYOS_DEPLOY_MINOR
-            || header_size != MYOS_DEPLOY_HEADER_SIZE) {
+            || (minor == 0 && !legacy)
+            || (minor != 0 && !current)) {
             return fail(Error::BadVersion);
         }
+        header_size_ = static_cast<uint32_t>(header_size);
+        table_count_ = static_cast<uint32_t>(table_count);
         if (total_size != bytes_.size()
             || architecture != MYOS_DEPLOY_ARCH_GENERIC
             || abi != MYOS_DEPLOY_ABI_ID) {
@@ -431,7 +457,8 @@ private:
         if (features != 0 || flags != 0 || checksum != 0) {
             return fail(Error::UnsupportedFeatures);
         }
-        if (table_count != MYOS_DEPLOY_TABLE_COUNT || reserved != 0) {
+        if ((table_count != MYOS_DEPLOY_TABLE_COUNT && !legacy)
+            || reserved != 0) {
             return fail(Error::InvalidHeader);
         }
         return true;
@@ -458,15 +485,16 @@ private:
             MYOS_DEPLOY_MAPPING_MAX, MYOS_DEPLOY_OBJECT_MAX,
             MYOS_DEPLOY_EXECUTION_MAX, MYOS_DEPLOY_IMPORT_MAX,
             MYOS_DEPLOY_DEPENDENCY_MAX, MYOS_DEPLOY_EXPORT_MAX,
-            MYOS_DEPLOY_STRING_MAX,
+            MYOS_DEPLOY_STRING_MAX, MYOS_DEPLOY_BOOTSTRAP_MAX,
         };
         constexpr uint32_t strides[MYOS_DEPLOY_TABLE_COUNT] = {
             MYOS_DEPLOY_TASK_STRIDE, MYOS_DEPLOY_IMAGE_STRIDE,
             MYOS_DEPLOY_MAPPING_STRIDE, MYOS_DEPLOY_OBJECT_STRIDE,
             MYOS_DEPLOY_EXECUTION_STRIDE, MYOS_DEPLOY_IMPORT_STRIDE,
             MYOS_DEPLOY_DEPENDENCY_STRIDE, MYOS_DEPLOY_EXPORT_STRIDE, 1,
+            MYOS_DEPLOY_BOOTSTRAP_STRIDE,
         };
-        for (uint32_t index = 0; index < MYOS_DEPLOY_TABLE_COUNT; ++index) {
+        for (uint32_t index = 0; index < table_count_; ++index) {
             const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
                 + static_cast<size_t>(index) * MYOS_DEPLOY_TABLE_DESC_SIZE;
             uint64_t offset{};
@@ -488,7 +516,7 @@ private:
                 tables_[index] = Table{0, 0, static_cast<uint32_t>(stride)};
                 continue;
             }
-            if (offset < MYOS_DEPLOY_HEADER_SIZE
+            if (offset < header_size_
                 || offset % MYOS_DEPLOY_TABLE_ALIGNMENT != 0
                 || offset > bytes_.size()) {
                 return fail(Error::InvalidTable);
@@ -505,6 +533,15 @@ private:
                 static_cast<size_t>(offset),
                 static_cast<uint32_t>(count),
                 static_cast<uint32_t>(stride),
+            };
+        }
+        for (uint32_t index = table_count_; index < MYOS_DEPLOY_TABLE_COUNT;
+             ++index) {
+            tables_[index] = Table{
+                0,
+                0,
+                index == MYOS_DEPLOY_TABLE_BOOTSTRAP
+                    ? MYOS_DEPLOY_BOOTSTRAP_STRIDE : 1,
             };
         }
         for (uint32_t first = 0; first < MYOS_DEPLOY_TABLE_COUNT; ++first) {
@@ -776,6 +813,21 @@ private:
                     return fail(Error::InvalidReference);
                 }
             }
+            uint64_t bootstrap_first{};
+            uint64_t bootstrap_count_value{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4,
+                       bootstrap_first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4,
+                          bootstrap_count_value)
+                || bootstrap_count_value > MYOS_DEPLOY_TASK_BOOTSTRAP_MAX
+                || bootstrap_first > tables_[MYOS_DEPLOY_TABLE_BOOTSTRAP].count
+                || bootstrap_count_value
+                    > tables_[MYOS_DEPLOY_TABLE_BOOTSTRAP].count
+                        - bootstrap_first) {
+                return fail(Error::InvalidReference);
+            }
         }
         return true;
     }
@@ -814,6 +866,22 @@ private:
             if (cursor != tables_[task_tables[child]].count) {
                 return fail(Error::InvalidReference);
             }
+        }
+        uint64_t bootstrap_cursor{};
+        for (uint32_t task = 0; task < task_count(); ++task) {
+            uint64_t first{};
+            uint64_t count{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4, first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4, count)
+                || first != bootstrap_cursor) {
+                return fail(Error::InvalidReference);
+            }
+            bootstrap_cursor += count;
+        }
+        if (bootstrap_cursor != tables_[MYOS_DEPLOY_TABLE_BOOTSTRAP].count) {
+            return fail(Error::InvalidReference);
         }
         return true;
     }
@@ -1412,6 +1480,7 @@ private:
             uint64_t mode{};
             uint64_t selector{};
             uint64_t flags{};
+            uint64_t source_class{};
             uint64_t attenuation_kind{};
             if (!read_key(MYOS_DEPLOY_TABLE_IMPORT, index,
                           MYOS_DEPLOY_IMPORT_SOURCE, source, true)
@@ -1425,13 +1494,17 @@ private:
                 || !value(MYOS_DEPLOY_TABLE_IMPORT, index,
                           MYOS_DEPLOY_IMPORT_FLAGS, 4, flags)
                 || !value(MYOS_DEPLOY_TABLE_IMPORT, index,
+                          MYOS_DEPLOY_IMPORT_SOURCE_CLASS, 2,
+                          source_class)
+                || !value(MYOS_DEPLOY_TABLE_IMPORT, index,
                           MYOS_DEPLOY_IMPORT_ATTENUATION
                               + MYOS_DEPLOY_ATTENUATION_KIND,
                           2, attenuation_kind)
-                /* Move remains a reserved wire value while Stage E has no
+                /* Move remains a reserved wire value while the current
                  * escrow ABI.  Reject it at the canonical manifest-policy
                  * boundary before DeploymentPlan/Task reservation. */
                 || mode >= MYOS_DEPLOY_IMPORT_MOVE
+                || source_class > MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY
                 || selector != MYOS_DEPLOY_SELECTOR_ALLOCATED_KEYED
                 || flags != 0
                 || !zero(MYOS_DEPLOY_TABLE_IMPORT, index,
@@ -1449,6 +1522,135 @@ private:
                  * operation.  Do not reject the kind merely by name. */
                 ) {
                 return fail(Error::InvalidRecord);
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] auto validate_bootstrap() noexcept -> bool {
+        for (uint32_t task = 0; task < task_count(); ++task) {
+            uint64_t first{};
+            uint64_t count{};
+            uint64_t import_first{};
+            uint64_t import_count_value{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4, first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4, count)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_IMPORT_FIRST, 4, import_first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_IMPORT_COUNT, 4,
+                          import_count_value)) {
+                return fail(Error::InvalidReference);
+            }
+            for (uint64_t local = 0; local < count; ++local) {
+                const uint32_t row = static_cast<uint32_t>(first + local);
+                uint64_t kind{};
+                ByteView destination{};
+                if (!value(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
+                           MYOS_DEPLOY_BOOTSTRAP_KIND, 4, kind)
+                    || !read_key(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
+                                 MYOS_DEPLOY_BOOTSTRAP_DESTINATION,
+                                 destination, true)
+                    || !zero(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
+                             MYOS_DEPLOY_BOOTSTRAP_RESERVED,
+                             MYOS_DEPLOY_BOOTSTRAP_DESTINATION)
+                    || kind < MYOS_BOOTSTRAP_CAP_VSPACE
+                    || kind > MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION
+                    || myos_bootstrap_object_kind(static_cast<uint32_t>(kind))
+                        == MYOS_OBJECT_KIND_INVALID) {
+                    return fail(Error::InvalidRecord);
+                }
+                const myos_object_kind_t expected_kind =
+                    myos_bootstrap_object_kind(static_cast<uint32_t>(kind));
+                for (uint64_t previous = 0; previous < local; ++previous) {
+                    uint64_t previous_kind{};
+                    if (!value(MYOS_DEPLOY_TABLE_BOOTSTRAP,
+                               static_cast<uint32_t>(first + previous),
+                               MYOS_DEPLOY_BOOTSTRAP_KIND, 4,
+                               previous_kind)
+                        || previous_kind == kind) {
+                        return fail(Error::DuplicateKey);
+                    }
+                }
+                uint32_t matches{};
+                myos_object_kind_t matched_kind = MYOS_OBJECT_KIND_INVALID;
+                for (uint64_t imported = 0;
+                     imported < import_count_value; ++imported) {
+                    ByteView imported_destination{};
+                    uint64_t imported_kind{};
+                    if (!read_key(
+                            MYOS_DEPLOY_TABLE_IMPORT,
+                            static_cast<uint32_t>(import_first + imported),
+                            MYOS_DEPLOY_IMPORT_DESTINATION,
+                            imported_destination, true)) {
+                        return fail(Error::InvalidReference);
+                    }
+                    if (imported_destination.equals(destination)) {
+                        if (!value(
+                                MYOS_DEPLOY_TABLE_IMPORT,
+                                static_cast<uint32_t>(import_first + imported),
+                                MYOS_DEPLOY_IMPORT_ATTENUATION
+                                    + MYOS_DEPLOY_ATTENUATION_KIND,
+                                2, imported_kind)
+                            || !valid_kind(imported_kind)) {
+                            return fail(Error::InvalidReference);
+                        }
+                        ++matches;
+                        matched_kind = static_cast<myos_object_kind_t>(
+                            imported_kind);
+                    }
+                }
+                if (matches != 1 || matched_kind != expected_kind) {
+                    return fail(Error::InvalidReference);
+                }
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] auto validate_import_sources() noexcept -> bool {
+        for (uint32_t task = 0; task < task_count(); ++task) {
+            uint64_t import_first{};
+            uint64_t import_count_value{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_IMPORT_FIRST, 4, import_first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_IMPORT_COUNT, 4,
+                          import_count_value)) {
+                return fail(Error::InvalidReference);
+            }
+            for (uint64_t local = 0; local < import_count_value; ++local) {
+                const uint32_t row = static_cast<uint32_t>(import_first + local);
+                uint64_t source_class{};
+                uint64_t attenuation_kind{};
+                ByteView source{};
+                if (!value(MYOS_DEPLOY_TABLE_IMPORT, row,
+                           MYOS_DEPLOY_IMPORT_SOURCE_CLASS, 2,
+                           source_class)
+                    || !value(MYOS_DEPLOY_TABLE_IMPORT, row,
+                              MYOS_DEPLOY_IMPORT_ATTENUATION
+                                  + MYOS_DEPLOY_ATTENUATION_KIND,
+                              2, attenuation_kind)
+                    || !read_key(MYOS_DEPLOY_TABLE_IMPORT, row,
+                                 MYOS_DEPLOY_IMPORT_SOURCE, source, true)) {
+                    return fail(Error::InvalidReference);
+                }
+                if (source_class != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY) {
+                    continue;
+                }
+                /* A TaskKey is a produced source in the task's current CSpace.
+                 * Import destinations live in the child CSpace and cannot be
+                 * reused as syscall sources without a separate source-CSpace
+                 * ABI.  Keep that unsupported relation out of the wire
+                 * language instead of admitting a constructor-only failure. */
+                const auto source_kind = task_source_kind(task, source);
+                if (!source_kind
+                    || *source_kind
+                        != static_cast<myos_object_kind_t>(attenuation_kind)) {
+                    return fail(Error::InvalidReference);
+                }
             }
         }
         return true;
@@ -1961,6 +2163,7 @@ private:
                  ++module_index) {
                 myos::boot::Module candidate{};
                 if (!bundle.module(module_index, candidate)
+                    || !candidate.bootable()
                     || !same_bytes(source, candidate.name())) {
                     continue;
                 }
@@ -2355,16 +2558,20 @@ private:
     }
 
     [[nodiscard]] auto validate(ManifestWorkspace& workspace) noexcept -> bool {
-        if (bytes_.data() == nullptr
-            || bytes_.size() > MYOS_DEPLOY_MAX_SIZE
-            || bytes_.size() < MYOS_DEPLOY_HEADER_SIZE
-            || !read_header() || !read_table_descriptors()
+        if (bytes_.data() == nullptr || bytes_.size() > MYOS_DEPLOY_MAX_SIZE
+            || bytes_.size() < 208U) {
+            error_ = Error::InvalidHeader;
+            return false;
+        }
+        if (!read_header() || !read_table_descriptors()
             || !validate_tasks() || !validate_ranges()
             || !validate_keys(workspace)
             || !validate_images()
             || !validate_mappings() || !validate_objects()
             || !validate_executions() || !validate_relations()
             || !validate_imports()
+            || !validate_import_sources()
+            || !validate_bootstrap()
             || !validate_dependencies(workspace) || !validate_exports()
             || !validate_overlap_and_budget()) {
             if (error_ == Error{}) {
@@ -2378,6 +2585,8 @@ private:
     ByteView bytes_{};
     Table tables_[MYOS_DEPLOY_TABLE_COUNT]{};
     Error error_{Error::InvalidHeader};
+    uint32_t header_size_{MYOS_DEPLOY_HEADER_SIZE};
+    uint32_t table_count_{MYOS_DEPLOY_TABLE_COUNT};
 };
 
 namespace manifest_detail {
@@ -2537,7 +2746,13 @@ inline auto ManifestView::task_row(
                                    output.restart)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
                                    MYOS_DEPLOY_TASK_READINESS_VALUE, 8,
-                                   output.readiness_value);
+                                   output.readiness_value)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
+                                   MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4,
+                                   output.bootstrap_first)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
+                                   MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4,
+                                   output.bootstrap_count);
 }
 
 inline auto ManifestView::image_row(
@@ -2705,6 +2920,9 @@ inline auto ManifestView::import_row(
                                    output.selector)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_IMPORT, index,
                                    MYOS_DEPLOY_IMPORT_FLAGS, 4, output.flags)
+        && manifest_detail::scalar(
+               *this, MYOS_DEPLOY_TABLE_IMPORT, index,
+               MYOS_DEPLOY_IMPORT_SOURCE_CLASS, 2, output.source_class)
         && manifest_detail::attenuation(
                *this, MYOS_DEPLOY_TABLE_IMPORT, index,
                MYOS_DEPLOY_IMPORT_ATTENUATION, output.attenuation);
@@ -2747,6 +2965,19 @@ inline auto ManifestView::export_row(
         && manifest_detail::attenuation(
                *this, MYOS_DEPLOY_TABLE_EXPORT, index,
                MYOS_DEPLOY_EXPORT_CEILING, output.ceiling);
+}
+
+inline auto ManifestView::bootstrap_row(
+    uint32_t index,
+    ManifestBootstrapRow& output) const noexcept -> bool {
+    output = {};
+    return manifest_detail::scalar(
+               *this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_KIND, 4, output.kind)
+        && manifest_detail::string_ref(
+               *this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_DESTINATION, true,
+               output.destination);
 }
 
 } // namespace myos::deploy

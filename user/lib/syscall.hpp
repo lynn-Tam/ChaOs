@@ -599,8 +599,10 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_VM_DESTROY_REGION, region);
 }
 
-[[noreturn]] inline void exit() noexcept {
-    (void)syscall(MYOS_SYS_EXIT);
+[[noreturn]] inline void exit(
+    myos_status_t status = MYOS_STATUS_OK) noexcept {
+    (void)syscall(
+        MYOS_SYS_EXIT, static_cast<myos_word_t>(status));
     for (;;) {
         asm volatile("wfi");
     }

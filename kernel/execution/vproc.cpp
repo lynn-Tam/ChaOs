@@ -1270,6 +1270,21 @@ void Vproc::request_exit() noexcept {
     retry_stop_if_ready();
 }
 
+void Vproc::request_normal_exit(myos_status_t status) noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        // A stop request that already won admission remains the terminal
+        // owner.  NormalExit is recorded only when this syscall is the first
+        // request to close the execution.
+        if (stopped_ || stop_requested_) {
+            return;
+        }
+        normal_exit_requested_ = true;
+        normal_exit_status_ = status;
+    }
+    request_exit();
+}
+
 auto Vproc::activation_quiescent() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{state_lock_};
     return activation_publishers_ == 0
@@ -1372,7 +1387,9 @@ void Vproc::retry_stop_if_ready() noexcept {
     }
 }
 
-void Vproc::finish_stop() noexcept {
+void Vproc::finish_terminal(
+    fault::Reason reason,
+    myos_status_t status) noexcept {
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
         KASSERT(!arm_attaching_ && activation_publishers_ == 0
@@ -1422,7 +1439,7 @@ void Vproc::finish_stop() noexcept {
     execution_.binding().detach_user();
     authority_.target_stopped();
     static_cast<void>(terminal_.claim(
-        fault::Reason::Stop, MYOS_STATUS_CANCELED));
+        reason, status));
     arm_ = {};
     runtime_.control_page.reset();
     runtime_.event_page.reset();
@@ -1442,6 +1459,30 @@ void Vproc::finish_stop() noexcept {
         }
         request->finish(*this);
     }
+}
+
+void Vproc::finish_stop() noexcept {
+    bool normal{};
+    myos_status_t status{MYOS_STATUS_CANCELED};
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        normal = normal_exit_requested_;
+        if (normal) {
+            status = normal_exit_status_;
+        }
+    }
+    finish_terminal(
+        normal && status == MYOS_STATUS_OK
+            ? fault::Reason::NormalExit
+            : normal ? fault::Reason::ExitFailure : fault::Reason::Stop,
+        status);
+}
+
+void Vproc::finish_exit(myos_status_t status) noexcept {
+    finish_terminal(
+        status == MYOS_STATUS_OK
+            ? fault::Reason::NormalExit : fault::Reason::ExitFailure,
+        status);
 }
 
 [[noreturn]] void Vproc::start(void* argument) noexcept {

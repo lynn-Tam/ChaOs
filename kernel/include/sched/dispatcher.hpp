@@ -11,6 +11,7 @@
 #include <sched/remote_queue.hpp>
 #include <sched/types.hpp>
 #include <time/clock.hpp>
+#include <uapi/status.h>
 
 namespace kernel {
 struct CpuLocal;
@@ -100,6 +101,11 @@ public:
     void park_current() noexcept;
     [[noreturn]] void exit_current() noexcept;
     void request_reschedule(DispatchReason reason) noexcept;
+    // Exit status is carried alongside the scheduler handoff until the
+    // target's single terminal claim. Other dispatch reasons ignore it.
+    void request_reschedule(
+        DispatchReason reason,
+        myos_status_t exit_status) noexcept;
     void on_timer() noexcept;
     void on_trap_exit() noexcept;
     // Re-publishes the current Execution's derived effective stack and roots
@@ -118,11 +124,15 @@ private:
     void enqueue_or_throttle(Binding& binding, time::Instant now) noexcept;
     void process_timers(time::Instant now) noexcept;
     void process_deadlines(time::Instant now) noexcept;
-    void dispatch(DispatchReason reason, time::Instant now) noexcept;
+    void dispatch(
+        DispatchReason reason,
+        time::Instant now,
+        myos_status_t exit_status = MYOS_STATUS_OK) noexcept;
     void commit(
         Binding* candidate,
         DispatchReason reason,
-        time::Instant now) noexcept;
+        time::Instant now,
+        myos_status_t exit_status) noexcept;
     void publish(execution::Target target) noexcept;
     void program_deadline(time::Instant now) noexcept;
     void arm_watchdog(time::Instant now) noexcept;
@@ -130,7 +140,10 @@ private:
     void post_switch() noexcept;
     [[nodiscard]] auto stop(execution::Target target) noexcept
         -> StopDisposition;
-    void finish_exit(execution::Target target) noexcept;
+    void finish_exit(
+        execution::Target target,
+        DispatchReason reason = DispatchReason::Exit,
+        myos_status_t exit_status = MYOS_STATUS_OK) noexcept;
     void record_dispatch(
         execution::Target outgoing,
         execution::Target incoming,
@@ -158,8 +171,11 @@ private:
     time::Instant accounted_at_{};
     time::Duration quantum_{};
     libk::optional<DispatchReason> pending_{};
+    myos_status_t pending_exit_status_{MYOS_STATUS_OK};
     usize preempt_depth_{};
     execution::Target handoff_outgoing_{};
+    DispatchReason handoff_reason_{DispatchReason::Exit};
+    myos_status_t handoff_exit_status_{MYOS_STATUS_OK};
     BuiltinPolicy policy_{};
     TimerQueue timers_{};
     DeadlineQueue deadlines_{};

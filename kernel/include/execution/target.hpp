@@ -5,6 +5,7 @@
 #include <libk/variant.hpp>
 #include <object/thread_pool.hpp>
 #include <object/vproc_pool.hpp>
+#include <uapi/status.h>
 
 namespace kernel::sched {
 class Binding;
@@ -60,6 +61,10 @@ public:
         sched::Binding& binding,
         sched::CpuDispatcher* owner) const noexcept -> bool;
     void finish_stop() const noexcept;
+    // Finalize a self-requested normal exit.  External stop still uses
+    // finish_stop(); keeping the two terminal reasons distinct is part of the
+    // execution ABI observed by supervisors.
+    void finish_exit(myos_status_t status = MYOS_STATUS_OK) const noexcept;
 
     [[nodiscard]] friend auto operator==(
         const Target&, const Target&) noexcept -> bool = default;

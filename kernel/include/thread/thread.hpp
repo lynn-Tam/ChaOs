@@ -173,7 +173,11 @@ private:
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop(execution::Stop& request) noexcept;
+    void finish_terminal(
+        fault::Reason reason,
+        myos_status_t status) noexcept;
     void finish_stop() noexcept;
+    void finish_exit(myos_status_t status = MYOS_STATUS_OK) noexcept;
 
     using StopList = libk::IntrusiveList<
         execution::Stop, &execution::Stop::hook_>;

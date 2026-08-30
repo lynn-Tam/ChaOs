@@ -158,11 +158,14 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                     kernel::sched::DispatchReason::Park);
                 return;
             case kernel::syscall::Disposition::Exit:
+                const myos_status_t status = static_cast<myos_status_t>(
+                    context.arg(1));
                 if (vproc != nullptr) {
-                    vproc->request_exit();
+                    vproc->request_normal_exit(status);
                 } else {
                     cpu.dispatcher()->request_reschedule(
-                        kernel::sched::DispatchReason::Exit);
+                        kernel::sched::DispatchReason::Exit,
+                        status);
                 }
                 return;
             }

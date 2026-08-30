@@ -9,6 +9,11 @@ namespace kernel::fault {
 
 enum class Reason : u8 {
     NormalExit,
+    // A userspace caller explicitly terminated with a non-OK status. Keep
+    // this distinct from a kernel fault, external Stop, and invariant
+    // failure so supervisors can preserve the caller's status without
+    // manufacturing a fault event.
+    ExitFailure,
     Fault,
     Stop,
     Revoked,

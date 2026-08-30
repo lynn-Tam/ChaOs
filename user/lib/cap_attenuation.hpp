@@ -69,7 +69,7 @@ enum class DescriptorForm : uint8_t {
  * Validate one canonical descriptor form.  A registered ceiling may carry a
  * rights-only Tunnel source; Duplicate is the rights-only wire form for every
  * kind; TypedRequest is the full typed form and deliberately excludes Tunnel,
- * whose only accepted Stage E operation is Duplicate.
+ * whose only accepted current operation is Duplicate.
  */
 [[nodiscard]] constexpr auto valid_descriptor(
     const myos_cap_attenuation& value,

@@ -85,6 +85,7 @@ struct PlanTask final {
     uint16_t terminal{};
     uint16_t restart{};
     uint64_t readiness_value{};
+    PlanRange bootstraps{};
 };
 
 struct PlanImage final {
@@ -146,6 +147,12 @@ struct PlanImport final {
     uint16_t selector{};
     uint32_t flags{};
     myos_cap_attenuation attenuation{};
+    uint16_t source_class{};
+};
+
+struct PlanBootstrap final {
+    uint32_t kind{};
+    SymbolId destination{};
 };
 
 struct PlanDependency final {
@@ -203,6 +210,9 @@ public:
     [[nodiscard]] constexpr auto export_count() const noexcept -> uint32_t {
         return export_count_;
     }
+    [[nodiscard]] constexpr auto bootstrap_count() const noexcept -> uint32_t {
+        return bootstrap_count_;
+    }
 
     [[nodiscard]] auto task(uint32_t index) const noexcept -> const PlanTask* {
         return index < task_count_ ? &tasks_[index] : nullptr;
@@ -233,6 +243,10 @@ public:
     [[nodiscard]] auto export_record(uint32_t index) const noexcept
         -> const PlanExport* {
         return index < export_count_ ? &exports_[index] : nullptr;
+    }
+    [[nodiscard]] auto bootstrap(uint32_t index) const noexcept
+        -> const PlanBootstrap* {
+        return index < bootstrap_count_ ? &bootstraps_[index] : nullptr;
     }
 
     [[nodiscard]] auto symbol(SymbolId symbol_id) const noexcept -> ByteView {
@@ -273,6 +287,9 @@ private:
         for (size_t index = 0; index < export_count_; ++index) {
             exports_[index] = {};
         }
+        for (size_t index = 0; index < bootstrap_count_; ++index) {
+            bootstraps_[index] = {};
+        }
         for (size_t index = 0; index < string_size_; ++index) {
             strings_[index] = 0;
         }
@@ -284,6 +301,7 @@ private:
         import_count_ = 0;
         dependency_count_ = 0;
         export_count_ = 0;
+        bootstrap_count_ = 0;
         string_size_ = 0;
     }
 
@@ -295,6 +313,7 @@ private:
     PlanImport imports_[MYOS_DEPLOY_IMPORT_MAX]{};
     PlanDependency dependencies_[MYOS_DEPLOY_DEPENDENCY_MAX]{};
     PlanExport exports_[MYOS_DEPLOY_EXPORT_MAX]{};
+    PlanBootstrap bootstraps_[MYOS_DEPLOY_BOOTSTRAP_MAX]{};
     uint8_t strings_[MYOS_DEPLOY_STRING_MAX]{};
     uint32_t task_count_{};
     uint32_t image_count_{};
@@ -304,6 +323,7 @@ private:
     uint32_t import_count_{};
     uint32_t dependency_count_{};
     uint32_t export_count_{};
+    uint32_t bootstrap_count_{};
     uint32_t string_size_{};
 };
 
@@ -349,6 +369,8 @@ struct TaskPlanView final {
         -> const PlanDependency*;
     [[nodiscard]] auto export_record(uint32_t index) const noexcept
         -> const PlanExport*;
+    [[nodiscard]] auto bootstrap(uint32_t index) const noexcept
+        -> const PlanBootstrap*;
     [[nodiscard]] auto symbol(SymbolId symbol) const noexcept -> ByteView;
 };
 
@@ -415,6 +437,10 @@ public:
     [[nodiscard]] constexpr auto export_count() const noexcept -> uint32_t {
         return control_ == nullptr ? 0 : control_->storage.export_count();
     }
+    [[nodiscard]] constexpr auto bootstrap_count() const noexcept -> uint32_t {
+        return control_ == nullptr ? 0
+            : control_->storage.bootstrap_count();
+    }
 
     [[nodiscard]] auto task(uint32_t index) const noexcept -> const PlanTask* {
         return control_ == nullptr ? nullptr : control_->storage.task(index);
@@ -449,10 +475,29 @@ public:
         return control_ == nullptr
             ? nullptr : control_->storage.export_record(index);
     }
+    [[nodiscard]] auto bootstrap(uint32_t index) const noexcept
+        -> const PlanBootstrap* {
+        return control_ == nullptr ? nullptr
+            : control_->storage.bootstrap(index);
+    }
 
     [[nodiscard]] auto symbol(SymbolId symbol_id) const noexcept -> ByteView {
         return control_ == nullptr ? ByteView{}
             : control_->storage.symbol(symbol_id);
+    }
+
+    /* Plan identity is the durable lookup key for deployment callers.  The
+     * query returns an index into this immutable plan; it does not create a
+     * second task registry or retain a borrowed row. */
+    [[nodiscard]] auto find_task(ByteView name) const noexcept
+        -> libk::optional<uint32_t>;
+
+    template<size_t N>
+    [[nodiscard]] auto find_task(const char (&name)[N]) const noexcept
+        -> libk::optional<uint32_t> {
+        static_assert(N != 0);
+        return find_task(ByteView{
+            reinterpret_cast<const uint8_t*>(name), N - 1});
     }
 
     [[nodiscard]] auto lease() const noexcept -> libk::optional<PlanLease>;
@@ -620,8 +665,31 @@ inline auto TaskPlanView::export_record(uint32_t index) const noexcept
     return control->storage.export_record(task->exports.first + index);
 }
 
+inline auto TaskPlanView::bootstrap(uint32_t index) const noexcept
+    -> const PlanBootstrap* {
+    const PlanTask* task = row();
+    if (task == nullptr || index >= task->bootstraps.count) {
+        return nullptr;
+    }
+    return control->storage.bootstrap(task->bootstraps.first + index);
+}
+
 inline auto TaskPlanView::symbol(SymbolId symbol_id) const noexcept -> ByteView {
     return valid() ? control->storage.symbol(symbol_id) : ByteView{};
+}
+
+inline auto DeploymentPlan::find_task(ByteView name) const noexcept
+    -> libk::optional<uint32_t> {
+    if (!name) {
+        return libk::nullopt;
+    }
+    for (uint32_t index = 0; index < task_count(); ++index) {
+        const PlanTask* const row = task(index);
+        if (row != nullptr && symbol(row->name).equals(name)) {
+            return index;
+        }
+    }
+    return libk::nullopt;
 }
 
 template<size_t Capacity, uint32_t GenerationLimit>
@@ -772,6 +840,7 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         row.terminal = source.terminal;
         row.restart = source.restart;
         row.readiness_value = source.readiness_value;
+        row.bootstraps = {source.bootstrap_first, source.bootstrap_count};
     }
     storage_->task_count_ = view.task_count();
 
@@ -867,6 +936,7 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         row.selector = source.selector;
         row.flags = source.flags;
         row.attenuation = source.attenuation;
+        row.source_class = source.source_class;
     }
     storage_->import_count_ = view.import_count();
 
@@ -896,6 +966,16 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         row.ceiling = source.ceiling;
     }
     storage_->export_count_ = view.export_count();
+    for (uint32_t index = 0; index < view.bootstrap_count(); ++index) {
+        ManifestBootstrapRow source{};
+        if (!view.bootstrap_row(index, source)) {
+            return false;
+        }
+        PlanBootstrap& row = storage_->bootstraps_[index];
+        row.kind = source.kind;
+        row.destination = symbol(source.destination);
+    }
+    storage_->bootstrap_count_ = view.bootstrap_count();
     return true;
 }
 

@@ -292,7 +292,7 @@ void put(
         8));
     size_t next_table = sizeof(fixture.raw);
     for (size_t table = MYOS_DEPLOY_TABLE_DEPENDENCY;
-         table < MYOS_DEPLOY_TABLE_COUNT; ++table) {
+         table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
         const size_t table_descriptor = MYOS_DEPLOY_HEADER_TABLES
             + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
         const size_t offset = static_cast<size_t>(get(
@@ -310,7 +310,7 @@ void put(
             fixture.raw[index - 1];
     }
     for (size_t table = MYOS_DEPLOY_TABLE_DEPENDENCY;
-         table < MYOS_DEPLOY_TABLE_COUNT; ++table) {
+         table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
         const size_t table_descriptor = MYOS_DEPLOY_HEADER_TABLES
             + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
         const size_t offset = static_cast<size_t>(get(

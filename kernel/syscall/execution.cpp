@@ -98,8 +98,17 @@ auto handle_execution(
     switch (operation) {
     case MYOS_SYS_YIELD:
         return Result{MYOS_STATUS_OK, 0, Disposition::Yield};
-    case MYOS_SYS_EXIT:
-        return Result{MYOS_STATUS_OK, 0, Disposition::Exit};
+    case MYOS_SYS_EXIT: {
+        // The status is a caller-supplied terminal result, not a syscall
+        // failure to be retried. Keep Result::status as the syscall
+        // completion status and carry the terminal payload in its value word.
+        const myos_status_t status = static_cast<myos_status_t>(
+            invocation.trap.arg(0));
+        return Result{
+            MYOS_STATUS_OK,
+            static_cast<usize>(static_cast<isize>(status)),
+            Disposition::Exit};
+    }
     case MYOS_SYS_SC_BIND:
         return bind(invocation);
     case MYOS_SYS_EXECUTION_START:

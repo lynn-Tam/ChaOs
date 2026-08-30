@@ -68,7 +68,7 @@ audit_one() {
 audit_task_source() {
     input=$1
     # TaskBuilder/TaskRecord no longer expose an arbitrary LocalSlot,
-    # identity and ceiling registration seam.  Stage F owns the sole Task
+    # identity and ceiling registration seam.  The deployment path owns the sole Task
     # publication registration path; construction must not grow a second
     # registration owner.
     if rg -q 'auto register_source\(' "$input" \

@@ -13,6 +13,7 @@ using kernel::image::BundleError;
 
 struct Header final {
     u64 total_size{};
+    u16 minor{};
     u64 modules_offset{};
     u32 modules_count{};
     u32 root_module{};
@@ -95,6 +96,7 @@ struct Module final {
         || !reader.read_le64(checksum)) {
         return libk::unexpected(BundleError::Truncated);
     }
+    header.minor = minor;
     if (magic != MYOS_BOOT_MAGIC) {
         return libk::unexpected(BundleError::BadMagic);
     }
@@ -146,9 +148,10 @@ struct Module final {
         || !reader.read_le64(tls_size)) {
         return libk::unexpected(BundleError::Truncated);
     }
-    if (module.flags != MYOS_BOOT_MODULE_BOOTABLE
+    if ((module.flags != MYOS_BOOT_MODULE_BOOTABLE
+            && module.flags != MYOS_BOOT_MODULE_DATA)
         || module.name_size == 0 || tls_offset != 0 || tls_size != 0) {
-        return libk::unexpected(BundleError::InvalidModule);
+        return libk::unexpected(BundleError::InvalidRole);
     }
     return libk::expected(module);
 }
@@ -258,6 +261,7 @@ auto BootBundle::module(usize index) const noexcept
             reinterpret_cast<const char*>(name.value().data()),
             name.value().size()},
         image.value(),
+        raw.flags,
         static_cast<usize>(raw.entry),
         segments_offset_,
         raw.segment_first,
@@ -284,6 +288,7 @@ auto parse_bundle(libk::ByteSpan bytes) noexcept
     bundle.segments_offset_ = static_cast<usize>(header.segments_offset);
 
     usize expected_segment{};
+    usize data_modules{};
     for (usize module_index = 0;
          module_index < bundle.module_count();
          ++module_index) {
@@ -292,6 +297,21 @@ auto parse_bundle(libk::ByteSpan bytes) noexcept
             return libk::unexpected(decoded.error());
         }
         const BundleModule module = decoded.value();
+        if (module.data_module()) {
+            if (header.minor == 0) {
+                return libk::unexpected(BundleError::BadVersion);
+            }
+            ++data_modules;
+            if (module.entry() != 0 || module.segment_count() != 0
+                || module.segment_first() != expected_segment
+                || module.image().empty()) {
+                return libk::unexpected(BundleError::InvalidModule);
+            }
+            if (module_index == bundle.root_index()) {
+                return libk::unexpected(BundleError::InvalidRole);
+            }
+            continue;
+        }
         if (module.segment_first() != expected_segment
             || module.segment_count() == 0
             || module.segment_count() > max_boot_segments
@@ -340,7 +360,8 @@ auto parse_bundle(libk::ByteSpan bytes) noexcept
             bundle.root_ = module;
         }
     }
-    if (expected_segment != header.segments_count) {
+    if (expected_segment != header.segments_count || data_modules > 1
+        || !bundle.root_.bootable()) {
         return libk::unexpected(BundleError::InvalidTable);
     }
     return libk::expected(bundle);

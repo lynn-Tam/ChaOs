@@ -32,7 +32,9 @@ struct Image final {
 
 struct Module final {
     std::string name;
+    bool data{};
     Image image;
+    std::vector<std::byte> payload;
 };
 
 [[nodiscard]] constexpr auto add_overflows(
@@ -48,7 +50,7 @@ struct Module final {
 
 [[nodiscard]] constexpr auto is_user_address(std::uint64_t address) noexcept
     -> bool {
-    // Stage E0's cross-architecture manifest accepts the positive canonical
+    // The cross-architecture manifest accepts the positive canonical
     // half. The selected kernel applies its own stricter layout policy.
     return address < (std::uint64_t{1} << 38);
 }
@@ -229,20 +231,24 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         || modules.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error("invalid module set");
     }
+    if (modules[root_index].data) {
+        throw std::runtime_error("root module must be bootable");
+    }
     std::size_t segment_count{};
     std::size_t names_size{};
     for (const Module& module : modules) {
         if (module.name.empty()
             || module.name.size()
                 > std::numeric_limits<std::uint32_t>::max()
-            || module.image.segments.size()
+            || (!module.data && module.image.segments.size()
                 > std::numeric_limits<std::uint32_t>::max()
+                || module.data && module.payload.empty())
             || segment_count
                 > std::numeric_limits<std::uint32_t>::max()
-                    - module.image.segments.size()) {
+                    - (module.data ? 0 : module.image.segments.size())) {
             throw std::runtime_error("module metadata exceeds the wire format");
         }
-        segment_count += module.image.segments.size();
+        segment_count += module.data ? 0 : module.image.segments.size();
         names_size += module.name.size();
     }
 
@@ -263,8 +269,10 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
     }
     cursor = align_up(cursor, 8);
     for (const Module& module : modules) {
+        const std::size_t image_size = module.data
+            ? module.payload.size() : module.image.bytes.size();
         image_offsets.push_back(cursor);
-        cursor = align_up(cursor + module.image.bytes.size(), 8);
+        cursor = align_up(cursor + image_size, 8);
     }
     const std::size_t total_size = cursor;
 
@@ -292,15 +300,22 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         const Module& module = modules[index];
         append_le(output, name_offsets[index], 8);
         append_le(output, module.name.size(), 4);
-        append_le(output, MYOS_BOOT_MODULE_BOOTABLE, 4);
+        append_le(
+            output,
+            module.data ? MYOS_BOOT_MODULE_DATA : MYOS_BOOT_MODULE_BOOTABLE,
+            4);
         append_le(output, image_offsets[index], 8);
-        append_le(output, module.image.bytes.size(), 8);
-        append_le(output, module.image.entry, 8);
+        append_le(
+            output,
+            module.data ? module.payload.size() : module.image.bytes.size(),
+            8);
+        append_le(output, module.data ? 0 : module.image.entry, 8);
         append_le(output, segment_first, 4);
-        append_le(output, module.image.segments.size(), 4);
+        append_le(
+            output, module.data ? 0 : module.image.segments.size(), 4);
         append_le(output, 0, 8); // TLS offset
         append_le(output, 0, 8); // TLS size
-        segment_first += module.image.segments.size();
+        segment_first += module.data ? 0 : module.image.segments.size();
     }
     pad_to(output, segments_offset);
 
@@ -325,10 +340,9 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
     }
     for (std::size_t index = 0; index < modules.size(); ++index) {
         pad_to(output, image_offsets[index]);
-        output.insert(
-            output.end(),
-            modules[index].image.bytes.begin(),
-            modules[index].image.bytes.end());
+        const auto& bytes = modules[index].data
+            ? modules[index].payload : modules[index].image.bytes;
+        output.insert(output.end(), bytes.begin(), bytes.end());
     }
     pad_to(output, total_size);
     if (output.size() != total_size) {
@@ -352,8 +366,8 @@ void write_file(const std::string& path, std::span<const std::byte> bytes) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::cerr
-            << "usage: bootpack OUTPUT.BUNDLE ROOT_NAME NAME=INPUT.ELF...\n";
+        std::cerr << "usage: bootpack OUTPUT.BUNDLE ROOT_NAME "
+                     "NAME=INPUT.ELF... data:NAME=INPUT.BIN...\n";
         return 2;
     }
     try {
@@ -361,11 +375,16 @@ int main(int argc, char** argv) {
         std::vector<Module> modules;
         std::size_t root_index = std::numeric_limits<std::size_t>::max();
         for (int index = 3; index < argc; ++index) {
-            const std::string_view spec{argv[index]};
+            const std::string_view raw_spec{argv[index]};
+            const bool data = raw_spec.starts_with("data:")
+                || raw_spec.starts_with("DATA:");
+            const std::string_view spec = data ? raw_spec.substr(5)
+                                               : raw_spec;
             const std::size_t separator = spec.find('=');
             if (separator == 0 || separator == std::string_view::npos
                 || separator + 1 == spec.size()) {
-                throw std::runtime_error("module must be NAME=INPUT.ELF");
+                throw std::runtime_error(
+                    "module must be NAME=INPUT.ELF or data:NAME=INPUT.BIN");
             }
             const std::string name{spec.substr(0, separator)};
             if (std::ranges::any_of(
@@ -376,11 +395,23 @@ int main(int argc, char** argv) {
             if (name == root_name) {
                 root_index = modules.size();
             }
-            modules.push_back(Module{
-                .name = name,
-                .image = parse_elf(read_file(
-                    std::string{spec.substr(separator + 1)})),
-            });
+            if (data) {
+                modules.push_back(Module{
+                    .name = name,
+                    .data = true,
+                    .image = {},
+                    .payload = read_file(
+                        std::string{spec.substr(separator + 1)}),
+                });
+            } else {
+                modules.push_back(Module{
+                    .name = name,
+                    .data = false,
+                    .image = parse_elf(read_file(
+                        std::string{spec.substr(separator + 1)})),
+                    .payload = {},
+                });
+            }
         }
         if (root_index == std::numeric_limits<std::size_t>::max()) {
             throw std::runtime_error("root module is absent");

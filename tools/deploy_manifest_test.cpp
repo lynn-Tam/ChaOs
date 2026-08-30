@@ -22,12 +22,20 @@ namespace libk {
 namespace {
 
 using myos::deploy::Error;
+using myos::deploy::ManifestImportRow;
+using myos::deploy::ManifestTaskRow;
 using myos::deploy::ManifestWorkspace;
 using myos::deploy::ManifestView;
 using myos::deploy::host::kGolden;
 using myos::deploy::host::kGoldenSize;
 
 void put(uint8_t* bytes, size_t offset, uint64_t value, size_t width);
+
+constexpr size_t kManifestBufferSize =
+    static_cast<size_t>(MYOS_DEPLOY_MAX_SIZE);
+uint8_t production_bytes[kManifestBufferSize]{};
+uint8_t production_mutation[kManifestBufferSize]{};
+size_t production_size{};
 
 void make_boot_bundle(uint8_t* bytes, size_t& size) {
     constexpr size_t modules = MYOS_BOOT_HEADER_SIZE;
@@ -94,6 +102,41 @@ void put(uint8_t* bytes, size_t offset, uint64_t value, size_t width) {
     }
 }
 
+auto load_production_manifest(const char* path) -> bool {
+    FILE* const input = fopen(path, "rb");
+    if (input == nullptr || fseek(input, 0, SEEK_END) != 0) {
+        if (input != nullptr) {
+            fclose(input);
+        }
+        return false;
+    }
+    const long end = ftell(input);
+    if (end < 0 || static_cast<size_t>(end) > kManifestBufferSize
+        || fseek(input, 0, SEEK_SET) != 0) {
+        fclose(input);
+        return false;
+    }
+    production_size = static_cast<size_t>(end);
+    const size_t read = production_size == 0
+        ? 0 : fread(production_bytes, 1, production_size, input);
+    fclose(input);
+    if (read != production_size) {
+        production_size = 0;
+        return false;
+    }
+    return true;
+}
+
+auto copy_production_manifest() -> bool {
+    if (production_size == 0) {
+        return false;
+    }
+    for (size_t index = 0; index < production_size; ++index) {
+        production_mutation[index] = production_bytes[index];
+    }
+    return true;
+}
+
 uint64_t fnv1a(const uint8_t* bytes, size_t size) {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (size_t index = 0; index < size; ++index) {
@@ -128,10 +171,10 @@ void make_two_task_manifest(
             + MYOS_DEPLOY_TABLE_COUNT_FIELD,
         2, 4);
     const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
-        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410,
+        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410, 0,
     };
     for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
-         table < MYOS_DEPLOY_TABLE_COUNT; ++table) {
+         table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
         const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
             + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
         put(bytes, descriptor + MYOS_DEPLOY_TABLE_OFFSET,
@@ -313,6 +356,124 @@ auto accepts_golden() -> bool {
         && parsed.value().export_count() == 1
         && parsed.value().task_name(0).size() == 4
         && fnv1a(kGolden, kGoldenSize) == UINT64_C(0x7c804c2f6cf27ba7);
+}
+
+auto accepts_production_shape() -> bool {
+    if (production_size == 0) {
+        return false;
+    }
+    ManifestWorkspace workspace{};
+    const auto parsed = ManifestView::parse(
+        production_bytes, production_size, workspace);
+    return parsed && parsed.value().task_count() == 2
+        && parsed.value().bootstrap_count() == 10;
+}
+
+auto accepts_production_authority_budget() -> bool {
+    if (production_size == 0) {
+        return false;
+    }
+    ManifestWorkspace workspace{};
+    const auto parsed = ManifestView::parse(
+        production_bytes, production_size, workspace);
+    if (!parsed) {
+        return false;
+    }
+    ManifestTaskRow process{};
+    ManifestTaskRow proof{};
+    ManifestImportRow process_pool{};
+    ManifestImportRow proof_pool{};
+    if (!parsed.value().task_row(0, process)
+        || !parsed.value().task_row(1, proof)
+        || process.import_count == 0 || proof.import_count == 0
+        || !parsed.value().import_row(process.import_first, process_pool)
+        || !parsed.value().import_row(proof.import_first, proof_pool)) {
+        return false;
+    }
+    constexpr uint64_t process_memory =
+        UINT64_C(32) * UINT64_C(1024) * UINT64_C(1024)
+        + MYOS_DEPLOY_PAGE_SIZE;
+    return process.pool_memory == process_memory
+        && process.pool_caps == 513
+        && proof.pool_memory == UINT64_C(16) * UINT64_C(1024) * UINT64_C(1024)
+        && proof.pool_caps == 256
+        && process_pool.attenuation.rights == MYOS_RIGHT_SPLIT
+        && (proof_pool.attenuation.rights & MYOS_RIGHT_SPLIT) == 0;
+}
+
+auto rejects_minor_shape_hybrids() -> bool {
+    if (!copy_production_manifest()) {
+        return false;
+    }
+    put(production_mutation, MYOS_DEPLOY_HEADER_MINOR, 0, 2);
+    ManifestWorkspace current_workspace{};
+    if (ManifestView::parse(
+            production_mutation, production_size, current_workspace)) {
+        return false;
+    }
+
+    for (size_t index = 0; index < production_size; ++index) {
+        production_mutation[index] = production_bytes[index];
+    }
+    put(production_mutation, MYOS_DEPLOY_HEADER_SIZE_FIELD, 208, 4);
+    put(production_mutation, MYOS_DEPLOY_HEADER_TABLE_COUNT, 9, 4);
+    ManifestWorkspace legacy_workspace{};
+    if (ManifestView::parse(
+            production_mutation, production_size, legacy_workspace)) {
+        return false;
+    }
+
+    for (size_t index = 0; index < kGoldenSize; ++index) {
+        production_mutation[index] = kGolden[index];
+    }
+    put(production_mutation, MYOS_DEPLOY_HEADER_MINOR, 1, 2);
+    ManifestWorkspace legacy_minor_workspace{};
+    return !ManifestView::parse(
+        production_mutation, kGoldenSize, legacy_minor_workspace);
+}
+
+auto rejects_task_key_kind_relabel() -> bool {
+    if (!copy_production_manifest()) {
+        return false;
+    }
+    ManifestWorkspace workspace{};
+    const auto parsed = ManifestView::parse(
+        production_mutation, production_size, workspace);
+    if (!parsed) {
+        return false;
+    }
+    const auto imports = parsed.value().table(MYOS_DEPLOY_TABLE_IMPORT);
+    put(production_mutation, imports.offset + MYOS_DEPLOY_IMPORT_ATTENUATION
+            + MYOS_DEPLOY_ATTENUATION_KIND,
+        MYOS_OBJECT_KIND_VSPACE, 2);
+    ManifestWorkspace mutated_workspace{};
+    return !ManifestView::parse(
+        production_mutation, production_size, mutated_workspace);
+}
+
+auto rejects_bootstrap_kind_relabel() -> bool {
+    if (!copy_production_manifest()) {
+        return false;
+    }
+    ManifestWorkspace workspace{};
+    const auto parsed = ManifestView::parse(
+        production_mutation, production_size, workspace);
+    if (!parsed) {
+        return false;
+    }
+    const auto bootstraps = parsed.value().table(MYOS_DEPLOY_TABLE_BOOTSTRAP);
+    put(production_mutation, bootstraps.offset + MYOS_DEPLOY_BOOTSTRAP_KIND,
+        MYOS_BOOTSTRAP_CAP_VSPACE, 4);
+    ManifestWorkspace mutated_workspace{};
+    return !ManifestView::parse(
+        production_mutation, production_size, mutated_workspace);
+}
+
+auto accepts_closed_bootstrap_kind_mapping() -> bool {
+    return myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE)
+            == MYOS_OBJECT_KIND_MEMORY
+        && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_UART_MEMORY)
+            == MYOS_OBJECT_KIND_MEMORY;
 }
 
 auto accepts_boot_bundle_cross_validation() -> bool {
@@ -1004,7 +1165,10 @@ auto accepts_entry_zero_fallback() -> bool {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool result = argc == 1 || (argc == 2 && matches_file(argv[1]));
+    const bool have_fixture = argc >= 2;
+    const bool have_production = argc >= 3;
+    bool result = (argc == 1 || (have_fixture && matches_file(argv[1])))
+        && (!have_production || load_production_manifest(argv[2]));
     const auto run = [&](const char* name, bool value) {
         if (!value) {
             fprintf(stderr, "failed %s\n", name);
@@ -1012,6 +1176,22 @@ int main(int argc, char** argv) {
         return value;
     };
     result = result && run("golden", accepts_golden())
+            && (!have_production
+                || run("production-shape", accepts_production_shape()))
+            && (!have_production
+                || run("production-authority-budget",
+                       accepts_production_authority_budget()))
+            && (!have_production
+                || run("minor-shape-hybrids", rejects_minor_shape_hybrids()))
+            && (!have_production
+                || run("task-key-kind-relabel",
+                       rejects_task_key_kind_relabel()))
+            && (!have_production
+                || run("bootstrap-kind-relabel",
+                       rejects_bootstrap_kind_relabel()))
+            && (!have_production
+                || run("bootstrap-kind-map",
+                       accepts_closed_bootstrap_kind_mapping()))
             && run("bundle", accepts_boot_bundle_cross_validation())
             && run("stack", rejects_effective_stack_range())
             && run("trunc", rejects_truncation())

@@ -299,7 +299,9 @@ void Thread::request_stop(execution::Stop& request) noexcept {
     }
 }
 
-void Thread::finish_stop() noexcept {
+void Thread::finish_terminal(
+    fault::Reason reason,
+    myos_status_t status) noexcept {
     {
         kernel::sync::IrqLockGuard guard{stop_lock_};
         KASSERT(execution_.state_ == State::Exited
@@ -314,7 +316,7 @@ void Thread::finish_stop() noexcept {
     authority_.target_stopped();
     execution_.binding().detach_user();
     static_cast<void>(terminal_.claim(
-        fault::Reason::Stop, MYOS_STATUS_CANCELED));
+        reason, status));
 
     for (;;) {
         execution::Stop* request{};
@@ -329,6 +331,17 @@ void Thread::finish_stop() noexcept {
         }
         request->finish(*this);
     }
+}
+
+void Thread::finish_stop() noexcept {
+    finish_terminal(fault::Reason::Stop, MYOS_STATUS_CANCELED);
+}
+
+void Thread::finish_exit(myos_status_t status) noexcept {
+    finish_terminal(
+        status == MYOS_STATUS_OK
+            ? fault::Reason::NormalExit : fault::Reason::ExitFailure,
+        status);
 }
 
 [[noreturn]] void Thread::start(void* argument) noexcept {

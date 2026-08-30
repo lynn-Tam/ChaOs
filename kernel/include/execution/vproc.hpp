@@ -209,6 +209,10 @@ public:
         u64 generation) noexcept -> libk::Expected<void, VprocError>;
     [[nodiscard]] auto in_upcall() const noexcept -> bool;
     void request_exit() noexcept;
+    // Called by the execution syscall path.  The cleanup sequence remains
+    // request_exit(), but the eventual terminal winner is NormalExit rather
+    // than an externally requested Stop.
+    void request_normal_exit(myos_status_t status = MYOS_STATUS_OK) noexcept;
     // Terminal edge: every outstanding Pager service claim registered by this
     // lane returns to Published through the requeue owner path. Idempotent.
     void release_pager_claims() noexcept;
@@ -283,7 +287,11 @@ private:
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop(execution::Stop& request) noexcept;
+    void finish_terminal(
+        fault::Reason reason,
+        myos_status_t status) noexcept;
     void finish_stop() noexcept;
+    void finish_exit(myos_status_t status = MYOS_STATUS_OK) noexcept;
     void publish_operation(
         operation::Key key,
         operation::Result result,
@@ -387,6 +395,8 @@ private:
     bool stop_requested_{};
     bool stop_dispatched_{};
     bool stopped_{};
+    bool normal_exit_requested_{};
+    myos_status_t normal_exit_status_{MYOS_STATUS_OK};
     bool park_requested_{};
     usize activation_publishers_{};
     ActivationPost activation_post_{ActivationPost::Idle};

@@ -474,7 +474,7 @@ void CpuDispatcher::request_stop(execution::Target target) noexcept {
             return;
         }
         if (stop(target) == StopDisposition::Finalize) {
-            finish_exit(target);
+            finish_exit(target, DispatchReason::Stop);
         }
         return;
     }
@@ -581,7 +581,7 @@ void CpuDispatcher::drain_remote() noexcept {
             // queue protocol before final relation teardown destroys Binding.
             remote_.complete(*request);
             if (disposition == StopDisposition::Finalize) {
-                finish_exit(target);
+                finish_exit(target, DispatchReason::Stop);
             }
             continue;
         }
@@ -692,6 +692,22 @@ void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
         || reason == DispatchReason::Exit
         || reason == DispatchReason::Stop) {
         pending_ = reason;
+        if (reason == DispatchReason::Exit) {
+            pending_exit_status_ = MYOS_STATUS_OK;
+        }
+    }
+}
+
+void CpuDispatcher::request_reschedule(
+    DispatchReason reason,
+    myos_status_t exit_status) noexcept {
+    if (!pending_ || reason == DispatchReason::Timer
+        || reason == DispatchReason::Exit
+        || reason == DispatchReason::Stop) {
+        pending_ = reason;
+        if (reason == DispatchReason::Exit) {
+            pending_exit_status_ = exit_status;
+        }
     }
 }
 
@@ -715,6 +731,7 @@ void CpuDispatcher::on_trap_exit() noexcept {
         return;
     }
     const DispatchReason reason = *pending_;
+    const myos_status_t exit_status = pending_exit_status_;
     pending_.reset();
     if (reason == DispatchReason::Block) {
         block_current();
@@ -724,7 +741,7 @@ void CpuDispatcher::on_trap_exit() noexcept {
         park_current();
         return;
     }
-    dispatch(reason, clock_->now());
+    dispatch(reason, clock_->now(), exit_status);
 }
 
 void CpuDispatcher::disable_preemption() noexcept {
@@ -744,7 +761,8 @@ void CpuDispatcher::enable_preemption() noexcept {
 
 void CpuDispatcher::dispatch(
     DispatchReason reason,
-    time::Instant now) noexcept {
+    time::Instant now,
+    myos_status_t exit_status) noexcept {
     KASSERT(!arch::interrupts_enabled());
     KASSERT(arch::trap_depth() == 0);
     KASSERT(current_);
@@ -824,7 +842,7 @@ void CpuDispatcher::dispatch(
         record_dispatch(outgoing, outgoing, reason, now);
         return;
     }
-    commit(candidate, reason, now);
+    commit(candidate, reason, now, exit_status);
 
     if (reason == DispatchReason::Exit || reason == DispatchReason::Stop) {
         KASSERT(false);
@@ -835,7 +853,8 @@ void CpuDispatcher::dispatch(
 void CpuDispatcher::commit(
     Binding* candidate,
     DispatchReason reason,
-    time::Instant now) noexcept {
+    time::Instant now,
+    myos_status_t exit_status) noexcept {
     const execution::Target outgoing = current_;
     execution::Target incoming{*idle_};
     Binding* incoming_binding{};
@@ -880,6 +899,8 @@ void CpuDispatcher::commit(
 
     KASSERT(!handoff_outgoing_);
     handoff_outgoing_ = outgoing;
+    handoff_reason_ = reason;
+    handoff_exit_status_ = exit_status;
     if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
         kernel::sync::assert_no_locks();
     }
@@ -1012,10 +1033,13 @@ void CpuDispatcher::post_switch() noexcept {
     KASSERT(cpu_->current_execution_ == &current_.execution());
     KASSERT(current_);
     const execution::Target outgoing = handoff_outgoing_;
+    const DispatchReason reason = handoff_reason_;
+    const myos_status_t exit_status = handoff_exit_status_;
     handoff_outgoing_ = {};
+    handoff_exit_status_ = MYOS_STATUS_OK;
     if (outgoing
         && outgoing.execution().state_ == ExecutionState::Exited) {
-        finish_exit(outgoing);
+        finish_exit(outgoing, reason, exit_status);
     }
 }
 
@@ -1077,7 +1101,10 @@ auto CpuDispatcher::stop(execution::Target target) noexcept
     return StopDisposition::Finalize;
 }
 
-void CpuDispatcher::finish_exit(execution::Target target) noexcept {
+void CpuDispatcher::finish_exit(
+    execution::Target target,
+    DispatchReason reason,
+    myos_status_t exit_status) noexcept {
     KASSERT(!arch::interrupts_enabled());
     Execution& execution = target.execution();
     KASSERT(execution.state_ == ExecutionState::Exited);
@@ -1095,7 +1122,11 @@ void CpuDispatcher::finish_exit(execution::Target target) noexcept {
         }
         KASSERT(binding.context().unbind(this));
     }
-    target.finish_stop();
+    if (reason == DispatchReason::Stop) {
+        target.finish_stop();
+    } else {
+        target.finish_exit(exit_status);
+    }
 }
 
 void yield() noexcept {

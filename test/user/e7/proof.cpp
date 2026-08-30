@@ -1,4 +1,4 @@
-#include <servers/proof/protocol.hpp>
+#include <test/user/e7/protocol.hpp>
 #include <user/lib/bootstrap.hpp>
 #include <user/lib/context.hpp>
 #include <user/lib/syscall.hpp>
@@ -15,7 +15,6 @@ using namespace myos::proof;
     return result.status == MYOS_STATUS_OK
         || result.status == MYOS_STATUS_PENDING;
 }
-
 [[noreturn]] void fail() noexcept {
     (void)*reinterpret_cast<volatile const myos_word_t*>(0x1000);
     myos::exit();

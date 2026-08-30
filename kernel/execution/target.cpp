@@ -339,6 +339,18 @@ void Target::finish_stop() const noexcept {
     }, value_);
 }
 
+void Target::finish_exit(myos_status_t status) const noexcept {
+    libk::visit([status](auto value) noexcept {
+        using T = libk::remove_cvr_t<decltype(value)>;
+        if constexpr (libk::SameAs<T, libk::monostate>) {
+            KASSERT(false);
+        } else {
+            KASSERT(value != nullptr);
+            value->finish_exit(status);
+        }
+    }, value_);
+}
+
 TargetHold::operator bool() const noexcept {
     return !libk::holds_alternative<libk::monostate>(value_);
 }

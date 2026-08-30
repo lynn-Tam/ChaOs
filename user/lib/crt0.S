@@ -16,6 +16,8 @@ _start:
     mv a1, s1
     call myos_main
 
+    /* An accidental return is still the canonical implicit OK exit. */
+    li a0, 0 /* MYOS_STATUS_OK */
     li a7, 1 /* MYOS_SYS_EXIT */
     ecall
 1:

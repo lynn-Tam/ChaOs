@@ -13,6 +13,7 @@
 #include <uapi/vm.h>
 #include <user/lib/boot_bundle.hpp>
 #include <user/lib/deployment.hpp>
+#include <user/lib/deployment_plan.hpp>
 #include <user/lib/deploy_manifest.hpp>
 
 namespace myos::deploy {
@@ -57,6 +58,154 @@ concept MaterializerBackend = Backend<B>
     { B::memory_write(destination, source, size) }
         -> libk::SameAs<myos_status_t>;
 };
+
+/*
+ * ImageMaterializer maps one complete destination object through
+ * ScratchWindow for each populate/write operation.  Derive that
+ * single-window requirement from the selected, already decoded task and the
+ * same BootBundle consumed by ImageMaterializer.  This query owns no mapping,
+ * capability, or deployment policy; ScratchWindow remains the sole lease
+ * owner.
+ */
+[[nodiscard]] inline auto required_scratch_size(
+    const TaskPlanView& task,
+    const boot::Bundle& bundle) noexcept -> libk::optional<myos_word_t> {
+    const PlanTask* const row = task.row();
+    constexpr myos_word_t page_size = MYOS_DEPLOY_PAGE_SIZE;
+    constexpr myos_word_t max_word = ~myos_word_t{};
+    if (row == nullptr || !bundle || page_size == 0
+        || page_size > max_word
+        || row->images.count > MYOS_DEPLOY_TASK_IMAGE_MAX
+        || row->mappings.count > MYOS_DEPLOY_TASK_MAPPING_MAX
+        || row->images.first > UINT32_MAX - row->images.count
+        || row->mappings.first > UINT32_MAX - row->mappings.count) {
+        return libk::nullopt;
+    }
+
+    myos_word_t required = page_size;
+    uint32_t image_segments[MYOS_DEPLOY_TASK_IMAGE_MAX]{};
+    const auto include = [&required](myos_word_t size) noexcept -> bool {
+        if (size == 0 || (size % MYOS_DEPLOY_PAGE_SIZE) != 0) {
+            return false;
+        }
+        if (size > required) {
+            required = size;
+        }
+        return true;
+    };
+    const auto same_name = [](boot::Bytes candidate,
+                              ByteView requested) noexcept -> bool {
+        if (!candidate || !requested
+            || candidate.size() != requested.size()) {
+            return false;
+        }
+        for (size_t index = 0; index < requested.size(); ++index) {
+            uint64_t value{};
+            if (!candidate.read(index, 1, value)
+                || value != requested[index]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (uint32_t image_index = 0; image_index < row->images.count;
+         ++image_index) {
+        const PlanImage* const image = task.image(image_index);
+        if (image == nullptr
+            || image->source_kind != MYOS_DEPLOY_IMAGE_SOURCE_BOOT_BUNDLE) {
+            return libk::nullopt;
+        }
+        const ByteView name = task.symbol(image->source);
+        if (!name) {
+            return libk::nullopt;
+        }
+        boot::Module module{};
+        size_t matches = 0;
+        for (size_t module_index = 0; module_index < bundle.module_count();
+             ++module_index) {
+            boot::Module candidate{};
+            if (!bundle.module(module_index, candidate)
+                || !same_name(candidate.name(), name)) {
+                continue;
+            }
+            module = candidate;
+            ++matches;
+        }
+        if (matches != 1 || !module.bootable()
+            || module.segment_count() == 0
+            || module.segment_count() > 32) {
+            return libk::nullopt;
+        }
+        image_segments[image_index] =
+            static_cast<uint32_t>(module.segment_count());
+        for (size_t segment_index = 0;
+             segment_index < module.segment_count(); ++segment_index) {
+            boot::Segment segment{};
+            if (!module.segment(segment_index, segment)
+                || segment.memory_size == 0
+                || static_cast<uintmax_t>(segment.memory_size)
+                    > static_cast<uintmax_t>(max_word)
+                || static_cast<uintmax_t>(segment.address)
+                    > static_cast<uintmax_t>(max_word)) {
+                return libk::nullopt;
+            }
+            const myos_word_t rounded = Window::round_size(
+                static_cast<myos_word_t>(segment.memory_size));
+            const Window destination{
+                static_cast<myos_word_t>(segment.address), rounded};
+            if (rounded == 0 || !destination.valid()
+                || !include(rounded)) {
+                return libk::nullopt;
+            }
+        }
+    }
+
+    for (uint32_t mapping_index = 0; mapping_index < row->mappings.count;
+         ++mapping_index) {
+        const PlanMapping* const mapping = task.mapping(mapping_index);
+        if (mapping == nullptr) {
+            return libk::nullopt;
+        }
+        switch (mapping->source) {
+        case MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT: {
+            if (mapping->image == MYOS_DEPLOY_NO_INDEX
+                || mapping->image < row->images.first
+                || mapping->image - row->images.first >= row->images.count
+                || mapping->segment == MYOS_DEPLOY_NO_INDEX) {
+                return libk::nullopt;
+            }
+            const uint32_t image_index = mapping->image - row->images.first;
+            if (mapping->segment >= image_segments[image_index]) {
+                return libk::nullopt;
+            }
+            break;
+        }
+        case MYOS_DEPLOY_MAPPING_SOURCE_ZERO: {
+            if (mapping->size > static_cast<uint64_t>(max_word)
+                || mapping->address > static_cast<uint64_t>(max_word)) {
+                return libk::nullopt;
+            }
+            const myos_word_t address =
+                static_cast<myos_word_t>(mapping->address);
+            const myos_word_t size = static_cast<myos_word_t>(mapping->size);
+            const myos_word_t rounded = Window::round_size(size);
+            const Window destination{address, rounded};
+            if (rounded == 0 || !destination.valid()
+                || !include(rounded)) {
+                return libk::nullopt;
+            }
+            break;
+        }
+        case MYOS_DEPLOY_MAPPING_SOURCE_PAGER:
+            /* Pager-backed mappings are installed without scratch population. */
+            break;
+        default:
+            return libk::nullopt;
+        }
+    }
+    return required;
+}
 
 // ImageMaterializer borrows all three deployment views.  It never retains a
 // Bundle byte view or a capability owner: TaskSpace is the sole selector

@@ -16,6 +16,7 @@
 #include <libk/utility.hpp>
 #include <libk/variant.hpp>
 #include <uapi/deploy.h>
+#include <uapi/bootstrap.h>
 #include <uapi/endpoint.h>
 #include <uapi/thread.h>
 #include <uapi/status.h>
@@ -47,9 +48,22 @@ enum class TaskState : uint8_t {
     Prepared,
     Starting,
     Running,
+    Terminating,
     Failed,
     Closing,
     Reclaimed,
+};
+
+/* The sequence is the kernel terminal generation; status is the public
+ * terminal status sampled from that generation.  A zero sequence means that
+ * the target is still live (or that no observation has been admitted yet). */
+struct TerminalObservation final {
+    uint64_t sequence{};
+    myos_status_t status{};
+
+    [[nodiscard]] constexpr auto terminal() const noexcept -> bool {
+        return sequence != 0;
+    }
 };
 
 enum class TaskSlotTag : uint8_t {
@@ -187,17 +201,21 @@ struct TaskConstructionWorkspace final {
         }
         for (size_t index = 0; index < kImportBatchMax; ++index) {
             const ImportProjection& output = imports[index];
-            if (output.authority.valid()
+            if (output.authority.valid() || output.task_key
                 || output.remote_index != static_cast<size_t>(-1)
                 || output.manager != 0
                 || output.kind != MYOS_OBJECT_KIND_INVALID) {
                 return false;
             }
         }
+        if (bootstrap_memory.valid()) {
+            return false;
+        }
         for (size_t index = 0; index < kImportBatchMax; ++index) {
             if (import_bindings[index].authority.valid()
                 || import_bindings[index].descriptor.valid()
-                || import_bindings[index].descriptor_offset != 0) {
+                || import_bindings[index].descriptor_offset != 0
+                || import_bindings[index].source) {
                 return false;
             }
         }
@@ -247,6 +265,7 @@ struct TaskConstructionWorkspace final {
             binding = {};
         }
         import_descriptor = {};
+        bootstrap_memory = {};
         for (auto& bytes : import_descriptor_bytes) {
             for (auto& byte : bytes) {
                 byte = 0;
@@ -268,6 +287,10 @@ struct TaskConstructionWorkspace final {
     ImportProjection imports[kImportBatchMax]{};
     ImportBinding import_bindings[kImportBatchMax]{};
     LocalSlot import_descriptor{};
+    /* Writable carrier retained only until the generated bootstrap envelope
+     * is sealed.  The mapped bootstrap region remains the published child
+     * projection after this selector is closed. */
+    LocalSlot bootstrap_memory{};
     uint8_t import_descriptor_bytes[kImportBatchMax][
         MYOS_CAP_ATTENUATION_SIZE]{};
 };
@@ -281,6 +304,9 @@ struct TaskConstructionInput final {
     ScratchWindow<B>* scratch{};
     const void* bootstrap{};
     size_t bootstrap_size{};
+    /* Runtime context is explicit construction input, not manifest policy.
+     * A generated bootstrap envelope requires a checked non-zero CPU count. */
+    uint32_t runtime_cpu_count{};
     const TaskAuthorityBindings* bindings{};
     workspace_type& workspace;
 };
@@ -787,12 +813,16 @@ public:
         : id_(other.id_), state_(other.state_), plan_(libk::move(other.plan_)),
           plan_task_(other.plan_task_), space_(libk::move(other.space_)),
           registrations_(libk::move(other.registrations_)),
-          projections_(other.projections_), accounting_(other.accounting_) {
+          projections_(other.projections_), accounting_(other.accounting_),
+          terminal_sequence_(other.terminal_sequence_),
+          terminal_status_(other.terminal_status_) {
         other.id_ = {};
         other.state_ = TaskState::Reclaimed;
         other.plan_task_ = 0;
         other.projections_ = TaskProjections{};
         other.accounting_ = ResidentAccounting{};
+        other.terminal_sequence_ = 0;
+        other.terminal_status_ = MYOS_STATUS_OK;
     }
 
     auto operator=(TaskRecord&& other) noexcept -> TaskRecord& {
@@ -812,11 +842,15 @@ public:
         registrations_ = libk::move(other.registrations_);
         projections_ = other.projections_;
         accounting_ = other.accounting_;
+        terminal_sequence_ = other.terminal_sequence_;
+        terminal_status_ = other.terminal_status_;
         other.id_ = {};
         other.state_ = TaskState::Reclaimed;
         other.plan_task_ = 0;
         other.projections_ = TaskProjections{};
         other.accounting_ = ResidentAccounting{};
+        other.terminal_sequence_ = 0;
+        other.terminal_status_ = MYOS_STATUS_OK;
         return *this;
     }
 
@@ -825,6 +859,28 @@ public:
     [[nodiscard]] constexpr auto id() const noexcept -> TaskId { return id_; }
     [[nodiscard]] constexpr auto state() const noexcept -> TaskState {
         return state_;
+    }
+    [[nodiscard]] auto readiness() const noexcept
+        -> myos_deploy_readiness_policy_t {
+        const PlanTask* row = plan().row();
+        return row == nullptr
+            ? MYOS_DEPLOY_READINESS_EXPLICIT
+            : static_cast<myos_deploy_readiness_policy_t>(row->readiness);
+    }
+    [[nodiscard]] auto ready() const noexcept -> bool {
+        /* NONE has no handshake and START is satisfied by the successful
+         * start submission.  EXPLICIT remains a real protocol boundary and
+         * is rejected by start() until a service supplies that protocol. */
+        return state_ == TaskState::Running
+            && readiness() != MYOS_DEPLOY_READINESS_EXPLICIT;
+    }
+    [[nodiscard]] constexpr auto terminal_sequence() const noexcept
+        -> uint64_t {
+        return terminal_sequence_;
+    }
+    [[nodiscard]] constexpr auto terminal_status() const noexcept
+        -> myos_status_t {
+        return terminal_status_;
     }
     [[nodiscard]] constexpr auto plan_task_id() const noexcept -> PlanTaskId {
         return PlanTaskId{plan_.id(), plan_task_};
@@ -874,6 +930,125 @@ public:
 
     static void ownership_fault(myos_status_t status) noexcept {
         backend_type::ownership_fault(status);
+    }
+
+    /* Resolve every execution before the first syscall.  Once Starting is
+     * published, already-started targets are external effects and are never
+     * rolled back by a later failure. */
+    template<typename B = backend_type>
+    requires requires(cap::CapRef target) {
+        { B::execution_start(target) } -> libk::SameAs<SysResult>;
+    }
+    [[nodiscard]] auto start() noexcept -> myos_status_t {
+        if (state_ != TaskState::Prepared) {
+            return MYOS_STATUS_BUSY;
+        }
+        if (readiness() == MYOS_DEPLOY_READINESS_EXPLICIT) {
+            /* No current caller owns an explicit readiness handshake yet;
+             * reject before resolving targets or changing lifecycle state. */
+            return MYOS_STATUS_BAD_ARGS;
+        }
+        const TaskPlanView task = plan();
+        const PlanTask* row = task.row();
+        if (row == nullptr || row->executions.count == 0
+            || row->executions.count > MYOS_DEPLOY_TASK_EXECUTION_MAX) {
+            if (!transition(TaskState::Failed)) {
+                return MYOS_STATUS_INTERNAL;
+            }
+            return MYOS_STATUS_BAD_ARGS;
+        }
+        cap::CapRef targets[MYOS_DEPLOY_TASK_EXECUTION_MAX]{};
+        myos_object_kind_t kinds[MYOS_DEPLOY_TASK_EXECUTION_MAX]{};
+        for (uint32_t index = 0; index < row->executions.count; ++index) {
+            const PlanExecution* execution = task.execution(index);
+            if (execution == nullptr) {
+                static_cast<void>(transition(TaskState::Failed));
+                return MYOS_STATUS_BAD_ARGS;
+            }
+            kinds[index] = execution->model == MYOS_DEPLOY_EXECUTION_THREAD
+                ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC;
+            const SlotProjection& projection = projections_.executions[index];
+            const auto target = resolve(projection, kinds[index]);
+            if (!target) {
+                static_cast<void>(transition(TaskState::Failed));
+                return MYOS_STATUS_INVALID_CAP;
+            }
+            targets[index] = target.value();
+        }
+        if (!transition(TaskState::Starting)) {
+            return MYOS_STATUS_INTERNAL;
+        }
+        for (uint32_t index = 0; index < row->executions.count; ++index) {
+            const SysResult result = B::execution_start(targets[index]);
+            if (result.status != MYOS_STATUS_OK) {
+                static_cast<void>(transition(TaskState::Failed));
+                return result.status;
+            }
+        }
+        if (!transition(TaskState::Running)) {
+            static_cast<void>(transition(TaskState::Failed));
+            return MYOS_STATUS_INTERNAL;
+        }
+        return MYOS_STATUS_OK;
+    }
+
+    template<typename B = backend_type>
+    requires requires(cap::CapRef target) {
+        { B::terminal_query(target) } -> libk::SameAs<SysResult>;
+    }
+    [[nodiscard]] auto observe_terminal() const noexcept -> SysResult {
+        if (state_ != TaskState::Starting && state_ != TaskState::Running
+            && state_ != TaskState::Terminating) {
+            return SysResult{.status = MYOS_STATUS_BUSY};
+        }
+        const TaskPlanView task = plan();
+        const PlanTask* row = task.row();
+        if (row == nullptr || row->executions.count != 1) {
+            /* The current production envelope is single-execution.  A
+             * multi-execution aggregation policy needs its own explicit
+             * terminal contract and is not guessed here. */
+            return SysResult{.status = MYOS_STATUS_BAD_ARGS};
+        }
+        const PlanExecution* execution = task.execution(0);
+        if (execution == nullptr) {
+            return SysResult{.status = MYOS_STATUS_BAD_ARGS};
+        }
+        const myos_object_kind_t kind =
+            execution->model == MYOS_DEPLOY_EXECUTION_THREAD
+            ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC;
+        const auto target = resolve(projections_.executions[0], kind);
+        if (!target) {
+            return SysResult{.status = MYOS_STATUS_INVALID_CAP};
+        }
+        return B::terminal_query(target.value());
+    }
+
+    /* Admit one fresh kernel terminal generation.  Repeated or stale
+     * observations are ignored; only the first accepted sequence chooses the
+     * Task result and lifecycle edge. */
+    [[nodiscard]] auto consume_terminal(
+        const SysResult& observation) noexcept -> myos_status_t {
+        if (observation.status != MYOS_STATUS_OK) {
+            return observation.status;
+        }
+        if (observation.value == 0) {
+            return MYOS_STATUS_RETRY;
+        }
+        if (observation.value <= terminal_sequence_) {
+            return MYOS_STATUS_RETRY;
+        }
+        if (state_ != TaskState::Starting && state_ != TaskState::Running) {
+            return MYOS_STATUS_BUSY;
+        }
+        terminal_sequence_ = observation.value;
+        terminal_status_ = static_cast<myos_status_t>(
+            static_cast<int64_t>(observation.value2));
+        if (terminal_status_ == MYOS_STATUS_OK) {
+            return transition(TaskState::Terminating)
+                ? MYOS_STATUS_OK : MYOS_STATUS_INTERNAL;
+        }
+        return transition(TaskState::Failed)
+            ? MYOS_STATUS_OK : MYOS_STATUS_INTERNAL;
     }
 
 private:
@@ -926,9 +1101,12 @@ private:
         case TaskState::Prepared:
             return to == TaskState::Starting || to == TaskState::Failed;
         case TaskState::Starting:
-            return to == TaskState::Running || to == TaskState::Failed;
+            return to == TaskState::Running || to == TaskState::Terminating
+                || to == TaskState::Failed;
         case TaskState::Running:
-            return to == TaskState::Failed;
+            return to == TaskState::Terminating || to == TaskState::Failed;
+        case TaskState::Terminating:
+            return to == TaskState::Closing;
         case TaskState::Failed:
             return to == TaskState::Closing;
         case TaskState::Closing:
@@ -955,6 +1133,8 @@ private:
     RegistrationOwner<MYOS_DEPLOY_TASK_EXPORT_MAX> registrations_{};
     TaskProjections projections_{};
     ResidentAccounting accounting_{};
+    uint64_t terminal_sequence_{};
+    myos_status_t terminal_status_{};
 };
 
 template<typename Record,
@@ -992,12 +1172,22 @@ public:
         [[nodiscard]] auto begin_close(
             CloseReason reason,
             myos_status_t status) noexcept -> bool {
-            if (record_.state() != TaskState::Failed
-                && !record_.transition(TaskState::Failed)) {
-                return false;
-            }
-            if (!record_.transition(TaskState::Closing)) {
-                return false;
+            /* A normal terminal winner already owns the Terminating edge;
+             * preserve that state while entering Closing.  Construction,
+             * startup and fatal outcomes are the only paths that first pass
+             * through Failed. */
+            if (record_.state() == TaskState::Terminating) {
+                if (!record_.transition(TaskState::Closing)) {
+                    return false;
+                }
+            } else {
+                if (record_.state() != TaskState::Failed
+                    && !record_.transition(TaskState::Failed)) {
+                    return false;
+                }
+                if (!record_.transition(TaskState::Closing)) {
+                    return false;
+                }
             }
             result_ = CompletionResult{record_.id(), reason, status};
             sender_.seal();
@@ -1221,6 +1411,15 @@ public:
         return payload == nullptr ? nullptr : &payload->closing.record();
     }
 
+    [[nodiscard]] auto record(TaskId id) const noexcept -> const Record* {
+        const Slot* slot = checked_slot(id);
+        if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Record) {
+            return nullptr;
+        }
+        const auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        return payload == nullptr ? nullptr : &payload->closing.record();
+    }
+
     [[nodiscard]] auto closing(TaskId id) noexcept -> ClosingRecord* {
         Slot* slot = checked_slot(id);
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Closing) {
@@ -1237,6 +1436,56 @@ public:
             return false;
         }
         return record_ptr->transition(next);
+    }
+
+    template<typename B = typename record_type::backend_type>
+    requires requires(cap::CapRef target) {
+        { B::execution_start(target) } -> libk::SameAs<SysResult>;
+    }
+    [[nodiscard]] auto start(TaskId id) noexcept -> myos_status_t {
+        Record* const record_ptr = record(id);
+        return record_ptr == nullptr
+            ? MYOS_STATUS_INVALID_CAP : record_ptr->template start<B>();
+    }
+
+    template<typename B = typename record_type::backend_type>
+    requires requires(cap::CapRef target) {
+        { B::terminal_query(target) } -> libk::SameAs<SysResult>;
+    }
+    [[nodiscard]] auto observe_terminal(TaskId id) const noexcept -> SysResult {
+        const Record* const record_ptr = record(id);
+        return record_ptr == nullptr
+            ? SysResult{.status = MYOS_STATUS_INVALID_CAP}
+            : record_ptr->template observe_terminal<B>();
+    }
+
+    [[nodiscard]] auto consume_terminal(
+        TaskId id,
+        const SysResult& observation) noexcept -> myos_status_t {
+        Record* const record_ptr = record(id);
+        return record_ptr == nullptr
+            ? MYOS_STATUS_INVALID_CAP
+            : record_ptr->consume_terminal(observation);
+    }
+
+    /* A policy owner calls this only for a normal/external termination
+     * decision.  Faults use begin_close directly so Failed remains distinct
+     * from the normal Terminating path. */
+    [[nodiscard]] auto terminate(
+        TaskId id,
+        CloseReason reason,
+        myos_status_t status) noexcept -> bool {
+        Slot* const slot = checked_slot(id);
+        Record* const record_ptr = record(id);
+        if (slot == nullptr || record_ptr == nullptr
+            || (record_ptr->state() != TaskState::Running
+                && record_ptr->state() != TaskState::Starting)
+            || !record_ptr->transition(TaskState::Terminating)) {
+            return false;
+        }
+        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        return payload != nullptr
+            && payload->closing.begin_close(reason, status);
     }
 
     [[nodiscard]] auto begin_close(
@@ -1307,6 +1556,7 @@ private:
             case TaskState::Prepared:
             case TaskState::Starting:
             case TaskState::Running:
+            case TaskState::Terminating:
             case TaskState::Failed:
                 return TaskSlotTag::Record;
             }
@@ -1500,6 +1750,12 @@ public:
         const TaskPlanView task = record.plan();
         const PlanTask* const row = task.row();
         if (row == nullptr) {
+            return MYOS_STATUS_BAD_ARGS;
+        }
+        /* Bootstrap rows own the envelope contents.  A caller-provided byte
+         * snapshot is the legacy path and cannot coexist with that policy. */
+        if (row->bootstraps.count != 0
+            && (input.bootstrap != nullptr || input.bootstrap_size != 0)) {
             return MYOS_STATUS_BAD_ARGS;
         }
 
@@ -1868,9 +2124,14 @@ public:
                         input.bootstrap,
                         input.bootstrap_size);
                 }
-                if (status == MYOS_STATUS_OK) {
+                /* A generated production envelope is populated after Imports,
+                 * so retain this writable MemoryObject until that point.  A
+                 * caller-supplied legacy snapshot remains closed here. */
+                if (status == MYOS_STATUS_OK && row->bootstraps.count == 0) {
                     status = record.space().close_slot(materialized.memory);
                     materialized.memory = {};
+                } else if (status == MYOS_STATUS_OK) {
+                    workspace.bootstrap_memory = materialized.memory;
                 }
             } else if (mapping->source == MYOS_DEPLOY_MAPPING_SOURCE_ZERO) {
                 status = materializer.materialize_zero(
@@ -2097,9 +2358,12 @@ public:
         /* Imports are bounded transactions; earlier successful batches remain
          * in the same unpublished TaskSpace and are reclaimed by failure.  A
          * typed row consumes its canonical descriptor bytes from the one
-         * TaskSpace-owned carrier at its batch-local offset. */
-        uint32_t imported = 0;
-        while (imported < row->imports.count) {
+         * TaskSpace-owned carrier at its batch-local offset.  The phase is
+         * declared here but invoked after every constructible TaskKey source
+         * (including executions and scheduling contexts) exists. */
+        const auto import_sources = [&]() noexcept -> myos_status_t {
+            uint32_t imported = 0;
+            while (imported < row->imports.count) {
             const uint32_t count = row->imports.count - imported
                 > kImportBatchMax
                 ? static_cast<uint32_t>(kImportBatchMax)
@@ -2112,60 +2376,256 @@ public:
                     byte = 0;
                 }
             }
-            for (uint32_t index = 0; index < count; ++index) {
-                const PlanImport* const import = task.import(imported + index);
-                if (import == nullptr) {
+                for (uint32_t index = 0; index < count; ++index) {
+                    const PlanImport* const import = task.import(imported + index);
+                    if (import == nullptr) {
+                        return failure(MYOS_STATUS_BAD_ARGS);
+                    }
+                    attenuation::encode_wire(
+                        import->attenuation,
+                        workspace.import_descriptor_bytes[index]);
+                    ImportBinding& binding = workspace.import_bindings[index];
+                    binding.authority = input.bindings->imports[imported + index];
+                    if (import->source_class == MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY) {
+                        const ByteView source_key = task.symbol(import->source);
+                        libk::optional<cap::CapRef> source{};
+                        const auto matches = [source_key](ByteView candidate)
+                            noexcept -> bool {
+                            return source_key.size() != 0
+                                && candidate.equals(source_key);
+                        };
+                        if (matches(task.symbol(row->pool_key))) {
+                            source = record.space().pool();
+                        }
+                        const auto consider = [&source, &record, matches](
+                            ByteView key,
+                            const SlotProjection& projection,
+                            myos_object_kind_t kind) noexcept {
+                            if (source.has_value() || !matches(key)
+                                || projection.kind != kind) {
+                                return;
+                            }
+                            source = record.resolve(projection, kind);
+                        };
+                        consider(task.symbol(row->vspace_key),
+                                 projections.vspace,
+                                 MYOS_OBJECT_KIND_VSPACE);
+                        consider(task.symbol(row->cspace_key),
+                                 projections.cspace,
+                                 MYOS_OBJECT_KIND_CSPACE);
+                        for (uint32_t mapping = 0;
+                             mapping < row->mappings.count && !source; ++mapping) {
+                            const PlanMapping* mapping_row = task.mapping(mapping);
+                            if (mapping_row == nullptr) {
+                                return failure(MYOS_STATUS_BAD_ARGS);
+                            }
+                            consider(task.symbol(mapping_row->produced),
+                                     projections.mappings[mapping],
+                                     MYOS_OBJECT_KIND_MEMORY);
+                        }
+                        for (uint32_t object = 0;
+                             object < row->objects.count && !source; ++object) {
+                            const PlanObject* object_row = task.object(object);
+                            if (object_row == nullptr) {
+                                return failure(MYOS_STATUS_BAD_ARGS);
+                            }
+                            consider(task.symbol(object_row->output),
+                                     projections.objects[object],
+                                     object_row->kind);
+                            consider(task.symbol(object_row->output_b),
+                                     projections.object_b[object],
+                                     object_row->kind);
+                        }
+                        for (uint32_t execution = 0;
+                             execution < row->executions.count && !source;
+                             ++execution) {
+                            const PlanExecution* execution_row =
+                                task.execution(execution);
+                            if (execution_row == nullptr) {
+                                return failure(MYOS_STATUS_BAD_ARGS);
+                            }
+                            consider(task.symbol(execution_row->key),
+                                     projections.executions[execution],
+                                     execution_row->model
+                                         == MYOS_DEPLOY_EXECUTION_THREAD
+                                     ? MYOS_OBJECT_KIND_THREAD
+                                     : MYOS_OBJECT_KIND_VPROC);
+                            consider(task.symbol(execution_row->sc),
+                                     projections.scheduling_contexts[execution],
+                                     MYOS_OBJECT_KIND_SCHED_CONTEXT);
+                        }
+                        if (!source || source->cspace != 0) {
+                            return failure(MYOS_STATUS_BAD_ARGS);
+                        }
+                        binding.source = source.value();
+                    }
+                    if (import->mode == MYOS_DEPLOY_IMPORT_TYPED_DELEGATE) {
+                        binding.descriptor = workspace.import_descriptor;
+                        binding.descriptor_offset =
+                            index * MYOS_CAP_ATTENUATION_SIZE;
+                    }
+                }
+                if (typed_imports) {
+                    const myos_status_t written = materializer.write(
+                        workspace.import_descriptor,
+                        MYOS_DEPLOY_PAGE_SIZE,
+                        0,
+                        &workspace.import_descriptor_bytes[0][0],
+                        sizeof(workspace.import_descriptor_bytes));
+                    if (written != MYOS_STATUS_OK) {
+                        return failure(written);
+                    }
+                }
+                const myos_status_t status = ImportTransaction<
+                    space_type, Authorities, kImportBatchMax>::run(
+                    record.space(), task, imported, count,
+                        workspace.import_bindings, authorities, outputs);
+                if (status != MYOS_STATUS_OK) {
+                    return failure(status);
+                }
+                for (uint32_t index = 0; index < count; ++index) {
+                    if (!outputs[index].valid()
+                        || !record.install_import_projection(
+                            imported + index, outputs[index])) {
+                        return failure(MYOS_STATUS_INVALID_CAP);
+                    }
+                }
+                imported += count;
+            }
+
+            if (workspace.import_descriptor.valid()) {
+                const myos_status_t closed = record.space().close_slot(
+                    workspace.import_descriptor);
+                if (closed != MYOS_STATUS_OK) {
+                    return failure(closed);
+                }
+                workspace.import_descriptor = {};
+            }
+            return MYOS_STATUS_OK;
+        };
+
+        /* Bootstrap rows are materialized only after every Import has been
+         * adopted.  The envelope therefore contains selectors from the
+         * admitted child projections, never source authorities or guessed
+         * fixed slots.  The current production path deliberately supports one execution here;
+         * extending this to multi-execution requires an explicit ABI for
+         * per-execution bootstrap state.  Defer the phase until after target
+         * construction so TaskKey sources are complete. */
+        const auto generate_bootstrap = [&]() noexcept -> myos_status_t {
+        if (row->bootstraps.count != 0) {
+            if (bootstrap_mapping == MYOS_DEPLOY_NO_INDEX
+                || row->bootstraps.count > MYOS_BOOTSTRAP_MAX_CAPS
+                || row->executions.count != 1
+                || input.runtime_cpu_count == 0
+                || !workspace.bootstrap_memory.valid()) {
+                return failure(MYOS_STATUS_BAD_ARGS);
+            }
+            const PlanExecution* const execution = task.execution(0);
+            const uint32_t stack_mapping = execution == nullptr
+                ? MYOS_DEPLOY_NO_INDEX : mapping_local(execution->stack);
+            const uint32_t execution_bootstrap = execution == nullptr
+                ? MYOS_DEPLOY_NO_INDEX : mapping_local(execution->bootstrap);
+            if (execution == nullptr
+                || stack_mapping == MYOS_DEPLOY_NO_INDEX
+                || execution_bootstrap != bootstrap_mapping
+                || mapping_sizes[bootstrap_mapping] < sizeof(myos_bootstrap_info)
+                || !mapping_regions[bootstrap_mapping].valid()
+                || mapping_addresses[stack_mapping] == 0
+                || mapping_sizes[stack_mapping] == 0
+                || execution->stack_top == 0
+                || input.bundle->size() == 0) {
+                return failure(MYOS_STATUS_BAD_ARGS);
+            }
+
+            myos_bootstrap_info info{};
+            info.magic = MYOS_BOOTSTRAP_MAGIC;
+            info.major = MYOS_BOOTSTRAP_MAJOR;
+            info.minor = MYOS_BOOTSTRAP_MINOR;
+            info.size = sizeof(info);
+            info.cap_count = row->bootstraps.count;
+            info.cpu_count = input.runtime_cpu_count;
+            info.stack_base = mapping_addresses[stack_mapping];
+            info.stack_size = mapping_sizes[stack_mapping];
+            info.boot_bundle_size = input.bundle->size();
+
+            for (uint32_t bootstrap = 0;
+                 bootstrap < row->bootstraps.count; ++bootstrap) {
+                const PlanBootstrap* const bootstrap_row =
+                    task.bootstrap(bootstrap);
+                if (bootstrap_row == nullptr
+                    || bootstrap_row->kind < MYOS_BOOTSTRAP_CAP_VSPACE
+                    || bootstrap_row->kind > MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION) {
                     return failure(MYOS_STATUS_BAD_ARGS);
                 }
-                attenuation::encode_wire(
-                    import->attenuation,
-                    workspace.import_descriptor_bytes[index]);
-                ImportBinding& binding = workspace.import_bindings[index];
-                binding.authority = input.bindings->imports[imported + index];
-                if (import->mode == MYOS_DEPLOY_IMPORT_TYPED_DELEGATE) {
-                    binding.descriptor = workspace.import_descriptor;
-                    binding.descriptor_offset =
-                        index * MYOS_CAP_ATTENUATION_SIZE;
+                const myos_object_kind_t expected_kind =
+                    myos_bootstrap_object_kind(bootstrap_row->kind);
+                if (expected_kind == MYOS_OBJECT_KIND_INVALID) {
+                    return failure(MYOS_STATUS_BAD_ARGS);
                 }
-            }
-            if (typed_imports) {
-                const myos_status_t written = materializer.write(
-                    workspace.import_descriptor,
-                    MYOS_DEPLOY_PAGE_SIZE,
-                    0,
-                    &workspace.import_descriptor_bytes[0][0],
-                    sizeof(workspace.import_descriptor_bytes));
-                if (written != MYOS_STATUS_OK) {
-                    return failure(written);
+                const ByteView destination =
+                    task.symbol(bootstrap_row->destination);
+                size_t import_index = 0;
+                size_t matches = 0;
+                for (uint32_t import = 0; import < row->imports.count;
+                     ++import) {
+                    const PlanImport* const import_row = task.import(import);
+                    if (import_row != nullptr
+                        && task.symbol(import_row->destination)
+                               .equals(destination)) {
+                        import_index = import;
+                        ++matches;
+                    }
                 }
+                if (destination.size() == 0 || matches != 1) {
+                    return failure(MYOS_STATUS_BAD_ARGS);
+                }
+                const PlanImport* const import = task.import(import_index);
+                const SlotProjection& projection =
+                    projections.imports[import_index];
+                if (import == nullptr || import->attenuation.kind != expected_kind
+                    || projection.kind != expected_kind) {
+                    return failure(MYOS_STATUS_BAD_ARGS);
+                }
+                const auto reference = record.resolve(
+                    projection, expected_kind);
+                if (!projection.valid() || !reference
+                    || reference->cspace == 0) {
+                    return failure(MYOS_STATUS_INVALID_CAP);
+                }
+                info.caps[bootstrap] = myos_bootstrap_cap{
+                    .kind = bootstrap_row->kind,
+                    .flags = 0,
+                    .handle = reference->selector};
             }
-            const myos_status_t status = ImportTransaction<
-                space_type, Authorities, kImportBatchMax>::run(
-                record.space(), task, imported, count,
-                    workspace.import_bindings, authorities, outputs);
+
+            myos_status_t status = materializer.write(
+                workspace.bootstrap_memory,
+                mapping_sizes[bootstrap_mapping],
+                0,
+                &info,
+                sizeof(info));
+            if (status == MYOS_STATUS_OK) {
+                const auto memory = record.space().lookup(
+                    workspace.bootstrap_memory, MYOS_OBJECT_KIND_MEMORY);
+                status = memory
+                    ? backend_type::memory_seal(memory.value())
+                    : MYOS_STATUS_INVALID_CAP;
+            }
+            if (status == MYOS_STATUS_OK) {
+                status = record.space().close_slot(workspace.bootstrap_memory);
+            }
             if (status != MYOS_STATUS_OK) {
                 return failure(status);
             }
-            for (uint32_t index = 0; index < count; ++index) {
-                if (!outputs[index].valid()
-                    || !record.install_import_projection(
-                        imported + index, outputs[index])) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
-                }
-            }
-            imported += count;
+            workspace.bootstrap_memory = {};
+            projections.mappings[bootstrap_mapping] = local_projection(
+                mapping_regions[bootstrap_mapping]);
+            projections.bootstrap = projections.mappings[bootstrap_mapping];
         }
+        return MYOS_STATUS_OK;
+        };
 
-        if (workspace.import_descriptor.valid()) {
-            const myos_status_t closed = record.space().close_slot(
-                workspace.import_descriptor);
-            if (closed != MYOS_STATUS_OK) {
-                return failure(closed);
-            }
-            workspace.import_descriptor = {};
-        }
-
-        /* Executions and their SCs are created after imports.  A descriptor
+        /* Executions and their SCs are created before imports.  A descriptor
          * MemoryObject is retained by TaskSpace until this unpublished task
          * either commits in Cut D or follows the strong-close path. */
         for (uint32_t index = 0; index < row->executions.count; ++index) {
@@ -2389,6 +2849,19 @@ public:
                     return failure(MYOS_STATUS_INVALID_CAP);
                 }
             }
+        }
+
+        /* Every local source named by a TaskKey now exists in the caller's
+         * current CSpace.  Imports adopt their destinations immediately, then
+         * the generated bootstrap envelope records only those admitted child
+         * selectors. */
+        const myos_status_t import_status = import_sources();
+        if (import_status != MYOS_STATUS_OK) {
+            return import_status;
+        }
+        const myos_status_t bootstrap_status = generate_bootstrap();
+        if (bootstrap_status != MYOS_STATUS_OK) {
+            return bootstrap_status;
         }
 
         /* Endpoint descriptor mappings are snapshot sources.  Retire their
@@ -2660,7 +3133,7 @@ private:
             }
             if (export_row->source_class == MYOS_DEPLOY_EXPORT_RUNTIME_READY) {
                 /* RuntimeReady is intentionally withheld from construction;
-                 * Stage F binds it during the real publication transition. */
+                 * the current production path binds it during the real publication transition. */
                 continue;
             }
             if (export_row->source_class != MYOS_DEPLOY_EXPORT_PREPARED_KEY) {
