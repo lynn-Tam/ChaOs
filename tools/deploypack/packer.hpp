@@ -305,7 +305,9 @@ inline auto pack_production(
                               std::uint32_t mapping_count,
                               std::uint16_t readiness,
                               std::uint64_t pool_memory,
-                              std::uint64_t pool_caps) {
+                              std::uint64_t pool_caps,
+                              std::uint32_t cspace_slots,
+                              std::uint32_t cspace_pages) {
         put(bytes, offset + MYOS_DEPLOY_TASK_NAME, key(name), 8);
         put(bytes, offset + MYOS_DEPLOY_TASK_POOL, key(pool), 8);
         put(bytes, offset + MYOS_DEPLOY_TASK_VSPACE, key(vspace), 8);
@@ -331,8 +333,8 @@ inline auto pack_production(
             MYOS_RESOURCE_E2_KINDS, 8);
         put(bytes, offset + MYOS_DEPLOY_TASK_CRITICAL_BYTES,
             4U * 1024U * 1024U, 8);
-        put(bytes, offset + MYOS_DEPLOY_TASK_CSPACE_SLOTS, 64, 4);
-        put(bytes, offset + MYOS_DEPLOY_TASK_CSPACE_PAGES, 4, 4);
+        put(bytes, offset + MYOS_DEPLOY_TASK_CSPACE_SLOTS, cspace_slots, 4);
+        put(bytes, offset + MYOS_DEPLOY_TASK_CSPACE_PAGES, cspace_pages, 4);
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_MAPPING,
             mapping_first + mapping_count - 1, 4);
         put(bytes, offset + MYOS_DEPLOY_TASK_READINESS,
@@ -350,11 +352,11 @@ inline auto pack_production(
     const std::size_t task1 = task0 + MYOS_DEPLOY_TASK_STRIDE;
     task_row(task0, 0, 2, 3, 4, 0, 0, 0, 0, 0, 0,
              process_mapping_count, MYOS_DEPLOY_READINESS_NONE,
-             32U * 1024U * 1024U + MYOS_DEPLOY_PAGE_SIZE, 513);
+             32U * 1024U * 1024U + MYOS_DEPLOY_PAGE_SIZE, 513, 64, 5);
     task_row(task1, 1, 5, 6, 7, 1,
              process_mapping_count, 1, 1, 5, 5, proof_mapping_count,
              MYOS_DEPLOY_READINESS_START,
-             16U * 1024U * 1024U, 256);
+             16U * 1024U * 1024U, 256, 64, 4);
 
     const std::size_t images = tables[MYOS_DEPLOY_TABLE_IMAGE].offset;
     put(bytes, images + MYOS_DEPLOY_IMAGE_SOURCE, key(8), 8);

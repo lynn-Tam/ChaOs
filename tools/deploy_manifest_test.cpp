@@ -395,8 +395,12 @@ auto accepts_production_authority_budget() -> bool {
         + MYOS_DEPLOY_PAGE_SIZE;
     return process.pool_memory == process_memory
         && process.pool_caps == 513
+        && process.cspace_slots == 64
+        && process.cspace_pages == 5
         && proof.pool_memory == UINT64_C(16) * UINT64_C(1024) * UINT64_C(1024)
         && proof.pool_caps == 256
+        && proof.cspace_slots == 64
+        && proof.cspace_pages == 4
         && process_pool.attenuation.rights == MYOS_RIGHT_SPLIT
         && (proof_pool.attenuation.rights & MYOS_RIGHT_SPLIT) == 0;
 }
