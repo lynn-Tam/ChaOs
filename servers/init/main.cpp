@@ -19,9 +19,10 @@
 #include <uapi/vm.h>
 
 /*
- * Root init owns only platform bootstrap and one process_server Task record.
- * Ordinary workload state belongs to process_server; this file contains no
- * proof/UART worker loader or second deployment state machine.
+ * Root init owns platform bootstrap, durable service objects, and the Task
+ * records it constructs through the decoded deployment plan.  Every child
+ * image still enters through TaskBuilder; the policy below only sequences the
+ * real service relations and their checked readiness edges.
  */
 namespace {
 
@@ -31,11 +32,11 @@ using Space = myos::deploy::TaskSpace<
     myos::deploy::kTaskImportRemoteCapacity,
     Backend>;
 using Record = myos::deploy::TaskRecord<Space>;
-using Completions = myos::deploy::CompletionSet<1>;
-using Table = myos::deploy::TaskTable<Record, Completions, 1>;
+using Completions = myos::deploy::CompletionSet<3>;
+using Table = myos::deploy::TaskTable<Record, Completions, 3>;
 using Builder = myos::deploy::TaskBuilder<Table, Completions>;
-using Authorities = myos::deploy::AuthoritySet<4>;
-using Journal = myos::deploy::RegistrationJournal<4>;
+using Authorities = myos::deploy::AuthoritySet<8>;
+using Journal = myos::deploy::RegistrationJournal<8>;
 using Workspace = myos::deploy::TaskConstructionWorkspace<Authorities>;
 using Plans = myos::deploy::PlanSet<1>;
 
@@ -43,6 +44,23 @@ constexpr myos_word_t PageSize = MYOS_DEPLOY_PAGE_SIZE;
 constexpr myos_word_t BundleAddress = 0x1000'0000;
 constexpr myos_word_t ScratchAddress = 0x1800'0000;
 constexpr myos_word_t UartAddress = 0x3001'0000;
+constexpr myos_word_t PagerBackingKey = 1;
+constexpr myos_word_t PagerPageLimit = 1;
+
+struct CoreAuthorities final {
+    myos::deploy::AuthorityId domain{};
+    myos::deploy::AuthorityId bundle{};
+    myos::deploy::AuthorityId pager{};
+    myos::deploy::AuthorityId device_memory{};
+    myos::deploy::AuthorityId irq{};
+};
+
+using Receiver = Completions::Receiver;
+
+struct TaskHandle final {
+    myos::deploy::TaskId id{};
+    libk::optional<Receiver> receiver{};
+};
 
 struct Console final {
     myos::cap::OwnedCap region{};
@@ -147,6 +165,8 @@ struct Runtime final {
     Console console{};
     myos::cap::MappedBundle bundle{};
     myos::cap::ScratchWindow scratch{};
+    myos::cap::OwnedCap pager{};
+    CoreAuthorities core{};
     Authorities authorities{};
     Journal journal{};
     Plans plans{};
@@ -165,34 +185,24 @@ Runtime runtime{};
     myos::exit(status);
 }
 
-[[nodiscard]] auto deploy_process_server(
-    myos::cap::CapRef parent_pool,
+[[nodiscard]] auto register_core_authorities(
+    myos::cap::CapRef root_pool,
     myos::cap::CapRef root_domain,
     myos::cap::CapRef root_bundle,
-    uint32_t runtime_cpu_count) noexcept -> bool {
-    const auto index = runtime.plan.find_task("process-server");
-    if (!index) {
+    myos::cap::CapRef uart_memory,
+    myos::cap::CapRef uart_irq) noexcept -> bool {
+    if (!root_pool || !root_domain || !root_bundle || !uart_memory
+        || !uart_irq || runtime.pager) {
         return false;
     }
-    auto lease = runtime.plan.lease();
-    if (!lease) {
+
+    const myos::SysResult pager = myos::pager_create(
+        root_pool.selector, PagerBackingKey, PagerPageLimit);
+    if (pager.status != MYOS_STATUS_OK || pager.value == 0) {
         return false;
     }
-    auto pending = Builder::begin(
-        runtime.completions, runtime.table, libk::move(*lease), *index);
-    if (!pending) {
-        return false;
-    }
-    Builder builder = libk::move(*pending);
-    const auto* reservation = builder.record();
-    if (reservation == nullptr) {
-        return false;
-    }
-    const myos::deploy::TaskId id = reservation->id();
-    auto receiver = builder.take_receiver();
-    if (!receiver) {
-        return false;
-    }
+    runtime.pager = myos::cap::OwnedCap{
+        myos::cap::CapRef{pager.value, 0}};
 
     const myos_cap_attenuation domain_ceiling{
         .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
@@ -209,25 +219,91 @@ Runtime runtime{};
             | MYOS_RIGHT_INSPECT,
         .words = {0, 1, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL},
     };
-    myos::deploy::TaskAuthorityBindings bindings{};
-    bindings.domains[0] = runtime.journal.register_source(
+    const myos_cap_attenuation pager_ceiling{
+        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = MYOS_OBJECT_KIND_PAGER,
+        .size = MYOS_CAP_ATTENUATION_SIZE,
+        .rights = MYOS_RIGHT_SERVE | MYOS_RIGHT_SUPPLY,
+        .words = {PagerPageLimit, 0, 0, 0, 0, 0},
+    };
+    const myos_cap_attenuation device_ceiling{
+        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = MYOS_OBJECT_KIND_MEMORY,
+        .size = MYOS_CAP_ATTENUATION_SIZE,
+        .rights = MYOS_RIGHT_MAP,
+        .words = {0, 1, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE},
+    };
+    const myos_cap_attenuation irq_ceiling{
+        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = MYOS_OBJECT_KIND_IRQ,
+        .size = MYOS_CAP_ATTENUATION_SIZE,
+        .rights = MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK,
+        .words = {},
+    };
+
+    runtime.core.domain = runtime.journal.register_source(
         runtime.authorities,
         root_domain,
         UINT64_C(0x524f4f54444f4d41),
         domain_ceiling)
         .value_or(myos::deploy::AuthorityId{});
-    bindings.imports[3] = bindings.domains[0];
-    bindings.imports[4] = runtime.journal.register_source(
+    runtime.core.bundle = runtime.journal.register_source(
         runtime.authorities,
         root_bundle,
         UINT64_C(0x524f4f5442554e44),
         bundle_ceiling)
         .value_or(myos::deploy::AuthorityId{});
-    if (!bindings.domains[0].valid() || !bindings.imports[4].valid()) {
-        const bool cleaned = myos::deploy::supervision::close_failed(
-            runtime.table, id, MYOS_STATUS_DENIED, builder, receiver);
-        static_cast<void>(cleaned);
-        return false;
+    runtime.core.pager = runtime.journal.register_source(
+        runtime.authorities,
+        runtime.pager.reference(),
+        UINT64_C(0x4455525041474552),
+        pager_ceiling)
+        .value_or(myos::deploy::AuthorityId{});
+    runtime.core.device_memory = runtime.journal.register_source(
+        runtime.authorities,
+        uart_memory,
+        UINT64_C(0x5541525444455649),
+        device_ceiling)
+        .value_or(myos::deploy::AuthorityId{});
+    runtime.core.irq = runtime.journal.register_source(
+        runtime.authorities,
+        uart_irq,
+        UINT64_C(0x5541525449525145),
+        irq_ceiling)
+        .value_or(myos::deploy::AuthorityId{});
+    return runtime.core.domain.valid() && runtime.core.bundle.valid()
+        && runtime.core.pager.valid() && runtime.core.device_memory.valid()
+        && runtime.core.irq.valid();
+}
+
+template<size_t N>
+[[nodiscard]] auto prepare_task(
+    const char (&name)[N],
+    myos::cap::CapRef parent_pool,
+    const myos::deploy::TaskAuthorityBindings& bindings,
+    uint32_t runtime_cpu_count) noexcept -> libk::optional<TaskHandle> {
+    const auto index = runtime.plan.find_task(name);
+    if (!index) {
+        return libk::nullopt;
+    }
+    auto lease = runtime.plan.lease();
+    if (!lease) {
+        return libk::nullopt;
+    }
+    auto pending = Builder::begin(
+        runtime.completions, runtime.table, libk::move(*lease), *index);
+    if (!pending) {
+        return libk::nullopt;
+    }
+    Builder builder = libk::move(*pending);
+    const auto* reservation = builder.record();
+    if (reservation == nullptr) {
+        return libk::nullopt;
+    }
+    const myos::deploy::TaskId id = reservation->id();
+    auto receiver = builder.take_receiver();
+    if (!receiver) {
+        return libk::nullopt;
     }
 
     myos::deploy::TaskConstructionInput<Backend, Authorities> input{
@@ -245,33 +321,113 @@ Runtime runtime{};
         const bool cleaned = myos::deploy::supervision::close_failed(
             runtime.table, id, constructed, builder, receiver);
         static_cast<void>(cleaned);
-        return false;
+        return libk::nullopt;
     }
     if (!builder.commit_prepared()) {
         const bool cleaned = myos::deploy::supervision::close_failed(
             runtime.table, id, MYOS_STATUS_INTERNAL, builder, receiver);
         static_cast<void>(cleaned);
-        return false;
+        return libk::nullopt;
     }
-    runtime.console.text("init: process-server-prepared\n");
-    const myos_status_t started = runtime.table.start(id);
+
+    return TaskHandle{.id = id, .receiver = libk::move(receiver)};
+}
+
+[[nodiscard]] auto start_task(TaskHandle& task) noexcept -> bool {
+    const myos_status_t started = runtime.table.start(task.id);
     if (started != MYOS_STATUS_OK) {
         if (!runtime.table.begin_close(
-                id,
+                task.id,
                 myos::deploy::CloseReason::ConstructionFailure,
                 started)) {
             return false;
         }
         const bool cleaned = myos::deploy::supervision::take_completion(
             runtime.table,
-            id,
+            task.id,
             myos::deploy::CloseReason::ConstructionFailure,
             started,
-            receiver);
+            task.receiver);
         static_cast<void>(cleaned);
         return false;
     }
-    const auto* started_record = runtime.table.record(id);
+    return true;
+}
+
+[[nodiscard]] auto wait_readiness(const TaskHandle& task) noexcept -> bool {
+    for (;;) {
+        const auto* record = runtime.table.record(task.id);
+        if (record == nullptr
+            || record->state() != myos::deploy::TaskState::Running) {
+            return false;
+        }
+        const myos_status_t status = runtime.table.consume_readiness(task.id);
+        if (status == MYOS_STATUS_OK) {
+            return true;
+        }
+        if (status != MYOS_STATUS_RETRY && status != MYOS_STATUS_BUSY) {
+            return false;
+        }
+        myos::yield();
+    }
+}
+
+[[nodiscard]] auto task_bindings(
+    myos::deploy::AuthorityId domain,
+    myos::deploy::AuthorityId bundle) noexcept
+    -> myos::deploy::TaskAuthorityBindings {
+    myos::deploy::TaskAuthorityBindings bindings{};
+    bindings.domains[0] = domain;
+    bindings.imports[3] = domain;
+    bindings.imports[4] = bundle;
+    return bindings;
+}
+
+[[nodiscard]] auto consumer_bindings() noexcept
+    -> myos::deploy::TaskAuthorityBindings {
+    auto bindings = task_bindings(
+        runtime.core.domain, runtime.core.bundle);
+    for (auto& pager : bindings.pagers) {
+        pager = runtime.core.pager;
+    }
+    return bindings;
+}
+
+[[nodiscard]] auto pager_bindings(
+    myos::deploy::AuthorityId target) noexcept
+    -> myos::deploy::TaskAuthorityBindings {
+    auto bindings = task_bindings(
+        runtime.core.domain, runtime.core.bundle);
+    bindings.imports[5] = runtime.core.pager;
+    bindings.imports[6] = target;
+    return bindings;
+}
+
+[[nodiscard]] auto uart_bindings() noexcept
+    -> myos::deploy::TaskAuthorityBindings {
+    auto bindings = task_bindings(
+        runtime.core.domain, runtime.core.bundle);
+    bindings.imports[5] = runtime.core.device_memory;
+    bindings.imports[6] = runtime.core.irq;
+    return bindings;
+}
+
+[[nodiscard]] auto deploy_process_server(
+    myos::cap::CapRef parent_pool,
+    uint32_t runtime_cpu_count) noexcept -> bool {
+    auto bindings = task_bindings(
+        runtime.core.domain, runtime.core.bundle);
+    auto pending = prepare_task(
+        "process-server", parent_pool, bindings, runtime_cpu_count);
+    if (!pending) {
+        return false;
+    }
+    TaskHandle task = libk::move(*pending);
+    runtime.console.text("init: process-server-prepared\n");
+    if (!start_task(task)) {
+        return false;
+    }
+    const auto* started_record = runtime.table.record(task.id);
     if (started_record == nullptr) {
         return false;
     }
@@ -282,26 +438,12 @@ Runtime runtime{};
     }
     myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
     if (!myos::deploy::supervision::observe_and_close(
-            runtime.table, id, receiver, terminal_status)) {
+            runtime.table, task.id, task.receiver, terminal_status)) {
         return false;
     }
     /* Init supervises process_server as a service boundary; its non-OK
      * terminal is therefore a failed deployment rather than root success. */
     return reached_running && terminal_status == MYOS_STATUS_OK;
-}
-
-[[nodiscard]] auto close_sources() noexcept -> bool {
-    for (;;) {
-        const myos_status_t status = runtime.journal.retire_all();
-        if (status == MYOS_STATUS_OK) {
-            break;
-        }
-        if (!myos::deploy::retryable(status)) {
-            return false;
-        }
-        myos::yield();
-    }
-    return runtime.authorities.live_leases() == 0;
 }
 
 [[nodiscard]] auto close_views() noexcept -> bool {
@@ -349,8 +491,9 @@ Runtime runtime{};
     const auto root_domain = bootstrap.cap(MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN);
     const auto root_bundle = bootstrap.cap(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE);
     const auto uart_memory = bootstrap.cap(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
+    const auto uart_irq = bootstrap.cap(MYOS_BOOTSTRAP_CAP_IRQ);
     if (!root_vspace || !root_pool || !root_domain || !root_bundle
-        || !uart_memory
+        || !uart_memory || !uart_irq
         || !runtime.console.open(*root_vspace, *uart_memory)
         || !open_views(*root_vspace, *root_bundle, bootstrap.bundle_size())
                || !myos::deploy::supervision::decode_plan(
@@ -362,23 +505,29 @@ Runtime runtime{};
         return false;
     }
 
-    const auto process_index = runtime.plan.find_task("process-server");
-    const auto process_lease = runtime.plan.lease();
-    const myos::deploy::TaskPlanView process_task =
-        process_index && process_lease
-        ? process_lease->task(*process_index)
-        : myos::deploy::TaskPlanView{};
     const myos::boot::Bundle* const package = runtime.bundle.view();
     const myos_word_t bundle_window_size = myos::deploy::Window::round_size(
         static_cast<myos_word_t>(runtime.bundle.size()));
-    const auto scratch_size = package != nullptr && process_task.valid()
-        ? myos::deploy::required_scratch_size(process_task, *package)
-        : libk::nullopt;
-    if (package == nullptr || !process_task.valid() || bundle_window_size == 0
-        || !scratch_size
+    myos_word_t scratch_size{};
+    if (package != nullptr && bundle_window_size != 0) {
+        for (uint32_t index = 0; index < runtime.plan.task_count(); ++index) {
+            const auto lease = runtime.plan.lease();
+            const auto task = lease ? lease->task(index)
+                                    : myos::deploy::TaskPlanView{};
+            if (!task.valid()) {
+                return false;
+            }
+            const auto required = myos::deploy::required_scratch_size(
+                task, *package);
+            if (!required || *required > scratch_size) {
+                scratch_size = required ? *required : 0;
+            }
+        }
+    }
+    if (package == nullptr || bundle_window_size == 0 || scratch_size == 0
         || runtime.scratch.open(
                *root_vspace,
-               myos::deploy::Window{ScratchAddress, *scratch_size},
+               myos::deploy::Window{ScratchAddress, scratch_size},
                myos::deploy::Window{BundleAddress, bundle_window_size})
             != MYOS_STATUS_OK) {
         return false;
@@ -386,23 +535,83 @@ Runtime runtime{};
     runtime.console.text("init: boot-root\n");
     runtime.console.text("init: manifest-decoded\n");
 
-    const bool deployed = deploy_process_server(
-        *root_pool,
-        *root_domain,
-        *root_bundle,
-        bootstrap.cpu_count());
-    if (deployed) {
-        runtime.console.text("init: process-server-terminal\n");
+    if (!register_core_authorities(
+            *root_pool, *root_domain, *root_bundle,
+            *uart_memory, *uart_irq)) {
+        return false;
     }
-    const bool sources_closed = close_sources();
-    if (sources_closed) {
-        runtime.console.text("init: authorities-retired\n");
+    runtime.console.text("init: core-authorities\n");
+
+    runtime.console.text("init: process-server-constructing\n");
+    if (!deploy_process_server(*root_pool, bootstrap.cpu_count())) {
+        return false;
     }
-    const bool views_closed = close_views();
-    if (views_closed) {
-        runtime.console.text("init: bundle-views-closed\n");
+
+    auto consumer_pending = prepare_task(
+        "consumer", *root_pool, consumer_bindings(), bootstrap.cpu_count());
+    if (!consumer_pending) {
+        return false;
     }
-    return deployed && sources_closed && views_closed;
+    TaskHandle consumer = libk::move(*consumer_pending);
+    runtime.console.text("init: consumer-prepared\n");
+    const auto target_authority = runtime.table.register_prepared_export(
+        consumer.id, 0, runtime.authorities);
+    if (!target_authority) {
+        return false;
+    }
+    runtime.console.text("init: consumer-exported\n");
+
+    auto pager_pending = prepare_task(
+        "pager-worker", *root_pool,
+        pager_bindings(*target_authority), bootstrap.cpu_count());
+    if (!pager_pending) {
+        return false;
+    }
+    TaskHandle pager = libk::move(*pager_pending);
+    runtime.console.text("init: pager-prepared\n");
+    if (!start_task(pager) || !wait_readiness(pager)) {
+        return false;
+    }
+    runtime.console.text("init: pager-ready\n");
+
+    auto uart_pending = prepare_task(
+        "uart-worker", *root_pool, uart_bindings(), bootstrap.cpu_count());
+    if (!uart_pending) {
+        return false;
+    }
+    TaskHandle uart = libk::move(*uart_pending);
+    runtime.console.text("init: uart-prepared\n");
+    if (!start_task(uart) || !wait_readiness(uart)) {
+        return false;
+    }
+    runtime.console.text("init: uart-ready\n");
+
+    /* All image sources have been retired by TaskBuilder before this point;
+     * release the two init mappings while every child keeps its own copied
+     * MemoryObjects and VSpace projections. */
+    if (!close_views()) {
+        return false;
+    }
+    runtime.console.text("init: bundle-views-closed\n");
+
+    if (!start_task(consumer)) {
+        return false;
+    }
+    runtime.console.text("init: consumer-running\n");
+    const auto* consumer_record = runtime.table.record(consumer.id);
+    if (consumer_record == nullptr
+        || consumer_record->accounting().total_bytes
+            > consumer_record->plan().row()->critical_bytes) {
+        return false;
+    }
+    myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
+    if (!myos::deploy::supervision::observe_and_close(
+            runtime.table, consumer.id, consumer.receiver, terminal_status)
+        || terminal_status != MYOS_STATUS_OK) {
+        return false;
+    }
+    runtime.console.text("init: consumer-terminal\n");
+    return true;
 }
 
 } // namespace
