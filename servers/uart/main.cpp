@@ -19,11 +19,14 @@ constexpr myos_word_t IrqBadge = 1;
 [[noreturn]] void run(
     const myos::bootstrap::BootstrapView& info) noexcept {
     const myos_cap_t vspace = info.selector(MYOS_BOOTSTRAP_CAP_VSPACE);
-    const myos_cap_t memory = info.selector(MYOS_BOOTSTRAP_CAP_UART_MEMORY);
-    const myos_cap_t irq = info.selector(MYOS_BOOTSTRAP_CAP_UART_IRQ);
+    const myos_cap_t memory = info.selector(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
+    const myos_cap_t irq = info.selector(MYOS_BOOTSTRAP_CAP_IRQ);
     const myos_cap_t notification = info.selector(
-        MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION);
-    if (vspace == 0 || memory == 0 || irq == 0 || notification == 0) {
+        MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
+    const myos_cap_t readiness = info.selector(
+        MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION);
+    if (vspace == 0 || memory == 0 || irq == 0 || notification == 0
+        || readiness == 0) {
         stop();
     }
 
@@ -58,6 +61,9 @@ constexpr myos_word_t IrqBadge = 1;
             IrqBadge, UartAddress)) {
         stop();
     }
+    if (myos::notification_signal(readiness).status != MYOS_STATUS_OK) {
+        stop();
+    }
 
     for (;;) {
         const auto notice = myos::notification_wait(notification);
@@ -83,7 +89,8 @@ constexpr myos_word_t IrqBadge = 1;
                 port.put(static_cast<char>(value));
             }
         }
-        const auto acknowledged = myos::irq_ack(irq, observed.value);
+        const auto acknowledged = myos::irq_ack(
+            irq, observed.value2, observed.value);
         if (acknowledged.status != MYOS_STATUS_OK
             && acknowledged.status != MYOS_STATUS_REASSERTED) {
             myos::yield();

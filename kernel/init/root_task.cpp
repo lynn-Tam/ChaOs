@@ -380,19 +380,6 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     }
     uart_irq_ = libk::move(uart_irq).value().publish();
 
-    auto uart_notification_charge = reserve(
-        kernel::resource::Traits<kernel::ipc::Notification>::fixed());
-    auto uart_notification = uart_notification_charge
-        ? kernel.objects().create_notification_sponsored(
-              libk::move(uart_notification_charge).value())
-        : libk::Expected<kernel::object::ObjectStore::NotificationPending,
-              kernel::object::NotificationPool::Error>{
-              libk::unexpected(kernel::object::ObjectError::OutOfMemory)};
-    if (!uart_notification) {
-        return libk::unexpected(RootTaskError::OutOfMemory);
-    }
-    uart_notification_ = libk::move(uart_notification).value().publish();
-
     const kernel::mm::MemoryTypes device = kernel::mm::MemoryTypes::of(
         kernel::mm::MemoryType::Device);
     const kernel::cap::MemoryAuthority uart_memory_authority{
@@ -411,16 +398,10 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
         kernel::cap::Right::Duplicate,
         kernel::cap::Right::Delegate,
         kernel::cap::Right::Route,
+        kernel::cap::Right::Observe,
         kernel::cap::Right::Ack,
         kernel::cap::Right::Inspect,
         kernel::cap::Right::Close,
-        kernel::cap::Right::Revoke);
-    const auto uart_notification_rights = kernel::cap::Rights::of(
-        kernel::cap::Right::Duplicate,
-        kernel::cap::Right::Delegate,
-        kernel::cap::Right::Signal,
-        kernel::cap::Right::Receive,
-        kernel::cap::Right::Inspect,
         kernel::cap::Right::Revoke);
     if (!add_cap(
             MYOS_BOOTSTRAP_CAP_VSPACE, vspace_.ref(), vspace_rights,
@@ -444,21 +425,16 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
             pool_rights,
             pool_authority)
         || !add_cap(
-            MYOS_BOOTSTRAP_CAP_UART_MEMORY,
+            MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY,
             uart_memory_.ref(),
             uart_memory_rights,
             uart_memory_authority)
         || !add_cap(
-            MYOS_BOOTSTRAP_CAP_UART_IRQ,
+            MYOS_BOOTSTRAP_CAP_IRQ,
             uart_irq_.ref(),
             uart_irq_rights,
             kernel::cap::IrqAuthority{
-                arch::riscv64::virt_uart_irq, true})
-        || !add_cap(
-            MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION,
-            uart_notification_.ref(),
-            uart_notification_rights,
-            kernel::cap::NotificationAuthority{1})) {
+                arch::riscv64::virt_uart_irq, true})) {
         return libk::unexpected(RootTaskError::CapabilityFailed);
     }
 
@@ -708,7 +684,6 @@ void RootTask::rollback(kernel::KernelState& kernel) noexcept {
         KASSERT(cspace_.retire());
         cspace_.reset();
     }
-    uart_notification_.reset();
     uart_irq_.reset();
     uart_memory_.reset();
     if (vspace_) {

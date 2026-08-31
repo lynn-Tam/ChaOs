@@ -73,7 +73,7 @@ constexpr Rights pager_rights = Rights::of(
 
 constexpr Rights irq_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect, Right::Route,
-    Right::Ack, Right::Control, Right::Close, Right::Destroy,
+    Right::Observe, Right::Ack, Right::Control, Right::Close, Right::Destroy,
     Right::Revoke);
 
 [[nodiscard]] auto valid(MemoryAuthority authority) noexcept -> bool {

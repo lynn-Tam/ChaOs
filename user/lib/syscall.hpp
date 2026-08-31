@@ -213,8 +213,9 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto irq_ack(
     myos_cap_t irq,
+    myos_word_t generation,
     myos_word_t sequence) noexcept -> SysResult {
-    return syscall(MYOS_SYS_IRQ_ACK, irq, sequence);
+    return syscall(MYOS_SYS_IRQ_ACK, irq, generation, sequence);
 }
 
 [[nodiscard]] inline auto terminal_query(myos_cap_t target) noexcept

@@ -256,7 +256,7 @@ extern "C" [[noreturn]] void myos_main(
                runtime.manifest_workspace,
                runtime.plans,
                runtime.plan,
-               2)) {
+               5)) {
         fail(MYOS_STATUS_INTERNAL);
     }
 

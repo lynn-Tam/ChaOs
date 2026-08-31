@@ -259,6 +259,14 @@ struct SyscallBackend final {
         return ::myos::notification_create(pool.selector, badge);
     }
 
+    [[nodiscard]] static auto notification_take(
+        CapRef notification) noexcept -> SysResult {
+        if (!current(notification)) {
+            return bad_args();
+        }
+        return ::myos::notification_take(notification.selector);
+    }
+
     [[nodiscard]] static auto channel_create(
         CapRef pool,
         myos_word_t queue,

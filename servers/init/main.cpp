@@ -348,17 +348,17 @@ Runtime runtime{};
     const auto root_pool = bootstrap.cap(MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     const auto root_domain = bootstrap.cap(MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN);
     const auto root_bundle = bootstrap.cap(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE);
-    const auto uart_memory = bootstrap.cap(MYOS_BOOTSTRAP_CAP_UART_MEMORY);
+    const auto uart_memory = bootstrap.cap(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
     if (!root_vspace || !root_pool || !root_domain || !root_bundle
         || !uart_memory
         || !runtime.console.open(*root_vspace, *uart_memory)
         || !open_views(*root_vspace, *root_bundle, bootstrap.bundle_size())
-        || !myos::deploy::supervision::decode_plan(
+               || !myos::deploy::supervision::decode_plan(
                runtime.bundle,
                runtime.manifest_workspace,
                runtime.plans,
                runtime.plan,
-               2)) {
+               5)) {
         return false;
     }
 

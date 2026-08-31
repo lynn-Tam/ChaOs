@@ -281,6 +281,17 @@ public:
     ~RegistrationOwner() noexcept = default;
 
 private:
+    template<typename Authorities>
+    [[nodiscard]] auto register_source(
+        Authorities& authorities,
+        cap::CapRef source,
+        uint64_t identity,
+        const myos_cap_attenuation& ceiling) noexcept
+        -> libk::optional<AuthorityId> {
+        return journal_.register_source(
+            authorities, source, identity, ceiling);
+    }
+
     template<typename Authorities, typename Space>
     [[nodiscard]] auto register_source(
         Authorities& authorities,

@@ -1302,13 +1302,14 @@ bool test_irq_sequence_reassert_requires_latest_ack(
     const auto first_notice = notification.take();
     const auto second = irq.observe();
     if (!first || !second || !first_notice
-        || irq.ack(first.value().sequence)) {
+        || irq.ack(
+            first.value().generation, first.value().sequence)) {
         return false;
     }
-    return irq.ack(second.value().sequence)
+    return irq.ack(second.value().generation, second.value().sequence)
         && notification.take()
         && irq.unbind()
-        && irq.state() == kernel::irq::State::MaskedUnbound;
+        && irq.state() == kernel::irq::State::UnboundIdle;
 }
 
 bool test_terminal_observation_is_read_only_projection(

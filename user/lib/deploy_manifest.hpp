@@ -1432,6 +1432,8 @@ private:
             uint64_t object_first{};
             uint64_t object_count_value{};
             uint64_t execution_count_value{};
+            uint64_t import_first{};
+            uint64_t import_count_value{};
             if (!value(MYOS_DEPLOY_TABLE_TASK, task,
                        MYOS_DEPLOY_TASK_OBJECT_FIRST, 4, object_first)
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
@@ -1461,11 +1463,134 @@ private:
                 }
             }
 
-            /* A task-level terminal observer is shared by every execution;
-             * Endpoint descriptors are defined only for a single execution
-             * task.  These are relations over validated ranges, not table-row
-             * ordering rules, so execution(0) is safe only after this check. */
-            if ((execution_count_value != 0 && notifications != 1)
+            /* The terminal relation is the sole Notification not named by a
+             * service/readiness bootstrap import.  Resolve those role
+             * sources from the manifest graph here so construction does not
+             * depend on object-row order or badge values. */
+            uint64_t bootstrap_first{};
+            uint64_t bootstrap_count_value{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4,
+                       bootstrap_first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4,
+                          bootstrap_count_value)) {
+                return fail(Error::InvalidReference);
+            }
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task,
+                       MYOS_DEPLOY_TASK_IMPORT_FIRST, 4, import_first)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_IMPORT_COUNT, 4,
+                          import_count_value)) {
+                return fail(Error::InvalidReference);
+            }
+            ByteView service_source{};
+            ByteView readiness_source{};
+            bool service_role = false;
+            bool readiness_role = false;
+            for (uint64_t bootstrap = 0;
+                 bootstrap < bootstrap_count_value; ++bootstrap) {
+                uint64_t kind{};
+                if (!value(MYOS_DEPLOY_TABLE_BOOTSTRAP,
+                           static_cast<uint32_t>(bootstrap_first + bootstrap),
+                           MYOS_DEPLOY_BOOTSTRAP_KIND, 4, kind)) {
+                    return fail(Error::InvalidReference);
+                }
+                ByteView* source = nullptr;
+                bool* role = nullptr;
+                if (kind == MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION) {
+                    source = &service_source;
+                    role = &service_role;
+                } else if (kind
+                           == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                    source = &readiness_source;
+                    role = &readiness_role;
+                }
+                if (source == nullptr) {
+                    continue;
+                }
+                if (*role) {
+                    return fail(Error::DuplicateKey);
+                }
+                *role = true;
+                ByteView destination{};
+                if (!read_key(
+                        MYOS_DEPLOY_TABLE_BOOTSTRAP,
+                        static_cast<uint32_t>(bootstrap_first + bootstrap),
+                        MYOS_DEPLOY_BOOTSTRAP_DESTINATION,
+                        destination, true)) {
+                    return fail(Error::InvalidReference);
+                }
+                uint32_t matches = 0;
+                for (uint64_t imported = 0;
+                     imported < import_count_value; ++imported) {
+                    const uint32_t import_index = static_cast<uint32_t>(
+                        import_first + imported);
+                    ByteView imported_destination{};
+                    if (!read_key(MYOS_DEPLOY_TABLE_IMPORT, import_index,
+                                  MYOS_DEPLOY_IMPORT_DESTINATION,
+                                  imported_destination, true)
+                        || !imported_destination.equals(destination)) {
+                        continue;
+                    }
+                    uint64_t source_class{};
+                    if (!value(MYOS_DEPLOY_TABLE_IMPORT, import_index,
+                               MYOS_DEPLOY_IMPORT_SOURCE_CLASS, 2,
+                               source_class)
+                        || source_class
+                            != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY
+                        || !read_key(MYOS_DEPLOY_TABLE_IMPORT, import_index,
+                                     MYOS_DEPLOY_IMPORT_SOURCE, *source,
+                                     true)) {
+                        return fail(Error::InvalidReference);
+                    }
+                    ++matches;
+                }
+                if (matches != 1) {
+                    return fail(Error::InvalidReference);
+                }
+            }
+            if (service_role && readiness_role
+                && service_source.equals(readiness_source)) {
+                return fail(Error::DuplicateKey);
+            }
+            uint32_t terminal_candidates = 0;
+            uint32_t service_matches = 0;
+            uint32_t readiness_matches = 0;
+            for (uint64_t local = 0; local < object_count_value; ++local) {
+                const uint32_t index = static_cast<uint32_t>(object_first + local);
+                uint64_t kind{};
+                if (!value(MYOS_DEPLOY_TABLE_OBJECT, index,
+                           MYOS_DEPLOY_OBJECT_KIND, 2, kind)) {
+                    return fail(Error::InvalidReference);
+                }
+                if (kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+                    continue;
+                }
+                ByteView output{};
+                if (!read_key(MYOS_DEPLOY_TABLE_OBJECT, index,
+                              MYOS_DEPLOY_OBJECT_OUTPUT_A, output, true)) {
+                    return fail(Error::InvalidReference);
+                }
+                const bool is_service = service_role
+                    && output.equals(service_source);
+                const bool is_readiness = readiness_role
+                    && output.equals(readiness_source);
+                if (is_service) {
+                    ++service_matches;
+                }
+                if (is_readiness) {
+                    ++readiness_matches;
+                }
+                if (!is_service && !is_readiness) {
+                    ++terminal_candidates;
+                }
+            }
+            if ((execution_count_value != 0
+                 && (notifications == 0 || terminal_candidates != 1))
+                || (notifications > 1 && !service_role && !readiness_role)
+                || (service_role && service_matches != 1)
+                || (readiness_role && readiness_matches != 1)
                 || (endpoints != 0 && execution_count_value != 1)) {
                 return fail(Error::InvalidRecord);
             }
@@ -1533,6 +1658,7 @@ private:
             uint64_t count{};
             uint64_t import_first{};
             uint64_t import_count_value{};
+            uint64_t readiness{};
             if (!value(MYOS_DEPLOY_TABLE_TASK, task,
                        MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4, first)
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
@@ -1541,9 +1667,12 @@ private:
                           MYOS_DEPLOY_TASK_IMPORT_FIRST, 4, import_first)
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
                           MYOS_DEPLOY_TASK_IMPORT_COUNT, 4,
-                          import_count_value)) {
+                          import_count_value)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_READINESS, 2, readiness)) {
                 return fail(Error::InvalidReference);
             }
+            uint32_t readiness_roles = 0;
             for (uint64_t local = 0; local < count; ++local) {
                 const uint32_t row = static_cast<uint32_t>(first + local);
                 uint64_t kind{};
@@ -1557,13 +1686,16 @@ private:
                              MYOS_DEPLOY_BOOTSTRAP_RESERVED,
                              MYOS_DEPLOY_BOOTSTRAP_DESTINATION)
                     || kind < MYOS_BOOTSTRAP_CAP_VSPACE
-                    || kind > MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION
+                    || kind > MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION
                     || myos_bootstrap_object_kind(static_cast<uint32_t>(kind))
                         == MYOS_OBJECT_KIND_INVALID) {
                     return fail(Error::InvalidRecord);
                 }
                 const myos_object_kind_t expected_kind =
                     myos_bootstrap_object_kind(static_cast<uint32_t>(kind));
+                if (kind == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                    ++readiness_roles;
+                }
                 for (uint64_t previous = 0; previous < local; ++previous) {
                     uint64_t previous_kind{};
                     if (!value(MYOS_DEPLOY_TABLE_BOOTSTRAP,
@@ -1597,6 +1729,40 @@ private:
                             || !valid_kind(imported_kind)) {
                             return fail(Error::InvalidReference);
                         }
+                        if (expected_kind
+                                == MYOS_OBJECT_KIND_NOTIFICATION) {
+                            uint64_t source_class{};
+                            uint64_t mode{};
+                            uint64_t rights{};
+                            if (!value(
+                                    MYOS_DEPLOY_TABLE_IMPORT,
+                                    static_cast<uint32_t>(
+                                        import_first + imported),
+                                    MYOS_DEPLOY_IMPORT_SOURCE_CLASS,
+                                    2, source_class)
+                                || !value(
+                                    MYOS_DEPLOY_TABLE_IMPORT,
+                                    static_cast<uint32_t>(
+                                        import_first + imported),
+                                    MYOS_DEPLOY_IMPORT_MODE, 2, mode)
+                                || !value(
+                                    MYOS_DEPLOY_TABLE_IMPORT,
+                                    static_cast<uint32_t>(
+                                        import_first + imported),
+                                    MYOS_DEPLOY_IMPORT_ATTENUATION
+                                        + MYOS_DEPLOY_ATTENUATION_RIGHTS,
+                                    8, rights)) {
+                                return fail(Error::InvalidReference);
+                            }
+                            if (kind
+                                    == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION
+                                && (source_class
+                                        != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY
+                                    || mode != MYOS_DEPLOY_IMPORT_DUPLICATE
+                                    || rights != MYOS_RIGHT_SIGNAL)) {
+                                return fail(Error::InvalidReference);
+                            }
+                        }
                         ++matches;
                         matched_kind = static_cast<myos_object_kind_t>(
                             imported_kind);
@@ -1605,6 +1771,10 @@ private:
                 if (matches != 1 || matched_kind != expected_kind) {
                     return fail(Error::InvalidReference);
                 }
+            }
+            if ((readiness == MYOS_DEPLOY_READINESS_EXPLICIT)
+                    != (readiness_roles == 1)) {
+                return fail(Error::InvalidReference);
             }
         }
         return true;

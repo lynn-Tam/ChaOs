@@ -1973,15 +1973,13 @@ public:
           bundle_{bootstrap.selector(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE), 0},
           parent_pool_{parent_pool, 0},
           bundle_size_{bootstrap.bundle_size()},
-          uart_memory_{bootstrap.selector(MYOS_BOOTSTRAP_CAP_UART_MEMORY), 0},
-          uart_irq_{bootstrap.selector(MYOS_BOOTSTRAP_CAP_UART_IRQ), 0},
-          uart_notification_{bootstrap.selector(
-              MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION), 0} {}
+          uart_memory_{bootstrap.selector(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0},
+          uart_irq_{bootstrap.selector(MYOS_BOOTSTRAP_CAP_IRQ), 0} {}
 
     [[nodiscard]] auto run() noexcept -> bool {
         stage_ = 1;
         if (!root_vspace_ || !domain_ || !bundle_ || !parent_pool_
-            || !uart_memory_ || !uart_irq_ || !uart_notification_
+            || !uart_memory_ || !uart_irq_
             || bundle_size_ == 0) {
             return false;
         }
@@ -2031,6 +2029,42 @@ public:
                 MYOS_RESOURCE_E7_KINDS, 64, 8) != MYOS_STATUS_OK) {
             return false;
         }
+        /* The UART service relation is owned by this fixture's child pool.
+         * The worker receives only the attenuated view delegated below; no
+         * root bootstrap notification is involved. */
+        const auto child_pool = task_.pool();
+        if (!child_pool.has_value()) {
+            return false;
+        }
+        const auto created = myos::notification_create(
+            child_pool->selector, NotificationBadge);
+        if (created.status != MYOS_STATUS_OK || created.value == 0) {
+            return false;
+        }
+        myos::cap::OwnedCap notification_owner{myos::cap::CapRef{
+            static_cast<myos_cap_t>(created.value), 0}};
+        if (!task_.adopt_local(
+                libk::move(notification_owner),
+                MYOS_OBJECT_KIND_NOTIFICATION).has_value()) {
+            return false;
+        }
+        uart_notification_ = myos::cap::CapRef{
+            static_cast<myos_cap_t>(created.value), 0};
+        const auto readiness_created = myos::notification_create(
+            child_pool->selector, NotificationBadge);
+        if (readiness_created.status != MYOS_STATUS_OK
+            || readiness_created.value == 0) {
+            return false;
+        }
+        myos::cap::OwnedCap readiness_owner{myos::cap::CapRef{
+            static_cast<myos_cap_t>(readiness_created.value), 0}};
+        if (!task_.adopt_local(
+                libk::move(readiness_owner),
+                MYOS_OBJECT_KIND_NOTIFICATION).has_value()) {
+            return false;
+        }
+        uart_readiness_ = myos::cap::CapRef{
+            static_cast<myos_cap_t>(readiness_created.value), 0};
 
         stage_ = 3;
         Materializer materializer{task_, bundle_view_, scratch_};
@@ -2138,22 +2172,24 @@ private:
         myos_cap_t memory_cap{};
         myos_cap_t irq_cap{};
         myos_cap_t notification_cap{};
+        myos_cap_t readiness_cap{};
         if (!delegate_remote(
                 child_vspace.value(),
-                MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP
-                    | MYOS_RIGHT_UNMAP | MYOS_RIGHT_INSPECT,
+                MYOS_RIGHT_CREATE_REGION,
                 vspace_cap)
             || !delegate_remote(
-                uart_memory_, MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT,
+                uart_memory_, MYOS_RIGHT_MAP,
                 memory_cap)
             || !delegate_remote(
-                uart_irq_, MYOS_RIGHT_ROUTE | MYOS_RIGHT_ACK
-                    | MYOS_RIGHT_INSPECT,
+                uart_irq_, MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE
+                    | MYOS_RIGHT_ACK,
                 irq_cap)
             || !delegate_remote(
-                uart_notification_, MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE
-                    | MYOS_RIGHT_INSPECT,
-                notification_cap)) {
+                uart_notification_, MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE,
+                notification_cap)
+            || !delegate_remote(
+                uart_readiness_, MYOS_RIGHT_SIGNAL,
+                readiness_cap)) {
             return false;
         }
 
@@ -2162,7 +2198,7 @@ private:
         info.major = MYOS_BOOTSTRAP_MAJOR;
         info.minor = MYOS_BOOTSTRAP_MINOR;
         info.size = sizeof(info);
-        info.cap_count = 4;
+        info.cap_count = 5;
         info.cpu_count = 1;
         info.stack_base = UartStackAddress;
         info.stack_size = StackSize;
@@ -2173,19 +2209,24 @@ private:
             .handle = vspace_cap,
         };
         info.caps[1] = myos_bootstrap_cap{
-            .kind = MYOS_BOOTSTRAP_CAP_UART_MEMORY,
+            .kind = MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY,
             .flags = 0,
             .handle = memory_cap,
         };
         info.caps[2] = myos_bootstrap_cap{
-            .kind = MYOS_BOOTSTRAP_CAP_UART_IRQ,
+            .kind = MYOS_BOOTSTRAP_CAP_IRQ,
             .flags = 0,
             .handle = irq_cap,
         };
         info.caps[3] = myos_bootstrap_cap{
-            .kind = MYOS_BOOTSTRAP_CAP_UART_NOTIFICATION,
+            .kind = MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION,
             .flags = 0,
             .handle = notification_cap,
+        };
+        info.caps[4] = myos_bootstrap_cap{
+            .kind = MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
+            .flags = 0,
+            .handle = readiness_cap,
         };
         return materializer.materialize_readonly(
                    UartInfoAddress, &info, sizeof(info), info_mapping_)
@@ -2301,6 +2342,7 @@ private:
     myos::cap::CapRef uart_memory_{};
     myos::cap::CapRef uart_irq_{};
     myos::cap::CapRef uart_notification_{};
+    myos::cap::CapRef uart_readiness_{};
     Task task_{};
     Bundle bundle_view_{};
     Scratch scratch_{};

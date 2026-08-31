@@ -92,20 +92,10 @@ template<typename Table, typename Receiver>
     myos_status_t& terminal_status) noexcept -> bool {
     terminal_status = MYOS_STATUS_INTERNAL;
     for (;;) {
-        const auto* record = table.record(id);
-        if (record == nullptr) {
-            return false;
-        }
-        /* The current production envelope is one execution with one terminal
-         * notification relation.  TaskRecord::observe_terminal independently
-         * enforces the one-execution rule; this check protects the borrowed
-         * relation projection before using it as the wake source. */
-        const auto& relation = record->projections().relations[0];
-        if (!relation.valid()) {
-            return false;
-        }
-        const auto notification = record->resolve(
-            relation, MYOS_OBJECT_KIND_NOTIFICATION);
+        /* TaskTable owns the terminal relation selector.  The checked narrow
+         * operation keeps supervision from recovering readiness or export
+         * selectors through a public TaskRecord view. */
+        const auto notification = table.terminal_notification(id);
         if (!notification) {
             return false;
         }

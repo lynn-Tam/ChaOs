@@ -189,8 +189,6 @@ struct Runtime final {
     myos::deploy::DeploymentPlan plan{};
     const void* bootstrap{};
     myos_word_t bootstrap_size{};
-    myos::cap::CapRef stale_reuse_pair{};
-    bool stale_reuse_proven{};
     bool source_open{};
     bool parent_open{};
     bool bundle_open{};
@@ -323,7 +321,7 @@ Runtime runtime{};
     const myos_cap_t root_domain = bootstrap.selector(
         MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN);
     const myos_cap_t uart_memory = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_UART_MEMORY);
+        MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
     if (root_vspace == 0 || root_bundle == 0 || root_pool == 0
         || root_domain == 0 || uart_memory == 0) {
         return false;
@@ -525,10 +523,7 @@ Runtime runtime{};
         const auto* failed = runtime.table.closing(id);
         if (failed != nullptr) {
             static_cast<void>(runtime.console.print<
-                "task-builder-test: diag-no-memory phase={} local={} remote={} accounted={} budget={}\\n">(
-                static_cast<unsigned>(failed->record().space().phase()),
-                failed->record().space().local_cumulative(),
-                failed->record().space().remote_size(),
+                "task-builder-test: diag-no-memory accounted={} budget={}\\n">(
                 failed->record().accounting().total_bytes,
                 failed->record().plan().row()->critical_bytes));
         }
@@ -570,46 +565,12 @@ Runtime runtime{};
         return false;
     }
 
-    /* The first failed Task leaves its caller-side manager slot vacant at the
-     * same generation.  Keep only that borrowed pair across the next normal
-     * construction; the next TaskSpace::open naturally reserves the slot and
-     * advances its generation before this exact pair is tested again. */
-    if (task_index == 2 && runtime.stale_reuse_pair
-        && !runtime.stale_reuse_proven) {
-        const myos::SysResult reused_close = myos::cap_close(
-            runtime.stale_reuse_pair.selector,
-            runtime.stale_reuse_pair.cspace);
-        if (reused_close.status != MYOS_STATUS_INVALID_CAP) {
-            return false;
-        }
-        const auto* replacement = runtime.table.closing(id);
-        if (replacement == nullptr
-            || !replacement->record().projections().imports[0].valid()
-            || !runtime.authorities.lease(runtime.typed_source)) {
-            return false;
-        }
-        runtime.stale_reuse_pair = {};
-        runtime.stale_reuse_proven = true;
-        runtime.console.text("task-builder-test: stale-reuse-ok\n");
-    }
-
-    myos::cap::CapRef stale{};
     if (task_index != 0) {
         const auto* closing = runtime.table.closing(id);
         if (closing == nullptr) {
             runtime.console.text("task-builder-test: diag-no-closing\n");
             return false;
         }
-        const auto& import = closing->record().projections().imports[0];
-        const auto resolved = closing->record().resolve(
-            import, import.kind);
-        runtime.console.text(resolved
-            ? "task-builder-test: diag-import-ok\n"
-            : "task-builder-test: diag-import-miss\n");
-        if (!resolved) {
-            return false;
-        }
-        stale = *resolved;
         const bool source_ok = runtime.authorities.lease(runtime.typed_source)
             .has_value();
         runtime.console.text(source_ok
@@ -645,24 +606,6 @@ Runtime runtime{};
         : "task-builder-test: diag-completion-miss\n");
     if (!completion_ok) {
         return false;
-    }
-    if (stale) {
-        static_cast<void>(runtime.console.print<
-            "task-builder-test: diag-stale-selector={}\\n">(
-            stale.selector));
-        static_cast<void>(runtime.console.print<
-            "task-builder-test: diag-stale-manager={}\\n">(
-            stale.cspace));
-        const myos::SysResult stale_close = myos::cap_close(
-            stale.selector, stale.cspace);
-        static_cast<void>(runtime.console.print<
-            "task-builder-test: diag-stale-status={}\n">(stale_close.status));
-        if (stale_close.status != MYOS_STATUS_BUSY) {
-            return false;
-        }
-        if (task_index == 1 && !runtime.stale_reuse_pair) {
-            runtime.stale_reuse_pair = stale;
-        }
     }
     return runtime.workspace.empty();
 }

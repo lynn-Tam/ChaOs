@@ -109,6 +109,8 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
         bytes, 0, MYOS_DEPLOY_DEPENDENCY_STRIDE);
     tables[MYOS_DEPLOY_TABLE_EXPORT] = append_table(
         bytes, export_count, MYOS_DEPLOY_EXPORT_STRIDE);
+    tables[MYOS_DEPLOY_TABLE_BOOTSTRAP] = Table{
+        0, 0, MYOS_DEPLOY_BOOTSTRAP_STRIDE};
 
     std::uint32_t image_cursor{};
     std::uint32_t mapping_cursor{};

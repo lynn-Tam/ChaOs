@@ -353,6 +353,14 @@ proof_user = executable(
   'proof.elf', files('programs/proof/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'proof.map')], link_language: 'c', build_by_default: false,
 )
+consumer_user = executable(
+  'consumer.elf', files('programs/consumer/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'consumer.map')], link_language: 'c', build_by_default: false,
+)
+pager_user = executable(
+  'pager.elf', files('servers/pager/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'pager.map')], link_language: 'c', build_by_default: false,
+)
  # The supervised-failure workload is test-owned, but it enters the same
  # production packer and ordinary init/process_server lifecycle as proof.elf.
 supervised_failure_user = executable(
@@ -446,16 +454,16 @@ deploy_fixture = custom_target(
   command: [deploypack, '@OUTPUT@'], build_by_default: false,
 )
 production_manifest = custom_target(
-  'production-manifest', input: [process_server_user, proof_user],
+  'production-manifest', input: [process_server_user, proof_user, consumer_user, pager_user, uart_user],
   output: 'deployment.manifest',
-  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@'],
+  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@'],
   build_by_default: false,
 )
 supervised_failure_manifest = custom_target(
   'supervised-failure-manifest',
-  input: [process_server_user, supervised_failure_user],
+  input: [process_server_user, supervised_failure_user, consumer_user, pager_user, uart_user],
   output: 'supervised-failure.manifest',
-  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@'],
+  command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@'],
   build_by_default: false,
 )
 run_target('test-deploy-manifest',
@@ -471,16 +479,16 @@ run_target('test-image-materializer', command: [image_materializer_test])
 run_target('test-task-transaction', command: [task_transaction_test])
 run_target('test-task-authority', command: [task_authority_test])
 boot_bundle = custom_target(
-  'boot-bundle', input: [init_user, process_server_user, proof_user, production_manifest], output: 'boot.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'process_server=@INPUT1@', 'proof=@INPUT2@', 'data:manifest=@INPUT3@'], build_by_default: false,
+  'boot-bundle', input: [init_user, process_server_user, proof_user, consumer_user, pager_user, uart_user, production_manifest], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'process_server=@INPUT1@', 'proof=@INPUT2@', 'consumer=@INPUT3@', 'pager=@INPUT4@', 'uart=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
 )
 supervised_failure_bundle = custom_target(
   'supervised-failure-bundle',
-  input: [init_user, process_server_user, supervised_failure_user, supervised_failure_manifest],
+  input: [init_user, process_server_user, supervised_failure_user, consumer_user, pager_user, uart_user, supervised_failure_manifest],
   output: 'supervised-failure.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@',
-    'process_server=@INPUT1@', 'proof=@INPUT2@',
-    'data:manifest=@INPUT3@'],
+    'process_server=@INPUT1@', 'proof=@INPUT2@', 'consumer=@INPUT3@',
+    'pager=@INPUT4@', 'uart=@INPUT5@', 'data:manifest=@INPUT6@'],
   build_by_default: false,
 )
 # /*luna change: encode pressure mode in the existing root module role, reason: the same user images and kernel composition need an explicit guest-visible run condition*/
@@ -524,7 +532,7 @@ run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
 run_target('audit-pressure-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure])
 run_target('audit-pressure-trace-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure_trace])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, process_server_user, proof_user, uart_user])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, process_server_user, proof_user, consumer_user, pager_user, uart_user])
 run_target('audit-e7-user', command: [sh, audit_user, nm, readelf, e7_init_user, e7_proof_user])
 run_target('audit-task-transaction', command: [sh, audit_task_transaction, join_paths(root, 'user/lib/task_transaction.hpp')])
 run_target('audit-task-authority', command: [sh, audit_task_authority,

@@ -40,10 +40,10 @@ private:
 };
 
 enum class State : u8 {
-    MaskedUnbound,
-    MaskedBound,
-    Armed,
-    Pending,
+    UnboundIdle,
+    UnboundPending,
+    BoundIdle,
+    BoundPending,
     Closing,
     Closed,
 };
@@ -85,7 +85,7 @@ public:
     [[nodiscard]] auto delivery() const noexcept
         -> libk::Expected<Delivery, Error>;
     [[nodiscard]] auto observe() noexcept -> libk::Expected<Delivery, Error>;
-    [[nodiscard]] auto ack(u64 sequence) noexcept
+    [[nodiscard]] auto ack(u64 generation, u64 sequence) noexcept
         -> libk::Expected<void, Error>;
     // Platform trap path: dispatches one normalized hardware source into the
     // single Irq object registered for it.  The registry is fixed-capacity.
@@ -94,6 +94,17 @@ public:
     void retire(object::ObjectCleanup&& cleanup) noexcept;
 
 private:
+    friend void initialize_platform() noexcept;
+
+    /* The registry lock is held by callers of both helpers.  Keeping the
+     * observe/close pair in this lock-coupled form lets the trap path retire
+     * a sequence-exhausted source without reopening the raw-pointer lifetime
+     * gap. */
+    [[nodiscard]] auto observe_locked() noexcept
+        -> libk::Expected<Delivery, Error>;
+    [[nodiscard]] auto close_locked(
+        ipc::Notification*& notification) noexcept -> bool;
+    void finish_close(ipc::Notification* notification) noexcept;
     void notification_closed() noexcept;
 
     SourceToken source_{};
@@ -101,8 +112,8 @@ private:
         lock_{};
     ipc::NotificationSource source_link_;
     ipc::Notification* notification_{};
-    State state_{State::MaskedUnbound};
-    u64 generation_{1};
+    State state_{State::UnboundIdle};
+    u64 generation_{};
     u64 sequence_{};
     bool observed_since_ack_{};
     object::ObjectCleanup cleanup_{};

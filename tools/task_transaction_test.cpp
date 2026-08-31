@@ -29,6 +29,7 @@ struct FakeBackend final {
     static inline myos_status_t terminal_status{MYOS_STATUS_OK};
     static inline bool terminal_visible{};
     static inline bool publish_terminal_on_start{};
+    static inline myos_word_t notification_value{};
     static inline myos_cap_t next_cap{100};
 
     static void reset() noexcept {
@@ -42,6 +43,7 @@ struct FakeBackend final {
         terminal_status = MYOS_STATUS_OK;
         terminal_visible = false;
         publish_terminal_on_start = false;
+        notification_value = 0;
         next_cap = 100;
     }
 
@@ -220,6 +222,11 @@ struct FakeBackend final {
         return {MYOS_STATUS_OK, next_cap++, 0};
     }
 
+    [[nodiscard]] static auto notification_take(
+        myos::cap::CapRef) noexcept -> myos::SysResult {
+        return {MYOS_STATUS_OK, notification_value, 0};
+    }
+
     [[nodiscard]] static auto channel_create(
         myos::cap::CapRef,
         myos_word_t,
@@ -380,6 +387,282 @@ struct Fixture final {
     myos::deploy::PlanSet<1> plans{};
     myos::deploy::DeploymentPlan plan{};
 };
+
+struct ExplicitFixture final {
+    uint8_t raw[4096]{};
+    size_t size{};
+    myos::deploy::ManifestWorkspace workspace{};
+    myos::deploy::PlanSet<1> plans{};
+    myos::deploy::DeploymentPlan plan{};
+};
+
+struct TableShape final {
+    size_t offset{};
+    uint32_t count{};
+    uint32_t stride{};
+};
+
+[[nodiscard]] auto read_manifest_field(
+    const uint8_t* bytes,
+    size_t offset,
+    size_t width) noexcept -> uint64_t {
+    uint64_t value = 0;
+    for (size_t index = 0; index < width; ++index) {
+        value |= static_cast<uint64_t>(bytes[offset + index])
+            << (index * 8);
+    }
+    return value;
+}
+
+void put_explicit(
+    uint8_t* bytes,
+    size_t offset,
+    uint64_t value,
+    size_t width) noexcept {
+    for (size_t index = 0; index < width; ++index) {
+        bytes[offset + index] = static_cast<uint8_t>(value >> (index * 8));
+    }
+}
+
+void insert_explicit(
+    ExplicitFixture& fixture,
+    size_t offset,
+    size_t count) noexcept {
+    for (size_t index = fixture.size; index > offset; --index) {
+        fixture.raw[index + count - 1] = fixture.raw[index - 1];
+    }
+    for (size_t index = 0; index < count; ++index) {
+        fixture.raw[offset + index] = 0;
+    }
+    fixture.size += count;
+}
+
+/* Keep the explicit-readiness fixture on the same host wire writer as the
+ * canonical golden input.  It adds one child-owned readiness Notification
+ * beside the existing terminal Notification and rewires the single import to
+ * that TaskKey; no production selector or test-only construction path is
+ * introduced. */
+[[nodiscard]] auto make_explicit_plan(ExplicitFixture& fixture) noexcept
+    -> bool {
+    constexpr size_t legacy_header = 208;
+    constexpr size_t table_count = 9;
+    fixture.size = myos::deploy::host::kGoldenSize;
+    for (size_t index = 0; index < fixture.size; ++index) {
+        fixture.raw[index] = myos::deploy::host::kGolden[index];
+    }
+    TableShape old[table_count]{};
+    for (size_t index = 0; index < table_count; ++index) {
+        const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
+            + index * MYOS_DEPLOY_TABLE_DESC_SIZE;
+        old[index] = TableShape{
+            static_cast<size_t>(read_manifest_field(
+                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8)),
+            static_cast<uint32_t>(read_manifest_field(
+                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD, 4)),
+            static_cast<uint32_t>(read_manifest_field(
+                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_STRIDE, 4))};
+    }
+
+    /* Current manifests reserve the tenth descriptor in the 224-byte header;
+     * move the legacy payload before extending the object table. */
+    insert_explicit(fixture, legacy_header, 16);
+    for (auto& table : old) {
+        table.offset += 16;
+    }
+    const size_t extra_object = old[MYOS_DEPLOY_TABLE_OBJECT].offset
+        + old[MYOS_DEPLOY_TABLE_OBJECT].stride;
+    insert_explicit(fixture, extra_object,
+                    old[MYOS_DEPLOY_TABLE_OBJECT].stride);
+
+    TableShape tables[MYOS_DEPLOY_TABLE_COUNT]{};
+    for (size_t index = 0; index < table_count; ++index) {
+        tables[index] = old[index];
+        if (index > MYOS_DEPLOY_TABLE_OBJECT) {
+            tables[index].offset += old[MYOS_DEPLOY_TABLE_OBJECT].stride;
+        }
+    }
+    tables[MYOS_DEPLOY_TABLE_OBJECT].count = 2;
+    const size_t bootstrap_offset = (fixture.size + 7) & ~size_t{7};
+    tables[MYOS_DEPLOY_TABLE_BOOTSTRAP] = TableShape{
+        bootstrap_offset, 1, MYOS_DEPLOY_BOOTSTRAP_STRIDE};
+    while (fixture.size < bootstrap_offset) {
+        fixture.raw[fixture.size++] = 0;
+    }
+    for (size_t index = 0; index < MYOS_DEPLOY_BOOTSTRAP_STRIDE; ++index) {
+        fixture.raw[fixture.size + index] = 0;
+    }
+    fixture.size += MYOS_DEPLOY_BOOTSTRAP_STRIDE;
+
+    constexpr uint64_t notify_key = UINT64_C(0x0000000600000026);
+    constexpr uint64_t authority_key = UINT64_C(0x0000000900000046);
+    constexpr uint64_t import_key = UINT64_C(0x000000060000003a);
+    const size_t task = tables[MYOS_DEPLOY_TABLE_TASK].offset;
+    put_explicit(
+        fixture.raw,
+        task + MYOS_DEPLOY_TASK_OBJECT_COUNT,
+        2,
+        4);
+    put_explicit(
+        fixture.raw,
+        task + MYOS_DEPLOY_TASK_READINESS,
+        MYOS_DEPLOY_READINESS_EXPLICIT,
+        2);
+    put_explicit(
+        fixture.raw,
+        task + MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST,
+        0,
+        4);
+    put_explicit(
+        fixture.raw,
+        task + MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT,
+        1,
+        4);
+
+    const size_t terminal = tables[MYOS_DEPLOY_TABLE_OBJECT].offset
+        + MYOS_DEPLOY_OBJECT_STRIDE;
+    put_explicit(
+        fixture.raw,
+        terminal + MYOS_DEPLOY_OBJECT_OUTPUT_A,
+        authority_key,
+        8);
+    put_explicit(
+        fixture.raw,
+        terminal + MYOS_DEPLOY_OBJECT_KIND,
+        MYOS_OBJECT_KIND_NOTIFICATION,
+        2);
+    put_explicit(
+        fixture.raw,
+        terminal + MYOS_DEPLOY_OBJECT_ARG0,
+        2,
+        8);
+    for (size_t field = MYOS_DEPLOY_OBJECT_REF0;
+         field <= MYOS_DEPLOY_OBJECT_REF3;
+         field += sizeof(uint32_t)) {
+        put_explicit(
+            fixture.raw,
+            terminal + field,
+            MYOS_DEPLOY_NO_INDEX,
+            4);
+    }
+
+    const size_t import = tables[MYOS_DEPLOY_TABLE_IMPORT].offset;
+    put_explicit(
+        fixture.raw,
+        import + MYOS_DEPLOY_IMPORT_SOURCE,
+        notify_key,
+        8);
+    put_explicit(
+        fixture.raw,
+        import + MYOS_DEPLOY_IMPORT_DESTINATION,
+        import_key,
+        8);
+    put_explicit(
+        fixture.raw,
+        import + MYOS_DEPLOY_IMPORT_ATTENUATION
+            + MYOS_DEPLOY_ATTENUATION_KIND,
+        MYOS_OBJECT_KIND_NOTIFICATION,
+        2);
+    put_explicit(
+        fixture.raw,
+        import + MYOS_DEPLOY_IMPORT_ATTENUATION
+            + MYOS_DEPLOY_ATTENUATION_RIGHTS,
+        MYOS_RIGHT_SIGNAL,
+        8);
+    put_explicit(
+        fixture.raw,
+        import + MYOS_DEPLOY_IMPORT_SOURCE_CLASS,
+        MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY,
+        2);
+
+    const size_t bootstrap = tables[MYOS_DEPLOY_TABLE_BOOTSTRAP].offset;
+    put_explicit(
+        fixture.raw,
+        bootstrap + MYOS_DEPLOY_BOOTSTRAP_KIND,
+        MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
+        4);
+    put_explicit(
+        fixture.raw,
+        bootstrap + MYOS_DEPLOY_BOOTSTRAP_DESTINATION,
+        import_key,
+        8);
+
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_MAGIC,
+        MYOS_DEPLOY_MAGIC,
+        8);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_MAJOR,
+        MYOS_DEPLOY_MAJOR,
+        2);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_MINOR,
+        MYOS_DEPLOY_MINOR,
+        2);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_SIZE_FIELD,
+        MYOS_DEPLOY_HEADER_SIZE,
+        4);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_TOTAL_SIZE,
+        fixture.size,
+        8);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_ARCHITECTURE,
+        MYOS_DEPLOY_ARCH_GENERIC,
+        4);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_ABI,
+        MYOS_DEPLOY_ABI_ID,
+        4);
+    put_explicit(
+        fixture.raw,
+        MYOS_DEPLOY_HEADER_TABLE_COUNT,
+        MYOS_DEPLOY_TABLE_COUNT,
+        4);
+    for (size_t index = 0; index < MYOS_DEPLOY_TABLE_COUNT; ++index) {
+        const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
+            + index * MYOS_DEPLOY_TABLE_DESC_SIZE;
+        put_explicit(
+            fixture.raw,
+            descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+            tables[index].count == 0 ? 0 : tables[index].offset,
+            8);
+        put_explicit(
+            fixture.raw,
+            descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD,
+            tables[index].count,
+            4);
+        put_explicit(
+            fixture.raw,
+            descriptor + MYOS_DEPLOY_TABLE_STRIDE,
+            tables[index].stride,
+            4);
+    }
+    auto parsed = myos::deploy::ManifestView::parse(
+        fixture.raw, fixture.size, fixture.workspace);
+    if (!parsed) {
+        return false;
+    }
+    auto decoded = myos::deploy::DeploymentPlan::decode(
+        parsed.value(), fixture.plans);
+    if (!decoded) {
+        return false;
+    }
+    fixture.plan = libk::move(decoded.value());
+    return fixture.plan.task_count() == 1
+        && fixture.plan.object_count() == 2
+        && fixture.plan.bootstrap_count() == 1
+        && fixture.plan.task(0) != nullptr
+        && fixture.plan.task(0)->readiness
+            == MYOS_DEPLOY_READINESS_EXPLICIT;
+}
 
 struct DependencyFixture final {
     uint8_t raw[1400]{};
@@ -1446,6 +1729,170 @@ void put_manifest(
         && result->status == MYOS_STATUS_NO_MEMORY;
 }
 
+[[nodiscard]] auto test_public_readiness_and_terminal_paths() noexcept
+    -> bool {
+    static ExplicitFixture fixture{};
+    if (!make_explicit_plan(fixture)) {
+        return false;
+    }
+    FakeBackend::reset();
+
+    const size_t bundle_size = make_construction_bundle();
+    ConstructionBundle bundle{};
+    ConstructionScratch scratch{};
+    const myos::cap::CapRef root{1, 0};
+    const myos_word_t bundle_address = static_cast<myos_word_t>(
+        reinterpret_cast<uintptr_t>(construction_bundle));
+    const myos_word_t scratch_address = static_cast<myos_word_t>(
+        reinterpret_cast<uintptr_t>(construction_scratch));
+    if (bundle.open(
+            root,
+            myos::cap::CapRef{2, 0},
+            myos::deploy::Window{bundle_address, 8192},
+            bundle_size)
+            != MYOS_STATUS_OK
+        || scratch.open(
+               root,
+               myos::deploy::Window{scratch_address, 16384})
+            != MYOS_STATUS_OK) {
+        return false;
+    }
+
+    ConstructionSpace source_space{};
+    if (source_space.open(root, 16384, 64, 0x100, 16, 2)
+        != MYOS_STATUS_OK) {
+        return false;
+    }
+    const auto domain_slot = source_space.adopt_local(
+        ConstructionSpace::owner_type{myos::cap::CapRef{91, 0}},
+        MYOS_OBJECT_KIND_SCHED_DOMAIN);
+    if (!domain_slot) {
+        return false;
+    }
+    myos::deploy::RegisteredSpace<ConstructionSpace, 2> source{};
+    if (!source.adopt(libk::move(source_space))) {
+        return false;
+    }
+    const myos_cap_attenuation domain_ceiling{
+        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = MYOS_OBJECT_KIND_SCHED_DOMAIN,
+        .size = MYOS_CAP_ATTENUATION_SIZE,
+        .rights = MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL,
+        .words = {},
+    };
+    ConstructionAuthorities authorities{};
+    const auto domain = source.register_source(
+        authorities, *domain_slot, UINT64_C(0x4558504c444f4d41),
+        domain_ceiling);
+    if (!domain) {
+        return false;
+    }
+
+    ConstructionCompletions completions{};
+    ConstructionTable table{};
+    auto lease = fixture.plan.lease();
+    if (!lease) {
+        return false;
+    }
+    auto builder = ConstructionBuilder::begin(
+        completions, table, libk::move(*lease), 0);
+    if (!builder || builder->record() == nullptr) {
+        return false;
+    }
+    const myos::deploy::TaskId id = builder->record()->id();
+    auto receiver = builder->take_receiver();
+    if (!receiver) {
+        return false;
+    }
+    myos::deploy::TaskAuthorityBindings bindings{};
+    bindings.domains[0] = *domain;
+    myos::deploy::TaskConstructionInput<
+        FakeBackend, ConstructionAuthorities> input{
+        .parent_pool = root,
+        .bundle = &bundle,
+        .scratch = &scratch,
+        .bootstrap = nullptr,
+        .bootstrap_size = 0,
+        .runtime_cpu_count = 1,
+        .bindings = &bindings,
+        .workspace = construction_workspace,
+    };
+    if (builder->construct(input, authorities) != MYOS_STATUS_OK
+        || !builder->commit_prepared()) {
+        return false;
+    }
+    const auto stale_export = table.register_prepared_export(
+        myos::deploy::TaskId{id.slot, id.generation + 1}, 0, authorities);
+    const auto wrong_export = table.register_prepared_export(
+        id, 1, authorities);
+    const auto prepared_export = table.register_prepared_export(
+        id, 0, authorities);
+    const auto duplicate_export = table.register_prepared_export(
+        id, 0, authorities);
+    if (stale_export || wrong_export || !prepared_export
+        || !prepared_export->valid() || duplicate_export) {
+        return false;
+    }
+    if (table.terminal_notification(
+            myos::deploy::TaskId{id.slot, id.generation + 1})) {
+        return false;
+    }
+    if (table.terminal_notification(id)) {
+        return false;
+    }
+    if (table.start(id) != MYOS_STATUS_OK
+        || table.record(id) == nullptr
+        || table.record(id)->ready()
+        || table.consume_readiness(id) != MYOS_STATUS_RETRY
+        || table.record(id)->ready()) {
+        return false;
+    }
+    const auto terminal = table.terminal_notification(id);
+    if (!terminal || terminal->cspace != 0) {
+        return false;
+    }
+    FakeBackend::notification_value = 1;
+    if (table.consume_readiness(id) != MYOS_STATUS_OK
+        || table.record(id) == nullptr
+        || !table.record(id)->ready()
+        || table.consume_readiness(id) != MYOS_STATUS_RETRY) {
+        return false;
+    }
+    FakeBackend::terminal_visible = false;
+    const auto empty_terminal = table.observe_terminal(id);
+    if (empty_terminal.status != MYOS_STATUS_OK
+        || empty_terminal.value != 0) {
+        return false;
+    }
+    const bool began_close = table.begin_close(
+        id, myos::deploy::CloseReason::Explicit, MYOS_STATUS_OK);
+    const myos_status_t closing_readiness = table.consume_readiness(id);
+    const auto closing_terminal = table.observe_terminal(id);
+    const auto closing_notification = table.terminal_notification(id);
+    if (!began_close || closing_readiness != MYOS_STATUS_INVALID_CAP
+        || closing_terminal.status != MYOS_STATUS_INVALID_CAP
+        || closing_notification) {
+        return false;
+    }
+    if (table.continue_close(id) != MYOS_STATUS_OK) {
+        return false;
+    }
+    const auto result = receiver->take();
+    if (!result || result->task != id
+        || result->reason != myos::deploy::CloseReason::Explicit
+        || result->status != MYOS_STATUS_OK
+        || table.record(id) != nullptr) {
+        return false;
+    }
+    if (source.close() != MYOS_STATUS_OK
+        || scratch.close() != MYOS_STATUS_OK
+        || bundle.close() != MYOS_STATUS_OK) {
+        return false;
+    }
+    return authorities.active_entries() == 0
+        && construction_workspace.empty();
+}
+
 [[nodiscard]] auto test_task_generation_exhaustion() noexcept -> bool {
     static DependencyFixture fixture{};
     if (!make_dependency_plan(fixture)) {
@@ -1799,6 +2246,7 @@ int main() {
         test_pressure_precedes_table,
         test_resource_failure_moves_to_closing,
         test_partial_open_failure_moves_to_closing,
+        test_public_readiness_and_terminal_paths,
         test_task_generation_exhaustion,
         test_finite_construction_path,
     };

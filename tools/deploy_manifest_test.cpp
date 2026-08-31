@@ -365,8 +365,8 @@ auto accepts_production_shape() -> bool {
     ManifestWorkspace workspace{};
     const auto parsed = ManifestView::parse(
         production_bytes, production_size, workspace);
-    return parsed && parsed.value().task_count() == 2
-        && parsed.value().bootstrap_count() == 10;
+    return parsed && parsed.value().task_count() == 5
+        && parsed.value().bootstrap_count() == 34;
 }
 
 auto accepts_production_authority_budget() -> bool {
@@ -381,10 +381,16 @@ auto accepts_production_authority_budget() -> bool {
     }
     ManifestTaskRow process{};
     ManifestTaskRow proof{};
+    ManifestTaskRow consumer{};
+    ManifestTaskRow pager{};
+    ManifestTaskRow uart{};
     ManifestImportRow process_pool{};
     ManifestImportRow proof_pool{};
     if (!parsed.value().task_row(0, process)
         || !parsed.value().task_row(1, proof)
+        || !parsed.value().task_row(2, consumer)
+        || !parsed.value().task_row(3, pager)
+        || !parsed.value().task_row(4, uart)
         || process.import_count == 0 || proof.import_count == 0
         || !parsed.value().import_row(process.import_first, process_pool)
         || !parsed.value().import_row(proof.import_first, proof_pool)) {
@@ -393,6 +399,14 @@ auto accepts_production_authority_budget() -> bool {
     constexpr uint64_t process_memory =
         UINT64_C(32) * UINT64_C(1024) * UINT64_C(1024)
         + MYOS_DEPLOY_PAGE_SIZE;
+    const auto exact_import_rights = [&](const ManifestTaskRow& task,
+                                         uint32_t local,
+                                         uint64_t rights) {
+        ManifestImportRow row{};
+        return local < task.import_count
+            && parsed.value().import_row(task.import_first + local, row)
+            && row.attenuation.rights == rights;
+    };
     return process.pool_memory == process_memory
         && process.pool_caps == 513
         && process.cspace_slots == 64
@@ -401,8 +415,63 @@ auto accepts_production_authority_budget() -> bool {
         && proof.pool_caps == 256
         && proof.cspace_slots == 64
         && proof.cspace_pages == 4
+        && consumer.pool_memory == UINT64_C(0x32000)
+        && consumer.pool_caps == 5
+        && consumer.critical_bytes == UINT64_C(0x12000)
+        && consumer.cspace_slots == 5
+        && consumer.cspace_pages == 3
+        && consumer.readiness == MYOS_DEPLOY_READINESS_START
+        && consumer.export_count == 1
+        && pager.pool_memory == UINT64_C(0x3a000)
+        && pager.pool_caps == 10
+        && pager.critical_bytes == UINT64_C(0x14000)
+        && pager.cspace_slots == 10
+        && pager.cspace_pages == 4
+        && pager.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
+        && pager.export_count == 0
+        && uart.pool_memory == UINT64_C(0x36000)
+        && uart.pool_caps == 10
+        && uart.critical_bytes == UINT64_C(0x12000)
+        && uart.cspace_slots == 10
+        && uart.cspace_pages == 4
+        && uart.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
+        && uart.export_count == 0
         && process_pool.attenuation.rights == MYOS_RIGHT_SPLIT
-        && (proof_pool.attenuation.rights & MYOS_RIGHT_SPLIT) == 0;
+        && (proof_pool.attenuation.rights & MYOS_RIGHT_SPLIT) == 0
+        /* Consumer only checks the closed role presence. */
+        && exact_import_rights(consumer, 0, 0)
+        && exact_import_rights(consumer, 1, 0)
+        && exact_import_rights(consumer, 2, 0)
+        && exact_import_rights(consumer, 3, 0)
+        && exact_import_rights(consumer, 4, 0)
+        /* Pager roots are presence-only; its service path gets only the
+         * operations exercised by the worker loop. */
+        && exact_import_rights(pager, 0, 0)
+        && exact_import_rights(pager, 1, 0)
+        && exact_import_rights(pager, 2, 0)
+        && exact_import_rights(pager, 3, 0)
+        && exact_import_rights(pager, 4, 0)
+        && exact_import_rights(
+               pager, 5, MYOS_RIGHT_SERVE | MYOS_RIGHT_SUPPLY)
+        && exact_import_rights(pager, 6, MYOS_RIGHT_MANAGE)
+        && exact_import_rights(pager, 7, MYOS_RIGHT_MANAGE)
+        && exact_import_rights(
+               pager, 8, MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE)
+        && exact_import_rights(pager, 9, MYOS_RIGHT_SIGNAL)
+        /* UART needs only region creation, device mapping and the exact IRQ
+         * and wake operations used by its loop. */
+        && exact_import_rights(uart, 0, 0)
+        && exact_import_rights(uart, 1, MYOS_RIGHT_CREATE_REGION)
+        && exact_import_rights(uart, 2, 0)
+        && exact_import_rights(uart, 3, 0)
+        && exact_import_rights(uart, 4, 0)
+        && exact_import_rights(uart, 5, MYOS_RIGHT_MAP)
+        && exact_import_rights(
+               uart, 6, MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE
+                   | MYOS_RIGHT_ACK)
+        && exact_import_rights(
+               uart, 7, MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE)
+        && exact_import_rights(uart, 8, MYOS_RIGHT_SIGNAL);
 }
 
 auto rejects_minor_shape_hybrids() -> bool {
@@ -476,7 +545,7 @@ auto rejects_bootstrap_kind_relabel() -> bool {
 auto accepts_closed_bootstrap_kind_mapping() -> bool {
     return myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE)
             == MYOS_OBJECT_KIND_MEMORY
-        && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_UART_MEMORY)
+        && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY)
             == MYOS_OBJECT_KIND_MEMORY;
 }
 

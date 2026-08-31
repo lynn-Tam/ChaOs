@@ -101,7 +101,7 @@
 #define MYOS_SYS_PAGER_FAIL            134 /* a0=pager, a1=target memory, a4=registered IPC-buffer descriptor offset */
 #define MYOS_SYS_IRQ_BIND              135 /* a0=irq, a1=notification, a2=badge */
 #define MYOS_SYS_IRQ_OBSERVE           136 /* a0=irq */
-#define MYOS_SYS_IRQ_ACK               137 /* a0=irq, a1=sequence */
+#define MYOS_SYS_IRQ_ACK               137 /* a0=irq, a1=generation, a2=sequence */
 #define MYOS_SYS_PAGER_SUPPLY          138 /* a0=pager, a1=target memory, a2=staging memory, a3=page, a4=registered IPC-buffer descriptor offset */
 #define MYOS_SYS_TERMINAL_QUERY        139 /* a0=Thread or Vproc; returns sequence/status */
 #define MYOS_SYS_TERMINAL_OBSERVE_BIND 140 /* a0=Thread or Vproc, a1=Notification, a2=badge */

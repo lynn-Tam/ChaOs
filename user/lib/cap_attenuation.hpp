@@ -4,7 +4,7 @@
  * Userspace admission relation for the public capability attenuation ABI.
  *
  * This is deliberately expressed only in the UAPI descriptor vocabulary.  It
- * is shared by ManifestView and the Unit 3 authority/import path; the kernel
+ * is shared by ManifestView and the authority/import path; the kernel
  * still decodes and checks the actual source authority at every syscall.
  */
 

@@ -100,7 +100,6 @@ private:
     // user UART service through explicit bootstrap caps.
     kernel::object::ObjectStore::MemoryHold uart_memory_{};
     kernel::object::ObjectStore::IrqHold uart_irq_{};
-    kernel::object::ObjectStore::NotificationHold uart_notification_{};
     bool started_{};
 };
 

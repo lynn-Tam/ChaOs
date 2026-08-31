@@ -423,8 +423,13 @@ auto handle_irq(usize operation, Invocation& invocation) noexcept -> Result {
     if (operation == MYOS_SYS_IRQ_BIND) {
         return handle_irq_bind(invocation);
     }
-    const cap::Right right = operation == MYOS_SYS_IRQ_ACK
-        ? cap::Right::Ack : cap::Right::Route;
+    if (operation != MYOS_SYS_IRQ_OBSERVE
+        && operation != MYOS_SYS_IRQ_ACK) {
+        return returned(MYOS_STATUS_BAD_ARGS);
+    }
+    const cap::Right right = operation == MYOS_SYS_IRQ_OBSERVE
+        ? cap::Right::Observe
+        : cap::Right::Ack;
     auto irq = invocation.cspace.resolve<kernel::irq::Irq>(
         handle_of(invocation.trap.arg(0)), cap::Rights::of(right));
     if (!irq) {
@@ -437,7 +442,8 @@ auto handle_irq(usize operation, Invocation& invocation) noexcept -> Result {
                 result.value().generation)
             : returned(irq_error(result.error()));
     }
-    const auto result = irq.value()->ack(invocation.trap.arg(1));
+    const auto result = irq.value()->ack(
+        invocation.trap.arg(1), invocation.trap.arg(2));
     return result ? returned(MYOS_STATUS_OK)
                   : returned(irq_error(result.error()));
 }

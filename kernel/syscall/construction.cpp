@@ -1014,7 +1014,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         [&](kernel::irq::Irq&) {
             const auto rights = cap::Rights::of(
                 cap::Right::Duplicate, cap::Right::Delegate,
-                cap::Right::Inspect, cap::Right::Route, cap::Right::Ack,
+                cap::Right::Inspect, cap::Right::Route, cap::Right::Observe,
+                cap::Right::Ack,
                 cap::Right::Control, cap::Right::Close,
                 cap::Right::Destroy, cap::Right::Revoke);
             const cap::IrqAuthority data{source, level};
