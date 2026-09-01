@@ -97,6 +97,7 @@ struct PlanImage final {
 struct PlanMapping final {
     SymbolId produced{};
     SymbolId pager{};
+    SymbolId region{};
     uint32_t image{MYOS_DEPLOY_NO_INDEX};
     uint32_t segment{MYOS_DEPLOY_NO_INDEX};
     uint16_t source{};
@@ -864,6 +865,7 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         PlanMapping& row = storage_->mappings_[index];
         row.produced = symbol(source.produced);
         row.pager = symbol(source.pager);
+        row.region = symbol(source.region);
         row.image = source.image;
         row.segment = source.segment;
         row.source = source.source;

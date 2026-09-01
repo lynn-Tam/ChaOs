@@ -9,7 +9,7 @@
 
 #define MYOS_BOOTSTRAP_MAGIC UINT64_C(0x4d594f53494e4954)
 #define MYOS_BOOTSTRAP_MAJOR 1U
-#define MYOS_BOOTSTRAP_MINOR 3U
+#define MYOS_BOOTSTRAP_MINOR 4U
 #define MYOS_BOOTSTRAP_MAX_CAPS 16U
 
 enum myos_bootstrap_cap_kind {
@@ -27,6 +27,7 @@ enum myos_bootstrap_cap_kind {
     MYOS_BOOTSTRAP_CAP_TARGET_MEMORY = 12,
     MYOS_BOOTSTRAP_CAP_STAGING_MEMORY = 13,
     MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION = 14,
+    MYOS_BOOTSTRAP_CAP_STAGING_REGION = 15,
 };
 
 #ifdef __cplusplus
@@ -65,6 +66,8 @@ enum myos_bootstrap_cap_kind {
         return MYOS_OBJECT_KIND_MEMORY;
     case MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION:
         return MYOS_OBJECT_KIND_NOTIFICATION;
+    case MYOS_BOOTSTRAP_CAP_STAGING_REGION:
+        return MYOS_OBJECT_KIND_VSPACE;
     default:
         return MYOS_OBJECT_KIND_INVALID;
     }

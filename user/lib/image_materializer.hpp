@@ -729,7 +729,7 @@ private:
         }
         const SysResult created = B::vm_create_region(
             vspace.value(), address, size, access, MYOS_VM_NORMAL,
-            MYOS_RIGHT_MAP);
+            MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
         if (created.value == 0) {
             return created.status == MYOS_STATUS_OK
                 ? MYOS_STATUS_INVALID_CAP : created.status;

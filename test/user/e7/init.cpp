@@ -2175,7 +2175,7 @@ private:
         myos_cap_t readiness_cap{};
         if (!delegate_remote(
                 child_vspace.value(),
-                MYOS_RIGHT_CREATE_REGION,
+                MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP,
                 vspace_cap)
             || !delegate_remote(
                 uart_memory_, MYOS_RIGHT_MAP,

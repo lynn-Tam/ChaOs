@@ -151,7 +151,7 @@ void make_two_task_manifest(
     size_t& size,
     bool optional_second_edge) {
     constexpr size_t shift = MYOS_DEPLOY_TASK_STRIDE;
-    constexpr size_t dependency_offset = 0x500;
+    constexpr size_t dependency_offset = 0x510;
     size = dependency_offset + 2 * MYOS_DEPLOY_DEPENDENCY_STRIDE;
     for (size_t index = 0; index < size; ++index) {
         bytes[index] = 0;
@@ -159,11 +159,11 @@ void make_two_task_manifest(
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    for (size_t index = kGoldenSize; index > 0x170; --index) {
+    for (size_t index = kGoldenSize; index > 0x180; --index) {
         bytes[index - 1 + shift] = kGolden[index - 1];
     }
     for (size_t index = 0; index < MYOS_DEPLOY_TASK_STRIDE; ++index) {
-        bytes[0xd0 + shift + index] = bytes[0xd0 + index];
+        bytes[0xe0 + shift + index] = bytes[0xe0 + index];
     }
     put(bytes, MYOS_DEPLOY_HEADER_TOTAL_SIZE, size, 8);
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
@@ -171,7 +171,7 @@ void make_two_task_manifest(
             + MYOS_DEPLOY_TABLE_COUNT_FIELD,
         2, 4);
     const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
-        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410, 0,
+        0xe0, 0x180, 0x1a0, 0x290, 0x2f0, 0x360, 0, 0x3c0, 0x420, 0,
     };
     for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
          table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
@@ -185,7 +185,7 @@ void make_two_task_manifest(
     put(bytes, dependency_descriptor + MYOS_DEPLOY_TABLE_OFFSET,
         dependency_offset, 8);
     put(bytes, dependency_descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD, 2, 4);
-    const size_t first_task = 0xd0;
+    const size_t first_task = 0xe0;
     const size_t second_task = first_task + MYOS_DEPLOY_TASK_STRIDE;
     put(bytes, first_task + MYOS_DEPLOY_TASK_DEPENDENCY_COUNT, 1, 4);
     const uint32_t first_fields[7] = {
@@ -230,8 +230,8 @@ void make_two_task_manifest(
 
 void make_two_execution_manifest(uint8_t* bytes, size_t& size) {
     constexpr size_t shift = MYOS_DEPLOY_EXECUTION_STRIDE;
-    constexpr size_t execution_tail = 0x350;
-    constexpr size_t string_offset = 0x480;
+    constexpr size_t execution_tail = 0x360;
+    constexpr size_t string_offset = 0x490;
     size = string_offset + 79;
     for (size_t index = 0; index < size; ++index) {
         bytes[index] = 0;
@@ -243,26 +243,26 @@ void make_two_execution_manifest(uint8_t* bytes, size_t& size) {
         bytes[index] = kGolden[index];
     }
     for (size_t index = 0; index < MYOS_DEPLOY_EXECUTION_STRIDE; ++index) {
-        bytes[execution_tail + index] = bytes[0x2e0 + index];
+        bytes[execution_tail + index] = bytes[0x2f0 + index];
     }
     put(bytes, MYOS_DEPLOY_HEADER_TOTAL_SIZE, size, 8);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_EXECUTION_COUNT, 2, 4);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_EXECUTION_COUNT, 2, 4);
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
             + MYOS_DEPLOY_TABLE_EXECUTION * MYOS_DEPLOY_TABLE_DESC_SIZE
             + MYOS_DEPLOY_TABLE_COUNT_FIELD,
         2, 4);
-    put(bytes, 0x350 + MYOS_DEPLOY_EXECUTION_KEY,
+    put(bytes, 0x360 + MYOS_DEPLOY_EXECUTION_KEY,
         UINT64_C(0x0000000600000040), 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_EXECUTION_SC,
+    put(bytes, 0x360 + MYOS_DEPLOY_EXECUTION_SC,
         UINT64_C(0x0000000900000046), 8);
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
             + MYOS_DEPLOY_TABLE_IMPORT * MYOS_DEPLOY_TABLE_DESC_SIZE
             + MYOS_DEPLOY_TABLE_OFFSET,
-        0x3c0, 8);
+        0x3d0, 8);
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
             + MYOS_DEPLOY_TABLE_EXPORT * MYOS_DEPLOY_TABLE_DESC_SIZE
             + MYOS_DEPLOY_TABLE_OFFSET,
-        0x420, 8);
+        0x430, 8);
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
             + MYOS_DEPLOY_TABLE_STRING * MYOS_DEPLOY_TABLE_DESC_SIZE
             + MYOS_DEPLOY_TABLE_OFFSET,
@@ -276,8 +276,8 @@ void make_two_object_manifest(
     uint16_t flags,
     const char* name,
     size_t name_size) {
-    constexpr size_t object_offset = 0x470;
-    constexpr size_t string_offset = 0x410;
+    constexpr size_t object_offset = 0x480;
+    constexpr size_t string_offset = 0x420;
     constexpr size_t string_count = 79;
     constexpr size_t object_name_offset = string_count;
     size = object_offset + 2 * MYOS_DEPLOY_OBJECT_STRIDE;
@@ -290,7 +290,7 @@ void make_two_object_manifest(
     for (size_t row = 0; row < 2; ++row) {
         for (size_t index = 0; index < MYOS_DEPLOY_OBJECT_STRIDE; ++index) {
             bytes[object_offset + row * MYOS_DEPLOY_OBJECT_STRIDE + index] =
-                kGolden[0x280 + index];
+                kGolden[0x290 + index];
         }
     }
     for (size_t index = 0; index < name_size; ++index) {
@@ -298,7 +298,7 @@ void make_two_object_manifest(
             static_cast<uint8_t>(name[index]);
     }
     put(bytes, MYOS_DEPLOY_HEADER_TOTAL_SIZE, size, 8);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_OBJECT_COUNT, 2, 4);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_OBJECT_COUNT, 2, 4);
     const size_t object_descriptor = MYOS_DEPLOY_HEADER_TABLES
         + MYOS_DEPLOY_TABLE_OBJECT * MYOS_DEPLOY_TABLE_DESC_SIZE;
     put(bytes, object_descriptor + MYOS_DEPLOY_TABLE_OFFSET,
@@ -320,28 +320,28 @@ void make_endpoint_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
         bytes, size, MYOS_OBJECT_KIND_ENDPOINT,
         MYOS_DEPLOY_OBJECT_POST_MAPPING, "endpoint", 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_REF0, 1, 4);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_REF0, 1, 4);
 }
 
 void make_channel_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
         bytes, size, MYOS_OBJECT_KIND_CHANNEL,
         MYOS_DEPLOY_OBJECT_FLAG_NONE, "channel", 7);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E6_KINDS, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E6_KINDS, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000900000046), 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_ARG3, 1, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_ARG3, 1, 8);
 }
 
 void make_pager_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
         bytes, size, MYOS_OBJECT_KIND_PAGER,
         MYOS_DEPLOY_OBJECT_EPHEMERAL_TASK, "pager", 5);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
 }
 
 auto accepts_golden() -> bool {
@@ -355,7 +355,7 @@ auto accepts_golden() -> bool {
         && parsed.value().import_count() == 1
         && parsed.value().export_count() == 1
         && parsed.value().task_name(0).size() == 4
-        && fnv1a(kGolden, kGoldenSize) == UINT64_C(0x7c804c2f6cf27ba7);
+        && fnv1a(kGolden, kGoldenSize) == UINT64_C(0xf726c0b2cea06463);
 }
 
 auto accepts_production_shape() -> bool {
@@ -366,7 +366,7 @@ auto accepts_production_shape() -> bool {
     const auto parsed = ManifestView::parse(
         production_bytes, production_size, workspace);
     return parsed && parsed.value().task_count() == 5
-        && parsed.value().bootstrap_count() == 34;
+        && parsed.value().bootstrap_count() == 35;
 }
 
 auto accepts_production_authority_budget() -> bool {
@@ -415,7 +415,7 @@ auto accepts_production_authority_budget() -> bool {
         && proof.pool_caps == 256
         && proof.cspace_slots == 64
         && proof.cspace_pages == 4
-        && consumer.pool_memory == UINT64_C(0x32000)
+        && consumer.pool_memory == UINT64_C(0x34000)
         && consumer.pool_caps == 5
         && consumer.critical_bytes == UINT64_C(0x12000)
         && consumer.cspace_slots == 5
@@ -423,13 +423,13 @@ auto accepts_production_authority_budget() -> bool {
         && consumer.readiness == MYOS_DEPLOY_READINESS_START
         && consumer.export_count == 1
         && pager.pool_memory == UINT64_C(0x3a000)
-        && pager.pool_caps == 10
+        && pager.pool_caps == 11
         && pager.critical_bytes == UINT64_C(0x14000)
-        && pager.cspace_slots == 10
+        && pager.cspace_slots == 11
         && pager.cspace_pages == 4
         && pager.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
         && pager.export_count == 0
-        && uart.pool_memory == UINT64_C(0x36000)
+        && uart.pool_memory == UINT64_C(0x37000)
         && uart.pool_caps == 10
         && uart.critical_bytes == UINT64_C(0x12000)
         && uart.cspace_slots == 10
@@ -458,10 +458,12 @@ auto accepts_production_authority_budget() -> bool {
         && exact_import_rights(
                pager, 8, MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE)
         && exact_import_rights(pager, 9, MYOS_RIGHT_SIGNAL)
-        /* UART needs only region creation, device mapping and the exact IRQ
-         * and wake operations used by its loop. */
+        && exact_import_rights(pager, 10, MYOS_RIGHT_UNMAP)
+        /* UART needs region creation and mapping, device mapping, and the
+         * exact IRQ and wake operations used by its loop. */
         && exact_import_rights(uart, 0, 0)
-        && exact_import_rights(uart, 1, MYOS_RIGHT_CREATE_REGION)
+        && exact_import_rights(
+               uart, 1, MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP)
         && exact_import_rights(uart, 2, 0)
         && exact_import_rights(uart, 3, 0)
         && exact_import_rights(uart, 4, 0)
@@ -546,7 +548,9 @@ auto accepts_closed_bootstrap_kind_mapping() -> bool {
     return myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE)
             == MYOS_OBJECT_KIND_MEMORY
         && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY)
-            == MYOS_OBJECT_KIND_MEMORY;
+            == MYOS_OBJECT_KIND_MEMORY
+        && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_STAGING_REGION)
+            == MYOS_OBJECT_KIND_VSPACE;
 }
 
 auto accepts_boot_bundle_cross_validation() -> bool {
@@ -569,7 +573,7 @@ auto rejects_effective_stack_range() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_STACK_TOP, 0x230000, 8);
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_STACK_TOP, 0x230000, 8);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed
@@ -592,7 +596,7 @@ auto rejects_table_overlap() -> bool {
         bytes[index] = kGolden[index];
     }
     put(bytes, MYOS_DEPLOY_HEADER_TABLES + MYOS_DEPLOY_TABLE_DESC_SIZE,
-        0xd0, 8);
+        0xe0, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -602,7 +606,7 @@ auto rejects_invalid_enum() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x190 + MYOS_DEPLOY_MAPPING_SOURCE, 9, 2);
+    put(bytes, 0x1a0 + MYOS_DEPLOY_MAPPING_SOURCE, 9, 2);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -612,7 +616,7 @@ auto rejects_duplicate_key() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_OUTPUT_A,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_OUTPUT_A,
         UINT64_C(0x0000000400000004), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -623,7 +627,7 @@ auto rejects_numeric_key() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x190 + MYOS_DEPLOY_MAPPING_PRODUCED, 4, 8);
+    put(bytes, 0x1a0 + MYOS_DEPLOY_MAPPING_PRODUCED, 4, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -633,7 +637,7 @@ auto rejects_noncanonical_empty_ref() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000000000001), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -644,7 +648,7 @@ auto rejects_invalid_positive_string_ref() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x190 + MYOS_DEPLOY_MAPPING_PRODUCED,
+    put(bytes, 0x1a0 + MYOS_DEPLOY_MAPPING_PRODUCED,
         UINT64_C(0x000000010000004f), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -655,7 +659,7 @@ auto accepts_external_domain_key() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_DOMAIN,
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_DOMAIN,
         UINT64_C(0x0000000400000004), 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
@@ -666,7 +670,7 @@ auto rejects_execution_fault_policy() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_FAULT,
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_FAULT,
         MYOS_DEPLOY_EXECUTION_FAULT_ENDPOINT, 2);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -677,7 +681,7 @@ auto rejects_execution_terminal_policy() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_TERMINAL,
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_TERMINAL,
         MYOS_DEPLOY_EXECUTION_TERMINAL_ALL_EXIT, 2);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -687,13 +691,13 @@ auto rejects_endpoint_with_two_executions() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_two_execution_manifest(bytes, size);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK,
         MYOS_RESOURCE_E4_KINDS, 8);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_KIND,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_KIND,
         MYOS_OBJECT_KIND_ENDPOINT, 2);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_FLAGS,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_FLAGS,
         MYOS_DEPLOY_OBJECT_POST_MAPPING, 2);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_REF0, 1, 4);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_REF0, 1, 4);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, size, workspace);
 }
@@ -702,12 +706,12 @@ auto rejects_missing_notification_relation() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_channel_manifest(bytes, size);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
-    put(bytes, 0x470 + MYOS_DEPLOY_OBJECT_KIND,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
+    put(bytes, 0x480 + MYOS_DEPLOY_OBJECT_KIND,
         MYOS_OBJECT_KIND_PAGER, 2);
-    put(bytes, 0x470 + MYOS_DEPLOY_OBJECT_FLAGS,
+    put(bytes, 0x480 + MYOS_DEPLOY_OBJECT_FLAGS,
         MYOS_DEPLOY_OBJECT_EPHEMERAL_TASK, 2);
-    put(bytes, 0x470 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
+    put(bytes, 0x480 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, size, workspace);
 }
@@ -718,7 +722,7 @@ auto rejects_multiple_notifications_relation() -> bool {
     make_two_object_manifest(
         bytes, size, MYOS_OBJECT_KIND_NOTIFICATION,
         MYOS_DEPLOY_OBJECT_FLAG_NONE, "notify2", 7);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK,
         MYOS_RESOURCE_E2_KINDS, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, size, workspace);
@@ -738,7 +742,7 @@ auto rejects_prepared_key_dangling_source() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_SOURCE,
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000900000046), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -752,7 +756,7 @@ auto rejects_prepared_key_import_destination() -> bool {
     /* The import destination is the distinct "import" key at string offset
      * 0x46.  PreparedKey sources are current-CSpace only and must reject it at
      * manifest admission rather than relying on construction lookup failure. */
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_SOURCE,
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000600000046), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -766,7 +770,7 @@ auto rejects_prepared_key_kind_mismatch() -> bool {
     /* The source key names the task's Thread, while this structurally valid
      * ceiling advertises a ResourcePool.  Manifest admission must reject the
      * namespace-kind mismatch before a DeploymentPlan is constructed. */
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_CEILING
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_CEILING
             + MYOS_DEPLOY_ATTENUATION_KIND,
         MYOS_OBJECT_KIND_RESOURCE_POOL, 2);
     ManifestWorkspace workspace{};
@@ -778,7 +782,7 @@ auto rejects_kind_mask_denial() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E1_KINDS, 8);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E1_KINDS, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -788,7 +792,7 @@ auto rejects_notification_badge() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_ARG0, 0, 8);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_ARG0, 0, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -798,7 +802,7 @@ auto rejects_wx_mapping() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x1e0 + MYOS_DEPLOY_MAPPING_ACCESS,
+    put(bytes, 0x1f0 + MYOS_DEPLOY_MAPPING_ACCESS,
         MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE, 4);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -809,7 +813,7 @@ auto rejects_mapping_target_range() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x1e0 + MYOS_DEPLOY_MAPPING_ADDRESS,
+    put(bytes, 0x1f0 + MYOS_DEPLOY_MAPPING_ADDRESS,
         MYOS_RISCV64_LOWER_CANONICAL_END, 8);
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
@@ -826,7 +830,7 @@ auto rejects_sc_configuration() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_SC_BUDGET, 0, 8);
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_SC_BUDGET, 0, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -836,7 +840,7 @@ auto rejects_home_cpu() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_HOME_CPU,
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_HOME_CPU,
         MYOS_DEPLOY_CPU_MAX, 4);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
@@ -853,7 +857,7 @@ auto accepts_duplicate_typed_kind() -> bool {
         for (size_t index = 0; index < kGoldenSize; ++index) {
             bytes[index] = kGolden[index];
         }
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_KIND,
             kind, 2);
         ManifestWorkspace workspace{};
@@ -868,9 +872,9 @@ void make_typed_import(uint8_t* bytes, uint16_t kind) {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_MODE,
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_MODE,
         MYOS_DEPLOY_IMPORT_TYPED_DELEGATE, 2);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_KIND,
         kind, 2);
 }
@@ -878,16 +882,16 @@ void make_typed_import(uint8_t* bytes, uint16_t kind) {
 auto accepts_typed_memory_schema() -> bool {
     uint8_t bytes[kGoldenSize]{};
     make_typed_import(bytes, MYOS_OBJECT_KIND_MEMORY);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD0,
         1, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD1,
         2, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD2,
         MYOS_VM_READ, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD3,
         MYOS_VM_NORMAL, 8);
     ManifestWorkspace workspace{};
@@ -900,16 +904,16 @@ auto accepts_typed_rwx_memory_vspace() -> bool {
              uint16_t{MYOS_OBJECT_KIND_VSPACE}}) {
         uint8_t bytes[kGoldenSize]{ };
         make_typed_import(bytes, kind);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD0,
             kind == MYOS_OBJECT_KIND_MEMORY ? 1 : 0x1000, 8);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD1,
             kind == MYOS_OBJECT_KIND_MEMORY ? 2 : 0x2000, 8);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD2,
             MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE, 8);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD3,
             MYOS_VM_NORMAL, 8);
         ManifestWorkspace workspace{};
@@ -923,16 +927,16 @@ auto accepts_typed_rwx_memory_vspace() -> bool {
 auto accepts_typed_vspace_schema() -> bool {
     uint8_t bytes[kGoldenSize]{};
     make_typed_import(bytes, MYOS_OBJECT_KIND_VSPACE);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD0,
         0x1000, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD1,
         0x2000, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD2,
         MYOS_VM_READ, 8);
-    put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+    put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD3,
         MYOS_VM_NORMAL, 8);
     ManifestWorkspace workspace{};
@@ -950,13 +954,13 @@ auto accepts_typed_channel_forms() -> bool {
     for (const uint64_t fixed : {uint64_t{0}, UINT64_MAX}) {
         uint8_t bytes[kGoldenSize]{};
         make_typed_import(bytes, MYOS_OBJECT_KIND_CHANNEL);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD0,
             MYOS_CAP_CHANNEL_SIDE_A, 8);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD1,
             fixed == 0 ? 0 : 7, 8);
-        put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                 + MYOS_DEPLOY_ATTENUATION_WORD2,
             fixed, 8);
         ManifestWorkspace workspace{};
@@ -987,37 +991,37 @@ auto rejects_typed_schema_mutations() -> bool {
         uint8_t bytes[kGoldenSize]{};
         make_typed_import(bytes, mutation.kind);
         if (mutation.kind == MYOS_OBJECT_KIND_MEMORY) {
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD1,
                 1, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD2,
                 MYOS_VM_READ, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD3,
                 MYOS_VM_NORMAL, 8);
         } else if (mutation.kind == MYOS_OBJECT_KIND_VSPACE) {
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD1,
                 0x1000, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD2,
                 MYOS_VM_READ, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD3,
                 MYOS_VM_NORMAL, 8);
         } else if (mutation.kind == MYOS_OBJECT_KIND_CHANNEL) {
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD0,
                 MYOS_CAP_CHANNEL_SIDE_A, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD1,
                 0, 8);
-            put(bytes, 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+            put(bytes, 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
                     + MYOS_DEPLOY_ATTENUATION_WORD2,
                 0, 8);
         }
-        const size_t base = 0x350 + MYOS_DEPLOY_IMPORT_ATTENUATION
+        const size_t base = 0x360 + MYOS_DEPLOY_IMPORT_ATTENUATION
             + MYOS_DEPLOY_ATTENUATION_WORD0 + mutation.word * 8;
         put(bytes, base, mutation.value, 8);
         ManifestWorkspace workspace{};
@@ -1043,7 +1047,7 @@ auto rejects_channel_zero_scalars() -> bool {
         uint8_t bytes[1400]{};
         size_t size{};
         make_channel_manifest(bytes, size);
-        put(bytes, 0x4d0 + field, 0, 8);
+        put(bytes, 0x4e0 + field, 0, 8);
         ManifestWorkspace workspace{};
         if (ManifestView::parse(bytes, size, workspace)) {
             return false;
@@ -1057,15 +1061,15 @@ auto rejects_duplicate_channel_b() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK,
         MYOS_RESOURCE_E6_KINDS, 8);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000600000026), 8);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_KIND,
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_KIND,
         MYOS_OBJECT_KIND_CHANNEL, 2);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_ARG3, 1, 8);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_ARG0, 1, 8);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_ARG1, 1, 8);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_ARG3, 1, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -1074,9 +1078,9 @@ auto accepts_prepared_channel_b() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_channel_manifest(bytes, size);
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_SOURCE,
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000900000046), 8);
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_CEILING
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_CEILING
             + MYOS_DEPLOY_ATTENUATION_KIND,
         MYOS_OBJECT_KIND_CHANNEL, 2);
     ManifestWorkspace workspace{};
@@ -1088,9 +1092,9 @@ auto accepts_prepared_sc() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_SOURCE,
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000200000032), 8);
-    put(bytes, 0x3b0 + MYOS_DEPLOY_EXPORT_CEILING
+    put(bytes, 0x3c0 + MYOS_DEPLOY_EXPORT_CEILING
             + MYOS_DEPLOY_ATTENUATION_KIND,
         MYOS_OBJECT_KIND_SCHED_CONTEXT, 2);
     ManifestWorkspace workspace{};
@@ -1109,7 +1113,7 @@ auto accepts_endpoint_schema() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_endpoint_manifest(bytes, size);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E4_KINDS, 8);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E4_KINDS, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, size, workspace).has_value();
 }
@@ -1122,9 +1126,9 @@ auto rejects_endpoint_nonresident_source() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_endpoint_manifest(bytes, size);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_KIND_MASK,
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_KIND_MASK,
         MYOS_RESOURCE_E4_KINDS, 8);
-    put(bytes, 0x4d0 + MYOS_DEPLOY_OBJECT_REF0, 0, 4);
+    put(bytes, 0x4e0 + MYOS_DEPLOY_OBJECT_REF0, 0, 4);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, size, workspace);
     return bundle && parsed
@@ -1136,7 +1140,7 @@ auto rejects_dangling_object_ref() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x280 + MYOS_DEPLOY_OBJECT_REF0, 2, 4);
+    put(bytes, 0x290 + MYOS_DEPLOY_OBJECT_REF0, 2, 4);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -1146,7 +1150,7 @@ auto rejects_critical_overflow() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_CRITICAL_BYTES, 4096, 8);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_CRITICAL_BYTES, 4096, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -1156,7 +1160,7 @@ auto rejects_nul_string() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    bytes[0x410] = 0;
+    bytes[0x420] = 0;
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -1173,7 +1177,7 @@ auto rejects_dependency_cycle() -> bool {
     put(bytes, MYOS_DEPLOY_HEADER_TABLES
         + MYOS_DEPLOY_TABLE_DEPENDENCY * MYOS_DEPLOY_TABLE_DESC_SIZE + 8,
         1, 4);
-    put(bytes, 0xd0 + MYOS_DEPLOY_TASK_DEPENDENCY_COUNT, 1, 4);
+    put(bytes, 0xe0 + MYOS_DEPLOY_TASK_DEPENDENCY_COUNT, 1, 4);
     put(bytes, 0x458 + MYOS_DEPLOY_DEPENDENCY_TARGET, 0, 4);
     put(bytes, 0x458 + MYOS_DEPLOY_DEPENDENCY_KIND,
         MYOS_DEPLOY_DEPENDENCY_REQUIRED, 2);
@@ -1228,7 +1232,7 @@ auto accepts_entry_zero_fallback() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0x2e0 + MYOS_DEPLOY_EXECUTION_ENTRY, 0, 8);
+    put(bytes, 0x2f0 + MYOS_DEPLOY_EXECUTION_ENTRY, 0, 8);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed

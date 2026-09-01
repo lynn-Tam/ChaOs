@@ -102,7 +102,7 @@ public:
         StableNodeKey key{};
     };
 
-    explicit NodePool(Pmm& pmm, Quota quota = {}) noexcept
+    explicit NodePool(Pmm& pmm, Quota quota = quota_for(4096)) noexcept
         : pmm_(&pmm), quota_(quota) {
         static_assert(slots_per_page != 0);
         static_assert(alignof(T) <= page_size);

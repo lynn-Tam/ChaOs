@@ -8,6 +8,7 @@ namespace {
 
 constexpr myos_word_t StagingAddress = 0x4300'1000;
 constexpr myos_word_t IpcAddress = 0x4300'0000;
+constexpr myos_word_t PageSize = 4096;
 constexpr myos_word_t ServiceBadge = 1;
 
 [[noreturn]] void stop(myos_status_t status = MYOS_STATUS_INTERNAL) noexcept {
@@ -35,8 +36,10 @@ constexpr myos_word_t ServiceBadge = 1;
         info.selector(MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
     const myos_cap_t readiness =
         info.selector(MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION);
+    const myos_cap_t staging_region =
+        info.selector(MYOS_BOOTSTRAP_CAP_STAGING_REGION);
     if (pager == 0 || target == 0 || staging == 0 || service == 0
-        || readiness == 0) {
+        || readiness == 0 || staging_region == 0) {
         stop(MYOS_STATUS_BAD_ARGS);
     }
 
@@ -66,6 +69,19 @@ constexpr myos_word_t ServiceBadge = 1;
         }
         *staging_page = 0;
         request->payload.page_in.content_epoch = 1;
+        for (;;) {
+            const auto unmapped = myos::vm_unmap(
+                staging_region, StagingAddress, PageSize);
+            if (unmapped.status == MYOS_STATUS_OK
+                || unmapped.status == MYOS_STATUS_PENDING) {
+                break;
+            }
+            if (unmapped.status != MYOS_STATUS_BUSY
+                && unmapped.status != MYOS_STATUS_RETRY) {
+                stop(unmapped.status);
+            }
+            myos::yield();
+        }
         for (;;) {
             const auto supplied = myos::pager_supply(
                 pager, target, staging, request->page_index);

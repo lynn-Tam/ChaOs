@@ -441,6 +441,7 @@ template<size_t N>
             runtime.table, task.id, task.receiver, terminal_status)) {
         return false;
     }
+    runtime.console.text("init: process-server-terminal\n");
     /* Init supervises process_server as a service boundary; its non-OK
      * terminal is therefore a failed deployment rather than root success. */
     return reached_running && terminal_status == MYOS_STATUS_OK;

@@ -444,7 +444,7 @@ void insert_explicit(
  * introduced. */
 [[nodiscard]] auto make_explicit_plan(ExplicitFixture& fixture) noexcept
     -> bool {
-    constexpr size_t legacy_header = 208;
+    constexpr size_t legacy_header = 224;
     constexpr size_t table_count = 9;
     fixture.size = myos::deploy::host::kGoldenSize;
     for (size_t index = 0; index < fixture.size; ++index) {
@@ -811,7 +811,7 @@ void put_manifest(
 [[nodiscard]] auto make_dependency_plan(
     DependencyFixture& fixture) noexcept -> bool {
     constexpr size_t shift = MYOS_DEPLOY_TASK_STRIDE;
-    constexpr size_t dependency_offset = 0x500;
+    constexpr size_t dependency_offset = 0x510;
     const size_t size = dependency_offset + 2 * MYOS_DEPLOY_DEPENDENCY_STRIDE;
     for (size_t index = 0; index < size; ++index) {
         fixture.raw[index] = 0;
@@ -819,13 +819,13 @@ void put_manifest(
     for (size_t index = 0; index < myos::deploy::host::kGoldenSize; ++index) {
         fixture.raw[index] = myos::deploy::host::kGolden[index];
     }
-    for (size_t index = myos::deploy::host::kGoldenSize; index > 0x170;
+    for (size_t index = myos::deploy::host::kGoldenSize; index > 0x180;
          --index) {
         fixture.raw[index - 1 + shift]
             = myos::deploy::host::kGolden[index - 1];
     }
     for (size_t index = 0; index < MYOS_DEPLOY_TASK_STRIDE; ++index) {
-        fixture.raw[0xd0 + shift + index] = fixture.raw[0xd0 + index];
+        fixture.raw[0xe0 + shift + index] = fixture.raw[0xe0 + index];
     }
 
     put_manifest(
@@ -838,7 +838,7 @@ void put_manifest(
         2,
         4);
     const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
-        0xd0, 0x170, 0x190, 0x280, 0x2e0, 0x350, 0, 0x3b0, 0x410, 0,
+        0xe0, 0x180, 0x1a0, 0x290, 0x2f0, 0x360, 0, 0x3c0, 0x420, 0,
     };
     for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
          table <= MYOS_DEPLOY_TABLE_STRING;
@@ -864,7 +864,7 @@ void put_manifest(
         2,
         4);
 
-    const size_t first_task = 0xd0;
+    const size_t first_task = 0xe0;
     const size_t second_task = first_task + MYOS_DEPLOY_TASK_STRIDE;
     put_manifest(
         fixture.raw,

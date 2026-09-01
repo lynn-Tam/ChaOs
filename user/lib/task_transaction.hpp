@@ -2677,6 +2677,9 @@ public:
                             consider(task.symbol(mapping_row->produced),
                                      projections.mappings[mapping],
                                      MYOS_OBJECT_KIND_MEMORY);
+                            consider(task.symbol(mapping_row->region),
+                                     local_projection(mapping_regions[mapping]),
+                                     MYOS_OBJECT_KIND_VSPACE);
                         }
                         for (uint32_t object = 0;
                              object < row->objects.count && !source; ++object) {
@@ -2812,7 +2815,7 @@ public:
                     task.bootstrap(bootstrap);
                 if (bootstrap_row == nullptr
                     || bootstrap_row->kind < MYOS_BOOTSTRAP_CAP_VSPACE
-                    || bootstrap_row->kind > MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                    || bootstrap_row->kind > MYOS_BOOTSTRAP_CAP_STAGING_REGION) {
                     return failure(MYOS_STATUS_BAD_ARGS);
                 }
                 const myos_object_kind_t expected_kind =

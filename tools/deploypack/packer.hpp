@@ -79,31 +79,13 @@ inline void finalize(
     }
 }
 
-/* Keep the original fixture wire image stable for legacy host tests.  The
- * current parser accepts this v1.0 nine-table shape as a compatibility input;
- * production manifests use finalize() and the ten-table v1.1 shape above. */
-inline void finalize_legacy(
+/* Build the compact host fixture with the same current envelope used by the
+ * production manifest.  Its bootstrap table is empty, but the complete
+ * ten-table shape remains part of the fixture contract. */
+inline void finalize_fixture(
     std::vector<std::uint8_t>& bytes,
-    const Table (&tables)[9]) {
-    put(bytes, MYOS_DEPLOY_HEADER_MAGIC, MYOS_DEPLOY_MAGIC, 8);
-    put(bytes, MYOS_DEPLOY_HEADER_MAJOR, MYOS_DEPLOY_MAJOR, 2);
-    put(bytes, MYOS_DEPLOY_HEADER_MINOR, 0, 2);
-    put(bytes, MYOS_DEPLOY_HEADER_SIZE_FIELD, 208, 4);
-    put(bytes, MYOS_DEPLOY_HEADER_TOTAL_SIZE, bytes.size(), 8);
-    put(bytes, MYOS_DEPLOY_HEADER_ARCHITECTURE,
-        MYOS_DEPLOY_ARCH_GENERIC, 4);
-    put(bytes, MYOS_DEPLOY_HEADER_ABI, MYOS_DEPLOY_ABI_ID, 4);
-    put(bytes, MYOS_DEPLOY_HEADER_TABLE_COUNT, 9, 4);
-    for (std::uint32_t index = 0; index < 9; ++index) {
-        const std::size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + static_cast<std::size_t>(index) * MYOS_DEPLOY_TABLE_DESC_SIZE;
-        put(bytes, descriptor + MYOS_DEPLOY_TABLE_OFFSET,
-            tables[index].count == 0 ? 0 : tables[index].offset, 8);
-        put(bytes, descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD,
-            tables[index].count, 4);
-        put(bytes, descriptor + MYOS_DEPLOY_TABLE_STRIDE,
-            tables[index].stride, 4);
-    }
+    const Table (&tables)[MYOS_DEPLOY_TABLE_COUNT]) {
+    finalize(bytes, tables);
 }
 
 /* Production deployment uses the same wire writer as every host fixture.
@@ -245,14 +227,14 @@ inline auto pack_production(
      * below.  Their accounting is established by the resource ledger for
      * these images and object relations; the packer only records the fixed
      * contract consumed by init and process_server. */
-    constexpr std::uint64_t consumer_pool_memory = UINT64_C(0x32000);
+    constexpr std::uint64_t consumer_pool_memory = UINT64_C(0x34000);
     constexpr std::uint64_t pager_pool_memory = UINT64_C(0x3a000);
-    constexpr std::uint64_t uart_pool_memory = UINT64_C(0x36000);
+    constexpr std::uint64_t uart_pool_memory = UINT64_C(0x37000);
     constexpr std::uint64_t consumer_pool_caps = 5;
-    constexpr std::uint64_t pager_pool_caps = 10;
+    constexpr std::uint64_t pager_pool_caps = 11;
     constexpr std::uint64_t uart_pool_caps = 10;
     constexpr std::uint32_t consumer_cspace_slots = 5;
-    constexpr std::uint32_t pager_cspace_slots = 10;
+    constexpr std::uint32_t pager_cspace_slots = 11;
     constexpr std::uint32_t uart_cspace_slots = 10;
     constexpr std::uint32_t consumer_cspace_pages = 3;
     constexpr std::uint32_t pager_cspace_pages = 4;
@@ -295,7 +277,7 @@ inline auto pack_production(
         "uart.bundle.cap",
         "consumer.segment2", "pager.segment2", "uart.segment2",
         "consumer.notify", "pager.notify", "uart.notify",
-        "pager", "uart",
+        "pager", "uart", "pager.staging.region", "pager.staging.region.cap",
     };
 
     struct KeyRef final {
@@ -347,14 +329,14 @@ inline auto pack_production(
     tables[MYOS_DEPLOY_TABLE_EXECUTION] = append_table(
         bytes, 5, MYOS_DEPLOY_EXECUTION_STRIDE);
     tables[MYOS_DEPLOY_TABLE_IMPORT] = append_table(
-        bytes, 34, MYOS_DEPLOY_IMPORT_STRIDE);
+        bytes, 35, MYOS_DEPLOY_IMPORT_STRIDE);
     tables[MYOS_DEPLOY_TABLE_DEPENDENCY] = append_table(
         bytes, 0, MYOS_DEPLOY_DEPENDENCY_STRIDE);
     tables[MYOS_DEPLOY_TABLE_EXPORT] = append_table(
         bytes, 1, MYOS_DEPLOY_EXPORT_STRIDE);
     tables[MYOS_DEPLOY_TABLE_STRING] = append_table(bytes, string_bytes, 1);
     tables[MYOS_DEPLOY_TABLE_BOOTSTRAP] = append_table(
-        bytes, 34, MYOS_DEPLOY_BOOTSTRAP_STRIDE);
+        bytes, 35, MYOS_DEPLOY_BOOTSTRAP_STRIDE);
 
     const auto attenuation = [&](std::size_t offset,
                                  std::uint16_t kind,
@@ -371,6 +353,7 @@ inline auto pack_production(
                              std::uint16_t critical, std::uint32_t access,
                              std::uint64_t address, std::uint64_t size) {
         put(bytes, offset + MYOS_DEPLOY_MAPPING_PRODUCED, key(produced), 8);
+        put(bytes, offset + MYOS_DEPLOY_MAPPING_REGION, 0, 8);
         put(bytes, offset + MYOS_DEPLOY_MAPPING_IMAGE, image, 4);
         put(bytes, offset + MYOS_DEPLOY_MAPPING_SEGMENT, segment, 4);
         put(bytes, offset + MYOS_DEPLOY_MAPPING_SOURCE,
@@ -386,6 +369,7 @@ inline auto pack_production(
                                   std::uint16_t critical, std::uint32_t access,
                                   std::uint64_t address, std::uint64_t size) {
         put(bytes, offset + MYOS_DEPLOY_MAPPING_PRODUCED, key(produced), 8);
+        put(bytes, offset + MYOS_DEPLOY_MAPPING_REGION, 0, 8);
         put(bytes, offset + MYOS_DEPLOY_MAPPING_IMAGE,
             MYOS_DEPLOY_NO_INDEX, 4);
         put(bytes, offset + MYOS_DEPLOY_MAPPING_SEGMENT,
@@ -544,14 +528,14 @@ inline auto pack_production(
     task_row_extra(
         task0 + 3 * MYOS_DEPLOY_TASK_STRIDE,
         43, 48, 49, 50, 3, pager_mapping_first, pager_mapping_count,
-        3, 3, 3, 15, 10, 15, 10, 1, 0,
+        3, 3, 3, 15, 11, 15, 11, 1, 0,
         MYOS_DEPLOY_READINESS_EXPLICIT, pager_pool_memory, pager_pool_caps,
         pager_critical, pager_cspace_slots, pager_cspace_pages,
         pager_mapping_first + pager_mapping_count - 3);
     task_row_extra(
         task0 + 4 * MYOS_DEPLOY_TASK_STRIDE,
         44, 51, 52, 53, 4, uart_mapping_first, uart_mapping_count,
-        6, 3, 4, 25, 9, 25, 9, 1, 0,
+        6, 3, 4, 26, 9, 26, 9, 1, 0,
         MYOS_DEPLOY_READINESS_EXPLICIT, uart_pool_memory, uart_pool_caps,
         uart_critical, uart_cspace_slots, uart_cspace_pages,
         uart_mapping_first + uart_mapping_count - 1);
@@ -680,6 +664,8 @@ inline auto pack_production(
                  MYOS_DEPLOY_CRITICAL_PAGER_RECOVERY,
                  MYOS_VM_READ | MYOS_VM_WRITE,
                  0x43001000, MYOS_DEPLOY_PAGE_SIZE);
+    put(bytes, mappings + pager_staging * MYOS_DEPLOY_MAPPING_STRIDE
+            + MYOS_DEPLOY_MAPPING_REGION, key(107), 8);
 
     write_image_mappings(uart_mapping_first, uart.segments, 4, 86, 87, 101);
     const std::uint32_t uart_stack =
@@ -919,38 +905,43 @@ inline auto pack_production(
            MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
 
     import(imports + 25 * MYOS_DEPLOY_IMPORT_STRIDE,
+           107, 108, MYOS_OBJECT_KIND_VSPACE,
+           MYOS_RIGHT_UNMAP,
+           MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
+
+    import(imports + 26 * MYOS_DEPLOY_IMPORT_STRIDE,
            51, 31, MYOS_OBJECT_KIND_RESOURCE_POOL,
            0,
            MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
-    import(imports + 26 * MYOS_DEPLOY_IMPORT_STRIDE,
-           52, 32, MYOS_OBJECT_KIND_VSPACE,
-           MYOS_RIGHT_CREATE_REGION,
-           MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
     import(imports + 27 * MYOS_DEPLOY_IMPORT_STRIDE,
+           52, 32, MYOS_OBJECT_KIND_VSPACE,
+           MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP,
+           MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
+    import(imports + 28 * MYOS_DEPLOY_IMPORT_STRIDE,
            53, 33, MYOS_OBJECT_KIND_CSPACE,
            0,
            MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
-    import(imports + 28 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 29 * MYOS_DEPLOY_IMPORT_STRIDE,
            38, 97, MYOS_OBJECT_KIND_SCHED_DOMAIN,
            0,
            MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY);
-    import(imports + 29 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 30 * MYOS_DEPLOY_IMPORT_STRIDE,
            39, 98, MYOS_OBJECT_KIND_MEMORY,
            0,
            MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY);
-    import(imports + 30 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 31 * MYOS_DEPLOY_IMPORT_STRIDE,
            93, 93, MYOS_OBJECT_KIND_MEMORY,
            MYOS_RIGHT_MAP,
            MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY);
-    import(imports + 31 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 32 * MYOS_DEPLOY_IMPORT_STRIDE,
            94, 94, MYOS_OBJECT_KIND_IRQ,
            MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK,
            MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY);
-    import(imports + 32 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 33 * MYOS_DEPLOY_IMPORT_STRIDE,
            95, 34, MYOS_OBJECT_KIND_NOTIFICATION,
            MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE,
            MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
-    import(imports + 33 * MYOS_DEPLOY_IMPORT_STRIDE,
+    import(imports + 34 * MYOS_DEPLOY_IMPORT_STRIDE,
            96, 35, MYOS_OBJECT_KIND_NOTIFICATION,
            MYOS_RIGHT_SIGNAL,
            MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY);
@@ -1028,10 +1019,11 @@ inline auto pack_production(
         MYOS_BOOTSTRAP_CAP_STAGING_MEMORY,
         MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION,
         MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
+        MYOS_BOOTSTRAP_CAP_STAGING_REGION,
     };
     constexpr std::size_t pager_destinations[] = {
-        31, 32, 33, 84, 85, 79, 80, 81, 29, 30};
-    for (std::size_t index = 0; index < 10; ++index) {
+        31, 32, 33, 84, 85, 79, 80, 81, 29, 30, 108};
+    for (std::size_t index = 0; index < 11; ++index) {
         bootstrap(bootstraps + (15 + index) * MYOS_DEPLOY_BOOTSTRAP_STRIDE,
                   pager_kinds[index], pager_destinations[index]);
     }
@@ -1049,7 +1041,7 @@ inline auto pack_production(
     constexpr std::size_t uart_destinations[] = {
         31, 32, 33, 97, 98, 93, 94, 34, 35};
     for (std::size_t index = 0; index < 9; ++index) {
-        bootstrap(bootstraps + (25 + index) * MYOS_DEPLOY_BOOTSTRAP_STRIDE,
+        bootstrap(bootstraps + (26 + index) * MYOS_DEPLOY_BOOTSTRAP_STRIDE,
                   uart_kinds[index], uart_destinations[index]);
     }
 
@@ -1089,8 +1081,8 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
         keys[index] = KeyRef{string_bytes, static_cast<std::uint32_t>(length)};
         string_bytes += static_cast<std::uint32_t>(length);
     }
-    std::vector<std::uint8_t> bytes(208, 0);
-    Table tables[9]{};
+    std::vector<std::uint8_t> bytes(MYOS_DEPLOY_HEADER_SIZE, 0);
+    Table tables[MYOS_DEPLOY_TABLE_COUNT]{};
     tables[MYOS_DEPLOY_TABLE_TASK] = append_table(
         bytes, 1, MYOS_DEPLOY_TASK_STRIDE);
     tables[MYOS_DEPLOY_TABLE_IMAGE] = append_table(
@@ -1108,6 +1100,8 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
     tables[MYOS_DEPLOY_TABLE_EXPORT] = append_table(
         bytes, 1, MYOS_DEPLOY_EXPORT_STRIDE);
     tables[MYOS_DEPLOY_TABLE_STRING] = append_table(bytes, string_bytes, 1);
+    tables[MYOS_DEPLOY_TABLE_BOOTSTRAP] = append_table(
+        bytes, 0, MYOS_DEPLOY_BOOTSTRAP_STRIDE);
 
     const std::size_t task = tables[MYOS_DEPLOY_TABLE_TASK].offset;
     put(bytes, task + MYOS_DEPLOY_TASK_NAME, keys[0].packed(), 8);
@@ -1260,7 +1254,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
         }
     }
 
-    finalize_legacy(bytes, tables);
+    finalize_fixture(bytes, tables);
     return bytes;
 }
 

@@ -34,7 +34,7 @@ constexpr myos_word_t IrqBadge = 1;
         vspace, UartAddress, PageSize,
         MYOS_VM_READ | MYOS_VM_WRITE,
         MYOS_VM_DEVICE,
-        MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
+        MYOS_RIGHT_MAP);
     if (region.status != MYOS_STATUS_OK) {
         stop();
     }

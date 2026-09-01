@@ -120,6 +120,7 @@ struct ManifestImageRow final {
 struct ManifestMappingRow final {
     StringRef produced{};
     StringRef pager{};
+    StringRef region{};
     uint32_t image{MYOS_DEPLOY_NO_INDEX};
     uint32_t segment{MYOS_DEPLOY_NO_INDEX};
     uint16_t source{};
@@ -434,17 +435,13 @@ private:
         if (magic != MYOS_DEPLOY_MAGIC) {
             return fail(Error::BadMagic);
         }
-        const bool legacy = header_size == 208U && table_count == 9U;
         const bool current = header_size == MYOS_DEPLOY_HEADER_SIZE
             && table_count == MYOS_DEPLOY_TABLE_COUNT;
-        /* Deployment minor versions bind the complete envelope shape.  A
-         * legacy v0 header is exactly the nine-table/208-byte form; v1 is
-         * exactly the ten-table/current form.  Accepting either minor with
-         * the other shape creates a hybrid wire contract that readers cannot
-         * interpret consistently. */
-        if (major != MYOS_DEPLOY_MAJOR || minor > MYOS_DEPLOY_MINOR
-            || (minor == 0 && !legacy)
-            || (minor != 0 && !current)) {
+        /* The minor version binds the complete envelope shape.  This is an
+         * internal wire migration; accepting an older shape would create a
+         * hybrid interpretation of mapping rows and bootstrap roles. */
+        if (major != MYOS_DEPLOY_MAJOR || minor != MYOS_DEPLOY_MINOR
+            || !current) {
             return fail(Error::BadVersion);
         }
         header_size_ = static_cast<uint32_t>(header_size);
@@ -457,8 +454,7 @@ private:
         if (features != 0 || flags != 0 || checksum != 0) {
             return fail(Error::UnsupportedFeatures);
         }
-        if ((table_count != MYOS_DEPLOY_TABLE_COUNT && !legacy)
-            || reserved != 0) {
+        if (table_count != MYOS_DEPLOY_TABLE_COUNT || reserved != 0) {
             return fail(Error::InvalidHeader);
         }
         return true;
@@ -911,6 +907,7 @@ private:
         for (uint32_t index = 0; index < mapping_count(); ++index) {
             ByteView produced{};
             ByteView pager_key{};
+            ByteView region_key{};
             uint64_t source{};
             uint64_t residency{};
             uint64_t critical{};
@@ -925,6 +922,9 @@ private:
                           MYOS_DEPLOY_MAPPING_PRODUCED, produced, true)
                 || !read_key(MYOS_DEPLOY_TABLE_MAPPING, index,
                              MYOS_DEPLOY_MAPPING_PAGER, pager_key,
+                             false)
+                || !read_key(MYOS_DEPLOY_TABLE_MAPPING, index,
+                             MYOS_DEPLOY_MAPPING_REGION, region_key,
                              false)
                 || !value(MYOS_DEPLOY_TABLE_MAPPING, index,
                        MYOS_DEPLOY_MAPPING_SOURCE, 2, source)
@@ -1229,7 +1229,8 @@ private:
                     switch (group) {
                     case 0:
                         fields[0] = MYOS_DEPLOY_MAPPING_PRODUCED;
-                        field_count = 1;
+                        fields[1] = MYOS_DEPLOY_MAPPING_REGION;
+                        field_count = 2;
                         break;
                     case 1:
                         fields[0] = MYOS_DEPLOY_OBJECT_OUTPUT_A;
@@ -1254,7 +1255,8 @@ private:
                     }
                     for (size_t field = 0; field < field_count; ++field) {
                         ByteView key{};
-                        const bool required = !(group == 1 && field == 1);
+                        const bool required = !((group == 0 && field == 1)
+                            || (group == 1 && field == 1));
                         if (!read_key(tables[group], static_cast<uint32_t>(row),
                                       fields[field], key, required)) {
                             return fail(Error::InvalidReference);
@@ -1686,7 +1688,7 @@ private:
                              MYOS_DEPLOY_BOOTSTRAP_RESERVED,
                              MYOS_DEPLOY_BOOTSTRAP_DESTINATION)
                     || kind < MYOS_BOOTSTRAP_CAP_VSPACE
-                    || kind > MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION
+                    || kind > MYOS_BOOTSTRAP_CAP_STAGING_REGION
                     || myos_bootstrap_object_kind(static_cast<uint32_t>(kind))
                         == MYOS_OBJECT_KIND_INVALID) {
                     return fail(Error::InvalidRecord);
@@ -2046,16 +2048,17 @@ private:
                         : group == 1
                             ? MYOS_DEPLOY_OBJECT_OUTPUT_A
                             : MYOS_DEPLOY_EXECUTION_KEY,
-                    group == 1 ? MYOS_DEPLOY_OBJECT_OUTPUT_B : 0,
+                    group == 0
+                        ? MYOS_DEPLOY_MAPPING_REGION
+                        : group == 1
+                            ? MYOS_DEPLOY_OBJECT_OUTPUT_B
+                            : MYOS_DEPLOY_EXECUTION_SC,
                 };
-                const size_t field_count = group == 1 ? 2 : 1;
-                if (group == 2) {
-                    fields[1] = MYOS_DEPLOY_EXECUTION_SC;
-                }
-                const size_t actual_field_count = group == 2 ? 2 : field_count;
+                const size_t actual_field_count = 2;
                 for (size_t field = 0; field < actual_field_count; ++field) {
                     ByteView key{};
-                    const bool required = !(group == 1 && field == 1);
+                    const bool required = !((group == 0 && field == 1)
+                        || (group == 1 && field == 1));
                     if (!read_key(tables[group], static_cast<uint32_t>(row),
                                   fields[field], key, required)) {
                         return libk::nullopt;
@@ -2065,7 +2068,8 @@ private:
                     }
                     myos_object_kind_t kind = MYOS_OBJECT_KIND_INVALID;
                     if (group == 0) {
-                        kind = MYOS_OBJECT_KIND_MEMORY;
+                        kind = field == 0 ? MYOS_OBJECT_KIND_MEMORY
+                                          : MYOS_OBJECT_KIND_VSPACE;
                     } else if (group == 1) {
                         uint64_t object_kind{};
                         if (!value(MYOS_DEPLOY_TABLE_OBJECT,
@@ -2949,6 +2953,9 @@ inline auto ManifestView::mapping_row(
         && manifest_detail::string_ref(
                *this, MYOS_DEPLOY_TABLE_MAPPING, index,
                MYOS_DEPLOY_MAPPING_PAGER, false, output.pager)
+        && manifest_detail::string_ref(
+               *this, MYOS_DEPLOY_TABLE_MAPPING, index,
+               MYOS_DEPLOY_MAPPING_REGION, false, output.region)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_MAPPING, index,
                                    MYOS_DEPLOY_MAPPING_IMAGE, 4, output.image)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_MAPPING, index,
