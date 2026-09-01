@@ -37,7 +37,7 @@ public:
     explicit constexpr Plic(usize base = virt_plic_base) noexcept
         : base_(base) {}
 
-    void initialize(u32 source, u32 priority = 1) const noexcept;
+    void configure(u32 source, u32 priority = 1) const noexcept;
     void mask(u32 source) const noexcept;
     void unmask(u32 source) const noexcept;
     [[nodiscard]] auto claim() const noexcept -> u32;

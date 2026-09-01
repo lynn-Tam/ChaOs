@@ -40,6 +40,28 @@ using Journal = myos::deploy::RegistrationJournal<8>;
 using Workspace = myos::deploy::TaskConstructionWorkspace<Authorities>;
 using Plans = myos::deploy::PlanSet<1>;
 
+enum class TerminalPoll : uint8_t {
+    Empty,
+    Ready,
+    Failed,
+};
+
+enum class Admission : uint8_t {
+    Ready,
+    Terminal,
+    Failed,
+};
+
+/* These are borrowed construction inputs derived from the one decoded
+ * deployment plan.  They do not own a capability or duplicate plan state. */
+struct ViewInputs final {
+    myos::cap::CapRef root_vspace{};
+    myos::cap::CapRef root_bundle{};
+    size_t bundle_size{};
+    myos_word_t bundle_window_size{};
+    myos_word_t scratch_size{};
+};
+
 constexpr myos_word_t PageSize = MYOS_DEPLOY_PAGE_SIZE;
 constexpr myos_word_t BundleAddress = 0x1000'0000;
 constexpr myos_word_t ScratchAddress = 0x1800'0000;
@@ -98,7 +120,7 @@ struct Console final {
         }
         phase = myos::deploy::LeasePhase::Mapped;
         port = myos::uart::Port{UartAddress};
-        port.initialize();
+        port.reset();
         return port.valid();
     }
 
@@ -354,22 +376,169 @@ template<size_t N>
     return true;
 }
 
-[[nodiscard]] auto wait_readiness(const TaskHandle& task) noexcept -> bool {
+[[nodiscard]] auto poll_terminal(
+    const TaskHandle& task,
+    myos_status_t& terminal_status,
+    myos_status_t& failure_status) noexcept -> TerminalPoll {
+    terminal_status = MYOS_STATUS_INTERNAL;
+    failure_status = MYOS_STATUS_INTERNAL;
+    const auto notification = runtime.table.terminal_notification(task.id);
+    if (!notification) {
+        return TerminalPoll::Failed;
+    }
+    const myos::SysResult wake = myos::notification_take(
+        notification->selector);
+    if (wake.status == MYOS_STATUS_RETRY) {
+        return TerminalPoll::Empty;
+    }
+    if (wake.status != MYOS_STATUS_OK) {
+        failure_status = wake.status;
+        return TerminalPoll::Failed;
+    }
+    const myos::SysResult observation = runtime.table.observe_terminal(
+        task.id);
+    if (observation.status != MYOS_STATUS_OK) {
+        failure_status = observation.status;
+        return TerminalPoll::Failed;
+    }
+    if (observation.value == 0) {
+        return TerminalPoll::Empty;
+    }
+    terminal_status = static_cast<myos_status_t>(
+        static_cast<int64_t>(observation.value2));
+    const myos_status_t consumed = runtime.table.consume_terminal(
+        task.id, observation);
+    if (consumed == MYOS_STATUS_RETRY) {
+        return TerminalPoll::Empty;
+    }
+    if (consumed != MYOS_STATUS_OK) {
+        failure_status = consumed;
+    }
+    return consumed == MYOS_STATUS_OK
+        ? TerminalPoll::Ready : TerminalPoll::Failed;
+}
+
+[[nodiscard]] auto close_observed(
+    TaskHandle& task,
+    myos_status_t terminal_status) noexcept -> bool {
+    if (!runtime.table.begin_close(
+            task.id, myos::deploy::CloseReason::Terminal,
+            terminal_status)) {
+        return false;
+    }
+    return myos::deploy::supervision::take_completion(
+        runtime.table, task.id, myos::deploy::CloseReason::Terminal,
+        terminal_status, task.receiver);
+}
+
+[[nodiscard]] auto close_views() noexcept -> bool;
+[[nodiscard]] auto reopen_views(const ViewInputs& views) noexcept -> bool;
+
+[[nodiscard]] auto close_unadmitted(
+    TaskHandle& task,
+    myos_status_t status) noexcept -> bool {
+    if (runtime.table.record(task.id) == nullptr) {
+        return false;
+    }
+    if (!runtime.table.begin_close(
+            task.id, myos::deploy::CloseReason::ConstructionFailure,
+            status)) {
+        return false;
+    }
+    return myos::deploy::supervision::take_completion(
+        runtime.table, task.id,
+        myos::deploy::CloseReason::ConstructionFailure,
+        status, task.receiver);
+}
+
+[[nodiscard]] auto admit_task(
+    TaskHandle& task) noexcept -> Admission {
     for (;;) {
+        myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
+        myos_status_t failure_status = MYOS_STATUS_INTERNAL;
+        TerminalPoll event = poll_terminal(
+            task, terminal_status, failure_status);
+        if (event == TerminalPoll::Ready) {
+            return close_observed(task, terminal_status)
+                ? Admission::Terminal : Admission::Failed;
+        }
+        if (event == TerminalPoll::Failed) {
+            static_cast<void>(close_unadmitted(task, failure_status));
+            return Admission::Failed;
+        }
+
         const auto* record = runtime.table.record(task.id);
         if (record == nullptr
             || record->state() != myos::deploy::TaskState::Running) {
-            return false;
+            return Admission::Failed;
         }
-        const myos_status_t status = runtime.table.consume_readiness(task.id);
-        if (status == MYOS_STATUS_OK) {
-            return true;
+        const myos_status_t readiness = runtime.table.consume_readiness(
+            task.id);
+        if (readiness == MYOS_STATUS_OK) {
+            /* A terminal published concurrently with the readiness signal
+             * wins this admission boundary.  A later terminal is handled by
+             * the supervisor loop using the same checked TaskId. */
+            terminal_status = MYOS_STATUS_INTERNAL;
+            failure_status = MYOS_STATUS_INTERNAL;
+            event = poll_terminal(
+                task, terminal_status, failure_status);
+            if (event == TerminalPoll::Ready) {
+                return close_observed(task, terminal_status)
+                    ? Admission::Terminal : Admission::Failed;
+            }
+            if (event == TerminalPoll::Failed) {
+                static_cast<void>(close_unadmitted(task, failure_status));
+                return Admission::Failed;
+            }
+            return Admission::Ready;
         }
-        if (status != MYOS_STATUS_RETRY && status != MYOS_STATUS_BUSY) {
-            return false;
+        if (readiness != MYOS_STATUS_RETRY
+            && readiness != MYOS_STATUS_BUSY) {
+            static_cast<void>(close_unadmitted(task, readiness));
+            return Admission::Failed;
         }
         myos::yield();
     }
+}
+
+template<size_t N>
+[[nodiscard]] auto replace_worker(
+    TaskHandle& current,
+    const char (&name)[N],
+    myos::cap::CapRef parent_pool,
+    const myos::deploy::TaskAuthorityBindings& bindings,
+    uint32_t runtime_cpu_count,
+    myos_status_t terminal_status,
+    const ViewInputs& views) noexcept -> bool {
+    if (!close_observed(current, terminal_status)) {
+        return false;
+    }
+    if (!reopen_views(views)) {
+        return false;
+    }
+    auto replacement = prepare_task(
+        name, parent_pool, bindings, runtime_cpu_count);
+    if (!replacement) {
+        static_cast<void>(close_views());
+        return false;
+    }
+    TaskHandle next = libk::move(*replacement);
+    if (!close_views()) {
+        static_cast<void>(close_unadmitted(next, MYOS_STATUS_INTERNAL));
+        return false;
+    }
+    if (!start_task(next)) {
+        return false;
+    }
+    if (admit_task(next) != Admission::Ready) {
+        return false;
+    }
+    current.id = next.id;
+    current.receiver.reset();
+    if (next.receiver) {
+        current.receiver.emplace(libk::move(*next.receiver));
+    }
+    return true;
 }
 
 [[nodiscard]] auto task_bindings(
@@ -454,7 +623,7 @@ template<size_t N>
             break;
         }
         if (!myos::deploy::retryable(status)) {
-            return false;
+            Backend::ownership_fault(status);
         }
         myos::yield();
     }
@@ -464,10 +633,40 @@ template<size_t N>
             return true;
         }
         if (!myos::deploy::retryable(status)) {
-            return false;
+            Backend::ownership_fault(status);
         }
         myos::yield();
     }
+}
+
+[[nodiscard]] auto reopen_views(const ViewInputs& views) noexcept -> bool {
+    if (!views.root_vspace || views.root_vspace.cspace != 0
+        || !views.root_bundle || views.root_bundle.cspace != 0
+        || views.bundle_size == 0 || views.bundle_window_size == 0
+        || views.scratch_size == 0
+        || runtime.bundle.phase() != myos::deploy::LeasePhase::Closed
+        || runtime.scratch.phase() != myos::deploy::LeasePhase::Closed) {
+        return false;
+    }
+    const myos_status_t bundle_opened = runtime.bundle.open(
+        views.root_vspace,
+        views.root_bundle,
+        myos::deploy::Window{
+            BundleAddress, views.bundle_window_size},
+        views.bundle_size);
+    if (bundle_opened != MYOS_STATUS_OK) {
+        static_cast<void>(close_views());
+        return false;
+    }
+    const myos_status_t scratch_opened = runtime.scratch.open(
+        views.root_vspace,
+        myos::deploy::Window{ScratchAddress, views.scratch_size},
+        myos::deploy::Window{BundleAddress, views.bundle_window_size});
+    if (scratch_opened != MYOS_STATUS_OK) {
+        static_cast<void>(close_views());
+        return false;
+    }
+    return true;
 }
 
 [[nodiscard]] auto open_views(
@@ -533,6 +732,12 @@ template<size_t N>
             != MYOS_STATUS_OK) {
         return false;
     }
+    const ViewInputs views{
+        .root_vspace = *root_vspace,
+        .root_bundle = *root_bundle,
+        .bundle_size = runtime.bundle.size(),
+        .bundle_window_size = bundle_window_size,
+        .scratch_size = scratch_size};
     runtime.console.text("init: boot-root\n");
     runtime.console.text("init: manifest-decoded\n");
 
@@ -570,7 +775,8 @@ template<size_t N>
     }
     TaskHandle pager = libk::move(*pager_pending);
     runtime.console.text("init: pager-prepared\n");
-    if (!start_task(pager) || !wait_readiness(pager)) {
+    if (!start_task(pager)
+        || admit_task(pager) != Admission::Ready) {
         return false;
     }
     runtime.console.text("init: pager-ready\n");
@@ -582,7 +788,8 @@ template<size_t N>
     }
     TaskHandle uart = libk::move(*uart_pending);
     runtime.console.text("init: uart-prepared\n");
-    if (!start_task(uart) || !wait_readiness(uart)) {
+    if (!start_task(uart)
+        || admit_task(uart) != Admission::Ready) {
         return false;
     }
     runtime.console.text("init: uart-ready\n");
@@ -605,14 +812,108 @@ template<size_t N>
             > consumer_record->plan().row()->critical_bytes) {
         return false;
     }
-    myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
-    if (!myos::deploy::supervision::observe_and_close(
-            runtime.table, consumer.id, consumer.receiver, terminal_status)
-        || terminal_status != MYOS_STATUS_OK) {
-        return false;
+    for (;;) {
+        myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
+        myos_status_t failure_status = MYOS_STATUS_INTERNAL;
+        const TerminalPoll pager_event = poll_terminal(
+            pager, terminal_status, failure_status);
+        if (pager_event == TerminalPoll::Failed) {
+            return false;
+        }
+        if (pager_event == TerminalPoll::Ready) {
+            if (!replace_worker(
+                    pager,
+                    "pager-worker",
+                    *root_pool,
+                    pager_bindings(target_authority.value()),
+                    bootstrap.cpu_count(),
+                    terminal_status,
+                    views)) {
+                return false;
+            }
+            continue;
+        }
+
+        terminal_status = MYOS_STATUS_INTERNAL;
+        failure_status = MYOS_STATUS_INTERNAL;
+        const TerminalPoll uart_event = poll_terminal(
+            uart, terminal_status, failure_status);
+        if (uart_event == TerminalPoll::Failed) {
+            return false;
+        }
+        if (uart_event == TerminalPoll::Ready) {
+            if (!replace_worker(
+                    uart,
+                    "uart-worker",
+                    *root_pool,
+                    uart_bindings(),
+                    bootstrap.cpu_count(),
+                    terminal_status,
+                    views)) {
+                return false;
+            }
+            continue;
+        }
+
+        terminal_status = MYOS_STATUS_INTERNAL;
+        failure_status = MYOS_STATUS_INTERNAL;
+        const TerminalPoll consumer_event = poll_terminal(
+            consumer, terminal_status, failure_status);
+        if (consumer_event == TerminalPoll::Failed) {
+            return false;
+        }
+        if (consumer_event == TerminalPoll::Ready) {
+            if (!runtime.table.terminate(
+                    pager.id,
+                    myos::deploy::CloseReason::Explicit,
+                    MYOS_STATUS_OK)
+                || !myos::deploy::supervision::take_completion(
+                    runtime.table,
+                    pager.id,
+                    myos::deploy::CloseReason::Explicit,
+                    MYOS_STATUS_OK,
+                    pager.receiver)) {
+                return false;
+            }
+            pager.id = {};
+            pager.receiver.reset();
+            const myos_status_t consumer_status = terminal_status;
+            if (!close_observed(consumer, consumer_status)) {
+                return false;
+            }
+            consumer.id = {};
+            consumer.receiver.reset();
+            runtime.console.text("init: consumer-terminal\n");
+            if (consumer_status != MYOS_STATUS_OK) {
+                return false;
+            }
+            runtime.console.text("init: complete\n");
+            for (;;) {
+                terminal_status = MYOS_STATUS_INTERNAL;
+                failure_status = MYOS_STATUS_INTERNAL;
+                const TerminalPoll event = poll_terminal(
+                    uart, terminal_status, failure_status);
+                if (event == TerminalPoll::Failed) {
+                    return false;
+                }
+                if (event == TerminalPoll::Ready) {
+                    if (!replace_worker(
+                            uart,
+                            "uart-worker",
+                            *root_pool,
+                            uart_bindings(),
+                            bootstrap.cpu_count(),
+                            terminal_status,
+                            views)) {
+                        return false;
+                    }
+                    continue;
+                }
+                myos::yield();
+            }
+        }
+        myos::yield();
     }
-    runtime.console.text("init: consumer-terminal\n");
-    return true;
 }
 
 } // namespace
@@ -630,10 +931,6 @@ extern "C" [[noreturn]] void myos_main(
     if (!complete) {
         fail(MYOS_STATUS_INTERNAL);
     }
-    /* Init is the supervising owner of the root console authority.  Keep its
-     * mapping and execution alive after the one-shot service deployment; a
-     * later durable-service loop will consume this same owner. */
-    runtime.console.text("init: complete\n");
     for (;;) {
         myos::yield();
     }

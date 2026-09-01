@@ -1294,6 +1294,7 @@ bool test_retire_waits_for_relation_then_detaches(
 bool test_irq_sequence_reassert_requires_latest_ack(
     const TestContext&) noexcept {
     kernel::ipc::Notification notification{};
+    kernel::ipc::Notification rebound_notification{};
     kernel::irq::Irq irq{kernel::irq::SourceToken::from_bootstrap(10)};
     if (!irq.bind(notification, 0x40)) {
         return false;
@@ -1306,8 +1307,37 @@ bool test_irq_sequence_reassert_requires_latest_ack(
             first.value().generation, first.value().sequence)) {
         return false;
     }
-    return irq.ack(second.value().generation, second.value().sequence)
-        && notification.take()
+    if (!irq.ack(second.value().generation, second.value().sequence)
+        || !notification.take()
+        || !irq.unbind()
+        || irq.state() != kernel::irq::State::UnboundIdle
+        || !irq.bind(notification, 0x40)) {
+        return false;
+    }
+    const auto pending = irq.observe();
+    if (!pending || !notification.take() || !irq.unbind()
+        || irq.state() != kernel::irq::State::UnboundPending) {
+        return false;
+    }
+    if (!irq.bind(rebound_notification, 0x40)
+        || irq.state() != kernel::irq::State::BoundPending) {
+        return false;
+    }
+    const auto retained = irq.delivery();
+    if (!retained
+        || retained.value().sequence != pending.value().sequence
+        || retained.value().generation == pending.value().generation
+        || !rebound_notification.take()) {
+        return false;
+    }
+    const auto stale = irq.ack(
+        pending.value().generation, pending.value().sequence);
+    if (stale || stale.error() != kernel::irq::Error::StaleSequence) {
+        return false;
+    }
+    return irq.ack(
+               retained.value().generation, retained.value().sequence)
+            && irq.state() == kernel::irq::State::BoundIdle
         && irq.unbind()
         && irq.state() == kernel::irq::State::UnboundIdle;
 }

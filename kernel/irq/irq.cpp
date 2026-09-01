@@ -64,20 +64,18 @@ void initialize_platform() noexcept {
         Irq* const target = registry[arch::riscv64::virt_uart_irq];
         if (target != nullptr) {
             kernel::sync::IrqLockGuard irq_guard{target->lock_};
-            plic.initialize(target->source_.id());
+            plic.configure(target->source_.id());
             if (target->state_ == State::BoundIdle) {
                 plic.unmask(target->source_.id());
             } else {
-                /* Plic::initialize() enables the source as part of its
-                 * legacy hardware setup.  A retained Pending obligation
-                 * must remain masked until its exact acknowledgement. */
+                /* A retained Pending obligation remains masked until its
+                 * exact acknowledgement. */
                 plic.mask(target->source_.id());
             }
         } else {
-            plic.initialize(arch::riscv64::virt_uart_irq);
-            /* No published Irq owns the source yet; initialize() enables it
-             * as part of the hardware setup, so restore the UnboundIdle
-             * masked invariant before exposing the trap path. */
+            plic.configure(arch::riscv64::virt_uart_irq);
+            /* No published Irq owns the source yet.  Keep the unbound source
+             * masked until a committed idle bind explicitly unmasks it. */
             plic.mask(arch::riscv64::virt_uart_irq);
         }
         /* Publish readiness before releasing the registry transaction.  A
@@ -169,8 +167,9 @@ auto Irq::bind(ipc::Notification& notification, u64 badge) noexcept
                 generation_ = next_generation;
                 state_ = pending ? State::BoundPending : State::BoundIdle;
                 if (platform_enabled(source_.id())) {
-                    plic.initialize(source_.id());
                     if (pending) {
+                        /* The source was masked when it became unbound; keep
+                         * that invariant explicit across the new relation. */
                         plic.mask(source_.id());
                     } else {
                         plic.unmask(source_.id());

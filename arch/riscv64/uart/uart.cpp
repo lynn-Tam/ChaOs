@@ -54,13 +54,12 @@ void Uart16550::write(const char* text) const noexcept {
     }
 }
 
-void Plic::initialize(u32 source, u32 priority) const noexcept {
+void Plic::configure(u32 source, u32 priority) const noexcept {
     if (source == 0 || source >= 32) {
         return;
     }
     word(PlicPriority + source * sizeof(u32))[0] = priority;
     word(PlicThresholdS)[0] = 0;
-    unmask(source);
 }
 
 void Plic::mask(u32 source) const noexcept {

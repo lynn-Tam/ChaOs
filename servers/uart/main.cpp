@@ -52,7 +52,7 @@ constexpr myos_word_t IrqBadge = 1;
         stop();
     }
     myos::uart::Port port{UartAddress};
-    port.initialize();
+    port.enable_rx();
     if (!port.valid()) {
         stop();
     }

@@ -18,7 +18,10 @@ public:
         return base_ != nullptr;
     }
 
-    void initialize(uint16_t divisor = 1) const noexcept {
+    /* Destructive device setup belongs to the durable mapping owner.  It
+     * resets both FIFOs and leaves receive interrupts disabled so a worker
+     * generation can attach without discarding an in-flight byte. */
+    void reset(uint16_t divisor = 1) const noexcept {
         if (!valid()) {
             return;
         }
@@ -28,7 +31,16 @@ public:
         reg(Ier) = static_cast<uint8_t>(divisor >> 8);
         reg(Lcr) = Lcr8n1;
         reg(Fcr) = FcrReset;
-        reg(Ier) = IerRx;
+        reg(Ier) = 0;
+    }
+
+    /* Worker generations only enable RX.  Preserve any unrelated interrupt
+     * enables configured by the durable device owner. */
+    void enable_rx() const noexcept {
+        if (!valid()) {
+            return;
+        }
+        reg(Ier) = static_cast<uint8_t>(reg(Ier) | IerRx);
     }
 
     [[nodiscard]] auto tx_ready() const noexcept -> bool {

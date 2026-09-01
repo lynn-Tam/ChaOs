@@ -95,7 +95,7 @@ struct Console final {
         }
         phase = myos::deploy::LeasePhase::Mapped;
         port = myos::uart::Port{UartAddress};
-        port.initialize();
+        port.reset();
         /* The mapping is the authoritative lifetime; a null Port is an
          * invalid observation, but cleanup still owns the committed mapping. */
         if (!port.valid()) {

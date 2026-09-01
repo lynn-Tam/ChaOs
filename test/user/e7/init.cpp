@@ -4,6 +4,7 @@
 #include <user/lib/deployment_syscall.hpp>
 #include <user/lib/image_materializer.hpp>
 #include <user/lib/syscall.hpp>
+#include <user/lib/uart.hpp>
 #include <uapi/bootstrap.h>
 
 namespace {
@@ -43,6 +44,7 @@ constexpr myos_word_t VprocDescriptorOffset =
 constexpr myos_word_t EndpointDescriptorOffset = 2048;
 constexpr myos_word_t SuccessFault = 0xe100;
 constexpr myos_word_t FailureFault = 0xe000;
+constexpr myos_word_t UartAddress = 0x3001'0000;
 
 void put_le16(uint8_t* bytes, size_t offset, uint16_t value) noexcept {
     bytes[offset] = static_cast<uint8_t>(value);
@@ -92,6 +94,85 @@ static_assert(
     (void)*reinterpret_cast<volatile const myos_word_t*>(address);
     myos::exit();
 }
+
+class UartRoot final {
+public:
+    [[nodiscard]] auto open(
+        myos::cap::CapRef vspace,
+        myos::cap::CapRef memory) noexcept -> bool {
+        if (!vspace || vspace.cspace != 0 || !memory
+            || memory.cspace != 0 || region_) {
+            return false;
+        }
+        const auto created = myos::vm_create_region(
+            vspace.selector,
+            UartAddress,
+            PageSize,
+            MYOS_VM_READ | MYOS_VM_WRITE,
+            MYOS_VM_DEVICE,
+            MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
+        if (created.status != MYOS_STATUS_OK || created.value == 0) {
+            return false;
+        }
+        region_ = myos::cap::OwnedCap{
+            myos::cap::CapRef{created.value, 0}};
+        const auto mapped = myos::vm_map(
+            region_.selector(), memory.selector,
+            UartAddress, PageSize, 0,
+            MYOS_VM_READ | MYOS_VM_WRITE);
+        if (!committed(mapped)) {
+            return false;
+        }
+        mapped_ = true;
+        myos::uart::Port{UartAddress}.reset();
+        return true;
+    }
+
+    [[nodiscard]] auto close() noexcept -> bool {
+        if (!region_) {
+            return true;
+        }
+        if (mapped_) {
+            for (;;) {
+                const auto unmapped = myos::vm_unmap(
+                    region_.selector(), UartAddress, PageSize);
+                if (committed(unmapped)) {
+                    mapped_ = false;
+                    break;
+                }
+                if (!retryable(unmapped.status)) {
+                    return false;
+                }
+                myos::yield();
+            }
+        }
+        for (;;) {
+            const auto destroyed = myos::vm_destroy_region(
+                region_.selector());
+            if (committed(destroyed)) {
+                break;
+            }
+            if (!retryable(destroyed.status)) {
+                return false;
+            }
+            myos::yield();
+        }
+        for (;;) {
+            const myos_status_t closed = region_.close();
+            if (closed == MYOS_STATUS_OK) {
+                return true;
+            }
+            if (!retryable(closed)) {
+                return false;
+            }
+            myos::yield();
+        }
+    }
+
+private:
+    myos::cap::OwnedCap region_{};
+    bool mapped_{};
+};
 
 class Loader final {
 public:
@@ -2375,12 +2456,23 @@ extern "C" void myos_main(
         fault(FailureFault);
     }
 
+    UartRoot uart_root{};
+    if (!uart_root.open(
+            myos::cap::CapRef{
+                bootstrap->selector(MYOS_BOOTSTRAP_CAP_VSPACE), 0},
+            myos::cap::CapRef{
+                bootstrap->selector(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0})) {
+        fault(FailureFault);
+    }
     Loader loader{*bootstrap, parent_pool};
     const bool complete = loader.run();
     if (!loader.cleanup()) {
         myos::cap::SyscallBackend::ownership_fault(MYOS_STATUS_BUSY);
     }
     if (!complete) {
+        if (!uart_root.close()) {
+            myos::cap::SyscallBackend::ownership_fault(MYOS_STATUS_BUSY);
+        }
         fault(FailureFault + loader.failure_code());
     }
     UartLoader uart{*bootstrap, parent_pool};
@@ -2388,7 +2480,13 @@ extern "C" void myos_main(
         if (!uart.cleanup()) {
             myos::cap::SyscallBackend::ownership_fault(MYOS_STATUS_BUSY);
         }
+        if (!uart_root.close()) {
+            myos::cap::SyscallBackend::ownership_fault(MYOS_STATUS_BUSY);
+        }
         fault(FailureFault + 0x100 + uart.failure_code());
+    }
+    if (!uart_root.close()) {
+        myos::cap::SyscallBackend::ownership_fault(MYOS_STATUS_BUSY);
     }
     fault(SuccessFault);
 }
