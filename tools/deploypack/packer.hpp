@@ -393,6 +393,7 @@ inline auto pack_production(
                               std::uint32_t bootstrap_first,
                               std::uint32_t mapping_count,
                               std::uint16_t readiness,
+                              std::uint16_t restart,
                               std::uint64_t pool_memory,
                               std::uint64_t pool_caps,
                               std::uint64_t critical_bytes,
@@ -432,7 +433,7 @@ inline auto pack_production(
         put(bytes, offset + MYOS_DEPLOY_TASK_TERMINAL,
             MYOS_DEPLOY_TERMINAL_CLOSE, 2);
         put(bytes, offset + MYOS_DEPLOY_TASK_RESTART,
-            MYOS_DEPLOY_RESTART_NEVER, 2);
+            restart, 2);
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST,
             bootstrap_first, 4);
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 5, 4);
@@ -442,11 +443,13 @@ inline auto pack_production(
     const std::size_t task1 = task0 + MYOS_DEPLOY_TASK_STRIDE;
     task_row(task0, 0, 2, 3, 4, 0, 0, 0, 0, 0, 0,
              process_mapping_count, MYOS_DEPLOY_READINESS_NONE,
+             MYOS_DEPLOY_RESTART_ON_FAULT,
              32U * 1024U * 1024U + MYOS_DEPLOY_PAGE_SIZE, 513,
              process_critical, 64, 5);
     task_row(task1, 1, 5, 6, 7, 1,
              process_mapping_count, 1, 1, 5, 5, proof_mapping_count,
              MYOS_DEPLOY_READINESS_START,
+             MYOS_DEPLOY_RESTART_NEVER,
              16U * 1024U * 1024U, 256, proof_critical, 64, 4);
 
     const auto task_row_extra = [&](std::size_t offset, std::size_t name,
@@ -465,6 +468,7 @@ inline auto pack_production(
                                     std::uint32_t export_first,
                                     std::uint32_t export_count,
                                     std::uint16_t readiness,
+                                    std::uint16_t restart,
                                     std::uint64_t pool_memory,
                                     std::uint64_t pool_caps,
                                     std::uint64_t critical_bytes,
@@ -504,7 +508,7 @@ inline auto pack_production(
         put(bytes, offset + MYOS_DEPLOY_TASK_TERMINAL,
             MYOS_DEPLOY_TERMINAL_CLOSE, 2);
         put(bytes, offset + MYOS_DEPLOY_TASK_RESTART,
-            MYOS_DEPLOY_RESTART_NEVER, 2);
+            restart, 2);
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST,
             bootstrap_first, 4);
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT,
@@ -521,7 +525,8 @@ inline auto pack_production(
         task0 + 2 * MYOS_DEPLOY_TASK_STRIDE,
         42, 45, 46, 47, 2, consumer_mapping_first, consumer_mapping_count,
         2, 1, 2, 10, 5, 10, 5, 0, 1,
-        MYOS_DEPLOY_READINESS_START, consumer_pool_memory,
+        MYOS_DEPLOY_READINESS_START, MYOS_DEPLOY_RESTART_NEVER,
+        consumer_pool_memory,
         consumer_pool_caps, consumer_critical, consumer_cspace_slots,
         consumer_cspace_pages,
         consumer_mapping_first + consumer_mapping_count - 2);
@@ -529,14 +534,16 @@ inline auto pack_production(
         task0 + 3 * MYOS_DEPLOY_TASK_STRIDE,
         43, 48, 49, 50, 3, pager_mapping_first, pager_mapping_count,
         3, 3, 3, 15, 11, 15, 11, 1, 0,
-        MYOS_DEPLOY_READINESS_EXPLICIT, pager_pool_memory, pager_pool_caps,
+        MYOS_DEPLOY_READINESS_EXPLICIT, MYOS_DEPLOY_RESTART_NEVER,
+        pager_pool_memory, pager_pool_caps,
         pager_critical, pager_cspace_slots, pager_cspace_pages,
         pager_mapping_first + pager_mapping_count - 3);
     task_row_extra(
         task0 + 4 * MYOS_DEPLOY_TASK_STRIDE,
         44, 51, 52, 53, 4, uart_mapping_first, uart_mapping_count,
         6, 3, 4, 26, 9, 26, 9, 1, 0,
-        MYOS_DEPLOY_READINESS_EXPLICIT, uart_pool_memory, uart_pool_caps,
+        MYOS_DEPLOY_READINESS_EXPLICIT, MYOS_DEPLOY_RESTART_NEVER,
+        uart_pool_memory, uart_pool_caps,
         uart_critical, uart_cspace_slots, uart_cspace_pages,
         uart_mapping_first + uart_mapping_count - 1);
 

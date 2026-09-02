@@ -583,22 +583,23 @@ template<size_t N>
 
 [[nodiscard]] auto deploy_process_server(
     myos::cap::CapRef parent_pool,
-    uint32_t runtime_cpu_count) noexcept -> bool {
+    uint32_t runtime_cpu_count) noexcept
+    -> libk::optional<myos_status_t> {
     auto bindings = task_bindings(
         runtime.core.domain, runtime.core.bundle);
     auto pending = prepare_task(
         "process-server", parent_pool, bindings, runtime_cpu_count);
     if (!pending) {
-        return false;
+        return libk::nullopt;
     }
     TaskHandle task = libk::move(*pending);
     runtime.console.text("init: process-server-prepared\n");
     if (!start_task(task)) {
-        return false;
+        return libk::nullopt;
     }
     const auto* started_record = runtime.table.record(task.id);
     if (started_record == nullptr) {
-        return false;
+        return libk::nullopt;
     }
     const bool reached_running =
         started_record->state() == myos::deploy::TaskState::Running;
@@ -608,12 +609,10 @@ template<size_t N>
     myos_status_t terminal_status = MYOS_STATUS_INTERNAL;
     if (!myos::deploy::supervision::observe_and_close(
             runtime.table, task.id, task.receiver, terminal_status)) {
-        return false;
+        return libk::nullopt;
     }
     runtime.console.text("init: process-server-terminal\n");
-    /* Init supervises process_server as a service boundary; its non-OK
-     * terminal is therefore a failed deployment rather than root success. */
-    return reached_running && terminal_status == MYOS_STATUS_OK;
+    return terminal_status;
 }
 
 [[nodiscard]] auto close_views() noexcept -> bool {
@@ -748,9 +747,37 @@ template<size_t N>
     }
     runtime.console.text("init: core-authorities\n");
 
+    uint16_t process_restart = MYOS_DEPLOY_RESTART_NEVER;
+    {
+        const auto process_index = runtime.plan.find_task("process-server");
+        const auto plan_lease = runtime.plan.lease();
+        if (!process_index || !plan_lease) {
+            return false;
+        }
+        const auto process_task = plan_lease->task(*process_index);
+        const auto* process_row = process_task.row();
+        if (process_row == nullptr
+            || process_row->readiness != MYOS_DEPLOY_READINESS_NONE
+            || process_row->terminal != MYOS_DEPLOY_TERMINAL_CLOSE
+            || process_row->restart != MYOS_DEPLOY_RESTART_ON_FAULT) {
+            return false;
+        }
+        process_restart = process_row->restart;
+    }
+
     runtime.console.text("init: process-server-constructing\n");
-    if (!deploy_process_server(*root_pool, bootstrap.cpu_count())) {
-        return false;
+    for (;;) {
+        const auto terminal = deploy_process_server(
+            *root_pool, bootstrap.cpu_count());
+        if (!terminal) {
+            return false;
+        }
+        if (*terminal == MYOS_STATUS_OK) {
+            break;
+        }
+        if (process_restart != MYOS_DEPLOY_RESTART_ON_FAULT) {
+            return false;
+        }
     }
 
     auto consumer_pending = prepare_task(

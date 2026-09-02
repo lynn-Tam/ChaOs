@@ -12,6 +12,7 @@
 
 #include "deploypack/golden_fixture.hpp"
 #include "../user/lib/deploy_manifest.hpp"
+#include "../user/lib/deployment_plan.hpp"
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
@@ -379,6 +380,26 @@ auto accepts_production_authority_budget() -> bool {
     if (!parsed) {
         return false;
     }
+    myos::deploy::PlanSet<1> plans{};
+    auto decoded = myos::deploy::DeploymentPlan::decode(
+        parsed.value(), plans);
+    if (!decoded || decoded.value().task_count() != 5) {
+        return false;
+    }
+    auto plan = libk::move(decoded).value();
+    const uint16_t expected_restart[5] = {
+        MYOS_DEPLOY_RESTART_ON_FAULT,
+        MYOS_DEPLOY_RESTART_NEVER,
+        MYOS_DEPLOY_RESTART_NEVER,
+        MYOS_DEPLOY_RESTART_NEVER,
+        MYOS_DEPLOY_RESTART_NEVER,
+    };
+    for (uint32_t index = 0; index < 5; ++index) {
+        const auto* row = plan.task(index);
+        if (row == nullptr || row->restart != expected_restart[index]) {
+            return false;
+        }
+    }
     ManifestTaskRow process{};
     ManifestTaskRow proof{};
     ManifestTaskRow consumer{};
@@ -408,10 +429,12 @@ auto accepts_production_authority_budget() -> bool {
             && row.attenuation.rights == rights;
     };
     return process.pool_memory == process_memory
+        && process.restart == MYOS_DEPLOY_RESTART_ON_FAULT
         && process.pool_caps == 513
         && process.cspace_slots == 64
         && process.cspace_pages == 5
         && proof.pool_memory == UINT64_C(16) * UINT64_C(1024) * UINT64_C(1024)
+        && proof.restart == MYOS_DEPLOY_RESTART_NEVER
         && proof.pool_caps == 256
         && proof.cspace_slots == 64
         && proof.cspace_pages == 4
@@ -421,6 +444,7 @@ auto accepts_production_authority_budget() -> bool {
         && consumer.cspace_slots == 5
         && consumer.cspace_pages == 3
         && consumer.readiness == MYOS_DEPLOY_READINESS_START
+        && consumer.restart == MYOS_DEPLOY_RESTART_NEVER
         && consumer.export_count == 1
         && pager.pool_memory == UINT64_C(0x3a000)
         && pager.pool_caps == 11
@@ -428,6 +452,7 @@ auto accepts_production_authority_budget() -> bool {
         && pager.cspace_slots == 11
         && pager.cspace_pages == 4
         && pager.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
+        && pager.restart == MYOS_DEPLOY_RESTART_NEVER
         && pager.export_count == 0
         && uart.pool_memory == UINT64_C(0x37000)
         && uart.pool_caps == 10
@@ -435,6 +460,7 @@ auto accepts_production_authority_budget() -> bool {
         && uart.cspace_slots == 10
         && uart.cspace_pages == 4
         && uart.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
+        && uart.restart == MYOS_DEPLOY_RESTART_NEVER
         && uart.export_count == 0
         && process_pool.attenuation.rights == MYOS_RIGHT_SPLIT
         && (proof_pool.attenuation.rights & MYOS_RIGHT_SPLIT) == 0

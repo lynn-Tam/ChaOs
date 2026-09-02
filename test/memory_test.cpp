@@ -33,15 +33,6 @@ constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_object{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_peer{};
 constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_staging{};
-constinit libk::ManualLifetime<kernel::pager::Pager> memory_test_pager{};
-constinit libk::ManualLifetime<kernel::pager::Pager> memory_test_wrong_pager{};
-
-struct PagerReset final {
-    ~PagerReset() noexcept {
-        memory_test_wrong_pager.reset();
-        memory_test_pager.reset();
-    }
-};
 
 struct StagingReset final {
     ~StagingReset() noexcept {
@@ -151,6 +142,45 @@ public:
         return *memory_test_objects;
     }
 
+    [[nodiscard]] auto make_pager() noexcept -> bool {
+        if (pager_) {
+            return false;
+        }
+        auto pending = objects().create_pager();
+        if (!pending) {
+            return false;
+        }
+        pager_ = libk::move(pending).value().publish();
+        return static_cast<bool>(pager_);
+    }
+
+    [[nodiscard]] auto make_wrong_pager() noexcept -> bool {
+        if (wrong_pager_) {
+            return false;
+        }
+        auto pending = objects().create_pager();
+        if (!pending) {
+            return false;
+        }
+        wrong_pager_ = libk::move(pending).value().publish();
+        return static_cast<bool>(wrong_pager_);
+    }
+
+    [[nodiscard]] auto pager() noexcept -> kernel::pager::Pager& {
+        KASSERT(pager_);
+        return pager_.get();
+    }
+
+    [[nodiscard]] auto pager_ref() noexcept {
+        KASSERT(pager_);
+        return pager_.ref();
+    }
+
+    [[nodiscard]] auto wrong_pager() noexcept -> kernel::pager::Pager& {
+        KASSERT(wrong_pager_);
+        return wrong_pager_.get();
+    }
+
     void keep(kernel::object::ObjectStore::MemoryHold&& memory) noexcept {
         KASSERT(!pooled_);
         pooled_ = libk::move(memory);
@@ -177,6 +207,14 @@ private:
             (void)pooled_.retire();
             pooled_.reset();
         }
+        if (wrong_pager_) {
+            (void)wrong_pager_.retire();
+            wrong_pager_.reset();
+        }
+        if (pager_) {
+            (void)pager_.retire();
+            pager_.reset();
+        }
         if (memory_test_objects) {
             memory_test_objects->drain_reclaim();
         }
@@ -190,6 +228,8 @@ private:
     }
 
     kernel::object::ObjectStore::MemoryHold pooled_{};
+    kernel::object::ObjectStore::PagerHold pager_{};
+    kernel::object::ObjectStore::PagerHold wrong_pager_{};
 };
 
 struct FakeMapping final : private libk::noncopyable_nonmovable {
@@ -608,17 +648,18 @@ bool test_object_store_memory_lifecycle_waits_for_page_lease(
 
 bool test_pager_backing_donates_owned_page_without_copy(
     const TestContext&) noexcept {
-    /*luna change: construct Pager cleanup before the backing fixture, reason: early exits must retire attachments before Pager destruction*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     kernel::mm::MemoryObject& memory = fixture.make(2 * kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)) {
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)) {
         return false;
     }
     const auto pending = memory.materialize(1);
@@ -665,13 +706,11 @@ bool test_pager_backing_donates_owned_page_without_copy(
 
 bool test_pager_supply_moves_staging_owner(
     const TestContext&) noexcept {
-    /*luna change: order Pager cleanup outside the backing fixture lifetime, reason: failed claim paths must detach before global Pager reset*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     StagingReset staging_reset{};
     kernel::mm::MemoryObject& target =
         fixture.make(kernel::mm::page_size);
@@ -680,8 +719,13 @@ bool test_pager_supply_moves_staging_owner(
         fixture.make_peer(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!target.initialize_pager(pager, access)
-        || !peer.initialize_pager(pager, access)) {
+    auto target_pager = fixture.pager_ref();
+    auto peer_pager = fixture.pager_ref();
+    if (!target_pager || !peer_pager
+        || !target.initialize_pager(
+               libk::move(target_pager).value(), access)
+        || !peer.initialize_pager(
+               libk::move(peer_pager).value(), access)) {
         return false;
     }
     /*luna change: route the staging object through the same bounded executor, reason: pager supply tests must not bypass MemoryObject work ownership*/
@@ -773,19 +817,22 @@ bool test_pager_supply_moves_staging_owner(
 
 bool test_two_pager_backings_reject_colliding_claim_owner(
     const TestContext&) noexcept {
-    /*luna change: let the fixture retire before resetting the shared Pager, reason: colliding-claim early exits must preserve attachment lifetime order*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
     auto& first = fixture.make(kernel::mm::page_size);
     auto& second = fixture.make_peer(kernel::mm::page_size);
-    if (!first.initialize_pager(pager, access)
-        || !second.initialize_pager(pager, access)
+    auto first_pager = fixture.pager_ref();
+    auto second_pager = fixture.pager_ref();
+    if (!first_pager || !second_pager
+        || !first.initialize_pager(
+               libk::move(first_pager).value(), access)
+        || !second.initialize_pager(
+               libk::move(second_pager).value(), access)
         || first.materialize(0).error() != kernel::mm::MemoryError::Pending
         || second.materialize(0).error() != kernel::mm::MemoryError::Pending) {
         return false;
@@ -843,20 +890,21 @@ bool test_two_pager_backings_reject_colliding_claim_owner(
     return protocol_ok && retired && closed;
 }
 
-/*luna change: remove the invalid relation-aware failure pseudo-test, reason: a raw callback owner cannot settle the private PageFault/Vproc pin and falsely reaches MemoryObject teardown*/
 bool test_pager_fail_publishes_backing_failure(
     const TestContext&) noexcept {
     /*luna change: place Pager cleanup outside fixture scope, reason: a failed pending claim must not outlive its backing attachment*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)) {
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)) {
         return false;
     }
     const auto pending = memory.materialize(0);
@@ -891,18 +939,21 @@ bool test_pager_fail_publishes_backing_failure(
 
 bool test_pager_backing_rejects_wrong_pager(
     const TestContext&) noexcept {
-    /*luna change: construct Pager cleanup before MemoryFixture, reason: ownership mismatch exits still need backing-first retirement*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize()
+        || !fixture.make_pager()
+        || !fixture.make_wrong_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
-    auto& wrong = memory_test_wrong_pager.emplace();
+    auto& pager = fixture.pager();
+    auto& wrong = fixture.wrong_pager();
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)
         || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
         return false;
     }
@@ -927,19 +978,23 @@ bool test_pager_backing_rejects_wrong_pager(
 
 bool test_pager_backing_attach_failure_rolls_back(
     const TestContext&) noexcept {
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     if (!pager.close(false)) {
         return false;
     }
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    const auto initialized = memory.initialize_pager(pager, access);
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref) {
+        return false;
+    }
+    const auto initialized = memory.initialize_pager(
+        libk::move(pager_ref).value(), access);
     return !initialized
         && initialized.error() == kernel::mm::MemoryError::AttachmentState
         && memory.state() == kernel::mm::MemoryState::Retired;
@@ -947,17 +1002,18 @@ bool test_pager_backing_attach_failure_rolls_back(
 
 bool test_pager_force_close_publishes_backing_failure(
     const TestContext&) noexcept {
-    /*luna change: keep Pager reset outermost around the backing fixture, reason: force-close cleanup must observe a retired attachment*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)
         || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
         return false;
     }
@@ -975,20 +1031,21 @@ bool test_pager_force_close_publishes_backing_failure(
 
 bool test_pager_reverse_mapping_usage_and_eviction(
     const TestContext&) noexcept {
-    /*luna change: keep Pager cleanup outside fixture destruction, reason: reverse-mapping early exits must retire pager backing first*/
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
         memory.retire();
     });
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)
         || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
         return false;
     }
@@ -1098,18 +1155,13 @@ bool test_pager_reverse_mapping_usage_and_eviction(
     return memory.state() == kernel::mm::MemoryState::Retired;
 }
 
-/*luna change: prove forced close through the real PagerBacking owner path,
-  reason: a PageSlot mirror cannot cover tree locking, node identity
-  matching or the attachment lifecycle the production forced transitions
-  exercise*/
 bool test_pager_forced_close_settles_backing_obligations(
     const TestContext&) noexcept {
-    PagerReset pager_reset{};
     MemoryFixture fixture{};
-    if (!fixture.initialize()) {
+    if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
-    auto& pager = memory_test_pager.emplace();
+    auto& pager = fixture.pager();
     kernel::mm::MemoryObject& memory =
         fixture.make(2 * kernel::mm::page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
@@ -1117,7 +1169,10 @@ bool test_pager_forced_close_settles_backing_obligations(
     });
     const auto access = kernel::mm::AccessMask::of(
         kernel::mm::Access::Read, kernel::mm::Access::Write);
-    if (!memory.initialize_pager(pager, access)
+    auto pager_ref = fixture.pager_ref();
+    if (!pager_ref
+        || !memory.initialize_pager(
+               libk::move(pager_ref).value(), access)
         || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
         return false;
     }

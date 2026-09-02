@@ -2451,21 +2451,6 @@ auto MemoryObject::initialize_boot_image(
 }
 
 auto MemoryObject::initialize_pager(
-    kernel::pager::Pager& pager,
-    AccessMask access) noexcept
-    -> libk::Expected<void, MemoryError> {
-    return initialize_backing(
-        BackingKind::Pager,
-        {},
-        {},
-        BootOwnership::Borrowed,
-        {},
-        &pager,
-        access,
-        {});
-}
-
-auto MemoryObject::initialize_pager(
     object::ObjectRef&& pager,
     AccessMask access) noexcept
     -> libk::Expected<void, MemoryError> {

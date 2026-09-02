@@ -338,13 +338,8 @@ public:
         BootOwnership ownership,
         OwnedPageGroup&& owned = {}) noexcept
         -> libk::Expected<void, MemoryError>;
-    [[nodiscard]] auto initialize_pager(
-        kernel::pager::Pager& pager,
-        AccessMask access) noexcept
-        -> libk::Expected<void, MemoryError>;
     // The structural reference keeps the Pager payload alive for the whole
-    // backing lifetime. The raw overload above is retained for stack-owned
-    // unit-test pagers and is intentionally non-owning.
+    // backing lifetime.
     [[nodiscard]] auto initialize_pager(
         object::ObjectRef&& pager,
         AccessMask access) noexcept

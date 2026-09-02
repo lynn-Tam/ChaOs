@@ -119,7 +119,7 @@ enum class FaultKind : u8 {
     AccessDenied,
     Busy,
     Pending,
-    /*luna change: preserve pressure classes through the page continuation, reason: Stage C resource policy must not collapse into pager failure*/
+    /* Preserve pressure classification through page-fault continuation. */
     Pressure,
     ResourceExhausted,
     OutOfMemory,
@@ -128,7 +128,7 @@ enum class FaultKind : u8 {
     Materialized,
 };
 
-/*luna change: share VSpace error classification at the fault boundary, reason: continuation adapters must not duplicate resource policy mapping*/
+/* Keep VSpace error classification at the fault boundary. */
 [[nodiscard]] auto fault_kind(VSpaceError error) noexcept -> FaultKind;
 
 struct FaultResult final {
