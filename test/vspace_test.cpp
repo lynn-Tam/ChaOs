@@ -432,6 +432,15 @@ bool test_child_region_and_capability_publish_together(
         if (!resolved) {
             return false;
         }
+        // Reservation exhaustion is a quota error, not a transient VSpace
+        // claim. Failure must leave the range available for publication.
+        kernel::cap::CSpace limited{fixture.pmm(), {.slots = 1, .pages = 2}};
+        auto denied = fixture.space().create_region(
+            resolved.value(), limited, child_range, child_policy,
+            kernel::cap::Rights::of(kernel::cap::Right::Map));
+        limited.retire();
+        if (denied || denied.error() != kernel::mm::VSpaceError::QuotaExceeded)
+            return false;
         auto created = fixture.space().create_region(
             resolved.value(),
             cspace,

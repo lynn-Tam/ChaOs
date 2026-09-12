@@ -63,6 +63,8 @@ static_assert(MYOS_RESOURCE_PAGER
     == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
 static_assert(MYOS_RESOURCE_IRQ
     == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
+static_assert(MYOS_RESOURCE_IO_SPACE
+    == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
 
 using kernel::object::ObjectKind;
 
@@ -1102,6 +1104,26 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         });
 }
 
+[[gnu::noinline]] [[nodiscard]] auto create_io_space(
+    Invocation& invocation) noexcept -> Result {
+    KernelState* const kernel = invocation.cpu.runtime().kernel;
+    KASSERT(kernel != nullptr);
+    for (usize index = 1; index < 6; ++index)
+        if (invocation.trap.arg(index) != 0) return returned(MYOS_STATUS_BAD_ARGS);
+    auto pool = resolve_pool(invocation, cap::Right::Create);
+    if (!pool) return returned(cap_status(pool.error()));
+    constexpr auto charge = resource::Traits<io::Space>::fixed();
+    return construct<io::Space>(invocation, pool.value(), charge, charge,
+        [&](resource::Reservation&& sponsorship) {
+            return kernel->objects().create_io_space_sponsored(libk::move(sponsorship),
+                kernel->pmm(), kernel->io_work(), kernel->objects(), kernel->grants());
+        }, [](io::Space&) {
+            constexpr auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
+                cap::Right::Inspect, cap::Right::Connect, cap::Right::Close, cap::Right::Revoke);
+            return PublishedAuthority{{rights}, {rights}};
+        });
+}
+
 [[gnu::noinline]] [[nodiscard]] auto create_memory(
     Invocation& invocation) noexcept -> Result {
     KernelState* const kernel = invocation.cpu.runtime().kernel;
@@ -1849,6 +1871,8 @@ auto handle_construction(
         return create_pager(invocation);
     case MYOS_SYS_IRQ_CREATE:
         return create_irq(invocation);
+    case MYOS_SYS_IO_SPACE_CREATE:
+        return create_io_space(invocation);
     default:
         break;
     }

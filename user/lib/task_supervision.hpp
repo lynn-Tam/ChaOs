@@ -50,7 +50,7 @@ template<typename Bundle, typename Plans>
         return false;
     }
     plan = libk::move(decoded.value());
-    return plan.task_count() == expected_tasks;
+    return expected_tasks == 0 || plan.task_count() == expected_tasks;
 }
 
 template<typename Table>

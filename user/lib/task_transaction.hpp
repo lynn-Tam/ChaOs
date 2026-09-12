@@ -556,7 +556,7 @@ public:
             if (this == &other) {
                 return *this;
             }
-            detach();
+            static_cast<void>(detach());
             set_ = other.set_;
             id_ = other.id_;
             active_ = other.active_;
@@ -1489,12 +1489,17 @@ public:
     auto operator=(const TaskTable&) -> TaskTable& = delete;
 
     ~TaskTable() noexcept {
+        if (!empty()) Record::ownership_fault(MYOS_STATUS_BUSY);
+    }
+
+    [[nodiscard]] auto empty() const noexcept -> bool {
         for (const Slot& slot : slots_) {
             if (slot_tag(slot) != TaskSlotTag::Vacant
                 && slot_tag(slot) != TaskSlotTag::Retired) {
-                Record::ownership_fault(MYOS_STATUS_BUSY);
+                return false;
             }
         }
+        return true;
     }
 
 private:
@@ -2813,9 +2818,7 @@ public:
                  bootstrap < row->bootstraps.count; ++bootstrap) {
                 const PlanBootstrap* const bootstrap_row =
                     task.bootstrap(bootstrap);
-                if (bootstrap_row == nullptr
-                    || bootstrap_row->kind < MYOS_BOOTSTRAP_CAP_VSPACE
-                    || bootstrap_row->kind > MYOS_BOOTSTRAP_CAP_STAGING_REGION) {
+                if (bootstrap_row == nullptr) {
                     return failure(MYOS_STATUS_BAD_ARGS);
                 }
                 const myos_object_kind_t expected_kind =

@@ -238,4 +238,9 @@ auto Sv39Builder::finalize() && noexcept -> arch::KernelRoot {
         libk::move(page_tables_));
 }
 
+auto Sv39Builder::finalize_io() && noexcept -> arch::IoRoot {
+    return arch::IoRoot{
+        libk::exchange(root_page_, empty_root()), libk::move(page_tables_)};
+}
+
 } // namespace arch::riscv64

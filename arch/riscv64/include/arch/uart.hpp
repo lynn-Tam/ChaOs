@@ -34,8 +34,8 @@ private:
 
 class Plic final {
 public:
-    explicit constexpr Plic(usize base = virt_plic_base) noexcept
-        : base_(base) {}
+    explicit constexpr Plic(usize base, usize context) noexcept
+        : base_(base), context_(context) {}
 
     void configure(u32 source, u32 priority = 1) const noexcept;
     void mask(u32 source) const noexcept;
@@ -49,6 +49,7 @@ private:
     }
 
     usize base_{};
+    usize context_{};
 };
 
 } // namespace arch::riscv64

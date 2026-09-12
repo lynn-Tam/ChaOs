@@ -593,6 +593,7 @@ bool test_resource_pool_close_waits_for_open_transactions(
     }
     reservation_pool.reset();
     sched_test_objects->drain_reclaim();
+
     return sched_test_pmm->verify_invariants();
 }
 
@@ -779,27 +780,31 @@ bool test_ready_queue_orders_priority_and_fifo(
         }
     }
 
-    kernel::sched::ReadyQueue queue{};
-    kernel::sched::Binding* const low = contexts[0]->binding();
-    kernel::sched::Binding* const high_first = contexts[1]->binding();
-    kernel::sched::Binding* const high_second = contexts[2]->binding();
-    const auto low_urgency = contexts[0]->urgency();
-    const auto high_urgency = contexts[1]->urgency();
-    queue.enqueue(*low, low_urgency);
-    queue.enqueue(*high_first, high_urgency);
-    queue.enqueue(*high_second, high_urgency);
+    bool ordered{};
+    bool membership{};
+    {
+        kernel::sched::ReadyQueue queue{};
+        kernel::sched::Binding* const low = contexts[0]->binding();
+        kernel::sched::Binding* const high_first = contexts[1]->binding();
+        kernel::sched::Binding* const high_second = contexts[2]->binding();
+        const auto low_urgency = contexts[0]->urgency();
+        const auto high_urgency = contexts[1]->urgency();
+        queue.enqueue(*low, low_urgency);
+        queue.enqueue(*high_first, high_urgency);
+        queue.enqueue(*high_second, high_urgency);
 
-    const bool ordered = queue.size() == 3
-        && queue.front() == high_first
-        && queue.pop_front(high_urgency) == high_first
-        && queue.front() == high_second
-        && queue.pop_front(high_urgency) == high_second
-        && queue.front() == low
-        && queue.pop_front(low_urgency) == low
-        && queue.empty();
-    queue.enqueue(*low, low_urgency);
-    queue.remove(*low, low_urgency);
-    const bool membership = queue.empty() && !low->queued();
+        ordered = queue.size() == 3
+            && queue.front() == high_first
+            && queue.pop_front(high_urgency) == high_first
+            && queue.front() == high_second
+            && queue.pop_front(high_urgency) == high_second
+            && queue.front() == low
+            && queue.pop_front(low_urgency) == low
+            && queue.empty();
+        queue.enqueue(*low, low_urgency);
+        queue.remove(*low, low_urgency);
+        membership = queue.empty() && !low->queued();
+    }
 
     for (usize index = 0; index < 3; ++index) {
         if (!contexts[index]->unbind()

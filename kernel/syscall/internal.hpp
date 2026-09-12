@@ -125,5 +125,8 @@ template<typename Descriptor>
 [[nodiscard]] auto handle_terminal(
     usize operation,
     Invocation& invocation) noexcept -> Result;
+[[nodiscard]] auto handle_io(
+    usize operation,
+    Invocation& invocation) noexcept -> Result;
 
 } // namespace kernel::syscall

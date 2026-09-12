@@ -6,6 +6,7 @@
 #include <uapi/capability.h>
 #include <uapi/channel.h>
 #include <uapi/endpoint.h>
+#include <uapi/io.h>
 #include <uapi/resource.h>
 #include <uapi/status.h>
 #include <uapi/syscall.h>
@@ -42,6 +43,37 @@ namespace myos {
         .value = a1,
         .value2 = a2,
     };
+}
+
+[[nodiscard]] inline auto io_space_create(myos_cap_t pool) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_CREATE, pool);
+}
+
+[[nodiscard]] inline auto io_space_bind(myos_cap_t space, myos_cap_t device,
+    myos_cap_t memory, myos_word_t first_page, myos_word_t page_count,
+    myos_word_t iova) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_BIND, space, device, memory, first_page, page_count, iova);
+}
+
+[[nodiscard]] inline auto io_space_state(myos_cap_t space) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_STATE, space);
+}
+
+[[nodiscard]] inline auto io_space_info(myos_cap_t space,
+    myos_word_t ipc_offset = 0) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_INFO, space, ipc_offset);
+}
+
+[[nodiscard]] inline auto io_space_bar(myos_cap_t space, myos_word_t index) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_BAR, space, index);
+}
+
+[[nodiscard]] inline auto io_space_irq(myos_cap_t space) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_IRQ, space);
+}
+
+[[nodiscard]] inline auto io_space_close(myos_cap_t space) noexcept -> SysResult {
+    return syscall(MYOS_SYS_IO_SPACE_CLOSE, space);
 }
 
 inline void yield() noexcept {

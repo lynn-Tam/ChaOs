@@ -81,7 +81,9 @@ arch_sources = files(
   'arch/riscv64/context/kernel_context.S', 'arch/riscv64/sbi/call.cpp',
   'arch/riscv64/sbi/console.cpp', 'arch/riscv64/sbi/system.cpp',
   'arch/riscv64/time/clock.cpp', 'arch/riscv64/time/timer.cpp',
-  'arch/riscv64/uart/uart.cpp', 'arch/riscv64/mmu/sv39_builder.cpp',
+  'arch/riscv64/uart/uart.cpp', 'arch/riscv64/pci/pci.cpp',
+  'arch/riscv64/iommu/iommu.cpp',
+  'arch/riscv64/mmu/sv39_builder.cpp', 'arch/riscv64/mmu/io_page_table.cpp',
   'arch/riscv64/mmu/sv39_editor.cpp', 'arch/riscv64/mmu/range_map.cpp',
   'arch/riscv64/mmu/initial_kernel_map.cpp', 'arch/riscv64/mmu/initial_page_table.cpp',
   'arch/riscv64/trap/trap.S', 'arch/riscv64/trap/context.cpp',
@@ -89,6 +91,7 @@ arch_sources = files(
 )
 
 core_kernel_sources = files(
+  'kernel/io/platform.cpp', 'kernel/io/device.cpp', 'kernel/io/space.cpp',
   'kernel/boot/boot.cpp', 'kernel/boot/cpu_topology.cpp', 'kernel/boot/timebase.cpp',
   'kernel/boot/firmware/devicetree/fdt.cpp', 'kernel/image/boot_bundle.cpp',
   'kernel/init/root_task.cpp', 'kernel/init/run.cpp', 'kernel/core/kernel_state.cpp',
@@ -116,6 +119,7 @@ core_kernel_sources = files(
   'kernel/syscall/object.cpp', 'kernel/syscall/notification.cpp',
   'kernel/syscall/vproc.cpp', 'kernel/syscall/tunnel.cpp', 'kernel/syscall/endpoint.cpp',
   'kernel/syscall/channel.cpp', 'kernel/syscall/pager_irq.cpp', 'kernel/syscall/terminal.cpp',
+  'kernel/syscall/io.cpp',
   'kernel/syscall/vm.cpp', 'kernel/time/clock.cpp', 'kernel/mm/page_state.cpp',
   'kernel/fault/terminal.cpp', 'kernel/fault/observation.cpp', 'kernel/mm/kernel_stack.cpp',
   'kernel/mm/reclaim.cpp',
@@ -258,7 +262,7 @@ test_sources = files(
   'test/scenario_basic.cpp', 'test/scenario_remote.cpp', 'test/scenario_publication.cpp',
   'test/scenario_report.cpp', 'test/scenario_observer.cpp',
   # /*luna change: compile the pressure fixture with the existing test module, reason: ordinary images keep the dormant storage while only the pressure image selects it*/
-  'test/scenario_pressure.cpp', 'test/libk_test.cpp',
+  'test/scenario_pressure.cpp', 'test/scenario_io.cpp', 'test/libk_test.cpp',
   'test/sync_test.cpp', 'test/allocator_test.cpp', 'test/bootinfo_test.cpp',
   'test/boot_bundle_test.cpp', 'test/cpu_topology_test.cpp', 'test/sched_test.cpp',
   'test/cap_test.cpp', 'test/memory_test.cpp', 'test/translation_test.cpp',
@@ -311,6 +315,19 @@ pressure_scenario = static_library(
   c_args: kernel_c_args,
   cpp_args: kernel_cpp_args + ['-DMYOS_SCENARIO_ID=9'],
   pic: false, build_by_default: false,
+)
+io_scenario = static_library(
+  'kernel-scenario-io', files('kernel/diag/scenario_real.cpp'),
+  c_args: kernel_c_args,
+  cpp_args: kernel_cpp_args + ['-DMYOS_SCENARIO_ID=10'],
+  pic: false, build_by_default: false,
+)
+kernel_io = executable(
+  'kernel_io.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: debug_build_info_args,
+  link_whole: [core, concurrency, lock, console, report, panic, io_scenario, test_module],
+  link_args: kernel_link_args,
+  link_language: 'c', build_by_default: false,
 )
 # /*luna change: link a pressure-only image from shared core and test objects, reason: the physical fixture must not alter ordinary kernel_debug scenario selection or duplicate the object tree*/
 # The functional pressure gate keeps panic/assert, console, tests and the exact
@@ -382,9 +399,66 @@ e7_proof_user = executable(
   'e7-proof-test.elf', files('test/user/e7/proof.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'e7-proof-test.map')], link_language: 'c', build_by_default: false,
 )
+io_init_user = executable(
+  'io-init-test.elf', files('test/user/io/init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+io_worker_user = executable(
+  'io-worker-test.elf', files('test/user/io/worker.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+block_user = executable(
+  'block.elf', files('servers/block/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+files_user = executable(
+  'files.elf', files('servers/files/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+io_session_init_user = executable(
+  'io-session-init-test.elf', files('test/user/io/session_init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+io_client_user = executable(
+  'io-client-test.elf', files('test/user/io/client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+file_init_user = executable(
+  'file-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+file_client_user = executable(
+  'file-client-test.elf', files('test/user/io/file_client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 uart_user = executable(
   'uart.elf', files('servers/uart/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'uart.map')], link_language: 'c', build_by_default: false,
+)
+
+shell_user = executable(
+  'shell.elf', files('programs/shell/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+
+hello_user = executable(
+  'hello.elf', files('programs/hello/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+
+supervision_init = executable(
+  'supervision-init.elf', files('test/user/supervision/init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+
+supervision_process = executable(
+  'supervision-process.elf', files('test/user/supervision/process_server.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+
+uart_fixture = executable(
+  'uart-fixture.elf', files('test/user/e7/uart.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
 bootpack = executable(
@@ -392,9 +466,25 @@ bootpack = executable(
   cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
 )
 deploypack = executable(
-  'deploypack', files('tools/deploypack/main.cpp'), native: true,
+  'deploypack', files('tools/deploypack/main.cpp', 'tools/deploypack/validate.cpp'), native: true,
   cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
 )
+shared_ring_test = executable(
+  'shared-ring-test', files('test/shared_ring_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root],
+  dependencies: dependency('threads', native: true), build_by_default: false,
+)
+run_target('check-shared-ring', command: [shared_ring_test])
+io_queue_test = executable(
+  'io-queue-test', files('test/io_queue_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root], build_by_default: false,
+)
+run_target('check-io-queue', command: [io_queue_test])
+fat32_test = executable(
+  'fat32-test', files('test/fat32_test.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root], build_by_default: false,
+)
+run_target('check-fat32', command: [fat32_test])
 task_builder_test_manifest = executable(
   'task-builder-test-manifest', files('test/user/task_builder/manifest.cpp'),
   native: true, cpp_args: ['-std=c++23', '-I' + root], build_by_default: false,
@@ -454,14 +544,14 @@ deploy_fixture = custom_target(
   command: [deploypack, '@OUTPUT@'], build_by_default: false,
 )
 production_manifest = custom_target(
-  'production-manifest', input: [process_server_user, proof_user, consumer_user, pager_user, uart_user],
+  'production-manifest', input: [supervision_process, proof_user, consumer_user, pager_user, uart_fixture],
   output: 'deployment.manifest',
   command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@'],
   build_by_default: false,
 )
 supervised_failure_manifest = custom_target(
   'supervised-failure-manifest',
-  input: [process_server_user, supervised_failure_user, consumer_user, pager_user, uart_user],
+  input: [supervision_process, supervised_failure_user, consumer_user, pager_user, uart_fixture],
   output: 'supervised-failure.manifest',
   command: [deploypack, 'production', '@OUTPUT@', '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@'],
   build_by_default: false,
@@ -478,13 +568,84 @@ run_target('test-syscall-dependency', command: [syscall_dependency_test])
 run_target('test-image-materializer', command: [image_materializer_test])
 run_target('test-task-transaction', command: [task_transaction_test])
 run_target('test-task-authority', command: [task_authority_test])
+io_user_manifest = custom_target(
+  'io-user-manifest', input: [io_worker_user], output: 'io-user.manifest',
+  command: [deploypack, 'io-test', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+io_user_bundle = custom_target(
+  'io-user-bundle', input: [io_init_user, io_worker_user, io_user_manifest], output: 'io-user.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'io-test=@INPUT1@', 'data:manifest=@INPUT2@'],
+  build_by_default: false,
+)
+io_session_manifest = custom_target(
+  'io-session-manifest', input: [block_user, io_client_user], output: 'io-session.manifest',
+  command: [deploypack, 'io-session', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+io_session_bundle = custom_target(
+  'io-session-bundle', input: [io_session_init_user, block_user, io_client_user, io_session_manifest],
+  output: 'io-session.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'io-client=@INPUT2@', 'data:manifest=@INPUT3@'],
+  build_by_default: false,
+)
+application_manifest = custom_target(
+  'application-manifest', input: hello_user, output: 'hello.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+hello_package = custom_target(
+  'hello-package', input: [hello_user, application_manifest], output: 'hello.pkg',
+  command: [bootpack, '@OUTPUT@', 'hello', 'hello=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+disk_image = custom_target(
+  'disk-image', input: [files('user/disk/README.TXT'), hello_package], output: 'disk.img',
+  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@'],
+  build_by_default: false,
+)
+file_test_data = custom_target(
+  'file-test-data', output: 'file-test.data',
+  command: [find_program('python3'), '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(bytes(i % 251 for i in range(16397)))', '@OUTPUT@'],
+  build_by_default: false,
+)
+file_test_disk = custom_target(
+  'file-test-disk', input: file_test_data, output: 'file-test.img',
+  command: [find_program('python3'), files('test/tools/file_image.py'), files('tools/build/fat-image.py'), '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+file_session_manifest = custom_target(
+  'file-session-manifest', input: [block_user, files_user, file_client_user], output: 'file-session.manifest',
+  command: [deploypack, 'file-session', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+file_session_bundle = custom_target(
+  'file-session-bundle', input: [file_init_user, block_user, files_user, file_client_user, file_session_manifest], output: 'file-session.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'files=@INPUT2@', 'file-client=@INPUT3@', 'data:manifest=@INPUT4@'],
+  build_by_default: false,
+)
+
+native_manifest = custom_target(
+  'native-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user],
+  output: 'native.manifest', command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
 boot_bundle = custom_target(
-  'boot-bundle', input: [init_user, process_server_user, proof_user, consumer_user, pager_user, uart_user, production_manifest], output: 'boot.bundle',
+  'boot-bundle', input: [init_user, uart_user, process_server_user, shell_user, block_user, files_user, native_manifest], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
+)
+exhaustion_manifest = custom_target(
+  'application-exhaustion-manifest', input: hello_user, output: 'hello-exhaustion.manifest',
+  command: [deploypack, 'application-exhaustion', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+exhaustion_package = custom_target(
+  'application-exhaustion-package', input: [hello_user, exhaustion_manifest], output: 'hello-exhaustion.pkg',
+  command: [bootpack, '@OUTPUT@', 'hello', 'hello=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+exhaustion_disk = custom_target(
+  'console-exhaustion-disk', input: [files('user/disk/README.TXT'), exhaustion_package], output: 'console-exhaustion.img',
+  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@'], build_by_default: false,
+)
+supervision_bundle = custom_target(
+  'supervision-bundle', input: [supervision_init, supervision_process, proof_user, consumer_user, pager_user, uart_fixture, production_manifest], output: 'supervision.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'process_server=@INPUT1@', 'proof=@INPUT2@', 'consumer=@INPUT3@', 'pager=@INPUT4@', 'uart=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
 )
 supervised_failure_bundle = custom_target(
   'supervised-failure-bundle',
-  input: [init_user, process_server_user, supervised_failure_user, consumer_user, pager_user, uart_user, supervised_failure_manifest],
+  input: [supervision_init, supervision_process, supervised_failure_user, consumer_user, pager_user, uart_fixture, supervised_failure_manifest],
   output: 'supervised-failure.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@',
     'process_server=@INPUT1@', 'proof=@INPUT2@', 'consumer=@INPUT3@',
@@ -493,13 +654,17 @@ supervised_failure_bundle = custom_target(
 )
 # /*luna change: encode pressure mode in the existing root module role, reason: the same user images and kernel composition need an explicit guest-visible run condition*/
 pressure_bundle = custom_target(
-    'pressure-bundle', input: [e7_init_user, e7_proof_user, uart_user], output: 'pressure.bundle',
+    'pressure-bundle', input: [e7_init_user, e7_proof_user, uart_fixture], output: 'pressure.bundle',
     command: [bootpack, '@OUTPUT@', 'pressure', 'pressure=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
 # /*luna change: encode resilience mode in its own root module role, reason: worker-death redelivery and pager_fail supervision are a separate run condition of the same images*/
 resilience_bundle = custom_target(
-    'resilience-bundle', input: [e7_init_user, e7_proof_user, uart_user], output: 'resilience.bundle',
+    'resilience-bundle', input: [e7_init_user, e7_proof_user, uart_fixture], output: 'resilience.bundle',
     command: [bootpack, '@OUTPUT@', 'resilience', 'resilience=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
+)
+ipc_bundle = custom_target(
+  'ipc-bundle', input: [e7_init_user, e7_proof_user, uart_fixture], output: 'ipc.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'proof=@INPUT1@', 'uart=@INPUT2@'], build_by_default: false,
 )
 proof_bundle = custom_target(
   'proof-bundle', input: e7_proof_user, output: 'proof.bundle', command: [bootpack, '@OUTPUT@', 'proof', 'proof=@INPUT@'], build_by_default: false,
@@ -532,7 +697,7 @@ run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
 run_target('audit-pressure-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure])
 run_target('audit-pressure-trace-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_pressure_trace])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, process_server_user, proof_user, consumer_user, pager_user, uart_user])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, init_user, process_server_user, shell_user, hello_user, consumer_user, pager_user, uart_user, block_user, files_user])
 run_target('audit-e7-user', command: [sh, audit_user, nm, readelf, e7_init_user, e7_proof_user])
 run_target('audit-task-transaction', command: [sh, audit_task_transaction, join_paths(root, 'user/lib/task_transaction.hpp')])
 run_target('audit-task-authority', command: [sh, audit_task_authority,
@@ -547,6 +712,15 @@ run_target('debug-disasm', command: [sh, artifact, objdump, 'disasm', kernel_deb
 run_target('debug-symbols', command: [sh, artifact, nm, 'symbols', kernel_debug, join_paths(meson.current_build_dir(), 'kernel_debug.sym')])
 
 qemu = find_program('qemu-system-riscv64')
+run_target('run-io-user-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', io_user_bundle,
+  '[io-user] ok: 32 outstanding, batch completion, task teardown, device reuse'])
+run_target('run-file-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '15',
+  '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])
+run_target('run-io-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', io_session_bundle,
+  '[io-session] ok: isolated pages, 32 outstanding, batched completion, cancel, close'])
 timeout = get_option('qemu_timeout')
 resilience_timeout = get_option('qemu_resilience_timeout')
 pressure_timeout = get_option('qemu_pressure_timeout')
@@ -554,12 +728,27 @@ smp = get_option('qemu_smp').to_string()
 pressure_memory = get_option('qemu_pressure_memory')
 run_target('run', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel])
 run_target('run-timeout', command: [sh, run_qemu, qemu, '3s', '1', kernel, 'timeout'])
+run_target('run-console', command: [qemu, '-machine', 'virt,iommu-sys=on', '-smp', smp, '-nographic',
+  '-bios', 'default', '-kernel', kernel_debug, '-initrd', boot_bundle,
+  '-drive', 'if=none,id=disk,format=raw,readonly=on,file=' + disk_image.full_path(),
+  '-device', 'virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on'], depends: disk_image)
 run_target('run-debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug])
 run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug, '-S', '-gdb', 'tcp:' + get_option('gdb_host') + ':' + get_option('gdb_port').to_string()])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0'])
 if profile == 'proof'
+  run_target('run-ipc-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'marker', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'user: contained fault address=0xe100', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', ipc_bundle])
   run_target('run-proof-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'root init: started', 'user: contained fault address=0x1000 after syscalls=5 active-vspace-cpus=1', '--initrd', proof_bundle])
-  run_target('run-e1-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--forbid', 'user: contained fault address=', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'init: boot-root', 'init: manifest-decoded', 'init: core-authorities', 'init: process-server-prepared', 'init: process-server-running', 'init: process-server-terminal', 'init: consumer-prepared', 'init: consumer-exported', 'init: pager-prepared', 'init: pager-ready', 'init: uart-prepared', 'init: uart-ready', 'init: bundle-views-closed', 'init: consumer-running', 'init: consumer-terminal', 'init: complete', '--initrd', boot_bundle])
+  run_target('run-supervision-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--forbid', 'user: contained fault address=', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'init: boot-root', 'init: manifest-decoded', 'init: core-authorities', 'init: process-server-prepared', 'init: process-server-running', 'init: process-server-terminal', 'init: consumer-prepared', 'init: consumer-exported', 'init: pager-prepared', 'init: pager-ready', 'init: uart-prepared', 'init: uart-ready', 'init: bundle-views-closed', 'init: consumer-running', 'init: consumer-terminal', 'init: complete', '--initrd', supervision_bundle])
+  run_target('run-e1-smp', command: [find_program('python3'), files('tools/build/run-io-platform.py'), qemu, kernel_debug, smp,
+    '--bundle', boot_bundle, '--disk', disk_image, '--timeout', '15', 'myos> '])
+  run_target('run-console-smp', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, smp])
+  run_target('run-console-exhaustion-smp', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, exhaustion_disk, smp, 'exhaustion'])
+  run_target('run-console-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, '1,2,4'])
+  run_target('run-io-console-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, '1,2,4'])
+  run_target('run-io-platform-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'), qemu, kernel_debug, '1,2,4'])
+  run_target('run-io-lease-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'), qemu, kernel_io, '1,2,4', '[scenario] io-lease ok: open, cancel, reset, fence, reuse', '[scenario] io-dma ok: translated block read before and after reuse', '[scenario] io-fault ok: physical DMA denied, guard intact, recovery read', '[scenario] io-space ok: source revoke, backing retire, pool close, cancel, quota, refund', '[scenario] io-irq ok: INTx notification, exact ack, reuse'])
+  run_target('run-console-exhaustion-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, exhaustion_disk, '1,2,4', 'exhaustion'])
+  run_target('run-console-soak', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, '1,2,4', 'normal', '16'])
   # /*luna change: route pressure through its root role, watchdog and fixture image, reason: one explicit A-to-A' run condition keeps ordinary E1 unchanged while exercising the physical PMM floor*/
   run_target('run-pressure-smp', command: [sh, run_qemu, qemu, pressure_timeout, smp, kernel_pressure, 'marker', '--memory', pressure_memory, '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'uart: online', '--stop-when', 'user: contained fault address=0xe0', '--stop-when', 'MYOS KERNEL PANIC', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=pressure', '[scenario] pressure armed', '--regex', 'user: contained.*fault address=0xe100', 'uart: online', '--initrd', pressure_bundle])
   # Full trace is an explicit diagnostic observation, not the functional gate.
@@ -597,7 +786,7 @@ if scenario_marker != ''
   scenario_args_qemu += [scenario_marker]
 endif
 if scenario_name == 'initrd'
-  scenario_args_qemu += ['--initrd', boot_bundle]
+  scenario_args_qemu += ['--initrd', boot_bundle, '--disk', disk_image]
 endif
 if scenario_name != 'off'
   run_target('run-scenario', command: scenario_args_qemu)

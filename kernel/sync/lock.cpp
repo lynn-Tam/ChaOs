@@ -1123,7 +1123,7 @@ auto lock_class_name(LockClass value) noexcept -> const char* {
         "sched-context", "sched-domain", "remote-queue", "thread-stop",
         "vproc", "wait", "endpoint", "notification-source",
         "notification", "tunnel", "channel", "pager", "reclaimer", "irq",
-        "irq-registry", "terminal",
+        "irq-registry", "terminal", "device",
     };
     const usize index = class_index(value);
     return index < class_count ? names[index] : "invalid";

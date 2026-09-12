@@ -1,4 +1,5 @@
 #include <test/test.hpp>
+#include <arch/io_page_table.hpp>
 
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
@@ -259,6 +260,73 @@ struct FakeMapping final : private libk::noncopyable_nonmovable {
     usize invalidations{};
     usize releases{};
 };
+
+bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
+    MemoryFixture fixture{};
+    if (!fixture.initialize()) return false;
+    auto backing = fixture.pmm().allocate_page();
+    if (!backing) return false;
+    const kernel::mm::Page pages[] = {backing.value().page(), backing.value().page()};
+    const usize free = fixture.pmm().free_page_count();
+    {
+        auto io = arch::IoRoot::create(fixture.pmm(), 0x1ff000, pages, true);
+        if (!io || io.value().page_count() != 4) return false;
+        const auto& direct = fixture.pmm().direct_map();
+        auto root = direct.ptr<const u64>(io.value().page().base(), 512);
+        if (!root || (root.value()[0] & 0x3ff) != 1) return false;
+        for (usize index = 1; index < 512; ++index)
+            if (root.value()[index] != 0) return false;
+        auto middle = direct.ptr<const u64>(
+            kernel::mm::PhysAddr{(root.value()[0] >> 10) << 12}, 512);
+        if (!middle) return false;
+        for (usize index = 0; index < 512; ++index) {
+            if (index >= 2) {
+                if (middle.value()[index] != 0) return false;
+                continue;
+            }
+            if ((middle.value()[index] & 0x3ff) != 1) return false;
+            auto leaves = direct.ptr<const u64>(
+                kernel::mm::PhysAddr{(middle.value()[index] >> 10) << 12}, 512);
+            if (!leaves) return false;
+            for (usize leaf = 0; leaf < 512; ++leaf) {
+                const u64 expected = leaf == (index == 0 ? 511 : 0)
+                    ? (u64{backing.value().page().frame().raw()} << 10) | 0xd7
+                    : 0;
+                if (leaves.value()[leaf] != expected) return false;
+            }
+        }
+    }
+    if (fixture.pmm().free_page_count() != free || !backing.value()) return false;
+    // Cross both table levels using a sequential source, as IOSpace does
+    // when its PageLeases occupy several metadata pages.
+    usize consumed{};
+    auto next = [&]() noexcept {
+        ++consumed;
+        return backing.value().page();
+    };
+    {
+        const auto required = arch::IoRoot::required_pages(0x3ffff000, 2);
+        auto io = arch::IoRoot::create(fixture.pmm(), 0x3ffff000, 2,
+            arch::IoRoot::PageSource::bind(next), false);
+        if (!required || required.value() != 5 || !io
+            || io.value().page_count() != required.value() || consumed != 2)
+            return false;
+    }
+    const usize invalid_first[] = {0, 1, usize{1} << 38};
+    for (const usize first : invalid_first) {
+        auto io = arch::IoRoot::create(fixture.pmm(), first, 1,
+            arch::IoRoot::PageSource::bind(next), false);
+        if (io || consumed != 2) return false;
+    }
+    if (arch::IoRoot::required_pages(0x1000, 0)
+        || arch::IoRoot::required_pages((usize{1} << 38) - 4096, 2)
+        || arch::IoRoot::required_pages(0x1000, ~usize{0})) return false;
+    const kernel::mm::Page invalid[] = {
+        kernel::mm::Page{kernel::mm::Pfn{usize{1} << 44}}};
+    auto rejected = arch::IoRoot::create(fixture.pmm(), 0x1000, invalid, false);
+    return !rejected && rejected.error() == arch::IoRootError::InvalidRange
+        && fixture.pmm().free_page_count() == free;
+}
 
 bool test_anonymous_sparse_pages_own_zeroed_frames(
     const TestContext&) noexcept {
@@ -1253,6 +1321,8 @@ bool test_pager_forced_close_settles_backing_obligations(
 } // namespace
 
 void register_memory_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("memory", "I/O root maps only its range and refunds tables",
+        test_io_root_isolated_range_and_refund);
     (void)registry.add(
         "memory",
         "anonymous sparse pages own zeroed resident frames",

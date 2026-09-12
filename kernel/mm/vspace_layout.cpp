@@ -151,10 +151,18 @@ auto VSpace::create_region(
     }
     auto reserved = destination.reserve();
     if (!reserved) {
-        return libk::unexpected(
-            reserved.error() == cap::CSpaceError::OutOfMemory
-                ? VSpaceError::OutOfMemory
-                : VSpaceError::Busy);
+        const auto error = reserved.error();
+        if (error == cap::CSpaceError::OutOfMemory)
+            return libk::unexpected(VSpaceError::OutOfMemory);
+        if (error == cap::CSpaceError::SlotQuota || error == cap::CSpaceError::PageQuota)
+            return libk::unexpected(VSpaceError::QuotaExceeded);
+        if (error == cap::CSpaceError::ResourceExhausted)
+            return libk::unexpected(VSpaceError::ResourceExhausted);
+        if (error == cap::CSpaceError::GenerationExhausted)
+            return libk::unexpected(VSpaceError::GenerationExhausted);
+        if (error == cap::CSpaceError::Contended)
+            return libk::unexpected(VSpaceError::Busy);
+        return libk::unexpected(VSpaceError::InvalidState);
     }
     cap::CSpace::Reservation slot = libk::move(reserved).value();
 

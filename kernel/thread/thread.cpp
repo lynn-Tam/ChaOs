@@ -276,11 +276,7 @@ void Thread::request_stop(execution::Stop& request) noexcept {
                 KASSERT(execution_.state_ == State::Prepared
                     || execution_.state_ == State::Exited);
                 execution_.set_state(State::Exited);
-                if (execution_.scheduler_binding_ == nullptr) {
-                    stopped_ = true;
-                    stops_.erase(request);
-                    finish = true;
-                } else {
+                if (execution_.scheduler_binding_ != nullptr) {
                     context = &execution_.scheduler_binding_->context();
                 }
             }
@@ -290,12 +286,18 @@ void Thread::request_stop(execution::Stop& request) noexcept {
         request.finish(*this);
     } else if (!initiate) {
         return;
-    } else if (context != nullptr) {
-        KASSERT(context->unbind());
-        finish_stop();
-    } else {
-        KASSERT(home != nullptr);
+    } else if (home != nullptr) {
         home->request_stop(*this);
+    } else {
+        execution::TargetHold lifetime{};
+        if (context != nullptr) {
+            auto unbound = context->unbind();
+            KASSERT(unbound);
+            lifetime = libk::move(unbound).value();
+        }
+        // Prepared user threads already own execution authority and roots.
+        // Complete Stop only after the common terminal path releases them.
+        finish_stop();
     }
 }
 
@@ -306,8 +308,7 @@ void Thread::finish_terminal(
         kernel::sync::IrqLockGuard guard{stop_lock_};
         KASSERT(execution_.state_ == State::Exited
             && execution_.scheduler_binding_ == nullptr);
-        execution_.home_ = nullptr;
-        stopped_ = true;
+        stop_requested_ = true;
     }
     /*luna change: settle service claims at the stop terminal, reason: a
       stopped worker must not hold a Pager claim hostage against graceful
@@ -317,6 +318,14 @@ void Thread::finish_terminal(
     execution_.binding().detach_user();
     static_cast<void>(terminal_.claim(
         reason, status));
+
+    {
+        kernel::sync::IrqLockGuard guard{stop_lock_};
+        // Keep the owner while cleanup runs. Concurrent Stop requests join
+        // stops_ until every execution relation is ready for retirement.
+        execution_.home_ = nullptr;
+        stopped_ = true;
+    }
 
     for (;;) {
         execution::Stop* request{};

@@ -157,11 +157,13 @@ auto SchedulingContext::bind_authorized(
     return bound;
 }
 
-auto SchedulingContext::unbind() noexcept -> Result {
+auto SchedulingContext::unbind() noexcept
+    -> libk::Expected<execution::TargetHold, Error> {
     return unbind(nullptr);
 }
 
-auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept -> Result {
+auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept
+    -> libk::Expected<execution::TargetHold, Error> {
     kernel::sync::IrqLockGuard authority_guard{authority_lock_};
     if (!binding_) {
         return libk::unexpected(Error::NotBound);
@@ -173,11 +175,12 @@ auto SchedulingContext::unbind(CpuDispatcher* owner) noexcept -> Result {
     if (!target.release_binding(*binding_, owner)) {
         return libk::unexpected(Error::Active);
     }
+    auto lifetime = libk::move(binding_->target_);
     binding_.reset();
     if (binding_authority_) {
         binding_authority_->release();
     }
-    return libk::expected();
+    return libk::expected(libk::move(lifetime));
 }
 
 auto SchedulingContext::prepare_retire() noexcept -> bool {

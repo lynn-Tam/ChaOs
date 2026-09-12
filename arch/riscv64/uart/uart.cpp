@@ -12,9 +12,10 @@ constexpr u8 LsrData = 1 << 0;
 constexpr u8 LsrEmpty = 1 << 5;
 constexpr u8 LcrDlab = 1 << 7;
 constexpr usize PlicPriority = 0x0000;
-constexpr usize PlicEnableS = 0x2080;
-constexpr usize PlicThresholdS = 0x201000;
-constexpr usize PlicClaimS = 0x201004;
+constexpr usize PlicEnable = 0x2000;
+constexpr usize PlicEnableStride = 0x80;
+constexpr usize PlicContext = 0x200000;
+constexpr usize PlicContextStride = 0x1000;
 }
 
 void Uart16550::initialize(u16 divisor) noexcept {
@@ -55,33 +56,40 @@ void Uart16550::write(const char* text) const noexcept {
 }
 
 void Plic::configure(u32 source, u32 priority) const noexcept {
-    if (source == 0 || source >= 32) {
+    if (source == 0 || source >= 1024) {
         return;
     }
     word(PlicPriority + source * sizeof(u32))[0] = priority;
-    word(PlicThresholdS)[0] = 0;
+    *word(PlicContext + context_ * PlicContextStride) = 0;
 }
 
 void Plic::mask(u32 source) const noexcept {
-    if (source == 0 || source >= 32) {
+    if (source == 0 || source >= 1024) {
         return;
     }
-    *word(PlicEnableS) &= ~(u32{1} << source);
+    *word(PlicEnable + context_ * PlicEnableStride + (source / 32) * sizeof(u32))
+        &= ~(u32{1} << (source % 32));
 }
 
 void Plic::unmask(u32 source) const noexcept {
-    if (source == 0 || source >= 32) {
+    if (source == 0 || source >= 1024) {
         return;
     }
-    *word(PlicEnableS) |= u32{1} << source;
+    *word(PlicEnable + context_ * PlicEnableStride + (source / 32) * sizeof(u32))
+        |= u32{1} << (source % 32);
+    // QEMU 10.2's SiFive PLIC does not recompute its output on enable
+    // writes. Preserve the source priority while refreshing that output,
+    // so an interrupt received while masked is delivered on unmask.
+    auto* const priority = word(PlicPriority + source * sizeof(u32));
+    *priority = *priority;
 }
 
 auto Plic::claim() const noexcept -> u32 {
-    return *word(PlicClaimS);
+    return *word(PlicContext + context_ * PlicContextStride + sizeof(u32));
 }
 
 void Plic::complete(u32 source) const noexcept {
-    *word(PlicClaimS) = source;
+    *word(PlicContext + context_ * PlicContextStride + sizeof(u32)) = source;
 }
 
 } // namespace arch::riscv64

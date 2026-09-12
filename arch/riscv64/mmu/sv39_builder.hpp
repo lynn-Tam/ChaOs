@@ -5,6 +5,7 @@
 #include <libk/expected.hpp>
 
 #include <arch/page_table.hpp>
+#include <arch/io_page_table.hpp>
 #include <mm/addr.hpp>
 #include <mm/pmm.hpp>
 
@@ -49,6 +50,7 @@ class Sv39Builder final {
     [[nodiscard]] auto mapping_at(kernel::mm::VPage virtual_page) const noexcept -> libk::optional<Pte>;
 
     [[nodiscard]] auto finalize() && noexcept -> arch::KernelRoot;
+    [[nodiscard]] auto finalize_io() && noexcept -> arch::IoRoot;
 
   private:
     Sv39Builder(kernel::mm::Page root_page, kernel::mm::OwnedPageGroup&& page_tables) noexcept;

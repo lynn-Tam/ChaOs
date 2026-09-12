@@ -47,6 +47,7 @@
 #define MYOS_SYS_PAGER_CREATE           59 /* a1=backing key, a2=max pages */
 #define MYOS_SYS_IRQ_CREATE             60 /* a1=platform source, a2=level */
 #define MYOS_SYS_MEMORY_CREATE_PAGER    61 /* a1=bytes, a2=access, a3=pager */
+#define MYOS_SYS_IO_SPACE_CREATE        62 /* a0=ResourcePool; creates an empty IOSpace */
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
@@ -106,3 +107,12 @@
 #define MYOS_SYS_TERMINAL_QUERY        139 /* a0=Thread or Vproc; returns sequence/status */
 #define MYOS_SYS_TERMINAL_OBSERVE_BIND 140 /* a0=Thread or Vproc, a1=Notification, a2=badge */
 #define MYOS_SYS_PAGER_BIND             141 /* a0=pager, a1=Notification, a2=badge */
+
+/* Binding starts asynchronously. STATE reports progress; close commits teardown
+ * and keeps the device unavailable until BAR/IRQ and DMA retirement complete. */
+#define MYOS_SYS_IO_SPACE_BIND          144 /* a0=IOSpace, a1=Device, a2=Memory, a3=first page, a4=page count, a5=IOVA */
+#define MYOS_SYS_IO_SPACE_STATE         145 /* a0=IOSpace; returns myos_io_space_state */
+#define MYOS_SYS_IO_SPACE_INFO          146 /* a0=IOSpace, a1=registered IPC buffer offset; writes myos_io_info */
+#define MYOS_SYS_IO_SPACE_BAR           147 /* a0=IOSpace, a1=BAR index; returns bounded Memory capability */
+#define MYOS_SYS_IO_SPACE_IRQ           148 /* a0=IOSpace; returns generation Irq capability */
+#define MYOS_SYS_IO_SPACE_CLOSE         149 /* a0=IOSpace */

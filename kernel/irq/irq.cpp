@@ -2,6 +2,9 @@
 
 #include <arch/riscv64/cpu/csr.hpp>
 #include <arch/uart.hpp>
+#include <arch/pci.hpp>
+#include <cpu/cpu_local.hpp>
+#include <cpu/cpu_registry.hpp>
 #include <libk/limits.hpp>
 #include <libk/sync/atomic.hpp>
 #include <mm/virtual_layout.hpp>
@@ -16,11 +19,13 @@ kernel::sync::SpinLock<kernel::sync::LockClass::IrqRegistry>
     registry_lock{};
 Irq* registry[max_sources]{};
 arch::riscv64::Plic plic{
-    kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base};
+    kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base, 0};
 libk::Atomic<bool> platform_ready{};
 
 [[nodiscard]] auto platform_source(u32 source) noexcept -> bool {
-    return source == arch::riscv64::virt_uart_irq;
+    return source == arch::riscv64::virt_uart_irq
+        || (source >= arch::virt_pci_irq_first
+            && source < arch::virt_pci_irq_first + arch::virt_pci_irq_count);
 }
 
 [[nodiscard]] auto platform_enabled(u32 source) noexcept -> bool {
@@ -61,22 +66,29 @@ void initialize_platform() noexcept {
     // and builtin tests therefore exercise only the Irq state machine.
     {
         kernel::sync::IrqLockGuard guard{registry_lock};
-        Irq* const target = registry[arch::riscv64::virt_uart_irq];
-        if (target != nullptr) {
-            kernel::sync::IrqLockGuard irq_guard{target->lock_};
-            plic.configure(target->source_.id());
-            if (target->state_ == State::BoundIdle) {
-                plic.unmask(target->source_.id());
+        KASSERT(!platform_ready.load<libk::MemoryOrder::Relaxed>());
+        // QEMU virt orders M/S PLIC contexts for each hardware hart. Only
+        // this boot hart enables SEIE; do not route to an assumed hart 0.
+        const auto hart = current_cpu().descriptor->hardware_id().raw;
+        plic = arch::riscv64::Plic{
+            kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base,
+            hart * 2 + 1};
+        for (u32 source = 1; source < max_sources; ++source) {
+            if (!platform_source(source)) continue;
+            plic.configure(source);
+            Irq* const target = registry[source];
+            if (target != nullptr) {
+                kernel::sync::IrqLockGuard irq_guard{target->lock_};
+                if (target->state_ == State::BoundIdle) {
+                    plic.unmask(source);
+                } else {
+                    // Retained Pending obligations stay masked until ack.
+                    plic.mask(source);
+                }
             } else {
-                /* A retained Pending obligation remains masked until its
-                 * exact acknowledgement. */
-                plic.mask(target->source_.id());
+                // Unbound sources stay masked until an idle bind commits.
+                plic.mask(source);
             }
-        } else {
-            plic.configure(arch::riscv64::virt_uart_irq);
-            /* No published Irq owns the source yet.  Keep the unbound source
-             * masked until a committed idle bind explicitly unmasks it. */
-            plic.mask(arch::riscv64::virt_uart_irq);
         }
         /* Publish readiness before releasing the registry transaction.  A
          * concurrent bind must observe the fully initialized PLIC edge, not
@@ -344,12 +356,19 @@ auto Irq::ack(u64 generation, u64 sequence) noexcept
     return libk::expected();
 }
 
-void Irq::dispatch(u32 source) noexcept {
-    if (source >= max_sources) {
-        return;
-    }
+void Irq::dispatch() noexcept {
     {
         kernel::sync::IrqLockGuard registry_guard{registry_lock};
+        const u32 source = plic.claim();
+        if (source == 0) return;
+        // PLIC may ignore completion once the source is disabled. Complete
+        // before observe_locked masks it, and exclude close/unbind from the
+        // entire claim-to-complete interval.
+        plic.complete(source);
+        if (source >= max_sources) {
+            plic.mask(source);
+            return;
+        }
         Irq* const target = registry[source];
         if (target != nullptr) {
             /* The registry lock is the lifetime boundary for this raw
@@ -366,6 +385,8 @@ void Irq::dispatch(u32 source) noexcept {
                     }
                 }
             }
+        } else {
+            plic.mask(source);
         }
     }
 }

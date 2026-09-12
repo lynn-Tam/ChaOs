@@ -5,6 +5,7 @@
 
 #include <core/debug.hpp>
 #include <arch/uart.hpp>
+#include <arch/pci.hpp>
 #include <libk/optional.hpp>
 #include <mm/addr.hpp>
 #include <mm/virtual_layout.hpp>
@@ -165,34 +166,24 @@ auto map_initial_kernel(Sv39Builder& builder, kernel::mm::Pmm& pmm) noexcept
         }
     }
 
-    // The interrupt controller and bootstrap UART are kernel-owned device
-    // windows.  They are not part of DirectMap (which admits RAM only), so
-    // give the trap/IRQ path an explicit high-half alias. User roots borrow
-    // these supervisor branches; kernel IRQ code therefore remains mapped
-    // while a user address space is active.
-    const auto uart = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{virt_uart_base}, kernel::mm::page_size);
-    KASSERT(uart);
-    auto mapped = map_and_verify(
-        builder,
-        kernel::mm::VirtAddr{
-            kernel::mm::layout::DirectMapBegin + virt_uart_base},
-        *uart,
-        PtePerm::supervisor_rw());
-    if (!mapped) {
-        return convert_mapping_error(mapped.error());
-    }
-    const auto plic = kernel::mm::PageRange::from_aligned_bytes(
-        kernel::mm::PhysAddr{virt_plic_base}, virt_plic_size);
-    KASSERT(plic);
-    mapped = map_and_verify(
-        builder,
-        kernel::mm::VirtAddr{
-            kernel::mm::layout::DirectMapBegin + virt_plic_base},
-        *plic,
-        PtePerm::supervisor_rw());
-    if (!mapped) {
-        return convert_mapping_error(mapped.error());
+    // Kernel-owned MMIO aliases are separate from the RAM-only DirectMap.
+    // User roots borrow these supervisor branches; I/O roots never do.
+    struct DeviceWindow { usize base; usize size; };
+    constexpr DeviceWindow windows[] = {
+        {virt_uart_base, kernel::mm::page_size},
+        {virt_plic_base, virt_plic_size},
+        {virt_iommu_base, kernel::mm::page_size},
+        {virt_pci_ecam, 1024 * 1024}, // selected root-bus topology
+        {virt_pci_memory, 1024 * 1024},
+    };
+    for (const auto window : windows) {
+        const auto physical = kernel::mm::PageRange::from_aligned_bytes(
+            kernel::mm::PhysAddr{window.base}, window.size);
+        KASSERT(physical);
+        const auto mapped = map_and_verify(builder,
+            kernel::mm::VirtAddr{kernel::mm::layout::DirectMapBegin + window.base},
+            *physical, PtePerm::supervisor_rw());
+        if (!mapped) return convert_mapping_error(mapped.error());
     }
 
     // Secondary harts enter with translation disabled.  This final-root alias
@@ -200,7 +191,7 @@ auto map_initial_kernel(Sv39Builder& builder, kernel::mm::Pmm& pmm) noexcept
     // D2 removes it after the last secondary acknowledges activation.
     const auto boot_entry = kernel::image::boot_entry();
     const auto secondary = kernel::image::secondary_entry();
-    mapped = map_and_verify(
+    auto mapped = map_and_verify(
         builder,
         kernel::mm::VirtAddr{boot_entry.first().base().raw()},
         boot_entry,

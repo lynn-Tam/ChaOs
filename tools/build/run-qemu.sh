@@ -33,12 +33,18 @@ trap cleanup EXIT
 trap interrupted HUP INT TERM
 initrd=''
 memory=''
+disk=''
 exact_failed=0
 count_pattern=''
 count_expected=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = '--initrd' ]; then
     initrd=$2
+    shift 2
+    continue
+  fi
+  if [ "$1" = '--disk' ]; then
+    disk=$2
     shift 2
     continue
   fi
@@ -67,17 +73,14 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-set +e
-# /*luna change: apply RAM only on the opted-in run, reason: one wrapper keeps all build and runtime ownership while normal QEMU invocations remain unchanged*/
-if [ -n "$initrd" ] && [ -n "$memory" ]; then
-  timeout --foreground "$timeout" "$qemu" -machine virt -m "$memory" -smp "$smp" -nographic -bios default -kernel "$image" -initrd "$initrd" >"$output" 2>&1 &
-elif [ -n "$initrd" ]; then
-  timeout --foreground "$timeout" "$qemu" -machine virt -smp "$smp" -nographic -bios default -kernel "$image" -initrd "$initrd" >"$output" 2>&1 &
-elif [ -n "$memory" ]; then
-  timeout --foreground "$timeout" "$qemu" -machine virt -m "$memory" -smp "$smp" -nographic -bios default -kernel "$image" >"$output" 2>&1 &
-else
-  timeout --foreground "$timeout" "$qemu" -machine virt -smp "$smp" -nographic -bios default -kernel "$image" >"$output" 2>&1 &
+set -- "$qemu" -machine "$(if [ -n "$disk" ]; then printf 'virt,iommu-sys=on'; else printf 'virt'; fi)"   -smp "$smp" -nographic -bios default -kernel "$image"
+if [ -n "$memory" ]; then set -- "$@" -m "$memory"; fi
+if [ -n "$initrd" ]; then set -- "$@" -initrd "$initrd"; fi
+if [ -n "$disk" ]; then
+  set -- "$@" -drive "if=none,id=disk,format=raw,readonly=on,file=$disk"     -device 'virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on'
 fi
+set +e
+timeout --foreground "$timeout" "$@" >"$output" 2>&1 &
 runner=$!
 stopped=0
 if [ -s "$stop_markers" ]; then

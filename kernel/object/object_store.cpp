@@ -20,6 +20,8 @@ ObjectStore::ObjectStore(
       channels_(pmm, reclaim_notify_),
       pagers_(pmm, reclaim_notify_),
       irqs_(pmm, reclaim_notify_),
+      devices_(pmm, reclaim_notify_),
+      io_spaces_(pmm, reclaim_notify_),
       tunnels_(pmm, reclaim_notify_),
       vprocs_(pmm, reclaim_notify_),
       notifications_(pmm, reclaim_notify_),
@@ -38,6 +40,8 @@ ObjectStore::~ObjectStore() noexcept {
     KASSERT(channels_.live_count() == 0);
     KASSERT(pagers_.live_count() == 0);
     KASSERT(irqs_.live_count() == 0);
+    KASSERT(devices_.live_count() == 0);
+    KASSERT(io_spaces_.live_count() == 0);
     KASSERT(tunnels_.live_count() == 0);
     KASSERT(vprocs_.live_count() == 0);
     KASSERT(notifications_.live_count() == 0);
@@ -396,6 +400,8 @@ auto ObjectStore::drain_reclaim() noexcept -> usize {
     drained += channels_.drain_reclaim();
     drained += pagers_.drain_reclaim();
     drained += irqs_.drain_reclaim();
+    drained += devices_.drain_reclaim();
+    drained += io_spaces_.drain_reclaim();
     drained += tunnels_.drain_reclaim();
     drained += vprocs_.drain_reclaim();
     drained += notifications_.drain_reclaim();

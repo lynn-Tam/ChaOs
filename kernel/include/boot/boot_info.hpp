@@ -72,6 +72,8 @@ struct BootInfo final {
     libk::optional<BootModule> module{};
     CpuHandoff cpu{};
     u64 timebase_frequency{};
+    // Optional system RISC-V IOMMU register range normalized from /soc.
+    libk::optional<kernel::mm::PageRange> iommu{};
     kernel::mm::RegionList memory_regions{};
 };
 

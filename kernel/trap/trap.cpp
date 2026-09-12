@@ -7,12 +7,10 @@
 #include <cpu/ipi.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <cpu/cpu_runtime.hpp>
-#include <arch/uart.hpp>
 #include <diag/console.hpp>
 #include <diag/concurrency.hpp>
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
-#include <mm/virtual_layout.hpp>
 #include <operation/page_fault.hpp>
 #include <operation/wait.hpp>
 #include <sched/dispatcher.hpp>
@@ -116,14 +114,7 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             kernel::handle_ipi(cpu.runtime());
             return;
         case Interrupt::External: {
-            static arch::riscv64::Plic plic{
-                kernel::mm::layout::DirectMapBegin
-                + arch::riscv64::virt_plic_base};
-            const u32 source = plic.claim();
-            if (source != 0) {
-                kernel::irq::Irq::dispatch(source);
-                plic.complete(source);
-            }
+            kernel::irq::Irq::dispatch();
             return;
         }
         default:

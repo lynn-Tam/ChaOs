@@ -167,16 +167,35 @@ public:
             } else if (name == "reserved-memory") {
                 scope_ = Scope::ReservedMemory;
                 reserved_format_ = root_format_;
+            } else if (name == "soc") {
+                scope_ = Scope::Soc;
+                soc_format_ = root_format_;
             } else {
                 scope_ = Scope::Other;
             }
         } else if (depth == 2) {
             in_reserved_child_ = scope_ == Scope::ReservedMemory;
+            in_iommu_ = scope_ == Scope::Soc && name.starts_with("iommu@");
+            iommu_compatible_ = false;
+            iommu_reg_ = {};
         }
         return true;
     }
 
     [[nodiscard]] auto prop(kernel::boot::fdt::StrView name, kernel::boot::fdt::ByteSpan value, int depth) noexcept -> bool {
+        if (depth == 1 && scope_ == Scope::Soc) {
+            if (name == "#address-cells") return soc_format_.set_address_cells(value);
+            if (name == "#size-cells") return soc_format_.set_size_cells(value);
+            if (name == "ranges") soc_identity_ = value.empty();
+        }
+        if (depth == 2 && in_iommu_) {
+            if (name == "compatible") {
+                const auto compatible = as_string(value);
+                iommu_compatible_ = compatible && *compatible == "riscv,iommu";
+            } else if (name == "reg") {
+                iommu_reg_ = value;
+            }
+        }
         if (depth == 0 && name == "#address-cells") {
             return root_format_.set_address_cells(value);
         }
@@ -240,6 +259,16 @@ public:
 
     [[nodiscard]] auto end_node(int depth) noexcept -> bool {
         if (depth == 2) {
+            if (in_iommu_ && iommu_compatible_) {
+                if (!soc_identity_ || iommu_) return false;
+                if (!soc_format_.visit(iommu_reg_, [this](Reg reg) {
+                        if (iommu_ || reg.address % kernel::mm::page_size != 0
+                            || reg.size != kernel::mm::page_size) return false;
+                        iommu_ = reg.contained_pages();
+                        return static_cast<bool>(iommu_);
+                    })) return false;
+            }
+            in_iommu_ = false;
             in_reserved_child_ = false;
         } else if (depth == 1) {
             scope_ = Scope::Other;
@@ -261,6 +290,9 @@ public:
         }
         return libk::nullopt;
     }
+
+    [[nodiscard]] auto iommu() const noexcept
+        -> libk::optional<kernel::mm::PageRange> { return iommu_; }
 
     [[nodiscard]] auto module() const noexcept
         -> libk::Expected<
@@ -303,11 +335,18 @@ private:
         Chosen,
         Memory,
         ReservedMemory,
+        Soc,
     };
 
     kernel::mm::BootMapBuilder& memory_;
     RegFormat root_format_{};
     RegFormat reserved_format_{};
+    RegFormat soc_format_{};
+    bool soc_identity_{};
+    bool in_iommu_{};
+    bool iommu_compatible_{};
+    kernel::boot::fdt::ByteSpan iommu_reg_{};
+    libk::optional<kernel::mm::PageRange> iommu_{};
     Scope scope_{Scope::Other};
     bool in_reserved_child_{};
     libk::InplaceVector<Alias, 8> aliases_{};
@@ -361,6 +400,7 @@ auto build_boot_info_from_fdt(
     info.cpu.cpus.clear();
     info.cpu.boot_index = 0;
     info.timebase_frequency = 0;
+    info.iommu.reset();
     info.memory_regions.clear();
 
     kernel::boot::fdt::FDT_View view{};
@@ -383,6 +423,7 @@ auto build_boot_info_from_fdt(
         diag::console::print<"invalid FDT structure\n">();
         return libk::unexpected(BootInfoError::InvalidStructure);
     }
+    info.iommu = collector.iommu();
 
     const bool reservations_valid = kernel::boot::fdt::visit_memory_reservations(
         view,

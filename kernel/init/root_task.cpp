@@ -380,6 +380,16 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     }
     uart_irq_ = libk::move(uart_irq).value().publish();
 
+    if (kernel.io_platform().present()
+        && !add_cap(MYOS_BOOTSTRAP_CAP_DEVICE,
+            kernel.io_platform().reference(),
+            kernel::cap::Rights::of(
+                kernel::cap::Right::Duplicate, kernel::cap::Right::Delegate,
+                kernel::cap::Right::Inspect, kernel::cap::Right::Connect,
+                kernel::cap::Right::Revoke))) {
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    }
+
     const kernel::mm::MemoryTypes device = kernel::mm::MemoryTypes::of(
         kernel::mm::MemoryType::Device);
     const kernel::cap::MemoryAuthority uart_memory_authority{

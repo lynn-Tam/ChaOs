@@ -90,6 +90,8 @@ enum class DescriptorForm : uint8_t {
     case MYOS_OBJECT_KIND_CSPACE:
     case MYOS_OBJECT_KIND_NOTIFICATION:
     case MYOS_OBJECT_KIND_VPROC:
+    case MYOS_OBJECT_KIND_IO_SPACE:
+    case MYOS_OBJECT_KIND_DEVICE:
     case MYOS_OBJECT_KIND_IRQ:
         return zero_words(value, 0);
     case MYOS_OBJECT_KIND_TUNNEL:
@@ -190,6 +192,8 @@ inline void encode_wire(
     case MYOS_OBJECT_KIND_CSPACE:
     case MYOS_OBJECT_KIND_NOTIFICATION:
     case MYOS_OBJECT_KIND_VPROC:
+    case MYOS_OBJECT_KIND_IO_SPACE:
+    case MYOS_OBJECT_KIND_DEVICE:
     case MYOS_OBJECT_KIND_IRQ:
         return true;
     case MYOS_OBJECT_KIND_MEMORY:

@@ -16,6 +16,7 @@
 #include <resource/pool.hpp>
 #include <sched/domain.hpp>
 #include <time/clock.hpp>
+#include <io/platform.hpp>
 
 namespace kernel {
 
@@ -77,6 +78,8 @@ public:
     [[nodiscard]] auto clock(this auto& self) noexcept -> decltype(auto) {
         return (*self.clock_);
     }
+    [[nodiscard]] auto io_work() noexcept -> io::Executor& { return io_work_; }
+    [[nodiscard]] auto io_platform() noexcept -> io::Platform& { return io_platform_; }
 
     [[nodiscard]] auto objects(this auto& self) noexcept -> decltype(auto) {
         return (*self.objects_);
@@ -115,6 +118,8 @@ private:
     libk::ManualLifetime<kernel::mm::Pmm> pmm_{};
     libk::ManualLifetime<kernel::mm::KernelVSpace> kernel_vspace_{};
     libk::ManualLifetime<kernel::time::Clock> clock_{};
+    io::Platform io_platform_{};
+    io::Executor io_work_{};
     kernel::mm::VSpaceExecutor vspace_work_{};
     kernel::mm::MemoryExecutor memory_work_{};
     kernel::mm::PageReclaimer pressure_work_{};

@@ -87,9 +87,9 @@ public:
     [[nodiscard]] auto observe() noexcept -> libk::Expected<Delivery, Error>;
     [[nodiscard]] auto ack(u64 generation, u64 sequence) noexcept
         -> libk::Expected<void, Error>;
-    // Platform trap path: dispatches one normalized hardware source into the
-    // single Irq object registered for it.  The registry is fixed-capacity.
-    static void dispatch(u32 source) noexcept;
+    // Claim, complete and publish one platform interrupt under the same
+    // registry lifetime boundary as source masking and removal.
+    static void dispatch() noexcept;
     [[nodiscard]] auto close() noexcept -> bool;
     void retire(object::ObjectCleanup&& cleanup) noexcept;
 

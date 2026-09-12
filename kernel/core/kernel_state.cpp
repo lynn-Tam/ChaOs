@@ -65,6 +65,7 @@ KernelState::~KernelState() noexcept {
     if (grants_) {
         grants().unbind_work_notifier();
     }
+    io_work_.unbind_notifier();
     vspace_work_.unbind_notifier();
     memory_work_.unbind_notifier();
     pressure_work_.unbind_notifier();
@@ -195,6 +196,7 @@ auto KernelState::start_reclaimer(
     pressure_work_.bind_notifier(
         kernel::mm::PageReclaimer::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
+    io_work_.bind_notifier(io::Executor::Notifier::bind<&KernelState::wake_reclaimer>(*this));
     vspace_work_.bind_notifier(
         kernel::mm::VSpaceExecutor::Notifier::bind<
             &KernelState::wake_reclaimer>(*this));
@@ -318,6 +320,7 @@ auto KernelState::start_reclaimer(
         vspace_update.detail[2] = grant_total;
         vspace_update.detail[3] = vspace_total;
         kernel.reclaimer_observation_.publish(vspace_update);
+        const bool io_more = kernel.io_work_.run(8);
         const auto memory = kernel.memory_work_.run(8);
         add_progress(memory_total, memory.progressed);
         kernel.reclaimer_observation_.advance(memory.progressed);
@@ -354,7 +357,7 @@ auto KernelState::start_reclaimer(
             claim.reset();
         }
         if (candidate_more || pressure_more || grant.more || vspace.more
-            || memory.more
+            || memory.more || io_more
             || !kernel.close_reclaimer_work(admitted)) {
             kernel.reclaimer_observation_.watch(true);
             kernel::sched::yield();

@@ -65,7 +65,7 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_VM_DESTROY_REGION) {
         outcome = handle_vm(operation, invocation);
     } else if (operation >= MYOS_SYS_RESOURCE_CREATE_CHILD
-        && operation <= MYOS_SYS_MEMORY_CREATE_PAGER) {
+        && operation <= MYOS_SYS_IO_SPACE_CREATE) {
         outcome = handle_construction(operation, invocation);
     } else if (operation >= MYOS_SYS_MEMORY_SEAL
         && operation <= MYOS_SYS_RESOURCE_CLOSE) {
@@ -98,6 +98,9 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_TERMINAL_QUERY
         && operation <= MYOS_SYS_TERMINAL_OBSERVE_BIND) {
         outcome = handle_terminal(operation, invocation);
+    } else if (operation >= MYOS_SYS_IO_SPACE_BIND
+        && operation <= MYOS_SYS_IO_SPACE_CLOSE) {
+        outcome = handle_io(operation, invocation);
     } else {
         outcome = returned(MYOS_STATUS_INVALID_OP);
     }

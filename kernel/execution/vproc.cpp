@@ -1380,7 +1380,8 @@ void Vproc::retry_stop_if_ready() noexcept {
     if (home != nullptr) {
         home->request_stop(*this);
     } else if (context != nullptr) {
-        KASSERT(context->unbind());
+        auto lifetime = context->unbind();
+        KASSERT(lifetime);
         finish_stop();
     } else if (finish) {
         finish_stop();
@@ -1432,8 +1433,6 @@ void Vproc::finish_terminal(
             &runtime_.events->fault_pc, 0, __ATOMIC_RELAXED);
         KASSERT(execution_.state_ == State::Exited
             && execution_.scheduler_binding_ == nullptr);
-        execution_.home_ = nullptr;
-        stopped_ = true;
         upcall_state_ = UpcallState::Unarmed;
     }
     execution_.binding().detach_user();
@@ -1447,6 +1446,14 @@ void Vproc::finish_terminal(
     runtime_.event_view.reset();
     runtime_.control = nullptr;
     runtime_.events = nullptr;
+
+    {
+        kernel::sync::IrqLockGuard guard{state_lock_};
+        // Publish stopped only after authority, roots and runtime leases
+        // are released; a concurrent Stop may immediately drive retirement.
+        execution_.home_ = nullptr;
+        stopped_ = true;
+    }
 
     for (;;) {
         execution::Stop* request{};

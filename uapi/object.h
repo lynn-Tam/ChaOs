@@ -28,7 +28,9 @@ enum myos_object_kind {
     MYOS_OBJECT_KIND_CHANNEL = 12,
     MYOS_OBJECT_KIND_PAGER = 13,
     MYOS_OBJECT_KIND_IRQ = 14,
-    MYOS_OBJECT_KIND_COUNT = 15,
+    MYOS_OBJECT_KIND_DEVICE = 15,
+    MYOS_OBJECT_KIND_IO_SPACE = 16,
+    MYOS_OBJECT_KIND_COUNT = 17,
 };
 
 typedef uint16_t myos_object_kind_t;

@@ -18,6 +18,8 @@
 #include <object/vproc_pool.hpp>
 #include <object/pager_pool.hpp>
 #include <object/irq_pool.hpp>
+#include <object/device_pool.hpp>
+#include <object/io_space_pool.hpp>
 
 namespace kernel::mm {
 class MemoryExecutor;
@@ -89,6 +91,30 @@ public:
     using IrqPending = object::IrqPending;
     using IrqHold = object::IrqHold;
     using IrqPin = object::IrqPin;
+    using IoSpacePool = object::IoSpacePool;
+    using IoSpacePending = object::IoSpacePending;
+    using IoSpaceHold = object::IoSpaceHold;
+    using IoSpacePin = object::IoSpacePin;
+    template<typename... Args>
+    [[nodiscard]] auto create_io_space(Args&&... args) noexcept
+        -> libk::Expected<IoSpacePending, IoSpacePool::Error> {
+        return io_spaces_.create(libk::forward<Args>(args)...);
+    }
+    template<typename... Args>
+    [[nodiscard]] auto create_io_space_sponsored(resource::Reservation&& charge, Args&&... args) noexcept
+        -> libk::Expected<IoSpacePending, IoSpacePool::Error> {
+        return io_spaces_.create_sponsored(libk::move(charge), libk::forward<Args>(args)...);
+    }
+    using DevicePool = object::DevicePool;
+    using DevicePending = object::DevicePending;
+    using DeviceHold = object::DeviceHold;
+    using DevicePin = object::DevicePin;
+
+    template<typename... Args>
+    [[nodiscard]] auto create_device(Args&&... args) noexcept
+        -> libk::Expected<DevicePending, DevicePool::Error> {
+        return devices_.create(libk::forward<Args>(args)...);
+    }
 
     explicit ObjectStore(
         kernel::mm::Pmm& pmm,
@@ -350,6 +376,8 @@ private:
     ChannelPool channels_;
     PagerPool pagers_;
     IrqPool irqs_;
+    DevicePool devices_;
+    IoSpacePool io_spaces_;
     TunnelPool tunnels_;
     VprocPool vprocs_;
     NotificationPool notifications_;

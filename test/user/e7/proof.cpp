@@ -271,6 +271,23 @@ using namespace myos::proof;
         || message->sender_badge != 10) {
         channel_fail(shared);
     }
+    // After draining a closed channel, arm with its current sequence. Closure
+    // must remain ready even without queued data or a sequence mismatch.
+    static_cast<void>(myos::notification_take(shared.load(ChannelNotifySSlot)));
+    if (myos::channel_arm(
+            shared.load(ChannelReceiverSlot),
+            shared.load(ChannelRelationSSlot), message->sequence).status
+            != MYOS_STATUS_OK) {
+        channel_fail(shared);
+    }
+    const auto closed_ready = myos::notification_take(
+        shared.load(ChannelNotifySSlot));
+    if (closed_ready.status != MYOS_STATUS_OK
+        || closed_ready.value != ChannelNotifySBadge
+        || myos::channel_try_recv(shared.load(ChannelReceiverSlot)).status
+            != MYOS_STATUS_CLOSED) {
+        channel_fail(shared);
+    }
     shared.store(ChannelDrainReceivedSlot, ChannelReady);
     shared.store(ChannelClosedSlot, ChannelClosed);
     shared.progress(ProgressActor::Receiver, ProgressStage::Complete);

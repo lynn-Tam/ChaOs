@@ -101,7 +101,10 @@ public:
         object::ObjectHold<Vproc>&& target,
         const cap::Resolved<SchedulingContext>& context,
         const cap::Resolved<Vproc>& vproc) noexcept -> Result;
-    [[nodiscard]] auto unbind() noexcept -> Result;
+    // Transfer the binding's lifetime to the caller. Terminal callers keep
+    // it until Stop callbacks and the final target access have completed.
+    [[nodiscard]] auto unbind() noexcept
+        -> libk::Expected<execution::TargetHold, Error>;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto startable() const noexcept -> bool;
 
@@ -124,7 +127,8 @@ private:
     void charge(time::Instant now, time::Duration elapsed) noexcept;
     [[nodiscard]] auto bind_target(
         execution::TargetHold&& target) noexcept -> Result;
-    [[nodiscard]] auto unbind(CpuDispatcher* owner) noexcept -> Result;
+    [[nodiscard]] auto unbind(CpuDispatcher* owner) noexcept
+        -> libk::Expected<execution::TargetHold, Error>;
     [[nodiscard]] auto active() const noexcept -> bool {
         return active_cpu_.load<libk::MemoryOrder::Acquire>()
             != max_cpu_count;

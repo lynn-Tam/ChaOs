@@ -1687,8 +1687,6 @@ private:
                     || !zero(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
                              MYOS_DEPLOY_BOOTSTRAP_RESERVED,
                              MYOS_DEPLOY_BOOTSTRAP_DESTINATION)
-                    || kind < MYOS_BOOTSTRAP_CAP_VSPACE
-                    || kind > MYOS_BOOTSTRAP_CAP_STAGING_REGION
                     || myos_bootstrap_object_kind(static_cast<uint32_t>(kind))
                         == MYOS_OBJECT_KIND_INVALID) {
                     return fail(Error::InvalidRecord);

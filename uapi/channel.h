@@ -12,6 +12,9 @@
 #define MYOS_CHANNEL_MAX_WAITERS 1U
 #define MYOS_CHANNEL_MAX_RELATIONS 2U
 
+// Readable/Writable also become ready on close: the corresponding operation
+// can return a terminal status. Notifications are hints; retry the operation
+// to distinguish queued data, available space, and closure.
 #define MYOS_CHANNEL_READABLE 0U
 #define MYOS_CHANNEL_WRITABLE 1U
 #define MYOS_CHANNEL_PEER_CLOSED 2U

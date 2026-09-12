@@ -23,6 +23,7 @@ namespace kernel::test::scenario {
     -> bool;
 
 namespace detail {
+[[nodiscard]] auto io_lease(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto remote(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto publication(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto resource_watchdog(

@@ -1110,6 +1110,7 @@ void CpuDispatcher::finish_exit(
     KASSERT(execution.state_ == ExecutionState::Exited);
     KASSERT(current_ != target);
     KASSERT(!target.stop_deferred());
+    execution::TargetHold lifetime{};
     if (execution.scheduler_binding_ != nullptr) {
         Binding& binding = *execution.scheduler_binding_;
         KASSERT(!binding.queued() && !binding.timer_queued());
@@ -1120,7 +1121,9 @@ void CpuDispatcher::finish_exit(
             const RemoteCancel canceled = remote_.cancel(vproc->activation_);
             KASSERT(canceled == RemoteCancel::NotPending);
         }
-        KASSERT(binding.context().unbind(this));
+        auto unbound = binding.context().unbind(this);
+        KASSERT(unbound);
+        lifetime = libk::move(unbound).value();
     }
     if (reason == DispatchReason::Stop) {
         target.finish_stop();

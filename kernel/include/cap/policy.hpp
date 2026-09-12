@@ -53,6 +53,16 @@ struct RightsPolicy {
 };
 
 template<>
+struct CapabilityPolicy<object::ObjectKind::IoSpace> final
+    : RightsPolicy<Right::Duplicate, Right::Delegate, Right::Inspect,
+          Right::Connect, Right::Close, Right::Revoke> {};
+
+template<>
+struct CapabilityPolicy<object::ObjectKind::Device> final
+    : RightsPolicy<Right::Duplicate, Right::Delegate, Right::Inspect,
+          Right::Connect, Right::Revoke> {};
+
+template<>
 struct CapabilityPolicy<object::ObjectKind::Thread> final
     : RightsPolicy<
           Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control,

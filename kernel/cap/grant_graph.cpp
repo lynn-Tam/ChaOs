@@ -1586,6 +1586,8 @@ void GrantGraph::stop_allocation(
         break;
     case object::ObjectKind::SchedulingDomain:
     case object::ObjectKind::CSpace:
+    case object::ObjectKind::IoSpace:
+    case object::ObjectKind::Device:
     case object::ObjectKind::MemoryObject:
     case object::ObjectKind::VSpace:
     case object::ObjectKind::Notification:

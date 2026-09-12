@@ -21,6 +21,8 @@ enum class ObjectKind : u16 {
     Channel = MYOS_OBJECT_KIND_CHANNEL,
     Pager = MYOS_OBJECT_KIND_PAGER,
     Irq = MYOS_OBJECT_KIND_IRQ,
+    Device = MYOS_OBJECT_KIND_DEVICE,
+    IoSpace = MYOS_OBJECT_KIND_IO_SPACE,
     Count = MYOS_OBJECT_KIND_COUNT,
 };
 

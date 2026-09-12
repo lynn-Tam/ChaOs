@@ -60,6 +60,8 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
 
     KASSERT(boot_info.timebase_frequency != 0);
     KASSERT(kernel.initialize_clock(boot_info.timebase_frequency));
+    KASSERT(kernel.io_platform().initialize(
+        boot_info, kernel.pmm(), kernel.clock(), kernel.objects()));
     KASSERT(boot_info.cpu);
     const kernel::CpuTopologySummary summary = boot_info.cpu.summary();
 

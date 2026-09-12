@@ -74,8 +74,9 @@ private:
     Value value_{};
 };
 
-// Owning form used only by SchedulingContext::Binding. Converting to Target
-// borrows the same object and never creates a second lifetime owner.
+// Owned by SchedulingContext::Binding until unbind transfers it to its caller.
+// Terminal paths retain it through their last callback/target access.
+// Converting to Target borrows the same object without another lifetime owner.
 class TargetHold final : private libk::noncopyable {
 public:
     TargetHold() noexcept = default;

@@ -386,6 +386,10 @@ auto validate_ceiling(
     object::ObjectKind kind,
     GrantCeiling ceiling) noexcept -> bool {
     switch (kind) {
+    case object::ObjectKind::IoSpace:
+        return CapabilityPolicy<object::ObjectKind::IoSpace>::validate(ceiling);
+    case object::ObjectKind::Device:
+        return CapabilityPolicy<object::ObjectKind::Device>::validate(ceiling);
     case object::ObjectKind::Thread:
         return CapabilityPolicy<object::ObjectKind::Thread>::validate(ceiling);
     case object::ObjectKind::Vproc:
@@ -432,6 +436,10 @@ auto compose(
     CapView view) noexcept
     -> libk::Expected<EffectiveAuthority, PolicyError> {
     switch (kind) {
+    case object::ObjectKind::IoSpace:
+        return compose_as<object::ObjectKind::IoSpace>(ceiling, view);
+    case object::ObjectKind::Device:
+        return compose_as<object::ObjectKind::Device>(ceiling, view);
     case object::ObjectKind::Thread:
         return compose_as<object::ObjectKind::Thread>(ceiling, view);
     case object::ObjectKind::Vproc:

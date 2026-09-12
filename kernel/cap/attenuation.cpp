@@ -120,6 +120,10 @@ auto decode_attenuation(libk::Span<const byte> bytes) noexcept
 auto attenuation_kind(u16 raw) noexcept
     -> libk::optional<object::ObjectKind> {
     switch (raw) {
+    case MYOS_OBJECT_KIND_IO_SPACE:
+        return object::ObjectKind::IoSpace;
+    case MYOS_OBJECT_KIND_DEVICE:
+        return object::ObjectKind::Device;
     case MYOS_OBJECT_KIND_THREAD:
         return object::ObjectKind::Thread;
     case MYOS_OBJECT_KIND_SCHED_CONTEXT:
@@ -170,6 +174,8 @@ auto make_attenuation_ceiling(
     const Rights child_rights = rights.value();
 
     switch (kind) {
+    case object::ObjectKind::IoSpace:
+    case object::ObjectKind::Device:
     case object::ObjectKind::Thread:
     case object::ObjectKind::Vproc:
     case object::ObjectKind::SchedulingContext:

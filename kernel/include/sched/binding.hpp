@@ -118,6 +118,7 @@ private:
     friend class TimerQueue;
     friend class RemoteQueue;
     friend class CpuDispatcher;
+    friend class SchedulingContext;
 
     // Scheduler state remains canonical in Execution/queues.  These bits are
     // only the bounded projection consumed by the wait-graph analyzer:

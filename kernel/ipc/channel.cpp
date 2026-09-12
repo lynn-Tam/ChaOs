@@ -343,11 +343,11 @@ auto Channel::ready_locked(
     const Side& other = side(peer(value));
     switch (condition) {
     case ChannelCondition::Readable:
-        return !current.queue.empty();
+        return !current.queue.empty() || current.closed || other.closed;
     case ChannelCondition::Writable:
-        return !current.closed && !other.closed
-            && !other.queue.full()
-            && other.queue.size() < config_.queue_capacity;
+        return current.closed || other.closed
+            || (!other.queue.full()
+                && other.queue.size() < config_.queue_capacity);
     case ChannelCondition::PeerClosed:
         return other.closed;
     }
