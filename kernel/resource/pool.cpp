@@ -458,6 +458,9 @@ auto ResourcePool::observe_refund(
     if (!pin || &pin.value().get() != this || self.anchor_ == nullptr) {
         return false;
     }
+    // The operation pin prevents sponsorship detach; this lock arbitrates
+    // concurrent blocking/asynchronous observers of the same one-shot close.
+    kernel::sync::IrqLockGuard guard{lock_};
     return self.anchor_->sponsorship_.observe_refund(notifier);
 }
 
@@ -530,6 +533,23 @@ void ResourcePool::target_ready(Allocation& allocation) noexcept {
         allocation.state_ = AllocationState::Stopped;
     }
     service();
+}
+
+void ResourcePool::close_allocation(Allocation& allocation) noexcept {
+    kernel::cap::GrantGraph* graph{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(allocation.pool_ == this);
+        // The caller's accepted grant lease pins this allocation before its
+        // revoke barrier. A concurrent pool close may already own the request.
+        KASSERT(allocation.state_ == AllocationState::Live || allocation.state_ == AllocationState::Revoking);
+        if (allocation.state_ == AllocationState::Live) {
+            allocation.independent_close_ = true;
+            allocation.state_ = AllocationState::Revoking;
+            graph = allocation.graph_;
+        }
+    }
+    if (graph != nullptr) graph->revoke_allocation(allocation);
 }
 
 void ResourcePool::child_closed(Allocation& allocation) noexcept {
@@ -660,7 +680,9 @@ void ResourcePool::detach(Sponsorship& sponsorship) noexcept {
         KASSERT(sponsorship_count_ != 0);
         --sponsorship_count_;
     }
-    service();
+    // Detach is called while the resource owner's container may still be
+    // locked. The returned Refund retains both capacity and the pool; its
+    // completion, after the resource is reusable, drives external close work.
 }
 
 void ResourcePool::refund(Refund& refund) noexcept {
@@ -724,40 +746,33 @@ void ResourcePool::service() noexcept {
             while (advance) {
                 advance = false;
 
-                Allocation* independent{};
+                // One pending local close must not block another allocation or
+                // the pool-wide revoke barrier that may let it finish.
                 for (Allocation* allocation = roots_;
-                     allocation != nullptr;
-                     allocation = allocation->next_) {
-                    if (allocation->independent_close_) {
-                        independent = allocation;
-                        break;
-                    }
-                }
-                if (independent != nullptr) {
-                    switch (independent->state_) {
+                     allocation != nullptr; allocation = allocation->next_) {
+                    if (!allocation->independent_close_) continue;
+                    switch (allocation->state_) {
                     case AllocationState::Revoking:
+                    case AllocationState::Stopping:
                     case AllocationState::Retiring:
-                        break;
+                        continue;
                     case AllocationState::Revoked:
-                        independent->state_ = AllocationState::Stopped;
-                        advance = true;
+                        allocation->state_ = AllocationState::Stopping;
+                        stop = allocation;
                         break;
                     case AllocationState::Stopped:
-                        independent->state_ = AllocationState::Retiring;
-                        retire = independent;
+                        allocation->state_ = AllocationState::Retiring;
+                        retire = allocation;
                         break;
                     case AllocationState::Empty:
                     case AllocationState::Pending:
                     case AllocationState::Live:
-                    case AllocationState::Stopping:
                         KASSERT(false);
                         break;
                     }
-                    if (retire != nullptr || !advance) {
-                        break;
-                    }
-                    continue;
+                    break;
                 }
+                if (stop != nullptr || retire != nullptr) break;
 
                 switch (state_) {
                 case PoolState::Open:
@@ -796,7 +811,8 @@ void ResourcePool::service() noexcept {
                          allocation = allocation->next_) {
                         KASSERT(allocation->state_ == AllocationState::Revoked
                             || allocation->state_ == AllocationState::Stopping
-                            || allocation->state_ == AllocationState::Stopped);
+                            || allocation->state_ == AllocationState::Stopped
+                            || allocation->state_ == AllocationState::Retiring);
                         if (allocation->state_ == AllocationState::Revoked) {
                             allocation->state_ = AllocationState::Stopping;
                             stop = allocation;

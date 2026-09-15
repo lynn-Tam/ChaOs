@@ -3,6 +3,8 @@
 #include <libk/variant.hpp>
 #include <mm/memory_object.hpp>
 #include <object/object_store.hpp>
+#include <cpu/cpu_runtime.hpp>
+#include <thread/thread.hpp>
 #include <uapi/syscall.h>
 #include <uapi/vm.h>
 
@@ -12,6 +14,21 @@ auto handle_vm(usize operation, Invocation& invocation) noexcept -> Result {
     arch::TrapContext& trap = invocation.trap;
     cap::CSpace& cspace = invocation.cspace;
     const cap::CapHandle vspace_handle = handle_of(trap.arg(0));
+    if (operation == MYOS_SYS_VM_SYNC) {
+        auto* thread = invocation.target.thread();
+        if (thread == nullptr) return returned(MYOS_STATUS_INVALID_OP);
+        if (thread->waiting()) return returned(MYOS_STATUS_BUSY);
+        // Observation does not expand this capability's memory permissions.
+        auto target = cspace.resolve<mm::VSpace>(vspace_handle, cap::Rights{});
+        if (!target) return returned(cap_status(target.error()));
+        auto reference = target.value().reference();
+        if (!reference) return returned(MYOS_STATUS_BUSY);
+        auto* wait = thread->current_wait().prepare_vm(libk::move(reference).value(), target.value().object());
+        auto* cpus = invocation.cpu.runtime().owner_registry;
+        KASSERT(wait != nullptr && cpus != nullptr && thread->begin_wait(wait->completion(), *cpus));
+        wait->start();
+        return Result{MYOS_STATUS_OK, 0, Disposition::Block};
+    }
     const cap::Right required = operation == MYOS_SYS_VM_MAP
         ? cap::Right::Map
         : operation == MYOS_SYS_VM_UNMAP
@@ -39,7 +56,7 @@ auto handle_vm(usize operation, Invocation& invocation) noexcept -> Result {
     const kernel::mm::VmContext vm = vm_context(invocation.cpu);
 
     if (operation == MYOS_SYS_VM_DESTROY_REGION) {
-        auto destroyed = space.destroy_region(vm, where->region);
+        auto destroyed = space.destroy_region(vm, *where);
         return returned(destroyed
             ? operation_status(destroyed.value())
             : vm_status(destroyed.error()));

@@ -1435,6 +1435,58 @@ bool test_parent_close_recursively_closes_child_pool(
     return cap_test_pmm->verify_invariants();
 }
 
+bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) return false;
+    constexpr kernel::resource::Budget limit{.memory = 8 * kernel::mm::page_size, .caps = 8};
+    auto pending = fixture.objects().create_resource(limit);
+    if (!pending) return false;
+    auto pool = libk::move(pending).value().publish();
+    kernel::cap::CapHandle handles[2]{};
+    const auto rights = Rights::of(Right::Inspect, Right::Destroy);
+    for (usize index = 0; index < 2; ++index) {
+        auto permit_ref = pool.ref();
+        auto root_ref = pool.ref();
+        auto child_ref = pool.ref();
+        if (!permit_ref || !root_ref || !child_ref) return false;
+        auto permit = pool->begin(libk::move(permit_ref).value());
+        auto root_charge = pool->reserve(libk::move(root_ref).value(), GrantGraph::node_charge());
+        auto child_charge = pool->reserve(libk::move(child_ref).value(), GrantGraph::node_charge());
+        auto target = fixture.target_ref(index);
+        if (!permit || !root_charge || !child_charge || !target) return false;
+        auto allocation = fixture.graph().create_allocation(permit.value(),
+            libk::move(root_charge).value(), libk::move(target).value(), GrantCeiling{rights});
+        if (!allocation) return false;
+        auto lease = allocation.value().acquire();
+        auto child_target = fixture.target_ref(index);
+        if (!lease || !child_target) return false;
+        auto child = fixture.graph().derive(libk::move(child_charge).value(), lease.value(),
+            libk::move(child_target).value(), GrantCeiling{rights});
+        if (!child) return false;
+        auto installed = fixture.a().insert(libk::move(child).value(), CapView{rights});
+        if (!installed) return false;
+        handles[index] = installed.value();
+        allocation.value().commit();
+    }
+    auto held = fixture.a().resolve<kernel::sched::SchedulingContext>(handles[1], inspect_rights);
+    if (!held) return false;
+    libk::optional<kernel::cap::Resolved<kernel::sched::SchedulingContext>> retained{libk::move(held).value()};
+    if (!fixture.a().destroy(handles[1]) || !fixture.a().destroy(handles[0])) return false;
+    // A retained operation delays its own revoke, not the other local close.
+    if (fixture.graph().live_count() != 2 || pool->state() != kernel::resource::PoolState::Open)
+        return false;
+    if (pool->close() != kernel::resource::PoolState::Revoking) return false;
+    retained.reset();
+    fixture.drop_retired_target(0);
+    fixture.drop_retired_target(1);
+    if (pool->state() != kernel::resource::PoolState::Closed || pool->available() != limit
+        || fixture.graph().live_count() != 0 || !fixture.a().close(handles[0])
+        || !fixture.a().close(handles[1]) || !pool.retire()) return false;
+    pool.reset();
+    fixture.objects().drain_reclaim();
+    return cap_test_pmm->verify_invariants();
+}
+
 bool test_destroy_authority_uses_object_anchor_retirement(
     const TestContext&) noexcept {
     CapFixture fixture{};
@@ -1571,6 +1623,8 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         "cap",
         "destroy authority enters the target ObjectAnchor retirement path",
         test_destroy_authority_uses_object_anchor_retirement);
+    (void)registry.add("cap", "local object destruction drains independently and joins pool close",
+        test_destroy_allocation_progress_and_pool_close);
     (void)registry.add(
         "cap",
         "Tunnel Connect authority cannot attenuate into source Tx rights",

@@ -6,7 +6,6 @@
 #include <libk/delegate.hpp>
 #include <libk/noncopyable.hpp>
 #include <sync/lock.hpp>
-#include <mm/node_pool.hpp>
 #include <mm/pmm.hpp>
 #include <resource/allocation.hpp>
 #include <resource/sponsorship.hpp>
@@ -125,8 +124,6 @@ private:
     friend class GrantRef;
     friend class GrantLease;
     friend class GrantAttachment;
-    friend class GrantRevokeWait;
-    friend class kernel::resource::CloseWait;
     friend class kernel::resource::AllocationTxn;
     friend class kernel::resource::ResourcePool;
 
@@ -244,6 +241,7 @@ private:
     [[nodiscard]] auto service_slot(Slot& slot) noexcept -> bool;
     [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
     void reclaim(GrantKey key, bool drop_reference) noexcept;
+    [[nodiscard]] auto destroy_target(const GrantLease& source) noexcept -> libk::Expected<void, GrantError>;
     void commit_allocation(kernel::resource::Allocation& allocation) noexcept;
     void abort_allocation(kernel::resource::Allocation& allocation) noexcept;
     void revoke_allocation(kernel::resource::Allocation& allocation) noexcept;
@@ -254,12 +252,6 @@ private:
         GrantKey source,
         GrantRevoke& completion,
         bool include_source) noexcept -> libk::Expected<void, GrantError>;
-    [[nodiscard]] auto create_revoke_wait() noexcept
-        -> libk::Expected<GrantRevokeWait*, GrantError>;
-    void destroy_revoke_wait(GrantRevokeWait& operation) noexcept;
-    [[nodiscard]] auto create_close_wait() noexcept
-        -> libk::Expected<kernel::resource::CloseWait*, GrantError>;
-    void destroy_close_wait(kernel::resource::CloseWait& operation) noexcept;
     [[nodiscard]] static auto descendant_of(
         const Node& node,
         const Node& root) noexcept -> bool;
@@ -271,8 +263,6 @@ private:
         work_lock_{};
     WorkQueue work_{};
     WorkNotifier work_notifier_{};
-    kernel::mm::NodePool<GrantRevokeWait> revoke_waits_;
-    kernel::mm::NodePool<kernel::resource::CloseWait> close_waits_;
     PageHeader* pages_{};
     usize page_count_{};
     usize live_nodes_{};

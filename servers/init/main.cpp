@@ -2,14 +2,16 @@
 #include <user/lib/uart.hpp>
 
 namespace {
+myos::deploy::Program program;
 using Supervisor = myos::deploy::Supervisor<5, 24>;
 Supervisor supervisor;
-myos::cap::OwnedCap channels[12];
+myos::cap::OwnedCap channels[10];
 libk::optional<Supervisor::Handle> tasks[5];
 
 void channel_pair(myos_cap_t pool, size_t index,
-                  const char* first, const char* second, bool io = false) {
-    const auto pair = myos::channel_create(pool, io ? 1 : 16, MYOS_CHANNEL_MAX_WORDS, io ? 4 : 0, 2);
+                  const char* first, const char* second, bool io = false, size_t depth = 1,
+                  size_t relations = 2) {
+    const auto pair = myos::channel_create(pool, io ? depth : 16, MYOS_CHANNEL_MAX_WORDS, io ? 4 : 0, relations);
     myos::service::require(pair.status);
     channels[index] = myos::cap::OwnedCap{{pair.value, 0}};
     channels[index + 1] = myos::cap::OwnedCap{{pair.value2, 0}};
@@ -33,18 +35,8 @@ void configure_uart(const myos::bootstrap::BootstrapView& info) {
     myos::uart::Port port{address};
     port.reset();
     port.write("init: native services\n");
-    for (;;) {
-        const auto status = myos::vm_unmap(region.value, address, 4096).status;
-        if (myos::deploy::committed(status)) break;
-        if (!myos::deploy::retryable(status)) myos::exit(status);
-        myos::yield();
-    }
-    for (;;) {
-        const auto status = myos::vm_destroy_region(region.value).status;
-        if (myos::deploy::committed(status)) break;
-        if (!myos::deploy::retryable(status)) myos::exit(status);
-        myos::yield();
-    }
+    myos::service::require(myos::vm_complete(vspace, myos::vm_unmap(region.value, address, 4096)).status);
+    myos::service::require(myos::vm_complete(vspace, myos::vm_destroy_region(region.value)).status);
     myos::service::require(myos::cap_close(region.value).status);
 }
 }
@@ -52,7 +44,8 @@ void configure_uart(const myos::bootstrap::BootstrapView& info) {
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     const auto info = myos::service::bootstrap(address, size);
     configure_uart(info);
-    myos::service::require(supervisor.open(info));
+    myos::service::require(supervisor.load(program, info));
+    supervisor.open(info);
     myos::service::require(supervisor.add_boot_sources(info));
     myos::service::require(supervisor.add("uart.memory",
         myos::service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY),
@@ -64,17 +57,16 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto pool = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     channel_pair(pool, 0, "console.sender", "console.receiver");
     channel_pair(pool, 2, "input.sender", "input.receiver");
-    channel_pair(pool, 4, "process.client", "process.server");
+    channel_pair(pool, 4, "process.client", "process.server", false, 1, 3);
     channel_pair(pool, 6, "block.client", "block.server", true);
-    channel_pair(pool, 8, "files.shell.client", "files.shell.server", true);
-    channel_pair(pool, 10, "files.process.client", "files.process.server", true);
+    channel_pair(pool, 8, "files.client", "files.server", true, 8);
     myos::service::require(supervisor.add("block.device",
         myos::service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE), MYOS_OBJECT_KIND_DEVICE,
         MYOS_RIGHT_CONNECT | MYOS_RIGHT_DUPLICATE));
     const char* roles[] = {"uart", "block", "files", "process_server", "shell"};
     myos_status_t status = MYOS_STATUS_OK;
     for (size_t i = 0; i < 5; ++i) {
-        tasks[i] = supervisor.launch(roles[i], status);
+        tasks[i] = supervisor.launch(program, roles[i], status);
         if (!tasks[i]) break;
     }
     if (status == MYOS_STATUS_OK) {

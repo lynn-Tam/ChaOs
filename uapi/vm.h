@@ -7,3 +7,7 @@
 #define MYOS_VM_NORMAL  (1U << 0)
 #define MYOS_VM_UNCACHED (1U << 1)
 #define MYOS_VM_DEVICE  (1U << 2)
+
+// Pager-backed private content may discard clean pages, but has no writeback
+// destination. Dirty pages stay resident until their MemoryObject is retired.
+#define MYOS_MEMORY_PAGER_PRIVATE (1U << 0)

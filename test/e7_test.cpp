@@ -837,14 +837,14 @@ bool test_pager_capacity_waiter_wakes_once(
     return wakes == 1;
 }
 
-bool test_pressure_result_and_frame_progress_are_distinct(
+bool test_pressure_capacity_and_generation_are_distinct(
     const TestContext&) noexcept {
     kernel::mm::PageReclaimer reclaimer{};
     constexpr usize relation_count = kernel::mm::PageReclaimer::pass_budget + 3;
     kernel::mm::WaitRelation relations[relation_count]{};
     const auto publish = [](void*, kernel::mm::PageWaitResult) noexcept {};
     for (usize index = 0; index < relation_count; ++index) {
-        if (!reclaimer.retain(relations[index], 1, nullptr, publish)) {
+        if (!reclaimer.retain(relations[index], nullptr, publish)) {
             return false;
         }
     }
@@ -878,12 +878,13 @@ bool test_pressure_result_and_frame_progress_are_distinct(
     }
     auto& reused = relations[0];
     const u64 previous_generation = reused.generation;
-    if (!reclaimer.retain(reused, 2, nullptr, publish)
+    if (!reclaimer.retain(reused, nullptr, publish, 2)
         || reused.generation == previous_generation
         || reclaimer.release(reused, previous_generation)) {
         return false;
     }
-    if (reclaimer.wake(3, ready, 1) != 1) {
+    if (reclaimer.wake(1, ready, 1) != 0
+        || reclaimer.wake(2, ready, 1) != 1) {
         return false;
     }
     return ready[0]
@@ -893,7 +894,7 @@ bool test_pressure_result_and_frame_progress_are_distinct(
         && (ready[0].reset(), reclaimer.pending() == 0);
 }
 
-/*luna change: prove equal-generation OutOfMemory only after an empty object round, reason: terminal pressure must follow reclaimer-owned completion and exact claim publication*/
+// OOM requires insufficient capacity and a complete idle scan.
 bool test_pressure_empty_round_proves_oom(
     const TestContext&) noexcept {
     kernel::mm::PageReclaimer reclaimer{};
@@ -901,14 +902,14 @@ bool test_pressure_empty_round_proves_oom(
     auto seen = kernel::mm::PageWaitResult::Canceled;
     /*luna change: bind the focused OOM callback to its local result, reason: claim publication must never dereference a null test context*/
     if (!reclaimer.retain(
-            relation, 7, &seen, &page_wait_published)
+            relation, &seen, &page_wait_published)
         || reclaimer.service(kernel::mm::PageReclaimer::pass_budget)
             != kernel::mm::ReclaimResult::Idle
         || reclaimer.pending() != 1) {
         return false;
     }
     kernel::mm::WaitClaim claim{};
-    if (reclaimer.wake(7, &claim, 1) != 1
+    if (reclaimer.wake(0, &claim, 1) != 1
         || !claim
         || claim.relation() != nullptr
         || relation.attached()
@@ -1436,7 +1437,7 @@ void register_e7_tests(TestRegistry& registry) noexcept {
         test_pager_capacity_waiter_wakes_once);
     (void)registry.add(
         "e7", "Pressure and frame progress remain distinct",
-        test_pressure_result_and_frame_progress_are_distinct);
+        test_pressure_capacity_and_generation_are_distinct);
     (void)registry.add(
         "e7", "Empty reclaim round proves equal-generation OOM",
         test_pressure_empty_round_proves_oom);

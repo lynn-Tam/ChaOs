@@ -1,5 +1,7 @@
 #pragma once
 
+#include <user/lib/imports.hpp>
+
 #include <array>
 #include <map>
 #include <user/lib/service_protocol.hpp>
@@ -71,6 +73,7 @@ class Task final {
     uint64_t budget_{};
     uint32_t cspace_slots_{};
     uint32_t cspace_pages_{};
+    uint64_t caps_{};
     bool supervisor_{};
     uint64_t kinds_{MYOS_RESOURCE_E2_KINDS};
 
@@ -100,10 +103,11 @@ class Task final {
         r.u64(MYOS_DEPLOY_MAPPING_SIZE, size);
         return index;
     }
-    void import(uint32_t role, uint64_t source, uint16_t source_class,
+    void import(BootstrapBinding binding, uint64_t source, uint16_t source_class,
                 uint64_t rights, uint16_t mode = MYOS_DEPLOY_IMPORT_DUPLICATE,
                 uint64_t side = 0, uint64_t badge = 0) {
-        const auto destination = key("cap." + std::to_string(role));
+        const auto destination = key("cap." + (binding.role != 0
+            ? std::to_string(binding.role) : std::string{binding.imported.name}));
         auto r = manifest_.row(MYOS_DEPLOY_TABLE_IMPORT);
         r.u64(MYOS_DEPLOY_IMPORT_SOURCE, source);
         r.u64(MYOS_DEPLOY_IMPORT_DESTINATION, destination);
@@ -111,7 +115,7 @@ class Task final {
         r.u16(MYOS_DEPLOY_IMPORT_SOURCE_CLASS, source_class);
         constexpr auto a = MYOS_DEPLOY_IMPORT_ATTENUATION;
         r.u16(a + MYOS_DEPLOY_ATTENUATION_VERSION, MYOS_CAP_ATTENUATION_VERSION_CURRENT);
-        r.u16(a + MYOS_DEPLOY_ATTENUATION_KIND, myos_bootstrap_object_kind(role));
+        r.u16(a + MYOS_DEPLOY_ATTENUATION_KIND, binding.kind());
         r.u32(a + MYOS_DEPLOY_ATTENUATION_SIZE, MYOS_CAP_ATTENUATION_SIZE);
         r.u64(a + MYOS_DEPLOY_ATTENUATION_RIGHTS, rights);
         if (mode == MYOS_DEPLOY_IMPORT_CHANNEL_MINT) {
@@ -120,11 +124,18 @@ class Task final {
             r.u64(a + MYOS_DEPLOY_ATTENUATION_WORD2, UINT64_MAX);
         }
         auto b = manifest_.row(MYOS_DEPLOY_TABLE_BOOTSTRAP);
-        b.u32(MYOS_DEPLOY_BOOTSTRAP_KIND, role);
+        b.u32(MYOS_DEPLOY_BOOTSTRAP_KIND, binding.role);
+        if (binding.role == 0) {
+            b.u64(MYOS_DEPLOY_BOOTSTRAP_NAME, manifest_.name(binding.imported.name));
+            b.u32(MYOS_DEPLOY_BOOTSTRAP_PROTOCOL, binding.imported.protocol);
+            b.u16(MYOS_DEPLOY_BOOTSTRAP_MAJOR, binding.imported.major);
+            b.u16(MYOS_DEPLOY_BOOTSTRAP_MINOR, binding.imported.minor);
+            b.u16(MYOS_DEPLOY_BOOTSTRAP_OBJECT_KIND, binding.kind());
+        }
         b.u64(MYOS_DEPLOY_BOOTSTRAP_DESTINATION, destination);
     }
-    void local(uint32_t role, std::string_view suffix, uint64_t rights) {
-        import(role, key(suffix), MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY, rights);
+    void local(BootstrapBinding binding, std::string_view suffix, uint64_t rights) {
+        import(binding, key(suffix), MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY, rights);
     }
 
 public:
@@ -140,7 +151,7 @@ public:
          uint64_t execution_budget = 1'000'000)
         : manifest_(manifest), name_(name), image_(production_image_metrics(elf)),
           budget_(budget), cspace_slots_(supervisor ? 128 : 32),
-          cspace_pages_(supervisor ? 9 : 4), supervisor_(supervisor) {
+          cspace_pages_(supervisor ? 9 : 4), caps_(supervisor ? 512 : 64), supervisor_(supervisor) {
         for (unsigned t = 0; t < first_.size(); ++t) first_[t] = manifest_.count(t);
         auto image = manifest_.row(MYOS_DEPLOY_TABLE_IMAGE);
         image.u64(MYOS_DEPLOY_IMAGE_SOURCE, manifest_.name(name));
@@ -187,14 +198,18 @@ public:
             authority(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE, "bundle", MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT);
         }
     }
-    void authority(uint32_t role, std::string_view source, uint64_t rights) {
-        import(role, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY, rights);
+    void authority(BootstrapBinding binding, std::string_view source, uint64_t rights) {
+        import(binding, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY, rights);
     }
     void kinds(uint64_t value) { kinds_ = value; }
-    void cspace(uint32_t slots, uint32_t pages) { cspace_slots_ = slots; cspace_pages_ = pages; }
-    void channel(uint32_t role, std::string_view source, uint64_t side,
+    void cspace(uint32_t slots, uint32_t pages) {
+        cspace_slots_ = slots;
+        cspace_pages_ = pages;
+        if (caps_ < slots) caps_ = slots;
+    }
+    void channel(BootstrapBinding binding, std::string_view source, uint64_t side,
                  uint64_t badge, uint64_t rights) {
-        import(role, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY,
+        import(binding, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY,
                rights, MYOS_DEPLOY_IMPORT_CHANNEL_MINT, side, badge);
     }
     void finish() {
@@ -214,7 +229,7 @@ public:
             r.u32(offsets[i] + 4, manifest_.count(tables[i]) - first_[tables[i]]);
         }
         r.u64(MYOS_DEPLOY_TASK_POOL_MEMORY, budget_);
-        r.u64(MYOS_DEPLOY_TASK_POOL_CAPS, supervisor_ ? 512 : 64);
+        r.u64(MYOS_DEPLOY_TASK_POOL_CAPS, caps_);
         r.u64(MYOS_DEPLOY_TASK_KIND_MASK, kinds_);
         r.u64(MYOS_DEPLOY_TASK_CRITICAL_BYTES, image_.critical_code_bytes + StackSize + 8192);
         r.u32(MYOS_DEPLOY_TASK_CSPACE_SLOTS, cspace_slots_);
@@ -242,12 +257,12 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
         task.cspace(32, 6);
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
         task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "block.server", 1, 1, rights);
+        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
         task.finish();
     }
     {
         Task task{manifest, "io-client", client, 2 * 1024 * 1024};
-        task.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "block.client", 0, 1, rights);
+        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, rights);
         task.finish();
     }
     return manifest.finish();
@@ -261,31 +276,38 @@ inline auto pack_file_session(char** paths) -> std::vector<uint8_t> {
         task.cspace(32, 6);
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
         task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "block.server", 1, 1, rights);
+        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
         task.finish();
     }
     {
         Task task{manifest, "files", paths[1], 16 * 1024 * 1024};
-        task.cspace(64, 10);
-        task.channel(MYOS_BOOTSTRAP_CAP_BLOCK_CHANNEL, "block.client", 0, 1, rights);
-        task.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "files.first.server", 1, 1, rights);
-        task.channel(MYOS_BOOTSTRAP_CAP_FILE_CHANNEL, "files.second.server", 1, 1, rights);
+        task.cspace(1024, 132);
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER);
+        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, rights);
+        task.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, MYOS_RIGHT_RECEIVE);
         task.finish();
     }
     {
         Task task{manifest, "file-client", paths[2], 4 * 1024 * 1024};
-        task.cspace(32, 6);
-        task.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "files.first.client", 0, 1, rights);
-        task.channel(MYOS_BOOTSTRAP_CAP_FILE_CHANNEL, "files.second.client", 0, 1, rights);
+        task.cspace(128, 20);
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, MYOS_RIGHT_SEND);
         task.finish();
     }
     return manifest.finish();
 }
 
-inline auto pack_application(const char* image, uint64_t budget = 1'000'000) -> std::vector<uint8_t> {
+inline auto pack_application(const char* name, const char* image, uint64_t budget = 1'000'000,
+                             bool denied = false) -> std::vector<uint8_t> {
     Manifest manifest;
-    Task task{manifest, "hello", image, 1024 * 1024, false, budget};
-    task.authority(MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT, "console.sender", MYOS_RIGHT_SEND);
+    Task task{manifest, name, image, 1024 * 1024, false, budget};
+    task.authority(myos::bootstrap::imports::ConsoleOutput, "console.sender", MYOS_RIGHT_SEND);
+    if (std::string_view{name} == "cat") {
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.cspace(128, 20);
+        task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
+    }
+    if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }
@@ -299,24 +321,27 @@ inline auto pack_console(char** paths)
         Task t{manifest, "uart", paths[0], 1024 * 1024};
         t.authority(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY, "uart.memory", MYOS_RIGHT_MAP);
         t.authority(MYOS_BOOTSTRAP_CAP_IRQ, "uart.irq", MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK);
-        t.channel(MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT, "console.receiver", 1, 1, receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT, "input.sender", 0, 1, send);
+        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.receiver", 1, 1, receive);
+        t.channel(myos::bootstrap::imports::ConsoleInput, "input.sender", 0, 1, send);
         t.finish();
     }
     {
         Task t{manifest, "process_server", paths[1], 32 * 1024 * 1024, true};
-        t.channel(MYOS_BOOTSTRAP_CAP_FILE_CHANNEL, "files.process.client", 0, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "process.server", 1, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT, "console.sender", 0, 1, send | MYOS_RIGHT_DUPLICATE);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL | MYOS_RESOURCE_PAGER);
+        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
+        t.channel(myos::bootstrap::imports::FilesRead, "files.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
+        t.channel(myos::bootstrap::imports::Process, "process.server", 1, 1, send | receive);
+        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 1, send | MYOS_RIGHT_DUPLICATE);
         t.finish();
     }
     {
         Task t{manifest, "shell", paths[2], 2 * 1024 * 1024};
-        t.cspace(32, 6);
-        t.channel(MYOS_BOOTSTRAP_CAP_FILE_CHANNEL, "files.shell.client", 0, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "process.client", 0, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT, "console.sender", 0, 2, send);
-        t.channel(MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT, "input.receiver", 1, 1, receive);
+        t.cspace(128, 20);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, send);
+        t.channel(myos::bootstrap::imports::Process, "process.client", 0, 1, send | receive);
+        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 2, send);
+        t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1, receive);
         t.finish();
     }
     {
@@ -324,15 +349,15 @@ inline auto pack_console(char** paths)
         t.cspace(32, 6);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
         t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        t.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "block.server", 1, 1, send | receive);
+        t.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, send | receive);
         t.finish();
     }
     {
         Task t{manifest, "files", paths[4], 16 * 1024 * 1024};
-        t.cspace(64, 10);
-        t.channel(MYOS_BOOTSTRAP_CAP_BLOCK_CHANNEL, "block.client", 0, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, "files.shell.server", 1, 1, send | receive);
-        t.channel(MYOS_BOOTSTRAP_CAP_FILE_CHANNEL, "files.process.server", 1, 1, send | receive);
+        t.cspace(1024, 132);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER);
+        t.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, send | receive);
+        t.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, receive);
         t.finish();
     }
     return manifest.finish();

@@ -177,6 +177,11 @@ struct ManifestImportRow final {
 struct ManifestBootstrapRow final {
     uint32_t kind{};
     StringRef destination{};
+    StringRef name{};
+    uint32_t protocol{};
+    uint16_t major{};
+    uint16_t minor{};
+    uint16_t object_kind{};
 };
 
 struct ManifestDependencyRow final {
@@ -1675,6 +1680,8 @@ private:
                 return fail(Error::InvalidReference);
             }
             uint32_t readiness_roles = 0;
+            uint32_t fixed_count = 0;
+            uint32_t named_count = 0;
             for (uint64_t local = 0; local < count; ++local) {
                 const uint32_t row = static_cast<uint32_t>(first + local);
                 uint64_t kind{};
@@ -1687,12 +1694,28 @@ private:
                     || !zero(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
                              MYOS_DEPLOY_BOOTSTRAP_RESERVED,
                              MYOS_DEPLOY_BOOTSTRAP_DESTINATION)
-                    || myos_bootstrap_object_kind(static_cast<uint32_t>(kind))
-                        == MYOS_OBJECT_KIND_INVALID) {
+                    || !zero(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
+                             MYOS_DEPLOY_BOOTSTRAP_TAIL, MYOS_DEPLOY_BOOTSTRAP_STRIDE)) {
                     return fail(Error::InvalidRecord);
                 }
-                const myos_object_kind_t expected_kind =
-                    myos_bootstrap_object_kind(static_cast<uint32_t>(kind));
+                ManifestBootstrapRow binding{};
+                if (!bootstrap_row(row, binding)) return fail(Error::InvalidRecord);
+                const bool named = kind == 0;
+                if ((named && ++named_count > MYOS_BOOTSTRAP_MAX_IMPORTS)
+                    || (!named && ++fixed_count > MYOS_BOOTSTRAP_MAX_CAPS))
+                    return fail(Error::InvalidRange);
+                const ByteView name = string(binding.name);
+                const myos_object_kind_t expected_kind = named ? binding.object_kind
+                    : myos_bootstrap_object_kind(static_cast<uint32_t>(kind));
+                if (!valid_kind(expected_kind)
+                    || (named && (name.size() == 0
+                        || name.size() >= MYOS_BOOTSTRAP_IMPORT_NAME_MAX
+                        || binding.protocol == 0 || binding.major == 0))
+                    || (!named && !zero(MYOS_DEPLOY_TABLE_BOOTSTRAP, row,
+                        MYOS_DEPLOY_BOOTSTRAP_NAME, MYOS_DEPLOY_BOOTSTRAP_STRIDE)))
+                    return fail(Error::InvalidRecord);
+                for (size_t i = 0; i < name.size(); ++i)
+                    if (name[i] < 33 || name[i] > 126) return fail(Error::InvalidString);
                 if (kind == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
                     ++readiness_roles;
                 }
@@ -1702,9 +1725,14 @@ private:
                                static_cast<uint32_t>(first + previous),
                                MYOS_DEPLOY_BOOTSTRAP_KIND, 4,
                                previous_kind)
-                        || previous_kind == kind) {
+                        || (!named && previous_kind == kind)) {
                         return fail(Error::DuplicateKey);
                     }
+                    ManifestBootstrapRow previous_binding{};
+                    if (!bootstrap_row(static_cast<uint32_t>(first + previous), previous_binding)
+                        || (named && previous_kind == 0
+                            && string(previous_binding.name).equals(name)))
+                        return fail(Error::DuplicateKey);
                 }
                 uint32_t matches{};
                 myos_object_kind_t matched_kind = MYOS_OBJECT_KIND_INVALID;
@@ -3152,7 +3180,17 @@ inline auto ManifestView::bootstrap_row(
         && manifest_detail::string_ref(
                *this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
                MYOS_DEPLOY_BOOTSTRAP_DESTINATION, true,
-               output.destination);
+               output.destination)
+        && manifest_detail::string_ref(*this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_NAME, false, output.name)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_PROTOCOL, 4, output.protocol)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_MAJOR, 2, output.major)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_MINOR, 2, output.minor)
+        && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_BOOTSTRAP, index,
+               MYOS_DEPLOY_BOOTSTRAP_OBJECT_KIND, 2, output.object_kind);
 }
 
 } // namespace myos::deploy

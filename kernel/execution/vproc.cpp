@@ -54,9 +54,6 @@ namespace {
         && runtime.control_view.valid() && runtime.event_view.valid()
         && runtime.control_view.access() == control_access
         && runtime.event_view.access() == event_access
-        && runtime.control_view.virtual_range().base()
-            == runtime.control_address
-        && runtime.event_view.virtual_range().base() == runtime.event_address
         && runtime.control_view.virtual_range().size() == kernel::mm::page_size
         && runtime.event_view.virtual_range().size() == kernel::mm::page_size
         && runtime.control_page.page().access.contains(control_access)
@@ -253,6 +250,7 @@ void Vproc::cancel_operations() noexcept {
     for (usize index = 0; index < max_operations; ++index) {
         operation::Completion* completion{};
         operation::Key key{};
+        operation::Completion::CancelClaim claim{};
         {
             kernel::sync::IrqLockGuard guard{state_lock_};
             OperationSlot& slot = operations_[index];
@@ -266,13 +264,14 @@ void Vproc::cancel_operations() noexcept {
             // Claim Delivery while the slot pointer and generation are
             // stable.  A producer that already owns publication leaves this
             // operation for its normal Ready path.
-            if (!completion->try_claim_cancel()) {
+            claim = completion->try_claim_cancel();
+            if (claim == operation::Completion::CancelClaim::Unavailable) {
                 continue;
             }
         }
 
         operation::Completion::CancelResult resolution =
-            completion->resolve_cancel();
+            completion->resolve_cancel(claim);
         if (resolution == operation::Completion::CancelResult::Reopen) {
             bool reopened{};
             {
@@ -336,6 +335,7 @@ auto Vproc::poll_operation(operation::Key key) const noexcept
 auto Vproc::cancel_operation(operation::Key key) noexcept
     -> libk::Expected<void, VprocError> {
     operation::Completion* completion{};
+    operation::Completion::CancelClaim claim{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
         if (!key.valid() || key.slot() >= max_operations) {
@@ -348,13 +348,14 @@ auto Vproc::cancel_operation(operation::Key key) noexcept
             return libk::unexpected(VprocError::InvalidState);
         }
         completion = slot.completion;
-        if (!completion->try_claim_cancel()) {
+        claim = completion->try_claim_cancel();
+        if (claim == operation::Completion::CancelClaim::Unavailable) {
             return libk::unexpected(VprocError::InvalidState);
         }
     }
 
     operation::Completion::CancelResult resolution =
-        completion->resolve_cancel();
+        completion->resolve_cancel(claim);
     if (resolution == operation::Completion::CancelResult::Reopen) {
         kernel::sync::IrqLockGuard guard{state_lock_};
         OperationSlot& slot = operations_[key.slot()];
@@ -498,8 +499,8 @@ auto Vproc::enter_runtime(
             __ATOMIC_RELEASE);
         entry = arm_.entry;
         entry.arguments[0] = upcall_generation_;
-        entry.arguments[1] = runtime_.event_address.raw();
-        entry.arguments[2] = runtime_.control_address.raw();
+        entry.arguments[1] = runtime_.event_view.virtual_range().base().raw();
+        entry.arguments[2] = runtime_.control_view.virtual_range().base().raw();
         entry.arguments[3] = pending_sequence_;
     }
     KASSERT(trap.load_user_start(entry));

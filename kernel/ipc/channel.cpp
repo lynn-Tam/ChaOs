@@ -940,7 +940,7 @@ auto Channel::bind(
     u64 generation{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (!opened_ || closing_ || relation_count_ >= config_.relation_capacity) {
+        if (!opened_ || closing_) {
             return libk::unexpected(ChannelError::ResourceExhausted);
         }
         for (index = 0; index < relation_count_; ++index) {
@@ -949,7 +949,7 @@ auto Channel::bind(
             }
         }
         if (index == relation_count_) {
-            if (relation_count_ == MYOS_CHANNEL_MAX_RELATIONS) {
+            if (relation_count_ == config_.relation_capacity) {
                 return libk::unexpected(ChannelError::ResourceExhausted);
             }
             ++relation_count_;

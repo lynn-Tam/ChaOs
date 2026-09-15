@@ -1,5 +1,7 @@
 #pragma once
 
+#include <user/lib/imports.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +18,16 @@
 #include <uapi/vm.h>
 
 namespace myos::deploy::host {
+
+struct BootstrapBinding final {
+    uint32_t role{};
+    myos::bootstrap::Import imported{};
+    constexpr BootstrapBinding(uint32_t fixed) : role(fixed) {}
+    constexpr BootstrapBinding(myos::bootstrap::Import named) : imported(named) {}
+    constexpr auto kind() const -> uint16_t {
+        return role != 0 ? myos_bootstrap_object_kind(role) : imported.kind;
+    }
+};
 
 struct Table final {
     std::size_t offset{};
@@ -223,13 +235,13 @@ inline auto pack_production(
     const std::uint64_t uart_critical =
         critical_budget(uart, stack_bootstrap);
 
-    /* These are page-rounded policy ceilings for the concrete worker rows
-     * below.  Their accounting is established by the resource ledger for
-     * these images and object relations; the packer only records the fixed
-     * contract consumed by init and process_server. */
-    constexpr std::uint64_t consumer_pool_memory = UINT64_C(0x34000);
-    constexpr std::uint64_t pager_pool_memory = UINT64_C(0x3a000);
-    constexpr std::uint64_t uart_pool_memory = UINT64_C(0x37000);
+    // Policy ceilings include runtime paging and capability directory growth,
+    // not only the currently measured constructor allocations. Reservations
+    // bound the worker; physical pages are still allocated on demand.
+    constexpr std::uint64_t worker_objects = 256 * 1024;
+    const auto consumer_pool_memory = consumer_critical + worker_objects;
+    const auto pager_pool_memory = pager_critical + worker_objects;
+    const auto uart_pool_memory = uart_critical + worker_objects;
     constexpr std::uint64_t consumer_pool_caps = 5;
     constexpr std::uint64_t pager_pool_caps = 11;
     constexpr std::uint64_t uart_pool_caps = 10;
@@ -278,6 +290,7 @@ inline auto pack_production(
         "consumer.segment2", "pager.segment2", "uart.segment2",
         "consumer.notify", "pager.notify", "uart.notify",
         "pager", "uart", "pager.staging.region", "pager.staging.region.cap",
+        "target.memory", "staging.memory", "staging.region",
     };
 
     struct KeyRef final {
@@ -982,9 +995,20 @@ inline auto pack_production(
 
     const std::size_t bootstraps =
         tables[MYOS_DEPLOY_TABLE_BOOTSTRAP].offset;
-    const auto bootstrap = [&](std::size_t offset, std::uint32_t kind,
+    const auto bootstrap = [&](std::size_t offset, BootstrapBinding binding,
                                std::size_t destination) {
-        put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_KIND, kind, 4);
+        put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_KIND, binding.role, 4);
+        if (binding.role == 0) {
+            size_t name_index = 0;
+            while (name_index < string_count && strings[name_index] != binding.imported.name)
+                ++name_index;
+            if (name_index == string_count) throw std::runtime_error("missing import name");
+            put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_NAME, key(name_index), 8);
+            put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_PROTOCOL, binding.imported.protocol, 4);
+            put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_MAJOR, binding.imported.major, 2);
+            put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_MINOR, binding.imported.minor, 2);
+            put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_OBJECT_KIND, binding.kind(), 2);
+        }
         put(bytes, offset + MYOS_DEPLOY_BOOTSTRAP_DESTINATION,
             key(destination), 8);
     };
@@ -1015,18 +1039,18 @@ inline auto pack_production(
         bootstrap(bootstraps + (10 + index) * MYOS_DEPLOY_BOOTSTRAP_STRIDE,
                   consumer_kinds[index], consumer_destinations[index]);
     }
-    constexpr std::uint32_t pager_kinds[] = {
+    constexpr BootstrapBinding pager_kinds[] = {
         MYOS_BOOTSTRAP_CAP_RESOURCE_POOL,
         MYOS_BOOTSTRAP_CAP_VSPACE,
         MYOS_BOOTSTRAP_CAP_CSPACE,
         MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN,
         MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE,
-        MYOS_BOOTSTRAP_CAP_PAGER,
-        MYOS_BOOTSTRAP_CAP_TARGET_MEMORY,
-        MYOS_BOOTSTRAP_CAP_STAGING_MEMORY,
+        myos::bootstrap::imports::Pager,
+        myos::bootstrap::imports::TargetMemory,
+        myos::bootstrap::imports::StagingMemory,
         MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION,
         MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
-        MYOS_BOOTSTRAP_CAP_STAGING_REGION,
+        myos::bootstrap::imports::StagingRegion,
     };
     constexpr std::size_t pager_destinations[] = {
         31, 32, 33, 84, 85, 79, 80, 81, 29, 30, 108};

@@ -10,7 +10,7 @@
 #define MYOS_CHANNEL_MAX_WORDS 16U
 #define MYOS_CHANNEL_MAX_CAPS MYOS_IPC_MAX_CAPS
 #define MYOS_CHANNEL_MAX_WAITERS 1U
-#define MYOS_CHANNEL_MAX_RELATIONS 2U
+#define MYOS_CHANNEL_MAX_RELATIONS 4U
 
 // Readable/Writable also become ready on close: the corresponding operation
 // can return a terminal status. Notifications are hints; retry the operation

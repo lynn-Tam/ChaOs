@@ -7,6 +7,12 @@
 
 namespace kernel::ipc {
 
+auto Buffer::Access::bytes(usize offset, usize size) const noexcept -> libk::Span<const byte> {
+    if (pmm_ == nullptr || size == 0 || offset >= size_ || size > size_ - offset
+        || size > mm::page_size - offset % mm::page_size) return {};
+    return {pmm_->bytes(pages_[offset / mm::page_size].page().page) + offset % mm::page_size, size};
+}
+
 auto Buffer::Access::read(
     usize offset, libk::Span<byte> output) const noexcept -> bool {
     const auto end = libk::checked_add(offset, output.size());

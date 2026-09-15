@@ -206,7 +206,8 @@ public:
         kernel::resource::Reservation&& sponsorship,
         usize byte_size,
         object::ObjectRef&& pager,
-        kernel::mm::AccessMask access) noexcept
+        kernel::mm::AccessMask access,
+        bool private_content = false) noexcept
         -> libk::Expected<MemoryPending, kernel::mm::MemoryError>;
     [[nodiscard]] auto create_physical(
         usize byte_size,

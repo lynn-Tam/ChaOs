@@ -245,9 +245,8 @@ private:
     libk::Atomic<u64> observation_key_{};
 };
 
-// Capability-owned operation used only for a blocking invocation. GrantGraph
-// owns its stable storage; Thread observes it through the embedded generic
-// operation::Completion and never contains capability-specific state.
+// One blocking revocation. The executing Wait reserves its stable storage;
+// GrantGraph owns the lineage transition and publishes the completion.
 class GrantRevokeWait final : private libk::noncopyable_nonmovable {
 public:
     explicit GrantRevokeWait(GrantGraph& graph) noexcept;
@@ -270,7 +269,6 @@ private:
     void release() noexcept;
     [[nodiscard]] auto cancel() noexcept -> bool;
 
-    GrantGraph* graph_{};
     GrantRevoke completion_;
     kernel::operation::Completion relation_;
 };

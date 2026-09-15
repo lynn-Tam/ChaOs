@@ -26,6 +26,7 @@
 #define MYOS_SYS_VM_RESERVE         36
 #define MYOS_SYS_VM_GUARD           37
 #define MYOS_SYS_VM_DESTROY_REGION  38
+#define MYOS_SYS_VM_SYNC            39 /* a0=VSpace cap; waits for the VM transaction current at admission */
 
 /*
  * Typed construction ABI:
@@ -51,10 +52,13 @@
 
 #define MYOS_SYS_MEMORY_SEAL           64 /* a0=MemoryObject */
 #define MYOS_SYS_RESOURCE_CLOSE        65 /* a0=child ResourcePool */
+#define MYOS_SYS_MEMORY_POPULATE       67 /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
+#define MYOS_SYS_RESOURCE_CLOSE_ASYNC  68 /* a0=pool, a1=Notification (Receive), a2=nonzero completion badge; OK=accepted */
+#define MYOS_SYS_MEMORY_WRITE          66 /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; private anonymous single-page initialization */
 
 #define MYOS_SYS_NOTIFICATION_SIGNAL   80 /* a0=Notification; badge is in cap */
 #define MYOS_SYS_NOTIFICATION_TAKE     81 /* a0=Notification */
-#define MYOS_SYS_NOTIFICATION_WAIT     82 /* a0=Notification */
+#define MYOS_SYS_NOTIFICATION_WAIT     82 /* a0=Notification, a1=absolute monotonic deadline ticks (0=infinite) */
 #define MYOS_SYS_NOTIFICATION_BIND_VPROC 83 /* a0=Notification, a1=slot, a2=tag */
 #define MYOS_SYS_NOTIFICATION_UNBIND_VPROC 84 /* a0=Notification */
 

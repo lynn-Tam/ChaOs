@@ -198,6 +198,27 @@ template<typename T>
             throw std::runtime_error("PT_LOAD page ranges overlap");
         }
     }
+    // The bundle is a load image, not an ELF archive. Read-only segments
+    // contain whole initialized pages so a file mapping can share their
+    // backing directly. Writable segments retain their explicit zero tail.
+    std::vector<std::byte> payload;
+    for (auto& segment : image.segments) {
+        const auto offset = (payload.size() + 4095) & ~std::size_t{4095};
+        const auto stored = (segment.access & MYOS_BOOT_SEGMENT_WRITE) != 0
+            ? segment.file_size : (segment.memory_size + 4095) & ~std::uint64_t{4095};
+        if (stored > payload.max_size() - offset)
+            throw std::runtime_error("load image is too large");
+        payload.resize(offset + stored);
+        std::copy_n(image.bytes.begin() + segment.image_offset, segment.file_size,
+                    payload.begin() + offset);
+        segment.image_offset = offset;
+        // The input's stronger congruence has already been checked. A load
+        // image needs page congruence; its virtual addresses stay unchanged.
+        segment.alignment = 4096;
+        if ((segment.access & MYOS_BOOT_SEGMENT_WRITE) == 0)
+            segment.memory_size = segment.file_size = stored;
+    }
+    image.bytes = std::move(payload);
     return image;
 }
 
@@ -267,8 +288,8 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         name_offsets.push_back(cursor);
         cursor += module.name.size();
     }
-    cursor = align_up(cursor, 8);
     for (const Module& module : modules) {
+        cursor = align_up(cursor, module.data ? 8 : 4096);
         const std::size_t image_size = module.data
             ? module.payload.size() : module.image.bytes.size();
         image_offsets.push_back(cursor);

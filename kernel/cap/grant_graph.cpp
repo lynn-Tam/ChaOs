@@ -108,13 +108,10 @@ GrantGraph::GrantGraph(kernel::mm::Pmm& pmm) noexcept
 
 GrantGraph::GrantGraph(kernel::mm::Pmm& pmm, Quota quota) noexcept
     : pmm_(&pmm),
-      quota_(quota),
-      revoke_waits_(pmm),
-      close_waits_(pmm) {}
+      quota_(quota) {}
 
 GrantRevokeWait::GrantRevokeWait(GrantGraph& graph) noexcept
-    : graph_(&graph),
-      completion_(kernel::sync::Completion::Notifier::bind<
+    : completion_(kernel::sync::Completion::Notifier::bind<
           &GrantRevokeWait::ready>(*this)),
       relation_(kernel::operation::Completion::bind<
           GrantRevokeWait,
@@ -141,58 +138,11 @@ auto GrantRevokeWait::read() noexcept -> kernel::operation::Result {
 }
 
 void GrantRevokeWait::release() noexcept {
-    GrantGraph* const graph = graph_;
-    KASSERT(graph != nullptr);
-    graph->destroy_revoke_wait(*this);
+    KASSERT(!completion_.initialized() || completion_.complete());
 }
 
 auto GrantRevokeWait::cancel() noexcept -> bool {
     return !completion_.initialized();
-}
-
-auto GrantGraph::create_revoke_wait() noexcept
-    -> libk::Expected<GrantRevokeWait*, GrantError> {
-    auto made = revoke_waits_.create(*this);
-    if (!made) {
-        switch (made.error()) {
-        case kernel::mm::NodePoolError::OutOfMemory:
-            return libk::unexpected(GrantError::OutOfMemory);
-        case kernel::mm::NodePoolError::QuotaExceeded:
-            return libk::unexpected(GrantError::QuotaExceeded);
-        case kernel::mm::NodePoolError::GenerationExhausted:
-            return libk::unexpected(GrantError::GenerationExhausted);
-        case kernel::mm::NodePoolError::ResourceExhausted:
-            return libk::unexpected(GrantError::OutOfMemory);
-        }
-    }
-    return libk::expected(made.value().object);
-}
-
-void GrantGraph::destroy_revoke_wait(GrantRevokeWait& operation) noexcept {
-    revoke_waits_.destroy(operation);
-}
-
-auto GrantGraph::create_close_wait() noexcept
-    -> libk::Expected<kernel::resource::CloseWait*, GrantError> {
-    auto made = close_waits_.create(*this);
-    if (!made) {
-        switch (made.error()) {
-        case kernel::mm::NodePoolError::OutOfMemory:
-            return libk::unexpected(GrantError::OutOfMemory);
-        case kernel::mm::NodePoolError::QuotaExceeded:
-            return libk::unexpected(GrantError::QuotaExceeded);
-        case kernel::mm::NodePoolError::GenerationExhausted:
-            return libk::unexpected(GrantError::GenerationExhausted);
-        case kernel::mm::NodePoolError::ResourceExhausted:
-            return libk::unexpected(GrantError::OutOfMemory);
-        }
-    }
-    return libk::expected(made.value().object);
-}
-
-void GrantGraph::destroy_close_wait(
-    kernel::resource::CloseWait& operation) noexcept {
-    close_waits_.destroy(operation);
 }
 
 auto GrantGraph::close_pool(
@@ -201,14 +151,10 @@ auto GrantGraph::close_pool(
     kernel::Thread& thread,
     kernel::CpuRegistry& cpus) noexcept
     -> libk::Expected<kernel::operation::State, GrantError> {
-    auto made = create_close_wait();
-    if (!made) {
-        return libk::unexpected(made.error());
-    }
-    kernel::resource::CloseWait* const operation = made.value();
+    auto* const operation = thread.current_wait().prepare_close(*this);
+    if (operation == nullptr) return libk::unexpected(GrantError::InvalidState);
     if (!thread.begin_wait(operation->relation(), cpus)) {
         KASSERT(operation->cancel());
-        destroy_close_wait(*operation);
         return libk::unexpected(GrantError::InvalidState);
     }
     if (!pool.observe_refund(self, operation->notifier())) {
@@ -217,9 +163,10 @@ auto GrantGraph::close_pool(
     }
     operation->commit();
     static_cast<void>(pool.close());
-    return libk::expected(operation->arm()
-        ? kernel::operation::State::Waiting
-        : kernel::operation::State::Complete);
+    if (operation->arm()) return libk::expected(kernel::operation::State::Waiting);
+    // The countdown completed before arming, so its notifier did not run.
+    operation->relation().signal();
+    return libk::expected(kernel::operation::State::Complete);
 }
 
 GrantLease::GrantLease(GrantLease&& other) noexcept
@@ -463,8 +410,6 @@ void GrantRevoke::progress(
 GrantGraph::~GrantGraph() noexcept {
     KASSERT(!work_notifier_);
     KASSERT(work_.empty());
-    KASSERT(close_waits_.live_count() == 0);
-    KASSERT(revoke_waits_.live_count() == 0);
     KASSERT(live_nodes_ == 0);
     while (pages_ != nullptr) {
         PageHeader* const page = pages_;
@@ -1459,6 +1404,31 @@ auto GrantGraph::revoke(
     completion.service(kick_work());
     completion.acknowledge();
     return libk::expected();
+}
+
+auto GrantGraph::destroy_target(const GrantLease& source) noexcept -> libk::Expected<void, GrantError> {
+    kernel::resource::Allocation* allocation{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        Node* const node = locate(source.key());
+        if (node == nullptr) return libk::unexpected(GrantError::InvalidKey);
+        for (Node* ancestor = node; ancestor != nullptr; ancestor = ancestor->parent) {
+            if (ancestor->allocation) {
+                KASSERT(ancestor->target.id() == node->target.id());
+                allocation = &ancestor->allocation;
+                break;
+            }
+        }
+    }
+    if (allocation != nullptr) {
+        // The source operation is part of the root's revoke barrier: neither
+        // this record nor its sponsoring pool can detach until it is released.
+        allocation->pool_->close_allocation(*allocation);
+        return libk::expected();
+    }
+    auto target = source.clone_target();
+    return target && target.value().retire() ? libk::Expected<void, GrantError>{libk::expected()}
+        : libk::Expected<void, GrantError>{libk::unexpected(GrantError::InvalidState)};
 }
 
 void GrantGraph::commit_allocation(

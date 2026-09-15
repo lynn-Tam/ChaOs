@@ -79,7 +79,10 @@ namespace {
     if (thread->waiting()) {
         return returned(MYOS_STATUS_BUSY);
     }
-    auto started = notification.value()->wait(*thread, *cpus);
+    const auto ticks = invocation.trap.arg(1);
+    const auto deadline = ticks == 0 ? libk::optional<time::Instant>{}
+        : libk::optional<time::Instant>{time::Instant::from_ticks(ticks)};
+    auto started = notification.value()->wait(*thread, *cpus, invocation.cpu.dispatcher(), deadline);
     if (!started) {
         return returned(status(started.error()));
     }

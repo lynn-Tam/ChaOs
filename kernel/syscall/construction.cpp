@@ -25,6 +25,7 @@
 #include <thread/thread.hpp>
 #include <uapi/syscall.h>
 #include <uapi/thread.h>
+#include <uapi/vm.h>
 #include <uapi/tunnel.h>
 #include <uapi/vproc.h>
 #include <uapi/resource.h>
@@ -1183,6 +1184,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         handle_of(trap.arg(3)), cap::Rights::of(cap::Right::Attach));
     const usize size = trap.arg(1);
     const auto access = access_of(trap.arg(2));
+    const usize flags = trap.arg(4);
     if (!pager) {
         return returned(cap_status(pager.error()));
     }
@@ -1190,7 +1192,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     if (!pager_reference) {
         return returned(MYOS_STATUS_BUSY);
     }
-    if (size == 0 || size % kernel::mm::page_size != 0 || !access) {
+    if (size == 0 || size % kernel::mm::page_size != 0 || !access
+        || (flags & ~usize{MYOS_MEMORY_PAGER_PRIVATE}) != 0) {
         return returned(MYOS_STATUS_BAD_ARGS);
     }
     return construct<kernel::mm::MemoryObject>(
@@ -1204,7 +1207,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 libk::move(sponsorship),
                 size,
                 libk::move(pager_reference),
-                *access);
+                *access, (flags & MYOS_MEMORY_PAGER_PRIVATE) != 0);
         },
         [&](kernel::mm::MemoryObject& memory) {
             const kernel::mm::MemoryTypes types =
@@ -1492,8 +1495,6 @@ struct ThreadStart final {
     runtime.control =
         reinterpret_cast<myos_vproc_control_page*>(control_bytes);
     runtime.events = reinterpret_cast<myos_vproc_event_page*>(event_bytes);
-    runtime.control_address = control_address;
-    runtime.event_address = event_address;
     return libk::expected(libk::move(runtime));
 }
 

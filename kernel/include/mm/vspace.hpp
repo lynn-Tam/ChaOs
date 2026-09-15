@@ -19,6 +19,7 @@
 #include <mm/node_pool.hpp>
 #include <mm/translation.hpp>
 #include <object/object_cleanup.hpp>
+#include <operation/vm_wait.hpp>
 #include <resource/sponsorship.hpp>
 
 namespace kernel {
@@ -130,6 +131,7 @@ enum class FaultKind : u8 {
 
 /* Keep VSpace error classification at the fault boundary. */
 [[nodiscard]] auto fault_kind(VSpaceError error) noexcept -> FaultKind;
+[[nodiscard]] auto fault_kind(MemoryError error) noexcept -> FaultKind;
 
 struct FaultResult final {
     FaultKind kind{FaultKind::NoMapping};
@@ -170,6 +172,7 @@ public:
 
     [[nodiscard]] auto state() const noexcept -> VSpaceState;
     [[nodiscard]] auto root_key() const noexcept -> RegionKey;
+    [[nodiscard]] auto can_destroy_object(cap::VSpaceAuthority authority) const noexcept -> bool;
     [[nodiscard]] auto translation() noexcept -> TranslationView;
     [[nodiscard]] auto active_cpus() const noexcept -> kernel::CpuSet {
         return coherence_.active_cpus();
@@ -241,6 +244,10 @@ public:
         VmContext context,
         RegionKey region) noexcept
         -> libk::Expected<VmStatus, VSpaceError>;
+    [[nodiscard]] auto destroy_region(
+        VmContext context,
+        cap::VSpaceAuthority authority) noexcept
+        -> libk::Expected<VmStatus, VSpaceError>;
 
     [[nodiscard]] auto fault(
         VmContext context,
@@ -268,6 +275,8 @@ public:
     [[nodiscard]] auto service(VmContext context) noexcept
         -> VSpaceServiceResult;
     [[nodiscard]] auto pending() const noexcept -> bool;
+    void wait_pending(operation::VmWait& wait) noexcept;
+    [[nodiscard]] auto cancel_wait(operation::VmWait& wait) noexcept -> bool;
 
     void retire(object::ObjectCleanup&& cleanup) noexcept;
 
@@ -372,6 +381,8 @@ private:
       unpublished PageMapping claims still own embedded storage*/
     [[nodiscard]] auto release_page(MappedPage& page) noexcept -> bool;
     void finish_authorities() noexcept;
+    void finish_waiters() noexcept;
+    libk::IntrusiveList<operation::VmWait, &operation::VmWait::hook_> waiters_{};
 
     void request_invalidation(
         MappingAuthority& authority,
@@ -423,7 +434,7 @@ private:
         const arch::PageEditor& editor) noexcept
         -> libk::Expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto reserve_tables(
-        MappedPage* pages) noexcept
+        MappedPage* pages, usize* needed = nullptr) noexcept
         -> libk::Expected<TableReserve, VSpaceError>;
     void commit_tables(TableReserve& reserve) noexcept;
     void retire_table(RetireBatch& retire, OwnedPage&& page) noexcept;

@@ -21,6 +21,7 @@ enum class Id : u16 {
     /*luna change: select the physical-pressure image condition, reason: the fixture is an image-level test input and never a production mode*/
     Pressure = 9,
     IoLease = 10,
+    WaitPublication = 11,
 };
 
 extern const Id selected;

@@ -337,7 +337,7 @@ auto KernelState::start_reclaimer(
             || candidate == mm::ReclaimResult::Progress;
         mm::WaitClaim pressure_ready[mm::PageReclaimer::pass_budget]{};
         const usize ready_count = kernel.pressure_work_.wake(
-            kernel.pmm().frame_progress_generation(),
+            kernel.pmm().free_page_count(),
             pressure_ready,
             mm::PageReclaimer::pass_budget);
         /*luna change: keep a full pressure claim batch runnable, reason:

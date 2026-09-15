@@ -84,7 +84,7 @@ auto WaitClaim::finalize() noexcept -> bool {
     relation_->owner = nullptr;
     relation_->publish = nullptr;
     relation_->request = nullptr;
-    relation_->observed_progress = 0;
+    relation_->request = nullptr;
     relation_->state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(PageWaitState::Detached));
     relation_ = nullptr;
@@ -212,7 +212,7 @@ auto PageRequest::detach(
     relation.owner = nullptr;
     relation.publish = nullptr;
     relation.request = nullptr;
-    relation.observed_progress = 0;
+    relation.request = nullptr;
     relation.state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(PageWaitState::Detached));
     return true;

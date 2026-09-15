@@ -79,9 +79,9 @@ auto PageReclaimer::next_locked(WaitRelation& relation) noexcept
 
 auto PageReclaimer::retain(
     WaitRelation& relation,
-    u64 observed_progress,
     void* owner,
-    WaitRelation::Publish publish) noexcept -> bool {
+    WaitRelation::Publish publish, usize required_frames) noexcept -> bool {
+    KASSERT(required_frames != 0 && required_frames <= libk::numeric_limits<u32>::max());
     Notifier notifier{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -92,7 +92,8 @@ auto PageReclaimer::retain(
         ++relation.generation;
         relation.owner = owner;
         relation.publish = publish;
-        relation.observed_progress = observed_progress;
+        relation.request = nullptr;
+        relation.required_frames = static_cast<u32>(required_frames);
         relation.state_.store<libk::MemoryOrder::Release>(
             static_cast<u8>(PageWaitState::Attached));
         relations_.push_back(relation);
@@ -151,7 +152,7 @@ auto PageReclaimer::release(
         relation.owner = nullptr;
         relation.publish = nullptr;
         relation.request = nullptr;
-        relation.observed_progress = 0;
+        relation.request = nullptr;
         relation.state_.store<libk::MemoryOrder::Release>(
             static_cast<u8>(PageWaitState::Detached));
         notifier = relations_.empty() ? Notifier{} : notifier_;
@@ -244,7 +245,7 @@ auto PageReclaimer::service(usize capacity) noexcept -> ReclaimResult {
 }
 
 auto PageReclaimer::wake(
-    u64 frame_progress,
+    usize available_frames,
     WaitClaim* ready,
     usize capacity) noexcept -> usize {
     if (ready == nullptr || capacity == 0) {
@@ -259,9 +260,9 @@ auto PageReclaimer::wake(
     if (cursor_ == nullptr && !relations_.empty()) {
         cursor_ = &*relations_.begin();
     }
-    /*luna change: arbitrate Ready before terminal OOM under one lock,
-      reason: PMM generation is the only real progress while internal claims
-      do not invalidate the object-round conclusion*/
+    // A returned partial allocation is not sufficient progress for a larger
+    // request. Retry only when PMM can satisfy that request, or terminate after
+    // a complete idle scan. The caller samples free capacity after reclaim.
     while (cursor_ != nullptr && inspected < limit && !relations_.empty()) {
         WaitRelation& relation = *cursor_;
         WaitRelation* const next = next_locked(relation);
@@ -269,7 +270,7 @@ auto PageReclaimer::wake(
         ++inspected;
         if (relation.state() == PageWaitState::Attached) {
             const PageWaitResult result =
-                relation.observed_progress < frame_progress
+                available_frames >= relation.required_frames
                     ? PageWaitResult::Ready
                     : round_done_
                         ? PageWaitResult::OutOfMemory
@@ -277,7 +278,7 @@ auto PageReclaimer::wake(
             if (result == PageWaitResult::Canceled) {
                 continue;
             }
-            relation.observed_progress = frame_progress;
+            relation.request = nullptr;
             relations_.erase(relation);
             if (relation.claim(
                 relation.generation,
@@ -289,7 +290,7 @@ auto PageReclaimer::wake(
                     relation.owner = nullptr;
                     relation.publish = nullptr;
                     relation.request = nullptr;
-                    relation.observed_progress = 0;
+                    relation.request = nullptr;
                     relation.state_.store<libk::MemoryOrder::Release>(
                         static_cast<u8>(PageWaitState::Detached));
                 }

@@ -1,3 +1,4 @@
+#include <user/lib/bootstrap.hpp>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -356,7 +357,7 @@ auto accepts_golden() -> bool {
         && parsed.value().import_count() == 1
         && parsed.value().export_count() == 1
         && parsed.value().task_name(0).size() == 4
-        && fnv1a(kGolden, kGoldenSize) == UINT64_C(0xf726c0b2cea06463);
+        && fnv1a(kGolden, kGoldenSize) == UINT64_C(0x4d0cd3f2083242f6);
 }
 
 auto accepts_production_shape() -> bool {
@@ -438,7 +439,7 @@ auto accepts_production_authority_budget() -> bool {
         && proof.pool_caps == 256
         && proof.cspace_slots == 64
         && proof.cspace_pages == 4
-        && consumer.pool_memory == UINT64_C(0x34000)
+        && consumer.pool_memory == consumer.critical_bytes + 256 * 1024
         && consumer.pool_caps == 5
         && consumer.critical_bytes == UINT64_C(0x12000)
         && consumer.cspace_slots == 5
@@ -446,7 +447,7 @@ auto accepts_production_authority_budget() -> bool {
         && consumer.readiness == MYOS_DEPLOY_READINESS_START
         && consumer.restart == MYOS_DEPLOY_RESTART_NEVER
         && consumer.export_count == 1
-        && pager.pool_memory == UINT64_C(0x3a000)
+        && pager.pool_memory == pager.critical_bytes + 256 * 1024
         && pager.pool_caps == 11
         && pager.critical_bytes == UINT64_C(0x14000)
         && pager.cspace_slots == 11
@@ -454,7 +455,7 @@ auto accepts_production_authority_budget() -> bool {
         && pager.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
         && pager.restart == MYOS_DEPLOY_RESTART_NEVER
         && pager.export_count == 0
-        && uart.pool_memory == UINT64_C(0x37000)
+        && uart.pool_memory == uart.critical_bytes + 256 * 1024
         && uart.pool_caps == 10
         && uart.critical_bytes == UINT64_C(0x12000)
         && uart.cspace_slots == 10
@@ -575,8 +576,83 @@ auto accepts_closed_bootstrap_kind_mapping() -> bool {
             == MYOS_OBJECT_KIND_MEMORY
         && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY)
             == MYOS_OBJECT_KIND_MEMORY
-        && myos_bootstrap_object_kind(MYOS_BOOTSTRAP_CAP_STAGING_REGION)
+        && myos::bootstrap::imports::StagingRegion.kind
             == MYOS_OBJECT_KIND_VSPACE;
+}
+
+auto checks_named_imports() -> bool {
+    if (!copy_production_manifest()) return false;
+    ManifestWorkspace workspace{};
+    auto parsed = ManifestView::parse(production_mutation, production_size, workspace);
+    if (!parsed) return false;
+    const auto table = parsed.value().table(MYOS_DEPLOY_TABLE_BOOTSTRAP);
+    uint32_t named = UINT32_MAX;
+    for (uint32_t i = 0; i < table.count; ++i) {
+        myos::deploy::ManifestBootstrapRow row{};
+        if (!parsed.value().bootstrap_row(i, row)) return false;
+        if (row.kind == 0) { named = i; break; }
+    }
+    if (named == UINT32_MAX) return false;
+    const size_t offset = table.offset + named * table.stride;
+    const auto rejects = [&](size_t field, uint64_t value, size_t width) {
+        if (!copy_production_manifest()) return false;
+        put(production_mutation, offset + field, value, width);
+        ManifestWorkspace check{};
+        return !ManifestView::parse(production_mutation, production_size, check);
+    };
+    if (!rejects(MYOS_DEPLOY_BOOTSTRAP_PROTOCOL, 0, 4)
+        || !rejects(MYOS_DEPLOY_BOOTSTRAP_MAJOR, 0, 2)
+        || !rejects(MYOS_DEPLOY_BOOTSTRAP_OBJECT_KIND, MYOS_OBJECT_KIND_THREAD, 2)
+        || !rejects(MYOS_DEPLOY_BOOTSTRAP_NAME, 0, 8)
+        || !rejects(MYOS_DEPLOY_BOOTSTRAP_DESTINATION, 0, 8)) return false;
+    // A new name is accepted without a service-role enum or kernel change.
+    if (!copy_production_manifest()) return false;
+    myos::deploy::ManifestBootstrapRow original{};
+    if (!parsed.value().bootstrap_row(named, original)) return false;
+    const auto strings = parsed.value().table(MYOS_DEPLOY_TABLE_STRING);
+    production_mutation[strings.offset + original.name.offset] = 'z';
+    ManifestWorkspace renamed{};
+    if (!ManifestView::parse(production_mutation, production_size, renamed)) return false;
+    // Two bindings of the same name are ambiguous even if their capabilities differ.
+    if (!copy_production_manifest()) return false;
+    const uint64_t name = uint64_t{original.name.offset} | (uint64_t{original.name.length} << 32);
+    put(production_mutation, offset + table.stride + MYOS_DEPLOY_BOOTSTRAP_NAME, name, 8);
+    ManifestWorkspace duplicate{};
+    return !ManifestView::parse(production_mutation, production_size, duplicate);
+}
+
+auto checks_import_lookup() -> bool {
+    myos_bootstrap_info info{};
+    info.magic = MYOS_BOOTSTRAP_MAGIC;
+    info.major = MYOS_BOOTSTRAP_MAJOR;
+    info.minor = MYOS_BOOTSTRAP_MINOR;
+    info.size = sizeof(info);
+    info.import_count = 1;
+    const auto requested = myos::bootstrap::imports::Files;
+    auto& entry = info.imports[0];
+    for (size_t i = 0; requested.name[i] != 0; ++i) entry.name[i] = requested.name[i];
+    entry.protocol = requested.protocol;
+    entry.major = requested.major;
+    entry.object_kind = requested.kind;
+    entry.handle = 42;
+    auto view = myos::bootstrap::BootstrapView::parse(&info, sizeof(info));
+    if (!view || view->selector(requested) != 42
+        || view->selector(myos::bootstrap::imports::Block) != 0) return false;
+    auto incompatible = requested;
+    ++incompatible.major;
+    if (view->selector(incompatible) != 0) return false;
+    incompatible = requested;
+    ++incompatible.minor;
+    if (view->selector(incompatible) != 0) return false;
+    incompatible = requested;
+    incompatible.kind = MYOS_OBJECT_KIND_MEMORY;
+    if (view->selector(incompatible) != 0) return false;
+    incompatible = requested;
+    ++incompatible.protocol;
+    if (view->selector(incompatible) != 0) return false;
+    info.import_count = 2;
+    info.imports[1] = entry;
+    return !myos::bootstrap::BootstrapView::parse(&info, sizeof(info));
 }
 
 auto accepts_boot_bundle_cross_validation() -> bool {
@@ -1295,6 +1371,8 @@ int main(int argc, char** argv) {
             && (!have_production
                 || run("bootstrap-kind-map",
                        accepts_closed_bootstrap_kind_mapping()))
+            && (!have_production || run("named-imports", checks_named_imports()))
+            && run("import-lookup", checks_import_lookup())
             && run("bundle", accepts_boot_bundle_cross_validation())
             && run("stack", rejects_effective_stack_range())
             && run("trunc", rejects_truncation())

@@ -2,6 +2,8 @@
 
 #include <core/debug.hpp>
 #include <cpu/cpu_registry.hpp>
+#include <cpu/cpu_local.hpp>
+#include <sched/dispatcher.hpp>
 #include <libk/limits.hpp>
 #include <libk/scope_guard.hpp>
 #include <sched/binding.hpp>
@@ -70,7 +72,8 @@ Notification::Wait::Wait(Notification& owner) noexcept
           &Wait::complete,
           &Wait::read,
           &Wait::release,
-          &Wait::cancel>(*this)) {
+          &Wait::cancel>(*this)),
+      deadline_(sched::Deadline::Callback::bind<&Wait::expire>(*this)) {
     relation_.set_policy(diag::concurrency::OperationPolicy{
         .kind = diag::concurrency::WaitKind::Notification,
         .expectation = diag::concurrency::Expectation::ExternalUnbounded,
@@ -88,6 +91,8 @@ auto Notification::Wait::complete() const noexcept -> bool {
 }
 
 void Notification::Wait::begin() noexcept {
+    KASSERT(!deadline_.armed());
+    status_ = MYOS_STATUS_OK;
     State expected = State::Idle;
     KASSERT((state_.compare_exchange_strong<
         libk::MemoryOrder::AcqRel,
@@ -109,7 +114,7 @@ auto Notification::Wait::arm() noexcept -> bool {
     return false;
 }
 
-auto Notification::Wait::ready() noexcept -> bool {
+auto Notification::Wait::ready(myos_status_t status) noexcept -> bool {
     State observed = state_.load<libk::MemoryOrder::Acquire>();
     for (;;) {
         if (observed == State::Ready || observed == State::Done
@@ -120,9 +125,19 @@ auto Notification::Wait::ready() noexcept -> bool {
         if (state_.compare_exchange_weak<
                 libk::MemoryOrder::AcqRel,
                 libk::MemoryOrder::Acquire>(observed, State::Ready)) {
+            status_ = status;
             return observed == State::Armed;
         }
     }
+}
+
+void Notification::Wait::expire() noexcept {
+    bool wake{};
+    {
+        kernel::sync::IrqLockGuard guard{owner_->receiver_lock_};
+        wake = ready(MYOS_STATUS_TIMED_OUT);
+    }
+    if (wake) relation_.signal();
 }
 
 void Notification::Wait::abort() noexcept {
@@ -272,7 +287,8 @@ auto Notification::take(Vproc* current) noexcept
     return libk::expected(NotificationTake{badges, sequence});
 }
 
-auto Notification::wait(Thread& thread, CpuRegistry& cpus) noexcept
+auto Notification::wait(Thread& thread, CpuRegistry& cpus,
+                        sched::CpuDispatcher* dispatcher, libk::optional<time::Instant> deadline) noexcept
     -> libk::Expected<NotificationWait, NotificationError> {
     {
         kernel::sync::IrqLockGuard guard{receiver_lock_};
@@ -288,15 +304,22 @@ auto Notification::wait(Thread& thread, CpuRegistry& cpus) noexcept
                 operation::State::Complete, badges, {}});
         }
         wait_.begin();
-        if (!thread.begin_wait(wait_.relation(), cpus)) {
+        if (deadline && (dispatcher == nullptr || !dispatcher->arm(wait_.deadline_, *deadline))) {
             wait_.abort();
             return libk::unexpected(NotificationError::Busy);
         }
+        wait_.relation().set_deadline(deadline, deadline
+            ? diag::concurrency::NodeRef::cpu(dispatcher->id()) : diag::concurrency::NodeRef{});
+        if (!thread.begin_wait(wait_.relation(), cpus)) {
+            if (wait_.deadline_.armed()) dispatcher->disarm(wait_.deadline_);
+            wait_.abort();
+            return libk::unexpected(NotificationError::Busy);
+        }
+        // Registration and arming are one admission transaction. A signal
+        // cannot publish Ready without also delivering the attached wait.
+        KASSERT(wait_.arm());
     }
-    return libk::expected(NotificationWait{
-        wait_.arm() ? operation::State::Waiting : operation::State::Complete,
-        0,
-        {}});
+    return libk::expected(NotificationWait{operation::State::Waiting, 0, {}});
 }
 
 auto Notification::bind_vproc(
@@ -571,11 +594,10 @@ auto Notification::finish_wait() noexcept -> operation::Result {
     {
         kernel::sync::IrqLockGuard guard{receiver_lock_};
         KASSERT(wait_.complete());
-        if (life_.load<libk::MemoryOrder::Acquire>() == Life::Open) {
+        status = wait_.status_;
+        if (status == MYOS_STATUS_OK) {
             badges = pending_.exchange<libk::MemoryOrder::AcqRel>(0);
             KASSERT(badges != 0);
-        } else {
-            status = MYOS_STATUS_CLOSED;
         }
         // Keep the owner non-admissible until Completion invokes the release
         // callback.  Reopening Idle here would let a new wait overwrite this
@@ -586,6 +608,9 @@ auto Notification::finish_wait() noexcept -> operation::Result {
 }
 
 void Notification::release_wait() noexcept {
+    // Wait finish/cancel runs on the continuation's home dispatcher. Remote
+    // producers publish only Ready; they never mutate its deadline queue.
+    if (wait_.deadline_.armed()) current_cpu().dispatcher()->disarm(wait_.deadline_);
     object::ObjectCleanup cleanup{};
     {
         kernel::sync::IrqLockGuard guard{receiver_lock_};
@@ -635,7 +660,7 @@ void Notification::retire(object::ObjectCleanup&& cleanup) noexcept {
         kernel::sync::IrqLockGuard guard{receiver_lock_};
         KASSERT(!cleanup_);
         cleanup_ = libk::move(cleanup);
-        if (!wait_.idle() && wait_.ready()) {
+        if (!wait_.idle() && wait_.ready(MYOS_STATUS_CLOSED)) {
             wait_.relation().signal();
         }
     }

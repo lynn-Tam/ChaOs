@@ -34,6 +34,7 @@ namespace detail {
 [[nodiscard]] auto initrd(const boot::BootInfo& boot) noexcept -> bool;
 [[nodiscard]] auto trap(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto dispatch(CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto wait_publication(CpuRuntime& runtime) noexcept -> bool;
 [[nodiscard]] auto observer(CpuRuntime& runtime) noexcept -> bool;
 /*luna change: expose the pressure-only PMM fixture entry, reason: runtime setup must remain a scenario-owned test boundary*/
 [[nodiscard]] auto pressure(CpuRuntime& runtime) noexcept -> bool;

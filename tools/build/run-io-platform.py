@@ -13,11 +13,14 @@ def main():
     bundle = None
     disk_image = None
     timeout = 5
-    while extra_markers[:1] in (["--bundle"], ["--disk"], ["--timeout"]):
+    fail_sector = None
+    while extra_markers[:1] in (["--bundle"], ["--disk"], ["--timeout"], ["--fail-sector"]):
         if extra_markers[0] == "--bundle":
             bundle = extra_markers[1]
         elif extra_markers[0] == "--disk":
             disk_image = extra_markers[1]
+        elif extra_markers[0] == "--fail-sector":
+            fail_sector = int(extra_markers[1])
         else:
             timeout = float(extra_markers[1])
         extra_markers = extra_markers[2:]
@@ -29,10 +32,16 @@ def main():
         if disk_image is None:
             with disk.open("wb") as stream:
                 stream.truncate(1024 * 1024)
+        disk_source = str(disk)
+        if fail_sector is not None:
+            # QEMU blkdebug injects a real backend error, without guest hooks.
+            config = pathlib.Path(directory) / "blkdebug.conf"
+            config.write_text(f'[inject-error]\nevent = "read_aio"\nerrno = "5"\nsector = "{fail_sector}"\n')
+            disk_source = f"blkdebug:{config}:{disk}"
         for count in cpus.split(","):
             command = [qemu, "-machine", "virt,iommu-sys=on", "-nographic",
                        "-bios", "default", "-kernel", kernel, "-smp", count,
-                       "-drive", f"if=none,id=disk,format=raw,readonly=on,file={disk}",
+                       "-drive", f"if=none,id=disk,format=raw,readonly=on,file={disk_source}",
                        "-device", "virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on"]
             if bundle is not None:
                 command += ["-initrd", bundle]

@@ -27,6 +27,7 @@ auto run(
     /*luna change: keep pressure selection runtime-only, reason: frame holding must occur after root-pool admission rather than during boot validation*/
     case diag::scenario::Id::Pressure:
     case diag::scenario::Id::IoLease:
+    case diag::scenario::Id::WaitPublication:
         // These scenarios need a published CpuRuntime and run from the
         // runtime hook below. Selection itself is validated before bring-up.
         return true;
@@ -38,6 +39,8 @@ auto run_runtime(
     diag::scenario::Id selected,
     CpuRuntime& runtime) noexcept -> bool {
     switch (selected) {
+    case diag::scenario::Id::WaitPublication:
+        return detail::wait_publication(runtime);
     case diag::scenario::Id::IoLease:
         return detail::io_lease(runtime);
     case diag::scenario::Id::Publication:

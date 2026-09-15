@@ -1,6 +1,7 @@
 #include <operation/wait.hpp>
 
 #include <core/debug.hpp>
+#include <libk/memory.hpp>
 #include <cpu/cpu_local.hpp>
 #include <cpu/cpu_registry.hpp>
 #include <sched/dispatcher.hpp>
@@ -12,8 +13,56 @@ Wait::Wait() noexcept = default;
 
 Wait::~Wait() noexcept {
     KASSERT(!attached());
-    KASSERT(!page_fault_.relation().attached());
-    KASSERT(!page_fault_.active());
+    reset_local();
+}
+
+void Wait::reset_local() noexcept {
+    switch (local_kind_) {
+    case LocalKind::None: break;
+    case LocalKind::Page: libk::destroy_at(&local_.page); break;
+    case LocalKind::Revoke: libk::destroy_at(&local_.revoke); break;
+    case LocalKind::Close: libk::destroy_at(&local_.close); break;
+    case LocalKind::Vm: libk::destroy_at(&local_.vm); break;
+    }
+    local_kind_ = LocalKind::None;
+}
+
+auto Wait::page_access() noexcept -> PageAccess& {
+    if (local_kind_ != LocalKind::Page) {
+        KASSERT(!attached());
+        reset_local();
+        libk::construct_at(&local_.page);
+        local_kind_ = LocalKind::Page;
+    }
+    return local_.page;
+}
+
+auto Wait::find_page_access() noexcept -> PageAccess* {
+    return local_kind_ == LocalKind::Page ? &local_.page : nullptr;
+}
+
+auto Wait::prepare_revoke(cap::GrantGraph& graph) noexcept -> cap::GrantRevokeWait* {
+    if (attached()) return nullptr;
+    reset_local();
+    auto* result = libk::construct_at(&local_.revoke, graph);
+    local_kind_ = LocalKind::Revoke;
+    return result;
+}
+
+auto Wait::prepare_close(cap::GrantGraph& graph) noexcept -> resource::CloseWait* {
+    if (attached()) return nullptr;
+    reset_local();
+    auto* result = libk::construct_at(&local_.close, graph);
+    local_kind_ = LocalKind::Close;
+    return result;
+}
+
+auto Wait::prepare_vm(object::ObjectRef&& target, mm::VSpace& space) noexcept -> VmWait* {
+    if (attached()) return nullptr;
+    reset_local();
+    auto* result = libk::construct_at(&local_.vm, libk::move(target), space);
+    local_kind_ = LocalKind::Vm;
+    return result;
 }
 
 auto Wait::attached() const noexcept -> bool {
@@ -146,9 +195,8 @@ auto Wait::finish(arch::TrapContext& trap) noexcept -> bool {
     if (result == Completion::ResumeResult::Rearm) {
         KASSERT(cpus != nullptr && binding != nullptr);
         KASSERT(begin(*completion, *cpus, *binding));
-        if (completion->complete()) {
-            completion->signal();
-        }
+        KASSERT(completion->ops_->arm != nullptr);
+        completion->ops_->arm(completion->owner_);
     }
     return true;
 }
@@ -157,6 +205,7 @@ auto Wait::cancel() noexcept -> bool {
     Completion* completion{};
     sched::Binding* binding{};
     bool was_ready{};
+    Completion::CancelClaim claim{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (phase_ != EdgePhase::Attached || completion_ == nullptr) {
@@ -168,13 +217,14 @@ auto Wait::cancel() noexcept -> bool {
         // Keep the pointer and its exact edge fields in the container while
         // cancellation resolves policy outside the lock.  Delivery now pins
         // the owner against producer publication and finish.
-        if (!completion->try_claim_cancel()) {
+        claim = completion->try_claim_cancel();
+        if (claim == Completion::CancelClaim::Unavailable) {
             return false;
         }
         phase_ = EdgePhase::CancelOwned;
     }
 
-    Completion::CancelResult resolution = completion->resolve_cancel();
+    Completion::CancelResult resolution = completion->resolve_cancel(claim);
     if (resolution == Completion::CancelResult::Reopen) {
         bool reopened{};
         {

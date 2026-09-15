@@ -1,17 +1,26 @@
-#include <servers/files/fat32.hpp>
+#include <user/lib/imports.hpp>
+#include <servers/files/backing.hpp>
 #include <user/lib/file_protocol.hpp>
 
 namespace {
 using namespace myos;
-constexpr size_t Clients = 2;
+constexpr size_t Clients = 8;
+io::ControlPort directory;
 io::ClientSession backend;
 files::fat32::Volume volume;
 MappedMemory metadata;
 myos_cap_t events;
+myos_cap_t files_pool, files_cspace;
+cap::OwnedCap descriptor;
+files::Backing backings[files::fat32::MaxFiles];
+files::Reader reader{backend, volume};
 
 struct Handle final { uint64_t generation{}; size_t file{}; bool live{}; };
-struct Pending final { io::Ticket ticket{}; size_t file{}, done{}, total{}; bool active{}, submitted{}; };
+struct Client;
+struct Pending final { io::Ticket ticket{}; Client* owner{}; files::Read read{}; };
 struct Client final {
+    cap::OwnedCap channel;
+    myos_word_t access{};
     io::ServerSession session;
     Handle handles[files::HandleCount]{};
     Pending pending[io::QueueDepth]{};
@@ -21,7 +30,8 @@ struct Client final {
         return handle.live && handle.generation == value / files::HandleCount
             ? handle.file : volume.count();
     }
-    void control(const io::ControlMessage& request, io::ControlMessage& reply) noexcept {
+    void control(const io::ControlMessage& request, io::ControlReply& response) noexcept {
+        auto& reply = response.message;
         const auto operation = static_cast<files::Control>(request.operation);
         if (operation == files::Control::List) {
             if (request.size != 0 || request.value > volume.count()) { reply.status = MYOS_STATUS_BAD_ARGS; return; }
@@ -50,25 +60,39 @@ struct Client final {
                 return;
             }
             reply.status = MYOS_STATUS_NO_MEMORY;
+        } else if (operation == files::Control::Map) {
+            const auto file = resolve(request.value);
+            const auto requested = static_cast<uint8_t>(request.data[0]);
+            if (request.size != 1 || (requested != MYOS_VM_READ
+                && requested != (MYOS_VM_READ | MYOS_VM_EXECUTE))) reply.status = MYOS_STATUS_BAD_ARGS;
+            else if ((requested & ~access) != 0) reply.status = MYOS_STATUS_DENIED;
+            else if (file == volume.count()) reply.status = MYOS_STATUS_NOT_FOUND;
+            else {
+                reply.status = backings[file].open(files_pool, events, file, volume.file(file).size);
+                if (reply.status == MYOS_STATUS_OK)
+                    reply.status = backings[file].export_view(files_cspace, descriptor.selector(), requested, response);
+            }
         } else if (operation == files::Control::Close) {
             if (request.size != 0) reply.status = MYOS_STATUS_BAD_ARGS;
             else if (resolve(request.value) == volume.count()) reply.status = MYOS_STATUS_NOT_FOUND;
             else handles[request.value % files::HandleCount].live = false;
         } else reply.status = MYOS_STATUS_INVALID_OP;
     }
-    void finish(Pending& pending, myos_status_t status) noexcept {
-        if (!session.queue()->finish(pending.ticket, status, pending.done)) exit(MYOS_STATUS_PEER_FAULT);
+    static void completed(files::Read& read, myos_status_t status) noexcept {
+        auto& pending = *static_cast<Pending*>(read.context);
+        auto& session = pending.owner->session;
+        if (session.failed() || !session.queue()->finish(pending.ticket, status, read.done)) {
+            session.abort();
+            if (!session.queue()->abandon(pending.ticket)) exit(MYOS_STATUS_INTERNAL);
+        }
         pending = {};
+    }
+    static auto cancelled(const files::Read& read) noexcept -> bool {
+        const auto& pending = *static_cast<const Pending*>(read.context);
+        return pending.owner->session.failed() || pending.owner->session.queue()->cancelled(pending.ticket);
     }
 };
 Client clients[Clients];
-struct Forward final {
-    Pending* pending{};
-    size_t client{};
-    uint64_t id{};
-    files::fat32::Extent extent{};
-};
-Forward forwards[io::QueueDepth];
 
 // Mount may wait before clients are served. Batch metadata reads through the
 // same queue used later for asynchronous forwarding, with no alternate I/O path.
@@ -120,8 +144,13 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto cspace = service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE);
+    files_pool = pool;
+    files_cspace = cspace;
+    const auto scratch = memory_create(pool, 4096, MYOS_VM_READ | MYOS_VM_WRITE);
+    service::require(scratch.status);
+    descriptor = cap::OwnedCap{{scratch.value, 0}};
     uint64_t capacity{};
-    service::require(backend.open(service::capability(info, MYOS_BOOTSTRAP_CAP_BLOCK_CHANNEL),
+    service::require(backend.open(service::capability(info, myos::bootstrap::imports::Block),
         events, vspace, 0x70000000, capacity));
     uint8_t boot[512]{};
     service::require(read_metadata(0, sizeof(boot), boot));
@@ -137,41 +166,54 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     auto* index = reinterpret_cast<uint32_t*>(fat + fat_size);
     auto* bitmap = reinterpret_cast<uint8_t*>(index) + index_size;
     service::require(volume.mount(geometry, fat, index, bitmap, read_metadata));
-    constexpr uint32_t roles[Clients] = {MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL, MYOS_BOOTSTRAP_CAP_FILE_CHANNEL};
+    service::require(directory.open(service::capability(info, bootstrap::imports::Files), events));
     for (size_t i = 0; i < Clients; ++i)
-        service::require(clients[i].session.open(service::capability(info, roles[i]), events,
-            pool, vspace, cspace, 0x71000000 + i * 0x100000));
+        service::require(clients[i].session.prepare(pool, vspace, cspace, 0x71000000 + i * 0x100000));
     size_t turn{};
     for (;;) {
-        for (auto& client : clients)
-            service::require(client.session.poll([&](const io::ControlMessage& request, io::ControlMessage& reply) {
-                client.control(request, reply);
-            }));
-        for (;;) {
-            io::Completion completion;
-            const auto result = backend.queue().take(completion);
-            if (result == libk::RingResult::Empty) break;
-            if (result != libk::RingResult::Ready) exit(MYOS_STATUS_PEER_FAULT);
-            size_t slot{};
-            while (slot < io::QueueDepth && forwards[slot].id != completion.id) ++slot;
-            if (slot == io::QueueDepth || forwards[slot].pending == nullptr) exit(MYOS_STATUS_PEER_FAULT);
-            auto& forward = forwards[slot];
-            auto& pending = *forward.pending;
-            auto& client = clients[forward.client];
-            const auto* request = client.session.queue()->request(pending.ticket);
-            if (request == nullptr || completion.flags != 0) exit(MYOS_STATUS_PEER_FAULT);
-            pending.submitted = false;
-            if (client.session.queue()->cancelled(pending.ticket)) client.finish(pending, MYOS_STATUS_CANCELED);
-            else if (completion.status != MYOS_STATUS_OK) client.finish(pending, completion.status);
-            else {
-                if (completion.bytes != forward.extent.size) exit(MYOS_STATUS_PEER_FAULT);
-                service::copy(client.session.payload() + request->buffer_offset + pending.done,
-                    backend.payload() + slot * io::BufferSize + forward.extent.skip, forward.extent.bytes);
-                pending.done += forward.extent.bytes;
-                if (pending.done == pending.total) client.finish(pending, MYOS_STATUS_OK);
+        bool again{};
+        for (size_t count = 0; count < Clients; ++count) {
+            io::ControlPacket packet;
+            const auto status = directory.receive(packet);
+            if (status == MYOS_STATUS_WOULD_BLOCK || status == MYOS_STATUS_BUSY) break;
+            if (status != MYOS_STATUS_OK || packet.count != 2) continue;
+            cap::OwnedCap endpoint = libk::move(packet.capabilities[0]);
+            if (packet.badge != files::ReadDirectory && packet.badge != files::ExecuteDirectory) {
+                const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
+                    .status = MYOS_STATUS_DENIED};
+                (void)io::ControlPort::send_to(endpoint.selector(), reply);
+                (void)channel_close(endpoint.selector());
+                continue;
             }
-            forward = {};
+            packet.capabilities[0] = libk::move(packet.capabilities[1]);
+            packet.count = 1;
+            Client* available{};
+            for (auto& client : clients) if (!client.channel) { available = &client; break; }
+            if (available == nullptr) {
+                const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
+                    .status = MYOS_STATUS_NO_MEMORY};
+                (void)io::ControlPort::send_to(endpoint.selector(), reply);
+                (void)channel_close(endpoint.selector());
+                continue;
+            }
+            auto& client = *available;
+            client.access = MYOS_VM_READ | (packet.badge == files::ExecuteDirectory ? MYOS_VM_EXECUTE : 0);
+            client.channel = libk::move(endpoint);
+            const auto bound = client.session.bind(client.channel.selector(), events);
+            const auto accepted = bound == MYOS_STATUS_OK
+                ? client.session.accept(packet, [&](const io::ControlMessage& request, io::ControlReply& reply) {
+                    client.control(request, reply);
+                }) : bound;
+            if (accepted != MYOS_STATUS_OK) client.session.abort();
         }
+        for (auto& client : clients) if (client.channel) {
+            const auto status = client.session.poll([&](const io::ControlMessage& request, io::ControlReply& reply) {
+                client.control(request, reply);
+            });
+            if (status != MYOS_STATUS_OK) { client.session.abort(); again = true; }
+        }
+        service::require(reader.poll());
+        for (size_t file = 0; file < volume.count(); ++file) service::require(backings[file].poll());
         for (auto& client : clients) {
             auto* queue = client.session.queue();
             if (queue == nullptr || client.session.closing()) continue;
@@ -179,55 +221,59 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 io::Ticket ticket;
                 const auto admitted = queue->admit(ticket);
                 if (admitted == io::Admission::Empty || admitted == io::Admission::Backpressure) break;
-                if (admitted != io::Admission::Ready) exit(MYOS_STATUS_PEER_FAULT);
+                if (admitted != io::Admission::Ready) { client.session.abort(); again = true; break; }
                 const auto& request = *queue->request(ticket);
                 const auto file = client.resolve(request.object);
                 const auto valid = request.operation == static_cast<uint64_t>(io::Operation::Read)
                     && request.buffer == 0 && request.flags == 0 && request.length <= io::BufferSize
                     && request.buffer_offset <= io::PayloadSize && request.length <= io::PayloadSize - request.buffer_offset;
                 if (!valid || file == volume.count()) {
-                    if (!queue->finish(ticket, valid ? MYOS_STATUS_NOT_FOUND : MYOS_STATUS_BAD_ARGS, 0)) exit(MYOS_STATUS_PEER_FAULT);
+                    if (!queue->finish(ticket, valid ? MYOS_STATUS_NOT_FOUND : MYOS_STATUS_BAD_ARGS, 0)) {
+                        client.session.abort();
+                        if (!queue->abandon(ticket)) exit(MYOS_STATUS_INTERNAL);
+                        again = true;
+                        break;
+                    }
                     continue;
                 }
                 const auto available = request.offset >= volume.file(file).size ? 0 : volume.file(file).size - request.offset;
                 const size_t length = request.length < available ? request.length : available;
                 auto& pending = client.pending[ticket.slot];
-                pending = {ticket, file, 0, length, true, false};
-                if (length == 0) client.finish(pending, MYOS_STATUS_OK);
+                pending = {.ticket = ticket, .owner = &client,
+                    .read = {.file = file, .offset = request.offset,
+                        .output = client.session.payload() + request.buffer_offset,
+                        .size = length, .context = &pending,
+                        .complete = Client::completed, .cancelled = Client::cancelled, .active = true}};
             }
         }
-        // Rotate client priority per batch; a fragmented file cannot monopolize
-        // all downstream slots while another client's work waits for admission.
-        for (size_t row = 0; row < io::QueueDepth; ++row) {
-            for (size_t n = 0; n < Clients; ++n) {
-                const size_t owner = (turn + n) % Clients;
-                auto& client = clients[owner];
-                auto& pending = client.pending[row];
-                if (!pending.active || pending.submitted) continue;
-                if (client.session.queue()->cancelled(pending.ticket)) {
-                    client.finish(pending, MYOS_STATUS_CANCELED); continue;
+        // Rotate the start of each bounded batch. Pager and ordinary reads
+        // share downstream credit, completion handling and immutable identity.
+        for (size_t row = 0; row < files::fat32::MaxFiles; ++row) {
+            if (row < io::QueueDepth) {
+                for (size_t n = 0; n < Clients; ++n) {
+                    auto& client = clients[(turn + n) % Clients];
+                    service::require(reader.submit(client.pending[row].read));
                 }
-                size_t slot{};
-                while (slot < io::QueueDepth && forwards[slot].pending != nullptr) ++slot;
-                if (slot == io::QueueDepth) continue;
-                const auto& request = *client.session.queue()->request(pending.ticket);
-                const auto extent = volume.extent(pending.file, request.offset + pending.done, pending.total - pending.done);
-                io::Request downstream{.operation = static_cast<uint64_t>(io::Operation::Read),
-                    .offset = extent.offset, .buffer_offset = slot * io::BufferSize, .length = extent.size};
-                const auto submitted = backend.queue().submit(downstream);
-                if (submitted == libk::RingResult::Full) continue;
-                if (submitted != libk::RingResult::Ready) exit(MYOS_STATUS_PEER_FAULT);
-                pending.submitted = true;
-                forwards[slot] = {&pending, owner, downstream.id, extent};
+            }
+            service::require(reader.submit(backings[(turn + row) % files::fat32::MaxFiles].read()));
+        }
+        turn = (turn + 1) % files::fat32::MaxFiles;
+        service::require(backend.flush());
+        for (auto& client : clients) if (client.channel) {
+            const auto status = client.session.flush(true);
+            if (status != MYOS_STATUS_OK) { client.session.abort(); again = true; }
+            if (client.session.done()) {
+                (void)channel_close(client.channel.selector());
+                client.channel = {};
+                client.session.reset();
+                for (auto& handle : client.handles) handle.live = false;
+            } else {
+                const auto armed = client.session.arm();
+                if (armed != MYOS_STATUS_OK) { client.session.abort(); again = true; }
             }
         }
-        turn = (turn + 1) % Clients;
-        service::require(backend.flush());
-        for (auto& client : clients) {
-            service::require(client.session.flush(true));
-            service::require(client.session.arm());
-        }
+        service::require(directory.arm());
         service::require(backend.arm());
-        service::require(notification_wait(events).status);
+        if (!again) service::require(notification_wait(events).status);
     }
 }

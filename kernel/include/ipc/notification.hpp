@@ -13,6 +13,7 @@
 #include <object/object_cleanup.hpp>
 #include <object/vproc_pool.hpp>
 #include <operation/completion.hpp>
+#include <sched/timer_queue.hpp>
 
 namespace kernel {
 class CpuRegistry;
@@ -54,7 +55,9 @@ public:
         -> libk::Expected<NotificationTake, NotificationError>;
     [[nodiscard]] auto wait(
         Thread& thread,
-        CpuRegistry& cpus) noexcept
+        CpuRegistry& cpus,
+        sched::CpuDispatcher* dispatcher = nullptr,
+        libk::optional<time::Instant> deadline = libk::nullopt) noexcept
         -> libk::Expected<NotificationWait, NotificationError>;
     [[nodiscard]] auto bind_vproc(
         Vproc& vproc,
@@ -107,7 +110,7 @@ private:
         [[nodiscard]] auto complete() const noexcept -> bool;
         void begin() noexcept;
         [[nodiscard]] auto arm() noexcept -> bool;
-        [[nodiscard]] auto ready() noexcept -> bool;
+        [[nodiscard]] auto ready(myos_status_t status = MYOS_STATUS_OK) noexcept -> bool;
         void abort() noexcept;
         [[nodiscard]] auto relation() noexcept -> operation::Completion& {
             return relation_;
@@ -126,11 +129,14 @@ private:
 
         [[nodiscard]] auto read() noexcept -> operation::Result;
         void release() noexcept;
+        void expire() noexcept;
         [[nodiscard]] auto cancel() noexcept -> bool;
 
         Notification* owner_{};
         libk::Atomic<State> state_{State::Idle};
         operation::Completion relation_;
+        sched::Deadline deadline_;
+        myos_status_t status_{MYOS_STATUS_OK}; // guarded by receiver_lock_
     };
 
     using Sources = libk::IntrusiveList<

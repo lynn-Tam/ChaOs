@@ -43,6 +43,12 @@ struct SyscallBackend final {
         return ::myos::resource_close(pool.selector).status;
     }
 
+    [[nodiscard]] static auto resource_close_async(CapRef pool, CapRef events, myos_word_t badge) noexcept
+        -> myos_status_t {
+        if (!current(pool) || !current(events)) return MYOS_STATUS_BAD_ARGS;
+        return ::myos::resource_close_async(pool.selector, events.selector, badge).status;
+    }
+
     [[nodiscard]] static auto typed_delegate(
         CapRef source,
         CapRef destination,
@@ -172,9 +178,9 @@ struct SyscallBackend final {
         if (!current(region) || !current(memory)) {
             return MYOS_STATUS_BAD_ARGS;
         }
-        return ::myos::vm_map(
+        return ::myos::vm_complete(region.selector, ::myos::vm_map(
             region.selector, memory.selector, address, size,
-            object_page, access).status;
+            object_page, access)).status;
     }
 
     [[nodiscard]] static auto vm_unmap(
@@ -184,7 +190,8 @@ struct SyscallBackend final {
         if (!current(region)) {
             return MYOS_STATUS_BAD_ARGS;
         }
-        return ::myos::vm_unmap(region.selector, address, size).status;
+        return ::myos::vm_complete(region.selector,
+            ::myos::vm_unmap(region.selector, address, size)).status;
     }
 
     [[nodiscard]] static auto vm_destroy_region(CapRef region) noexcept
@@ -192,7 +199,7 @@ struct SyscallBackend final {
         if (!current(region)) {
             return MYOS_STATUS_BAD_ARGS;
         }
-        return ::myos::vm_destroy_region(region.selector).status;
+        return ::myos::vm_complete(region.selector, ::myos::vm_destroy_region(region.selector)).status;
     }
 
     [[nodiscard]] static auto sc_bind(

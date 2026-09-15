@@ -442,6 +442,22 @@ auto VSpace::start_region_destroy(
 
 auto VSpace::destroy_region(
     VmContext context,
+    cap::VSpaceAuthority authority) noexcept -> libk::Expected<VmStatus, VSpaceError> {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        const auto* region = regions_.find(authority.region.node);
+        if (region == nullptr || region->key_ != authority.region)
+            return libk::unexpected(VSpaceError::InvalidRegion);
+        if (!authority.range.contains(region->range_))
+            return libk::unexpected(VSpaceError::InvalidAuthority);
+    }
+    // Region identity and extent are immutable. The generation is checked
+    // again at admission, so concurrent destruction cannot substitute a region.
+    return destroy_region(context, authority.region);
+}
+
+auto VSpace::destroy_region(
+    VmContext context,
     RegionKey key) noexcept -> libk::Expected<VmStatus, VSpaceError> {
     return start_region_destroy(
         context, key, true, PendingKind::DestroyRegion);

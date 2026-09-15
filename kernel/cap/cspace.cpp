@@ -3,6 +3,7 @@
 #include <cpu/cpu_registry.hpp>
 #include <libk/memory.hpp>
 #include <libk/utility.hpp>
+#include <object/vspace_pool.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <thread/thread.hpp>
 
@@ -440,13 +441,9 @@ auto CSpace::revoke(
         return libk::unexpected(CSpaceError::Denied);
     }
 
-    auto made = source.graph->create_revoke_wait();
-    if (!made) {
-        return libk::unexpected(grant_error(made.error()));
-    }
-    GrantRevokeWait* const operation = made.value();
+    auto* const operation = thread.current_wait().prepare_revoke(*source.graph);
+    if (operation == nullptr) return libk::unexpected(CSpaceError::Contended);
     if (!thread.begin_wait(operation->relation(), cpus)) {
-        source.graph->destroy_revoke_wait(*operation);
         return libk::unexpected(CSpaceError::Contended);
     }
 
@@ -458,9 +455,10 @@ auto CSpace::revoke(
         thread.cancel_wait();
         return libk::unexpected(grant_error(started.error()));
     }
-    return libk::expected(operation->arm()
-        ? kernel::operation::State::Waiting
-        : kernel::operation::State::Complete);
+    if (operation->arm()) return libk::expected(kernel::operation::State::Waiting);
+    // The countdown completed before arming, so its notifier did not run.
+    operation->relation().signal();
+    return libk::expected(kernel::operation::State::Complete);
 }
 
 auto CSpace::destroy(CapHandle source_handle) noexcept
@@ -478,14 +476,18 @@ auto CSpace::destroy(CapHandle source_handle) noexcept
     if (!effective.value().rights.contains(Right::Destroy)) {
         return libk::unexpected(CSpaceError::Denied);
     }
-    auto target = lease.clone_target();
-    if (!target) {
-        return libk::unexpected(CSpaceError::GrantUnavailable);
+    if (lease.kind() == object::ObjectKind::VSpace) {
+        const auto* authority = libk::get_if<VSpaceAuthority>(&effective.value().data);
+        auto target = lease.clone_target();
+        if (!target) return libk::unexpected(CSpaceError::InvalidHandle);
+        auto space = target.value().pin<kernel::mm::VSpace>();
+        // Region-local Destroy cannot retire the containing address space.
+        if (!space || authority == nullptr || !space.value()->can_destroy_object(*authority))
+            return libk::unexpected(CSpaceError::Denied);
     }
-    return target.value().retire()
-        ? libk::Expected<void, CSpaceError>{libk::expected()}
-        : libk::Expected<void, CSpaceError>{
-              libk::unexpected(CSpaceError::InvalidState)};
+    auto destroyed = source.graph->destroy_target(lease);
+    return destroyed ? libk::Expected<void, CSpaceError>{libk::expected()}
+        : libk::Expected<void, CSpaceError>{libk::unexpected(grant_error(destroyed.error()))};
 }
 
 auto CSpace::move(

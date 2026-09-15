@@ -9,7 +9,7 @@ import sys
 import time
 
 
-def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk):
+def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -67,7 +67,7 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk):
         run('help', b'run hello')
         run('ls', b'HELLO.PKG')
         run('cat README.TXT', b'myos disk file service')
-        run('cat absent.txt', b'file error: -5')
+        run('cat absent.txt', b'exit: -5')
         if exhaustion:
             for _ in range(iterations):
                 run('run hello', b'exit: -7')
@@ -77,9 +77,16 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk):
             return
         for _ in range(iterations):
             run('run hello', b'Hello from userspace.\nexit: 0')
+            run('run echo named arguments survive paging', b'named arguments survive paging\nexit: 0')
+        run('run demand', b'[demand] initialized data, BSS, private writes and VM reuse ok\nexit: 0')
+        if pressure and (not re.search(rb'pressure drained held=[1-9][0-9]* free=0', output)
+                         or b'pressure released held=' not in output):
+            raise RuntimeError('missing actual PMM drain/release evidence')
+        run('run bad', b'exit: -4')
+        run('run absent', b'exit: -5')
         run('run uart', b'exit: -6')
         run('wait', b'exit: -1')
-        run('spawn hello', b'task: ')
+        run('spawn sleep 10000', b'task: ')
         run('stop', b'exit: -18')
         run('run hello', b'Hello from userspace.\nexit: 0')
         print(f'[console] OK: {smp} harts, serial commands, repeated launch, denied authority, stop/refund')
@@ -103,4 +110,5 @@ if __name__ == '__main__':
     exhaustion = len(sys.argv) >= 7 and sys.argv[6] == 'exhaustion'
     iterations = int(sys.argv[7]) if len(sys.argv) == 8 else 3
     for smp in harts.split(','):
-        exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk)
+        exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk,
+                 pressure=len(sys.argv) >= 7 and sys.argv[6] == 'pressure')

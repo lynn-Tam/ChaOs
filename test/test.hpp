@@ -23,7 +23,7 @@ public:
         TestFn fn;
     };
 
-    static constexpr size_t kMaxTests = 192;
+    static constexpr size_t kMaxTests = 256;
 
     bool add(const char* group, const char* name, TestFn fn) noexcept;
     TestStats run(const TestContext& ctx) noexcept;
@@ -31,6 +31,7 @@ public:
 private:
     Entry entries_[kMaxTests]{};
     size_t count_{};
+    size_t dropped_{};
 };
 
 void register_builtin_tests(TestRegistry& registry) noexcept;

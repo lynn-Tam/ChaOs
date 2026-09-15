@@ -70,6 +70,8 @@ struct Policy final {
                 static_cast<u8>(LocusMask::ThreadBase)
                 | static_cast<u8>(LocusMask::Vproc))};
     case MYOS_SYS_CAP_REVOKE:
+    case MYOS_SYS_MEMORY_POPULATE:
+    case MYOS_SYS_VM_SYNC:
     case MYOS_SYS_RESOURCE_CLOSE:
     case MYOS_SYS_NOTIFICATION_WAIT:
     case MYOS_SYS_ENDPOINT_CALL:
@@ -96,6 +98,7 @@ struct Policy final {
         return {Continuation::Resume, TargetMask::Thread,
             LocusMask::EndpointLeaf};
     case MYOS_SYS_VM_MAP:
+    case MYOS_SYS_RESOURCE_CLOSE_ASYNC:
     case MYOS_SYS_VM_UNMAP:
     case MYOS_SYS_VM_PROTECT:
         return {Continuation::SplitPhase, TargetMask::Both, LocusMask::All};
@@ -146,6 +149,7 @@ struct Policy final {
     case MYOS_SYS_IO_SPACE_IRQ:
     case MYOS_SYS_IO_SPACE_CLOSE:
     case MYOS_SYS_MEMORY_SEAL:
+    case MYOS_SYS_MEMORY_WRITE:
     case MYOS_SYS_NOTIFICATION_SIGNAL:
     case MYOS_SYS_NOTIFICATION_TAKE:
     case MYOS_SYS_ENDPOINT_CLOSE:

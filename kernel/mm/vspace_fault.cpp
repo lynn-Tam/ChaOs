@@ -27,6 +27,10 @@ auto fault_kind(VSpaceError error) noexcept -> FaultKind {
     }
 }
 
+auto fault_kind(MemoryError error) noexcept -> FaultKind {
+    return error == MemoryError::Pending ? FaultKind::Pending : fault_kind(memory_error(error));
+}
+
 auto VSpace::fault(
     VmContext context,
     VirtAddr address,
@@ -138,6 +142,19 @@ auto VSpace::materialize_fault(
         });
     };
     MemoryObject* const memory = &authority.memory();
+    auto allocation_failed = [&](VSpaceError error, usize frames = 1)
+        -> libk::Expected<FaultResult, VSpaceError> {
+        const bool pressure = error == VSpaceError::OutOfMemory && relation != nullptr && demand != nullptr;
+        // The layout claim still pins MappingAuthority while the MemoryObject
+        // takes over the pressure relation. Release it only after that handoff.
+        const bool retained = pressure && memory->wait_frame(*relation, frames, owner, publish, *demand);
+        const FaultResult result{.kind = FaultKind::Pressure, .mapping = mapping.key_,
+            .object_page = object_page, .memory = memory};
+        kernel::sync::IrqLockGuard guard{lock_};
+        release_claim();
+        if (retained) return libk::expected(result);
+        return libk::unexpected(pressure ? VSpaceError::Busy : error);
+    };
     auto resident = memory->materialize(
         object_page, relation, owner, publish, demand);
     if (!resident) {
@@ -190,10 +207,6 @@ auto VSpace::materialize_fault(
     }
     auto alias = kernel_->aliases().acquire(physical.page, physical.type);
     if (!alias) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            release_claim();
-        }
         VSpaceError error{VSpaceError::AliasConflict};
         switch (alias.error()) {
         case AliasError::ConflictingType:
@@ -206,7 +219,7 @@ auto VSpace::materialize_fault(
             error = VSpaceError::QuotaExceeded;
             break;
         }
-        return libk::unexpected(error);
+        return allocation_failed(error);
     }
     auto made = pages_.create(
         page_address,
@@ -214,11 +227,7 @@ auto VSpace::materialize_fault(
         libk::move(source),
         libk::move(alias).value());
     if (!made) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            release_claim();
-        }
-        return libk::unexpected(node_error(made.error()));
+        return allocation_failed(node_error(made.error()));
     }
     MappedPage* const page = made.value().object;
     /*luna change: arm each materialized page with its authority route,
@@ -236,18 +245,15 @@ auto VSpace::materialize_fault(
         release_claim();
         return libk::unexpected(memory_error(linked.error()));
     }
-    auto table_reserve = reserve_tables(page);
+    usize table_frames{};
+    auto table_reserve = reserve_tables(page, &table_frames);
     if (!table_reserve) {
         KASSERT(authority.memory().unbind_mapping(page->page_mapping_));
         /*luna change: clear the rejected page route before recycle, reason:
           backing unlink precedes MappedPage destruction*/
         page->authority_ = nullptr;
         pages_.destroy(*page);
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            release_claim();
-        }
-        return libk::unexpected(table_reserve.error());
+        return allocation_failed(table_reserve.error(), table_frames);
     }
     TableReserve tables = libk::move(table_reserve).value();
 

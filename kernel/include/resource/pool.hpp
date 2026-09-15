@@ -72,6 +72,7 @@ private:
     void ready(Allocation& allocation) noexcept;
     void target_ready(Allocation& allocation) noexcept;
     void child_closed(Allocation& allocation) noexcept;
+    void close_allocation(Allocation& allocation) noexcept;
     void bind_parent(Allocation& allocation) noexcept;
     void unbind_parent(Allocation& allocation) noexcept;
     void attach(Permit& permit, Allocation& allocation) noexcept;

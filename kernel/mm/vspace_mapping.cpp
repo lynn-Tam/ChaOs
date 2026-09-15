@@ -30,7 +30,7 @@ auto VSpace::prepare_plan(
               libk::unexpected(VSpaceError::ShootdownUnavailable)};
 }
 
-auto VSpace::reserve_tables(MappedPage* pages) noexcept
+auto VSpace::reserve_tables(MappedPage* pages, usize* needed) noexcept
     -> libk::Expected<TableReserve, VSpaceError> {
     arch::PageEditor editor = arch::PageEditor::user(*root_);
     auto plan = editor.plan();
@@ -42,6 +42,7 @@ auto VSpace::reserve_tables(MappedPage* pages) noexcept
         }
     }
     const usize count = plan.table_pages();
+    if (needed != nullptr) *needed = count;
     kernel::resource::Charge charge{};
     if (sponsor_ != nullptr && count != 0) {
         const auto bytes = libk::checked_multiply<u64>(

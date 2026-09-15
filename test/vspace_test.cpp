@@ -404,6 +404,7 @@ bool test_child_region_and_capability_publish_together(
     const auto root_rights = kernel::cap::Rights::of(
         kernel::cap::Right::CreateRegion,
         kernel::cap::Right::Map,
+        kernel::cap::Right::Destroy,
         kernel::cap::Right::Inspect);
     auto grant = graph.create_root(
         libk::move(reference).value(),
@@ -448,6 +449,7 @@ bool test_child_region_and_capability_publish_together(
             child_policy,
             kernel::cap::Rights::of(
                 kernel::cap::Right::Map,
+                kernel::cap::Right::Destroy,
                 kernel::cap::Right::Inspect));
         if (!created) {
             return false;
@@ -471,7 +473,19 @@ bool test_child_region_and_capability_publish_together(
             && authority->range == child_range
             && authority->access == child_policy.access
             && authority->types == child_policy.types;
+        if (!coherent) return false;
+        auto clipped = *authority;
+        clipped.range = kernel::mm::VirtRange{child_range.base(), kernel::mm::page_size};
+        const auto denied = fixture.space().destroy_region(VSpaceFixture::context(), clipped);
+        if (denied || denied.error() != kernel::mm::VSpaceError::InvalidAuthority) return false;
+        if (fixture.space().can_destroy_object(*authority)
+            || !fixture.space().can_destroy_object(root_authority)) return false;
+        auto clipped_root = root_authority;
+        clipped_root.range = child_range;
+        if (fixture.space().can_destroy_object(clipped_root)) return false;
     }
+    const auto denied_destroy = cspace.destroy(child.capability);
+    if (denied_destroy || denied_destroy.error() != kernel::cap::CSpaceError::Denied) return false;
     const bool closed_child = static_cast<bool>(cspace.close(child.capability));
     const bool closed_root = static_cast<bool>(cspace.close(root.value()));
     cspace.retire();

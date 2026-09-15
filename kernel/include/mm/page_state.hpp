@@ -77,14 +77,12 @@ struct WaitRelation final {
     using Publish = void (*)(void*, PageWaitResult) noexcept;
 
     libk::IntrusiveListHook hook_{};
-    union {
-        PageRequest* request;
-        u64 observed_progress;
-    };
+    PageRequest* request{};
     void* owner{};
     Publish publish{};
     u64 generation{};
     libk::Atomic<u8> state_{static_cast<u8>(PageWaitState::Detached)};
+    u32 required_frames{1};
 
     [[nodiscard]] auto attached() const noexcept -> bool {
         const auto state = static_cast<PageWaitState>(state_.load<

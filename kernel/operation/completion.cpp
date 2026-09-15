@@ -240,25 +240,22 @@ auto Completion::try_claim_finish() noexcept -> FinishClaim {
         ? FinishClaim::Publishing : FinishClaim::Unavailable;
 }
 
-auto Completion::try_claim_cancel() noexcept -> bool {
+auto Completion::try_claim_cancel() noexcept -> CancelClaim {
     const Delivery observed = delivery_.load<libk::MemoryOrder::Acquire>();
-    if (observed != Delivery::Attached && observed != Delivery::Ready) {
-        return false;
-    }
+    if (observed != Delivery::Attached && observed != Delivery::Ready) return CancelClaim::Unavailable;
     Delivery expected = observed;
-    return delivery_.compare_exchange_strong<
-        libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, Delivery::Cancelling);
+    if (!delivery_.compare_exchange_strong<libk::MemoryOrder::AcqRel, libk::MemoryOrder::Acquire>(
+            expected, Delivery::Cancelling)) return CancelClaim::Unavailable;
+    return observed == Delivery::Ready ? CancelClaim::Published : CancelClaim::Pending;
 }
 
-auto Completion::resolve_cancel() noexcept -> CancelResult {
-    if (complete()) {
-        return CancelResult::Completed;
-    }
-    if (ops_->cancel(owner_)) {
-        return CancelResult::Canceled;
-    }
-    return complete() ? CancelResult::Completed : CancelResult::Reopen;
+auto Completion::resolve_cancel(CancelClaim claim) noexcept -> CancelResult {
+    KASSERT(claim != CancelClaim::Unavailable);
+    if (claim == CancelClaim::Published) return CancelResult::Completed;
+    if (ops_->cancel(owner_)) return CancelResult::Canceled;
+    // A ready result is not yet a released producer. Until signal() publishes
+    // Ready or CancelRaced, its callback may still access this operation.
+    return CancelResult::Reopen;
 }
 
 auto Completion::try_reopen_cancel() noexcept -> bool {

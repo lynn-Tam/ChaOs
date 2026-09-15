@@ -110,8 +110,8 @@ core_kernel_sources = files(
   'kernel/execution/authority.cpp', 'kernel/execution/target.cpp',
   'kernel/execution/vproc.cpp', 'kernel/execution/vproc_notification.cpp',
   'kernel/execution/vproc_tunnel.cpp', 'kernel/execution/stop.cpp',
-  # /*luna change: link the standalone PageFault continuation owner, reason: Wait only transports one page-specific edge*/
-  'kernel/operation/completion.cpp', 'kernel/operation/page_fault.cpp',
+  # /*luna change: link the standalone PageAccess continuation owner, reason: Wait only transports one page-specific edge*/
+  'kernel/operation/completion.cpp', 'kernel/operation/page_access.cpp', 'kernel/operation/vm_wait.cpp',
   'kernel/operation/wait.cpp',
   'kernel/execution/execution.cpp', 'kernel/execution/binding.cpp',
   'kernel/syscall/syscall.cpp', 'kernel/syscall/common.cpp', 'kernel/syscall/execution.cpp',
@@ -259,7 +259,7 @@ test_off = static_library(
 )
 test_sources = files(
   'test/boot.cpp', 'test/scenario_gate.cpp', 'test/framework.cpp', 'test/scenario.cpp',
-  'test/scenario_basic.cpp', 'test/scenario_remote.cpp', 'test/scenario_publication.cpp',
+  'test/scenario_basic.cpp', 'test/scenario_wait.cpp', 'test/scenario_remote.cpp', 'test/scenario_publication.cpp',
   'test/scenario_report.cpp', 'test/scenario_observer.cpp',
   # /*luna change: compile the pressure fixture with the existing test module, reason: ordinary images keep the dormant storage while only the pressure image selects it*/
   'test/scenario_pressure.cpp', 'test/scenario_io.cpp', 'test/libk_test.cpp',
@@ -328,6 +328,17 @@ kernel_io = executable(
   link_whole: [core, concurrency, lock, console, report, panic, io_scenario, test_module],
   link_args: kernel_link_args,
   link_language: 'c', build_by_default: false,
+)
+wait_scenario = static_library(
+  'kernel-scenario-wait', files('kernel/diag/scenario_real.cpp'),
+  c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DMYOS_SCENARIO_ID=11'],
+  pic: false, build_by_default: false,
+)
+kernel_wait = executable(
+  'kernel_wait.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: debug_build_info_args,
+  link_whole: [core, concurrency, lock, console, report, panic, wait_scenario, test_module],
+  link_args: kernel_link_args, link_language: 'c', build_by_default: false,
 )
 # /*luna change: link a pressure-only image from shared core and test objects, reason: the physical fixture must not alter ordinary kernel_debug scenario selection or duplicate the object tree*/
 # The functional pressure gate keeps panic/assert, console, tests and the exact
@@ -431,6 +442,15 @@ file_client_user = executable(
   'file-client-test.elf', files('test/user/io/file_client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
+file_failure_init_user = executable(
+  'file-failure-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_common_args,
+  cpp_args: user_cpp_args + ['-DMYOS_TEST_FILE_FAILURE'],
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+file_failure_user = executable(
+  'file-failure-test.elf', files('test/user/io/file_failure.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 uart_user = executable(
   'uart.elf', files('servers/uart/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), 'uart.map')], link_language: 'c', build_by_default: false,
@@ -443,6 +463,22 @@ shell_user = executable(
 
 hello_user = executable(
   'hello.elf', files('programs/hello/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+echo_user = executable(
+  'echo.elf', files('programs/echo/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+cat_user = executable(
+  'cat.elf', files('programs/cat/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+sleep_user = executable(
+  'sleep.elf', files('programs/sleep/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+demand_user = executable(
+  'demand-test.elf', files('test/user/demand/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
@@ -589,15 +625,58 @@ io_session_bundle = custom_target(
 )
 application_manifest = custom_target(
   'application-manifest', input: hello_user, output: 'hello.manifest',
-  command: [deploypack, 'application', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+  command: [deploypack, 'application', '@OUTPUT@', 'hello', '@INPUT@'], build_by_default: false,
 )
 hello_package = custom_target(
   'hello-package', input: [hello_user, application_manifest], output: 'hello.pkg',
   command: [bootpack, '@OUTPUT@', 'hello', 'hello=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
+run_target('test-bootpack-image', command: [find_program('python3'),
+  files('test/tools/bootpack_image.py'), hello_user, hello_package])
+echo_manifest = custom_target(
+  'echo-manifest', input: echo_user, output: 'echo.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'echo', '@INPUT@'], build_by_default: false,
+)
+echo_package = custom_target(
+  'echo-package', input: [echo_user, echo_manifest], output: 'echo.pkg',
+  command: [bootpack, '@OUTPUT@', 'echo', 'echo=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+cat_manifest = custom_target(
+  'cat-manifest', input: cat_user, output: 'cat.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'cat', '@INPUT@'], build_by_default: false,
+)
+cat_package = custom_target(
+  'cat-package', input: [cat_user, cat_manifest], output: 'cat.pkg',
+  command: [bootpack, '@OUTPUT@', 'cat', 'cat=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+sleep_manifest = custom_target(
+  'sleep-manifest', input: sleep_user, output: 'sleep.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'sleep', '@INPUT@'], build_by_default: false,
+)
+sleep_package = custom_target(
+  'sleep-package', input: [sleep_user, sleep_manifest], output: 'sleep.pkg',
+  command: [bootpack, '@OUTPUT@', 'sleep', 'sleep=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+demand_manifest = custom_target(
+  'demand-manifest', input: demand_user, output: 'demand.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'demand', '@INPUT@'], build_by_default: false,
+)
+demand_package = custom_target(
+  'demand-package', input: [demand_user, demand_manifest], output: 'demand.pkg',
+  command: [bootpack, '@OUTPUT@', 'demand', 'demand=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+denied_manifest = custom_target(
+  'denied-manifest', input: uart_user, output: 'denied.manifest',
+  command: [deploypack, 'application-denied', '@OUTPUT@', 'uart', '@INPUT@'], build_by_default: false,
+)
+denied_package = custom_target(
+  'denied-package', input: [uart_user, denied_manifest], output: 'denied.pkg',
+  command: [bootpack, '@OUTPUT@', 'uart', 'uart=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
 disk_image = custom_target(
-  'disk-image', input: [files('user/disk/README.TXT'), hello_package], output: 'disk.img',
-  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@'],
+  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package], output: 'disk.img',
+  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@',
+    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'BAD.PKG=@INPUT0@'],
   build_by_default: false,
 )
 file_test_data = custom_target(
@@ -618,6 +697,16 @@ file_session_bundle = custom_target(
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'files=@INPUT2@', 'file-client=@INPUT3@', 'data:manifest=@INPUT4@'],
   build_by_default: false,
 )
+file_failure_manifest = custom_target(
+  'file-failure-manifest', input: [block_user, files_user, file_failure_user], output: 'file-failure.manifest',
+  command: [deploypack, 'file-session', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+file_failure_bundle = custom_target(
+  'file-failure-bundle', input: [file_failure_init_user, block_user, files_user, file_failure_user, file_failure_manifest],
+  output: 'file-failure.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'files=@INPUT2@', 'file-client=@INPUT3@', 'data:manifest=@INPUT4@'],
+  build_by_default: false,
+)
 
 native_manifest = custom_target(
   'native-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user],
@@ -629,7 +718,7 @@ boot_bundle = custom_target(
 )
 exhaustion_manifest = custom_target(
   'application-exhaustion-manifest', input: hello_user, output: 'hello-exhaustion.manifest',
-  command: [deploypack, 'application-exhaustion', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+  command: [deploypack, 'application-exhaustion', '@OUTPUT@', 'hello', '@INPUT@'], build_by_default: false,
 )
 exhaustion_package = custom_target(
   'application-exhaustion-package', input: [hello_user, exhaustion_manifest], output: 'hello-exhaustion.pkg',
@@ -716,8 +805,18 @@ run_target('run-io-user-matrix', command: [find_program('python3'), files('tools
   qemu, kernel_debug, '1,2,4', '--bundle', io_user_bundle,
   '[io-user] ok: 32 outstanding, batch completion, task teardown, device reuse'])
 run_target('run-file-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
-  qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '15',
+  qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '45',
   '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])
+run_target('run-file-paging-pressure-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_pressure, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '45',
+  '[scenario] pressure drained', '[scenario] pressure released',
+  '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])
+run_target('run-file-failure-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', file_failure_bundle, '--disk', file_test_disk,
+  '--timeout', '20', '--fail-sector', '2081',
+  'user: contained fault address=0x75000000',
+  '[file-failure] ok: read error, two faulted mappings, closed sessions, services live'])
+
 run_target('run-io-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', io_session_bundle,
   '[io-session] ok: isolated pages, 32 outstanding, batched completion, cancel, close'])
@@ -734,6 +833,9 @@ run_target('run-console', command: [qemu, '-machine', 'virt,iommu-sys=on', '-smp
   '-device', 'virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on'], depends: disk_image)
 run_target('run-debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug])
 run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug, '-S', '-gdb', 'tcp:' + get_option('gdb_host') + ':' + get_option('gdb_port').to_string()])
+run_target('run-wait-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_wait, 'marker',
+  '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
+  '[scenario] wait publication ok'])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0'])
 if profile == 'proof'
   run_target('run-ipc-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'marker', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'user: contained fault address=0xe100', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', ipc_bundle])
@@ -744,6 +846,7 @@ if profile == 'proof'
   run_target('run-console-smp', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, smp])
   run_target('run-console-exhaustion-smp', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, exhaustion_disk, smp, 'exhaustion'])
   run_target('run-console-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, '1,2,4'])
+  run_target('run-demand-pressure-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_pressure, boot_bundle, disk_image, '1,2,4', 'pressure'])
   run_target('run-io-console-matrix', command: [find_program('python3'), files('tools/build/run-console.py'), qemu, kernel_debug, boot_bundle, disk_image, '1,2,4'])
   run_target('run-io-platform-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'), qemu, kernel_debug, '1,2,4'])
   run_target('run-io-lease-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'), qemu, kernel_io, '1,2,4', '[scenario] io-lease ok: open, cancel, reset, fence, reuse', '[scenario] io-dma ok: translated block read before and after reuse', '[scenario] io-fault ok: physical DMA denied, guard intact, recovery read', '[scenario] io-space ok: source revoke, backing retire, pool close, cancel, quota, refund', '[scenario] io-irq ok: INTx notification, exact ack, reuse'])

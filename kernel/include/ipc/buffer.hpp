@@ -35,6 +35,8 @@ public:
         Access(Access&&) noexcept = default;
         auto operator=(Access&&) noexcept -> Access& = default;
 
+        // A bounded single-page borrow, valid for this Access lifetime.
+        [[nodiscard]] auto bytes(usize offset, usize size) const noexcept -> libk::Span<const byte>;
         [[nodiscard]] auto read(
             usize offset, libk::Span<byte> output) const noexcept -> bool;
         [[nodiscard]] auto write(

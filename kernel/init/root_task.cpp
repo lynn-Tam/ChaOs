@@ -232,7 +232,12 @@ auto RootTask::reserve(kernel::resource::Budget charge) noexcept
 
 auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     -> libk::Expected<void, RootTaskError> {
-    myos_bootstrap_info info_page{};
+    // Construct the envelope in its final private page. Its import capacity
+    // must not grow the boot stack or require a second full-page copy.
+    auto info_lease = info_->materialize(0);
+    if (!info_lease) return libk::unexpected(RootTaskError::OutOfMemory);
+    auto& info_page = *libk::construct_at(reinterpret_cast<myos_bootstrap_info*>(
+        kernel.pmm().bytes(info_lease.value().page().page)));
     info_page.magic = MYOS_BOOTSTRAP_MAGIC;
     info_page.major = MYOS_BOOTSTRAP_MAJOR;
     info_page.minor = MYOS_BOOTSTRAP_MINOR;
@@ -476,13 +481,6 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
             MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN,
             kernel.kernel_domain_ref(), basic_rights)) {
         return libk::unexpected(RootTaskError::CapabilityFailed);
-    }
-    if (!write_memory(
-            kernel.pmm(), info_.get(),
-            libk::ByteSpan{
-                reinterpret_cast<const byte*>(&info_page),
-                sizeof(info_page)})) {
-        return libk::unexpected(RootTaskError::OutOfMemory);
     }
     return libk::expected();
 }

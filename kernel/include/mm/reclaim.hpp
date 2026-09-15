@@ -100,9 +100,8 @@ public:
 
     [[nodiscard]] auto retain(
         WaitRelation& relation,
-        u64 observed_progress,
         void* owner,
-        WaitRelation::Publish publish) noexcept -> bool;
+        WaitRelation::Publish publish, usize required_frames = 1) noexcept -> bool;
     [[nodiscard]] auto release(
         WaitRelation& relation,
         u64 expected_generation) noexcept -> bool;
@@ -113,7 +112,7 @@ public:
         return relations_.size();
     }
     [[nodiscard]] auto wake(
-        u64 frame_progress,
+        usize available_frames,
         WaitClaim* ready,
         usize capacity) noexcept -> usize;
 private:

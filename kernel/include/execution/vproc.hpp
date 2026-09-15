@@ -71,8 +71,6 @@ struct VprocRuntime final : private libk::noncopyable {
     kernel::mm::PageLease event_page{};
     myos_vproc_control_page* control{};
     myos_vproc_event_page* events{};
-    kernel::mm::VirtAddr control_address{};
-    kernel::mm::VirtAddr event_address{};
 };
 
 struct VprocArm final : private libk::noncopyable {
@@ -390,19 +388,19 @@ private:
     u64 notification_mask_{};
     u64 upcall_generation_{};
     u64 park_sequence_{};
+    usize activation_publishers_{};
+    sched::RemoteRequest activation_{sched::RemoteKind::Activation, this};
+    myos_status_t normal_exit_status_{MYOS_STATUS_OK};
     UpcallState upcall_state_{UpcallState::Unarmed};
     bool arm_attaching_{};
     bool stop_requested_{};
     bool stop_dispatched_{};
     bool stopped_{};
     bool normal_exit_requested_{};
-    myos_status_t normal_exit_status_{MYOS_STATUS_OK};
     bool park_requested_{};
-    usize activation_publishers_{};
     ActivationPost activation_post_{ActivationPost::Idle};
     bool activation_dirty_{};
     mutable bool relation_admission_closed_{};
-    sched::RemoteRequest activation_{sched::RemoteKind::Activation, this};
 };
 
 } // namespace kernel

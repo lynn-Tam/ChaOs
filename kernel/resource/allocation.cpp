@@ -30,8 +30,7 @@ void Allocation::child_closed() noexcept {
 }
 
 CloseWait::CloseWait(kernel::cap::GrantGraph& graph) noexcept
-    : graph_(&graph),
-      completion_(kernel::sync::Completion::Notifier::bind<
+    : completion_(kernel::sync::Completion::Notifier::bind<
           &CloseWait::refunded>(*this)),
       relation_(kernel::operation::Completion::bind<
           CloseWait,
@@ -66,9 +65,7 @@ auto CloseWait::read() noexcept -> kernel::operation::Result {
 }
 
 void CloseWait::release() noexcept {
-    kernel::cap::GrantGraph* const graph = graph_;
-    KASSERT(graph != nullptr);
-    graph->destroy_close_wait(*this);
+    KASSERT(completion_.complete());
 }
 
 auto CloseWait::cancel() noexcept -> bool {

@@ -1,4 +1,5 @@
 #include <mm/vspace.hpp>
+#include <libk/scope_guard.hpp>
 #include <mm/vspace_work.hpp>
 
 #include "vspace_internal.hpp"
@@ -160,6 +161,7 @@ VSpace::VSpace(
       views_(pmm) {}
 
 VSpace::~VSpace() noexcept {
+    KASSERT(waiters_.empty());
     KASSERT(state_ == VSpaceState::Quiescent);
     KASSERT(root_region_ == nullptr);
     KASSERT(!root_);
@@ -296,6 +298,12 @@ auto VSpace::root_key() const noexcept -> RegionKey {
     return root_region_ != nullptr ? root_region_->key_ : RegionKey{};
 }
 
+auto VSpace::can_destroy_object(cap::VSpaceAuthority authority) const noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return root_region_ != nullptr && authority.region == root_region_->key_
+        && authority.range.contains(root_region_->range_);
+}
+
 auto VSpace::translation() noexcept -> TranslationView {
     KASSERT(root_);
     return TranslationView{coherence_, root_->token()};
@@ -417,6 +425,7 @@ auto VSpace::release_page(MappedPage& page) noexcept -> bool {
 }
 
 void VSpace::finish_authorities() noexcept {
+    libk::scope_exit completed{[this]() noexcept { finish_waiters(); }};
     for (;;) {
         MappingAuthority* authority{};
         {
@@ -506,8 +515,46 @@ auto VSpace::finish_pending() noexcept -> bool {
         static_cast<Mapping*>(node)->state_ = MappingState::Live;
     }
     pending_kind_ = PendingKind::None;
+    for (auto& wait : waiters_) wait.ready_.store<libk::MemoryOrder::Release>(true);
     try_finish_retire();
     return true;
+}
+
+void VSpace::wait_pending(operation::VmWait& wait) noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(!wait.hook_.is_linked());
+        if (pending_kind_ != PendingKind::None) {
+            waiters_.push_back(wait);
+            return;
+        }
+        wait.ready_.store<libk::MemoryOrder::Release>(true);
+    }
+    wait.completion_.signal();
+}
+
+auto VSpace::cancel_wait(operation::VmWait& wait) noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (!wait.hook_.is_linked()) return false;
+    waiters_.erase(wait);
+    return true;
+}
+
+void VSpace::finish_waiters() noexcept {
+    for (;;) {
+        operation::VmWait* ready{};
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            for (auto& wait : waiters_) {
+                if (wait.complete()) { ready = &wait; break; }
+            }
+            if (ready == nullptr) return;
+            waiters_.erase(*ready);
+        }
+        // Dequeue transfers publication ownership; cancellation must now wait
+        // for signal, even though the transaction result is already ready.
+        ready->completion_.signal();
+    }
 }
 
 } // namespace kernel::mm

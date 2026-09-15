@@ -152,7 +152,8 @@ auto ObjectStore::create_pager_memory_sponsored(
     kernel::resource::Reservation&& sponsorship,
     usize byte_size,
     object::ObjectRef&& pager,
-    kernel::mm::AccessMask access) noexcept
+    kernel::mm::AccessMask access,
+    bool private_content) noexcept
     -> libk::Expected<MemoryPending, kernel::mm::MemoryError> {
     auto pending = memories_.create_sponsored(
         libk::move(sponsorship), *pmm_, byte_size, *memory_work_, reclaimer_);
@@ -161,7 +162,7 @@ auto ObjectStore::create_pager_memory_sponsored(
     }
     MemoryPending memory = libk::move(pending).value();
     auto initialized = memory.get().initialize_pager(
-        libk::move(pager), access);
+        libk::move(pager), access, private_content);
     if (!initialized) {
         return libk::unexpected(initialized.error());
     }

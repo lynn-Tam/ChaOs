@@ -154,6 +154,11 @@ struct PlanImport final {
 struct PlanBootstrap final {
     uint32_t kind{};
     SymbolId destination{};
+    SymbolId name{};
+    uint32_t protocol{};
+    uint16_t major{};
+    uint16_t minor{};
+    uint16_t object_kind{};
 };
 
 struct PlanDependency final {
@@ -502,6 +507,12 @@ public:
     }
 
     [[nodiscard]] auto lease() const noexcept -> libk::optional<PlanLease>;
+
+    // A mapped program may release its bytes only after the last task has
+    // relinquished the plan that borrows those bytes.
+    [[nodiscard]] auto borrowed() const noexcept -> bool {
+        return control_ != nullptr && control_->lease_count != 0;
+    }
 
 private:
     friend class PlanLease;
@@ -976,6 +987,11 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         PlanBootstrap& row = storage_->bootstraps_[index];
         row.kind = source.kind;
         row.destination = symbol(source.destination);
+        row.name = symbol(source.name);
+        row.protocol = source.protocol;
+        row.major = source.major;
+        row.minor = source.minor;
+        row.object_kind = source.object_kind;
     }
     storage_->bootstrap_count_ = view.bootstrap_count();
     return true;

@@ -18,6 +18,15 @@
 
 namespace myos::deploy {
 
+// A loader may provide already-backed segment objects. Each returned selector
+// is a new owner, scoped to the segment's native object-page range and access.
+// first identifies that range's origin; attenuation never rebases a MemoryObject.
+// TaskSpace adopts it before constructing the mapping, including on failure.
+struct ImageSource final {
+    void* context{};
+    SysResult (*create)(void*, cap::CapRef, const boot::Segment&, myos_word_t& first) noexcept{};
+};
+
 template<size_t SegmentCapacity = 32, size_t StackCapacity = 64>
 struct MaterializedImage final {
     struct Mapping final {
@@ -26,6 +35,7 @@ struct MaterializedImage final {
         uintptr_t address{};
         myos_word_t size{};
         myos_word_t access{};
+        myos_word_t first{};
     };
 
     struct Stack final {
@@ -228,8 +238,9 @@ public:
     ImageMaterializer(
         Task& task,
         BundleLease& bundle,
-        Scratch& scratch) noexcept
-        : task_(task), bundle_(bundle), scratch_(scratch) {}
+        Scratch& scratch,
+        ImageSource source = {}) noexcept
+        : task_(task), bundle_(bundle), scratch_(scratch), source_(source) {}
 
     [[nodiscard]] auto materialize(
         size_t module_index,
@@ -756,14 +767,15 @@ private:
         LocalSlot memory,
         myos_word_t address,
         myos_word_t size,
-        myos_word_t access) noexcept -> myos_status_t {
+        myos_word_t access,
+        myos_word_t first = 0) noexcept -> myos_status_t {
         const auto region_ref = task_.lookup(region, MYOS_OBJECT_KIND_VSPACE);
         const auto memory_ref = task_.lookup(memory, MYOS_OBJECT_KIND_MEMORY);
         if (!region_ref.has_value() || !memory_ref.has_value()) {
             return MYOS_STATUS_INVALID_CAP;
         }
         const myos_status_t status = B::vm_map(
-            region_ref.value(), memory_ref.value(), address, size, 0, access);
+            region_ref.value(), memory_ref.value(), address, size, first, access);
         return committed(status) ? MYOS_STATUS_OK : status;
     }
 
@@ -856,15 +868,28 @@ private:
             const myos_word_t load_access = segment.access
                 | MYOS_VM_READ | MYOS_VM_WRITE;
             LocalSlot memory{};
-            myos_status_t status = create_memory(
-                size.value(), load_access, memory);
-            if (status != MYOS_STATUS_OK
-                || (status = populate(memory, segment, size.value()))
-                    != MYOS_STATUS_OK) {
+            myos_status_t status{};
+            myos_word_t first{};
+            if (source_.create != nullptr) {
+                const auto pool = task_.pool();
+                if (!pool) return MYOS_STATUS_BAD_ARGS;
+                const auto created = source_.create(source_.context, *pool, segment, first);
+                owner_type owner{cap::CapRef{created.value, 0}};
+                status = created.status;
+                if (status == MYOS_STATUS_OK) {
+                    if (!owner) status = MYOS_STATUS_INVALID_CAP;
+                    else if (auto slot = task_.adopt_local(libk::move(owner), MYOS_OBJECT_KIND_MEMORY)) memory = *slot;
+                    else status = MYOS_STATUS_NO_MEMORY;
+                }
+            } else {
+                status = create_memory(size.value(), load_access, memory);
+                if (status == MYOS_STATUS_OK) status = populate(memory, segment, size.value());
+            }
+            if (status != MYOS_STATUS_OK) {
                 output.clear();
                 return status;
             }
-            if ((segment.access & MYOS_VM_EXECUTE) != 0) {
+            if (source_.create == nullptr && (segment.access & MYOS_VM_EXECUTE) != 0) {
                 const auto reference = task_.lookup(
                     memory, MYOS_OBJECT_KIND_MEMORY);
                 if (!reference.has_value()) {
@@ -884,7 +909,7 @@ private:
             if (status != MYOS_STATUS_OK
                 || (status = map(
                     region, memory, static_cast<myos_word_t>(segment.address),
-                    size.value(), segment.access)) != MYOS_STATUS_OK
+                    size.value(), segment.access, first)) != MYOS_STATUS_OK
             ) {
                 output.clear();
                 return status;
@@ -894,7 +919,7 @@ private:
                     .region = region,
                     .address = segment.address,
                     .size = size.value(),
-                    .access = segment.access})) {
+                    .access = segment.access, .first = first})) {
                 output.clear();
                 return MYOS_STATUS_NO_MEMORY;
             }
@@ -905,6 +930,7 @@ private:
     Task& task_;
     BundleLease& bundle_;
     Scratch& scratch_;
+    ImageSource source_{};
 };
 
 } // namespace myos::deploy

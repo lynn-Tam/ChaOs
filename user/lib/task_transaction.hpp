@@ -26,6 +26,7 @@
 #include <user/lib/deployment_plan.hpp>
 #include <user/lib/image_materializer.hpp>
 #include <user/lib/task_authority.hpp>
+#include <user/lib/arguments.hpp>
 
 namespace myos::deploy {
 
@@ -194,6 +195,7 @@ struct TaskConstructionWorkspace final {
             if (mapping_regions[index].valid()
                 || mapping_addresses[index] != 0
                 || mapping_sizes[index] != 0
+                || mapping_first[index] != 0
                 || mapping_access[index] != 0
                 || mapping_done[index]) {
                 return false;
@@ -252,6 +254,7 @@ struct TaskConstructionWorkspace final {
         for (auto& size : mapping_sizes) {
             size = 0;
         }
+        for (auto& first : mapping_first) first = 0;
         for (auto& access : mapping_access) {
             access = 0;
         }
@@ -282,6 +285,7 @@ struct TaskConstructionWorkspace final {
     LocalSlot mapping_regions[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
     myos_word_t mapping_addresses[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
     myos_word_t mapping_sizes[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
+    myos_word_t mapping_first[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
     myos_word_t mapping_access[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
     bool mapping_done[MYOS_DEPLOY_TASK_MAPPING_MAX]{};
     ImportProjection imports[kImportBatchMax]{};
@@ -308,6 +312,12 @@ struct TaskConstructionInput final {
      * A generated bootstrap envelope requires a checked non-zero CPU count. */
     uint32_t runtime_cpu_count{};
     const TaskAuthorityBindings* bindings{};
+    ImageSource image_source{};
+    const bootstrap::Arguments* arguments{};
+    // Optional observer supplied by a resident supervisor. The accepted
+    // selector is moved into TaskSpace; application imports cannot gain rights
+    // beyond that selector. The supervisor waits on its own Notification.
+    cap::BasicOwnedCap<B>* terminal_notification{};
     workspace_type& workspace;
 };
 
@@ -572,8 +582,12 @@ public:
             return set_ != nullptr && active_ && id_.valid();
         }
 
+        [[nodiscard]] auto ready() const noexcept -> bool {
+            return valid() && set_->cell_state(id_) == CompletionCellState::Ready;
+        }
+
         [[nodiscard]] auto take() noexcept -> libk::optional<CompletionResult> {
-            if (!valid() || set_->cell_state(id_) != CompletionCellState::Ready) {
+            if (!ready()) {
                 return libk::nullopt;
             }
             CompletionResult result = set_->cell(id_).result;
@@ -1708,6 +1722,19 @@ public:
         return MYOS_STATUS_OK;
     }
 
+    void close_events(TaskId id, cap::CapRef events, myos_word_t badge) noexcept {
+        auto* target = record(id);
+        if (target == nullptr) Record::ownership_fault(MYOS_STATUS_INVALID_CAP);
+        target->space().close_events(events, badge);
+    }
+    void observe_close(TaskId id, myos_word_t badges) noexcept {
+        if (auto* target = closing(id)) target->record().space().observe_close(badges);
+    }
+    [[nodiscard]] auto close_waiting(TaskId id) noexcept -> bool {
+        auto* target = closing(id);
+        return target != nullptr && target->record().space().phase() == Phase::ResourceWaiting;
+    }
+
     [[nodiscard]] constexpr auto capacity() const noexcept -> size_t {
         return Capacity;
     }
@@ -2092,7 +2119,7 @@ public:
             1>;
         using Image = typename Materializer::Image;
         Materializer materializer{
-            record.space(), *input.bundle, *input.scratch};
+            record.space(), *input.bundle, *input.scratch, input.image_source};
         Image& image = workspace.image;
         uintptr_t (&image_entries)[MYOS_DEPLOY_TASK_IMAGE_MAX] =
             workspace.image_entries;
@@ -2102,6 +2129,7 @@ public:
             workspace.mapping_addresses;
         myos_word_t (&mapping_sizes)[MYOS_DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_sizes;
+        auto& mapping_first = workspace.mapping_first;
         myos_word_t (&mapping_access)[MYOS_DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_access;
         bool (&mapping_done)[MYOS_DEPLOY_TASK_MAPPING_MAX] =
@@ -2214,6 +2242,17 @@ public:
             myos_status_t status = MYOS_STATUS_BAD_ARGS;
             switch (object->kind) {
             case MYOS_OBJECT_KIND_NOTIFICATION: {
+                const auto key = task.symbol(object->output);
+                if (input.terminal_notification != nullptr && !key.equals(service_key)
+                    && !key.equals(readiness_key)) {
+                    if (!*input.terminal_notification) return failure(MYOS_STATUS_BAD_ARGS);
+                    const auto adopted = record.space().adopt_local(
+                        libk::move(*input.terminal_notification), MYOS_OBJECT_KIND_NOTIFICATION);
+                    if (!adopted) return failure(MYOS_STATUS_NO_MEMORY);
+                    slot = *adopted;
+                    status = MYOS_STATUS_OK;
+                    break;
+                }
                 status = adopt_result(
                     backend_type::notification_create(
                         pool.value(), object->args[0]),
@@ -2343,6 +2382,7 @@ public:
                         static_cast<myos_word_t>(
                             image.segments[segment].address);
                     mapping_sizes[mapping_index] = image.segments[segment].size;
+                    mapping_first[mapping_index] = image.segments[segment].first;
                     mapping_access[mapping_index] =
                         image.segments[segment].access;
                     mapping_done[mapping_index] = true;
@@ -2421,6 +2461,7 @@ public:
             mapping_regions[mapping_index] = materialized.region;
             mapping_addresses[mapping_index] = materialized.address;
             mapping_sizes[mapping_index] = materialized.size;
+            mapping_first[mapping_index] = materialized.first;
             mapping_access[mapping_index] = materialized.access;
             mapping_done[mapping_index] = true;
             if (mapping_index == bootstrap_mapping) {
@@ -2557,12 +2598,12 @@ public:
             descriptor.flags = MYOS_ENDPOINT_FLAGS_NONE;
             descriptor.entry = execution_entry;
             descriptor.code_memory = code_ref->selector;
-            descriptor.code_page = 0;
+            descriptor.code_page = mapping_first[code_mapping];
             descriptor.code_address = mapping_addresses[code_mapping];
             descriptor.code_pages = mapping_sizes[code_mapping]
                 / MYOS_DEPLOY_PAGE_SIZE;
             descriptor.stack_memory = stack_ref->selector;
-            descriptor.stack_page = 0;
+            descriptor.stack_page = mapping_first[stack_mapping_index];
             descriptor.stack_address = mapping_addresses[stack_mapping_index];
             descriptor.stack_pages = mapping_sizes[stack_mapping_index]
                 / MYOS_DEPLOY_PAGE_SIZE;
@@ -2587,6 +2628,7 @@ public:
                     return failure(MYOS_STATUS_INVALID_CAP);
                 }
                 descriptor.ipc.memory = ipc_ref->selector;
+                descriptor.ipc.page = mapping_first[ipc_mapping_index];
                 descriptor.ipc.address = mapping_addresses[ipc_mapping_index];
                 descriptor.ipc.pages = mapping_sizes[ipc_mapping_index]
                     / MYOS_DEPLOY_PAGE_SIZE;
@@ -2780,7 +2822,7 @@ public:
         SlotProjection service_source{};
         if (row->bootstraps.count != 0) {
             if (bootstrap_mapping == MYOS_DEPLOY_NO_INDEX
-                || row->bootstraps.count > MYOS_BOOTSTRAP_MAX_CAPS
+                || row->bootstraps.count > MYOS_DEPLOY_TASK_BOOTSTRAP_MAX
                 || row->executions.count != 1
                 || input.runtime_cpu_count == 0
                 || !workspace.bootstrap_memory.valid()) {
@@ -2808,11 +2850,12 @@ public:
             info.major = MYOS_BOOTSTRAP_MAJOR;
             info.minor = MYOS_BOOTSTRAP_MINOR;
             info.size = sizeof(info);
-            info.cap_count = row->bootstraps.count;
+
             info.cpu_count = input.runtime_cpu_count;
             info.stack_base = mapping_addresses[stack_mapping];
             info.stack_size = mapping_sizes[stack_mapping];
             info.boot_bundle_size = input.bundle->size();
+            if (input.arguments != nullptr) info.arguments = input.arguments->data();
 
             for (uint32_t bootstrap = 0;
                  bootstrap < row->bootstraps.count; ++bootstrap) {
@@ -2822,7 +2865,8 @@ public:
                     return failure(MYOS_STATUS_BAD_ARGS);
                 }
                 const myos_object_kind_t expected_kind =
-                    myos_bootstrap_object_kind(bootstrap_row->kind);
+                    bootstrap_row->kind == 0 ? bootstrap_row->object_kind
+                        : myos_bootstrap_object_kind(bootstrap_row->kind);
                 if (expected_kind == MYOS_OBJECT_KIND_INVALID) {
                     return failure(MYOS_STATUS_BAD_ARGS);
                 }
@@ -2948,10 +2992,28 @@ public:
                     || reference->cspace == 0) {
                     return failure(MYOS_STATUS_INVALID_CAP);
                 }
-                info.caps[bootstrap] = myos_bootstrap_cap{
-                    .kind = bootstrap_row->kind,
-                    .flags = 0,
-                    .handle = reference->selector};
+                if (bootstrap_row->kind != 0) {
+                    if (info.cap_count == MYOS_BOOTSTRAP_MAX_CAPS)
+                        return failure(MYOS_STATUS_BAD_ARGS);
+                    info.caps[info.cap_count++] = myos_bootstrap_cap{
+                        .kind = bootstrap_row->kind,
+                        .flags = 0,
+                        .handle = reference->selector};
+                } else {
+                    const ByteView name = task.symbol(bootstrap_row->name);
+                    if (info.import_count == MYOS_BOOTSTRAP_MAX_IMPORTS
+                        || name.size() == 0 || name.size() >= MYOS_BOOTSTRAP_IMPORT_NAME_MAX
+                        || bootstrap_row->protocol == 0 || bootstrap_row->major == 0)
+                        return failure(MYOS_STATUS_BAD_ARGS);
+                    auto& binding = info.imports[info.import_count++];
+                    for (size_t i = 0; i < name.size(); ++i)
+                        binding.name[i] = static_cast<char>(name[i]);
+                    binding.protocol = bootstrap_row->protocol;
+                    binding.major = bootstrap_row->major;
+                    binding.minor = bootstrap_row->minor;
+                    binding.object_kind = expected_kind;
+                    binding.handle = reference->selector;
+                }
             }
 
             myos_status_t status = materializer.write(
@@ -3069,6 +3131,7 @@ public:
                         return failure(MYOS_STATUS_INVALID_CAP);
                     }
                     descriptor.ipc.memory = ipc->selector;
+                    descriptor.ipc.page = mapping_first[ipc_mapping_index];
                     descriptor.ipc.address = mapping_addresses[
                         ipc_mapping_index];
                     descriptor.ipc.pages = mapping_sizes[ipc_mapping_index]
@@ -3129,11 +3192,11 @@ public:
                 descriptor.arguments[1] = mapping_sizes[
                     bootstrap_mapping_index];
                 descriptor.control_memory = control->selector;
-                descriptor.control_page = 0;
+                descriptor.control_page = mapping_first[control_mapping_index];
                 descriptor.control_address = mapping_addresses[
                     control_mapping_index];
                 descriptor.event_memory = event->selector;
-                descriptor.event_page = 0;
+                descriptor.event_page = mapping_first[event_mapping_index];
                 descriptor.event_address = mapping_addresses[
                     event_mapping_index];
                 status = materializer.materialize_descriptor(

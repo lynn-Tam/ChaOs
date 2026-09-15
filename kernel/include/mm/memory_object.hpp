@@ -30,7 +30,7 @@ struct ClaimKey;
 }
 
 namespace kernel::operation {
-class PageFault;
+class PageAccess;
 }
 
 namespace kernel::mm {
@@ -342,7 +342,8 @@ public:
     // backing lifetime.
     [[nodiscard]] auto initialize_pager(
         object::ObjectRef&& pager,
-        AccessMask access) noexcept
+        AccessMask access,
+        bool private_content = false) noexcept
         -> libk::Expected<void, MemoryError>;
 
     [[nodiscard]] auto size() const noexcept -> usize {
@@ -445,6 +446,10 @@ public:
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto evict_page(usize page_index) noexcept
         -> libk::Expected<void, MemoryError>;
+    // Initialize a private anonymous page without publishing a CPU mapping.
+    // A write is bounded to one page and excludes attachments and page loans.
+    [[nodiscard]] auto write(usize offset, libk::Span<const byte> input) noexcept
+        -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept
         -> libk::Expected<void, MemoryError>;
 
@@ -462,7 +467,8 @@ private:
     friend class MemoryExecutor;
     friend class PageReclaimer;
     friend class PagerBacking;
-    friend class kernel::operation::PageFault;
+    friend class kernel::operation::PageAccess;
+    friend class VSpace;
     /*luna change: let the fixed Vproc continuation settle the existing fault pin, reason: Vproc shares MemoryObject lifetime ownership without a second lease API*/
     friend class kernel::Vproc;
 
@@ -526,9 +532,6 @@ private:
         libk::Expected<MemoryWork, MemoryError> (*claim_mapping)(
             void* backing,
             PageMapping& mapping) noexcept;
-        libk::Expected<void, MemoryError> (*lease_acquire)(
-            void* backing,
-            usize page_index) noexcept;
         void (*lease_release)(void* backing, Page page) noexcept;
         libk::Expected<PageSlotState, MemoryError> (*page_state)(
             const void* backing,
@@ -574,7 +577,8 @@ private:
         OwnedPageGroup&& boot_pages,
         kernel::pager::Pager* pager,
         AccessMask pager_access,
-        object::ObjectRef&& pager_ref) noexcept
+        object::ObjectRef&& pager_ref,
+        bool private_content = false) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto materialize_impl(
         usize page_index,
@@ -583,8 +587,12 @@ private:
         void* owner,
         WaitRelation::Publish publish) noexcept
         -> libk::Expected<PageLease, MemoryError>;
-    /*luna change: settle the single fault pin only through its owner, reason: PageFault cancellation and terminal release must not become public lifetime APIs*/
+    /*luna change: settle the single fault pin only through its owner, reason: PageAccess cancellation and terminal release must not become public lifetime APIs*/
     void release_fault() noexcept;
+    // Retain the same fault when its backing is ready but installing the
+    // mapping needs a frame. No backing allocation reservation is transferred.
+    [[nodiscard]] auto wait_frame(WaitRelation& relation, usize frames,
+        void* owner, WaitRelation::Publish publish, FrameDemand& demand) noexcept -> bool;
     [[nodiscard]] auto release_pressure(
         WaitRelation& relation,
         u64 generation) noexcept -> bool;

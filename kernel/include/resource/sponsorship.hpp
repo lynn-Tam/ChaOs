@@ -20,7 +20,28 @@ class Sponsorship;
 class Permit;
 class Charge;
 
-using RefundNotifier = libk::delegate<void() noexcept>;
+// A refund happens after the sponsored object has been destroyed. Delivery
+// therefore owns a value, never a callback into that object's payload.
+class RefundNotifier final {
+public:
+    template<auto Method, typename Owner>
+    static auto bind(Owner& owner) noexcept -> RefundNotifier {
+        return {&owner, [](void* context, usize, u64, u64) noexcept {
+            (static_cast<Owner*>(context)->*Method)();
+        }, 0, 0, 0};
+    }
+    using Deliver = void (*)(void*, usize, u64, u64) noexcept;
+    RefundNotifier() noexcept = default;
+    RefundNotifier(void* context, Deliver deliver, usize slot, u64 generation, u64 badge) noexcept
+        : context_(context), deliver_(deliver), slot_(slot), generation_(generation), badge_(badge) {}
+    explicit operator bool() const noexcept { return deliver_ != nullptr; }
+    void operator()() const noexcept { deliver_(context_, slot_, generation_, badge_); }
+private:
+    void* context_{};
+    Deliver deliver_{};
+    usize slot_{};
+    u64 generation_{}, badge_{};
+};
 
 struct Budget final {
     u64 memory{};

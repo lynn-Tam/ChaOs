@@ -11,7 +11,7 @@
 #include <diag/concurrency.hpp>
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
-#include <operation/page_fault.hpp>
+#include <operation/page_access.hpp>
 #include <operation/wait.hpp>
 #include <sched/dispatcher.hpp>
 #include <syscall/syscall.hpp>
@@ -25,10 +25,10 @@ namespace kernel::trap {
 
 namespace {
 
-/*luna change: share initial and resumed Thread page-fault terminal handling, reason: one PageFault owns retry outcome while trap policy owns yield, unwind, and exit decisions*/
+/*luna change: share initial and resumed Thread page-fault terminal handling, reason: one PageAccess owns retry outcome while trap policy owns yield, unwind, and exit decisions*/
 void finish_thread_page_fault(
     Thread& thread,
-    operation::PageFault& page_fault,
+    operation::PageAccess& page_fault,
     arch::TrapContext& context,
     sched::CpuDispatcher& dispatcher) noexcept {
     KASSERT(page_fault.terminal());
@@ -183,12 +183,12 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 }
                 return;
             }
-            /*luna change: route Thread faults through the leaf PageFault continuation, reason: Pager Pending must block on one Wait/Completion instead of polling Yield while Vproc keeps its existing adapter*/
+            /*luna change: route Thread faults through the leaf PageAccess continuation, reason: Pager Pending must block on one Wait/Completion instead of polling Yield while Vproc keeps its existing adapter*/
             if (thread != nullptr) {
                 KASSERT(cpu.runtime().owner_registry != nullptr);
                 KASSERT(test::scenario::page_fault(
                     cpu.runtime(), mm::VirtAddr{event.fault_addr()}));
-                auto& page_fault = thread->current_wait().page_fault();
+                auto& page_fault = thread->current_wait().page_access();
                 const mm::FaultKind result = page_fault.start(
                     *execution->binding().vspace(),
                     *cpu.runtime().owner_registry,
@@ -202,9 +202,7 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                     KASSERT(thread->begin_wait(
                         page_fault.completion(),
                         *cpu.runtime().owner_registry));
-                    if (page_fault.completion().complete()) {
-                        page_fault.completion().signal();
-                    }
+                    page_fault.arm();
                     cpu.dispatcher()->request_reschedule(
                         sched::DispatchReason::Block);
                     return;
@@ -346,20 +344,24 @@ void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
     KASSERT(cpu.current_execution() == execution);
     wait = thread != nullptr ? &thread->current_wait() : nullptr;
     while (wait != nullptr && wait->attached()) {
-        if (wait->ready() && wait->finish(context)) {
-            break;
+        if (wait->ready()) {
+            // Finishing consumes one publication. A page-in may immediately
+            // rearm for another backing or frame dependency; only detachment
+            // permits this saved context to return to userspace.
+            static_cast<void>(wait->finish(context));
+            continue;
         }
         cpu.dispatcher()->block_current();
         KASSERT(cpu.current_execution() == execution);
         wait = thread != nullptr ? &thread->current_wait() : nullptr;
     }
-    /*luna change: consume a resumed terminal PageFault after serial Wait delivery, reason: Rearm remains attached while Done leaves the result for the shared trap policy*/
+    /*luna change: consume a resumed terminal PageAccess after serial Wait delivery, reason: Rearm remains attached while Done leaves the result for the shared trap policy*/
     if (thread != nullptr) {
         wait = &thread->current_wait();
-        if (wait->page_fault().terminal()) {
+        if (auto* access = wait->find_page_access(); access != nullptr && access->terminal()) {
             finish_thread_page_fault(
                 *thread,
-                wait->page_fault(),
+                *access,
                 context,
                 *cpu.dispatcher());
         }

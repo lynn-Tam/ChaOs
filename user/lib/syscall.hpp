@@ -149,12 +149,23 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_MEMORY_CREATE, pool, size, access);
 }
 
+// Data is snapshotted from the registered IPC buffer. The destination must
+// remain private, writable and anonymous; no mapping/TLB teardown is needed.
+[[nodiscard]] inline auto memory_populate(myos_cap_t memory, myos_word_t page) noexcept -> SysResult {
+    return syscall(MYOS_SYS_MEMORY_POPULATE, memory, page);
+}
+[[nodiscard]] inline auto memory_write(myos_cap_t memory, myos_word_t offset,
+    myos_word_t ipc_offset, myos_word_t size) noexcept -> SysResult {
+    return syscall(MYOS_SYS_MEMORY_WRITE, memory, offset, ipc_offset, size);
+}
+
 [[nodiscard]] inline auto memory_create_pager(
     myos_cap_t pool,
     myos_word_t size,
     myos_word_t access,
-    myos_cap_t pager) noexcept -> SysResult {
-    return syscall(MYOS_SYS_MEMORY_CREATE_PAGER, pool, size, access, pager);
+    myos_cap_t pager,
+    myos_word_t flags = 0) noexcept -> SysResult {
+    return syscall(MYOS_SYS_MEMORY_CREATE_PAGER, pool, size, access, pager, flags);
 }
 
 [[nodiscard]] inline auto pager_create(
@@ -330,6 +341,11 @@ inline void yield() noexcept {
     return syscall(MYOS_SYS_NOTIFICATION_CREATE, pool, badge);
 }
 
+[[nodiscard]] inline auto resource_close_async(myos_cap_t pool, myos_cap_t events,
+                                              myos_word_t badge) noexcept -> SysResult {
+    return syscall(MYOS_SYS_RESOURCE_CLOSE_ASYNC, pool, events, badge);
+}
+
 [[nodiscard]] inline auto notification_signal(
     myos_cap_t notification) noexcept -> SysResult {
     return syscall(MYOS_SYS_NOTIFICATION_SIGNAL, notification);
@@ -342,8 +358,8 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto notification_wait(
     myos_cap_t notification,
-    myos_word_t cookie = 0) noexcept -> SysResult {
-    return syscall(MYOS_SYS_NOTIFICATION_WAIT, notification, cookie);
+    myos_word_t deadline = 0) noexcept -> SysResult {
+    return syscall(MYOS_SYS_NOTIFICATION_WAIT, notification, deadline);
 }
 
 [[nodiscard]] inline auto notification_bind_vproc(
@@ -630,6 +646,17 @@ inline void yield() noexcept {
 [[nodiscard]] inline auto vm_destroy_region(myos_cap_t region) noexcept
     -> SysResult {
     return syscall(MYOS_SYS_VM_DESTROY_REGION, region);
+}
+
+[[nodiscard]] inline auto vm_sync(myos_cap_t vspace) noexcept -> SysResult {
+    return syscall(MYOS_SYS_VM_SYNC, vspace);
+}
+
+// Ordinary Thread callers may compose split-phase VM operations with a
+// completion barrier before reusing virtual addresses or mapping storage.
+[[nodiscard]] inline auto vm_complete(myos_cap_t vspace, SysResult result) noexcept -> SysResult {
+    if (result.status == MYOS_STATUS_PENDING) result.status = vm_sync(vspace).status;
+    return result;
 }
 
 [[noreturn]] inline void exit(

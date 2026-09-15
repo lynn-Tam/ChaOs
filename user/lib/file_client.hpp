@@ -1,18 +1,23 @@
 #pragma once
 
+#include <user/lib/imports.hpp>
+
 #include <user/lib/file_protocol.hpp>
 
 namespace myos::files {
 
 struct File final { uint64_t handle{}, size{}; };
+struct FileMemory final { cap::OwnedCap memory{}; uint64_t size{}, identity{}; };
 
 class Client final : private libk::noncopyable_nonmovable {
 public:
-    [[nodiscard]] auto connect(const bootstrap::BootstrapView& info, uintptr_t address = 0x70000000) noexcept
+    [[nodiscard]] auto connect(const bootstrap::BootstrapView& info, uintptr_t address = 0x70000000, myos_cap_t events = 0) noexcept
         -> myos_status_t {
-        events_ = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
+        events_ = events != 0 ? events : service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
         uint64_t value{};
-        return session_.open(service::capability(info, MYOS_BOOTSTRAP_CAP_FILE_CHANNEL), events_,
+        return session_.connect(service::capability(info, myos::bootstrap::imports::Files),
+            service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
+            service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), events_,
             service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE), address, value);
     }
     [[nodiscard]] auto list(io::ControlMessage& message) noexcept -> myos_status_t {
@@ -33,6 +38,22 @@ public:
     [[nodiscard]] auto close(File file) noexcept -> myos_status_t {
         io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Close), .value = file.handle};
         return session_.exchange(message);
+    }
+    [[nodiscard]] auto close() noexcept -> myos_status_t { return session_.close(); }
+
+    [[nodiscard]] auto backing(File file, myos_word_t access = MYOS_VM_READ) noexcept
+        -> libk::Expected<FileMemory, myos_status_t> {
+        if (access != MYOS_VM_READ && access != (MYOS_VM_READ | MYOS_VM_EXECUTE))
+            return libk::unexpected(MYOS_STATUS_BAD_ARGS);
+        io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Map),
+            .value = file.handle, .size = 1};
+        message.data[0] = access;
+        io::ControlPacket packet;
+        const auto status = session_.exchange(message, packet);
+        if (status != MYOS_STATUS_OK) return libk::unexpected(status);
+        if (packet.count != 1 || message.size != 8 || message.value == 0
+            || file_size(message) != file.size) return libk::unexpected(MYOS_STATUS_PEER_FAULT);
+        return libk::expected(FileMemory{libk::move(packet.capabilities[0]), file.size, message.value});
     }
 
     // Bounded pipelining with ordered consumption, suitable for console output

@@ -720,8 +720,10 @@ public:
         Pmm& pmm,
         kernel::pager::Pager& pager,
         AccessMask access,
+        bool private_content,
         kernel::resource::Sponsorship* sponsor) noexcept
         : owner_(&owner), pmm_(&pmm), pager_(&pager), access_(access),
+          private_content_(private_content),
           sponsor_(sponsor) {
         static_assert(slots_per_page != 0);
         attachment_ = kernel::pager::PagerAttachment{
@@ -1083,6 +1085,10 @@ public:
                 switch (node->slot.state) {
                 case PageSlotState::ResidentClean:
                 case PageSlotState::ResidentDirty: {
+                    if (private_content_ && node->slot.state == PageSlotState::ResidentDirty) {
+                        node = next;
+                        continue;
+                    }
                     auto retained = node->slot.retain_reclaim();
                     if (!retained) {
                         node = next;
@@ -1181,6 +1187,10 @@ public:
                 }
                 if (node->slot.state == PageSlotState::ResidentClean
                     || node->slot.state == PageSlotState::ResidentDirty) {
+                    // Capture the frame and its lease in the same critical
+                    // section. Reclaim cannot replace it between lookup and pin.
+                    KASSERT(node->leases != libk::numeric_limits<usize>::max());
+                    ++node->leases;
                     return libk::expected(MemoryPage{
                         .page = node->resident.page(),
                         .access = access_,
@@ -1500,37 +1510,17 @@ public:
         return libk::expected(libk::move(work));
     }
 
-    [[nodiscard]] auto lease_acquire(usize page_index) noexcept
-        -> libk::Expected<void, MemoryError> {
-        kernel::sync::IrqLockGuard guard{tree_lock_};
-        Node* const node = find_locked(page_index);
-        if (node == nullptr) {
-            return libk::unexpected(MemoryError::NotBacked);
-        }
-        if (node->slot.state != PageSlotState::ResidentClean
-            && node->slot.state != PageSlotState::ResidentDirty) {
-            return libk::unexpected(
-                node->slot.state == PageSlotState::Failed
-                    ? MemoryError::BackingFailed
-                    : MemoryError::Pending);
-        }
-        KASSERT(node->leases != libk::numeric_limits<usize>::max());
-        ++node->leases;
-        return libk::expected();
-    }
-
     void lease_release(Page page) noexcept {
         kernel::sync::IrqLockGuard guard{tree_lock_};
-        Node* node{};
-        for (Node* candidate = nodes_; candidate != nullptr;
-             candidate = candidate->next) {
-            if (candidate->resident.page() == page) {
-                node = candidate;
-                break;
+        for (Node* node = nodes_; node != nullptr; node = node->next) {
+            // Missing and failed entries retain their metadata without a frame.
+            if (node->resident && node->resident.page() == page) {
+                KASSERT(node->leases != 0);
+                --node->leases;
+                return;
             }
         }
-        KASSERT(node != nullptr && node->leases != 0);
-        --node->leases;
+        KASSERT(false);
     }
 
     [[nodiscard]] auto page_state(usize page_index) const noexcept
@@ -1596,6 +1586,7 @@ public:
 
     [[nodiscard]] auto queue_writeback(usize page_index) noexcept
         -> libk::Expected<WritebackKey, MemoryError> {
+        if (private_content_) return libk::unexpected(MemoryError::InvalidState);
         kernel::sync::IrqLockGuard guard{tree_lock_};
         Node* const node = find_locked(page_index);
         if (node == nullptr) {
@@ -2037,6 +2028,7 @@ private:
     Pmm* pmm_{};
     kernel::pager::Pager* pager_{};
     AccessMask access_{};
+    bool private_content_{};
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::BackingTree>
         tree_lock_{};
     kernel::sync::SpinLock<kernel::sync::LockClass::BackingStorage>
@@ -2452,7 +2444,8 @@ auto MemoryObject::initialize_boot_image(
 
 auto MemoryObject::initialize_pager(
     object::ObjectRef&& pager,
-    AccessMask access) noexcept
+    AccessMask access,
+    bool private_content) noexcept
     -> libk::Expected<void, MemoryError> {
     auto pinned = pager.pin<kernel::pager::Pager>();
     if (!pinned) {
@@ -2466,7 +2459,7 @@ auto MemoryObject::initialize_pager(
         {},
         &pinned.value().get(),
         access,
-        libk::move(pager));
+        libk::move(pager), private_content);
 }
 
 auto MemoryObject::initialize_backing(
@@ -2477,7 +2470,8 @@ auto MemoryObject::initialize_backing(
     OwnedPageGroup&& boot_pages,
     kernel::pager::Pager* pager,
     AccessMask pager_access,
-    object::ObjectRef&& pager_ref) noexcept
+    object::ObjectRef&& pager_ref,
+    bool private_content) noexcept
     -> libk::Expected<void, MemoryError> {
     if (state_ != MemoryState::Building || logical_pages_ == 0) {
         fail_build();
@@ -2551,7 +2545,6 @@ auto MemoryObject::initialize_backing(
         .unbind_mapping = nullptr,
         .unbind_claimed_mapping = nullptr,
         .claim_mapping = nullptr,
-        .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
@@ -2594,7 +2587,6 @@ auto MemoryObject::initialize_backing(
         .unbind_mapping = nullptr,
         .unbind_claimed_mapping = nullptr,
         .claim_mapping = nullptr,
-        .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
@@ -2637,7 +2629,6 @@ auto MemoryObject::initialize_backing(
         .unbind_mapping = nullptr,
         .unbind_claimed_mapping = nullptr,
         .claim_mapping = nullptr,
-        .lease_acquire = nullptr,
         .lease_release = nullptr,
         .page_state = nullptr,
         .observe_usage = nullptr,
@@ -2710,9 +2701,6 @@ auto MemoryObject::initialize_backing(
         },
         .claim_mapping = [](void* backing, PageMapping& mapping) noexcept {
             return static_cast<PagerBacking*>(backing)->claim_mapping(mapping);
-        },
-        .lease_acquire = [](void* backing, usize index) noexcept {
-            return static_cast<PagerBacking*>(backing)->lease_acquire(index);
         },
         .lease_release = [](void* backing, Page page) noexcept {
             static_cast<PagerBacking*>(backing)->lease_release(page);
@@ -2791,7 +2779,7 @@ auto MemoryObject::initialize_backing(
         ++operations_;
         auto* const backing = libk::construct_at(
             static_cast<PagerBacking*>(backend),
-            *this, *pmm_, *pager, pager_access, sponsor_);
+            *this, *pmm_, *pager, pager_access, private_content, sponsor_);
         ops = &pager_ops;
         backend = backing;
         initialized = backing->init();
@@ -2960,16 +2948,12 @@ auto MemoryObject::materialize_impl(
         backing = backing_;
     }
 
-    /*luna change: sample frame progress before backing allocation,
-      reason: a frame returned after Pressure must remain observable to the relation*/
-    const u64 progress = pmm_->frame_progress_generation();
     auto result = ops->materialize(
         backing, page_index, demand, relation, owner, publish);
     const bool pressure = relation != nullptr && demand != nullptr
         && !result && result.error() == MemoryError::Pressure && *demand;
     if (pressure && !reclaimer_.retain(
             *relation,
-            progress,
             owner,
             publish)) {
         /*luna change: settle an unadmitted pressure pin at its owner,
@@ -2993,7 +2977,7 @@ auto MemoryObject::materialize_impl(
     {
         kernel::sync::IrqLockGuard guard{lock_};
         live = state_ == MemoryState::Live;
-        if ((!result && !retained) || (live == false && !retained)) {
+        if (!result && !retained) {
             KASSERT(operations_ != 0);
             --operations_;
         }
@@ -3004,24 +2988,16 @@ auto MemoryObject::materialize_impl(
         return libk::unexpected(
             pressure ? MemoryError::Pressure : MemoryError::Pending);
     }
-    if (!result || !live) {
+    if (!result) {
         finish_retire();
-        if (!live) {
-            return libk::unexpected(MemoryError::InvalidState);
-        }
-        return libk::unexpected(result.error());
+        return libk::unexpected(live ? result.error() : MemoryError::InvalidState);
     }
-    if (ops->lease_acquire != nullptr) {
-        auto acquired = ops->lease_acquire(backing, page_index);
-        if (!acquired) {
-            {
-                kernel::sync::IrqLockGuard guard{lock_};
-                KASSERT(operations_ != 0);
-                --operations_;
-            }
-            finish_retire();
-            return libk::unexpected(acquired.error());
-        }
+    if (!live) {
+        // Even a retiring object must release the backing lease before its
+        // operation pin, which is the last protection of backing storage.
+        if (ops->lease_release != nullptr) ops->lease_release(backing, result.value().page);
+        drop_page();
+        return libk::unexpected(MemoryError::InvalidState);
     }
     return libk::expected(PageLease{*this, result.value()});
 }
@@ -3032,11 +3008,11 @@ auto MemoryObject::begin_transfer(usize page_index) noexcept
     void* backing{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (state_ != MemoryState::Live || !attachments_.empty()
+        if (state_ != MemoryState::Live || !attachments_.empty() || operations_ != 0
             || page_index >= logical_pages_ || backing_ops_ == nullptr
             || backing_ops_->begin_transfer == nullptr) {
             return libk::unexpected(
-                !attachments_.empty() ? MemoryError::Busy
+                (!attachments_.empty() || operations_ != 0) ? MemoryError::Busy
                                        : MemoryError::InvalidState);
         }
         KASSERT(operations_ != libk::numeric_limits<usize>::max());
@@ -3662,6 +3638,35 @@ auto MemoryObject::evict_page(usize page_index) noexcept
     return result;
 }
 
+auto MemoryObject::write(usize offset, libk::Span<const byte> input) noexcept
+    -> libk::Expected<void, MemoryError> {
+    const usize within = offset & (page_size - 1);
+    if (input.empty() || input.size() > page_size - within
+        || offset >= size() || input.size() > size() - offset)
+        return libk::unexpected(MemoryError::InvalidRange);
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != MemoryState::Live || backing_ops_->kind != BackingKind::Anonymous
+            || seal_ != SealState::Loadable || !access_.contains(Access::Write))
+            return libk::unexpected(MemoryError::InvalidAccess);
+        if (!attachments_.empty() || operations_ != 0)
+            return libk::unexpected(MemoryError::Busy);
+    }
+    auto lease = materialize(offset / page_size);
+    if (!lease) return libk::unexpected(lease.error());
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        // Allocation happened without the lock. Recheck publication and
+        // sealing before the bounded copy; our lease is the sole operation.
+        if (state_ != MemoryState::Live || seal_ != SealState::Loadable)
+            return libk::unexpected(MemoryError::InvalidAccess);
+        if (!attachments_.empty() || operations_ != 1)
+            return libk::unexpected(MemoryError::Busy);
+        memcpy(pmm_->bytes(lease.value().page().page) + within, input.data(), input.size());
+    }
+    return libk::expected();
+}
+
 auto MemoryObject::read(usize offset, libk::Span<byte> output) noexcept
     -> libk::Expected<void, MemoryError> {
     const auto end = libk::checked_add(offset, output.size());
@@ -3865,6 +3870,21 @@ void MemoryObject::drop_page() noexcept {
 }
 
 /*luna change: settle the retained fault pin through the MemoryObject owner, reason: one operation count must cover foreign Pager detach and terminal release*/
+auto MemoryObject::wait_frame(WaitRelation& relation, usize frames,
+    void* owner, WaitRelation::Publish publish, FrameDemand& demand) noexcept -> bool {
+    KASSERT(!demand && !relation.attached());
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (state_ != MemoryState::Live) return false;
+        ++operations_;
+    }
+    demand.emplace(kernel::resource::Reservation{});
+    if (reclaimer_.retain(relation, owner, publish, frames)) return true;
+    demand.reset();
+    drop_page();
+    return false;
+}
+
 void MemoryObject::release_fault() noexcept {
     drop_page();
 }

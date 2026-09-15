@@ -1,3 +1,4 @@
+#include <user/lib/imports.hpp>
 #include <user/lib/io_session.hpp>
 
 namespace {
@@ -22,7 +23,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     using namespace myos;
     const auto info = service::bootstrap(address, size);
     events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
-    service::require(control.open(service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL), events));
+    service::require(control.open(service::capability(info, myos::bootstrap::imports::Block), events));
     const myos_cap_transfer event{events, MYOS_RIGHT_SIGNAL, MYOS_CAP_COPY, 0};
     service::require(control.send({.operation = static_cast<uint64_t>(io::Control::Open),
         .id = 1, .value = io::QueueDepth}, &event, 1));

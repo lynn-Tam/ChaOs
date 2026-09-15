@@ -86,7 +86,6 @@ private:
     void release() noexcept;
     [[nodiscard]] auto cancel() noexcept -> bool;
 
-    kernel::cap::GrantGraph* graph_{};
     kernel::sync::Completion completion_;
     kernel::operation::Completion relation_;
     bool committed_{};

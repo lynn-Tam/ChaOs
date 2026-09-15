@@ -22,6 +22,7 @@ enum class Phase : uint8_t {
     Open,
     Draining,
     ResourceClosing,
+    ResourceWaiting,
     ResourceClosed,
 };
 
@@ -147,6 +148,7 @@ public:
           caps_(libk::move(other.caps_)),
           local_kinds_(libk::move(other.local_kinds_)),
           phase_(other.phase_),
+          close_events_(other.close_events_), close_badge_(other.close_badge_),
           initialized_(other.initialized_),
           vspace_slot_(other.vspace_slot_),
           manager_slot_(other.manager_slot_) {
@@ -167,6 +169,8 @@ public:
         caps_ = libk::move(other.caps_);
         local_kinds_ = libk::move(other.local_kinds_);
         phase_ = other.phase_;
+        close_events_ = other.close_events_;
+        close_badge_ = other.close_badge_;
         initialized_ = other.initialized_;
         vspace_slot_ = other.vspace_slot_;
         manager_slot_ = other.manager_slot_;
@@ -276,6 +280,14 @@ public:
             if (!pool_) {
                 phase_ = Phase::ResourceClosed;
             } else {
+                if constexpr (requires { B::resource_close_async(pool_.reference(), close_events_, close_badge_); }) {
+                    if (close_events_) {
+                        const auto status = B::resource_close_async(pool_.reference(), close_events_, close_badge_);
+                        if (status != MYOS_STATUS_OK) return status;
+                        phase_ = Phase::ResourceWaiting;
+                        return MYOS_STATUS_BUSY;
+                    }
+                }
                 const myos_status_t status = B::resource_close(
                     pool_.reference());
                 if (status != MYOS_STATUS_OK) {
@@ -284,6 +296,7 @@ public:
                 phase_ = Phase::ResourceClosed;
             }
         }
+        if (phase_ == Phase::ResourceWaiting) return MYOS_STATUS_BUSY;
         if (phase_ == Phase::ResourceClosed) {
             const myos_status_t status = pool_.close();
             if (status != MYOS_STATUS_OK) {
@@ -304,6 +317,16 @@ public:
             return libk::nullopt;
         }
         return pool_.reference();
+    }
+
+    void close_events(cap::CapRef events, myos_word_t badge) noexcept {
+        if (phase_ != Phase::Open || !events || badge == 0) B::ownership_fault(MYOS_STATUS_BAD_ARGS);
+        close_events_ = events;
+        close_badge_ = badge;
+    }
+    void observe_close(myos_word_t badges) noexcept {
+        if (phase_ == Phase::ResourceWaiting && (badges & close_badge_) != 0)
+            phase_ = Phase::ResourceClosed;
     }
 
     [[nodiscard]] constexpr auto vspace_slot() const noexcept -> LocalSlot {
@@ -446,6 +469,8 @@ private:
     caps_type caps_{};
     libk::InplaceVector<myos_object_kind_t, LocalCapacity> local_kinds_{};
     Phase phase_{Phase::Closed};
+    cap::CapRef close_events_{};
+    myos_word_t close_badge_{};
     bool initialized_{};
     LocalSlot vspace_slot_{};
     LocalSlot manager_slot_{};

@@ -5,7 +5,9 @@
 #include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
 #include <operation/completion.hpp>
-#include <operation/page_fault.hpp>
+#include <operation/page_access.hpp>
+#include <operation/vm_wait.hpp>
+#include <resource/allocation.hpp>
 
 namespace arch {
 class TrapContext;
@@ -35,14 +37,13 @@ public:
     [[nodiscard]] auto ready() const noexcept -> bool;
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey;
-    // PageFault owns its relation and Completion; Wait only exposes the
-    // continuation object that can be attached to this blocking edge.
-    [[nodiscard]] auto page_fault() noexcept -> PageFault& {
-        return page_fault_;
-    }
-    [[nodiscard]] auto page_fault() const noexcept -> const PageFault& {
-        return page_fault_;
-    }
+    // Mutually exclusive syscall continuations share resident storage. A
+    // release operation must not allocate the memory needed to wait for it.
+    [[nodiscard]] auto page_access() noexcept -> PageAccess&;
+    [[nodiscard]] auto find_page_access() noexcept -> PageAccess*;
+    [[nodiscard]] auto prepare_revoke(cap::GrantGraph& graph) noexcept -> cap::GrantRevokeWait*;
+    [[nodiscard]] auto prepare_close(cap::GrantGraph& graph) noexcept -> resource::CloseWait*;
+    [[nodiscard]] auto prepare_vm(object::ObjectRef&& target, mm::VSpace& space) noexcept -> VmWait*;
     [[nodiscard]] auto begin(
         Completion& completion,
         CpuRegistry& cpus,
@@ -69,7 +70,17 @@ private:
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Wait> lock_{};
     libk::Atomic<bool> ready_{};
     EdgePhase phase_{EdgePhase::Detached};
-    PageFault page_fault_{};
+    enum class LocalKind : u8 { None, Page, Revoke, Close, Vm };
+    LocalKind local_kind_{LocalKind::Page};
+    union Local {
+        PageAccess page;
+        cap::GrantRevokeWait revoke;
+        resource::CloseWait close;
+        VmWait vm;
+        Local() noexcept : page{} {}
+        ~Local() noexcept {}
+    } local_;
+    void reset_local() noexcept;
 };
 
 } // namespace operation

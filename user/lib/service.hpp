@@ -59,7 +59,8 @@ inline auto bootstrap(const void* address, myos_word_t size) noexcept -> bootstr
     if (!result || result->cpu_count() == 0) myos::exit(MYOS_STATUS_BAD_ARGS);
     return *result;
 }
-inline auto capability(const bootstrap::BootstrapView& info, uint32_t role) noexcept -> myos_cap_t {
+template<class Binding>
+inline auto capability(const bootstrap::BootstrapView& info, Binding role) noexcept -> myos_cap_t {
     auto cap = info.selector(role);
     if (cap == 0) myos::exit(MYOS_STATUS_INVALID_CAP);
     return cap;
@@ -75,6 +76,8 @@ class Connection final {
     myos_cap_t events_;
     myos_word_t readable_;
     uint64_t sequence_{};
+    myos_word_t writable_{};
+    uint64_t write_sequence_{};
 public:
     Connection(myos_cap_t channel, myos_cap_t events) noexcept
         : channel_(channel), events_(events) {
@@ -88,15 +91,34 @@ public:
     auto send(const Message& message) const noexcept -> SysResult {
         return service::send(channel_, message);
     }
+    auto enable_writable() noexcept -> myos_status_t {
+        const auto binding = channel_bind(channel_, events_, MYOS_CHANNEL_WRITABLE);
+        if (binding.status == MYOS_STATUS_OK) writable_ = binding.value;
+        return binding.status;
+    }
+    auto try_send(const Message& message) noexcept -> SysResult {
+        const auto result = service::send(channel_, message, false);
+        if (result.status == MYOS_STATUS_OK || result.status == MYOS_STATUS_WOULD_BLOCK)
+            write_sequence_ = result.value;
+        return result;
+    }
+    auto arm_writable() noexcept -> SysResult {
+        return channel_arm(channel_, writable_, write_sequence_);
+    }
+    auto try_receive(Message& message) noexcept -> SysResult {
+        const auto result = service::receive(channel_, message, false);
+        if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
+        return result;
+    }
+    auto arm() noexcept -> SysResult { return channel_arm(channel_, readable_, sequence_); }
     auto receive(Message& message) noexcept -> SysResult {
         for (;;) {
-            const auto result = service::receive(channel_, message, false);
+            const auto result = try_receive(message);
             if (result.status == MYOS_STATUS_OK) {
-                sequence_ = result.value;
                 return result;
             }
             if (result.status != MYOS_STATUS_WOULD_BLOCK) return result;
-            const auto armed = channel_arm(channel_, readable_, sequence_);
+            const auto armed = arm();
             if (armed.status != MYOS_STATUS_OK) return armed;
             const auto wake = notification_wait(events_);
             if (wake.status != MYOS_STATUS_OK) return wake;

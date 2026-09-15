@@ -621,6 +621,38 @@ bool test_reverse_attachment_drives_destroy_invalidation(
         && fixture.pmm().free_page_count() == free_before;
 }
 
+bool test_private_memory_initialization(const TestContext&) noexcept {
+    MemoryFixture fixture{};
+    if (!fixture.initialize()) return false;
+    auto& memory = fixture.make(2 * kernel::mm::page_size);
+    using namespace kernel::mm;
+    if (!memory.initialize_anonymous(AnonymousConfig{
+        .access = AccessMask::of(Access::Read, Access::Write, Access::Execute)})) return false;
+    const byte data[]{byte{0x31}, byte{0x72}};
+    if (!memory.write(17, {data, sizeof(data)})) return false;
+    byte output[20]{};
+    if (!memory.read(0, {output, sizeof(output)}) || output[16] != byte{}
+        || output[17] != data[0] || output[18] != data[1] || output[19] != byte{}) return false;
+    if (memory.write(page_size - 1, {data, sizeof(data)})) return false;
+    {
+        auto loan = memory.materialize(0);
+        if (!loan || memory.write(0, {data, sizeof(data)}) || memory.begin_transfer(0)) return false;
+    }
+    FakeMapping reader{};
+    if (!memory.attach(reader.attachment, AccessMask::of(Access::Read))) return false;
+    const auto while_mapped = memory.write(0, {data, sizeof(data)});
+    if (while_mapped || while_mapped.error() != MemoryError::Busy
+        || !reader.attachment.detach()) return false;
+    {
+        auto transfer = memory.begin_transfer(0);
+        if (!transfer || fixture.pmm().bytes(transfer.value().page())[17] != data[0]) return false;
+        transfer.value().abort();
+    }
+    if (!memory.seal()) return false;
+    const auto sealed = memory.write(0, {data, sizeof(data)});
+    return !sealed && sealed.error() == MemoryError::InvalidAccess;
+}
+
 bool test_executable_seal_closes_writable_attachments(
     const TestContext&) noexcept {
     MemoryFixture fixture{};
@@ -1097,6 +1129,31 @@ bool test_pager_force_close_publishes_backing_failure(
     return memory.state() == kernel::mm::MemoryState::Retired;
 }
 
+bool test_pager_lease_with_missing_sibling(const TestContext&) noexcept {
+    using namespace kernel::mm;
+    MemoryFixture fixture{};
+    if (!fixture.initialize() || !fixture.make_pager()) return false;
+    auto& memory = fixture.make(2 * page_size);
+    auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
+    auto reference = fixture.pager_ref();
+    if (!reference || !memory.initialize_pager(libk::move(reference).value(), AccessMask::of(Access::Read))
+        || memory.materialize(0).error() != MemoryError::Pending) return false;
+    (void)memory_test_memory_work->run(1);
+    auto& pager = fixture.pager();
+    const auto request = pager.try_claim();
+    auto page = fixture.pmm().allocate_page();
+    if (!request || !page || !memory.pager_supply(pager, 0, request.value().page_key,
+        request.value().claim, libk::move(page).value(), 1)) return false;
+    auto first = memory.materialize(0);
+    auto second = memory.materialize(0);
+    if (!first || !second || first.value().page().page != second.value().page().page
+        || memory.materialize(1).error() != MemoryError::Pending) return false;
+    first.value().reset();
+    if (memory.evict_page(0).error() != MemoryError::Busy) return false;
+    second.value().reset();
+    return static_cast<bool>(memory.evict_page(0));
+}
+
 bool test_pager_reverse_mapping_usage_and_eviction(
     const TestContext&) noexcept {
     MemoryFixture fixture{};
@@ -1223,6 +1280,39 @@ bool test_pager_reverse_mapping_usage_and_eviction(
     return memory.state() == kernel::mm::MemoryState::Retired;
 }
 
+bool test_private_pager_preserves_dirty_content(const TestContext&) noexcept {
+    using namespace kernel::mm;
+    MemoryFixture fixture{};
+    if (!fixture.initialize() || !fixture.make_pager()) return false;
+    auto& memory = fixture.make(2 * page_size);
+    auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
+    auto reference = fixture.pager_ref();
+    if (!reference || !memory.initialize_pager(libk::move(reference).value(),
+        AccessMask::of(Access::Read, Access::Write), true)) return false;
+    auto& pager = fixture.pager();
+    for (usize index = 0; index < 2; ++index) {
+        if (memory.materialize(index).error() != MemoryError::Pending) return false;
+        (void)memory_test_memory_work->run(1);
+        const auto request = pager.try_claim();
+        auto page = fixture.pmm().allocate_page();
+        if (!request || !page) return false;
+        page.value().bytes()[0] = byte{0x5a};
+        if (!memory.pager_supply(pager, index, request.value().page_key, request.value().claim,
+            libk::move(page).value(), 1)) return false;
+    }
+    if (!memory.observe_usage(0, false, true)
+        || memory.queue_writeback(0).error() != MemoryError::InvalidState) return false;
+    WaitRelation pressure;
+    auto& reclaimer = *memory_test_reclaimer;
+    if (!reclaimer.retain(pressure, nullptr, [](void*, PageWaitResult) noexcept {})) return false;
+    auto release = libk::on_scope_exit([&]() noexcept { (void)reclaimer.release(pressure, pressure.generation); });
+    for (usize pass = 0; pass < 8; ++pass) (void)reclaimer.service(8);
+    if (memory.page_state(1).value() != PageSlotState::Missing
+        || memory.page_state(0).value() != PageSlotState::ResidentDirty || pager.pending() != 0) return false;
+    byte contents[1]{};
+    return memory.read(0, {contents, 1}) && contents[0] == byte{0x5a};
+}
+
 bool test_pager_forced_close_settles_backing_obligations(
     const TestContext&) noexcept {
     MemoryFixture fixture{};
@@ -1321,6 +1411,8 @@ bool test_pager_forced_close_settles_backing_obligations(
 } // namespace
 
 void register_memory_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("memory", "private page initialization excludes loans, mappings and sealed content",
+        test_private_memory_initialization);
     (void)registry.add("memory", "I/O root maps only its range and refunds tables",
         test_io_root_isolated_range_and_refund);
     (void)registry.add(
@@ -1379,6 +1471,12 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         "memory",
         "pager backing tracks mappings, usage, writeback, and eviction",
         test_pager_reverse_mapping_usage_and_eviction);
+    (void)registry.add("memory", "private pager evicts clean pages and preserves dirty bytes",
+        test_private_pager_preserves_dirty_content);
+    (void)registry.add(
+        "memory",
+        "pager leases survive missing siblings and prevent frame replacement",
+        test_pager_lease_with_missing_sibling);
     (void)registry.add(
         "memory",
         "forced pager close settles active writeback and pending page-in",

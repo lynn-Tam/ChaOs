@@ -1,3 +1,4 @@
+#include <user/lib/imports.hpp>
 #include <user/lib/service.hpp>
 #include <user/lib/uart.hpp>
 
@@ -8,8 +9,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto device = service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
     const auto irq = service::capability(info, MYOS_BOOTSTRAP_CAP_IRQ);
     const auto events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
-    const auto output = service::capability(info, MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT);
-    const auto input = service::capability(info, MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT);
+    const auto output = service::capability(info, myos::bootstrap::imports::ConsoleOutput);
+    const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
     constexpr uintptr_t base = 0x30010000;
     auto region = vm_create_region(vspace, base, 4096, MYOS_VM_READ | MYOS_VM_WRITE,
                                    MYOS_VM_DEVICE, MYOS_RIGHT_MAP);

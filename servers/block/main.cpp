@@ -1,3 +1,4 @@
+#include <user/lib/imports.hpp>
 #include <servers/block/device.hpp>
 #include <user/lib/io_session.hpp>
 
@@ -25,15 +26,15 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto cspace = service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE);
     const auto events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
     service::require(device.open(pool, vspace, service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE), events));
-    service::require(session.open(service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL),
+    service::require(session.open(service::capability(info, myos::bootstrap::imports::Block),
         events, pool, vspace, cspace, 0x70000000, device.capacity()));
     bool hardware_closed{};
 
     for (;;) {
         // Complete the interrupt handshake before the final ring drain.
         if (!hardware_closed) service::require(device.acknowledge());
-        service::require(session.poll([](const io::ControlMessage&, io::ControlMessage& reply) {
-            reply.status = MYOS_STATUS_INVALID_OP;
+        service::require(session.poll([](const io::ControlMessage&, io::ControlReply& reply) {
+            reply.message.status = MYOS_STATUS_INVALID_OP;
         }));
         auto* queue = session.queue();
 

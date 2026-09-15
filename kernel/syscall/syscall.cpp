@@ -62,13 +62,13 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
         && operation <= MYOS_SYS_CAP_TYPED_DELEGATE) {
         outcome = handle_capability(operation, invocation);
     } else if (operation >= MYOS_SYS_VM_MAP
-        && operation <= MYOS_SYS_VM_DESTROY_REGION) {
+        && operation <= MYOS_SYS_VM_SYNC) {
         outcome = handle_vm(operation, invocation);
     } else if (operation >= MYOS_SYS_RESOURCE_CREATE_CHILD
         && operation <= MYOS_SYS_IO_SPACE_CREATE) {
         outcome = handle_construction(operation, invocation);
     } else if (operation >= MYOS_SYS_MEMORY_SEAL
-        && operation <= MYOS_SYS_RESOURCE_CLOSE) {
+        && operation <= MYOS_SYS_RESOURCE_CLOSE_ASYNC) {
         outcome = handle_object(operation, invocation);
     } else if (operation >= MYOS_SYS_NOTIFICATION_SIGNAL
         && operation <= MYOS_SYS_NOTIFICATION_UNBIND_VPROC) {

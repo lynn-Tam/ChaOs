@@ -2,7 +2,7 @@
 #include <user/lib/supervisor.hpp>
 #include <user/lib/uart.hpp>
 
-namespace { myos::deploy::Supervisor<2> supervisor; }
+namespace { myos::deploy::Program program; myos::deploy::Supervisor<2> supervisor; }
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
@@ -13,7 +13,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping.value().address};
     port.reset();
-    service::require(supervisor.open(info));
+    service::require(supervisor.load(program, info));
+    supervisor.open(info);
     service::require(supervisor.add_boot_sources(info));
     service::require(supervisor.add("block.device", service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE),
         MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONNECT));
@@ -25,13 +26,13 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.add("block.client", pair.value, MYOS_OBJECT_KIND_CHANNEL, rights, 0));
     service::require(supervisor.add("block.server", pair.value2, MYOS_OBJECT_KIND_CHANNEL, rights, 1));
     myos_status_t status{};
-    auto server = supervisor.launch("block", status);
+    auto server = supervisor.launch(program, "block", status);
     if (!server) {
         uart::Printer printer{uart::Writer{port}};
         (void)printer.print<"[io-session] server launch failed status={}\n">(status);
         exit(status);
     }
-    auto client = supervisor.launch("io-client", status);
+    auto client = supervisor.launch(program, "io-client", status);
     if (!client) {
         uart::Printer printer{uart::Writer{port}};
         (void)printer.print<"[io-session] client launch failed status={}\n">(status);

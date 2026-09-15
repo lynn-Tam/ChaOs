@@ -1,3 +1,4 @@
+#include <user/lib/imports.hpp>
 #include <user/lib/bootstrap.hpp>
 #include <user/lib/syscall.hpp>
 #include <uapi/bootstrap.h>
@@ -28,16 +29,16 @@ constexpr myos_word_t ServiceBadge = 1;
 }
 
 [[noreturn]] void run(const myos::bootstrap::BootstrapView& info) noexcept {
-    const myos_cap_t pager = info.selector(MYOS_BOOTSTRAP_CAP_PAGER);
-    const myos_cap_t target = info.selector(MYOS_BOOTSTRAP_CAP_TARGET_MEMORY);
+    const myos_cap_t pager = info.selector(myos::bootstrap::imports::Pager);
+    const myos_cap_t target = info.selector(myos::bootstrap::imports::TargetMemory);
     const myos_cap_t staging =
-        info.selector(MYOS_BOOTSTRAP_CAP_STAGING_MEMORY);
+        info.selector(myos::bootstrap::imports::StagingMemory);
     const myos_cap_t service =
         info.selector(MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
     const myos_cap_t readiness =
         info.selector(MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION);
     const myos_cap_t staging_region =
-        info.selector(MYOS_BOOTSTRAP_CAP_STAGING_REGION);
+        info.selector(myos::bootstrap::imports::StagingRegion);
     if (pager == 0 || target == 0 || staging == 0 || service == 0
         || readiness == 0 || staging_region == 0) {
         stop(MYOS_STATUS_BAD_ARGS);

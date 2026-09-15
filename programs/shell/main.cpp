@@ -1,9 +1,16 @@
+#include <user/lib/imports.hpp>
+#include <user/lib/clock.hpp>
 #include <libk/fmt.hpp>
 #include <user/lib/file_client.hpp>
 
 namespace {
 using namespace myos;
-uint64_t child = 0;
+uint64_t children[4]{};
+uint64_t latest{};
+void forget(uint64_t id) {
+    for (auto& child : children) if (child == id) child = 0;
+    if (latest == id) { latest = 0; for (auto child : children) if (child) latest = child; }
+}
 files::Client filesystem;
 
 void command(char* line, service::Connection& process, service::Console& console) {
@@ -14,7 +21,7 @@ void command(char* line, service::Connection& process, service::Console& console
     while (*argument == ' ') ++argument;
     if (*line == '\0') return;
     if (service::equal(line, "help")) {
-        console.write("help | ls | cat FILE | run hello | spawn hello | wait | stop\n");
+        console.write("help | ls | cat FILE | run hello | spawn hello | jobs | wait [ID] [MS] | stop [ID]\n");
         return;
     }
     if (service::equal(line, "ls")) {
@@ -29,20 +36,12 @@ void command(char* line, service::Connection& process, service::Console& console
         } while (reply.value != 0);
         return;
     }
-    if (service::equal(line, "cat")) {
-        files::File file;
-        auto status = filesystem.open(argument, service::length(argument), file);
-        if (status == MYOS_STATUS_OK) {
-            status = filesystem.read(file, [&](uint64_t, const uint8_t* data, size_t bytes) {
-                console.write(reinterpret_cast<const char*>(data), bytes);
-            });
-            const auto closed = filesystem.close(file);
-            if (status == MYOS_STATUS_OK) status = closed;
-        }
-        if (status != MYOS_STATUS_OK) (void)libk::fmt::format_to<"file error: {}\n">(console, status);
+    if (service::equal(line, "jobs")) {
+        for (auto child : children) if (child) (void)libk::fmt::format_to<"task: {}\n">(console, child);
         return;
     }
-    const bool run = service::equal(line, "run");
+    const bool cat = service::equal(line, "cat");
+    const bool run = cat || service::equal(line, "run");
     const bool spawn = service::equal(line, "spawn");
     const bool wait = service::equal(line, "wait");
     const bool stop = service::equal(line, "stop");
@@ -53,28 +52,76 @@ void command(char* line, service::Connection& process, service::Console& console
     service::Message request{};
     request.operation = static_cast<uint64_t>(run || spawn ? service::Process::Spawn
         : wait ? service::Process::Wait : service::Process::Stop);
-    request.id = child;
-    request.size = service::length(argument);
-    if (request.size >= sizeof(request.data)) { console.write("argument too long\n"); return; }
-    service::copy(request.data, argument, request.size);
+    request.id = latest;
+    if ((wait || stop) && *argument != 0) {
+        char* end = argument;
+        while (*end && *end != ' ') ++end;
+        if (*end) *end++ = 0;
+        const auto parsed = decimal(argument);
+        if (!parsed) { console.write("invalid task\n"); return; }
+        request.id = *parsed;
+        while (*end == ' ') ++end;
+        if (wait && *end) {
+            const auto duration = decimal(end);
+            Clock clock;
+            service::require(clock.open());
+            const auto deadline = duration ? clock.after_ms(*duration) : libk::nullopt;
+            if (!deadline) { console.write("invalid timeout\n"); return; }
+            request.size = sizeof(uint64_t);
+            service::copy(request.data, &*deadline, request.size);
+        }
+    }
+    if (run || spawn) {
+        bootstrap::Arguments arguments;
+        if (cat) (void)arguments.append("cat", 3);
+        while (*argument != 0) {
+            const char* first = argument;
+            while (*argument != 0 && *argument != ' ') ++argument;
+            if (!arguments.append(first, argument - first)) { console.write("argument too long\n"); return; }
+            while (*argument == ' ') ++argument;
+        }
+        request.size = arguments.data().size;
+        if (request.size > sizeof(request.data)) { console.write("argument too long\n"); return; }
+        service::copy(request.data, arguments.data().bytes, request.size);
+    }
     service::require(process.send(request).status);
     service::Message reply{};
     service::require(process.receive(reply).status);
     if ((run || spawn) && reply.status == MYOS_STATUS_OK) {
-        child = reply.id;
+        const auto child = reply.id;
+        latest = child;
         if (run) {
             request = {};
             request.operation = static_cast<uint64_t>(service::Process::Wait);
-            request.id = child;
+            request.id = latest;
+    if ((wait || stop) && *argument != 0) {
+        char* end = argument;
+        while (*end && *end != ' ') ++end;
+        if (*end) *end++ = 0;
+        const auto parsed = decimal(argument);
+        if (!parsed) { console.write("invalid task\n"); return; }
+        request.id = *parsed;
+        while (*end == ' ') ++end;
+        if (wait && *end) {
+            const auto duration = decimal(end);
+            Clock clock;
+            service::require(clock.open());
+            const auto deadline = duration ? clock.after_ms(*duration) : libk::nullopt;
+            if (!deadline) { console.write("invalid timeout\n"); return; }
+            request.size = sizeof(uint64_t);
+            service::copy(request.data, &*deadline, request.size);
+        }
+    }
             service::require(process.send(request).status);
             service::require(process.receive(reply).status);
-            child = 0;
+            forget(child);
         } else {
+            for (auto& slot : children) if (slot == 0) { slot = child; break; }
             static_cast<void>(libk::fmt::format_to<"task: {}\n">(console, child));
             return;
         }
     } else if (wait || stop) {
-        child = 0;
+        if (reply.status != MYOS_STATUS_TIMED_OUT) forget(request.id);
     }
     static_cast<void>(libk::fmt::format_to<"exit: {}\n">(console, reply.status));
 }
@@ -83,10 +130,10 @@ void command(char* line, service::Connection& process, service::Console& console
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
-    service::Console console{service::capability(info, MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT)};
-    const auto input = service::capability(info, MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT);
+    service::Console console{service::capability(info, myos::bootstrap::imports::ConsoleOutput)};
+    const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
     service::Connection process{
-        service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL),
+        service::capability(info, myos::bootstrap::imports::Process),
         service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
     service::require(filesystem.connect(info));
     console.write("myos native shell\nmyos> ");

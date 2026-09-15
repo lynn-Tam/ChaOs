@@ -14,6 +14,7 @@ void report_failure(const char* group, const char* name) noexcept {
 
 bool TestRegistry::add(const char* group, const char* name, TestFn fn) noexcept {
     if (count_ >= kMaxTests) {
+        ++dropped_;
         return false;
     }
     entries_[count_++] = Entry{group, name, fn};
@@ -21,7 +22,8 @@ bool TestRegistry::add(const char* group, const char* name, TestFn fn) noexcept 
 }
 
 TestStats TestRegistry::run(const TestContext& ctx) noexcept {
-    TestStats stats{};
+    TestStats stats{.failed = dropped_};
+    if (dropped_ != 0) report_failure("registry", "test capacity exhausted");
 
     for (size_t i = 0; i < count_; ++i) {
         const Entry& entry = entries_[i];

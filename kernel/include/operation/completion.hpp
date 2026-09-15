@@ -106,7 +106,8 @@ public:
         Result (Owner::*Read)() noexcept,
         void (Owner::*Release)() noexcept,
         bool (Owner::*Cancel)() noexcept,
-        ResumeResult (Owner::*Resume)(arch::TrapContext&) noexcept>
+        ResumeResult (Owner::*Resume)(arch::TrapContext&) noexcept,
+        void (Owner::*Arm)() noexcept>
     [[nodiscard]] static auto bind_resume(Owner& owner) noexcept
         -> Completion {
         static constexpr Ops operations{
@@ -125,6 +126,7 @@ public:
             .resume = [](void* context, arch::TrapContext& trap) noexcept {
                 return (static_cast<Owner*>(context)->*Resume)(trap);
             },
+            .arm = [](void* context) noexcept { (static_cast<Owner*>(context)->*Arm)(); },
         };
         return Completion{owner, operations};
     }
@@ -175,6 +177,7 @@ private:
         void (*release)(void*) noexcept;
         bool (*cancel)(void*) noexcept;
         ResumeResult (*resume)(void*, arch::TrapContext&) noexcept{};
+        void (*arm)(void*) noexcept{};
     };
 
     template<typename Owner>
@@ -199,7 +202,8 @@ private:
     };
 
     [[nodiscard]] auto try_claim_finish() noexcept -> FinishClaim;
-    [[nodiscard]] auto try_claim_cancel() noexcept -> bool;
+    enum class CancelClaim : u8 { Unavailable, Pending, Published };
+    [[nodiscard]] auto try_claim_cancel() noexcept -> CancelClaim;
 
     enum class CancelResult : u8 {
         Reopen,
@@ -210,7 +214,7 @@ private:
     // Resolve policy only after the container has granted cancellation
     // ownership.  No sink, container, scheduler or owner-release callbacks
     // occur here.
-    [[nodiscard]] auto resolve_cancel() noexcept -> CancelResult;
+    [[nodiscard]] auto resolve_cancel(CancelClaim claim) noexcept -> CancelResult;
     // A cancellation owner may reopen only when this CAS proves no producer
     // recorded CancelRaced.  The caller restores its container edge before
     // publishing Attached.

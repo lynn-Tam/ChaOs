@@ -1,21 +1,24 @@
-#include <operation/page_fault.hpp>
+#include <operation/page_access.hpp>
 
 #include <core/debug.hpp>
 #include <libk/utility.hpp>
 #include <mm/memory_object.hpp>
 #include <mm/vspace.hpp>
+#include <arch/trap.hpp>
+#include <object/memory_pool.hpp>
 
 namespace kernel::operation {
 
 /*luna change: publish page outcomes through atomic lifecycle phases, reason: a Pager callback may race Wait admission without a second continuation state*/
-PageFault::PageFault() noexcept
+PageAccess::PageAccess() noexcept
     : completion_(Completion::bind_resume<
-          PageFault,
-          &PageFault::complete,
-          &PageFault::read,
-          &PageFault::release,
-          &PageFault::cancel,
-          &PageFault::resume>(*this)) {
+          PageAccess,
+          &PageAccess::complete,
+          &PageAccess::read,
+          &PageAccess::release,
+          &PageAccess::cancel,
+          &PageAccess::resume,
+          &PageAccess::arm>(*this)) {
     completion_.set_policy(diag::concurrency::OperationPolicy{
         .kind = diag::concurrency::WaitKind::Pager,
         .expectation = diag::concurrency::Expectation::ExternalUnbounded,
@@ -24,7 +27,7 @@ PageFault::PageFault() noexcept
     });
 }
 
-PageFault::~PageFault() noexcept {
+PageAccess::~PageAccess() noexcept {
     KASSERT(!completion_.attached());
     KASSERT(!relation_.attached());
     KASSERT(memory_.load<libk::MemoryOrder::Acquire>() == nullptr);
@@ -34,23 +37,23 @@ PageFault::~PageFault() noexcept {
         || phase_.load<libk::MemoryOrder::Acquire>() == Phase::Canceled);
 }
 
-auto PageFault::active() const noexcept -> bool {
+auto PageAccess::active() const noexcept -> bool {
     return phase_.load<libk::MemoryOrder::Acquire>() != Phase::Idle;
 }
 
-auto PageFault::terminal() const noexcept -> bool {
+auto PageAccess::terminal() const noexcept -> bool {
     return phase_.load<libk::MemoryOrder::Acquire>() == Phase::Terminal;
 }
 
-auto PageFault::kind() const noexcept -> mm::FaultKind {
+auto PageAccess::kind() const noexcept -> mm::FaultKind {
     return static_cast<mm::FaultKind>(kind_.load<libk::MemoryOrder::Acquire>());
 }
 
-auto PageFault::complete() const noexcept -> bool {
+auto PageAccess::complete() const noexcept -> bool {
     return phase_.load<libk::MemoryOrder::Acquire>() == Phase::Ready;
 }
 
-auto PageFault::read() noexcept -> Result {
+auto PageAccess::read() noexcept -> Result {
     const auto kind = this->kind();
     /*luna change: expose terminal memory pressure failures as no-memory,
       reason: completion reads must preserve ResourceExhausted/OOM classes*/
@@ -61,6 +64,7 @@ auto PageFault::read() noexcept -> Result {
             : kind == mm::FaultKind::OutOfMemory
                 || kind == mm::FaultKind::ResourceExhausted
                 ? MYOS_STATUS_NO_MEMORY
+            : kind == mm::FaultKind::Busy ? MYOS_STATUS_BUSY
             : kind == mm::FaultKind::BackingFailed
                 ? MYOS_STATUS_PEER_FAULT
                 : MYOS_STATUS_CANCELED,
@@ -68,7 +72,7 @@ auto PageFault::read() noexcept -> Result {
     };
 }
 
-void PageFault::drop_pin() noexcept {
+void PageAccess::drop_pin() noexcept {
     mm::MemoryObject* const memory = memory_.exchange<
         libk::MemoryOrder::AcqRel>(nullptr);
     if (memory != nullptr) {
@@ -76,8 +80,14 @@ void PageFault::drop_pin() noexcept {
     }
 }
 
-void PageFault::release() noexcept {
+void PageAccess::release() noexcept {
     drop_pin();
+    if (target_) {
+        demand_.reset();
+        target_.reset();
+        phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
+        return;
+    }
     const Phase phase = phase_.load<libk::MemoryOrder::Acquire>();
     /*luna change: refund retained demand at terminal completion, reason:
       pressure retry keeps it only across a Rearm handoff*/
@@ -93,15 +103,16 @@ void PageFault::release() noexcept {
     case Phase::Idle:
     case Phase::Attaching:
     case Phase::Pending:
+    case Phase::Armed:
         KASSERT(false);
         return;
     }
 }
 
-void PageFault::publish(
+void PageAccess::publish(
     void* owner,
     mm::PageWaitResult result) noexcept {
-    auto& fault = *static_cast<PageFault*>(owner);
+    auto& fault = *static_cast<PageAccess*>(owner);
     const mm::FaultKind previous = fault.kind();
     const mm::FaultKind kind = result == mm::PageWaitResult::OutOfMemory
         ? mm::FaultKind::OutOfMemory
@@ -112,49 +123,62 @@ void PageFault::publish(
                 ? mm::FaultKind::Ready
                 : mm::FaultKind::BackingFailed;
     fault.kind_.store<libk::MemoryOrder::Release>(static_cast<u8>(kind));
-    Phase expected = fault.phase_.load<libk::MemoryOrder::Acquire>();
-    for (;;) {
-        if (expected != Phase::Attaching && expected != Phase::Pending) {
-            KASSERT(expected == Phase::Ready);
-            return;
-        }
-        if (fault.phase_.compare_exchange_weak<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(expected, Phase::Ready)) {
-            break;
-        }
-    }
-    if (fault.completion_.attached()) {
-        fault.completion_.signal();
-    }
+    // Capture the callback before publishing Ready: the early-completion
+    // receiver may release or rearm this owner immediately after the exchange.
+    Completion* const completion = &fault.completion_;
+    const Phase previous_phase = fault.phase_.exchange<libk::MemoryOrder::AcqRel>(Phase::Ready);
+    KASSERT(previous_phase == Phase::Attaching || previous_phase == Phase::Pending
+        || previous_phase == Phase::Armed);
+    if (previous_phase == Phase::Armed) completion->signal();
 }
 
-/*luna change: remove the duplicate PageFault error classifier, reason: VSpace owns the shared fault boundary mapping*/
+void PageAccess::arm() noexcept {
+    Phase expected = Phase::Pending;
+    if (phase_.compare_exchange_strong<libk::MemoryOrder::AcqRel, libk::MemoryOrder::Acquire>(
+            expected, Phase::Armed)) return;
+    KASSERT(expected == Phase::Ready);
+    completion_.signal();
+}
 
-auto PageFault::admit() noexcept -> mm::FaultKind {
-    KASSERT(vspace_ != nullptr && cpus_ != nullptr);
+/*luna change: remove the duplicate PageAccess error classifier, reason: VSpace owns the shared fault boundary mapping*/
+
+auto PageAccess::resolve() noexcept -> mm::FaultKind {
+    if (target_) {
+        auto object = target_.pin<mm::MemoryObject>();
+        if (!object) return mm::FaultKind::BackingFailed;
+        auto& memory = object.value().get();
+        auto result = memory.materialize(page_, &relation_, this, &PageAccess::publish, &demand_);
+        if (result) return mm::FaultKind::Ready;
+        if (result.error() == mm::MemoryError::Pending || result.error() == mm::MemoryError::Pressure)
+            memory_.store<libk::MemoryOrder::Release>(&memory);
+        return mm::fault_kind(result.error());
+    }
+    const auto result = vspace_->fault(
+        mm::VmContext{.cpus = cpus_, .local = local_}, address_, access_,
+        &relation_, this, &PageAccess::publish, &demand_);
+    if (!result) return mm::fault_kind(result.error());
+    if (result.value().kind == mm::FaultKind::Pending || result.value().kind == mm::FaultKind::Pressure)
+        memory_.store<libk::MemoryOrder::Release>(result.value().memory);
+    return result.value().kind;
+}
+
+auto PageAccess::populate(object::ObjectRef&& memory, usize page) noexcept -> mm::FaultKind {
+    KASSERT(!active() && !completion_.attached() && !relation_.attached());
+    KASSERT(memory && memory_.load<libk::MemoryOrder::Acquire>() == nullptr && !demand_);
+    target_ = libk::move(memory);
+    page_ = page;
+    return admit();
+}
+
+auto PageAccess::admit() noexcept -> mm::FaultKind {
+    KASSERT(target_ || (vspace_ != nullptr && cpus_ != nullptr));
     KASSERT(!relation_.attached());
     phase_.store<libk::MemoryOrder::Release>(Phase::Attaching);
     kind_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(mm::FaultKind::Pending));
-    const auto result = vspace_->fault(
-        mm::VmContext{.cpus = cpus_, .local = local_},
-        address_,
-        access_,
-        &relation_,
-        this,
-        &PageFault::publish,
-        &demand_);
-    if (!result) {
-        kind_.store<libk::MemoryOrder::Release>(
-            static_cast<u8>(mm::fault_kind(result.error())));
-        demand_.reset();
-        phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
-        return kind();
-    }
-    const mm::FaultKind next = result.value().kind;
+    const mm::FaultKind next = resolve();
     if (next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure) {
-        if (result.value().memory == nullptr) {
+        if (memory_.load<libk::MemoryOrder::Acquire>() == nullptr) {
             kind_.store<libk::MemoryOrder::Release>(
                 static_cast<u8>(mm::FaultKind::BackingFailed));
             demand_.reset();
@@ -175,7 +199,6 @@ auto PageFault::admit() noexcept -> mm::FaultKind {
         /*luna change: consume the backing-owned relation handoff, reason:
           MemoryObject attached PageReclaimer before returning Pressure*/
         /*luna change: accept the pin handoff even after an early callback, reason: Attaching may already have published Ready before VSpace returns Pending*/
-        memory_.store<libk::MemoryOrder::Release>(result.value().memory);
         generation_.store<libk::MemoryOrder::Release>(relation_.generation);
         Phase expected = Phase::Attaching;
         if (!phase_.compare_exchange_strong<
@@ -191,7 +214,7 @@ auto PageFault::admit() noexcept -> mm::FaultKind {
     return next;
 }
 
-auto PageFault::start(
+auto PageAccess::start(
     mm::VSpace& vspace,
     CpuRegistry& cpus,
     CpuId local,
@@ -202,6 +225,7 @@ auto PageFault::start(
         || phase == Phase::Canceled);
     KASSERT(!completion_.attached() && !relation_.attached());
     drop_pin();
+    target_.reset();
     vspace_ = &vspace;
     cpus_ = &cpus;
     local_ = local;
@@ -213,8 +237,9 @@ auto PageFault::start(
     return admit();
 }
 
-auto PageFault::cancel() noexcept -> bool {
-    if (phase_.load<libk::MemoryOrder::Acquire>() != Phase::Pending) {
+auto PageAccess::cancel() noexcept -> bool {
+    const auto phase = phase_.load<libk::MemoryOrder::Acquire>();
+    if (phase != Phase::Pending && phase != Phase::Armed) {
         return false;
     }
     mm::MemoryObject* const memory = memory_.load<
@@ -241,11 +266,13 @@ auto PageFault::cancel() noexcept -> bool {
     return true;
 }
 
-void PageFault::reset() noexcept {
+void PageAccess::reset() noexcept {
     KASSERT(!completion_.attached() && !relation_.attached());
     KASSERT(memory_.load<libk::MemoryOrder::Acquire>() == nullptr);
     KASSERT(!demand_);
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
+    target_.reset();
+    page_ = 0;
     vspace_ = nullptr;
     cpus_ = nullptr;
     local_ = {};
@@ -256,7 +283,7 @@ void PageFault::reset() noexcept {
         static_cast<u8>(mm::FaultKind::NoMapping));
 }
 
-auto PageFault::resume(arch::TrapContext& trap) noexcept
+auto PageAccess::resume(arch::TrapContext& trap) noexcept
     -> Completion::ResumeResult {
     static_cast<void>(trap);
     KASSERT(phase_.load<libk::MemoryOrder::Acquire>() == Phase::Ready);
@@ -266,6 +293,7 @@ auto PageFault::resume(arch::TrapContext& trap) noexcept
         || kind() == mm::FaultKind::BackingFailed) {
         demand_.reset();
         phase_.store<libk::MemoryOrder::Release>(Phase::Terminal);
+        if (target_) trap.set_result(0, static_cast<usize>(static_cast<isize>(status())));
         return Completion::ResumeResult::Done;
     }
     phase_.store<libk::MemoryOrder::Release>(Phase::Idle);
@@ -274,6 +302,8 @@ auto PageFault::resume(arch::TrapContext& trap) noexcept
         next == mm::FaultKind::Pending || next == mm::FaultKind::Pressure
         ? Completion::ResumeResult::Rearm
         : Completion::ResumeResult::Done;
+    if (target_ && result == Completion::ResumeResult::Done)
+        trap.set_result(0, static_cast<usize>(static_cast<isize>(status())));
     return result;
 }
 

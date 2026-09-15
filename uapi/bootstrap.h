@@ -9,7 +9,7 @@
 
 #define MYOS_BOOTSTRAP_MAGIC UINT64_C(0x4d594f53494e4954)
 #define MYOS_BOOTSTRAP_MAJOR 1U
-#define MYOS_BOOTSTRAP_MINOR 6U
+#define MYOS_BOOTSTRAP_MINOR 8U
 #define MYOS_BOOTSTRAP_MAX_CAPS 16U
 
 enum myos_bootstrap_cap_kind {
@@ -23,16 +23,7 @@ enum myos_bootstrap_cap_kind {
     MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY = 8,
     MYOS_BOOTSTRAP_CAP_IRQ = 9,
     MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION = 10,
-    MYOS_BOOTSTRAP_CAP_PAGER = 11,
-    MYOS_BOOTSTRAP_CAP_TARGET_MEMORY = 12,
-    MYOS_BOOTSTRAP_CAP_STAGING_MEMORY = 13,
     MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION = 14,
-    MYOS_BOOTSTRAP_CAP_STAGING_REGION = 15,
-    MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT = 16,
-    MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT = 17,
-    MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL = 18,
-    MYOS_BOOTSTRAP_CAP_FILE_CHANNEL = 19,
-    MYOS_BOOTSTRAP_CAP_BLOCK_CHANNEL = 20,
     MYOS_BOOTSTRAP_CAP_DEVICE = 21,
 
 };
@@ -68,21 +59,8 @@ enum myos_bootstrap_cap_kind {
         return MYOS_OBJECT_KIND_DEVICE;
     case MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION:
         return MYOS_OBJECT_KIND_NOTIFICATION;
-    case MYOS_BOOTSTRAP_CAP_PAGER:
-        return MYOS_OBJECT_KIND_PAGER;
-    case MYOS_BOOTSTRAP_CAP_TARGET_MEMORY:
-    case MYOS_BOOTSTRAP_CAP_STAGING_MEMORY:
-        return MYOS_OBJECT_KIND_MEMORY;
     case MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION:
         return MYOS_OBJECT_KIND_NOTIFICATION;
-    case MYOS_BOOTSTRAP_CAP_CONSOLE_OUTPUT:
-    case MYOS_BOOTSTRAP_CAP_CONSOLE_INPUT:
-    case MYOS_BOOTSTRAP_CAP_SERVICE_CHANNEL:
-    case MYOS_BOOTSTRAP_CAP_FILE_CHANNEL:
-    case MYOS_BOOTSTRAP_CAP_BLOCK_CHANNEL:
-        return MYOS_OBJECT_KIND_CHANNEL;
-    case MYOS_BOOTSTRAP_CAP_STAGING_REGION:
-        return MYOS_OBJECT_KIND_VSPACE;
     default:
         return MYOS_OBJECT_KIND_INVALID;
     }
@@ -93,6 +71,30 @@ struct myos_bootstrap_cap {
     uint32_t kind;
     uint32_t flags;
     myos_cap_t handle;
+};
+
+#define MYOS_BOOTSTRAP_MAX_IMPORTS 16U
+#define MYOS_BOOTSTRAP_IMPORT_NAME_MAX 32U
+
+/* Names locate a child-CSpace capability; they never confer authority. */
+struct myos_bootstrap_import {
+    char name[MYOS_BOOTSTRAP_IMPORT_NAME_MAX];
+    uint32_t protocol;
+    uint16_t major;
+    uint16_t minor;
+    uint16_t object_kind;
+    uint16_t reserved;
+    uint32_t flags;
+    myos_cap_t handle;
+};
+
+#define MYOS_BOOTSTRAP_ARG_MAX 16U
+#define MYOS_BOOTSTRAP_ARG_BYTES 256U
+struct myos_bootstrap_arguments {
+    uint16_t count;
+    uint16_t size;
+    uint16_t offsets[MYOS_BOOTSTRAP_ARG_MAX];
+    char bytes[MYOS_BOOTSTRAP_ARG_BYTES];
 };
 
 struct myos_bootstrap_info {
@@ -106,4 +108,8 @@ struct myos_bootstrap_info {
     uint64_t stack_size;
     uint64_t boot_bundle_size;
     struct myos_bootstrap_cap caps[MYOS_BOOTSTRAP_MAX_CAPS];
+    uint32_t import_count;
+    uint32_t reserved;
+    struct myos_bootstrap_import imports[MYOS_BOOTSTRAP_MAX_IMPORTS];
+    struct myos_bootstrap_arguments arguments;
 };
