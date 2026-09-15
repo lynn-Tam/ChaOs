@@ -262,7 +262,7 @@ public:
     [[nodiscard]] auto arm(
         cap::Resolved<Channel>& authority,
         usize relation,
-        u64 observed) noexcept -> libk::Expected<void, ChannelError>;
+        u64 observed) noexcept -> libk::Expected<u64, ChannelError>;
 
     [[nodiscard]] auto mint(
         cap::Resolved<Channel>& authority,

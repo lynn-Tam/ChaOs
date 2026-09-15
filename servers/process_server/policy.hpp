@@ -34,13 +34,24 @@ inline auto admit(const deploy::TaskPlanView& task) noexcept -> bool {
         }
         if (binding == nullptr) return false;
         if (binding->kind == 0) {
-            const bool file = named(task.symbol(binding->name), bootstrap::imports::Files.name);
-            const auto contract = file ? bootstrap::imports::Files : bootstrap::imports::ConsoleOutput;
-            if (!named(task.symbol(binding->name), contract.name) || binding->protocol != contract.protocol
-                || binding->major != contract.major || binding->object_kind != contract.kind
+            const auto name = task.symbol(binding->name);
+            const bootstrap::Import* contract{};
+            const char* source{};
+            myos_word_t rights = MYOS_RIGHT_SEND;
+            if (named(name, bootstrap::imports::Files.name)) {
+                contract = &bootstrap::imports::Files; source = "files.directory";
+            } else if (named(name, bootstrap::imports::Stdin.name)) {
+                contract = &bootstrap::imports::Stdin; source = "stdin"; rights = MYOS_RIGHT_RECEIVE;
+            } else if (named(name, bootstrap::imports::Stdout.name)) {
+                contract = &bootstrap::imports::Stdout; source = "stdout";
+            } else if (named(name, bootstrap::imports::Stderr.name)) {
+                contract = &bootstrap::imports::Stderr; source = "stderr";
+            }
+            if (contract == nullptr || binding->protocol != contract->protocol || binding->major != contract->major
+                || binding->object_kind != contract->kind
                 || imported.source_class != MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
-                || !named(task.symbol(imported.source), file ? "files.directory" : "console.sender")
-                || imported.attenuation.rights != MYOS_RIGHT_SEND) return false;
+                || !named(task.symbol(imported.source), source) || imported.attenuation.rights != rights)
+                return false;
             continue;
         }
         if (imported.source_class != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY) return false;

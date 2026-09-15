@@ -1,3 +1,4 @@
+#include <user/lib/stream.hpp>
 #include <user/lib/imports.hpp>
 #include <user/lib/clock.hpp>
 #include <libk/fmt.hpp>
@@ -7,13 +8,17 @@ namespace {
 using namespace myos;
 uint64_t children[4]{};
 uint64_t latest{};
+void remember(uint64_t id) {
+    for (auto& child : children) if (!child) { child = id; latest = id; return; }
+    exit(MYOS_STATUS_INTERNAL);
+}
 void forget(uint64_t id) {
     for (auto& child : children) if (child == id) child = 0;
     if (latest == id) { latest = 0; for (auto child : children) if (child) latest = child; }
 }
 files::Client filesystem;
 
-void command(char* line, service::Connection& process, service::Console& console) {
+void command(char* line, service::Connection& process, stream::Writer& console) {
     while (*line == ' ') ++line;
     char* argument = line;
     while (*argument != '\0' && *argument != ' ') ++argument;
@@ -74,13 +79,25 @@ void command(char* line, service::Connection& process, service::Console& console
     if (run || spawn) {
         bootstrap::Arguments arguments;
         if (cat) (void)arguments.append("cat", 3);
+        size_t split{};
         while (*argument != 0) {
             const char* first = argument;
             while (*argument != 0 && *argument != ' ') ++argument;
+            if (argument - first == 1 && *first == '|') {
+                if (split || arguments.count() == 0) { console.write("invalid pipeline\n"); return; }
+                split = arguments.data().size;
+                while (*argument == ' ') ++argument;
+                continue;
+            }
             if (!arguments.append(first, argument - first)) { console.write("argument too long\n"); return; }
             while (*argument == ' ') ++argument;
         }
         request.size = arguments.data().size;
+        if (split != 0) {
+            if (split == request.size) { console.write("invalid pipeline\n"); return; }
+            request.operation = static_cast<uint64_t>(service::Process::Pipeline);
+            request.id = split;
+        }
         if (request.size > sizeof(request.data)) { console.write("argument too long\n"); return; }
         service::copy(request.data, arguments.data().bytes, request.size);
     }
@@ -89,35 +106,32 @@ void command(char* line, service::Connection& process, service::Console& console
     service::require(process.receive(reply).status);
     if ((run || spawn) && reply.status == MYOS_STATUS_OK) {
         const auto child = reply.id;
-        latest = child;
-        if (run) {
-            request = {};
-            request.operation = static_cast<uint64_t>(service::Process::Wait);
-            request.id = latest;
-    if ((wait || stop) && *argument != 0) {
-        char* end = argument;
-        while (*end && *end != ' ') ++end;
-        if (*end) *end++ = 0;
-        const auto parsed = decimal(argument);
-        if (!parsed) { console.write("invalid task\n"); return; }
-        request.id = *parsed;
-        while (*end == ' ') ++end;
-        if (wait && *end) {
-            const auto duration = decimal(end);
-            Clock clock;
-            service::require(clock.open());
-            const auto deadline = duration ? clock.after_ms(*duration) : libk::nullopt;
-            if (!deadline) { console.write("invalid timeout\n"); return; }
-            request.size = sizeof(uint64_t);
-            service::copy(request.data, &*deadline, request.size);
+        uint64_t consumer{};
+        if (reply.operation == static_cast<uint64_t>(service::Process::Pipeline)) {
+            if (reply.size != sizeof(consumer)) exit(MYOS_STATUS_PEER_FAULT);
+            service::copy(&consumer, reply.data, sizeof(consumer));
         }
-    }
-            service::require(process.send(request).status);
+        if (run) {
+            service::Message wait_request{.operation = static_cast<uint64_t>(service::Process::Wait),
+                .id = consumer ? consumer : child};
+            service::require(process.send(wait_request).status);
             service::require(process.receive(reply).status);
-            forget(child);
+            const auto status = reply.status;
+            if (consumer) {
+                wait_request.id = child;
+                service::require(process.send(wait_request).status);
+                service::require(process.receive(reply).status);
+                if (reply.status != MYOS_STATUS_OK)
+                    (void)libk::fmt::format_to<"producer: {}\n">(console, reply.status);
+                reply.status = status;
+            }
         } else {
-            for (auto& slot : children) if (slot == 0) { slot = child; break; }
-            static_cast<void>(libk::fmt::format_to<"task: {}\n">(console, child));
+            remember(child);
+            (void)libk::fmt::format_to<"task: {}\n">(console, child);
+            if (consumer) {
+                remember(consumer);
+                (void)libk::fmt::format_to<"task: {}\n">(console, consumer);
+            }
             return;
         }
     } else if (wait || stop) {
@@ -130,7 +144,7 @@ void command(char* line, service::Connection& process, service::Console& console
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
-    service::Console console{service::capability(info, myos::bootstrap::imports::ConsoleOutput)};
+    stream::Writer console{service::capability(info, myos::bootstrap::imports::ConsoleOutput)};
     const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
     service::Connection process{
         service::capability(info, myos::bootstrap::imports::Process),

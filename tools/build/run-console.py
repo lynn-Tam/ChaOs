@@ -57,6 +57,7 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         transcript = output[start:]
         if expected not in transcript:
             raise RuntimeError(f'{text}: expected {expected!r}, got {transcript!r}')
+        return transcript
 
     try:
         until(b'myos> ')
@@ -86,10 +87,32 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         run('run absent', b'exit: -5')
         run('run uart', b'exit: -6')
         run('wait', b'exit: -1')
-        run('spawn sleep 10000', b'task: ')
-        run('stop', b'exit: -18')
+        run('run sleep 1', b'exit: 0')
+        first = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
+        second = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
+        if first == second:
+            raise RuntimeError('two live tasks share a handle')
+        run(f'wait {first} 1', b'exit: -21')
+        run('run echo unrelated task progresses', b'unrelated task progresses\nexit: 0')
+        run(f'stop {second}', b'exit: -18')
+        run(f'wait {second}', b'exit: -1')
+        run(f'stop {first}', b'exit: -18')
+        run(f'wait {first}', b'exit: -1')
+        run('run echo ordered pipe bytes | cat', b'ordered pipe bytes\nexit: 0')
+        run('run fill 8192 | slow 1', b'bytes: 8192\nexit: 0')
+        early = run('run fill 100000 | slow 1 96', b'bytes: 96')
+        if b'producer: -22' not in early and b'producer: -13' not in early:
+            raise RuntimeError(f'writer did not observe consumer close: {early!r}')
+        blocked = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 100', b'task: '))
+        if len(blocked) != 2:
+            raise RuntimeError('pipeline did not return independent handles')
+        run('run echo running during backpressure', b'running during backpressure\nexit: 0')
+        run(f'stop {int(blocked[1])}', b'exit: -18')
+        producer = run(f'wait {int(blocked[0])}', b'exit: ')
+        if b'exit: -22' not in producer and b'exit: -13' not in producer:
+            raise RuntimeError(f'blocked producer was not released: {producer!r}')
         run('run hello', b'Hello from userspace.\nexit: 0')
-        print(f'[console] OK: {smp} harts, serial commands, repeated launch, denied authority, stop/refund')
+        print(f'[console] OK: {smp} harts, applications, concurrent tasks, deadlines, bounded streams, EOF, stop and reuse')
     except Exception:
         sys.stdout.buffer.write(output)
         raise

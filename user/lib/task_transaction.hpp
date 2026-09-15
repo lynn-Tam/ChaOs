@@ -586,6 +586,10 @@ public:
             return valid() && set_->cell_state(id_) == CompletionCellState::Ready;
         }
 
+        [[nodiscard]] auto result() const noexcept -> libk::optional<CompletionResult> {
+            return ready() ? libk::optional<CompletionResult>{set_->cell(id_).result} : libk::nullopt;
+        }
+
         [[nodiscard]] auto take() noexcept -> libk::optional<CompletionResult> {
             if (!ready()) {
                 return libk::nullopt;

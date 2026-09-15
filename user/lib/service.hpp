@@ -98,19 +98,25 @@ public:
     }
     auto try_send(const Message& message) noexcept -> SysResult {
         const auto result = service::send(channel_, message, false);
-        if (result.status == MYOS_STATUS_OK || result.status == MYOS_STATUS_WOULD_BLOCK)
+        if (result.status == MYOS_STATUS_OK)
             write_sequence_ = result.value;
         return result;
     }
     auto arm_writable() noexcept -> SysResult {
-        return channel_arm(channel_, writable_, write_sequence_);
+        const auto result = channel_arm(channel_, writable_, write_sequence_);
+        if (result.status == MYOS_STATUS_OK) write_sequence_ = result.value;
+        return result;
     }
     auto try_receive(Message& message) noexcept -> SysResult {
         const auto result = service::receive(channel_, message, false);
         if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
         return result;
     }
-    auto arm() noexcept -> SysResult { return channel_arm(channel_, readable_, sequence_); }
+    auto arm() noexcept -> SysResult {
+        const auto result = channel_arm(channel_, readable_, sequence_);
+        if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
+        return result;
+    }
     auto receive(Message& message) noexcept -> SysResult {
         for (;;) {
             const auto result = try_receive(message);
@@ -128,32 +134,5 @@ public:
     }
 };
 
-// The channel supplies bounded backpressure. No reply queue is shared by
-// writers; console access grants only the ability to enqueue output.
-class Console final {
-    myos_cap_t output_;
-public:
-    explicit Console(myos_cap_t output) noexcept : output_(output) {}
-    void write(const char* text, size_t size) const noexcept {
-        while (size != 0) {
-            Message message{};
-            message.size = size < sizeof(message.data) ? size : sizeof(message.data);
-            copy(message.data, text, message.size);
-            for (;;) {
-                const auto status = send(output_, message).status;
-                if (status == MYOS_STATUS_BUSY || status == MYOS_STATUS_RETRY) {
-                    myos::yield();
-                    continue;
-                }
-                require(status);
-                break;
-            }
-            text += message.size;
-            size -= message.size;
-        }
-    }
-    void write(const char* text) const noexcept { write(text, length(text)); }
-    void put(char value) const noexcept { write(&value, 1); }
-};
 
 } // namespace myos::service

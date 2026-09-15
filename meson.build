@@ -469,6 +469,14 @@ echo_user = executable(
   'echo.elf', files('programs/echo/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
+slow_user = executable(
+  'slow.elf', files('programs/slow/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+fill_user = executable(
+  'fill.elf', files('programs/fill/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 cat_user = executable(
   'cat.elf', files('programs/cat/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
@@ -641,6 +649,22 @@ echo_package = custom_target(
   'echo-package', input: [echo_user, echo_manifest], output: 'echo.pkg',
   command: [bootpack, '@OUTPUT@', 'echo', 'echo=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
+slow_manifest = custom_target(
+  'slow-manifest', input: slow_user, output: 'slow.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'slow', '@INPUT@'], build_by_default: false,
+)
+slow_package = custom_target(
+  'slow-package', input: [slow_user, slow_manifest], output: 'slow.pkg',
+  command: [bootpack, '@OUTPUT@', 'slow', 'slow=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+fill_manifest = custom_target(
+  'fill-manifest', input: fill_user, output: 'fill.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'fill', '@INPUT@'], build_by_default: false,
+)
+fill_package = custom_target(
+  'fill-package', input: [fill_user, fill_manifest], output: 'fill.pkg',
+  command: [bootpack, '@OUTPUT@', 'fill', 'fill=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
 cat_manifest = custom_target(
   'cat-manifest', input: cat_user, output: 'cat.manifest',
   command: [deploypack, 'application', '@OUTPUT@', 'cat', '@INPUT@'], build_by_default: false,
@@ -674,9 +698,9 @@ denied_package = custom_target(
   command: [bootpack, '@OUTPUT@', 'uart', 'uart=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
 disk_image = custom_target(
-  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package], output: 'disk.img',
+  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package, slow_package, fill_package], output: 'disk.img',
   command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@',
-    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'BAD.PKG=@INPUT0@'],
+    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'SLOW.PKG=@INPUT7@', 'FILL.PKG=@INPUT8@', 'BAD.PKG=@INPUT0@'],
   build_by_default: false,
 )
 file_test_data = custom_target(
@@ -725,8 +749,8 @@ exhaustion_package = custom_target(
   command: [bootpack, '@OUTPUT@', 'hello', 'hello=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
 exhaustion_disk = custom_target(
-  'console-exhaustion-disk', input: [files('user/disk/README.TXT'), exhaustion_package], output: 'console-exhaustion.img',
-  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@'], build_by_default: false,
+  'console-exhaustion-disk', input: [files('user/disk/README.TXT'), exhaustion_package, cat_package], output: 'console-exhaustion.img',
+  command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@', 'CAT.PKG=@INPUT2@'], build_by_default: false,
 )
 supervision_bundle = custom_target(
   'supervision-bundle', input: [supervision_init, supervision_process, proof_user, consumer_user, pager_user, uart_fixture, production_manifest], output: 'supervision.bundle',

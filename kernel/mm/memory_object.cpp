@@ -766,6 +766,10 @@ public:
                 request.writeback_generation,
                 request.dirty_epoch};
             switch (event) {
+            case kernel::pager::PagerAttachment::Event::Publish:
+                if (!node->slot.publish_writeback(key, request.key.generation)) return false;
+                node->slot.writeback.transport_slot = request.key.slot;
+                return true;
             case kernel::pager::PagerAttachment::Event::Claim:
                 return static_cast<bool>(node->slot.claim_writeback(
                     key, request.key.generation, request.claim.generation));
@@ -780,6 +784,11 @@ public:
                     WritebackFailure::BackingUnavailable));
             }
             return false;
+        }
+        if (event == kernel::pager::PagerAttachment::Event::Publish) {
+            if (node->slot.state != PageSlotState::Requested || !node->slot.request.publish()) return false;
+            self.unindex_work_locked(*node);
+            return true;
         }
         // Page-in supply/fail owns the target semantic transition. Claim is
         // transport admission only; forced close invalidates the request.
@@ -941,30 +950,6 @@ public:
                 continue;
             }
 
-            bool committed{};
-            {
-                kernel::sync::IrqLockGuard guard{tree_lock_};
-                Node* const current = find_locked(page_key.index);
-                if (current != nullptr
-                    && current->slot.request.key == page_key
-                        && current->slot.state == PageSlotState::Requested
-                        && current->slot.request.publish()) {
-                    unindex_work_locked(*current);
-                    committed = true;
-                }
-            }
-            if (!committed) {
-                static_cast<void>(pager_->cancel(published.value().key));
-                kernel::sync::IrqLockGuard guard{tree_lock_};
-                Node* const current = find_locked(page_key.index);
-                if (current != nullptr
-                    && current->slot.request.key == page_key
-                    && current->slot.request.state
-                        == PageRequestState::Publishing) {
-                    KASSERT(current->slot.request.abort_publish());
-                }
-                continue;
-            }
             ++progressed;
         }
 
@@ -1639,26 +1624,6 @@ public:
                     : published.error() == pager::Error::Closed
                         ? MemoryError::BackingFailed
                         : MemoryError::OwnershipMismatch);
-        }
-        bool committed{};
-        {
-            kernel::sync::IrqLockGuard guard{tree_lock_};
-            Node* const node = find_locked(page_index);
-            if (node != nullptr && node->slot.request.key == key.page
-                && node->slot.publish_writeback(
-                    key, published.value().key.generation)) {
-                node->slot.writeback.transport_slot = published.value().key.slot;
-                committed = true;
-            }
-        }
-        if (!committed) {
-            static_cast<void>(pager_->cancel(published.value().key));
-            kernel::sync::IrqLockGuard guard{tree_lock_};
-            Node* const node = find_locked(page_index);
-            if (node != nullptr) {
-                static_cast<void>(node->slot.abort_writeback_publish(key));
-            }
-            return libk::unexpected(MemoryError::OwnershipMismatch);
         }
         return libk::expected();
     }

@@ -183,6 +183,7 @@ struct PagerTransition final {
         const kernel::pager::Request&,
         kernel::pager::PagerAttachment::Event event) noexcept -> bool {
         auto& self = *static_cast<PagerTransition*>(context);
+        if (event == kernel::pager::PagerAttachment::Event::Publish) return true;
         if (event == kernel::pager::PagerAttachment::Event::Forced) {
             ++self.forced;
             if (self.force_forced) {
@@ -208,6 +209,55 @@ struct PagerTransition final {
         return true;
     }
 };
+
+bool test_pager_publication_commits_before_delivery(const TestContext&) noexcept {
+    using namespace kernel::pager;
+    struct Publication final {
+        Pager* pager;
+        PagerAttachment* attachment{};
+        unsigned mode;
+        bool invisible{}, retiring{}, drained{}, compensated{};
+        static bool transition(void* context, const Request&, PagerAttachment::Event event) noexcept {
+            auto& self = *static_cast<Publication*>(context);
+            if (event == PagerAttachment::Event::Publish) {
+                const auto claim = self.pager->try_claim();
+                self.invisible = !claim && claim.error() == Error::Busy && self.pager->pending() == 0;
+                if (self.mode == 1) self.retiring = !self.pager->close(true);
+                if (self.mode == 2) self.retiring = self.pager->detach(*self.attachment)
+                    && self.attachment->state == PagerAttachment::State::Retiring && !self.drained;
+            } else if (event == PagerAttachment::Event::Forced) self.compensated = true;
+            return true;
+        }
+        static void drain(void* context) noexcept { static_cast<Publication*>(context)->drained = true; }
+    };
+    for (unsigned mode = 0; mode != 3; ++mode) {
+        auto& pager = e7_pager.emplace();
+        PagerReset reset{};
+        Publication owner{.pager = &pager, .mode = mode};
+        PagerAttachment attachment{.context = &owner, .transition = &Publication::transition,
+            .drained = &Publication::drain, .ready = &pager_attachment_ready};
+        owner.attachment = &attachment;
+        auto cleanup = libk::on_scope_exit([&]() noexcept {
+            if (attachment.state == PagerAttachment::State::Attached) (void)pager.detach(attachment);
+        });
+        if (!pager.attach(attachment)) return false;
+        const auto published = pager.publish(attachment, kernel::mm::PageKey{1, 4}, 4, 1, 1);
+        if (!owner.invisible) return false;
+        if (mode == 0) {
+            if (!published || pager.pending() != 1) return false;
+            const auto claim = pager.try_claim();
+            if (!claim) return false;
+            auto reply = pager.begin_reply(claim.value().claim);
+            if (!reply || !reply.value().commit()) return false;
+        } else {
+            if (published || published.error() != Error::Stale || !owner.retiring
+                || !owner.compensated || pager.pending() != 0) return false;
+            if (mode == 1 && pager.state() != State::Closed) return false;
+            if (mode == 2 && (!owner.drained || attachment.state != PagerAttachment::State::Detached)) return false;
+        }
+    }
+    return true;
+}
 
 bool test_pager_admitted_claim_completes_while_closing(
     const TestContext&) noexcept {
@@ -1372,6 +1422,8 @@ bool test_terminal_observation_is_read_only_projection(
 } // namespace
 
 void register_e7_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("e7", "Pager commits publication before delivery and compensates retirement",
+        test_pager_publication_commits_before_delivery);
     (void)registry.add(
         "e7", "PageSlot rejects stale supply and tracks dirty writeback",
         test_page_slot_protocol_is_generation_checked);

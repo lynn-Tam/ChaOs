@@ -47,6 +47,7 @@ struct Request;
 
 struct PagerAttachment final {
     enum class Event : u8 {
+        Publish,
         Claim,
         Requeue,
         Forced,
@@ -163,6 +164,7 @@ class Pager final : private libk::noncopyable_nonmovable {
     friend class Reply;
     enum class TransportState : u8 {
         Free,
+        Publishing,
         Queued,
         Claimed,
         Completing,
@@ -352,6 +354,7 @@ private:
     ipc::Notification* notification_{};
     u64 badge_{};
     State state_{State::Open};
+    usize publishing_{};
     usize claimed_{};
     using Attachments = libk::IntrusiveList<
         PagerAttachment, &PagerAttachment::hook_>;

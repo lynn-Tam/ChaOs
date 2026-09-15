@@ -58,7 +58,7 @@ Pager::~Pager() noexcept {
     /*luna change: include producer waiter unlink in Pager teardown,
       reason: attachment capacity hooks must be empty before storage dies*/
     KASSERT(state_ == State::Open || state_ == State::Closed);
-    KASSERT(claimed_ == 0 && !cleanup_);
+    KASSERT(claimed_ == 0 && publishing_ == 0 && !cleanup_);
     KASSERT(notification_ == nullptr && attachments_.empty()
         && capacity_waiters_.empty() && !source_link_.attached());
 }
@@ -289,7 +289,7 @@ auto Pager::detach(PagerAttachment& attachment) noexcept -> bool {
                     drained = true;
                 }
                 close = state_ == State::Closing
-                    && ready_.empty() && claimed_ == 0;
+                    && ready_.empty() && claimed_ == 0 && publishing_ == 0;
                 if (close) {
                     state_ = State::Closed;
                 }
@@ -361,7 +361,13 @@ auto Pager::publish(
         }
         ++slot->generation;
         slot->claim_generation = 0;
-        slot->state = TransportState::Queued;
+        slot->state = TransportState::Publishing;
+        slot->leases = 1;
+        ++publishing_;
+        if (attachment != nullptr) {
+            KASSERT(attachment->leases != libk::numeric_limits<u32>::max());
+            ++attachment->leases;
+        }
         slot->attachment = attachment;
         slot->attachment_generation = attachment != nullptr
             ? attachment->generation : 0;
@@ -382,12 +388,58 @@ auto Pager::publish(
             };
         }
         const u16 index = static_cast<u16>(slot - slots_);
-        if (!ready_.try_push_back(index)) {
-            slot->state = TransportState::Free;
-            return libk::unexpected(Error::Full);
-        }
         result = view(*slot, index);
-        signal = notification_ != nullptr;
+    }
+    // A reserved delivery is invisible to consumers until its semantic
+    // owner accepts Publish. No Pager lock is held across the owner callback.
+    const bool owner = attachment == nullptr || attachment->transition(
+        attachment->context, result, PagerAttachment::Event::Publish);
+    bool committed{}, drained{}, compensate{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        Slot* const slot = find_locked(result.key);
+        KASSERT(slot != nullptr && slot->state == TransportState::Publishing && slot->leases == 1);
+        committed = owner && state_ == State::Open && (attachment == nullptr
+            || (attachment->state == PagerAttachment::State::Attached
+                && attachment->generation == slot->attachment_generation));
+        if (committed) {
+            slot->state = TransportState::Queued;
+            --slot->leases;
+            --publishing_;
+            if (attachment != nullptr) --attachment->leases;
+            KASSERT(ready_.try_push_back(result.key.slot));
+            signal = notification_ != nullptr;
+        } else {
+            compensate = owner && attachment != nullptr;
+        }
+    }
+    if (compensate) static_cast<void>(attachment->transition(
+        attachment->context, result, PagerAttachment::Event::Forced));
+    bool close{};
+    if (!committed) {
+        kernel::sync::IrqLockGuard guard{lock_};
+        Slot* const slot = find_locked(result.key);
+        KASSERT(slot != nullptr && slot->leases != 0 && publishing_ != 0);
+        --slot->leases;
+        --publishing_;
+        slot->state = TransportState::Free;
+        slot->attachment = nullptr;
+        slot->attachment_generation = 0;
+        if (attachment != nullptr) {
+            KASSERT(attachment->leases != 0);
+            --attachment->leases;
+            if (attachment->state == PagerAttachment::State::Retiring && attachment->leases == 0) {
+                attachment->state = PagerAttachment::State::Detached;
+                drained = true;
+            }
+        }
+        close = state_ != State::Open;
+    }
+    if (drained && attachment->drained != nullptr) attachment->drained(attachment->context);
+    if (!committed) {
+        if (close) static_cast<void>(this->close(false));
+        else wake_capacity();
+        return libk::unexpected(Error::Stale);
     }
     if (signal) {
         static_cast<void>(source_link_.signal());
@@ -876,7 +928,7 @@ auto Pager::finish_locked(
     KASSERT(claimed_ != 0);
     --claimed_;
     return (state_ == State::Closing || state_ == State::Forced)
-        && ready_.empty() && claimed_ == 0;
+        && ready_.empty() && claimed_ == 0 && publishing_ == 0;
 }
 
 auto Pager::finish_reply(Reply& reply) noexcept
@@ -1039,7 +1091,7 @@ auto Pager::close(bool force) noexcept -> bool {
         bool complete{};
         {
             kernel::sync::IrqLockGuard guard{lock_};
-            complete = ready_.empty() && claimed_ == 0;
+            complete = ready_.empty() && claimed_ == 0 && publishing_ == 0;
             if (complete) {
                 state_ = State::Closed;
             }
@@ -1102,7 +1154,7 @@ auto Pager::close(bool force) noexcept -> bool {
                 }
             }
             if (!removed) {
-                complete = ready_.empty() && claimed_ == 0;
+                complete = ready_.empty() && claimed_ == 0 && publishing_ == 0;
                 if (complete) {
                     state_ = State::Closed;
                 }

@@ -18,6 +18,6 @@ struct Message final {
 // Wait optionally carries an absolute clock deadline (uint64_t); a timeout or
 // CancelWait removes the wait only. Stop terminates; the first terminal result wins.
 // argv[0] selects the package. A successful reply carries the task token in id.
-enum class Process : uint64_t { Spawn = 1, Wait, Stop, CancelWait };
+enum class Process : uint64_t { Spawn = 1, Wait, Stop, CancelWait, Pipeline };
 
 } // namespace myos::service

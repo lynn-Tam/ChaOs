@@ -12,6 +12,7 @@
 #define MYOS_CHANNEL_MAX_WAITERS 1U
 #define MYOS_CHANNEL_MAX_RELATIONS 4U
 
+// ARM returns the current sequence for the next recheck/arm cycle.
 // Readable/Writable also become ready on close: the corresponding operation
 // can return a terminal status. Notifications are hints; retry the operation
 // to distinguish queued data, available space, and closure.

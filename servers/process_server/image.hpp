@@ -128,8 +128,9 @@ public:
             }
             request.payload.page_in.content_epoch = 1;
             service::copy(reinterpret_cast<void*>(service::IpcAddress), &request, sizeof(request));
-            if (status == MYOS_STATUS_OK)
+            if (status == MYOS_STATUS_OK) {
                 status = pager_supply(target.pager.selector(), target.memory.selector(), buffer_->staging_.selector(), 0).status;
+            }
             if (status != MYOS_STATUS_OK) {
                 const auto failed = pager_fail(target.pager.selector(), target.memory.selector()).status;
                 if (failed != MYOS_STATUS_OK) return failed;

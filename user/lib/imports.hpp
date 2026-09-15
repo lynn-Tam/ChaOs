@@ -17,6 +17,9 @@ struct Import final {
 namespace imports {
 inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import Stdin{"stdin", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import Stdout{"stdout", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import Stderr{"stderr", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Process{"process", 0x50524f43, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import Files{"files", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import FilesRead{"files.read", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};

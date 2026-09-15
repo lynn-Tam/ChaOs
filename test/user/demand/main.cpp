@@ -1,3 +1,4 @@
+#include <user/lib/stream.hpp>
 #include <user/lib/mapped_memory.hpp>
 #include <user/lib/service.hpp>
 #include <uapi/test_scenario.h>
@@ -35,7 +36,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     auto reused = MappedMemory::create(pool, vspace, MYOS_TEST_PRESSURE_RELEASE_ADDRESS, 4096);
     check(reused && *reinterpret_cast<const volatile uint8_t*>(reused.value().address) == 0);
     service::require(reused.value().close());
-    service::Console{service::capability(info, bootstrap::imports::ConsoleOutput)}
+    stream::Writer{service::capability(info, bootstrap::imports::Stdout)}
         .write("[demand] initialized data, BSS, private writes and VM reuse ok\n");
     exit();
 }

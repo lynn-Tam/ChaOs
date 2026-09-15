@@ -256,7 +256,7 @@ namespace {
     }
     auto armed = authority.value()->arm(
         authority.value(), invocation.trap.arg(1), invocation.trap.arg(2));
-    return returned(armed ? MYOS_STATUS_OK : status(armed.error()));
+    return armed ? returned(MYOS_STATUS_OK, armed.value()) : returned(status(armed.error()));
 }
 
 [[nodiscard]] auto mint(Invocation& invocation) noexcept -> Result {

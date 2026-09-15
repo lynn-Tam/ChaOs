@@ -1011,10 +1011,11 @@ auto Channel::bind(
 auto Channel::arm(
     cap::Resolved<Channel>& authority,
     usize relation_handle,
-    u64 observed) noexcept -> libk::Expected<void, ChannelError> {
+    u64 observed) noexcept -> libk::Expected<u64, ChannelError> {
     const usize index = relation_handle & kRelationIndexMask;
     const u64 generation = relation_handle >> kRelationIndexBits;
     NotificationSource* signal{};
+    u64 sequence{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (index >= relation_count_) {
@@ -1034,7 +1035,7 @@ auto Channel::arm(
             || relation.side != requested_side) {
             return libk::unexpected(ChannelError::InvalidRelation);
         }
-        const u64 sequence = sequence_locked(
+        sequence = sequence_locked(
             relation.side, relation.condition);
         relation.observed = observed;
         if (ready_locked(relation.side, relation.condition)
@@ -1048,7 +1049,7 @@ auto Channel::arm(
     if (signal != nullptr) {
         static_cast<void>(signal->signal());
     }
-    return libk::expected();
+    return libk::expected(sequence);
 }
 
 auto Channel::mint(

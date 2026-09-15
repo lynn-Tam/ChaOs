@@ -1,17 +1,26 @@
 #pragma once
 
 #include <libk/noncopyable.hpp>
+#include <libk/scope_guard.hpp>
+#include <libk/span.hpp>
 #include <user/lib/deployment_syscall.hpp>
 #include <user/lib/task_supervision.hpp>
 #include <user/lib/service.hpp>
 
 namespace myos::deploy {
 
+struct LaunchSource final {
+    const char* name{};
+    cap::CapRef capability{};
+    myos_cap_attenuation ceiling{};
+};
+
 struct LaunchOptions final {
     ImageSource image_source{};
     const bootstrap::Arguments* arguments{};
     myos_cap_t terminal_events{};
     myos_word_t close_badge{};
+    libk::Span<const LaunchSource> sources{};
     bool (*admit)(const TaskPlanView&) noexcept{};
 };
 
@@ -134,6 +143,17 @@ public:
         if (!index || !lease) return libk::nullopt;
         auto task = lease->task(*index);
         if (options.admit != nullptr && !options.admit(task)) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+        RegistrationJournal<MYOS_BOOTSTRAP_MAX_IMPORTS> temporary;
+        AuthorityId overrides[MYOS_BOOTSTRAP_MAX_IMPORTS]{};
+        auto retire = libk::on_scope_exit([&]() noexcept { checked(temporary.retire_all() == MYOS_STATUS_OK); });
+        if (options.sources.size() > MYOS_BOOTSTRAP_MAX_IMPORTS) return libk::nullopt;
+        for (size_t i = 0; i < options.sources.size(); ++i) {
+            const auto& source = options.sources[i];
+            auto id = temporary.register_source(authorities_, source.capability,
+                AuthorityCapacity + 1 + i, source.ceiling);
+            if (!id) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+            overrides[i] = *id;
+        }
         TaskAuthorityBindings bindings{};
         for (uint32_t i = 0; i < task.row()->executions.count; ++i)
             bindings.domains[i] = source(task.symbol(task.execution(i)->domain));
@@ -141,6 +161,9 @@ public:
             const auto& import = *task.import(i);
             if (import.source_class == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY) {
                 bindings.imports[i] = source(task.symbol(import.source));
+                for (size_t s = 0; s < options.sources.size(); ++s)
+                    if (task.symbol(import.source).equals(Supervisor::name(options.sources[s].name)))
+                        bindings.imports[i] = overrides[s];
                 if (!bindings.imports[i].valid()) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
             }
         }
@@ -232,6 +255,9 @@ public:
         const auto result = handle.receiver->take();
         checked(result && result->task == handle.id);
         return {.status = MYOS_STATUS_OK, .value = static_cast<myos_word_t>(result->status)};
+    }
+    auto result(const Handle& handle) const noexcept -> libk::optional<CompletionResult> {
+        return handle.receiver ? handle.receiver->result() : libk::nullopt;
     }
 
 };

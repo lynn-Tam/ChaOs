@@ -301,7 +301,9 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
                              bool denied = false) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, name, image, 1024 * 1024, false, budget};
-    task.authority(myos::bootstrap::imports::ConsoleOutput, "console.sender", MYOS_RIGHT_SEND);
+    task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
+    task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
+    task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
     if (std::string_view{name} == "cat") {
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
@@ -327,6 +329,8 @@ inline auto pack_console(char** paths)
     }
     {
         Task t{manifest, "process_server", paths[1], 32 * 1024 * 1024, true};
+        // Four live task authorities, package mappings and stream endpoints.
+        t.cspace(512, 68);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL | MYOS_RESOURCE_PAGER);
         t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
         t.channel(myos::bootstrap::imports::FilesRead, "files.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);

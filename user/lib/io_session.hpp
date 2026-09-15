@@ -102,7 +102,9 @@ public:
     // Call only after draining control/data work. A sequence mismatch or
     // terminal Channel state retains a hint in the caller's Notification.
     [[nodiscard]] auto arm() noexcept -> myos_status_t {
-        return channel_arm(channel_, readable_, sequence_).status;
+        const auto result = channel_arm(channel_, readable_, sequence_);
+        if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
+        return result.status;
     }
 
 private:
