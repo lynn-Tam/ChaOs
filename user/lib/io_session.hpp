@@ -470,7 +470,11 @@ public:
             const bool completed = queue_->publish();
             if (completed && peer_event_) {
                 const auto status = notification_signal(peer_event_.selector()).status;
-                if (status != MYOS_STATUS_OK) return status;
+                // The peer may revoke its notification while a borrowed I/O
+                // completion is still in flight. Finish the local session.
+                if (status == MYOS_STATUS_BUSY || status == MYOS_STATUS_CLOSED
+                    || status == MYOS_STATUS_INVALID_CAP) abort();
+                else if (status != MYOS_STATUS_OK) return status;
             }
         }
         if (closing_ && close_ready && (!queue_ || queue_->active() == 0)) {

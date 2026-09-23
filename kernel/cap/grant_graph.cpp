@@ -95,9 +95,10 @@ auto GrantAttachment::detach() noexcept -> bool {
 void GrantAttachment::drop_work() noexcept {
     const usize previous = work_.fetch_sub<libk::MemoryOrder::SeqCst>(1);
     KASSERT(previous != 0);
-    if (previous == 1
-        && static_cast<State>(state_.load<libk::MemoryOrder::SeqCst>())
-            == State::Detached) {
+    u8 draining = static_cast<u8>(State::Draining);
+    if (previous == 1 && state_.compare_exchange_strong<
+            libk::MemoryOrder::SeqCst, libk::MemoryOrder::SeqCst>(
+                draining, static_cast<u8>(State::Detached))) {
         KASSERT(ops_ != nullptr && ops_->released != nullptr);
         ops_->released(context_);
     }
@@ -703,7 +704,12 @@ auto GrantGraph::claim_slot() noexcept
                     return libk::expected(slot);
                 }
             }
-            if (page_count_ >= quota_.pages) {
+            // Storage follows the node quota, including a partial last page.
+            // A separate page cap silently reduced the advertised capacity
+            // whenever the node layout grew.
+            const usize max_pages = quota_.nodes / slots_per_page
+                + (quota_.nodes % slots_per_page != 0);
+            if (page_count_ >= max_pages) {
                 return libk::unexpected(
                     quarantined_slots_ == page_count_ * slots_per_page
                         ? GrantError::GenerationExhausted
@@ -1170,8 +1176,12 @@ auto GrantGraph::detach(GrantAttachment& attachment) noexcept -> bool {
         attachment.node_ = nullptr;
         attachment.generation_ = 0;
         attachment.state_.store<libk::MemoryOrder::SeqCst>(
-            static_cast<u8>(GrantAttachment::State::Detached));
-        quiescent = attachment.work_.load<libk::MemoryOrder::SeqCst>() == 0;
+            static_cast<u8>(GrantAttachment::State::Draining));
+        u8 draining = static_cast<u8>(GrantAttachment::State::Draining);
+        quiescent = attachment.work_.load<libk::MemoryOrder::SeqCst>() == 0
+            && attachment.state_.compare_exchange_strong<
+                libk::MemoryOrder::SeqCst, libk::MemoryOrder::SeqCst>(
+                    draining, static_cast<u8>(GrantAttachment::State::Detached));
 
         if (node.slot->state.load<libk::MemoryOrder::Acquire>()
                 == GrantState::Revoking
@@ -1445,52 +1455,13 @@ void GrantGraph::commit_allocation(
 
 void GrantGraph::abort_allocation(
     kernel::resource::Allocation& allocation) noexcept {
-    GrantKey root{};
-    kernel::resource::ResourcePool* pool{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        KASSERT(allocation.graph_ == this && allocation.root_.valid());
-        KASSERT(allocation.state_
-            == kernel::resource::AllocationState::Pending);
-        root = allocation.root_;
-        pool = allocation.pool_;
-        KASSERT(pool != nullptr);
-        allocation.state_ = kernel::resource::AllocationState::Revoking;
-    }
-
-    // No user capability has been published while AllocationTxn is live.
-    // Therefore this lineage has no legitimate operation or attachment and
-    // permanent revocation must complete synchronously.
-    const auto revoked = invalidate(root, allocation.revoke_);
-    KASSERT(revoked && allocation.revoke_.complete());
-
-    object::ObjectRef target{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        Node* const node = locate(root);
-        KASSERT(node != nullptr && &node->allocation == &allocation);
-        allocation.state_ = kernel::resource::AllocationState::Retiring;
-        target = libk::move(allocation.target_);
-    }
-    if (target.kind() == object::ObjectKind::ResourcePool) {
-        auto child = target.pin<kernel::resource::ResourcePool>();
-        KASSERT(child);
-        KASSERT(child.value()->close() == kernel::resource::PoolState::Closed);
-    }
-    KASSERT(target && target.retire());
-    target.reset();
-
-    pool->detach(allocation);
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        Node* const node = locate(root);
-        KASSERT(node != nullptr && &node->allocation == &allocation);
-        KASSERT(allocation.pool_ == nullptr && !allocation.target_);
-        allocation.graph_ = nullptr;
-        allocation.root_ = {};
-        allocation.state_ = kernel::resource::AllocationState::Empty;
-    }
-    reclaim(root, false);
+    // A failed constructor still owns its Permit, so the pool cannot finish
+    // closing here. Transfer the unpublished object to the same independent
+    // close used by explicit destruction; revocation may require an executor.
+    auto* const pool = allocation.pool_;
+    KASSERT(pool != nullptr);
+    commit_allocation(allocation);
+    pool->close_allocation(allocation);
 }
 
 void GrantGraph::revoke_allocation(

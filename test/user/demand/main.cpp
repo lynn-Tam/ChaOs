@@ -1,4 +1,5 @@
 #include <user/lib/stream.hpp>
+#include <user/lib/clock.hpp>
 #include <user/lib/mapped_memory.hpp>
 #include <user/lib/service.hpp>
 #include <uapi/test_scenario.h>
@@ -12,7 +13,8 @@ void check(bool value) { if (!value) myos::exit(MYOS_STATUS_INTERNAL); }
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
-    check(info.argument_count() == 1 && service::equal(info.argument(0), "demand"));
+    check((info.argument_count() == 1 || info.argument_count() == 3)
+        && service::equal(info.argument(0), "demand"));
     for (size_t i = 0; i < sizeof(initialized); ++i) {
         check(initialized[i] == (i == 0 ? 0x39 : i == 1 ? 0x82 : 0));
         initialized[i] = i % 251;
@@ -38,5 +40,20 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(reused.value().close());
     stream::Writer{service::capability(info, bootstrap::imports::Stdout)}
         .write("[demand] initialized data, BSS, private writes and VM reuse ok\n");
+    if (info.argument_count() == 3) {
+        const auto duration = decimal(info.argument(1));
+        const auto seed = decimal(info.argument(2));
+        check(duration && seed && *seed > 0 && *seed < 256);
+        initialized[0] = *seed;
+        zeroed[0] = *seed + 7;
+        Clock clock;
+        service::require(clock.open());
+        const auto deadline = clock.after_ms(*duration);
+        check(static_cast<bool>(deadline));
+        stream::Writer{service::capability(info, bootstrap::imports::Stdout)}.write("[demand] holding private pages\n");
+        check(notification_wait(service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION),
+            *deadline).status == MYOS_STATUS_TIMED_OUT);
+        check(initialized[0] == *seed && zeroed[0] == static_cast<uint8_t>(*seed + 7));
+    }
     exit();
 }

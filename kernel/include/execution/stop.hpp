@@ -4,6 +4,7 @@
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
+#include <libk/sync/atomic.hpp>
 
 namespace kernel {
 
@@ -24,8 +25,8 @@ public:
     explicit Stop(Notifier notifier = {}) noexcept : notifier_(notifier) {}
     ~Stop() noexcept;
 
-    [[nodiscard]] auto started() const noexcept -> bool { return started_; }
-    [[nodiscard]] auto complete() const noexcept -> bool { return complete_; }
+    [[nodiscard]] auto started() const noexcept -> bool { return state_.load<libk::MemoryOrder::Acquire>() != State::Idle; }
+    [[nodiscard]] auto complete() const noexcept -> bool { return state_.load<libk::MemoryOrder::Acquire>() == State::Complete; }
     [[nodiscard]] auto observation_key() const noexcept
         -> diag::concurrency::ObservationKey {
         return observation_;
@@ -44,8 +45,8 @@ private:
     Execution* target_{};
     libk::IntrusiveListHook hook_{};
     diag::concurrency::ObservationKey observation_{};
-    bool started_{};
-    bool complete_{};
+    enum class State : u8 { Idle, Started, Complete };
+    libk::Atomic<State> state_{State::Idle};
 };
 
 } // namespace execution

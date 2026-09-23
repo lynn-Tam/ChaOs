@@ -89,6 +89,7 @@ auto VSpace::start_page_invalidation(
     VmContext context,
     MappingAuthority& authority) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
+    kernel::resource::Charge refund{};
     kernel::sync::IrqLockToken lock{lock_};
     if (pending_kind_ != PendingKind::None || claim_.region != nullptr
         || authority.reclaim_page_ == nullptr) {
@@ -127,8 +128,9 @@ auto VSpace::start_page_invalidation(
     pending_kind_ = PendingKind::PageInvalidate;
     queue_page(page);
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(), libk::move(plan).value(), retire, refund);
     lock.restore();
+    refund.reset();
     return committed;
 }
 
@@ -137,6 +139,7 @@ auto VSpace::start_invalidation(
     MappingAuthority& authority,
     PendingKind kind) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
+    kernel::resource::Charge refund{};
     kernel::sync::IrqLockToken lock{lock_};
     if (pending_kind_ != PendingKind::None || claim_.region != nullptr) {
         return libk::unexpected(VSpaceError::Busy);
@@ -204,14 +207,16 @@ auto VSpace::start_invalidation(
     if (pending_pages_ == nullptr) {
         mutation.value().abort();
         retire_batch_.reset();
-        KASSERT(finish_pending());
+        KASSERT(finish_pending(refund));
         lock.restore();
+        refund.reset();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(), libk::move(plan).value(), retire, refund);
     lock.restore();
+    refund.reset();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }
@@ -245,9 +250,10 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
     /*luna change: select exact-page work from relation membership, reason:
       no convenience reclaim flag may become a second invalidation truth*/
     bool page_invalidate{};
+    kernel::resource::Charge refund{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (pending_kind_ != PendingKind::None && !finish_pending()) {
+        if (pending_kind_ != PendingKind::None && !finish_pending(refund)) {
             if (ticket_) {
                 waiting_ticket = &*ticket_;
             } else {
@@ -255,6 +261,7 @@ auto VSpace::service(VmContext context) noexcept -> VSpaceServiceResult {
             }
         }
     }
+    refund.reset();
     if (waiting_ticket != nullptr) {
         KASSERT(context.cpus != nullptr);
         switch (retry_shootdowns(*context.cpus, *waiting_ticket)) {

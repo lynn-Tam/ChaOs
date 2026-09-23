@@ -6,6 +6,7 @@
 #include <cpu/cpu_registry.hpp>
 #include <ipc/buffer.hpp>
 #include <libk/limits.hpp>
+#include <libk/checked_arithmetic.hpp>
 #include <libk/scope_guard.hpp>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
@@ -126,68 +127,55 @@ Channel::Relation::~Relation() noexcept {
     KASSERT(!notification);
 }
 
-Channel::Waiter::Waiter(Channel& channel) noexcept
+ChannelWait::ChannelWait(Channel& channel) noexcept
     : owner(&channel),
       grant_attachment(this, Channel::waiter_ops_),
       completion(kernel::operation::Completion::bind_resume<
-          Waiter,
-          &Waiter::complete,
-          &Waiter::read,
-          &Waiter::release,
-          &Waiter::cancel,
-          &Waiter::resume>(*this)) {
-    completion.set_policy(diag::concurrency::OperationPolicy{
-        .kind = diag::concurrency::WaitKind::ChannelReceive,
-        .expectation = diag::concurrency::Expectation::ExternalUnbounded,
-        .driver = diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&channel), 1),
-    });
-}
+          ChannelWait,
+          &ChannelWait::complete,
+          &ChannelWait::read,
+          &ChannelWait::release,
+          &ChannelWait::cancel,
+          &ChannelWait::resume>(*this)) {}
 
-Channel::Waiter::~Waiter() noexcept {
-    KASSERT(state == State::Idle);
+ChannelWait::~ChannelWait() noexcept {
+    KASSERT(state == State::Done && references == 0 && !hook.is_linked());
     KASSERT(!channel_ref);
     KASSERT(!grant_attachment.attached() && !grant_attachment.busy());
-    KASSERT(!grant_work);
     KASSERT(!completion.attached());
 }
 
-auto Channel::Waiter::complete() const noexcept -> bool {
+auto ChannelWait::complete() const noexcept -> bool {
     kernel::sync::IrqLockGuard guard{owner->lock_};
-    return state == State::Ready || state == State::Done;
+    return references == 1 && (state == State::Ready || state == State::Done);
 }
 
-auto Channel::Waiter::read() noexcept -> kernel::operation::Result {
+auto ChannelWait::read() noexcept -> kernel::operation::Result {
     kernel::sync::IrqLockGuard guard{owner->lock_};
-    KASSERT(state == State::Ready || state == State::Done);
+    KASSERT(references == 1 && (state == State::Ready || state == State::Done));
     return result;
 }
 
-void Channel::Waiter::release() noexcept {
-    bool finish{};
+void ChannelWait::release() noexcept {
+    owner->finish_waiter(*this);
+}
+
+auto ChannelWait::cancel() noexcept -> bool {
     {
         kernel::sync::IrqLockGuard guard{owner->lock_};
-        if (state == State::Ready) {
-            state = State::Done;
-        }
-        finish = state == State::Done;
+        if (state != State::Awaiting && state != State::Armed) return false;
+        result = kernel::operation::Result{MYOS_STATUS_CANCELED, 0};
+        state = State::Done;
+        ++references;
     }
-    if (finish) {
-        owner->finish_waiter(*this);
-    }
+    owner->detach_waiter_authority(*this);
+    owner->drop_waiter(*this);
+    // Publication, including any authority callback already in flight, owns
+    // completion. Stop retains the continuation until that publication drains.
+    return false;
 }
 
-auto Channel::Waiter::cancel() noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{owner->lock_};
-    if (state != State::Awaiting && state != State::Armed) {
-        return false;
-    }
-    result = kernel::operation::Result{MYOS_STATUS_CANCELED, 0};
-    state = State::Done;
-    return true;
-}
-
-void Channel::Waiter::resume(arch::TrapContext& trap) noexcept {
+void ChannelWait::resume(arch::TrapContext& trap) noexcept {
     static_cast<void>(owner->resume_waiter(*this, trap));
 }
 
@@ -201,32 +189,34 @@ void Channel::Relation::notification_closed() noexcept {
     }
 }
 
+auto Channel::storage_bytes(ChannelConfig config) noexcept -> libk::optional<usize> {
+    const auto cells = libk::checked_multiply(config.queue_capacity, usize{2});
+    if (!cells) return libk::nullopt;
+    const auto pages = libk::checked_add(mm::NodePool<Message>::quota_for(*cells).pages,
+        mm::NodePool<Relation>::quota_for(config.relation_capacity).pages);
+    return pages ? libk::checked_multiply(*pages, mm::page_size) : libk::nullopt;
+}
+
 Channel::Channel(kernel::mm::Pmm& pmm, ChannelConfig config) noexcept
     : config_(config),
-      messages_(pmm, mm::NodePool<Message>::Quota{
-          .nodes = max_messages,
-          .pages = max_messages}),
+      messages_(pmm, mm::NodePool<Message>::quota_for(config.queue_capacity * 2)),
       side_links_{
           SideLink{*this, ChannelSide::A},
           SideLink{*this, ChannelSide::B}},
-      waiter_(*this) {
-    for (Relation& relation : relations_) {
-        relation.owner = this;
-    }
-}
+      relation_pool_(pmm, mm::NodePool<Relation>::quota_for(config.relation_capacity)) {}
 
 Channel::~Channel() noexcept {
-    KASSERT(!cleanup_);
+    KASSERT(!cleanup_ && waiter_count_ == 0);
     clear_queues();
-    for (usize index = 0; index < free_message_count_; ++index) {
-        KASSERT(free_messages_[index] != nullptr);
-        messages_.destroy(*free_messages_[index]);
-        free_messages_[index] = nullptr;
+    while (!free_messages_.empty()) {
+        auto& message = free_messages_.pop_front();
+        messages_.destroy(message);
     }
-    free_message_count_ = 0;
     KASSERT(messages_.live_count() == 0);
-    for (Relation& relation : relations_) {
+    while (!relations_.empty()) {
+        auto& relation = relations_.pop_front();
         KASSERT(relation.state == Relation::State::Idle);
+        relation_pool_.destroy(relation);
     }
     for (SideLink& link : side_links_) {
         KASSERT(!link.attachment.attached() && !link.attachment.busy());
@@ -238,6 +228,7 @@ Channel::~Channel() noexcept {
 void Channel::bind_sponsor(
     kernel::resource::Sponsorship& sponsor) noexcept {
     messages_.bind_sponsor(sponsor);
+    relation_pool_.bind_sponsor(sponsor);
 }
 
 auto Channel::open() noexcept -> libk::Expected<void, ChannelError> {
@@ -246,7 +237,6 @@ auto Channel::open() noexcept -> libk::Expected<void, ChannelError> {
         || config_.max_words == 0
         || config_.max_words > MYOS_CHANNEL_MAX_WORDS
         || config_.max_caps > MYOS_CHANNEL_MAX_CAPS
-        || config_.waiter_capacity > MYOS_CHANNEL_MAX_WAITERS
         || config_.relation_capacity > MYOS_CHANNEL_MAX_RELATIONS) {
         return libk::unexpected(ChannelError::Invalid);
     }
@@ -257,17 +247,21 @@ auto Channel::open() noexcept -> libk::Expected<void, ChannelError> {
         }
     }
 
+    // Creation pays for every cell and readiness slot. Operational paths only
+    // move intrusive links and never grow backing storage.
     const usize required = config_.queue_capacity * 2;
-    for (usize index = free_message_count_; index < required; ++index) {
+    while (free_messages_.size() < required) {
         auto made = messages_.create();
-        if (!made) {
-            while (free_message_count_ != 0) {
-                messages_.destroy(*free_messages_[--free_message_count_]);
-                free_messages_[free_message_count_] = nullptr;
-            }
-            return libk::unexpected(ChannelError::ResourceExhausted);
-        }
-        free_messages_[free_message_count_++] = made.value().object;
+        if (!made) return libk::unexpected(ChannelError::ResourceExhausted);
+        free_messages_.push_back(*made.value().object);
+    }
+    while (relations_.size() < config_.relation_capacity) {
+        auto made = relation_pool_.create();
+        if (!made) return libk::unexpected(ChannelError::ResourceExhausted);
+        auto& relation = *made.value().object;
+        relation.owner = this;
+        relation.index = relations_.size();
+        relations_.push_back(relation);
     }
 
     kernel::sync::IrqLockGuard guard{lock_};
@@ -346,8 +340,7 @@ auto Channel::ready_locked(
         return !current.queue.empty() || current.closed || other.closed;
     case ChannelCondition::Writable:
         return current.closed || other.closed
-            || (!other.queue.full()
-                && other.queue.size() < config_.queue_capacity);
+            || (other.occupied < config_.queue_capacity);
     case ChannelCondition::PeerClosed:
         return other.closed;
     }
@@ -361,42 +354,60 @@ auto Channel::sequence_locked(
 }
 
 void Channel::notify_ready() {
-    NotificationSource* pending[MYOS_CHANNEL_MAX_RELATIONS]{};
-    usize count{};
-    Waiter* waiter{};
+    Waiter* ready[4]{};
+    usize ready_count{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (waiters_ != 0
-            && (waiter_.state == Waiter::State::Awaiting
-                || waiter_.state == Waiter::State::Armed)
-            && waiter_ready_locked(waiter_)) {
-            waiter_.state = Waiter::State::Ready;
-            waiter = &waiter_;
-        }
-        for (usize index = 0; index < relation_count_; ++index) {
-            Relation& relation = relations_[index];
-            if (relation.state != Relation::State::Attached || !relation.armed
-                || !ready_locked(relation.side, relation.condition)) {
-                continue;
-            }
-            const u64 sequence = sequence_locked(
-                relation.side, relation.condition);
-            relation.observed = sequence;
-            relation.armed = false;
-            if (count < MYOS_CHANNEL_MAX_RELATIONS) {
-                pending[count++] = &relation.source;
+        for (auto& queues : wait_queues_) {
+            for (auto& queue : queues) {
+                if (queue.empty()) continue;
+                Waiter& waiter = queue.front();
+                if ((waiter.state == Waiter::State::Awaiting
+                        || waiter.state == Waiter::State::Armed)
+                    && waiter_ready_locked(waiter)) {
+                    waiter.state = Waiter::State::Ready;
+                    ++waiter.references;
+                    ready[ready_count++] = &waiter;
+                }
             }
         }
     }
-    for (usize index = 0; index < count; ++index) {
-        static_cast<void>(pending[index]->signal());
+    // The ABI bounds the readiness fanout independently of waiter count.
+    // Signal one source at a time rather than putting the fanout on the stack.
+    for (auto& relation : relations_) {
+        NotificationSource* pending{};
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            if (relation.state == Relation::State::Attached && relation.armed
+                && ready_locked(relation.side, relation.condition)) {
+                relation.observed = sequence_locked(relation.side, relation.condition);
+                relation.armed = false;
+                pending = &relation.source;
+            }
+        }
+        if (pending != nullptr) (void)pending->signal();
     }
-    if (waiter != nullptr) {
-        waiter->completion.signal();
+    for (usize index = 0; index < ready_count; ++index) {
+        detach_waiter_authority(*ready[index]);
+        drop_waiter(*ready[index]);
     }
 }
 
-auto Channel::waiter_ready_locked(const Waiter& waiter) const noexcept -> bool {
+auto Channel::wait_queue(Waiter::Kind kind, ChannelSide value) noexcept -> WaitQueue& {
+    return wait_queues_[side_index(value)][static_cast<usize>(kind)];
+}
+
+auto Channel::owns_turn_locked(
+    Waiter::Kind kind, ChannelSide value, const Waiter* reservation) noexcept -> bool {
+    auto& queue = wait_queue(kind, value);
+    return reservation == nullptr ? queue.empty()
+        : !queue.empty() && &queue.front() == reservation
+            && reservation->state == Waiter::State::Ready;
+}
+
+auto Channel::waiter_ready_locked(const Waiter& waiter) noexcept -> bool {
+    const auto& queue = wait_queue(waiter.kind, waiter.side);
+    if (queue.empty() || &queue.front() != &waiter) return false;
     if (closing_ || !opened_) {
         return true;
     }
@@ -407,8 +418,7 @@ auto Channel::waiter_ready_locked(const Waiter& waiter) const noexcept -> bool {
         // transition. The resume path re-resolves the authority and returns
         // CLOSED/PEER_CLOSED instead of leaving a blocked sender stranded.
         return current.closed || other.closed
-            || (!other.queue.full()
-                && other.queue.size() < config_.queue_capacity);
+            || (other.occupied < config_.queue_capacity);
     }
     return !current.queue.empty() || current.closed || other.closed;
 }
@@ -427,7 +437,7 @@ auto Channel::arm_waiter(Waiter& waiter) noexcept -> bool {
         }
     }
     if (ready) {
-        waiter.completion.signal();
+        detach_waiter_authority(waiter);
     }
     return ready;
 }
@@ -461,36 +471,24 @@ auto Channel::send_impl(
         return libk::unexpected(ChannelError::Invalid);
     }
 
+    Message* message{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (!opened_ || closing_) {
             return libk::unexpected(ChannelError::Closed);
         }
-        const bool owns_reservation = reservation == &waiter_
-            && waiter_.state == Waiter::State::Ready
-            && waiter_.kind == Waiter::Kind::Send
-            && waiter_.side == *side_value;
-        if (reservation != nullptr && !owns_reservation) {
-            return libk::unexpected(ChannelError::Busy);
-        }
-        if (reservation == nullptr
-            && waiter_.state == Waiter::State::Ready
-            && waiter_.kind == Waiter::Kind::Send
-            && waiter_.side == *side_value) {
-            // A Ready sender owns the first available peer slot until its
-            // resume callback commits or reports its terminal result.
+        if (!owns_turn_locked(Waiter::Kind::Send, *side_value, reservation)) {
             return libk::unexpected(ChannelError::WouldBlock);
         }
         const Side& current = side(*side_value);
-        const Side& target = side(peer(*side_value));
+        Side& target = side(peer(*side_value));
         if (current.closed) {
             return libk::unexpected(ChannelError::Closed);
         }
         if (target.closed) {
             return libk::unexpected(ChannelError::PeerClosed);
         }
-        if (target.queue.full()
-            || target.queue.size() >= config_.queue_capacity) {
+        if (target.occupied >= config_.queue_capacity) {
             return libk::unexpected(ChannelError::WouldBlock);
         }
         if (target.sequence[static_cast<usize>(ChannelCondition::Readable)]
@@ -499,12 +497,12 @@ auto Channel::send_impl(
                 == libk::numeric_limits<u64>::max()) {
             return libk::unexpected(ChannelError::GenerationExhausted);
         }
+        KASSERT(!free_messages_.empty());
+        message = &free_messages_.pop_front();
+        message->destination = peer(*side_value);
+        ++target.occupied;
     }
 
-    Message* const message = take_message();
-    if (message == nullptr) {
-        return libk::unexpected(ChannelError::ResourceExhausted);
-    }
     message->transaction = request.transaction;
     message->tag = request.tag;
     message->sender_badge = auth->badge;
@@ -535,16 +533,7 @@ auto Channel::send_impl(
         if (!opened_ || closing_) {
             failure = ChannelError::Closed;
         } else {
-            const bool owns_reservation = reservation == &waiter_
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Send
-                && waiter_.side == *side_value;
-            if (reservation != nullptr && !owns_reservation) {
-                failure = ChannelError::Busy;
-            } else if (reservation == nullptr
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Send
-                && waiter_.side == *side_value) {
+            if (!owns_turn_locked(Waiter::Kind::Send, *side_value, reservation)) {
                 failure = ChannelError::WouldBlock;
             } else {
                 Side& target = side(peer(*side_value));
@@ -552,9 +541,6 @@ auto Channel::send_impl(
                     failure = ChannelError::Closed;
                 } else if (target.closed) {
                     failure = ChannelError::PeerClosed;
-                } else if (target.queue.full()
-                    || target.queue.size() >= config_.queue_capacity) {
-                    failure = ChannelError::WouldBlock;
                 } else {
                     u64& readable_sequence = target.sequence[
                         static_cast<usize>(ChannelCondition::Readable)];
@@ -570,7 +556,7 @@ auto Channel::send_impl(
                         sequence = readable_sequence;
                         message->sequence = sequence;
                         ++writable_sequence;
-                        target.queue.emplace_back(message);
+                        target.queue.push_back(*message);
                         enqueued = true;
                     }
                 }
@@ -602,65 +588,11 @@ auto Channel::send_blocking(
     if (sent.error() != ChannelError::WouldBlock) {
         return libk::unexpected(sent.error());
     }
-    auto reference = authority.reference();
-    if (!reference) {
-        return libk::unexpected(ChannelError::Busy);
-    }
-    const auto side_value = authority_side(authority, cap::Right::Send);
-    KASSERT(side_value);
-
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (waiters_ != 0 || waiter_.state != Waiter::State::Idle) {
-            return libk::unexpected(ChannelError::Busy);
-        }
-        waiter_.kind = Waiter::Kind::Send;
-        waiter_.state = Waiter::State::Attaching;
-        waiter_.side = *side_value;
-        waiter_.cspace = &source;
-        waiter_.authority = authority_handle;
-        waiter_.thread = &thread;
-        waiter_.cpus = &cpus;
-        waiter_.buffer = nullptr;
-        waiter_.send = request;
-        waiter_.recv = {};
-        waiter_.result = {};
-        waiter_.channel_ref = libk::move(reference).value();
-        ++waiters_;
-    }
-
-    if (!authority.attach(waiter_.grant_attachment)) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            waiter_.result = kernel::operation::Result{
-                MYOS_STATUS_BUSY, 0};
-            waiter_.state = Waiter::State::Done;
-        }
-        finish_waiter(waiter_);
-        return libk::unexpected(ChannelError::Busy);
-    }
-    if (!thread.begin_wait(waiter_.completion, cpus)) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            waiter_.result = kernel::operation::Result{
-                MYOS_STATUS_BUSY, 0};
-            waiter_.state = Waiter::State::Done;
-        }
-        finish_waiter(waiter_);
-        return libk::unexpected(ChannelError::Busy);
-    }
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (waiter_.state != Waiter::State::Done) {
-            waiter_.state = Waiter::State::Awaiting;
-        }
-    }
-    return libk::expected(
-        ChannelWaitResult{
-            arm_waiter(waiter_)
-                ? kernel::operation::State::Complete
-                : kernel::operation::State::Waiting,
-            0});
+    auto queued = enqueue_waiter(authority, authority_handle, source, thread, Waiter::Kind::Send);
+    if (!queued) return libk::unexpected(queued.error());
+    Waiter& waiter = *queued.value();
+    waiter.send = request;
+    return begin_wait(waiter, authority, thread, cpus);
 }
 
 auto Channel::receive(
@@ -690,19 +622,7 @@ auto Channel::receive_impl(
             if (!opened_ || closing_) {
                 return libk::unexpected(ChannelError::Closed);
             }
-            const bool owns_reservation = reservation == &waiter_
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Receive
-                && waiter_.side == *side_value;
-            if (reservation != nullptr && !owns_reservation) {
-                return libk::unexpected(ChannelError::Busy);
-            }
-            if (reservation == nullptr
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Receive
-                && waiter_.side == *side_value) {
-                // A Ready receiver owns the queue head until its resume
-                // callback publishes the result or a terminal error.
+            if (!owns_turn_locked(Waiter::Kind::Receive, *side_value, reservation)) {
                 return libk::unexpected(ChannelError::WouldBlock);
             }
             Side& current = side(*side_value);
@@ -716,7 +636,7 @@ auto Channel::receive_impl(
                     : libk::Expected<void, ChannelError>{
                           libk::unexpected(ChannelError::WouldBlock)};
             }
-            const Message& message = *current.queue.front();
+            const Message& message = current.queue.front();
             cap_count = message.escrows.size();
             if (cap_count > result.receive_limit) {
                 return libk::unexpected(ChannelError::ResourceExhausted);
@@ -740,24 +660,14 @@ auto Channel::receive_impl(
         {
             kernel::sync::IrqLockGuard guard{lock_};
             Side& current = side(*side_value);
-            const bool owns_reservation = reservation == &waiter_
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Receive
-                && waiter_.side == *side_value;
-            if (reservation != nullptr && !owns_reservation) {
-                return libk::unexpected(ChannelError::Busy);
-            }
-            if (reservation == nullptr
-                && waiter_.state == Waiter::State::Ready
-                && waiter_.kind == Waiter::Kind::Receive
-                && waiter_.side == *side_value) {
+            if (!owns_turn_locked(Waiter::Kind::Receive, *side_value, reservation)) {
                 return libk::unexpected(ChannelError::WouldBlock);
             }
             if (current.queue.empty()
-                || current.queue.front()->sequence != expected_sequence) {
+                || current.queue.front().sequence != expected_sequence) {
                 continue;
             }
-            Message& message = *current.queue.front();
+            Message& message = current.queue.front();
             received.transaction = message.transaction;
             received.tag = message.tag;
             received.sender_badge = message.sender_badge;
@@ -771,7 +681,7 @@ auto Channel::receive_impl(
             if (commit == CommitResult::Capacity) {
                 return libk::unexpected(ChannelError::ResourceExhausted);
             }
-            current.queue.pop_front();
+            (void)current.queue.pop_front();
             const usize readable = static_cast<usize>(
                 ChannelCondition::Readable);
             const usize writable = static_cast<usize>(
@@ -815,65 +725,90 @@ auto Channel::receive_blocking(
     if (received.error() != ChannelError::WouldBlock) {
         return libk::unexpected(received.error());
     }
+    auto queued = enqueue_waiter(authority, authority_handle, destination, thread, Waiter::Kind::Receive);
+    if (!queued) return libk::unexpected(queued.error());
+    Waiter& waiter = *queued.value();
+    waiter.buffer = buffer;
+    waiter.receive_limit = result.receive_limit;
+    return begin_wait(waiter, authority, thread, cpus);
+}
+
+auto Channel::enqueue_waiter(
+    cap::Resolved<Channel>& authority, cap::CapHandle handle,
+    cap::CSpace& cspace, kernel::Thread& thread, Waiter::Kind kind) noexcept
+    -> libk::Expected<Waiter*, ChannelError> {
     auto reference = authority.reference();
-    if (!reference) {
-        return libk::unexpected(ChannelError::Busy);
-    }
-    const auto side_value = authority_side(authority, cap::Right::Receive);
-    KASSERT(side_value);
-
+    if (!reference) return libk::unexpected(ChannelError::Invalid);
+    const auto value = authority_side(authority,
+        kind == Waiter::Kind::Send ? cap::Right::Send : cap::Right::Receive);
+    KASSERT(value);
+    auto* node = thread.current_wait().prepare_channel(*this);
+    if (node == nullptr) return libk::unexpected(ChannelError::Busy);
+    Waiter& waiter = *node;
+    waiter.kind = kind;
+    waiter.side = *value;
+    waiter.cspace = &cspace;
+    waiter.authority = handle;
+    waiter.channel_ref = libk::move(reference).value();
+    waiter.completion.set_policy(diag::concurrency::OperationPolicy{
+        .kind = kind == Waiter::Kind::Send
+            ? diag::concurrency::WaitKind::ChannelSend
+            : diag::concurrency::WaitKind::ChannelReceive,
+        .expectation = diag::concurrency::Expectation::ExternalUnbounded,
+        .driver = diag::concurrency::NodeRef::external(reinterpret_cast<u64>(this), 1),
+    });
+    bool accepted{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (waiters_ != 0 || waiter_.state != Waiter::State::Idle) {
-            return libk::unexpected(ChannelError::Busy);
+        accepted = opened_ && !closing_;
+        if (accepted) {
+            ++waiter_count_;
+            wait_queue(kind, *value).push_back(waiter);
+        } else {
+            waiter.state = Waiter::State::Done;
+            waiter.references = 0;
         }
-        waiter_.kind = Waiter::Kind::Receive;
-        waiter_.state = Waiter::State::Attaching;
-        waiter_.side = *side_value;
-        waiter_.cspace = &destination;
-        waiter_.authority = authority_handle;
-        waiter_.thread = &thread;
-        waiter_.cpus = &cpus;
-        waiter_.buffer = buffer;
-        waiter_.send = {};
-        waiter_.recv = result;
-        waiter_.result = {};
-        waiter_.channel_ref = libk::move(reference).value();
-        ++waiters_;
     }
+    if (!accepted) {
+        waiter.channel_ref.reset();
+        return libk::unexpected(ChannelError::Closed);
+    }
+    return libk::expected(&waiter);
+}
 
-    if (!authority.attach(waiter_.grant_attachment)) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            waiter_.result = kernel::operation::Result{
-                MYOS_STATUS_BUSY, 0};
-            waiter_.state = Waiter::State::Done;
-        }
-        finish_waiter(waiter_);
-        return libk::unexpected(ChannelError::Busy);
+auto Channel::begin_wait(
+    Waiter& waiter, cap::Resolved<Channel>& authority,
+    kernel::Thread& thread, kernel::CpuRegistry& cpus) noexcept
+    -> libk::Expected<ChannelWaitResult, ChannelError> {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        ++waiter.references; // Completion, before any producer can publish.
     }
-    if (!thread.begin_wait(waiter_.completion, cpus)) {
-        {
-            kernel::sync::IrqLockGuard guard{lock_};
-            waiter_.result = kernel::operation::Result{
-                MYOS_STATUS_BUSY, 0};
-            waiter_.state = Waiter::State::Done;
-        }
-        finish_waiter(waiter_);
+    if (!thread.begin_wait(waiter.completion, cpus)) {
+        { kernel::sync::IrqLockGuard guard{lock_}; --waiter.references; }
+        finish_waiter(waiter);
         return libk::unexpected(ChannelError::Busy);
     }
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (waiter_.state != Waiter::State::Done) {
-            waiter_.state = Waiter::State::Awaiting;
-        }
+        ++waiter.references; // Authority and all its dispatched callbacks.
     }
-    return libk::expected(
-        ChannelWaitResult{
-            arm_waiter(waiter_)
-                ? kernel::operation::State::Complete
-                : kernel::operation::State::Waiting,
-            0});
+    const bool attached = static_cast<bool>(authority.attach(waiter.grant_attachment));
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!attached) {
+            waiter.result = kernel::operation::Result{MYOS_STATUS_INVALID_CAP, 0};
+            waiter.state = Waiter::State::Done;
+            waiter.authority_detaching = true;
+            --waiter.references;
+        } else if (waiter.state == Waiter::State::Attaching) {
+            waiter.state = Waiter::State::Awaiting;
+        }
+        waiter.admitted = true;
+    }
+    (void)arm_waiter(waiter);
+    drop_waiter(waiter); // Admission is the last access on this path.
+    return libk::expected(ChannelWaitResult{kernel::operation::State::Waiting, 0});
 }
 
 auto Channel::close(ChannelSide value) noexcept -> bool {
@@ -943,18 +878,14 @@ auto Channel::bind(
         if (!opened_ || closing_) {
             return libk::unexpected(ChannelError::ResourceExhausted);
         }
-        for (index = 0; index < relation_count_; ++index) {
-            if (relations_[index].state == Relation::State::Idle) {
+        for (auto& candidate : relations_) {
+            if (candidate.state == Relation::State::Idle) {
+                relation = &candidate;
                 break;
             }
         }
-        if (index == relation_count_) {
-            if (relation_count_ == config_.relation_capacity) {
-                return libk::unexpected(ChannelError::ResourceExhausted);
-            }
-            ++relation_count_;
-        }
-        relation = &relations_[index];
+        if (relation == nullptr) return libk::unexpected(ChannelError::ResourceExhausted);
+        index = relation->index;
         if (relation->generation == kRelationGenerationMax) {
             return libk::unexpected(ChannelError::GenerationExhausted);
         }
@@ -1018,10 +949,10 @@ auto Channel::arm(
     u64 sequence{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (index >= relation_count_) {
+        if (index >= relations_.size()) {
             return libk::unexpected(ChannelError::InvalidRelation);
         }
-        Relation& relation = relations_[index];
+        Relation& relation = relation_at(index);
         const cap::Right required = relation.condition
             == ChannelCondition::Writable
             ? cap::Right::Send : cap::Right::Receive;
@@ -1111,25 +1042,6 @@ void Channel::retire(object::ObjectCleanup&& cleanup) noexcept {
     }
     static_cast<void>(close(ChannelSide::A));
     static_cast<void>(close(ChannelSide::B));
-    bool wake_waiter{};
-    bool finish_waiter_now{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (waiter_.state != Waiter::State::Idle
-            && waiter_.state != Waiter::State::Done) {
-            waiter_.result = kernel::operation::Result{
-                MYOS_STATUS_CLOSED, 0};
-            waiter_.state = Waiter::State::Done;
-            wake_waiter = waiter_.completion.attached();
-        } else if (waiter_.state == Waiter::State::Done) {
-            finish_waiter_now = true;
-        }
-    }
-    if (wake_waiter) {
-        waiter_.completion.signal();
-    } else if (finish_waiter_now) {
-        finish_waiter(waiter_);
-    }
     clear_queues();
     for (Relation& relation : relations_) {
         if (relation.state != Relation::State::Idle) {
@@ -1148,49 +1060,44 @@ auto Channel::side_state(ChannelSide value) const noexcept -> bool {
 }
 
 void Channel::finish_waiter(Waiter& waiter) noexcept {
-    cap::GrantWork work{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (waiter.state != Waiter::State::Done
-            || waiter.completion.attached()) {
-            return;
-        }
-        work = libk::move(waiter.grant_work);
+        KASSERT(!waiter.completion.attached() && waiter.references == 1);
+        KASSERT(!waiter.grant_attachment.attached() && !waiter.grant_attachment.busy());
+        waiter.state = Waiter::State::Done;
+        waiter.references = 0;
+        wait_queue(waiter.kind, waiter.side).erase(waiter);
+        KASSERT(waiter_count_ != 0);
+        --waiter_count_;
     }
-    work.reset();
-    if (waiter.grant_attachment.attached()
-        && !waiter.grant_attachment.detach()) {
-        return;
-    }
-    if (waiter.grant_attachment.busy()) {
-        return;
-    }
-    waiter.grant_attachment.reset();
-    object::ObjectRef channel_ref{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (waiter.state != Waiter::State::Done
-            || waiter.completion.attached()
-            || waiter.grant_attachment.attached()
-            || waiter.grant_attachment.busy()) {
-            return;
-        }
-        channel_ref = libk::move(waiter.channel_ref);
-        waiter.kind = Waiter::Kind::Idle;
-        waiter.cspace = nullptr;
-        waiter.authority = {};
-        waiter.thread = nullptr;
-        waiter.cpus = nullptr;
-        waiter.buffer = nullptr;
-        waiter.send = {};
-        waiter.recv = {};
-        waiter.result = {};
-        waiter.state = Waiter::State::Idle;
-        KASSERT(waiters_ == 1);
-        waiters_ = 0;
-    }
-    channel_ref.reset();
+    auto channel_ref = libk::move(waiter.channel_ref);
+    notify_ready();
     try_finish_retire();
+}
+
+void Channel::detach_waiter_authority(Waiter& waiter) noexcept {
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        if (!waiter.admitted || waiter.authority_detaching) return;
+        waiter.authority_detaching = true;
+    }
+    if (waiter.grant_attachment.detach()) drop_waiter(waiter);
+    // Otherwise the last dispatched GrantWork drops the authority reference.
+}
+
+void Channel::drop_waiter(Waiter& waiter) noexcept {
+    bool publish{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(waiter.references > 1);
+        --waiter.references;
+        publish = waiter.references == 1
+            && (waiter.state == Waiter::State::Ready || waiter.state == Waiter::State::Done);
+        if (publish) KASSERT(waiter.admitted && waiter.authority_detaching);
+    }
+    // The sole remaining reference belongs to Completion. No callback can
+    // access resident storage after it becomes consumable by the continuation.
+    if (publish) waiter.completion.signal();
 }
 
 void Channel::invalidate_waiter(
@@ -1205,31 +1112,20 @@ void Channel::invalidate_waiter(
 void Channel::release_waiter(void* context) noexcept {
     KASSERT(context != nullptr);
     auto& waiter = *static_cast<Waiter*>(context);
-    waiter.owner->waiter_released(waiter);
+    waiter.owner->drop_waiter(waiter);
 }
 
 void Channel::waiter_invalidated(
-    Waiter& waiter,
-    cap::GrantWork&& work) noexcept {
-    bool signal{};
+    Waiter& waiter, cap::GrantWork&& work) noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        waiter.grant_work = libk::move(work);
-        if (waiter.state != Waiter::State::Idle
-            && waiter.state != Waiter::State::Done) {
-            waiter.result = kernel::operation::Result{
-                MYOS_STATUS_DENIED, 0};
-            waiter.state = Waiter::State::Done;
-            signal = waiter.completion.attached();
-        }
+        ++waiter.references;
+        waiter.result = kernel::operation::Result{MYOS_STATUS_DENIED, 0};
+        waiter.state = Waiter::State::Done;
     }
-    if (signal) {
-        waiter.completion.signal();
-    }
-}
-
-void Channel::waiter_released(Waiter& waiter) noexcept {
-    finish_waiter(waiter);
+    detach_waiter_authority(waiter);
+    work.reset();
+    drop_waiter(waiter);
 }
 
 auto Channel::resume_waiter(
@@ -1267,7 +1163,8 @@ auto Channel::resume_waiter(
             }
         }
     } else {
-        ChannelRecv received = waiter.recv;
+        ChannelRecv received{};
+        received.receive_limit = waiter.receive_limit;
         auto authority = waiter.cspace->resolve<Channel>(
             waiter.authority, cap::Rights::of(cap::Right::Receive));
         if (!authority) {
@@ -1430,8 +1327,7 @@ void Channel::try_finish_retire() noexcept {
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (!cleanup_ || !closing_
-            || waiter_.state != Waiter::State::Idle
-            || waiters_ != 0) {
+            || waiter_count_ != 0) {
             return;
         }
         for (const SideLink& link : side_links_) {
@@ -1549,18 +1445,22 @@ void Channel::discard_message(Message& message) noexcept {
     message.escrows.clear();
 }
 
-auto Channel::take_message() noexcept -> Message* {
-    kernel::sync::IrqLockGuard guard{lock_};
-    if (free_message_count_ == 0) {
-        return nullptr;
-    }
-    return free_messages_[--free_message_count_];
+auto Channel::relation_at(usize index) noexcept -> Relation& {
+    KASSERT(index < relations_.size());
+    auto it = relations_.begin();
+    while (index-- != 0) ++it;
+    return *it;
 }
 
 void Channel::release_message(Message& message) noexcept {
-    kernel::sync::IrqLockGuard guard{lock_};
-    KASSERT(free_message_count_ < max_messages);
-    free_messages_[free_message_count_++] = &message;
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        auto& target = side(message.destination);
+        KASSERT(target.occupied != 0);
+        --target.occupied;
+        free_messages_.push_back(message);
+    }
+    notify_ready();
 }
 
 void Channel::clear_queues() noexcept {
@@ -1573,8 +1473,7 @@ void Channel::clear_queues() noexcept {
                 if (current.queue.empty()) {
                     break;
                 }
-                message = current.queue.front();
-                current.queue.pop_front();
+                message = &current.queue.pop_front();
             }
             KASSERT(message != nullptr);
             discard_message(*message);

@@ -766,6 +766,7 @@ template<typename BuilderT>
         .scratch = &scratch,
         .bootstrap = nullptr,
         .bootstrap_size = 0,
+        .runtime_cpu_count = 1,
         .bindings = &bindings,
         .workspace = construction_workspace,
     };
@@ -1685,6 +1686,7 @@ void put_manifest(
         .scratch = &scratch,
         .bootstrap = nullptr,
         .bootstrap_size = 0,
+        .runtime_cpu_count = 1,
         .bindings = &bindings,
         .workspace = construction_workspace,
     };
@@ -2028,6 +2030,7 @@ void put_manifest(
         .scratch = &scratch,
         .bootstrap = "boot",
         .bootstrap_size = 4,
+        .runtime_cpu_count = 1,
         .bindings = &bindings,
         .workspace = construction_workspace,
     };

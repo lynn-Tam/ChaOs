@@ -1,6 +1,7 @@
 #pragma once
 
 #include <user/lib/imports.hpp>
+#include <test/user/io/file_fault.hpp>
 
 #include <array>
 #include <map>
@@ -268,7 +269,7 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
     return manifest.finish();
 }
 
-inline auto pack_file_session(char** paths) -> std::vector<uint8_t> {
+inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vector<uint8_t> {
     Manifest manifest;
     constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
     {
@@ -292,12 +293,19 @@ inline auto pack_file_session(char** paths) -> std::vector<uint8_t> {
         task.cspace(128, 20);
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, MYOS_RIGHT_SEND);
+        if (fault_test) {
+            task.authority(file_fault_test::Ready, "test.ready", MYOS_RIGHT_SIGNAL);
+            task.authority(file_fault_test::Go, "test.go", MYOS_RIGHT_RECEIVE);
+        }
         task.finish();
     }
     return manifest.finish();
 }
 
-inline auto pack_application(const char* name, const char* image, uint64_t budget = 1'000'000,
+// Four ordinary instances share the 10% left on a single hart after the root,
+// service and kernel reservations. Admission still enforces the real domain.
+inline constexpr uint64_t ApplicationBudget = 250'000;
+inline auto pack_application(const char* name, const char* image, uint64_t budget = ApplicationBudget,
                              bool denied = false) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, name, image, 1024 * 1024, false, budget};
@@ -311,6 +319,23 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
     }
     if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();
+    return manifest.finish();
+}
+
+inline auto pack_channel_test(const char* coordinator, const char* worker) -> std::vector<uint8_t> {
+    Manifest manifest;
+    {
+        Task task{manifest, "channel-test", coordinator, 8 * 1024 * 1024, true};
+        task.cspace(512, 68);
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.finish();
+    }
+    {
+        Task task{manifest, "writer", worker, 1024 * 1024, false, ApplicationBudget};
+        task.channel(myos::bootstrap::imports::Stdout, "data", 0, 1, MYOS_RIGHT_SEND);
+        task.channel(myos::bootstrap::imports::Stderr, "ready", 0, 1, MYOS_RIGHT_SEND);
+        task.finish();
+    }
     return manifest.finish();
 }
 

@@ -30,7 +30,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     uint64_t write_sequence = 0;
     for (;;) {
         // Bound each drain so sustained output cannot starve receive/IRQ ack.
-        for (unsigned count = 0; count < MYOS_CHANNEL_MAX_QUEUE; ++count) {
+        for (unsigned count = 0; count < 16; ++count) {
             service::Message message{};
             const auto result = service::receive(output, message, false);
             if (result.status == MYOS_STATUS_WOULD_BLOCK || result.status == MYOS_STATUS_BUSY) break;

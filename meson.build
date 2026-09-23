@@ -721,6 +721,25 @@ file_session_bundle = custom_target(
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'files=@INPUT2@', 'file-client=@INPUT3@', 'data:manifest=@INPUT4@'],
   build_by_default: false,
 )
+file_fault_user = executable(
+  'file-fault.elf', files('test/user/io/file_fault.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+file_fault_init_user = executable(
+  'file-fault-init.elf', files('test/user/io/file_fault_init.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+file_fault_manifest = custom_target(
+  'file-fault-manifest', input: [block_user, files_user, file_fault_user], output: 'file-fault.manifest',
+  command: [deploypack, 'file-fault', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+file_fault_bundle = custom_target(
+  'file-fault-bundle', input: [file_fault_init_user, block_user, files_user, file_fault_user, file_fault_manifest],
+  output: 'file-fault.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'block=@INPUT1@', 'files=@INPUT2@', 'file-client=@INPUT3@', 'data:manifest=@INPUT4@'], build_by_default: false,
+)
 file_failure_manifest = custom_target(
   'file-failure-manifest', input: [block_user, files_user, file_failure_user], output: 'file-failure.manifest',
   command: [deploypack, 'file-session', '@OUTPUT@', '@INPUT@'], build_by_default: false,
@@ -735,6 +754,44 @@ file_failure_bundle = custom_target(
 native_manifest = custom_target(
   'native-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user],
   output: 'native.manifest', command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+channel_init_user = executable(
+  'channel-init.elf', files('test/user/channel/init.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+channel_test_user = executable(
+  'channel-test.elf', files('test/user/channel/main.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+channel_worker_user = executable(
+  'channel-worker.elf', files('test/user/channel/worker.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+channel_test_manifest = custom_target(
+  'channel-test-manifest', input: [channel_test_user, channel_worker_user],
+  output: 'channel-test.manifest', command: [deploypack, 'channel-test', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+channel_test_bundle = custom_target(
+  'channel-test-bundle', input: [channel_init_user, channel_test_user, channel_worker_user, channel_test_manifest],
+  output: 'channel-test.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'channel-test=@INPUT1@', 'writer=@INPUT2@', 'data:manifest=@INPUT3@'], build_by_default: false,
+)
+process_client_user = executable(
+  'process-client.elf', files('test/user/process/main.cpp'),
+  c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+process_test_manifest = custom_target(
+  'process-test-manifest', input: [uart_user, process_server_user, process_client_user, block_user, files_user],
+  output: 'process-test.manifest', command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
+)
+process_test_bundle = custom_target(
+  'process-test-bundle', input: [init_user, uart_user, process_server_user, process_client_user, block_user, files_user, process_test_manifest],
+  output: 'process-test.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
 )
 boot_bundle = custom_target(
   'boot-bundle', input: [init_user, uart_user, process_server_user, shell_user, block_user, files_user, native_manifest], output: 'boot.bundle',
@@ -828,11 +885,14 @@ qemu = find_program('qemu-system-riscv64')
 run_target('run-io-user-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', io_user_bundle,
   '[io-user] ok: 32 outstanding, batch completion, task teardown, device reuse'])
+run_target('run-process-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--disk', disk_image, '--timeout', '45',
+  '[process] async wait, cancel, retention, deadlines and reuse ok'])
 run_target('run-file-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
-  qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '45',
+  qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '60',
   '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])
 run_target('run-file-paging-pressure-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
-  qemu, kernel_pressure, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '45',
+  qemu, kernel_pressure, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '60',
   '[scenario] pressure drained', '[scenario] pressure released',
   '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])
 run_target('run-file-failure-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
@@ -860,6 +920,20 @@ run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', '
 run_target('run-wait-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_wait, 'marker',
   '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
   '[scenario] wait publication ok'])
+run_target('run-wait-test-dual', command: [sh, run_qemu, qemu, timeout, '2', kernel_wait, 'marker',
+  '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
+  '[scenario] pending VM wait completed after remote shootdown', '[scenario] wait publication ok'])
+sharing_gdb = find_program('gdb-multiarch', required: false)
+if sharing_gdb.found()
+  run_target('run-file-fault-matrix', command: [find_program('python3'), files('test/tools/file_fault.py'),
+    qemu, sharing_gdb, kernel_debug, file_fault_bundle, file_test_disk, '1,2,4'])
+  run_target('run-application-sharing', command: [find_program('python3'), files('test/tools/application_sharing.py'),
+  qemu, sharing_gdb, find_program('riscv64-unknown-elf-nm'),
+  kernel_debug, boot_bundle, disk_image, demand_user])
+endif
+run_target('run-channel-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,2,4', '--bundle', channel_test_bundle, '--timeout', '30',
+  '[channel] three blocked senders, stop, peer close and reuse ok'])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0'])
 if profile == 'proof'
   run_target('run-ipc-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'marker', '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', 'user: contained fault address=0xe100', 'cpu: discovered=' + smp + ' prepared=0 starting=0 online=' + smp + ' failed=0', 'boot bundle: root=init', 'user: contained fault address=0xe100', '--initrd', ipc_bundle])

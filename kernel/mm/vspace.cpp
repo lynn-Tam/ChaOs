@@ -313,6 +313,7 @@ auto VSpace::commit_translation(
     TranslationState::Mutation&& mutation,
     ShootdownPlan&& plan,
     RetireBatch& retire,
+    kernel::resource::Charge& refund,
     bool instruction_sync) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
     KASSERT(pending_kind_ != PendingKind::None);
@@ -325,7 +326,7 @@ auto VSpace::commit_translation(
         /*luna change: report Pending while an unpublished exact claim keeps
           its page in the pending lane, reason: shootdown completion is not
           page-storage completion*/
-        if (finish_pending()) {
+        if (finish_pending(refund)) {
             return libk::expected(VmStatus::Complete);
         }
         return libk::expected(VmStatus::Pending);
@@ -478,7 +479,7 @@ void VSpace::finish_authorities() noexcept {
     }
 }
 
-auto VSpace::finish_pending() noexcept -> bool {
+auto VSpace::finish_pending(kernel::resource::Charge& refund) noexcept -> bool {
     if (pending_kind_ == PendingKind::None) {
         try_finish_retire();
         return true;
@@ -487,7 +488,9 @@ auto VSpace::finish_pending() noexcept -> bool {
         return false;
     }
     if (retire_batch_) {
-        KASSERT(retire_batch_->release());
+        // Capacity refund can synchronously drive unrelated pool close work.
+        // Transfer it to the caller, which completes it after dropping lock_.
+        KASSERT(retire_batch_->release(refund));
         retire_batch_.reset();
     }
     if (ticket_) {

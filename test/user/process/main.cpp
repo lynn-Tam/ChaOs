@@ -27,6 +27,11 @@ auto request(service::Process operation, uint64_t id = 0, uint64_t expires = 0) 
 auto receive(service::Connection& channel, service::Process operation, myos_status_t status) noexcept -> service::Message {
     service::Message reply;
     check(channel.receive(reply).status == MYOS_STATUS_OK);
+    if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
+        stream::Writer writer{output};
+        (void)libk::fmt::format_to<"[process] reply op={} status={} id={}, expected op={} status={}\n">(
+            writer, reply.operation, reply.status, reply.id, static_cast<uint64_t>(operation), status);
+    }
     check(reply.operation == static_cast<uint64_t>(operation) && reply.status == status);
     return reply;
 }
@@ -37,8 +42,9 @@ auto exchange(service::Connection& channel, service::Message message, myos_statu
 auto spawn(service::Connection& channel, const char* ms, myos_status_t status = MYOS_STATUS_OK) noexcept -> uint64_t {
     auto message = request(service::Process::Spawn);
     bootstrap::Arguments args;
-    check(args.append("sleep") && args.append(ms));
-    message.size = args.encode(message.data, sizeof(message.data));
+    check(args.append("sleep", 5) && args.append(ms, service::length(ms)));
+    message.size = args.data().size;
+    service::copy(message.data, args.data().bytes, message.size);
     return exchange(channel, message, status).id;
 }
 void stop(service::Connection& channel, uint64_t id) noexcept {
@@ -80,6 +86,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_INVALID_CAP);
     }
     stop(channel, reused);
+
+    // Stop while a child owns a deadline wait, then reuse its allocation.
+    for (unsigned i = 0; i != 16; ++i) stop(channel, spawn(channel, "10000"));
 
     // Exercise the actual timeout/completion arbitration repeatedly. A timeout
     // removes only the waiter; completion remains consumable exactly once.

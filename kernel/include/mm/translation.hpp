@@ -153,7 +153,8 @@ public:
         return pages_.page_count();
     }
     [[nodiscard]] auto ready() const noexcept -> bool;
-    [[nodiscard]] auto release() noexcept -> bool;
+    // The caller refunds capacity after dropping its address-space lock.
+    [[nodiscard]] auto release(kernel::resource::Charge& refund) noexcept -> bool;
 
 private:
     friend class TranslationState;

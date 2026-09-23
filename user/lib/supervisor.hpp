@@ -78,6 +78,9 @@ public:
     struct Handle final {
         TaskId id{};
         libk::optional<typename Completions::Receiver> receiver{};
+        // Borrowed receive authority supplied by the caller. TaskSpace retains
+        // only Signal for terminal publication; it cannot receive this event.
+        myos_cap_t events{};
         auto token() const noexcept -> uint64_t {
             return (uint64_t{id.generation} << 32) | id.slot;
         }
@@ -176,7 +179,7 @@ public:
         auto pending = Builder::begin(completions_, table_, libk::move(*lease), *index);
         if (!pending) { status = MYOS_STATUS_BUSY; return libk::nullopt; }
         auto builder = libk::move(*pending);
-        Handle handle{builder.record()->id(), builder.take_receiver()};
+        Handle handle{builder.record()->id(), builder.take_receiver(), options.terminal_events};
         TaskConstructionInput<Backend, Authorities> input{
             .parent_pool = pool_, .bundle = &program.bundle_, .scratch = &program.scratch_,
             .runtime_cpu_count = cpus_, .bindings = &bindings, .image_source = options.image_source,
@@ -202,20 +205,29 @@ public:
         return launch(program, name(text), status);
     }
     auto wait(Handle& handle) noexcept -> myos_status_t {
-        myos_status_t terminal = MYOS_STATUS_INTERNAL;
-        checked(supervision::observe_and_close(table_, handle.id, handle.receiver, terminal));
-        return terminal;
+        for (;;) {
+            const auto result = collect(handle);
+            if (result.status == MYOS_STATUS_OK)
+                return static_cast<myos_status_t>(result.value);
+            if (result.status != MYOS_STATUS_WOULD_BLOCK && !retryable(result.status))
+                return result.status;
+            if (closing_needs_poll(handle)) { myos::yield(); continue; }
+            const auto local = handle.events == 0 ? table_.terminal_notification(handle.id)
+                                                 : libk::optional<cap::CapRef>{cap::CapRef{handle.events, 0}};
+            if (!local) return MYOS_STATUS_INVALID_CAP;
+            const auto wake = notification_wait(local->selector);
+            if (wake.status != MYOS_STATUS_OK) return wake.status;
+            notify(handle, wake.value);
+        }
     }
     auto stop(Handle& handle) noexcept -> myos_status_t {
-        checked(table_.begin_close(handle.id, CloseReason::Explicit, MYOS_STATUS_CANCELED));
-        checked(supervision::take_completion(table_, handle.id, CloseReason::Explicit,
-                                            MYOS_STATUS_CANCELED, handle.receiver));
-        return MYOS_STATUS_CANCELED;
+        const auto status = request_stop(handle);
+        return status == MYOS_STATUS_OK ? wait(handle) : status;
     }
     auto observe(const Handle& handle) noexcept -> SysResult { return table_.observe_terminal(handle.id); }
 
-    // Poll never waits for a child. Closing advances one bounded pass; the
-    // caller services other producers and retries while teardown is pending.
+    // With close_badge configured, closing advances without waiting for pool
+    // refund. The caller services other producers while teardown is pending.
     auto poll(Handle& handle) noexcept -> myos_status_t {
         if (!handle.receiver || !handle.receiver->valid()) return MYOS_STATUS_INVALID_CAP;
         if (handle.receiver->ready()) return MYOS_STATUS_OK;

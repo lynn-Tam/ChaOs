@@ -323,7 +323,11 @@ auto VSpace::map_impl(
         return libk::unexpected(error);
     };
 
-    for (usize index = 0; index < count; ++index) {
+    // Pageable content is resolved by faults, including pages another address
+    // space is currently loading or reclaiming. Mapping only establishes the
+    // authorized range; it must not depend on a transient cache snapshot.
+    const usize resident_pages = memory.kind() == BackingKind::Pager ? 0 : count;
+    for (usize index = 0; index < resident_pages; ++index) {
         const usize object_page = request.object.first + index;
         auto content = memory.query(object_page);
         if (!content) {
@@ -468,12 +472,15 @@ auto VSpace::map_impl(
     pending_kind_ = PendingKind::Map;
     release_claim();
     auto& retire = retire_batch_.emplace(*pmm_);
+    kernel::resource::Charge refund{};
     auto committed = commit_translation(
         libk::move(mutation).value(),
         libk::move(plan).value(),
         retire,
+        refund,
         request.access.contains(Access::Execute));
     lock.restore();
+    refund.reset();
     if (!committed) {
         return libk::unexpected(committed.error());
     }

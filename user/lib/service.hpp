@@ -67,8 +67,8 @@ inline auto capability(const bootstrap::BootstrapView& info, Binding role) noexc
 }
 
 // A service connection has one reader. Readiness belongs to that reader's
-// Notification, so opposite channel sides never compete for the channel's
-// single blocking-operation slot. Construct once for the service lifetime:
+// Notification, allowing one event loop to multiplex several sources.
+// Construct once for the service lifetime:
 // task authority revocation withdraws the binding. The supervisor stops the
 // connected services together if either persistent peer terminates.
 class Connection final {

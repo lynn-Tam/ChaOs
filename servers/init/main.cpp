@@ -55,6 +55,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         myos::service::capability(info, MYOS_BOOTSTRAP_CAP_IRQ), MYOS_OBJECT_KIND_IRQ,
         MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK));
     const auto pool = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
+    const auto notification = myos::notification_create(pool, 1);
+    myos::service::require(notification.status);
+    myos::cap::OwnedCap events{{notification.value, 0}};
     channel_pair(pool, 0, "console.sender", "console.receiver");
     channel_pair(pool, 2, "input.sender", "input.receiver");
     channel_pair(pool, 4, "process.client", "process.server", false, 1, 3);
@@ -66,7 +69,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const char* roles[] = {"uart", "block", "files", "process_server", "shell"};
     myos_status_t status = MYOS_STATUS_OK;
     for (size_t i = 0; i < 5; ++i) {
-        tasks[i] = supervisor.launch(program, roles[i], status);
+        tasks[i] = supervisor.launch(program, Supervisor::name(roles[i]), status,
+            {.terminal_events = events.selector()});
         if (!tasks[i]) break;
     }
     if (status == MYOS_STATUS_OK) {
@@ -83,7 +87,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 }
             }
             if (terminal) break;
-            myos::yield();
+            myos::service::require(myos::notification_wait(events.selector()).status);
         }
     }
     for (size_t i = 5; i != 0; --i)

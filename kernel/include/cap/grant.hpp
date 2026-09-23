@@ -65,6 +65,9 @@ public:
 
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto busy() const noexcept -> bool;
+    // For an attached relation, true transfers quiescence to the caller;
+    // false leaves it with released(). Already detached returns quiescence.
+    // Detach and the final work release choose exactly one notification owner.
     [[nodiscard]] auto detach() noexcept -> bool;
     // A detached attachment is a reusable relation cell. The graph edge must
     // already be gone and all invalidation work drained before resetting it.
@@ -78,6 +81,7 @@ private:
         Idle,
         Attached,
         Invalidating,
+        Draining,
         Detached,
     };
 

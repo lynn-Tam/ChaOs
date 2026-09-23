@@ -308,8 +308,7 @@ struct TaskConstructionInput final {
     ScratchWindow<B>* scratch{};
     const void* bootstrap{};
     size_t bootstrap_size{};
-    /* Runtime context is explicit construction input, not manifest policy.
-     * A generated bootstrap envelope requires a checked non-zero CPU count. */
+    // Placement and the bootstrap envelope share the actual runtime topology.
     uint32_t runtime_cpu_count{};
     const TaskAuthorityBindings* bindings{};
     ImageSource image_source{};
@@ -1966,7 +1965,7 @@ public:
     [[nodiscard]] auto construct(
         const TaskConstructionInput<backend_type, Authorities>& input,
         Authorities& authorities) noexcept -> myos_status_t {
-        if (!valid() || input.bindings == nullptr
+        if (!valid() || input.bindings == nullptr || input.runtime_cpu_count == 0
             || input.scratch == nullptr || !input.parent_pool
             || !input.workspace.empty()) {
             return MYOS_STATUS_BAD_ARGS;
@@ -3239,14 +3238,24 @@ public:
                 static_cast<myos_object_kind_t>(
                     execution->model == MYOS_DEPLOY_EXECUTION_THREAD
                         ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC));
-            const auto sc = adopt_result(
-                backend_type::sc_create(
+            const auto create_context = [&](uint32_t cpu) noexcept {
+                return backend_type::sc_create(
                     pool.value(), workspace.domain_leases[index]->source(),
                     static_cast<myos_word_t>(execution->sc_budget),
                     static_cast<myos_word_t>(execution->sc_period),
-                    static_cast<myos_word_t>(execution->urgency),
-                    execution->home_cpu == MYOS_DEPLOY_HOME_CPU_ANY
-                        ? 0 : execution->home_cpu),
+                    static_cast<myos_word_t>(execution->urgency), cpu);
+            };
+            SysResult context{};
+            if (execution->home_cpu == MYOS_DEPLOY_HOME_CPU_ANY) {
+                // Distribute independent tasks, then probe each allowed CPU
+                // at most once. The domain remains the admission authority.
+                for (uint32_t attempt = 0; attempt < input.runtime_cpu_count; ++attempt) {
+                    const auto cpu = (record.id().slot + index + attempt) % input.runtime_cpu_count;
+                    context = create_context(cpu);
+                    if (context.status != MYOS_STATUS_BUSY) break;
+                }
+            } else context = create_context(execution->home_cpu);
+            const auto sc = adopt_result(context,
                 MYOS_OBJECT_KIND_SCHED_CONTEXT,
                 projections.scheduling_contexts[index].local);
             if (status != MYOS_STATUS_OK || !execution_ref

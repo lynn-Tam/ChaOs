@@ -4,10 +4,11 @@
 #include <cap/resolved.hpp>
 #include <core/types.hpp>
 #include <ipc/notification.hpp>
+#include <ipc/channel_wait.hpp>
 #include <libk/array.hpp>
 #include <libk/expected.hpp>
-#include <libk/inplace_ring.hpp>
 #include <libk/inplace_vector.hpp>
+#include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
 #include <mm/node_pool.hpp>
@@ -49,32 +50,10 @@ enum class ChannelCondition : u8 {
 };
 
 struct ChannelConfig final {
-    usize queue_capacity{MYOS_CHANNEL_MAX_QUEUE};
+    usize queue_capacity{16};
     usize max_words{MYOS_CHANNEL_MAX_WORDS};
     usize max_caps{MYOS_CHANNEL_MAX_CAPS};
-    usize waiter_capacity{MYOS_CHANNEL_MAX_WAITERS};
-    usize relation_capacity{MYOS_CHANNEL_MAX_RELATIONS};
-};
-
-struct ChannelSend final {
-    u64 transaction{};
-    u64 tag{};
-    usize word_count{};
-    u64 words[MYOS_CHANNEL_MAX_WORDS]{};
-    usize cap_count{};
-    myos_cap_transfer caps[MYOS_CHANNEL_MAX_CAPS]{};
-};
-
-struct ChannelRecv final {
-    u64 transaction{};
-    u64 tag{};
-    u64 sender_badge{};
-    u64 sequence{};
-    usize word_count{};
-    u64 words[MYOS_CHANNEL_MAX_WORDS]{};
-    usize cap_count{};
-    usize receive_limit{MYOS_CHANNEL_MAX_CAPS};
-    cap::CapHandle caps[MYOS_CHANNEL_MAX_CAPS]{};
+    usize relation_capacity{4};
 };
 
 struct ChannelWaitResult final {
@@ -112,6 +91,8 @@ class Channel final : private libk::noncopyable_nonmovable {
     };
 
     struct Message final : private libk::noncopyable {
+        libk::IntrusiveListHook hook{};
+        ChannelSide destination{ChannelSide::A};
         u64 transaction{};
         u64 tag{};
         u64 sender_badge{};
@@ -151,6 +132,8 @@ class Channel final : private libk::noncopyable_nonmovable {
         void notification_closed() noexcept;
 
         Channel* owner{};
+        libk::IntrusiveListHook hook{};
+        usize index{};
         NotificationSource source;
         object::ObjectHold<Notification> notification{};
         AuthLink channel_link;
@@ -169,55 +152,19 @@ class Channel final : private libk::noncopyable_nonmovable {
         bool armed{};
     };
 
+    using MessageQueue = libk::IntrusiveList<Message, &Message::hook>;
     struct Side final {
-        libk::InplaceRing<Message*, MYOS_CHANNEL_MAX_QUEUE> queue{};
+        MessageQueue queue{};
+        usize occupied{}; // Queued, preparing, or finishing a receive.
         u64 sequence[3]{};
         bool closed{};
     };
 
-    struct Waiter final : private libk::noncopyable_nonmovable {
-        enum class Kind : u8 {
-            Idle,
-            Send,
-            Receive,
-        };
-        enum class State : u8 {
-            Idle,
-            Attaching,
-            Awaiting,
-            Armed,
-            Ready,
-            Done,
-        };
-
-        explicit Waiter(Channel& owner) noexcept;
-        ~Waiter() noexcept;
-
-        [[nodiscard]] auto complete() const noexcept -> bool;
-        [[nodiscard]] auto read() noexcept -> kernel::operation::Result;
-        void release() noexcept;
-        [[nodiscard]] auto cancel() noexcept -> bool;
-        void resume(arch::TrapContext& trap) noexcept;
-
-        Channel* owner{};
-        Kind kind{Kind::Idle};
-        State state{State::Idle};
-        ChannelSide side{ChannelSide::A};
-        cap::CSpace* cspace{};
-        cap::CapHandle authority{};
-        kernel::Thread* thread{};
-        kernel::CpuRegistry* cpus{};
-        Buffer* buffer{};
-        ChannelSend send{};
-        ChannelRecv recv{};
-        kernel::operation::Result result{};
-        object::ObjectRef channel_ref{};
-        cap::GrantAttachment grant_attachment;
-        cap::GrantWork grant_work{};
-        kernel::operation::Completion completion;
-    };
+    friend struct ChannelWait;
+    using Waiter = ChannelWait;
 
 public:
+    [[nodiscard]] static auto storage_bytes(ChannelConfig config) noexcept -> libk::optional<usize>;
     Channel(kernel::mm::Pmm& pmm, ChannelConfig config = {}) noexcept;
     ~Channel() noexcept;
 
@@ -307,13 +254,26 @@ private:
         cap::GrantInvalidation reason) noexcept;
     static void release_waiter(void* context) noexcept;
     void waiter_invalidated(Waiter& waiter, cap::GrantWork&& work) noexcept;
-    void waiter_released(Waiter& waiter) noexcept;
+    void drop_waiter(Waiter& waiter) noexcept;
+    void detach_waiter_authority(Waiter& waiter) noexcept;
     void finish_waiter(Waiter& waiter) noexcept;
     void abort_relation(Relation& relation) noexcept;
     void detach_side(SideLink& link) noexcept;
     void try_finish_retire() noexcept;
+    using WaitQueue = libk::IntrusiveList<Waiter, &Waiter::hook>;
+    [[nodiscard]] auto wait_queue(Waiter::Kind kind, ChannelSide side) noexcept -> WaitQueue&;
+    [[nodiscard]] auto enqueue_waiter(
+        cap::Resolved<Channel>& authority, cap::CapHandle handle,
+        cap::CSpace& cspace, kernel::Thread& thread, Waiter::Kind kind) noexcept
+        -> libk::Expected<Waiter*, ChannelError>;
+    [[nodiscard]] auto begin_wait(
+        Waiter& waiter, cap::Resolved<Channel>& authority,
+        kernel::Thread& thread, kernel::CpuRegistry& cpus) noexcept
+        -> libk::Expected<ChannelWaitResult, ChannelError>;
+    [[nodiscard]] auto owns_turn_locked(
+        Waiter::Kind kind, ChannelSide side, const Waiter* reservation) noexcept -> bool;
     [[nodiscard]] auto waiter_ready_locked(
-        const Waiter& waiter) const noexcept -> bool;
+        const Waiter& waiter) noexcept -> bool;
     [[nodiscard]] auto send_impl(
         cap::Resolved<Channel>& authority,
         cap::CSpace& source,
@@ -349,7 +309,7 @@ private:
     void detach_relation(Relation& relation) noexcept;
     void finish_relation(Relation& relation) noexcept;
     void discard_message(Message& message) noexcept;
-    [[nodiscard]] auto take_message() noexcept -> Message*;
+    [[nodiscard]] auto relation_at(usize index) noexcept -> Relation&;
     void release_message(Message& message) noexcept;
     void clear_queues() noexcept;
     [[nodiscard]] auto make_escrow(
@@ -373,13 +333,11 @@ private:
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Channel> lock_{};
     Side sides_[2]{};
     SideLink side_links_[2];
-    Relation relations_[MYOS_CHANNEL_MAX_RELATIONS];
-    Waiter waiter_;
-    static constexpr usize max_messages = MYOS_CHANNEL_MAX_QUEUE * 2;
-    Message* free_messages_[max_messages]{};
-    usize free_message_count_{};
-    usize relation_count_{};
-    usize waiters_{};
+    mm::NodePool<Relation> relation_pool_;
+    libk::IntrusiveList<Relation, &Relation::hook> relations_{};
+    WaitQueue wait_queues_[2][2]{};
+    MessageQueue free_messages_{};
+    usize waiter_count_{};
     bool opened_{};
     bool closing_{};
     object::ObjectCleanup cleanup_{};

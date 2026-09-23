@@ -944,6 +944,7 @@ bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
     }
     const kernel::mm::Page page = page_result.value().page();
     kernel::mm::RetireBatch retired{*cpu_test_pmm};
+    kernel::resource::Charge refund{};
     if (!retired.adopt(libk::move(page_result).value())) {
         return false;
     }
@@ -981,7 +982,7 @@ bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
         && translation.pending_retires() == 1
         && ticket.acknowledged(kernel::CpuId{0})
         && !ticket.acknowledged(kernel::CpuId{1})
-        && !retired.release()
+        && !retired.release(refund)
         && held_state
         && held_state.value() == kernel::mm::PageState::Allocated;
 
@@ -990,8 +991,9 @@ bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
         && ticket.acknowledged(kernel::CpuId{1})
         && translation.pending_tickets() == 0
         && translation.pending_retires() == 1
-        && retired.release()
+        && retired.release(refund)
         && translation.pending_retires() == 0;
+    refund.reset();
     const auto released_state = cpu_test_pmm->state_of(page);
     translation.leave(kernel::CpuId{1});
     translation.leave(kernel::CpuId{0});

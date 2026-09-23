@@ -5,6 +5,7 @@
 #include <cap/grant_graph.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
+#include <libk/scope_guard.hpp>
 #include <libk/utility.hpp>
 #include <mm/kernel_vspace.hpp>
 #include <mm/vspace.hpp>
@@ -320,6 +321,64 @@ bool test_lazy_fault_materialization_and_split_unmap(
     return unmapped && unmapped.value() == kernel::mm::VmStatus::Complete
         && second && second.value().kind == kernel::mm::FaultKind::Materialized
         && fixture.aliases().active_pages() == 1;
+}
+
+bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noexcept {
+    using namespace kernel::mm;
+    VSpaceFixture fixture;
+    if (!fixture.initialize(false)) return false;
+    libk::delegate<kernel::diag::concurrency::ObservationKey() noexcept> notify;
+    kernel::object::MemoryPool memories{fixture.pmm(), notify};
+    auto pending_pager = vspace_test_objects->create_pager();
+    if (!pending_pager) return false;
+    auto pager = libk::move(pending_pager).value().publish();
+    auto close_pager = libk::on_scope_exit([&]() noexcept {
+        KASSERT(pager.retire());
+        pager.reset();
+        vspace_test_objects->drain_reclaim();
+    });
+    auto pending = memories.create(fixture.pmm(), page_size,
+        *vspace_test_memory_work, *vspace_test_reclaimer);
+    if (!pending) return false;
+    auto reference = pager.ref();
+    const auto access = AccessMask::of(Access::Read);
+    if (!reference || !pending.value().get().initialize_pager(libk::move(reference).value(), access))
+        return false;
+    auto memory = libk::move(pending).value().publish();
+    const VirtRange ranges[]{ {VirtAddr{0x40000}, page_size}, {VirtAddr{0x50000}, page_size} };
+    auto cleanup = libk::on_scope_exit([&]() noexcept {
+        for (const auto range : ranges)
+            (void)fixture.space().unmap_kernel(fixture.context(), fixture.space().root_key(), range);
+        KASSERT(memory.retire());
+        memory.reset();
+        while (vspace_test_memory_work->run(8).more) {}
+        memories.drain_reclaim();
+    });
+    for (usize index = 0; index < 2; ++index) {
+        // The second mapping is admitted while the first fault is pending.
+        auto ref = memory.ref();
+        if (!ref) return false;
+        const auto mapped = fixture.space().map_kernel(fixture.context(), fixture.space().root_key(),
+            MapRequest{ranges[index], {0, 1}, access}, libk::move(ref).value(), memory.get(),
+            fixture.memory_authority(1));
+        if (!mapped || mapped.value().status != VmStatus::Complete) return false;
+        const auto fault = fixture.space().fault(fixture.context(), ranges[index].base(), Access::Read);
+        if (!fault || fault.value().kind != FaultKind::Pending
+            || memory->query(0).value() != ContentState::Busy) return false;
+    }
+    while (vspace_test_memory_work->run(8).more) {}
+    if (pager->pending() != 1 || fixture.aliases().active_pages() != 0) return false;
+    const auto request = pager->try_claim();
+    auto page = fixture.pmm().allocate_page();
+    if (!request || !page) return false;
+    if (!memory->pager_supply(pager.get(), 0, request.value().page_key, request.value().claim,
+            libk::move(page).value(), 1)) return false;
+    while (vspace_test_memory_work->run(8).more) {}
+    for (usize index = 0; index < 2; ++index) {
+        const auto fault = fixture.space().fault(fixture.context(), ranges[index].base(), Access::Read);
+        if (!fault || fault.value().kind != FaultKind::Materialized) return false;
+    }
+    return pager->pending() == 0 && fixture.aliases().active_pages() == 1;
 }
 
 bool test_capability_mapping_revokes_after_hardware_retirement(
@@ -727,6 +786,8 @@ void register_vspace_tests(TestRegistry& registry) noexcept {
         "vspace",
         "lazy fault materialization survives mapping split",
         test_lazy_fault_materialization_and_split_unmap);
+    (void)registry.add("vspace", "mapping during page-in joins one backing request",
+        test_mapping_during_page_in_joins_existing_request);
     (void)registry.add(
         "vspace",
         "capability revoke waits for PTE and alias retirement",

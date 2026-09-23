@@ -13,6 +13,7 @@
 #include <mm/object_range.hpp>
 #include <mm/permissions.hpp>
 #include <object/object_ref.hpp>
+#include <object/object_cleanup.hpp>
 #include <resource/sponsorship.hpp>
 
 namespace kernel::object {
@@ -458,7 +459,7 @@ public:
         AccessMask access) noexcept
         -> libk::Expected<void, MemoryError>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
-    void retire() noexcept;
+    void retire(object::ObjectCleanup&& cleanup = {}) noexcept;
 private:
     friend struct kernel::object::ObjectTraits<MemoryObject>;
     friend class PageLease;
@@ -634,6 +635,7 @@ private:
     kernel::resource::Sponsorship backing_sponsorship_{};
     usize operations_{};
     MemoryState state_{MemoryState::Building};
+    object::ObjectCleanup cleanup_{};
     SealState seal_{SealState::Loadable};
     ContentEpoch content_epoch_{};
     AccessMask access_{};

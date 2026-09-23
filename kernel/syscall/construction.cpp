@@ -194,16 +194,21 @@ template<
     if (!pending) {
         return returned(MYOS_STATUS_NO_MEMORY);
     }
-    const myos_status_t prepared = prepare(pending.value().get());
-    if (prepared != MYOS_STATUS_OK) {
-        return returned(prepared);
-    }
     auto object = libk::move(pending).value().publish();
+    const auto discard_unregistered = [&]() noexcept {
+        if constexpr (requires(T& target, execution::Stop& stop) { stop.start(target); }) {
+            // No authority or scheduler relation has been published yet.
+            execution::Stop stop;
+            stop.start(object.get());
+            KASSERT(stop.complete());
+        }
+        KASSERT(object.retire());
+        object.reset();
+    };
     const PublishedAuthority published = authority(object.get());
     auto reference = object.ref();
     if (!reference) {
-        KASSERT(object.retire());
-        object.reset();
+        discard_unregistered();
         return returned(MYOS_STATUS_INTERNAL);
     }
     auto allocation = kernel->grants().create_allocation(
@@ -212,9 +217,16 @@ template<
         libk::move(reference).value(),
         published.ceiling);
     if (!allocation) {
-        KASSERT(object.retire());
-        object.reset();
+        discard_unregistered();
         return returned(MYOS_STATUS_NO_MEMORY);
+    }
+    // Preparing can publish revocable relations. Their rollback therefore
+    // needs the allocation's canonical revoke/stop/retire owner already live.
+    const myos_status_t prepared = prepare(object.get());
+    if (prepared != MYOS_STATUS_OK) {
+        allocation.value().reset();
+        object.reset();
+        return returned(prepared);
     }
     auto root_lease = allocation.value().acquire();
     auto user_target = object.ref();
@@ -786,7 +798,6 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         .queue_capacity = invocation.trap.arg(1),
         .max_words = invocation.trap.arg(2),
         .max_caps = invocation.trap.arg(3),
-        .waiter_capacity = MYOS_CHANNEL_MAX_WAITERS,
         .relation_capacity = invocation.trap.arg(4),
     };
     if (config.queue_capacity == 0
@@ -800,8 +811,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     const auto allowed = pool_authority(pool.value());
     const auto object_charge = kernel::resource::Traits<
         kernel::ipc::Channel>::fixed();
-    const auto message_pages = libk::checked_multiply(
-        config.queue_capacity * 2, kernel::mm::page_size);
+    const auto message_pages = kernel::ipc::Channel::storage_bytes(config);
     const auto channel_charge = message_pages
         ? add_budget(object_charge,
               kernel::resource::Budget{.memory = *message_pages})

@@ -19,13 +19,14 @@ constexpr usize StressAddress = MYOS_TEST_PRESSURE_STRESS_ADDRESS;
 // scenario's post-proof release-address fault is its only normal release edge.
 constinit libk::ManualLifetime<mm::OwnedPageGroup> pressure_hold{};
 constinit libk::Atomic<bool> pressure_triggered{};
+constinit libk::Atomic<bool> pressure_release_claimed{};
 
 } // namespace
 
 /*luna change: arm pressure after root admission, reason: the real stress fault
   rather than runtime setup owns the fixture's PMM transition*/
 auto pressure(CpuRuntime& runtime) noexcept -> bool {
-    if (runtime.kernel == nullptr || pressure_hold
+    if (runtime.kernel == nullptr
         || pressure_triggered.load<libk::MemoryOrder::Acquire>()) {
         return false;
     }
@@ -39,10 +40,14 @@ auto page_fault(CpuRuntime& runtime, mm::VirtAddr address) noexcept -> bool {
         return false;
     }
     if (address.raw() == MYOS_TEST_PRESSURE_RELEASE_ADDRESS) {
-        if (!pressure_triggered.load<libk::MemoryOrder::Acquire>()
-            || !pressure_hold) {
-            return false;
-        }
+        if (!pressure_triggered.load<libk::MemoryOrder::Acquire>()) return false;
+        // The application may unmap and reuse this address. Only the first
+        // fault releases the held frames; later faults follow normal VM rules.
+        bool expected{};
+        if (!pressure_release_claimed.compare_exchange_strong<
+                libk::MemoryOrder::AcqRel,
+                libk::MemoryOrder::Acquire>(expected, true)) return true;
+        KASSERT(pressure_hold);
         const usize held = pressure_hold->page_count();
         // The three production barriers are complete before userspace can
         // touch this lazy page. Release precedes construction of its PageFault,

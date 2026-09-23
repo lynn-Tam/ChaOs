@@ -15,8 +15,8 @@ struct ObjectTraits<kernel::mm::MemoryObject> final {
         memory.bind_sponsor(sponsor);
     }
 
-    static void retire(kernel::mm::MemoryObject& memory) noexcept {
-        memory.retire();
+    static void retire(kernel::mm::MemoryObject& memory, ObjectCleanup&& cleanup) noexcept {
+        memory.retire(libk::move(cleanup));
     }
     static void destroy(kernel::mm::MemoryObject& memory) noexcept {
         libk::destroy_at(&memory);

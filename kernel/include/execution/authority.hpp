@@ -4,89 +4,65 @@
 #include <cap/resolved.hpp>
 #include <execution/stop.hpp>
 #include <libk/noncopyable.hpp>
-#include <sync/lock.hpp>
 #include <libk/variant.hpp>
+#include <object/object_cleanup.hpp>
+#include <sync/lock.hpp>
 
 namespace kernel {
-
 class Thread;
 class Vproc;
-
-namespace mm {
-class MemoryObject;
-class VSpace;
-}
+namespace mm { class MemoryObject; class VSpace; }
 
 namespace execution {
 
-// Persistent capability authority for one user execution lane.  Resolving a
-// capability authorizes construction only momentarily; these attachments keep
-// the roots and registered runtime backing authorized for every later dispatch.
-// Revoking any source stops the lane before releasing the complete relation.
+// Persistent authority for one execution lane. Revocation stops execution;
+// retirement additionally waits for every detached authority callback to drain.
 class Authority final : private libk::noncopyable_nonmovable {
-    struct Link final : private libk::noncopyable_nonmovable {
+    enum Root : usize { VSpace, CSpace, Control, Events, Code, Stack, Count };
+    struct Link final {
         Link(Authority& owner, const cap::GrantAttachmentOps& ops) noexcept
-            : owner(&owner), attachment(this, ops) {}
-
-        Authority* owner{};
+            : attachment(&owner, ops) {}
         cap::GrantAttachment attachment;
         cap::GrantWork work{};
     };
-
 public:
     explicit Authority(Thread& thread) noexcept;
     explicit Authority(Vproc& vproc) noexcept;
     ~Authority() noexcept;
 
-    [[nodiscard]] auto attach(
-        const cap::Resolved<kernel::mm::VSpace>& vspace,
-        const cap::Resolved<cap::CSpace>& cspace) noexcept
-        -> libk::Expected<void, cap::GrantError>;
-    [[nodiscard]] auto attach_runtime(
-        const cap::Resolved<kernel::mm::MemoryObject>& control,
-        const cap::Resolved<kernel::mm::MemoryObject>& events) noexcept
-        -> libk::Expected<void, cap::GrantError>;
-    [[nodiscard]] auto attach_arm(
-        const cap::Resolved<kernel::mm::MemoryObject>& code,
-        const cap::Resolved<kernel::mm::MemoryObject>& stack) noexcept
-        -> libk::Expected<void, cap::GrantError>;
+    [[nodiscard]] auto attach(const cap::Resolved<mm::VSpace>& vspace,
+        const cap::Resolved<cap::CSpace>& cspace) noexcept -> libk::Expected<void, cap::GrantError>;
+    [[nodiscard]] auto attach_runtime(const cap::Resolved<mm::MemoryObject>& control,
+        const cap::Resolved<mm::MemoryObject>& events) noexcept -> libk::Expected<void, cap::GrantError>;
+    [[nodiscard]] auto attach_arm(const cap::Resolved<mm::MemoryObject>& code,
+        const cap::Resolved<mm::MemoryObject>& stack) noexcept -> libk::Expected<void, cap::GrantError>;
     void detach_arm() noexcept;
     [[nodiscard]] auto active() const noexcept -> bool;
-
-    // Called only after the dispatcher has removed the target's scheduling
-    // relation and no CPU can observe its ExecutionBinding.
     void target_stopped() noexcept;
+    void retire(object::ObjectCleanup&& cleanup) noexcept;
 
 private:
-    static void invalidate(
-        void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
-    static void released(void* context) noexcept;
-
-    void invalidate(Link& link, cap::GrantWork&& work) noexcept;
-    void stopped() noexcept;
-    void reset() noexcept;
+    template<usize Index> static auto ops() noexcept -> const cap::GrantAttachmentOps&;
+    template<usize First, class A, class B>
+    auto attach_pair(const cap::Resolved<A>& first, const cap::Resolved<B>& second) noexcept
+        -> libk::Expected<void, cap::GrantError>;
+    void invalidate(usize index, cap::GrantWork&& work) noexcept;
+    void released(usize index) noexcept;
+    void detach(usize index) noexcept;
     void drain(Link& link) noexcept;
     void start_stop() noexcept;
+    void stopped() noexcept;
+    void finish_retire() noexcept;
 
-    using Target = libk::variant<Thread*, Vproc*>;
-
-    static const cap::GrantAttachmentOps ops_;
-
-    Target target_;
-    mutable kernel::sync::SpinLock<
-        kernel::sync::LockClass::ExecutionAuthority> lock_{};
-    Link vspace_;
-    Link cspace_;
-    Link control_;
-    Link events_;
-    Link code_;
-    Link stack_;
+    libk::variant<Thread*, Vproc*> target_;
+    mutable kernel::sync::SpinLock<kernel::sync::LockClass::ExecutionAuthority> lock_{};
+    Link links_[Count];
     Stop stop_;
-    bool arm_attaching_{};
-    bool start_armed_{};
-    bool ended_{};
+    object::ObjectCleanup cleanup_{};
+    // A bit owns the relation until detach returns true or released acknowledges
+    // its last callback. detached_ elects one detacher per attachment generation.
+    u8 pending_{}, detached_{};
+    bool attaching_{}, start_armed_{}, ended_{};
 };
 
 } // namespace execution

@@ -251,7 +251,7 @@ auto Thread::prepare_retire() const noexcept -> bool {
             || execution_.state_ == State::Exited)
         && execution_.scheduler_binding_ == nullptr && !current_wait().attached()
         && active_ == nullptr
-        && execution_.home_ == nullptr && !authority_.active()
+        && execution_.home_ == nullptr
         && (execution_.binding().kernel_bound()
             || execution_.binding().detached());
 }
@@ -263,7 +263,7 @@ void Thread::request_stop(execution::Stop& request) noexcept {
     bool initiate{};
     {
         kernel::sync::IrqLockGuard guard{stop_lock_};
-        KASSERT(request.started_ && request.target_ == &execution_);
+        KASSERT(request.started() && request.target_ == &execution_);
         stops_.push_back(request);
         if (stopped_) {
             stops_.erase(request);

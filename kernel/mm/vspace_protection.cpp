@@ -233,6 +233,7 @@ auto VSpace::protect_impl(
         }
     }
 
+    kernel::resource::Charge refund{};
     kernel::sync::IrqLockToken lock{lock_};
     if (claim_.region != &region || claim_.range != range
         || !find_coverage()) {
@@ -343,14 +344,16 @@ auto VSpace::protect_impl(
     if (!changed_pte) {
         mutation.value().abort();
         retire_batch_.reset();
-        KASSERT(finish_pending());
+        KASSERT(finish_pending(refund));
         lock.restore();
+        refund.reset();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(), libk::move(plan).value(), retire, refund);
     lock.restore();
+    refund.reset();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }

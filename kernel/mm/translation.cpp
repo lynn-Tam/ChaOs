@@ -186,12 +186,13 @@ auto RetireBatch::ready() const noexcept -> bool {
     return ticket_ == nullptr || ticket_->complete();
 }
 
-auto RetireBatch::release() noexcept -> bool {
+auto RetireBatch::release(kernel::resource::Charge& refund) noexcept -> bool {
     if (!ready()) {
         return false;
     }
+    KASSERT(!refund);
     pages_.reset();
-    charge_.reset();
+    refund = libk::move(charge_);
     ticket_ = nullptr;
     if (owner_ != nullptr) {
         const usize pending = owner_->pending_retires_.fetch_sub<

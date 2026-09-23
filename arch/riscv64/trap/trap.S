@@ -141,6 +141,10 @@ arch_riscv64_trap_entry:
     mv sp, a0
 
 .Lrestore_frame:
+    // A newly started Thread reaches this path with interrupts enabled.
+    // Restoring sepc and sstatus must be indivisible: an interrupt between
+    // those writes would replace the user PC with a supervisor return PC.
+    csrci sstatus, 2
     //NOTE: sepc和sstatus要写回csr,因为sret真正依赖他们
     ld t0, SEPC_OFFSET(sp)
     csrw sepc, t0

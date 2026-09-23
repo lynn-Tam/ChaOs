@@ -14,15 +14,15 @@ constexpr u32 stop_finished = 2;
 } // namespace
 
 Stop::~Stop() noexcept {
+    KASSERT(!started() || complete());
     KASSERT(target_ == nullptr);
     KASSERT(!hook_.is_linked());
-    KASSERT(!started_ || complete_);
 }
 
 void Stop::start(Thread& thread) noexcept {
-    KASSERT(!started_ && !complete_);
+    KASSERT(!started());
     KASSERT(target_ == nullptr);
-    started_ = true;
+    state_.store<libk::MemoryOrder::Release>(State::Started);
     target_ = &thread.execution();
     // The Stop object is the obligation identity. A target may have several
     // simultaneous stop requests, so target address alone is not unique.
@@ -47,24 +47,24 @@ void Stop::start(Thread& thread) noexcept {
 }
 
 void Stop::finish(Thread& thread) noexcept {
-    KASSERT(started_ && !complete_
+    KASSERT(started() && !complete()
         && target_ == &thread.execution() && !hook_.is_linked());
     target_ = nullptr;
-    complete_ = true;
     auto observation =
         diag::concurrency::ObservationLease::borrow(observation_);
     observation.finish(stop_finished);
     observation_ = {};
     const Notifier notify = notifier_;
+    state_.store<libk::MemoryOrder::Release>(State::Complete);
     if (notify) {
         notify();
     }
 }
 
 void Stop::start(Vproc& vproc) noexcept {
-    KASSERT(!started_ && !complete_);
+    KASSERT(!started());
     KASSERT(target_ == nullptr);
-    started_ = true;
+    state_.store<libk::MemoryOrder::Release>(State::Started);
     target_ = &vproc.execution();
     auto observation = diag::concurrency::ObservationLease::reserve(
         diag::concurrency::RecordKind::ExecutionStop,
@@ -87,15 +87,15 @@ void Stop::start(Vproc& vproc) noexcept {
 }
 
 void Stop::finish(Vproc& vproc) noexcept {
-    KASSERT(started_ && !complete_
+    KASSERT(started() && !complete()
         && target_ == &vproc.execution() && !hook_.is_linked());
     target_ = nullptr;
-    complete_ = true;
     auto observation =
         diag::concurrency::ObservationLease::borrow(observation_);
     observation.finish(stop_finished);
     observation_ = {};
     const Notifier notify = notifier_;
+    state_.store<libk::MemoryOrder::Release>(State::Complete);
     if (notify) {
         notify();
     }

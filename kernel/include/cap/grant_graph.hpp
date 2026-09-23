@@ -33,7 +33,6 @@ public:
 
     struct Quota final {
         usize nodes{4096};
-        usize pages{64};
     };
 
     explicit GrantGraph(kernel::mm::Pmm& pmm) noexcept;
@@ -212,6 +211,7 @@ private:
         (sizeof(PageHeader) + alignof(Slot) - 1) & ~(alignof(Slot) - 1);
     static constexpr usize slots_per_page =
         (kernel::mm::page_size - slot_offset) / sizeof(Slot);
+    static_assert(slots_per_page != 0);
 
     [[nodiscard]] auto create(
         kernel::resource::Reservation&& charge,

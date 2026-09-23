@@ -703,6 +703,48 @@ bool test_delegation_revoke_waits_for_existing_lease(
         && fixture.graph().live_count() == 0;
 }
 
+bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexcept {
+    struct Probe {
+        kernel::cap::GrantWork work;
+        usize releases{};
+        kernel::cap::GrantAttachment attachment;
+        explicit Probe(const kernel::cap::GrantAttachmentOps& ops) noexcept : attachment(this, ops) {}
+        ~Probe() noexcept {
+            if (attachment.attached()) (void)attachment.detach();
+            work.reset();
+        }
+    };
+    static constexpr kernel::cap::GrantAttachmentOps ops{
+        .invalidate = [](void* context, kernel::cap::GrantWork&& work, kernel::cap::GrantInvalidation) noexcept {
+            static_cast<Probe*>(context)->work = libk::move(work);
+        },
+        .released = [](void* context) noexcept { ++static_cast<Probe*>(context)->releases; },
+    };
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    for (unsigned order = 0; order < 3; ++order) {
+        auto root = fixture.root(0);
+        if (!root) return false;
+        kernel::cap::GrantRevoke revoke;
+        Probe probe{ops};
+        auto lease = root.value().acquire();
+        if (!lease || !lease.value().attach(probe.attachment)) return false;
+        lease.value().reset();
+        if (order != 0) {
+            if (!fixture.graph().invalidate(root.value().key(), revoke)
+                || !probe.work || !probe.attachment.busy()) return false;
+            if (order == 2) probe.work.reset();
+        }
+        const bool synchronous = probe.attachment.detach();
+        if (synchronous != (order != 1) || probe.releases != 0) return false;
+        probe.work.reset();
+        if (probe.releases != (order == 1 ? 1U : 0U)
+            || probe.attachment.attached() || probe.attachment.busy()
+            || (order != 0 && !revoke.complete())) return false;
+    }
+    return fixture.graph().live_count() == 0;
+}
+
 bool test_handles_are_local_and_stale_generation_stays_dead(
     const TestContext&) noexcept {
     CapFixture fixture{};
@@ -1174,8 +1216,7 @@ bool test_revoked_tombstones_do_not_retain_target(
         && fixture.graph().live_count() == 0;
 }
 
-bool test_allocation_transaction_aborts_complete_lineage(
-    const TestContext&) noexcept {
+bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
     CapFixture fixture{};
     if (!fixture.initialize()) {
         return false;
@@ -1230,7 +1271,19 @@ bool test_allocation_transaction_aborts_complete_lineage(
         return false;
     }
 
+    struct Work final {
+        usize signals{};
+        auto wake() noexcept -> kernel::diag::concurrency::ObservationKey { ++signals; return {}; }
+    } work;
+    if (deferred) fixture.graph().bind_work_notifier(GrantGraph::WorkNotifier::bind<&Work::wake>(work));
     allocation.value().reset();
+    if (deferred) {
+        const bool retained = work.signals != 0 && fixture.graph().work_pending()
+            && pool->available() != limit;
+        while (fixture.graph().service(1).more) {}
+        fixture.graph().unbind_work_notifier();
+        if (!retained) return false;
+    }
     child.value().reset();
     permit.value().reset();
     fixture.drop_retired_target(0);
@@ -1244,6 +1297,13 @@ bool test_allocation_transaction_aborts_complete_lineage(
     pool.reset();
     fixture.objects().drain_reclaim();
     return cap_test_pmm->verify_invariants();
+}
+
+bool test_allocation_transaction_aborts_complete_lineage(const TestContext&) noexcept {
+    return allocation_transaction_aborts_complete_lineage(false);
+}
+bool test_allocation_transaction_defers_rollback(const TestContext&) noexcept {
+    return allocation_transaction_aborts_complete_lineage(true);
 }
 
 bool test_pool_close_revokes_hidden_allocation_root(
@@ -1547,6 +1607,10 @@ bool test_tunnel_rights_keep_connect_and_tx_distinct(
 } // namespace
 
 void register_cap_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("cap", "attachment detach transfers callback quiescence exactly once",
+        test_attachment_detach_transfers_quiescence_once);
+    (void)registry.add("cap", "unpublished allocation rollback survives deferred revoke work",
+        test_allocation_transaction_defers_rollback);
     (void)registry.add(
         "cap",
         "typed attenuation decodes every supported capability family",

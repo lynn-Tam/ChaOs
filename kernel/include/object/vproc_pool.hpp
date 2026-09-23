@@ -15,7 +15,9 @@ struct ObjectTraits<kernel::Vproc> final {
         const kernel::Vproc& vproc) noexcept -> bool {
         return vproc.prepare_retire();
     }
-    static void retire([[maybe_unused]] kernel::Vproc& vproc) noexcept {}
+    static void retire(kernel::Vproc& vproc, ObjectCleanup&& cleanup) noexcept {
+        vproc.retire(libk::move(cleanup));
+    }
     static void destroy(kernel::Vproc& vproc) noexcept {
         libk::destroy_at(&vproc);
     }

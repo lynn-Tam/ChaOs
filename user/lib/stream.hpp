@@ -18,15 +18,7 @@ public:
             service::Message message{};
             message.size = size < sizeof(message.data) ? size : sizeof(message.data);
             service::copy(message.data, text, message.size);
-            for (;;) {
-                const auto status = service::send(output_, message).status;
-                if (status == MYOS_STATUS_BUSY || status == MYOS_STATUS_RETRY) {
-                    myos::yield();
-                    continue;
-                }
-                service::require(status);
-                break;
-            }
+            service::require(service::send(output_, message).status);
             text += message.size;
             size -= message.size;
         }

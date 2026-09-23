@@ -98,8 +98,10 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
     const auto closed = filesystem.close(file);
     if (status == MYOS_STATUS_OK) status = closed;
     const auto address = 0x10000000 + (job - jobs) * 0x1000000;
-    if (status == MYOS_STATUS_OK) status = supervisor.load(job->program, info,
-        job->package.memory.selector(), job->package.size, address, address + 0x800000);
+    if (status == MYOS_STATUS_OK) {
+        status = supervisor.load(job->program, info,
+            job->package.memory.selector(), job->package.size, address, address + 0x800000);
+    }
     if (status == MYOS_STATUS_OK && input == 0) {
         status = job->input.open(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
             service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE),
@@ -120,12 +122,14 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
     const deploy::LaunchSource sources[]{binding("stdin", input, MYOS_RIGHT_RECEIVE, 1),
         binding("stdout", output ? output : console, MYOS_RIGHT_SEND, 0),
         binding("stderr", console, MYOS_RIGHT_SEND, 0)};
-    if (status == MYOS_STATUS_OK) job->child = supervisor.launch(job->program,
+    if (status == MYOS_STATUS_OK) {
+        job->child = supervisor.launch(job->program,
         {reinterpret_cast<const uint8_t*>(name), length}, status,
         {.image_source = job->image.source(page_buffer, job->package.memory.selector(), address, job->package.size),
          .arguments = &arguments,
          .terminal_events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION),
          .close_badge = uint64_t{1} << (8 + job - jobs), .sources = sources, .admit = process::admit});
+    }
     reply.status = status;
     if (job->child) reply.id = job->child->token();
     else job->release_image();

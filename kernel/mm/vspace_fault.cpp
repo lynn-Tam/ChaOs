@@ -311,12 +311,15 @@ auto VSpace::materialize_fault(
     pending_kind_ = PendingKind::Map;
     release_claim();
     auto& retire = retire_batch_.emplace(*pmm_);
+    kernel::resource::Charge refund{};
     auto committed = commit_translation(
         libk::move(mutation).value(),
         libk::move(plan).value(),
         retire,
+        refund,
         mapping.access_.contains(Access::Execute));
     lock.restore();
+    refund.reset();
     if (!committed) {
         return libk::unexpected(committed.error());
     }
@@ -417,11 +420,13 @@ auto VSpace::sample_usage(
     }
     pending_kind_ = PendingKind::Protect;
     auto& retire = retire_batch_.emplace(*pmm_);
+    kernel::resource::Charge refund{};
     auto committed = commit_translation(
         libk::move(mutation).value(),
         libk::move(plan).value(),
-        retire);
+        retire, refund);
     lock.restore();
+    refund.reset();
     if (!committed) {
         return libk::unexpected(committed.error());
     }

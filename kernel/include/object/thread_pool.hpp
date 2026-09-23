@@ -17,7 +17,8 @@ struct ObjectTraits<kernel::Thread> final {
         return thread.prepare_retire();
     }
 
-    static void retire([[maybe_unused]] kernel::Thread& thread) noexcept {
+    static void retire(kernel::Thread& thread, ObjectCleanup&& cleanup) noexcept {
+        thread.retire(libk::move(cleanup));
     }
 
     static void destroy(kernel::Thread& thread) noexcept {

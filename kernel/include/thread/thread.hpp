@@ -162,6 +162,7 @@ public:
         return pager_claims_;
     }
     [[nodiscard]] auto prepare_retire() const noexcept -> bool;
+    void retire(object::ObjectCleanup&& cleanup) noexcept { authority_.retire(libk::move(cleanup)); }
 
 private:
     friend class sched::Binding;

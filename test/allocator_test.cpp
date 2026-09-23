@@ -854,14 +854,16 @@ bool test_runtime_editor_owns_private_and_shared_tables(
             return false;
         }
         kernel::mm::RetireBatch retired{memory};
+        kernel::resource::Charge refund{};
         while (auto page = unmapped.value().tables.take()) {
             if (!retired.adopt(libk::move(*page))) {
                 return false;
             }
         }
-        if (retired.page_count() != 2 || !retired.release()) {
+        if (retired.page_count() != 2 || !retired.release(refund)) {
             return false;
         }
+        refund.reset();
 
         const auto kernel_page = kernel::mm::VPage::from_base(
             kernel::mm::VirtAddr{kernel::mm::layout::DirectMapBegin});
@@ -886,7 +888,7 @@ bool test_runtime_editor_owns_private_and_shared_tables(
                 return false;
             }
         }
-        if (!kernel_retired.release() || !memory.verify_invariants()) {
+        if (!kernel_retired.release(refund) || !memory.verify_invariants()) {
             return false;
         }
     }

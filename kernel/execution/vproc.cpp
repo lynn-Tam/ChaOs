@@ -1173,7 +1173,6 @@ auto Vproc::prepare_retire() const noexcept -> bool {
             && execution_.state_ != State::Exited)
         || execution_.scheduler_binding_ != nullptr
         || execution_.home_ != nullptr
-        || authority_.active()
         || (!execution_.binding().detached()
             && !execution_.binding().kernel_bound())) {
         return false;
@@ -1219,7 +1218,7 @@ void Vproc::request_stop(execution::Stop& request) noexcept {
     bool finish{};
     {
         kernel::sync::IrqLockGuard guard{state_lock_};
-        KASSERT(request.started_ && request.target_ == &execution_);
+        KASSERT(request.started() && request.target_ == &execution_);
         stops_.push_back(request);
         if (stopped_) {
             stops_.erase(request);

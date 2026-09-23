@@ -189,6 +189,7 @@ struct Runtime final {
     myos::deploy::DeploymentPlan plan{};
     const void* bootstrap{};
     myos_word_t bootstrap_size{};
+    uint32_t cpu_count{};
     bool source_open{};
     bool parent_open{};
     bool bundle_open{};
@@ -348,6 +349,7 @@ Runtime runtime{};
     runtime.parent_open = true;
     runtime.bootstrap = bootstrap.data();
     runtime.bootstrap_size = sizeof(myos_bootstrap_info);
+    runtime.cpu_count = bootstrap.cpu_count();
     runtime.console.text("task-builder-test: parent\n");
 
     const myos_word_t bundle_window = page_round(
@@ -513,6 +515,7 @@ Runtime runtime{};
         .scratch = &runtime.scratch,
         .bootstrap = runtime.bootstrap,
         .bootstrap_size = runtime.bootstrap_size,
+        .runtime_cpu_count = runtime.cpu_count,
         .bindings = &bindings,
         .workspace = runtime.workspace};
     const myos_status_t constructed = builder.construct(

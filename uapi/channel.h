@@ -6,11 +6,12 @@
 
 #define MYOS_CHANNEL_VERSION 1U
 #define MYOS_CHANNEL_FLAGS_NONE 0U
-#define MYOS_CHANNEL_MAX_QUEUE 16U
+// Queue storage is prepaid at creation; depth is a 32-bit configuration value.
+#define MYOS_CHANNEL_MAX_QUEUE UINT32_MAX
 #define MYOS_CHANNEL_MAX_WORDS 16U
 #define MYOS_CHANNEL_MAX_CAPS MYOS_IPC_MAX_CAPS
-#define MYOS_CHANNEL_MAX_WAITERS 1U
-#define MYOS_CHANNEL_MAX_RELATIONS 4U
+// The relation handle dedicates eight bits to its slot.
+#define MYOS_CHANNEL_MAX_RELATIONS 256U
 
 // ARM returns the current sequence for the next recheck/arm cycle.
 // Readable/Writable also become ready on close: the corresponding operation
@@ -44,7 +45,7 @@ struct myos_channel_config {
     uint32_t queue_capacity;
     uint32_t max_words;
     uint32_t max_caps;
-    uint32_t waiter_capacity;
+    uint32_t waiter_capacity; // Legacy layout field; no per-Channel waiter quota.
     uint32_t relation_capacity;
     uint32_t reserved;
 };

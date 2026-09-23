@@ -747,6 +747,9 @@ public:
         if (attachment_.state != kernel::pager::PagerAttachment::State::Detached) {
             static_cast<void>(pager_->detach(attachment_));
         }
+        // Retirement closes executor admission. Publish the terminal results
+        // created by detach before waiting for mappings to leave this owner.
+        while (drain_page_waiters(8) != 0) {}
     }
 
     static auto request_transition(
@@ -2353,7 +2356,7 @@ MemoryObject::~MemoryObject() noexcept {
     if (state_ == MemoryState::Building || state_ == MemoryState::Live) {
         retire();
     }
-    KASSERT(state_ == MemoryState::Retired);
+    KASSERT(state_ == MemoryState::Retired && !cleanup_);
     KASSERT(!releasing_);
     KASSERT(backing_ == nullptr);
     KASSERT(backing_ops_ == nullptr);
@@ -3725,21 +3728,29 @@ auto MemoryObject::detach(MemoryAttachment& attachment) noexcept -> bool {
     return quiescent;
 }
 
-/*luna change: close work admission before backing stop and withdraw queued work, reason: retire must preserve one operations pin for any in-flight service without publishing new work*/
-void MemoryObject::retire() noexcept {
+// The cleanup token retains object storage until backing work, mappings, and
+// leases have drained. The retirement walk itself owns an operation pin: a
+// synchronous withdrawal callback must not finish cleanup beneath this walk.
+void MemoryObject::retire(object::ObjectCleanup&& cleanup) noexcept {
+    bool retired{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
-        if (state_ == MemoryState::Retired
-            || state_ == MemoryState::Stopping) {
-            return;
-        }
-        if (state_ == MemoryState::Building) {
+        retired = state_ == MemoryState::Retired;
+        if (!retired) {
+            if (cleanup) {
+                KASSERT(!cleanup_);
+                cleanup_ = libk::move(cleanup);
+            }
+            if (state_ == MemoryState::Stopping) return;
+            KASSERT(state_ == MemoryState::Building || state_ == MemoryState::Live);
             state_ = MemoryState::Stopping;
-        } else {
-            KASSERT(state_ == MemoryState::Live);
-            state_ = MemoryState::Stopping;
+            ++operations_;
+            work_open_.store<libk::MemoryOrder::Release>(false);
         }
-        work_open_.store<libk::MemoryOrder::Release>(false);
+    }
+    if (retired) {
+        if (cleanup) cleanup.complete();
+        return;
     }
 
     static_cast<void>(reclaimer_.withdraw(*this));
@@ -3787,6 +3798,11 @@ void MemoryObject::retire() noexcept {
     }
     if (stopped_ops != nullptr && stopped_ops->stop != nullptr) {
         stopped_ops->stop(stopped_backing);
+    }
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        KASSERT(operations_ != 0);
+        --operations_;
     }
     finish_retire();
 }
@@ -3938,6 +3954,7 @@ void MemoryObject::finish_retire() noexcept {
     const BackingOps* ops{};
     OwnedPage storage{};
     u64 terminal_key{};
+    object::ObjectCleanup cleanup{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
         if (state_ != MemoryState::Stopping
@@ -3968,6 +3985,7 @@ void MemoryObject::finish_retire() noexcept {
         KASSERT(releasing_);
         releasing_ = false;
         state_ = MemoryState::Retired;
+        cleanup = libk::move(cleanup_);
         terminal_key = observation_key_.exchange<
             libk::MemoryOrder::AcqRel>(0);
         observation_reserved_.store<libk::MemoryOrder::Release>(false);
@@ -3978,6 +3996,7 @@ void MemoryObject::finish_retire() noexcept {
         observation.finish(static_cast<u32>(
             diag::concurrency::ServicePhase::Completed));
     }
+    if (cleanup) cleanup.complete();
 }
 
 /*luna change: seal failed construction against executor admission, reason: a non-live object has no backing service to drain*/

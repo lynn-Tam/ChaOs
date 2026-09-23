@@ -7,6 +7,7 @@
 #include <operation/completion.hpp>
 #include <operation/page_access.hpp>
 #include <operation/vm_wait.hpp>
+#include <ipc/channel_wait.hpp>
 #include <resource/allocation.hpp>
 
 namespace arch {
@@ -33,6 +34,7 @@ public:
     Wait() noexcept;
     ~Wait() noexcept;
 
+    [[nodiscard]] auto prepare_channel(ipc::Channel& channel) noexcept -> ipc::ChannelWait*;
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto ready() const noexcept -> bool;
     [[nodiscard]] auto observation_key() const noexcept
@@ -70,13 +72,14 @@ private:
     mutable kernel::sync::SpinLock<kernel::sync::LockClass::Wait> lock_{};
     libk::Atomic<bool> ready_{};
     EdgePhase phase_{EdgePhase::Detached};
-    enum class LocalKind : u8 { None, Page, Revoke, Close, Vm };
+    enum class LocalKind : u8 { None, Page, Revoke, Close, Vm, Channel };
     LocalKind local_kind_{LocalKind::Page};
     union Local {
         PageAccess page;
         cap::GrantRevokeWait revoke;
         resource::CloseWait close;
         VmWait vm;
+        ipc::ChannelWait channel;
         Local() noexcept : page{} {}
         ~Local() noexcept {}
     } local_;

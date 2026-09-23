@@ -369,9 +369,10 @@ private:
         TranslationState::Mutation&& mutation,
         ShootdownPlan&& plan,
         RetireBatch& retire,
+        kernel::resource::Charge& refund,
         bool instruction_sync = false) noexcept
         -> libk::Expected<VmStatus, VSpaceError>;
-    [[nodiscard]] auto finish_pending() noexcept -> bool;
+    [[nodiscard]] auto finish_pending(kernel::resource::Charge& refund) noexcept -> bool;
     void queue_layout(LayoutNode& node) noexcept;
     void queue_page(MappedPage& page) noexcept;
     void queue_authority(MappingAuthority& authority) noexcept;

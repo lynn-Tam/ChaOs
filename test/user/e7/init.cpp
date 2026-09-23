@@ -1070,7 +1070,7 @@ private:
 
     [[nodiscard]] auto make_channel() noexcept -> bool {
         const auto created = myos::channel_create(
-            pool_, 1, MYOS_CHANNEL_MAX_WORDS, 1, MYOS_CHANNEL_MAX_RELATIONS);
+            pool_, 1, MYOS_CHANNEL_MAX_WORDS, 1, 4);
         if (created.status != MYOS_STATUS_OK
             || created.value == 0 || created.value2 == 0) {
             return false;

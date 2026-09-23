@@ -389,6 +389,7 @@ auto VSpace::start_region_destroy(
     PendingKind kind,
     bool root_target) noexcept
     -> libk::Expected<VmStatus, VSpaceError> {
+    kernel::resource::Charge refund{};
     kernel::sync::IrqLockToken lock{lock_};
     // Resolve the target only while the VSpace transaction lock is held.  A
     // RegionKey is generation-stable across the unlocked admission window;
@@ -426,14 +427,16 @@ auto VSpace::start_region_destroy(
     if (pending_pages_ == nullptr) {
         mutation.value().abort();
         retire_batch_.reset();
-        KASSERT(finish_pending());
+        KASSERT(finish_pending(refund));
         lock.restore();
+        refund.reset();
         finish_authorities();
         return libk::expected(VmStatus::Complete);
     }
     auto committed = commit_translation(
-        libk::move(mutation).value(), libk::move(plan).value(), retire);
+        libk::move(mutation).value(), libk::move(plan).value(), retire, refund);
     lock.restore();
+    refund.reset();
     if (committed && committed.value() == VmStatus::Complete) {
         finish_authorities();
     }

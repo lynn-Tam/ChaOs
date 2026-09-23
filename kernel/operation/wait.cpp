@@ -23,6 +23,7 @@ void Wait::reset_local() noexcept {
     case LocalKind::Revoke: libk::destroy_at(&local_.revoke); break;
     case LocalKind::Close: libk::destroy_at(&local_.close); break;
     case LocalKind::Vm: libk::destroy_at(&local_.vm); break;
+    case LocalKind::Channel: libk::destroy_at(&local_.channel); break;
     }
     local_kind_ = LocalKind::None;
 }
@@ -62,6 +63,14 @@ auto Wait::prepare_vm(object::ObjectRef&& target, mm::VSpace& space) noexcept ->
     reset_local();
     auto* result = libk::construct_at(&local_.vm, libk::move(target), space);
     local_kind_ = LocalKind::Vm;
+    return result;
+}
+
+auto Wait::prepare_channel(ipc::Channel& channel) noexcept -> ipc::ChannelWait* {
+    if (attached()) return nullptr;
+    reset_local();
+    auto* result = libk::construct_at(&local_.channel, channel);
+    local_kind_ = LocalKind::Channel;
     return result;
 }
 
