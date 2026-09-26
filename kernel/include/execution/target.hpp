@@ -3,13 +3,16 @@
 #include <execution/execution.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/variant.hpp>
-#include <object/thread_pool.hpp>
-#include <object/vproc_pool.hpp>
+#include <object/object_ref.hpp>
 #include <uapi/status.h>
 
 namespace kernel::sched {
 class Binding;
 class CpuDispatcher;
+}
+
+namespace kernel {
+class Thread;
 }
 
 namespace kernel::operation {
@@ -80,10 +83,10 @@ private:
 class TargetHold final : private libk::noncopyable {
 public:
     TargetHold() noexcept = default;
-    explicit TargetHold(object::ThreadHold&& thread) noexcept
-        : value_(libk::in_place_type<object::ThreadHold>, libk::move(thread)) {}
-    explicit TargetHold(object::VprocHold&& vproc) noexcept
-        : value_(libk::in_place_type<object::VprocHold>, libk::move(vproc)) {}
+    explicit TargetHold(object::ObjectHold<Thread>&& thread) noexcept
+        : value_(libk::in_place_type<object::ObjectHold<Thread>>, libk::move(thread)) {}
+    explicit TargetHold(object::ObjectHold<Vproc>&& vproc) noexcept
+        : value_(libk::in_place_type<object::ObjectHold<Vproc>>, libk::move(vproc)) {}
     TargetHold(TargetHold&&) noexcept = default;
     auto operator=(TargetHold&&) noexcept -> TargetHold& = default;
 
@@ -95,7 +98,7 @@ public:
 
 private:
     using Value = libk::variant<
-        libk::monostate, object::ThreadHold, object::VprocHold>;
+        libk::monostate, object::ObjectHold<Thread>, object::ObjectHold<Vproc>>;
     Value value_{};
 };
 

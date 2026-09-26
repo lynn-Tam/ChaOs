@@ -1,4 +1,5 @@
 #include <object/tunnel_pool.hpp>
+#include <object/vproc_pool.hpp>
 
 #include <core/debug.hpp>
 #include <cpu/cpu_registry.hpp>

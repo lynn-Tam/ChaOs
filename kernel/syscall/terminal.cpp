@@ -4,6 +4,7 @@
 #include <fault/terminal.hpp>
 #include <ipc/notification.hpp>
 #include <object/notification_pool.hpp>
+#include <object/thread_pool.hpp>
 #include <thread/thread.hpp>
 #include <uapi/syscall.h>
 

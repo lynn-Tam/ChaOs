@@ -11,7 +11,6 @@
 #include <libk/sync/atomic.hpp>
 #include <sync/lock.hpp>
 #include <object/object_ref.hpp>
-#include <object/vproc_pool.hpp>
 #include <sched/binding.hpp>
 #include <sched/authority.hpp>
 #include <sched/refill_queue.hpp>

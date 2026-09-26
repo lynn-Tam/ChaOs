@@ -16,7 +16,7 @@
 #include <mm/node_pool.hpp>
 #include <mm/user_view.hpp>
 #include <object/object_cleanup.hpp>
-#include <object/thread_pool.hpp>
+#include <object/object_ref.hpp>
 #include <operation/completion.hpp>
 #include <operation/wait.hpp>
 #include <ipc/transfer.hpp>
@@ -157,7 +157,7 @@ private:
     operation::Completion completion_;
     sched::Deadline deadline_;
     libk::ManualLifetime<cap::GrantAttachment> authority_{};
-    object::ThreadHold caller_{};
+    object::ObjectHold<Thread> caller_{};
     arch::UserFrame caller_frame_{};
     Activation* activation_{};
     usize arguments_[3]{};
@@ -250,7 +250,7 @@ private:
     };
 
     [[nodiscard]] static auto hold(Thread& thread) noexcept
-        -> libk::Expected<object::ThreadHold, EndpointError>;
+        -> libk::Expected<object::ObjectHold<Thread>, EndpointError>;
     [[nodiscard]] auto depth(const Thread& thread) const noexcept -> usize;
     [[nodiscard]] auto call_complete(const Call& call) const noexcept -> bool;
     [[nodiscard]] auto read_call(Call& call) noexcept -> operation::Result;

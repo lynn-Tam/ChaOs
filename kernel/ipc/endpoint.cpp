@@ -1,4 +1,5 @@
 #include <object/endpoint_pool.hpp>
+#include <object/thread_pool.hpp>
 
 #include <core/debug.hpp>
 #include <cpu/cpu_local.hpp>
@@ -220,7 +221,7 @@ auto Endpoint::open() noexcept -> libk::Expected<void, EndpointError> {
 }
 
 auto Endpoint::hold(Thread& thread) noexcept
-    -> libk::Expected<object::ThreadHold, EndpointError> {
+    -> libk::Expected<object::ObjectHold<Thread>, EndpointError> {
     sched::Binding* const binding = thread.binding();
     if (binding == nullptr) {
         return libk::unexpected(EndpointError::InvalidCaller);
@@ -231,7 +232,7 @@ auto Endpoint::hold(Thread& thread) noexcept
     }
     auto held = libk::move(reference).value().into_hold<Thread>();
     return held
-        ? libk::Expected<object::ThreadHold, EndpointError>{
+        ? libk::Expected<object::ObjectHold<Thread>, EndpointError>{
               libk::expected(libk::move(held).value())}
         : libk::unexpected(EndpointError::InvalidCaller);
 }
@@ -842,7 +843,7 @@ void Endpoint::release_call(Call& call) noexcept {
     }
 
     close_installed(call);
-    call.caller_ = object::ThreadHold{};
+    call.caller_ = object::ObjectHold<Thread>{};
     call.caller_frame_ = {};
     Call* ready{};
     {

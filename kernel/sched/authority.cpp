@@ -4,6 +4,7 @@
 #include <libk/utility.hpp>
 #include <object/sched_pool.hpp>
 #include <object/thread_pool.hpp>
+#include <object/vproc_pool.hpp>
 #include <sync/irq_lock_guard.hpp>
 #include <thread/thread.hpp>
 #include <execution/vproc.hpp>

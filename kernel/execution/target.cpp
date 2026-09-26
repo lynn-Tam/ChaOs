@@ -371,7 +371,7 @@ auto TargetHold::get() const noexcept -> Target {
         using T = libk::remove_cvr_t<decltype(value)>;
         if constexpr (libk::SameAs<T, libk::monostate>) {
             return {};
-        } else if constexpr (libk::SameAs<T, object::ThreadHold>) {
+        } else if constexpr (libk::SameAs<T, object::ObjectHold<Thread>>) {
             return Target{const_cast<Thread&>(value.get())};
         } else {
             return Target{const_cast<Vproc&>(value.get())};

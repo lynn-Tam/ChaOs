@@ -7,7 +7,7 @@
 #include <libk/noncopyable.hpp>
 #include <libk/optional.hpp>
 #include <mm/translation.hpp>
-#include <object/object_store.hpp>
+#include <object/object_ref.hpp>
 #include <sched/dispatcher.hpp>
 #include <thread/thread.hpp>
 
@@ -35,19 +35,19 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     }
 
     CpuLocal local{};
-    kernel::mm::ShootdownQueue shootdowns{};
-    libk::optional<kernel::mm::TranslationView> initial_translation{};
+    mm::ShootdownQueue shootdowns{};
+    libk::optional<mm::TranslationView> initial_translation{};
     CpuStackSet stacks{};
-    kernel::mm::OwnedPage diagnostics_page{};
+    mm::OwnedPage diagnostics_page{};
     diag::CpuDiagnostics* diagnostics{};
-    object::ObjectStore::ThreadHold idle_thread{};
+    object::ObjectHold<Thread> idle_thread{};
     libk::ManualLifetime<sched::CpuDispatcher> dispatcher_storage{};
     arch::CpuStartContext start_context{};
     CpuRegistry* owner_registry{};
     KernelState* kernel{};
 };
 
-static_assert(sizeof(CpuRuntime) <= kernel::mm::page_size,
+static_assert(sizeof(CpuRuntime) <= mm::page_size,
     "CpuRuntime must remain allocatable by the page-bounded meta arena");
 
 } // namespace kernel
