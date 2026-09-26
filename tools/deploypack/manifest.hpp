@@ -80,6 +80,10 @@ class Task final {
     bool supervisor_{};
     uint64_t kinds_{MYOS_RESOURCE_E2_KINDS};
     uint16_t restart_{MYOS_DEPLOY_RESTART_NEVER};
+    uint16_t readiness_{MYOS_DEPLOY_READINESS_START};
+    uint64_t readiness_timeout_ns_{};
+    std::string arguments_{};
+    size_t argument_count_{};
 
     auto key(std::string_view suffix) -> uint64_t {
         return manifest_.name(name_ + "." + std::string{suffix});
@@ -207,6 +211,23 @@ public:
     }
     void kinds(uint64_t value) { kinds_ = value; }
     void restart(uint16_t policy) { restart_ = policy; }
+    void explicit_readiness(uint64_t timeout_ns) {
+        if (timeout_ns == 0) throw std::invalid_argument("readiness needs a deadline");
+        readiness_ = MYOS_DEPLOY_READINESS_EXPLICIT;
+        readiness_timeout_ns_ = timeout_ns;
+        notification("readiness", 1);
+        local(MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION, "readiness", MYOS_RIGHT_SIGNAL);
+    }
+    void argument(std::string_view value) {
+        if (argument_count_ == MYOS_BOOTSTRAP_ARG_MAX
+            || arguments_.size() >= MYOS_BOOTSTRAP_ARG_BYTES
+            || value.size() >= MYOS_BOOTSTRAP_ARG_BYTES - arguments_.size()
+            || value.find('\0') != std::string_view::npos)
+            throw std::invalid_argument("task argument exceeds bootstrap envelope");
+        arguments_.append(value);
+        arguments_.push_back('\0');
+        ++argument_count_;
+    }
     void requires_service(uint32_t target, std::string_view relation,
                           uint16_t flags = MYOS_DEPLOY_DEPENDENCY_STARTUP) {
         auto r = manifest_.row(MYOS_DEPLOY_TABLE_DEPENDENCY);
@@ -279,9 +300,12 @@ public:
         r.u32(MYOS_DEPLOY_TASK_CSPACE_SLOTS, cspace_slots_);
         r.u32(MYOS_DEPLOY_TASK_CSPACE_PAGES, cspace_pages_);
         r.u32(MYOS_DEPLOY_TASK_BOOTSTRAP_MAPPING, bootstrap_);
-        r.u16(MYOS_DEPLOY_TASK_READINESS, MYOS_DEPLOY_READINESS_START);
+        r.u16(MYOS_DEPLOY_TASK_READINESS, readiness_);
+        r.u64(MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS, readiness_timeout_ns_);
         r.u16(MYOS_DEPLOY_TASK_TERMINAL, MYOS_DEPLOY_TERMINAL_CLOSE);
         r.u16(MYOS_DEPLOY_TASK_RESTART, restart_);
+        r.u64(MYOS_DEPLOY_TASK_ARGUMENTS,
+            arguments_.empty() ? 0 : manifest_.name(arguments_));
     }
 };
 
@@ -409,7 +433,8 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
     return manifest.finish();
 }
 
-inline auto pack_console(char** paths, bool fail_shell = false, bool storage = false)
+inline auto pack_console(char** paths, bool fail_shell = false, bool storage = false,
+    std::string_view volume_id = {})
     -> std::vector<uint8_t> {
     Manifest manifest;
     // Row identities belong to this manifest, not to init or the kernel.
@@ -499,11 +524,14 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
     }
     if (storage) {
         Task t{manifest, "store", paths[6], 8 * 1024 * 1024, false, service_budget};
+        if (!volume_id.empty()) t.argument(volume_id);
         t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.explicit_readiness(10'000'000'000);
         t.requires_service(data_block, "data block");
         t.cspace(256, 36);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         t.channel(myos::bootstrap::imports::Block, "block_data.client", 0, 1, send);
+        t.authority(myos::bootstrap::imports::ServiceWake, "service.wake", MYOS_RIGHT_SIGNAL);
         t.channel_service(myos::bootstrap::imports::Store, "store.client", 1,
             receive, send, 4, 4);
         t.finish();

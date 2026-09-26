@@ -1637,6 +1637,11 @@ public:
             : record_ptr->template consume_readiness<B>();
     }
 
+    [[nodiscard]] auto ready(TaskId id) const noexcept -> bool {
+        const Record* const record_ptr = record(id);
+        return record_ptr != nullptr && record_ptr->ready();
+    }
+
     /* Register one PreparedKey export through the source TaskRecord.  The
      * caller supplies no identity: it is an injective, checked encoding of
      * the live TaskId and export row, so stale task generations cannot alias a

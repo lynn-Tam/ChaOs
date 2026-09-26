@@ -54,6 +54,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto notification = myos::notification_create(pool, 1);
     myos::service::require(notification.status);
     myos::cap::OwnedCap events{{notification.value, 0}};
+    myos::service::require(supervisor.add("service.wake", events.selector(),
+        MYOS_OBJECT_KIND_NOTIFICATION, MYOS_RIGHT_SIGNAL));
     const auto pair = myos::channel_create(pool, 4, MYOS_CHANNEL_MAX_WORDS, 1, 1);
     myos::service::require(pair.status);
     myos::cap::OwnedCap control_root{{pair.value, 0}}, control_client{{pair.value2, 0}};

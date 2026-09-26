@@ -41,6 +41,36 @@ class ServiceSupervisor final {
         return status;
     }
 
+    auto wait_ready(uint32_t i) noexcept -> myos_status_t {
+        const auto timeout = program_.plan().task(i)->readiness_timeout_ns;
+        if (timeout == 0) return MYOS_STATUS_OK;
+        const auto now = clock_now();
+        if (now.status != MYOS_STATUS_OK) return now.status;
+        const uint64_t deadline = now.value > UINT64_MAX - timeout
+            ? UINT64_MAX : now.value + timeout;
+        for (;;) {
+            const auto observed = supervisor_.observe(*tasks_[i]);
+            if (observed.status != MYOS_STATUS_OK) return observed.status;
+            if (observed.value != 0) {
+                const auto status = static_cast<myos_status_t>(static_cast<int64_t>(observed.value2));
+                return status == MYOS_STATUS_OK ? MYOS_STATUS_PEER_FAULT : status;
+            }
+            const auto status = supervisor_.ready(*tasks_[i]);
+            if (status == MYOS_STATUS_OK) {
+                const auto terminal = supervisor_.observe(*tasks_[i]);
+                if (terminal.status != MYOS_STATUS_OK) return terminal.status;
+                if (terminal.value == 0) return MYOS_STATUS_OK;
+                const auto ended = static_cast<myos_status_t>(static_cast<int64_t>(terminal.value2));
+                return ended == MYOS_STATUS_OK ? MYOS_STATUS_PEER_FAULT : ended;
+            }
+            if (status != MYOS_STATUS_WOULD_BLOCK) return status;
+            const auto wake = notification_wait(events_, deadline);
+            if (wake.status == MYOS_STATUS_TIMED_OUT) return wake.status;
+            if (wake.status != MYOS_STATUS_OK) return wake.status;
+            notify(wake.value);
+        }
+    }
+
 public:
     struct StartResult {
         myos_status_t status;
@@ -58,11 +88,12 @@ public:
         const auto valid = supervisor_.validate_graph(program_);
         if (valid != MYOS_STATUS_OK) return {valid, libk::nullopt};
         for (uint32_t p = 0; p < plan.task_count(); ++p) {
-            const auto status = launch(order_[p]);
+            auto status = launch(order_[p]);
+            if (status == MYOS_STATUS_OK) status = wait_ready(order_[p]);
             if (status == MYOS_STATUS_OK) continue;
             // A dependent may own grants derived from its provider. Finish
             // each dependent's close before revoking the provider lineage.
-            for (size_t q = p; q != 0; --q) {
+            for (size_t q = p + 1; q != 0; --q) {
                 auto& task = tasks_[order_[q - 1]];
                 if (!task) continue;
                 const auto stopped = supervisor_.request_stop(*task);
@@ -142,7 +173,8 @@ public:
         for (uint32_t p = 0; p < plan.task_count(); ++p) {
             const auto i = order_[p];
             if (!recovering_[i] || disabled_[i]) continue;
-            const auto status = launch(i);
+            auto status = launch(i);
+            if (status == MYOS_STATUS_OK) status = wait_ready(i);
             if (status != MYOS_STATUS_OK) {
                 // A partial new cohort must close before another attempt;
                 // admission failure does not change the manifest's restart

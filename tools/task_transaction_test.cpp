@@ -512,6 +512,8 @@ void insert_explicit(
         task + MYOS_DEPLOY_TASK_READINESS,
         MYOS_DEPLOY_READINESS_EXPLICIT,
         2);
+    put_explicit(fixture.raw, task + MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS,
+        10'000'000'000, 8);
     put_explicit(
         fixture.raw,
         task + MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST,
@@ -817,7 +819,7 @@ void put_manifest(
 [[nodiscard]] auto make_dependency_plan(
     DependencyFixture& fixture) noexcept -> bool {
     constexpr size_t shift = MYOS_DEPLOY_TASK_STRIDE;
-    constexpr size_t dependency_offset = 0x510;
+    constexpr size_t dependency_offset = myos::deploy::host::kGoldenSize + MYOS_DEPLOY_TASK_STRIDE;
     const size_t size = dependency_offset + 2 * MYOS_DEPLOY_DEPENDENCY_STRIDE;
     for (size_t index = 0; index < size; ++index) {
         fixture.raw[index] = 0;
@@ -825,7 +827,7 @@ void put_manifest(
     for (size_t index = 0; index < myos::deploy::host::kGoldenSize; ++index) {
         fixture.raw[index] = myos::deploy::host::kGolden[index];
     }
-    for (size_t index = myos::deploy::host::kGoldenSize; index > 0x180;
+    for (size_t index = myos::deploy::host::kGoldenSize; index > 0x188;
          --index) {
         fixture.raw[index - 1 + shift]
             = myos::deploy::host::kGolden[index - 1];
@@ -844,7 +846,7 @@ void put_manifest(
         2,
         4);
     const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
-        0xe0, 0x180, 0x1a0, 0x290, 0x2f0, 0x360, 0, 0x3c0, 0x420, 0,
+        0xe0, 0x188, 0x1a8, 0x298, 0x2f8, 0x368, 0, 0x3c8, 0x428, 0,
     };
     for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
          table <= MYOS_DEPLOY_TABLE_STRING;
@@ -1067,7 +1069,7 @@ void put_manifest(
         || task->exports.first != 0 || task->exports.count != 1
         || task->flags != 0 || task->readiness != 0
         || task->terminal != 0 || task->restart != 0
-        || task->readiness_value != 0
+        || task->readiness_timeout_ns != 0
         || !equals(fixture.plan.symbol(image->source), "init")
         || image->source_kind != 0 || image->flags != 0
         || !equals(fixture.plan.symbol(code->produced), "code")

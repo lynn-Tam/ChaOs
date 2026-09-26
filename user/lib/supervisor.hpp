@@ -150,9 +150,6 @@ public:
         if (plan.task_count() == 0 || plan.task_count() > Capacity) return MYOS_STATUS_BAD_ARGS;
         for (uint32_t t = 0; t < plan.task_count(); ++t) {
             const auto& task = *plan.task(t);
-            // This executor currently uses start readiness. Explicit readiness
-            // must gain an event-driven observation path before admission.
-            if (task.readiness == MYOS_DEPLOY_READINESS_EXPLICIT) return MYOS_STATUS_BAD_ARGS;
             for (uint32_t x = 0; x < task.executions.count; ++x)
                 if (!source(plan.symbol(plan.execution(task.executions.first + x)->domain)).valid())
                     return MYOS_STATUS_DENIED;
@@ -190,6 +187,14 @@ public:
         if (!index || !lease) return libk::nullopt;
         auto task = lease->task(*index);
         if (options.admit != nullptr && !options.admit(task)) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+        bootstrap::Arguments defaults;
+        const bootstrap::Arguments* arguments = options.arguments;
+        if (arguments == nullptr && !task.row()->arguments.empty()) {
+            const auto encoded = task.symbol(task.row()->arguments);
+            if (!defaults.decode(reinterpret_cast<const char*>(encoded.data()), encoded.size()))
+                return libk::nullopt;
+            arguments = &defaults;
+        }
         RegistrationJournal<MYOS_BOOTSTRAP_MAX_IMPORTS> temporary;
         AuthorityId overrides[MYOS_BOOTSTRAP_MAX_IMPORTS]{};
         auto retire = libk::on_scope_exit([&]() noexcept { checked(temporary.retire_all() == MYOS_STATUS_OK); });
@@ -238,7 +243,7 @@ public:
         TaskConstructionInput<Backend, Authorities> input{
             .parent_pool = pool_, .bundle = &program.bundle_, .scratch = &program.scratch_,
             .runtime_cpu_count = cpus_, .bindings = &bindings, .image_source = options.image_source,
-            .arguments = options.arguments,
+            .arguments = arguments,
             .terminal_notification = options.terminal_events != 0 ? &terminal : nullptr, .workspace = workspace_};
         status = builder.construct(input, authorities_);
         if (status == MYOS_STATUS_OK && !builder.commit_prepared()) status = MYOS_STATUS_INTERNAL;
@@ -291,6 +296,11 @@ public:
         return status == MYOS_STATUS_OK ? wait(handle) : status;
     }
     auto observe(const Handle& handle) noexcept -> SysResult { return table_.observe_terminal(handle.id); }
+    auto ready(const Handle& handle) noexcept -> myos_status_t {
+        if (table_.ready(handle.id)) return MYOS_STATUS_OK;
+        const auto status = table_.consume_readiness(handle.id);
+        return status == MYOS_STATUS_RETRY ? MYOS_STATUS_WOULD_BLOCK : status;
+    }
 
     // With close_badge configured, closing advances without waiting for pool
     // refund. The caller services other producers while teardown is pending.

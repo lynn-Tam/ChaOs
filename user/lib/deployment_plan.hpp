@@ -84,8 +84,9 @@ struct PlanTask final {
     uint16_t readiness{};
     uint16_t terminal{};
     uint16_t restart{};
-    uint64_t readiness_value{};
+    uint64_t readiness_timeout_ns{};
     PlanRange bootstraps{};
+    SymbolId arguments{};
 };
 
 struct PlanImage final {
@@ -851,8 +852,9 @@ inline auto DeploymentPlan::decode_rows(const ManifestView& view) noexcept
         row.readiness = source.readiness;
         row.terminal = source.terminal;
         row.restart = source.restart;
-        row.readiness_value = source.readiness_value;
+        row.readiness_timeout_ns = source.readiness_timeout_ns;
         row.bootstraps = {source.bootstrap_first, source.bootstrap_count};
+        row.arguments = symbol(source.arguments);
     }
     storage_->task_count_ = view.task_count();
 

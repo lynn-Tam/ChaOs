@@ -518,6 +518,9 @@ inline auto pack_production(
         put(bytes, offset + MYOS_DEPLOY_TASK_BOOTSTRAP_MAPPING,
             bootstrap_mapping, 4);
         put(bytes, offset + MYOS_DEPLOY_TASK_READINESS, readiness, 2);
+        if (readiness == MYOS_DEPLOY_READINESS_EXPLICIT)
+            put(bytes, offset + MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS,
+                10'000'000'000, 8);
         put(bytes, offset + MYOS_DEPLOY_TASK_TERMINAL,
             MYOS_DEPLOY_TERMINAL_CLOSE, 2);
         put(bytes, offset + MYOS_DEPLOY_TASK_RESTART,

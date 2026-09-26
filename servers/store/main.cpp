@@ -10,6 +10,14 @@ io::ControlPort directory;
 block::Client backend;
 store::Volume volume;
 myos_cap_t events;
+uint8_t expected_id[store::VolumeIdSize]{};
+bool require_id{};
+
+auto expected(const uint8_t* id) noexcept -> bool {
+    for (size_t i = 0; i < sizeof(expected_id); ++i)
+        if (id[i] != expected_id[i]) return false;
+    return true;
+}
 
 struct File final {
     lfs_file_t state{};
@@ -77,6 +85,10 @@ struct Client final {
             if (!admin) { reply.status = MYOS_STATUS_DENIED; return; }
             if ((request.size != 0 && request.size != store::VolumeIdSize) || request.value != 0) {
                 reply.status = MYOS_STATUS_BAD_ARGS; return;
+            }
+            if (require_id && (request.size != store::VolumeIdSize
+                || !expected(reinterpret_cast<const uint8_t*>(request.data)))) {
+                reply.status = MYOS_STATUS_DENIED; return;
             }
             for (auto& owner : clients) for (auto& opened : owner.files)
                 if (opened.open) { reply.status = MYOS_STATUS_BUSY; return; }
@@ -256,13 +268,29 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto cspace = service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE);
     events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
+    if (info.argument_count() > 1) exit(MYOS_STATUS_BAD_ARGS);
+    if (info.argument_count() == 1) {
+        const auto* text = info.argument(0);
+        if (!store::parse_volume_id(text, service::length(text), expected_id))
+            exit(MYOS_STATUS_BAD_ARGS);
+        require_id = true;
+    }
     service::require(backend.connect(service::capability(info, bootstrap::imports::Block),
         pool, cspace, events, vspace, 0x70000000));
     service::require(volume.open(backend));
+    if (require_id && volume.mounted()) {
+        uint8_t actual[store::VolumeIdSize]{};
+        service::require(volume.identity(actual));
+        if (!expected(actual)) exit(MYOS_STATUS_DENIED);
+    }
     service::require(directory.open(service::capability(info, bootstrap::imports::Store), events));
     for (size_t i = 0; i < Clients; ++i)
         service::require(clients[i].session.prepare(pool, vspace, cspace,
             0x71000000 + i * 0x100000, true));
+    service::require(notification_signal(
+        service::capability(info, MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION)).status);
+    service::require(notification_signal(
+        service::capability(info, bootstrap::imports::ServiceWake)).status);
     size_t turn{};
     for (;;) {
         bool again{};

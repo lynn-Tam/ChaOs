@@ -18,6 +18,7 @@
 #include <uapi/vm.h>
 
 #include <user/lib/boot_bundle.hpp>
+#include <user/lib/arguments.hpp>
 #include <user/lib/cap_attenuation.hpp>
 
 namespace myos::deploy {
@@ -106,9 +107,10 @@ struct ManifestTaskRow final {
     uint16_t readiness{};
     uint16_t terminal{};
     uint16_t restart{};
-    uint64_t readiness_value{};
+    uint64_t readiness_timeout_ns{};
     uint32_t bootstrap_first{};
     uint32_t bootstrap_count{};
+    StringRef arguments{};
 };
 
 struct ManifestImageRow final {
@@ -715,13 +717,25 @@ private:
                              MYOS_DEPLOY_TASK_CSPACE, cspace, true)
                 || !zero(MYOS_DEPLOY_TABLE_TASK, task,
                          MYOS_DEPLOY_TASK_RESERVED,
-                         MYOS_DEPLOY_TASK_RESERVED + 2)
-                || !zero(MYOS_DEPLOY_TABLE_TASK, task,
-                         MYOS_DEPLOY_TASK_RESERVED_TAIL,
-                         MYOS_DEPLOY_TASK_STRIDE)) {
+                         MYOS_DEPLOY_TASK_RESERVED + 2)) {
                 return fail(Error::InvalidRecord);
             }
+            uint64_t argument_ref{};
+            if (!value(MYOS_DEPLOY_TABLE_TASK, task, MYOS_DEPLOY_TASK_ARGUMENTS,
+                    8, argument_ref)) return fail(Error::InvalidRecord);
+            const StringRef arguments{static_cast<uint32_t>(argument_ref),
+                static_cast<uint32_t>(argument_ref >> 32)};
+            if (arguments.length == 0) {
+                if (arguments.offset != 0) return fail(Error::InvalidRecord);
+            } else {
+                const auto bytes = string(arguments);
+                bootstrap::Arguments decoded;
+                if (!bytes || !decoded.decode(
+                    reinterpret_cast<const char*>(bytes.data()), bytes.size()))
+                    return fail(Error::InvalidRecord);
+            }
             uint64_t readiness{};
+            uint64_t readiness_timeout_ns{};
             uint64_t terminal{};
             uint64_t restart{};
             uint64_t flags{};
@@ -734,6 +748,9 @@ private:
             uint64_t cspace_pages{};
             if (!value(MYOS_DEPLOY_TABLE_TASK, task,
                        MYOS_DEPLOY_TASK_READINESS, 2, readiness)
+                || !value(MYOS_DEPLOY_TABLE_TASK, task,
+                          MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS, 8,
+                          readiness_timeout_ns)
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
                           MYOS_DEPLOY_TASK_TERMINAL, 2, terminal)
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
@@ -756,6 +773,8 @@ private:
                 || !value(MYOS_DEPLOY_TABLE_TASK, task,
                           MYOS_DEPLOY_TASK_CSPACE_PAGES, 4, cspace_pages)
                 || readiness > MYOS_DEPLOY_READINESS_EXPLICIT
+                || ((readiness == MYOS_DEPLOY_READINESS_EXPLICIT)
+                    != (readiness_timeout_ns != 0))
                 || terminal > MYOS_DEPLOY_TERMINAL_CLOSE
                 || restart > MYOS_DEPLOY_RESTART_ALWAYS
                 || flags != 0
@@ -2949,14 +2968,17 @@ inline auto ManifestView::task_row(
                                    MYOS_DEPLOY_TASK_RESTART, 2,
                                    output.restart)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
-                                   MYOS_DEPLOY_TASK_READINESS_VALUE, 8,
-                                   output.readiness_value)
+                                   MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS, 8,
+                                   output.readiness_timeout_ns)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
                                    MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST, 4,
                                    output.bootstrap_first)
         && manifest_detail::scalar(*this, MYOS_DEPLOY_TABLE_TASK, index,
                                    MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT, 4,
-                                   output.bootstrap_count);
+                                   output.bootstrap_count)
+        && manifest_detail::string_ref(*this, MYOS_DEPLOY_TABLE_TASK, index,
+                                      MYOS_DEPLOY_TASK_ARGUMENTS, false,
+                                      output.arguments);
 }
 
 inline auto ManifestView::image_row(
