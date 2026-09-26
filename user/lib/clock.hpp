@@ -22,6 +22,18 @@ public:
         return duration && now.status == MYOS_STATUS_OK
             ? libk::checked_add(now.value, *duration) : libk::nullopt;
     }
+    // Round up so an absolute tick deadline never precedes the requested time.
+    auto after_ns(uint64_t nanoseconds) const noexcept -> libk::optional<uint64_t> {
+        if (frequency_ == 0) return libk::nullopt;
+        const auto seconds = libk::checked_multiply(nanoseconds / 1'000'000'000, frequency_);
+        const auto fraction = libk::checked_multiply(nanoseconds % 1'000'000'000, frequency_);
+        if (!seconds || !fraction) return libk::nullopt;
+        const auto ticks = libk::checked_add(*seconds,
+            *fraction / 1'000'000'000 + (*fraction % 1'000'000'000 != 0));
+        const auto now = clock_now();
+        return ticks && now.status == MYOS_STATUS_OK
+            ? libk::checked_add(now.value, *ticks) : libk::nullopt;
+    }
 };
 inline auto decimal(const char* text) noexcept -> libk::optional<uint64_t> {
     if (text == nullptr || *text == 0) return libk::nullopt;

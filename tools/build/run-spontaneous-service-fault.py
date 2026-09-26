@@ -25,7 +25,9 @@ def main():
         selector.register(process.stdout, selectors.EVENT_READ)
         try:
             deadline = time.monotonic() + 35
-            while output.count(marker) < 3 or output.count(b'user: contained fault address=0xe100') < 3:
+            while (output.count(marker) < 3
+                   or output.count(b'user: contained fault') < 3
+                   or output.count(b'address=0xe100') < 3):
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError('three service generations did not read the disk')
                 for key, _ in selector.select(0.1):

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <user/lib/clock.hpp>
 #include <user/lib/service_graph.hpp>
 #include <user/lib/supervisor.hpp>
 
@@ -12,6 +13,7 @@ class ServiceSupervisor final {
     using Tasks = Supervisor<Capacity, Authorities>;
     Tasks& supervisor_;
     Program& program_;
+    Clock clock_{};
     myos_cap_t events_;
     libk::optional<typename Tasks::Handle> tasks_[Capacity];
     uint32_t order_[Capacity]{};
@@ -20,7 +22,7 @@ class ServiceSupervisor final {
     bool needs_poll_{};
     uint64_t restart_at_{};
     // Rate-limit repeated crashes without spinning or replaying old requests.
-    static constexpr uint64_t RestartDelay = 100'000'000;
+    static constexpr uint64_t RestartDelayNs = 100'000'000;
 
     auto launch(uint32_t i) noexcept -> myos_status_t {
         const auto& plan = program_.plan();
@@ -44,10 +46,8 @@ class ServiceSupervisor final {
     auto wait_ready(uint32_t i) noexcept -> myos_status_t {
         const auto timeout = program_.plan().task(i)->readiness_timeout_ns;
         if (timeout == 0) return MYOS_STATUS_OK;
-        const auto now = clock_now();
-        if (now.status != MYOS_STATUS_OK) return now.status;
-        const uint64_t deadline = now.value > UINT64_MAX - timeout
-            ? UINT64_MAX : now.value + timeout;
+        const auto deadline = clock_.after_ns(timeout);
+        if (!deadline) return MYOS_STATUS_BAD_ARGS;
         for (;;) {
             const auto observed = supervisor_.observe(*tasks_[i]);
             if (observed.status != MYOS_STATUS_OK) return observed.status;
@@ -64,7 +64,7 @@ class ServiceSupervisor final {
                 return ended == MYOS_STATUS_OK ? MYOS_STATUS_PEER_FAULT : ended;
             }
             if (status != MYOS_STATUS_WOULD_BLOCK) return status;
-            const auto wake = notification_wait(events_, deadline);
+            const auto wake = notification_wait(events_, *deadline);
             if (wake.status == MYOS_STATUS_TIMED_OUT) return wake.status;
             if (wake.status != MYOS_STATUS_OK) return wake.status;
             notify(wake.value);
@@ -82,6 +82,8 @@ public:
         : supervisor_(supervisor), program_(program), events_(events) {}
 
     auto start() noexcept -> StartResult {
+        const auto clock_status = clock_.open();
+        if (clock_status != MYOS_STATUS_OK) return {clock_status, libk::nullopt};
         const auto& plan = program_.plan();
         if (plan.task_count() > Capacity || !ServiceGraph{plan}.order(order_))
             return {MYOS_STATUS_BAD_ARGS, libk::nullopt};
@@ -137,9 +139,9 @@ public:
             if (observed.status != MYOS_STATUS_OK) return observed.status;
             if (observed.value == 0) continue;
             recovering_[i] = true;
-            const auto now = clock_now();
-            if (now.status != MYOS_STATUS_OK) return now.status;
-            restart_at_ = now.value > UINT64_MAX - RestartDelay ? UINT64_MAX : now.value + RestartDelay;
+            const auto restart = clock_.after_ns(RestartDelayNs);
+            if (!restart) return MYOS_STATUS_BAD_ARGS;
+            restart_at_ = *restart;
             const auto policy = plan.task(i)->restart;
             const auto status = static_cast<myos_status_t>(observed.value2);
             if (policy == MYOS_DEPLOY_RESTART_NEVER
@@ -179,10 +181,9 @@ public:
                 // A partial new cohort must close before another attempt;
                 // admission failure does not change the manifest's restart
                 // policy or permanently disable healthy providers.
-                const auto now = clock_now();
-                if (now.status != MYOS_STATUS_OK) return now.status;
-                restart_at_ = now.value > UINT64_MAX - RestartDelay
-                    ? UINT64_MAX : now.value + RestartDelay;
+                const auto restart = clock_.after_ns(RestartDelayNs);
+                if (!restart) return MYOS_STATUS_BAD_ARGS;
+                restart_at_ = *restart;
                 needs_poll_ = true;
                 return MYOS_STATUS_OK;
             }
