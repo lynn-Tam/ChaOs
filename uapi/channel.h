@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uapi/ipc.h>
 #include <uapi/types.h>
@@ -38,3 +39,9 @@ struct myos_channel_message {
     myos_word_t sender_badge;
     myos_word_t sequence;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_channel_message) == 448);
+static_assert(offsetof(myos_channel_message, caps) == 168);
+static_assert(offsetof(myos_channel_message, received_count) == 424);
+#endif

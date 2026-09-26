@@ -16,3 +16,7 @@ struct myos_thread_start {
     myos_word_t arguments[6];
     struct myos_ipc_binding ipc;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_thread_start) == 104);
+#endif

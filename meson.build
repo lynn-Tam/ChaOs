@@ -82,7 +82,7 @@ arch_sources = files(
   'arch/riscv64/sbi/console.cpp', 'arch/riscv64/sbi/system.cpp',
   'arch/riscv64/time/clock.cpp', 'arch/riscv64/time/timer.cpp',
   'arch/riscv64/uart/uart.cpp', 'arch/riscv64/pci/pci.cpp',
-  'arch/riscv64/iommu/iommu.cpp',
+  'arch/riscv64/iommu/iommu.cpp', 'arch/riscv64/io/platform.cpp',
   'arch/riscv64/mmu/sv39_builder.cpp', 'arch/riscv64/mmu/io_page_table.cpp',
   'arch/riscv64/mmu/sv39_editor.cpp', 'arch/riscv64/mmu/range_map.cpp',
   'arch/riscv64/mmu/initial_kernel_map.cpp', 'arch/riscv64/mmu/initial_page_table.cpp',
@@ -91,7 +91,7 @@ arch_sources = files(
 )
 
 core_kernel_sources = files(
-  'kernel/io/platform.cpp', 'kernel/io/device.cpp', 'kernel/io/space.cpp',
+  'kernel/io/device.cpp', 'kernel/io/space.cpp',
   'kernel/boot/boot.cpp', 'kernel/boot/cpu_topology.cpp', 'kernel/boot/timebase.cpp',
   'kernel/boot/firmware/devicetree/fdt.cpp', 'kernel/image/boot_bundle.cpp',
   'kernel/init/root_task.cpp', 'kernel/init/run.cpp', 'kernel/core/kernel_state.cpp',

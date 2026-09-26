@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uapi/types.h>
 
@@ -34,3 +35,8 @@ struct myos_pager_request {
         } writeback;
     } payload;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_pager_request) == 88);
+static_assert(offsetof(myos_pager_request, payload) == 56);
+#endif

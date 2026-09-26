@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uapi/capability.h>
 #include <uapi/types.h>
@@ -45,3 +46,11 @@ struct myos_ipc_caps {
     uint32_t received_count;
     uint32_t reserved;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_ipc_binding) == 32);
+static_assert(sizeof(myos_cap_transfer) == 24);
+static_assert(sizeof(myos_ipc_caps) == 280);
+static_assert(offsetof(myos_ipc_caps, send) == 16);
+static_assert(offsetof(myos_ipc_caps, received_count) == 272);
+#endif

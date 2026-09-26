@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uapi/capability.h>
 #include <uapi/ipc.h>
@@ -116,3 +117,13 @@ struct myos_vproc_event_page {
     myos_word_t fault_pc;
     struct myos_user_context delivered;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_user_context) == 256);
+static_assert(sizeof(myos_vproc_start) == 152);
+static_assert(sizeof(myos_vproc_arm) == 88);
+static_assert(sizeof(myos_vproc_control_page) == 296);
+static_assert(sizeof(myos_vproc_event_page) == 1040);
+static_assert(offsetof(myos_vproc_event_page, fault_key) == 752);
+static_assert(offsetof(myos_vproc_event_page, delivered) == 784);
+#endif

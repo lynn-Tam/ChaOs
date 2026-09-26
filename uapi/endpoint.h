@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uapi/capability.h>
 #include <uapi/ipc.h>
@@ -38,3 +39,8 @@ struct myos_endpoint_desc {
     myos_word_t budget_floor_ns;
     myos_word_t urgency_ceiling;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_endpoint_desc) == 168);
+static_assert(offsetof(myos_endpoint_desc, ipc) == 88);
+#endif

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <uapi/types.h>
 
 enum myos_io_space_state {
@@ -33,3 +34,10 @@ struct myos_io_info {
     uint32_t configuration[64];
     uint64_t bar_sizes[6];
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_device_info) == 312);
+static_assert(sizeof(myos_io_info) == 312);
+static_assert(offsetof(myos_device_info, configuration) == 8);
+static_assert(offsetof(myos_device_info, bar_sizes) == 264);
+#endif
