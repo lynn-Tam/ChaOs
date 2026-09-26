@@ -18,12 +18,18 @@ constexpr usize max_sources = 64;
 kernel::sync::SpinLock<kernel::sync::LockClass::IrqRegistry>
     registry_lock{};
 Irq* registry[max_sources]{};
+struct KernelSource final {
+    void* context{};
+    bool (*handle)(void*) noexcept{};
+};
+KernelSource kernel_sources[max_sources]{};
 arch::riscv64::Plic plic{
     kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base, 0};
 libk::Atomic<bool> platform_ready{};
 
 [[nodiscard]] auto platform_source(u32 source) noexcept -> bool {
     return source == arch::riscv64::virt_uart_irq
+        || source == arch::virt_iommu_fault_irq
         || (source >= arch::virt_pci_irq_first
             && source < arch::virt_pci_irq_first + arch::virt_pci_irq_count);
 }
@@ -42,7 +48,8 @@ libk::Atomic<bool> platform_ready{};
         return false;
     }
     Irq*& entry = registry[irq.source().id()];
-    if (entry != nullptr && entry != &irq) {
+    if (kernel_sources[irq.source().id()].handle != nullptr
+        || (entry != nullptr && entry != &irq)) {
         return false;
     }
     entry = &irq;
@@ -59,6 +66,17 @@ void unregister_source_locked(Irq& irq) noexcept {
 }
 
 } // namespace
+
+auto register_kernel_source(u32 source, void* context,
+    bool (*handle)(void*) noexcept) noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{registry_lock};
+    if (!platform_source(source) || source >= max_sources || context == nullptr
+        || handle == nullptr || registry[source] != nullptr
+        || kernel_sources[source].handle != nullptr
+        || platform_ready.load<libk::MemoryOrder::Acquire>()) return false;
+    kernel_sources[source] = {context, handle};
+    return true;
+}
 
 void initialize_platform() noexcept {
     // This is deliberately after install_local_entry(): before that point a
@@ -77,7 +95,9 @@ void initialize_platform() noexcept {
             if (!platform_source(source)) continue;
             plic.configure(source);
             Irq* const target = registry[source];
-            if (target != nullptr) {
+            if (kernel_sources[source].handle != nullptr) {
+                plic.unmask(source);
+            } else if (target != nullptr) {
                 kernel::sync::IrqLockGuard irq_guard{target->lock_};
                 if (target->state_ == State::BoundIdle) {
                     plic.unmask(source);
@@ -357,6 +377,8 @@ auto Irq::ack(u64 generation, u64 sequence) noexcept
 }
 
 void Irq::dispatch() noexcept {
+    KernelSource kernel{};
+    u32 kernel_source{};
     {
         kernel::sync::IrqLockGuard registry_guard{registry_lock};
         const u32 source = plic.claim();
@@ -369,25 +391,34 @@ void Irq::dispatch() noexcept {
             plic.mask(source);
             return;
         }
-        Irq* const target = registry[source];
-        if (target != nullptr) {
-            /* The registry lock is the lifetime boundary for this raw
-             * pointer.  Sequence exhaustion only unpublishes the source and
-             * enters Closing here; relation detach and cleanup wait for a
-             * later close/retire call that owns a live object reference. */
-            const auto observed = target->observe_locked();
-            if (!observed) {
-                kernel::sync::IrqLockGuard irq_guard{target->lock_};
-                if (target->state_ == State::Closing) {
-                    unregister_source_locked(*target);
-                    if (platform_enabled(target->source_.id())) {
-                        plic.mask(target->source_.id());
+        kernel = kernel_sources[source];
+        if (kernel.handle != nullptr) {
+            kernel_source = source;
+        } else {
+            Irq* const target = registry[source];
+            if (target != nullptr) {
+                /* The registry lock is the lifetime boundary for this raw
+                 * pointer. Sequence exhaustion only unpublishes the source
+                 * here; cleanup waits for close/retire with an object ref. */
+                const auto observed = target->observe_locked();
+                if (!observed) {
+                    kernel::sync::IrqLockGuard irq_guard{target->lock_};
+                    if (target->state_ == State::Closing) {
+                        unregister_source_locked(*target);
+                        if (platform_enabled(target->source_.id()))
+                            plic.mask(target->source_.id());
                     }
                 }
+            } else {
+                plic.mask(source);
             }
-        } else {
-            plic.mask(source);
         }
+    }
+    // The platform handler may take controller and Device locks. The IRQ
+    // registry lock protects only source publication and PLIC transitions.
+    if (kernel.handle != nullptr && !kernel.handle(kernel.context)) {
+        kernel::sync::IrqLockGuard guard{registry_lock};
+        plic.mask(kernel_source);
     }
 }
 

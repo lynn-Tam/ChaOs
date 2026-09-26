@@ -30,6 +30,7 @@ namespace {
 using kernel::init::RootTaskError;
 
 constexpr usize root_stack_pages = 8;
+constexpr kernel::mm::VirtAddr root_ipc_address{MYOS_BOOTSTRAP_ROOT_IPC_ADDRESS};
 constexpr usize root_stack_size = root_stack_pages * kernel::mm::page_size;
 constexpr kernel::mm::VirtAddr root_info_address{
     kernel::mm::layout::UserEnd - 2 * kernel::mm::page_size};
@@ -246,6 +247,9 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     info_page.stack_base = root_stack_address.raw();
     info_page.stack_size = root_stack_size;
     info_page.boot_bundle_size = module_.size;
+    info_page.cap_count = 0;
+    info_page.import_count = 0;
+    info_page.reserved = 0;
     auto add_cap = [&](u32 kind, auto&& reference, kernel::cap::Rights rights,
                        kernel::cap::AuthorityData authority = {}) -> bool {
         if (!reference || info_page.cap_count == MYOS_BOOTSTRAP_MAX_CAPS) {
@@ -385,14 +389,31 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     }
     uart_irq_ = libk::move(uart_irq).value().publish();
 
-    if (kernel.io_platform().present()
-        && !add_cap(MYOS_BOOTSTRAP_CAP_DEVICE,
-            kernel.io_platform().reference(),
+    for (usize i = 0; i < kernel.io_platform().count(); ++i) {
+        if (info_page.import_count == MYOS_BOOTSTRAP_MAX_IMPORTS)
+            return libk::unexpected(RootTaskError::CapabilityFailed);
+        auto reference = kernel.io_platform().reference(i);
+        if (!reference) return libk::unexpected(RootTaskError::InvalidState);
+        auto charge = reserve(kernel.grants().node_charge());
+        if (!charge) return libk::unexpected(RootTaskError::OutOfMemory);
+        auto installed = install_cap(kernel, cspace_.get(),
+            libk::move(charge).value(), libk::move(reference).value(),
             kernel::cap::Rights::of(
                 kernel::cap::Right::Duplicate, kernel::cap::Right::Delegate,
                 kernel::cap::Right::Inspect, kernel::cap::Right::Connect,
-                kernel::cap::Right::Revoke))) {
-        return libk::unexpected(RootTaskError::OutOfMemory);
+                kernel::cap::Right::Revoke));
+        if (!installed) return libk::unexpected(RootTaskError::CapabilityFailed);
+        auto& entry = info_page.imports[info_page.import_count++];
+        entry = {};
+        const u16 requester = kernel.io_platform().device(i).requester();
+        constexpr char hex[] = "0123456789abcdef";
+        entry.name[0] = 'p'; entry.name[1] = 'c'; entry.name[2] = 'i'; entry.name[3] = '.';
+        for (usize digit = 0; digit < 4; ++digit)
+            entry.name[4 + digit] = hex[(requester >> (12 - digit * 4)) & 15];
+        entry.protocol = MYOS_BOOTSTRAP_DEVICE_PROTOCOL;
+        entry.major = 1;
+        entry.object_kind = MYOS_OBJECT_KIND_DEVICE;
+        entry.handle = installed.value().raw();
     }
 
     const kernel::mm::MemoryTypes device = kernel::mm::MemoryTypes::of(
@@ -485,6 +506,109 @@ auto RootTask::prepare_bootstrap(kernel::KernelState& kernel) noexcept
     return libk::expected();
 }
 
+auto RootTask::load_segments(kernel::KernelState& kernel,
+    const kernel::image::BootBundle& package, kernel::CpuId cpu) noexcept
+    -> libk::Expected<void, RootTaskError> {
+    const kernel::mm::VirtRange stack_range{root_stack_address, root_stack_size};
+    const kernel::mm::VirtRange info_range{
+        root_info_address, kernel::mm::page_size};
+    for (usize index = 0; index < package.segment_count(); ++index) {
+        auto decoded = package.segment(index);
+        if (!decoded) {
+            return libk::unexpected(RootTaskError::InvalidBundle);
+        }
+        const kernel::image::BundleSegment segment = decoded.value();
+        const auto size = page_round(segment.memory_size);
+        if (!size) {
+            return libk::unexpected(RootTaskError::InvalidBundle);
+        }
+        const kernel::mm::VirtRange range{
+            kernel::mm::VirtAddr{segment.virtual_address}, *size};
+        if (range.intersects(stack_range) || range.intersects(info_range)
+            || range.intersects(kernel::mm::VirtRange{root_ipc_address, kernel::mm::page_size})) {
+            return libk::unexpected(RootTaskError::InvalidBundle);
+        }
+        auto memory_charge = reserve(charge_pages(1 + *size / kernel::mm::page_size));
+        if (!memory_charge) {
+            return libk::unexpected(RootTaskError::OutOfMemory);
+        }
+        auto memory = kernel.objects().create_anonymous_sponsored(
+            libk::move(memory_charge).value(),
+            *size,
+            kernel::mm::AnonymousConfig{
+                .access = segment.access,
+                .eager = true,
+            });
+        if (!memory) {
+            return libk::unexpected(RootTaskError::OutOfMemory);
+        }
+        auto hold = libk::move(memory).value().publish();
+        if (!write_memory(kernel.pmm(), hold.get(), segment.file)) {
+            KASSERT(hold.retire());
+            hold.reset();
+            return libk::unexpected(RootTaskError::OutOfMemory);
+        }
+        if (segment.access.contains(kernel::mm::Access::Execute)
+            && !hold->seal()) {
+            KASSERT(hold.retire());
+            hold.reset();
+            return libk::unexpected(RootTaskError::InvalidState);
+        }
+        if (!map_memory(
+                vspace_.get(), cpu, hold,
+                kernel::mm::VirtAddr{segment.virtual_address},
+                segment.access)) {
+            KASSERT(hold.retire());
+            hold.reset();
+            return libk::unexpected(RootTaskError::MappingFailed);
+        }
+        KASSERT(segments_.try_push_back(libk::move(hold)));
+    }
+    return libk::expected();
+}
+
+auto RootTask::create_thread(kernel::KernelState& kernel, usize entry) noexcept
+    -> libk::Expected<void, RootTaskError> {
+    auto thread_charge = reserve(
+        kernel::resource::Traits<kernel::Thread>::fixed());
+    auto kernel_stack_charge = reserve(kernel::resource::Budget{
+        .memory = kernel::mm::KernelStackLayout::StackBytes});
+    if (!thread_charge || !kernel_stack_charge)
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    auto stack_capacity = libk::move(kernel_stack_charge).value();
+    auto home = kernel::KernelStack::create(kernel.kernel_vspace());
+    auto execution_vspace = vspace_.ref();
+    auto execution_cspace = cspace_.ref();
+    if (!home || !execution_vspace || !execution_cspace)
+        return libk::unexpected(RootTaskError::OutOfMemory);
+    auto ipc_reference = ipc_.ref();
+    if (!ipc_reference) return libk::unexpected(RootTaskError::InvalidState);
+    auto ipc_buffer = kernel::ipc::Buffer::bind(kernel.pmm(), vspace_.get(),
+        libk::move(ipc_reference).value(), ipc_.get(), kernel::mm::ObjectRange{0, 1},
+        kernel::mm::VirtRange{root_ipc_address, kernel::mm::page_size});
+    if (!ipc_buffer) return libk::unexpected(RootTaskError::MappingFailed);
+    auto execution = kernel::ExecutionBinding::user(
+        libk::move(execution_vspace).value(),
+        libk::move(execution_cspace).value(), kernel::FaultRoute::Terminate,
+        libk::move(ipc_buffer).value());
+    if (!execution) return libk::unexpected(RootTaskError::InvalidState);
+    auto pending_thread = kernel.objects().create_thread_sponsored(
+        libk::move(thread_charge).value(),
+        libk::move(stack_capacity).commit(),
+        libk::move(home).value(),
+        libk::move(execution).value(),
+        kernel::Thread::UserStart{
+            .entry = kernel::mm::VirtAddr{entry},
+            .stack = kernel::mm::VirtAddr{
+                root_stack_address.raw() + root_stack_size},
+            .arguments = {
+                root_info_address.raw(), sizeof(myos_bootstrap_info)},
+        });
+    if (!pending_thread) return libk::unexpected(RootTaskError::OutOfMemory);
+    thread_ = libk::move(pending_thread).value().publish();
+    return libk::expected();
+}
+
 auto RootTask::start(
     kernel::KernelState& kernel,
     kernel::CpuRuntime& runtime) noexcept
@@ -500,9 +624,6 @@ auto RootTask::start(
     }
     const kernel::image::BootBundle package = parsed.value();
     const kernel::CpuId cpu = runtime.local.descriptor->logical_id();
-    const kernel::mm::VirtRange stack_range{root_stack_address, root_stack_size};
-    const kernel::mm::VirtRange info_range{
-        root_info_address, kernel::mm::page_size};
 
     auto fail = [&](RootTaskError error)
         -> libk::Expected<void, RootTaskError> {
@@ -524,62 +645,13 @@ auto RootTask::start(
     }
     vspace_ = libk::move(space).value().publish();
     cspace_ = libk::move(cspace).value().publish();
-
-    for (usize index = 0; index < package.segment_count(); ++index) {
-        auto decoded = package.segment(index);
-        if (!decoded) {
-            return fail(RootTaskError::InvalidBundle);
-        }
-        const kernel::image::BundleSegment segment = decoded.value();
-        const auto size = page_round(segment.memory_size);
-        if (!size) {
-            return fail(RootTaskError::InvalidBundle);
-        }
-        const kernel::mm::VirtRange range{
-            kernel::mm::VirtAddr{segment.virtual_address}, *size};
-        if (range.intersects(stack_range) || range.intersects(info_range)) {
-            return fail(RootTaskError::InvalidBundle);
-        }
-        auto memory_charge = reserve(charge_pages(1 + *size / kernel::mm::page_size));
-        if (!memory_charge) {
-            return fail(RootTaskError::OutOfMemory);
-        }
-        auto memory = kernel.objects().create_anonymous_sponsored(
-            libk::move(memory_charge).value(),
-            *size,
-            kernel::mm::AnonymousConfig{
-                .access = segment.access,
-                .eager = true,
-            });
-        if (!memory) {
-            return fail(RootTaskError::OutOfMemory);
-        }
-        auto hold = libk::move(memory).value().publish();
-        if (!write_memory(kernel.pmm(), hold.get(), segment.file)) {
-            KASSERT(hold.retire());
-            hold.reset();
-            return fail(RootTaskError::OutOfMemory);
-        }
-        if (segment.access.contains(kernel::mm::Access::Execute)
-            && !hold->seal()) {
-            KASSERT(hold.retire());
-            hold.reset();
-            return fail(RootTaskError::InvalidState);
-        }
-        if (!map_memory(
-                vspace_.get(), cpu, hold,
-                kernel::mm::VirtAddr{segment.virtual_address},
-                segment.access)) {
-            KASSERT(hold.retire());
-            hold.reset();
-            return fail(RootTaskError::MappingFailed);
-        }
-        KASSERT(segments_.try_push_back(libk::move(hold)));
-    }
+    if (auto loaded = load_segments(kernel, package, cpu); !loaded)
+        return fail(loaded.error());
 
     auto stack_charge = reserve(charge_pages(1 + root_stack_pages));
     auto info_charge = reserve(charge_pages(2));
-    if (!stack_charge || !info_charge) {
+    auto ipc_charge = reserve(charge_pages(2));
+    if (!stack_charge || !info_charge || !ipc_charge) {
         return fail(RootTaskError::OutOfMemory);
     }
     auto stack = kernel.objects().create_anonymous_sponsored(
@@ -598,57 +670,33 @@ auto RootTask::start(
                 kernel::mm::Access::Read, kernel::mm::Access::Write),
             .eager = true,
         });
-    if (!stack || !info) {
+    auto ipc_memory = kernel.objects().create_anonymous_sponsored(
+        libk::move(ipc_charge).value(), kernel::mm::page_size,
+        kernel::mm::AnonymousConfig{
+            .access = kernel::mm::AccessMask::of(
+                kernel::mm::Access::Read, kernel::mm::Access::Write),
+            .eager = true,
+        });
+    if (!stack || !info || !ipc_memory) {
         return fail(RootTaskError::OutOfMemory);
     }
     stack_ = libk::move(stack).value().publish();
     info_ = libk::move(info).value().publish();
+    ipc_ = libk::move(ipc_memory).value().publish();
     if (!map_memory(
             vspace_.get(), cpu, stack_, root_stack_address,
             kernel::mm::AccessMask::of(
                 kernel::mm::Access::Read, kernel::mm::Access::Write))
         || !map_memory(
             vspace_.get(), cpu, info_, root_info_address,
-            kernel::mm::AccessMask::of(kernel::mm::Access::Read))) {
+            kernel::mm::AccessMask::of(kernel::mm::Access::Read))
+        || !map_memory(vspace_.get(), cpu, ipc_, root_ipc_address,
+            kernel::mm::AccessMask::of(kernel::mm::Access::Read, kernel::mm::Access::Write))) {
         return fail(RootTaskError::MappingFailed);
     }
 
-    auto thread_charge = reserve(
-        kernel::resource::Traits<kernel::Thread>::fixed());
-    auto kernel_stack_charge = reserve(kernel::resource::Budget{
-        .memory = kernel::mm::KernelStackLayout::StackBytes});
-    if (!thread_charge || !kernel_stack_charge) {
-        return fail(RootTaskError::OutOfMemory);
-    }
-    auto stack_capacity = libk::move(kernel_stack_charge).value();
-    auto home = kernel::KernelStack::create(kernel.kernel_vspace());
-    auto execution_vspace = vspace_.ref();
-    auto execution_cspace = cspace_.ref();
-    if (!home || !execution_vspace || !execution_cspace) {
-        return fail(RootTaskError::OutOfMemory);
-    }
-    auto execution = kernel::ExecutionBinding::user(
-        libk::move(execution_vspace).value(),
-        libk::move(execution_cspace).value());
-    if (!execution) {
-        return fail(RootTaskError::InvalidState);
-    }
-    auto pending_thread = kernel.objects().create_thread_sponsored(
-        libk::move(thread_charge).value(),
-        libk::move(stack_capacity).commit(),
-        libk::move(home).value(),
-        libk::move(execution).value(),
-        kernel::Thread::UserStart{
-            .entry = kernel::mm::VirtAddr{package.entry()},
-            .stack = kernel::mm::VirtAddr{
-                root_stack_address.raw() + root_stack_size},
-            .arguments = {
-                root_info_address.raw(), sizeof(myos_bootstrap_info)},
-        });
-    if (!pending_thread) {
-        return fail(RootTaskError::OutOfMemory);
-    }
-    thread_ = libk::move(pending_thread).value().publish();
+    if (auto created = create_thread(kernel, package.entry()); !created)
+        return fail(created.error());
 
     const auto prepared = prepare_bootstrap(kernel);
     if (!prepared) {
@@ -701,6 +749,10 @@ void RootTask::rollback(kernel::KernelState& kernel) noexcept {
     if (info_) {
         KASSERT(info_.retire());
         info_.reset();
+    }
+    if (ipc_) {
+        KASSERT(ipc_.retire());
+        ipc_.reset();
     }
     if (stack_) {
         KASSERT(stack_.retire());

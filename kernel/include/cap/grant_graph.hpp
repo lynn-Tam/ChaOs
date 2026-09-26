@@ -245,6 +245,7 @@ private:
     void commit_allocation(kernel::resource::Allocation& allocation) noexcept;
     void abort_allocation(kernel::resource::Allocation& allocation) noexcept;
     void revoke_allocation(kernel::resource::Allocation& allocation) noexcept;
+    void retry_allocations() noexcept;
     void stop_allocation(kernel::resource::Allocation& allocation) noexcept;
     void retire_allocation(kernel::resource::Allocation& allocation) noexcept;
     void release_page(PageHeader& page) noexcept;
@@ -264,6 +265,7 @@ private:
     WorkQueue work_{};
     WorkNotifier work_notifier_{};
     PageHeader* pages_{};
+    kernel::resource::Allocation* revoke_retry_{};
     usize page_count_{};
     usize live_nodes_{};
     usize quarantined_slots_{};

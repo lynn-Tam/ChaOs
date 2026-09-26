@@ -1,6 +1,8 @@
 #pragma once
 
 #include <user/lib/imports.hpp>
+#include <test/user/channel/export_protocol.hpp>
+#include <uapi/channel.h>
 #include <test/user/io/file_fault.hpp>
 
 #include <array>
@@ -77,6 +79,7 @@ class Task final {
     uint64_t caps_{};
     bool supervisor_{};
     uint64_t kinds_{MYOS_RESOURCE_E2_KINDS};
+    uint16_t restart_{MYOS_DEPLOY_RESTART_NEVER};
 
     auto key(std::string_view suffix) -> uint64_t {
         return manifest_.name(name_ + "." + std::string{suffix});
@@ -203,6 +206,15 @@ public:
         import(binding, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY, rights);
     }
     void kinds(uint64_t value) { kinds_ = value; }
+    void restart(uint16_t policy) { restart_ = policy; }
+    void requires_service(uint32_t target, std::string_view relation,
+                          uint16_t flags = MYOS_DEPLOY_DEPENDENCY_STARTUP) {
+        auto r = manifest_.row(MYOS_DEPLOY_TABLE_DEPENDENCY);
+        r.u32(MYOS_DEPLOY_DEPENDENCY_TARGET, target);
+        r.u16(MYOS_DEPLOY_DEPENDENCY_KIND, MYOS_DEPLOY_DEPENDENCY_REQUIRED);
+        r.u16(MYOS_DEPLOY_DEPENDENCY_FLAGS, flags);
+        r.u64(MYOS_DEPLOY_DEPENDENCY_RELATION, manifest_.name(relation));
+    }
     void cspace(uint32_t slots, uint32_t pages) {
         cspace_slots_ = slots;
         cspace_pages_ = pages;
@@ -212,6 +224,37 @@ public:
                  uint64_t badge, uint64_t rights) {
         import(binding, manifest_.name(source), MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY,
                rights, MYOS_DEPLOY_IMPORT_CHANNEL_MINT, side, badge);
+    }
+    void channel_service(BootstrapBinding binding, std::string_view label,
+                         uint64_t server_side, uint64_t server_rights,
+                         uint64_t client_rights, uint64_t depth = 16,
+                         uint64_t transfers = 0, uint64_t relations = 2) {
+        kinds_ |= MYOS_RESOURCE_CHANNEL;
+        auto object = manifest_.row(MYOS_DEPLOY_TABLE_OBJECT);
+        const auto first = key(std::string{label} + ".side0");
+        const auto second = key(std::string{label} + ".side1");
+        object.u64(MYOS_DEPLOY_OBJECT_OUTPUT, first);
+        object.u64(MYOS_DEPLOY_OBJECT_OUTPUT_B, second);
+        object.u16(MYOS_DEPLOY_OBJECT_KIND, MYOS_OBJECT_KIND_CHANNEL);
+        for (auto offset : {MYOS_DEPLOY_OBJECT_REF0, MYOS_DEPLOY_OBJECT_REF1,
+                            MYOS_DEPLOY_OBJECT_REF2, MYOS_DEPLOY_OBJECT_REF3})
+            object.u32(offset, MYOS_DEPLOY_NO_INDEX);
+        object.u64(MYOS_DEPLOY_OBJECT_ARG0, depth);
+        object.u64(MYOS_DEPLOY_OBJECT_ARG1, MYOS_CHANNEL_MAX_WORDS);
+        object.u64(MYOS_DEPLOY_OBJECT_ARG2, transfers);
+        object.u64(MYOS_DEPLOY_OBJECT_ARG3, relations);
+        import(binding, server_side == 0 ? first : second, MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY,
+               server_rights, MYOS_DEPLOY_IMPORT_CHANNEL_MINT, server_side, 1);
+        auto exported = manifest_.row(MYOS_DEPLOY_TABLE_EXPORT);
+        exported.u64(MYOS_DEPLOY_EXPORT_SOURCE, server_side == 0 ? second : first);
+        exported.u64(MYOS_DEPLOY_EXPORT_KEY, manifest_.name(label));
+        exported.u16(MYOS_DEPLOY_EXPORT_CLASS, MYOS_DEPLOY_EXPORT_PREPARED_KEY);
+        constexpr auto a = MYOS_DEPLOY_EXPORT_CEILING;
+        exported.u16(a + MYOS_DEPLOY_ATTENUATION_VERSION, MYOS_CAP_ATTENUATION_VERSION_CURRENT);
+        exported.u16(a + MYOS_DEPLOY_ATTENUATION_KIND, MYOS_OBJECT_KIND_CHANNEL);
+        exported.u32(a + MYOS_DEPLOY_ATTENUATION_SIZE, MYOS_CAP_ATTENUATION_SIZE);
+        exported.u64(a + MYOS_DEPLOY_ATTENUATION_RIGHTS, client_rights | MYOS_RIGHT_DUPLICATE);
+        exported.u64(a + MYOS_DEPLOY_ATTENUATION_WORD0, 1 - server_side);
     }
     void finish() {
         auto r = manifest_.row(MYOS_DEPLOY_TABLE_TASK);
@@ -238,6 +281,7 @@ public:
         r.u32(MYOS_DEPLOY_TASK_BOOTSTRAP_MAPPING, bootstrap_);
         r.u16(MYOS_DEPLOY_TASK_READINESS, MYOS_DEPLOY_READINESS_START);
         r.u16(MYOS_DEPLOY_TASK_TERMINAL, MYOS_DEPLOY_TERMINAL_CLOSE);
+        r.u16(MYOS_DEPLOY_TASK_RESTART, restart_);
     }
 };
 
@@ -255,7 +299,7 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
     constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
     {
         Task task{manifest, "block", server, 4 * 1024 * 1024};
-        task.cspace(32, 6);
+        task.cspace(128, 20);
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
         task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
         task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
@@ -263,7 +307,8 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
     }
     {
         Task task{manifest, "io-client", client, 2 * 1024 * 1024};
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, rights);
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
         task.finish();
     }
     return manifest.finish();
@@ -274,7 +319,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
     {
         Task task{manifest, "block", paths[0], 4 * 1024 * 1024};
-        task.cspace(32, 6);
+        task.cspace(128, 20);
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
         task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
         task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
@@ -283,8 +328,8 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     {
         Task task{manifest, "files", paths[1], 16 * 1024 * 1024};
         task.cspace(1024, 132);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER);
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, rights);
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER | MYOS_RESOURCE_CHANNEL);
+        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
         task.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, MYOS_RIGHT_RECEIVE);
         task.finish();
     }
@@ -302,8 +347,8 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     return manifest.finish();
 }
 
-// Four ordinary instances share the 10% left on a single hart after the root,
-// service and kernel reservations. Admission still enforces the real domain.
+// Application reservations participate in the same per-hart admission domain
+// as native services; this budget leaves room for four concurrent jobs.
 inline constexpr uint64_t ApplicationBudget = 250'000;
 inline auto pack_application(const char* name, const char* image, uint64_t budget = ApplicationBudget,
                              bool denied = false) -> std::vector<uint8_t> {
@@ -312,17 +357,23 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
     task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
-    if (std::string_view{name} == "cat") {
+    if (std::string_view{name} == "cat" || std::string_view{name} == "put"
+        || std::string_view{name} == "get") {
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
-        task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
+        if (std::string_view{name} == "cat")
+            task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
+        else if (std::string_view{name} == "put")
+            task.authority(myos::bootstrap::imports::Store, "store.directory", MYOS_RIGHT_SEND);
+        else task.authority(myos::bootstrap::imports::StoreRead, "store.read.directory", MYOS_RIGHT_SEND);
     }
     if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }
 
-inline auto pack_channel_test(const char* coordinator, const char* worker) -> std::vector<uint8_t> {
+inline auto pack_channel_test(const char* coordinator, const char* worker,
+    const char* provider, const char* holder) -> std::vector<uint8_t> {
     Manifest manifest;
     {
         Task task{manifest, "channel-test", coordinator, 8 * 1024 * 1024, true};
@@ -336,57 +387,125 @@ inline auto pack_channel_test(const char* coordinator, const char* worker) -> st
         task.channel(myos::bootstrap::imports::Stderr, "ready", 0, 1, MYOS_RIGHT_SEND);
         task.finish();
     }
+    {
+        Task task{manifest, "provider", provider, 1024 * 1024};
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
+            MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE);
+        task.channel_service(channel_test::Provider, "provider.client", 1,
+            MYOS_RIGHT_RECEIVE, MYOS_RIGHT_SEND, 2);
+        task.finish();
+    }
+    {
+        Task task{manifest, "export-holder", holder, 1024 * 1024};
+        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.requires_service(2, "provider");
+        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
+            MYOS_RIGHT_SEND);
+        task.channel(channel_test::Provider, "provider.client", 0, 1,
+            MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE);
+        task.finish();
+    }
     return manifest.finish();
 }
 
-inline auto pack_console(char** paths)
+inline auto pack_console(char** paths, bool fail_shell = false, bool storage = false)
     -> std::vector<uint8_t> {
     Manifest manifest;
+    // Row identities belong to this manifest, not to init or the kernel.
+    constexpr uint32_t uart = 0, process = 1, shell = 2, block = 3, files = 4;
+    constexpr uint32_t data_block = 5;
     constexpr auto send = MYOS_RIGHT_SEND;
     constexpr auto receive = MYOS_RIGHT_RECEIVE;
+    constexpr uint64_t service_budget = 500'000; // 5% per 10 ms period
     {
-        Task t{manifest, "uart", paths[0], 1024 * 1024};
+        Task t{manifest, "uart", paths[0], 1024 * 1024, false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
         t.authority(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY, "uart.memory", MYOS_RIGHT_MAP);
         t.authority(MYOS_BOOTSTRAP_CAP_IRQ, "uart.irq", MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK);
-        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.receiver", 1, 1, receive);
-        t.channel(myos::bootstrap::imports::ConsoleInput, "input.sender", 0, 1, send);
+        t.channel_service(myos::bootstrap::imports::ConsoleOutput, "console.sender", 1, receive, send);
+        t.channel_service(myos::bootstrap::imports::ConsoleInput, "input.receiver", 0, send, receive);
         t.finish();
     }
     {
-        Task t{manifest, "process_server", paths[1], 32 * 1024 * 1024, true};
+        Task t{manifest, "process_server", paths[1], 32 * 1024 * 1024, true, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        // The sole Process session owns its jobs. Losing shell closes this
+        // session's supervisor and jobs; Files, Block and UART are independent.
+        t.requires_service(shell, "session-owner", MYOS_DEPLOY_DEPENDENCY_LIFETIME);
+        t.requires_service(uart, "console");
+        t.requires_service(files, "files");
+        if (storage) t.requires_service(6, "store");
         // Four live task authorities, package mappings and stream endpoints.
         t.cspace(512, 68);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL | MYOS_RESOURCE_PAGER);
         t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
         t.channel(myos::bootstrap::imports::FilesRead, "files.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
-        t.channel(myos::bootstrap::imports::Process, "process.server", 1, 1, send | receive);
+        if (storage) t.channel(myos::bootstrap::imports::Store,
+            "store.client", 0, 2, send | MYOS_RIGHT_DUPLICATE);
+        if (storage) t.channel(myos::bootstrap::imports::StoreRead,
+            "store.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
+        t.channel_service(myos::bootstrap::imports::Process, "process.client", 1, send | receive, send | receive, 16, 0, 3);
         t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 1, send | MYOS_RIGHT_DUPLICATE);
         t.finish();
     }
     {
-        Task t{manifest, "shell", paths[2], 2 * 1024 * 1024};
+        Task t{manifest, "shell", paths[2], fail_shell ? uint64_t{128} * 1024 : uint64_t{2} * 1024 * 1024,
+            false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.requires_service(uart, "console");
+        t.requires_service(process, "process");
+        t.requires_service(files, "files");
+        if (storage) t.requires_service(6, "store");
         t.cspace(128, 20);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         t.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, send);
+        if (storage) t.channel(myos::bootstrap::imports::Store,
+            "store.client", 0, 3, send);
         t.channel(myos::bootstrap::imports::Process, "process.client", 0, 1, send | receive);
         t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 2, send);
         t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1, receive);
+        t.channel(myos::bootstrap::imports::ServiceControl, "service.control", 1, 1, send | receive);
         t.finish();
     }
     {
-        Task t{manifest, "block", paths[3], 4 * 1024 * 1024};
-        t.cspace(32, 6);
+        Task t{manifest, "block", paths[3], 4 * 1024 * 1024, false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.cspace(128, 20);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        t.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, send | receive);
+        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "pci.0008", MYOS_RIGHT_CONNECT);
+        t.channel_service(myos::bootstrap::imports::Block, "block.client", 1, receive, send, 4, 4);
         t.finish();
     }
     {
-        Task t{manifest, "files", paths[4], 16 * 1024 * 1024};
+        Task t{manifest, "files", paths[4], 16 * 1024 * 1024, false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.requires_service(block, "block");
         t.cspace(1024, 132);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER);
-        t.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, send | receive);
-        t.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, receive);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER | MYOS_RESOURCE_CHANNEL);
+        t.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, send);
+        t.channel_service(myos::bootstrap::imports::Files, "files.client", 1, receive, send, 8, 4);
+        t.finish();
+    }
+    if (storage) {
+        Task t{manifest, "block_data", paths[5], 4 * 1024 * 1024, false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.cspace(128, 20);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
+        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "pci.0010", MYOS_RIGHT_CONNECT);
+        t.channel_service(myos::bootstrap::imports::Block, "block_data.client", 1,
+            receive, send, 4, 4);
+        t.finish();
+    }
+    if (storage) {
+        Task t{manifest, "store", paths[6], 8 * 1024 * 1024, false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.requires_service(data_block, "data block");
+        t.cspace(256, 36);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        t.channel(myos::bootstrap::imports::Block, "block_data.client", 0, 1, send);
+        t.channel_service(myos::bootstrap::imports::Store, "store.client", 1,
+            receive, send, 4, 4);
         t.finish();
     }
     return manifest.finish();

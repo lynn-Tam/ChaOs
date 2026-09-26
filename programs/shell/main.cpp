@@ -3,6 +3,7 @@
 #include <user/lib/clock.hpp>
 #include <libk/fmt.hpp>
 #include <user/lib/file_client.hpp>
+#include <user/lib/store_client.hpp>
 
 namespace {
 using namespace myos;
@@ -17,8 +18,15 @@ void forget(uint64_t id) {
     if (latest == id) { latest = 0; for (auto child : children) if (child) latest = child; }
 }
 files::Client filesystem;
+store::Client store_client;
+bool storage_available{};
 
-void command(char* line, service::Connection& process, stream::Writer& console) {
+void storage_error(stream::Writer& console, myos_status_t status) {
+    (void)libk::fmt::format_to<"storage error: {}\n">(console, status);
+}
+
+void command(char* line, service::Connection& process, stream::Writer& console,
+    myos_cap_t control, myos_cap_t pool, myos_cap_t cspace) {
     while (*line == ' ') ++line;
     char* argument = line;
     while (*argument != '\0' && *argument != ' ') ++argument;
@@ -26,7 +34,152 @@ void command(char* line, service::Connection& process, stream::Writer& console) 
     while (*argument == ' ') ++argument;
     if (*line == '\0') return;
     if (service::equal(line, "help")) {
-        console.write("help | ls | cat FILE | run hello | spawn hello | jobs | wait [ID] [MS] | stop [ID]\n");
+        console.write("help | ls | cat FILE | run hello | spawn hello | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
+        if (storage_available)
+            console.write("wdevice | mkfs | wls [DIR] | wcat FILE | wstat FILE | write FILE TEXT | append FILE TEXT | save BOOTFILE FILE | mkdir DIR | rm FILE | mv OLD NEW\n");
+        return;
+    }
+    if (service::equal(line, "wdevice") || service::equal(line, "mkfs") || service::equal(line, "wls")
+        || service::equal(line, "wcat") || service::equal(line, "wstat")
+        || service::equal(line, "write") || service::equal(line, "append")
+        || service::equal(line, "save") || service::equal(line, "mkdir")
+        || service::equal(line, "rm") || service::equal(line, "mv")) {
+        if (!storage_available) { console.write("no writable volume\n"); return; }
+        myos_status_t status = MYOS_STATUS_OK;
+        if (service::equal(line, "wdevice")) {
+            if (*argument != '\0') status = MYOS_STATUS_BAD_ARGS;
+            else {
+                uint8_t id[20]{};
+                status = store_client.device_id(id);
+                if (status == MYOS_STATUS_OK) {
+                    constexpr char digits[] = "0123456789abcdef";
+                    char hex[sizeof(id) * 2];
+                    for (size_t i = 0; i < sizeof(id); ++i) {
+                        hex[i * 2] = digits[id[i] >> 4];
+                        hex[i * 2 + 1] = digits[id[i] & 15];
+                    }
+                    console.write(hex, sizeof(hex));
+                    console.put('\n');
+                    return;
+                }
+            }
+        } else if (service::equal(line, "mkfs")) {
+            if (*argument != '\0') status = MYOS_STATUS_BAD_ARGS;
+            else status = store_client.format();
+        } else if (service::equal(line, "wls")) {
+            io::ControlMessage entry{};
+            do {
+                status = store_client.list(entry, argument);
+                if (status != MYOS_STATUS_OK) break;
+                if (entry.size != 0) { console.write(entry.data, entry.size); console.put('\n'); }
+            } while (entry.value != 0);
+        } else if (service::equal(line, "mkdir")) status = store_client.mkdir(argument);
+        else if (service::equal(line, "rm")) status = store_client.remove(argument);
+        else if (service::equal(line, "mv")) {
+            char* next = argument;
+            while (*next != '\0' && *next != ' ') ++next;
+            if (*next == '\0') status = MYOS_STATUS_BAD_ARGS;
+            else {
+                *next++ = '\0';
+                while (*next == ' ') ++next;
+                status = store_client.rename(argument, next);
+            }
+        } else if (service::equal(line, "wcat") || service::equal(line, "wstat")) {
+            store::File file{};
+            status = store_client.open(argument, store::Read, file);
+            if (status == MYOS_STATUS_OK) {
+                if (service::equal(line, "wstat"))
+                    (void)libk::fmt::format_to<"{} bytes\n">(console, file.size);
+                else status = store_client.read(file,
+                    [&](uint64_t, const uint8_t* data, size_t count) {
+                        console.write(reinterpret_cast<const char*>(data), count);
+                    });
+                const auto closed = store_client.close(file);
+                if (status == MYOS_STATUS_OK) status = closed;
+            }
+        } else {
+            char* next = argument;
+            while (*next != '\0' && *next != ' ') ++next;
+            if (*next == '\0') status = MYOS_STATUS_BAD_ARGS;
+            else {
+                *next++ = '\0';
+                while (*next == ' ') ++next;
+                if (service::equal(line, "write") || service::equal(line, "append")) {
+                    store::File file{};
+                    const bool append = service::equal(line, "append");
+                    status = store_client.open(argument, append
+                        ? store::Read | store::Write | store::Create
+                        : store::Write | store::Create | store::Truncate, file);
+                    if (status == MYOS_STATUS_OK) {
+                        status = store_client.write(file, append ? file.size : 0,
+                            reinterpret_cast<const uint8_t*>(next), service::length(next));
+                        if (status == MYOS_STATUS_OK) status = store_client.sync(file);
+                        const auto closed = store_client.close(file);
+                        if (status == MYOS_STATUS_OK) status = closed;
+                    }
+                } else {
+                    files::File source{};
+                    status = filesystem.open(argument, service::length(argument), source);
+                    if (status == MYOS_STATUS_OK) {
+                        store::File target{};
+                        status = store_client.open(next,
+                            store::Write | store::Create | store::Truncate, target);
+                        if (status == MYOS_STATUS_OK) {
+                            myos_status_t copied = MYOS_STATUS_OK;
+                            status = filesystem.read(source,
+                                [&](uint64_t offset, const uint8_t* data, size_t count) {
+                                    if (copied == MYOS_STATUS_OK)
+                                        copied = store_client.write(target, offset, data, count);
+                                });
+                            if (status == MYOS_STATUS_OK) status = copied;
+                            if (status == MYOS_STATUS_OK) status = store_client.sync(target);
+                            const auto closed = store_client.close(target);
+                            if (status == MYOS_STATUS_OK) status = closed;
+                        }
+                        const auto closed = filesystem.close(source);
+                        if (status == MYOS_STATUS_OK) status = closed;
+                    }
+                }
+            }
+        }
+        if (status != MYOS_STATUS_OK) storage_error(console, status);
+        else console.write("ok\n");
+        return;
+    }
+    if (service::equal(line, "restart")) {
+        service::Message request{};
+        request.size = service::length(argument);
+        if (request.size == 0 || request.size >= sizeof(request.data)) {
+            console.write("invalid service\n");
+            return;
+        }
+        service::copy(request.data, argument, request.size);
+        const auto pair = channel_create(pool, 1, MYOS_CHANNEL_MAX_WORDS, 0, 1);
+        if (pair.status != MYOS_STATUS_OK) {
+            (void)libk::fmt::format_to<"service restart: {}\n">(console, pair.status);
+            return;
+        }
+        cap::OwnedCap inbox_root{{pair.value, 0}}, outbox_root{{pair.value2, 0}};
+        const auto reader = channel_mint(inbox_root.selector(), cspace, 1, MYOS_RIGHT_RECEIVE);
+        const auto sender = channel_mint(outbox_root.selector(), cspace, 1,
+            MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE);
+        cap::OwnedCap inbox, outbox;
+        if (reader.status == MYOS_STATUS_OK) inbox = cap::OwnedCap{{reader.value, 0}};
+        if (sender.status == MYOS_STATUS_OK) outbox = cap::OwnedCap{{sender.value, 0}};
+        auto status = reader.status != MYOS_STATUS_OK ? reader.status : sender.status;
+        if (status == MYOS_STATUS_OK) {
+            status = service::send_cap(control, request, outbox.selector(), MYOS_RIGHT_SEND).status;
+            if (status == MYOS_STATUS_OK) {
+                console.write("service restart requested\n");
+                service::Message reply{};
+                status = service::receive(inbox.selector(), reply).status;
+                if (status == MYOS_STATUS_OK) status = reply.status;
+            }
+        }
+        const auto destroyed = object_destroy(inbox_root.selector()).status;
+        if (destroyed != MYOS_STATUS_OK) status = destroyed;
+        if (status != MYOS_STATUS_OK && status != MYOS_STATUS_BUSY)
+            (void)libk::fmt::format_to<"service restart: {}\n">(console, status);
         return;
     }
     if (service::equal(line, "ls")) {
@@ -150,6 +303,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::capability(info, myos::bootstrap::imports::Process),
         service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
     service::require(filesystem.connect(info));
+    storage_available = info.selector(bootstrap::imports::Store) != 0;
+    if (storage_available) service::require(store_client.connect(info));
     console.write("myos native shell\nmyos> ");
     char line[128]{};
     size_t used = 0;
@@ -166,7 +321,10 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 console.put('\n');
                 line[used] = '\0';
                 if (overflow) console.write("line too long\n");
-                else command(line, process, console);
+                else command(line, process, console,
+                    service::capability(info, bootstrap::imports::ServiceControl),
+                    service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
+                    service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
                 used = 0;
                 overflow = false;
                 console.write("myos> ");

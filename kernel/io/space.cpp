@@ -16,8 +16,31 @@ Space::Space(mm::Pmm& pmm, Executor& executor, object::ObjectStore& objects,
     : pmm_(pmm), executor_(executor), objects_(objects), grants_(grants) {}
 
 Space::~Space() noexcept {
-    KASSERT(state_ == SpaceState::Empty || state_ == SpaceState::Closed);
-    KASSERT(!self_ && !cleanup_ && !lease_ && !pins_ && !work_open_);
+    KASSERT(state_ == SpaceState::Empty || state_ == SpaceState::Closed
+        || state_ == SpaceState::Faulted);
+    KASSERT(!self_ && !cleanup_ && !lease_ && !pins_ && !work_open_
+        && !watching_ && !fault_source_.attached());
+}
+
+auto Space::watch(ipc::Notification& notification, u64 badge) noexcept
+    -> libk::Expected<void, SpaceError> {
+    if (badge == 0) return libk::unexpected(SpaceError::InvalidRange);
+    {
+        sync::IrqLockGuard guard{lock_};
+        if (state_ != SpaceState::Empty || watching_ || fault_source_.attached())
+            return libk::unexpected(SpaceError::InvalidState);
+        watching_ = true;
+    }
+    const bool bound = notification.bind(fault_source_, badge).has_value();
+    bool keep{};
+    {
+        sync::IrqLockGuard guard{lock_};
+        keep = bound && state_ == SpaceState::Empty;
+        watching_ = false;
+    }
+    if (!keep && bound) fault_source_.reset();
+    if (!keep) return libk::unexpected(SpaceError::InvalidState);
+    return libk::expected();
 }
 
 auto Space::state() const noexcept -> SpaceState {
@@ -75,7 +98,7 @@ auto Space::bind(object::ObjectRef self, cap::Resolved<Device>& device,
         return libk::unexpected(SpaceError::UnsupportedMemory);
     {
         sync::IrqLockGuard guard{lock_};
-        if (state_ != SpaceState::Empty)
+        if (state_ != SpaceState::Empty || watching_)
             return libk::unexpected(SpaceError::InvalidState);
         self_ = libk::move(self);
         state_ = SpaceState::Binding;
@@ -280,8 +303,9 @@ auto Space::retire_interrupt() noexcept -> bool {
     return interrupt_->state() == irq::State::Closed;
 }
 
-void Space::stop_device(void* context) noexcept {
+void Space::stop_device(void* context, bool fault) noexcept {
     auto& space = *static_cast<Space*>(context);
+    if (fault) space.fault_signal_.store<libk::MemoryOrder::Release>(true);
     space.closing_.store<libk::MemoryOrder::Release>(true);
     space.executor_.submit(space);
 }
@@ -317,17 +341,27 @@ void Space::invalidate_memory_grant(void* context, cap::GrantWork&& work,
 }
 
 void Space::close() noexcept {
-    sync::IrqLockGuard guard{lock_};
-    if (state_ == SpaceState::Empty) { state_ = SpaceState::Closed; return; }
-    if (state_ == SpaceState::Closed || state_ == SpaceState::Failed) return;
-    closing_.store<libk::MemoryOrder::Release>(true);
-    executor_.submit(*this);
+    bool empty{};
+    {
+        sync::IrqLockGuard guard{lock_};
+        if (state_ == SpaceState::Empty) {
+            state_ = SpaceState::Closed;
+            empty = true;
+        } else if (state_ == SpaceState::Closed || state_ == SpaceState::Faulted
+            || state_ == SpaceState::Failed) return;
+        else {
+            closing_.store<libk::MemoryOrder::Release>(true);
+            executor_.submit(*this);
+        }
+    }
+    if (empty) fault_source_.reset();
 }
 
 void Space::retire(object::ObjectCleanup&& cleanup) noexcept {
     {
         sync::IrqLockGuard guard{lock_};
-        if (state_ != SpaceState::Empty && state_ != SpaceState::Closed) {
+        if (state_ != SpaceState::Empty && state_ != SpaceState::Closed
+            && state_ != SpaceState::Faulted) {
             cleanup_ = libk::move(cleanup);
             closing_.store<libk::MemoryOrder::Release>(true);
             executor_.submit(*this);
@@ -335,6 +369,7 @@ void Space::retire(object::ObjectCleanup&& cleanup) noexcept {
         }
         state_ = SpaceState::Closed;
     }
+    fault_source_.reset();
     cleanup.complete();
 }
 
@@ -349,12 +384,19 @@ void Space::free_pages() noexcept {
 
 auto Space::service() noexcept -> Completion {
     bool close_hardware{};
+    bool notify_fault{};
     {
         sync::IrqLockGuard guard{lock_};
         if (state_ == SpaceState::Binding || state_ == SpaceState::Failed)
             return {};
+        if (fault_signal_.exchange<libk::MemoryOrder::AcqRel>(false)) {
+            faulted_ = true;
+            state_ = SpaceState::Closing;
+            notify_fault = true;
+        }
         close_hardware = closing_.load<libk::MemoryOrder::Acquire>();
     }
+    if (notify_fault) (void)fault_source_.signal();
     // Only this executor mutates a published lease. poll may release a large
     // completed translation tree; callbacks need neither that tree nor a lock
     // around its destruction, and self_ retains the complete invocation.
@@ -368,15 +410,27 @@ auto Space::service() noexcept -> Completion {
         if (close_hardware) lease_->close();
         hardware = lease_->poll();
     }
+    if (hardware == DeviceLease::State::Failed) {
+        closing_.store<libk::MemoryOrder::Release>(true);
+        if (!close_hardware) {
+            const bool bars_done = retire_bars();
+            const bool interrupt_done = retire_interrupt();
+            if (!bars_done || !interrupt_done) return {.more = true};
+        }
+        {
+            sync::IrqLockGuard guard{lock_};
+            state_ = SpaceState::Failed;
+            executor_.withdraw(*this);
+        }
+        // Hardware drain is unproved: retain the lease, pins and structural
+        // self-reference, but wake the owner so it cannot wait for an IRQ.
+        (void)fault_source_.signal();
+        return {};
+    }
     {
         sync::IrqLockGuard guard{lock_};
         if (closing_.load<libk::MemoryOrder::Acquire>()) state_ = SpaceState::Closing;
         if (lease_) {
-            if (hardware == DeviceLease::State::Failed) {
-                state_ = SpaceState::Failed;
-                executor_.withdraw(*this);
-                return {}; // retain self, cleanup, source pins and table budget
-            }
             if (state_ != SpaceState::Closing) {
                 state_ = hardware == DeviceLease::State::Active
                     ? SpaceState::Active : SpaceState::Opening;
@@ -423,8 +477,13 @@ auto Space::service() noexcept -> Completion {
     interrupt_.reset();
     memory_.reset();
     device_.reset();
+    if (fault_signal_.exchange<libk::MemoryOrder::AcqRel>(false) && !faulted_) {
+        faulted_ = true;
+        (void)fault_source_.signal();
+    }
+    fault_source_.reset();
     sync::IrqLockGuard guard{lock_};
-    state_ = SpaceState::Closed;
+    state_ = faulted_ ? SpaceState::Faulted : SpaceState::Closed;
     return {libk::move(self_), libk::move(cleanup_), false};
 }
 

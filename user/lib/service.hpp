@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <user/lib/bootstrap.hpp>
+#include <user/lib/capability_syscall.hpp>
 #include <user/lib/syscall.hpp>
 #include <user/lib/service_protocol.hpp>
 
@@ -37,6 +38,17 @@ inline auto send(myos_cap_t channel, const Message& message, bool block = true) 
     copy(wire.words, &message, sizeof(message));
     return block ? channel_send(channel) : channel_try_send(channel);
 }
+inline auto send_cap(myos_cap_t channel, const Message& message,
+    myos_cap_t capability, myos_word_t rights) noexcept -> SysResult {
+    auto& wire = *reinterpret_cast<myos_channel_message*>(IpcAddress);
+    wire = {};
+    wire.version = MYOS_CHANNEL_VERSION;
+    wire.word_count = MYOS_CHANNEL_MAX_WORDS;
+    wire.cap_count = 1;
+    wire.caps[0] = {capability, rights, MYOS_CAP_COPY, 0};
+    copy(wire.words, &message, sizeof(message));
+    return channel_send(channel);
+}
 inline auto receive(myos_cap_t channel, Message& message, bool block = true) noexcept -> SysResult {
     auto& wire = *reinterpret_cast<myos_channel_message*>(IpcAddress);
     wire = {};
@@ -51,6 +63,22 @@ inline auto receive(myos_cap_t channel, Message& message, bool block = true) noe
     }
     return result;
 }
+inline auto receive_cap(myos_cap_t channel, Message& message,
+    cap::OwnedCap& capability) noexcept -> SysResult {
+    auto& wire = *reinterpret_cast<myos_channel_message*>(IpcAddress);
+    wire = {};
+    wire.version = MYOS_CHANNEL_VERSION;
+    wire.receive_limit = 1;
+    const auto result = channel_try_recv(channel);
+    if (result.status != MYOS_STATUS_OK) return result;
+    if (wire.received_count == 1)
+        capability = cap::OwnedCap{{wire.received[0], 0}};
+    if (wire.word_count != MYOS_CHANNEL_MAX_WORDS || wire.received_count != 1)
+        return {.status = MYOS_STATUS_BAD_ARGS, .value = result.value};
+    copy(&message, wire.words, sizeof(message));
+    return message.size <= sizeof(message.data)
+        ? result : SysResult{.status = MYOS_STATUS_BAD_ARGS, .value = result.value};
+}
 inline void require(myos_status_t status) noexcept {
     if (status != MYOS_STATUS_OK) myos::exit(status);
 }
@@ -63,6 +91,12 @@ template<class Binding>
 inline auto capability(const bootstrap::BootstrapView& info, Binding role) noexcept -> myos_cap_t {
     auto cap = info.selector(role);
     if (cap == 0) myos::exit(MYOS_STATUS_INVALID_CAP);
+    return cap;
+}
+inline auto initial_device(const bootstrap::BootstrapView& info,
+    size_t ordinal = 0) noexcept -> myos_cap_t {
+    const auto cap = info.device(ordinal);
+    if (cap == 0) myos::exit(MYOS_STATUS_NOT_FOUND);
     return cap;
 }
 
@@ -110,6 +144,12 @@ public:
     auto try_receive(Message& message) noexcept -> SysResult {
         const auto result = service::receive(channel_, message, false);
         if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
+        return result;
+    }
+    auto try_receive(Message& message, cap::OwnedCap& capability) noexcept -> SysResult {
+        const auto result = service::receive_cap(channel_, message, capability);
+        if (result.status == MYOS_STATUS_OK || result.status == MYOS_STATUS_BAD_ARGS)
+            sequence_ = result.value;
         return result;
     }
     auto arm() noexcept -> SysResult {

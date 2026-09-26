@@ -14,16 +14,21 @@ def main():
     disk_image = None
     timeout = 5
     fail_sector = None
-    while extra_markers[:1] in (["--bundle"], ["--disk"], ["--timeout"], ["--fail-sector"]):
-        if extra_markers[0] == "--bundle":
-            bundle = extra_markers[1]
-        elif extra_markers[0] == "--disk":
-            disk_image = extra_markers[1]
-        elif extra_markers[0] == "--fail-sector":
-            fail_sector = int(extra_markers[1])
+    second_disk = False
+    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--second-disk"):
+        option = extra_markers.pop(0)
+        if option == "--second-disk":
+            second_disk = True
+            continue
+        value = extra_markers.pop(0)
+        if option == "--bundle":
+            bundle = value
+        elif option == "--disk":
+            disk_image = value
+        elif option == "--fail-sector":
+            fail_sector = int(value)
         else:
-            timeout = float(extra_markers[1])
-        extra_markers = extra_markers[2:]
+            timeout = float(value)
     root = pathlib.Path(__file__).resolve().parents[2]
     temporary = root / ".tmp/project/interactive-storage/platform"
     temporary.mkdir(parents=True, exist_ok=True)
@@ -38,11 +43,18 @@ def main():
             config = pathlib.Path(directory) / "blkdebug.conf"
             config.write_text(f'[inject-error]\nevent = "read_aio"\nerrno = "5"\nsector = "{fail_sector}"\n')
             disk_source = f"blkdebug:{config}:{disk}"
+        if second_disk:
+            other = pathlib.Path(directory) / "probe2.img"
+            with other.open("wb") as stream:
+                stream.truncate(1024 * 1024)
         for count in cpus.split(","):
             command = [qemu, "-machine", "virt,iommu-sys=on", "-nographic",
                        "-bios", "default", "-kernel", kernel, "-smp", count,
                        "-drive", f"if=none,id=disk,format=raw,readonly=on,file={disk_source}",
                        "-device", "virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on"]
+            if second_disk:
+                command += ["-drive", f"if=none,id=disk2,format=raw,readonly=on,file={other}",
+                            "-device", "virtio-blk-pci,addr=2,drive=disk2,disable-legacy=on,iommu_platform=on"]
             if bundle is not None:
                 command += ["-initrd", bundle]
             try:
@@ -55,6 +67,8 @@ def main():
             expected = ["io: isolated PCI function ready requester=0x8",
                         f"cpu: discovered={count} prepared=0 starting=0 online={count} failed=0",
                         "failed=0", "runtime: entered", *extra_markers]
+            if second_disk:
+                expected.append("io: isolated PCI function ready requester=0x10")
             if any(marker not in text for marker in expected) or "MYOS KERNEL PANIC" in text:
                 log = temporary / f"failed-{count}.log"
                 log.write_text(text)

@@ -1134,6 +1134,7 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
     }
     if (completed != nullptr) {
         completed->acknowledge();
+        retry_allocations();
     }
     if (attachment != nullptr) {
         attachment->ops_->invalidate(
@@ -1216,6 +1217,7 @@ auto GrantGraph::detach(GrantAttachment& attachment) noexcept -> bool {
     }
     if (completion != nullptr) {
         completion->acknowledge();
+        retry_allocations();
     }
     return quiescent;
 }
@@ -1467,10 +1469,55 @@ void GrantGraph::abort_allocation(
 void GrantGraph::revoke_allocation(
     kernel::resource::Allocation& allocation) noexcept {
     KASSERT(allocation.graph_ == this && allocation.root_.valid());
-    const auto revoked = invalidate(allocation.root_, allocation.revoke_);
-    KASSERT(revoked);
+    for (;;) {
+        const auto revoked = invalidate(allocation.root_, allocation.revoke_);
+        if (revoked) break;
+        KASSERT(revoked.error() == GrantError::RevocationConflict);
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            Node* const root = locate(allocation.root_);
+            KASSERT(root != nullptr);
+            bool conflict{};
+            for (PageHeader* page = pages_; page != nullptr && !conflict; page = page->next) {
+                auto* const slots = reinterpret_cast<Slot*>(
+                    reinterpret_cast<usize>(page) + slot_offset);
+                for (usize i = 0; i < slots_per_page; ++i) {
+                    if (!slots[i].occupied.load<libk::MemoryOrder::Acquire>()) continue;
+                    Node& node = *slots[i].node();
+                    conflict = (&node == root || descendant_of(node, *root))
+                        && node.slot->state.load<libk::MemoryOrder::Acquire>()
+                            == GrantState::Revoking;
+                    if (conflict) break;
+                }
+            }
+            if (conflict) {
+                // The allocation stays in Revoking and its pool keeps it
+                // alive. The completion of the conflicting descendant will
+                // retry this root after releasing the graph lock.
+                allocation.revoke_retry_next_ = revoke_retry_;
+                revoke_retry_ = &allocation;
+                return;
+            }
+        }
+        // The conflicting lineage completed before we could register. No
+        // completion can wake us now, so retry against the current graph.
+    }
     if (allocation.revoke_.complete() || !allocation.revoke_.arm()) {
         allocation.ready();
+    }
+}
+
+void GrantGraph::retry_allocations() noexcept {
+    kernel::resource::Allocation* pending{};
+    {
+        kernel::sync::IrqLockGuard guard{lock_};
+        pending = libk::exchange(revoke_retry_, nullptr);
+    }
+    while (pending != nullptr) {
+        auto* const next = pending->revoke_retry_next_;
+        pending->revoke_retry_next_ = nullptr;
+        revoke_allocation(*pending);
+        pending = next;
     }
 }
 

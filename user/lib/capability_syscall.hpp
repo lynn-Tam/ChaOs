@@ -136,6 +136,12 @@ struct SyscallBackend final {
         return ::myos::memory_seal(memory.selector).status;
     }
 
+    [[nodiscard]] static auto memory_populate(CapRef memory,
+        myos_word_t page) noexcept -> myos_status_t {
+        if (!current(memory)) return MYOS_STATUS_BAD_ARGS;
+        return ::myos::memory_populate(memory.selector, page).status;
+    }
+
     [[nodiscard]] static auto memory_write(
         void* destination,
         const uint8_t* source,

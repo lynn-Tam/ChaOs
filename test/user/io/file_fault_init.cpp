@@ -32,7 +32,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     supervisor.open(info);
     service::require(supervisor.load(program, info));
     service::require(supervisor.add_boot_sources(info));
-    service::require(supervisor.add("block.device", service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE),
+    service::require(supervisor.add("block.device", service::initial_device(info),
         MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONNECT));
     const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     constexpr const char* names[][2] = {{"block.client", "block.server"}, {"files.client", "files.server"}};

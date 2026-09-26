@@ -22,7 +22,7 @@ enum class CpuTopologyError : u8 {
 };
 
 [[nodiscard]] auto parse_fdt_cpus(
-    const kernel::boot::fdt::FDT_View& view,
+    const Fdt& tree,
     CpuHardwareId boot_hardware_id,
     CpuHandoff& destination) noexcept
     -> libk::Expected<void, CpuTopologyError>;

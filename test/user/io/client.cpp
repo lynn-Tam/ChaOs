@@ -23,14 +23,28 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     using namespace myos;
     const auto info = service::bootstrap(address, size);
     events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
-    service::require(control.open(service::capability(info, myos::bootstrap::imports::Block), events));
-    const myos_cap_transfer event{events, MYOS_RIGHT_SIGNAL, MYOS_CAP_COPY, 0};
-    service::require(control.send({.operation = static_cast<uint64_t>(io::Control::Open),
-        .id = 1, .value = io::QueueDepth}, &event, 1));
+    const auto pair = channel_create(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
+        1, MYOS_CHANNEL_MAX_WORDS, 4, 2);
+    service::require(pair.status);
+    cap::OwnedCap client{{pair.value, 0}}, server{{pair.value2, 0}};
+    const auto own_endpoint = channel_mint(client.selector(), service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE),
+        1, MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE);
+    service::require(own_endpoint.status);
+    client = cap::OwnedCap{{own_endpoint.value, 0}};
+    service::require(control.open(client.selector(), events));
+    const auto endpoint = channel_mint(server.selector(), service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE),
+        1, MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE | MYOS_RIGHT_DUPLICATE);
+    service::require(endpoint.status);
+    cap::OwnedCap fixed{{endpoint.value, 0}};
+    const myos_cap_transfer transfers[]{
+        {fixed.selector(), MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE, MYOS_CAP_COPY, 0},
+        {events, MYOS_RIGHT_SIGNAL, MYOS_CAP_COPY, 0}};
+    service::require(io::ControlPort::send_to(service::capability(info, bootstrap::imports::Block),
+        {.operation = static_cast<uint64_t>(io::Control::Open), .id = 1, .value = io::QueueDepth}, transfers, 2));
     auto opened = receive();
     service::require(opened.message.status);
     if (opened.message.id != 1 || opened.message.value != 1024 * 1024) exit(MYOS_STATUS_BAD_ARGS);
-    for (size_t index = 1; index < 3; ++index) {
+    for (size_t index = 1; index < 2; ++index) {
         const uintptr_t probe = 0x71000000 + index * 4096;
         const auto region = vm_create_region(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
             probe, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, MYOS_RIGHT_MAP);
@@ -39,7 +53,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         if (vm_map(region.value, opened.capabilities[index].selector(), probe, 4096, 0,
             MYOS_VM_READ | MYOS_VM_WRITE).status != MYOS_STATUS_BAD_RIGHTS) exit(MYOS_STATUS_INTERNAL);
     }
-    service::require(memory.map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE), 0x70000000, opened));
+    service::require(memory.map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
+        0x70000000, opened, true));
+    if (memory.writable_payload() == nullptr) exit(MYOS_STATUS_INTERNAL);
     service::require(memory.signal());
     io::ClientQueue queue{memory.client(), memory.server()};
     for (size_t batch = 0; batch < 16; ++batch) {
@@ -49,12 +65,16 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             io::Request request{.operation = static_cast<uint64_t>(io::Operation::Read),
                 .offset = slot * io::BufferSize, .buffer_offset = slot * io::BufferSize,
                 .length = io::BufferSize};
-            if (slot == 0 && batch >= 1 && batch <= 4) {
+            if (slot == 0 && batch >= 1 && batch <= 5) {
                 if (batch == 1) request.offset = UINT64_MAX - 511;
                 if (batch == 2) request.buffer_offset = io::PayloadSize + 1;
                 if (batch == 3) request.length = 0;
                 if (batch == 4) request.operation = UINT64_MAX;
-                expected_status[slot] = MYOS_STATUS_BAD_ARGS;
+                if (batch == 5) {
+                    request.operation = static_cast<uint64_t>(io::Operation::Write);
+                    memory.writable_payload()[0] = 0x5a;
+                }
+                expected_status[slot] = batch == 5 ? MYOS_STATUS_DENIED : MYOS_STATUS_BAD_ARGS;
             }
             if (queue.submit(request) != libk::RingResult::Ready) exit(MYOS_STATUS_INTERNAL);
             expected[slot] = request.id;

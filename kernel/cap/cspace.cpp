@@ -559,6 +559,10 @@ auto CSpace::snapshot(CapHandle handle) noexcept
         || occupied->generation != handle.generation()) {
         return libk::unexpected(CSpaceError::InvalidHandle);
     }
+    if (occupied->state == SlotState::Empty
+        || occupied->state == SlotState::Quarantined) {
+        return libk::unexpected(CSpaceError::InvalidHandle);
+    }
     if (occupied->state != SlotState::Occupied) {
         return libk::unexpected(CSpaceError::InvalidState);
     }

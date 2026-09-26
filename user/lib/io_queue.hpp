@@ -10,7 +10,7 @@ inline constexpr size_t QueueDepth = 32;
 using Submissions = libk::SharedRing<8, QueueDepth>;
 using Completions = libk::SharedRing<4, QueueDepth>;
 
-enum class Operation : uint64_t { Read = 1 };
+enum class Operation : uint64_t { Read = 1, Write = 2, Flush = 3, Identify = 4 };
 // Cancellation travels over the session's control Channel, so a full data
 // queue never prevents it. Its reply acknowledges receipt, not buffer release.
 enum class Control : uint64_t { Open = 1, Cancel, Close };

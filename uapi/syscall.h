@@ -120,3 +120,5 @@
 #define MYOS_SYS_IO_SPACE_BAR           147 /* a0=IOSpace, a1=BAR index; returns bounded Memory capability */
 #define MYOS_SYS_IO_SPACE_IRQ           148 /* a0=IOSpace; returns generation Irq capability */
 #define MYOS_SYS_IO_SPACE_CLOSE         149 /* a0=IOSpace */
+#define MYOS_SYS_DEVICE_INFO            150 /* a0=Device, a1=registered IPC buffer offset; writes myos_device_info */
+#define MYOS_SYS_IO_SPACE_WATCH          151 /* a0=IOSpace, a1=Notification, a2=badge; before bind */

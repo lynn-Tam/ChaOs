@@ -12,6 +12,10 @@ namespace kernel::irq {
 // Called once the boot CPU has installed a valid trap entry.  Before that
 // point construction tests may exercise Irq state without touching MMIO.
 void initialize_platform() noexcept;
+// Platform-lifetime interrupt handling for kernel-owned controllers. Register
+// before initialize_platform; returning false masks a fatally failed source.
+[[nodiscard]] auto register_kernel_source(u32 source, void* context,
+    bool (*handle)(void*) noexcept) noexcept -> bool;
 
 // A token is minted by the platform/bootstrap layer.  User code can carry it
 // only through a typed Irq construction; the integer is never a capability.

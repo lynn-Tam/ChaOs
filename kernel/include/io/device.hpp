@@ -10,6 +10,12 @@ namespace kernel::io {
 
 class Device;
 
+struct DeviceInfo final {
+    libk::Array<u32, 64> configuration{};
+    libk::Array<usize, 6> bar_sizes{};
+    u16 requester{};
+};
+
 // IOSpace owns this exclusive hardware lease and serializes its operations.
 // It must retain the mapped MemoryObject leases until Closed. Failed hardware
 // remains quarantined with this token, its tables and all backing references.
@@ -56,7 +62,7 @@ private:
 // the move-only lease owns the hardware phase and is never duplicated.
 class Device final : private libk::noncopyable_nonmovable {
 public:
-    using Stop = void (*)(void*) noexcept;
+    using Stop = void (*)(void*, bool fault) noexcept;
     Device(arch::PciFunction&& function, arch::Iommu& iommu,
         const time::Clock& clock) noexcept
         : function_(libk::move(function)), iommu_(iommu), clock_(clock) {}
@@ -67,7 +73,9 @@ public:
     [[nodiscard]] auto acquire(void* context = nullptr, Stop stop = nullptr) noexcept
         -> libk::optional<DeviceLease>;
     void retire() noexcept;
+    void signal_fault() noexcept;
     [[nodiscard]] auto requester() const noexcept -> u16 { return function_.requester(); }
+    [[nodiscard]] auto info() const noexcept -> DeviceInfo;
 
 private:
     friend class DeviceLease;

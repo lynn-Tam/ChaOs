@@ -24,6 +24,6 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         (void)printer.print<"[channel] failed status={}\n">(status);
         exit(status);
     }
-    port.write("[channel] three blocked senders, stop, peer close and reuse ok\n");
+    port.write("[channel] service generations, stale cap denied, blocked senders, stop and reuse ok\n");
     exit();
 }

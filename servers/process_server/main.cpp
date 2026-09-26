@@ -198,6 +198,14 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         MYOS_OBJECT_KIND_SCHED_DOMAIN, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL));
     service::require(supervisor.add("files.directory", service::capability(info, bootstrap::imports::FilesRead),
         MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE, 0, 1, UINT64_MAX));
+    if (const auto store = info.selector(bootstrap::imports::Store); store != 0)
+        service::require(supervisor.add("store.directory", store,
+            MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
+            0, 1, UINT64_MAX));
+    if (const auto store = info.selector(bootstrap::imports::StoreRead); store != 0)
+        service::require(supervisor.add("store.read.directory", store,
+            MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
+            0, 1, UINT64_MAX));
     service::Connection channel{service::capability(info, bootstrap::imports::Process), events};
     service::require(channel.enable_writable());
     for (;;) {

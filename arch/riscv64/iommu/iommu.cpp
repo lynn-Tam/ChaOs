@@ -4,11 +4,13 @@
 #include <core/debug.hpp>
 #include <libk/limits.hpp>
 #include <mm/virtual_layout.hpp>
+#include <sync/irq_lock_guard.hpp>
 
 namespace arch {
 namespace {
 constexpr usize Base = kernel::mm::layout::DirectMapBegin + virt_iommu_base;
 constexpr usize Ddtp = 0x10;
+constexpr usize Fctl = 0x8;
 constexpr usize Cqb = 0x18;
 constexpr usize Cqh = 0x20;
 constexpr usize Cqt = 0x24;
@@ -17,6 +19,10 @@ constexpr usize Fqh = 0x30;
 constexpr usize Fqt = 0x34;
 constexpr usize Cqcsr = 0x48;
 constexpr usize Fqcsr = 0x4c;
+constexpr usize Ipsr = 0x54;
+constexpr usize Icvec = 0x2f8;
+constexpr u32 FaultInterrupt = 1 << 1;
+constexpr u32 FaultQueueErrors = (1 << 8) | (1 << 9);
 constexpr u32 On = 1 << 16;
 constexpr u32 Busy = 1 << 17;
 constexpr u32 CommandErrors = (1 << 8) | (1 << 9) | (1 << 10);
@@ -45,7 +51,7 @@ Iommu::~Iommu() noexcept {
     KASSERT(state_ == State::Idle);
 }
 
-auto Iommu::start(kernel::mm::Pmm& pmm, u16 requester) noexcept
+auto Iommu::start(kernel::mm::Pmm& pmm) noexcept
     -> libk::Expected<void, IommuError> {
     if (state_ != State::Idle) return libk::unexpected(IommuError::Busy);
     const u64 capabilities = read<u64>(0);
@@ -56,14 +62,15 @@ auto Iommu::start(kernel::mm::Pmm& pmm, u16 requester) noexcept
     if ((capabilities & 0xf0) != 0x10
         || (capabilities & (u64{1} << 9)) == 0
         || (capabilities & (u64{1} << 22)) == 0
-        || (read<u32>(8) & 5) != 0)
-        return libk::unexpected(IommuError::Unsupported);
-    if (requester >= (1 << 15))
+        || ((capabilities >> 28) & 3) == 0
+        || ((capabilities >> 28) & 3) == 3
+        || (read<u32>(Fctl) & 5) != 0)
         return libk::unexpected(IommuError::Unsupported);
     storage_ = pmm.make_page_group();
     {
         auto extension = storage_.extend();
-        kernel::mm::Page* pages[] = {&directory_, &contexts_, &commands_, &faults_};
+        kernel::mm::Page* pages[] = {&directory_, &commands_, &faults_,
+            &contexts_[0], &contexts_[1], &contexts_[2], &contexts_[3]};
         for (auto* slot : pages) {
             auto allocated = extension.allocate_page();
             if (!allocated) return libk::unexpected(IommuError::InsufficientMemory);
@@ -76,11 +83,9 @@ auto Iommu::start(kernel::mm::Pmm& pmm, u16 requester) noexcept
         }
         extension.commit();
     }
-    requester_ = requester;
     auto* directory = reinterpret_cast<u64*>(storage_.bytes(directory_));
-    directory[requester >> 6] = (ppn(contexts_) << 10) | 1;
-    context_ = reinterpret_cast<u64*>(storage_.bytes(contexts_))
-        + (requester & 63) * 8;
+    for (usize i = 0; i < ContextPages; ++i)
+        directory[i] = (ppn(contexts_[i]) << 10) | 1;
     // Do not release storage after this point, including failed initialization.
     state_ = State::Disabling;
     write<u64>(Ddtp, 0);
@@ -105,6 +110,12 @@ auto Iommu::initialize() noexcept -> IoStatus {
             || (read<u32>(Fqcsr) & (On | Busy)) != 0)
             return IoStatus::Pending;
         if ((read<u64>(Ddtp) & 15) != 0) return failed();
+        // QEMU virt wires FQ to PLIC source 37. Select WSI while the IOMMU
+        // is Off and its queues are disabled, as required by fctl.
+        write<u32>(Fctl, 2);
+        if ((read<u32>(Fctl) & 7) != 2) return failed();
+        write<u64>(Icvec, (read<u64>(Icvec) & ~u64{0xf0}) | (u64{1} << 4));
+        if (((read<u64>(Icvec) >> 4) & 15) != 1) return failed();
         write<u64>(Cqb, (ppn(commands_) << 10) | 7); // 256 commands
         write<u64>(Fqb, (ppn(faults_) << 10) | 6); // 128 fault records
         write<u32>(Cqt, 0);
@@ -131,6 +142,8 @@ auto Iommu::initialize() noexcept -> IoStatus {
         const u64 directory = read<u64>(Ddtp);
         if ((directory & 16) != 0) return IoStatus::Pending;
         if (directory != ((ppn(directory_) << 10) | 3)) return failed();
+        write<u32>(Ipsr, FaultInterrupt);
+        write<u32>(Fqcsr, 3); // FQEN | FIE
         state_ = State::Ready;
         return IoStatus::Complete;
     }
@@ -140,9 +153,13 @@ auto Iommu::initialize() noexcept -> IoStatus {
     __builtin_unreachable();
 }
 
-auto Iommu::replace(libk::optional<kernel::mm::Page> root) noexcept
+auto Iommu::replace(u16 requester, libk::optional<kernel::mm::Page> root) noexcept
     -> libk::Expected<u64, IommuError> {
+    kernel::sync::IrqLockGuard guard{lock_};
     if (state_ != State::Ready) return libk::unexpected(IommuError::Failed);
+    if (requester >= RootBusRequesters)
+        return libk::unexpected(IommuError::Unsupported);
+    if (root && overflow_) return libk::unexpected(IommuError::Busy);
     if (issued_ != completed_) return libk::unexpected(IommuError::Busy);
     if (issued_ == libk::numeric_limits<u64>::max()
         || (read<u32>(Cqcsr) & CommandErrors) != 0
@@ -152,16 +169,21 @@ auto Iommu::replace(libk::optional<kernel::mm::Page> root) noexcept
     }
     if (root && ppn(*root) >= (u64{1} << 44))
         return libk::unexpected(IommuError::Unsupported);
-    __atomic_store_n(&context_[0], u64{0}, __ATOMIC_RELEASE);
-    context_[1] = 0; // no second-stage translation
-    context_[2] = 0; // PSCID zero; single isolated function
-    context_[3] = root ? (u64{8} << 60) | ppn(*root) : 0;
-    if (root) __atomic_store_n(&context_[0], u64{1}, __ATOMIC_RELEASE);
+    auto* context = reinterpret_cast<u64*>(storage_.bytes(contexts_[requester >> 6]))
+        + (requester & 63) * 8;
+    __atomic_store_n(&context[0], u64{0}, __ATOMIC_RELEASE);
+    context[1] = 0; // no second-stage translation
+    // A PSCID identifies one first-stage address space. Distinct live DIDs
+    // may map the same IOVA differently, so sharing PSCID would alias IOATC
+    // entries even when their device-directory contexts are distinct.
+    context[2] = root ? u64{requester} << 12 : 0;
+    context[3] = root ? (u64{8} << 60) | ppn(*root) : 0;
+    if (root) __atomic_store_n(&context[0], u64{1}, __ATOMIC_RELEASE);
 
     auto* commands = reinterpret_cast<u64*>(storage_.bytes(commands_));
     const u64 batch[] = {
-        u64{3} | (u64{1} << 33) | (u64{requester_} << 40),
-        u64{1}, // all first-stage translation caches, including PSCID zero
+        u64{3} | (u64{1} << 33) | (u64{requester} << 40),
+        u64{1}, // global VMA invalidation also covers this DID's old generation
         u64{2} | (u64{1} << 12) | (u64{1} << 13), // IOFENCE.C PR/PW
     };
     for (const auto command : batch) {
@@ -170,13 +192,19 @@ auto Iommu::replace(libk::optional<kernel::mm::Page> root) noexcept
         tail_ = (tail_ + 1) & 255;
     }
     ++issued_;
+    // Ownership lasts through the null-context fence and fault-mailbox
+    // drain. An overflow observed there must still account for this DID.
+    if (root) active_[requester] = true;
     write<u32>(Cqt, tail_);
     return libk::expected(issued_);
 }
 
 auto Iommu::poll(u64 ticket) noexcept -> IoStatus {
-    if (state_ != State::Ready || ticket == 0 || ticket != issued_)
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (state_ != State::Ready || ticket == 0 || ticket > issued_)
         return IoStatus::Failed;
+    if (ticket <= completed_) return IoStatus::Complete;
+    if (ticket != issued_) return IoStatus::Failed;
     if ((read<u32>(Cqcsr) & CommandErrors) != 0) return failed();
     // CQH alone doesn't complete ordinary commands. This batch ends with a
     // fence, whose CQH advancement is the architectural completion boundary.
@@ -185,36 +213,109 @@ auto Iommu::poll(u64 ticket) noexcept -> IoStatus {
     return IoStatus::Complete;
 }
 
-auto Iommu::take_fault() noexcept -> libk::optional<IoFault> {
-    if (state_ != State::Ready) return libk::nullopt;
+auto Iommu::drain_faults() noexcept -> IoStatus {
+    if (state_ != State::Ready) return IoStatus::Failed;
     const u32 tail = read<u32>(Fqt);
-    if (tail >= 128 || (read<u32>(Fqcsr) & (1 << 8)) != 0) {
-        static_cast<void>(failed());
-        return libk::nullopt;
+    const u32 status = read<u32>(Fqcsr);
+    if (tail >= 128 || (status & (1 << 8)) != 0) {
+        return failed();
     }
-    if (tail == fault_head_) return libk::nullopt;
-    const auto* record = reinterpret_cast<volatile const u64*>(
-        storage_.bytes(faults_)) + fault_head_ * 4;
-    const u64 header = record[0];
-    const IoFault fault{
-        .cause = static_cast<u16>(header & 0xfff),
-        .requester = static_cast<u32>(header >> 40), .address = record[2]};
-    fault_head_ = (fault_head_ + 1) & 127;
+    if ((status & (1 << 9)) != 0) {
+        begin_overflow();
+        if (recovery_count_ == 0) return failed();
+    }
+    while (fault_head_ != tail) {
+        const auto* record = reinterpret_cast<volatile const u64*>(
+            storage_.bytes(faults_)) + fault_head_ * 4;
+        const u64 header = record[0];
+        const IoFault fault{
+            .cause = static_cast<u16>(header & 0xfff),
+            .requester = static_cast<u32>(header >> 40), .address = record[2]};
+        if (fault.requester < RootBusRequesters
+            && !pending_faults_[fault.requester])
+            pending_faults_[fault.requester] = fault;
+        fault_head_ = (fault_head_ + 1) & 127;
+    }
     write<u32>(Fqh, fault_head_);
-    return libk::optional<IoFault>{fault};
+    return IoStatus::Complete;
 }
 
-auto Iommu::clear_faults() noexcept -> IoStatus {
-    if (state_ != State::Ready || issued_ != completed_) return IoStatus::Failed;
+void Iommu::begin_overflow() noexcept {
+    if (overflow_) return;
+    overflow_ = true;
+    // A dropped record has no trustworthy DID. Stop every context that could
+    // have generated it and suppress the level IRQ until all have fenced.
+    // Request FQEN with FIE masked and no FQOF clear. Some emulators clear
+    // FQOF on this write anyway; overflow_ remains latched until every
+    // affected context has completed its invalidation fence.
+    write<u32>(Fqcsr, 1);
+    for (u16 requester = 0; requester < RootBusRequesters; ++requester) {
+        recovering_[requester] = active_[requester];
+        if (active_[requester]) ++recovery_count_;
+    }
+}
+
+auto Iommu::handle_fault_irq() noexcept -> IoStatus {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (state_ != State::Ready) return IoStatus::Failed;
+    // Clear the interrupt before reading the queue. A newly appended record
+    // after this edge raises FIP again; records already present are drained.
+    write<u32>(Ipsr, FaultInterrupt);
+    const auto status = drain_faults();
+    if (overflow_) write<u32>(Ipsr, FaultInterrupt);
+    return status;
+}
+
+auto Iommu::fault_pending(u16 requester) noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return requester < RootBusRequesters && pending_faults_[requester].has_value();
+}
+
+auto Iommu::fault_overflow() noexcept -> bool {
+    kernel::sync::IrqLockGuard guard{lock_};
+    return overflow_;
+}
+
+auto Iommu::take_fault(u16 requester) noexcept -> libk::optional<IoFault> {
+    kernel::sync::IrqLockGuard guard{lock_};
+    if (requester >= RootBusRequesters || drain_faults() != IoStatus::Complete)
+        return libk::nullopt;
+    auto fault = libk::move(pending_faults_[requester]);
+    pending_faults_[requester].reset();
+    return fault;
+}
+
+auto Iommu::clear_faults(u16 requester) noexcept -> IoStatus {
+    kernel::sync::IrqLockGuard guard{lock_};
+    // The caller already awaited this DID's invalidation fence. Another DID
+    // may now have a command in flight; its ticket does not gate this mailbox.
+    if (state_ != State::Ready) return IoStatus::Failed;
+    if (requester >= RootBusRequesters || drain_faults() != IoStatus::Complete)
+        return IoStatus::Failed;
     const u32 status = read<u32>(Fqcsr);
-    const u32 tail = read<u32>(Fqt);
-    if ((status & (1 << 8)) != 0 || (status & On) == 0 || tail >= 128)
+    if ((status & (1 << 8)) != 0 || (status & On) == 0)
         return failed();
-    fault_head_ = tail;
-    write<u32>(Fqh, tail);
-    // FQOF is W1C. A full old-generation queue must not suppress subsequent
-    // fault reporting after its consumer position has been reset.
-    write<u32>(Fqcsr, (status & 3) | (1 << 9));
+    pending_faults_[requester].reset();
+    if (recovering_[requester]) {
+        if (recovery_count_ == 1) {
+            if ((status & Busy) != 0) return IoStatus::Pending;
+            if (!rearming_) {
+                write<u32>(Fqcsr, 3 | (1 << 9)); // clear FQOF, restore FIE
+                rearming_ = true;
+                return IoStatus::Pending;
+            }
+            const u32 resumed = read<u32>(Fqcsr);
+            if ((resumed & Busy) != 0) return IoStatus::Pending;
+            if ((resumed & (FaultQueueErrors | On | 3)) != (On | 3))
+                return failed();
+            write<u32>(Ipsr, FaultInterrupt);
+            overflow_ = false;
+            rearming_ = false;
+        }
+        recovering_[requester] = false;
+        --recovery_count_;
+    }
+    active_[requester] = false;
     return IoStatus::Complete;
 }
 

@@ -14,7 +14,7 @@ Implemented or under active development:
 - capability spaces, derivation, attenuation, revocation, and resource accounting
 - threads, Vprocs, scheduling contexts, timers, and CPU dispatch
 - notifications, channels, endpoints, and asynchronous completion
-- user-space `init`, process supervision, UART, block, and FAT32 file services
+- user-space `init`, process supervision, UART, block, read-only FAT32, and writable data-volume services
 - application loading from disk and file-backed demand paging
 - an interactive shell and basic user programs
 - PCI, I/O-space, DMA, and IOMMU foundations
@@ -36,8 +36,17 @@ tools/build/ninja.sh kernel.elf bundle
 Run the native userspace environment under QEMU with:
 
 ```sh
-tools/build/ninja.sh run-console-smp
+tools/build/ninja.sh run-console
 ```
+
+The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
+disk, run `mkfs` once in the shell; running it again erases the data volume.
+Then use `write note hello`, `append note world`,
+`wcat note`, `wstat note`, `wls` or `wls directory`,
+`save README.TXT readme`, `mv`, and `rm`. User programs can also write through
+the Store capability, for example `run echo hello | put greeting`.
+The FAT32 boot disk remains read-only.
+Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
 
 Additional test, audit, SMP matrix, debug, and proof targets are defined in `meson.build`.
 

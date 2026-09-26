@@ -319,8 +319,11 @@ typedef enum myos_deploy_dependency_kind {
 
 #define MYOS_DEPLOY_DEPENDENCY_STARTUP (1U << 0)
 #define MYOS_DEPLOY_DEPENDENCY_READINESS (1U << 1)
+/* Runtime-only ownership edges may form a shutdown cohort without imposing
+ * a cyclic startup order (for example a supervisor and its sole session). */
+#define MYOS_DEPLOY_DEPENDENCY_LIFETIME (1U << 2)
 #define MYOS_DEPLOY_DEPENDENCY_FLAGS_VALID \
-    (MYOS_DEPLOY_DEPENDENCY_STARTUP | MYOS_DEPLOY_DEPENDENCY_READINESS)
+    (MYOS_DEPLOY_DEPENDENCY_STARTUP | MYOS_DEPLOY_DEPENDENCY_READINESS | MYOS_DEPLOY_DEPENDENCY_LIFETIME)
 
 typedef enum myos_deploy_export_class {
     MYOS_DEPLOY_EXPORT_PREPARED_KEY = 0,

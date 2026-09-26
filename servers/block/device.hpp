@@ -14,7 +14,7 @@ class Device final : private libk::noncopyable_nonmovable {
 public:
     static constexpr size_t Depth = myos::io::QueueDepth;
     static constexpr size_t BlockSize = 512;
-    static constexpr size_t MaxRead = 4096;
+    static constexpr size_t MaxTransfer = 4096;
     struct Completion final {
         myos::io::Ticket ticket{};
         myos_status_t status{};
@@ -31,6 +31,8 @@ public:
         auto arena = MappedMemory::create(pool, vspace, ArenaAddress, ArenaSize);
         if (!arena) return arena.error();
         arena_ = libk::move(arena).value();
+        const auto watched = io_space_watch(created.value, events, service::EventsBadge);
+        if (watched.status != MYOS_STATUS_OK) return watched.status;
         const auto bound = io_space_bind(created.value, device, arena_.memory.selector(),
             0, ArenaSize / 4096, Iova);
         if (bound.status != MYOS_STATUS_OK) return bound.status;
@@ -78,29 +80,53 @@ public:
             const auto state = myos::io_space_state(space_.selector());
             if (state.status != MYOS_STATUS_OK) return state.status;
             if (state.value == MYOS_IO_SPACE_CLOSED) return MYOS_STATUS_OK;
-            if (state.value == MYOS_IO_SPACE_FAILED) return MYOS_STATUS_BACKING_FAILED;
+            if (state.value == MYOS_IO_SPACE_FAILED
+                || state.value == MYOS_IO_SPACE_FAULTED) return MYOS_STATUS_BACKING_FAILED;
             myos::yield();
         }
     }
 
-    [[nodiscard]] auto submit(myos::io::Ticket ticket, uint64_t offset, size_t size) noexcept
+    [[nodiscard]] auto submit(myos::io::Ticket ticket, myos::io::Operation operation,
+        uint64_t offset, size_t size, const uint8_t* source = nullptr) noexcept
         -> myos_status_t {
         if (ticket.slot >= Depth || slots_[ticket.slot].active) return MYOS_STATUS_BUSY;
-        if (size == 0 || size > MaxRead || size % BlockSize != 0 || offset % BlockSize != 0
-            || offset > capacity() || size > capacity() - offset) return MYOS_STATUS_BAD_ARGS;
+        if (operation == myos::io::Operation::Flush) {
+            if (!flush_supported_) return MYOS_STATUS_INVALID_OP;
+            if (offset != 0 || size != 0 || source != nullptr) return MYOS_STATUS_BAD_ARGS;
+        } else if (operation == myos::io::Operation::Identify) {
+            if (offset != 0 || size != 20 || source != nullptr) return MYOS_STATUS_BAD_ARGS;
+        } else {
+            if (operation != myos::io::Operation::Read && operation != myos::io::Operation::Write)
+                return MYOS_STATUS_INVALID_OP;
+            if (operation == myos::io::Operation::Write && (read_only_ || source == nullptr))
+                return MYOS_STATUS_DENIED;
+            if (size == 0 || size > MaxTransfer || size % BlockSize != 0 || offset % BlockSize != 0
+                || offset > capacity() || size > capacity() - offset) return MYOS_STATUS_BAD_ARGS;
+        }
         const size_t slot = ticket.slot;
         const uintptr_t header = ArenaAddress + Headers + slot * 32;
-        dma_write<uint32_t>(header, 0); // VIRTIO_BLK_T_IN
+        const uint32_t type = operation == myos::io::Operation::Read ? 0
+            : operation == myos::io::Operation::Write ? 1
+            : operation == myos::io::Operation::Flush ? 4 : 8;
+        dma_write<uint32_t>(header, type);
         dma_write<uint32_t>(header + 4, 0);
-        dma_write<uint64_t>(header + 8, offset / BlockSize);
+        dma_write<uint64_t>(header + 8, operation == myos::io::Operation::Read
+            || operation == myos::io::Operation::Write ? offset / BlockSize : 0);
         dma_write<uint8_t>(header + 16, 0xff);
         const uint16_t head = static_cast<uint16_t>(slot * 3);
         descriptor(head, Iova + Headers + slot * 32, 16, 1, head + 1);
-        descriptor(head + 1, Iova + Data + slot * MaxRead, size, 3, head + 2);
-        descriptor(head + 2, Iova + Headers + slot * 32 + 16, 1, 2, 0);
+        if (operation == myos::io::Operation::Flush) {
+            descriptor(head + 1, Iova + Headers + slot * 32 + 16, 1, 2, 0);
+        } else {
+            if (operation == myos::io::Operation::Write)
+                myos::service::copy(reinterpret_cast<void*>(ArenaAddress + Data + slot * MaxTransfer), source, size);
+            descriptor(head + 1, Iova + Data + slot * MaxTransfer, size,
+                operation == myos::io::Operation::Write ? 1 : 3, head + 2);
+            descriptor(head + 2, Iova + Headers + slot * 32 + 16, 1, 2, 0);
+        }
         dma_write<uint16_t>(ArenaAddress + Available + 4 + (available_ % QueueSize) * 2, head);
         ++available_;
-        slots_[slot] = {ticket, size, true};
+        slots_[slot] = {ticket, size, operation, true};
         ++active_;
         return MYOS_STATUS_OK;
     }
@@ -129,9 +155,15 @@ public:
         const auto& slot = slots_[index];
         if (!slot.active) return MYOS_STATUS_BACKING_FAILED;
         const uint8_t status = dma_read<uint8_t>(ArenaAddress + Headers + index * 32 + 16);
-        if (status > 2 || (status == 0 && written != slot.size + 1)) return MYOS_STATUS_BACKING_FAILED;
-        completion = {slot.ticket, status == 0 ? MYOS_STATUS_OK : MYOS_STATUS_BACKING_FAILED,
-            status == 0 ? slot.size : 0, reinterpret_cast<const uint8_t*>(ArenaAddress + Data + index * MaxRead)};
+        const bool returned_data = slot.operation == myos::io::Operation::Read
+            || slot.operation == myos::io::Operation::Identify;
+        const uint32_t expected = returned_data ? static_cast<uint32_t>(slot.size + 1) : 1;
+        if (status > 2 || (status == 0 && written != expected)) return MYOS_STATUS_BACKING_FAILED;
+        completion = {slot.ticket, status == 0 ? MYOS_STATUS_OK
+            : status == 2 ? MYOS_STATUS_INVALID_OP : MYOS_STATUS_BACKING_FAILED,
+            status == 0 ? slot.size : 0,
+            returned_data
+                ? reinterpret_cast<const uint8_t*>(ArenaAddress + Data + index * MaxTransfer) : nullptr};
         slots_[index] = {};
         --active_;
         ++used_;
@@ -139,6 +171,9 @@ public:
     }
 
     [[nodiscard]] auto acknowledge() noexcept -> myos_status_t {
+        const auto state = myos::io_space_state(space_.selector());
+        if (state.status != MYOS_STATUS_OK) return state.status;
+        if (state.value != MYOS_IO_SPACE_ACTIVE) return MYOS_STATUS_BACKING_FAILED;
         const auto delivered = myos::irq_observe(interrupt_.selector());
         if (delivered.status == MYOS_STATUS_BUSY) return MYOS_STATUS_OK;
         if (delivered.status != MYOS_STATUS_OK) return delivered.status;
@@ -157,7 +192,7 @@ private:
     static constexpr size_t Used = 4096;
     static constexpr size_t Headers = 8192;
     static constexpr size_t Data = 12288;
-    static constexpr size_t ArenaSize = Data + Depth * MaxRead;
+    static constexpr size_t ArenaSize = Data + Depth * MaxTransfer;
     static_assert(Depth * 3 <= QueueSize && Available + QueueSize * 2 + 6 <= Used);
 
     template<typename T> static auto dma_read(uintptr_t address) noexcept -> T {
@@ -232,7 +267,10 @@ private:
         write<uint32_t>(common, 1);
         if ((read<uint32_t>(common + 4) & 3) != 3) return false;
         write<uint32_t>(common, 0);
-        const uint32_t low = read<uint32_t>(common + 4) & (1U << 5); // read-only feature
+        const uint32_t offered = read<uint32_t>(common + 4);
+        const uint32_t low = offered & ((1U << 5) | (1U << 9));
+        read_only_ = (offered & (1U << 5)) != 0;
+        flush_supported_ = (offered & (1U << 9)) != 0;
         write<uint32_t>(common + 8, 0);
         write<uint32_t>(common + 12, low);
         write<uint32_t>(common + 8, 1);
@@ -262,13 +300,20 @@ private:
         return true;
     }
 
-    struct Slot final { myos::io::Ticket ticket{}; size_t size{}; bool active{}; };
+    struct Slot final {
+        myos::io::Ticket ticket{};
+        size_t size{};
+        myos::io::Operation operation{myos::io::Operation::Read};
+        bool active{};
+    };
     Slot slots_[Depth]{};
     size_t active_{};
     uint16_t available_{};
     uint16_t published_{};
     uint16_t used_{};
     uint64_t sectors_{};
+    bool read_only_{};
+    bool flush_supported_{};
     uintptr_t notify_{};
     uintptr_t isr_{};
     myos::cap::OwnedCap space_{};

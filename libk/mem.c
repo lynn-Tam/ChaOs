@@ -49,3 +49,44 @@ int memcmp(const void* lhs, const void* rhs, size_t n) {
     }
     return 0;
 }
+
+size_t strlen(const char* text) {
+    size_t size = 0;
+    while (text[size] != '\0') ++size;
+    return size;
+}
+
+char* strcpy(char* dst, const char* src) {
+    char* out = dst;
+    while ((*dst++ = *src++) != '\0') {}
+    return out;
+}
+
+char* strchr(const char* text, int character) {
+    const char value = (char)character;
+    while (*text != value) {
+        if (*text == '\0') return 0;
+        ++text;
+    }
+    return (char*)text;
+}
+
+size_t strspn(const char* text, const char* accept) {
+    size_t count = 0;
+    for (; text[count] != '\0'; ++count) {
+        const char* match = accept;
+        while (*match != '\0' && *match != text[count]) ++match;
+        if (*match == '\0') break;
+    }
+    return count;
+}
+
+size_t strcspn(const char* text, const char* reject) {
+    size_t count = 0;
+    for (; text[count] != '\0'; ++count) {
+        const char* match = reject;
+        while (*match != '\0' && *match != text[count]) ++match;
+        if (*match != '\0') break;
+    }
+    return count;
+}

@@ -98,8 +98,10 @@ auto handle(arch::TrapContext& context) noexcept -> Disposition {
     } else if (operation >= MYOS_SYS_TERMINAL_QUERY
         && operation <= MYOS_SYS_TERMINAL_OBSERVE_BIND) {
         outcome = handle_terminal(operation, invocation);
-    } else if (operation >= MYOS_SYS_IO_SPACE_BIND
-        && operation <= MYOS_SYS_IO_SPACE_CLOSE) {
+    } else if ((operation >= MYOS_SYS_IO_SPACE_BIND
+        && operation <= MYOS_SYS_IO_SPACE_CLOSE)
+        || operation == MYOS_SYS_DEVICE_INFO
+        || operation == MYOS_SYS_IO_SPACE_WATCH) {
         outcome = handle_io(operation, invocation);
     } else {
         outcome = returned(MYOS_STATUS_INVALID_OP);

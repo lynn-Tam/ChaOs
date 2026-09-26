@@ -4,7 +4,7 @@
 namespace {
 using namespace myos;
 deploy::Program program;
-using Supervisor = deploy::Supervisor<3>;
+using Supervisor = deploy::Supervisor<4>;
 Supervisor supervisor;
 unsigned step{};
 void require(myos_status_t status) noexcept {
@@ -63,6 +63,116 @@ void configured_capacity(myos_cap_t pool, myos_cap_t cspace) noexcept {
     for (auto& event : events) require(object_destroy(event.selector()).status);
 }
 
+void stale_channel(myos_cap_t pool, myos_cap_t cspace) noexcept {
+    const auto old_pool = resource_create_child(pool, 256 * 1024, 64,
+        MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+    require(old_pool.status);
+    const auto terminal = notification_create(pool, 1);
+    require(terminal.status);
+    const auto old = channel_create(old_pool.value, 1, MYOS_CHANNEL_MAX_WORDS, 0, 1);
+    require(old.status);
+    const auto old_sender = channel_mint(old.value, cspace, 1, MYOS_RIGHT_SEND);
+    require(old_sender.status);
+    require(service::send(old_sender.value, {.id = 1}).status);
+    service::Message message;
+    require(service::receive(old.value2, message).status);
+    check(message.id == 1);
+    require(resource_close_async(old_pool.value, terminal.value, 1).status);
+    require(notification_wait(terminal.value).status);
+
+    const auto current = channel_create(pool, 1, MYOS_CHANNEL_MAX_WORDS, 0, 1);
+    require(current.status);
+    const auto current_sender = channel_mint(current.value, cspace, 1, MYOS_RIGHT_SEND);
+    require(current_sender.status);
+    check(service::send(old_sender.value, {.id = 2}, false).status == MYOS_STATUS_BUSY);
+    require(cap_close(old_sender.value).status);
+    check(service::send(old_sender.value, {.id = 2}, false).status == MYOS_STATUS_INVALID_CAP);
+    require(service::send(current_sender.value, {.id = 3}).status);
+    require(service::receive(current.value2, message).status);
+    check(message.id == 3);
+    check(service::receive(current.value2, message, false).status == MYOS_STATUS_WOULD_BLOCK);
+    require(cap_close(old.value).status);
+    require(cap_close(old.value2).status);
+    require(cap_close(old_pool.value).status);
+    require(object_destroy(terminal.value).status);
+    require(cap_close(terminal.value).status);
+    require(cap_close(current_sender.value).status);
+    destroy(current);
+}
+
+void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
+    const auto handoff = channel_create(pool, 4, MYOS_CHANNEL_MAX_WORDS, 1, 1);
+    require(handoff.status);
+    const auto control = channel_mint(handoff.value2, cspace, 1,
+        MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE);
+    require(control.status);
+    const deploy::LaunchSource source[] = {{"handoff", {handoff.value, 0}, {
+        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = MYOS_OBJECT_KIND_CHANNEL, .size = MYOS_CAP_ATTENUATION_SIZE,
+        .rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE,
+        .words = {0, 0, 0, 0}}}};
+    auto next_cap = [&]() noexcept -> cap::OwnedCap {
+        const auto begin = clock_now();
+        require(begin.status);
+        for (;;) {
+            service::Message message{};
+            cap::OwnedCap received;
+            const auto result = service::receive_cap(control.value, message, received);
+            if (result.status == MYOS_STATUS_WOULD_BLOCK) {
+                const auto now = clock_now();
+                require(now.status);
+                check(now.value - begin.value < 1'000'000'000);
+                yield();
+                continue;
+            }
+            require(result.status);
+            check(message.id == 1 && static_cast<bool>(received));
+            return received;
+        }
+    };
+    auto launch = [&]() noexcept -> Supervisor::Handle {
+        myos_status_t status{};
+        auto task = supervisor.launch(program, Supervisor::name("provider"), status,
+            {.sources = source});
+        require(status);
+        check(static_cast<bool>(task));
+        return libk::move(*task);
+    };
+    struct Transfer final { cap::OwnedCap cap; Supervisor::Handle holder; };
+    auto transfer = [&](Supervisor::Handle& provider) noexcept -> Transfer {
+        const Supervisor::Handle* providers[]{&provider};
+        myos_status_t status{};
+        auto holder = supervisor.launch(program, Supervisor::name("export-holder"), status,
+            {.sources = source}, {providers, 1});
+        require(status);
+        check(static_cast<bool>(holder));
+        auto received = next_cap();
+        return {libk::move(received), libk::move(*holder)};
+    };
+
+    auto first = launch();
+    auto old = transfer(first);
+    require(service::send(old.cap.selector(), {.id = 41}).status);
+    service::Message message{};
+    require(service::receive(control.value, message).status);
+    check(message.id == 4);
+    require(service::send(control.value, {.id = 3}).status);
+    check(supervisor.wait(first) == MYOS_STATUS_INTERNAL);
+    check(supervisor.stop(old.holder) == MYOS_STATUS_CANCELED);
+
+    auto second = launch();
+    auto current = transfer(second);
+    check(service::send(old.cap.selector(), {.id = 42}, false).status == MYOS_STATUS_BUSY);
+    require(service::send(current.cap.selector(), {.id = 41}).status);
+    require(service::receive(control.value, message).status);
+    check(message.id == 4);
+    require(service::send(control.value, {.id = 3}).status);
+    check(supervisor.wait(second) == MYOS_STATUS_INTERNAL);
+    check(supervisor.stop(current.holder) == MYOS_STATUS_CANCELED);
+    require(cap_close(control.value).status);
+    destroy(handoff);
+}
+
 }
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
@@ -72,6 +182,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     require(supervisor.add_boot_sources(info));
     const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     configured_capacity(pool, service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
+    stale_channel(pool, service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
+    stale_service(pool, service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
     Clock clock;
     require(clock.open());
     for (unsigned round = 0; round != 9; ++round) {

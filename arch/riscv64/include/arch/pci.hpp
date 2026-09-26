@@ -3,6 +3,7 @@
 #include <core/types.hpp>
 #include <libk/array.hpp>
 #include <libk/expected.hpp>
+#include <libk/inplace_vector.hpp>
 #include <libk/noncopyable.hpp>
 
 namespace arch {
@@ -12,6 +13,8 @@ inline constexpr usize virt_pci_memory = 0x4000'0000;
 inline constexpr usize virt_iommu_base = 0x0301'0000;
 inline constexpr u32 virt_pci_irq_first = 32;
 inline constexpr u32 virt_pci_irq_count = 4;
+// QEMU virt system IOMMU: CQ/FQ/PM/PQ use PLIC sources 36..39.
+inline constexpr u32 virt_iommu_fault_irq = 37;
 
 struct PciBar final {
     usize address{};
@@ -21,17 +24,18 @@ struct PciBar final {
 
 enum class PciError : u8 { Absent, Unsupported, Invalid };
 
-// QEMU virt's isolated block-function topology: one modern virtio-blk endpoint
-// on the root bus. The kernel Device owns this handle;
+// QEMU virt root-bus modern virtio-blk endpoints. The kernel Device owns each
+// handle; BAR addresses are allocated from one platform-wide MMIO window.
 // a userspace driver never receives ECAM authority. All methods require the
 // Device owner's serialization, including across IOSpace lease generations.
 class PciFunction final : private libk::noncopyable {
 public:
+    using Functions = libk::InplaceVector<PciFunction, virt_pci_irq_count>;
     PciFunction(PciFunction&&) noexcept = default;
     auto operator=(PciFunction&&) noexcept -> PciFunction& = default;
 
-    [[nodiscard]] static auto discover_block() noexcept
-        -> libk::Expected<PciFunction, PciError>;
+    [[nodiscard]] static auto discover_blocks(Functions& output) noexcept
+        -> libk::Expected<void, PciError>;
     [[nodiscard]] auto requester() const noexcept -> u16 { return requester_; }
     [[nodiscard]] auto irq_source() const noexcept -> u32 { return irq_source_; }
     [[nodiscard]] auto configuration() const noexcept -> const libk::Array<u32, 64>& {
@@ -54,6 +58,8 @@ public:
 
 private:
     PciFunction() noexcept = default;
+    [[nodiscard]] auto configure_bars(usize& next) noexcept
+        -> libk::Expected<void, PciError>;
     usize config_{};
     usize status_{};
     u16 requester_{};

@@ -143,8 +143,10 @@ struct Policy final {
     case MYOS_SYS_IRQ_CREATE:
     case MYOS_SYS_IO_SPACE_CREATE:
     case MYOS_SYS_IO_SPACE_BIND:
+    case MYOS_SYS_IO_SPACE_WATCH:
     case MYOS_SYS_IO_SPACE_STATE:
     case MYOS_SYS_IO_SPACE_INFO:
+    case MYOS_SYS_DEVICE_INFO:
     case MYOS_SYS_IO_SPACE_BAR:
     case MYOS_SYS_IO_SPACE_IRQ:
     case MYOS_SYS_IO_SPACE_CLOSE:

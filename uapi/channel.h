@@ -38,14 +38,3 @@ struct myos_channel_message {
     myos_word_t sender_badge;
     myos_word_t sequence;
 };
-
-struct myos_channel_config {
-    uint32_t version;
-    uint32_t flags;
-    uint32_t queue_capacity;
-    uint32_t max_words;
-    uint32_t max_caps;
-    uint32_t waiter_capacity; // Legacy layout field; no per-Channel waiter quota.
-    uint32_t relation_capacity;
-    uint32_t reserved;
-};

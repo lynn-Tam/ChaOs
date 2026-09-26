@@ -33,7 +33,8 @@ public:
         if (info->magic != MYOS_BOOTSTRAP_MAGIC
             || info->major != MYOS_BOOTSTRAP_MAJOR
             || info->minor < MYOS_BOOTSTRAP_MINOR
-            || info->size != sizeof(myos_bootstrap_info)
+            || info->size < sizeof(myos_bootstrap_info)
+            || info->size > size
             || info->cap_count > MYOS_BOOTSTRAP_MAX_CAPS
             || info->import_count > MYOS_BOOTSTRAP_MAX_IMPORTS
             || info->reserved != 0 || !valid_arguments(info->arguments)) {
@@ -106,6 +107,36 @@ public:
     [[nodiscard]] auto selector(Import requested) const noexcept -> myos_cap_t {
         const auto reference = cap(requested);
         return reference ? reference->selector : 0;
+    }
+
+    // Initial hardware authority is a finite boot inventory. Each entry is
+    // a distinct Device grant; DEVICE_INFO remains the identity source.
+    [[nodiscard]] auto device_count() const noexcept -> size_t {
+        if (!valid()) return 0;
+        size_t count{};
+        for (uint32_t i = 0; i < info_->import_count; ++i)
+            if (info_->imports[i].protocol == MYOS_BOOTSTRAP_DEVICE_PROTOCOL
+                && info_->imports[i].object_kind == MYOS_OBJECT_KIND_DEVICE
+                && info_->imports[i].major == 1) ++count;
+        return count;
+    }
+    [[nodiscard]] auto device_import(size_t ordinal) const noexcept
+        -> const myos_bootstrap_import* {
+        if (!valid()) return nullptr;
+        for (uint32_t i = 0; i < info_->import_count; ++i) {
+            const auto& entry = info_->imports[i];
+            if (entry.protocol == MYOS_BOOTSTRAP_DEVICE_PROTOCOL
+                && entry.object_kind == MYOS_OBJECT_KIND_DEVICE
+                && entry.major == 1) {
+                if (ordinal == 0) return &entry;
+                --ordinal;
+            }
+        }
+        return nullptr;
+    }
+    [[nodiscard]] auto device(size_t ordinal) const noexcept -> myos_cap_t {
+        const auto* entry = device_import(ordinal);
+        return entry == nullptr ? 0 : entry->handle;
     }
 
     [[nodiscard]] constexpr auto cpu_count() const noexcept -> uint32_t {

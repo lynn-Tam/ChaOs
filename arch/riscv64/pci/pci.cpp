@@ -30,33 +30,52 @@ auto config(u16 requester) noexcept -> usize {
 }
 } // namespace
 
-auto PciFunction::discover_block() noexcept
-    -> libk::Expected<PciFunction, PciError> {
-    PciFunction function{};
-    bool found{};
-    for (u16 slot = 0; slot < 32; ++slot) {
-        const u16 requester = static_cast<u16>(slot << 3);
-        const usize candidate = config(requester);
-        if (read<u32>(candidate) != 0x1042'1af4) continue;
-        if (found || read<u8>(candidate + 14) != 0)
-            return libk::unexpected(PciError::Unsupported);
-        found = true;
-        function.requester_ = requester;
-        function.config_ = candidate;
-    }
-    if (!found) return libk::unexpected(PciError::Absent);
-
-    const u8 pin = read<u8>(function.config_ + 0x3d);
-    if (pin == 0 || pin > 4) return libk::unexpected(PciError::Unsupported);
-    // QEMU virt root-bus interrupt-map swizzles INTA..INTD by slot.
-    function.irq_source_ = virt_pci_irq_first
-        + ((function.requester_ >> 3) + pin - 1) % virt_pci_irq_count;
-
-    function.disable_dma();
-    write<u16>(function.config_ + Command, InterruptDisable);
+auto PciFunction::discover_blocks(Functions& output) noexcept
+    -> libk::Expected<void, PciError> {
+    if (!output.empty()) return libk::unexpected(PciError::Invalid);
     usize next = virt_pci_memory;
-    for (usize index = 0; index < function.bars_.size(); ++index) {
-        const usize reg = function.config_ + 0x10 + 4 * index;
+    for (u16 slot = 0; slot < 32; ++slot) {
+        const usize primary = config(static_cast<u16>(slot << 3));
+        if (read<u16>(primary) == 0xffff) continue;
+        const u8 functions = (read<u8>(primary + 14) & 0x80) != 0 ? 8 : 1;
+        for (u16 number = 0; number < functions; ++number) {
+            const u16 requester = static_cast<u16>((slot << 3) | number);
+            const usize candidate = config(requester);
+            if (read<u16>(candidate) == 0xffff) continue;
+            // Unknown root-bus functions remain quiescent and default-denied
+            // by the IOMMU until a driver and reset protocol are supported.
+            write<u16>(candidate + Command, InterruptDisable);
+            if (read<u32>(candidate) != 0x1042'1af4) continue;
+            if ((read<u8>(candidate + 14) & 0x7f) != 0)
+                return libk::unexpected(PciError::Unsupported);
+            PciFunction function{};
+            function.requester_ = requester;
+            function.config_ = candidate;
+            const u8 pin = read<u8>(candidate + 0x3d);
+            if (pin == 0 || pin > 4)
+                return libk::unexpected(PciError::Unsupported);
+            // QEMU virt root-bus interrupt-map swizzles INTA..INTD by slot.
+            function.irq_source_ = virt_pci_irq_first
+                + (slot + pin - 1) % virt_pci_irq_count;
+            for (const auto& existing : output)
+                if (existing.irq_source() == function.irq_source_)
+                    return libk::unexpected(PciError::Unsupported);
+            if (output.size() == output.capacity())
+                return libk::unexpected(PciError::Unsupported);
+            auto configured = function.configure_bars(next);
+            if (!configured) return configured;
+            if (!output.try_push_back(libk::move(function)))
+                return libk::unexpected(PciError::Unsupported);
+        }
+    }
+    return output.empty() ? libk::Expected<void, PciError>{libk::unexpected(PciError::Absent)}
+                          : libk::Expected<void, PciError>{libk::expected()};
+}
+
+auto PciFunction::configure_bars(usize& next) noexcept
+    -> libk::Expected<void, PciError> {
+    for (usize index = 0; index < bars_.size(); ++index) {
+        const usize reg = config_ + 0x10 + 4 * index;
         const u32 original = read<u32>(reg);
         if ((original & 1) != 0) return libk::unexpected(PciError::Unsupported);
         const bool wide = (original & 6) == 4;
@@ -81,7 +100,7 @@ auto PciFunction::discover_block() noexcept
         const usize aligned = (next + allocation - 1) & ~(allocation - 1);
         if (aligned > virt_pci_memory + WindowSize - allocation)
             return libk::unexpected(PciError::Unsupported);
-        function.bars_[index] = PciBar{
+        bars_[index] = PciBar{
             .address = aligned, .size = static_cast<usize>(extent),
             .attributes = original & 15};
         write<u32>(reg, static_cast<u32>(aligned) | (original & 15));
@@ -92,14 +111,14 @@ auto PciFunction::discover_block() noexcept
         next = aligned + allocation;
     }
 
-    if ((read<u16>(function.config_ + 6) & 0x10) == 0)
+    if ((read<u16>(config_ + 6) & 0x10) == 0)
         return libk::unexpected(PciError::Unsupported);
-    u8 capability = read<u8>(function.config_ + 0x34);
+    u8 capability = read<u8>(config_ + 0x34);
     usize status{};
     for (usize count = 0; capability != 0 && count < 48; ++count) {
         if (capability < 0x40 || (capability & 3) != 0)
             return libk::unexpected(PciError::Invalid);
-        const usize cap = function.config_ + capability;
+        const usize cap = config_ + capability;
         const u8 id = read<u8>(cap);
         if (id == 9 && read<u8>(cap + 3) == 1) {
             if (capability > 0xf0 || read<u8>(cap + 2) < 16 || status != 0)
@@ -107,25 +126,25 @@ auto PciFunction::discover_block() noexcept
             const u8 bar = read<u8>(cap + 4);
             const u32 offset = read<u32>(cap + 8);
             const u32 length = read<u32>(cap + 12);
-            if (bar >= function.bars_.size() || length < 21
-                || offset > function.bars_[bar].size
-                || length > function.bars_[bar].size - offset)
+            if (bar >= bars_.size() || length < 21
+                || offset > bars_[bar].size
+                || length > bars_[bar].size - offset)
                 return libk::unexpected(PciError::Invalid);
-            status = Alias + function.bars_[bar].address + offset + 20;
+            status = Alias + bars_[bar].address + offset + 20;
         }
         capability = read<u8>(cap + 1);
     }
     if (capability != 0 || status == 0)
         return libk::unexpected(PciError::Unsupported);
-    function.status_ = status;
-    write<u16>(function.config_ + Command, MemoryDecode | InterruptDisable);
+    status_ = status;
+    write<u16>(config_ + Command, MemoryDecode | InterruptDisable);
     // Immutable discovery metadata for userspace. BAR address authority is
     // exported separately through bounded MemoryObjects.
-    for (usize index = 0; index < function.configuration_.size(); ++index)
-        function.configuration_[index] = read<u32>(function.config_ + index * 4);
-    for (usize index = 0; index < function.bars_.size(); ++index)
-        function.configuration_[4 + index] = function.bars_[index].attributes;
-    return libk::expected(libk::move(function));
+    for (usize index = 0; index < configuration_.size(); ++index)
+        configuration_[index] = read<u32>(config_ + index * 4);
+    for (usize index = 0; index < bars_.size(); ++index)
+        configuration_[4 + index] = bars_[index].attributes;
+    return libk::expected();
 }
 
 auto PciFunction::config32(u16 offset) const noexcept -> u32 {

@@ -70,6 +70,7 @@ enum class LockClass : u8 {
     IrqRegistry,
     Terminal,
     Device,
+    Iommu,
     IoSpace,
     IoWork,
     Count,

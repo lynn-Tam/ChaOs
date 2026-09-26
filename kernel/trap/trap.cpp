@@ -92,9 +92,9 @@ void finish_thread_page_fault(
         event.fault_addr()));
     // One-way diagnostic projection; it must never participate in fault policy.
     kernel::diag::console::print<
-        "user: contained fault address={:#x} after syscalls={} "
+        "user: contained fault pc={:#x} address={:#x} after syscalls={} "
         "active-vspace-cpus={} fault-kind={}\n">(
-        event.fault_addr(), thread.user_syscalls(),
+        event.pc(), event.fault_addr(), thread.user_syscalls(),
         thread.effective_binding().vspace()->active_cpus().size(),
         static_cast<u8>(kind));
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
@@ -252,9 +252,9 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
                 event.pc(),
                 event.fault_addr()));
             kernel::diag::console::print<
-                "user: contained fault address={:#x} after syscalls={} "
+                "user: contained fault pc={:#x} address={:#x} after syscalls={} "
                 "active-vspace-cpus={}\n">(
-                event.fault_addr(), thread->user_syscalls(),
+                event.pc(), event.fault_addr(), thread->user_syscalls(),
                 execution->binding().vspace()->active_cpus().size());
         } else {
             static_cast<void>(vproc->terminal().claim(

@@ -123,7 +123,7 @@ constexpr Rights irq_rights = Rights::of(
 }
 
 template<object::ObjectKind Kind>
-[[nodiscard]] auto compose_as(
+[[nodiscard, gnu::noinline]] auto compose_as(
     GrantCeiling ceiling,
     CapView view) noexcept
     -> libk::Expected<EffectiveAuthority, PolicyError> {
@@ -435,44 +435,48 @@ auto compose(
     GrantCeiling ceiling,
     CapView view) noexcept
     -> libk::Expected<EffectiveAuthority, PolicyError> {
+    using Compose = libk::Expected<EffectiveAuthority, PolicyError>
+        (*)(GrantCeiling, CapView) noexcept;
+    Compose selected{};
     switch (kind) {
     case object::ObjectKind::IoSpace:
-        return compose_as<object::ObjectKind::IoSpace>(ceiling, view);
+        selected = compose_as<object::ObjectKind::IoSpace>; break;
     case object::ObjectKind::Device:
-        return compose_as<object::ObjectKind::Device>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Device>; break;
     case object::ObjectKind::Thread:
-        return compose_as<object::ObjectKind::Thread>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Thread>; break;
     case object::ObjectKind::Vproc:
-        return compose_as<object::ObjectKind::Vproc>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Vproc>; break;
     case object::ObjectKind::SchedulingContext:
-        return compose_as<object::ObjectKind::SchedulingContext>(ceiling, view);
+        selected = compose_as<object::ObjectKind::SchedulingContext>; break;
     case object::ObjectKind::SchedulingDomain:
-        return compose_as<object::ObjectKind::SchedulingDomain>(ceiling, view);
+        selected = compose_as<object::ObjectKind::SchedulingDomain>; break;
     case object::ObjectKind::CSpace:
-        return compose_as<object::ObjectKind::CSpace>(ceiling, view);
+        selected = compose_as<object::ObjectKind::CSpace>; break;
     case object::ObjectKind::MemoryObject:
-        return compose_as<object::ObjectKind::MemoryObject>(ceiling, view);
+        selected = compose_as<object::ObjectKind::MemoryObject>; break;
     case object::ObjectKind::VSpace:
-        return compose_as<object::ObjectKind::VSpace>(ceiling, view);
+        selected = compose_as<object::ObjectKind::VSpace>; break;
     case object::ObjectKind::ResourcePool:
-        return compose_as<object::ObjectKind::ResourcePool>(ceiling, view);
+        selected = compose_as<object::ObjectKind::ResourcePool>; break;
     case object::ObjectKind::Notification:
-        return compose_as<object::ObjectKind::Notification>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Notification>; break;
     case object::ObjectKind::Tunnel:
-        return compose_as<object::ObjectKind::Tunnel>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Tunnel>; break;
     case object::ObjectKind::Endpoint:
-        return compose_as<object::ObjectKind::Endpoint>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Endpoint>; break;
     case object::ObjectKind::Channel:
-        return compose_as<object::ObjectKind::Channel>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Channel>; break;
     case object::ObjectKind::Pager:
-        return compose_as<object::ObjectKind::Pager>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Pager>; break;
     case object::ObjectKind::Irq:
-        return compose_as<object::ObjectKind::Irq>(ceiling, view);
+        selected = compose_as<object::ObjectKind::Irq>; break;
     case object::ObjectKind::Invalid:
     case object::ObjectKind::Count:
         return libk::unexpected(PolicyError::UnsupportedKind);
     }
-    return libk::unexpected(PolicyError::UnsupportedKind);
+    if (selected == nullptr) return libk::unexpected(PolicyError::UnsupportedKind);
+    return selected(ceiling, view);
 }
 
 auto attenuates(

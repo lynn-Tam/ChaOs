@@ -1917,11 +1917,15 @@ private:
                         return fail(Error::InvalidReference);
                     }
                     uint64_t kind{};
+                    uint64_t flags{};
                     if (!value(MYOS_DEPLOY_TABLE_DEPENDENCY, dependency,
-                               MYOS_DEPLOY_DEPENDENCY_KIND, 2, kind)) {
+                               MYOS_DEPLOY_DEPENDENCY_KIND, 2, kind)
+                        || !value(MYOS_DEPLOY_TABLE_DEPENDENCY, dependency,
+                                  MYOS_DEPLOY_DEPENDENCY_FLAGS, 2, flags)) {
                         return fail(Error::InvalidReference);
                     }
                     if (kind == MYOS_DEPLOY_DEPENDENCY_REQUIRED
+                        && (flags & (MYOS_DEPLOY_DEPENDENCY_STARTUP | MYOS_DEPLOY_DEPENDENCY_READINESS))
                         && owner == task && !complete[target]) {
                         blocked = true;
                         break;

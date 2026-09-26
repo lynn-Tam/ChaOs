@@ -168,6 +168,11 @@ struct FakeBackend final {
         return MYOS_STATUS_OK;
     }
 
+    [[nodiscard]] static auto memory_populate(
+        myos::cap::CapRef, myos_word_t) noexcept -> myos_status_t {
+        return MYOS_STATUS_OK;
+    }
+
     [[nodiscard]] static auto memory_write(
         void* destination,
         const uint8_t* source,

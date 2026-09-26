@@ -40,6 +40,10 @@ inline auto admit(const deploy::TaskPlanView& task) noexcept -> bool {
             myos_word_t rights = MYOS_RIGHT_SEND;
             if (named(name, bootstrap::imports::Files.name)) {
                 contract = &bootstrap::imports::Files; source = "files.directory";
+            } else if (named(name, bootstrap::imports::Store.name)) {
+                contract = &bootstrap::imports::Store; source = "store.directory";
+            } else if (named(name, bootstrap::imports::StoreRead.name)) {
+                contract = &bootstrap::imports::StoreRead; source = "store.read.directory";
             } else if (named(name, bootstrap::imports::Stdin.name)) {
                 contract = &bootstrap::imports::Stdin; source = "stdin"; rights = MYOS_RIGHT_RECEIVE;
             } else if (named(name, bootstrap::imports::Stdout.name)) {

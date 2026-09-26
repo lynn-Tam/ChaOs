@@ -1,10 +1,12 @@
 #include "kernel/syscall/internal.hpp"
 
 #include <io/space.hpp>
+#include <ipc/notification.hpp>
 #include <ipc/buffer.hpp>
 #include <object/io_space_pool.hpp>
 #include <object/device_pool.hpp>
 #include <object/memory_pool.hpp>
+#include <object/notification_pool.hpp>
 #include <uapi/io.h>
 #include <uapi/syscall.h>
 
@@ -17,6 +19,7 @@ static_assert(static_cast<u8>(io::SpaceState::Active) == MYOS_IO_SPACE_ACTIVE);
 static_assert(static_cast<u8>(io::SpaceState::Closing) == MYOS_IO_SPACE_CLOSING);
 static_assert(static_cast<u8>(io::SpaceState::Closed) == MYOS_IO_SPACE_CLOSED);
 static_assert(static_cast<u8>(io::SpaceState::Failed) == MYOS_IO_SPACE_FAILED);
+static_assert(static_cast<u8>(io::SpaceState::Faulted) == MYOS_IO_SPACE_FAULTED);
 
 auto status(io::SpaceError error) noexcept -> myos_status_t {
     switch (error) {
@@ -47,6 +50,19 @@ auto bind(Invocation& invocation, cap::Resolved<io::Space>& space) noexcept -> R
     return returned(bound ? MYOS_STATUS_OK : status(bound.error()));
 }
 
+auto watch(Invocation& invocation, io::Space& space) noexcept -> Result {
+    auto notification = invocation.cspace.resolve<ipc::Notification>(
+        handle_of(invocation.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
+    if (!notification) return returned(cap_status(notification.error()));
+    const auto authority = notification.value().authority();
+    const auto* data = libk::get_if<cap::NotificationAuthority>(&authority.data);
+    const u64 badge = invocation.trap.arg(2);
+    if (data == nullptr || badge == 0 || data->badge != badge)
+        return returned(MYOS_STATUS_BAD_ARGS);
+    const auto result = space.watch(notification.value().object(), badge);
+    return returned(result ? MYOS_STATUS_OK : status(result.error()));
+}
+
 auto info(Invocation& invocation, io::Space& space) noexcept -> Result {
     auto snapshot = space.info();
     if (!snapshot) return returned(status(snapshot.error()));
@@ -65,6 +81,27 @@ auto info(Invocation& invocation, io::Space& space) noexcept -> Result {
     return returned(MYOS_STATUS_OK);
 }
 
+auto device_info(Invocation& invocation) noexcept -> Result {
+    auto device = invocation.cspace.resolve<io::Device>(
+        handle_of(invocation.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!device) return returned(cap_status(device.error()));
+    const auto snapshot = device.value()->info();
+    myos_device_info output{};
+    output.version = MYOS_DEVICE_INFO_VERSION;
+    output.requester = snapshot.requester;
+    for (usize index = 0; index < 64; ++index)
+        output.configuration[index] = snapshot.configuration[index];
+    for (usize index = 0; index < 6; ++index)
+        output.bar_sizes[index] = snapshot.bar_sizes[index];
+    auto* buffer = invocation.target.ipc_buffer();
+    if (buffer == nullptr) return returned(MYOS_STATUS_BAD_ARGS);
+    auto access = buffer->access();
+    if (!access || !access.value().write(invocation.trap.arg(1),
+        {reinterpret_cast<const byte*>(&output), sizeof(output)}))
+        return returned(MYOS_STATUS_BAD_ARGS);
+    return returned(MYOS_STATUS_OK);
+}
+
 auto install(Invocation& invocation,
     libk::Expected<cap::GrantRef, io::SpaceError>&& exported) noexcept -> Result {
     if (!exported) return returned(status(exported.error()));
@@ -79,6 +116,7 @@ auto install(Invocation& invocation,
 } // namespace
 
 auto handle_io(usize operation, Invocation& invocation) noexcept -> Result {
+    if (operation == MYOS_SYS_DEVICE_INFO) return device_info(invocation);
     const auto right = operation == MYOS_SYS_IO_SPACE_STATE || operation == MYOS_SYS_IO_SPACE_INFO
         ? cap::Right::Inspect : operation == MYOS_SYS_IO_SPACE_CLOSE ? cap::Right::Close : cap::Right::Connect;
     auto space = invocation.cspace.resolve<io::Space>(handle_of(invocation.trap.arg(0)),
@@ -86,6 +124,7 @@ auto handle_io(usize operation, Invocation& invocation) noexcept -> Result {
     if (!space) return returned(cap_status(space.error()));
     switch (operation) {
     case MYOS_SYS_IO_SPACE_BIND: return bind(invocation, space.value());
+    case MYOS_SYS_IO_SPACE_WATCH: return watch(invocation, space.value().object());
     case MYOS_SYS_IO_SPACE_STATE: return returned(MYOS_STATUS_OK, static_cast<u8>(space.value()->state()));
     case MYOS_SYS_IO_SPACE_INFO: return info(invocation, space.value().object());
     case MYOS_SYS_IO_SPACE_BAR: return install(invocation, space.value()->bar(invocation.trap.arg(1)));

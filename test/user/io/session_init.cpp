@@ -16,12 +16,22 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.load(program, info));
     supervisor.open(info);
     service::require(supervisor.add_boot_sources(info));
-    service::require(supervisor.add("block.device", service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE),
+    service::require(supervisor.add("block.device", service::initial_device(info),
         MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONNECT));
     const auto pair = channel_create(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
         1, MYOS_CHANNEL_MAX_WORDS, 4, 2);
     service::require(pair.status);
     cap::OwnedCap first{{pair.value, 0}}, second{{pair.value2, 0}};
+    // Exercise the root execution's registered IPC page before clients start.
+    // A user mapping alone would leave CHANNEL_TRY_RECV returning BAD_ARGS.
+    const auto probe = channel_mint(first.selector(),
+        service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), 1, MYOS_RIGHT_RECEIVE);
+    service::require(probe.status);
+    cap::OwnedCap probe_owner{{probe.value, 0}};
+    service::Message empty{};
+    if (service::receive(probe_owner.selector(), empty, false).status != MYOS_STATUS_WOULD_BLOCK)
+        exit(MYOS_STATUS_INTERNAL);
+    probe_owner = {};
     constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE;
     service::require(supervisor.add("block.client", pair.value, MYOS_OBJECT_KIND_CHANNEL, rights, 0));
     service::require(supervisor.add("block.server", pair.value2, MYOS_OBJECT_KIND_CHANNEL, rights, 1));

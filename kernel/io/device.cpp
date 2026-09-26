@@ -10,6 +10,14 @@ Device::~Device() noexcept {
     KASSERT(!reserved_);
 }
 
+auto Device::info() const noexcept -> DeviceInfo {
+    DeviceInfo snapshot{.configuration = function_.configuration(),
+        .requester = function_.requester()};
+    for (usize i = 0; i < snapshot.bar_sizes.size(); ++i)
+        snapshot.bar_sizes[i] = function_.bars()[i].size;
+    return snapshot;
+}
+
 auto Device::acquire(void* context, Stop stop) noexcept -> libk::optional<DeviceLease> {
     sync::IrqLockGuard guard{lock_};
     if (reserved_ || retired_) return libk::nullopt;
@@ -24,7 +32,12 @@ void Device::retire() noexcept {
     sync::IrqLockGuard guard{lock_};
     if (retired_) return;
     retired_ = true;
-    if (stop_) stop_(context_);
+    if (stop_) stop_(context_, false);
+}
+
+void Device::signal_fault() noexcept {
+    sync::IrqLockGuard guard{lock_};
+    if (stop_) stop_(context_, true);
 }
 
 void Device::release() noexcept {
@@ -70,7 +83,7 @@ auto DeviceLease::configuration() const noexcept -> const libk::Array<u32, 64>& 
 
 auto DeviceLease::take_fault() noexcept -> libk::optional<arch::IoFault> {
     KASSERT(device_ != nullptr);
-    return device_->iommu_.take_fault();
+    return device_->iommu_.take_fault(device_->requester());
 }
 
 auto DeviceLease::deadline(u64 nanoseconds) noexcept -> bool {
@@ -91,12 +104,12 @@ void DeviceLease::open(arch::IoRoot&& root) noexcept {
     root_.emplace(libk::move(root));
     state_ = State::Opening;
     if (!deadline(1'000'000'000)) return;
-    const auto issued = device_->iommu_.replace(root_->page());
-    if (!issued) {
+    const auto issued = device_->iommu_.replace(device_->requester(), root_->page());
+    if (!issued && issued.error() != arch::IommuError::Busy) {
         fail();
         return;
     }
-    ticket_ = issued.value();
+    if (issued) ticket_ = issued.value();
 }
 
 void DeviceLease::reset_device() noexcept {
@@ -126,6 +139,19 @@ auto DeviceLease::poll() noexcept -> State {
     case State::Opening:
     case State::ClosingOpening:
     case State::Invalidating: {
+        if (ticket_ == 0) {
+            if (state_ == State::ClosingOpening) {
+                reset_device();
+                break;
+            }
+            const auto issued = device_->iommu_.replace(device_->requester(), root_->page());
+            if (issued) ticket_ = issued.value();
+            else if (issued.error() != arch::IommuError::Busy) fail();
+            if (ticket_ == 0) {
+                if (device_->clock_.now() >= deadline_) fail();
+                break;
+            }
+        }
         const auto completion = device_->iommu_.poll(ticket_);
         if (completion == arch::IoStatus::Failed) {
             fail();
@@ -137,7 +163,9 @@ auto DeviceLease::poll() noexcept -> State {
         } else if (state_ == State::ClosingOpening) {
             reset_device();
         } else {
-            if (device_->iommu_.clear_faults() != arch::IoStatus::Complete) {
+            const auto cleared = device_->iommu_.clear_faults(device_->requester());
+            if (cleared == arch::IoStatus::Pending) break;
+            if (cleared == arch::IoStatus::Failed) {
                 fail();
                 break;
             }
@@ -151,11 +179,13 @@ auto DeviceLease::poll() noexcept -> State {
             if (device_->clock_.now() >= deadline_) fail();
             break;
         }
-        if (const auto issued = device_->iommu_.replace(libk::nullopt)) {
+        if (const auto issued = device_->iommu_.replace(device_->requester(), libk::nullopt)) {
             ticket_ = issued.value();
             state_ = State::Invalidating;
             static_cast<void>(deadline(1'000'000'000));
-        } else {
+        } else if (issued.error() != arch::IommuError::Busy) {
+            fail();
+        } else if (device_->clock_.now() >= deadline_) {
             fail();
         }
         break;

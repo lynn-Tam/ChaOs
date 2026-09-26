@@ -16,6 +16,6 @@ enum class TimebaseError : u8 {
 using TimebaseResult = libk::Expected<u64, TimebaseError>;
 
 [[nodiscard]] auto parse_timebase_frequency(
-    const kernel::boot::fdt::FDT_View& view) noexcept -> TimebaseResult;
+    const Fdt& tree) noexcept -> TimebaseResult;
 
 } // namespace kernel::boot

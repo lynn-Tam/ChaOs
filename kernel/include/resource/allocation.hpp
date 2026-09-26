@@ -56,6 +56,7 @@ private:
     execution::Stop stop_;
     Allocation* previous_{};
     Allocation* next_{};
+    Allocation* revoke_retry_next_{};
     AllocationState state_{AllocationState::Empty};
     bool independent_close_{};
 };

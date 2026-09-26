@@ -33,6 +33,7 @@ class Program final : private libk::noncopyable_nonmovable {
     PlanSet<1> plans_{};
     DeploymentPlan plan_{};
 public:
+    auto plan() const noexcept -> const DeploymentPlan& { return plan_; }
     auto close() noexcept -> myos_status_t {
         if (plan_.borrowed()) return MYOS_STATUS_BUSY;
         plan_ = {};
@@ -81,6 +82,9 @@ public:
         // Borrowed receive authority supplied by the caller. TaskSpace retains
         // only Signal for terminal publication; it cannot receive this event.
         myos_cap_t events{};
+        PlanTaskId plan_task{};
+        // Checked identities only; the provider TaskRecord owns registrations.
+        AuthorityId exports[MYOS_DEPLOY_TASK_EXPORT_MAX]{};
         auto token() const noexcept -> uint64_t {
             return (uint64_t{id.generation} << 32) | id.slot;
         }
@@ -139,7 +143,47 @@ public:
                    MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT,
                    0, Window::round_size(info.bundle_size()) / 4096, MYOS_VM_READ, MYOS_VM_NORMAL);
     }
-    auto launch(Program& program, ByteView name, myos_status_t& status, LaunchOptions options = {}) noexcept -> libk::optional<Handle> {
+    // Validate the whole graph before publishing any task. Names select an
+    // already authorized root or a declared provider export; they grant no rights.
+    auto validate_graph(const Program& program) const noexcept -> myos_status_t {
+        const auto& plan = program.plan_;
+        if (plan.task_count() == 0 || plan.task_count() > Capacity) return MYOS_STATUS_BAD_ARGS;
+        for (uint32_t t = 0; t < plan.task_count(); ++t) {
+            const auto& task = *plan.task(t);
+            // This executor currently uses start readiness. Explicit readiness
+            // must gain an event-driven observation path before admission.
+            if (task.readiness == MYOS_DEPLOY_READINESS_EXPLICIT) return MYOS_STATUS_BAD_ARGS;
+            for (uint32_t x = 0; x < task.executions.count; ++x)
+                if (!source(plan.symbol(plan.execution(task.executions.first + x)->domain)).valid())
+                    return MYOS_STATUS_DENIED;
+            for (uint32_t i = 0; i < task.imports.count; ++i) {
+                const auto& imported = *plan.import(task.imports.first + i);
+                if (imported.source_class != MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY) continue;
+                const auto label = plan.symbol(imported.source);
+                size_t matches = source(label).valid() ? 1 : 0;
+                for (uint32_t p = 0; p < plan.task_count(); ++p) {
+                    const auto& provider = *plan.task(p);
+                    for (uint32_t e = 0; e < provider.exports.count; ++e) {
+                        const auto& exported = *plan.export_record(provider.exports.first + e);
+                        if (!plan.symbol(exported.key).equals(label)) continue;
+                        bool required{};
+                        for (uint32_t d = 0; d < task.dependencies.count; ++d) {
+                            const auto& edge = *plan.dependency(task.dependencies.first + d);
+                            if (edge.target == p && edge.kind == MYOS_DEPLOY_DEPENDENCY_REQUIRED
+                                && (edge.flags & (MYOS_DEPLOY_DEPENDENCY_STARTUP | MYOS_DEPLOY_DEPENDENCY_READINESS))) required = true;
+                        }
+                        if (!required || exported.source_class != MYOS_DEPLOY_EXPORT_PREPARED_KEY)
+                            return MYOS_STATUS_DENIED;
+                        ++matches;
+                    }
+                }
+                if (matches != 1) return MYOS_STATUS_DENIED;
+            }
+        }
+        return MYOS_STATUS_OK;
+    }
+    auto launch(Program& program, ByteView name, myos_status_t& status, LaunchOptions options = {},
+                libk::Span<const Handle*> providers = {}) noexcept -> libk::optional<Handle> {
         status = MYOS_STATUS_BAD_ARGS;
         const auto index = program.plan_.find_task(name);
         auto lease = program.plan_.lease();
@@ -164,6 +208,17 @@ public:
             const auto& import = *task.import(i);
             if (import.source_class == MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY) {
                 bindings.imports[i] = source(task.symbol(import.source));
+                for (const auto* provider : providers) {
+                    if (provider == nullptr || provider->plan_task.plan != task.id.plan
+                        || table_.tag(provider->id) != TaskSlotTag::Record) continue;
+                    const auto* row = program.plan_.task(provider->plan_task.index);
+                    for (uint32_t e = 0; e < row->exports.count; ++e) {
+                        const auto& exported = *program.plan_.export_record(row->exports.first + e);
+                        if (!program.plan_.symbol(exported.key).equals(task.symbol(import.source))) continue;
+                        if (bindings.imports[i].valid()) { status = MYOS_STATUS_BAD_ARGS; return libk::nullopt; }
+                        bindings.imports[i] = provider->exports[e];
+                    }
+                }
                 for (size_t s = 0; s < options.sources.size(); ++s)
                     if (task.symbol(import.source).equals(Supervisor::name(options.sources[s].name)))
                         bindings.imports[i] = overrides[s];
@@ -190,6 +245,17 @@ public:
         if (status != MYOS_STATUS_OK) {
             checked(supervision::close_failed(table_, handle.id, status, builder, handle.receiver));
             return libk::nullopt;
+        }
+        handle.plan_task = task.id;
+        for (uint32_t e = 0; e < task.row()->exports.count; ++e) {
+            const auto exported = table_.register_prepared_export(handle.id, e, authorities_);
+            if (!exported) {
+                status = MYOS_STATUS_DENIED;
+                checked(table_.begin_close(handle.id, CloseReason::ConstructionFailure, status));
+                checked(supervision::take_completion(table_, handle.id, CloseReason::ConstructionFailure, status, handle.receiver));
+                return libk::nullopt;
+            }
+            handle.exports[e] = *exported;
         }
         status = table_.start(handle.id);
         if (status != MYOS_STATUS_OK) {

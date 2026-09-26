@@ -1,0 +1,163 @@
+#pragma once
+
+#include <user/lib/service_graph.hpp>
+#include <user/lib/supervisor.hpp>
+
+namespace myos::deploy {
+
+// Policy worksets contain desired recovery, never a copy of TaskTable state.
+// One graph owner serializes construction, observation and connection rebinding.
+template<size_t Capacity, size_t Authorities = 16>
+class ServiceSupervisor final {
+    using Tasks = Supervisor<Capacity, Authorities>;
+    Tasks& supervisor_;
+    Program& program_;
+    myos_cap_t events_;
+    libk::optional<typename Tasks::Handle> tasks_[Capacity];
+    uint32_t order_[Capacity]{};
+    bool recovering_[Capacity]{};
+    bool disabled_[Capacity]{};
+    bool needs_poll_{};
+    uint64_t restart_at_{};
+    // Rate-limit repeated crashes without spinning or replaying old requests.
+    static constexpr uint64_t RestartDelay = 100'000'000;
+
+    auto launch(uint32_t i) noexcept -> myos_status_t {
+        const auto& plan = program_.plan();
+        const auto& row = *plan.task(i);
+        const typename Tasks::Handle* providers[Capacity]{};
+        bool included[Capacity]{};
+        size_t count{};
+        for (uint32_t d = 0; d < row.dependencies.count; ++d) {
+            const auto& edge = *plan.dependency(row.dependencies.first + d);
+            if (tasks_[edge.target] && !included[edge.target]) {
+                providers[count++] = &*tasks_[edge.target];
+                included[edge.target] = true;
+            }
+        }
+        myos_status_t status{};
+        tasks_[i] = supervisor_.launch(program_, plan.symbol(row.name), status,
+            {.terminal_events = events_, .close_badge = myos_word_t{1} << (i + 1)}, {providers, count});
+        return status;
+    }
+
+public:
+    struct StartResult {
+        myos_status_t status;
+        libk::optional<uint32_t> task;
+    };
+
+    static_assert(Capacity < sizeof(myos_word_t) * 8);
+    ServiceSupervisor(Tasks& supervisor, Program& program, myos_cap_t events) noexcept
+        : supervisor_(supervisor), program_(program), events_(events) {}
+
+    auto start() noexcept -> StartResult {
+        const auto& plan = program_.plan();
+        if (plan.task_count() > Capacity || !ServiceGraph{plan}.order(order_))
+            return {MYOS_STATUS_BAD_ARGS, libk::nullopt};
+        const auto valid = supervisor_.validate_graph(program_);
+        if (valid != MYOS_STATUS_OK) return {valid, libk::nullopt};
+        for (uint32_t p = 0; p < plan.task_count(); ++p) {
+            const auto status = launch(order_[p]);
+            if (status == MYOS_STATUS_OK) continue;
+            // A dependent may own grants derived from its provider. Finish
+            // each dependent's close before revoking the provider lineage.
+            for (size_t q = p; q != 0; --q) {
+                auto& task = tasks_[order_[q - 1]];
+                if (!task) continue;
+                const auto stopped = supervisor_.request_stop(*task);
+                if (stopped != MYOS_STATUS_OK) return {stopped, order_[p]};
+                for (;;) {
+                    const auto result = supervisor_.collect(*task);
+                    if (result.status == MYOS_STATUS_OK) { task.reset(); break; }
+                    if (!retryable(result.status) && result.status != MYOS_STATUS_WOULD_BLOCK)
+                        return {result.status, order_[p]};
+                    if (supervisor_.closing_needs_poll(*task)) { myos::yield(); continue; }
+                    const auto wake = notification_wait(events_);
+                    if (wake.status != MYOS_STATUS_OK) return {wake.status, order_[p]};
+                    // The notification is shared with all task generations.
+                    notify(wake.value);
+                }
+            }
+            return {status, order_[p]};
+        }
+        return {MYOS_STATUS_OK, libk::nullopt};
+    }
+
+    void notify(myos_word_t badges) noexcept {
+        for (auto& task : tasks_) if (task) supervisor_.notify(*task, badges);
+    }
+    auto needs_poll() const noexcept -> bool { return needs_poll_; }
+    auto deadline() const noexcept -> uint64_t { return restart_at_; }
+    auto restart(uint32_t index) noexcept -> myos_status_t {
+        if (index >= program_.plan().task_count() || !tasks_[index] || disabled_[index])
+            return MYOS_STATUS_NOT_FOUND;
+        recovering_[index] = true;
+        return MYOS_STATUS_OK;
+    }
+
+    auto poll() noexcept -> myos_status_t {
+        const auto& plan = program_.plan();
+        const ServiceGraph graph{plan};
+        needs_poll_ = false;
+        for (uint32_t i = 0; i < plan.task_count(); ++i) {
+            if (!tasks_[i] || recovering_[i]) continue;
+            const auto observed = supervisor_.observe(*tasks_[i]);
+            if (observed.status != MYOS_STATUS_OK) return observed.status;
+            if (observed.value == 0) continue;
+            recovering_[i] = true;
+            const auto now = clock_now();
+            if (now.status != MYOS_STATUS_OK) return now.status;
+            restart_at_ = now.value > UINT64_MAX - RestartDelay ? UINT64_MAX : now.value + RestartDelay;
+            const auto policy = plan.task(i)->restart;
+            const auto status = static_cast<myos_status_t>(observed.value2);
+            if (policy == MYOS_DEPLOY_RESTART_NEVER
+                || (policy == MYOS_DEPLOY_RESTART_ON_FAULT && status == MYOS_STATUS_OK)) disabled_[i] = true;
+        }
+        (void)graph.affected(recovering_);
+        (void)graph.affected(disabled_);
+        for (size_t p = plan.task_count(); p != 0; --p) {
+            const auto i = order_[p - 1];
+            if (!recovering_[i] || !tasks_[i]) continue;
+            // A provider's grants remain live until every dependent has
+            // finished closing. Revoking both lineages concurrently conflicts
+            // with a dependent's in-flight revocation of a derived grant.
+            const auto stopped = supervisor_.request_stop(*tasks_[i]);
+            if (stopped != MYOS_STATUS_OK) return stopped;
+            const auto result = supervisor_.collect(*tasks_[i]);
+            if (result.status == MYOS_STATUS_OK) tasks_[i].reset();
+            else if (retryable(result.status) || result.status == MYOS_STATUS_WOULD_BLOCK) {
+                needs_poll_ = supervisor_.closing_needs_poll(*tasks_[i]);
+                return MYOS_STATUS_OK;
+            } else return result.status;
+        }
+        if (restart_at_) {
+            const auto now = clock_now();
+            if (now.status != MYOS_STATUS_OK) return now.status;
+            if (now.value < restart_at_) return MYOS_STATUS_OK;
+            restart_at_ = 0;
+        }
+        // No new instance borrows an old cohort's channels or memory. All
+        // exact close completions were consumed before any relaunch begins.
+        for (uint32_t p = 0; p < plan.task_count(); ++p) {
+            const auto i = order_[p];
+            if (!recovering_[i] || disabled_[i]) continue;
+            const auto status = launch(i);
+            if (status != MYOS_STATUS_OK) {
+                // A partial new cohort must close before another attempt;
+                // admission failure does not change the manifest's restart
+                // policy or permanently disable healthy providers.
+                const auto now = clock_now();
+                if (now.status != MYOS_STATUS_OK) return now.status;
+                restart_at_ = now.value > UINT64_MAX - RestartDelay
+                    ? UINT64_MAX : now.value + RestartDelay;
+                needs_poll_ = true;
+                return MYOS_STATUS_OK;
+            }
+        }
+        for (auto& recovery : recovering_) recovery = false;
+        return MYOS_STATUS_OK;
+    }
+};
+
+} // namespace myos::deploy

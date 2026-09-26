@@ -150,8 +150,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(scratch.status);
     descriptor = cap::OwnedCap{{scratch.value, 0}};
     uint64_t capacity{};
-    service::require(backend.open(service::capability(info, myos::bootstrap::imports::Block),
-        events, vspace, 0x70000000, capacity));
+    service::require(backend.connect(service::capability(info, myos::bootstrap::imports::Block),
+        pool, cspace, events, vspace, 0x70000000, capacity));
     uint8_t boot[512]{};
     service::require(read_metadata(0, sizeof(boot), boot));
     files::fat32::Geometry geometry;

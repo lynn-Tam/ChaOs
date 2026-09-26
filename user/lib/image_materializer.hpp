@@ -65,6 +65,7 @@ concept MaterializerBackend = Backend<B>
         myos_word_t access) {
     { B::memory_create(pool, size, access) } -> libk::SameAs<SysResult>;
     { B::memory_seal(memory) } -> libk::SameAs<myos_status_t>;
+    { B::memory_populate(memory, size) } -> libk::SameAs<myos_status_t>;
     { B::memory_write(destination, source, size) }
         -> libk::SameAs<myos_status_t>;
 };
@@ -611,7 +612,9 @@ public:
         if (!reference) {
             return MYOS_STATUS_INVALID_CAP;
         }
-        myos_status_t status = scratch_.map(
+        myos_status_t status = populate_backing(reference.value(), memory_size);
+        if (status != MYOS_STATUS_OK) return status;
+        status = scratch_.map(
             reference.value(), 0, memory_size,
             MYOS_VM_READ | MYOS_VM_WRITE);
         if (status != MYOS_STATUS_OK) {
@@ -784,6 +787,17 @@ private:
         return task_.close_slot(slot);
     }
 
+    [[nodiscard]] static auto populate_backing(
+        cap::CapRef memory, myos_word_t size) noexcept -> myos_status_t {
+        // Scratch writes must not turn a budget failure into an unhandled
+        // fault in the supervisor's own address space.
+        for (myos_word_t page = 0; page < size / MYOS_DEPLOY_PAGE_SIZE; ++page) {
+            const auto status = B::memory_populate(memory, page);
+            if (status != MYOS_STATUS_OK) return status;
+        }
+        return MYOS_STATUS_OK;
+    }
+
     [[nodiscard]] auto populate(
         LocalSlot memory,
         const boot::Segment& segment,
@@ -806,6 +820,8 @@ private:
             || (source_size != 0 && source == nullptr)) {
             return MYOS_STATUS_BAD_ARGS;
         }
+        const auto backing = populate_backing(reference.value(), size);
+        if (backing != MYOS_STATUS_OK) return backing;
         const myos_status_t mapped = scratch_.map(
             reference.value(), 0, size,
             MYOS_VM_READ | MYOS_VM_WRITE);

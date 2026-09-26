@@ -4,113 +4,133 @@
 #include <stdint.h>
 
 #include <libk/byte_reader.hpp>
+#include <libk/expected.hpp>
+#include <libk/optional.hpp>
+#include <libk/span.hpp>
+#include <libk/string_view.hpp>
 
-namespace kernel::boot::fdt {
+namespace kernel::boot {
 
-inline constexpr uint32_t magic = 0xd00dfeed;
-inline constexpr uint32_t FDT_BEGIN_NODE = 0x00000001;
-inline constexpr uint32_t FDT_END_NODE = 0x00000002;
-inline constexpr uint32_t FDT_PROP = 0x00000003;
-inline constexpr uint32_t FDT_NOP = 0x00000004;
-inline constexpr uint32_t FDT_END = 0x00000009;
+class FdtNode final {
+private:
+    explicit constexpr FdtNode(uint32_t offset) noexcept
+        : offset_(offset) {}
 
-using StrView = libk::StrView;
-using ByteSpan = libk::ByteSpan;
-using ByteReader = libk::ByteReader;
+    uint32_t offset_{};
 
-struct FDT_View {
-    const uint8_t* base{};
-    size_t size{};
-    const uint8_t* dt_struct{};
-    size_t dt_struct_size{};
-    const char* dt_strings{};
-    size_t dt_strings_size{};
-    const uint8_t* mem_rsvmap{};
-    size_t mem_rsvmap_size{};
+    friend class Fdt;
 };
 
-[[nodiscard]] auto init_view(FDT_View& out, const void* dtb) -> bool;
+enum class FdtError : uint8_t {
+    InvalidHeader,
+    InvalidStructure,
+    InvalidReservations,
+};
 
-template<typename Visitor>
-[[nodiscard]] auto visit_memory_reservations(
-    const FDT_View& view,
-    Visitor&& visitor) -> bool {
-    ByteReader reader{view.mem_rsvmap, view.mem_rsvmap_size};
-    for (;;) {
-        uint64_t address{};
-        uint64_t size{};
-        if (!reader.read_be64(address) || !reader.read_be64(size)) {
-            return false;
-        }
-        if (address == 0 && size == 0) {
-            return true;
-        }
-        if (!visitor(address, size)) {
-            return false;
+class Fdt final {
+public:
+    [[nodiscard]] static auto open(const void* dtb) noexcept
+        -> libk::Expected<Fdt, FdtError>;
+
+    [[nodiscard]] auto size() const noexcept -> size_t {
+        return blob_.size();
+    }
+
+    [[nodiscard]] auto root() const noexcept -> FdtNode {
+        return FdtNode{root_offset_};
+    }
+
+    [[nodiscard]] auto node_name(FdtNode node) const noexcept
+        -> libk::StrView;
+
+    [[nodiscard]] auto property(
+        FdtNode node,
+        libk::StrView name) const noexcept
+        -> libk::optional<libk::ByteSpan>;
+
+    [[nodiscard]] auto property_count(
+        FdtNode node,
+        libk::StrView name) const noexcept -> size_t;
+
+    [[nodiscard]] auto first_child(FdtNode parent) const noexcept
+        -> libk::optional<FdtNode>;
+
+    [[nodiscard]] auto next_sibling(FdtNode node) const noexcept
+        -> libk::optional<FdtNode>;
+
+    [[nodiscard]] auto child(
+        FdtNode parent,
+        libk::StrView name) const noexcept
+        -> libk::optional<FdtNode>;
+
+    template<typename Visitor>
+    [[nodiscard]] auto for_each_reservation(
+        Visitor&& visitor) const noexcept -> bool {
+
+        libk::ByteReader reader{
+            reservations_.data(),
+            reservations_.size(),
+        };
+
+        for (;;) {
+            uint64_t address{};
+            uint64_t size{};
+
+            if (!reader.read_be64(address)
+                || !reader.read_be64(size)) {
+                return false;
+            }
+
+            if (address == 0 && size == 0) {
+                return true;
+            }
+
+            if (!visitor(address, size)) {
+                return false;
+            }
         }
     }
-}
 
-template<typename Collector>
-[[nodiscard]] auto walk_view(const FDT_View& view, Collector&& collector) -> bool {
-    ByteReader reader{view.dt_struct, view.dt_struct_size};
-    int depth = -1;
+    [[nodiscard]] static auto read_u32(
+        libk::ByteSpan bytes,
+        uint32_t& value) noexcept -> bool;
 
-    for (;;) {
-        uint32_t token{};
-        if (!reader.read_be32(token)) {
-            return false;
-        }
+    [[nodiscard]] static auto first_string(
+        libk::ByteSpan bytes) noexcept
+        -> libk::optional<libk::StrView>;
 
-        switch (token) {
-        case FDT_BEGIN_NODE: {
-            StrView node_name{};
-            if (!reader.read_cstr(node_name) || !reader.align(4)) {
-                return false;
-            }
-            ++depth;
-            if (!collector.begin_node(node_name, depth)) {
-                return false;
-            }
-            break;
-        }
-        case FDT_PROP: {
-            uint32_t length{};
-            uint32_t name_offset{};
-            if (!reader.read_be32(length)
-                || !reader.read_be32(name_offset)
-                || name_offset >= view.dt_strings_size) {
-                return false;
-            }
+private:
+    struct Item;
 
-            ByteReader name_reader{
-                reinterpret_cast<const uint8_t*>(view.dt_strings + name_offset),
-                view.dt_strings_size - name_offset,
-            };
-            StrView property_name{};
-            ByteSpan value{};
-            if (!name_reader.read_cstr(property_name)
-                || !reader.take_bytes(length, value)
-                || !reader.align(4)
-                || !collector.prop(property_name, value, depth)) {
-                return false;
-            }
-            break;
-        }
-        case FDT_END_NODE:
-            if (depth < 0 || !collector.end_node(depth)) {
-                return false;
-            }
-            --depth;
-            break;
-        case FDT_NOP:
-            break;
-        case FDT_END:
-            return depth == -1;
-        default:
-            return false;
-        }
-    }
-}
+    Fdt(
+        libk::ByteSpan blob,
+        libk::ByteSpan structure,
+        libk::ByteSpan strings,
+        libk::ByteSpan reservations) noexcept
+        : blob_(blob),
+          structure_(structure),
+          strings_(strings),
+          reservations_(reservations) {}
 
-} // namespace kernel::boot::fdt
+    [[nodiscard]] auto read_item(
+        uint32_t offset,
+        Item& item) const noexcept -> bool;
+
+    [[nodiscard]] auto string_at(
+        uint32_t offset,
+        libk::StrView& string) const noexcept -> bool;
+
+    [[nodiscard]] auto validate_structure() noexcept -> bool;
+
+    [[nodiscard]] auto validate_reservations(
+        size_t& actual_size) const noexcept -> bool;
+
+    libk::ByteSpan blob_{};
+    libk::ByteSpan structure_{};
+    libk::ByteSpan strings_{};
+    libk::ByteSpan reservations_{};
+
+    uint32_t root_offset_{};
+};
+
+} // namespace kernel::boot

@@ -144,13 +144,13 @@ public:
     }
 
     auto begin_node(const char* name) noexcept -> void {
-        be32(kernel::boot::fdt::FDT_BEGIN_NODE);
+        be32(1U);
         cstring(name);
         align4();
     }
 
-    auto end_node() noexcept -> void { be32(kernel::boot::fdt::FDT_END_NODE); }
-    auto finish() noexcept -> void { be32(kernel::boot::fdt::FDT_END); }
+    auto end_node() noexcept -> void { be32(2U); }
+    auto finish() noexcept -> void { be32(9U); }
 
     auto cell_property(uint32_t name_offset, uint32_t value) noexcept -> void {
         property_header(name_offset, sizeof(uint32_t));
@@ -184,21 +184,50 @@ public:
         be32(static_cast<uint32_t>(second));
     }
 
-    [[nodiscard]] auto view() const noexcept -> kernel::boot::fdt::FDT_View {
+    [[nodiscard]] auto view() noexcept
+        -> libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError> {
         if (!valid_) {
-            return {};
+            return libk::unexpected(kernel::boot::FdtError::InvalidStructure);
         }
-        kernel::boot::fdt::FDT_View result{};
-        result.dt_struct = bytes_;
-        result.dt_struct_size = size_;
-        result.dt_strings = property_names;
-        result.dt_strings_size = sizeof(property_names);
-        return result;
+        constexpr size_t header_size = 40;
+        constexpr size_t reservations_size = 16;
+        constexpr size_t structure_offset = header_size + reservations_size;
+        const size_t strings_offset = structure_offset + size_;
+        const size_t total = strings_offset + sizeof(property_names);
+        if (total > sizeof(blob_)) {
+            return libk::unexpected(kernel::boot::FdtError::InvalidStructure);
+        }
+        auto write32 = [this](size_t offset, uint32_t value) {
+            blob_[offset] = static_cast<uint8_t>(value >> 24);
+            blob_[offset + 1] = static_cast<uint8_t>(value >> 16);
+            blob_[offset + 2] = static_cast<uint8_t>(value >> 8);
+            blob_[offset + 3] = static_cast<uint8_t>(value);
+        };
+        write32(0, 0xd00dfeed);
+        write32(4, static_cast<uint32_t>(total));
+        write32(8, static_cast<uint32_t>(structure_offset));
+        write32(12, static_cast<uint32_t>(strings_offset));
+        write32(16, static_cast<uint32_t>(header_size));
+        write32(20, 17);
+        write32(24, 16);
+        write32(28, 0);
+        write32(32, sizeof(property_names));
+        write32(36, static_cast<uint32_t>(size_));
+        for (size_t index = header_size; index < structure_offset; ++index) {
+            blob_[index] = 0;
+        }
+        for (size_t index = 0; index < size_; ++index) {
+            blob_[structure_offset + index] = bytes_[index];
+        }
+        for (size_t index = 0; index < sizeof(property_names); ++index) {
+            blob_[strings_offset + index] = property_names[index];
+        }
+        return kernel::boot::Fdt::open(blob_);
     }
 
 private:
     auto property_header(uint32_t name_offset, size_t length) noexcept -> void {
-        be32(kernel::boot::fdt::FDT_PROP);
+        be32(3U);
         be32(static_cast<uint32_t>(length));
         be32(name_offset);
     }
@@ -231,6 +260,7 @@ private:
     }
 
     uint8_t bytes_[32768]{};
+    alignas(8) uint8_t blob_[33024]{};
     size_t size_{};
     bool valid_{true};
 };
@@ -239,14 +269,17 @@ constinit FdtStructureWriter fdt_writer{};
 constinit kernel::boot::CpuHandoff cpu_handoff_storage{};
 
 [[nodiscard]] auto parse_cpu_tree(
-    const kernel::boot::fdt::FDT_View& view,
+    const libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError>& view,
     kernel::CpuHardwareId boot_cpu) noexcept
     -> libk::Expected<kernel::boot::CpuHandoff*,
         kernel::boot::CpuTopologyError> {
     cpu_handoff_storage.cpus.clear();
     cpu_handoff_storage.boot_index = 0;
+    if (!view) {
+        return libk::unexpected(kernel::boot::CpuTopologyError::InvalidCpuNode);
+    }
     auto parsed = kernel::boot::parse_fdt_cpus(
-        view, boot_cpu, cpu_handoff_storage);
+        view.value(), boot_cpu, cpu_handoff_storage);
     if (!parsed) {
         return libk::unexpected(parsed.error());
     }
@@ -279,7 +312,7 @@ auto add_cpu(
     fdt_writer.end_node();
 }
 
-[[nodiscard]] auto finish_cpu_tree() noexcept -> kernel::boot::fdt::FDT_View {
+[[nodiscard]] auto finish_cpu_tree() noexcept -> libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError> {
     fdt_writer.end_node();
     fdt_writer.end_node();
     fdt_writer.finish();

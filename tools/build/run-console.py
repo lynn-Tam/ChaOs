@@ -9,7 +9,7 @@ import sys
 import time
 
 
-def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=False):
+def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=False, service_fault=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -69,6 +69,25 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         run('ls', b'HELLO.PKG')
         run('cat README.TXT', b'myos disk file service')
         run('cat absent.txt', b'exit: -5')
+        if service_fault:
+            run('restart absent', b'service restart: -5')
+            baseline = output.count(b'uart: console ready')
+            for target in ('files', 'block'):
+                start = len(output)
+                for byte in f'restart {target}\r'.encode():
+                    process.stdin.write(bytes([byte]))
+                    process.stdin.flush()
+                    time.sleep(0.003)
+                until(b'myos native shell', start)
+                restarted = output.index(b'myos native shell', start)
+                until(b'myos> ', restarted)
+                if output.count(b'uart: console ready') != baseline:
+                    raise RuntimeError('unrelated UART service restarted')
+                run('run hello', b'Hello from userspace.\nexit: 0')
+                run('cat README.TXT', b'myos disk file service')
+                run('restart absent', b'service restart: -5')
+            print(f'[console] OK: {smp} harts, local service restart and surviving UART')
+            return
         if exhaustion:
             for _ in range(iterations):
                 run('run hello', b'exit: -7')
@@ -131,7 +150,8 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
 if __name__ == '__main__':
     qemu, kernel, bundle, disk, harts = sys.argv[1:6]
     exhaustion = len(sys.argv) >= 7 and sys.argv[6] == 'exhaustion'
-    iterations = int(sys.argv[7]) if len(sys.argv) == 8 else 3
+    iterations = int(sys.argv[7]) if len(sys.argv) == 8 and sys.argv[6] not in ('service-fault', 'pressure') else 3
     for smp in harts.split(','):
         exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk,
-                 pressure=len(sys.argv) >= 7 and sys.argv[6] == 'pressure')
+                 pressure=len(sys.argv) >= 7 and sys.argv[6] == 'pressure',
+                 service_fault=len(sys.argv) >= 7 and sys.argv[6] == 'service-fault')

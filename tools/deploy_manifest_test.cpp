@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <elf.h>
 
 #include <initializer_list>
 
@@ -14,6 +15,7 @@
 #include "deploypack/golden_fixture.hpp"
 #include "../user/lib/deploy_manifest.hpp"
 #include "../user/lib/deployment_plan.hpp"
+#include <user/lib/service_graph.hpp>
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
@@ -38,6 +40,30 @@ constexpr size_t kManifestBufferSize =
 uint8_t production_bytes[kManifestBufferSize]{};
 uint8_t production_mutation[kManifestBufferSize]{};
 size_t production_size{};
+uint64_t production_critical[3]{};
+
+// Compare admission budgets to the current ELF, not an old compiler's code
+// size. This independently reads the first executable load segment.
+auto executable_extent(const char* path) -> uint64_t {
+    FILE* file = fopen(path, "rb");
+    if (!file) return 0;
+    Elf64_Ehdr header{};
+    uint64_t address = UINT64_MAX, size{};
+    if (fread(&header, sizeof(header), 1, file) == 1
+        && header.e_phentsize == sizeof(Elf64_Phdr)) {
+        for (uint16_t i = 0; i < header.e_phnum; ++i) {
+            Elf64_Phdr segment{};
+            if (fseek(file, header.e_phoff + uint64_t{i} * sizeof(segment), SEEK_SET) != 0
+                || fread(&segment, sizeof(segment), 1, file) != 1) { size = 0; break; }
+            if (segment.p_type == PT_LOAD && segment.p_memsz && segment.p_vaddr < address) {
+                address = segment.p_vaddr;
+                size = (segment.p_flags & PF_X) != 0 ? segment.p_memsz : 0;
+            }
+        }
+    }
+    fclose(file);
+    return size > UINT64_MAX - 4095 ? 0 : (size + 4095) & ~uint64_t{4095};
+}
 
 void make_boot_bundle(uint8_t* bytes, size_t& size) {
     constexpr size_t modules = MYOS_BOOT_HEADER_SIZE;
@@ -441,7 +467,7 @@ auto accepts_production_authority_budget() -> bool {
         && proof.cspace_pages == 4
         && consumer.pool_memory == consumer.critical_bytes + 256 * 1024
         && consumer.pool_caps == 5
-        && consumer.critical_bytes == UINT64_C(0x12000)
+        && consumer.critical_bytes == production_critical[0]
         && consumer.cspace_slots == 5
         && consumer.cspace_pages == 3
         && consumer.readiness == MYOS_DEPLOY_READINESS_START
@@ -449,7 +475,7 @@ auto accepts_production_authority_budget() -> bool {
         && consumer.export_count == 1
         && pager.pool_memory == pager.critical_bytes + 256 * 1024
         && pager.pool_caps == 11
-        && pager.critical_bytes == UINT64_C(0x14000)
+        && pager.critical_bytes == production_critical[1]
         && pager.cspace_slots == 11
         && pager.cspace_pages == 4
         && pager.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
@@ -457,7 +483,7 @@ auto accepts_production_authority_budget() -> bool {
         && pager.export_count == 0
         && uart.pool_memory == uart.critical_bytes + 256 * 1024
         && uart.pool_caps == 10
-        && uart.critical_bytes == UINT64_C(0x12000)
+        && uart.critical_bytes == production_critical[2]
         && uart.cspace_slots == 10
         && uart.cspace_pages == 4
         && uart.readiness == MYOS_DEPLOY_READINESS_EXPLICIT
@@ -650,6 +676,14 @@ auto checks_import_lookup() -> bool {
     incompatible = requested;
     ++incompatible.protocol;
     if (view->selector(incompatible) != 0) return false;
+    struct ExtendedBootstrap {
+        myos_bootstrap_info prefix;
+        uint64_t extension;
+    } extended{info, 0};
+    extended.prefix.minor = MYOS_BOOTSTRAP_MINOR + 1;
+    extended.prefix.size = sizeof(extended);
+    if (!myos::bootstrap::BootstrapView::parse(&extended, sizeof(extended))
+        || myos::bootstrap::BootstrapView::parse(&extended, sizeof(info))) return false;
     info.import_count = 2;
     info.imports[1] = entry;
     return !myos::bootstrap::BootstrapView::parse(&info, sizeof(info));
@@ -1301,7 +1335,17 @@ auto accepts_optional_dependency_edge() -> bool {
     make_two_task_manifest(bytes, size, true);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, size, workspace);
-    return parsed.has_value();
+    if (!parsed) return false;
+    myos::deploy::PlanSet<1> plans;
+    auto decoded = myos::deploy::DeploymentPlan::decode(parsed.value(), plans);
+    if (!decoded) return false;
+    const myos::deploy::ServiceGraph graph{decoded.value()};
+    uint32_t order[2]{};
+    bool provider_failed[2]{false, true};
+    bool consumer_failed[2]{true, false};
+    return graph.order(order) && order[0] == 1 && order[1] == 0
+        && graph.affected(provider_failed) && provider_failed[0] && provider_failed[1]
+        && graph.affected(consumer_failed) && consumer_failed[0] && !consumer_failed[1];
 }
 
 auto rejects_boot_bundle_alignment() -> bool {
@@ -1344,6 +1388,14 @@ auto accepts_entry_zero_fallback() -> bool {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 3) {
+        if (argc != 6) return 1;
+        for (size_t i = 0; i < 3; ++i) {
+            const auto code = executable_extent(argv[3 + i]);
+            if (code == 0) return 1;
+            production_critical[i] = code + 0x11000 + (i == 1 ? 0x2000 : 0);
+        }
+    }
     const bool have_fixture = argc >= 2;
     const bool have_production = argc >= 3;
     bool result = (argc == 1 || (have_fixture && matches_file(argv[1])))

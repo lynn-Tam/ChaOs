@@ -15,8 +15,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         uint64_t expected[block::Device::Depth]{};
         for (size_t slot = 0; slot < block::Device::Depth; ++slot) {
             expected[slot] = ++next_id;
-            service::require(device.submit({slot, next_id}, slot * block::Device::MaxRead,
-                block::Device::MaxRead));
+            service::require(device.submit({slot, next_id}, io::Operation::Read,
+                slot * block::Device::MaxTransfer, block::Device::MaxTransfer));
         }
         if (device.active() != block::Device::Depth) exit(MYOS_STATUS_INTERNAL);
         device.publish();
@@ -32,7 +32,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 service::require(completion.status);
                 if (completion.ticket.slot >= block::Device::Depth
                     || completion.ticket.id != expected[completion.ticket.slot]
-                    || completion.size != block::Device::MaxRead) exit(MYOS_STATUS_INTERNAL);
+                    || completion.size != block::Device::MaxTransfer) exit(MYOS_STATUS_INTERNAL);
                 expected[completion.ticket.slot] = 0;
                 for (size_t index = 0; index < completion.size; ++index)
                     if (completion.data[index] != 0) exit(MYOS_STATUS_BACKING_FAILED);
@@ -43,8 +43,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     // Leave live BAR CPU mappings and a full submitted batch to Task teardown.
     // The next worker may acquire the device only after the kernel drains it.
     for (size_t slot = 0; slot < block::Device::Depth; ++slot)
-        service::require(device.submit({slot, ++next_id}, slot * block::Device::MaxRead,
-            block::Device::MaxRead));
+        service::require(device.submit({slot, ++next_id}, io::Operation::Read,
+            slot * block::Device::MaxTransfer, block::Device::MaxTransfer));
     device.publish();
     exit();
 }

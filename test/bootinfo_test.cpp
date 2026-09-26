@@ -290,27 +290,36 @@ bool test_byte_ranges_have_explicit_page_rounding(const TestContext&) noexcept {
 }
 
 bool test_fdt_memory_reservations_are_bounded(const TestContext&) noexcept {
-    constexpr uint8_t reservations[] = {
-        0, 0, 0, 0, 0, 0, 0x10, 0,
-        0, 0, 0, 0, 0, 0, 0x20, 0,
-        0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0,
+    alignas(8) uint8_t blob[88]{};
+    auto be32 = [&blob](size_t offset, uint32_t value) {
+        blob[offset] = static_cast<uint8_t>(value >> 24);
+        blob[offset + 1] = static_cast<uint8_t>(value >> 16);
+        blob[offset + 2] = static_cast<uint8_t>(value >> 8);
+        blob[offset + 3] = static_cast<uint8_t>(value);
     };
-    kernel::boot::fdt::FDT_View view{};
-    view.mem_rsvmap = reservations;
-    view.mem_rsvmap_size = sizeof(reservations);
+    be32(0, 0xd00dfeed);
+    be32(4, sizeof(blob));
+    be32(8, 72);
+    be32(12, 88);
+    be32(16, 40);
+    be32(20, 17);
+    be32(24, 16);
+    be32(36, 16);
+    be32(44, 0x1000);
+    be32(52, 0x2000);
+    be32(72, 1);
+    be32(80, 2);
+    be32(84, 9);
+    const auto tree = kernel::boot::Fdt::open(blob);
     size_t visits = 0;
-    const bool valid = kernel::boot::fdt::visit_memory_reservations(
-        view,
+    const bool valid = tree && tree.value().for_each_reservation(
         [&visits](uint64_t address, uint64_t size) {
             ++visits;
             return address == 0x1000 && size == 0x2000;
         });
-    view.mem_rsvmap_size -= 1;
-    const bool truncated = kernel::boot::fdt::visit_memory_reservations(
-        view,
-        [](uint64_t, uint64_t) { return true; });
-    return valid && visits == 1 && !truncated;
+    blob[71] = 1; // The reservation terminator no longer fits in its block.
+    const auto unterminated = kernel::boot::Fdt::open(blob);
+    return valid && visits == 1 && !unterminated;
 }
 
 } // namespace

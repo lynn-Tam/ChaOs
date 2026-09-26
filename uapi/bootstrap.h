@@ -1,6 +1,10 @@
 #pragma once
 
+/* The root execution has a resident, registered IPC page at this address. */
+#define MYOS_BOOTSTRAP_ROOT_IPC_ADDRESS 0x40000000UL
+
 #include <stdint.h>
+#include <stddef.h>
 #include <uapi/capability.h>
 
 #ifndef __ASSEMBLER__
@@ -75,6 +79,7 @@ struct myos_bootstrap_cap {
 
 #define MYOS_BOOTSTRAP_MAX_IMPORTS 16U
 #define MYOS_BOOTSTRAP_IMPORT_NAME_MAX 32U
+#define MYOS_BOOTSTRAP_DEVICE_PROTOCOL UINT32_C(0x50434944)
 
 /* Names locate a child-CSpace capability; they never confer authority. */
 struct myos_bootstrap_import {
@@ -104,7 +109,7 @@ struct myos_bootstrap_info {
     uint32_t size;
     uint32_t cap_count;
     uint32_t cpu_count;
-    uintptr_t stack_base;
+    uint64_t stack_base;
     uint64_t stack_size;
     uint64_t boot_bundle_size;
     struct myos_bootstrap_cap caps[MYOS_BOOTSTRAP_MAX_CAPS];
@@ -113,3 +118,10 @@ struct myos_bootstrap_info {
     struct myos_bootstrap_import imports[MYOS_BOOTSTRAP_MAX_IMPORTS];
     struct myos_bootstrap_arguments arguments;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(myos_bootstrap_info) == 1504);
+static_assert(offsetof(myos_bootstrap_info, stack_base) == 24);
+static_assert(offsetof(myos_bootstrap_info, imports) == 312);
+static_assert(offsetof(myos_bootstrap_info, arguments) == 1208);
+#endif

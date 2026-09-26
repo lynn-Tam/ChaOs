@@ -142,7 +142,8 @@ public:
         for (size_t index = 0; index < PayloadSize; ++index) bytes[index] = 0;
     }
 
-    [[nodiscard]] auto export_pages(myos_cap_t cspace, cap::OwnedCap (&exports)[3]) noexcept
+    [[nodiscard]] auto export_pages(myos_cap_t cspace, cap::OwnedCap (&exports)[3],
+        bool writable_payload = false) noexcept
         -> myos_status_t {
         // The tail is padding, outside both ring objects. This is private
         // writable descriptor scratch; peers can only read this page.
@@ -157,7 +158,8 @@ public:
                 .size = MYOS_CAP_ATTENUATION_SIZE,
                 .rights = MYOS_RIGHT_MAP | MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_REVOKE,
                 .words = {0, mappings_[index].size / 4096,
-                    index == 0 ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ, MYOS_VM_NORMAL}};
+                    index == 0 || (index == 2 && writable_payload)
+                        ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ, MYOS_VM_NORMAL}};
             deploy::attenuation::encode_wire(view, wire);
             const auto exported = cap_typed_delegate(mappings_[index].memory.selector(), cspace,
                 mappings_[1].memory.selector(), scratch);
@@ -183,7 +185,8 @@ private:
 
 class ClientMemory final {
 public:
-    [[nodiscard]] auto map(myos_cap_t vspace, uintptr_t address, ControlPacket& packet) noexcept
+    [[nodiscard]] auto map(myos_cap_t vspace, uintptr_t address, ControlPacket& packet,
+        bool writable_payload = false) noexcept
         -> myos_status_t {
         if (packet.count != 4) return MYOS_STATUS_BAD_ARGS;
         constexpr size_t sizes[] = {4096, 4096, PayloadSize};
@@ -191,12 +194,14 @@ public:
         for (size_t index = 0; index < 3; ++index) {
             auto memory = MappedMemory::map(vspace, libk::move(packet.capabilities[index]),
                 address + index * 4096, sizes[index],
-                index == 0 ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ);
+                index == 0 || (index == 2 && writable_payload)
+                    ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ);
             if (!memory) return memory.error();
             mappings[index] = libk::move(memory).value();
         }
         for (size_t index = 0; index < 3; ++index) mappings_[index] = libk::move(mappings[index]);
         event_ = libk::move(packet.capabilities[3]);
+        writable_payload_ = writable_payload;
         return MYOS_STATUS_OK;
     }
 
@@ -206,6 +211,7 @@ public:
             if (status != MYOS_STATUS_OK) return status;
         }
         event_ = {};
+        writable_payload_ = false;
         return MYOS_STATUS_OK;
     }
 
@@ -218,6 +224,9 @@ public:
     [[nodiscard]] auto payload() const noexcept -> const uint8_t* {
         return reinterpret_cast<const uint8_t*>(mappings_[2].address);
     }
+    [[nodiscard]] auto writable_payload() noexcept -> uint8_t* {
+        return writable_payload_ ? reinterpret_cast<uint8_t*>(mappings_[2].address) : nullptr;
+    }
     [[nodiscard]] auto signal() const noexcept -> myos_status_t {
         return notification_signal(event_.selector()).status;
     }
@@ -225,6 +234,7 @@ public:
 private:
     MappedMemory mappings_[3]{};
     cap::OwnedCap event_{};
+    bool writable_payload_{};
 };
 
 // Synchronous control is reserved for startup and explicit application calls.
@@ -233,7 +243,8 @@ private:
 class ClientSession final : private libk::noncopyable_nonmovable {
 public:
     [[nodiscard]] auto open(myos_cap_t channel, myos_cap_t events,
-        myos_cap_t vspace, uintptr_t address, uint64_t& value) noexcept -> myos_status_t {
+        myos_cap_t vspace, uintptr_t address, uint64_t& value,
+        bool writable_payload = false) noexcept -> myos_status_t {
         if (queue_) return MYOS_STATUS_BAD_ARGS;
         events_ = events;
         auto status = control_.open(channel, events);
@@ -247,7 +258,7 @@ public:
         status = receive(request, packet);
         if (status != MYOS_STATUS_OK) return status;
         if (packet.message.status != MYOS_STATUS_OK) return packet.message.status;
-        status = memory_.map(vspace, address, packet);
+        status = memory_.map(vspace, address, packet, writable_payload);
         if (status != MYOS_STATUS_OK) return status;
         queue_.emplace(memory_.client(), memory_.server());
         value = packet.message.value;
@@ -257,7 +268,8 @@ public:
     // A directory capability grants only admission. Replies and data belong
     // to the newly created private channel, so clients never share a reader.
     [[nodiscard]] auto connect(myos_cap_t directory, myos_cap_t pool, myos_cap_t cspace, myos_cap_t events,
-        myos_cap_t vspace, uintptr_t address, uint64_t& value) noexcept -> myos_status_t {
+        myos_cap_t vspace, uintptr_t address, uint64_t& value,
+        bool writable_payload = false) noexcept -> myos_status_t {
         if (queue_ || channel_) return MYOS_STATUS_BUSY;
         const auto pair = channel_create(pool, 1, MYOS_CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != MYOS_STATUS_OK) return pair.status;
@@ -287,7 +299,7 @@ public:
         ControlPacket packet;
         if (status == MYOS_STATUS_OK) status = receive(request, packet);
         if (status == MYOS_STATUS_OK) status = packet.message.status;
-        if (status == MYOS_STATUS_OK) status = memory_.map(vspace, address, packet);
+        if (status == MYOS_STATUS_OK) status = memory_.map(vspace, address, packet, writable_payload);
         if (status != MYOS_STATUS_OK) {
             (void)object_destroy(channel_.selector());
             channel_ = {};
@@ -333,6 +345,7 @@ public:
     }
 
     [[nodiscard]] auto queue() noexcept -> ClientQueue& { return *queue_; }
+    [[nodiscard]] auto writable_payload() noexcept -> uint8_t* { return memory_.writable_payload(); }
     [[nodiscard]] auto payload() const noexcept -> const uint8_t* { return memory_.payload(); }
     [[nodiscard]] auto flush() noexcept -> myos_status_t {
         const bool submitted = queue_->publish();
@@ -371,8 +384,10 @@ private:
 class ServerSession final : private libk::noncopyable_nonmovable {
 public:
     [[nodiscard]] auto prepare(myos_cap_t pool, myos_cap_t vspace,
-        myos_cap_t cspace, uintptr_t address) noexcept -> myos_status_t {
+        myos_cap_t cspace, uintptr_t address,
+        bool writable_payload = false) noexcept -> myos_status_t {
         cspace_ = cspace;
+        writable_payload_ = writable_payload;
         return memory_.create(pool, vspace, address);
     }
     [[nodiscard]] auto bind(myos_cap_t channel, myos_cap_t events, uint64_t value = 0) noexcept -> myos_status_t {
@@ -427,7 +442,7 @@ public:
                 reply_->message.status = MYOS_STATUS_BAD_ARGS;
             else {
                 memory_.initialize();
-                auto created = memory_.export_pages(cspace_, exports_);
+                auto created = memory_.export_pages(cspace_, exports_, writable_payload_);
                 if (created != MYOS_STATUS_OK) return created;
                 for (auto& exported : exports_) {
                     const auto copied = cap_duplicate(exported.selector(), cspace_, MYOS_RIGHT_MAP | MYOS_RIGHT_DUPLICATE);
@@ -505,6 +520,7 @@ private:
     myos_cap_t events_{}, cspace_{};
     uint64_t value_{};
     bool closing_{};
+    bool writable_payload_{};
 };
 
 } // namespace myos::io

@@ -77,6 +77,11 @@ public:
         return image_;
     }
 private:
+    [[nodiscard]] auto load_segments(kernel::KernelState& kernel,
+        const kernel::image::BootBundle& package, kernel::CpuId cpu) noexcept
+        -> libk::Expected<void, RootTaskError>;
+    [[nodiscard]] auto create_thread(kernel::KernelState& kernel, usize entry) noexcept
+        -> libk::Expected<void, RootTaskError>;
     [[nodiscard]] auto reserve(kernel::resource::Budget charge) noexcept
         -> libk::Expected<kernel::resource::Reservation, RootTaskError>;
     [[nodiscard]] auto prepare_bootstrap(kernel::KernelState& kernel) noexcept
@@ -92,6 +97,7 @@ private:
         kernel::image::max_boot_segments> segments_{};
     kernel::object::ObjectStore::MemoryHold stack_{};
     kernel::object::ObjectStore::MemoryHold info_{};
+    kernel::object::ObjectStore::MemoryHold ipc_{};
     kernel::object::ObjectStore::VSpaceHold vspace_{};
     kernel::object::ObjectStore::CSpaceHold cspace_{};
     kernel::object::ObjectStore::ThreadHold thread_{};

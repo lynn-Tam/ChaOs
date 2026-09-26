@@ -11,13 +11,9 @@ namespace kernel::object { class ObjectStore; }
 namespace kernel::io {
 
 class Executor;
-enum class SpaceState : u8 { Empty, Binding, Opening, Active, Closing, Closed, Failed };
+enum class SpaceState : u8 { Empty, Binding, Opening, Active, Closing, Closed, Failed, Faulted };
 enum class SpaceError : u8 { InvalidState, InvalidAuthority, InvalidRange, Busy,
     UnsupportedMemory, BackingUnavailable, OutOfMemory, QuotaExceeded, Cancelled };
-struct DeviceInfo final {
-    libk::Array<u32, 64> configuration{};
-    libk::Array<usize, 6> bar_sizes{};
-};
 
 // One immutable DMA arena and one exclusive device generation. Source
 // attachments revoke the binding; page pins survive through hardware drain.
@@ -30,6 +26,8 @@ public:
     [[nodiscard]] auto bind(object::ObjectRef self,
         cap::Resolved<Device>& device, cap::Resolved<mm::MemoryObject>& memory,
         mm::ObjectRange range, usize first) noexcept
+        -> libk::Expected<void, SpaceError>;
+    [[nodiscard]] auto watch(ipc::Notification& notification, u64 badge) noexcept
         -> libk::Expected<void, SpaceError>;
     [[nodiscard]] auto state() const noexcept -> SpaceState;
     [[nodiscard]] auto bar(usize index) noexcept
@@ -66,7 +64,8 @@ private:
     [[nodiscard]] auto retire_interrupt() noexcept -> bool;
     void free_pages() noexcept;
     void bind_sponsor(resource::Sponsorship& sponsor) noexcept { sponsor_ = &sponsor; }
-    static void stop_device(void* context) noexcept;
+    static void stop_device(void* context, bool fault) noexcept;
+    void notification_closed() noexcept {}
     static void invalidate_memory(void*, mm::MemoryWork&&, mm::MemoryInvalidation) noexcept;
     static void invalidate_device_grant(void*, cap::GrantWork&&, cap::GrantInvalidation) noexcept;
     static void invalidate_memory_grant(void*, cap::GrantWork&&, cap::GrantInvalidation) noexcept;
@@ -85,6 +84,11 @@ private:
     mutable sync::SpinLock<sync::LockClass::IoSpace> lock_{};
     SpaceState state_{SpaceState::Empty};
     libk::Atomic<bool> closing_{};
+    libk::Atomic<bool> fault_signal_{};
+    bool faulted_{};
+    bool watching_{};
+    ipc::NotificationSource fault_source_ =
+        ipc::NotificationSource::bind<Space, &Space::notification_closed>(*this);
     object::ObjectRef self_{};
     object::ObjectCleanup cleanup_{};
     object::ObjectHold<Device> device_{};
