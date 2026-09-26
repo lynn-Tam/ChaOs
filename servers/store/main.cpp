@@ -237,7 +237,11 @@ struct Client final {
             || request.length > LFS_FILE_MAX - request.offset)
             return {request.id, MYOS_STATUS_BAD_ARGS, 0, 0};
         const auto seek = lfs_file_seek(volume.fs(), &opened->state, request.offset, LFS_SEEK_SET);
-        if (seek < 0) return {request.id, volume.error(seek), 0, 0};
+        if (seek < 0) {
+            const auto status = volume.error(seek);
+            if (volume.failed()) exit(status);
+            return {request.id, status, 0, 0};
+        }
         auto* data = session.payload() + request.buffer_offset;
         const auto result = write
             ? lfs_file_write(volume.fs(), &opened->state, data, request.length)
