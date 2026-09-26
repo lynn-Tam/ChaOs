@@ -20,9 +20,21 @@ public:
             service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE), address, ignored, true);
     }
 
-    [[nodiscard]] auto format() noexcept -> myos_status_t {
+    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> myos_status_t {
         io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Format)};
+        if (id != nullptr) {
+            message.size = VolumeIdSize;
+            service::copy(message.data, id, message.size);
+        }
         return session_.exchange(message);
+    }
+    [[nodiscard]] auto volume_id(uint8_t (&id)[VolumeIdSize]) noexcept -> myos_status_t {
+        io::ControlMessage message{.operation = static_cast<uint64_t>(Control::VolumeId)};
+        const auto status = session_.exchange(message);
+        if (status != MYOS_STATUS_OK) return status;
+        if (message.size != sizeof(id)) return MYOS_STATUS_PEER_FAULT;
+        service::copy(id, message.data, sizeof(id));
+        return MYOS_STATUS_OK;
     }
     [[nodiscard]] auto device_id(uint8_t (&id)[20]) noexcept -> myos_status_t {
         io::ControlMessage message{.operation = static_cast<uint64_t>(Control::DeviceId)};

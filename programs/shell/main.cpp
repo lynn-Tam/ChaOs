@@ -25,6 +25,32 @@ void storage_error(stream::Writer& console, myos_status_t status) {
     (void)libk::fmt::format_to<"storage error: {}\n">(console, status);
 }
 
+void print_hex(stream::Writer& console, const uint8_t* bytes, size_t size) {
+    constexpr char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < size; ++i) {
+        console.put(digits[bytes[i] >> 4]);
+        console.put(digits[bytes[i] & 15]);
+    }
+    console.put('\n');
+}
+
+auto parse_volume_id(const char* text, uint8_t (&id)[store::VolumeIdSize]) -> bool {
+    if (service::length(text) != sizeof(id) * 2) return false;
+    auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < sizeof(id); ++i) {
+        const int high = digit(text[2 * i]);
+        const int low = digit(text[2 * i + 1]);
+        if (high < 0 || low < 0) return false;
+        id[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
 void command(char* line, service::Connection& process, stream::Writer& console,
     myos_cap_t control, myos_cap_t pool, myos_cap_t cspace) {
     while (*line == ' ') ++line;
@@ -36,10 +62,11 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     if (service::equal(line, "help")) {
         console.write("help | ls | cat FILE | run hello | spawn hello | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
         if (storage_available)
-            console.write("wdevice | mkfs | wls [DIR] | wcat FILE | wstat FILE | write FILE TEXT | append FILE TEXT | save BOOTFILE FILE | mkdir DIR | rm FILE | mv OLD NEW\n");
+            console.write("wdevice | wvolid | mkfs [32_HEX_ID] | wls [DIR] | wcat FILE | wstat FILE | write FILE TEXT | append FILE TEXT | save BOOTFILE FILE | mkdir DIR | rm FILE | mv OLD NEW\n");
         return;
     }
-    if (service::equal(line, "wdevice") || service::equal(line, "mkfs") || service::equal(line, "wls")
+    if (service::equal(line, "wdevice") || service::equal(line, "wvolid")
+        || service::equal(line, "mkfs") || service::equal(line, "wls")
         || service::equal(line, "wcat") || service::equal(line, "wstat")
         || service::equal(line, "write") || service::equal(line, "append")
         || service::equal(line, "save") || service::equal(line, "mkdir")
@@ -52,20 +79,27 @@ void command(char* line, service::Connection& process, stream::Writer& console,
                 uint8_t id[20]{};
                 status = store_client.device_id(id);
                 if (status == MYOS_STATUS_OK) {
-                    constexpr char digits[] = "0123456789abcdef";
-                    char hex[sizeof(id) * 2];
-                    for (size_t i = 0; i < sizeof(id); ++i) {
-                        hex[i * 2] = digits[id[i] >> 4];
-                        hex[i * 2 + 1] = digits[id[i] & 15];
-                    }
-                    console.write(hex, sizeof(hex));
-                    console.put('\n');
+                    print_hex(console, id, sizeof(id));
+                    return;
+                }
+            }
+        } else if (service::equal(line, "wvolid")) {
+            if (*argument != '\0') status = MYOS_STATUS_BAD_ARGS;
+            else {
+                uint8_t id[store::VolumeIdSize]{};
+                status = store_client.volume_id(id);
+                if (status == MYOS_STATUS_OK) {
+                    print_hex(console, id, sizeof(id));
                     return;
                 }
             }
         } else if (service::equal(line, "mkfs")) {
-            if (*argument != '\0') status = MYOS_STATUS_BAD_ARGS;
-            else status = store_client.format();
+            if (*argument == '\0') status = store_client.format();
+            else {
+                uint8_t id[store::VolumeIdSize]{};
+                status = parse_volume_id(argument, id)
+                    ? store_client.format(id) : MYOS_STATUS_BAD_ARGS;
+            }
         } else if (service::equal(line, "wls")) {
             io::ControlMessage entry{};
             do {

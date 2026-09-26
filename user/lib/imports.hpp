@@ -24,8 +24,8 @@ inline constexpr Import Process{"process", 0x50524f43, MYOS_OBJECT_KIND_CHANNEL,
 inline constexpr Import Files{"files", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import FilesRead{"files.read", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import Block{"block", 0x424c4f43, MYOS_OBJECT_KIND_CHANNEL, 2, 1};
-inline constexpr Import Store{"store", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL};
-inline constexpr Import StoreRead{"store.read", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import Store{"store", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
+inline constexpr Import StoreRead{"store.read", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import ServiceControl{"service.control", 0x53564354, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Pager{"pager", 0x50414745, MYOS_OBJECT_KIND_PAGER};
 inline constexpr Import TargetMemory{"target.memory", 0x4d454d4f, MYOS_OBJECT_KIND_MEMORY};

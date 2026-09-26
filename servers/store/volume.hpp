@@ -2,6 +2,7 @@
 
 #include <third_party/littlefs/lfs.h>
 #include <user/lib/block_client.hpp>
+#include <user/lib/store_protocol.hpp>
 
 namespace myos::store {
 
@@ -37,7 +38,7 @@ public:
         return status(result);
     }
 
-    [[nodiscard]] auto format() noexcept -> myos_status_t {
+    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> myos_status_t {
         if (mounted_) {
             const int unmounted = lfs_unmount(&fs_);
             if (unmounted < 0) return status(unmounted);
@@ -49,7 +50,24 @@ public:
         const int mounted = lfs_mount(&fs_, &config_);
         if (failed_) return last_error_;
         mounted_ = mounted == 0;
-        return status(mounted);
+        if (mounted < 0) return status(mounted);
+        if (id == nullptr) return MYOS_STATUS_OK;
+        const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, VolumeIdSize);
+        if (written < 0) return error(written);
+        const auto synced = backend_->flush();
+        if (synced != MYOS_STATUS_OK) {
+            failed_ = true;
+            last_error_ = synced;
+        }
+        return synced;
+    }
+
+    [[nodiscard]] auto identity(uint8_t (&id)[VolumeIdSize]) noexcept -> myos_status_t {
+        if (!mounted_) return MYOS_STATUS_BACKING_FAILED;
+        const auto size = lfs_getattr(&fs_, "/", IdentityAttribute, id, sizeof(id));
+        if (size == LFS_ERR_NOATTR) return MYOS_STATUS_NOT_FOUND;
+        if (size < 0) return error(size);
+        return size == sizeof(id) ? MYOS_STATUS_OK : MYOS_STATUS_BACKING_FAILED;
     }
 
     [[nodiscard]] auto mounted() const noexcept -> bool { return mounted_; }
@@ -62,6 +80,7 @@ public:
 private:
     static constexpr uint32_t SectorSize = 512;
     static constexpr uint32_t BlockSize = 4096;
+    static constexpr uint8_t IdentityAttribute = 1;
 
     [[nodiscard]] static auto status(int result) noexcept -> myos_status_t {
         switch (result) {

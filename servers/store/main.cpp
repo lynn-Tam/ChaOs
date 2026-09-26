@@ -60,14 +60,28 @@ struct Client final {
             }
             return;
         }
+        if (operation == store::Control::VolumeId) {
+            if (request.size != 0 || request.value != 0) {
+                reply.status = MYOS_STATUS_BAD_ARGS; return;
+            }
+            uint8_t id[store::VolumeIdSize]{};
+            reply.status = volume.identity(id);
+            if (volume.failed()) exit(volume.error(-1));
+            if (reply.status == MYOS_STATUS_OK) {
+                reply.size = sizeof(id);
+                service::copy(reply.data, id, sizeof(id));
+            }
+            return;
+        }
         if (operation == store::Control::Format) {
             if (!admin) { reply.status = MYOS_STATUS_DENIED; return; }
-            if (request.size != 0 || request.value != 0) {
+            if ((request.size != 0 && request.size != store::VolumeIdSize) || request.value != 0) {
                 reply.status = MYOS_STATUS_BAD_ARGS; return;
             }
             for (auto& owner : clients) for (auto& opened : owner.files)
                 if (opened.open) { reply.status = MYOS_STATUS_BUSY; return; }
-            reply.status = volume.format();
+            reply.status = volume.format(request.size == 0
+                ? nullptr : reinterpret_cast<const uint8_t*>(request.data));
             if (volume.failed()) exit(volume.error(-1));
             return;
         }
