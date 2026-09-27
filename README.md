@@ -49,8 +49,10 @@ data disk. `cat` and `ls` are ordinary programs using the userland VFS service;
 the other file commands launch the ordinary `fs` program, also available as
 `fs COMMAND`. VFS grants read-only access to `cat`, `ls`, and `get`, and write
 access to `fs`, `edit`, and `put`. Quote names and text containing spaces,
-for example `write "my note" "hello world"`. `edit note` runs a separate line
-editor: enter replacement lines, then `.` to save or `:q` to discard. The shell
+for example `write "my note" "hello world"`. `edit note` opens a file in a
+separate line editor. Type text to append; use `:p` to show numbered lines,
+`:a TEXT` to append, `:i N TEXT` to insert, `:r N TEXT` to replace, and `:d N` to delete a line.
+`.` saves and `:q` discards. The shell
 hands terminal input to a foreground program until it exits; background tasks
 receive EOF instead. Only `mkfs.pkg` can receive Store Admin authority;
 ordinary `fs` and `edit` cannot format. Programs run by name, for example
