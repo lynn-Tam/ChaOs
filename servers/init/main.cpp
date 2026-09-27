@@ -4,7 +4,8 @@
 
 namespace {
 myos::deploy::Program program;
-using Supervisor = myos::deploy::Supervisor<7, 24>;
+constexpr size_t ServiceCapacity = 8;
+using Supervisor = myos::deploy::Supervisor<ServiceCapacity, 24>;
 Supervisor supervisor;
 
 void report_uart(const myos::bootstrap::BootstrapView& info,
@@ -72,7 +73,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         myos::service::require(supervisor.add(device->name, device->handle,
             MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_CONNECT | MYOS_RIGHT_DUPLICATE));
     }
-    myos::deploy::ServiceSupervisor<7, 24> services{supervisor, program, events.selector()};
+    myos::deploy::ServiceSupervisor<ServiceCapacity, 24> services{supervisor, program, events.selector()};
     const auto started = services.start();
     if (started.status != MYOS_STATUS_OK) {
         const auto task = started.task

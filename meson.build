@@ -438,6 +438,10 @@ store_user = executable(
   link_whole: user_runtime, link_args: user_link_args + ['-lgcc'],
   link_language: 'c', build_by_default: false,
 )
+vfs_user = executable(
+  'vfs.elf', files('servers/vfs/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 io_session_init_user = executable(
   'io-session-init-test.elf', files('test/user/io/session_init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
@@ -876,12 +880,12 @@ file_failure_bundle = custom_target(
 )
 
 native_manifest = custom_target(
-  'native-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user],
+  'native-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user, vfs_user],
   output: 'native.manifest', command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
 )
 storage_manifest = custom_target(
   'storage-manifest', input: [uart_user, process_server_user, shell_user,
-    block_user, files_user, block_user, store_user],
+    block_user, files_user, block_user, store_user, vfs_user],
   output: 'storage.manifest',
   command: [deploypack, 'console-storage', '@OUTPUT@', '@INPUT@'], build_by_default: false,
 )
@@ -935,26 +939,26 @@ process_client_user = executable(
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 process_test_manifest = custom_target(
-  'process-test-manifest', input: [uart_user, process_server_user, process_client_user, block_user, files_user],
+  'process-test-manifest', input: [uart_user, process_server_user, process_client_user, block_user, files_user, vfs_user],
   output: 'process-test.manifest', command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
 )
 process_test_bundle = custom_target(
-  'process-test-bundle', input: [init_user, uart_user, process_server_user, process_client_user, block_user, files_user, process_test_manifest],
+  'process-test-bundle', input: [init_user, uart_user, process_server_user, process_client_user, block_user, files_user, vfs_user, process_test_manifest],
   output: 'process-test.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@', 'data:manifest=@INPUT7@'], build_by_default: false,
 )
 boot_bundle = custom_target(
-  'boot-bundle', input: [init_user, uart_user, process_server_user, shell_user, block_user, files_user, native_manifest], output: 'boot.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
+  'boot-bundle', input: [init_user, uart_user, process_server_user, shell_user, block_user, files_user, vfs_user, native_manifest], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@', 'data:manifest=@INPUT7@'], build_by_default: false,
 )
 storage_bundle = custom_target(
   'storage-bundle', input: [init_user, uart_user, process_server_user,
-    shell_user, block_user, files_user, store_user, storage_manifest],
+    shell_user, block_user, files_user, store_user, vfs_user, storage_manifest],
   output: 'storage.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@',
     'process_server=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@',
-    'files=@INPUT5@', 'block_data=@INPUT4@', 'store=@INPUT6@',
-    'data:manifest=@INPUT7@'], build_by_default: false,
+    'files=@INPUT5@', 'block_data=@INPUT4@', 'store=@INPUT6@', 'vfs=@INPUT7@',
+    'data:manifest=@INPUT8@'], build_by_default: false,
 )
 fault_shell_user = executable(
   'fault-shell.elf', files('test/user/service_start/fault_shell.cpp'),
@@ -962,16 +966,16 @@ fault_shell_user = executable(
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 spontaneous_fault_manifest = custom_target(
-  'spontaneous-fault-manifest', input: [uart_user, process_server_user, fault_shell_user, block_user, files_user],
+  'spontaneous-fault-manifest', input: [uart_user, process_server_user, fault_shell_user, block_user, files_user, vfs_user],
   output: 'spontaneous-fault.manifest',
   command: [deploypack, 'console', '@OUTPUT@', '@INPUT@'], build_by_default: false,
 )
 spontaneous_fault_bundle = custom_target(
   'spontaneous-fault-bundle',
-  input: [init_user, uart_user, process_server_user, fault_shell_user, block_user, files_user, spontaneous_fault_manifest],
+  input: [init_user, uart_user, process_server_user, fault_shell_user, block_user, files_user, vfs_user, spontaneous_fault_manifest],
   output: 'spontaneous-fault.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@',
-    'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
+    'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@', 'data:manifest=@INPUT7@'], build_by_default: false,
 )
 service_start_init_user = executable(
   'service-start-init.elf', files('test/user/service_start/init.cpp'),
@@ -979,16 +983,16 @@ service_start_init_user = executable(
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 service_start_manifest = custom_target(
-  'service-start-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user],
+  'service-start-manifest', input: [uart_user, process_server_user, shell_user, block_user, files_user, vfs_user],
   output: 'service-start.manifest',
   command: [deploypack, 'console-start-failure', '@OUTPUT@', '@INPUT@'], build_by_default: false,
 )
 service_start_bundle = custom_target(
   'service-start-bundle',
-  input: [service_start_init_user, uart_user, process_server_user, shell_user, block_user, files_user, service_start_manifest],
+  input: [service_start_init_user, uart_user, process_server_user, shell_user, block_user, files_user, vfs_user, service_start_manifest],
   output: 'service-start.bundle',
   command: [bootpack, '@OUTPUT@', 'init', 'init=@INPUT0@', 'uart=@INPUT1@', 'process_server=@INPUT2@',
-    'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'data:manifest=@INPUT6@'], build_by_default: false,
+    'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@', 'data:manifest=@INPUT7@'], build_by_default: false,
 )
 exhaustion_manifest = custom_target(
   'application-exhaustion-manifest', input: hello_user, output: 'hello-exhaustion.manifest',

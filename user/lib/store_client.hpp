@@ -7,7 +7,7 @@ namespace myos::store {
 
 struct File final { uint64_t handle{}, size{}; };
 
-class Client final : private libk::noncopyable_nonmovable {
+class Session : private libk::noncopyable_nonmovable {
 public:
     [[nodiscard]] auto connect(const bootstrap::BootstrapView& info,
         bootstrap::Import directory = bootstrap::imports::Store,
@@ -20,14 +20,6 @@ public:
             service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE), address, ignored, true);
     }
 
-    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> myos_status_t {
-        io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Format)};
-        if (id != nullptr) {
-            message.size = VolumeIdSize;
-            service::copy(message.data, id, message.size);
-        }
-        return session_.exchange(message);
-    }
     [[nodiscard]] auto volume_id(uint8_t (&id)[VolumeIdSize]) noexcept -> myos_status_t {
         io::ControlMessage message{.operation = static_cast<uint64_t>(Control::VolumeId)};
         const auto status = session_.exchange(message);
@@ -110,6 +102,15 @@ public:
         return MYOS_STATUS_OK;
     }
 
+    [[nodiscard]] auto read_at(File file, uint64_t offset, uint8_t* data,
+        size_t size, uint64_t& bytes) noexcept -> myos_status_t {
+        if (size > io::BufferSize || (size != 0 && data == nullptr)) return MYOS_STATUS_BAD_ARGS;
+        if (size == 0) { bytes = 0; return MYOS_STATUS_OK; }
+        const auto status = transfer(io::Operation::Read, file.handle, offset, size, bytes);
+        if (status == MYOS_STATUS_OK) service::copy(data, session_.payload(), bytes);
+        return status;
+    }
+
     template<class Consumer>
     [[nodiscard]] auto read(File file, Consumer&& consume) noexcept -> myos_status_t {
         uint64_t offset{};
@@ -166,8 +167,22 @@ private:
         }
     }
 
+protected:
     io::ClientSession session_{};
+private:
     myos_cap_t events_{};
+};
+
+class Client final : public Session {
+public:
+    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> myos_status_t {
+        io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Format)};
+        if (id != nullptr) {
+            message.size = VolumeIdSize;
+            service::copy(message.data, id, message.size);
+        }
+        return session_.exchange(message);
+    }
 };
 
 } // namespace myos::store

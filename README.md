@@ -45,8 +45,10 @@ The data disk is `/`; the read-only FAT32 boot disk is `/boot`. Use `touch note`
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
 `mkdir dir`, `mv note dir/note`, and `rm dir/note`. `ls /boot` shows boot files;
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the
-data disk. These shell commands run the ordinary `fs` program, which is also
-available explicitly as `fs COMMAND`. Quote names and text containing spaces,
+data disk. `cat` and `ls` are ordinary programs using the userland VFS service;
+the other file commands launch the ordinary `fs` program, also available as
+`fs COMMAND`. VFS grants read-only access to `cat`, `ls`, and `get`, and write
+access to `fs`, `edit`, and `put`. Quote names and text containing spaces,
 for example `write "my note" "hello world"`. `edit note` runs a separate line
 editor: enter replacement lines, then `.` to save or `:q` to discard. The shell
 hands terminal input to a foreground program until it exits; background tasks

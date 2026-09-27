@@ -1,6 +1,7 @@
 #pragma once
 
 #include <user/lib/imports.hpp>
+#include <user/lib/vfs_protocol.hpp>
 #include <test/user/channel/export_protocol.hpp>
 #include <uapi/channel.h>
 #include <test/user/io/file_fault.hpp>
@@ -388,13 +389,10 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
         if (std::string_view{name} == "cat" || std::string_view{name} == "ls"
-            || std::string_view{name} == "fs")
-            task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
-        if (std::string_view{name} == "put" || std::string_view{name} == "fs"
-            || std::string_view{name} == "edit")
-            task.authority(myos::bootstrap::imports::Store, "store.directory", MYOS_RIGHT_SEND);
-        if (std::string_view{name} == "get")
-            task.authority(myos::bootstrap::imports::StoreRead, "store.read.directory", MYOS_RIGHT_SEND);
+            || std::string_view{name} == "get")
+            task.authority(myos::bootstrap::imports::VfsRead, "vfs.read.directory", MYOS_RIGHT_SEND);
+        else if (std::string_view{name} != "mkfs")
+            task.authority(myos::bootstrap::imports::Vfs, "vfs.directory", MYOS_RIGHT_SEND);
         if (std::string_view{name} == "mkfs")
             task.authority(myos::bootstrap::imports::StoreAdmin, "store.admin.directory", MYOS_RIGHT_SEND);
     }
@@ -468,16 +466,16 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         t.requires_service(shell, "session-owner", MYOS_DEPLOY_DEPENDENCY_LIFETIME);
         t.requires_service(uart, "console");
         t.requires_service(files, "files");
-        if (storage) t.requires_service(6, "store");
+        t.requires_service(storage ? 7 : 5, "vfs");
+        if (storage) t.requires_service(6, "store admin");
         // Four live task authorities, package mappings and stream endpoints.
         t.cspace(512, 68);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL | MYOS_RESOURCE_PAGER);
         t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
-        t.channel(myos::bootstrap::imports::FilesRead, "files.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
-        if (storage) t.channel(myos::bootstrap::imports::Store,
-            "store.client", 0, 2, send | MYOS_RIGHT_DUPLICATE);
-        if (storage) t.channel(myos::bootstrap::imports::StoreRead,
-            "store.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
+        t.channel(myos::bootstrap::imports::Vfs, "vfs.client", 0,
+            myos::vfs::WriteDirectory, send | MYOS_RIGHT_DUPLICATE);
+        t.channel(myos::bootstrap::imports::VfsRead, "vfs.client", 0,
+            myos::vfs::ReadDirectory, send | MYOS_RIGHT_DUPLICATE);
         if (storage) t.channel(myos::bootstrap::imports::StoreAdmin,
             "store.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
         t.channel_service(myos::bootstrap::imports::Process, "process.client", 1,
@@ -542,6 +540,22 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         t.channel(myos::bootstrap::imports::Block, "block_data.client", 0, 1, send);
         t.authority(myos::bootstrap::imports::ServiceWake, "service.wake", MYOS_RIGHT_SIGNAL);
         t.channel_service(myos::bootstrap::imports::Store, "store.client", 1,
+            receive, send, 4, 4);
+        t.finish();
+    }
+    {
+        Task t{manifest, "vfs", paths[storage ? 7 : 5], 4 * 1024 * 1024,
+            false, service_budget};
+        t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
+        t.explicit_readiness(10'000'000'000);
+        t.requires_service(files, "files");
+        if (storage) t.requires_service(6, "store");
+        t.cspace(256, 36);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, send);
+        if (storage) t.channel(myos::bootstrap::imports::Store, "store.client", 0, 2, send);
+        t.authority(myos::bootstrap::imports::ServiceWake, "service.wake", MYOS_RIGHT_SIGNAL);
+        t.channel_service(myos::bootstrap::imports::Vfs, "vfs.client", 1,
             receive, send, 4, 4);
         t.finish();
     }

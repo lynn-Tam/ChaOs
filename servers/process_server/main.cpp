@@ -33,7 +33,6 @@ Supervisor supervisor;
 files::Client filesystem;
 process::PageBuffer page_buffer;
 cap::OwnedCap file_events;
-
 // Replies retain their own bytes while the peer is backpressured. Admission
 // stops at this bound; paging and teardown continue independently.
 class Replies final {
@@ -128,7 +127,8 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
         {.image_source = job->image.source(page_buffer, job->package.memory.selector(), address, job->package.size),
          .arguments = &arguments,
          .terminal_events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION),
-         .close_badge = uint64_t{1} << (8 + job - jobs), .sources = sources, .admit = process::admit});
+         .close_badge = uint64_t{1} << (8 + job - jobs), .sources = sources,
+         .admit = process::admit});
     }
     reply.status = status;
     if (job->child) reply.id = job->child->token();
@@ -197,16 +197,10 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), events));
     service::require(supervisor.add("domain", service::capability(info, MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN),
         MYOS_OBJECT_KIND_SCHED_DOMAIN, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL));
-    service::require(supervisor.add("files.directory", service::capability(info, bootstrap::imports::FilesRead),
+    service::require(supervisor.add("vfs.directory", service::capability(info, bootstrap::imports::Vfs),
         MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE, 0, 1, UINT64_MAX));
-    if (const auto store = info.selector(bootstrap::imports::Store); store != 0)
-        service::require(supervisor.add("store.directory", store,
-            MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
-            0, 1, UINT64_MAX));
-    if (const auto store = info.selector(bootstrap::imports::StoreRead); store != 0)
-        service::require(supervisor.add("store.read.directory", store,
-            MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
-            0, 1, UINT64_MAX));
+    service::require(supervisor.add("vfs.read.directory", service::capability(info, bootstrap::imports::VfsRead),
+        MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE, 0, 1, UINT64_MAX));
     if (const auto store = info.selector(bootstrap::imports::StoreAdmin); store != 0)
         service::require(supervisor.add("store.admin.directory", store,
             MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,

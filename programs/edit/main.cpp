@@ -1,5 +1,5 @@
 #include <user/lib/clock.hpp>
-#include <user/lib/store_client.hpp>
+#include <user/lib/vfs_client.hpp>
 #include <user/lib/stream.hpp>
 #include <user/lib/terminal.hpp>
 #include <user/lib/volume_path.hpp>
@@ -8,14 +8,14 @@ namespace {
 using namespace myos;
 
 class Draft final {
-    store::Client& storage_;
-    store::File file_{};
+    vfs::Client& storage_;
+    vfs::File file_{};
     char target_[sizeof(io::ControlMessage::data) + 1]{};
     char temporary_[24]{};
     uint64_t offset_{};
     bool present_{};
 public:
-    explicit Draft(store::Client& storage) noexcept : storage_(storage) {}
+    explicit Draft(vfs::Client& storage) noexcept : storage_(storage) {}
     auto present() const noexcept -> bool { return present_; }
     auto path() const noexcept -> const char* { return temporary_; }
 
@@ -34,7 +34,7 @@ public:
                 temporary_[7 + i] = digits[(candidate >> ((15 - i) * 4)) & 15];
             temporary_[23] = '\0';
             const auto status = storage_.open(temporary_,
-                store::Write | store::Create | store::Exclusive, file_);
+                vfs::Write | vfs::Create | vfs::Exclusive, file_);
             if (status == MYOS_STATUS_BUSY && candidate != UINT64_MAX) { ++candidate; continue; }
             if (status == MYOS_STATUS_OK) present_ = true;
             return status;
@@ -80,7 +80,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     if (info.argument_count() != 2) exit(MYOS_STATUS_BAD_ARGS);
     const auto stdout = service::capability(info, bootstrap::imports::Stdout);
     stream::Writer output{stdout};
-    store::Client storage;
+    vfs::Client storage;
     auto status = storage.connect(info);
     if (status != MYOS_STATUS_OK) exit(status);
     Draft draft{storage};

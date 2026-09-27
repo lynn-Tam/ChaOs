@@ -38,12 +38,10 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
             const bootstrap::Import* contract{};
             const char* source{};
             myos_word_t rights = MYOS_RIGHT_SEND;
-            if (named(name, bootstrap::imports::Files.name)) {
-                contract = &bootstrap::imports::Files; source = "files.directory";
-            } else if (named(name, bootstrap::imports::Store.name)) {
-                contract = &bootstrap::imports::Store; source = "store.directory";
-            } else if (named(name, bootstrap::imports::StoreRead.name)) {
-                contract = &bootstrap::imports::StoreRead; source = "store.read.directory";
+            if (named(name, bootstrap::imports::Vfs.name)) {
+                contract = &bootstrap::imports::Vfs; source = "vfs.directory";
+            } else if (named(name, bootstrap::imports::VfsRead.name)) {
+                contract = &bootstrap::imports::VfsRead; source = "vfs.read.directory";
             } else if (named(name, bootstrap::imports::StoreAdmin.name)
                 && named(package, "mkfs")) {
                 // package is the trusted boot-disk lookup selected by argv[0].

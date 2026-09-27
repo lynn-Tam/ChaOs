@@ -72,7 +72,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     if (*line == '\0') return;
     if (service::equal(line, "help")) {
         console.write("help | ls [DIR] | cat FILE | mkfs [32_HEX_ID] | edit FILE | run/spawn PROGRAM [ARGS] | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
-        if (storage_available) console.write("touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp /boot/FILE FILE | stat FILE | fs device/volid; / is data, /boot is read-only\n");
+        if (storage_available) console.write("touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp SOURCE DEST | stat FILE | fs device/volid; / is data, /boot is read-only\n");
         return;
     }
     if (service::equal(line, "restart")) {
@@ -114,14 +114,12 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         for (auto child : children) if (child) (void)libk::fmt::format_to<"task: {}\n">(console, child);
         return;
     }
-    const bool cat = service::equal(line, "cat");
     const bool file_command = storage_available && (
-        service::equal(line, "ls") || service::equal(line, "stat")
-        || service::equal(line, "touch") || service::equal(line, "write")
+        service::equal(line, "stat") || service::equal(line, "touch")
+        || service::equal(line, "write")
         || service::equal(line, "append") || service::equal(line, "mkdir")
         || service::equal(line, "rm") || service::equal(line, "mv")
-        || service::equal(line, "cp")
-        || (cat && *argument != '\0' && *argument != '|'));
+        || service::equal(line, "cp"));
     const bool explicit_run = service::equal(line, "run");
     const bool spawn = service::equal(line, "spawn");
     const bool wait = service::equal(line, "wait");

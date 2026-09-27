@@ -1,7 +1,7 @@
 #include <user/lib/stream.hpp>
-#include <user/lib/file_client.hpp>
+#include <user/lib/vfs_client.hpp>
 
-namespace { myos::files::Client filesystem; }
+namespace { myos::vfs::Client filesystem; }
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
@@ -18,9 +18,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             output.write(message.data, message.size);
         }
     }
-    service::require(filesystem.connect(info));
-    files::File file;
-    auto status = filesystem.open(info.argument(1), service::length(info.argument(1)), file);
+    service::require(filesystem.connect(info, bootstrap::imports::VfsRead));
+    vfs::File file;
+    auto status = filesystem.open(info.argument(1), vfs::Read, file);
     if (status == MYOS_STATUS_OK) {
         status = filesystem.read(file, [&](uint64_t, const uint8_t* data, size_t bytes) {
             output.write(reinterpret_cast<const char*>(data), bytes);

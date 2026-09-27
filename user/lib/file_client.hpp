@@ -41,6 +41,35 @@ public:
     }
     [[nodiscard]] auto close() noexcept -> myos_status_t { return session_.close(); }
 
+    [[nodiscard]] auto read_at(File file, uint64_t offset, uint8_t* data,
+        size_t size, uint64_t& bytes) noexcept -> myos_status_t {
+        if (size > io::BufferSize || (size != 0 && data == nullptr)) return MYOS_STATUS_BAD_ARGS;
+        if (size == 0) { bytes = 0; return MYOS_STATUS_OK; }
+        io::Request request{.operation = static_cast<uint64_t>(io::Operation::Read),
+            .object = file.handle, .offset = offset, .length = size};
+        if (session_.queue().submit(request) != libk::RingResult::Ready)
+            return MYOS_STATUS_PEER_FAULT;
+        auto status = session_.flush();
+        if (status != MYOS_STATUS_OK) return status;
+        for (;;) {
+            io::Completion completion{};
+            const auto taken = session_.queue().take(completion);
+            if (taken == libk::RingResult::Ready) {
+                if (completion.id != request.id || completion.flags != 0 || completion.bytes > size)
+                    return MYOS_STATUS_PEER_FAULT;
+                bytes = completion.bytes;
+                if (completion.status == MYOS_STATUS_OK) service::copy(data, session_.payload(), bytes);
+                status = session_.flush();
+                return status == MYOS_STATUS_OK ? completion.status : status;
+            }
+            if (taken != libk::RingResult::Empty) return MYOS_STATUS_PEER_FAULT;
+            status = session_.arm();
+            if (status != MYOS_STATUS_OK) return status;
+            status = notification_wait(events_).status;
+            if (status != MYOS_STATUS_OK) return status;
+        }
+    }
+
     [[nodiscard]] auto backing(File file, myos_word_t access = MYOS_VM_READ) noexcept
         -> libk::Expected<FileMemory, myos_status_t> {
         if (access != MYOS_VM_READ && access != (MYOS_VM_READ | MYOS_VM_EXECUTE))

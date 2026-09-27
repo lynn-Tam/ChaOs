@@ -27,6 +27,8 @@ inline constexpr Import Block{"block", 0x424c4f43, MYOS_OBJECT_KIND_CHANNEL, 2, 
 inline constexpr Import Store{"store", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import StoreRead{"store.read", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import StoreAdmin{"store.admin", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
+inline constexpr Import Vfs{"vfs", 0x56465320, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import VfsRead{"vfs.read", 0x56465320, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import ServiceControl{"service.control", 0x53564354, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import ServiceWake{"service.wake", 0x53564357, MYOS_OBJECT_KIND_NOTIFICATION};
 inline constexpr Import Pager{"pager", 0x50414745, MYOS_OBJECT_KIND_PAGER};

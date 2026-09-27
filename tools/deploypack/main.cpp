@@ -17,17 +17,17 @@ int main(int argc, char** argv) {
     const bool io_test = argc == 4 && std::string_view{argv[1]} == "io-test";
     const bool channel_test = argc == 7 && std::string_view{argv[1]} == "channel-test";
     const bool io_session = argc == 5 && std::string_view{argv[1]} == "io-session";
-    const bool start_failure = argc == 8 && std::string_view{argv[1]} == "console-start-failure";
-    const bool console = argc == 8 && (std::string_view{argv[1]} == "console" || start_failure);
-    const bool console_storage = (argc == 10 || argc == 11)
+    const bool start_failure = argc == 9 && std::string_view{argv[1]} == "console-start-failure";
+    const bool console = argc == 9 && (std::string_view{argv[1]} == "console" || start_failure);
+    const bool console_storage = (argc == 11 || argc == 12)
         && std::string_view{argv[1]} == "console-storage";
     if (!fixture && !production && !console && !console_storage && !io_test && !io_session && !file_session && !application && !channel_test) {
         std::cerr << "usage: deploypack OUTPUT | deploypack production OUTPUT"
                      " PROCESS_SERVER.ELF PROOF.ELF CONSUMER.ELF"
                      " PAGER.ELF UART.ELF | deploypack console|console-start-failure OUTPUT"
-                     " UART.ELF PROCESS_SERVER.ELF SHELL.ELF BLOCK.ELF FILES.ELF"
+                     " UART.ELF PROCESS_SERVER.ELF SHELL.ELF BLOCK.ELF FILES.ELF VFS.ELF"
                      " | deploypack console-storage OUTPUT UART.ELF PROCESS_SERVER.ELF"
-                     " SHELL.ELF BLOCK.ELF FILES.ELF BLOCK.ELF STORE.ELF [VOLUME_ID]"
+                     " SHELL.ELF BLOCK.ELF FILES.ELF BLOCK.ELF STORE.ELF VFS.ELF [VOLUME_ID]"
                      " | deploypack io-test OUTPUT WORKER.ELF"
                      " | deploypack channel-test OUTPUT COORDINATOR.ELF WORKER.ELF PROVIDER.ELF HOLDER.ELF"
                      " | deploypack io-session OUTPUT BLOCK.ELF CLIENT.ELF"
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
             : io_session ? myos::deploy::host::pack_io_session(argv[3], argv[4])
             : io_test ? myos::deploy::host::pack_io_test(argv[3])
             : console_storage ? myos::deploy::host::pack_console(argv + 3, false, true,
-                argc == 11 ? std::string_view{argv[10]} : std::string_view{})
+                argc == 12 ? std::string_view{argv[11]} : std::string_view{})
             : console ? myos::deploy::host::pack_console(argv + 3, start_failure) : production
             ? myos::deploy::host::pack_production(
                   myos::deploy::host::production_image_metrics(argv[3]),

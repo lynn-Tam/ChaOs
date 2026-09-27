@@ -1,15 +1,15 @@
-#include <user/lib/store_client.hpp>
+#include <user/lib/vfs_client.hpp>
 #include <user/lib/stream.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
     if (info.argument_count() != 2) exit(MYOS_STATUS_BAD_ARGS);
-    store::Client storage;
+    vfs::Client storage;
     service::require(storage.connect(info));
-    store::File file{};
+    vfs::File file{};
     auto status = storage.open(info.argument(1),
-        store::Write | store::Create | store::Truncate, file);
+        vfs::Write | vfs::Create | vfs::Truncate, file);
     if (status != MYOS_STATUS_OK) exit(status);
     stream::Reader input;
     status = input.open(service::capability(info, bootstrap::imports::Stdin),

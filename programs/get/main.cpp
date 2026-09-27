@@ -1,14 +1,14 @@
-#include <user/lib/store_client.hpp>
+#include <user/lib/vfs_client.hpp>
 #include <user/lib/stream.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;
     const auto info = service::bootstrap(address, size);
     if (info.argument_count() != 2) exit(MYOS_STATUS_BAD_ARGS);
-    store::Client storage;
-    service::require(storage.connect(info, bootstrap::imports::StoreRead));
-    store::File file{};
-    auto status = storage.open(info.argument(1), store::Read, file);
+    vfs::Client storage;
+    service::require(storage.connect(info, bootstrap::imports::VfsRead));
+    vfs::File file{};
+    auto status = storage.open(info.argument(1), vfs::Read, file);
     if (status == MYOS_STATUS_OK) {
         stream::Writer output{service::capability(info, bootstrap::imports::Stdout)};
         status = storage.read(file, [&](uint64_t, const uint8_t* data, size_t bytes) {
