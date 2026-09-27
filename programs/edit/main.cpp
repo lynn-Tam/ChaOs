@@ -35,6 +35,7 @@ public:
         while (*text != 0) put(*text++);
         put('\n');
     }
+    [[nodiscard]] auto status() const noexcept -> myos_status_t { return status_; }
     [[nodiscard]] auto finish() noexcept -> myos_status_t { flush(); return status_; }
 };
 
@@ -160,6 +161,7 @@ public:
                     newline = buffer[i] == '\n';
                     if (newline) { ++line; start = true; skip = false; }
                 }
+                status = output.status();
                 offset += bytes;
             }
             if (status == MYOS_STATUS_OK) {
@@ -173,7 +175,8 @@ public:
                         output.put('\n'); output.line(text); done = true;
                     }
                 }
-                status = done ? output.finish() : MYOS_STATUS_BAD_ARGS;
+                status = output.finish();
+                if (status == MYOS_STATUS_OK && !done) status = MYOS_STATUS_BAD_ARGS;
             }
             if (status == MYOS_STATUS_OK) status = fs_.sync(destination);
             const auto closed = fs_.close(destination);
