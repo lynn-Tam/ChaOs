@@ -382,14 +382,15 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
     task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
     if (std::string_view{name} == "cat" || std::string_view{name} == "put"
-        || std::string_view{name} == "get") {
+        || std::string_view{name} == "get" || std::string_view{name} == "fs") {
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
-        if (std::string_view{name} == "cat")
+        if (std::string_view{name} == "cat" || std::string_view{name} == "fs")
             task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
-        else if (std::string_view{name} == "put")
+        if (std::string_view{name} == "put" || std::string_view{name} == "fs")
             task.authority(myos::bootstrap::imports::Store, "store.directory", MYOS_RIGHT_SEND);
-        else task.authority(myos::bootstrap::imports::StoreRead, "store.read.directory", MYOS_RIGHT_SEND);
+        if (std::string_view{name} == "get")
+            task.authority(myos::bootstrap::imports::StoreRead, "store.read.directory", MYOS_RIGHT_SEND);
     }
     if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();

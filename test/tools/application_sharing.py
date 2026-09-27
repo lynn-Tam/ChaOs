@@ -134,9 +134,9 @@ with tempfile.TemporaryDirectory(dir=logs) as directory:
         # Resume the unmodified guest and verify ordinary stop/reuse still works.
         for task in ids:
             start = command(f'stop {task}')
-            if b'exit: -18' not in serial[start:]: raise RuntimeError('stop failed')
+            if b'error:' in serial[start:]: raise RuntimeError('stop failed')
         start = command('run hello')
-        if b'Hello from userspace.\nexit: 0' not in serial[start:]: raise RuntimeError('reuse failed')
+        if b'Hello from userspace.\nmyos> ' not in serial[start:]: raise RuntimeError('reuse failed')
     finally:
         (logs / 'serial.log').write_bytes(serial)
         process.terminate()

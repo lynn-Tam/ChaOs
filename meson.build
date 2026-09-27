@@ -510,6 +510,10 @@ get_user = executable(
   'get.elf', files('programs/get/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
+fs_user = executable(
+  'fs.elf', files('programs/fs/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 sleep_user = executable(
   'sleep.elf', files('programs/sleep/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
@@ -749,6 +753,14 @@ get_package = custom_target(
   'get-package', input: [get_user, get_manifest], output: 'get.pkg',
   command: [bootpack, '@OUTPUT@', 'get', 'get=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
+fs_manifest = custom_target(
+  'fs-manifest', input: fs_user, output: 'fs.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'fs', '@INPUT@'], build_by_default: false,
+)
+fs_package = custom_target(
+  'fs-package', input: [fs_user, fs_manifest], output: 'fs.pkg',
+  command: [bootpack, '@OUTPUT@', 'fs', 'fs=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
 sleep_manifest = custom_target(
   'sleep-manifest', input: sleep_user, output: 'sleep.manifest',
   command: [deploypack, 'application', '@OUTPUT@', 'sleep', '@INPUT@'], build_by_default: false,
@@ -774,9 +786,9 @@ denied_package = custom_target(
   command: [bootpack, '@OUTPUT@', 'uart', 'uart=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
 disk_image = custom_target(
-  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package, slow_package, fill_package, put_package, get_package], output: 'disk.img',
+  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package, slow_package, fill_package, put_package, get_package, fs_package], output: 'disk.img',
   command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@',
-    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'SLOW.PKG=@INPUT7@', 'FILL.PKG=@INPUT8@', 'PUT.PKG=@INPUT9@', 'GET.PKG=@INPUT10@', 'BAD.PKG=@INPUT0@'],
+    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'SLOW.PKG=@INPUT7@', 'FILL.PKG=@INPUT8@', 'PUT.PKG=@INPUT9@', 'GET.PKG=@INPUT10@', 'FS.PKG=@INPUT11@', 'BAD.PKG=@INPUT0@'],
   build_by_default: false,
 )
 file_test_data = custom_target(

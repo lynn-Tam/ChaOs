@@ -15,7 +15,7 @@ struct Import final {
 };
 
 namespace imports {
-inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, MYOS_OBJECT_KIND_CHANNEL};
+inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Stdin{"stdin", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Stdout{"stdout", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};

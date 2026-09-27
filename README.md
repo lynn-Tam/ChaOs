@@ -41,11 +41,16 @@ tools/build/ninja.sh run-console
 
 The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
 disk, run `mkfs` once in the shell; running it again erases the data volume.
-Then use `write note hello`, `append note world`,
-`wcat note`, `wstat note`, `wls` or `wls directory`,
-`save README.TXT readme`, `mv`, and `rm`. User programs can also write through
-the Store capability, for example `run echo hello | put greeting`.
-The FAT32 boot disk remains read-only.
+`fs` is an ordinary disk application: `fs touch note`, `fs write note hello`,
+`fs append note world`, `fs cat note`, `fs ls`, `fs stat note`, `fs mkdir dir`,
+`fs mv note dir/note`, and `fs rm dir/note`. `fs copy README.TXT readme` copies
+from the read-only FAT32 boot disk. Quote names and text containing spaces, for
+example `fs write "my note" "hello world"`. `edit note` enters the shell's line editor:
+enter replacement lines, then `.` to save or `:q` to discard. The shell owns
+terminal input and the Admin authority needed by `mkfs`; ordinary `fs` has
+only the Store directory capability. Programs run by name, for example
+`echo hello | put greeting`. Successful commands return to the prompt without
+an extra status line; failures print `error: STATUS`.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
 
 Additional test, audit, SMP matrix, debug, and proof targets are defined in `meson.build`.

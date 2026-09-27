@@ -65,12 +65,12 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
             raise RuntimeError('missing isolated Device bootstrap')
         if not re.search(rb'\[test\] summary\s+passed=[1-9][0-9]*\s+failed=0\s', output):
             raise RuntimeError('missing successful builtin test summary')
-        run('help', b'run hello')
+        run('help', b'run/spawn PROGRAM')
         run('ls', b'HELLO.PKG')
         run('cat README.TXT', b'myos disk file service')
-        run('cat absent.txt', b'exit: -5')
+        run('cat absent.txt', b'error: -5')
         if service_fault:
-            run('restart absent', b'service restart: -5')
+            run('restart absent', b'error: -5')
             baseline = output.count(b'uart: console ready')
             for target in ('files', 'block'):
                 start = len(output)
@@ -83,54 +83,55 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
                 until(b'myos> ', restarted)
                 if output.count(b'uart: console ready') != baseline:
                     raise RuntimeError('unrelated UART service restarted')
-                run('run hello', b'Hello from userspace.\nexit: 0')
+                run('run hello', b'Hello from userspace.\nmyos> ')
                 run('cat README.TXT', b'myos disk file service')
-                run('restart absent', b'service restart: -5')
+                run('restart absent', b'error: -5')
             print(f'[console] OK: {smp} harts, local service restart and surviving UART')
             return
         if exhaustion:
             for _ in range(iterations):
-                run('run hello', b'exit: -7')
-            run('help', b'run hello')
-            run('wait', b'exit: -1')
+                run('run hello', b'error: -7')
+            run('help', b'run/spawn PROGRAM')
+            run('wait', b'error: -1')
             print(f'[console] OK: {smp} harts, repeated admission failure and rollback')
             return
         for _ in range(iterations):
-            run('run hello', b'Hello from userspace.\nexit: 0')
-            run('run echo named arguments survive paging', b'named arguments survive paging\nexit: 0')
-        run('run demand', b'[demand] initialized data, BSS, private writes and VM reuse ok\nexit: 0')
+            run('run hello', b'Hello from userspace.\nmyos> ')
+            run('run echo named arguments survive paging', b'named arguments survive paging\nmyos> ')
+        run('hello', b'Hello from userspace.\nmyos> ')
+        run('run demand', b'[demand] initialized data, BSS, private writes and VM reuse ok\nmyos> ')
         if pressure and (not re.search(rb'pressure drained held=[1-9][0-9]* free=0', output)
                          or b'pressure released held=' not in output):
             raise RuntimeError('missing actual PMM drain/release evidence')
-        run('run bad', b'exit: -4')
-        run('run absent', b'exit: -5')
-        run('run uart', b'exit: -6')
-        run('wait', b'exit: -1')
-        run('run sleep 1', b'exit: 0')
+        run('run bad', b'error: -4')
+        run('run absent', b'error: -5')
+        run('run uart', b'error: -6')
+        run('wait', b'error: -1')
+        run('run sleep 1', b'myos> ')
         first = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
         second = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
         if first == second:
             raise RuntimeError('two live tasks share a handle')
-        run(f'wait {first} 1', b'exit: -21')
-        run('run echo unrelated task progresses', b'unrelated task progresses\nexit: 0')
-        run(f'stop {second}', b'exit: -18')
-        run(f'wait {second}', b'exit: -1')
-        run(f'stop {first}', b'exit: -18')
-        run(f'wait {first}', b'exit: -1')
-        run('run echo ordered pipe bytes | cat', b'ordered pipe bytes\nexit: 0')
-        run('run fill 8192 | slow 1', b'bytes: 8192\nexit: 0')
+        run(f'wait {first} 1', b'error: -21')
+        run('run echo unrelated task progresses', b'unrelated task progresses\nmyos> ')
+        run(f'stop {second}', b'myos> ')
+        run(f'wait {second}', b'error: -1')
+        run(f'stop {first}', b'myos> ')
+        run(f'wait {first}', b'error: -1')
+        run('run echo ordered pipe bytes | cat', b'ordered pipe bytes\nmyos> ')
+        run('run fill 8192 | slow 1', b'bytes: 8192\nmyos> ')
         early = run('run fill 100000 | slow 1 96', b'bytes: 96')
-        if b'producer: -22' not in early and b'producer: -13' not in early:
+        if b'error: -22' not in early and b'error: -13' not in early:
             raise RuntimeError(f'writer did not observe consumer close: {early!r}')
         blocked = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 100', b'task: '))
         if len(blocked) != 2:
             raise RuntimeError('pipeline did not return independent handles')
-        run('run echo running during backpressure', b'running during backpressure\nexit: 0')
-        run(f'stop {int(blocked[1])}', b'exit: -18')
-        producer = run(f'wait {int(blocked[0])}', b'exit: ')
-        if b'exit: -22' not in producer and b'exit: -13' not in producer:
+        run('run echo running during backpressure', b'running during backpressure\nmyos> ')
+        run(f'stop {int(blocked[1])}', b'myos> ')
+        producer = run(f'wait {int(blocked[0])}', b'error: ')
+        if b'error: -22' not in producer and b'error: -13' not in producer:
             raise RuntimeError(f'blocked producer was not released: {producer!r}')
-        run('run hello', b'Hello from userspace.\nexit: 0')
+        run('run hello', b'Hello from userspace.\nmyos> ')
         print(f'[console] OK: {smp} harts, applications, concurrent tasks, deadlines, bounded streams, EOF, stop and reuse')
     except Exception:
         sys.stdout.buffer.write(output)

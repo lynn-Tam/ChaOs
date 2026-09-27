@@ -85,60 +85,60 @@ def main():
                 stream.truncate(0)
                 stream.truncate(16 * 1024 * 1024)
             boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
-                ("mkfs", b"ok\n"),
-                ("write note hello-persistent", b"ok\n"),
-                ("append note -again", b"ok\n"),
-                ("wcat note", b"hello-persistent-again"),
-                ("wls", b"note\n"),
-                ("save README.TXT readme", b"ok\n"),
-                ("wcat readme", b"myos disk file service"),
-                ("save HELLO.PKG hello.pkg", b"ok\n"),
-                ("wstat hello.pkg", package_size),
-                ("run echo stream-persisted | put piped", b"exit: 0"),
-                ("wcat piped", b"stream-persisted"),
-                ("run get piped | put copied", b"exit: 0"),
-                ("wcat copied", b"stream-persisted"),
-                ("mkdir notes", b"ok\n"),
-                ("write notes/item nested-persistent", b"ok\n"),
-                ("wls notes", b"item\n"),
+                ("mkfs", b"myos> "),
+                ("fs write note hello-persistent", b"myos> "),
+                ("fs append note -again", b"myos> "),
+                ("fs cat note", b"hello-persistent-again\nmyos> "),
+                ("fs ls", b"note\n"),
+                ("fs copy README.TXT readme", b"myos> "),
+                ("fs cat readme", b"myos disk file service"),
+                ("fs copy HELLO.PKG hello.pkg", b"myos> "),
+                ("fs stat hello.pkg", package_size),
+                ("run echo stream-persisted | put piped", b"myos> "),
+                ("fs cat piped", b"stream-persisted"),
+                ("run get piped | put copied", b"myos> "),
+                ("fs cat copied", b"stream-persisted"),
+                ("fs mkdir notes", b"myos> "),
+                ("fs write notes/item nested-persistent", b"myos> "),
+                ("fs ls notes", b"item\n"),
             ])
             resumed = [
-                ("wcat note", b"hello-persistent-again"),
-                ("wcat readme", b"myos disk file service"),
-                ("wstat hello.pkg", package_size),
-                ("wcat piped", b"stream-persisted"),
-                ("wcat copied", b"stream-persisted"),
-                ("wcat notes/item", b"nested-persistent"),
-                ("wls notes", b"item\n"),
+                ("fs cat note", b"hello-persistent-again"),
+                ("fs cat readme", b"myos disk file service"),
+                ("fs stat hello.pkg", package_size),
+                ("fs cat piped", b"stream-persisted"),
+                ("fs cat copied", b"stream-persisted"),
+                ("fs cat notes/item", b"nested-persistent"),
+                ("fs ls notes", b"item\n"),
                 ("restart store", b"myos native shell"),
-                ("wcat readme", b"myos disk file service"),
-                ("mv note renamed", b"ok\n"),
-                ("rm renamed", b"ok\n"),
-                ("wls", b"readme\n"),
+                ("fs cat readme", b"myos disk file service"),
+                ("fs mv note renamed", b"myos> "),
+                ("fs rm renamed", b"myos> "),
+                ("fs ls", b"readme\n"),
             ]
             if count == "1":
                 resumed.extend([
-                    ("mkfs", b"ok\n"),
-                    ("write fresh reinitialized", b"ok\n"),
-                    ("wcat fresh", b"reinitialized"),
+                    ("mkfs", b"myos> "),
+                    ("fs write fresh reinitialized", b"myos> "),
+                    ("fs cat fresh", b"reinitialized"),
                 ])
             boot(qemu, kernel, bundle, boot_disk, data_disk, count, resumed)
             if count == "1":
                 boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
-                    ("wcat fresh", b"reinitialized"),
-                    ("save README.TXT readme", b"ok\n"),
+                    ("fs cat fresh", b"reinitialized"),
+                    ("fs copy README.TXT readme", b"myos> "),
                 ])
             print(f"[storage] OK: {count} hart(s), shell writes survive forced QEMU death")
         config = Path(directory) / "write-error.conf"
         config.write_text('[inject-error]\nevent = "write_aio"\nerrno = "5"\nonce = "on"\n')
         source = f"blkdebug:{config}:{data_disk}"
         boot(qemu, kernel, bundle, boot_disk, data_disk, "1", [
-            ("write readme uncertain", b"myos native shell", True),
-            ("wcat readme", b"myos disk file service"),
-            ("write readme recovered", b"ok\n"),
+            ("fs write readme uncertain", b"myos native shell", True),
+            ("fs cat readme", b"myos disk file service"),
+            ("fs write readme recovered", b"myos> "),
         ], source)
         boot(qemu, kernel, bundle, boot_disk, data_disk, "1", [
-            ("wcat readme", b"recovered"),
+            ("fs cat readme", b"recovered"),
         ])
         print("[storage] OK: injected write EIO isolated, old file survived, later sync persisted")
 

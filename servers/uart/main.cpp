@@ -1,4 +1,5 @@
 #include <user/lib/imports.hpp>
+#include <user/lib/console.hpp>
 #include <user/lib/service.hpp>
 #include <user/lib/uart.hpp>
 
@@ -25,6 +26,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     uart::Port port{base};
     port.enable_rx();
     port.write("uart: console ready\n");
+    bool line_start = true;
     service::Message pending{};
     uint64_t read_sequence = 0;
     uint64_t write_sequence = 0;
@@ -36,7 +38,15 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             if (result.status == MYOS_STATUS_WOULD_BLOCK || result.status == MYOS_STATUS_BUSY) break;
             service::require(result.status);
             read_sequence = result.value;
-            port.write(message.data, message.size);
+            if (message.operation == static_cast<uint64_t>(console::Operation::Prompt)) {
+                if (!line_start) { port.put('\n'); line_start = true; }
+            } else if (message.operation != static_cast<uint64_t>(console::Operation::Bytes)) {
+                continue;
+            }
+            for (size_t i = 0; i < message.size; ++i) {
+                port.put(message.data[i]);
+                line_start = message.data[i] == '\n' || message.data[i] == '\r';
+            }
         }
         if (pending.size == 0) {
             uint8_t byte{};
