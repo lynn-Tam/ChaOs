@@ -89,7 +89,11 @@ def main():
                 ("fs write note hello-persistent", b"myos> "),
                 ("fs append note -again", b"myos> "),
                 ("fs cat note", b"hello-persistent-again\nmyos> "),
+                ("cat note", b"hello-persistent-again\nmyos> "),
                 ("fs ls", b"note\n"),
+                ("ls /boot", b"HELLO.PKG"),
+                ("cat /boot/README.TXT", b"myos disk file service"),
+                ("write /boot/denied no", b"error: "),
                 ("fs copy README.TXT readme", b"myos> "),
                 ("fs cat readme", b"myos disk file service"),
                 ("fs copy HELLO.PKG hello.pkg", b"myos> "),
@@ -104,6 +108,7 @@ def main():
             ])
             resumed = [
                 ("fs cat note", b"hello-persistent-again"),
+                ("cat note", b"hello-persistent-again"),
                 ("fs cat readme", b"myos disk file service"),
                 ("fs stat hello.pkg", package_size),
                 ("fs cat piped", b"stream-persisted"),

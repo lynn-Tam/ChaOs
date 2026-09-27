@@ -2,11 +2,45 @@
 #include <user/lib/file_client.hpp>
 #include <user/lib/store_client.hpp>
 #include <user/lib/stream.hpp>
+#include <user/lib/volume_path.hpp>
 
 namespace {
 using namespace myos;
 
 auto same(const char* a, const char* b) noexcept -> bool { return service::equal(a, b); }
+
+auto read_boot(const bootstrap::BootstrapView& info, stream::Writer& output,
+    const char* command, const char* name) noexcept -> myos_status_t {
+    files::Client boot;
+    auto status = boot.connect(info);
+    if (status != MYOS_STATUS_OK) return status;
+    if (same(command, "ls")) {
+        if (*name != '\0') status = MYOS_STATUS_NOT_FOUND;
+        else {
+            io::ControlMessage entry{};
+            do {
+                status = boot.list(entry);
+                if (status != MYOS_STATUS_OK) break;
+                output.write(entry.data, entry.size);
+            } while (entry.value != 0);
+        }
+    } else if (*name == '\0') status = MYOS_STATUS_BAD_ARGS;
+    else {
+        files::File file{};
+        status = boot.open(name, service::length(name), file);
+        if (status == MYOS_STATUS_OK) {
+            if (same(command, "stat"))
+                (void)libk::fmt::format_to<"{} bytes\n">(output, file.size);
+            else status = boot.read(file, [&](uint64_t, const uint8_t* data, size_t bytes) {
+                output.write(reinterpret_cast<const char*>(data), bytes);
+            });
+            const auto closed = boot.close(file);
+            if (status == MYOS_STATUS_OK) status = closed;
+        }
+    }
+    const auto closed = boot.close();
+    return status == MYOS_STATUS_OK ? closed : status;
+}
 
 void hex(stream::Writer& output, const uint8_t* bytes, size_t count) noexcept {
     constexpr char digits[] = "0123456789abcdef";
@@ -40,7 +74,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto info = service::bootstrap(address, size);
     stream::Writer output{service::capability(info, bootstrap::imports::Stdout)};
     if (info.argument_count() < 2) {
-        output.write("fs ls [DIR] | cat FILE | stat FILE | touch FILE | write FILE TEXT | append FILE TEXT | mkdir DIR | rm FILE | mv OLD NEW | copy BOOTFILE FILE | device | volid\n");
+        output.write("fs ls [DIR] | cat/stat/touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | copy BOOTFILE FILE | device | volid\n");
         exit();
     }
     const auto* command = info.argument(1);
@@ -53,6 +87,16 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const bool writing = count >= 4 && (same(command, "write") || same(command, "append"));
     const bool identity = count == 2 && (same(command, "device") || same(command, "volid"));
     if (!listing && !unary && !binary && !writing && !identity) exit(MYOS_STATUS_BAD_ARGS);
+
+    const char* path = count >= 3 ? arg(2) : nullptr;
+    const char* boot_path = path ? volume_path::boot_name(path) : nullptr;
+    if (boot_path != nullptr) {
+        if ((listing || same(command, "cat") || same(command, "stat")))
+            exit(read_boot(info, output, command, boot_path));
+        if (!same(command, "copy")) exit(MYOS_STATUS_DENIED);
+    }
+    if ((same(command, "mv") || same(command, "copy"))
+        && volume_path::boot_name(arg(3)) != nullptr) exit(MYOS_STATUS_DENIED);
 
     store::Client storage;
     auto status = storage.connect(info);
@@ -80,7 +124,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         status = boot.connect(info);
         if (status == MYOS_STATUS_OK) {
             files::File source{};
-            status = boot.open(arg(2), service::length(arg(2)), source);
+            const char* source_name = boot_path != nullptr ? boot_path : arg(2);
+            status = boot.open(source_name, service::length(source_name), source);
             if (status == MYOS_STATUS_OK) {
                 store::File target{};
                 status = storage.open(arg(3), store::Write | store::Create | store::Truncate, target);

@@ -5,6 +5,7 @@
 #include <libk/fmt.hpp>
 #include <user/lib/file_client.hpp>
 #include <user/lib/store_client.hpp>
+#include <user/lib/volume_path.hpp>
 
 namespace {
 using namespace myos;
@@ -40,6 +41,7 @@ public:
     auto open(const char* path) noexcept -> myos_status_t {
         const size_t length = service::length(path);
         if (length == 0 || length > sizeof(io::ControlMessage::data)) return MYOS_STATUS_BAD_ARGS;
+        if (volume_path::boot_name(path) != nullptr) return MYOS_STATUS_DENIED;
         service::copy(target_, path, length + 1);
         const auto now = clock_now();
         if (now.status != MYOS_STATUS_OK) return now.status;
@@ -146,8 +148,8 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     while (*argument == ' ') ++argument;
     if (*line == '\0') return;
     if (service::equal(line, "help")) {
-        console.write("help | ls (boot) | cat FILE (boot) | fs COMMAND (data) | mkfs [32_HEX_ID] | edit FILE | run/spawn PROGRAM [ARGS] | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
-        if (storage_available) console.write("fs: ls [DIR], cat/stat/touch FILE, write/append FILE TEXT, mkdir/rm PATH, mv OLD NEW, copy BOOTFILE FILE, device, volid\n");
+        console.write("help | ls [DIR] | cat FILE | mkfs [32_HEX_ID] | edit FILE | run/spawn PROGRAM [ARGS] | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
+        if (storage_available) console.write("touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp /boot/FILE FILE | stat FILE | fs device/volid; / is data, /boot is read-only\n");
         return;
     }
     if (service::equal(line, "mkfs")) {
@@ -209,7 +211,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         if (status != MYOS_STATUS_OK && status != MYOS_STATUS_BUSY) error(console, status);
         return;
     }
-    if (service::equal(line, "ls")) {
+    if (!storage_available && service::equal(line, "ls")) {
         io::ControlMessage reply;
         do {
             const auto status = filesystem.list(reply);
@@ -226,6 +228,13 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         return;
     }
     const bool cat = service::equal(line, "cat");
+    const bool file_command = storage_available && (
+        service::equal(line, "ls") || service::equal(line, "stat")
+        || service::equal(line, "touch") || service::equal(line, "write")
+        || service::equal(line, "append") || service::equal(line, "mkdir")
+        || service::equal(line, "rm") || service::equal(line, "mv")
+        || service::equal(line, "cp")
+        || (cat && *argument != '\0' && *argument != '|'));
     const bool explicit_run = service::equal(line, "run");
     const bool spawn = service::equal(line, "spawn");
     const bool wait = service::equal(line, "wait");
@@ -255,7 +264,11 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     }
     if (run || spawn) {
         bootstrap::Arguments words;
-        if (cat) (void)words.append("cat", 3);
+        if (file_command) {
+            (void)words.append("fs", 2);
+            if (service::equal(line, "cp")) (void)words.append("copy", 4);
+            else (void)words.append(line, service::length(line));
+        } else if (cat) (void)words.append("cat", 3);
         else if (!explicit_run && !spawn)
             (void)words.append(line, service::length(line));
         size_t split{};
