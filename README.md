@@ -54,7 +54,9 @@ editor: enter replacement lines, then `.` to save or `:q` to discard. The shell
 hands terminal input to a foreground program until it exits; background tasks
 receive EOF instead. Only `mkfs.pkg` can receive Store Admin authority;
 ordinary `fs` and `edit` cannot format. Programs run by name, for example
-`echo hello | put greeting`. Successful commands return to the prompt without
+`echo hello | put greeting`. `echo hello > greeting` replaces a file, and
+`echo world >> greeting` appends to it; redirection runs the ordinary `put`
+program through the same two-task pipe. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
 

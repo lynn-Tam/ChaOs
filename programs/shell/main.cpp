@@ -25,21 +25,27 @@ void error(stream::Writer& console, myos_status_t status) {
 
 // Parse one bounded command line into the existing argv wire form. A pipe is
 // syntax only outside quotes; escaped bytes and empty quoted words are data.
-auto arguments(char* text, bootstrap::Arguments& output, size_t& split) noexcept -> bool {
+auto arguments(char* text, bootstrap::Arguments& output, size_t& split,
+    char (&target)[128], bool& append_output) noexcept -> bool {
     char word[128]{};
     size_t used{};
     bool present{};
+    bool redirect{}, target_present{};
     char quote{};
     auto append = [&]() noexcept -> bool {
         if (!present) return true;
-        const bool ok = output.append(word, used);
+        bool ok{};
+        if (redirect) {
+            ok = !target_present && used != 0;
+            if (ok) { service::copy(target, word, used); target[used] = 0; target_present = true; }
+        } else ok = output.append(word, used);
         used = 0;
         present = false;
         return ok;
     };
     for (;;) {
         const char ch = *text++;
-        if (ch == '\0') return quote == 0 && append();
+        if (ch == '\0') return quote == 0 && append() && (!redirect || target_present);
         if (ch == '\\' && *text != '\0') {
             if (used == sizeof(word)) return false;
             word[used++] = *text++;
@@ -48,11 +54,15 @@ auto arguments(char* text, bootstrap::Arguments& output, size_t& split) noexcept
             if (quote == 0) { quote = ch; present = true; }
             else if (quote == ch) quote = 0;
             else { if (used == sizeof(word)) return false; word[used++] = ch; }
-        } else if (quote == 0 && (ch == ' ' || ch == '|')) {
+        } else if (quote == 0 && (ch == ' ' || ch == '|' || ch == '>')) {
             if (!append()) return false;
             if (ch == '|') {
-                if (split != 0 || output.count() == 0) return false;
+                if (split != 0 || redirect || output.count() == 0) return false;
                 split = output.data().size;
+            } else if (ch == '>') {
+                if (split != 0 || redirect || output.count() == 0) return false;
+                redirect = true;
+                if (*text == '>') { append_output = true; ++text; }
             }
         } else {
             if (used == sizeof(word)) return false;
@@ -65,13 +75,18 @@ auto arguments(char* text, bootstrap::Arguments& output, size_t& split) noexcept
 void command(char* line, service::Connection& process, stream::Writer& console,
     myos_cap_t control, myos_cap_t pool, myos_cap_t cspace) {
     while (*line == ' ') ++line;
+    char name[128]{};
     char* argument = line;
-    while (*argument != '\0' && *argument != ' ') ++argument;
-    if (*argument != '\0') *argument++ = '\0';
+    while (*argument != '\0' && *argument != ' ' && *argument != '|' && *argument != '>') ++argument;
+    const size_t name_size = argument - line;
+    service::copy(name, line, name_size);
+    line = name;
     while (*argument == ' ') ++argument;
     if (*line == '\0') return;
     if (service::equal(line, "help")) {
+        if (*argument != '\0') { console.write("invalid command line\n"); return; }
         console.write("help | ls [DIR] | cat FILE | mkfs [32_HEX_ID] | edit FILE | run/spawn PROGRAM [ARGS] | jobs | wait [ID] [MS] | stop [ID] | restart SERVICE\n");
+        if (storage_available) console.write("PROGRAM > FILE (replace) | PROGRAM >> FILE (append)\n");
         if (storage_available) console.write("touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp SOURCE DEST | stat FILE | fs device/volid; / is data, /boot is read-only\n");
         return;
     }
@@ -111,6 +126,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         return;
     }
     if (service::equal(line, "jobs")) {
+        if (*argument != '\0') { console.write("invalid command line\n"); return; }
         for (auto child : children) if (child) (void)libk::fmt::format_to<"task: {}\n">(console, child);
         return;
     }
@@ -157,8 +173,18 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         } else if (!explicit_run && !spawn)
             (void)words.append(line, service::length(line));
         size_t split{};
-        if (!arguments(argument, words, split) || words.count() == 0) {
+        char target[128]{};
+        bool append_output{};
+        if (!arguments(argument, words, split, target, append_output) || words.count() == 0) {
             console.write("invalid command line\n"); return;
+        }
+        if (*target != '\0') {
+            split = words.data().size;
+            if (!words.append("put", 3)
+                || (append_output && !words.append("-a", 2))
+                || !words.append(target, service::length(target))) {
+                console.write("argument too long\n"); return;
+            }
         }
         request.size = words.data().size;
         if (split != 0) {
