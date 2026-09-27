@@ -20,12 +20,13 @@ inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, MYOS_OBJECT_KI
 inline constexpr Import Stdin{"stdin", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Stdout{"stdout", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import Stderr{"stderr", 0x5354524d, MYOS_OBJECT_KIND_CHANNEL};
-inline constexpr Import Process{"process", 0x50524f43, MYOS_OBJECT_KIND_CHANNEL, 3};
+inline constexpr Import Process{"process", 0x50524f43, MYOS_OBJECT_KIND_CHANNEL, 3, 1};
 inline constexpr Import Files{"files", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import FilesRead{"files.read", 0x46494c45, MYOS_OBJECT_KIND_CHANNEL, 3};
 inline constexpr Import Block{"block", 0x424c4f43, MYOS_OBJECT_KIND_CHANNEL, 2, 1};
 inline constexpr Import Store{"store", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import StoreRead{"store.read", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
+inline constexpr Import StoreAdmin{"store.admin", 0x53544f52, MYOS_OBJECT_KIND_CHANNEL, 1, 1};
 inline constexpr Import ServiceControl{"service.control", 0x53564354, MYOS_OBJECT_KIND_CHANNEL};
 inline constexpr Import ServiceWake{"service.wake", 0x53564357, MYOS_OBJECT_KIND_NOTIFICATION};
 inline constexpr Import Pager{"pager", 0x50414745, MYOS_OBJECT_KIND_PAGER};

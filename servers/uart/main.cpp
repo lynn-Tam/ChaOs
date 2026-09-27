@@ -1,6 +1,7 @@
 #include <user/lib/imports.hpp>
 #include <user/lib/console.hpp>
 #include <user/lib/service.hpp>
+#include <user/lib/stream.hpp>
 #include <user/lib/uart.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
@@ -28,6 +29,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     port.write("uart: console ready\n");
     bool line_start = true;
     service::Message pending{};
+    bool pending_valid{};
+    bool eof_pending{};
+    bool carriage_return{};
     uint64_t read_sequence = 0;
     uint64_t write_sequence = 0;
     for (;;) {
@@ -48,21 +52,45 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 line_start = message.data[i] == '\n' || message.data[i] == '\r';
             }
         }
-        if (pending.size == 0) {
-            uint8_t byte{};
-            while (pending.size < sizeof(pending.data) && port.try_get(byte))
-                pending.data[pending.size++] = static_cast<char>(byte);
+        if (!pending_valid) {
+            if (eof_pending) {
+                pending.operation = static_cast<uint64_t>(stream::Frame::End);
+                pending_valid = true;
+                eof_pending = false;
+            } else {
+                uint8_t byte{};
+                while (pending.size < sizeof(pending.data) && port.try_get(byte)) {
+                    if (byte == '\n' && carriage_return) {
+                        carriage_return = false;
+                        continue;
+                    }
+                    carriage_return = byte == '\r';
+                    if (carriage_return) byte = '\n';
+                    if (byte == 4) {
+                        if (pending.size == 0) {
+                            pending.operation = static_cast<uint64_t>(stream::Frame::End);
+                            pending_valid = true;
+                        } else eof_pending = true;
+                        break;
+                    }
+                    pending.data[pending.size++] = static_cast<char>(byte);
+                    pending_valid = true;
+                    if (byte == '\n') break;
+                }
+            }
         }
-        if (pending.size != 0) {
+        if (pending_valid) {
             const auto result = service::send(input, pending, false);
             if (result.status == MYOS_STATUS_OK) {
                 write_sequence = result.value;
                 pending = {};
+                pending_valid = false;
             } else if (result.status != MYOS_STATUS_WOULD_BLOCK && result.status != MYOS_STATUS_BUSY) {
                 service::require(result.status);
             }
         }
-        if (pending.size == 0) {
+        if (!pending_valid && eof_pending) continue;
+        if (!pending_valid) {
             const auto observed = irq_observe(irq);
             if (observed.status == MYOS_STATUS_OK) {
                 const auto status = irq_ack(irq, observed.value2, observed.value).status;
@@ -76,7 +104,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             if (port.rx_ready()) continue;
         }
         service::require(channel_arm(output, readable.value, read_sequence).status);
-        if (pending.size != 0)
+        if (pending_valid)
             service::require(channel_arm(input, writable.value, write_sequence).status);
         service::require(notification_wait(events).status);
     }

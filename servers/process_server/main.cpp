@@ -137,7 +137,8 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
 }
 // A two-stage pipeline is one admission request. Failed second-stage admission
 // owns and reaps the first stage internally; no orphan handle escapes.
-auto pipeline(const bootstrap::BootstrapView& info, const service::Message& request) noexcept -> service::Message {
+auto pipeline(const bootstrap::BootstrapView& info, const service::Message& request,
+    myos_cap_t input) noexcept -> service::Message {
     service::Message reply{.operation = request.operation, .status = MYOS_STATUS_BAD_ARGS};
     if (request.id == 0 || request.id >= request.size) return reply;
     size_t available{};
@@ -152,7 +153,7 @@ auto pipeline(const bootstrap::BootstrapView& info, const service::Message& requ
     if (reply.status != MYOS_STATUS_OK) return reply;
     auto first = request;
     first.size = request.id;
-    auto producer = spawn(info, first, 0, pipe->writer());
+    auto producer = spawn(info, first, input, pipe->writer());
     if (producer.status != MYOS_STATUS_OK) { pipe->close(); reply.status = producer.status; return reply; }
     pipe->producer = producer.id;
     service::Message second{.size = request.size - request.id};
@@ -204,6 +205,10 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             0, 1, UINT64_MAX));
     if (const auto store = info.selector(bootstrap::imports::StoreRead); store != 0)
         service::require(supervisor.add("store.read.directory", store,
+            MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
+            0, 1, UINT64_MAX));
+    if (const auto store = info.selector(bootstrap::imports::StoreAdmin); store != 0)
+        service::require(supervisor.add("store.admin.directory", store,
             MYOS_OBJECT_KIND_CHANNEL, MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE,
             0, 1, UINT64_MAX));
     service::Connection channel{service::capability(info, bootstrap::imports::Process), events};
@@ -260,10 +265,18 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 service::Message reply{.operation = request.operation, .id = request.id, .status = MYOS_STATUS_BAD_ARGS};
                 switch (static_cast<service::Process>(request.operation)) {
                 case service::Process::Pipeline:
-                    reply = pipeline(info, request);
+                    reply = pipeline(info, request, 0);
                     break;
                 case service::Process::Spawn:
                     reply = spawn(info, request);
+                    break;
+                case service::Process::ForegroundPipeline:
+                    reply = pipeline(info, request,
+                        service::capability(info, bootstrap::imports::ConsoleInput));
+                    break;
+                case service::Process::ForegroundSpawn:
+                    reply = spawn(info, request,
+                        service::capability(info, bootstrap::imports::ConsoleInput));
                     break;
                 case service::Process::CancelWait: {
                     auto* job = find(request.id);

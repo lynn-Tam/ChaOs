@@ -12,7 +12,7 @@ inline auto named(deploy::ByteView value, const char* name) noexcept -> bool {
 
 // The scheduling domain is an input to construction, not an application
 // import. Only the explicitly allowed service contracts may cross that boundary.
-inline auto admit(const deploy::TaskPlanView& task) noexcept -> bool {
+inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) noexcept -> bool {
     const auto& row = *task.row();
     if (row.executions.count != 1 || task.execution(0)->model != MYOS_DEPLOY_EXECUTION_THREAD
         || row.images.count != 1 || row.exports.count != 0 || row.dependencies.count != 0
@@ -44,6 +44,10 @@ inline auto admit(const deploy::TaskPlanView& task) noexcept -> bool {
                 contract = &bootstrap::imports::Store; source = "store.directory";
             } else if (named(name, bootstrap::imports::StoreRead.name)) {
                 contract = &bootstrap::imports::StoreRead; source = "store.read.directory";
+            } else if (named(name, bootstrap::imports::StoreAdmin.name)
+                && named(package, "mkfs")) {
+                // package is the trusted boot-disk lookup selected by argv[0].
+                contract = &bootstrap::imports::StoreAdmin; source = "store.admin.directory";
             } else if (named(name, bootstrap::imports::Stdin.name)) {
                 contract = &bootstrap::imports::Stdin; source = "stdin"; rights = MYOS_RIGHT_RECEIVE;
             } else if (named(name, bootstrap::imports::Stdout.name)) {

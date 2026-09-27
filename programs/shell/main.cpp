@@ -3,9 +3,7 @@
 #include <user/lib/imports.hpp>
 #include <user/lib/clock.hpp>
 #include <libk/fmt.hpp>
-#include <user/lib/file_client.hpp>
-#include <user/lib/store_client.hpp>
-#include <user/lib/volume_path.hpp>
+#include <user/lib/terminal.hpp>
 
 namespace {
 using namespace myos;
@@ -19,86 +17,11 @@ void forget(uint64_t id) {
     for (auto& child : children) if (child == id) child = 0;
     if (latest == id) { latest = 0; for (auto child : children) if (child) latest = child; }
 }
-files::Client filesystem;
-store::Client store_client;
 bool storage_available{};
 
 void error(stream::Writer& console, myos_status_t status) {
     (void)libk::fmt::format_to<"error: {}\n">(console, status);
 }
-
-class Editor final {
-    store::File draft_{};
-    char target_[sizeof(io::ControlMessage::data) + 1]{};
-    char temporary_[24]{};
-    uint64_t offset_{};
-    bool active_{};
-    bool draft_present_{};
-public:
-    auto active() const noexcept -> bool { return active_; }
-    auto draft_present() const noexcept -> bool { return draft_present_; }
-
-    auto open(const char* path) noexcept -> myos_status_t {
-        const size_t length = service::length(path);
-        if (length == 0 || length > sizeof(io::ControlMessage::data)) return MYOS_STATUS_BAD_ARGS;
-        if (volume_path::boot_name(path) != nullptr) return MYOS_STATUS_DENIED;
-        service::copy(target_, path, length + 1);
-        const auto now = clock_now();
-        if (now.status != MYOS_STATUS_OK) return now.status;
-        uint64_t candidate = now.value;
-        constexpr char digits[] = "0123456789abcdef";
-        for (;;) {
-            service::copy(temporary_, "/.edit-", 7);
-            for (size_t i = 0; i < 16; ++i)
-                temporary_[7 + i] = digits[(candidate >> ((15 - i) * 4)) & 15];
-            temporary_[23] = '\0';
-            const auto status = store_client.open(temporary_,
-                store::Write | store::Create | store::Exclusive, draft_);
-            if (status == MYOS_STATUS_BUSY && candidate != UINT64_MAX) { ++candidate; continue; }
-            if (status != MYOS_STATUS_OK) return status;
-            offset_ = 0;
-            active_ = true;
-            draft_present_ = true;
-            return MYOS_STATUS_OK;
-        }
-    }
-
-    auto line(const char* text) noexcept -> myos_status_t {
-        const size_t length = service::length(text);
-        const auto status = store_client.write(draft_, offset_,
-            reinterpret_cast<const uint8_t*>(text), length);
-        if (status != MYOS_STATUS_OK) return status;
-        offset_ += length;
-        const uint8_t newline = '\n';
-        const auto ended = store_client.write(draft_, offset_, &newline, 1);
-        if (ended == MYOS_STATUS_OK) ++offset_;
-        return ended;
-    }
-
-    auto finish() noexcept -> myos_status_t {
-        active_ = false;
-        auto status = store_client.sync(draft_);
-        const auto closed = store_client.close(draft_);
-        if (status == MYOS_STATUS_OK) status = closed;
-        if (status == MYOS_STATUS_OK) {
-            status = store_client.rename(temporary_, target_);
-            if (status == MYOS_STATUS_OK) draft_present_ = false;
-        }
-        return status;
-    }
-
-    auto cancel() noexcept -> myos_status_t {
-        active_ = false;
-        auto status = store_client.close(draft_);
-        const auto removed = store_client.remove(temporary_);
-        if (removed == MYOS_STATUS_OK) draft_present_ = false;
-        if (status == MYOS_STATUS_OK) status = removed;
-        return status;
-    }
-
-    auto draft() const noexcept -> const char* { return temporary_; }
-};
-Editor editor;
 
 // Parse one bounded command line into the existing argv wire form. A pipe is
 // syntax only outside quotes; escaped bytes and empty quoted words are data.
@@ -152,30 +75,6 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         if (storage_available) console.write("touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp /boot/FILE FILE | stat FILE | fs device/volid; / is data, /boot is read-only\n");
         return;
     }
-    if (service::equal(line, "mkfs")) {
-        if (!storage_available) { error(console, MYOS_STATUS_NOT_FOUND); return; }
-        myos_status_t status{};
-        if (*argument == '\0') status = store_client.format();
-        else {
-            uint8_t id[store::VolumeIdSize]{};
-            status = store::parse_volume_id(argument, service::length(argument), id)
-                ? store_client.format(id) : MYOS_STATUS_BAD_ARGS;
-        }
-        if (status != MYOS_STATUS_OK) error(console, status);
-        return;
-    }
-    if (service::equal(line, "edit")) {
-        if (!storage_available) { error(console, MYOS_STATUS_NOT_FOUND); return; }
-        bootstrap::Arguments path;
-        size_t split{};
-        if (!arguments(argument, path, split) || split != 0 || path.count() != 1) {
-            error(console, MYOS_STATUS_BAD_ARGS); return;
-        }
-        const auto status = editor.open(path.argument(0));
-        if (status != MYOS_STATUS_OK) error(console, status);
-        else console.write("Enter replacement text; '.' saves, ':q' cancels.\n");
-        return;
-    }
     if (service::equal(line, "restart")) {
         service::Message request{};
         request.size = service::length(argument);
@@ -211,18 +110,6 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         if (status != MYOS_STATUS_OK && status != MYOS_STATUS_BUSY) error(console, status);
         return;
     }
-    if (!storage_available && service::equal(line, "ls")) {
-        io::ControlMessage reply;
-        do {
-            const auto status = filesystem.list(reply);
-            if (status != MYOS_STATUS_OK) {
-                error(console, status);
-                return;
-            }
-            console.write(reply.data, reply.size);
-        } while (reply.value != 0);
-        return;
-    }
     if (service::equal(line, "jobs")) {
         for (auto child : children) if (child) (void)libk::fmt::format_to<"task: {}\n">(console, child);
         return;
@@ -241,7 +128,8 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     const bool stop = service::equal(line, "stop");
     const bool run = !spawn && !wait && !stop;
     service::Message request{};
-    request.operation = static_cast<uint64_t>(run || spawn ? service::Process::Spawn
+    request.operation = static_cast<uint64_t>(run ? service::Process::ForegroundSpawn
+        : spawn ? service::Process::Spawn
         : wait ? service::Process::Wait : service::Process::Stop);
     request.id = latest;
     if ((wait || stop) && *argument != 0) {
@@ -268,8 +156,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
             (void)words.append("fs", 2);
             if (service::equal(line, "cp")) (void)words.append("copy", 4);
             else (void)words.append(line, service::length(line));
-        } else if (cat) (void)words.append("cat", 3);
-        else if (!explicit_run && !spawn)
+        } else if (!explicit_run && !spawn)
             (void)words.append(line, service::length(line));
         size_t split{};
         if (!arguments(argument, words, split) || words.count() == 0) {
@@ -278,7 +165,8 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         request.size = words.data().size;
         if (split != 0) {
             if (split == request.size) { console.write("invalid pipeline\n"); return; }
-            request.operation = static_cast<uint64_t>(service::Process::Pipeline);
+            request.operation = static_cast<uint64_t>(run
+                ? service::Process::ForegroundPipeline : service::Process::Pipeline);
             request.id = split;
         }
         if (request.size > sizeof(request.data)) { console.write("argument too long\n"); return; }
@@ -290,7 +178,8 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     if ((run || spawn) && reply.status == MYOS_STATUS_OK) {
         const auto child = reply.id;
         uint64_t consumer{};
-        if (reply.operation == static_cast<uint64_t>(service::Process::Pipeline)) {
+        if (reply.operation == static_cast<uint64_t>(service::Process::Pipeline)
+            || reply.operation == static_cast<uint64_t>(service::Process::ForegroundPipeline)) {
             if (reply.size != sizeof(consumer)) exit(MYOS_STATUS_PEER_FAULT);
             service::copy(&consumer, reply.data, sizeof(consumer));
         }
@@ -333,53 +222,19 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::Connection process{
         service::capability(info, myos::bootstrap::imports::Process),
         service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
-    service::require(filesystem.connect(info));
-    storage_available = info.selector(bootstrap::imports::Store) != 0;
-    if (storage_available) service::require(store_client.connect(info));
+    storage_available = info.argument_count() == 1 && service::equal(info.argument(0), "storage");
     console.write("myos native shell\n");
     myos::console::prompt(output, "myos> ");
+    terminal::LineReader reader{input, output};
     char line[128]{};
-    size_t used = 0;
-    bool overflow = false;
-    bool carriage_return = false;
     for (;;) {
-        service::Message message{};
-        service::require(service::receive(input, message).status);
-        for (size_t i = 0; i < message.size; ++i) {
-            const char byte = message.data[i];
-            if (byte == '\n' && carriage_return) { carriage_return = false; continue; }
-            carriage_return = byte == '\r';
-            if (byte == '\r' || byte == '\n') {
-                console.put('\n');
-                line[used] = '\0';
-                if (overflow) console.write("line too long\n");
-                else if (editor.active()) {
-                    myos_status_t status = MYOS_STATUS_OK;
-                    if (service::equal(line, ".")) status = editor.finish();
-                    else if (service::equal(line, ":q")) status = editor.cancel();
-                    else status = editor.line(line);
-                    if (status != MYOS_STATUS_OK) {
-                        error(console, status);
-                        if (editor.active()) (void)editor.cancel();
-                        if (editor.draft_present()) {
-                            console.write("draft: ");
-                            console.write(editor.draft());
-                            console.put('\n');
-                        }
-                    }
-                } else command(line, process, console,
-                    service::capability(info, bootstrap::imports::ServiceControl),
-                    service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
-                    service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
-                used = 0;
-                overflow = false;
-                myos::console::prompt(output, editor.active() ? "edit> " : "myos> ");
-            } else if (byte == '\b' || byte == 127) {
-                if (used != 0) { --used; console.write("\b \b"); }
-            } else if (byte >= 32 && byte < 127) {
-                if (used + 1 < sizeof(line)) { line[used++] = byte; console.put(byte); }
-                else overflow = true;
-            }
-        }
+        const auto result = reader.read(line);
+        if (result == terminal::LineResult::TooLong) console.write("line too long\n");
+        else if (result == terminal::LineResult::Line)
+            command(line, process, console,
+                service::capability(info, bootstrap::imports::ServiceControl),
+                service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
+                service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
+        myos::console::prompt(output, "myos> ");
     }
 }

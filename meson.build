@@ -502,6 +502,10 @@ cat_user = executable(
   'cat.elf', files('programs/cat/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
+ls_user = executable(
+  'ls.elf', files('programs/ls/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
 put_user = executable(
   'put.elf', files('programs/put/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
@@ -512,6 +516,14 @@ get_user = executable(
 )
 fs_user = executable(
   'fs.elf', files('programs/fs/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+edit_user = executable(
+  'edit.elf', files('programs/edit/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
+)
+mkfs_user = executable(
+  'mkfs.elf', files('programs/mkfs/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
   link_whole: user_runtime, link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 sleep_user = executable(
@@ -737,6 +749,14 @@ cat_package = custom_target(
   'cat-package', input: [cat_user, cat_manifest], output: 'cat.pkg',
   command: [bootpack, '@OUTPUT@', 'cat', 'cat=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
+ls_manifest = custom_target(
+  'ls-manifest', input: ls_user, output: 'ls.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'ls', '@INPUT@'], build_by_default: false,
+)
+ls_package = custom_target(
+  'ls-package', input: [ls_user, ls_manifest], output: 'ls.pkg',
+  command: [bootpack, '@OUTPUT@', 'ls', 'ls=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
 put_manifest = custom_target(
   'put-manifest', input: put_user, output: 'put.manifest',
   command: [deploypack, 'application', '@OUTPUT@', 'put', '@INPUT@'], build_by_default: false,
@@ -760,6 +780,22 @@ fs_manifest = custom_target(
 fs_package = custom_target(
   'fs-package', input: [fs_user, fs_manifest], output: 'fs.pkg',
   command: [bootpack, '@OUTPUT@', 'fs', 'fs=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+edit_manifest = custom_target(
+  'edit-manifest', input: edit_user, output: 'edit.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'edit', '@INPUT@'], build_by_default: false,
+)
+edit_package = custom_target(
+  'edit-package', input: [edit_user, edit_manifest], output: 'edit.pkg',
+  command: [bootpack, '@OUTPUT@', 'edit', 'edit=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
+)
+mkfs_manifest = custom_target(
+  'mkfs-manifest', input: mkfs_user, output: 'mkfs.manifest',
+  command: [deploypack, 'application', '@OUTPUT@', 'mkfs', '@INPUT@'], build_by_default: false,
+)
+mkfs_package = custom_target(
+  'mkfs-package', input: [mkfs_user, mkfs_manifest], output: 'mkfs.pkg',
+  command: [bootpack, '@OUTPUT@', 'mkfs', 'mkfs=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
 sleep_manifest = custom_target(
   'sleep-manifest', input: sleep_user, output: 'sleep.manifest',
@@ -786,9 +822,9 @@ denied_package = custom_target(
   command: [bootpack, '@OUTPUT@', 'uart', 'uart=@INPUT0@', 'data:manifest=@INPUT1@'], build_by_default: false,
 )
 disk_image = custom_target(
-  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package, slow_package, fill_package, put_package, get_package, fs_package], output: 'disk.img',
+  'disk-image', input: [files('user/disk/README.TXT'), hello_package, echo_package, demand_package, denied_package, sleep_package, cat_package, ls_package, slow_package, fill_package, put_package, get_package, fs_package, edit_package, mkfs_package], output: 'disk.img',
   command: [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@', 'README.TXT=@INPUT0@', 'HELLO.PKG=@INPUT1@',
-    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'SLOW.PKG=@INPUT7@', 'FILL.PKG=@INPUT8@', 'PUT.PKG=@INPUT9@', 'GET.PKG=@INPUT10@', 'FS.PKG=@INPUT11@', 'BAD.PKG=@INPUT0@'],
+    'ECHO.PKG=@INPUT2@', 'DEMAND.PKG=@INPUT3@', 'UART.PKG=@INPUT4@', 'SLEEP.PKG=@INPUT5@', 'CAT.PKG=@INPUT6@', 'LS.PKG=@INPUT7@', 'SLOW.PKG=@INPUT8@', 'FILL.PKG=@INPUT9@', 'PUT.PKG=@INPUT10@', 'GET.PKG=@INPUT11@', 'FS.PKG=@INPUT12@', 'EDIT.PKG=@INPUT13@', 'MKFS.PKG=@INPUT14@', 'BAD.PKG=@INPUT0@'],
   build_by_default: false,
 )
 file_test_data = custom_target(

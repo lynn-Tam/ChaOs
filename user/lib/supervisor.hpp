@@ -21,7 +21,7 @@ struct LaunchOptions final {
     myos_cap_t terminal_events{};
     myos_word_t close_badge{};
     libk::Span<const LaunchSource> sources{};
-    bool (*admit)(const TaskPlanView&) noexcept{};
+    bool (*admit)(const TaskPlanView&, ByteView) noexcept{};
 };
 
 // Program owns the bytes borrowed by its immutable plan and live tasks.
@@ -186,7 +186,7 @@ public:
         auto lease = program.plan_.lease();
         if (!index || !lease) return libk::nullopt;
         auto task = lease->task(*index);
-        if (options.admit != nullptr && !options.admit(task)) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+        if (options.admit != nullptr && !options.admit(task, name)) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
         bootstrap::Arguments defaults;
         const bootstrap::Arguments* arguments = options.arguments;
         if (arguments == nullptr && !task.row()->arguments.empty()) {

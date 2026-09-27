@@ -381,16 +381,22 @@ inline auto pack_application(const char* name, const char* image, uint64_t budge
     task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
-    if (std::string_view{name} == "cat" || std::string_view{name} == "put"
-        || std::string_view{name} == "get" || std::string_view{name} == "fs") {
+    if (std::string_view{name} == "cat" || std::string_view{name} == "ls"
+        || std::string_view{name} == "put"
+        || std::string_view{name} == "get" || std::string_view{name} == "fs"
+        || std::string_view{name} == "edit" || std::string_view{name} == "mkfs") {
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
-        if (std::string_view{name} == "cat" || std::string_view{name} == "fs")
+        if (std::string_view{name} == "cat" || std::string_view{name} == "ls"
+            || std::string_view{name} == "fs")
             task.authority(myos::bootstrap::imports::Files, "files.directory", MYOS_RIGHT_SEND);
-        if (std::string_view{name} == "put" || std::string_view{name} == "fs")
+        if (std::string_view{name} == "put" || std::string_view{name} == "fs"
+            || std::string_view{name} == "edit")
             task.authority(myos::bootstrap::imports::Store, "store.directory", MYOS_RIGHT_SEND);
         if (std::string_view{name} == "get")
             task.authority(myos::bootstrap::imports::StoreRead, "store.read.directory", MYOS_RIGHT_SEND);
+        if (std::string_view{name} == "mkfs")
+            task.authority(myos::bootstrap::imports::StoreAdmin, "store.admin.directory", MYOS_RIGHT_SEND);
     }
     if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();
@@ -450,7 +456,8 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         t.authority(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY, "uart.memory", MYOS_RIGHT_MAP);
         t.authority(MYOS_BOOTSTRAP_CAP_IRQ, "uart.irq", MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK);
         t.channel_service(myos::bootstrap::imports::ConsoleOutput, "console.sender", 1, receive, send);
-        t.channel_service(myos::bootstrap::imports::ConsoleInput, "input.receiver", 0, send, receive);
+        t.channel_service(myos::bootstrap::imports::ConsoleInput, "input.receiver", 0,
+            send, receive | MYOS_RIGHT_DUPLICATE);
         t.finish();
     }
     {
@@ -471,7 +478,12 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
             "store.client", 0, 2, send | MYOS_RIGHT_DUPLICATE);
         if (storage) t.channel(myos::bootstrap::imports::StoreRead,
             "store.client", 0, 1, send | MYOS_RIGHT_DUPLICATE);
-        t.channel_service(myos::bootstrap::imports::Process, "process.client", 1, send | receive, send | receive, 16, 0, 3);
+        if (storage) t.channel(myos::bootstrap::imports::StoreAdmin,
+            "store.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
+        t.channel_service(myos::bootstrap::imports::Process, "process.client", 1,
+            send | receive, send | receive, 16, 0, 3);
+        t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1,
+            receive | MYOS_RIGHT_DUPLICATE);
         t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 1, send | MYOS_RIGHT_DUPLICATE);
         t.finish();
     }
@@ -481,13 +493,9 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
         t.requires_service(uart, "console");
         t.requires_service(process, "process");
-        t.requires_service(files, "files");
-        if (storage) t.requires_service(6, "store");
         t.cspace(128, 20);
         t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, send);
-        if (storage) t.channel(myos::bootstrap::imports::Store,
-            "store.client", 0, 3, send);
+        if (storage) t.argument("storage");
         t.channel(myos::bootstrap::imports::Process, "process.client", 0, 1, send | receive);
         t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 2, send);
         t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1, receive);

@@ -40,17 +40,18 @@ tools/build/ninja.sh run-console
 ```
 
 The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
-disk, run `mkfs` once in the shell; running it again erases the data volume.
+disk, run the `mkfs` program once; running it again erases the data volume.
 The data disk is `/`; the read-only FAT32 boot disk is `/boot`. Use `touch note`,
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
 `mkdir dir`, `mv note dir/note`, and `rm dir/note`. `ls /boot` shows boot files;
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the
 data disk. These shell commands run the ordinary `fs` program, which is also
 available explicitly as `fs COMMAND`. Quote names and text containing spaces,
-for example `write "my note" "hello world"`. `edit note` enters the shell's line editor:
-enter replacement lines, then `.` to save or `:q` to discard. The shell owns
-terminal input and the Admin authority needed by `mkfs`; ordinary `fs` has
-only the Store directory capability. Programs run by name, for example
+for example `write "my note" "hello world"`. `edit note` runs a separate line
+editor: enter replacement lines, then `.` to save or `:q` to discard. The shell
+hands terminal input to a foreground program until it exits; background tasks
+receive EOF instead. Only `mkfs.pkg` can receive Store Admin authority;
+ordinary `fs` and `edit` cannot format. Programs run by name, for example
 `echo hello | put greeting`. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
