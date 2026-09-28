@@ -22,7 +22,7 @@ auto expected(const uint8_t* id) noexcept -> bool {
 struct File final {
     lfs_file_t state{};
     lfs_file_config config{};
-    uint8_t cache[512]{};
+    uint8_t cache[store::Volume::BlockSize]{};
     char name[sizeof(io::ControlMessage::data) + 1]{};
     uint64_t generation{};
     bool open{};

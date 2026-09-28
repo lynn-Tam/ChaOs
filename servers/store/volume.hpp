@@ -11,6 +11,7 @@ namespace myos::store {
 // sync is a real virtio-blk FLUSH. No implicit formatting occurs on mount.
 class Volume final : private libk::noncopyable_nonmovable {
 public:
+    static constexpr uint32_t BlockSize = 4096;
     [[nodiscard]] auto open(block::Client& backend) noexcept -> myos_status_t {
         backend_ = &backend;
         const uint64_t blocks = backend.capacity() / BlockSize;
@@ -26,7 +27,7 @@ public:
         config_.block_size = BlockSize;
         config_.block_count = static_cast<lfs_size_t>(blocks);
         config_.block_cycles = -1;
-        config_.cache_size = SectorSize;
+        config_.cache_size = BlockSize;
         config_.lookahead_size = sizeof(lookahead_);
         config_.read_buffer = read_cache_;
         config_.prog_buffer = write_cache_;
@@ -79,7 +80,6 @@ public:
 
 private:
     static constexpr uint32_t SectorSize = 512;
-    static constexpr uint32_t BlockSize = 4096;
     static constexpr uint8_t IdentityAttribute = 1;
 
     [[nodiscard]] static auto status(int result) noexcept -> myos_status_t {
@@ -139,8 +139,8 @@ private:
     block::Client* backend_{};
     lfs_config config_{};
     lfs_t fs_{};
-    uint8_t read_cache_[SectorSize]{};
-    uint8_t write_cache_[SectorSize]{};
+    uint8_t read_cache_[BlockSize]{};
+    uint8_t write_cache_[BlockSize]{};
     uint8_t lookahead_[SectorSize]{};
     uint8_t erased_[BlockSize]{};
     myos_status_t last_error_{};
