@@ -15,7 +15,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     do {
         status = boot.list(entry, info.argument_count() == 2 ? info.argument(1) : nullptr);
         if (status != MYOS_STATUS_OK) break;
-        if (entry.size != 0) { output.write(entry.data, entry.size); output.put('\n'); }
+        if (!store::each_name(entry, [&](const char* name, size_t length) {
+            output.write(name, length); output.put('\n');
+        })) { status = MYOS_STATUS_PEER_FAULT; break; }
     } while (entry.value != 0);
     const auto closed = boot.close();
     if (status == MYOS_STATUS_OK) status = closed;

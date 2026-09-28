@@ -170,20 +170,28 @@ struct Client final {
                 result = lfs_dir_seek(volume.fs(), &cursor, request.value);
             lfs_info entry{};
             while (result == 0) {
+                const auto position = lfs_dir_tell(volume.fs(), &cursor);
+                if (position < 0) { result = position; break; }
                 result = lfs_dir_read(volume.fs(), &cursor, &entry);
-                if (result <= 0 || (!service::equal(entry.name, ".")
-                    && !service::equal(entry.name, ".."))) break;
-                result = 0;
-            }
-            if (result > 0) {
-                reply.size = service::length(entry.name);
-                if (reply.size > sizeof(reply.data)) result = LFS_ERR_NAMETOOLONG;
-                else {
-                    service::copy(reply.data, entry.name, reply.size);
-                    const auto position = lfs_dir_tell(volume.fs(), &cursor);
-                    result = position < 0 ? position : 0;
-                    if (position >= 0) reply.value = position;
+                if (result <= 0) { reply.value = 0; break; }
+                if (service::equal(entry.name, ".") || service::equal(entry.name, "..")) {
+                    result = 0; continue;
                 }
+                const size_t length = service::length(entry.name);
+                if (length > sizeof(reply.data)) { result = LFS_ERR_NAMETOOLONG; break; }
+                const size_t separator = reply.size != 0;
+                if (length + separator > sizeof(reply.data) - reply.size) {
+                    reply.value = position;
+                    result = 0;
+                    break;
+                }
+                if (separator) reply.data[reply.size++] = '\0';
+                service::copy(reply.data + reply.size, entry.name, length);
+                reply.size += length;
+                const auto next = lfs_dir_tell(volume.fs(), &cursor);
+                if (next < 0) { result = next; break; }
+                reply.value = next;
+                result = 0;
             }
             const int closed = opened ? lfs_dir_close(volume.fs(), &cursor) : 0;
             reply.status = volume.error(result < 0 ? result : closed);

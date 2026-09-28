@@ -121,25 +121,42 @@ struct Client final {
             if (boot_dir) reply.status = boot.list(entry);
             else do {
                 reply.status = data.list(entry, name);
-                if (reply.status != MYOS_STATUS_OK || !root || entry.size != 4
-                    || entry.data[0] != 'b' || entry.data[1] != 'o'
-                    || entry.data[2] != 'o' || entry.data[3] != 't') break;
-                if (entry.value == 0) { entry.size = 0; break; }
+                if (reply.status != MYOS_STATUS_OK || !root) break;
+                size_t start{};
+                reply.size = 0;
+                while (start < entry.size) {
+                    size_t end = start;
+                    while (end < entry.size && entry.data[end] != '\0') ++end;
+                    if (end - start != 4 || entry.data[start] != 'b'
+                        || entry.data[start + 1] != 'o' || entry.data[start + 2] != 'o'
+                        || entry.data[start + 3] != 't') {
+                        if (reply.size != 0) reply.data[reply.size++] = '\0';
+                        service::copy(reply.data + reply.size, entry.data + start, end - start);
+                        reply.size += end - start;
+                    }
+                    start = end + 1;
+                }
+                if (reply.size != 0 || entry.value == 0) break;
+                entry = {.value = entry.value};
             } while (true);
             if (reply.status == MYOS_STATUS_OK) {
                 if (boot_dir && entry.size != 0) {
-                    while (reply.size < entry.size && entry.data[reply.size] != '\n')
-                        ++reply.size;
-                    if (reply.size == entry.size) {
+                    reply.size = entry.size;
+                    service::copy(reply.data, entry.data, reply.size);
+                    if (reply.data[reply.size - 1] != '\n') {
                         reply.status = MYOS_STATUS_PEER_FAULT; return;
                     }
-                    reply.value = reply.size + 1 < entry.size || entry.value != 0
-                        ? cursor + 1 : 0;
+                    for (size_t i = 0; i < reply.size; ++i)
+                        if (reply.data[i] == '\n') reply.data[i] = '\0';
+                    --reply.size;
+                    reply.value = entry.value;
                 } else {
-                    reply.size = entry.size;
+                    if (!root) {
+                        reply.size = entry.size;
+                        service::copy(reply.data, entry.data, reply.size);
+                    }
                     reply.value = entry.value;
                 }
-                service::copy(reply.data, entry.data, reply.size);
             }
         } else if (operation == store::Control::Remove || operation == store::Control::Mkdir) {
             if (!writable || !writable_root || volume_path::boot_name(path) != nullptr) {

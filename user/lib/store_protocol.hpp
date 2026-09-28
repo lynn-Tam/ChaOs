@@ -25,6 +25,21 @@ inline constexpr size_t VolumeIdSize = 16;
 }
 
 enum class Control : uint64_t { List = 16, Open, Sync, Close, Format, Remove, Mkdir, Rename, DeviceId, VolumeId };
+// List replies pack nonempty names separated by NUL; value resumes after the
+// final name, or is zero at end of directory.
+template<class Visit>
+[[nodiscard]] auto each_name(const io::ControlMessage& reply, Visit visit) noexcept -> bool {
+    if (reply.size > sizeof(reply.data)) return false;
+    size_t start{};
+    while (start < reply.size) {
+        size_t end = start;
+        while (end < reply.size && reply.data[end] != '\0') ++end;
+        if (end == start) return false;
+        visit(reply.data + start, end - start);
+        start = end + 1;
+    }
+    return start == 0 || start == reply.size + 1;
+}
 enum OpenFlags : uint64_t { Read = 1, Write = 2, Create = 4, Truncate = 8, Exclusive = 16 };
 inline constexpr uint64_t ReadDirectory = 1;
 inline constexpr uint64_t WriteDirectory = 2;

@@ -447,7 +447,7 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
     constexpr uint32_t data_block = 5;
     constexpr auto send = MYOS_RIGHT_SEND;
     constexpr auto receive = MYOS_RIGHT_RECEIVE;
-    constexpr uint64_t service_budget = 1'000'000; // 10% per 10 ms period
+    constexpr uint64_t service_budget = 600'000; // 6% per 10 ms period
     {
         Task t{manifest, "uart", paths[0], 1024 * 1024, false, service_budget};
         t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);

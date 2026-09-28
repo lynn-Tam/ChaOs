@@ -100,7 +100,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         do {
             status = fs.list(entry, count == 3 ? arg(2) : "/");
             if (status != MYOS_STATUS_OK) break;
-            if (entry.size != 0) { output.write(entry.data, entry.size); output.put('\n'); }
+            if (!store::each_name(entry, [&](const char* name, size_t length) {
+                output.write(name, length); output.put('\n');
+            })) { status = MYOS_STATUS_PEER_FAULT; break; }
         } while (entry.value != 0);
     } else if (same(command, "mkdir")) status = fs.mkdir(arg(2));
     else if (same(command, "rm")) status = fs.remove(arg(2));
