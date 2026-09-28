@@ -196,9 +196,13 @@ auto VSpace::map_impl(
     const MemoryTypes types = region.policy_.types
         .intersect(vspace_types)
         .intersect(memory_authority.types);
+    const bool private_write = request.private_write;
     const AccessMask ceiling = region.policy_.access
         .intersect(vspace_access)
-        .intersect(memory_authority.access);
+        .intersect(private_write
+            ? AccessMask::from_raw(memory_authority.access.raw()
+                | static_cast<u8>(Access::Write))
+            : memory_authority.access);
     const bool invalid_access = !valid_access(request.access)
         || (request.access.contains(Access::Write)
             && request.access.contains(Access::Execute));
@@ -214,6 +218,11 @@ auto VSpace::map_impl(
         || !request.object.within(memory.page_count())
         || !memory_authority.range.contains(request.object)
         || !ceiling.contains(request.access)
+        || (private_write && (!request.access.contains(Access::Write)
+            || !memory_authority.access.contains(Access::Read)
+            || memory.kind() != BackingKind::Pager
+            || memory.seal_state() != SealState::Executable
+            || !types.contains(MemoryType::Normal)))
         || types.empty()) {
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
@@ -229,7 +238,8 @@ auto VSpace::map_impl(
         memory,
         memory_authority,
         request.access,
-        source);
+        source,
+        private_write);
     if (!authority_entry) {
         kernel::sync::IrqLockGuard guard{lock_};
         release_claim();
@@ -348,12 +358,14 @@ auto VSpace::map_impl(
         }
         PageLease source_page = libk::move(resident).value();
         const MemoryPage physical = source_page.page();
-        if (!physical.access.contains(request.access)
+        const AccessMask source_access = private_write
+            ? AccessMask::of(Access::Read) : request.access;
+        if (!physical.access.contains(source_access)
             || !types.contains(physical.type)) {
             return fail(VSpaceError::InvalidAuthority);
         }
         if (!arch::PageEditor::user_permissions(
-                request.access, physical.type)) {
+                source_access, physical.type)) {
             return fail(VSpaceError::UnsupportedMemoryType);
         }
         auto alias = kernel_->aliases().acquire(physical.page, physical.type);
@@ -456,7 +468,8 @@ auto VSpace::map_impl(
         const auto virtual_page = VPage::from_base(page->address_);
         KASSERT(virtual_page);
         const auto permissions = arch::PageEditor::user_permissions(
-            request.access, page->type_);
+            private_write ? AccessMask::of(Access::Read) : request.access,
+            page->type_);
         KASSERT(permissions);
         auto installed = editor.map(
             *virtual_page,

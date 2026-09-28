@@ -38,6 +38,19 @@ public:
           source_(libk::move(source)),
           alias_(libk::move(alias)) {}
 
+    MappedPage(
+        VirtAddr address,
+        usize object_page,
+        OwnedPage&& private_page,
+        kernel::resource::Charge&& charge,
+        AliasLease&& alias) noexcept
+        : address_(address), object_page_(object_page),
+          page_(private_page.page()),
+          access_(AccessMask::of(Access::Read, Access::Write)),
+          private_charge_(libk::move(charge)),
+          private_page_(libk::move(private_page)),
+          alias_(libk::move(alias)) {}
+
     ~MappedPage() noexcept;
 
     [[nodiscard]] auto address() const noexcept -> VirtAddr {
@@ -49,6 +62,7 @@ public:
     }
     [[nodiscard]] auto access() const noexcept -> AccessMask { return access_; }
     [[nodiscard]] auto type() const noexcept -> MemoryType { return type_; }
+    [[nodiscard]] auto private_owned() const noexcept -> bool { return static_cast<bool>(private_page_); }
 
 private:
     friend class VSpace;
@@ -59,6 +73,8 @@ private:
     Page page_{};
     AccessMask access_{};
     MemoryType type_{MemoryType::Normal};
+    kernel::resource::Charge private_charge_{};
+    OwnedPage private_page_{};
     PageLease source_{};
     AliasLease alias_{};
     PageMapping page_mapping_{};
@@ -103,7 +119,8 @@ public:
         MemoryObject& object,
         cap::MemoryAuthority frozen,
         AccessMask access,
-        AuthoritySource source) noexcept;
+        AuthoritySource source,
+        bool private_write) noexcept;
     ~MappingAuthority() noexcept;
 
     [[nodiscard]] auto source() const noexcept -> AuthoritySource {
@@ -145,6 +162,7 @@ private:
     cap::MemoryAuthority frozen_{};
     AccessMask access_{};
     AuthoritySource source_{AuthoritySource::Kernel};
+    bool private_write_{};
     MappingList mappings_{};
     PageTree pages_{};
     libk::IntrusiveListHook invalidation_hook_{};

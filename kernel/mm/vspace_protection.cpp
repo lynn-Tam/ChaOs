@@ -327,7 +327,9 @@ auto VSpace::protect_impl(
             const auto virtual_page = VPage::from_base(page->address_);
             KASSERT(virtual_page);
             const auto permissions = arch::PageEditor::user_permissions(
-                access, page->type_);
+                authority.private_write_ && !page->private_owned()
+                    ? AccessMask::of(Access::Read) : access,
+                page->type_);
             KASSERT(permissions);
             /*luna change: fold usage before permission projection change,
               reason: semantic A/D state must not depend on PTE rewrite order*/

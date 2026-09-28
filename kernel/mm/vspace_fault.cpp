@@ -3,6 +3,7 @@
 #include "vspace_internal.hpp"
 
 #include <core/debug.hpp>
+#include <libk/mem.h>
 #include <libk/utility.hpp>
 #include <sync/irq_lock_guard.hpp>
 
@@ -47,6 +48,7 @@ auto VSpace::fault(
     }
 
     Mapping* mapping{};
+    MappedPage* private_source{};
     usize object_page{};
     {
         kernel::sync::IrqLockGuard guard{lock_};
@@ -88,7 +90,14 @@ auto VSpace::fault(
                 mapping->range_.page_offset(page_range.base());
             KASSERT(mapping_offset);
             object_page = mapping->object_.first + *mapping_offset;
-            if (mapping->authority_->pages_.find(page_range.base()) != nullptr) {
+            if (auto* existing = mapping->authority_->pages_.find(page_range.base())) {
+                if (access == Access::Write && mapping->authority_->private_write_
+                    && !existing->private_owned()) {
+                    auto claimed = begin_claim(*region, page_range, false);
+                    if (!claimed) return libk::expected(FaultResult{.kind = FaultKind::Busy});
+                    private_source = existing;
+                    break;
+                }
                 /*luna change: refund a retry demand when the mapping winner
                   already supplied the page, reason: PageAuthority truth makes
                   the continuation reservation unnecessary*/
@@ -109,6 +118,8 @@ auto VSpace::fault(
         }
     }
     KASSERT(mapping != nullptr);
+    if (private_source != nullptr) return copy_private_fault(
+        context, *mapping, *private_source, relation, owner, publish, demand);
     return materialize_fault(
         context,
         *mapping,
@@ -118,6 +129,115 @@ auto VSpace::fault(
         owner,
         publish,
         demand);
+}
+
+auto VSpace::copy_private_fault(
+    VmContext context,
+    Mapping& mapping,
+    MappedPage& source,
+    WaitRelation* relation,
+    void* owner,
+    WaitRelation::Publish publish,
+    FrameDemand* demand) noexcept
+    -> libk::Expected<FaultResult, VSpaceError> {
+    auto fail = [&](VSpaceError error)
+        -> libk::Expected<FaultResult, VSpaceError> {
+        kernel::sync::IrqLockGuard guard{lock_};
+        release_claim();
+        return libk::unexpected(error);
+    };
+    kernel::resource::Charge charge{};
+    if (sponsor_ != nullptr) {
+        auto acquired = sponsor_->acquire(kernel::resource::Budget{.memory = page_size});
+        if (!acquired) return fail(VSpaceError::ResourceExhausted);
+        charge = libk::move(acquired).value();
+    }
+    auto allocated = pmm_->allocate_page();
+    if (!allocated) {
+        MemoryObject& memory = mapping.authority_->memory();
+        const bool retained = relation != nullptr && demand != nullptr
+            && memory.wait_frame(*relation, 1, owner, publish, *demand);
+        {
+            kernel::sync::IrqLockGuard guard{lock_};
+            release_claim();
+        }
+        return retained
+            ? libk::Expected<FaultResult, VSpaceError>{libk::expected(FaultResult{
+                .kind = FaultKind::Pressure, .mapping = mapping.key_,
+                .object_page = source.object_page_, .memory = &memory})}
+            : libk::Expected<FaultResult, VSpaceError>{
+                libk::unexpected(VSpaceError::OutOfMemory)};
+    }
+    OwnedPage private_page = libk::move(allocated).value();
+    memcpy(private_page.bytes(), pmm_->bytes(source.page_), page_size);
+    auto alias = kernel_->aliases().acquire(private_page.page(), MemoryType::Normal);
+    if (!alias) {
+        return fail(alias.error() == AliasError::ConflictingType
+            ? VSpaceError::AliasConflict : alias.error() == AliasError::QuotaExceeded
+                ? VSpaceError::QuotaExceeded : VSpaceError::OutOfMemory);
+    }
+    auto made = pages_.create(source.address_, source.object_page_,
+        libk::move(private_page), libk::move(charge), libk::move(alias).value());
+    if (!made) return fail(node_error(made.error()));
+    MappedPage* const replacement = made.value().object;
+    const usize object_page = source.object_page_;
+    const MappingKey mapping_key = mapping.key_;
+    replacement->authority_ = mapping.authority_;
+    auto abort = [&](VSpaceError error)
+        -> libk::Expected<FaultResult, VSpaceError> {
+        replacement->authority_ = nullptr;
+        pages_.destroy(*replacement);
+        return fail(error);
+    };
+
+    kernel::sync::IrqLockToken lock{lock_};
+    MappingAuthority& authority = *mapping.authority_;
+    if (state_ != VSpaceState::Live || mapping.state_ != MappingState::Live
+        || claim_.region != mapping.parent_
+        || claim_.range != VirtRange{source.address_, page_size}
+        || authority.invalidation_requested_
+        || authority.pages_.find(source.address_) != &source
+        || source.reclaim_work_ || source.page_mapping_.invalidating()) {
+        lock.restore();
+        return abort(VSpaceError::Busy);
+    }
+    auto mutation = coherence_.begin();
+    if (!mutation) { lock.restore(); return abort(VSpaceError::ShootdownUnavailable); }
+    auto plan = prepare_plan(context, mutation.value().targets());
+    if (!plan) {
+        mutation.value().abort();
+        lock.restore();
+        return abort(plan.error());
+    }
+    arch::PageEditor editor = arch::PageEditor::user(*root_);
+    const auto virtual_page = VPage::from_base(source.address_);
+    KASSERT(virtual_page);
+    auto folded = fold_usage(source, editor);
+    KASSERT(folded);
+    const auto permissions = arch::PageEditor::user_permissions(
+        mapping.access_, MemoryType::Normal);
+    KASSERT(permissions);
+    auto replaced = editor.replace(*virtual_page, replacement->page_, *permissions);
+    KASSERT(replaced && replaced.value().page == source.page_);
+    authority.pages_.erase(source);
+    authority.pages_.insert(*replacement);
+    replacement->alias_.commit();
+    queue_page(source);
+    pending_kind_ = PendingKind::Map;
+    release_claim();
+    auto& retire = retire_batch_.emplace(*pmm_);
+    kernel::resource::Charge refund{};
+    auto committed = commit_translation(
+        libk::move(mutation).value(), libk::move(plan).value(), retire, refund);
+    lock.restore();
+    refund.reset();
+    if (!committed) return libk::unexpected(committed.error());
+    if (committed.value() == VmStatus::Complete) finish_authorities();
+    return libk::expected(FaultResult{
+        .kind = FaultKind::Materialized,
+        .mapping = mapping_key,
+        .object_page = object_page,
+        .status = committed.value()});
 }
 
 auto VSpace::materialize_fault(
@@ -192,12 +312,14 @@ auto VSpace::materialize_fault(
     }
     PageLease source = libk::move(resident).value();
     const MemoryPage physical = source.page();
-    if (!physical.access.contains(mapping.access_)
+    const AccessMask source_access = authority.private_write_
+        ? AccessMask::of(Access::Read) : mapping.access_;
+    if (!physical.access.contains(source_access)
         || !mapping.types_.contains(physical.type)) {
         return fail(FaultKind::AccessDenied);
     }
     const auto permissions = arch::PageEditor::user_permissions(
-        mapping.access_, physical.type);
+        source_access, physical.type);
     if (!permissions) {
         {
             kernel::sync::IrqLockGuard guard{lock_};
@@ -453,10 +575,10 @@ auto VSpace::fold_usage(
     if (!observed) {
         return libk::unexpected(VSpaceError::NotMapped);
     }
-    auto folded = page.authority_->memory().observe_usage(
-        page.page_mapping_, observed.value().accessed, observed.value().dirty);
-    if (!folded) {
-        return libk::unexpected(memory_error(folded.error()));
+    if (!page.private_owned()) {
+        auto folded = page.authority_->memory().observe_usage(
+            page.page_mapping_, observed.value().accessed, observed.value().dirty);
+        if (!folded) return libk::unexpected(memory_error(folded.error()));
     }
     return libk::expected(PageUsage{
         .accessed = observed.value().accessed,

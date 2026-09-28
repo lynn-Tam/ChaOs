@@ -64,8 +64,11 @@ auto handle_vm(usize operation, Invocation& invocation) noexcept -> Result {
     if (operation == MYOS_SYS_VM_MAP) {
         const cap::CapHandle memory_handle = handle_of(trap.arg(1));
         const auto range = range_of(trap.arg(2), trap.arg(3));
-        const auto access = access_of(trap.arg(5));
-        if (!memory_handle || !range || !access) {
+        const usize flags = trap.arg(5);
+        const auto access = access_of(flags & (MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE));
+        if (!memory_handle || !range || !access
+            || (flags & ~(MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE
+                | MYOS_VM_MAP_PRIVATE)) != 0) {
             return returned(MYOS_STATUS_BAD_ARGS);
         }
         auto memory = cspace.resolve<kernel::mm::MemoryObject>(
@@ -80,7 +83,7 @@ auto handle_vm(usize operation, Invocation& invocation) noexcept -> Result {
             kernel::mm::MapRequest{
                 *range,
                 kernel::mm::ObjectRange{trap.arg(4), pages},
-                *access},
+                *access, (flags & MYOS_VM_MAP_PRIVATE) != 0},
             memory.value());
         return returned(mapped
             ? operation_status(mapped.value().status)

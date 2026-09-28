@@ -62,6 +62,29 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         for (size_t n = 0; n < mapped_size; ++n)
             check(bytes[n] == (n < FileSize ? n % 251 : 0));
     }
+    // Files exports one immutable source to every client. A private mapping
+    // initially reads that source, then owns only the pages it changes.
+    io::ControlMessage private_request{.operation = static_cast<uint64_t>(files::Control::Map),
+        .value = handles[0], .size = 1};
+    private_request.data[0] = MYOS_VM_READ;
+    io::ControlPacket private_packet;
+    service::require(sessions[0].exchange(private_request, private_packet));
+    check(private_packet.count == 1 && private_request.value == identity);
+    auto private_result = MappedMemory::map_private(vspace,
+        libk::move(private_packet.capabilities[0]), 0x76000000, mapped_size);
+    check(static_cast<bool>(private_result));
+    auto private_mapping = libk::move(private_result).value();
+    auto* private_bytes = reinterpret_cast<volatile uint8_t*>(private_mapping.address);
+    check(private_bytes[0] == 0 && private_bytes[4096] == 4096 % 251);
+    private_bytes[0] = 97;
+    private_bytes[4096] = 98;
+    private_bytes[FileSize] = 99;
+    check(private_bytes[0] == 97 && private_bytes[4096] == 98 && private_bytes[FileSize] == 99);
+    for (const auto& shared : mappings) {
+        const auto* bytes = reinterpret_cast<const volatile uint8_t*>(shared.address);
+        check(bytes[0] == 0 && bytes[4096] == 4096 % 251 && bytes[FileSize] == 0);
+    }
+    service::require(private_mapping.close());
     // The pressure kernel drains free frames on this first fault. The same
     // consumer and artifacts also run normally; no service has a test mode.
     const auto fresh = [&](uintptr_t address) {

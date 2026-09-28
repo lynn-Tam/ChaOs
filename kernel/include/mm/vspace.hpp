@@ -102,6 +102,7 @@ struct MapRequest final {
     VirtRange virtual_range{};
     ObjectRange object{};
     AccessMask access{};
+    bool private_write{};
 };
 
 struct MapResult final {
@@ -380,7 +381,8 @@ private:
     void detach_mapping(Mapping& mapping) noexcept;
     /*luna change: retain pending pages until exact reclaim unlink, reason:
       unpublished PageMapping claims still own embedded storage*/
-    [[nodiscard]] auto release_page(MappedPage& page) noexcept -> bool;
+    [[nodiscard]] auto release_page(MappedPage& page,
+        kernel::resource::Charge& refund) noexcept -> bool;
     void finish_authorities() noexcept;
     void finish_waiters() noexcept;
     libk::IntrusiveList<operation::VmWait, &operation::VmWait::hook_> waiters_{};
@@ -423,6 +425,15 @@ private:
         Mapping& mapping,
         VirtAddr page_address,
         usize object_page,
+        WaitRelation* relation,
+        void* owner,
+        WaitRelation::Publish publish,
+        FrameDemand* demand) noexcept
+        -> libk::Expected<FaultResult, VSpaceError>;
+    [[nodiscard]] auto copy_private_fault(
+        VmContext context,
+        Mapping& mapping,
+        MappedPage& source,
         WaitRelation* relation,
         void* owner,
         WaitRelation::Publish publish,

@@ -391,6 +391,27 @@ auto Editor::protect(
     return current;
 }
 
+auto Editor::replace(
+    kernel::mm::VPage virtual_page,
+    kernel::mm::Page physical,
+    PtePerm permissions) noexcept -> libk::Expected<Leaf, EditError> {
+    const auto previous = query(virtual_page);
+    if (!previous) return libk::unexpected(previous.error());
+    const auto leaf = Pte::leaf_4k_cold(physical, permissions);
+    if (!leaf) return libk::unexpected(EditError::BadPhysicalAddress);
+    const auto page = Sv39VPage::from(virtual_page);
+    KASSERT(page);
+    auto root = TableRef::open(*tables_, root_);
+    const auto level1_page = root.entry(page->level2_index()).next_table_page();
+    KASSERT(level1_page);
+    auto level1 = TableRef::open(*tables_, *level1_page);
+    const auto level0_page = level1.entry(page->level1_index()).next_table_page();
+    KASSERT(level0_page);
+    auto level0 = TableRef::open(*tables_, *level0_page);
+    level0.entry(page->level0_index()) = *leaf;
+    return previous;
+}
+
 auto Editor::unmap(kernel::mm::VPage virtual_page) noexcept
     -> libk::Expected<Unmapped, EditError> {
     const auto current = query(virtual_page);

@@ -52,6 +52,13 @@ struct MappedMemory final {
         return map_impl(vspace, libk::move(memory), address, size, access, type, false);
     }
 
+    // The source stays immutable; the first write to each page belongs to this mapping.
+    [[nodiscard]] static auto map_private(myos_cap_t vspace, cap::OwnedCap&& source,
+        uintptr_t address, size_t size) noexcept -> libk::Expected<MappedMemory, myos_status_t> {
+        return map_impl(vspace, libk::move(source), address, size,
+            MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, false, MYOS_VM_MAP_PRIVATE);
+    }
+
     [[nodiscard]] static auto create(myos_cap_t pool, myos_cap_t vspace,
         uintptr_t address, size_t size) noexcept -> libk::Expected<MappedMemory, myos_status_t> {
         const auto memory = memory_create(pool, size, MYOS_VM_READ | MYOS_VM_WRITE);
@@ -76,7 +83,7 @@ private:
     }
     static auto map_impl(myos_cap_t vspace, cap::OwnedCap&& memory,
         uintptr_t address, size_t size, myos_word_t access, myos_word_t type,
-        bool owns_memory) noexcept -> libk::Expected<MappedMemory, myos_status_t> {
+        bool owns_memory, myos_word_t flags = 0) noexcept -> libk::Expected<MappedMemory, myos_status_t> {
         MappedMemory result;
         result.memory = libk::move(memory);
         result.owns_memory_ = owns_memory;
@@ -87,7 +94,7 @@ private:
         result.address = address;
         result.size = size;
         const auto mapped = vm_complete(region.value,
-            vm_map(region.value, result.memory.selector(), address, size, 0, access));
+            vm_map(region.value, result.memory.selector(), address, size, 0, access | flags));
         if (mapped.status != MYOS_STATUS_OK)
             return libk::unexpected(mapped.status);
         return libk::expected(libk::move(result));

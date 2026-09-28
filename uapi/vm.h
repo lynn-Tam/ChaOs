@@ -4,6 +4,9 @@
 #define MYOS_VM_WRITE   (1U << 1)
 #define MYOS_VM_EXECUTE (1U << 2)
 
+// VM_MAP only: writes copy the source page into this mapping on first write.
+#define MYOS_VM_MAP_PRIVATE (1U << 8)
+
 #define MYOS_VM_NORMAL  (1U << 0)
 #define MYOS_VM_UNCACHED (1U << 1)
 #define MYOS_VM_DEVICE  (1U << 2)

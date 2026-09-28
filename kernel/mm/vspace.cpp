@@ -50,13 +50,15 @@ MappingAuthority::MappingAuthority(
     MemoryObject& object,
     cap::MemoryAuthority frozen,
     AccessMask access,
-    AuthoritySource source) noexcept
+    AuthoritySource source,
+    bool private_write) noexcept
     : owner_(&owner),
       memory_ref_(libk::move(memory)),
       memory_(&object),
       frozen_(frozen),
       access_(access),
       source_(source),
+      private_write_(private_write),
       memory_attachment_(this, memory_ops_) {}
 
 MappingAuthority::~MappingAuthority() noexcept {
@@ -75,7 +77,8 @@ MappingAuthority::~MappingAuthority() noexcept {
 
 auto MappingAuthority::attach_memory() noexcept
     -> libk::Expected<void, MemoryError> {
-    return memory_->attach(memory_attachment_, access_);
+    return memory_->attach(memory_attachment_, private_write_
+        ? AccessMask::of(Access::Read) : access_);
 }
 
 auto MappingAuthority::attach_grant(
@@ -391,7 +394,8 @@ void VSpace::destroy_layout(LayoutNode& node) noexcept {
 
 /*luna change: retain a pending page when normal unbind loses to a claim,
   reason: the existing pending lane pins embedded PageMapping storage*/
-auto VSpace::release_page(MappedPage& page) noexcept -> bool {
+auto VSpace::release_page(MappedPage& page,
+    kernel::resource::Charge& refund) noexcept -> bool {
     MemoryObject* const memory = page.page_mapping_.owner();
     if (page.reclaim_work_) {
         KASSERT(memory != nullptr);
@@ -421,6 +425,7 @@ auto VSpace::release_page(MappedPage& page) noexcept -> bool {
     }
     page.authority_ = nullptr;
     kernel_->aliases().release(page.page_, page.type_);
+    refund.merge(libk::move(page.private_charge_));
     pages_.destroy(page);
     return true;
 }
@@ -499,7 +504,7 @@ auto VSpace::finish_pending(kernel::resource::Charge& refund) noexcept -> bool {
     while (pending_pages_ != nullptr) {
         MappedPage* const page = pending_pages_;
         MappedPage* const next = page->pending_next_;
-        if (!release_page(*page)) {
+        if (!release_page(*page, refund)) {
             return false;
         }
         pending_pages_ = next;

@@ -135,6 +135,13 @@ public:
         kernel::mm::VPage page,
         PtePerm permissions) noexcept -> libk::Expected<Leaf, EditError>;
 
+    // Replace one leaf without changing table ownership. The caller orders
+    // the old translation's retirement through its shootdown transaction.
+    [[nodiscard]] auto replace(
+        kernel::mm::VPage page,
+        kernel::mm::Page physical,
+        PtePerm permissions) noexcept -> libk::Expected<Leaf, EditError>;
+
     [[nodiscard]] auto query(kernel::mm::VPage page) const noexcept
         -> libk::Expected<Leaf, EditError>;
 
