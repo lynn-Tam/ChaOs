@@ -100,6 +100,13 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
             run('run echo named arguments survive paging', b'named arguments survive paging\nmyos> ')
         run('hello', b'Hello from userspace.\nmyos> ')
         run('run demand', b'[demand] initialized data, BSS, private writes and VM reuse ok\nmyos> ')
+        first = int(re.search(rb'task: ([0-9]+)', run('spawn demand 1000 17', b'task: '))[1])
+        second = int(re.search(rb'task: ([0-9]+)', run('spawn demand 1000 71', b'task: '))[1])
+        if first == second:
+            raise RuntimeError('concurrent ELF processes share a task handle')
+        for token in (first, second):
+            if b'error: ' in run(f'wait {token}', b'myos> '):
+                raise RuntimeError('concurrent ELF mapping check failed')
         if pressure and (not re.search(rb'pressure drained held=[1-9][0-9]* free=0', output)
                          or b'pressure released held=' not in output):
             raise RuntimeError('missing actual PMM drain/release evidence')

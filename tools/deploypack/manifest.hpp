@@ -470,7 +470,7 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         if (storage) t.requires_service(6, "store admin");
         // Four live task authorities, package mappings and stream endpoints.
         t.cspace(512, 68);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL | MYOS_RESOURCE_PAGER);
+        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
         t.channel(myos::bootstrap::imports::Vfs, "vfs.client", 0,
             myos::vfs::WriteDirectory, send | MYOS_RIGHT_DUPLICATE);

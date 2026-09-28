@@ -24,7 +24,9 @@ namespace myos::deploy {
 // TaskSpace adopts it before constructing the mapping, including on failure.
 struct ImageSource final {
     void* context{};
-    SysResult (*create)(void*, cap::CapRef, const boot::Segment&, myos_word_t& first) noexcept{};
+    // Only complete file pages are passed here. The caller owns boundary and
+    // zero pages; a writable segment maps this read-only source privately.
+    SysResult (*create)(void*, const boot::Segment&, myos_word_t& first) noexcept{};
 };
 
 template<size_t SegmentCapacity = 32, size_t StackCapacity = 64>
@@ -816,14 +818,23 @@ private:
         myos_word_t size) noexcept -> myos_status_t {
         const auto reference = task_.lookup(
             memory, MYOS_OBJECT_KIND_MEMORY);
-        if (!reference.has_value() || source_size > size
+        return reference ? populate_bytes(*reference, source, source_size, size)
+                         : MYOS_STATUS_BAD_ARGS;
+    }
+
+    [[nodiscard]] auto populate_bytes(
+        cap::CapRef memory,
+        const uint8_t* source,
+        size_t source_size,
+        myos_word_t size) noexcept -> myos_status_t {
+        if (!memory || source_size > size
             || (source_size != 0 && source == nullptr)) {
             return MYOS_STATUS_BAD_ARGS;
         }
-        const auto backing = populate_backing(reference.value(), size);
+        const auto backing = populate_backing(memory, size);
         if (backing != MYOS_STATUS_OK) return backing;
         const myos_status_t mapped = scratch_.map(
-            reference.value(), 0, size,
+            memory, 0, size,
             MYOS_VM_READ | MYOS_VM_WRITE);
         if (mapped != MYOS_STATUS_OK) {
             return mapped;
@@ -849,6 +860,87 @@ private:
             return status;
         }
         return scratch_.unmap();
+    }
+
+    [[nodiscard]] auto materialize_source_segment(
+        const boot::Segment& segment, myos_word_t size,
+        Image& output) noexcept -> myos_status_t {
+        constexpr myos_word_t page = MYOS_DEPLOY_PAGE_SIZE;
+        const myos_word_t file_pages = segment.file_size / page * page;
+        const myos_word_t boundary = segment.file_size % page != 0 ? page : 0;
+        const myos_word_t zero_first = file_pages + boundary;
+        const auto pool = task_.pool();
+        const auto vspace = task_.lookup(task_.vspace_slot(), MYOS_OBJECT_KIND_VSPACE);
+        if (!pool || !vspace) return MYOS_STATUS_INVALID_CAP;
+        const auto region = B::vm_create_region(*vspace, segment.address, size,
+            segment.access, MYOS_VM_NORMAL,
+            MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
+        owner_type region_owner{cap::CapRef{region.value, 0}};
+        if (region.status != MYOS_STATUS_OK) return region.status;
+        if (!region_owner) return MYOS_STATUS_INVALID_CAP;
+        LocalSlot primary{};
+        myos_word_t primary_first{};
+        const auto install = [&](myos_word_t offset, myos_word_t length,
+                                 bool file, size_t bytes) noexcept -> myos_status_t {
+            myos_word_t first{};
+            SysResult created{};
+            if (file) {
+                auto part = segment;
+                part.address += offset;
+                part.file += offset;
+                part.file_size = part.memory_size = length;
+                created = source_.create(source_.context, part, first);
+            } else {
+                created = B::memory_create(*pool, length,
+                    segment.access | MYOS_VM_READ | MYOS_VM_WRITE);
+            }
+            owner_type memory_owner{cap::CapRef{created.value, 0}};
+            if (created.status != MYOS_STATUS_OK) return created.status;
+            if (!memory_owner) return MYOS_STATUS_INVALID_CAP;
+            if (!file && bytes != 0) {
+                const auto status = populate_bytes(memory_owner.reference(),
+                    segment.file + offset, bytes, length);
+                if (status != MYOS_STATUS_OK) return status;
+            }
+            if (!file && (segment.access & MYOS_VM_EXECUTE) != 0) {
+                const auto status = B::memory_seal(memory_owner.reference());
+                if (status != MYOS_STATUS_OK) return status;
+            }
+            const auto address = static_cast<myos_word_t>(segment.address + offset);
+            const auto flags = file && (segment.access & MYOS_VM_WRITE) != 0
+                ? MYOS_VM_MAP_PRIVATE : 0;
+            const auto mapped = B::vm_map(region_owner.reference(), memory_owner.reference(),
+                address, length, first, segment.access | flags);
+            if (!committed(mapped)) return mapped;
+            if (primary.valid()) return MYOS_STATUS_OK;
+            const auto memory = task_.adopt_local(libk::move(memory_owner), MYOS_OBJECT_KIND_MEMORY);
+            if (!memory) return MYOS_STATUS_NO_MEMORY;
+            primary = *memory;
+            primary_first = first;
+            return MYOS_STATUS_OK;
+        };
+        // One region describes the whole ELF segment. Subrange mappings keep
+        // their backing through VSpace; only the primary cap enters the plan.
+        if (file_pages != 0) {
+            const auto status = install(0, file_pages, true, 0);
+            if (status != MYOS_STATUS_OK) return status;
+        }
+        if (boundary != 0) {
+            const auto status = install(file_pages, page, false, segment.file_size - file_pages);
+            if (status != MYOS_STATUS_OK) return status;
+        }
+        if (zero_first < size) {
+            const auto status = install(zero_first, size - zero_first, false, 0);
+            if (status != MYOS_STATUS_OK) return status;
+        }
+        if (!primary.valid()) return MYOS_STATUS_INTERNAL;
+        const auto saved_region = task_.adopt_local(libk::move(region_owner), MYOS_OBJECT_KIND_VSPACE);
+        if (!saved_region) return MYOS_STATUS_NO_MEMORY;
+        return output.segments.try_push_back(typename Image::Mapping{
+            .memory = primary, .region = *saved_region,
+            .address = segment.address, .size = size,
+            .access = segment.access, .first = primary_first})
+            ? MYOS_STATUS_OK : MYOS_STATUS_NO_MEMORY;
     }
 
     [[nodiscard]] auto materialize_module(
@@ -883,29 +975,22 @@ private:
             }
             const myos_word_t load_access = segment.access
                 | MYOS_VM_READ | MYOS_VM_WRITE;
+            if (source_.create != nullptr) {
+                const auto status = materialize_source_segment(segment, size.value(), output);
+                if (status != MYOS_STATUS_OK) output.clear();
+                if (status != MYOS_STATUS_OK) return status;
+                continue;
+            }
             LocalSlot memory{};
             myos_status_t status{};
             myos_word_t first{};
-            if (source_.create != nullptr) {
-                const auto pool = task_.pool();
-                if (!pool) return MYOS_STATUS_BAD_ARGS;
-                const auto created = source_.create(source_.context, *pool, segment, first);
-                owner_type owner{cap::CapRef{created.value, 0}};
-                status = created.status;
-                if (status == MYOS_STATUS_OK) {
-                    if (!owner) status = MYOS_STATUS_INVALID_CAP;
-                    else if (auto slot = task_.adopt_local(libk::move(owner), MYOS_OBJECT_KIND_MEMORY)) memory = *slot;
-                    else status = MYOS_STATUS_NO_MEMORY;
-                }
-            } else {
-                status = create_memory(size.value(), load_access, memory);
-                if (status == MYOS_STATUS_OK) status = populate(memory, segment, size.value());
-            }
+            status = create_memory(size.value(), load_access, memory);
+            if (status == MYOS_STATUS_OK) status = populate(memory, segment, size.value());
             if (status != MYOS_STATUS_OK) {
                 output.clear();
                 return status;
             }
-            if (source_.create == nullptr && (segment.access & MYOS_VM_EXECUTE) != 0) {
+            if ((segment.access & MYOS_VM_EXECUTE) != 0) {
                 const auto reference = task_.lookup(
                     memory, MYOS_OBJECT_KIND_MEMORY);
                 if (!reference.has_value()) {

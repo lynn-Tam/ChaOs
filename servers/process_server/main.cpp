@@ -31,7 +31,7 @@ Job jobs[Capacity];
 process::Pipe pipes[Capacity / 2];
 Supervisor supervisor;
 files::Client filesystem;
-process::PageBuffer page_buffer;
+process::ViewDescriptor view_descriptor;
 cap::OwnedCap file_events;
 // Replies retain their own bytes while the peer is backpressured. Admission
 // stops at this bound; paging and teardown continue independently.
@@ -124,7 +124,7 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
     if (status == MYOS_STATUS_OK) {
         job->child = supervisor.launch(job->program,
         {reinterpret_cast<const uint8_t*>(name), length}, status,
-        {.image_source = job->image.source(page_buffer, job->package.memory.selector(), address, job->package.size),
+        {.image_source = job->image.source(view_descriptor, job->package.memory.selector(), address, job->package.size),
          .arguments = &arguments,
          .terminal_events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION),
          .close_badge = uint64_t{1} << (8 + job - jobs), .sources = sources,
@@ -193,8 +193,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(file_notification.status);
     file_events = cap::OwnedCap{{file_notification.value, 0}};
     service::require(filesystem.connect(info, 0x70000000, file_events.selector()));
-    service::require(page_buffer.open(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
-        service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), events));
+    service::require(view_descriptor.open(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
+        service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE)));
     service::require(supervisor.add("domain", service::capability(info, MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN),
         MYOS_OBJECT_KIND_SCHED_DOMAIN, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL));
     service::require(supervisor.add("vfs.directory", service::capability(info, bootstrap::imports::Vfs),
@@ -214,7 +214,6 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::require(now.status);
         for (auto& job : jobs) {
             if (!job.child) continue;
-            if (!supervisor.closing(*job.child)) service::require(job.image.poll());
             const auto status = supervisor.poll(*job.child);
             if (status == MYOS_STATUS_OK) {
                 // Ready proves TaskTable has released both the pool and plan.
