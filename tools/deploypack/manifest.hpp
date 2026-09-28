@@ -374,7 +374,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
 
 // Application reservations participate in the same per-hart admission domain
 // as native services; this budget leaves room for four concurrent jobs.
-inline constexpr uint64_t ApplicationBudget = 250'000;
+inline constexpr uint64_t ApplicationBudget = 500'000;
 inline auto pack_application(const char* name, const char* image, uint64_t budget = ApplicationBudget,
                              bool denied = false) -> std::vector<uint8_t> {
     Manifest manifest;
@@ -447,7 +447,7 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
     constexpr uint32_t data_block = 5;
     constexpr auto send = MYOS_RIGHT_SEND;
     constexpr auto receive = MYOS_RIGHT_RECEIVE;
-    constexpr uint64_t service_budget = 500'000; // 5% per 10 ms period
+    constexpr uint64_t service_budget = 1'000'000; // 10% per 10 ms period
     {
         Task t{manifest, "uart", paths[0], 1024 * 1024, false, service_budget};
         t.restart(MYOS_DEPLOY_RESTART_ON_FAULT);
