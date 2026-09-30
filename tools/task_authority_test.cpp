@@ -5,7 +5,7 @@
 #include <libk/assert.hpp>
 #include <libk/utility.hpp>
 #include <uapi/status.h>
-#include <user/lib/task_authority.hpp>
+#include <servers/deploy/detail/authority.hpp>
 
 #include "deploypack/golden_fixture.hpp"
 
@@ -154,12 +154,12 @@ struct FakeBackend final {
     }
 };
 
-using Space = myos::deploy::TaskSpace<8, 8, FakeBackend>;
-using Authorities = myos::deploy::AuthoritySet<4, 4>;
+using Space = deploy::TaskSpace<8, 8, FakeBackend>;
+using Authorities = deploy::AuthoritySet<4, 4>;
 
 template<size_t RegistrationCapacity>
 struct SourceFixture final {
-    using aggregate_type = myos::deploy::RegisteredSpace<
+    using aggregate_type = deploy::RegisteredSpace<
         Space, RegistrationCapacity>;
 
     Space raw{};
@@ -174,7 +174,7 @@ struct SourceFixture final {
     [[nodiscard]] auto add(
         myos_cap_t selector,
         myos_object_kind_t kind) noexcept
-        -> libk::optional<myos::deploy::LocalSlot> {
+        -> libk::optional<deploy::LocalSlot> {
         return raw.adopt_local(
             typename Space::owner_type{
                 myos::cap::CapRef{selector, 0}},
@@ -188,10 +188,10 @@ struct SourceFixture final {
     template<typename Set>
     [[nodiscard]] auto register_source(
         Set& authorities,
-        myos::deploy::LocalSlot slot,
+        deploy::LocalSlot slot,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<myos::deploy::AuthorityId> {
+        -> libk::optional<deploy::AuthorityId> {
         return aggregate.register_source(
             authorities, slot, identity, ceiling);
     }
@@ -202,18 +202,18 @@ struct SourceFixture final {
 };
 
 struct Fixture final {
-    uint8_t raw[myos::deploy::host::kGoldenSize]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    uint8_t raw[deploy::host::kGoldenSize]{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 struct BatchFixture final {
-    uint8_t raw[myos::deploy::host::kGoldenSize
-                + MYOS_DEPLOY_IMPORT_STRIDE]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    uint8_t raw[deploy::host::kGoldenSize
+                + DEPLOY_IMPORT_STRIDE]{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 void put(
@@ -240,37 +240,37 @@ void put(
 
 [[nodiscard]] auto make_plan(
     Fixture& fixture,
-    uint16_t mode = MYOS_DEPLOY_IMPORT_DUPLICATE,
+    uint16_t mode = DEPLOY_IMPORT_DUPLICATE,
     uint16_t attenuation_kind = MYOS_OBJECT_KIND_THREAD,
     uint64_t channel_badge = 0) noexcept -> bool {
     for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
-    const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_IMPORT * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    const size_t descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_IMPORT * DEPLOY_TABLE_DESC_SIZE;
     const size_t import_table = static_cast<size_t>(get(
-        fixture.raw, descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8));
+        fixture.raw, descriptor + DEPLOY_TABLE_OFFSET, 8));
     const size_t import = import_table;
-    put(fixture.raw, import + MYOS_DEPLOY_IMPORT_MODE, mode, 2);
-    put(fixture.raw, import + MYOS_DEPLOY_IMPORT_ATTENUATION
-            + MYOS_DEPLOY_ATTENUATION_KIND,
+    put(fixture.raw, import + DEPLOY_IMPORT_MODE, mode, 2);
+    put(fixture.raw, import + DEPLOY_IMPORT_ATTENUATION
+            + DEPLOY_ATTENUATION_KIND,
         attenuation_kind, 2);
-    if (mode == MYOS_DEPLOY_IMPORT_CHANNEL_MINT) {
-        put(fixture.raw, import + MYOS_DEPLOY_IMPORT_ATTENUATION
-                + MYOS_DEPLOY_ATTENUATION_WORD1,
+    if (mode == DEPLOY_IMPORT_CHANNEL_MINT) {
+        put(fixture.raw, import + DEPLOY_IMPORT_ATTENUATION
+                + DEPLOY_ATTENUATION_WORD1,
             channel_badge, 8);
-        put(fixture.raw, import + MYOS_DEPLOY_IMPORT_ATTENUATION
-                + MYOS_DEPLOY_ATTENUATION_WORD2,
+        put(fixture.raw, import + DEPLOY_IMPORT_ATTENUATION
+                + DEPLOY_ATTENUATION_WORD2,
             UINT64_MAX, 8);
     }
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw,
         sizeof(fixture.raw),
         fixture.workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -280,23 +280,23 @@ void put(
 }
 
 [[nodiscard]] auto make_two_import_plan(BatchFixture& fixture) noexcept -> bool {
-    for (size_t index = 0; index < myos::deploy::host::kGoldenSize; ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+    for (size_t index = 0; index < deploy::host::kGoldenSize; ++index) {
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
-    const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_IMPORT * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    const size_t descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_IMPORT * DEPLOY_TABLE_DESC_SIZE;
     const size_t import_descriptor = descriptor;
     const size_t import_table = static_cast<size_t>(get(
         fixture.raw,
-        import_descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+        import_descriptor + DEPLOY_TABLE_OFFSET,
         8));
     size_t next_table = sizeof(fixture.raw);
-    for (size_t table = MYOS_DEPLOY_TABLE_DEPENDENCY;
-         table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
-        const size_t table_descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    for (size_t table = DEPLOY_TABLE_DEPENDENCY;
+         table <= DEPLOY_TABLE_STRING; ++table) {
+        const size_t table_descriptor = DEPLOY_HEADER_TABLES
+            + table * DEPLOY_TABLE_DESC_SIZE;
         const size_t offset = static_cast<size_t>(get(
-            fixture.raw, table_descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8));
+            fixture.raw, table_descriptor + DEPLOY_TABLE_OFFSET, 8));
         if (offset > import_table && offset < next_table) {
             next_table = offset;
         }
@@ -304,54 +304,54 @@ void put(
     if (next_table == sizeof(fixture.raw)) {
         return false;
     }
-    for (size_t index = myos::deploy::host::kGoldenSize;
+    for (size_t index = deploy::host::kGoldenSize;
          index > next_table; --index) {
-        fixture.raw[index + MYOS_DEPLOY_IMPORT_STRIDE - 1] =
+        fixture.raw[index + DEPLOY_IMPORT_STRIDE - 1] =
             fixture.raw[index - 1];
     }
-    for (size_t table = MYOS_DEPLOY_TABLE_DEPENDENCY;
-         table <= MYOS_DEPLOY_TABLE_STRING; ++table) {
-        const size_t table_descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    for (size_t table = DEPLOY_TABLE_DEPENDENCY;
+         table <= DEPLOY_TABLE_STRING; ++table) {
+        const size_t table_descriptor = DEPLOY_HEADER_TABLES
+            + table * DEPLOY_TABLE_DESC_SIZE;
         const size_t offset = static_cast<size_t>(get(
-            fixture.raw, table_descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8));
+            fixture.raw, table_descriptor + DEPLOY_TABLE_OFFSET, 8));
         if (offset >= next_table && offset != 0) {
-            put(fixture.raw, table_descriptor + MYOS_DEPLOY_TABLE_OFFSET,
-                offset + MYOS_DEPLOY_IMPORT_STRIDE, 8);
+            put(fixture.raw, table_descriptor + DEPLOY_TABLE_OFFSET,
+                offset + DEPLOY_IMPORT_STRIDE, 8);
         }
     }
-    put(fixture.raw, MYOS_DEPLOY_HEADER_TOTAL_SIZE,
-        myos::deploy::host::kGoldenSize + MYOS_DEPLOY_IMPORT_STRIDE, 8);
-    const size_t task_descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_TASK * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    put(fixture.raw, DEPLOY_HEADER_TOTAL_SIZE,
+        deploy::host::kGoldenSize + DEPLOY_IMPORT_STRIDE, 8);
+    const size_t task_descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_TASK * DEPLOY_TABLE_DESC_SIZE;
     const size_t task_table = static_cast<size_t>(get(
-        fixture.raw, task_descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8));
-    put(fixture.raw, task_table + MYOS_DEPLOY_TASK_IMPORT_COUNT, 2, 4);
-    put(fixture.raw, import_descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD, 2, 4);
-    for (size_t index = 0; index < MYOS_DEPLOY_IMPORT_STRIDE; ++index) {
-        fixture.raw[import_table + MYOS_DEPLOY_IMPORT_STRIDE + index] =
+        fixture.raw, task_descriptor + DEPLOY_TABLE_OFFSET, 8));
+    put(fixture.raw, task_table + DEPLOY_TASK_IMPORT_COUNT, 2, 4);
+    put(fixture.raw, import_descriptor + DEPLOY_TABLE_COUNT_FIELD, 2, 4);
+    for (size_t index = 0; index < DEPLOY_IMPORT_STRIDE; ++index) {
+        fixture.raw[import_table + DEPLOY_IMPORT_STRIDE + index] =
             fixture.raw[import_table + index];
     }
     /* The copied row must receive a distinct local destination symbol.  The
      * export key is an existing bounded symbol that is not part of the
      * task-local produced-key set, so it keeps this fixture self-contained
      * without inventing a second string-table representation. */
-    const size_t export_descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_EXPORT * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    const size_t export_descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_EXPORT * DEPLOY_TABLE_DESC_SIZE;
     const size_t export_table = static_cast<size_t>(get(
-        fixture.raw, export_descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8));
+        fixture.raw, export_descriptor + DEPLOY_TABLE_OFFSET, 8));
     const uint64_t export_key = get(
-        fixture.raw, export_table + MYOS_DEPLOY_EXPORT_KEY, 8);
+        fixture.raw, export_table + DEPLOY_EXPORT_KEY, 8);
     put(fixture.raw,
-        import_table + MYOS_DEPLOY_IMPORT_STRIDE
-            + MYOS_DEPLOY_IMPORT_DESTINATION,
+        import_table + DEPLOY_IMPORT_STRIDE
+            + DEPLOY_IMPORT_DESTINATION,
         export_key, 8);
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw, sizeof(fixture.raw), fixture.workspace);
     if (!parsed || parsed.value().import_count() != 2) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -373,12 +373,12 @@ void put(
 }
 
 [[nodiscard]] auto test_descriptor_containment() noexcept -> bool {
-    using myos::deploy::attenuation::DescriptorForm;
-    using myos::deploy::attenuation::valid_descriptor;
-    using myos::deploy::attenuation::within;
+    using deploy::attenuation::DescriptorForm;
+    using deploy::attenuation::valid_descriptor;
+    using deploy::attenuation::within;
 
     auto invalid_memory = ceiling(MYOS_OBJECT_KIND_MEMORY);
-    if (myos::deploy::valid_authority_ceiling(invalid_memory)) {
+    if (deploy::valid_authority_ceiling(invalid_memory)) {
         return false;
     }
     auto invalid_version = ceiling(MYOS_OBJECT_KIND_THREAD);
@@ -405,10 +405,10 @@ void put(
         || !within(
             ceiling(MYOS_OBJECT_KIND_TUNNEL),
             ceiling(MYOS_OBJECT_KIND_TUNNEL),
-            MYOS_DEPLOY_IMPORT_DUPLICATE)
+            DEPLOY_IMPORT_DUPLICATE)
         || within(
             thread_request, thread_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)) {
+            DEPLOY_IMPORT_TYPED_DELEGATE)) {
         return false;
     }
 
@@ -422,10 +422,10 @@ void put(
     memory_request.words[1] = 10;
     memory_request.words[2] = MYOS_VM_READ;
     memory_request.words[3] = MYOS_VM_NORMAL;
-    if (!myos::deploy::valid_authority_ceiling(memory_ceiling)
+    if (!deploy::valid_authority_ceiling(memory_ceiling)
         || !within(
             memory_request, memory_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)) {
+            DEPLOY_IMPORT_TYPED_DELEGATE)) {
         return false;
     }
     auto memory_escape = memory_request;
@@ -442,13 +442,13 @@ void put(
     duplicate_typed.words[0] = 1;
     if (within(
             memory_escape, memory_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             memory_access, memory_request,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             memory_types, memory_request,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || valid_descriptor(memory_overflow, DescriptorForm::Ceiling)
         || valid_descriptor(duplicate_typed, DescriptorForm::DuplicateRequest)) {
         return false;
@@ -474,10 +474,10 @@ void put(
     vspace_overflow.words[1] = 0x2000;
     if (!within(
             vspace_request, vspace_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             vspace_escape, vspace_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || valid_descriptor(vspace_unaligned, DescriptorForm::Ceiling)
         || valid_descriptor(vspace_overflow, DescriptorForm::Ceiling)) {
         return false;
@@ -498,13 +498,13 @@ void put(
     pool_mask.words[2] |= uint64_t{1} << MYOS_OBJECT_KIND_ENDPOINT;
     if (!within(
             pool_request, pool_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             pool_budget, pool_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             pool_mask, pool_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)) {
+            DEPLOY_IMPORT_TYPED_DELEGATE)) {
         return false;
     }
 
@@ -524,16 +524,16 @@ void put(
     endpoint_limit.words[2] = 5;
     if (!within(
             endpoint_request, endpoint_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             endpoint_fixed, endpoint_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             endpoint_badge, endpoint_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             endpoint_limit, endpoint_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)) {
+            DEPLOY_IMPORT_TYPED_DELEGATE)) {
         return false;
     }
 
@@ -552,25 +552,25 @@ void put(
     channel_partial_fixed.words[2] = UINT64_MAX - 1;
     if (!within(
             channel_unbound, channel_unbound,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             channel_exact, channel_unbound,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || !within(
             channel_exact, channel_unbound,
-            MYOS_DEPLOY_IMPORT_CHANNEL_MINT)
+            DEPLOY_IMPORT_CHANNEL_MINT)
         || within(
             channel_exact, channel_exact,
-            MYOS_DEPLOY_IMPORT_CHANNEL_MINT)
+            DEPLOY_IMPORT_CHANNEL_MINT)
         || within(
             channel_other, channel_exact,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             channel_b, channel_unbound,
-            MYOS_DEPLOY_IMPORT_CHANNEL_MINT)
+            DEPLOY_IMPORT_CHANNEL_MINT)
         || within(
             channel_zero_badge, channel_unbound,
-            MYOS_DEPLOY_IMPORT_CHANNEL_MINT)
+            DEPLOY_IMPORT_CHANNEL_MINT)
         || valid_descriptor(channel_partial_fixed, DescriptorForm::TypedRequest)) {
         return false;
     }
@@ -585,18 +585,18 @@ void put(
     pager_zero.words[0] = 0;
     if (!within(
             pager_request, pager_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
             pager_escape, pager_ceiling,
-            MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)
+            DEPLOY_IMPORT_TYPED_DELEGATE)
         || valid_descriptor(pager_zero, DescriptorForm::Ceiling)) {
         return false;
     }
 
     auto tunnel = ceiling(MYOS_OBJECT_KIND_TUNNEL);
-    return myos::deploy::valid_authority_ceiling(tunnel)
-        && within(tunnel, tunnel, MYOS_DEPLOY_IMPORT_DUPLICATE)
-        && !within(tunnel, tunnel, MYOS_DEPLOY_IMPORT_TYPED_DELEGATE);
+    return deploy::valid_authority_ceiling(tunnel)
+        && within(tunnel, tunnel, DEPLOY_IMPORT_DUPLICATE)
+        && !within(tunnel, tunnel, DEPLOY_IMPORT_TYPED_DELEGATE);
 }
 
 [[nodiscard]] auto test_registration_and_lease_lifetime() noexcept -> bool {
@@ -618,7 +618,7 @@ void put(
         authorities, *second_slot, 2, thread);
     const auto rejected = source.register_source(
         authorities,
-        myos::deploy::LocalSlot{
+        deploy::LocalSlot{
             .pool = 999, .index = 0, .kind = MYOS_OBJECT_KIND_THREAD},
         3, thread);
     if (!first || !second || rejected) {
@@ -653,7 +653,7 @@ void put(
 }
 
 [[nodiscard]] auto test_generation_exhaustion() noexcept -> bool {
-    using Exhausted = myos::deploy::AuthoritySet<1, 1, 1>;
+    using Exhausted = deploy::AuthoritySet<1, 1, 1>;
     Exhausted authorities{};
     SourceFixture<1> source{};
     if (!source.open()) {
@@ -707,7 +707,7 @@ void put(
     if (!owned_slot || !source.adopt()) {
         return false;
     }
-    const auto foreign = myos::deploy::LocalSlot{
+    const auto foreign = deploy::LocalSlot{
         .pool = 999, .index = 0, .kind = MYOS_OBJECT_KIND_THREAD};
     const auto wrong_kind = source.aggregate.manager_slot();
     if (source.register_source(authorities, foreign, 41, thread)
@@ -749,10 +749,10 @@ void put(
     if (!id) {
         return false;
     }
-    const myos::deploy::ImportBinding binding{*id, {}};
-    myos::deploy::ImportProjection output{};
+    const deploy::ImportBinding binding{*id, {}};
+    deploy::ImportProjection output{};
     const myos_status_t status =
-        myos::deploy::ImportTransaction<Space, Authorities>::run(
+        deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output);
     const auto resolved = space.lookup_remote(
         output.remote_index, output.manager);
@@ -772,7 +772,7 @@ void put(
     FakeBackend::reset();
     Fixture fixture{};
     if (!make_plan(
-            fixture, MYOS_DEPLOY_IMPORT_DUPLICATE,
+            fixture, DEPLOY_IMPORT_DUPLICATE,
             MYOS_OBJECT_KIND_TUNNEL)) {
         return false;
     }
@@ -801,9 +801,9 @@ void put(
     if (!id) {
         return false;
     }
-    const myos::deploy::ImportBinding binding{*id, {}};
-    myos::deploy::ImportProjection output{};
-    if (myos::deploy::ImportTransaction<Space, Authorities>::run(
+    const deploy::ImportBinding binding{*id, {}};
+    deploy::ImportProjection output{};
+    if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output)
             != MYOS_STATUS_OK
         || !output.valid()
@@ -815,7 +815,7 @@ void put(
     FakeBackend::reset();
     Fixture typed{};
     return !make_plan(
-        typed, MYOS_DEPLOY_IMPORT_TYPED_DELEGATE,
+        typed, DEPLOY_IMPORT_TYPED_DELEGATE,
         MYOS_OBJECT_KIND_TUNNEL)
         && FakeBackend::duplicate_calls == 0
         && FakeBackend::typed_calls == 0
@@ -825,7 +825,7 @@ void put(
 [[nodiscard]] auto test_typed_and_channel_imports() noexcept -> bool {
     FakeBackend::reset();
     Fixture typed_fixture{};
-    if (!make_plan(typed_fixture, MYOS_DEPLOY_IMPORT_TYPED_DELEGATE)) {
+    if (!make_plan(typed_fixture, DEPLOY_IMPORT_TYPED_DELEGATE)) {
         return false;
     }
     auto typed_plan = typed_fixture.plan.lease();
@@ -857,10 +857,10 @@ void put(
     if (!descriptor_slot || !typed_id) {
         return false;
     }
-    const myos::deploy::ImportBinding typed_binding{
+    const deploy::ImportBinding typed_binding{
         *typed_id, *descriptor_slot};
-    myos::deploy::ImportProjection typed_output{};
-    const auto typed_status = myos::deploy::ImportTransaction<Space, Authorities>::run(
+    deploy::ImportProjection typed_output{};
+    const auto typed_status = deploy::ImportTransaction<Space, Authorities>::run(
             typed_space, typed_plan->task(0), 0, 1, &typed_binding,
             typed_authorities, &typed_output);
     if (typed_status != MYOS_STATUS_OK
@@ -875,7 +875,7 @@ void put(
 
     Fixture channel_fixture{};
     if (!make_plan(
-            channel_fixture, MYOS_DEPLOY_IMPORT_CHANNEL_MINT,
+            channel_fixture, DEPLOY_IMPORT_CHANNEL_MINT,
             MYOS_OBJECT_KIND_CHANNEL, 9)) {
         return false;
     }
@@ -905,9 +905,9 @@ void put(
     if (!channel_id) {
         return false;
     }
-    const myos::deploy::ImportBinding channel_binding{*channel_id, {}};
-    myos::deploy::ImportProjection channel_output{};
-    const auto channel_status = myos::deploy::ImportTransaction<Space, Authorities>::run(
+    const deploy::ImportBinding channel_binding{*channel_id, {}};
+    deploy::ImportProjection channel_output{};
+    const auto channel_status = deploy::ImportTransaction<Space, Authorities>::run(
             channel_space, channel_plan->task(0), 0, 1, &channel_binding,
             channel_authorities, &channel_output);
     if (channel_status != MYOS_STATUS_OK
@@ -950,14 +950,14 @@ void put(
     if (!id) {
         return false;
     }
-    const myos::deploy::ImportBinding bad_binding{
+    const deploy::ImportBinding bad_binding{
         *id,
-        myos::deploy::LocalSlot{
+        deploy::LocalSlot{
             .pool = 10,
             .index = 0,
             .kind = MYOS_OBJECT_KIND_MEMORY}};
-    myos::deploy::ImportProjection rejected{};
-    if (myos::deploy::ImportTransaction<Space, Authorities>::run(
+    deploy::ImportProjection rejected{};
+    if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &bad_binding, authorities,
             &rejected) != MYOS_STATUS_BAD_ARGS
         || FakeBackend::duplicate_calls != 0
@@ -965,9 +965,9 @@ void put(
         return false;
     }
     FakeBackend::fail_after = 1;
-    const myos::deploy::ImportBinding binding{*id, {}};
-    myos::deploy::ImportProjection output{};
-    if (myos::deploy::ImportTransaction<Space, Authorities>::run(
+    const deploy::ImportBinding binding{*id, {}};
+    deploy::ImportProjection output{};
+    if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output)
             != MYOS_STATUS_BUSY
         || space.remote_size() != 0
@@ -976,7 +976,7 @@ void put(
         return false;
     }
     FakeBackend::fail_after = 0;
-    if (myos::deploy::ImportTransaction<Space, Authorities>::run(
+    if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output)
             != MYOS_STATUS_OK
         || !output.valid()
@@ -1018,10 +1018,10 @@ void put(
     if (!id) {
         return false;
     }
-    const myos::deploy::ImportBinding bindings[2]{{*id, {}}, {*id, {}}};
-    myos::deploy::ImportProjection outputs[2]{};
+    const deploy::ImportBinding bindings[2]{{*id, {}}, {*id, {}}};
+    deploy::ImportProjection outputs[2]{};
     FakeBackend::fail_nonzero_after = 2;
-    const auto status = myos::deploy::ImportTransaction<Space, Authorities>::run(
+    const auto status = deploy::ImportTransaction<Space, Authorities>::run(
         space, plan->task(0), 0, 2, bindings, authorities, outputs);
     if (status != MYOS_STATUS_BUSY
         || space.remote_live_size() != 0
@@ -1071,10 +1071,10 @@ void put(
     }
     FakeBackend::fail_nonzero_after = 1;
     FakeBackend::close_failure_selector = 91;
-    const myos::deploy::ImportBinding failing_binding{*failing_id, {}};
-    myos::deploy::ImportProjection failing_output{};
+    const deploy::ImportBinding failing_binding{*failing_id, {}};
+    deploy::ImportProjection failing_output{};
     const auto failing_status =
-        myos::deploy::ImportTransaction<Space, Authorities>::run(
+        deploy::ImportTransaction<Space, Authorities>::run(
             failing_space, second_plan->task(0), 0, 1, &failing_binding,
             failing_authorities, &failing_output);
     FakeBackend::close_failure_selector = 0;
@@ -1133,9 +1133,9 @@ void put(
     if (!id) {
         return false;
     }
-    const myos::deploy::ImportBinding binding{*id, {}};
-    myos::deploy::ImportProjection output{};
-    const auto status = myos::deploy::ImportTransaction<Space, Authorities>::run(
+    const deploy::ImportBinding binding{*id, {}};
+    deploy::ImportProjection output{};
+    const auto status = deploy::ImportTransaction<Space, Authorities>::run(
         space, plan->task(0), 0, 1, &binding, authorities, &output);
     return status == MYOS_STATUS_NO_MEMORY
         && FakeBackend::duplicate_calls == 0
@@ -1145,7 +1145,7 @@ void put(
 
 [[nodiscard]] auto test_lease_capacity_pressure() noexcept -> bool {
     FakeBackend::reset();
-    using PressureAuthorities = myos::deploy::AuthoritySet<2, 2>;
+    using PressureAuthorities = deploy::AuthoritySet<2, 2>;
     PressureAuthorities authorities{};
     SourceFixture<2> source{};
     if (!source.open()) {
@@ -1225,10 +1225,10 @@ void put(
     if (!bounded_id) {
         return false;
     }
-    const myos::deploy::ImportBinding bounded_bindings[2]{
+    const deploy::ImportBinding bounded_bindings[2]{
         {*bounded_id, {}}, {*bounded_id, {}}};
-    myos::deploy::ImportProjection bounded_outputs[2]{};
-    if (myos::deploy::ImportTransaction<Space, Authorities, 1>::run(
+    deploy::ImportProjection bounded_outputs[2]{};
+    if (deploy::ImportTransaction<Space, Authorities, 1>::run(
             bounded_space, plan->task(0), 0, 2, bounded_bindings,
             bounded_authorities, bounded_outputs) != MYOS_STATUS_BAD_ARGS
         || FakeBackend::duplicate_calls != 0
@@ -1264,12 +1264,12 @@ void put(
     if (!zero_id) {
         return false;
     }
-    const myos::deploy::ImportBinding zero_bindings[2]{
+    const deploy::ImportBinding zero_bindings[2]{
         {*zero_id, {}}, {*zero_id, {}}};
-    myos::deploy::ImportProjection zero_outputs[2]{};
+    deploy::ImportProjection zero_outputs[2]{};
     FakeBackend::fail_after = 2;
     const auto zero_status =
-        myos::deploy::ImportTransaction<Space, Authorities>::run(
+        deploy::ImportTransaction<Space, Authorities>::run(
             zero_space, plan->task(0), 0, 2, zero_bindings,
             zero_authorities, zero_outputs);
     FakeBackend::fail_after = 0;
@@ -1315,13 +1315,13 @@ void put(
     if (!retained_id) {
         return false;
     }
-    const myos::deploy::ImportBinding retained_bindings[2]{
+    const deploy::ImportBinding retained_bindings[2]{
         {*retained_id, {}}, {*retained_id, {}}};
-    myos::deploy::ImportProjection retained_outputs[2]{};
+    deploy::ImportProjection retained_outputs[2]{};
     FakeBackend::fail_after = 2;
     FakeBackend::close_failure_selector = 91;
     const auto retained_status =
-        myos::deploy::ImportTransaction<Space, Authorities>::run(
+        deploy::ImportTransaction<Space, Authorities>::run(
             retained_space, plan->task(0), 0, 2, retained_bindings,
             retained_authorities, retained_outputs);
     FakeBackend::fail_after = 0;
@@ -1354,13 +1354,13 @@ void put(
     if (!source_slot) {
         return false;
     }
-    myos::deploy::RegisteredSpace<Space, 2> bootstrap{};
+    deploy::RegisteredSpace<Space, 2> bootstrap{};
     Space closed{};
     if (bootstrap.adopt(libk::move(closed))
-        || closed.phase() != myos::deploy::Phase::Closed
+        || closed.phase() != deploy::Phase::Closed
         || !bootstrap.adopt(libk::move(raw))
-        || raw.phase() != myos::deploy::Phase::Closed
-        || bootstrap.phase() != myos::deploy::Phase::Open) {
+        || raw.phase() != deploy::Phase::Closed
+        || bootstrap.phase() != deploy::Phase::Open) {
         return false;
     }
     Authorities authorities{};
@@ -1382,7 +1382,7 @@ void put(
     lease.reset();
     if (bootstrap.close() != MYOS_STATUS_OK
         || FakeBackend::resource_close_calls != 1
-        || bootstrap.phase() != myos::deploy::Phase::Closed) {
+        || bootstrap.phase() != deploy::Phase::Closed) {
         return false;
     }
 
@@ -1393,7 +1393,7 @@ void put(
         return false;
     }
     if (bootstrap.adopt(libk::move(replacement))
-        || replacement.phase() != myos::deploy::Phase::Open
+        || replacement.phase() != deploy::Phase::Open
         || replacement.close() != MYOS_STATUS_OK) {
         return false;
     }
@@ -1404,17 +1404,17 @@ void put(
     FakeBackend::reset();
     Fixture fixture{};
     for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
-    const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_IMPORT * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    const size_t descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_IMPORT * DEPLOY_TABLE_DESC_SIZE;
     const size_t import = static_cast<size_t>(get(
         fixture.raw,
-        descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+        descriptor + DEPLOY_TABLE_OFFSET,
         8));
-    put(fixture.raw, import + MYOS_DEPLOY_IMPORT_MODE,
-        MYOS_DEPLOY_IMPORT_MOVE, 2);
-    auto parsed = myos::deploy::ManifestView::parse(
+    put(fixture.raw, import + DEPLOY_IMPORT_MODE,
+        DEPLOY_IMPORT_MOVE, 2);
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw, sizeof(fixture.raw), fixture.workspace);
     return !parsed && FakeBackend::duplicate_calls == 0
         && FakeBackend::typed_calls == 0 && FakeBackend::channel_calls == 0;

@@ -41,48 +41,48 @@ public:
 
     [[nodiscard]] auto create_root(
         object::ObjectRef&& target,
-        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+        Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto create_root(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+        Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto create_allocation(
         kernel::resource::Permit& permit,
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling) noexcept
+        Authority ceiling) noexcept
         -> libk::Expected<kernel::resource::AllocationTxn, GrantError>;
 
     [[nodiscard]] auto derive(
         const GrantLease& source,
         object::ObjectRef&& target,
-        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+        Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive(
         kernel::resource::Reservation&& charge,
         const GrantLease& source,
         object::ObjectRef&& target,
-        GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
+        Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto derive_region(
         kernel::resource::Reservation&& charge,
         const GrantLease& source,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         RegionDerivation proof) noexcept
         -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive_tunnel_tx(
         kernel::resource::Reservation&& charge,
         const GrantLease& source,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         TunnelConnectProof proof) noexcept
         -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive_channel_badge(
         kernel::resource::Reservation&& charge,
         const GrantLease& source,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         ChannelBadgeDerivation proof) noexcept
         -> libk::Expected<GrantRef, GrantError>;
 
@@ -138,7 +138,7 @@ private:
         Node(
             Slot& owner,
             object::ObjectRef&& target_ref,
-            GrantCeiling authority,
+            Authority authority,
             Node* parent_node,
             kernel::resource::Reservation&& charge) noexcept
             : slot(&owner),
@@ -152,7 +152,7 @@ private:
 
         Slot* slot{};
         object::ObjectRef target{};
-        GrantCeiling ceiling{};
+        Authority ceiling{};
         Node* parent{};
         ChildList children{};
         AttachmentList attachments{};
@@ -216,7 +216,7 @@ private:
     [[nodiscard]] auto create(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         Node* parent) noexcept -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto claim_slot() noexcept
         -> libk::Expected<Slot*, GrantError>;

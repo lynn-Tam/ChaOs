@@ -1,15 +1,19 @@
+#include <user/server_rt/service.hpp>
+#include <user/server_rt/io.hpp>
 #include <servers/store/volume.hpp>
-#include <user/lib/imports.hpp>
-#include <user/lib/store_protocol.hpp>
+#include <user/abi/startup.hpp>
+#include <user/ipc/storage.hpp>
+#include <expected>
 
 namespace {
 using namespace myos;
 constexpr size_t Clients = 4;
-constexpr size_t Files = 8;
+constexpr size_t Opens = 8;
 io::ControlPort directory;
-block::Client backend;
+block::client backend;
 store::Volume volume;
 myos_cap_t events;
+myos_cap_t store_pool, store_cspace, store_vspace;
 uint8_t expected_id[store::VolumeIdSize]{};
 bool require_id{};
 
@@ -19,40 +23,338 @@ auto expected(const uint8_t* id) noexcept -> bool {
     return true;
 }
 
-struct File final {
+struct inode final {
     lfs_file_t state{};
     lfs_file_config config{};
     uint8_t cache[store::Volume::BlockSize]{};
-    char name[sizeof(io::ControlMessage::data) + 1]{};
-    uint64_t generation{};
     bool open{};
-    bool writable{};
-    bool readable{};
+    size_t refs{};
 };
+inode nodes[Opens];
 
-struct Client;
-extern Client clients[Clients];
+void drain_reads() noexcept;
+
+void drop(inode& node) noexcept {
+    lfs_file_drop(volume.fs(), &node.state);
+    node.open = false;
+}
+void reap() noexcept {
+    for (auto& node : nodes) if (node.open && !node.refs
+        && (!(node.state.flags & (LFS_F_DIRTY | LFS_F_WRITING))
+            || node.state.m.pair[0] == UINT32_MAX || node.state.m.pair[1] == UINT32_MAX)) drop(node);
+}
+auto writeback(inode& node) noexcept -> myos_status_t {
+    if (node.state.flags & LFS_F_ERRED) return MYOS_STATUS_BACKING_FAILED;
+    const auto status = volume.error(lfs_file_sync(volume.fs(), &node.state));
+    if (volume.failed()) exit(status);
+    return status;
+}
+auto allocate() noexcept -> std::expected<inode*, myos_status_t> {
+    for (auto& node : nodes) if (!node.open) return &node;
+    // Cache pressure, rather than close, chooses when a dormant inode writes
+    // back. Its mlist reference pins uncommitted CTZ blocks until then.
+    for (auto& node : nodes) if (!node.refs) {
+        const auto status = writeback(node);
+        if (status != MYOS_STATUS_OK) return std::unexpected(status);
+        drop(node);
+        return &node;
+    }
+    return std::unexpected(MYOS_STATUS_NO_MEMORY);
+}
+
+
+// littlefs updates these references on metadata relocation and deletion.
+// Resolve namespace identity, never a second pathname/size cache.
+struct entry {
+    lfs_mdir_t dir;
+    uint16_t id;
+};
+auto lookup(const char* path) -> std::expected<entry, int> {
+    uint8_t cache[store::Volume::BlockSize];
+    lfs_file_config config{};
+    config.buffer = cache;
+    lfs_file_t probe{};
+    const int opened = lfs_file_opencfg(volume.fs(), &probe, path, LFS_O_RDONLY, &config);
+    if (opened < 0) return std::unexpected(opened);
+    const entry found{probe.m, probe.id};
+    lfs_file_drop(volume.fs(), &probe);
+    return found;
+}
+auto find(const entry& entry) -> inode* {
+    for (auto& node : nodes) if (node.open && node.state.id == entry.id) {
+        const auto& a = node.state.m.pair;
+        const auto& b = entry.dir.pair;
+        if (a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1]) return &node;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] auto open_file(inode& file, const char* path,
+    uint64_t flags, uint64_t& length) noexcept -> myos_status_t {
+    file.config = {};
+    file.config.buffer = file.cache;
+    const bool write = (flags & store::Write) != 0;
+    int mode = (flags & (store::Read | store::Write)) == (store::Read | store::Write)
+        ? LFS_O_RDWR : write ? LFS_O_WRONLY : LFS_O_RDONLY;
+    if (flags & store::Create) mode |= LFS_O_CREAT;
+    if (flags & store::Truncate) mode |= LFS_O_TRUNC;
+    if (flags & store::Exclusive) mode |= LFS_O_EXCL;
+    const int result = lfs_file_opencfg(volume.fs(), &file.state, path, mode, &file.config);
+    if (result < 0) return volume.error(result);
+    const auto bytes = lfs_file_size(volume.fs(), &file.state);
+    if (bytes < 0) {
+        lfs_file_drop(volume.fs(), &file.state);
+        return volume.error(bytes);
+    }
+    file.open = true;
+    length = bytes;
+    return MYOS_STATUS_OK;
+}
+
+[[nodiscard]] auto transfer(inode& file, const io::Request& request,
+    uint8_t* data, uint64_t& logical, bool implicit,
+    bool readable, bool writable, bool append = false) noexcept -> io::Completion {
+    const bool write = request.operation == static_cast<uint64_t>(io::Operation::Write);
+    if (!write && request.operation != static_cast<uint64_t>(io::Operation::Read))
+        return {request.id, MYOS_STATUS_INVALID_OP, 0, 0};
+    if ((write && !writable) || (!write && !readable))
+        return {request.id, MYOS_STATUS_DENIED, 0, 0};
+    auto offset = implicit ? logical : request.offset;
+    if (write && implicit && append) {
+        const auto size = lfs_file_size(volume.fs(), &file.state);
+        if (size < 0) return {request.id, volume.error(size), 0, 0};
+        offset = size;
+    }
+    if (offset > LFS_FILE_MAX || request.length > LFS_FILE_MAX - offset)
+        return {request.id, MYOS_STATUS_BAD_ARGS, 0, 0};
+    const auto seek = lfs_file_seek(volume.fs(), &file.state, offset, LFS_SEEK_SET);
+    if (seek < 0) {
+        const auto status = volume.error(seek);
+        if (volume.failed()) exit(status);
+        return {request.id, status, 0, 0};
+    }
+    const auto result = write
+        ? lfs_file_write(volume.fs(), &file.state, data, request.length)
+        : lfs_file_read(volume.fs(), &file.state, data, request.length);
+    if (volume.failed()) exit(volume.error(result));
+    if (result > 0 && implicit) logical = offset + result;
+    return {request.id, volume.error(result < 0 ? result : 0),
+        result > 0 ? static_cast<uint64_t>(result) : 0, 0};
+}
+
+struct Open final {
+    inode* file{};
+    cap::OwnedCap channel;
+    io::ServerSession session;
+    uint64_t offset{}, generation{};
+    bool live{}, busy{};
+    bool prepared{};
+    bool readable{}, writable{}, append{};
+
+    [[nodiscard]] auto create(const io::ControlMessage& request, const char* path,
+        size_t slot, io::ControlReply& reply) noexcept -> myos_status_t {
+        if (generation == UINT64_MAX) return MYOS_STATUS_NO_MEMORY;
+        const auto pair = channel_create(store_pool, 1, MYOS_CHANNEL_MAX_WORDS, 4, 2);
+        if (pair.status != MYOS_STATUS_OK) return pair.status;
+        cap::OwnedCap client_root{{pair.value, 0}}, server_root{{pair.value2, 0}};
+        constexpr auto common = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE;
+        const auto client = channel_mint(client_root.selector(), store_cspace, 1,
+            common | MYOS_RIGHT_DESTROY | MYOS_RIGHT_DUPLICATE);
+        const auto server = channel_mint(server_root.selector(), store_cspace, 1, common);
+        if (client.status != MYOS_STATUS_OK || server.status != MYOS_STATUS_OK) {
+            (void)object_destroy(client_root.selector());
+            return client.status != MYOS_STATUS_OK ? client.status : server.status;
+        }
+        cap::OwnedCap endpoint{{client.value, 0}};
+        channel = cap::OwnedCap{{server.value, 0}};
+        auto status = MYOS_STATUS_OK;
+        if (!prepared) {
+            status = session.prepare(store_pool, store_vspace, store_cspace,
+                0x72000000 + slot * 0x100000, true);
+            if (status == MYOS_STATUS_OK) prepared = true;
+        }
+        if (status == MYOS_STATUS_OK) status = session.bind(channel.selector(), events, generation + 1);
+        uint64_t length{};
+        if (status == MYOS_STATUS_OK) {
+            const auto entry = lookup(path);
+            if (!entry && entry.error() != LFS_ERR_NOENT) status = volume.error(entry.error());
+            if (entry) file = find(*entry);
+            if (file) {
+                if ((request.value & store::Exclusive) && (request.value & store::Create))
+                    status = MYOS_STATUS_BUSY;
+                else if (request.value & store::Truncate) {
+                    const auto result = lfs_file_truncate(volume.fs(), &file->state, 0);
+                    status = volume.error(result);
+                }
+                if (status == MYOS_STATUS_OK) {
+                    const auto bytes = lfs_file_size(volume.fs(), &file->state);
+                    status = volume.error(bytes < 0 ? bytes : 0);
+                    if (status == MYOS_STATUS_OK) length = bytes;
+                }
+            } else if (status == MYOS_STATUS_OK) {
+                const auto available = allocate();
+                if (!available) status = available.error();
+                else {
+                    file = *available;
+                    const auto flags = (request.value & ~(store::Read | store::Write))
+                        | store::Read | store::Write;
+                    status = open_file(*file, path, flags, length);
+                }
+            }
+        }
+        if (status != MYOS_STATUS_OK) {
+            reap();
+            file = nullptr;
+            (void)object_destroy(endpoint.selector());
+            channel = {};
+            session.abort();
+            if (session.done()) session.reset();
+            return status;
+        }
+        if (!reply.offer(libk::move(endpoint), common | MYOS_RIGHT_DESTROY
+            | MYOS_RIGHT_DUPLICATE)) {
+            reap();
+            file = nullptr;
+            (void)object_destroy(endpoint.selector());
+            channel = {};
+            session.abort();
+            if (session.done()) session.reset();
+            return MYOS_STATUS_INTERNAL;
+        }
+        live = true;
+        ++file->refs;
+        readable = (request.value & store::Read) != 0;
+        writable = (request.value & store::Write) != 0;
+        append = (request.value & store::Append) != 0;
+        offset = request.value & store::Append ? length : 0;
+        reply.message.value = ++generation;
+        reply.message.size = sizeof(length);
+        service::copy(reply.message.data, &length, sizeof(length));
+        return MYOS_STATUS_OK;
+    }
+
+    void control(const io::ControlMessage& request, io::ControlReply& reply) noexcept {
+        drain_reads();
+        if (request.operation == static_cast<uint64_t>(io::Control::Stat)
+            && request.size == 0 && request.value == 0) {
+            const auto size = lfs_file_size(volume.fs(), &file->state);
+            reply.message.status = volume.error(size < 0 ? size : 0);
+            if (size >= 0) reply.message.value = size;
+            return;
+        }
+        if (request.operation != static_cast<uint64_t>(io::Control::Sync)
+            || request.size != 0 || request.value != 0) {
+            reply.message.status = MYOS_STATUS_INVALID_OP;
+            return;
+        }
+        reply.message.status = writeback(*file);
+        if (reply.message.status == MYOS_STATUS_OK) reply.message.status = backend.flush();
+        if (reply.message.status == MYOS_STATUS_BACKING_FAILED) exit(reply.message.status);
+    }
+
+    static auto valid(const io::Request& request) noexcept -> bool {
+        return !request.object && !request.buffer && request.flags <= 1
+            && request.length && request.length <= io::BufferSize
+            && request.buffer_offset <= io::PayloadSize
+            && request.length <= io::PayloadSize - request.buffer_offset;
+    }
+    [[nodiscard]] auto transfer(const io::Request& request) noexcept -> io::Completion {
+        if (!valid(request)) return {request.id, MYOS_STATUS_BAD_ARGS, 0, 0};
+        return ::transfer(*file, request, session.payload() + request.buffer_offset,
+            offset, request.flags == 1, readable, writable, append);
+    }
+};
+Open opens[Opens];
+
+// The ticket retains its endpoint and inode until the device stops accessing
+// the payload. Filesystem mutation is serialized behind these physical reads.
+struct pending {
+    Open* open{};
+    io::Ticket ticket{};
+    io::read read{};
+};
+std::array<pending, io::QueueDepth> reads;
+auto map_read(const io::read& read) noexcept -> std::expected<io::extent, myos_status_t> {
+    auto& node = *reinterpret_cast<inode*>(read.object);
+    return volume.extent(node.state, read.offset + read.done, read.size - read.done);
+}
+// CTZ lookup may itself read metadata. Leave one of the 32 device credits
+// available so lookup never waits for a credit held by its own data reader.
+io::reader<block::client, decltype(&map_read), io::QueueDepth - 1> reader{backend, map_read};
+
+auto cancelled(const io::read& read) noexcept -> bool {
+    const auto& pending = *static_cast<const ::pending*>(read.context);
+    auto& session = pending.open->session;
+    return session.failed() || session.queue()->cancelled(pending.ticket);
+}
+void completed(io::read& read, myos_status_t status) noexcept {
+    auto& pending = *static_cast<::pending*>(read.context);
+    auto& open = *pending.open;
+    auto* queue = open.session.queue();
+    const auto* request = queue->request(pending.ticket);
+    if (request->flags == 1) {
+        if (status == MYOS_STATUS_OK) open.offset += read.done;
+        open.busy = false;
+    }
+    if (open.session.failed() || !queue->finish(pending.ticket, status, read.done)) {
+        open.session.abort();
+        if (!queue->abandon(pending.ticket)) exit(MYOS_STATUS_INTERNAL);
+    }
+    pending = {};
+    if (status != MYOS_STATUS_OK && status != MYOS_STATUS_CANCELED) exit(status);
+}
+auto slot() noexcept -> pending* {
+    for (auto& pending : reads) if (!pending.open) return &pending;
+    return nullptr;
+}
+auto reading() noexcept -> bool {
+    for (const auto& pending : reads) if (pending.open) return true;
+    return false;
+}
+auto pump_reads() noexcept -> bool {
+    const auto polled = reader.poll();
+    if (!polled) exit(polled.error());
+    bool progress = *polled;
+    for (auto& pending : reads) {
+        const auto submitted = reader.submit(pending.read);
+        if (!submitted) exit(submitted.error());
+        progress |= *submitted;
+    }
+    return progress;
+}
+void drain_reads() noexcept {
+    while (reading()) {
+        (void)pump_reads();
+        if (reading()) service::require(reader.wait());
+    }
+}
+auto start_read(Open& open, io::Ticket ticket, pending& pending) noexcept -> bool {
+    const auto& request = *open.session.queue()->request(ticket);
+    auto& file = open.file->state;
+    const auto offset = request.flags == 1 ? open.offset : request.offset;
+    if (request.operation != static_cast<uint64_t>(io::Operation::Read)
+        || !open.readable || !Open::valid(request)
+        || offset > LFS_FILE_MAX || request.length > LFS_FILE_MAX - offset
+        || (file.flags & (LFS_F_INLINE | LFS_F_WRITING))) return false;
+    service::require(backend.drain_writes());
+    const auto available = offset < file.ctz.size ? file.ctz.size - offset : 0;
+    pending = {.open = &open, .ticket = ticket,
+        .read = {.object = reinterpret_cast<uintptr_t>(open.file), .offset = offset,
+            .output = open.session.payload() + request.buffer_offset,
+            .size = std::min<uint64_t>(request.length, available), .context = &pending,
+            .complete = completed, .cancelled = cancelled, .active = true}};
+    if (request.flags == 1) open.busy = true;
+    return true;
+}
+
 struct Client final {
     cap::OwnedCap channel;
     io::ServerSession session;
-    File files[Files]{};
     bool writable{};
     bool admin{};
 
-    [[nodiscard]] auto file(uint64_t token) noexcept -> File* {
-        auto& candidate = files[token % Files];
-        return candidate.open && candidate.generation == token / Files ? &candidate : nullptr;
-    }
-
-    void close_files() noexcept {
-        for (auto& file : files) if (file.open) {
-            const int result = lfs_file_close(volume.fs(), &file.state);
-            file.open = false;
-            if (result < 0) exit(volume.error(result));
-        }
-    }
-
     void control(const io::ControlMessage& request, io::ControlReply& response) noexcept {
+        drain_reads();
         auto& reply = response.message;
         const auto operation = static_cast<store::Control>(request.operation);
         if (operation == store::Control::DeviceId) {
@@ -90,74 +392,43 @@ struct Client final {
                 || !expected(reinterpret_cast<const uint8_t*>(request.data)))) {
                 reply.status = MYOS_STATUS_DENIED; return;
             }
-            for (auto& owner : clients) for (auto& opened : owner.files)
-                if (opened.open) { reply.status = MYOS_STATUS_BUSY; return; }
+            for (const auto& opened : opens)
+                if (opened.live) { reply.status = MYOS_STATUS_BUSY; return; }
+            for (auto& node : nodes) if (node.open) drop(node);
             reply.status = volume.format(request.size == 0
                 ? nullptr : reinterpret_cast<const uint8_t*>(request.data));
             if (volume.failed()) exit(volume.error(-1));
             return;
         }
         if (!volume.mounted()) { reply.status = MYOS_STATUS_BACKING_FAILED; return; }
-        if (operation == store::Control::Sync || operation == store::Control::Close) {
-            auto* opened = file(request.value);
-            if (request.size != 0 || opened == nullptr) reply.status = MYOS_STATUS_BAD_ARGS;
-            else {
-                const int result = operation == store::Control::Sync
-                    ? lfs_file_sync(volume.fs(), &opened->state)
-                    : lfs_file_close(volume.fs(), &opened->state);
-                if (operation == store::Control::Close) opened->open = false;
-                reply.status = volume.error(result);
+        if (operation == store::Control::Sync) {
+            if (!writable) { reply.status = MYOS_STATUS_DENIED; return; }
+            if (request.size || request.value) { reply.status = MYOS_STATUS_BAD_ARGS; return; }
+            for (auto& node : nodes) if (node.open) {
+                reply.status = writeback(node);
+                if (reply.status != MYOS_STATUS_OK) return;
             }
-        } else if (operation == store::Control::Open) {
+            reply.status = backend.flush();
+            if (reply.status != MYOS_STATUS_OK) exit(reply.status);
+            reap();
+            return;
+        }
+        if (operation == store::Control::Open) {
             char path[sizeof(request.data) + 1]{};
             if (!path_from(request, path) || request.value == 0
                 || (request.value & ~(store::Read | store::Write | store::Create
-                    | store::Truncate | store::Exclusive)) != 0
-                || ((request.value & (store::Create | store::Truncate | store::Exclusive)) != 0
+                    | store::Truncate | store::Exclusive | store::Append)) != 0
+                || ((request.value & (store::Create | store::Truncate | store::Exclusive | store::Append)) != 0
                     && (request.value & store::Write) == 0)) {
                 reply.status = MYOS_STATUS_BAD_ARGS;
                 return;
             }
             const bool write = (request.value & store::Write) != 0;
             if (write && !writable) { reply.status = MYOS_STATUS_DENIED; return; }
-            if (write) for (auto& other : clients) for (auto& existing : other.files)
-                if (existing.open && existing.writable && service::equal(existing.name, path)) {
-                    reply.status = MYOS_STATUS_BUSY;
-                    return;
-                }
-            File* available{};
-            size_t index{};
-            for (size_t i = 0; i < Files; ++i) if (!files[i].open
-                && files[i].generation != UINT64_MAX / Files) { available = &files[i]; index = i; break; }
-            if (available == nullptr) { reply.status = MYOS_STATUS_NO_MEMORY; return; }
-            auto& opened = *available;
-            opened.config = {};
-            opened.config.buffer = opened.cache;
-            int flags = (request.value & (store::Read | store::Write)) == (store::Read | store::Write)
-                ? LFS_O_RDWR : write ? LFS_O_WRONLY : LFS_O_RDONLY;
-            if (request.value & store::Create) flags |= LFS_O_CREAT;
-            if (request.value & store::Truncate) flags |= LFS_O_TRUNC;
-            if (request.value & store::Exclusive) flags |= LFS_O_EXCL;
-            const int result = lfs_file_opencfg(volume.fs(), &opened.state, path, flags,
-                &opened.config);
-            reply.status = volume.error(result);
-            if (result == 0) {
-                opened.open = true;
-                opened.writable = write;
-                opened.readable = (request.value & store::Read) != 0;
-                service::copy(opened.name, path, request.size + 1);
-                reply.value = ++opened.generation * Files + index;
-                const auto size = lfs_file_size(volume.fs(), &opened.state);
-                reply.status = volume.error(size < 0 ? size : 0);
-                if (size >= 0) {
-                    const uint64_t length = size;
-                    reply.size = sizeof(uint64_t);
-                    service::copy(reply.data, &length, sizeof(length));
-                } else {
-                    (void)lfs_file_close(volume.fs(), &opened.state);
-                    opened.open = false;
-                }
-            }
+            size_t slot{};
+            while (slot < Opens && opens[slot].live) ++slot;
+            reply.status = slot == Opens ? MYOS_STATUS_NO_MEMORY
+                : opens[slot].create(request, path, slot, response);
         } else if (operation == store::Control::List) {
             char path[sizeof(request.data) + 1]{};
             if (request.value > UINT32_MAX) { reply.status = MYOS_STATUS_BAD_ARGS; return; }
@@ -199,12 +470,6 @@ struct Client final {
             || operation == store::Control::Mkdir
             || operation == store::Control::Rename) {
             if (!writable) { reply.status = MYOS_STATUS_DENIED; return; }
-            if (operation != store::Control::Mkdir)
-                for (auto& other : clients) for (auto& existing : other.files)
-                    if (existing.open && existing.writable) {
-                        reply.status = MYOS_STATUS_BUSY;
-                        return;
-                    }
             char path[sizeof(request.data) + 1]{};
             if (!path_from(request, path)) { reply.status = MYOS_STATUS_BAD_ARGS; return; }
             int result{};
@@ -222,41 +487,29 @@ struct Client final {
                     if (request.data[i] == '\0') {
                         reply.status = MYOS_STATUS_BAD_ARGS; return;
                     }
-                result = lfs_rename(volume.fs(), path, path + first + 1);
+                const char* target = path + first + 1;
+                const auto source = lookup(path);
+                auto* moved = source ? find(*source) : nullptr;
+                if (!source && source.error() != LFS_ERR_ISDIR) result = source.error();
+                else {
+                    result = lfs_rename(volume.fs(), path, target);
+                    if (result == 0 && moved) {
+                        const auto entry = lookup(target);
+                        if (!entry) result = entry.error();
+                        else {
+                            // littlefs detaches deleted entries, including the
+                            // source of rename. Keep this inode at the new link;
+                            // the replaced inode remains detached.
+                            moved->state.m = entry->dir;
+                            moved->state.id = entry->id;
+                        }
+                    }
+                }
             }
             reply.status = volume.error(result);
         } else reply.status = MYOS_STATUS_INVALID_OP;
         if (volume.failed()) exit(volume.error(-1));
-    }
-
-    [[nodiscard]] auto transfer(const io::Request& request) noexcept -> io::Completion {
-        if (request.buffer != 0 || request.flags != 0 || request.length == 0
-            || request.length > io::BufferSize || request.buffer_offset > io::PayloadSize
-            || request.length > io::PayloadSize - request.buffer_offset)
-            return {request.id, MYOS_STATUS_BAD_ARGS, 0, 0};
-        auto* opened = file(request.object);
-        if (!opened) return {request.id, MYOS_STATUS_NOT_FOUND, 0, 0};
-        const bool write = request.operation == static_cast<uint64_t>(io::Operation::Write);
-        if (!write && request.operation != static_cast<uint64_t>(io::Operation::Read))
-            return {request.id, MYOS_STATUS_INVALID_OP, 0, 0};
-        if (write && !opened->writable) return {request.id, MYOS_STATUS_DENIED, 0, 0};
-        if (!write && !opened->readable) return {request.id, MYOS_STATUS_DENIED, 0, 0};
-        if (request.offset > LFS_FILE_MAX
-            || request.length > LFS_FILE_MAX - request.offset)
-            return {request.id, MYOS_STATUS_BAD_ARGS, 0, 0};
-        const auto seek = lfs_file_seek(volume.fs(), &opened->state, request.offset, LFS_SEEK_SET);
-        if (seek < 0) {
-            const auto status = volume.error(seek);
-            if (volume.failed()) exit(status);
-            return {request.id, status, 0, 0};
-        }
-        auto* data = session.payload() + request.buffer_offset;
-        const auto result = write
-            ? lfs_file_write(volume.fs(), &opened->state, data, request.length)
-            : lfs_file_read(volume.fs(), &opened->state, data, request.length);
-        if (volume.failed()) exit(volume.error(result));
-        return {request.id, volume.error(result < 0 ? result : 0),
-            result > 0 ? static_cast<uint64_t>(result) : 0, 0};
+        reap();
     }
 
     static auto path_from(const io::ControlMessage& request,
@@ -279,6 +532,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto cspace = service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE);
+    store_pool = pool;
+    store_cspace = cspace;
+    store_vspace = vspace;
     events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
     if (info.argument_count() > 1) exit(MYOS_STATUS_BAD_ARGS);
     if (info.argument_count() == 1) {
@@ -305,7 +561,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::capability(info, bootstrap::imports::ServiceWake)).status);
     size_t turn{};
     for (;;) {
-        bool again{};
+        bool again = pump_reads();
         for (size_t count = 0; count < Clients; ++count) {
             io::ControlPacket packet;
             const auto status = directory.receive(packet);
@@ -343,8 +599,14 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         }
         for (auto& client : clients) if (client.channel) {
             if (client.session.poll([&](const io::ControlMessage& request,
-                io::ControlReply& reply) { client.control(request, reply); }) != MYOS_STATUS_OK) {
+                io::ControlReply& reply) { again = true; client.control(request, reply); }) != MYOS_STATUS_OK) {
                 client.session.abort(); again = true;
+            }
+        }
+        for (auto& opened : opens) if (opened.live) {
+            if (opened.session.poll([&](const io::ControlMessage& request,
+                io::ControlReply& reply) { again = true; opened.control(request, reply); }) != MYOS_STATUS_OK) {
+                opened.session.abort(); again = true;
             }
         }
         for (size_t row = 0; row < io::QueueDepth; ++row)
@@ -356,22 +618,65 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 const auto admission = queue->admit(ticket);
                 if (admission == io::Admission::Empty || admission == io::Admission::Backpressure) continue;
                 if (admission != io::Admission::Ready) { client.session.abort(); again = true; continue; }
-                const auto completion = client.transfer(*queue->request(ticket));
-                if (!queue->finish(ticket, completion.status, completion.bytes)) {
+                if (!queue->finish(ticket, MYOS_STATUS_INVALID_OP, 0)) {
                     client.session.abort();
                     if (!queue->abandon(ticket)) exit(MYOS_STATUS_INTERNAL);
                     again = true;
                 }
             }
         turn = (turn + 1) % Clients;
+        for (auto& opened : opens) if (opened.live) {
+            auto* queue = opened.session.queue();
+            if (!queue || opened.session.closing()) continue;
+            for (size_t row = 0; row < io::QueueDepth && !opened.busy; ++row) {
+                auto* pending = slot();
+                if (!pending) break;
+                io::Ticket ticket{};
+                const auto admission = queue->admit(ticket);
+                if (admission == io::Admission::Empty || admission == io::Admission::Backpressure) break;
+                if (admission != io::Admission::Ready) {
+                    opened.session.abort(); again = true; break;
+                }
+                if (start_read(opened, ticket, *pending)) { again = true; continue; }
+                // Native inline/dirty-cache I/O and mutations retain littlefs'
+                // cursor/cache ordering and cannot recycle a pinned data block.
+                drain_reads();
+                const auto completion = opened.transfer(*queue->request(ticket));
+                // Nested Block waits share this notification and may consume
+                // another session's hint. Drain all queues again before sleep.
+                again = true;
+                if (!queue->finish(ticket, completion.status, completion.bytes)) {
+                    opened.session.abort();
+                    if (!queue->abandon(ticket)) exit(MYOS_STATUS_INTERNAL);
+                    again = true; break;
+                }
+            }
+        }
+        again |= pump_reads();
         for (auto& client : clients) if (client.channel) {
             if (client.session.flush(true) != MYOS_STATUS_OK) { client.session.abort(); again = true; }
             if (client.session.done()) {
-                client.close_files();
                 (void)channel_close(client.channel.selector());
                 client.channel = {};
                 client.session.reset();
             } else if (client.session.arm() != MYOS_STATUS_OK) { client.session.abort(); again = true; }
+        }
+        for (auto& opened : opens) if (opened.live) {
+            if (opened.session.flush(true) != MYOS_STATUS_OK) {
+                opened.session.abort(); again = true;
+            }
+            if (opened.session.done()) {
+                again = true;
+                --opened.file->refs;
+                reap();
+                opened.file = nullptr;
+                (void)channel_close(opened.channel.selector());
+                opened.channel = {};
+                opened.session.reset();
+                opened.live = false;
+            } else if (opened.session.arm() != MYOS_STATUS_OK) {
+                opened.session.abort(); again = true;
+            }
         }
         service::require(directory.arm());
         if (!again) service::require(notification_wait(events).status);

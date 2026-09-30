@@ -5,7 +5,6 @@
 #include <core/types.hpp>
 #include <ipc/notification.hpp>
 #include <ipc/channel_wait.hpp>
-#include <libk/array.hpp>
 #include <libk/expected.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/intrusive_list.hpp>
@@ -85,7 +84,7 @@ class Channel final : private libk::noncopyable_nonmovable {
         cap::CSpace* source{};
         cap::CSpace::Reservation source_slot{};
         cap::GrantRef grant{};
-        cap::CapView view{};
+        cap::Authority view{};
         cap::CapHandle source_handle{};
         Kind kind{Kind::Copy};
     };

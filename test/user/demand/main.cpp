@@ -1,7 +1,9 @@
-#include <user/lib/stream.hpp>
-#include <user/lib/clock.hpp>
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/service.hpp>
+#include <user/server_rt/console.hpp>
+#include <libk/parse.hpp>
+#include <user/ipc/channel.hpp>
+#include <user/abi/time.hpp>
+#include <user/abi/objects.hpp>
+#include <user/server_rt/service.hpp>
 #include <uapi/test_scenario.h>
 
 namespace {
@@ -41,8 +43,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     stream::Writer{service::capability(info, bootstrap::imports::Stdout)}
         .write("[demand] initialized data, BSS, private writes and VM reuse ok\n");
     if (info.argument_count() == 3) {
-        const auto duration = decimal(info.argument(1));
-        const auto seed = decimal(info.argument(2));
+        const auto duration = libk::parse<uint64_t>(info.argument(1));
+        const auto seed = libk::parse<uint64_t>(info.argument(2));
         check(duration && seed && *seed > 0 && *seed < 256);
         initialized[0] = *seed;
         zeroed[0] = *seed + 7;

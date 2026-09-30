@@ -1,23 +1,24 @@
+#include <user/server_rt/service.hpp>
 #include <servers/process_server/image.hpp>
 #include <servers/process_server/pipe.hpp>
 #include <servers/process_server/policy.hpp>
-#include <user/lib/imports.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/file_client.hpp>
+#include <user/abi/startup.hpp>
+#include <servers/deploy/launch.hpp>
+#include <user/ipc/storage.hpp>
 
 namespace {
 using namespace myos;
 constexpr size_t Capacity = 4;
 constexpr size_t PackageLimit = 4 * 1024 * 1024;
-using Supervisor = deploy::Supervisor<Capacity>;
+using Supervisor = deploy::tasks<Capacity>;
 struct Waiter final { service::Message reply; uint64_t deadline{}; };
 struct Job final {
     files::FileMemory package;
-    deploy::Program program;
+    deploy::program program;
     process::Image image;
     process::Pipe input;
     bool discard{};
-    libk::optional<Supervisor::Handle> child;
+    libk::optional<Supervisor::handle> child;
     libk::optional<Waiter> waiter;
 
     void release_image() noexcept {
@@ -113,12 +114,12 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
     }
     const auto console = service::capability(info, bootstrap::imports::ConsoleOutput);
     const auto binding = [](const char* name, myos_cap_t cap, myos_word_t rights, myos_word_t side) noexcept {
-        return deploy::LaunchSource{name, {cap, 0}, {
+        return deploy::source{name, {cap, 0}, {
             .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT, .kind = MYOS_OBJECT_KIND_CHANNEL,
             .size = MYOS_CAP_ATTENUATION_SIZE, .rights = rights | MYOS_RIGHT_DUPLICATE,
             .words = {side, 1, UINT64_MAX}}};
     };
-    const deploy::LaunchSource sources[]{binding("stdin", input, MYOS_RIGHT_RECEIVE, 1),
+    const deploy::source sources[]{binding("stdin", input, MYOS_RIGHT_RECEIVE, 1),
         binding("stdout", output ? output : console, MYOS_RIGHT_SEND, 0),
         binding("stderr", console, MYOS_RIGHT_SEND, 0)};
     if (status == MYOS_STATUS_OK) {

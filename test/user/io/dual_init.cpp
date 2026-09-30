@@ -1,12 +1,13 @@
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/objects.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/uart/port.hpp>
 
 namespace {
-myos::deploy::Program program;
-myos::deploy::Supervisor<2> supervisor;
+deploy::program program;
+deploy::tasks<2> supervisor;
 
-auto binding(myos_cap_t device) noexcept -> myos::deploy::LaunchSource {
+auto binding(myos_cap_t device) noexcept -> deploy::source {
     myos_cap_attenuation ceiling{};
     ceiling.version = MYOS_CAP_ATTENUATION_VERSION_CURRENT;
     ceiling.kind = MYOS_OBJECT_KIND_DEVICE;
@@ -29,11 +30,11 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.load(program, info));
     supervisor.open(info);
     service::require(supervisor.add_boot_sources(info));
-    libk::optional<deploy::Supervisor<2>::Handle> tasks[2];
+    libk::optional<deploy::tasks<2>::handle> tasks[2];
     for (size_t i = 0; i < 2; ++i) {
-        const deploy::LaunchSource source[] = {binding(info.device(i))};
+        const deploy::source source[] = {binding(info.device(i))};
         myos_status_t status{};
-        tasks[i] = supervisor.launch(program, deploy::Supervisor<2>::name("io-test"), status,
+        tasks[i] = supervisor.launch(program, deploy::tasks<2>::name("io-test"), status,
             {.sources = source});
         if (status != MYOS_STATUS_OK || !tasks[i]) {
             uart::Printer printer{uart::Writer{port}};

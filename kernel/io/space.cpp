@@ -238,7 +238,7 @@ auto Space::prepare_bars() noexcept -> libk::Expected<void, SpaceError> {
         // Space's allocation root owns these subordinate objects. Binding
         // excludes cleanup until every constructed object is recorded here.
         // Only Space invalidates this lineage; users may duplicate/delegate.
-        const cap::GrantCeiling ceiling{
+        const cap::Authority ceiling{
             cap::Rights::of(cap::Right::Map, cap::Right::Inspect,
                 cap::Right::Duplicate, cap::Right::Delegate),
             cap::MemoryAuthority{{0, bytes / mm::page_size}, DmaAccess,

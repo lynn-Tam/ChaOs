@@ -2,7 +2,6 @@
 
 #include <core/types.hpp>
 #include <cpu/topology.hpp>
-#include <libk/array.hpp>
 #include <libk/delegate.hpp>
 #include <libk/limits.hpp>
 

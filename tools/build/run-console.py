@@ -66,7 +66,7 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         if not re.search(rb'\[test\] summary\s+passed=[1-9][0-9]*\s+failed=0\s', output):
             raise RuntimeError('missing successful builtin test summary')
         run('help', b'run/spawn PROGRAM')
-        run('ls', b'HELLO.PKG')
+        run('ls', b'CAT.PKG')
         run('cat README.TXT', b'myos disk file service')
         run('cat absent.txt', b'error: -5')
         if service_fault:
@@ -83,22 +83,22 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
                 until(b'myos> ', restarted)
                 if output.count(b'uart: console ready') != baseline:
                     raise RuntimeError('unrelated UART service restarted')
-                run('run hello', b'Hello from userspace.\nmyos> ')
+                run('run echo console-ready', b'console-ready\nmyos> ')
                 run('cat README.TXT', b'myos disk file service')
                 run('restart absent', b'error: -5')
             print(f'[console] OK: {smp} harts, local service restart and surviving UART')
             return
         if exhaustion:
             for _ in range(iterations):
-                run('run hello', b'error: -7')
+                run('run echo console-ready', b'error: -7')
             run('help', b'run/spawn PROGRAM')
             run('wait', b'error: -1')
             print(f'[console] OK: {smp} harts, repeated admission failure and rollback')
             return
         for _ in range(iterations):
-            run('run hello', b'Hello from userspace.\nmyos> ')
+            run('run echo console-ready', b'console-ready\nmyos> ')
             run('run echo named arguments survive paging', b'named arguments survive paging\nmyos> ')
-        run('hello', b'Hello from userspace.\nmyos> ')
+        run('echo console-ready', b'console-ready\nmyos> ')
         run('run demand', b'[demand] initialized data, BSS, private writes and VM reuse ok\nmyos> ')
         first = int(re.search(rb'task: ([0-9]+)', run('spawn demand 1000 17', b'task: '))[1])
         second = int(re.search(rb'task: ([0-9]+)', run('spawn demand 1000 71', b'task: '))[1])
@@ -138,7 +138,7 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         producer = run(f'wait {int(blocked[0])}', b'error: ')
         if b'error: -22' not in producer and b'error: -13' not in producer:
             raise RuntimeError(f'blocked producer was not released: {producer!r}')
-        run('run hello', b'Hello from userspace.\nmyos> ')
+        run('run echo console-ready', b'console-ready\nmyos> ')
         print(f'[console] OK: {smp} harts, applications, concurrent tasks, deadlines, bounded streams, EOF, stop and reuse')
     except Exception:
         sys.stdout.buffer.write(output)

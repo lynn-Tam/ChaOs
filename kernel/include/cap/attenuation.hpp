@@ -42,8 +42,8 @@ struct Attenuation final {
 // identity inheritance.
 [[nodiscard]] auto make_attenuation_ceiling(
     object::ObjectKind kind,
-    const EffectiveAuthority& source,
+    const Authority& source,
     const Attenuation& descriptor) noexcept
-    -> libk::Expected<GrantCeiling, AttenuationError>;
+    -> libk::Expected<Authority, AttenuationError>;
 
 } // namespace kernel::cap

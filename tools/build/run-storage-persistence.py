@@ -50,6 +50,13 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
                 process.stdin.write(bytes([char]))
                 process.stdin.flush()
                 time.sleep(0.003)
+            if len(item) > 3:
+                interaction = begin
+                for marker, keys in item[3]:
+                    until(marker, interaction)
+                    interaction = len(output)
+                    process.stdin.write(keys)
+                    process.stdin.flush()
             if restart or command == "restart store":
                 until(b"myos native shell", begin)
                 reopened = output.index(b"myos native shell", begin)
@@ -72,7 +79,7 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
 
 def main():
     qemu, kernel, bundle, boot_disk, cpus = sys.argv[1:6]
-    package_size = f"{(Path(boot_disk).parent / 'hello.pkg').stat().st_size} bytes".encode()
+    package_size = f"{(Path(boot_disk).parent / 'cat.pkg').stat().st_size} bytes".encode()
     root = Path(__file__).resolve().parents[2] / ".tmp/project/interactive-storage"
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as directory:
@@ -86,18 +93,24 @@ def main():
                 stream.truncate(16 * 1024 * 1024)
             boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
                 ("mkfs", b"myos> "),
+                ("run fdcheck admin", b"admin denied"),
+                ("run fdcheck", b"fd offsets ok"),
+                ("run fdcheck cache", b"fd cache ok"),
+                ("run fdcheck close", b"close accepted"),
+                ("cat fd-async", b"CR"),
+                ("fs sync", b"myos> "),
                 ("fs write note hello-persistent", b"myos> "),
                 ("fs append note -again", b"myos> "),
                 ("fs cat note", b"hello-persistent-again\nmyos> "),
                 ("cat note", b"hello-persistent-again\nmyos> "),
                 ("fs ls", b"note\n"),
-                ("ls /boot", b"HELLO.PKG"),
+                ("ls /boot", b"CAT.PKG"),
                 ("cat /boot/README.TXT", b"myos disk file service"),
                 ("write /boot/denied no", b"error: "),
-                ("fs copy README.TXT readme", b"myos> "),
+                ("fs copy /boot/README.TXT readme", b"myos> "),
                 ("fs cat readme", b"myos disk file service"),
-                ("fs copy HELLO.PKG hello.pkg", b"myos> "),
-                ("fs stat hello.pkg", package_size),
+                ("fs copy /boot/CAT.PKG cat.pkg", b"myos> "),
+                ("fs stat cat.pkg", package_size),
                 ("run echo stream-persisted | put piped", b"myos> "),
                 ("fs cat piped", b"stream-persisted"),
                 ("run get piped | put copied", b"myos> "),
@@ -105,16 +118,23 @@ def main():
                 ("fs mkdir notes", b"myos> "),
                 ("fs write notes/item nested-persistent", b"myos> "),
                 ("fs ls notes", b"item\n"),
+                ("edit edited", b"Written", False, [
+                    (b"Ctrl+O Save", b"editor-persistent\x0f"),
+                    (b"Written", b"\x18"),
+                ]),
+                ("cat edited", b"editor-persistent"),
             ])
             resumed = [
                 ("fs cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again"),
                 ("fs cat readme", b"myos disk file service"),
-                ("fs stat hello.pkg", package_size),
+                ("fs stat cat.pkg", package_size),
                 ("fs cat piped", b"stream-persisted"),
                 ("fs cat copied", b"stream-persisted"),
                 ("fs cat notes/item", b"nested-persistent"),
                 ("fs ls notes", b"item\n"),
+                ("cat edited", b"editor-persistent"),
+                ("cat fd-async", b"CR"),
                 ("restart store", b"myos native shell"),
                 ("fs cat readme", b"myos disk file service"),
                 ("fs mv note renamed", b"myos> "),
@@ -131,7 +151,7 @@ def main():
             if count == "1":
                 boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
                     ("fs cat fresh", b"reinitialized"),
-                    ("fs copy README.TXT readme", b"myos> "),
+                    ("fs copy /boot/README.TXT readme", b"myos> "),
                 ])
             print(f"[storage] OK: {count} hart(s), shell writes survive forced QEMU death")
         config = Path(directory) / "write-error.conf"

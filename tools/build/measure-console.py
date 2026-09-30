@@ -44,8 +44,8 @@ def run(args, disk, trace=None):
     try:
         until(b"myos> ", 0)
         for label, command, expected in (
-            ("hello_cold", "hello", b"Hello from userspace."),
-            ("hello_hot", "hello", b"Hello from userspace."),
+            ("echo_cold", "echo baseline", b"baseline"),
+            ("echo_hot", "echo baseline", b"baseline"),
             ("cat_cold", "cat /boot/README.TXT", b"myos disk file service"),
             ("cat_hot", "cat /boot/README.TXT", b"myos disk file service"),
             ("ls_cold", "ls", b"boot"),

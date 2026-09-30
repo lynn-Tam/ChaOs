@@ -1,34 +1,15 @@
-#include <user/lib/stream.hpp>
-#include <user/lib/vfs_client.hpp>
+#include <unistd.h>
 
-namespace { myos::vfs::Client filesystem; }
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
-    const auto info = service::bootstrap(address, size);
-    if (info.argument_count() > 2) exit(MYOS_STATUS_BAD_ARGS);
-    stream::Writer output{service::capability(info, bootstrap::imports::Stdout)};
-    if (info.argument_count() == 1) {
-        stream::Reader input;
-        service::require(input.open(service::capability(info, bootstrap::imports::Stdin),
-            service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)));
-        for (;;) {
-            service::Message message;
-            service::require(input.read(message));
-            if (message.size == 0) exit();
-            output.write(message.data, message.size);
-        }
+int main(int argc, char** argv) {
+    if (argc > 2) return 1;
+    const int fd = argc == 1 ? STDIN_FILENO : open(argv[1], O_RDONLY);
+    if (fd < 0) return fd;
+    char buffer[4096];
+    for (;;) {
+        const auto count = read(fd, buffer, sizeof(buffer));
+        if (count < 0) return count;
+        if (count == 0) break;
+        if (write(STDOUT_FILENO, buffer, count) != count) return 1;
     }
-    service::require(filesystem.connect(info, bootstrap::imports::VfsRead));
-    vfs::File file;
-    auto status = filesystem.open(info.argument(1), vfs::Read, file);
-    if (status == MYOS_STATUS_OK) {
-        status = filesystem.read(file, [&](uint64_t, const uint8_t* data, size_t bytes) {
-            output.write(reinterpret_cast<const char*>(data), bytes);
-        });
-        const auto closed = filesystem.close(file);
-        if (status == MYOS_STATUS_OK) status = closed;
-    }
-    const auto disconnected = filesystem.close();
-    if (status == MYOS_STATUS_OK) status = disconnected;
-    exit(status);
+    return fd == STDIN_FILENO || close(fd) == 0 ? 0 : 1;
 }

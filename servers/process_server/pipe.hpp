@@ -1,7 +1,8 @@
+#include <user/server_rt/service.hpp>
 #pragma once
 
-#include <user/lib/capability_syscall.hpp>
-#include <user/lib/stream.hpp>
+#include <user/abi/objects.hpp>
+#include <user/ipc/channel.hpp>
 
 namespace myos::process {
 // The supervisor owns the channel independently of either task's pool. Root

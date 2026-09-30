@@ -1,7 +1,6 @@
-#include <user/lib/bootstrap.hpp>
-#include <user/lib/context.hpp>
-#include <user/lib/syscall.hpp>
-#include <user/lib/uart.hpp>
+#include <user/abi/startup.hpp>
+#include <user/abi/calls.hpp>
+#include <servers/uart/port.hpp>
 #include <uapi/bootstrap.h>
 #include <uapi/status.h>
 #include <uapi/vm.h>

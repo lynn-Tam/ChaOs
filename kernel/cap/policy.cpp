@@ -124,25 +124,25 @@ constexpr Rights irq_rights = Rights::of(
 
 template<object::ObjectKind Kind>
 [[nodiscard, gnu::noinline]] auto compose_as(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     return CapabilityPolicy<Kind>::compose(ceiling, view);
 }
 
 } // namespace
 
 auto CapabilityPolicy<object::ObjectKind::MemoryObject>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<MemoryAuthority>(&ceiling.data);
     return memory_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::MemoryObject>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!memory_rights.contains(ceiling.rights)
         || !memory_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -159,21 +159,21 @@ auto CapabilityPolicy<object::ObjectKind::MemoryObject>::compose(
         || !upper->types.contains(local->types)) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::VSpace>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<VSpaceAuthority>(&ceiling.data);
     return vspace_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::VSpace>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!vspace_rights.contains(ceiling.rights)
         || !vspace_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -191,21 +191,21 @@ auto CapabilityPolicy<object::ObjectKind::VSpace>::compose(
         || !upper->types.contains(local->types)) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::ResourcePool>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<ResourcePoolAuthority>(&ceiling.data);
     return resource_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::ResourcePool>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!resource_rights.contains(ceiling.rights)
         || !resource_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -223,12 +223,12 @@ auto CapabilityPolicy<object::ObjectKind::ResourcePool>::compose(
         || (local->object_kinds & ~upper->object_kinds) != 0) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::Notification>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<NotificationAuthority>(
         &ceiling.data);
     return notification_rights.contains(ceiling.rights)
@@ -236,9 +236,9 @@ auto CapabilityPolicy<object::ObjectKind::Notification>::validate(
 }
 
 auto CapabilityPolicy<object::ObjectKind::Notification>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!notification_rights.contains(ceiling.rights)
         || !notification_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -254,21 +254,21 @@ auto CapabilityPolicy<object::ObjectKind::Notification>::compose(
         || upper->badge != local->badge) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::Pager>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<PagerAuthority>(&ceiling.data);
     return pager_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::Pager>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     const auto* const upper = libk::get_if<PagerAuthority>(&ceiling.data);
     const auto* const local = libk::get_if<PagerAuthority>(&view.data);
     if (!pager_rights.contains(ceiling.rights)
@@ -282,21 +282,21 @@ auto CapabilityPolicy<object::ObjectKind::Pager>::compose(
         || local->max_pages > upper->max_pages) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::Irq>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<IrqAuthority>(&ceiling.data);
     return irq_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::Irq>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     const auto* const upper = libk::get_if<IrqAuthority>(&ceiling.data);
     const auto* const local = libk::get_if<IrqAuthority>(&view.data);
     if (!irq_rights.contains(ceiling.rights)
@@ -310,21 +310,21 @@ auto CapabilityPolicy<object::ObjectKind::Irq>::compose(
         || upper->level != local->level) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::Endpoint>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<EndpointAuthority>(&ceiling.data);
     return endpoint_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::Endpoint>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!endpoint_rights.contains(ceiling.rights)
         || !endpoint_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -341,21 +341,21 @@ auto CapabilityPolicy<object::ObjectKind::Endpoint>::compose(
         || local->cap_limit > upper->cap_limit) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto CapabilityPolicy<object::ObjectKind::Channel>::validate(
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     const auto* const data = libk::get_if<ChannelAuthority>(&ceiling.data);
     return channel_rights.contains(ceiling.rights)
         && data != nullptr && valid(*data);
 }
 
 auto CapabilityPolicy<object::ObjectKind::Channel>::compose(
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
     if (!channel_rights.contains(ceiling.rights)
         || !channel_rights.contains(view.rights)) {
         return libk::unexpected(PolicyError::InvalidRights);
@@ -378,13 +378,13 @@ auto CapabilityPolicy<object::ObjectKind::Channel>::compose(
         || (root_issuer && local->side == ChannelSide::Any)) {
         return libk::unexpected(PolicyError::Amplification);
     }
-    return libk::expected(EffectiveAuthority{
+    return libk::expected(Authority{
         ceiling.rights.intersect(view.rights), *local});
 }
 
 auto validate_ceiling(
     object::ObjectKind kind,
-    GrantCeiling ceiling) noexcept -> bool {
+    Authority ceiling) noexcept -> bool {
     switch (kind) {
     case object::ObjectKind::IoSpace:
         return CapabilityPolicy<object::ObjectKind::IoSpace>::validate(ceiling);
@@ -432,11 +432,11 @@ auto validate_ceiling(
 
 auto compose(
     object::ObjectKind kind,
-    GrantCeiling ceiling,
-    CapView view) noexcept
-    -> libk::Expected<EffectiveAuthority, PolicyError> {
-    using Compose = libk::Expected<EffectiveAuthority, PolicyError>
-        (*)(GrantCeiling, CapView) noexcept;
+    Authority ceiling,
+    Authority view) noexcept
+    -> libk::Expected<Authority, PolicyError> {
+    using Compose = libk::Expected<Authority, PolicyError>
+        (*)(Authority, Authority) noexcept;
     Compose selected{};
     switch (kind) {
     case object::ObjectKind::IoSpace:
@@ -481,12 +481,11 @@ auto compose(
 
 auto attenuates(
     object::ObjectKind kind,
-    EffectiveAuthority source,
-    GrantCeiling child) noexcept -> bool {
+    Authority source,
+    Authority child) noexcept -> bool {
     auto composed = compose(
         kind,
-        source.ceiling(),
-        CapView{child.rights, child.data});
+        source, child);
     return composed
         && composed.value().rights == child.rights
         && composed.value().data == child.data;

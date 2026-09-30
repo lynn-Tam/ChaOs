@@ -1,25 +1,18 @@
-#include <user/lib/vfs_client.hpp>
-#include <user/lib/stream.hpp>
+#include <dirent.h>
+#include <unistd.h>
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
-    const auto info = service::bootstrap(address, size);
-    if (info.argument_count() != 1
-        && (info.argument_count() != 2 || !service::equal(info.argument(1), "/boot")))
-        exit(MYOS_STATUS_BAD_ARGS);
-    stream::Writer output{service::capability(info, bootstrap::imports::Stdout)};
-    vfs::Client boot;
-    auto status = boot.connect(info, bootstrap::imports::VfsRead);
-    if (status != MYOS_STATUS_OK) exit(status);
-    io::ControlMessage entry{};
-    do {
-        status = boot.list(entry, info.argument_count() == 2 ? info.argument(1) : nullptr);
-        if (status != MYOS_STATUS_OK) break;
-        if (!store::each_name(entry, [&](const char* name, size_t length) {
-            output.write(name, length); output.put('\n');
-        })) { status = MYOS_STATUS_PEER_FAULT; break; }
-    } while (entry.value != 0);
-    const auto closed = boot.close();
-    if (status == MYOS_STATUS_OK) status = closed;
-    exit(status);
+int main(int argc, char** argv) {
+    if (argc > 2) return 1;
+    auto* dir = opendir(argc == 2 ? argv[1] : "/");
+    if (!dir) return 1;
+    dirent entry{};
+    int status{};
+    while ((status = readdir(dir, &entry)) > 0) {
+        uint64_t size{};
+        while (entry.name[size]) ++size;
+        if (write(STDOUT_FILENO, entry.name, size) != static_cast<int64_t>(size)
+            || write(STDOUT_FILENO, "\n", 1) != 1) { status = -1; break; }
+    }
+    const auto closed = closedir(dir);
+    return status < 0 ? status : closed;
 }

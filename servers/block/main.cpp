@@ -1,6 +1,8 @@
-#include <user/lib/imports.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/server_rt/io.hpp>
+#include <user/abi/startup.hpp>
 #include <servers/block/device.hpp>
-#include <user/lib/io_session.hpp>
+#include <user/ipc/io.hpp>
 
 namespace {
 using namespace myos;
@@ -129,6 +131,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                     const io::Ticket device_ticket{static_cast<uint32_t>(slot), ++operation.generation};
                     const auto status = device.submit(device_ticket, io::Operation::Flush, 0, 0);
                     if (status == MYOS_STATUS_OK) {
+                        if (!queue.commit(flush.ticket)) exit(MYOS_STATUS_INTERNAL);
                         operation.client = flush.client;
                         operation.ticket = flush.ticket;
                         flush.submitted = true;
@@ -173,7 +176,12 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                         ? client.session.payload() + request.buffer_offset : nullptr;
                     status = device.submit(device_ticket, kind, request.offset, request.length, source);
                 }
-                if (status == MYOS_STATUS_OK) { operation.client = &client; operation.ticket = ticket; }
+                if (status == MYOS_STATUS_OK) {
+                    if (request.operation == static_cast<uint64_t>(io::Operation::Write)
+                        && !queue->commit(ticket)) exit(MYOS_STATUS_INTERNAL);
+                    operation.client = &client;
+                    operation.ticket = ticket;
+                }
                 else if (!queue->finish(ticket, status, 0)) {
                     client.session.abort();
                     if (!queue->abandon(ticket)) exit(MYOS_STATUS_INTERNAL);

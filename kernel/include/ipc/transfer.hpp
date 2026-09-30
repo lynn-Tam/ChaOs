@@ -66,8 +66,8 @@ private:
             cap::GrantRef&& grant,
             cap::CapHandle source_handle,
             cap::GrantKey source_key,
-            cap::CapView source_view,
-            cap::CapView destination_view,
+            cap::Authority source_view,
+            cap::Authority destination_view,
             TransferKind transfer_kind) noexcept
             : slot(libk::move(reserved)),
               lease(libk::move(admission)),
@@ -86,8 +86,8 @@ private:
         cap::GrantRef prepared{};
         cap::CapHandle source{};
         cap::GrantKey key{};
-        cap::CapView original{};
-        cap::CapView view{};
+        cap::Authority original{};
+        cap::Authority view{};
         TransferKind kind{TransferKind::Copy};
     };
 

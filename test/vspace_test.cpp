@@ -396,7 +396,7 @@ bool test_capability_mapping_revokes_after_hardware_retirement(
     const auto memory_authority = fixture.memory_authority(1);
     auto grant = graph.create_root(
         libk::move(reference).value(),
-        kernel::cap::GrantCeiling{
+        kernel::cap::Authority{
             kernel::cap::Rights::of(
                 kernel::cap::Right::Map,
                 kernel::cap::Right::Inspect),
@@ -406,7 +406,7 @@ bool test_capability_mapping_revokes_after_hardware_retirement(
     }
     auto inserted = cspace.insert(
         libk::move(grant).value(),
-        kernel::cap::CapView{
+        kernel::cap::Authority{
             kernel::cap::Rights::of(kernel::cap::Right::Map),
             memory_authority});
     if (!inserted) {
@@ -467,13 +467,13 @@ bool test_child_region_and_capability_publish_together(
         kernel::cap::Right::Inspect);
     auto grant = graph.create_root(
         libk::move(reference).value(),
-        kernel::cap::GrantCeiling{root_rights, root_authority});
+        kernel::cap::Authority{root_rights, root_authority});
     if (!grant) {
         return false;
     }
     auto root = cspace.insert(
         libk::move(grant).value(),
-        kernel::cap::CapView{root_rights, root_authority});
+        kernel::cap::Authority{root_rights, root_authority});
     if (!root) {
         return false;
     }
@@ -523,7 +523,7 @@ bool test_child_region_and_capability_publish_together(
         if (!resolved_child) {
             return false;
         }
-        const kernel::cap::EffectiveAuthority effective =
+        const kernel::cap::Authority effective =
             resolved_child.value().authority();
         const auto* authority = libk::get_if<kernel::cap::VSpaceAuthority>(
             &effective.data);

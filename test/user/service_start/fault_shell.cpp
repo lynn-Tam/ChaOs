@@ -1,5 +1,7 @@
-#include <user/lib/file_client.hpp>
-#include <user/lib/stream.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/server_rt/console.hpp>
+#include <user/ipc/storage.hpp>
+#include <user/ipc/channel.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;

@@ -1,9 +1,9 @@
 #pragma once
 
 #include <libk/optional.hpp>
-#include <user/lib/io_queue.hpp>
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/service.hpp>
+#include <user/ipc/io.hpp>
+#include <user/abi/objects.hpp>
+#include <user/server_rt/service.hpp>
 
 namespace block {
 

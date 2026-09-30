@@ -1,7 +1,8 @@
+#include <user/server_rt/service.hpp>
 #pragma once
 
-#include <servers/files/reader.hpp>
-#include <user/lib/file_protocol.hpp>
+#include <user/ipc/io.hpp>
+#include <user/ipc/storage.hpp>
 #include <uapi/pager.h>
 
 namespace myos::files {
@@ -15,7 +16,7 @@ class Backing final {
     uint64_t size_{};
     myos_pager_request claim_{};
     uint8_t bytes_[io::BufferSize]{};
-    Read read_{};
+    io::read read_{};
 
     void discard() noexcept {
         cap::OwnedCap* objects[]{&memory_, &pager_, &staging_};
@@ -26,7 +27,7 @@ class Backing final {
             }
         }
     }
-    static void completed(Read& read, myos_status_t status) noexcept {
+    static void completed(io::read& read, myos_status_t status) noexcept {
         auto& self = *static_cast<Backing*>(read.context);
         if (status == MYOS_STATUS_OK) {
             status = memory_populate(self.staging_.selector(), 0).status;
@@ -75,7 +76,7 @@ public:
             .size = MYOS_CAP_ATTENUATION_SIZE, .rights = rights,
             .words = {0, (size_ + 4095) / 4096, access, MYOS_VM_NORMAL}};
         auto& wire = *reinterpret_cast<uint8_t (*)[MYOS_CAP_ATTENUATION_SIZE]>(service::IpcAddress);
-        deploy::attenuation::encode_wire(view, wire);
+        myos::cap::encode(view, wire);
         const auto written = memory_write(descriptor, 0, 0, sizeof(wire));
         if (written.status != MYOS_STATUS_OK) return written.status;
         const auto exported = cap_typed_delegate(memory_.selector(), cspace, descriptor);
@@ -99,12 +100,12 @@ public:
         for (auto& byte : bytes_) byte = 0;
         const auto offset = claim_.page_index * uint64_t{4096};
         const auto remaining = size_ - offset;
-        read_ = {.file = file_, .offset = offset, .output = bytes_,
+        read_ = {.object = file_, .offset = offset, .output = bytes_,
             .size = static_cast<size_t>(remaining < 4096 ? remaining : 4096),
             .context = this, .complete = completed, .active = true};
         return MYOS_STATUS_OK;
     }
-    auto read() noexcept -> Read& { return read_; }
+    auto read() noexcept -> io::read& { return read_; }
 };
 
 } // namespace myos::files

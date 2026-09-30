@@ -50,6 +50,13 @@ int memcmp(const void* lhs, const void* rhs, size_t n) {
     return 0;
 }
 
+void* memchr(const void* data, int c, size_t n) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] == (unsigned char)c) return (void*)(p + i);
+    return 0;
+}
+
 size_t strlen(const char* text) {
     size_t size = 0;
     while (text[size] != '\0') ++size;

@@ -1,367 +1,262 @@
+#include <unistd.h>
+#include <sys/stat.h>
 #include <libk/fmt.hpp>
-#include <user/lib/clock.hpp>
-#include <user/lib/stream.hpp>
-#include <user/lib/terminal.hpp>
-#include <user/lib/vfs_client.hpp>
-#include <user/lib/volume_path.hpp>
+#include <algorithm>
+#include <string_view>
 #include <programs/edit/screen.hpp>
 
 namespace {
-using namespace myos;
-
-enum class Edit { Append, Insert, Replace, Delete };
-
-class Output final {
-    vfs::Client& fs_;
-    vfs::File file_;
-    uint8_t buffer_[io::BufferSize]{};
-    size_t used_{};
-    uint64_t offset_{};
-    myos_status_t status_{MYOS_STATUS_OK};
-public:
-    Output(vfs::Client& fs, vfs::File file) noexcept : fs_(fs), file_(file) {}
-    void flush() noexcept {
-        if (status_ == MYOS_STATUS_OK && used_ != 0) {
-            status_ = fs_.write(file_, offset_, buffer_, used_);
-            offset_ += used_;
-            used_ = 0;
-        }
-    }
-    void put(uint8_t byte) noexcept {
-        if (status_ != MYOS_STATUS_OK) return;
-        buffer_[used_++] = byte;
-        if (used_ == sizeof(buffer_)) flush();
-    }
-    void line(const char* text) noexcept {
-        while (*text != 0) put(*text++);
-        put('\n');
-    }
-    [[nodiscard]] auto status() const noexcept -> myos_status_t { return status_; }
-    [[nodiscard]] auto finish() noexcept -> myos_status_t { flush(); return status_; }
+struct file {
+    int fd;
+    file(const char* path, unsigned flags) : fd(::open(path, flags)) {}
+    explicit file(int value) : fd(value) {}
+    file(const file&) = delete;
+    ~file() { if (fd >= 0) ::close(fd); }
 };
 
-class Draft final {
-    vfs::Client& fs_;
-    char target_[sizeof(io::ControlMessage::data) + 1]{};
-    char paths_[2][25]{};
-    bool created_[2]{};
-    size_t active_{};
-public:
-    explicit Draft(vfs::Client& fs) noexcept : fs_(fs) {}
-    [[nodiscard]] auto present() const noexcept -> bool { return created_[0] || created_[1]; }
-    [[nodiscard]] auto path() const noexcept -> const char* {
-        return paths_[created_[active_] ? active_ : 1 - active_];
+int send(int fd, const void* data, size_t size) {
+    auto* bytes = static_cast<const char*>(data);
+    while (size) {
+        const auto count = write(fd, bytes, size);
+        if (count <= 0) return count < 0 ? count : static_cast<int>(errc::io_error);
+        bytes += count; size -= count;
     }
-
-    [[nodiscard]] auto open(const char* path) noexcept -> myos_status_t {
-        const size_t length = service::length(path);
-        if (length == 0 || length > sizeof(io::ControlMessage::data)) return MYOS_STATUS_BAD_ARGS;
-        if (volume_path::boot_name(path) != nullptr) return MYOS_STATUS_DENIED;
-        service::copy(target_, path, length + 1);
-        const auto now = clock_now();
-        if (now.status != MYOS_STATUS_OK) return now.status;
-        uint64_t candidate = now.value;
-        constexpr char digits[] = "0123456789abcdef";
-        for (;;) {
-            for (size_t slot = 0; slot < 2; ++slot) {
-                service::copy(paths_[slot], "/.edit-", 7);
-                for (size_t i = 0; i < 16; ++i)
-                    paths_[slot][7 + i] = digits[(candidate >> ((15 - i) * 4)) & 15];
-                paths_[slot][23] = slot == 0 ? 'a' : 'b';
-                paths_[slot][24] = 0;
-            }
-            vfs::File first{};
-            auto status = fs_.open(paths_[0], vfs::Write | vfs::Create | vfs::Exclusive, first);
-            if (status == MYOS_STATUS_BUSY && candidate != UINT64_MAX) { ++candidate; continue; }
-            if (status != MYOS_STATUS_OK) return status;
-            created_[0] = true;
-            status = fs_.close(first);
-            if (status != MYOS_STATUS_OK) return status;
-            vfs::File second{};
-            status = fs_.open(paths_[1], vfs::Write | vfs::Create | vfs::Exclusive, second);
-            if (status == MYOS_STATUS_BUSY && candidate != UINT64_MAX) {
-                const auto removed = fs_.remove(paths_[0]);
-                if (removed != MYOS_STATUS_OK) return removed;
-                created_[0] = false;
-                ++candidate;
-                continue;
-            }
-            if (status != MYOS_STATUS_OK) return status;
-            created_[1] = true;
-            status = fs_.close(second);
-            if (status != MYOS_STATUS_OK) return status;
-            return copy_existing();
-        }
-    }
-
-    [[nodiscard]] auto show(stream::Writer& output) noexcept -> myos_status_t {
-        vfs::File file{};
-        auto status = fs_.open(path(), vfs::Read, file);
-        if (status != MYOS_STATUS_OK) return status;
-        uint8_t buffer[io::BufferSize]{};
-        uint64_t number = 1;
-        bool start = true, newline = true;
-        for (uint64_t offset = 0; offset < file.size && status == MYOS_STATUS_OK;) {
-            const size_t length = file.size - offset < sizeof(buffer)
-                ? file.size - offset : sizeof(buffer);
-            uint64_t bytes{};
-            status = fs_.read_at(file, offset, buffer, length, bytes);
-            if (status == MYOS_STATUS_OK && bytes == 0) status = MYOS_STATUS_BACKING_FAILED;
-            if (status != MYOS_STATUS_OK) break;
-            size_t first{};
-            for (size_t i = 0; i < bytes; ++i) if (buffer[i] == '\n') {
-                if (start) (void)libk::fmt::format_to<"{}: ">(output, number);
-                output.write(reinterpret_cast<const char*>(buffer + first), i + 1 - first);
-                first = i + 1;
-                ++number;
-                start = true;
-            }
-            if (first < bytes) {
-                if (start) (void)libk::fmt::format_to<"{}: ">(output, number);
-                output.write(reinterpret_cast<const char*>(buffer + first), bytes - first);
-                start = false;
-            }
-            newline = buffer[bytes - 1] == '\n';
-            offset += bytes;
-        }
-        if (file.size == 0) output.write("(empty)\n");
-        else if (!newline) output.put('\n');
-        const auto closed = fs_.close(file);
-        return status == MYOS_STATUS_OK ? closed : status;
-    }
-
-    [[nodiscard]] auto load(edit::Buffer& buffer, bool& fits) noexcept -> myos_status_t {
-        vfs::File file{};
-        auto status = fs_.open(path(), vfs::Read, file);
-        if (status != MYOS_STATUS_OK) return status;
-        fits = file.size <= edit::Buffer::Capacity;
-        uint8_t bytes[io::BufferSize]{};
-        for (uint64_t offset = 0; fits && offset < file.size && status == MYOS_STATUS_OK;) {
-            const size_t length = file.size - offset < sizeof(bytes)
-                ? file.size - offset : sizeof(bytes);
-            uint64_t received{};
-            status = fs_.read_at(file, offset, bytes, length, received);
-            if (status == MYOS_STATUS_OK && received == 0) status = MYOS_STATUS_BACKING_FAILED;
-            if (status == MYOS_STATUS_OK && !buffer.append(bytes, received)) status = MYOS_STATUS_INTERNAL;
-            offset += received;
-        }
-        const auto closed = fs_.close(file);
-        return status == MYOS_STATUS_OK ? closed : status;
-    }
-
-    [[nodiscard]] auto replace(const edit::Buffer& buffer) noexcept -> myos_status_t {
-        vfs::File file{};
-        auto status = fs_.open(paths_[1 - active_], vfs::Write | vfs::Truncate, file);
-        if (status != MYOS_STATUS_OK) return status;
-        if (buffer.cursor() != 0)
-            status = fs_.write(file, 0, reinterpret_cast<const uint8_t*>(buffer.before()),
-                buffer.cursor());
-        if (status == MYOS_STATUS_OK && buffer.after_size() != 0)
-            status = fs_.write(file, buffer.cursor(),
-                reinterpret_cast<const uint8_t*>(buffer.after()), buffer.after_size());
-        if (status == MYOS_STATUS_OK) status = fs_.sync(file);
-        const auto closed = fs_.close(file);
-        if (status == MYOS_STATUS_OK) status = closed;
-        if (status == MYOS_STATUS_OK) active_ = 1 - active_;
-        return status;
-    }
-
-    [[nodiscard]] auto change(Edit edit, uint64_t target, const char* text) noexcept
-        -> myos_status_t {
-        vfs::File source{};
-        auto status = fs_.open(path(), vfs::Read, source);
-        if (status != MYOS_STATUS_OK) return status;
-        vfs::File destination{};
-        status = fs_.open(paths_[1 - active_], vfs::Write | vfs::Truncate, destination);
-        if (status == MYOS_STATUS_OK) {
-            Output output{fs_, destination};
-            uint8_t buffer[io::BufferSize]{};
-            uint64_t line = 1;
-            bool start = true, done = false, skip = false, newline = true;
-            for (uint64_t offset = 0; offset < source.size && status == MYOS_STATUS_OK;) {
-                const size_t length = source.size - offset < sizeof(buffer)
-                    ? source.size - offset : sizeof(buffer);
-                uint64_t bytes{};
-                status = fs_.read_at(source, offset, buffer, length, bytes);
-                if (status == MYOS_STATUS_OK && bytes == 0) status = MYOS_STATUS_BACKING_FAILED;
-                if (status != MYOS_STATUS_OK) break;
-                for (size_t i = 0; i < bytes; ++i) {
-                    if (start) {
-                        if (edit == Edit::Insert && line == target) { output.line(text); done = true; }
-                        if ((edit == Edit::Replace || edit == Edit::Delete) && line == target) {
-                            if (edit == Edit::Replace) output.line(text);
-                            done = skip = true;
-                        }
-                        start = false;
-                    }
-                    if (!skip) output.put(buffer[i]);
-                    newline = buffer[i] == '\n';
-                    if (newline) { ++line; start = true; skip = false; }
-                }
-                status = output.status();
-                offset += bytes;
-            }
-            if (status == MYOS_STATUS_OK) {
-                if (edit == Edit::Append) {
-                    if (source.size != 0 && !newline) output.put('\n');
-                    output.line(text);
-                    done = true;
-                } else if (edit == Edit::Insert && !done) {
-                    if (target == line && start) { output.line(text); done = true; }
-                    else if (target == line + 1 && !start) {
-                        output.put('\n'); output.line(text); done = true;
-                    }
-                }
-                status = output.finish();
-                if (status == MYOS_STATUS_OK && !done) status = MYOS_STATUS_BAD_ARGS;
-            }
-            if (status == MYOS_STATUS_OK) status = fs_.sync(destination);
-            const auto closed = fs_.close(destination);
-            if (status == MYOS_STATUS_OK) status = closed;
-        }
-        const auto closed = fs_.close(source);
-        if (status == MYOS_STATUS_OK) status = closed;
-        if (status == MYOS_STATUS_OK) active_ = 1 - active_;
-        return status;
-    }
-
-    [[nodiscard]] auto save() noexcept -> myos_status_t {
-        auto status = fs_.rename(path(), target_);
-        if (status == MYOS_STATUS_OK) {
-            created_[active_] = false;
-            active_ = 1 - active_;
-            status = fs_.remove(path());
-            if (status == MYOS_STATUS_OK) created_[active_] = false;
-        }
-        return status;
-    }
-    [[nodiscard]] auto discard() noexcept -> myos_status_t {
-        myos_status_t status = MYOS_STATUS_OK;
-        for (size_t i = 0; i < 2; ++i) if (created_[i]) {
-            const auto removed = fs_.remove(paths_[i]);
-            if (removed == MYOS_STATUS_OK) created_[i] = false;
-            else if (status == MYOS_STATUS_OK) status = removed;
-        }
-        return status;
-    }
-private:
-    [[nodiscard]] auto copy_existing() noexcept -> myos_status_t {
-        vfs::File source{};
-        auto status = fs_.open(target_, vfs::Read, source);
-        if (status == MYOS_STATUS_NOT_FOUND) return MYOS_STATUS_OK;
-        if (status != MYOS_STATUS_OK) return status;
-        vfs::File target{};
-        status = fs_.open(path(), vfs::Write | vfs::Truncate, target);
-        if (status == MYOS_STATUS_OK) {
-            uint8_t buffer[io::BufferSize]{};
-            for (uint64_t offset = 0; offset < source.size && status == MYOS_STATUS_OK;) {
-                const size_t length = source.size - offset < sizeof(buffer)
-                    ? source.size - offset : sizeof(buffer);
-                uint64_t bytes{};
-                status = fs_.read_at(source, offset, buffer, length, bytes);
-                if (status == MYOS_STATUS_OK && bytes == 0) status = MYOS_STATUS_BACKING_FAILED;
-                if (status == MYOS_STATUS_OK) status = fs_.write(target, offset, buffer, bytes);
-                offset += bytes;
-            }
-            if (status == MYOS_STATUS_OK) status = fs_.sync(target);
-            const auto closed = fs_.close(target);
-            if (status == MYOS_STATUS_OK) status = closed;
-        }
-        const auto closed = fs_.close(source);
-        return status == MYOS_STATUS_OK ? closed : status;
-    }
-};
-
-[[nodiscard]] auto number_and_text(char* input, uint64_t& number, const char*& text,
-    bool needs_text) noexcept -> bool {
-    char* end = input;
-    while (*end >= '0' && *end <= '9') ++end;
-    if (*end != 0 && *end != ' ') return false;
-    const char separator = *end;
-    *end = 0;
-    const auto parsed = decimal(input);
-    *end = separator;
-    if (!parsed || *parsed == 0) return false;
-    number = *parsed;
-    text = separator == 0 ? end : end + 1;
-    return needs_text ? separator == ' ' : separator == 0;
+    return 0;
 }
-
-[[nodiscard]] auto line_editor(Draft& draft, stream::Writer& output,
-    myos_cap_t input_cap, myos_cap_t output_cap) noexcept -> myos_status_t {
-    myos_status_t status{};
-    output.write("Large file: line editor. Text or :a TEXT appends; :p shows, :i/:r/:d N edits; . saves, :q cancels.\n");
-    terminal::LineReader input{input_cap, output_cap};
-    char line[128]{};
+int copy(int source, int target) {
+    char bytes[4096];
     for (;;) {
-        output.write("edit> ");
-        const auto result = input.read(line);
-        if (result == terminal::LineResult::TooLong) { output.write("line too long\n"); continue; }
-        if (result == terminal::LineResult::End || service::equal(line, ":q"))
-            return draft.discard();
-        if (service::equal(line, ".") || service::equal(line, ":w"))
-            return draft.save();
-        if (service::equal(line, ":p")) status = draft.show(output);
-        else if (line[0] == ':' && line[1] == 'a' && line[2] == ' ')
-            status = draft.change(Edit::Append, 0, line + 3);
-        else if (line[0] == ':' && (line[1] == 'i' || line[1] == 'r'
-            || line[1] == 'd') && line[2] == ' ') {
-            uint64_t number{};
-            const char* text{};
-            if (!number_and_text(line + 3, number, text, line[1] != 'd')) {
-                output.write("invalid line command\n"); continue;
-            }
-            status = draft.change(line[1] == 'i' ? Edit::Insert
-                : line[1] == 'r' ? Edit::Replace : Edit::Delete, number, text);
-            if (status == MYOS_STATUS_BAD_ARGS) {
-                output.write("line out of range\n"); continue;
-            }
-        } else if (line[0] == ':' && line[1] != ':') {
-            output.write("invalid editor command\n"); continue;
-        } else status = draft.change(Edit::Append, 0, line[0] == ':' ? line + 1 : line);
-        if (status != MYOS_STATUS_OK) return status;
+        const auto count = read(source, bytes, sizeof(bytes));
+        if (count <= 0) return count;
+        if (const int status = send(target, bytes, count)) return status;
     }
 }
 
-edit::Buffer text;
-} // namespace
-
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
-    const auto info = service::bootstrap(address, size);
-    if (info.argument_count() != 2) exit(MYOS_STATUS_BAD_ARGS);
-    const auto stdout = service::capability(info, bootstrap::imports::Stdout);
-    stream::Writer output{stdout};
-    vfs::Client fs;
-    auto status = fs.connect(info);
-    if (status != MYOS_STATUS_OK) exit(status);
-    Draft draft{fs};
-    status = draft.open(info.argument(1));
-    if (status != MYOS_STATUS_OK) {
-        if (draft.present()) (void)draft.discard();
-        exit(status);
+class writer {
+    int fd_, status_{};
+    char bytes_[4096];
+    size_t used_{};
+public:
+    explicit writer(int fd) : fd_(fd) {}
+    int flush() {
+        if (!status_) status_ = send(fd_, bytes_, used_);
+        used_ = 0;
+        return status_;
     }
+    void put(char byte) {
+        if (status_) return;
+        bytes_[used_++] = byte;
+        if (used_ == sizeof(bytes_)) flush();
+    }
+    void line(const char* text) { while (*text) put(*text++); put('\n'); }
+};
+
+enum class change { append, insert, replace, erase };
+
+class draft {
+    const char* target_{};
+    char paths_[2][20]{};
+    unsigned active_{};
+public:
+    bool present() const { return paths_[0][0] || paths_[1][0]; }
+    const char* path() const { return paths_[paths_[active_][0] ? active_ : 1 - active_]; }
+    int open(const char* path) {
+        target_ = path;
+        active_ = 0;
+        for (auto& name : paths_) {
+            std::copy_n("/.edit-XXXXXX", 14, name);
+            file temp{mkstemp(name)};
+            if (temp.fd < 0) { name[0] = 0; return temp.fd; }
+        }
+        file source{target_, O_RDONLY};
+        if (source.fd == errc::not_found) return 0;
+        if (source.fd < 0) return source.fd;
+        file dest{this->path(), O_WRONLY};
+        return dest.fd < 0 ? dest.fd : copy(source.fd, dest.fd);
+    }
+    int show(edit::output& out) {
+        file source{path(), O_RDONLY};
+        if (source.fd < 0) return source.fd;
+        char bytes[4096];
+        uint64_t line = 1;
+        bool start = true, any = false;
+        for (;;) {
+            const auto count = read(source.fd, bytes, sizeof(bytes));
+            if (count < 0) return count;
+            if (!count) break;
+            any = true;
+            for (int64_t i = 0; i < count; ++i) {
+                if (start) (void)libk::fmt::format_to<"{}: ">(out, line);
+                size_t end = i;
+                while (end < static_cast<size_t>(count) && bytes[end] != '\n') ++end;
+                start = end < static_cast<size_t>(count);
+                if (start) { ++end; ++line; }
+                out.write(bytes + i, end - i);
+                i = end - 1;
+            }
+        }
+        if (!any) out.write("(empty)\n");
+        else if (!start) out.put('\n');
+        return out.status();
+    }
+    int load(edit::buffer& text, bool& fits) {
+        file source{path(), O_RDONLY};
+        if (source.fd < 0) return source.fd;
+        struct stat info{};
+        if (const int status = fstat(source.fd, &info)) return status;
+        fits = info.size <= edit::buffer::capacity;
+        char bytes[4096];
+        while (fits) {
+            const auto count = read(source.fd, bytes, sizeof(bytes));
+            if (count <= 0) return count;
+            fits = text.append(reinterpret_cast<const uint8_t*>(bytes), count);
+        }
+        return 0;
+    }
+    int replace(const edit::buffer& text) {
+        file dest{paths_[1 - active_], O_WRONLY | O_TRUNC};
+        if (dest.fd < 0) return dest.fd;
+        int status = send(dest.fd, text.before(), text.cursor());
+        if (!status) status = send(dest.fd, text.after(), text.after_size());
+        if (!status) status = fsync(dest.fd);
+        if (!status) active_ = 1 - active_;
+        return status;
+    }
+    int edit(change op, uint64_t target, const char* text) {
+        file source{path(), O_RDONLY};
+        if (source.fd < 0) return source.fd;
+        file dest{paths_[1 - active_], O_WRONLY | O_TRUNC};
+        if (dest.fd < 0) return dest.fd;
+        writer out{dest.fd};
+        char bytes[4096];
+        uint64_t line = 1;
+        bool start = true, done = false, skip = false, any = false;
+        for (;;) {
+            const auto count = read(source.fd, bytes, sizeof(bytes));
+            if (count < 0) return count;
+            if (!count) break;
+            any = true;
+            for (int64_t i = 0; i < count; ++i) {
+                if (start) {
+                    if (op == change::insert && line == target) { out.line(text); done = true; }
+                    if ((op == change::replace || op == change::erase) && line == target) {
+                        if (op == change::replace) out.line(text);
+                        done = skip = true;
+                    }
+                    start = false;
+                }
+                if (!skip) out.put(bytes[i]);
+                if (bytes[i] == '\n') { ++line; start = true; skip = false; }
+            }
+        }
+        if (op == change::append) {
+            if (any && !start) out.put('\n');
+            out.line(text); done = true;
+        } else if (op == change::insert && !done
+            && target == line + (start ? 0 : 1)) {
+            if (!start) out.put('\n');
+            out.line(text); done = true;
+        }
+        if (!done) return errc::invalid;
+        int status = out.flush();
+        if (!status) status = fsync(dest.fd);
+        if (!status) active_ = 1 - active_;
+        return status;
+    }
+    int save() {
+        int status = rename(path(), target_);
+        if (!status) { paths_[active_][0] = 0; status = discard(); }
+        return status;
+    }
+    int discard() {
+        int status{};
+        for (auto& path : paths_) if (path[0]) {
+            const int removed = unlink(path);
+            if (!removed) path[0] = 0;
+            else if (!status) status = removed;
+        }
+        return status;
+    }
+};
+
+// Canonical line editing is a UI choice here; the runtime owns stream transport.
+int line_editor(draft& doc, edit::output& out) {
+    out.write("Large file: line editor. Text or :a TEXT appends; :p shows, :i/:r/:d N edits; . saves, :q cancels.\n");
+    for (;;) {
+        out.write("edit> ");
+        char text[128]{};
+        size_t used{};
+        bool overflow{};
+        for (;;) {
+            char byte;
+            const auto count = read(STDIN_FILENO, &byte, 1);
+            if (count < 0) return count;
+            if (!count) return doc.discard();
+            if (byte == '\n' || byte == '\r') { out.put('\n'); break; }
+            if (byte == '\b' || byte == 127) {
+                if (used) { --used; out.write("\b \b"); }
+            } else if (byte >= 32 && byte < 127) {
+                if (used + 1 < sizeof(text)) { text[used++] = byte; out.put(byte); }
+                else overflow = true;
+            }
+        }
+        if (out.status()) return out.status();
+        if (overflow) { out.write("line too long\n"); continue; }
+        const std::string_view command{text, used};
+        if (command == ":q") return doc.discard();
+        if (command == "." || command == ":w") return doc.save();
+        int status{};
+        if (command == ":p") status = doc.show(out);
+        else if (command.starts_with(":a ")) status = doc.edit(change::append, 0, text + 3);
+        else if (used >= 3 && text[0] == ':' && std::string_view("ird").find(text[1]) != std::string_view::npos && text[2] == ' ') {
+            uint64_t line{};
+            const char* end = text + 3;
+            bool valid{};
+            while (*end >= '0' && *end <= '9') {
+                if (line > (UINT64_MAX - (*end - '0')) / 10) { valid = false; break; }
+                line = line * 10 + (*end++ - '0');
+                valid = true;
+            }
+            const bool erase = text[1] == 'd';
+            if (!valid || !line
+                || (erase ? end != text + used : end == text + used || *end != ' ')) {
+                out.write("invalid line command\n"); continue;
+            }
+            status = doc.edit(erase ? change::erase : text[1] == 'i' ? change::insert : change::replace,
+                line, erase ? "" : end + 1);
+            if (status == errc::invalid) { out.write("line out of range\n"); continue; }
+        } else if (command.starts_with(':') && !command.starts_with("::")) {
+            out.write("invalid editor command\n"); continue;
+        } else status = doc.edit(change::append, 0, text + (command.starts_with("::") ? 1 : 0));
+        if (status) return status;
+    }
+}
+edit::buffer text;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 2) return errc::invalid;
+    edit::output out;
+    draft doc;
+    int status = doc.open(argv[1]);
+    if (status) { if (doc.present()) doc.discard(); return status; }
     bool fits{};
-    status = draft.load(text, fits);
-    if (status == MYOS_STATUS_OK) {
-        if (!fits) status = line_editor(draft, output,
-            service::capability(info, bootstrap::imports::Stdin), stdout);
+    status = doc.load(text, fits);
+    if (!status) {
+        if (!fits) status = line_editor(doc, out);
         else {
-            edit::Screen screen{text,
-                service::capability(info, bootstrap::imports::Stdin), output, info.argument(1)};
-            status = screen.run([&](bool continue_editing) noexcept -> myos_status_t {
-                auto saved = draft.replace(text);
-                if (saved == MYOS_STATUS_OK) saved = draft.save();
-                if (saved == MYOS_STATUS_OK && continue_editing)
-                    saved = draft.open(info.argument(1));
+            edit::screen screen{text, out, argv[1]};
+            status = screen.run([&](bool again) {
+                int saved = doc.replace(text);
+                if (!saved) saved = doc.save();
+                if (!saved && again) saved = doc.open(argv[1]);
                 return saved;
             });
-            if (status == MYOS_STATUS_OK && draft.present()) status = draft.discard();
+            if (!status && doc.present()) status = doc.discard();
         }
     }
-    if (draft.present()) {
-        output.write("draft: "); output.write(draft.path()); output.put('\n');
+    if (doc.present()) {
+        out.write("draft: "); out.write(doc.path()); out.put('\n');
     }
-    const auto closed = fs.close();
-    exit(status == MYOS_STATUS_OK ? closed : status);
+    return status ? status : out.status();
 }

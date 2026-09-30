@@ -14,7 +14,7 @@ namespace {
     const cap::Resolved<kernel::mm::MemoryObject>& memory,
     usize page,
     kernel::mm::AccessMask access) noexcept -> bool {
-    const cap::EffectiveAuthority effective = memory.authority();
+    const cap::Authority effective = memory.authority();
     const auto* const authority = libk::get_if<cap::MemoryAuthority>(
         &effective.data);
     return authority != nullptr

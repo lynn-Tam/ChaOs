@@ -137,7 +137,7 @@ public:
     }
     [[nodiscard]] auto key() const noexcept -> GrantKey;
     [[nodiscard]] auto kind() const noexcept -> object::ObjectKind;
-    [[nodiscard]] auto ceiling() const noexcept -> GrantCeiling;
+    [[nodiscard]] auto ceiling() const noexcept -> Authority;
     [[nodiscard]] auto clone_target() const noexcept
         -> libk::Expected<object::ObjectRef, object::ObjectError>;
     [[nodiscard]] auto attach(GrantAttachment& attachment) const noexcept
@@ -145,19 +145,19 @@ public:
     [[nodiscard]] auto derive_region(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         RegionDerivation proof) const noexcept
         -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive_tunnel_tx(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         TunnelConnectProof proof) const noexcept
         -> libk::Expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive_channel_badge(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         ChannelBadgeDerivation proof) const noexcept
         -> libk::Expected<GrantRef, GrantError>;
     void reset() noexcept;

@@ -6,7 +6,7 @@
 #include <libk/utility.hpp>
 #include <uapi/resource.h>
 #include <uapi/status.h>
-#include <user/lib/task_transaction.hpp>
+#include <servers/deploy/detail/task.hpp>
 
 #include "deploypack/golden_fixture.hpp"
 
@@ -361,44 +361,44 @@ struct ReturningFaultBackend final {
     }
 };
 
-using Space = myos::deploy::TaskSpace<8, 8, FakeBackend>;
-using Record = myos::deploy::TaskRecord<Space>;
-using Completions = myos::deploy::CompletionSet<2, 3>;
-using Table = myos::deploy::TaskTable<Record, Completions, 2, 3>;
-using Builder = myos::deploy::TaskBuilder<Table, Completions>;
+using Space = deploy::TaskSpace<8, 8, FakeBackend>;
+using Record = deploy::TaskRecord<Space>;
+using Completions = deploy::CompletionSet<2, 3>;
+using Table = deploy::TaskTable<Record, Completions, 2, 3>;
+using Builder = deploy::TaskBuilder<Table, Completions>;
 
-using ConstructionSpace = myos::deploy::TaskSpace<32, 8, FakeBackend>;
-using ConstructionRecord = myos::deploy::TaskRecord<ConstructionSpace>;
-using ConstructionCompletions = myos::deploy::CompletionSet<1, 3>;
-using ConstructionTable = myos::deploy::TaskTable<
+using ConstructionSpace = deploy::TaskSpace<32, 8, FakeBackend>;
+using ConstructionRecord = deploy::TaskRecord<ConstructionSpace>;
+using ConstructionCompletions = deploy::CompletionSet<1, 3>;
+using ConstructionTable = deploy::TaskTable<
     ConstructionRecord, ConstructionCompletions, 1, 3>;
-using ConstructionBuilder = myos::deploy::TaskBuilder<
+using ConstructionBuilder = deploy::TaskBuilder<
     ConstructionTable, ConstructionCompletions>;
-using ConstructionBundle = myos::deploy::MappedBundle<FakeBackend>;
-using ConstructionScratch = myos::deploy::ScratchWindow<FakeBackend>;
-using ConstructionAuthorities = myos::deploy::AuthoritySet<2, 2>;
-using ConstructionWorkspace = myos::deploy::TaskConstructionWorkspace<
+using ConstructionBundle = deploy::MappedBundle<FakeBackend>;
+using ConstructionScratch = deploy::ScratchWindow<FakeBackend>;
+using ConstructionAuthorities = deploy::AuthoritySet<2, 2>;
+using ConstructionWorkspace = deploy::TaskConstructionWorkspace<
     ConstructionAuthorities>;
 
-static_assert(myos::deploy::Backend<FakeBackend>);
-static_assert(myos::deploy::ConstructionBackend<FakeBackend>);
-static_assert(myos::deploy::Backend<ReturningFaultBackend>);
+static_assert(deploy::Backend<FakeBackend>);
+static_assert(deploy::ConstructionBackend<FakeBackend>);
+static_assert(deploy::Backend<ReturningFaultBackend>);
 static_assert(!libk::is_copy_constructible_v<Record>);
 static_assert(!libk::is_copy_constructible_v<Table>);
 
 struct Fixture final {
-    uint8_t raw[myos::deploy::host::kGoldenSize]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    uint8_t raw[deploy::host::kGoldenSize]{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 struct ExplicitFixture final {
     uint8_t raw[4096]{};
     size_t size{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 struct TableShape final {
@@ -451,21 +451,21 @@ void insert_explicit(
     -> bool {
     constexpr size_t legacy_header = 224;
     constexpr size_t table_count = 9;
-    fixture.size = myos::deploy::host::kGoldenSize;
+    fixture.size = deploy::host::kGoldenSize;
     for (size_t index = 0; index < fixture.size; ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
     TableShape old[table_count]{};
     for (size_t index = 0; index < table_count; ++index) {
-        const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + index * MYOS_DEPLOY_TABLE_DESC_SIZE;
+        const size_t descriptor = DEPLOY_HEADER_TABLES
+            + index * DEPLOY_TABLE_DESC_SIZE;
         old[index] = TableShape{
             static_cast<size_t>(read_manifest_field(
-                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_OFFSET, 8)),
+                fixture.raw, descriptor + DEPLOY_TABLE_OFFSET, 8)),
             static_cast<uint32_t>(read_manifest_field(
-                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD, 4)),
+                fixture.raw, descriptor + DEPLOY_TABLE_COUNT_FIELD, 4)),
             static_cast<uint32_t>(read_manifest_field(
-                fixture.raw, descriptor + MYOS_DEPLOY_TABLE_STRIDE, 4))};
+                fixture.raw, descriptor + DEPLOY_TABLE_STRIDE, 4))};
     }
 
     /* Current manifests reserve the tenth descriptor in the 224-byte header;
@@ -474,190 +474,190 @@ void insert_explicit(
     for (auto& table : old) {
         table.offset += 16;
     }
-    const size_t extra_object = old[MYOS_DEPLOY_TABLE_OBJECT].offset
-        + old[MYOS_DEPLOY_TABLE_OBJECT].stride;
+    const size_t extra_object = old[DEPLOY_TABLE_OBJECT].offset
+        + old[DEPLOY_TABLE_OBJECT].stride;
     insert_explicit(fixture, extra_object,
-                    old[MYOS_DEPLOY_TABLE_OBJECT].stride);
+                    old[DEPLOY_TABLE_OBJECT].stride);
 
-    TableShape tables[MYOS_DEPLOY_TABLE_COUNT]{};
+    TableShape tables[DEPLOY_TABLE_COUNT]{};
     for (size_t index = 0; index < table_count; ++index) {
         tables[index] = old[index];
-        if (index > MYOS_DEPLOY_TABLE_OBJECT) {
-            tables[index].offset += old[MYOS_DEPLOY_TABLE_OBJECT].stride;
+        if (index > DEPLOY_TABLE_OBJECT) {
+            tables[index].offset += old[DEPLOY_TABLE_OBJECT].stride;
         }
     }
-    tables[MYOS_DEPLOY_TABLE_OBJECT].count = 2;
+    tables[DEPLOY_TABLE_OBJECT].count = 2;
     const size_t bootstrap_offset = (fixture.size + 7) & ~size_t{7};
-    tables[MYOS_DEPLOY_TABLE_BOOTSTRAP] = TableShape{
-        bootstrap_offset, 1, MYOS_DEPLOY_BOOTSTRAP_STRIDE};
+    tables[DEPLOY_TABLE_BOOTSTRAP] = TableShape{
+        bootstrap_offset, 1, DEPLOY_BOOTSTRAP_STRIDE};
     while (fixture.size < bootstrap_offset) {
         fixture.raw[fixture.size++] = 0;
     }
-    for (size_t index = 0; index < MYOS_DEPLOY_BOOTSTRAP_STRIDE; ++index) {
+    for (size_t index = 0; index < DEPLOY_BOOTSTRAP_STRIDE; ++index) {
         fixture.raw[fixture.size + index] = 0;
     }
-    fixture.size += MYOS_DEPLOY_BOOTSTRAP_STRIDE;
+    fixture.size += DEPLOY_BOOTSTRAP_STRIDE;
 
     constexpr uint64_t notify_key = UINT64_C(0x0000000600000026);
     constexpr uint64_t authority_key = UINT64_C(0x0000000900000046);
     constexpr uint64_t import_key = UINT64_C(0x000000060000003a);
-    const size_t task = tables[MYOS_DEPLOY_TABLE_TASK].offset;
+    const size_t task = tables[DEPLOY_TABLE_TASK].offset;
     put_explicit(
         fixture.raw,
-        task + MYOS_DEPLOY_TASK_OBJECT_COUNT,
+        task + DEPLOY_TASK_OBJECT_COUNT,
         2,
         4);
     put_explicit(
         fixture.raw,
-        task + MYOS_DEPLOY_TASK_READINESS,
-        MYOS_DEPLOY_READINESS_EXPLICIT,
+        task + DEPLOY_TASK_READINESS,
+        DEPLOY_READINESS_EXPLICIT,
         2);
-    put_explicit(fixture.raw, task + MYOS_DEPLOY_TASK_READINESS_TIMEOUT_NS,
+    put_explicit(fixture.raw, task + DEPLOY_TASK_READINESS_TIMEOUT_NS,
         10'000'000'000, 8);
     put_explicit(
         fixture.raw,
-        task + MYOS_DEPLOY_TASK_BOOTSTRAP_FIRST,
+        task + DEPLOY_TASK_BOOTSTRAP_FIRST,
         0,
         4);
     put_explicit(
         fixture.raw,
-        task + MYOS_DEPLOY_TASK_BOOTSTRAP_COUNT,
+        task + DEPLOY_TASK_BOOTSTRAP_COUNT,
         1,
         4);
 
-    const size_t terminal = tables[MYOS_DEPLOY_TABLE_OBJECT].offset
-        + MYOS_DEPLOY_OBJECT_STRIDE;
+    const size_t terminal = tables[DEPLOY_TABLE_OBJECT].offset
+        + DEPLOY_OBJECT_STRIDE;
     put_explicit(
         fixture.raw,
-        terminal + MYOS_DEPLOY_OBJECT_OUTPUT_A,
+        terminal + DEPLOY_OBJECT_OUTPUT_A,
         authority_key,
         8);
     put_explicit(
         fixture.raw,
-        terminal + MYOS_DEPLOY_OBJECT_KIND,
+        terminal + DEPLOY_OBJECT_KIND,
         MYOS_OBJECT_KIND_NOTIFICATION,
         2);
     put_explicit(
         fixture.raw,
-        terminal + MYOS_DEPLOY_OBJECT_ARG0,
+        terminal + DEPLOY_OBJECT_ARG0,
         2,
         8);
-    for (size_t field = MYOS_DEPLOY_OBJECT_REF0;
-         field <= MYOS_DEPLOY_OBJECT_REF3;
+    for (size_t field = DEPLOY_OBJECT_REF0;
+         field <= DEPLOY_OBJECT_REF3;
          field += sizeof(uint32_t)) {
         put_explicit(
             fixture.raw,
             terminal + field,
-            MYOS_DEPLOY_NO_INDEX,
+            DEPLOY_NO_INDEX,
             4);
     }
 
-    const size_t import = tables[MYOS_DEPLOY_TABLE_IMPORT].offset;
+    const size_t import = tables[DEPLOY_TABLE_IMPORT].offset;
     put_explicit(
         fixture.raw,
-        import + MYOS_DEPLOY_IMPORT_SOURCE,
+        import + DEPLOY_IMPORT_SOURCE,
         notify_key,
         8);
     put_explicit(
         fixture.raw,
-        import + MYOS_DEPLOY_IMPORT_DESTINATION,
+        import + DEPLOY_IMPORT_DESTINATION,
         import_key,
         8);
     put_explicit(
         fixture.raw,
-        import + MYOS_DEPLOY_IMPORT_ATTENUATION
-            + MYOS_DEPLOY_ATTENUATION_KIND,
+        import + DEPLOY_IMPORT_ATTENUATION
+            + DEPLOY_ATTENUATION_KIND,
         MYOS_OBJECT_KIND_NOTIFICATION,
         2);
     put_explicit(
         fixture.raw,
-        import + MYOS_DEPLOY_IMPORT_ATTENUATION
-            + MYOS_DEPLOY_ATTENUATION_RIGHTS,
+        import + DEPLOY_IMPORT_ATTENUATION
+            + DEPLOY_ATTENUATION_RIGHTS,
         MYOS_RIGHT_SIGNAL,
         8);
     put_explicit(
         fixture.raw,
-        import + MYOS_DEPLOY_IMPORT_SOURCE_CLASS,
-        MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY,
+        import + DEPLOY_IMPORT_SOURCE_CLASS,
+        DEPLOY_IMPORT_SOURCE_TASK_KEY,
         2);
 
-    const size_t bootstrap = tables[MYOS_DEPLOY_TABLE_BOOTSTRAP].offset;
+    const size_t bootstrap = tables[DEPLOY_TABLE_BOOTSTRAP].offset;
     put_explicit(
         fixture.raw,
-        bootstrap + MYOS_DEPLOY_BOOTSTRAP_KIND,
+        bootstrap + DEPLOY_BOOTSTRAP_KIND,
         MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
         4);
     put_explicit(
         fixture.raw,
-        bootstrap + MYOS_DEPLOY_BOOTSTRAP_DESTINATION,
+        bootstrap + DEPLOY_BOOTSTRAP_DESTINATION,
         import_key,
         8);
 
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_MAGIC,
-        MYOS_DEPLOY_MAGIC,
+        DEPLOY_HEADER_MAGIC,
+        DEPLOY_MAGIC,
         8);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_MAJOR,
-        MYOS_DEPLOY_MAJOR,
+        DEPLOY_HEADER_MAJOR,
+        DEPLOY_MAJOR,
         2);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_MINOR,
-        MYOS_DEPLOY_MINOR,
+        DEPLOY_HEADER_MINOR,
+        DEPLOY_MINOR,
         2);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_SIZE_FIELD,
-        MYOS_DEPLOY_HEADER_SIZE,
+        DEPLOY_HEADER_SIZE_FIELD,
+        DEPLOY_HEADER_SIZE,
         4);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_TOTAL_SIZE,
+        DEPLOY_HEADER_TOTAL_SIZE,
         fixture.size,
         8);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_ARCHITECTURE,
-        MYOS_DEPLOY_ARCH_GENERIC,
+        DEPLOY_HEADER_ARCHITECTURE,
+        DEPLOY_ARCH_GENERIC,
         4);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_ABI,
-        MYOS_DEPLOY_ABI_ID,
+        DEPLOY_HEADER_ABI,
+        DEPLOY_ABI_ID,
         4);
     put_explicit(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_TABLE_COUNT,
-        MYOS_DEPLOY_TABLE_COUNT,
+        DEPLOY_HEADER_TABLE_COUNT,
+        DEPLOY_TABLE_COUNT,
         4);
-    for (size_t index = 0; index < MYOS_DEPLOY_TABLE_COUNT; ++index) {
-        const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + index * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    for (size_t index = 0; index < DEPLOY_TABLE_COUNT; ++index) {
+        const size_t descriptor = DEPLOY_HEADER_TABLES
+            + index * DEPLOY_TABLE_DESC_SIZE;
         put_explicit(
             fixture.raw,
-            descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+            descriptor + DEPLOY_TABLE_OFFSET,
             tables[index].count == 0 ? 0 : tables[index].offset,
             8);
         put_explicit(
             fixture.raw,
-            descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD,
+            descriptor + DEPLOY_TABLE_COUNT_FIELD,
             tables[index].count,
             4);
         put_explicit(
             fixture.raw,
-            descriptor + MYOS_DEPLOY_TABLE_STRIDE,
+            descriptor + DEPLOY_TABLE_STRIDE,
             tables[index].stride,
             4);
     }
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw, fixture.size, fixture.workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -668,14 +668,14 @@ void insert_explicit(
         && fixture.plan.bootstrap_count() == 1
         && fixture.plan.task(0) != nullptr
         && fixture.plan.task(0)->readiness
-            == MYOS_DEPLOY_READINESS_EXPLICIT;
+            == DEPLOY_READINESS_EXPLICIT;
 }
 
 struct DependencyFixture final {
     uint8_t raw[1400]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 alignas(4096) uint8_t construction_bundle[8192]{};
@@ -756,17 +756,17 @@ template<typename BuilderT>
     if (bundle.open(
             root,
             myos::cap::CapRef{2, 0},
-            myos::deploy::Window{bundle_address, 8192},
+            deploy::Window{bundle_address, 8192},
             bundle_size)
         != MYOS_STATUS_OK
         || scratch.open(
                root,
-               myos::deploy::Window{scratch_address, 16384})
+               deploy::Window{scratch_address, 16384})
             != MYOS_STATUS_OK) {
         return false;
     }
-    myos::deploy::TaskAuthorityBindings bindings{};
-    myos::deploy::TaskConstructionInput<
+    deploy::TaskAuthorityBindings bindings{};
+    deploy::TaskConstructionInput<
         FakeBackend, ConstructionAuthorities> input{
         .parent_pool = root,
         .bundle = &bundle,
@@ -793,16 +793,16 @@ void put_manifest(
 
 [[nodiscard]] auto make_plan(Fixture& fixture) noexcept -> bool {
     for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw,
         sizeof(fixture.raw),
         fixture.workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -811,91 +811,91 @@ void put_manifest(
     for (uint8_t& byte : fixture.raw) {
         byte = 0;
     }
-    return fixture.plan.id() == myos::deploy::PlanId{0, 1}
+    return fixture.plan.id() == deploy::PlanId{0, 1}
         && fixture.plan.task_count() == 1
         && fixture.plan.mapping_count() == 3;
 }
 
 [[nodiscard]] auto make_dependency_plan(
     DependencyFixture& fixture) noexcept -> bool {
-    constexpr size_t shift = MYOS_DEPLOY_TASK_STRIDE;
-    constexpr size_t dependency_offset = myos::deploy::host::kGoldenSize + MYOS_DEPLOY_TASK_STRIDE;
-    const size_t size = dependency_offset + 2 * MYOS_DEPLOY_DEPENDENCY_STRIDE;
+    constexpr size_t shift = DEPLOY_TASK_STRIDE;
+    constexpr size_t dependency_offset = deploy::host::kGoldenSize + DEPLOY_TASK_STRIDE;
+    const size_t size = dependency_offset + 2 * DEPLOY_DEPENDENCY_STRIDE;
     for (size_t index = 0; index < size; ++index) {
         fixture.raw[index] = 0;
     }
-    for (size_t index = 0; index < myos::deploy::host::kGoldenSize; ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+    for (size_t index = 0; index < deploy::host::kGoldenSize; ++index) {
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
-    for (size_t index = myos::deploy::host::kGoldenSize; index > 0x188;
+    for (size_t index = deploy::host::kGoldenSize; index > 0x188;
          --index) {
         fixture.raw[index - 1 + shift]
-            = myos::deploy::host::kGolden[index - 1];
+            = deploy::host::kGolden[index - 1];
     }
-    for (size_t index = 0; index < MYOS_DEPLOY_TASK_STRIDE; ++index) {
+    for (size_t index = 0; index < DEPLOY_TASK_STRIDE; ++index) {
         fixture.raw[0xe0 + shift + index] = fixture.raw[0xe0 + index];
     }
 
     put_manifest(
-        fixture.raw, MYOS_DEPLOY_HEADER_TOTAL_SIZE, size, 8);
+        fixture.raw, DEPLOY_HEADER_TOTAL_SIZE, size, 8);
     put_manifest(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_TABLES
-            + MYOS_DEPLOY_TABLE_TASK * MYOS_DEPLOY_TABLE_DESC_SIZE
-            + MYOS_DEPLOY_TABLE_COUNT_FIELD,
+        DEPLOY_HEADER_TABLES
+            + DEPLOY_TABLE_TASK * DEPLOY_TABLE_DESC_SIZE
+            + DEPLOY_TABLE_COUNT_FIELD,
         2,
         4);
-    const uint64_t old_offsets[MYOS_DEPLOY_TABLE_COUNT] = {
+    const uint64_t old_offsets[DEPLOY_TABLE_COUNT] = {
         0xe0, 0x188, 0x1a8, 0x298, 0x2f8, 0x368, 0, 0x3c8, 0x428, 0,
     };
-    for (uint32_t table = MYOS_DEPLOY_TABLE_IMAGE;
-         table <= MYOS_DEPLOY_TABLE_STRING;
+    for (uint32_t table = DEPLOY_TABLE_IMAGE;
+         table <= DEPLOY_TABLE_STRING;
          ++table) {
-        const size_t descriptor = MYOS_DEPLOY_HEADER_TABLES
-            + table * MYOS_DEPLOY_TABLE_DESC_SIZE;
+        const size_t descriptor = DEPLOY_HEADER_TABLES
+            + table * DEPLOY_TABLE_DESC_SIZE;
         put_manifest(
             fixture.raw,
-            descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+            descriptor + DEPLOY_TABLE_OFFSET,
             old_offsets[table] + shift,
             8);
     }
-    const size_t dependency_descriptor = MYOS_DEPLOY_HEADER_TABLES
-        + MYOS_DEPLOY_TABLE_DEPENDENCY * MYOS_DEPLOY_TABLE_DESC_SIZE;
+    const size_t dependency_descriptor = DEPLOY_HEADER_TABLES
+        + DEPLOY_TABLE_DEPENDENCY * DEPLOY_TABLE_DESC_SIZE;
     put_manifest(
         fixture.raw,
-        dependency_descriptor + MYOS_DEPLOY_TABLE_OFFSET,
+        dependency_descriptor + DEPLOY_TABLE_OFFSET,
         dependency_offset,
         8);
     put_manifest(
         fixture.raw,
-        dependency_descriptor + MYOS_DEPLOY_TABLE_COUNT_FIELD,
+        dependency_descriptor + DEPLOY_TABLE_COUNT_FIELD,
         2,
         4);
 
     const size_t first_task = 0xe0;
-    const size_t second_task = first_task + MYOS_DEPLOY_TASK_STRIDE;
+    const size_t second_task = first_task + DEPLOY_TASK_STRIDE;
     put_manifest(
         fixture.raw,
-        first_task + MYOS_DEPLOY_TASK_DEPENDENCY_COUNT,
+        first_task + DEPLOY_TASK_DEPENDENCY_COUNT,
         1,
         4);
     const uint32_t first_fields[7] = {
-        MYOS_DEPLOY_TASK_IMAGE_FIRST,
-        MYOS_DEPLOY_TASK_MAPPING_FIRST,
-        MYOS_DEPLOY_TASK_OBJECT_FIRST,
-        MYOS_DEPLOY_TASK_EXECUTION_FIRST,
-        MYOS_DEPLOY_TASK_IMPORT_FIRST,
-        MYOS_DEPLOY_TASK_DEPENDENCY_FIRST,
-        MYOS_DEPLOY_TASK_EXPORT_FIRST,
+        DEPLOY_TASK_IMAGE_FIRST,
+        DEPLOY_TASK_MAPPING_FIRST,
+        DEPLOY_TASK_OBJECT_FIRST,
+        DEPLOY_TASK_EXECUTION_FIRST,
+        DEPLOY_TASK_IMPORT_FIRST,
+        DEPLOY_TASK_DEPENDENCY_FIRST,
+        DEPLOY_TASK_EXPORT_FIRST,
     };
     const uint32_t count_fields[7] = {
-        MYOS_DEPLOY_TASK_IMAGE_COUNT,
-        MYOS_DEPLOY_TASK_MAPPING_COUNT,
-        MYOS_DEPLOY_TASK_OBJECT_COUNT,
-        MYOS_DEPLOY_TASK_EXECUTION_COUNT,
-        MYOS_DEPLOY_TASK_IMPORT_COUNT,
-        MYOS_DEPLOY_TASK_DEPENDENCY_COUNT,
-        MYOS_DEPLOY_TASK_EXPORT_COUNT,
+        DEPLOY_TASK_IMAGE_COUNT,
+        DEPLOY_TASK_MAPPING_COUNT,
+        DEPLOY_TASK_OBJECT_COUNT,
+        DEPLOY_TASK_EXECUTION_COUNT,
+        DEPLOY_TASK_IMPORT_COUNT,
+        DEPLOY_TASK_DEPENDENCY_COUNT,
+        DEPLOY_TASK_EXPORT_COUNT,
     };
     const uint32_t global_counts[7] = {1, 3, 1, 1, 1, 2, 1};
     for (size_t child = 0; child < 7; ++child) {
@@ -912,51 +912,51 @@ void put_manifest(
     }
     put_manifest(
         fixture.raw,
-        second_task + MYOS_DEPLOY_TASK_BOOTSTRAP_MAPPING,
-        MYOS_DEPLOY_NO_INDEX,
+        second_task + DEPLOY_TASK_BOOTSTRAP_MAPPING,
+        DEPLOY_NO_INDEX,
         4);
 
     const size_t dependency = dependency_offset;
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_TARGET,
+        dependency + DEPLOY_DEPENDENCY_TARGET,
         1,
         4);
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_KIND,
-        MYOS_DEPLOY_DEPENDENCY_REQUIRED,
+        dependency + DEPLOY_DEPENDENCY_KIND,
+        DEPLOY_DEPENDENCY_REQUIRED,
         2);
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_FLAGS,
-        MYOS_DEPLOY_DEPENDENCY_STARTUP,
+        dependency + DEPLOY_DEPENDENCY_FLAGS,
+        DEPLOY_DEPENDENCY_STARTUP,
         2);
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_STRIDE
-            + MYOS_DEPLOY_DEPENDENCY_TARGET,
+        dependency + DEPLOY_DEPENDENCY_STRIDE
+            + DEPLOY_DEPENDENCY_TARGET,
         0,
         4);
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_STRIDE
-            + MYOS_DEPLOY_DEPENDENCY_KIND,
-        MYOS_DEPLOY_DEPENDENCY_OPTIONAL,
+        dependency + DEPLOY_DEPENDENCY_STRIDE
+            + DEPLOY_DEPENDENCY_KIND,
+        DEPLOY_DEPENDENCY_OPTIONAL,
         2);
     put_manifest(
         fixture.raw,
-        dependency + MYOS_DEPLOY_DEPENDENCY_STRIDE
-            + MYOS_DEPLOY_DEPENDENCY_FLAGS,
-        MYOS_DEPLOY_DEPENDENCY_STARTUP,
+        dependency + DEPLOY_DEPENDENCY_STRIDE
+            + DEPLOY_DEPENDENCY_FLAGS,
+        DEPLOY_DEPENDENCY_STARTUP,
         2);
 
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw, size, fixture.workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -986,12 +986,12 @@ void put_manifest(
         && second_task->dependencies.first == 1
         && second_task->dependencies.count == 1
         && first->target == 1
-        && first->kind == MYOS_DEPLOY_DEPENDENCY_REQUIRED
-        && first->flags == MYOS_DEPLOY_DEPENDENCY_STARTUP
+        && first->kind == DEPLOY_DEPENDENCY_REQUIRED
+        && first->flags == DEPLOY_DEPENDENCY_STARTUP
         && first->relation.empty()
         && second->target == 0
-        && second->kind == MYOS_DEPLOY_DEPENDENCY_OPTIONAL
-        && second->flags == MYOS_DEPLOY_DEPENDENCY_STARTUP
+        && second->kind == DEPLOY_DEPENDENCY_OPTIONAL
+        && second->flags == DEPLOY_DEPENDENCY_STARTUP
         && second->relation.empty();
 }
 
@@ -1005,7 +1005,7 @@ void put_manifest(
         return false;
     }
     fixture.workspace.reset();
-    const auto equals = [](myos::deploy::ByteView bytes,
+    const auto equals = [](deploy::ByteView bytes,
                            const char* expected) noexcept -> bool {
         size_t length = 0;
         while (expected[length] != '\0') {
@@ -1074,38 +1074,38 @@ void put_manifest(
         || image->source_kind != 0 || image->flags != 0
         || !equals(fixture.plan.symbol(code->produced), "code")
         || !code->pager.empty() || code->image != 0 || code->segment != 0
-        || code->source != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
-        || code->residency != MYOS_DEPLOY_MAPPING_RESIDENT
-        || code->critical != MYOS_DEPLOY_CRITICAL_CODE
+        || code->source != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+        || code->residency != DEPLOY_MAPPING_RESIDENT
+        || code->critical != DEPLOY_CRITICAL_CODE
         || code->flags != 0 || code->access != 0
         || code->address != 0 || code->size != 0
         || !equals(fixture.plan.symbol(stack->produced), "stack")
         || !stack->pager.empty()
-        || stack->image != MYOS_DEPLOY_NO_INDEX
-        || stack->segment != MYOS_DEPLOY_NO_INDEX
-        || stack->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
-        || stack->residency != MYOS_DEPLOY_MAPPING_RESIDENT
-        || stack->critical != MYOS_DEPLOY_CRITICAL_STACK
+        || stack->image != DEPLOY_NO_INDEX
+        || stack->segment != DEPLOY_NO_INDEX
+        || stack->source != DEPLOY_MAPPING_SOURCE_ZERO
+        || stack->residency != DEPLOY_MAPPING_RESIDENT
+        || stack->critical != DEPLOY_CRITICAL_STACK
         || stack->flags != 0
         || stack->access != (MYOS_VM_READ | MYOS_VM_WRITE)
         || stack->address != 0x210000 || stack->size != 4096
         || !equals(fixture.plan.symbol(bootstrap->produced), "bootstrap")
         || !bootstrap->pager.empty()
-        || bootstrap->image != MYOS_DEPLOY_NO_INDEX
-        || bootstrap->segment != MYOS_DEPLOY_NO_INDEX
-        || bootstrap->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
-        || bootstrap->residency != MYOS_DEPLOY_MAPPING_RESIDENT
-        || bootstrap->critical != MYOS_DEPLOY_CRITICAL_BOOTSTRAP
+        || bootstrap->image != DEPLOY_NO_INDEX
+        || bootstrap->segment != DEPLOY_NO_INDEX
+        || bootstrap->source != DEPLOY_MAPPING_SOURCE_ZERO
+        || bootstrap->residency != DEPLOY_MAPPING_RESIDENT
+        || bootstrap->critical != DEPLOY_CRITICAL_BOOTSTRAP
         || bootstrap->flags != 0 || bootstrap->access != MYOS_VM_READ
         || bootstrap->address != 0x220000 || bootstrap->size != 4096
         || !equals(fixture.plan.symbol(object->output), "notify")
         || !object->output_b.empty() || object->flags != 0
         || object->kind != MYOS_OBJECT_KIND_NOTIFICATION
         || object->args[0] != 1
-        || object->refs[0] != MYOS_DEPLOY_NO_INDEX
-        || object->refs[1] != MYOS_DEPLOY_NO_INDEX
-        || object->refs[2] != MYOS_DEPLOY_NO_INDEX
-        || object->refs[3] != MYOS_DEPLOY_NO_INDEX
+        || object->refs[0] != DEPLOY_NO_INDEX
+        || object->refs[1] != DEPLOY_NO_INDEX
+        || object->refs[2] != DEPLOY_NO_INDEX
+        || object->refs[3] != DEPLOY_NO_INDEX
         || object->args[1] != 0 || object->args[2] != 0
         || object->args[3] != 0 || object->args[4] != 0
         || object->args[5] != 0
@@ -1114,34 +1114,34 @@ void put_manifest(
         || !equals(fixture.plan.symbol(execution->domain), "domain")
         || execution->image != 0 || execution->stack != 1
         || execution->bootstrap != 2
-        || execution->ipc != MYOS_DEPLOY_NO_INDEX
-        || execution->control != MYOS_DEPLOY_NO_INDEX
-        || execution->event != MYOS_DEPLOY_NO_INDEX
+        || execution->ipc != DEPLOY_NO_INDEX
+        || execution->control != DEPLOY_NO_INDEX
+        || execution->event != DEPLOY_NO_INDEX
         || execution->model != 0 || execution->flags != 0
         || execution->fault != 0 || execution->terminal != 0
         || execution->entry != 0x200000
         || execution->stack_top != 0x211000
         || execution->sc_budget != 1 || execution->sc_period != 1
         || execution->urgency != 0
-        || execution->home_cpu != MYOS_DEPLOY_HOME_CPU_ANY
+        || execution->home_cpu != DEPLOY_HOME_CPU_ANY
         || !equals(fixture.plan.symbol(import->source), "authority")
         || !equals(fixture.plan.symbol(import->destination), "import")
-        || import->mode != MYOS_DEPLOY_IMPORT_DUPLICATE
-        || import->selector != MYOS_DEPLOY_SELECTOR_ALLOCATED_KEYED
+        || import->mode != DEPLOY_IMPORT_DUPLICATE
+        || import->selector != DEPLOY_SELECTOR_ALLOCATED_KEYED
         || import->flags != 0
         || import->attenuation.version
-            != MYOS_DEPLOY_ATTENUATION_VERSION_CURRENT
+            != DEPLOY_ATTENUATION_VERSION_CURRENT
         || import->attenuation.kind != MYOS_OBJECT_KIND_THREAD
-        || import->attenuation.size != MYOS_DEPLOY_ATTENUATION_STRIDE
+        || import->attenuation.size != DEPLOY_ATTENUATION_STRIDE
         || !zero_attenuation(import->attenuation)
         || !equals(fixture.plan.symbol(output->source), "thread")
         || !equals(fixture.plan.symbol(output->key), "export")
-        || output->source_class != MYOS_DEPLOY_EXPORT_PREPARED_KEY
+        || output->source_class != DEPLOY_EXPORT_PREPARED_KEY
         || output->flags != 0
         || output->ceiling.version
-            != MYOS_DEPLOY_ATTENUATION_VERSION_CURRENT
+            != DEPLOY_ATTENUATION_VERSION_CURRENT
         || output->ceiling.kind != MYOS_OBJECT_KIND_THREAD
-        || output->ceiling.size != MYOS_DEPLOY_ATTENUATION_STRIDE
+        || output->ceiling.size != DEPLOY_ATTENUATION_STRIDE
         || !zero_attenuation(output->ceiling)) {
         return false;
     }
@@ -1152,35 +1152,35 @@ void put_manifest(
 }
 
 [[nodiscard]] auto test_plan_registry_lifetime() noexcept -> bool {
-    using Plans = myos::deploy::PlanSet<1>;
+    using Plans = deploy::PlanSet<1>;
     static Plans plans{};
-    uint8_t raw[myos::deploy::host::kGoldenSize]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::TaskPlanView view{};
+    uint8_t raw[deploy::host::kGoldenSize]{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::TaskPlanView view{};
     {
         for (size_t index = 0; index < sizeof(raw); ++index) {
-            raw[index] = myos::deploy::host::kGolden[index];
+            raw[index] = deploy::host::kGolden[index];
         }
-        auto parsed = myos::deploy::ManifestView::parse(
+        auto parsed = deploy::ManifestView::parse(
             raw, sizeof(raw), workspace);
         if (!parsed) {
             return false;
         }
-        auto decoded = myos::deploy::DeploymentPlan::decode(parsed.value(), plans);
+        auto decoded = deploy::DeploymentPlan::decode(parsed.value(), plans);
         if (!decoded) {
             return false;
         }
-        myos::deploy::DeploymentPlan owner = libk::move(decoded.value());
+        deploy::DeploymentPlan owner = libk::move(decoded.value());
         auto lease = owner.lease();
         if (!lease) {
             return false;
         }
         view = lease->task(0);
-        if (!view.valid() || view.id.plan != myos::deploy::PlanId{0, 1}) {
+        if (!view.valid() || view.id.plan != deploy::PlanId{0, 1}) {
             return false;
         }
-        myos::deploy::DeploymentPlan moved = libk::move(owner);
-        if (!view.valid() || myos::deploy::DeploymentPlan::decode(
+        deploy::DeploymentPlan moved = libk::move(owner);
+        if (!view.valid() || deploy::DeploymentPlan::decode(
                 parsed.value(), plans)) {
             return false;
         }
@@ -1192,37 +1192,37 @@ void put_manifest(
         return false;
     }
     for (size_t index = 0; index < sizeof(raw); ++index) {
-        raw[index] = myos::deploy::host::kGolden[index];
+        raw[index] = deploy::host::kGolden[index];
     }
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         raw, sizeof(raw), workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(parsed.value(), plans);
-    return decoded && decoded.value().id() == myos::deploy::PlanId{0, 2};
+    auto decoded = deploy::DeploymentPlan::decode(parsed.value(), plans);
+    return decoded && decoded.value().id() == deploy::PlanId{0, 2};
 }
 
 [[nodiscard]] auto test_plan_generation_exhaustion() noexcept -> bool {
-    using Plans = myos::deploy::PlanSet<1, 3>;
-    static uint8_t raw[myos::deploy::host::kGoldenSize]{};
-    static myos::deploy::ManifestWorkspace workspace{};
+    using Plans = deploy::PlanSet<1, 3>;
+    static uint8_t raw[deploy::host::kGoldenSize]{};
+    static deploy::ManifestWorkspace workspace{};
     Plans plans{};
     for (uint32_t expected = 1; expected <= 3; ++expected) {
         for (size_t index = 0; index < sizeof(raw); ++index) {
-            raw[index] = myos::deploy::host::kGolden[index];
+            raw[index] = deploy::host::kGolden[index];
         }
-        auto parsed = myos::deploy::ManifestView::parse(
+        auto parsed = deploy::ManifestView::parse(
             raw, sizeof(raw), workspace);
         if (!parsed) {
             return false;
         }
         {
-            auto decoded = myos::deploy::DeploymentPlan::decode(
+            auto decoded = deploy::DeploymentPlan::decode(
                 parsed.value(), plans);
             if (!decoded
                 || decoded.value().id()
-                    != myos::deploy::PlanId{0, expected}) {
+                    != deploy::PlanId{0, expected}) {
                 return false;
             }
             auto owner = libk::move(decoded.value());
@@ -1231,16 +1231,16 @@ void put_manifest(
             }
         }
     }
-    auto parsed = myos::deploy::ManifestView::parse(
-        myos::deploy::host::kGolden,
-        myos::deploy::host::kGoldenSize,
+    auto parsed = deploy::ManifestView::parse(
+        deploy::host::kGolden,
+        deploy::host::kGoldenSize,
         workspace);
     return parsed
-        && !myos::deploy::DeploymentPlan::decode(parsed.value(), plans);
+        && !deploy::DeploymentPlan::decode(parsed.value(), plans);
 }
 
 [[nodiscard]] auto test_completion_lifecycle() noexcept -> bool {
-    using Set = myos::deploy::CompletionSet<1, 3>;
+    using Set = deploy::CompletionSet<1, 3>;
 
     Set sender_first_set{};
     auto sender_first_pair = sender_first_set.reserve();
@@ -1254,7 +1254,7 @@ void put_manifest(
         || !sender_first.valid() || !receiver_first.valid()
         || sender_first_set.available() != 0
         || sender_first_set.cell_state(sender_first_id)
-            != myos::deploy::CompletionCellState::Reserved
+            != deploy::CompletionCellState::Reserved
         || !receiver_first.detach()
         || !sender_first.cancel()
         || sender_first.valid() || receiver_first.valid()
@@ -1283,12 +1283,12 @@ void put_manifest(
     auto receiver = first->take_receiver();
     const auto first_id = sender.id();
     if (!receiver.detach()
-        || sender.complete({myos::deploy::TaskId{1, 1},
-                            myos::deploy::CloseReason::Explicit,
+        || sender.complete({deploy::TaskId{1, 1},
+                            deploy::CloseReason::Explicit,
                             MYOS_STATUS_OK})
         || set.available() != 1
         || set.cell_state(first_id)
-            != myos::deploy::CompletionCellState::Retired) {
+            != deploy::CompletionCellState::Retired) {
         return false;
     }
 
@@ -1298,9 +1298,9 @@ void put_manifest(
     }
     auto second_sender = second->take_sender();
     auto second_receiver = second->take_receiver();
-    const myos::deploy::TaskId task{2, 1};
+    const deploy::TaskId task{2, 1};
     if (!second_sender.complete({
-            task, myos::deploy::CloseReason::Terminal, MYOS_STATUS_BUSY})) {
+            task, deploy::CloseReason::Terminal, MYOS_STATUS_BUSY})) {
         return false;
     }
     auto result = second_receiver.take();
@@ -1315,7 +1315,7 @@ void put_manifest(
     }
     auto third_sender = third->take_sender();
     auto third_receiver = third->take_receiver();
-    if (!third_sender.complete({task, myos::deploy::CloseReason::Explicit,
+    if (!third_sender.complete({task, deploy::CloseReason::Explicit,
                                 MYOS_STATUS_OK})) {
         return false;
     }
@@ -1337,8 +1337,8 @@ void put_manifest(
     {
     auto discard_receiver = discard_pair->take_receiver();
         if (!discard_sender.complete({
-                myos::deploy::TaskId{3, 1},
-                myos::deploy::CloseReason::Explicit,
+                deploy::TaskId{3, 1},
+                deploy::CloseReason::Explicit,
                 MYOS_STATUS_OK})) {
             return false;
         }
@@ -1357,8 +1357,8 @@ void put_manifest(
     sealed_sender.seal();
     if (sealed_sender.cancel()
         || !sealed_sender.complete({
-            myos::deploy::TaskId{4, 1},
-            myos::deploy::CloseReason::Explicit,
+            deploy::TaskId{4, 1},
+            deploy::CloseReason::Explicit,
             MYOS_STATUS_OK})
         || !sealed_receiver.take()) {
         return false;
@@ -1373,7 +1373,7 @@ void put_manifest(
     }
     Completions completions{};
     Table table{};
-    myos::deploy::TaskId first_id{};
+    deploy::TaskId first_id{};
     {
         auto lease = fixture.plan.lease();
         if (!lease) {
@@ -1386,7 +1386,7 @@ void put_manifest(
         }
         first_id = builder->record()->id();
     }
-    if (table.tag(first_id) != myos::deploy::TaskSlotTag::Vacant
+    if (table.tag(first_id) != deploy::TaskSlotTag::Vacant
         || completions.available() != completions.capacity()) {
         return false;
     }
@@ -1402,13 +1402,13 @@ void put_manifest(
             return false;
         }
     }
-    if (table.tag(first_id) != myos::deploy::TaskSlotTag::Vacant
+    if (table.tag(first_id) != deploy::TaskSlotTag::Vacant
         || completions.available() != completions.capacity()) {
         return false;
     }
 
-    using SmallTable = myos::deploy::TaskTable<Record, Completions, 1, 3>;
-    using SmallBuilder = myos::deploy::TaskBuilder<SmallTable, Completions>;
+    using SmallTable = deploy::TaskTable<Record, Completions, 1, 3>;
+    using SmallBuilder = deploy::TaskBuilder<SmallTable, Completions>;
     Completions pressure{};
     SmallTable small_table{};
     auto lease = fixture.plan.lease();
@@ -1426,13 +1426,13 @@ void put_manifest(
         if (!second_lease
             || SmallBuilder::begin(
                    pressure, small_table, libk::move(*second_lease), 0)
-            || small_table.tag(id) != myos::deploy::TaskSlotTag::Reserved
+            || small_table.tag(id) != deploy::TaskSlotTag::Reserved
             || pressure.available() != 1) {
             return false;
         }
     }
-    return small_table.tag(myos::deploy::TaskId{0, 1})
-            == myos::deploy::TaskSlotTag::Vacant
+    return small_table.tag(deploy::TaskId{0, 1})
+            == deploy::TaskSlotTag::Vacant
         && pressure.available() == pressure.capacity();
 }
 
@@ -1457,14 +1457,14 @@ void put_manifest(
     if (!receiver
         || builder->cancel()
         || !builder->valid()
-        || table.tag(id) != myos::deploy::TaskSlotTag::Reserved
+        || table.tag(id) != deploy::TaskSlotTag::Reserved
         || completions.available() != completions.capacity() - 1) {
         return false;
     }
     if (!receiver->detach()
         || !builder->cancel()
         || builder->valid()
-        || table.tag(id) != myos::deploy::TaskSlotTag::Vacant
+        || table.tag(id) != deploy::TaskSlotTag::Vacant
         || completions.available() != completions.capacity()) {
         return false;
     }
@@ -1472,7 +1472,7 @@ void put_manifest(
 }
 
 [[nodiscard]] auto test_resourceful_destructor_fail_stop() noexcept -> bool {
-    using FaultSpace = myos::deploy::TaskSpace<8, 8, ReturningFaultBackend>;
+    using FaultSpace = deploy::TaskSpace<8, 8, ReturningFaultBackend>;
 
     ReturningFaultBackend::reset();
     {
@@ -1548,67 +1548,67 @@ void put_manifest(
     }
     auto receiver = builder->take_receiver();
     if (!receiver || builder->record() == nullptr
-        || builder->record()->state() != myos::deploy::TaskState::Constructing) {
+        || builder->record()->state() != deploy::TaskState::Constructing) {
         return false;
     }
-    const myos::deploy::TaskId id = builder->record()->id();
-    if (table.transition(id, myos::deploy::TaskState::Prepared)
-        || table.transition(id, myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Running)
-        || table.transition(id, myos::deploy::TaskState::Closing)
-        || table.transition(id, myos::deploy::TaskState::Reclaimed)
+    const deploy::TaskId id = builder->record()->id();
+    if (table.transition(id, deploy::TaskState::Prepared)
+        || table.transition(id, deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Closing)
+        || table.transition(id, deploy::TaskState::Reclaimed)
         || builder->record()->state()
-            != myos::deploy::TaskState::Constructing
+            != deploy::TaskState::Constructing
         || !builder->commit_prepared()
-        || table.tag(id) != myos::deploy::TaskSlotTag::Record
-        || table.transition(myos::deploy::TaskId{id.slot, id.generation + 1},
-                            myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Constructing)
-        || table.transition(id, myos::deploy::TaskState::Prepared)
-        || table.transition(id, myos::deploy::TaskState::Running)
-        || table.transition(id, myos::deploy::TaskState::Reclaimed)
-        || table.record(id)->state() != myos::deploy::TaskState::Prepared
-        || !table.transition(id, myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Constructing)
-        || table.transition(id, myos::deploy::TaskState::Prepared)
-        || table.transition(id, myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Reclaimed)
-        || table.record(id)->state() != myos::deploy::TaskState::Starting
-        || !table.transition(id, myos::deploy::TaskState::Running)
-        || table.transition(id, myos::deploy::TaskState::Constructing)
-        || table.transition(id, myos::deploy::TaskState::Prepared)
-        || table.transition(id, myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Running)
-        || table.transition(id, myos::deploy::TaskState::Reclaimed)
-        || table.record(id)->state() != myos::deploy::TaskState::Running
-        || !table.transition(id, myos::deploy::TaskState::Failed)
-        || table.transition(id, myos::deploy::TaskState::Constructing)
-        || table.transition(id, myos::deploy::TaskState::Prepared)
-        || table.transition(id, myos::deploy::TaskState::Starting)
-        || table.transition(id, myos::deploy::TaskState::Running)
-        || table.transition(id, myos::deploy::TaskState::Failed)
-        || table.transition(id, myos::deploy::TaskState::Reclaimed)
-        || table.record(id)->state() != myos::deploy::TaskState::Failed
-        || !table.begin_close(id, myos::deploy::CloseReason::Terminal,
+        || table.tag(id) != deploy::TaskSlotTag::Record
+        || table.transition(deploy::TaskId{id.slot, id.generation + 1},
+                            deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Constructing)
+        || table.transition(id, deploy::TaskState::Prepared)
+        || table.transition(id, deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Reclaimed)
+        || table.record(id)->state() != deploy::TaskState::Prepared
+        || !table.transition(id, deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Constructing)
+        || table.transition(id, deploy::TaskState::Prepared)
+        || table.transition(id, deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Reclaimed)
+        || table.record(id)->state() != deploy::TaskState::Starting
+        || !table.transition(id, deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Constructing)
+        || table.transition(id, deploy::TaskState::Prepared)
+        || table.transition(id, deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Reclaimed)
+        || table.record(id)->state() != deploy::TaskState::Running
+        || !table.transition(id, deploy::TaskState::Failed)
+        || table.transition(id, deploy::TaskState::Constructing)
+        || table.transition(id, deploy::TaskState::Prepared)
+        || table.transition(id, deploy::TaskState::Starting)
+        || table.transition(id, deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Failed)
+        || table.transition(id, deploy::TaskState::Reclaimed)
+        || table.record(id)->state() != deploy::TaskState::Failed
+        || !table.begin_close(id, deploy::CloseReason::Terminal,
                               MYOS_STATUS_CANCELED)
-        || table.tag(id) != myos::deploy::TaskSlotTag::Closing
+        || table.tag(id) != deploy::TaskSlotTag::Closing
         || table.closing(id) == nullptr
-        || table.transition(id, myos::deploy::TaskState::Running)
+        || table.transition(id, deploy::TaskState::Running)
         || table.continue_close(id) != MYOS_STATUS_OK) {
         return false;
     }
     auto result = receiver->take();
     if (!result || result->task != id
-        || result->reason != myos::deploy::CloseReason::Terminal
+        || result->reason != deploy::CloseReason::Terminal
         || result->status != MYOS_STATUS_CANCELED
-        || table.tag(id) != myos::deploy::TaskSlotTag::Retired) {
+        || table.tag(id) != deploy::TaskSlotTag::Retired) {
         return false;
     }
     return table.record(id) == nullptr
         && table.closing(id) == nullptr
-        && !table.transition(id, myos::deploy::TaskState::Running)
-        && table.tag(myos::deploy::TaskId{id.slot, id.generation + 1})
-            == myos::deploy::TaskSlotTag::Vacant;
+        && !table.transition(id, deploy::TaskState::Running)
+        && table.tag(deploy::TaskId{id.slot, id.generation + 1})
+            == deploy::TaskSlotTag::Vacant;
 }
 
 [[nodiscard]] auto test_pressure_precedes_table() noexcept -> bool {
@@ -1627,8 +1627,8 @@ void put_manifest(
     if (!lease || Builder::begin(completions, table, libk::move(*lease), 0)) {
         return false;
     }
-    return table.tag(myos::deploy::TaskId{0, 1})
-        == myos::deploy::TaskSlotTag::Vacant;
+    return table.tag(deploy::TaskId{0, 1})
+        == deploy::TaskSlotTag::Vacant;
 }
 
 [[nodiscard]] auto test_resource_failure_moves_to_closing() noexcept -> bool {
@@ -1642,9 +1642,9 @@ void put_manifest(
     FakeBackend::reset();
     FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
     if (space.close() != MYOS_STATUS_BUSY
-        || space.phase() != myos::deploy::Phase::ResourceClosing
+        || space.phase() != deploy::Phase::ResourceClosing
         || space.close() != MYOS_STATUS_OK
-        || space.phase() != myos::deploy::Phase::Closed) {
+        || space.phase() != deploy::Phase::Closed) {
         return false;
     }
     return true;
@@ -1675,18 +1675,18 @@ void put_manifest(
     if (bundle.open(
             root,
             myos::cap::CapRef{2, 0},
-            myos::deploy::Window{bundle_address, 8192},
+            deploy::Window{bundle_address, 8192},
             bundle_size)
             != MYOS_STATUS_OK
         || scratch.open(
                root,
-               myos::deploy::Window{scratch_address, 16384})
+               deploy::Window{scratch_address, 16384})
             != MYOS_STATUS_OK) {
         return false;
     }
 
-    myos::deploy::TaskAuthorityBindings bindings{};
-    myos::deploy::TaskConstructionInput<
+    deploy::TaskAuthorityBindings bindings{};
+    deploy::TaskConstructionInput<
         FakeBackend, ConstructionAuthorities> input{
         .parent_pool = root,
         .bundle = &bundle,
@@ -1709,7 +1709,7 @@ void put_manifest(
     if (!builder || builder->record() == nullptr) {
         return false;
     }
-    const myos::deploy::TaskId id = builder->record()->id();
+    const deploy::TaskId id = builder->record()->id();
     auto receiver = builder->take_receiver();
     if (!receiver) {
         return false;
@@ -1718,23 +1718,23 @@ void put_manifest(
     if (status != MYOS_STATUS_NO_MEMORY
         || builder->valid()
         || !construction_workspace.empty()
-        || table.tag(id) != myos::deploy::TaskSlotTag::Closing) {
+        || table.tag(id) != deploy::TaskSlotTag::Closing) {
         return false;
     }
     const myos_status_t first_close = table.continue_close(id);
     const auto first_tag = table.tag(id);
     const myos_status_t second_close = table.continue_close(id);
     if (first_close != MYOS_STATUS_BUSY
-        || first_tag != myos::deploy::TaskSlotTag::Closing
+        || first_tag != deploy::TaskSlotTag::Closing
         || second_close != MYOS_STATUS_OK
-        || table.tag(myos::deploy::TaskId{
+        || table.tag(deploy::TaskId{
                          id.slot, id.generation + 1})
-            != myos::deploy::TaskSlotTag::Vacant) {
+            != deploy::TaskSlotTag::Vacant) {
         return false;
     }
     const auto result = receiver->take();
     return result && result->task == id
-        && result->reason == myos::deploy::CloseReason::ConstructionFailure
+        && result->reason == deploy::CloseReason::ConstructionFailure
         && result->status == MYOS_STATUS_NO_MEMORY;
 }
 
@@ -1757,12 +1757,12 @@ void put_manifest(
     if (bundle.open(
             root,
             myos::cap::CapRef{2, 0},
-            myos::deploy::Window{bundle_address, 8192},
+            deploy::Window{bundle_address, 8192},
             bundle_size)
             != MYOS_STATUS_OK
         || scratch.open(
                root,
-               myos::deploy::Window{scratch_address, 16384})
+               deploy::Window{scratch_address, 16384})
             != MYOS_STATUS_OK) {
         return false;
     }
@@ -1778,7 +1778,7 @@ void put_manifest(
     if (!domain_slot) {
         return false;
     }
-    myos::deploy::RegisteredSpace<ConstructionSpace, 2> source{};
+    deploy::RegisteredSpace<ConstructionSpace, 2> source{};
     if (!source.adopt(libk::move(source_space))) {
         return false;
     }
@@ -1808,14 +1808,14 @@ void put_manifest(
     if (!builder || builder->record() == nullptr) {
         return false;
     }
-    const myos::deploy::TaskId id = builder->record()->id();
+    const deploy::TaskId id = builder->record()->id();
     auto receiver = builder->take_receiver();
     if (!receiver) {
         return false;
     }
-    myos::deploy::TaskAuthorityBindings bindings{};
+    deploy::TaskAuthorityBindings bindings{};
     bindings.domains[0] = *domain;
-    myos::deploy::TaskConstructionInput<
+    deploy::TaskConstructionInput<
         FakeBackend, ConstructionAuthorities> input{
         .parent_pool = root,
         .bundle = &bundle,
@@ -1831,7 +1831,7 @@ void put_manifest(
         return false;
     }
     const auto stale_export = table.register_prepared_export(
-        myos::deploy::TaskId{id.slot, id.generation + 1}, 0, authorities);
+        deploy::TaskId{id.slot, id.generation + 1}, 0, authorities);
     const auto wrong_export = table.register_prepared_export(
         id, 1, authorities);
     const auto prepared_export = table.register_prepared_export(
@@ -1843,7 +1843,7 @@ void put_manifest(
         return false;
     }
     if (table.terminal_notification(
-            myos::deploy::TaskId{id.slot, id.generation + 1})) {
+            deploy::TaskId{id.slot, id.generation + 1})) {
         return false;
     }
     if (table.terminal_notification(id)) {
@@ -1874,7 +1874,7 @@ void put_manifest(
         return false;
     }
     const bool began_close = table.begin_close(
-        id, myos::deploy::CloseReason::Explicit, MYOS_STATUS_OK);
+        id, deploy::CloseReason::Explicit, MYOS_STATUS_OK);
     const myos_status_t closing_readiness = table.consume_readiness(id);
     const auto closing_terminal = table.observe_terminal(id);
     const auto closing_notification = table.terminal_notification(id);
@@ -1888,7 +1888,7 @@ void put_manifest(
     }
     const auto result = receiver->take();
     if (!result || result->task != id
-        || result->reason != myos::deploy::CloseReason::Explicit
+        || result->reason != deploy::CloseReason::Explicit
         || result->status != MYOS_STATUS_OK
         || table.record(id) != nullptr) {
         return false;
@@ -1907,9 +1907,9 @@ void put_manifest(
     if (!make_dependency_plan(fixture)) {
         return false;
     }
-    using SmallCompletions = myos::deploy::CompletionSet<1, 3>;
-    using SmallTable = myos::deploy::TaskTable<Record, SmallCompletions, 1, 3>;
-    using SmallBuilder = myos::deploy::TaskBuilder<SmallTable, SmallCompletions>;
+    using SmallCompletions = deploy::CompletionSet<1, 3>;
+    using SmallTable = deploy::TaskTable<Record, SmallCompletions, 1, 3>;
+    using SmallBuilder = deploy::TaskBuilder<SmallTable, SmallCompletions>;
     SmallCompletions completions{};
     SmallTable table{};
     for (uint32_t expected = 1; expected <= 3; ++expected) {
@@ -1931,9 +1931,9 @@ void put_manifest(
             || builder->record()->id().generation != expected) {
             return false;
         }
-        const myos::deploy::TaskId id = builder->record()->id();
+        const deploy::TaskId id = builder->record()->id();
         if (!builder->commit_prepared()
-            || !table.begin_close(id, myos::deploy::CloseReason::Explicit,
+            || !table.begin_close(id, deploy::CloseReason::Explicit,
                                   MYOS_STATUS_OK)
             || table.continue_close(id) != MYOS_STATUS_OK) {
             return false;
@@ -1942,12 +1942,12 @@ void put_manifest(
         if (!result || result->task != id) {
             return false;
         }
-        const auto next = myos::deploy::TaskId{0, expected + 1};
+        const auto next = deploy::TaskId{0, expected + 1};
         if (expected < 3) {
-            if (table.tag(next) != myos::deploy::TaskSlotTag::Vacant) {
+            if (table.tag(next) != deploy::TaskSlotTag::Vacant) {
                 return false;
             }
-        } else if (table.tag(next) != myos::deploy::TaskSlotTag::Retired) {
+        } else if (table.tag(next) != deploy::TaskSlotTag::Retired) {
             return false;
         }
     }
@@ -1979,7 +1979,7 @@ void put_manifest(
     if (!domain_slot || !import_slot) {
         return false;
     }
-    myos::deploy::RegisteredSpace<ConstructionSpace, 2> source{};
+    deploy::RegisteredSpace<ConstructionSpace, 2> source{};
     if (!source.adopt(libk::move(source_space))) {
         return false;
     }
@@ -2016,21 +2016,21 @@ void put_manifest(
     if (bundle.open(
             root,
             myos::cap::CapRef{2, 0},
-            myos::deploy::Window{bundle_address, 8192},
+            deploy::Window{bundle_address, 8192},
             bundle_size)
         != MYOS_STATUS_OK
         || scratch.open(
                root,
-               myos::deploy::Window{scratch_address, 16384})
+               deploy::Window{scratch_address, 16384})
             != MYOS_STATUS_OK
-        || bundle.phase() != myos::deploy::LeasePhase::Mapped
-        || scratch.phase() != myos::deploy::LeasePhase::Ready) {
+        || bundle.phase() != deploy::LeasePhase::Mapped
+        || scratch.phase() != deploy::LeasePhase::Ready) {
         return false;
     }
-    myos::deploy::TaskAuthorityBindings bindings{};
+    deploy::TaskAuthorityBindings bindings{};
     bindings.domains[0] = *domain;
     bindings.imports[0] = *import;
-    myos::deploy::TaskConstructionInput<
+    deploy::TaskConstructionInput<
         FakeBackend, ConstructionAuthorities> input{
         .parent_pool = root,
         .bundle = &bundle,
@@ -2056,7 +2056,7 @@ void put_manifest(
         return false;
     }
     const auto projections = builder->record()->projections();
-    if (builder->record()->state() != myos::deploy::TaskState::Constructing
+    if (builder->record()->state() != deploy::TaskState::Constructing
         || !projections.vspace.valid() || !projections.cspace.valid()
         || !projections.bootstrap.valid()
         || !projections.mappings[0].valid()
@@ -2071,28 +2071,28 @@ void put_manifest(
         || projections.exports[0].kind != MYOS_OBJECT_KIND_THREAD
         || builder->record()->accounting().total_bytes != 12288
         || builder->record()->accounting().by_class[
-               MYOS_DEPLOY_CRITICAL_CODE] != 4096
+               DEPLOY_CRITICAL_CODE] != 4096
         || builder->record()->accounting().by_class[
-               MYOS_DEPLOY_CRITICAL_STACK] != 4096
+               DEPLOY_CRITICAL_STACK] != 4096
         || builder->record()->accounting().by_class[
-               MYOS_DEPLOY_CRITICAL_BOOTSTRAP] != 4096) {
+               DEPLOY_CRITICAL_BOOTSTRAP] != 4096) {
         return false;
     }
     if (!construction_workspace.empty()) {
         return false;
     }
-    const myos::deploy::TaskId task = builder->record()->id();
+    const deploy::TaskId task = builder->record()->id();
     auto* const record_before_commit = builder->record();
     if (!builder->commit_prepared()
         || builder->valid()
         || table.record(task) != record_before_commit
-        || table.record(task)->state() != myos::deploy::TaskState::Prepared) {
+        || table.record(task)->state() != deploy::TaskState::Prepared) {
         return false;
     }
     FakeBackend::reset();
     if (table.start(task) != MYOS_STATUS_OK
         || table.record(task) == nullptr
-        || table.record(task)->state() != myos::deploy::TaskState::Running
+        || table.record(task)->state() != deploy::TaskState::Running
         || !table.record(task)->ready()
         || FakeBackend::execution_start_count != 1) {
         return false;
@@ -2104,21 +2104,21 @@ void put_manifest(
         || table.consume_terminal(task, observation) != MYOS_STATUS_OK
         || table.record(task) == nullptr
         || table.record(task)->state()
-            != myos::deploy::TaskState::Terminating
+            != deploy::TaskState::Terminating
         || table.record(task)->ready()) {
         return false;
     }
     auto receiver = builder->take_receiver();
     if (!receiver
         || !table.begin_close(
-            task, myos::deploy::CloseReason::Terminal,
+            task, deploy::CloseReason::Terminal,
             MYOS_STATUS_OK)
         || table.continue_close(task) != MYOS_STATUS_OK) {
         return false;
     }
     const auto result = receiver->take();
     if (!result || result->task != task
-        || result->reason != myos::deploy::CloseReason::Terminal
+        || result->reason != deploy::CloseReason::Terminal
         || result->status != MYOS_STATUS_OK) {
         return false;
     }
@@ -2137,7 +2137,7 @@ void put_manifest(
         || early_terminal_builder->record() == nullptr) {
         return false;
     }
-    const myos::deploy::TaskId early_terminal_task =
+    const deploy::TaskId early_terminal_task =
         early_terminal_builder->record()->id();
     FakeBackend::terminal_visible = false;
     FakeBackend::publish_terminal_on_start = true;
@@ -2153,7 +2153,7 @@ void put_manifest(
         || table.start(early_terminal_task) != MYOS_STATUS_OK
         || table.record(early_terminal_task) == nullptr
         || table.record(early_terminal_task)->state()
-            != myos::deploy::TaskState::Running
+            != deploy::TaskState::Running
         || table.record(early_terminal_task)->terminal_sequence() != 0) {
         return false;
     }
@@ -2164,7 +2164,7 @@ void put_manifest(
             != MYOS_STATUS_OK
         || table.record(early_terminal_task) == nullptr
         || table.record(early_terminal_task)->state()
-            != myos::deploy::TaskState::Terminating
+            != deploy::TaskState::Terminating
         || table.record(early_terminal_task)->terminal_sequence() != 2
         || table.record(early_terminal_task)->terminal_status()
             != MYOS_STATUS_OK) {
@@ -2172,7 +2172,7 @@ void put_manifest(
     }
     if (!table.begin_close(
             early_terminal_task,
-            myos::deploy::CloseReason::Terminal,
+            deploy::CloseReason::Terminal,
             MYOS_STATUS_OK)
         || table.continue_close(early_terminal_task) != MYOS_STATUS_OK) {
         return false;
@@ -2181,7 +2181,7 @@ void put_manifest(
     if (!early_terminal_result
         || early_terminal_result->task != early_terminal_task
         || early_terminal_result->reason
-            != myos::deploy::CloseReason::Terminal
+            != deploy::CloseReason::Terminal
         || early_terminal_result->status != MYOS_STATUS_OK) {
         return false;
     }
@@ -2195,7 +2195,7 @@ void put_manifest(
     if (!failed_builder || failed_builder->record() == nullptr) {
         return false;
     }
-    const myos::deploy::TaskId failed_task = failed_builder->record()->id();
+    const deploy::TaskId failed_task = failed_builder->record()->id();
     auto invalid_input = input;
     invalid_input.bootstrap_size = 8192;
     const myos_status_t failed_status = failed_builder->construct(
@@ -2203,12 +2203,12 @@ void put_manifest(
     if (failed_status != MYOS_STATUS_BAD_ARGS
         || failed_builder->valid()
         || !construction_workspace.empty()
-        || table.tag(failed_task) != myos::deploy::TaskSlotTag::Closing) {
+        || table.tag(failed_task) != deploy::TaskSlotTag::Closing) {
         return false;
     }
     FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
     if (table.continue_close(failed_task) != MYOS_STATUS_BUSY
-        || table.tag(failed_task) != myos::deploy::TaskSlotTag::Closing
+        || table.tag(failed_task) != deploy::TaskSlotTag::Closing
         || !construction_workspace.empty()
         || table.continue_close(failed_task) != MYOS_STATUS_OK) {
         return false;
@@ -2220,7 +2220,7 @@ void put_manifest(
     const auto failed_result = failed_receiver->take();
     if (!failed_result || failed_result->task != failed_task
         || failed_result->reason
-            != myos::deploy::CloseReason::ConstructionFailure
+            != deploy::CloseReason::ConstructionFailure
         || failed_result->status != MYOS_STATUS_BAD_ARGS) {
         return false;
     }

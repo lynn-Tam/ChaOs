@@ -1,9 +1,10 @@
-#include <user/lib/stream.hpp>
-#include <user/lib/console.hpp>
-#include <user/lib/imports.hpp>
-#include <user/lib/clock.hpp>
+#include <user/server_rt/service.hpp>
+#include <libk/parse.hpp>
+#include <user/ipc/channel.hpp>
+#include <user/server_rt/console.hpp>
+#include <user/abi/startup.hpp>
+#include <user/abi/time.hpp>
 #include <libk/fmt.hpp>
-#include <user/lib/terminal.hpp>
 
 namespace {
 using namespace myos;
@@ -150,12 +151,12 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         char* end = argument;
         while (*end && *end != ' ') ++end;
         if (*end) *end++ = 0;
-        const auto parsed = decimal(argument);
+        const auto parsed = libk::parse<uint64_t>(argument);
         if (!parsed) { console.write("invalid task\n"); return; }
         request.id = *parsed;
         while (*end == ' ') ++end;
         if (wait && *end) {
-            const auto duration = decimal(end);
+            const auto duration = libk::parse<uint64_t>(end);
             Clock clock;
             service::require(clock.open());
             const auto deadline = duration ? clock.after_ms(*duration) : libk::nullopt;

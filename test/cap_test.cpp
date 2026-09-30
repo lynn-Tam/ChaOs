@@ -21,12 +21,12 @@
 
 namespace {
 
-using kernel::cap::CapView;
+using kernel::cap::Authority;
 using kernel::cap::CSpace;
 using kernel::cap::Attenuation;
 using kernel::cap::AttenuationError;
-using kernel::cap::EffectiveAuthority;
-using kernel::cap::GrantCeiling;
+using kernel::cap::Authority;
+using kernel::cap::Authority;
 using kernel::cap::GrantError;
 using kernel::cap::GrantGraph;
 using kernel::cap::GrantRef;
@@ -185,7 +185,7 @@ public:
         }
         return graph().create_root(
             libk::move(reference).value(),
-            GrantCeiling{rights});
+            Authority{rights});
     }
 
     [[nodiscard]] auto graph() noexcept -> GrantGraph& {
@@ -268,7 +268,7 @@ private:
 
 [[nodiscard]] auto decode_and_check(
     kernel::object::ObjectKind kind,
-    const EffectiveAuthority& source,
+    const Authority& source,
     byte (&bytes)[MYOS_CAP_ATTENUATION_SIZE]) noexcept -> bool {
     auto decoded = kernel::cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
@@ -296,7 +296,7 @@ bool test_typed_attenuation_covers_all_families(
     using kernel::object::ObjectKind;
 
     byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
-    const EffectiveAuthority simple{attenuation_rights, libk::monostate{}};
+    const Authority simple{attenuation_rights, libk::monostate{}};
     const ObjectKind simple_kinds[] = {
         ObjectKind::Thread,
         ObjectKind::Vproc,
@@ -310,7 +310,7 @@ bool test_typed_attenuation_covers_all_families(
         }
     }
 
-    const EffectiveAuthority memory{
+    const Authority memory{
         attenuation_rights,
         MemoryAuthority{
             kernel::mm::ObjectRange{0, 16},
@@ -327,7 +327,7 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority vspace{
+    const Authority vspace{
         attenuation_rights,
         VSpaceAuthority{
             kernel::mm::RegionKey{kernel::mm::StableNodeKey{1, 1}},
@@ -343,7 +343,7 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority pool{
+    const Authority pool{
         attenuation_rights,
         ResourcePoolAuthority{
             kernel::resource::Budget{1024 * 1024, 16},
@@ -357,14 +357,14 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority notification{
+    const Authority notification{
         attenuation_rights, NotificationAuthority{7}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_NOTIFICATION);
     if (!decode_and_check(ObjectKind::Notification, notification, bytes)) {
         return false;
     }
 
-    const EffectiveAuthority endpoint{
+    const Authority endpoint{
         attenuation_rights, EndpointAuthority{3, 3, 8}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_ENDPOINT);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 3);
@@ -374,7 +374,7 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority channel{
+    const Authority channel{
         attenuation_rights, ChannelAuthority{ChannelSide::Any, 0, 0}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_CHANNEL);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET,
@@ -383,7 +383,7 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority pager{
+    const Authority pager{
         attenuation_rights, PagerAuthority{9, 8}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_PAGER);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 2);
@@ -391,7 +391,7 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const EffectiveAuthority irq{
+    const Authority irq{
         attenuation_rights, IrqAuthority{4, true}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_IRQ);
     return decode_and_check(ObjectKind::Irq, irq, bytes);
@@ -423,7 +423,7 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     if (!decoded) {
         return false;
     }
-    const EffectiveAuthority simple{attenuation_rights, libk::monostate{}};
+    const Authority simple{attenuation_rights, libk::monostate{}};
     if (kernel::cap::make_attenuation_ceiling(
             ObjectKind::Thread, simple, decoded.value())) {
         return false;
@@ -435,7 +435,7 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET, MYOS_VM_NORMAL);
     decoded = kernel::cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
-    const EffectiveAuthority memory{
+    const Authority memory{
         attenuation_rights,
         MemoryAuthority{
             kernel::mm::ObjectRange{0, 16},
@@ -452,7 +452,7 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, ~u64{});
     decoded = kernel::cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
-    const EffectiveAuthority channel{
+    const Authority channel{
         attenuation_rights, ChannelAuthority{ChannelSide::Any, 0, 0}};
     if (!decoded) {
         return false;
@@ -475,7 +475,7 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{basic_rights});
+        libk::move(root).value(), Authority{basic_rights});
     if (!source) {
         return false;
     }
@@ -566,7 +566,7 @@ bool test_resolve_composes_authority_and_pins_kind(
         return false;
     }
     auto inserted = fixture.a().insert(
-        libk::move(root).value(), CapView{basic_rights});
+        libk::move(root).value(), Authority{basic_rights});
     if (!inserted) {
         return false;
     }
@@ -604,18 +604,18 @@ bool test_duplicate_attenuates_without_splitting_grant(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{basic_rights});
+        libk::move(root).value(), Authority{basic_rights});
     if (!source) {
         return false;
     }
     auto amplified = fixture.a().duplicate(
-        source.value(), fixture.b(), CapView{Rights::of(Right::Control)});
+        source.value(), fixture.b(), Authority{Rights::of(Right::Control)});
     if (amplified
         || amplified.error() != kernel::cap::CSpaceError::Amplification) {
         return false;
     }
     auto copy = fixture.a().duplicate(
-        source.value(), fixture.b(), CapView{inspect_rights});
+        source.value(), fixture.b(), Authority{inspect_rights});
     if (!copy) {
         return false;
     }
@@ -651,15 +651,15 @@ bool test_delegation_revoke_waits_for_existing_lease(
     }
     const auto root_key = root.value().key();
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{all_context_rights});
+        libk::move(root).value(), Authority{all_context_rights});
     if (!source) {
         return false;
     }
     auto child = fixture.a().delegate(
         source.value(),
         fixture.b(),
-        GrantCeiling{inspect_rights},
-        CapView{inspect_rights});
+        Authority{inspect_rights},
+        Authority{inspect_rights});
     if (!child) {
         return false;
     }
@@ -757,9 +757,9 @@ bool test_handles_are_local_and_stale_generation_stays_dead(
         return false;
     }
     auto handle_a = fixture.a().insert(
-        libk::move(root_a).value(), CapView{inspect_rights});
+        libk::move(root_a).value(), Authority{inspect_rights});
     auto handle_b = fixture.b().insert(
-        libk::move(root_b).value(), CapView{inspect_rights});
+        libk::move(root_b).value(), Authority{inspect_rights});
     if (!handle_a || !handle_b
         || handle_a.value().raw() != handle_b.value().raw()) {
         return false;
@@ -784,7 +784,7 @@ bool test_handles_are_local_and_stale_generation_stays_dead(
         return false;
     }
     auto replacement = fixture.a().insert(
-        libk::move(replacement_root).value(), CapView{inspect_rights});
+        libk::move(replacement_root).value(), Authority{inspect_rights});
     auto rejected = fixture.a().resolve<
         kernel::sched::SchedulingContext>(stale, inspect_rights);
     if (!replacement
@@ -810,7 +810,7 @@ bool test_remote_selector_close_is_cspace_exact(
         return false;
     }
     auto installed = fixture.b().insert(
-        libk::move(root).value(), CapView{inspect_rights});
+        libk::move(root).value(), Authority{inspect_rights});
     if (!installed) {
         return false;
     }
@@ -841,9 +841,9 @@ bool test_move_is_transactional_across_cspaces(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(source_root).value(), CapView{inspect_rights});
+        libk::move(source_root).value(), Authority{inspect_rights});
     auto blocker = fixture.one().insert(
-        libk::move(blocker_root).value(), CapView{inspect_rights});
+        libk::move(blocker_root).value(), Authority{inspect_rights});
     if (!source || !blocker) {
         return false;
     }
@@ -890,9 +890,9 @@ bool test_ipc_transfer_commits_copy_and_move_atomically(
         return false;
     }
     auto copy_source = fixture.a().insert(
-        libk::move(copy_root).value(), CapView{basic_rights});
+        libk::move(copy_root).value(), Authority{basic_rights});
     auto move_source = fixture.a().insert(
-        libk::move(move_root).value(), CapView{inspect_rights});
+        libk::move(move_root).value(), Authority{inspect_rights});
     if (!copy_source || !move_source) {
         return false;
     }
@@ -954,7 +954,7 @@ bool test_ipc_transfer_rolls_back_when_move_source_changes(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{inspect_rights});
+        libk::move(root).value(), Authority{inspect_rights});
     if (!source) {
         return false;
     }
@@ -1084,7 +1084,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         return false;
     }
     auto installed = space->insert(
-        libk::move(root).value(), CapView{basic_rights});
+        libk::move(root).value(), Authority{basic_rights});
     const kernel::resource::Budget after_install{
         .memory = limit.memory - object_charge.memory
             - 3 * kernel::mm::page_size,
@@ -1148,7 +1148,7 @@ bool test_attenuated_operations_and_revoke_use_slot_authority(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{source_rights});
+        libk::move(root).value(), Authority{source_rights});
     if (!source) {
         return false;
     }
@@ -1187,7 +1187,7 @@ bool test_revoked_tombstones_do_not_retain_target(
         return false;
     }
     auto source = fixture.a().insert(
-        libk::move(root).value(), CapView{rights});
+        libk::move(root).value(), Authority{rights});
     if (!source) {
         return false;
     }
@@ -1252,7 +1252,7 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
         permit.value(),
         libk::move(root_reservation).value(),
         libk::move(target_ref).value(),
-        GrantCeiling{all_context_rights});
+        Authority{all_context_rights});
     if (!allocation) {
         return false;
     }
@@ -1265,7 +1265,7 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
         libk::move(child_reservation).value(),
         root_lease.value(),
         libk::move(child_target).value(),
-        GrantCeiling{inspect_rights});
+        Authority{inspect_rights});
     root_lease.value().reset();
     if (!child) {
         return false;
@@ -1340,7 +1340,7 @@ bool test_pool_close_revokes_hidden_allocation_root(
         permit.value(),
         libk::move(root_reservation).value(),
         libk::move(target_ref).value(),
-        GrantCeiling{all_context_rights});
+        Authority{all_context_rights});
     if (!allocation) {
         return false;
     }
@@ -1353,13 +1353,13 @@ bool test_pool_close_revokes_hidden_allocation_root(
         libk::move(child_reservation).value(),
         root_lease.value(),
         libk::move(child_target).value(),
-        GrantCeiling{inspect_rights});
+        Authority{inspect_rights});
     root_lease.value().reset();
     if (!child) {
         return false;
     }
     auto installed = fixture.a().insert(
-        libk::move(child).value(), CapView{inspect_rights});
+        libk::move(child).value(), Authority{inspect_rights});
     if (!installed) {
         return false;
     }
@@ -1452,7 +1452,7 @@ bool test_parent_close_recursively_closes_child_pool(
         permit.value(),
         libk::move(root_reservation).value(),
         libk::move(child_ref).value(),
-        GrantCeiling{rights, authority});
+        Authority{rights, authority});
     if (!allocation) {
         return false;
     }
@@ -1465,13 +1465,13 @@ bool test_parent_close_recursively_closes_child_pool(
         libk::move(user_reservation).value(),
         root_lease.value(),
         libk::move(user_target).value(),
-        GrantCeiling{rights, authority});
+        Authority{rights, authority});
     root_lease.value().reset();
     if (!user_grant) {
         return false;
     }
     auto installed = fixture.a().insert(
-        libk::move(user_grant).value(), CapView{rights, authority});
+        libk::move(user_grant).value(), Authority{rights, authority});
     if (!installed) {
         return false;
     }
@@ -1515,15 +1515,15 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
         auto target = fixture.target_ref(index);
         if (!permit || !root_charge || !child_charge || !target) return false;
         auto allocation = fixture.graph().create_allocation(permit.value(),
-            libk::move(root_charge).value(), libk::move(target).value(), GrantCeiling{rights});
+            libk::move(root_charge).value(), libk::move(target).value(), Authority{rights});
         if (!allocation) return false;
         auto lease = allocation.value().acquire();
         auto child_target = fixture.target_ref(index);
         if (!lease || !child_target) return false;
         auto child = fixture.graph().derive(libk::move(child_charge).value(), lease.value(),
-            libk::move(child_target).value(), GrantCeiling{rights});
+            libk::move(child_target).value(), Authority{rights});
         if (!child) return false;
-        auto installed = fixture.a().insert(libk::move(child).value(), CapView{rights});
+        auto installed = fixture.a().insert(libk::move(child).value(), Authority{rights});
         if (!installed) return false;
         handles[index] = installed.value();
         allocation.value().commit();
@@ -1559,7 +1559,7 @@ bool test_destroy_authority_uses_object_anchor_retirement(
         return false;
     }
     auto handle = fixture.a().insert(
-        libk::move(root).value(), CapView{rights});
+        libk::move(root).value(), Authority{rights});
     if (!handle || !fixture.a().destroy(handle.value())) {
         return false;
     }
@@ -1591,15 +1591,15 @@ bool test_tunnel_rights_keep_connect_and_tx_distinct(
         Right::Duplicate, Right::Inspect, Right::Signal, Right::Close);
     const auto forbidden_tx = kernel::cap::compose(
         ObjectKind::Tunnel,
-        GrantCeiling{connect},
-        CapView{tx});
+        Authority{connect},
+        Authority{tx});
 
     return kernel::cap::validate_ceiling(
-               ObjectKind::Tunnel, GrantCeiling{receiver})
+               ObjectKind::Tunnel, Authority{receiver})
         && !kernel::cap::validate_ceiling(
-            ObjectKind::Vproc, GrantCeiling{connect})
+            ObjectKind::Vproc, Authority{connect})
         && !kernel::cap::validate_ceiling(
-            ObjectKind::Notification, GrantCeiling{connect})
+            ObjectKind::Notification, Authority{connect})
         && !forbidden_tx
         && forbidden_tx.error() == PolicyError::Amplification;
 }

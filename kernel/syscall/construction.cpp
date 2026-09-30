@@ -76,7 +76,7 @@ using kernel::object::ObjectKind;
 [[nodiscard]] auto pool_authority(
     const cap::Resolved<kernel::resource::ResourcePool>& pool) noexcept
     -> libk::optional<cap::ResourcePoolAuthority> {
-    const cap::EffectiveAuthority effective = pool.authority();
+    const cap::Authority effective = pool.authority();
     const auto* const authority =
         libk::get_if<cap::ResourcePoolAuthority>(&effective.data);
     return authority != nullptr
@@ -142,8 +142,8 @@ using kernel::object::ObjectKind;
 }
 
 struct PublishedAuthority final {
-    cap::GrantCeiling ceiling{};
-    cap::CapView view{};
+    cap::Authority ceiling{};
+    cap::Authority view{};
 };
 
 template<
@@ -323,7 +323,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     const cap::Resolved<kernel::mm::MemoryObject>& memory,
     kernel::mm::ObjectRange range,
     kernel::mm::AccessMask access) noexcept -> bool {
-    const cap::EffectiveAuthority effective = memory.authority();
+    const cap::Authority effective = memory.authority();
     const auto* const authority = libk::get_if<cap::MemoryAuthority>(
         &effective.data);
     return authority != nullptr && authority->range.contains(range)
@@ -609,8 +609,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
             };
             return PublishedAuthority{
-                cap::GrantCeiling{rights, authority},
-                cap::CapView{rights, authority}};
+                cap::Authority{rights, authority},
+                cap::Authority{rights, authority}};
         });
 }
 
@@ -884,7 +884,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         permit.value(),
         libk::move(root_charge).value(),
         libk::move(reference).value(),
-        cap::GrantCeiling{rights, root_authority});
+        cap::Authority{rights, root_authority});
     if (!allocation) {
         KASSERT(object.retire());
         object.reset();
@@ -911,7 +911,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     auto first_grant = kernel->grants().derive(
         libk::move(first_charge).value(), root.value(),
         libk::move(first_target).value(),
-        cap::GrantCeiling{rights, first_authority});
+        cap::Authority{rights, first_authority});
     if (!first_grant) {
         allocation.value().reset();
         object.reset();
@@ -926,7 +926,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     auto first_installed = invocation.cspace.insert(
         libk::move(first_slot).value(),
         libk::move(first_grant).value(),
-        cap::CapView{rights, first_authority});
+        cap::Authority{rights, first_authority});
     if (!first_installed) {
         allocation.value().reset();
         object.reset();
@@ -935,7 +935,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     auto second_grant = kernel->grants().derive(
         libk::move(second_charge).value(), root.value(),
         libk::move(second_target).value(),
-        cap::GrantCeiling{rights, second_authority});
+        cap::Authority{rights, second_authority});
     if (!second_grant) {
         static_cast<void>(invocation.cspace.close(first_installed.value()));
         allocation.value().reset();
@@ -952,7 +952,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
     auto second_installed = invocation.cspace.insert(
         libk::move(second_slot).value(),
         libk::move(second_grant).value(),
-        cap::CapView{rights, second_authority});
+        cap::Authority{rights, second_authority});
     if (!second_installed) {
         static_cast<void>(invocation.cspace.close(first_installed.value()));
         allocation.value().reset();
@@ -997,8 +997,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 cap::Right::Close, cap::Right::Destroy, cap::Right::Revoke);
             const cap::PagerAuthority data{backing_key, max_pages};
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data},
-                cap::CapView{rights, data}};
+                cap::Authority{rights, data},
+                cap::Authority{rights, data}};
         });
 }
 
@@ -1033,8 +1033,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 cap::Right::Destroy, cap::Right::Revoke);
             const cap::IrqAuthority data{source, level};
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data},
-                cap::CapView{rights, data}};
+                cap::Authority{rights, data},
+                cap::Authority{rights, data}};
         });
 }
 
@@ -1110,8 +1110,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         [&](kernel::resource::ResourcePool&) {
             const cap::ResourcePoolAuthority data{limit, kinds};
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data},
-                cap::CapView{rights, data}};
+                cap::Authority{rights, data},
+                cap::Authority{rights, data}};
         });
 }
 
@@ -1176,8 +1176,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 cap::Right::Manage,
                 cap::Right::Revoke);
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data},
-                cap::CapView{rights, data}};
+                cap::Authority{rights, data},
+                cap::Authority{rights, data}};
         });
 }
 
@@ -1235,8 +1235,8 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 cap::Right::Manage,
                 cap::Right::Revoke);
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data},
-                cap::CapView{rights, data}};
+                cap::Authority{rights, data},
+                cap::Authority{rights, data}};
         });
 }
 
@@ -1285,7 +1285,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
                 cap::Right::Destroy,
                 cap::Right::Revoke);
             return PublishedAuthority{
-                cap::GrantCeiling{rights, data}, cap::CapView{rights, data}};
+                cap::Authority{rights, data}, cap::Authority{rights, data}};
         });
 }
 
@@ -1321,7 +1321,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         },
         [&](cap::CSpace&) {
             return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
+                cap::Authority{rights}, cap::Authority{rights}};
         });
 }
 
@@ -1371,7 +1371,7 @@ template<kernel::resource::SponsoredObject T, typename Factory, typename Authori
         },
         [&](kernel::sched::SchedulingContext&) {
             return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
+                cap::Authority{rights}, cap::Authority{rights}};
         });
 }
 
@@ -1411,7 +1411,7 @@ struct ThreadStart final {
     const cap::Resolved<kernel::mm::MemoryObject>& memory,
     usize page,
     kernel::mm::AccessMask access) noexcept -> bool {
-    const cap::EffectiveAuthority effective = memory.authority();
+    const cap::Authority effective = memory.authority();
     const auto* const authority =
         libk::get_if<cap::MemoryAuthority>(&effective.data);
     return authority != nullptr && authority->range.contains(
@@ -1563,7 +1563,7 @@ struct ThreadStart final {
         [&](kernel::Thread&) {
             const auto rights = basic_rights();
             return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
+                cap::Authority{rights}, cap::Authority{rights}};
         });
 }
 
@@ -1636,8 +1636,8 @@ struct ThreadStart final {
                 cap::Right::Revoke);
             const cap::NotificationAuthority authority{badge};
             return PublishedAuthority{
-                cap::GrantCeiling{rights, authority},
-                cap::CapView{rights, authority}};
+                cap::Authority{rights, authority},
+                cap::Authority{rights, authority}};
         });
 }
 
@@ -1700,7 +1700,7 @@ struct ThreadStart final {
                 cap::Right::Destroy,
                 cap::Right::Revoke);
             return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
+                cap::Authority{rights}, cap::Authority{rights}};
         });
 }
 
@@ -1763,7 +1763,7 @@ struct ThreadStart final {
         [&](kernel::Vproc&) {
             const auto rights = vproc_rights();
             return PublishedAuthority{
-                cap::GrantCeiling{rights}, cap::CapView{rights}};
+                cap::Authority{rights}, cap::Authority{rights}};
         });
 }
 

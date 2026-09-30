@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <libk/array.hpp>
+#include <array>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
 
@@ -24,7 +24,7 @@ enum class RingResult : uint8_t {
 template<size_t Words, size_t Capacity>
     requires(Words > 0 && Capacity > 0 && (Capacity & (Capacity - 1)) == 0)
 struct SharedRing final {
-    using Entry = Array<uint64_t, Words>;
+    using Entry = std::array<uint64_t, Words>;
 
     struct alignas(64) Data final {
         Atomic<uint64_t> published{};

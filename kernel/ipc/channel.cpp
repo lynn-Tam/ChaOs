@@ -1012,7 +1012,7 @@ auto Channel::mint(
         .badge = badge,
         .fixed = ~u64{},
     };
-    const cap::GrantCeiling ceiling{rights, child_data};
+    const cap::Authority ceiling{rights, child_data};
     const cap::ChannelBadgeDerivation proof{*this, *side_value, badge};
     auto transaction = libk::move(reserved).value();
     auto child = authority.derive_channel_badge(
@@ -1026,7 +1026,7 @@ auto Channel::mint(
     auto installed = destination.insert(
         libk::move(transaction.slot_),
         libk::move(child).value(),
-        cap::CapView{rights, child_data});
+        cap::Authority{rights, child_data});
     if (!installed) {
         return libk::unexpected(cap_error(installed.error()));
     }
@@ -1523,8 +1523,8 @@ auto Channel::make_escrow(
         if (!effective.value().rights.contains(cap::Right::Duplicate)) {
             return libk::unexpected(ChannelError::Denied);
         }
-        const cap::CapView view{*rights, effective.value().data};
-        auto valid = cap::compose(lease.kind(), effective.value().ceiling(), view);
+        const cap::Authority view{*rights, effective.value().data};
+        auto valid = cap::compose(lease.kind(), effective.value(), view);
         auto grant = snapshot.graph->ref(snapshot.key);
         if (!valid || !grant) {
             return libk::unexpected(ChannelError::Denied);
@@ -1534,7 +1534,7 @@ auto Channel::make_escrow(
         break;
     }
     case Escrow::Kind::Delegate: {
-        const cap::GrantCeiling ceiling{*rights, effective.value().data};
+        const cap::Authority ceiling{*rights, effective.value().data};
         if (!effective.value().rights.contains(cap::Right::Delegate)
             || !cap::attenuates(lease.kind(), effective.value(), ceiling)) {
             return libk::unexpected(ChannelError::Denied);
@@ -1542,7 +1542,7 @@ auto Channel::make_escrow(
         auto charge = source.reserve_grant();
         auto target = lease.clone_target();
         auto valid = cap::compose(lease.kind(), ceiling,
-            cap::CapView{*rights, effective.value().data});
+            cap::Authority{*rights, effective.value().data});
         if (!charge || !target || !valid) {
             return libk::unexpected(ChannelError::ResourceExhausted);
         }
@@ -1553,7 +1553,7 @@ auto Channel::make_escrow(
             return libk::unexpected(ChannelError::ResourceExhausted);
         }
         escrow.grant = libk::move(child).value();
-        escrow.view = cap::CapView{*rights, effective.value().data};
+        escrow.view = cap::Authority{*rights, effective.value().data};
         break;
     }
     case Escrow::Kind::Move: {

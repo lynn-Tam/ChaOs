@@ -135,8 +135,8 @@ with tempfile.TemporaryDirectory(dir=logs) as directory:
         for task in ids:
             start = command(f'stop {task}')
             if b'error:' in serial[start:]: raise RuntimeError('stop failed')
-        start = command('run hello')
-        if b'Hello from userspace.\nmyos> ' not in serial[start:]: raise RuntimeError('reuse failed')
+        start = command('run echo console-ready')
+        if b'console-ready\nmyos> ' not in serial[start:]: raise RuntimeError('reuse failed')
     finally:
         (logs / 'serial.log').write_bytes(serial)
         process.terminate()

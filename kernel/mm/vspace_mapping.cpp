@@ -139,7 +139,7 @@ auto VSpace::map(
     MapRequest request,
     kernel::cap::Resolved<MemoryObject>& memory) noexcept
     -> libk::Expected<MapResult, VSpaceError> {
-    const cap::EffectiveAuthority effective = memory.authority();
+    const cap::Authority effective = memory.authority();
     const auto* const memory_authority =
         libk::get_if<cap::MemoryAuthority>(&effective.data);
     if (memory_authority == nullptr

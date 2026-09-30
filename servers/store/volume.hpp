@@ -1,8 +1,12 @@
 #pragma once
 
 #include <third_party/littlefs/lfs.h>
-#include <user/lib/block_client.hpp>
-#include <user/lib/store_protocol.hpp>
+#include <user/ipc/storage.hpp>
+
+// Store-private littlefs extension; the caller pins mutation through I/O.
+extern "C" int lfs_file_map(lfs_t*, lfs_file_t*, lfs_off_t,
+    lfs_block_t*, lfs_off_t*, lfs_size_t*);
+extern "C" void lfs_file_drop(lfs_t*, lfs_file_t*);
 
 namespace myos::store {
 
@@ -12,7 +16,7 @@ namespace myos::store {
 class Volume final : private libk::noncopyable_nonmovable {
 public:
     static constexpr uint32_t BlockSize = 4096;
-    [[nodiscard]] auto open(block::Client& backend) noexcept -> myos_status_t {
+    [[nodiscard]] auto open(block::client& backend) noexcept -> myos_status_t {
         backend_ = &backend;
         const uint64_t blocks = backend.capacity() / BlockSize;
         if (blocks < 8 || blocks > UINT32_MAX) return MYOS_STATUS_BAD_ARGS;
@@ -71,6 +75,20 @@ public:
         return size == sizeof(id) ? MYOS_STATUS_OK : MYOS_STATUS_BACKING_FAILED;
     }
 
+    // No cursor change or data-cache mutation. The server pins filesystem
+    // mutation until all reads using these physical extents have completed.
+    [[nodiscard]] auto extent(lfs_file_t& file, uint64_t offset, size_t size) noexcept
+        -> std::expected<io::extent, myos_status_t> {
+        lfs_block_t block{};
+        lfs_off_t off{};
+        lfs_size_t bytes = size;
+        const int result = lfs_file_map(&fs_, &file, offset, &block, &off, &bytes);
+        if (result < 0) return std::unexpected(error(result));
+        const auto start = off & ~(SectorSize - 1);
+        const auto end = (off + bytes + SectorSize - 1) & ~(SectorSize - 1);
+        return io::extent{uint64_t{block} * BlockSize + start, end - start, off - start, bytes};
+    }
+
     [[nodiscard]] auto mounted() const noexcept -> bool { return mounted_; }
     [[nodiscard]] auto failed() const noexcept -> bool { return failed_; }
     [[nodiscard]] auto error(int result) const noexcept -> myos_status_t {
@@ -100,11 +118,28 @@ private:
         if (failed_) return LFS_ERR_IO;
         const auto result = op == io::Operation::Read
             ? backend_->read(offset, static_cast<uint8_t*>(data), size)
-            : backend_->write(offset, static_cast<const uint8_t*>(data), size);
+            : program(offset, data, size);
         if (result == MYOS_STATUS_OK) return 0;
         failed_ = true;
         last_error_ = result;
         return LFS_ERR_IO;
+    }
+    [[nodiscard]] auto program(uint64_t offset, void* data, size_t size) noexcept -> myos_status_t {
+        // littlefs still runs in one ordered execution. Independent physical
+        // writes may remain in flight; overlapping writes/readback and its
+        // sync callback establish their actual device dependencies.
+        const auto dependency = backend_->dependencies(offset, size);
+        if (dependency != MYOS_STATUS_OK) return dependency;
+        io::Request request{.operation = static_cast<uint64_t>(io::Operation::Write),
+            .offset = offset, .length = size};
+        for (;;) {
+            const auto status = backend_->submit(request, data);
+            if (status != MYOS_STATUS_BUSY) return status;
+            io::Completion result{};
+            const auto taken = backend_->wait(result);
+            if (taken != MYOS_STATUS_OK) return taken;
+            if (result.status != MYOS_STATUS_OK) return result.status;
+        }
     }
     [[nodiscard]] static auto self(const lfs_config* config) noexcept -> Volume& {
         return *static_cast<Volume*>(config->context);
@@ -136,7 +171,7 @@ private:
         return LFS_ERR_IO;
     }
 
-    block::Client* backend_{};
+    block::client* backend_{};
     lfs_config config_{};
     lfs_t fs_{};
     uint8_t read_cache_[BlockSize]{};

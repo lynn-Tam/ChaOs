@@ -25,7 +25,7 @@ public:
     [[nodiscard]] auto rights() const noexcept -> Rights {
         return authority_.rights;
     }
-    [[nodiscard]] auto authority() const noexcept -> EffectiveAuthority {
+    [[nodiscard]] auto authority() const noexcept -> Authority {
         return authority_;
     }
     [[nodiscard]] auto grant() const noexcept -> GrantKey {
@@ -42,7 +42,7 @@ public:
     [[nodiscard]] auto derive_region(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         RegionDerivation proof) const noexcept
         -> libk::Expected<GrantRef, GrantError> {
         return lease_.derive_region(
@@ -51,7 +51,7 @@ public:
     [[nodiscard]] auto derive_tunnel_tx(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         TunnelConnectProof proof) const noexcept
         -> libk::Expected<GrantRef, GrantError> {
         return lease_.derive_tunnel_tx(
@@ -60,7 +60,7 @@ public:
     [[nodiscard]] auto derive_channel_badge(
         kernel::resource::Reservation&& charge,
         object::ObjectRef&& target,
-        GrantCeiling ceiling,
+        Authority ceiling,
         ChannelBadgeDerivation proof) const noexcept
         -> libk::Expected<GrantRef, GrantError> {
         return lease_.derive_channel_badge(
@@ -74,7 +74,7 @@ private:
         CSpace& source,
         object::ObjectPin<T>&& pin,
         GrantLease&& lease,
-        EffectiveAuthority authority) noexcept
+        Authority authority) noexcept
         : source_(&source),
           lease_(libk::move(lease)),
           pin_(libk::move(pin)),
@@ -83,7 +83,7 @@ private:
     CSpace* source_{};
     GrantLease lease_;
     object::ObjectPin<T> pin_;
-    EffectiveAuthority authority_{};
+    Authority authority_{};
 };
 
 } // namespace kernel::cap

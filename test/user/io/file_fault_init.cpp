@@ -1,15 +1,16 @@
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/objects.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/uart/port.hpp>
 #include "file_fault.hpp"
 
 namespace {
 using namespace myos;
-deploy::Program program;
-using Supervisor = deploy::Supervisor<4>;
+deploy::program program;
+using Supervisor = deploy::tasks<4>;
 Supervisor supervisor;
 void check(bool condition) noexcept { if (!condition) exit(MYOS_STATUS_INTERNAL); }
-auto event_source(const char* name, myos_cap_t cap, myos_word_t rights) -> deploy::LaunchSource {
+auto event_source(const char* name, myos_cap_t cap, myos_word_t rights) -> deploy::source {
     return {name, {cap, 0}, {.version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
         .kind = MYOS_OBJECT_KIND_NOTIFICATION, .size = MYOS_CAP_ATTENUATION_SIZE,
         .rights = rights, .words = {}}};
@@ -46,7 +47,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::require(supervisor.add(names[i][0], pair.value, MYOS_OBJECT_KIND_CHANNEL, rights, 0));
         service::require(supervisor.add(names[i][1], pair.value2, MYOS_OBJECT_KIND_CHANNEL, rights, 1));
     }
-    Supervisor::Handle tasks[4];
+    Supervisor::handle tasks[4];
     for (unsigned i = 0; i != 2; ++i) {
         myos_status_t status{};
         auto task = supervisor.launch(program, i == 0 ? "block" : "files", status);
@@ -62,7 +63,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     for (unsigned i = 0; i != 2; ++i) {
         const auto signal = notification_create(pool, 1);
         service::require(signal.status); go[i] = cap::OwnedCap{{signal.value, 0}};
-        const deploy::LaunchSource sources[] = {
+        const deploy::source sources[] = {
             event_source("test.ready", ready.value, MYOS_RIGHT_SIGNAL),
             event_source("test.go", signal.value, MYOS_RIGHT_RECEIVE)};
         myos_status_t status{};

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <user/lib/imports.hpp>
+#include <user/abi/startup.hpp>
 
 namespace channel_test {
 inline constexpr myos::bootstrap::Import Provider{"provider.channel", 0x50524f56,

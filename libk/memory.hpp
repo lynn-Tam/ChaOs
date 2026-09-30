@@ -1,7 +1,7 @@
 #pragma once
+#include <new>
 #include <libk/assert.hpp>
 #include <libk/concepts.hpp>
-#include <libk/new.hpp>
 #include <libk/utility.hpp>
 
 namespace libk {

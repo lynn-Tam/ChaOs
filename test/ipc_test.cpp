@@ -105,17 +105,17 @@ bool test_notification_badge_is_immutable_authority(
     const TestContext&) noexcept {
     const auto rights = kernel::cap::Rights::of(
         kernel::cap::Right::Signal);
-    const kernel::cap::GrantCeiling ceiling{
+    const kernel::cap::Authority ceiling{
         rights, kernel::cap::NotificationAuthority{32}};
     const auto exact = kernel::cap::compose(
         kernel::object::ObjectKind::Notification,
         ceiling,
-        kernel::cap::CapView{
+        kernel::cap::Authority{
             rights, kernel::cap::NotificationAuthority{32}});
     const auto changed = kernel::cap::compose(
         kernel::object::ObjectKind::Notification,
         ceiling,
-        kernel::cap::CapView{
+        kernel::cap::Authority{
             rights, kernel::cap::NotificationAuthority{64}});
     return exact && !changed
         && changed.error() == kernel::cap::PolicyError::Amplification;
@@ -123,9 +123,9 @@ bool test_notification_badge_is_immutable_authority(
 
 bool test_endpoint_authority_narrows_badge_and_limits(
     const TestContext&) noexcept {
-    using kernel::cap::CapView;
+    using kernel::cap::Authority;
     using kernel::cap::EndpointAuthority;
-    using kernel::cap::GrantCeiling;
+    using kernel::cap::Authority;
     using kernel::cap::PolicyError;
     using kernel::cap::Right;
     using kernel::cap::Rights;
@@ -145,20 +145,20 @@ bool test_endpoint_authority_narrows_badge_and_limits(
     };
     const auto narrowed = kernel::cap::compose(
         ObjectKind::Endpoint,
-        GrantCeiling{rights, root},
-        CapView{rights, caller});
+        Authority{rights, root},
+        Authority{rights, caller});
     const auto widened_caps = kernel::cap::compose(
         ObjectKind::Endpoint,
-        GrantCeiling{rights, caller},
-        CapView{rights, EndpointAuthority{
+        Authority{rights, caller},
+        Authority{rights, EndpointAuthority{
             .badge = 0x42,
             .fixed = ~u64{},
             .cap_limit = 3,
         }});
     const auto changed_badge = kernel::cap::compose(
         ObjectKind::Endpoint,
-        GrantCeiling{rights, caller},
-        CapView{rights, EndpointAuthority{
+        Authority{rights, caller},
+        Authority{rights, EndpointAuthority{
             .badge = 0x43,
             .fixed = ~u64{},
             .cap_limit = 2,
@@ -171,10 +171,10 @@ bool test_endpoint_authority_narrows_badge_and_limits(
 
 bool test_channel_root_cannot_fix_badge_generically(
     const TestContext&) noexcept {
-    using kernel::cap::CapView;
+    using kernel::cap::Authority;
     using kernel::cap::ChannelAuthority;
     using kernel::cap::ChannelSide;
-    using kernel::cap::GrantCeiling;
+    using kernel::cap::Authority;
     using kernel::cap::PolicyError;
     using kernel::cap::Right;
     using kernel::cap::Rights;
@@ -190,16 +190,16 @@ bool test_channel_root_cannot_fix_badge_generically(
     };
     const auto side = kernel::cap::compose(
         ObjectKind::Channel,
-        GrantCeiling{rights, root},
-        CapView{rights, ChannelAuthority{
+        Authority{rights, root},
+        Authority{rights, ChannelAuthority{
             .side = ChannelSide::A,
             .badge = 0,
             .fixed = 0,
         }});
     const auto exact = kernel::cap::compose(
         ObjectKind::Channel,
-        GrantCeiling{rights, root},
-        CapView{rights, ChannelAuthority{
+        Authority{rights, root},
+        Authority{rights, ChannelAuthority{
             .side = ChannelSide::A,
             .badge = 0x55,
             .fixed = ~u64{},
@@ -209,10 +209,10 @@ bool test_channel_root_cannot_fix_badge_generically(
 
 bool test_channel_badge_and_side_are_immutable(
     const TestContext&) noexcept {
-    using kernel::cap::CapView;
+    using kernel::cap::Authority;
     using kernel::cap::ChannelAuthority;
     using kernel::cap::ChannelSide;
-    using kernel::cap::GrantCeiling;
+    using kernel::cap::Authority;
     using kernel::cap::PolicyError;
     using kernel::cap::Right;
     using kernel::cap::Rights;
@@ -228,19 +228,19 @@ bool test_channel_badge_and_side_are_immutable(
     };
     const auto same = kernel::cap::compose(
         ObjectKind::Channel,
-        GrantCeiling{rights, exact}, CapView{rights, exact});
+        Authority{rights, exact}, Authority{rights, exact});
     const auto changed_badge = kernel::cap::compose(
         ObjectKind::Channel,
-        GrantCeiling{rights, exact},
-        CapView{rights, ChannelAuthority{
+        Authority{rights, exact},
+        Authority{rights, ChannelAuthority{
             .side = ChannelSide::A,
             .badge = 0x56,
             .fixed = ~u64{},
         }});
     const auto changed_side = kernel::cap::compose(
         ObjectKind::Channel,
-        GrantCeiling{rights, exact},
-        CapView{rights, ChannelAuthority{
+        Authority{rights, exact},
+        Authority{rights, ChannelAuthority{
             .side = ChannelSide::B,
             .badge = 0x55,
             .fixed = ~u64{},

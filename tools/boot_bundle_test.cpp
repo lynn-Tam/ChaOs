@@ -4,7 +4,7 @@
 #include <uapi/boot_bundle.h>
 #include <libk/assert.hpp>
 
-#include "../user/lib/boot_bundle.hpp"
+#include "../servers/deploy/bundle.hpp"
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {

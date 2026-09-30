@@ -5,7 +5,7 @@
 
 #include <libk/assert.hpp>
 #include <libk/utility.hpp>
-#include <user/lib/deployment.hpp>
+#include <servers/deploy/detail/space.hpp>
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
@@ -192,12 +192,12 @@ struct FakeBackend final {
     }
 };
 
-using Space = myos::deploy::TaskSpace<3, 3, FakeBackend>;
+using Space = deploy::TaskSpace<3, 3, FakeBackend>;
 using Owner = myos::cap::BasicOwnedCap<FakeBackend>;
-using Bundle = myos::deploy::MappedBundle<FakeBackend>;
-using Scratch = myos::deploy::ScratchWindow<FakeBackend>;
+using Bundle = deploy::MappedBundle<FakeBackend>;
+using Scratch = deploy::ScratchWindow<FakeBackend>;
 
-static_assert(myos::deploy::Backend<FakeBackend>);
+static_assert(deploy::Backend<FakeBackend>);
 static_assert(!libk::is_copy_constructible_v<Space>);
 
 [[nodiscard]] auto has_call(
@@ -248,7 +248,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     FakeBackend::reset();
     Space space{};
     if (!open_space(space)
-        || space.phase() != myos::deploy::Phase::Open
+        || space.phase() != deploy::Phase::Open
         || !space.vspace_slot().valid()
         || space.vspace_slot().index != 0
         || !space.manager_slot().is_manager()
@@ -258,9 +258,34 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         return false;
     }
     return space.close() == MYOS_STATUS_OK
-        && space.phase() == myos::deploy::Phase::Closed
+        && space.phase() == deploy::Phase::Closed
         && has_call(FakeBackend::Op::ResourceClose, 5, 10, 0)
         && has_call(FakeBackend::Op::Close, 6, 10, 0);
+}
+
+[[nodiscard]] auto test_remote_drain_identity() noexcept -> bool {
+    FakeBackend::reset();
+    Space space{};
+    if (!open_space(space)) return false;
+    Owner foreign{{19, 99}}, first{{20, 12}}, second{{21, 12}};
+    if (space.can_adopt_remote(foreign) || space.adopt_remote(libk::move(foreign))
+        || !foreign || foreign.close() != MYOS_STATUS_OK
+        || !space.adopt_remote(libk::move(first)) || !space.adopt_remote(libk::move(second)))
+        return false;
+    Space moved{libk::move(space)};
+    if (moved.lookup_remote(0, 99) || moved.lookup_remote(0, 12).value() != myos::cap::CapRef{20, 12})
+        return false;
+    FakeBackend::next_close = MYOS_STATUS_BUSY;
+    if (moved.close() != MYOS_STATUS_BUSY || moved.can_adopt_remote()
+        || moved.phase() != deploy::Phase::Draining || FakeBackend::call_count != 5
+        || !has_call(FakeBackend::Op::Close, 4, 21, 12)) return false;
+    return moved.close() == MYOS_STATUS_OK
+        && has_call(FakeBackend::Op::Close, 5, 21, 12)
+        && has_call(FakeBackend::Op::Close, 6, 20, 12)
+        && has_call(FakeBackend::Op::Close, 7, 12, 0)
+        && has_call(FakeBackend::Op::Close, 8, 11, 0)
+        && has_call(FakeBackend::Op::ResourceClose, 9, 10, 0)
+        && has_call(FakeBackend::Op::Close, 10, 10, 0);
 }
 
 [[nodiscard]] auto test_creation_failures_strong_close() noexcept -> bool {
@@ -270,7 +295,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         FakeBackend::next_child = MYOS_STATUS_BUSY;
         if (space.open({1, 0}, 4096, 64, 0x100, 16, 2)
                 != MYOS_STATUS_BUSY
-            || space.phase() != myos::deploy::Phase::Closed) {
+            || space.phase() != deploy::Phase::Closed) {
             return false;
         }
     }
@@ -280,7 +305,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         FakeBackend::next_vspace = MYOS_STATUS_BUSY;
         if (space.open({1, 0}, 4096, 64, 0x100, 16, 2)
                 != MYOS_STATUS_BUSY
-            || space.phase() != myos::deploy::Phase::Closed) {
+            || space.phase() != deploy::Phase::Closed) {
             return false;
         }
     }
@@ -290,7 +315,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         FakeBackend::next_cspace = MYOS_STATUS_BUSY;
         if (space.open({1, 0}, 4096, 64, 0x100, 16, 2)
                 != MYOS_STATUS_BUSY
-            || space.phase() != myos::deploy::Phase::Closed) {
+            || space.phase() != deploy::Phase::Closed) {
             return false;
         }
     }
@@ -305,12 +330,12 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     }
     FakeBackend::next_close = MYOS_STATUS_BUSY;
     if (space.close() != MYOS_STATUS_BUSY
-        || space.phase() != myos::deploy::Phase::Draining
+        || space.phase() != deploy::Phase::Draining
         || count_calls(FakeBackend::Op::ResourceClose) != 0) {
         return false;
     }
     if (space.close() != MYOS_STATUS_OK
-        || space.phase() != myos::deploy::Phase::Closed) {
+        || space.phase() != deploy::Phase::Closed) {
         return false;
     }
 
@@ -320,9 +345,9 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
     if (partial.open({1, 0}, 4096, 64, 0x100, 16, 2)
             != MYOS_STATUS_BUSY
-        || partial.phase() != myos::deploy::Phase::ResourceClosing
+        || partial.phase() != deploy::Phase::ResourceClosing
         || partial.close() != MYOS_STATUS_OK
-        || partial.phase() != myos::deploy::Phase::Closed) {
+        || partial.phase() != deploy::Phase::Closed) {
         return false;
     }
 
@@ -332,14 +357,14 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     FakeBackend::next_close = MYOS_STATUS_BUSY;
     if (drain_failure.open({1, 0}, 4096, 64, 0x100, 16, 2)
             != MYOS_STATUS_BUSY
-        || drain_failure.phase() != myos::deploy::Phase::Draining
+        || drain_failure.phase() != deploy::Phase::Draining
         || !drain_failure.pool()
         || drain_failure.pool().value() != myos::cap::CapRef{10, 0}
         || FakeBackend::call_count != 4
         || count_calls(FakeBackend::Op::ResourceClose) != 0
         || !has_call(FakeBackend::Op::Close, 3, 11, 0)
         || drain_failure.close() != MYOS_STATUS_OK
-        || drain_failure.phase() != myos::deploy::Phase::Closed
+        || drain_failure.phase() != deploy::Phase::Closed
         || FakeBackend::call_count != 7
         || !has_call(FakeBackend::Op::Close, 4, 11, 0)
         || !has_call(FakeBackend::Op::ResourceClose, 5, 10, 0)
@@ -353,14 +378,14 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     FakeBackend::next_pool_close = MYOS_STATUS_BUSY;
     if (pool_close_failure.open({1, 0}, 4096, 64, 0x100, 16, 2)
             != MYOS_STATUS_BUSY
-        || pool_close_failure.phase() != myos::deploy::Phase::ResourceClosed
+        || pool_close_failure.phase() != deploy::Phase::ResourceClosed
         || !pool_close_failure.pool()
         || pool_close_failure.pool().value() != myos::cap::CapRef{10, 0}
         || FakeBackend::call_count != 6
         || !has_call(FakeBackend::Op::ResourceClose, 4, 10, 0)
         || !has_call(FakeBackend::Op::Close, 5, 10, 0)
         || pool_close_failure.close() != MYOS_STATUS_OK
-        || pool_close_failure.phase() != myos::deploy::Phase::Closed
+        || pool_close_failure.phase() != deploy::Phase::Closed
         || FakeBackend::call_count != 7
         || !has_call(FakeBackend::Op::Close, 6, 10, 0)) {
         return false;
@@ -373,11 +398,11 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     }
     FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
     if (resource.close() != MYOS_STATUS_BUSY
-        || resource.phase() != myos::deploy::Phase::ResourceClosing) {
+        || resource.phase() != deploy::Phase::ResourceClosing) {
         return false;
     }
     if (resource.close() != MYOS_STATUS_OK
-        || resource.phase() != myos::deploy::Phase::Closed) {
+        || resource.phase() != deploy::Phase::Closed) {
         return false;
     }
 
@@ -388,9 +413,9 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     }
     FakeBackend::next_pool_close = MYOS_STATUS_BUSY;
     if (second.close() != MYOS_STATUS_BUSY
-        || second.phase() != myos::deploy::Phase::ResourceClosed
+        || second.phase() != deploy::Phase::ResourceClosed
         || second.close() != MYOS_STATUS_OK
-        || second.phase() != myos::deploy::Phase::Closed) {
+        || second.phase() != deploy::Phase::Closed) {
         return false;
     }
     return true;
@@ -413,7 +438,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         || space.local_cumulative() != 3
         || space.lookup(*memory_slot, MYOS_OBJECT_KIND_NOTIFICATION)
         || space.lookup(
-            myos::deploy::LocalSlot{
+            deploy::LocalSlot{
                 .pool = 999, .index = memory_slot->index,
                 .kind = MYOS_OBJECT_KIND_MEMORY},
             MYOS_OBJECT_KIND_MEMORY)
@@ -431,7 +456,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
         return false;
     }
     Space moved{libk::move(space)};
-    if (space.phase() != myos::deploy::Phase::Closed
+    if (space.phase() != deploy::Phase::Closed
         || moved.lookup(*notification_slot, MYOS_OBJECT_KIND_NOTIFICATION)
             .value()
             != myos::cap::CapRef{21, 0}
@@ -440,7 +465,7 @@ static_assert(!libk::is_copy_constructible_v<Space>);
     }
     Space assigned{};
     assigned = libk::move(moved);
-    return moved.phase() == myos::deploy::Phase::Closed
+    return moved.phase() == deploy::Phase::Closed
         && assigned.lookup(
             assigned.vspace_slot(), MYOS_OBJECT_KIND_VSPACE)
         && assigned.close() == MYOS_STATUS_OK;
@@ -521,43 +546,43 @@ void put_bundle(
 [[nodiscard]] auto test_bundle_cleanup_retry() noexcept -> bool {
     FakeBackend::reset();
     Bundle bundle{};
-    const myos::deploy::Window window{
+    const deploy::Window window{
         reinterpret_cast<myos_word_t>(bundle_bytes), sizeof(bundle_bytes)};
     const myos_status_t opened = bundle.open(
         {1, 0}, {2, 0}, window, sizeof(bundle_bytes));
     if (opened != MYOS_STATUS_BAD_ARGS
-        || bundle.phase() != myos::deploy::LeasePhase::Mapped
+        || bundle.phase() != deploy::LeasePhase::Mapped
         || bundle.view() != nullptr) {
         return false;
     }
     FakeBackend::next_unmap = MYOS_STATUS_BUSY;
     if (bundle.close() != MYOS_STATUS_BUSY
-        || bundle.phase() != myos::deploy::LeasePhase::Unmapping) {
+        || bundle.phase() != deploy::LeasePhase::Unmapping) {
         return false;
     }
     FakeBackend::next_destroy = MYOS_STATUS_BUSY;
     if (bundle.close() != MYOS_STATUS_BUSY
-        || bundle.phase() != myos::deploy::LeasePhase::Destroying) {
+        || bundle.phase() != deploy::LeasePhase::Destroying) {
         return false;
     }
     FakeBackend::next_close = MYOS_STATUS_BUSY;
     if (bundle.close() != MYOS_STATUS_BUSY
-        || bundle.phase() != myos::deploy::LeasePhase::Closing) {
+        || bundle.phase() != deploy::LeasePhase::Closing) {
         return false;
     }
     return bundle.close() == MYOS_STATUS_OK
-        && bundle.phase() == myos::deploy::LeasePhase::Closed;
+        && bundle.phase() == deploy::LeasePhase::Closed;
 }
 
 [[nodiscard]] auto test_lease_create_and_map_failures() noexcept -> bool {
-    const myos::deploy::Window window{0x300000, 0x2000};
+    const deploy::Window window{0x300000, 0x2000};
 
     FakeBackend::reset();
     Bundle create_failure{};
     FakeBackend::next_region = MYOS_STATUS_BUSY;
     if (create_failure.open({1, 0}, {2, 0}, window, 0x1000)
             != MYOS_STATUS_BUSY
-        || create_failure.phase() != myos::deploy::LeasePhase::Empty
+        || create_failure.phase() != deploy::LeasePhase::Empty
         || FakeBackend::call_count != 1
         || !region_call_matches(
             0, MYOS_VM_READ, MYOS_VM_NORMAL,
@@ -571,7 +596,7 @@ void put_bundle(
     FakeBackend::next_map = MYOS_STATUS_BUSY;
     if (map_failure.open({1, 0}, {2, 0}, window, 0x1000)
             != MYOS_STATUS_BUSY
-        || map_failure.phase() != myos::deploy::LeasePhase::Ready
+        || map_failure.phase() != deploy::LeasePhase::Ready
         || map_failure.close() != MYOS_STATUS_OK
         || FakeBackend::call_count != 4
         || !has_call(FakeBackend::Op::Destroy, 2, 100, 0)
@@ -583,7 +608,7 @@ void put_bundle(
     Scratch scratch_create_failure{};
     FakeBackend::next_region = MYOS_STATUS_BUSY;
     if (scratch_create_failure.open({1, 0}, window) != MYOS_STATUS_BUSY
-        || scratch_create_failure.phase() != myos::deploy::LeasePhase::Empty
+        || scratch_create_failure.phase() != deploy::LeasePhase::Empty
         || !region_call_matches(
             0, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY)) {
@@ -598,7 +623,7 @@ void put_bundle(
     FakeBackend::next_map = MYOS_STATUS_BUSY;
     if (scratch_map_failure.map({2, 0}, 0, 0x1000, MYOS_VM_READ)
             != MYOS_STATUS_BUSY
-        || scratch_map_failure.phase() != myos::deploy::LeasePhase::Ready
+        || scratch_map_failure.phase() != deploy::LeasePhase::Ready
         || scratch_map_failure.close() != MYOS_STATUS_OK
         || FakeBackend::call_count != 4) {
         return false;
@@ -610,7 +635,7 @@ void put_bundle(
 [[nodiscard]] auto test_pending_cleanup_is_committed() noexcept -> bool {
     FakeBackend::reset();
     Bundle bundle{};
-    const myos::deploy::Window window{
+    const deploy::Window window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x1000};
     const size_t bundle_size = make_valid_bundle();
     if (bundle.open({1, 0}, {2, 0}, window, bundle_size)
@@ -621,7 +646,7 @@ void put_bundle(
     FakeBackend::next_unmap = MYOS_STATUS_PENDING;
     FakeBackend::next_destroy = MYOS_STATUS_PENDING;
     if (bundle.close() != MYOS_STATUS_OK
-        || bundle.phase() != myos::deploy::LeasePhase::Closed
+        || bundle.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 5
         || !has_call(FakeBackend::Op::Unmap, 2, 100, 0)
         || !has_call(FakeBackend::Op::Destroy, 3, 100, 0)
@@ -632,7 +657,7 @@ void put_bundle(
 }
 
 [[nodiscard]] auto test_pending_phase_retries() noexcept -> bool {
-    const myos::deploy::Window bundle_window{
+    const deploy::Window bundle_window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x1000};
 
     FakeBackend::reset();
@@ -644,7 +669,7 @@ void put_bundle(
     FakeBackend::next_unmap = MYOS_STATUS_PENDING;
     FakeBackend::next_destroy = MYOS_STATUS_BUSY;
     if (bundle.close() != MYOS_STATUS_BUSY
-        || bundle.phase() != myos::deploy::LeasePhase::Destroying
+        || bundle.phase() != deploy::LeasePhase::Destroying
         || bundle.view() != nullptr
         || FakeBackend::call_count != 4
         || count_calls(FakeBackend::Op::Unmap) != 1
@@ -654,7 +679,7 @@ void put_bundle(
         return false;
     }
     if (bundle.close() != MYOS_STATUS_OK
-        || bundle.phase() != myos::deploy::LeasePhase::Closed
+        || bundle.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 6
         || count_calls(FakeBackend::Op::Unmap) != 1
         || count_calls(FakeBackend::Op::Destroy) != 2
@@ -675,12 +700,12 @@ void put_bundle(
     FakeBackend::next_destroy = MYOS_STATUS_PENDING;
     FakeBackend::next_close = MYOS_STATUS_BUSY;
     if (close_retry.close() != MYOS_STATUS_BUSY
-        || close_retry.phase() != myos::deploy::LeasePhase::Closing
+        || close_retry.phase() != deploy::LeasePhase::Closing
         || FakeBackend::call_count != 5) {
         return false;
     }
     if (close_retry.close() != MYOS_STATUS_OK
-        || close_retry.phase() != myos::deploy::LeasePhase::Closed
+        || close_retry.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 6
         || count_calls(FakeBackend::Op::Unmap) != 1
         || count_calls(FakeBackend::Op::Destroy) != 1
@@ -697,7 +722,7 @@ void put_bundle(
     FakeBackend::next_unmap = MYOS_STATUS_PENDING;
     FakeBackend::next_destroy = MYOS_STATUS_BUSY;
     if (scratch.close() != MYOS_STATUS_BUSY
-        || scratch.phase() != myos::deploy::LeasePhase::Destroying
+        || scratch.phase() != deploy::LeasePhase::Destroying
         || FakeBackend::call_count != 4
         || count_calls(FakeBackend::Op::Unmap) != 1
         || count_calls(FakeBackend::Op::Destroy) != 1
@@ -705,7 +730,7 @@ void put_bundle(
         return false;
     }
     if (scratch.close() != MYOS_STATUS_OK
-        || scratch.phase() != myos::deploy::LeasePhase::Closed
+        || scratch.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 6
         || count_calls(FakeBackend::Op::Unmap) != 1
         || count_calls(FakeBackend::Op::Destroy) != 2
@@ -725,10 +750,10 @@ void put_bundle(
     FakeBackend::next_destroy = MYOS_STATUS_PENDING;
     FakeBackend::next_close = MYOS_STATUS_BUSY;
     if (scratch_close_retry.close() != MYOS_STATUS_BUSY
-        || scratch_close_retry.phase() != myos::deploy::LeasePhase::Closing
+        || scratch_close_retry.phase() != deploy::LeasePhase::Closing
         || FakeBackend::call_count != 5
         || scratch_close_retry.close() != MYOS_STATUS_OK
-        || scratch_close_retry.phase() != myos::deploy::LeasePhase::Closed
+        || scratch_close_retry.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 6
         || count_calls(FakeBackend::Op::Unmap) != 1
         || count_calls(FakeBackend::Op::Destroy) != 1
@@ -743,7 +768,7 @@ void put_bundle(
     FakeBackend::reset();
     Bundle bundle{};
     const size_t bundle_size = make_valid_bundle();
-    const myos::deploy::Window window{
+    const deploy::Window window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x1000};
     if (bundle.open({1, 0}, {2, 0}, window, bundle_size)
             != MYOS_STATUS_OK
@@ -752,15 +777,15 @@ void put_bundle(
     }
     FakeBackend::next_unmap = MYOS_STATUS_BUSY;
     if (bundle.close() != MYOS_STATUS_BUSY
-        || bundle.phase() != myos::deploy::LeasePhase::Unmapping
+        || bundle.phase() != deploy::LeasePhase::Unmapping
         || bundle.view() != nullptr) {
         return false;
     }
     Bundle moved{libk::move(bundle)};
-    if (bundle.phase() != myos::deploy::LeasePhase::Empty
-        || moved.phase() != myos::deploy::LeasePhase::Unmapping
+    if (bundle.phase() != deploy::LeasePhase::Empty
+        || moved.phase() != deploy::LeasePhase::Unmapping
         || moved.close() != MYOS_STATUS_OK
-        || moved.phase() != myos::deploy::LeasePhase::Closed) {
+        || moved.phase() != deploy::LeasePhase::Closed) {
         return false;
     }
 
@@ -773,17 +798,17 @@ void put_bundle(
     }
     FakeBackend::next_unmap = MYOS_STATUS_BUSY;
     if (scratch.close() != MYOS_STATUS_BUSY
-        || scratch.phase() != myos::deploy::LeasePhase::Unmapping) {
+        || scratch.phase() != deploy::LeasePhase::Unmapping) {
         return false;
     }
     Scratch scratch_moved{libk::move(scratch)};
-    return scratch_moved.phase() == myos::deploy::LeasePhase::Unmapping
+    return scratch_moved.phase() == deploy::LeasePhase::Unmapping
         && scratch_moved.close() == MYOS_STATUS_OK
-        && scratch_moved.phase() == myos::deploy::LeasePhase::Closed;
+        && scratch_moved.phase() == deploy::LeasePhase::Closed;
 }
 
 [[nodiscard]] auto test_move_assignment_preserves_cleanup() noexcept -> bool {
-    const myos::deploy::Window bundle_window{
+    const deploy::Window bundle_window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x1000};
 
     FakeBackend::reset();
@@ -794,19 +819,19 @@ void put_bundle(
     }
     FakeBackend::next_unmap = MYOS_STATUS_BUSY;
     if (source.close() != MYOS_STATUS_BUSY
-        || source.phase() != myos::deploy::LeasePhase::Unmapping) {
+        || source.phase() != deploy::LeasePhase::Unmapping) {
         return false;
     }
     Bundle target{};
     target = libk::move(source);
-    if (source.phase() != myos::deploy::LeasePhase::Empty
-        || target.phase() != myos::deploy::LeasePhase::Unmapping
+    if (source.phase() != deploy::LeasePhase::Empty
+        || target.phase() != deploy::LeasePhase::Unmapping
         || target.view() != nullptr
         || FakeBackend::call_count != 3) {
         return false;
     }
     if (target.close() != MYOS_STATUS_OK
-        || target.phase() != myos::deploy::LeasePhase::Closed
+        || target.phase() != deploy::LeasePhase::Closed
         || FakeBackend::call_count != 6
         || count_calls(FakeBackend::Op::Unmap) != 2
         || count_calls(FakeBackend::Op::Destroy) != 1
@@ -827,18 +852,18 @@ void put_bundle(
     }
     FakeBackend::next_unmap = MYOS_STATUS_BUSY;
     if (scratch_source.close() != MYOS_STATUS_BUSY
-        || scratch_source.phase() != myos::deploy::LeasePhase::Unmapping) {
+        || scratch_source.phase() != deploy::LeasePhase::Unmapping) {
         return false;
     }
     Scratch scratch_target{};
     scratch_target = libk::move(scratch_source);
-    if (scratch_source.phase() != myos::deploy::LeasePhase::Empty
-        || scratch_target.phase() != myos::deploy::LeasePhase::Unmapping
+    if (scratch_source.phase() != deploy::LeasePhase::Empty
+        || scratch_target.phase() != deploy::LeasePhase::Unmapping
         || FakeBackend::call_count != 3) {
         return false;
     }
     return scratch_target.close() == MYOS_STATUS_OK
-        && scratch_target.phase() == myos::deploy::LeasePhase::Closed
+        && scratch_target.phase() == deploy::LeasePhase::Closed
         && FakeBackend::call_count == 6
         && count_calls(FakeBackend::Op::Unmap) == 2
         && count_calls(FakeBackend::Op::Destroy) == 1
@@ -872,7 +897,7 @@ void put_bundle(
         return false;
     }
     return scratch.close() == MYOS_STATUS_OK
-        && scratch.phase() == myos::deploy::LeasePhase::Closed;
+        && scratch.phase() == deploy::LeasePhase::Closed;
 }
 
 [[nodiscard]] auto test_lease_destructor_fault() noexcept -> bool {
@@ -891,13 +916,13 @@ void put_bundle(
 }
 
 [[nodiscard]] auto test_window_checks() noexcept -> bool {
-    using myos::deploy::Window;
+    using deploy::Window;
     if (Window{0x1001, 0x1000}.valid()
         || Window{0x1000, 0x1001}.valid()
         || Window{~myos_word_t{} - 0xfff, 0x2000}.valid()
-        || !myos::deploy::windows_disjoint(
+        || !deploy::windows_disjoint(
             Window{0x1000, 0x1000}, Window{0x2000, 0x1000})
-        || myos::deploy::windows_disjoint(
+        || deploy::windows_disjoint(
             Window{0x1000, 0x2000}, Window{0x2000, 0x1000})) {
         return false;
     }
@@ -934,6 +959,7 @@ struct Test final {
 
 constexpr Test tests[] = {
     {"TaskSpace lifecycle", test_taskspace_lifecycle},
+    {"remote CSpace identity/move/failed drain", test_remote_drain_identity},
     {"creation failures strong close", test_creation_failures_strong_close},
     {"resource close retry", test_resource_close_retry},
     {"typed slot tombstone/move", test_slot_identity_tombstone_and_move},

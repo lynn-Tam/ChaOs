@@ -152,8 +152,8 @@ namespace {
         auto minted = invocation.cspace.delegate(
             source,
             destination,
-            cap::GrantCeiling{*rights, data},
-            cap::CapView{*rights, data});
+            cap::Authority{*rights, data},
+            cap::Authority{*rights, data});
         return returned(
             minted ? MYOS_STATUS_OK : cap_status(minted.error()),
             minted ? minted.value().raw() : 0);

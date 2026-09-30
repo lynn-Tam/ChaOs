@@ -1,8 +1,8 @@
-#include <user/lib/imports.hpp>
-#include <user/lib/console.hpp>
-#include <user/lib/service.hpp>
-#include <user/lib/stream.hpp>
-#include <user/lib/uart.hpp>
+#include <user/abi/startup.hpp>
+#include <user/server_rt/console.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/ipc/channel.hpp>
+#include <servers/uart/port.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;

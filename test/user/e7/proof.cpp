@@ -1,7 +1,6 @@
 #include <test/user/e7/protocol.hpp>
-#include <user/lib/bootstrap.hpp>
-#include <user/lib/context.hpp>
-#include <user/lib/syscall.hpp>
+#include <user/abi/startup.hpp>
+#include <user/abi/calls.hpp>
 #include <uapi/bootstrap.h>
 /*luna change: expose the registered pager descriptor to the proof worker, reason: pager_claim/supply validation is part of the userspace ABI evidence*/
 #include <uapi/pager.h>

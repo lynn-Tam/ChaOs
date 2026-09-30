@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <arch/io_page_table.hpp>
 #include <arch/iommu.hpp>
 #include <arch/pci.hpp>
@@ -11,8 +12,8 @@ namespace kernel::io {
 class Device;
 
 struct DeviceInfo final {
-    libk::Array<u32, 64> configuration{};
-    libk::Array<usize, 6> bar_sizes{};
+    std::array<u32, 64> configuration{};
+    std::array<usize, 6> bar_sizes{};
     u16 requester{};
 };
 
@@ -31,10 +32,10 @@ public:
     ~DeviceLease() noexcept;
 
     [[nodiscard]] auto state() const noexcept -> State { return state_; }
-    [[nodiscard]] auto bars() const noexcept -> const libk::Array<arch::PciBar, 6>&;
+    [[nodiscard]] auto bars() const noexcept -> const std::array<arch::PciBar, 6>&;
     [[nodiscard]] auto config32(u16 offset) const noexcept -> u32;
     [[nodiscard]] auto irq_source() const noexcept -> u32;
-    [[nodiscard]] auto configuration() const noexcept -> const libk::Array<u32, 64>&;
+    [[nodiscard]] auto configuration() const noexcept -> const std::array<u32, 64>&;
     [[nodiscard]] auto take_fault() noexcept -> libk::optional<arch::IoFault>;
     // Transfers table ownership before publishing the context. Failure after
     // publication cannot return the tables or release the device reservation.

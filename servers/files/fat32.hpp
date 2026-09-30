@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <uapi/status.h>
+#include <user/ipc/io.hpp>
 
 namespace myos::files::fat32 {
 
@@ -64,13 +64,6 @@ struct File final {
     char name[13]{};
     uint32_t size{};
     uint32_t first{}; // index into the mount's immutable cluster array
-};
-
-struct Extent final {
-    uint64_t offset{}; // sector-aligned backend read
-    size_t size{};
-    size_t skip{};
-    size_t bytes{};   // authorized file bytes within that read
 };
 
 // The owner supplies mount-lifetime storage sized from validated geometry.
@@ -159,7 +152,7 @@ public:
 
     // Caller has resolved the file index and bounded length by its size.
     // Coalesce adjacent clusters, keeping each downstream read within 4 KiB.
-    [[nodiscard]] auto extent(size_t file_index, uint64_t offset, size_t length) const noexcept -> Extent {
+    [[nodiscard]] auto extent(size_t file_index, uint64_t offset, size_t length) const noexcept -> io::extent {
         const auto& file = files_[file_index];
         if (offset >= file.size || length == 0) return {};
         const size_t ordinal = offset / geometry_.cluster_bytes;

@@ -1,17 +1,17 @@
-#include <user/lib/store_client.hpp>
+#include <sys/storage.h>
+#include <sys/status.h>
+#include <libk/parse.hpp>
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
-    const auto info = service::bootstrap(address, size);
-    if (info.argument_count() != 1 && info.argument_count() != 2) exit(MYOS_STATUS_BAD_ARGS);
-    uint8_t id[store::VolumeIdSize]{};
-    const bool identified = info.argument_count() == 2;
-    if (identified && !store::parse_volume_id(info.argument(1),
-        service::length(info.argument(1)), id)) exit(MYOS_STATUS_BAD_ARGS);
-    store::Client storage;
-    auto status = storage.connect(info, bootstrap::imports::StoreAdmin);
-    if (status == MYOS_STATUS_OK) status = storage.format(identified ? id : nullptr);
-    const auto closed = storage.close();
-    if (status == MYOS_STATUS_OK) status = closed;
-    exit(status);
+int main(int argc, char** argv) {
+    if (argc == 1) return format_volume(nullptr, 0);
+    if (argc != 2) return invalid;
+    const std::string_view text = argv[1];
+    if (text.size() != 32) return invalid;
+    uint8_t id[16];
+    for (unsigned i = 0; i < sizeof(id); ++i) {
+        const auto byte = libk::parse<uint8_t>(text.substr(2 * i, 2), 16);
+        if (!byte) return invalid;
+        id[i] = *byte;
+    }
+    return format_volume(id, sizeof(id));
 }

@@ -202,7 +202,7 @@ auto GrantLease::kind() const noexcept -> object::ObjectKind {
     return static_cast<const GrantGraph::Node*>(node_)->target.kind();
 }
 
-auto GrantLease::ceiling() const noexcept -> GrantCeiling {
+auto GrantLease::ceiling() const noexcept -> Authority {
     KASSERT(graph_ != nullptr);
     return static_cast<const GrantGraph::Node*>(node_)->ceiling;
 }
@@ -224,7 +224,7 @@ auto GrantLease::attach(GrantAttachment& attachment) const noexcept
 auto GrantLease::derive_region(
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     RegionDerivation proof) const noexcept
     -> libk::Expected<GrantRef, GrantError> {
     if (graph_ == nullptr) {
@@ -237,7 +237,7 @@ auto GrantLease::derive_region(
 auto GrantLease::derive_tunnel_tx(
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     TunnelConnectProof proof) const noexcept
     -> libk::Expected<GrantRef, GrantError> {
     if (graph_ == nullptr) {
@@ -250,7 +250,7 @@ auto GrantLease::derive_tunnel_tx(
 auto GrantLease::derive_channel_badge(
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     ChannelBadgeDerivation proof) const noexcept
     -> libk::Expected<GrantRef, GrantError> {
     if (graph_ == nullptr) {
@@ -422,14 +422,14 @@ GrantGraph::~GrantGraph() noexcept {
 
 auto GrantGraph::create_root(
     object::ObjectRef&& target,
-    GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
+    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
     return create_root({}, libk::move(target), ceiling);
 }
 
 auto GrantGraph::create_root(
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
+    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
     if (!target || !validate_ceiling(target.kind(), ceiling)) {
         return libk::unexpected(GrantError::RightsViolation);
     }
@@ -441,7 +441,7 @@ auto GrantGraph::create_allocation(
     kernel::resource::Permit& permit,
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling) noexcept
+    Authority ceiling) noexcept
     -> libk::Expected<kernel::resource::AllocationTxn, GrantError> {
     if (!permit || !target) {
         return libk::unexpected(GrantError::InvalidState);
@@ -479,7 +479,7 @@ auto GrantGraph::create_allocation(
 auto GrantGraph::derive(
     const GrantLease& source,
     object::ObjectRef&& target,
-    GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
+    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
     return derive({}, source, libk::move(target), ceiling);
 }
 
@@ -487,7 +487,7 @@ auto GrantGraph::derive(
     kernel::resource::Reservation&& charge,
     const GrantLease& source,
     object::ObjectRef&& target,
-    GrantCeiling ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
+    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
     if (source.graph_ != this || !target) {
         return libk::unexpected(GrantError::InvalidKey);
     }
@@ -498,7 +498,7 @@ auto GrantGraph::derive(
     if (!validate_ceiling(target.kind(), ceiling)
         || !attenuates(
             target.kind(),
-            EffectiveAuthority{
+            Authority{
                 parent->ceiling.rights, parent->ceiling.data},
             ceiling)) {
         return libk::unexpected(GrantError::RightsViolation);
@@ -511,7 +511,7 @@ auto GrantGraph::derive_region(
     kernel::resource::Reservation&& charge,
     const GrantLease& source,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     RegionDerivation proof) noexcept
     -> libk::Expected<GrantRef, GrantError> {
     if (source.graph_ != this || !target
@@ -545,7 +545,7 @@ auto GrantGraph::derive_tunnel_tx(
     kernel::resource::Reservation&& charge,
     const GrantLease& source,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     TunnelConnectProof proof) noexcept
     -> libk::Expected<GrantRef, GrantError> {
     const Rights connect = Rights::of(Right::Connect);
@@ -574,7 +574,7 @@ auto GrantGraph::derive_channel_badge(
     kernel::resource::Reservation&& charge,
     const GrantLease& source,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     ChannelBadgeDerivation proof) noexcept
     -> libk::Expected<GrantRef, GrantError> {
     if (source.graph_ != this || !target
@@ -611,7 +611,7 @@ auto GrantGraph::derive_channel_badge(
 auto GrantGraph::create(
     kernel::resource::Reservation&& charge,
     object::ObjectRef&& target,
-    GrantCeiling ceiling,
+    Authority ceiling,
     Node* parent) noexcept -> libk::Expected<GrantRef, GrantError> {
     auto claimed = claim_slot();
     if (!claimed) {

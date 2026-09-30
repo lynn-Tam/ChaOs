@@ -124,12 +124,12 @@ constexpr kernel::mm::VirtAddr root_stack_address{
     auto grant = kernel.grants().create_root(
         libk::move(charge),
         libk::move(object),
-        kernel::cap::GrantCeiling{rights, authority});
+        kernel::cap::Authority{rights, authority});
     if (!grant) {
         return libk::unexpected(RootTaskError::CapabilityFailed);
     }
     auto cap = cspace.insert(
-        libk::move(grant).value(), kernel::cap::CapView{rights, authority});
+        libk::move(grant).value(), kernel::cap::Authority{rights, authority});
     return cap
         ? libk::Expected<kernel::cap::CapHandle, RootTaskError>{
               libk::expected(cap.value())}

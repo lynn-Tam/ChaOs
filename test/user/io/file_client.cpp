@@ -1,5 +1,6 @@
-#include <user/lib/imports.hpp>
-#include <user/lib/file_protocol.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/startup.hpp>
+#include <user/ipc/storage.hpp>
 #include <uapi/test_scenario.h>
 
 namespace {

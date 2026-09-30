@@ -1,5 +1,6 @@
 #include <test/scenario.hpp>
 
+#include <array>
 #include <core/kernel_state.hpp>
 #include <cpu/cpu_runtime.hpp>
 #include <diag/console.hpp>
@@ -27,11 +28,11 @@ void write(usize address, T value) noexcept {
 struct SectorRing final { usize ram{}; usize isr{}; };
 struct SpaceFunction final {
     io::DeviceInfo info{};
-    libk::Array<arch::PciBar, 6> regions{};
+    std::array<arch::PciBar, 6> regions{};
     [[nodiscard]] auto config32(u16 offset) const noexcept -> u32 {
         return info.configuration[offset / 4];
     }
-    [[nodiscard]] auto bars() const noexcept -> const libk::Array<arch::PciBar, 6>& {
+    [[nodiscard]] auto bars() const noexcept -> const std::array<arch::PciBar, 6>& {
         return regions;
     }
 };
@@ -302,8 +303,8 @@ struct CaseBinding final {
     auto device_ref = kernel.io_platform().reference();
     auto memory_ref = memory.ref();
     KASSERT(device_ref && memory_ref);
-    const cap::GrantCeiling dc{cap::Rights::of(cap::Right::Connect)};
-    const cap::GrantCeiling mc{cap::Rights::of(cap::Right::Map),
+    const cap::Authority dc{cap::Rights::of(cap::Right::Connect)};
+    const cap::Authority mc{cap::Rights::of(cap::Right::Map),
         cap::MemoryAuthority{{0, PageCount}, Access, mm::MemoryTypes::of(mm::MemoryType::Normal)}};
     auto dg = graph.create_root(libk::move(device_ref).value(), dc);
     auto mg = graph.create_root(libk::move(memory_ref).value(), mc);

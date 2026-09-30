@@ -371,7 +371,7 @@ auto Endpoint::call(
         || dispatcher.current().thread() != &caller) {
         return libk::unexpected(EndpointError::InvalidCaller);
     }
-    const cap::EffectiveAuthority effective = authority.authority();
+    const cap::Authority effective = authority.authority();
     const auto* const endpoint_authority =
         libk::get_if<cap::EndpointAuthority>(&effective.data);
     if (endpoint_authority == nullptr || !endpoint_authority->callable()

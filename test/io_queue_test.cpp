@@ -1,4 +1,4 @@
-#include <user/lib/io_queue.hpp>
+#include <user/ipc/io.hpp>
 
 #include <cstdio>
 
@@ -61,16 +61,16 @@ auto cancellation_and_close() -> bool {
     if (session.client.submit(request) != Result::Ready || !session.client.publish()) return false;
     Ticket ticket{}, cancelled{};
     if (session.server.admit(ticket) != Admission::Ready
-        || !session.server.cancel(request.id, cancelled)
+        || session.server.cancel(request.id, cancelled) != MYOS_STATUS_OK
         || cancelled.id != ticket.id || cancelled.slot != ticket.slot
-        || !session.server.cancelled(ticket)) return false;
+        || !session.server.cancelled(ticket) || session.server.commit(ticket)) return false;
     // Receipt of cancellation has not ended the borrow or produced a result.
     Completion completion{};
     if (session.server.active() != 1 || session.server.request(ticket) == nullptr
         || session.client.take(completion) != Result::Empty) return false;
     if (!session.server.finish(ticket, MYOS_STATUS_CANCELED, 0)
         || !session.server.publish()
-        || session.server.cancel(request.id, cancelled)
+        || session.server.cancel(request.id, cancelled) != MYOS_STATUS_NOT_FOUND
         || session.server.finish(ticket, 0, 4096)) return false;
     if (session.client.take(completion) != Result::Ready
         || completion.id != request.id || completion.status != MYOS_STATUS_CANCELED)
@@ -78,7 +78,10 @@ auto cancellation_and_close() -> bool {
     if (!session.client.release() || !session.server.release()) return false;
     if (session.client.submit(request) != Result::Ready || !session.client.publish()
         || session.server.admit(cancelled) != Admission::Ready) return false;
-    if (session.server.request(ticket) != nullptr || session.server.abandon(cancelled)) return false;
+    if (session.server.request(ticket) != nullptr || session.server.abandon(cancelled)
+        || !session.server.commit(cancelled)
+        || session.server.cancel(request.id, ticket) != MYOS_STATUS_BUSY
+        || session.server.cancelled(cancelled)) return false;
     session.server.stop();
     Ticket ignored{};
     return session.server.admit(ignored) == Admission::Closed
@@ -105,6 +108,34 @@ auto hostile_session() -> bool {
     return session.server.admit(duplicate) == Admission::InvalidPeer
         && session.server.admit(duplicate) == Admission::Closed;
 }
+
+auto buffered_requests() -> bool {
+    Session session{};
+    std::array<uint8_t, PayloadSize> payload{};
+    requests transfers{session.client, payload.data(), payload.data()};
+    uint8_t data[8]{}, value = 'W';
+    Request write{.operation = static_cast<uint64_t>(Operation::Write), .length = 1};
+    Request read{.operation = static_cast<uint64_t>(Operation::Read), .length = sizeof(data)};
+    if (transfers.submit(write, &value, true) || transfers.submit(read, data)
+        || write.buffer_offset == read.buffer_offset || payload[write.buffer_offset] != value
+        || !session.client.publish()) return false;
+    Ticket a{}, b{};
+    if (session.server.admit(a) != Admission::Ready || session.server.admit(b) != Admission::Ready)
+        return false;
+    payload[read.buffer_offset] = 'R';
+    if (!session.server.finish(b, 0, 1) || !session.server.finish(a, 0, 1)
+        || !session.server.publish()) return false;
+    Completion result{};
+    if (transfers.take(result, write.id) || result.id != write.id || result.bytes != 1
+        || transfers.contains(write.id) || !transfers.contains(read.id)
+        || transfers.take(result) || result.id != read.id || result.bytes != 1
+        || data[0] != 'R' || data[1] != 0 || transfers.next()) return false;
+    if (!session.client.release() || !session.server.release()) return false;
+    if (transfers.submit(read, data) || transfers.fail(MYOS_STATUS_PEER_FAULT) != MYOS_STATUS_PEER_FAULT
+        || transfers.take(result) || result.id != read.id || result.status != MYOS_STATUS_PEER_FAULT
+        || transfers.submit(write, &value) != MYOS_STATUS_PEER_FAULT) return false;
+    return !transfers.next();
+}
 } // namespace
 
 int main() {
@@ -118,6 +149,7 @@ int main() {
     check("completion credits and out-of-order results", completion_credits());
     check("cancellation, stale tickets and drained close", cancellation_and_close());
     check("hostile descriptor mutation and duplicate IDs", hostile_session());
-    std::printf("io-queue: %u passed, %u failed\n", 3 - failed, failed);
+    check("buffer slots, short reads, retained results and terminal failure", buffered_requests());
+    std::printf("io-queue: %u passed, %u failed\n", 4 - failed, failed);
     return failed == 0 ? 0 : 1;
 }

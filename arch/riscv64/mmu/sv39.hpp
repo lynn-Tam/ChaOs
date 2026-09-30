@@ -5,7 +5,7 @@
 
 #include <libk/optional.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/array.hpp>
+#include <array>
 #include <libk/assert.hpp>
 #include <mm/addr.hpp>
 
@@ -285,7 +285,7 @@ private:
     ~TablePage() noexcept = default;
 
     /* 8 byte * 512 = 4K 页 */
-    libk::Array<Pte, ptes_per_pg> entries_;
+    std::array<Pte, ptes_per_pg> entries_;
 };
 static_assert(sizeof(TablePage) == kernel::mm::page_size);
 static_assert(alignof(TablePage) == kernel::mm::page_size);

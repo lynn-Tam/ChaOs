@@ -1,4 +1,5 @@
-#include <user/lib/file_client.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/ipc/storage.hpp>
 #include "file_fault.hpp"
 
 namespace { myos::files::Client filesystem; }

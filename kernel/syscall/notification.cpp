@@ -40,7 +40,7 @@ namespace {
     if (!notification) {
         return returned(cap_status(notification.error()));
     }
-    const cap::EffectiveAuthority effective =
+    const cap::Authority effective =
         notification.value().authority();
     const auto* const authority = libk::get_if<cap::NotificationAuthority>(
         &effective.data);

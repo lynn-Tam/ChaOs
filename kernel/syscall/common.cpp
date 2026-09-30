@@ -65,7 +65,7 @@ auto read_snapshot_bytes(
         return libk::unexpected(cap_status(resolved.error()));
     }
     auto& source = resolved.value();
-    const cap::EffectiveAuthority effective = source.authority();
+    const cap::Authority effective = source.authority();
     const auto* const authority = libk::get_if<cap::MemoryAuthority>(
         &effective.data);
     const auto end = libk::checked_add(offset, destination.size());

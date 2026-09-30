@@ -138,7 +138,7 @@ auto VSpace::create_region(
     if (&source.object() != this) {
         return libk::unexpected(VSpaceError::InvalidAuthority);
     }
-    const cap::EffectiveAuthority effective = source.authority();
+    const cap::Authority effective = source.authority();
     const auto* const parent_authority =
         libk::get_if<cap::VSpaceAuthority>(&effective.data);
     if (parent_authority == nullptr
@@ -192,8 +192,8 @@ auto VSpace::create_region(
         .access = policy.access,
         .types = policy.types,
     };
-    const cap::GrantCeiling ceiling{child_rights, child_authority};
-    const cap::CapView child_view{child_rights, child_authority};
+    const cap::Authority ceiling{child_rights, child_authority};
+    const cap::Authority child_view{child_rights, child_authority};
     auto composed = cap::compose(
         object::ObjectKind::VSpace, ceiling, child_view);
     if (!composed) {

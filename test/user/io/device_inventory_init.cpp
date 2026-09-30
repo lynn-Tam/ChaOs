@@ -1,6 +1,6 @@
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/service.hpp>
-#include <user/lib/uart.hpp>
+#include <user/abi/objects.hpp>
+#include <user/server_rt/service.hpp>
+#include <servers/uart/port.hpp>
 #include <uapi/io.h>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {

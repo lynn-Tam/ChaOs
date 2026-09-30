@@ -1,8 +1,9 @@
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/objects.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/uart/port.hpp>
 
-namespace { myos::deploy::Program program; myos::deploy::Supervisor<2> supervisor; }
+namespace { deploy::program program; deploy::tasks<2> supervisor; }
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;

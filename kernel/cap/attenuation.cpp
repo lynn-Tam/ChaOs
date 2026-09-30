@@ -160,9 +160,9 @@ auto attenuation_kind(u16 raw) noexcept
 
 auto make_attenuation_ceiling(
     object::ObjectKind kind,
-    const EffectiveAuthority& source,
+    const Authority& source,
     const Attenuation& descriptor) noexcept
-    -> libk::Expected<GrantCeiling, AttenuationError> {
+    -> libk::Expected<Authority, AttenuationError> {
     const auto source_kind = attenuation_kind(descriptor.kind);
     if (!source_kind || *source_kind != kind) {
         return libk::unexpected(AttenuationError::InvalidKind);
@@ -184,7 +184,7 @@ auto make_attenuation_ceiling(
         if (!words_zero(descriptor, 0)) {
             return libk::unexpected(AttenuationError::InvalidWord);
         }
-        return libk::expected(GrantCeiling{child_rights, libk::monostate{}});
+        return libk::expected(Authority{child_rights, libk::monostate{}});
 
     case object::ObjectKind::MemoryObject: {
         if (!words_zero(descriptor, 4)) {
@@ -201,7 +201,7 @@ auto make_attenuation_ceiling(
             || !range.end()) {
             return libk::unexpected(AttenuationError::InvalidRange);
         }
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights,
             MemoryAuthority{range, *access, *types}});
     }
@@ -226,7 +226,7 @@ auto make_attenuation_ceiling(
         if (!range.valid() || range.empty()) {
             return libk::unexpected(AttenuationError::InvalidRange);
         }
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights,
             VSpaceAuthority{upper->region, range, *access, *types}});
     }
@@ -235,7 +235,7 @@ auto make_attenuation_ceiling(
         if (!words_zero(descriptor, 3)) {
             return libk::unexpected(AttenuationError::InvalidWord);
         }
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights,
             ResourcePoolAuthority{
                 kernel::resource::Budget{
@@ -250,10 +250,10 @@ auto make_attenuation_ceiling(
         const auto* const upper =
             libk::get_if<NotificationAuthority>(&source.data);
         return upper == nullptr
-            ? libk::Expected<GrantCeiling, AttenuationError>{
+            ? libk::Expected<Authority, AttenuationError>{
                   libk::unexpected(AttenuationError::InvalidData)}
-            : libk::Expected<GrantCeiling, AttenuationError>{libk::expected(
-                  GrantCeiling{child_rights, *upper})};
+            : libk::Expected<Authority, AttenuationError>{libk::expected(
+                  Authority{child_rights, *upper})};
     }
 
     case object::ObjectKind::Irq: {
@@ -262,10 +262,10 @@ auto make_attenuation_ceiling(
         }
         const auto* const upper = libk::get_if<IrqAuthority>(&source.data);
         return upper == nullptr
-            ? libk::Expected<GrantCeiling, AttenuationError>{
+            ? libk::Expected<Authority, AttenuationError>{
                   libk::unexpected(AttenuationError::InvalidData)}
-            : libk::Expected<GrantCeiling, AttenuationError>{libk::expected(
-                  GrantCeiling{child_rights, *upper})};
+            : libk::Expected<Authority, AttenuationError>{libk::expected(
+                  Authority{child_rights, *upper})};
     }
 
     case object::ObjectKind::Endpoint: {
@@ -278,7 +278,7 @@ auto make_attenuation_ceiling(
         if (!cap_limit) {
             return libk::unexpected(AttenuationError::InvalidData);
         }
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights,
             EndpointAuthority{
                 descriptor.words[0], descriptor.words[1],
@@ -300,7 +300,7 @@ auto make_attenuation_ceiling(
         }
         const auto side = descriptor.words[0] == MYOS_CAP_CHANNEL_SIDE_A
             ? ChannelSide::A : ChannelSide::B;
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights,
             ChannelAuthority{side, descriptor.words[1], descriptor.words[2]}});
     }
@@ -315,7 +315,7 @@ auto make_attenuation_ceiling(
             || upper->backing_key == 0) {
             return libk::unexpected(AttenuationError::InvalidData);
         }
-        return libk::expected(GrantCeiling{
+        return libk::expected(Authority{
             child_rights, PagerAuthority{upper->backing_key, *max_pages}});
     }
 

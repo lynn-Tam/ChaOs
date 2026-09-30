@@ -1,8 +1,9 @@
-#include <user/lib/mapped_memory.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/objects.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/uart/port.hpp>
 
-namespace { myos::deploy::Program program;
+namespace { deploy::program program;
 #ifdef MYOS_TEST_FILE_FAILURE
 constexpr size_t TaskCount = 4;
 constexpr myos_status_t ExpectedStatus = MYOS_STATUS_PEER_FAULT;
@@ -10,7 +11,7 @@ constexpr myos_status_t ExpectedStatus = MYOS_STATUS_PEER_FAULT;
 constexpr size_t TaskCount = 3;
 constexpr myos_status_t ExpectedStatus = MYOS_STATUS_OK;
 #endif
-myos::deploy::Supervisor<TaskCount> supervisor;
+deploy::tasks<TaskCount> supervisor;
 }
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
@@ -42,7 +43,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::require(supervisor.add(sources[i][1], pair.value2, MYOS_OBJECT_KIND_CHANNEL, rights, 1));
     }
     constexpr const char* names[] = {"block", "files", "file-client", "file-client"};
-    deploy::Supervisor<TaskCount>::Handle ids[TaskCount]{};
+    deploy::tasks<TaskCount>::handle ids[TaskCount]{};
     bool finished[TaskCount]{};
     size_t remaining = TaskCount - 2;
     for (size_t i = 0; i < TaskCount; ++i) {

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <user/lib/deployment_plan.hpp>
-#include <user/lib/imports.hpp>
-#include <user/lib/service.hpp>
+#include <servers/deploy/detail/plan.hpp>
+#include <user/abi/startup.hpp>
+#include <user/server_rt/service.hpp>
 
 namespace myos::process {
 
@@ -14,7 +14,7 @@ inline auto named(deploy::ByteView value, const char* name) noexcept -> bool {
 // import. Only the explicitly allowed service contracts may cross that boundary.
 inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) noexcept -> bool {
     const auto& row = *task.row();
-    if (row.executions.count != 1 || task.execution(0)->model != MYOS_DEPLOY_EXECUTION_THREAD
+    if (row.executions.count != 1 || task.execution(0)->model != DEPLOY_EXECUTION_THREAD
         || row.images.count != 1 || row.exports.count != 0 || row.dependencies.count != 0
         || row.pool_memory > 8 * 1024 * 1024 || row.pool_caps > 256
         || (row.kind_mask & ~(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL)) != 0)
@@ -22,8 +22,8 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
     for (uint32_t i = 0; i < row.objects.count; ++i)
         if (task.object(i)->kind != MYOS_OBJECT_KIND_NOTIFICATION) return false;
     for (uint32_t i = 0; i < row.mappings.count; ++i)
-        if (task.mapping(i)->source != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
-            && task.mapping(i)->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO) return false;
+        if (task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+            && task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_ZERO) return false;
     for (uint32_t i = 0; i < row.imports.count; ++i) {
         const auto& imported = *task.import(i);
         const deploy::PlanBootstrap* binding{};
@@ -55,12 +55,12 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
             }
             if (contract == nullptr || binding->protocol != contract->protocol || binding->major != contract->major
                 || binding->object_kind != contract->kind
-                || imported.source_class != MYOS_DEPLOY_IMPORT_SOURCE_AUTHORITY
+                || imported.source_class != DEPLOY_IMPORT_SOURCE_AUTHORITY
                 || !named(task.symbol(imported.source), source) || imported.attenuation.rights != rights)
                 return false;
             continue;
         }
-        if (imported.source_class != MYOS_DEPLOY_IMPORT_SOURCE_TASK_KEY) return false;
+        if (imported.source_class != DEPLOY_IMPORT_SOURCE_TASK_KEY) return false;
         const auto source = imported.source;
         myos_word_t rights{};
         switch (binding->kind) {

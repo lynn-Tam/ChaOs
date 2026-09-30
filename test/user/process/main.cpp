@@ -1,5 +1,7 @@
-#include <user/lib/stream.hpp>
-#include <user/lib/clock.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/server_rt/console.hpp>
+#include <user/ipc/channel.hpp>
+#include <user/abi/time.hpp>
 #include <libk/fmt.hpp>
 
 namespace {

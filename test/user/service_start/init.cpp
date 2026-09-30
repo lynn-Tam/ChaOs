@@ -1,10 +1,11 @@
-#include <user/lib/service_supervisor.hpp>
-#include <user/lib/supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <servers/deploy/services.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/uart/port.hpp>
 
 namespace {
-myos::deploy::Program program;
-myos::deploy::Supervisor<5, 24> supervisor;
+deploy::program program;
+deploy::tasks<5, 24> supervisor;
 
 void report(const myos::bootstrap::BootstrapView& info, const char* message,
     bool initialize = false) noexcept {
@@ -55,7 +56,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.add("pci.0008", block_device,
         MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_CONNECT | MYOS_RIGHT_DUPLICATE));
 
-    deploy::ServiceSupervisor<5, 24> services{supervisor, program, events.selector()};
+    deploy::services<5, 24> services{supervisor, program, events.selector()};
     for (unsigned attempt = 0; attempt != 2; ++attempt) {
         const auto started = services.start();
         if (started.status != MYOS_STATUS_NO_MEMORY) exit(started.status == MYOS_STATUS_OK

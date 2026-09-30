@@ -28,15 +28,15 @@ struct RightsPolicy {
         return allowed().contains(rights);
     }
 
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool {
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool {
         return validate(ceiling.rights)
             && libk::holds_alternative<libk::monostate>(ceiling.data);
     }
 
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError> {
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError> {
         if (!validate(ceiling.rights) || !validate(view.rights)) {
             return libk::unexpected(PolicyError::InvalidRights);
         }
@@ -47,7 +47,7 @@ struct RightsPolicy {
         if (!ceiling.rights.contains(view.rights)) {
             return libk::unexpected(PolicyError::Amplification);
         }
-        return libk::expected(EffectiveAuthority{
+        return libk::expected(Authority{
             ceiling.rights.intersect(view.rights), libk::monostate{}});
     }
 };
@@ -83,20 +83,20 @@ struct CapabilityPolicy<object::ObjectKind::Tunnel> final
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Endpoint> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Channel> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
@@ -119,73 +119,73 @@ struct CapabilityPolicy<object::ObjectKind::CSpace> final
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::MemoryObject> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::VSpace> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::ResourcePool> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Notification> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Pager> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 template<>
 struct CapabilityPolicy<object::ObjectKind::Irq> final {
-    [[nodiscard]] static auto validate(GrantCeiling ceiling) noexcept -> bool;
+    [[nodiscard]] static auto validate(Authority ceiling) noexcept -> bool;
     [[nodiscard]] static auto compose(
-        GrantCeiling ceiling,
-        CapView view) noexcept
-        -> libk::Expected<EffectiveAuthority, PolicyError>;
+        Authority ceiling,
+        Authority view) noexcept
+        -> libk::Expected<Authority, PolicyError>;
 };
 
 [[nodiscard]] auto validate_ceiling(
     object::ObjectKind kind,
-    GrantCeiling ceiling) noexcept -> bool;
+    Authority ceiling) noexcept -> bool;
 
 [[nodiscard]] auto compose(
     object::ObjectKind kind,
-    GrantCeiling ceiling,
-    CapView view) noexcept -> libk::Expected<EffectiveAuthority, PolicyError>;
+    Authority ceiling,
+    Authority view) noexcept -> libk::Expected<Authority, PolicyError>;
 
 // Checks a new Grant ceiling against the authority that the source slot can
 // actually exercise. This is intentionally stronger than comparing it with
 // the source Grant's original ceiling.
 [[nodiscard]] auto attenuates(
     object::ObjectKind kind,
-    EffectiveAuthority source,
-    GrantCeiling child) noexcept -> bool;
+    Authority source,
+    Authority child) noexcept -> bool;
 
 } // namespace kernel::cap

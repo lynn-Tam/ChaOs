@@ -1,134 +1,96 @@
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/storage.h>
 #include <libk/fmt.hpp>
-#include <user/lib/stream.hpp>
-#include <user/lib/vfs_client.hpp>
-#include <user/lib/volume_path.hpp>
+#include <string_view>
 
 namespace {
-using namespace myos;
-
-auto same(const char* a, const char* b) noexcept -> bool { return service::equal(a, b); }
-
-void hex(stream::Writer& output, const uint8_t* bytes, size_t count) noexcept {
-    constexpr char digits[] = "0123456789abcdef";
-    for (size_t i = 0; i < count; ++i) {
-        output.put(digits[bytes[i] >> 4]);
-        output.put(digits[bytes[i] & 15]);
+struct output {
+    void write(const char* data, size_t size) { ::write(STDOUT_FILENO, data, size); }
+};
+int print(std::string_view text) {
+    const auto count = write(STDOUT_FILENO, text.data(), text.size());
+    return count < 0 ? count : count == static_cast<int64_t>(text.size()) ? 0 : 1;
+}
+int list(const char* path) {
+    auto* dir = opendir(path);
+    if (!dir) return 1;
+    dirent entry{};
+    int status{};
+    while ((status = readdir(dir, &entry)) > 0) {
+        if (const auto error = print(entry.name)) { status = error; break; }
+        if (const auto error = print("\n")) { status = error; break; }
     }
-    output.put('\n');
+    const auto closed = closedir(dir);
+    return status < 0 ? status : closed;
+}
+int transfer(int source, int target) {
+    char bytes[4096];
+    for (;;) {
+        const auto size = read(source, bytes, sizeof(bytes));
+        if (size <= 0) return size;
+        const auto sent = write(target, bytes, size);
+        if (sent != size) return sent < 0 ? sent : 1;
+    }
+}
+int copy(const char* from, const char* to) {
+    if (std::string_view(*from == '/' ? from + 1 : from)
+        == (*to == '/' ? to + 1 : to)) return 1;
+    const int source = open(from, O_RDONLY);
+    if (source < 0) return source;
+    const int target = open(to, O_WRONLY | O_CREAT | O_TRUNC);
+    int status = target < 0 ? target : transfer(source, target);
+    if (status == 0) status = fsync(target);
+    if (target >= 0) { const auto closed = close(target); if (!status) status = closed; }
+    const auto closed = close(source);
+    return status ? status : closed;
+}
 }
 
-auto write_words(vfs::Client& fs, vfs::File file,
-    const bootstrap::BootstrapView& info, size_t first, uint64_t offset) noexcept -> myos_status_t {
-    for (size_t i = first; i < info.argument_count(); ++i) {
-        if (i != first) {
-            const uint8_t space = ' ';
-            const auto status = fs.write(file, offset++, &space, 1);
-            if (status != MYOS_STATUS_OK) return status;
+int main(int argc, char** argv) {
+    if (argc < 2) return print("fs ls [DIR] | cat/stat/touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv/copy OLD NEW | device | volid | sync\n");
+    const std::string_view command = argv[1];
+    if (command == "sync" && argc == 2) return sync();
+    if (command == "ls" && (argc == 2 || argc == 3)) return list(argc == 3 ? argv[2] : "/");
+    if ((command == "device" || command == "volid") && argc == 2) {
+        uint8_t id[20]{};
+        const int status = command == "device" ? device_id(id) : volume_id(id);
+        if (status) return status;
+        constexpr char digits[] = "0123456789abcdef";
+        char text[41]{};
+        const int size = command == "device" ? 20 : 16;
+        for (int i = 0; i < size; ++i) { text[2*i] = digits[id[i] >> 4]; text[2*i+1] = digits[id[i] & 15]; }
+        text[2*size] = '\n';
+        return print({text, static_cast<size_t>(2*size+1)});
+    }
+    if (argc == 4 && command == "mv") return rename(argv[2], argv[3]);
+    if (argc == 4 && command == "copy") return copy(argv[2], argv[3]);
+    if (argc == 3 && command == "mkdir") return mkdir(argv[2]);
+    if (argc == 3 && command == "rm") return unlink(argv[2]);
+    const bool writing = argc >= 4 && (command == "write" || command == "append");
+    const bool reading = argc == 3 && (command == "cat" || command == "stat");
+    const bool touch = argc == 3 && command == "touch";
+    if (!writing && !reading && !touch) return 1;
+    const int flags = reading ? O_RDONLY : O_WRONLY | O_CREAT
+        | (command == "append" ? O_APPEND : touch ? 0 : O_TRUNC);
+    const int fd = open(argv[2], flags);
+    if (fd < 0) return fd;
+    int status{};
+    if (command == "stat") {
+        struct stat info{};
+        status = fstat(fd, &info);
+        if (!status) { output out; (void)libk::fmt::format_to<"{} bytes\n">(out, info.size); }
+    } else if (command == "cat") status = transfer(fd, STDOUT_FILENO);
+    else if (writing) {
+        for (int i = 3; i < argc && !status; ++i) {
+            if (i > 3 && write(fd, " ", 1) != 1) { status = 1; break; }
+            const std::string_view word = argv[i];
+            const auto size = write(fd, word.data(), word.size());
+            if (size != static_cast<int64_t>(word.size())) status = size < 0 ? size : 1;
         }
-        const auto* word = info.argument(i);
-        const size_t length = service::length(word);
-        const auto status = fs.write(file, offset, reinterpret_cast<const uint8_t*>(word), length);
-        if (status != MYOS_STATUS_OK) return status;
-        offset += length;
+        if (!status) status = fsync(fd);
     }
-    return fs.sync(file);
-}
-
-auto copy(vfs::Client& fs, const char* from, const char* to) noexcept -> myos_status_t {
-    const bool data_paths = volume_path::boot_name(from) == nullptr
-        && volume_path::boot_name(to) == nullptr;
-    const char* source_name = data_paths && *from == '/' ? from + 1 : from;
-    const char* target_name = data_paths && *to == '/' ? to + 1 : to;
-    if (same(source_name, target_name)) return MYOS_STATUS_BAD_ARGS;
-    vfs::File source{};
-    auto status = fs.open(from, vfs::Read, source);
-    if (status != MYOS_STATUS_OK) return status;
-    vfs::File target{};
-    status = fs.open(to, vfs::Write | vfs::Create | vfs::Truncate, target);
-    if (status == MYOS_STATUS_OK) {
-        myos_status_t copied = MYOS_STATUS_OK;
-        status = fs.read(source, [&](uint64_t offset, const uint8_t* bytes, size_t count) {
-            if (copied == MYOS_STATUS_OK) copied = fs.write(target, offset, bytes, count);
-        });
-        if (status == MYOS_STATUS_OK) status = copied;
-        if (status == MYOS_STATUS_OK) status = fs.sync(target);
-        const auto closed = fs.close(target);
-        if (status == MYOS_STATUS_OK) status = closed;
-    }
-    const auto closed = fs.close(source);
-    return status == MYOS_STATUS_OK ? closed : status;
-}
-} // namespace
-
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
-    const auto info = service::bootstrap(address, size);
-    stream::Writer output{service::capability(info, bootstrap::imports::Stdout)};
-    if (info.argument_count() < 2) {
-        output.write("fs ls [DIR] | cat/stat/touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv/copy OLD NEW | device | volid\n");
-        exit();
-    }
-    const auto* command = info.argument(1);
-    const auto count = info.argument_count();
-    const auto arg = [&](size_t i) noexcept { return info.argument(i); };
-    const bool listing = same(command, "ls") && (count == 2 || count == 3);
-    const bool unary = count == 3 && (same(command, "cat") || same(command, "stat")
-        || same(command, "touch") || same(command, "mkdir") || same(command, "rm"));
-    const bool binary = count == 4 && (same(command, "mv") || same(command, "copy"));
-    const bool writing = count >= 4 && (same(command, "write") || same(command, "append"));
-    const bool identity = count == 2 && (same(command, "device") || same(command, "volid"));
-    if (!listing && !unary && !binary && !writing && !identity) exit(MYOS_STATUS_BAD_ARGS);
-
-    vfs::Client fs;
-    auto status = fs.connect(info);
-    if (status != MYOS_STATUS_OK) exit(status);
-    if (identity) {
-        if (same(command, "device")) {
-            uint8_t id[20]{};
-            status = fs.device_id(id);
-            if (status == MYOS_STATUS_OK) hex(output, id, sizeof(id));
-        } else {
-            uint8_t id[store::VolumeIdSize]{};
-            status = fs.volume_id(id);
-            if (status == MYOS_STATUS_OK) hex(output, id, sizeof(id));
-        }
-        const auto closed = fs.close();
-        exit(status == MYOS_STATUS_OK ? closed : status);
-    }
-    if (listing) {
-        io::ControlMessage entry{};
-        do {
-            status = fs.list(entry, count == 3 ? arg(2) : "/");
-            if (status != MYOS_STATUS_OK) break;
-            if (!store::each_name(entry, [&](const char* name, size_t length) {
-                output.write(name, length); output.put('\n');
-            })) { status = MYOS_STATUS_PEER_FAULT; break; }
-        } while (entry.value != 0);
-    } else if (same(command, "mkdir")) status = fs.mkdir(arg(2));
-    else if (same(command, "rm")) status = fs.remove(arg(2));
-    else if (same(command, "mv")) status = fs.rename(arg(2), arg(3));
-    else if (same(command, "copy")) status = copy(fs, arg(2), arg(3));
-    else {
-        const bool append = same(command, "append");
-        const bool touch = same(command, "touch");
-        const bool read = same(command, "cat") || same(command, "stat");
-        vfs::File file{};
-        status = fs.open(arg(2), read ? vfs::Read
-            : touch ? vfs::Write | vfs::Create
-            : append ? vfs::Write | vfs::Create
-            : vfs::Write | vfs::Create | vfs::Truncate, file);
-        if (status == MYOS_STATUS_OK) {
-            if (same(command, "stat"))
-                (void)libk::fmt::format_to<"{} bytes\n">(output, file.size);
-            else if (same(command, "cat"))
-                status = fs.read(file, [&](uint64_t, const uint8_t* bytes, size_t count) {
-                    output.write(reinterpret_cast<const char*>(bytes), count);
-                });
-            else if (writing) status = write_words(fs, file, info, 3, append ? file.size : 0);
-            const auto closed = fs.close(file);
-            if (status == MYOS_STATUS_OK) status = closed;
-        }
-    }
-    const auto closed = fs.close();
-    exit(status == MYOS_STATUS_OK ? closed : status);
+    const int closed = close(fd);
+    return status ? status : closed;
 }

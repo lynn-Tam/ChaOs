@@ -1,13 +1,18 @@
-#include <user/lib/stream.hpp>
-#include <user/lib/service.hpp>
+#include <unistd.h>
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    const auto info = myos::service::bootstrap(address, size);
-    const myos::stream::Writer output{myos::service::capability(info, myos::bootstrap::imports::Stdout)};
-    for (size_t i = 1; i < info.argument_count(); ++i) {
-        if (i != 1) output.put(' ');
-        output.write(info.argument(i));
+namespace {
+auto length(const char* text) -> uint64_t {
+    uint64_t size{};
+    while (text[size] != '\0') ++size;
+    return size;
+}
+}
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (i != 1 && write(STDOUT_FILENO, " ", 1) != 1) return 1;
+        const auto size = length(argv[i]);
+        if (write(STDOUT_FILENO, argv[i], size) != static_cast<int64_t>(size)) return 1;
     }
-    output.put('\n');
-    myos::exit();
+    return write(STDOUT_FILENO, "\n", 1) == 1 ? 0 : 1;
 }

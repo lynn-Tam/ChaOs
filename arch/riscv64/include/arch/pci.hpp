@@ -1,7 +1,7 @@
 #pragma once
 
 #include <core/types.hpp>
-#include <libk/array.hpp>
+#include <array>
 #include <libk/expected.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/noncopyable.hpp>
@@ -38,10 +38,10 @@ public:
         -> libk::Expected<void, PciError>;
     [[nodiscard]] auto requester() const noexcept -> u16 { return requester_; }
     [[nodiscard]] auto irq_source() const noexcept -> u32 { return irq_source_; }
-    [[nodiscard]] auto configuration() const noexcept -> const libk::Array<u32, 64>& {
+    [[nodiscard]] auto configuration() const noexcept -> const std::array<u32, 64>& {
         return configuration_;
     }
-    [[nodiscard]] auto bars() const noexcept -> const libk::Array<PciBar, 6>& {
+    [[nodiscard]] auto bars() const noexcept -> const std::array<PciBar, 6>& {
         return bars_;
     }
     [[nodiscard]] auto config32(u16 offset) const noexcept -> u32;
@@ -64,8 +64,8 @@ private:
     usize status_{};
     u16 requester_{};
     u32 irq_source_{};
-    libk::Array<PciBar, 6> bars_{};
-    libk::Array<u32, 64> configuration_{};
+    std::array<PciBar, 6> bars_{};
+    std::array<u32, 64> configuration_{};
 };
 
 } // namespace arch

@@ -1,10 +1,10 @@
-#include <user/lib/clock.hpp>
-#include <user/lib/supervisor.hpp>
+#include <user/abi/time.hpp>
+#include <servers/deploy/launch.hpp>
 
 namespace {
 using namespace myos;
-deploy::Program program;
-using Supervisor = deploy::Supervisor<4>;
+deploy::program program;
+using Supervisor = deploy::tasks<4>;
 Supervisor supervisor;
 unsigned step{};
 void require(myos_status_t status) noexcept {
@@ -13,7 +13,7 @@ void require(myos_status_t status) noexcept {
     if (status != MYOS_STATUS_OK) exit(-static_cast<myos_status_t>(step * 100) + status);
 }
 void check(bool value) noexcept { require(value ? MYOS_STATUS_OK : MYOS_STATUS_INTERNAL); }
-auto binding(const char* name, myos_cap_t channel) noexcept -> deploy::LaunchSource {
+auto binding(const char* name, myos_cap_t channel) noexcept -> deploy::source {
     return {name, {channel, 0}, {
         .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
         .kind = MYOS_OBJECT_KIND_CHANNEL, .size = MYOS_CAP_ATTENUATION_SIZE,
@@ -106,7 +106,7 @@ void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
     const auto control = channel_mint(handoff.value2, cspace, 1,
         MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE);
     require(control.status);
-    const deploy::LaunchSource source[] = {{"handoff", {handoff.value, 0}, {
+    const deploy::source source[] = {{"handoff", {handoff.value, 0}, {
         .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
         .kind = MYOS_OBJECT_KIND_CHANNEL, .size = MYOS_CAP_ATTENUATION_SIZE,
         .rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE,
@@ -130,7 +130,7 @@ void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
             return received;
         }
     };
-    auto launch = [&]() noexcept -> Supervisor::Handle {
+    auto launch = [&]() noexcept -> Supervisor::handle {
         myos_status_t status{};
         auto task = supervisor.launch(program, Supervisor::name("provider"), status,
             {.sources = source});
@@ -138,9 +138,9 @@ void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
         check(static_cast<bool>(task));
         return libk::move(*task);
     };
-    struct Transfer final { cap::OwnedCap cap; Supervisor::Handle holder; };
-    auto transfer = [&](Supervisor::Handle& provider) noexcept -> Transfer {
-        const Supervisor::Handle* providers[]{&provider};
+    struct Transfer final { cap::OwnedCap cap; Supervisor::handle holder; };
+    auto transfer = [&](Supervisor::handle& provider) noexcept -> Transfer {
+        const Supervisor::handle* providers[]{&provider};
         myos_status_t status{};
         auto holder = supervisor.launch(program, Supervisor::name("export-holder"), status,
             {.sources = source}, {providers, 1});
@@ -196,8 +196,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         require(sender.status);
         require(service::send(sender.value, {.id = 100}).status);
         require(cap_close(sender.value).status);
-        const deploy::LaunchSource sources[] = {binding("data", data.value), binding("ready", ready.value)};
-        Supervisor::Handle tasks[3];
+        const deploy::source sources[] = {binding("data", data.value), binding("ready", ready.value)};
+        Supervisor::handle tasks[3];
         for (unsigned i = 0; i != 3; ++i) {
             bootstrap::Arguments arguments;
             const char number = '0' + i;

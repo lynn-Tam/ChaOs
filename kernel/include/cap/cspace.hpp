@@ -128,17 +128,17 @@ public:
         -> libk::Expected<DerivationReservation, CSpaceError>;
     [[nodiscard]] auto insert(
         GrantRef&& grant,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto insert(
         Reservation&& reservation,
         GrantRef&& grant,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto close(CapHandle handle) noexcept
         -> libk::Expected<void, CSpaceError>;
     [[nodiscard]] auto duplicate(
         CapHandle source,
         CSpace& destination,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto duplicate(
         CapHandle source,
         CSpace& destination,
@@ -146,8 +146,8 @@ public:
     [[nodiscard]] auto delegate(
         CapHandle source,
         CSpace& destination,
-        GrantCeiling ceiling,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority ceiling,
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto delegate(
         CapHandle source,
         CSpace& destination,
@@ -230,7 +230,7 @@ private:
 
     struct Capability final {
         GrantRef grant{};
-        CapView view{};
+        Authority view{};
     };
 
     enum class SlotState : u8 {
@@ -299,7 +299,7 @@ private:
         Snapshot(
             GrantGraph& owner,
             GrantKey identity,
-            CapView cap_view,
+            Authority cap_view,
             GrantLease&& admission) noexcept
             : graph(&owner),
               key(identity),
@@ -310,7 +310,7 @@ private:
 
         GrantGraph* graph{};
         GrantKey key{};
-        CapView view{};
+        Authority view{};
         GrantLease lease{};
     };
 
@@ -319,19 +319,19 @@ private:
     [[nodiscard]] auto delegate_snapshot(
         Snapshot&& source,
         CSpace& destination,
-        GrantCeiling ceiling,
-        CapView view) noexcept
+        Authority ceiling,
+        Authority view) noexcept
         -> libk::Expected<CapHandle, CSpaceError>;
     [[nodiscard]] auto commit(
         Reservation& reservation,
         GrantRef&& grant,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     // Caller holds lock_. Reservation is the operation lease which keeps this
     // prepared slot valid even after retirement closes new admission.
     [[nodiscard]] auto commit_locked(
         Reservation& reservation,
         GrantRef&& grant,
-        CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
+        Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError>;
     void rollback(CapHandle handle) noexcept;
     void finish_retire() noexcept;
     [[nodiscard]] auto reserve_grant() noexcept
@@ -340,13 +340,13 @@ private:
     [[nodiscard]] auto escrow_move(
         CapHandle source,
         GrantRef& grant,
-        CapView& view,
+        Authority& view,
         Reservation& reservation) noexcept
         -> libk::Expected<void, CSpaceError>;
     [[nodiscard]] auto escrow_restore(
         Reservation& reservation,
         GrantRef&& grant,
-        CapView view) noexcept -> bool;
+        Authority view) noexcept -> bool;
     [[nodiscard]] auto escrow_drop(
         Reservation& reservation) noexcept -> kernel::resource::Refund;
     void retain_escrow() noexcept;

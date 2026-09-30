@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace myos::deploy::host {
+namespace deploy::host {
 
 inline constexpr uint8_t kGolden[] = {
   0x4d, 0x53, 0x44, 0x45, 0x50, 0x4c, 0x4f, 0x59, 0x01, 0x00, 0x04, 0x00,
@@ -105,4 +105,4 @@ inline constexpr uint8_t kGolden[] = {
 };
 inline constexpr size_t kGoldenSize = sizeof(kGolden);
 
-} // namespace myos::deploy::host
+} // namespace deploy::host

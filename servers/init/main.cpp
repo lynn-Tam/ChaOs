@@ -1,16 +1,17 @@
-#include <user/lib/supervisor.hpp>
-#include <user/lib/service_supervisor.hpp>
-#include <user/lib/uart.hpp>
+#include <user/server_rt/service.hpp>
+#include <servers/deploy/launch.hpp>
+#include <servers/deploy/services.hpp>
+#include <servers/uart/port.hpp>
 
 namespace {
-myos::deploy::Program program;
+deploy::program program;
 constexpr size_t ServiceCapacity = 8;
-using Supervisor = myos::deploy::Supervisor<ServiceCapacity, 24>;
+using Supervisor = deploy::tasks<ServiceCapacity, 24>;
 Supervisor supervisor;
 
 void report_uart(const myos::bootstrap::BootstrapView& info,
     myos_status_t startup = MYOS_STATUS_OK,
-    myos::deploy::ByteView task = {}) {
+    deploy::ByteView task = {}) {
     const auto vspace = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto memory = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
     constexpr auto address = 0x30010000;
@@ -73,12 +74,12 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         myos::service::require(supervisor.add(device->name, device->handle,
             MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_CONNECT | MYOS_RIGHT_DUPLICATE));
     }
-    myos::deploy::ServiceSupervisor<ServiceCapacity, 24> services{supervisor, program, events.selector()};
+    deploy::services<ServiceCapacity, 24> services{supervisor, program, events.selector()};
     const auto started = services.start();
     if (started.status != MYOS_STATUS_OK) {
         const auto task = started.task
             ? program.plan().symbol(program.plan().task(*started.task)->name)
-            : myos::deploy::ByteView{};
+            : deploy::ByteView{};
         report_uart(info, started.status, task);
     }
     myos::service::require(started.status);

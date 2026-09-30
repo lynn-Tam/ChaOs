@@ -155,7 +155,7 @@ auto Tunnel::connect(
     auto child = authority.derive_tunnel_tx(
         libk::move(transaction.grant_),
         libk::move(target).value(),
-        cap::GrantCeiling{tx_rights},
+        cap::Authority{tx_rights},
         proof);
     if (!child) {
         return libk::unexpected(TunnelError::ResourceExhausted);
@@ -163,7 +163,7 @@ auto Tunnel::connect(
     auto published = cspace.insert(
         libk::move(transaction.slot_),
         libk::move(child).value(),
-        cap::CapView{tx_rights});
+        cap::Authority{tx_rights});
     if (!published) {
         return libk::unexpected(TunnelError::ResourceExhausted);
     }

@@ -1,5 +1,6 @@
-#include <user/lib/imports.hpp>
-#include <user/lib/io_session.hpp>
+#include <user/server_rt/service.hpp>
+#include <user/abi/startup.hpp>
+#include <user/ipc/io.hpp>
 
 namespace {
 constexpr uint64_t Offset = 64 * 512;

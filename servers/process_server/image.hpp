@@ -1,10 +1,10 @@
 #pragma once
 
-#include <user/lib/image_materializer.hpp>
-#include <user/lib/deployment_syscall.hpp>
-#include <user/lib/cap_attenuation.hpp>
+#include <servers/deploy/detail/image.hpp>
+#include <servers/deploy/detail/space.hpp>
+#include <servers/deploy/format.hpp>
 #include <libk/noncopyable.hpp>
-#include <user/lib/service.hpp>
+#include <user/server_rt/service.hpp>
 
 namespace myos::process {
 
@@ -48,7 +48,7 @@ class Image final : private libk::noncopyable_nonmovable {
             .size = MYOS_CAP_ATTENUATION_SIZE, .rights = MYOS_RIGHT_MAP,
             .words = {first, size / 4096, source_access, MYOS_VM_NORMAL}};
         auto& wire = *reinterpret_cast<uint8_t (*)[MYOS_CAP_ATTENUATION_SIZE]>(service::IpcAddress);
-        deploy::attenuation::encode_wire(view, wire);
+        myos::cap::encode(view, wire);
         const auto written = memory_write(descriptor_->memory_.selector(), 0, 0, sizeof(wire));
         return written.status == MYOS_STATUS_OK
             ? cap_typed_delegate(package_, descriptor_->cspace_, descriptor_->memory_.selector()) : written;

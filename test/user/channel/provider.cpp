@@ -1,5 +1,5 @@
 #include <test/user/channel/export_protocol.hpp>
-#include <user/lib/service.hpp>
+#include <user/server_rt/service.hpp>
 
 extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
     using namespace myos;

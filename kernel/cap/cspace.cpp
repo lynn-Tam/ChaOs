@@ -156,7 +156,7 @@ auto CSpace::reserve_derivation() noexcept
 
 auto CSpace::insert(
     GrantRef&& grant,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     auto reserved = reserve();
     if (!reserved) {
         return libk::unexpected(reserved.error());
@@ -168,7 +168,7 @@ auto CSpace::insert(
 auto CSpace::insert(
     Reservation&& reserved,
     GrantRef&& grant,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     if (!grant) {
         return libk::unexpected(CSpaceError::GrantUnavailable);
     }
@@ -222,7 +222,7 @@ auto CSpace::close(CapHandle handle) noexcept
 auto CSpace::duplicate(
     CapHandle source_handle,
     CSpace& destination,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     auto copied = snapshot(source_handle);
     if (!copied) {
         return libk::unexpected(copied.error());
@@ -237,7 +237,7 @@ auto CSpace::duplicate(
         return libk::unexpected(CSpaceError::Denied);
     }
     auto destination_authority = compose(
-        lease.kind(), effective.value().ceiling(), view);
+        lease.kind(), effective.value(), view);
     if (!destination_authority) {
         return libk::unexpected(policy_error(destination_authority.error()));
     }
@@ -272,14 +272,14 @@ auto CSpace::duplicate(
     return duplicate(
         source_handle,
         destination,
-        CapView{rights, effective.value().data});
+        Authority{rights, effective.value().data});
 }
 
 auto CSpace::delegate_snapshot(
     Snapshot&& source,
     CSpace& destination,
-    GrantCeiling ceiling,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority ceiling,
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     GrantLease lease = libk::move(source.lease);
     auto effective = compose(lease.kind(), lease.ceiling(), source.view);
     if (!effective) {
@@ -328,8 +328,8 @@ auto CSpace::delegate_snapshot(
 auto CSpace::delegate(
     CapHandle source_handle,
     CSpace& destination,
-    GrantCeiling ceiling,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority ceiling,
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     auto copied = snapshot(source_handle);
     if (!copied) {
         return libk::unexpected(copied.error());
@@ -352,12 +352,12 @@ auto CSpace::delegate(
     if (!effective) {
         return libk::unexpected(policy_error(effective.error()));
     }
-    const GrantCeiling ceiling{rights, effective.value().data};
+    const Authority ceiling{rights, effective.value().data};
     return delegate_snapshot(
         libk::move(source),
         destination,
         ceiling,
-        CapView{rights, effective.value().data});
+        Authority{rights, effective.value().data});
 }
 
 auto CSpace::typed_delegate(
@@ -391,7 +391,7 @@ auto CSpace::typed_delegate(
         libk::move(source),
         destination,
         ceiling.value(),
-        CapView{ceiling.value().rights, ceiling.value().data});
+        Authority{ceiling.value().rights, ceiling.value().data});
 }
 
 auto CSpace::revoke(
@@ -582,7 +582,7 @@ auto CSpace::snapshot(CapHandle handle) noexcept
 auto CSpace::commit(
     Reservation& reservation,
     GrantRef&& grant,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     kernel::sync::IrqLockGuard guard{lock_};
     return commit_locked(reservation, libk::move(grant), view);
 }
@@ -590,7 +590,7 @@ auto CSpace::commit(
 auto CSpace::commit_locked(
     Reservation& reservation,
     GrantRef&& grant,
-    CapView view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
+    Authority view) noexcept -> libk::Expected<CapHandle, CSpaceError> {
     kernel::sync::LockAccess::assert_held(lock_);
     if (reservation.owner_ != this || !grant || !accepting_) {
         return libk::unexpected(CSpaceError::InvalidState);
@@ -919,7 +919,7 @@ void CSpace::detach_execution() noexcept {
 auto CSpace::escrow_move(
     CapHandle source_handle,
     GrantRef& grant,
-    CapView& view,
+    Authority& view,
     Reservation& reservation) noexcept
     -> libk::Expected<void, CSpaceError> {
     kernel::sync::IrqLockGuard guard{lock_};
@@ -948,7 +948,7 @@ auto CSpace::escrow_move(
 auto CSpace::escrow_restore(
     Reservation& reservation,
     GrantRef&& grant,
-    CapView view) noexcept -> bool {
+    Authority view) noexcept -> bool {
     kernel::sync::IrqLockGuard guard{lock_};
     if (reservation.owner_ != this || !grant) {
         return false;

@@ -7,8 +7,8 @@
 #include <libk/assert.hpp>
 #include <libk/utility.hpp>
 #include <uapi/resource.h>
-#include <user/lib/deployment_syscall.hpp>
-#include <user/lib/image_materializer.hpp>
+#include <servers/deploy/detail/space.hpp>
+#include <servers/deploy/detail/image.hpp>
 
 #include "deploypack/golden_fixture.hpp"
 
@@ -309,26 +309,26 @@ struct FakeBackend final {
     }
 };
 
-using Space = myos::deploy::TaskSpace<16, 4, FakeBackend>;
-using SmallSpace = myos::deploy::TaskSpace<2, 4, FakeBackend>;
-using Bundle = myos::deploy::MappedBundle<FakeBackend>;
-using Scratch = myos::deploy::ScratchWindow<FakeBackend>;
-using Materializer = myos::deploy::ImageMaterializer<
+using Space = deploy::TaskSpace<16, 4, FakeBackend>;
+using SmallSpace = deploy::TaskSpace<2, 4, FakeBackend>;
+using Bundle = deploy::MappedBundle<FakeBackend>;
+using Scratch = deploy::ScratchWindow<FakeBackend>;
+using Materializer = deploy::ImageMaterializer<
     16, 4, FakeBackend, 4, 4>;
-using SmallMaterializer = myos::deploy::ImageMaterializer<
+using SmallMaterializer = deploy::ImageMaterializer<
     2, 4, FakeBackend, 4, 4>;
 using Image = Materializer::Image;
 
-static_assert(myos::deploy::MaterializerBackend<FakeBackend>);
+static_assert(deploy::MaterializerBackend<FakeBackend>);
 
 alignas(4096) uint8_t bundle_bytes[8192]{};
 alignas(4096) uint8_t scratch_bytes[0x10000]{};
 
 struct PlanFixture final {
-    uint8_t raw[myos::deploy::host::kGoldenSize]{};
-    myos::deploy::ManifestWorkspace workspace{};
-    myos::deploy::PlanSet<1> plans{};
-    myos::deploy::DeploymentPlan plan{};
+    uint8_t raw[deploy::host::kGoldenSize]{};
+    deploy::ManifestWorkspace workspace{};
+    deploy::PlanSet<1> plans{};
+    deploy::DeploymentPlan plan{};
 };
 
 void put_plan(
@@ -358,42 +358,42 @@ void put_plan(
     PlanFixture& fixture,
     uint64_t stack_size = 0x10000) noexcept -> bool {
     for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
-        fixture.raw[index] = myos::deploy::host::kGolden[index];
+        fixture.raw[index] = deploy::host::kGolden[index];
     }
     const size_t task_table = static_cast<size_t>(read_plan(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_TABLES
-            + MYOS_DEPLOY_TABLE_TASK * MYOS_DEPLOY_TABLE_DESC_SIZE
-            + MYOS_DEPLOY_TABLE_OFFSET,
+        DEPLOY_HEADER_TABLES
+            + DEPLOY_TABLE_TASK * DEPLOY_TABLE_DESC_SIZE
+            + DEPLOY_TABLE_OFFSET,
         8));
     const size_t mapping_table = static_cast<size_t>(read_plan(
         fixture.raw,
-        MYOS_DEPLOY_HEADER_TABLES
-            + MYOS_DEPLOY_TABLE_MAPPING * MYOS_DEPLOY_TABLE_DESC_SIZE
-            + MYOS_DEPLOY_TABLE_OFFSET,
+        DEPLOY_HEADER_TABLES
+            + DEPLOY_TABLE_MAPPING * DEPLOY_TABLE_DESC_SIZE
+            + DEPLOY_TABLE_OFFSET,
         8));
     put_plan(
         fixture.raw,
-        task_table + MYOS_DEPLOY_TASK_POOL_MEMORY,
+        task_table + DEPLOY_TASK_POOL_MEMORY,
         0x20000,
         8);
     put_plan(
         fixture.raw,
-        task_table + MYOS_DEPLOY_TASK_CRITICAL_BYTES,
+        task_table + DEPLOY_TASK_CRITICAL_BYTES,
         0x12000,
         8);
     put_plan(
         fixture.raw,
-        mapping_table + MYOS_DEPLOY_MAPPING_STRIDE
-            + MYOS_DEPLOY_MAPPING_SIZE,
+        mapping_table + DEPLOY_MAPPING_STRIDE
+            + DEPLOY_MAPPING_SIZE,
         stack_size,
         8);
-    auto parsed = myos::deploy::ManifestView::parse(
+    auto parsed = deploy::ManifestView::parse(
         fixture.raw, sizeof(fixture.raw), fixture.workspace);
     if (!parsed) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         parsed.value(), fixture.plans);
     if (!decoded) {
         return false;
@@ -560,9 +560,9 @@ template<typename Task>
     }
     const auto vspace = task.lookup(
         task.vspace_slot(), MYOS_OBJECT_KIND_VSPACE);
-    const myos::deploy::Window bundle_window{
+    const deploy::Window bundle_window{
         reinterpret_cast<myos_word_t>(bundle_bytes), 0x2000};
-    const myos::deploy::Window scratch_window{
+    const deploy::Window scratch_window{
         reinterpret_cast<myos_word_t>(scratch_bytes), scratch_size};
     return vspace.has_value()
         && bundle.open(vspace.value(), {2, 0}, bundle_window, bundle_size)
@@ -581,7 +581,7 @@ template<typename Task>
         }
     }
     const bool scratch_closed = status == MYOS_STATUS_OK
-        && scratch.phase() == myos::deploy::LeasePhase::Closed;
+        && scratch.phase() == deploy::LeasePhase::Closed;
     status = MYOS_STATUS_INTERNAL;
     for (size_t attempt = 0; attempt < 4; ++attempt) {
         status = bundle.close();
@@ -590,7 +590,7 @@ template<typename Task>
         }
     }
     const bool bundle_closed = status == MYOS_STATUS_OK
-        && bundle.phase() == myos::deploy::LeasePhase::Closed;
+        && bundle.phase() == deploy::LeasePhase::Closed;
     status = MYOS_STATUS_INTERNAL;
     for (size_t attempt = 0; attempt < 4; ++attempt) {
         status = task.close();
@@ -599,7 +599,7 @@ template<typename Task>
         }
     }
     return scratch_closed && bundle_closed && status == MYOS_STATUS_OK
-        && task.phase() == myos::deploy::Phase::Closed;
+        && task.phase() == deploy::Phase::Closed;
 }
 
 [[nodiscard]] auto test_production_zero_fill() noexcept -> bool {
@@ -729,7 +729,7 @@ template<typename Task>
     Materializer materializer{task, bundle, scratch};
     constexpr uint8_t bytes[] = {0x31, 0x32, 0x33, 0x34};
     Image::Mapping readonly{};
-    myos::deploy::LocalSlot descriptor{};
+    deploy::LocalSlot descriptor{};
     const auto readonly_status = materializer.materialize_readonly(
         0x500000, bytes, sizeof(bytes), readonly);
     const auto descriptor_status = materializer.materialize_descriptor(
@@ -737,7 +737,7 @@ template<typename Task>
     const bool materialized = readonly_status == MYOS_STATUS_OK
         && readonly.access == MYOS_VM_READ
         && readonly.address == 0x500000
-        && readonly.size == MYOS_DEPLOY_PAGE_SIZE
+        && readonly.size == DEPLOY_PAGE_SIZE
         && task.lookup(readonly.region, MYOS_OBJECT_KIND_VSPACE)
             .has_value()
         && !task.lookup(readonly.memory, MYOS_OBJECT_KIND_MEMORY)
@@ -830,7 +830,7 @@ template<typename Task>
     };
 
     const myos_word_t near_end = ~myos_word_t{}
-        - (MYOS_DEPLOY_PAGE_SIZE - 1);
+        - (DEPLOY_PAGE_SIZE - 1);
     if (!run_invalid(0, 0x400000, 0x2000, 0x1000)
         || !run_invalid(5, 0x400000, 0x2000, 0x1000)
         || !run_invalid(2, 0x400000, 0x1000, 0x2000)
@@ -953,7 +953,7 @@ template<typename Task>
         const myos_status_t status = materializer.materialize("proof", image);
         const bool cleaned = status == MYOS_STATUS_BUSY
             && image.segments.empty()
-            && scratch.phase() == myos::deploy::LeasePhase::Ready
+            && scratch.phase() == deploy::LeasePhase::Ready
             && count(FakeBackend::Op::Unmap) == 1;
         const bool closed = close_environment(task, bundle, scratch);
         if (!cleaned || !closed || !environment_roots_closed()
@@ -1050,27 +1050,27 @@ template<typename Task>
         return false;
     }
     const auto task = lease->task(0);
-    const auto requirement = myos::deploy::required_scratch_size(
+    const auto requirement = deploy::required_scratch_size(
         task, parsed);
     if (!requirement || *requirement != 0x10000) {
         return false;
     }
-    if (myos::deploy::required_scratch_size(
-            myos::deploy::TaskPlanView{}, parsed)
-        || myos::deploy::required_scratch_size(task, myos::boot::Bundle{})) {
+    if (deploy::required_scratch_size(
+            deploy::TaskPlanView{}, parsed)
+        || deploy::required_scratch_size(task, myos::boot::Bundle{})) {
         return false;
     }
 
     PlanFixture minimum{};
-    if (!make_query_plan(minimum, MYOS_DEPLOY_PAGE_SIZE)) {
+    if (!make_query_plan(minimum, DEPLOY_PAGE_SIZE)) {
         return false;
     }
     auto minimum_lease = minimum.plan.lease();
     if (!minimum_lease
-        || !myos::deploy::required_scratch_size(
+        || !deploy::required_scratch_size(
             minimum_lease->task(0), parsed)
-        || *myos::deploy::required_scratch_size(
-               minimum_lease->task(0), parsed) != MYOS_DEPLOY_PAGE_SIZE) {
+        || *deploy::required_scratch_size(
+               minimum_lease->task(0), parsed) != DEPLOY_PAGE_SIZE) {
         return false;
     }
     minimum_lease.reset();
@@ -1111,7 +1111,7 @@ template<typename Task>
     Scratch undersized_scratch{};
     if (!open_environment(
             undersized_task, undersized_bundle, undersized_scratch,
-            bundle_size, MYOS_DEPLOY_PAGE_SIZE)) {
+            bundle_size, DEPLOY_PAGE_SIZE)) {
         return false;
     }
     Materializer undersized_materializer{
@@ -1122,7 +1122,7 @@ template<typename Task>
             0x400000, *requirement,
             MYOS_VM_READ | MYOS_VM_WRITE, rejected)
             == MYOS_STATUS_BAD_ARGS
-        && undersized_scratch.phase() == myos::deploy::LeasePhase::Ready;
+        && undersized_scratch.phase() == deploy::LeasePhase::Ready;
     const bool undersized_closed = close_environment(
         undersized_task, undersized_bundle, undersized_scratch);
     return rejected_zero && undersized_closed

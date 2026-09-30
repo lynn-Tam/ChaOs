@@ -2,12 +2,12 @@
 #include <stdint.h>
 
 #include <libk/optional.hpp>
-#include <user/lib/bootstrap.hpp>
-#include <user/lib/deployment_plan.hpp>
-#include <user/lib/deployment_syscall.hpp>
-#include <user/lib/task_authority.hpp>
-#include <user/lib/task_transaction.hpp>
-#include <user/lib/uart.hpp>
+#include <user/abi/startup.hpp>
+#include <servers/deploy/detail/plan.hpp>
+#include <servers/deploy/detail/space.hpp>
+#include <servers/deploy/detail/authority.hpp>
+#include <servers/deploy/detail/task.hpp>
+#include <servers/uart/port.hpp>
 #include <uapi/bootstrap.h>
 #include <uapi/resource.h>
 #include <uapi/status.h>
@@ -28,21 +28,21 @@ extern const size_t manifest_size;
 namespace {
 
 using Backend = myos::cap::SyscallBackend;
-using Space = myos::deploy::TaskSpace<
-    myos::deploy::kTaskLocalCapacity,
-    myos::deploy::kTaskImportRemoteCapacity,
+using Space = deploy::TaskSpace<
+    deploy::kTaskLocalCapacity,
+    deploy::kTaskImportRemoteCapacity,
     Backend>;
-using Record = myos::deploy::TaskRecord<Space>;
-using Completions = myos::deploy::CompletionSet<1>;
-using Table = myos::deploy::TaskTable<Record, Completions, 1>;
-using Builder = myos::deploy::TaskBuilder<Table, Completions>;
-using Authorities = myos::deploy::AuthoritySet<4>;
-using Workspace = myos::deploy::TaskConstructionWorkspace<Authorities>;
-using Plans = myos::deploy::PlanSet<1>;
-using SourceSpace = myos::deploy::TaskSpace<16, 4, Backend>;
-using Source = myos::deploy::RegisteredSpace<SourceSpace, 2>;
+using Record = deploy::TaskRecord<Space>;
+using Completions = deploy::CompletionSet<1>;
+using Table = deploy::TaskTable<Record, Completions, 1>;
+using Builder = deploy::TaskBuilder<Table, Completions>;
+using Authorities = deploy::AuthoritySet<4>;
+using Workspace = deploy::TaskConstructionWorkspace<Authorities>;
+using Plans = deploy::PlanSet<1>;
+using SourceSpace = deploy::TaskSpace<16, 4, Backend>;
+using Source = deploy::RegisteredSpace<SourceSpace, 2>;
 
-constexpr myos_word_t PageSize = MYOS_DEPLOY_PAGE_SIZE;
+constexpr myos_word_t PageSize = DEPLOY_PAGE_SIZE;
 constexpr myos_word_t BundleAddress = 0x1000'0000;
 constexpr myos_word_t ScratchAddress = 0x1800'0000;
 constexpr myos_word_t ScratchSize = 0x20'0000;
@@ -64,13 +64,13 @@ constexpr myos_word_t SourceDomainRights =
 struct Console final {
     myos::cap::OwnedCap region{};
     myos::uart::Port port{0};
-    myos::deploy::LeasePhase phase{myos::deploy::LeasePhase::Empty};
+    deploy::LeasePhase phase{deploy::LeasePhase::Empty};
 
     [[nodiscard]] auto open(
         myos::cap::CapRef vspace,
         myos::cap::CapRef memory) noexcept -> bool {
-        if (phase != myos::deploy::LeasePhase::Empty
-            && phase != myos::deploy::LeasePhase::Closed) {
+        if (phase != deploy::LeasePhase::Empty
+            && phase != deploy::LeasePhase::Closed) {
             return false;
         }
         port = myos::uart::Port{0};
@@ -86,14 +86,14 @@ struct Console final {
         }
         region = myos::cap::OwnedCap{
             myos::cap::CapRef{created.value, 0}};
-        phase = myos::deploy::LeasePhase::Ready;
+        phase = deploy::LeasePhase::Ready;
         const myos::SysResult mapped_result = myos::vm_map(
             region.selector(), memory.selector, UartAddress, PageSize, 0,
             MYOS_VM_READ | MYOS_VM_WRITE);
-        if (!myos::deploy::committed(mapped_result.status)) {
+        if (!deploy::committed(mapped_result.status)) {
             return false;
         }
-        phase = myos::deploy::LeasePhase::Mapped;
+        phase = deploy::LeasePhase::Mapped;
         port = myos::uart::Port{UartAddress};
         port.reset();
         /* The mapping is the authoritative lifetime; a null Port is an
@@ -110,16 +110,16 @@ struct Console final {
         port = myos::uart::Port{0};
         for (;;) {
             switch (phase) {
-            case myos::deploy::LeasePhase::Empty:
-            case myos::deploy::LeasePhase::Closed:
+            case deploy::LeasePhase::Empty:
+            case deploy::LeasePhase::Closed:
                 return true;
-            case myos::deploy::LeasePhase::Mapped:
-            case myos::deploy::LeasePhase::Unmapping: {
-                phase = myos::deploy::LeasePhase::Unmapping;
+            case deploy::LeasePhase::Mapped:
+            case deploy::LeasePhase::Unmapping: {
+                phase = deploy::LeasePhase::Unmapping;
                 const myos_status_t status = myos::vm_unmap(
                     region.selector(), UartAddress, PageSize).status;
-                if (myos::deploy::committed(status)) {
-                    phase = myos::deploy::LeasePhase::Ready;
+                if (deploy::committed(status)) {
+                    phase = deploy::LeasePhase::Ready;
                     continue;
                 }
                 if (retryable(status)) {
@@ -128,13 +128,13 @@ struct Console final {
                 }
                 Backend::ownership_fault(status);
             }
-            case myos::deploy::LeasePhase::Ready:
-            case myos::deploy::LeasePhase::Destroying: {
-                phase = myos::deploy::LeasePhase::Destroying;
+            case deploy::LeasePhase::Ready:
+            case deploy::LeasePhase::Destroying: {
+                phase = deploy::LeasePhase::Destroying;
                 const myos_status_t status = myos::vm_destroy_region(
                     region.selector()).status;
-                if (myos::deploy::committed(status)) {
-                    phase = myos::deploy::LeasePhase::Closing;
+                if (deploy::committed(status)) {
+                    phase = deploy::LeasePhase::Closing;
                     continue;
                 }
                 if (retryable(status)) {
@@ -143,11 +143,11 @@ struct Console final {
                 }
                 Backend::ownership_fault(status);
             }
-            case myos::deploy::LeasePhase::Closing: {
+            case deploy::LeasePhase::Closing: {
                 const myos_status_t status = region.close();
                 if (status == MYOS_STATUS_OK) {
                     region = {};
-                    phase = myos::deploy::LeasePhase::Closed;
+                    phase = deploy::LeasePhase::Closed;
                     return true;
                 }
                 if (retryable(status)) {
@@ -175,18 +175,18 @@ struct Console final {
 struct Runtime final {
     Console console{};
     myos::cap::OwnedCap parent{};
-    myos::cap::MappedBundle bundle{};
-    myos::cap::ScratchWindow scratch{};
+    deploy::MappedBundle<> bundle{};
+    deploy::ScratchWindow<> scratch{};
     Source source{};
     Authorities authorities{};
     Plans plans{};
-    myos::deploy::ManifestWorkspace manifest_workspace{};
+    deploy::ManifestWorkspace manifest_workspace{};
     Table table{};
     Completions completions{};
     Workspace workspace{};
-    myos::deploy::AuthorityId domain{};
-    myos::deploy::AuthorityId typed_source{};
-    myos::deploy::DeploymentPlan plan{};
+    deploy::AuthorityId domain{};
+    deploy::AuthorityId typed_source{};
+    deploy::DeploymentPlan plan{};
     const void* bootstrap{};
     myos_word_t bootstrap_size{};
     uint32_t cpu_count{};
@@ -208,7 +208,7 @@ Runtime runtime{};
         : 0;
 }
 
-[[nodiscard]] auto drain_task(myos::deploy::TaskId id) noexcept -> bool {
+[[nodiscard]] auto drain_task(deploy::TaskId id) noexcept -> bool {
     for (size_t attempt = 0; attempt < 256; ++attempt) {
         const myos_status_t status = runtime.table.continue_close(id);
         if (status == MYOS_STATUS_OK) {
@@ -358,7 +358,7 @@ Runtime runtime{};
         || runtime.bundle.open(
                myos::cap::CapRef{root_vspace, 0},
                myos::cap::CapRef{root_bundle, 0},
-               myos::deploy::Window{BundleAddress, bundle_window},
+               deploy::Window{BundleAddress, bundle_window},
                bootstrap.bundle_size()) != MYOS_STATUS_OK) {
         return false;
     }
@@ -366,8 +366,8 @@ Runtime runtime{};
     runtime.console.text("task-builder-test: bundle\n");
     if (runtime.scratch.open(
             myos::cap::CapRef{root_vspace, 0},
-            myos::deploy::Window{ScratchAddress, ScratchSize},
-            myos::deploy::Window{BundleAddress, bundle_window})
+            deploy::Window{ScratchAddress, ScratchSize},
+            deploy::Window{BundleAddress, bundle_window})
         != MYOS_STATUS_OK) {
         return false;
     }
@@ -377,14 +377,14 @@ Runtime runtime{};
 }
 
 [[nodiscard]] auto decode_plan() noexcept -> bool {
-    const auto manifest = myos::deploy::ManifestView::parse(
+    const auto manifest = deploy::ManifestView::parse(
         myos::task_builder_fixture::manifest,
         myos::task_builder_fixture::manifest_size,
         runtime.manifest_workspace);
     if (!manifest) {
         return false;
     }
-    auto decoded = myos::deploy::DeploymentPlan::decode(
+    auto decoded = deploy::DeploymentPlan::decode(
         manifest.value(), runtime.plans);
     if (!decoded) {
         return false;
@@ -395,10 +395,10 @@ Runtime runtime{};
 }
 
 [[nodiscard]] auto observe_completion(
-    myos::deploy::TaskId id,
-    myos::deploy::CloseReason reason,
+    deploy::TaskId id,
+    deploy::CloseReason reason,
     myos_status_t status,
-    myos::deploy::TaskBuilder<Table, Completions>& builder,
+    deploy::TaskBuilder<Table, Completions>& builder,
     libk::optional<Completions::Receiver>& receiver) noexcept -> bool {
     if (builder.valid() && !builder.fail(reason, status)) {
         return false;
@@ -443,13 +443,13 @@ Runtime runtime{};
         || data.memory_size - data.file_size < 2 * PageSize) {
         return libk::nullopt;
     }
-    const myos::deploy::PlanTask* const row = runtime.plan.task(task_index);
+    const deploy::PlanTask* const row = runtime.plan.task(task_index);
     if (row == nullptr
         || row->mappings.count != (task_index == 3 ? 4U : 5U)) {
         return libk::nullopt;
     }
     const auto mapping = [&](uint32_t local) noexcept
-        -> const myos::deploy::PlanMapping* {
+        -> const deploy::PlanMapping* {
         return runtime.plan.mapping(row->mappings.first + local);
     };
     const auto* const code = mapping(0);
@@ -458,25 +458,25 @@ Runtime runtime{};
     const auto* const bootstrap = mapping(3);
     if (code == nullptr || data_mapping == nullptr || stack == nullptr
         || bootstrap == nullptr
-        || code->source != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
-        || code->segment != 0 || code->critical != MYOS_DEPLOY_CRITICAL_CODE
+        || code->source != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+        || code->segment != 0 || code->critical != DEPLOY_CRITICAL_CODE
         || data_mapping->source
-            != MYOS_DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
+            != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
         || data_mapping->segment != 1
-        || data_mapping->critical != MYOS_DEPLOY_CRITICAL_NONE
-        || stack->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
+        || data_mapping->critical != DEPLOY_CRITICAL_NONE
+        || stack->source != DEPLOY_MAPPING_SOURCE_ZERO
         || stack->critical
-            != (task_index == 4 ? MYOS_DEPLOY_CRITICAL_STACK
-                                 : MYOS_DEPLOY_CRITICAL_NONE)
-        || bootstrap->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
-        || bootstrap->critical != MYOS_DEPLOY_CRITICAL_BOOTSTRAP) {
+            != (task_index == 4 ? DEPLOY_CRITICAL_STACK
+                                 : DEPLOY_CRITICAL_NONE)
+        || bootstrap->source != DEPLOY_MAPPING_SOURCE_ZERO
+        || bootstrap->critical != DEPLOY_CRITICAL_BOOTSTRAP) {
         return libk::nullopt;
     }
     if (task_index == 4) {
         const auto* const descriptor = mapping(4);
         if (descriptor == nullptr
-            || descriptor->source != MYOS_DEPLOY_MAPPING_SOURCE_ZERO
-            || descriptor->critical != MYOS_DEPLOY_CRITICAL_NONE) {
+            || descriptor->source != DEPLOY_MAPPING_SOURCE_ZERO
+            || descriptor->critical != DEPLOY_CRITICAL_NONE) {
             return libk::nullopt;
         }
     }
@@ -506,10 +506,10 @@ Runtime runtime{};
     if (!receiver) {
         return false;
     }
-    myos::deploy::TaskAuthorityBindings bindings{};
+    deploy::TaskAuthorityBindings bindings{};
     bindings.domains[0] = runtime.domain;
     bindings.imports[0] = runtime.typed_source;
-    myos::deploy::TaskConstructionInput<Backend, Authorities> input{
+    deploy::TaskConstructionInput<Backend, Authorities> input{
         .parent_pool = runtime.parent.reference(),
         .bundle = &runtime.bundle,
         .scratch = &runtime.scratch,
@@ -536,7 +536,7 @@ Runtime runtime{};
         if (constructed != MYOS_STATUS_OK || !builder.commit_prepared()) {
             return observe_completion(
                 id,
-                myos::deploy::CloseReason::ConstructionFailure,
+                deploy::CloseReason::ConstructionFailure,
                 constructed == MYOS_STATUS_OK
                     ? MYOS_STATUS_INTERNAL : constructed,
                 builder,
@@ -545,20 +545,20 @@ Runtime runtime{};
         const auto* prepared = runtime.table.record(id);
         const auto expected = expected_critical_bytes(task_index);
         if (prepared == nullptr
-            || prepared->state() != myos::deploy::TaskState::Prepared
+            || prepared->state() != deploy::TaskState::Prepared
             || !expected
             || prepared->accounting().total_bytes != *expected) {
             return false;
         }
         if (!runtime.table.begin_close(
-                id, myos::deploy::CloseReason::Explicit, MYOS_STATUS_OK)
+                id, deploy::CloseReason::Explicit, MYOS_STATUS_OK)
             || !drain_task(id)) {
             return false;
         }
         const auto result = receiver->take();
         return result.has_value()
             && result->task == id
-            && result->reason == myos::deploy::CloseReason::Explicit
+            && result->reason == deploy::CloseReason::Explicit
             && result->status == MYOS_STATUS_OK;
     }
 
@@ -600,7 +600,7 @@ Runtime runtime{};
     }
     const bool completion_ok = observe_completion(
             id,
-            myos::deploy::CloseReason::ConstructionFailure,
+            deploy::CloseReason::ConstructionFailure,
             expected,
             builder,
             receiver);
@@ -710,8 +710,8 @@ Runtime runtime{};
     }
     if (complete) {
         runtime.console.text("task-builder-test: cuts-ok\n");
-    } else if (runtime.console.phase != myos::deploy::LeasePhase::Empty
-               && runtime.console.phase != myos::deploy::LeasePhase::Closed) {
+    } else if (runtime.console.phase != deploy::LeasePhase::Empty
+               && runtime.console.phase != deploy::LeasePhase::Closed) {
         runtime.console.text("task-builder-test: failed\n");
     }
     return cleanup(complete) && complete;

@@ -59,16 +59,16 @@ auto Transfer::prepare(
         }
 
         cap::GrantRef prepared{};
-        cap::CapView destination_view{};
+        cap::Authority destination_view{};
         switch (spec.kind) {
         case TransferKind::Copy: {
             if (!effective.value().rights.contains(cap::Right::Duplicate)) {
                 return libk::unexpected(cap::CSpaceError::Denied);
             }
-            destination_view = cap::CapView{
+            destination_view = cap::Authority{
                 spec.rights, effective.value().data};
             auto valid = cap::compose(
-                lease.kind(), effective.value().ceiling(), destination_view);
+                lease.kind(), effective.value(), destination_view);
             auto cloned = source_snapshot.graph->ref(source_snapshot.key);
             if (!valid || !cloned) {
                 return libk::unexpected(!valid
@@ -85,9 +85,9 @@ auto Transfer::prepare(
             if (!effective.value().rights.contains(cap::Right::Delegate)) {
                 return libk::unexpected(cap::CSpaceError::Denied);
             }
-            const cap::GrantCeiling ceiling{
+            const cap::Authority ceiling{
                 spec.rights, effective.value().data};
-            destination_view = cap::CapView{
+            destination_view = cap::Authority{
                 spec.rights, effective.value().data};
             if (!cap::attenuates(lease.kind(), effective.value(), ceiling)) {
                 return libk::unexpected(cap::CSpaceError::Amplification);

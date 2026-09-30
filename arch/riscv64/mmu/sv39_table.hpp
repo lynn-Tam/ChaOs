@@ -4,7 +4,7 @@
 
 #include <core/debug.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/new.hpp>
+#include <new>
 #include <mm/pmm.hpp>
 
 namespace arch::riscv64 {

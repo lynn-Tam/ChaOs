@@ -1,7 +1,7 @@
 #include <test/test.hpp>
 
 #include <libk/align.hpp>
-#include <libk/array.hpp>
+#include <array>
 #include <libk/byte_reader.hpp>
 #include <libk/expected.hpp>
 #include <libk/intrusive_tree.hpp>
@@ -384,14 +384,13 @@ bool test_checked_arithmetic_reports_overflow(const TestContext&) noexcept {
 
 bool test_array_and_string_views_preserve_empty_contracts(
     const TestContext&) noexcept {
-    libk::Array<int, 0> empty_array{};
-    libk::Array<int, 3> values{{4, 5, 6}};
+    std::array<int, 0> empty_array{};
+    std::array<int, 3> values{{4, 5, 6}};
     const libk::StrView empty{};
     const libk::StrView text{"kernel"};
 
     return empty_array.empty()
         && empty_array.size() == 0
-        && empty_array.data() == nullptr
         && empty_array.begin() == empty_array.end()
         && !values.empty()
         && values.size() == 3

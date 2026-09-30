@@ -125,23 +125,9 @@ using AuthorityData = libk::variant<
     PagerAuthority,
     IrqAuthority>;
 
-struct GrantCeiling final {
+struct Authority final {
     Rights rights{};
     AuthorityData data{};
-};
-
-struct CapView final {
-    Rights rights{};
-    AuthorityData data{};
-};
-
-struct EffectiveAuthority final {
-    Rights rights{};
-    AuthorityData data{};
-
-    [[nodiscard]] auto ceiling() const noexcept -> GrantCeiling {
-        return GrantCeiling{rights, data};
-    }
 };
 
 // Proof carried only across the VSpace-owned create-region transaction. It

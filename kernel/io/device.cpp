@@ -60,7 +60,7 @@ DeviceLease::~DeviceLease() noexcept {
     device_->release();
 }
 
-auto DeviceLease::bars() const noexcept -> const libk::Array<arch::PciBar, 6>& {
+auto DeviceLease::bars() const noexcept -> const std::array<arch::PciBar, 6>& {
     KASSERT(device_ != nullptr);
     return device_->function_.bars();
 }
@@ -76,7 +76,7 @@ auto DeviceLease::irq_source() const noexcept -> u32 {
     return device_->function_.irq_source();
 }
 
-auto DeviceLease::configuration() const noexcept -> const libk::Array<u32, 64>& {
+auto DeviceLease::configuration() const noexcept -> const std::array<u32, 64>& {
     KASSERT(device_ != nullptr);
     return device_->function_.configuration();
 }

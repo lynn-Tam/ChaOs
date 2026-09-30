@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cap/resolved.hpp>
 #include <io/device.hpp>
 #include <irq/irq.hpp>
@@ -99,7 +100,7 @@ private:
         cap::GrantRef grant{};
         cap::GrantRevoke revoke{};
     };
-    libk::Array<Bar, 6> bars_{};
+    std::array<Bar, 6> bars_{};
     object::ObjectHold<irq::Irq> interrupt_{};
     cap::GrantRef interrupt_grant_{};
     cap::GrantRevoke interrupt_revoke_{};

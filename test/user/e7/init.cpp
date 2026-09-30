@@ -1,10 +1,10 @@
 #include <test/user/e7/protocol.hpp>
-#include <user/lib/bootstrap.hpp>
-#include <user/lib/boot_bundle.hpp>
-#include <user/lib/deployment_syscall.hpp>
-#include <user/lib/image_materializer.hpp>
-#include <user/lib/syscall.hpp>
-#include <user/lib/uart.hpp>
+#include <user/abi/startup.hpp>
+#include <servers/deploy/bundle.hpp>
+#include <servers/deploy/detail/space.hpp>
+#include <servers/deploy/detail/image.hpp>
+#include <user/abi/calls.hpp>
+#include <servers/uart/port.hpp>
 #include <uapi/bootstrap.h>
 
 namespace {
@@ -177,10 +177,10 @@ private:
 class Loader final {
 public:
     using Backend = myos::cap::SyscallBackend;
-    using Task = myos::cap::TaskSpace<128, 24>;
-    using Bundle = myos::cap::MappedBundle;
-    using Scratch = myos::cap::ScratchWindow;
-    using Materializer = myos::deploy::ImageMaterializer<
+    using Task = deploy::TaskSpace<128, 24>;
+    using Bundle = deploy::MappedBundle<>;
+    using Scratch = deploy::ScratchWindow<>;
+    using Materializer = deploy::ImageMaterializer<
         128, 24, Backend, 16, MaxStacks>;
     using Image = Materializer::Image;
 
@@ -209,7 +209,7 @@ public:
         if (bundle_window_size == 0
             || bundle_view_.open(
                 root_vspace, bundle,
-                myos::deploy::Window{
+                deploy::Window{
                     .address = BundleAddress,
                     .size = bundle_window_size},
                 bundle_size_) != MYOS_STATUS_OK) {
@@ -256,10 +256,10 @@ public:
         stage_ = 3;
         if (scratch_.open(
                 root_vspace,
-                myos::deploy::Window{
+                deploy::Window{
                     .address = ScratchAddress,
                     .size = scratch_size},
-                myos::deploy::Window{
+                deploy::Window{
                     .address = BundleAddress,
                     .size = bundle_window_size}) != MYOS_STATUS_OK) {
             return false;
@@ -444,7 +444,7 @@ private:
         static_cast<myos_word_t>(-1);
 
     struct Target final {
-        myos::deploy::LocalSlot slot{};
+        deploy::LocalSlot slot{};
         myos_object_kind_t kind{MYOS_OBJECT_KIND_INVALID};
     };
 
@@ -530,7 +530,7 @@ private:
     [[nodiscard]] auto adopt_local_selector(
         myos_cap_t selector,
         myos_object_kind_t kind) noexcept
-        -> libk::optional<myos::deploy::LocalSlot> {
+        -> libk::optional<deploy::LocalSlot> {
         if (selector == 0) {
             return libk::nullopt;
         }
@@ -630,7 +630,7 @@ private:
         myos_word_t size,
         myos_word_t access,
         myos_cap_t& result,
-        myos::deploy::LocalSlot* slot = nullptr) noexcept -> bool {
+        deploy::LocalSlot* slot = nullptr) noexcept -> bool {
         const auto memory = myos::memory_create(pool_, size, access);
         if (memory.status != MYOS_STATUS_OK || memory.value == 0) {
             return false;
@@ -721,7 +721,7 @@ private:
     // the only destination-slot and sponsorship owners.
     [[nodiscard]] auto exercise_typed_delegate() noexcept -> bool {
         myos_cap_t descriptor_memory{};
-        myos::deploy::LocalSlot descriptor_slot{};
+        deploy::LocalSlot descriptor_slot{};
         if (!create_memory(
                 TypedDescriptorSize,
                 MYOS_VM_READ | MYOS_VM_WRITE,
@@ -900,7 +900,7 @@ private:
             return false;
         }
         myos_cap_t descriptor_replacement{};
-        myos::deploy::LocalSlot descriptor_replacement_slot{};
+        deploy::LocalSlot descriptor_replacement_slot{};
         if (!create_memory(
                 TypedDescriptorSize,
                 MYOS_VM_READ | MYOS_VM_WRITE,
@@ -1247,9 +1247,9 @@ private:
         const Descriptor& descriptor,
         myos_object_kind_t kind,
         Constructor&& constructor,
-        myos::deploy::LocalSlot& output) noexcept -> myos::SysResult {
+        deploy::LocalSlot& output) noexcept -> myos::SysResult {
         output = {};
-        myos::deploy::LocalSlot slot{};
+        deploy::LocalSlot slot{};
         const myos_status_t populated = materializer.materialize_descriptor(
             &descriptor, sizeof(descriptor), slot);
         if (populated != MYOS_STATUS_OK) {
@@ -1986,7 +1986,7 @@ private:
     bool resilience_{};
     /*luna change: keep the doomed worker's stable TaskSpace slot for terminal
       evidence, reason: the execution selector is a derived lookup only*/
-    myos::deploy::LocalSlot worker_slot_{};
+    deploy::LocalSlot worker_slot_{};
     myos_cap_t pool_{};
     myos_cap_t child_vspace_{};
     myos_cap_t child_cspace_{};
@@ -2023,7 +2023,7 @@ private:
     Target targets_[
         MaxThreads + ChannelThreadCount + MaxPagerWorkers + VprocCount]{};
     myos_word_t target_count_{};
-    myos::deploy::LocalSlot endpoint_slot_{};
+    deploy::LocalSlot endpoint_slot_{};
     bool closed_{};
     myos_word_t stage_{};
     bool observe_enabled_{};
@@ -2039,10 +2039,10 @@ private:
 class UartLoader final {
 public:
     using Backend = myos::cap::SyscallBackend;
-    using Task = myos::cap::TaskSpace<48, 8>;
-    using Bundle = myos::cap::MappedBundle;
-    using Scratch = myos::cap::ScratchWindow;
-    using Materializer = myos::deploy::ImageMaterializer<
+    using Task = deploy::TaskSpace<48, 8>;
+    using Bundle = deploy::MappedBundle<>;
+    using Scratch = deploy::ScratchWindow<>;
+    using Materializer = deploy::ImageMaterializer<
         48, 8, Backend, 16, 4>;
     using Image = Materializer::Image;
 
@@ -2068,7 +2068,7 @@ public:
         if (bundle_window_size == 0
             || bundle_view_.open(
                 root_vspace_, bundle_,
-                myos::deploy::Window{
+                deploy::Window{
                     .address = UartBundleAddress,
                     .size = bundle_window_size},
                 bundle_size_) != MYOS_STATUS_OK) {
@@ -2098,7 +2098,7 @@ public:
         }
         if (scratch_.open(
                 root_vspace_,
-                myos::deploy::Window{
+                deploy::Window{
                     .address = UartScratchAddress,
                     .size = scratch_size_}) != MYOS_STATUS_OK) {
             return false;
@@ -2332,7 +2332,7 @@ private:
     }
 
     [[nodiscard]] auto prepare() noexcept
-        -> libk::optional<myos::deploy::LocalSlot> {
+        -> libk::optional<deploy::LocalSlot> {
         const auto pool_cap = pool();
         const auto child_vspace = vspace();
         const auto child_cspace = manager();
@@ -2429,8 +2429,8 @@ private:
     Scratch scratch_{};
     Image image_{};
     typename Image::Mapping info_mapping_{};
-    myos::deploy::LocalSlot start_slot_{};
-    myos::deploy::LocalSlot thread_slot_{};
+    deploy::LocalSlot start_slot_{};
+    deploy::LocalSlot thread_slot_{};
     myos_word_t scratch_size_{PageSize};
     myos_word_t entry_{};
     myos_word_t stage_{};

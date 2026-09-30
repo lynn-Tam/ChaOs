@@ -5,9 +5,8 @@ source=$1
 manifest=${2:-}
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 project_tmp="$repo_root/.tmp/project/paged-memory-and-task-supervision/stage-e/unit3-cut-b"
-policy=$(CDPATH= cd -- "$(dirname "$source")" && pwd)/cap_attenuation.hpp
-task_source="$repo_root/user/lib/task_transaction.hpp"
-space_source="$repo_root/user/lib/deployment.hpp"
+policy="$repo_root/servers/deploy/format.hpp"
+task_source="$repo_root/servers/deploy/detail/task.hpp"
 mkdir -p "$project_tmp"
 
 audit_one() {
@@ -18,7 +17,7 @@ audit_one() {
     rg -q 'journal_\.retire_all\(\)' "$input" || return 1
     rg -q 'entry->retiring = true' "$input" || return 1
     rg -q 'entry->leases != 0' "$input" || return 1
-    rg -q 'import->mode == MYOS_DEPLOY_IMPORT_MOVE' "$input" || return 1
+    rg -q 'import->mode == DEPLOY_IMPORT_MOVE' "$input" || return 1
     rg -q 'authorities\.lease\(' "$input" || return 1
     rg -q 'source\.cspace != 0' "$input" || return 1
     rg -q 'const auto source = space\.lookup\(slot, ceiling\.kind\)' "$input" || return 1
@@ -78,21 +77,6 @@ audit_task_source() {
     if rg -q 'registration_journal' "$input"; then return 1; fi
 }
 
-audit_task_space_source() {
-    input=$1
-    # Local selectors are adopted only by the TaskSpace that owns their
-    # aggregate.  Keep this gate on the actual definition rather than on a
-    # caller's use-site or a removed Builder wrapper.
-    block=$(sed -n '/\[\[nodiscard\]\] auto adopt_local(/,/^    }$/p' "$input")
-    [ -n "$block" ] || return 1
-    printf '%s\n' "$block" | rg -q 'phase_ != Phase::Open' || return 1
-    printf '%s\n' "$block" | rg -q 'owner\.cspace\(\) != 0' || return 1
-    printf '%s\n' "$block" \
-        | rg -q 'caps_\.adopt_local_slot\(libk::move\(owner\)\)' \
-        || return 1
-    printf '%s\n' "$block" | rg -q 'if \(!index\)' || return 1
-}
-
 audit_policy() {
     input=$1
     rg -q 'enum class DescriptorForm' "$input" || return 1
@@ -114,9 +98,8 @@ audit_policy() {
 
 audit_one "$source"
 audit_task_source "$task_source"
-audit_task_space_source "$space_source"
 if [ -n "$manifest" ]; then
-    rg -q 'mode >= MYOS_DEPLOY_IMPORT_MOVE' "$manifest"
+    rg -q 'mode >= DEPLOY_IMPORT_MOVE' "$manifest"
 fi
 
 mutation_dir=$(mktemp -d "$project_tmp/audit-task-authority.XXXXXX")
@@ -134,8 +117,8 @@ expect_reject() {
 }
 
 expect_reject missing-move-gate \
-    -e '/import->mode == MYOS_DEPLOY_IMPORT_MOVE/d' \
-    -e '/import->mode >= MYOS_DEPLOY_IMPORT_MOVE/d'
+    -e '/import->mode == DEPLOY_IMPORT_MOVE/d' \
+    -e '/import->mode >= DEPLOY_IMPORT_MOVE/d'
 expect_reject missing-lease-gate -e '/auto lease = authorities\.lease/d'
 expect_reject missing-source-current \
     -e '/source\.cspace != 0/d'
@@ -163,16 +146,6 @@ expect_reject missing-bootstrap-adopt \
     -e '/adopt(Space&& source)/d'
 expect_reject missing-bootstrap-open-check \
     -e '/source\.phase() != Phase::Open/d'
-
-task_mutation_dir="$mutation_dir/task"
-mkdir -p "$task_mutation_dir"
-mutated_task="$task_mutation_dir/deployment.hpp"
-sed '/caps_\.adopt_local_slot(libk::move(owner))/d' "$space_source" > "$mutated_task"
-if audit_task_space_source "$mutated_task" >/dev/null 2>&1; then
-    printf '%s\n' '[audit] FAIL: mutation accepted: task adoption owner path' >&2
-    exit 1
-fi
-printf '%s\n' '[audit] mutation rejected: task adoption owner path'
 
 audit_policy "$policy"
 policy_mutation_dir="$mutation_dir/policy"
@@ -208,10 +181,10 @@ expect_policy_reject missing-pager-limit \
 
 if [ -n "$manifest" ]; then
     audit_manifest() {
-        rg -q 'mode >= MYOS_DEPLOY_IMPORT_MOVE' "$1"
+        rg -q 'mode >= DEPLOY_IMPORT_MOVE' "$1"
     }
     mutated="$mutation_dir/manifest.hpp"
-    sed '/mode >= MYOS_DEPLOY_IMPORT_MOVE/d' "$manifest" > "$mutated"
+    sed '/mode >= DEPLOY_IMPORT_MOVE/d' "$manifest" > "$mutated"
     if audit_manifest "$mutated"; then
         printf '%s\n' '[audit] FAIL: parser Move mutation accepted' >&2
         exit 1

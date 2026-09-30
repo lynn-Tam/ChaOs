@@ -48,7 +48,7 @@ auto handle_vm(usize operation, Invocation& invocation) noexcept -> Result {
     if (!target) {
         return returned(cap_status(target.error()));
     }
-    const cap::EffectiveAuthority effective = target.value().authority();
+    const cap::Authority effective = target.value().authority();
     const auto* const where =
         libk::get_if<cap::VSpaceAuthority>(&effective.data);
     KASSERT(where != nullptr);
