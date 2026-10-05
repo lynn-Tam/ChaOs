@@ -1,197 +1,55 @@
+#include <optional>
 #include <io/device.hpp>
+#include <utility>
 
-#include <core/debug.hpp>
-#include <libk/utility.hpp>
-#include <sync/irq_lock_guard.hpp>
+namespace io {
 
-namespace kernel::io {
+Device::~Device() noexcept { libk_assert(!reserved_); }
 
-Device::~Device() noexcept {
-    KASSERT(!reserved_);
-}
-
-auto Device::info() const noexcept -> DeviceInfo {
-    DeviceInfo snapshot{.configuration = function_.configuration(),
-        .requester = function_.requester()};
-    for (usize i = 0; i < snapshot.bar_sizes.size(); ++i)
-        snapshot.bar_sizes[i] = function_.bars()[i].size;
-    return snapshot;
-}
-
-auto Device::acquire(void* context, Stop stop) noexcept -> libk::optional<DeviceLease> {
-    sync::IrqLockGuard guard{lock_};
-    if (reserved_ || retired_) return libk::nullopt;
-    KASSERT((context == nullptr) == (stop == nullptr));
+auto Device::acquire(Stop stop) noexcept -> std::optional<DeviceLease> {
+    sync::Lock guard{lock_};
+    if (reserved_ || retired_) return std::nullopt;
+    hw_.reserve();
     reserved_ = true;
-    context_ = context;
     stop_ = stop;
-    return libk::optional<DeviceLease>{DeviceLease{*this}};
+    return std::optional<DeviceLease>{DeviceLease{*this}};
 }
 
 void Device::retire() noexcept {
-    sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     if (retired_) return;
     retired_ = true;
-    if (stop_) stop_(context_, false);
+    if (stop_) stop_(false);
 }
 
 void Device::signal_fault() noexcept {
-    sync::IrqLockGuard guard{lock_};
-    if (stop_) stop_(context_, true);
+    sync::Lock guard{lock_};
+    if (stop_) stop_(true);
 }
 
 void Device::release() noexcept {
-    sync::IrqLockGuard guard{lock_};
-    KASSERT(reserved_);
+    sync::Lock guard{lock_};
+    libk_assert(reserved_);
     reserved_ = false;
-    context_ = nullptr;
-    stop_ = nullptr;
+    stop_.reset();
 }
 
 DeviceLease::DeviceLease(DeviceLease&& other) noexcept
-    : device_(libk::exchange(other.device_, nullptr)),
-      root_(libk::move(other.root_)), state_(other.state_),
-      deadline_(other.deadline_), ticket_(other.ticket_) {}
+    : device_(std::exchange(other.device_, nullptr)) {}
 
 DeviceLease::~DeviceLease() noexcept {
-    if (device_ == nullptr) return;
-    KASSERT(state_ == State::Reserved || state_ == State::Closed);
-    KASSERT(!root_);
+    if (!device_) return;
+    libk_assert(state() == State::Reserved || state() == State::Closed);
     device_->release();
 }
 
-auto DeviceLease::bars() const noexcept -> const std::array<arch::PciBar, 6>& {
-    KASSERT(device_ != nullptr);
-    return device_->function_.bars();
-}
+auto DeviceLease::state() const noexcept -> State { return device_->hw_.state(); }
+auto DeviceLease::bars() const noexcept -> const std::array<Bar, 6>& { return device_->hw_.bars(); }
+auto DeviceLease::config32(u16 offset) const noexcept -> u32 { return device_->hw_.config32(offset); }
+auto DeviceLease::irq_source() const noexcept -> irq::Line { return device_->hw_.irq(); }
+auto DeviceLease::take_fault() noexcept -> std::optional<Fault> { return device_->hw_.take_fault(); }
+void DeviceLease::open(mm::PageTable&& root) noexcept { device_->hw_.open(std::move(root)); }
+void DeviceLease::close() noexcept { device_->hw_.close(); }
+auto DeviceLease::poll() noexcept -> State { return device_->hw_.poll(); }
 
-auto DeviceLease::config32(u16 offset) const noexcept -> u32 {
-    KASSERT(device_ != nullptr);
-    KASSERT(state_ == State::Reserved || state_ == State::Active);
-    return device_->function_.config32(offset);
-}
-
-auto DeviceLease::irq_source() const noexcept -> u32 {
-    KASSERT(device_ != nullptr);
-    return device_->function_.irq_source();
-}
-
-auto DeviceLease::configuration() const noexcept -> const std::array<u32, 64>& {
-    KASSERT(device_ != nullptr);
-    return device_->function_.configuration();
-}
-
-auto DeviceLease::take_fault() noexcept -> libk::optional<arch::IoFault> {
-    KASSERT(device_ != nullptr);
-    return device_->iommu_.take_fault(device_->requester());
-}
-
-auto DeviceLease::deadline(u64 nanoseconds) noexcept -> bool {
-    const auto duration = device_->clock_.duration_from_nanoseconds(nanoseconds);
-    const auto end = duration ? device_->clock_.now().checked_add(*duration)
-                              : libk::nullopt;
-    if (!end) {
-        fail();
-        return false;
-    }
-    deadline_ = *end;
-    return true;
-}
-
-void DeviceLease::open(arch::IoRoot&& root) noexcept {
-    KASSERT(device_ != nullptr && state_ == State::Reserved);
-    KASSERT(root.page_count() != 0);
-    root_.emplace(libk::move(root));
-    state_ = State::Opening;
-    if (!deadline(1'000'000'000)) return;
-    const auto issued = device_->iommu_.replace(device_->requester(), root_->page());
-    if (!issued && issued.error() != arch::IommuError::Busy) {
-        fail();
-        return;
-    }
-    if (issued) ticket_ = issued.value();
-}
-
-void DeviceLease::reset_device() noexcept {
-    // BAR retirement precedes this call. A device-memory read drains prior CPU
-    // posted writes while decode is still enabled; virtio reset drains the selected
-    // QEMU virtio backend. IOFENCE alone cannot prove backend quiescence.
-    device_->function_.disable_dma();
-    device_->function_.flush_mmio();
-    device_->function_.begin_reset();
-    state_ = State::Resetting;
-    static_cast<void>(deadline(1'000'000'000));
-}
-
-void DeviceLease::close() noexcept {
-    KASSERT(device_ != nullptr);
-    switch (state_) {
-    case State::Reserved: state_ = State::Closed; break;
-    case State::Opening: state_ = State::ClosingOpening; break;
-    case State::Active: reset_device(); break;
-    default: break;
-    }
-}
-
-auto DeviceLease::poll() noexcept -> State {
-    KASSERT(device_ != nullptr);
-    switch (state_) {
-    case State::Opening:
-    case State::ClosingOpening:
-    case State::Invalidating: {
-        if (ticket_ == 0) {
-            if (state_ == State::ClosingOpening) {
-                reset_device();
-                break;
-            }
-            const auto issued = device_->iommu_.replace(device_->requester(), root_->page());
-            if (issued) ticket_ = issued.value();
-            else if (issued.error() != arch::IommuError::Busy) fail();
-            if (ticket_ == 0) {
-                if (device_->clock_.now() >= deadline_) fail();
-                break;
-            }
-        }
-        const auto completion = device_->iommu_.poll(ticket_);
-        if (completion == arch::IoStatus::Failed) {
-            fail();
-        } else if (completion == arch::IoStatus::Pending) {
-            if (device_->clock_.now() >= deadline_) fail();
-        } else if (state_ == State::Opening) {
-            device_->function_.enable_dma();
-            state_ = State::Active;
-        } else if (state_ == State::ClosingOpening) {
-            reset_device();
-        } else {
-            const auto cleared = device_->iommu_.clear_faults(device_->requester());
-            if (cleared == arch::IoStatus::Pending) break;
-            if (cleared == arch::IoStatus::Failed) {
-                fail();
-                break;
-            }
-            root_.reset();
-            state_ = State::Closed;
-        }
-        break;
-    }
-    case State::Resetting:
-        if (!device_->function_.reset_complete()) {
-            if (device_->clock_.now() >= deadline_) fail();
-            break;
-        }
-        if (const auto issued = device_->iommu_.replace(device_->requester(), libk::nullopt)) {
-            ticket_ = issued.value();
-            state_ = State::Invalidating;
-            static_cast<void>(deadline(1'000'000'000));
-        } else if (issued.error() != arch::IommuError::Busy) {
-            fail();
-        } else if (device_->clock_.now() >= deadline_) {
-            fail();
-        }
-        break;
-    default: break;
-    }
-    return state_;
-}
-
-} // namespace kernel::io
+} // namespace io

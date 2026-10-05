@@ -3,16 +3,14 @@
 #include "arch/riscv64/cpu/local_entry.hpp"
 #include "arch/riscv64/cpu/start_context.hpp"
 
-#include <core/types.hpp>
-#include <cpu/topology.hpp>
-#include <libk/expected.hpp>
+#include <base/types.hpp>
+#include <cpu/types.hpp>
+#include <expected>
 
-namespace kernel {
 class KernelState;
 struct CpuRuntime;
-}
 
-namespace kernel::mm {
+namespace mm {
 class DirectMap;
 }
 
@@ -31,10 +29,10 @@ enum class CpuStartError : u8 {
 
 [[nodiscard]] auto secondary_start_available() noexcept -> bool;
 [[nodiscard]] auto start_secondary(
-    kernel::CpuHardwareId hardware_id,
+    CpuHwId hardware_id,
     CpuStartContext& context,
-    const kernel::mm::DirectMap& direct_map) noexcept
-    -> libk::Expected<void, CpuStartError>;
+    const mm::DirectMap& direct_map) noexcept
+    -> std::expected<void, CpuStartError>;
 
 void initialize_cpu_entry(CpuEntryState& state, void* owner) noexcept;
 [[nodiscard]] auto set_local_cpu_entry(CpuEntryState& state) noexcept -> bool;

@@ -6,23 +6,6 @@
 
 namespace libk {
 
-namespace spin_lock_detail {
-
-inline void wait_hint() noexcept {
-#if defined(__i386__) || defined(__x86_64__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-    asm volatile("yield" ::: "memory");
-#else
-    // The atomic load remains the synchronization operation. This fence only
-    // prevents an unsupported target from turning the empty wait body into an
-    // overly aggressive compiler loop.
-    atomic_signal_fence<MemoryOrder::SeqCst>();
-#endif
-}
-
-} // namespace spin_lock_detail
-
 // Fair, allocation-free mutual exclusion for short non-sleeping sections.
 // IRQ and preemption discipline are deliberately left to kernel-level guards.
 class TicketSpinLock final {
@@ -41,35 +24,10 @@ public:
         const ticket_type ticket =
             next_ticket_.fetch_add<MemoryOrder::Relaxed>(ticket_type{1});
         while (serving_ticket_.load<MemoryOrder::Relaxed>() != ticket) {
-            spin_lock_detail::wait_hint();
+            pause();
         }
         // The final relaxed load observes the preceding owner's release store;
         // acquire once after the wait instead of fencing every poll.
-        atomic_thread_fence<MemoryOrder::Acquire>();
-    }
-
-    // A queued waiter is otherwise invisible to higher-level diagnostics.
-    // The observer overload keeps that policy outside libk while placing the
-    // observation point inside the only loop guaranteed to run in an all-CPU
-    // lock cycle. The ordinary lock() path remains a separate implementation
-    // so production code has no callback or conditional seam.
-    template<typename Observer>
-        requires requires(
-            Observer& observer, ticket_type ticket, ticket_type serving) {
-            { observer(ticket, serving) } noexcept;
-        }
-    void lock(Observer& observer) noexcept {
-        const ticket_type ticket =
-            next_ticket_.fetch_add<MemoryOrder::Relaxed>(ticket_type{1});
-        for (;;) {
-            const ticket_type serving =
-                serving_ticket_.load<MemoryOrder::Relaxed>();
-            if (serving == ticket) {
-                break;
-            }
-            observer(ticket, serving);
-            spin_lock_detail::wait_hint();
-        }
         atomic_thread_fence<MemoryOrder::Acquire>();
     }
 
@@ -97,6 +55,19 @@ public:
     }
 
 private:
+    static void pause() noexcept {
+#if defined(__i386__) || defined(__x86_64__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield" ::: "memory");
+#else
+    // The atomic load remains the synchronization operation. This fence only
+    // prevents an unsupported target from turning the empty wait body into an
+    // overly aggressive compiler loop.
+    atomic_signal_fence<MemoryOrder::SeqCst>();
+#endif
+    }
+
     Atomic<ticket_type> next_ticket_{};
     Atomic<ticket_type> serving_ticket_{};
 };

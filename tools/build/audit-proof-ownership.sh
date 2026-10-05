@@ -62,10 +62,10 @@ audit_one() {
         'const auto context_slot = adopt_local_selector' || true)" -ge 1 ] || return 1
     printf '%s\n' "$thread_block" | rg -q 'sc_bind\(' || return 1
     [ "$(printf '%s\n' "$make_block" | rg -c \
-        'const auto context_slot = adopt_local_selector' || true)" -ge 2 ] || return 1
+        'const auto context_slot = adopt_local_selector' || true)" -ge 1 ] || return 1
 
     channel_start=$(line 'auto make_channel\(\) noexcept -> bool')
-    channel_end=$(line 'auto make_vproc_runtime\(\) noexcept -> bool')
+    channel_end=$(line 'auto construct_descriptor\(')
     [ -n "$channel_start" ] && [ -n "$channel_end" ] || return 1
     channel_block=$(sed -n "${channel_start},$((channel_end - 1))p" "$source")
     [ "$(printf '%s\n' "$channel_block" | rg -c 'channel_mint\(' || true)" -eq 3 ] || return 1

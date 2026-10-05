@@ -8,12 +8,11 @@
 #include <arch/trap.hpp>
 #include <arch/time.hpp>
 #include <arch/cpu.hpp>
-#include <core/debug.hpp>
-#include <diag/console.hpp>
-#include <diag/panic.hpp>
-#include <diag/concurrency.hpp>
+#include <panic.hpp>
+#include <console.hpp>
+#include <trace.hpp>
 #include <trap/trap.hpp>
-#include <sync/trace.hpp>
+#include <sync.hpp>
 
 using arch::riscv64::TrapFrame;
 
@@ -22,58 +21,34 @@ extern "C" void arch_riscv64_trap_entry();
 
 extern "C" auto arch_riscv64_trap_handler(TrapFrame* frame) noexcept
     -> TrapFrame* {
-    KASSERT(frame != nullptr);
+    libk_assert(frame != nullptr);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
-    if (kernel::diag::stop_requested()) {
-        kernel::diag::stop_peer(context);
+    if (arch::panic_stop_requested()) {
+        panic_stop(context);
     }
-    const kernel::trap::Event event = arch::riscv64::make_event(*frame);
-    const u64 entry_tick = (kernel::sync::enabled(
-        kernel::sync::Level::Profile)
-        || kernel::diag::concurrency::enabled(
-            kernel::diag::concurrency::Level::Snapshot))
-        ? arch::trap_entry_tick() : 0;
-    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
-        kernel::sync::trap_enter(
-            event,
-            kernel::sync::enabled(kernel::sync::Level::Profile)
-                ? entry_tick : 0);
-    }
-    if (kernel::diag::concurrency::enabled(
-            kernel::diag::concurrency::Level::Snapshot)) {
-        kernel::diag::concurrency::trap_enter(
-            entry_tick, static_cast<u32>(event.origin()));
-    }
-    kernel::trap::handle(event, context);
+    const trap::Event event = arch::riscv64::make_event(*frame);
+    trace::emit(trace::Event::TrapEnter, static_cast<u64>(event.origin()));
+    if (event.origin() != trap::Origin::User || event.interrupt() != nullptr)
+        trap::handle(event, context);
     return arch::riscv64::raw_frame(context.frame());
 }
 
 extern "C" auto arch_riscv64_trap_exit(TrapFrame* frame) noexcept
     -> TrapFrame* {
-    KASSERT(frame != nullptr);
-    KASSERT(arch::trap_depth() == 0);
+    libk_assert(frame != nullptr);
+    libk_assert(arch::trap_depth() == 0);
 
     arch::TrapContext context = arch::riscv64::make_context(*frame);
-    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
-        kernel::sync::trap_exiting();
-        kernel::sync::assert_no_locks();
-        // The trap's CPU-local diagnostic frame must be retired before
-        // on_exit may dispatch another execution.  A scheduler switch can
-        // return through this hook much later; keeping the old frame live
-        // would make unrelated user traps look recursively nested.
-        kernel::sync::trap_exit(
-            kernel::sync::enabled(kernel::sync::Level::Profile)
-                ? arch::read_clock().ticks() : 0);
-    }
-    if (kernel::diag::concurrency::enabled(
-            kernel::diag::concurrency::Level::Snapshot)) {
-        kernel::diag::concurrency::trap_exit(arch::read_clock().ticks());
-    }
-    kernel::trap::on_exit(context);
+    sync::assert_unlocked();
+    trap::on_exit(arch::riscv64::make_event(*frame), context);
+    trace::emit(trace::Event::TrapExit);
     return arch::riscv64::raw_frame(context.frame());
 }
 
+extern "C" void arch_riscv64_trap_return(TrapFrame*) noexcept {
+    trap::on_return();
+}
 
 namespace arch {
 

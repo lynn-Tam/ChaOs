@@ -1,11 +1,59 @@
 #pragma once
 
 #include <stdint.h>
+#include <bit>
+#include <concepts>
+#include <optional>
+#include <type_traits>
+#include <utility>
 
 #include <libk/concepts.hpp>
 #include <libk/assert.hpp>
 
 namespace libk {
+
+// Enum values normally encode bits. An explicit projection also supports
+// ordinal enums without changing their hardware or wire representation.
+template<typename E, auto encode = std::to_underlying<E>>
+    requires std::is_enum_v<E>
+class enum_flags final {
+    using word = std::underlying_type_t<E>;
+    static_assert(std::unsigned_integral<word>);
+public:
+    constexpr enum_flags() noexcept = default;
+
+    template<typename... T>
+        requires (std::same_as<T, E> && ...)
+    [[nodiscard]] static constexpr auto of(T... values) noexcept -> enum_flags {
+        return from_raw(static_cast<word>((word{} | ... | encode(values))));
+    }
+    [[nodiscard]] constexpr auto contains(E value) const noexcept -> bool {
+        return contains(of(value));
+    }
+    [[nodiscard]] constexpr auto contains(enum_flags other) const noexcept -> bool {
+        return (bits_ & other.bits_) == other.bits_;
+    }
+    [[nodiscard]] constexpr auto intersect(enum_flags other) const noexcept -> enum_flags {
+        return from_raw(static_cast<word>(bits_ & other.bits_));
+    }
+    [[nodiscard]] constexpr auto empty() const noexcept -> bool { return bits_ == 0; }
+    [[nodiscard]] constexpr auto raw() const noexcept -> word { return bits_; }
+
+    // Raw construction preserves bits; callers apply their domain's policy.
+    [[nodiscard]] static constexpr auto from_raw(word bits) noexcept -> enum_flags {
+        enum_flags value;
+        value.bits_ = bits;
+        return value;
+    }
+    [[nodiscard]] static constexpr auto parse(word bits, word allowed) noexcept
+        -> std::optional<enum_flags> {
+        return (bits & ~allowed) == 0
+            ? std::optional<enum_flags>{from_raw(bits)} : std::nullopt;
+    }
+    friend constexpr auto operator==(enum_flags, enum_flags) noexcept -> bool = default;
+private:
+    word bits_{};
+};
 
 // Bit operations intentionally accept only unsigned, non-bool integral types.
 // This keeps shifts and bit-pattern arithmetic free from signed-overflow rules.
@@ -103,96 +151,16 @@ template<UnsignedIntegral T>
         : static_cast<T>((value >> shift) & low_mask<T>(width));
 }
 
-namespace bits_detail {
-
-enum class ZeroSide : uint8_t {
-    Leading,
-    Trailing,
-};
-
-template<ZeroSide side, unsigned width, UnsignedIntegral T>
-[[nodiscard]] constexpr auto count_zero_step(
-    T value,
-    unsigned count) noexcept -> unsigned {
-    if constexpr (width == 0) {
-        return count;
-    } else {
-        bool half_is_zero = false;
-        if constexpr (side == ZeroSide::Leading) {
-            half_is_zero =
-                (value >> (bit_digits<T>() - width)) == T{0};
-        } else {
-            half_is_zero = (value & low_mask<T>(width)) == T{0};
-        }
-
-        if (half_is_zero) {
-            count += width;
-            if constexpr (side == ZeroSide::Leading) {
-                value = static_cast<T>(value << width);
-            } else {
-                value = static_cast<T>(value >> width);
-            }
-        }
-        return count_zero_step<side, width / 2>(value, count);
-    }
-}
-
-template<ZeroSide side, UnsignedIntegral T>
-[[nodiscard]] constexpr auto count_zero(T value) noexcept -> unsigned {
-    constexpr unsigned digits = bit_digits<T>();
-    static_assert((digits & (digits - 1)) == 0);
-    return value == T{0}
-        ? digits
-        : count_zero_step<side, digits / 2>(value, 0);
-}
-
-} // namespace bits_detail
-
-template<UnsignedIntegral T>
-[[nodiscard]] constexpr auto countl_zero(T value) noexcept -> unsigned {
-    return bits_detail::count_zero<bits_detail::ZeroSide::Leading>(value);
-}
-
-template<UnsignedIntegral T>
-[[nodiscard]] constexpr auto countr_zero(T value) noexcept -> unsigned {
-    return bits_detail::count_zero<bits_detail::ZeroSide::Trailing>(value);
-}
-
-template<UnsignedIntegral T>
-[[nodiscard]] constexpr auto popcount(T value) noexcept -> unsigned {
-    static_assert(sizeof(T) <= sizeof(uint64_t));
-    uint64_t bits = static_cast<uint64_t>(value);
-    bits -= (bits >> 1) & UINT64_C(0x5555555555555555);
-    bits = (bits & UINT64_C(0x3333333333333333))
-        + ((bits >> 2) & UINT64_C(0x3333333333333333));
-    bits = (bits + (bits >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
-    return static_cast<unsigned>(
-        (bits * UINT64_C(0x0101010101010101)) >> 56);
-}
-
-template<UnsignedIntegral T>
-[[nodiscard]] constexpr auto bit_width(T value) noexcept -> unsigned {
-    return value == T{0}
-        ? 0u
-        : bit_digits<T>() - countl_zero(value);
-}
-
-template<UnsignedIntegral T>
-[[nodiscard]] constexpr auto has_single_bit(T value) noexcept -> bool {
-    return value != T{0}
-        && (value & static_cast<T>(value - T{1})) == T{0};
-}
-
 template<UnsignedIntegral T>
 [[nodiscard]] constexpr auto find_first_set(T value) noexcept -> unsigned {
-    return value == T{0} ? bit_npos : countr_zero(value);
+    return value == T{0} ? bit_npos : static_cast<unsigned>(std::countr_zero(value));
 }
 
 template<UnsignedIntegral T>
 [[nodiscard]] constexpr auto find_last_set(T value) noexcept -> unsigned {
     return value == T{0}
         ? bit_npos
-        : bit_digits<T>() - 1u - countl_zero(value);
+        : bit_digits<T>() - 1u - static_cast<unsigned>(std::countl_zero(value));
 }
 
 } // namespace libk

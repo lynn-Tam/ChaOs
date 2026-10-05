@@ -1,6 +1,8 @@
+#include <task/exit.hpp>
+#include <irq/irq.hpp>
 #include <test/test.hpp>
 
-#include <cap/policy.hpp>
+#include <cap/cap.hpp>
 #include <ipc/notification.hpp>
 #include <uapi/channel.h>
 #include <uapi/endpoint.h>
@@ -10,13 +12,12 @@ namespace {
 class TestSource final {
 public:
     TestSource() noexcept
-        : binding_(kernel::ipc::NotificationSource::bind<
-              TestSource, &TestSource::closed>(*this)) {}
+        : binding_(ipc::NotificationSource::Closed::bind<&TestSource::closed>(*this)) {}
 
     ~TestSource() noexcept { binding_.reset(); }
 
-    [[nodiscard]] auto binding() noexcept
-        -> kernel::ipc::NotificationSource& {
+    [[nodiscard]] auto sc() noexcept
+        -> ipc::NotificationSource& {
         return binding_;
     }
 
@@ -44,14 +45,14 @@ public:
 private:
     void closed() noexcept { closed_ = true; }
 
-    kernel::ipc::NotificationSource binding_;
+    ipc::NotificationSource binding_;
     u64 sequence_{};
     bool ready_{};
     bool closed_{};
 };
 
 bool test_notification_badges_are_coalesced(const TestContext&) noexcept {
-    kernel::ipc::Notification notification{};
+    ipc::Notification notification{};
     if (!notification.signal(1) || !notification.signal(2)
         || !notification.signal(1)) {
         return false;
@@ -61,14 +62,14 @@ bool test_notification_badges_are_coalesced(const TestContext&) noexcept {
     return first && first.value().badges == 3
         && first.value().sequence == 3
         && !second
-        && second.error() == kernel::ipc::NotificationError::Empty;
+        && second.error() == ipc::NotificationError::Empty;
 }
 
 bool test_notification_source_rearm_preserves_level(
     const TestContext&) noexcept {
-    kernel::ipc::Notification notification{};
+    ipc::Notification notification{};
     TestSource source{};
-    if (!notification.bind(source.binding(), 4)) {
+    if (!notification.bind(source.sc(), 4)) {
         return false;
     }
 
@@ -84,122 +85,122 @@ bool test_notification_source_rearm_preserves_level(
     source.publish();
     source.rearm(observed);
     const auto replayed = notification.take();
-    source.binding().reset();
+    source.sc().reset();
     return replayed && replayed.value().badges == 4
         && replayed.value().sequence > initial.value().sequence
-        && !source.binding().attached() && !source.was_closed();
+        && !source.sc().attached() && !source.was_closed();
 }
 
 bool test_notification_source_has_one_receiver(const TestContext&) noexcept {
-    kernel::ipc::Notification first{};
-    kernel::ipc::Notification second{};
+    ipc::Notification first{};
+    ipc::Notification second{};
     TestSource source{};
-    const auto attached = first.bind(source.binding(), 8);
-    const auto duplicate = second.bind(source.binding(), 16);
-    source.binding().reset();
+    const auto attached = first.bind(source.sc(), 8);
+    const auto duplicate = second.bind(source.sc(), 16);
+    source.sc().reset();
     return attached && !duplicate
-        && duplicate.error() == kernel::ipc::NotificationError::Busy;
+        && duplicate.error() == ipc::NotificationError::Busy;
 }
 
 bool test_notification_badge_is_immutable_authority(
     const TestContext&) noexcept {
-    const auto rights = kernel::cap::Rights::of(
-        kernel::cap::Right::Signal);
-    const kernel::cap::Authority ceiling{
-        rights, kernel::cap::NotificationAuthority{32}};
-    const auto exact = kernel::cap::compose(
-        kernel::object::ObjectKind::Notification,
+    const auto rights = cap::Rights::of(
+        cap::Right::Signal);
+    const cap::View ceiling{
+        rights, cap::Badge{32}};
+    const auto exact = cap::compose(
+        object::ObjectKind::Notification,
         ceiling,
-        kernel::cap::Authority{
-            rights, kernel::cap::NotificationAuthority{32}});
-    const auto changed = kernel::cap::compose(
-        kernel::object::ObjectKind::Notification,
+        cap::View{
+            rights, cap::Badge{32}});
+    const auto changed = cap::compose(
+        object::ObjectKind::Notification,
         ceiling,
-        kernel::cap::Authority{
-            rights, kernel::cap::NotificationAuthority{64}});
+        cap::View{
+            rights, cap::Badge{64}});
     return exact && !changed
-        && changed.error() == kernel::cap::PolicyError::Amplification;
+        && changed.error() == cap::PolicyError::Amplification;
 }
 
 bool test_endpoint_authority_narrows_badge_and_limits(
     const TestContext&) noexcept {
-    using kernel::cap::Authority;
-    using kernel::cap::EndpointAuthority;
-    using kernel::cap::Authority;
-    using kernel::cap::PolicyError;
-    using kernel::cap::Right;
-    using kernel::cap::Rights;
-    using kernel::object::ObjectKind;
+    using cap::View;
+    using cap::EpLimit;
+    using cap::View;
+    using cap::PolicyError;
+    using cap::Right;
+    using cap::Rights;
+    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Delegate, Right::Call, Right::Inspect);
-    const EndpointAuthority root{
+    const EpLimit root{
         .badge = 0,
         .fixed = 0,
         .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
     };
-    const EndpointAuthority caller{
+    const EpLimit caller{
         .badge = 0x42,
         .fixed = ~u64{},
         .cap_limit = 2,
     };
-    const auto narrowed = kernel::cap::compose(
+    const auto narrowed = cap::compose(
         ObjectKind::Endpoint,
-        Authority{rights, root},
-        Authority{rights, caller});
-    const auto widened_caps = kernel::cap::compose(
+        View{rights, root},
+        View{rights, caller});
+    const auto widened_caps = cap::compose(
         ObjectKind::Endpoint,
-        Authority{rights, caller},
-        Authority{rights, EndpointAuthority{
+        View{rights, caller},
+        View{rights, EpLimit{
             .badge = 0x42,
             .fixed = ~u64{},
             .cap_limit = 3,
         }});
-    const auto changed_badge = kernel::cap::compose(
+    const auto changed_badge = cap::compose(
         ObjectKind::Endpoint,
-        Authority{rights, caller},
-        Authority{rights, EndpointAuthority{
+        View{rights, caller},
+        View{rights, EpLimit{
             .badge = 0x43,
             .fixed = ~u64{},
             .cap_limit = 2,
         }});
     return narrowed
-        && libk::get<EndpointAuthority>(narrowed.value().data).callable()
+        && std::get<EpLimit>(narrowed.value().data).callable()
         && !widened_caps && widened_caps.error() == PolicyError::Amplification
         && !changed_badge && changed_badge.error() == PolicyError::Amplification;
 }
 
 bool test_channel_root_cannot_fix_badge_generically(
     const TestContext&) noexcept {
-    using kernel::cap::Authority;
-    using kernel::cap::ChannelAuthority;
-    using kernel::cap::ChannelSide;
-    using kernel::cap::Authority;
-    using kernel::cap::PolicyError;
-    using kernel::cap::Right;
-    using kernel::cap::Rights;
-    using kernel::object::ObjectKind;
+    using cap::View;
+    using cap::ChanLimit;
+    using cap::ChannelSide;
+    using cap::View;
+    using cap::PolicyError;
+    using cap::Right;
+    using cap::Rights;
+    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Duplicate, Right::Delegate, Right::Inspect,
         Right::Send, Right::Receive, Right::Close, Right::Revoke);
-    const ChannelAuthority root{
+    const ChanLimit root{
         .side = ChannelSide::Any,
         .badge = 0,
         .fixed = 0,
     };
-    const auto side = kernel::cap::compose(
+    const auto side = cap::compose(
         ObjectKind::Channel,
-        Authority{rights, root},
-        Authority{rights, ChannelAuthority{
+        View{rights, root},
+        View{rights, ChanLimit{
             .side = ChannelSide::A,
             .badge = 0,
             .fixed = 0,
         }});
-    const auto exact = kernel::cap::compose(
+    const auto exact = cap::compose(
         ObjectKind::Channel,
-        Authority{rights, root},
-        Authority{rights, ChannelAuthority{
+        View{rights, root},
+        View{rights, ChanLimit{
             .side = ChannelSide::A,
             .badge = 0x55,
             .fixed = ~u64{},
@@ -209,38 +210,38 @@ bool test_channel_root_cannot_fix_badge_generically(
 
 bool test_channel_badge_and_side_are_immutable(
     const TestContext&) noexcept {
-    using kernel::cap::Authority;
-    using kernel::cap::ChannelAuthority;
-    using kernel::cap::ChannelSide;
-    using kernel::cap::Authority;
-    using kernel::cap::PolicyError;
-    using kernel::cap::Right;
-    using kernel::cap::Rights;
-    using kernel::object::ObjectKind;
+    using cap::View;
+    using cap::ChanLimit;
+    using cap::ChannelSide;
+    using cap::View;
+    using cap::PolicyError;
+    using cap::Right;
+    using cap::Rights;
+    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Duplicate, Right::Delegate, Right::Inspect,
         Right::Send, Right::Receive, Right::Close, Right::Revoke);
-    const ChannelAuthority exact{
+    const ChanLimit exact{
         .side = ChannelSide::A,
         .badge = 0x55,
         .fixed = ~u64{},
     };
-    const auto same = kernel::cap::compose(
+    const auto same = cap::compose(
         ObjectKind::Channel,
-        Authority{rights, exact}, Authority{rights, exact});
-    const auto changed_badge = kernel::cap::compose(
+        View{rights, exact}, View{rights, exact});
+    const auto changed_badge = cap::compose(
         ObjectKind::Channel,
-        Authority{rights, exact},
-        Authority{rights, ChannelAuthority{
+        View{rights, exact},
+        View{rights, ChanLimit{
             .side = ChannelSide::A,
             .badge = 0x56,
             .fixed = ~u64{},
         }});
-    const auto changed_side = kernel::cap::compose(
+    const auto changed_side = cap::compose(
         ObjectKind::Channel,
-        Authority{rights, exact},
-        Authority{rights, ChannelAuthority{
+        View{rights, exact},
+        View{rights, ChanLimit{
             .side = ChannelSide::B,
             .badge = 0x55,
             .fixed = ~u64{},
@@ -253,7 +254,70 @@ bool test_channel_badge_and_side_are_immutable(
 
 } // namespace
 
+static bool test_irq_sequence_reassert_requires_latest_ack(const TestContext &) noexcept {
+    ipc::Notification notification{};
+    ipc::Notification rebound_notification{};
+    irq::Routes routes{};
+    irq::Irq irq{{routes, 10}};
+    auto take = []() noexcept -> u32 { return 10; };
+    if (!irq.bind(notification, 0x40)) {
+        return false;
+    }
+    routes.dispatch(irq::Routes::Take::bind(take));
+    const auto first = irq.delivery();
+    const auto first_notice = notification.take();
+    routes.dispatch(irq::Routes::Take::bind(take));
+    const auto second = irq.delivery();
+    if (!first || !second || !first_notice ||
+        irq.ack(first.value().generation, first.value().sequence)) {
+        return false;
+    }
+    if (!irq.ack(second.value().generation, second.value().sequence) || !notification.take() ||
+        !irq.unbind() || (irq.bound() || irq.pending()) || !irq.bind(notification, 0x40)) {
+        return false;
+    }
+    routes.dispatch(irq::Routes::Take::bind(take));
+    const auto pending = irq.delivery();
+    if (!pending || !notification.take() || !irq.unbind() || (irq.bound() || !irq.pending())) {
+        return false;
+    }
+    if (!irq.bind(rebound_notification, 0x40) || (!irq.bound() || !irq.pending())) {
+        return false;
+    }
+    const auto retained = irq.delivery();
+    if (!retained || retained.value().sequence != pending.value().sequence ||
+        retained.value().generation == pending.value().generation || !rebound_notification.take()) {
+        return false;
+    }
+    const auto stale = irq.ack(pending.value().generation, pending.value().sequence);
+    if (stale || stale.error() != irq::Error::StaleSequence) {
+        return false;
+    }
+    return irq.ack(retained.value().generation, retained.value().sequence) && irq.bound() &&
+           !irq.pending() && irq.unbind() && !irq.bound() && !irq.pending();
+}
+
+static bool test_exit_notification_is_read_only(const TestContext &) noexcept {
+    ipc::Notification notification{};
+    Exit first{}, second{};
+    if (!first.observe(notification, 0x80) || first.observe(notification, 0x40) ||
+        !second.claim(Exit::Reason::Normal, MYOS_STATUS_OK) ||
+        !second.observe(notification, 0x40) ||
+        !first.claim(Exit::Reason::Stop, MYOS_STATUS_CANCELED, 7))
+        return false;
+    const auto event = notification.take();
+    const auto result = first.read();
+    return event && event.value().badges == 0xc0 && result.reason == Exit::Reason::Stop &&
+           result.status == MYOS_STATUS_CANCELED && result.detail == 7 &&
+           !first.claim(Exit::Reason::Fault, MYOS_STATUS_INTERNAL) && first.published();
+}
+
 void register_ipc_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("ipc", "IRQ acknowledgement rejects stale sequence",
+        test_irq_sequence_reassert_requires_latest_ack);
+    (void)registry.add("ipc", "Exit notification observes one result",
+        test_exit_notification_is_read_only);
+
     (void)registry.add(
         "ipc",
         "Notification ORs badges and one take wins the pending state",

@@ -3,7 +3,6 @@ import pathlib
 import struct
 import sys
 
-
 def verify(elf_path, package_path):
     elf = pathlib.Path(elf_path).read_bytes()
     package = pathlib.Path(package_path).read_bytes()
@@ -36,7 +35,6 @@ def verify(elf_path, package_path):
         assert package[source:source + file_size] == elf[offset:offset + file_size]
         assert not any(package[source + file_size:source + stored])
     print('[bootpack] load bytes, permissions, alignment and zero tails match ELF')
-
 
 if __name__ == '__main__':
     verify(*sys.argv[1:])

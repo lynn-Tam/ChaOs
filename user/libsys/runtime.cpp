@@ -1,3 +1,4 @@
+#include <utility>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -6,9 +7,9 @@
 #include <time.h>
 #include <libk/checked_arithmetic.hpp>
 
-#include <user/abi/startup.hpp>
-#include <user/ipc/channel.hpp>
-#include <user/ipc/storage.hpp>
+#include <sys/start.hpp>
+#include <sys/channel.hpp>
+#include <sys/storage.hpp>
 
 struct directory {
     myos::io::ControlMessage batch{};
@@ -299,7 +300,7 @@ extern "C" int32_t open(const char* path, uint32_t flags) {
     auto status = vfs.open(path, backend, object, length, expected);
     if (status != MYOS_STATUS_OK) return status;
     uint64_t generation{};
-    status = files[slot].session.adopt(libk::move(object), events, vspace,
+    status = files[slot].session.adopt(std::move(object), events, vspace,
         Sessions + (slot + 2) * Stride, generation, access != O_RDONLY);
     if (status != MYOS_STATUS_OK) return status;
     if (generation != expected) {

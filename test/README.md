@@ -58,7 +58,7 @@ reported as `[FAIL] group: name`.
 - page-group ownership chains cross arenas
 - page-group detach and reattach preserve one frame owner
 - direct map covers proven RAM independent of allocation state
-- KernelRoot move transfers architecture ownership
+- PageTable move transfers table ownership
 - runtime editor separates private and shared table ownership
 - Sv39 page-table initialization clears the complete frame
 - Sv39 walk allocates only missing tables
@@ -112,7 +112,7 @@ reported as `[FAIL] group: name`.
 - prepare publishes one descriptor-backed CpuRuntime
 - lifecycle publication and snapshots derive from canonical states
 - shootdown acknowledgement controls detached-page retirement
-- ObjectRef and typed pins share canonical reclaim state
+- Typed references retain retiring objects until final release
 - RemoteQueue retains failed kicks without stale-generation loss
 
 ## sched
@@ -122,7 +122,7 @@ reported as `[FAIL] group: name`.
 - bounded refill merge delays but never advances budget
 - refill model preserves every sampled sliding window
 - SC configuration rejects invalid time and urgency bounds
-- ObjectStore unpublished construction rolls back slab and payload
+- Object pool unpublished construction rolls back slab and payload
 - ResourcePool refunds only after sponsored object reclaim
 - child ResourcePool returns its delegated budget after reclaim
 - ResourcePool close waits for construction and budget transactions
@@ -146,7 +146,7 @@ reported as `[FAIL] group: name`.
 - allocation transaction abort revokes its complete hidden lineage
 - ResourcePool close revokes hidden roots without scanning CSpaces
 - parent ResourcePool close recursively drains its child pool
-- destroy authority enters the target ObjectAnchor retirement path
+- destroy authority enters the target anchor retirement path
 - Tunnel Connect authority cannot attenuate into source Tx rights
 
 ## memory
@@ -156,7 +156,7 @@ reported as `[FAIL] group: name`.
 - boot image distinguishes borrowed and owned frame release
 - reverse attachment drives destroy invalidation completion
 - executable seal closes writable attachment admission
-- ObjectStore memory retirement waits for active page lease
+- MM object memory retirement waits for active page lease
 
 ## translation
 
@@ -172,7 +172,7 @@ reported as `[FAIL] group: name`.
 - capability revoke waits for PTE and alias retirement
 - child Region and capability publish in one transaction
 - Memory retirement invalidates mapping and hardware projection
-- ExecutionBinding blocks retirement of effective roots
+- Env blocks retirement of effective roots
 - IPC binding blocks normal edits and follows strong invalidation
 - sponsored table capacity follows physical retirement
 

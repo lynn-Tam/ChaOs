@@ -20,53 +20,85 @@ import gdb
 def manual(value, name):
     assert bool(value['engaged_']), 'uninitialized ' + name
     return value['storage_'].address.cast(gdb.lookup_type(name).pointer()).dereference()
-state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'kernel::KernelState')
-objects = manual(state['objects_'], 'kernel::object::ObjectStore')
+state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
+memory = manual(state['memory_objects_'], 'object::store<mm::VSpace, mm::Mem, Pager>')
+def pool(name):
+    def find(value):
+        if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
+            return manual(value, 'object::pool<%s>' % name)
+        for f in value.type.fields():
+            child = value.cast(f.type) if f.is_base_class else value[f.name]
+            if f.is_base_class or f.name == '_M_head_impl':
+                result = find(child)
+                if result is not None: return result
+        return None
+    result = find(memory['pools_'])
+    assert result is not None, name
+    return result
 def live_objects(pool, name):
-    slot_type = gdb.lookup_type('kernel::object::ObjectPool<%s>::Slot' % name)
-    header = gdb.lookup_type('kernel::object::ObjectPool<%s>::PageHeader' % name)
+    slot_type = gdb.lookup_type('object::pool<%s>::Slot' % name)
+    header = gdb.lookup_type('object::pool<%s>::PageHeader' % name)
     offset = (header.sizeof + slot_type.alignof - 1) & ~(slot_type.alignof - 1)
-    page = pool['pages_head_']
+    page = pool['storage_']['head_']
     seen = set()
     while int(page):
         assert int(page) not in seen, 'cyclic pool page list'
         seen.add(int(page))
         for index in range((4096 - offset) // slot_type.sizeof):
             slot = gdb.Value(int(page) + offset + index * slot_type.sizeof).cast(slot_type.pointer()).dereference()
-            if int(slot['anchor']['lifecycle_']) == 2:
+            if int(slot['anchor']['phase_']) == 2:
                 yield slot['storage'].address.cast(gdb.lookup_type(name).pointer()).dereference()
         page = page['next']
-requests = []
-for thread in live_objects(objects['threads_'], 'kernel::Thread'):
-    wait = thread['wait_']
-    if int(wait['local_kind_']) != 1 or int(wait['phase_']) != 1: continue
-    fault = wait['local_']['page']
-    if int(fault['address_']['value_']) != 0x75000000: continue
-    assert int(fault['phase_']['value_']) == 3, 'fault must be Armed'
-    request = fault['relation_']['request']
-    assert int(request), 'fault must belong to a PageRequest'
-    requests.append(request)
-assert len(requests) == 2 and int(requests[0]) == int(requests[1]), 'two faults must join one canonical request'
-request = requests[0].dereference()
-# MemoryObject remains Published until supply/fail begins. The independent
-# Pager transport owns the service's claim; do not infer it from PageSlot.
-assert int(request['state']) == 3 and int(request['claim_generation']) == 0
-assert int(request['waiters']['size_']) == 2, 'request must retain both real waiters'
-assert int(request['first']) == 0 and int(request['count']) == 1
-pagers = list(live_objects(objects['pagers_'], 'kernel::pager::Pager'))
+# Requests now live on virtual kernel stacks. Resolve those addresses through
+# the real kernel page table instead of assuming every payload is a RAM alias.
+layout = manual(state['pmm_'], 'mm::Pmm')['direct_map_']['layout_']
+delta = int(layout['virtual_base']['value_']) - int(layout['physical_base']['value_'])
+kroot = manual(state['kernel_vspace_'], 'mm::KSpace')['root_']['root_']
+inferior = gdb.selected_inferior()
+def alias(address, typ):
+    table = int(kroot['value_']) << 12
+    for level in (2, 1, 0):
+        entry = table + ((address >> (12 + 9 * level)) & 511) * 8
+        pte = int.from_bytes(inferior.read_memory(entry + delta, 8), 'little')
+        assert pte & 1, 'unmapped kernel address'
+        if pte & 14:
+            mask = (1 << (12 + 9 * level)) - 1
+            phys = (((pte >> 10) << 12) & ~mask) | (address & mask)
+            return gdb.Value(phys + delta).cast(typ.pointer()).dereference()
+        table = (pte >> 10) << 12
+    raise AssertionError('missing kernel leaf')
+
+pagers = list(live_objects(pool('Pager'), 'Pager'))
 assert len(pagers) == 1, 'fixture exports one canonical file backing'
 pager = pagers[0]
-assert int(pager['claimed_']) == 1 and int(pager['ready_']['size_']) == 0
-slots = pager['slots_']
-first, last = slots.type.range()
-claims = [slots[i] for i in range(first, last + 1) if int(slots[i]['state']) == 3]
-assert len(claims) == 1
-claim = claims[0]
-assert int(claim['claim_generation']) != 0 and int(claim['claim_index']) != 0
-assert int(claim['page_index']) == int(request['key']['index'])
-assert int(claim['page_generation']) == int(request['key']['generation'])
-assert int(claim['payload']['page_in']['count']) == 1
-print('[file-fault] request=%#x transport claim=%d waiters=2 page=0' % (int(requests[0]), int(claim['claim_generation'])))
+index = pager['claimed_']
+assert int(index['size_']) == 1 and int(pager['ready_']['size_']) == 0
+ptr = int(index['sentinel_']['next_']) - int(index['hook_offset_'])
+claim = gdb.Value(ptr).cast(gdb.lookup_type('Pager::Request').pointer()).dereference()
+assert int(claim['info']['id']) != 0 and int(claim['info']['page_index']) == 0
+assert int(claim['info']['count']) == 1
+node_type = gdb.lookup_type('mm::Paged::Node')
+offset = next(f.bitpos // 8 for f in node_type.fields() if f.name == 'request')
+node = gdb.Value(int(claim.address) - offset).cast(node_type.pointer()).dereference()
+queue = node['waiters']
+assert int(queue['waiters']['size_']) == 2, 'both actual faults must remain queued'
+relations = queue['waiters']
+sentinel = int(relations['sentinel_'].address)
+hook = int(relations['sentinel_']['next_'])
+relation_type = gdb.lookup_type('mm::WaitRelation')
+offset = next(f.bitpos // 8 for f in relation_type.fields() if f.name == 'hook_')
+threads = set()
+while hook != sentinel:
+    relation = alias(hook - offset, relation_type)
+    assert int(relation['request']) == int(queue.address)
+    req = alias(int(relation['owner']), gdb.lookup_type('mm::PageReq'))
+    edge = req['done_']['wait_']
+    assert int(edge) and int(edge['phase_']) == 1, 'completion must own an attached wait edge'
+    assert int(edge['completion_']) == int(relation['owner']) + next(f.bitpos // 8 for f in req.type.fields() if f.name == 'done_')
+    threads.add(int(req['thread_'].address))
+    hook = int(relation['hook_']['next_'])
+assert len(threads) == 2, 'two distinct threads must join the same content request'
+print('[file-fault] request=%#x transport claim=%d waiters=2 page=0' % (int(queue.address), int(claim['info']['id'])))
 print('[file-fault] joined pending faults verified')
 '''
 

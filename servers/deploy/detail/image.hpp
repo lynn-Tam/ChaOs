@@ -1,12 +1,13 @@
 #pragma once
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <libk/checked_arithmetic.hpp>
 #include <libk/inplace_vector.hpp>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
+#include <optional>
+#include <utility>
 #include <servers/deploy/format.h>
 #include <uapi/object.h>
 #include <uapi/status.h>
@@ -65,11 +66,11 @@ concept MaterializerBackend = Backend<B>
         const uint8_t* source,
         myos_word_t size,
         myos_word_t access) {
-    { B::memory_create(pool, size, access) } -> libk::SameAs<myos::SysResult>;
-    { B::memory_seal(memory) } -> libk::SameAs<myos_status_t>;
-    { B::memory_populate(memory, size) } -> libk::SameAs<myos_status_t>;
+    { B::memory_create(pool, size, access) } -> std::same_as<myos::SysResult>;
+    { B::memory_seal(memory) } -> std::same_as<myos_status_t>;
+    { B::memory_populate(memory, size) } -> std::same_as<myos_status_t>;
     { B::memory_write(destination, source, size) }
-        -> libk::SameAs<myos_status_t>;
+        -> std::same_as<myos_status_t>;
 };
 
 /*
@@ -82,7 +83,7 @@ concept MaterializerBackend = Backend<B>
  */
 [[nodiscard]] inline auto required_scratch_size(
     const TaskPlanView& task,
-    const myos::boot::Bundle& bundle) noexcept -> libk::optional<myos_word_t> {
+    const myos::boot::Bundle& bundle) noexcept -> std::optional<myos_word_t> {
     const PlanTask* const row = task.row();
     constexpr myos_word_t page_size = DEPLOY_PAGE_SIZE;
     constexpr myos_word_t max_word = ~myos_word_t{};
@@ -92,7 +93,7 @@ concept MaterializerBackend = Backend<B>
         || row->mappings.count > DEPLOY_TASK_MAPPING_MAX
         || row->images.first > UINT32_MAX - row->images.count
         || row->mappings.first > UINT32_MAX - row->mappings.count) {
-        return libk::nullopt;
+        return std::nullopt;
     }
 
     myos_word_t required = page_size;
@@ -127,11 +128,11 @@ concept MaterializerBackend = Backend<B>
         const PlanImage* const image = task.image(image_index);
         if (image == nullptr
             || image->source_kind != DEPLOY_IMAGE_SOURCE_BOOT_BUNDLE) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const ByteView name = task.symbol(image->source);
         if (!name) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         myos::boot::Module module{};
         size_t matches = 0;
@@ -148,7 +149,7 @@ concept MaterializerBackend = Backend<B>
         if (matches != 1 || !module.bootable()
             || module.segment_count() == 0
             || module.segment_count() > 32) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         image_segments[image_index] =
             static_cast<uint32_t>(module.segment_count());
@@ -161,7 +162,7 @@ concept MaterializerBackend = Backend<B>
                     > static_cast<uintmax_t>(max_word)
                 || static_cast<uintmax_t>(segment.address)
                     > static_cast<uintmax_t>(max_word)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             const myos_word_t rounded = Window::round_size(
                 static_cast<myos_word_t>(segment.memory_size));
@@ -169,7 +170,7 @@ concept MaterializerBackend = Backend<B>
                 static_cast<myos_word_t>(segment.address), rounded};
             if (rounded == 0 || !destination.valid()
                 || !include(rounded)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
         }
     }
@@ -178,7 +179,7 @@ concept MaterializerBackend = Backend<B>
          ++mapping_index) {
         const PlanMapping* const mapping = task.mapping(mapping_index);
         if (mapping == nullptr) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         switch (mapping->source) {
         case DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT: {
@@ -186,18 +187,18 @@ concept MaterializerBackend = Backend<B>
                 || mapping->image < row->images.first
                 || mapping->image - row->images.first >= row->images.count
                 || mapping->segment == DEPLOY_NO_INDEX) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             const uint32_t image_index = mapping->image - row->images.first;
             if (mapping->segment >= image_segments[image_index]) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             break;
         }
         case DEPLOY_MAPPING_SOURCE_ZERO: {
             if (mapping->size > static_cast<uint64_t>(max_word)
                 || mapping->address > static_cast<uint64_t>(max_word)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             const myos_word_t address =
                 static_cast<myos_word_t>(mapping->address);
@@ -206,7 +207,7 @@ concept MaterializerBackend = Backend<B>
             const Window destination{address, rounded};
             if (rounded == 0 || !destination.valid()
                 || !include(rounded)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             break;
         }
@@ -214,7 +215,7 @@ concept MaterializerBackend = Backend<B>
             /* Pager-backed mappings are installed without scratch population. */
             break;
         default:
-            return libk::nullopt;
+            return std::nullopt;
         }
     }
     return required;
@@ -339,7 +340,7 @@ public:
             const auto address = offset.has_value()
                 ? libk::checked_add(
                     static_cast<myos_word_t>(base), offset.value())
-                : libk::optional<myos_word_t>{};
+                : std::optional<myos_word_t>{};
             if (!address.has_value() || !valid_range(address.value(), size)) {
                 output.stacks.clear();
                 return MYOS_STATUS_BAD_ARGS;
@@ -460,7 +461,7 @@ public:
         myos_word_t size,
         myos_word_t access) {
         { T::memory_create_pager(pool, size, access, pager) }
-            -> libk::SameAs<myos::SysResult>;
+            -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto materialize_paged(
         myos::cap::CapRef pager,
@@ -498,7 +499,7 @@ public:
             return created.status;
         }
         const auto memory = task_.adopt_local(
-            libk::move(memory_owner), MYOS_OBJECT_KIND_MEMORY);
+            std::move(memory_owner), MYOS_OBJECT_KIND_MEMORY);
         if (!memory) {
             return MYOS_STATUS_NO_MEMORY;
         }
@@ -539,7 +540,6 @@ public:
     }
 
     // Construction consumers may need the source MemoryObject after its
-    // final mapping (for example Thread/Endpoint/Vproc snapshots).  Keep
     // those unpublished slots in TaskSpace until the caller has completed
     // every consumer, then retire them in place.  A failed close leaves the
     // exact slot armed so a later call resumes at the same source.
@@ -693,9 +693,9 @@ private:
     }
 
     [[nodiscard]] static auto rounded(size_t size) noexcept
-        -> libk::optional<myos_word_t> {
+        -> std::optional<myos_word_t> {
         if (size == 0 || size > static_cast<size_t>(~myos_word_t{})) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto aligned = libk::checked_align_up(
             static_cast<myos_word_t>(size), DEPLOY_PAGE_SIZE);
@@ -725,7 +725,7 @@ private:
             return created.status;
         }
         const auto slot = task_.adopt_local(
-            libk::move(owner), MYOS_OBJECT_KIND_MEMORY);
+            std::move(owner), MYOS_OBJECT_KIND_MEMORY);
         if (!slot.has_value()) {
             return MYOS_STATUS_NO_MEMORY;
         }
@@ -743,7 +743,7 @@ private:
         if (!vspace.has_value()) {
             return MYOS_STATUS_INVALID_CAP;
         }
-        const myos::SysResult created = B::vm_create_region(
+        const myos::SysResult created = B::vm_slice(
             vspace.value(), address, size, access, MYOS_VM_NORMAL,
             MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
         if (created.value == 0) {
@@ -759,7 +759,7 @@ private:
             return created.status;
         }
         const auto slot = task_.adopt_local(
-            libk::move(owner), MYOS_OBJECT_KIND_VSPACE);
+            std::move(owner), MYOS_OBJECT_KIND_VSPACE);
         if (!slot.has_value()) {
             return MYOS_STATUS_NO_MEMORY;
         }
@@ -872,7 +872,7 @@ private:
         const auto pool = task_.pool();
         const auto vspace = task_.lookup(task_.vspace_slot(), MYOS_OBJECT_KIND_VSPACE);
         if (!pool || !vspace) return MYOS_STATUS_INVALID_CAP;
-        const auto region = B::vm_create_region(*vspace, segment.address, size,
+        const auto region = B::vm_slice(*vspace, segment.address, size,
             segment.access, MYOS_VM_NORMAL,
             MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
         owner_type region_owner{myos::cap::CapRef{region.value, 0}};
@@ -913,7 +913,7 @@ private:
                 address, length, first, segment.access | flags);
             if (!committed(mapped)) return mapped;
             if (primary.valid()) return MYOS_STATUS_OK;
-            const auto memory = task_.adopt_local(libk::move(memory_owner), MYOS_OBJECT_KIND_MEMORY);
+            const auto memory = task_.adopt_local(std::move(memory_owner), MYOS_OBJECT_KIND_MEMORY);
             if (!memory) return MYOS_STATUS_NO_MEMORY;
             primary = *memory;
             primary_first = first;
@@ -934,7 +934,7 @@ private:
             if (status != MYOS_STATUS_OK) return status;
         }
         if (!primary.valid()) return MYOS_STATUS_INTERNAL;
-        const auto saved_region = task_.adopt_local(libk::move(region_owner), MYOS_OBJECT_KIND_VSPACE);
+        const auto saved_region = task_.adopt_local(std::move(region_owner), MYOS_OBJECT_KIND_VSPACE);
         if (!saved_region) return MYOS_STATUS_NO_MEMORY;
         return output.segments.try_push_back(typename Image::Mapping{
             .memory = primary, .region = *saved_region,

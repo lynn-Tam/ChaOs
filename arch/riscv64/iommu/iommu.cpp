@@ -1,14 +1,16 @@
+#include <expected>
+#include <optional>
+#include <utility>
 #include <arch/iommu.hpp>
-#include <arch/pci.hpp>
 
-#include <core/debug.hpp>
-#include <libk/limits.hpp>
-#include <mm/virtual_layout.hpp>
-#include <sync/irq_lock_guard.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
+#include <limits>
+#include <mm/table.hpp>
+#include <sync.hpp>
 
 namespace arch {
 namespace {
-constexpr usize Base = kernel::mm::layout::DirectMapBegin + virt_iommu_base;
 constexpr usize Ddtp = 0x10;
 constexpr usize Fctl = 0x8;
 constexpr usize Cqb = 0x18;
@@ -27,36 +29,37 @@ constexpr u32 On = 1 << 16;
 constexpr u32 Busy = 1 << 17;
 constexpr u32 CommandErrors = (1 << 8) | (1 << 9) | (1 << 10);
 
-template<typename T>
-auto read(usize offset) noexcept -> T {
+auto ppn(mm::Page page) noexcept -> u64 {
+    return page.raw();
+}
+} // namespace
+
+template<class T>
+auto Iommu::read(usize offset) const noexcept -> T {
     asm volatile("fence iorw, iorw" ::: "memory");
-    const T value = *reinterpret_cast<volatile const T*>(Base + offset);
+    const T value = *reinterpret_cast<volatile const T*>(base_ + offset);
     asm volatile("fence iorw, iorw" ::: "memory");
     return value;
 }
-template<typename T>
-void write(usize offset, T value) noexcept {
+template<class T>
+void Iommu::write(usize offset, T value) const noexcept {
     asm volatile("fence iorw, iorw" ::: "memory");
-    *reinterpret_cast<volatile T*>(Base + offset) = value;
+    *reinterpret_cast<volatile T*>(base_ + offset) = value;
     asm volatile("fence iorw, iorw" ::: "memory");
 }
-auto ppn(kernel::mm::Page page) noexcept -> u64 {
-    return page.frame().raw();
-}
-} // namespace
 
 Iommu::~Iommu() noexcept {
     // Controller shutdown is a machine-lifetime operation. Returning these
     // frames while hardware can still access them is never a recovery path.
-    KASSERT(state_ == State::Idle);
+    libk_assert(state_ == State::Idle);
 }
 
-auto Iommu::start(kernel::mm::Pmm& pmm) noexcept
-    -> libk::Expected<void, IommuError> {
-    if (state_ != State::Idle) return libk::unexpected(IommuError::Busy);
+auto Iommu::start(mm::Pmm& pmm) noexcept
+    -> std::expected<void, IommuError> {
+    if (state_ != State::Idle) return std::unexpected(IommuError::Busy);
     const u64 capabilities = read<u64>(0);
     if (capabilities == 0 || capabilities == ~u64{0})
-        return libk::unexpected(IommuError::Absent);
+        return std::unexpected(IommuError::Absent);
     // Version 1.x, coherent little-endian Sv39 and extended device contexts.
     // MSI translation itself remains disabled in each context.
     if ((capabilities & 0xf0) != 0x10
@@ -65,23 +68,23 @@ auto Iommu::start(kernel::mm::Pmm& pmm) noexcept
         || ((capabilities >> 28) & 3) == 0
         || ((capabilities >> 28) & 3) == 3
         || (read<u32>(Fctl) & 5) != 0)
-        return libk::unexpected(IommuError::Unsupported);
-    storage_ = pmm.make_page_group();
+        return std::unexpected(IommuError::Unsupported);
+    storage_ = pmm.group();
     {
-        auto extension = storage_.extend();
-        kernel::mm::Page* pages[] = {&directory_, &commands_, &faults_,
+        auto pending = storage_.owner().group();
+        mm::Page* pages[] = {&directory_, &commands_, &faults_,
             &contexts_[0], &contexts_[1], &contexts_[2], &contexts_[3]};
         for (auto* slot : pages) {
-            auto allocated = extension.allocate_page();
-            if (!allocated) return libk::unexpected(IommuError::InsufficientMemory);
+            auto allocated = pending.allocate();
+            if (!allocated) return std::unexpected(IommuError::InsufficientMemory);
             *slot = allocated.value();
             if (ppn(*slot) >= (u64{1} << 44))
-                return libk::unexpected(IommuError::Unsupported);
-            auto* bytes = extension.bytes(*slot);
-            for (usize index = 0; index < kernel::mm::page_size; ++index)
+                return std::unexpected(IommuError::Unsupported);
+            auto* bytes = pending.bytes(*slot);
+            for (usize index = 0; index < mm::page_size; ++index)
                 bytes[index] = byte{};
         }
-        extension.commit();
+        storage_.append(std::move(pending));
     }
     auto* directory = reinterpret_cast<u64*>(storage_.bytes(directory_));
     for (usize i = 0; i < ContextPages; ++i)
@@ -91,7 +94,7 @@ auto Iommu::start(kernel::mm::Pmm& pmm) noexcept
     write<u64>(Ddtp, 0);
     write<u32>(Cqcsr, 0);
     write<u32>(Fqcsr, 0);
-    return libk::expected();
+    return {};
 }
 
 auto Iommu::failed() noexcept -> IoStatus {
@@ -153,22 +156,22 @@ auto Iommu::initialize() noexcept -> IoStatus {
     __builtin_unreachable();
 }
 
-auto Iommu::replace(u16 requester, libk::optional<kernel::mm::Page> root) noexcept
-    -> libk::Expected<u64, IommuError> {
-    kernel::sync::IrqLockGuard guard{lock_};
-    if (state_ != State::Ready) return libk::unexpected(IommuError::Failed);
+auto Iommu::replace(u16 requester, std::optional<mm::Page> root) noexcept
+    -> std::expected<u64, IommuError> {
+    sync::Lock guard{lock_};
+    if (state_ != State::Ready) return std::unexpected(IommuError::Failed);
     if (requester >= RootBusRequesters)
-        return libk::unexpected(IommuError::Unsupported);
-    if (root && overflow_) return libk::unexpected(IommuError::Busy);
-    if (issued_ != completed_) return libk::unexpected(IommuError::Busy);
-    if (issued_ == libk::numeric_limits<u64>::max()
+        return std::unexpected(IommuError::Unsupported);
+    if (root && overflow_) return std::unexpected(IommuError::Busy);
+    if (issued_ != completed_) return std::unexpected(IommuError::Busy);
+    if (issued_ == std::numeric_limits<u64>::max()
         || (read<u32>(Cqcsr) & CommandErrors) != 0
         || read<u32>(Cqh) != tail_) {
         static_cast<void>(failed());
-        return libk::unexpected(IommuError::Failed);
+        return std::unexpected(IommuError::Failed);
     }
     if (root && ppn(*root) >= (u64{1} << 44))
-        return libk::unexpected(IommuError::Unsupported);
+        return std::unexpected(IommuError::Unsupported);
     auto* context = reinterpret_cast<u64*>(storage_.bytes(contexts_[requester >> 6]))
         + (requester & 63) * 8;
     __atomic_store_n(&context[0], u64{0}, __ATOMIC_RELEASE);
@@ -196,11 +199,11 @@ auto Iommu::replace(u16 requester, libk::optional<kernel::mm::Page> root) noexce
     // drain. An overflow observed there must still account for this DID.
     if (root) active_[requester] = true;
     write<u32>(Cqt, tail_);
-    return libk::expected(issued_);
+    return (issued_);
 }
 
 auto Iommu::poll(u64 ticket) noexcept -> IoStatus {
-    kernel::sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     if (state_ != State::Ready || ticket == 0 || ticket > issued_)
         return IoStatus::Failed;
     if (ticket <= completed_) return IoStatus::Complete;
@@ -228,7 +231,7 @@ auto Iommu::drain_faults() noexcept -> IoStatus {
         const auto* record = reinterpret_cast<volatile const u64*>(
             storage_.bytes(faults_)) + fault_head_ * 4;
         const u64 header = record[0];
-        const IoFault fault{
+        const io::Fault fault{
             .cause = static_cast<u16>(header & 0xfff),
             .requester = static_cast<u32>(header >> 40), .address = record[2]};
         if (fault.requester < RootBusRequesters
@@ -256,7 +259,7 @@ void Iommu::begin_overflow() noexcept {
 }
 
 auto Iommu::handle_fault_irq() noexcept -> IoStatus {
-    kernel::sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     if (state_ != State::Ready) return IoStatus::Failed;
     // Clear the interrupt before reading the queue. A newly appended record
     // after this edge raises FIP again; records already present are drained.
@@ -267,26 +270,26 @@ auto Iommu::handle_fault_irq() noexcept -> IoStatus {
 }
 
 auto Iommu::fault_pending(u16 requester) noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     return requester < RootBusRequesters && pending_faults_[requester].has_value();
 }
 
 auto Iommu::fault_overflow() noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     return overflow_;
 }
 
-auto Iommu::take_fault(u16 requester) noexcept -> libk::optional<IoFault> {
-    kernel::sync::IrqLockGuard guard{lock_};
+auto Iommu::take_fault(u16 requester) noexcept -> std::optional<io::Fault> {
+    sync::Lock guard{lock_};
     if (requester >= RootBusRequesters || drain_faults() != IoStatus::Complete)
-        return libk::nullopt;
-    auto fault = libk::move(pending_faults_[requester]);
+        return std::nullopt;
+    auto fault = std::move(pending_faults_[requester]);
     pending_faults_[requester].reset();
     return fault;
 }
 
 auto Iommu::clear_faults(u16 requester) noexcept -> IoStatus {
-    kernel::sync::IrqLockGuard guard{lock_};
+    sync::Lock guard{lock_};
     // The caller already awaited this DID's invalidation fence. Another DID
     // may now have a command in flight; its ticket does not gate this mailbox.
     if (state_ != State::Ready) return IoStatus::Failed;

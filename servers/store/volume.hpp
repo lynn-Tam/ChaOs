@@ -1,7 +1,10 @@
 #pragma once
 
+#include <expected>
+
+
 #include <third_party/littlefs/lfs.h>
-#include <user/ipc/storage.hpp>
+#include <sys/storage.hpp>
 
 // Store-private littlefs extension; the caller pins mutation through I/O.
 extern "C" int lfs_file_map(lfs_t*, lfs_file_t*, lfs_off_t,

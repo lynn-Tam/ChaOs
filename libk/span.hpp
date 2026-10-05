@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -9,9 +10,9 @@
 namespace libk {
 
 template<typename T>
-concept SpanElement = !libk::is_void_v<T>
-    && !libk::is_reference_v<T>
-    && !libk::is_function_v<T>;
+concept SpanElement = !std::is_void_v<T>
+    && !std::is_reference_v<T>
+    && !std::is_function_v<T>;
 
 template<SpanElement T>
 class Span {
@@ -23,12 +24,12 @@ public:
     }
 
     template<typename U, size_t Size>
-        requires libk::ConvertibleTo<U (*)[], T (*)[]>
+        requires std::convertible_to<U (*)[], T (*)[]>
     constexpr Span(U (&values)[Size]) noexcept
         : pointer_(values), size_(Size) {}
 
     template<typename U>
-        requires libk::ConvertibleTo<U (*)[], T (*)[]>
+        requires std::convertible_to<U (*)[], T (*)[]>
     constexpr Span(const Span<U>& other) noexcept
         : pointer_(other.data()), size_(other.size()) {}
 

@@ -8,8 +8,8 @@
 #include <stddef.h>
 
 #include <libk/assert.hpp>
-#include <libk/typetraits.hpp>
-#include <libk/utility.hpp>
+#include <type_traits>
+#include <utility>
 
 #ifndef LIBK_INTRUSIVE_LIST_DEBUG_OWNER
 #define LIBK_INTRUSIVE_LIST_DEBUG_OWNER 0
@@ -85,7 +85,7 @@ private:
 
 template<typename T, IntrusiveListHook T::* HookMember>
 class IntrusiveList {
-    static_assert(is_object_v<T> && !is_const_v<T>,
+    static_assert(std::is_object_v<T> && !std::is_const_v<T>,
                   "IntrusiveList requires a non-const object type");
 
     static constexpr ptrdiff_t unknown_offset_ = static_cast<ptrdiff_t>(-1);
@@ -100,8 +100,8 @@ public:
     public:
         using value_type = T;
         using difference_type = ptrdiff_t;
-        using reference = conditional_t<IsConst, const T&, T&>;
-        using pointer = conditional_t<IsConst, const T*, T*>;
+        using reference = std::conditional_t<IsConst, const T&, T&>;
+        using pointer = std::conditional_t<IsConst, const T*, T*>;
 
         constexpr basic_iterator() noexcept = default;
 
@@ -112,14 +112,14 @@ public:
 
         [[nodiscard]] constexpr reference operator*() const noexcept {
             libk_assert(hook_ != nullptr);
-            using byte_pointer = conditional_t<IsConst, const unsigned char*, unsigned char*>;
+            using byte_pointer = std::conditional_t<IsConst, const unsigned char*, unsigned char*>;
             byte_pointer hook_bytes = reinterpret_cast<byte_pointer>(hook_);
             byte_pointer object_bytes = hook_bytes - hook_offset_;
             return *reinterpret_cast<pointer>(object_bytes);
         }
 
         [[nodiscard]] constexpr pointer operator->() const noexcept {
-            return libk::addressof(operator*());
+            return std::addressof(operator*());
         }
 
         constexpr basic_iterator& operator++() noexcept {
@@ -154,7 +154,7 @@ public:
         }
 
     private:
-        using hook_pointer = conditional_t<IsConst, const IntrusiveListHook*, IntrusiveListHook*>;
+        using hook_pointer = std::conditional_t<IsConst, const IntrusiveListHook*, IntrusiveListHook*>;
 
         constexpr basic_iterator(hook_pointer hook, ptrdiff_t hook_offset) noexcept
             : hook_(hook), hook_offset_(hook_offset) {}
@@ -441,8 +441,8 @@ private:
     }
 
     constexpr void establish_offset(T& value) noexcept {
-        auto* object_bytes = reinterpret_cast<unsigned char*>(libk::addressof(value));
-        auto* hook_bytes = reinterpret_cast<unsigned char*>(libk::addressof(hook_of(value)));
+        auto* object_bytes = reinterpret_cast<unsigned char*>(std::addressof(value));
+        auto* hook_bytes = reinterpret_cast<unsigned char*>(std::addressof(hook_of(value)));
         const ptrdiff_t offset = hook_bytes - object_bytes;
         if (hook_offset_ == unknown_offset_) {
             hook_offset_ = offset;
@@ -468,14 +468,14 @@ private:
 
     [[nodiscard]] constexpr T& value_from_hook(IntrusiveListHook& hook) noexcept {
         libk_assert(hook_offset_ != unknown_offset_);
-        auto* hook_bytes = reinterpret_cast<unsigned char*>(libk::addressof(hook));
+        auto* hook_bytes = reinterpret_cast<unsigned char*>(std::addressof(hook));
         return *reinterpret_cast<T*>(hook_bytes - hook_offset_);
     }
 
     [[nodiscard]] constexpr const T& value_from_hook(
         const IntrusiveListHook& hook) const noexcept {
         libk_assert(hook_offset_ != unknown_offset_);
-        auto* hook_bytes = reinterpret_cast<const unsigned char*>(libk::addressof(hook));
+        auto* hook_bytes = reinterpret_cast<const unsigned char*>(std::addressof(hook));
         return *reinterpret_cast<const T*>(hook_bytes - hook_offset_);
     }
 

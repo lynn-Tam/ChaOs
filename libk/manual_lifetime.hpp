@@ -5,12 +5,12 @@
 #include <libk/concepts.hpp>
 #include <libk/assert.hpp>
 #include <libk/memory.hpp>
-#include <libk/utility.hpp>
+#include <utility>
 
 namespace libk {
 
 template<typename T>
-requires(Object<T> && !is_const_v<T>)
+requires(Object<T> && !std::is_const_v<T>)
 class ManualLifetime{
 public:
     constexpr ManualLifetime() noexcept = default;
@@ -27,7 +27,7 @@ public:
         libk_assert(!engaged_);
         T* value = libk::construct_at(
             stor_ptr(),
-            libk::forward<Args>(args)...);
+            std::forward<Args>(args)...);
         engaged_ = true;
         return *value;
     }

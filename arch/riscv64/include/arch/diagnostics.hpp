@@ -1,7 +1,7 @@
 #pragma once
 
 #include <arch/trap.hpp>
-#include <core/types.hpp>
+#include <base/types.hpp>
 
 namespace arch {
 

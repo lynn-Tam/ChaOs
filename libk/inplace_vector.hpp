@@ -7,13 +7,13 @@
 #include <libk/concepts.hpp>
 #include <libk/memory.hpp>
 #include <libk/span.hpp>
-#include <libk/typetraits.hpp>
-#include <libk/utility.hpp>
+#include <type_traits>
+#include <utility>
 
 namespace libk {
 
 template<typename T, size_t Capacity>
-    requires(Object<T> && !is_const_v<T>)
+    requires(Object<T> && !std::is_const_v<T>)
 class InplaceVector final {
 public:
     InplaceVector() noexcept = default;
@@ -23,21 +23,21 @@ public:
             sizeof...(Args) <= Capacity
             && (... && ConstructibleFrom<T, Args&&>))
     explicit InplaceVector(Args&&... arguments)
-        noexcept((is_nothrow_constructible_v<T, Args&&> && ...)) {
+        noexcept((std::is_nothrow_constructible_v<T, Args&&> && ...)) {
         (static_cast<void>(try_emplace_back(
-            libk::forward<Args>(arguments))), ...);
+            std::forward<Args>(arguments))), ...);
     }
 
     InplaceVector(const InplaceVector&) = delete;
     auto operator=(const InplaceVector&) -> InplaceVector& = delete;
 
     InplaceVector(InplaceVector&& other)
-        noexcept(is_nothrow_move_constructible_v<T>) {
+        noexcept(std::is_nothrow_move_constructible_v<T>) {
         move_from(other);
     }
 
     auto operator=(InplaceVector&& other)
-        noexcept(is_nothrow_move_constructible_v<T>) -> InplaceVector& {
+        noexcept(std::is_nothrow_move_constructible_v<T>) -> InplaceVector& {
         if (this != &other) {
             clear();
             move_from(other);
@@ -92,19 +92,19 @@ public:
     template<typename U>
         requires ConstructibleFrom<T, U&&>
     [[nodiscard]] auto try_push_back(U&& value)
-        noexcept(is_nothrow_constructible_v<T, U&&>) -> bool {
-        return try_emplace_back(libk::forward<U>(value));
+        noexcept(std::is_nothrow_constructible_v<T, U&&>) -> bool {
+        return try_emplace_back(std::forward<U>(value));
     }
 
     template<typename... Args>
         requires ConstructibleFrom<T, Args&&...>
     [[nodiscard]] auto try_emplace_back(Args&&... arguments)
-        noexcept(is_nothrow_constructible_v<T, Args&&...>) -> bool {
+        noexcept(std::is_nothrow_constructible_v<T, Args&&...>) -> bool {
         if (size_ == Capacity) {
             return false;
         }
         libk::construct_at(
-            ptr_at(size_), libk::forward<Args>(arguments)...);
+            ptr_at(size_), std::forward<Args>(arguments)...);
         ++size_;
         return true;
     }
@@ -125,35 +125,35 @@ public:
             && AssignableFrom<T&, T&&>)
     auto insert(T* position, U&& value)
         noexcept(
-            is_nothrow_constructible_v<T, U&&>
-            && is_nothrow_move_constructible_v<T>
-            && is_nothrow_move_assignable_v<T>) -> T* {
+            std::is_nothrow_constructible_v<T, U&&>
+            && std::is_nothrow_move_constructible_v<T>
+            && std::is_nothrow_move_assignable_v<T>) -> T* {
         libk_assert(size_ < Capacity);
         size_t index{};
         libk_assert(position_index(position, true, index));
 
         // Stage first so inserting an element already owned by this vector is
         // well-defined even when the subsequent shift moves that element.
-        T staged(libk::forward<U>(value));
+        T staged(std::forward<U>(value));
         if (index == size_) {
-            libk::construct_at(ptr_at(size_), libk::move(staged));
+            libk::construct_at(ptr_at(size_), std::move(staged));
         } else {
-            libk::construct_at(ptr_at(size_), libk::move(back()));
+            libk::construct_at(ptr_at(size_), std::move(back()));
             for (size_t cursor = size_ - 1; cursor > index; --cursor) {
-                *ptr_at(cursor) = libk::move(*ptr_at(cursor - 1));
+                *ptr_at(cursor) = std::move(*ptr_at(cursor - 1));
             }
-            *ptr_at(index) = libk::move(staged);
+            *ptr_at(index) = std::move(staged);
         }
         ++size_;
         return ptr_at(index);
     }
 
-    auto erase(T* position) noexcept(is_nothrow_move_assignable_v<T>) -> T*
+    auto erase(T* position) noexcept(std::is_nothrow_move_assignable_v<T>) -> T*
         requires AssignableFrom<T&, T&&> {
         size_t index{};
         libk_assert(position_index(position, false, index));
         for (size_t cursor = index; cursor + 1 < size_; ++cursor) {
-            *ptr_at(cursor) = libk::move(*ptr_at(cursor + 1));
+            *ptr_at(cursor) = std::move(*ptr_at(cursor + 1));
         }
         --size_;
         libk::destroy_at(ptr_at(size_));
@@ -166,13 +166,13 @@ public:
             && ConstructibleFrom<T, T&&>)
     void replace(T* position, U&& value)
         noexcept(
-            is_nothrow_constructible_v<T, U&&>
-            && is_nothrow_move_constructible_v<T>) {
+            std::is_nothrow_constructible_v<T, U&&>
+            && std::is_nothrow_move_constructible_v<T>) {
         size_t index{};
         libk_assert(position_index(position, false, index));
-        T staged(libk::forward<U>(value));
+        T staged(std::forward<U>(value));
         libk::destroy_at(ptr_at(index));
-        libk::construct_at(ptr_at(index), libk::move(staged));
+        libk::construct_at(ptr_at(index), std::move(staged));
     }
 
     void clear() noexcept {
@@ -227,9 +227,9 @@ private:
     }
 
     void move_from(InplaceVector& other)
-        noexcept(is_nothrow_move_constructible_v<T>) {
+        noexcept(std::is_nothrow_move_constructible_v<T>) {
         for (size_t index = 0; index < other.size_; ++index) {
-            libk::construct_at(ptr_at(index), libk::move(other[index]));
+            libk::construct_at(ptr_at(index), std::move(other[index]));
             ++size_;
         }
         other.clear();

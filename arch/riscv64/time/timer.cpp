@@ -1,3 +1,4 @@
+#include <expected>
 #include <arch/time.hpp>
 
 #include "arch/riscv64/cpu/csr.hpp"
@@ -11,18 +12,18 @@ auto timer_available() noexcept -> bool {
         riscv64::sbi::time_extension_id);
 }
 
-auto program_timer(kernel::time::Instant deadline) noexcept
-    -> libk::Expected<void, TimerError> {
+auto program_timer(time::Instant deadline) noexcept
+    -> std::expected<void, TimerError> {
     const riscv64::sbi::Ret result =
         riscv64::sbi::set_timer(deadline.ticks());
     if (result.error == riscv64::sbi::success) {
         riscv64::Sie::enable_timer();
-        return libk::expected();
+        return {};
     }
     if (result.error == riscv64::sbi::not_supported) {
-        return libk::unexpected(TimerError::NotSupported);
+        return std::unexpected(TimerError::NotSupported);
     }
-    return libk::unexpected(TimerError::Rejected);
+    return std::unexpected(TimerError::Rejected);
 }
 
 void mask_timer() noexcept {

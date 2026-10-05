@@ -1,9 +1,11 @@
 #pragma once
 
-#include <core/types.hpp>
-#include <uapi/vproc.h>
+#include <base/types.hpp>
 
 namespace arch {
+// Selected machine interrupt wiring; initialization follows trap installation.
+void start_irqs(usize hart) noexcept;
+void external_irq() noexcept;
 
 struct TrapContextAccess;
 struct UserStart;
@@ -57,16 +59,10 @@ public:
 
     [[nodiscard]] auto fault_addr() const noexcept -> usize;
     [[nodiscard]] auto snapshot() const noexcept -> TrapSnapshot;
-    void save_user(myos_user_context& output) const noexcept;
-    [[nodiscard]] auto load_user(
-        const myos_user_context& input) noexcept -> bool;
     [[nodiscard]] auto load_user_start(
         const UserStart& start) noexcept -> bool;
 
     [[nodiscard]] auto frame() const noexcept -> UserFrame;
-    /*luna change: copy the complete return frame into the reserved Vproc cell, reason: FaultSlot retains only an opaque architecture frame token*/
-    [[nodiscard]] auto save_frame(usize raw_stack_top) const noexcept
-        -> UserFrame;
     void redirect(UserFrame frame) noexcept;
 
 private:

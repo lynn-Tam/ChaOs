@@ -1,16 +1,15 @@
-#include <boot/boot_info.hpp>
+#include <expected>
+#include <boot/info.hpp>
 #include <boot/cpu_topology.hpp>
-#include <boot/firmware/devicetree/fdt.hpp>
-#include <boot/timebase.hpp>
+#include <boot/fdt.hpp>
 
-#include <diag/console.hpp>
-#include <libk/limits.hpp>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
-#include <mm/boot_map.hpp>
-#include <core/kernel_image.hpp>
+#include <console.hpp>
+#include <limits>
+#include <optional>
+#include <utility>
+#include <mm/phys.hpp>
+#include <boot/link.hpp>
 
-namespace kernel::boot {
 namespace {
 
 [[nodiscard]] auto before_colon(libk::StrView string) noexcept -> libk::StrView {
@@ -27,24 +26,24 @@ struct Reg {
     uint64_t size{};
 
     [[nodiscard]] auto contained_pages() const noexcept
-        -> libk::optional<mm::PageRange> {
-        if (address > libk::numeric_limits<uintptr_t>::max()
-            || size > libk::numeric_limits<size_t>::max()) {
-            return libk::nullopt;
+        -> std::optional<mm::Pages> {
+        if (address > std::numeric_limits<uintptr_t>::max()
+            || size > std::numeric_limits<size_t>::max()) {
+            return std::nullopt;
         }
-        return mm::PageRange::contained_bytes(
-            mm::PhysAddr{static_cast<uintptr_t>(address)},
+        return mm::Pages::contained_bytes(
+            mm::Phys{static_cast<uintptr_t>(address)},
             static_cast<size_t>(size));
     }
 
     [[nodiscard]] auto covering_pages() const noexcept
-        -> libk::optional<mm::PageRange> {
-        if (address > libk::numeric_limits<uintptr_t>::max()
-            || size > libk::numeric_limits<size_t>::max()) {
-            return libk::nullopt;
+        -> std::optional<mm::Pages> {
+        if (address > std::numeric_limits<uintptr_t>::max()
+            || size > std::numeric_limits<size_t>::max()) {
+            return std::nullopt;
         }
-        return mm::PageRange::covering_bytes(
-            mm::PhysAddr{static_cast<uintptr_t>(address)},
+        return mm::Pages::covering_bytes(
+            mm::Phys{static_cast<uintptr_t>(address)},
             static_cast<size_t>(size));
     }
 };
@@ -137,7 +136,7 @@ private:
 class BootTree final {
 public:
     BootTree(const Fdt& tree,
-             mm::BootMapBuilder& memory) noexcept
+             mm::PhysMap& memory) noexcept
         : tree_(tree), memory_(memory) {}
 
     [[nodiscard]] auto read() noexcept -> bool {
@@ -166,34 +165,42 @@ public:
     }
 
     [[nodiscard]] auto iommu() const noexcept
-        -> libk::optional<mm::PageRange> { return iommu_; }
+        -> std::optional<mm::Pages> { return iommu_; }
 
     [[nodiscard]] auto stdout_path() const noexcept
-        -> libk::optional<libk::StrView> { return stdout_path_; }
+        -> std::optional<libk::StrView> { return stdout_path_; }
 
     [[nodiscard]] auto module() const noexcept
-        -> libk::Expected<libk::optional<BootModule>,
+        -> std::expected<std::optional<BootModule>,
                           BootInfoError> {
         if (!initrd_start_ && !initrd_end_) {
-            return libk::expected(libk::optional<BootModule>{});
+            return (std::optional<BootModule>{});
         }
         if (!initrd_start_ || !initrd_end_
             || *initrd_start_ >= *initrd_end_
-            || *initrd_start_ > libk::numeric_limits<usize>::max()
-            || *initrd_end_ - *initrd_start_ > libk::numeric_limits<usize>::max()) {
-            return libk::unexpected(BootInfoError::InvalidModuleRange);
+            || *initrd_start_ > std::numeric_limits<usize>::max()
+            || *initrd_end_ - *initrd_start_ > std::numeric_limits<usize>::max()) {
+            return std::unexpected(BootInfoError::InvalidModuleRange);
         }
-        const mm::PhysAddr physical{static_cast<usize>(*initrd_start_)};
+        const mm::Phys physical{static_cast<usize>(*initrd_start_)};
         const usize size = static_cast<usize>(*initrd_end_ - *initrd_start_);
-        const auto pages = mm::PageRange::covering_bytes(physical, size);
+        const auto pages = mm::Pages::covering_bytes(physical, size);
         if (!pages) {
-            return libk::unexpected(BootInfoError::InvalidModuleRange);
+            return std::unexpected(BootInfoError::InvalidModuleRange);
         }
-        return libk::expected(libk::optional<BootModule>{
+        return (std::optional<BootModule>{
             BootModule{
                 .physical = physical, .size = size, .pages = *pages,
-                .kind = BootModuleKind::Bundle,
             }});
+    }
+
+    [[nodiscard]] auto timebase() const noexcept -> std::optional<u64> {
+        const auto cpus = tree_.child(tree_.root(), "cpus");
+        u32 hz{};
+        if (!cpus || tree_.property_count(*cpus, "timebase-frequency") != 1
+            || !Fdt::read_u32(*tree_.property(*cpus, "timebase-frequency"), hz)
+            || hz == 0) return std::nullopt;
+        return hz;
     }
 
 private:
@@ -209,7 +216,7 @@ private:
                 && !format.visit(*reg, [this](Reg value) {
                     const auto range = value.covering_pages();
                     return range && static_cast<bool>(memory_.reserve(
-                        *range, mm::RegionKind::FirmwareReserved));
+                        *range, mm::Region::Kind::Firmware));
                 })) return false;
         }
         return true;
@@ -227,7 +234,7 @@ private:
             if (!tree_.node_name(*node).starts_with("iommu@")) continue;
             const auto compatible = tree_.property(*node, "compatible");
             const auto name = compatible
-                ? Fdt::first_string(*compatible) : libk::nullopt;
+                ? Fdt::first_string(*compatible) : std::nullopt;
             if (!name || *name != "riscv,iommu") continue;
             if (!ranges || !ranges->empty() || iommu_) return false;
             const auto reg = tree_.property(*node, "reg");
@@ -265,19 +272,19 @@ private:
     }
 
     const Fdt& tree_;
-    mm::BootMapBuilder& memory_;
+    mm::PhysMap& memory_;
     RegFormat root_format_{};
-    libk::optional<mm::PageRange> iommu_{};
-    libk::optional<libk::StrView> stdout_path_{};
-    libk::optional<uint64_t> initrd_start_{};
-    libk::optional<uint64_t> initrd_end_{};
+    std::optional<mm::Pages> iommu_{};
+    std::optional<libk::StrView> stdout_path_{};
+    std::optional<uint64_t> initrd_start_{};
+    std::optional<uint64_t> initrd_end_{};
 };
 
-[[nodiscard]] auto reserve_kernel(mm::BootMapBuilder& memory) noexcept -> bool {
-    const auto boot_entry = image::boot_entry();
-    const auto secondary = image::secondary_entry();
-    const auto transition = image::transition();
-    const auto high_image = image::physical_image();
+[[nodiscard]] auto reserve_kernel(mm::PhysMap& memory) noexcept -> bool {
+    const auto boot_entry = boot_pages();
+    const auto secondary = secondary_pages();
+    const auto transition = transition_pages();
+    const auto high_image = kernel_pages();
 
     for (const auto& bank : memory.ram()) {
         if (!bank.contains(boot_entry)
@@ -286,19 +293,19 @@ private:
             || !bank.contains(high_image)) {
             continue;
         }
-        const size_t prefix_pages = boot_entry.first().frame().raw()
-            - bank.first().frame().raw();
+        const size_t prefix_pages = boot_entry.base().raw()
+            - bank.base().raw();
         if (prefix_pages != 0
             && !memory.reserve(
-                mm::PageRange{bank.first(), prefix_pages},
-                mm::RegionKind::FirmwareReserved)) {
+                mm::Pages{bank.base(), prefix_pages},
+                mm::Region::Kind::Firmware)) {
             return false;
         }
-        return memory.reserve(boot_entry, mm::RegionKind::KernelImage)
-            && memory.reserve(secondary, mm::RegionKind::KernelImage)
+        return memory.reserve(boot_entry, mm::Region::Kind::Kernel)
+            && memory.reserve(secondary, mm::Region::Kind::Kernel)
             && memory.reserve(
-                transition, mm::RegionKind::ReclaimableBootData)
-            && memory.reserve(high_image, mm::RegionKind::KernelImage);
+                transition, mm::Region::Kind::Boot)
+            && memory.reserve(high_image, mm::Region::Kind::Kernel);
     }
     return false;
 }
@@ -307,9 +314,10 @@ private:
 
 auto build_boot_info_from_fdt(
     BootInfo& info,
-    CpuHardwareId boot_cpu,
-    mm::PhysAddr fdt_physical,
-    const void* fdt_pointer) noexcept -> libk::Expected<void, BootInfoError> {
+    mm::RegionList& regions,
+    CpuHwId boot_cpu,
+    mm::Phys fdt_physical,
+    const void* fdt_pointer) noexcept -> std::expected<void, BootInfoError> {
     info.fdt = {};
     info.transition = {};
     info.module.reset();
@@ -317,28 +325,28 @@ auto build_boot_info_from_fdt(
     info.cpu.boot_index = 0;
     info.timebase_frequency = 0;
     info.iommu.reset();
-    info.memory_regions.clear();
+    regions.clear();
 
     auto opened = Fdt::open(fdt_pointer);
     if (!opened) {
-        return libk::unexpected(BootInfoError::InvalidFdt);
+        return std::unexpected(BootInfoError::InvalidFdt);
     }
     const Fdt& tree = opened.value();
 
     if (!parse_fdt_cpus(tree, boot_cpu, info.cpu)) {
-        return libk::unexpected(BootInfoError::InvalidCpuTopology);
+        return std::unexpected(BootInfoError::InvalidCpuTopology);
     }
-    const auto timebase = parse_timebase_frequency(tree);
-    if (!timebase) {
-        return libk::unexpected(BootInfoError::InvalidTimebase);
-    }
-    info.timebase_frequency = timebase.value();
-
-    mm::BootMapBuilder memory{};
+    mm::PhysMap memory{};
     BootTree parsed{tree, memory};
+    const auto timebase = parsed.timebase();
+    if (!timebase) {
+        return std::unexpected(BootInfoError::InvalidTimebase);
+    }
+    info.timebase_frequency = *timebase;
+
     if (!parsed.read()) {
-        diag::console::print<"invalid FDT structure\n">();
-        return libk::unexpected(BootInfoError::InvalidStructure);
+        console::print<"invalid FDT structure\n">();
+        return std::unexpected(BootInfoError::InvalidStructure);
     }
     info.iommu = parsed.iommu();
 
@@ -347,39 +355,39 @@ auto build_boot_info_from_fdt(
             const auto range = Reg{address, size}.covering_pages();
             return range && static_cast<bool>(memory.reserve(
                 *range,
-                mm::RegionKind::FirmwareReserved));
+                mm::Region::Kind::Firmware));
         });
     if (!reservations_valid) {
-        return libk::unexpected(BootInfoError::InvalidMemoryMap);
+        return std::unexpected(BootInfoError::InvalidMemoryMap);
     }
     if (!reserve_kernel(memory)) {
-        return libk::unexpected(BootInfoError::InvalidKernelRange);
+        return std::unexpected(BootInfoError::InvalidKernelRange);
     }
 
     auto module = parsed.module();
     if (!module) {
-        return libk::unexpected(module.error());
+        return std::unexpected(module.error());
     }
     if (module.value()
         && !memory.reserve(
             module.value()->pages,
-            mm::RegionKind::ReclaimableBootData)) {
-        return libk::unexpected(BootInfoError::InvalidModuleRange);
+            mm::Region::Kind::Boot)) {
+        return std::unexpected(BootInfoError::InvalidModuleRange);
     }
 
-    const auto fdt_pages = mm::PageRange::covering_bytes(
+    const auto fdt_pages = mm::Pages::covering_bytes(
         fdt_physical,
         tree.size());
     if (!fdt_pages
         || !memory.reserve(
             *fdt_pages,
-            mm::RegionKind::ReclaimableBootData)) {
-        return libk::unexpected(BootInfoError::InvalidFdtRange);
+            mm::Region::Kind::Boot)) {
+        return std::unexpected(BootInfoError::InvalidFdtRange);
     }
 
-    const size_t ram_banks = memory.ram().size();
-    if (!libk::move(memory).build_into(info.memory_regions)) {
-        return libk::unexpected(BootInfoError::InvalidMemoryMap);
+    const size_t ram_banks = std::ranges::distance(memory.ram());
+    if (!std::move(memory).finish(regions)) {
+        return std::unexpected(BootInfoError::InvalidMemoryMap);
     }
 
     info.fdt = FdtSource{
@@ -387,18 +395,16 @@ auto build_boot_info_from_fdt(
         .size = static_cast<uint32_t>(tree.size()),
         .pages = *fdt_pages,
     };
-    info.transition = TransitionMemory{.pages = image::transition()};
-    info.module = libk::move(module).value();
+    info.transition = transition_pages();
+    info.module = std::move(module).value();
 
     const auto stdout = parsed.stdout_path();
     if (stdout) {
-        diag::console::print<"stdout-path(resolved)={}\n">(*stdout);
+        console::print<"stdout-path(resolved)={}\n">(*stdout);
     } else {
-        diag::console::print<"stdout-path(resolved)=notfound\n">();
+        console::print<"stdout-path(resolved)=notfound\n">();
     }
-    diag::console::print<"ram_banks={:#x}\nmemory_regions={:#x}\n">(
-        ram_banks, info.memory_regions.size());
-    return libk::expected();
+    console::print<"ram_banks={:#x}\nmemory_regions={:#x}\n">(
+        ram_banks, regions.size());
+    return {};
 }
-
-} // namespace kernel::boot

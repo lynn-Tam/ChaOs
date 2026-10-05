@@ -3,76 +3,25 @@
 #include <libk/align.hpp>
 #include <array>
 #include <libk/byte_reader.hpp>
-#include <libk/expected.hpp>
 #include <libk/intrusive_tree.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/fmt.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/inplace_ring.hpp>
-#include <libk/limits.hpp>
-#include <libk/optional.hpp>
+#include <limits>
 #include <libk/scope_guard.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/utility.hpp>
-#include <libk/variant.hpp>
+#include <utility>
 
 namespace {
-
-enum class ExpectedError {
-    rejected,
-    recovered,
-};
-
-using IntResult = libk::Expected<int, ExpectedError>;
-using IntOptional = libk::optional<int>;
-
-struct VariantA {
-    explicit VariantA(int input) noexcept : value(input) {}
-
-    int value;
-};
-
-[[nodiscard]] constexpr auto operator==(
-    const VariantA& lhs,
-    const VariantA& rhs) noexcept -> bool {
-    return lhs.value == rhs.value;
-}
-
-struct VariantB {
-    VariantB(int left_input, int right_input) noexcept
-        : left(left_input), right(right_input) {}
-
-    int left;
-    int right;
-};
-
-[[nodiscard]] constexpr auto operator==(
-    const VariantB& lhs,
-    const VariantB& rhs) noexcept -> bool {
-    return lhs.left == rhs.left && lhs.right == rhs.right;
-}
-
 struct MoveOnly {
-    explicit MoveOnly(int input) noexcept : value(input) {}
-
+    int value;
+    explicit MoveOnly(int n) noexcept : value(n) {}
     MoveOnly(const MoveOnly&) = delete;
     auto operator=(const MoveOnly&) -> MoveOnly& = delete;
-
-    MoveOnly(MoveOnly&& other) noexcept : value(other.value) {
-        other.value = -1;
-    }
-
-    auto operator=(MoveOnly&& other) noexcept -> MoveOnly& {
-        value = other.value;
-        other.value = -1;
-        return *this;
-    }
-
-    int value;
+    MoveOnly(MoveOnly&&) = default;
+    auto operator=(MoveOnly&&) -> MoveOnly& = default;
 };
-
-using TestVariant = libk::variant<VariantA, VariantB>;
-using SingleVariant = libk::variant<VariantA>;
 
 enum class AtomicPhase : uint32_t {
     Empty,
@@ -113,9 +62,9 @@ static_assert(!libk::AtomicValue<UnsupportedAtomicValue>);
 static_assert(!libk::AtomicValue<volatile uint32_t>);
 static_assert(libk::AtomicHasScalarLayout<uint32_t>);
 static_assert(libk::AtomicHasScalarLayout<int*>);
-static_assert(!libk::is_copy_constructible_v<libk::Atomic<uint32_t>>);
-static_assert(!libk::is_move_constructible_v<libk::Atomic<uint32_t>>);
-static_assert(libk::is_trivially_destructible_v<libk::Atomic<uint32_t>>);
+static_assert(!std::is_copy_constructible_v<libk::Atomic<uint32_t>>);
+static_assert(!std::is_move_constructible_v<libk::Atomic<uint32_t>>);
+static_assert(std::is_trivially_destructible_v<libk::Atomic<uint32_t>>);
 
 template<typename AtomicType>
 concept HasAcquireLoad = requires(const AtomicType& value) {
@@ -162,198 +111,13 @@ static_assert(!HasAcquireStore<libk::Atomic<AtomicPhase>>);
 static_assert(HasValidAcqRelCas<libk::Atomic<AtomicPhase>>);
 static_assert(!HasInvalidReleaseAcquireCas<libk::Atomic<AtomicPhase>>);
 
-static_assert(libk::variant_size_v<TestVariant> == 2);
-static_assert(libk::variant_size_v<SingleVariant> == 1);
-static_assert(libk::is_same_v<
-    libk::variant_alternative_t<0, TestVariant>,
-    VariantA>);
-static_assert(libk::is_same_v<
-    libk::variant_alternative_t<1, TestVariant>,
-    VariantB>);
-
 [[nodiscard]] auto same_text(libk::StrView actual, const char* expected) noexcept
     -> bool {
     return actual == libk::StrView::from_cstr(expected);
 }
 
-bool test_expected_value_semantics_and_chaining(const TestContext&) noexcept {
-    const auto source = IntResult::success(20);
-    auto copied = source;
-    auto assigned = IntResult::failure(ExpectedError::rejected);
-    assigned = source;
-
-    auto chained = libk::move(assigned)
-        .transform([](int value) { return value + 1; })
-        .and_then([](int value) {
-            return libk::Expected<long, ExpectedError>::success(value * 2L);
-        });
-
-    auto recovered = IntResult::failure(ExpectedError::rejected)
-        .or_else([](ExpectedError error) {
-            return error == ExpectedError::rejected
-                ? IntResult::success(7)
-                : IntResult::failure(ExpectedError::recovered);
-        });
-
-    auto moved = libk::Expected<MoveOnly, ExpectedError>::success(9);
-    auto transformed = libk::move(moved).transform(
-        [](MoveOnly&& value) { return value.value; });
-
-    return copied.has_value() && copied.value() == 20
-        && chained.has_value() && chained.value() == 42
-        && recovered.has_value() && recovered.value() == 7
-        && transformed.has_value() && transformed.value() == 9;
-}
-
-static_assert(requires(IntOptional value) {
-    value.and_then([](int&) { return libk::optional<long>{2L}; });
-});
-
-static_assert(!requires(IntOptional value) {
-    value.and_then([](int&) { return 2; });
-});
-
-static_assert(requires(IntOptional value) {
-    value.transform([](int& input) -> int& { return input; });
-});
-
-static_assert(!requires(IntOptional value) {
-    value.transform([](int&) {});
-});
-
-static_assert(requires(IntOptional value) {
-    value.or_else([] { return IntOptional{1}; });
-});
-
-static_assert(!requires(IntOptional value) {
-    value.or_else([] { return libk::optional<long>{1L}; });
-});
-
-static_assert(requires(IntOptional value) {
-    value.value_or(1);
-});
-
-static_assert(requires(const IntOptional value) {
-    value.value_or(1);
-});
-
-static_assert(requires(libk::optional<MoveOnly> value) {
-    libk::move(value).value_or(MoveOnly{1});
-});
-
-bool test_optional_monadic_operations(const TestContext&) noexcept {
-    bool empty_transform_called = false;
-    bool empty_and_then_called = false;
-    bool kept_or_else_called = false;
-    bool empty_or_else_called = false;
-
-    IntOptional chain_source{20};
-    auto chained = chain_source.transform([](int& value) { return value + 1; })
-        .and_then([](int&& value) {
-            return libk::optional<long>{value * 2L};
-        });
-
-    IntOptional empty_source{libk::nullopt};
-    auto empty_transform = empty_source.transform([&empty_transform_called](int&) {
-        empty_transform_called = true;
-        return 17;
-    });
-
-    auto empty_chain = empty_source.and_then([&empty_and_then_called](int&) {
-        empty_and_then_called = true;
-        return libk::optional<long>{99L};
-    });
-
-    auto kept = IntOptional{7}.or_else([&kept_or_else_called] {
-        kept_or_else_called = true;
-        return IntOptional{11};
-    });
-
-    auto recovered = IntOptional{libk::nullopt}.or_else([&empty_or_else_called] {
-        empty_or_else_called = true;
-        return IntOptional{11};
-    });
-
-    auto nested = IntOptional{3}.transform([](int value) {
-        return IntOptional{value + 4};
-    });
-
-    int external = 31;
-    IntOptional reference_source{1};
-    auto from_reference = reference_source.transform([&external](int&) -> int& {
-        return external;
-    });
-    external = 42;
-
-    auto moved_payload = libk::optional<MoveOnly>{libk::optional_in_place, 9};
-    auto moved_value = libk::move(moved_payload).transform(
-        [](MoveOnly&& value) { return value.value; });
-
-    auto moved_or_else_source = libk::optional<MoveOnly>{libk::optional_in_place, 13};
-    auto moved_or_else = libk::move(moved_or_else_source).or_else([] {
-        return libk::optional<MoveOnly>{libk::optional_in_place, 99};
-    });
-
-    const IntOptional const_lvalue{5};
-    auto from_const_lvalue = const_lvalue.transform([](const int& value) {
-        return value + 1;
-    });
-
-    auto from_rvalue = IntOptional{6}.and_then([](int&& value) {
-        return IntOptional{value + 1};
-    });
-
-    const IntOptional const_rvalue{8};
-    auto from_const_rvalue = libk::move(const_rvalue).transform([](const int&& value) {
-        return value + 1;
-    });
-
-    return chained.has_value() && chained.value() == 42
-        && !empty_transform.has_value()
-        && !empty_transform_called
-        && !empty_chain.has_value()
-        && !empty_and_then_called
-        && kept.has_value() && kept.value() == 7
-        && !kept_or_else_called
-        && recovered.has_value() && recovered.value() == 11
-        && empty_or_else_called
-        && nested.has_value() && nested.value().has_value()
-        && nested.value().value() == 7
-        && from_reference.has_value() && from_reference.value() == 31
-        && moved_value.has_value() && moved_value.value() == 9
-        && moved_or_else.has_value() && moved_or_else.value().value == 13
-        && from_const_lvalue.has_value() && from_const_lvalue.value() == 6
-        && from_rvalue.has_value() && from_rvalue.value() == 7
-        && from_const_rvalue.has_value() && from_const_rvalue.value() == 9;
-}
-
-bool test_optional_value_or(const TestContext&) noexcept {
-    IntOptional kept{10};
-    IntOptional empty{libk::nullopt};
-    const IntOptional const_kept{12};
-    const IntOptional const_empty{libk::nullopt};
-
-    const auto moved_kept =
-        libk::optional<MoveOnly>{libk::optional_in_place, 21}.value_or(
-            MoveOnly{30});
-    const auto moved_empty =
-        libk::optional<MoveOnly>{libk::nullopt}.value_or(MoveOnly{30});
-
-    const IntOptional const_rvalue{8};
-
-    return kept.value_or(3) == 10
-        && empty.value_or(3) == 3
-        && const_kept.value_or(4) == 12
-        && const_empty.value_or(4) == 4
-        && IntOptional{5}.value_or(6) == 5
-        && IntOptional{libk::nullopt}.value_or(6) == 6
-        && libk::move(const_rvalue).value_or(99) == 8
-        && moved_kept.value == 21
-        && moved_empty.value == 30;
-}
-
 bool test_checked_arithmetic_reports_overflow(const TestContext&) noexcept {
-    constexpr size_t max = libk::numeric_limits<size_t>::max();
+    constexpr size_t max = std::numeric_limits<size_t>::max();
 
     const auto add = libk::checked_add<size_t>(40, 2);
     const auto add_overflow = libk::checked_add<size_t>(max, 1);
@@ -526,7 +290,7 @@ bool test_inplace_vector_handles_aliasing_and_zero_capacity(
     if (!source.try_emplace_back(7) || !source.try_emplace_back(9)) {
         return false;
     }
-    libk::InplaceVector<MoveOnly, 2> moved{libk::move(source)};
+    libk::InplaceVector<MoveOnly, 2> moved{std::move(source)};
     return source.empty()
         && moved.size() == 2
         && moved[0].value == 7
@@ -568,16 +332,13 @@ bool test_inplace_ring_erase_preserves_logical_order(
         && *wrapped_next == 5;
 }
 
-bool test_align_and_single_variant_contracts(const TestContext&) noexcept {
-    constexpr size_t max = libk::numeric_limits<size_t>::max();
+bool test_alignment(const TestContext&) noexcept {
+    constexpr size_t max = std::numeric_limits<size_t>::max();
     const auto overflow = libk::checked_align_up(max, size_t{8});
-    SingleVariant value{VariantA{17}};
 
     return libk::align_up<size_t>(0x1001, 0x1000) == 0x2000
         && !overflow.has_value()
-        && value.index() == 0
-        && libk::get<0>(value).value == 17
-        && libk::get<VariantA>(value).value == 17;
+;
 }
 
 bool test_fmt_is_bounded_and_copy_elision_independent(const TestContext&) noexcept {
@@ -605,70 +366,6 @@ bool test_fmt_is_bounded_and_copy_elision_independent(const TestContext&) noexce
     return truncation.error == libk::fmt::errc::output_truncated
         && truncation.produced == 5
         && truncated[3] == '\0';
-}
-
-bool test_variant_tracks_active_alternative(const TestContext&) noexcept {
-    TestVariant value{VariantA{7}};
-    if (!libk::holds_alternative<VariantA>(value)
-        || libk::get<VariantA>(value).value != 7
-        || libk::get_if<VariantB>(&value) != nullptr) {
-        return false;
-    }
-
-    auto& placed = value.emplace<VariantB>(2, 5);
-    return placed.left == 2
-        && placed.right == 5
-        && value.index() == 1
-        && libk::holds_alternative<VariantB>(value)
-        && libk::get_if<VariantA>(&value) == nullptr
-        && libk::get<VariantB>(value).left == 2
-        && libk::get<VariantB>(value).right == 5;
-}
-
-bool test_variant_visit_and_equality(const TestContext&) noexcept {
-    TestVariant left{VariantA{9}};
-    TestVariant same{VariantA{9}};
-    TestVariant different{VariantB{4, 5}};
-
-    const int left_value = libk::visit(
-        [](const auto& payload) -> int {
-            if constexpr (requires { payload.right; }) {
-                return payload.left + payload.right;
-            } else {
-                return payload.value;
-            }
-        },
-        left);
-
-    const int different_value = libk::visit(
-        [](const auto& payload) -> int {
-            if constexpr (requires { payload.right; }) {
-                return payload.left + payload.right;
-            } else {
-                return payload.value;
-            }
-        },
-        different);
-
-    return left_value == 9
-        && different_value == 9
-        && left == same
-        && !(left == different);
-}
-
-bool test_variant_move_preserves_move_only_payload(const TestContext&) noexcept {
-    using MoveVariant = libk::variant<MoveOnly, VariantA>;
-
-    MoveVariant source{libk::in_place_type<MoveOnly>, 11};
-    MoveVariant moved{libk::move(source)};
-    if (!libk::holds_alternative<MoveOnly>(moved)
-        || libk::get<MoveOnly>(moved).value != 11) {
-        return false;
-    }
-
-    moved = VariantA{3};
-    return libk::holds_alternative<VariantA>(moved)
-        && libk::get<VariantA>(moved).value == 3;
 }
 
 bool test_atomic_scalar_and_compare_exchange_contract(
@@ -760,7 +457,7 @@ bool test_scope_exit_runs_once_and_can_release(const TestContext&) noexcept {
     int calls{};
     {
         auto guard = libk::on_scope_exit([&calls]() noexcept { ++calls; });
-        auto moved = libk::move(guard);
+        auto moved = std::move(guard);
         static_cast<void>(moved);
     }
     if (calls != 1) {
@@ -778,18 +475,6 @@ bool test_scope_exit_runs_once_and_can_release(const TestContext&) noexcept {
 } // namespace
 
 void register_libk_tests(TestRegistry& registry) noexcept {
-    (void)registry.add(
-        "libk",
-        "Expected preserves value semantics and chain propagation",
-        test_expected_value_semantics_and_chaining);
-    (void)registry.add(
-        "libk",
-        "optional supports monadic chaining without hidden fallback calls",
-        test_optional_monadic_operations);
-    (void)registry.add(
-        "libk",
-        "optional value_or selects contained or fallback value",
-        test_optional_value_or);
     (void)registry.add(
         "libk",
         "checked arithmetic reports overflow without asserting",
@@ -812,24 +497,12 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         test_inplace_ring_erase_preserves_logical_order);
     (void)registry.add(
         "libk",
-        "alignment and single-alternative variant contracts hold",
-        test_align_and_single_variant_contracts);
+        "alignment overflow is reported",
+        test_alignment);
     (void)registry.add(
         "libk",
         "fmt remains bounded and independent of copy elision",
         test_fmt_is_bounded_and_copy_elision_independent);
-    (void)registry.add(
-        "libk",
-        "variant tracks its active alternative",
-        test_variant_tracks_active_alternative);
-    (void)registry.add(
-        "libk",
-        "variant visit and equality follow the active payload",
-        test_variant_visit_and_equality);
-    (void)registry.add(
-        "libk",
-        "variant moves a move-only payload",
-        test_variant_move_preserves_move_only_payload);
     (void)registry.add(
         "libk",
         "atomic scalar operations preserve compare-exchange contract",

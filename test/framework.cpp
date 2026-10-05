@@ -1,13 +1,13 @@
 #include <test/test.hpp>
 
-#include <diag/console.hpp>
+#include <console.hpp>
 
 namespace {
 
 constinit TestRegistry builtin_registry{};
 
 void report_failure(const char* group, const char* name) noexcept {
-    kernel::diag::console::print<"[FAIL] {}: {}\n">(group, name);
+    console::print<"[FAIL] {}: {}\n">(group, name);
 }
 
 } // namespace
@@ -36,7 +36,7 @@ TestStats TestRegistry::run(const TestContext& ctx) noexcept {
         }
     }
 
-    kernel::diag::console::print<
+    console::print<
         "\n[test] summary\npassed={}\nfailed={}\n">(
         stats.passed, stats.failed);
     return stats;
@@ -51,11 +51,10 @@ void register_sync_tests(TestRegistry& registry) noexcept;
 void register_sched_tests(TestRegistry& registry) noexcept;
 void register_cap_tests(TestRegistry& registry) noexcept;
 void register_memory_tests(TestRegistry& registry) noexcept;
-void register_translation_tests(TestRegistry& registry) noexcept;
+void register_tlb_tests(TestRegistry& registry) noexcept;
 void register_vspace_tests(TestRegistry& registry) noexcept;
 void register_user_tests(TestRegistry& registry) noexcept;
 void register_ipc_tests(TestRegistry& registry) noexcept;
-void register_e7_tests(TestRegistry& registry) noexcept;
 
 void register_builtin_tests(TestRegistry& registry) noexcept {
     register_libk_tests(registry);
@@ -67,15 +66,14 @@ void register_builtin_tests(TestRegistry& registry) noexcept {
     register_sched_tests(registry);
     register_cap_tests(registry);
     register_memory_tests(registry);
-    register_translation_tests(registry);
+    register_tlb_tests(registry);
     register_vspace_tests(registry);
     register_user_tests(registry);
     register_ipc_tests(registry);
-    register_e7_tests(registry);
 }
 
-auto run_builtin_tests(const kernel::boot::BootInfo& boot) noexcept
+auto run_builtin_tests(const BootInfo& boot, const mm::Pmm& memory) noexcept
     -> TestStats {
     register_builtin_tests(builtin_registry);
-    return builtin_registry.run(TestContext{boot});
+    return builtin_registry.run(TestContext{boot, memory});
 }

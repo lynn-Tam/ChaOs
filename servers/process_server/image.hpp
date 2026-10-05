@@ -4,7 +4,7 @@
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/format.hpp>
 #include <libk/noncopyable.hpp>
-#include <user/server_rt/service.hpp>
+#include <servers/runtime/service.hpp>
 
 namespace myos::process {
 

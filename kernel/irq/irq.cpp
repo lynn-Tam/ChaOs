@@ -1,480 +1,162 @@
+#include <expected>
 #include <irq/irq.hpp>
+#include <ipc/notification.hpp>
+#include <limits>
 
-#include <arch/riscv64/cpu/csr.hpp>
-#include <arch/uart.hpp>
-#include <arch/pci.hpp>
-#include <cpu/cpu_local.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <libk/limits.hpp>
-#include <libk/sync/atomic.hpp>
-#include <mm/virtual_layout.hpp>
-#include <sync/irq_lock_guard.hpp>
+namespace irq {
 
-namespace kernel::irq {
-
-namespace {
-
-constexpr usize max_sources = 64;
-kernel::sync::SpinLock<kernel::sync::LockClass::IrqRegistry>
-    registry_lock{};
-Irq* registry[max_sources]{};
-struct KernelSource final {
-    void* context{};
-    bool (*handle)(void*) noexcept{};
-};
-KernelSource kernel_sources[max_sources]{};
-arch::riscv64::Plic plic{
-    kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base, 0};
-libk::Atomic<bool> platform_ready{};
-
-[[nodiscard]] auto platform_source(u32 source) noexcept -> bool {
-    return source == arch::riscv64::virt_uart_irq
-        || source == arch::virt_iommu_fault_irq
-        || (source >= arch::virt_pci_irq_first
-            && source < arch::virt_pci_irq_first + arch::virt_pci_irq_count);
-}
-
-[[nodiscard]] auto platform_enabled(u32 source) noexcept -> bool {
-    return platform_source(source)
-        && platform_ready.load<libk::MemoryOrder::Acquire>();
-}
-
-/* Every registry operation is performed with registry_lock held.  Callers
- * that also need the Irq state lock acquire them in that order: registry,
- * then Irq.  Dispatch therefore keeps the raw pointer inside the same
- * lifetime boundary until observe() returns. */
-[[nodiscard]] auto register_source_locked(Irq& irq) noexcept -> bool {
-    if (irq.source().id() >= max_sources) {
-        return false;
-    }
-    Irq*& entry = registry[irq.source().id()];
-    if (kernel_sources[irq.source().id()].handle != nullptr
-        || (entry != nullptr && entry != &irq)) {
-        return false;
-    }
-    entry = &irq;
+auto Route::connect_locked(bool armed) noexcept -> bool {
+    if (hook_.is_linked() || line_.id == 0 || !handler_) return false;
+    for (auto& r : line_.routes.routes_)
+        if (r.line_.id == line_.id) return false;
+    line_.routes.routes_.push_back(*this);
+    arm_locked(armed);
     return true;
 }
 
-void unregister_source_locked(Irq& irq) noexcept {
-    if (irq.source().id() >= max_sources) {
+auto Route::connect() noexcept -> bool {
+    sync::Lock guard{line_.routes.lock_};
+    return connect_locked(true);
+}
+
+void Route::arm_locked(bool armed) noexcept {
+    armed_ = armed;
+    line_.routes.set(line_.id, armed);
+}
+
+void Route::reset_locked() noexcept {
+    if (!hook_.is_linked()) return;
+    arm_locked(false);
+    line_.routes.routes_.erase(*this);
+}
+
+void Route::reset() noexcept {
+    sync::Lock guard{line_.routes.lock_};
+    reset_locked();
+}
+
+void Routes::dispatch(Take take, End end) noexcept {
+    sync::Lock guard{lock_};
+    const u32 id = take();
+    if (id == 0) return;
+    for (auto& r : routes_) {
+        if (r.line_.id != id) continue;
+        r.arm_locked(false);
+        const bool rearm = r.handler_();
+        if (end) end(id);
+        if (rearm && r.hook_.is_linked()) r.arm_locked(true);
         return;
     }
-    if (registry[irq.source().id()] == &irq) {
-        registry[irq.source().id()] = nullptr;
-    }
+    set(id, false);
+    if (end) end(id);
 }
 
-} // namespace
-
-auto register_kernel_source(u32 source, void* context,
-    bool (*handle)(void*) noexcept) noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{registry_lock};
-    if (!platform_source(source) || source >= max_sources || context == nullptr
-        || handle == nullptr || registry[source] != nullptr
-        || kernel_sources[source].handle != nullptr
-        || platform_ready.load<libk::MemoryOrder::Acquire>()) return false;
-    kernel_sources[source] = {context, handle};
-    return true;
+void Routes::refresh(Setup setup) noexcept {
+    sync::Lock guard{lock_};
+    if (setup) setup();
+    for (auto& r : routes_) set(r.line_.id, r.armed_);
 }
 
-void initialize_platform() noexcept {
-    // This is deliberately after install_local_entry(): before that point a
-    // PLIC interrupt would have no valid S-mode trap target.  Construction
-    // and builtin tests therefore exercise only the Irq state machine.
-    {
-        kernel::sync::IrqLockGuard guard{registry_lock};
-        KASSERT(!platform_ready.load<libk::MemoryOrder::Relaxed>());
-        // QEMU virt orders M/S PLIC contexts for each hardware hart. Only
-        // this boot hart enables SEIE; do not route to an assumed hart 0.
-        const auto hart = current_cpu().descriptor->hardware_id().raw;
-        plic = arch::riscv64::Plic{
-            kernel::mm::layout::DirectMapBegin + arch::riscv64::virt_plic_base,
-            hart * 2 + 1};
-        for (u32 source = 1; source < max_sources; ++source) {
-            if (!platform_source(source)) continue;
-            plic.configure(source);
-            Irq* const target = registry[source];
-            if (kernel_sources[source].handle != nullptr) {
-                plic.unmask(source);
-            } else if (target != nullptr) {
-                kernel::sync::IrqLockGuard irq_guard{target->lock_};
-                if (target->state_ == State::BoundIdle) {
-                    plic.unmask(source);
-                } else {
-                    // Retained Pending obligations stay masked until ack.
-                    plic.mask(source);
-                }
-            } else {
-                // Unbound sources stay masked until an idle bind commits.
-                plic.mask(source);
-            }
-        }
-        /* Publish readiness before releasing the registry transaction.  A
-         * concurrent bind must observe the fully initialized PLIC edge, not
-         * a transient state in which the source is published but still
-         * masked by the bootstrap setup. */
-        platform_ready.store<libk::MemoryOrder::Release>(true);
-    }
-    arch::riscv64::Sie::enable_external();
+Irq::Irq(Line line) noexcept
+    : route_(line, Route::Handler::bind<&Irq::publish>(*this)) {
+    libk_assert(line.id != 0);
 }
 
-Irq::Irq(SourceToken source) noexcept
-    : source_(source),
-      source_link_(ipc::NotificationSource::bind<
-          Irq,
-          &Irq::notification_closed>(*this)) {
-    KASSERT(source_);
+Irq::~Irq() noexcept { (void)close(); }
+
+auto Irq::bound() const noexcept -> bool {
+    sync::Lock guard{route_.line_.routes.lock_};
+    return notice_.attached();
 }
 
-Irq::~Irq() noexcept {
-    KASSERT(state_ == State::UnboundIdle || state_ == State::UnboundPending
-            || state_ == State::Closed);
-    KASSERT(notification_ == nullptr && !source_link_.attached());
-    KASSERT(!cleanup_);
+auto Irq::pending() const noexcept -> bool {
+    sync::Lock guard{route_.line_.routes.lock_};
+    return pending_;
 }
 
-auto Irq::state() const noexcept -> State {
-    kernel::sync::IrqLockGuard guard{lock_};
-    return state_;
+auto Irq::closed() const noexcept -> bool {
+    sync::Lock guard{route_.line_.routes.lock_};
+    return closed_;
 }
 
-auto Irq::delivery_sequence() const noexcept -> u64 {
-    kernel::sync::IrqLockGuard guard{lock_};
-    return sequence_;
-}
-
-auto Irq::bind(ipc::Notification& notification, u64 badge) noexcept
-    -> libk::Expected<void, Error> {
-    if (badge == 0) {
-        return libk::unexpected(Error::InvalidState);
+auto Irq::bind(ipc::Notification& n, u64 badge) noexcept -> std::expected<void, Error> {
+    sync::Lock guard{route_.line_.routes.lock_};
+    if (closed_ || generation_ == std::numeric_limits<u64>::max())
+        return std::unexpected(Error::Closed);
+    if (badge == 0) return std::unexpected(Error::InvalidState);
+    if (notice_.attached()) return std::unexpected(Error::Busy);
+    // A closed Notification has removed its edge. It owes no callback into
+    // this object; the route retains any already delivered event until rebind.
+    route_.reset_locked();
+    if (!n.bind(notice_, badge)) return std::unexpected(Error::Busy);
+    if (!route_.connect_locked(!pending_)) {
+        notice_.reset();
+        return std::unexpected(Error::Busy);
     }
-    bool pending = false;
-    u64 next_generation = 0;
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        kernel::sync::IrqLockGuard irq_guard{lock_};
-        if ((state_ != State::UnboundIdle
-             && state_ != State::UnboundPending)
-            || notification_ != nullptr) {
-            return libk::unexpected(Error::Busy);
-        }
-        if (generation_ == libk::numeric_limits<u64>::max()) {
-            return libk::unexpected(Error::Closed);
-        }
-        pending = state_ == State::UnboundPending;
-        next_generation = generation_ + 1;
-    }
-
-    /* Bind the notification before publishing either the registry entry or
-     * the new generation.  Any failure below leaves the previous unbound
-     * state intact and the relation is rolled back through source_link_. */
-    auto attached = notification.bind(source_link_, badge);
-    if (!attached) {
-        return libk::unexpected(Error::Busy);
-    }
-    if (!source_link_.attached()) {
-        source_link_.reset();
-        return libk::unexpected(Error::Busy);
-    }
-    bool rollback = false;
-    bool republish = false;
-    {
-        /* Registry is retained through the publication and, for a retained
-         * Pending, through the reassert signal.  This keeps dispatch from
-         * entering the newly published object until the complete bind
-         * transaction has committed, while the Irq lock never surrounds the
-         * foreign Notification operation itself. */
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        {
-            kernel::sync::IrqLockGuard irq_guard{lock_};
-            if ((state_ != State::UnboundIdle
-                 && state_ != State::UnboundPending)
-                || notification_ != nullptr || !source_link_.attached()) {
-                rollback = true;
-            } else if (!register_source_locked(*this)) {
-                rollback = true;
-            } else {
-                notification_ = &notification;
-                generation_ = next_generation;
-                state_ = pending ? State::BoundPending : State::BoundIdle;
-                if (platform_enabled(source_.id())) {
-                    if (pending) {
-                        /* The source was masked when it became unbound; keep
-                         * that invariant explicit across the new relation. */
-                        plic.mask(source_.id());
-                    } else {
-                        plic.unmask(source_.id());
-                    }
-                }
-                republish = pending;
-            }
-        }
-        if (!rollback && republish) {
-            /* NotificationSource::signal retains its own relation lease and
-             * is intentionally called with the Irq lock released. */
-            static_cast<void>(source_link_.signal());
-        }
-    }
-    if (rollback) {
-        source_link_.reset();
-        return libk::unexpected(Error::Busy);
-    }
-    return libk::expected();
+    ++generation_;
+    if (pending_) (void)notice_.signal();
+    return {};
 }
 
 auto Irq::unbind() noexcept -> bool {
-    ipc::Notification* notification{};
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        kernel::sync::IrqLockGuard irq_guard{lock_};
-        if (state_ == State::Closed || state_ == State::Closing) {
-            return false;
-        }
-        notification = notification_;
-
-        /* Registry is the outer lifetime boundary.  Remove the dispatch
-         * publication before converting the relation to an unbound state,
-         * and keep the hardware transition under the Irq lock. */
-        unregister_source_locked(*this);
-        if (platform_enabled(source_.id())) {
-            plic.mask(source_.id());
-        }
-        notification_ = nullptr;
-        state_ = observed_since_ack_ ? State::UnboundPending
-                                     : State::UnboundIdle;
-    }
-
-    /* NotificationSource::reset() may invoke the foreign Notification
-     * callback, so it remains outside both synchronization boundaries. */
-    if (notification != nullptr) {
-        source_link_.reset();
-    }
-    return notification != nullptr;
+    sync::Lock guard{route_.line_.routes.lock_};
+    const bool bound = notice_.attached();
+    route_.reset_locked();
+    notice_.reset();
+    return bound;
 }
 
-auto Irq::delivery() const noexcept
-    -> libk::Expected<Delivery, Error> {
-    kernel::sync::IrqLockGuard guard{lock_};
-    if (state_ == State::Closed || state_ == State::Closing) {
-        return libk::unexpected(Error::Closed);
-    }
-    if (state_ != State::BoundPending || !observed_since_ack_
-        || sequence_ == 0 || generation_ == 0) {
-        return libk::unexpected(Error::InvalidState);
-    }
-    return libk::expected(Delivery{sequence_, generation_});
+auto Irq::delivery() const noexcept -> std::expected<Delivery, Error> {
+    sync::Lock guard{route_.line_.routes.lock_};
+    if (closed_) return std::unexpected(Error::Closed);
+    if (!pending_ || !notice_.attached()) return std::unexpected(Error::InvalidState);
+    return (Delivery{sequence_, generation_});
 }
 
-void Irq::notification_closed() noexcept {
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        kernel::sync::IrqLockGuard irq_guard{lock_};
-        /* A close callback for an old relation can race a new bind after the
-         * old source was detached.  If the source is attached again, the
-         * callback has no authority over that new relation. */
-        if (source_link_.attached()) {
-            return;
-        }
-        /* Notification::detach_source has already removed the reverse edge;
-         * keep the Irq visibly bound until dispatch publication and hardware
-         * delivery are detached.  This also serializes a rebind against the
-         * old registry entry without invoking a foreign callback under the
-         * Irq lock. */
-        unregister_source_locked(*this);
-        if (platform_enabled(source_.id())) {
-            plic.mask(source_.id());
-        }
-        notification_ = nullptr;
-        if (state_ == State::BoundPending) {
-            state_ = State::UnboundPending;
-        } else if (state_ == State::BoundIdle) {
-            state_ = State::UnboundIdle;
-        }
-    }
-}
-
-auto Irq::observe_locked() noexcept -> libk::Expected<Delivery, Error> {
-    ipc::NotificationSource* link{};
-    Delivery delivery{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (state_ == State::Closing || state_ == State::Closed) {
-            return libk::unexpected(Error::Closed);
-        }
-        if (state_ != State::BoundIdle && state_ != State::BoundPending) {
-            return libk::unexpected(Error::InvalidState);
-        }
-        if (sequence_ == libk::numeric_limits<u64>::max()) {
-            if (platform_enabled(source_.id())) {
-                plic.mask(source_.id());
-            }
-            state_ = State::Closing;
-            return libk::unexpected(Error::Closed);
-        }
-        ++sequence_;
-        observed_since_ack_ = true;
-        state_ = State::BoundPending;
-        delivery = Delivery{sequence_, generation_};
-        link = &source_link_;
-        if (platform_enabled(source_.id())) {
-            plic.mask(source_.id());
-        }
-    }
-    // NotificationSource performs the retained relation lease and coalesces
-    // badges.  It is deliberately outside the Irq lock.
-    static_cast<void>(link->signal());
-    return libk::expected(delivery);
-}
-
-auto Irq::observe() noexcept -> libk::Expected<Delivery, Error> {
-    libk::Expected<Delivery, Error> result =
-        libk::unexpected(Error::InvalidState);
-    ipc::Notification* notification{};
-    bool closed = false;
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        result = observe_locked();
-        if (!result && state_ == State::Closing) {
-            closed = close_locked(notification);
-        }
-    }
-    if (closed) {
-        finish_close(notification);
-    }
-    return result;
-}
-
-auto Irq::ack(u64 generation, u64 sequence) noexcept
-    -> libk::Expected<void, Error> {
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        if (state_ == State::Closed || state_ == State::Closing) {
-            return libk::unexpected(Error::Closed);
-        }
-        if (state_ != State::BoundPending || !observed_since_ack_) {
-            return libk::unexpected(Error::InvalidState);
-        }
-        if (generation != generation_) {
-            return libk::unexpected(Error::StaleSequence);
-        }
-        if (sequence == 0 || sequence > sequence_) {
-            return libk::unexpected(Error::BadSequence);
-        }
-        if (sequence < sequence_) {
-            return libk::unexpected(Error::StaleSequence);
-        }
-        observed_since_ack_ = false;
-        state_ = State::BoundIdle;
-        if (platform_enabled(source_.id())) {
-            /* Keep this MMIO edge in the same Irq critical section as the
-             * state release.  A concurrent detach cannot subsequently be
-             * overtaken by a delayed unmask. */
-            plic.unmask(source_.id());
-        }
-    }
-    return libk::expected();
-}
-
-void Irq::dispatch() noexcept {
-    KernelSource kernel{};
-    u32 kernel_source{};
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        const u32 source = plic.claim();
-        if (source == 0) return;
-        // PLIC may ignore completion once the source is disabled. Complete
-        // before observe_locked masks it, and exclude close/unbind from the
-        // entire claim-to-complete interval.
-        plic.complete(source);
-        if (source >= max_sources) {
-            plic.mask(source);
-            return;
-        }
-        kernel = kernel_sources[source];
-        if (kernel.handle != nullptr) {
-            kernel_source = source;
-        } else {
-            Irq* const target = registry[source];
-            if (target != nullptr) {
-                /* The registry lock is the lifetime boundary for this raw
-                 * pointer. Sequence exhaustion only unpublishes the source
-                 * here; cleanup waits for close/retire with an object ref. */
-                const auto observed = target->observe_locked();
-                if (!observed) {
-                    kernel::sync::IrqLockGuard irq_guard{target->lock_};
-                    if (target->state_ == State::Closing) {
-                        unregister_source_locked(*target);
-                        if (platform_enabled(target->source_.id()))
-                            plic.mask(target->source_.id());
-                    }
-                }
-            } else {
-                plic.mask(source);
-            }
-        }
-    }
-    // The platform handler may take controller and Device locks. The IRQ
-    // registry lock protects only source publication and PLIC transitions.
-    if (kernel.handle != nullptr && !kernel.handle(kernel.context)) {
-        kernel::sync::IrqLockGuard guard{registry_lock};
-        plic.mask(kernel_source);
-    }
-}
-
-auto Irq::close_locked(ipc::Notification*& notification) noexcept -> bool {
-    kernel::sync::IrqLockGuard irq_guard{lock_};
-    notification = nullptr;
-    if (state_ == State::Closed) {
+auto Irq::publish() noexcept -> bool {
+    // Routes holds a claimed, masked line and the ownership lock through
+    // publication; the controller retains its own EOI timing.
+    if (closed_) return false;
+    if (sequence_ == std::numeric_limits<u64>::max()) {
+        closed_ = true;
+        route_.reset_locked();
+        notice_.reset();
         return false;
     }
-    state_ = State::Closing;
-    notification = notification_;
-    notification_ = nullptr;
-    unregister_source_locked(*this);
-    if (platform_enabled(source_.id())) {
-        plic.mask(source_.id());
-    }
-    state_ = State::Closed;
-    return true;
+    ++sequence_;
+    pending_ = true;
+    (void)notice_.signal();
+    return false;
 }
 
-void Irq::finish_close(ipc::Notification* notification) noexcept {
-    /* Detaching the foreign Notification and completing object cleanup both
-     * remain outside the Irq lock (and outside registry_lock). */
-    if (notification != nullptr || source_link_.attached()) {
-        source_link_.reset();
-    }
-    object::ObjectCleanup cleanup{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        cleanup = libk::move(cleanup_);
-    }
-    if (cleanup) {
-        cleanup.complete();
-    }
+auto Irq::ack(u64 generation, u64 sequence) noexcept -> std::expected<void, Error> {
+    sync::Lock guard{route_.line_.routes.lock_};
+    if (closed_) return std::unexpected(Error::Closed);
+    if (!pending_ || !notice_.attached()) return std::unexpected(Error::InvalidState);
+    if (generation != generation_)
+        return std::unexpected(Error::StaleSequence);
+    if (sequence == 0 || sequence > sequence_) return std::unexpected(Error::BadSequence);
+    if (sequence < sequence_) return std::unexpected(Error::StaleSequence);
+    pending_ = false;
+    // The driver must first clear the device's interrupt condition. This
+    // acknowledgement releases the software delivery, then enables the line.
+    route_.arm_locked(true);
+    return {};
 }
 
 auto Irq::close() noexcept -> bool {
-    ipc::Notification* notification{};
-    {
-        kernel::sync::IrqLockGuard registry_guard{registry_lock};
-        static_cast<void>(close_locked(notification));
-    }
-    /* close() is called through a live object reference (and by retire while
-     * its pool pin is held), so it also drains a cleanup installed after an
-     * earlier sequence-exhaustion close. */
-    finish_close(notification);
+    sync::Lock guard{route_.line_.routes.lock_};
+    route_.reset_locked();
+    notice_.reset();
+    closed_ = true;
     return true;
 }
 
-void Irq::retire(object::ObjectCleanup&& cleanup) noexcept {
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        KASSERT(!cleanup_);
-        cleanup_ = libk::move(cleanup);
-    }
-    static_cast<void>(close());
+void Irq::retire(object::cleanup&& cleanup) noexcept {
+    (void)close();
+    // Removing the route under the controller ownership lock has drained
+    // every publication. No asynchronous callback retains an Irq pointer.
+    cleanup.complete();
 }
 
-} // namespace kernel::irq
+} // namespace irq

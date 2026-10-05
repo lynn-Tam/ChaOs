@@ -1,0 +1,105 @@
+// CALL(name, number, entry, locus, unit); intentionally reusable.
+
+/*
+ * Blocking operations return only after completion. MYOS_STATUS_PENDING is
+ * reserved for explicitly asynchronous operations. VM edits complete their
+ * hardware retirement before returning; there is no user polling barrier.
+ */
+
+CALL(YIELD, 0, yield, Any, Call)
+CALL(EXIT, 1, exit, Base, Call)
+CALL(SC_BIND, 2, sc_bind, Any, Call) /* a0=SC, a1=Thread */
+CALL(EXECUTION_START, 3, thread_start, Any, Call) /* a0=Thread */
+
+CALL(CAP_CLOSE, 16, cap_call, Any, Call) /* a0=selector, a1=dest CSpace (0=current) */
+CALL(CAP_DUPLICATE, 17, cap_call, Any, Call)
+CALL(CAP_DELEGATE, 18, cap_call, Any, Call)
+CALL(CAP_MOVE, 19, cap_call, Any, Call)
+CALL(CAP_REVOKE, 20, cap_call, Any, Call)
+CALL(OBJECT_DESTROY, 21, cap_call, Any, Call)
+CALL(CAP_TYPED_DELEGATE, 22, cap_call, Any, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset */
+
+CALL(VM_MAP, 32, vm_call, Any, Call)
+CALL(VM_UNMAP, 33, vm_call, Any, Call)
+CALL(VM_PROTECT, 34, vm_call, Any, Call)
+CALL(VM_SLICE, 35, vm_call, Any, Call)
+CALL(VM_RESERVE, 36, vm_call, Any, Call)
+CALL(VM_GUARD, 37, vm_call, Any, Call)
+CALL(VM_CLEAR, 38, vm_call, Any, Call)
+
+/*
+ * Typed construction ABI:
+ *   a0: ResourcePool capability
+ *   a1-a3: type-specific scalar configuration
+ * Returns a0=status and a1=new capability in the caller's CSpace.
+ */
+CALL(RESOURCE_CREATE_CHILD, 48, resource_create_child, Any, Create) /* a1=memory, a2=caps, a3=kind mask */
+CALL(MEMORY_CREATE, 49, memory_create, Any, Create) /* a1=bytes, a2=access bits */
+CALL(VSPACE_CREATE, 50, vspace_create, Any, Create)
+CALL(CSPACE_CREATE, 51, cspace_create, Any, Create) /* a1=slot quota, a2=page quota */
+CALL(SC_CREATE, 52, sc_create, Any, Create) /* a1=domain, a2=budget ns, a3=period ns, a4=urgency, a5=cpu */
+CALL(THREAD_CREATE, 53, thread_create, Any, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
+CALL(NOTIFICATION_CREATE, 54, notification_create, Any, Create) /* a1=immutable signal badge */
+CALL(ENDPOINT_CREATE, 57, endpoint_create, Any, Create) /* a1=VSpace, a2=CSpace, a3=descriptor memory, a4=offset */
+CALL(CHANNEL_CREATE, 58, channel_create, Any, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations */
+CALL(PAGER_CREATE, 59, pager_create, Any, Create) /* a0=ResourcePool */
+CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Any, Create) /* a1=bytes, a2=access, a3=pager */
+CALL(IO_SPACE_CREATE, 62, io_space_create, Any, Create) /* a0=ResourcePool; creates an empty IOSpace */
+
+CALL(MEMORY_SEAL, 64, memory_seal, Any, Call) /* a0=MemoryObject */
+CALL(RESOURCE_CLOSE, 65, resource_close, Any, Call) /* a0=child ResourcePool */
+CALL(MEM_TRIM, 70, mem_call, Any, Call) /* Manage Mem, a1=first page, a2=count; drains PTE/TLB/borrows, DIRTY requires writeback */
+CALL(MEM_WRITEBACK, 69, mem_call, Any, Call) /* Manage Mem, a1=page; emits a Pager writeback request */
+CALL(MEMORY_POPULATE, 67, mem_call, Any, Call) /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
+CALL(RESOURCE_CLOSE_ASYNC, 68, resource_close_async, Any, Call) /* a0=pool, a1=Notification (Receive), a2=nonzero completion badge; OK=accepted */
+CALL(MEMORY_WRITE, 66, memory_write, Any, Call) /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; private anonymous single-page initialization */
+
+CALL(NOTIFICATION_SIGNAL, 80, notification_signal, Any, Ipc) /* a0=Notification; badge is in cap */
+CALL(NOTIFICATION_TAKE, 81, notification_take, Any, Ipc) /* a0=Notification */
+CALL(NOTIFICATION_WAIT, 82, notification_wait, Any, Ipc) /* a0=Notification, a1=absolute monotonic deadline ticks (0=infinite) */
+
+
+
+
+
+CALL(ENDPOINT_CALL, 112, endpoint_call, Any, Ipc) /* a0=Endpoint, a1-a3=service words, a4=relative timeout ns (0=infinite) */
+CALL(ENDPOINT_REPLY, 113, endpoint_reply, Leaf, Ipc) /* a0=status, a1=value */
+CALL(ENDPOINT_CLOSE, 114, endpoint_close, Any, Ipc) /* a0=Endpoint */
+CALL(ENDPOINT_MINT, 115, endpoint_mint, Any, Ipc) /* a0=root, a1=dest CSpace, a2=badge, a3=cap limit, a4=rights */
+CALL(ENDPOINT_ABORT, 116, endpoint_abort, Leaf, Ipc) /* a0=callee-defined abort detail */
+
+CALL(CHANNEL_TRY_SEND, 120, channel_send, Any, Ipc) /* a0=Channel, message in IPC buffer */
+CALL(CHANNEL_TRY_RECV, 121, channel_recv, Any, Ipc) /* a0=Channel, message in IPC buffer */
+CALL(CHANNEL_SEND, 122, channel_send, Any, Ipc) /* ThreadBlocking send */
+CALL(CHANNEL_RECV, 123, channel_recv, Any, Ipc) /* ThreadBlocking receive */
+CALL(CHANNEL_CLOSE, 124, channel_close, Any, Ipc) /* a0=Channel */
+CALL(CHANNEL_BIND, 125, channel_bind, Any, Ipc) /* a0=Channel, a1=Notification, a2=condition */
+CALL(CHANNEL_ARM, 126, channel_arm, Any, Ipc) /* a0=Channel, a1=relation, a2=sequence */
+CALL(CHANNEL_MINT, 127, channel_mint, Any, Ipc) /* a0=side root, a1=dest CSpace, a2=badge, a3=rights */
+
+/* Canonical kernel monotonic clock; returns ticks or ticks/second. */
+CALL(CLOCK_NOW, 128, clock_now, Any, Call)
+CALL(CLOCK_FREQUENCY, 129, clock_frequency, Any, Call)
+
+CALL(PAGER_CLAIM, 131, pg_call, Any, Call) /* a0=pager; writes the tagged request to the registered IPC buffer */
+CALL(PAGER_REQUEUE, 132, pg_call, Any, Call) /* a0=pager, a1=request id */
+CALL(PAGER_COMPLETE, 133, pg_call, Any, Call) /* a0=pager, a1=target memory, a2=request id */
+CALL(PAGER_FAIL, 134, pg_call, Any, Call) /* a0=pager, a1=target memory, a2=request id */
+CALL(IRQ_BIND, 135, pg_call, Any, Call) /* a0=irq, a1=notification, a2=badge */
+CALL(IRQ_OBSERVE, 136, pg_call, Any, Call) /* a0=irq */
+CALL(IRQ_ACK, 137, pg_call, Any, Call) /* a0=irq, a1=generation, a2=sequence */
+CALL(PAGER_SUPPLY, 138, pg_call, Any, Call) /* a0=pager, a1=target memory, a2=staging memory, a3=source page, a4=request id */
+CALL(EXIT_QUERY, 139, exit_call, Any, Call) /* a0=Thread; returns sequence/status */
+CALL(EXIT_BIND, 140, exit_call, Any, Call) /* a0=Thread, a1=Notification, a2=badge */
+CALL(PAGER_BIND, 141, pg_call, Any, Call) /* a0=pager, a1=Notification, a2=badge */
+
+/* Binding starts asynchronously. STATE reports progress; close commits teardown
+ * and keeps the device unavailable until BAR/IRQ and DMA retirement complete. */
+CALL(IO_SPACE_BIND, 144, io_call, Any, Call) /* a0=IOSpace, a1=Device, a2=Memory, a3=first page, a4=page count, a5=IOVA */
+CALL(IO_SPACE_STATE, 145, io_call, Any, Call) /* a0=IOSpace; returns myos_io_space_state */
+CALL(IO_SPACE_INFO, 146, io_call, Any, Call) /* a0=IOSpace, a1=registered IPC buffer offset; writes myos_io_info */
+CALL(IO_SPACE_BAR, 147, io_call, Any, Call) /* a0=IOSpace, a1=BAR index; returns bounded Memory capability */
+CALL(IO_SPACE_IRQ, 148, io_call, Any, Call) /* a0=IOSpace; returns generation Irq capability */
+CALL(IO_SPACE_CLOSE, 149, io_call, Any, Call) /* a0=IOSpace */
+CALL(DEVICE_INFO, 150, io_call, Any, Call) /* a0=Device, a1=registered IPC buffer offset; writes myos_device_info */
+CALL(IO_SPACE_WATCH, 151, io_call, Any, Call) /* a0=IOSpace, a1=Notification, a2=badge; before bind */

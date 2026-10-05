@@ -1,9 +1,10 @@
-#include <user/server_rt/service.hpp>
+#include <servers/process_server/protocol.hpp>
+#include <servers/runtime/service.hpp>
 #include <libk/parse.hpp>
-#include <user/ipc/channel.hpp>
-#include <user/server_rt/console.hpp>
-#include <user/abi/startup.hpp>
-#include <user/abi/time.hpp>
+#include <sys/channel.hpp>
+#include <programs/shell/terminal.hpp>
+#include <sys/start.hpp>
+#include <sys/clock.hpp>
 #include <libk/fmt.hpp>
 
 namespace {
@@ -143,9 +144,9 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     const bool stop = service::equal(line, "stop");
     const bool run = !spawn && !wait && !stop;
     service::Message request{};
-    request.operation = static_cast<uint64_t>(run ? service::Process::ForegroundSpawn
-        : spawn ? service::Process::Spawn
-        : wait ? service::Process::Wait : service::Process::Stop);
+    request.operation = static_cast<uint64_t>(run ? process::op::ForegroundSpawn
+        : spawn ? process::op::Spawn
+        : wait ? process::op::Wait : process::op::Stop);
     request.id = latest;
     if ((wait || stop) && *argument != 0) {
         char* end = argument;
@@ -159,7 +160,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
             const auto duration = libk::parse<uint64_t>(end);
             Clock clock;
             service::require(clock.open());
-            const auto deadline = duration ? clock.after_ms(*duration) : libk::nullopt;
+            const auto deadline = duration ? clock.after_ms(*duration) : std::nullopt;
             if (!deadline) { console.write("invalid timeout\n"); return; }
             request.size = sizeof(uint64_t);
             service::copy(request.data, &*deadline, request.size);
@@ -191,7 +192,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         if (split != 0) {
             if (split == request.size) { console.write("invalid pipeline\n"); return; }
             request.operation = static_cast<uint64_t>(run
-                ? service::Process::ForegroundPipeline : service::Process::Pipeline);
+                ? process::op::ForegroundPipeline : process::op::Pipeline);
             request.id = split;
         }
         if (request.size > sizeof(request.data)) { console.write("argument too long\n"); return; }
@@ -203,13 +204,13 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     if ((run || spawn) && reply.status == MYOS_STATUS_OK) {
         const auto child = reply.id;
         uint64_t consumer{};
-        if (reply.operation == static_cast<uint64_t>(service::Process::Pipeline)
-            || reply.operation == static_cast<uint64_t>(service::Process::ForegroundPipeline)) {
+        if (reply.operation == static_cast<uint64_t>(process::op::Pipeline)
+            || reply.operation == static_cast<uint64_t>(process::op::ForegroundPipeline)) {
             if (reply.size != sizeof(consumer)) exit(MYOS_STATUS_PEER_FAULT);
             service::copy(&consumer, reply.data, sizeof(consumer));
         }
         if (run) {
-            service::Message wait_request{.operation = static_cast<uint64_t>(service::Process::Wait),
+            service::Message wait_request{.operation = static_cast<uint64_t>(process::op::Wait),
                 .id = consumer ? consumer : child};
             service::require(process.send(wait_request).status);
             service::require(process.receive(reply).status);

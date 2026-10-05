@@ -8,7 +8,6 @@ import subprocess
 import sys
 import time
 
-
 def main():
     qemu, kernel, bundle, disk, harts = sys.argv[1:6]
     marker = b'[fault-shell] file read before failure'
@@ -56,7 +55,6 @@ def main():
                 process.kill()
                 process.wait()
             selector.close()
-
 
 if __name__ == '__main__':
     main()

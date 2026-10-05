@@ -5,7 +5,6 @@ from pathlib import Path
 import subprocess
 import sys
 
-
 def main():
     qemu, kernel, bundle, disk, cpus = sys.argv[1:6]
     logs = Path(__file__).resolve().parents[2] / '.tmp/project/service-start'
@@ -31,7 +30,6 @@ def main():
             log.write_bytes(output)
             raise RuntimeError(f'{count} hart startup rollback failed; diagnostic: {log}')
         print(f'[service-start] OK: {count} harts, late admission rollback and relaunch')
-
 
 if __name__ == '__main__':
     main()

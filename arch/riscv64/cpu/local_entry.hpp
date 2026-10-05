@@ -16,8 +16,8 @@
 #pragma once
 
 #if !defined(__ASSEMBLER__)
-#include <core/types.hpp>
-#include <libk/typetraits.hpp>
+#include <base/types.hpp>
+#include <type_traits>
 #include <stddef.h>
 #endif
 
@@ -86,10 +86,10 @@ struct CpuEntryBlock final {
     }
 };
 
-static_assert(libk::is_standard_layout_v<EntryScratch>);
-static_assert(libk::is_standard_layout_v<CpuEntryBlock>);
-static_assert(libk::is_trivially_destructible_v<EntryScratch>);
-static_assert(libk::is_trivially_destructible_v<CpuEntryBlock>);
+static_assert(std::is_standard_layout_v<EntryScratch>);
+static_assert(std::is_standard_layout_v<CpuEntryBlock>);
+static_assert(std::is_trivially_destructible_v<EntryScratch>);
+static_assert(std::is_trivially_destructible_v<CpuEntryBlock>);
 
 static_assert(sizeof(EntryScratch) == RISCV64_CPU_ENTRY_SIZE);
 static_assert(alignof(EntryScratch) == alignof(usize));

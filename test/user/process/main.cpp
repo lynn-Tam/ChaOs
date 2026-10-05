@@ -1,7 +1,8 @@
-#include <user/server_rt/service.hpp>
-#include <user/server_rt/console.hpp>
-#include <user/ipc/channel.hpp>
-#include <user/abi/time.hpp>
+#include <servers/process_server/protocol.hpp>
+#include <servers/runtime/service.hpp>
+#include <servers/runtime/output.hpp>
+#include <sys/channel.hpp>
+#include <sys/clock.hpp>
 #include <libk/fmt.hpp>
 
 namespace {
@@ -21,12 +22,12 @@ auto deadline(uint64_t ms) noexcept -> uint64_t {
     check(static_cast<bool>(value));
     return *value;
 }
-auto request(service::Process operation, uint64_t id = 0, uint64_t expires = 0) noexcept -> service::Message {
+auto request(process::op operation, uint64_t id = 0, uint64_t expires = 0) noexcept -> service::Message {
     service::Message result{.operation = static_cast<uint64_t>(operation), .id = id};
     if (expires != 0) { result.size = sizeof(expires); service::copy(result.data, &expires, sizeof(expires)); }
     return result;
 }
-auto receive(service::Connection& channel, service::Process operation, myos_status_t status) noexcept -> service::Message {
+auto receive(service::Connection& channel, process::op operation, myos_status_t status) noexcept -> service::Message {
     service::Message reply;
     check(channel.receive(reply).status == MYOS_STATUS_OK);
     if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
@@ -39,10 +40,10 @@ auto receive(service::Connection& channel, service::Process operation, myos_stat
 }
 auto exchange(service::Connection& channel, service::Message message, myos_status_t status) noexcept -> service::Message {
     check(channel.send(message).status == MYOS_STATUS_OK);
-    return receive(channel, static_cast<service::Process>(message.operation), status);
+    return receive(channel, static_cast<process::op>(message.operation), status);
 }
 auto spawn(service::Connection& channel, const char* ms, myos_status_t status = MYOS_STATUS_OK) noexcept -> uint64_t {
-    auto message = request(service::Process::Spawn);
+    auto message = request(process::op::Spawn);
     bootstrap::Arguments args;
     check(args.append("sleep", 5) && args.append(ms, service::length(ms)));
     message.size = args.data().size;
@@ -50,8 +51,8 @@ auto spawn(service::Connection& channel, const char* ms, myos_status_t status = 
     return exchange(channel, message, status).id;
 }
 void stop(service::Connection& channel, uint64_t id) noexcept {
-    check(exchange(channel, request(service::Process::Stop, id), MYOS_STATUS_CANCELED).id == id);
-    exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_INVALID_CAP);
+    check(exchange(channel, request(process::op::Stop, id), MYOS_STATUS_CANCELED).id == id);
+    exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
 }
 }
 
@@ -64,28 +65,28 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
 
     const auto first = spawn(channel, "10000");
-    check(channel.send(request(service::Process::Wait, first)).status == MYOS_STATUS_OK);
+    check(channel.send(request(process::op::Wait, first)).status == MYOS_STATUS_OK);
     const auto second = spawn(channel, "10000"); // Must progress while the first Wait is pending.
     check(first != second);
-    check(channel.send(request(service::Process::CancelWait, first)).status == MYOS_STATUS_OK);
-    check(receive(channel, service::Process::Wait, MYOS_STATUS_CANCELED).id == first);
-    receive(channel, service::Process::CancelWait, MYOS_STATUS_OK);
-    exchange(channel, request(service::Process::Wait, first, deadline(1)), MYOS_STATUS_TIMED_OUT);
+    check(channel.send(request(process::op::CancelWait, first)).status == MYOS_STATUS_OK);
+    check(receive(channel, process::op::Wait, MYOS_STATUS_CANCELED).id == first);
+    receive(channel, process::op::CancelWait, MYOS_STATUS_OK);
+    exchange(channel, request(process::op::Wait, first, deadline(1)), MYOS_STATUS_TIMED_OUT);
     stop(channel, second);
-    check(channel.send(request(service::Process::Wait, first)).status == MYOS_STATUS_OK);
-    check(channel.send(request(service::Process::Stop, first)).status == MYOS_STATUS_OK);
-    receive(channel, service::Process::Stop, MYOS_STATUS_OK);
-    receive(channel, service::Process::Wait, MYOS_STATUS_CANCELED);
-    exchange(channel, request(service::Process::Wait, first), MYOS_STATUS_INVALID_CAP);
+    check(channel.send(request(process::op::Wait, first)).status == MYOS_STATUS_OK);
+    check(channel.send(request(process::op::Stop, first)).status == MYOS_STATUS_OK);
+    receive(channel, process::op::Stop, MYOS_STATUS_OK);
+    receive(channel, process::op::Wait, MYOS_STATUS_CANCELED);
+    exchange(channel, request(process::op::Wait, first), MYOS_STATUS_INVALID_CAP);
 
     uint64_t retained[4]{};
     for (auto& id : retained) id = spawn(channel, "1");
     spawn(channel, "1", MYOS_STATUS_BUSY); // Even completed, unconsumed results retain admission slots.
-    for (auto id : retained) exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_OK);
+    for (auto id : retained) exchange(channel, request(process::op::Wait, id), MYOS_STATUS_OK);
     const auto reused = spawn(channel, "10000");
     for (auto id : retained) {
         check(id != reused);
-        exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_INVALID_CAP);
+        exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
     }
     stop(channel, reused);
 
@@ -96,14 +97,14 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     // removes only the waiter; completion remains consumable exactly once.
     for (unsigned i = 0; i != 16; ++i) {
         const auto id = spawn(channel, "1");
-        check(channel.send(request(service::Process::Wait, id, deadline(1))).status == MYOS_STATUS_OK);
+        check(channel.send(request(process::op::Wait, id, deadline(1))).status == MYOS_STATUS_OK);
         service::Message reply;
         check(channel.receive(reply).status == MYOS_STATUS_OK && reply.id == id
-            && reply.operation == static_cast<uint64_t>(service::Process::Wait));
+            && reply.operation == static_cast<uint64_t>(process::op::Wait));
         check(reply.status == MYOS_STATUS_OK || reply.status == MYOS_STATUS_TIMED_OUT);
         if (reply.status == MYOS_STATUS_TIMED_OUT)
-            exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_OK);
-        exchange(channel, request(service::Process::Wait, id), MYOS_STATUS_INVALID_CAP);
+            exchange(channel, request(process::op::Wait, id), MYOS_STATUS_OK);
+        exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
         check(channel.try_receive(reply).status == MYOS_STATUS_WOULD_BLOCK);
     }
 

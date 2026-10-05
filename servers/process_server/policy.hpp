@@ -1,8 +1,8 @@
 #pragma once
 
 #include <servers/deploy/detail/plan.hpp>
-#include <user/abi/startup.hpp>
-#include <user/server_rt/service.hpp>
+#include <sys/start.hpp>
+#include <servers/runtime/service.hpp>
 
 namespace myos::process {
 
@@ -70,7 +70,7 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
             break;
         case MYOS_BOOTSTRAP_CAP_VSPACE:
             if (source != row.vspace_key) return false;
-            rights = MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
+            rights = MYOS_RIGHT_DELEGATE | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
                 | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY;
             break;
         case MYOS_BOOTSTRAP_CAP_CSPACE:

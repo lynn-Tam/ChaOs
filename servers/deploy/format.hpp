@@ -4,8 +4,8 @@
 #include <stdint.h>
 
 #include <libk/checked_arithmetic.hpp>
-#include <libk/expected.hpp>
-#include <libk/optional.hpp>
+#include <expected>
+#include <optional>
 #include <uapi/capability.h>
 #include <uapi/channel.h>
 #include <uapi/bootstrap.h>
@@ -14,11 +14,10 @@
 #include <uapi/object.h>
 #include <uapi/ipc.h>
 #include <uapi/thread.h>
-#include <uapi/vproc.h>
 #include <uapi/vm.h>
 
 #include <servers/deploy/bundle.hpp>
-#include <user/abi/startup.hpp>
+#include <sys/start.hpp>
 
 
 /*
@@ -51,7 +50,7 @@ enum class DescriptorForm : uint8_t {
 }
 
 [[nodiscard]] constexpr auto valid_kind(uint16_t kind) noexcept -> bool {
-    return kind > MYOS_OBJECT_KIND_INVALID && kind < MYOS_OBJECT_KIND_COUNT;
+    return kind > MYOS_OBJECT_KIND_INVALID && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
 }
 
 [[nodiscard]] constexpr auto valid_access(uint64_t access) noexcept -> bool {
@@ -79,12 +78,6 @@ enum class DescriptorForm : uint8_t {
     return count != 0 && base <= UINT64_MAX - count;
 }
 
-/*
- * Validate one canonical descriptor form.  A registered ceiling may carry a
- * rights-only Tunnel source; Duplicate is the rights-only wire form for every
- * kind; TypedRequest is the full typed form and deliberately excludes Tunnel,
- * whose only accepted current operation is Duplicate.
- */
 [[nodiscard]] constexpr auto valid_descriptor(
     const myos_cap_attenuation& value,
     DescriptorForm form = DescriptorForm::Ceiling) noexcept -> bool {
@@ -103,14 +96,11 @@ enum class DescriptorForm : uint8_t {
     case MYOS_OBJECT_KIND_SCHED_DOMAIN:
     case MYOS_OBJECT_KIND_CSPACE:
     case MYOS_OBJECT_KIND_NOTIFICATION:
-    case MYOS_OBJECT_KIND_VPROC:
     case MYOS_OBJECT_KIND_IO_SPACE:
     case MYOS_OBJECT_KIND_DEVICE:
     case MYOS_OBJECT_KIND_IRQ:
+    case MYOS_OBJECT_KIND_PAGER:
         return zero_words(value, 0);
-    case MYOS_OBJECT_KIND_TUNNEL:
-        return form != DescriptorForm::TypedRequest
-            && zero_words(value, 0);
     case MYOS_OBJECT_KIND_MEMORY:
         return valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
@@ -126,7 +116,7 @@ enum class DescriptorForm : uint8_t {
             && zero_words(value, 4);
     case MYOS_OBJECT_KIND_RESOURCE_POOL: {
         constexpr uint64_t valid_mask =
-            (uint64_t{1} << MYOS_OBJECT_KIND_COUNT) - 1;
+            MYOS_OBJECT_KINDS;
         return (value.words[2] & ~valid_mask) == 0
             && (value.words[2] & (uint64_t{1}
                                   << MYOS_OBJECT_KIND_INVALID)) == 0
@@ -143,8 +133,6 @@ enum class DescriptorForm : uint8_t {
         return value.words[0] <= MYOS_CAP_CHANNEL_SIDE_B
             && (unbound || exact) && zero_words(value, 3);
     }
-    case MYOS_OBJECT_KIND_PAGER:
-        return value.words[0] != 0 && zero_words(value, 1);
     case MYOS_OBJECT_KIND_INVALID:
     case MYOS_OBJECT_KIND_COUNT:
         return false;
@@ -183,10 +171,10 @@ enum class DescriptorForm : uint8_t {
     case MYOS_OBJECT_KIND_SCHED_DOMAIN:
     case MYOS_OBJECT_KIND_CSPACE:
     case MYOS_OBJECT_KIND_NOTIFICATION:
-    case MYOS_OBJECT_KIND_VPROC:
     case MYOS_OBJECT_KIND_IO_SPACE:
     case MYOS_OBJECT_KIND_DEVICE:
     case MYOS_OBJECT_KIND_IRQ:
+    case MYOS_OBJECT_KIND_PAGER:
         return true;
     case MYOS_OBJECT_KIND_MEMORY:
     case MYOS_OBJECT_KIND_VSPACE:
@@ -223,9 +211,6 @@ enum class DescriptorForm : uint8_t {
             && requested.words[1] == ceiling.words[1]
             && requested.words[2] == ceiling.words[2];
     }
-    case MYOS_OBJECT_KIND_PAGER:
-        return requested.words[0] <= ceiling.words[0];
-    case MYOS_OBJECT_KIND_TUNNEL:
     case MYOS_OBJECT_KIND_INVALID:
     case MYOS_OBJECT_KIND_COUNT:
         return false;
@@ -276,8 +261,6 @@ enum class DescriptorForm : uint8_t {
 namespace deploy {
 
 static_assert(sizeof(myos_ipc_binding) <= DEPLOY_PAGE_SIZE);
-static_assert(sizeof(myos_vproc_control_page) <= DEPLOY_PAGE_SIZE);
-static_assert(sizeof(myos_vproc_event_page) <= DEPLOY_PAGE_SIZE);
 
 class ByteView final {
 public:
@@ -520,13 +503,13 @@ public:
         const void* data,
         size_t size,
         ManifestWorkspace& workspace) noexcept
-        -> libk::Expected<ManifestView, Error> {
+        -> std::expected<ManifestView, Error> {
         workspace.reset();
         ManifestView result{data, size};
         if (result.validate(workspace)) {
-            return libk::expected(result);
+            return (result);
         }
-        return libk::unexpected(result.error_);
+        return std::unexpected(result.error_);
     }
 
     [[nodiscard]] constexpr auto bytes() const noexcept -> ByteView {
@@ -891,7 +874,7 @@ private:
     [[nodiscard]] static constexpr auto valid_kind(uint64_t kind) noexcept
         -> bool {
         return kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT;
+            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
     }
 
     [[nodiscard]] static constexpr auto valid_access(uint64_t access) noexcept
@@ -1031,7 +1014,7 @@ private:
                 || restart > DEPLOY_RESTART_ALWAYS
                 || flags != 0
                 || (kind_mask
-                    & ~((UINT64_C(1) << MYOS_OBJECT_KIND_COUNT) - 1)) != 0
+                    & ~MYOS_OBJECT_KINDS) != 0
                 || (kind_mask
                     & (UINT64_C(1) << MYOS_OBJECT_KIND_INVALID)) != 0
                 || pool_memory == 0
@@ -1366,8 +1349,8 @@ private:
                 if (refs[0] != DEPLOY_NO_INDEX
                     || refs[1] != DEPLOY_NO_INDEX
                     || refs[2] != DEPLOY_NO_INDEX
-                    || refs[3] != DEPLOY_NO_INDEX || args[0] == 0
-                    || args[1] == 0 || args[2] != 0 || args[3] != 0
+                    || refs[3] != DEPLOY_NO_INDEX || args[0] != 0
+                    || args[1] != 0 || args[2] != 0 || args[3] != 0
                     || args[4] != 0 || args[5] != 0) {
                     return fail(Error::InvalidRecord);
                 }
@@ -1639,7 +1622,7 @@ private:
                           DEPLOY_EXECUTION_URGENCY, 4, urgency)
                 || !value(DEPLOY_TABLE_EXECUTION, index,
                           DEPLOY_EXECUTION_HOME_CPU, 4, home_cpu)
-                || model > DEPLOY_EXECUTION_VPROC
+                || model != DEPLOY_EXECUTION_THREAD
                 || flags != 0
                 || fault != DEPLOY_EXECUTION_FAULT_TERMINATE
                 || terminal != DEPLOY_EXECUTION_TERMINAL_LEADER_EXIT
@@ -1678,12 +1661,7 @@ private:
                     && !in_task_range(owner, DEPLOY_TABLE_MAPPING, event))) {
                 return fail(Error::InvalidReference);
             }
-            if ((model == DEPLOY_EXECUTION_THREAD
-                 && (control != DEPLOY_NO_INDEX
-                     || event != DEPLOY_NO_INDEX))
-                || (model == DEPLOY_EXECUTION_VPROC
-                    && (control == DEPLOY_NO_INDEX
-                        || event == DEPLOY_NO_INDEX))) {
+            if (control != DEPLOY_NO_INDEX || event != DEPLOY_NO_INDEX) {
                 return fail(Error::InvalidRecord);
             }
             if ((stack_top & 0xf) != 0 || stack_top == 0) {
@@ -2256,7 +2234,7 @@ private:
     [[nodiscard]] auto task_source_kind(
         uint32_t task,
         ByteView target) const noexcept
-        -> libk::optional<myos_object_kind_t> {
+        -> std::optional<myos_object_kind_t> {
         /* Import destinations live in the child CSpace and therefore cannot
          * be a construction-time PreparedKey source.  Check this namespace
          * explicitly before accepting an equal local symbol; otherwise a
@@ -2269,17 +2247,17 @@ private:
             || !value(DEPLOY_TABLE_TASK, task,
                       DEPLOY_TASK_IMPORT_COUNT, 4,
                       import_count_value)) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         for (uint64_t index = 0; index < import_count_value; ++index) {
             ByteView destination{};
             if (!read_key(DEPLOY_TABLE_IMPORT,
                           static_cast<uint32_t>(import_first + index),
                           DEPLOY_IMPORT_DESTINATION, destination, true)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             if (destination.equals(target)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
         }
 
@@ -2315,7 +2293,7 @@ private:
             if (!read_key(DEPLOY_TABLE_TASK, task, roots[index], key,
                           true)
                 || !consider(key, root_kinds[index])) {
-                return libk::nullopt;
+                return std::nullopt;
             }
         }
         const uint32_t tables[] = {
@@ -2340,7 +2318,7 @@ private:
                        first)
                 || !value(DEPLOY_TABLE_TASK, task, count_fields[group], 4,
                           count)) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             for (uint64_t row = first; row < first + count; ++row) {
                 size_t fields[] = {
@@ -2362,7 +2340,7 @@ private:
                         || (group == 1 && field == 1));
                     if (!read_key(tables[group], static_cast<uint32_t>(row),
                                   fields[field], key, required)) {
-                        return libk::nullopt;
+                        return std::nullopt;
                     }
                     if (!required && key.size() == 0) {
                         continue;
@@ -2378,7 +2356,7 @@ private:
                                    DEPLOY_OBJECT_KIND, 2,
                                    object_kind)
                             || !valid_kind(object_kind)) {
-                            return libk::nullopt;
+                            return std::nullopt;
                         }
                         kind = static_cast<myos_object_kind_t>(object_kind);
                     } else {
@@ -2386,27 +2364,25 @@ private:
                         if (!value(DEPLOY_TABLE_EXECUTION,
                                    static_cast<uint32_t>(row),
                                    DEPLOY_EXECUTION_MODEL, 2, model)
-                            || model > DEPLOY_EXECUTION_VPROC) {
-                            return libk::nullopt;
+                            || model != DEPLOY_EXECUTION_THREAD) {
+                            return std::nullopt;
                         }
                         kind = field == 0
                             ? static_cast<myos_object_kind_t>(
-                                  model == DEPLOY_EXECUTION_THREAD
-                                      ? MYOS_OBJECT_KIND_THREAD
-                                      : MYOS_OBJECT_KIND_VPROC)
+                                  MYOS_OBJECT_KIND_THREAD)
                             : static_cast<myos_object_kind_t>(
                                   MYOS_OBJECT_KIND_SCHED_CONTEXT);
                     }
                     if (!consider(key, kind)) {
-                        return libk::nullopt;
+                        return std::nullopt;
                     }
                 }
             }
         }
         if (!found) {
-            return libk::nullopt;
+            return std::nullopt;
         }
-        return libk::optional<myos_object_kind_t>{found_kind};
+        return std::optional<myos_object_kind_t>{found_kind};
     }
 
     [[nodiscard]] auto validate_exports() noexcept -> bool {
@@ -3005,26 +2981,6 @@ private:
                         || !special_mapping(static_cast<uint32_t>(ipc),
                                             DEPLOY_CRITICAL_IPC_HEADER,
                                             MYOS_VM_READ | MYOS_VM_WRITE))) {
-                    return fail(Error::InvalidBootBundle);
-                }
-                if (model == DEPLOY_EXECUTION_VPROC) {
-                    if (control == DEPLOY_NO_INDEX
-                        || event == DEPLOY_NO_INDEX
-                        || control < mapping_first
-                        || control >= mapping_first + mapping_count_value
-                        || event < mapping_first
-                        || event >= mapping_first + mapping_count_value
-                        || !special_mapping(
-                            static_cast<uint32_t>(control),
-                            DEPLOY_CRITICAL_VPROC_CONTROL,
-                            MYOS_VM_READ | MYOS_VM_WRITE)
-                        || !special_mapping(static_cast<uint32_t>(event),
-                                            DEPLOY_CRITICAL_VPROC_EVENT,
-                                            MYOS_VM_READ)) {
-                        return fail(Error::InvalidBootBundle);
-                    }
-                } else if (control != DEPLOY_NO_INDEX
-                           || event != DEPLOY_NO_INDEX) {
                     return fail(Error::InvalidBootBundle);
                 }
             }

@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 
-
 def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
          data_source=None):
     data_source = data_source or data_disk
@@ -75,7 +74,6 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
         process.kill()  # Simulate power loss; no guest shutdown or unmount.
         process.wait()
         poll.close()
-
 
 def main():
     qemu, kernel, bundle, boot_disk, cpus = sys.argv[1:6]
@@ -166,7 +164,6 @@ def main():
             ("fs cat readme", b"recovered"),
         ])
         print("[storage] OK: injected write EIO isolated, old file survived, later sync persisted")
-
 
 if __name__ == "__main__":
     main()

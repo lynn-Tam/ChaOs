@@ -60,7 +60,6 @@ static_assert(offsetof(myos_cap_attenuation, words) == 16);
 #define MYOS_RIGHT_DUPLICATE     (MYOS_U64_C(1) << 0)
 #define MYOS_RIGHT_DELEGATE      (MYOS_U64_C(1) << 1)
 #define MYOS_RIGHT_RESERVE       (MYOS_U64_C(1) << 2)
-#define MYOS_RIGHT_CREATE_REGION (MYOS_U64_C(1) << 3)
 #define MYOS_RIGHT_MAP           (MYOS_U64_C(1) << 4)
 #define MYOS_RIGHT_UNMAP         (MYOS_U64_C(1) << 5)
 #define MYOS_RIGHT_PROTECT       (MYOS_U64_C(1) << 6)

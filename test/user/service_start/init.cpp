@@ -1,4 +1,4 @@
-#include <user/server_rt/service.hpp>
+#include <servers/runtime/service.hpp>
 #include <servers/deploy/services.hpp>
 #include <servers/deploy/launch.hpp>
 #include <servers/uart/port.hpp>
@@ -12,7 +12,7 @@ void report(const myos::bootstrap::BootstrapView& info, const char* message,
     using namespace myos;
     constexpr uintptr_t address = 0x30010000;
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
-    const auto region = vm_create_region(vspace, address, 4096,
+    const auto region = vm_slice(vspace, address, 4096,
         MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE,
         MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
     service::require(region.status);
@@ -22,8 +22,8 @@ void report(const myos::bootstrap::BootstrapView& info, const char* message,
     uart::Port port{address};
     if (initialize) port.reset();
     port.write(message);
-    service::require(vm_complete(vspace, vm_unmap(region.value, address, 4096)).status);
-    service::require(vm_complete(vspace, vm_destroy_region(region.value)).status);
+    service::require(vm_unmap(region.value, address, 4096).status);
+    service::require(vm_clear(region.value).status);
     service::require(cap_close(region.value).status);
 }
 }

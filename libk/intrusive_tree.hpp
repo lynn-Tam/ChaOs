@@ -8,7 +8,7 @@
 #include <stddef.h>
 
 #include <libk/assert.hpp>
-#include <libk/typetraits.hpp>
+#include <type_traits>
 
 namespace libk {
 
@@ -44,7 +44,7 @@ private:
 
 template<typename T, IntrusiveTreeHook T::* HookMember, typename Compare>
 class IntrusiveTree {
-    static_assert(is_object_v<T> && !is_const_v<T>);
+    static_assert(std::is_object_v<T> && !std::is_const_v<T>);
 
 public:
     constexpr IntrusiveTree() noexcept = default;

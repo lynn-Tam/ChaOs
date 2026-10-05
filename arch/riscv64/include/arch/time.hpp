@@ -1,7 +1,7 @@
 #pragma once
 
-#include <core/types.hpp>
-#include <libk/expected.hpp>
+#include <base/types.hpp>
+#include <expected>
 #include <time/time.hpp>
 
 namespace arch {
@@ -11,10 +11,10 @@ enum class TimerError : u8 {
     Rejected,
 };
 
-[[nodiscard]] auto read_clock() noexcept -> kernel::time::Instant;
+[[nodiscard]] auto read_clock() noexcept -> time::Instant;
 [[nodiscard]] auto timer_available() noexcept -> bool;
-[[nodiscard]] auto program_timer(kernel::time::Instant deadline) noexcept
-    -> libk::Expected<void, TimerError>;
+[[nodiscard]] auto program_timer(time::Instant deadline) noexcept
+    -> std::expected<void, TimerError>;
 void mask_timer() noexcept;
 
 } // namespace arch

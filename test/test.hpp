@@ -2,10 +2,13 @@
 
 #include <stddef.h>
 
-#include <boot/boot_info.hpp>
+#include <boot/info.hpp>
+
+namespace mm { class Pmm; }
 
 struct TestContext {
-    const kernel::boot::BootInfo& boot;
+    const BootInfo& boot;
+    const mm::Pmm& memory;
 };
 
 struct TestStats {
@@ -36,4 +39,4 @@ private:
 
 void register_builtin_tests(TestRegistry& registry) noexcept;
 [[nodiscard]] auto run_builtin_tests(
-    const kernel::boot::BootInfo& boot) noexcept -> TestStats;
+    const BootInfo& boot, const mm::Pmm& memory) noexcept -> TestStats;

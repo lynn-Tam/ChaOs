@@ -1,16 +1,17 @@
 #pragma once
+#include <concepts>
 #include <new>
 #include <libk/assert.hpp>
 #include <libk/concepts.hpp>
-#include <libk/utility.hpp>
+#include <utility>
 
 namespace libk {
 
 template<typename T, typename... Args>
 constexpr auto construct_at(T* location, Args&&... arguments)
-    noexcept(is_nothrow_constructible_v<T, Args&&...>) -> T* {
+    noexcept(std::is_nothrow_constructible_v<T, Args&&...>) -> T* {
     return ::new(static_cast<void*>(location))
-        T(libk::forward<Args>(arguments)...);
+        T(std::forward<Args>(arguments)...);
 }
 
 template<typename T>
@@ -29,7 +30,7 @@ public:
     constexpr explicit observer_ptr(pointer ptr) noexcept : ptr_(ptr) {}
 
     template<typename U>
-        requires ConvertibleTo<U*, pointer>
+        requires std::convertible_to<U*, pointer>
     constexpr observer_ptr(observer_ptr<U> other) noexcept : ptr_(other.get()) {}
 
     constexpr pointer release() noexcept {
@@ -100,15 +101,15 @@ class not_null {
 
 public:
     using pointer = Ptr;
-    using element_type = remove_extent_t<
-        remove_ref_t<decltype(*static_cast<Ptr>(nullptr))>>;
+    using element_type = std::remove_extent_t<
+        std::remove_reference_t<decltype(*static_cast<Ptr>(nullptr))>>;
 
     constexpr explicit not_null(pointer ptr) noexcept : ptr_(ptr) {
         libk_assert(ptr_ != nullptr);
     }
 
     template<typename U>
-        requires ConvertibleTo<U, pointer>
+        requires std::convertible_to<U, pointer>
     constexpr not_null(not_null<U> other) noexcept
         : ptr_(static_cast<pointer>(other.get())) {}
 

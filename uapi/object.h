@@ -22,8 +22,7 @@ enum myos_object_kind {
     MYOS_OBJECT_KIND_VSPACE = 6,
     MYOS_OBJECT_KIND_RESOURCE_POOL = 7,
     MYOS_OBJECT_KIND_NOTIFICATION = 8,
-    MYOS_OBJECT_KIND_VPROC = 9,
-    MYOS_OBJECT_KIND_TUNNEL = 10,
+    /* 9-10 reserved: removed experimental lane and transport. */
     MYOS_OBJECT_KIND_ENDPOINT = 11,
     MYOS_OBJECT_KIND_CHANNEL = 12,
     MYOS_OBJECT_KIND_PAGER = 13,
@@ -32,6 +31,8 @@ enum myos_object_kind {
     MYOS_OBJECT_KIND_IO_SPACE = 16,
     MYOS_OBJECT_KIND_COUNT = 17,
 };
+
+#define MYOS_OBJECT_KINDS (((UINT64_C(1) << MYOS_OBJECT_KIND_COUNT) - 2) & ~(UINT64_C(3) << 9))
 
 typedef uint16_t myos_object_kind_t;
 

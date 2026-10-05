@@ -1,9 +1,12 @@
 #pragma once
 
-#include <libk/optional.hpp>
-#include <user/ipc/io.hpp>
-#include <user/abi/objects.hpp>
-#include <user/server_rt/service.hpp>
+#include <utility>
+
+
+#include <optional>
+#include <sys/queue.hpp>
+#include <sys/handle.hpp>
+#include <servers/runtime/service.hpp>
 
 namespace block {
 
@@ -30,7 +33,7 @@ public:
         space_ = cap::OwnedCap{{created.value, 0}};
         auto arena = MappedMemory::create(pool, vspace, ArenaAddress, ArenaSize);
         if (!arena) return arena.error();
-        arena_ = libk::move(arena).value();
+        arena_ = std::move(*arena);
         const auto watched = io_space_watch(created.value, events, service::EventsBadge);
         if (watched.status != MYOS_STATUS_OK) return watched.status;
         const auto bound = io_space_bind(created.value, device, arena_.memory.selector(),
@@ -58,7 +61,7 @@ public:
             auto mapped = MappedMemory::map(vspace, cap::OwnedCap{{bar.value, 0}},
                 BarsAddress + index * BarStride, bytes, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE);
             if (!mapped) return mapped.error();
-            bars_[index] = libk::move(mapped).value();
+            bars_[index] = std::move(*mapped);
         }
         const auto interrupt = io_space_irq(created.value);
         if (interrupt.status != MYOS_STATUS_OK) return interrupt.status;

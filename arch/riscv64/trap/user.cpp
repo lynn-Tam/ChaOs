@@ -1,3 +1,4 @@
+#include <optional>
 #include <arch/user.hpp>
 #include <arch/trap.hpp>
 
@@ -5,8 +6,9 @@
 #include "arch/riscv64/trap/context.hpp"
 #include "arch/riscv64/trap/trapframe.hpp"
 
-#include <mm/virtual_layout.hpp>
-#include <core/debug.hpp>
+#include <mm/table.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
 #include <libk/memory.hpp>
 
 extern "C" [[noreturn]] void arch_riscv64_resume_user(
@@ -24,44 +26,24 @@ namespace {
 } // namespace
 
 auto valid_user_start(UserStart start) noexcept -> bool {
-    return kernel::mm::layout::is_user(start.entry)
+    return mm::is_user(start.entry)
         && (start.entry.raw() & 0x1U) == 0
-        && start.stack.raw() >= kernel::mm::layout::LowGuardEnd
-        && start.stack.raw() <= kernel::mm::layout::UserEnd
+        && start.stack.raw() >= mm::UserBegin
+        && start.stack.raw() <= mm::UserEnd
         && (start.stack.raw() & 0xfU) == 0;
-}
-
-auto valid_user_context(const myos_user_context& context) noexcept -> bool {
-    constexpr usize Pc = 0;
-    constexpr usize Sp = 2;
-    return kernel::mm::layout::is_user(
-               kernel::mm::VirtAddr{context.words[Pc]})
-        && (context.words[Pc] & 0x1U) == 0
-        && context.words[Sp] >= kernel::mm::layout::LowGuardEnd
-        && context.words[Sp] <= kernel::mm::layout::UserEnd
-        && (context.words[Sp] & 0xfU) == 0;
-}
-
-/*luna change: derive the Vproc active stack top from the raw mapped top, reason: one architecture-sized cell remains reserved for a fault frame*/
-auto vproc_stack_top(usize raw_stack_top) noexcept -> usize {
-    if (raw_stack_top < sizeof(riscv64::TrapFrame)
-        || (raw_stack_top & 0xfU) != 0) {
-        return 0;
-    }
-    return raw_stack_top - sizeof(riscv64::TrapFrame);
 }
 
 auto prepare_user_stack(
     usize home_stack_top,
-    UserStart start) noexcept -> libk::optional<usize> {
+    UserStart start) noexcept -> std::optional<usize> {
     if (!valid_user_start(start)
         || home_stack_top < sizeof(riscv64::TrapFrame)
         || (home_stack_top & 0xfU) != 0) {
-        return libk::nullopt;
+        return std::nullopt;
     }
 
     riscv64::TrapFrame* const frame = frame_at(home_stack_top);
-    KASSERT((reinterpret_cast<usize>(frame) & 0xfU) == 0);
+    libk_assert((reinterpret_cast<usize>(frame) & 0xfU) == 0);
     libk::construct_at(frame);
     *frame = {};
     frame->sp = start.stack.raw();
@@ -80,20 +62,20 @@ auto prepare_user_stack(
 
 auto prepare_user_frame(
     usize kernel_stack_top,
-    UserStart start) noexcept -> libk::optional<UserFrame> {
+    UserStart start) noexcept -> std::optional<UserFrame> {
     const auto frame = prepare_user_stack(kernel_stack_top, start);
     return frame
-        ? libk::optional<UserFrame>{
+        ? std::optional<UserFrame>{
               riscv64::make_user_frame(
                   *reinterpret_cast<riscv64::TrapFrame*>(*frame))}
-        : libk::nullopt;
+        : std::nullopt;
 }
 
 [[noreturn]] void resume_user(usize home_stack_top) noexcept {
     riscv64::TrapFrame* const frame = frame_at(home_stack_top);
-    KASSERT(kernel::mm::layout::is_user(kernel::mm::VirtAddr{frame->sepc}));
-    KASSERT(frame->sstatus == riscv64::Sstatus::SPIE);
-    KASSERT((frame->sp & 0xfU) == 0);
+    libk_assert(mm::is_user(mm::Virt{frame->sepc}));
+    libk_assert(frame->sstatus == riscv64::Sstatus::SPIE);
+    libk_assert((frame->sp & 0xfU) == 0);
     arch_riscv64_resume_user(frame);
 }
 

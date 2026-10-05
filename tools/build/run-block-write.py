@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 
-
 def boot(qemu, kernel, bundle, disk, cpus, log):
     command = [qemu, '-machine', 'virt,iommu-sys=on', '-smp', cpus,
                '-nographic', '-bios', 'default', '-kernel', kernel,
@@ -41,7 +40,6 @@ def boot(qemu, kernel, bundle, disk, cpus, log):
         process.communicate()
         poll.close()
 
-
 def main():
     qemu, kernel, writer, verifier, cpus = sys.argv[1:6]
     logs = Path(__file__).resolve().parents[2] / '.tmp/project/block-write'
@@ -54,7 +52,6 @@ def main():
             boot(qemu, kernel, writer, disk, count, logs / f'write-{count}.log')
             boot(qemu, kernel, verifier, disk, count, logs / f'verify-{count}.log')
             print(f'[block-write] OK: {count} harts, write/flush, QEMU kill, reread')
-
 
 if __name__ == '__main__':
     main()

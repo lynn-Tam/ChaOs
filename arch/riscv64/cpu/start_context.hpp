@@ -13,20 +13,17 @@
 
 #include <stddef.h>
 
-#include <arch/page_table.hpp>
-#include <core/types.hpp>
-#include <cpu/topology.hpp>
+#include <base/types.hpp>
+#include <cpu/types.hpp>
 #include <libk/sync/atomic.hpp>
-#include <libk/typetraits.hpp>
+#include <type_traits>
 
-namespace kernel {
 struct CpuRuntime;
-}
 
 namespace arch::riscv64 {
 
 using SecondaryContinuation = void (*)(
-    kernel::CpuRuntime*, usize) noexcept;
+    CpuRuntime*, usize) noexcept;
 
 struct CpuStartContextLayout;
 
@@ -42,10 +39,10 @@ public:
     auto operator=(CpuStartContext&&) -> CpuStartContext& = delete;
 
     void initialize(
-        kernel::CpuHardwareId hardware_id,
-        RootToken root,
+        CpuHwId hardware_id,
+        usize root,
         usize init_stack_top,
-        kernel::CpuRuntime& runtime,
+        CpuRuntime& runtime,
         SecondaryContinuation entry) noexcept;
 
     [[nodiscard]] auto ready() const noexcept -> bool;
@@ -58,7 +55,7 @@ private:
     usize hardware_id_{};
     usize satp_{};
     usize init_stack_top_{};
-    kernel::CpuRuntime* runtime_{};
+    CpuRuntime* runtime_{};
     SecondaryContinuation entry_{};
 };
 
@@ -78,8 +75,8 @@ struct CpuStartContextLayout final {
                 == RISCV64_CPU_START_ENTRY_OFFSET;
 };
 
-static_assert(libk::is_standard_layout_v<CpuStartContext>);
-static_assert(libk::is_trivially_destructible_v<CpuStartContext>);
+static_assert(std::is_standard_layout_v<CpuStartContext>);
+static_assert(std::is_trivially_destructible_v<CpuStartContext>);
 static_assert(sizeof(CpuStartContext) == RISCV64_CPU_START_CONTEXT_SIZE);
 static_assert(alignof(CpuStartContext) == alignof(usize));
 static_assert(CpuStartContextLayout::valid);

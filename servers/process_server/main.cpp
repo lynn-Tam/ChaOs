@@ -1,10 +1,13 @@
-#include <user/server_rt/service.hpp>
+#include <optional>
+#include <utility>
+#include <servers/process_server/protocol.hpp>
+#include <servers/runtime/service.hpp>
 #include <servers/process_server/image.hpp>
 #include <servers/process_server/pipe.hpp>
 #include <servers/process_server/policy.hpp>
-#include <user/abi/startup.hpp>
+#include <sys/start.hpp>
 #include <servers/deploy/launch.hpp>
-#include <user/ipc/storage.hpp>
+#include <sys/storage.hpp>
 
 namespace {
 using namespace myos;
@@ -18,8 +21,8 @@ struct Job final {
     process::Image image;
     process::Pipe input;
     bool discard{};
-    libk::optional<Supervisor::handle> child;
-    libk::optional<Waiter> waiter;
+    std::optional<Supervisor::handle> child;
+    std::optional<Waiter> waiter;
 
     void release_image() noexcept {
         input.close();
@@ -92,7 +95,7 @@ auto spawn(const bootstrap::BootstrapView& info, const service::Message& request
     if (file.size == 0 || file.size > PackageLimit) status = MYOS_STATUS_BAD_ARGS;
     if (status == MYOS_STATUS_OK) {
         auto backing = filesystem.backing(file, MYOS_VM_READ | MYOS_VM_EXECUTE);
-        if (backing) job->package = libk::move(backing).value();
+        if (backing) job->package = std::move(*backing);
         else status = backing.error();
     }
     const auto closed = filesystem.close(file);
@@ -257,22 +260,22 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             const auto received = channel.try_receive(request);
             if (received.status == MYOS_STATUS_OK) {
                 service::Message reply{.operation = request.operation, .id = request.id, .status = MYOS_STATUS_BAD_ARGS};
-                switch (static_cast<service::Process>(request.operation)) {
-                case service::Process::Pipeline:
+                switch (static_cast<process::op>(request.operation)) {
+                case process::op::Pipeline:
                     reply = pipeline(info, request, 0);
                     break;
-                case service::Process::Spawn:
+                case process::op::Spawn:
                     reply = spawn(info, request);
                     break;
-                case service::Process::ForegroundPipeline:
+                case process::op::ForegroundPipeline:
                     reply = pipeline(info, request,
                         service::capability(info, bootstrap::imports::ConsoleInput));
                     break;
-                case service::Process::ForegroundSpawn:
+                case process::op::ForegroundSpawn:
                     reply = spawn(info, request,
                         service::capability(info, bootstrap::imports::ConsoleInput));
                     break;
-                case service::Process::CancelWait: {
+                case process::op::CancelWait: {
                     auto* job = find(request.id);
                     if (job == nullptr || !job->waiter) { reply.status = MYOS_STATUS_INVALID_CAP; break; }
                     job->waiter->reply.status = MYOS_STATUS_CANCELED;
@@ -281,11 +284,11 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                     reply.status = MYOS_STATUS_OK;
                     break;
                 }
-                case service::Process::Wait:
-                case service::Process::Stop: {
+                case process::op::Wait:
+                case process::op::Stop: {
                     auto* job = find(request.id);
                     if (job == nullptr) { reply.status = MYOS_STATUS_INVALID_CAP; break; }
-                    const bool stop = request.operation == static_cast<uint64_t>(service::Process::Stop);
+                    const bool stop = request.operation == static_cast<uint64_t>(process::op::Stop);
                     if (stop) service::require(supervisor.request_stop(*job->child));
                     if (job->waiter) { reply.status = stop ? MYOS_STATUS_OK : MYOS_STATUS_BUSY; break; }
                     uint64_t expires{};

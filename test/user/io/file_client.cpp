@@ -1,7 +1,7 @@
-#include <user/server_rt/service.hpp>
-#include <user/abi/startup.hpp>
-#include <user/ipc/storage.hpp>
-#include <uapi/test_scenario.h>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <sys/start.hpp>
+#include <sys/storage.hpp>
 
 namespace {
 using namespace myos;
@@ -55,10 +55,12 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         // The response conveys Map-only content authority; it cannot initialize
         // or modify the server's canonical backing object.
         check(memory_write(packet.capabilities[0].selector(), 0, 0, 1).status == MYOS_STATUS_BAD_RIGHTS);
-        auto mapped = MappedMemory::map(vspace, libk::move(packet.capabilities[0]),
+        check(mem_trim(packet.capabilities[0].selector(), 0, 1).status == MYOS_STATUS_BAD_RIGHTS);
+        check(mem_writeback(packet.capabilities[0].selector(), 0).status == MYOS_STATUS_BAD_RIGHTS);
+        auto mapped = MappedMemory::map(vspace, std::move(packet.capabilities[0]),
             0x75000000 + i * 0x100000, mapped_size, MYOS_VM_READ);
         check(static_cast<bool>(mapped));
-        mappings[i] = libk::move(mapped).value();
+        mappings[i] = std::move(*mapped);
         const auto* bytes = reinterpret_cast<const volatile uint8_t*>(mappings[i].address);
         for (size_t n = 0; n < mapped_size; ++n)
             check(bytes[n] == (n < FileSize ? n % 251 : 0));
@@ -72,9 +74,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(sessions[0].exchange(private_request, private_packet));
     check(private_packet.count == 1 && private_request.value == identity);
     auto private_result = MappedMemory::map_private(vspace,
-        libk::move(private_packet.capabilities[0]), 0x76000000, mapped_size);
+        std::move(private_packet.capabilities[0]), 0x76000000, mapped_size);
     check(static_cast<bool>(private_result));
-    auto private_mapping = libk::move(private_result).value();
+    auto private_mapping = std::move(*private_result);
     auto* private_bytes = reinterpret_cast<volatile uint8_t*>(private_mapping.address);
     check(private_bytes[0] == 0 && private_bytes[4096] == 4096 % 251);
     private_bytes[0] = 97;
@@ -86,24 +88,12 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         check(bytes[0] == 0 && bytes[4096] == 4096 % 251 && bytes[FileSize] == 0);
     }
     service::require(private_mapping.close());
-    // The pressure kernel drains free frames on this first fault. The same
-    // consumer and artifacts also run normally; no service has a test mode.
-    const auto fresh = [&](uintptr_t address) {
-        auto mapping = MappedMemory::create(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
-            vspace, address, 4096);
-        check(static_cast<bool>(mapping));
-        return libk::move(mapping).value();
-    };
-    auto stress = fresh(MYOS_TEST_PRESSURE_STRESS_ADDRESS);
-    auto release = fresh(MYOS_TEST_PRESSURE_RELEASE_ADDRESS);
-    check(*reinterpret_cast<const volatile uint8_t*>(stress.address) == 0);
     for (size_t pass = 0; pass < 8; ++pass) {
         for (size_t page = 0; page < mapped_size; page += 4096) {
             const auto* bytes = reinterpret_cast<const volatile uint8_t*>(mappings[pass % 2].address);
             check(bytes[page] == page % 251);
         }
     }
-    check(*reinterpret_cast<const volatile uint8_t*>(release.address) == 0);
     for (size_t batch = 0; batch < 16; ++batch) {
         uint64_t ids[2][io::QueueDepth]{}, offsets[2][io::QueueDepth]{};
         for (size_t i = 0; i < 2; ++i) {

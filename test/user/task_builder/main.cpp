@@ -1,8 +1,9 @@
+#include <utility>
 #include <stddef.h>
 #include <stdint.h>
 
-#include <libk/optional.hpp>
-#include <user/abi/startup.hpp>
+#include <optional>
+#include <sys/start.hpp>
 #include <servers/deploy/detail/plan.hpp>
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/authority.hpp>
@@ -74,7 +75,7 @@ struct Console final {
             return false;
         }
         port = myos::uart::Port{0};
-        const myos::SysResult created = myos::vm_create_region(
+        const myos::SysResult created = myos::vm_slice(
             vspace.selector,
             UartAddress,
             PageSize,
@@ -131,7 +132,7 @@ struct Console final {
             case deploy::LeasePhase::Ready:
             case deploy::LeasePhase::Destroying: {
                 phase = deploy::LeasePhase::Destroying;
-                const myos_status_t status = myos::vm_destroy_region(
+                const myos_status_t status = myos::vm_clear(
                     region.selector()).status;
                 if (deploy::committed(status)) {
                     phase = deploy::LeasePhase::Closing;
@@ -289,7 +290,7 @@ Runtime runtime{};
     if (!memory_slot) {
         return false;
     }
-    if (!runtime.source.adopt(libk::move(source_space))) {
+    if (!runtime.source.adopt(std::move(source_space))) {
         return false;
     }
     const auto domain_id = runtime.source.register_source(
@@ -389,7 +390,7 @@ Runtime runtime{};
     if (!decoded) {
         return false;
     }
-    runtime.plan = libk::move(decoded.value());
+    runtime.plan = std::move(decoded.value());
     return runtime.plan.task_count() == 5
         && runtime.bundle.view() != nullptr;
 }
@@ -399,7 +400,7 @@ Runtime runtime{};
     deploy::CloseReason reason,
     myos_status_t status,
     deploy::TaskBuilder<Table, Completions>& builder,
-    libk::optional<Completions::Receiver>& receiver) noexcept -> bool {
+    std::optional<Completions::Receiver>& receiver) noexcept -> bool {
     if (builder.valid() && !builder.fail(reason, status)) {
         return false;
     }
@@ -417,17 +418,17 @@ Runtime runtime{};
 }
 
 [[nodiscard]] auto expected_critical_bytes(uint32_t task_index) noexcept
-    -> libk::optional<uint64_t> {
+    -> std::optional<uint64_t> {
     if (task_index != 3 && task_index != 4) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     const myos::boot::Bundle* const package = runtime.bundle.view();
     if (package == nullptr) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     myos::boot::Module child{};
     if (!package->find("child", child) || child.segment_count() != 2) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     myos::boot::Segment text{};
     myos::boot::Segment data{};
@@ -441,12 +442,12 @@ Runtime runtime{};
         || data.file_size != sizeof(uint64_t)
         || data.memory_size != 3 * PageSize
         || data.memory_size - data.file_size < 2 * PageSize) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     const deploy::PlanTask* const row = runtime.plan.task(task_index);
     if (row == nullptr
         || row->mappings.count != (task_index == 3 ? 4U : 5U)) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     const auto mapping = [&](uint32_t local) noexcept
         -> const deploy::PlanMapping* {
@@ -470,19 +471,19 @@ Runtime runtime{};
                                  : DEPLOY_CRITICAL_NONE)
         || bootstrap->source != DEPLOY_MAPPING_SOURCE_ZERO
         || bootstrap->critical != DEPLOY_CRITICAL_BOOTSTRAP) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     if (task_index == 4) {
         const auto* const descriptor = mapping(4);
         if (descriptor == nullptr
             || descriptor->source != DEPLOY_MAPPING_SOURCE_ZERO
             || descriptor->critical != DEPLOY_CRITICAL_NONE) {
-            return libk::nullopt;
+            return std::nullopt;
         }
     }
     const uint64_t expected = task_index == 3 ? 2 * PageSize : 3 * PageSize;
     if (row->critical_bytes != expected) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     return expected;
 }
@@ -495,12 +496,12 @@ Runtime runtime{};
     auto builder_value = Builder::begin(
         runtime.completions,
         runtime.table,
-        libk::move(*plan_lease),
+        std::move(*plan_lease),
         task_index);
     if (!builder_value) {
         return false;
     }
-    Builder builder = libk::move(*builder_value);
+    Builder builder = std::move(*builder_value);
     const auto id = builder.record()->id();
     auto receiver = builder.take_receiver();
     if (!receiver) {

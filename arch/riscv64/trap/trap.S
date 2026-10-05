@@ -139,6 +139,8 @@ arch_riscv64_trap_entry:
     // The selected-arch exit hook may redirect this return to a synthetic
     // frame on another guarded kernel stack (Endpoint Activation).
     mv sp, a0
+    mv a0, sp
+    call arch_riscv64_trap_return
 
 .Lrestore_frame:
     // A newly started Thread reaches this path with interrupts enabled.

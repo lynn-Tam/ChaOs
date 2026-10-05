@@ -1,3 +1,4 @@
+#include <libk/assert.hpp>
 #include <stddef.h>
 #include <servers/deploy/format.hpp>
 

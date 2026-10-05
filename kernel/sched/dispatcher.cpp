@@ -1,75 +1,72 @@
+#include <expected>
+#include <utility>
 #include <sched/dispatcher.hpp>
+#include <trace.hpp>
 
 #include <arch/context.hpp>
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
 #include <arch/ipi.hpp>
 #include <arch/time.hpp>
-#include <diag/console.hpp>
-#include <core/debug.hpp>
-#include <cpu/cpu_local.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <cpu/cpu_runtime.hpp>
-#include <sched/context.hpp>
+#include <console.hpp>
+#include <panic.hpp>
+#include <cpu/local.hpp>
+#include <cpu/registry.hpp>
+#include <cpu/runtime.hpp>
+#include <sched/sc.hpp>
 #include <sched/domain.hpp>
-#include <sync/irq_lock_guard.hpp>
+#include <sync.hpp>
 #include <libk/checked_arithmetic.hpp>
-#include <libk/limits.hpp>
-#include <thread/thread.hpp>
-#include <execution/vproc.hpp>
-#include <operation/wait.hpp>
+#include <limits>
+#include <task/thread.hpp>
+#include <wait.hpp>
 
-namespace kernel::sched {
+namespace sched {
 
-CpuDispatcher::CpuDispatcher(
+Dispatcher::Dispatcher(
     CpuLocal& cpu,
     CpuId id,
     Thread& idle,
     time::Clock& clock) noexcept
-    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock), remote_(id),
-      watchdog_deadline_(
-          Deadline::Callback::bind<&CpuDispatcher::watchdog_fire>(*this))
+    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock), remote_(id)
 {
-    KASSERT(cpu_->dispatcher_ == nullptr);
-    KASSERT(idle_->idle());
-    KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
+    libk_assert(cpu_->dispatcher_ == nullptr);
+    libk_assert(idle_->idle());
+    libk_assert(idle_->state_ == Thread::State::Prepared);
     const auto quantum = clock_->duration_from_nanoseconds(4'000'000);
-    KASSERT(quantum && !quantum->empty());
+    libk_assert(quantum && !quantum->empty());
     quantum_ = *quantum;
     timer_available_ = arch::timer_available();
     ipi_available_ = arch::ipi_available();
-    const auto watchdog_period =
-        clock_->duration_from_nanoseconds(10'000'000);
-    watchdog_period_ = watchdog_period
-        ? *watchdog_period : time::Duration{};
     cpu_->dispatcher_ = this;
 }
 
-CpuDispatcher::~CpuDispatcher() noexcept {
-    if (watchdog_deadline_.armed()) {
-        deadlines_.remove(watchdog_deadline_);
-        watchdog_deadline_.owner_ = nullptr;
-    }
+Dispatcher::~Dispatcher() noexcept {
+
     if (cpu_ != nullptr && cpu_->dispatcher_ == this) {
         cpu_->dispatcher_ = nullptr;
     }
 }
 
-auto CpuDispatcher::remaining_budget() const noexcept -> time::Duration {
-    KASSERT(current_binding_ != nullptr);
-    return current_binding_->context().available(clock_->now());
+auto Dispatcher::current() const noexcept -> Thread* {
+    return cpu_->current_;
 }
 
-auto CpuDispatcher::current_urgency() const noexcept -> Urgency {
-    KASSERT(current_binding_ != nullptr);
-    return current_binding_->context().urgency();
+auto Dispatcher::remaining_budget() const noexcept -> time::Duration {
+    libk_assert(current_sc_ != nullptr);
+    return current_sc_->available(clock_->now());
 }
 
-auto CpuDispatcher::arm(
+auto Dispatcher::current_urgency() const noexcept -> Urgency {
+    libk_assert(current_sc_ != nullptr);
+    return current_sc_->urgency();
+}
+
+auto Dispatcher::arm(
     Deadline& deadline,
     time::Instant when) noexcept -> bool {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::current_cpu_owner() == cpu_);
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::current_cpu_owner() == cpu_);
     if (!timer_available_ || deadline.armed() || !deadline.callback_) {
         return false;
     }
@@ -79,55 +76,52 @@ auto CpuDispatcher::arm(
     return true;
 }
 
-void CpuDispatcher::disarm(Deadline& deadline) noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::current_cpu_owner() == cpu_);
-    KASSERT(deadline.owner_ == this);
+void Dispatcher::disarm(Deadline& deadline) noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::current_cpu_owner() == cpu_);
+    libk_assert(deadline.owner_ == this);
     deadlines_.remove(deadline);
     deadline.owner_ = nullptr;
     program_deadline(clock_->now());
 }
 
-void CpuDispatcher::publish(execution::Target target) noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::current_cpu_owner() == cpu_);
-    KASSERT(target);
-    Execution& execution = target.execution();
-    const usize stack_top = target.stack_top();
-    KASSERT(stack_top != 0 && (stack_top & 0xfU) == 0);
+void Dispatcher::publish(Thread* target) noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::current_cpu_owner() == cpu_);
+    libk_assert(target);
+    const usize stack_top = target->current_stack_top();
+    libk_assert(stack_top != 0 && (stack_top & 0xfU) == 0);
 
-    ExecutionBinding& roots = target.effective_binding();
-    roots.translation().activate(*cpu_);
-    current_ = target;
-    cpu_->current_execution_ = &execution;
+    Env& roots = target->env();
+    roots.root().activate(*cpu_);
+    cpu_->current_ = target;
     arch::publish_active_stack(cpu_->arch_state, stack_top);
 }
 
-[[noreturn]] void CpuDispatcher::enter_idle() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(!current_);
-    KASSERT(idle_->execution_.state_ == ExecutionState::Prepared);
-    idle_->execution_.set_state(ExecutionState::Running);
+[[noreturn]] void Dispatcher::enter_idle() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(!cpu_->current_);
+    libk_assert(idle_->state_ == Thread::State::Prepared);
+    idle_->set_state(Thread::State::Running);
     accounted_at_ = clock_->now();
-    publish(execution::Target{*idle_});
+    publish(idle_);
     program_deadline(accounted_at_);
-    const execution::Target idle{*idle_};
+    Thread* idle = idle_;
     record_dispatch(idle, idle, DispatchReason::Start, accounted_at_);
-    arch::enter_context(idle_->execution_.context());
+    arch::enter_context(idle_->ctx());
 }
 
-void CpuDispatcher::on_context_enter() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_);
-    KASSERT(cpu_->current_execution_ == &current_.execution());
-    KASSERT(arch::active_stack(cpu_->arch_state)
-        == current_.stack_top());
-    ExecutionBinding& roots = current_.effective_binding();
-    KASSERT(cpu_->kernel_vspace() == roots.kernel_vspace());
-    KASSERT(cpu_->vspace() == roots.vspace());
-    KASSERT(cpu_->cspace() == roots.cspace());
-    KASSERT(cpu_->active_translation_
-        == &roots.translation().state());
+void Dispatcher::on_context_enter() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(cpu_->current_);
+    libk_assert(arch::active_stack(cpu_->arch_state)
+        == cpu_->current_->current_stack_top());
+    Env& roots = cpu_->current_->env();
+    libk_assert(cpu_->kernel_vspace() == roots.kernel_vspace());
+    libk_assert(cpu_->vspace() == roots.vspace());
+    libk_assert(cpu_->cspace() == roots.cspace());
+    libk_assert(cpu_->active_tlb_
+        == &roots.root().state());
     post_switch();
     if (ipi_available_) {
         arch::enable_ipi();
@@ -135,52 +129,50 @@ void CpuDispatcher::on_context_enter() noexcept {
     arch::enable_interrupts();
 }
 
-void CpuDispatcher::refresh() noexcept {
-    KASSERT(!arch::interrupts_enabled());
+void Dispatcher::refresh() noexcept {
+    libk_assert(!arch::interrupts_enabled());
     // Endpoint frames change synchronously in the trap handler (depth 1) or
     // while an asynchronous terminal cause is committed by the common
     // trap-exit hook (depth 0). Both are owner-CPU, interrupts-off points
     // before the selected user frame is restored.
-    KASSERT(arch::trap_depth() <= 1);
-    KASSERT(current_ && cpu_->current_execution_ == &current_.execution());
-    publish(current_);
+    libk_assert(arch::trap_depth() <= 1);
+    libk_assert(cpu_->current_);
+    publish(cpu_->current_);
 }
 
-auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
-    KASSERT(!arch::interrupts_enabled());
-    if (binding.home_cpu() != id_ || binding.queued()) {
+auto Dispatcher::make_ready(Sc& sc) noexcept -> bool {
+    libk_assert(!arch::interrupts_enabled());
+    if (sc.home_cpu() != id_ || sc.queued()) {
         return false;
     }
-    execution::Target target = binding.target();
-    Execution& execution = target.execution();
-    SchedulingContext& context = binding.context();
-    if (execution.scheduler_binding_ != &binding
-        || context.binding() != &binding
+    Thread* target = &sc.thread();
+    Thread& exec = *target;
+    Sc& context = sc;
+    if (exec.sc_ != &sc
         || !context.admitted()) {
         return false;
     }
-    if (execution.state_ != ExecutionState::Prepared
-        && execution.state_ != ExecutionState::Blocked
-        && execution.state_ != ExecutionState::Parked
-        && execution.state_ != ExecutionState::Throttled) {
+    if (exec.state_ != Thread::State::Prepared
+        && exec.state_ != Thread::State::Blocked
+        && exec.state_ != Thread::State::Throttled) {
         return false;
     }
-    if (!target.claim_home(*this)) {
+    if (!target->claim_home(*this)) {
         return false;
     }
     const time::Instant now = clock_->now();
-    if (binding.timer_queued()) {
-        if (execution.state_ != ExecutionState::Throttled) {
+    if (sc.timer_queued()) {
+        if (exec.state_ != Thread::State::Throttled) {
             return false;
         }
         if (!context.eligible(now)) {
             return true;
         }
-        timers_.remove(binding);
+        timers_.remove(sc);
     }
-    enqueue_or_throttle(binding, now);
-    binding.publish_projection();
-    if (execution.state_ == ExecutionState::Throttled) {
+    enqueue_or_throttle(sc, now);
+
+    if (exec.state_ == Thread::State::Throttled) {
         program_deadline(now);
         return true;
     }
@@ -188,289 +180,94 @@ auto CpuDispatcher::make_ready(Binding& binding) noexcept -> bool {
     return true;
 }
 
-auto CpuDispatcher::accept_wake(
-    Binding& binding,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey delivery) noexcept
+auto Dispatcher::accept_wake(
+    Sc& sc) noexcept
     -> WakeAcceptance {
-    KASSERT(!arch::interrupts_enabled());
-    if (binding.home_cpu() != id_) {
+    libk_assert(!arch::interrupts_enabled());
+    if (sc.home_cpu() != id_) {
         return WakeAcceptance::Rejected;
     }
-    Execution& execution = binding.execution();
-    if (execution.state_ == ExecutionState::Blocked) {
-        if (!make_ready(binding)) {
+    Thread& exec = sc.thread();
+    if (exec.state_ == Thread::State::Blocked) {
+        if (!make_ready(sc)) {
             return WakeAcceptance::Rejected;
         }
-        binding.publish_accept(cause, delivery);
-        binding.publish_projection();
-        return execution.state_ == ExecutionState::Ready
+
+        return exec.state_ == Thread::State::Ready
             ? WakeAcceptance::Readied
             : WakeAcceptance::Accepted;
     }
-    if (execution.state_ == ExecutionState::Running
-        || execution.state_ == ExecutionState::Ready
-        || execution.state_ == ExecutionState::Prepared) {
-        binding.wake_credit_ = true;
-        binding.publish_accept(cause, delivery);
-        binding.publish_projection();
+    if (exec.state_ == Thread::State::Running
+        || exec.state_ == Thread::State::Ready
+        || exec.state_ == Thread::State::Prepared) {
+        sc.wake_credit_ = true;
+
         return WakeAcceptance::Accepted;
     }
-    if (execution.state_ == ExecutionState::Throttled) {
+    if (exec.state_ == Thread::State::Throttled) {
         // A wake accepted while the continuation is budget-throttled must
         // survive the refill and the resumed stack until block_current().
         // The Blocked arm above deliberately does not set this bit: its
         // make_ready() transition already consumes that wake.
-        binding.wake_credit_ = true;
-        binding.publish_accept(cause, delivery);
-        binding.publish_projection();
+        sc.wake_credit_ = true;
+
         return WakeAcceptance::Accepted;
     }
     return WakeAcceptance::Rejected;
 }
 
-auto Binding::wake_credit() const noexcept -> bool {
-    return wake_credit_;
+auto Dispatcher::post_wake(
+    Sc& sc) noexcept -> WakeResult {
+    if (sc.home_cpu() != id_) {
+        return std::unexpected(WakeError::WrongCpu);
+    }
+    return post_remote(sc.wake_);
 }
 
-auto CpuDispatcher::post_wake(
-    Binding& binding,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
-    if (binding.home_cpu() != id_) {
-        return libk::unexpected(WakeError::WrongCpu);
+auto Dispatcher::post_start(Sc& sc) noexcept -> WakeResult {
+    if (sc.home_cpu() != id_) {
+        return std::unexpected(WakeError::WrongCpu);
     }
-    return post_remote(binding.wake_, cause, delivery);
+    return post_remote(sc.start_);
 }
 
-auto CpuDispatcher::post_wake_if_available(
-    Binding& binding,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
-    if (binding.home_cpu() != id_) {
-        return libk::unexpected(WakeError::WrongCpu);
-    }
-    return try_post_remote(binding.wake_, cause, delivery);
-}
-
-auto CpuDispatcher::post_start(Binding& binding) noexcept -> WakeResult {
-    if (binding.home_cpu() != id_) {
-        return libk::unexpected(WakeError::WrongCpu);
-    }
-    return post_remote(binding.start_);
-}
-
-auto CpuDispatcher::accept_activation(Vproc& vproc) noexcept -> bool {
-    KASSERT(!arch::interrupts_enabled());
-    Binding* binding{};
-    bool wake_parked{};
-    {
-        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
-        binding = vproc.execution_.scheduler_binding_;
-        if (binding == nullptr || binding->home_cpu() != id_
-            || vproc.stop_requested_ || vproc.stopped_
-            || vproc.upcall_state_ == Vproc::UpcallState::Unarmed) {
-            return false;
-        }
-        if (vproc.upcall_state_ == Vproc::UpcallState::Active) {
-            return true;
-        }
-        switch (vproc.execution_.state_) {
-        case ExecutionState::Running:
-            KASSERT(current_.vproc() == &vproc);
-            binding->activation_credit_ = false;
-            binding->publish_projection();
-            return true;
-        case ExecutionState::Ready:
-            binding->activation_credit_ = true;
-            binding->publish_projection();
-            request_reschedule(DispatchReason::Activation);
-            return true;
-        case ExecutionState::Parked:
-            binding->activation_credit_ = true;
-            binding->publish_projection();
-            wake_parked = true;
-            break;
-        case ExecutionState::Prepared:
-        case ExecutionState::Blocked:
-        case ExecutionState::Throttled:
-            binding->activation_credit_ = true;
-            binding->publish_projection();
-            return true;
-        case ExecutionState::Exited:
-            return false;
-        }
-    }
-    return wake_parked && make_ready(*binding);
-}
-
-auto CpuDispatcher::post_activation(Vproc& vproc) noexcept -> WakeResult {
-    return post_remote(vproc.activation_);
-}
-
-auto CpuDispatcher::request_activation(
-    CpuRegistry& cpus,
-    Vproc& vproc) noexcept -> WakeResult {
-    CpuId home{};
-    {
-        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
-        Binding* const binding = vproc.execution_.scheduler_binding_;
-        if (vproc.upcall_state_ != Vproc::UpcallState::Armed) {
-            return libk::expected();
-        }
-        if (binding == nullptr || vproc.stop_requested_ || vproc.stopped_) {
-            return libk::unexpected(WakeError::Unavailable);
-        }
-        KASSERT(vproc.activation_publishers_
-            != libk::numeric_limits<usize>::max());
-        ++vproc.activation_publishers_;
-        home = binding->home_cpu();
-    }
-    CpuRuntime* const target = cpus.runtime(home);
-    if (target == nullptr
-        || target->local.descriptor->state() != CpuState::Online) {
-        vproc.activation_publisher_done();
-        return libk::unexpected(WakeError::Unavailable);
-    }
-    if (arch::current_cpu_owner() == &target->local) {
-        kernel::sync::IrqToken irq{};
-        const bool accepted = target->dispatcher().accept_activation(vproc);
-        vproc.activation_publisher_done();
-        return accepted
-            ? WakeResult{libk::expected()}
-            : WakeResult{libk::unexpected(WakeError::Unavailable)};
-    }
-    {
-        kernel::sync::IrqLockGuard guard{vproc.state_lock_};
-        KASSERT(vproc.activation_publishers_ != 0);
-        --vproc.activation_publishers_;
-        if (vproc.activation_post_ != Vproc::ActivationPost::Idle) {
-            // A publication concurrent with an already consumed request must
-            // receive another home-CPU admission pass. Publications that race
-            // an unconsumed request may be folded into that pass, but treating
-            // all coalescing as dirty keeps the ordering proof local.
-            vproc.activation_dirty_ = true;
-            return libk::expected();
-        }
-        KASSERT(!vproc.activation_dirty_);
-        vproc.activation_post_ = Vproc::ActivationPost::Posting;
-    }
-    for (;;) {
-        auto posted = target->dispatcher().post_activation(vproc);
-        const bool repost = vproc.activation_request_posted(
-            static_cast<bool>(posted));
-        if (!posted || !repost) {
-            return posted;
-        }
-    }
-}
-
-auto CpuDispatcher::post_remote(
-    RemoteRequest& request,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
+auto Dispatcher::post_remote(
+    RemoteRequest& request) noexcept -> WakeResult {
     if (!ipi_available_) {
-        return libk::unexpected(WakeError::Unavailable);
+        return std::unexpected(WakeError::Unavailable);
     }
-    const RemotePostResult posted = remote_.post(request, cause);
-    if (delivery != nullptr) {
-        *delivery = posted.delivery;
-    }
+    static_cast<void>(remote_.post(request));
     return kick_remote();
 }
 
-auto CpuDispatcher::try_post_remote(
-    RemoteRequest& request,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept -> WakeResult {
+auto Dispatcher::kick_remote() noexcept -> WakeResult {
     if (!ipi_available_) {
-        return libk::unexpected(WakeError::Unavailable);
+        return std::unexpected(WakeError::Unavailable);
     }
-    const auto posted = remote_.try_post(request, cause);
-    if (!posted) {
-        // No request was admitted, so the canonical pending bit and
-        // intrusive hook remain untouched.  A later ordinary scheduler event
-        // may retry without having to repair a half-posted request.
-        return libk::unexpected(WakeError::Busy);
-    }
-    if (delivery != nullptr) {
-        *delivery = posted->post.delivery;
-    }
-    if (!posted->transport) {
-        // An existing transport already owns the edge, or the consumer
-        // drained the queue between admission and this observation.
-        return libk::expected();
-    }
-    KASSERT(cpu_->descriptor != nullptr);
-    // This path is used by IRQ-off diagnostic producers.  Flight recording
-    // is deliberately left to the ordinary scheduler wake path: the
-    // recorder has a bounded storage target but its reservation loop is not a
-    // fixed-step producer operation.
-    if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
-        return libk::expected();
-    }
-    const bool retry = remote_.try_transport_failed(*posted->transport);
-    if (retry) {
-        // Admission succeeded and the request remains pending.  Surface the
-        // retained-but-not-kicked state instead of collapsing it into the
-        // admission-level Unavailable error.
-        return libk::unexpected(WakeError::Retained);
-    }
-    // A consumer or a newer transport advanced the delivery generation while
-    // this send was in flight.  No retry is owed by this token, so the wake
-    // edge is already consumed or owned by the newer transport.
-    return libk::expected();
-}
-
-auto CpuDispatcher::kick_remote() noexcept -> WakeResult {
-    if (!ipi_available_) {
-        return libk::unexpected(WakeError::Unavailable);
-    }
-    KASSERT(cpu_->descriptor != nullptr);
+    libk_assert(cpu_->descriptor != nullptr);
     for (usize attempt = 0; attempt < 8; ++attempt) {
         const auto transport = remote_.claim_transport();
         if (!transport) {
-            return libk::expected();
+            return {};
         }
         if (arch::send_ipi(cpu_->descriptor->hardware_id())) {
-            diag::concurrency::record(
-                diag::concurrency::FlightDomain::Remote,
-                diag::concurrency::FlightEvent::RemoteIpiSent,
-                id_.raw,
-                cpu_->descriptor->hardware_id().raw);
-            return libk::expected();
+            trace::emit(trace::Event::Ipi, id_.raw, cpu_->descriptor->hardware_id().raw);
+            return {};
         }
-        diag::concurrency::record(
-            diag::concurrency::FlightDomain::Remote,
-            diag::concurrency::FlightEvent::RemoteTransportFailure,
-            id_.raw,
-            cpu_->descriptor->hardware_id().raw,
-            attempt);
+        trace::emit(trace::Event::KickFail, id_.raw, cpu_->descriptor->hardware_id().raw, attempt);
         remote_.transport_failed(*transport);
     }
-    KPANIC((diag::FatalEvent{
-        .facility = diag::Facility::Scheduler,
-        .id = diag::EventId{0x40000001},
-        .arguments = {id_.raw},
-        .argument_count = 1,
-    }));
+    panic("IPI delivery failed");
 }
 
-void CpuDispatcher::request_stop(Thread& thread) noexcept {
-    request_stop(execution::Target{thread});
-}
-
-void CpuDispatcher::request_stop(Vproc& vproc) noexcept {
-    request_stop(execution::Target{vproc});
-}
-
-void CpuDispatcher::request_stop(execution::Target target) noexcept {
+void Dispatcher::request_stop(Thread& entity) noexcept {
+    auto* target = &entity;
     if (arch::current_cpu_owner() == cpu_) {
-        kernel::sync::IrqToken irq{};
+        sync::Irq irq{};
         // A target may finish its ordinary exit after the stop owner publishes
         // the terminal transaction but before this owner-CPU call is entered.
         // The queued Stop has already been completed by finish_stop() then.
-        if (target.stopped()) {
+        if (target->stopped()) {
             return;
         }
         if (stop(target) == StopDisposition::Finalize) {
@@ -480,105 +277,54 @@ void CpuDispatcher::request_stop(execution::Target target) noexcept {
     }
 
     if (!ipi_available_) {
-        KPANIC((diag::FatalEvent{
-            .facility = diag::Facility::Scheduler,
-            .id = diag::EventId{0x40000002},
-            .arguments = {id_.raw},
-            .argument_count = 1,
-        }));
+        panic("remote stop requires IPI");
     }
 
     bool queued{};
-    bool owned{};
-    if (Vproc* const vproc = target.vproc()) {
-        kernel::sync::IrqLockGuard guard{vproc->state_lock_};
-        Binding* const binding = vproc->execution_.scheduler_binding_;
-        owned = vproc->execution_.home_ == this;
-        if (binding != nullptr) {
-            KASSERT(owned && binding->target() == target);
-            static_cast<void>(remote_.post(binding->stop_));
+    {
+        sync::Lock guard{entity.lock_};
+        Sc* const sc = entity.sc_;
+        const bool owned = entity.home_ == this;
+        if (sc != nullptr) {
+            libk_assert(owned && &sc->thread() == &entity);
+            static_cast<void>(remote_.post(sc->stop_));
             queued = true;
-        } else if (vproc->stopped_) {
-            KASSERT(vproc->execution_.home_ == nullptr
-                && vproc->execution_.state_ == ExecutionState::Exited);
+        } else if (entity.stopped_) {
+            libk_assert(entity.home_ == nullptr && entity.state_ == Thread::State::Exited);
         } else {
-            KASSERT(owned && vproc->execution_.state_ == ExecutionState::Exited
-                && vproc->stop_requested_ && vproc->stop_dispatched_);
-        }
-    } else {
-        Thread* const thread = target.thread();
-        KASSERT(thread != nullptr);
-        kernel::sync::IrqLockGuard guard{thread->stop_lock_};
-        Binding* const binding = thread->execution_.scheduler_binding_;
-        owned = thread->execution_.home_ == this;
-        if (binding != nullptr) {
-            KASSERT(owned && binding->target() == target);
-            static_cast<void>(remote_.post(binding->stop_));
-            queued = true;
-        } else if (thread->stopped_) {
-            KASSERT(thread->execution_.home_ == nullptr
-                && thread->execution_.state_ == ExecutionState::Exited);
-        } else {
-            KASSERT(owned && thread->execution_.state_ == ExecutionState::Exited
-                && thread->stop_requested_);
+            libk_assert(owned && entity.state_ == Thread::State::Exited && entity.stopping_);
         }
     }
     if (queued && !kick_remote()) {
-        KPANIC((diag::FatalEvent{
-            .facility = diag::Facility::Scheduler,
-            .id = diag::EventId{0x40000003},
-            .arguments = {id_.raw},
-            .argument_count = 1,
-        }));
+        panic("remote stop delivery failed");
     }
 }
 
-void CpuDispatcher::drain_remote() noexcept {
-    KASSERT(!arch::interrupts_enabled());
+void Dispatcher::drain_remote() noexcept {
+    libk_assert(!arch::interrupts_enabled());
     bool made_ready{};
     while (RemoteRequest* request = remote_.take()) {
         switch (request->kind()) {
         case RemoteKind::Start: {
-            auto& binding = *static_cast<Binding*>(request->owner());
-            const bool accepted = make_ready(binding);
-            remote_.accepted(*request, accepted);
+            auto& sc = *static_cast<Sc*>(request->owner());
+            const bool accepted = make_ready(sc);
+
             made_ready = accepted || made_ready;
             break;
         }
         case RemoteKind::Wake: {
-            auto& binding = *static_cast<Binding*>(request->owner());
-            // Capture the delivery identity before acceptance while the
-            // request is still pending. A single cause is copied from the
-            // delivery observation for the Binding's diagnostic witness;
-            // neither value participates in wake admission or coalescing.
-            const auto delivery = request->delivery();
-            const auto diagnostic_cause =
-                request->diagnostic_cause(delivery);
-            const WakeAcceptance acceptance =
-                accept_wake(
-                    binding, diagnostic_cause, delivery);
-            remote_.accepted(
-                *request, acceptance != WakeAcceptance::Rejected);
+            auto& sc = *static_cast<Sc*>(request->owner());
+            const WakeAcceptance acceptance = accept_wake(sc);
             made_ready = acceptance == WakeAcceptance::Readied || made_ready;
             break;
         }
-        case RemoteKind::Activation: {
-            auto& vproc = *static_cast<Vproc*>(request->owner());
-            remote_.accepted(*request, true);
-            remote_.complete(*request);
-            do {
-                static_cast<void>(accept_activation(vproc));
-            } while (vproc.activation_request_consumed());
-            continue;
-        }
         case RemoteKind::Stop: {
-            const execution::Target target =
-                static_cast<Binding*>(request->owner())->target();
+            Thread* target =
+                &static_cast<Sc*>(request->owner())->thread();
             const StopDisposition disposition = stop(target);
-            remote_.accepted(*request, true);
-            // stop() may make the Binding terminal, but the consumed request
-            // still owns its embedded storage until complete().  Release the
-            // queue protocol before final relation teardown destroys Binding.
+
+            // The request remains consumer-owned through stop(). Complete it
+            // before unbind permits target reuse or SC retirement.
             remote_.complete(*request);
             if (disposition == StopDisposition::Finalize) {
                 finish_exit(target, DispatchReason::Stop);
@@ -593,101 +339,90 @@ void CpuDispatcher::drain_remote() noexcept {
     }
 }
 
-void CpuDispatcher::enqueue_or_throttle(
-    Binding& binding,
+void Dispatcher::enqueue_or_throttle(
+    Sc& sc,
     time::Instant now) noexcept {
-    Execution& execution = binding.execution();
-    SchedulingContext& context = binding.context();
-    KASSERT(!binding.queued() && !binding.timer_queued());
+    Thread& exec = sc.thread();
+    Sc& context = sc;
+    libk_assert(!sc.queued() && !sc.timer_queued());
     if (context.eligible(now)) {
-        execution.set_state(ExecutionState::Ready);
-        policy_.enqueue(binding, context.urgency());
+        exec.set_state(Thread::State::Ready);
+        ready_.enqueue(sc, context.urgency());
         return;
     }
     const auto deadline = context.next_refill();
-    KASSERT(deadline && *deadline > now);
-    execution.set_state(ExecutionState::Throttled);
-    timers_.insert(binding, *deadline);
+    libk_assert(deadline && *deadline > now);
+    exec.set_state(Thread::State::Throttled);
+    timers_.insert(sc, *deadline);
 }
 
-void CpuDispatcher::process_timers(time::Instant now) noexcept {
+void Dispatcher::process_timers(time::Instant now) noexcept {
     for (;;) {
         const auto deadline = timers_.deadline();
         if (!deadline || *deadline > now) {
             return;
         }
-        Binding* const binding = timers_.front();
-        KASSERT(binding != nullptr);
-        timers_.remove(*binding);
-        KASSERT(binding->execution().state_
-            == ExecutionState::Throttled);
-        enqueue_or_throttle(*binding, now);
-        binding->publish_projection();
+        Sc* const sc = timers_.front();
+        libk_assert(sc != nullptr);
+        timers_.remove(*sc);
+        libk_assert(sc->thread().state_
+            == Thread::State::Throttled);
+        enqueue_or_throttle(*sc, now);
+
     }
 }
 
-void CpuDispatcher::process_deadlines(time::Instant now) noexcept {
+void Dispatcher::process_deadlines(time::Instant now) noexcept {
     for (;;) {
         const auto when = deadlines_.deadline();
         if (!when || *when > now) {
             return;
         }
         Deadline* const deadline = deadlines_.front();
-        KASSERT(deadline != nullptr && deadline->owner_ == this);
+        libk_assert(deadline != nullptr && deadline->owner_ == this);
         deadlines_.remove(*deadline);
         deadline->owner_ = nullptr;
         const Deadline::Callback callback = deadline->callback_;
-        KASSERT(callback);
+        libk_assert(callback);
         callback();
     }
 }
 
-void CpuDispatcher::charge_to(time::Instant now) noexcept {
+void Dispatcher::charge_to(time::Instant now) noexcept {
     const auto elapsed = now.elapsed_since(accounted_at_);
-    KASSERT(elapsed);
-    if (current_binding_ != nullptr && !elapsed->empty()) {
-        current_binding_->context().charge(now, *elapsed);
-    }
-    if (!elapsed->empty()) {
-        const auto total = libk::checked_add(
-            pending_charge_.ticks(), elapsed->ticks());
-        KASSERT(total);
-        pending_charge_ = time::Duration::from_ticks(*total);
+    libk_assert(elapsed);
+    if (current_sc_ != nullptr && !elapsed->empty()) {
+        current_sc_->charge(now, *elapsed);
     }
     accounted_at_ = now;
 }
 
-void CpuDispatcher::yield() noexcept {
-    KASSERT(!arch::interrupts_enabled());
+void Dispatcher::yield() noexcept {
+    libk_assert(!arch::interrupts_enabled());
     dispatch(DispatchReason::Yield, clock_->now());
 }
 
-void CpuDispatcher::block_current() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ && !current_.idle());
-    KASSERT(current_binding_ != nullptr);
-    if (current_binding_->wake_credit_) {
-        current_binding_->wake_credit_ = false;
-        current_binding_->publish_projection();
+void Dispatcher::block_current() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(cpu_->current_ && !cpu_->current_->idle());
+    libk_assert(current_sc_ != nullptr);
+    if (current_sc_->wake_credit_) {
+        current_sc_->wake_credit_ = false;
+
         return;
     }
     dispatch(DispatchReason::Block, clock_->now());
 }
 
-void CpuDispatcher::park_current() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    dispatch(DispatchReason::Park, clock_->now());
-}
-
-[[noreturn]] void CpuDispatcher::exit_current() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(current_ && !current_.idle());
+[[noreturn]] void Dispatcher::exit_current() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(cpu_->current_ && !cpu_->current_->idle());
     dispatch(DispatchReason::Exit, clock_->now());
-    KASSERT(false);
+    libk_assert(false);
     __builtin_unreachable();
 }
 
-void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
+void Dispatcher::request_reschedule(DispatchReason reason) noexcept {
     if (!pending_ || reason == DispatchReason::Timer
         || reason == DispatchReason::Exit
         || reason == DispatchReason::Stop) {
@@ -698,7 +433,7 @@ void CpuDispatcher::request_reschedule(DispatchReason reason) noexcept {
     }
 }
 
-void CpuDispatcher::request_reschedule(
+void Dispatcher::request_reschedule(
     DispatchReason reason,
     myos_status_t exit_status) noexcept {
     if (!pending_ || reason == DispatchReason::Timer
@@ -711,23 +446,25 @@ void CpuDispatcher::request_reschedule(
     }
 }
 
-void CpuDispatcher::on_timer() noexcept {
-    KASSERT(!arch::interrupts_enabled());
+void Dispatcher::on_timer() noexcept {
+    libk_assert(!arch::interrupts_enabled());
     const time::Instant now = clock_->now();
-    diag::concurrency::timer(id_, now.ticks());
+
     charge_to(now);
     arch::mask_timer();
     process_deadlines(now);
     request_reschedule(DispatchReason::Timer);
 }
 
-void CpuDispatcher::on_trap_exit() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::trap_depth() == 0);
-    if (current_.stop_ready()) {
+void Dispatcher::on_trap_exit() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::trap_depth() == 0);
+    if (cpu_->current_->stop_ready()) {
         request_reschedule(DispatchReason::Stop);
     }
-    if (!pending_ || preempt_depth_ != 0) {
+    if (!pending_ || preempt_depth_ != 0
+        || ((*pending_ == DispatchReason::Stop || *pending_ == DispatchReason::Exit)
+            && cpu_->current_->in_kernel_)) {
         return;
     }
     const DispatchReason reason = *pending_;
@@ -737,107 +474,67 @@ void CpuDispatcher::on_trap_exit() noexcept {
         block_current();
         return;
     }
-    if (reason == DispatchReason::Park) {
-        park_current();
-        return;
-    }
     dispatch(reason, clock_->now(), exit_status);
 }
 
-void CpuDispatcher::disable_preemption() noexcept {
-    KASSERT(!arch::interrupts_enabled());
+void Dispatcher::disable_preemption() noexcept {
+    libk_assert(!arch::interrupts_enabled());
     ++preempt_depth_;
-    KASSERT(preempt_depth_ != 0);
+    libk_assert(preempt_depth_ != 0);
 }
 
-void CpuDispatcher::enable_preemption() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(preempt_depth_ != 0);
+void Dispatcher::enable_preemption() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(preempt_depth_ != 0);
     --preempt_depth_;
     if (preempt_depth_ == 0 && pending_ && arch::trap_depth() == 0) {
         on_trap_exit();
     }
 }
 
-void CpuDispatcher::dispatch(
+void Dispatcher::dispatch(
     DispatchReason reason,
     time::Instant now,
     myos_status_t exit_status) noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::trap_depth() == 0);
-    KASSERT(current_);
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::trap_depth() == 0);
+    libk_assert(cpu_->current_);
     charge_to(now);
     process_timers(now);
 
-    const execution::Target outgoing = current_;
-    Binding* const outgoing_binding = current_binding_;
-    bool parked{};
-    if (reason == DispatchReason::Park) {
-        Vproc* const vproc = outgoing.vproc();
-        KASSERT(vproc != nullptr && outgoing_binding != nullptr);
-        kernel::sync::IrqLockGuard guard{vproc->state_lock_};
-        if (!vproc->park_requested_
-            || vproc->park_sequence_ != vproc->pending_sequence_
-            || vproc->ready_mask_ != 0 || vproc->ingress_mask_ != 0
-            || vproc->notification_mask_ != 0
-            || vproc->stop_requested_
-            || vproc->execution_.state_ != ExecutionState::Running) {
-            vproc->park_requested_ = false;
-            return;
-        }
-        SchedulingContext& context = outgoing_binding->context();
+    Thread* outgoing = cpu_->current_;
+    Sc* const outgoing_sc = current_sc_;
+    if (outgoing_sc != nullptr) {
+        Sc& context = *outgoing_sc;
         context.deactivate(id_);
-        current_binding_ = nullptr;
-        vproc->park_requested_ = false;
-        vproc->execution_.set_state(ExecutionState::Parked);
-        parked = true;
-    } else if (outgoing_binding != nullptr) {
-        SchedulingContext& context = outgoing_binding->context();
-        context.deactivate(id_);
-        current_binding_ = nullptr;
-
+        current_sc_ = nullptr;
         switch (reason) {
         case DispatchReason::Exit:
         case DispatchReason::Stop:
-            outgoing.execution().set_state(ExecutionState::Exited);
-            /*luna change: settle service claims at the Thread terminal,
-              reason: a dying worker must release its Pager claims so
-              redelivery and graceful close can proceed*/
-            if (Thread* const thread = outgoing.thread();
-                thread != nullptr) {
-                thread->release_pager_claims();
-            } else if (Vproc* const vproc = outgoing.vproc();
-                       vproc != nullptr) {
-                vproc->release_pager_claims();
-            }
+            outgoing->set_state(Thread::State::Exited);
             break;
         case DispatchReason::Block:
-            outgoing.execution().set_state(ExecutionState::Blocked);
-            break;
-        case DispatchReason::Park:
-            KASSERT(false);
+            outgoing->set_state(Thread::State::Blocked);
             break;
         case DispatchReason::Start:
         case DispatchReason::Yield:
         case DispatchReason::Timer:
         case DispatchReason::RemoteWake:
-        case DispatchReason::Activation:
             if (context.eligible(now)) {
-                outgoing.execution().set_state(ExecutionState::Ready);
-                policy_.enqueue(*outgoing_binding, context.urgency());
-                outgoing_binding->publish_projection();
+                outgoing->set_state(Thread::State::Ready);
+                ready_.enqueue(*outgoing_sc, context.urgency());
+
             } else {
-                enqueue_or_throttle(*outgoing_binding, now);
-                outgoing_binding->publish_projection();
+                enqueue_or_throttle(*outgoing_sc, now);
+
             }
             break;
         }
     }
-    KASSERT(reason != DispatchReason::Park || parked);
 
-    Binding* const candidate = policy_.select().binding;
-    if (candidate == nullptr && outgoing.idle()) {
-        outgoing.execution().set_state(ExecutionState::Running);
+    Sc* const candidate = ready_.select();
+    if (candidate == nullptr && outgoing->idle()) {
+        outgoing->set_state(Thread::State::Running);
         program_deadline(now);
         record_dispatch(outgoing, outgoing, reason, now);
         return;
@@ -845,47 +542,46 @@ void CpuDispatcher::dispatch(
     commit(candidate, reason, now, exit_status);
 
     if (reason == DispatchReason::Exit || reason == DispatchReason::Stop) {
-        KASSERT(false);
+        libk_assert(false);
         __builtin_unreachable();
     }
 }
 
-void CpuDispatcher::commit(
-    Binding* candidate,
+void Dispatcher::commit(
+    Sc* candidate,
     DispatchReason reason,
     time::Instant now,
     myos_status_t exit_status) noexcept {
-    const execution::Target outgoing = current_;
-    execution::Target incoming{*idle_};
-    Binding* incoming_binding{};
+    Thread* outgoing = cpu_->current_;
+    Thread* incoming = idle_;
+    Sc* incoming_sc{};
 
     if (candidate != nullptr) {
-        SchedulingContext& context = candidate->context();
-        execution::Target target = candidate->target();
-        Execution& execution = target.execution();
-        KASSERT(candidate->home_cpu() == id_);
-        KASSERT(candidate->queued());
-        KASSERT(execution.state_ == ExecutionState::Ready);
-        KASSERT(execution.scheduler_binding_ == candidate);
-        KASSERT(context.binding() == candidate);
-        KASSERT(context.domain_ != nullptr);
-        KASSERT(context.domain_->allows(id_));
-        KASSERT(context.eligible(now));
+        Sc& context = *candidate;
+        Thread* target = &candidate->thread();
+        Thread& exec = *target;
+        libk_assert(candidate->home_cpu() == id_);
+        libk_assert(candidate->queued());
+        libk_assert(exec.state_ == Thread::State::Ready);
+        libk_assert(exec.sc_ == candidate);
+        libk_assert(context.bound());
+        libk_assert(context.domain_ != nullptr);
+        libk_assert(context.domain_->allows(id_));
+        libk_assert(context.eligible(now));
 
-        candidate->activation_credit_ = false;
-        policy_.remove(*candidate, context.urgency());
-        candidate->publish_projection();
-        KASSERT(context.activate(id_));
-        execution.set_state(ExecutionState::Running);
+        ready_.remove(*candidate, context.urgency());
+
+        libk_assert(context.activate(id_));
+        exec.set_state(Thread::State::Running);
         incoming = target;
-        incoming_binding = candidate;
+        incoming_sc = candidate;
     } else {
-        KASSERT(idle_->execution_.state_ == ExecutionState::Prepared
-            || idle_->execution_.state_ == ExecutionState::Running);
-        idle_->execution_.set_state(ExecutionState::Running);
+        libk_assert(idle_->state_ == Thread::State::Prepared
+            || idle_->state_ == Thread::State::Running);
+        idle_->set_state(Thread::State::Running);
     }
 
-    current_binding_ = incoming_binding;
+    current_sc_ = incoming_sc;
     publish(incoming);
     program_deadline(now);
     record_dispatch(outgoing, incoming, reason, now);
@@ -893,26 +589,21 @@ void CpuDispatcher::commit(
     if (incoming == outgoing) {
         return;
     }
-    if (outgoing.idle()) {
-        outgoing.execution().set_state(ExecutionState::Prepared);
+    if (outgoing->idle()) {
+        outgoing->set_state(Thread::State::Prepared);
     }
 
-    KASSERT(!handoff_outgoing_);
+    libk_assert(!handoff_outgoing_);
     handoff_outgoing_ = outgoing;
     handoff_reason_ = reason;
     handoff_exit_status_ = exit_status;
-    if (kernel::sync::enabled(kernel::sync::Level::Verify)) {
-        kernel::sync::assert_no_locks();
-    }
+    sync::assert_unlocked();
     arch::switch_context(
-        outgoing.execution().context(), incoming.execution().context());
+        outgoing->ctx(), incoming->ctx());
     post_switch();
 }
 
-void CpuDispatcher::program_deadline(time::Instant now) noexcept {
-    if (diag::concurrency::enabled(diag::concurrency::Level::Watch)) {
-        arm_watchdog(now);
-    }
+void Dispatcher::program_deadline(time::Instant now) noexcept {
     if (!timer_available_) {
         programmed_deadline_ = time::Instant::max();
         arch::mask_timer();
@@ -920,16 +611,16 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
     }
 
     time::Instant deadline = time::Instant::max();
-    if (current_binding_ != nullptr) {
+    if (current_sc_ != nullptr) {
         const time::Duration budget =
-            current_binding_->context().available(now);
+            current_sc_->available(now);
         const time::Duration slice = budget < quantum_ ? budget : quantum_;
         if (slice.empty()) {
             request_reschedule(DispatchReason::Timer);
             deadline = now;
         } else {
             const auto computed = now.checked_add(slice);
-            KASSERT(computed);
+            libk_assert(computed);
             deadline = *computed;
         }
     }
@@ -951,289 +642,185 @@ void CpuDispatcher::program_deadline(time::Instant now) noexcept {
     }
 }
 
-void CpuDispatcher::arm_watchdog(time::Instant now) noexcept {
-    if (!timer_available_) {
-        diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
-        return;
-    }
-    if (watchdog_deadline_.armed()) {
-        return;
-    }
-    if (watchdog_period_.empty()) {
-        diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
-        return;
-    }
-    const auto when = now.checked_add(watchdog_period_);
-    if (!when) {
-        diag::concurrency::mark_degraded(
-            diag::concurrency::DiagnosticFlag::WatchdogUnavailable);
-        return;
-    }
-    deadlines_.insert(watchdog_deadline_, *when);
-    watchdog_deadline_.owner_ = this;
-}
-
-void CpuDispatcher::watchdog_fire() noexcept {
-    const time::Instant now = clock_->now();
-    diag::concurrency::watchdog_tick(id_, now.ticks());
-    arm_watchdog(now);
-}
-
-void CpuDispatcher::record_dispatch(
-    execution::Target outgoing,
-    execution::Target incoming,
+void Dispatcher::record_dispatch(
+    Thread* outgoing,
+    Thread* incoming,
     DispatchReason reason,
     time::Instant now) noexcept {
-    const u64 context = reinterpret_cast<usize>(current_binding_ == nullptr
-        ? nullptr
-        : &current_binding_->context());
-    const u64 actor = current_binding_ == nullptr
-        ? incoming.identity()
-        : current_binding_->actor_key().raw;
-    diag::concurrency::dispatch(
-        id_, actor, context, now.ticks());
-    const auto event = [&]() noexcept {
-        switch (reason) {
-        case DispatchReason::Start:
-            return diag::concurrency::FlightEvent::Start;
-        case DispatchReason::Yield:
-            return diag::concurrency::FlightEvent::Yield;
-        case DispatchReason::Timer:
-            return diag::concurrency::FlightEvent::Timer;
-        case DispatchReason::Block:
-            return diag::concurrency::FlightEvent::Block;
-        case DispatchReason::Park:
-            return diag::concurrency::FlightEvent::Park;
-        case DispatchReason::Exit:
-            return diag::concurrency::FlightEvent::Exit;
-        case DispatchReason::Stop:
-            return diag::concurrency::FlightEvent::StopRequested;
-        case DispatchReason::RemoteWake:
-            return diag::concurrency::FlightEvent::WakeAccepted;
-        case DispatchReason::Activation:
-            return diag::concurrency::FlightEvent::Activation;
-        }
-        return diag::concurrency::FlightEvent::ObservationDegraded;
-    }();
-    diag::concurrency::record(
-        diag::concurrency::FlightDomain::Scheduler,
-        event,
-        outgoing.identity(),
-        incoming.identity(),
-        context,
-        pending_charge_.ticks(),
-        programmed_deadline_.ticks());
-    pending_charge_ = {};
+    trace::emit(trace::Event::Dispatch, outgoing->identity(), incoming->identity(),
+                static_cast<u64>(reason), reinterpret_cast<u64>(current_sc_));
+    static_cast<void>(now);
 }
 
-void CpuDispatcher::post_switch() noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(cpu_->current_execution_ == &current_.execution());
-    KASSERT(current_);
-    const execution::Target outgoing = handoff_outgoing_;
+void Dispatcher::post_switch() noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(cpu_->current_);
+    Thread* outgoing = handoff_outgoing_;
     const DispatchReason reason = handoff_reason_;
     const myos_status_t exit_status = handoff_exit_status_;
     handoff_outgoing_ = {};
     handoff_exit_status_ = MYOS_STATUS_OK;
     if (outgoing
-        && outgoing.execution().state_ == ExecutionState::Exited) {
+        && outgoing->state_ == Thread::State::Exited) {
         finish_exit(outgoing, reason, exit_status);
     }
 }
 
-auto CpuDispatcher::stop(execution::Target target) noexcept
+auto Dispatcher::stop(Thread* target) noexcept
     -> StopDisposition {
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(target.owned_by(*this));
-    Execution& execution = target.execution();
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(target->owned_by(*this));
+    Thread& exec = *target;
 
-    if (operation::Wait* const wait = target.wait();
-        wait != nullptr && wait->attached()) {
-        if (!wait->cancel()) {
-            return StopDisposition::Deferred;
-        }
-        if (execution.state_ == ExecutionState::Blocked) {
-            Binding* const binding = execution.scheduler_binding_;
-            KASSERT(binding != nullptr);
-            static_cast<void>(accept_wake(*binding));
+    auto& wait = target->current_wait();
+    if (wait.attached()) {
+        if (!wait.cancel()) return StopDisposition::Deferred;
+        if (exec.state_ == Thread::State::Blocked) {
+            Sc* const sc = exec.sc_;
+            libk_assert(sc != nullptr);
+            static_cast<void>(accept_wake(*sc));
             return StopDisposition::Deferred;
         }
     }
-
-    if (Vproc* const vproc = target.vproc()) {
-        const RemoteCancel canceled = remote_.cancel(vproc->activation_);
-        // stop_ready() is derived from the Vproc-owned post state. Reaching
-        // the home dispatcher therefore implies that queue ownership is gone.
-        KASSERT(canceled == RemoteCancel::NotPending);
+    if (target->in_kernel_ || target->activation() != nullptr) {
+        if (exec.state_ == Thread::State::Blocked) {
+            libk_assert(exec.sc_ != nullptr);
+            static_cast<void>(accept_wake(*exec.sc_));
+        }
+        return StopDisposition::Deferred;
     }
 
-    if (execution.state_ == ExecutionState::Running) {
-        KASSERT(current_ == target);
+    if (exec.state_ == Thread::State::Running) {
+        libk_assert(cpu_->current_ == target);
         request_reschedule(DispatchReason::Stop);
         return StopDisposition::Deferred;
     }
-    if ((target.vproc() != nullptr && target.stop_deferred())
-        || (execution.state_ == ExecutionState::Blocked
-            && target.stop_deferred())) {
+    if (exec.state_ == Thread::State::Blocked && target->draining()) {
         // The operation owns the continuation and may already be completing
         // on another CPU. Let its retained wake make the frame runnable; trap
         // exit consumes the result before the pending stop is committed.
         return StopDisposition::Deferred;
     }
 
-    Binding* const binding = execution.scheduler_binding_;
-    if (binding != nullptr) {
-        if (binding->queued()) {
-            policy_.remove(*binding, binding->context().urgency());
+    Sc* const sc = exec.sc_;
+    if (sc != nullptr) {
+        if (sc->queued()) {
+            ready_.remove(*sc, sc->urgency());
         }
-        if (binding->timer_queued()) {
-            timers_.remove(*binding);
+        if (sc->timer_queued()) {
+            timers_.remove(*sc);
         }
-        binding->activation_credit_ = false;
-        binding->publish_projection();
-        static_cast<void>(remote_.cancel(binding->start_));
-        static_cast<void>(remote_.cancel(binding->wake_));
-        static_cast<void>(remote_.cancel(binding->stop_));
+
+        static_cast<void>(remote_.cancel(sc->start_));
+        static_cast<void>(remote_.cancel(sc->wake_));
+        static_cast<void>(remote_.cancel(sc->stop_));
     }
-    execution.set_state(ExecutionState::Exited);
+    exec.set_state(Thread::State::Exited);
     return StopDisposition::Finalize;
 }
 
-void CpuDispatcher::finish_exit(
-    execution::Target target,
+void Dispatcher::cancel(Sc& sc) noexcept {
+    libk_assert(arch::current_cpu_owner() == cpu_ && !arch::interrupts_enabled());
+    libk_assert(remote_.cancel(sc.start_) != RemoteCancel::AlreadyClaimed);
+    libk_assert(remote_.cancel(sc.wake_) != RemoteCancel::AlreadyClaimed);
+    libk_assert(remote_.cancel(sc.stop_) != RemoteCancel::AlreadyClaimed);
+}
+
+void Dispatcher::finish_exit(
+    Thread* target,
     DispatchReason reason,
     myos_status_t exit_status) noexcept {
-    KASSERT(!arch::interrupts_enabled());
-    Execution& execution = target.execution();
-    KASSERT(execution.state_ == ExecutionState::Exited);
-    KASSERT(current_ != target);
-    KASSERT(!target.stop_deferred());
-    execution::TargetHold lifetime{};
-    if (execution.scheduler_binding_ != nullptr) {
-        Binding& binding = *execution.scheduler_binding_;
-        KASSERT(!binding.queued() && !binding.timer_queued());
-        static_cast<void>(remote_.cancel(binding.start_));
-        static_cast<void>(remote_.cancel(binding.wake_));
-        static_cast<void>(remote_.cancel(binding.stop_));
-        if (Vproc* const vproc = target.vproc()) {
-            const RemoteCancel canceled = remote_.cancel(vproc->activation_);
-            KASSERT(canceled == RemoteCancel::NotPending);
-        }
-        auto unbound = binding.context().unbind(this);
-        KASSERT(unbound);
-        lifetime = libk::move(unbound).value();
+    libk_assert(!arch::interrupts_enabled());
+    Thread& exec = *target;
+    libk_assert(exec.state_ == Thread::State::Exited);
+    libk_assert(cpu_->current_ != target);
+    // Also covers Stop of a ready exec after frame redirect: its saved
+    // kernel stack is now discarded, so every popped stack can be recycled.
+    target->release_calls();
+    libk_assert(!target->draining());
+    object::ref<> lifetime{};
+    if (exec.sc_ != nullptr) {
+        Sc& sc = *exec.sc_;
+        libk_assert(!sc.queued() && !sc.timer_queued());
+        auto unbound = sc.unbind(this);
+        libk_assert(unbound);
+        lifetime = std::move(unbound).value();
     }
     if (reason == DispatchReason::Stop) {
-        target.finish_stop();
+        target->finish_stop();
     } else {
-        target.finish_exit(exit_status);
+        target->finish_exit(exit_status);
     }
 }
 
 void yield() noexcept {
     // The call may switch away before it returns.  An IrqToken's diagnostic
     // lifetime is stack-bound, so carrying it across that handoff would make
-    // the next execution look as if this CPU still owned a disabled-IRQ
+    // the next exec look as if this CPU still owned a disabled-IRQ
     // section.  Keep this scheduler boundary raw; the dispatcher itself
     // already requires interrupts to be masked.
     const arch::InterruptState interrupts = arch::disable_interrupts();
     CpuLocal& cpu = current_cpu();
-    KASSERT(cpu.dispatcher() != nullptr);
+    libk_assert(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->yield();
     arch::restore_interrupts(interrupts);
 }
 
 void block() noexcept {
-    // See yield(): block_current() can hand the stack to another execution.
+    // See yield(): block_current() can hand the stack to another exec.
     const arch::InterruptState interrupts = arch::disable_interrupts();
     CpuLocal& cpu = current_cpu();
-    KASSERT(cpu.dispatcher() != nullptr);
+    libk_assert(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->block_current();
     arch::restore_interrupts(interrupts);
 }
 
 auto wake(
     CpuRegistry& cpus,
-    Binding& binding,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept
-    -> CpuDispatcher::WakeResult {
-    CpuRuntime* const target = cpus.runtime(binding.home_cpu());
+    Sc& sc) noexcept
+    -> Dispatcher::WakeResult {
+    CpuRuntime* const target = cpus.runtime(sc.home_cpu());
     if (target == nullptr
         || target->local.descriptor->state() != CpuState::Online) {
-        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
+        return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
 
     if (arch::current_cpu_owner() == &target->local) {
-        kernel::sync::IrqToken irq{};
-        const CpuDispatcher::WakeAcceptance accepted =
-            target->dispatcher().accept_wake(binding, cause);
-        if (delivery != nullptr) {
-            *delivery = {};
+        sync::Irq irq{};
+        const Dispatcher::WakeAcceptance accepted =
+            target->dispatcher().accept_wake(sc);
+        if (accepted != Dispatcher::WakeAcceptance::Rejected) {
+            return {};
         }
-        if (accepted != CpuDispatcher::WakeAcceptance::Rejected) {
-            return libk::expected();
-        }
-        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
+        return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
-    return target->dispatcher().post_wake(binding, cause, delivery);
+    return target->dispatcher().post_wake(sc);
 }
 
-auto try_wake(
-    CpuRegistry& cpus,
-    Binding& binding,
-    diag::concurrency::ObservationKey cause,
-    diag::concurrency::ObservationKey* delivery) noexcept
-    -> CpuDispatcher::WakeResult {
-    // The only caller is the IRQ-off diagnostic report producer. Keep this
-    // boundary explicit so the bounded path cannot silently grow an IRQ
-    // instrumentation/restore sequence when reused elsewhere.
-    KASSERT(!arch::interrupts_enabled());
-    CpuRuntime* const target = cpus.runtime(binding.home_cpu());
+auto start(CpuRegistry& cpus, Sc& sc) noexcept
+    -> Dispatcher::WakeResult {
+    CpuRuntime* const target = cpus.runtime(sc.home_cpu());
     if (target == nullptr
         || target->local.descriptor->state() != CpuState::Online) {
-        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
-    }
-
-    // Keep the observer path uniform even for a home CPU equal to the
-    // producer: the self-IPI is a scheduling hint, while the home CPU's
-    // normal software-interrupt consumer remains the sole owner of
-    // accept_wake/make_ready and its canonical scheduler mutations.
-    return target->dispatcher().post_wake_if_available(
-        binding, cause, delivery);
-}
-
-auto start(CpuRegistry& cpus, Binding& binding) noexcept
-    -> CpuDispatcher::WakeResult {
-    CpuRuntime* const target = cpus.runtime(binding.home_cpu());
-    if (target == nullptr
-        || target->local.descriptor->state() != CpuState::Online) {
-        return libk::unexpected(CpuDispatcher::WakeError::Unavailable);
+        return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
     if (arch::current_cpu_owner() == &target->local) {
-        kernel::sync::IrqToken irq{};
-        const bool accepted = target->dispatcher().make_ready(binding);
+        sync::Irq irq{};
+        const bool accepted = target->dispatcher().make_ready(sc);
         return accepted
-            ? CpuDispatcher::WakeResult{libk::expected()}
-            : CpuDispatcher::WakeResult{
-                  libk::unexpected(CpuDispatcher::WakeError::Unavailable)};
+            ? Dispatcher::WakeResult{}
+            : Dispatcher::WakeResult{
+                  std::unexpected(Dispatcher::WakeError::Unavailable)};
     }
-    return target->dispatcher().post_start(binding);
-}
-
-auto activate(CpuRegistry& cpus, Vproc& vproc) noexcept
-    -> CpuDispatcher::WakeResult {
-    return CpuDispatcher::request_activation(cpus, vproc);
+    return target->dispatcher().post_start(sc);
 }
 
 [[noreturn]] void exit_current() noexcept {
     [[maybe_unused]] const arch::InterruptState interrupts =
         arch::disable_interrupts();
     CpuLocal& cpu = current_cpu();
-    KASSERT(cpu.dispatcher() != nullptr);
+    libk_assert(cpu.dispatcher() != nullptr);
     cpu.dispatcher()->exit_current();
 }
 
-} // namespace kernel::sched
+} // namespace sched

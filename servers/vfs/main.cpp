@@ -1,6 +1,7 @@
-#include <user/server_rt/service.hpp>
-#include <user/server_rt/io.hpp>
-#include <user/ipc/storage.hpp>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <servers/runtime/queue.hpp>
+#include <sys/storage.hpp>
 
 namespace {
 // The boot mount is read-only and flat. Only this exact component selects it.
@@ -73,7 +74,7 @@ struct Client final {
             if (reply.status != MYOS_STATUS_OK) return;
             constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE
                 | MYOS_RIGHT_CLOSE | MYOS_RIGHT_DESTROY;
-            if (!response.offer(libk::move(object), rights)) {
+            if (!response.offer(std::move(object), rights)) {
                 reply.status = MYOS_STATUS_INTERNAL; return;
             }
             reply.value = generation;
@@ -81,9 +82,9 @@ struct Client final {
             service::copy(reply.data, &length, sizeof(length));
         } else if (operation == store::Control::List) {
             const char* name = request.size == 0 ? "/" : path;
-            const char* boot = boot_name(name);
-            const bool boot_dir = boot != nullptr || !writable_root;
-            if (boot_dir && boot != nullptr && *boot != '\0') {
+            const char* tail = boot_name(name);
+            const bool boot_dir = tail != nullptr || !writable_root;
+            if (boot_dir && tail != nullptr && *tail != '\0') {
                 reply.status = MYOS_STATUS_NOT_FOUND; return;
             }
             const bool root = service::equal(name, "/") || service::equal(name, "");
@@ -211,8 +212,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             const auto status = directory.receive(packet);
             if (status == MYOS_STATUS_WOULD_BLOCK || status == MYOS_STATUS_BUSY) break;
             if (status != MYOS_STATUS_OK || packet.count != 2) continue;
-            auto endpoint = libk::move(packet.capabilities[0]);
-            packet.capabilities[0] = libk::move(packet.capabilities[1]);
+            auto endpoint = std::move(packet.capabilities[0]);
+            packet.capabilities[0] = std::move(packet.capabilities[1]);
             packet.count = 1;
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
@@ -228,7 +229,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 continue;
             }
             available->writable = packet.badge == vfs::WriteDirectory;
-            available->channel = libk::move(endpoint);
+            available->channel = std::move(endpoint);
             const auto bound = available->session.bind(available->channel.selector(), events);
             const auto accepted = bound == MYOS_STATUS_OK
                 ? available->session.accept(packet, [&](const io::ControlMessage& request,

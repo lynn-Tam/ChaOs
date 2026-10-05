@@ -28,3 +28,4 @@
 #define MYOS_STATUS_TRANSFER_FAILED   -20
 #define MYOS_STATUS_TIMED_OUT         -21
 #define MYOS_STATUS_PEER_CLOSED       -22
+#define MYOS_STATUS_DIRTY             -23

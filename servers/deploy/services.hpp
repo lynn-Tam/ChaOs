@@ -1,6 +1,9 @@
 #pragma once
 
-#include <user/abi/time.hpp>
+#include <optional>
+
+
+#include <sys/clock.hpp>
 #include <servers/deploy/launch.hpp>
 
 namespace deploy {
@@ -14,7 +17,7 @@ class services final {
     program& program_;
     myos::Clock clock_{};
     myos_cap_t events_;
-    libk::optional<typename Tasks::handle> tasks_[Capacity];
+    std::optional<typename Tasks::handle> tasks_[Capacity];
     uint32_t order_[Capacity]{};
     bool recovering_[Capacity]{};
     bool disabled_[Capacity]{};
@@ -73,7 +76,7 @@ class services final {
 public:
     struct start_result {
         myos_status_t status;
-        libk::optional<uint32_t> task;
+        std::optional<uint32_t> task;
     };
 
     static_assert(Capacity < sizeof(myos_word_t) * 8);
@@ -82,12 +85,12 @@ public:
 
     auto start() noexcept -> start_result {
         const auto clock_status = clock_.open();
-        if (clock_status != MYOS_STATUS_OK) return {clock_status, libk::nullopt};
+        if (clock_status != MYOS_STATUS_OK) return {clock_status, std::nullopt};
         const auto& plan = program_.plan();
         if (plan.task_count() > Capacity || !plan.order(order_))
-            return {MYOS_STATUS_BAD_ARGS, libk::nullopt};
+            return {MYOS_STATUS_BAD_ARGS, std::nullopt};
         const auto valid = supervisor_.validate_graph(program_);
-        if (valid != MYOS_STATUS_OK) return {valid, libk::nullopt};
+        if (valid != MYOS_STATUS_OK) return {valid, std::nullopt};
         for (uint32_t p = 0; p < plan.task_count(); ++p) {
             auto status = launch(order_[p]);
             if (status == MYOS_STATUS_OK) status = wait_ready(order_[p]);
@@ -113,7 +116,7 @@ public:
             }
             return {status, order_[p]};
         }
-        return {MYOS_STATUS_OK, libk::nullopt};
+        return {MYOS_STATUS_OK, std::nullopt};
     }
 
     void notify(myos_word_t badges) noexcept {

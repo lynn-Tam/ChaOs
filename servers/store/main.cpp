@@ -1,8 +1,9 @@
-#include <user/server_rt/service.hpp>
-#include <user/server_rt/io.hpp>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <servers/runtime/queue.hpp>
 #include <servers/store/volume.hpp>
-#include <user/abi/startup.hpp>
-#include <user/ipc/storage.hpp>
+#include <sys/start.hpp>
+#include <sys/storage.hpp>
 #include <expected>
 
 namespace {
@@ -211,7 +212,7 @@ struct Open final {
             if (session.done()) session.reset();
             return status;
         }
-        if (!reply.offer(libk::move(endpoint), common | MYOS_RIGHT_DESTROY
+        if (!reply.offer(std::move(endpoint), common | MYOS_RIGHT_DESTROY
             | MYOS_RIGHT_DUPLICATE)) {
             reap();
             file = nullptr;
@@ -567,7 +568,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             const auto status = directory.receive(packet);
             if (status == MYOS_STATUS_WOULD_BLOCK || status == MYOS_STATUS_BUSY) break;
             if (status != MYOS_STATUS_OK || packet.count != 2) continue;
-            auto endpoint = libk::move(packet.capabilities[0]);
+            auto endpoint = std::move(packet.capabilities[0]);
             if (packet.badge != store::ReadDirectory && packet.badge != store::WriteDirectory
                 && packet.badge != store::AdminDirectory) {
                 const io::ControlMessage reply{.operation = packet.message.operation,
@@ -576,7 +577,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 (void)channel_close(endpoint.selector());
                 continue;
             }
-            packet.capabilities[0] = libk::move(packet.capabilities[1]);
+            packet.capabilities[0] = std::move(packet.capabilities[1]);
             packet.count = 1;
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
@@ -590,7 +591,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             auto& client = *available;
             client.writable = packet.badge != store::ReadDirectory;
             client.admin = packet.badge == store::AdminDirectory;
-            client.channel = libk::move(endpoint);
+            client.channel = std::move(endpoint);
             const auto bound = client.session.bind(client.channel.selector(), events);
             const auto accepted = bound == MYOS_STATUS_OK
                 ? client.session.accept(packet, [&](const io::ControlMessage& request,

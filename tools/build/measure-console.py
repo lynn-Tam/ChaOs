@@ -10,7 +10,6 @@ import statistics
 import subprocess
 import time
 
-
 def run(args, disk, trace=None):
     command = [args.qemu, "-machine", "virt,iommu-sys=on", "-smp", str(args.smp),
                "-nographic", "-bios", "default", "-kernel", args.kernel,
@@ -72,11 +71,9 @@ def run(args, disk, trace=None):
         process.wait()
         poll.close()
 
-
 def percentile(values, percent):
     ordered = sorted(values)
     return ordered[max(0, (len(ordered) * percent + 99) // 100 - 1)]
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -111,7 +108,6 @@ def main():
         print(f"{label:12} p50={statistics.median(samples):.3f}s "
               f"p95={percentile(samples, 95):.3f}s "
               f"samples={','.join(f'{value:.3f}' for value in samples)}")
-
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libk/utility.hpp>
+#include <utility>
 
 namespace libk {
 
@@ -11,13 +11,13 @@ constexpr void insertion_sort(Iterator first, Iterator last, Compare before) {
     }
 
     for (Iterator current = first + 1; current != last; ++current) {
-        auto value = libk::move(*current);
+        auto value = std::move(*current);
         Iterator position = current;
         while (position != first && before(value, *(position - 1))) {
-            *position = libk::move(*(position - 1));
+            *position = std::move(*(position - 1));
             --position;
         }
-        *position = libk::move(value);
+        *position = std::move(value);
     }
 }
 

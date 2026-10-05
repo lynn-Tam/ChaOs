@@ -2,7 +2,7 @@
 
 #include <libk/concepts.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/utility.hpp>
+#include <utility>
 
 namespace libk {
 
@@ -16,10 +16,10 @@ requires requires(F& function) {
 class scope_exit final : private noncopyable {
 public:
     constexpr explicit scope_exit(F function) noexcept
-        : function_(libk::move(function)) {}
+        : function_(std::move(function)) {}
 
     constexpr scope_exit(scope_exit&& other) noexcept
-        : function_(libk::move(other.function_)), active_(other.release()) {}
+        : function_(std::move(other.function_)), active_(other.release()) {}
 
     auto operator=(scope_exit&&) -> scope_exit& = delete;
 
@@ -30,7 +30,7 @@ public:
     }
 
     constexpr auto release() noexcept -> bool {
-        return libk::exchange(active_, false);
+        return std::exchange(active_, false);
     }
 
 private:
@@ -43,8 +43,8 @@ scope_exit(F) -> scope_exit<F>;
 
 template<typename F>
 [[nodiscard]] constexpr auto on_scope_exit(F&& function) noexcept
-    -> scope_exit<remove_cvr_t<F>> {
-    return scope_exit<remove_cvr_t<F>>{libk::forward<F>(function)};
+    -> scope_exit<std::remove_cvref_t<F>> {
+    return scope_exit<std::remove_cvref_t<F>>{std::forward<F>(function)};
 }
 
 } // namespace libk

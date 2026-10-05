@@ -34,10 +34,23 @@ def manual(value, name):
     assert bool(value['engaged_'])
     return value['storage_'].address.cast(gdb.lookup_type(name).pointer()).dereference()
 
-state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'kernel::KernelState')
-objects = manual(state['objects_'], 'kernel::object::ObjectStore')
-direct = manual(state['direct_map_'], 'kernel::mm::DirectMap')
-delta = int(direct['virtual_base_']['value_']) - int(direct['physical_base_']['value_'])
+state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
+memory = manual(state['memory_objects_'], 'object::store<mm::VSpace, mm::Mem, Pager>')
+def pool(name):
+    def find(value):
+        if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
+            return manual(value, 'object::pool<%s>' % name)
+        for f in value.type.fields():
+            child = value.cast(f.type) if f.is_base_class else value[f.name]
+            if f.is_base_class or f.name == '_M_head_impl':
+                result = find(child)
+                if result is not None: return result
+        return None
+    result = find(memory['pools_'])
+    assert result is not None, name
+    return result
+direct = manual(state['pmm_'], 'mm::Pmm')['direct_map_']['layout_']
+delta = int(direct['virtual_base']['value_']) - int(direct['physical_base']['value_'])
 inferior = gdb.selected_inferior()
 def physical(address, size):
     return bytes(inferior.read_memory(address + delta, size))
@@ -54,20 +67,20 @@ def translate(root, address):
         table = (pte >> 10) << 12
     return None
 
-slot_type = gdb.lookup_type('kernel::object::ObjectPool<kernel::mm::VSpace>::Slot')
-page_type = gdb.lookup_type('kernel::object::ObjectPool<kernel::mm::VSpace>::PageHeader')
+slot_type = gdb.lookup_type('object::pool<mm::VSpace>::Slot')
+page_type = gdb.lookup_type('object::pool<mm::VSpace>::PageHeader')
 offset = (page_type.sizeof + slot_type.alignof - 1) & ~(slot_type.alignof - 1)
 count = (4096 - offset) // slot_type.sizeof
-page = objects['vspaces_']['pages_head_']
+page = pool('mm::VSpace')['storage_']['head_']
 found = {{}}
 while int(page):
     for index in range(count):
         slot = gdb.Value(int(page) + offset + index * slot_type.sizeof).cast(slot_type.pointer()).dereference()
-        if int(slot['anchor']['lifecycle_']) != 2: continue
-        space = slot['storage'].address.cast(gdb.lookup_type('kernel::mm::VSpace').pointer()).dereference()
+        if int(slot['anchor']['phase_']) != 2: continue
+        space = slot['storage'].address.cast(gdb.lookup_type('mm::VSpace').pointer()).dereference()
         if not bool(space['root_']['engaged_']): continue
-        user = manual(space['root_'], 'arch::UserRoot')
-        root = int(user['root_page_']['frame_']['value_']) << 12
+        user = manual(space['root_'], 'mm::PageTable')
+        root = int(user['root_']['value_']) << 12
         data, bss = translate(root, {initialized}), translate(root, {zeroed})
         if data is None or bss is None: continue
         seed = physical(data[0], 1)[0]

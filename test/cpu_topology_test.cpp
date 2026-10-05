@@ -1,42 +1,38 @@
-#include <diag/owner.hpp>
+#include <expected>
+#include <panic.hpp>
+#include <trace.hpp>
 #include <test/test.hpp>
 
 #include <arch/ipi.hpp>
 #include <boot/cpu_topology.hpp>
-#include <cpu/cpu_provisioner.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <cpu/cpu_runtime.hpp>
+#include <cpu/setup.hpp>
+#include <cpu/registry.hpp>
+#include <cpu/runtime.hpp>
 #include <libk/manual_lifetime.hpp>
-#include <libk/utility.hpp>
+#include <utility>
 #include <mm/pmm.hpp>
-#include <mm/kernel_stack.hpp>
-#include <mm/kernel_vspace.hpp>
-#include <core/kernel_image.hpp>
-#include <object/object_store.hpp>
-#include <mm/vspace_work.hpp>
-#include <mm/memory_work.hpp>
-#include <mm/reclaim.hpp>
-#include <sched/context.hpp>
+#include <mm/kspace.hpp>
+#include <boot/link.hpp>
+#include <object/pool.hpp>
+#include <object/group.hpp>
+#include <sched/sc.hpp>
 #include <sched/domain.hpp>
 #include <sched/remote_queue.hpp>
 #include <time/clock.hpp>
 
-#include "arch/riscv64/mmu/sv39_builder.hpp"
+#include <mm/table.hpp>
 
 namespace {
 
-constexpr size_t cpu_test_pages = 256;
-alignas(kernel::mm::page_size) uint8_t cpu_test_ram[cpu_test_pages * kernel::mm::page_size]{};
-constinit libk::ManualLifetime<kernel::mm::Pmm> cpu_test_pmm{};
-constinit libk::ManualLifetime<kernel::mm::DirectMap> cpu_test_direct{};
-constinit libk::ManualLifetime<kernel::object::ObjectStore> cpu_test_objects{};
-constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor> cpu_test_vspace_work{};
-constinit libk::ManualLifetime<kernel::mm::MemoryExecutor> cpu_test_memory_work{};
-constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
-    cpu_test_reclaimer{};
-constinit libk::ManualLifetime<kernel::time::Clock> cpu_test_clock{};
-constinit libk::ManualLifetime<kernel::CpuRegistry> cpu_test_registry{};
-constinit libk::ManualLifetime<kernel::mm::KernelVSpace> cpu_test_kernel{};
+constexpr size_t cpu_test_pages = 512;
+alignas(mm::page_size) uint8_t cpu_test_ram[cpu_test_pages * mm::page_size]{};
+constinit libk::ManualLifetime<mm::Pmm> cpu_test_pmm{};
+constinit libk::delegate<void() noexcept> cpu_test_notify{};
+constinit libk::ManualLifetime<object::pool<Thread>> cpu_test_threads{};
+
+constinit libk::ManualLifetime<time::Clock> cpu_test_clock{};
+constinit libk::ManualLifetime<CpuRegistry> cpu_test_registry{};
+constinit libk::ManualLifetime<mm::KSpace> cpu_test_kernel{};
 
 void unused_idle_entry(void*) noexcept {}
 
@@ -50,46 +46,32 @@ public:
         if (pages == 0 || pages > cpu_test_pages) {
             return false;
         }
-        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel_phys(mm::Virt{
             reinterpret_cast<uintptr_t>(cpu_test_ram)});
         if (!physical) {
             return false;
         }
-        const auto first = kernel::mm::Page::from_base(*physical);
+        const auto first = mm::Page::from_base(*physical);
         if (!first) {
             return false;
         }
-        kernel::mm::RegionList map{};
-        if (!map.try_emplace_back(kernel::mm::Region{
-                kernel::mm::PageRange{*first, pages},
-                kernel::mm::RegionKind::AvailableRam})) {
+        mm::RegionList map{};
+        if (!map.try_emplace_back(mm::Region{
+                mm::Pages{*first, pages},
+                mm::Region::Kind::Ram})) {
             return false;
         }
-        const auto direct = kernel::mm::DirectMap::initialize_in(
-            cpu_test_direct,
-            map,
-            kernel::mm::DirectMapLayout{
-                .physical_base = kernel::mm::PhysAddr{
+        if (!mm::Pmm::initialize_in(
+                cpu_test_pmm, std::move(map), mm::DirectMap::Layout{
+                .physical_base = mm::Phys{
                     physical->raw()},
-                .virtual_base = kernel::mm::VirtAddr{
+                .virtual_base = mm::Virt{
                     reinterpret_cast<uintptr_t>(cpu_test_ram)},
                 .window_size = sizeof(cpu_test_ram),
-            });
-        if (!direct) {
+            })) {
             return false;
         }
-        if (!kernel::mm::Pmm::initialize_in(
-                cpu_test_pmm, *cpu_test_direct, libk::move(map))) {
-            return false;
-        }
-        auto& vspace_work = cpu_test_vspace_work.emplace();
-        auto& memory_work = cpu_test_memory_work.emplace();
-        /*luna change: construct a real reclaimer for CPU objects, reason:
-          pooled MemoryObjects require one mandatory Pager owner*/
-        auto& reclaimer = cpu_test_reclaimer.emplace();
-        [[maybe_unused]] auto& objects =
-            cpu_test_objects.emplace(
-                *cpu_test_pmm, vspace_work, memory_work, reclaimer);
+        (void)cpu_test_threads.emplace(*cpu_test_pmm, cpu_test_notify);
         [[maybe_unused]] auto& clock = cpu_test_clock.emplace(10'000'000);
         return true;
     }
@@ -97,25 +79,21 @@ public:
 private:
     static auto reset() noexcept -> void {
         cpu_test_registry.reset();
-        cpu_test_objects.reset();
-        cpu_test_reclaimer.reset();
-        cpu_test_memory_work.reset();
-        cpu_test_vspace_work.reset();
+        cpu_test_threads.reset();
         cpu_test_clock.reset();
         cpu_test_kernel.reset();
         cpu_test_pmm.reset();
-        cpu_test_direct.reset();
     }
 };
 
-[[nodiscard]] auto make_test_root() noexcept -> kernel::mm::KernelVSpace* {
-    auto builder = arch::riscv64::Sv39Builder::create(*cpu_test_pmm);
+[[nodiscard]] auto make_test_root() noexcept -> mm::KSpace* {
+    auto builder = mm::PageTable::create(*cpu_test_pmm, mm::PageTable::Kind::Kernel);
     if (!builder) {
         return nullptr;
     }
-    arch::KernelRoot root = libk::move(builder).value().finalize();
-    if (!kernel::mm::KernelVSpace::adopt_in(
-            cpu_test_kernel, *cpu_test_pmm, libk::move(root))) {
+    mm::PageTable root = std::move(builder).value();
+    if (!mm::KSpace::adopt_in(
+            cpu_test_kernel, *cpu_test_pmm, std::move(root))) {
         return nullptr;
     }
     return &*cpu_test_kernel;
@@ -185,9 +163,9 @@ public:
     }
 
     [[nodiscard]] auto view() noexcept
-        -> libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError> {
+        -> std::expected<Fdt, FdtError> {
         if (!valid_) {
-            return libk::unexpected(kernel::boot::FdtError::InvalidStructure);
+            return std::unexpected(FdtError::InvalidStructure);
         }
         constexpr size_t header_size = 40;
         constexpr size_t reservations_size = 16;
@@ -195,7 +173,7 @@ public:
         const size_t strings_offset = structure_offset + size_;
         const size_t total = strings_offset + sizeof(property_names);
         if (total > sizeof(blob_)) {
-            return libk::unexpected(kernel::boot::FdtError::InvalidStructure);
+            return std::unexpected(FdtError::InvalidStructure);
         }
         auto write32 = [this](size_t offset, uint32_t value) {
             blob_[offset] = static_cast<uint8_t>(value >> 24);
@@ -222,7 +200,7 @@ public:
         for (size_t index = 0; index < sizeof(property_names); ++index) {
             blob_[strings_offset + index] = property_names[index];
         }
-        return kernel::boot::Fdt::open(blob_);
+        return Fdt::open(blob_);
     }
 
 private:
@@ -266,24 +244,24 @@ private:
 };
 
 constinit FdtStructureWriter fdt_writer{};
-constinit kernel::boot::CpuHandoff cpu_handoff_storage{};
+constinit CpuHandoff cpu_handoff_storage{};
 
 [[nodiscard]] auto parse_cpu_tree(
-    const libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError>& view,
-    kernel::CpuHardwareId boot_cpu) noexcept
-    -> libk::Expected<kernel::boot::CpuHandoff*,
-        kernel::boot::CpuTopologyError> {
+    const std::expected<Fdt, FdtError>& view,
+    CpuHwId boot_cpu) noexcept
+    -> std::expected<CpuHandoff*,
+        CpuTopologyError> {
     cpu_handoff_storage.cpus.clear();
     cpu_handoff_storage.boot_index = 0;
     if (!view) {
-        return libk::unexpected(kernel::boot::CpuTopologyError::InvalidCpuNode);
+        return std::unexpected(CpuTopologyError::InvalidCpuNode);
     }
-    auto parsed = kernel::boot::parse_fdt_cpus(
+    auto parsed = parse_fdt_cpus(
         view.value(), boot_cpu, cpu_handoff_storage);
     if (!parsed) {
-        return libk::unexpected(parsed.error());
+        return std::unexpected(parsed.error());
     }
-    return libk::expected(&cpu_handoff_storage);
+    return (&cpu_handoff_storage);
 }
 
 auto begin_cpu_tree(
@@ -312,7 +290,7 @@ auto add_cpu(
     fdt_writer.end_node();
 }
 
-[[nodiscard]] auto finish_cpu_tree() noexcept -> libk::Expected<kernel::boot::Fdt, kernel::boot::FdtError> {
+[[nodiscard]] auto finish_cpu_tree() noexcept -> std::expected<Fdt, FdtError> {
     fdt_writer.end_node();
     fdt_writer.end_node();
     fdt_writer.finish();
@@ -327,7 +305,7 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
     const auto view = finish_cpu_tree();
 
     const auto summary = parse_cpu_tree(
-        view, kernel::CpuHardwareId{256});
+        view, CpuHwId{256});
     if (!summary
         || summary.value()->cpus.size() != 3
         || summary.value()->boot_index != 1) {
@@ -338,15 +316,15 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
     if (!storage.initialize()) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
         summary.value()->summary());
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
-    for (const kernel::boot::BootCpu& cpu : summary.value()->cpus) {
+    auto builder = std::move(begun).value();
+    for (const BootCpu& cpu : summary.value()->cpus) {
         if (!builder.append(cpu.hardware_id, cpu.availability)) {
             return false;
         }
@@ -355,24 +333,24 @@ bool test_sparse_inventory_and_statuses(const TestContext&) noexcept {
         return false;
     }
 
-    const auto* cpu0 = cpu_test_registry->descriptor(kernel::CpuId{0});
-    const auto* cpu1 = cpu_test_registry->descriptor(kernel::CpuId{1});
-    const auto* cpu2 = cpu_test_registry->descriptor(kernel::CpuId{2});
+    const auto* cpu0 = cpu_test_registry->descriptor(CpuId{0});
+    const auto* cpu1 = cpu_test_registry->descriptor(CpuId{1});
+    const auto* cpu2 = cpu_test_registry->descriptor(CpuId{2});
     if (cpu0 == nullptr || cpu1 == nullptr || cpu2 == nullptr) {
         return false;
     }
     const auto failure = cpu2->failure();
-    return cpu0->hardware_id() == kernel::CpuHardwareId{0}
-        && cpu0->availability() == kernel::CpuAvailability::Disabled
-        && cpu1->hardware_id() == kernel::CpuHardwareId{256}
-        && cpu1->availability() == kernel::CpuAvailability::Enabled
-        && cpu2->hardware_id() == kernel::CpuHardwareId{1024}
-        && cpu2->availability() == kernel::CpuAvailability::Failed
-        && cpu0->state() == kernel::CpuState::Possible
-        && cpu1->state() == kernel::CpuState::Present
-        && cpu2->state() == kernel::CpuState::Failed
+    return cpu0->hardware_id() == CpuHwId{0}
+        && cpu0->availability() == CpuAvail::Disabled
+        && cpu1->hardware_id() == CpuHwId{256}
+        && cpu1->availability() == CpuAvail::Enabled
+        && cpu2->hardware_id() == CpuHwId{1024}
+        && cpu2->availability() == CpuAvail::Failed
+        && cpu0->state() == CpuState::Possible
+        && cpu1->state() == CpuState::Present
+        && cpu2->state() == CpuState::Failed
         && failure
-        && *failure == kernel::CpuFailure::FirmwareReported;
+        && *failure == CpuFailure::FirmwareReported;
 }
 
 bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
@@ -381,49 +359,49 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.end_node();
     fdt_writer.finish();
     const auto missing_cpus = parse_cpu_tree(
-        fdt_writer.view(), kernel::CpuHardwareId{0});
+        fdt_writer.view(), CpuHwId{0});
     if (missing_cpus
         || missing_cpus.error()
-            != kernel::boot::CpuTopologyError::MissingCpusNode) {
+            != CpuTopologyError::MissingCpusNode) {
         return false;
     }
 
     begin_cpu_tree();
     const auto zero_cpus = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (zero_cpus
         || zero_cpus.error()
-            != kernel::boot::CpuTopologyError::BootCpuMissing) {
+            != CpuTopologyError::BootCpuMissing) {
         return false;
     }
 
     begin_cpu_tree(3, 0);
     add_cpu("cpu@0", 0);
     const auto bad_cells = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (bad_cells
         || bad_cells.error()
-            != kernel::boot::CpuTopologyError::InvalidAddressCells) {
+            != CpuTopologyError::InvalidAddressCells) {
         return false;
     }
 
     begin_cpu_tree(2, 1);
     add_cpu("cpu@0", 0);
     const auto bad_size_cells = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (bad_size_cells
         || bad_size_cells.error()
-            != kernel::boot::CpuTopologyError::InvalidSizeCells) {
+            != CpuTopologyError::InvalidSizeCells) {
         return false;
     }
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0, nullptr, false);
     const auto missing_reg = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (missing_reg
         || missing_reg.error()
-            != kernel::boot::CpuTopologyError::MissingReg) {
+            != CpuTopologyError::MissingReg) {
         return false;
     }
 
@@ -432,10 +410,10 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.reg64(0);
     fdt_writer.end_node();
     const auto missing_type = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (missing_type
         || missing_type.error()
-            != kernel::boot::CpuTopologyError::InvalidCpuNode) {
+            != CpuTopologyError::InvalidCpuNode) {
         return false;
     }
 
@@ -446,10 +424,10 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.reg64(1);
     fdt_writer.end_node();
     const auto duplicate_reg = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (duplicate_reg
         || duplicate_reg.error()
-            != kernel::boot::CpuTopologyError::InvalidReg) {
+            != CpuTopologyError::InvalidReg) {
         return false;
     }
 
@@ -459,40 +437,40 @@ bool test_malformed_cpu_nodes_are_rejected(const TestContext&) noexcept {
     fdt_writer.reg64_pair(0, 1);
     fdt_writer.end_node();
     const auto multi_tuple_reg = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (multi_tuple_reg
         || multi_tuple_reg.error()
-            != kernel::boot::CpuTopologyError::InvalidReg) {
+            != CpuTopologyError::InvalidReg) {
         return false;
     }
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0, "mystery");
     const auto bad_status = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     return !bad_status
         && bad_status.error()
-            == kernel::boot::CpuTopologyError::InvalidStatus;
+            == CpuTopologyError::InvalidStatus;
 }
 
 bool test_boot_hart_match_is_strict(const TestContext&) noexcept {
     begin_cpu_tree();
     add_cpu("cpu@0", 0, "disabled");
     const auto disabled = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     if (disabled
         || disabled.error()
-            != kernel::boot::CpuTopologyError::BootCpuUnavailable) {
+            != CpuTopologyError::BootCpuUnavailable) {
         return false;
     }
 
     begin_cpu_tree();
     add_cpu("cpu@0", 0);
     const auto missing = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{7});
+        finish_cpu_tree(), CpuHwId{7});
     if (missing
         || missing.error()
-            != kernel::boot::CpuTopologyError::BootCpuMissing) {
+            != CpuTopologyError::BootCpuMissing) {
         return false;
     }
 
@@ -500,10 +478,10 @@ bool test_boot_hart_match_is_strict(const TestContext&) noexcept {
     add_cpu("cpu@0", 0);
     add_cpu("cpu@00", 0);
     const auto duplicate = parse_cpu_tree(
-        finish_cpu_tree(), kernel::CpuHardwareId{0});
+        finish_cpu_tree(), CpuHwId{0});
     return !duplicate
         && duplicate.error()
-            == kernel::boot::CpuTopologyError::DuplicateBootCpu;
+            == CpuTopologyError::DuplicateBootCpu;
 }
 
 bool test_builder_rejects_mismatch_and_duplicate_id(const TestContext&) noexcept {
@@ -511,31 +489,31 @@ bool test_builder_rejects_mismatch_and_duplicate_id(const TestContext&) noexcept
     if (!storage.initialize()) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{2, 0});
+        CpuTopo{2, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{0},
-            kernel::CpuAvailability::Enabled)) {
+            CpuHwId{0},
+            CpuAvail::Enabled)) {
         return false;
     }
     const auto duplicate = builder.append(
-        kernel::CpuHardwareId{0},
-        kernel::CpuAvailability::Disabled);
+        CpuHwId{0},
+        CpuAvail::Disabled);
     if (duplicate
         || duplicate.error()
-            != kernel::CpuRegistry::Error::DuplicateHardwareId) {
+            != CpuRegistry::Error::DuplicateHardwareId) {
         return false;
     }
     const auto incomplete = builder.finish();
     return !incomplete
         && incomplete.error()
-            == kernel::CpuRegistry::Error::InvalidTopology;
+            == CpuRegistry::Error::InvalidTopology;
 }
 
 [[nodiscard]] auto registry_accepts_count(usize count) noexcept -> bool {
@@ -543,28 +521,28 @@ bool test_builder_rejects_mismatch_and_duplicate_id(const TestContext&) noexcept
     if (!storage.initialize()) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{count, 0});
+        CpuTopo{count, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     for (usize index = 0; index < count; ++index) {
         if (!builder.append(
-                kernel::CpuHardwareId{index * 17},
-                kernel::CpuAvailability::Enabled)) {
+                CpuHwId{index * 17},
+                CpuAvail::Enabled)) {
             return false;
         }
     }
     if (!builder.finish() || cpu_test_registry->count() != count) {
         return false;
     }
-    const auto* last = cpu_test_registry->descriptor(kernel::CpuId{count - 1});
+    const auto* last = cpu_test_registry->descriptor(CpuId{count - 1});
     return last != nullptr
         && last->hardware_id()
-            == kernel::CpuHardwareId{(count - 1) * 17};
+            == CpuHwId{(count - 1) * 17};
 }
 
 bool test_registry_crosses_legacy_array_thresholds(const TestContext&) noexcept {
@@ -582,35 +560,35 @@ bool test_registry_rejects_unbounded_logical_ids(const TestContext&) noexcept {
     if (!storage.initialize(32)) {
         return false;
     }
-    const auto begun = kernel::CpuRegistry::begin(
+    const auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{100000, 0});
+        CpuTopo{100000, 0});
     return !begun
         && begun.error()
-            == kernel::CpuRegistry::Error::InvalidTopology;
+            == CpuRegistry::Error::InvalidTopology;
 }
 
 [[nodiscard]] auto prepare_failure_with_budget(
     bool warm_stack_pool,
     usize remaining_pages,
-    kernel::CpuProvisioner::Error expected_error,
-    kernel::CpuFailure expected_failure) noexcept -> bool {
+    CpuSetup::Error expected_error,
+    CpuFailure expected_failure) noexcept -> bool {
     CpuStorageGuard storage{};
-    if (!storage.initialize(64)) {
+    if (!storage.initialize(384)) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{1, 0});
+        CpuTopo{1, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{0},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{0},
+            CpuAvail::Enabled)
         || !builder.finish()) {
         return false;
     }
@@ -620,45 +598,45 @@ bool test_registry_rejects_unbounded_logical_ids(const TestContext&) noexcept {
         return false;
     }
     if (warm_stack_pool) {
-        auto first = kernel::KernelStack::create(*activation);
-        auto second = kernel::KernelStack::create(*activation);
-        auto third = kernel::KernelStack::create(*activation);
-        auto fourth = kernel::KernelStack::create(*activation);
+        auto first = mm::Stack::create(*activation);
+        auto second = mm::Stack::create(*activation);
+        auto third = mm::Stack::create(*activation);
+        auto fourth = mm::Stack::create(*activation);
         if (!first || !second || !third || !fourth) {
             return false;
         }
     }
 
-    auto withheld = cpu_test_pmm->make_page_group();
+    auto withheld = cpu_test_pmm->group();
     if (cpu_test_pmm->free_page_count() < remaining_pages) {
         return false;
     }
     {
-        auto extension = withheld.extend();
+        auto pending = withheld.owner().group();
         while (cpu_test_pmm->free_page_count() > remaining_pages) {
-            if (!extension.allocate_page()) {
+            if (!pending.allocate()) {
                 return false;
             }
         }
-        extension.commit();
+        withheld.append(std::move(pending));
     }
 
-    kernel::CpuProvisioner provisioner{
+    CpuSetup provisioner{
         *cpu_test_registry,
         *cpu_test_pmm,
-        *cpu_test_objects,
+        *cpu_test_threads,
         *cpu_test_clock};
     const auto prepared = provisioner.prepare(
-        kernel::CpuId{0},
+        CpuId{0},
         *activation,
         unused_idle_entry);
     const auto* const cpu =
-        cpu_test_registry->descriptor(kernel::CpuId{0});
+        cpu_test_registry->descriptor(CpuId{0});
     return !prepared
         && prepared.error() == expected_error
         && cpu != nullptr
-        && cpu_test_registry->runtime(kernel::CpuId{0}) == nullptr
-        && cpu->state() == kernel::CpuState::Failed
+        && cpu_test_registry->runtime(CpuId{0}) == nullptr
+        && cpu->state() == CpuState::Failed
         && cpu->failure()
         && *cpu->failure() == expected_failure
         && cpu_test_pmm->verify_invariants();
@@ -669,147 +647,103 @@ bool test_prepare_resource_exhaustion_is_unpublished(
     return prepare_failure_with_budget(
                false,
                1,
-               kernel::CpuProvisioner::Error::StackAllocation,
-               kernel::CpuFailure::StackAllocation)
+               CpuSetup::Error::StackAllocation,
+               CpuFailure::StackAllocation)
         && prepare_failure_with_budget(
                true,
                1,
-               kernel::CpuProvisioner::Error::MetadataAllocation,
-               kernel::CpuFailure::MetadataAllocation)
+               CpuSetup::Error::MetadataAllocation,
+               CpuFailure::MetadataAllocation)
         && prepare_failure_with_budget(
                true,
-               2,
-               kernel::CpuProvisioner::Error::ObjectAllocation,
-               kernel::CpuFailure::ObjectAllocation);
-}
-
-bool test_prepare_metadata_exhaustion_is_unpublished(const TestContext&) noexcept {
-    CpuStorageGuard storage{};
-    if (!storage.initialize(3)) {
-        return false;
-    }
-    auto begun = kernel::CpuRegistry::begin(
-        cpu_test_registry,
-        *cpu_test_pmm,
-        kernel::CpuTopologySummary{1, 0});
-    if (!begun) {
-        return false;
-    }
-    auto builder = libk::move(begun).value();
-    if (!builder.append(
-            kernel::CpuHardwareId{0},
-            kernel::CpuAvailability::Enabled)
-        || !builder.finish()) {
-        return false;
-    }
-    const auto activation = make_test_root();
-    if (!activation) {
-        return false;
-    }
-    kernel::CpuProvisioner provisioner{
-        *cpu_test_registry,
-        *cpu_test_pmm,
-        *cpu_test_objects,
-        *cpu_test_clock};
-    const auto prepared = provisioner.prepare(
-        kernel::CpuId{0},
-        *activation,
-        unused_idle_entry);
-    const auto* cpu = cpu_test_registry->descriptor(kernel::CpuId{0});
-    return !prepared
-        && prepared.error()
-            == kernel::CpuProvisioner::Error::MetadataAllocation
-        && cpu != nullptr
-        && cpu->state() == kernel::CpuState::Failed
-        && cpu->failure()
-        && *cpu->failure() == kernel::CpuFailure::MetadataAllocation
-        && cpu_test_registry->runtime(kernel::CpuId{0}) == nullptr
-        && cpu_test_pmm->verify_invariants();
+               2 + usize(trace::enabled()),
+               CpuSetup::Error::ObjectAllocation,
+               CpuFailure::ObjectAllocation);
 }
 
 bool test_secondary_prepare_failure_preserves_prepared_boot_cpu(
     const TestContext&) noexcept {
     CpuStorageGuard storage{};
-    if (!storage.initialize(96)) {
+    if (!storage.initialize(384)) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{2, 0});
+        CpuTopo{2, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{0},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{0},
+            CpuAvail::Enabled)
         || !builder.append(
-            kernel::CpuHardwareId{1},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{1},
+            CpuAvail::Enabled)
         || !builder.finish()) {
         return false;
     }
     const auto activation = make_test_root();
-    kernel::CpuProvisioner provisioner{
+    CpuSetup provisioner{
         *cpu_test_registry,
         *cpu_test_pmm,
-        *cpu_test_objects,
+        *cpu_test_threads,
         *cpu_test_clock};
     if (!activation
         || !provisioner.prepare(
-            kernel::CpuId{0},
+            CpuId{0},
             *activation,
             unused_idle_entry)) {
         return false;
     }
-    kernel::CpuRuntime* const boot =
-        cpu_test_registry->runtime(kernel::CpuId{0});
-    auto withheld = cpu_test_pmm->make_page_group();
+    CpuRuntime* const boot =
+        cpu_test_registry->runtime(CpuId{0});
+    auto withheld = cpu_test_pmm->group();
     {
-        auto extension = withheld.extend();
+        auto pending = withheld.owner().group();
         while (cpu_test_pmm->free_page_count() > 1) {
-            if (!extension.allocate_page()) {
+            if (!pending.allocate()) {
                 return false;
             }
         }
-        extension.commit();
+        withheld.append(std::move(pending));
     }
     const auto secondary = provisioner.prepare(
-        kernel::CpuId{1},
+        CpuId{1},
         *activation,
         unused_idle_entry);
     const auto* const boot_descriptor =
-        cpu_test_registry->descriptor(kernel::CpuId{0});
+        cpu_test_registry->descriptor(CpuId{0});
     const auto* const secondary_descriptor =
-        cpu_test_registry->descriptor(kernel::CpuId{1});
+        cpu_test_registry->descriptor(CpuId{1});
     return !secondary
         && secondary.error()
-            == kernel::CpuProvisioner::Error::StackAllocation
+            == CpuSetup::Error::StackAllocation
         && boot != nullptr
-        && cpu_test_registry->runtime(kernel::CpuId{0}) == boot
-        && boot_descriptor->state() == kernel::CpuState::Prepared
-        && secondary_descriptor->state() == kernel::CpuState::Failed
-        && cpu_test_registry->runtime(kernel::CpuId{1}) == nullptr
+        && cpu_test_registry->runtime(CpuId{0}) == boot
+        && boot_descriptor->state() == CpuState::Prepared
+        && secondary_descriptor->state() == CpuState::Failed
+        && cpu_test_registry->runtime(CpuId{1}) == nullptr
         && cpu_test_pmm->verify_invariants();
 }
 
 bool test_prepare_publishes_descriptor_borrow(const TestContext&) noexcept {
     CpuStorageGuard storage{};
-    if (!storage.initialize(64)) {
+    if (!storage.initialize(384)) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{1, 0});
+        CpuTopo{1, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{42},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{42},
+            CpuAvail::Enabled)
         || !builder.finish()) {
         return false;
     }
@@ -818,13 +752,13 @@ bool test_prepare_publishes_descriptor_borrow(const TestContext&) noexcept {
         return false;
     }
     {
-        kernel::CpuProvisioner provisioner{
+        CpuSetup provisioner{
             *cpu_test_registry,
             *cpu_test_pmm,
-            *cpu_test_objects,
+            *cpu_test_threads,
             *cpu_test_clock};
         if (!provisioner.prepare(
-            kernel::CpuId{0},
+            CpuId{0},
             *activation,
             unused_idle_entry)) {
             return false;
@@ -832,97 +766,97 @@ bool test_prepare_publishes_descriptor_borrow(const TestContext&) noexcept {
     }
 
     const auto* descriptor =
-        cpu_test_registry->descriptor(kernel::CpuId{0});
-    const auto* runtime = cpu_test_registry->runtime(kernel::CpuId{0});
+        cpu_test_registry->descriptor(CpuId{0});
+    const auto* runtime = cpu_test_registry->runtime(CpuId{0});
     return descriptor != nullptr
-        && descriptor->state() == kernel::CpuState::Prepared
+        && descriptor->state() == CpuState::Prepared
         && runtime != nullptr
         && runtime->owner_registry == &*cpu_test_registry
         && runtime->local.descriptor == descriptor
         && runtime->local.current_thread() == nullptr
         && arch::active_stack(runtime->local.arch_state) == 0
-        && runtime->diagnostics != nullptr
+        && runtime->panic != nullptr
         && arch::panic_slot(runtime->local.arch_state)
-            == &runtime->diagnostics->panic
+            == runtime->panic
         && arch::emergency_stack(runtime->local.arch_state)
-            == runtime->stacks.emergency->top()
-        && runtime->idle().state() == kernel::Thread::State::Prepared
+            == runtime->emergency_stack->top()
+        && runtime->idle().state() == Thread::State::Prepared
         && runtime->idle().home_stack_top() != 0
         && (runtime->idle().home_stack_top() & 0xfU) == 0
         && runtime->start_context.ready()
         && cpu_test_registry->runtime_by_hardware_id(
-            kernel::CpuHardwareId{42}) == runtime;
+            CpuHwId{42}) == runtime;
 }
 
 bool test_lifecycle_start_failure_and_snapshot_use_canonical_states(
     const TestContext&) noexcept {
     CpuStorageGuard storage{};
-    if (!storage.initialize(96)) {
+    if (!storage.initialize(384)) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{2, 0});
+        CpuTopo{2, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{4},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{4},
+            CpuAvail::Enabled)
         || !builder.append(
-            kernel::CpuHardwareId{19},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{19},
+            CpuAvail::Enabled)
         || !builder.finish()) {
         return false;
     }
     const auto activation = make_test_root();
-    kernel::CpuProvisioner provisioner{
+    CpuSetup provisioner{
         *cpu_test_registry,
         *cpu_test_pmm,
-        *cpu_test_objects,
+        *cpu_test_threads,
         *cpu_test_clock};
     if (!activation
         || !provisioner.prepare(
-            kernel::CpuId{0},
+            CpuId{0},
             *activation,
             unused_idle_entry)
         || !provisioner.prepare(
-            kernel::CpuId{1},
+            CpuId{1},
             *activation,
             unused_idle_entry)) {
         return false;
     }
 
-    auto* const first = cpu_test_registry->runtime(kernel::CpuId{0});
-    auto* const second = cpu_test_registry->runtime(kernel::CpuId{1});
+    auto* const first = cpu_test_registry->runtime(CpuId{0});
+    auto* const second = cpu_test_registry->runtime(CpuId{1});
     if (first == nullptr || second == nullptr || first == second
         || &first->local == &second->local
-        || first->stacks.init->top() == second->stacks.init->top()
+        || first->init_stack->top() == second->init_stack->top()
         || &first->idle() == &second->idle()
         || first->idle().home_stack_top() == second->idle().home_stack_top()
         || &first->start_context == &second->start_context) {
         return false;
     }
 
-    if (!cpu_test_registry->begin_start(kernel::CpuId{0})
-        || cpu_test_registry->begin_start(kernel::CpuId{0})
+    if (!cpu_test_registry->begin_start(CpuId{0})
+        || cpu_test_registry->begin_start(CpuId{0})
         || !cpu_test_registry->fail_start(
-            kernel::CpuId{1},
-            kernel::CpuFailure::HsmUnavailable)
+            CpuId{1},
+            CpuFailure::HsmUnavailable)
         || cpu_test_registry->publish_online(*first)) {
         return false;
     }
 
     const auto* const failed =
-        cpu_test_registry->descriptor(kernel::CpuId{1});
-    const kernel::CpuSnapshot snapshot = cpu_test_registry->snapshot();
+        cpu_test_registry->descriptor(CpuId{1});
+    const CpuSnapshot snapshot = cpu_test_registry->snapshot();
     return failed != nullptr
-        && failed->state() == kernel::CpuState::Failed
+        && failed->state() == CpuState::Failed
         && failed->failure()
-        && *failed->failure() == kernel::CpuFailure::HsmUnavailable
-        && cpu_test_registry->runtime(kernel::CpuId{1}) == second
+        && *failed->failure() == CpuFailure::HsmUnavailable
+        && cpu_test_registry->runtime(CpuId{1}) == second
         && snapshot.starting == 1
         && snapshot.failed == 1
         && snapshot.possible == 0
@@ -933,23 +867,23 @@ bool test_lifecycle_start_failure_and_snapshot_use_canonical_states(
 
 bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
     CpuStorageGuard storage{};
-    if (!storage.initialize(96)) {
+    if (!storage.initialize(384)) {
         return false;
     }
-    auto begun = kernel::CpuRegistry::begin(
+    auto begun = CpuRegistry::begin(
         cpu_test_registry,
         *cpu_test_pmm,
-        kernel::CpuTopologySummary{2, 0});
+        CpuTopo{2, 0});
     if (!begun) {
         return false;
     }
-    auto builder = libk::move(begun).value();
+    auto builder = std::move(begun).value();
     if (!builder.append(
-            kernel::CpuHardwareId{0},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{0},
+            CpuAvail::Enabled)
         || !builder.append(
-            kernel::CpuHardwareId{4096},
-            kernel::CpuAvailability::Enabled)
+            CpuHwId{4096},
+            CpuAvail::Enabled)
         || !builder.finish()) {
         return false;
     }
@@ -957,90 +891,61 @@ bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
     if (!root) {
         return false;
     }
-    kernel::mm::TranslationState& translation = root->coherence();
-    kernel::CpuProvisioner provisioner{
+    mm::Tlb& translation = root->tlb();
+    CpuSetup provisioner{
         *cpu_test_registry,
         *cpu_test_pmm,
-        *cpu_test_objects,
+        *cpu_test_threads,
         *cpu_test_clock};
     if (!provisioner.prepare(
-            kernel::CpuId{0}, *root, unused_idle_entry)
+            CpuId{0}, *root, unused_idle_entry)
         || !provisioner.prepare(
-            kernel::CpuId{1}, *root, unused_idle_entry)) {
+            CpuId{1}, *root, unused_idle_entry)) {
         return false;
     }
-    kernel::CpuRuntime* const remote =
-        cpu_test_registry->runtime(kernel::CpuId{1});
+    CpuRuntime* const remote =
+        cpu_test_registry->runtime(CpuId{1});
     auto page_result = cpu_test_pmm->allocate_page();
     if (remote == nullptr || !page_result) {
         return false;
     }
-    const kernel::mm::Page page = page_result.value().page();
-    kernel::mm::RetireBatch retired{*cpu_test_pmm};
-    kernel::resource::Charge refund{};
-    if (!retired.adopt(libk::move(page_result).value())) {
+    const mm::Page page = page_result.value().page();
+    mm::Flush retired{*cpu_test_pmm};
+    resource::Charge refund{};
+    if (!retired.adopt(std::move(page_result).value())) {
         return false;
     }
 
-    static_cast<void>(translation.enter(kernel::CpuId{0}));
-    static_cast<void>(translation.enter(kernel::CpuId{1}));
-    kernel::mm::ShootdownTicket ticket{};
-    auto mutation = translation.begin();
-    if (!mutation) {
-        translation.leave(kernel::CpuId{1});
-        translation.leave(kernel::CpuId{0});
-        return false;
-    }
-    auto plan = kernel::mm::ShootdownPlan::prepare(
-        *cpu_test_registry,
-        kernel::CpuId{0},
-        mutation.value().targets());
-    if (!plan) {
-        mutation.value().abort();
-        translation.leave(kernel::CpuId{1});
-        translation.leave(kernel::CpuId{0});
-        return false;
-    }
+    static_cast<void>(translation.enter(CpuId{0}));
+    static_cast<void>(translation.enter(CpuId{1}));
+    auto edit = translation.begin();
     arch::inject_ipi_failures_for_test(2);
-    const auto issued = mutation.value().commit(
-        libk::move(plan).value(), ticket, &retired);
-    const auto retained_retry = kernel::mm::retry_shootdowns(
-        *cpu_test_registry, ticket);
+    const bool complete = edit.commit(retired, &*cpu_test_registry, CpuId{0});
+    const bool retried = retired.kick(*cpu_test_registry);
     arch::inject_ipi_failures_for_test(0);
     const auto held_state = cpu_test_pmm->state_of(page);
-    const bool held = issued != kernel::mm::ShootdownStatus::Complete
-        && retained_retry == kernel::mm::ShootdownRetry::TransportFailure
-        && !ticket.complete()
-        && translation.pending_tickets() == 1
-        && translation.pending_retires() == 1
-        && ticket.acknowledged(kernel::CpuId{0})
-        && !ticket.acknowledged(kernel::CpuId{1})
-        && !retired.release(refund)
-        && held_state
-        && held_state.value() == kernel::mm::PageState::Allocated;
-
-    kernel::mm::drain_shootdowns(*remote);
-    const bool completed = ticket.complete()
-        && ticket.acknowledged(kernel::CpuId{1})
-        && translation.pending_tickets() == 0
-        && translation.pending_retires() == 1
-        && retired.release(refund)
-        && translation.pending_retires() == 0;
+    const bool held = !complete && !retried && !retired.complete()
+        && retired.acknowledged(CpuId{0}) && !retired.acknowledged(CpuId{1})
+        && !retired.release(refund) && held_state
+        && held_state.value() == mm::PageState::Allocated;
+    mm::drain_tlb(remote->local.descriptor->logical_id());
+    const bool completed = retired.complete() && retired.acknowledged(CpuId{1})
+        && retired.release(refund);
     refund.reset();
     const auto released_state = cpu_test_pmm->state_of(page);
-    translation.leave(kernel::CpuId{1});
-    translation.leave(kernel::CpuId{0});
+    translation.leave(CpuId{1});
+    translation.leave(CpuId{0});
     return held
         && completed
         && released_state
-        && released_state.value() == kernel::mm::PageState::Free
+        && released_state.value() == mm::PageState::Free
         && cpu_test_pmm->verify_invariants();
 }
 
-bool test_object_ref_generation_and_pin_reclaim(
+bool test_object_ref_generation_and_reclaim(
     const TestContext&) noexcept {
     CpuStorageGuard storage{};
-    if (!storage.initialize(16)) {
+    if (!storage.initialize(320)) {
         return false;
     }
     auto kernel_vspace = make_test_root();
@@ -1048,96 +953,91 @@ bool test_object_ref_generation_and_pin_reclaim(
         return false;
     }
     {
-        auto warm = kernel::KernelStack::create(*kernel_vspace);
+        auto warm = mm::Stack::create(*kernel_vspace);
         if (!warm) {
             return false;
         }
     }
     const usize free_before = cpu_test_pmm->free_page_count();
-    auto stack = kernel::KernelStack::create(*kernel_vspace);
+    auto stack = mm::Stack::create(*kernel_vspace);
     if (!stack) {
         return false;
     }
-    auto pending = cpu_test_objects->create_thread(
-        libk::move(stack).value(),
-        kernel::ExecutionBinding::kernel(*kernel_vspace),
-        kernel::Thread::KernelStart{unused_idle_entry, nullptr});
+    auto pending = cpu_test_threads->create(
+        std::move(stack).value(),
+        Env::kernel(*kernel_vspace),
+        Thread::KernelStart{unused_idle_entry, nullptr});
     if (!pending) {
         return false;
     }
-    auto owner = libk::move(pending).value().publish();
-    const kernel::object::ObjectId stale = owner.id();
+    auto owner = std::move(pending).value().publish();
+    const object::ObjectId stale = owner.id();
     auto extra = owner.clone();
-    auto ref_result = owner.ref();
-    auto cold_pin = cpu_test_objects->pin_thread(stale);
-    if (!extra || !ref_result || !cold_pin) {
+    auto ref_result = owner.erase();
+    auto lookup = cpu_test_threads->lookup(stale);
+    if (!extra || !ref_result || !lookup) {
         return false;
     }
-    auto ref = libk::move(ref_result).value();
+    auto ref = std::move(ref_result).value();
     auto ref_clone = ref.clone();
-    auto ref_pin = ref.pin<kernel::Thread>();
-    auto wrong_pin = ref.pin<kernel::sched::SchedulingContext>();
+    auto typed = ref.as<Thread>();
+    auto wrong_type = ref.as<sched::Sc>();
     if (ref.id() != stale
-        || ref.kind() != kernel::object::ObjectKind::Thread
+        || ref.kind() != object::ObjectKind::Thread
         || !ref_clone
-        || !ref_pin
-        || wrong_pin
-        || wrong_pin.error() != kernel::object::ObjectError::WrongKind
+        || !typed
+        || wrong_type
+        || wrong_type.error() != object::error::wrong_type
         || !owner.retire()
-        || cpu_test_objects->hold_thread(stale)
-        || cpu_test_objects->pin_thread(stale)
+        || cpu_test_threads->lookup(stale)
         || ref.clone()
-        || ref.pin<kernel::Thread>()) {
+        || ref.as<Thread>()) {
         return false;
     }
-    auto extra_hold = libk::move(extra).value();
-    auto structural_ref = libk::move(ref_clone).value();
-    auto active_cold_pin = libk::move(cold_pin).value();
-    auto active_ref_pin = libk::move(ref_pin).value();
+    auto extra_ref = std::move(extra).value();
+    auto structural_ref = std::move(ref_clone).value();
+    auto first = std::move(lookup).value();
+    auto last = std::move(typed).value();
     usize notifications{};
-    auto notify = [&notifications]() noexcept
-        -> kernel::diag::concurrency::ObservationKey {
-        ++notifications;
-        return {};
-    };
-    cpu_test_objects->bind_reclaim_notifier(
-        kernel::object::ObjectStore::ReclaimNotifier::bind(notify));
+    auto notify = [&notifications]() noexcept { ++notifications; };
+    cpu_test_notify = decltype(cpu_test_notify)::bind(notify);
 
     owner.reset();
-    extra_hold.reset();
+    extra_ref.reset();
     ref.reset();
     structural_ref.reset();
-    cpu_test_objects->drain_reclaim();
+    cpu_test_threads->drain_reclaim();
     if (notifications != 0
-        || active_cold_pin.get().state() != kernel::Thread::State::Prepared
-        || active_ref_pin.get().state() != kernel::Thread::State::Prepared) {
-        cpu_test_objects->unbind_reclaim_notifier();
+        || first.get().state() != Thread::State::Prepared
+        || last.get().state() != Thread::State::Prepared) {
+        cpu_test_notify.reset();
         return false;
     }
-    active_cold_pin.reset();
-    cpu_test_objects->drain_reclaim();
+    first.reset();
+    cpu_test_threads->drain_reclaim();
     if (notifications != 0) {
-        cpu_test_objects->unbind_reclaim_notifier();
+        cpu_test_notify.reset();
         return false;
     }
-    active_ref_pin.reset();
-    cpu_test_objects->drain_reclaim();
+    object::ref<> terminal = std::move(last);
+    const bool transferred = !last && terminal.id() == stale;
+    terminal.reset();
+    cpu_test_threads->drain_reclaim();
 
-    const bool reclaimed = notifications == 1
-        && !cpu_test_objects->hold_thread(stale)
-        && !cpu_test_objects->pin_thread(stale)
+    const bool reclaimed = transferred && notifications == 1
+        && !cpu_test_threads->lookup(stale)
         && cpu_test_pmm->free_page_count() == free_before
         && cpu_test_pmm->verify_invariants();
-    cpu_test_objects->unbind_reclaim_notifier();
+    cpu_test_notify.reset();
     return reclaimed;
 }
 
 bool test_remote_queue_coalesces_without_losing_membership(
     const TestContext&) noexcept {
     usize owner{};
-    kernel::sched::RemoteRequest request{
-        kernel::sched::RemoteKind::Wake, &owner};
-    kernel::sched::RemoteQueue queue{kernel::CpuId{0}};
+    sched::RemoteRequest request{
+        sched::RemoteKind::Wake, &owner};
+    sched::RemoteQueue queue{CpuId{0}};
     const auto first_post = queue.post(request);
     const auto first_signal = queue.claim_transport();
     const auto coalesced = queue.post(request);
@@ -1154,7 +1054,7 @@ bool test_remote_queue_coalesces_without_losing_membership(
     // replacement signal that now owns delivery.
     queue.transport_failed(*first_signal);
     const auto stale_retry = queue.claim_transport();
-    kernel::sched::RemoteRequest* const taken = queue.take();
+    sched::RemoteRequest* const taken = queue.take();
     const auto claimed_cancel = queue.cancel(request);
     const auto second_post = queue.post(request);
     const auto during_signal = queue.claim_transport();
@@ -1162,7 +1062,7 @@ bool test_remote_queue_coalesces_without_losing_membership(
     const bool drained = queue.take() == nullptr;
     const auto third_post = queue.post(request);
     const auto after_drain_signal = queue.claim_transport();
-    kernel::sched::RemoteRequest* const final = queue.take();
+    sched::RemoteRequest* const final = queue.take();
     queue.complete(request);
     const bool final_drained = queue.take() == nullptr;
     const auto fourth_post = queue.post(request);
@@ -1171,22 +1071,22 @@ bool test_remote_queue_coalesces_without_losing_membership(
     const bool canceled_drained = queue.size() == 0;
 
     const bool protocol =
-        first_post.disposition == kernel::sched::RemotePost::Inserted
-        && coalesced.disposition == kernel::sched::RemotePost::Coalesced
-        && second_post.disposition == kernel::sched::RemotePost::Coalesced
-        && third_post.disposition == kernel::sched::RemotePost::Inserted
-        && fourth_post.disposition == kernel::sched::RemotePost::Inserted
+        first_post == sched::RemotePost::Inserted
+        && coalesced == sched::RemotePost::Coalesced
+        && second_post == sched::RemotePost::Coalesced
+        && third_post == sched::RemotePost::Inserted
+        && fourth_post == sched::RemotePost::Inserted
         && first_signal && !duplicate_signal
         && retry_signal
         && retry_signal->generation != first_signal->generation
         && !stale_retry
         && taken == &request
-        && claimed_cancel == kernel::sched::RemoteCancel::AlreadyClaimed
+        && claimed_cancel == sched::RemoteCancel::AlreadyClaimed
         && !during_signal
         && drained && after_drain_signal
         && final == &request && final_drained
-        && queued_cancel == kernel::sched::RemoteCancel::CanceledQueued
-        && canceled_again == kernel::sched::RemoteCancel::NotPending
+        && queued_cancel == sched::RemoteCancel::CanceledQueued
+        && canceled_again == sched::RemoteCancel::NotPending
         && canceled_drained;
     return protocol;
 }
@@ -1201,11 +1101,10 @@ void register_cpu_topology_tests(TestRegistry& registry) noexcept {
     (void)registry.add("cpu-topology", "record blocks cross legacy continuous-array thresholds", test_registry_crosses_legacy_array_thresholds);
     (void)registry.add("cpu-topology", "logical CPU namespace has one explicit bound", test_registry_rejects_unbounded_logical_ids);
     (void)registry.add("cpu-topology", "each stack/object allocation failure leaves runtime unpublished", test_prepare_resource_exhaustion_is_unpublished);
-    (void)registry.add("cpu-topology", "runtime metadata exhaustion leaves association unpublished", test_prepare_metadata_exhaustion_is_unpublished);
     (void)registry.add("cpu-topology", "secondary prepare failure preserves the prepared boot CPU", test_secondary_prepare_failure_preserves_prepared_boot_cpu);
     (void)registry.add("cpu-topology", "prepare publishes one descriptor-backed CpuRuntime", test_prepare_publishes_descriptor_borrow);
     (void)registry.add("cpu-topology", "lifecycle publication and snapshots derive from canonical states", test_lifecycle_start_failure_and_snapshot_use_canonical_states);
     (void)registry.add("cpu-topology", "shootdown acknowledgement controls detached-page retirement", test_shootdown_ack_controls_retirement);
-    (void)registry.add("cpu-topology", "ObjectRef and typed pins share canonical reclaim state", test_object_ref_generation_and_pin_reclaim);
+    (void)registry.add("cpu-topology", "typed references retain retiring objects until final release", test_object_ref_generation_and_reclaim);
     (void)registry.add("cpu-topology", "RemoteQueue retains failed kicks without stale-generation loss", test_remote_queue_coalesces_without_losing_membership);
 }

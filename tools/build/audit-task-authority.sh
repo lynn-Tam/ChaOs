@@ -84,7 +84,7 @@ audit_policy() {
     rg -q 'DescriptorForm::DuplicateRequest' "$input" || return 1
     rg -q 'DescriptorForm::TypedRequest' "$input" || return 1
     rg -q 'valid_descriptor' "$input" || return 1
-    rg -q 'valid_access' "$input" || return 1
+    rg -q 'valid_perms' "$input" || return 1
     rg -q 'valid_types' "$input" || return 1
     rg -q 'inner_count <= outer_base \+ outer_count - inner_base' "$input" || return 1
     rg -q 'requested\.words\[2\] & ~ceiling\.words\[2\]' "$input" || return 1

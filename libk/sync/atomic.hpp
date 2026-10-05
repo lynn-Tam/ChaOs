@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #include <libk/concepts.hpp>
-#include <libk/typetraits.hpp>
+#include <type_traits>
 
 namespace libk {
 
@@ -18,22 +18,22 @@ enum class MemoryOrder : uint8_t {
 namespace atomic_detail {
 
 template<typename T>
-struct IsObjectPointer : false_type {};
+struct IsObjectPointer : std::false_type {};
 
 template<typename T>
-struct IsObjectPointer<T*> : bool_constant<is_object_v<T>> {};
+struct IsObjectPointer<T*> : std::bool_constant<std::is_object_v<T>> {};
 
 template<typename T>
 inline constexpr bool IsObjectPointerV = IsObjectPointer<T>::value;
 
-template<typename T, bool = is_enum_v<T>>
+template<typename T, bool = std::is_enum_v<T>>
 struct StorageType {
     using type = T;
 };
 
 template<typename T>
 struct StorageType<T, true> {
-    using type = underlying_type_t<T>;
+    using type = std::underlying_type_t<T>;
 };
 
 template<typename T>
@@ -51,7 +51,7 @@ template<typename T>
 
 template<typename T>
 inline constexpr bool IsRmwIntegral =
-    is_integral_v<T> && !is_same_v<remove_cv_t<T>, bool>;
+    std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>;
 
 template<MemoryOrder order>
 inline constexpr bool ValidLoadOrder =
@@ -101,9 +101,9 @@ inline constexpr bool ValidCompareExchangeOrders = [] consteval {
 
 template<typename T>
 concept AtomicValue =
-    !is_const_v<T>
-    && !is_volatile_v<T>
-    && (is_integral_v<T> || is_enum_v<T>
+    !std::is_const_v<T>
+    && !std::is_volatile_v<T>
+    && (std::is_integral_v<T> || std::is_enum_v<T>
         || atomic_detail::IsObjectPointerV<T>)
     && (sizeof(T) == 1 || sizeof(T) == 2
         || sizeof(T) == 4 || sizeof(T) == 8)
@@ -275,13 +275,13 @@ void atomic_inc_sat(Atomic<T>& value) noexcept {
 // the sole storage truth, while every concurrent access must use AtomicRef for
 // the duration of the protocol.
 template<typename T>
-concept AtomicRefValue = !is_volatile_v<T>
-    && AtomicValue<remove_const_t<T>>;
+concept AtomicRefValue = !std::is_volatile_v<T>
+    && AtomicValue<std::remove_const_t<T>>;
 
 template<AtomicRefValue T>
 class AtomicRef final {
 public:
-    using value_type = remove_const_t<T>;
+    using value_type = std::remove_const_t<T>;
     static constexpr bool is_always_lock_free = true;
 
     constexpr explicit AtomicRef(T& value) noexcept : value_(&value) {
@@ -295,21 +295,21 @@ public:
     }
 
     template<MemoryOrder order>
-        requires(!is_const_v<T> && atomic_detail::ValidStoreOrder<order>)
+        requires(!std::is_const_v<T> && atomic_detail::ValidStoreOrder<order>)
     void store(value_type desired) noexcept {
         __atomic_store_n(
             value_, desired, atomic_detail::builtin_order<order>());
     }
 
     template<MemoryOrder order>
-        requires(!is_const_v<T>)
+        requires(!std::is_const_v<T>)
     [[nodiscard]] auto exchange(value_type desired) noexcept -> value_type {
         return __atomic_exchange_n(
             value_, desired, atomic_detail::builtin_order<order>());
     }
 
     template<MemoryOrder order>
-        requires(!is_const_v<T>
+        requires(!std::is_const_v<T>
             && atomic_detail::IsRmwIntegral<value_type>)
     [[nodiscard]] auto fetch_add(value_type operand) noexcept -> value_type {
         return __atomic_fetch_add(
@@ -317,7 +317,7 @@ public:
     }
 
     template<MemoryOrder order>
-        requires(!is_const_v<T>
+        requires(!std::is_const_v<T>
             && atomic_detail::IsRmwIntegral<value_type>)
     [[nodiscard]] auto fetch_sub(value_type operand) noexcept -> value_type {
         return __atomic_fetch_sub(
@@ -325,7 +325,7 @@ public:
     }
 
     template<MemoryOrder success, MemoryOrder failure>
-        requires(!is_const_v<T>
+        requires(!std::is_const_v<T>
             && atomic_detail::ValidCompareExchangeOrders<success, failure>)
     [[nodiscard]] auto compare_exchange_strong(
         value_type& expected,

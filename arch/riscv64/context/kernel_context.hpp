@@ -20,8 +20,8 @@
 
 #if !defined(__ASSEMBLER__)
 
-#include <core/types.hpp>
-#include <libk/typetraits.hpp>
+#include <base/types.hpp>
+#include <type_traits>
 #include <stddef.h>
 
 namespace arch::riscv64 {
@@ -43,8 +43,8 @@ struct KernelContext final {
     usize s11{};
 };
 
-static_assert(libk::is_standard_layout_v<KernelContext>);
-static_assert(libk::is_trivially_destructible_v<KernelContext>);
+static_assert(std::is_standard_layout_v<KernelContext>);
+static_assert(std::is_trivially_destructible_v<KernelContext>);
 static_assert(sizeof(KernelContext) == RISCV64_KERNEL_CONTEXT_SIZE);
 static_assert(alignof(KernelContext) == alignof(usize));
 static_assert(offsetof(KernelContext, ra) == RISCV64_KERNEL_CONTEXT_RA_OFFSET);

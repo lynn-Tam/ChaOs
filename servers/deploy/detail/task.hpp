@@ -7,26 +7,26 @@
  * that owner between Builder, TaskTable and ClosingRecord.
  */
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
-#include <libk/variant.hpp>
+#include <optional>
+#include <utility>
+#include <variant>
 #include <servers/deploy/format.h>
 #include <uapi/bootstrap.h>
 #include <uapi/endpoint.h>
 #include <uapi/thread.h>
 #include <uapi/status.h>
-#include <uapi/vproc.h>
 
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/plan.hpp>
 #include <servers/deploy/detail/image.hpp>
 #include <servers/deploy/detail/authority.hpp>
-#include <user/abi/startup.hpp>
+#include <sys/start.hpp>
 
 namespace deploy {
 
@@ -106,7 +106,7 @@ struct SlotProjection final {
             && remote_index != static_cast<size_t>(-1)
             && manager != 0
             && kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT;
+            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
     }
 };
 
@@ -276,9 +276,9 @@ struct TaskConstructionWorkspace final {
         }
     }
 
-    libk::optional<lease_type> domain_leases[
+    std::optional<lease_type> domain_leases[
         DEPLOY_TASK_EXECUTION_MAX]{};
-    libk::optional<lease_type> pager_leases[
+    std::optional<lease_type> pager_leases[
         DEPLOY_TASK_MAPPING_MAX]{};
     image_type image{};
     uintptr_t image_entries[DEPLOY_TASK_IMAGE_MAX]{};
@@ -332,22 +332,20 @@ concept ConstructionBackend = Backend<B>
         myos::cap::CapRef notification,
         myos_word_t words) {
     { B::memory_create_pager(pool, words, words, descriptor) }
-        -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
     { B::sc_create(pool, domain, words, words, words, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { B::sc_bind(domain, target) } -> libk::SameAs<myos_status_t>;
+        -> std::same_as<myos::SysResult>;
+    { B::sc_bind(domain, target) } -> std::same_as<myos_status_t>;
     { B::thread_create(pool, vspace, cspace, descriptor, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { B::vproc_create(pool, vspace, cspace, descriptor, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { B::notification_create(pool, words) } -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
+    { B::notification_create(pool, words) } -> std::same_as<myos::SysResult>;
     { B::channel_create(pool, words, words, words, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { B::pager_create(pool, words, words) } -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
+    { B::pager_create(pool) } -> std::same_as<myos::SysResult>;
     { B::endpoint_create(pool, vspace, cspace, descriptor, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { B::terminal_observe_bind(target, notification, words) }
-        -> libk::SameAs<myos_status_t>;
+        -> std::same_as<myos::SysResult>;
+    { B::exit_bind(target, notification, words) }
+        -> std::same_as<myos_status_t>;
 };
 
 struct TaskProjections final {
@@ -420,26 +418,26 @@ public:
         auto operator=(const Pair&) -> Pair& = delete;
 
         Pair(Pair&& other) noexcept
-            : sender_(libk::move(other.sender_)),
-              receiver_(libk::move(other.receiver_)) {}
+            : sender_(std::move(other.sender_)),
+              receiver_(std::move(other.receiver_)) {}
 
         auto operator=(Pair&& other) noexcept -> Pair& {
             if (this == &other) {
                 return *this;
             }
             cancel();
-            sender_ = libk::move(other.sender_);
-            receiver_ = libk::move(other.receiver_);
+            sender_ = std::move(other.sender_);
+            receiver_ = std::move(other.receiver_);
             return *this;
         }
 
         ~Pair() noexcept { cancel(); }
 
         [[nodiscard]] auto take_sender() noexcept -> Sender {
-            return libk::move(sender_);
+            return std::move(sender_);
         }
         [[nodiscard]] auto take_receiver() noexcept -> Receiver {
-            return libk::move(receiver_);
+            return std::move(receiver_);
         }
 
         void cancel() noexcept {
@@ -585,13 +583,13 @@ public:
             return valid() && set_->cell_state(id_) == CompletionCellState::Ready;
         }
 
-        [[nodiscard]] auto result() const noexcept -> libk::optional<CompletionResult> {
-            return ready() ? libk::optional<CompletionResult>{set_->cell(id_).result} : libk::nullopt;
+        [[nodiscard]] auto result() const noexcept -> std::optional<CompletionResult> {
+            return ready() ? std::optional<CompletionResult>{set_->cell(id_).result} : std::nullopt;
         }
 
-        [[nodiscard]] auto take() noexcept -> libk::optional<CompletionResult> {
+        [[nodiscard]] auto take() noexcept -> std::optional<CompletionResult> {
             if (!ready()) {
-                return libk::nullopt;
+                return std::nullopt;
             }
             CompletionResult result = set_->cell(id_).result;
             set_->recycle(id_);
@@ -637,7 +635,7 @@ public:
         }
     }
 
-    [[nodiscard]] auto reserve() noexcept -> libk::optional<Pair> {
+    [[nodiscard]] auto reserve() noexcept -> std::optional<Pair> {
         for (size_t index = 0; index < Capacity; ++index) {
             Cell& cell = cells_[index];
             if (cell.state != CompletionCellState::Vacant) {
@@ -649,7 +647,7 @@ public:
             cell.result = {};
             return Pair{this, id};
         }
-        return libk::nullopt;
+        return std::nullopt;
     }
 
     [[nodiscard]] auto cell_state(CompletionId id) const noexcept
@@ -772,13 +770,13 @@ public:
 
     CompletionPublication() noexcept = default;
     CompletionPublication(Sender&& sender, CompletionResult result) noexcept
-        : sender_(libk::move(sender)), result_(result), active_(true) {}
+        : sender_(std::move(sender)), result_(result), active_(true) {}
 
     CompletionPublication(const CompletionPublication&) = delete;
     auto operator=(const CompletionPublication&) -> CompletionPublication& = delete;
 
     CompletionPublication(CompletionPublication&& other) noexcept
-        : sender_(libk::move(other.sender_)), result_(other.result_),
+        : sender_(std::move(other.sender_)), result_(other.result_),
           active_(other.active_) {
         other.active_ = false;
     }
@@ -789,7 +787,7 @@ public:
             return *this;
         }
         publish();
-        sender_ = libk::move(other.sender_);
+        sender_ = std::move(other.sender_);
         result_ = other.result_;
         active_ = other.active_;
         other.active_ = false;
@@ -819,7 +817,7 @@ public:
     using backend_type = typename Space::backend_type;
 
     TaskRecord(TaskId id, PlanLease&& plan, uint32_t plan_task) noexcept
-        : id_(id), plan_(libk::move(plan)), plan_task_(plan_task) {
+        : id_(id), plan_(std::move(plan)), plan_task_(plan_task) {
         libk_assert(id_.valid() && plan_.valid() && plan_.task(plan_task_).valid());
     }
 
@@ -827,9 +825,9 @@ public:
     auto operator=(const TaskRecord&) -> TaskRecord& = delete;
 
     TaskRecord(TaskRecord&& other) noexcept
-        : id_(other.id_), state_(other.state_), plan_(libk::move(other.plan_)),
-          plan_task_(other.plan_task_), space_(libk::move(other.space_)),
-          registrations_(libk::move(other.registrations_)),
+        : id_(other.id_), state_(other.state_), plan_(std::move(other.plan_)),
+          plan_task_(other.plan_task_), space_(std::move(other.space_)),
+          registrations_(std::move(other.registrations_)),
           projections_(other.projections_), readiness_(other.readiness_),
           accounting_(other.accounting_),
           readiness_ready_(other.readiness_ready_),
@@ -857,10 +855,10 @@ public:
         }
         id_ = other.id_;
         state_ = other.state_;
-        plan_ = libk::move(other.plan_);
+        plan_ = std::move(other.plan_);
         plan_task_ = other.plan_task_;
-        space_ = libk::move(other.space_);
-        registrations_ = libk::move(other.registrations_);
+        space_ = std::move(other.space_);
+        registrations_ = std::move(other.registrations_);
         projections_ = other.projections_;
         readiness_ = other.readiness_;
         accounting_ = other.accounting_;
@@ -938,7 +936,7 @@ public:
      * rolled back by a later failure. */
     template<typename B = backend_type>
     requires requires(myos::cap::CapRef target) {
-        { B::execution_start(target) } -> libk::SameAs<myos::SysResult>;
+        { B::execution_start(target) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto start() noexcept -> myos_status_t {
         if (state_ != TaskState::Prepared) {
@@ -961,8 +959,7 @@ public:
                 static_cast<void>(transition(TaskState::Failed));
                 return MYOS_STATUS_BAD_ARGS;
             }
-            kinds[index] = execution->model == DEPLOY_EXECUTION_THREAD
-                ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC;
+            kinds[index] = MYOS_OBJECT_KIND_THREAD;
             const SlotProjection& projection = projections_.executions[index];
             const auto target = resolve(projection, kinds[index]);
             if (!target) {
@@ -995,7 +992,7 @@ private:
     [[nodiscard]] auto resolve(
         const SlotProjection& projection,
         myos_object_kind_t expected_kind) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         /* The readiness relation is a TaskTable-owned operation.  Even if a
          * caller reconstructs the same local slot from a public object view,
          * the generic resolver must not disclose that selector. */
@@ -1004,7 +1001,7 @@ private:
             && projection.local.pool == readiness_.local.pool
             && projection.local.index == readiness_.local.index
             && projection.local.kind == readiness_.local.kind) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return resolve_internal(projection, expected_kind);
     }
@@ -1020,7 +1017,7 @@ private:
 
     template<typename B = backend_type>
     requires requires(myos::cap::CapRef notification) {
-        { B::notification_take(notification) } -> libk::SameAs<myos::SysResult>;
+        { B::notification_take(notification) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto consume_readiness() noexcept -> myos_status_t {
         if (readiness() != DEPLOY_READINESS_EXPLICIT
@@ -1046,20 +1043,20 @@ private:
     }
 
     [[nodiscard]] auto terminal_notification() const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (state_ != TaskState::Starting && state_ != TaskState::Running
             && state_ != TaskState::Terminating) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const TaskPlanView task = plan();
         const PlanTask* const row = task.row();
         if (row == nullptr || row->executions.count != 1) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const SlotProjection& relation = projections_.relations[0];
         if (!relation.valid()
             || relation.kind != MYOS_OBJECT_KIND_NOTIFICATION) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return resolve_internal(relation, MYOS_OBJECT_KIND_NOTIFICATION);
     }
@@ -1067,7 +1064,7 @@ private:
 public:
     template<typename B = backend_type>
     requires requires(myos::cap::CapRef target) {
-        { B::terminal_query(target) } -> libk::SameAs<myos::SysResult>;
+        { B::exit_query(target) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto observe_terminal() const noexcept -> myos::SysResult {
         if (state_ != TaskState::Starting && state_ != TaskState::Running
@@ -1087,13 +1084,12 @@ public:
             return myos::SysResult{.status = MYOS_STATUS_BAD_ARGS};
         }
         const myos_object_kind_t kind =
-            execution->model == DEPLOY_EXECUTION_THREAD
-            ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC;
+            MYOS_OBJECT_KIND_THREAD;
         const auto target = resolve(projections_.executions[0], kind);
         if (!target) {
             return myos::SysResult{.status = MYOS_STATUS_INVALID_CAP};
         }
-        return B::terminal_query(target.value());
+        return B::exit_query(target.value());
     }
 
     /* Admit one fresh kernel terminal generation.  Repeated or stale
@@ -1133,31 +1129,31 @@ private:
     [[nodiscard]] auto register_prepared_export(
         Authorities& authorities,
         uint32_t export_index,
-        uint64_t identity) noexcept -> libk::optional<AuthorityId> {
+        uint64_t identity) noexcept -> std::optional<AuthorityId> {
         if (state_ != TaskState::Prepared) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const TaskPlanView task = plan();
         const PlanTask* const row = task.row();
         if (row == nullptr || export_index >= row->exports.count
             || export_index >= DEPLOY_TASK_EXPORT_MAX) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const PlanExport* const export_row =
             task.export_record(export_index);
         if (export_row == nullptr
             || export_row->source_class != DEPLOY_EXPORT_PREPARED_KEY
             || !valid_authority_ceiling(export_row->ceiling)) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const SourceProjection& projection = projections_.exports[export_index];
         if (!projection.valid()
             || projection.kind != export_row->ceiling.kind) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto source = resolve_source(projection, projection.kind);
         if (!source || source->cspace != 0) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return registrations_.register_source(
             authorities, source.value(), identity, export_row->ceiling);
@@ -1170,11 +1166,11 @@ private:
     friend class TaskBuilder;
 
     [[nodiscard]] auto resolve_readiness() const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (readiness_.projection != ProjectionKind::Local
             || !readiness_.valid()
             || readiness_.kind != MYOS_OBJECT_KIND_NOTIFICATION) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return space_.lookup(readiness_.local, MYOS_OBJECT_KIND_NOTIFICATION);
     }
@@ -1182,15 +1178,15 @@ private:
     [[nodiscard]] auto resolve_internal(
         const SlotProjection& projection,
         myos_object_kind_t expected_kind) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (!projection.valid()) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (projection.projection == ProjectionKind::Local) {
             return space_.lookup(projection.local, expected_kind);
         }
         if (projection.kind != expected_kind) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return space_.lookup_remote(
             projection.remote_index, projection.manager);
@@ -1199,13 +1195,13 @@ private:
     [[nodiscard]] auto resolve_source(
         const SourceProjection& projection,
         myos_object_kind_t expected_kind) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (!projection.valid() || projection.kind != expected_kind) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (projection.projection == SourceProjectionKind::Pool) {
             return expected_kind == MYOS_OBJECT_KIND_RESOURCE_POOL
-                ? space_.pool() : libk::nullopt;
+                ? space_.pool() : std::nullopt;
         }
         return space_.lookup(projection.local, expected_kind);
     }
@@ -1302,8 +1298,8 @@ public:
             uint32_t plan_task,
             sender_type&& sender
             ) noexcept
-            : record_(id, libk::move(plan), plan_task),
-              sender_(libk::move(sender)) {}
+            : record_(id, std::move(plan), plan_task),
+              sender_(std::move(sender)) {}
 
         ClosingRecord(const ClosingRecord&) = delete;
         auto operator=(const ClosingRecord&) -> ClosingRecord& = delete;
@@ -1361,7 +1357,7 @@ public:
             return sender_.cancel();
         }
         [[nodiscard]] auto take_sender() noexcept -> sender_type {
-            return libk::move(sender_);
+            return std::move(sender_);
         }
 
         Record record_;
@@ -1387,14 +1383,14 @@ private:
             PlanLease&& plan,
             uint32_t plan_task,
             sender_type&& sender) noexcept
-            : closing(id, libk::move(plan), plan_task, libk::move(sender)) {}
+            : closing(id, std::move(plan), plan_task, std::move(sender)) {}
 
         ClosingRecord closing;
     };
 
     struct RetiredSlot final {};
 
-    using SlotPayload = libk::variant<VacantSlot, ActiveSlot, RetiredSlot>;
+    using SlotPayload = std::variant<VacantSlot, ActiveSlot, RetiredSlot>;
 
     struct Slot final {
         uint32_t generation{1};
@@ -1523,12 +1519,12 @@ private:
     [[nodiscard]] auto reserve(
         sender_type&& sender,
         PlanLease&& plan,
-        uint32_t plan_task) noexcept -> libk::optional<Reservation> {
+        uint32_t plan_task) noexcept -> std::optional<Reservation> {
         if (!sender.valid() || !plan.valid()) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (!plan.task(plan_task).valid()) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         for (size_t index = 0; index < Capacity; ++index) {
             Slot& slot = slots_[index];
@@ -1537,10 +1533,10 @@ private:
             }
             const TaskId id{static_cast<uint32_t>(index), slot.generation};
             slot.payload.template emplace<ActiveSlot>(
-                id, libk::move(plan), plan_task, libk::move(sender));
+                id, std::move(plan), plan_task, std::move(sender));
             return Reservation{this, id};
         }
-        return libk::nullopt;
+        return std::nullopt;
     }
 
 public:
@@ -1554,7 +1550,7 @@ public:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Record) {
             return nullptr;
         }
-        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         return payload == nullptr ? nullptr : &payload->closing.record();
     }
 
@@ -1563,7 +1559,7 @@ public:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Record) {
             return nullptr;
         }
-        const auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        const auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         return payload == nullptr ? nullptr : &payload->closing.record();
     }
 
@@ -1572,7 +1568,7 @@ public:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Closing) {
             return nullptr;
         }
-        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         return payload == nullptr ? nullptr : &payload->closing;
     }
 
@@ -1587,7 +1583,7 @@ public:
 
     template<typename B = typename record_type::backend_type>
     requires requires(myos::cap::CapRef target) {
-        { B::execution_start(target) } -> libk::SameAs<myos::SysResult>;
+        { B::execution_start(target) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto start(TaskId id) noexcept -> myos_status_t {
         Record* const record_ptr = record(id);
@@ -1597,7 +1593,7 @@ public:
 
     template<typename B = typename record_type::backend_type>
     requires requires(myos::cap::CapRef target) {
-        { B::terminal_query(target) } -> libk::SameAs<myos::SysResult>;
+        { B::exit_query(target) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto observe_terminal(TaskId id) const noexcept -> myos::SysResult {
         const Record* const record_ptr = record(id);
@@ -1611,10 +1607,10 @@ public:
      * caller cannot recover readiness or Prepared-export selectors from its
      * immutable projections. */
     [[nodiscard]] auto terminal_notification(TaskId id) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         const Record* const record_ptr = record(id);
         return record_ptr == nullptr
-            ? libk::nullopt : record_ptr->terminal_notification();
+            ? std::nullopt : record_ptr->terminal_notification();
     }
 
     [[nodiscard]] auto consume_terminal(
@@ -1628,7 +1624,7 @@ public:
 
     template<typename B = typename record_type::backend_type>
     requires requires(myos::cap::CapRef notification) {
-        { B::notification_take(notification) } -> libk::SameAs<myos::SysResult>;
+        { B::notification_take(notification) } -> std::same_as<myos::SysResult>;
     }
     [[nodiscard]] auto consume_readiness(TaskId id) noexcept -> myos_status_t {
         Record* const record_ptr = record(id);
@@ -1651,14 +1647,14 @@ public:
         TaskId id,
         uint32_t export_index,
         Authorities& authorities) noexcept
-        -> libk::optional<AuthorityId> {
+        -> std::optional<AuthorityId> {
         Record* const record_ptr = record(id);
         if (record_ptr == nullptr) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto identity = export_identity(id, export_index);
         if (!identity) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return record_ptr->register_prepared_export(
             authorities, export_index, identity.value());
@@ -1679,7 +1675,7 @@ public:
             || !record_ptr->transition(TaskState::Terminating)) {
             return false;
         }
-        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         return payload != nullptr
             && payload->closing.begin_close(reason, status);
     }
@@ -1692,7 +1688,7 @@ public:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Record) {
             return false;
         }
-        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         if (payload == nullptr
             || !payload->closing.begin_close(reason, status)) {
             return false;
@@ -1705,7 +1701,7 @@ public:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Closing) {
             return MYOS_STATUS_INVALID_CAP;
         }
-        auto* payload = libk::get_if<ActiveSlot>(&slot->payload);
+        auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         if (payload == nullptr) {
             return MYOS_STATUS_INVALID_CAP;
         }
@@ -1750,26 +1746,26 @@ public:
 private:
     [[nodiscard]] static auto export_identity(
         TaskId id,
-        uint32_t export_index) noexcept -> libk::optional<uint64_t> {
+        uint32_t export_index) noexcept -> std::optional<uint64_t> {
         if (!id.valid() || id.slot >= Capacity
             || export_index >= DEPLOY_TASK_EXPORT_MAX) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto generation = libk::checked_multiply<uint64_t>(
             static_cast<uint64_t>(id.generation),
             static_cast<uint64_t>(Capacity));
         if (!generation) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto slot = libk::checked_add<uint64_t>(
             generation.value(), static_cast<uint64_t>(id.slot));
         if (!slot) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const auto row = libk::checked_multiply<uint64_t>(
             slot.value(), static_cast<uint64_t>(DEPLOY_TASK_EXPORT_MAX));
         if (!row) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return libk::checked_add<uint64_t>(
             row.value(), static_cast<uint64_t>(export_index));
@@ -1777,10 +1773,10 @@ private:
 
     [[nodiscard]] static auto slot_tag(const Slot& slot) noexcept
         -> TaskSlotTag {
-        if (libk::holds_alternative<VacantSlot>(slot.payload)) {
+        if (std::holds_alternative<VacantSlot>(slot.payload)) {
             return TaskSlotTag::Vacant;
         }
-        if (const auto* active = libk::get_if<ActiveSlot>(&slot.payload)) {
+        if (const auto* active = std::get_if<ActiveSlot>(&slot.payload)) {
             switch (active->closing.record().state()) {
             case TaskState::Constructing:
                 return TaskSlotTag::Reserved;
@@ -1823,7 +1819,7 @@ private:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Reserved) {
             return nullptr;
         }
-        ActiveSlot* active = libk::get_if<ActiveSlot>(&slot->payload);
+        ActiveSlot* active = std::get_if<ActiveSlot>(&slot->payload);
         return active == nullptr ? nullptr : &active->closing.record();
     }
 
@@ -1833,7 +1829,7 @@ private:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Reserved) {
             return nullptr;
         }
-        const ActiveSlot* active = libk::get_if<ActiveSlot>(&slot->payload);
+        const ActiveSlot* active = std::get_if<ActiveSlot>(&slot->payload);
         return active == nullptr ? nullptr : &active->closing.record();
     }
 
@@ -1842,7 +1838,7 @@ private:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Reserved) {
             return false;
         }
-        ActiveSlot* active = libk::get_if<ActiveSlot>(&slot->payload);
+        ActiveSlot* active = std::get_if<ActiveSlot>(&slot->payload);
         if (active == nullptr || !active->closing.cancel_sender()) {
             return false;
         }
@@ -1856,7 +1852,7 @@ private:
             || !reservation.record().transition(TaskState::Prepared)) {
             return false;
         }
-        ActiveSlot* active = libk::get_if<ActiveSlot>(&slot->payload);
+        ActiveSlot* active = std::get_if<ActiveSlot>(&slot->payload);
         if (active == nullptr) {
             return false;
         }
@@ -1875,7 +1871,7 @@ private:
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Reserved) {
             return false;
         }
-        ActiveSlot* active = libk::get_if<ActiveSlot>(&slot->payload);
+        ActiveSlot* active = std::get_if<ActiveSlot>(&slot->payload);
         if (active == nullptr || !active->closing.begin_close(reason, status)) {
             return false;
         }
@@ -1905,8 +1901,8 @@ public:
     auto operator=(const TaskBuilder&) -> TaskBuilder& = delete;
 
     TaskBuilder(TaskBuilder&& other) noexcept
-        : table_(other.table_), reservation_(libk::move(other.reservation_)),
-          receiver_(libk::move(other.receiver_)) {
+        : table_(other.table_), reservation_(std::move(other.reservation_)),
+          receiver_(std::move(other.receiver_)) {
         other.table_ = nullptr;
     }
 
@@ -1916,8 +1912,8 @@ public:
         }
         abandon();
         table_ = other.table_;
-        reservation_ = libk::move(other.reservation_);
-        receiver_ = libk::move(other.receiver_);
+        reservation_ = std::move(other.reservation_);
+        receiver_ = std::move(other.receiver_);
         other.table_ = nullptr;
         return *this;
     }
@@ -1928,29 +1924,29 @@ public:
         completion_set_type& completions,
         table_type& table,
         PlanLease&& plan,
-        uint32_t plan_task) noexcept -> libk::optional<TaskBuilder> {
+        uint32_t plan_task) noexcept -> std::optional<TaskBuilder> {
         const TaskPlanView task = plan.task(plan_task);
         if (!task.valid() || !imports_admissible(task)) {
             // Move is a reserved wire value, not an immediate syscall mode.
             // Reject before CompletionSet or TaskTable reservation so this
             // policy has no resource, lease or publication side effect.
-            return libk::nullopt;
+            return std::nullopt;
         }
         auto pair = completions.reserve();
         if (!pair) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         auto sender = pair->take_sender();
         auto receiver = pair->take_receiver();
         auto reservation = table.reserve(
-            libk::move(sender), libk::move(plan), plan_task);
+            std::move(sender), std::move(plan), plan_task);
         if (!reservation) {
             static_cast<void>(receiver.detach());
             static_cast<void>(sender.cancel());
-            return libk::nullopt;
+            return std::nullopt;
         }
         return TaskBuilder{
-            &table, libk::move(*reservation), libk::move(receiver)};
+            &table, std::move(*reservation), std::move(receiver)};
     }
 
     [[nodiscard]] auto valid() const noexcept -> bool {
@@ -2040,7 +2036,7 @@ public:
                 || lease->ceiling().kind != MYOS_OBJECT_KIND_SCHED_DOMAIN) {
                 return MYOS_STATUS_DENIED;
             }
-            workspace.domain_leases[index] = libk::move(*lease);
+            workspace.domain_leases[index] = std::move(*lease);
         }
         for (uint32_t index = 0; index < row->mappings.count; ++index) {
             const PlanMapping* const mapping = task.mapping(index);
@@ -2060,7 +2056,7 @@ public:
                 || lease->ceiling().kind != MYOS_OBJECT_KIND_PAGER) {
                 return MYOS_STATUS_DENIED;
             }
-            workspace.pager_leases[index] = libk::move(*lease);
+            workspace.pager_leases[index] = std::move(*lease);
         }
 
         if (!input.bundle || input.bundle->phase() != LeasePhase::Mapped) {
@@ -2186,7 +2182,7 @@ public:
                 return result.status;
             }
             const auto slot = record.space().adopt_local(
-                libk::move(owner), kind);
+                std::move(owner), kind);
             if (!slot) {
                 static_cast<void>(close_owner(owner));
                 return MYOS_STATUS_NO_MEMORY;
@@ -2255,7 +2251,7 @@ public:
                     && !key.equals(readiness_key)) {
                     if (!*input.terminal_notification) return failure(MYOS_STATUS_BAD_ARGS);
                     const auto adopted = record.space().adopt_local(
-                        libk::move(*input.terminal_notification), MYOS_OBJECT_KIND_NOTIFICATION);
+                        std::move(*input.terminal_notification), MYOS_OBJECT_KIND_NOTIFICATION);
                     if (!adopted) return failure(MYOS_STATUS_NO_MEMORY);
                     slot = *adopted;
                     status = MYOS_STATUS_OK;
@@ -2288,7 +2284,7 @@ public:
                     break;
                 }
                 const auto first_slot = record.space().adopt_local(
-                    libk::move(first), object->kind);
+                    std::move(first), object->kind);
                 if (!first_slot) {
                     static_cast<void>(close_owner(first));
                     static_cast<void>(close_owner(second));
@@ -2296,7 +2292,7 @@ public:
                     break;
                 }
                 const auto second_slot = record.space().adopt_local(
-                    libk::move(second), object->kind);
+                    std::move(second), object->kind);
                 if (!second_slot) {
                     static_cast<void>(close_owner(second));
                     status = MYOS_STATUS_NO_MEMORY;
@@ -2310,7 +2306,7 @@ public:
             case MYOS_OBJECT_KIND_PAGER:
                 status = adopt_result(
                     backend_type::pager_create(
-                        pool.value(), object->args[0], object->args[1]),
+                        pool.value()),
                     object->kind, slot);
                 break;
             default:
@@ -2698,7 +2694,7 @@ public:
                     binding.authority = input.bindings->imports[imported + index];
                     if (import->source_class == DEPLOY_IMPORT_SOURCE_TASK_KEY) {
                         const ByteView source_key = task.symbol(import->source);
-                        libk::optional<myos::cap::CapRef> source{};
+                        std::optional<myos::cap::CapRef> source{};
                         const auto matches = [source_key](ByteView candidate)
                             noexcept -> bool {
                             return source_key.size() != 0
@@ -2759,10 +2755,7 @@ public:
                             }
                             consider(task.symbol(execution_row->key),
                                      projections.executions[execution],
-                                     execution_row->model
-                                         == DEPLOY_EXECUTION_THREAD
-                                     ? MYOS_OBJECT_KIND_THREAD
-                                     : MYOS_OBJECT_KIND_VPROC);
+                                     MYOS_OBJECT_KIND_THREAD);
                             consider(task.symbol(execution_row->sc),
                                      projections.scheduling_contexts[execution],
                                      MYOS_OBJECT_KIND_SCHED_CONTEXT);
@@ -3131,7 +3124,7 @@ public:
                     const PlanMapping* const ipc_mapping =
                         task.mapping(ipc_mapping_index);
                     const auto ipc = ipc_mapping == nullptr
-                        ? libk::optional<myos::cap::CapRef>{}
+                        ? std::optional<myos::cap::CapRef>{}
                         : record.resolve_internal(
                             projections.mappings[ipc_mapping_index],
                             MYOS_OBJECT_KIND_MEMORY);
@@ -3159,68 +3152,6 @@ public:
                               projections.executions[index].local)
                         : MYOS_STATUS_INVALID_CAP;
                 }
-            } else if (execution->model == DEPLOY_EXECUTION_VPROC) {
-                if (execution->control == DEPLOY_NO_INDEX
-                    || execution->event == DEPLOY_NO_INDEX) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
-                }
-                const uint32_t control_mapping_index =
-                    mapping_local(execution->control);
-                const uint32_t event_mapping_index =
-                    mapping_local(execution->event);
-                if (control_mapping_index == DEPLOY_NO_INDEX
-                    || event_mapping_index == DEPLOY_NO_INDEX) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
-                }
-                const PlanMapping* const control_mapping =
-                    task.mapping(control_mapping_index);
-                const PlanMapping* const event_mapping =
-                    task.mapping(event_mapping_index);
-                const auto control = control_mapping == nullptr
-                    ? libk::optional<myos::cap::CapRef>{}
-                    : record.resolve_internal(
-                        projections.mappings[control_mapping_index],
-                        MYOS_OBJECT_KIND_MEMORY);
-                const auto event = event_mapping == nullptr
-                    ? libk::optional<myos::cap::CapRef>{}
-                    : record.resolve_internal(
-                        projections.mappings[event_mapping_index],
-                        MYOS_OBJECT_KIND_MEMORY);
-                if (!control || !event || control_mapping == nullptr
-                    || event_mapping == nullptr) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
-                }
-                myos_vproc_start descriptor{};
-                descriptor.version = MYOS_VPROC_START_VERSION;
-                descriptor.flags = 0;
-                descriptor.entry = entry;
-                descriptor.stack = execution->stack_top;
-                descriptor.arguments[0] = mapping_addresses[
-                    bootstrap_mapping_index];
-                descriptor.arguments[1] = mapping_sizes[
-                    bootstrap_mapping_index];
-                descriptor.control_memory = control->selector;
-                descriptor.control_page = mapping_first[control_mapping_index];
-                descriptor.control_address = mapping_addresses[
-                    control_mapping_index];
-                descriptor.event_memory = event->selector;
-                descriptor.event_page = mapping_first[event_mapping_index];
-                descriptor.event_address = mapping_addresses[
-                    event_mapping_index];
-                status = materializer.materialize_descriptor(
-                    &descriptor, sizeof(descriptor), descriptor_slot);
-                if (status == MYOS_STATUS_OK) {
-                    const auto descriptor_ref = record.space().lookup(
-                        descriptor_slot, MYOS_OBJECT_KIND_MEMORY);
-                    status = descriptor_ref
-                        ? adopt_result(
-                              backend_type::vproc_create(
-                                  pool.value(), vspace.value(), cspace.value(),
-                                  descriptor_ref.value(), 0),
-                              MYOS_OBJECT_KIND_VPROC,
-                              projections.executions[index].local)
-                        : MYOS_STATUS_INVALID_CAP;
-                }
             } else {
                 status = MYOS_STATUS_BAD_ARGS;
             }
@@ -3241,8 +3172,7 @@ public:
             const auto execution_ref = record.resolve_internal(
                 projections.executions[index],
                 static_cast<myos_object_kind_t>(
-                    execution->model == DEPLOY_EXECUTION_THREAD
-                        ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC));
+                    MYOS_OBJECT_KIND_THREAD));
             const auto create_context = [&](uint32_t cpu) noexcept {
                 return backend_type::sc_create(
                     pool.value(), workspace.domain_leases[index]->source(),
@@ -3288,7 +3218,7 @@ public:
                     return failure(MYOS_STATUS_INVALID_CAP);
                 }
                 const myos_status_t terminal_status =
-                    backend_type::terminal_observe_bind(
+                    backend_type::exit_bind(
                         execution_ref.value(), notification.value(),
                         relation_badge);
                 if (terminal_status != MYOS_STATUS_OK) {
@@ -3382,11 +3312,11 @@ public:
         return MYOS_STATUS_OK;
     }
     [[nodiscard]] auto take_receiver() noexcept
-        -> libk::optional<receiver_type> {
+        -> std::optional<receiver_type> {
         if (!receiver_) {
-            return libk::nullopt;
+            return std::nullopt;
         }
-        auto result = libk::move(*receiver_);
+        auto result = std::move(*receiver_);
         receiver_.reset();
         return result;
     }
@@ -3654,10 +3584,7 @@ private:
                 if (execution_row == nullptr
                     || !check_slot(task.symbol(execution_row->key),
                                    projections.executions[execution],
-                                   execution_row->model
-                                           == DEPLOY_EXECUTION_THREAD
-                                       ? MYOS_OBJECT_KIND_THREAD
-                                       : MYOS_OBJECT_KIND_VPROC)
+                                   MYOS_OBJECT_KIND_THREAD)
                     || !check_slot(task.symbol(execution_row->sc),
                                    projections.scheduling_contexts[execution],
                                    MYOS_OBJECT_KIND_SCHED_CONTEXT)) {
@@ -3760,8 +3687,7 @@ private:
         for (uint32_t index = 0; index < row->executions.count; ++index) {
             const PlanExecution* execution = task.execution(index);
             const myos_object_kind_t execution_kind = execution != nullptr
-                && execution->model == DEPLOY_EXECUTION_THREAD
-                ? MYOS_OBJECT_KIND_THREAD : MYOS_OBJECT_KIND_VPROC;
+                && MYOS_OBJECT_KIND_THREAD;
             if (execution == nullptr || !projections.executions[index].valid()
                 || !record.resolve_internal(projections.executions[index], execution_kind)
                 || !projections.scheduling_contexts[index].valid()
@@ -3817,8 +3743,8 @@ private:
         table_type* table,
         reservation_type&& reservation,
         receiver_type&& receiver) noexcept
-        : table_(table), reservation_(libk::move(reservation)),
-          receiver_(libk::move(receiver)) {}
+        : table_(table), reservation_(std::move(reservation)),
+          receiver_(std::move(receiver)) {}
 
     void abandon() noexcept {
         if (!reservation_ || !reservation_->valid()) {
@@ -3846,8 +3772,8 @@ private:
     }
 
     table_type* table_{};
-    libk::optional<reservation_type> reservation_{};
-    libk::optional<receiver_type> receiver_{};
+    std::optional<reservation_type> reservation_{};
+    std::optional<receiver_type> receiver_{};
 };
 
 } // namespace deploy

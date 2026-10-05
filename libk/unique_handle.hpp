@@ -3,16 +3,17 @@
 // Move-only RAII wrapper for non-pointer resource handles.
 // EmptyPolicy supplies static empty() and is_empty(handle); DefaultEmptyValue uses T{}.
 
+#include <concepts>
 #include <libk/concepts.hpp>
-#include <libk/typetraits.hpp>
-#include <libk/utility.hpp>
+#include <type_traits>
+#include <utility>
 
 namespace libk {
 
 template<typename HandleT>
 struct DefaultEmptyValue {
     [[nodiscard]] static constexpr HandleT empty() noexcept(
-        is_nothrow_default_constructible_v<HandleT>) {
+        std::is_nothrow_default_constructible_v<HandleT>) {
         return HandleT{};
     }
 
@@ -39,12 +40,12 @@ template<
     typename DeleterT,
     typename EmptyPolicy = DefaultEmptyValue<HandleT>>
 class unique_handle {
-    static_assert(is_move_constructible_v<HandleT>
-                  && is_move_assignable_v<HandleT>,
+    static_assert(std::is_move_constructible_v<HandleT>
+                  && std::is_move_assignable_v<HandleT>,
                   "unique_handle requires a movable handle type");
     static_assert(requires(const HandleT& handle) {
-        { EmptyPolicy::empty() } -> ConvertibleTo<HandleT>;
-        { EmptyPolicy::is_empty(handle) } -> ConvertibleTo<bool>;
+        { EmptyPolicy::empty() } -> std::convertible_to<HandleT>;
+        { EmptyPolicy::is_empty(handle) } -> std::convertible_to<bool>;
     }, "EmptyPolicy must provide static empty() and is_empty(handle)");
     static_assert(requires(DeleterT& deleter, HandleT& handle) {
         deleter(handle);
@@ -67,40 +68,40 @@ public:
 
     constexpr unique_handle()
         noexcept(noexcept(empty_value())
-                 && is_nothrow_default_constructible_v<deleter_type>)
+                 && std::is_nothrow_default_constructible_v<deleter_type>)
         : handle_(empty_value()), deleter_{} {}
 
     constexpr explicit unique_handle(handle_type handle)
-        noexcept(is_nothrow_move_constructible_v<handle_type>
-                 && is_nothrow_default_constructible_v<deleter_type>)
-        : handle_(libk::move(handle)), deleter_{} {}
+        noexcept(std::is_nothrow_move_constructible_v<handle_type>
+                 && std::is_nothrow_default_constructible_v<deleter_type>)
+        : handle_(std::move(handle)), deleter_{} {}
 
     constexpr unique_handle(handle_type handle, const deleter_type& deleter)
-        noexcept(is_nothrow_move_constructible_v<handle_type>
-                 && is_nothrow_copy_constructible_v<deleter_type>)
-        : handle_(libk::move(handle)), deleter_(deleter) {}
+        noexcept(std::is_nothrow_move_constructible_v<handle_type>
+                 && std::is_nothrow_copy_constructible_v<deleter_type>)
+        : handle_(std::move(handle)), deleter_(deleter) {}
 
     constexpr unique_handle(handle_type handle, deleter_type&& deleter)
-        noexcept(is_nothrow_move_constructible_v<handle_type>
-                 && is_nothrow_move_constructible_v<deleter_type>)
-        : handle_(libk::move(handle)), deleter_(libk::move(deleter)) {}
+        noexcept(std::is_nothrow_move_constructible_v<handle_type>
+                 && std::is_nothrow_move_constructible_v<deleter_type>)
+        : handle_(std::move(handle)), deleter_(std::move(deleter)) {}
 
     unique_handle(const unique_handle&) = delete;
     unique_handle& operator=(const unique_handle&) = delete;
 
     constexpr unique_handle(unique_handle&& other)
         noexcept(noexcept(other.release())
-                 && is_nothrow_move_constructible_v<deleter_type>)
-        : handle_(other.release()), deleter_(libk::move(other.deleter_)) {}
+                 && std::is_nothrow_move_constructible_v<deleter_type>)
+        : handle_(other.release()), deleter_(std::move(other.deleter_)) {}
 
     constexpr unique_handle& operator=(unique_handle&& other)
         noexcept(noexcept(reset(other.release()))
-                 && is_nothrow_move_assignable_v<deleter_type>) {
+                 && std::is_nothrow_move_assignable_v<deleter_type>) {
         if (this == &other) {
             return *this;
         }
         reset(other.release());
-        deleter_ = libk::move(other.deleter_);
+        deleter_ = std::move(other.deleter_);
         return *this;
     }
 
@@ -126,10 +127,10 @@ public:
     }
 
     [[nodiscard]] constexpr handle_type release()
-        noexcept(is_nothrow_move_constructible_v<handle_type>
-                 && is_nothrow_assignable_v<handle_type&, handle_type>
+        noexcept(std::is_nothrow_move_constructible_v<handle_type>
+                 && std::is_nothrow_assignable_v<handle_type&, handle_type>
                  && noexcept(empty_value())) {
-        handle_type old = libk::move(handle_);
+        handle_type old = std::move(handle_);
         handle_ = empty_value();
         return old;
     }
@@ -137,8 +138,8 @@ public:
     constexpr void reset(handle_type replacement = empty_value())
         noexcept(noexcept(EmptyPolicy::is_empty(handle_))
                  && noexcept(deleter_(handle_))
-                 && is_nothrow_move_constructible_v<handle_type>
-                 && is_nothrow_move_assignable_v<handle_type>
+                 && std::is_nothrow_move_constructible_v<handle_type>
+                 && std::is_nothrow_move_assignable_v<handle_type>
                  && equality_is_nothrow_) {
         if constexpr (has_equality_) {
             if (handle_ == replacement) {
@@ -146,18 +147,18 @@ public:
             }
         }
 
-        handle_type old = libk::move(handle_);
-        handle_ = libk::move(replacement);
+        handle_type old = std::move(handle_);
+        handle_ = std::move(replacement);
         if (!EmptyPolicy::is_empty(old)) {
             deleter_(old);
         }
     }
 
     constexpr void swap(unique_handle& other)
-        noexcept(noexcept(libk::swap(handle_, other.handle_))
-                 && noexcept(libk::swap(deleter_, other.deleter_))) {
-        libk::swap(handle_, other.handle_);
-        libk::swap(deleter_, other.deleter_);
+        noexcept(noexcept(std::swap(handle_, other.handle_))
+                 && noexcept(std::swap(deleter_, other.deleter_))) {
+        std::swap(handle_, other.handle_);
+        std::swap(deleter_, other.deleter_);
     }
 
     [[nodiscard]] static constexpr handle_type empty_value()
@@ -177,8 +178,5 @@ template<typename H, typename D, typename P>
     noexcept(noexcept(lhs.get() == rhs.get())) {
     return lhs.get() == rhs.get();
 }
-
-template<typename HandleT, typename DeleterT, typename EmptyPolicy = DefaultEmptyValue<HandleT>>
-using UniqueHandle = unique_handle<HandleT, DeleterT, EmptyPolicy>;
 
 } // namespace libk

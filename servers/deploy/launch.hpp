@@ -1,12 +1,16 @@
 #pragma once
 
+#include <optional>
+#include <utility>
+
+
 #include <libk/noncopyable.hpp>
 #include <libk/scope_guard.hpp>
 #include <libk/span.hpp>
-#include <user/abi/objects.hpp>
+#include <sys/handle.hpp>
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/task.hpp>
-#include <user/server_rt/service.hpp>
+#include <servers/runtime/service.hpp>
 
 namespace deploy {
 
@@ -73,7 +77,7 @@ class tasks final {
         return {};
     }
     auto discard(TaskId id, myos_status_t status,
-                 libk::optional<typename Completions::Receiver>& receiver) noexcept -> bool {
+                 std::optional<typename Completions::Receiver>& receiver) noexcept -> bool {
         if (!receiver || !receiver->valid()) return false;
         for (;;) {
             const auto closed = table_.continue_close(id);
@@ -92,7 +96,7 @@ class tasks final {
 public:
     struct handle final {
         TaskId id{};
-        libk::optional<typename Completions::Receiver> receiver{};
+        std::optional<typename Completions::Receiver> receiver{};
         // Borrowed receive authority supplied by the caller. TaskSpace retains
         // only Signal for terminal publication; it cannot receive this event.
         myos_cap_t events{};
@@ -130,7 +134,7 @@ public:
             return MYOS_STATUS_BAD_ARGS;
         auto decoded = program.plans_.decode(parsed.value());
         if (!decoded) return MYOS_STATUS_BAD_ARGS;
-        program.plan_ = libk::move(decoded.value());
+        program.plan_ = std::move(decoded.value());
         myos_word_t scratch_size = 0;
         auto lease = program.plan_.lease();
         if (!lease) return MYOS_STATUS_INTERNAL;
@@ -203,30 +207,30 @@ public:
         return MYOS_STATUS_OK;
     }
     auto launch(program& program, ByteView name, myos_status_t& status, options options = {},
-                libk::Span<const handle*> providers = {}) noexcept -> libk::optional<handle> {
+                libk::Span<const handle*> providers = {}) noexcept -> std::optional<handle> {
         status = MYOS_STATUS_BAD_ARGS;
         const auto index = program.plan_.find_task(name);
         auto lease = program.plan_.lease();
-        if (!index || !lease) return libk::nullopt;
+        if (!index || !lease) return std::nullopt;
         auto task = lease->task(*index);
-        if (options.admit != nullptr && !options.admit(task, name)) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+        if (options.admit != nullptr && !options.admit(task, name)) { status = MYOS_STATUS_DENIED; return std::nullopt; }
         myos::bootstrap::Arguments defaults;
         const myos::bootstrap::Arguments* arguments = options.arguments;
         if (arguments == nullptr && !task.row()->arguments.empty()) {
             const auto encoded = task.symbol(task.row()->arguments);
             if (!defaults.decode(reinterpret_cast<const char*>(encoded.data()), encoded.size()))
-                return libk::nullopt;
+                return std::nullopt;
             arguments = &defaults;
         }
         RegistrationJournal<MYOS_BOOTSTRAP_MAX_IMPORTS> temporary;
         AuthorityId overrides[MYOS_BOOTSTRAP_MAX_IMPORTS]{};
         auto retire = libk::on_scope_exit([&]() noexcept { checked(temporary.retire_all() == MYOS_STATUS_OK); });
-        if (options.sources.size() > MYOS_BOOTSTRAP_MAX_IMPORTS) return libk::nullopt;
+        if (options.sources.size() > MYOS_BOOTSTRAP_MAX_IMPORTS) return std::nullopt;
         for (size_t i = 0; i < options.sources.size(); ++i) {
             const auto& source = options.sources[i];
             auto id = temporary.register_source(authorities_, source.cap,
                 AuthorityCapacity + 1 + i, source.ceiling);
-            if (!id) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+            if (!id) { status = MYOS_STATUS_DENIED; return std::nullopt; }
             overrides[i] = *id;
         }
         TaskAuthorityBindings bindings{};
@@ -243,25 +247,25 @@ public:
                     for (uint32_t e = 0; e < row->exports.count; ++e) {
                         const auto& exported = *program.plan_.export_record(row->exports.first + e);
                         if (!program.plan_.symbol(exported.key).equals(task.symbol(import.source))) continue;
-                        if (bindings.imports[i].valid()) { status = MYOS_STATUS_BAD_ARGS; return libk::nullopt; }
+                        if (bindings.imports[i].valid()) { status = MYOS_STATUS_BAD_ARGS; return std::nullopt; }
                         bindings.imports[i] = provider->exports[e];
                     }
                 }
                 for (size_t s = 0; s < options.sources.size(); ++s)
                     if (task.symbol(import.source).equals(tasks::name(options.sources[s].name)))
                         bindings.imports[i] = overrides[s];
-                if (!bindings.imports[i].valid()) { status = MYOS_STATUS_DENIED; return libk::nullopt; }
+                if (!bindings.imports[i].valid()) { status = MYOS_STATUS_DENIED; return std::nullopt; }
             }
         }
         myos::cap::OwnedCap terminal;
         if (options.terminal_events != 0) {
             const auto copied = myos::cap_duplicate(options.terminal_events, 0, MYOS_RIGHT_SIGNAL);
-            if (copied.status != MYOS_STATUS_OK) { status = copied.status; return libk::nullopt; }
+            if (copied.status != MYOS_STATUS_OK) { status = copied.status; return std::nullopt; }
             terminal = myos::cap::OwnedCap{{copied.value, 0}};
         }
-        auto pending = Builder::begin(completions_, table_, libk::move(*lease), *index);
-        if (!pending) { status = MYOS_STATUS_BUSY; return libk::nullopt; }
-        auto builder = libk::move(*pending);
+        auto pending = Builder::begin(completions_, table_, std::move(*lease), *index);
+        if (!pending) { status = MYOS_STATUS_BUSY; return std::nullopt; }
+        auto builder = std::move(*pending);
         handle handle{builder.record()->id(), builder.take_receiver(), options.terminal_events};
         TaskConstructionInput<Backend, Authorities> input{
             .parent_pool = pool_, .bundle = &program.bundle_, .scratch = &program.scratch_,
@@ -273,7 +277,7 @@ public:
         if (status != MYOS_STATUS_OK) {
             if (builder.valid()) checked(builder.fail(CloseReason::ConstructionFailure, status));
             checked(discard(handle.id, status, handle.receiver));
-            return libk::nullopt;
+            return std::nullopt;
         }
         handle.plan_task = task.id;
         for (uint32_t e = 0; e < task.row()->exports.count; ++e) {
@@ -282,7 +286,7 @@ public:
                 status = MYOS_STATUS_DENIED;
                 checked(table_.begin_close(handle.id, CloseReason::ConstructionFailure, status));
                 checked(discard(handle.id, status, handle.receiver));
-                return libk::nullopt;
+                return std::nullopt;
             }
             handle.exports[e] = *exported;
         }
@@ -290,13 +294,13 @@ public:
         if (status != MYOS_STATUS_OK) {
             checked(table_.begin_close(handle.id, CloseReason::ConstructionFailure, status));
             checked(discard(handle.id, status, handle.receiver));
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (options.close_badge != 0)
             table_.close_events(handle.id, {options.terminal_events, 0}, options.close_badge);
         return handle;
     }
-    auto launch(program& program, const char* text, myos_status_t& status) noexcept -> libk::optional<handle> {
+    auto launch(program& program, const char* text, myos_status_t& status) noexcept -> std::optional<handle> {
         return launch(program, name(text), status);
     }
     auto wait(handle& handle) noexcept -> myos_status_t {
@@ -308,7 +312,7 @@ public:
                 return result.status;
             if (closing_needs_poll(handle)) { myos::yield(); continue; }
             const auto local = handle.events == 0 ? table_.terminal_notification(handle.id)
-                                                 : libk::optional<myos::cap::CapRef>{myos::cap::CapRef{handle.events, 0}};
+                                                 : std::optional<myos::cap::CapRef>{myos::cap::CapRef{handle.events, 0}};
             if (!local) return MYOS_STATUS_INVALID_CAP;
             const auto wake = myos::notification_wait(local->selector);
             if (wake.status != MYOS_STATUS_OK) return wake.status;
@@ -368,8 +372,8 @@ public:
         checked(result && result->task == handle.id);
         return {.status = MYOS_STATUS_OK, .value = static_cast<myos_word_t>(result->status)};
     }
-    auto result(const handle& handle) const noexcept -> libk::optional<CompletionResult> {
-        return handle.receiver ? handle.receiver->result() : libk::nullopt;
+    auto result(const handle& handle) const noexcept -> std::optional<CompletionResult> {
+        return handle.receiver ? handle.receiver->result() : std::nullopt;
     }
 
 };

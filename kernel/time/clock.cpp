@@ -1,13 +1,13 @@
 #include <time/clock.hpp>
 
 #include <arch/time.hpp>
-#include <core/debug.hpp>
+#include <libk/assert.hpp>
 
-namespace kernel::time {
+namespace time {
 
 auto Clock::now() const noexcept -> Instant {
-    KASSERT(valid());
+    libk_assert(valid());
     return arch::read_clock();
 }
 
-} // namespace kernel::time
+} // namespace time

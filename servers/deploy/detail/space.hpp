@@ -1,20 +1,21 @@
 #pragma once
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <array>
 #include <utility>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
+#include <optional>
+#include <utility>
 #include <uapi/capability.h>
 #include <servers/deploy/format.h>
 #include <uapi/object.h>
 #include <uapi/status.h>
 #include <uapi/vm.h>
 #include <servers/deploy/bundle.hpp>
-#include <user/abi/objects.hpp>
-#include <user/abi/calls.hpp>
+#include <sys/handle.hpp>
+#include <sys/syscall.hpp>
 
 namespace deploy {
 
@@ -100,18 +101,18 @@ concept Backend = myos::cap::CapBackend<T>
         myos_word_t types,
         myos_word_t rights) {
     { T::resource_create_child(pool, words, words, words) }
-        -> libk::SameAs<myos::SysResult>;
-    { T::resource_close(pool) } -> libk::SameAs<myos_status_t>;
-    { T::vspace_create(pool) } -> libk::SameAs<myos::SysResult>;
-    { T::cspace_create(pool, words, words) } -> libk::SameAs<myos::SysResult>;
-    { T::vm_create_region(
+        -> std::same_as<myos::SysResult>;
+    { T::resource_close(pool) } -> std::same_as<myos_status_t>;
+    { T::vspace_create(pool) } -> std::same_as<myos::SysResult>;
+    { T::cspace_create(pool, words, words) } -> std::same_as<myos::SysResult>;
+    { T::vm_slice(
           vspace, address, size, access, types, rights) }
-        -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
     { T::vm_map(region, memory, address, size, words, access) }
-        -> libk::SameAs<myos_status_t>;
+        -> std::same_as<myos_status_t>;
     { T::vm_unmap(region, address, size) }
-        -> libk::SameAs<myos_status_t>;
-    { T::vm_destroy_region(region) } -> libk::SameAs<myos_status_t>;
+        -> std::same_as<myos_status_t>;
+    { T::vm_clear(region) } -> std::same_as<myos_status_t>;
 };
 
 struct LocalSlot final {
@@ -123,7 +124,7 @@ struct LocalSlot final {
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
         return pool != 0 && kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT;
+            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
     }
 
     [[nodiscard]] constexpr auto is_manager() const noexcept -> bool {
@@ -143,7 +144,7 @@ public:
     auto operator=(const TaskSpace&) -> TaskSpace& = delete;
 
     TaskSpace(TaskSpace&& other) noexcept
-        : pool_(libk::move(other.pool_)),
+        : pool_(std::move(other.pool_)),
           local_(std::move(other.local_)), manager_(std::move(other.manager_)),
           remote_(std::move(other.remote_)),
           local_count_(std::exchange(other.local_count_, 0)),
@@ -166,7 +167,7 @@ public:
         if (phase_ != Phase::Closed || initialized_) {
             B::ownership_fault(MYOS_STATUS_BUSY);
         }
-        pool_ = libk::move(other.pool_);
+        pool_ = std::move(other.pool_);
         local_ = std::move(other.local_);
         manager_ = std::move(other.manager_);
         remote_ = std::move(other.remote_);
@@ -242,7 +243,7 @@ public:
         }
         owner_type vspace_owner{myos::cap::CapRef{vspace.value, 0}};
         const auto vspace_slot = adopt_local(
-            libk::move(vspace_owner), MYOS_OBJECT_KIND_VSPACE);
+            std::move(vspace_owner), MYOS_OBJECT_KIND_VSPACE);
         if (!vspace_slot) {
             return fail(MYOS_STATUS_NO_MEMORY);
         }
@@ -322,9 +323,9 @@ public:
         return phase_;
     }
 
-    [[nodiscard]] auto pool() const noexcept -> libk::optional<myos::cap::CapRef> {
+    [[nodiscard]] auto pool() const noexcept -> std::optional<myos::cap::CapRef> {
         if (!pool_) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return pool_.reference();
     }
@@ -348,9 +349,9 @@ public:
     }
 
     [[nodiscard]] auto adopt_local(
-        owner_type&& owner, myos_object_kind_t kind) noexcept -> libk::optional<LocalSlot> {
+        owner_type&& owner, myos_object_kind_t kind) noexcept -> std::optional<LocalSlot> {
         if (phase_ != Phase::Open || !pool_ || !owner || owner.cspace() != 0
-            || !valid_kind(kind) || local_count_ == LocalCapacity) return libk::nullopt;
+            || !valid_kind(kind) || local_count_ == LocalCapacity) return std::nullopt;
         const auto index = local_count_++;
         local_[index] = {std::move(owner), kind};
         return LocalSlot{.pool = pool_.selector(), .index = index, .kind = kind};
@@ -360,8 +361,8 @@ public:
         return adopt_remote_index(std::move(owner)).has_value();
     }
 
-    [[nodiscard]] auto adopt_remote_index(owner_type&& owner) noexcept -> libk::optional<size_t> {
-        if (!can_adopt_remote(owner)) return libk::nullopt;
+    [[nodiscard]] auto adopt_remote_index(owner_type&& owner) noexcept -> std::optional<size_t> {
+        if (!can_adopt_remote(owner)) return std::nullopt;
         const auto index = remote_count_++;
         remote_[index] = std::move(owner);
         return index;
@@ -383,21 +384,21 @@ public:
     [[nodiscard]] auto lookup(
         LocalSlot slot,
         myos_object_kind_t expected_kind) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (phase_ != Phase::Open || !slot.valid()
             || slot.pool != pool_.selector() || slot.kind != expected_kind) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (slot.is_manager()) {
             if (slot.kind != MYOS_OBJECT_KIND_CSPACE) {
-                return libk::nullopt;
+                return std::nullopt;
             }
-            if (!manager_) return libk::nullopt;
+            if (!manager_) return std::nullopt;
             return manager_.reference();
         }
         if (slot.index >= local_count_
             || local_[slot.index].kind != expected_kind || !local_[slot.index].cap) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return local_[slot.index].cap.reference();
     }
@@ -405,12 +406,12 @@ public:
     [[nodiscard]] auto lookup_remote(
         size_t index,
         myos_cap_t manager) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         if (phase_ != Phase::Open || manager == 0) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         if (!manager_ || manager_.selector() != manager || index >= remote_count_ || !remote_[index])
-            return libk::nullopt;
+            return std::nullopt;
         return remote_[index].reference();
     }
 
@@ -455,7 +456,7 @@ private:
     [[nodiscard]] static constexpr auto valid_kind(
         myos_object_kind_t kind) noexcept -> bool {
         return kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT;
+            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
     }
 
     struct entry { owner_type cap; myos_object_kind_t kind{}; };
@@ -487,7 +488,7 @@ public:
         : root_(other.root_),
           window_(other.window_),
           size_(other.size_),
-          region_(libk::move(other.region_)),
+          region_(std::move(other.region_)),
           view_(other.view_),
           phase_(other.phase_) {
         other.reset_empty();
@@ -504,7 +505,7 @@ public:
         root_ = other.root_;
         window_ = other.window_;
         size_ = other.size_;
-        region_ = libk::move(other.region_);
+        region_ = std::move(other.region_);
         view_ = other.view_;
         phase_ = other.phase_;
         other.reset_empty();
@@ -540,7 +541,7 @@ public:
         root_ = root_vspace;
         window_ = window;
         size_ = bundle_size;
-        const myos::SysResult created = B::vm_create_region(
+        const myos::SysResult created = B::vm_slice(
             root_,
             window.address,
             window.size,
@@ -589,7 +590,7 @@ public:
         }
         if (phase_ == LeasePhase::Ready || phase_ == LeasePhase::Destroying) {
             phase_ = LeasePhase::Destroying;
-            const myos_status_t status = B::vm_destroy_region(
+            const myos_status_t status = B::vm_clear(
                 region_.reference());
             if (!committed(status)) {
                 return status;
@@ -652,7 +653,7 @@ public:
     ScratchWindow(ScratchWindow&& other) noexcept
         : root_(other.root_),
           window_(other.window_),
-          region_(libk::move(other.region_)),
+          region_(std::move(other.region_)),
           mapped_size_(other.mapped_size_),
           phase_(other.phase_) {
         other.reset_empty();
@@ -668,7 +669,7 @@ public:
         }
         root_ = other.root_;
         window_ = other.window_;
-        region_ = libk::move(other.region_);
+        region_ = std::move(other.region_);
         mapped_size_ = other.mapped_size_;
         phase_ = other.phase_;
         other.reset_empty();
@@ -699,7 +700,7 @@ public:
         reset_empty();
         root_ = root_vspace;
         window_ = window;
-        const myos::SysResult created = B::vm_create_region(
+        const myos::SysResult created = B::vm_slice(
             root_,
             window.address,
             window.size,
@@ -771,7 +772,7 @@ public:
         }
         if (phase_ == LeasePhase::Ready || phase_ == LeasePhase::Destroying) {
             phase_ = LeasePhase::Destroying;
-            const myos_status_t status = B::vm_destroy_region(
+            const myos_status_t status = B::vm_clear(
                 region_.reference());
             if (!committed(status)) {
                 return status;

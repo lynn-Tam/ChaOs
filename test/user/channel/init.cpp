@@ -1,5 +1,5 @@
-#include <user/server_rt/service.hpp>
-#include <user/abi/objects.hpp>
+#include <servers/runtime/service.hpp>
+#include <sys/handle.hpp>
 #include <servers/deploy/launch.hpp>
 #include <servers/uart/port.hpp>
 
@@ -12,7 +12,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         cap::OwnedCap{{service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0}},
         0x30010000, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE);
     if (!mapping) exit(mapping.error());
-    uart::Port port{mapping.value().address};
+    uart::Port port{mapping->address};
     port.reset();
     supervisor.open(info);
     service::require(supervisor.load(program, info));

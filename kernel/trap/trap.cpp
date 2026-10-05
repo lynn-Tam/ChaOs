@@ -1,41 +1,37 @@
 // kernel/trap/trap.cpp
 // 系统 trap policy 的当前 owner；架构层只提供 Event 和返回现场访问。
 
-#include "kernel/trap/dump.hpp"
+#include <panic.hpp>
 
-#include <cpu/cpu_local.hpp>
+#include <cpu/local.hpp>
 #include <cpu/ipi.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <cpu/cpu_runtime.hpp>
-#include <diag/console.hpp>
-#include <diag/concurrency.hpp>
+#include <cpu/registry.hpp>
+#include <cpu/runtime.hpp>
+#include <console.hpp>
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
-#include <operation/page_access.hpp>
-#include <operation/wait.hpp>
+#include <mm/mem.hpp>
+#include <wait.hpp>
 #include <sched/dispatcher.hpp>
-#include <syscall/syscall.hpp>
-#include <thread/thread.hpp>
+#include <syscall/call.hpp>
+#include <task/thread.hpp>
+#include <ipc/endpoint.hpp>
+#if TEST_ENABLED
 #include <test/scenario.hpp>
-#include <execution/vproc.hpp>
+#endif
 #include <trap/trap.hpp>
 #include <uapi/status.h>
+#include <libk/scope_guard.hpp>
 
-namespace kernel::trap {
+namespace trap {
 
-namespace {
-
-/*luna change: share initial and resumed Thread page-fault terminal handling, reason: one PageAccess owns retry outcome while trap policy owns yield, unwind, and exit decisions*/
-void finish_thread_page_fault(
+static void finish_thread_page_fault(
     Thread& thread,
-    operation::PageAccess& page_fault,
+    mm::FaultKind kind,
+    mm::Virt address,
+    mm::Perm access,
     arch::TrapContext& context,
-    sched::CpuDispatcher& dispatcher) noexcept {
-    KASSERT(page_fault.terminal());
-    const mm::FaultKind kind = page_fault.kind();
-    const mm::VirtAddr address = page_fault.address();
-    const mm::Access access = page_fault.access();
-    page_fault.reset();
+    sched::Dispatcher& dispatcher) noexcept {
     myos_status_t status{MYOS_STATUS_PEER_FAULT};
     switch (kind) {
     case mm::FaultKind::Ready:
@@ -44,11 +40,10 @@ void finish_thread_page_fault(
     case mm::FaultKind::Busy:
         dispatcher.request_reschedule(sched::DispatchReason::Yield);
         return;
-    case mm::FaultKind::Pressure:
         dispatcher.request_reschedule(sched::DispatchReason::Yield);
         return;
     case mm::FaultKind::Pending:
-        KASSERT(false);
+        libk_assert(false);
         return;
     case mm::FaultKind::ResourceExhausted:
     case mm::FaultKind::OutOfMemory: {
@@ -58,23 +53,21 @@ void finish_thread_page_fault(
     default:
         break;
     }
-    KASSERT(thread.effective_binding().fault_route()
-        == FaultRoute::Terminate);
-    if (execution::Frame* const frame = thread.active_frame();
+    if (ipc::Activation* const frame = thread.activation();
         frame != nullptr) {
         frame->unwind(context, dispatcher, status);
         return;
     }
-    Access trap_access{Access::None};
+    Perm trap_access{Perm::None};
     switch (access) {
-    case mm::Access::Read:
-        trap_access = Access::Read;
+    case mm::Perm::Read:
+        trap_access = Perm::Read;
         break;
-    case mm::Access::Write:
-        trap_access = Access::Write;
+    case mm::Perm::Write:
+        trap_access = Perm::Write;
         break;
-    case mm::Access::Execute:
-        trap_access = Access::Execute;
+    case mm::Perm::Execute:
+        trap_access = Perm::Execute;
         break;
     }
     const Event event = Event::exception(
@@ -84,160 +77,98 @@ void finish_thread_page_fault(
         context.pc(),
         address.raw());
     thread.record_user_fault(event);
-    static_cast<void>(thread.terminal().claim(
-        fault::Reason::Fault,
+    static_cast<void>(thread.exit().claim(
+        Exit::Reason::Fault,
         status,
         0,
         event.pc(),
         event.fault_addr()));
     // One-way diagnostic projection; it must never participate in fault policy.
-    kernel::diag::console::print<
+    console::print<
         "user: contained fault pc={:#x} address={:#x} after syscalls={} "
         "active-vspace-cpus={} fault-kind={}\n">(
         event.pc(), event.fault_addr(), thread.user_syscalls(),
-        thread.effective_binding().vspace()->active_cpus().size(),
+        thread.env().vspace()->active_cpus().size(),
         static_cast<u8>(kind));
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
 
-} // namespace
-
 void handle(const Event& event, arch::TrapContext& context) noexcept {
     if (const auto* interrupt = event.interrupt()) {
-        kernel::CpuLocal& cpu = kernel::current_cpu();
-        KASSERT(cpu.dispatcher() != nullptr);
+        CpuLocal& cpu = current_cpu();
+        libk_assert(cpu.dispatcher() != nullptr);
         switch (interrupt->cause) {
         case Interrupt::Timer:
             cpu.dispatcher()->on_timer();
             return;
         case Interrupt::Software:
-            kernel::handle_ipi(cpu.runtime());
+            handle_ipi(cpu.runtime());
             return;
         case Interrupt::External: {
-            kernel::irq::Irq::dispatch();
+            arch::external_irq();
             return;
         }
         default:
-            panic_unhandled(event, context);
+            panic("unhandled trap", &context);
         }
     }
 
     if (event.origin() == Origin::User) {
         const auto* exception = event.exception();
-        KASSERT(exception != nullptr);
-        kernel::CpuLocal& cpu = kernel::current_cpu();
-        kernel::Execution* const execution = cpu.current_execution();
-        kernel::Thread* const thread = cpu.current_thread();
-        kernel::Vproc* const vproc = cpu.current_vproc();
-        KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr)
-            && execution->binding().user_bound());
+        libk_assert(exception != nullptr);
+        CpuLocal& cpu = current_cpu();
+        Thread* const thread = cpu.current_thread();
+        libk_assert(thread != nullptr
+            && thread->env().user_bound());
         if (exception->cause == Exception::Syscall) {
-            switch (kernel::syscall::handle(context)) {
-            case kernel::syscall::Disposition::Return:
-            case kernel::syscall::Disposition::Resume:
+            switch (syscall::handle(context)) {
+            case syscall::Disposition::Return:
+            case syscall::Disposition::Resume:
                 return;
-            case kernel::syscall::Disposition::Yield:
+            case syscall::Disposition::Yield:
                 cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Yield);
+                    sched::DispatchReason::Yield);
                 return;
-            case kernel::syscall::Disposition::Block:
-                cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Block);
-                return;
-            case kernel::syscall::Disposition::Park:
-                cpu.dispatcher()->request_reschedule(
-                    kernel::sched::DispatchReason::Park);
-                return;
-            case kernel::syscall::Disposition::Exit:
+            case syscall::Disposition::Exit:
                 const myos_status_t status = static_cast<myos_status_t>(
                     context.arg(1));
-                if (vproc != nullptr) {
-                    vproc->request_normal_exit(status);
-                } else {
-                    cpu.dispatcher()->request_reschedule(
-                        kernel::sched::DispatchReason::Exit,
-                        status);
-                }
+                cpu.dispatcher()->request_reschedule(sched::DispatchReason::Exit, status);
                 return;
             }
         }
         if (exception->cause == Exception::PageFault) {
-            kernel::mm::Access access{};
+            mm::Perm access{};
             switch (exception->access) {
-            case Access::Read:
-                access = kernel::mm::Access::Read;
+            case Perm::Read:
+                access = mm::Perm::Read;
                 break;
-            case Access::Write:
-                access = kernel::mm::Access::Write;
+            case Perm::Write:
+                access = mm::Perm::Write;
                 break;
-            case Access::Execute:
-                access = kernel::mm::Access::Execute;
+            case Perm::Execute:
+                access = mm::Perm::Execute;
                 break;
-            case Access::None:
+            case Perm::None:
                 if (thread != nullptr) {
                     thread->record_user_fault(event);
                     cpu.dispatcher()->request_reschedule(
-                        kernel::sched::DispatchReason::Exit);
-                } else {
-                    vproc->request_exit();
+                        sched::DispatchReason::Exit);
                 }
                 return;
             }
-            /*luna change: route Thread faults through the leaf PageAccess continuation, reason: Pager Pending must block on one Wait/Completion instead of polling Yield while Vproc keeps its existing adapter*/
             if (thread != nullptr) {
-                KASSERT(cpu.runtime().owner_registry != nullptr);
-                KASSERT(test::scenario::page_fault(
-                    cpu.runtime(), mm::VirtAddr{event.fault_addr()}));
-                auto& page_fault = thread->current_wait().page_access();
-                const mm::FaultKind result = page_fault.start(
-                    *execution->binding().vspace(),
-                    *cpu.runtime().owner_registry,
-                    cpu.descriptor->logical_id(),
-                    mm::VirtAddr{event.fault_addr()},
-                    access);
-                /*luna change: block both pager and retained-pressure waits,
-                  reason: pressure wake owns the same Completion rearm lane*/
-                if (result == mm::FaultKind::Pending
-                    || result == mm::FaultKind::Pressure) {
-                    KASSERT(thread->begin_wait(
-                        page_fault.completion(),
-                        *cpu.runtime().owner_registry));
-                    page_fault.arm();
-                    cpu.dispatcher()->request_reschedule(
-                        sched::DispatchReason::Block);
-                    return;
-                }
-                finish_thread_page_fault(
-                    *thread, page_fault, context, *cpu.dispatcher());
+                libk_assert(cpu.runtime().owner_registry != nullptr);
+                const auto address = mm::Virt{event.fault_addr()};
+                const auto kind = thread->env().vspace()->fault(
+                    *thread, mm::VmCtx{.cpus = cpu.runtime().owner_registry,
+                                       .local = cpu.descriptor->logical_id()}, address, access);
+                if (!thread->stop_requested())
+                    finish_thread_page_fault(*thread, kind, address, access, context, *cpu.dispatcher());
                 return;
-            }
-            /*luna change: route Vproc faults through the durable FaultSlot adapter, reason: Pending must retain the exact return frame while the runtime continues*/
-            KASSERT(vproc != nullptr && cpu.runtime().owner_registry != nullptr);
-            const mm::FaultKind fault = vproc->fault(
-                context,
-                *cpu.runtime().owner_registry,
-                cpu.descriptor->logical_id(),
-                mm::VirtAddr{event.fault_addr()},
-                access);
-            switch (fault) {
-            case mm::FaultKind::Ready:
-            case mm::FaultKind::Materialized:
-                return;
-            case mm::FaultKind::Pending:
-                return;
-            case mm::FaultKind::Busy:
-            case mm::FaultKind::Pressure:
-                cpu.dispatcher()->request_reschedule(
-                    sched::DispatchReason::Yield);
-                return;
-            default:
-                break;
             }
         }
-        KASSERT(execution->binding().fault_route()
-            == kernel::FaultRoute::Terminate);
-        if (kernel::execution::Frame* const frame =
-                thread != nullptr ? thread->active_frame() : nullptr;
+        if (ipc::Activation* const frame =
+                thread != nullptr ? thread->activation() : nullptr;
             frame != nullptr) {
             frame->unwind(
                 context, *cpu.dispatcher(), MYOS_STATUS_PEER_FAULT);
@@ -245,36 +176,19 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
         }
         if (thread != nullptr) {
             thread->record_user_fault(event);
-            static_cast<void>(thread->terminal().claim(
-                kernel::fault::Reason::Fault,
+            static_cast<void>(thread->exit().claim(
+                Exit::Reason::Fault,
                 MYOS_STATUS_PEER_FAULT,
                 0,
                 event.pc(),
                 event.fault_addr()));
-            kernel::diag::console::print<
+            console::print<
                 "user: contained fault pc={:#x} address={:#x} after syscalls={} "
                 "active-vspace-cpus={}\n">(
                 event.pc(), event.fault_addr(), thread->user_syscalls(),
-                execution->binding().vspace()->active_cpus().size());
-        } else {
-            static_cast<void>(vproc->terminal().claim(
-                kernel::fault::Reason::Fault,
-                MYOS_STATUS_PEER_FAULT,
-                0,
-                event.pc(),
-                event.fault_addr()));
-            kernel::diag::console::print<
-                "vproc: contained fault address={:#x} "
-                "active-vspace-cpus={}\n">(
-                event.fault_addr(),
-                execution->binding().vspace()->active_cpus().size());
+                thread->env().vspace()->active_cpus().size());
         }
-        if (vproc != nullptr) {
-            vproc->request_exit();
-        } else {
-            cpu.dispatcher()->request_reschedule(
-                kernel::sched::DispatchReason::Exit);
-        }
+        cpu.dispatcher()->request_reschedule(sched::DispatchReason::Exit);
         return;
     }
 
@@ -284,106 +198,46 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             context.complete_breakpoint();
             return;
         default:
-            panic_unhandled(event, context);
+            panic("unhandled trap", &context);
         }
     }
 
-    panic_unhandled(event, context);
+    panic("unhandled trap", &context);
 }
 
-void on_exit([[maybe_unused]] arch::TrapContext& context) noexcept {
-    kernel::CpuLocal& cpu = kernel::current_cpu();
-    KASSERT(cpu.dispatcher() != nullptr);
-    kernel::Thread* const thread = cpu.current_thread();
-    kernel::Vproc* const vproc = cpu.current_vproc();
-    kernel::Execution* const execution = cpu.current_execution();
-    KASSERT(execution != nullptr && (thread != nullptr || vproc != nullptr));
-    auto continuation = diag::concurrency::ObservationLease::reserve(
-        diag::concurrency::RecordKind::TrapContinuation,
-        reinterpret_cast<u64>(execution),
-        1,
-        diag::concurrency::Expectation::InternalFinite);
-    const auto driver = execution->scheduler_binding() != nullptr
-        ? execution->scheduler_binding()->actor_ref()
-        : diag::concurrency::NodeRef::cpu(
-              cpu.descriptor->logical_id());
-    while (thread != nullptr && thread->active_frame() != nullptr
-        && !thread->current_wait().attached()
-        && (cpu.dispatcher()->current().stop_requested()
-            || thread->cancel_pending())) {
-        thread->active_frame()->unwind(
-            context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
-    }
-    operation::Wait* wait = thread != nullptr
-        ? &thread->current_wait()
-        : nullptr;
-    const auto operation = wait != nullptr
-        ? wait->observation_key()
-        : diag::concurrency::ObservationKey{};
-    diag::concurrency::ObservationBatch update{
-        .phase = 1,
-        .semantic_stamp = 1,
-        .wait = operation
-            ? diag::concurrency::WaitKind::OperationCompletion
-            : diag::concurrency::WaitKind::SchedulerActivation,
-        .driver = driver,
-        .blocker = diag::concurrency::NodeRef::observation(operation),
-        .site = diag::concurrency::SourceSite::current(),
-        .update_progress = true,
-        .update_watched = true,
-        .watched = true};
-    continuation.publish(update);
-    if (wait != nullptr && wait->ready()) {
-        static_cast<void>(wait->finish(context));
+void on_exit(const Event& event, arch::TrapContext& context) noexcept {
+    CpuLocal& cpu = current_cpu();
+    libk_assert(cpu.dispatcher() != nullptr);
+    Thread* const thread = cpu.current_thread();
+    libk_assert(thread != nullptr);
+    if (event.origin() == Origin::User && event.exception() != nullptr) {
+        thread->enter_kernel();
+        const auto leave = libk::on_scope_exit([thread]() noexcept {
+            thread->leave_kernel();
+        });
+        handle(event, context);
     }
     cpu.dispatcher()->on_trap_exit();
-    // A wake credit closes wake-before-block, but it is not evidence that the
-    // current subsystem operation has completed: an older credit may merely
-    // make the first block attempt a no-op. The canonical wait is the truth.
-    // Keep this continuation in the kernel until that relation is complete.
-    KASSERT(cpu.current_execution() == execution);
-    wait = thread != nullptr ? &thread->current_wait() : nullptr;
-    while (wait != nullptr && wait->attached()) {
-        if (wait->ready()) {
-            // Finishing consumes one publication. A page-in may immediately
-            // rearm for another backing or frame dependency; only detachment
-            // permits this saved context to return to userspace.
-            static_cast<void>(wait->finish(context));
-            continue;
-        }
-        cpu.dispatcher()->block_current();
-        KASSERT(cpu.current_execution() == execution);
-        wait = thread != nullptr ? &thread->current_wait() : nullptr;
-    }
-    /*luna change: consume a resumed terminal PageAccess after serial Wait delivery, reason: Rearm remains attached while Done leaves the result for the shared trap policy*/
-    if (thread != nullptr) {
-        wait = &thread->current_wait();
-        if (auto* access = wait->find_page_access(); access != nullptr && access->terminal()) {
-            finish_thread_page_fault(
-                *thread,
-                *access,
-                context,
-                *cpu.dispatcher());
-        }
-    }
+    libk_assert(cpu.current_thread() == thread);
     // A canceled Endpoint frame cannot be popped while its leaf Wait still
     // owns the continuation. Once that relation has completed or canceled,
     // this same owning CPU performs the pending chain unwind.
-    while (thread != nullptr && thread->active_frame() != nullptr
+    while (thread != nullptr && thread->activation() != nullptr
         && !thread->current_wait().attached()
-        && (cpu.dispatcher()->current().stop_requested()
+        && (cpu.dispatcher()->current()->stop_requested()
             || thread->cancel_pending())) {
-        thread->active_frame()->unwind(
+        thread->activation()->unwind(
             context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.
     cpu.dispatcher()->on_trap_exit();
-    KASSERT(cpu.current_execution() == execution);
-    if (vproc != nullptr) {
-        vproc->on_trap_exit(context);
-    }
-    continuation.finish(2);
+    libk_assert(cpu.current_thread() == thread);
+
 }
 
-} // namespace kernel::trap
+void on_return() noexcept {
+    if (auto* thread = current_cpu().current_thread()) thread->release_calls();
+}
+
+} // namespace trap

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <core/types.hpp>
+#include <base/types.hpp>
 
 extern "C" char boot_stack_top[];
 extern "C" [[nodiscard]] auto arch_boot_stack_guard_intact() noexcept -> bool;

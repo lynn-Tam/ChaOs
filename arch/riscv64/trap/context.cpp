@@ -6,7 +6,8 @@
 
 #include <arch/instruction.hpp>
 #include <arch/user.hpp>
-#include <core/debug.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
 #include <libk/mem.h>
 #include <libk/memory.hpp>
 
@@ -39,7 +40,7 @@ struct TrapContextAccess final {
 
 TrapContext::TrapContext(void* frame) noexcept
     : frame_(frame) {
-    KASSERT(frame_ != nullptr);
+    libk_assert(frame_ != nullptr);
 }
 
 namespace riscv64 {
@@ -101,7 +102,7 @@ auto TrapContext::arg(usize index) const noexcept -> usize {
     case 7:
         return frame.a7;
     default:
-        KASSERT(false);
+        libk_assert(false);
         __builtin_unreachable();
     }
 }
@@ -119,7 +120,7 @@ void TrapContext::set_result(usize index, usize value) noexcept {
         frame.a2 = value;
         return;
     default:
-        KASSERT(false);
+        libk_assert(false);
     }
 }
 
@@ -141,68 +142,28 @@ auto TrapContext::snapshot() const noexcept -> TrapSnapshot {
     return result;
 }
 
-void TrapContext::save_user(myos_user_context& output) const noexcept {
-    const auto& frame = frame_of(frame_);
-    output = {};
-    output.words[0] = frame.sepc;
-    const auto* const registers = &frame.ra;
-    for (usize index = 0; index < 31; ++index) {
-        output.words[index + 1] = registers[index];
-    }
-}
-
-auto TrapContext::load_user(const myos_user_context& input) noexcept -> bool {
-    if (!valid_user_context(input)) {
-        return false;
-    }
-    auto& frame = frame_of(frame_);
-    auto* const registers = &frame.ra;
-    for (usize index = 0; index < 31; ++index) {
-        registers[index] = input.words[index + 1];
-    }
-    frame.sepc = input.words[0];
-    // User memory never contributes supervisor-controlled status.
-    frame.sstatus = riscv64::Sstatus::SPIE;
-    frame.scause = 0;
-    frame.stval = 0;
-    frame.padding = 0;
-    return true;
-}
-
 auto TrapContext::load_user_start(const UserStart& start) noexcept -> bool {
-    if (!valid_user_start(start)) {
-        return false;
-    }
-    myos_user_context context{};
-    context.words[0] = start.entry.raw();
-    context.words[2] = start.stack.raw();
-    constexpr usize A0 = 10;
-    for (usize index = 0; index < 6; ++index) {
-        context.words[A0 + index] = start.arguments[index];
-    }
-    return load_user(context);
+    if (!valid_user_start(start)) return false;
+    auto& f = frame_of(frame_);
+    f = {};
+    f.sepc = start.entry.raw();
+    f.sp = start.stack.raw();
+    f.a0 = start.arguments[0];
+    f.a1 = start.arguments[1];
+    f.a2 = start.arguments[2];
+    f.a3 = start.arguments[3];
+    f.a4 = start.arguments[4];
+    f.a5 = start.arguments[5];
+    f.sstatus = riscv64::Sstatus::SPIE;
+    return true;
 }
 
 auto TrapContext::frame() const noexcept -> UserFrame {
     return TrapContextAccess::frame(frame_);
 }
 
-/*luna change: preserve the interrupted frame in the Vproc-reserved cell, reason: runtime entry may rewrite the ordinary trap frame while FaultSlot owns the exact return token*/
-auto TrapContext::save_frame(usize raw_stack_top) const noexcept -> UserFrame {
-    if (raw_stack_top < sizeof(riscv64::TrapFrame)
-        || (raw_stack_top & 0xfU) != 0) {
-        return {};
-    }
-    auto* const source = static_cast<riscv64::TrapFrame*>(frame_);
-    auto* const reserved = reinterpret_cast<riscv64::TrapFrame*>(
-        raw_stack_top - sizeof(riscv64::TrapFrame));
-    KASSERT(source != nullptr && source != reserved);
-    *reserved = *source;
-    return TrapContextAccess::frame(reserved);
-}
-
 void TrapContext::redirect(UserFrame frame) noexcept {
-    KASSERT(frame);
+    libk_assert(frame);
     frame_ = TrapContextAccess::raw(frame);
 }
 

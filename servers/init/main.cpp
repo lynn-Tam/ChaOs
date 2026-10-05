@@ -1,4 +1,4 @@
-#include <user/server_rt/service.hpp>
+#include <servers/runtime/service.hpp>
 #include <servers/deploy/launch.hpp>
 #include <servers/deploy/services.hpp>
 #include <servers/uart/port.hpp>
@@ -15,7 +15,7 @@ void report_uart(const myos::bootstrap::BootstrapView& info,
     const auto vspace = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto memory = myos::service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
     constexpr auto address = 0x30010000;
-    const auto region = myos::vm_create_region(vspace, address, 4096,
+    const auto region = myos::vm_slice(vspace, address, 4096,
         MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE,
         MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
     myos::service::require(region.status);
@@ -33,8 +33,8 @@ void report_uart(const myos::bootstrap::BootstrapView& info,
         }
         port.write("\n");
     }
-    myos::service::require(myos::vm_complete(vspace, myos::vm_unmap(region.value, address, 4096)).status);
-    myos::service::require(myos::vm_complete(vspace, myos::vm_destroy_region(region.value)).status);
+    myos::service::require(myos::vm_unmap(region.value, address, 4096).status);
+    myos::service::require(myos::vm_clear(region.value).status);
     myos::service::require(myos::cap_close(region.value).status);
 }
 }

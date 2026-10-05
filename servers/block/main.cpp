@@ -1,8 +1,9 @@
-#include <user/server_rt/service.hpp>
-#include <user/server_rt/io.hpp>
-#include <user/abi/startup.hpp>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <servers/runtime/queue.hpp>
+#include <sys/start.hpp>
 #include <servers/block/device.hpp>
-#include <user/ipc/io.hpp>
+#include <sys/queue.hpp>
 
 namespace {
 using namespace myos;
@@ -64,8 +65,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             const auto status = directory.receive(packet);
             if (status == MYOS_STATUS_WOULD_BLOCK || status == MYOS_STATUS_BUSY) break;
             if (status != MYOS_STATUS_OK || packet.count != 2) continue;
-            auto endpoint = libk::move(packet.capabilities[0]);
-            packet.capabilities[0] = libk::move(packet.capabilities[1]);
+            auto endpoint = std::move(packet.capabilities[0]);
+            packet.capabilities[0] = std::move(packet.capabilities[1]);
             packet.count = 1;
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
@@ -77,7 +78,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 continue;
             }
             auto& client = *available;
-            client.channel = libk::move(endpoint);
+            client.channel = std::move(endpoint);
             const auto bound = client.session.bind(client.channel.selector(), events, device.capacity());
             if (bound != MYOS_STATUS_OK || client.session.accept(packet, control) != MYOS_STATUS_OK)
                 client.session.abort();

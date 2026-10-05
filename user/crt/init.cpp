@@ -1,7 +1,7 @@
 #include <stddef.h>
 
 #include <libk/assert.hpp>
-#include <user/abi/calls.hpp>
+#include <sys/syscall.hpp>
 
 namespace {
 using Constructor = void (*)();
@@ -23,3 +23,5 @@ namespace libk {
     myos::exit();
 }
 } // namespace libk
+
+extern "C" [[noreturn]] void abort() noexcept { myos::exit(MYOS_STATUS_INTERNAL); }

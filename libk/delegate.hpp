@@ -12,8 +12,8 @@
 
 #include <libk/assert.hpp>
 #include <libk/detail/callable.hpp>
-#include <libk/typetraits.hpp>
-#include <libk/utility.hpp>
+#include <type_traits>
+#include <utility>
 
 namespace libk {
 
@@ -36,8 +36,8 @@ public:
           stub_(function == nullptr ? nullptr : &invoke_runtime_function) {}
 
     template<auto Function>
-        requires(is_pointer_v<decltype(Function)>
-                 && is_function_v<remove_pointer_t<decltype(Function)>>
+        requires(std::is_pointer_v<decltype(Function)>
+                 && std::is_function_v<std::remove_pointer_t<decltype(Function)>>
                  && detail::InvocableR<R, decltype(Function), Args...>)
     [[nodiscard]] static constexpr delegate bind() noexcept {
         static_assert(Function != nullptr, "delegate cannot bind a null function");
@@ -47,29 +47,29 @@ public:
     }
 
     template<auto Method, typename C>
-        requires(is_member_function_pointer_v<decltype(Method)>
+        requires(std::is_member_function_pointer_v<decltype(Method)>
                  && requires(C& object, Args&&... args) {
-            (object.*Method)(libk::forward<Args>(args)...);
-            requires is_void_v<R> || requires {
-                static_cast<R>((object.*Method)(libk::forward<Args>(args)...));
+            (object.*Method)(std::forward<Args>(args)...);
+            requires std::is_void_v<R> || requires {
+                static_cast<R>((object.*Method)(std::forward<Args>(args)...));
             };
         })
     [[nodiscard]] static constexpr delegate bind(C& object) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
-            static_cast<const void*>(libk::addressof(object))));
+            static_cast<const void*>(std::addressof(object))));
         result.stub_ = &invoke_member<Method, C>;
         return result;
     }
 
     template<typename F>
-        requires (!is_same_v<remove_cvr_t<F>, delegate>
-                  && !is_function_v<remove_ref_t<F>>
+        requires (!std::is_same_v<std::remove_cvref_t<F>, delegate>
+                  && !std::is_function_v<std::remove_reference_t<F>>
                   && detail::InvocableR<R, F&, Args...>)
     [[nodiscard]] static constexpr delegate bind(F& function) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
-            static_cast<const void*>(libk::addressof(function))));
+            static_cast<const void*>(std::addressof(function))));
         result.stub_ = &invoke_object<F>;
         return result;
     }
@@ -84,37 +84,37 @@ public:
     }
 
     constexpr R operator()(Args... args) const
-        noexcept(noexcept(stub_(target_, libk::forward<Args>(args)...))) {
+        noexcept(noexcept(stub_(target_, std::forward<Args>(args)...))) {
         libk_assert(stub_ != nullptr);
-        return stub_(target_, libk::forward<Args>(args)...);
+        return stub_(target_, std::forward<Args>(args)...);
     }
 
 private:
     static constexpr R invoke_runtime_function(target_type target, Args&&... args)
         noexcept(noexcept(detail::invoke_r<R>(
-            target.function, libk::forward<Args>(args)...))) {
+            target.function, std::forward<Args>(args)...))) {
         return detail::invoke_r<R>(
-            target.function, libk::forward<Args>(args)...);
+            target.function, std::forward<Args>(args)...);
     }
 
     template<auto Function>
     static constexpr R invoke_free(target_type, Args&&... args)
         noexcept(noexcept(detail::invoke_r<R>(
-            Function, libk::forward<Args>(args)...))) {
+            Function, std::forward<Args>(args)...))) {
         return detail::invoke_r<R>(
-            Function, libk::forward<Args>(args)...);
+            Function, std::forward<Args>(args)...);
     }
 
     template<auto Method, typename C>
     static constexpr R invoke_member(target_type target, Args&&... args)
         noexcept(noexcept(((*static_cast<C*>(target.object)).*Method)(
-            libk::forward<Args>(args)...))) {
+            std::forward<Args>(args)...))) {
         C& object = *static_cast<C*>(target.object);
-        if constexpr (is_void_v<R>) {
-            (object.*Method)(libk::forward<Args>(args)...);
+        if constexpr (std::is_void_v<R>) {
+            static_cast<void>((object.*Method)(std::forward<Args>(args)...));
         } else {
             return static_cast<R>(
-                (object.*Method)(libk::forward<Args>(args)...));
+                (object.*Method)(std::forward<Args>(args)...));
         }
     }
 
@@ -122,10 +122,10 @@ private:
     static constexpr R invoke_object(target_type target, Args&&... args)
         noexcept(noexcept(detail::invoke_r<R>(
             *static_cast<F*>(target.object),
-            libk::forward<Args>(args)...))) {
+            std::forward<Args>(args)...))) {
         return detail::invoke_r<R>(
             *static_cast<F*>(target.object),
-            libk::forward<Args>(args)...);
+            std::forward<Args>(args)...);
     }
 
     target_type target_{};
@@ -148,8 +148,8 @@ public:
           stub_(function == nullptr ? nullptr : &invoke_runtime_function) {}
 
     template<auto Function>
-        requires(is_pointer_v<decltype(Function)>
-                 && is_function_v<remove_pointer_t<decltype(Function)>>
+        requires(std::is_pointer_v<decltype(Function)>
+                 && std::is_function_v<std::remove_pointer_t<decltype(Function)>>
                  && detail::NothrowInvocableR<R, decltype(Function), Args...>)
     [[nodiscard]] static constexpr delegate bind() noexcept {
         static_assert(Function != nullptr, "delegate cannot bind a null function");
@@ -159,30 +159,30 @@ public:
     }
 
     template<auto Method, typename C>
-        requires(is_member_function_pointer_v<decltype(Method)>
+        requires(std::is_member_function_pointer_v<decltype(Method)>
                  && requires(C& object, Args&&... args) {
-            requires noexcept((object.*Method)(libk::forward<Args>(args)...));
-            (object.*Method)(libk::forward<Args>(args)...);
-            requires is_void_v<R> || requires {
-                static_cast<R>((object.*Method)(libk::forward<Args>(args)...));
+            requires noexcept((object.*Method)(std::forward<Args>(args)...));
+            (object.*Method)(std::forward<Args>(args)...);
+            requires std::is_void_v<R> || requires {
+                static_cast<R>((object.*Method)(std::forward<Args>(args)...));
             };
         })
     [[nodiscard]] static constexpr delegate bind(C& object) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
-            static_cast<const void*>(libk::addressof(object))));
+            static_cast<const void*>(std::addressof(object))));
         result.stub_ = &invoke_member<Method, C>;
         return result;
     }
 
     template<typename F>
-        requires (!is_same_v<remove_cvr_t<F>, delegate>
-                  && !is_function_v<remove_ref_t<F>>
+        requires (!std::is_same_v<std::remove_cvref_t<F>, delegate>
+                  && !std::is_function_v<std::remove_reference_t<F>>
                   && detail::NothrowInvocableR<R, F&, Args...>)
     [[nodiscard]] static constexpr delegate bind(F& function) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
-            static_cast<const void*>(libk::addressof(function))));
+            static_cast<const void*>(std::addressof(function))));
         result.stub_ = &invoke_object<F>;
         return result;
     }
@@ -198,29 +198,29 @@ public:
 
     constexpr R operator()(Args... args) const noexcept {
         libk_assert(stub_ != nullptr);
-        return stub_(target_, libk::forward<Args>(args)...);
+        return stub_(target_, std::forward<Args>(args)...);
     }
 
 private:
     static constexpr R invoke_runtime_function(target_type target, Args&&... args) noexcept {
         return detail::invoke_r<R>(
-            target.function, libk::forward<Args>(args)...);
+            target.function, std::forward<Args>(args)...);
     }
 
     template<auto Function>
     static constexpr R invoke_free(target_type, Args&&... args) noexcept {
         return detail::invoke_r<R>(
-            Function, libk::forward<Args>(args)...);
+            Function, std::forward<Args>(args)...);
     }
 
     template<auto Method, typename C>
     static constexpr R invoke_member(target_type target, Args&&... args) noexcept {
         C& object = *static_cast<C*>(target.object);
-        if constexpr (is_void_v<R>) {
-            (object.*Method)(libk::forward<Args>(args)...);
+        if constexpr (std::is_void_v<R>) {
+            static_cast<void>((object.*Method)(std::forward<Args>(args)...));
         } else {
             return static_cast<R>(
-                (object.*Method)(libk::forward<Args>(args)...));
+                (object.*Method)(std::forward<Args>(args)...));
         }
     }
 
@@ -228,7 +228,7 @@ private:
     static constexpr R invoke_object(target_type target, Args&&... args) noexcept {
         return detail::invoke_r<R>(
             *static_cast<F*>(target.object),
-            libk::forward<Args>(args)...);
+            std::forward<Args>(args)...);
     }
 
     target_type target_{};
@@ -241,7 +241,7 @@ class multicast_delegate;
 template<typename... Args, size_t Capacity>
 class multicast_delegate<void(Args...), Capacity> {
     static_assert(Capacity > 0, "multicast_delegate capacity must be non-zero");
-    static_assert((!is_rvalue_reference_v<Args> && ...),
+    static_assert((!std::is_rvalue_reference_v<Args> && ...),
                   "multicast_delegate does not support rvalue-reference event arguments");
 
 public:
@@ -303,7 +303,7 @@ public:
     }
 
     template<typename F>
-        requires (!is_same_v<remove_cvr_t<F>, callback_type>)
+        requires (!std::is_same_v<std::remove_cvref_t<F>, callback_type>)
     [[nodiscard]] constexpr connection try_connect(F& function) noexcept {
         return try_connect(callback_type::bind(function));
     }
@@ -404,7 +404,7 @@ private:
 template<typename... Args, size_t Capacity>
 class multicast_delegate<void(Args...) noexcept, Capacity> {
     static_assert(Capacity > 0, "multicast_delegate capacity must be non-zero");
-    static_assert((!is_rvalue_reference_v<Args> && ...),
+    static_assert((!std::is_rvalue_reference_v<Args> && ...),
                   "multicast_delegate does not support rvalue-reference event arguments");
 
 public:
@@ -464,7 +464,7 @@ public:
     }
 
     template<typename F>
-        requires (!is_same_v<remove_cvr_t<F>, callback_type>)
+        requires (!std::is_same_v<std::remove_cvref_t<F>, callback_type>)
     [[nodiscard]] constexpr connection try_connect(F& function) noexcept {
         return try_connect(callback_type::bind(function));
     }

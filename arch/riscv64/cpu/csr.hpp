@@ -3,10 +3,11 @@
 // Typed RISC-V CSR accessors and field helpers. This file owns register
 // semantics only; CPU-local runtime state lives behind the selected arch API.
 
-#include "core/debug.hpp"
-#include "core/types.hpp"
+#include <libk/assert.hpp>
+#include <base/types.hpp>
+#include "base/types.hpp"
 #include <libk/bits.hpp>
-#include <libk/optional.hpp>
+#include <optional>
 
 namespace arch::riscv64 {
 enum class CsrId : u16 {
@@ -139,7 +140,7 @@ struct Stvec : ReadWriteCsr<CsrId::Stvec> {
     }
 
     static void install_direct(void* entry) noexcept {
-        KASSERT( ((reinterpret_cast<usize>(entry)) & MODE_MASK) == 0 );
+        libk_assert( ((reinterpret_cast<usize>(entry)) & MODE_MASK) == 0 );
         write(make(reinterpret_cast<usize>(entry), DIRECT));
     }
 
@@ -209,13 +210,13 @@ struct Satp : ReadWriteCsr<CsrId::Satp> {
 
     [[nodiscard]] static constexpr auto try_make_sv39(
         usize root_ppn,
-        usize asid = 0) noexcept -> libk::optional<usize> {
+        usize asid = 0) noexcept -> std::optional<usize> {
         constexpr usize max_ppn =
             (usize{1} << PPN_WIDTH) - 1;
         constexpr usize max_asid =
             (usize{1} << ASID_WIDTH) - 1;
         if (root_ppn > max_ppn || asid > max_asid) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return libk::encode_field<usize>(MODE_SV39, MODE_SHIFT, MODE_WIDTH) |
                libk::encode_field<usize>(asid, ASID_SHIFT, ASID_WIDTH) |

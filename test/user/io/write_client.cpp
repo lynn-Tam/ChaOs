@@ -1,6 +1,6 @@
-#include <user/server_rt/service.hpp>
-#include <user/abi/startup.hpp>
-#include <user/ipc/io.hpp>
+#include <servers/runtime/service.hpp>
+#include <sys/start.hpp>
+#include <sys/queue.hpp>
 
 namespace {
 constexpr uint64_t Offset = 64 * 512;

@@ -1,3 +1,4 @@
+#include <expected>
 #include <arch/ipi.hpp>
 
 #include "arch/riscv64/cpu/csr.hpp"
@@ -30,25 +31,25 @@ auto ipi_available() noexcept -> bool {
         riscv64::sbi::ipi_extension_id);
 }
 
-auto send_ipi(kernel::CpuHardwareId target) noexcept
-    -> libk::Expected<void, IpiError> {
+auto send_ipi(CpuHwId target) noexcept
+    -> std::expected<void, IpiError> {
     if (consume_injected_failure()) {
-        return libk::unexpected(IpiError::Rejected);
+        return std::unexpected(IpiError::Rejected);
     }
     const riscv64::sbi::HartMask mask =
         riscv64::sbi::single_hart_mask(target.raw);
     const riscv64::sbi::Ret result = riscv64::sbi::send_ipi(
         mask.bits, mask.base);
     if (result.error == riscv64::sbi::success) {
-        return libk::expected();
+        return {};
     }
     if (result.error == riscv64::sbi::not_supported) {
-        return libk::unexpected(IpiError::NotSupported);
+        return std::unexpected(IpiError::NotSupported);
     }
     if (result.error == riscv64::sbi::invalid_parameter) {
-        return libk::unexpected(IpiError::InvalidTarget);
+        return std::unexpected(IpiError::InvalidTarget);
     }
-    return libk::unexpected(IpiError::Rejected);
+    return std::unexpected(IpiError::Rejected);
 }
 
 void enable_ipi() noexcept {

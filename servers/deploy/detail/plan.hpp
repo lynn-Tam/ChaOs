@@ -15,9 +15,9 @@
 #include <stdint.h>
 
 #include <libk/assert.hpp>
-#include <libk/expected.hpp>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
+#include <expected>
+#include <optional>
+#include <utility>
 #include <uapi/capability.h>
 #include <servers/deploy/format.h>
 
@@ -416,7 +416,7 @@ public:
     [[nodiscard]] static auto decode(
         const ManifestView& view,
         PlanSet<Capacity, GenerationLimit>& plans) noexcept
-        -> libk::Expected<DeploymentPlan, PlanError>;
+        -> std::expected<DeploymentPlan, PlanError>;
 
     [[nodiscard]] auto id() const noexcept -> PlanId {
         return control_ == nullptr ? PlanId{} : control_->id;
@@ -499,17 +499,17 @@ public:
      * query returns an index into this immutable plan; it does not create a
      * second task registry or retain a borrowed row. */
     [[nodiscard]] auto find_task(ByteView name) const noexcept
-        -> libk::optional<uint32_t>;
+        -> std::optional<uint32_t>;
 
     template<size_t N>
     [[nodiscard]] auto find_task(const char (&name)[N]) const noexcept
-        -> libk::optional<uint32_t> {
+        -> std::optional<uint32_t> {
         static_assert(N != 0);
         return find_task(ByteView{
             reinterpret_cast<const uint8_t*>(name), N - 1});
     }
 
-    [[nodiscard]] auto lease() const noexcept -> libk::optional<PlanLease>;
+    [[nodiscard]] auto lease() const noexcept -> std::optional<PlanLease>;
 
     // A mapped program may release its bytes only after the last task has
     // relinquished the plan that borrows those bytes.
@@ -651,10 +651,10 @@ private:
     PlanId id_{};
 };
 
-inline auto DeploymentPlan::lease() const noexcept -> libk::optional<PlanLease> {
+inline auto DeploymentPlan::lease() const noexcept -> std::optional<PlanLease> {
     if (control_ == nullptr || control_->state != plan_detail::SlotState::Owned
         || !control_->id.valid() || control_->lease_count == UINT32_MAX) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     ++control_->lease_count;
     return PlanLease{control_, control_->id};
@@ -748,9 +748,9 @@ inline auto TaskPlanView::symbol(SymbolId symbol_id) const noexcept -> ByteView 
 }
 
 inline auto DeploymentPlan::find_task(ByteView name) const noexcept
-    -> libk::optional<uint32_t> {
+    -> std::optional<uint32_t> {
     if (!name) {
-        return libk::nullopt;
+        return std::nullopt;
     }
     for (uint32_t index = 0; index < task_count(); ++index) {
         const PlanTask* const row = task(index);
@@ -758,7 +758,7 @@ inline auto DeploymentPlan::find_task(ByteView name) const noexcept
             return index;
         }
     }
-    return libk::nullopt;
+    return std::nullopt;
 }
 
 template<size_t Capacity, uint32_t GenerationLimit>
@@ -787,7 +787,7 @@ public:
     }
 
     [[nodiscard]] auto decode(const ManifestView& view) noexcept
-        -> libk::Expected<DeploymentPlan, PlanError> {
+        -> std::expected<DeploymentPlan, PlanError> {
         plan_detail::PlanControl* control = nullptr;
         for (auto& candidate : controls_) {
             if (candidate.state == plan_detail::SlotState::Vacant) {
@@ -796,7 +796,7 @@ public:
             }
         }
         if (control == nullptr) {
-            return libk::unexpected(PlanError::Capacity);
+            return std::unexpected(PlanError::Capacity);
         }
 
         control->state = plan_detail::SlotState::Owned;
@@ -805,9 +805,9 @@ public:
         DeploymentPlan result{control};
         if (!result.decode_rows(view)) {
             result.release_owner();
-            return libk::unexpected(PlanError::InvalidInput);
+            return std::unexpected(PlanError::InvalidInput);
         }
-        return libk::expected(libk::move(result));
+        return result;
     }
 
     [[nodiscard]] constexpr auto capacity() const noexcept -> size_t {
@@ -844,7 +844,7 @@ template<size_t Capacity, uint32_t GenerationLimit>
 inline auto DeploymentPlan::decode(
     const ManifestView& view,
     PlanSet<Capacity, GenerationLimit>& plans) noexcept
-    -> libk::Expected<DeploymentPlan, PlanError> {
+    -> std::expected<DeploymentPlan, PlanError> {
     return plans.decode(view);
 }
 

@@ -8,13 +8,13 @@
 #include <libk/concepts.hpp>
 #include <libk/assert.hpp>
 #include <libk/memory.hpp>
-#include <libk/typetraits.hpp>
-#include <libk/utility.hpp>
+#include <type_traits>
+#include <utility>
 
 namespace libk {
 
 template<typename T, size_t Capacity>
-    requires(Object<T> && !is_const_v<T> && Capacity > 0)
+    requires(Object<T> && !std::is_const_v<T> && Capacity > 0)
 class InplaceRing {
 private:
     union slot {
@@ -34,13 +34,13 @@ public:
         template<bool>
         friend class basic_iterator;
 
-        using ring_type = conditional_t<IsConst, const InplaceRing, InplaceRing>;
+        using ring_type = std::conditional_t<IsConst, const InplaceRing, InplaceRing>;
 
     public:
         using value_type = T;
         using difference_type = ptrdiff_t;
-        using reference = conditional_t<IsConst, const T&, T&>;
-        using pointer = conditional_t<IsConst, const T*, T*>;
+        using reference = std::conditional_t<IsConst, const T&, T&>;
+        using pointer = std::conditional_t<IsConst, const T*, T*>;
 
         constexpr basic_iterator() noexcept = default;
 
@@ -55,7 +55,7 @@ public:
         }
 
         [[nodiscard]] constexpr pointer operator->() const noexcept {
-            return libk::addressof(operator*());
+            return std::addressof(operator*());
         }
 
         constexpr basic_iterator& operator++() noexcept {
@@ -91,29 +91,29 @@ public:
     constexpr InplaceRing() noexcept = default;
 
     constexpr InplaceRing(const InplaceRing& other)
-        requires is_copy_constructible_v<T> {
+        requires std::is_copy_constructible_v<T> {
         for (const T& value : other) {
             emplace_back(value);
         }
     }
 
     constexpr InplaceRing(const InplaceRing&)
-        requires (!is_copy_constructible_v<T>) = delete;
+        requires (!std::is_copy_constructible_v<T>) = delete;
 
     constexpr InplaceRing(InplaceRing&& other)
-        noexcept(is_nothrow_move_constructible_v<T>)
-        requires is_move_constructible_v<T> {
+        noexcept(std::is_nothrow_move_constructible_v<T>)
+        requires std::is_move_constructible_v<T> {
         while (!other.empty()) {
-            emplace_back(libk::move(other.front()));
+            emplace_back(std::move(other.front()));
             other.pop_front();
         }
     }
 
     constexpr InplaceRing(InplaceRing&&)
-        requires (!is_move_constructible_v<T>) = delete;
+        requires (!std::is_move_constructible_v<T>) = delete;
 
     constexpr InplaceRing& operator=(const InplaceRing& other)
-        requires is_copy_constructible_v<T> {
+        requires std::is_copy_constructible_v<T> {
         if (this == &other) {
             return *this;
         }
@@ -125,24 +125,24 @@ public:
     }
 
     constexpr InplaceRing& operator=(const InplaceRing&)
-        requires (!is_copy_constructible_v<T>) = delete;
+        requires (!std::is_copy_constructible_v<T>) = delete;
 
     constexpr InplaceRing& operator=(InplaceRing&& other)
-        noexcept(is_nothrow_move_constructible_v<T>)
-        requires is_move_constructible_v<T> {
+        noexcept(std::is_nothrow_move_constructible_v<T>)
+        requires std::is_move_constructible_v<T> {
         if (this == &other) {
             return *this;
         }
         clear();
         while (!other.empty()) {
-            emplace_back(libk::move(other.front()));
+            emplace_back(std::move(other.front()));
             other.pop_front();
         }
         return *this;
     }
 
     constexpr InplaceRing& operator=(InplaceRing&&)
-        requires (!is_move_constructible_v<T>) = delete;
+        requires (!std::is_move_constructible_v<T>) = delete;
 
     constexpr ~InplaceRing() {
         clear();
@@ -186,14 +186,14 @@ public:
     template<typename... Args>
         requires ConstructibleFrom<T, Args&&...>
     [[nodiscard]] constexpr T* try_emplace_back(Args&&... args)
-        noexcept(is_nothrow_constructible_v<T, Args&&...>) {
+        noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         if (full()) {
             return nullptr;
         }
         const size_t index = physical_index(size_);
         T* value = libk::construct_at(
-            libk::addressof(slot_at(index).value_),
-            libk::forward<Args>(args)...);
+            std::addressof(slot_at(index).value_),
+            std::forward<Args>(args)...);
         ++size_;
         return value;
     }
@@ -201,8 +201,8 @@ public:
     template<typename... Args>
         requires ConstructibleFrom<T, Args&&...>
     constexpr T& emplace_back(Args&&... args)
-        noexcept(is_nothrow_constructible_v<T, Args&&...>) {
-        T* value = try_emplace_back(libk::forward<Args>(args)...);
+        noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        T* value = try_emplace_back(std::forward<Args>(args)...);
         libk_assert(value != nullptr);
         return *value;
     }
@@ -210,21 +210,21 @@ public:
     template<typename U>
         requires ConstructibleFrom<T, U&&>
     [[nodiscard]] constexpr bool try_push_back(U&& value)
-        noexcept(is_nothrow_constructible_v<T, U&&>) {
-        return try_emplace_back(libk::forward<U>(value)) != nullptr;
+        noexcept(std::is_nothrow_constructible_v<T, U&&>) {
+        return try_emplace_back(std::forward<U>(value)) != nullptr;
     }
 
     template<typename... Args>
         requires ConstructibleFrom<T, Args&&...>
     [[nodiscard]] constexpr T* try_emplace_front(Args&&... args)
-        noexcept(is_nothrow_constructible_v<T, Args&&...>) {
+        noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         if (full()) {
             return nullptr;
         }
         const size_t new_head = decrement(head_);
         T* value = libk::construct_at(
-            libk::addressof(slot_at(new_head).value_),
-            libk::forward<Args>(args)...);
+            std::addressof(slot_at(new_head).value_),
+            std::forward<Args>(args)...);
         head_ = new_head;
         ++size_;
         return value;
@@ -233,8 +233,8 @@ public:
     template<typename... Args>
         requires ConstructibleFrom<T, Args&&...>
     constexpr T& emplace_front(Args&&... args)
-        noexcept(is_nothrow_constructible_v<T, Args&&...>) {
-        T* value = try_emplace_front(libk::forward<Args>(args)...);
+        noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        T* value = try_emplace_front(std::forward<Args>(args)...);
         libk_assert(value != nullptr);
         return *value;
     }
@@ -242,13 +242,13 @@ public:
     template<typename U>
         requires ConstructibleFrom<T, U&&>
     [[nodiscard]] constexpr bool try_push_front(U&& value)
-        noexcept(is_nothrow_constructible_v<T, U&&>) {
-        return try_emplace_front(libk::forward<U>(value)) != nullptr;
+        noexcept(std::is_nothrow_constructible_v<T, U&&>) {
+        return try_emplace_front(std::forward<U>(value)) != nullptr;
     }
 
     constexpr void pop_front() noexcept {
         libk_assert(!empty());
-        libk::destroy_at(libk::addressof(slot_at(head_).value_));
+        libk::destroy_at(std::addressof(slot_at(head_).value_));
         head_ = increment(head_);
         --size_;
         if (size_ == 0) {
@@ -267,11 +267,11 @@ public:
     template<typename U>
         requires AssignableFrom<U&, T&&>
     [[nodiscard]] constexpr bool try_pop_front(U& output)
-        noexcept(is_nothrow_assignable_v<U&, T&&>) {
+        noexcept(std::is_nothrow_assignable_v<U&, T&&>) {
         if (empty()) {
             return false;
         }
-        output = libk::move(front());
+        output = std::move(front());
         pop_front();
         return true;
     }
@@ -279,7 +279,7 @@ public:
     constexpr void pop_back() noexcept {
         libk_assert(!empty());
         const size_t index = physical_index(size_ - 1);
-        libk::destroy_at(libk::addressof(slot_at(index).value_));
+        libk::destroy_at(std::addressof(slot_at(index).value_));
         --size_;
         if (size_ == 0) {
             head_ = 0;
@@ -297,11 +297,11 @@ public:
     template<typename U>
         requires AssignableFrom<U&, T&&>
     [[nodiscard]] constexpr bool try_pop_back(U& output)
-        noexcept(is_nothrow_assignable_v<U&, T&&>) {
+        noexcept(std::is_nothrow_assignable_v<U&, T&&>) {
         if (empty()) {
             return false;
         }
-        output = libk::move(back());
+        output = std::move(back());
         pop_back();
         return true;
     }
@@ -337,12 +337,12 @@ public:
         const size_t index = position.logical_index_;
         if (index < size_ / 2) {
             for (size_t current = index; current != 0; --current) {
-                (*this)[current] = libk::move((*this)[current - 1]);
+                (*this)[current] = std::move((*this)[current - 1]);
             }
             pop_front();
         } else {
             for (size_t current = index; current + 1 < size_; ++current) {
-                (*this)[current] = libk::move((*this)[current + 1]);
+                (*this)[current] = std::move((*this)[current + 1]);
             }
             pop_back();
         }

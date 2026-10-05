@@ -6,7 +6,6 @@ import subprocess
 import sys
 import tempfile
 
-
 def main():
     qemu, kernel, cpus = sys.argv[1:4]
     extra_markers = sys.argv[4:]
@@ -75,7 +74,6 @@ def main():
                 print(text)
                 raise SystemExit(f"[io-platform] failed; diagnostic: {log}")
             print(f"[io-platform] OK: {count} harts, PCI enumeration, default-deny IOMMU")
-
 
 if __name__ == "__main__":
     main()

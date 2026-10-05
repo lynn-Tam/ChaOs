@@ -1,6 +1,6 @@
 #include <stdint.h>
 
-#include <user/abi/calls.hpp>
+#include <sys/syscall.hpp>
 
 namespace {
 

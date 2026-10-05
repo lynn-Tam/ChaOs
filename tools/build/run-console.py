@@ -8,8 +8,7 @@ import subprocess
 import sys
 import time
 
-
-def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=False, service_fault=False):
+def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fault=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -107,9 +106,6 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         for token in (first, second):
             if b'error: ' in run(f'wait {token}', b'myos> '):
                 raise RuntimeError('concurrent ELF mapping check failed')
-        if pressure and (not re.search(rb'pressure drained held=[1-9][0-9]* free=0', output)
-                         or b'pressure released held=' not in output):
-            raise RuntimeError('missing actual PMM drain/release evidence')
         run('run bad', b'error: -4')
         run('run absent', b'error: -5')
         run('run uart', b'error: -6')
@@ -154,12 +150,10 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, pressure=F
         profile = 'console-exhaustion' if exhaustion else 'console'
         (logs / f'{profile}-{smp}.raw').write_bytes(output)
 
-
 if __name__ == '__main__':
     qemu, kernel, bundle, disk, harts = sys.argv[1:6]
     exhaustion = len(sys.argv) >= 7 and sys.argv[6] == 'exhaustion'
-    iterations = int(sys.argv[7]) if len(sys.argv) == 8 and sys.argv[6] not in ('service-fault', 'pressure') else 3
+    iterations = int(sys.argv[7]) if len(sys.argv) == 8 and sys.argv[6] not in ('service-fault',) else 3
     for smp in harts.split(','):
         exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk,
-                 pressure=len(sys.argv) >= 7 and sys.argv[6] == 'pressure',
                  service_fault=len(sys.argv) >= 7 and sys.argv[6] == 'service-fault')

@@ -1,14 +1,12 @@
 #pragma once
 
-#include <user/abi/startup.hpp>
-#include <user/ipc/storage.hpp>
-#include <test/user/channel/export_protocol.hpp>
+#include <sys/start.hpp>
+#include <servers/vfs/protocol.hpp>
 #include <uapi/channel.h>
-#include <test/user/io/file_fault.hpp>
 
 #include <array>
 #include <map>
-#include <user/ipc/channel.hpp>
+#include <sys/channel.hpp>
 #include "packer.hpp"
 
 namespace deploy::host {
@@ -71,7 +69,7 @@ public:
 class Task final {
     Manifest& manifest_;
     std::string name_;
-    ProductionImageMetrics image_;
+    image_info image_;
     std::array<uint32_t, DEPLOY_TABLE_COUNT> first_{};
     uint32_t bootstrap_{};
     uint64_t budget_{};
@@ -158,7 +156,7 @@ public:
     Task(Manifest& manifest, std::string_view name, std::string_view elf,
          uint64_t budget, bool supervisor = false,
          uint64_t execution_budget = 1'000'000)
-        : manifest_(manifest), name_(name), image_(production_image_metrics(elf)),
+        : manifest_(manifest), name_(name), image_(read_image(elf)),
           budget_(budget), cspace_slots_(supervisor ? 128 : 32),
           cspace_pages_(supervisor ? 9 : 4), caps_(supervisor ? 512 : 64), supervisor_(supervisor) {
         for (unsigned t = 0; t < first_.size(); ++t) first_[t] = manifest_.count(t);
@@ -197,7 +195,7 @@ public:
         local(MYOS_BOOTSTRAP_CAP_RESOURCE_POOL, "pool",
               MYOS_RIGHT_CREATE | (supervisor ? MYOS_RIGHT_SPLIT : 0));
         local(MYOS_BOOTSTRAP_CAP_VSPACE, "vspace",
-              MYOS_RIGHT_CREATE_REGION | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
+              MYOS_RIGHT_DELEGATE | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
                   | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
         local(MYOS_BOOTSTRAP_CAP_CSPACE, "cspace", MYOS_RIGHT_MANAGE);
         local(MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION, "events",
@@ -310,138 +308,34 @@ public:
     }
 };
 
-inline auto pack_io_test(const char* path) -> std::vector<uint8_t> {
-    Manifest manifest;
-    Task task{manifest, "io-test", path, 4 * 1024 * 1024};
-    task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-    task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-    task.finish();
-    return manifest.finish();
-}
-
-inline auto pack_io_session(const char* server, const char* client) -> std::vector<uint8_t> {
-    Manifest manifest;
-    constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
-    {
-        Task task{manifest, "block", server, 4 * 1024 * 1024};
-        task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
-        task.finish();
-    }
-    {
-        Task task{manifest, "io-client", client, 2 * 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
-        task.finish();
-    }
-    return manifest.finish();
-}
-
-inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vector<uint8_t> {
-    Manifest manifest;
-    constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
-    {
-        Task task{manifest, "block", paths[0], 4 * 1024 * 1024};
-        task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
-        task.finish();
-    }
-    {
-        Task task{manifest, "files", paths[1], 16 * 1024 * 1024};
-        task.cspace(1024, 132);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
-        task.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, MYOS_RIGHT_RECEIVE);
-        task.finish();
-    }
-    {
-        Task task{manifest, "file-client", paths[2], 4 * 1024 * 1024};
-        task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, MYOS_RIGHT_SEND);
-        if (fault_test) {
-            task.authority(file_fault_test::Ready, "test.ready", MYOS_RIGHT_SIGNAL);
-            task.authority(file_fault_test::Go, "test.go", MYOS_RIGHT_RECEIVE);
-        }
-        task.finish();
-    }
-    return manifest.finish();
-}
-
 // Application reservations participate in the same per-hart admission domain
 // as native services; this budget leaves room for four concurrent jobs.
 inline constexpr uint64_t ApplicationBudget = 500'000;
-inline auto pack_application(const char* name, const char* image, uint64_t budget = ApplicationBudget,
-                             bool denied = false) -> std::vector<uint8_t> {
+enum class access { none, read, write, admin };
+
+inline auto pack_application(const char* name, const char* image,
+    access files = access::none, uint64_t budget = ApplicationBudget) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, name, image, 1024 * 1024, false, budget};
     task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
     task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
-    if (std::string_view{name} == "cat" || std::string_view{name} == "ls"
-        || std::string_view{name} == "put"
-        || std::string_view{name} == "get" || std::string_view{name} == "cp"
-        || std::string_view{name} == "fdcheck"
-        || std::string_view{name} == "fs"
-        || std::string_view{name} == "edit" || std::string_view{name} == "mkfs") {
+    if (files != access::none) {
         task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
         task.cspace(128, 20);
-        if (std::string_view{name} == "cat" || std::string_view{name} == "ls"
-            || std::string_view{name} == "get")
+        if (files == access::read)
             task.authority(myos::bootstrap::imports::VfsRead, "vfs.read.directory", MYOS_RIGHT_SEND);
-        else if (std::string_view{name} != "mkfs")
+        else if (files == access::write)
             task.authority(myos::bootstrap::imports::Vfs, "vfs.directory", MYOS_RIGHT_SEND);
-        if (std::string_view{name} == "mkfs")
+        else
             task.authority(myos::bootstrap::imports::StoreAdmin, "store.admin.directory", MYOS_RIGHT_SEND);
     }
-    if (denied) task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }
 
-inline auto pack_channel_test(const char* coordinator, const char* worker,
-    const char* provider, const char* holder) -> std::vector<uint8_t> {
-    Manifest manifest;
-    {
-        Task task{manifest, "channel-test", coordinator, 8 * 1024 * 1024, true};
-        task.cspace(512, 68);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.finish();
-    }
-    {
-        Task task{manifest, "writer", worker, 1024 * 1024, false, ApplicationBudget};
-        task.channel(myos::bootstrap::imports::Stdout, "data", 0, 1, MYOS_RIGHT_SEND);
-        task.channel(myos::bootstrap::imports::Stderr, "ready", 0, 1, MYOS_RIGHT_SEND);
-        task.finish();
-    }
-    {
-        Task task{manifest, "provider", provider, 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
-            MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE);
-        task.channel_service(channel_test::Provider, "provider.client", 1,
-            MYOS_RIGHT_RECEIVE, MYOS_RIGHT_SEND, 2);
-        task.finish();
-    }
-    {
-        Task task{manifest, "export-holder", holder, 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.requires_service(2, "provider");
-        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
-            MYOS_RIGHT_SEND);
-        task.channel(channel_test::Provider, "provider.client", 0, 1,
-            MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE);
-        task.finish();
-    }
-    return manifest.finish();
-}
-
-inline auto pack_console(char** paths, bool fail_shell = false, bool storage = false,
-    std::string_view volume_id = {})
+inline auto pack_console(char** paths, bool storage = false,
+    std::string_view volume_id = {}, uint64_t shell_memory = 2 * 1024 * 1024)
     -> std::vector<uint8_t> {
     Manifest manifest;
     // Row identities belong to this manifest, not to init or the kernel.
@@ -488,7 +382,7 @@ inline auto pack_console(char** paths, bool fail_shell = false, bool storage = f
         t.finish();
     }
     {
-        Task t{manifest, "shell", paths[2], fail_shell ? uint64_t{128} * 1024 : uint64_t{2} * 1024 * 1024,
+        Task t{manifest, "shell", paths[2], shell_memory,
             false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.requires_service(uart, "console");

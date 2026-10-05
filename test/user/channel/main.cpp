@@ -1,4 +1,5 @@
-#include <user/abi/time.hpp>
+#include <utility>
+#include <sys/clock.hpp>
 #include <servers/deploy/launch.hpp>
 
 namespace {
@@ -136,7 +137,7 @@ void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
             {.sources = source});
         require(status);
         check(static_cast<bool>(task));
-        return libk::move(*task);
+        return std::move(*task);
     };
     struct Transfer final { cap::OwnedCap cap; Supervisor::handle holder; };
     auto transfer = [&](Supervisor::handle& provider) noexcept -> Transfer {
@@ -147,7 +148,7 @@ void stale_service(myos_cap_t pool, myos_cap_t cspace) noexcept {
         require(status);
         check(static_cast<bool>(holder));
         auto received = next_cap();
-        return {libk::move(received), libk::move(*holder)};
+        return {std::move(received), std::move(*holder)};
     };
 
     auto first = launch();
@@ -206,7 +207,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             auto task = supervisor.launch(program, Supervisor::name("writer"), status,
                 {.arguments = &arguments, .terminal_events = terminal.value, .sources = sources});
             require(status); check(static_cast<bool>(task));
-            tasks[i] = libk::move(*task);
+            tasks[i] = std::move(*task);
         }
         unsigned entered{};
         for (unsigned i = 0; i != 3; ++i) {

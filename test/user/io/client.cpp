@@ -1,6 +1,6 @@
-#include <user/server_rt/service.hpp>
-#include <user/abi/startup.hpp>
-#include <user/ipc/io.hpp>
+#include <servers/runtime/service.hpp>
+#include <sys/start.hpp>
+#include <sys/queue.hpp>
 
 namespace {
 myos::io::ControlPort control;
@@ -47,7 +47,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     if (opened.message.id != 1 || opened.message.value != 1024 * 1024) exit(MYOS_STATUS_BAD_ARGS);
     for (size_t index = 1; index < 2; ++index) {
         const uintptr_t probe = 0x71000000 + index * 4096;
-        const auto region = vm_create_region(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
+        const auto region = vm_slice(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
             probe, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, MYOS_RIGHT_MAP);
         service::require(region.status);
         cap::OwnedCap owner{{region.value, 0}};

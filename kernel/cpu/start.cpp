@@ -4,22 +4,21 @@
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
 #include <arch/trap.hpp>
-#include <diag/console.hpp>
+#include <console.hpp>
 #include <irq/irq.hpp>
-#include <core/kernel_state.hpp>
-#include <core/debug.hpp>
-#include <cpu/cpu_registry.hpp>
-#include <cpu/cpu_runtime.hpp>
-#include <init/run.hpp>
-#include <libk/utility.hpp>
-#include <mm/direct_map.hpp>
-#include <arch/cpu.hpp>
+#include <state.hpp>
+#include <panic.hpp>
+#include <cpu/registry.hpp>
+#include <cpu/runtime.hpp>
+#include <boot/start.hpp>
+#include <utility>
+#include <mm/phys.hpp>
 #include <sched/dispatcher.hpp>
-#include <sync/trace.hpp>
+#if TEST_ENABLED
 #include <test/boot.hpp>
-#include <thread/thread.hpp>
+#endif
+#include <task/thread.hpp>
 
-namespace kernel {
 namespace {
 
 [[nodiscard]] constexpr auto failure_from(arch::CpuStartError error) noexcept
@@ -52,22 +51,22 @@ static_assert(failure_from(arch::CpuStartError::Rejected)
 
 void install_local_entry(
     CpuRuntime& runtime,
-    CpuHardwareId observed_hardware_id) noexcept {
-    KASSERT(runtime.owner_registry != nullptr);
-    KASSERT(runtime.local.descriptor != nullptr);
-    KASSERT(runtime.local.descriptor->hardware_id()
+    CpuHwId observed_hardware_id) noexcept {
+    libk_assert(runtime.owner_registry != nullptr);
+    libk_assert(runtime.local.descriptor != nullptr);
+    libk_assert(runtime.local.descriptor->hardware_id()
         == observed_hardware_id);
-    KASSERT(runtime.local.descriptor->state() == CpuState::Starting);
-    KASSERT(!arch::interrupts_enabled());
-    KASSERT(arch::set_local_cpu_entry(runtime.local.arch_state));
-    KASSERT(arch::install_trap());
-    KASSERT(runtime.initial_translation);
+    libk_assert(runtime.local.descriptor->state() == CpuState::Starting);
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(arch::set_local_cpu_entry(runtime.local.arch_state));
+    libk_assert(arch::install_trap());
+    libk_assert(runtime.initial_translation);
     runtime.initial_translation->adopt(runtime.local);
 }
 
 void start_secondaries(
     CpuRegistry& cpus,
-    const kernel::mm::DirectMap& direct_map) noexcept {
+    const mm::DirectMap& direct_map) noexcept {
     const CpuId boot = cpus.boot_id();
     if (!arch::secondary_start_available()) {
         for (usize index = 0; index < cpus.count(); ++index) {
@@ -75,7 +74,7 @@ void start_secondaries(
             const CpuDescriptor* const cpu = cpus.descriptor(id);
             if (id != boot && cpu != nullptr
                 && cpu->state() == CpuState::Prepared) {
-                KASSERT(cpus.fail_start(id, CpuFailure::HsmUnavailable));
+                libk_assert(cpus.fail_start(id, CpuFailure::HsmUnavailable));
             }
         }
         return;
@@ -95,11 +94,11 @@ void start_secondaries(
         }
 
         CpuRuntime* const runtime = cpus.runtime(id);
-        KASSERT(runtime != nullptr);
+        libk_assert(runtime != nullptr);
         const auto started = arch::start_secondary(
             cpu->hardware_id(), runtime->start_context, direct_map);
         if (!started) {
-            KASSERT(cpus.fail_start(id, failure_from(started.error())));
+            libk_assert(cpus.fail_start(id, failure_from(started.error())));
         }
     }
 }
@@ -116,7 +115,7 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
         }
     }
 
-    diag::console::print<
+    console::print<
         "cpu: discovered={} prepared={} starting={} online={} failed={}\n">(
         cpus.count(),
         snapshot.prepared,
@@ -129,19 +128,19 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
 
 [[noreturn]] void cpu_idle_entry(void* argument) noexcept {
     auto& runtime = *static_cast<CpuRuntime*>(argument);
-    KASSERT(runtime.owner_registry != nullptr);
-    KASSERT(runtime.local.current_thread() == &runtime.idle());
-    KASSERT(arch::active_stack(runtime.local.arch_state)
+    libk_assert(runtime.owner_registry != nullptr);
+    libk_assert(runtime.local.current_thread() == &runtime.idle());
+    libk_assert(arch::active_stack(runtime.local.arch_state)
         == runtime.idle().home_stack_top());
-    KASSERT(runtime.owner_registry->publish_online(runtime));
+    libk_assert(runtime.owner_registry->publish_online(runtime));
 
     if (runtime.local.descriptor->logical_id()
         == runtime.owner_registry->boot_id()) {
         print_snapshot(*runtime.owner_registry);
-        sync::dump_diagnostics();
-        kernel::test::runtime(runtime);
-        diag::console::print<"runtime: entered\n">();
-        diag::panic_probe(KERNEL_SOURCE_LOCATION("false"));
+#if TEST_ENABLED
+        test::runtime(runtime);
+#endif
+        console::print<"runtime: entered\n">();
     }
     sched::yield();
     for (;;) {
@@ -152,23 +151,22 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
 [[noreturn]] void boot_cpu_continue(
     KernelState& kernel,
     CpuRuntime& runtime) noexcept {
-    KASSERT(runtime.local.descriptor->logical_id()
+    libk_assert(runtime.local.descriptor->logical_id()
         == kernel.cpus().boot_id());
     install_local_entry(runtime, runtime.local.descriptor->hardware_id());
-    kernel::irq::initialize_platform();
-    diag::console::print<"trap install ok\n">();
+    arch::start_irqs(runtime.local.descriptor->hardware_id().raw);
+    console::print<"trap install ok\n">();
 
     auto allocation = kernel.pmm().allocate_page();
-    KASSERT(allocation);
-    auto page = libk::move(allocation).value();
+    libk_assert(allocation);
+    auto page = std::move(allocation).value();
     auto* const payload =
         reinterpret_cast<volatile uint8_t*>(page.bytes());
     *payload = 0xa5;
-    KASSERT(*payload == 0xa5);
+    libk_assert(*payload == 0xa5);
     page.reset();
-    KASSERT(kernel.pmm().verify_invariants());
-    KASSERT(arch_boot_stack_guard_intact());
-
+    libk_assert(kernel.pmm().verify_invariants());
+    libk_assert(arch_boot_stack_guard_intact());
 
     start_secondaries(kernel.cpus(), kernel.direct_map());
     runtime.dispatcher().enter_idle();
@@ -176,10 +174,8 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
 extern "C" [[noreturn]] void kernel_secondary_continue(
     CpuRuntime* runtime,
     usize observed_hardware_id) noexcept {
-    KASSERT(runtime != nullptr);
+    libk_assert(runtime != nullptr);
     auto& cpu = *runtime;
-    install_local_entry(cpu, CpuHardwareId{observed_hardware_id});
+    install_local_entry(cpu, CpuHwId{observed_hardware_id});
     cpu.dispatcher().enter_idle();
 }
-
-} // namespace kernel

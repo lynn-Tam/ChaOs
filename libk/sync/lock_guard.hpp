@@ -1,13 +1,14 @@
 #pragma once
 
+#include <concepts>
 #include <libk/concepts.hpp>
 
 namespace libk {
 
 template<typename Lock>
 concept BasicLockable = requires(Lock& lock) {
-    { lock.lock() } noexcept -> SameAs<void>;
-    { lock.unlock() } noexcept -> SameAs<void>;
+    { lock.lock() } noexcept -> std::same_as<void>;
+    { lock.unlock() } noexcept -> std::same_as<void>;
 };
 
 template<BasicLockable Lock>

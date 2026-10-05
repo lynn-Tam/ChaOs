@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -8,8 +9,8 @@
 #include "libk/fmt/error.hpp"
 #include "libk/fmt/output.hpp"
 #include "libk/fmt/spec.hpp"
-#include "libk/typetraits.hpp"
-#include "libk/utility.hpp"
+#include <type_traits>
+#include <utility>
 
 namespace libk::fmt {
 
@@ -19,36 +20,36 @@ struct formatter {};
 namespace detail {
 
 template<typename T>
-struct is_signed_integer : false_type {};
-template<> struct is_signed_integer<signed char> : true_type {};
-template<> struct is_signed_integer<short> : true_type {};
-template<> struct is_signed_integer<int> : true_type {};
-template<> struct is_signed_integer<long> : true_type {};
-template<> struct is_signed_integer<long long> : true_type {};
+struct is_signed_integer : std::false_type {};
+template<> struct is_signed_integer<signed char> : std::true_type {};
+template<> struct is_signed_integer<short> : std::true_type {};
+template<> struct is_signed_integer<int> : std::true_type {};
+template<> struct is_signed_integer<long> : std::true_type {};
+template<> struct is_signed_integer<long long> : std::true_type {};
 
 template<typename T>
-struct is_unsigned_integer : false_type {};
-template<> struct is_unsigned_integer<unsigned char> : true_type {};
-template<> struct is_unsigned_integer<unsigned short> : true_type {};
-template<> struct is_unsigned_integer<unsigned int> : true_type {};
-template<> struct is_unsigned_integer<unsigned long> : true_type {};
-template<> struct is_unsigned_integer<unsigned long long> : true_type {};
+struct is_unsigned_integer : std::false_type {};
+template<> struct is_unsigned_integer<unsigned char> : std::true_type {};
+template<> struct is_unsigned_integer<unsigned short> : std::true_type {};
+template<> struct is_unsigned_integer<unsigned int> : std::true_type {};
+template<> struct is_unsigned_integer<unsigned long> : std::true_type {};
+template<> struct is_unsigned_integer<unsigned long long> : std::true_type {};
 
 template<typename T>
-struct is_char_array : false_type {};
-template<size_t N> struct is_char_array<char[N]> : true_type {};
-template<size_t N> struct is_char_array<const char[N]> : true_type {};
+struct is_char_array : std::false_type {};
+template<size_t N> struct is_char_array<char[N]> : std::true_type {};
+template<size_t N> struct is_char_array<const char[N]> : std::true_type {};
 
 template<typename T>
-struct is_c_string_pointer : false_type {};
-template<> struct is_c_string_pointer<char*> : true_type {};
-template<> struct is_c_string_pointer<const char*> : true_type {};
+struct is_c_string_pointer : std::false_type {};
+template<> struct is_c_string_pointer<char*> : std::true_type {};
+template<> struct is_c_string_pointer<const char*> : std::true_type {};
 
 template<typename T>
-inline constexpr bool is_signed_integer_v = is_signed_integer<remove_cvr_t<T>>::value;
+inline constexpr bool is_signed_integer_v = is_signed_integer<std::remove_cvref_t<T>>::value;
 
 template<typename T>
-inline constexpr bool is_unsigned_integer_v = is_unsigned_integer<remove_cvr_t<T>>::value;
+inline constexpr bool is_unsigned_integer_v = is_unsigned_integer<std::remove_cvref_t<T>>::value;
 
 template<typename T, typename Ctx>
 concept has_custom_formatter = requires(formatter<T> f, const T& value, Ctx& ctx, const format_spec& spec) {
@@ -406,11 +407,11 @@ constexpr bool write_pointer(Ctx& ctx, const void* ptr, const format_spec& spec)
 
 template<typename R>
 constexpr bool custom_result_ok(R value) noexcept {
-    if constexpr (SameAs<R, bool>) {
+    if constexpr (std::same_as<R, bool>) {
         return value;
-    } else if constexpr (SameAs<R, errc>) {
+    } else if constexpr (std::same_as<R, errc>) {
         return value == errc::ok;
-    } else if constexpr (SameAs<R, result>) {
+    } else if constexpr (std::same_as<R, result>) {
         return value.ok();
     } else {
         return static_cast<bool>(value);
@@ -421,7 +422,7 @@ template<typename Sink, typename T>
 constexpr bool format_custom(output_context<Sink>& ctx, const format_spec& spec, const T& value) noexcept {
     formatter<T> f{};
     using R = decltype(f.format(value, ctx, spec));
-    if constexpr (is_void_v<R>) {
+    if constexpr (std::is_void_v<R>) {
         f.format(value, ctx, spec);
         return true;
     } else {
@@ -438,8 +439,8 @@ constexpr bool format_custom(output_context<Sink>& ctx, const format_spec& spec,
 
 template<typename Sink, typename T>
 constexpr bool format_value(output_context<Sink>& ctx, const format_spec& spec, const T& value) noexcept {
-    using Raw = remove_ref_t<T>;
-    using Clean = remove_cvr_t<T>;
+    using Raw = std::remove_reference_t<T>;
+    using Clean = std::remove_cvref_t<T>;
 
     if constexpr (has_custom_formatter<Clean, output_context<Sink>>) {
         return format_custom(ctx, spec, static_cast<const Clean&>(value));
@@ -449,14 +450,14 @@ constexpr bool format_value(output_context<Sink>& ctx, const format_spec& spec, 
             ++n;
         }
         return write_string(ctx, StrView{value, n}, spec);
-    } else if constexpr (SameAs<Clean, StrView>) {
+    } else if constexpr (std::same_as<Clean, StrView>) {
         return write_string(ctx, value, spec);
-    } else if constexpr (SameAs<Clean, bool>) {
+    } else if constexpr (std::same_as<Clean, bool>) {
         if (spec.type == 0 || spec.type == 's' || spec.type == '?') {
             return write_string(ctx, value ? StrView{"true", 4} : StrView{"false", 5}, spec);
         }
         return write_unsigned_number(ctx, value ? 1u : 0u, spec, false);
-    } else if constexpr (SameAs<Clean, char>) {
+    } else if constexpr (std::same_as<Clean, char>) {
         if (spec.type == 0 || spec.type == 'c' || spec.type == '?') {
             return write_char(ctx, value, spec);
         }
@@ -477,9 +478,9 @@ constexpr bool format_value(output_context<Sink>& ctx, const format_spec& spec, 
     } else if constexpr (__is_enum(Clean)) {
         using Underlying = __underlying_type(Clean);
         return format_value(ctx, spec, static_cast<Underlying>(value));
-    } else if constexpr (is_pointer_v<Clean>) {
+    } else if constexpr (std::is_pointer_v<Clean>) {
         return write_pointer(ctx, static_cast<const void*>(value), spec);
-    } else if constexpr (SameAs<Clean, decltype(nullptr)>) {
+    } else if constexpr (std::same_as<Clean, decltype(nullptr)>) {
         return write_pointer(ctx, nullptr, spec);
     } else {
         ctx.fail(errc::type_mismatch);

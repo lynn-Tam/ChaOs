@@ -1,43 +1,27 @@
-#include <cap/grant_graph.hpp>
+#include <expected>
+#include <cap/graph.hpp>
 
-#include <object/tunnel_pool.hpp>
-#include <object/channel_pool.hpp>
-#include <object/pager_pool.hpp>
-#include <object/irq_pool.hpp>
+#include <object/ref.hpp>
 
-#include <cap/policy.hpp>
-#include <core/debug.hpp>
-#include <diag/console.hpp>
-#include <libk/limits.hpp>
+#include <cap/cap.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
+#include <console.hpp>
+#include <limits>
 #include <libk/memory.hpp>
-#include <libk/utility.hpp>
-#include <object/resource_pool.hpp>
-#include <object/sched_pool.hpp>
-#include <object/thread_pool.hpp>
-#include <object/vproc_pool.hpp>
-#include <resource/pool.hpp>
-#include <thread/thread.hpp>
-#include <sync/irq_lock_guard.hpp>
+#include <utility>
+#include <object/group.hpp>
+#include <sync.hpp>
 
-namespace kernel::cap {
-
-namespace {
-
-constexpr u32 grant_published = 1;
-constexpr u32 grant_servicing = 2;
-constexpr u32 grant_complete = 3;
-
-} // namespace
-
-/*luna change: use the libk saturating epoch primitive, reason: grant service diagnostics share the common no-wrap epoch contract*/
+namespace cap {
 
 GrantWork::GrantWork(GrantWork&& other) noexcept
-    : attachment_(libk::exchange(other.attachment_, nullptr)) {}
+    : attachment_(std::exchange(other.attachment_, nullptr)) {}
 
 auto GrantWork::operator=(GrantWork&& other) noexcept -> GrantWork& {
     if (this != &other) {
         reset();
-        attachment_ = libk::exchange(other.attachment_, nullptr);
+        attachment_ = std::exchange(other.attachment_, nullptr);
     }
     return *this;
 }
@@ -48,7 +32,7 @@ GrantWork::~GrantWork() noexcept {
 
 void GrantWork::reset() noexcept {
     GrantAttachment* const attachment =
-        libk::exchange(attachment_, nullptr);
+        std::exchange(attachment_, nullptr);
     if (attachment != nullptr) {
         attachment->drop_work();
     }
@@ -57,9 +41,9 @@ void GrantWork::reset() noexcept {
 GrantAttachment::~GrantAttachment() noexcept {
     const State current = static_cast<State>(
         state_.load<libk::MemoryOrder::Acquire>());
-    KASSERT(current == State::Idle || current == State::Detached);
-    KASSERT(graph_ == nullptr && node_ == nullptr);
-    KASSERT(work_.load<libk::MemoryOrder::Acquire>() == 0);
+    libk_assert(current == State::Idle || current == State::Detached);
+    libk_assert(graph_ == nullptr && node_ == nullptr);
+    libk_assert(work_.load<libk::MemoryOrder::Acquire>() == 0);
 }
 
 auto GrantAttachment::attached() const noexcept -> bool {
@@ -73,11 +57,11 @@ auto GrantAttachment::busy() const noexcept -> bool {
 }
 
 void GrantAttachment::reset() noexcept {
-    KASSERT(graph_ == nullptr && node_ == nullptr);
-    KASSERT(work_.load<libk::MemoryOrder::Acquire>() == 0);
+    libk_assert(graph_ == nullptr && node_ == nullptr);
+    libk_assert(work_.load<libk::MemoryOrder::Acquire>() == 0);
     const State current = static_cast<State>(
         state_.load<libk::MemoryOrder::Acquire>());
-    KASSERT(current == State::Detached || current == State::Idle);
+    libk_assert(current == State::Detached || current == State::Idle);
     state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(State::Idle));
 }
@@ -94,542 +78,214 @@ auto GrantAttachment::detach() noexcept -> bool {
 
 void GrantAttachment::drop_work() noexcept {
     const usize previous = work_.fetch_sub<libk::MemoryOrder::SeqCst>(1);
-    KASSERT(previous != 0);
+    libk_assert(previous != 0);
     u8 draining = static_cast<u8>(State::Draining);
     if (previous == 1 && state_.compare_exchange_strong<
             libk::MemoryOrder::SeqCst, libk::MemoryOrder::SeqCst>(
                 draining, static_cast<u8>(State::Detached))) {
-        KASSERT(ops_ != nullptr && ops_->released != nullptr);
+        libk_assert(ops_ != nullptr && ops_->released != nullptr);
         ops_->released(context_);
     }
 }
 
-GrantGraph::GrantGraph(kernel::mm::Pmm& pmm) noexcept
+GrantGraph::GrantGraph(mm::Pmm& pmm) noexcept
     : GrantGraph(pmm, Quota{}) {}
 
-GrantGraph::GrantGraph(kernel::mm::Pmm& pmm, Quota quota) noexcept
+GrantGraph::GrantGraph(mm::Pmm& pmm, Quota quota) noexcept
     : pmm_(&pmm),
       quota_(quota) {}
 
-GrantRevokeWait::GrantRevokeWait(GrantGraph& graph) noexcept
-    : completion_(kernel::sync::Completion::Notifier::bind<
-          &GrantRevokeWait::ready>(*this)),
-      relation_(kernel::operation::Completion::bind<
-          GrantRevokeWait,
-          &GrantRevokeWait::complete,
-          &GrantRevokeWait::read,
-          &GrantRevokeWait::release,
-          &GrantRevokeWait::cancel>(*this)) {
-    relation_.set_policy(diag::concurrency::OperationPolicy{
-        .kind = diag::concurrency::WaitKind::GrantWork,
-        .expectation = diag::concurrency::Expectation::InternalFinite,
-        .driver = diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&graph), 1),
-    });
-}
-
-void GrantRevokeWait::ready() noexcept {
-    KASSERT(completion_.complete());
-    relation_.signal();
-}
-
-auto GrantRevokeWait::read() noexcept -> kernel::operation::Result {
-    KASSERT(completion_.complete());
-    return {};
-}
-
-void GrantRevokeWait::release() noexcept {
-    KASSERT(!completion_.initialized() || completion_.complete());
-}
-
-auto GrantRevokeWait::cancel() noexcept -> bool {
-    return !completion_.initialized();
-}
-
-auto GrantGraph::close_pool(
-    kernel::resource::ResourcePool& pool,
-    const kernel::object::ObjectRef& self,
-    kernel::Thread& thread,
-    kernel::CpuRegistry& cpus) noexcept
-    -> libk::Expected<kernel::operation::State, GrantError> {
-    auto* const operation = thread.current_wait().prepare_close(*this);
-    if (operation == nullptr) return libk::unexpected(GrantError::InvalidState);
-    if (!thread.begin_wait(operation->relation(), cpus)) {
-        KASSERT(operation->cancel());
-        return libk::unexpected(GrantError::InvalidState);
-    }
-    if (!pool.observe_refund(self, operation->notifier())) {
-        thread.cancel_wait();
-        return libk::unexpected(GrantError::InvalidState);
-    }
-    operation->commit();
-    static_cast<void>(pool.close());
-    if (operation->arm()) return libk::expected(kernel::operation::State::Waiting);
-    // The countdown completed before arming, so its notifier did not run.
-    operation->relation().signal();
-    return libk::expected(kernel::operation::State::Complete);
-}
-
-GrantLease::GrantLease(GrantLease&& other) noexcept
-    : graph_(libk::exchange(other.graph_, nullptr)),
-      node_(libk::exchange(other.node_, nullptr)),
-      generation_(libk::exchange(other.generation_, u64{})) {}
-
-auto GrantLease::operator=(GrantLease&& other) noexcept -> GrantLease& {
-    if (this != &other) {
-        reset();
-        graph_ = libk::exchange(other.graph_, nullptr);
-        node_ = libk::exchange(other.node_, nullptr);
-        generation_ = libk::exchange(other.generation_, u64{});
-    }
-    return *this;
-}
-
-GrantLease::~GrantLease() noexcept {
-    reset();
-}
-
 auto GrantLease::key() const noexcept -> GrantKey {
-    KASSERT(graph_ != nullptr);
-    const auto& node = *static_cast<const GrantGraph::Node*>(node_);
-    KASSERT(node.slot->generation.load<libk::MemoryOrder::Acquire>()
-        == generation_);
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    const auto& node = *static_cast<const GrantGraph::Node*>(d.node);
+    libk_assert(node.slot->generation.load<libk::MemoryOrder::Acquire>()
+        == d.gen);
     return GrantGraph::key_of(node);
 }
 
-auto GrantLease::kind() const noexcept -> object::ObjectKind {
-    KASSERT(graph_ != nullptr);
-    return static_cast<const GrantGraph::Node*>(node_)->target.kind();
+auto GrantLease::graph() const noexcept -> GrantGraph& {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return *d.graph;
 }
 
-auto GrantLease::ceiling() const noexcept -> Authority {
-    KASSERT(graph_ != nullptr);
-    return static_cast<const GrantGraph::Node*>(node_)->ceiling;
+auto GrantLease::kind() const noexcept -> object::ObjectKind {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return static_cast<const GrantGraph::Node*>(d.node)->target.kind();
+}
+
+auto GrantLease::get() const noexcept -> void* {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    // Revocation and reclamation cannot move Node::target until operations=0.
+    return static_cast<const GrantGraph::Node*>(d.node)->target.get();
+}
+
+auto GrantLease::target_live() const noexcept -> bool {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return static_cast<const GrantGraph::Node*>(d.node)->target.live();
+}
+
+auto GrantLease::ceiling() const noexcept -> View {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return static_cast<const GrantGraph::Node*>(d.node)->ceiling;
 }
 
 auto GrantLease::clone_target() const noexcept
-    -> libk::Expected<object::ObjectRef, object::ObjectError> {
-    KASSERT(graph_ != nullptr);
-    return static_cast<const GrantGraph::Node*>(node_)->target.clone();
+    -> std::expected<object::ref<>, object::error> {
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return static_cast<const GrantGraph::Node*>(d.node)->target.clone();
 }
 
 auto GrantLease::attach(GrantAttachment& attachment) const noexcept
-    -> libk::Expected<void, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
+    -> std::expected<void, GrantError> {
+    const auto& d = h_.get();
+    if (d.graph == nullptr) {
+        return std::unexpected(GrantError::InvalidKey);
     }
-    return graph_->attach(*this, attachment);
+    return d.graph->attach(*this, attachment);
 }
 
-auto GrantLease::derive_region(
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    RegionDerivation proof) const noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    return graph_->derive_region(
-        libk::move(charge), *this, libk::move(target), ceiling, proof);
+auto GrantLease::mint(resource::Reservation&& charge, View ceiling) const noexcept
+    -> std::expected<GrantRef, GrantError> {
+    const auto& d = h_.get();
+    if (!d.graph) return std::unexpected(GrantError::InvalidKey);
+    auto* parent = static_cast<GrantGraph::Node*>(d.node);
+    if (!validate_ceiling(parent->target.kind(), ceiling))
+        return std::unexpected(GrantError::RightsViolation);
+    auto target = parent->target.clone();
+    if (!target) return std::unexpected(GrantError::InvalidState);
+    return d.graph->create(std::move(charge), std::move(target).value(), ceiling, parent);
 }
 
-auto GrantLease::derive_tunnel_tx(
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    TunnelConnectProof proof) const noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    return graph_->derive_tunnel_tx(
-        libk::move(charge), *this, libk::move(target), ceiling, proof);
-}
-
-auto GrantLease::derive_channel_badge(
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    ChannelBadgeDerivation proof) const noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    return graph_->derive_channel_badge(
-        libk::move(charge), *this, libk::move(target), ceiling, proof);
-}
-
-void GrantLease::reset() noexcept {
-    GrantGraph* const graph = libk::exchange(graph_, nullptr);
-    void* const node = libk::exchange(node_, nullptr);
-    const u64 generation = libk::exchange(generation_, u64{});
-    if (graph != nullptr) {
-        graph->drop_lease(node, generation);
-    }
-}
-
-GrantRef::GrantRef(GrantRef&& other) noexcept
-    : graph_(libk::exchange(other.graph_, nullptr)),
-      slot_(libk::exchange(other.slot_, nullptr)),
-      generation_(libk::exchange(other.generation_, u64{})) {}
-
-auto GrantRef::operator=(GrantRef&& other) noexcept -> GrantRef& {
-    if (this != &other) {
-        reset();
-        graph_ = libk::exchange(other.graph_, nullptr);
-        slot_ = libk::exchange(other.slot_, nullptr);
-        generation_ = libk::exchange(other.generation_, u64{});
-    }
-    return *this;
-}
-
-GrantRef::~GrantRef() noexcept {
-    reset();
+void GrantLease::Drop::operator()(Data& d) const noexcept {
+    d.graph->drop_lease(d.node, d.gen);
 }
 
 auto GrantRef::key() const noexcept -> GrantKey {
-    KASSERT(graph_ != nullptr);
-    KASSERT(slot_ != nullptr && generation_ != 0);
-    return GrantKey{reinterpret_cast<usize>(slot_), generation_};
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    libk_assert(d.slot != nullptr && d.gen != 0);
+    return GrantKey{reinterpret_cast<usize>(d.slot), d.gen};
 }
 
 auto GrantRef::graph() const noexcept -> GrantGraph& {
-    KASSERT(graph_ != nullptr);
-    return *graph_;
+    const auto& d = h_.get();
+    libk_assert(d.graph != nullptr);
+    return *d.graph;
 }
 
 auto GrantRef::clone() const noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
+    -> std::expected<GrantRef, GrantError> {
+    const auto& d = h_.get();
+    if (d.graph == nullptr) {
+        return std::unexpected(GrantError::InvalidKey);
     }
-    return graph_->ref(key());
+    return d.graph->ref(key());
 }
 
 auto GrantRef::acquire() const noexcept
-    -> libk::Expected<GrantLease, GrantError> {
-    if (graph_ == nullptr) {
-        return libk::unexpected(GrantError::InvalidKey);
+    -> std::expected<GrantLease, GrantError> {
+    const auto& d = h_.get();
+    if (d.graph == nullptr) {
+        return std::unexpected(GrantError::InvalidKey);
     }
-    return graph_->try_acquire(
-        *static_cast<GrantGraph::Slot*>(slot_), generation_);
+    return d.graph->try_acquire(
+        *static_cast<GrantGraph::Slot*>(d.slot), d.gen);
 }
 
-void GrantRef::reset() noexcept {
-    GrantGraph* const graph = libk::exchange(graph_, nullptr);
-    void* const slot = libk::exchange(slot_, nullptr);
-    const u64 generation = libk::exchange(generation_, u64{});
-    if (graph != nullptr) {
-        graph->drop_ref(slot, generation);
-    }
+void GrantRef::Drop::operator()(Data& d) const noexcept {
+    d.graph->drop_ref(d.slot, d.gen);
 }
 
-void GrantRevoke::initialize(usize pending) noexcept {
-    // Revoke objects are caller-owned and may be re-emplaced over a retired
-    // generation. Never carry the previous diagnostic key into this one.
-    observation_key_.store<libk::MemoryOrder::Relaxed>(0);
-    completion_.initialize(pending);
-    auto observation = diag::concurrency::ObservationLease::reserve(
-        diag::concurrency::RecordKind::GrantRevoke,
-        reinterpret_cast<u64>(this),
-        pending == 0 ? 1 : pending,
-        diag::concurrency::Expectation::InternalFinite);
-    diag::concurrency::ObservationBatch update{
-        .phase = grant_published,
-        .semantic_stamp = pending,
-        .wait = diag::concurrency::WaitKind::GrantWork,
-        .driver = diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(this)),
-        .site = diag::concurrency::SourceSite::current(),
-        .detail_mask = 1U,
-        .update_progress = true,
-        .update_watched = true,
-        .watched = pending != 0};
-    update.detail[0] = pending;
-    observation.publish(update);
-    if (pending != 0) {
-        observation_key_.store<libk::MemoryOrder::Release>(
-            observation.detach_key().raw);
-    } else {
-        observation.finish(grant_complete);
-    }
-}
+void GrantRevoke::initialize(usize pending) noexcept { completion_.initialize(pending); }
 
-void GrantRevoke::acknowledge() noexcept {
-    const auto key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(key);
-    observation.advance();
-    static_cast<void>(completion_.acknowledge([&]() noexcept {
-        const auto terminal = diag::concurrency::ObservationKey{
-            observation_key_.exchange<libk::MemoryOrder::AcqRel>(0)};
-        if (terminal) {
-            auto finished =
-                diag::concurrency::ObservationLease::borrow(terminal);
-            finished.finish(grant_complete);
-        }
-    }));
-}
-
-void GrantRevoke::service(
-    diag::concurrency::ObservationKey key) noexcept {
-    const auto own_key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(own_key);
-    observation.attempt(
-        grant_published,
-        diag::concurrency::WaitKind::GrantWork,
-        diag::concurrency::NodeRef::observation(key));
-}
-
-void GrantRevoke::progress(
-    u32 phase,
-    u64 semantic_stamp,
-    diag::concurrency::NodeRef driver,
-    diag::concurrency::NodeRef blocker,
-    usize operations,
-    usize attachments,
-    bool retained,
-    u64 slot) noexcept {
-    const auto key = observation_key();
-    auto observation = diag::concurrency::ObservationLease::borrow(key);
-    diag::concurrency::ObservationBatch update{
-        .phase = phase,
-        .semantic_stamp = semantic_stamp,
-        .wait = diag::concurrency::WaitKind::GrantOperations,
-        .driver = driver,
-        .blocker = blocker,
-        .site = diag::concurrency::SourceSite::current(),
-        .detail_mask = 0xfU,
-        .update_progress = true};
-    update.detail[0] = operations;
-    update.detail[1] = attachments;
-    update.detail[2] = retained ? 1 : 0;
-    update.detail[3] = slot;
-    observation.publish(update);
-}
+void GrantRevoke::acknowledge() noexcept { static_cast<void>(completion_.acknowledge()); }
 
 GrantGraph::~GrantGraph() noexcept {
-    KASSERT(!work_notifier_);
-    KASSERT(work_.empty());
-    KASSERT(live_nodes_ == 0);
-    while (pages_ != nullptr) {
-        PageHeader* const page = pages_;
-        pages_ = page->next;
-        release_page(*page);
-    }
-    KASSERT(page_count_ == 0);
+    libk_assert(!work_notifier_);
+    libk_assert(work_.empty());
+    libk_assert(storage_.live() == 0 && growing_ == 0);
+    while (auto* page = storage_.take_page()) release_page(*page);
 }
 
 auto GrantGraph::create_root(
-    object::ObjectRef&& target,
-    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
-    return create_root({}, libk::move(target), ceiling);
+    object::ref<>&& target,
+    View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
+    return create_root({}, std::move(target), ceiling);
 }
 
 auto GrantGraph::create_root(
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
+    resource::Reservation&& charge,
+    object::ref<>&& target,
+    View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
     if (!target || !validate_ceiling(target.kind(), ceiling)) {
-        return libk::unexpected(GrantError::RightsViolation);
+        return std::unexpected(GrantError::RightsViolation);
     }
     return create(
-        libk::move(charge), libk::move(target), ceiling, nullptr);
-}
-
-auto GrantGraph::create_allocation(
-    kernel::resource::Permit& permit,
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling) noexcept
-    -> libk::Expected<kernel::resource::AllocationTxn, GrantError> {
-    if (!permit || !target) {
-        return libk::unexpected(GrantError::InvalidState);
-    }
-    auto capability_target = target.clone();
-    if (!capability_target) {
-        return libk::unexpected(GrantError::InvalidState);
-    }
-    auto created = create_root(
-        libk::move(charge),
-        libk::move(capability_target).value(),
-        ceiling);
-    if (!created) {
-        return libk::unexpected(created.error());
-    }
-    GrantRef root = libk::move(created).value();
-    const GrantKey key = root.key();
-    kernel::resource::Allocation* allocation{};
-    {
-        kernel::sync::IrqLockGuard guard{lock_};
-        Node* const node = find(key);
-        KASSERT(node != nullptr && !node->allocation);
-        allocation = &node->allocation;
-        allocation->graph_ = this;
-        allocation->root_ = key;
-        allocation->target_ = libk::move(target);
-        allocation->state_ = kernel::resource::AllocationState::Pending;
-    }
-    KASSERT(permit.pool_ != nullptr);
-    permit.pool_->attach(permit, *allocation);
-    return libk::expected(kernel::resource::AllocationTxn{
-        *this, *allocation, libk::move(root)});
+        std::move(charge), std::move(target), ceiling, nullptr);
 }
 
 auto GrantGraph::derive(
     const GrantLease& source,
-    object::ObjectRef&& target,
-    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
-    return derive({}, source, libk::move(target), ceiling);
+    object::ref<>&& target,
+    View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
+    return derive({}, source, std::move(target), ceiling);
 }
 
 auto GrantGraph::derive(
-    kernel::resource::Reservation&& charge,
+    resource::Reservation&& charge,
     const GrantLease& source,
-    object::ObjectRef&& target,
-    Authority ceiling) noexcept -> libk::Expected<GrantRef, GrantError> {
-    if (source.graph_ != this || !target) {
-        return libk::unexpected(GrantError::InvalidKey);
+    object::ref<>&& target,
+    View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
+    if (source.h_.get().graph != this || !target) {
+        return std::unexpected(GrantError::InvalidKey);
     }
-    auto* const parent = static_cast<Node*>(source.node_);
+    auto* const parent = static_cast<Node*>(source.h_.get().node);
     if (target.kind() != parent->target.kind()) {
-        return libk::unexpected(GrantError::WrongKind);
+        return std::unexpected(GrantError::WrongKind);
+    }
+    if (target.id() != parent->target.id()) {
+        return std::unexpected(GrantError::InvalidKey);
     }
     if (!validate_ceiling(target.kind(), ceiling)
         || !attenuates(
             target.kind(),
-            Authority{
-                parent->ceiling.rights, parent->ceiling.data},
+            parent->ceiling,
             ceiling)) {
-        return libk::unexpected(GrantError::RightsViolation);
+        return std::unexpected(GrantError::RightsViolation);
     }
     return create(
-        libk::move(charge), libk::move(target), ceiling, parent);
-}
-
-auto GrantGraph::derive_region(
-    kernel::resource::Reservation&& charge,
-    const GrantLease& source,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    RegionDerivation proof) noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (source.graph_ != this || !target
-        || target.kind() != object::ObjectKind::VSpace) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    auto* const parent = static_cast<Node*>(source.node_);
-    if (target.kind() != parent->target.kind()
-        || !validate_ceiling(target.kind(), ceiling)) {
-        return libk::unexpected(GrantError::RightsViolation);
-    }
-    const auto* const parent_data =
-        libk::get_if<VSpaceAuthority>(&parent->ceiling.data);
-    const auto* const child_data =
-        libk::get_if<VSpaceAuthority>(&ceiling.data);
-    if (parent_data == nullptr || child_data == nullptr
-        || parent_data->region != proof.parent_
-        || child_data->region != proof.child_
-        || child_data->range != proof.range_
-        || !parent_data->range.contains(proof.range_)
-        || !parent_data->access.contains(child_data->access)
-        || !parent_data->types.contains(child_data->types)
-        || !parent->ceiling.rights.contains(ceiling.rights)) {
-        return libk::unexpected(GrantError::RightsViolation);
-    }
-    return create(
-        libk::move(charge), libk::move(target), ceiling, parent);
-}
-
-auto GrantGraph::derive_tunnel_tx(
-    kernel::resource::Reservation&& charge,
-    const GrantLease& source,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    TunnelConnectProof proof) noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    const Rights connect = Rights::of(Right::Connect);
-    const Rights tx = Rights::of(
-        Right::Duplicate, Right::Inspect, Right::Signal, Right::Close);
-    if (source.graph_ != this || !target
-        || target.kind() != object::ObjectKind::Tunnel
-        || proof.tunnel_ == nullptr || proof.source_ == nullptr
-        || proof.claim_ == 0 || ceiling.rights != tx
-        || !libk::holds_alternative<libk::monostate>(ceiling.data)) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    auto* const parent = static_cast<Node*>(source.node_);
-    auto tunnel = target.pin<kernel::ipc::Tunnel>();
-    if (parent->target.kind() != object::ObjectKind::Tunnel
-        || !parent->ceiling.rights.contains(connect)
-        || target.id() != parent->target.id() || !tunnel
-        || &tunnel.value().get() != proof.tunnel_) {
-        return libk::unexpected(GrantError::RightsViolation);
-    }
-    return create(
-        libk::move(charge), libk::move(target), ceiling, parent);
-}
-
-auto GrantGraph::derive_channel_badge(
-    kernel::resource::Reservation&& charge,
-    const GrantLease& source,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    ChannelBadgeDerivation proof) noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    if (source.graph_ != this || !target
-        || target.kind() != object::ObjectKind::Channel
-        || proof.channel_ == nullptr || proof.badge_ == 0
-        || !validate_ceiling(target.kind(), ceiling)) {
-        return libk::unexpected(GrantError::InvalidKey);
-    }
-    auto* const parent = static_cast<Node*>(source.node_);
-    auto channel = target.pin<kernel::ipc::Channel>();
-    if (parent->target.kind() != object::ObjectKind::Channel
-        || target.id() != parent->target.id() || !channel
-        || &channel.value().get() != proof.channel_) {
-        return libk::unexpected(GrantError::RightsViolation);
-    }
-    const auto* const parent_data =
-        libk::get_if<ChannelAuthority>(&parent->ceiling.data);
-    const auto* const child_data =
-        libk::get_if<ChannelAuthority>(&ceiling.data);
-    if (parent_data == nullptr || child_data == nullptr
-        || !parent_data->unbound()
-        || (parent_data->side != ChannelSide::Any
-            && parent_data->side != proof.side_)
-        || child_data->side != proof.side_
-        || !child_data->exact()
-        || child_data->badge != proof.badge_
-        || !parent->ceiling.rights.contains(ceiling.rights)) {
-        return libk::unexpected(GrantError::RightsViolation);
-    }
-    return create(
-        libk::move(charge), libk::move(target), ceiling, parent);
+        std::move(charge), std::move(target), ceiling, parent);
 }
 
 auto GrantGraph::create(
-    kernel::resource::Reservation&& charge,
-    object::ObjectRef&& target,
-    Authority ceiling,
-    Node* parent) noexcept -> libk::Expected<GrantRef, GrantError> {
+    resource::Reservation&& charge,
+    object::ref<>&& target,
+    View ceiling,
+    Node* parent) noexcept -> std::expected<GrantRef, GrantError> {
     auto claimed = claim_slot();
     if (!claimed) {
-        return libk::unexpected(claimed.error());
+        return std::unexpected(claimed.error());
     }
     Slot* const slot = claimed.value();
     Node* const node = libk::construct_at(
         slot->node(),
         *slot,
-        libk::move(target),
+        std::move(target),
         ceiling,
         parent,
-        libk::move(charge));
+        std::move(charge));
 
-    object::ObjectRef returned{};
+    object::ref<> returned{};
     bool rejected{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         if (parent != nullptr && (admission_closed(
                     parent->slot->operations.load<libk::MemoryOrder::Acquire>())
             || parent->slot->state.load<libk::MemoryOrder::Acquire>()
@@ -647,111 +303,59 @@ auto GrantGraph::create(
         }
     }
     if (rejected) {
-        returned = libk::move(node->target);
+        returned = std::move(node->target);
         auto refund = node->sponsorship.detach();
         libk::destroy_at(node);
         {
-            kernel::sync::IrqLockGuard guard{lock_};
+            sync::Lock guard{lock_};
             slot->state.store<libk::MemoryOrder::Release>(
                 GrantState::Revoked);
             slot->occupied.store<libk::MemoryOrder::Release>(false);
-            slot->next_free = slot->page->free_head;
-            slot->page->free_head = slot;
-            ++slot->page->free_count;
-            --slot->page->live_count;
-            --live_nodes_;
+            static_cast<void>(storage_.release(*slot, false));
         }
         returned.reset();
         refund.complete();
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
-    return libk::expected(GrantRef{
+    return (GrantRef{
         *this, slot,
         slot->generation.load<libk::MemoryOrder::Relaxed>()});
 }
 
-auto GrantGraph::claim_slot() noexcept
-    -> libk::Expected<Slot*, GrantError> {
+auto GrantGraph::claim_slot() noexcept -> std::expected<Slot*, GrantError> {
     for (;;) {
         {
-            kernel::sync::IrqLockGuard guard{lock_};
-            if (live_nodes_ >= quota_.nodes) {
-                return libk::unexpected(GrantError::QuotaExceeded);
+            sync::Lock guard{lock_};
+            if (storage_.exhausted()) return std::unexpected(GrantError::GenerationExhausted);
+            if (storage_.live() >= quota_.nodes) return std::unexpected(GrantError::QuotaExceeded);
+            if (auto entry = storage_.claim(); entry.slot) {
+                auto* slot = entry.slot;
+                libk_assert(!slot->occupied.load<libk::MemoryOrder::Relaxed>());
+                libk_assert(operation_count(slot->operations.load<libk::MemoryOrder::Relaxed>()) == 0);
+                slot->generation.store<libk::MemoryOrder::Relaxed>(entry.generation);
+                slot->state.store<libk::MemoryOrder::Relaxed>(GrantState::Live);
+                slot->operations.store<libk::MemoryOrder::Relaxed>(0);
+                return (slot);
             }
-            for (PageHeader* page = pages_; page != nullptr; page = page->next) {
-                while (page->free_head != nullptr) {
-                    Slot* const slot = page->free_head;
-                    page->free_head = slot->next_free;
-                    slot->next_free = nullptr;
-                    --page->free_count;
-                    const u64 generation =
-                        slot->generation.load<libk::MemoryOrder::Relaxed>();
-                    if (generation == libk::numeric_limits<u64>::max()) {
-                        slot->quarantined = true;
-                        ++quarantined_slots_;
-                        continue;
-                    }
-                    slot->generation.store<libk::MemoryOrder::Relaxed>(
-                        generation + 1);
-                    slot->state.store<libk::MemoryOrder::Relaxed>(
-                        GrantState::Live);
-                    KASSERT(!slot->occupied.load<libk::MemoryOrder::Relaxed>());
-                    KASSERT(operation_count(slot->operations.load<
-                        libk::MemoryOrder::Relaxed>()) == 0);
-                    slot->operations.store<libk::MemoryOrder::Relaxed>(0);
-                    ++page->live_count;
-                    ++live_nodes_;
-                    return libk::expected(slot);
-                }
-            }
-            // Storage follows the node quota, including a partial last page.
-            // A separate page cap silently reduced the advertised capacity
-            // whenever the node layout grew.
             const usize max_pages = quota_.nodes / slots_per_page
                 + (quota_.nodes % slots_per_page != 0);
-            if (page_count_ >= max_pages) {
-                return libk::unexpected(
-                    quarantined_slots_ == page_count_ * slots_per_page
-                        ? GrantError::GenerationExhausted
-                        : GrantError::QuotaExceeded);
-            }
-            ++page_count_;
+            if (storage_.pages() + growing_ >= max_pages)
+                return std::unexpected(GrantError::QuotaExceeded);
+            ++growing_;
         }
-
         auto made = make_page();
-        if (!made) {
-            kernel::sync::IrqLockGuard guard{lock_};
-            KASSERT(page_count_ != 0);
-            --page_count_;
-            return libk::unexpected(made.error());
-        }
-        PageHeader* const page = made.value();
-        kernel::sync::IrqLockGuard guard{lock_};
-        page->next = pages_;
-        pages_ = page;
+        sync::Lock guard{lock_};
+        libk_assert(growing_ != 0);
+        --growing_;
+        if (!made) return std::unexpected(made.error());
+        storage_.add(*made.value());
     }
 }
 
-auto GrantGraph::make_page() noexcept
-    -> libk::Expected<PageHeader*, GrantError> {
-    auto allocation = pmm_->allocate_page();
-    if (!allocation) {
-        return libk::unexpected(GrantError::OutOfMemory);
-    }
-    kernel::mm::OwnedPage backing = libk::move(allocation).value();
-    auto* const page = libk::construct_at(
-        reinterpret_cast<PageHeader*>(backing.bytes()),
-        libk::move(backing));
-    auto* const slots = reinterpret_cast<Slot*>(
-        reinterpret_cast<usize>(page) + slot_offset);
-    for (usize index = slots_per_page; index > 0; --index) {
-        Slot* const slot = libk::construct_at(&slots[index - 1]);
-        slot->page = page;
-        slot->next_free = page->free_head;
-        page->free_head = slot;
-        ++page->free_count;
-    }
-    return libk::expected(page);
+auto GrantGraph::make_page() noexcept -> std::expected<PageHeader*, GrantError> {
+    auto backing = pmm_->allocate_page();
+    if (!backing) return std::unexpected(GrantError::OutOfMemory);
+    return (Storage::make(std::move(backing).value(), [](Slot&) noexcept {}));
 }
 
 auto GrantGraph::locate(GrantKey key) noexcept -> Node* {
@@ -763,26 +367,10 @@ auto GrantGraph::locate(GrantKey key) const noexcept -> const Node* {
     if (!key.valid()) {
         return nullptr;
     }
-    for (const PageHeader* page = pages_; page != nullptr; page = page->next) {
-        const auto* const first = reinterpret_cast<const Slot*>(
-            reinterpret_cast<usize>(page) + slot_offset);
-        const usize first_address = reinterpret_cast<usize>(first);
-        const usize bytes = slots_per_page * sizeof(Slot);
-        if (key.slot < first_address || key.slot - first_address >= bytes) {
-            continue;
-        }
-        const usize displacement = key.slot - first_address;
-        if (displacement % sizeof(Slot) != 0) {
-            return nullptr;
-        }
-        const Slot& slot = first[displacement / sizeof(Slot)];
-        return slot.occupied.load<libk::MemoryOrder::Acquire>()
-                && slot.generation.load<libk::MemoryOrder::Relaxed>()
-                    == key.generation
-            ? slot.node()
-            : nullptr;
-    }
-    return nullptr;
+    const auto* slot = storage_.find(key.slot);
+    return slot && slot->occupied.load<libk::MemoryOrder::Acquire>()
+            && slot->generation.load<libk::MemoryOrder::Relaxed>() == key.generation
+        ? slot->node() : nullptr;
 }
 
 auto GrantGraph::find(GrantKey key) noexcept -> Node* {
@@ -806,58 +394,58 @@ auto GrantGraph::key_of(const Node& node) noexcept -> GrantKey {
 }
 
 auto GrantGraph::ref(GrantKey key) noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    kernel::sync::IrqLockGuard guard{lock_};
+    -> std::expected<GrantRef, GrantError> {
+    sync::Lock guard{lock_};
     Node* const node = find(key);
     return node != nullptr
         ? try_ref(*node)
-        : libk::Expected<GrantRef, GrantError>{
-              libk::unexpected(GrantError::InvalidKey)};
+        : std::expected<GrantRef, GrantError>{
+              std::unexpected(GrantError::InvalidKey)};
 }
 
 auto GrantGraph::try_ref(Node& node) noexcept
-    -> libk::Expected<GrantRef, GrantError> {
-    KASSERT(!admission_closed(node.slot->operations.load<
+    -> std::expected<GrantRef, GrantError> {
+    libk_assert(!admission_closed(node.slot->operations.load<
         libk::MemoryOrder::Acquire>()));
     if (node.slot->state.load<libk::MemoryOrder::Acquire>()
         != GrantState::Live) {
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
-    if (node.refs == libk::numeric_limits<usize>::max()) {
-        return libk::unexpected(GrantError::QuotaExceeded);
+    if (node.refs == std::numeric_limits<usize>::max()) {
+        return std::unexpected(GrantError::QuotaExceeded);
     }
     ++node.refs;
-    return libk::expected(GrantRef{
+    return (GrantRef{
         *this, node.slot,
         node.slot->generation.load<libk::MemoryOrder::Relaxed>()});
 }
 
 auto GrantGraph::acquire(GrantKey key) noexcept
-    -> libk::Expected<GrantLease, GrantError> {
-    kernel::sync::IrqLockGuard guard{lock_};
+    -> std::expected<GrantLease, GrantError> {
+    sync::Lock guard{lock_};
     Node* const node = find(key);
     return node != nullptr
         ? try_acquire(*node->slot, key.generation)
-        : libk::Expected<GrantLease, GrantError>{
-              libk::unexpected(GrantError::InvalidKey)};
+        : std::expected<GrantLease, GrantError>{
+              std::unexpected(GrantError::InvalidKey)};
 }
 
 auto GrantGraph::try_acquire(Slot& slot, u64 generation) noexcept
-    -> libk::Expected<GrantLease, GrantError> {
+    -> std::expected<GrantLease, GrantError> {
     if (slot.generation.load<libk::MemoryOrder::Acquire>() != generation
         || !slot.occupied.load<libk::MemoryOrder::Acquire>()
         || slot.state.load<libk::MemoryOrder::Acquire>()
             != GrantState::Live) {
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
 
     usize operations = slot.operations.load<libk::MemoryOrder::Acquire>();
     for (;;) {
         if (admission_closed(operations)) {
-            return libk::unexpected(GrantError::InvalidState);
+            return std::unexpected(GrantError::InvalidState);
         }
         if (operation_count(operations) == operation_closed - 1) {
-            return libk::unexpected(GrantError::QuotaExceeded);
+            return std::unexpected(GrantError::QuotaExceeded);
         }
         if (slot.operations.compare_exchange_weak<
                 libk::MemoryOrder::AcqRel,
@@ -871,18 +459,18 @@ auto GrantGraph::try_acquire(Slot& slot, u64 generation) noexcept
         || slot.state.load<libk::MemoryOrder::Acquire>()
             != GrantState::Live) {
         release_operation(slot);
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
     Node& node = *slot.node();
-    return libk::expected(GrantLease{
+    return (GrantLease{
         *this, &node, generation});
 }
 
 auto GrantGraph::attach(
     const GrantLease& source,
     GrantAttachment& attachment) noexcept
-    -> libk::Expected<void, GrantError> {
-    if (source.graph_ != this
+    -> std::expected<void, GrantError> {
+    if (source.h_.get().graph != this
         || attachment.graph_ != nullptr
         || attachment.node_ != nullptr
         || attachment.ops_ == nullptr
@@ -891,36 +479,36 @@ auto GrantGraph::attach(
         || static_cast<GrantAttachment::State>(
             attachment.state_.load<libk::MemoryOrder::Relaxed>())
             != GrantAttachment::State::Idle) {
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
-    auto* const node = static_cast<Node*>(source.node_);
-    kernel::sync::IrqLockGuard guard{lock_};
+    auto* const node = static_cast<Node*>(source.h_.get().node);
+    sync::Lock guard{lock_};
     if (node->slot->generation.load<libk::MemoryOrder::Acquire>()
-            != source.generation_
+            != source.h_.get().gen
         || node->slot->state.load<libk::MemoryOrder::Acquire>()
             != GrantState::Live
         || admission_closed(node->slot->operations.load<
             libk::MemoryOrder::Acquire>())) {
-        return libk::unexpected(GrantError::InvalidState);
+        return std::unexpected(GrantError::InvalidState);
     }
     attachment.graph_ = this;
     attachment.node_ = node;
-    attachment.generation_ = source.generation_;
+    attachment.generation_ = source.h_.get().gen;
     attachment.state_.store<libk::MemoryOrder::Release>(
         static_cast<u8>(GrantAttachment::State::Attached));
     node->attachments.push_back(attachment);
-    return libk::expected();
+    return {};
 }
 
 void GrantGraph::drop_ref(void* raw, u64 generation) noexcept {
-    KASSERT(raw != nullptr && generation != 0);
+    libk_assert(raw != nullptr && generation != 0);
     reclaim(GrantKey{reinterpret_cast<usize>(raw), generation}, true);
 }
 
 void GrantGraph::drop_lease(void* raw, u64 generation) noexcept {
-    KASSERT(raw != nullptr);
+    libk_assert(raw != nullptr);
     auto& node = *static_cast<Node*>(raw);
-    KASSERT(node.slot->generation.load<libk::MemoryOrder::Acquire>()
+    libk_assert(node.slot->generation.load<libk::MemoryOrder::Acquire>()
         == generation);
     release_operation(*node.slot);
 }
@@ -928,7 +516,7 @@ void GrantGraph::drop_lease(void* raw, u64 generation) noexcept {
 void GrantGraph::release_operation(Slot& slot) noexcept {
     usize operations = slot.operations.load<libk::MemoryOrder::Acquire>();
     for (;;) {
-        KASSERT(operation_count(operations) != 0);
+        libk_assert(operation_count(operations) != 0);
         if (admission_closed(operations)) {
             break;
         }
@@ -943,64 +531,55 @@ void GrantGraph::release_operation(Slot& slot) noexcept {
     }
 
     bool schedule{};
-    GrantRevoke* completion{};
     {
         // Once admission is closed, the graph lock is the lifetime barrier
         // between the final lease and node destruction. work_retained means
         // one queued or in-flight worker already owns the retry obligation.
-        kernel::sync::IrqLockGuard guard{lock_};
-        KASSERT(slot.occupied.load<libk::MemoryOrder::Acquire>());
+        sync::Lock guard{lock_};
+        libk_assert(slot.occupied.load<libk::MemoryOrder::Acquire>());
         const usize previous =
             slot.operations.fetch_sub<libk::MemoryOrder::AcqRel>(1);
-        KASSERT(admission_closed(previous)
+        libk_assert(admission_closed(previous)
             && operation_count(previous) != 0);
         if (operation_count(previous) == 1
             && !slot.work_retained.exchange<libk::MemoryOrder::AcqRel>(true)) {
             schedule = true;
-            completion = slot.node()->revoke;
         }
     }
     if (schedule) {
-        if (completion != nullptr) {
-            completion->service({});
-        }
         enqueue(slot);
-        const auto service = kick_work();
-        if (completion != nullptr) {
-            completion->service(service);
-        }
+        kick_work();
     }
 }
 
 void GrantGraph::enqueue(Slot& slot) noexcept {
-    kernel::sync::IrqLockGuard guard{work_lock_};
-    KASSERT(slot.work_retained.load<libk::MemoryOrder::Acquire>());
+    sync::Lock guard{work_lock_};
+    libk_assert(slot.work_retained.load<libk::MemoryOrder::Acquire>());
     if (!slot.work_hook.is_linked()) {
         work_.push_back(slot);
     }
 }
 
 auto GrantGraph::take_work() noexcept -> Slot* {
-    kernel::sync::IrqLockGuard guard{work_lock_};
+    sync::Lock guard{work_lock_};
     return work_.empty() ? nullptr : &work_.pop_front();
 }
 
-auto GrantGraph::kick_work() noexcept
-    -> diag::concurrency::ObservationKey {
+void GrantGraph::kick_work() noexcept {
     WorkNotifier notifier{};
     {
-        kernel::sync::IrqLockGuard guard{work_lock_};
+        sync::Lock guard{work_lock_};
         notifier = work_notifier_;
     }
     if (notifier) {
-        return notifier();
+        notifier();
+        return;
     }
     while (service(quota_.nodes).more) {}
-    return {};
 }
 
 auto GrantGraph::service(usize budget) noexcept -> GrantServiceResult {
-    KASSERT(budget != 0);
+    libk_assert(budget != 0);
     usize processed{};
     usize progressed{};
     for (usize completed = 0; completed < budget; ++completed) {
@@ -1010,47 +589,38 @@ auto GrantGraph::service(usize budget) noexcept -> GrantServiceResult {
         }
         progressed += service_slot(*slot) ? 1 : 0;
         ++processed;
-        /*luna change: advance the service epoch through the shared primitive, reason: keep grant diagnostics monotonic without a business-local CAS loop*/
-        libk::atomic_inc_sat(service_epoch_);
     }
     return GrantServiceResult{
         processed,
         progressed,
-        work_pending(),
-        service_epoch_.load<libk::MemoryOrder::Acquire>()};
+        work_pending()};
 }
 
 auto GrantGraph::work_pending() const noexcept -> bool {
-    kernel::sync::IrqLockGuard guard{work_lock_};
+    sync::Lock guard{work_lock_};
     return !work_.empty();
 }
 
 void GrantGraph::bind_work_notifier(WorkNotifier notifier) noexcept {
-    KASSERT(notifier);
-    kernel::sync::IrqLockGuard guard{work_lock_};
-    KASSERT(!work_notifier_);
+    libk_assert(notifier);
+    sync::Lock guard{work_lock_};
+    libk_assert(!work_notifier_);
     work_notifier_ = notifier;
 }
 
 void GrantGraph::unbind_work_notifier() noexcept {
-    kernel::sync::IrqLockGuard guard{work_lock_};
+    sync::Lock guard{work_lock_};
     work_notifier_.reset();
 }
 
 auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
-    object::ObjectRef target_ref{};
-    GrantRevoke* operation{};
+    object::ref<> target_ref{};
     GrantRevoke* completed{};
     GrantAttachment* attachment{};
     GrantWork work{};
-    u64 progress_stamp{};
-    diag::concurrency::NodeRef progress_driver{};
-    diag::concurrency::NodeRef progress_blocker{};
     bool reclaimable{};
-    usize attachment_count{};
-    bool work_retained{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         if (!slot.occupied.load<libk::MemoryOrder::Acquire>()) {
             return slot.work_retained.exchange<
                 libk::MemoryOrder::AcqRel>(false);
@@ -1060,26 +630,8 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
             slot.state.load<libk::MemoryOrder::Acquire>();
         const usize operations =
             slot.operations.load<libk::MemoryOrder::Acquire>();
-        attachment_count = node.attachments.size();
-        work_retained = slot.work_retained.load<
-            libk::MemoryOrder::Acquire>();
-        progress_stamp = static_cast<u64>(slot.state.load<
-            libk::MemoryOrder::Relaxed>())
-            << 56;
-        progress_stamp |= static_cast<u64>(operation_count(operations));
-        progress_stamp ^= static_cast<u64>(attachment_count) << 32;
-        progress_stamp ^= work_retained ? u64{1} << 31 : 0;
-        progress_driver = diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(this));
-        progress_blocker = diag::concurrency::NodeRef::external(
-            reinterpret_cast<u64>(&slot),
-            slot.generation.load<libk::MemoryOrder::Relaxed>());
-        if (state == GrantState::Revoking) {
-            operation = node.revoke;
-            KASSERT(operation != nullptr);
-        }
         if (state == GrantState::Live && admission_closed(operations)) {
-            KASSERT(operation_count(operations) == 0
+            libk_assert(operation_count(operations) == 0
                 && node.refs == 0 && node.attachments.empty()
                 && node.children.empty() && !node.allocation);
         } else if (state == GrantState::Revoking
@@ -1087,9 +639,9 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
             && node.attachments.empty()) {
             slot.state.store<libk::MemoryOrder::Release>(
                 GrantState::Revoked);
-            completed = libk::exchange(node.revoke, nullptr);
-            KASSERT(completed != nullptr);
-            target_ref = libk::move(node.target);
+            completed = std::exchange(node.revoke, nullptr);
+            libk_assert(completed != nullptr);
+            target_ref = std::move(node.target);
         } else if (state == GrantState::Revoking) {
             for (GrantAttachment& candidate : node.attachments) {
                 if (static_cast<GrantAttachment::State>(
@@ -1097,8 +649,8 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
                     != GrantAttachment::State::Attached) {
                     continue;
                 }
-                KASSERT(candidate.work_.load<libk::MemoryOrder::Relaxed>()
-                    != libk::numeric_limits<usize>::max());
+                libk_assert(candidate.work_.load<libk::MemoryOrder::Relaxed>()
+                    != std::numeric_limits<usize>::max());
                 static_cast<void>(candidate.work_.fetch_add<
                     libk::MemoryOrder::Relaxed>(1));
                 candidate.state_.store<libk::MemoryOrder::Release>(
@@ -1120,18 +672,6 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
     }
 
     target_ref.reset();
-    if (operation != nullptr) {
-        operation->progress(
-            grant_servicing,
-            progress_stamp,
-            progress_driver,
-            progress_blocker,
-            operation_count(slot.operations.load<
-                libk::MemoryOrder::Acquire>()),
-            attachment_count,
-            work_retained,
-            reinterpret_cast<u64>(&slot));
-    }
     if (completed != nullptr) {
         completed->acknowledge();
         retry_allocations();
@@ -1139,7 +679,7 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
     if (attachment != nullptr) {
         attachment->ops_->invalidate(
             attachment->context_,
-            libk::move(work),
+            std::move(work),
             GrantInvalidation::Revoke);
         enqueue(slot);
     } else if (reclaimable) {
@@ -1154,23 +694,23 @@ auto GrantGraph::service_slot(Slot& slot) noexcept -> bool {
 }
 
 auto GrantGraph::detach(GrantAttachment& attachment) noexcept -> bool {
-    object::ObjectRef target{};
+    object::ref<> target{};
     GrantRevoke* completion{};
     void* reclaimable{};
     u64 reclaim_generation{};
     bool quiescent{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         if (attachment.graph_ != this || attachment.node_ == nullptr) {
             return false;
         }
         auto& node = *static_cast<Node*>(attachment.node_);
-        KASSERT(node.slot->generation.load<libk::MemoryOrder::Acquire>()
+        libk_assert(node.slot->generation.load<libk::MemoryOrder::Acquire>()
             == attachment.generation_);
         const u64 node_generation = attachment.generation_;
         const auto current = static_cast<GrantAttachment::State>(
             attachment.state_.load<libk::MemoryOrder::Relaxed>());
-        KASSERT(current == GrantAttachment::State::Attached
+        libk_assert(current == GrantAttachment::State::Attached
             || current == GrantAttachment::State::Invalidating);
         node.attachments.erase(attachment);
         attachment.graph_ = nullptr;
@@ -1191,9 +731,9 @@ auto GrantGraph::detach(GrantAttachment& attachment) noexcept -> bool {
             && node.attachments.empty()) {
             node.slot->state.store<libk::MemoryOrder::Release>(
                 GrantState::Revoked);
-            completion = libk::exchange(node.revoke, nullptr);
-            KASSERT(completion != nullptr);
-            target = libk::move(node.target);
+            completion = std::exchange(node.revoke, nullptr);
+            libk_assert(completion != nullptr);
+            target = std::move(node.target);
         }
         if (node.refs == 0
             && operation_count(node.slot->operations.load<
@@ -1228,13 +768,13 @@ void GrantGraph::reclaim(
     GrantKey current = initial;
     bool drop = drop_reference;
     while (current.valid()) {
-        object::ObjectRef target{};
-        kernel::resource::Refund refund{};
+        object::ref<> target{};
+        resource::Refund refund{};
         Node* parent{};
         GrantKey parent_key{};
         Slot* slot{};
         {
-            kernel::sync::IrqLockGuard guard{lock_};
+            sync::Lock guard{lock_};
             Node* const found = locate(current);
             if (found == nullptr) {
                 return;
@@ -1265,7 +805,7 @@ void GrantGraph::reclaim(
                 parent_key = key_of(*parent);
                 parent->children.erase(node);
             }
-            target = libk::move(node.target);
+            target = std::move(node.target);
             slot = node.slot;
         }
 
@@ -1273,19 +813,13 @@ void GrantGraph::reclaim(
         refund = slot->node()->sponsorship.detach();
 
         {
-            kernel::sync::IrqLockGuard guard{lock_};
+            sync::Lock guard{lock_};
             libk::destroy_at(slot->node());
-            KASSERT(slot->occupied.load<libk::MemoryOrder::Acquire>());
+            libk_assert(slot->occupied.load<libk::MemoryOrder::Acquire>());
             slot->state.store<libk::MemoryOrder::Release>(
                 GrantState::Revoked);
             slot->occupied.store<libk::MemoryOrder::Release>(false);
-            slot->next_free = slot->page->free_head;
-            slot->page->free_head = slot;
-            ++slot->page->free_count;
-            KASSERT(slot->page->live_count != 0);
-            --slot->page->live_count;
-            KASSERT(live_nodes_ != 0);
-            --live_nodes_;
+            static_cast<void>(storage_.release(*slot, false));
         }
         refund.complete();
         // A non-empty child list itself prevents parent reclamation; it does
@@ -1296,66 +830,66 @@ void GrantGraph::reclaim(
 }
 
 auto GrantGraph::state(GrantKey key) const noexcept
-    -> libk::Expected<GrantState, GrantError> {
-    kernel::sync::IrqLockGuard guard{lock_};
+    -> std::expected<GrantState, GrantError> {
+    sync::Lock guard{lock_};
     const Node* const node = locate(key);
     return node != nullptr
-        ? libk::expected(
+        ? (
               node->slot->state.load<libk::MemoryOrder::Acquire>())
-        : libk::Expected<GrantState, GrantError>{
-              libk::unexpected(GrantError::InvalidKey)};
+        : std::expected<GrantState, GrantError>{
+              std::unexpected(GrantError::InvalidKey)};
 }
 
 auto GrantGraph::live_count() const noexcept -> usize {
-    kernel::sync::IrqLockGuard guard{lock_};
-    return live_nodes_;
+    sync::Lock guard{lock_};
+    return storage_.live();
 }
 
-auto GrantGraph::node_charge() noexcept -> kernel::resource::Budget {
-    return kernel::resource::Budget{.memory = sizeof(Slot)};
+auto GrantGraph::node_charge() noexcept -> resource::budget {
+    return resource::budget{.memory = sizeof(Slot)};
 }
 
 auto GrantGraph::revoke_descendants(
     GrantKey source,
     GrantRevoke& completion) noexcept
-    -> libk::Expected<void, GrantError> {
+    -> std::expected<void, GrantError> {
     return revoke(source, completion, false);
 }
 
 auto GrantGraph::invalidate(
     GrantKey source,
     GrantRevoke& completion) noexcept
-    -> libk::Expected<void, GrantError> {
+    -> std::expected<void, GrantError> {
     return revoke(source, completion, true);
 }
 
 auto GrantGraph::revoke(
     GrantKey source_key,
     GrantRevoke& completion,
-    bool include_source) noexcept -> libk::Expected<void, GrantError> {
+    bool include_source) noexcept -> std::expected<void, GrantError> {
     Node* source{};
     GrantRef source_hold{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         source = find(source_key);
         if (source == nullptr) {
-            return libk::unexpected(GrantError::InvalidKey);
+            return std::unexpected(GrantError::InvalidKey);
         }
         if (source->slot->state.load<libk::MemoryOrder::Acquire>()
                 != GrantState::Live
             || completion.initialized()) {
-            return libk::unexpected(GrantError::InvalidState);
+            return std::unexpected(GrantError::InvalidState);
         }
         auto held = try_ref(*source);
         if (!held) {
-            return libk::unexpected(held.error());
+            return std::unexpected(held.error());
         }
-        source_hold = libk::move(held).value();
+        source_hold = std::move(held).value();
 
         usize pending{};
-        for (PageHeader* page = pages_; page != nullptr; page = page->next) {
+        for (PageHeader* page = storage_.head(); page != nullptr; page = page->next) {
             auto* const slots = reinterpret_cast<Slot*>(
-                reinterpret_cast<usize>(page) + slot_offset);
+                reinterpret_cast<usize>(page) + Storage::offset());
             for (usize index = 0; index < slots_per_page; ++index) {
                 if (!slots[index].occupied.load<libk::MemoryOrder::Acquire>()) {
                     continue;
@@ -1372,9 +906,9 @@ auto GrantGraph::revoke(
                     continue;
                 }
                 if (state == GrantState::Revoking) {
-                    return libk::unexpected(GrantError::RevocationConflict);
+                    return std::unexpected(GrantError::RevocationConflict);
                 }
-                KASSERT(pending != libk::numeric_limits<usize>::max());
+                libk_assert(pending != std::numeric_limits<usize>::max());
                 ++pending;
             }
         }
@@ -1382,11 +916,11 @@ auto GrantGraph::revoke(
         // Every selected node owns one obligation, independent of the operation
         // count observed here. Closing admission before sampling operations is
         // what makes the hot acquire/recheck protocol linearizable.
-        KASSERT(pending != libk::numeric_limits<usize>::max());
+        libk_assert(pending != std::numeric_limits<usize>::max());
         completion.initialize(pending + 1);
-        for (PageHeader* page = pages_; page != nullptr; page = page->next) {
+        for (PageHeader* page = storage_.head(); page != nullptr; page = page->next) {
             auto* const slots = reinterpret_cast<Slot*>(
-                reinterpret_cast<usize>(page) + slot_offset);
+                reinterpret_cast<usize>(page) + Storage::offset());
             for (usize index = 0; index < slots_per_page; ++index) {
                 if (!slots[index].occupied.load<libk::MemoryOrder::Acquire>()) {
                     continue;
@@ -1412,22 +946,21 @@ auto GrantGraph::revoke(
         }
     }
 
-    completion.service({});
-    completion.service(kick_work());
+    kick_work();
     completion.acknowledge();
-    return libk::expected();
+    return {};
 }
 
-auto GrantGraph::destroy_target(const GrantLease& source) noexcept -> libk::Expected<void, GrantError> {
-    kernel::resource::Allocation* allocation{};
+auto GrantGraph::destroy_target(const GrantLease& source) noexcept -> std::expected<void, GrantError> {
+    object::allocation* allocation{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         Node* const node = locate(source.key());
-        if (node == nullptr) return libk::unexpected(GrantError::InvalidKey);
+        if (node == nullptr) return std::unexpected(GrantError::InvalidKey);
         for (Node* ancestor = node; ancestor != nullptr; ancestor = ancestor->parent) {
             if (ancestor->allocation) {
-                KASSERT(ancestor->target.id() == node->target.id());
-                allocation = &ancestor->allocation;
+                libk_assert(ancestor->target.id() == node->target.id());
+                allocation = ancestor->allocation;
                 break;
             }
         }
@@ -1435,52 +968,29 @@ auto GrantGraph::destroy_target(const GrantLease& source) noexcept -> libk::Expe
     if (allocation != nullptr) {
         // The source operation is part of the root's revoke barrier: neither
         // this record nor its sponsoring pool can detach until it is released.
-        allocation->pool_->close_allocation(*allocation);
-        return libk::expected();
+        allocation->owner_->close_allocation(*allocation);
+        return {};
     }
     auto target = source.clone_target();
-    return target && target.value().retire() ? libk::Expected<void, GrantError>{libk::expected()}
-        : libk::Expected<void, GrantError>{libk::unexpected(GrantError::InvalidState)};
-}
-
-void GrantGraph::commit_allocation(
-    kernel::resource::Allocation& allocation) noexcept {
-    KASSERT(allocation.graph_ == this && allocation.root_.valid());
-    KASSERT(allocation.pool_ != nullptr);
-    if (allocation.target_.kind() == object::ObjectKind::ResourcePool) {
-        auto child = allocation.target_.pin<kernel::resource::ResourcePool>();
-        KASSERT(child);
-        child.value()->bind_parent(allocation);
-    }
-    allocation.pool_->commit(allocation);
-}
-
-void GrantGraph::abort_allocation(
-    kernel::resource::Allocation& allocation) noexcept {
-    // A failed constructor still owns its Permit, so the pool cannot finish
-    // closing here. Transfer the unpublished object to the same independent
-    // close used by explicit destruction; revocation may require an executor.
-    auto* const pool = allocation.pool_;
-    KASSERT(pool != nullptr);
-    commit_allocation(allocation);
-    pool->close_allocation(allocation);
+    return target && target.value().retire() ? std::expected<void, GrantError>{}
+        : std::expected<void, GrantError>{std::unexpected(GrantError::InvalidState)};
 }
 
 void GrantGraph::revoke_allocation(
-    kernel::resource::Allocation& allocation) noexcept {
-    KASSERT(allocation.graph_ == this && allocation.root_.valid());
+    object::allocation& allocation) noexcept {
+    libk_assert(allocation.graph_ == this && allocation.root_.valid());
     for (;;) {
         const auto revoked = invalidate(allocation.root_, allocation.revoke_);
         if (revoked) break;
-        KASSERT(revoked.error() == GrantError::RevocationConflict);
+        libk_assert(revoked.error() == GrantError::RevocationConflict);
         {
-            kernel::sync::IrqLockGuard guard{lock_};
+            sync::Lock guard{lock_};
             Node* const root = locate(allocation.root_);
-            KASSERT(root != nullptr);
+            libk_assert(root != nullptr);
             bool conflict{};
-            for (PageHeader* page = pages_; page != nullptr && !conflict; page = page->next) {
+            for (PageHeader* page = storage_.head(); page != nullptr && !conflict; page = page->next) {
                 auto* const slots = reinterpret_cast<Slot*>(
-                    reinterpret_cast<usize>(page) + slot_offset);
+                    reinterpret_cast<usize>(page) + Storage::offset());
                 for (usize i = 0; i < slots_per_page; ++i) {
                     if (!slots[i].occupied.load<libk::MemoryOrder::Acquire>()) continue;
                     Node& node = *slots[i].node();
@@ -1508,10 +1018,10 @@ void GrantGraph::revoke_allocation(
 }
 
 void GrantGraph::retry_allocations() noexcept {
-    kernel::resource::Allocation* pending{};
+    object::allocation* pending{};
     {
-        kernel::sync::IrqLockGuard guard{lock_};
-        pending = libk::exchange(revoke_retry_, nullptr);
+        sync::Lock guard{lock_};
+        pending = std::exchange(revoke_retry_, nullptr);
     }
     while (pending != nullptr) {
         auto* const next = pending->revoke_retry_next_;
@@ -1521,142 +1031,22 @@ void GrantGraph::retry_allocations() noexcept {
     }
 }
 
-void GrantGraph::stop_allocation(
-    kernel::resource::Allocation& allocation) noexcept {
-    KASSERT(allocation.graph_ == this && allocation.root_.valid());
-    KASSERT(allocation.pool_ != nullptr && allocation.target_);
-    KASSERT(allocation.state_
-        == kernel::resource::AllocationState::Stopping);
-
-    switch (allocation.target_.kind()) {
-    case object::ObjectKind::Thread: {
-        auto thread = allocation.target_.pin<kernel::Thread>();
-        KASSERT(thread);
-        KASSERT(!allocation.stop_.started());
-        allocation.stop_.start(thread.value().get());
-        return;
-    }
-    case object::ObjectKind::Vproc: {
-        auto vproc = allocation.target_.pin<kernel::Vproc>();
-        KASSERT(vproc);
-        KASSERT(!allocation.stop_.started());
-        allocation.stop_.start(vproc.value().get());
-        return;
-    }
-    case object::ObjectKind::ResourcePool: {
-        auto child = allocation.target_.pin<kernel::resource::ResourcePool>();
-        KASSERT(child);
-        if (child.value()->close() == kernel::resource::PoolState::Closed
-            && allocation.state_
-                == kernel::resource::AllocationState::Stopping) {
-            allocation.target_ready();
-        }
-        return;
-    }
-    case object::ObjectKind::SchedulingContext: {
-        auto context = allocation.target_.pin<kernel::sched::SchedulingContext>();
-        KASSERT(context);
-        if (context.value()->binding() == nullptr) {
-            allocation.target_ready();
-            return;
-        }
-        KASSERT(!allocation.stop_.started());
-        const execution::Target target = context.value()->binding()->target();
-        if (Thread* const thread = target.thread()) {
-            allocation.stop_.start(*thread);
-        } else {
-            allocation.stop_.start(*target.vproc());
-        }
-        return;
-    }
-    case object::ObjectKind::Invalid:
-    case object::ObjectKind::Count:
-        break;
-    case object::ObjectKind::SchedulingDomain:
-    case object::ObjectKind::CSpace:
-    case object::ObjectKind::IoSpace:
-    case object::ObjectKind::Device:
-    case object::ObjectKind::MemoryObject:
-    case object::ObjectKind::VSpace:
-    case object::ObjectKind::Notification:
-    case object::ObjectKind::Tunnel:
-    case object::ObjectKind::Endpoint:
-        allocation.target_ready();
-        return;
-    case object::ObjectKind::Channel: {
-        auto channel = allocation.target_.pin<kernel::ipc::Channel>();
-        KASSERT(channel);
-        static_cast<void>(channel.value()->close(ChannelSide::A));
-        static_cast<void>(channel.value()->close(ChannelSide::B));
-        allocation.target_ready();
-        return;
-    }
-    case object::ObjectKind::Pager: {
-        auto pager = allocation.target_.pin<kernel::pager::Pager>();
-        KASSERT(pager);
-        static_cast<void>(pager.value()->close(true));
-        allocation.target_ready();
-        return;
-    }
-    case object::ObjectKind::Irq: {
-        auto irq = allocation.target_.pin<kernel::irq::Irq>();
-        KASSERT(irq);
-        static_cast<void>(irq.value()->close());
-        allocation.target_ready();
-        return;
-    }
-    }
-    KASSERT(false);
+void GrantGraph::bind_allocation(
+    GrantKey root, object::allocation& allocation) noexcept {
+    sync::Lock guard{lock_};
+    Node* const node = find(root);
+    libk_assert(node != nullptr && node->parent == nullptr && !node->allocation);
+    libk_assert(node->target.id() == allocation.target_.id());
+    node->allocation = &allocation;
 }
 
-void GrantGraph::retire_allocation(
-    kernel::resource::Allocation& allocation) noexcept {
-    KASSERT(allocation.graph_ == this && allocation.root_.valid());
-    KASSERT(allocation.pool_ != nullptr && allocation.target_);
-
-    if (allocation.target_.kind() == object::ObjectKind::ResourcePool) {
-        auto child = allocation.target_.pin<kernel::resource::ResourcePool>();
-        KASSERT(child);
-        if (child.value()->close() != kernel::resource::PoolState::Closed) {
-            return;
-        }
-        child.value()->unbind_parent(allocation);
-    }
-    if (allocation.stop_.started()) {
-        KASSERT(allocation.stop_.started() && allocation.stop_.complete());
-    }
-    // Stopping has already drained every execution relation in this pool.
-    // A false pre-retire result here means a target kind is missing an
-    // explicit stop/dependency adapter; waiting silently would deadlock the
-    // pool in Retiring with no event capable of re-driving it.
-    const object::ObjectId target = allocation.target_.id();
-    const bool retired = allocation.target_.retire();
-    KASSERT_EVENT(
-        retired,
-        (diag::FatalEvent{
-            .facility = diag::Facility::Capability,
-            .id = diag::EventId{0x30000001},
-            .arguments = {
-                static_cast<usize>(target.kind),
-                target.slot,
-                static_cast<usize>(target.generation),
-            },
-            .argument_count = 3,
-        }));
-    allocation.target_.reset();
-
-    const GrantKey root = allocation.root_;
-    kernel::resource::ResourcePool* const pool = allocation.pool_;
-    pool->detach(allocation);
+void GrantGraph::release_allocation(
+    GrantKey root, const object::allocation* allocation) noexcept {
     {
-        kernel::sync::IrqLockGuard guard{lock_};
+        sync::Lock guard{lock_};
         Node* const node = locate(root);
-        KASSERT(node != nullptr && &node->allocation == &allocation);
-        KASSERT(allocation.pool_ == nullptr && !allocation.target_);
-        allocation.graph_ = nullptr;
-        allocation.root_ = {};
-        allocation.independent_close_ = false;
-        allocation.state_ = kernel::resource::AllocationState::Empty;
+        libk_assert(node != nullptr && node->allocation == allocation);
+        node->allocation = nullptr;
     }
     reclaim(root, false);
 }
@@ -1675,18 +1065,12 @@ auto GrantGraph::descendant_of(
 }
 
 void GrantGraph::release_page(PageHeader& page) noexcept {
-    KASSERT(page.live_count == 0);
-    auto* const slots = reinterpret_cast<Slot*>(
-        reinterpret_cast<usize>(&page) + slot_offset);
-    for (usize index = 0; index < slots_per_page; ++index) {
-        KASSERT(!slots[index].occupied.load<libk::MemoryOrder::Acquire>());
-        libk::destroy_at(&slots[index]);
+    libk_assert(page.live == 0);
+    for (const auto& slot : Storage::slots(page)) {
+        libk_assert(!slot.occupied.load<libk::MemoryOrder::Acquire>());
     }
-    kernel::mm::OwnedPage backing = libk::move(page.backing);
-    libk::destroy_at(&page);
-    KASSERT(page_count_ != 0);
-    --page_count_;
+    auto backing = Storage::dispose(page);
     backing.reset();
 }
 
-} // namespace kernel::cap
+} // namespace cap

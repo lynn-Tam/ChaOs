@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <stddef.h>
 
 #include "libk/concepts.hpp"
@@ -139,9 +140,9 @@ namespace detail {
 
 template<typename R>
 constexpr bool sink_result_ok(R value) noexcept {
-    if constexpr (SameAs<R, bool>) {
+    if constexpr (std::same_as<R, bool>) {
         return value;
-    } else if constexpr (SameAs<R, errc>) {
+    } else if constexpr (std::same_as<R, errc>) {
         return value == errc::ok;
     } else {
         return static_cast<bool>(value);
@@ -152,7 +153,7 @@ template<typename Sink>
 constexpr bool write_one_to_sink(Sink& sink, char c) noexcept {
     if constexpr (requires(Sink& s, char ch) { s.write(ch); }) {
         using R = decltype(sink.write(c));
-        if constexpr (is_void_v<R>) {
+        if constexpr (std::is_void_v<R>) {
             sink.write(c);
             return true;
         } else {
@@ -160,7 +161,7 @@ constexpr bool write_one_to_sink(Sink& sink, char c) noexcept {
         }
     } else if constexpr (requires(Sink& s, char ch) { s.put(ch); }) {
         using R = decltype(sink.put(c));
-        if constexpr (is_void_v<R>) {
+        if constexpr (std::is_void_v<R>) {
             sink.put(c);
             return true;
         } else {
@@ -177,7 +178,7 @@ template<typename Sink>
 constexpr bool write_bulk_to_sink(Sink& sink, const char* text, size_t n) noexcept {
     if constexpr (requires(Sink& s, const char* p, size_t len) { s.write(p, len); }) {
         using R = decltype(sink.write(text, n));
-        if constexpr (is_void_v<R>) {
+        if constexpr (std::is_void_v<R>) {
             sink.write(text, n);
             return true;
         } else {

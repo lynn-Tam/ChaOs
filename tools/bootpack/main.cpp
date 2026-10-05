@@ -1,3 +1,4 @@
+#include <utility>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -262,8 +263,8 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
             || module.name.size()
                 > std::numeric_limits<std::uint32_t>::max()
             || (!module.data && module.image.segments.size()
-                > std::numeric_limits<std::uint32_t>::max()
-                || module.data && module.payload.empty())
+                > std::numeric_limits<std::uint32_t>::max())
+            || (module.data && module.payload.empty())
             || segment_count
                 > std::numeric_limits<std::uint32_t>::max()
                     - (module.data ? 0 : module.image.segments.size())) {

@@ -1,29 +1,30 @@
+#include <expected>
 #include "arch/riscv64/cpu/start_context.hpp"
-#include "arch/riscv64/mmu/root_access.hpp"
 #include "arch/riscv64/sbi/base.hpp"
 #include "arch/riscv64/sbi/hsm.hpp"
 
 #include <arch/cpu.hpp>
-#include <core/kernel_image.hpp>
-#include <core/debug.hpp>
-#include <cpu/cpu_runtime.hpp>
-#include <mm/direct_map.hpp>
+#include <boot/link.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
+#include <cpu/runtime.hpp>
+#include <mm/phys.hpp>
 
 namespace arch::riscv64 {
 
 void CpuStartContext::initialize(
-    kernel::CpuHardwareId hardware_id,
-    RootToken root,
+    CpuHwId hardware_id,
+    usize root,
     usize init_stack_top,
-    kernel::CpuRuntime& runtime,
+    CpuRuntime& runtime,
     SecondaryContinuation entry) noexcept {
-    KASSERT(!ready());
-    KASSERT(init_stack_top != 0);
-    KASSERT((init_stack_top & 0xfU) == 0);
-    KASSERT(entry != nullptr);
+    libk_assert(!ready());
+    libk_assert(init_stack_top != 0);
+    libk_assert((init_stack_top & 0xfU) == 0);
+    libk_assert(entry != nullptr);
 
     hardware_id_ = hardware_id.raw;
-    satp_ = RootAccess::value(root);
+    satp_ = root;
     init_stack_top_ = init_stack_top;
     runtime_ = &runtime;
     entry_ = entry;
@@ -68,25 +69,25 @@ auto secondary_start_available() noexcept -> bool {
 }
 
 auto start_secondary(
-    kernel::CpuHardwareId hardware_id,
+    CpuHwId hardware_id,
     CpuStartContext& context,
-    const kernel::mm::DirectMap& direct_map) noexcept
-    -> libk::Expected<void, CpuStartError> {
-    KASSERT(context.ready());
+    const mm::DirectMap& direct_map) noexcept
+    -> std::expected<void, CpuStartError> {
+    libk_assert(context.ready());
 
-    const usize entry = kernel::image::secondary_entry().first().base().raw();
+    const usize entry = secondary_pages().base().base().raw();
     const auto record = direct_map.unmap(
-        kernel::mm::VirtAddr{reinterpret_cast<usize>(&context)}, sizeof(context));
+        mm::Virt{reinterpret_cast<usize>(&context)}, sizeof(context));
     if (!record || (entry & 0x3U) != 0) {
-        return libk::unexpected(CpuStartError::InvalidEntryAddress);
+        return std::unexpected(CpuStartError::InvalidEntryAddress);
     }
 
     const auto result = riscv64::sbi::hart_start(
         hardware_id.raw, entry, record.value().raw());
     if (result.error == riscv64::sbi::success) {
-        return libk::expected();
+        return {};
     }
-    return libk::unexpected(start_error(result.error));
+    return std::unexpected(start_error(result.error));
 }
 
 void wait_for_interrupt() noexcept {

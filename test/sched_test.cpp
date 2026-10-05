@@ -1,59 +1,50 @@
 #include <test/test.hpp>
 
 #include <libk/manual_lifetime.hpp>
-#include <libk/utility.hpp>
-#include <mm/kernel_stack.hpp>
-#include <mm/kernel_vspace.hpp>
+#include <utility>
+#include <mm/kspace.hpp>
 #include <mm/pmm.hpp>
-#include <object/object_store.hpp>
-#include <resource/pool.hpp>
-#include <core/kernel_image.hpp>
-#include <mm/vspace_work.hpp>
-#include <mm/memory_work.hpp>
-#include <mm/reclaim.hpp>
-#include <sched/context.hpp>
+#include <kernel/task/objects.hpp>
+#include <kernel/sched/objects.hpp>
+#include <object/group.hpp>
+#include <object/pool.hpp>
+#include <mm/mem.hpp>
+#include <mm/vspace.hpp>
+#include <mm/pager.hpp>
+#include <boot/link.hpp>
+#include <sched/sc.hpp>
 #include <sched/domain.hpp>
-#include <sched/ready_queue.hpp>
+#include <sched/queues.hpp>
 #include <sched/refill_queue.hpp>
-#include <sched/timer_queue.hpp>
-#include <thread/thread.hpp>
+#include <task/thread.hpp>
 
-#include "arch/riscv64/mmu/sv39_builder.hpp"
+#include <mm/table.hpp>
 
 namespace {
 
-struct MissingObjectTraits final {};
+struct unregistered final {};
 
-static_assert(!kernel::object::StorableObject<MissingObjectTraits>);
-static_assert(kernel::object::StorableObject<kernel::Thread>);
-static_assert(kernel::object::StorableObject<kernel::resource::ResourcePool>);
-static_assert(kernel::object::StorableObject<
-    kernel::sched::SchedulingContext>);
-static_assert(kernel::object::StorableObject<
-    kernel::sched::SchedulingDomain>);
+static_assert(object::kind<unregistered> == object::ObjectKind::Invalid);
 
-using kernel::sched::RefillQueue;
-using kernel::time::Duration;
-using kernel::time::Instant;
+using sched::RefillQueue;
+using time::Duration;
+using time::Instant;
 
-constexpr usize sched_test_page_count = 40;
-alignas(kernel::mm::page_size) byte
-    sched_test_ram[sched_test_page_count * kernel::mm::page_size]{};
+constexpr usize sched_test_page_count = 320;
+alignas(mm::page_size) byte
+    sched_test_ram[sched_test_page_count * mm::page_size]{};
 // The full boot-memory map is PMM construction workspace, so the test fixture
 // owns that storage and drops it immediately after initialization instead of
 // charging it to every test.
-constinit libk::ManualLifetime<kernel::mm::RegionList> sched_test_memory_map{};
-constinit libk::ManualLifetime<kernel::mm::Pmm> sched_test_pmm{};
-constinit libk::ManualLifetime<kernel::mm::DirectMap> sched_test_direct{};
-constinit libk::ManualLifetime<kernel::object::ObjectStore>
-    sched_test_objects{};
-constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
+constinit libk::ManualLifetime<mm::RegionList> sched_test_memory_map{};
+constinit libk::ManualLifetime<mm::Pmm> sched_test_pmm{};
+constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> sched_test_mm{};
+constinit libk::delegate<void() noexcept> sched_test_notify{};
+constinit libk::ManualLifetime<Tasks> sched_test_tasks{};
+constinit libk::ManualLifetime<sched::objects> sched_test_sched{};
+constinit libk::ManualLifetime<mm::SpaceWork>
     sched_test_vspace_work{};
-constinit libk::ManualLifetime<kernel::mm::MemoryExecutor>
-    sched_test_memory_work{};
-constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
-    sched_test_reclaimer{};
-constinit libk::ManualLifetime<kernel::mm::KernelVSpace> sched_test_kernel{};
+constinit libk::ManualLifetime<mm::KSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
 
@@ -65,16 +56,16 @@ struct DeadlineProbe final {
 bool test_deadline_queue_orders_and_removes_fixed_relations(
     const TestContext&) noexcept {
     DeadlineProbe probe{};
-    kernel::sched::Deadline first{
-        kernel::sched::Deadline::Callback::bind<
+    sched::Deadline first{
+        sched::Deadline::Callback::bind<
             &DeadlineProbe::fire>(probe)};
-    kernel::sched::Deadline second{
-        kernel::sched::Deadline::Callback::bind<
+    sched::Deadline second{
+        sched::Deadline::Callback::bind<
             &DeadlineProbe::fire>(probe)};
-    kernel::sched::Deadline later{
-        kernel::sched::Deadline::Callback::bind<
+    sched::Deadline later{
+        sched::Deadline::Callback::bind<
             &DeadlineProbe::fire>(probe)};
-    kernel::sched::DeadlineQueue queue{};
+    sched::DeadlineQueue queue{};
     queue.insert(later, Instant::from_ticks(30));
     queue.insert(first, Instant::from_ticks(10));
     queue.insert(second, Instant::from_ticks(10));
@@ -103,73 +94,61 @@ public:
     ~SchedStorageGuard() noexcept { reset(); }
 
     [[nodiscard]] auto initialize() noexcept -> bool {
-        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel_phys(mm::Virt{
             reinterpret_cast<usize>(sched_test_ram)});
         if (!physical) {
             return false;
         }
-        const auto first = kernel::mm::Page::from_base(*physical);
+        const auto first = mm::Page::from_base(*physical);
         if (!first) {
             return false;
         }
         auto& map = sched_test_memory_map.emplace();
-        if (!map.try_emplace_back(kernel::mm::Region{
-                kernel::mm::PageRange{*first, sched_test_page_count},
-                kernel::mm::RegionKind::AvailableRam})) {
+        if (!map.try_emplace_back(mm::Region{
+                mm::Pages{*first, sched_test_page_count},
+                mm::Region::Kind::Ram})) {
             reset();
             return false;
         }
-        const auto direct = kernel::mm::DirectMap::initialize_in(
-            sched_test_direct,
-            map,
-            kernel::mm::DirectMapLayout{
-                .physical_base = kernel::mm::PhysAddr{
+        if (!mm::Pmm::initialize_in(
+                sched_test_pmm, std::move(map), mm::DirectMap::Layout{
+                .physical_base = mm::Phys{
                     physical->raw()},
-                .virtual_base = kernel::mm::VirtAddr{
+                .virtual_base = mm::Virt{
                     reinterpret_cast<usize>(sched_test_ram)},
                 .window_size = sizeof(sched_test_ram),
-            });
-        if (!direct) {
-            reset();
-            return false;
-        }
-        if (!kernel::mm::Pmm::initialize_in(
-                sched_test_pmm, *sched_test_direct, libk::move(map))) {
+            })) {
             reset();
             return false;
         }
         sched_test_memory_map.reset();
-        auto builder = arch::riscv64::Sv39Builder::create(*sched_test_pmm);
+        auto builder = mm::PageTable::create(*sched_test_pmm, mm::PageTable::Kind::Kernel);
         if (!builder) {
             reset();
             return false;
         }
-        arch::KernelRoot root = libk::move(builder).value().finalize();
-        if (!kernel::mm::KernelVSpace::adopt_in(
-                sched_test_kernel, *sched_test_pmm, libk::move(root))) {
+        mm::PageTable root = std::move(builder).value();
+        if (!mm::KSpace::adopt_in(
+                sched_test_kernel, *sched_test_pmm, std::move(root))) {
             reset();
             return false;
         }
-        auto& vspace_work = sched_test_vspace_work.emplace();
-        auto& memory_work = sched_test_memory_work.emplace();
-        /*luna change: construct a real reclaimer for scheduler objects,
-          reason: ObjectStore requires one mandatory Pager owner*/
-        auto& reclaimer = sched_test_reclaimer.emplace();
-        [[maybe_unused]] auto& objects =
-            sched_test_objects.emplace(
-                *sched_test_pmm, vspace_work, memory_work, reclaimer);
+        (void)sched_test_vspace_work.emplace();
+        [[maybe_unused]] auto& memory =
+            sched_test_mm.emplace(*sched_test_pmm, sched_test_notify);
+        (void)sched_test_tasks.emplace(*sched_test_pmm, sched_test_notify);
+        (void)sched_test_sched.emplace(*sched_test_pmm, sched_test_notify);
         return true;
     }
 
 private:
     static void reset() noexcept {
-        sched_test_objects.reset();
-        sched_test_reclaimer.reset();
-        sched_test_memory_work.reset();
+        sched_test_mm.reset();
+        sched_test_sched.reset();
+        sched_test_tasks.reset();
         sched_test_vspace_work.reset();
         sched_test_kernel.reset();
         sched_test_pmm.reset();
-        sched_test_direct.reset();
         sched_test_memory_map.reset();
     }
 };
@@ -264,26 +243,26 @@ bool test_refill_state_space_preserves_sliding_window(
 
 bool test_scheduling_context_config_boundaries(
     const TestContext&) noexcept {
-    using Config = kernel::sched::SchedulingContext::Config;
+    using Config = sched::Sc::Config;
     const auto valid = [](u64 budget, u64 period, usize capacity) noexcept {
-        return kernel::sched::SchedulingContext::valid_config(Config{
+        return sched::Sc::valid_config(Config{
             .budget = Duration::from_ticks(budget),
             .period = Duration::from_ticks(period),
             .refill_capacity = capacity,
         });
     };
     return valid(1, 1, 1)
-        && valid(4, 8, kernel::sched::SchedulingContext::max_refills)
+        && valid(4, 8, sched::Sc::max_refills)
         && !valid(0, 1, 1)
         && !valid(1, 0, 1)
         && !valid(2, 1, 1)
         && !valid(1, 1, 0)
         && !valid(
-            1, 1, kernel::sched::SchedulingContext::max_refills + 1)
-        && kernel::sched::Urgency::make(
-            kernel::sched::Urgency::level_count - 1)
-        && !kernel::sched::Urgency::make(
-            kernel::sched::Urgency::level_count);
+            1, 1, sched::Sc::max_refills + 1)
+        && sched::Urgency::make(
+            sched::Urgency::level_count - 1)
+        && !sched::Urgency::make(
+            sched::Urgency::level_count);
 }
 
 bool test_object_store_unpublished_construction_rolls_back(
@@ -292,25 +271,25 @@ bool test_object_store_unpublished_construction_rolls_back(
     if (!storage.initialize()) {
         return false;
     }
-    // KernelVSpace owns mapped guarded stack slots as a reusable pool. Warm
+    // KSpace owns mapped guarded stack slots as a reusable pool. Warm
     // one slot so this test measures Thread construction rollback, not pool
     // growth.
     {
-        auto warm = kernel::KernelStack::create(*sched_test_kernel);
+        auto warm = mm::Stack::create(*sched_test_kernel);
         if (!warm) {
             return false;
         }
     }
     const usize free_before = sched_test_pmm->free_page_count();
     {
-        auto stack = kernel::KernelStack::create(*sched_test_kernel);
+        auto stack = mm::Stack::create(*sched_test_kernel);
         if (!stack) {
             return false;
         }
-        auto pending = sched_test_objects->create_thread(
-            libk::move(stack).value(),
-            kernel::ExecutionBinding::kernel(*sched_test_kernel),
-            kernel::Thread::KernelStart{unused_thread_entry, nullptr});
+        auto pending = sched_test_tasks->threads.create(
+            std::move(stack).value(),
+            Env::kernel(*sched_test_kernel),
+            Thread::KernelStart{unused_thread_entry, nullptr});
         if (!pending) {
             return false;
         }
@@ -328,31 +307,31 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
 
-    constexpr kernel::resource::Budget limit{
-        .memory = 4 * kernel::mm::page_size,
+    constexpr resource::budget limit{
+        .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    constexpr kernel::resource::Budget charge{
-        .memory = kernel::mm::page_size,
+    constexpr resource::budget charge{
+        .memory = mm::page_size,
         .caps = 1,
     };
-    auto pending_pool = sched_test_objects->create_resource(limit);
+    auto pending_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
     if (!pending_pool) {
         return false;
     }
-    auto pool = libk::move(pending_pool).value().publish();
+    auto pool = std::move(pending_pool).value().publish();
 
     // An abandoned pre-commit reservation has created no resource and must
     // restore the ledger immediately.
     {
-        auto self = pool.ref();
+        auto self = pool.erase();
         if (!self) {
             return false;
         }
-        auto reserved = pool->reserve(libk::move(self).value(), charge);
+        auto reserved = pool->reserve(std::move(self).value(), charge);
         if (!reserved
             || pool->available()
-                != kernel::resource::Budget{
+                != resource::budget{
                     .memory = limit.memory - charge.memory,
                     .caps = limit.caps - charge.caps}) {
             return false;
@@ -362,22 +341,21 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
 
-    auto self = pool.ref();
+    auto self = pool.erase();
     if (!self) {
         return false;
     }
-    auto reserved = pool->reserve(libk::move(self).value(), charge);
+    auto reserved = pool->reserve(std::move(self).value(), charge);
     if (!reserved) {
         return false;
     }
-    auto pending_memory = sched_test_objects->create_anonymous_sponsored(
-        libk::move(reserved).value(), 2 * kernel::mm::page_size);
+    auto pending_memory = sched_test_mm->get<mm::Mem>().make(std::move(reserved).value(), [&](auto& m) { return m.init_anon({}); }, *sched_test_pmm, 2 * mm::page_size);
     if (!pending_memory) {
         return false;
     }
-    auto memory = libk::move(pending_memory).value().publish();
-    const kernel::resource::Budget after_backing{
-        .memory = limit.memory - charge.memory - kernel::mm::page_size,
+    auto memory = std::move(pending_memory).value().publish();
+    const resource::budget after_backing{
+        .memory = limit.memory - charge.memory - mm::page_size,
         .caps = limit.caps - charge.caps,
     };
     if (pool->sponsorship_count() != 2
@@ -391,10 +369,10 @@ bool test_resource_pool_refunds_after_object_reclaim(
         || pool->sponsorship_count() != 4) {
         return false;
     }
-    auto first_page = libk::move(first_result).value();
+    auto first_page = std::move(first_result).value();
     auto exhausted = memory.get().materialize(1);
     if (exhausted
-        || exhausted.error() != kernel::mm::MemoryError::ResourceExhausted
+        || exhausted.error() != mm::MemErr::ResourceExhausted
         || pool->available().memory != 0
         || pool->sponsorship_count() != 4) {
         return false;
@@ -406,20 +384,24 @@ bool test_resource_pool_refunds_after_object_reclaim(
     memory.reset();
 
     // Retire only requests cleanup. Capacity is dishonest if it returns
-    // before ObjectPool has made the slot and payload reusable.
+    // before pool has made the slot and payload reusable.
     if (pool->sponsorship_count() != 1 || pool->available() == limit) {
         return false;
     }
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     if (pool->sponsorship_count() != 0
         || pool->available() != limit
-        || pool->close() != kernel::resource::PoolState::Closed
+        || pool->close() != object::group::phase::closed
         || !pool->can_retire()
         || !pool.retire()) {
         return false;
     }
     pool.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     return sched_test_pmm->verify_invariants();
 }
 
@@ -430,60 +412,58 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
 
-    constexpr kernel::resource::Budget parent_limit{
-        .memory = 16 * kernel::mm::page_size,
+    constexpr resource::budget parent_limit{
+        .memory = 16 * mm::page_size,
         .caps = 16,
     };
-    constexpr kernel::resource::Budget child_limit{
-        .memory = 4 * kernel::mm::page_size,
+    constexpr resource::budget child_limit{
+        .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    // The child owns its delegated budget. Its ObjectPool capacity is a
+    // The child owns its delegated budget. Its pool capacity is a
     // separate parent-funded cost and returns with the child object.
-    constexpr kernel::resource::Budget transfer{
-        .memory = child_limit.memory + kernel::mm::page_size,
+    constexpr resource::budget transfer{
+        .memory = child_limit.memory + mm::page_size,
         .caps = child_limit.caps,
     };
-    auto pending_parent = sched_test_objects->create_resource(parent_limit);
+    auto pending_parent = sched_test_tasks->groups.create(*sched_test_pmm, parent_limit);
     if (!pending_parent) {
         return false;
     }
-    auto parent = libk::move(pending_parent).value().publish();
-    auto parent_ref = parent.ref();
+    auto parent = std::move(pending_parent).value().publish();
+    auto parent_ref = parent.erase();
     if (!parent_ref) {
         return false;
     }
     auto child_charge = parent->reserve(
-        libk::move(parent_ref).value(), transfer);
+        std::move(parent_ref).value(), transfer);
     if (!child_charge) {
         return false;
     }
-    auto pending_child = sched_test_objects->create_resource_sponsored(
-        libk::move(child_charge).value(), child_limit);
+    auto pending_child = sched_test_tasks->groups.create(std::move(child_charge).value(), *sched_test_pmm, child_limit);
     if (!pending_child) {
         return false;
     }
-    auto child = libk::move(pending_child).value().publish();
+    auto child = std::move(pending_child).value().publish();
 
-    constexpr kernel::resource::Budget object_charge{
-        .memory = kernel::mm::page_size,
+    constexpr resource::budget object_charge{
+        .memory = mm::page_size,
         .caps = 1,
     };
-    auto child_ref = child.ref();
+    auto child_ref = child.erase();
     if (!child_ref) {
         return false;
     }
     auto reserved = child->reserve(
-        libk::move(child_ref).value(), object_charge);
+        std::move(child_ref).value(), object_charge);
     if (!reserved) {
         return false;
     }
-    auto pending_memory = sched_test_objects->create_anonymous_sponsored(
-        libk::move(reserved).value(), kernel::mm::page_size);
+    auto pending_memory = sched_test_mm->get<mm::Mem>().make(std::move(reserved).value(), [&](auto& m) { return m.init_anon({}); }, *sched_test_pmm, mm::page_size);
     if (!pending_memory) {
         return false;
     }
-    auto memory = libk::move(pending_memory).value().publish();
+    auto memory = std::move(pending_memory).value().publish();
     if (child.retire()
         || child->sponsorship_count() != 2
         || parent->sponsorship_count() != 1) {
@@ -494,21 +474,27 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
     memory.reset();
-    sched_test_objects->drain_reclaim();
-    if (child->close() != kernel::resource::PoolState::Closed
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
+    if (child->close() != object::group::phase::closed
         || !child->can_retire() || !child.retire()) {
         return false;
     }
     child.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     if (parent->available() != parent_limit
         || parent->sponsorship_count() != 0
-        || parent->close() != kernel::resource::PoolState::Closed
+        || parent->close() != object::group::phase::closed
         || !parent.retire()) {
         return false;
     }
     parent.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     return sched_test_pmm->verify_invariants();
 }
 
@@ -519,80 +505,84 @@ bool test_resource_pool_close_waits_for_open_transactions(
         return false;
     }
 
-    constexpr kernel::resource::Budget limit{
-        .memory = 2 * kernel::mm::page_size,
+    constexpr resource::budget limit{
+        .memory = 2 * mm::page_size,
         .caps = 2,
     };
-    constexpr kernel::resource::Budget charge{
-        .memory = kernel::mm::page_size,
+    constexpr resource::budget charge{
+        .memory = mm::page_size,
         .caps = 1,
     };
 
-    auto pending_permit_pool = sched_test_objects->create_resource(limit);
-    if (!pending_permit_pool) {
+    auto pending_txn_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
+    if (!pending_txn_pool) {
         return false;
     }
-    auto permit_pool = libk::move(pending_permit_pool).value().publish();
-    auto permit_ref = permit_pool.ref();
-    if (!permit_ref) {
+    auto txn_pool = std::move(pending_txn_pool).value().publish();
+    auto txn_ref = txn_pool.erase();
+    if (!txn_ref) {
         return false;
     }
-    auto permit = permit_pool->begin(libk::move(permit_ref).value());
-    if (!permit
-        || permit_pool->close() != kernel::resource::PoolState::Closing) {
+    auto txn = txn_pool->begin(std::move(txn_ref).value());
+    if (!txn
+        || txn_pool->close() != object::group::phase::closing) {
         return false;
     }
 
     // Closing is a linearization boundary: existing construction may finish,
     // but no new construction epoch or budget reservation may enter.
-    auto rejected_permit_ref = permit_pool.ref();
-    auto rejected_reservation_ref = permit_pool.ref();
-    if (!rejected_permit_ref || !rejected_reservation_ref) {
+    auto rejected_txn_ref = txn_pool.erase();
+    auto rejected_reservation_ref = txn_pool.erase();
+    if (!rejected_txn_ref || !rejected_reservation_ref) {
         return false;
     }
-    auto rejected_permit = permit_pool->begin(
-        libk::move(rejected_permit_ref).value());
-    auto rejected_reservation = permit_pool->reserve(
-        libk::move(rejected_reservation_ref).value(), charge);
-    if (rejected_permit
-        || rejected_permit.error() != kernel::resource::PoolError::Closed
+    auto rejected_txn = txn_pool->begin(
+        std::move(rejected_txn_ref).value());
+    auto rejected_reservation = txn_pool->reserve(
+        std::move(rejected_reservation_ref).value(), charge);
+    if (rejected_txn
+        || rejected_txn.error() != resource::errc::closed
         || rejected_reservation
         || rejected_reservation.error()
-            != kernel::resource::PoolError::Closed) {
+            != resource::errc::closed) {
         return false;
     }
-    libk::move(permit).value().reset();
-    if (permit_pool->state() != kernel::resource::PoolState::Closed
-        || !permit_pool.retire()) {
+    std::move(txn).value().reset();
+    if (txn_pool->state() != object::group::phase::closed
+        || !txn_pool.retire()) {
         return false;
     }
-    permit_pool.reset();
-    sched_test_objects->drain_reclaim();
+    txn_pool.reset();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
 
-    auto pending_reservation_pool = sched_test_objects->create_resource(limit);
+    auto pending_reservation_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
     if (!pending_reservation_pool) {
         return false;
     }
     auto reservation_pool =
-        libk::move(pending_reservation_pool).value().publish();
-    auto reservation_ref = reservation_pool.ref();
+        std::move(pending_reservation_pool).value().publish();
+    auto reservation_ref = reservation_pool.erase();
     if (!reservation_ref) {
         return false;
     }
     auto reservation = reservation_pool->reserve(
-        libk::move(reservation_ref).value(), charge);
+        std::move(reservation_ref).value(), charge);
     if (!reservation
-        || reservation_pool->close() != kernel::resource::PoolState::Closing) {
+        || reservation_pool->close() != object::group::phase::closing) {
         return false;
     }
-    libk::move(reservation).value().reset();
+    std::move(reservation).value().reset();
     if (reservation_pool->available() != limit
-        || reservation_pool->state() != kernel::resource::PoolState::Closed
+        || reservation_pool->state() != object::group::phase::closed
         || !reservation_pool.retire()) {
         return false;
     }
     reservation_pool.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
 
     return sched_test_pmm->verify_invariants();
 }
@@ -606,45 +596,40 @@ bool test_kernel_stack_uses_guarded_virtual_slot(
 
     usize first_base{};
     {
-        auto created = kernel::KernelStack::create(*sched_test_kernel);
+        auto created = mm::Stack::create(*sched_test_kernel);
         if (!created) {
             return false;
         }
-        auto stack = libk::move(created).value();
+        auto stack = std::move(created).value();
         first_base = stack.base();
 
-        auto edit_result = sched_test_kernel->begin_edit();
-        if (!edit_result) {
-            return false;
-        }
-        auto edit = libk::move(edit_result).value();
-        const auto lower = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{stack.lower_guard()});
-        const auto first = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{stack.base()});
-        const auto last = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{stack.top() - kernel::mm::page_size});
-        const auto upper = kernel::mm::VPage::from_base(
-            kernel::mm::VirtAddr{stack.upper_guard()});
+        const auto lower = mm::VPage::from_base(
+            mm::Virt{stack.lower_guard()});
+        const auto first = mm::VPage::from_base(
+            mm::Virt{stack.base()});
+        const auto last = mm::VPage::from_base(
+            mm::Virt{stack.top() - mm::page_size});
+        const auto upper = mm::VPage::from_base(
+            mm::Virt{stack.upper_guard()});
         if (!lower || !first || !last || !upper) {
             return false;
         }
-        const auto lower_entry = edit.pages().query(*lower);
-        const auto first_entry = edit.pages().query(*first);
-        const auto last_entry = edit.pages().query(*last);
-        const auto upper_entry = edit.pages().query(*upper);
+        const auto lower_entry = sched_test_kernel->pages().query(*lower);
+        const auto first_entry = sched_test_kernel->pages().query(*first);
+        const auto last_entry = sched_test_kernel->pages().query(*last);
+        const auto upper_entry = sched_test_kernel->pages().query(*upper);
         if (lower_entry
-            || lower_entry.error() != arch::PageEditError::NotMapped
+            || lower_entry.error() != mm::PtErr::Missing
             || !first_entry
             || !last_entry
             || upper_entry
-            || upper_entry.error() != arch::PageEditError::NotMapped
-            || stack.size() != kernel::mm::KernelStackLayout::StackBytes) {
+            || upper_entry.error() != mm::PtErr::Missing
+            || stack.size() != mm::Stack::StackBytes) {
             return false;
         }
     }
 
-    auto reused = kernel::KernelStack::create(*sched_test_kernel);
+    auto reused = mm::Stack::create(*sched_test_kernel);
     return reused && reused.value().base() == first_base;
 }
 
@@ -654,26 +639,26 @@ bool test_domain_admission_is_conservative_and_transactional(
     if (!storage.initialize()) {
         return false;
     }
-    auto capacity = kernel::sched::DomainCapacity::create(
+    auto capacity = sched::DomainCapacity::create(
         *sched_test_pmm, 1);
     if (!capacity) {
         return false;
     }
-    auto pending_domain = sched_test_objects->create_domain(
-        libk::move(capacity).value(),
-        kernel::sched::SchedulingDomain::share_scale,
+    auto pending_domain = sched_test_sched->domains.create(
+        std::move(capacity).value(),
+        sched::Domain::share_scale,
         100'000U);
     if (!pending_domain) {
         return false;
     }
-    auto domain = libk::move(pending_domain).value().publish();
+    auto domain = std::move(pending_domain).value().publish();
 
-    kernel::object::ObjectStore::SchedulingContextHold contexts[3]{};
+    object::ref<sched::Sc> contexts[3]{};
     constexpr u64 budgets[3]{1, 1, 1};
     constexpr u64 periods[3]{3, 3, 2};
     for (usize index = 0; index < 3; ++index) {
-        auto pending = sched_test_objects->create_context(
-            kernel::sched::SchedulingContext::Config{
+        auto pending = sched_test_sched->contexts.create(
+            sched::Sc::Config{
                 .budget = Duration::from_ticks(budgets[index]),
                 .period = Duration::from_ticks(periods[index]),
             },
@@ -681,28 +666,28 @@ bool test_domain_admission_is_conservative_and_transactional(
         if (!pending) {
             return false;
         }
-        contexts[index] = libk::move(pending).value().publish();
+        contexts[index] = std::move(pending).value().publish();
     }
 
     const bool first = static_cast<bool>(
-        domain->admit(contexts[0].get(), kernel::CpuId{0}));
+        domain->admit(contexts[0].get(), CpuId{0}));
     const bool second = static_cast<bool>(
-        domain->admit(contexts[1].get(), kernel::CpuId{0}));
-    const auto rejected = domain->admit(contexts[2].get(), kernel::CpuId{0});
+        domain->admit(contexts[1].get(), CpuId{0}));
+    const auto rejected = domain->admit(contexts[2].get(), CpuId{0});
     const bool rejected_cleanly = !rejected
         && rejected.error()
-            == kernel::sched::SchedulingDomain::Error::CapacityExceeded
+            == sched::Domain::Error::CapacityExceeded
         && !contexts[2]->admitted();
     const bool released = static_cast<bool>(
         domain->unadmit(contexts[0].get()));
     const bool admitted_after_release = static_cast<bool>(
-        domain->admit(contexts[2].get(), kernel::CpuId{0}));
-    const auto wrong_cpu = domain->admit(contexts[0].get(), kernel::CpuId{1});
+        domain->admit(contexts[2].get(), CpuId{0}));
+    const auto wrong_cpu = domain->admit(contexts[0].get(), CpuId{1});
 
     const bool result = first && second && rejected_cleanly && released
         && admitted_after_release && !wrong_cpu
         && wrong_cpu.error()
-            == kernel::sched::SchedulingDomain::Error::InvalidCpu;
+            == sched::Domain::Error::InvalidCpu;
 
     for (usize index = 1; index < 3; ++index) {
         if (!domain->unadmit(contexts[index].get())) {
@@ -719,7 +704,9 @@ bool test_domain_admission_is_conservative_and_transactional(
         return false;
     }
     domain.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     return result && sched_test_pmm->verify_invariants();
 }
 
@@ -729,40 +716,40 @@ bool test_ready_queue_orders_priority_and_fifo(
     if (!storage.initialize()) {
         return false;
     }
-    auto capacity = kernel::sched::DomainCapacity::create(
+    auto capacity = sched::DomainCapacity::create(
         *sched_test_pmm, 1);
     if (!capacity) {
         return false;
     }
-    auto pending_domain = sched_test_objects->create_domain(
-        libk::move(capacity).value(),
-        kernel::sched::SchedulingDomain::share_scale,
+    auto pending_domain = sched_test_sched->domains.create(
+        std::move(capacity).value(),
+        sched::Domain::share_scale,
         0U);
     if (!pending_domain) {
         return false;
     }
-    auto domain = libk::move(pending_domain).value().publish();
+    auto domain = std::move(pending_domain).value().publish();
 
-    kernel::object::ObjectStore::ThreadHold threads[3]{};
-    kernel::object::ObjectStore::SchedulingContextHold contexts[3]{};
+    object::ref<Thread> threads[3]{};
+    object::ref<sched::Sc> contexts[3]{};
     constexpr u8 levels[3]{2, 5, 5};
     for (usize index = 0; index < 3; ++index) {
-        auto stack = kernel::KernelStack::create(*sched_test_kernel);
+        auto stack = mm::Stack::create(*sched_test_kernel);
         if (!stack) {
             return false;
         }
-        auto pending_thread = sched_test_objects->create_thread(
-            libk::move(stack).value(),
-            kernel::ExecutionBinding::kernel(*sched_test_kernel),
-            kernel::Thread::KernelStart{unused_thread_entry, nullptr});
-        const auto urgency = kernel::sched::Urgency::make(levels[index]);
+        auto pending_thread = sched_test_tasks->threads.create(
+            std::move(stack).value(),
+            Env::kernel(*sched_test_kernel),
+            Thread::KernelStart{unused_thread_entry, nullptr});
+        const auto urgency = sched::Urgency::make(levels[index]);
         if (!pending_thread || !urgency) {
             return false;
         }
-        threads[index] = libk::move(pending_thread).value().publish();
+        threads[index] = std::move(pending_thread).value().publish();
 
-        auto pending_context = sched_test_objects->create_context(
-            kernel::sched::SchedulingContext::Config{
+        auto pending_context = sched_test_sched->contexts.create(
+            sched::Sc::Config{
                 .budget = Duration::from_ticks(1),
                 .period = Duration::from_ticks(10),
                 .urgency = *urgency,
@@ -771,11 +758,11 @@ bool test_ready_queue_orders_priority_and_fifo(
         if (!pending_context) {
             return false;
         }
-        contexts[index] = libk::move(pending_context).value().publish();
+        contexts[index] = std::move(pending_context).value().publish();
         auto target = threads[index].clone();
         if (!target
-            || !domain->admit(contexts[index].get(), kernel::CpuId{0})
-            || !contexts[index]->bind(libk::move(target).value())) {
+            || !domain->admit(contexts[index].get(), CpuId{0})
+            || !contexts[index]->bind(std::move(target).value())) {
             return false;
         }
     }
@@ -783,10 +770,10 @@ bool test_ready_queue_orders_priority_and_fifo(
     bool ordered{};
     bool membership{};
     {
-        kernel::sched::ReadyQueue queue{};
-        kernel::sched::Binding* const low = contexts[0]->binding();
-        kernel::sched::Binding* const high_first = contexts[1]->binding();
-        kernel::sched::Binding* const high_second = contexts[2]->binding();
+        sched::ReadyQueue queue{};
+        sched::Sc* const low = &contexts[0].get();
+        sched::Sc* const high_first = &contexts[1].get();
+        sched::Sc* const high_second = &contexts[2].get();
         const auto low_urgency = contexts[0]->urgency();
         const auto high_urgency = contexts[1]->urgency();
         queue.enqueue(*low, low_urgency);
@@ -820,7 +807,9 @@ bool test_ready_queue_orders_priority_and_fifo(
         return false;
     }
     domain.reset();
-    sched_test_objects->drain_reclaim();
+    sched_test_mm->drain();
+    sched_test_sched->drain();
+    sched_test_tasks->drain();
     return ordered && membership && sched_test_pmm->verify_invariants();
 }
 
@@ -849,7 +838,7 @@ void register_sched_tests(TestRegistry& registry) noexcept {
         test_scheduling_context_config_boundaries);
     (void)registry.add(
         "sched",
-        "ObjectStore unpublished construction rolls back slab and payload",
+        "Object pool unpublished construction rolls back slab and payload",
         test_object_store_unpublished_construction_rolls_back);
     (void)registry.add(
         "sched",

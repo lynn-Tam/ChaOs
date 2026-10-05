@@ -1,8 +1,8 @@
-#include <user/server_rt/service.hpp>
+#include <servers/runtime/service.hpp>
 #pragma once
 
-#include <user/ipc/io.hpp>
-#include <user/ipc/storage.hpp>
+#include <sys/queue.hpp>
+#include <sys/storage.hpp>
 #include <uapi/pager.h>
 
 namespace myos::files {
@@ -36,12 +36,10 @@ class Backing final {
             service::copy(reinterpret_cast<void*>(service::IpcAddress), self.bytes_, sizeof(self.bytes_));
             status = memory_write(self.staging_.selector(), 0, 0, sizeof(self.bytes_)).status;
         }
-        self.claim_.payload.page_in.content_epoch = 1;
-        service::copy(reinterpret_cast<void*>(service::IpcAddress), &self.claim_, sizeof(self.claim_));
         if (status == MYOS_STATUS_OK)
-            status = pager_supply(self.pager_.selector(), self.memory_.selector(), self.staging_.selector(), 0).status;
+            status = pager_supply(self.pager_.selector(), self.memory_.selector(), self.staging_.selector(), 0, self.claim_.id).status;
         if (status != MYOS_STATUS_OK)
-            service::require(pager_fail(self.pager_.selector(), self.memory_.selector()).status);
+            service::require(pager_fail(self.pager_.selector(), self.memory_.selector(), self.claim_.id).status);
         self.claim_ = {};
     }
 
@@ -49,7 +47,7 @@ public:
     auto open(myos_cap_t pool, myos_cap_t events, size_t file, uint64_t size) noexcept -> myos_status_t {
         if (memory_) return MYOS_STATUS_OK;
         if (size == 0) return MYOS_STATUS_BAD_ARGS;
-        const auto pager = pager_create(pool, file + 1, 1);
+        const auto pager = pager_create(pool);
         if (pager.status != MYOS_STATUS_OK) return pager.status;
         pager_ = cap::OwnedCap{{pager.value, 0}};
         const uint64_t rounded = (size + 4095) & ~uint64_t{4095};
@@ -94,8 +92,8 @@ public:
         if (result.status == MYOS_STATUS_WOULD_BLOCK) return MYOS_STATUS_OK;
         if (result.status != MYOS_STATUS_OK) return result.status;
         service::copy(&claim_, reinterpret_cast<void*>(service::IpcAddress), sizeof(claim_));
-        if (claim_.version != MYOS_PAGER_REQUEST_VERSION || claim_.kind != MYOS_PAGER_REQUEST_PAGE_IN
-            || claim_.flags != 0 || claim_.payload.page_in.count != 1
+        if (!claim_.id || claim_.kind != MYOS_PAGER_REQUEST_PAGE_IN
+            || claim_.payload.page_in.count != 1
             || claim_.page_index >= (size_ + 4095) / 4096) return MYOS_STATUS_PEER_FAULT;
         for (auto& byte : bytes_) byte = 0;
         const auto offset = claim_.page_index * uint64_t{4096};

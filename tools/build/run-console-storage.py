@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import sys
 
-
 def main():
     qemu, kernel, bundle, boot, data, cpus = sys.argv[1:7]
     data = Path(data)
@@ -20,7 +19,6 @@ def main():
                "-drive", f"if=none,id=data,format=raw,file={data}",
                "-device", "virtio-blk-pci,addr=2,drive=data,disable-legacy=on,iommu_platform=on"]
     os.execvp(qemu, command)
-
 
 if __name__ == "__main__":
     main()

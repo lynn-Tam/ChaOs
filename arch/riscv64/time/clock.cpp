@@ -2,10 +2,10 @@
 
 namespace arch {
 
-auto read_clock() noexcept -> kernel::time::Instant {
+auto read_clock() noexcept -> time::Instant {
     u64 ticks;
     asm volatile("rdtime %0" : "=r"(ticks));
-    return kernel::time::Instant::from_ticks(ticks);
+    return time::Instant::from_ticks(ticks);
 }
 
 } // namespace arch

@@ -11,7 +11,6 @@ FAT_SECTORS = 1024
 DATA = RESERVED + 2 * FAT_SECTORS
 CLUSTERS = SECTORS - DATA
 
-
 def build(output, sources):
     if len(sources) > 128:
         raise ValueError("at most 128 root files")
@@ -77,7 +76,6 @@ def build(output, sources):
         for cluster, data in payloads:
             image.seek((DATA + cluster - 2) * SECTOR)
             image.write(data)
-
 
 if __name__ == "__main__":
     try:

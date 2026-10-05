@@ -1,43 +1,38 @@
 #include <test/test.hpp>
-#include <arch/io_page_table.hpp>
+#include <mm/table.hpp>
 
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/scope_guard.hpp>
 #include <libk/span.hpp>
-#include <libk/utility.hpp>
-#include <mm/memory_object.hpp>
-#include <mm/reclaim.hpp>
-#include <pager/pager.hpp>
-#include <object/object_store.hpp>
-#include <mm/vspace_work.hpp>
-#include <mm/memory_work.hpp>
-#include <core/kernel_image.hpp>
+#include <utility>
+#include <mm/mem.hpp>
+#include <mm/pager.hpp>
+#include <object/pool.hpp>
+#include <object/group.hpp>
+#include <mm/vspace.hpp>
+#include <boot/link.hpp>
 
 namespace {
 
 constexpr usize memory_test_pages = 160;
 constexpr usize reserved_pages = 8;
-alignas(kernel::mm::page_size) byte
-    memory_test_ram[memory_test_pages * kernel::mm::page_size]{};
-constinit libk::ManualLifetime<kernel::mm::RegionList> memory_test_map{};
-constinit libk::ManualLifetime<kernel::mm::DirectMap> memory_test_direct{};
-constinit libk::ManualLifetime<kernel::mm::Pmm> memory_test_pmm{};
-constinit libk::ManualLifetime<kernel::object::ObjectStore>
-    memory_test_objects{};
-constinit libk::ManualLifetime<kernel::mm::VSpaceExecutor>
+alignas(mm::page_size) byte
+    memory_test_ram[memory_test_pages * mm::page_size]{};
+constinit libk::ManualLifetime<mm::RegionList> memory_test_map{};
+constinit libk::ManualLifetime<mm::Pmm> memory_test_pmm{};
+constinit libk::delegate<void() noexcept> memory_test_notify{};
+constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_test_mm{};
+
+constinit libk::ManualLifetime<mm::SpaceWork>
     memory_test_vspace_work{};
-constinit libk::ManualLifetime<kernel::mm::MemoryExecutor>
-    memory_test_memory_work{};
-constinit libk::ManualLifetime<kernel::mm::PageReclaimer>
-    memory_test_reclaimer{};
-constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_object{};
-constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_peer{};
-constinit libk::ManualLifetime<kernel::mm::MemoryObject> memory_test_staging{};
+constinit libk::ManualLifetime<mm::Mem> memory_test_object{};
+constinit libk::ManualLifetime<mm::Mem> memory_test_peer{};
+constinit libk::ManualLifetime<mm::Mem> memory_test_staging{};
 
 struct StagingReset final {
     ~StagingReset() noexcept {
-        /*luna change: retire staging before reset in focused tests, reason: early transfer assertions must not be masked by MemoryObject teardown*/
+        /*luna change: retire staging before reset in focused tests, reason: early transfer assertions must not be masked by Mem teardown*/
         if (memory_test_staging) {
             memory_test_staging->retire();
             memory_test_staging.reset();
@@ -45,14 +40,14 @@ struct StagingReset final {
     }
 };
 
-[[nodiscard]] auto page_at(usize offset) noexcept -> kernel::mm::Page {
-    const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
+[[nodiscard]] auto page_at(usize offset) noexcept -> mm::Page {
+    const auto physical = kernel_phys(mm::Virt{
         reinterpret_cast<usize>(memory_test_ram)});
-    KASSERT(physical);
-    const auto address = physical->checked_add(offset * kernel::mm::page_size);
-    KASSERT(address);
-    const auto page = kernel::mm::Page::from_base(*address);
-    KASSERT(page);
+    libk_assert(physical);
+    const auto address = physical->checked_add(offset * mm::page_size);
+    libk_assert(address);
+    const auto page = mm::Page::from_base(*address);
+    libk_assert(page);
     return *page;
 }
 
@@ -63,95 +58,79 @@ public:
 
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
-        const auto physical = kernel::image::linked_physical(kernel::mm::VirtAddr{
+        const auto physical = kernel_phys(mm::Virt{
             reinterpret_cast<usize>(memory_test_ram)});
         if (!physical) {
             return false;
         }
         auto& map = memory_test_map.emplace();
-        if (!map.try_emplace_back(kernel::mm::Region{
-                kernel::mm::PageRange{page_at(0), reserved_pages},
-                kernel::mm::RegionKind::KernelImage})
-            || !map.try_emplace_back(kernel::mm::Region{
-                kernel::mm::PageRange{
+        libk_assert(map.try_emplace_back(mm::Region{
+            {*mm::Page::from_base(mm::Phys{0x1000'0000}), 1}, mm::Region::Kind::Mmio}));
+        if (!map.try_emplace_back(mm::Region{
+                mm::Pages{page_at(0), reserved_pages},
+                mm::Region::Kind::Kernel})
+            || !map.try_emplace_back(mm::Region{
+                mm::Pages{
                     page_at(reserved_pages),
                     memory_test_pages - reserved_pages},
-                kernel::mm::RegionKind::AvailableRam})) {
+                mm::Region::Kind::Ram})) {
             reset();
             return false;
         }
-        const auto direct = kernel::mm::DirectMap::initialize_in(
-            memory_test_direct,
-            map,
-            kernel::mm::DirectMapLayout{
+        if (!mm::Pmm::initialize_in(
+                memory_test_pmm, std::move(map), mm::DirectMap::Layout{
                 .physical_base = *physical,
-                .virtual_base = kernel::mm::VirtAddr{
+                .virtual_base = mm::Virt{
                     reinterpret_cast<usize>(memory_test_ram)},
                 .window_size = sizeof(memory_test_ram),
-            });
-        if (!direct
-            || !kernel::mm::Pmm::initialize_in(
-                memory_test_pmm,
-                *memory_test_direct,
-                libk::move(map))) {
+            })) {
             reset();
             return false;
         }
         memory_test_map.reset();
-        auto& vspace_work = memory_test_vspace_work.emplace();
-        auto& memory_work = memory_test_memory_work.emplace();
-        /*luna change: construct a real reclaimer for focused objects, reason:
-          tests must exercise the mandatory Pager membership owner*/
-        auto& reclaimer = memory_test_reclaimer.emplace();
-        [[maybe_unused]] auto& objects =
-            memory_test_objects.emplace(
-                *memory_test_pmm, vspace_work, memory_work, reclaimer);
+        (void)memory_test_vspace_work.emplace();
+
+        [[maybe_unused]] auto& memory =
+            memory_test_mm.emplace(*memory_test_pmm, memory_test_notify);
         return true;
     }
 
-    [[nodiscard]] auto make(usize byte_size) noexcept -> kernel::mm::MemoryObject& {
+    [[nodiscard]] auto make(usize byte_size) noexcept -> mm::Mem& {
         if (memory_test_object) {
             memory_test_object->retire();
             memory_test_object.reset();
         }
         return memory_test_object.emplace(
             *memory_test_pmm,
-            byte_size,
-            *memory_test_memory_work,
-            *memory_test_reclaimer);
+            byte_size);
     }
 
     [[nodiscard]] auto make_peer(usize byte_size) noexcept
-        -> kernel::mm::MemoryObject& {
+        -> mm::Mem& {
         if (memory_test_peer) {
             memory_test_peer->retire();
             memory_test_peer.reset();
         }
         return memory_test_peer.emplace(
             *memory_test_pmm,
-            byte_size,
-            *memory_test_memory_work,
-            *memory_test_reclaimer);
+            byte_size);
     }
 
-    [[nodiscard]] auto pmm() noexcept -> kernel::mm::Pmm& {
+    [[nodiscard]] auto pmm() noexcept -> mm::Pmm& {
         return *memory_test_pmm;
     }
 
-    [[nodiscard]] auto objects() noexcept
-        -> kernel::object::ObjectStore& {
-        return *memory_test_objects;
-    }
+    auto memory() noexcept -> object::store<mm::VSpace, mm::Mem, Pager>& { return *memory_test_mm; }
 
     [[nodiscard]] auto make_pager() noexcept -> bool {
         if (pager_) {
             return false;
         }
-        auto pending = objects().create_pager();
+        auto pending = memory().get<Pager>().create();
         if (!pending) {
             return false;
         }
-        pager_ = libk::move(pending).value().publish();
+        pager_ = std::move(pending).value().publish();
         return static_cast<bool>(pager_);
     }
 
@@ -159,36 +138,36 @@ public:
         if (wrong_pager_) {
             return false;
         }
-        auto pending = objects().create_pager();
+        auto pending = memory().get<Pager>().create();
         if (!pending) {
             return false;
         }
-        wrong_pager_ = libk::move(pending).value().publish();
+        wrong_pager_ = std::move(pending).value().publish();
         return static_cast<bool>(wrong_pager_);
     }
 
-    [[nodiscard]] auto pager() noexcept -> kernel::pager::Pager& {
-        KASSERT(pager_);
+    [[nodiscard]] auto pager() noexcept -> Pager& {
+        libk_assert(pager_);
         return pager_.get();
     }
 
     [[nodiscard]] auto pager_ref() noexcept {
-        KASSERT(pager_);
-        return pager_.ref();
+        libk_assert(pager_);
+        return pager_.erase();
     }
 
-    [[nodiscard]] auto wrong_pager() noexcept -> kernel::pager::Pager& {
-        KASSERT(wrong_pager_);
+    [[nodiscard]] auto wrong_pager() noexcept -> Pager& {
+        libk_assert(wrong_pager_);
         return wrong_pager_.get();
     }
 
-    void keep(kernel::object::ObjectStore::MemoryHold&& memory) noexcept {
-        KASSERT(!pooled_);
-        pooled_ = libk::move(memory);
+    void keep(object::ref<mm::Mem>&& memory) noexcept {
+        libk_assert(!pooled_);
+        pooled_ = std::move(memory);
     }
 
     [[nodiscard]] auto pooled() noexcept
-        -> kernel::object::ObjectStore::MemoryHold& {
+        -> object::ref<mm::Mem>& {
         return pooled_;
     }
 
@@ -216,21 +195,19 @@ private:
             (void)pager_.retire();
             pager_.reset();
         }
-        if (memory_test_objects) {
-            memory_test_objects->drain_reclaim();
+        if (memory_test_mm) {
+            memory_test_mm->drain();
         }
-        memory_test_objects.reset();
-        memory_test_reclaimer.reset();
-        memory_test_memory_work.reset();
+        memory_test_mm.reset();
+
         memory_test_vspace_work.reset();
         memory_test_pmm.reset();
-        memory_test_direct.reset();
         memory_test_map.reset();
     }
 
-    kernel::object::ObjectStore::MemoryHold pooled_{};
-    kernel::object::ObjectStore::PagerHold pager_{};
-    kernel::object::ObjectStore::PagerHold wrong_pager_{};
+    object::ref<mm::Mem> pooled_{};
+    object::ref<Pager> pager_{};
+    object::ref<Pager> wrong_pager_{};
 };
 
 struct FakeMapping final : private libk::noncopyable_nonmovable {
@@ -238,25 +215,23 @@ struct FakeMapping final : private libk::noncopyable_nonmovable {
 
     static void invalidate(
         void* context,
-        kernel::mm::MemoryWork&& work,
-        kernel::mm::MemoryInvalidation reason) noexcept {
+        mm::MemWork&& work) noexcept {
         auto& self = *static_cast<FakeMapping*>(context);
-        KASSERT(reason == kernel::mm::MemoryInvalidation::Destroy);
         ++self.invalidations;
-        self.work = libk::move(work);
+        self.work = std::move(work);
     }
 
     static void released(void* context) noexcept {
         ++static_cast<FakeMapping*>(context)->releases;
     }
 
-    inline static const kernel::mm::MemoryAttachmentOps ops{
+    inline static const mm::MemOps ops{
         invalidate,
         released,
     };
 
-    kernel::mm::MemoryAttachment attachment;
-    kernel::mm::MemoryWork work{};
+    mm::MemLink attachment;
+    mm::MemWork work{};
     usize invalidations{};
     usize releases{};
 };
@@ -266,10 +241,10 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
     if (!fixture.initialize()) return false;
     auto backing = fixture.pmm().allocate_page();
     if (!backing) return false;
-    const kernel::mm::Page pages[] = {backing.value().page(), backing.value().page()};
+    const mm::Page pages[] = {backing.value().page(), backing.value().page()};
     const usize free = fixture.pmm().free_page_count();
     {
-        auto io = arch::IoRoot::create(fixture.pmm(), 0x1ff000, pages, true);
+        auto io = mm::PageTable::dma(fixture.pmm(), 0x1ff000, pages, true);
         if (!io || io.value().page_count() != 4) return false;
         const auto& direct = fixture.pmm().direct_map();
         auto root = direct.ptr<const u64>(io.value().page().base(), 512);
@@ -277,7 +252,7 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
         for (usize index = 1; index < 512; ++index)
             if (root.value()[index] != 0) return false;
         auto middle = direct.ptr<const u64>(
-            kernel::mm::PhysAddr{(root.value()[0] >> 10) << 12}, 512);
+            mm::Phys{(root.value()[0] >> 10) << 12}, 512);
         if (!middle) return false;
         for (usize index = 0; index < 512; ++index) {
             if (index >= 2) {
@@ -286,11 +261,11 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
             }
             if ((middle.value()[index] & 0x3ff) != 1) return false;
             auto leaves = direct.ptr<const u64>(
-                kernel::mm::PhysAddr{(middle.value()[index] >> 10) << 12}, 512);
+                mm::Phys{(middle.value()[index] >> 10) << 12}, 512);
             if (!leaves) return false;
             for (usize leaf = 0; leaf < 512; ++leaf) {
                 const u64 expected = leaf == (index == 0 ? 511 : 0)
-                    ? (u64{backing.value().page().frame().raw()} << 10) | 0xd7
+                    ? (u64{backing.value().page().raw()} << 10) | 0xd7
                     : 0;
                 if (leaves.value()[leaf] != expected) return false;
             }
@@ -298,33 +273,33 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
     }
     if (fixture.pmm().free_page_count() != free || !backing.value()) return false;
     // Cross both table levels using a sequential source, as IOSpace does
-    // when its PageLeases occupy several metadata pages.
+    // when its PageHolds occupy several metadata pages.
     usize consumed{};
     auto next = [&]() noexcept {
         ++consumed;
         return backing.value().page();
     };
     {
-        const auto required = arch::IoRoot::required_pages(0x3ffff000, 2);
-        auto io = arch::IoRoot::create(fixture.pmm(), 0x3ffff000, 2,
-            arch::IoRoot::PageSource::bind(next), false);
+        const auto required = mm::PageTable::dma_pages(0x3ffff000, 2);
+        auto io = mm::PageTable::dma(fixture.pmm(), 0x3ffff000, 2,
+            next, false);
         if (!required || required.value() != 5 || !io
             || io.value().page_count() != required.value() || consumed != 2)
             return false;
     }
     const usize invalid_first[] = {0, 1, usize{1} << 38};
     for (const usize first : invalid_first) {
-        auto io = arch::IoRoot::create(fixture.pmm(), first, 1,
-            arch::IoRoot::PageSource::bind(next), false);
+        auto io = mm::PageTable::dma(fixture.pmm(), first, 1,
+            next, false);
         if (io || consumed != 2) return false;
     }
-    if (arch::IoRoot::required_pages(0x1000, 0)
-        || arch::IoRoot::required_pages((usize{1} << 38) - 4096, 2)
-        || arch::IoRoot::required_pages(0x1000, ~usize{0})) return false;
-    const kernel::mm::Page invalid[] = {
-        kernel::mm::Page{kernel::mm::Pfn{usize{1} << 44}}};
-    auto rejected = arch::IoRoot::create(fixture.pmm(), 0x1000, invalid, false);
-    return !rejected && rejected.error() == arch::IoRootError::InvalidRange
+    if (mm::PageTable::dma_pages(0x1000, 0)
+        || mm::PageTable::dma_pages((usize{1} << 38) - 4096, 2)
+        || mm::PageTable::dma_pages(0x1000, ~usize{0})) return false;
+    const mm::Page invalid[] = {
+        mm::Page{usize{1} << 44}};
+    auto rejected = mm::PageTable::dma(fixture.pmm(), 0x1000, invalid, false);
+    return !rejected && rejected.error() == mm::PtErr::BadPhys
         && fixture.pmm().free_page_count() == free;
 }
 
@@ -335,25 +310,25 @@ bool test_anonymous_sparse_pages_own_zeroed_frames(
         return false;
     }
     const usize free_before = fixture.pmm().free_page_count();
-    kernel::mm::MemoryObject& memory = fixture.make(8 * kernel::mm::page_size);
-    if (!memory.initialize_anonymous({})
-        || memory.kind() != kernel::mm::BackingKind::Anonymous
-        || memory.query(5).value() != kernel::mm::ContentState::Zero) {
+    mm::Mem& memory = fixture.make(8 * mm::page_size);
+    if (!memory.init_anon({})
+        || memory.kind() != mm::BackingKind::Anonymous
+        || memory.query(5).value() != mm::ContentState::Zero) {
         return false;
     }
 
-    kernel::mm::Page resident{};
+    mm::Page resident{};
     {
         auto materialized = memory.materialize(5);
         if (!materialized) {
             return false;
         }
-        auto lease = libk::move(materialized).value();
+        auto lease = std::move(materialized).value();
         resident = lease.page().page;
         const byte* const bytes = fixture.pmm().bytes(resident);
-        if (bytes[0] != 0 || bytes[kernel::mm::page_size - 1] != 0
-            || !lease.page().access.contains(kernel::mm::Access::Write)
-            || lease.page().type != kernel::mm::MemoryType::Normal) {
+        if (bytes[0] != 0 || bytes[mm::page_size - 1] != 0
+            || !lease.page().access.contains(mm::Perm::Write)
+            || lease.page().type != mm::MemoryType::Normal) {
             return false;
         }
         fixture.pmm().bytes(resident)[37] = byte{0x5a};
@@ -363,40 +338,40 @@ bool test_anonymous_sparse_pages_own_zeroed_frames(
         if (!materialized
             || materialized.value().page().page != resident
             || fixture.pmm().bytes(resident)[37] != byte{0x5a}
-            || memory.query(3).value() != kernel::mm::ContentState::Zero) {
+            || memory.query(3).value() != mm::ContentState::Zero) {
             return false;
         }
-        auto lease = libk::move(materialized).value();
+        auto lease = std::move(materialized).value();
         memory.retire();
-        if (memory.state() != kernel::mm::MemoryState::Stopping
+        if (memory.state() != mm::MemState::Stopping
             || fixture.pmm().state_of(resident).value()
-                != kernel::mm::PageState::Allocated) {
+                != mm::PageState::Allocated) {
             return false;
         }
     }
-    const bool lazy_complete = memory.state() == kernel::mm::MemoryState::Retired
-        && fixture.pmm().state_of(resident).value() == kernel::mm::PageState::Free
+    const bool lazy_complete = memory.state() == mm::MemState::Retired
+        && fixture.pmm().state_of(resident).value() == mm::PageState::Free
         && fixture.pmm().free_page_count() == free_before
         && fixture.pmm().verify_invariants();
     if (!lazy_complete) {
         return false;
     }
 
-    kernel::mm::MemoryObject& eager = fixture.make(3 * kernel::mm::page_size);
-    if (!eager.initialize_anonymous(kernel::mm::AnonymousConfig{
-            .access = kernel::mm::AccessMask::of(kernel::mm::Access::Read, kernel::mm::Access::Write),
+    mm::Mem& eager = fixture.make(3 * mm::page_size);
+    if (!eager.init_anon(mm::AnonCfg{
+            .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
             .eager = true,
         })) {
         return false;
     }
     for (usize index = 0; index < eager.page_count(); ++index) {
         auto state = eager.query(index);
-        if (!state || state.value() != kernel::mm::ContentState::Resident) {
+        if (!state || state.value() != mm::ContentState::Resident) {
             return false;
         }
     }
     eager.retire();
-    return eager.state() == kernel::mm::MemoryState::Retired
+    return eager.state() == mm::MemState::Retired
         && fixture.pmm().free_page_count() == free_before;
 }
 
@@ -407,27 +382,25 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
         return false;
     }
     const usize free_before = fixture.pmm().free_page_count();
-    constexpr auto read_execute = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Execute);
-    constexpr auto read_write = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
-    const kernel::mm::Page device = *kernel::mm::Page::from_base(kernel::mm::PhysAddr{0x1000'0000});
-    const kernel::mm::MemoryExtent extents[]{
+    constexpr auto read_execute = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Execute);
+    constexpr auto read_write = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
+    const mm::Page device = *mm::Page::from_base(mm::Phys{0x1000'0000});
+    const mm::Extent extents[]{
         {
             .object = {0, 2},
             .physical = {page_at(0), 2},
             .access = read_execute,
-            .type = kernel::mm::MemoryType::Normal,
         },
         {
             .object = {2, 1},
             .physical = {device, 1},
             .access = read_write,
-            .type = kernel::mm::MemoryType::Device,
         },
     };
-    kernel::mm::MemoryObject& memory = fixture.make(3 * kernel::mm::page_size);
-    if (!memory.initialize_physical(libk::Span<const kernel::mm::MemoryExtent>{extents})) {
+    mm::Mem& memory = fixture.make(3 * mm::page_size);
+    if (!memory.init_phys(libk::Span<const mm::Extent>{extents})) {
         return false;
     }
     {
@@ -437,54 +410,60 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
             || code.value().page().page != page_at(1)
             || code.value().page().access != read_execute
             || mmio.value().page().page != device
-            || mmio.value().page().type != kernel::mm::MemoryType::Device) {
+            || mmio.value().page().type != mm::MemoryType::Device) {
             return false;
         }
     }
+    byte output{};
+    const auto device_read = memory.read(2 * mm::page_size, {&output, 1});
+    if (device_read || device_read.error() != mm::MemErr::InvalidMemoryType) return false;
     memory.retire();
     if (fixture.pmm().state_of(page_at(0)).value()
-            != kernel::mm::PageState::Reserved
+            != mm::PageState::Reserved
         || fixture.pmm().free_page_count() != free_before) {
         return false;
     }
 
-    kernel::mm::MemoryObject& invalid = fixture.make(kernel::mm::page_size);
-    const kernel::mm::MemoryExtent free_extent[]{
+    mm::Mem& invalid = fixture.make(mm::page_size);
+    const mm::Extent free_extent[]{
         {
             .object = {0, 1},
             .physical = {page_at(reserved_pages + 20), 1},
             .access = read_write,
-            .type = kernel::mm::MemoryType::Normal,
         },
     };
-    const auto rejected = invalid.initialize_physical(
-        libk::Span<const kernel::mm::MemoryExtent>{free_extent});
+    const auto rejected = invalid.init_phys(
+        libk::Span<const mm::Extent>{free_extent});
     if (rejected
-        || rejected.error() != kernel::mm::MemoryError::OwnershipMismatch
-        || invalid.state() != kernel::mm::MemoryState::Retired) {
+        || rejected.error() != mm::MemErr::OwnershipMismatch
+        || invalid.state() != mm::MemState::Retired) {
         return false;
     }
 
-    kernel::mm::MemoryObject& conflicting = fixture.make(2 * kernel::mm::page_size);
-    const kernel::mm::MemoryExtent conflicting_extents[]{
+    mm::Mem& conflicting = fixture.make(2 * mm::page_size);
+    const mm::Extent conflicting_extents[]{
         {
             .object = {0, 1},
             .physical = {device, 1},
             .access = read_write,
-            .type = kernel::mm::MemoryType::Device,
         },
         {
             .object = {1, 1},
             .physical = {device, 1},
             .access = read_write,
-            .type = kernel::mm::MemoryType::Uncached,
         },
     };
-    const auto alias = conflicting.initialize_physical(
-        libk::Span<const kernel::mm::MemoryExtent>{conflicting_extents});
-    return !alias
-        && alias.error() == kernel::mm::MemoryError::InvalidMemoryType
-        && conflicting.state() == kernel::mm::MemoryState::Retired;
+    const auto alias = conflicting.init_phys(
+        libk::Span<const mm::Extent>{conflicting_extents});
+    if (alias || alias.error() != mm::MemErr::InvalidRange
+        || conflicting.state() != mm::MemState::Retired) return false;
+    // External physical memory must come from the inventory, not merely
+    // lie outside allocator-owned RAM. An arbitrary bus address has no owner.
+    mm::Mem& unknown = fixture.make(mm::page_size);
+    const mm::Extent hole{{0, 1}, {mm::Page{0x20000000 / mm::page_size}, 1}, read_write};
+    auto rejected_hole = unknown.init_phys({&hole, 1});
+    return !rejected_hole && rejected_hole.error() == mm::MemErr::NotBacked
+        && unknown.state() == mm::MemState::Retired;
 }
 
 bool test_boot_image_distinguishes_borrowed_and_owned_frames(
@@ -493,63 +472,60 @@ bool test_boot_image_distinguishes_borrowed_and_owned_frames(
     if (!fixture.initialize()) {
         return false;
     }
-    constexpr auto read_only = kernel::mm::AccessMask::of(kernel::mm::Access::Read);
-    const kernel::mm::MemoryExtent borrowed_extent[]{
+    constexpr auto read_only = mm::Perms::of(mm::Perm::Read);
+    const mm::Extent borrowed_extent[]{
         {
             .object = {0, 1},
             .physical = {page_at(2), 1},
             .access = read_only,
-            .type = kernel::mm::MemoryType::Normal,
         },
     };
-    kernel::mm::MemoryObject& borrowed = fixture.make(kernel::mm::page_size);
-    if (!borrowed.initialize_boot_image(
-            libk::Span<const kernel::mm::MemoryExtent>{borrowed_extent},
-            kernel::mm::BootOwnership::Borrowed)) {
+    mm::Mem& borrowed = fixture.make(mm::page_size);
+    if (!borrowed.init_boot(
+            libk::Span<const mm::Extent>{borrowed_extent},
+            mm::BootOwnership::Borrowed)) {
         return false;
     }
     borrowed.retire();
     if (fixture.pmm().state_of(page_at(2)).value()
-        != kernel::mm::PageState::Reserved) {
+        != mm::PageState::Reserved) {
         return false;
     }
     memory_test_object.reset();
 
     const usize free_before = fixture.pmm().free_page_count();
-    auto owned = fixture.pmm().make_page_group();
-    kernel::mm::Page pages[2]{};
+    auto owned = fixture.pmm().group();
+    mm::Page pages[2]{};
     {
-        auto extension = owned.extend();
+        auto pending = owned.owner().group();
         for (usize index = 0; index < 2; ++index) {
-            auto allocated = extension.allocate_page();
+            auto allocated = pending.allocate();
             if (!allocated) {
                 return false;
             }
             pages[index] = allocated.value();
-            extension.bytes(pages[index])[0] =
+            pending.bytes(pages[index])[0] =
                 static_cast<byte>(0x30 + index);
         }
-        extension.commit();
+        owned.append(std::move(pending));
     }
-    const kernel::mm::MemoryExtent owned_extents[]{
+    const mm::Extent owned_extents[]{
         {
             .object = {0, 1},
             .physical = {pages[0], 1},
             .access = read_only,
-            .type = kernel::mm::MemoryType::Normal,
         },
         {
             .object = {1, 1},
             .physical = {pages[1], 1},
             .access = read_only,
-            .type = kernel::mm::MemoryType::Normal,
         },
     };
-    kernel::mm::MemoryObject& image = fixture.make(2 * kernel::mm::page_size);
-    if (!image.initialize_boot_image(
-            libk::Span<const kernel::mm::MemoryExtent>{owned_extents},
-            kernel::mm::BootOwnership::Owned,
-            libk::move(owned))) {
+    mm::Mem& image = fixture.make(2 * mm::page_size);
+    if (!image.init_boot(
+            libk::Span<const mm::Extent>{owned_extents},
+            mm::BootOwnership::Owned,
+            std::move(owned))) {
         return false;
     }
     {
@@ -558,17 +534,17 @@ bool test_boot_image_distinguishes_borrowed_and_owned_frames(
             || fixture.pmm().bytes(pages[0])[0] != byte{0x30}) {
             return false;
         }
-        auto lease = libk::move(page).value();
+        auto lease = std::move(page).value();
         image.retire();
-        if (image.state() != kernel::mm::MemoryState::Stopping
+        if (image.state() != mm::MemState::Stopping
             || fixture.pmm().state_of(pages[0]).value()
-                != kernel::mm::PageState::Allocated) {
+                != mm::PageState::Allocated) {
             return false;
         }
     }
-    return image.state() == kernel::mm::MemoryState::Retired
-        && fixture.pmm().state_of(pages[0]).value() == kernel::mm::PageState::Free
-        && fixture.pmm().state_of(pages[1]).value() == kernel::mm::PageState::Free
+    return image.state() == mm::MemState::Retired
+        && fixture.pmm().state_of(pages[0]).value() == mm::PageState::Free
+        && fixture.pmm().state_of(pages[1]).value() == mm::PageState::Free
         && fixture.pmm().free_page_count() == free_before;
 }
 
@@ -579,11 +555,11 @@ bool test_reverse_attachment_drives_destroy_invalidation(
         return false;
     }
     const usize free_before = fixture.pmm().free_page_count();
-    kernel::mm::MemoryObject& memory = fixture.make(2 * kernel::mm::page_size);
-    if (!memory.initialize_anonymous({})) {
+    mm::Mem& memory = fixture.make(2 * mm::page_size);
+    if (!memory.init_anon({})) {
         return false;
     }
-    kernel::mm::Page resident{};
+    mm::Page resident{};
     {
         auto page = memory.materialize(0);
         if (!page) {
@@ -594,24 +570,24 @@ bool test_reverse_attachment_drives_destroy_invalidation(
     FakeMapping mapping{};
     if (!memory.attach(
             mapping.attachment,
-            kernel::mm::AccessMask::of(
-                kernel::mm::Access::Read,
-                kernel::mm::Access::Write))) {
+            mm::Perms::of(
+                mm::Perm::Read,
+                mm::Perm::Write))) {
         return false;
     }
     memory.retire();
     if (mapping.invalidations != 1
         || !mapping.attachment.attached()
         || !mapping.attachment.busy()
-        || memory.state() != kernel::mm::MemoryState::Stopping
+        || memory.state() != mm::MemState::Stopping
         || memory.attachment_count() != 1
         || fixture.pmm().state_of(resident).value()
-            != kernel::mm::PageState::Allocated) {
+            != mm::PageState::Allocated) {
         return false;
     }
     if (mapping.attachment.detach()
-        || memory.state() != kernel::mm::MemoryState::Retired
-        || fixture.pmm().state_of(resident).value() != kernel::mm::PageState::Free
+        || memory.state() != mm::MemState::Retired
+        || fixture.pmm().state_of(resident).value() != mm::PageState::Free
         || mapping.releases != 0) {
         return false;
     }
@@ -624,10 +600,10 @@ bool test_reverse_attachment_drives_destroy_invalidation(
 bool test_private_memory_initialization(const TestContext&) noexcept {
     MemoryFixture fixture{};
     if (!fixture.initialize()) return false;
-    auto& memory = fixture.make(2 * kernel::mm::page_size);
-    using namespace kernel::mm;
-    if (!memory.initialize_anonymous(AnonymousConfig{
-        .access = AccessMask::of(Access::Read, Access::Write, Access::Execute)})) return false;
+    auto& memory = fixture.make(2 * mm::page_size);
+    using namespace mm;
+    if (!memory.init_anon(AnonCfg{
+        .access = Perms::of(Perm::Read, Perm::Write, Perm::Execute)})) return false;
     const byte data[]{byte{0x31}, byte{0x72}};
     if (!memory.write(17, {data, sizeof(data)})) return false;
     byte output[20]{};
@@ -639,9 +615,9 @@ bool test_private_memory_initialization(const TestContext&) noexcept {
         if (!loan || memory.write(0, {data, sizeof(data)}) || memory.begin_transfer(0)) return false;
     }
     FakeMapping reader{};
-    if (!memory.attach(reader.attachment, AccessMask::of(Access::Read))) return false;
+    if (!memory.attach(reader.attachment, Perms::of(Perm::Read))) return false;
     const auto while_mapped = memory.write(0, {data, sizeof(data)});
-    if (while_mapped || while_mapped.error() != MemoryError::Busy
+    if (while_mapped || while_mapped.error() != MemErr::Busy
         || !reader.attachment.detach()) return false;
     {
         auto transfer = memory.begin_transfer(0);
@@ -650,7 +626,7 @@ bool test_private_memory_initialization(const TestContext&) noexcept {
     }
     if (!memory.seal()) return false;
     const auto sealed = memory.write(0, {data, sizeof(data)});
-    return !sealed && sealed.error() == MemoryError::InvalidAccess;
+    return !sealed && sealed.error() == MemErr::InvalidAccess;
 }
 
 bool test_executable_seal_closes_writable_attachments(
@@ -659,12 +635,12 @@ bool test_executable_seal_closes_writable_attachments(
     if (!fixture.initialize()) {
         return false;
     }
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
-    if (!memory.initialize_anonymous(kernel::mm::AnonymousConfig{
-            .access = kernel::mm::AccessMask::of(
-                kernel::mm::Access::Read,
-                kernel::mm::Access::Write,
-                kernel::mm::Access::Execute),
+    mm::Mem& memory = fixture.make(mm::page_size);
+    if (!memory.init_anon(mm::AnonCfg{
+            .access = mm::Perms::of(
+                mm::Perm::Read,
+                mm::Perm::Write,
+                mm::Perm::Execute),
             .eager = true,
         })) {
         return false;
@@ -672,34 +648,34 @@ bool test_executable_seal_closes_writable_attachments(
     FakeMapping writer{};
     if (!memory.attach(
             writer.attachment,
-            kernel::mm::AccessMask::of(
-                kernel::mm::Access::Read, kernel::mm::Access::Write))) {
+            mm::Perms::of(
+                mm::Perm::Read, mm::Perm::Write))) {
         return false;
     }
     const auto busy = memory.seal();
-    if (busy || busy.error() != kernel::mm::MemoryError::Busy
-        || memory.seal_state() != kernel::mm::SealState::Loadable
+    if (busy || busy.error() != mm::MemErr::Busy
+        || memory.seal_state() != mm::SealState::Loadable
         || memory.content_epoch().raw != 0
         || !writer.attachment.detach()) {
         return false;
     }
     if (!memory.seal()
-        || memory.seal_state() != kernel::mm::SealState::Executable
-        || memory.content_epoch() != kernel::mm::ContentEpoch{1}) {
+        || memory.seal_state() != mm::SealState::Executable
+        || memory.content_epoch() != mm::ContentEpoch{1}) {
         return false;
     }
     FakeMapping executable{};
     FakeMapping late_writer{};
     const auto mapped = memory.attach(
         executable.attachment,
-        kernel::mm::AccessMask::of(
-            kernel::mm::Access::Read, kernel::mm::Access::Execute));
+        mm::Perms::of(
+            mm::Perm::Read, mm::Perm::Execute));
     const auto rejected = memory.attach(
         late_writer.attachment,
-        kernel::mm::AccessMask::of(
-            kernel::mm::Access::Read, kernel::mm::Access::Write));
+        mm::Perms::of(
+            mm::Perm::Read, mm::Perm::Write));
     return mapped && !rejected
-        && rejected.error() == kernel::mm::MemoryError::InvalidAccess
+        && rejected.error() == mm::MemErr::InvalidAccess
         && executable.attachment.detach();
 }
 
@@ -709,40 +685,40 @@ bool test_object_store_memory_lifecycle_waits_for_page_lease(
     if (!fixture.initialize()) {
         return false;
     }
-    auto invalid = fixture.objects().create_anonymous(1);
-    if (invalid || invalid.error() != kernel::mm::MemoryError::InvalidSize) {
+    auto invalid = fixture.memory().get<mm::Mem>().make({}, [&](auto& m) { return m.init_anon({}); }, fixture.pmm(), 1);
+    if (invalid || invalid.error() != mm::MemErr::InvalidSize) {
         return false;
     }
-    auto pending = fixture.objects().create_anonymous(2 * kernel::mm::page_size);
+    auto pending = fixture.memory().get<mm::Mem>().make({}, [&](auto& m) { return m.init_anon({}); }, fixture.pmm(), 2 * mm::page_size);
     if (!pending) {
         return false;
     }
-    fixture.keep(libk::move(pending).value().publish());
+    fixture.keep(std::move(pending).value().publish());
     const auto id = fixture.pooled().id();
-    auto pin_result = fixture.objects().pin_memory(id);
+    auto pin_result = fixture.memory().get<mm::Mem>().lookup(id);
     if (!pin_result) {
         return false;
     }
-    auto pin = libk::move(pin_result).value();
+    auto pin = std::move(pin_result).value();
     auto page_result = pin->materialize(0);
     if (!page_result) {
         return false;
     }
-    auto page = libk::move(page_result).value();
+    auto page = std::move(page_result).value();
     if (!fixture.pooled().retire()) {
         return false;
     }
     fixture.release_pooled();
-    if (pin->state() != kernel::mm::MemoryState::Stopping) {
+    if (pin->state() != mm::MemState::Stopping) {
         return false;
     }
     page.reset();
-    if (pin->state() != kernel::mm::MemoryState::Retired) {
+    if (pin->state() != mm::MemState::Retired) {
         return false;
     }
     pin.reset();
-    fixture.objects().drain_reclaim();
-    return !fixture.objects().hold_memory(id)
+    fixture.memory().drain();
+    return !fixture.memory().get<mm::Mem>().lookup(id)
         && fixture.pmm().verify_invariants();
 }
 
@@ -753,42 +729,34 @@ bool test_pager_backing_donates_owned_page_without_copy(
         return false;
     }
     auto& pager = fixture.pager();
-    kernel::mm::MemoryObject& memory = fixture.make(2 * kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& memory = fixture.make(2 * mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)) {
         return false;
     }
     const auto pending = memory.materialize(1);
-    if (pending || pending.error() != kernel::mm::MemoryError::Pending
-        || memory.query(1).value() != kernel::mm::ContentState::Busy) {
+    if (pending || pending.error() != mm::MemErr::Pending
+        || memory.query(1).value() != mm::ContentState::Busy) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1
-        || pager.pending() != 1) {
+    if (pager.pending() != 1) {
         return false;
     }
-    const auto request = pager.try_claim();
-    if (!request || request.value().page_key.index != 1) {
+    const auto request = pager.claim();
+    if (!request || request.value().page_index != 1) {
         return false;
     }
     auto allocated = fixture.pmm().allocate_page();
     if (!allocated) {
         return false;
     }
-    const kernel::mm::Page donated = allocated.value().page();
+    const mm::Page donated = allocated.value().page();
     fixture.pmm().bytes(donated)[0] = byte{0x7a};
-    if (!memory.pager_supply(
-            pager,
-        1,
-            request.value().page_key,
-            request.value().claim,
-            libk::move(allocated).value(),
-            1)) {
+    if (!memory.supply(pager, request.value().id, std::move(allocated).value())) {
         return false;
     }
     auto resident = memory.materialize(1);
@@ -798,9 +766,9 @@ bool test_pager_backing_donates_owned_page_without_copy(
     }
     resident.value().reset();
     memory.retire();
-    const bool result = memory.state() == kernel::mm::MemoryState::Retired
+    const bool result = memory.state() == mm::MemState::Retired
         && fixture.pmm().state_of(donated).value()
-            == kernel::mm::PageState::Free;
+            == mm::PageState::Free;
     return result;
 }
 
@@ -812,54 +780,50 @@ bool test_pager_supply_moves_staging_owner(
     }
     auto& pager = fixture.pager();
     StagingReset staging_reset{};
-    kernel::mm::MemoryObject& target =
-        fixture.make(kernel::mm::page_size);
+    mm::Mem& target =
+        fixture.make(mm::page_size);
     /*luna change: add a second Pager attachment for the pre-commit ownership rejection, reason: Reply::abort must restore the staging owner and leave the target claim retryable*/
-    kernel::mm::MemoryObject& peer =
-        fixture.make_peer(kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& peer =
+        fixture.make_peer(mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto target_pager = fixture.pager_ref();
     auto peer_pager = fixture.pager_ref();
     if (!target_pager || !peer_pager
-        || !target.initialize_pager(
-               libk::move(target_pager).value(), access)
-        || !peer.initialize_pager(
-               libk::move(peer_pager).value(), access)) {
+        || !target.init_paged(
+               std::move(target_pager).value(), access)
+        || !peer.init_paged(
+               std::move(peer_pager).value(), access)) {
         return false;
     }
-    /*luna change: route the staging object through the same bounded executor, reason: pager supply tests must not bypass MemoryObject work ownership*/
+    /*luna change: route the staging object through the same bounded executor, reason: pager supply tests must not bypass Mem work ownership*/
     auto& staging = memory_test_staging.emplace(
         fixture.pmm(),
-        kernel::mm::page_size,
-        *memory_test_memory_work,
-        *memory_test_reclaimer);
-    if (!staging.initialize_anonymous(
-            kernel::mm::AnonymousConfig{.access = access})) {
+        mm::page_size);
+    if (!staging.init_anon(
+            mm::AnonCfg{.access = access})) {
         return false;
     }
     auto source_page = staging.materialize(0);
     if (!source_page) {
         return false;
     }
-    const kernel::mm::Page donated = source_page.value().page().page;
+    const mm::Page donated = source_page.value().page().page;
     fixture.pmm().bytes(donated)[0] = byte{0x31};
     source_page.value().reset();
     auto pending = target.materialize(0);
-    if (pending || pending.error() != kernel::mm::MemoryError::Pending) {
+    if (pending || pending.error() != mm::MemErr::Pending) {
         return false;
     }
     const auto peer_pending = peer.materialize(0);
     if (peer_pending
-        || peer_pending.error() != kernel::mm::MemoryError::Pending) {
+        || peer_pending.error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(2);
-    if (work.processed != 2 || work.progressed != 2
-        || pager.pending() != 2) {
+    if (pager.pending() != 2) {
         return false;
     }
-    auto request = pager.try_claim();
+    auto request = pager.claim();
     if (!request) {
         return false;
     }
@@ -868,28 +832,18 @@ bool test_pager_supply_moves_staging_owner(
         return false;
     }
     /*luna change: exercise the Completing-ticket abort before target commit, reason: an attachment mismatch must keep the PageTransfer payload and exact Pager claim available for retry*/
-    if (peer.pager_supply_transfer(
-            pager,
-            libk::move(transfer).value(), 0,
-            request.value().page_key,
-            request.value().claim,
-            1)
-        || staging.query(0).value() != kernel::mm::ContentState::Resident) {
+    if (peer.supply(pager, std::move(transfer).value(), request.value().id)
+        || staging.query(0).value() != mm::ContentState::Resident) {
         return false;
     }
     auto retry_transfer = staging.begin_transfer(0);
     if (!retry_transfer) {
         return false;
     }
-    if (!target.pager_supply_transfer(
-            pager,
-            libk::move(retry_transfer).value(), 0,
-            request.value().page_key,
-            request.value().claim,
-            1)) {
+    if (!target.supply(pager, std::move(retry_transfer).value(), request.value().id)) {
         return false;
     }
-    if (staging.query(0).value() != kernel::mm::ContentState::Zero) {
+    if (staging.query(0).value() != mm::ContentState::Zero) {
         return false;
     }
     auto resident = target.materialize(0);
@@ -900,19 +854,15 @@ bool test_pager_supply_moves_staging_owner(
         resident.value().reset();
     }
     target.retire();
-    const auto peer_request = pager.try_claim();
+    const auto peer_request = pager.claim();
     if (peer_request) {
-        if (!peer.pager_fail(
-                pager,
-                0,
-                peer_request.value().page_key,
-                peer_request.value().claim)) {
+        if (!peer.pager_finish(pager, peer_request.value().id, true)) {
             return false;
         }
     }
     staging.retire();
     return result && fixture.pmm().state_of(donated).value()
-        == kernel::mm::PageState::Free;
+        == mm::PageState::Free;
 }
 
 bool test_two_pager_backings_reject_colliding_claim_owner(
@@ -922,67 +872,55 @@ bool test_two_pager_backings_reject_colliding_claim_owner(
         return false;
     }
     auto& pager = fixture.pager();
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
-    auto& first = fixture.make(kernel::mm::page_size);
-    auto& second = fixture.make_peer(kernel::mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
+    auto& first = fixture.make(mm::page_size);
+    auto& second = fixture.make_peer(mm::page_size);
     auto first_pager = fixture.pager_ref();
     auto second_pager = fixture.pager_ref();
     if (!first_pager || !second_pager
-        || !first.initialize_pager(
-               libk::move(first_pager).value(), access)
-        || !second.initialize_pager(
-               libk::move(second_pager).value(), access)
-        || first.materialize(0).error() != kernel::mm::MemoryError::Pending
-        || second.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        || !first.init_paged(
+               std::move(first_pager).value(), access)
+        || !second.init_paged(
+               std::move(second_pager).value(), access)
+        || first.materialize(0).error() != mm::MemErr::Pending
+        || second.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(2);
-    if (work.processed != 2 || work.progressed != 2
-        || pager.pending() != 2) {
+    if (pager.pending() != 2) {
         return false;
     }
-    const auto first_claim = pager.try_claim();
-    const auto second_claim = pager.try_claim();
+    const auto first_claim = pager.claim();
+    const auto second_claim = pager.claim();
     if (!first_claim || !second_claim
-        || first_claim.value().page_key != second_claim.value().page_key) {
+        || first_claim.value().page_index != second_claim.value().page_index) {
         if (first_claim) {
-            static_cast<void>(first.pager_fail(
-                pager,
-                0, first_claim.value().page_key, first_claim.value().claim));
+            static_cast<void>(first.pager_finish(pager, first_claim.value().id, true));
         }
         if (second_claim) {
-            static_cast<void>(second.pager_fail(
-                pager,
-                0, second_claim.value().page_key, second_claim.value().claim));
+            static_cast<void>(second.pager_finish(pager, second_claim.value().id, true));
         }
         first.retire();
         second.retire();
         static_cast<void>(pager.close(true));
         return false;
     }
-    const auto rejected_result = first.pager_fail(
-        pager,
-        0, second_claim.value().page_key, second_claim.value().claim);
+    const auto rejected_result = first.pager_finish(pager, second_claim.value().id, true);
     const bool first_busy = first.query(0).value()
-        == kernel::mm::ContentState::Busy;
+        == mm::ContentState::Busy;
     const bool second_busy = second.query(0).value()
-        == kernel::mm::ContentState::Busy;
-    const auto first_failed = first.pager_fail(
-        pager,
-        0, first_claim.value().page_key, first_claim.value().claim);
-    const auto second_failed = second.pager_fail(
-        pager,
-        0, second_claim.value().page_key, second_claim.value().claim);
+        == mm::ContentState::Busy;
+    const auto first_failed = first.pager_finish(pager, first_claim.value().id, true);
+    const auto second_failed = second.pager_finish(pager, second_claim.value().id, true);
     const bool protocol_ok = !rejected_result.has_value() && first_busy
         && second_busy && first_failed.has_value()
         && second_failed.has_value()
-        && first.query(0).value() == kernel::mm::ContentState::Failed
-        && second.query(0).value() == kernel::mm::ContentState::Failed;
+        && first.query(0).value() == mm::ContentState::Failed
+        && second.query(0).value() == mm::ContentState::Failed;
     first.retire();
     second.retire();
-    const bool retired = first.state() == kernel::mm::MemoryState::Retired
-        && second.state() == kernel::mm::MemoryState::Retired;
+    const bool retired = first.state() == mm::MemState::Retired
+        && second.state() == mm::MemState::Retired;
     const bool closed = pager.close(false);
     if (!closed) {
         static_cast<void>(pager.close(true));
@@ -998,43 +936,37 @@ bool test_pager_fail_publishes_backing_failure(
         return false;
     }
     auto& pager = fixture.pager();
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& memory = fixture.make(mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)) {
         return false;
     }
     const auto pending = memory.materialize(0);
-    if (pending || pending.error() != kernel::mm::MemoryError::Pending) {
+    if (pending || pending.error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1
-        || pager.pending() != 1) {
+    if (pager.pending() != 1) {
         return false;
     }
-    const auto request = pager.try_claim();
+    const auto request = pager.claim();
     if (!request
-        || !memory.pager_fail(
-            pager,
-            0,
-            request.value().page_key,
-            request.value().claim)
-        || memory.query(0).value() != kernel::mm::ContentState::Failed) {
+        || !memory.pager_finish(pager, request.value().id, true)
+        || memory.query(0).value() != mm::ContentState::Failed) {
         return false;
     }
-    if (pager.begin_reply(request.value().claim)) {
+    if (pager.reply(request.value().id)) {
         return false;
     }
     const auto failed = memory.materialize(0);
-    if (failed || failed.error() != kernel::mm::MemoryError::BackingFailed) {
+    if (failed || failed.error() != mm::MemErr::BackingFailed) {
         return false;
     }
     memory.retire();
-    return memory.state() == kernel::mm::MemoryState::Retired;
+    return memory.state() == mm::MemState::Retired;
 }
 
 bool test_pager_backing_rejects_wrong_pager(
@@ -1047,33 +979,29 @@ bool test_pager_backing_rejects_wrong_pager(
     }
     auto& pager = fixture.pager();
     auto& wrong = fixture.wrong_pager();
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& memory = fixture.make(mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)
-        || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)
+        || memory.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1
-        || pager.pending() != 1) {
+    if (pager.pending() != 1) {
         return false;
     }
-    const auto request = pager.try_claim();
+    const auto request = pager.claim();
     if (!request) {
         return false;
     }
-    const auto rejected = memory.pager_fail(
-        wrong, 0, request.value().page_key, request.value().claim);
-    const auto finished = memory.pager_fail(
-        pager, 0, request.value().page_key, request.value().claim);
+    const auto rejected = memory.pager_finish(wrong, request.value().id, true);
+    const auto finished = memory.pager_finish(pager, request.value().id, true);
     memory.retire();
     return !rejected
-        && rejected.error() == kernel::mm::MemoryError::OwnershipMismatch
-        && finished && memory.state() == kernel::mm::MemoryState::Retired;
+        && rejected.error() == mm::MemErr::OwnershipMismatch
+        && finished && memory.state() == mm::MemState::Retired;
 }
 
 bool test_pager_backing_attach_failure_rolls_back(
@@ -1086,18 +1014,18 @@ bool test_pager_backing_attach_failure_rolls_back(
     if (!pager.close(false)) {
         return false;
     }
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& memory = fixture.make(mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) {
         return false;
     }
-    const auto initialized = memory.initialize_pager(
-        libk::move(pager_ref).value(), access);
+    const auto initialized = memory.init_paged(
+        std::move(pager_ref).value(), access);
     return !initialized
-        && initialized.error() == kernel::mm::MemoryError::AttachmentState
-        && memory.state() == kernel::mm::MemoryState::Retired;
+        && initialized.error() == mm::MemErr::AttachmentState
+        && memory.state() == mm::MemState::Retired;
 }
 
 bool test_pager_force_close_publishes_backing_failure(
@@ -1107,208 +1035,132 @@ bool test_pager_force_close_publishes_backing_failure(
         return false;
     }
     auto& pager = fixture.pager();
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    mm::Mem& memory = fixture.make(mm::page_size);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)
-        || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)
+        || memory.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1
-        || pager.pending() != 1
-        || !pager.try_claim()
+    if (pager.pending() != 1
+        || !pager.claim()
         || !pager.close(true)
-        || memory.query(0).value() != kernel::mm::ContentState::Failed) {
+        || memory.query(0).value() != mm::ContentState::Failed) {
         return false;
     }
     memory.retire();
-    return memory.state() == kernel::mm::MemoryState::Retired;
+    return memory.state() == mm::MemState::Retired;
 }
 
 bool test_pager_lease_with_missing_sibling(const TestContext&) noexcept {
-    using namespace kernel::mm;
+    using namespace mm;
     MemoryFixture fixture{};
     if (!fixture.initialize() || !fixture.make_pager()) return false;
     auto& memory = fixture.make(2 * page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
     auto reference = fixture.pager_ref();
-    if (!reference || !memory.initialize_pager(libk::move(reference).value(), AccessMask::of(Access::Read))
-        || memory.materialize(0).error() != MemoryError::Pending) return false;
-    (void)memory_test_memory_work->run(1);
+    if (!reference || !memory.init_paged(std::move(reference).value(), Perms::of(Perm::Read))
+        || memory.materialize(0).error() != MemErr::Pending) return false;
+
     auto& pager = fixture.pager();
-    const auto request = pager.try_claim();
+    const auto request = pager.claim();
     auto page = fixture.pmm().allocate_page();
-    if (!request || !page || !memory.pager_supply(pager, 0, request.value().page_key,
-        request.value().claim, libk::move(page).value(), 1)) return false;
+    if (!request || !page || !memory.supply(pager, request.value().id, std::move(page).value())) return false;
     auto first = memory.materialize(0);
     auto second = memory.materialize(0);
     if (!first || !second || first.value().page().page != second.value().page().page
-        || memory.materialize(1).error() != MemoryError::Pending) return false;
+        || memory.materialize(1).error() != MemErr::Pending) return false;
     first.value().reset();
-    if (memory.evict_page(0).error() != MemoryError::Busy) return false;
+    if (memory.query(0).value() != ContentState::Resident) return false;
+    memory.retire();
+    if (memory.state() != MemState::Stopping ||
+        first.value() || !second.value() || memory.materialize(0))
+        return false;
     second.value().reset();
-    return static_cast<bool>(memory.evict_page(0));
+    return memory.state() == MemState::Retired;
 }
 
-bool test_pager_reverse_mapping_usage_and_eviction(
+bool test_pager_writeback_tracks_new_writes(
     const TestContext&) noexcept {
     MemoryFixture fixture{};
     if (!fixture.initialize() || !fixture.make_pager()) {
         return false;
     }
     auto& pager = fixture.pager();
-    kernel::mm::MemoryObject& memory = fixture.make(kernel::mm::page_size);
+    mm::Mem& memory = fixture.make(mm::page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
         memory.retire();
     });
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)
-        || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)
+        || memory.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1
-        || pager.pending() != 1) {
+    if (pager.pending() != 1) {
         return false;
     }
-    const auto request = pager.try_claim();
+    const auto request = pager.claim();
     auto page = fixture.pmm().allocate_page();
     if (!request || !page
-        || !memory.pager_supply(
-            pager,
-            0,
-            request.value().page_key,
-            request.value().claim,
-            libk::move(page).value(),
-            1)) {
+        || !memory.supply(pager, request.value().id, std::move(page).value())) {
         return false;
     }
 
-    auto lease = memory.materialize(0);
-    if (!lease
-        || memory.evict_page(0).error() != kernel::mm::MemoryError::Busy
-        || !memory.observe_usage(0, true, true)
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::ResidentDirty) {
+    if (!memory.observe_usage(0, true, true))
+        return false;
+    // Completion of an older snapshot must leave newer writes dirty.
+    if (!memory.writeback(0)) {
         return false;
     }
-    lease.value().reset();
-
-    kernel::mm::PageMapping mapping{};
-    kernel::mm::PageMapping sibling{};
-    if (!memory.bind_mapping(mapping, 0)
-        || !memory.bind_mapping(sibling, 0)
-        || !mapping.attached()
-        || !sibling.attached()
-        || memory.evict_page(0).error() != kernel::mm::MemoryError::InvalidState) {
-        return false;
-    }
-    /*luna change: exercise claim-first teardown, stale claim and exact token
-      rejection through production relation operations, reason: embedded
-      PageMapping storage must survive the owner race*/
-    auto mapping_work = memory.claim_mapping(mapping);
-    auto sibling_work = memory.claim_mapping(sibling);
-    if (!mapping_work || !sibling_work
-        || memory.unbind_mapping(mapping).error()
-            != kernel::mm::MemoryError::Busy
-        || memory.unbind_mapping(mapping, sibling_work.value()).error()
-            != kernel::mm::MemoryError::OwnershipMismatch
-        || !memory.unbind_mapping(sibling, sibling_work.value())) {
-        return false;
-    }
-    sibling_work.value().reset();
-    if (!memory.unbind_mapping(mapping, mapping_work.value())) {
-        return false;
-    }
-    mapping_work.value().reset();
-    if (mapping.attached()
-        || sibling.attached()
-        || memory.evict_page(0).error() != kernel::mm::MemoryError::InvalidState) {
-        return false;
-    }
-    kernel::mm::PageMapping stale{};
-    if (!memory.bind_mapping(stale, 0)
-        || !memory.unbind_mapping(stale)
-        || stale.attached()
-        || memory.claim_mapping(stale).error()
-            != kernel::mm::MemoryError::AttachmentState) {
-        return false;
-    }
-    // A dirty resident page cannot be evicted merely because its mapping is
-    // removed; writeback owns the clean transition.
-    const auto writeback = memory.queue_writeback(0);
-    if (!writeback || !memory.publish_writeback(0, writeback.value())) {
-        return false;
-    }
-    const auto writeback_claim = pager.try_claim();
+    const auto writeback_claim = pager.claim();
     if (!writeback_claim
+        || memory.pager_finish(pager, 0, false).error()
+            != mm::MemErr::OwnershipMismatch
         || !memory.observe_usage(0, true, true)
-        || !memory.complete_writeback(
-            pager,
-            0, writeback.value(), writeback_claim.value().key.generation,
-            writeback_claim.value().claim.generation)
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::ResidentDirty) {
+        || !memory.pager_finish(pager, writeback_claim.value().id, false)) {
         return false;
     }
-    const auto retry = memory.queue_writeback(0);
-    if (!retry || !memory.publish_writeback(0, retry.value())) {
+    if (!memory.writeback(0)) {
         return false;
     }
-    const auto retry_claim = pager.try_claim();
+    const auto retry_claim = pager.claim();
     if (!retry_claim
-        || !memory.complete_writeback(
-            pager,
-            0, retry.value(), retry_claim.value().key.generation,
-            retry_claim.value().claim.generation)
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::ResidentClean
-        || !memory.evict_page(0)
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::Missing) {
+        || !memory.pager_finish(pager, retry_claim.value().id, false)
+        || memory.query(0).value() != mm::ContentState::Resident) {
         return false;
     }
     memory.retire();
-    return memory.state() == kernel::mm::MemoryState::Retired;
+    return memory.state() == mm::MemState::Retired;
 }
 
 bool test_private_pager_preserves_dirty_content(const TestContext&) noexcept {
-    using namespace kernel::mm;
+    using namespace mm;
     MemoryFixture fixture{};
     if (!fixture.initialize() || !fixture.make_pager()) return false;
     auto& memory = fixture.make(2 * page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
     auto reference = fixture.pager_ref();
-    if (!reference || !memory.initialize_pager(libk::move(reference).value(),
-        AccessMask::of(Access::Read, Access::Write), true)) return false;
+    if (!reference || !memory.init_paged(std::move(reference).value(),
+        Perms::of(Perm::Read, Perm::Write), true)) return false;
     auto& pager = fixture.pager();
     for (usize index = 0; index < 2; ++index) {
-        if (memory.materialize(index).error() != MemoryError::Pending) return false;
-        (void)memory_test_memory_work->run(1);
-        const auto request = pager.try_claim();
+        if (memory.materialize(index).error() != MemErr::Pending) return false;
+
+        const auto request = pager.claim();
         auto page = fixture.pmm().allocate_page();
         if (!request || !page) return false;
         page.value().bytes()[0] = byte{0x5a};
-        if (!memory.pager_supply(pager, index, request.value().page_key, request.value().claim,
-            libk::move(page).value(), 1)) return false;
+        if (!memory.supply(pager, request.value().id, std::move(page).value())) return false;
     }
     if (!memory.observe_usage(0, false, true)
-        || memory.queue_writeback(0).error() != MemoryError::InvalidState) return false;
-    WaitRelation pressure;
-    auto& reclaimer = *memory_test_reclaimer;
-    if (!reclaimer.retain(pressure, nullptr, [](void*, PageWaitResult) noexcept {})) return false;
-    auto release = libk::on_scope_exit([&]() noexcept { (void)reclaimer.release(pressure, pressure.generation); });
-    for (usize pass = 0; pass < 8; ++pass) (void)reclaimer.service(8);
-    if (memory.page_state(1).value() != PageSlotState::Missing
-        || memory.page_state(0).value() != PageSlotState::ResidentDirty || pager.pending() != 0) return false;
+        || memory.writeback(0).error() != MemErr::InvalidState) return false;
     byte contents[1]{};
     return memory.read(0, {contents, 1}) && contents[0] == byte{0x5a};
 }
@@ -1320,97 +1172,178 @@ bool test_pager_forced_close_settles_backing_obligations(
         return false;
     }
     auto& pager = fixture.pager();
-    kernel::mm::MemoryObject& memory =
-        fixture.make(2 * kernel::mm::page_size);
+    mm::Mem& memory =
+        fixture.make(2 * mm::page_size);
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
         memory.retire();
     });
-    const auto access = kernel::mm::AccessMask::of(
-        kernel::mm::Access::Read, kernel::mm::Access::Write);
+    const auto access = mm::Perms::of(
+        mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref
-        || !memory.initialize_pager(
-               libk::move(pager_ref).value(), access)
-        || memory.materialize(0).error() != kernel::mm::MemoryError::Pending) {
+        || !memory.init_paged(
+               std::move(pager_ref).value(), access)
+        || memory.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto work = memory_test_memory_work->run(1);
-    if (work.processed != 1 || work.progressed != 1 || pager.pending() != 1) {
+    if (pager.pending() != 1) {
         return false;
     }
-    const auto request = pager.try_claim();
+    const auto request = pager.claim();
     auto page = fixture.pmm().allocate_page();
     if (!request || !page
-        || !memory.pager_supply(
-            pager,
-            0,
-            request.value().page_key,
-            request.value().claim,
-            libk::move(page).value(),
-            1)
-        || !memory.observe_usage(0, true, true)
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::ResidentDirty) {
+        || !memory.supply(pager, request.value().id, std::move(page).value())
+        || !memory.observe_usage(0, true, true)) {
         return false;
     }
-    const auto writeback = memory.queue_writeback(0);
-    if (!writeback || !memory.publish_writeback(0, writeback.value())
+    if (!memory.writeback(0)
         || pager.pending() != 1) {
         return false;
     }
     // A second page stays published-but-unclaimed so forced close also walks
     // the real page-in Forced branch, not only the writeback edge.
-    if (memory.materialize(1).error() != kernel::mm::MemoryError::Pending) {
+    if (memory.materialize(1).error() != mm::MemErr::Pending) {
         return false;
     }
-    const auto pending = memory_test_memory_work->run(1);
-    if (pending.processed != 1 || pending.progressed != 1
-        || pager.pending() != 2) {
+    if (pager.pending() != 2) {
         return false;
     }
-    const auto active = pager.try_claim();
+    const auto active = pager.claim();
     if (!active
-        || active.value().kind != kernel::pager::DeliveryKind::Writeback
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::WritebackActive) {
+        || active.value().kind != Pager::Kind::Writeback
+        || memory.writeback(0).error() != mm::MemErr::InvalidState) {
         return false;
     }
-    const auto queued = pager.try_claim();
+    const auto queued = pager.claim();
     if (!queued
-        || queued.value().kind != kernel::pager::DeliveryKind::PageIn) {
+        || queued.value().kind != Pager::Kind::PageIn) {
         return false;
     }
-    if (!pager.close(true) || pager.state() != kernel::pager::State::Closed
-        || memory.page_state(0).value()
-            != kernel::mm::PageSlotState::WritebackFailed
-        || memory.page_state(1).value() != kernel::mm::PageSlotState::Failed
-        || pager.begin_reply(active.value().claim).error()
-            != kernel::pager::Error::Stale
-        || pager.begin_reply(queued.value().claim).error()
-            != kernel::pager::Error::Stale
-        || memory.complete_writeback(
-               pager,
-               0,
-               writeback.value(),
-               active.value().key.generation,
-               active.value().claim.generation)
+    if (!pager.close(true) || pager.state() != Pager::State::Closed
+        || memory.writeback(0).error() != mm::MemErr::InvalidState
+        || memory.query(1).value() != mm::ContentState::Failed
+        || pager.reply(active.value().id).error()
+            != Pager::Error::Stale
+        || pager.reply(queued.value().id).error()
+            != Pager::Error::Stale
+        || memory.pager_finish(pager, active.value().id, false)
                .has_value()
-        || memory.pager_fail(
-               pager,
-               1,
-               queued.value().page_key,
-               queued.value().claim)
+        || memory.pager_finish(pager, queued.value().id, true)
                .has_value()) {
         return false;
     }
     memory.retire();
-    return memory.state() == kernel::mm::MemoryState::Retired
-        && pager.state() == kernel::pager::State::Closed;
+    return memory.state() == mm::MemState::Retired
+        && pager.state() == Pager::State::Closed;
 }
 
 } // namespace
 
+static bool test_pager_requests_follow_mem_lifetime(const TestContext&) noexcept {
+    using namespace mm;
+    MemoryFixture f;
+    if (!f.initialize() || !f.make_pager()) return false;
+    auto& mem = f.make(40 * page_size);
+    auto& pager = f.pager();
+    auto ref = f.pager_ref();
+    if (!ref || !mem.init_paged(std::move(*ref), Perms::of(Perm::Read))) return false;
+    Pager::Claims worker;
+    auto cleanup = libk::on_scope_exit([&]() noexcept { mem.retire(); (void)pager.close(true); });
+    for (usize i=0; i<40; ++i)
+        if (mem.materialize(i).error() != MemErr::Pending) return false;
+    if (pager.pending() != 40) return false;
+    auto first = pager.claim(&worker);
+    auto second = pager.claim(&worker);
+    if (!first || !second || worker.empty()) return false;
+    auto busy = pager.reply(first->id);
+    if (!busy) return false;
+    worker.release();
+    if (!worker.empty() || pager.reply(second->id)) return false;
+    busy = Pager::Reply{}; // Abort hands the same storage back to the ready queue.
+    if (pager.pending() != 40 || pager.reply(first->id)) return false;
+    auto next = pager.claim();
+    if (!next || next->id <= second->id) return false;
+    auto held = pager.reply(next->id);
+    if (!held || pager.close(true) || pager.state() != Pager::State::Forced) return false;
+    mem.retire();
+    if (mem.state() != MemState::Stopping) return false;
+    held = Pager::Reply{}; // The final actual borrow permits backing retirement.
+    return mem.state() == MemState::Retired && pager.state() == Pager::State::Closed;
+}
+
+static void page_wait_published(void *context, mm::WaitRc result) noexcept {
+    *static_cast<mm::WaitRc *>(context) = result;
+}
+
+static bool
+test_page_wait_relation_is_owner_storage_and_terminal_checked(const TestContext &) noexcept {
+    mm::WaitQueue request{};
+    mm::WaitRelation relation{};
+    auto seen = mm::WaitRc::Canceled;
+    if (!request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    auto batch = request.take();
+    auto ready = mm::WaitQueue::finish(batch, mm::WaitRc::Ready);
+    if (!batch.empty() || relation.attached() || !ready.publish() || seen != mm::WaitRc::Ready)
+        return false;
+    const u64 previous_generation = relation.generation;
+    if (!request.waiters.empty()) {
+        return false;
+    }
+    if (!request.attach(relation, &seen, &page_wait_published)) {
+        return false;
+    }
+    if (relation.generation == previous_generation) {
+        return false;
+    }
+    mm::WaitClaim canceled{};
+    if (request.detach(relation, previous_generation)) {
+        return false;
+    }
+    batch = request.take();
+    canceled = mm::WaitQueue::finish(batch, mm::WaitRc::Canceled);
+    if (relation.attached() || !canceled.publish()) return false;
+    return request.waiters.empty();
+}
+
+static bool test_page_request_drain_keeps_next_request(const TestContext &) noexcept {
+    mm::WaitQueue request{};
+    mm::WaitRelation relations[3]{};
+    mm::WaitRc seen[3]{
+        mm::WaitRc::Canceled,
+        mm::WaitRc::Canceled,
+        mm::WaitRc::Canceled,
+    };
+    for (usize index = 0; index < 3; ++index) {
+        if (!request.attach(relations[index], &seen[index], &page_wait_published)) {
+            return false;
+        }
+    }
+    auto batch = request.take();
+    mm::WaitRelation next{};
+    auto next_seen = mm::WaitRc::Canceled;
+    if (!request.attach(next, &next_seen, &page_wait_published)) return false;
+    usize drained{};
+    while (!batch.empty()) {
+        if (request.detach(batch.front(), batch.front().generation)) return false;
+        auto claim = mm::WaitQueue::finish(batch, mm::WaitRc::Ready);
+        if (!claim.publish()) return false;
+        ++drained;
+    }
+    return drained == 3 && seen[0] == mm::WaitRc::Ready && seen[1] == mm::WaitRc::Ready &&
+           seen[2] == mm::WaitRc::Ready && next_seen == mm::WaitRc::Canceled &&
+           request.detach(next, next.generation);
+
+}
+
 void register_memory_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("memory", "Content completion drains before relation reuse",
+        test_page_wait_relation_is_owner_storage_and_terminal_checked);
+    (void)registry.add("memory", "Content completion keeps next request and excludes cancellation",
+        test_page_request_drain_keeps_next_request);
+
+    (void)registry.add("memory", "Mem owns dynamic requests through worker exit and outstanding Reply retirement", test_pager_requests_follow_mem_lifetime);
     (void)registry.add("memory", "private page initialization excludes loans, mappings and sealed content",
         test_private_memory_initialization);
     (void)registry.add("memory", "I/O root maps only its range and refunds tables",
@@ -1437,7 +1370,7 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         test_executable_seal_closes_writable_attachments);
     (void)registry.add(
         "memory",
-        "ObjectStore memory retirement waits for active page lease",
+        "MM object memory retirement waits for active page lease",
         test_object_store_memory_lifecycle_waits_for_page_lease);
     (void)registry.add(
         "memory",
@@ -1469,13 +1402,13 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         test_pager_force_close_publishes_backing_failure);
     (void)registry.add(
         "memory",
-        "pager backing tracks mappings, usage, writeback, and eviction",
-        test_pager_reverse_mapping_usage_and_eviction);
-    (void)registry.add("memory", "private pager evicts clean pages and preserves dirty bytes",
+        "pager writeback preserves newer writes",
+        test_pager_writeback_tracks_new_writes);
+    (void)registry.add("memory", "private pager preserves resident contents",
         test_private_pager_preserves_dirty_content);
     (void)registry.add(
         "memory",
-        "pager leases survive missing siblings and prevent frame replacement",
+        "resident borrow pins backing through close",
         test_pager_lease_with_missing_sibling);
     (void)registry.add(
         "memory",

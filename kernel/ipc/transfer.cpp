@@ -1,22 +1,25 @@
+#include <expected>
 #include <ipc/transfer.hpp>
+#include <cap/graph.hpp>
+#include <sync.hpp>
 
 #include <arch/interrupt.hpp>
-#include <core/debug.hpp>
-#include <libk/manual_lifetime.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
 #include <libk/memory.hpp>
 #include <libk/scope_guard.hpp>
-#include <libk/utility.hpp>
+#include <utility>
 
-namespace kernel::ipc {
+namespace ipc {
 
 auto Transfer::prepare(
     Transfer& transfer,
     cap::CSpace& source,
     cap::CSpace& destination,
     const Specs& specs) noexcept
-    -> libk::Expected<void, cap::CSpaceError> {
+    -> std::expected<void, cap::CSpaceError> {
     if (transfer.source_ != nullptr || !transfer.entries_.empty()) {
-        return libk::unexpected(cap::CSpaceError::InvalidState);
+        return std::unexpected(cap::CSpaceError::InvalidState);
     }
     transfer.source_ = &source;
     transfer.destination_ = &destination;
@@ -31,13 +34,13 @@ auto Transfer::prepare(
         const TransferSpec& spec = specs[index];
         if (!spec.source || (spec.kind == TransferKind::Move
                 && !spec.rights.empty())) {
-            return libk::unexpected(cap::CSpaceError::InvalidHandle);
+            return std::unexpected(cap::CSpaceError::InvalidHandle);
         }
         if (spec.kind == TransferKind::Move) {
             for (usize previous = 0; previous < index; ++previous) {
                 if (specs[previous].kind == TransferKind::Move
                     && specs[previous].source == spec.source) {
-                    return libk::unexpected(cap::CSpaceError::InvalidHandle);
+                    return std::unexpected(cap::CSpaceError::InvalidHandle);
                 }
             }
         }
@@ -45,89 +48,84 @@ auto Transfer::prepare(
         auto reserved = destination.reserve();
         auto snapshot = source.snapshot(spec.source);
         if (!reserved || !snapshot) {
-            return libk::unexpected(
+            return std::unexpected(
                 !reserved ? reserved.error() : snapshot.error());
         }
         cap::CSpace::Snapshot source_snapshot =
-            libk::move(snapshot).value();
-        cap::GrantLease lease = libk::move(source_snapshot.lease);
-        auto effective = cap::compose(
-            lease.kind(), lease.ceiling(), source_snapshot.view);
-        if (!effective) {
-            return libk::unexpected(
-                cap::CSpace::policy_error(effective.error()));
-        }
+            std::move(snapshot).value();
+        cap::GrantLease lease = std::move(source_snapshot.lease);
 
         cap::GrantRef prepared{};
-        cap::Authority destination_view{};
+        cap::View destination_view{};
         switch (spec.kind) {
         case TransferKind::Copy: {
-            if (!effective.value().rights.contains(cap::Right::Duplicate)) {
-                return libk::unexpected(cap::CSpaceError::Denied);
+            if (!source_snapshot.view.rights.contains(cap::Right::Duplicate)) {
+                return std::unexpected(cap::CSpaceError::Denied);
             }
-            destination_view = cap::Authority{
-                spec.rights, effective.value().data};
+            destination_view = cap::View{
+                spec.rights, source_snapshot.view.data};
             auto valid = cap::compose(
-                lease.kind(), effective.value(), destination_view);
-            auto cloned = source_snapshot.graph->ref(source_snapshot.key);
+                lease.kind(), source_snapshot.view, destination_view);
+            auto cloned = lease.graph().ref(lease.key());
             if (!valid || !cloned) {
-                return libk::unexpected(!valid
+                return std::unexpected(!valid
                     ? cap::CSpace::policy_error(valid.error())
                     : cap::CSpace::grant_error(cloned.error()));
             }
-            prepared = libk::move(cloned).value();
+            prepared = std::move(cloned).value();
             break;
         }
         case TransferKind::Move:
             destination_view = source_snapshot.view;
             break;
         case TransferKind::Delegate: {
-            if (!effective.value().rights.contains(cap::Right::Delegate)) {
-                return libk::unexpected(cap::CSpaceError::Denied);
+            if (!source_snapshot.view.rights.contains(cap::Right::Delegate)) {
+                return std::unexpected(cap::CSpaceError::Denied);
             }
-            const cap::Authority ceiling{
-                spec.rights, effective.value().data};
-            destination_view = cap::Authority{
-                spec.rights, effective.value().data};
-            if (!cap::attenuates(lease.kind(), effective.value(), ceiling)) {
-                return libk::unexpected(cap::CSpaceError::Amplification);
+            const cap::View ceiling{
+                spec.rights, source_snapshot.view.data};
+            destination_view = cap::View{
+                spec.rights, source_snapshot.view.data};
+            if (!cap::attenuates(lease.kind(), source_snapshot.view, ceiling)) {
+                return std::unexpected(cap::CSpaceError::Amplification);
             }
             auto valid = cap::compose(
                 lease.kind(), ceiling, destination_view);
             auto charge = source.reserve_grant();
             auto target = lease.clone_target();
             if (!valid || !charge || !target) {
-                return libk::unexpected(!valid
+                return std::unexpected(!valid
                     ? cap::CSpace::policy_error(valid.error())
                     : !charge ? charge.error()
                     : cap::CSpaceError::GrantUnavailable);
             }
-            auto child = source_snapshot.graph->derive(
-                libk::move(charge).value(),
+            auto child = lease.graph().derive(
+                std::move(charge).value(),
                 lease,
-                libk::move(target).value(),
+                std::move(target).value(),
                 ceiling);
             if (!child) {
-                return libk::unexpected(
+                return std::unexpected(
                     cap::CSpace::grant_error(child.error()));
             }
-            prepared = libk::move(child).value();
+            prepared = std::move(child).value();
             break;
         }
         }
 
-        KASSERT(transfer.entries_.try_emplace_back(
-            libk::move(reserved).value(),
-            libk::move(lease),
-            libk::move(prepared),
+        const auto key = lease.key();
+        libk_assert(transfer.entries_.try_emplace_back(
+            std::move(reserved).value(),
+            std::move(lease),
+            std::move(prepared),
             spec.source,
-            source_snapshot.key,
+            key,
             source_snapshot.view,
             destination_view,
             spec.kind));
     }
     prepared = true;
-    return libk::expected();
+    return {};
 }
 
 void Transfer::reset() noexcept {
@@ -139,28 +137,23 @@ void Transfer::reset() noexcept {
 auto Transfer::handles() const noexcept -> Handles {
     Handles result{};
     for (const Entry& entry : entries_) {
-        KASSERT(result.try_push_back(entry.slot.handle()));
+        libk_assert(result.try_push_back(entry.slot.handle()));
     }
     return result;
 }
 
 auto Transfer::commit() noexcept
-    -> libk::Expected<Handles, TransferError> {
+    -> std::expected<Handles, TransferError> {
     if (source_ == nullptr || destination_ == nullptr) {
-        return libk::unexpected(TransferError::InvalidSpec);
+        return std::unexpected(TransferError::InvalidSpec);
     }
 
-    kernel::sync::OrderedIrqLockPair locks{
+    sync::Pair locks{
         source_->lock_, destination_->lock_};
 
     bool valid = true;
     for (Entry& entry : entries_) {
-        const cap::CapHandle destination = entry.slot.handle();
-        cap::CSpace::Slot* const target =
-            destination_->slot(destination.index());
-        valid = valid && target != nullptr
-            && target->generation == destination.generation()
-            && target->state == cap::CSpace::SlotState::Reserved;
+        valid = valid && destination_->reserved(entry.slot) != nullptr;
         if (!valid || entry.kind != TransferKind::Move) {
             continue;
         }
@@ -175,62 +168,48 @@ auto Transfer::commit() noexcept
     }
 
     Handles handles{};
-    libk::ManualLifetime<kernel::resource::Refund>
-        refunds[MYOS_IPC_MAX_CAPS]{};
-    usize refund_count{};
+    resource::Charge refund{};
     if (valid) {
         for (Entry& entry : entries_) {
             cap::CSpace::Reservation& reservation = entry.slot;
-            const cap::CapHandle handle = reservation.handle();
-            cap::CSpace::Slot* const target =
-                destination_->slot(handle.index());
+            const cap::Handle handle = reservation.handle();
             cap::CSpace::Capability capability{};
             if (entry.kind == TransferKind::Move) {
                 cap::CSpace::Slot* const source =
                     source_->slot(entry.source.index());
-                capability = libk::move(source->storage.capability);
+                capability = std::move(source->storage.capability);
                 libk::destroy_at(&source->storage.capability);
                 source_->unlink_occupied(entry.source.index(), *source);
-                auto& refund = refunds[refund_count++].emplace(
-                    source->sponsorship.detach());
-                (void)refund;
+                if (source_->charge_) {
+                    refund.merge(source_->charge_.split({.caps = 1}));
+                }
                 source->state = cap::CSpace::SlotState::Empty;
-                KASSERT(source_->live_slots_ != 0);
+                libk_assert(source_->live_slots_ != 0);
                 --source_->live_slots_;
                 if (source_->accepting_) {
                     source_->push_free(entry.source.index(), *source);
                 }
             } else {
                 capability = cap::CSpace::Capability{
-                    libk::move(entry.prepared), entry.view};
+                    std::move(entry.prepared), entry.view};
             }
-            libk::construct_at(
-                &target->storage.capability, libk::move(capability));
-            if (reservation.charge_) {
-                target->sponsorship.commit(libk::move(reservation.charge_));
-            }
-            target->state = cap::CSpace::SlotState::Occupied;
-            destination_->link_occupied(handle.index(), *target);
-            reservation.disarm();
-            KASSERT(handles.try_push_back(handle));
+            destination_->publish(reservation, std::move(capability));
+            libk_assert(handles.try_push_back(handle));
         }
     }
 
     locks.release();
 
-    for (usize index = 0; index < refund_count; ++index) {
-        refunds[index]->complete();
-        refunds[index].reset();
-    }
+    refund.reset();
     if (!valid) {
-        return libk::unexpected(TransferError::SourceChanged);
+        return std::unexpected(TransferError::SourceChanged);
     }
     source_->finish_retire();
     if (destination_ != source_) {
         destination_->finish_retire();
     }
     reset();
-    return libk::expected(libk::move(handles));
+    return handles;
 }
 
-} // namespace kernel::ipc
+} // namespace ipc

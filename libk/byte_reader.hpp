@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include <libk/assert.hpp>
-#include <libk/bits.hpp>
+#include <bit>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/span.hpp>
 #include <libk/string_view.hpp>
@@ -41,7 +41,7 @@ public:
 
     [[nodiscard]] auto align(size_t alignment) noexcept -> bool {
         if (base_ == nullptr) {
-            return has_single_bit(alignment) && remaining() == 0;
+            return std::has_single_bit(alignment) && remaining() == 0;
         }
         const uintptr_t current =
             reinterpret_cast<uintptr_t>(base_ + offset_);

@@ -1,20 +1,12 @@
 #pragma once
 
-#include <core/types.hpp>
+#include <base/types.hpp>
 
 namespace arch::riscv64 {
 
-// QEMU virt exposes a NS16550-compatible UART at this address.  The driver
-// only performs MMIO after the caller has installed a Device MemoryObject
-// mapping; the constant is not a userspace physical-frame authority.
-inline constexpr usize virt_uart_base = 0x1000'0000;
-inline constexpr u32 virt_uart_irq = 10;
-inline constexpr usize virt_plic_base = 0x0c00'0000;
-inline constexpr usize virt_plic_size = 0x0040'0000;
-
 class Uart16550 final {
 public:
-    explicit Uart16550(usize base = virt_uart_base) noexcept
+    explicit Uart16550(usize base) noexcept
         : base_(base) {}
 
     void initialize(u16 divisor = 1) noexcept;
@@ -30,26 +22,6 @@ private:
     }
 
     usize base_{};
-};
-
-class Plic final {
-public:
-    explicit constexpr Plic(usize base, usize context) noexcept
-        : base_(base), context_(context) {}
-
-    void configure(u32 source, u32 priority = 1) const noexcept;
-    void mask(u32 source) const noexcept;
-    void unmask(u32 source) const noexcept;
-    [[nodiscard]] auto claim() const noexcept -> u32;
-    void complete(u32 source) const noexcept;
-
-private:
-    [[nodiscard]] volatile u32* word(usize offset) const noexcept {
-        return reinterpret_cast<volatile u32*>(base_ + offset);
-    }
-
-    usize base_{};
-    usize context_{};
 };
 
 } // namespace arch::riscv64

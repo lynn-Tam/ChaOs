@@ -1,9 +1,11 @@
-#include <user/server_rt/service.hpp>
-#include <user/server_rt/io.hpp>
-#include <user/abi/startup.hpp>
+#include <expected>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <servers/runtime/queue.hpp>
+#include <sys/start.hpp>
 #include <servers/files/backing.hpp>
 #include <servers/files/fat32.hpp>
-#include <user/ipc/storage.hpp>
+#include <sys/storage.hpp>
 
 namespace {
 using namespace myos;
@@ -68,7 +70,7 @@ struct Open final {
             channel = {};
             return status;
         }
-        if (!reply.offer(libk::move(endpoint), common | MYOS_RIGHT_DESTROY
+        if (!reply.offer(std::move(endpoint), common | MYOS_RIGHT_DESTROY
             | MYOS_RIGHT_DUPLICATE)) {
             (void)object_destroy(endpoint.selector());
             channel = {};
@@ -258,7 +260,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const size_t metadata_size = (fat_size + index_size + geometry.bitmap_bytes() + 4095) & ~size_t{4095};
     auto mapped = MappedMemory::create(pool, vspace, 0x74000000, metadata_size);
     if (!mapped) exit(mapped.error());
-    metadata = libk::move(mapped).value();
+    metadata = std::move(*mapped);
     auto* fat = reinterpret_cast<uint8_t*>(metadata.address);
     auto* index = reinterpret_cast<uint32_t*>(fat + fat_size);
     auto* bitmap = reinterpret_cast<uint8_t*>(index) + index_size;
@@ -274,7 +276,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             const auto status = directory.receive(packet);
             if (status == MYOS_STATUS_WOULD_BLOCK || status == MYOS_STATUS_BUSY) break;
             if (status != MYOS_STATUS_OK || packet.count != 2) continue;
-            cap::OwnedCap endpoint = libk::move(packet.capabilities[0]);
+            cap::OwnedCap endpoint = std::move(packet.capabilities[0]);
             if (packet.badge != files::ReadDirectory && packet.badge != files::ExecuteDirectory) {
                 const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
                     .status = MYOS_STATUS_DENIED};
@@ -282,7 +284,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 (void)channel_close(endpoint.selector());
                 continue;
             }
-            packet.capabilities[0] = libk::move(packet.capabilities[1]);
+            packet.capabilities[0] = std::move(packet.capabilities[1]);
             packet.count = 1;
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
@@ -295,7 +297,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
             }
             auto& client = *available;
             client.access = MYOS_VM_READ | (packet.badge == files::ExecuteDirectory ? MYOS_VM_EXECUTE : 0);
-            client.channel = libk::move(endpoint);
+            client.channel = std::move(endpoint);
             const auto bound = client.session.bind(client.channel.selector(), events);
             const auto accepted = bound == MYOS_STATUS_OK
                 ? client.session.accept(packet, [&](const io::ControlMessage& request, io::ControlReply& reply) {

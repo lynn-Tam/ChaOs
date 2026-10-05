@@ -1,5 +1,6 @@
-#include <image/boot_bundle.hpp>
+#include <boot/bundle.hpp>
 #include <libk/assert.hpp>
+#include <base/types.hpp>
 #include <test/test.hpp>
 #include <uapi/boot_bundle.h>
 
@@ -49,7 +50,7 @@ void build_bundle(byte (&bytes)[BundleSize]) noexcept {
     write_le(bytes, cursor, ImageOffset, 8);
     write_le(bytes, cursor, 4, 8);
     write_le(bytes, cursor, 8, 8);
-    write_le(bytes, cursor, kernel::mm::page_size, 8);
+    write_le(bytes, cursor, mm::page_size, 8);
     write_le(
         bytes, cursor,
         MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_EXECUTE, 4);
@@ -69,14 +70,14 @@ void build_bundle(byte (&bytes)[BundleSize]) noexcept {
 bool test_bundle_view_accepts_valid_manifest(const TestContext&) noexcept {
     byte bytes[BundleSize]{};
     build_bundle(bytes);
-    auto parsed = kernel::image::parse_bundle(
+    auto parsed = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes)});
     if (!parsed) {
         return false;
     }
-    const kernel::image::BootBundle& bundle = parsed.value();
+    const BootBundle& bundle = parsed.value();
     if (bundle.root_name() != "init"
-        || bundle.root_image().size() != 4
+        || bundle.root_bytes().size() != 4
         || bundle.entry() != 0x20'0000
         || bundle.segment_count() != 1) {
         return false;
@@ -85,32 +86,32 @@ bool test_bundle_view_accepts_valid_manifest(const TestContext&) noexcept {
     if (!segment) {
         return false;
     }
-    const kernel::image::BundleSegment& view = segment.value();
+    const BundleSegment& view = segment.value();
     return segment
         && view.virtual_address == 0x20'0000
         && view.file.size() == 4
         && view.memory_size == 8
-        && view.access.contains(kernel::mm::Access::Read)
-        && view.access.contains(kernel::mm::Access::Execute)
-        && !view.access.contains(kernel::mm::Access::Write);
+        && view.access.contains(mm::Perm::Read)
+        && view.access.contains(mm::Perm::Execute)
+        && !view.access.contains(mm::Perm::Write);
 }
 
 bool test_bundle_view_rejects_bad_envelopes(const TestContext&) noexcept {
     byte bytes[BundleSize]{};
     build_bundle(bytes);
     bytes[0] ^= 1;
-    const auto bad_magic = kernel::image::parse_bundle(
+    const auto bad_magic = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes)});
     bytes[0] ^= 1;
-    const auto truncated = kernel::image::parse_bundle(
+    const auto truncated = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes) - 1});
     bytes[24] = 0xff;
-    const auto bad_target = kernel::image::parse_bundle(
+    const auto bad_target = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes)});
-    return !bad_magic && bad_magic.error() == kernel::image::BundleError::BadMagic
+    return !bad_magic && bad_magic.error() == BundleError::BadMagic
         && !truncated
         && !bad_target
-        && bad_target.error() == kernel::image::BundleError::WrongTarget;
+        && bad_target.error() == BundleError::WrongTarget;
 }
 
 bool test_bundle_view_rejects_writable_code(const TestContext&) noexcept {
@@ -118,10 +119,10 @@ bool test_bundle_view_rejects_writable_code(const TestContext&) noexcept {
     build_bundle(bytes);
     bytes[SegmentOffset + 40] = MYOS_BOOT_SEGMENT_READ
         | MYOS_BOOT_SEGMENT_WRITE | MYOS_BOOT_SEGMENT_EXECUTE;
-    const auto parsed = kernel::image::parse_bundle(
+    const auto parsed = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes)});
     return !parsed
-        && parsed.error() == kernel::image::BundleError::InvalidSegment;
+        && parsed.error() == BundleError::InvalidSegment;
 }
 
 } // namespace

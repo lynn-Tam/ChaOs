@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cpu/topology.hpp>
-#include <libk/expected.hpp>
+#include <cpu/types.hpp>
+#include <expected>
 
 namespace arch {
 
@@ -12,8 +12,8 @@ enum class IpiError : u8 {
 };
 
 [[nodiscard]] auto ipi_available() noexcept -> bool;
-[[nodiscard]] auto send_ipi(kernel::CpuHardwareId target) noexcept
-    -> libk::Expected<void, IpiError>;
+[[nodiscard]] auto send_ipi(CpuHwId target) noexcept
+    -> std::expected<void, IpiError>;
 void enable_ipi() noexcept;
 void acknowledge_ipi() noexcept;
 

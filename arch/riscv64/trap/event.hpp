@@ -9,6 +9,6 @@
 
 namespace arch::riscv64 {
 
-[[nodiscard]] auto make_event(const TrapFrame& frame) noexcept -> kernel::trap::Event;
+[[nodiscard]] auto make_event(const TrapFrame& frame) noexcept -> trap::Event;
 
 } // namespace arch::riscv64

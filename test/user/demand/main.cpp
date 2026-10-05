@@ -1,10 +1,9 @@
-#include <user/server_rt/console.hpp>
+#include <servers/runtime/output.hpp>
 #include <libk/parse.hpp>
-#include <user/ipc/channel.hpp>
-#include <user/abi/time.hpp>
-#include <user/abi/objects.hpp>
-#include <user/server_rt/service.hpp>
-#include <uapi/test_scenario.h>
+#include <sys/channel.hpp>
+#include <sys/clock.hpp>
+#include <sys/handle.hpp>
+#include <servers/runtime/service.hpp>
 
 namespace {
 volatile uint8_t initialized[8197]{0x39, 0x82};
@@ -27,8 +26,8 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     }
     const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
-    auto stress = MappedMemory::create(pool, vspace, MYOS_TEST_PRESSURE_STRESS_ADDRESS, 4096);
-    auto release = MappedMemory::create(pool, vspace, MYOS_TEST_PRESSURE_RELEASE_ADDRESS, 4096);
+    auto stress = MappedMemory::create(pool, vspace, 0x28000000, 4096);
+    auto release = MappedMemory::create(pool, vspace, 0x28003000, 4096);
     check(stress && release);
     check(*reinterpret_cast<const volatile uint8_t*>(stress.value().address) == 0);
     for (size_t i = 0; i < sizeof(initialized); ++i) check(initialized[i] == i % 251);
@@ -36,8 +35,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     check(*reinterpret_cast<const volatile uint8_t*>(release.value().address) == 0);
     service::require(stress.value().close());
     service::require(release.value().close());
-    service::require(vm_sync(vspace).status);
-    auto reused = MappedMemory::create(pool, vspace, MYOS_TEST_PRESSURE_RELEASE_ADDRESS, 4096);
+    auto reused = MappedMemory::create(pool, vspace, 0x28003000, 4096);
     check(reused && *reinterpret_cast<const volatile uint8_t*>(reused.value().address) == 0);
     service::require(reused.value().close());
     stream::Writer{service::capability(info, bootstrap::imports::Stdout)}

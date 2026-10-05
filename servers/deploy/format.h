@@ -285,8 +285,6 @@ typedef enum myos_deploy_mapping_critical {
     DEPLOY_CRITICAL_LOADER = 4,
     DEPLOY_CRITICAL_PAGER_RECOVERY = 5,
     DEPLOY_CRITICAL_DRIVER_RECOVERY = 6,
-    DEPLOY_CRITICAL_VPROC_CONTROL = 7,
-    DEPLOY_CRITICAL_VPROC_EVENT = 8,
     DEPLOY_CRITICAL_IPC_HEADER = 9,
 } myos_deploy_mapping_critical_t;
 
@@ -332,14 +330,12 @@ typedef enum myos_deploy_export_class {
 
 typedef enum myos_deploy_execution_model {
     DEPLOY_EXECUTION_THREAD = 0,
-    DEPLOY_EXECUTION_VPROC = 1,
 } myos_deploy_execution_model_t;
 
 /* Fault policy is target-specific even though its wire field is shared. */
 typedef enum myos_deploy_execution_fault_policy {
     DEPLOY_EXECUTION_FAULT_TERMINATE = 0,
     DEPLOY_EXECUTION_FAULT_ENDPOINT = 1,
-    DEPLOY_EXECUTION_FAULT_RUNTIME = 1,
 } myos_deploy_execution_fault_policy_t;
 
 typedef enum myos_deploy_execution_terminal_policy {

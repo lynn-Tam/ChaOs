@@ -1,5 +1,6 @@
-#include <user/server_rt/service.hpp>
-#include <user/ipc/storage.hpp>
+#include <utility>
+#include <servers/runtime/service.hpp>
+#include <sys/storage.hpp>
 
 namespace { myos::files::Client filesystem; }
 
@@ -16,13 +17,13 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     auto backing = filesystem.backing(file);
     if (!backing) exit(backing.error());
     auto mapping = MappedMemory::map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
-        libk::move(backing.value().memory), 0x75000000, (file.size + 4095) & ~size_t{4095}, MYOS_VM_READ);
+        std::move(backing->memory), 0x75000000, (file.size + 4095) & ~size_t{4095}, MYOS_VM_READ);
     if (!mapping) exit(mapping.error());
     service::require(filesystem.close(file));
     service::require(filesystem.close());
     // Closing both handles must preserve the independent content authority.
     // Its first fault must report the backend failure, never fabricate zeros.
-    const auto byte = *reinterpret_cast<const volatile uint8_t*>(mapping.value().address);
+    const auto byte = *reinterpret_cast<const volatile uint8_t*>(mapping->address);
     (void)byte;
     exit(MYOS_STATUS_INTERNAL);
 }

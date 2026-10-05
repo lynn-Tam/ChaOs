@@ -6,7 +6,8 @@
 
 #include "arch/riscv64/cpu/csr.hpp"
 
-#include <core/debug.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
 
 namespace arch {
 namespace {
@@ -19,12 +20,12 @@ namespace {
 } // namespace
 
 void initialize_cpu_entry(CpuEntryState& state, void* owner) noexcept {
-    KASSERT(owner != nullptr);
+    libk_assert(owner != nullptr);
     state.initialize(owner);
 }
 
 auto set_local_cpu_entry(CpuEntryState& state) noexcept -> bool {
-    KASSERT(state.owner_cpu != nullptr);
+    libk_assert(state.owner_cpu != nullptr);
 
     riscv64::Sscratch::write(reinterpret_cast<usize>(&state));
     return riscv64::Sscratch::read() == reinterpret_cast<usize>(&state);
@@ -36,8 +37,8 @@ auto current_cpu_owner() noexcept -> void* {
 }
 
 void publish_active_stack(CpuEntryState& state, usize stack_top) noexcept {
-    KASSERT(stack_top != 0);
-    KASSERT((stack_top & 0xfU) == 0);
+    libk_assert(stack_top != 0);
+    libk_assert((stack_top & 0xfU) == 0);
     state.publish_active_stack(stack_top);
 }
 
@@ -51,7 +52,7 @@ auto trap_depth(const CpuEntryState& state) noexcept -> usize {
 
 auto trap_depth() noexcept -> usize {
     const auto* const state = local_state();
-    KASSERT(state != nullptr);
+    libk_assert(state != nullptr);
     return trap_depth(*state);
 }
 
@@ -64,9 +65,9 @@ void publish_panic_state(
     CpuEntryState& state,
     usize emergency_stack_top,
     void* slot) noexcept {
-    KASSERT(emergency_stack_top != 0);
-    KASSERT((emergency_stack_top & 0xfU) == 0);
-    KASSERT(slot != nullptr);
+    libk_assert(emergency_stack_top != 0);
+    libk_assert((emergency_stack_top & 0xfU) == 0);
+    libk_assert(slot != nullptr);
     state.publish_diagnostics(emergency_stack_top, slot);
 }
 
@@ -135,9 +136,9 @@ void restore_interrupts(InterruptState state) noexcept {
     usize stack_top,
     void* argument,
     StackContinuation continuation) noexcept -> void {
-    KASSERT(stack_top != 0);
-    KASSERT((stack_top & 0xfU) == 0);
-    KASSERT(continuation != nullptr);
+    libk_assert(stack_top != 0);
+    libk_assert((stack_top & 0xfU) == 0);
+    libk_assert(continuation != nullptr);
 
     asm volatile(
         "mv sp, %[stack]\n"

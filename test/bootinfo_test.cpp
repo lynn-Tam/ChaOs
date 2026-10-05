@@ -1,25 +1,24 @@
 #include <test/test.hpp>
 
-#include <boot/firmware/devicetree/fdt.hpp>
-#include <libk/utility.hpp>
-#include <mm/boot_map.hpp>
+#include <boot/fdt.hpp>
+#include <utility>
+#include <mm/phys.hpp>
 #include <mm/pmm.hpp>
-#include <core/kernel_image.hpp>
+#include <boot/link.hpp>
 
 namespace {
 
 bool test_default_bootinfo_is_cleared(const TestContext&) noexcept {
-    kernel::boot::BootInfo boot{};
+    BootInfo boot{};
     return !boot.fdt
-        && !boot.transition
+        && !boot.transition.valid()
         && boot.fdt.physical.raw() == 0
         && boot.fdt.size == 0
-        && !boot.fdt.pages.valid()
-        && boot.memory_regions.empty();
+        && !boot.fdt.pages.valid();
 }
 
 bool test_boot_map_is_valid_and_non_overlapping(const TestContext& ctx) noexcept {
-    const auto map = ctx.boot.memory_regions.span();
+    const auto map = ctx.memory.regions();
     if (map.empty()) {
         return false;
     }
@@ -37,10 +36,10 @@ bool test_boot_map_is_valid_and_non_overlapping(const TestContext& ctx) noexcept
 }
 
 bool test_boot_map_is_ordered(const TestContext& ctx) noexcept {
-    const auto map = ctx.boot.memory_regions.span();
+    const auto map = ctx.memory.regions();
     for (size_t i = 1; i < map.size(); ++i) {
-        const auto previous_end = map[i - 1].range.end_frame();
-        if (!previous_end || *previous_end > map[i].range.first().frame()) {
+        const auto previous_end = map[i - 1].range.limit();
+        if (!previous_end || *previous_end > map[i].range.base()) {
             return false;
         }
     }
@@ -48,47 +47,47 @@ bool test_boot_map_is_ordered(const TestContext& ctx) noexcept {
 }
 
 bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
-    const auto boot_range = kernel::image::boot_entry();
-    const auto secondary_range = kernel::image::secondary_entry();
-    const auto image_range = kernel::image::physical_image();
-    const auto boot_end = boot_range.end_frame();
-    const auto secondary_end = secondary_range.end_frame();
-    const auto image_end = image_range.end_frame();
+    const auto boot_range = boot_pages();
+    const auto secondary_range = secondary_pages();
+    const auto image_range = kernel_pages();
+    const auto boot_end = boot_range.limit();
+    const auto secondary_end = secondary_range.limit();
+    const auto image_end = image_range.limit();
     if (!boot_end || !secondary_end || !image_end) {
         return false;
     }
     bool boot_entry{};
     bool secondary{};
     bool high_image{};
-    for (const auto& region : ctx.boot.memory_regions) {
-        if (region.kind != kernel::mm::RegionKind::KernelImage) {
+    for (const auto& region : ctx.memory.regions()) {
+        if (region.kind != mm::Region::Kind::Kernel) {
             continue;
         }
-        const auto end = region.range.end_frame();
+        const auto end = region.range.limit();
         if (!end) {
             return false;
         }
-        const uintptr_t first = region.range.first().base().raw();
-        const uintptr_t last = end->raw() * kernel::mm::page_size;
-        boot_entry |= first == boot_range.first().base().raw()
-            && last == boot_end->raw() * kernel::mm::page_size;
-        secondary |= first == secondary_range.first().base().raw()
-            && last == secondary_end->raw() * kernel::mm::page_size;
-        high_image |= first == image_range.first().base().raw()
-            && last == image_end->raw() * kernel::mm::page_size;
+        const uintptr_t first = region.range.base().base().raw();
+        const uintptr_t last = end->raw() * mm::page_size;
+        boot_entry |= first == boot_range.base().base().raw()
+            && last == boot_end->raw() * mm::page_size;
+        secondary |= first == secondary_range.base().base().raw()
+            && last == secondary_end->raw() * mm::page_size;
+        high_image |= first == image_range.base().base().raw()
+            && last == image_end->raw() * mm::page_size;
     }
     return boot_entry && secondary && high_image;
 }
 
 bool test_pre_kernel_ram_is_firmware_reserved(const TestContext& ctx) noexcept {
     const uintptr_t kernel_start =
-        kernel::image::boot_entry().first().base().raw();
-    for (const auto& region : ctx.boot.memory_regions) {
-        if (region.kind != kernel::mm::RegionKind::FirmwareReserved) {
+        boot_pages().base().base().raw();
+    for (const auto& region : ctx.memory.regions()) {
+        if (region.kind != mm::Region::Kind::Firmware) {
             continue;
         }
-        const auto end = region.range.end_frame();
-        return end && end->raw() * kernel::mm::page_size == kernel_start;
+        const auto end = region.range.limit();
+        return end && end->raw() * mm::page_size == kernel_start;
     }
     return false;
 }
@@ -97,9 +96,9 @@ bool test_fdt_pages_are_reclaimable(const TestContext& ctx) noexcept {
     if (!ctx.boot.fdt) {
         return false;
     }
-    for (const auto& region : ctx.boot.memory_regions) {
-        if (region.kind == kernel::mm::RegionKind::ReclaimableBootData
-            && region.range.first() == ctx.boot.fdt.pages.first()
+    for (const auto& region : ctx.memory.regions()) {
+        if (region.kind == mm::Region::Kind::Boot
+            && region.range.base() == ctx.boot.fdt.pages.base()
             && region.range.page_count()
                 == ctx.boot.fdt.pages.page_count()) {
             return true;
@@ -109,14 +108,14 @@ bool test_fdt_pages_are_reclaimable(const TestContext& ctx) noexcept {
 }
 
 bool test_transition_pages_are_reclaimable(const TestContext& ctx) noexcept {
-    if (!ctx.boot.transition) {
+    if (!ctx.boot.transition.valid()) {
         return false;
     }
-    for (const auto& region : ctx.boot.memory_regions) {
-        if (region.kind == kernel::mm::RegionKind::ReclaimableBootData
-            && region.range.first() == ctx.boot.transition.pages.first()
+    for (const auto& region : ctx.memory.regions()) {
+        if (region.kind == mm::Region::Kind::Boot
+            && region.range.base() == ctx.boot.transition.base()
             && region.range.page_count()
-                == ctx.boot.transition.pages.page_count()) {
+                == ctx.boot.transition.page_count()) {
             return true;
         }
     }
@@ -124,21 +123,21 @@ bool test_transition_pages_are_reclaimable(const TestContext& ctx) noexcept {
 }
 
 bool test_region_policy_is_explicit(const TestContext&) noexcept {
-    const kernel::mm::Region available{
-        kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{1}}, 1},
-        kernel::mm::RegionKind::AvailableRam,
+    const mm::Region available{
+        mm::Pages{mm::Page{1}, 1},
+        mm::Region::Kind::Ram,
     };
-    const kernel::mm::Region reclaimable{
-        kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{2}}, 1},
-        kernel::mm::RegionKind::ReclaimableBootData,
+    const mm::Region reclaimable{
+        mm::Pages{mm::Page{2}, 1},
+        mm::Region::Kind::Boot,
     };
-    const kernel::mm::Region kernel{
-        kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{3}}, 1},
-        kernel::mm::RegionKind::KernelImage,
+    const mm::Region kernel{
+        mm::Pages{mm::Page{3}, 1},
+        mm::Region::Kind::Kernel,
     };
-    const kernel::mm::Region mmio{
-        kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{4}}, 1},
-        kernel::mm::RegionKind::Mmio,
+    const mm::Region mmio{
+        mm::Pages{mm::Page{4}, 1},
+        mm::Region::Kind::Mmio,
     };
     return available.is_ram() && !available.is_reclaimable()
         && reclaimable.is_ram() && reclaimable.is_reclaimable()
@@ -147,26 +146,26 @@ bool test_region_policy_is_explicit(const TestContext&) noexcept {
 }
 
 bool test_builder_normalizes_multiple_ram_banks(const TestContext&) noexcept {
-    using Kind = kernel::mm::RegionKind;
-    kernel::mm::BootMapBuilder builder{};
-    if (!builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{100}}, 8})
-        || !builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{200}}, 4})
+    using Kind = mm::Region::Kind;
+    mm::PhysMap builder{};
+    if (!builder.add_ram(mm::Pages{
+            mm::Page{100}, 8})
+        || !builder.add_ram(mm::Pages{
+            mm::Page{200}, 4})
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{102}}, 2},
-            Kind::FirmwareReserved)
+            mm::Pages{mm::Page{102}, 2},
+            Kind::Firmware)
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{103}}, 2},
-            Kind::KernelImage)
+            mm::Pages{mm::Page{103}, 2},
+            Kind::Kernel)
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{201}}, 1},
-            Kind::ReclaimableBootData)) {
+            mm::Pages{mm::Page{201}, 1},
+            Kind::Boot)) {
         return false;
     }
 
-    kernel::mm::RegionList map{};
-    const auto result = libk::move(builder).build_into(map);
+    mm::RegionList map{};
+    const auto result = std::move(builder).finish(map);
     if (!result) {
         return false;
     }
@@ -177,19 +176,19 @@ bool test_builder_normalizes_multiple_ram_banks(const TestContext&) noexcept {
         Kind kind;
     };
     constexpr ExpectedRegion expected[] = {
-        {100, 2, Kind::AvailableRam},
-        {102, 1, Kind::FirmwareReserved},
-        {103, 2, Kind::KernelImage},
-        {105, 3, Kind::AvailableRam},
-        {200, 1, Kind::AvailableRam},
-        {201, 1, Kind::ReclaimableBootData},
-        {202, 2, Kind::AvailableRam},
+        {100, 2, Kind::Ram},
+        {102, 1, Kind::Firmware},
+        {103, 2, Kind::Kernel},
+        {105, 3, Kind::Ram},
+        {200, 1, Kind::Ram},
+        {201, 1, Kind::Boot},
+        {202, 2, Kind::Ram},
     };
     if (map.size() != sizeof(expected) / sizeof(expected[0])) {
         return false;
     }
     for (size_t index = 0; index < map.size(); ++index) {
-        if (map[index].range.first().frame().raw() != expected[index].first
+        if (map[index].range.base().raw() != expected[index].first
             || map[index].range.page_count() != expected[index].pages
             || map[index].kind != expected[index].kind) {
             return false;
@@ -199,93 +198,93 @@ bool test_builder_normalizes_multiple_ram_banks(const TestContext&) noexcept {
 }
 
 bool test_permanent_reservation_overrides_reclaimable(const TestContext&) noexcept {
-    using Kind = kernel::mm::RegionKind;
-    kernel::mm::BootMapBuilder builder{};
-    if (!builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{300}}, 8})
+    using Kind = mm::Region::Kind;
+    mm::PhysMap builder{};
+    if (!builder.add_ram(mm::Pages{
+            mm::Page{300}, 8})
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{301}}, 5},
-            Kind::ReclaimableBootData)
+            mm::Pages{mm::Page{301}, 5},
+            Kind::Boot)
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{303}}, 1},
-            Kind::FirmwareReserved)) {
+            mm::Pages{mm::Page{303}, 1},
+            Kind::Firmware)) {
         return false;
     }
 
-    kernel::mm::RegionList map{};
-    const auto result = libk::move(builder).build_into(map);
+    mm::RegionList map{};
+    const auto result = std::move(builder).finish(map);
     if (!result) {
         return false;
     }
     if (map.size() != 5) {
         return false;
     }
-    return map[1].kind == Kind::ReclaimableBootData
+    return map[1].kind == Kind::Boot
         && map[1].range.page_count() == 2
-        && map[2].kind == Kind::FirmwareReserved
+        && map[2].kind == Kind::Firmware
         && map[2].range.page_count() == 1
-        && map[3].kind == Kind::ReclaimableBootData
+        && map[3].kind == Kind::Boot
         && map[3].range.page_count() == 2;
 }
 
 bool test_adjacent_reclaimable_resources_keep_boundaries(const TestContext&) noexcept {
-    using Kind = kernel::mm::RegionKind;
-    kernel::mm::BootMapBuilder builder{};
-    if (!builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{500}}, 8})
+    using Kind = mm::Region::Kind;
+    mm::PhysMap builder{};
+    if (!builder.add_ram(mm::Pages{
+            mm::Page{500}, 8})
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{501}}, 2},
-            Kind::ReclaimableBootData)
+            mm::Pages{mm::Page{501}, 2},
+            Kind::Boot)
         || !builder.reserve(
-            kernel::mm::PageRange{kernel::mm::Page{kernel::mm::Pfn{503}}, 2},
-            Kind::ReclaimableBootData)) {
+            mm::Pages{mm::Page{503}, 2},
+            Kind::Boot)) {
         return false;
     }
 
-    kernel::mm::RegionList map{};
-    if (!libk::move(builder).build_into(map) || map.size() != 4) {
+    mm::RegionList map{};
+    if (!std::move(builder).finish(map) || map.size() != 4) {
         return false;
     }
-    return map[1].kind == Kind::ReclaimableBootData
-        && map[1].range.first().frame().raw() == 501
+    return map[1].kind == Kind::Boot
+        && map[1].range.base().raw() == 501
         && map[1].range.page_count() == 2
-        && map[2].kind == Kind::ReclaimableBootData
-        && map[2].range.first().frame().raw() == 503
+        && map[2].kind == Kind::Boot
+        && map[2].range.base().raw() == 503
         && map[2].range.page_count() == 2;
 }
 
 bool test_builder_rejects_overlapping_ram_banks(const TestContext&) noexcept {
-    kernel::mm::BootMapBuilder builder{};
-    if (!builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{400}}, 8})
-        || !builder.add_ram(kernel::mm::PageRange{
-            kernel::mm::Page{kernel::mm::Pfn{404}}, 8})) {
+    mm::PhysMap builder{};
+    if (!builder.add_ram(mm::Pages{
+            mm::Page{400}, 8})
+        || !builder.add_ram(mm::Pages{
+            mm::Page{404}, 8})) {
         return false;
     }
-    kernel::mm::RegionList map{};
-    const auto result = libk::move(builder).build_into(map);
-    return !result && result.error() == kernel::mm::BootMapError::OverlappingRam;
+    mm::RegionList map{};
+    const auto result = std::move(builder).finish(map);
+    return !result && result.error() == mm::PhysErr::Overlap;
 }
 
 bool test_builder_requires_ram(const TestContext&) noexcept {
-    kernel::mm::BootMapBuilder builder{};
-    kernel::mm::RegionList map{};
-    const auto result = libk::move(builder).build_into(map);
-    return !result && result.error() == kernel::mm::BootMapError::NoRam;
+    mm::PhysMap builder{};
+    mm::RegionList map{};
+    const auto result = std::move(builder).finish(map);
+    return !result && result.error() == mm::PhysErr::NoRam;
 }
 
 bool test_byte_ranges_have_explicit_page_rounding(const TestContext&) noexcept {
-    const auto contained = kernel::mm::PageRange::contained_bytes(
-        kernel::mm::PhysAddr{0x1003},
+    const auto contained = mm::Pages::contained_bytes(
+        mm::Phys{0x1003},
         0x2ffe);
-    const auto covering = kernel::mm::PageRange::covering_bytes(
-        kernel::mm::PhysAddr{0x1003},
+    const auto covering = mm::Pages::covering_bytes(
+        mm::Phys{0x1003},
         0x2ffe);
     return contained
-        && contained->first().frame().raw() == 2
+        && contained->base().raw() == 2
         && contained->page_count() == 2
         && covering
-        && covering->first().frame().raw() == 1
+        && covering->base().raw() == 1
         && covering->page_count() == 4;
 }
 
@@ -310,7 +309,7 @@ bool test_fdt_memory_reservations_are_bounded(const TestContext&) noexcept {
     be32(72, 1);
     be32(80, 2);
     be32(84, 9);
-    const auto tree = kernel::boot::Fdt::open(blob);
+    const auto tree = Fdt::open(blob);
     size_t visits = 0;
     const bool valid = tree && tree.value().for_each_reservation(
         [&visits](uint64_t address, uint64_t size) {
@@ -318,14 +317,14 @@ bool test_fdt_memory_reservations_are_bounded(const TestContext&) noexcept {
             return address == 0x1000 && size == 0x2000;
         });
     blob[71] = 1; // The reservation terminator no longer fits in its block.
-    const auto unterminated = kernel::boot::Fdt::open(blob);
+    const auto unterminated = Fdt::open(blob);
     return valid && visits == 1 && !unterminated;
 }
 
 } // namespace
 
 void register_bootinfo_tests(TestRegistry& registry) noexcept {
-    (void)registry.add("boot-map", "default BootInfo owns an empty map", test_default_bootinfo_is_cleared);
+    (void)registry.add("boot-map", "default firmware handoff is empty", test_default_bootinfo_is_cleared);
     (void)registry.add("boot-map", "regions are valid and non-overlapping", test_boot_map_is_valid_and_non_overlapping);
     (void)registry.add("boot-map", "regions are ordered by address", test_boot_map_is_ordered);
     (void)registry.add("boot-map", "kernel image owns only persistent load regions", test_kernel_image_has_exact_region);

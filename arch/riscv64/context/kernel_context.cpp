@@ -1,6 +1,7 @@
 #include <arch/context.hpp>
 
-#include <core/debug.hpp>
+#include <libk/assert.hpp>
+#include <base/types.hpp>
 
 extern "C" void arch_riscv64_switch_context(
     arch::KernelContext* outgoing,
@@ -14,9 +15,9 @@ namespace arch {
 namespace {
 
 void assert_restorable(const KernelContext& context) noexcept {
-    KASSERT(context.ra != 0);
-    KASSERT(context.sp != 0);
-    KASSERT((context.sp & 0xfU) == 0);
+    libk_assert(context.ra != 0);
+    libk_assert(context.sp != 0);
+    libk_assert((context.sp & 0xfU) == 0);
 }
 
 } // namespace
@@ -24,9 +25,9 @@ void assert_restorable(const KernelContext& context) noexcept {
 void prepare_context(
     KernelContext& context,
     ContextStart start) noexcept {
-    KASSERT(start.stack_top != 0);
-    KASSERT((start.stack_top & 0xfU) == 0);
-    KASSERT(start.entry != nullptr);
+    libk_assert(start.stack_top != 0);
+    libk_assert((start.stack_top & 0xfU) == 0);
+    libk_assert(start.entry != nullptr);
 
     context = {};
     context.ra = reinterpret_cast<usize>(&arch_riscv64_context_start);

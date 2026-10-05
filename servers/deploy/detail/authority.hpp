@@ -10,14 +10,15 @@
  * into TaskSpace; it never keeps a second owner for an adopted result.
  */
 
+#include <concepts>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <libk/assert.hpp>
 #include <libk/concepts.hpp>
 #include <libk/inplace_vector.hpp>
-#include <libk/optional.hpp>
-#include <libk/utility.hpp>
+#include <optional>
+#include <utility>
 #include <uapi/capability.h>
 #include <servers/deploy/format.h>
 #include <uapi/object.h>
@@ -157,7 +158,7 @@ public:
         delete;
 
     RegistrationJournal(RegistrationJournal&& other) noexcept
-        : entries_(libk::move(other.entries_)) {}
+        : entries_(std::move(other.entries_)) {}
 
     auto operator=(RegistrationJournal&& other) noexcept
         -> RegistrationJournal& {
@@ -165,7 +166,7 @@ public:
             return *this;
         }
         libk_assert(live_size() == 0);
-        entries_ = libk::move(other.entries_);
+        entries_ = std::move(other.entries_);
         return *this;
     }
 
@@ -212,24 +213,24 @@ public:
         myos::cap::CapRef source,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<AuthorityId> {
+        -> std::optional<AuthorityId> {
         if (entries_.size() == Capacity) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         auto registration = authorities.register_source(
             source, identity, ceiling);
         if (!registration) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         const AuthorityId id = registration->id();
-        if (!adopt(libk::move(*registration))) {
+        if (!adopt(std::move(*registration))) {
             // No lease can exist yet, so exact retirement is immediate.  A
             // failed retirement is an ownership fault rather than a leak.
             const myos_status_t status = registration->retire();
             if (status != MYOS_STATUS_OK) {
                 libk_assert(false);
             }
-            return libk::nullopt;
+            return std::nullopt;
         }
         return id;
     }
@@ -239,7 +240,7 @@ private:
         if (!registration.valid() || entries_.size() == Capacity) {
             return false;
         }
-        return entries_.try_push_back(libk::move(registration));
+        return entries_.try_push_back(std::move(registration));
     }
 
     template<size_t, size_t, uint32_t>
@@ -266,14 +267,14 @@ public:
     auto operator=(const RegistrationOwner&) -> RegistrationOwner& = delete;
 
     RegistrationOwner(RegistrationOwner&& other) noexcept
-        : journal_(libk::move(other.journal_)) {}
+        : journal_(std::move(other.journal_)) {}
 
     auto operator=(RegistrationOwner&& other) noexcept -> RegistrationOwner& {
         if (this == &other) {
             return *this;
         }
         libk_assert(journal_.live_size() == 0);
-        journal_ = libk::move(other.journal_);
+        journal_ = std::move(other.journal_);
         return *this;
     }
 
@@ -286,7 +287,7 @@ private:
         myos::cap::CapRef source,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<AuthorityId> {
+        -> std::optional<AuthorityId> {
         return journal_.register_source(
             authorities, source, identity, ceiling);
     }
@@ -298,10 +299,10 @@ private:
         LocalSlot slot,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<AuthorityId> {
+        -> std::optional<AuthorityId> {
         const auto source = space.lookup(slot, ceiling.kind);
         if (!source) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return journal_.register_source(
             authorities, source.value(), identity, ceiling);
@@ -346,8 +347,8 @@ public:
     auto operator=(const RegisteredSpace&) -> RegisteredSpace& = delete;
 
     RegisteredSpace(RegisteredSpace&& other) noexcept
-        : space_(libk::move(other.space_)),
-          owner_(libk::move(other.owner_)), adopted_(other.adopted_) {
+        : space_(std::move(other.space_)),
+          owner_(std::move(other.owner_)), adopted_(other.adopted_) {
         other.adopted_ = false;
     }
 
@@ -357,8 +358,8 @@ public:
         }
         libk_assert(space_.phase() == Phase::Closed);
         libk_assert(!owner_.has_live_registrations());
-        space_ = libk::move(other.space_);
-        owner_ = libk::move(other.owner_);
+        space_ = std::move(other.space_);
+        owner_ = std::move(other.owner_);
         adopted_ = other.adopted_;
         other.adopted_ = false;
         return *this;
@@ -377,7 +378,7 @@ public:
             || owner_.has_live_registrations()) {
             return false;
         }
-        space_ = libk::move(source);
+        space_ = std::move(source);
         adopted_ = true;
         return true;
     }
@@ -388,9 +389,9 @@ public:
         LocalSlot slot,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<AuthorityId> {
+        -> std::optional<AuthorityId> {
         if (!adopted_) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         return owner_.register_source(
             authorities, space_, slot, identity, ceiling);
@@ -405,7 +406,7 @@ public:
     }
 
     [[nodiscard]] auto pool() const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         return space_.pool();
     }
 
@@ -420,7 +421,7 @@ public:
     [[nodiscard]] auto lookup(
         LocalSlot slot,
         myos_object_kind_t expected_kind) const noexcept
-        -> libk::optional<myos::cap::CapRef> {
+        -> std::optional<myos::cap::CapRef> {
         return space_.lookup(slot, expected_kind);
     }
 
@@ -577,14 +578,14 @@ private:
         myos::cap::CapRef source,
         uint64_t identity,
         const myos_cap_attenuation& ceiling) noexcept
-        -> libk::optional<Registration> {
+        -> std::optional<Registration> {
         if (!source || source.cspace != 0
             || !valid_authority_ceiling(ceiling)) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         for (const Entry& entry : entries_) {
             if (entry.occupied && entry.identity == identity) {
-                return libk::nullopt;
+                return std::nullopt;
             }
         }
         for (size_t index = 0; index < Capacity; ++index) {
@@ -605,7 +606,7 @@ private:
                     static_cast<uint32_t>(index), entry.generation},
                 &retire_erased};
         }
-        return libk::nullopt;
+        return std::nullopt;
     }
 
     template<size_t>
@@ -614,11 +615,11 @@ private:
 public:
 
     [[nodiscard]] auto lease(AuthorityId id) noexcept
-        -> libk::optional<Lease> {
+        -> std::optional<Lease> {
         Entry* entry = checked(id);
         if (entry == nullptr || entry->retiring
             || live_leases_ == LeaseCapacity) {
-            return libk::nullopt;
+            return std::nullopt;
         }
         ++entry->leases;
         ++live_leases_;
@@ -754,7 +755,7 @@ struct ImportProjection final {
             && remote_index != static_cast<size_t>(-1)
             && manager != 0
             && kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT;
+            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
     }
 };
 
@@ -766,11 +767,11 @@ concept ImportBackend = requires(
     myos_word_t rights,
     myos_word_t badge) {
     { B::duplicate(source, destination, rights) }
-        -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
     { B::typed_delegate(source, destination, descriptor, 0) }
-        -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
     { B::channel_mint(source, destination, badge, rights) }
-        -> libk::SameAs<myos::SysResult>;
+        -> std::same_as<myos::SysResult>;
 };
 
 template<typename Space, typename Authorities, size_t BatchMax = 32>
@@ -810,7 +811,7 @@ public:
             return MYOS_STATUS_OK;
         }
 
-        libk::optional<Lease> leases[BatchMax]{};
+        std::optional<Lease> leases[BatchMax]{};
         for (uint32_t index = 0; index < count; ++index) {
             const PlanImport* import = task.import(first + index);
             if (import == nullptr || !valid_import(*import)
@@ -851,7 +852,7 @@ public:
                         import.attenuation, ceiling, import.mode)) {
                     return MYOS_STATUS_DENIED;
                 }
-                leases[index] = libk::move(*lease);
+                leases[index] = std::move(*lease);
             } else {
                 source = bindings[index].source;
                 /* TaskBuilder resolves a TaskKey to a capability that this
@@ -952,7 +953,7 @@ public:
                     space, remote_indices, adopted, outputs, result.status);
             }
 
-            const auto remote = space.adopt_remote_index(libk::move(owner));
+            const auto remote = space.adopt_remote_index(std::move(owner));
             if (!remote) {
                 const myos_status_t closed = owner.close();
                 if (closed != MYOS_STATUS_OK) {
