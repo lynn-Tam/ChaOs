@@ -30,12 +30,13 @@ zeroed = symbol('zeroedE')
 probe = f'''
 import gdb
 
-def manual(value, name):
+def manual(value, name=None):
     assert bool(value['engaged_'])
-    return value['storage_'].address.cast(gdb.lookup_type(name).pointer()).dereference()
+    typ = gdb.lookup_type(name) if name else value.type.strip_typedefs().template_argument(0)
+    return value['storage_'].address.cast(typ.pointer()).dereference()
 
 state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
-memory = manual(state['memory_objects_'], 'object::store<mm::VSpace, mm::Mem, Pager>')
+memory = manual(state['objects_'])
 def pool(name):
     def find(value):
         if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
@@ -49,8 +50,8 @@ def pool(name):
     result = find(memory['pools_'])
     assert result is not None, name
     return result
-direct = manual(state['pmm_'], 'mm::Pmm')['direct_map_']['layout_']
-delta = int(direct['virtual_base']['value_']) - int(direct['physical_base']['value_'])
+direct = manual(state['pmm_'], 'mm::Pmm')['window_']
+delta = int(direct['va']['value_']) - int(direct['pa']['value_'])
 inferior = gdb.selected_inferior()
 def physical(address, size):
     return bytes(inferior.read_memory(address + delta, size))

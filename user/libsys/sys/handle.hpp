@@ -279,13 +279,12 @@ struct SyscallBackend final {
         myos_word_t address,
         myos_word_t size,
         myos_word_t access,
-        myos_word_t types,
         myos_word_t rights) noexcept -> SysResult {
         if (!current(vspace)) {
             return bad_args();
         }
         return ::myos::vm_slice(
-            vspace.selector, address, size, access, types, rights);
+            vspace.selector, address, size, access, rights);
     }
 
     [[nodiscard]] static auto vm_map(
@@ -496,16 +495,15 @@ struct MappedMemory final {
     }
 
     [[nodiscard]] static auto map(myos_cap_t vspace, cap::OwnedCap&& memory,
-        uintptr_t address, size_t size, myos_word_t access,
-        myos_word_t type = MYOS_VM_NORMAL) noexcept -> std::expected<MappedMemory, myos_status_t> {
-        return map_impl(vspace, std::move(memory), address, size, access, type, false);
+        uintptr_t address, size_t size, myos_word_t access) noexcept -> std::expected<MappedMemory, myos_status_t> {
+        return map_impl(vspace, std::move(memory), address, size, access, false);
     }
 
     // The source stays immutable; the first write to each page belongs to this mapping.
     [[nodiscard]] static auto map_private(myos_cap_t vspace, cap::OwnedCap&& source,
         uintptr_t address, size_t size) noexcept -> std::expected<MappedMemory, myos_status_t> {
         return map_impl(vspace, std::move(source), address, size,
-            MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, false, MYOS_VM_MAP_PRIVATE);
+            MYOS_VM_READ | MYOS_VM_WRITE, false, MYOS_VM_MAP_PRIVATE);
     }
 
     [[nodiscard]] static auto create(myos_cap_t pool, myos_cap_t vspace,
@@ -513,7 +511,7 @@ struct MappedMemory final {
         const auto memory = memory_create(pool, size, MYOS_VM_READ | MYOS_VM_WRITE);
         if (memory.status != MYOS_STATUS_OK) return std::unexpected(memory.status);
         return map_impl(vspace, cap::OwnedCap{{memory.value, 0}}, address, size,
-            MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, true);
+            MYOS_VM_READ | MYOS_VM_WRITE, true);
     }
 
 private:
@@ -531,12 +529,12 @@ private:
         owns_memory_ = std::exchange(other.owns_memory_, false);
     }
     static auto map_impl(myos_cap_t vspace, cap::OwnedCap&& memory,
-        uintptr_t address, size_t size, myos_word_t access, myos_word_t type,
+        uintptr_t address, size_t size, myos_word_t access,
         bool owns_memory, myos_word_t flags = 0) noexcept -> std::expected<MappedMemory, myos_status_t> {
         MappedMemory result;
         result.memory = std::move(memory);
         result.owns_memory_ = owns_memory;
-        const auto region = vm_slice(vspace, address, size, access, type,
+        const auto region = vm_slice(vspace, address, size, access,
             MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
         if (region.status != MYOS_STATUS_OK) return std::unexpected(region.status);
         result.region = cap::OwnedCap{{region.value, 0}};

@@ -1,4 +1,5 @@
 #pragma once
+#include <libk/inplace_vector.hpp>
 #include <base/types.hpp>
 #include <compare>
 #include <concepts>
@@ -204,26 +205,18 @@ using ObjectRange = Range<usize>;
 class Map;
 using MapId = libk::key<Map>;
 
-// CPU mapping request. Native preserves the platform PMA, for RAM or devices.
-enum class CpuAttr : u8 { Native, Nc, Io };
-
-enum class MemoryType : u8 {
-    Normal,
-    Uncached,
-    Device,
+struct Region {
+    enum class Kind : u8 { Ram, Boot, Kernel, Firmware, Mmio };
+    Pages range{};
+    Kind kind{Kind::Mmio};
+    constexpr bool valid() const noexcept { return range.valid(); }
+    constexpr bool is_ram() const noexcept { return kind != Kind::Mmio; }
+    constexpr bool is_reclaimable() const noexcept { return kind == Kind::Boot; }
 };
 
-[[nodiscard]] constexpr auto type_bit(MemoryType type) noexcept -> u8 {
-    return static_cast<u8>(u8{1} << std::to_underlying(type));
-}
+inline constexpr usize max_regions = 32;
+using RegionList = libk::InplaceVector<Region, max_regions>;
 
-using MemoryTypes = libk::enum_flags<MemoryType, type_bit>;
-
-[[nodiscard]] constexpr auto valid_memory_types(MemoryTypes types) noexcept -> bool {
-    constexpr u8 valid =
-        MemoryTypes::of(MemoryType::Normal, MemoryType::Uncached, MemoryType::Device).raw();
-    return !types.empty() && (types.raw() & ~valid) == 0;
-}
 
 enum class Perm : u8 {
     Read = u8{1} << 0,
@@ -233,10 +226,10 @@ enum class Perm : u8 {
 
 using Perms = libk::enum_flags<Perm>;
 
-[[nodiscard]] constexpr auto valid_perms(Perms access) noexcept -> bool {
+[[nodiscard]] constexpr auto valid_perms(Perms perms) noexcept -> bool {
     constexpr u8 valid = Perms::of(Perm::Read, Perm::Write, Perm::Execute).raw();
-    return !access.empty() && (access.raw() & ~valid) == 0 &&
-           (!access.contains(Perm::Write) || access.contains(Perm::Read));
+    return !perms.empty() && (perms.raw() & ~valid) == 0 &&
+           (!perms.contains(Perm::Write) || perms.contains(Perm::Read));
 }
 
 } // namespace mm

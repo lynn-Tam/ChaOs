@@ -14,6 +14,8 @@
 #include <optional>
 #include <sync.hpp>
 #include <utility>
+#include <variant>
+#include <libk/intrusive_tree.hpp>
 #include <wait.hpp>
 
 class Thread;
@@ -116,23 +118,17 @@ struct WaitQueue final {
 struct Extent final {
     ObjectRange object{};
     Pages physical{};
-    Perms access{};
+    Perms perms{};
 };
 
 struct AnonCfg final {
-    Perms access{Perms::of(Perm::Read, Perm::Write)};
+    Perms perms{Perms::of(Perm::Read, Perm::Write)};
     bool eager{};
-};
-
-enum class BootOwnership : u8 {
-    Borrowed,
-    Owned,
 };
 
 enum class BackingKind : u8 {
     Anonymous,
     Physical,
-    Boot,
     Pager,
 };
 
@@ -145,8 +141,7 @@ enum class ContentState : u8 {
 
 struct Frame final {
     Page page{};
-    Perms access{};
-    MemoryType type{MemoryType::Normal};
+    Perms perms{};
 };
 
 class Mem;
@@ -156,7 +151,7 @@ enum class MemErr : u8 {
     InvalidSize,
     InvalidRange,
     InvalidAccess,
-    InvalidMemoryType,
+    NotRam,
     InvalidState,
     OutOfMemory,
     ResourceExhausted,
@@ -171,7 +166,6 @@ enum class MemErr : u8 {
 };
 
 enum class MemState : u8 {
-    Building,
     Live,
     Stopping,
     Retired,
@@ -278,7 +272,7 @@ class MemLink final : private libk::noncopyable_nonmovable {
     const MemOps* ops_{};
     libk::Atomic<usize> work_{};
     libk::Atomic<u8> state_{static_cast<u8>(State::Idle)};
-    Perms access_{};
+    Perms perms_{};
 };
 
 // Owns one Mem operation pin through the caller or installed PTE lifetime.
@@ -290,16 +284,17 @@ class PageHold final : private libk::noncopyable {
     ~PageHold() noexcept = default;
 
     [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(h_); }
-    [[nodiscard]] auto page() const noexcept -> Frame { return h_.get().page; }
+    [[nodiscard]] auto page() const noexcept -> Page { return h_.get().frame.page; }
+    [[nodiscard]] auto perms() const noexcept -> Perms { return h_.get().frame.perms; }
     void reset() noexcept { h_.reset(); }
 
   private:
     friend class Mem;
-    PageHold(Mem& owner, Frame page) noexcept : h_(Data{&owner, page}) {}
+    PageHold(Mem& owner, Frame frame) noexcept : h_(Data{&owner, frame}) {}
 
     struct Data {
         Mem* owner{};
-        Frame page{};
+        Frame frame{};
         static auto empty() noexcept -> Data { return {}; }
         static bool is_empty(const Data& d) noexcept { return !d.owner; }
     };
@@ -309,19 +304,108 @@ class PageHold final : private libk::noncopyable {
     libk::unique_handle<Data, Drop, Data> h_{};
 };
 
-class Mem final : private libk::noncopyable_nonmovable {
-  public:
-    Mem(Pmm& pmm, usize byte_size) noexcept;
-    ~Mem() noexcept;
+struct PagerData {
+    Pager::Request request;
+    WaitQueue waiters;
+    u64 dirty_epoch{}, usage_epoch{};
+    bool failed{}, write_failed{};
+    ~PagerData() noexcept { libk_assert(!request.pager && waiters.waiters.empty()); }
+};
 
-    [[nodiscard]] auto init_anon(AnonCfg config) noexcept -> std::expected<void, MemErr>;
-    [[nodiscard]] auto init_phys(libk::Span<const Extent> extents) noexcept -> std::expected<void, MemErr>;
-    [[nodiscard]] auto init_boot(libk::Span<const Extent> extents, BootOwnership ownership,
-                                 PageGroup&& owned = {}) noexcept -> std::expected<void, MemErr>;
-    // The structural reference keeps the Pager payload alive for the whole
-    // backing lifetime.
-    [[nodiscard]] auto init_paged(object::ref<>&& pager, Perms access, bool private_content = false) noexcept
+template<class Extra = std::monostate> class Cache {
+    static constexpr bool is_paged = std::same_as<Extra, PagerData>;
+    struct Node : Extra {
+        explicit Node(usize i) noexcept : index(i) {}
+        usize index;
+        resource::Charge charge;
+        OwnedPage resident;
+        libk::IntrusiveTreeHook hook;
+    };
+    struct Compare {
+        bool operator()(const Node& a, const Node& b) const noexcept { return a.index < b.index; }
+        bool operator()(usize a, const Node& b) const noexcept { return a < b.index; }
+        bool operator()(const Node& a, usize b) const noexcept { return a.index < b; }
+    };
+    struct Drop { Cache* cache; void operator()(Node*& n) noexcept { cache->rows_.destroy(*n); } };
+    using Row = libk::unique_handle<Node*, Drop>;
+    struct PagerCfg { Pager* pager; bool priv; };
+  public:
+    Cache(Pmm&, Perms, Pager* = nullptr, bool = false) noexcept;
+    Cache(const Cache&) = delete;
+    Cache(Cache&&) noexcept;
+    ~Cache() noexcept;
+    auto query(usize) const noexcept -> ContentState;
+    auto materialize(Mem&, usize, WaitRelation*, void*, WaitRelation::Publish) noexcept
+        -> std::expected<Frame, MemErr>;
+    auto allocate(const object::ref<>&, usize) noexcept -> std::expected<Frame, MemErr> requires (!is_paged);
+    auto begin_transfer(usize) noexcept -> std::expected<OwnedPage, MemErr> requires (!is_paged);
+    auto restore_transfer(usize, OwnedPage&&) noexcept -> std::expected<void, MemErr> requires (!is_paged);
+    auto commit_transfer(usize) noexcept -> std::expected<void, MemErr> requires (!is_paged);
+    void stop(Mem&) noexcept requires is_paged;
+    auto cancel_fault(WaitRelation&, u64) noexcept -> bool requires is_paged;
+    auto supply(Mem&, Pager&, u64, OwnedPage&&) noexcept -> std::expected<void, MemErr> requires is_paged;
+    auto finish(Mem&, Pager&, u64, bool) noexcept -> std::expected<void, MemErr> requires is_paged;
+    void complete(Pager::Reply&, bool) noexcept requires is_paged;
+    auto observe_usage(usize, bool, bool) noexcept -> std::expected<void, MemErr> requires is_paged;
+    auto writeback(usize) noexcept -> std::expected<void, MemErr> requires is_paged;
+    auto trim(ObjectRange) noexcept -> std::expected<void, MemErr> requires is_paged;
+  private:
+    auto make(const object::ref<>&, usize) noexcept -> std::expected<Row, MemErr>;
+    static auto charge_page(const object::ref<>&) noexcept -> std::expected<resource::Charge, MemErr>;
+    void publish_waiters(Node&, WaitRc) noexcept requires is_paged;
+    auto writeback_locked(Node&) noexcept -> bool requires is_paged;
+    Pmm* pmm_;
+    Perms perms_;
+    mutable sync::Spin tree_lock_;
+    libk::IntrusiveTree<Node, &Node::hook, Compare> nodes_;
+    Slab<Node, false, false> rows_;
+    [[no_unique_address]] std::conditional_t<is_paged, PagerCfg, std::monostate> cfg_{};
+};
+using Anon = Cache<>;
+using Paged = Cache<PagerData>;
+
+class Extents {
+    struct Row { explicit Row(Extent e) noexcept : extent(e) {} Extent extent; Row* next{}; };
+  public:
+    explicit Extents(Pmm&) noexcept;
+    Extents(const Extents&) = delete;
+    Extents(Extents&&) noexcept;
+    ~Extents() noexcept;
+    auto initialize(const object::ref<>&, libk::Span<const Extent>, PageGroup&&) noexcept
         -> std::expected<void, MemErr>;
+    auto query(usize) const noexcept -> ContentState;
+    auto materialize(usize) const noexcept -> std::expected<Frame, MemErr>;
+  private:
+    auto find(usize) const noexcept -> const Extent*;
+    void reset() noexcept;
+    Slab<Row, false> rows_;
+    Row* head_{};
+    PageGroup owned_{};
+};
+
+struct PhysCfg { libk::Span<const Extent> extents; PageGroup owned; };
+struct PagedCfg { object::ref<> pager; Perms perms; bool priv{}; };
+
+class Mem final : private libk::noncopyable_nonmovable {
+    using Store = std::variant<Anon, Paged, Extents>;
+  public:
+    using Config = std::variant<AnonCfg, PhysCfg, PagedCfg>;
+    class Data {
+        friend class Mem;
+        Data(Pmm& pmm, usize pages) noexcept : pmm_(&pmm), pages_(pages) {}
+        object::ref<> payer_, pager_;
+        Pmm* pmm_;
+        usize pages_;
+        Perms perms_;
+        std::optional<Store> store_;
+      public:
+        Data(Data&&) noexcept = default;
+        Data(const Data&) = delete;
+    };
+    static auto prepare(const object::ref<>& payer, Pmm&, usize, Config) noexcept
+        -> std::expected<Data, MemErr>;
+    explicit Mem(Data&&) noexcept;
+    ~Mem() noexcept;
 
     [[nodiscard]] auto size() const noexcept -> usize { return logical_pages_ * page_size; }
     [[nodiscard]] auto page_count() const noexcept -> usize { return logical_pages_; }
@@ -355,7 +439,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         -> std::expected<void, MemErr>;
     [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept -> std::expected<void, MemErr>;
 
-    [[nodiscard]] auto attach(MemLink& attachment, Perms access) noexcept -> std::expected<void, MemErr>;
+    [[nodiscard]] auto attach(MemLink& attachment, Perms perms) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
     void retire(object::cleanup&& cleanup = {}) noexcept;
 
@@ -365,7 +449,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     friend class PageTransfer;
     friend class MemLink;
     friend class MemWork;
-    friend class Paged;
+    template<class> friend class Cache;
     friend class ::Pager;
     friend class ::Pager::Claims;
     friend class PageReq;
@@ -388,13 +472,6 @@ class Mem final : private libk::noncopyable_nonmovable {
         void release() noexcept { mem_ = nullptr; }
     };
 
-    struct Store;
-
-    [[nodiscard]] auto initialize_backing(BackingKind kind, libk::Span<const Extent> extents,
-                                          AnonCfg anonymous, BootOwnership boot_ownership,
-                                          PageGroup&& boot_pages, Pager* pager, Perms pager_access,
-                                          object::ref<>&& pager_ref, bool private_content = false) noexcept
-        -> std::expected<void, MemErr>;
     [[nodiscard]] auto materialize_impl(usize page_index, WaitRelation* relation, void* owner,
                                         WaitRelation::Publish publish) noexcept
         -> std::expected<PageHold, MemErr>;
@@ -408,13 +485,10 @@ class Mem final : private libk::noncopyable_nonmovable {
     void finish_trim() noexcept;
     void invalidate(ObjectRange) noexcept;
     void stop() noexcept;
-    void fail_build() noexcept;
-    void bind_sponsor(resource::Sponsorship& sponsor) noexcept;
-    [[nodiscard]] auto reserve_dynamic(resource::budget charge) noexcept
-        -> std::expected<resource::Reservation, MemErr>;
     void request_pin() noexcept;
     void request_drop() noexcept;
     void cancel_request(Pager::Reply&) noexcept;
+    object::ref<> payer_{};
     Pmm* pmm_{};
     usize logical_pages_{};
     mutable sync::Spin lock_{};
@@ -422,21 +496,18 @@ class Mem final : private libk::noncopyable_nonmovable {
     std::optional<ObjectRange> trimming_{};
     WaitQueue trim_waiters_{};
     bool trim_walk_{};
-    Store* store_{};
-    OwnedPage backing_page_{};
-    resource::Sponsorship backing_sponsorship_{};
+    std::optional<Store> store_{};
     usize operations_{};
     libk::Atomic<usize> request_pins_{};
-    MemState state_{MemState::Building};
+    MemState state_{MemState::Live};
     object::cleanup cleanup_{};
     SealState seal_{SealState::Loadable};
     ContentEpoch content_epoch_{};
-    Perms access_{};
+    Perms perms_{};
     object::ref<> pager_ref_{};
     bool releasing_{};
     // Closes page request admission before retirement scans the backing.
     libk::Atomic<bool> work_open_{true};
-    resource::Sponsorship* sponsor_{};
 };
 
 // One content completion, owned by the blocked call's stack.

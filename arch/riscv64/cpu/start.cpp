@@ -1,23 +1,17 @@
 #include <expected>
 #include "arch/riscv64/cpu/start_context.hpp"
-#include "arch/riscv64/sbi/base.hpp"
-#include "arch/riscv64/sbi/hsm.hpp"
+#include <sbi.hpp>
+#include <arch/interrupt.hpp>
+#include <arch/system.hpp>
 
 #include <arch/cpu.hpp>
-#include <boot/link.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/runtime.hpp>
-#include <mm/phys.hpp>
 
 namespace arch::riscv64 {
 
-void CpuStartContext::initialize(
-    CpuHwId hardware_id,
-    usize root,
-    usize init_stack_top,
-    CpuRuntime& runtime,
-    SecondaryContinuation entry) noexcept {
+void CpuStartContext::initialize(CpuHwId hardware_id, usize root, usize init_stack_top, CpuRuntime& runtime,
+                                 SecondaryContinuation entry) noexcept {
     libk_assert(!ready());
     libk_assert(init_stack_top != 0);
     libk_assert((init_stack_top & 0xfU) == 0);
@@ -35,63 +29,40 @@ void CpuStartContext::initialize(
 }
 
 auto CpuStartContext::ready() const noexcept -> bool {
-    return publication_.load<libk::MemoryOrder::Acquire>()
-        == RISCV64_CPU_START_READY;
+    return publication_.load<libk::MemoryOrder::Acquire>() == RISCV64_CPU_START_READY;
 }
 
 } // namespace arch::riscv64
 
 namespace arch {
 
-namespace {
+auto secondary_start_available() noexcept -> bool { return sbi::probe(sbi::Ext::Hsm); }
 
-[[nodiscard]] constexpr auto start_error(isize error) noexcept
-    -> CpuStartError {
-    switch (error) {
-    case riscv64::sbi::not_supported:
-        return CpuStartError::NotSupported;
-    case riscv64::sbi::invalid_parameter:
-        return CpuStartError::InvalidHardwareId;
-    case riscv64::sbi::invalid_address:
-        return CpuStartError::InvalidEntryAddress;
-    case riscv64::sbi::already_started:
-    case riscv64::sbi::already_available:
-        return CpuStartError::AlreadyStarted;
-    default:
-        return CpuStartError::Rejected;
-    }
-}
-
-} // namespace
-
-auto secondary_start_available() noexcept -> bool {
-    return riscv64::sbi::extension_available(riscv64::sbi::hsm_extension_id);
-}
-
-auto start_secondary(
-    CpuHwId hardware_id,
-    CpuStartContext& context,
-    const mm::DirectMap& direct_map) noexcept
+auto start_secondary(CpuHwId hardware_id, usize entry, usize record) noexcept
     -> std::expected<void, CpuStartError> {
-    libk_assert(context.ready());
+    if (!record || (entry & 0x3U) != 0) return std::unexpected(CpuStartError::InvalidEntryAddress);
 
-    const usize entry = secondary_pages().base().base().raw();
-    const auto record = direct_map.unmap(
-        mm::Virt{reinterpret_cast<usize>(&context)}, sizeof(context));
-    if (!record || (entry & 0x3U) != 0) {
+    const auto result = sbi::call(sbi::Ext::Hsm, 0, hardware_id.raw, entry, record);
+    if (result) return {};
+    switch (result.error()) {
+    case sbi::Unsupported:
+        return std::unexpected(CpuStartError::NotSupported);
+    case sbi::Invalid:
+        return std::unexpected(CpuStartError::InvalidHardwareId);
+    case sbi::BadAddr:
         return std::unexpected(CpuStartError::InvalidEntryAddress);
+    case sbi::Started:
+    case sbi::Available:
+        return std::unexpected(CpuStartError::AlreadyStarted);
+    default:
+        return std::unexpected(CpuStartError::Rejected);
     }
-
-    const auto result = riscv64::sbi::hart_start(
-        hardware_id.raw, entry, record.value().raw());
-    if (result.error == riscv64::sbi::success) {
-        return {};
-    }
-    return std::unexpected(start_error(result.error));
 }
 
-void wait_for_interrupt() noexcept {
-    asm volatile("wfi" ::: "memory");
-}
+void wait_for_interrupt() noexcept { asm volatile("wfi" ::: "memory"); }
 
+[[noreturn]] void halt_current_cpu([[maybe_unused]] HaltReason reason) noexcept {
+    static_cast<void>(disable_interrupts());
+    for (;;) wait_for_interrupt();
+}
 } // namespace arch

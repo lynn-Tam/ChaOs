@@ -202,9 +202,9 @@ struct Module final {
     if (!file) {
         return std::unexpected(BundleError::InvalidSegment);
     }
-    const mm::Perms access =
+    const mm::Perms perms =
         mm::Perms::from_raw(static_cast<u8>(access_bits));
-    if (!mm::valid_perms(access)) {
+    if (!mm::valid_perms(perms)) {
         return std::unexpected(BundleError::InvalidSegment);
     }
     return (BundleSegment{
@@ -212,7 +212,7 @@ struct Module final {
         .file = file.value(),
         .memory_size = static_cast<usize>(memory_size),
         .alignment = static_cast<usize>(alignment),
-        .access = access,
+        .perms = perms,
     });
 }
 
@@ -346,7 +346,7 @@ auto parse_bundle(libk::ByteSpan bytes) noexcept
             if (module.entry() >= segment.virtual_address
                 && module.entry() - segment.virtual_address
                     < segment.memory_size
-                && segment.access.contains(mm::Perm::Execute)) {
+                && segment.perms.contains(mm::Perm::Execute)) {
                 entry_covered = true;
             }
         }

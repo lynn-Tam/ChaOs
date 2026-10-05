@@ -27,14 +27,11 @@ public:
         auto ppn = encode(page);
         return ppn ? std::optional{Pte{*ppn | Valid}} : std::nullopt;
     }
-    // PBMT=0 inherits PMA. Explicit overrides need Svpbmt and firmware enable;
-    // neither is negotiated yet, so reject them instead of silently dropping them.
-    static constexpr bool supports(mm::CpuAttr attr) noexcept { return attr == mm::CpuAttr::Native; }
-    static constexpr auto leaf_4k(mm::Page page, PtPerm perms, bool warm = true,
-                                  mm::CpuAttr attr = mm::CpuAttr::Native) noexcept
+    // PBMT stays zero: CPU accesses inherit platform PMAs. No cache override API.
+    static constexpr auto leaf_4k(mm::Page page, PtPerm perms, bool warm = true) noexcept
         -> std::optional<Pte> {
         auto ppn = encode(page);
-        return ppn && supports(attr) ? std::optional{Pte{*ppn | (u64(perms) << 1) | Valid | (warm ? Used : 0)}}
+        return ppn ? std::optional{Pte{*ppn | (u64(perms) << 1) | Valid | (warm ? Used : 0)}}
                    : std::nullopt;
     }
     auto load() const noexcept -> Pte {

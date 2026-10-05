@@ -52,15 +52,13 @@ arch_sources = files(
   'arch/riscv64/cpu/local_entry.cpp', 'arch/riscv64/cpu/ipi.cpp',
   'arch/riscv64/cpu/instruction.cpp', 'arch/riscv64/cpu/start.cpp',
   'arch/riscv64/cpu/secondary_entry.S', 'arch/riscv64/context/kernel_context.cpp',
-  'arch/riscv64/context/kernel_context.S', 'arch/riscv64/sbi/call.cpp',
-  'arch/riscv64/sbi/console.cpp', 'arch/riscv64/sbi/system.cpp',
+  'arch/riscv64/context/kernel_context.S', 'arch/riscv64/sbi.cpp',
   'arch/riscv64/time/clock.cpp', 'arch/riscv64/time/timer.cpp',
   'arch/riscv64/uart/uart.cpp', 'arch/riscv64/irq/plic.cpp',
   'platform/riscv-virt/pci.cpp', 'platform/riscv-virt/dma.cpp',
   'arch/riscv64/iommu/iommu.cpp', 'platform/riscv-virt/board.cpp',
   'arch/riscv64/mmu/pte.cpp', 'kernel/mm/table.cpp',
-  'arch/riscv64/trap/trap.S', 'arch/riscv64/trap/context.cpp',
-  'arch/riscv64/trap/event.cpp', 'arch/riscv64/trap/trap.cpp', 'arch/riscv64/trap/user.cpp',
+  'arch/riscv64/trap.S', 'arch/riscv64/trap.cpp',
 )
 
 core_kernel_sources = files(
@@ -84,7 +82,7 @@ core_kernel_sources = files(
   'kernel/syscall/ipc.cpp', 'kernel/time/clock.cpp',
   'kernel/task/exit.cpp',
   'kernel/mm/mem.cpp', 'kernel/mm/vspace.cpp',
-  'kernel/mm/kspace.cpp', 'kernel/mm/tlb.cpp', 'kernel/mm/phys.cpp',
+  'kernel/mm/kspace.cpp', 'kernel/mm/tlb.cpp',
   'kernel/mm/pmm.cpp',
   'libk/mem.c',
 )

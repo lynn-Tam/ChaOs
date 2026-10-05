@@ -14,8 +14,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     const auto output = service::capability(info, myos::bootstrap::imports::ConsoleOutput);
     const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
     constexpr uintptr_t base = 0x30010000;
-    auto region = vm_slice(vspace, base, 4096, MYOS_VM_READ | MYOS_VM_WRITE,
-                                   MYOS_VM_DEVICE, MYOS_RIGHT_MAP);
+    auto region = vm_slice(vspace, base, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP);
     service::require(region.status);
     service::require(vm_map(region.value, device, base, 4096, 0,
                             MYOS_VM_READ | MYOS_VM_WRITE).status);

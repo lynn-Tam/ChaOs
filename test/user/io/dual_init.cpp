@@ -24,7 +24,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     if (info.device_count() != 2) exit(MYOS_STATUS_NOT_FOUND);
     auto mapping = MappedMemory::map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
         cap::OwnedCap{{service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0}},
-        0x30010000, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE);
+        0x30010000, 4096, MYOS_VM_READ | MYOS_VM_WRITE);
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping->address};
     port.reset();

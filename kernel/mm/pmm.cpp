@@ -1,11 +1,9 @@
 #include <algorithm>
 #include <expected>
 #include <mm/pmm.hpp>
-#include <mmu/pte.hpp>
 #include <optional>
 
 #include <base/types.hpp>
-#include <libk/algorithm.hpp>
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/memory.hpp>
@@ -139,7 +137,7 @@ auto BootPages::range() const noexcept -> Pages {
 }
 
 auto Pmm::initialize_in(libk::ManualLifetime<Pmm>& storage, RegionList&& memory_map,
-                        DirectMap::Layout layout) noexcept -> InitializationResult {
+                        Window layout) noexcept -> InitializationResult {
     Pmm& memory = storage.emplace(ConstructionKey{}, std::move(memory_map), layout);
     auto result = memory.initialize();
 
@@ -157,14 +155,12 @@ auto Pmm::initialize() noexcept -> InitializationResult {
     }
 
     for (const auto& region : memory_) {
-        if (!arch::Pte::supports(region.attr)) return std::unexpected(PmmInitError::BadAttr);
         if (!region.valid()) {
             return std::unexpected(PmmInitError::InvalidRegion);
         }
     }
 
-    libk::insertion_sort(
-        memory_, [](const auto& lhs, const auto& rhs) { return lhs.range.base() < rhs.range.base(); });
+    std::ranges::sort(memory_, {}, [](const Region& r) { return r.range.base(); });
 
     for (size_t index = 1; index < memory_.size(); ++index) {
         if (memory_[index - 1].range.intersects(memory_[index].range)) {
@@ -205,7 +201,12 @@ auto Pmm::initialize() noexcept -> InitializationResult {
         return std::unexpected(PmmInitError::NoRam);
     }
 
-    if (!direct_map_.valid()) return std::unexpected(PmmInitError::OutsideWindow);
+    const auto end = window_.pa.checked_add(window_.size);
+    if (!window_.size || !window_.va.valid() || !end || !window_.va.checked_add(window_.size))
+        return std::unexpected(PmmInitError::OutsideWindow);
+    for (auto r : ram())
+        if (r.base().base() < window_.pa || r.limit()->base() > *end)
+            return std::unexpected(PmmInitError::OutsideWindow);
 
     for (auto& arena : arenas_) {
         const auto bytes = libk::checked_multiply(arena.range.page_count(), sizeof(Desc));
@@ -285,20 +286,17 @@ auto Pmm::initialize() noexcept -> InitializationResult {
     return {};
 }
 
-// Immutable inventory is the attribute authority, including external MMIO.
-// Adjacent inventory records may cover one range only with the same CPU attribute.
-auto Pmm::attr_of(Pages range) const noexcept -> std::optional<CpuAttr> {
-    if (!range.valid()) return std::nullopt;
+// Includes external resources; allocator ownership remains a separate fact.
+bool Pmm::covers(Pages range) const noexcept {
+    if (!range.valid()) return false;
     auto at = range.base();
-    std::optional<CpuAttr> attr;
     for (const auto& r : memory_) {
         if (*r.range.limit() <= at) continue;
-        if (at < r.range.base() || (attr && *attr != r.attr)) return std::nullopt;
-        attr = r.attr;
-        if (*range.limit() <= *r.range.limit()) return attr;
+        if (at < r.range.base()) return false;
+        if (*range.limit() <= *r.range.limit()) return true;
         at = *r.range.limit();
     }
-    return std::nullopt;
+    return false;
 }
 
 Pmm::~Pmm() noexcept {
@@ -308,13 +306,39 @@ Pmm::~Pmm() noexcept {
     libk_assert(issued_reservations_ == 0);
 }
 
+bool Pmm::is_ram(Pages r) const noexcept {
+    // Arenas are the immutable, coalesced RAM projection of memory_.
+    return r.valid() && std::ranges::any_of(arenas_, [&](const Arena& a) { return a.range.contains(r); });
+}
+
+auto Pmm::virt(Phys address, usize size) const noexcept -> std::optional<Virt> {
+    auto r = Pages::covering_bytes(address, size);
+    if (!r) return std::nullopt;
+    if (!is_ram(*r)) return std::nullopt;
+    auto offset = window_.pa.checked_distance_to(address);
+    if (!offset || *offset > window_.size || size > window_.size - *offset)
+        return std::nullopt;
+    return window_.va.checked_add(*offset);
+}
+
+auto Pmm::phys(Virt address, usize size) const noexcept -> std::optional<Phys> {
+    auto offset = window_.va.checked_distance_to(address);
+    if (!offset || *offset > window_.size || size > window_.size - *offset)
+        return std::nullopt;
+    auto pa = window_.pa.checked_add(*offset);
+    if (!pa) return std::nullopt;
+    auto r = Pages::covering_bytes(*pa, size);
+    if (!r || !is_ram(*r)) return std::nullopt;
+    return *pa;
+}
+
 auto Pmm::descriptor_at(Arena& arena, usize index) noexcept -> Desc& {
     libk_assert((index != Nil) && index < arena.range.page_count());
     const auto bytes = libk::checked_multiply(index, sizeof(Desc));
     libk_assert(bytes.has_value());
     const auto address = arena.descriptor_storage.base().base().checked_add(bytes.value());
     libk_assert(address.has_value());
-    auto descriptor = direct_map_.ptr<Desc>(address.value());
+    auto descriptor = ptr<Desc>(address.value());
     libk_assert(descriptor);
     return *descriptor.value();
 }
@@ -325,21 +349,19 @@ auto Pmm::descriptor_at(const Arena& arena, usize index) const noexcept -> const
     libk_assert(bytes.has_value());
     const auto address = arena.descriptor_storage.base().base().checked_add(bytes.value());
     libk_assert(address.has_value());
-    auto descriptor = direct_map_.ptr<const Desc>(address.value());
+    auto descriptor = ptr<const Desc>(address.value());
     libk_assert(descriptor);
     return *descriptor.value();
 }
 
 auto Pmm::bytes(Page page) noexcept -> byte* {
-    libk_assert(direct_map_);
-    auto mapped = direct_map_.ptr<byte>(page.base(), page_size);
+    auto mapped = ptr<byte>(page.base(), page_size);
     libk_assert(mapped);
     return mapped.value();
 }
 
 auto Pmm::bytes(Page page) const noexcept -> const byte* {
-    libk_assert(direct_map_);
-    auto mapped = direct_map_.ptr<const byte>(page.base(), page_size);
+    auto mapped = ptr<const byte>(page.base(), page_size);
     libk_assert(mapped);
     return mapped.value();
 }

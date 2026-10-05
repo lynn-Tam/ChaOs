@@ -129,14 +129,28 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     template <typename... Args>
-    [[nodiscard]] auto create(Args&&... args) noexcept -> std::expected<pending, error> {
+    [[nodiscard]] auto create(Args&&... args) noexcept {
         return create(resource::Reservation{}, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    [[nodiscard]] auto create(resource::Reservation&& sponsorship, Args&&... args) noexcept
-        -> std::expected<pending, error> {
+    [[nodiscard]] auto create(resource::Reservation&& charge, Args&&... args) noexcept {
+        if constexpr (requires { T::prepare(charge.payer(), std::forward<Args>(args)...); }) {
+            auto data = T::prepare(charge.payer(), std::forward<Args>(args)...);
+            using Err = typename decltype(data)::error_type;
+            using Result = std::expected<pending, Err>;
+            if (!data) return Result{std::unexpected(data.error())};
+            auto made = construct(std::move(charge), std::move(*data));
+            if (!made) return Result{std::unexpected(made.error() == error::exhausted
+                ? Err::GenerationExhausted : Err::OutOfMemory)};
+            return Result{std::move(*made)};
+        } else return construct(std::move(charge), std::forward<Args>(args)...);
+    }
 
+  private:
+    template <typename... Args>
+    auto construct(resource::Reservation&& sponsorship, Args&&... args) noexcept
+        -> std::expected<pending, error> {
         auto claimed = claim_slot();
         if (!claimed) {
             return std::unexpected(claimed.error());
@@ -152,20 +166,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return (pending{*this, *slot});
     }
 
-    // Initialization and its failure are owned by the unpublished slot.
-    template <class Init, class... Args>
-    auto make(resource::Reservation charge, Init&& init, Args&&... args) noexcept {
-        using Error = typename decltype(init(std::declval<T&>()))::error_type;
-        using Result = std::expected<pending, Error>;
-        auto made = create(std::move(charge), std::forward<Args>(args)...);
-        if (!made)
-            return Result{std::unexpected(made.error() == error::exhausted ? Error::GenerationExhausted
-                                                                           : Error::OutOfMemory)};
-        auto ready = init(made->get());
-        if (!ready) return Result{std::unexpected(ready.error())};
-        return Result{std::move(*made)};
-    }
-
+  public:
     [[nodiscard]] auto lookup(ObjectId id) noexcept -> std::expected<reference, error> {
         sync::Lock guard{lock_};
         Slot* const slot = find_slot(id);

@@ -43,7 +43,6 @@ struct FakeBackend final {
         myos_word_t address;
         myos_word_t size;
         myos_word_t access;
-        myos_word_t types;
         myos_word_t rights;
         bool zero;
 
@@ -56,7 +55,6 @@ struct FakeBackend final {
             myos_word_t call_address = 0,
             myos_word_t call_size = 0,
             myos_word_t call_access = 0,
-            myos_word_t call_types = 0,
             myos_word_t call_rights = 0,
             bool call_zero = false) noexcept
             : op(operation),
@@ -65,7 +63,6 @@ struct FakeBackend final {
               address(call_address),
               size(call_size),
               access(call_access),
-              types(call_types),
               rights(call_rights),
               zero(call_zero) {}
     };
@@ -231,7 +228,7 @@ struct FakeBackend final {
             Op::Write,
             {}, {},
             reinterpret_cast<myos_word_t>(destination),
-            static_cast<myos_word_t>(size), 0, 0, 0, source == nullptr});
+            static_cast<myos_word_t>(size), 0, 0, source == nullptr});
         if (fail_write_at != 0 && write_count == fail_write_at) {
             fail_write_at = 0;
             return consume(write_failure);
@@ -252,10 +249,9 @@ struct FakeBackend final {
         myos_word_t address,
         myos_word_t size,
         myos_word_t access,
-        myos_word_t types,
         myos_word_t rights) noexcept -> myos::SysResult {
         record(Call{Op::Region, vspace, {}, address, size,
-            access, types, rights});
+            access, rights});
         const myos_status_t status = consume(next_region);
         if (status != MYOS_STATUS_OK && nonzero_region_failure_cap != 0) {
             const myos_cap_t selector = nonzero_region_failure_cap;
@@ -728,7 +724,7 @@ template<typename Task>
     }
     Materializer materializer{task, bundle, scratch};
     constexpr uint8_t bytes[] = {0x31, 0x32, 0x33, 0x34};
-    Image::Map readonly{};
+    Image::Mapping readonly{};
     deploy::LocalSlot descriptor{};
     const auto readonly_status = materializer.materialize_readonly(
         0x500000, bytes, sizeof(bytes), readonly);
@@ -921,7 +917,7 @@ template<typename Task>
         FakeBackend::next_pager_memory = MYOS_STATUS_BUSY;
         FakeBackend::nonzero_pager_failure_cap = 702;
         Materializer materializer{task, bundle, scratch};
-        Image::Map mapping{};
+        Image::Mapping mapping{};
         const bool result = materializer.materialize_paged(
                 {77, 0}, 0x600000, 0x1000, MYOS_VM_READ, mapping)
                 == MYOS_STATUS_BUSY
@@ -1089,7 +1085,7 @@ template<typename Task>
     }
     Materializer materializer{task_space, bundle, scratch};
     Image image{};
-    Image::Map zero{};
+    Image::Mapping zero{};
     const bool materialized =
         materializer.materialize("init", image) == MYOS_STATUS_OK
         && image.segments.size() == 1
@@ -1116,7 +1112,7 @@ template<typename Task>
     }
     Materializer undersized_materializer{
         undersized_task, undersized_bundle, undersized_scratch};
-    Image::Map rejected{};
+    Image::Mapping rejected{};
     const bool rejected_zero =
         undersized_materializer.materialize_zero(
             0x400000, *requirement,

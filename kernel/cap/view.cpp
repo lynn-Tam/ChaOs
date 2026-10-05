@@ -80,8 +80,7 @@ constexpr Rights irq_rights = Rights::of(
 
 [[nodiscard]] static auto valid(MemLimit limit) noexcept -> bool {
     return limit.range.limit().has_value()
-        && mm::valid_perms(limit.access)
-        && mm::valid_memory_types(limit.types);
+        && mm::valid_perms(limit.perms);
 }
 
 [[nodiscard]] static auto valid(VmLimit limit) noexcept -> bool {
@@ -89,8 +88,7 @@ constexpr Rights irq_rights = Rights::of(
         && !limit.range.empty()
         && (limit.range.base().raw() & (mm::page_size - 1)) == 0
         && (limit.range.size() & (mm::page_size - 1)) == 0
-        && mm::valid_perms(limit.access)
-        && mm::valid_memory_types(limit.types);
+        && mm::valid_perms(limit.perms);
 }
 
 [[nodiscard]] static auto valid(Quota limit) noexcept -> bool {
@@ -123,11 +121,11 @@ static auto valid(Badge p) noexcept -> bool { return p.badge != 0; }
 
 static auto contains(std::monostate, std::monostate) noexcept -> bool { return true; }
 static auto contains(MemLimit a, MemLimit b) noexcept -> bool {
-    return a.range.contains(b.range) && a.access.contains(b.access) && a.types.contains(b.types);
+    return a.range.contains(b.range) && a.perms.contains(b.perms);
 }
 static auto contains(VmLimit a, VmLimit b) noexcept -> bool {
     return a.range.contains(b.range)
-        && a.access.contains(b.access) && a.types.contains(b.types);
+        && a.perms.contains(b.perms);
 }
 static auto contains(Quota a, Quota b) noexcept -> bool {
     return a.budget.contains(b.budget) && (b.object_kinds & ~a.object_kinds) == 0;
@@ -250,18 +248,6 @@ template<class T>
         : std::nullopt;
 }
 
-[[nodiscard]] auto decode_types(u64 raw) noexcept
-    -> std::optional<mm::MemoryTypes> {
-    const auto value = u8_value(raw);
-    if (!value) {
-        return std::nullopt;
-    }
-    const auto types = mm::MemoryTypes::from_raw(*value);
-    return mm::valid_memory_types(types)
-        ? std::optional<mm::MemoryTypes>{types}
-        : std::nullopt;
-}
-
 [[nodiscard]] auto rights_value(u64 raw) noexcept
     -> std::expected<Rights, AttenuationError> {
     const auto rights = Rights::parse(raw, MYOS_RIGHT_MASK);
@@ -369,35 +355,33 @@ auto make_attenuation_ceiling(
         return (View{child_rights, std::monostate{}});
 
     case object::ObjectKind::Mem: {
-        if (!words_zero(descriptor, 4)) {
+        if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
         const auto first = usize_value(descriptor.words[0]);
         const auto count = usize_value(descriptor.words[1]);
         const auto access = decode_access(descriptor.words[2]);
-        const auto types = decode_types(descriptor.words[3]);
         const mm::ObjectRange range{
             first ? *first : 0, count ? *count : 0};
-        if (!first || !count || !access || !types
+        if (!first || !count || !access
             || *count == 0
             || !range.limit()) {
             return std::unexpected(AttenuationError::InvalidRange);
         }
         return (View{
             child_rights,
-            MemLimit{range, *access, *types}});
+            MemLimit{range, *access}});
     }
 
     case object::ObjectKind::VSpace: {
-        if (!words_zero(descriptor, 4)) {
+        if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
         const auto base = usize_value(descriptor.words[0]);
         const auto size = usize_value(descriptor.words[1]);
         const auto access = decode_access(descriptor.words[2]);
-        const auto types = decode_types(descriptor.words[3]);
         const auto* const upper = std::get_if<VmLimit>(&source.data);
-        if (!base || !size || !access || !types || *base == 0 || *size == 0
+        if (!base || !size || !access || *base == 0 || *size == 0
             || (*base % mm::page_size) != 0
             || (*size % mm::page_size) != 0
             || upper == nullptr) {
@@ -410,7 +394,7 @@ auto make_attenuation_ceiling(
         }
         return (View{
             child_rights,
-            VmLimit{range, *access, *types}});
+            VmLimit{range, *access}});
     }
 
     case object::ObjectKind::group: {

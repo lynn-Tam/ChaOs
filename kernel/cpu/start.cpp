@@ -1,9 +1,10 @@
+#include <platform/riscv-virt/board.hpp>
 #include <cpu/start.hpp>
 
 #include <arch/boot_stack.hpp>
 #include <arch/cpu.hpp>
 #include <arch/interrupt.hpp>
-#include <arch/trap.hpp>
+#include <trap.hpp>
 #include <console.hpp>
 #include <irq/irq.hpp>
 #include <state.hpp>
@@ -12,7 +13,7 @@
 #include <cpu/runtime.hpp>
 #include <boot/start.hpp>
 #include <utility>
-#include <mm/phys.hpp>
+#include <boot/link.hpp>
 #include <sched/dispatcher.hpp>
 #if TEST_ENABLED
 #include <test/boot.hpp>
@@ -66,7 +67,7 @@ void install_local_entry(
 
 void start_secondaries(
     CpuRegistry& cpus,
-    const mm::DirectMap& direct_map) noexcept {
+    const mm::Pmm& pmm) noexcept {
     const CpuId boot = cpus.boot_id();
     if (!arch::secondary_start_available()) {
         for (usize index = 0; index < cpus.count(); ++index) {
@@ -95,8 +96,15 @@ void start_secondaries(
 
         CpuRuntime* const runtime = cpus.runtime(id);
         libk_assert(runtime != nullptr);
-        const auto started = arch::start_secondary(
-            cpu->hardware_id(), runtime->start_context, direct_map);
+        libk_assert(runtime->start_context.ready());
+        const auto record = pmm.phys(mm::Virt{reinterpret_cast<usize>(&runtime->start_context)},
+                                     sizeof(runtime->start_context));
+        if (!record) {
+            libk_assert(cpus.fail_start(id, failure_from(arch::CpuStartError::InvalidEntryAddress)));
+            continue;
+        }
+        const auto started = arch::start_secondary(cpu->hardware_id(),
+            secondary_pages().base().base().raw(), record->raw());
         if (!started) {
             libk_assert(cpus.fail_start(id, failure_from(started.error())));
         }
@@ -154,7 +162,7 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     libk_assert(runtime.local.descriptor->logical_id()
         == kernel.cpus().boot_id());
     install_local_entry(runtime, runtime.local.descriptor->hardware_id());
-    arch::start_irqs(runtime.local.descriptor->hardware_id().raw);
+    virt_irq_start(runtime.local.descriptor->hardware_id().raw);
     console::print<"trap install ok\n">();
 
     auto allocation = kernel.pmm().allocate_page();
@@ -168,7 +176,7 @@ void print_snapshot(CpuRegistry& cpus) noexcept {
     libk_assert(kernel.pmm().verify_invariants());
     libk_assert(arch_boot_stack_guard_intact());
 
-    start_secondaries(kernel.cpus(), kernel.direct_map());
+    start_secondaries(kernel.cpus(), kernel.pmm());
     runtime.dispatcher().enter_idle();
 }
 extern "C" [[noreturn]] void kernel_secondary_continue(

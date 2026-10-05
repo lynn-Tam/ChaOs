@@ -4,7 +4,7 @@
 
 
 #include <optional>
-#include <arch/trap.hpp>
+#include <trap.hpp>
 #include <cap/cspace.hpp>
 #include <base/types.hpp>
 #include <libk/span.hpp>
@@ -25,7 +25,7 @@ enum class Disposition : u8 {
     Resume,
 };
 
-[[nodiscard]] auto handle(arch::TrapContext& ctx) noexcept
+[[nodiscard]] auto handle(arch::TrapCtx& ctx) noexcept
     -> Disposition;
 
 
@@ -35,7 +35,7 @@ struct Call final {
     Thread* target;
     cap::CSpace& cspace;
     mm::VSpace& vspace;
-    arch::TrapContext& trap;
+    arch::TrapCtx& trap;
 };
 
 struct Result final {
@@ -84,6 +84,7 @@ template<typename Descriptor>
     }
     return (descriptor);
 }
+[[nodiscard]] auto mem_status(mm::MemErr error) noexcept -> myos_status_t;
 [[nodiscard]] auto vm_status(mm::VSpaceError error) noexcept
     -> myos_status_t;
 [[nodiscard]] auto handle_of(usize raw) noexcept -> cap::Handle;
@@ -91,8 +92,6 @@ template<typename Descriptor>
     -> std::optional<cap::Rights>;
 [[nodiscard]] auto perms_of(usize raw) noexcept
     -> std::optional<mm::Perms>;
-[[nodiscard]] auto types_of(usize raw) noexcept
-    -> std::optional<mm::MemoryTypes>;
 [[nodiscard]] auto range_of(usize base, usize size) noexcept
     -> std::optional<mm::VRange>;
 [[nodiscard]] auto vm_context(CpuLocal& cpu) noexcept -> mm::VmCtx;

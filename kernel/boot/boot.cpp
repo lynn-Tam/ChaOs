@@ -7,8 +7,125 @@
 #include <limits>
 #include <optional>
 #include <utility>
-#include <mm/phys.hpp>
+#include <algorithm>
 #include <boot/link.hpp>
+
+extern "C" {
+extern char kernel_text_start[], kernel_text_end[];
+extern char kernel_rodata_start[], kernel_rodata_end[];
+extern char kernel_data_start[], kernel_data_end[];
+extern char kernel_bss_start[], kernel_bss_end[];
+extern char kernel_bootstack_start[], kernel_bootstack_end[];
+}
+
+auto kernel_root(mm::Pmm& pmm) noexcept -> std::expected<mm::PageTable, mm::PtErr> {
+    using mm::PtPerm;
+    using mm::PtErr;
+    auto root = mm::PageTable::create(pmm, mm::PageTable::Kind::Kernel);
+    if (!root) return std::unexpected(root.error());
+    const struct Section {
+        const char* begin;
+        const char* end;
+        PtPerm perms;
+    } sections[] = {
+        {kernel_text_start, kernel_text_end, PtPerm::Rx},
+        {kernel_rodata_start, kernel_rodata_end, PtPerm::Ro},
+        {kernel_data_start, kernel_data_end, PtPerm::Rw},
+        {kernel_bss_start, kernel_bss_end, PtPerm::Rw},
+        {kernel_bootstack_start, kernel_bootstack_end, PtPerm::Rw},
+    };
+    for (const auto& s : sections) {
+        const usize begin = reinterpret_cast<usize>(s.begin), end = reinterpret_cast<usize>(s.end);
+        libk_assert(begin <= end && begin % mm::page_size == 0 && end % mm::page_size == 0);
+        if (begin == end) continue;
+        auto physical = kernel_phys(mm::Virt{begin});
+        if (!physical) return std::unexpected(PtErr::BadPhys);
+        auto pages = mm::Pages::from_aligned_bytes(*physical, end - begin);
+        if (!pages) return std::unexpected(PtErr::BadPhys);
+        auto installed = root->map(mm::Virt{begin}, *pages, s.perms);
+        if (!installed) return std::unexpected(installed.error());
+    }
+    for (auto pages : pmm.ram()) {
+        auto va = pmm.virt(pages.base().base(), pages.page_count() * mm::page_size);
+        libk_assert(va);
+        auto installed = root->map(*va, pages, PtPerm::Rw);
+        if (!installed) return std::unexpected(installed.error());
+    }
+    // MMIO has the same immutable resource inventory, but is not allocatable RAM.
+    for (const auto& region : pmm.regions()) {
+        if (region.is_ram()) continue;
+        const auto pages = region.range;
+        auto installed = root->map(mm::Virt{mm::DirectBegin + pages.base().base().raw()}, pages, PtPerm::Rw);
+        if (!installed) return std::unexpected(installed.error());
+    }
+    // Secondaries enter physically; these leaves bridge to their high entry.
+    for (auto pages : {boot_pages(), secondary_pages()}) {
+        auto installed = root->map(mm::Virt{pages.base().base().raw()}, pages, PtPerm::Rx);
+        if (!installed) return std::unexpected(installed.error());
+    }
+    return root;
+}
+
+auto BootMap::add_ram(mm::Pages r) noexcept -> std::expected<void, Err> {
+    if (!r.valid()) return std::unexpected(Err::Invalid);
+    if (!input_.try_emplace_back(mm::Region{r, mm::Region::Kind::Ram}))
+        return std::unexpected(Err::Capacity);
+    return {};
+}
+
+auto BootMap::reserve(mm::Pages r, mm::Region::Kind kind) noexcept -> std::expected<void, Err> {
+    if (!r.valid() || kind == mm::Region::Kind::Ram || kind == mm::Region::Kind::Mmio)
+        return std::unexpected(Err::Invalid);
+    if (!input_.try_emplace_back(mm::Region{r, kind}))
+        return std::unexpected(Err::Capacity);
+    return {};
+}
+
+auto BootMap::finish(mm::RegionList& out) && noexcept -> std::expected<void, Err> {
+    out.clear();
+    auto fail = [&](Err e) -> std::expected<void, Err> {
+        out.clear();
+        return std::unexpected(e);
+    };
+    std::ranges::sort(input_, {}, [](const mm::Region& r) { return r.range.base(); });
+    bool found = false;
+    mm::Pages previous{};
+    for (const auto& source : input_) {
+        if (source.kind != mm::Region::Kind::Ram) continue;
+        const auto bank = source.range;
+        if (previous.valid() && previous.intersects(bank)) return fail(Err::Overlap);
+        found = true;
+        previous = bank;
+        auto end = *bank.limit();
+        for (auto p = bank.base(); p < end;) {
+            auto next = end;
+            mm::Region::Kind kind = mm::Region::Kind::Ram;
+            for (const auto& r : input_) {
+                // Ram < Boot < Firmware < Kernel. Keep enum order semantic,
+                // rather than encoding precedence in public classification.
+                auto rank = [](mm::Region::Kind k) {
+                    return k == mm::Region::Kind::Kernel ? 3 : k == mm::Region::Kind::Firmware ? 2
+                         : k == mm::Region::Kind::Boot ? 1 : 0;
+                };
+                auto last = *r.range.limit();
+                if (p < r.range.base()) next = std::min(next, r.range.base());
+                if (p < last) next = std::min(next, last);
+                if (r.range.contains(p) && rank(r.kind) > rank(kind)) kind = r.kind;
+            }
+            auto n = next.raw() - p.raw();
+            // Boot runs preserve individual reclaimable resource boundaries.
+            if (!out.empty() && kind != mm::Region::Kind::Boot && out.back().kind == kind
+                && *out.back().range.limit() == p) {
+                auto& r = out.back().range;
+                r = mm::Pages{r.base(), r.page_count() + n};
+            } else if (!out.try_emplace_back(mm::Region{mm::Pages{p, n}, kind})) {
+                return fail(Err::Capacity);
+            }
+            p = next;
+        }
+    }
+    return found ? std::expected<void, Err>{} : fail(Err::NoRam);
+}
 
 namespace {
 
@@ -136,7 +253,7 @@ private:
 class BootTree final {
 public:
     BootTree(const Fdt& tree,
-             mm::PhysMap& memory) noexcept
+             BootMap& memory) noexcept
         : tree_(tree), memory_(memory) {}
 
     [[nodiscard]] auto read() noexcept -> bool {
@@ -272,7 +389,7 @@ private:
     }
 
     const Fdt& tree_;
-    mm::PhysMap& memory_;
+    BootMap& memory_;
     RegFormat root_format_{};
     std::optional<mm::Pages> iommu_{};
     std::optional<libk::StrView> stdout_path_{};
@@ -280,7 +397,7 @@ private:
     std::optional<uint64_t> initrd_end_{};
 };
 
-[[nodiscard]] auto reserve_kernel(mm::PhysMap& memory) noexcept -> bool {
+[[nodiscard]] auto reserve_kernel(BootMap& memory) noexcept -> bool {
     const auto boot_entry = boot_pages();
     const auto secondary = secondary_pages();
     const auto transition = transition_pages();
@@ -336,7 +453,7 @@ auto build_boot_info_from_fdt(
     if (!parse_fdt_cpus(tree, boot_cpu, info.cpu)) {
         return std::unexpected(BootInfoError::InvalidCpuTopology);
     }
-    mm::PhysMap memory{};
+    BootMap memory{};
     BootTree parsed{tree, memory};
     const auto timebase = parsed.timebase();
     if (!timebase) {

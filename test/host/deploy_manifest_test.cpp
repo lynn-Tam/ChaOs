@@ -700,9 +700,6 @@ auto accepts_typed_memory_schema() -> bool {
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD2,
         MYOS_VM_READ, 8);
-    put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
-            + DEPLOY_ATTENUATION_WORD3,
-        MYOS_VM_NORMAL, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
@@ -722,9 +719,6 @@ auto accepts_typed_rwx_memory_vspace() -> bool {
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD2,
             MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE, 8);
-        put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
-                + DEPLOY_ATTENUATION_WORD3,
-            MYOS_VM_NORMAL, 8);
         ManifestWorkspace workspace{};
         if (!ManifestView::parse(bytes, sizeof(bytes), workspace)) {
             return false;
@@ -745,9 +739,6 @@ auto accepts_typed_vspace_schema() -> bool {
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD2,
         MYOS_VM_READ, 8);
-    put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
-            + DEPLOY_ATTENUATION_WORD3,
-        MYOS_VM_NORMAL, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
@@ -788,7 +779,7 @@ auto rejects_typed_schema_mutations() -> bool {
     };
     const Mutation mutations[] = {
         {10, 0, 0},
-        {MYOS_OBJECT_KIND_MEMORY, 3, 0},
+        {MYOS_OBJECT_KIND_MEMORY, 3, 1},
         {MYOS_OBJECT_KIND_MEMORY, 2, MYOS_VM_WRITE},
         {MYOS_OBJECT_KIND_MEMORY, 2, MYOS_VM_READ | (uint64_t{1} << 8)},
         {MYOS_OBJECT_KIND_VSPACE, 0, 0x1001},
@@ -806,9 +797,6 @@ auto rejects_typed_schema_mutations() -> bool {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD2,
                 MYOS_VM_READ, 8);
-            put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
-                    + DEPLOY_ATTENUATION_WORD3,
-                MYOS_VM_NORMAL, 8);
         } else if (mutation.kind == MYOS_OBJECT_KIND_VSPACE) {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD1,
@@ -816,9 +804,6 @@ auto rejects_typed_schema_mutations() -> bool {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD2,
                 MYOS_VM_READ, 8);
-            put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
-                    + DEPLOY_ATTENUATION_WORD3,
-                MYOS_VM_NORMAL, 8);
         } else if (mutation.kind == MYOS_OBJECT_KIND_CHANNEL) {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD0,

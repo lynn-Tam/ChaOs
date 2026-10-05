@@ -50,15 +50,17 @@ class group final : private libk::noncopyable_nonmovable {
             -> std::expected<void, cap::GrantError>;
         auto root(cap::GrantGraph&, cap::View) noexcept -> std::expected<void, cap::GrantError>;
         template <class T, class... Args>
-        auto make(pool<T>& storage, resource::Reservation charge, Args&&... args) noexcept
-            -> std::expected<ref<T>, error> {
+        auto make(pool<T>& storage, resource::Reservation charge, Args&&... args) noexcept {
+            using Err = typename decltype(storage.create(std::move(charge),
+                std::forward<Args>(args)...))::error_type;
+            using Result = std::expected<ref<T>, Err>;
             auto made = storage.create(std::move(charge), std::forward<Args>(args)...);
-            if (!made) return std::unexpected(made.error());
+            if (!made) return Result{std::unexpected(made.error())};
             auto value = std::move(*made).publish();
             auto target = value.erase();
             libk_assert(target);
             own(std::move(*target));
-            return value;
+            return Result{std::move(value)};
         }
         auto acquire() const noexcept -> std::expected<cap::GrantLease, cap::GrantError>;
         using Error = std::variant<resource::errc, cap::GrantError, cap::CSpaceError>;

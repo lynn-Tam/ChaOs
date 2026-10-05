@@ -744,7 +744,7 @@ private:
             return MYOS_STATUS_INVALID_CAP;
         }
         const myos::SysResult created = B::vm_slice(
-            vspace.value(), address, size, access, MYOS_VM_NORMAL,
+            vspace.value(), address, size, access,
             MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
         if (created.value == 0) {
             return created.status == MYOS_STATUS_OK
@@ -873,7 +873,7 @@ private:
         const auto vspace = task_.lookup(task_.vspace_slot(), MYOS_OBJECT_KIND_VSPACE);
         if (!pool || !vspace) return MYOS_STATUS_INVALID_CAP;
         const auto region = B::vm_slice(*vspace, segment.address, size,
-            segment.access, MYOS_VM_NORMAL,
+            segment.access,
             MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP);
         owner_type region_owner{myos::cap::CapRef{region.value, 0}};
         if (region.status != MYOS_STATUS_OK) return region.status;

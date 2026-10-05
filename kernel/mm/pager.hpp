@@ -15,7 +15,7 @@ class Notification;
 }
 namespace mm {
 class Mem;
-class Paged;
+template<class> class Cache;
 } // namespace mm
 
 // Mem owns request storage and contents; Pager owns only delivery indexes.
@@ -86,7 +86,7 @@ public:
 
 private:
     friend class mm::Mem;
-    friend class mm::Paged;
+    template<class> friend class mm::Cache;
     class Pin {
         Pager &pager_;
 

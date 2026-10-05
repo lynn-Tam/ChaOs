@@ -13,7 +13,7 @@ void report(const myos::bootstrap::BootstrapView& info, const char* message,
     constexpr uintptr_t address = 0x30010000;
     const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
     const auto region = vm_slice(vspace, address, 4096,
-        MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE,
+        MYOS_VM_READ | MYOS_VM_WRITE,
         MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
     service::require(region.status);
     service::require(vm_map(region.value,
@@ -38,7 +38,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.add("uart.memory",
         service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY),
         MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_MAP, 0, 1,
-        MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE));
+        MYOS_VM_READ | MYOS_VM_WRITE, 0));
     service::require(supervisor.add("uart.irq",
         service::capability(info, MYOS_BOOTSTRAP_CAP_IRQ), MYOS_OBJECT_KIND_IRQ,
         MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK));

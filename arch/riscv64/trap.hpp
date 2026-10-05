@@ -1,10 +1,4 @@
-//arch/riscv64/trap/trapframe.hpp
-
 #pragma once
-#if !defined(__ASSEMBLER__)
-#include <stddef.h>
-#include <stdint.h>
-#endif
 
 #if !defined(__ASSEMBLER__)
 #define RISCV64_TRAP_WORD_BYTES 8UL
@@ -66,57 +60,68 @@
 #define STVAL_OFFSET 272
 #define PADDING_OFFSET 280
 
+
 #if !defined(__ASSEMBLER__)
-namespace arch::riscv64 {
+#include <array>
+#include <base/types.hpp>
+#include <cstddef>
+#include <libk/assert.hpp>
+#include <mm/types.hpp>
+#include <optional>
 
+namespace arch {
+// gpr[x-1] stores x1..x31; x0 is constant. Assembly uses the offsets above.
 struct TrapFrame {
-    uint64_t ra;
-    uint64_t sp;
-    uint64_t gp;
-    uint64_t tp;
-    uint64_t t0;
-    uint64_t t1;
-    uint64_t t2;
-    uint64_t s0;
-    uint64_t s1;
-    uint64_t a0;
-    uint64_t a1;
-    uint64_t a2;
-    uint64_t a3;
-    uint64_t a4;
-    uint64_t a5;
-    uint64_t a6;
-    uint64_t a7;
-    uint64_t s2;
-    uint64_t s3;
-    uint64_t s4;
-    uint64_t s5;
-    uint64_t s6;
-    uint64_t s7;
-    uint64_t s8;
-    uint64_t s9;
-    uint64_t s10;
-    uint64_t s11;
-    uint64_t t3;
-    uint64_t t4;
-    uint64_t t5;
-    uint64_t t6;
-    uint64_t sepc;
-    uint64_t sstatus;
-    uint64_t scause;
-    uint64_t stval;
-    uint64_t padding;
+    std::array<usize, 31> gpr;
+    usize sepc, sstatus, scause, stval, padding;
 };
-
 static_assert(sizeof(TrapFrame) == RISCV64_TRAP_FRAME_SIZE);
 static_assert(alignof(TrapFrame) == RISCV64_TRAP_WORD_BYTES);
-static_assert(offsetof(TrapFrame, ra) == RA_OFFSET);
-static_assert(offsetof(TrapFrame, t6) == T6_OFFSET);
+static_assert(offsetof(TrapFrame, gpr) == RA_OFFSET);
+static_assert(sizeof(TrapFrame::gpr) == T6_OFFSET + sizeof(usize));
 static_assert(offsetof(TrapFrame, sepc) == SEPC_OFFSET);
 static_assert(offsetof(TrapFrame, sstatus) == SSTATUS_OFFSET);
 static_assert(offsetof(TrapFrame, scause) == SCAUSE_OFFSET);
 static_assert(offsetof(TrapFrame, stval) == STVAL_OFFSET);
 static_assert(offsetof(TrapFrame, padding) == PADDING_OFFSET);
 
-} // namespace arch::riscv64
+struct TrapRegs {
+    std::array<usize, 31> gpr{};
+    usize pc{}, status{}, cause{}, fault_address{};
+};
+struct UserStart {
+    mm::Virt entry{}, stack{};
+    std::array<usize, 6> arguments{};
+};
+
+// A typed borrow of the sole return frame; redirection selects another owned stack.
+class TrapCtx {
+  public:
+    explicit TrapCtx(TrapFrame& f) noexcept : frame_(&f) {}
+    TrapCtx(const TrapCtx&) = delete;
+    auto operator=(const TrapCtx&) -> TrapCtx& = delete;
+    usize pc() const noexcept { return frame_->sepc; }
+    void set_pc(usize pc) noexcept { frame_->sepc = pc; }
+    void complete_breakpoint() noexcept;
+    void complete_syscall() noexcept { frame_->sepc += 4; }
+    usize arg(usize i) const noexcept { libk_assert(i < 8); return frame_->gpr[9 + i]; }
+    void set_result(usize i, usize value) noexcept { libk_assert(i < 3); frame_->gpr[9 + i] = value; }
+    void set_return(usize value) noexcept { set_result(0, value); }
+    usize fault_addr() const noexcept { return frame_->stval; }
+    TrapRegs snapshot() const noexcept {
+        return {frame_->gpr, frame_->sepc, frame_->sstatus, frame_->scause, frame_->stval};
+    }
+    bool load_user_start(const UserStart&) noexcept;
+    TrapFrame* frame() const noexcept { return frame_; }
+    void redirect(TrapFrame* frame) noexcept { libk_assert(frame); frame_ = frame; }
+  private:
+    TrapFrame* frame_;
+};
+
+bool install_trap() noexcept;
+bool valid_user_start(UserStart) noexcept;
+std::optional<TrapFrame*> prepare_user_frame(usize top, UserStart) noexcept;
+std::optional<usize> prepare_user_stack(usize top, UserStart) noexcept;
+[[noreturn]] void resume_user(usize top) noexcept;
+} // namespace arch
 #endif

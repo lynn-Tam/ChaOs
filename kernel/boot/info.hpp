@@ -5,7 +5,25 @@
 #include <expected>
 #include <libk/inplace_vector.hpp>
 #include <optional>
-#include <mm/phys.hpp>
+#include <mm/table.hpp>
+#include <ranges>
+
+// Firmware input may overlap; finish sweeps boundaries without another index.
+class BootMap {
+  public:
+    enum class Err : u8 { Invalid, NoRam, Overlap, Capacity };
+    auto add_ram(mm::Pages r) noexcept -> std::expected<void, Err>;
+    auto reserve(mm::Pages r, mm::Region::Kind kind) noexcept -> std::expected<void, Err>;
+    auto ram() const noexcept {
+        return input_.span() |
+               std::views::filter([](const mm::Region& r) { return r.kind == mm::Region::Kind::Ram; }) |
+               std::views::transform([](const mm::Region& r) { return r.range; });
+    }
+    auto finish(mm::RegionList& out) && noexcept -> std::expected<void, Err>;
+
+  private:
+    mm::RegionList input_{};
+};
 
 struct FdtSource final {
     mm::Phys physical{};
@@ -80,3 +98,6 @@ enum class BootInfoError : uint8_t {
     const void* fdt_view) noexcept
     -> std::expected<void, BootInfoError>;
 
+
+// Boot assembles permanent mappings before exposing the hardware root.
+auto kernel_root(mm::Pmm&) noexcept -> std::expected<mm::PageTable, mm::PtErr>;

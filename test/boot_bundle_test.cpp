@@ -91,9 +91,9 @@ bool test_bundle_view_accepts_valid_manifest(const TestContext&) noexcept {
         && view.virtual_address == 0x20'0000
         && view.file.size() == 4
         && view.memory_size == 8
-        && view.access.contains(mm::Perm::Read)
-        && view.access.contains(mm::Perm::Execute)
-        && !view.access.contains(mm::Perm::Write);
+        && view.perms.contains(mm::Perm::Read)
+        && view.perms.contains(mm::Perm::Execute)
+        && !view.perms.contains(mm::Perm::Write);
 }
 
 bool test_bundle_view_rejects_bad_envelopes(const TestContext&) noexcept {

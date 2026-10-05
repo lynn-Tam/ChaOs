@@ -148,8 +148,20 @@ static auto publication(std::expected<std::array<cap::Handle, N>, object::group:
                                         mm::Perms access) noexcept -> bool {
     const cap::View effective = memory.view();
     const auto* const lim = std::get_if<cap::MemLimit>(&effective.data);
-    return lim != nullptr && lim->range.contains(range) && lim->access.contains(access) &&
-           lim->types.contains(mm::MemoryType::Normal);
+    return lim != nullptr && lim->range.contains(range) && lim->perms.contains(access);
+}
+
+template<class Pages>
+[[nodiscard]] static auto hold_ram(mm::Pmm& pmm, mm::Mem& mem, mm::ObjectRange range) noexcept
+    -> std::expected<Pages, myos_status_t> {
+    Pages pages;
+    for (usize i = 0; i < range.size(); ++i) {
+        auto page = mem.materialize(range.base() + i);
+        if (!page) return std::unexpected(mem_status(page.error()));
+        if (!pmm.is_ram(page->page())) return std::unexpected(MYOS_STATUS_DENIED);
+        if (!pages.try_push_back(std::move(*page))) return std::unexpected(MYOS_STATUS_NO_MEMORY);
+    }
+    return pages;
 }
 
 [[nodiscard]] static auto ipc_error(ipc::BufferError error) noexcept -> myos_status_t {
@@ -242,13 +254,8 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
     if (!user_stack) {
         return vm_status(user_stack.error());
     }
-    ipc::StackPages resident{};
-    for (usize page = 0; page < desc.stack_pages; ++page) {
-        auto lease = stack->materialize(*first_page + page);
-        if (!lease || !resident.try_push_back(std::move(lease).value())) {
-            return !lease ? MYOS_STATUS_BACKING_FAILED : MYOS_STATUS_NO_MEMORY;
-        }
-    }
+    auto resident = hold_ram<ipc::StackPages>(kernel.pmm(), stack.object(), {*first_page, desc.stack_pages});
+    if (!resident) return resident.error();
     const auto top = virtual_base->checked_add(stack_bytes);
     if (!top) {
         return MYOS_STATUS_BAD_ARGS;
@@ -275,7 +282,7 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
     }
     auto added =
         endpoint.add_activation(std::move(capacity).value().commit(), std::move(kernel_stack).value(),
-                                std::move(user_stack).value(), std::move(ipc), std::move(resident), *top);
+                                std::move(user_stack).value(), std::move(ipc), std::move(*resident), *top);
     return added ? MYOS_STATUS_OK : MYOS_STATUS_BAD_ARGS;
 }
 
@@ -320,7 +327,7 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool, object::pool<ipc::Endpoint>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel.ipc().endpoints, std::move(*fee), kernel.pmm(), std::move(service),
+    auto object = txn->make(kernel.pool<ipc::Endpoint>(), std::move(*fee), kernel.pmm(), std::move(service),
                             std::move(code_view), std::move(resident_code), config);
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     auto& obj = object->get();
@@ -448,13 +455,8 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
     if (!code_view) {
         return returned(vm_status(code_view.error()));
     }
-    ipc::CodePages resident_code{};
-    for (usize page = 0; page < desc.code_pages; ++page) {
-        auto lease = code.value()->materialize(desc.code_page + page);
-        if (!lease || !resident_code.try_push_back(std::move(lease).value())) {
-            return returned(!lease ? MYOS_STATUS_BACKING_FAILED : MYOS_STATUS_NO_MEMORY);
-        }
-    }
+    auto resident_code = hold_ram<ipc::CodePages>(kernel.pmm(), code.value().object(), code_object);
+    if (!resident_code) return returned(resident_code.error());
 
     auto vspace_ref = vspace.reference();
     auto cspace_ref = cspace.reference();
@@ -468,7 +470,7 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
 
     return finish_endpoint(inv, kernel, pool, vspace, stack.value(), ipc_memory ? &*ipc_memory : nullptr,
                            desc, *stack_bytes, std::move(service).value(), std::move(code_view).value(),
-                           std::move(resident_code));
+                           std::move(*resident_code));
 }
 
 template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Result {
@@ -499,7 +501,7 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), *cost);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->ipc().channels, std::move(*fee), kernel->pmm(), config);
+    auto object = txn->make(kernel->pool<ipc::Channel>(), std::move(*fee), kernel->pmm(), config);
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     auto& obj = object->get();
     if (!obj.open()) return returned(MYOS_STATUS_NO_MEMORY);
@@ -541,7 +543,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv)
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto endpoint_create(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto vspace = inv.cspace.resolve<mm::VSpace>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Manage));
     auto cspace =
@@ -559,7 +561,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto endpoint_create(Call& i
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Split);
     if (!pool) {
         return returned(cap_status(pool.error()));
@@ -581,7 +583,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(C
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), *charge);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->tasks().groups, std::move(*fee), kernel->pmm(), limit);
+    auto object = txn->make(kernel->pool<object::group>(), std::move(*fee), kernel->pmm(), limit);
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     const cap::Quota data{limit, kinds};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
@@ -601,8 +603,8 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), charge);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->io().spaces, std::move(*fee), kernel->pmm(), kernel->io_work(),
-                            kernel->io().irqs, kernel->pool<mm::Mem>(), kernel->grants());
+    auto object = txn->make(kernel->pool<io::Space>(), std::move(*fee), kernel->pmm(), kernel->io_work(),
+                            kernel->pool<irq::Irq>(), kernel->pool<mm::Mem>(), kernel->grants());
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     constexpr auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
                                             cap::Right::Connect, cap::Right::Close, cap::Right::Revoke);
@@ -614,26 +616,25 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
         return returned(cap_status(pool.error()));
     }
     const usize size = trap.arg(1);
     const auto access = perms_of(trap.arg(2));
-    if (size == 0 || !access) {
+    if (size == 0 || size % mm::page_size || !access) {
         return returned(MYOS_STATUS_BAD_ARGS);
     }
     auto txn = begin_create<mm::Mem>(inv, pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size,
+                            mm::AnonCfg{.perms = *access});
+    if (!object) return returned(mem_status(object.error()));
     auto& obj = object->get();
-    if (!(obj.init_anon({.access = *access}))) return returned(MYOS_STATUS_NO_MEMORY);
-    const mm::MemoryTypes types = mm::MemoryTypes::of(mm::MemoryType::Normal);
-    const cap::MemLimit data{mm::ObjectRange{0, obj.page_count()}, *access, types};
+    const cap::MemLimit data{mm::ObjectRange{0, obj.page_count()}, *access};
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
@@ -645,7 +646,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
         return returned(cap_status(pool.error()));
@@ -669,14 +670,12 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size,
+                            mm::PagedCfg{std::move(*pg_ref), *access,
+                                (flags & MYOS_MEMORY_PAGER_PRIVATE) != 0});
+    if (!object) return returned(mem_status(object.error()));
     auto& obj = object->get();
-    if (!(obj.init_paged(std::move(*pg_ref), *access,
-                               (flags & MYOS_MEMORY_PAGER_PRIVATE) != 0)))
-        return returned(MYOS_STATUS_NO_MEMORY);
-    const mm::MemoryTypes types = mm::MemoryTypes::of(mm::MemoryType::Normal);
-    const cap::MemLimit data{mm::ObjectRange{0, obj.page_count()}, *access, types};
+    const cap::MemLimit data{mm::ObjectRange{0, obj.page_count()}, *access};
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
@@ -698,13 +697,10 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<mm::VSpace>(), std::move(*fee), kernel->pmm(),
                             kernel->kernel_vspace(), kernel->space_work());
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
-    auto& obj = object->get();
-    if (!(obj.initialize())) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(vm_status(object.error()));
     const cap::VmLimit data{
         mm::VRange{mm::Virt{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
-        mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
-        mm::MemoryTypes::of(mm::MemoryType::Normal, mm::MemoryType::Uncached, mm::MemoryType::Device)};
+        mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute)};
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve,
                         cap::Right::Delegate, cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
@@ -717,7 +713,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
         return returned(cap_status(pool.error()));
@@ -732,7 +728,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<cap::CSpace>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->cspaces(), std::move(*fee), kernel->pmm(), quota);
+    auto object = txn->make(kernel->pool<cap::CSpace>(), std::move(*fee), kernel->pmm(), quota);
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
 
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
@@ -743,7 +739,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto domain =
         inv.cspace.resolve<sched::Domain>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Control));
@@ -766,7 +762,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<sched::Sc>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->sched().contexts, std::move(*fee), config, kernel->clock().now());
+    auto object = txn->make(kernel->pool<sched::Sc>(), std::move(*fee), config, kernel->clock().now());
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     auto& obj = object->get();
 
@@ -835,7 +831,7 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool, object::pool<Thread>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel.tasks().threads, std::move(*fee), std::move(stack_capacity).commit(),
+    auto object = txn->make(kernel.pool<Thread>(), std::move(*fee), std::move(stack_capacity).commit(),
                             std::move(home).value(), std::move(env).value(), start.user);
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     auto& obj = object->get();
@@ -849,7 +845,7 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv) noexcept -> Result {
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto vspace = inv.cspace.resolve<mm::VSpace>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Manage));
     auto cspace =
@@ -886,7 +882,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Cal
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<ipc::Notification>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->ipc().notifications, std::move(*fee));
+    auto object = txn->make(kernel->pool<ipc::Notification>(), std::move(*fee));
     if (!object) return returned(MYOS_STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Signal,

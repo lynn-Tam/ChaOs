@@ -13,6 +13,11 @@ namespace resource {
 class Sponsorship;
 class Charge;
 
+// An empty payer is an uncharged internal allocation. A nonempty payer must
+// name an open group; the returned charge owns its own structural reference.
+[[nodiscard]] auto acquire(const object::ref<>& payer, budget amount) noexcept
+    -> std::expected<Charge, errc>;
+
 // A refund happens after the sponsored object has been destroyed. Delivery
 // therefore owns a value, never a callback into that object's payload.
 class RefundNotifier final {
@@ -50,6 +55,7 @@ public:
     }
 
     [[nodiscard]] auto charge() const noexcept -> budget { return charge_; }
+    [[nodiscard]] auto payer() const noexcept -> const object::ref<>& { return ref_; }
     // Commits this deduction without creating a new sponsored object. The
     // returned token must follow the concrete reusable resource (a page,
     // stack lease, queue cell, ...), and refunds only when that resource is
@@ -132,6 +138,7 @@ public:
     }
 
     [[nodiscard]] auto charge() const noexcept -> budget { return charge_; }
+    [[nodiscard]] auto payer() const noexcept -> const object::ref<>& { return ref_; }
     // Mints a child charge from the same canonical pool. The returned
     // reservation owns a new structural hold; this attachment remains the
     // lineage fact but is not borrowed by the child allocation.

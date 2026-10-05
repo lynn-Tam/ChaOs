@@ -426,14 +426,18 @@ bool test_intrusive_tree_order_and_removal(const TestContext&) noexcept {
         {7, 0}, {2, 0}, {9, 0}, {1, 0}, {5, 0}, {8, 0},
         {10, 0}, {3, 0}, {6, 0}, {4, 0}, {5, 1},
     };
-    TestTree tree{};
+    TestTree initial{};
     for (TreeNode& node : nodes) {
-        tree.insert(node);
+        initial.insert(node);
     }
-    if (tree.size() != 11 || tree.minimum() != &nodes[3]) {
+    TestTree tree{std::move(initial)};
+    if (!initial.empty() || tree.size() != 11 || tree.minimum() != &nodes[3]) {
         return false;
     }
 
+    initial = std::move(tree);
+    if (!tree.empty()) return false;
+    tree = std::move(initial);
     tree.erase(nodes[0]);
     tree.erase(nodes[4]);
     tree.erase(nodes[3]);

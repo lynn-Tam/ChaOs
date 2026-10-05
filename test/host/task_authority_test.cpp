@@ -94,7 +94,6 @@ struct FakeBackend final {
         myos_word_t,
         myos_word_t,
         myos_word_t,
-        myos_word_t,
         myos_word_t) noexcept -> myos::SysResult {
         return {MYOS_STATUS_OK, 13, 0};
     }
@@ -413,12 +412,10 @@ void put(
     memory_ceiling.words[0] = 100;
     memory_ceiling.words[1] = 100;
     memory_ceiling.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
-    memory_ceiling.words[3] = MYOS_VM_NORMAL | MYOS_VM_UNCACHED;
     auto memory_request = memory_ceiling;
     memory_request.words[0] = 120;
     memory_request.words[1] = 10;
     memory_request.words[2] = MYOS_VM_READ;
-    memory_request.words[3] = MYOS_VM_NORMAL;
     if (!deploy::valid_authority_ceiling(memory_ceiling)
         || !within(
             memory_request, memory_ceiling,
@@ -430,8 +427,8 @@ void put(
     memory_escape.words[1] = 20;
     auto memory_access = memory_request;
     memory_access.words[2] = MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE;
-    auto memory_types = memory_request;
-    memory_types.words[3] = MYOS_VM_NORMAL | MYOS_VM_DEVICE;
+    auto memory_reserved = memory_request;
+    memory_reserved.words[3] = 1;
     auto memory_overflow = memory_ceiling;
     memory_overflow.words[0] = UINT64_MAX - 1;
     memory_overflow.words[1] = 2;
@@ -444,7 +441,7 @@ void put(
             memory_access, memory_request,
             DEPLOY_IMPORT_TYPED_DELEGATE)
         || within(
-            memory_types, memory_request,
+            memory_reserved, memory_request,
             DEPLOY_IMPORT_TYPED_DELEGATE)
         || valid_descriptor(memory_overflow, DescriptorForm::Ceiling)
         || valid_descriptor(duplicate_typed, DescriptorForm::DuplicateRequest)) {
@@ -455,12 +452,10 @@ void put(
     vspace_ceiling.words[0] = 0x1000;
     vspace_ceiling.words[1] = 0x4000;
     vspace_ceiling.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
-    vspace_ceiling.words[3] = MYOS_VM_NORMAL | MYOS_VM_UNCACHED;
     auto vspace_request = vspace_ceiling;
     vspace_request.words[0] = 0x2000;
     vspace_request.words[1] = 0x1000;
     vspace_request.words[2] = MYOS_VM_READ;
-    vspace_request.words[3] = MYOS_VM_NORMAL;
     auto vspace_escape = vspace_request;
     vspace_escape.words[0] = 0x4000;
     vspace_escape.words[1] = 0x2000;

@@ -113,7 +113,7 @@ auto dispatch(CpuRuntime& runtime) noexcept -> bool {
         return false;
     }
     DispatchState state{};
-    auto pending_thread = kernel.tasks().threads.create(
+    auto pending_thread = kernel.pool<Thread>().create(
         std::move(stack).value(),
         Env::kernel(kernel.kernel_vspace()),
         Thread::KernelStart{dispatch_entry, &state});
@@ -129,7 +129,7 @@ auto dispatch(CpuRuntime& runtime) noexcept -> bool {
         kernel.drain_reclaim();
         return false;
     }
-    auto pending_context = kernel.sched().contexts.create(
+    auto pending_context = kernel.pool<sched::Sc>().create(
         sched::Sc::Config{.budget = *budget, .period = *period},
         kernel.clock().now());
     if (!pending_context) {

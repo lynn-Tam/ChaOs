@@ -46,7 +46,7 @@ class Image final : private libk::noncopyable_nonmovable {
         const myos_cap_attenuation view{
             .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT, .kind = MYOS_OBJECT_KIND_MEMORY,
             .size = MYOS_CAP_ATTENUATION_SIZE, .rights = MYOS_RIGHT_MAP,
-            .words = {first, size / 4096, source_access, MYOS_VM_NORMAL}};
+            .words = {first, size / 4096, source_access}};
         auto& wire = *reinterpret_cast<uint8_t (*)[MYOS_CAP_ATTENUATION_SIZE]>(service::IpcAddress);
         myos::cap::encode(view, wire);
         const auto written = memory_write(descriptor_->memory_.selector(), 0, 0, sizeof(wire));

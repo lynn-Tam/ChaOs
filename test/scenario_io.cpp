@@ -197,12 +197,12 @@ struct BarUse final {
         libk_assert(bar);
         auto page = bar.value()->materialize(0);
         libk_assert(page);
-        function.regions[index] = {.address = page.value().page().page.base().raw(),
+        function.regions[index] = {.address = page.value().page().base().raw(),
                                    .size = function.info.bar_sizes[index]};
     }
     auto page = memory.materialize(0);
     libk_assert(page);
-    const usize backing = mm::DirectBegin + page.value().page().page.base().raw();
+    const usize backing = mm::DirectBegin + page.value().page().base().raw();
     page.value().reset();
     auto forbidden = kernel.pmm().allocate_page();
     libk_assert(forbidden);
@@ -300,7 +300,7 @@ struct CaseBinding final {
     libk_assert(device_ref && memory_ref);
     const cap::View dc{cap::Rights::of(cap::Right::Connect)};
     const cap::View mc{cap::Rights::of(cap::Right::Map),
-                       cap::MemLimit{{0, PageCount}, Perm, mm::MemoryTypes::of(mm::MemoryType::Normal)}};
+                       cap::MemLimit{{0, PageCount}, Perm}};
     auto dg = graph.create_root(std::move(device_ref).value(), dc);
     auto mg = graph.create_root(std::move(memory_ref).value(), mc);
     libk_assert(dg && mg);
@@ -324,7 +324,7 @@ struct CaseBinding final {
     return {dk, mk, before};
 }
 
-[[gnu::noinline]] auto inspect_space(io::Space& space, cap::CSpace& caps, ipc::Notification& notification,
+[[gnu::noinline]] auto inspect_space(mm::Pmm& pmm, io::Space& space, cap::CSpace& caps, ipc::Notification& notification,
                                      object::ref<mm::Mem>& old_bar, object::ref<irq::Irq>& old_interrupt,
                                      std::optional<cap::Handle>& bar_cap,
                                      std::optional<cap::Handle>& interrupt_cap) noexcept -> io::DeviceInfo {
@@ -352,7 +352,7 @@ struct CaseBinding final {
         libk_assert(hold);
         old_bar = std::move(hold).value();
         auto page = old_bar->materialize(0);
-        libk_assert(page && page.value().page().type == mm::MemoryType::Device);
+        libk_assert(page && !pmm.is_ram(page.value().page()));
     }
     libk_assert(bar_cap && !space.bar(6));
     auto grant = space.interrupt();
@@ -387,15 +387,15 @@ struct CaseBinding final {
         const resource::budget limit{.memory = test == 5 ? object::pool<io::Space>::slot_charge().memory
                                                          : 64 * mm::page_size,
                                      .caps = 4};
-        auto pool_pending = kernel.tasks().groups.create(pmm, limit);
+        auto pool_pending = kernel.pool<object::group>().create(pmm, limit);
         libk_assert(pool_pending);
         auto pool = std::move(pool_pending).value().publish();
         auto pool_ref = pool.erase();
         libk_assert(pool_ref);
         auto charge = pool->reserve(std::move(pool_ref).value(), object::pool<io::Space>::slot_charge());
         libk_assert(charge);
-        auto pending = kernel.io().spaces.create(std::move(charge).value(), pmm, executor,
-                                                           kernel.io().irqs, kernel.pool<mm::Mem>(), graph);
+        auto pending = kernel.pool<io::Space>().create(std::move(charge).value(), pmm, executor,
+                                                           kernel.pool<irq::Irq>(), kernel.pool<mm::Mem>(), graph);
         libk_assert(pending);
         auto space = std::move(pending).value().publish();
         auto notification_page = pmm.allocate_page();
@@ -404,9 +404,7 @@ struct CaseBinding final {
         auto& notification =
             *libk::construct_at(reinterpret_cast<ipc::Notification*>(notification_page.value().bytes()));
         if (test == 8) libk_assert(space->watch(notification, 2));
-        auto memory_pending = kernel.pool<mm::Mem>().make(
-            {}, [&](auto& m) { return m.init_anon({.eager = true}); }, kernel.pmm(),
-            PageCount * mm::page_size);
+        auto memory_pending = kernel.pool<mm::Mem>().create({}, kernel.pmm(), PageCount * mm::page_size, mm::AnonCfg{.eager = true});
         libk_assert(memory_pending);
         auto memory = std::move(memory_pending).value().publish();
         const auto binding = bind_case(test, graph, caps, pool, space, memory);
@@ -426,7 +424,7 @@ struct CaseBinding final {
             libk_assert(space->state() == io::SpaceState::Active);
             libk_assert(!device.acquire() && !memory->seal());
             libk_assert(pool->available().memory < before.memory);
-            const auto info = inspect_space(space.get(), caps, notification, old_bar, old_interrupt, bar_cap,
+            const auto info = inspect_space(pmm, space.get(), caps, notification, old_bar, old_interrupt, bar_cap,
                                             interrupt_cap);
             if (test == 7) libk_assert(old_bar->attach(use.attachment, Perm));
             if (test == 8) space_fault(kernel, space.get(), memory.get(), notification, graph, info);

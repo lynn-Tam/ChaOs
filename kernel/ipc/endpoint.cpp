@@ -127,8 +127,10 @@ Endpoint::~Endpoint() noexcept {
 
 void Endpoint::bind_sponsor(
     resource::Sponsorship& sponsor) noexcept {
-    activations_.bind_sponsor(sponsor);
-    calls_.bind_sponsor(sponsor);
+    libk_assert(!payer_);
+    auto source = sponsor.payer().clone();
+    libk_assert(source);
+    payer_ = std::move(*source);
 }
 
 auto Endpoint::add_call() noexcept
@@ -138,7 +140,7 @@ auto Endpoint::add_call() noexcept
         || call_count_ >= MYOS_ENDPOINT_MAX_CALLS) {
         return std::unexpected(EndpointError::InvalidConfig);
     }
-    auto made = calls_.create(*this);
+    auto made = calls_.create(payer_, *this);
     if (!made) {
         return std::unexpected(EndpointError::InvalidConfig);
     }
@@ -161,7 +163,7 @@ auto Endpoint::add_activation(
         || (user_stack_top.raw() & 0xfU) != 0) {
         return std::unexpected(EndpointError::InvalidConfig);
     }
-    auto made = activations_.create(
+    auto made = activations_.create(payer_,
         *this,
         std::move(stack_charge),
         std::move(kernel_stack),
@@ -334,7 +336,7 @@ void Endpoint::close_installed(Call& call) noexcept {
 auto Endpoint::call(
     cap::Resolved<Endpoint>&& view,
     Thread& caller,
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
     CpuRegistry& cpus,
     const usize (&arguments)[3],
@@ -547,7 +549,7 @@ auto Endpoint::call(
 
 auto Endpoint::enter(
     Call& call,
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher) noexcept -> bool {
     Activation* const activation = call.activation_;
     Thread* const caller = dispatcher.current();
@@ -626,7 +628,7 @@ auto Endpoint::enter(
 
 auto Endpoint::reply(
     Thread& caller,
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
     isize status,
     usize value) noexcept -> std::expected<void, EndpointError> {
@@ -652,7 +654,7 @@ auto Endpoint::reply(
 
 auto Endpoint::abort(
     Thread& caller,
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
     isize status) noexcept -> std::expected<void, EndpointError> {
     if (dispatcher.current() != &caller) {
@@ -691,7 +693,7 @@ void Activation::release() noexcept {
 }
 
 void Activation::unwind(
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
     isize status) noexcept {
     static_cast<void>(endpoint_->finish_active(*this, trap, dispatcher, status, 0, false));
@@ -704,7 +706,7 @@ auto Activation::cancel_pending() const noexcept -> bool {
 
 auto Endpoint::finish_active(
     Activation& activation,
-    arch::TrapContext& trap,
+    arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
     isize status,
     usize value,

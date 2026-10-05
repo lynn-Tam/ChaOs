@@ -183,8 +183,10 @@ Channel::~Channel() noexcept {
 
 void Channel::bind_sponsor(
     resource::Sponsorship& sponsor) noexcept {
-    messages_.bind_sponsor(sponsor);
-    relation_pool_.bind_sponsor(sponsor);
+    libk_assert(!payer_);
+    auto source = sponsor.payer().clone();
+    libk_assert(source);
+    payer_ = std::move(*source);
 }
 
 auto Channel::open() noexcept -> std::expected<void, ChannelError> {
@@ -207,12 +209,12 @@ auto Channel::open() noexcept -> std::expected<void, ChannelError> {
     // move intrusive links and never grow backing storage.
     const usize required = config_.queue_capacity * 2;
     while (free_messages_.size() < required) {
-        auto made = messages_.create();
+        auto made = messages_.create(payer_);
         if (!made) return std::unexpected(ChannelError::ResourceExhausted);
         free_messages_.push_back(*made.value());
     }
     while (relations_.size() < config_.relation_capacity) {
-        auto made = relation_pool_.create();
+        auto made = relation_pool_.create(payer_);
         if (!made) return std::unexpected(ChannelError::ResourceExhausted);
         auto& relation = *made.value();
         relation.owner = this;

@@ -35,7 +35,6 @@ struct FakeBackend final {
         myos_word_t address;
         myos_word_t size;
         myos_word_t access;
-        myos_word_t types;
         myos_word_t rights;
 
         constexpr Call() noexcept : Call(Op::Close) {}
@@ -47,7 +46,6 @@ struct FakeBackend final {
             myos_word_t call_address = 0,
             myos_word_t call_size = 0,
             myos_word_t call_access = 0,
-            myos_word_t call_types = 0,
             myos_word_t call_rights = 0) noexcept
             : op(operation),
               first(first_reference),
@@ -55,7 +53,6 @@ struct FakeBackend final {
               address(call_address),
               size(call_size),
               access(call_access),
-              types(call_types),
               rights(call_rights) {}
     };
 
@@ -158,10 +155,9 @@ struct FakeBackend final {
         myos_word_t address,
         myos_word_t size,
         myos_word_t access,
-        myos_word_t types,
         myos_word_t rights) noexcept -> myos::SysResult {
         record(Call{Op::Region, vspace, {}, address, size,
-            access, types, rights});
+            access, rights});
         const myos_status_t status = consume(next_region);
         return {status, status == MYOS_STATUS_OK ? next_cap++ : 0, 0};
     }
@@ -229,12 +225,10 @@ static_assert(!std::is_copy_constructible_v<Space>);
 [[nodiscard]] auto region_call_matches(
     size_t index,
     myos_word_t access,
-    myos_word_t types,
     myos_word_t rights) noexcept -> bool {
     return index < FakeBackend::call_count
         && FakeBackend::calls[index].op == FakeBackend::Op::Region
         && FakeBackend::calls[index].access == access
-        && FakeBackend::calls[index].types == types
         && FakeBackend::calls[index].rights == rights;
 }
 
@@ -585,7 +579,7 @@ void put_bundle(
         || create_failure.phase() != deploy::LeasePhase::Empty
         || FakeBackend::call_count != 1
         || !region_call_matches(
-            0, MYOS_VM_READ, MYOS_VM_NORMAL,
+            0, MYOS_VM_READ,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY)
         || create_failure.close() != MYOS_STATUS_OK) {
         return false;
@@ -610,7 +604,7 @@ void put_bundle(
     if (scratch_create_failure.open({1, 0}, window) != MYOS_STATUS_BUSY
         || scratch_create_failure.phase() != deploy::LeasePhase::Empty
         || !region_call_matches(
-            0, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL,
+            0, MYOS_VM_READ | MYOS_VM_WRITE,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY)) {
         return false;
     }

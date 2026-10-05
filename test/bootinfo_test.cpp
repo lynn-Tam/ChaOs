@@ -2,7 +2,7 @@
 
 #include <boot/fdt.hpp>
 #include <utility>
-#include <mm/phys.hpp>
+#include <boot/info.hpp>
 #include <mm/pmm.hpp>
 #include <boot/link.hpp>
 
@@ -147,7 +147,7 @@ bool test_region_policy_is_explicit(const TestContext&) noexcept {
 
 bool test_builder_normalizes_multiple_ram_banks(const TestContext&) noexcept {
     using Kind = mm::Region::Kind;
-    mm::PhysMap builder{};
+    BootMap builder{};
     if (!builder.add_ram(mm::Pages{
             mm::Page{100}, 8})
         || !builder.add_ram(mm::Pages{
@@ -199,7 +199,7 @@ bool test_builder_normalizes_multiple_ram_banks(const TestContext&) noexcept {
 
 bool test_permanent_reservation_overrides_reclaimable(const TestContext&) noexcept {
     using Kind = mm::Region::Kind;
-    mm::PhysMap builder{};
+    BootMap builder{};
     if (!builder.add_ram(mm::Pages{
             mm::Page{300}, 8})
         || !builder.reserve(
@@ -229,7 +229,7 @@ bool test_permanent_reservation_overrides_reclaimable(const TestContext&) noexce
 
 bool test_adjacent_reclaimable_resources_keep_boundaries(const TestContext&) noexcept {
     using Kind = mm::Region::Kind;
-    mm::PhysMap builder{};
+    BootMap builder{};
     if (!builder.add_ram(mm::Pages{
             mm::Page{500}, 8})
         || !builder.reserve(
@@ -254,7 +254,7 @@ bool test_adjacent_reclaimable_resources_keep_boundaries(const TestContext&) noe
 }
 
 bool test_builder_rejects_overlapping_ram_banks(const TestContext&) noexcept {
-    mm::PhysMap builder{};
+    BootMap builder{};
     if (!builder.add_ram(mm::Pages{
             mm::Page{400}, 8})
         || !builder.add_ram(mm::Pages{
@@ -263,14 +263,14 @@ bool test_builder_rejects_overlapping_ram_banks(const TestContext&) noexcept {
     }
     mm::RegionList map{};
     const auto result = std::move(builder).finish(map);
-    return !result && result.error() == mm::PhysErr::Overlap;
+    return !result && result.error() == BootMap::Err::Overlap;
 }
 
 bool test_builder_requires_ram(const TestContext&) noexcept {
-    mm::PhysMap builder{};
+    BootMap builder{};
     mm::RegionList map{};
     const auto result = std::move(builder).finish(map);
-    return !result && result.error() == mm::PhysErr::NoRam;
+    return !result && result.error() == BootMap::Err::NoRam;
 }
 
 bool test_byte_ranges_have_explicit_page_rounding(const TestContext&) noexcept {

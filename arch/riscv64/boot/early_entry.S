@@ -140,7 +140,7 @@ arch_early_entry:
 
     /*
      * The migration root projects the policy window so high C++ can parse
-     * the FDT and construct the exact RAM map.  DirectMap itself exposes only
+     * the FDT and construct the exact RAM map.  The PMM view exposes only
      * BootMap-proven RAM, and the final root contains only those ranges.
      */
 .Lmap_direct_window:

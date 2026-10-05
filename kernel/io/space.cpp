@@ -70,8 +70,7 @@ auto Space::bind(object::ref<> self, cap::Resolved<Device>& device, cap::Resolve
     const auto effective = memory.view();
     const auto* limit = std::get_if<cap::MemLimit>(&effective.data);
     if (!device.rights().contains(cap::Right::Connect) || !memory.rights().contains(cap::Right::Map) ||
-        limit == nullptr || !limit->range.contains(range) || !limit->access.contains(DmaAccess) ||
-        !limit->types.contains(mm::MemoryType::Normal))
+        limit == nullptr || !limit->range.contains(range) || !limit->perms.contains(DmaAccess))
         return std::unexpected(SpaceError::Denied);
     const auto tables = mm::PageTable::dma_pages(first, range.size());
     if (!tables || !range.within(memory->page_count())) return std::unexpected(SpaceError::InvalidRange);
@@ -160,8 +159,8 @@ auto Space::prepare(cap::Resolved<Device>& device, cap::Resolved<mm::Mem>& memor
                                            ? SpaceError::QuotaExceeded
                                            : SpaceError::BackingUnavailable);
             }
-            if (source.value().page().type != mm::MemoryType::Normal ||
-                !source.value().page().access.contains(DmaAccess))
+            if (!pmm_.is_ram(source.value().page()) ||
+                !source.value().perms().contains(DmaAccess))
                 return std::unexpected(SpaceError::UnsupportedMemory);
             block->pages[block->count++] = std::move(source).value();
         }
@@ -170,7 +169,7 @@ auto Space::prepare(cap::Resolved<Device>& device, cap::Resolved<mm::Mem>& memor
     usize index{};
     auto next = [&]() noexcept {
         libk_assert(block != nullptr && index < block->count);
-        const auto page = block->pages[index++].page().page;
+        const auto page = block->pages[index++].page();
         if (index == block->count) {
             block = block->next;
             index = 0;
@@ -193,7 +192,7 @@ auto Space::prepare_bars() noexcept -> std::expected<void, SpaceError> {
         if (!range) return std::unexpected(SpaceError::InvalidRange);
         const mm::Extent extent{.object = {0, bytes / mm::page_size},
                                       .physical = *range,
-                                      .access = DmaAccess,};
+                                      .perms = DmaAccess,};
         resource::Reservation object_charge{};
         resource::Reservation grant_charge{};
         if (sponsor_ != nullptr) {
@@ -203,9 +202,7 @@ auto Space::prepare_bars() noexcept -> std::expected<void, SpaceError> {
             object_charge = std::move(memory).value();
             grant_charge = std::move(grant).value();
         }
-        auto pending = mems_.make(
-            std::move(object_charge), [&](auto& m) { return m.init_phys({&extent, 1}); }, pmm_,
-            bytes);
+        auto pending = mems_.create(std::move(object_charge), pmm_, bytes, mm::PhysCfg{{&extent, 1}, {}});
         if (!pending)
             return std::unexpected(pending.error() == mm::MemErr::ResourceExhausted
                                        ? SpaceError::QuotaExceeded
@@ -220,8 +217,7 @@ auto Space::prepare_bars() noexcept -> std::expected<void, SpaceError> {
         const cap::View ceiling{cap::Rights::of(cap::Right::Map, cap::Right::Inspect, cap::Right::Duplicate,
                                                 cap::Right::Delegate),
                                 cap::MemLimit{{0, bytes / mm::page_size},
-                                              DmaAccess,
-                                              mm::MemoryTypes::of(mm::MemoryType::Device)}};
+                                              DmaAccess}};
         auto grant = grants_.create_root(std::move(grant_charge), std::move(target).value(), ceiling);
         if (!grant) return std::unexpected(SpaceError::OutOfMemory);
         bar.grant = std::move(grant).value();

@@ -59,7 +59,7 @@ public:
             if (bar.status != MYOS_STATUS_OK) return bar.status;
             const size_t bytes = (info.bar_sizes[index] + 4095) & ~size_t{4095};
             auto mapped = MappedMemory::map(vspace, cap::OwnedCap{{bar.value, 0}},
-                BarsAddress + index * BarStride, bytes, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_DEVICE);
+                BarsAddress + index * BarStride, bytes, MYOS_VM_READ | MYOS_VM_WRITE);
             if (!mapped) return mapped.error();
             bars_[index] = std::move(*mapped);
         }

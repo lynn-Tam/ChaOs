@@ -62,12 +62,12 @@ public:
             return false;
         }
         if (!mm::Pmm::initialize_in(
-                cpu_test_pmm, std::move(map), mm::DirectMap::Layout{
-                .physical_base = mm::Phys{
+                cpu_test_pmm, std::move(map), mm::Pmm::Window{
+                .pa = mm::Phys{
                     physical->raw()},
-                .virtual_base = mm::Virt{
+                .va = mm::Virt{
                     reinterpret_cast<uintptr_t>(cpu_test_ram)},
-                .window_size = sizeof(cpu_test_ram),
+                .size = sizeof(cpu_test_ram),
             })) {
             return false;
         }
@@ -91,11 +91,7 @@ private:
     if (!builder) {
         return nullptr;
     }
-    mm::PageTable root = std::move(builder).value();
-    if (!mm::KSpace::adopt_in(
-            cpu_test_kernel, *cpu_test_pmm, std::move(root))) {
-        return nullptr;
-    }
+    (void)cpu_test_kernel.emplace(*cpu_test_pmm, std::move(*builder), kernel_begin().raw());
     return &*cpu_test_kernel;
 }
 

@@ -50,7 +50,7 @@ public:
                 .rights = MYOS_RIGHT_MAP | MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_REVOKE,
                 .words = {0, mappings_[index].size / 4096,
                     index == 0 || (index == 2 && writable_payload)
-                        ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ, MYOS_VM_NORMAL}};
+                        ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ}};
             myos::cap::encode(view, wire);
             const auto exported = cap_typed_delegate(mappings_[index].memory.selector(), cspace,
                 mappings_[1].memory.selector(), scratch);

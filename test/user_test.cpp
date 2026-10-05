@@ -3,7 +3,7 @@
 #include <boot/link.hpp>
 #include <mm/table.hpp>
 #include <arch/instruction.hpp>
-#include <arch/user.hpp>
+#include <trap.hpp>
 #include <cap/cap.hpp>
 #include <uapi/capability.h>
 #include <uapi/status.h>
@@ -53,8 +53,18 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
             .entry = kernel_begin(),
             .stack = valid.stack,
         });
-    return prepared && *prepared >= reinterpret_cast<usize>(home)
-        && *prepared < top && (*prepared & 0xfU) == 0 && !rejected;
+    if (!prepared || *prepared < reinterpret_cast<usize>(home)
+        || *prepared >= top || (*prepared & 15) != 0 || rejected) return false;
+    auto& frame = *reinterpret_cast<arch::TrapFrame*>(*prepared);
+    arch::TrapCtx ctx{frame};
+    const auto saved = ctx.snapshot();
+    for (usize i = 0; i < valid.arguments.size(); ++i)
+        if (ctx.arg(i) != valid.arguments[i]) return false;
+    ctx.set_result(0, 17);
+    return ctx.pc() == valid.entry.raw() && frame.gpr[1] == valid.stack.raw()
+        && frame.gpr[0] == 0 && frame.gpr[30] == 0 && frame.sstatus == 0x20
+        && ctx.arg(0) == 17 && saved.gpr[9] == 1;
+
 }
 
 bool test_uapi_values_are_stable_and_not_internal_pointers(

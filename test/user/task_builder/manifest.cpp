@@ -197,8 +197,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
                                       std::uint64_t rights,
                                       std::uint64_t word0,
                                       std::uint64_t word1,
-                                      std::uint64_t word2,
-                                      std::uint64_t word3) {
+                                      std::uint64_t word2) {
         put(bytes, offset + DEPLOY_ATTENUATION_VERSION,
             DEPLOY_ATTENUATION_VERSION_CURRENT, 2);
         put(bytes, offset + DEPLOY_ATTENUATION_KIND, kind, 2);
@@ -208,7 +207,6 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
         put(bytes, offset + DEPLOY_ATTENUATION_WORD0, word0, 8);
         put(bytes, offset + DEPLOY_ATTENUATION_WORD1, word1, 8);
         put(bytes, offset + DEPLOY_ATTENUATION_WORD2, word2, 8);
-        put(bytes, offset + DEPLOY_ATTENUATION_WORD3, word3, 8);
     };
 
     for (std::size_t task = 0; task < task_count; ++task) {
@@ -407,7 +405,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
         write_descriptor(
             import + DEPLOY_IMPORT_ATTENUATION,
             MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_MAP,
-            0, 1, MYOS_VM_READ, MYOS_VM_NORMAL);
+            0, 1, MYOS_VM_READ);
 
         const std::size_t output = export_offset(range.export_first);
         const bool valid_prepared = task == 4;
@@ -426,8 +424,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             valid_prepared ? 0 : MYOS_RIGHT_MAP,
             valid_prepared ? 0 : 0,
             valid_prepared ? 0 : 1,
-            valid_prepared ? 0 : MYOS_VM_READ,
-            valid_prepared ? 0 : MYOS_VM_NORMAL);
+            valid_prepared ? 0 : MYOS_VM_READ);
     }
 
     std::size_t strings_size{};

@@ -158,7 +158,7 @@ void Pager::dispose(Reply::Data &d) noexcept {
     }
     auto *mem = d.mem;
     mem->request_drop();
-    unpin(); // May free Pager; no member access follows.
+    unpin(); // May free Pager; no member perms follows.
 }
 
 auto Pager::requeue(u64 id) noexcept -> std::expected<void, Error> {

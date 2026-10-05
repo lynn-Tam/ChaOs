@@ -106,12 +106,9 @@ bool PageTable::Count::include(mm::VPage va) noexcept {
 }
 
 auto PageTable::encode(mm::Page page, PtPerm perms) const noexcept -> std::expected<Pte, PtErr> {
-    // CPU aliases share one immutable attribute. DMA translation is separate.
-    const auto attr = kind_ == Kind::Io ? std::optional{CpuAttr::Native}
-                                       : tables_.owner().attr_of(Pages{page, 1});
-    if (!attr) return std::unexpected(PtErr::BadPhys);
-    if (!Pte::supports(*attr)) return std::unexpected(PtErr::BadAttr);
-    auto pte = Pte::leaf_4k(page, perms, kind_ != Kind::User, *attr);
+    if (kind_ != Kind::Io && !tables_.owner().covers(Pages{page, 1}))
+        return std::unexpected(PtErr::BadPhys);
+    auto pte = Pte::leaf_4k(page, perms, kind_ != Kind::User);
     return pte ? std::expected<Pte, PtErr>{*pte} : std::unexpected(PtErr::BadPhys);
 }
 

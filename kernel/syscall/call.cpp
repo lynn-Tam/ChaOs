@@ -88,7 +88,7 @@ auto read_desc_bytes(
         &effective.data);
     const auto end = libk::checked_add(offset, dest.size());
     if (authority == nullptr || !end
-        || !authority->access.contains(mm::Perm::Read)) {
+        || !authority->perms.contains(mm::Perm::Read)) {
         return std::unexpected(MYOS_STATUS_DENIED);
     }
     const auto rounded = libk::checked_add(
@@ -133,7 +133,7 @@ auto vm_status(mm::VSpaceError error) noexcept -> myos_status_t {
         return MYOS_STATUS_NOT_FOUND;
     case mm::VSpaceError::InvalidRange:
     case mm::VSpaceError::Overlap:
-    case mm::VSpaceError::UnsupportedMemoryType:
+    case mm::VSpaceError::NotRam:
         return MYOS_STATUS_BAD_ARGS;
     case mm::VSpaceError::OutOfMemory:
     case mm::VSpaceError::QuotaExceeded:
@@ -172,16 +172,6 @@ auto perms_of(usize raw) noexcept -> std::optional<mm::Perms> {
     const auto access = mm::Perms::from_raw(static_cast<u8>(raw));
     return mm::valid_perms(access)
         ? std::optional<mm::Perms>{access}
-        : std::nullopt;
-}
-
-auto types_of(usize raw) noexcept -> std::optional<mm::MemoryTypes> {
-    if (raw > std::numeric_limits<u8>::max()) {
-        return std::nullopt;
-    }
-    const auto types = mm::MemoryTypes::from_raw(static_cast<u8>(raw));
-    return mm::valid_memory_types(types)
-        ? std::optional<mm::MemoryTypes>{types}
         : std::nullopt;
 }
 
@@ -237,7 +227,7 @@ template<typename Operation>
 template<usize op>
 auto cap_call(Call& inv) noexcept -> Result {
     cap::CSpace& cspace = inv.cspace;
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     Thread* const thread = inv.target;
 
     if constexpr (op == MYOS_SYS_CAP_CLOSE) {
@@ -360,7 +350,7 @@ auto cap_call(Call& inv) noexcept -> Result {
     return returned(MYOS_STATUS_INVALID_OP);
 }
 
-[[nodiscard]] static auto status(mm::MemErr error) noexcept
+auto mem_status(mm::MemErr error) noexcept
     -> myos_status_t {
     switch (error) {
     case mm::MemErr::OutOfMemory:
@@ -379,7 +369,7 @@ auto cap_call(Call& inv) noexcept -> Result {
     case mm::MemErr::InvalidSize:
     case mm::MemErr::InvalidRange:
     case mm::MemErr::InvalidAccess:
-    case mm::MemErr::InvalidMemoryType:
+    case mm::MemErr::NotRam:
     case mm::MemErr::NotBacked:
     case mm::MemErr::OwnershipMismatch:
         return MYOS_STATUS_BAD_ARGS;
@@ -396,7 +386,7 @@ template<usize op>
         return returned(cap_status(memory.error()));
     }
     auto sealed = memory.value()->seal();
-    return returned(sealed ? MYOS_STATUS_OK : status(sealed.error()));
+    return returned(sealed ? MYOS_STATUS_OK : mem_status(sealed.error()));
 }
 
 template<usize op>
@@ -413,8 +403,7 @@ template<usize op>
     const auto* limit = std::get_if<cap::MemLimit>(&effective.data);
     if (limit == nullptr
         || !limit->range.contains(mm::ObjectRange{offset / mm::page_size, 1})
-        || !limit->access.contains(mm::Perm::Write)
-        || !limit->types.contains(mm::MemoryType::Normal))
+        || !limit->perms.contains(mm::Perm::Write))
         return returned(MYOS_STATUS_BAD_RIGHTS);
     auto* buffer = inv.target->ipc_buffer();
     if (buffer == nullptr) return returned(MYOS_STATUS_BAD_ARGS);
@@ -426,7 +415,7 @@ template<usize op>
     const auto bytes = access.value().bytes(source, size);
     if (bytes.empty()) return returned(MYOS_STATUS_BAD_ARGS);
     auto written = memory.value()->write(offset, bytes);
-    return returned(written ? MYOS_STATUS_OK : status(written.error()));
+    return returned(written ? MYOS_STATUS_OK : mem_status(written.error()));
 }
 
 template<usize op>
@@ -458,7 +447,7 @@ template<usize op>
         else return mem.populate(*thread, *cpus, page);
     }();
     return returned(thread->stop_requested() ? MYOS_STATUS_CANCELED
-                    : result ? MYOS_STATUS_OK : status(result.error()));
+                    : result ? MYOS_STATUS_OK : mem_status(result.error()));
 }
 
 template<usize op>
@@ -515,7 +504,7 @@ template<usize op>
     auto dest = notification.value().reference();
     if (!self || !dest) return returned(MYOS_STATUS_BUSY);
     const auto id = dest.value().id();
-    auto& notifications = inv.cpu.runtime().kernel->ipc().notifications;
+    auto& notifications = inv.cpu.runtime().kernel->pool<ipc::Notification>();
     const resource::RefundNotifier notifier{&notifications,
         [](void* ctx, usize slot, u64 generation, u64 bits) noexcept {
             // Weak generation identity: a dead inbox drops the delivery. No
@@ -624,7 +613,7 @@ static auto pg_finish(Call& inv) noexcept -> Result {
     if (!memory) return returned(cap_status(memory.error()));
     const auto result = memory.value()->pager_finish(pager.value().object(), inv.trap.arg(2),
         op == MYOS_SYS_PAGER_FAIL);
-    return result ? returned(MYOS_STATUS_OK) : returned(status(result.error()));
+    return result ? returned(MYOS_STATUS_OK) : returned(mem_status(result.error()));
 }
 
 static auto pg_supply(Call& inv) noexcept -> Result {
@@ -639,11 +628,11 @@ static auto pg_supply(Call& inv) noexcept -> Result {
             : !target ? target.error() : source.error()));
     }
     auto transfer = source.value()->begin_transfer(inv.trap.arg(3));
-    if (!transfer) return returned(status(transfer.error()));
+    if (!transfer) return returned(mem_status(transfer.error()));
     auto supplied = target.value()->supply(pager.value().object(), std::move(*transfer),
         inv.trap.arg(4));
     return supplied ? returned(MYOS_STATUS_OK)
-                    : returned(status(supplied.error()));
+                    : returned(mem_status(supplied.error()));
 }
 
 static auto pg_bind(Call& inv) noexcept -> Result {
@@ -769,7 +758,7 @@ static_assert(static_cast<u8>(io::SpaceState::Closed) == MYOS_IO_SPACE_CLOSED);
 static_assert(static_cast<u8>(io::SpaceState::Failed) == MYOS_IO_SPACE_FAILED);
 static_assert(static_cast<u8>(io::SpaceState::Faulted) == MYOS_IO_SPACE_FAULTED);
 
-static auto status(io::SpaceError error) noexcept -> myos_status_t {
+static auto io_status(io::SpaceError error) noexcept -> myos_status_t {
     switch (error) {
     case io::SpaceError::InvalidState:
     case io::SpaceError::Busy: return MYOS_STATUS_BUSY;
@@ -795,7 +784,7 @@ static auto status(io::SpaceError error) noexcept -> myos_status_t {
     if (!self) return returned(MYOS_STATUS_CLOSED);
     auto bound = space->bind(std::move(self).value(), device.value(), memory.value(),
         {trap.arg(3), trap.arg(4)}, trap.arg(5));
-    return returned(bound ? MYOS_STATUS_OK : status(bound.error()));
+    return returned(bound ? MYOS_STATUS_OK : io_status(bound.error()));
 }
 
 static auto watch(Call& inv, io::Space& space) noexcept -> Result {
@@ -808,7 +797,7 @@ static auto watch(Call& inv, io::Space& space) noexcept -> Result {
     if (data == nullptr || badge == 0 || data->badge != badge)
         return returned(MYOS_STATUS_BAD_ARGS);
     const auto result = space.watch(notification.value().object(), badge);
-    return returned(result ? MYOS_STATUS_OK : status(result.error()));
+    return returned(result ? MYOS_STATUS_OK : io_status(result.error()));
 }
 
 static auto write_info(Call& inv, const io::DeviceInfo& info) noexcept -> Result {
@@ -820,7 +809,7 @@ static auto write_info(Call& inv, const io::DeviceInfo& info) noexcept -> Result
 
 static auto info(Call& inv, io::Space& space) noexcept -> Result {
     auto snapshot = space.info();
-    if (!snapshot) return returned(status(snapshot.error()));
+    if (!snapshot) return returned(io_status(snapshot.error()));
     snapshot.value().version = MYOS_IO_INFO_VERSION;
     snapshot.value().requester = 0; // IO_INFO's second word is reserved.
     return write_info(inv, snapshot.value());
@@ -835,7 +824,7 @@ static auto info(Call& inv, io::Space& space) noexcept -> Result {
 
 static auto install(Call& inv,
     std::expected<cap::GrantRef, io::SpaceError>&& exported) noexcept -> Result {
-    if (!exported) return returned(status(exported.error()));
+    if (!exported) return returned(io_status(exported.error()));
     auto lease = exported.value().acquire();
     if (!lease) return returned(MYOS_STATUS_CLOSED);
     const auto ceiling = lease.value().ceiling();
@@ -869,7 +858,7 @@ auto io_call(Call& inv) noexcept -> Result {
 
 template<usize op>
 auto vm_call(Call& inv) noexcept -> Result {
-    arch::TrapContext& trap = inv.trap;
+    arch::TrapCtx& trap = inv.trap;
     cap::CSpace& cspace = inv.cspace;
     const cap::Handle vspace_handle = handle_of(trap.arg(0));
     const cap::Right required = op == MYOS_SYS_VM_MAP
@@ -969,12 +958,11 @@ auto vm_call(Call& inv) noexcept -> Result {
     }
     if constexpr (op == MYOS_SYS_VM_SLICE) {
         const auto access = perms_of(trap.arg(3));
-        const auto types = types_of(trap.arg(4));
-        const auto rights = rights_of(trap.arg(5));
-        if (!access || !types || !rights) {
+        const auto rights = rights_of(trap.arg(4));
+        if (!access || !rights || trap.arg(5) != 0) {
             return returned(MYOS_STATUS_BAD_ARGS);
         }
-        const cap::View slice{*rights, cap::VmLimit{*range,*access,*types}};
+        const cap::View slice{*rights, cap::VmLimit{*range,*access}};
         auto created = cspace.delegate(vspace_handle,cspace,slice,slice);
         return returned(created ? MYOS_STATUS_OK : cap_status(created.error()),
             created ? created->raw() : 0);
@@ -1064,7 +1052,7 @@ auto exit(Call& inv) noexcept -> Result {
         static_cast<usize>(static_cast<isize>(status)), Disposition::Exit};
 }
 
-static void publish(arch::TrapContext& ctx, const Result& result) noexcept {
+static void publish(arch::TrapCtx& ctx, const Result& result) noexcept {
     ctx.set_result(
         0, static_cast<usize>(static_cast<isize>(result.status)));
     ctx.set_result(1, result.value);
@@ -1072,7 +1060,7 @@ static void publish(arch::TrapContext& ctx, const Result& result) noexcept {
 }
 
 
-auto handle(arch::TrapContext& ctx) noexcept -> Disposition {
+auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
     CpuLocal& cpu = current_cpu();
     libk_assert(cpu.dispatcher() != nullptr);
     Thread* target = cpu.dispatcher()->current();

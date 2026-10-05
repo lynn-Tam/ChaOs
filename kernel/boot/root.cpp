@@ -57,7 +57,7 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
         if (!page) {
             return false;
         }
-        byte* const destination = pmm.bytes(page.value().page().page);
+        byte* const destination = pmm.bytes(page.value().page());
         const usize remaining = bytes.size() - copied;
         const usize amount = remaining < mm::page_size ? remaining : mm::page_size;
         if (amount != 0) {
@@ -77,7 +77,6 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
     if (!reference) {
         return false;
     }
-    const mm::MemoryTypes types = mm::MemoryTypes::of(mm::MemoryType::Normal);
     const mm::ObjectRange object{0, memory->page_count()};
     const auto mapped =
         vspace.map(mm::VmCtx{.local = cpu},
@@ -86,7 +85,7 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
                        .object = object,
                        .perms = access,
                    },
-                   std::move(reference).value(), memory.get(), cap::MemLimit{object, access, types});
+                   std::move(reference).value(), memory.get(), cap::MemLimit{object, access});
     return mapped && mapped.value().status == mm::VmStatus::Complete;
 }
 
@@ -107,7 +106,7 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
 } // namespace
 
 auto RootTask::initialize_in(libk::ManualLifetime<RootTask>& storage, object::pool<mm::Mem>& memory,
-                             mm::Pmm& pmm, mm::DirectMap& direct_map, object::ref<object::group>&& pool,
+                             mm::Pmm& pmm, object::ref<object::group>&& pool,
                              BootModule module, mm::BootPages&& reservation) noexcept
     -> std::expected<void, RootTaskError> {
     if (!pool || !module || !module.physical.is_aligned(mm::page_size) ||
@@ -116,7 +115,7 @@ auto RootTask::initialize_in(libk::ManualLifetime<RootTask>& storage, object::po
         reservation.range().page_count() != module.pages.page_count()) {
         return std::unexpected(RootTaskError::InvalidModule);
     }
-    const auto source = direct_map.ptr<const byte>(module.physical, module.size);
+    const auto source = pmm.ptr<const byte>(module.physical, module.size);
     if (!source) {
         return std::unexpected(RootTaskError::InvalidModule);
     }
@@ -134,7 +133,7 @@ auto RootTask::initialize_in(libk::ManualLifetime<RootTask>& storage, object::po
     const mm::Extent extent{
         .object = mm::ObjectRange{0, pages.page_count()},
         .physical = module.pages,
-        .access = mm::Perms::of(mm::Perm::Read),
+        .perms = mm::Perms::of(mm::Perm::Read),
     };
     auto pool_ref = pool.erase();
     if (!pool_ref) {
@@ -144,24 +143,19 @@ auto RootTask::initialize_in(libk::ManualLifetime<RootTask>& storage, object::po
     if (!sponsorship) {
         return std::unexpected(RootTaskError::OutOfMemory);
     }
-    auto image = memory.make(
-        std::move(sponsorship).value(),
-        [&](auto& m) {
-            return m.init_boot({&extent, 1}, mm::BootOwnership::Owned, std::move(pages));
-        },
-        pmm, image_size);
+    auto image = memory.create(std::move(sponsorship).value(), pmm, image_size, mm::PhysCfg{{&extent, 1}, std::move(pages)});
     if (!image) {
         return std::unexpected(RootTaskError::OutOfMemory);
     }
 
-    RootTask& bootstrap = storage.emplace(ConstructionKey{}, direct_map, module);
+    RootTask& bootstrap = storage.emplace(ConstructionKey{}, pmm, module);
     bootstrap.pool_ = std::move(pool);
     bootstrap.package_ = std::move(image).value().publish();
     return {};
 }
 
 auto RootTask::bundle() const noexcept -> std::expected<BootBundle, BundleError> {
-    const auto source = direct_map_->ptr<const byte>(module_.physical, module_.size);
+    const auto source = pmm_->ptr<const byte>(module_.physical, module_.size);
     if (!source) {
         return std::unexpected(BundleError::Truncated);
     }
@@ -186,7 +180,7 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
     auto info_lease = info_->materialize(0);
     if (!info_lease) return std::unexpected(RootTaskError::OutOfMemory);
     auto& info_page = *libk::construct_at(
-        reinterpret_cast<myos_bootstrap_info*>(kernel.pmm().bytes(info_lease.value().page().page)));
+        reinterpret_cast<myos_bootstrap_info*>(kernel.pmm().bytes(info_lease.value().page())));
     info_page.magic = MYOS_BOOTSTRAP_MAGIC;
     info_page.major = MYOS_BOOTSTRAP_MAJOR;
     info_page.minor = MYOS_BOOTSTRAP_MINOR;
@@ -232,22 +226,13 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve, cap::Right::Map,
                         cap::Right::Unmap, cap::Right::Destroy, cap::Right::Protect, cap::Right::Inspect,
                         cap::Right::Manage, cap::Right::Revoke);
-    const mm::MemoryTypes normal = mm::MemoryTypes::of(mm::MemoryType::Normal);
-    const mm::MemoryTypes bootstrap_types =
-        mm::MemoryTypes::of(mm::MemoryType::Normal, mm::MemoryType::Uncached, mm::MemoryType::Device);
     const cap::VmLimit vspace_authority{
         .range = mm::VRange{mm::Virt{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
-        .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
-        // Root init is the trusted bootstrap supervisor.  Its VSpace
-        // authority must include the platform memory classes so it can hand
-        // a device mapping to a user service without manufacturing a second
-        // physical-memory path.
-        .types = bootstrap_types,
+        .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
     };
     const cap::MemLimit bundle_authority{
         .range = mm::ObjectRange{0, package_->page_count()},
-        .access = mm::Perms::of(mm::Perm::Read),
-        .types = normal,
+        .perms = mm::Perms::of(mm::Perm::Read),
     };
     constexpr u64 resource_kinds = MYOS_OBJECT_KINDS;
     const cap::Quota pool_authority{
@@ -263,14 +248,11 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
     const mm::Extent uart_extent{
         .object = mm::ObjectRange{0, 1},
         .physical = *uart_physical,
-        .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+        .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
     };
     auto uart_memory_charge = reserve(object::pool<mm::Mem>::slot_charge());
     auto uart_memory = uart_memory_charge
-                           ? kernel.pool<mm::Mem>().make(
-                                 std::move(uart_memory_charge).value(),
-                                 [&](auto& m) { return m.init_phys({&uart_extent, 1}); },
-                                 kernel.pmm(), mm::page_size)
+                           ? kernel.pool<mm::Mem>().create(std::move(uart_memory_charge).value(), kernel.pmm(), mm::page_size, mm::PhysCfg{{&uart_extent, 1}, {}})
                            : std::expected<object::pool<mm::Mem>::pending, mm::MemErr>{
                                  std::unexpected(mm::MemErr::OutOfMemory)};
     if (!uart_memory) {
@@ -279,7 +261,7 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
     uart_memory_ = std::move(uart_memory).value().publish();
 
     auto uart_irq_charge = reserve(object::pool<irq::Irq>::slot_charge());
-    auto uart_irq = uart_irq_charge ? kernel.io().irqs.create(std::move(uart_irq_charge).value(),
+    auto uart_irq = uart_irq_charge ? kernel.pool<irq::Irq>().create(std::move(uart_irq_charge).value(),
                                                                         virt_uart_irq())
                                     : std::expected<object::pool<irq::Irq>::pending, object::error>{
                                           std::unexpected(object::error::out_of_memory)};
@@ -316,11 +298,9 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
         entry.handle = installed.value().raw();
     }
 
-    const mm::MemoryTypes device = mm::MemoryTypes::of(mm::MemoryType::Device);
     const cap::MemLimit uart_memory_authority{
         .range = mm::ObjectRange{0, 1},
-        .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
-        .types = device,
+        .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
     };
     const auto uart_memory_rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
                                                     cap::Right::Map, cap::Right::Inspect, cap::Right::Revoke);
@@ -352,7 +332,7 @@ auto RootTask::prepare_bootstrap(KernelState& kernel) noexcept -> std::expected<
     if (!context_charge) {
         return std::unexpected(RootTaskError::OutOfMemory);
     }
-    auto pending_context = kernel.sched().contexts.create(std::move(context_charge).value(),
+    auto pending_context = kernel.pool<sched::Sc>().create(std::move(context_charge).value(),
                                                                     sched::Sc::Config{
                                                                         .budget = *budget,
                                                                         .period = *period,
@@ -393,15 +373,10 @@ auto RootTask::load_segments(KernelState& kernel, const BootBundle& package, Cpu
         if (!memory_charge) {
             return std::unexpected(RootTaskError::OutOfMemory);
         }
-        auto memory = kernel.pool<mm::Mem>().make(
-            std::move(memory_charge).value(),
-            [&](auto& m) {
-                return m.init_anon(mm::AnonCfg{
-                    .access = segment.access,
+        auto memory = kernel.pool<mm::Mem>().create(std::move(memory_charge).value(), kernel.pmm(), *size, mm::AnonCfg{
+                    .perms = segment.perms,
                     .eager = true,
                 });
-            },
-            kernel.pmm(), *size);
         if (!memory) {
             return std::unexpected(RootTaskError::OutOfMemory);
         }
@@ -411,12 +386,12 @@ auto RootTask::load_segments(KernelState& kernel, const BootBundle& package, Cpu
             hold.reset();
             return std::unexpected(RootTaskError::OutOfMemory);
         }
-        if (segment.access.contains(mm::Perm::Execute) && !hold->seal()) {
+        if (segment.perms.contains(mm::Perm::Execute) && !hold->seal()) {
             libk_assert(hold.retire());
             hold.reset();
             return std::unexpected(RootTaskError::InvalidState);
         }
-        if (!map_memory(vspace_.get(), cpu, hold, mm::Virt{segment.virtual_address}, segment.access)) {
+        if (!map_memory(vspace_.get(), cpu, hold, mm::Virt{segment.virtual_address}, segment.perms)) {
             libk_assert(hold.retire());
             hold.reset();
             return std::unexpected(RootTaskError::MappingFailed);
@@ -445,7 +420,7 @@ auto RootTask::create_thread(KernelState& kernel, usize entry) noexcept
     auto execution = Env::user(std::move(execution_vspace).value(), std::move(execution_cspace).value(),
                                std::move(ipc_buffer).value());
     if (!execution) return std::unexpected(RootTaskError::InvalidState);
-    auto pending_thread = kernel.tasks().threads.create(
+    auto pending_thread = kernel.pool<Thread>().create(
         std::move(thread_charge).value(), std::move(stack_capacity).commit(), std::move(home).value(),
         std::move(execution).value(),
         Thread::UserStart{
@@ -481,10 +456,10 @@ auto RootTask::start(KernelState& kernel, CpuRuntime& runtime) noexcept
     if (!space_charge || !cspace_charge) {
         return fail(RootTaskError::OutOfMemory);
     }
-    auto space = kernel.pool<mm::VSpace>().make(
-        std::move(space_charge).value(), [&](auto& m) { return m.initialize(); }, kernel.pmm(),
+    auto space = kernel.pool<mm::VSpace>().create(
+        std::move(space_charge).value(), kernel.pmm(),
         kernel.kernel_vspace(), kernel.space_work());
-    auto cspace = kernel.cspaces().create(std::move(cspace_charge).value(), kernel.pmm());
+    auto cspace = kernel.pool<cap::CSpace>().create(std::move(cspace_charge).value(), kernel.pmm());
     if (!space || !cspace) {
         return fail(RootTaskError::OutOfMemory);
     }
@@ -498,33 +473,18 @@ auto RootTask::start(KernelState& kernel, CpuRuntime& runtime) noexcept
     if (!stack_charge || !info_charge || !ipc_charge) {
         return fail(RootTaskError::OutOfMemory);
     }
-    auto stack = kernel.pool<mm::Mem>().make(
-        std::move(stack_charge).value(),
-        [&](auto& m) {
-            return m.init_anon(mm::AnonCfg{
-                .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+    auto stack = kernel.pool<mm::Mem>().create(std::move(stack_charge).value(), kernel.pmm(), root_stack_size, mm::AnonCfg{
+                .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
                 .eager = true,
             });
-        },
-        kernel.pmm(), root_stack_size);
-    auto info = kernel.pool<mm::Mem>().make(
-        std::move(info_charge).value(),
-        [&](auto& m) {
-            return m.init_anon(mm::AnonCfg{
-                .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+    auto info = kernel.pool<mm::Mem>().create(std::move(info_charge).value(), kernel.pmm(), mm::page_size, mm::AnonCfg{
+                .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
                 .eager = true,
             });
-        },
-        kernel.pmm(), mm::page_size);
-    auto ipc_memory = kernel.pool<mm::Mem>().make(
-        std::move(ipc_charge).value(),
-        [&](auto& m) {
-            return m.init_anon(mm::AnonCfg{
-                .access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+    auto ipc_memory = kernel.pool<mm::Mem>().create(std::move(ipc_charge).value(), kernel.pmm(), mm::page_size, mm::AnonCfg{
+                .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
                 .eager = true,
             });
-        },
-        kernel.pmm(), mm::page_size);
     if (!stack || !info || !ipc_memory) {
         return fail(RootTaskError::OutOfMemory);
     }

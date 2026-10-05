@@ -475,11 +475,10 @@ inline void yield() noexcept {
     myos_word_t address,
     myos_word_t size,
     myos_word_t access,
-    myos_word_t memory_types,
     myos_word_t rights) noexcept -> SysResult {
     return syscall(
         MYOS_SYS_VM_SLICE,
-        vspace, address, size, access, memory_types, rights);
+        vspace, address, size, access, rights);
 }
 
 [[nodiscard]] inline auto vm_map(

@@ -48,7 +48,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     for (size_t index = 1; index < 2; ++index) {
         const uintptr_t probe = 0x71000000 + index * 4096;
         const auto region = vm_slice(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
-            probe, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_VM_NORMAL, MYOS_RIGHT_MAP);
+            probe, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP);
         service::require(region.status);
         cap::OwnedCap owner{{region.value, 0}};
         if (vm_map(region.value, opened.capabilities[index].selector(), probe, 4096, 0,

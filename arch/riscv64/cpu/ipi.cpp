@@ -2,8 +2,7 @@
 #include <arch/ipi.hpp>
 
 #include "arch/riscv64/cpu/csr.hpp"
-#include "arch/riscv64/sbi/base.hpp"
-#include "arch/riscv64/sbi/ipi.hpp"
+#include <sbi.hpp>
 
 #include <libk/sync/atomic.hpp>
 
@@ -15,9 +14,8 @@ libk::Atomic<usize> injected_failures{};
 [[nodiscard]] auto consume_injected_failure() noexcept -> bool {
     usize remaining = injected_failures.load<libk::MemoryOrder::Acquire>();
     while (remaining != 0) {
-        if (injected_failures.compare_exchange_weak<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(remaining, remaining - 1)) {
+        if (injected_failures.compare_exchange_weak<libk::MemoryOrder::AcqRel, libk::MemoryOrder::Acquire>(
+                remaining, remaining - 1)) {
             return true;
         }
     }
@@ -26,39 +24,24 @@ libk::Atomic<usize> injected_failures{};
 
 } // namespace
 
-auto ipi_available() noexcept -> bool {
-    return riscv64::sbi::extension_available(
-        riscv64::sbi::ipi_extension_id);
-}
+auto ipi_available() noexcept -> bool { return sbi::probe(sbi::Ext::Ipi); }
 
-auto send_ipi(CpuHwId target) noexcept
-    -> std::expected<void, IpiError> {
+auto send_ipi(CpuHwId target) noexcept -> std::expected<void, IpiError> {
     if (consume_injected_failure()) {
         return std::unexpected(IpiError::Rejected);
     }
-    const riscv64::sbi::HartMask mask =
-        riscv64::sbi::single_hart_mask(target.raw);
-    const riscv64::sbi::Ret result = riscv64::sbi::send_ipi(
-        mask.bits, mask.base);
-    if (result.error == riscv64::sbi::success) {
-        return {};
-    }
-    if (result.error == riscv64::sbi::not_supported) {
-        return std::unexpected(IpiError::NotSupported);
-    }
-    if (result.error == riscv64::sbi::invalid_parameter) {
-        return std::unexpected(IpiError::InvalidTarget);
-    }
+    constexpr usize width = sizeof(usize) * 8;
+    const usize base = target.raw & ~(width - 1);
+    const auto result = sbi::call(sbi::Ext::Ipi, 0, usize{1} << (target.raw - base), base);
+    if (result) return {};
+    if (result.error() == sbi::Unsupported) return std::unexpected(IpiError::NotSupported);
+    if (result.error() == sbi::Invalid) return std::unexpected(IpiError::InvalidTarget);
     return std::unexpected(IpiError::Rejected);
 }
 
-void enable_ipi() noexcept {
-    riscv64::Sie::enable_software();
-}
+void enable_ipi() noexcept { riscv64::Sie::enable_software(); }
 
-void acknowledge_ipi() noexcept {
-    riscv64::Sip::clear_software_pending();
-}
+void acknowledge_ipi() noexcept { riscv64::Sip::clear_software_pending(); }
 
 void inject_ipi_failures_for_test(usize count) noexcept {
     injected_failures.store<libk::MemoryOrder::Release>(count);

@@ -11,7 +11,7 @@ namespace ipc {
 auto Buffer::Perm::bytes(usize offset, usize size) const noexcept -> libk::Span<const byte> {
     if (pmm_ == nullptr || size == 0 || offset >= size_ || size > size_ - offset
         || size > mm::page_size - offset % mm::page_size) return {};
-    return {pmm_->bytes(pages_[offset / mm::page_size].page().page) + offset % mm::page_size, size};
+    return {pmm_->bytes(pages_[offset / mm::page_size].page()) + offset % mm::page_size, size};
 }
 
 auto Buffer::Perm::read(
@@ -28,7 +28,7 @@ auto Buffer::Perm::read(
         const usize available = mm::page_size - in_page;
         const usize remaining = output.size() - copied;
         const usize count = available < remaining ? available : remaining;
-        const byte* const bytes = pmm_->bytes(pages_[page_index].page().page);
+        const byte* const bytes = pmm_->bytes(pages_[page_index].page());
         if (bytes == nullptr) {
             return false;
         }
@@ -52,7 +52,7 @@ auto Buffer::Perm::write(
         const usize available = mm::page_size - in_page;
         const usize remaining = input.size() - copied;
         const usize count = available < remaining ? available : remaining;
-        byte* const bytes = pmm_->bytes(pages_[page_index].page().page);
+        byte* const bytes = pmm_->bytes(pages_[page_index].page());
         if (bytes == nullptr) {
             return false;
         }
@@ -95,6 +95,7 @@ auto Buffer::bind(
                     == mm::MemErr::OutOfMemory
                 ? BufferError::NoMemory : BufferError::Unavailable);
         }
+        if (!pmm.is_ram(page->page())) return std::unexpected(BufferError::Invalid);
         libk_assert(leases.try_push_back(std::move(page).value()));
     }
     // Binding materializes the complete bounded range once, but residency is
@@ -122,6 +123,7 @@ auto Buffer::lease_pages() const noexcept
         if (!page) {
             return std::unexpected(page.error());
         }
+        if (!pmm_->is_ram(page->page())) return std::unexpected(mm::MemErr::NotRam);
         libk_assert(leases.try_push_back(std::move(page).value()));
     }
     // This is the operation-admission linearization point. An invalidation

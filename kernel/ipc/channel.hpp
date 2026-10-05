@@ -344,6 +344,7 @@ private:
     static const cap::GrantAttachmentOps waiter_ops_;
 
     ChannelConfig config_{};
+    object::ref<> payer_{};
     mm::Slab<Message, false> messages_;
     mutable sync::Spin lock_{};
     Side sides_[2]{};

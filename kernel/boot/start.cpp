@@ -7,6 +7,7 @@
 #include <boot/start.hpp>
 #include <console.hpp>
 #include <boot/info.hpp>
+#include <boot/link.hpp>
 #include <state.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
@@ -63,7 +64,7 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
 
     libk_assert(boot_info.timebase_frequency != 0);
     libk_assert(kernel.initialize_clock(boot_info.timebase_frequency));
-    libk_assert(virt_io_start(kernel.io(), kernel.pmm(), boot_info, kernel.clock()));
+    libk_assert(virt_io_start(kernel.pool<io::Device>(), kernel.pmm(), boot_info, kernel.clock()));
     libk_assert(boot_info.cpu);
     const CpuTopo summary = boot_info.cpu.summary();
 
@@ -100,7 +101,6 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
             root_task_storage,
             kernel.pool<mm::Mem>(),
             kernel.pmm(),
-            kernel.direct_map(),
             std::move(pool).value(),
             *boot_info.module,
             std::move(*state.module)));
@@ -121,7 +121,7 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
         CpuSetup provisioner{
             cpus,
             kernel.pmm(),
-            kernel.tasks().threads,
+            kernel.pool<Thread>(),
             kernel.clock(),
             &kernel};
 
@@ -199,10 +199,10 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
     const auto initialized = KernelState::initialize_in(
         kernel_storage,
         std::move(*memory),
-        mm::DirectMap::Layout{
-            .physical_base = mm::Phys{0},
-            .virtual_base = mm::Virt{mm::DirectBegin},
-            .window_size = mm::DirectSize,
+        mm::Pmm::Window{
+            .pa = mm::Phys{0},
+            .va = mm::Virt{mm::DirectBegin},
+            .size = mm::DirectSize,
         });
     memory.reset();
     libk_assert(initialized);
@@ -225,7 +225,9 @@ constinit libk::ManualLifetime<ContinuationState> continuation_storage{};
         libk_assert(kernel.pmm().reclaim(std::move(*reservation)));
     }
 
-    libk_assert(kernel.initialize_kernel_vspace());
+    auto root = kernel_root(kernel.pmm());
+    libk_assert(root);
+    kernel.install_root(std::move(*root), kernel_begin().raw());
     console::print<"kernel vspace: active\n">();
     libk_assert(kernel.pmm().reclaim(std::move(*transition)));
 

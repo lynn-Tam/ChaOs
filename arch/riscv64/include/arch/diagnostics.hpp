@@ -1,6 +1,6 @@
 #pragma once
 
-#include <arch/trap.hpp>
+#include <trap.hpp>
 #include <base/types.hpp>
 
 namespace arch {
@@ -25,8 +25,8 @@ using CallSiteSnapshot = UnwindSeed;
 }
 
 [[nodiscard]] constexpr auto unwind_seed(
-    const TrapSnapshot& trap) noexcept -> UnwindSeed {
-    // TrapSnapshot GPR order is ra, sp, gp, tp, t0-t2, s0, ...
+    const TrapRegs& trap) noexcept -> UnwindSeed {
+    // TrapRegs GPR order is ra, sp, gp, tp, t0-t2, s0, ...
     return UnwindSeed{
         .pc = trap.pc,
         .sp = trap.gpr[1],

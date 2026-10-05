@@ -2,6 +2,7 @@
 
 #include <array>
 #include <expected>
+#include <utility>
 #include <libk/inplace_vector.hpp>
 #include <libk/span.hpp>
 #include <mm/pmm.hpp>
@@ -19,7 +20,7 @@ inline constexpr usize DynamicBegin = DirectEnd;
 constexpr bool is_user(Virt a) noexcept { return a.raw() >= UserBegin && a.raw() < UserEnd; }
 static_assert(UserBegin < UserEnd && DirectEnd > DirectBegin);
 using arch::PtPerm;
-enum class PtErr : u8 { BadAddr, BadPhys, BadAttr, NoMemory, Exists, Missing, Corrupt };
+enum class PtErr : u8 { BadAddr, BadPhys, NoMemory, Exists, Missing, Corrupt };
 struct PtLeaf {
     mm::Page page;
     PtPerm perms;
@@ -76,6 +77,33 @@ class PageTable {
     auto replace(mm::VPage, mm::Page, PtPerm) noexcept -> std::expected<PageUsage, PtErr>;
     auto unmap(mm::VPage) noexcept -> std::expected<PtRemoved, PtErr>;
 
+    // A fresh range: caller keeps it unpublished and serializes tree changes.
+    // Failure removes this invocation's leaves and returns all new tables.
+    template<class Source>
+    auto map(mm::VPage first, usize n, Source next, PtPerm perms) noexcept
+        -> std::expected<void, PtErr> {
+        if (!n || !first.checked_add(n - 1)) return std::unexpected(PtErr::BadAddr);
+        auto plan = count();
+        for (usize i = 0; i < n; ++i)
+            if (!plan.include(*first.checked_add(i))) return std::unexpected(PtErr::BadAddr);
+        auto reserve = tables_.owner().group();
+        if (!reserve.grow(plan.pages())) return std::unexpected(PtErr::NoMemory);
+        for (usize i = 0; i < n; ++i) {
+            auto added = map(*first.checked_add(i), next(), perms, reserve);
+            if (!added) {
+                while (i) { auto removed = unmap(*first.checked_add(--i)); libk_assert(removed); }
+                return added;
+            }
+        }
+        return {};
+    }
+    auto map(mm::Virt va, mm::Pages pages, PtPerm perms) noexcept -> std::expected<void, PtErr> {
+        auto first = mm::VPage::from_base(va);
+        if (!first || !pages.valid()) return std::unexpected(PtErr::BadAddr);
+        usize i{};
+        return map(*first, pages.page_count(), [&] { return *pages.base().checked_add(i++); }, perms);
+    }
+
     static auto dma_pages(usize first, usize count) noexcept -> std::expected<usize, PtErr>;
     template <class Source>
     static auto dma(mm::Pmm &pmm, usize first, usize n, Source next, bool writable) noexcept
@@ -84,13 +112,9 @@ class PageTable {
         if (!pages) return std::unexpected(pages.error());
         auto root = create(pmm, Kind::Io);
         if (!root) return root;
-        auto reserve = pmm.group();
-        if (!reserve.grow(*pages - 1)) return std::unexpected(PtErr::NoMemory);
-        for (usize i = 0; i < n; ++i) {
-            auto va = mm::VPage::from_base(mm::Virt{first + i * mm::page_size});
-            auto mapped = root->map(*va, next(), writable ? PtPerm::UserRw : PtPerm::UserRo, reserve);
-            if (!mapped) return std::unexpected(mapped.error());
-        }
+        auto va = mm::VPage::from_base(mm::Virt{first});
+        auto added = root->map(*va, n, std::move(next), writable ? PtPerm::UserRw : PtPerm::UserRo);
+        if (!added) return std::unexpected(added.error());
         return root;
     }
     static auto dma(mm::Pmm &pmm, usize first, libk::Span<const mm::Page> pages, bool writable) noexcept

@@ -106,7 +106,7 @@ concept Backend = myos::cap::CapBackend<T>
     { T::vspace_create(pool) } -> std::same_as<myos::SysResult>;
     { T::cspace_create(pool, words, words) } -> std::same_as<myos::SysResult>;
     { T::vm_slice(
-          vspace, address, size, access, types, rights) }
+          vspace, address, size, access, rights) }
         -> std::same_as<myos::SysResult>;
     { T::vm_map(region, memory, address, size, words, access) }
         -> std::same_as<myos_status_t>;
@@ -546,7 +546,6 @@ public:
             window.address,
             window.size,
             MYOS_VM_READ,
-            MYOS_VM_NORMAL,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
         if (created.status != MYOS_STATUS_OK || created.value == 0) {
             reset_empty();
@@ -705,7 +704,6 @@ public:
             window.address,
             window.size,
             MYOS_VM_READ | MYOS_VM_WRITE,
-            MYOS_VM_NORMAL,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
         if (created.status != MYOS_STATUS_OK || created.value == 0) {
             reset_empty();

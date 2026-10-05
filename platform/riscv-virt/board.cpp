@@ -5,7 +5,7 @@
 #include <arch/riscv64/irq/plic.hpp>
 #include <arch/riscv64/cpu/csr.hpp>
 #include <console.hpp>
-#include <arch/trap.hpp>
+#include <trap.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <mm/table.hpp>
 
@@ -41,13 +41,13 @@ struct PciBus final {
 static libk::ManualLifetime<PciBus> pci{};
 
 auto virt_uart_irq() noexcept -> irq::Line { return {plic->routes(), VirtUartIrq}; }
-void arch::start_irqs(usize hart) noexcept {
+void virt_irq_start(usize hart) noexcept {
     plic->start(mm::DirectBegin + VirtPlicBase, hart * 2 + 1);
     arch::riscv64::Sie::enable_external();
 }
-void arch::external_irq() noexcept { plic->dispatch(); }
+void virt_irq() noexcept { plic->dispatch(); }
 
-auto virt_io_start(io::objects& objects, mm::Pmm& pmm,
+auto virt_io_start(object::pool<io::Device>& devices, mm::Pmm& pmm,
     const BootInfo& boot, const time::Clock& clock) noexcept -> bool {
     (void)plic.emplace();
     if (!boot.iommu) return true;
@@ -74,7 +74,7 @@ auto virt_io_start(io::objects& objects, mm::Pmm& pmm,
         const u32 id = fn.irq_source();
         auto* node = libk::construct_at(reinterpret_cast<PciBus::Node*>(pending.bytes(page.value())),
             std::move(fn), bus.iommu, clock, irq::Line{plic->routes(), id});
-        auto device = objects.devices.create(node->hw);
+        auto device = devices.create(node->hw);
         if (!device) { libk::destroy_at(node); return false; }
         node->device = std::move(device).value().publish();
         bus.nodes.append(std::move(pending));
@@ -105,10 +105,10 @@ auto virt_device_ref(usize index) noexcept -> std::expected<object::ref<>, objec
 
 auto virt_mmio(const BootInfo& boot) noexcept -> std::array<mm::Region, 5> {
     return {{
-        {{mm::Page{VirtUartBase / mm::page_size}, 1}, mm::Region::Kind::Mmio, mm::CpuAttr::Native},
-        {{mm::Page{VirtPlicBase / mm::page_size}, VirtPlicSize / mm::page_size}, mm::Region::Kind::Mmio, mm::CpuAttr::Native},
-        {{mm::Page{VirtPciEcam / mm::page_size}, 256}, mm::Region::Kind::Mmio, mm::CpuAttr::Native},
-        {{mm::Page{VirtPciMmio / mm::page_size}, 256}, mm::Region::Kind::Mmio, mm::CpuAttr::Native},
-        {boot.iommu.value_or(mm::Pages{}), mm::Region::Kind::Mmio, mm::CpuAttr::Native},
+        {{mm::Page{VirtUartBase / mm::page_size}, 1}, mm::Region::Kind::Mmio},
+        {{mm::Page{VirtPlicBase / mm::page_size}, VirtPlicSize / mm::page_size}, mm::Region::Kind::Mmio},
+        {{mm::Page{VirtPciEcam / mm::page_size}, 256}, mm::Region::Kind::Mmio},
+        {{mm::Page{VirtPciMmio / mm::page_size}, 256}, mm::Region::Kind::Mmio},
+        {boot.iommu.value_or(mm::Pages{}), mm::Region::Kind::Mmio},
     }};
 }

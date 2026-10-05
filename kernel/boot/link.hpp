@@ -18,7 +18,7 @@ extern const char build_id[];
 [[nodiscard]] auto kernel_pages() noexcept -> mm::Pages;
 
 // Converts only addresses inside the statically linked high kernel image.
-// Runtime RAM translation remains owned by mm::DirectMap.
+// Runtime RAM translation remains owned by mm::Pmm.
 [[nodiscard]] auto kernel_phys(mm::Virt address) noexcept
     -> std::optional<mm::Phys>;
 

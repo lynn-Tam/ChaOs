@@ -101,23 +101,14 @@ enum class Right : u64 {
 
 using Rights = libk::enum_flags<Right>;
 
-struct MemLimit final {
-    mm::ObjectRange range{};
-    mm::Perms access{};
-    mm::MemoryTypes types{};
-
-    [[nodiscard]] friend constexpr auto operator==(
-        MemLimit, MemLimit) noexcept -> bool = default;
+template<class Range>
+struct Limit final {
+    Range range{};
+    mm::Perms perms{};
+    friend constexpr auto operator==(Limit, Limit) noexcept -> bool = default;
 };
-
-struct VmLimit final {
-    mm::VRange range{};
-    mm::Perms access{};
-    mm::MemoryTypes types{};
-
-    [[nodiscard]] friend constexpr auto operator==(
-        VmLimit, VmLimit) noexcept -> bool = default;
-};
+using MemLimit = Limit<mm::ObjectRange>;
+using VmLimit = Limit<mm::VRange>;
 
 struct Quota final {
     resource::budget budget{};

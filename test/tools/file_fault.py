@@ -17,11 +17,12 @@ logs.mkdir(parents=True, exist_ok=True)
 probe = '''
 import gdb
 
-def manual(value, name):
-    assert bool(value['engaged_']), 'uninitialized ' + name
-    return value['storage_'].address.cast(gdb.lookup_type(name).pointer()).dereference()
+def manual(value, name=None):
+    assert bool(value['engaged_']), 'uninitialized ' + str(value.type)
+    typ = gdb.lookup_type(name) if name else value.type.strip_typedefs().template_argument(0)
+    return value['storage_'].address.cast(typ.pointer()).dereference()
 state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
-memory = manual(state['memory_objects_'], 'object::store<mm::VSpace, mm::Mem, Pager>')
+memory = manual(state['objects_'])
 def pool(name):
     def find(value):
         if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
@@ -51,8 +52,8 @@ def live_objects(pool, name):
         page = page['next']
 # Requests now live on virtual kernel stacks. Resolve those addresses through
 # the real kernel page table instead of assuming every payload is a RAM alias.
-layout = manual(state['pmm_'], 'mm::Pmm')['direct_map_']['layout_']
-delta = int(layout['virtual_base']['value_']) - int(layout['physical_base']['value_'])
+layout = manual(state['pmm_'], 'mm::Pmm')['window_']
+delta = int(layout['va']['value_']) - int(layout['pa']['value_'])
 kroot = manual(state['kernel_vspace_'], 'mm::KSpace')['root_']['root_']
 inferior = gdb.selected_inferior()
 def alias(address, typ):
@@ -77,8 +78,16 @@ ptr = int(index['sentinel_']['next_']) - int(index['hook_offset_'])
 claim = gdb.Value(ptr).cast(gdb.lookup_type('Pager::Request').pointer()).dereference()
 assert int(claim['info']['id']) != 0 and int(claim['info']['page_index']) == 0
 assert int(claim['info']['count']) == 1
-node_type = gdb.lookup_type('mm::Paged::Node')
-offset = next(f.bitpos // 8 for f in node_type.fields() if f.name == 'request')
+def field_offset(typ, name):
+    for f in typ.fields():
+        if f.name == name: return f.bitpos // 8
+        if f.is_base_class:
+            offset = field_offset(f.type, name)
+            if offset is not None: return f.bitpos // 8 + offset
+    return None
+node_type = gdb.lookup_type('mm::Cache<mm::PagerData>::Node')
+offset = field_offset(node_type, 'request')
+assert offset is not None
 node = gdb.Value(int(claim.address) - offset).cast(node_type.pointer()).dereference()
 queue = node['waiters']
 assert int(queue['waiters']['size_']) == 2, 'both actual faults must remain queued'

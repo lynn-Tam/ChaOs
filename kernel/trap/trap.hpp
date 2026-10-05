@@ -3,17 +3,17 @@
 
 #pragma once
 
-#include <arch/trap.hpp>
+#include <trap.hpp>
 #include <trap/event.hpp>
 
 namespace trap {
 
-void handle(const Event& event, arch::TrapContext& context) noexcept;
+void handle(const Event& event, arch::TrapCtx& context) noexcept;
 
 // Called after logical trap completion and trap_depth decrement while the
 // original TrapFrame remains on the interrupted execution's stack. The
 // dispatcher attaches its preemptive commit boundary here.
-void on_exit(const Event& event, arch::TrapContext& context) noexcept;
+void on_exit(const Event& event, arch::TrapCtx& context) noexcept;
 // The CPU now runs on the selected return stack. Popped stacks can be reused.
 void on_return() noexcept;
 

@@ -98,7 +98,6 @@ struct FakeBackend final {
         myos_word_t,
         myos_word_t,
         myos_word_t,
-        myos_word_t,
         myos_word_t) noexcept -> myos::SysResult {
         return {MYOS_STATUS_OK, 13, 0};
     }
@@ -319,10 +318,9 @@ struct ReturningFaultBackend final {
         myos_word_t address,
         myos_word_t size,
         myos_word_t access,
-        myos_word_t types,
         myos_word_t rights) noexcept -> myos::SysResult {
         return FakeBackend::vm_slice(
-            vspace, address, size, access, types, rights);
+            vspace, address, size, access, rights);
     }
 
     [[nodiscard]] static auto vm_map(

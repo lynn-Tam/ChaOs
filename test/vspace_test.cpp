@@ -16,6 +16,7 @@
 #include <object/group.hpp>
 #include <mm/pager.hpp>
 #include <boot/link.hpp>
+#include <boot/info.hpp>
 #include <task/env.hpp>
 
 //Confirmatory experiment.
@@ -68,36 +69,34 @@ public:
                 mm::Pages{*test_end, image.limit()->raw() - test_end->raw()}, mm::Region::Kind::Kernel}))
             return false;
         if (!mm::Pmm::initialize_in(
-                vspace_test_pmm, std::move(map), mm::DirectMap::Layout{
-                .physical_base = mm::Phys{0},
-                .virtual_base = mm::Virt{mm::DirectBegin},
-                .window_size = mm::DirectSize,
+                vspace_test_pmm, std::move(map), mm::Pmm::Window{
+                .pa = mm::Phys{0},
+                .va = mm::Virt{mm::DirectBegin},
+                .size = mm::DirectSize,
             })) {
             reset();
             return false;
         }
         vspace_test_map.reset();
-        if (!mm::KSpace::build_in(
-                vspace_test_kernel, *vspace_test_pmm)) {
-            reset();
-            return false;
-        }
+        auto root = kernel_root(*vspace_test_pmm);
+        if (!root) { reset(); return false; }
+        (void)vspace_test_kernel.emplace(*vspace_test_pmm, std::move(*root), kernel_begin().raw());
         auto& work = vspace_test_work.emplace();
 
         auto& mm = vspace_test_mm.emplace(*vspace_test_pmm, vspace_test_notify);
         (void)vspace_test_groups.emplace(*vspace_test_pmm, vspace_test_notify);
         (void)vspace_test_cspaces.emplace(*vspace_test_pmm, vspace_test_notify);
-        auto memory = mm.get<mm::Mem>().make({}, [&](auto& m) { return m.init_anon(mm::AnonCfg{
-                .access = mm::Perms::of(
+        auto memory = mm.get<mm::Mem>().create({}, *vspace_test_pmm, pages * mm::page_size, mm::AnonCfg{
+                .perms = mm::Perms::of(
                     mm::Perm::Read, mm::Perm::Write),
                 .eager = eager,
-            }); }, *vspace_test_pmm, pages * mm::page_size);
+            });
         if (!memory) {
             reset();
             return false;
         }
         memory_ = std::move(memory).value().publish();
-        auto space = mm.get<mm::VSpace>().make({}, [&](auto& m) { return m.initialize(); }, *vspace_test_pmm, *vspace_test_kernel, work);
+        auto space = mm.get<mm::VSpace>().create(resource::Reservation{}, *vspace_test_pmm, *vspace_test_kernel, work);
         if (!space) {
             reset();
             return false;
@@ -133,9 +132,8 @@ public:
         -> cap::MemLimit {
         return cap::MemLimit{
             .range = mm::ObjectRange{0, pages},
-            .access = mm::Perms::of(
+            .perms = mm::Perms::of(
                 mm::Perm::Read, mm::Perm::Write),
-            .types = mm::MemoryTypes::of(mm::MemoryType::Normal),
         };
     }
 
@@ -145,11 +143,10 @@ public:
             .range = mm::VRange{
                 mm::Virt{mm::UserBegin},
                 mm::UserEnd - mm::UserBegin},
-            .access = mm::Perms::of(
+            .perms = mm::Perms::of(
                 mm::Perm::Read,
                 mm::Perm::Write,
                 mm::Perm::Execute),
-            .types = mm::MemoryTypes::of(mm::MemoryType::Normal),
         };
     }
 
@@ -325,12 +322,11 @@ bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noex
         vspace_test_cspaces->drain_reclaim();
         vspace_test_groups->drain_reclaim();
     });
-    auto pending = memories.create(fixture.pmm(), page_size);
-    if (!pending) return false;
     auto reference = pager.erase();
     const auto access = Perms::of(Perm::Read);
-    if (!reference || !pending.value().get().init_paged(std::move(reference).value(), access))
-        return false;
+    if (!reference) return false;
+    auto pending = memories.create(fixture.pmm(), page_size, mm::PagedCfg{std::move(*reference), access});
+    if (!pending) return false;
     auto memory = std::move(pending).value().publish();
     const VRange ranges[]{ {Virt{0x40000}, page_size}, {Virt{0x50000}, page_size} };
     auto cleanup = libk::on_scope_exit([&]() noexcept {
@@ -610,7 +606,7 @@ bool test_sponsored_table_capacity_follows_retirement(
     if (!reserved) {
         return false;
     }
-    auto pending_space = vspace_test_mm->get<mm::VSpace>().make(std::move(reserved).value(), [&](auto& m) { return m.initialize(); }, *vspace_test_pmm, *vspace_test_kernel, *vspace_test_work);
+    auto pending_space = vspace_test_mm->get<mm::VSpace>().create(std::move(reserved).value(), *vspace_test_pmm, *vspace_test_kernel, *vspace_test_work);
     if (!pending_space) {
         return false;
     }
@@ -704,9 +700,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
         if (!charge) return false;
         auto space = txn->make(vspace_test_mm->get<mm::VSpace>(), std::move(*charge),
             fixture.pmm(), *vspace_test_kernel, *vspace_test_work);
-        if (!space) return false;
-        auto ready = space->get().initialize();
-        failed = !ready && ready.error() == mm::VSpaceError::ResourceExhausted;
+        failed = !space && space.error() == mm::VSpaceError::ResourceExhausted;
     }
     vspace_test_mm->drain();
     const bool refunded = pool->available() == limit && pool->sponsorship_count() == 0;

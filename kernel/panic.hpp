@@ -6,9 +6,7 @@
 #include <libk/sync/atomic.hpp>
 #include <cpu/types.hpp>
 #include <arch/diagnostics.hpp>
-#include <arch/trap.hpp>
-
-namespace arch { class TrapContext; }
+#include <trap.hpp>
 
 class CpuRegistry;
 
@@ -19,7 +17,7 @@ struct PanicSlot final {
     const char* reason{};
     libk::AssertInfo site{};
     arch::CallSiteSnapshot call_site{};
-    arch::TrapSnapshot trap{};
+    arch::TrapRegs trap{};
     CpuRegistry* registry{};
     usize current_thread{};
     usize active_root{};
@@ -31,6 +29,6 @@ struct PanicSlot final {
 };
 
 [[noreturn]] void panic(
-    const char* reason, const arch::TrapContext* trap = nullptr,
+    const char* reason, const arch::TrapCtx* trap = nullptr,
     std::source_location site = std::source_location::current()) noexcept;
-[[noreturn]] void panic_stop(const arch::TrapContext&) noexcept;
+[[noreturn]] void panic_stop(const arch::TrapCtx&) noexcept;

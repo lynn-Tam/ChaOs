@@ -106,18 +106,12 @@ auto pending_vm_wait(CpuRuntime& runtime) noexcept -> bool {
         }
     }
     if (!remote) return true; // The single-hart publication test still runs.
-    auto space_pending = kernel.pool<mm::VSpace>().make(
-        {}, [&](auto& m) { return m.initialize(); }, kernel.pmm(), kernel.kernel_vspace(),
+    auto space_pending = kernel.pool<mm::VSpace>().create(
+        resource::Reservation{}, kernel.pmm(), kernel.kernel_vspace(),
         kernel.space_work());
     libk_assert(space_pending);
     auto space = std::move(space_pending).value().publish();
-    auto memory_pending = kernel.pool<mm::Mem>().make(
-        {},
-        [&](auto& m) {
-            return m.init_anon(
-                mm::AnonCfg{.access = mm::Perms::of(mm::Perm::Read), .eager = true});
-        },
-        kernel.pmm(), mm::page_size);
+    auto memory_pending = kernel.pool<mm::Mem>().create({}, kernel.pmm(), mm::page_size, mm::AnonCfg{.perms = mm::Perms::of(mm::Perm::Read), .eager = true});
     libk_assert(memory_pending);
     auto memory = std::move(memory_pending).value().publish();
     auto cleanup = libk::on_scope_exit([&]() noexcept {
@@ -134,20 +128,20 @@ auto pending_vm_wait(CpuRuntime& runtime) noexcept -> bool {
     libk_assert(reference);
     auto mapped =
         space->map(context, {range, {0, 1}, access}, std::move(reference).value(), memory.get(),
-                   {.range = {0, 1}, .access = access, .types = mm::MemoryTypes::of(mm::MemoryType::Normal)});
+                   {.range = {0, 1}, .perms = access});
     libk_assert(mapped && mapped.value().status == mm::VmStatus::Complete);
     VmPeer peer{space.get(), kernel};
     auto stack = mm::Stack::create(kernel.kernel_vspace());
     libk_assert(stack);
     auto thread_pending =
-        kernel.tasks().threads.create(std::move(stack).value(), Env::kernel(kernel.kernel_vspace()),
+        kernel.pool<Thread>().create(std::move(stack).value(), Env::kernel(kernel.kernel_vspace()),
                                       Thread::KernelStart{vm_peer_entry, &peer});
     libk_assert(thread_pending);
     auto thread = std::move(thread_pending).value().publish();
     auto budget = kernel.clock().duration_from_nanoseconds(1'000'000);
     auto period = kernel.clock().duration_from_nanoseconds(10'000'000);
     libk_assert(budget && period);
-    auto sc_pending = kernel.sched().contexts.create(sched::Sc::Config{.budget = *budget, .period = *period},
+    auto sc_pending = kernel.pool<sched::Sc>().create(sched::Sc::Config{.budget = *budget, .period = *period},
                                                      kernel.clock().now());
     libk_assert(sc_pending);
     auto sc = std::move(sc_pending).value().publish();
@@ -212,18 +206,13 @@ auto live_trim(CpuRuntime& rt) noexcept -> bool {
     auto pager = std::move(*pg).publish();
     auto pg_ref = pager.erase();
     if (!pg_ref) return false;
-    auto pending = k.pool<mm::Mem>().make(
-        {},
-        [&](auto& m) {
-            return m.init_paged(std::move(*pg_ref), Perms::of(Perm::Read, Perm::Write), false);
-        },
-        k.pmm(), page_size);
+    auto pending = k.pool<mm::Mem>().create({}, k.pmm(), page_size, mm::PagedCfg{std::move(*pg_ref), Perms::of(Perm::Read, Perm::Write), false});
     if (!pending) return false;
     auto mem = std::move(*pending).publish();
-    auto a = k.pool<mm::VSpace>().make(
-             {}, [&](auto& m) { return m.initialize(); }, k.pmm(), k.kernel_vspace(), k.space_work()),
-         b = k.pool<mm::VSpace>().make(
-             {}, [&](auto& m) { return m.initialize(); }, k.pmm(), k.kernel_vspace(), k.space_work());
+    auto a = k.pool<mm::VSpace>().create(
+             resource::Reservation{}, k.pmm(), k.kernel_vspace(), k.space_work()),
+         b = k.pool<mm::VSpace>().create(
+             resource::Reservation{}, k.pmm(), k.kernel_vspace(), k.space_work());
     if (!a || !b) return false;
     auto first = std::move(*a).publish(), second = std::move(*b).publish();
     auto cleanup = libk::on_scope_exit([&]() noexcept {
@@ -255,7 +244,7 @@ auto live_trim(CpuRuntime& rt) noexcept -> bool {
         if (!ref) return false;
         auto map =
             space->map(ctx, {range, {0, 1}, perms}, std::move(*ref), mem.get(),
-                       {.range = {0, 1}, .access = perms, .types = MemoryTypes::of(MemoryType::Normal)});
+                       {.range = {0, 1}, .perms = perms});
         if (!map) return false;
         auto fault = space->fault(ctx, range.base(), Perm::Read);
         if (!fault || fault->kind != FaultKind::Materialized) return false;
@@ -272,7 +261,7 @@ auto live_trim(CpuRuntime& rt) noexcept -> bool {
     if (!fault || fault->kind != FaultKind::Materialized) return false;
     auto held = mem->materialize(0);
     if (!held) return false;
-    k.pmm().bytes(held->page().page)[0] = byte{0x6b};
+    k.pmm().bytes(held->page())[0] = byte{0x6b};
     if (!mem->observe_usage(0, false, true)) return false;
     held->reset();
     auto dirty = mem->trim(thread, cpus, {0, 1});
@@ -311,7 +300,7 @@ auto wait_publication(CpuRuntime& runtime) noexcept -> bool {
     }
     WaitState state{};
     auto pending_thread =
-        kernel.tasks().threads.create(std::move(stack).value(), Env::kernel(kernel.kernel_vspace()),
+        kernel.pool<Thread>().create(std::move(stack).value(), Env::kernel(kernel.kernel_vspace()),
                                       Thread::KernelStart{wait_entry, &state});
     if (!pending_thread) {
         return false;
@@ -325,7 +314,7 @@ auto wait_publication(CpuRuntime& runtime) noexcept -> bool {
         kernel.drain_reclaim();
         return false;
     }
-    auto pending_context = kernel.sched().contexts.create(
+    auto pending_context = kernel.pool<sched::Sc>().create(
         sched::Sc::Config{.budget = *budget, .period = *period}, kernel.clock().now());
     if (!pending_context) {
         static_cast<void>(thread.retire());

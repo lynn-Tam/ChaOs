@@ -168,7 +168,7 @@ public:
         if (status != MYOS_STATUS_OK) return status;
         return add("bundle", myos::service::capability(info, MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE),
                    MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT,
-                   0, Window::round_size(info.bundle_size()) / 4096, MYOS_VM_READ, MYOS_VM_NORMAL);
+                   0, Window::round_size(info.bundle_size()) / 4096, MYOS_VM_READ, 0);
     }
     // Validate the whole graph before publishing any task. Names select an
     // already authorized root or a declared provider export; they grant no rights.

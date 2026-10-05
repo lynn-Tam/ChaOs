@@ -62,12 +62,6 @@ enum class DescriptorForm : uint8_t {
             || (access & MYOS_VM_READ) != 0);
 }
 
-[[nodiscard]] constexpr auto valid_types(uint64_t types) noexcept -> bool {
-    constexpr uint64_t valid = uint64_t{MYOS_VM_NORMAL}
-        | uint64_t{MYOS_VM_UNCACHED} | uint64_t{MYOS_VM_DEVICE};
-    return types != 0 && (types & ~valid) == 0;
-}
-
 [[nodiscard]] constexpr auto valid_rights(uint64_t rights) noexcept -> bool {
     return (rights & ~uint64_t{MYOS_RIGHT_MASK}) == 0;
 }
@@ -104,16 +98,14 @@ enum class DescriptorForm : uint8_t {
     case MYOS_OBJECT_KIND_MEMORY:
         return valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
-            && valid_types(value.words[3])
-            && zero_words(value, 4);
+            && zero_words(value, 3);
     case MYOS_OBJECT_KIND_VSPACE:
         return value.words[0] != 0 && value.words[1] != 0
             && (value.words[0] % DEPLOY_PAGE_SIZE) == 0
             && (value.words[1] % DEPLOY_PAGE_SIZE) == 0
             && valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
-            && valid_types(value.words[3])
-            && zero_words(value, 4);
+            && zero_words(value, 3);
     case MYOS_OBJECT_KIND_RESOURCE_POOL: {
         constexpr uint64_t valid_mask =
             MYOS_OBJECT_KINDS;
@@ -181,8 +173,7 @@ enum class DescriptorForm : uint8_t {
         return range_within(
                    ceiling.words[0], ceiling.words[1], requested.words[0],
                    requested.words[1])
-            && (requested.words[2] & ~ceiling.words[2]) == 0
-            && (requested.words[3] & ~ceiling.words[3]) == 0;
+            && (requested.words[2] & ~ceiling.words[2]) == 0;
     case MYOS_OBJECT_KIND_RESOURCE_POOL:
         return requested.words[0] <= ceiling.words[0]
             && requested.words[1] <= ceiling.words[1]

@@ -13,6 +13,7 @@
 #include <mm/pmm.hpp>
 #include <mm/tlb.hpp>
 #include <boot/link.hpp>
+#include <boot/info.hpp>
 
 namespace {
 
@@ -51,13 +52,13 @@ class PmmFixture : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto initialize(mm::RegionList&& memory_map) noexcept
         -> mm::Pmm::InitializationResult {
         return mm::Pmm::initialize_in(
-            storage_, std::move(memory_map), mm::DirectMap::Layout{
-                .physical_base = mm::Phys{
+            storage_, std::move(memory_map), mm::Pmm::Window{
+                .pa = mm::Phys{
                     kernel_phys(mm::Virt{
                         reinterpret_cast<uintptr_t>(test_ram)})->raw()},
-                .virtual_base = mm::Virt{
+                .va = mm::Virt{
                     reinterpret_cast<uintptr_t>(test_ram)},
-                .window_size = sizeof(test_ram),
+                .size = sizeof(test_ram),
             });
     }
 
@@ -196,8 +197,6 @@ consteval auto sv39_pte_representation_contract() noexcept -> bool {
         && !reserved_leaf.leaf_page()
         && reserved_branch.is_non_leaf()
         && !reserved_branch.next_table_page()
-        && !arch::Pte::leaf_4k(page, arch::PtPerm::Rw, true, mm::CpuAttr::Nc)
-        && !arch::Pte::leaf_4k(page, arch::PtPerm::Rw, true, mm::CpuAttr::Io)
         && !write_without_read.is_leaf()
         && !write_without_read.is_non_leaf()
         && !arch::Pte::non_leaf(invalid_page)
@@ -775,10 +774,10 @@ bool test_direct_map_preserves_ram_independent_of_allocation_state(
     const auto expected_ram = page_range(0, 80);
 
     auto coverage = [&] {
-        return memory.direct_map().map(expected_ram.base().base(),
+        return memory.virt(expected_ram.base().base(),
                    expected_ram.page_count() * mm::page_size).has_value()
-            && memory.direct_map().map(kernel_image.base().base(), mm::page_size).has_value()
-            && memory.direct_map().map(firmware.base().base(), mm::page_size).has_value();
+            && memory.virt(kernel_image.base().base(), mm::page_size).has_value()
+            && memory.virt(firmware.base().base(), mm::page_size).has_value();
     };
     if (memory.arena_count() != 1 || memory.metadata_page_count() == 0 || !coverage())
         return false;
@@ -825,6 +824,16 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
         for (auto va : {*first, *next, *distant})
             if (!user->map(va, payload->page(), arch::PtPerm::UserRw, reserve)) return false;
         if (reserve.page_count() != 0 || user->page_count() != 4) return false;
+        // A failed fresh batch preserves old leaves and refunds its new branches.
+        auto fresh = *first->checked_add(1024);
+        const auto available = pmm.free_page_count();
+        usize supplied{};
+        auto failed = user->map(fresh, 2, [&] {
+            return supplied++ == 0 ? payload->page() : mm::Page{};
+        }, arch::PtPerm::UserRw);
+        if (failed || failed.error() != mm::PtErr::BadPhys || user->page_count() != 4
+            || pmm.free_page_count() != available || user->query(fresh)
+            || !user->query(*first) || !user->query(*distant)) return false;
         auto usage = user->usage(*first);
         if (!usage || usage->accessed || usage->dirty) return false;
         // Simulate the same atomic A/D updates as the hardware walker.
@@ -874,8 +883,7 @@ bool test_initial_page_table_exhaustion_rolls_back(
 
     auto& memory = fixture.memory();
     const size_t initial_free = memory.free_page_count();
-    libk::ManualLifetime<mm::KSpace> root;
-    const auto result = mm::KSpace::build_in(root, memory);
+    const auto result = kernel_root(memory);
 
     return !result
         && result.error()
@@ -902,10 +910,10 @@ bool test_initial_page_table_unrepresentable_range_rolls_back(
     libk_assert(base);
     const auto result = mm::Pmm::initialize_in(
         secondary_memory_storage, std::move(map),
-        mm::DirectMap::Layout{
-            .physical_base = *base,
-            .virtual_base = mm::Virt{reinterpret_cast<uintptr_t>(test_ram)},
-            .window_size = sizeof(test_ram),
+        mm::Pmm::Window{
+            .pa = *base,
+            .va = mm::Virt{reinterpret_cast<uintptr_t>(test_ram)},
+            .size = sizeof(test_ram),
         });
     secondary_memory_storage.reset();
     return !result && result.error() == mm::PmmInitError::OutsideWindow;
@@ -924,12 +932,6 @@ bool test_invalid_region_is_rejected(const TestContext&) noexcept {
         (void)append_region(map, 0, 0, mm::Region::Kind::Ram);
         PmmFixture fixture{primary_memory_storage, std::move(map)};
         if (fixture || fixture.error() != mm::PmmInitError::InvalidRegion) return false;
-    }
-    for (const auto attr : {mm::CpuAttr::Nc, mm::CpuAttr::Io}) {
-        auto map = make_available_map();
-        map.front().attr = attr;
-        PmmFixture fixture{primary_memory_storage, std::move(map)};
-        if (fixture || fixture.error() != mm::PmmInitError::BadAttr) return false;
     }
     return true;
 }
@@ -980,17 +982,21 @@ bool test_node_key_survives_page_reuse(const TestContext&) noexcept {
     auto& memory = fixture.memory();
     const auto free = memory.free_page_count();
     mm::Slab<unsigned> nodes{memory, {.nodes = 1, .pages = 1}};
-    auto first = nodes.create(1u);
+    auto first = nodes.create({}, 1u);
     if (!first) return false;
-    const auto key = first.value().key;
-    nodes.destroy(*first.value().object);
+    const auto key = first->key;
+    auto moved = std::move(nodes);
+    const bool retained = !nodes.live_count() && !nodes.find(key)
+        && moved.find(key) == first->object;
+    moved.destroy(*first->object);
     const bool returned = memory.free_page_count() == free;
-    auto second = nodes.create(2u);
+    auto second = moved.create({}, 2u);
     if (!second) return false;
-    const bool valid = returned && second.value().key.generation > key.generation
-        && nodes.find(key) == nullptr && *nodes.find(second.value().key) == 2u;
-    nodes.destroy(*second.value().object);
+    const bool valid = retained && returned && second->key.generation > key.generation
+        && moved.find(key) == nullptr && *moved.find(second->key) == 2u;
+    moved.destroy(*second->object);
     return valid && memory.free_page_count() == free;
+
 }
 
 } // namespace

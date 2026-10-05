@@ -150,11 +150,21 @@ auto Sponsorship::reserve(budget charge) const noexcept
     return owner_->reserve(*this, charge);
 }
 
-auto Sponsorship::acquire(budget charge) const noexcept
+auto acquire(const object::ref<>& payer, budget amount) noexcept
     -> std::expected<Charge, errc> {
-    auto reserved = reserve(charge);
+    if (!payer) return Charge{};
+    auto owner = payer.as<object::group>();
+    auto ref = payer.clone();
+    if (!owner || !ref) return std::unexpected(errc::invalid);
+    auto reserved = owner->get().reserve(std::move(*ref), amount);
     if (!reserved) return std::unexpected(reserved.error());
-    return (std::move(reserved).value().commit());
+    return std::move(*reserved).commit();
+}
+
+auto Sponsorship::acquire(budget amount) const noexcept
+    -> std::expected<Charge, errc> {
+    if (!owner_) return std::unexpected(errc::invalid);
+    return resource::acquire(ref_, amount);
 }
 
 auto Sponsorship::detach() noexcept -> Refund {
@@ -244,7 +254,7 @@ auto group::begin(ref<> self) noexcept -> std::expected<Txn, errc> {
     fee.owner_ = this;
     fee.ref_ = std::move(self);
     fee.charge_ = cost;
-    auto made = allocations_.create();
+    auto made = allocations_.create({});
     if (!made) {
         finish();
         return std::unexpected(errc::exhausted);

@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include <arch/user.hpp>
+#include <trap.hpp>
 #include <base/types.hpp>
 #include <arch/context.hpp>
 #include <array>

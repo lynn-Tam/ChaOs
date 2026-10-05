@@ -4,8 +4,6 @@
 #include <utility>
 #include <mm/kspace.hpp>
 #include <mm/pmm.hpp>
-#include <kernel/task/objects.hpp>
-#include <kernel/sched/objects.hpp>
 #include <object/group.hpp>
 #include <object/pool.hpp>
 #include <mm/mem.hpp>
@@ -40,8 +38,8 @@ constinit libk::ManualLifetime<mm::RegionList> sched_test_memory_map{};
 constinit libk::ManualLifetime<mm::Pmm> sched_test_pmm{};
 constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> sched_test_mm{};
 constinit libk::delegate<void() noexcept> sched_test_notify{};
-constinit libk::ManualLifetime<Tasks> sched_test_tasks{};
-constinit libk::ManualLifetime<sched::objects> sched_test_sched{};
+constinit libk::ManualLifetime<object::store<Thread, object::group>> sched_test_tasks{};
+constinit libk::ManualLifetime<object::store<sched::Domain, sched::Sc>> sched_test_sched{};
 constinit libk::ManualLifetime<mm::SpaceWork>
     sched_test_vspace_work{};
 constinit libk::ManualLifetime<mm::KSpace> sched_test_kernel{};
@@ -111,12 +109,12 @@ public:
             return false;
         }
         if (!mm::Pmm::initialize_in(
-                sched_test_pmm, std::move(map), mm::DirectMap::Layout{
-                .physical_base = mm::Phys{
+                sched_test_pmm, std::move(map), mm::Pmm::Window{
+                .pa = mm::Phys{
                     physical->raw()},
-                .virtual_base = mm::Virt{
+                .va = mm::Virt{
                     reinterpret_cast<usize>(sched_test_ram)},
-                .window_size = sizeof(sched_test_ram),
+                .size = sizeof(sched_test_ram),
             })) {
             reset();
             return false;
@@ -127,12 +125,7 @@ public:
             reset();
             return false;
         }
-        mm::PageTable root = std::move(builder).value();
-        if (!mm::KSpace::adopt_in(
-                sched_test_kernel, *sched_test_pmm, std::move(root))) {
-            reset();
-            return false;
-        }
+        (void)sched_test_kernel.emplace(*sched_test_pmm, std::move(*builder), kernel_begin().raw());
         (void)sched_test_vspace_work.emplace();
         [[maybe_unused]] auto& memory =
             sched_test_mm.emplace(*sched_test_pmm, sched_test_notify);
@@ -286,7 +279,7 @@ bool test_object_store_unpublished_construction_rolls_back(
         if (!stack) {
             return false;
         }
-        auto pending = sched_test_tasks->threads.create(
+        auto pending = sched_test_tasks->get<Thread>().create(
             std::move(stack).value(),
             Env::kernel(*sched_test_kernel),
             Thread::KernelStart{unused_thread_entry, nullptr});
@@ -308,14 +301,14 @@ bool test_resource_pool_refunds_after_object_reclaim(
     }
 
     constexpr resource::budget limit{
-        .memory = 4 * mm::page_size,
+        .memory = 3 * mm::page_size,
         .caps = 4,
     };
     constexpr resource::budget charge{
         .memory = mm::page_size,
         .caps = 1,
     };
-    auto pending_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
+    auto pending_pool = sched_test_tasks->get<object::group>().create(*sched_test_pmm, limit);
     if (!pending_pool) {
         return false;
     }
@@ -349,24 +342,25 @@ bool test_resource_pool_refunds_after_object_reclaim(
     if (!reserved) {
         return false;
     }
-    auto pending_memory = sched_test_mm->get<mm::Mem>().make(std::move(reserved).value(), [&](auto& m) { return m.init_anon({}); }, *sched_test_pmm, 2 * mm::page_size);
+    auto pending_memory = sched_test_mm->get<mm::Mem>().create(std::move(reserved).value(), *sched_test_pmm, 2 * mm::page_size, mm::AnonCfg{});
     if (!pending_memory) {
         return false;
     }
     auto memory = std::move(pending_memory).value().publish();
     const resource::budget after_backing{
-        .memory = limit.memory - charge.memory - mm::page_size,
+        .memory = limit.memory - charge.memory,
         .caps = limit.caps - charge.caps,
     };
-    if (pool->sponsorship_count() != 2
+    if (pool->sponsorship_count() != 1
         || pool->available() != after_backing
         || pool->can_retire()) {
         return false;
     }
+    // Storage and residents carry capacity charges; only the Mem slot is registered.
     auto first_result = memory.get().materialize(0);
     if (!first_result
         || pool->available().memory != 0
-        || pool->sponsorship_count() != 4) {
+        || pool->sponsorship_count() != 1) {
         return false;
     }
     auto first_page = std::move(first_result).value();
@@ -374,7 +368,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
     if (exhausted
         || exhausted.error() != mm::MemErr::ResourceExhausted
         || pool->available().memory != 0
-        || pool->sponsorship_count() != 4) {
+        || pool->sponsorship_count() != 1) {
         return false;
     }
     first_page.reset();
@@ -426,7 +420,7 @@ bool test_resource_pool_child_returns_transferred_budget(
         .memory = child_limit.memory + mm::page_size,
         .caps = child_limit.caps,
     };
-    auto pending_parent = sched_test_tasks->groups.create(*sched_test_pmm, parent_limit);
+    auto pending_parent = sched_test_tasks->get<object::group>().create(*sched_test_pmm, parent_limit);
     if (!pending_parent) {
         return false;
     }
@@ -440,7 +434,7 @@ bool test_resource_pool_child_returns_transferred_budget(
     if (!child_charge) {
         return false;
     }
-    auto pending_child = sched_test_tasks->groups.create(std::move(child_charge).value(), *sched_test_pmm, child_limit);
+    auto pending_child = sched_test_tasks->get<object::group>().create(std::move(child_charge).value(), *sched_test_pmm, child_limit);
     if (!pending_child) {
         return false;
     }
@@ -459,13 +453,13 @@ bool test_resource_pool_child_returns_transferred_budget(
     if (!reserved) {
         return false;
     }
-    auto pending_memory = sched_test_mm->get<mm::Mem>().make(std::move(reserved).value(), [&](auto& m) { return m.init_anon({}); }, *sched_test_pmm, mm::page_size);
+    auto pending_memory = sched_test_mm->get<mm::Mem>().create(std::move(reserved).value(), *sched_test_pmm, mm::page_size, mm::AnonCfg{});
     if (!pending_memory) {
         return false;
     }
     auto memory = std::move(pending_memory).value().publish();
     if (child.retire()
-        || child->sponsorship_count() != 2
+        || child->sponsorship_count() != 1
         || parent->sponsorship_count() != 1) {
         return false;
     }
@@ -514,7 +508,7 @@ bool test_resource_pool_close_waits_for_open_transactions(
         .caps = 1,
     };
 
-    auto pending_txn_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
+    auto pending_txn_pool = sched_test_tasks->get<object::group>().create(*sched_test_pmm, limit);
     if (!pending_txn_pool) {
         return false;
     }
@@ -557,7 +551,7 @@ bool test_resource_pool_close_waits_for_open_transactions(
     sched_test_sched->drain();
     sched_test_tasks->drain();
 
-    auto pending_reservation_pool = sched_test_tasks->groups.create(*sched_test_pmm, limit);
+    auto pending_reservation_pool = sched_test_tasks->get<object::group>().create(*sched_test_pmm, limit);
     if (!pending_reservation_pool) {
         return false;
     }
@@ -644,7 +638,7 @@ bool test_domain_admission_is_conservative_and_transactional(
     if (!capacity) {
         return false;
     }
-    auto pending_domain = sched_test_sched->domains.create(
+    auto pending_domain = sched_test_sched->get<sched::Domain>().create(
         std::move(capacity).value(),
         sched::Domain::share_scale,
         100'000U);
@@ -657,7 +651,7 @@ bool test_domain_admission_is_conservative_and_transactional(
     constexpr u64 budgets[3]{1, 1, 1};
     constexpr u64 periods[3]{3, 3, 2};
     for (usize index = 0; index < 3; ++index) {
-        auto pending = sched_test_sched->contexts.create(
+        auto pending = sched_test_sched->get<sched::Sc>().create(
             sched::Sc::Config{
                 .budget = Duration::from_ticks(budgets[index]),
                 .period = Duration::from_ticks(periods[index]),
@@ -721,7 +715,7 @@ bool test_ready_queue_orders_priority_and_fifo(
     if (!capacity) {
         return false;
     }
-    auto pending_domain = sched_test_sched->domains.create(
+    auto pending_domain = sched_test_sched->get<sched::Domain>().create(
         std::move(capacity).value(),
         sched::Domain::share_scale,
         0U);
@@ -738,7 +732,7 @@ bool test_ready_queue_orders_priority_and_fifo(
         if (!stack) {
             return false;
         }
-        auto pending_thread = sched_test_tasks->threads.create(
+        auto pending_thread = sched_test_tasks->get<Thread>().create(
             std::move(stack).value(),
             Env::kernel(*sched_test_kernel),
             Thread::KernelStart{unused_thread_entry, nullptr});
@@ -748,7 +742,7 @@ bool test_ready_queue_orders_priority_and_fifo(
         }
         threads[index] = std::move(pending_thread).value().publish();
 
-        auto pending_context = sched_test_sched->contexts.create(
+        auto pending_context = sched_test_sched->get<sched::Sc>().create(
             sched::Sc::Config{
                 .budget = Duration::from_ticks(1),
                 .period = Duration::from_ticks(10),

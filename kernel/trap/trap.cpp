@@ -1,3 +1,4 @@
+#include <platform/riscv-virt/board.hpp>
 // kernel/trap/trap.cpp
 // 系统 trap policy 的当前 owner；架构层只提供 Event 和返回现场访问。
 
@@ -30,7 +31,7 @@ static void finish_thread_page_fault(
     mm::FaultKind kind,
     mm::Virt address,
     mm::Perm access,
-    arch::TrapContext& context,
+    arch::TrapCtx& context,
     sched::Dispatcher& dispatcher) noexcept {
     myos_status_t status{MYOS_STATUS_PEER_FAULT};
     switch (kind) {
@@ -93,7 +94,7 @@ static void finish_thread_page_fault(
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
 
-void handle(const Event& event, arch::TrapContext& context) noexcept {
+void handle(const Event& event, arch::TrapCtx& context) noexcept {
     if (const auto* interrupt = event.interrupt()) {
         CpuLocal& cpu = current_cpu();
         libk_assert(cpu.dispatcher() != nullptr);
@@ -105,7 +106,7 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
             handle_ipi(cpu.runtime());
             return;
         case Interrupt::External: {
-            arch::external_irq();
+            virt_irq();
             return;
         }
         default:
@@ -205,7 +206,7 @@ void handle(const Event& event, arch::TrapContext& context) noexcept {
     panic("unhandled trap", &context);
 }
 
-void on_exit(const Event& event, arch::TrapContext& context) noexcept {
+void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
     CpuLocal& cpu = current_cpu();
     libk_assert(cpu.dispatcher() != nullptr);
     Thread* const thread = cpu.current_thread();

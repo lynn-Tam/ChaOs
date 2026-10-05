@@ -31,6 +31,10 @@ public:
     slab() = default;
     slab(const slab&) = delete;
     auto operator=(const slab&) -> slab& = delete;
+    slab(slab&& other) noexcept
+        : head_(std::exchange(other.head_, nullptr)),
+          pages_(std::exchange(other.pages_, 0)),
+          live_(std::exchange(other.live_, 0)), next_(other.next_) {}
 
     static constexpr auto offset() noexcept -> std::size_t {
         return (sizeof(page) + alignof(Slot) - 1) & ~(alignof(Slot) - 1);

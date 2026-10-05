@@ -74,7 +74,7 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
 /*luna change: extend double-panic projection with entry and canonical target stack facts, reason: distinguish stale target stack state from active-stack publication corruption without changing panic control*/
 [[noreturn]] static void double_panic(
     usize cpu,
-    const arch::TrapSnapshot& snapshot) noexcept {
+    const arch::TrapRegs& snapshot) noexcept {
     auto& local = current_cpu();
     const auto* const dispatcher = local.dispatcher();
     Thread* target = dispatcher != nullptr
@@ -136,7 +136,7 @@ static void capture_stack_bounds(
 
 static void capture(
     PanicSlot& slot,
-    const char* reason, libk::AssertInfo site, const arch::TrapContext* trap,
+    const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
     arch::CallSiteSnapshot call_site,
     bool interrupts_were_enabled) noexcept {
     slot.reason = reason;
@@ -410,7 +410,7 @@ static void halt_peer(void* ptr) noexcept {
 }
 
 [[noreturn]] static void enter_panic(
-    const char* reason, libk::AssertInfo site, const arch::TrapContext* trap,
+    const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
     arch::PanicContinuation entry) noexcept {
     const arch::CallSiteSnapshot call_site = arch::capture_call_site();
     const arch::InterruptState interrupts = arch::disable_interrupts();
@@ -425,19 +425,19 @@ static void halt_peer(void* ptr) noexcept {
     }
     auto& slot = *static_cast<PanicSlot*>(ptr);
     if (!arch::enter_emergency()) {
-        double_panic(slot.cpu.raw, trap ? trap->snapshot() : arch::TrapSnapshot{});
+        double_panic(slot.cpu.raw, trap ? trap->snapshot() : arch::TrapRegs{});
     }
     capture(slot, reason, site, trap, call_site, interrupts.enabled());
     arch::switch_to_panic_stack(top, &slot, entry);
 }
 
-void panic(const char* reason, const arch::TrapContext* trap,
+void panic(const char* reason, const arch::TrapCtx* trap,
            std::source_location site) noexcept {
     enter_panic(reason, {nullptr, site.file_name(), site.function_name(), site.line()},
                 trap, panic_on_emergency_stack);
 }
 
-void panic_stop(const arch::TrapContext& trap) noexcept {
+void panic_stop(const arch::TrapCtx& trap) noexcept {
     enter_panic("peer stop", {}, &trap, halt_peer);
 }
 

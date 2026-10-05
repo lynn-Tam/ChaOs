@@ -35,8 +35,6 @@ using cap::Rights;
 static_assert(Rights::of(Right::Inspect).raw() == MYOS_RIGHT_INSPECT);
 static_assert(Rights::parse(MYOS_RIGHT_MASK, MYOS_RIGHT_MASK));
 static_assert(!Rights::parse(u64{1} << 63, MYOS_RIGHT_MASK));
-static_assert(mm::MemoryTypes::of(mm::MemoryType::Normal).raw() == MYOS_VM_NORMAL);
-static_assert(mm::MemoryTypes::of(mm::MemoryType::Device).raw() == MYOS_VM_DEVICE);
 static_assert(mm::Perms::of(mm::Perm::Read, mm::Perm::Write).raw()
     == (MYOS_VM_READ | MYOS_VM_WRITE));
 
@@ -126,11 +124,11 @@ public:
             return false;
         }
         if (!mm::Pmm::initialize_in(
-                cap_test_pmm, std::move(map), mm::DirectMap::Layout{
-                .physical_base = *physical,
-                .virtual_base = mm::Virt{
+                cap_test_pmm, std::move(map), mm::Pmm::Window{
+                .pa = *physical,
+                .va = mm::Virt{
                     reinterpret_cast<usize>(cap_test_ram)},
-                .window_size = sizeof(cap_test_ram),
+                .size = sizeof(cap_test_ram),
             })) {
             reset();
             return false;
@@ -304,15 +302,12 @@ bool test_typed_attenuation_covers_all_families(
         attenuation_rights,
         MemLimit{
             mm::ObjectRange{0, 16},
-            mm::Perms::of(mm::Perm::Read),
-            mm::MemoryTypes::of(mm::MemoryType::Normal)}};
+            mm::Perms::of(mm::Perm::Read)}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_MEMORY);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 1);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET,
         static_cast<u64>(MYOS_VM_READ));
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET,
-        static_cast<u64>(MYOS_VM_NORMAL));
     if (!decode_and_check(ObjectKind::Mem, memory, bytes)) {
         return false;
     }
@@ -321,13 +316,11 @@ bool test_typed_attenuation_covers_all_families(
         attenuation_rights,
         VmLimit{
             mm::VRange{mm::Virt{0x1000}, 0x10000},
-            mm::Perms::of(mm::Perm::Read),
-            mm::MemoryTypes::of(mm::MemoryType::Normal)}};
+            mm::Perms::of(mm::Perm::Read)}};
     attenuation_bytes(bytes, MYOS_OBJECT_KIND_VSPACE);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 0x2000);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 0x2000);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET, MYOS_VM_NORMAL);
     if (!decode_and_check(ObjectKind::VSpace, vspace, bytes)) {
         return false;
     }
@@ -420,15 +413,13 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, ~u64{});
     put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
     put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD3_OFFSET, MYOS_VM_NORMAL);
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     const View memory{
         attenuation_rights,
         MemLimit{
             mm::ObjectRange{0, 16},
-            mm::Perms::of(mm::Perm::Read),
-            mm::MemoryTypes::of(mm::MemoryType::Normal)}};
+            mm::Perms::of(mm::Perm::Read)}};
     if (!decoded || cap::make_attenuation_ceiling(
                          ObjectKind::Mem, memory, decoded.value())) {
         return false;

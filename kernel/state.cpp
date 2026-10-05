@@ -14,7 +14,7 @@
 auto KernelState::initialize_in(
     libk::ManualLifetime<KernelState>& storage,
     mm::RegionList&& memory_map,
-    mm::DirectMap::Layout direct_map) noexcept
+    mm::Pmm::Window direct_map) noexcept
     -> InitializationResult {
     KernelState& kernel = storage.emplace(ConstructionKey{});
     auto result = mm::Pmm::initialize_in(
@@ -31,7 +31,7 @@ auto KernelState::initialize_in(
 
 KernelState::~KernelState() noexcept {
 
-    if (tasks_) {
+    if (objects_) {
         cleanup_notify_.reset();
     }
     if (grants_) {
@@ -42,12 +42,7 @@ KernelState::~KernelState() noexcept {
     cpus_.reset();
     release_scheduler_objects();
     grants_.reset();
-    io_.reset();
-    memory_objects_.reset();
-    cspaces_.reset();
-    ipc_.reset();
-    sched_.reset();
-    tasks_.reset();
+    objects_.reset();
     clock_.reset();
     kernel_vspace_.reset();
     pmm_.reset();
@@ -61,7 +56,7 @@ auto KernelState::initialize_kernel_domain(usize cpu_count) noexcept -> bool {
     if (!capacity) {
         return false;
     }
-    auto pending = sched().domains.create(
+    auto pending = pool<sched::Domain>().create(
         std::move(capacity).value(),
         sched::Domain::share_scale,
         100'000U);
@@ -77,7 +72,7 @@ auto KernelState::initialize_root_pool(
     if (root_pool_ || limit.memory == 0 || limit.caps == 0) {
         return false;
     }
-    auto pending = tasks().groups.create(pmm(), limit);
+    auto pending = pool<object::group>().create(pmm(), limit);
     if (!pending) {
         return false;
     }
@@ -96,7 +91,7 @@ auto KernelState::start_cleanup(
     if (!stack) {
         return false;
     }
-    auto pending_thread = tasks().threads.create(
+    auto pending_thread = pool<Thread>().create(
         std::move(stack).value(),
         Env::kernel(kernel_vspace()),
         Thread::KernelStart{cleanup_entry, this});
@@ -114,7 +109,7 @@ auto KernelState::start_cleanup(
         drain_reclaim();
         return false;
     }
-    auto pending_context = sched().contexts.create(
+    auto pending_context = pool<sched::Sc>().create(
         sched::Sc::Config{
             .budget = *budget,
             .period = *period,
@@ -224,26 +219,21 @@ void KernelState::release_scheduler_objects() noexcept {
         libk_assert(kernel_domain_.retire());
         kernel_domain_.reset();
     }
-    if (tasks_) {
+    if (objects_) {
         drain_reclaim();
     }
 }
 
 auto KernelState::initialize_objects() noexcept -> bool {
-    if (tasks_) {
+    if (objects_) {
         return false;
     }
-    (void)io_.emplace(pmm(), cleanup_notify_);
-    (void)tasks_.emplace(pmm(), cleanup_notify_);
-    (void)sched_.emplace(pmm(), cleanup_notify_);
-    (void)ipc_.emplace(pmm(), cleanup_notify_);
-    (void)cspaces_.emplace(pmm(), cleanup_notify_);
-    (void)memory_objects_.emplace(pmm(), cleanup_notify_);
+    (void)objects_.emplace(pmm(), cleanup_notify_);
     return true;
 }
 
 auto KernelState::initialize_grants() noexcept -> bool {
-    if (!tasks_ || grants_) {
+    if (!objects_ || grants_) {
         return false;
     }
     [[maybe_unused]] auto& graph = grants_.emplace(pmm());
@@ -258,11 +248,10 @@ auto KernelState::initialize_clock(u64 ticks_per_second) noexcept -> bool {
     return configured.valid();
 }
 
-auto KernelState::initialize_kernel_vspace() noexcept
-    -> KSpaceInitResult {
-    auto built = mm::KSpace::build_in(kernel_vspace_, pmm());
-    if (built) arch::activate_root(kernel_vspace_->cpu_root());
-    return built;
+void KernelState::install_root(mm::PageTable&& root, usize stack_end) noexcept {
+    libk_assert(!kernel_vspace_);
+    (void)kernel_vspace_.emplace(pmm(), std::move(root), stack_end);
+    arch::activate_root(kernel_vspace_->cpu_root());
 }
 
 auto KernelState::begin_cpus(

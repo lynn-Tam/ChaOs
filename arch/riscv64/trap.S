@@ -1,15 +1,15 @@
 //arch/riscv64/trap/trap.S
 
-#include "arch/riscv64/trap/trapframe.hpp"
+#include "arch/riscv64/trap.hpp"
 #include "arch/riscv64/cpu/local_entry.hpp"
 
 .section .text, "ax", @progbits
 .balign 4
 
-.global arch_riscv64_trap_entry
-.hidden arch_riscv64_trap_entry
-.type arch_riscv64_trap_entry, @function
-arch_riscv64_trap_entry:
+.global trap_entry
+.hidden trap_entry
+.type trap_entry, @function
+trap_entry:
     /*
     The first instructions run before any stack is trusted. sscratch must hold
     CpuEntryBlock*. csrrw gives us that entry view in t0 while preserving the
@@ -120,7 +120,7 @@ arch_riscv64_trap_entry:
     // continuations may replace the interrupted frame before the common exit
     // hook observes scheduler and wait state.
     mv a0, sp
-    call arch_riscv64_trap_handler
+    call trap_enter
     mv sp, a0
     /*---- 恢复边界 ----*/
     // sscratch is restored to CpuEntryBlock before C++ runs, so return can update
@@ -135,12 +135,12 @@ arch_riscv64_trap_entry:
     switch may resume at this call site before restoring this same frame.
     */
     mv a0, sp
-    call arch_riscv64_trap_exit
+    call trap_exit
     // The selected-arch exit hook may redirect this return to a synthetic
     // frame on another guarded kernel stack (Endpoint Activation).
     mv sp, a0
     mv a0, sp
-    call arch_riscv64_trap_return
+    call trap_return
 
 .Lrestore_frame:
     // A newly started Thread reaches this path with interrupts enabled.
@@ -240,13 +240,13 @@ arch_riscv64_trap_entry:
 3:
     wfi
     j 3b
-.size arch_riscv64_trap_entry, .-arch_riscv64_trap_entry
+.size trap_entry, .-trap_entry
 
-.global arch_riscv64_resume_user
-.hidden arch_riscv64_resume_user
-.type arch_riscv64_resume_user, @function
-arch_riscv64_resume_user:
+.global user_return
+.hidden user_return
+.type user_return, @function
+user_return:
     // a0 names the synthetic TrapFrame built on the Thread home stack.
     mv sp, a0
     j .Lrestore_frame
-.size arch_riscv64_resume_user, .-arch_riscv64_resume_user
+.size user_return, .-user_return

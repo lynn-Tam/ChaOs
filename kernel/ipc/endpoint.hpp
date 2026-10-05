@@ -4,8 +4,7 @@
 #include <optional>
 
 
-#include <arch/trap.hpp>
-#include <arch/user.hpp>
+#include <trap.hpp>
 #include <cap/grant.hpp>
 #include <base/types.hpp>
 #include <task/env.hpp>
@@ -85,7 +84,7 @@ public:
     [[nodiscard]] auto wait() noexcept -> Wait& { return wait_; }
     [[nodiscard]] auto previous() const noexcept -> Activation* { return previous_; }
     [[nodiscard]] auto cancel_pending() const noexcept -> bool;
-    void unwind(arch::TrapContext&, sched::Dispatcher&, isize) noexcept;
+    void unwind(arch::TrapCtx&, sched::Dispatcher&, isize) noexcept;
     void release() noexcept;
     [[nodiscard]] auto endpoint() const noexcept -> Endpoint& {
         return *endpoint_;
@@ -148,7 +147,7 @@ private:
     sched::Deadline deadline_;
     libk::ManualLifetime<cap::GrantAttachment> grant_{};
     object::ref<Thread> caller_{};
-    arch::UserFrame caller_frame_{};
+    arch::TrapFrame* caller_frame_{};
     Activation* activation_{};
     usize arguments_[3]{};
     WaitResult result_{};
@@ -196,7 +195,7 @@ public:
     [[nodiscard]] auto call(
         cap::Resolved<Endpoint>&& view,
         Thread& caller,
-        arch::TrapContext& trap,
+        arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher,
         CpuRegistry& cpus,
         const usize (&arguments)[3],
@@ -204,13 +203,13 @@ public:
         -> std::expected<void, EndpointError>;
     [[nodiscard]] auto reply(
         Thread& caller,
-        arch::TrapContext& trap,
+        arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher,
         isize status,
         usize value) noexcept -> std::expected<void, EndpointError>;
     [[nodiscard]] auto abort(
         Thread& caller,
-        arch::TrapContext& trap,
+        arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher,
         isize status) noexcept -> std::expected<void, EndpointError>;
 
@@ -243,7 +242,7 @@ private:
     void publish_ready(Call& call) noexcept;
     [[nodiscard]] auto enter(
         Call& call,
-        arch::TrapContext& trap,
+        arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher) noexcept -> bool;
     [[nodiscard]] auto snapshot_caps(
         const Buffer* buffer,
@@ -260,7 +259,7 @@ private:
     void close_installed(Call& call) noexcept;
     [[nodiscard]] auto finish_active(
         Activation& activation,
-        arch::TrapContext& trap,
+        arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher,
         isize status,
         usize value,
@@ -274,6 +273,7 @@ private:
     mm::View code_;
     CodePages resident_code_{};
     EndpointConfig config_{};
+    object::ref<> payer_{};
     mm::Slab<Activation, false> activations_;
     mm::Slab<Call, false> calls_;
     Activation* slots_[max_activations]{};

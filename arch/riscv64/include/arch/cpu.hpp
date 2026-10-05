@@ -10,10 +10,6 @@
 class KernelState;
 struct CpuRuntime;
 
-namespace mm {
-class DirectMap;
-}
-
 namespace arch {
 
 using CpuEntryState = riscv64::CpuEntryBlock;
@@ -30,8 +26,8 @@ enum class CpuStartError : u8 {
 [[nodiscard]] auto secondary_start_available() noexcept -> bool;
 [[nodiscard]] auto start_secondary(
     CpuHwId hardware_id,
-    CpuStartContext& context,
-    const mm::DirectMap& direct_map) noexcept
+    usize entry,
+    usize record) noexcept
     -> std::expected<void, CpuStartError>;
 
 void initialize_cpu_entry(CpuEntryState& state, void* owner) noexcept;

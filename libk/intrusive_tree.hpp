@@ -9,6 +9,7 @@
 
 #include <libk/assert.hpp>
 #include <type_traits>
+#include <utility>
 
 namespace libk {
 
@@ -50,8 +51,27 @@ public:
     constexpr IntrusiveTree() noexcept = default;
     IntrusiveTree(const IntrusiveTree&) = delete;
     auto operator=(const IntrusiveTree&) -> IntrusiveTree& = delete;
-    IntrusiveTree(IntrusiveTree&&) = delete;
-    auto operator=(IntrusiveTree&&) -> IntrusiveTree& = delete;
+    constexpr IntrusiveTree(IntrusiveTree&& other)
+        noexcept(std::is_nothrow_move_constructible_v<Compare>)
+        : root_(std::exchange(other.root_, nullptr)),
+          minimum_(std::exchange(other.minimum_, nullptr)),
+          size_(std::exchange(other.size_, 0)),
+          hook_offset_(std::exchange(other.hook_offset_, 0)),
+          offset_known_(std::exchange(other.offset_known_, false)),
+          compare_(std::move(other.compare_)) {}
+    constexpr auto operator=(IntrusiveTree&& other)
+        noexcept(std::is_nothrow_move_assignable_v<Compare>) -> IntrusiveTree& {
+        if (this != &other) {
+            clear();
+            root_ = std::exchange(other.root_, nullptr);
+            minimum_ = std::exchange(other.minimum_, nullptr);
+            size_ = std::exchange(other.size_, 0);
+            hook_offset_ = std::exchange(other.hook_offset_, 0);
+            offset_known_ = std::exchange(other.offset_known_, false);
+            compare_ = std::move(other.compare_);
+        }
+        return *this;
+    }
 
     constexpr ~IntrusiveTree() { clear(); }
 

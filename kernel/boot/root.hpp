@@ -6,7 +6,6 @@
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <mm/phys.hpp>
 #include <mm/pmm.hpp>
 #include <object/pool.hpp>
 #include <mm/mem.hpp>
@@ -46,7 +45,6 @@ public:
         libk::ManualLifetime<RootTask>& storage,
         object::pool<mm::Mem>& memory,
         mm::Pmm& pmm,
-        mm::DirectMap& direct_map,
         object::ref<object::group>&& pool,
         BootModule module,
         mm::BootPages&& reservation) noexcept
@@ -54,9 +52,9 @@ public:
 
     RootTask(
         [[maybe_unused]] ConstructionKey key,
-        mm::DirectMap& direct_map,
+        mm::Pmm& pmm,
         BootModule module) noexcept
-        : direct_map_(&direct_map), module_(module) {}
+        : pmm_(&pmm), module_(module) {}
 
     [[nodiscard]] auto bundle() const noexcept
         -> std::expected<BootBundle, BundleError>;
@@ -76,7 +74,7 @@ private:
         -> std::expected<void, RootTaskError>;
     void rollback(KernelState& kernel) noexcept;
 
-    mm::DirectMap* direct_map_{};
+    mm::Pmm* pmm_{};
     BootModule module_{};
     object::ref<object::group> pool_{};
     object::ref<mm::Mem> package_{};

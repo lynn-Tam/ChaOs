@@ -28,7 +28,7 @@ struct BundleSegment final {
     libk::ByteSpan file{};
     usize memory_size{};
     usize alignment{};
-    mm::Perms access{};
+    mm::Perms perms{};
 };
 
 class BootBundle;

@@ -80,7 +80,6 @@ struct Console final {
             UartAddress,
             PageSize,
             MYOS_VM_READ | MYOS_VM_WRITE,
-            MYOS_VM_DEVICE,
             MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
         if (created.status != MYOS_STATUS_OK || created.value == 0) {
             return false;
@@ -235,7 +234,6 @@ Runtime runtime{};
         value.words[0] = 0;
         value.words[1] = 1;
         value.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
-        value.words[3] = MYOS_VM_NORMAL;
     }
     return value;
 }

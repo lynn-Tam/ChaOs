@@ -5,21 +5,22 @@
 #include <libk/manual_lifetime.hpp>
 #include <cap/graph.hpp>
 #include <cpu/registry.hpp>
-#include <mm/phys.hpp>
-#include <mm/kspace.hpp>
 #include <mm/pmm.hpp>
+#include <mm/kspace.hpp>
 #include <object/pool.hpp>
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <mm/pager.hpp>
-#include <kernel/task/objects.hpp>
-#include <kernel/sched/objects.hpp>
-#include <kernel/ipc/objects.hpp>
 #include <cap/cspace.hpp>
 #include <object/group.hpp>
 #include <sched/domain.hpp>
+#include <sched/sc.hpp>
+#include <task/thread.hpp>
+#include <ipc/endpoint.hpp>
+#include <ipc/channel.hpp>
+#include <ipc/notification.hpp>
+#include <io/space.hpp>
 #include <time/clock.hpp>
-#include <io/objects.hpp>
 
 class KernelState final : private libk::noncopyable_nonmovable {
     class ConstructionKey {
@@ -29,19 +30,17 @@ class KernelState final : private libk::noncopyable_nonmovable {
 
   public:
     using InitializationResult = std::expected<void, mm::PmmInitError>;
-    using KSpaceInitResult = mm::KSpace::InitResult;
     using CpuBeginResult = CpuRegistry::BeginResult;
 
     [[nodiscard]] static auto initialize_in(libk::ManualLifetime<KernelState>& storage,
                                             mm::RegionList&& memory_map,
-                                            mm::DirectMap::Layout direct_map) noexcept
+                                            mm::Pmm::Window direct_map) noexcept
         -> InitializationResult;
     explicit KernelState([[maybe_unused]] ConstructionKey key) noexcept {}
 
     ~KernelState() noexcept;
 
-    [[nodiscard]] auto initialize_kernel_vspace() noexcept
-        -> KSpaceInitResult;
+    void install_root(mm::PageTable&&, usize stack_end) noexcept;
     [[nodiscard]] auto initialize_objects() noexcept -> bool;
     [[nodiscard]] auto initialize_grants() noexcept -> bool;
     [[nodiscard]] auto initialize_clock(u64 ticks_per_second) noexcept -> bool;
@@ -52,9 +51,7 @@ class KernelState final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] auto pmm(this auto& self) noexcept -> decltype(auto) { return (*self.pmm_); }
 
-    [[nodiscard]] auto direct_map(this auto& self) noexcept -> decltype(auto) {
-        return self.pmm().direct_map();
-    }
+
 
     [[nodiscard]] auto kernel_vspace(this auto& self) noexcept -> decltype(auto) {
         return (*self.kernel_vspace_);
@@ -64,24 +61,10 @@ class KernelState final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] auto clock(this auto& self) noexcept -> decltype(auto) { return (*self.clock_); }
     [[nodiscard]] auto io_work() noexcept -> io::Executor& { return io_work_; }
-    [[nodiscard]] auto io() noexcept -> io::objects& { return *io_; }
-
     using notifier = libk::delegate<void() noexcept>;
-    auto tasks() noexcept -> Tasks& { return *tasks_; }
-    auto sched() noexcept -> sched::objects& { return *sched_; }
-    auto ipc() noexcept -> ipc::objects& { return *ipc_; }
-    auto cspaces() noexcept -> object::pool<cap::CSpace>& { return *cspaces_; }
-    template <class T> auto pool() noexcept -> object::pool<T>& { return memory_objects_->get<T>(); }
+    template <class T> auto pool() noexcept -> object::pool<T>& { return objects_->get<T>(); }
     auto space_work() noexcept -> mm::SpaceWork& { return vspace_work_; }
-    auto drain_reclaim() noexcept -> usize {
-        const auto devices = io().drain();
-        const auto memory = memory_objects_->drain();
-        auto count = devices + memory;
-        count += ipc().drain();
-        count += cspaces().drain_reclaim();
-        count += sched().drain();
-        return count + tasks().drain();
-    }
+    auto drain_reclaim() noexcept -> usize { return objects_->drain(); }
     [[nodiscard]] auto grants(this auto& self) noexcept -> decltype(auto) { return (*self.grants_); }
     [[nodiscard]] auto kernel_domain(this auto& self) noexcept -> decltype(auto) {
         return self.kernel_domain_.get();
@@ -100,15 +83,14 @@ class KernelState final : private libk::noncopyable_nonmovable {
     libk::ManualLifetime<mm::Pmm> pmm_{};
     libk::ManualLifetime<mm::KSpace> kernel_vspace_{};
     libk::ManualLifetime<time::Clock> clock_{};
-    libk::ManualLifetime<io::objects> io_{};
     io::Executor io_work_{};
     mm::SpaceWork vspace_work_{};
     notifier cleanup_notify_{};
-    libk::ManualLifetime<Tasks> tasks_{};
-    libk::ManualLifetime<sched::objects> sched_{};
-    libk::ManualLifetime<ipc::objects> ipc_{};
-    libk::ManualLifetime<object::pool<cap::CSpace>> cspaces_{};
-    libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_objects_{};
+    // References retain dependent payloads; sponsoring groups drain last.
+    using Objects = object::store<io::Space, irq::Irq, io::Device, mm::VSpace, mm::Mem, Pager,
+                                  cap::CSpace, ipc::Endpoint, ipc::Channel, ipc::Notification,
+                                  sched::Domain, sched::Sc, Thread, object::group>;
+    libk::ManualLifetime<Objects> objects_{};
     libk::ManualLifetime<cap::GrantGraph> grants_{};
     libk::ManualLifetime<CpuRegistry> cpus_{};
     object::ref<sched::Domain> kernel_domain_{};

@@ -12,7 +12,10 @@
 #include <libk/noncopyable.hpp>
 #include <libk/unique_handle.hpp>
 #include <limits>
-#include <mm/phys.hpp>
+#include <mm/types.hpp>
+#include <libk/checked_arithmetic.hpp>
+#include <ranges>
+#include <span>
 #include <optional>
 #include <resource/sponsorship.hpp>
 #include <sync.hpp>
@@ -29,7 +32,6 @@ enum class PageState : uint8_t {
 enum class PmmInitError : uint8_t {
     EmptyMemoryMap,
     InvalidRegion,
-    BadAttr,
     OverlappingRegions,
     NoRam,
     MetadataOverflow,
@@ -137,12 +139,13 @@ class Pmm {
     using ReclaimResult = std::expected<size_t, BootErr>;
     using AdoptResult = std::expected<PageGroup, BootErr>;
 
+    struct Window { Phys pa{}; Virt va{}; usize size{}; };
     [[nodiscard]] static auto initialize_in(libk::ManualLifetime<Pmm>& storage, RegionList&& memory_map,
-                                            DirectMap::Layout layout) noexcept -> InitializationResult;
+                                            Window layout) noexcept -> InitializationResult;
 
-    explicit Pmm([[maybe_unused]] ConstructionKey key, RegionList&& memory, DirectMap::Layout layout) noexcept
+    explicit Pmm([[maybe_unused]] ConstructionKey key, RegionList&& memory, Window layout) noexcept
         : memory_(std::move(memory)),
-          direct_map_(std::span<const Region>{memory_.data(), memory_.size()}, layout) {}
+          window_(layout) {}
 
     Pmm(const Pmm&) = delete;
     auto operator=(const Pmm&) -> Pmm& = delete;
@@ -164,8 +167,20 @@ class Pmm {
     [[nodiscard]] auto free_page_count() const noexcept -> size_t;
     [[nodiscard]] auto arena_count() const noexcept -> size_t;
     [[nodiscard]] auto metadata_page_count() const noexcept -> size_t;
-    [[nodiscard]] auto direct_map(this auto& self) noexcept -> decltype(auto) { return (self.direct_map_); }
-    auto attr_of(Pages range) const noexcept -> std::optional<CpuAttr>;
+    bool covers(Pages range) const noexcept;
+    bool is_ram(Pages range) const noexcept;
+    bool is_ram(Page p) const noexcept { return is_ram(Pages{p, 1}); }
+    auto ram() const noexcept {
+        return regions() | std::views::filter([](const Region& r) { return r.is_ram(); }) |
+               std::views::transform([](const Region& r) { return r.range; });
+    }
+    auto virt(Phys pa, usize size) const noexcept -> std::optional<Virt>;
+    auto phys(Virt va, usize size) const noexcept -> std::optional<Phys>;
+    template<class T> auto ptr(Phys pa, usize count = 1) const noexcept -> std::optional<T*> {
+        const auto size = libk::checked_multiply(sizeof(T), count);
+        const auto va = size ? virt(pa, *size) : std::nullopt;
+        return va ? std::optional<T*>{reinterpret_cast<T*>(va->raw())} : std::nullopt;
+    }
     auto regions() const noexcept -> std::span<const Region> { return {memory_.data(), memory_.size()}; }
     [[nodiscard]] auto bytes(Page page) noexcept -> byte*;
     [[nodiscard]] auto bytes(Page page) const noexcept -> const byte*;
@@ -247,7 +262,7 @@ class Pmm {
 
     mutable sync::Spin lock_{};
     RegionList memory_{};
-    DirectMap direct_map_{};
+    Window window_{};
     libk::InplaceVector<Arena, max_regions> arenas_{};
     libk::InplaceVector<ReservationRecord, max_regions> reservations_{};
     size_t outstanding_pages_{};
@@ -318,10 +333,10 @@ struct SlabQuota {
     usize pages{64};
 };
 
-// The domain serializes payload access; this pool owns only storage and ids.
+// The domain serializes payload perms; this pool owns only storage and ids.
 template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     struct Slot;
-    using Storage = base::slab<Slot, OwnedPage, page_size, resource::Sponsorship>;
+    using Storage = base::slab<Slot, OwnedPage, page_size, resource::Charge>;
     using PageHeader = typename Storage::page;
     struct Id {
         u64 generation{};
@@ -347,24 +362,24 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
         return {nodes, nodes / count + (nodes % count != 0)};
     }
     static constexpr auto slot_size() noexcept -> usize { return sizeof(Slot); }
-    explicit Slab(Pmm& pmm, Quota quota = {~usize{}, ~usize{}},
-                  resource::Sponsorship* sponsor = nullptr) noexcept
-        : pmm_(&pmm), quota_(quota), sponsor_(sponsor) {}
+    explicit Slab(Pmm& pmm, Quota quota = {~usize{}, ~usize{}}) noexcept
+        : pmm_(&pmm), quota_(quota) {}
     Slab(const Slab&) = delete;
     auto operator=(const Slab&) -> Slab& = delete;
+    // Exclusive ownership transfer: payload addresses and keys stay stable.
+    // The moved-from allocator is empty and has no allocation quota.
+    Slab(Slab&& other) noexcept
+        : pmm_(other.pmm_), quota_(std::exchange(other.quota_, Quota{0, 0})),
+          storage_(std::move(other.storage_)) {
+        libk_assert(other.growing_ == 0);
+    }
     ~Slab() noexcept {
         libk_assert(storage_.live() == 0 && growing_ == 0);
-        while (auto* page = storage_.take_page())
-            release_page(*page);
-    }
-    void bind_sponsor(resource::Sponsorship& sponsor) noexcept {
-        sync::Lock guard{lock_};
-        libk_assert(!sponsor_ && sponsor && storage_.pages() == 0 && growing_ == 0);
-        sponsor_ = &sponsor;
+        while (auto* page = storage_.take_page()) release_page(*page);
     }
     using Result = std::conditional_t<Indexed, Entry, T*>;
-    template <class... Args> auto create(Args&&... args) noexcept -> std::expected<Result, SlabErr> {
-        auto claimed = claim();
+    template <class... Args> auto create(const object::ref<>& payer, Args&&... args) noexcept -> std::expected<Result, SlabErr> {
+        auto claimed = claim(payer);
         if (!claimed) return std::unexpected(claimed.error());
         auto* slot = claimed.value();
         auto* object = std::construct_at(slot->object(), std::forward<Args>(args)...);
@@ -413,7 +428,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     static auto slot_of(T& object) noexcept -> Slot& {
         return const_cast<Slot&>(slot_of(std::as_const(object)));
     }
-    auto claim() noexcept -> std::expected<Slot*, SlabErr> {
+    auto claim(const object::ref<>& payer) noexcept -> std::expected<Slot*, SlabErr> {
         for (;;) {
             {
                 sync::Lock guard{lock_};
@@ -427,7 +442,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
                     return std::unexpected(SlabErr::QuotaExceeded);
                 ++growing_;
             }
-            auto made = make_page();
+            auto made = make_page(payer);
             sync::Lock guard{lock_};
             libk_assert(growing_ != 0);
             --growing_;
@@ -435,25 +450,21 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
             storage_.add(*made.value());
         }
     }
-    auto make_page() noexcept -> std::expected<PageHeader*, SlabErr> {
-        resource::Reservation charge;
-        if (sponsor_) {
-            auto reserved = sponsor_->reserve(resource::budget{.memory = page_size});
-            if (!reserved) return std::unexpected(SlabErr::ResourceExhausted);
-            charge = std::move(reserved).value();
-        }
+    auto make_page(const object::ref<>& payer) noexcept -> std::expected<PageHeader*, SlabErr> {
+        auto charge = resource::acquire(payer, {.memory = page_size});
+        if (!charge) return std::unexpected(SlabErr::ResourceExhausted);
         auto backing = pmm_->allocate_page();
         if (!backing) return std::unexpected(SlabErr::OutOfMemory);
         auto* page = Storage::make(std::move(backing).value(), [](Slot&) noexcept {});
-        if (charge) page->extra.commit(std::move(charge));
+        page->extra = std::move(*charge);
         return (page);
     }
     static void release_page(PageHeader& page) noexcept {
         libk_assert(page.live == 0);
-        auto refund = page.extra.detach();
+        auto charge = std::move(page.extra);
         auto backing = Storage::dispose(page);
         backing.reset();
-        refund.complete();
+        charge.reset();
     }
 
     Pmm* pmm_;
@@ -461,7 +472,6 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     mutable sync::Spin lock_{};
     Storage storage_{};
     usize growing_{};
-    resource::Sponsorship* sponsor_{};
 };
 
 } // namespace mm
