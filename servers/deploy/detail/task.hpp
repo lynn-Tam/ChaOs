@@ -18,9 +18,8 @@
 #include <variant>
 #include <servers/deploy/format.h>
 #include <uapi/start.h>
-#include <uapi/endpoint.h>
-#include <uapi/thread.h>
-#include <uapi/status.h>
+#include <uapi/ipc.h>
+#include <uapi/abi.h>
 
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/plan.hpp>
@@ -2817,7 +2816,9 @@ public:
          * extending this to multi-execution requires an explicit ABI for
          * per-execution bootstrap state.  Defer the phase until after target
          * construction so TaskKey sources are complete. */
-        size_t arg_offset{}, arg_size{};
+        const size_t arg_offset = sizeof(BootHdr) + size_t{row->bootstraps.count} * sizeof(BootCap);
+        const size_t arg_size = row->bootstraps.count && input.arguments
+            ? input.arguments->data().size : 0;
         const auto generate_bootstrap = [&]() noexcept -> status_t {
         uint32_t readiness_roles = 0;
         SlotProjection readiness_source{};
@@ -2852,9 +2853,7 @@ public:
             info.major = BOOT_MAJOR;
             info.minor = BOOT_MINOR;
             info.count = row->bootstraps.count;
-            info.size = sizeof(info) + info.count * sizeof(BootCap);
-            arg_offset = info.size;
-            arg_size = input.arguments ? input.arguments->data().size : 0;
+            info.size = arg_offset;
             if (info.size > mapping_sizes[bootstrap_mapping]
                 || arg_size > mapping_sizes[bootstrap_mapping] - info.size)
                 return failure(STATUS_BAD_ARGS);

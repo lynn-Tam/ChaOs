@@ -17,7 +17,7 @@
 #include <sync.hpp>
 #include <task/thread.hpp>
 #include <sched/dispatcher.hpp>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 
 namespace ipc {
 

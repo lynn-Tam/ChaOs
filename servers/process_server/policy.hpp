@@ -17,7 +17,7 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
     if (row.executions.count != 1 || task.execution(0)->model != DEPLOY_EXECUTION_THREAD
         || row.images.count != 1 || row.exports.count != 0 || row.dependencies.count != 0
         || row.pool_memory > 8 * 1024 * 1024 || row.pool_caps > 256
-        || (row.kind_mask & ~(RESOURCE_E2_KINDS | RESOURCE_CHANNEL)) != 0)
+        || (row.kind_mask & ~(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL))) != 0)
         return false;
     for (uint32_t i = 0; i < row.objects.count; ++i)
         if (task.object(i)->kind != OBJECT_KIND_NOTIFICATION) return false;

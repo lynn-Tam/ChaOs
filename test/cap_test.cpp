@@ -17,7 +17,7 @@
 #include <boot/link.hpp>
 #include <sched/sc.hpp>
 #include <task/thread.hpp>
-#include <uapi/vm.h>
+#include <uapi/mem.h>
 
 namespace {
 

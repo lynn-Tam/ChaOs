@@ -9,9 +9,9 @@
 #include <optional>
 #include <utility>
 #include <servers/deploy/format.h>
-#include <uapi/object.h>
-#include <uapi/status.h>
-#include <uapi/vm.h>
+#include <uapi/cap.h>
+#include <uapi/abi.h>
+#include <uapi/mem.h>
 #include <servers/deploy/bundle.hpp>
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/plan.hpp>

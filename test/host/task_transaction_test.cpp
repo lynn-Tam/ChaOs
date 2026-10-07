@@ -4,8 +4,8 @@
 
 #include <libk/assert.hpp>
 #include <utility>
-#include <uapi/resource.h>
-#include <uapi/status.h>
+#include <uapi/cap.h>
+#include <uapi/abi.h>
 #include <servers/deploy/detail/task.hpp>
 
 #include "deploy/golden.hpp"
@@ -1043,7 +1043,7 @@ void put_manifest(
         || !equals(fixture.plan.symbol(task->vspace_key), "vspace")
         || !equals(fixture.plan.symbol(task->cspace_key), "cspace")
         || task->pool_memory != 16384 || task->pool_caps != 16
-        || task->kind_mask != RESOURCE_E2_KINDS
+        || task->kind_mask != DEPLOY_BASE_KINDS
         || task->critical_bytes != 12288 || task->cspace_slots != 16
         || task->cspace_pages != 1 || task->bootstrap_mapping != 2
         || task->images.first != 0 || task->images.count != 1

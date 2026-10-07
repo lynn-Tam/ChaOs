@@ -18,7 +18,7 @@
 #include <expected>
 #include <optional>
 #include <utility>
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 #include <servers/deploy/format.h>
 
 #include <servers/deploy/format.hpp>

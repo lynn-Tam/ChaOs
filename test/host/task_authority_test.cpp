@@ -5,7 +5,7 @@
 
 #include <libk/assert.hpp>
 #include <utility>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 #include <servers/deploy/detail/authority.hpp>
 
 #include "deploy/golden.hpp"

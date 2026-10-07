@@ -8,7 +8,7 @@
 #include <mm/pmm.hpp>
 #include <mm/types.hpp>
 #include <pte.hpp>
-#include <uapi/arch/riscv64/address_space.h>
+#include <uapi/riscv64.h>
 
 namespace mm {
 inline constexpr usize UserBegin = RISCV64_LOW_GUARD_END;

@@ -7,17 +7,16 @@
 #include <ipc/notification.hpp>
 #include <object/ref.hpp>
 #include <task/thread.hpp>
-#include <uapi/syscall.h>
+#include <uapi/abi.h>
 #include <utility>
 #include <state.hpp>
 #include <ipc/endpoint.hpp>
 #include <sched/dispatcher.hpp>
-#include <uapi/endpoint.h>
+#include <uapi/ipc.h>
 #include <cap/cspace.hpp>
 #include <ipc/channel.hpp>
 #include <ipc/buffer.hpp>
 #include <cpu/registry.hpp>
-#include <uapi/channel.h>
 
 namespace syscall {
 

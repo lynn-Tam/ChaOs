@@ -8,11 +8,10 @@
 #include <utility>
 #include <optional>
 #include <utility>
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 #include <servers/deploy/format.h>
-#include <uapi/object.h>
-#include <uapi/status.h>
-#include <uapi/vm.h>
+#include <uapi/abi.h>
+#include <uapi/mem.h>
 #include <servers/deploy/bundle.hpp>
 #include <sys/handle.hpp>
 #include <sys/syscall.hpp>

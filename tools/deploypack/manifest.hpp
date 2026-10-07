@@ -2,7 +2,7 @@
 
 #include <sys/start.hpp>
 #include <servers/vfs/protocol.hpp>
-#include <uapi/channel.h>
+#include <uapi/ipc.h>
 
 #include <array>
 #include <map>
@@ -77,7 +77,7 @@ class Task final {
     uint32_t cspace_pages_{};
     uint64_t caps_{};
     bool supervisor_{};
-    uint64_t kinds_{RESOURCE_E2_KINDS};
+    uint64_t kinds_{DEPLOY_BASE_KINDS};
     uint16_t restart_{DEPLOY_RESTART_NEVER};
     uint16_t readiness_{DEPLOY_READINESS_START};
     uint64_t readiness_timeout_ns_{};
@@ -249,7 +249,7 @@ public:
                          uint64_t server_side, uint64_t server_rights,
                          uint64_t client_rights, uint64_t depth = 16,
                          uint64_t transfers = 0, uint64_t relations = 2) {
-        kinds_ |= RESOURCE_CHANNEL;
+        kinds_ |= OBJ_BIT(OBJECT_KIND_CHANNEL);
         auto object = manifest_.row(DEPLOY_TABLE_OBJECT);
         const auto first = key(std::string{label} + ".side0");
         const auto second = key(std::string{label} + ".side1");
@@ -321,7 +321,7 @@ inline auto pack_application(const char* name, const char* image,
     task.authority(boot::Stderr, "stderr", RIGHT_SEND);
     task.authority(boot::Stdin, "stdin", RIGHT_RECEIVE);
     if (files != access::none) {
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.cspace(128, 20);
         if (files == access::read)
             task.authority(boot::VfsRead, "vfs.read.directory", RIGHT_SEND);
@@ -366,7 +366,7 @@ inline auto pack_console(char** paths, bool storage = false,
         if (storage) t.requires_service(6, "store admin");
         // Four live task authorities, package mappings and stream endpoints.
         t.cspace(512, 68);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         t.channel(boot::Files, "files.client", 0, 3, send | RIGHT_DUPLICATE);
         t.channel(boot::Vfs, "vfs.client", 0,
             sys::vfs::WriteDirectory, send | RIGHT_DUPLICATE);
@@ -388,7 +388,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.requires_service(uart, "console");
         t.requires_service(process, "process");
         t.cspace(128, 20);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         if (storage) t.argument("storage");
         t.channel(boot::Process, "process.client", 0, 1, send | receive);
         t.channel(boot::ConsoleOutput, "console.sender", 0, 2, send);
@@ -400,7 +400,7 @@ inline auto pack_console(char** paths, bool storage = false,
         Task t{manifest, "block", paths[3], 4 * 1024 * 1024, false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
         t.authority(BOOT_DEVICE, "pci.0008", RIGHT_CONNECT);
         t.channel_service(boot::Block, "block.client", 1, receive, send, 4, 4);
         t.finish();
@@ -410,7 +410,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.requires_service(block, "block");
         t.cspace(1024, 132);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_PAGER | RESOURCE_CHANNEL);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_CHANNEL));
         t.channel(boot::Block, "block.client", 0, 1, send);
         t.channel_service(boot::Files, "files.client", 1, receive, send, 8, 4);
         t.finish();
@@ -419,7 +419,7 @@ inline auto pack_console(char** paths, bool storage = false,
         Task t{manifest, "block_data", paths[5], 4 * 1024 * 1024, false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
         t.authority(BOOT_DEVICE, "pci.0010", RIGHT_CONNECT);
         t.channel_service(boot::Block, "block_data.client", 1,
             receive, send, 4, 4);
@@ -432,7 +432,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.explicit_readiness(10'000'000'000);
         t.requires_service(data_block, "data block");
         t.cspace(256, 36);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         t.channel(boot::Block, "block_data.client", 0, 1, send);
         t.authority(boot::ServiceWake, "service.wake", RIGHT_SIGNAL);
         t.channel_service(boot::Store, "store.client", 1,
@@ -447,7 +447,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.requires_service(files, "files");
         if (storage) t.requires_service(6, "store");
         t.cspace(256, 36);
-        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         t.channel(boot::Files, "files.client", 0, 1, send);
         if (storage) t.channel(boot::Store, "store.client", 0, 2, send);
         t.authority(boot::ServiceWake, "service.wake", RIGHT_SIGNAL);

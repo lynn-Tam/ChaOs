@@ -11,7 +11,7 @@
 #include <mm/vspace.hpp>
 #include <task/thread.hpp>
 
-#include <uapi/status.h>
+#include <uapi/abi.h>
 
 struct CpuLocal;
 class Thread;

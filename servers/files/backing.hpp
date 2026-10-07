@@ -3,7 +3,7 @@
 
 #include <sys/queue.hpp>
 #include <sys/storage.hpp>
-#include <uapi/pager.h>
+#include <uapi/mem.h>
 
 namespace sys::files {
 

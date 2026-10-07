@@ -251,7 +251,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             spec.pool_memory, 8);
         put(bytes, task_row + DEPLOY_TASK_POOL_CAPS, 512, 8);
         put(bytes, task_row + DEPLOY_TASK_KIND_MASK,
-            RESOURCE_E4_KINDS, 8);
+            (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
         put(bytes, task_row + DEPLOY_TASK_CRITICAL_BYTES,
             spec.critical_bytes, 8);
         put(bytes, task_row + DEPLOY_TASK_CSPACE_SLOTS, 128, 4);

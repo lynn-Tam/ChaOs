@@ -5,10 +5,9 @@
 #include <cpu.hpp>
 #include <trap.hpp>
 #include <cap/cap.hpp>
-#include <uapi/capability.h>
-#include <uapi/status.h>
-#include <uapi/syscall.h>
-#include <uapi/vm.h>
+#include <uapi/cap.h>
+#include <uapi/abi.h>
+#include <uapi/mem.h>
 
 namespace {
 

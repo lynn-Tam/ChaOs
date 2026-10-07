@@ -66,7 +66,7 @@ void configured_capacity(cap_t pool, cap_t cspace) noexcept {
 
 void stale_channel(cap_t pool, cap_t cspace) noexcept {
     const auto old_pool = resource_create_child(pool, 256 * 1024, 64,
-        RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
     require(old_pool.status);
     const auto terminal = notification_create(pool, 1);
     require(terminal.status);

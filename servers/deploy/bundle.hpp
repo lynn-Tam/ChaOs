@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <uapi/arch/riscv64/address_space.h>
+#include <uapi/riscv64.h>
 #include <uapi/boot_bundle.h>
 
 namespace boot {

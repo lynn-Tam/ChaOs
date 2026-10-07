@@ -119,7 +119,7 @@ test_module = static_library(
 sh = find_program('sh')
 image_suffix = '-riscv64-' + profile + '-trace' + (trace_enabled ? '1' : '0')
 build_info_source = files('kernel/boot/build_id.cpp')
-build_info_args = kernel_cpp_args + ['-DMYOS_BUILD_ID="' + get_option('build_id') + '"']
+build_info_args = kernel_cpp_args + ['-DBUILD_ID="' + get_option('build_id') + '"']
 debug_build_info_args = build_info_args
 if get_option('build_id') == 'auto'
   build_info_source = vcs_tag(
@@ -127,8 +127,8 @@ if get_option('build_id') == 'auto'
     input: 'tools/build/build_info.cpp.in', output: 'build_info_auto.cpp',
     replace_string: '@VCS_TAG@', fallback: 'unknown-clean',
   )
-  build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="-riscv64-kernel-concoff"']
-  debug_build_info_args = kernel_cpp_args + ['-DMYOS_IMAGE_SUFFIX="' + image_suffix + '"']
+  build_info_args = kernel_cpp_args + ['-DIMAGE_SUFFIX="-riscv64-kernel-concoff"']
+  debug_build_info_args = kernel_cpp_args + ['-DIMAGE_SUFFIX="' + image_suffix + '"']
 endif
 kernel = executable(
   'kernel.elf', build_info_source,
@@ -248,7 +248,7 @@ file_client_user = executable(
 )
 file_failure_init_user = executable(
   'file-failure-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_common_args,
-  cpp_args: user_cpp_args + ['-DMYOS_TEST_FILE_FAILURE'],
+  cpp_args: user_cpp_args + ['-DTEST_FILE_FAILURE'],
   link_whole: [crt, service_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_failure_user = executable(

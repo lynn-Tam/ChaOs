@@ -19,10 +19,9 @@
 #include <libk/inplace_vector.hpp>
 #include <optional>
 #include <utility>
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 #include <servers/deploy/format.h>
-#include <uapi/object.h>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/plan.hpp>

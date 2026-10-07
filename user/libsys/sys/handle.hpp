@@ -4,8 +4,8 @@
 #include <concepts>
 #include <optional>
 #include <utility>
-#include <uapi/capability.h>
-#include <uapi/status.h>
+#include <uapi/cap.h>
+#include <uapi/abi.h>
 #include <sys/syscall.hpp>
 #include <expected>
 

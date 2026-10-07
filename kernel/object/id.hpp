@@ -1,7 +1,7 @@
 #pragma once
 
 #include <base/types.hpp>
-#include <uapi/object.h>
+#include <uapi/cap.h>
 
 namespace object { class group; }
 namespace ipc { class Endpoint; class Channel; class Notification; }

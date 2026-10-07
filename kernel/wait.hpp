@@ -4,7 +4,7 @@
 #include <base/types.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/sync/atomic.hpp>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 #include <sync.hpp>
 
 class CpuRegistry;

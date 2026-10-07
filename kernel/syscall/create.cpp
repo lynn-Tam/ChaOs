@@ -13,7 +13,7 @@
 #include <ipc/endpoint.hpp>
 #include <ipc/channel.hpp>
 #include <object/ref.hpp>
-#include <uapi/channel.h>
+#include <uapi/ipc.h>
 #include <ipc/notification.hpp>
 #include <mm/table.hpp>
 #include <mm/kspace.hpp>
@@ -22,28 +22,27 @@
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
 #include <task/thread.hpp>
-#include <uapi/syscall.h>
-#include <uapi/thread.h>
-#include <uapi/vm.h>
-#include <uapi/resource.h>
-#include <uapi/endpoint.h>
+#include <uapi/abi.h>
+#include <uapi/start.h>
+#include <uapi/mem.h>
+#include <uapi/cap.h>
 #include <mm/pager.hpp>
 #include <irq/irq.hpp>
 
 namespace syscall {
 
-static_assert(RESOURCE_THREAD == (u64{1} << static_cast<u16>(object::ObjectKind::Thread)));
-static_assert(RESOURCE_SCHED_CONTEXT == (u64{1} << static_cast<u16>(object::ObjectKind::Sc)));
-static_assert(RESOURCE_CSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::CSpace)));
-static_assert(RESOURCE_MEMORY == (u64{1} << static_cast<u16>(object::ObjectKind::Mem)));
-static_assert(RESOURCE_VSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::VSpace)));
-static_assert(RESOURCE_POOL == (u64{1} << static_cast<u16>(object::ObjectKind::group)));
-static_assert(RESOURCE_NOTIFICATION == (u64{1} << static_cast<u16>(object::ObjectKind::Notification)));
-static_assert(RESOURCE_ENDPOINT == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
-static_assert(RESOURCE_CHANNEL == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
-static_assert(RESOURCE_PAGER == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
-static_assert(RESOURCE_IRQ == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
-static_assert(RESOURCE_IO_SPACE == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
+static_assert(OBJ_BIT(OBJECT_KIND_THREAD) == (u64{1} << static_cast<u16>(object::ObjectKind::Thread)));
+static_assert(OBJ_BIT(OBJECT_KIND_SCHED_CONTEXT) == (u64{1} << static_cast<u16>(object::ObjectKind::Sc)));
+static_assert(OBJ_BIT(OBJECT_KIND_CSPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::CSpace)));
+static_assert(OBJ_BIT(OBJECT_KIND_MEMORY) == (u64{1} << static_cast<u16>(object::ObjectKind::Mem)));
+static_assert(OBJ_BIT(OBJECT_KIND_VSPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::VSpace)));
+static_assert(OBJ_BIT(OBJECT_KIND_RESOURCE_POOL) == (u64{1} << static_cast<u16>(object::ObjectKind::group)));
+static_assert(OBJ_BIT(OBJECT_KIND_NOTIFICATION) == (u64{1} << static_cast<u16>(object::ObjectKind::Notification)));
+static_assert(OBJ_BIT(OBJECT_KIND_ENDPOINT) == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
+static_assert(OBJ_BIT(OBJECT_KIND_CHANNEL) == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
+static_assert(OBJ_BIT(OBJECT_KIND_PAGER) == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
+static_assert(OBJ_BIT(OBJECT_KIND_IRQ) == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
+static_assert(OBJ_BIT(OBJECT_KIND_IO_SPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
 
 using object::ObjectKind;
 

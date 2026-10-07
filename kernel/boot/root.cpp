@@ -177,6 +177,26 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
                          std::unexpected(BootErr::OutOfMemory)};
     };
 
+    // The group owns retirement, independently of storage references held by
+    // maps or capability slots. Private boot pages need the same protocol.
+    auto own = [&](object::ref<>&& ref, cap::View view,
+                   cap::CSpace* space = nullptr) noexcept -> std::expected<cap::Handle, BootErr> {
+        auto self = pool.erase();
+        if (!self)
+            return std::unexpected(BootErr::InvalidState);
+        auto txn = pool->begin(std::move(*self));
+        if (!txn || !txn->adopt(kernel.grants(), std::move(ref), view))
+            return std::unexpected(BootErr::CapabilityFailed);
+        if (space) {
+            auto slots = txn->publish(*space, std::array{view});
+            if (!slots)
+                return std::unexpected(BootErr::CapabilityFailed);
+            return (*slots)[0];
+        }
+        txn->commit();
+        return cap::Handle{};
+    };
+
     // Every boot object follows the same reserve/create/publish transaction.
     auto create = [&]<class T>(object::ref<T>& dst, resource::budget budget,
                                auto&&... args) noexcept -> bool {
@@ -188,6 +208,13 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!pending)
             return false;
         dst = std::move(pending).value().publish();
+        if constexpr (std::same_as<T, mm::Mem>) {
+            auto ref = dst.erase();
+            return ref && own(std::move(*ref), {{},
+                                                cap::MemLimit{mm::ObjectRange{0, dst->page_count()},
+                                                              mm::Perms::of(mm::Perm::Read)}})
+                              .has_value();
+        }
         return true;
     };
     const CpuId cpu = runtime.local.descriptor->logical_id();
@@ -218,19 +245,13 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
                         mm::AnonCfg{.perms = segment.perms, .eager = true}))
                 return std::unexpected(BootErr::OutOfMemory);
             if (!write_memory(kernel.pmm(), hold.get(), segment.file)) {
-                libk_assert(hold.retire());
-                hold.reset();
                 return std::unexpected(BootErr::OutOfMemory);
             }
             if (segment.perms.contains(mm::Perm::Execute) && !hold->seal()) {
-                libk_assert(hold.retire());
-                hold.reset();
                 return std::unexpected(BootErr::InvalidState);
             }
             if (!map_memory(vspace.get(), cpu, hold, mm::Virt{segment.virtual_address},
                             segment.perms)) {
-                libk_assert(hold.retire());
-                hold.reset();
                 return std::unexpected(BootErr::MappingFailed);
             }
             // The mapping now owns the segment; no boot-side lifetime mirror.
@@ -304,14 +325,19 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         info_page.stack_size = root_stack_size;
         info_page.boot_bundle_size = module.size;
         auto* entries = reinterpret_cast<BootCap*>(&info_page + 1);
-        auto publish = [&](BootCap entry, object::ref<>&& ref, cap::View view) noexcept -> bool {
+        auto publish = [&](BootCap entry, object::ref<>&& ref, cap::View view,
+                           bool owned) noexcept -> bool {
             if (!ref || sizeof(info_page) + (info_page.count + 1) * sizeof(BootCap) > mm::page_size)
                 return false;
-            auto charge = reserve(kernel.grants().node_charge());
-            if (!charge)
-                return false;
-            auto installed = install_cap(kernel, cspace.get(), std::move(charge).value(),
-                                         std::move(ref), view.rights, view.data);
+            auto installed = [&]() -> std::expected<cap::Handle, BootErr> {
+                if (owned)
+                    return own(std::move(ref), view, &cspace.get());
+                auto charge = reserve(kernel.grants().node_charge());
+                if (!charge)
+                    return std::unexpected(charge.error());
+                return install_cap(kernel, cspace.get(), std::move(*charge), std::move(ref),
+                                   view.rights, view.data);
+            }();
             if (!installed)
                 return false;
             entry.handle = installed->raw();
@@ -319,14 +345,14 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
             info_page.size += sizeof(BootCap);
             return true;
         };
-        auto add_cap = [&](u32 role, auto&& ref, cap::Rights rights,
-                           cap::Limits limit = {}) -> bool {
+        auto add_cap = [&](u32 role, auto&& ref, cap::Rights rights, cap::Limits limit = {},
+                           bool owned = true) -> bool {
             if (!ref)
                 return false;
             BootCap entry{};
             entry.role = role;
             entry.kind = static_cast<u16>(ref->kind());
-            return publish(entry, std::move(ref).value(), {rights, limit});
+            return publish(entry, std::move(ref).value(), {rights, limit}, owned);
         };
 
         const auto basic_rights =
@@ -356,7 +382,10 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
             .object_kinds = resource_kinds,
         };
 
-        if (!virt_caps(BootCaps::bind(publish)))
+        auto borrow = [&](BootCap entry, object::ref<>&& ref, cap::View view) noexcept {
+            return publish(entry, std::move(ref), view, false);
+        };
+        if (!virt_caps(BootCaps::bind(borrow)))
             return std::unexpected(BootErr::CapabilityFailed);
 
         if (!add_cap(BOOT_VSPACE, vspace.erase(), vspace_rights, vm_limit) ||
@@ -366,7 +395,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
                                      cap::Right::Inspect, cap::Right::Revoke),
                      bundle_limit) ||
             !add_cap(BOOT_THREAD, thread.erase(), basic_rights) ||
-            !add_cap(BOOT_POOL, pool.erase(), pool_rights, pool_limit)) {
+            !add_cap(BOOT_POOL, pool.erase(), pool_rights, pool_limit, false)) {
             return std::unexpected(BootErr::CapabilityFailed);
         }
 
@@ -381,7 +410,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
                     kernel.clock().now()))
             return std::unexpected(BootErr::OutOfMemory);
         if (!add_cap(BOOT_SC, sc.erase(), basic_rights) ||
-            !add_cap(BOOT_DOMAIN, kernel.kernel_domain_ref(), basic_rights)) {
+            !add_cap(BOOT_DOMAIN, kernel.kernel_domain_ref(), basic_rights, {}, false)) {
             return std::unexpected(BootErr::CapabilityFailed);
         }
     }

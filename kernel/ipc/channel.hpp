@@ -13,7 +13,7 @@
 #include <object/ref.hpp>
 #include <wait.hpp>
 #include <sync.hpp>
-#include <uapi/channel.h>
+#include <uapi/ipc.h>
 
 class CpuRegistry;
 class Thread;

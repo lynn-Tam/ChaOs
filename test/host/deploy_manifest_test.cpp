@@ -6,9 +6,9 @@
 #include <initializer_list>
 
 #include <servers/deploy/format.h>
-#include <uapi/arch/riscv64/address_space.h>
+#include <uapi/riscv64.h>
 #include <uapi/boot_bundle.h>
-#include <uapi/resource.h>
+#include <uapi/cap.h>
 #include <libk/assert.hpp>
 
 #include "deploy/golden.hpp"
@@ -288,7 +288,7 @@ void make_channel_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
         bytes, size, OBJECT_KIND_CHANNEL,
         DEPLOY_OBJECT_FLAG_NONE, "channel", 7);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E6_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL)), 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000900000046), 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_ARG0, 1, 8);
@@ -303,7 +303,7 @@ void make_pager_manifest(uint8_t* bytes, size_t& size) {
     for (size_t i = 0; i < 6; ++i) {
         put(bytes, 0x4e0 + DEPLOY_OBJECT_ARG0 + i * 8, 0, 8);
     }
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E7_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL) | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_IRQ)), 8);
 }
 
 auto accepts_golden() -> bool {
@@ -498,7 +498,7 @@ auto rejects_endpoint_with_two_executions() -> bool {
     size_t size{};
     make_two_execution_manifest(bytes, size);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        RESOURCE_E4_KINDS, 8);
+        (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_KIND,
         OBJECT_KIND_ENDPOINT, 2);
     put(bytes, 0x298 + DEPLOY_OBJECT_FLAGS,
@@ -512,7 +512,7 @@ auto rejects_missing_notification_relation() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_channel_manifest(bytes, size);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E7_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL) | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_IRQ)), 8);
     put(bytes, 0x480 + DEPLOY_OBJECT_KIND,
         OBJECT_KIND_PAGER, 2);
     put(bytes, 0x480 + DEPLOY_OBJECT_FLAGS,
@@ -529,7 +529,7 @@ auto rejects_multiple_notifications_relation() -> bool {
         bytes, size, OBJECT_KIND_NOTIFICATION,
         DEPLOY_OBJECT_FLAG_NONE, "notify2", 7);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        RESOURCE_E2_KINDS, 8);
+        DEPLOY_BASE_KINDS, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, size, workspace);
 }
@@ -588,7 +588,7 @@ auto rejects_kind_mask_denial() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E1_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS & ~OBJ_BIT(OBJECT_KIND_NOTIFICATION)), 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -853,7 +853,7 @@ auto rejects_duplicate_channel_b() -> bool {
         bytes[index] = kGolden[index];
     }
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        RESOURCE_E6_KINDS, 8);
+        (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL)), 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000600000026), 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_KIND,
@@ -904,7 +904,7 @@ auto accepts_endpoint_schema() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_endpoint_manifest(bytes, size);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E4_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, size, workspace).has_value();
 }
@@ -918,7 +918,7 @@ auto rejects_endpoint_nonresident_source() -> bool {
     size_t size{};
     make_endpoint_manifest(bytes, size);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        RESOURCE_E4_KINDS, 8);
+        (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_REF0, 0, 4);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, size, workspace);

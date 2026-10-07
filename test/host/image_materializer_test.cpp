@@ -6,7 +6,7 @@
 
 #include <libk/assert.hpp>
 #include <utility>
-#include <uapi/resource.h>
+#include <uapi/cap.h>
 #include <servers/deploy/detail/space.hpp>
 #include <servers/deploy/detail/image.hpp>
 
@@ -550,7 +550,7 @@ template<typename Task>
     word_t scratch_size = sizeof(scratch_bytes)) noexcept -> bool {
     FakeBackend::reset();
     FakeBackend::scratch_address = reinterpret_cast<word_t>(scratch_bytes);
-    if (task.open({1, 0}, 8192, 64, RESOURCE_E7_KINDS, 32, 8)
+    if (task.open({1, 0}, 8192, 64, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL) | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_IRQ)), 32, 8)
             != STATUS_OK) {
         return false;
     }

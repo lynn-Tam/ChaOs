@@ -21,7 +21,7 @@
 #include <test/scenario.hpp>
 #endif
 #include <trap/trap.hpp>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 #include <libk/scope_guard.hpp>
 
 namespace trap {

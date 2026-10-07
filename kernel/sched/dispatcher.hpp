@@ -13,7 +13,7 @@
 #include <sched/sc.hpp>
 #include <sched/sched.hpp>
 #include <time/clock.hpp>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 
 struct CpuLocal;
 class CpuRegistry;

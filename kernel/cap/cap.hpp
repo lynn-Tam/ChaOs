@@ -1,7 +1,7 @@
 #pragma once
 
 #include <libk/bits.hpp>
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 
 #include <variant>
 #include <mm/types.hpp>

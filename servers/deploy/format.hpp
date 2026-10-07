@@ -6,15 +6,11 @@
 #include <libk/checked_arithmetic.hpp>
 #include <expected>
 #include <optional>
-#include <uapi/capability.h>
-#include <uapi/channel.h>
+#include <uapi/cap.h>
+#include <uapi/ipc.h>
 #include <uapi/start.h>
 #include <servers/deploy/format.h>
-#include <uapi/endpoint.h>
-#include <uapi/object.h>
-#include <uapi/ipc.h>
-#include <uapi/thread.h>
-#include <uapi/vm.h>
+#include <uapi/mem.h>
 
 #include <servers/deploy/bundle.hpp>
 #include <sys/start.hpp>

@@ -2,10 +2,10 @@
 #include <optional>
 #include <variant>
 #include <cap/cap.hpp>
-#include <uapi/endpoint.h>
+#include <uapi/ipc.h>
 #include <libk/checked_arithmetic.hpp>
 #include <mm/types.hpp>
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 
 namespace cap {
 

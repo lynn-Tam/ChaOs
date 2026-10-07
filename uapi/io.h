@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stddef.h>
-#include <uapi/types.h>
+#include <uapi/abi.h>
 
 enum IoState {
     IO_SPACE_EMPTY = 0,

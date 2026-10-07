@@ -10,9 +10,9 @@
 #include <servers/deploy/detail/task.hpp>
 #include <servers/uart/port.hpp>
 #include <uapi/start.h>
-#include <uapi/resource.h>
-#include <uapi/status.h>
-#include <uapi/vm.h>
+#include <uapi/cap.h>
+#include <uapi/abi.h>
+#include <uapi/mem.h>
 
 /*
  * Unit 4 is a boot-root production caller.  The generated manifest is linked
@@ -50,10 +50,10 @@ constexpr word_t ScratchSize = 0x20'0000;
 constexpr word_t UartAddress = 0x3001'0000;
 constexpr word_t ParentMemory = 12 * 1024 * 1024;
 constexpr word_t ParentCaps = 1024;
-constexpr word_t ParentKinds = RESOURCE_E7_KINDS;
+constexpr word_t ParentKinds = (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT) | OBJ_BIT(OBJECT_KIND_CHANNEL) | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_IRQ));
 constexpr word_t SourceMemory = 128 * 1024;
 constexpr word_t SourceCaps = 128;
-constexpr word_t SourceKinds = RESOURCE_E4_KINDS;
+constexpr word_t SourceKinds = (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT));
 constexpr word_t SourceDomainRights =
     RIGHT_DUPLICATE | RIGHT_DELEGATE | RIGHT_INSPECT
     | RIGHT_CONTROL | RIGHT_DESTROY | RIGHT_REVOKE;

@@ -23,7 +23,7 @@
 #include <sched/sched.hpp>
 #include <sched/sched.hpp>
 #include <time/time.hpp>
-#include <uapi/endpoint.h>
+#include <uapi/ipc.h>
 
 class CpuRegistry;
 class Thread;

@@ -9,6 +9,11 @@
 #include <stdint.h>
 #endif
 
+// Default application quota policy, outside the kernel ABI.
+#define DEPLOY_BASE_KINDS (OBJ_BIT(OBJECT_KIND_THREAD) | OBJ_BIT(OBJECT_KIND_SCHED_CONTEXT) | \
+    OBJ_BIT(OBJECT_KIND_CSPACE) | OBJ_BIT(OBJECT_KIND_MEMORY) | OBJ_BIT(OBJECT_KIND_VSPACE) | \
+    OBJ_BIT(OBJECT_KIND_RESOURCE_POOL) | OBJ_BIT(OBJECT_KIND_NOTIFICATION))
+
 #define DEPLOY_MAGIC UINT64_C(0x594f4c504544534d) /* "MSDEPLOY" */
 #define DEPLOY_MAJOR 1
 #define DEPLOY_MINOR 4
@@ -224,7 +229,7 @@
 #define DEPLOY_EXPORT_RESERVED_TAIL 88U
 
 /* Source-relative attenuation descriptor fields. */
-#include <uapi/capability.h>
+#include <uapi/cap.h>
 #include <uapi/start.h>
 
 /* Deployment wire offsets are aliases of the canonical capability ABI. */

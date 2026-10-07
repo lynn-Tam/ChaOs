@@ -13,9 +13,8 @@
 #include <vector>
 
 #include <servers/deploy/format.h>
-#include <uapi/object.h>
-#include <uapi/resource.h>
-#include <uapi/vm.h>
+#include <uapi/cap.h>
+#include <uapi/mem.h>
 
 namespace deploy::host {
 

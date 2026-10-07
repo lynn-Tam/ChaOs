@@ -4,8 +4,7 @@
 
 #include <cap/cap.hpp>
 #include <ipc/notification.hpp>
-#include <uapi/channel.h>
-#include <uapi/endpoint.h>
+#include <uapi/ipc.h>
 
 namespace {
 

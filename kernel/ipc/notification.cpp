@@ -13,7 +13,7 @@
 #include <sched/sc.hpp>
 #include <sync.hpp>
 #include <task/thread.hpp>
-#include <uapi/status.h>
+#include <uapi/abi.h>
 
 namespace ipc {
 

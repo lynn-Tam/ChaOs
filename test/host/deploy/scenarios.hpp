@@ -73,7 +73,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
     put(bytes, task + DEPLOY_TASK_EXPORT_COUNT, 1, 4);
     put(bytes, task + DEPLOY_TASK_POOL_MEMORY, 16384, 8);
     put(bytes, task + DEPLOY_TASK_POOL_CAPS, 16, 8);
-    put(bytes, task + DEPLOY_TASK_KIND_MASK, RESOURCE_E2_KINDS, 8);
+    put(bytes, task + DEPLOY_TASK_KIND_MASK, DEPLOY_BASE_KINDS, 8);
     put(bytes, task + DEPLOY_TASK_CRITICAL_BYTES, 12288, 8);
     put(bytes, task + DEPLOY_TASK_CSPACE_SLOTS, 16, 4);
     put(bytes, task + DEPLOY_TASK_CSPACE_PAGES, 1, 4);
@@ -210,7 +210,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
 inline auto pack_io_test(const char* path) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, "io-test", path, 4 * 1024 * 1024};
-    task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+    task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
     task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
@@ -222,14 +222,14 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
     {
         Task task{manifest, "block", server, 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
         task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
         task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
     }
     {
         Task task{manifest, "io-client", client, 2 * 1024 * 1024};
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.channel(boot::Block, "block.client", 0, 1, RIGHT_SEND);
         task.finish();
     }
@@ -242,7 +242,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     {
         Task task{manifest, "block", paths[0], 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
         task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
         task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
@@ -250,7 +250,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     {
         Task task{manifest, "files", paths[1], 16 * 1024 * 1024};
         task.cspace(1024, 132);
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_PAGER | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_PAGER) | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.channel(boot::Block, "block.client", 0, 1, RIGHT_SEND);
         task.channel(boot::Files, "files.server", 1, 1, RIGHT_RECEIVE);
         task.finish();
@@ -258,7 +258,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
     {
         Task task{manifest, "file-client", paths[2], 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.channel(boot::Files, "files.client", 0, 1, RIGHT_SEND);
         if (fault_test) {
             task.authority(file_fault_test::Ready, "test.ready", RIGHT_SIGNAL);
@@ -275,7 +275,7 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
     {
         Task task{manifest, "channel-test", coordinator, 8 * 1024 * 1024, true};
         task.cspace(512, 68);
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.finish();
     }
     {
@@ -286,7 +286,7 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
     }
     {
         Task task{manifest, "provider", provider, 1024 * 1024};
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.channel(boot::Stdout, "handoff", 0, 1,
             RIGHT_SEND | RIGHT_RECEIVE);
         task.channel_service(channel_test::Provider, "provider.client", 1,
@@ -295,7 +295,7 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
     }
     {
         Task task{manifest, "export-holder", holder, 1024 * 1024};
-        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL));
         task.requires_service(2, "provider");
         task.channel(boot::Stdout, "handoff", 0, 1,
             RIGHT_SEND);

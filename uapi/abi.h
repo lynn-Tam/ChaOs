@@ -1,9 +1,13 @@
 #pragma once
 
-// Register ABI constants shared by C/C++ and preprocessed assembly.
 #ifndef __ASSEMBLER__
-#include <uapi/types.h>
+#include <stdint.h>
+
+typedef uintptr_t word_t;
+typedef int32_t status_t;
 #endif
+
+// Register ABI constants shared by C/C++ and preprocessed assembly.
 
 #define STATUS_OK               0
 #define STATUS_INVALID_CAP     -1
@@ -29,3 +33,11 @@
 #define STATUS_TIMED_OUT         -21
 #define STATUS_PEER_CLOSED       -22
 #define STATUS_DIRTY             -23
+
+#ifndef __ASSEMBLER__
+enum {
+#define CALL(name, nr, entry, locus, unit) SYS_##name = nr,
+#include <uapi/calls.def>
+#undef CALL
+};
+#endif

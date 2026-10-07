@@ -9,7 +9,7 @@
 #include <cpu/runtime.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <limits>
-#include <uapi/syscall.h>
+#include <uapi/abi.h>
 #include <cap/cap.hpp>
 #include <task/thread.hpp>
 #include <utility>
@@ -18,15 +18,13 @@
 #include <resource/sponsorship.hpp>
 #include <irq/irq.hpp>
 #include <mm/pager.hpp>
-#include <uapi/pager.h>
+#include <uapi/mem.h>
 #include <io/space.hpp>
 #include <ipc/buffer.hpp>
 #include <io/device.hpp>
 #include <uapi/io.h>
 #include <variant>
-#include <uapi/vm.h>
 #include <sched/dispatcher.hpp>
-#include <uapi/status.h>
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
 
