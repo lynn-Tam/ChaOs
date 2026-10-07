@@ -16,7 +16,7 @@ public:
     struct Info final {
         u64 sequence{};
         Reason reason{Reason::Normal};
-        myos_status_t status{};
+        status_t status{};
         usize detail{};
         usize pc{};
         usize address{};
@@ -30,7 +30,7 @@ public:
 
     [[nodiscard]] auto observe(ipc::Notification&, u64 badge) noexcept -> bool;
     [[nodiscard]] auto read() const noexcept -> Info;
-    [[nodiscard]] auto claim(Reason, myos_status_t, usize detail = 0,
+    [[nodiscard]] auto claim(Reason, status_t, usize detail = 0,
         usize pc = 0, usize address = 0, u8 locus = 0) noexcept -> bool;
     [[nodiscard]] auto published() const noexcept -> bool;
 

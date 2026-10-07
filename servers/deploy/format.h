@@ -79,7 +79,7 @@
 #define DEPLOY_TASK_IMPORT_MAX 128U
 #define DEPLOY_TASK_DEPENDENCY_MAX 128U
 #define DEPLOY_TASK_EXPORT_MAX 64U
-#define DEPLOY_TASK_BOOTSTRAP_MAX (MYOS_BOOTSTRAP_MAX_CAPS + MYOS_BOOTSTRAP_MAX_IMPORTS)
+#define DEPLOY_TASK_BOOTSTRAP_MAX 32U
 
 /* Fixed envelope table descriptor fields. */
 #define DEPLOY_TABLE_OFFSET 0U
@@ -225,27 +225,27 @@
 
 /* Source-relative attenuation descriptor fields. */
 #include <uapi/capability.h>
-#include <uapi/bootstrap.h>
+#include <uapi/start.h>
 
 /* Deployment wire offsets are aliases of the canonical capability ABI. */
 #define DEPLOY_ATTENUATION_VERSION \
-    MYOS_CAP_ATTENUATION_VERSION_OFFSET
-#define DEPLOY_ATTENUATION_KIND MYOS_CAP_ATTENUATION_KIND_OFFSET
-#define DEPLOY_ATTENUATION_SIZE MYOS_CAP_ATTENUATION_SIZE_OFFSET
-#define DEPLOY_ATTENUATION_RIGHTS MYOS_CAP_ATTENUATION_RIGHTS_OFFSET
-#define DEPLOY_ATTENUATION_WORD0 MYOS_CAP_ATTENUATION_WORD0_OFFSET
-#define DEPLOY_ATTENUATION_WORD1 MYOS_CAP_ATTENUATION_WORD1_OFFSET
-#define DEPLOY_ATTENUATION_WORD2 MYOS_CAP_ATTENUATION_WORD2_OFFSET
-#define DEPLOY_ATTENUATION_WORD3 MYOS_CAP_ATTENUATION_WORD3_OFFSET
-#define DEPLOY_ATTENUATION_WORD4 MYOS_CAP_ATTENUATION_WORD4_OFFSET
-#define DEPLOY_ATTENUATION_WORD5 MYOS_CAP_ATTENUATION_WORD5_OFFSET
-#define DEPLOY_ATTENUATION_STRIDE MYOS_CAP_ATTENUATION_SIZE
+    CAP_ATTENUATION_VERSION_OFFSET
+#define DEPLOY_ATTENUATION_KIND CAP_ATTENUATION_KIND_OFFSET
+#define DEPLOY_ATTENUATION_SIZE CAP_ATTENUATION_SIZE_OFFSET
+#define DEPLOY_ATTENUATION_RIGHTS CAP_ATTENUATION_RIGHTS_OFFSET
+#define DEPLOY_ATTENUATION_WORD0 CAP_ATTENUATION_WORD0_OFFSET
+#define DEPLOY_ATTENUATION_WORD1 CAP_ATTENUATION_WORD1_OFFSET
+#define DEPLOY_ATTENUATION_WORD2 CAP_ATTENUATION_WORD2_OFFSET
+#define DEPLOY_ATTENUATION_WORD3 CAP_ATTENUATION_WORD3_OFFSET
+#define DEPLOY_ATTENUATION_WORD4 CAP_ATTENUATION_WORD4_OFFSET
+#define DEPLOY_ATTENUATION_WORD5 CAP_ATTENUATION_WORD5_OFFSET
+#define DEPLOY_ATTENUATION_STRIDE CAP_ATTENUATION_SIZE
 #define DEPLOY_ATTENUATION_VERSION_CURRENT \
-    MYOS_CAP_ATTENUATION_VERSION_CURRENT
+    CAP_ATTENUATION_VERSION_CURRENT
 
 #ifndef __ASSEMBLER__
 
-typedef enum myos_deploy_table {
+typedef enum deploy_table {
     DEPLOY_TABLE_KIND_TASK = DEPLOY_TABLE_TASK,
     DEPLOY_TABLE_KIND_IMAGE = DEPLOY_TABLE_IMAGE,
     DEPLOY_TABLE_KIND_MAPPING = DEPLOY_TABLE_MAPPING,
@@ -256,28 +256,28 @@ typedef enum myos_deploy_table {
     DEPLOY_TABLE_KIND_EXPORT = DEPLOY_TABLE_EXPORT,
     DEPLOY_TABLE_KIND_STRING = DEPLOY_TABLE_STRING,
     DEPLOY_TABLE_KIND_BOOTSTRAP = DEPLOY_TABLE_BOOTSTRAP,
-} myos_deploy_table_t;
+} deploy_table_t;
 
-typedef enum myos_deploy_architecture {
+typedef enum deploy_architecture {
     DEPLOY_ARCHITECTURE_GENERIC = DEPLOY_ARCH_GENERIC,
-} myos_deploy_architecture_t;
+} deploy_architecture_t;
 
-typedef enum myos_deploy_image_source_kind {
+typedef enum deploy_image_source_kind {
     DEPLOY_IMAGE_SOURCE_BOOT_BUNDLE = 0,
-} myos_deploy_image_source_kind_t;
+} deploy_image_source_kind_t;
 
-typedef enum myos_deploy_mapping_source {
+typedef enum deploy_mapping_source {
     DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT = 0,
     DEPLOY_MAPPING_SOURCE_ZERO = 1,
     DEPLOY_MAPPING_SOURCE_PAGER = 2,
-} myos_deploy_mapping_source_t;
+} deploy_mapping_source_t;
 
-typedef enum myos_deploy_mapping_residency {
+typedef enum deploy_mapping_residency {
     DEPLOY_MAPPING_RESIDENT = 0,
     DEPLOY_MAPPING_PAGEABLE = 1,
-} myos_deploy_mapping_residency_t;
+} deploy_mapping_residency_t;
 
-typedef enum myos_deploy_mapping_critical {
+typedef enum deploy_mapping_critical {
     DEPLOY_CRITICAL_NONE = 0,
     DEPLOY_CRITICAL_CODE = 1,
     DEPLOY_CRITICAL_STACK = 2,
@@ -286,7 +286,7 @@ typedef enum myos_deploy_mapping_critical {
     DEPLOY_CRITICAL_PAGER_RECOVERY = 5,
     DEPLOY_CRITICAL_DRIVER_RECOVERY = 6,
     DEPLOY_CRITICAL_IPC_HEADER = 9,
-} myos_deploy_mapping_critical_t;
+} deploy_mapping_critical_t;
 
 #define DEPLOY_OBJECT_FLAG_NONE 0U
 #define DEPLOY_OBJECT_EPHEMERAL_TASK (1U << 0)
@@ -294,26 +294,26 @@ typedef enum myos_deploy_mapping_critical {
 #define DEPLOY_OBJECT_FLAGS_VALID \
     (DEPLOY_OBJECT_EPHEMERAL_TASK | DEPLOY_OBJECT_POST_MAPPING)
 
-typedef enum myos_deploy_import_mode {
+typedef enum deploy_import_mode {
     DEPLOY_IMPORT_TYPED_DELEGATE = 0,
     DEPLOY_IMPORT_DUPLICATE = 1,
     DEPLOY_IMPORT_CHANNEL_MINT = 2,
     DEPLOY_IMPORT_MOVE = 3,
-} myos_deploy_import_mode_t;
+} deploy_import_mode_t;
 
-typedef enum myos_deploy_import_source_class {
+typedef enum deploy_import_source_class {
     DEPLOY_IMPORT_SOURCE_AUTHORITY = 0,
     DEPLOY_IMPORT_SOURCE_TASK_KEY = 1,
-} myos_deploy_import_source_class_t;
+} deploy_import_source_class_t;
 
-typedef enum myos_deploy_selector_policy {
+typedef enum deploy_selector_policy {
     DEPLOY_SELECTOR_ALLOCATED_KEYED = 0,
-} myos_deploy_selector_policy_t;
+} deploy_selector_policy_t;
 
-typedef enum myos_deploy_dependency_kind {
+typedef enum deploy_dependency_kind {
     DEPLOY_DEPENDENCY_REQUIRED = 0,
     DEPLOY_DEPENDENCY_OPTIONAL = 1,
-} myos_deploy_dependency_kind_t;
+} deploy_dependency_kind_t;
 
 #define DEPLOY_DEPENDENCY_STARTUP (1U << 0)
 #define DEPLOY_DEPENDENCY_READINESS (1U << 1)
@@ -323,44 +323,44 @@ typedef enum myos_deploy_dependency_kind {
 #define DEPLOY_DEPENDENCY_FLAGS_VALID \
     (DEPLOY_DEPENDENCY_STARTUP | DEPLOY_DEPENDENCY_READINESS | DEPLOY_DEPENDENCY_LIFETIME)
 
-typedef enum myos_deploy_export_class {
+typedef enum deploy_export_class {
     DEPLOY_EXPORT_PREPARED_KEY = 0,
     DEPLOY_EXPORT_RUNTIME_READY = 1,
-} myos_deploy_export_class_t;
+} deploy_export_class_t;
 
-typedef enum myos_deploy_execution_model {
+typedef enum deploy_execution_model {
     DEPLOY_EXECUTION_THREAD = 0,
-} myos_deploy_execution_model_t;
+} deploy_execution_model_t;
 
 /* Fault policy is target-specific even though its wire field is shared. */
-typedef enum myos_deploy_execution_fault_policy {
+typedef enum deploy_execution_fault_policy {
     DEPLOY_EXECUTION_FAULT_TERMINATE = 0,
     DEPLOY_EXECUTION_FAULT_ENDPOINT = 1,
-} myos_deploy_execution_fault_policy_t;
+} deploy_execution_fault_policy_t;
 
-typedef enum myos_deploy_execution_terminal_policy {
+typedef enum deploy_execution_terminal_policy {
     DEPLOY_EXECUTION_TERMINAL_LEADER_EXIT = 0,
     DEPLOY_EXECUTION_TERMINAL_ALL_EXIT = 1,
     DEPLOY_EXECUTION_TERMINAL_ANY_FAILURE = 2,
     DEPLOY_EXECUTION_TERMINAL_SUPERVISOR_MANAGED = 3,
-} myos_deploy_execution_terminal_policy_t;
+} deploy_execution_terminal_policy_t;
 
-typedef enum myos_deploy_readiness_policy {
+typedef enum deploy_readiness_policy {
     DEPLOY_READINESS_NONE = 0,
     DEPLOY_READINESS_START = 1,
     DEPLOY_READINESS_EXPLICIT = 2,
-} myos_deploy_readiness_policy_t;
+} deploy_readiness_policy_t;
 
-typedef enum myos_deploy_terminal_policy {
+typedef enum deploy_terminal_policy {
     DEPLOY_TERMINAL_RETAIN = 0,
     DEPLOY_TERMINAL_RESTART = 1,
     DEPLOY_TERMINAL_CLOSE = 2,
-} myos_deploy_terminal_policy_t;
+} deploy_terminal_policy_t;
 
-typedef enum myos_deploy_restart_policy {
+typedef enum deploy_restart_policy {
     DEPLOY_RESTART_NEVER = 0,
     DEPLOY_RESTART_ON_FAULT = 1,
     DEPLOY_RESTART_ALWAYS = 2,
-} myos_deploy_restart_policy_t;
+} deploy_restart_policy_t;
 
 #endif

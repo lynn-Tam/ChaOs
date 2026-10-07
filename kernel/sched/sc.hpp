@@ -7,13 +7,11 @@
 #include <libk/intrusive_tree.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <optional>
 #include <libk/sync/atomic.hpp>
 #include <sync.hpp>
 #include <object/ref.hpp>
-#include <sched/remote_queue.hpp>
-#include <sched/refill_queue.hpp>
-#include <sched/types.hpp>
+#include <libk/inplace_ring.hpp>
+#include <sched/sched.hpp>
 #include <time/time.hpp>
 #include <task/thread.hpp>
 
@@ -37,7 +35,7 @@ public:
         return timer_hook_.is_linked();
     }
 
-    static constexpr usize max_refills = RefillQueue::max_capacity;
+    static constexpr usize max_refills = 8;
 
     struct Config final {
         time::Duration budget{};
@@ -54,7 +52,6 @@ public:
         NotBound,
         WrongCpu,
         Active,
-        ArithmeticOverflow,
     };
 
     using Result = std::expected<void, Error>;
@@ -78,14 +75,11 @@ public:
     [[nodiscard]] auto eligible(time::Instant now) const noexcept -> bool;
     [[nodiscard]] auto available(time::Instant now) const noexcept
         -> time::Duration;
-    [[nodiscard]] auto next_refill() const noexcept
-        -> std::optional<time::Instant>;
-    [[nodiscard]] auto overrun() const noexcept -> time::Duration {
-        return overrun_;
+    [[nodiscard]] auto next_refill() const noexcept -> time::Instant {
+        return refills_.front().ready_at;
     }
-    [[nodiscard]] auto activation_count() const noexcept -> u64 {
-        return activation_count_;
-    }
+    // Home-CPU serialized, off the timer index; returns execution beyond budget.
+    auto charge(time::Instant now, time::Duration elapsed) noexcept -> time::Duration;
     [[nodiscard]] auto bound() const noexcept -> bool { return static_cast<bool>(owner_); }
     [[nodiscard]] auto admitted() const noexcept -> bool {
         return domain_ != nullptr;
@@ -106,9 +100,6 @@ public:
     [[nodiscard]] auto startable() const noexcept -> bool;
 
 private:
-    friend class ReadyQueue;
-    friend class TimerQueue;
-    friend class RemoteQueue;
 
     class auth final : private libk::noncopyable_nonmovable {
         struct link final : private libk::noncopyable_nonmovable {
@@ -176,7 +167,6 @@ private:
 
     [[nodiscard]] auto activate(CpuId cpu) noexcept -> bool;
     void deactivate(CpuId cpu) noexcept;
-    void charge(time::Instant now, time::Duration elapsed) noexcept;
     [[nodiscard]] auto unbind(Dispatcher* owner) noexcept
         -> std::expected<object::ref<>, Error>;
     [[nodiscard]] auto active() const noexcept -> bool {
@@ -184,17 +174,19 @@ private:
             != MaxCpus;
     }
 
+    struct Refill { time::Instant ready_at; time::Duration amount; };
     Config config_{};
-    RefillQueue refills_;
+    libk::InplaceRing<Refill, max_refills> refills_{};
     mutable sync::Spin
         authority_lock_{};
     object::ref<Thread> owner_{};
     libk::IntrusiveListHook ready_hook_{};
     libk::IntrusiveTreeHook timer_hook_{};
-    time::Instant timer_deadline_{};
-    RemoteRequest start_{RemoteKind::Start, this};
-    RemoteRequest wake_{RemoteKind::Wake, this};
-    RemoteRequest stop_{RemoteKind::Stop, this};
+    libk::IntrusiveListHook mail_hook_{};
+    u8 actions_{}; // Protected by the home dispatcher's mail lock.
+    // Queued or consumer-owned. External unbind must not release the binding
+    // while a home consumer has removed the hook to execute its actions.
+    libk::Atomic<bool> mailed_{};
     // Home-CPU-owned one-bit event credit. It closes the wake-before-block
     // race without allowing a remote producer to modify Thread state.
     bool wake_credit_{};
@@ -202,8 +194,6 @@ private:
     Domain* domain_{};
     CpuId home_cpu_{};
     libk::Atomic<usize> active_cpu_{MaxCpus};
-    time::Duration overrun_{};
-    u64 activation_count_{};
     cap::GrantAttachment domain_authority_{this, domain_ops_};
     cap::GrantWork domain_work_{};
     Stop domain_stop_{Stop::Notifier::bind<

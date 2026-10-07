@@ -33,7 +33,7 @@ printf '%s\n' '[audit] checking panic/assert and console providers...'
   | rg -q 'libk::assert_fail\(' \
   || fail 'common assertion provider is not linked'
 "$nm" -C --defined-only -n "$image" \
-  | rg -q 'arch::console::write\(' \
+  | rg -q 'arch::putchar\(' \
   || fail 'kernel console provider is not linked'
 
 "$nm" -C --defined-only -n "$image" | rg -q 'trace::emit\(' || fail 'event recorder is not linked'

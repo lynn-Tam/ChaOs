@@ -1,13 +1,13 @@
 #pragma once
 
 #ifdef __ASSEMBLER__
-#define MYOS_U64_C(value) value
+#define U64_C(value) value
 #else
 #include <stddef.h>
 #include <stdint.h>
 
-typedef uint64_t myos_cap_t;
-#define MYOS_U64_C(value) UINT64_C(value)
+typedef uint64_t cap_t;
+#define U64_C(value) UINT64_C(value)
 #endif
 
 /*
@@ -18,9 +18,9 @@ typedef uint64_t myos_cap_t;
  */
 #ifndef __ASSEMBLER__
 #ifdef __cplusplus
-struct alignas(8) myos_cap_attenuation {
+struct alignas(8) CapView {
 #else
-struct myos_cap_attenuation {
+struct CapView {
 #endif
     uint16_t version;
     uint16_t kind;
@@ -30,58 +30,58 @@ struct myos_cap_attenuation {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(myos_cap_attenuation) == 64);
-static_assert(alignof(myos_cap_attenuation) == 8);
-static_assert(offsetof(myos_cap_attenuation, version) == 0);
-static_assert(offsetof(myos_cap_attenuation, kind) == 2);
-static_assert(offsetof(myos_cap_attenuation, size) == 4);
-static_assert(offsetof(myos_cap_attenuation, rights) == 8);
-static_assert(offsetof(myos_cap_attenuation, words) == 16);
+static_assert(sizeof(CapView) == 64);
+static_assert(alignof(CapView) == 8);
+static_assert(offsetof(CapView, version) == 0);
+static_assert(offsetof(CapView, kind) == 2);
+static_assert(offsetof(CapView, size) == 4);
+static_assert(offsetof(CapView, rights) == 8);
+static_assert(offsetof(CapView, words) == 16);
 #endif
 #endif
 
-#define MYOS_CAP_ATTENUATION_VERSION_OFFSET 0U
-#define MYOS_CAP_ATTENUATION_KIND_OFFSET 2U
-#define MYOS_CAP_ATTENUATION_SIZE_OFFSET 4U
-#define MYOS_CAP_ATTENUATION_RIGHTS_OFFSET 8U
-#define MYOS_CAP_ATTENUATION_WORD0_OFFSET 16U
-#define MYOS_CAP_ATTENUATION_WORD1_OFFSET 24U
-#define MYOS_CAP_ATTENUATION_WORD2_OFFSET 32U
-#define MYOS_CAP_ATTENUATION_WORD3_OFFSET 40U
-#define MYOS_CAP_ATTENUATION_WORD4_OFFSET 48U
-#define MYOS_CAP_ATTENUATION_WORD5_OFFSET 56U
-#define MYOS_CAP_ATTENUATION_SIZE 64U
-#define MYOS_CAP_ATTENUATION_VERSION_CURRENT 1U
+#define CAP_ATTENUATION_VERSION_OFFSET 0U
+#define CAP_ATTENUATION_KIND_OFFSET 2U
+#define CAP_ATTENUATION_SIZE_OFFSET 4U
+#define CAP_ATTENUATION_RIGHTS_OFFSET 8U
+#define CAP_ATTENUATION_WORD0_OFFSET 16U
+#define CAP_ATTENUATION_WORD1_OFFSET 24U
+#define CAP_ATTENUATION_WORD2_OFFSET 32U
+#define CAP_ATTENUATION_WORD3_OFFSET 40U
+#define CAP_ATTENUATION_WORD4_OFFSET 48U
+#define CAP_ATTENUATION_WORD5_OFFSET 56U
+#define CAP_ATTENUATION_SIZE 64U
+#define CAP_ATTENUATION_VERSION_CURRENT 1U
 
 /* Capability-family fields with a stable public encoding. */
-#define MYOS_CAP_CHANNEL_SIDE_A 0U
-#define MYOS_CAP_CHANNEL_SIDE_B 1U
+#define CAP_CHANNEL_SIDE_A 0U
+#define CAP_CHANNEL_SIDE_B 1U
 
-#define MYOS_RIGHT_DUPLICATE     (MYOS_U64_C(1) << 0)
-#define MYOS_RIGHT_DELEGATE      (MYOS_U64_C(1) << 1)
-#define MYOS_RIGHT_RESERVE       (MYOS_U64_C(1) << 2)
-#define MYOS_RIGHT_MAP           (MYOS_U64_C(1) << 4)
-#define MYOS_RIGHT_UNMAP         (MYOS_U64_C(1) << 5)
-#define MYOS_RIGHT_PROTECT       (MYOS_U64_C(1) << 6)
-#define MYOS_RIGHT_DESTROY       (MYOS_U64_C(1) << 7)
-#define MYOS_RIGHT_INSPECT       (MYOS_U64_C(1) << 8)
-#define MYOS_RIGHT_CONTROL       (MYOS_U64_C(1) << 9)
-#define MYOS_RIGHT_MANAGE        (MYOS_U64_C(1) << 10)
-#define MYOS_RIGHT_REVOKE        (MYOS_U64_C(1) << 11)
-#define MYOS_RIGHT_CREATE        (MYOS_U64_C(1) << 12)
-#define MYOS_RIGHT_SPLIT         (MYOS_U64_C(1) << 13)
-#define MYOS_RIGHT_CLOSE         (MYOS_U64_C(1) << 14)
-#define MYOS_RIGHT_SIGNAL        (MYOS_U64_C(1) << 15)
-#define MYOS_RIGHT_RECEIVE       (MYOS_U64_C(1) << 16)
-#define MYOS_RIGHT_CONNECT       (MYOS_U64_C(1) << 17)
-#define MYOS_RIGHT_ACK           (MYOS_U64_C(1) << 18)
-#define MYOS_RIGHT_CALL          (MYOS_U64_C(1) << 19)
-#define MYOS_RIGHT_SEND          (MYOS_U64_C(1) << 20)
-#define MYOS_RIGHT_SERVE         (MYOS_U64_C(1) << 21)
-#define MYOS_RIGHT_SUPPLY        (MYOS_U64_C(1) << 22)
-#define MYOS_RIGHT_FAIL          (MYOS_U64_C(1) << 23)
-#define MYOS_RIGHT_WRITEBACK_ACK (MYOS_U64_C(1) << 24)
-#define MYOS_RIGHT_ROUTE         (MYOS_U64_C(1) << 25)
-#define MYOS_RIGHT_OBSERVE       (MYOS_U64_C(1) << 26)
-#define MYOS_RIGHT_ATTACH        (MYOS_U64_C(1) << 27)
-#define MYOS_RIGHT_MASK          ((MYOS_U64_C(1) << 28) - 1)
+#define RIGHT_DUPLICATE     (U64_C(1) << 0)
+#define RIGHT_DELEGATE      (U64_C(1) << 1)
+#define RIGHT_RESERVE       (U64_C(1) << 2)
+#define RIGHT_MAP           (U64_C(1) << 4)
+#define RIGHT_UNMAP         (U64_C(1) << 5)
+#define RIGHT_PROTECT       (U64_C(1) << 6)
+#define RIGHT_DESTROY       (U64_C(1) << 7)
+#define RIGHT_INSPECT       (U64_C(1) << 8)
+#define RIGHT_CONTROL       (U64_C(1) << 9)
+#define RIGHT_MANAGE        (U64_C(1) << 10)
+#define RIGHT_REVOKE        (U64_C(1) << 11)
+#define RIGHT_CREATE        (U64_C(1) << 12)
+#define RIGHT_SPLIT         (U64_C(1) << 13)
+#define RIGHT_CLOSE         (U64_C(1) << 14)
+#define RIGHT_SIGNAL        (U64_C(1) << 15)
+#define RIGHT_RECEIVE       (U64_C(1) << 16)
+#define RIGHT_CONNECT       (U64_C(1) << 17)
+#define RIGHT_ACK           (U64_C(1) << 18)
+#define RIGHT_CALL          (U64_C(1) << 19)
+#define RIGHT_SEND          (U64_C(1) << 20)
+#define RIGHT_SERVE         (U64_C(1) << 21)
+#define RIGHT_SUPPLY        (U64_C(1) << 22)
+#define RIGHT_FAIL          (U64_C(1) << 23)
+#define RIGHT_WRITEBACK_ACK (U64_C(1) << 24)
+#define RIGHT_ROUTE         (U64_C(1) << 25)
+#define RIGHT_OBSERVE       (U64_C(1) << 26)
+#define RIGHT_ATTACH        (U64_C(1) << 27)
+#define RIGHT_MASK          ((U64_C(1) << 28) - 1)

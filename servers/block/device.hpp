@@ -15,60 +15,60 @@ namespace block {
 // before submitting another request in that slot. IOSpace owns device drain.
 class Device final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr size_t Depth = myos::io::QueueDepth;
+    static constexpr size_t Depth = sys::io::QueueDepth;
     static constexpr size_t BlockSize = 512;
     static constexpr size_t MaxTransfer = 4096;
     struct Completion final {
-        myos::io::Ticket ticket{};
-        myos_status_t status{};
+        sys::io::Ticket ticket{};
+        status_t status{};
         size_t size{};
         const uint8_t* data{};
     };
 
-    [[nodiscard]] auto open(myos_cap_t pool, myos_cap_t vspace,
-        myos_cap_t device, myos_cap_t events) noexcept -> myos_status_t {
-        using namespace myos;
+    [[nodiscard]] auto open(cap_t pool, cap_t vspace,
+        cap_t device, cap_t events) noexcept -> status_t {
+        using namespace sys;
         const auto created = io_space_create(pool);
-        if (created.status != MYOS_STATUS_OK) return created.status;
+        if (created.status != STATUS_OK) return created.status;
         space_ = cap::OwnedCap{{created.value, 0}};
         auto arena = MappedMemory::create(pool, vspace, ArenaAddress, ArenaSize);
         if (!arena) return arena.error();
         arena_ = std::move(*arena);
         const auto watched = io_space_watch(created.value, events, service::EventsBadge);
-        if (watched.status != MYOS_STATUS_OK) return watched.status;
+        if (watched.status != STATUS_OK) return watched.status;
         const auto bound = io_space_bind(created.value, device, arena_.memory.selector(),
             0, ArenaSize / 4096, Iova);
-        if (bound.status != MYOS_STATUS_OK) return bound.status;
+        if (bound.status != STATUS_OK) return bound.status;
         for (;;) {
             const auto state = io_space_state(created.value);
-            if (state.status != MYOS_STATUS_OK) return state.status;
-            if (state.value == MYOS_IO_SPACE_ACTIVE) break;
-            if (state.value != MYOS_IO_SPACE_OPENING) return MYOS_STATUS_BACKING_FAILED;
+            if (state.status != STATUS_OK) return state.status;
+            if (state.value == IO_SPACE_ACTIVE) break;
+            if (state.value != IO_SPACE_OPENING) return STATUS_BACKING_FAILED;
             yield();
         }
         auto result = io_space_info(created.value);
-        if (result.status != MYOS_STATUS_OK) return result.status;
-        myos_io_info info{};
+        if (result.status != STATUS_OK) return result.status;
+        IoInfo info{};
         service::copy(&info, reinterpret_cast<const void*>(service::IpcAddress), sizeof(info));
-        if (info.version != MYOS_IO_INFO_VERSION || info.reserved != 0
-            || info.configuration[0] != 0x1042'1af4) return MYOS_STATUS_BAD_ARGS;
+        if (info.version != IO_INFO_VERSION || info.reserved != 0
+            || info.configuration[0] != 0x1042'1af4) return STATUS_BAD_ARGS;
         for (size_t index = 0; index < 6; ++index) {
             if (info.bar_sizes[index] == 0) continue;
-            if (info.bar_sizes[index] > BarStride) return MYOS_STATUS_BAD_ARGS;
+            if (info.bar_sizes[index] > BarStride) return STATUS_BAD_ARGS;
             const auto bar = io_space_bar(created.value, index);
-            if (bar.status != MYOS_STATUS_OK) return bar.status;
+            if (bar.status != STATUS_OK) return bar.status;
             const size_t bytes = (info.bar_sizes[index] + 4095) & ~size_t{4095};
             auto mapped = MappedMemory::map(vspace, cap::OwnedCap{{bar.value, 0}},
-                BarsAddress + index * BarStride, bytes, MYOS_VM_READ | MYOS_VM_WRITE);
+                BarsAddress + index * BarStride, bytes, VM_READ | VM_WRITE);
             if (!mapped) return mapped.error();
             bars_[index] = std::move(*mapped);
         }
         const auto interrupt = io_space_irq(created.value);
-        if (interrupt.status != MYOS_STATUS_OK) return interrupt.status;
+        if (interrupt.status != STATUS_OK) return interrupt.status;
         interrupt_ = cap::OwnedCap{{interrupt.value, 0}};
         result = irq_bind(interrupt.value, events, service::EventsBadge);
-        if (result.status != MYOS_STATUS_OK) return result.status;
-        return configure(info) ? MYOS_STATUS_OK : MYOS_STATUS_BACKING_FAILED;
+        if (result.status != STATUS_OK) return result.status;
+        return configure(info) ? STATUS_OK : STATUS_BACKING_FAILED;
     }
 
     [[nodiscard]] auto capacity() const noexcept -> uint64_t { return sectors_ * BlockSize; }
@@ -76,62 +76,62 @@ public:
 
     // After close starts, BAR/IRQ views may be revoked. Do not submit,
     // observe or acknowledge again; only the IOSpace state remains usable.
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
-        const auto closed = myos::io_space_close(space_.selector());
-        if (closed.status != MYOS_STATUS_OK) return closed.status;
+    [[nodiscard]] auto close() noexcept -> status_t {
+        const auto closed = sys::io_space_close(space_.selector());
+        if (closed.status != STATUS_OK) return closed.status;
         for (;;) {
-            const auto state = myos::io_space_state(space_.selector());
-            if (state.status != MYOS_STATUS_OK) return state.status;
-            if (state.value == MYOS_IO_SPACE_CLOSED) return MYOS_STATUS_OK;
-            if (state.value == MYOS_IO_SPACE_FAILED
-                || state.value == MYOS_IO_SPACE_FAULTED) return MYOS_STATUS_BACKING_FAILED;
-            myos::yield();
+            const auto state = sys::io_space_state(space_.selector());
+            if (state.status != STATUS_OK) return state.status;
+            if (state.value == IO_SPACE_CLOSED) return STATUS_OK;
+            if (state.value == IO_SPACE_FAILED
+                || state.value == IO_SPACE_FAULTED) return STATUS_BACKING_FAILED;
+            sys::yield();
         }
     }
 
-    [[nodiscard]] auto submit(myos::io::Ticket ticket, myos::io::Operation operation,
+    [[nodiscard]] auto submit(sys::io::Ticket ticket, sys::io::Operation operation,
         uint64_t offset, size_t size, const uint8_t* source = nullptr) noexcept
-        -> myos_status_t {
-        if (ticket.slot >= Depth || slots_[ticket.slot].active) return MYOS_STATUS_BUSY;
-        if (operation == myos::io::Operation::Flush) {
-            if (!flush_supported_) return MYOS_STATUS_INVALID_OP;
-            if (offset != 0 || size != 0 || source != nullptr) return MYOS_STATUS_BAD_ARGS;
-        } else if (operation == myos::io::Operation::Identify) {
-            if (offset != 0 || size != 20 || source != nullptr) return MYOS_STATUS_BAD_ARGS;
+        -> status_t {
+        if (ticket.slot >= Depth || slots_[ticket.slot].active) return STATUS_BUSY;
+        if (operation == sys::io::Operation::Flush) {
+            if (!flush_supported_) return STATUS_INVALID_OP;
+            if (offset != 0 || size != 0 || source != nullptr) return STATUS_BAD_ARGS;
+        } else if (operation == sys::io::Operation::Identify) {
+            if (offset != 0 || size != 20 || source != nullptr) return STATUS_BAD_ARGS;
         } else {
-            if (operation != myos::io::Operation::Read && operation != myos::io::Operation::Write)
-                return MYOS_STATUS_INVALID_OP;
-            if (operation == myos::io::Operation::Write && (read_only_ || source == nullptr))
-                return MYOS_STATUS_DENIED;
+            if (operation != sys::io::Operation::Read && operation != sys::io::Operation::Write)
+                return STATUS_INVALID_OP;
+            if (operation == sys::io::Operation::Write && (read_only_ || source == nullptr))
+                return STATUS_DENIED;
             if (size == 0 || size > MaxTransfer || size % BlockSize != 0 || offset % BlockSize != 0
-                || offset > capacity() || size > capacity() - offset) return MYOS_STATUS_BAD_ARGS;
+                || offset > capacity() || size > capacity() - offset) return STATUS_BAD_ARGS;
         }
         const size_t slot = ticket.slot;
         const uintptr_t header = ArenaAddress + Headers + slot * 32;
-        const uint32_t type = operation == myos::io::Operation::Read ? 0
-            : operation == myos::io::Operation::Write ? 1
-            : operation == myos::io::Operation::Flush ? 4 : 8;
+        const uint32_t type = operation == sys::io::Operation::Read ? 0
+            : operation == sys::io::Operation::Write ? 1
+            : operation == sys::io::Operation::Flush ? 4 : 8;
         dma_write<uint32_t>(header, type);
         dma_write<uint32_t>(header + 4, 0);
-        dma_write<uint64_t>(header + 8, operation == myos::io::Operation::Read
-            || operation == myos::io::Operation::Write ? offset / BlockSize : 0);
+        dma_write<uint64_t>(header + 8, operation == sys::io::Operation::Read
+            || operation == sys::io::Operation::Write ? offset / BlockSize : 0);
         dma_write<uint8_t>(header + 16, 0xff);
         const uint16_t head = static_cast<uint16_t>(slot * 3);
         descriptor(head, Iova + Headers + slot * 32, 16, 1, head + 1);
-        if (operation == myos::io::Operation::Flush) {
+        if (operation == sys::io::Operation::Flush) {
             descriptor(head + 1, Iova + Headers + slot * 32 + 16, 1, 2, 0);
         } else {
-            if (operation == myos::io::Operation::Write)
-                myos::service::copy(reinterpret_cast<void*>(ArenaAddress + Data + slot * MaxTransfer), source, size);
+            if (operation == sys::io::Operation::Write)
+                sys::service::copy(reinterpret_cast<void*>(ArenaAddress + Data + slot * MaxTransfer), source, size);
             descriptor(head + 1, Iova + Data + slot * MaxTransfer, size,
-                operation == myos::io::Operation::Write ? 1 : 3, head + 2);
+                operation == sys::io::Operation::Write ? 1 : 3, head + 2);
             descriptor(head + 2, Iova + Headers + slot * 32 + 16, 1, 2, 0);
         }
         dma_write<uint16_t>(ArenaAddress + Available + 4 + (available_ % QueueSize) * 2, head);
         ++available_;
         slots_[slot] = {ticket, size, operation, true};
         ++active_;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     void publish() noexcept {
@@ -144,44 +144,44 @@ public:
         published_ = available_;
     }
 
-    [[nodiscard]] auto take(Completion& completion) noexcept -> myos_status_t {
+    [[nodiscard]] auto take(Completion& completion) noexcept -> status_t {
         const uint16_t published = dma_read<uint16_t>(ArenaAddress + Used + 2);
         const uint16_t count = static_cast<uint16_t>(published - used_);
-        if (count == 0) return MYOS_STATUS_WOULD_BLOCK;
-        if (count > active_) return MYOS_STATUS_BACKING_FAILED;
+        if (count == 0) return STATUS_WOULD_BLOCK;
+        if (count > active_) return STATUS_BACKING_FAILED;
         asm volatile("fence r, rw" ::: "memory");
         const uintptr_t entry = ArenaAddress + Used + 4 + (used_ % QueueSize) * 8;
         const uint32_t head = dma_read<uint32_t>(entry);
         const uint32_t written = dma_read<uint32_t>(entry + 4);
-        if (head % 3 != 0 || head / 3 >= Depth) return MYOS_STATUS_BACKING_FAILED;
+        if (head % 3 != 0 || head / 3 >= Depth) return STATUS_BACKING_FAILED;
         const size_t index = head / 3;
         const auto& slot = slots_[index];
-        if (!slot.active) return MYOS_STATUS_BACKING_FAILED;
+        if (!slot.active) return STATUS_BACKING_FAILED;
         const uint8_t status = dma_read<uint8_t>(ArenaAddress + Headers + index * 32 + 16);
-        const bool returned_data = slot.operation == myos::io::Operation::Read
-            || slot.operation == myos::io::Operation::Identify;
+        const bool returned_data = slot.operation == sys::io::Operation::Read
+            || slot.operation == sys::io::Operation::Identify;
         const uint32_t expected = returned_data ? static_cast<uint32_t>(slot.size + 1) : 1;
-        if (status > 2 || (status == 0 && written != expected)) return MYOS_STATUS_BACKING_FAILED;
-        completion = {slot.ticket, status == 0 ? MYOS_STATUS_OK
-            : status == 2 ? MYOS_STATUS_INVALID_OP : MYOS_STATUS_BACKING_FAILED,
+        if (status > 2 || (status == 0 && written != expected)) return STATUS_BACKING_FAILED;
+        completion = {slot.ticket, status == 0 ? STATUS_OK
+            : status == 2 ? STATUS_INVALID_OP : STATUS_BACKING_FAILED,
             status == 0 ? slot.size : 0,
             returned_data
                 ? reinterpret_cast<const uint8_t*>(ArenaAddress + Data + index * MaxTransfer) : nullptr};
         slots_[index] = {};
         --active_;
         ++used_;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
-    [[nodiscard]] auto acknowledge() noexcept -> myos_status_t {
-        const auto state = myos::io_space_state(space_.selector());
-        if (state.status != MYOS_STATUS_OK) return state.status;
-        if (state.value != MYOS_IO_SPACE_ACTIVE) return MYOS_STATUS_BACKING_FAILED;
-        const auto delivered = myos::irq_observe(interrupt_.selector());
-        if (delivered.status == MYOS_STATUS_BUSY) return MYOS_STATUS_OK;
-        if (delivered.status != MYOS_STATUS_OK) return delivered.status;
+    [[nodiscard]] auto acknowledge() noexcept -> status_t {
+        const auto state = sys::io_space_state(space_.selector());
+        if (state.status != STATUS_OK) return state.status;
+        if (state.value != IO_SPACE_ACTIVE) return STATUS_BACKING_FAILED;
+        const auto delivered = sys::irq_observe(interrupt_.selector());
+        if (delivered.status == STATUS_BUSY) return STATUS_OK;
+        if (delivered.status != STATUS_OK) return delivered.status;
         (void)read<uint8_t>(isr_); // clear the device's level before unmasking PLIC
-        const auto result = myos::irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
+        const auto result = sys::irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
         return result.status;
     }
 
@@ -224,7 +224,7 @@ private:
         dma_write<uint16_t>(target + 14, next);
     }
 
-    auto configure(const myos_io_info& info) noexcept -> bool {
+    auto configure(const IoInfo& info) noexcept -> bool {
         uintptr_t common{};
         uintptr_t device{};
         size_t notify_size{};
@@ -304,9 +304,9 @@ private:
     }
 
     struct Slot final {
-        myos::io::Ticket ticket{};
+        sys::io::Ticket ticket{};
         size_t size{};
-        myos::io::Operation operation{myos::io::Operation::Read};
+        sys::io::Operation operation{sys::io::Operation::Read};
         bool active{};
     };
     Slot slots_[Depth]{};
@@ -319,10 +319,10 @@ private:
     bool flush_supported_{};
     uintptr_t notify_{};
     uintptr_t isr_{};
-    myos::cap::OwnedCap space_{};
-    myos::cap::OwnedCap interrupt_{};
-    myos::MappedMemory arena_{};
-    myos::MappedMemory bars_[6]{};
+    sys::cap::OwnedCap space_{};
+    sys::cap::OwnedCap interrupt_{};
+    sys::MappedMemory arena_{};
+    sys::MappedMemory bars_[6]{};
 };
 
 } // namespace block

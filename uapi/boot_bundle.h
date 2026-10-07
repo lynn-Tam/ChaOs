@@ -4,29 +4,29 @@
  * BootBundle is a little-endian wire format. These are byte offsets, not a C
  * object layout: readers must decode fields explicitly from bounded storage.
  */
-#define MYOS_BOOT_MAGIC UINT64_C(0x544f4f42534f594d) /* "MYOSBOOT" */
-#define MYOS_BOOT_MAJOR 1
-#define MYOS_BOOT_MINOR 1
+#define BUNDLE_MAGIC UINT64_C(0x544f4f42534f594d) /* "MYOSBOOT" */
+#define BUNDLE_MAJOR 1
+#define BUNDLE_MINOR 1
 
-#define MYOS_BOOT_ARCH_RISCV64 1
-#define MYOS_BOOT_ABI_RISCV_LP64 1
+#define BUNDLE_ARCH_RISCV64 1
+#define BUNDLE_ABI_RISCV_LP64 1
 
-#define MYOS_BOOT_HEADER_SIZE 80
-#define MYOS_BOOT_MODULE_SIZE 64
-#define MYOS_BOOT_SEGMENT_SIZE 48
+#define BUNDLE_HEADER_SIZE 80
+#define BUNDLE_MODULE_SIZE 64
+#define BUNDLE_SEGMENT_SIZE 48
 
-#define MYOS_BOOT_MODULE_BOOTABLE (UINT32_C(1) << 0)
-#define MYOS_BOOT_MODULE_DATA     (UINT32_C(1) << 1)
-#define MYOS_BOOT_MODULE_ROLE_MASK \
-    (MYOS_BOOT_MODULE_BOOTABLE | MYOS_BOOT_MODULE_DATA)
+#define BUNDLE_MODULE_BOOTABLE (UINT32_C(1) << 0)
+#define BUNDLE_MODULE_DATA     (UINT32_C(1) << 1)
+#define BUNDLE_MODULE_ROLE_MASK \
+    (BUNDLE_MODULE_BOOTABLE | BUNDLE_MODULE_DATA)
 
-#define MYOS_BOOT_SEGMENT_READ    (UINT32_C(1) << 0)
-#define MYOS_BOOT_SEGMENT_WRITE   (UINT32_C(1) << 1)
-#define MYOS_BOOT_SEGMENT_EXECUTE (UINT32_C(1) << 2)
+#define BUNDLE_SEGMENT_READ    (UINT32_C(1) << 0)
+#define BUNDLE_SEGMENT_WRITE   (UINT32_C(1) << 1)
+#define BUNDLE_SEGMENT_EXECUTE (UINT32_C(1) << 2)
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
-typedef uint64_t myos_boot_features_t;
+typedef uint64_t bundle_flags_t;
 
 #endif

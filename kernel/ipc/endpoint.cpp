@@ -137,7 +137,7 @@ auto Endpoint::add_call() noexcept
     -> std::expected<void, EndpointError> {
     if (state_ != State::Constructing
         || call_count_ >= config_.call_capacity
-        || call_count_ >= MYOS_ENDPOINT_MAX_CALLS) {
+        || call_count_ >= ENDPOINT_MAX_CALLS) {
         return std::unexpected(EndpointError::InvalidConfig);
     }
     auto made = calls_.create(payer_, *this);
@@ -183,9 +183,9 @@ auto Endpoint::open() noexcept -> std::expected<void, EndpointError> {
         || !code_.valid() || config_.capacity == 0
         || config_.capacity > max_activations
         || config_.call_capacity < config_.capacity
-        || config_.call_capacity > MYOS_ENDPOINT_MAX_CALLS
+        || config_.call_capacity > ENDPOINT_MAX_CALLS
         || config_.max_depth == 0
-        || config_.max_depth > MYOS_ENDPOINT_MAX_DEPTH
+        || config_.max_depth > ENDPOINT_MAX_DEPTH
         || slot_count_ != config_.capacity
         || call_count_ != config_.call_capacity
         || !arch::valid_user_start(config_.entry)) {
@@ -226,29 +226,29 @@ auto Endpoint::snapshot_caps(
     if (buffer == nullptr) {
         return true;
     }
-    myos_ipc_caps message{};
+    IpcCaps message{};
     if (!buffer->read(0, libk::Span<byte>{
             reinterpret_cast<byte*>(&message), sizeof(message)})
-        || message.version != MYOS_IPC_CAPS_VERSION
-        || message.flags != MYOS_IPC_CAPS_FLAGS_NONE
+        || message.version != IPC_CAPS_VERSION
+        || message.flags != IPC_CAPS_FLAGS_NONE
         || message.reserved != 0
-        || message.send_count > MYOS_IPC_MAX_CAPS
-        || message.receive_limit > MYOS_IPC_MAX_CAPS
+        || message.send_count > IPC_MAX_CAPS
+        || message.receive_limit > IPC_MAX_CAPS
         || message.send_count > limit || message.receive_limit > limit) {
         return false;
     }
     for (usize index = 0; index < message.send_count; ++index) {
-        const myos_cap_transfer& wire = message.send[index];
-        const auto rights = cap::Rights::parse(wire.rights, MYOS_RIGHT_MASK);
+        const CapXfer& wire = message.send[index];
+        const auto rights = cap::Rights::parse(wire.rights, RIGHT_MASK);
         TransferKind kind{};
         switch (wire.operation) {
-        case MYOS_CAP_COPY:
+        case CAP_COPY:
             kind = TransferKind::Copy;
             break;
-        case MYOS_CAP_MOVE:
+        case CAP_MOVE:
             kind = TransferKind::Move;
             break;
-        case MYOS_CAP_DELEGATE:
+        case CAP_DELEGATE:
             kind = TransferKind::Delegate;
             break;
         default:
@@ -282,8 +282,8 @@ auto Endpoint::commit_caps(
         if (!access) {
             return false;
         }
-        myos_ipc_caps projection{};
-        projection.version = MYOS_IPC_CAPS_VERSION;
+        IpcCaps projection{};
+        projection.version = IPC_CAPS_VERSION;
         return access.value().write(0, libk::Span<const byte>{
             reinterpret_cast<const byte*>(&projection), sizeof(projection)});
     }
@@ -298,8 +298,8 @@ auto Endpoint::commit_caps(
         transfer.abort();
         return false;
     }
-    myos_ipc_caps projection{};
-    projection.version = MYOS_IPC_CAPS_VERSION;
+    IpcCaps projection{};
+    projection.version = IPC_CAPS_VERSION;
     const Transfer::Handles reserved = transfer.handles();
     for (usize index = 0; index < reserved.size(); ++index) {
         projection.received[index] = reserved[index].raw();
@@ -312,7 +312,7 @@ auto Endpoint::commit_caps(
     auto committed = transfer.commit();
     if (!committed) {
         projection = {};
-        projection.version = MYOS_IPC_CAPS_VERSION;
+        projection.version = IPC_CAPS_VERSION;
         static_cast<void>(access.value().write(0, libk::Span<const byte>{
             reinterpret_cast<const byte*>(&projection), sizeof(projection)}));
         return false;
@@ -433,7 +433,7 @@ auto Endpoint::call(
     if (!view.attach(grant)) {
         {
             sync::Lock guard{lock_};
-            call->result_ = WaitResult{MYOS_STATUS_DENIED, 0};
+            call->result_ = WaitResult{STATUS_DENIED, 0};
             call->state_ = Call::State::Complete;
         }
         publisher_done(*call);
@@ -442,7 +442,7 @@ auto Endpoint::call(
     if (deadline && !dispatcher.arm(call->deadline_, *deadline)) {
         {
             sync::Lock guard{lock_};
-            call->result_ = WaitResult{MYOS_STATUS_INTERNAL, 0};
+            call->result_ = WaitResult{STATUS_INTERNAL, 0};
             call->state_ = Call::State::Complete;
         }
         publisher_done(*call);
@@ -457,7 +457,7 @@ auto Endpoint::call(
             {
                 sync::Lock guard{lock_};
                 call->result_ = WaitResult{
-                    MYOS_STATUS_WOULD_BLOCK, 0};
+                    STATUS_WOULD_BLOCK, 0};
                 call->state_ = Call::State::Complete;
             }
             if (call->deadline_.armed()) {
@@ -472,7 +472,7 @@ auto Endpoint::call(
             if (state_ != State::Open || call->cancel_pending_) {
                 if (!call->cancel_pending_) {
                     call->result_ = WaitResult{
-                        MYOS_STATUS_CLOSED, 0};
+                        STATUS_CLOSED, 0};
                 }
                 call->state_ = Call::State::Complete;
                 ready = true;
@@ -498,7 +498,7 @@ auto Endpoint::call(
                 sync::Lock guard{lock_};
                 if (call->state_ == Call::State::Ready) {
                     call->state_ = Call::State::Complete;
-                    call->result_ = {MYOS_STATUS_CLOSED, 0};
+                    call->result_ = {STATUS_CLOSED, 0};
                 }
                 libk_assert(call->state_ == Call::State::Complete);
                 result = call->result_;
@@ -515,7 +515,7 @@ auto Endpoint::call(
         sync::Lock guard{lock_};
         if (state_ != State::Open || call->cancel_pending_) {
             if (!call->cancel_pending_) {
-                call->result_ = WaitResult{MYOS_STATUS_CLOSED, 0};
+                call->result_ = WaitResult{STATUS_CLOSED, 0};
             }
             call->state_ = Call::State::Complete;
 
@@ -529,11 +529,11 @@ auto Endpoint::call(
         {
             sync::Lock guard{lock_};
             if (call->state_ != Call::State::Complete) {
-                call->result_ = WaitResult{MYOS_STATUS_CLOSED, 0};
+                call->result_ = WaitResult{STATUS_CLOSED, 0};
                 call->state_ = Call::State::Complete;
 
             }
-            if (call->result_.status == MYOS_STATUS_TRANSFER_FAILED) {
+            if (call->result_.status == STATUS_TRANSFER_FAILED) {
                 error = EndpointError::TransferFailed;
             }
         }
@@ -588,7 +588,7 @@ auto Endpoint::enter(
     if (!transferred) {
         sync::Lock guard{lock_};
         libk_assert(call.state_ == Call::State::Committing && activation->call_ == &call);
-        call.result_ = WaitResult{MYOS_STATUS_TRANSFER_FAILED, 0};
+        call.result_ = WaitResult{STATUS_TRANSFER_FAILED, 0};
         call.state_ = Call::State::Complete;
 
         return false;
@@ -603,8 +603,8 @@ auto Endpoint::enter(
             || activation->call_ != &call) {
             call.result_ = WaitResult{
                 call.cancel_pending_
-                    ? static_cast<myos_status_t>(call.cancel_status_)
-                    : MYOS_STATUS_CLOSED,
+                    ? static_cast<status_t>(call.cancel_status_)
+                    : STATUS_CLOSED,
                 0};
             call.state_ = Call::State::Complete;
 
@@ -676,7 +676,7 @@ auto Endpoint::abort(
                activation,
                trap,
                dispatcher,
-               MYOS_STATUS_PEER_ABORTED,
+               STATUS_PEER_ABORTED,
                static_cast<usize>(status),
                false)
         ? std::expected<void, EndpointError>{}
@@ -756,7 +756,7 @@ auto Endpoint::finish_active(
             call->transfer_,
             *source, *destination, reply_caps,
             caller_buffer, reply_handles))) {
-        status = MYOS_STATUS_TRANSFER_FAILED;
+        status = STATUS_TRANSFER_FAILED;
         value = 0;
     }
 
@@ -769,7 +769,7 @@ auto Endpoint::finish_active(
     {
         sync::Lock guard{lock_};
         call->result_ = WaitResult{
-            static_cast<myos_status_t>(status), value};
+            static_cast<status_t>(status), value};
         call->state_ = Call::State::Complete;
 
     }
@@ -875,11 +875,11 @@ auto Endpoint::cancel_call(Call& call) noexcept -> bool {
             complete = true;
         } else if (call.state_ == Call::State::Committing) {
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_CANCELED;
+            call.cancel_status_ = STATUS_CANCELED;
             return false;
         } else if (call.state_ == Call::State::Queued
             || call.state_ == Call::State::Ready) {
-            call.result_ = WaitResult{MYOS_STATUS_CANCELED, 0};
+            call.result_ = WaitResult{STATUS_CANCELED, 0};
             call.state_ = Call::State::Complete;
             complete = true;
         } else {
@@ -917,18 +917,18 @@ void Endpoint::expire_call(Call& call) noexcept {
         case Call::State::Preparing:
         case Call::State::Committing:
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_TIMED_OUT;
-            call.result_ = WaitResult{MYOS_STATUS_TIMED_OUT, 0};
+            call.cancel_status_ = STATUS_TIMED_OUT;
+            call.result_ = WaitResult{STATUS_TIMED_OUT, 0};
             break;
         case Call::State::Queued:
         case Call::State::Ready:
-            call.result_ = WaitResult{MYOS_STATUS_TIMED_OUT, 0};
+            call.result_ = WaitResult{STATUS_TIMED_OUT, 0};
             call.state_ = Call::State::Complete;
             ready = call.completion_.attached();
             break;
         case Call::State::Active:
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_TIMED_OUT;
+            call.cancel_status_ = STATUS_TIMED_OUT;
             cancel = true;
             break;
         case Call::State::Replying:
@@ -961,24 +961,24 @@ void Endpoint::invalidate_call(Call& call) noexcept {
         switch (call.state_) {
         case Call::State::Preparing:
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_DENIED;
-            call.result_ = WaitResult{MYOS_STATUS_DENIED, 0};
+            call.cancel_status_ = STATUS_DENIED;
+            call.result_ = WaitResult{STATUS_DENIED, 0};
             break;
         case Call::State::Queued:
         case Call::State::Ready:
-            call.result_ = WaitResult{MYOS_STATUS_DENIED, 0};
+            call.result_ = WaitResult{STATUS_DENIED, 0};
             call.state_ = Call::State::Complete;
             ready = call.completion_.attached();
             break;
         case Call::State::Active:
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_DENIED;
+            call.cancel_status_ = STATUS_DENIED;
             cancel = true;
             break;
         case Call::State::Committing:
             call.cancel_pending_ = true;
-            call.cancel_status_ = MYOS_STATUS_DENIED;
-            call.result_ = WaitResult{MYOS_STATUS_DENIED, 0};
+            call.cancel_status_ = STATUS_DENIED;
+            call.result_ = WaitResult{STATUS_DENIED, 0};
             break;
         case Call::State::Replying:
         case Call::State::Canceling:
@@ -1037,7 +1037,7 @@ void Endpoint::reset_call_locked(Call& call) noexcept {
     call.request_caps_.clear();
     libk_assert(call.installed_caps_.empty());
     call.transfer_.abort();
-    call.cancel_status_ = MYOS_STATUS_CANCELED;
+    call.cancel_status_ = STATUS_CANCELED;
     call.cpus_ = nullptr;
     libk_assert(call.publishers_ == 0);
     call.cancel_pending_ = false;
@@ -1045,8 +1045,8 @@ void Endpoint::reset_call_locked(Call& call) noexcept {
 }
 
 void Endpoint::close() noexcept {
-    libk::InplaceVector<Call*, MYOS_ENDPOINT_MAX_CALLS> ready{};
-    libk::InplaceVector<Call*, MYOS_ENDPOINT_MAX_CALLS> cancel{};
+    libk::InplaceVector<Call*, ENDPOINT_MAX_CALLS> ready{};
+    libk::InplaceVector<Call*, ENDPOINT_MAX_CALLS> cancel{};
     bool finish{};
     {
         sync::Lock guard{lock_};
@@ -1059,18 +1059,18 @@ void Endpoint::close() noexcept {
             if ((call.state_ == Call::State::Queued
                     || call.state_ == Call::State::Ready)
                 && call.completion_.attached()) {
-                call.result_ = WaitResult{MYOS_STATUS_CLOSED, 0};
+                call.result_ = WaitResult{STATUS_CLOSED, 0};
                 call.state_ = Call::State::Complete;
                 libk_assert(ready.try_push_back(&call));
             } else if (call.state_ == Call::State::Preparing
                 || call.state_ == Call::State::Committing
                 || call.state_ == Call::State::Ready) {
                 call.cancel_pending_ = true;
-                call.cancel_status_ = MYOS_STATUS_CLOSED;
-                call.result_ = WaitResult{MYOS_STATUS_CLOSED, 0};
+                call.cancel_status_ = STATUS_CLOSED;
+                call.result_ = WaitResult{STATUS_CLOSED, 0};
             } else if (call.state_ == Call::State::Active) {
                 call.cancel_pending_ = true;
-                call.cancel_status_ = MYOS_STATUS_CLOSED;
+                call.cancel_status_ = STATUS_CLOSED;
                 libk_assert(call.publishers_
                     != std::numeric_limits<usize>::max());
                 ++call.publishers_;

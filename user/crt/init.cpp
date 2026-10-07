@@ -20,8 +20,8 @@ extern "C" void run_constructors() noexcept {
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
-    myos::exit();
+    sys::exit();
 }
 } // namespace libk
 
-extern "C" [[noreturn]] void abort() noexcept { myos::exit(MYOS_STATUS_INTERNAL); }
+extern "C" [[noreturn]] void abort() noexcept { sys::exit(STATUS_INTERNAL); }

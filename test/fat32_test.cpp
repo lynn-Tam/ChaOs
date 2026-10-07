@@ -9,7 +9,7 @@
 } } while (false)
 
 namespace {
-using namespace myos::files::fat32;
+using namespace sys::files::fat32;
 void put16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 void put32(uint8_t* p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 struct Fixture {
@@ -45,11 +45,11 @@ struct Fixture {
     }
     auto mount() {
         return volume.mount(geometry, fat.data(), index.data(), visited.data(),
-            [&](uint64_t offset, size_t size, uint8_t* output) -> myos_status_t {
+            [&](uint64_t offset, size_t size, uint8_t* output) -> status_t {
                 CHECK(offset % 512 == 0 && size % 512 == 0);
                 CHECK(offset <= disk.size() && size <= disk.size() - offset);
                 std::memcpy(output, disk.data() + offset, size);
-                return MYOS_STATUS_OK;
+                return STATUS_OK;
             });
     }
 };
@@ -57,7 +57,7 @@ struct Fixture {
 
 int main() {
     Fixture f;
-    CHECK(f.mount() == MYOS_STATUS_OK);
+    CHECK(f.mount() == STATUS_OK);
     CHECK(f.volume.count() == 1 && f.volume.file(0).size == 1301);
     CHECK(f.volume.find("/data.bin", 9) == 0);
     CHECK(f.volume.find("data.bin\0", 9) == 1);
@@ -73,19 +73,19 @@ int main() {
     }
     CHECK(f.volume.extent(0, UINT64_MAX, 1).bytes == 0);
     CHECK(f.volume.extent(0, 1300, 4096).bytes == 1);
-    f.link(6, 3); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // cycle
-    f.link(6, 0x0ffffff7); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // bad cluster
-    f.link(6, f.geometry.clusters + 2); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED);
+    f.link(6, 3); CHECK(f.mount() == STATUS_BACKING_FAILED); // cycle
+    f.link(6, 0x0ffffff7); CHECK(f.mount() == STATUS_BACKING_FAILED); // bad cluster
+    f.link(6, f.geometry.clusters + 2); CHECK(f.mount() == STATUS_BACKING_FAILED);
     f.link(6, 0x0fffffff);
-    f.link(3, 0x0fffffff); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // short chain
+    f.link(3, 0x0fffffff); CHECK(f.mount() == STATUS_BACKING_FAILED); // short chain
     f.link(3, 5);
-    f.entry(1, "OTHER   BIN", 5, 512); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // overlap
-    f.entry(1, "OTHER   BIN", 2, 512); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // root overlap
+    f.entry(1, "OTHER   BIN", 5, 512); CHECK(f.mount() == STATUS_BACKING_FAILED); // overlap
+    f.entry(1, "OTHER   BIN", 2, 512); CHECK(f.mount() == STATUS_BACKING_FAILED); // root overlap
     f.entry(1, "DATA    BIN", 7, 512); f.link(7, 0x0fffffff);
-    CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED); // ambiguous name
+    CHECK(f.mount() == STATUS_BACKING_FAILED); // ambiguous name
     f.disk[f.geometry.data_offset + 32] = 0;
-    f.link(2, 2); CHECK(f.mount() == MYOS_STATUS_BACKING_FAILED);
-    f.link(2, 0x0fffffff); CHECK(f.mount() == MYOS_STATUS_OK);
+    f.link(2, 2); CHECK(f.mount() == STATUS_BACKING_FAILED);
+    f.link(2, 0x0fffffff); CHECK(f.mount() == STATUS_OK);
     auto* boot = f.disk.data();
     put32(boot + 36, UINT32_MAX); CHECK(!f.parse());
     put32(boot + 36, 1024); boot[13] = 3; CHECK(!f.parse());

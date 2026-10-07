@@ -1,7 +1,5 @@
 #include "sbi.hpp"
-#include <arch/console.hpp>
-#include <arch/interrupt.hpp>
-#include <arch/system.hpp>
+#include <cpu.hpp>
 
 namespace sbi {
 auto call(Ext ext, usize fn, usize x, usize y, usize z) noexcept -> std::expected<usize, isize> {
@@ -23,17 +21,11 @@ namespace arch {
                                 reason == HaltReason::PeerStop ? 0 : 1));
     halt_current_cpu(reason);
 }
-} // namespace arch
-
-namespace arch::console {
-void write(char c) noexcept {
+void putchar(char c) noexcept {
     const auto byte = static_cast<unsigned char>(c);
     if (!sbi::call(sbi::Ext::Console, 2, byte)) {
         // SBI 0.1 remains the early-console fallback for older firmware.
         static_cast<void>(sbi::call(sbi::Ext::PutChar, 0, byte));
     }
 }
-void write(libk::StrView text) noexcept {
-    for (const char c : text) write(c);
-}
-} // namespace arch::console
+} // namespace arch

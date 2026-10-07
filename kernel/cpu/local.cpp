@@ -3,7 +3,7 @@
 #include <task/thread.hpp>
 #include <sched/dispatcher.hpp>
 
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 
 auto CpuLocal::kernel_vspace() const noexcept -> mm::KSpace* {
@@ -25,7 +25,7 @@ auto CpuLocal::cspace() const noexcept -> cap::CSpace* {
 }
 
 auto current_cpu() noexcept -> CpuLocal& {
-    void* const owner = arch::current_cpu_owner();
+    auto* const owner = arch::local() ? arch::local()->owner : nullptr;
     libk_assert(owner != nullptr);
-    return *static_cast<CpuLocal*>(owner);
+    return *owner;
 }

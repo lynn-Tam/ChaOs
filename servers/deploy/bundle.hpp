@@ -5,7 +5,7 @@
 #include <uapi/arch/riscv64/address_space.h>
 #include <uapi/boot_bundle.h>
 
-namespace myos::boot {
+namespace boot {
 
 struct Segment final {
     uintptr_t address{};
@@ -88,10 +88,10 @@ public:
         return flags_;
     }
     [[nodiscard]] constexpr auto bootable() const noexcept -> bool {
-        return flags_ == MYOS_BOOT_MODULE_BOOTABLE;
+        return flags_ == BUNDLE_MODULE_BOOTABLE;
     }
     [[nodiscard]] constexpr auto data_module() const noexcept -> bool {
-        return flags_ == MYOS_BOOT_MODULE_DATA;
+        return flags_ == BUNDLE_MODULE_DATA;
     }
     [[nodiscard]] auto entry() const noexcept -> uintptr_t { return entry_; }
     [[nodiscard]] auto data() const noexcept -> Bytes {
@@ -112,11 +112,11 @@ public:
         }
         const size_t relative = segment_first_ + index;
         if (relative > (bytes_.size() - segments_offset_)
-                / MYOS_BOOT_SEGMENT_SIZE) {
+                / BUNDLE_SEGMENT_SIZE) {
             return false;
         }
         const size_t offset = segments_offset_
-            + relative * MYOS_BOOT_SEGMENT_SIZE;
+            + relative * BUNDLE_SEGMENT_SIZE;
         uint64_t address{};
         uint64_t file_offset{};
         uint64_t file_size{};
@@ -135,19 +135,19 @@ public:
             || file_size > memory_size
             || alignment == 0 || (alignment & (alignment - 1)) != 0
             || alignment < 4096
-            || alignment > MYOS_RISCV64_LOWER_CANONICAL_END
+            || alignment > RISCV64_LOWER_CANONICAL_END
             || (address & 4095) != 0
-            || address < MYOS_RISCV64_LOW_GUARD_END
-            || address >= MYOS_RISCV64_LOWER_CANONICAL_END
-            || memory_size > MYOS_RISCV64_LOWER_CANONICAL_END - address
+            || address < RISCV64_LOW_GUARD_END
+            || address >= RISCV64_LOWER_CANONICAL_END
+            || memory_size > RISCV64_LOWER_CANONICAL_END - address
             || (access & ~static_cast<uint64_t>(
-                MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_WRITE
-                    | MYOS_BOOT_SEGMENT_EXECUTE)) != 0
+                BUNDLE_SEGMENT_READ | BUNDLE_SEGMENT_WRITE
+                    | BUNDLE_SEGMENT_EXECUTE)) != 0
             || access == 0
-            || ((access & MYOS_BOOT_SEGMENT_WRITE) != 0
-                && (access & MYOS_BOOT_SEGMENT_READ) == 0)
-            || ((access & MYOS_BOOT_SEGMENT_WRITE) != 0
-                && (access & MYOS_BOOT_SEGMENT_EXECUTE) != 0)
+            || ((access & BUNDLE_SEGMENT_WRITE) != 0
+                && (access & BUNDLE_SEGMENT_READ) == 0)
+            || ((access & BUNDLE_SEGMENT_WRITE) != 0
+                && (access & BUNDLE_SEGMENT_EXECUTE) != 0)
             || file_offset > bytes_.size()
             || file_size > bytes_.size() - file_offset
             || file_offset < image_offset_
@@ -158,7 +158,7 @@ public:
         const uint64_t rounded_memory =
             (memory_size + UINT64_C(4095)) / UINT64_C(4096)
             * UINT64_C(4096);
-        if (rounded_memory > MYOS_RISCV64_LOWER_CANONICAL_END - address) {
+        if (rounded_memory > RISCV64_LOWER_CANONICAL_END - address) {
             return false;
         }
         if ((address % alignment)
@@ -229,20 +229,20 @@ public:
             || !bytes.read(64, 4, segments_count)
             || !bytes.read(68, 4, reserved)
             || !bytes.read(72, 8, checksum)
-            || magic != MYOS_BOOT_MAGIC
-            || major != MYOS_BOOT_MAJOR || minor > MYOS_BOOT_MINOR
-            || header_size != MYOS_BOOT_HEADER_SIZE
+            || magic != BUNDLE_MAGIC
+            || major != BUNDLE_MAJOR || minor > BUNDLE_MINOR
+            || header_size != BUNDLE_HEADER_SIZE
             || total_size != size
-            || architecture != MYOS_BOOT_ARCH_RISCV64
-            || abi != MYOS_BOOT_ABI_RISCV_LP64
+            || architecture != BUNDLE_ARCH_RISCV64
+            || abi != BUNDLE_ABI_RISCV_LP64
             || features != 0 || reserved != 0 || checksum != 0
             || modules_count == 0 || modules_count > 32
             || root_index >= modules_count
             || modules_offset > size
-            || modules_count > (size - modules_offset) / MYOS_BOOT_MODULE_SIZE
+            || modules_count > (size - modules_offset) / BUNDLE_MODULE_SIZE
             || segments_offset > size
             || segments_count
-                > (size - segments_offset) / MYOS_BOOT_SEGMENT_SIZE) {
+                > (size - segments_offset) / BUNDLE_SEGMENT_SIZE) {
             return {};
         }
         result.bytes_ = bytes;
@@ -278,7 +278,7 @@ public:
             return false;
         }
         const size_t offset = modules_offset_
-            + index * MYOS_BOOT_MODULE_SIZE;
+            + index * BUNDLE_MODULE_SIZE;
         uint64_t name_offset{};
         uint64_t name_size{};
         uint64_t flags{};
@@ -299,8 +299,8 @@ public:
             || !bytes_.read(offset + 44, 4, segment_count)
             || !bytes_.read(offset + 48, 8, tls_offset)
             || !bytes_.read(offset + 56, 8, tls_size)
-            || (flags != MYOS_BOOT_MODULE_BOOTABLE
-                && flags != MYOS_BOOT_MODULE_DATA)
+            || (flags != BUNDLE_MODULE_BOOTABLE
+                && flags != BUNDLE_MODULE_DATA)
             || name_size == 0 || tls_offset != 0 || tls_size != 0
             || name_offset > bytes_.size()
             || name_size > bytes_.size() - name_offset
@@ -404,7 +404,7 @@ private:
                 if (candidate.entry() >= segment.address
                     && candidate.entry() - segment.address
                         < segment.memory_size
-                    && (segment.access & MYOS_BOOT_SEGMENT_EXECUTE) != 0) {
+                    && (segment.access & BUNDLE_SEGMENT_EXECUTE) != 0) {
                     entry_covered = true;
                 }
             }
@@ -426,4 +426,4 @@ private:
     uint16_t minor_{};
 };
 
-} // namespace myos::boot
+} // namespace boot

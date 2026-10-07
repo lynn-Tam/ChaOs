@@ -4,23 +4,23 @@
 #include <sys/channel.hpp>
 #include <servers/uart/port.hpp>
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
+extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
+    using namespace sys;
     const auto info = service::bootstrap(address, size);
-    const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
-    const auto device = service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
-    const auto irq = service::capability(info, MYOS_BOOTSTRAP_CAP_IRQ);
-    const auto events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
-    const auto output = service::capability(info, myos::bootstrap::imports::ConsoleOutput);
-    const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
+    const auto vspace = service::capability(info, BOOT_VSPACE);
+    const auto device = service::capability(info, boot::UartMem);
+    const auto irq = service::capability(info, boot::UartIrq);
+    const auto events = service::capability(info, BOOT_EVENTS);
+    const auto output = service::capability(info, boot::ConsoleOutput);
+    const auto input = service::capability(info, boot::ConsoleInput);
     constexpr uintptr_t base = 0x30010000;
-    auto region = vm_slice(vspace, base, 4096, MYOS_VM_READ | MYOS_VM_WRITE, MYOS_RIGHT_MAP);
+    auto region = vm_slice(vspace, base, 4096, VM_READ | VM_WRITE, RIGHT_MAP);
     service::require(region.status);
     service::require(vm_map(region.value, device, base, 4096, 0,
-                            MYOS_VM_READ | MYOS_VM_WRITE).status);
+                            VM_READ | VM_WRITE).status);
     service::require(irq_bind(irq, events, service::EventsBadge).status);
-    const auto readable = channel_bind(output, events, MYOS_CHANNEL_READABLE);
-    const auto writable = channel_bind(input, events, MYOS_CHANNEL_WRITABLE);
+    const auto readable = channel_bind(output, events, CHANNEL_READABLE);
+    const auto writable = channel_bind(input, events, CHANNEL_WRITABLE);
     service::require(readable.status);
     service::require(writable.status);
     uart::Port port{base};
@@ -38,7 +38,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         for (unsigned count = 0; count < 16; ++count) {
             service::Message message{};
             const auto result = service::receive(output, message, false);
-            if (result.status == MYOS_STATUS_WOULD_BLOCK || result.status == MYOS_STATUS_BUSY) break;
+            if (result.status == STATUS_WOULD_BLOCK || result.status == STATUS_BUSY) break;
             service::require(result.status);
             read_sequence = result.value;
             if (message.operation == static_cast<uint64_t>(console::Operation::Prompt)) {
@@ -80,24 +80,24 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         }
         if (pending_valid) {
             const auto result = service::send(input, pending, false);
-            if (result.status == MYOS_STATUS_OK) {
+            if (result.status == STATUS_OK) {
                 write_sequence = result.value;
                 pending = {};
                 pending_valid = false;
-            } else if (result.status != MYOS_STATUS_WOULD_BLOCK && result.status != MYOS_STATUS_BUSY) {
+            } else if (result.status != STATUS_WOULD_BLOCK && result.status != STATUS_BUSY) {
                 service::require(result.status);
             }
         }
         if (!pending_valid && eof_pending) continue;
         if (!pending_valid) {
             const auto observed = irq_observe(irq);
-            if (observed.status == MYOS_STATUS_OK) {
+            if (observed.status == STATUS_OK) {
                 const auto status = irq_ack(irq, observed.value2, observed.value).status;
-                if (status != MYOS_STATUS_REASSERTED) service::require(status);
+                if (status != STATUS_REASSERTED) service::require(status);
             // BoundIdle has no dispatched delivery to acknowledge.
-            } else if (observed.status != MYOS_STATUS_BUSY
-                       && observed.status != MYOS_STATUS_WOULD_BLOCK
-                       && observed.status != MYOS_STATUS_RETRY) {
+            } else if (observed.status != STATUS_BUSY
+                       && observed.status != STATUS_WOULD_BLOCK
+                       && observed.status != STATUS_RETRY) {
                 service::require(observed.status);
             }
             if (port.rx_ready()) continue;

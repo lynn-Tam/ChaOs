@@ -251,7 +251,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             spec.pool_memory, 8);
         put(bytes, task_row + DEPLOY_TASK_POOL_CAPS, 512, 8);
         put(bytes, task_row + DEPLOY_TASK_KIND_MASK,
-            MYOS_RESOURCE_E4_KINDS, 8);
+            RESOURCE_E4_KINDS, 8);
         put(bytes, task_row + DEPLOY_TASK_CRITICAL_BYTES,
             spec.critical_bytes, 8);
         put(bytes, task_row + DEPLOY_TASK_CSPACE_SLOTS, 128, 4);
@@ -311,8 +311,8 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
                 const bool readonly = (!has_image)
                     || (has_image && zero_index == 1);
                 put(bytes, row + DEPLOY_MAPPING_ACCESS,
-                    readonly ? MYOS_VM_READ
-                             : MYOS_VM_READ | MYOS_VM_WRITE, 4);
+                    readonly ? VM_READ
+                             : VM_READ | VM_WRITE, 4);
                 const std::uint64_t base = readonly
                     ? 0x2200'0000ULL
                     : has_image && zero_index == 0
@@ -329,7 +329,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             put(bytes, notification + DEPLOY_OBJECT_OUTPUT,
                 object_key(task, "notify").packed(), 8);
             put(bytes, notification + DEPLOY_OBJECT_KIND,
-                MYOS_OBJECT_KIND_NOTIFICATION, 2);
+                OBJECT_KIND_NOTIFICATION, 2);
             put(bytes, notification + DEPLOY_OBJECT_ARG0, 0x40 + task, 8);
             for (std::size_t field = DEPLOY_OBJECT_REF0;
                  field <= DEPLOY_OBJECT_REF3;
@@ -343,7 +343,7 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             put(bytes, endpoint + DEPLOY_OBJECT_OUTPUT,
                 object_key(task, "endpoint").packed(), 8);
             put(bytes, endpoint + DEPLOY_OBJECT_KIND,
-                MYOS_OBJECT_KIND_ENDPOINT, 2);
+                OBJECT_KIND_ENDPOINT, 2);
             put(bytes, endpoint + DEPLOY_OBJECT_FLAGS,
                 DEPLOY_OBJECT_POST_MAPPING, 2);
             put(bytes, endpoint + DEPLOY_OBJECT_REF0,
@@ -404,8 +404,8 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             DEPLOY_SELECTOR_ALLOCATED_KEYED, 2);
         write_descriptor(
             import + DEPLOY_IMPORT_ATTENUATION,
-            MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_MAP,
-            0, 1, MYOS_VM_READ);
+            OBJECT_KIND_MEMORY, RIGHT_MAP,
+            0, 1, VM_READ);
 
         const std::size_t output = export_offset(range.export_first);
         const bool valid_prepared = task == 4;
@@ -419,12 +419,12 @@ inline auto pack_task_builder_fixture() -> std::vector<std::uint8_t> {
             DEPLOY_EXPORT_PREPARED_KEY, 2);
         write_descriptor(
             output + DEPLOY_EXPORT_CEILING,
-            valid_prepared ? MYOS_OBJECT_KIND_THREAD
-                           : MYOS_OBJECT_KIND_MEMORY,
-            valid_prepared ? 0 : MYOS_RIGHT_MAP,
+            valid_prepared ? OBJECT_KIND_THREAD
+                           : OBJECT_KIND_MEMORY,
+            valid_prepared ? 0 : RIGHT_MAP,
             valid_prepared ? 0 : 0,
             valid_prepared ? 0 : 1,
-            valid_prepared ? 0 : MYOS_VM_READ);
+            valid_prepared ? 0 : VM_READ);
     }
 
     std::size_t strings_size{};
@@ -450,7 +450,7 @@ inline auto emit_task_builder_source(
     const std::vector<std::uint8_t>& bytes) -> std::string {
     std::string output;
     output += "#include <stddef.h>\n#include <stdint.h>\n\n";
-    output += "namespace myos::task_builder_fixture {\n";
+    output += "namespace sys::task_builder_fixture {\n";
     output += "alignas(8) extern const uint8_t manifest[] = {";
     for (std::size_t index = 0; index < bytes.size(); ++index) {
         if ((index % 12) == 0) {
@@ -461,7 +461,7 @@ inline auto emit_task_builder_source(
     }
     output += "\n};\n";
     output += "extern const size_t manifest_size = sizeof(manifest);\n";
-    output += "} // namespace myos::task_builder_fixture\n";
+    output += "} // namespace sys::task_builder_fixture\n";
     return output;
 }
 } // namespace deploy::task_builder_test

@@ -43,10 +43,10 @@ public:
     }
     [[nodiscard]] auto flags() const noexcept -> u32 { return flags_; }
     [[nodiscard]] auto bootable() const noexcept -> bool {
-        return flags_ == MYOS_BOOT_MODULE_BOOTABLE;
+        return flags_ == BUNDLE_MODULE_BOOTABLE;
     }
     [[nodiscard]] auto data_module() const noexcept -> bool {
-        return flags_ == MYOS_BOOT_MODULE_DATA;
+        return flags_ == BUNDLE_MODULE_DATA;
     }
     [[nodiscard]] auto entry() const noexcept -> usize { return entry_; }
     [[nodiscard]] auto segment_count() const noexcept -> usize {

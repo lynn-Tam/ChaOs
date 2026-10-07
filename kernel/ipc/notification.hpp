@@ -13,7 +13,7 @@
 #include <sync.hpp>
 #include <object/ref.hpp>
 #include <wait.hpp>
-#include <sched/queues.hpp>
+#include <sched/sched.hpp>
 
 class CpuRegistry;
 class Thread;

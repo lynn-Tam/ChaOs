@@ -1,10 +1,9 @@
-#include <arch/instruction.hpp>
-#include <arch/interrupt.hpp>
-#include <arch/ipi.hpp>
+#include <cpu/ipi.hpp>
+#include <cpu.hpp>
 #include <cpu/local.hpp>
 #include <cpu/registry.hpp>
 #include <mm/tlb.hpp>
-#include <mmu/pte.hpp>
+#include <pte.hpp>
 #include <trace.hpp>
 
 namespace mm {
@@ -59,7 +58,7 @@ bool Flush::kick(CpuRegistry &cpus) const noexcept {
     pending.for_each([&](CpuId cpu) noexcept {
         const auto *desc = cpus.descriptor(cpu);
         libk_assert(desc && cpus.runtime(cpu));
-        if (!arch::send_ipi(desc->hardware_id())) {
+        if (!send_ipi(desc->hardware_id())) {
             sent = false;
             trace::emit(trace::Event::KickFail, cpu.raw);
         }

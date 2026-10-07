@@ -1,9 +1,10 @@
+#include <test/boot.hpp>
 #include <expected>
 #include <panic.hpp>
 #include <trace.hpp>
 #include <test/test.hpp>
 
-#include <arch/ipi.hpp>
+#include <cpu.hpp>
 #include <boot/cpu_topology.hpp>
 #include <cpu/setup.hpp>
 #include <cpu/registry.hpp>
@@ -17,7 +18,6 @@
 #include <object/group.hpp>
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
-#include <sched/remote_queue.hpp>
 #include <time/clock.hpp>
 
 #include <mm/table.hpp>
@@ -770,16 +770,16 @@ bool test_prepare_publishes_descriptor_borrow(const TestContext&) noexcept {
         && runtime->owner_registry == &*cpu_test_registry
         && runtime->local.descriptor == descriptor
         && runtime->local.current_thread() == nullptr
-        && arch::active_stack(runtime->local.arch_state) == 0
+        && runtime->local.entry.stack == 0
         && runtime->panic != nullptr
-        && arch::panic_slot(runtime->local.arch_state)
+        && runtime->local.entry.panic
             == runtime->panic
-        && arch::emergency_stack(runtime->local.arch_state)
+        && runtime->local.entry.emergency_stack
             == runtime->emergency_stack->top()
         && runtime->idle().state() == Thread::State::Prepared
         && runtime->idle().home_stack_top() != 0
         && (runtime->idle().home_stack_top() & 0xfU) == 0
-        && runtime->start_context.ready()
+        && (__atomic_load_n(&runtime->start.ready, __ATOMIC_ACQUIRE) == CPU_START_READY)
         && cpu_test_registry->runtime_by_hardware_id(
             CpuHwId{42}) == runtime;
 }
@@ -832,7 +832,7 @@ bool test_lifecycle_start_failure_and_snapshot_use_canonical_states(
         || first->init_stack->top() == second->init_stack->top()
         || &first->idle() == &second->idle()
         || first->idle().home_stack_top() == second->idle().home_stack_top()
-        || &first->start_context == &second->start_context) {
+        || &first->start == &second->start) {
         return false;
     }
 
@@ -915,10 +915,10 @@ bool test_shootdown_ack_controls_retirement(const TestContext&) noexcept {
     static_cast<void>(translation.enter(CpuId{0}));
     static_cast<void>(translation.enter(CpuId{1}));
     auto edit = translation.begin();
-    arch::inject_ipi_failures_for_test(2);
+    test::fail_ipis(2);
     const bool complete = edit.commit(retired, &*cpu_test_registry, CpuId{0});
     const bool retried = retired.kick(*cpu_test_registry);
-    arch::inject_ipi_failures_for_test(0);
+    test::fail_ipis(0);
     const auto held_state = cpu_test_pmm->state_of(page);
     const bool held = !complete && !retried && !retired.complete()
         && retired.acknowledged(CpuId{0}) && !retired.acknowledged(CpuId{1})
@@ -1028,65 +1028,6 @@ bool test_object_ref_generation_and_reclaim(
     return reclaimed;
 }
 
-bool test_remote_queue_coalesces_without_losing_membership(
-    const TestContext&) noexcept {
-    usize owner{};
-    sched::RemoteRequest request{
-        sched::RemoteKind::Wake, &owner};
-    sched::RemoteQueue queue{CpuId{0}};
-    const auto first_post = queue.post(request);
-    const auto first_signal = queue.claim_transport();
-    const auto coalesced = queue.post(request);
-    const auto duplicate_signal = queue.claim_transport();
-    if (!first_signal) {
-        return false;
-    }
-    queue.transport_failed(*first_signal);
-    const auto retry_signal = queue.claim_transport();
-    if (!retry_signal) {
-        return false;
-    }
-    // A late error from the old transport generation must not demote the
-    // replacement signal that now owns delivery.
-    queue.transport_failed(*first_signal);
-    const auto stale_retry = queue.claim_transport();
-    sched::RemoteRequest* const taken = queue.take();
-    const auto claimed_cancel = queue.cancel(request);
-    const auto second_post = queue.post(request);
-    const auto during_signal = queue.claim_transport();
-    queue.complete(request);
-    const bool drained = queue.take() == nullptr;
-    const auto third_post = queue.post(request);
-    const auto after_drain_signal = queue.claim_transport();
-    sched::RemoteRequest* const final = queue.take();
-    queue.complete(request);
-    const bool final_drained = queue.take() == nullptr;
-    const auto fourth_post = queue.post(request);
-    const auto queued_cancel = queue.cancel(request);
-    const auto canceled_again = queue.cancel(request);
-    const bool canceled_drained = queue.size() == 0;
-
-    const bool protocol =
-        first_post == sched::RemotePost::Inserted
-        && coalesced == sched::RemotePost::Coalesced
-        && second_post == sched::RemotePost::Coalesced
-        && third_post == sched::RemotePost::Inserted
-        && fourth_post == sched::RemotePost::Inserted
-        && first_signal && !duplicate_signal
-        && retry_signal
-        && retry_signal->generation != first_signal->generation
-        && !stale_retry
-        && taken == &request
-        && claimed_cancel == sched::RemoteCancel::AlreadyClaimed
-        && !during_signal
-        && drained && after_drain_signal
-        && final == &request && final_drained
-        && queued_cancel == sched::RemoteCancel::CanceledQueued
-        && canceled_again == sched::RemoteCancel::NotPending
-        && canceled_drained;
-    return protocol;
-}
-
 } // namespace
 
 void register_cpu_topology_tests(TestRegistry& registry) noexcept {
@@ -1102,5 +1043,4 @@ void register_cpu_topology_tests(TestRegistry& registry) noexcept {
     (void)registry.add("cpu-topology", "lifecycle publication and snapshots derive from canonical states", test_lifecycle_start_failure_and_snapshot_use_canonical_states);
     (void)registry.add("cpu-topology", "shootdown acknowledgement controls detached-page retirement", test_shootdown_ack_controls_retirement);
     (void)registry.add("cpu-topology", "typed references retain retiring objects until final release", test_object_ref_generation_and_reclaim);
-    (void)registry.add("cpu-topology", "RemoteQueue retains failed kicks without stale-generation loss", test_remote_queue_coalesces_without_losing_membership);
 }

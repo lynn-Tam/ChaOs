@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
 #include <cpu/types.hpp>
@@ -39,20 +39,8 @@ struct CpuLocal final {
     CpuLocal(CpuLocal&&) = delete;
     auto operator=(CpuLocal&&) -> CpuLocal& = delete;
 
-    arch::CpuEntryState arch_state{};
+    arch::Entry entry{};
     const CpuDescriptor* descriptor{};
-
-    void initialize(
-        const CpuDescriptor& identity,
-        CpuRuntime& runtime) noexcept {
-        descriptor = &identity;
-        runtime_ = &runtime;
-        current_ = nullptr;
-        dispatcher_ = nullptr;
-        active_tlb_ = nullptr;
-        active_root_ = {};
-        arch::initialize_cpu_entry(arch_state, this);
-    }
 
     [[nodiscard]] auto current_thread() noexcept -> Thread* {
         return current_;
@@ -91,4 +79,4 @@ struct CpuLocal final {
 
 static_assert(std::is_standard_layout_v<CpuLocal>);
 static_assert(std::is_trivially_destructible_v<CpuLocal>);
-static_assert(offsetof(CpuLocal, arch_state) == 0);
+static_assert(offsetof(CpuLocal, entry) == 0);

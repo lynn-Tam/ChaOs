@@ -32,7 +32,6 @@ kernel_common_args = [
   '-ffreestanding', '-Wall', '-Wextra', '-O2', '-g3',
   '-march=rv64gc', '-mabi=lp64d', '-mcmodel=medany', '-msmall-data-limit=0',
   '-I' + root, '-I' + join_paths(root, 'kernel'),
-  '-I' + join_paths(root, 'arch/riscv64/include'),
   '-I' + join_paths(root, 'arch/riscv64'),
 ]
 kernel_c_args = kernel_common_args + ['-Werror=implicit-function-declaration']
@@ -43,26 +42,21 @@ kernel_cpp_args = kernel_common_args + [
 ]
 kernel_link_args = [
   '-march=rv64gc', '-mabi=lp64d', '-nostdlib', '-lgcc',
-  '-Wl,-T,' + join_paths(root, 'arch/riscv64/linker.ld'),
+  '-Wl,-T,' + join_paths(root, 'platform/riscv-virt/kernel.ld'),
 ]
 
 arch_sources = files(
-  'arch/riscv64/boot/entry.S', 'arch/riscv64/boot/early_entry.S',
-  'arch/riscv64/boot/high_entry.cpp', 'arch/riscv64/boot/link.cpp',
-  'arch/riscv64/cpu/local_entry.cpp', 'arch/riscv64/cpu/ipi.cpp',
-  'arch/riscv64/cpu/instruction.cpp', 'arch/riscv64/cpu/start.cpp',
-  'arch/riscv64/cpu/secondary_entry.S', 'arch/riscv64/context/kernel_context.cpp',
-  'arch/riscv64/context/kernel_context.S', 'arch/riscv64/sbi.cpp',
-  'arch/riscv64/time/clock.cpp', 'arch/riscv64/time/timer.cpp',
-  'arch/riscv64/uart/uart.cpp', 'arch/riscv64/irq/plic.cpp',
-  'platform/riscv-virt/pci.cpp', 'platform/riscv-virt/dma.cpp',
-  'arch/riscv64/iommu/iommu.cpp', 'platform/riscv-virt/board.cpp',
-  'arch/riscv64/mmu/pte.cpp', 'kernel/mm/table.cpp',
+  'arch/riscv64/boot.S', 'arch/riscv64/link.cpp',
+  'arch/riscv64/cpu.cpp', 'arch/riscv64/cpu.S', 'arch/riscv64/sbi.cpp',
   'arch/riscv64/trap.S', 'arch/riscv64/trap.cpp',
+)
+platform_sources = files(
+  'platform/riscv-virt/pci.cpp', 'platform/riscv-virt/dma.cpp',
+  'platform/riscv-virt/board.cpp',
 )
 
 core_kernel_sources = files(
-  'kernel/io/device.cpp', 'kernel/io/space.cpp',
+  'kernel/io/device.cpp', 'kernel/io/space.cpp', 'kernel/mm/table.cpp',
   'kernel/boot/boot.cpp', 'kernel/boot/cpu_topology.cpp',
   'kernel/boot/fdt.cpp', 'kernel/boot/bundle.cpp',
   'kernel/boot/root.cpp', 'kernel/state.cpp',
@@ -70,11 +64,10 @@ core_kernel_sources = files(
   'kernel/cap/cspace.cpp', 'kernel/ipc/notification.cpp', 'kernel/ipc/buffer.cpp', 'kernel/ipc/channel.cpp', 'kernel/mm/pager.cpp',
   'kernel/irq/irq.cpp', 'kernel/ipc/endpoint.cpp', 'kernel/ipc/transfer.cpp',
   'kernel/resource/budget.cpp', 'kernel/object/group.cpp',
-  'kernel/sched/sc.cpp', 'kernel/sched/refill_queue.cpp',
-  'kernel/sched/domain.cpp', 'kernel/sched/queues.cpp',
-  'kernel/sched/remote_queue.cpp',
+  'kernel/sched/sc.cpp',
+  'kernel/sched/domain.cpp',
   'kernel/sched/dispatcher.cpp', 'kernel/cpu/setup.cpp',
-  'kernel/cpu/registry.cpp', 'kernel/cpu/local.cpp', 'kernel/cpu/ipi.cpp',
+  'kernel/cpu/registry.cpp', 'kernel/cpu/local.cpp',
   'kernel/task/thread.cpp',
   'kernel/wait.cpp',
   'kernel/task/env.cpp',
@@ -87,16 +80,16 @@ core_kernel_sources = files(
   'libk/mem.c',
 )
 
-core = static_library('kernel-core', arch_sources + core_kernel_sources, c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
+core = static_library('kernel-core', arch_sources + platform_sources + core_kernel_sources, c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 trace = static_library('kernel-trace', files('kernel/trace.cpp'),
   c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DTRACE_ENABLED=' + (trace_enabled ? '1' : '0')], pic: false)
 sync = static_library('kernel-sync', files('kernel/sync.cpp'),
   c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 panic = static_library('kernel-panic', files('kernel/panic.cpp'),
   c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
-# Only these three entry TUs call the test boundary. Common mechanisms are
-# compiled once; production has no test calls, selectors or empty providers.
-entry_sources = files('kernel/boot/start.cpp', 'kernel/cpu/start.cpp', 'kernel/trap/trap.cpp')
+# Entry selects test calls and the IPI transport at link time. Common
+# mechanisms are compiled once; production has no test selectors or providers.
+entry_sources = files('kernel/boot/start.cpp', 'kernel/cpu/start.cpp', 'kernel/trap/trap.cpp', 'kernel/cpu/ipi.cpp')
 entry = static_library('kernel-entry', entry_sources,
   c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DTEST_ENABLED=0'], pic: false)
 test_entry = static_library('kernel-test-entry', entry_sources,

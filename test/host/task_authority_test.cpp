@@ -27,9 +27,9 @@ struct FakeBackend final {
     static inline size_t fail_nonzero_after{};
     static inline size_t produced{90};
     static inline size_t resource_close_calls{};
-    static inline myos_cap_t closed_selectors[32]{};
+    static inline cap_t closed_selectors[32]{};
     static inline size_t closed_count{};
-    static inline myos_cap_t close_failure_selector{};
+    static inline cap_t close_failure_selector{};
     static inline bool ownership_faulted{};
 
     static void reset() noexcept {
@@ -47,110 +47,110 @@ struct FakeBackend final {
         ownership_faulted = false;
     }
 
-    static void ownership_fault(myos_status_t) noexcept {
+    static void ownership_fault(status_t) noexcept {
         ownership_faulted = true;
     }
 
     [[nodiscard]] static auto close(
-        myos::cap::CapRef reference) noexcept -> myos_status_t {
+        sys::cap::CapRef reference) noexcept -> status_t {
         ++close_calls;
         if (closed_count < sizeof(closed_selectors) / sizeof(closed_selectors[0])) {
             closed_selectors[closed_count++] = reference.selector;
         }
         if (reference.selector == close_failure_selector) {
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto resource_create_child(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 10, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 10, 0};
     }
 
     [[nodiscard]] static auto resource_close(
-        myos::cap::CapRef) noexcept -> myos_status_t {
+        sys::cap::CapRef) noexcept -> status_t {
         ++resource_close_calls;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vspace_create(
-        myos::cap::CapRef) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 11, 0};
+        sys::cap::CapRef) noexcept -> sys::SysResult {
+        return {STATUS_OK, 11, 0};
     }
 
     [[nodiscard]] static auto cspace_create(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 12, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 12, 0};
     }
 
     [[nodiscard]] static auto vm_slice(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 13, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 13, 0};
     }
 
     [[nodiscard]] static auto vm_map(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_unmap(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_clear(
-        myos::cap::CapRef) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto duplicate(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
         ++duplicate_calls;
         if (fail_after != 0 && duplicate_calls >= fail_after) {
-            return {MYOS_STATUS_BUSY, 0, 0};
+            return {STATUS_BUSY, 0, 0};
         }
         if (fail_nonzero_after != 0
             && duplicate_calls >= fail_nonzero_after) {
-            return {MYOS_STATUS_BUSY, ++produced, 0};
+            return {STATUS_BUSY, ++produced, 0};
         }
-        return {MYOS_STATUS_OK, ++produced, 0};
+        return {STATUS_OK, ++produced, 0};
     }
 
     [[nodiscard]] static auto typed_delegate(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
         ++typed_calls;
-        return {MYOS_STATUS_OK, ++produced, 0};
+        return {STATUS_OK, ++produced, 0};
     }
 
     [[nodiscard]] static auto channel_mint(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
         ++channel_calls;
-        return {MYOS_STATUS_OK, ++produced, 0};
+        return {STATUS_OK, ++produced, 0};
     }
 };
 
@@ -167,17 +167,17 @@ struct SourceFixture final {
 
     [[nodiscard]] auto open() noexcept -> bool {
         return raw.open(
-                   myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-            == MYOS_STATUS_OK;
+                   sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+            == STATUS_OK;
     }
 
     [[nodiscard]] auto add(
-        myos_cap_t selector,
-        myos_object_kind_t kind) noexcept
+        cap_t selector,
+        obj_kind_t kind) noexcept
         -> std::optional<deploy::LocalSlot> {
         return raw.adopt_local(
             typename Space::owner_type{
-                myos::cap::CapRef{selector, 0}},
+                sys::cap::CapRef{selector, 0}},
             kind);
     }
 
@@ -190,13 +190,13 @@ struct SourceFixture final {
         Set& authorities,
         deploy::LocalSlot slot,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<deploy::AuthorityId> {
         return aggregate.register_source(
             authorities, slot, identity, ceiling);
     }
 
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
+    [[nodiscard]] auto close() noexcept -> status_t {
         return aggregate.close();
     }
 };
@@ -241,7 +241,7 @@ void put(
 [[nodiscard]] auto make_plan(
     Fixture& fixture,
     uint16_t mode = DEPLOY_IMPORT_DUPLICATE,
-    uint16_t attenuation_kind = MYOS_OBJECT_KIND_THREAD,
+    uint16_t attenuation_kind = OBJECT_KIND_THREAD,
     uint64_t channel_badge = 0) noexcept -> bool {
     for (size_t index = 0; index < sizeof(fixture.raw); ++index) {
         fixture.raw[index] = deploy::host::kGolden[index];
@@ -361,12 +361,12 @@ void put(
 }
 
 [[nodiscard]] constexpr auto ceiling(
-    myos_object_kind_t kind,
-    uint64_t rights = MYOS_RIGHT_MASK) noexcept -> myos_cap_attenuation {
-    return myos_cap_attenuation{
-        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
+    obj_kind_t kind,
+    uint64_t rights = RIGHT_MASK) noexcept -> CapView {
+    return CapView{
+        .version = CAP_ATTENUATION_VERSION_CURRENT,
         .kind = kind,
-        .size = MYOS_CAP_ATTENUATION_SIZE,
+        .size = CAP_ATTENUATION_SIZE,
         .rights = rights,
         .words = {},
     };
@@ -377,18 +377,18 @@ void put(
     using deploy::attenuation::valid_descriptor;
     using deploy::attenuation::within;
 
-    auto invalid_memory = ceiling(MYOS_OBJECT_KIND_MEMORY);
+    auto invalid_memory = ceiling(OBJECT_KIND_MEMORY);
     if (deploy::valid_authority_ceiling(invalid_memory)) {
         return false;
     }
-    auto invalid_version = ceiling(MYOS_OBJECT_KIND_THREAD);
+    auto invalid_version = ceiling(OBJECT_KIND_THREAD);
     invalid_version.version = 0;
-    auto invalid_size = ceiling(MYOS_OBJECT_KIND_THREAD);
+    auto invalid_size = ceiling(OBJECT_KIND_THREAD);
     invalid_size.size = 0;
-    auto invalid_kind = ceiling(MYOS_OBJECT_KIND_THREAD);
-    invalid_kind.kind = MYOS_OBJECT_KIND_COUNT;
-    auto invalid_rights = ceiling(MYOS_OBJECT_KIND_THREAD);
-    invalid_rights.rights = ~uint64_t{MYOS_RIGHT_MASK};
+    auto invalid_kind = ceiling(OBJECT_KIND_THREAD);
+    invalid_kind.kind = OBJECT_KIND_COUNT;
+    auto invalid_rights = ceiling(OBJECT_KIND_THREAD);
+    invalid_rights.rights = ~uint64_t{RIGHT_MASK};
     if (valid_descriptor(invalid_version, DescriptorForm::Ceiling)
         || valid_descriptor(invalid_size, DescriptorForm::Ceiling)
         || valid_descriptor(invalid_kind, DescriptorForm::Ceiling)
@@ -397,10 +397,10 @@ void put(
     }
 
     const auto thread_ceiling = ceiling(
-        MYOS_OBJECT_KIND_THREAD, MYOS_RIGHT_DUPLICATE);
+        OBJECT_KIND_THREAD, RIGHT_DUPLICATE);
     auto thread_request = ceiling(
-        MYOS_OBJECT_KIND_THREAD,
-        MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_DELEGATE);
+        OBJECT_KIND_THREAD,
+        RIGHT_DUPLICATE | RIGHT_DELEGATE);
     if (!valid_descriptor(thread_ceiling, DescriptorForm::Ceiling)
         || within(
             thread_request, thread_ceiling,
@@ -408,14 +408,14 @@ void put(
         return false;
     }
 
-    auto memory_ceiling = ceiling(MYOS_OBJECT_KIND_MEMORY);
+    auto memory_ceiling = ceiling(OBJECT_KIND_MEMORY);
     memory_ceiling.words[0] = 100;
     memory_ceiling.words[1] = 100;
-    memory_ceiling.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
+    memory_ceiling.words[2] = VM_READ | VM_WRITE;
     auto memory_request = memory_ceiling;
     memory_request.words[0] = 120;
     memory_request.words[1] = 10;
-    memory_request.words[2] = MYOS_VM_READ;
+    memory_request.words[2] = VM_READ;
     if (!deploy::valid_authority_ceiling(memory_ceiling)
         || !within(
             memory_request, memory_ceiling,
@@ -426,13 +426,13 @@ void put(
     memory_escape.words[0] = 190;
     memory_escape.words[1] = 20;
     auto memory_access = memory_request;
-    memory_access.words[2] = MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE;
+    memory_access.words[2] = VM_READ | VM_WRITE | VM_EXECUTE;
     auto memory_reserved = memory_request;
     memory_reserved.words[3] = 1;
     auto memory_overflow = memory_ceiling;
     memory_overflow.words[0] = UINT64_MAX - 1;
     memory_overflow.words[1] = 2;
-    auto duplicate_typed = ceiling(MYOS_OBJECT_KIND_MEMORY);
+    auto duplicate_typed = ceiling(OBJECT_KIND_MEMORY);
     duplicate_typed.words[0] = 1;
     if (within(
             memory_escape, memory_ceiling,
@@ -448,14 +448,14 @@ void put(
         return false;
     }
 
-    auto vspace_ceiling = ceiling(MYOS_OBJECT_KIND_VSPACE);
+    auto vspace_ceiling = ceiling(OBJECT_KIND_VSPACE);
     vspace_ceiling.words[0] = 0x1000;
     vspace_ceiling.words[1] = 0x4000;
-    vspace_ceiling.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
+    vspace_ceiling.words[2] = VM_READ | VM_WRITE;
     auto vspace_request = vspace_ceiling;
     vspace_request.words[0] = 0x2000;
     vspace_request.words[1] = 0x1000;
-    vspace_request.words[2] = MYOS_VM_READ;
+    vspace_request.words[2] = VM_READ;
     auto vspace_escape = vspace_request;
     vspace_escape.words[0] = 0x4000;
     vspace_escape.words[1] = 0x2000;
@@ -475,19 +475,19 @@ void put(
         return false;
     }
 
-    auto pool_ceiling = ceiling(MYOS_OBJECT_KIND_RESOURCE_POOL);
+    auto pool_ceiling = ceiling(OBJECT_KIND_RESOURCE_POOL);
     pool_ceiling.words[0] = 100;
     pool_ceiling.words[1] = 10;
-    pool_ceiling.words[2] = (uint64_t{1} << MYOS_OBJECT_KIND_MEMORY)
-        | (uint64_t{1} << MYOS_OBJECT_KIND_VSPACE);
+    pool_ceiling.words[2] = (uint64_t{1} << OBJECT_KIND_MEMORY)
+        | (uint64_t{1} << OBJECT_KIND_VSPACE);
     auto pool_request = pool_ceiling;
     pool_request.words[0] = 50;
     pool_request.words[1] = 5;
-    pool_request.words[2] = uint64_t{1} << MYOS_OBJECT_KIND_MEMORY;
+    pool_request.words[2] = uint64_t{1} << OBJECT_KIND_MEMORY;
     auto pool_budget = pool_request;
     pool_budget.words[0] = 101;
     auto pool_mask = pool_request;
-    pool_mask.words[2] |= uint64_t{1} << MYOS_OBJECT_KIND_ENDPOINT;
+    pool_mask.words[2] |= uint64_t{1} << OBJECT_KIND_ENDPOINT;
     if (!within(
             pool_request, pool_ceiling,
             DEPLOY_IMPORT_TYPED_DELEGATE)
@@ -500,7 +500,7 @@ void put(
         return false;
     }
 
-    auto endpoint_ceiling = ceiling(MYOS_OBJECT_KIND_ENDPOINT);
+    auto endpoint_ceiling = ceiling(OBJECT_KIND_ENDPOINT);
     endpoint_ceiling.words[0] = 3;
     endpoint_ceiling.words[1] = 3;
     endpoint_ceiling.words[2] = 4;
@@ -529,15 +529,15 @@ void put(
         return false;
     }
 
-    auto channel_unbound = ceiling(MYOS_OBJECT_KIND_CHANNEL);
-    channel_unbound.words[0] = MYOS_CAP_CHANNEL_SIDE_A;
+    auto channel_unbound = ceiling(OBJECT_KIND_CHANNEL);
+    channel_unbound.words[0] = CAP_CHANNEL_SIDE_A;
     auto channel_exact = channel_unbound;
     channel_exact.words[1] = 9;
     channel_exact.words[2] = UINT64_MAX;
     auto channel_other = channel_exact;
     channel_other.words[1] = 10;
     auto channel_b = channel_exact;
-    channel_b.words[0] = MYOS_CAP_CHANNEL_SIDE_B;
+    channel_b.words[0] = CAP_CHANNEL_SIDE_B;
     auto channel_zero_badge = channel_unbound;
     channel_zero_badge.words[2] = UINT64_MAX;
     auto channel_partial_fixed = channel_exact;
@@ -567,7 +567,7 @@ void put(
         return false;
     }
 
-    auto pager_ceiling = ceiling(MYOS_OBJECT_KIND_PAGER);
+    auto pager_ceiling = ceiling(OBJECT_KIND_PAGER);
     auto pager_request = pager_ceiling;
     auto pager_extra = pager_ceiling;
     pager_extra.words[0] = 1;
@@ -584,13 +584,13 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto first_slot = source.add(41, MYOS_OBJECT_KIND_THREAD);
-    const auto second_slot = source.add(42, MYOS_OBJECT_KIND_THREAD);
-    const auto reused_slot = source.add(44, MYOS_OBJECT_KIND_THREAD);
+    const auto first_slot = source.add(41, OBJECT_KIND_THREAD);
+    const auto second_slot = source.add(42, OBJECT_KIND_THREAD);
+    const auto reused_slot = source.add(44, OBJECT_KIND_THREAD);
     if (!first_slot || !second_slot || !reused_slot || !source.adopt()) {
         return false;
     }
-    const auto thread = ceiling(MYOS_OBJECT_KIND_THREAD);
+    const auto thread = ceiling(OBJECT_KIND_THREAD);
     const auto first = source.register_source(
         authorities, *first_slot, 1, thread);
     const auto second = source.register_source(
@@ -598,18 +598,18 @@ void put(
     const auto rejected = source.register_source(
         authorities,
         deploy::LocalSlot{
-            .pool = 999, .index = 0, .kind = MYOS_OBJECT_KIND_THREAD},
+            .pool = 999, .index = 0, .kind = OBJECT_KIND_THREAD},
         3, thread);
     if (!first || !second || rejected) {
         return false;
     }
     auto first_lease = authorities.lease(*first);
-    if (!first_lease || source.close() != MYOS_STATUS_BUSY
+    if (!first_lease || source.close() != STATUS_BUSY
         || authorities.lease(*first)) {
         return false;
     }
     first_lease->release();
-    if (source.close() != MYOS_STATUS_OK
+    if (source.close() != STATUS_OK
         || authorities.active_entries() != 0
         || authorities.lease(*first)) {
         return false;
@@ -618,14 +618,14 @@ void put(
     if (!replacement.open()) {
         return false;
     }
-    const auto replacement_slot = replacement.add(45, MYOS_OBJECT_KIND_THREAD);
+    const auto replacement_slot = replacement.add(45, OBJECT_KIND_THREAD);
     if (!replacement_slot || !replacement.adopt()) {
         return false;
     }
     const auto reused = replacement.register_source(
         authorities, *replacement_slot, 4, thread);
     if (!reused || reused->slot != 0 || reused->generation != 2
-        || replacement.close() != MYOS_STATUS_OK) {
+        || replacement.close() != STATUS_OK) {
         return false;
     }
     return authorities.active_entries() == 0;
@@ -638,40 +638,40 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto slot = source.add(51, MYOS_OBJECT_KIND_THREAD);
+    const auto slot = source.add(51, OBJECT_KIND_THREAD);
     if (!slot || !source.adopt()
         || !source.register_source(
-            authorities, *slot, 7, ceiling(MYOS_OBJECT_KIND_THREAD))
-        || source.close() != MYOS_STATUS_OK) {
+            authorities, *slot, 7, ceiling(OBJECT_KIND_THREAD))
+        || source.close() != STATUS_OK) {
         return false;
     }
     SourceFixture<1> replacement{};
     if (!replacement.open()) {
         return false;
     }
-    const auto replacement_slot = replacement.add(52, MYOS_OBJECT_KIND_THREAD);
+    const auto replacement_slot = replacement.add(52, OBJECT_KIND_THREAD);
     if (!replacement_slot || !replacement.adopt()
         || replacement.register_source(
                authorities, *replacement_slot, 8,
-               ceiling(MYOS_OBJECT_KIND_THREAD))) {
+               ceiling(OBJECT_KIND_THREAD))) {
         return false;
     }
-    return replacement.close() == MYOS_STATUS_OK
+    return replacement.close() == STATUS_OK
         && authorities.active_entries() == 0;
 }
 
 [[nodiscard]] auto test_registration_slot_admission() noexcept -> bool {
     FakeBackend::reset();
     Authorities authorities{};
-    const auto thread = ceiling(MYOS_OBJECT_KIND_THREAD);
+    const auto thread = ceiling(OBJECT_KIND_THREAD);
 
     SourceFixture<2> stale_source{};
     if (!stale_source.open()) {
         return false;
     }
-    const auto stale_slot = stale_source.add(53, MYOS_OBJECT_KIND_THREAD);
+    const auto stale_slot = stale_source.add(53, OBJECT_KIND_THREAD);
     if (!stale_slot || !stale_source.adopt()
-        || stale_source.close() != MYOS_STATUS_OK
+        || stale_source.close() != STATUS_OK
         || stale_source.register_source(
                authorities, *stale_slot, 40, thread)
         || authorities.active_entries() != 0) {
@@ -682,17 +682,17 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto owned_slot = source.add(54, MYOS_OBJECT_KIND_THREAD);
+    const auto owned_slot = source.add(54, OBJECT_KIND_THREAD);
     if (!owned_slot || !source.adopt()) {
         return false;
     }
     const auto foreign = deploy::LocalSlot{
-        .pool = 999, .index = 0, .kind = MYOS_OBJECT_KIND_THREAD};
+        .pool = 999, .index = 0, .kind = OBJECT_KIND_THREAD};
     const auto wrong_kind = source.aggregate.manager_slot();
     if (source.register_source(authorities, foreign, 41, thread)
         || source.register_source(authorities, wrong_kind, 42, thread)
         || authorities.active_entries() != 0
-        || source.close() != MYOS_STATUS_OK) {
+        || source.close() != STATUS_OK) {
         return false;
     }
     return true;
@@ -710,8 +710,8 @@ void put(
     }
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     Authorities authorities{};
@@ -719,29 +719,29 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto source_slot = source.add(77, MYOS_OBJECT_KIND_THREAD);
+    const auto source_slot = source.add(77, OBJECT_KIND_THREAD);
     if (!source_slot || !source.adopt()) {
         return false;
     }
     const auto id = source.register_source(
-        authorities, *source_slot, 10, ceiling(MYOS_OBJECT_KIND_THREAD));
+        authorities, *source_slot, 10, ceiling(OBJECT_KIND_THREAD));
     if (!id) {
         return false;
     }
     const deploy::ImportBinding binding{*id, {}};
     deploy::ImportProjection output{};
-    const myos_status_t status =
+    const status_t status =
         deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output);
     const auto resolved = space.lookup_remote(
         output.remote_index, output.manager);
-    if (status != MYOS_STATUS_OK || !output.valid() || !resolved
+    if (status != STATUS_OK || !output.valid() || !resolved
         || resolved->selector != 91 || resolved->cspace != output.manager
         || FakeBackend::duplicate_calls != 1) {
         return false;
     }
-    if (space.close() != MYOS_STATUS_OK
-        || source.close() != MYOS_STATUS_OK) {
+    if (space.close() != STATUS_OK
+        || source.close() != STATUS_OK) {
         return false;
     }
     return true;
@@ -759,26 +759,26 @@ void put(
     }
     Space typed_space{};
     if (typed_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
-    auto descriptor = Space::owner_type{myos::cap::CapRef{88, 0}};
+    auto descriptor = Space::owner_type{sys::cap::CapRef{88, 0}};
     const auto descriptor_slot = typed_space.adopt_local(
-        std::move(descriptor), MYOS_OBJECT_KIND_MEMORY);
+        std::move(descriptor), OBJECT_KIND_MEMORY);
     Authorities typed_authorities{};
     SourceFixture<4> typed_source{};
     if (!typed_source.open()) {
         return false;
     }
     const auto typed_source_slot = typed_source.add(
-        78, MYOS_OBJECT_KIND_THREAD);
+        78, OBJECT_KIND_THREAD);
     if (!typed_source_slot || !typed_source.adopt()) {
         return false;
     }
     const auto typed_id = typed_source.register_source(
         typed_authorities, *typed_source_slot, 11,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!descriptor_slot || !typed_id) {
         return false;
     }
@@ -788,20 +788,20 @@ void put(
     const auto typed_status = deploy::ImportTransaction<Space, Authorities>::run(
             typed_space, typed_plan->task(0), 0, 1, &typed_binding,
             typed_authorities, &typed_output);
-    if (typed_status != MYOS_STATUS_OK
+    if (typed_status != STATUS_OK
         || FakeBackend::typed_calls != 1
         || !typed_output.valid()) {
         return false;
     }
-    if (typed_space.close() != MYOS_STATUS_OK
-        || typed_source.close() != MYOS_STATUS_OK) {
+    if (typed_space.close() != STATUS_OK
+        || typed_source.close() != STATUS_OK) {
         return false;
     }
 
     Fixture channel_fixture{};
     if (!make_plan(
             channel_fixture, DEPLOY_IMPORT_CHANNEL_MINT,
-            MYOS_OBJECT_KIND_CHANNEL, 9)) {
+            OBJECT_KIND_CHANNEL, 9)) {
         return false;
     }
     auto channel_plan = channel_fixture.plan.lease();
@@ -810,8 +810,8 @@ void put(
     }
     Space channel_space{};
     if (channel_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     Authorities channel_authorities{};
@@ -820,13 +820,13 @@ void put(
         return false;
     }
     const auto channel_source_slot = channel_source.add(
-        79, MYOS_OBJECT_KIND_CHANNEL);
+        79, OBJECT_KIND_CHANNEL);
     if (!channel_source_slot || !channel_source.adopt()) {
         return false;
     }
     const auto channel_id = channel_source.register_source(
         channel_authorities, *channel_source_slot, 12,
-        ceiling(MYOS_OBJECT_KIND_CHANNEL));
+        ceiling(OBJECT_KIND_CHANNEL));
     if (!channel_id) {
         return false;
     }
@@ -835,13 +835,13 @@ void put(
     const auto channel_status = deploy::ImportTransaction<Space, Authorities>::run(
             channel_space, channel_plan->task(0), 0, 1, &channel_binding,
             channel_authorities, &channel_output);
-    if (channel_status != MYOS_STATUS_OK
+    if (channel_status != STATUS_OK
         || FakeBackend::channel_calls != 1
         || !channel_output.valid()) {
         return false;
     }
-    return channel_space.close() == MYOS_STATUS_OK
-        && channel_source.close() == MYOS_STATUS_OK;
+    return channel_space.close() == STATUS_OK
+        && channel_source.close() == STATUS_OK;
 }
 
 [[nodiscard]] auto test_import_failure_preserves_source() noexcept -> bool {
@@ -856,8 +856,8 @@ void put(
     }
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     Authorities authorities{};
@@ -865,13 +865,13 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto source_slot = source.add(81, MYOS_OBJECT_KIND_THREAD);
+    const auto source_slot = source.add(81, OBJECT_KIND_THREAD);
     if (!source_slot || !source.adopt()) {
         return false;
     }
     const auto id = source.register_source(
         authorities, *source_slot, 13,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!id) {
         return false;
     }
@@ -880,11 +880,11 @@ void put(
         deploy::LocalSlot{
             .pool = 10,
             .index = 0,
-            .kind = MYOS_OBJECT_KIND_MEMORY}};
+            .kind = OBJECT_KIND_MEMORY}};
     deploy::ImportProjection rejected{};
     if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &bad_binding, authorities,
-            &rejected) != MYOS_STATUS_BAD_ARGS
+            &rejected) != STATUS_BAD_ARGS
         || FakeBackend::duplicate_calls != 0
         || space.remote_size() != 0) {
         return false;
@@ -894,7 +894,7 @@ void put(
     deploy::ImportProjection output{};
     if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output)
-            != MYOS_STATUS_BUSY
+            != STATUS_BUSY
         || space.remote_size() != 0
         || authorities.live_leases() != 0
         || !authorities.lease(*id)) {
@@ -903,10 +903,10 @@ void put(
     FakeBackend::fail_after = 0;
     if (deploy::ImportTransaction<Space, Authorities>::run(
             space, plan->task(0), 0, 1, &binding, authorities, &output)
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || !output.valid()
-        || space.close() != MYOS_STATUS_OK
-        || source.close() != MYOS_STATUS_OK) {
+        || space.close() != STATUS_OK
+        || source.close() != STATUS_OK) {
         return false;
     }
     return true;
@@ -924,8 +924,8 @@ void put(
     }
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     Authorities authorities{};
@@ -933,13 +933,13 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto source_slot = source.add(83, MYOS_OBJECT_KIND_THREAD);
+    const auto source_slot = source.add(83, OBJECT_KIND_THREAD);
     if (!source_slot || !source.adopt()) {
         return false;
     }
     const auto id = source.register_source(
         authorities, *source_slot, 15,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!id) {
         return false;
     }
@@ -948,7 +948,7 @@ void put(
     FakeBackend::fail_nonzero_after = 2;
     const auto status = deploy::ImportTransaction<Space, Authorities>::run(
         space, plan->task(0), 0, 2, bindings, authorities, outputs);
-    if (status != MYOS_STATUS_BUSY
+    if (status != STATUS_BUSY
         || space.remote_live_size() != 0
         || FakeBackend::closed_count != 2
         || FakeBackend::closed_selectors[0] != 92
@@ -962,8 +962,8 @@ void put(
     }
     source_retry.reset();
     FakeBackend::fail_nonzero_after = 0;
-    if (space.close() != MYOS_STATUS_OK
-        || source.close() != MYOS_STATUS_OK) {
+    if (space.close() != STATUS_OK
+        || source.close() != STATUS_OK) {
         return false;
     }
 
@@ -974,8 +974,8 @@ void put(
     }
     Space failing_space{};
     if (failing_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     Authorities failing_authorities{};
@@ -984,13 +984,13 @@ void put(
         return false;
     }
     const auto failing_source_slot = failing_source.add(
-        84, MYOS_OBJECT_KIND_THREAD);
+        84, OBJECT_KIND_THREAD);
     if (!failing_source_slot || !failing_source.adopt()) {
         return false;
     }
     const auto failing_id = failing_source.register_source(
         failing_authorities, *failing_source_slot, 16,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!failing_id) {
         return false;
     }
@@ -1003,13 +1003,13 @@ void put(
             failing_space, second_plan->task(0), 0, 1, &failing_binding,
             failing_authorities, &failing_output);
     FakeBackend::close_failure_selector = 0;
-    if (failing_status != MYOS_STATUS_BUSY
+    if (failing_status != STATUS_BUSY
         || !FakeBackend::ownership_faulted
         || FakeBackend::closed_count == 0
         || FakeBackend::closed_selectors[0] != 91
         || failing_space.remote_live_size() != 0
-        || failing_space.close() != MYOS_STATUS_OK
-        || failing_source.close() != MYOS_STATUS_OK) {
+        || failing_space.close() != STATUS_OK
+        || failing_source.close() != STATUS_OK) {
         return false;
     }
     return true;
@@ -1027,18 +1027,18 @@ void put(
     }
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     const auto manager = space.lookup(
-        space.manager_slot(), MYOS_OBJECT_KIND_CSPACE);
+        space.manager_slot(), OBJECT_KIND_CSPACE);
     if (!manager) {
         return false;
     }
     for (size_t index = 0; index < Space::remote_capacity(); ++index) {
-        auto owner = Space::owner_type{myos::cap::CapRef{
-            static_cast<myos_cap_t>(100 + index), manager->selector}};
+        auto owner = Space::owner_type{sys::cap::CapRef{
+            static_cast<cap_t>(100 + index), manager->selector}};
         if (!space.adopt_remote_index(std::move(owner))) {
             return false;
         }
@@ -1048,13 +1048,13 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto source_slot = source.add(82, MYOS_OBJECT_KIND_THREAD);
+    const auto source_slot = source.add(82, OBJECT_KIND_THREAD);
     if (!source_slot || !source.adopt()) {
         return false;
     }
     const auto id = source.register_source(
         authorities, *source_slot, 14,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!id) {
         return false;
     }
@@ -1062,10 +1062,10 @@ void put(
     deploy::ImportProjection output{};
     const auto status = deploy::ImportTransaction<Space, Authorities>::run(
         space, plan->task(0), 0, 1, &binding, authorities, &output);
-    return status == MYOS_STATUS_NO_MEMORY
+    return status == STATUS_NO_MEMORY
         && FakeBackend::duplicate_calls == 0
-        && space.close() == MYOS_STATUS_OK
-        && source.close() == MYOS_STATUS_OK;
+        && space.close() == STATUS_OK
+        && source.close() == STATUS_OK;
 }
 
 [[nodiscard]] auto test_lease_capacity_pressure() noexcept -> bool {
@@ -1076,15 +1076,15 @@ void put(
     if (!source.open()) {
         return false;
     }
-    const auto first_slot = source.add(93, MYOS_OBJECT_KIND_THREAD);
-    const auto second_slot = source.add(94, MYOS_OBJECT_KIND_THREAD);
+    const auto first_slot = source.add(93, OBJECT_KIND_THREAD);
+    const auto second_slot = source.add(94, OBJECT_KIND_THREAD);
     if (!first_slot || !second_slot || !source.adopt()) {
         return false;
     }
     const auto first = source.register_source(
-        authorities, *first_slot, 30, ceiling(MYOS_OBJECT_KIND_THREAD));
+        authorities, *first_slot, 30, ceiling(OBJECT_KIND_THREAD));
     const auto second = source.register_source(
-        authorities, *second_slot, 31, ceiling(MYOS_OBJECT_KIND_THREAD));
+        authorities, *second_slot, 31, ceiling(OBJECT_KIND_THREAD));
     if (!first || !second || authorities.active_entries() != 2) {
         return false;
     }
@@ -1101,7 +1101,7 @@ void put(
     if (!reacquired || authorities.live_leases() != 2) {
         return false;
     }
-    if (source.close() != MYOS_STATUS_BUSY
+    if (source.close() != STATUS_BUSY
         || authorities.lease(*first) || authorities.lease(*second)
         || authorities.active_entries() != 2
         || FakeBackend::resource_close_calls != 0) {
@@ -1109,7 +1109,7 @@ void put(
     }
     held_second->release();
     reacquired->release();
-    return source.close() == MYOS_STATUS_OK
+    return source.close() == STATUS_OK
         && authorities.active_entries() == 0
         && authorities.live_leases() == 0
         && FakeBackend::resource_close_calls == 1;
@@ -1130,8 +1130,8 @@ void put(
     FakeBackend::reset();
     Space bounded_space{};
     if (bounded_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     SourceFixture<2> bounded_source{};
@@ -1139,14 +1139,14 @@ void put(
         return false;
     }
     const auto bounded_slot = bounded_source.add(
-        87, MYOS_OBJECT_KIND_THREAD);
+        87, OBJECT_KIND_THREAD);
     if (!bounded_slot || !bounded_source.adopt()) {
         return false;
     }
     Authorities bounded_authorities{};
     const auto bounded_id = bounded_source.register_source(
         bounded_authorities, *bounded_slot, 20,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!bounded_id) {
         return false;
     }
@@ -1155,13 +1155,13 @@ void put(
     deploy::ImportProjection bounded_outputs[2]{};
     if (deploy::ImportTransaction<Space, Authorities, 1>::run(
             bounded_space, plan->task(0), 0, 2, bounded_bindings,
-            bounded_authorities, bounded_outputs) != MYOS_STATUS_BAD_ARGS
+            bounded_authorities, bounded_outputs) != STATUS_BAD_ARGS
         || FakeBackend::duplicate_calls != 0
         || bounded_authorities.live_leases() != 0
         || bounded_authorities.active_entries() != 1
         || bounded_space.remote_size() != 0
-        || bounded_space.close() != MYOS_STATUS_OK
-        || bounded_source.close() != MYOS_STATUS_OK) {
+        || bounded_space.close() != STATUS_OK
+        || bounded_source.close() != STATUS_OK) {
         return false;
     }
 
@@ -1170,22 +1170,22 @@ void put(
     FakeBackend::reset();
     Space zero_space{};
     if (zero_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     SourceFixture<2> zero_source{};
     if (!zero_source.open()) {
         return false;
     }
-    const auto zero_slot = zero_source.add(88, MYOS_OBJECT_KIND_THREAD);
+    const auto zero_slot = zero_source.add(88, OBJECT_KIND_THREAD);
     if (!zero_slot || !zero_source.adopt()) {
         return false;
     }
     Authorities zero_authorities{};
     const auto zero_id = zero_source.register_source(
         zero_authorities, *zero_slot, 21,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!zero_id) {
         return false;
     }
@@ -1199,7 +1199,7 @@ void put(
             zero_authorities, zero_outputs);
     FakeBackend::fail_after = 0;
     auto zero_retry = zero_authorities.lease(*zero_id);
-    if (zero_status != MYOS_STATUS_BUSY
+    if (zero_status != STATUS_BUSY
         || FakeBackend::duplicate_calls != 2
         || FakeBackend::closed_count != 1
         || FakeBackend::closed_selectors[0] != 91
@@ -1210,8 +1210,8 @@ void put(
         return false;
     }
     zero_retry.reset();
-    if (zero_space.close() != MYOS_STATUS_OK
-        || zero_source.close() != MYOS_STATUS_OK) {
+    if (zero_space.close() != STATUS_OK
+        || zero_source.close() != STATUS_OK) {
         return false;
     }
 
@@ -1220,8 +1220,8 @@ void put(
     FakeBackend::reset();
     Space retained_space{};
     if (retained_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     SourceFixture<2> retained_source{};
@@ -1229,14 +1229,14 @@ void put(
         return false;
     }
     const auto retained_slot = retained_source.add(
-        89, MYOS_OBJECT_KIND_THREAD);
+        89, OBJECT_KIND_THREAD);
     if (!retained_slot || !retained_source.adopt()) {
         return false;
     }
     Authorities retained_authorities{};
     const auto retained_id = retained_source.register_source(
         retained_authorities, *retained_slot, 22,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!retained_id) {
         return false;
     }
@@ -1251,15 +1251,15 @@ void put(
             retained_authorities, retained_outputs);
     FakeBackend::fail_after = 0;
     FakeBackend::close_failure_selector = 0;
-    if (retained_status != MYOS_STATUS_BUSY
+    if (retained_status != STATUS_BUSY
         || retained_space.remote_size() != 1
         || retained_space.remote_live_size() != 1
         || FakeBackend::closed_count != 1
         || FakeBackend::closed_selectors[0] != 91
-        || retained_space.close_remote(0) != MYOS_STATUS_OK
+        || retained_space.close_remote(0) != STATUS_OK
         || retained_space.remote_live_size() != 0
-        || retained_space.close() != MYOS_STATUS_OK
-        || retained_source.close() != MYOS_STATUS_OK) {
+        || retained_space.close() != STATUS_OK
+        || retained_source.close() != STATUS_OK) {
         return false;
     }
     return true;
@@ -1269,13 +1269,13 @@ void put(
     FakeBackend::reset();
     Space raw{};
     if (raw.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     const auto source_slot = raw.adopt_local(
-        Space::owner_type{myos::cap::CapRef{85, 0}},
-        MYOS_OBJECT_KIND_THREAD);
+        Space::owner_type{sys::cap::CapRef{85, 0}},
+        OBJECT_KIND_THREAD);
     if (!source_slot) {
         return false;
     }
@@ -1291,7 +1291,7 @@ void put(
     Authorities authorities{};
     const auto id = bootstrap.register_source(
         authorities, *source_slot, 17,
-        ceiling(MYOS_OBJECT_KIND_THREAD));
+        ceiling(OBJECT_KIND_THREAD));
     if (!id) {
         return false;
     }
@@ -1299,13 +1299,13 @@ void put(
     if (!lease) {
         return false;
     }
-    if (bootstrap.close() != MYOS_STATUS_BUSY
+    if (bootstrap.close() != STATUS_BUSY
         || FakeBackend::resource_close_calls != 0
         || FakeBackend::close_calls != 0) {
         return false;
     }
     lease.reset();
-    if (bootstrap.close() != MYOS_STATUS_OK
+    if (bootstrap.close() != STATUS_OK
         || FakeBackend::resource_close_calls != 1
         || bootstrap.phase() != deploy::Phase::Closed) {
         return false;
@@ -1313,13 +1313,13 @@ void put(
 
     Space replacement{};
     if (replacement.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     if (bootstrap.adopt(std::move(replacement))
         || replacement.phase() != deploy::Phase::Open
-        || replacement.close() != MYOS_STATUS_OK) {
+        || replacement.close() != STATUS_OK) {
         return false;
     }
     return true;

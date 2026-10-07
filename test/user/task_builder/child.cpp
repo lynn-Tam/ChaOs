@@ -12,11 +12,11 @@ volatile uint8_t bss_tail[8192];
 
 } // namespace
 
-extern "C" [[noreturn]] void myos_main(
+extern "C" [[noreturn]] void user_main(
     const void* bootstrap,
-    myos_word_t bootstrap_size) noexcept {
+    word_t bootstrap_size) noexcept {
     static_cast<void>(bootstrap);
     static_cast<void>(bootstrap_size);
     bss_tail[0] = static_cast<uint8_t>(initialized_data);
-    myos::exit();
+    sys::exit();
 }

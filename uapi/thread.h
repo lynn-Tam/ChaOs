@@ -4,19 +4,19 @@
 #include <uapi/ipc.h>
 #include <uapi/types.h>
 
-#define MYOS_THREAD_START_VERSION 2U
+#define THREAD_START_VERSION 2U
 
 // Immutable constructor snapshot read from an authorized MemoryObject. The
 // kernel never follows a transient user pointer while building a Thread.
-struct myos_thread_start {
+struct ThreadInit {
     uint32_t version;
     uint32_t flags;
-    myos_word_t entry;
-    myos_word_t stack;
-    myos_word_t arguments[6];
-    struct myos_ipc_binding ipc;
+    word_t entry;
+    word_t stack;
+    word_t arguments[6];
+    struct IpcBinding ipc;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(myos_thread_start) == 104);
+static_assert(sizeof(ThreadInit) == 104);
 #endif

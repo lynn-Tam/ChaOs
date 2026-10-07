@@ -8,7 +8,7 @@
 #include <optional>
 #include <uapi/capability.h>
 #include <uapi/channel.h>
-#include <uapi/bootstrap.h>
+#include <uapi/start.h>
 #include <servers/deploy/format.h>
 #include <uapi/endpoint.h>
 #include <uapi/object.h>
@@ -39,7 +39,7 @@ enum class DescriptorForm : uint8_t {
 };
 
 [[nodiscard]] constexpr auto zero_words(
-    const myos_cap_attenuation& value,
+    const CapView& value,
     uint32_t first) noexcept -> bool {
     for (uint32_t index = first; index < 6; ++index) {
         if (value.words[index] != 0) {
@@ -50,20 +50,20 @@ enum class DescriptorForm : uint8_t {
 }
 
 [[nodiscard]] constexpr auto valid_kind(uint16_t kind) noexcept -> bool {
-    return kind > MYOS_OBJECT_KIND_INVALID && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
+    return kind > OBJECT_KIND_INVALID && kind < OBJECT_KIND_COUNT && ((OBJECT_KINDS >> kind) & 1);
 }
 
 [[nodiscard]] constexpr auto valid_access(uint64_t access) noexcept -> bool {
-    return (access & ~(uint64_t{MYOS_VM_READ}
-                       | uint64_t{MYOS_VM_WRITE}
-                       | uint64_t{MYOS_VM_EXECUTE})) == 0
+    return (access & ~(uint64_t{VM_READ}
+                       | uint64_t{VM_WRITE}
+                       | uint64_t{VM_EXECUTE})) == 0
         && access != 0
-        && ((access & MYOS_VM_WRITE) == 0
-            || (access & MYOS_VM_READ) != 0);
+        && ((access & VM_WRITE) == 0
+            || (access & VM_READ) != 0);
 }
 
 [[nodiscard]] constexpr auto valid_rights(uint64_t rights) noexcept -> bool {
-    return (rights & ~uint64_t{MYOS_RIGHT_MASK}) == 0;
+    return (rights & ~uint64_t{RIGHT_MASK}) == 0;
 }
 
 [[nodiscard]] constexpr auto valid_range(
@@ -73,10 +73,10 @@ enum class DescriptorForm : uint8_t {
 }
 
 [[nodiscard]] constexpr auto valid_descriptor(
-    const myos_cap_attenuation& value,
+    const CapView& value,
     DescriptorForm form = DescriptorForm::Ceiling) noexcept -> bool {
-    if (value.version != MYOS_CAP_ATTENUATION_VERSION_CURRENT
-        || value.size != MYOS_CAP_ATTENUATION_SIZE
+    if (value.version != CAP_ATTENUATION_VERSION_CURRENT
+        || value.size != CAP_ATTENUATION_SIZE
         || !valid_kind(value.kind) || !valid_rights(value.rights)) {
         return false;
     }
@@ -85,48 +85,48 @@ enum class DescriptorForm : uint8_t {
     }
 
     switch (value.kind) {
-    case MYOS_OBJECT_KIND_THREAD:
-    case MYOS_OBJECT_KIND_SCHED_CONTEXT:
-    case MYOS_OBJECT_KIND_SCHED_DOMAIN:
-    case MYOS_OBJECT_KIND_CSPACE:
-    case MYOS_OBJECT_KIND_NOTIFICATION:
-    case MYOS_OBJECT_KIND_IO_SPACE:
-    case MYOS_OBJECT_KIND_DEVICE:
-    case MYOS_OBJECT_KIND_IRQ:
-    case MYOS_OBJECT_KIND_PAGER:
+    case OBJECT_KIND_THREAD:
+    case OBJECT_KIND_SCHED_CONTEXT:
+    case OBJECT_KIND_SCHED_DOMAIN:
+    case OBJECT_KIND_CSPACE:
+    case OBJECT_KIND_NOTIFICATION:
+    case OBJECT_KIND_IO_SPACE:
+    case OBJECT_KIND_DEVICE:
+    case OBJECT_KIND_IRQ:
+    case OBJECT_KIND_PAGER:
         return zero_words(value, 0);
-    case MYOS_OBJECT_KIND_MEMORY:
+    case OBJECT_KIND_MEMORY:
         return valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
             && zero_words(value, 3);
-    case MYOS_OBJECT_KIND_VSPACE:
+    case OBJECT_KIND_VSPACE:
         return value.words[0] != 0 && value.words[1] != 0
             && (value.words[0] % DEPLOY_PAGE_SIZE) == 0
             && (value.words[1] % DEPLOY_PAGE_SIZE) == 0
             && valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
             && zero_words(value, 3);
-    case MYOS_OBJECT_KIND_RESOURCE_POOL: {
+    case OBJECT_KIND_RESOURCE_POOL: {
         constexpr uint64_t valid_mask =
-            MYOS_OBJECT_KINDS;
+            OBJECT_KINDS;
         return (value.words[2] & ~valid_mask) == 0
             && (value.words[2] & (uint64_t{1}
-                                  << MYOS_OBJECT_KIND_INVALID)) == 0
+                                  << OBJECT_KIND_INVALID)) == 0
             && zero_words(value, 3);
     }
-    case MYOS_OBJECT_KIND_ENDPOINT:
+    case OBJECT_KIND_ENDPOINT:
         return (value.words[0] & ~value.words[1]) == 0
-            && value.words[2] <= MYOS_ENDPOINT_MAX_CAPS
+            && value.words[2] <= ENDPOINT_MAX_CAPS
             && zero_words(value, 3);
-    case MYOS_OBJECT_KIND_CHANNEL: {
+    case OBJECT_KIND_CHANNEL: {
         const bool unbound = value.words[1] == 0 && value.words[2] == 0;
         const bool exact = value.words[1] != 0
             && value.words[2] == UINT64_MAX;
-        return value.words[0] <= MYOS_CAP_CHANNEL_SIDE_B
+        return value.words[0] <= CAP_CHANNEL_SIDE_B
             && (unbound || exact) && zero_words(value, 3);
     }
-    case MYOS_OBJECT_KIND_INVALID:
-    case MYOS_OBJECT_KIND_COUNT:
+    case OBJECT_KIND_INVALID:
+    case OBJECT_KIND_COUNT:
         return false;
     }
     return false;
@@ -137,8 +137,8 @@ enum class DescriptorForm : uint8_t {
  * representation; callers must not copy the native C++ object layout into a
  * descriptor MemoryObject. */
 [[nodiscard]] constexpr auto rights_within(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling) noexcept -> bool {
+    const CapView& requested,
+    const CapView& ceiling) noexcept -> bool {
     return requested.kind == ceiling.kind
         && (requested.rights & ~ceiling.rights) == 0;
 }
@@ -155,34 +155,34 @@ enum class DescriptorForm : uint8_t {
 }
 
 [[nodiscard]] constexpr auto data_within(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling) noexcept -> bool {
+    const CapView& requested,
+    const CapView& ceiling) noexcept -> bool {
     switch (requested.kind) {
-    case MYOS_OBJECT_KIND_THREAD:
-    case MYOS_OBJECT_KIND_SCHED_CONTEXT:
-    case MYOS_OBJECT_KIND_SCHED_DOMAIN:
-    case MYOS_OBJECT_KIND_CSPACE:
-    case MYOS_OBJECT_KIND_NOTIFICATION:
-    case MYOS_OBJECT_KIND_IO_SPACE:
-    case MYOS_OBJECT_KIND_DEVICE:
-    case MYOS_OBJECT_KIND_IRQ:
-    case MYOS_OBJECT_KIND_PAGER:
+    case OBJECT_KIND_THREAD:
+    case OBJECT_KIND_SCHED_CONTEXT:
+    case OBJECT_KIND_SCHED_DOMAIN:
+    case OBJECT_KIND_CSPACE:
+    case OBJECT_KIND_NOTIFICATION:
+    case OBJECT_KIND_IO_SPACE:
+    case OBJECT_KIND_DEVICE:
+    case OBJECT_KIND_IRQ:
+    case OBJECT_KIND_PAGER:
         return true;
-    case MYOS_OBJECT_KIND_MEMORY:
-    case MYOS_OBJECT_KIND_VSPACE:
+    case OBJECT_KIND_MEMORY:
+    case OBJECT_KIND_VSPACE:
         return range_within(
                    ceiling.words[0], ceiling.words[1], requested.words[0],
                    requested.words[1])
             && (requested.words[2] & ~ceiling.words[2]) == 0;
-    case MYOS_OBJECT_KIND_RESOURCE_POOL:
+    case OBJECT_KIND_RESOURCE_POOL:
         return requested.words[0] <= ceiling.words[0]
             && requested.words[1] <= ceiling.words[1]
             && (requested.words[2] & ~ceiling.words[2]) == 0;
-    case MYOS_OBJECT_KIND_ENDPOINT:
+    case OBJECT_KIND_ENDPOINT:
         return (requested.words[1] & ceiling.words[1]) == ceiling.words[1]
             && (requested.words[0] & ceiling.words[1]) == ceiling.words[0]
             && requested.words[2] <= ceiling.words[2];
-    case MYOS_OBJECT_KIND_CHANNEL: {
+    case OBJECT_KIND_CHANNEL: {
         const bool ceiling_unbound =
             ceiling.words[1] == 0 && ceiling.words[2] == 0;
         const bool ceiling_exact =
@@ -202,18 +202,18 @@ enum class DescriptorForm : uint8_t {
             && requested.words[1] == ceiling.words[1]
             && requested.words[2] == ceiling.words[2];
     }
-    case MYOS_OBJECT_KIND_INVALID:
-    case MYOS_OBJECT_KIND_COUNT:
+    case OBJECT_KIND_INVALID:
+    case OBJECT_KIND_COUNT:
         return false;
     }
     return false;
 }
 
 [[nodiscard]] constexpr auto channel_mint_within(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling) noexcept -> bool {
-    return requested.kind == MYOS_OBJECT_KIND_CHANNEL
-        && ceiling.kind == MYOS_OBJECT_KIND_CHANNEL
+    const CapView& requested,
+    const CapView& ceiling) noexcept -> bool {
+    return requested.kind == OBJECT_KIND_CHANNEL
+        && ceiling.kind == OBJECT_KIND_CHANNEL
         && ceiling.words[0] == requested.words[0]
         && ceiling.words[1] == 0 && ceiling.words[2] == 0
         && requested.words[1] != 0 && requested.words[2] == UINT64_MAX;
@@ -226,8 +226,8 @@ enum class DescriptorForm : uint8_t {
  * the explicit unbound-to-exact same-side proof.
  */
 [[nodiscard]] constexpr auto within(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling,
+    const CapView& requested,
+    const CapView& ceiling,
     uint16_t mode) noexcept -> bool {
     if (!valid_descriptor(ceiling, DescriptorForm::Ceiling)
         || !rights_within(requested, ceiling)) {
@@ -251,7 +251,7 @@ enum class DescriptorForm : uint8_t {
 
 namespace deploy {
 
-static_assert(sizeof(myos_ipc_binding) <= DEPLOY_PAGE_SIZE);
+static_assert(sizeof(IpcBinding) <= DEPLOY_PAGE_SIZE);
 
 class ByteView final {
 public:
@@ -398,7 +398,7 @@ struct ManifestImportRow final {
     uint16_t mode{};
     uint16_t selector{};
     uint32_t flags{};
-    myos_cap_attenuation attenuation{};
+    CapView attenuation{};
     uint16_t source_class{};
 };
 
@@ -424,7 +424,7 @@ struct ManifestExportRow final {
     StringRef key{};
     uint16_t source_class{};
     uint16_t flags{};
-    myos_cap_attenuation ceiling{};
+    CapView ceiling{};
 };
 
 struct EffectiveMapping final {
@@ -508,7 +508,7 @@ public:
     }
 
     [[nodiscard]] auto validate_boot_bundle(
-        const myos::boot::Bundle& bundle,
+        const boot::Bundle& bundle,
         ManifestWorkspace& workspace) noexcept -> bool {
         workspace.reset();
         if (!bundle) {
@@ -864,18 +864,18 @@ private:
 
     [[nodiscard]] static constexpr auto valid_kind(uint64_t kind) noexcept
         -> bool {
-        return kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
+        return kind > OBJECT_KIND_INVALID
+            && kind < OBJECT_KIND_COUNT && ((OBJECT_KINDS >> kind) & 1);
     }
 
     [[nodiscard]] static constexpr auto valid_access(uint64_t access) noexcept
         -> bool {
-        return (access & ~(MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE)) == 0
+        return (access & ~(VM_READ | VM_WRITE | VM_EXECUTE)) == 0
             && access != 0
-            && ((access & MYOS_VM_WRITE) == 0
-                || (access & MYOS_VM_READ) != 0)
-            && (access & (MYOS_VM_WRITE | MYOS_VM_EXECUTE))
-                != (MYOS_VM_WRITE | MYOS_VM_EXECUTE);
+            && ((access & VM_WRITE) == 0
+                || (access & VM_READ) != 0)
+            && (access & (VM_WRITE | VM_EXECUTE))
+                != (VM_WRITE | VM_EXECUTE);
     }
 
     [[nodiscard]] auto validate_attenuation(
@@ -912,7 +912,7 @@ private:
             }
             words[word] = value_word;
         }
-        myos_cap_attenuation descriptor{};
+        CapView descriptor{};
         descriptor.version = static_cast<uint16_t>(version);
         descriptor.kind = static_cast<uint16_t>(kind);
         descriptor.size = static_cast<uint32_t>(size);
@@ -955,7 +955,7 @@ private:
                 if (arguments.offset != 0) return fail(Error::InvalidRecord);
             } else {
                 const auto bytes = string(arguments);
-                myos::bootstrap::Arguments decoded;
+                boot::Args decoded;
                 if (!bytes || !decoded.decode(
                     reinterpret_cast<const char*>(bytes.data()), bytes.size()))
                     return fail(Error::InvalidRecord);
@@ -1005,9 +1005,9 @@ private:
                 || restart > DEPLOY_RESTART_ALWAYS
                 || flags != 0
                 || (kind_mask
-                    & ~MYOS_OBJECT_KINDS) != 0
+                    & ~OBJECT_KINDS) != 0
                 || (kind_mask
-                    & (UINT64_C(1) << MYOS_OBJECT_KIND_INVALID)) != 0
+                    & (UINT64_C(1) << OBJECT_KIND_INVALID)) != 0
                 || pool_memory == 0
                 || (pool_memory % DEPLOY_PAGE_SIZE) != 0
                 || pool_caps == 0
@@ -1297,11 +1297,11 @@ private:
                     return fail(Error::InvalidRecord);
                 }
             }
-            const bool output_b_required = kind == MYOS_OBJECT_KIND_CHANNEL;
+            const bool output_b_required = kind == OBJECT_KIND_CHANNEL;
             const uint16_t required_flags =
-                kind == MYOS_OBJECT_KIND_PAGER
+                kind == OBJECT_KIND_PAGER
                     ? DEPLOY_OBJECT_EPHEMERAL_TASK
-                    : kind == MYOS_OBJECT_KIND_ENDPOINT
+                    : kind == OBJECT_KIND_ENDPOINT
                         ? DEPLOY_OBJECT_POST_MAPPING
                         : DEPLOY_OBJECT_FLAG_NONE;
             if ((output_b_required && output_b_key.size() == 0)
@@ -1315,7 +1315,7 @@ private:
                 || (kind_mask & (UINT64_C(1) << kind)) == 0) {
                 return fail(Error::InvalidRecord);
             }
-            if (kind == MYOS_OBJECT_KIND_NOTIFICATION) {
+            if (kind == OBJECT_KIND_NOTIFICATION) {
                 if (args[0] == 0 || args[1] != 0 || args[2] != 0
                     || args[3] != 0 || args[4] != 0 || args[5] != 0
                     || refs[0] != DEPLOY_NO_INDEX
@@ -1324,11 +1324,11 @@ private:
                     || refs[3] != DEPLOY_NO_INDEX) {
                     return fail(Error::InvalidRecord);
                 }
-            } else if (kind == MYOS_OBJECT_KIND_CHANNEL) {
-                if (args[0] == 0 || args[0] > MYOS_CHANNEL_MAX_QUEUE
-                    || args[1] == 0 || args[1] > MYOS_CHANNEL_MAX_WORDS
-                    || args[2] > MYOS_CHANNEL_MAX_CAPS
-                    || args[3] == 0 || args[3] > MYOS_CHANNEL_MAX_RELATIONS
+            } else if (kind == OBJECT_KIND_CHANNEL) {
+                if (args[0] == 0 || args[0] > CHANNEL_MAX_QUEUE
+                    || args[1] == 0 || args[1] > CHANNEL_MAX_WORDS
+                    || args[2] > CHANNEL_MAX_CAPS
+                    || args[3] == 0 || args[3] > CHANNEL_MAX_RELATIONS
                     || args[4] != 0 || args[5] != 0
                     || refs[0] != DEPLOY_NO_INDEX
                     || refs[1] != DEPLOY_NO_INDEX
@@ -1336,7 +1336,7 @@ private:
                     || refs[3] != DEPLOY_NO_INDEX) {
                     return fail(Error::InvalidRecord);
                 }
-            } else if (kind == MYOS_OBJECT_KIND_PAGER) {
+            } else if (kind == OBJECT_KIND_PAGER) {
                 if (refs[0] != DEPLOY_NO_INDEX
                     || refs[1] != DEPLOY_NO_INDEX
                     || refs[2] != DEPLOY_NO_INDEX
@@ -1345,7 +1345,7 @@ private:
                     || args[4] != 0 || args[5] != 0) {
                     return fail(Error::InvalidRecord);
                 }
-            } else if (kind == MYOS_OBJECT_KIND_ENDPOINT) {
+            } else if (kind == OBJECT_KIND_ENDPOINT) {
                 if (refs[0] == DEPLOY_NO_INDEX
                     || !in_task_range(owner, DEPLOY_TABLE_MAPPING,
                                       refs[0])
@@ -1637,13 +1637,13 @@ private:
                 || !mapping_policy(
                     static_cast<uint32_t>(stack),
                     DEPLOY_CRITICAL_STACK,
-                    MYOS_VM_READ | MYOS_VM_WRITE,
-                    MYOS_VM_EXECUTE)
+                    VM_READ | VM_WRITE,
+                    VM_EXECUTE)
                 || !mapping_policy(
                     static_cast<uint32_t>(bootstrap),
                     DEPLOY_CRITICAL_BOOTSTRAP,
-                    MYOS_VM_READ,
-                    MYOS_VM_WRITE | MYOS_VM_EXECUTE)
+                    VM_READ,
+                    VM_WRITE | VM_EXECUTE)
                 || (ipc != DEPLOY_NO_INDEX
                     && !in_task_range(owner, DEPLOY_TABLE_MAPPING, ipc))
                 || (control != DEPLOY_NO_INDEX
@@ -1703,9 +1703,9 @@ private:
                               DEPLOY_OBJECT_KIND, 2, kind)) {
                     return fail(Error::InvalidReference);
                 }
-                if (kind == MYOS_OBJECT_KIND_NOTIFICATION) {
+                if (kind == OBJECT_KIND_NOTIFICATION) {
                     ++notifications;
-                } else if (kind == MYOS_OBJECT_KIND_ENDPOINT) {
+                } else if (kind == OBJECT_KIND_ENDPOINT) {
                     ++endpoints;
                 }
             }
@@ -1745,11 +1745,11 @@ private:
                 }
                 ByteView* source = nullptr;
                 bool* role = nullptr;
-                if (kind == MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION) {
+                if (kind == BOOT_EVENTS) {
                     source = &service_source;
                     role = &service_role;
                 } else if (kind
-                           == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                           == BOOT_READY) {
                     source = &readiness_source;
                     role = &readiness_role;
                 }
@@ -1811,7 +1811,7 @@ private:
                            DEPLOY_OBJECT_KIND, 2, kind)) {
                     return fail(Error::InvalidReference);
                 }
-                if (kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+                if (kind != OBJECT_KIND_NOTIFICATION) {
                     continue;
                 }
                 ByteView output{};
@@ -1887,7 +1887,7 @@ private:
                     DEPLOY_IMPORT_ATTENUATION,
                     mode == DEPLOY_IMPORT_DUPLICATE)
                 || (mode == DEPLOY_IMPORT_CHANNEL_MINT
-                    && attenuation_kind != MYOS_OBJECT_KIND_CHANNEL)
+                    && attenuation_kind != OBJECT_KIND_CHANNEL)
                 /* TypedDelegate accepts a Channel only when its
                  * source-relative side/badge/fixed schema is valid; the
                  * closed ChannelMint path remains the only badge-minting
@@ -1920,8 +1920,7 @@ private:
                 return fail(Error::InvalidReference);
             }
             uint32_t readiness_roles = 0;
-            uint32_t fixed_count = 0;
-            uint32_t named_count = 0;
+            if (count > DEPLOY_TASK_BOOTSTRAP_MAX) return fail(Error::InvalidRange);
             for (uint64_t local = 0; local < count; ++local) {
                 const uint32_t row = static_cast<uint32_t>(first + local);
                 uint64_t kind{};
@@ -1941,22 +1940,19 @@ private:
                 ManifestBootstrapRow binding{};
                 if (!bootstrap_row(row, binding)) return fail(Error::InvalidRecord);
                 const bool named = kind == 0;
-                if ((named && ++named_count > MYOS_BOOTSTRAP_MAX_IMPORTS)
-                    || (!named && ++fixed_count > MYOS_BOOTSTRAP_MAX_CAPS))
-                    return fail(Error::InvalidRange);
                 const ByteView name = string(binding.name);
-                const myos_object_kind_t expected_kind = named ? binding.object_kind
-                    : myos_bootstrap_object_kind(static_cast<uint32_t>(kind));
+                const obj_kind_t expected_kind = named ? binding.object_kind
+                    : boot_kind(static_cast<uint32_t>(kind));
                 if (!valid_kind(expected_kind)
                     || (named && (name.size() == 0
-                        || name.size() >= MYOS_BOOTSTRAP_IMPORT_NAME_MAX
+                        || name.size() >= BOOT_NAME_MAX
                         || binding.protocol == 0 || binding.major == 0))
                     || (!named && !zero(DEPLOY_TABLE_BOOTSTRAP, row,
                         DEPLOY_BOOTSTRAP_NAME, DEPLOY_BOOTSTRAP_STRIDE)))
                     return fail(Error::InvalidRecord);
                 for (size_t i = 0; i < name.size(); ++i)
                     if (name[i] < 33 || name[i] > 126) return fail(Error::InvalidString);
-                if (kind == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                if (kind == BOOT_READY) {
                     ++readiness_roles;
                 }
                 for (uint64_t previous = 0; previous < local; ++previous) {
@@ -1975,7 +1971,7 @@ private:
                         return fail(Error::DuplicateKey);
                 }
                 uint32_t matches{};
-                myos_object_kind_t matched_kind = MYOS_OBJECT_KIND_INVALID;
+                obj_kind_t matched_kind = OBJECT_KIND_INVALID;
                 for (uint64_t imported = 0;
                      imported < import_count_value; ++imported) {
                     ByteView imported_destination{};
@@ -1998,7 +1994,7 @@ private:
                             return fail(Error::InvalidReference);
                         }
                         if (expected_kind
-                                == MYOS_OBJECT_KIND_NOTIFICATION) {
+                                == OBJECT_KIND_NOTIFICATION) {
                             uint64_t source_class{};
                             uint64_t mode{};
                             uint64_t rights{};
@@ -2023,16 +2019,16 @@ private:
                                 return fail(Error::InvalidReference);
                             }
                             if (kind
-                                    == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION
+                                    == BOOT_READY
                                 && (source_class
                                         != DEPLOY_IMPORT_SOURCE_TASK_KEY
                                     || mode != DEPLOY_IMPORT_DUPLICATE
-                                    || rights != MYOS_RIGHT_SIGNAL)) {
+                                    || rights != RIGHT_SIGNAL)) {
                                 return fail(Error::InvalidReference);
                             }
                         }
                         ++matches;
-                        matched_kind = static_cast<myos_object_kind_t>(
+                        matched_kind = static_cast<obj_kind_t>(
                             imported_kind);
                     }
                 }
@@ -2086,7 +2082,7 @@ private:
                 const auto source_kind = task_source_kind(task, source);
                 if (!source_kind
                     || *source_kind
-                        != static_cast<myos_object_kind_t>(attenuation_kind)) {
+                        != static_cast<obj_kind_t>(attenuation_kind)) {
                     return fail(Error::InvalidReference);
                 }
             }
@@ -2225,7 +2221,7 @@ private:
     [[nodiscard]] auto task_source_kind(
         uint32_t task,
         ByteView target) const noexcept
-        -> std::optional<myos_object_kind_t> {
+        -> std::optional<obj_kind_t> {
         /* Import destinations live in the child CSpace and therefore cannot
          * be a construction-time PreparedKey source.  Check this namespace
          * explicitly before accepting an equal local symbol; otherwise a
@@ -2253,9 +2249,9 @@ private:
         }
 
         bool found{};
-        myos_object_kind_t found_kind = MYOS_OBJECT_KIND_INVALID;
+        obj_kind_t found_kind = OBJECT_KIND_INVALID;
         const auto consider = [&](ByteView key,
-                                  myos_object_kind_t kind) noexcept -> bool {
+                                  obj_kind_t kind) noexcept -> bool {
             if (!key.equals(target)) {
                 return true;
             }
@@ -2273,10 +2269,10 @@ private:
             DEPLOY_TASK_POOL, DEPLOY_TASK_VSPACE,
             DEPLOY_TASK_CSPACE,
         };
-        const myos_object_kind_t root_kinds[] = {
-            MYOS_OBJECT_KIND_RESOURCE_POOL,
-            MYOS_OBJECT_KIND_VSPACE,
-            MYOS_OBJECT_KIND_CSPACE,
+        const obj_kind_t root_kinds[] = {
+            OBJECT_KIND_RESOURCE_POOL,
+            OBJECT_KIND_VSPACE,
+            OBJECT_KIND_CSPACE,
         };
         for (size_t index = 0; index < sizeof(roots) / sizeof(roots[0]);
              ++index) {
@@ -2336,10 +2332,10 @@ private:
                     if (!required && key.size() == 0) {
                         continue;
                     }
-                    myos_object_kind_t kind = MYOS_OBJECT_KIND_INVALID;
+                    obj_kind_t kind = OBJECT_KIND_INVALID;
                     if (group == 0) {
-                        kind = field == 0 ? MYOS_OBJECT_KIND_MEMORY
-                                          : MYOS_OBJECT_KIND_VSPACE;
+                        kind = field == 0 ? OBJECT_KIND_MEMORY
+                                          : OBJECT_KIND_VSPACE;
                     } else if (group == 1) {
                         uint64_t object_kind{};
                         if (!value(DEPLOY_TABLE_OBJECT,
@@ -2349,7 +2345,7 @@ private:
                             || !valid_kind(object_kind)) {
                             return std::nullopt;
                         }
-                        kind = static_cast<myos_object_kind_t>(object_kind);
+                        kind = static_cast<obj_kind_t>(object_kind);
                     } else {
                         uint64_t model{};
                         if (!value(DEPLOY_TABLE_EXECUTION,
@@ -2359,10 +2355,10 @@ private:
                             return std::nullopt;
                         }
                         kind = field == 0
-                            ? static_cast<myos_object_kind_t>(
-                                  MYOS_OBJECT_KIND_THREAD)
-                            : static_cast<myos_object_kind_t>(
-                                  MYOS_OBJECT_KIND_SCHED_CONTEXT);
+                            ? static_cast<obj_kind_t>(
+                                  OBJECT_KIND_THREAD)
+                            : static_cast<obj_kind_t>(
+                                  OBJECT_KIND_SCHED_CONTEXT);
                     }
                     if (!consider(key, kind)) {
                         return std::nullopt;
@@ -2373,7 +2369,7 @@ private:
         if (!found) {
             return std::nullopt;
         }
-        return std::optional<myos_object_kind_t>{found_kind};
+        return std::optional<obj_kind_t>{found_kind};
     }
 
     [[nodiscard]] auto validate_exports() noexcept -> bool {
@@ -2415,7 +2411,7 @@ private:
                 const auto source_kind = task_source_kind(owner, source);
                 if (!source_kind
                     || *source_kind
-                        != static_cast<myos_object_kind_t>(ceiling_kind)) {
+                        != static_cast<obj_kind_t>(ceiling_kind)) {
                     return fail(Error::InvalidReference);
                 }
             }
@@ -2579,10 +2575,10 @@ private:
     }
 
     [[nodiscard]] auto validate_boot_bundle_records(
-        const myos::boot::Bundle& bundle,
+        const boot::Bundle& bundle,
         ManifestWorkspace& workspace) noexcept -> bool {
         const auto same_bytes = [](ByteView left,
-                                   myos::boot::Bytes right) noexcept {
+                                   boot::Bytes right) noexcept {
             if (left.size() != right.size()) {
                 return false;
             }
@@ -2594,7 +2590,7 @@ private:
             return true;
         };
         const auto module_for_image = [&](uint32_t image,
-                                          myos::boot::Module& result) noexcept {
+                                          boot::Module& result) noexcept {
             ByteView source{};
             if (!read_key(DEPLOY_TABLE_IMAGE, image,
                           DEPLOY_IMAGE_SOURCE, source, true)) {
@@ -2603,7 +2599,7 @@ private:
             uint32_t matches{};
             for (size_t module_index = 0; module_index < bundle.module_count();
                  ++module_index) {
-                myos::boot::Module candidate{};
+                boot::Module candidate{};
                 if (!bundle.module(module_index, candidate)
                     || !candidate.bootable()
                     || !same_bytes(source, candidate.name())) {
@@ -2640,8 +2636,8 @@ private:
                 return false;
             }
             if (source == DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT) {
-                myos::boot::Module module{};
-                myos::boot::Segment segment{};
+                boot::Module module{};
+                boot::Segment segment{};
                 if (!module_for_image(static_cast<uint32_t>(image), module)
                     || !module.segment(static_cast<size_t>(segment_index),
                                        segment)) {
@@ -2709,16 +2705,16 @@ private:
                 if (!effective_mapping(static_cast<uint32_t>(mapping_first + local),
                                        mapping)
                     || mapping.size == 0
-                    || mapping.address < MYOS_RISCV64_LOW_GUARD_END
-                    || mapping.address >= MYOS_RISCV64_LOWER_CANONICAL_END
-                    || mapping.size > MYOS_RISCV64_LOWER_CANONICAL_END
+                    || mapping.address < RISCV64_LOW_GUARD_END
+                    || mapping.address >= RISCV64_LOWER_CANONICAL_END
+                    || mapping.size > RISCV64_LOWER_CANONICAL_END
                         - mapping.address
                     || mapping.address > UINT64_MAX - mapping.size) {
                     return fail(Error::InvalidBootBundle);
                 }
                 uint64_t first_end{};
                 if (!rounded_end(mapping, first_end)
-                    || first_end > MYOS_RISCV64_LOWER_CANONICAL_END) {
+                    || first_end > RISCV64_LOWER_CANONICAL_END) {
                     return fail(Error::InvalidBootBundle);
                 }
                 for (uint64_t previous = 0; previous < local; ++previous) {
@@ -2730,7 +2726,7 @@ private:
                     }
                 }
                 if (mapping.critical == DEPLOY_CRITICAL_CODE
-                    && (mapping.access & MYOS_VM_EXECUTE) == 0) {
+                    && (mapping.access & VM_EXECUTE) == 0) {
                     return fail(Error::InvalidBootBundle);
                 }
             }
@@ -2784,7 +2780,7 @@ private:
                               descriptor_offset)) {
                     return fail(Error::InvalidBootBundle);
                 }
-                if (kind == MYOS_OBJECT_KIND_ENDPOINT) {
+                if (kind == OBJECT_KIND_ENDPOINT) {
                     uint64_t descriptor_source{};
                     uint64_t descriptor_residency{};
                     if (mapping < mapping_first
@@ -2805,7 +2801,7 @@ private:
                         || descriptor.source
                             == DEPLOY_MAPPING_SOURCE_PAGER
                         || descriptor_offset > descriptor.size
-                        || sizeof(myos_endpoint_desc)
+                        || sizeof(EpDesc)
                             > descriptor.size - descriptor_offset) {
                         return fail(Error::InvalidBootBundle);
                     }
@@ -2823,7 +2819,7 @@ private:
                  ++image_local) {
                 const uint32_t image = static_cast<uint32_t>(image_first
                     + image_local);
-                myos::boot::Module module{};
+                boot::Module module{};
                 if (!module_for_image(image, module)) {
                     return fail(Error::InvalidBootBundle);
                 }
@@ -2920,10 +2916,10 @@ private:
                         == DEPLOY_MAPPING_SOURCE_PAGER
                     || bootstrap_mapping.critical
                         != DEPLOY_CRITICAL_BOOTSTRAP
-                    || bootstrap_mapping.access != MYOS_VM_READ) {
+                    || bootstrap_mapping.access != VM_READ) {
                     return fail(Error::InvalidBootBundle);
                 }
-                myos::boot::Module module{};
+                boot::Module module{};
                 if (!module_for_image(static_cast<uint32_t>(image), module)) {
                     return fail(Error::InvalidBootBundle);
                 }
@@ -2951,7 +2947,7 @@ private:
                         || mapping_image != image) {
                         continue;
                     }
-                    myos::boot::Segment segment{};
+                    boot::Segment segment{};
                     if (!module.segment(static_cast<size_t>(mapping_segment),
                                         segment)) {
                         return fail(Error::InvalidBootBundle);
@@ -2959,7 +2955,7 @@ private:
                     if (effective_entry >= segment.address
                         && effective_entry - segment.address
                             < segment.memory_size
-                        && (segment.access & MYOS_VM_EXECUTE) != 0) {
+                        && (segment.access & VM_EXECUTE) != 0) {
                         entry_mapped = true;
                     }
                 }
@@ -2971,7 +2967,7 @@ private:
                         || ipc >= mapping_first + mapping_count_value
                         || !special_mapping(static_cast<uint32_t>(ipc),
                                             DEPLOY_CRITICAL_IPC_HEADER,
-                                            MYOS_VM_READ | MYOS_VM_WRITE))) {
+                                            VM_READ | VM_WRITE))) {
                     return fail(Error::InvalidBootBundle);
                 }
             }
@@ -3053,7 +3049,7 @@ template<typename T>
     uint32_t table,
     uint32_t index,
     size_t base,
-    myos_cap_attenuation& output) noexcept -> bool {
+    CapView& output) noexcept -> bool {
     if (!scalar(view, table, index,
                 base + DEPLOY_ATTENUATION_VERSION, 2, output.version)
         || !scalar(view, table, index,

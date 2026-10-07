@@ -3,7 +3,7 @@
 #include <cstdio>
 
 namespace {
-using namespace myos::io;
+using namespace sys::io;
 using Result = libk::RingResult;
 
 struct Session final {
@@ -35,7 +35,7 @@ auto completion_credits() -> bool {
     // Complete in reverse order. Every operation already owns its CQ credit;
     // an unread full CQ must retain backpressure even when no backend is busy.
     for (size_t i = QueueDepth; i != 0; --i) {
-        if (!session.server.finish(tickets[i - 1], MYOS_STATUS_OK, 512)) return false;
+        if (!session.server.finish(tickets[i - 1], STATUS_OK, 512)) return false;
     }
     if (session.server.active() != 0 || !session.server.publish()
         || session.server.admit(next) != Admission::Backpressure) return false;
@@ -61,26 +61,26 @@ auto cancellation_and_close() -> bool {
     if (session.client.submit(request) != Result::Ready || !session.client.publish()) return false;
     Ticket ticket{}, cancelled{};
     if (session.server.admit(ticket) != Admission::Ready
-        || session.server.cancel(request.id, cancelled) != MYOS_STATUS_OK
+        || session.server.cancel(request.id, cancelled) != STATUS_OK
         || cancelled.id != ticket.id || cancelled.slot != ticket.slot
         || !session.server.cancelled(ticket) || session.server.commit(ticket)) return false;
     // Receipt of cancellation has not ended the borrow or produced a result.
     Completion completion{};
     if (session.server.active() != 1 || session.server.request(ticket) == nullptr
         || session.client.take(completion) != Result::Empty) return false;
-    if (!session.server.finish(ticket, MYOS_STATUS_CANCELED, 0)
+    if (!session.server.finish(ticket, STATUS_CANCELED, 0)
         || !session.server.publish()
-        || session.server.cancel(request.id, cancelled) != MYOS_STATUS_NOT_FOUND
+        || session.server.cancel(request.id, cancelled) != STATUS_NOT_FOUND
         || session.server.finish(ticket, 0, 4096)) return false;
     if (session.client.take(completion) != Result::Ready
-        || completion.id != request.id || completion.status != MYOS_STATUS_CANCELED)
+        || completion.id != request.id || completion.status != STATUS_CANCELED)
         return false;
     if (!session.client.release() || !session.server.release()) return false;
     if (session.client.submit(request) != Result::Ready || !session.client.publish()
         || session.server.admit(cancelled) != Admission::Ready) return false;
     if (session.server.request(ticket) != nullptr || session.server.abandon(cancelled)
         || !session.server.commit(cancelled)
-        || session.server.cancel(request.id, ticket) != MYOS_STATUS_BUSY
+        || session.server.cancel(request.id, ticket) != STATUS_BUSY
         || session.server.cancelled(cancelled)) return false;
     session.server.stop();
     Ticket ignored{};
@@ -131,9 +131,9 @@ auto buffered_requests() -> bool {
         || transfers.take(result) || result.id != read.id || result.bytes != 1
         || data[0] != 'R' || data[1] != 0 || transfers.next()) return false;
     if (!session.client.release() || !session.server.release()) return false;
-    if (transfers.submit(read, data) || transfers.fail(MYOS_STATUS_PEER_FAULT) != MYOS_STATUS_PEER_FAULT
-        || transfers.take(result) || result.id != read.id || result.status != MYOS_STATUS_PEER_FAULT
-        || transfers.submit(write, &value) != MYOS_STATUS_PEER_FAULT) return false;
+    if (transfers.submit(read, data) || transfers.fail(STATUS_PEER_FAULT) != STATUS_PEER_FAULT
+        || transfers.take(result) || result.id != read.id || result.status != STATUS_PEER_FAULT
+        || transfers.submit(write, &value) != STATUS_PEER_FAULT) return false;
     return !transfers.next();
 }
 } // namespace

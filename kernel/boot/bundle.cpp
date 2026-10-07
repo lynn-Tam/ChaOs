@@ -64,7 +64,7 @@ struct Module final {
 
 [[nodiscard]] auto read_header(libk::ByteSpan bytes) noexcept
     -> std::expected<Header, BundleError> {
-    if (bytes.size() < MYOS_BOOT_HEADER_SIZE) {
+    if (bytes.size() < BUNDLE_HEADER_SIZE) {
         return std::unexpected(BundleError::Truncated);
     }
     libk::ByteReader reader{bytes.data(), bytes.size()};
@@ -96,15 +96,15 @@ struct Module final {
         return std::unexpected(BundleError::Truncated);
     }
     header.minor = minor;
-    if (magic != MYOS_BOOT_MAGIC) {
+    if (magic != BUNDLE_MAGIC) {
         return std::unexpected(BundleError::BadMagic);
     }
-    if (major != MYOS_BOOT_MAJOR || minor > MYOS_BOOT_MINOR
-        || header_size != MYOS_BOOT_HEADER_SIZE) {
+    if (major != BUNDLE_MAJOR || minor > BUNDLE_MINOR
+        || header_size != BUNDLE_HEADER_SIZE) {
         return std::unexpected(BundleError::BadVersion);
     }
-    if (architecture != MYOS_BOOT_ARCH_RISCV64
-        || abi != MYOS_BOOT_ABI_RISCV_LP64) {
+    if (architecture != BUNDLE_ARCH_RISCV64
+        || abi != BUNDLE_ABI_RISCV_LP64) {
         return std::unexpected(BundleError::WrongTarget);
     }
     if (features != 0) {
@@ -115,10 +115,10 @@ struct Module final {
         || header.root_module >= header.modules_count
         || !table_fits(
             bytes.size(), header.modules_offset, header.modules_count,
-            MYOS_BOOT_MODULE_SIZE)
+            BUNDLE_MODULE_SIZE)
         || !table_fits(
             bytes.size(), header.segments_offset, header.segments_count,
-            MYOS_BOOT_SEGMENT_SIZE)) {
+            BUNDLE_SEGMENT_SIZE)) {
         return std::unexpected(BundleError::InvalidTable);
     }
     return (header);
@@ -147,8 +147,8 @@ struct Module final {
         || !reader.read_le64(tls_size)) {
         return std::unexpected(BundleError::Truncated);
     }
-    if ((module.flags != MYOS_BOOT_MODULE_BOOTABLE
-            && module.flags != MYOS_BOOT_MODULE_DATA)
+    if ((module.flags != BUNDLE_MODULE_BOOTABLE
+            && module.flags != BUNDLE_MODULE_DATA)
         || module.name_size == 0 || tls_offset != 0 || tls_size != 0) {
         return std::unexpected(BundleError::InvalidRole);
     }
@@ -180,16 +180,16 @@ struct Module final {
         || !reader.read_le32(reserved)) {
         return std::unexpected(BundleError::Truncated);
     }
-    constexpr u32 known_access = MYOS_BOOT_SEGMENT_READ
-        | MYOS_BOOT_SEGMENT_WRITE | MYOS_BOOT_SEGMENT_EXECUTE;
+    constexpr u32 known_access = BUNDLE_SEGMENT_READ
+        | BUNDLE_SEGMENT_WRITE | BUNDLE_SEGMENT_EXECUTE;
     if (memory_size == 0 || file_size > memory_size || alignment == 0
         || !std::has_single_bit(static_cast<usize>(alignment))
         || alignment < mm::page_size
         || (virtual_address & (mm::page_size - 1)) != 0
         || alignment > mm::UserEnd
         || (access_bits & ~known_access) != 0
-        || ((access_bits & MYOS_BOOT_SEGMENT_WRITE) != 0
-            && (access_bits & MYOS_BOOT_SEGMENT_EXECUTE) != 0)
+        || ((access_bits & BUNDLE_SEGMENT_WRITE) != 0
+            && (access_bits & BUNDLE_SEGMENT_EXECUTE) != 0)
         || reserved != 0
         || virtual_address > mm::UserEnd
         || memory_size > mm::UserEnd - virtual_address
@@ -225,7 +225,7 @@ auto BundleModule::segment(usize index) const noexcept
     }
     const auto relative = libk::checked_add(segment_first_, index);
     const auto byte_offset = relative
-        ? libk::checked_multiply(*relative, usize{MYOS_BOOT_SEGMENT_SIZE})
+        ? libk::checked_multiply(*relative, usize{BUNDLE_SEGMENT_SIZE})
         : std::nullopt;
     const auto absolute = byte_offset
         ? libk::checked_add(segments_offset_, *byte_offset)
@@ -241,7 +241,7 @@ auto BootBundle::module(usize index) const noexcept
     if (index >= module_count_) {
         return std::unexpected(BundleError::InvalidModule);
     }
-    const usize offset = modules_offset_ + index * MYOS_BOOT_MODULE_SIZE;
+    const usize offset = modules_offset_ + index * BUNDLE_MODULE_SIZE;
     auto parsed = read_module(bytes_, offset);
     if (!parsed) {
         return std::unexpected(parsed.error());

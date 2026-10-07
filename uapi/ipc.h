@@ -5,28 +5,28 @@
 #include <uapi/capability.h>
 #include <uapi/types.h>
 
-#define MYOS_IPC_MAX_CAPS 8U
-#define MYOS_IPC_BUFFER_MAX_PAGES 2U
-#define MYOS_IPC_CAPS_VERSION 1U
-#define MYOS_IPC_CAPS_FLAGS_NONE 0U
+#define IPC_MAX_CAPS 8U
+#define IPC_BUFFER_MAX_PAGES 2U
+#define IPC_CAPS_VERSION 1U
+#define IPC_CAPS_FLAGS_NONE 0U
 
-#define MYOS_CAP_COPY     0U
-#define MYOS_CAP_MOVE     1U
-#define MYOS_CAP_DELEGATE 2U
+#define CAP_COPY     0U
+#define CAP_MOVE     1U
+#define CAP_DELEGATE 2U
 
 // Immutable registration for one execution-local IPC buffer. A zero page
 // count means that the execution supports only the register message subset.
-struct myos_ipc_binding {
-    myos_cap_t memory;
-    myos_word_t page;
-    myos_word_t address;
-    myos_word_t pages;
+struct IpcBinding {
+    cap_t memory;
+    word_t page;
+    word_t address;
+    word_t pages;
 };
 
 // A bounded capability transfer request. Rights are an attenuation for copy
 // and delegate; move requires zero and preserves the complete source view.
-struct myos_cap_transfer {
-    myos_cap_t source;
+struct CapXfer {
+    cap_t source;
     uint64_t rights;
     uint32_t operation;
     uint32_t flags;
@@ -36,21 +36,21 @@ struct myos_cap_transfer {
 // an IPC operation is admitted. received[] is a projection of destination
 // reservations and becomes authoritative only when received_count is
 // published after the all-or-nothing CSpace commit.
-struct myos_ipc_caps {
+struct IpcCaps {
     uint32_t version;
     uint32_t flags;
     uint32_t send_count;
     uint32_t receive_limit;
-    struct myos_cap_transfer send[MYOS_IPC_MAX_CAPS];
-    myos_cap_t received[MYOS_IPC_MAX_CAPS];
+    struct CapXfer send[IPC_MAX_CAPS];
+    cap_t received[IPC_MAX_CAPS];
     uint32_t received_count;
     uint32_t reserved;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(myos_ipc_binding) == 32);
-static_assert(sizeof(myos_cap_transfer) == 24);
-static_assert(sizeof(myos_ipc_caps) == 280);
-static_assert(offsetof(myos_ipc_caps, send) == 16);
-static_assert(offsetof(myos_ipc_caps, received_count) == 272);
+static_assert(sizeof(IpcBinding) == 32);
+static_assert(sizeof(CapXfer) == 24);
+static_assert(sizeof(IpcCaps) == 280);
+static_assert(offsetof(IpcCaps, send) == 16);
+static_assert(offsetof(IpcCaps, received_count) == 272);
 #endif

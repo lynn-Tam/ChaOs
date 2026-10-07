@@ -9,7 +9,7 @@
 #include <libk/bits.hpp>
 #include <optional>
 
-namespace arch::riscv64 {
+namespace csr {
 enum class CsrId : u16 {
     Sstatus = 0x100,
     Sie = 0x104,
@@ -236,4 +236,4 @@ struct Satp : ReadWriteCsr<CsrId::Satp> {
     }
 };
 
-} // namespace arch::riscv64
+} // namespace csr

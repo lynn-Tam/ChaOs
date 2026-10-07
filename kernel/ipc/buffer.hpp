@@ -31,7 +31,7 @@ enum class BufferError : u8 {
 class Buffer final : private libk::noncopyable {
 public:
     using Leases = libk::InplaceVector<
-        mm::PageHold, MYOS_IPC_BUFFER_MAX_PAGES>;
+        mm::PageHold, IPC_BUFFER_MAX_PAGES>;
 
     class Perm final : private libk::noncopyable {
     public:

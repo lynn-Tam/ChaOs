@@ -2,11 +2,11 @@
 
 #include <sys/syscall.hpp>
 
-#if defined(DEPLOY_MAGIC) || defined(MYOS_BOOT_MAGIC)
+#if defined(DEPLOY_MAGIC) || defined(BUNDLE_MAGIC)
 #error "raw syscall.hpp must not depend on deployment or BootBundle"
 #endif
 
-static_assert(sizeof(myos::SysResult) == 3 * sizeof(myos_word_t));
+static_assert(sizeof(sys::SysResult) == 3 * sizeof(word_t));
 
 int main() {
     return 0;

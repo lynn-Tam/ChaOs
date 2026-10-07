@@ -1,6 +1,6 @@
 #include <cpu/ipi.hpp>
 
-#include <arch/ipi.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <cpu/runtime.hpp>
 #include <cpu/registry.hpp>
@@ -13,3 +13,9 @@ void handle_ipi(CpuRuntime& runtime) noexcept {
     mm::drain_tlb(runtime.local.descriptor->logical_id());
     runtime.dispatcher().drain_remote();
 }
+
+#if !TEST_ENABLED
+bool send_ipi(CpuHwId target) noexcept {
+    return static_cast<bool>(arch::send_ipi(target));
+}
+#endif

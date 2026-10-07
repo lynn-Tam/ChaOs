@@ -1,6 +1,6 @@
 #pragma once
 
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <base/types.hpp>
 #include <libk/assert.hpp>
 #include <libk/delegate.hpp>
@@ -39,7 +39,7 @@ public:
     }
     [[nodiscard]] auto active() const noexcept -> bool { return active_; }
 private:
-    arch::InterruptState state_;
+    bool state_;
     bool active_{true};
 };
 

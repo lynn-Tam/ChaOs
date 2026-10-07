@@ -14,7 +14,7 @@ auto Exit::published() const noexcept -> bool {
     return read().sequence != 0;
 }
 
-auto Exit::claim(Reason reason, myos_status_t status, usize detail,
+auto Exit::claim(Reason reason, status_t status, usize detail,
                  usize pc, usize address, u8 locus) noexcept -> bool {
     {
         sync::Lock guard{lock_};

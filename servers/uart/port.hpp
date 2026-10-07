@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace myos::uart {
+namespace sys::uart {
 
 // A mapped NS16550 port.  The service owns the mapping and the IRQ
 // capability; this class only performs accesses within that mapping.
@@ -155,4 +155,4 @@ private:
     Writer writer_;
 };
 
-} // namespace myos::uart
+} // namespace sys::uart

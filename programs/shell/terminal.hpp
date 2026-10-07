@@ -7,26 +7,26 @@
 
 #include <servers/uart/protocol.hpp>
 
-namespace myos::console {
-inline void prompt(myos_cap_t output, const char* text) noexcept {
+namespace sys::console {
+inline void prompt(cap_t output, const char* text) noexcept {
     service::Message message{.operation = static_cast<uint64_t>(Operation::Prompt)};
     message.size = service::length(text);
-    if (message.size > sizeof(message.data)) exit(MYOS_STATUS_BAD_ARGS);
+    if (message.size > sizeof(message.data)) exit(STATUS_BAD_ARGS);
     service::copy(message.data, text, message.size);
     service::require(service::send(output, message).status);
 }
 
 }
 
-namespace myos::terminal {
+namespace sys::terminal {
 
 enum class LineResult { Line, TooLong, End };
 
 class LineReader final {
-    myos_cap_t input_;
+    cap_t input_;
     stream::Writer output_;
 public:
-    LineReader(myos_cap_t input, myos_cap_t output) noexcept
+    LineReader(cap_t input, cap_t output) noexcept
         : input_(input), output_(output) {}
 
     auto read(char (&line)[128]) noexcept -> LineResult {
@@ -38,7 +38,7 @@ public:
             if (message.operation == static_cast<uint64_t>(stream::Frame::End))
                 return LineResult::End;
             if (message.operation != static_cast<uint64_t>(stream::Frame::Data))
-                exit(MYOS_STATUS_PEER_FAULT);
+                exit(STATUS_PEER_FAULT);
             for (size_t i = 0; i < message.size; ++i) {
                 const char byte = message.data[i];
                 if (byte == '\n') {
@@ -57,4 +57,4 @@ public:
     }
 };
 
-} // namespace myos::terminal
+} // namespace sys::terminal

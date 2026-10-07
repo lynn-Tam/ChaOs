@@ -2,13 +2,13 @@
 
 #include <servers/runtime/service.hpp>
 
-namespace myos::stream {
+namespace sys::stream {
 // The channel supplies bounded backpressure. No reply queue is shared by
 // writers; console access grants only the ability to enqueue output.
 class Writer final {
-    myos_cap_t output_;
+    cap_t output_;
 public:
-    explicit Writer(myos_cap_t output) noexcept : output_(output) {}
+    explicit Writer(cap_t output) noexcept : output_(output) {}
     void write(const char* text, size_t size) const noexcept {
         while (size != 0) {
             service::Message message{};
@@ -24,5 +24,5 @@ public:
 };
 
 
-} // namespace myos::stream
+} // namespace sys::stream
 

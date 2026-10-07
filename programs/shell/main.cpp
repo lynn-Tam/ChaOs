@@ -8,12 +8,12 @@
 #include <libk/fmt.hpp>
 
 namespace {
-using namespace myos;
+using namespace sys;
 uint64_t children[4]{};
 uint64_t latest{};
 void remember(uint64_t id) {
     for (auto& child : children) if (!child) { child = id; latest = id; return; }
-    exit(MYOS_STATUS_INTERNAL);
+    exit(STATUS_INTERNAL);
 }
 void forget(uint64_t id) {
     for (auto& child : children) if (child == id) child = 0;
@@ -21,13 +21,13 @@ void forget(uint64_t id) {
 }
 bool storage_available{};
 
-void error(stream::Writer& console, myos_status_t status) {
+void error(stream::Writer& console, status_t status) {
     (void)libk::fmt::format_to<"error: {}\n">(console, status);
 }
 
 // Parse one bounded command line into the existing argv wire form. A pipe is
 // syntax only outside quotes; escaped bytes and empty quoted words are data.
-auto arguments(char* text, bootstrap::Arguments& output, size_t& split,
+auto arguments(char* text, boot::Args& output, size_t& split,
     char (&target)[128], bool& append_output) noexcept -> bool {
     char word[128]{};
     size_t used{};
@@ -75,7 +75,7 @@ auto arguments(char* text, bootstrap::Arguments& output, size_t& split,
 }
 
 void command(char* line, service::Connection& process, stream::Writer& console,
-    myos_cap_t control, myos_cap_t pool, myos_cap_t cspace) {
+    cap_t control, cap_t pool, cap_t cspace) {
     while (*line == ' ') ++line;
     char name[128]{};
     char* argument = line;
@@ -100,31 +100,31 @@ void command(char* line, service::Connection& process, stream::Writer& console,
             return;
         }
         service::copy(request.data, argument, request.size);
-        const auto pair = channel_create(pool, 1, MYOS_CHANNEL_MAX_WORDS, 0, 1);
-        if (pair.status != MYOS_STATUS_OK) {
+        const auto pair = channel_create(pool, 1, CHANNEL_MAX_WORDS, 0, 1);
+        if (pair.status != STATUS_OK) {
             error(console, pair.status);
             return;
         }
         cap::OwnedCap inbox_root{{pair.value, 0}}, outbox_root{{pair.value2, 0}};
-        const auto reader = channel_mint(inbox_root.selector(), cspace, 1, MYOS_RIGHT_RECEIVE);
+        const auto reader = channel_mint(inbox_root.selector(), cspace, 1, RIGHT_RECEIVE);
         const auto sender = channel_mint(outbox_root.selector(), cspace, 1,
-            MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE);
+            RIGHT_SEND | RIGHT_DUPLICATE);
         cap::OwnedCap inbox, outbox;
-        if (reader.status == MYOS_STATUS_OK) inbox = cap::OwnedCap{{reader.value, 0}};
-        if (sender.status == MYOS_STATUS_OK) outbox = cap::OwnedCap{{sender.value, 0}};
-        auto status = reader.status != MYOS_STATUS_OK ? reader.status : sender.status;
-        if (status == MYOS_STATUS_OK) {
-            status = service::send_cap(control, request, outbox.selector(), MYOS_RIGHT_SEND).status;
-            if (status == MYOS_STATUS_OK) {
+        if (reader.status == STATUS_OK) inbox = cap::OwnedCap{{reader.value, 0}};
+        if (sender.status == STATUS_OK) outbox = cap::OwnedCap{{sender.value, 0}};
+        auto status = reader.status != STATUS_OK ? reader.status : sender.status;
+        if (status == STATUS_OK) {
+            status = service::send_cap(control, request, outbox.selector(), RIGHT_SEND).status;
+            if (status == STATUS_OK) {
                 console.write("service restart requested\n");
                 service::Message reply{};
                 status = service::receive(inbox.selector(), reply).status;
-                if (status == MYOS_STATUS_OK) status = reply.status;
+                if (status == STATUS_OK) status = reply.status;
             }
         }
         const auto destroyed = object_destroy(inbox_root.selector()).status;
-        if (destroyed != MYOS_STATUS_OK) status = destroyed;
-        if (status != MYOS_STATUS_OK && status != MYOS_STATUS_BUSY) error(console, status);
+        if (destroyed != STATUS_OK) status = destroyed;
+        if (status != STATUS_OK && status != STATUS_BUSY) error(console, status);
         return;
     }
     if (service::equal(line, "jobs")) {
@@ -167,7 +167,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
         }
     }
     if (run || spawn) {
-        bootstrap::Arguments words;
+        boot::Args words;
         if (file_command) {
             (void)words.append("fs", 2);
             if (service::equal(line, "cp")) (void)words.append("copy", 4);
@@ -201,12 +201,12 @@ void command(char* line, service::Connection& process, stream::Writer& console,
     service::require(process.send(request).status);
     service::Message reply{};
     service::require(process.receive(reply).status);
-    if ((run || spawn) && reply.status == MYOS_STATUS_OK) {
+    if ((run || spawn) && reply.status == STATUS_OK) {
         const auto child = reply.id;
         uint64_t consumer{};
         if (reply.operation == static_cast<uint64_t>(process::op::Pipeline)
             || reply.operation == static_cast<uint64_t>(process::op::ForegroundPipeline)) {
-            if (reply.size != sizeof(consumer)) exit(MYOS_STATUS_PEER_FAULT);
+            if (reply.size != sizeof(consumer)) exit(STATUS_PEER_FAULT);
             service::copy(&consumer, reply.data, sizeof(consumer));
         }
         if (run) {
@@ -219,7 +219,7 @@ void command(char* line, service::Connection& process, stream::Writer& console,
                 wait_request.id = child;
                 service::require(process.send(wait_request).status);
                 service::require(process.receive(reply).status);
-                if (reply.status != MYOS_STATUS_OK) error(console, reply.status);
+                if (reply.status != STATUS_OK) error(console, reply.status);
                 reply.status = status;
             }
         } else {
@@ -232,25 +232,27 @@ void command(char* line, service::Connection& process, stream::Writer& console,
             return;
         }
     } else if (wait || stop) {
-        if (reply.status != MYOS_STATUS_TIMED_OUT) forget(request.id);
+        if (reply.status != STATUS_TIMED_OUT) forget(request.id);
     }
-    if (reply.status != MYOS_STATUS_OK
-        && !(stop && reply.status == MYOS_STATUS_CANCELED)) error(console, reply.status);
+    if (reply.status != STATUS_OK
+        && !(stop && reply.status == STATUS_CANCELED)) error(console, reply.status);
 }
 }
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
+extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
+    using namespace sys;
     const auto info = service::bootstrap(address, size);
-    const auto output = service::capability(info, myos::bootstrap::imports::ConsoleOutput);
+    boot::Args args;
+    if (!args.decode(arg_data, arg_size)) exit(STATUS_BAD_ARGS);
+    const auto output = service::capability(info, boot::ConsoleOutput);
     stream::Writer console{output};
-    const auto input = service::capability(info, myos::bootstrap::imports::ConsoleInput);
+    const auto input = service::capability(info, boot::ConsoleInput);
     service::Connection process{
-        service::capability(info, myos::bootstrap::imports::Process),
-        service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
-    storage_available = info.argument_count() == 1 && service::equal(info.argument(0), "storage");
+        service::capability(info, boot::Process),
+        service::capability(info, BOOT_EVENTS)};
+    storage_available = args.count() == 1 && service::equal(args.argument(0), "storage");
     console.write("myos native shell\n");
-    myos::console::prompt(output, "myos> ");
+    sys::console::prompt(output, "myos> ");
     terminal::LineReader reader{input, output};
     char line[128]{};
     for (;;) {
@@ -258,9 +260,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         if (result == terminal::LineResult::TooLong) console.write("line too long\n");
         else if (result == terminal::LineResult::Line)
             command(line, process, console,
-                service::capability(info, bootstrap::imports::ServiceControl),
-                service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL),
-                service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE));
-        myos::console::prompt(output, "myos> ");
+                service::capability(info, boot::ServiceControl),
+                service::capability(info, BOOT_POOL),
+                service::capability(info, BOOT_CSPACE));
+        sys::console::prompt(output, "myos> ");
     }
 }

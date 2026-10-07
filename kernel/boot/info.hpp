@@ -101,3 +101,12 @@ enum class BootInfoError : uint8_t {
 
 // Boot assembles permanent mappings before exposing the hardware root.
 auto kernel_root(mm::Pmm&) noexcept -> std::expected<mm::PageTable, mm::PtErr>;
+
+class KernelState;
+struct CpuRuntime;
+enum class BootErr : u8 {
+    InvalidModule, InvalidBundle, Ownership, OutOfMemory,
+    InvalidState, MappingFailed, CapabilityFailed, SchedulingFailed,
+};
+auto boot_root(KernelState&, CpuRuntime&, BootModule, mm::BootPages&&) noexcept
+    -> std::expected<void, BootErr>;

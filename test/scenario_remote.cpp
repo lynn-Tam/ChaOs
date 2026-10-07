@@ -1,7 +1,8 @@
 #include <expected>
 #include <test/scenario.hpp>
+#include <test/boot.hpp>
 
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <state.hpp>
 #include <cpu/registry.hpp>
 #include <cpu/runtime.hpp>
@@ -111,7 +112,9 @@ auto remote(CpuRuntime& runtime) noexcept -> bool {
     if (binding == nullptr) {
         return false;
     }
+    fail_ipis(2);
     const auto started = sched::start(*runtime.owner_registry, *binding);
+    fail_ipis(0);
     const auto posted = started
         ? sched::wake(*runtime.owner_registry, *binding)
         : decltype(started){std::unexpected(
@@ -123,33 +126,15 @@ auto remote(CpuRuntime& runtime) noexcept -> bool {
         libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
     }
     state.release.store<libk::MemoryOrder::Release>(1);
-    bool returned = state.returned.load<libk::MemoryOrder::Acquire>() != 0;
-    for (usize spin = 0; entered && !returned && spin < wait_spins; ++spin) {
-        returned = state.returned.load<libk::MemoryOrder::Acquire>() != 0;
+    // Exited and an empty Sc binding precede the final home-owner release.
+    // Observe the real completion cut instead of racing retirement against it.
+    bool stopped = thread->stopped();
+    for (usize spin = 0; entered && !stopped && spin < wait_spins; ++spin) {
+        stopped = thread->stopped();
         libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
     }
-    bool exited = thread->state() == Thread::State::Exited;
-    for (usize spin = 0; returned && !exited && spin < wait_spins; ++spin) {
-        exited = thread->state() == Thread::State::Exited;
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-    }
-    // Thread::start() performs the scheduler Exit commit after the entry
-    // returns. Once that production-owned state is visible, explicitly tear
-    // down the context binding and wait for the target to release it before
-    // unadmit/retire can touch either object.
-    bool unbound{};
-    for (usize spin = 0; exited && !unbound && spin < wait_spins; ++spin) {
-        unbound = !context->bound()
-            || static_cast<bool>(context->unbind());
-        if (!unbound) {
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-        }
-    }
-    bool released = !context->bound();
-    for (usize spin = 0; unbound && !released && spin < wait_spins; ++spin) {
-        released = !context->bound();
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
-    }
+    const bool returned = state.returned.load<libk::MemoryOrder::Acquire>() != 0;
+    const bool released = stopped && !context->bound();
 
     const bool unadmitted = static_cast<bool>(
         kernel.kernel_domain().unadmit(context.get()));
@@ -159,11 +144,15 @@ auto remote(CpuRuntime& runtime) noexcept -> bool {
     thread.reset();
     kernel.drain_reclaim();
 
-    const bool result = started && posted  && entered && returned && exited
-        && released && unbound && unadmitted
+    const bool result = started && posted && entered && returned && stopped
+        && released && unadmitted
         && context_retired && thread_retired;
     if (result) {
         console::print<"[scenario] remote-delivery ok\n">();
+    } else {
+        console::print<"[scenario] remote failure: start={} wake={} enter={} return={} stopped={} released={} unadmit={} retire={}/{}\n">(
+            bool(started), bool(posted), entered, returned, stopped,
+            released, unadmitted, context_retired, thread_retired);
     }
     return result;
 }

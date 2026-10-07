@@ -39,40 +39,40 @@ struct Call final {
 };
 
 struct Result final {
-    myos_status_t status{MYOS_STATUS_OK};
+    status_t status{STATUS_OK};
     usize value{};
     Disposition disposition{Disposition::Return};
     usize value2{};
 };
 
 [[nodiscard]] constexpr auto returned(
-    myos_status_t status,
+    status_t status,
     usize value = 0) noexcept -> Result {
     return Result{status, value, Disposition::Return, 0};
 }
 
 [[nodiscard]] constexpr auto returned(
-    myos_status_t status,
+    status_t status,
     usize value,
     usize value2) noexcept -> Result {
     return Result{status, value, Disposition::Return, value2};
 }
 
 [[nodiscard]] auto cap_status(cap::CSpaceError error) noexcept
-    -> myos_status_t;
+    -> status_t;
 
 [[nodiscard]] auto read_desc_bytes(
     Call& inv,
     cap::Handle handle,
     usize offset,
     libk::Span<byte> dest) noexcept
-    -> std::expected<void, myos_status_t>;
+    -> std::expected<void, status_t>;
 
 template<typename Descriptor>
 [[nodiscard]] auto read_desc(
     Call& inv,
     cap::Handle handle,
-    usize offset) noexcept -> std::expected<Descriptor, myos_status_t> {
+    usize offset) noexcept -> std::expected<Descriptor, status_t> {
     Descriptor descriptor{};
     auto read = read_desc_bytes(
         inv,
@@ -84,9 +84,9 @@ template<typename Descriptor>
     }
     return (descriptor);
 }
-[[nodiscard]] auto mem_status(mm::MemErr error) noexcept -> myos_status_t;
+[[nodiscard]] auto mem_status(mm::MemErr error) noexcept -> status_t;
 [[nodiscard]] auto vm_status(mm::VSpaceError error) noexcept
-    -> myos_status_t;
+    -> status_t;
 [[nodiscard]] auto handle_of(usize raw) noexcept -> cap::Handle;
 [[nodiscard]] auto rights_of(usize raw) noexcept
     -> std::optional<cap::Rights>;

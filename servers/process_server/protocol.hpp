@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-namespace myos::process {
+namespace sys::process {
 // Spawn carries a sequence of NUL-terminated arguments in data[0..size).
 // Wait optionally carries an absolute clock deadline (uint64_t); a timeout or
 // CancelWait removes the wait only. Stop terminates; the first terminal result wins.

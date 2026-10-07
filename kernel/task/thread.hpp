@@ -4,7 +4,7 @@
 
 #include <trap.hpp>
 #include <base/types.hpp>
-#include <arch/context.hpp>
+#include <cpu.hpp>
 #include <array>
 #include <cap/grant.hpp>
 #include <task/exit.hpp>
@@ -21,7 +21,6 @@
 #include <type_traits>
 #include <variant>
 #include <libk/sync/atomic.hpp>
-#include <sched/remote_queue.hpp>
 #include <trap/event.hpp>
 #include <wait.hpp>
 
@@ -36,7 +35,6 @@ class Completion;
 namespace sched {
 class Sc;
 class Dispatcher;
-class RemoteQueue;
 }
 // A caller-owned interest in exit cleanup. Completion may destroy it.
 class Stop final {
@@ -121,7 +119,7 @@ public:
     [[nodiscard]] auto identity() const noexcept -> usize {
         return reinterpret_cast<usize>(this);
     }
-    [[nodiscard]] auto ctx() noexcept -> arch::KernelContext& { return ctx_; }
+    [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return ctx_; }
     [[nodiscard]] auto exit() noexcept -> Exit& { return exit_; }
     [[nodiscard]] auto exit() const noexcept -> const Exit& { return exit_; }
     [[nodiscard]] auto draining() const noexcept -> bool;
@@ -190,16 +188,15 @@ public:
 
 private:
     friend class sched::Dispatcher;
-    friend class sched::RemoteQueue;
     friend class Stop;
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop(Stop& request) noexcept;
     void finish(
         Exit::Reason reason,
-        myos_status_t status) noexcept;
+        status_t status) noexcept;
     void finish_stop() noexcept;
-    void finish_exit(myos_status_t status = MYOS_STATUS_OK) noexcept;
+    void finish_exit(status_t status = STATUS_OK) noexcept;
 
     struct Root {
         Root(Thread& owner) noexcept : owner(&owner), cap(this, grant_ops_) {}
@@ -234,7 +231,7 @@ private:
 
     resource::Charge stack_charge_{};
     mm::Stack stack_;
-    arch::KernelContext ctx_{};
+    arch::Ctx ctx_{};
     Env env_;
     State state_{State::Prepared};
     sched::Sc* sc_{};

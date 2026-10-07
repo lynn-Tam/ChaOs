@@ -19,242 +19,242 @@ namespace libk {
 namespace {
 
 struct FakeBackend final {
-    static inline myos_status_t next_close{MYOS_STATUS_OK};
-    static inline myos_status_t next_resource_close{MYOS_STATUS_OK};
+    static inline status_t next_close{STATUS_OK};
+    static inline status_t next_resource_close{STATUS_OK};
     static inline size_t resource_close_busy_count{};
-    static inline myos_status_t next_vspace_status{MYOS_STATUS_OK};
-    static inline myos_status_t next_execution_start{MYOS_STATUS_OK};
+    static inline status_t next_vspace_status{STATUS_OK};
+    static inline status_t next_execution_start{STATUS_OK};
     static inline size_t execution_start_count{};
     static inline uint64_t terminal_sequence{1};
-    static inline myos_status_t terminal_status{MYOS_STATUS_OK};
+    static inline status_t terminal_status{STATUS_OK};
     static inline bool terminal_visible{};
     static inline bool publish_terminal_on_start{};
-    static inline myos_word_t notification_value{};
-    static inline myos_cap_t next_cap{100};
+    static inline word_t notification_value{};
+    static inline cap_t next_cap{100};
 
     static void reset() noexcept {
-        next_close = MYOS_STATUS_OK;
-        next_resource_close = MYOS_STATUS_OK;
+        next_close = STATUS_OK;
+        next_resource_close = STATUS_OK;
         resource_close_busy_count = 0;
-        next_vspace_status = MYOS_STATUS_OK;
-        next_execution_start = MYOS_STATUS_OK;
+        next_vspace_status = STATUS_OK;
+        next_execution_start = STATUS_OK;
         execution_start_count = 0;
         terminal_sequence = 1;
-        terminal_status = MYOS_STATUS_OK;
+        terminal_status = STATUS_OK;
         terminal_visible = false;
         publish_terminal_on_start = false;
         notification_value = 0;
         next_cap = 100;
     }
 
-    [[noreturn]] static void ownership_fault(myos_status_t) noexcept {
+    [[noreturn]] static void ownership_fault(status_t) noexcept {
         __builtin_trap();
     }
 
     [[nodiscard]] static auto close(
-        myos::cap::CapRef) noexcept -> myos_status_t {
-        const myos_status_t status = next_close;
-        next_close = MYOS_STATUS_OK;
+        sys::cap::CapRef) noexcept -> status_t {
+        const status_t status = next_close;
+        next_close = STATUS_OK;
         return status;
     }
 
     [[nodiscard]] static auto resource_create_child(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 10, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 10, 0};
     }
 
     [[nodiscard]] static auto resource_close(
-        myos::cap::CapRef) noexcept -> myos_status_t {
+        sys::cap::CapRef) noexcept -> status_t {
         if (resource_close_busy_count != 0) {
             --resource_close_busy_count;
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
-        const myos_status_t status = next_resource_close;
-        next_resource_close = MYOS_STATUS_OK;
+        const status_t status = next_resource_close;
+        next_resource_close = STATUS_OK;
         return status;
     }
 
     [[nodiscard]] static auto vspace_create(
-        myos::cap::CapRef) noexcept -> myos::SysResult {
-        const myos_status_t status = next_vspace_status;
-        next_vspace_status = MYOS_STATUS_OK;
+        sys::cap::CapRef) noexcept -> sys::SysResult {
+        const status_t status = next_vspace_status;
+        next_vspace_status = STATUS_OK;
         return {status,
-                static_cast<myos_cap_t>(status == MYOS_STATUS_OK ? 11 : 0),
+                static_cast<cap_t>(status == STATUS_OK ? 11 : 0),
                 0};
     }
 
     [[nodiscard]] static auto cspace_create(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 12, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 12, 0};
     }
 
     [[nodiscard]] static auto vm_slice(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, 13, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, 13, 0};
     }
 
     [[nodiscard]] static auto vm_map(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_unmap(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_clear(
-        myos::cap::CapRef) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto memory_create(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto memory_create_pager(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos::cap::CapRef) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        sys::cap::CapRef) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto duplicate(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto typed_delegate(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto channel_mint(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto memory_seal(
-        myos::cap::CapRef) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto memory_populate(
-        myos::cap::CapRef, myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef, word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto memory_write(
         void* destination,
         const uint8_t* source,
-        size_t size) noexcept -> myos_status_t {
+        size_t size) noexcept -> status_t {
         if (destination == nullptr) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
         auto* const bytes = static_cast<uint8_t*>(destination);
         for (size_t index = 0; index < size; ++index) {
             bytes[index] = source == nullptr ? 0 : source[index];
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto sc_create(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto sc_bind(
-        myos::cap::CapRef,
-        myos::cap::CapRef) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        sys::cap::CapRef) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto thread_create(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto notification_create(
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto notification_take(
-        myos::cap::CapRef) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, notification_value, 0};
+        sys::cap::CapRef) noexcept -> sys::SysResult {
+        return {STATUS_OK, notification_value, 0};
     }
 
     [[nodiscard]] static auto channel_create(
-        myos::cap::CapRef,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
-        const myos_cap_t first = next_cap++;
-        const myos_cap_t second = next_cap++;
-        return {MYOS_STATUS_OK, first, second};
+        sys::cap::CapRef,
+        word_t,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
+        const cap_t first = next_cap++;
+        const cap_t second = next_cap++;
+        return {STATUS_OK, first, second};
     }
 
-    [[nodiscard]] static auto pager_create(myos::cap::CapRef) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+    [[nodiscard]] static auto pager_create(sys::cap::CapRef) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto endpoint_create(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, next_cap++, 0};
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> sys::SysResult {
+        return {STATUS_OK, next_cap++, 0};
     }
 
     [[nodiscard]] static auto exit_bind(
-        myos::cap::CapRef,
-        myos::cap::CapRef,
-        myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef,
+        sys::cap::CapRef,
+        word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto execution_start(
-        myos::cap::CapRef) noexcept -> myos::SysResult {
+        sys::cap::CapRef) noexcept -> sys::SysResult {
         ++execution_start_count;
         if (publish_terminal_on_start) {
             terminal_visible = true;
@@ -263,9 +263,9 @@ struct FakeBackend final {
     }
 
     [[nodiscard]] static auto exit_query(
-        myos::cap::CapRef) noexcept -> myos::SysResult {
-        return {MYOS_STATUS_OK, terminal_visible ? terminal_sequence : 0,
-                static_cast<myos_word_t>(terminal_status)};
+        sys::cap::CapRef) noexcept -> sys::SysResult {
+        return {STATUS_OK, terminal_visible ? terminal_sequence : 0,
+                static_cast<word_t>(terminal_status)};
     }
 };
 
@@ -281,68 +281,68 @@ struct ReturningFaultBackend final {
         FakeBackend::reset();
     }
 
-    static void ownership_fault(myos_status_t) noexcept { ++faults; }
+    static void ownership_fault(status_t) noexcept { ++faults; }
 
     [[nodiscard]] static auto close(
-        myos::cap::CapRef reference) noexcept -> myos_status_t {
+        sys::cap::CapRef reference) noexcept -> status_t {
         return FakeBackend::close(reference);
     }
 
     [[nodiscard]] static auto resource_create_child(
-        myos::cap::CapRef pool,
-        myos_word_t memory,
-        myos_word_t caps,
-        myos_word_t kinds) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t memory,
+        word_t caps,
+        word_t kinds) noexcept -> sys::SysResult {
         return FakeBackend::resource_create_child(pool, memory, caps, kinds);
     }
 
     [[nodiscard]] static auto resource_close(
-        myos::cap::CapRef pool) noexcept -> myos_status_t {
+        sys::cap::CapRef pool) noexcept -> status_t {
         return FakeBackend::resource_close(pool);
     }
 
     [[nodiscard]] static auto vspace_create(
-        myos::cap::CapRef pool) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool) noexcept -> sys::SysResult {
         return FakeBackend::vspace_create(pool);
     }
 
     [[nodiscard]] static auto cspace_create(
-        myos::cap::CapRef pool,
-        myos_word_t slots,
-        myos_word_t pages) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t slots,
+        word_t pages) noexcept -> sys::SysResult {
         return FakeBackend::cspace_create(pool, slots, pages);
     }
 
     [[nodiscard]] static auto vm_slice(
-        myos::cap::CapRef vspace,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t access,
-        myos_word_t rights) noexcept -> myos::SysResult {
+        sys::cap::CapRef vspace,
+        word_t address,
+        word_t size,
+        word_t access,
+        word_t rights) noexcept -> sys::SysResult {
         return FakeBackend::vm_slice(
             vspace, address, size, access, rights);
     }
 
     [[nodiscard]] static auto vm_map(
-        myos::cap::CapRef region,
-        myos::cap::CapRef memory,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t offset,
-        myos_word_t access) noexcept -> myos_status_t {
+        sys::cap::CapRef region,
+        sys::cap::CapRef memory,
+        word_t address,
+        word_t size,
+        word_t offset,
+        word_t access) noexcept -> status_t {
         return FakeBackend::vm_map(
             region, memory, address, size, offset, access);
     }
 
     [[nodiscard]] static auto vm_unmap(
-        myos::cap::CapRef region,
-        myos_word_t address,
-        myos_word_t size) noexcept -> myos_status_t {
+        sys::cap::CapRef region,
+        word_t address,
+        word_t size) noexcept -> status_t {
         return FakeBackend::vm_unmap(region, address, size);
     }
 
     [[nodiscard]] static auto vm_clear(
-        myos::cap::CapRef region) noexcept -> myos_status_t {
+        sys::cap::CapRef region) noexcept -> status_t {
         return FakeBackend::vm_clear(region);
     }
 };
@@ -521,7 +521,7 @@ void insert_explicit(
     put_explicit(
         fixture.raw,
         terminal + DEPLOY_OBJECT_KIND,
-        MYOS_OBJECT_KIND_NOTIFICATION,
+        OBJECT_KIND_NOTIFICATION,
         2);
     put_explicit(
         fixture.raw,
@@ -553,13 +553,13 @@ void insert_explicit(
         fixture.raw,
         import + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_NOTIFICATION,
+        OBJECT_KIND_NOTIFICATION,
         2);
     put_explicit(
         fixture.raw,
         import + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_RIGHTS,
-        MYOS_RIGHT_SIGNAL,
+        RIGHT_SIGNAL,
         8);
     put_explicit(
         fixture.raw,
@@ -571,7 +571,7 @@ void insert_explicit(
     put_explicit(
         fixture.raw,
         bootstrap + DEPLOY_BOOTSTRAP_KIND,
-        MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
+        BOOT_READY,
         4);
     put_explicit(
         fixture.raw,
@@ -679,31 +679,31 @@ void put_bundle(
 }
 
 [[nodiscard]] auto make_construction_bundle() noexcept -> size_t {
-    constexpr size_t modules_offset = MYOS_BOOT_HEADER_SIZE;
+    constexpr size_t modules_offset = BUNDLE_HEADER_SIZE;
     constexpr size_t segments_offset =
-        modules_offset + MYOS_BOOT_MODULE_SIZE;
+        modules_offset + BUNDLE_MODULE_SIZE;
     constexpr size_t name_offset =
-        segments_offset + MYOS_BOOT_SEGMENT_SIZE;
+        segments_offset + BUNDLE_SEGMENT_SIZE;
     constexpr size_t image_offset = name_offset + 4;
     constexpr size_t image_size = 0x1000;
     constexpr size_t total_size = image_offset + image_size;
     for (size_t index = 0; index < total_size; ++index) {
         construction_bundle[index] = 0;
     }
-    put_bundle(0, MYOS_BOOT_MAGIC, 8);
-    put_bundle(8, MYOS_BOOT_MAJOR, 2);
-    put_bundle(10, MYOS_BOOT_MINOR, 2);
-    put_bundle(12, MYOS_BOOT_HEADER_SIZE, 4);
+    put_bundle(0, BUNDLE_MAGIC, 8);
+    put_bundle(8, BUNDLE_MAJOR, 2);
+    put_bundle(10, BUNDLE_MINOR, 2);
+    put_bundle(12, BUNDLE_HEADER_SIZE, 4);
     put_bundle(16, total_size, 8);
-    put_bundle(24, MYOS_BOOT_ARCH_RISCV64, 4);
-    put_bundle(28, MYOS_BOOT_ABI_RISCV_LP64, 4);
+    put_bundle(24, BUNDLE_ARCH_RISCV64, 4);
+    put_bundle(28, BUNDLE_ABI_RISCV_LP64, 4);
     put_bundle(40, modules_offset, 8);
     put_bundle(48, 1, 4);
     put_bundle(56, segments_offset, 8);
     put_bundle(64, 1, 4);
     put_bundle(modules_offset, name_offset, 8);
     put_bundle(modules_offset + 8, 4, 4);
-    put_bundle(modules_offset + 12, MYOS_BOOT_MODULE_BOOTABLE, 4);
+    put_bundle(modules_offset + 12, BUNDLE_MODULE_BOOTABLE, 4);
     put_bundle(modules_offset + 16, image_offset, 8);
     put_bundle(modules_offset + 24, image_size, 8);
     put_bundle(modules_offset + 32, 0x200000, 8);
@@ -719,7 +719,7 @@ void put_bundle(
     put_bundle(segments_offset + 24, image_size, 8);
     put_bundle(segments_offset + 32, 0x1000, 8);
     put_bundle(segments_offset + 40,
-        MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_EXECUTE, 4);
+        BUNDLE_SEGMENT_READ | BUNDLE_SEGMENT_EXECUTE, 4);
     for (size_t index = 0; index < 16; ++index) {
         construction_bundle[image_offset + index] =
             static_cast<uint8_t>(0xa0 + index);
@@ -734,21 +734,21 @@ template<typename BuilderT>
     const size_t bundle_size = make_construction_bundle();
     ConstructionBundle bundle{};
     ConstructionScratch scratch{};
-    const myos::cap::CapRef root{1, 0};
-    const myos_word_t bundle_address = static_cast<myos_word_t>(
+    const sys::cap::CapRef root{1, 0};
+    const word_t bundle_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_bundle));
-    const myos_word_t scratch_address = static_cast<myos_word_t>(
+    const word_t scratch_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_scratch));
     if (bundle.open(
             root,
-            myos::cap::CapRef{2, 0},
+            sys::cap::CapRef{2, 0},
             deploy::Window{bundle_address, 8192},
             bundle_size)
-        != MYOS_STATUS_OK
+        != STATUS_OK
         || scratch.open(
                root,
                deploy::Window{scratch_address, 16384})
-            != MYOS_STATUS_OK) {
+            != STATUS_OK) {
         return false;
     }
     deploy::TaskAuthorityBindings bindings{};
@@ -763,7 +763,7 @@ template<typename BuilderT>
         .bindings = &bindings,
         .workspace = construction_workspace,
     };
-    return builder.construct(input, authorities) == MYOS_STATUS_OK
+    return builder.construct(input, authorities) == STATUS_OK
         && construction_workspace.empty();
 }
 
@@ -1007,7 +1007,7 @@ void put_manifest(
         }
         return true;
     };
-    const auto zero_attenuation = [](const myos_cap_attenuation& value) noexcept {
+    const auto zero_attenuation = [](const CapView& value) noexcept {
         if (value.rights != 0) {
             return false;
         }
@@ -1043,7 +1043,7 @@ void put_manifest(
         || !equals(fixture.plan.symbol(task->vspace_key), "vspace")
         || !equals(fixture.plan.symbol(task->cspace_key), "cspace")
         || task->pool_memory != 16384 || task->pool_caps != 16
-        || task->kind_mask != MYOS_RESOURCE_E2_KINDS
+        || task->kind_mask != RESOURCE_E2_KINDS
         || task->critical_bytes != 12288 || task->cspace_slots != 16
         || task->cspace_pages != 1 || task->bootstrap_mapping != 2
         || task->images.first != 0 || task->images.count != 1
@@ -1073,7 +1073,7 @@ void put_manifest(
         || stack->residency != DEPLOY_MAPPING_RESIDENT
         || stack->critical != DEPLOY_CRITICAL_STACK
         || stack->flags != 0
-        || stack->access != (MYOS_VM_READ | MYOS_VM_WRITE)
+        || stack->access != (VM_READ | VM_WRITE)
         || stack->address != 0x210000 || stack->size != 4096
         || !equals(fixture.plan.symbol(bootstrap->produced), "bootstrap")
         || !bootstrap->pager.empty()
@@ -1082,11 +1082,11 @@ void put_manifest(
         || bootstrap->source != DEPLOY_MAPPING_SOURCE_ZERO
         || bootstrap->residency != DEPLOY_MAPPING_RESIDENT
         || bootstrap->critical != DEPLOY_CRITICAL_BOOTSTRAP
-        || bootstrap->flags != 0 || bootstrap->access != MYOS_VM_READ
+        || bootstrap->flags != 0 || bootstrap->access != VM_READ
         || bootstrap->address != 0x220000 || bootstrap->size != 4096
         || !equals(fixture.plan.symbol(object->output), "notify")
         || !object->output_b.empty() || object->flags != 0
-        || object->kind != MYOS_OBJECT_KIND_NOTIFICATION
+        || object->kind != OBJECT_KIND_NOTIFICATION
         || object->args[0] != 1
         || object->refs[0] != DEPLOY_NO_INDEX
         || object->refs[1] != DEPLOY_NO_INDEX
@@ -1117,7 +1117,7 @@ void put_manifest(
         || import->flags != 0
         || import->attenuation.version
             != DEPLOY_ATTENUATION_VERSION_CURRENT
-        || import->attenuation.kind != MYOS_OBJECT_KIND_THREAD
+        || import->attenuation.kind != OBJECT_KIND_THREAD
         || import->attenuation.size != DEPLOY_ATTENUATION_STRIDE
         || !zero_attenuation(import->attenuation)
         || !equals(fixture.plan.symbol(output->source), "thread")
@@ -1126,7 +1126,7 @@ void put_manifest(
         || output->flags != 0
         || output->ceiling.version
             != DEPLOY_ATTENUATION_VERSION_CURRENT
-        || output->ceiling.kind != MYOS_OBJECT_KIND_THREAD
+        || output->ceiling.kind != OBJECT_KIND_THREAD
         || output->ceiling.size != DEPLOY_ATTENUATION_STRIDE
         || !zero_attenuation(output->ceiling)) {
         return false;
@@ -1271,7 +1271,7 @@ void put_manifest(
     if (!receiver.detach()
         || sender.complete({deploy::TaskId{1, 1},
                             deploy::CloseReason::Explicit,
-                            MYOS_STATUS_OK})
+                            STATUS_OK})
         || set.available() != 1
         || set.cell_state(first_id)
             != deploy::CompletionCellState::Retired) {
@@ -1286,12 +1286,12 @@ void put_manifest(
     auto second_receiver = second->take_receiver();
     const deploy::TaskId task{2, 1};
     if (!second_sender.complete({
-            task, deploy::CloseReason::Terminal, MYOS_STATUS_BUSY})) {
+            task, deploy::CloseReason::Terminal, STATUS_BUSY})) {
         return false;
     }
     auto result = second_receiver.take();
     if (!result || result->task != task
-        || result->status != MYOS_STATUS_BUSY || set.available() != 1) {
+        || result->status != STATUS_BUSY || set.available() != 1) {
         return false;
     }
 
@@ -1302,7 +1302,7 @@ void put_manifest(
     auto third_sender = third->take_sender();
     auto third_receiver = third->take_receiver();
     if (!third_sender.complete({task, deploy::CloseReason::Explicit,
-                                MYOS_STATUS_OK})) {
+                                STATUS_OK})) {
         return false;
     }
     if (!third_receiver.detach() || set.available() != 0) {
@@ -1325,7 +1325,7 @@ void put_manifest(
         if (!discard_sender.complete({
                 deploy::TaskId{3, 1},
                 deploy::CloseReason::Explicit,
-                MYOS_STATUS_OK})) {
+                STATUS_OK})) {
             return false;
         }
     }
@@ -1345,7 +1345,7 @@ void put_manifest(
         || !sealed_sender.complete({
             deploy::TaskId{4, 1},
             deploy::CloseReason::Explicit,
-            MYOS_STATUS_OK})
+            STATUS_OK})
         || !sealed_receiver.take()) {
         return false;
     }
@@ -1464,8 +1464,8 @@ void put_manifest(
     {
         FaultSpace space{};
         if (space.open(
-                myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-                != MYOS_STATUS_OK) {
+                sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+                != STATUS_OK) {
             return false;
         }
     }
@@ -1476,25 +1476,25 @@ void put_manifest(
     FakeBackend::reset();
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     const auto local = space.vspace_slot();
-    const auto local_ref = space.lookup(local, MYOS_OBJECT_KIND_VSPACE);
+    const auto local_ref = space.lookup(local, OBJECT_KIND_VSPACE);
     if (!local_ref || local_ref->selector != 11 || local_ref->cspace != 0) {
         return false;
     }
-    if (space.lookup(local, MYOS_OBJECT_KIND_THREAD)) {
+    if (space.lookup(local, OBJECT_KIND_THREAD)) {
         return false;
     }
     const auto manager_ref = space.lookup(
-        space.manager_slot(), MYOS_OBJECT_KIND_CSPACE);
+        space.manager_slot(), OBJECT_KIND_CSPACE);
     if (!manager_ref) {
         return false;
     }
     auto remote_owner = Space::owner_type{
-        myos::cap::CapRef{99, manager_ref->selector}};
+        sys::cap::CapRef{99, manager_ref->selector}};
     const auto remote_index = space.adopt_remote_index(
         std::move(remote_owner));
     if (!remote_index) {
@@ -1509,7 +1509,7 @@ void put_manifest(
     if (space.lookup_remote(*remote_index, manager_ref->selector + 1)) {
         return false;
     }
-    return space.close() == MYOS_STATUS_OK;
+    return space.close() == STATUS_OK;
 }
 
 [[nodiscard]] auto test_table_transfer_and_close() noexcept -> bool {
@@ -1576,17 +1576,17 @@ void put_manifest(
         || table.transition(id, deploy::TaskState::Reclaimed)
         || table.record(id)->state() != deploy::TaskState::Failed
         || !table.begin_close(id, deploy::CloseReason::Terminal,
-                              MYOS_STATUS_CANCELED)
+                              STATUS_CANCELED)
         || table.tag(id) != deploy::TaskSlotTag::Closing
         || table.closing(id) == nullptr
         || table.transition(id, deploy::TaskState::Running)
-        || table.continue_close(id) != MYOS_STATUS_OK) {
+        || table.continue_close(id) != STATUS_OK) {
         return false;
     }
     auto result = receiver->take();
     if (!result || result->task != id
         || result->reason != deploy::CloseReason::Terminal
-        || result->status != MYOS_STATUS_CANCELED
+        || result->status != STATUS_CANCELED
         || table.tag(id) != deploy::TaskSlotTag::Retired) {
         return false;
     }
@@ -1621,15 +1621,15 @@ void put_manifest(
     FakeBackend::reset();
     Space space{};
     if (space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-            != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+            != STATUS_OK) {
         return false;
     }
     FakeBackend::reset();
-    FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
-    if (space.close() != MYOS_STATUS_BUSY
+    FakeBackend::next_resource_close = STATUS_BUSY;
+    if (space.close() != STATUS_BUSY
         || space.phase() != deploy::Phase::ResourceClosing
-        || space.close() != MYOS_STATUS_OK
+        || space.close() != STATUS_OK
         || space.phase() != deploy::Phase::Closed) {
         return false;
     }
@@ -1644,7 +1644,7 @@ void put_manifest(
     }
 
     FakeBackend::reset();
-    FakeBackend::next_vspace_status = MYOS_STATUS_NO_MEMORY;
+    FakeBackend::next_vspace_status = STATUS_NO_MEMORY;
     /* TaskSpace::open consumes the first BUSY while unwinding the partial
      * aggregate; the table-owned close consumes the second and succeeds on
      * its retry. */
@@ -1653,21 +1653,21 @@ void put_manifest(
     const size_t bundle_size = make_construction_bundle();
     ConstructionBundle bundle{};
     ConstructionScratch scratch{};
-    const myos::cap::CapRef root{1, 0};
-    const myos_word_t bundle_address = static_cast<myos_word_t>(
+    const sys::cap::CapRef root{1, 0};
+    const word_t bundle_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_bundle));
-    const myos_word_t scratch_address = static_cast<myos_word_t>(
+    const word_t scratch_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_scratch));
     if (bundle.open(
             root,
-            myos::cap::CapRef{2, 0},
+            sys::cap::CapRef{2, 0},
             deploy::Window{bundle_address, 8192},
             bundle_size)
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || scratch.open(
                root,
                deploy::Window{scratch_address, 16384})
-            != MYOS_STATUS_OK) {
+            != STATUS_OK) {
         return false;
     }
 
@@ -1700,19 +1700,19 @@ void put_manifest(
     if (!receiver) {
         return false;
     }
-    const myos_status_t status = builder->construct(input, authorities);
-    if (status != MYOS_STATUS_NO_MEMORY
+    const status_t status = builder->construct(input, authorities);
+    if (status != STATUS_NO_MEMORY
         || builder->valid()
         || !construction_workspace.empty()
         || table.tag(id) != deploy::TaskSlotTag::Closing) {
         return false;
     }
-    const myos_status_t first_close = table.continue_close(id);
+    const status_t first_close = table.continue_close(id);
     const auto first_tag = table.tag(id);
-    const myos_status_t second_close = table.continue_close(id);
-    if (first_close != MYOS_STATUS_BUSY
+    const status_t second_close = table.continue_close(id);
+    if (first_close != STATUS_BUSY
         || first_tag != deploy::TaskSlotTag::Closing
-        || second_close != MYOS_STATUS_OK
+        || second_close != STATUS_OK
         || table.tag(deploy::TaskId{
                          id.slot, id.generation + 1})
             != deploy::TaskSlotTag::Vacant) {
@@ -1721,7 +1721,7 @@ void put_manifest(
     const auto result = receiver->take();
     return result && result->task == id
         && result->reason == deploy::CloseReason::ConstructionFailure
-        && result->status == MYOS_STATUS_NO_MEMORY;
+        && result->status == STATUS_NO_MEMORY;
 }
 
 [[nodiscard]] auto test_public_readiness_and_terminal_paths() noexcept
@@ -1735,32 +1735,32 @@ void put_manifest(
     const size_t bundle_size = make_construction_bundle();
     ConstructionBundle bundle{};
     ConstructionScratch scratch{};
-    const myos::cap::CapRef root{1, 0};
-    const myos_word_t bundle_address = static_cast<myos_word_t>(
+    const sys::cap::CapRef root{1, 0};
+    const word_t bundle_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_bundle));
-    const myos_word_t scratch_address = static_cast<myos_word_t>(
+    const word_t scratch_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_scratch));
     if (bundle.open(
             root,
-            myos::cap::CapRef{2, 0},
+            sys::cap::CapRef{2, 0},
             deploy::Window{bundle_address, 8192},
             bundle_size)
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || scratch.open(
                root,
                deploy::Window{scratch_address, 16384})
-            != MYOS_STATUS_OK) {
+            != STATUS_OK) {
         return false;
     }
 
     ConstructionSpace source_space{};
     if (source_space.open(root, 16384, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+        != STATUS_OK) {
         return false;
     }
     const auto domain_slot = source_space.adopt_local(
-        ConstructionSpace::owner_type{myos::cap::CapRef{91, 0}},
-        MYOS_OBJECT_KIND_SCHED_DOMAIN);
+        ConstructionSpace::owner_type{sys::cap::CapRef{91, 0}},
+        OBJECT_KIND_SCHED_DOMAIN);
     if (!domain_slot) {
         return false;
     }
@@ -1768,11 +1768,11 @@ void put_manifest(
     if (!source.adopt(std::move(source_space))) {
         return false;
     }
-    const myos_cap_attenuation domain_ceiling{
-        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
-        .kind = MYOS_OBJECT_KIND_SCHED_DOMAIN,
-        .size = MYOS_CAP_ATTENUATION_SIZE,
-        .rights = MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL,
+    const CapView domain_ceiling{
+        .version = CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = OBJECT_KIND_SCHED_DOMAIN,
+        .size = CAP_ATTENUATION_SIZE,
+        .rights = RIGHT_DUPLICATE | RIGHT_CONTROL,
         .words = {},
     };
     ConstructionAuthorities authorities{};
@@ -1812,7 +1812,7 @@ void put_manifest(
         .bindings = &bindings,
         .workspace = construction_workspace,
     };
-    if (builder->construct(input, authorities) != MYOS_STATUS_OK
+    if (builder->construct(input, authorities) != STATUS_OK
         || !builder->commit_prepared()) {
         return false;
     }
@@ -1835,10 +1835,10 @@ void put_manifest(
     if (table.terminal_notification(id)) {
         return false;
     }
-    if (table.start(id) != MYOS_STATUS_OK
+    if (table.start(id) != STATUS_OK
         || table.record(id) == nullptr
         || table.record(id)->ready()
-        || table.consume_readiness(id) != MYOS_STATUS_RETRY
+        || table.consume_readiness(id) != STATUS_RETRY
         || table.record(id)->ready()) {
         return false;
     }
@@ -1847,41 +1847,41 @@ void put_manifest(
         return false;
     }
     FakeBackend::notification_value = 1;
-    if (table.consume_readiness(id) != MYOS_STATUS_OK
+    if (table.consume_readiness(id) != STATUS_OK
         || table.record(id) == nullptr
         || !table.record(id)->ready()
-        || table.consume_readiness(id) != MYOS_STATUS_RETRY) {
+        || table.consume_readiness(id) != STATUS_RETRY) {
         return false;
     }
     FakeBackend::terminal_visible = false;
     const auto empty_terminal = table.observe_terminal(id);
-    if (empty_terminal.status != MYOS_STATUS_OK
+    if (empty_terminal.status != STATUS_OK
         || empty_terminal.value != 0) {
         return false;
     }
     const bool began_close = table.begin_close(
-        id, deploy::CloseReason::Explicit, MYOS_STATUS_OK);
-    const myos_status_t closing_readiness = table.consume_readiness(id);
+        id, deploy::CloseReason::Explicit, STATUS_OK);
+    const status_t closing_readiness = table.consume_readiness(id);
     const auto closing_terminal = table.observe_terminal(id);
     const auto closing_notification = table.terminal_notification(id);
-    if (!began_close || closing_readiness != MYOS_STATUS_INVALID_CAP
-        || closing_terminal.status != MYOS_STATUS_INVALID_CAP
+    if (!began_close || closing_readiness != STATUS_INVALID_CAP
+        || closing_terminal.status != STATUS_INVALID_CAP
         || closing_notification) {
         return false;
     }
-    if (table.continue_close(id) != MYOS_STATUS_OK) {
+    if (table.continue_close(id) != STATUS_OK) {
         return false;
     }
     const auto result = receiver->take();
     if (!result || result->task != id
         || result->reason != deploy::CloseReason::Explicit
-        || result->status != MYOS_STATUS_OK
+        || result->status != STATUS_OK
         || table.record(id) != nullptr) {
         return false;
     }
-    if (source.close() != MYOS_STATUS_OK
-        || scratch.close() != MYOS_STATUS_OK
-        || bundle.close() != MYOS_STATUS_OK) {
+    if (source.close() != STATUS_OK
+        || scratch.close() != STATUS_OK
+        || bundle.close() != STATUS_OK) {
         return false;
     }
     return authorities.active_entries() == 0
@@ -1920,8 +1920,8 @@ void put_manifest(
         const deploy::TaskId id = builder->record()->id();
         if (!builder->commit_prepared()
             || !table.begin_close(id, deploy::CloseReason::Explicit,
-                                  MYOS_STATUS_OK)
-            || table.continue_close(id) != MYOS_STATUS_OK) {
+                                  STATUS_OK)
+            || table.continue_close(id) != STATUS_OK) {
             return false;
         }
         auto result = receiver->take();
@@ -1952,16 +1952,16 @@ void put_manifest(
     const size_t bundle_size = make_construction_bundle();
     ConstructionSpace source_space{};
     if (source_space.open(
-            myos::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
-        != MYOS_STATUS_OK) {
+            sys::cap::CapRef{1, 0}, 4096, 64, 0x100, 16, 2)
+        != STATUS_OK) {
         return false;
     }
     const auto domain_slot = source_space.adopt_local(
-        ConstructionSpace::owner_type{myos::cap::CapRef{91, 0}},
-        MYOS_OBJECT_KIND_SCHED_DOMAIN);
+        ConstructionSpace::owner_type{sys::cap::CapRef{91, 0}},
+        OBJECT_KIND_SCHED_DOMAIN);
     const auto import_slot = source_space.adopt_local(
-        ConstructionSpace::owner_type{myos::cap::CapRef{92, 0}},
-        MYOS_OBJECT_KIND_THREAD);
+        ConstructionSpace::owner_type{sys::cap::CapRef{92, 0}},
+        OBJECT_KIND_THREAD);
     if (!domain_slot || !import_slot) {
         return false;
     }
@@ -1970,18 +1970,18 @@ void put_manifest(
         return false;
     }
     ConstructionAuthorities authorities{};
-    const myos_cap_attenuation domain_ceiling{
-        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
-        .kind = MYOS_OBJECT_KIND_SCHED_DOMAIN,
-        .size = MYOS_CAP_ATTENUATION_SIZE,
-        .rights = MYOS_RIGHT_MASK,
+    const CapView domain_ceiling{
+        .version = CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = OBJECT_KIND_SCHED_DOMAIN,
+        .size = CAP_ATTENUATION_SIZE,
+        .rights = RIGHT_MASK,
         .words = {},
     };
-    const myos_cap_attenuation thread_ceiling{
-        .version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
-        .kind = MYOS_OBJECT_KIND_THREAD,
-        .size = MYOS_CAP_ATTENUATION_SIZE,
-        .rights = MYOS_RIGHT_MASK,
+    const CapView thread_ceiling{
+        .version = CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = OBJECT_KIND_THREAD,
+        .size = CAP_ATTENUATION_SIZE,
+        .rights = RIGHT_MASK,
         .words = {},
     };
     const auto domain = source.register_source(
@@ -1994,21 +1994,21 @@ void put_manifest(
 
     ConstructionBundle bundle{};
     ConstructionScratch scratch{};
-    const myos::cap::CapRef root{1, 0};
-    const myos_word_t bundle_address = static_cast<myos_word_t>(
+    const sys::cap::CapRef root{1, 0};
+    const word_t bundle_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_bundle));
-    const myos_word_t scratch_address = static_cast<myos_word_t>(
+    const word_t scratch_address = static_cast<word_t>(
         reinterpret_cast<uintptr_t>(construction_scratch));
     if (bundle.open(
             root,
-            myos::cap::CapRef{2, 0},
+            sys::cap::CapRef{2, 0},
             deploy::Window{bundle_address, 8192},
             bundle_size)
-        != MYOS_STATUS_OK
+        != STATUS_OK
         || scratch.open(
                root,
                deploy::Window{scratch_address, 16384})
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || bundle.phase() != deploy::LeasePhase::Mapped
         || scratch.phase() != deploy::LeasePhase::Ready) {
         return false;
@@ -2036,9 +2036,9 @@ void put_manifest(
     }
     auto builder = ConstructionBuilder::begin(
         completions, table, std::move(*plan), 0);
-    const myos_status_t construction_status = builder
-        ? builder->construct(input, authorities) : MYOS_STATUS_BAD_ARGS;
-    if (!builder || construction_status != MYOS_STATUS_OK) {
+    const status_t construction_status = builder
+        ? builder->construct(input, authorities) : STATUS_BAD_ARGS;
+    if (!builder || construction_status != STATUS_OK) {
         return false;
     }
     const auto projections = builder->record()->projections();
@@ -2054,7 +2054,7 @@ void put_manifest(
         || !projections.imports[0].valid()
         || !projections.relations[0].valid()
         || !projections.exports[0].valid()
-        || projections.exports[0].kind != MYOS_OBJECT_KIND_THREAD
+        || projections.exports[0].kind != OBJECT_KIND_THREAD
         || builder->record()->accounting().total_bytes != 12288
         || builder->record()->accounting().by_class[
                DEPLOY_CRITICAL_CODE] != 4096
@@ -2076,7 +2076,7 @@ void put_manifest(
         return false;
     }
     FakeBackend::reset();
-    if (table.start(task) != MYOS_STATUS_OK
+    if (table.start(task) != STATUS_OK
         || table.record(task) == nullptr
         || table.record(task)->state() != deploy::TaskState::Running
         || !table.record(task)->ready()
@@ -2085,9 +2085,9 @@ void put_manifest(
     }
     FakeBackend::terminal_visible = true;
     const auto observation = table.observe_terminal(task);
-    if (observation.status != MYOS_STATUS_OK
+    if (observation.status != STATUS_OK
         || observation.value != FakeBackend::terminal_sequence
-        || table.consume_terminal(task, observation) != MYOS_STATUS_OK
+        || table.consume_terminal(task, observation) != STATUS_OK
         || table.record(task) == nullptr
         || table.record(task)->state()
             != deploy::TaskState::Terminating
@@ -2098,14 +2098,14 @@ void put_manifest(
     if (!receiver
         || !table.begin_close(
             task, deploy::CloseReason::Terminal,
-            MYOS_STATUS_OK)
-        || table.continue_close(task) != MYOS_STATUS_OK) {
+            STATUS_OK)
+        || table.continue_close(task) != STATUS_OK) {
         return false;
     }
     const auto result = receiver->take();
     if (!result || result->task != task
         || result->reason != deploy::CloseReason::Terminal
-        || result->status != MYOS_STATUS_OK) {
+        || result->status != STATUS_OK) {
         return false;
     }
 
@@ -2128,15 +2128,15 @@ void put_manifest(
     FakeBackend::terminal_visible = false;
     FakeBackend::publish_terminal_on_start = true;
     FakeBackend::terminal_sequence = 2;
-    FakeBackend::terminal_status = MYOS_STATUS_OK;
+    FakeBackend::terminal_status = STATUS_OK;
     if (early_terminal_builder->construct(input, authorities)
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || !early_terminal_builder->commit_prepared()) {
         return false;
     }
     auto early_terminal_receiver = early_terminal_builder->take_receiver();
     if (!early_terminal_receiver
-        || table.start(early_terminal_task) != MYOS_STATUS_OK
+        || table.start(early_terminal_task) != STATUS_OK
         || table.record(early_terminal_task) == nullptr
         || table.record(early_terminal_task)->state()
             != deploy::TaskState::Running
@@ -2144,23 +2144,23 @@ void put_manifest(
         return false;
     }
     const auto early_observation = table.observe_terminal(early_terminal_task);
-    if (early_observation.status != MYOS_STATUS_OK
+    if (early_observation.status != STATUS_OK
         || early_observation.value != 2
         || table.consume_terminal(early_terminal_task, early_observation)
-            != MYOS_STATUS_OK
+            != STATUS_OK
         || table.record(early_terminal_task) == nullptr
         || table.record(early_terminal_task)->state()
             != deploy::TaskState::Terminating
         || table.record(early_terminal_task)->terminal_sequence() != 2
         || table.record(early_terminal_task)->terminal_status()
-            != MYOS_STATUS_OK) {
+            != STATUS_OK) {
         return false;
     }
     if (!table.begin_close(
             early_terminal_task,
             deploy::CloseReason::Terminal,
-            MYOS_STATUS_OK)
-        || table.continue_close(early_terminal_task) != MYOS_STATUS_OK) {
+            STATUS_OK)
+        || table.continue_close(early_terminal_task) != STATUS_OK) {
         return false;
     }
     const auto early_terminal_result = early_terminal_receiver->take();
@@ -2168,7 +2168,7 @@ void put_manifest(
         || early_terminal_result->task != early_terminal_task
         || early_terminal_result->reason
             != deploy::CloseReason::Terminal
-        || early_terminal_result->status != MYOS_STATUS_OK) {
+        || early_terminal_result->status != STATUS_OK) {
         return false;
     }
 
@@ -2184,19 +2184,19 @@ void put_manifest(
     const deploy::TaskId failed_task = failed_builder->record()->id();
     auto invalid_input = input;
     invalid_input.bootstrap_size = 8192;
-    const myos_status_t failed_status = failed_builder->construct(
+    const status_t failed_status = failed_builder->construct(
         invalid_input, authorities);
-    if (failed_status != MYOS_STATUS_BAD_ARGS
+    if (failed_status != STATUS_BAD_ARGS
         || failed_builder->valid()
         || !construction_workspace.empty()
         || table.tag(failed_task) != deploy::TaskSlotTag::Closing) {
         return false;
     }
-    FakeBackend::next_resource_close = MYOS_STATUS_BUSY;
-    if (table.continue_close(failed_task) != MYOS_STATUS_BUSY
+    FakeBackend::next_resource_close = STATUS_BUSY;
+    if (table.continue_close(failed_task) != STATUS_BUSY
         || table.tag(failed_task) != deploy::TaskSlotTag::Closing
         || !construction_workspace.empty()
-        || table.continue_close(failed_task) != MYOS_STATUS_OK) {
+        || table.continue_close(failed_task) != STATUS_OK) {
         return false;
     }
     auto failed_receiver = failed_builder->take_receiver();
@@ -2207,19 +2207,19 @@ void put_manifest(
     if (!failed_result || failed_result->task != failed_task
         || failed_result->reason
             != deploy::CloseReason::ConstructionFailure
-        || failed_result->status != MYOS_STATUS_BAD_ARGS) {
+        || failed_result->status != STATUS_BAD_ARGS) {
         return false;
     }
 
     auto held = authorities.lease(*domain);
     if (!held || authorities.live_leases() != 1
-        || source.close() != MYOS_STATUS_BUSY) {
+        || source.close() != STATUS_BUSY) {
         /* A source close starts retirement but cannot bypass the reciprocal
          * registration while this independent lease pins the entry. */
         return false;
     }
     held.reset();
-    return source.close() == MYOS_STATUS_OK
+    return source.close() == STATUS_OK
         && authorities.active_entries() == 0;
 }
 

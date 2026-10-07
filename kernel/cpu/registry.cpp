@@ -386,7 +386,7 @@ void CpuRegistry::publish_runtime(
     libk_assert(runtime_value.emergency_stack);
     libk_assert(runtime_value.idle_thread);
     libk_assert(runtime_value.dispatcher_storage);
-    libk_assert(runtime_value.start_context.ready());
+    libk_assert((__atomic_load_n(&runtime_value.start.ready, __ATOMIC_ACQUIRE) == CPU_START_READY));
 
     cpu.runtime_ = &runtime_value;
     // Publishes the stable association and every fully initialized runtime
@@ -435,7 +435,7 @@ auto CpuRegistry::publish_online(CpuRuntime& runtime_value) noexcept -> bool {
     }
     if (runtime_value.local.current_thread() != &runtime_value.idle()
         || runtime_value.idle().state() != Thread::State::Running
-        || arch::active_stack(runtime_value.local.arch_state)
+        || runtime_value.local.entry.stack
             != runtime_value.idle().home_stack_top()) {
         return false;
     }

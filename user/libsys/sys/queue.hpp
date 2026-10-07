@@ -13,7 +13,7 @@
 #include <sys/channel.hpp>
 #include <expected>
 
-namespace myos::io {
+namespace sys::io {
 
 inline constexpr uint64_t QueueVersion = 1;
 inline constexpr size_t QueueDepth = 32;
@@ -120,26 +120,26 @@ class requests final : private libk::noncopyable_nonmovable {
 public:
     requests(ClientQueue& queue, const uint8_t* payload, uint8_t* writable) noexcept
         : queue_(queue), payload_(payload), writable_(writable) {}
-    [[nodiscard]] auto submit(Request& request, void* data, bool exact = false) noexcept -> myos_status_t {
+    [[nodiscard]] auto submit(Request& request, void* data, bool exact = false) noexcept -> status_t {
         if (error_) return error_;
         if (request.length > BufferSize
-            || request.offset > UINT64_MAX - request.length) return MYOS_STATUS_BAD_ARGS;
+            || request.offset > UINT64_MAX - request.length) return STATUS_BAD_ARGS;
         const auto op = static_cast<Operation>(request.operation);
-        if (op == Operation::Write && request.length && !data) return MYOS_STATUS_BAD_ARGS;
-        if (op == Operation::Write && !writable_) return MYOS_STATUS_DENIED;
-        if (op == Operation::Identify && next()) return MYOS_STATUS_BUSY;
+        if (op == Operation::Write && request.length && !data) return STATUS_BAD_ARGS;
+        if (op == Operation::Write && !writable_) return STATUS_DENIED;
+        if (op == Operation::Identify && next()) return STATUS_BUSY;
         for (size_t slot = 0; slot < entries_.size(); ++slot) if (!entries_[slot].request.id) {
             request.buffer_offset = op == Operation::Flush || op == Operation::Identify
                 ? 0 : slot * BufferSize;
             if (op == Operation::Write && request.length)
                 std::copy_n(static_cast<const uint8_t*>(data), request.length, writable_ + request.buffer_offset);
             const auto status = queue_.submit(request);
-            if (status == libk::RingResult::Full) return MYOS_STATUS_BUSY;
-            if (status != libk::RingResult::Ready) return fail(MYOS_STATUS_PEER_FAULT);
+            if (status == libk::RingResult::Full) return STATUS_BUSY;
+            if (status != libk::RingResult::Ready) return fail(STATUS_PEER_FAULT);
             entries_[slot] = {.request = request, .data = data, .exact = exact};
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         }
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     }
     void poll() noexcept {
         if (error_) return;
@@ -150,26 +150,26 @@ public:
             auto* entry = find(result.id);
             if (status != libk::RingResult::Ready || !entry || entry->ready || result.flags
                 || result.bytes > entry->request.length
-                || (entry->exact && result.status == MYOS_STATUS_OK && result.bytes != entry->request.length)) {
-                (void)fail(MYOS_STATUS_PEER_FAULT);
+                || (entry->exact && result.status == STATUS_OK && result.bytes != entry->request.length)) {
+                (void)fail(STATUS_PEER_FAULT);
                 return;
             }
             const auto op = static_cast<Operation>(entry->request.operation);
-            if (entry->data && result.bytes && result.status == MYOS_STATUS_OK && (op == Operation::Read || op == Operation::Identify))
+            if (entry->data && result.bytes && result.status == STATUS_OK && (op == Operation::Read || op == Operation::Identify))
                 std::copy_n(payload_ + entry->request.buffer_offset, result.bytes, static_cast<uint8_t*>(entry->data));
             entry->result = result;
             entry->ready = true;
         }
     }
     // id zero selects any ready result. A result is retired exactly once.
-    [[nodiscard]] auto take(Completion& result, uint64_t id = 0) noexcept -> myos_status_t {
+    [[nodiscard]] auto take(Completion& result, uint64_t id = 0) noexcept -> status_t {
         poll();
         for (auto& entry : entries_) if (entry.request.id && entry.ready && (!id || entry.request.id == id)) {
             result = entry.result;
             entry = {};
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         }
-        return MYOS_STATUS_WOULD_BLOCK;
+        return STATUS_WOULD_BLOCK;
     }
     [[nodiscard]] auto next(uint64_t after = 0) const noexcept -> const Request* {
         const Request* first{};
@@ -177,12 +177,12 @@ public:
             if (entry.request.id > after && (!first || entry.request.id < first->id)) first = &entry.request;
         return first;
     }
-    [[nodiscard]] auto error() const noexcept -> myos_status_t { return error_; }
+    [[nodiscard]] auto error() const noexcept -> status_t { return error_; }
     [[nodiscard]] auto contains(uint64_t id) const noexcept -> bool {
         if (id) for (const auto& entry : entries_) if (entry.request.id == id) return true;
         return false;
     }
-    [[nodiscard]] auto fail(myos_status_t status) noexcept -> myos_status_t {
+    [[nodiscard]] auto fail(status_t status) noexcept -> status_t {
         error_ = status;
         for (auto& entry : entries_) if (entry.request.id && !entry.ready) {
             entry.result = {entry.request.id, status, 0, 0};
@@ -205,7 +205,7 @@ private:
     const uint8_t* payload_;
     uint8_t* writable_;
     std::array<entry, QueueDepth> entries_{};
-    myos_status_t error_{};
+    status_t error_{};
 };
 
 enum class Admission : uint8_t { Ready, Empty, Backpressure, Closed, InvalidPeer };
@@ -255,17 +255,17 @@ public:
     [[nodiscard]] auto request(Ticket ticket) const noexcept -> const Request* {
         return valid(ticket) ? &pending_[ticket.slot].request : nullptr;
     }
-    [[nodiscard]] auto cancel(uint64_t id, Ticket& ticket) noexcept -> myos_status_t {
+    [[nodiscard]] auto cancel(uint64_t id, Ticket& ticket) noexcept -> status_t {
         for (size_t slot = 0; slot < QueueDepth; ++slot) {
             auto& pending = pending_[slot];
             if (pending.active && pending.request.id == id) {
-                if (pending.committed) return MYOS_STATUS_BUSY;
+                if (pending.committed) return STATUS_BUSY;
                 pending.cancelled = true;
                 ticket = {slot, id};
-                return MYOS_STATUS_OK;
+                return STATUS_OK;
             }
         }
-        return MYOS_STATUS_NOT_FOUND;
+        return STATUS_NOT_FOUND;
     }
     // Called at the backend's irreversible boundary, before another control
     // request can run. A committed operation reports its real completion.
@@ -330,9 +330,9 @@ private:
     bool stopping_{};
 };
 
-} // namespace myos::io
+} // namespace sys::io
 
-namespace myos::io {
+namespace sys::io {
 
 // Each endpoint has one control reader and one outstanding control exchange.
 // Data submission never uses this Channel's blocking-operation slot.
@@ -345,13 +345,13 @@ struct ControlMessage final {
     uint64_t size{};
     char data[80]{};
 };
-static_assert(sizeof(ControlMessage) == MYOS_CHANNEL_MAX_WORDS * sizeof(myos_word_t));
+static_assert(sizeof(ControlMessage) == CHANNEL_MAX_WORDS * sizeof(word_t));
 
 struct ControlPacket final {
     ControlMessage message{};
     cap::OwnedCap capabilities[4]{};
     size_t count{};
-    myos_word_t badge{};
+    word_t badge{};
 };
 
 // A pending reply owns transferred capabilities until the Channel accepts
@@ -359,10 +359,10 @@ struct ControlPacket final {
 struct ControlReply final {
     ControlMessage message{};
     cap::OwnedCap capabilities[4]{};
-    myos_word_t rights[4]{};
+    word_t rights[4]{};
     size_t count{};
 
-    auto offer(cap::OwnedCap&& capability, myos_word_t granted) noexcept -> bool {
+    auto offer(cap::OwnedCap&& capability, word_t granted) noexcept -> bool {
         if (!capability || count == 4) return false;
         rights[count] = granted;
         capabilities[count++] = std::move(capability);
@@ -372,41 +372,41 @@ struct ControlReply final {
 
 class ControlPort final : private libk::noncopyable_nonmovable {
 public:
-    [[nodiscard]] auto open(myos_cap_t channel, myos_cap_t events) noexcept -> myos_status_t {
-        const auto bound = channel_bind(channel, events, MYOS_CHANNEL_READABLE);
-        if (bound.status != MYOS_STATUS_OK) return bound.status;
+    [[nodiscard]] auto open(cap_t channel, cap_t events) noexcept -> status_t {
+        const auto bound = channel_bind(channel, events, CHANNEL_READABLE);
+        if (bound.status != STATUS_OK) return bound.status;
         channel_ = channel;
         sequence_ = 0;
         readable_ = bound.value;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] auto send(const ControlMessage& message,
-        const myos_cap_transfer* capabilities = nullptr, size_t count = 0) noexcept -> myos_status_t {
+        const CapXfer* capabilities = nullptr, size_t count = 0) noexcept -> status_t {
         return send_to(channel_, message, capabilities, count);
     }
 
-    [[nodiscard]] static auto send_to(myos_cap_t channel, const ControlMessage& message,
-        const myos_cap_transfer* capabilities = nullptr, size_t count = 0) noexcept -> myos_status_t {
-        if (count > 4) return MYOS_STATUS_BAD_ARGS;
-        auto& wire = *reinterpret_cast<myos_channel_message*>(service::IpcAddress);
+    [[nodiscard]] static auto send_to(cap_t channel, const ControlMessage& message,
+        const CapXfer* capabilities = nullptr, size_t count = 0) noexcept -> status_t {
+        if (count > 4) return STATUS_BAD_ARGS;
+        auto& wire = *reinterpret_cast<ChanMsg*>(service::IpcAddress);
         wire = {};
-        wire.version = MYOS_CHANNEL_VERSION;
-        wire.word_count = MYOS_CHANNEL_MAX_WORDS;
+        wire.version = CHANNEL_VERSION;
+        wire.word_count = CHANNEL_MAX_WORDS;
         wire.cap_count = count;
         service::copy(wire.words, &message, sizeof(message));
         for (size_t index = 0; index < count; ++index) wire.caps[index] = capabilities[index];
         return channel_try_send(channel).status;
     }
 
-    [[nodiscard]] auto receive(ControlPacket& packet) noexcept -> myos_status_t {
+    [[nodiscard]] auto receive(ControlPacket& packet) noexcept -> status_t {
         packet = {};
-        auto& wire = *reinterpret_cast<myos_channel_message*>(service::IpcAddress);
+        auto& wire = *reinterpret_cast<ChanMsg*>(service::IpcAddress);
         wire = {};
-        wire.version = MYOS_CHANNEL_VERSION;
+        wire.version = CHANNEL_VERSION;
         wire.receive_limit = 4;
         const auto received = channel_try_recv(channel_);
-        if (received.status != MYOS_STATUS_OK) return received.status;
+        if (received.status != STATUS_OK) return received.status;
         sequence_ = received.value;
         packet.badge = wire.sender_badge;
         // Adopt every committed capability even if the message is invalid.
@@ -414,24 +414,24 @@ public:
         packet.count = wire.received_count;
         for (size_t index = 0; index < packet.count; ++index)
             packet.capabilities[index] = cap::OwnedCap{{wire.received[index], 0}};
-        if (wire.word_count != MYOS_CHANNEL_MAX_WORDS) return MYOS_STATUS_BAD_ARGS;
+        if (wire.word_count != CHANNEL_MAX_WORDS) return STATUS_BAD_ARGS;
         service::copy(&packet.message, wire.words, sizeof(packet.message));
         if (packet.message.version != QueueVersion || packet.message.size > sizeof(packet.message.data))
-            return MYOS_STATUS_BAD_ARGS;
-        return MYOS_STATUS_OK;
+            return STATUS_BAD_ARGS;
+        return STATUS_OK;
     }
 
     // Call only after draining control/data work. A sequence mismatch or
     // terminal Channel state retains a hint in the caller's Notification.
-    [[nodiscard]] auto arm() noexcept -> myos_status_t {
+    [[nodiscard]] auto arm() noexcept -> status_t {
         const auto result = channel_arm(channel_, readable_, sequence_);
-        if (result.status == MYOS_STATUS_OK) sequence_ = result.value;
+        if (result.status == STATUS_OK) sequence_ = result.value;
         return result.status;
     }
 
 private:
-    myos_cap_t channel_{};
-    myos_word_t readable_{};
+    cap_t channel_{};
+    word_t readable_{};
     uint64_t sequence_{};
 };
 
@@ -440,34 +440,34 @@ private:
 // writable. Revoking that session's export grants precedes buffer reuse.
 class ClientMemory final {
 public:
-    [[nodiscard]] auto map(myos_cap_t vspace, uintptr_t address, ControlPacket& packet,
+    [[nodiscard]] auto map(cap_t vspace, uintptr_t address, ControlPacket& packet,
         bool writable_payload = false) noexcept
-        -> myos_status_t {
-        if (packet.count != 4) return MYOS_STATUS_BAD_ARGS;
+        -> status_t {
+        if (packet.count != 4) return STATUS_BAD_ARGS;
         constexpr size_t sizes[] = {4096, 4096, PayloadSize};
         MappedMemory mappings[3];
         for (size_t index = 0; index < 3; ++index) {
             auto memory = MappedMemory::map(vspace, std::move(packet.capabilities[index]),
                 address + index * 4096, sizes[index],
                 index == 0 || (index == 2 && writable_payload)
-                    ? MYOS_VM_READ | MYOS_VM_WRITE : MYOS_VM_READ);
+                    ? VM_READ | VM_WRITE : VM_READ);
             if (!memory) return memory.error();
             mappings[index] = std::move(memory).value();
         }
         for (size_t index = 0; index < 3; ++index) mappings_[index] = std::move(mappings[index]);
         event_ = std::move(packet.capabilities[3]);
         writable_payload_ = writable_payload;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
+    [[nodiscard]] auto close() noexcept -> status_t {
         for (auto& mapping : mappings_) {
             const auto status = mapping.close();
-            if (status != MYOS_STATUS_OK) return status;
+            if (status != STATUS_OK) return status;
         }
         event_ = {};
         writable_payload_ = false;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] auto client() noexcept -> ClientPage& {
@@ -482,7 +482,7 @@ public:
     [[nodiscard]] auto writable_payload() noexcept -> uint8_t* {
         return writable_payload_ ? reinterpret_cast<uint8_t*>(mappings_[2].address) : nullptr;
     }
-    [[nodiscard]] auto signal() const noexcept -> myos_status_t {
+    [[nodiscard]] auto signal() const noexcept -> status_t {
         return notification_signal(event_.selector()).status;
     }
 
@@ -497,37 +497,37 @@ private:
 // forwarding consumers own their snapshots and use queue() instead.
 class ClientSession final : private libk::noncopyable_nonmovable {
 public:
-    [[nodiscard]] auto adopt(cap::OwnedCap&& channel, myos_cap_t events,
-        myos_cap_t vspace, uintptr_t address, uint64_t& value,
-        bool writable_payload = false) noexcept -> myos_status_t {
-        if (queue_ || channel_ || !channel) return MYOS_STATUS_BAD_ARGS;
+    [[nodiscard]] auto adopt(cap::OwnedCap&& channel, cap_t events,
+        cap_t vspace, uintptr_t address, uint64_t& value,
+        bool writable_payload = false) noexcept -> status_t {
+        if (queue_ || channel_ || !channel) return STATUS_BAD_ARGS;
         channel_ = std::move(channel);
         const auto status = open(channel_.selector(), events, vspace, address,
             value, writable_payload);
-        if (status != MYOS_STATUS_OK) {
+        if (status != STATUS_OK) {
             (void)object_destroy(channel_.selector());
             channel_ = {};
         }
         return status;
     }
-    [[nodiscard]] auto open(myos_cap_t channel, myos_cap_t events,
-        myos_cap_t vspace, uintptr_t address, uint64_t& value,
-        bool writable_payload = false) noexcept -> myos_status_t {
-        if (queue_) return MYOS_STATUS_BAD_ARGS;
+    [[nodiscard]] auto open(cap_t channel, cap_t events,
+        cap_t vspace, uintptr_t address, uint64_t& value,
+        bool writable_payload = false) noexcept -> status_t {
+        if (queue_) return STATUS_BAD_ARGS;
         events_ = events;
         auto status = control_.open(channel, events);
-        if (status != MYOS_STATUS_OK) return status;
-        const myos_cap_transfer event{events, MYOS_RIGHT_SIGNAL, MYOS_CAP_COPY, 0};
+        if (status != STATUS_OK) return status;
+        const CapXfer event{events, RIGHT_SIGNAL, CAP_COPY, 0};
         ControlMessage request{.operation = static_cast<uint64_t>(Control::Open),
             .id = ++next_id_, .value = QueueDepth};
         status = control_.send(request, &event, 1);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         ControlPacket packet;
         status = receive(request, packet);
-        if (status != MYOS_STATUS_OK) return status;
-        if (packet.message.status != MYOS_STATUS_OK) return packet.message.status;
+        if (status != STATUS_OK) return status;
+        if (packet.message.status != STATUS_OK) return packet.message.status;
         status = memory_.map(vspace, address, packet, writable_payload);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         queue_.emplace(memory_.client(), memory_.server());
         requests_.emplace(*queue_, memory_.payload(), memory_.writable_payload());
         value = packet.message.value;
@@ -536,20 +536,20 @@ public:
 
     // A directory capability grants only admission. Replies and data belong
     // to the newly created private channel, so clients never share a reader.
-    [[nodiscard]] auto connect(myos_cap_t directory, myos_cap_t pool, myos_cap_t cspace, myos_cap_t events,
-        myos_cap_t vspace, uintptr_t address, uint64_t& value,
-        bool writable_payload = false) noexcept -> myos_status_t {
-        if (queue_ || channel_) return MYOS_STATUS_BUSY;
-        const auto pair = channel_create(pool, 1, MYOS_CHANNEL_MAX_WORDS, 4, 2);
-        if (pair.status != MYOS_STATUS_OK) return pair.status;
+    [[nodiscard]] auto connect(cap_t directory, cap_t pool, cap_t cspace, cap_t events,
+        cap_t vspace, uintptr_t address, uint64_t& value,
+        bool writable_payload = false) noexcept -> status_t {
+        if (queue_ || channel_) return STATUS_BUSY;
+        const auto pair = channel_create(pool, 1, CHANNEL_MAX_WORDS, 4, 2);
+        if (pair.status != STATUS_OK) return pair.status;
         channel_ = cap::OwnedCap{{pair.value, 0}};
         cap::OwnedCap server{{pair.value2, 0}};
-        constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE | MYOS_RIGHT_DUPLICATE;
-        const auto client_endpoint = channel_mint(channel_.selector(), cspace, 1, rights | MYOS_RIGHT_DESTROY);
+        constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE | RIGHT_DUPLICATE;
+        const auto client_endpoint = channel_mint(channel_.selector(), cspace, 1, rights | RIGHT_DESTROY);
         const auto server_endpoint = channel_mint(server.selector(), cspace, 1, rights);
         cap::OwnedCap client_fixed, server_fixed;
-        if (client_endpoint.status == MYOS_STATUS_OK) client_fixed = cap::OwnedCap{{client_endpoint.value, 0}};
-        if (server_endpoint.status == MYOS_STATUS_OK) server_fixed = cap::OwnedCap{{server_endpoint.value, 0}};
+        if (client_endpoint.status == STATUS_OK) client_fixed = cap::OwnedCap{{client_endpoint.value, 0}};
+        if (server_endpoint.status == STATUS_OK) server_fixed = cap::OwnedCap{{server_endpoint.value, 0}};
         if (!client_fixed || !server_fixed) {
             (void)object_destroy(channel_.selector());
             channel_ = {};
@@ -561,19 +561,19 @@ public:
         auto status = control_.open(channel_.selector(), events);
         const ControlMessage request{.operation = static_cast<uint64_t>(Control::Open),
             .id = ++next_id_, .value = QueueDepth};
-        const myos_cap_transfer transfers[]{
-            {server.selector(), MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_CLOSE, MYOS_CAP_COPY, 0},
-            {events, MYOS_RIGHT_SIGNAL, MYOS_CAP_COPY, 0}};
-        if (status == MYOS_STATUS_OK) status = ControlPort::send_to(directory, request, transfers, 2);
+        const CapXfer transfers[]{
+            {server.selector(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0},
+            {events, RIGHT_SIGNAL, CAP_COPY, 0}};
+        if (status == STATUS_OK) status = ControlPort::send_to(directory, request, transfers, 2);
         ControlPacket packet;
-        if (status == MYOS_STATUS_OK) status = receive(request, packet);
-        if (status == MYOS_STATUS_OK) status = packet.message.status;
-        if (status == MYOS_STATUS_OK) status = memory_.map(vspace, address, packet, writable_payload);
-        if (status != MYOS_STATUS_OK) {
+        if (status == STATUS_OK) status = receive(request, packet);
+        if (status == STATUS_OK) status = packet.message.status;
+        if (status == STATUS_OK) status = memory_.map(vspace, address, packet, writable_payload);
+        if (status != STATUS_OK) {
             (void)object_destroy(channel_.selector());
             channel_ = {};
             const auto closed = memory_.close();
-            if (closed != MYOS_STATUS_OK) cap::SyscallBackend::ownership_fault(closed);
+            if (closed != STATUS_OK) cap::SyscallBackend::ownership_fault(closed);
             return status;
         }
         queue_.emplace(memory_.client(), memory_.server());
@@ -582,88 +582,88 @@ public:
         return memory_.signal();
     }
 
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
-        if (!queue_ || !channel_) return MYOS_STATUS_BAD_ARGS;
+    [[nodiscard]] auto close() noexcept -> status_t {
+        if (!queue_ || !channel_) return STATUS_BAD_ARGS;
         ControlMessage request{.operation = static_cast<uint64_t>(Control::Close)};
         const auto status = requests_->error() ? requests_->error() : exchange(request);
         requests_.reset();
         queue_.reset();
         const auto unmapped = memory_.close();
-        if (unmapped != MYOS_STATUS_OK) cap::SyscallBackend::ownership_fault(unmapped);
+        if (unmapped != STATUS_OK) cap::SyscallBackend::ownership_fault(unmapped);
         const auto destroyed = object_destroy(channel_.selector()).status;
-        if (destroyed != MYOS_STATUS_OK) cap::SyscallBackend::ownership_fault(destroyed);
+        if (destroyed != STATUS_OK) cap::SyscallBackend::ownership_fault(destroyed);
         channel_ = {};
         return status;
     }
 
     [[nodiscard]] auto exchange(ControlMessage& message, ControlPacket& packet) noexcept
-        -> myos_status_t {
-        if (!queue_ || next_id_ == UINT64_MAX) return MYOS_STATUS_BAD_ARGS;
+        -> status_t {
+        if (!queue_ || next_id_ == UINT64_MAX) return STATUS_BAD_ARGS;
         message.id = ++next_id_;
         auto status = control_.send(message);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         status = receive(message, packet);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         message = packet.message;
         status = memory_.signal();
-        return status == MYOS_STATUS_OK ? message.status : status;
+        return status == STATUS_OK ? message.status : status;
     }
 
-    [[nodiscard]] auto exchange(ControlMessage& message) noexcept -> myos_status_t {
+    [[nodiscard]] auto exchange(ControlMessage& message) noexcept -> status_t {
         ControlPacket packet;
         const auto status = exchange(message, packet);
-        return packet.count == 0 ? status : MYOS_STATUS_PEER_FAULT;
+        return packet.count == 0 ? status : STATUS_PEER_FAULT;
     }
 
     [[nodiscard]] auto queue() noexcept -> ClientQueue& { return *queue_; }
     [[nodiscard]] auto requests() noexcept -> io::requests& { return *requests_; }
-    [[nodiscard]] auto submit(Request& request, void* data = nullptr, bool exact = false) noexcept -> myos_status_t {
+    [[nodiscard]] auto submit(Request& request, void* data = nullptr, bool exact = false) noexcept -> status_t {
         const auto status = requests_->submit(request, data, exact);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         const auto published = flush();
-        if (published != MYOS_STATUS_OK) (void)requests_->fail(published);
-        return MYOS_STATUS_OK;
+        if (published != STATUS_OK) (void)requests_->fail(published);
+        return STATUS_OK;
     }
-    [[nodiscard]] auto completion(Completion& result, uint64_t id = 0) noexcept -> myos_status_t {
+    [[nodiscard]] auto completion(Completion& result, uint64_t id = 0) noexcept -> status_t {
         requests_->poll();
         if (!requests_->error()) {
             const auto status = flush();
-            if (status != MYOS_STATUS_OK) (void)requests_->fail(status);
+            if (status != STATUS_OK) (void)requests_->fail(status);
         }
         return requests_->take(result, id);
     }
-    [[nodiscard]] auto wait(Completion& result, uint64_t id = 0, uint64_t deadline = 0) noexcept -> myos_status_t {
-        if (id && !requests_->contains(id)) return MYOS_STATUS_NOT_FOUND;
+    [[nodiscard]] auto wait(Completion& result, uint64_t id = 0, uint64_t deadline = 0) noexcept -> status_t {
+        if (id && !requests_->contains(id)) return STATUS_NOT_FOUND;
         for (;;) {
             const auto status = completion(result, id);
-            if (status != MYOS_STATUS_WOULD_BLOCK || !requests_->next()) return status;
+            if (status != STATUS_WOULD_BLOCK || !requests_->next()) return status;
             auto waiting = arm();
-            if (waiting == MYOS_STATUS_OK) waiting = notification_wait(events_, deadline).status;
-            if (waiting != MYOS_STATUS_OK) (void)requests_->fail(waiting);
+            if (waiting == STATUS_OK) waiting = notification_wait(events_, deadline).status;
+            if (waiting != STATUS_OK) (void)requests_->fail(waiting);
         }
     }
     [[nodiscard]] auto writable_payload() noexcept -> uint8_t* { return memory_.writable_payload(); }
     [[nodiscard]] auto payload() const noexcept -> const uint8_t* { return memory_.payload(); }
-    [[nodiscard]] auto flush() noexcept -> myos_status_t {
+    [[nodiscard]] auto flush() noexcept -> status_t {
         const bool submitted = queue_->publish();
         const bool consumed = queue_->release();
-        return submitted || consumed ? memory_.signal() : MYOS_STATUS_OK;
+        return submitted || consumed ? memory_.signal() : STATUS_OK;
     }
-    [[nodiscard]] auto arm() noexcept -> myos_status_t { return control_.arm(); }
+    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm(); }
 
 private:
     [[nodiscard]] auto receive(const ControlMessage& request, ControlPacket& packet) noexcept
-        -> myos_status_t {
+        -> status_t {
         for (;;) {
             auto status = control_.receive(packet);
-            if (status == MYOS_STATUS_OK)
+            if (status == STATUS_OK)
                 return packet.message.id == request.id && packet.message.operation == request.operation
-                    ? MYOS_STATUS_OK : MYOS_STATUS_PEER_FAULT;
-            if (status != MYOS_STATUS_WOULD_BLOCK && status != MYOS_STATUS_BUSY) return status;
+                    ? STATUS_OK : STATUS_PEER_FAULT;
+            if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) return status;
             status = control_.arm();
-            if (status != MYOS_STATUS_OK) return status;
+            if (status != STATUS_OK) return status;
             status = notification_wait(events_).status;
-            if (status != MYOS_STATUS_OK) return status;
+            if (status != STATUS_OK) return status;
         }
     }
 
@@ -672,7 +672,7 @@ private:
     ClientMemory memory_;
     std::optional<ClientQueue> queue_;
     std::optional<io::requests> requests_;
-    myos_cap_t events_{};
+    cap_t events_{};
     uint64_t next_id_{};
 };
 
@@ -682,7 +682,7 @@ struct read final {
     uint8_t* output{};
     size_t size{}, done{};
     void* context{};
-    void (*complete)(read&, myos_status_t) noexcept{};
+    void (*complete)(read&, status_t) noexcept{};
     bool (*cancelled)(const read&) noexcept{};
     bool active{}, submitted{};
 };
@@ -705,7 +705,7 @@ class reader final {
     static auto cancelled(const io::read& read) noexcept -> bool {
         return read.cancelled && read.cancelled(read);
     }
-    static void finish(io::read& read, myos_status_t status) noexcept {
+    static void finish(io::read& read, status_t status) noexcept {
         read.active = read.submitted = false;
         read.complete(read, status);
     }
@@ -714,56 +714,56 @@ class reader final {
         slot = {};
         auto& read = *flight.read;
         read.submitted = false;
-        if (cancelled(read)) finish(read, MYOS_STATUS_CANCELED);
-        else if (result.status != MYOS_STATUS_OK) finish(read, result.status);
-        else if (result.bytes != flight.extent.size) finish(read, MYOS_STATUS_PEER_FAULT);
+        if (cancelled(read)) finish(read, STATUS_CANCELED);
+        else if (result.status != STATUS_OK) finish(read, result.status);
+        else if (result.bytes != flight.extent.size) finish(read, STATUS_PEER_FAULT);
         else {
             service::copy(read.output + read.done,
                 backend_.payload() + flight.buffer + flight.extent.skip, flight.extent.bytes);
             read.done += flight.extent.bytes;
-            if (read.done == read.size) finish(read, MYOS_STATUS_OK);
+            if (read.done == read.size) finish(read, STATUS_OK);
         }
     }
 
 public:
     reader(Backend& backend, Mapper map) noexcept : backend_(backend), map_(map) {}
 
-    auto poll() noexcept -> std::expected<bool, myos_status_t> {
+    auto poll() noexcept -> std::expected<bool, status_t> {
         bool progress{};
         for (auto& slot : flights_) if (slot.read) {
             Completion result{};
             const auto status = backend_.completion(result, slot.id);
-            if (status == MYOS_STATUS_WOULD_BLOCK) continue;
-            if (status != MYOS_STATUS_OK) return std::unexpected(status);
+            if (status == STATUS_WOULD_BLOCK) continue;
+            if (status != STATUS_OK) return std::unexpected(status);
             complete(slot, result);
             progress = true;
         }
         return progress;
     }
-    auto wait() noexcept -> myos_status_t {
+    auto wait() noexcept -> status_t {
         for (auto& slot : flights_) if (slot.read) {
             Completion result{};
             const auto status = backend_.wait(result, slot.id);
-            if (status == MYOS_STATUS_OK) complete(slot, result);
+            if (status == STATUS_OK) complete(slot, result);
             return status;
         }
-        return MYOS_STATUS_WOULD_BLOCK;
+        return STATUS_WOULD_BLOCK;
     }
-    auto submit(io::read& read) noexcept -> std::expected<bool, myos_status_t> {
+    auto submit(io::read& read) noexcept -> std::expected<bool, status_t> {
         if (!read.active || read.submitted) return false;
-        if (cancelled(read)) { finish(read, MYOS_STATUS_CANCELED); return true; }
-        if (read.done == read.size) { finish(read, MYOS_STATUS_OK); return true; }
+        if (cancelled(read)) { finish(read, STATUS_CANCELED); return true; }
+        if (read.done == read.size) { finish(read, STATUS_OK); return true; }
         for (auto& slot : flights_) if (!slot.read) {
             const auto extent = map_(read);
             if (!extent) { finish(read, extent.error()); return true; }
             if (!extent->bytes || extent->bytes > read.size - read.done
                 || extent->skip > extent->size || extent->bytes > extent->size - extent->skip)
-                return std::unexpected(MYOS_STATUS_INTERNAL);
+                return std::unexpected(STATUS_INTERNAL);
             Request request{.operation = static_cast<uint64_t>(Operation::Read),
                 .offset = extent->offset, .length = extent->size};
             const auto status = backend_.submit(request);
-            if (status == MYOS_STATUS_BUSY) return false;
-            if (status != MYOS_STATUS_OK) { finish(read, status); return true; }
+            if (status == STATUS_BUSY) return false;
+            if (status != STATUS_OK) { finish(read, status); return true; }
             read.submitted = true;
             slot = {&read, request.id, request.buffer_offset, *extent};
             return true;
@@ -775,4 +775,4 @@ public:
 // One lifetime per endpoint. Backend owners stop admission on closing(), end
 // all backend access, then pass close_ready to flush(). The common transport
 // owns page authority, control reply credit and terminal queue publication.
-} // namespace myos::io
+} // namespace sys::io

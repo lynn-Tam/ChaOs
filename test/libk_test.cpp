@@ -395,7 +395,6 @@ bool test_atomic_scalar_and_compare_exchange_contract(
         && phase.load<libk::MemoryOrder::Relaxed>() == AtomicPhase::Empty;
 }
 
-/*luna change: test the shared saturating atomic increment contract, reason: normal epoch progress and max stability are the only focused invariants needed here*/
 bool test_atomic_inc_sat_contract(const TestContext&) noexcept {
     libk::Atomic<uint64_t> value{};
     libk::atomic_inc_sat(value);
@@ -511,7 +510,6 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         "libk",
         "atomic scalar operations preserve compare-exchange contract",
         test_atomic_scalar_and_compare_exchange_contract);
-    /*luna change: register the saturating atomic increment focused test, reason: keep the generic no-wrap contract executable without concurrency pressure*/
     (void)registry.add(
         "libk",
         "atomic increment saturates at the unsigned maximum",

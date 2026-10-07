@@ -2,7 +2,7 @@
 #include <test/test.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <sync.hpp>
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 
 namespace {
 

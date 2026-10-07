@@ -1,3 +1,4 @@
+#include <cpu.hpp>
 #include <expected>
 #include "pci.hpp"
 #include "config.hpp"
@@ -15,16 +16,16 @@ constexpr usize WindowSize = 0x10'0000;
 
 template<typename T>
 auto read(usize address) noexcept -> T {
-    asm volatile("fence iorw, iorw" ::: "memory");
+    arch::io_fence();
     const T value = *reinterpret_cast<volatile const T*>(address);
-    asm volatile("fence iorw, iorw" ::: "memory");
+    arch::io_fence();
     return value;
 }
 template<typename T>
 void write(usize address, T value) noexcept {
-    asm volatile("fence iorw, iorw" ::: "memory");
+    arch::io_fence();
     *reinterpret_cast<volatile T*>(address) = value;
-    asm volatile("fence iorw, iorw" ::: "memory");
+    arch::io_fence();
 }
 auto config(u16 requester) noexcept -> usize {
     return Alias + VirtPciEcam + (usize{requester} << 12);

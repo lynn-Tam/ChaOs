@@ -5,7 +5,7 @@
 #include <libk/assert.hpp>
 #include <libk/sync/atomic.hpp>
 #include <cpu/types.hpp>
-#include <arch/diagnostics.hpp>
+#include <cpu.hpp>
 #include <trap.hpp>
 
 class CpuRegistry;
@@ -16,7 +16,7 @@ struct PanicSlot final {
     CpuHwId hardware{};
     const char* reason{};
     libk::AssertInfo site{};
-    arch::CallSiteSnapshot call_site{};
+    arch::StackRegs stack{};
     arch::TrapRegs trap{};
     CpuRegistry* registry{};
     usize current_thread{};

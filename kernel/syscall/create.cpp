@@ -32,18 +32,18 @@
 
 namespace syscall {
 
-static_assert(MYOS_RESOURCE_THREAD == (u64{1} << static_cast<u16>(object::ObjectKind::Thread)));
-static_assert(MYOS_RESOURCE_SCHED_CONTEXT == (u64{1} << static_cast<u16>(object::ObjectKind::Sc)));
-static_assert(MYOS_RESOURCE_CSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::CSpace)));
-static_assert(MYOS_RESOURCE_MEMORY == (u64{1} << static_cast<u16>(object::ObjectKind::Mem)));
-static_assert(MYOS_RESOURCE_VSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::VSpace)));
-static_assert(MYOS_RESOURCE_POOL == (u64{1} << static_cast<u16>(object::ObjectKind::group)));
-static_assert(MYOS_RESOURCE_NOTIFICATION == (u64{1} << static_cast<u16>(object::ObjectKind::Notification)));
-static_assert(MYOS_RESOURCE_ENDPOINT == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
-static_assert(MYOS_RESOURCE_CHANNEL == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
-static_assert(MYOS_RESOURCE_PAGER == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
-static_assert(MYOS_RESOURCE_IRQ == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
-static_assert(MYOS_RESOURCE_IO_SPACE == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
+static_assert(RESOURCE_THREAD == (u64{1} << static_cast<u16>(object::ObjectKind::Thread)));
+static_assert(RESOURCE_SCHED_CONTEXT == (u64{1} << static_cast<u16>(object::ObjectKind::Sc)));
+static_assert(RESOURCE_CSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::CSpace)));
+static_assert(RESOURCE_MEMORY == (u64{1} << static_cast<u16>(object::ObjectKind::Mem)));
+static_assert(RESOURCE_VSPACE == (u64{1} << static_cast<u16>(object::ObjectKind::VSpace)));
+static_assert(RESOURCE_POOL == (u64{1} << static_cast<u16>(object::ObjectKind::group)));
+static_assert(RESOURCE_NOTIFICATION == (u64{1} << static_cast<u16>(object::ObjectKind::Notification)));
+static_assert(RESOURCE_ENDPOINT == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
+static_assert(RESOURCE_CHANNEL == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
+static_assert(RESOURCE_PAGER == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
+static_assert(RESOURCE_IRQ == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
+static_assert(RESOURCE_IO_SPACE == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
 
 using object::ObjectKind;
 
@@ -83,21 +83,21 @@ using object::ObjectKind;
     return pool->begin(std::move(reference).value());
 }
 
-[[nodiscard]] static auto pool_error(resource::errc error) noexcept -> myos_status_t {
+[[nodiscard]] static auto pool_error(resource::errc error) noexcept -> status_t {
     switch (error) {
     case resource::errc::invalid:
-        return MYOS_STATUS_INVALID_CAP;
+        return STATUS_INVALID_CAP;
     case resource::errc::closed:
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     case resource::errc::exhausted:
-        return MYOS_STATUS_NO_MEMORY;
+        return STATUS_NO_MEMORY;
     }
-    return MYOS_STATUS_INTERNAL;
+    return STATUS_INTERNAL;
 }
 
 template <class T, usize N = 1>
 static auto begin_create(Call& inv, cap::Resolved<object::group>& pool, resource::budget limit) noexcept
-    -> std::expected<object::group::Txn, myos_status_t> {
+    -> std::expected<object::group::Txn, status_t> {
     auto& kernel = *inv.cpu.runtime().kernel;
     const auto quota = pool_quota(pool);
     std::optional<resource::budget> publication = object::group::allocation_charge();
@@ -105,7 +105,7 @@ static auto begin_create(Call& inv, cap::Resolved<object::group>& pool, resource
         publication = add_budget(*publication, kernel.grants().node_charge());
     if (!quota || !(quota->object_kinds & kind_bit(object::kind<T>)) || !quota->budget.contains(limit) ||
         !publication || !quota->budget.contains(*publication))
-        return std::unexpected(MYOS_STATUS_DENIED);
+        return std::unexpected(STATUS_DENIED);
     auto txn = begin(pool);
     if (!txn) return std::unexpected(pool_error(txn.error()));
     return std::move(*txn);
@@ -116,16 +116,16 @@ static auto publication(std::expected<std::array<cap::Handle, N>, object::group:
     -> Result {
     if (!handles)
         return returned(std::visit(
-            [](auto error) -> myos_status_t {
+            [](auto error) -> status_t {
                 if constexpr (std::is_same_v<decltype(error), resource::errc>)
                     return pool_error(error);
                 else if constexpr (std::is_same_v<decltype(error), cap::CSpaceError>)
                     return cap_status(error);
                 else
-                    return MYOS_STATUS_NO_MEMORY;
+                    return STATUS_NO_MEMORY;
             },
             handles.error()));
-    return Result{MYOS_STATUS_OK, (*handles)[0].raw(), Disposition::Return,
+    return Result{STATUS_OK, (*handles)[0].raw(), Disposition::Return,
                   N > 1 ? (*handles)[N - 1].raw() : 0};
 }
 
@@ -153,62 +153,62 @@ static auto publication(std::expected<std::array<cap::Handle, N>, object::group:
 
 template<class Pages>
 [[nodiscard]] static auto hold_ram(mm::Pmm& pmm, mm::Mem& mem, mm::ObjectRange range) noexcept
-    -> std::expected<Pages, myos_status_t> {
+    -> std::expected<Pages, status_t> {
     Pages pages;
     for (usize i = 0; i < range.size(); ++i) {
         auto page = mem.materialize(range.base() + i);
         if (!page) return std::unexpected(mem_status(page.error()));
-        if (!pmm.is_ram(page->page())) return std::unexpected(MYOS_STATUS_DENIED);
-        if (!pages.try_push_back(std::move(*page))) return std::unexpected(MYOS_STATUS_NO_MEMORY);
+        if (!pmm.is_ram(page->page())) return std::unexpected(STATUS_DENIED);
+        if (!pages.try_push_back(std::move(*page))) return std::unexpected(STATUS_NO_MEMORY);
     }
     return pages;
 }
 
-[[nodiscard]] static auto ipc_error(ipc::BufferError error) noexcept -> myos_status_t {
+[[nodiscard]] static auto ipc_error(ipc::BufferError error) noexcept -> status_t {
     switch (error) {
     case ipc::BufferError::Invalid:
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     case ipc::BufferError::Unavailable:
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     case ipc::BufferError::NoMemory:
-        return MYOS_STATUS_NO_MEMORY;
+        return STATUS_NO_MEMORY;
     }
-    return MYOS_STATUS_INTERNAL;
+    return STATUS_INTERNAL;
 }
 
 [[nodiscard]] static auto bind_ipc(KernelState& kernel, cap::Resolved<mm::VSpace>& vspace,
                                    cap::Resolved<mm::Mem>& memory,
-                                   const myos_ipc_binding& desc) noexcept
-    -> std::expected<ipc::Buffer, myos_status_t> {
-    if (desc.pages == 0 || desc.pages > MYOS_IPC_BUFFER_MAX_PAGES) {
-        return std::unexpected(MYOS_STATUS_BAD_ARGS);
+                                   const IpcBinding& desc) noexcept
+    -> std::expected<ipc::Buffer, status_t> {
+    if (desc.pages == 0 || desc.pages > IPC_BUFFER_MAX_PAGES) {
+        return std::unexpected(STATUS_BAD_ARGS);
     }
     const auto bytes = libk::checked_multiply(desc.pages, mm::page_size);
     const mm::Virt address{desc.address};
     if (!bytes || !address.is_aligned(mm::page_size)) {
-        return std::unexpected(MYOS_STATUS_BAD_ARGS);
+        return std::unexpected(STATUS_BAD_ARGS);
     }
     const auto rw = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
     const mm::ObjectRange object{desc.page, desc.pages};
     if (!mem_permits(memory, object, rw)) {
-        return std::unexpected(MYOS_STATUS_DENIED);
+        return std::unexpected(STATUS_DENIED);
     }
     auto reference = memory.reference();
     if (!reference) {
-        return std::unexpected(MYOS_STATUS_BUSY);
+        return std::unexpected(STATUS_BUSY);
     }
     auto buffer = ipc::Buffer::bind(kernel.pmm(), vspace.object(), std::move(reference).value(),
                                     memory.object(), object, mm::VRange{address, *bytes});
-    return buffer ? std::expected<ipc::Buffer, myos_status_t>{(std::move(buffer).value())}
+    return buffer ? std::expected<ipc::Buffer, status_t>{(std::move(buffer).value())}
                   : std::unexpected(ipc_error(buffer.error()));
 }
 
 [[nodiscard]] static auto prepare_ipc(Call& inv, KernelState& kernel, cap::Resolved<mm::VSpace>& vspace,
-                                      const myos_ipc_binding& desc) noexcept
-    -> std::expected<std::optional<ipc::Buffer>, myos_status_t> {
+                                      const IpcBinding& desc) noexcept
+    -> std::expected<std::optional<ipc::Buffer>, status_t> {
     if (desc.pages == 0) {
         if (desc.memory != 0 || desc.page != 0 || desc.address != 0) {
-            return std::unexpected(MYOS_STATUS_BAD_ARGS);
+            return std::unexpected(STATUS_BAD_ARGS);
         }
         return (std::optional<ipc::Buffer>{std::nullopt});
     }
@@ -226,23 +226,23 @@ template<class Pages>
 [[gnu::noinline]] [[nodiscard]] static auto
 add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<object::group>& pool,
                   cap::Resolved<mm::VSpace>& vspace, cap::Resolved<mm::Mem>& stack,
-                  cap::Resolved<mm::Mem>* ipc_memory, const myos_endpoint_desc& desc, usize stack_bytes,
-                  usize index) noexcept -> myos_status_t {
+                  cap::Resolved<mm::Mem>* ipc_memory, const EpDesc& desc, usize stack_bytes,
+                  usize index) noexcept -> status_t {
     auto capacity = reserve(pool, resource::budget{.memory = mm::Stack::StackBytes});
     auto kernel_stack = mm::Stack::create(kernel.kernel_vspace());
     const auto displacement = libk::checked_multiply(index, desc.stack_stride);
     const auto object_page = libk::checked_multiply(index, desc.stack_pages);
     if (!capacity || !kernel_stack || !displacement || !object_page) {
-        return !capacity ? pool_error(capacity.error()) : MYOS_STATUS_NO_MEMORY;
+        return !capacity ? pool_error(capacity.error()) : STATUS_NO_MEMORY;
     }
     const auto virtual_base = mm::Virt{desc.stack_address}.checked_add(*displacement);
     const auto first_page = libk::checked_add(desc.stack_page, *object_page);
     if (!virtual_base || !first_page) {
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     }
     auto stack_ref = stack.reference();
     if (!stack_ref) {
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     }
     const auto rw = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
     auto user_stack = vspace->bind_view(mm::ViewReq{
@@ -258,7 +258,7 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
     if (!resident) return resident.error();
     const auto top = virtual_base->checked_add(stack_bytes);
     if (!top) {
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     }
     std::optional<ipc::Buffer> ipc{};
     if (ipc_memory != nullptr) {
@@ -269,9 +269,9 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
         const auto first_ipc_page =
             ipc_page ? libk::checked_add(desc.ipc.page, *ipc_page) : std::nullopt;
         if (!ipc_address || !first_ipc_page) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        myos_ipc_binding binding = desc.ipc;
+        IpcBinding binding = desc.ipc;
         binding.address = ipc_address->raw();
         binding.page = *first_ipc_page;
         auto made = bind_ipc(kernel, vspace, *ipc_memory, binding);
@@ -283,13 +283,13 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
     auto added =
         endpoint.add_activation(std::move(capacity).value().commit(), std::move(kernel_stack).value(),
                                 std::move(user_stack).value(), std::move(ipc), std::move(*resident), *top);
-    return added ? MYOS_STATUS_OK : MYOS_STATUS_BAD_ARGS;
+    return added ? STATUS_OK : STATUS_BAD_ARGS;
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
 finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& pool,
                 cap::Resolved<mm::VSpace>& vspace, cap::Resolved<mm::Mem>& stack,
-                cap::Resolved<mm::Mem>* ipc_memory, const myos_endpoint_desc& desc, usize stack_bytes,
+                cap::Resolved<mm::Mem>* ipc_memory, const EpDesc& desc, usize stack_bytes,
                 Env&& service, mm::View&& code_view, ipc::CodePages&& resident_code) noexcept -> Result {
     const auto stack_capacity = libk::checked_multiply(desc.activation_count, mm::Stack::StackBytes);
     const auto call_capacity = libk::checked_add(desc.activation_count, desc.queue_capacity);
@@ -304,12 +304,12 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
                                   : std::nullopt;
     const auto stack_top = mm::Virt{desc.stack_address}.checked_add(stack_bytes);
     if (!total_charge || !stack_top) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const auto budget_floor = kernel.clock().duration_from_nanoseconds(desc.budget_floor_ns);
     const auto urgency_ceiling = sched::Urgency::make(desc.urgency_ceiling);
     if (!budget_floor || !urgency_ceiling) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     ipc::EndpointConfig config{
         .entry =
@@ -329,7 +329,7 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel.pool<ipc::Endpoint>(), std::move(*fee), kernel.pmm(), std::move(service),
                             std::move(code_view), std::move(resident_code), config);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Call,
@@ -337,39 +337,39 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
     const cap::EpLimit lim{
         .badge = 0,
         .fixed = 0,
-        .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
+        .cap_limit = ENDPOINT_MAX_CAPS,
     };
     const auto caps = std::array<cap::View, 1>{cap::View{rights, lim}};
-    if (!txn->root(kernel.grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel.grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     for (usize index = 0; index < desc.activation_count; ++index) {
-        const myos_status_t added =
+        const status_t added =
             add_endpoint_slot(obj, kernel, pool, vspace, stack, ipc_memory, desc, stack_bytes, index);
-        if (added != MYOS_STATUS_OK) {
+        if (added != STATUS_OK) {
             return returned(added);
         }
     }
     for (usize index = 0; index < *call_capacity; ++index) {
         if (!obj.add_call()) {
-            return returned(MYOS_STATUS_NO_MEMORY);
+            return returned(STATUS_NO_MEMORY);
         }
     }
-    if (!obj.open()) return returned(MYOS_STATUS_BAD_ARGS);
+    if (!obj.open()) return returned(STATUS_BAD_ARGS);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
 publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& pool,
                  cap::Resolved<mm::VSpace>& vspace, cap::Resolved<cap::CSpace>& cspace,
-                 const myos_endpoint_desc& desc) noexcept -> Result {
-    if (desc.version != MYOS_ENDPOINT_VERSION || desc.flags != MYOS_ENDPOINT_FLAGS_NONE ||
-        desc.activation_count == 0 || desc.activation_count > MYOS_ENDPOINT_MAX_ACTIVATIONS ||
-        desc.queue_capacity > MYOS_ENDPOINT_MAX_CALLS - desc.activation_count ||
-        desc.code_pages == 0 || desc.code_pages > MYOS_ENDPOINT_MAX_CODE_PAGES ||
-        desc.stack_pages == 0 || desc.stack_pages > MYOS_ENDPOINT_MAX_STACK_PAGES ||
-        desc.max_depth == 0 || desc.max_depth > MYOS_ENDPOINT_MAX_DEPTH ||
+                 const EpDesc& desc) noexcept -> Result {
+    if (desc.version != ENDPOINT_VERSION || desc.flags != ENDPOINT_FLAGS_NONE ||
+        desc.activation_count == 0 || desc.activation_count > ENDPOINT_MAX_ACTIVATIONS ||
+        desc.queue_capacity > ENDPOINT_MAX_CALLS - desc.activation_count ||
+        desc.code_pages == 0 || desc.code_pages > ENDPOINT_MAX_CODE_PAGES ||
+        desc.stack_pages == 0 || desc.stack_pages > ENDPOINT_MAX_STACK_PAGES ||
+        desc.max_depth == 0 || desc.max_depth > ENDPOINT_MAX_DEPTH ||
         desc.urgency_ceiling >= sched::Urgency::level_count ||
         desc.stack_stride % mm::page_size != 0) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const auto code_bytes = libk::checked_multiply(desc.code_pages, mm::page_size);
     const auto stack_bytes = libk::checked_multiply(desc.stack_pages, mm::page_size);
@@ -388,13 +388,13 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
     const auto ipc_end =
         has_ipc && ipc_span && ipc_bytes ? libk::checked_add(*ipc_span, *ipc_bytes) : std::optional<usize>{};
     if (!code_bytes || !stack_bytes || !last_end || desc.stack_stride < *stack_bytes) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     if ((!has_ipc && !empty_ipc) ||
-        (has_ipc && (desc.ipc.memory == 0 || desc.ipc.pages > MYOS_IPC_BUFFER_MAX_PAGES ||
+        (has_ipc && (desc.ipc.memory == 0 || desc.ipc.pages > IPC_BUFFER_MAX_PAGES ||
                      !ipc_bytes || !ipc_span || !ipc_end || desc.ipc_stride < *ipc_bytes ||
                      desc.ipc_stride % mm::page_size != 0))) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const mm::Virt code_base{desc.code_address};
     const mm::Virt stack_base{desc.stack_address};
@@ -407,7 +407,7 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
         (has_ipc && (!ipc_base.is_aligned(mm::page_size) || !ipc_extent.valid() || ipc_extent.empty() ||
                      ipc_extent.intersects(code_range) || ipc_extent.intersects(stack_extent))) ||
         !code_range.contains(mm::Virt{desc.entry})) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
 
     auto code =
@@ -439,12 +439,12 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
         (has_ipc &&
          (!total_ipc_pages ||
           !mem_permits(*ipc_memory, mm::ObjectRange{desc.ipc.page, *total_ipc_pages}, rw)))) {
-        return returned(MYOS_STATUS_DENIED);
+        return returned(STATUS_DENIED);
     }
 
     auto code_ref = code.value().reference();
     if (!code_ref) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
     auto code_view = vspace->bind_view(mm::ViewReq{
         .memory = std::move(code_ref).value(),
@@ -461,11 +461,11 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
     auto vspace_ref = vspace.reference();
     auto cspace_ref = cspace.reference();
     if (!vspace_ref || !cspace_ref) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
     auto service = Env::user(std::move(vspace_ref).value(), std::move(cspace_ref).value());
     if (!service) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
 
     return finish_endpoint(inv, kernel, pool, vspace, stack.value(), ipc_memory ? &*ipc_memory : nullptr,
@@ -486,25 +486,25 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
         .max_caps = inv.trap.arg(3),
         .relation_capacity = inv.trap.arg(4),
     };
-    if (config.queue_capacity == 0 || config.queue_capacity > MYOS_CHANNEL_MAX_QUEUE ||
-        config.max_words == 0 || config.max_words > MYOS_CHANNEL_MAX_WORDS ||
-        config.max_caps > MYOS_CHANNEL_MAX_CAPS || config.relation_capacity == 0 ||
-        config.relation_capacity > MYOS_CHANNEL_MAX_RELATIONS) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+    if (config.queue_capacity == 0 || config.queue_capacity > CHANNEL_MAX_QUEUE ||
+        config.max_words == 0 || config.max_words > CHANNEL_MAX_WORDS ||
+        config.max_caps > CHANNEL_MAX_CAPS || config.relation_capacity == 0 ||
+        config.relation_capacity > CHANNEL_MAX_RELATIONS) {
+        return returned(STATUS_BAD_ARGS);
     }
     const auto bytes = ipc::Channel::storage_bytes(config);
     const auto cost =
         bytes ? add_budget(object::pool<ipc::Channel>::slot_charge(), resource::budget{.memory = *bytes})
               : std::nullopt;
-    if (!cost) return returned(MYOS_STATUS_BAD_ARGS);
+    if (!cost) return returned(STATUS_BAD_ARGS);
     auto txn = begin_create<ipc::Channel, 2>(inv, pool.value(), *cost);
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), *cost);
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<ipc::Channel>(), std::move(*fee), kernel->pmm(), config);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
-    if (!obj.open()) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!obj.open()) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Send,
                         cap::Right::Receive, cap::Right::Close, cap::Right::Destroy, cap::Right::Revoke);
@@ -513,7 +513,7 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     };
     const auto [ceiling, caps] = std::pair{view(cap::ChannelSide::Any),
                                            std::array{view(cap::ChannelSide::A), view(cap::ChannelSide::B)}};
-    if (!txn->root(kernel->grants(), ceiling)) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), ceiling)) return returned(STATUS_NO_MEMORY);
     auto handles = txn->publish(inv.cspace, caps, [&](cap::GrantRef& grant, usize i) {
         return bool(obj.bind_side_root(grant, i == 0 ? cap::ChannelSide::A : cap::ChannelSide::B));
     });
@@ -530,13 +530,13 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv)
     auto fee = reserve(pool.value(), object::pool<Pager>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<Pager>(), std::move(*fee));
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Attach,
                         cap::Right::Serve, cap::Right::Supply, cap::Right::Fail, cap::Right::WritebackAck,
                         cap::Right::Close, cap::Right::Destroy, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -552,7 +552,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto endpoint_create(Call& i
         const cap::CSpaceError error = !pool ? pool.error() : !vspace ? vspace.error() : cspace.error();
         return returned(cap_status(error));
     }
-    auto snapshot = read_desc<myos_endpoint_desc>(inv, handle_of(trap.arg(3)), trap.arg(4));
+    auto snapshot = read_desc<EpDesc>(inv, handle_of(trap.arg(3)), trap.arg(4));
     return snapshot ? publish_endpoint(inv, *kernel, pool.value(), vspace.value(), cspace.value(),
                                        snapshot.value())
                     : returned(snapshot.error());
@@ -570,11 +570,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(C
     const u64 kinds = trap.arg(3);
     const auto parent = pool_quota(pool.value());
     if (!parent || !parent->budget.contains(limit) || (kinds & ~parent->object_kinds) != 0 || kinds == 0) {
-        return returned(MYOS_STATUS_DENIED);
+        return returned(STATUS_DENIED);
     }
     const auto charge = add_budget(object::pool<object::group>::slot_charge(), limit);
     if (!charge) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Create,
@@ -584,10 +584,10 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(C
     auto fee = reserve(pool.value(), *charge);
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<object::group>(), std::move(*fee), kernel->pmm(), limit);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     const cap::Quota data{limit, kinds};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -595,7 +595,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
     KernelState* const kernel = inv.cpu.runtime().kernel;
     libk_assert(kernel != nullptr);
     for (usize index = 1; index < 6; ++index)
-        if (inv.trap.arg(index) != 0) return returned(MYOS_STATUS_BAD_ARGS);
+        if (inv.trap.arg(index) != 0) return returned(STATUS_BAD_ARGS);
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) return returned(cap_status(pool.error()));
     constexpr auto charge = object::pool<io::Space>::slot_charge();
@@ -605,11 +605,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<io::Space>(), std::move(*fee), kernel->pmm(), kernel->io_work(),
                             kernel->pool<irq::Irq>(), kernel->pool<mm::Mem>(), kernel->grants());
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     constexpr auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
                                             cap::Right::Connect, cap::Right::Close, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -624,7 +624,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv
     const usize size = trap.arg(1);
     const auto access = perms_of(trap.arg(2));
     if (size == 0 || size % mm::page_size || !access) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     auto txn = begin_create<mm::Mem>(inv, pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!txn) return returned(txn.error());
@@ -639,7 +639,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -660,11 +660,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     }
     auto pg_ref = pager.value().reference();
     if (!pg_ref) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
     if (size == 0 || size % mm::page_size != 0 || !access ||
-        (flags & ~usize{MYOS_MEMORY_PAGER_PRIVATE}) != 0) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        (flags & ~usize{MEMORY_PAGER_PRIVATE}) != 0) {
+        return returned(STATUS_BAD_ARGS);
     }
     auto txn = begin_create<mm::Mem>(inv, pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!txn) return returned(txn.error());
@@ -672,7 +672,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size,
                             mm::PagedCfg{std::move(*pg_ref), *access,
-                                (flags & MYOS_MEMORY_PAGER_PRIVATE) != 0});
+                                (flags & MEMORY_PAGER_PRIVATE) != 0});
     if (!object) return returned(mem_status(object.error()));
     auto& obj = object->get();
     const cap::MemLimit data{mm::ObjectRange{0, obj.page_count()}, *access};
@@ -680,7 +680,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -706,7 +706,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
                         cap::Right::Delegate, cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
                         cap::Right::Inspect, cap::Right::Manage, cap::Right::Destroy, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -720,7 +720,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
     }
     const cap::CSpace::Quota quota{.slots = trap.arg(1), .pages = trap.arg(2)};
     if (quota.slots == 0 || quota.pages == 0) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
                                         cap::Right::Manage, cap::Right::Destroy, cap::Right::Revoke);
@@ -729,10 +729,10 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
     auto fee = reserve(pool.value(), object::pool<cap::CSpace>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<cap::CSpace>(), std::move(*fee), kernel->pmm(), quota);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
 
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -751,11 +751,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     const auto urgency = sched::Urgency::make(trap.arg(4));
     const CpuId home{trap.arg(5)};
     if (!budget || !period || !urgency) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const sched::Sc::Config config{.budget = *budget, .period = *period, .urgency = *urgency};
     if (!sched::Sc::valid_config(config)) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const auto rights = sc_rights();
     auto txn = begin_create<sched::Sc>(inv, pool.value(), object::pool<sched::Sc>::slot_charge());
@@ -763,32 +763,32 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     auto fee = reserve(pool.value(), object::pool<sched::Sc>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<sched::Sc>(), std::move(*fee), config, kernel->clock().now());
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
 
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     auto admitted = obj.admit(domain.value(), home);
     if (!admitted)
-        return returned(admitted.error() == sched::Sc::Error::WrongCpu ? MYOS_STATUS_BAD_ARGS
-                                                                       : MYOS_STATUS_BUSY);
+        return returned(admitted.error() == sched::Sc::Error::WrongCpu ? STATUS_BAD_ARGS
+                                                                       : STATUS_BUSY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 struct ThreadStart final {
     arch::UserStart user{};
-    myos_ipc_binding ipc{};
+    IpcBinding ipc{};
 };
 
 [[nodiscard]] static auto start_snapshot(Call& inv, cap::Handle handle, usize offset) noexcept
-    -> std::expected<ThreadStart, myos_status_t> {
-    auto snapshot = read_desc<myos_thread_start>(inv, handle, offset);
+    -> std::expected<ThreadStart, status_t> {
+    auto snapshot = read_desc<ThreadInit>(inv, handle, offset);
     if (!snapshot) {
         return std::unexpected(snapshot.error());
     }
-    const myos_thread_start& desc = snapshot.value();
-    if (desc.version != MYOS_THREAD_START_VERSION || desc.flags != 0) {
-        return std::unexpected(MYOS_STATUS_BAD_ARGS);
+    const ThreadInit& desc = snapshot.value();
+    if (desc.version != THREAD_START_VERSION || desc.flags != 0) {
+        return std::unexpected(STATUS_BAD_ARGS);
     }
     arch::UserStart start{
         .entry = mm::Virt{desc.entry},
@@ -798,7 +798,7 @@ struct ThreadStart final {
         start.arguments[index] = desc.arguments[index];
     }
     if (!arch::valid_user_start(start)) {
-        return std::unexpected(MYOS_STATUS_BAD_ARGS);
+        return std::unexpected(STATUS_BAD_ARGS);
     }
     return (ThreadStart{start, desc.ipc});
 }
@@ -816,12 +816,12 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
     auto address_space = vspace.reference();
     auto capability_space = cspace.reference();
     if (!home || !address_space || !capability_space) {
-        return returned(MYOS_STATUS_NO_MEMORY);
+        return returned(STATUS_NO_MEMORY);
     }
     auto env =
         Env::user(std::move(address_space).value(), std::move(capability_space).value(), std::move(ipc));
     if (!env) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
 
     const auto total =
@@ -833,12 +833,12 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel.pool<Thread>(), std::move(*fee), std::move(stack_capacity).commit(),
                             std::move(home).value(), std::move(env).value(), start.user);
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
     const auto rights = basic_rights();
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel.grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
-    if (!obj.authorize(vspace, cspace)) return returned(MYOS_STATUS_BUSY);
+    if (!txn->root(kernel.grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!obj.authorize(vspace, cspace)) return returned(STATUS_BUSY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
@@ -856,7 +856,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv
     }
     auto start = start_snapshot(inv, handle_of(trap.arg(3)), trap.arg(4));
     if (!start || trap.arg(5) != 0) {
-        return returned(start ? MYOS_STATUS_BAD_ARGS : start.error());
+        return returned(start ? STATUS_BAD_ARGS : start.error());
     }
     auto ipc = prepare_ipc(inv, *kernel, vspace.value(), start.value().ipc);
     if (!ipc) {
@@ -875,7 +875,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Cal
         return returned(cap_status(pool.error()));
     }
     if (badge == 0) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     auto txn =
         begin_create<ipc::Notification>(inv, pool.value(), object::pool<ipc::Notification>::slot_charge());
@@ -883,13 +883,13 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Cal
     auto fee = reserve(pool.value(), object::pool<ipc::Notification>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = txn->make(kernel->pool<ipc::Notification>(), std::move(*fee));
-    if (!object) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Signal,
                         cap::Right::Receive, cap::Right::Destroy, cap::Right::Revoke);
     const cap::Badge lim{badge};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, lim}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(MYOS_STATUS_NO_MEMORY);
+    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 

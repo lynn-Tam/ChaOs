@@ -2,7 +2,7 @@
 
 #include <sys/queue.hpp>
 
-namespace myos::files {
+namespace sys::files {
 
 // The session control Channel authenticates file handles. Open returns a
 // session-local handle in value and the byte size as eight little-endian bytes.
@@ -20,5 +20,5 @@ inline auto file_size(const io::ControlMessage& reply) noexcept -> uint64_t {
     return value;
 }
 
-} // namespace myos::files
+} // namespace sys::files
 

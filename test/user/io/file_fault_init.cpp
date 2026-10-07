@@ -6,14 +6,14 @@
 #include "file_fault.hpp"
 
 namespace {
-using namespace myos;
+using namespace sys;
 deploy::program program;
 using Supervisor = deploy::tasks<4>;
 Supervisor supervisor;
-void check(bool condition) noexcept { if (!condition) exit(MYOS_STATUS_INTERNAL); }
-auto event_source(const char* name, myos_cap_t cap, myos_word_t rights) -> deploy::source {
-    return {name, {cap, 0}, {.version = MYOS_CAP_ATTENUATION_VERSION_CURRENT,
-        .kind = MYOS_OBJECT_KIND_NOTIFICATION, .size = MYOS_CAP_ATTENUATION_SIZE,
+void check(bool condition) noexcept { if (!condition) exit(STATUS_INTERNAL); }
+auto event_source(const char* name, cap_t cap, word_t rights) -> deploy::source {
+    return {name, {cap, 0}, {.version = CAP_ATTENUATION_VERSION_CURRENT,
+        .kind = OBJECT_KIND_NOTIFICATION, .size = CAP_ATTENUATION_SIZE,
         .rights = rights, .words = {}}};
 }
 auto input(uart::Port port) -> uint8_t {
@@ -23,11 +23,11 @@ auto input(uart::Port port) -> uint8_t {
     return value;
 }
 }
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
+extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     const auto info = service::bootstrap(address, size);
-    auto mapping = MappedMemory::map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
-        cap::OwnedCap{{service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0}},
-        0x30010000, 4096, MYOS_VM_READ | MYOS_VM_WRITE);
+    auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
+        cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
+        0x30010000, 4096, VM_READ | VM_WRITE);
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping->address}; port.reset();
     uart::Printer printer{uart::Writer{port}};
@@ -35,22 +35,22 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     service::require(supervisor.load(program, info));
     service::require(supervisor.add_boot_sources(info));
     service::require(supervisor.add("block.device", service::initial_device(info),
-        MYOS_OBJECT_KIND_DEVICE, MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONNECT));
-    const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
+        OBJECT_KIND_DEVICE, RIGHT_DUPLICATE | RIGHT_CONNECT));
+    const auto pool = service::capability(info, BOOT_POOL);
     constexpr const char* names[][2] = {{"block.client", "block.server"}, {"files.client", "files.server"}};
     cap::OwnedCap endpoints[4];
     for (size_t i = 0; i != 2; ++i) {
-        const auto pair = channel_create(pool, i == 0 ? 1 : 8, MYOS_CHANNEL_MAX_WORDS, 4, 2);
+        const auto pair = channel_create(pool, i == 0 ? 1 : 8, CHANNEL_MAX_WORDS, 4, 2);
         service::require(pair.status);
         endpoints[2 * i] = cap::OwnedCap{{pair.value, 0}};
         endpoints[2 * i + 1] = cap::OwnedCap{{pair.value2, 0}};
-        const auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE;
-        service::require(supervisor.add(names[i][0], pair.value, MYOS_OBJECT_KIND_CHANNEL, rights, 0));
-        service::require(supervisor.add(names[i][1], pair.value2, MYOS_OBJECT_KIND_CHANNEL, rights, 1));
+        const auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_DUPLICATE;
+        service::require(supervisor.add(names[i][0], pair.value, OBJECT_KIND_CHANNEL, rights, 0));
+        service::require(supervisor.add(names[i][1], pair.value2, OBJECT_KIND_CHANNEL, rights, 1));
     }
     Supervisor::handle tasks[4];
     for (unsigned i = 0; i != 2; ++i) {
-        myos_status_t status{};
+        status_t status{};
         auto task = supervisor.launch(program, i == 0 ? "block" : "files", status);
         if (!task) {
             (void)printer.print<"[file-fault] service {} launch failed status={}\n">(i, status);
@@ -65,9 +65,9 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         const auto signal = notification_create(pool, 1);
         service::require(signal.status); go[i] = cap::OwnedCap{{signal.value, 0}};
         const deploy::source sources[] = {
-            event_source("test.ready", ready.value, MYOS_RIGHT_SIGNAL),
-            event_source("test.go", signal.value, MYOS_RIGHT_RECEIVE)};
-        myos_status_t status{};
+            event_source("test.ready", ready.value, RIGHT_SIGNAL),
+            event_source("test.go", signal.value, RIGHT_RECEIVE)};
+        status_t status{};
         auto task = supervisor.launch(program, Supervisor::name("file-client"), status, {.sources = sources});
         if (!task) {
             (void)printer.print<"[file-fault] client {} launch failed status={}\n">(i, status);
@@ -85,20 +85,20 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         port.write("[file-fault] stopping Files with page-in pending\n");
         const auto status = supervisor.stop(tasks[1]);
         (void)printer.print<"[file-fault] Files stop status={}\n">(status);
-        check(status == MYOS_STATUS_CANCELED);
+        check(status == STATUS_CANCELED);
     }
     for (unsigned i = 2; i != 4; ++i) {
         const auto status = supervisor.wait(tasks[i]);
         (void)printer.print<"[file-fault] client {} status={}\n">(i, status);
-        check(status == (mode == 'k' ? MYOS_STATUS_PEER_FAULT : MYOS_STATUS_OK));
+        check(status == (mode == 'k' ? STATUS_PEER_FAULT : STATUS_OK));
     }
     const auto block = supervisor.observe(tasks[0]);
     (void)printer.print<"[file-fault] Block observe status={} value={} result={}\n">(block.status, block.value, block.value2);
-    check(block.status == MYOS_STATUS_OK && block.value == 0);
-    if (mode == 'r') check(supervisor.stop(tasks[1]) == MYOS_STATUS_CANCELED);
+    check(block.status == STATUS_OK && block.value == 0);
+    if (mode == 'r') check(supervisor.stop(tasks[1]) == STATUS_CANCELED);
     const auto block_stop = supervisor.stop(tasks[0]);
     (void)printer.print<"[file-fault] Block stop status={}\n">(block_stop);
-    check(block_stop == MYOS_STATUS_CANCELED);
+    check(block_stop == STATUS_CANCELED);
     port.write(mode == 'k' ? "[file-fault] Files death released both faults, Block survived\n"
                            : "[file-fault] shared request supplied both mappings\n");
     exit();

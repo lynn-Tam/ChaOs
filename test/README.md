@@ -113,11 +113,10 @@ reported as `[FAIL] group: name`.
 - lifecycle publication and snapshots derive from canonical states
 - shootdown acknowledgement controls detached-page retirement
 - Typed references retain retiring objects until final release
-- RemoteQueue retains failed kicks without stale-generation loss
+- Remote scheduler mail coalesces actions and retains work through delivery
 
 ## sched
 
-- deadline queue orders fixed one-shot relations
 - refill ledger conserves budget and reports overrun
 - bounded refill merge delays but never advances budget
 - refill model preserves every sampled sliding window
@@ -128,7 +127,6 @@ reported as `[FAIL] group: name`.
 - ResourcePool close waits for construction and budget transactions
 - kernel stacks use guarded reusable virtual slots
 - domain admission rounds conservatively and rolls back failure
-- ReadyQueue chooses highest urgency and preserves FIFO
 
 ## cap
 

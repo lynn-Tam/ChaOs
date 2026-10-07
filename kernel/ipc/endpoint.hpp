@@ -20,8 +20,8 @@
 #include <wait.hpp>
 #include <ipc/transfer.hpp>
 #include <resource/sponsorship.hpp>
-#include <sched/types.hpp>
-#include <sched/queues.hpp>
+#include <sched/sched.hpp>
+#include <sched/sched.hpp>
 #include <time/time.hpp>
 #include <uapi/endpoint.h>
 
@@ -57,9 +57,9 @@ struct EndpointConfig final {
 };
 
 using CodePages = libk::InplaceVector<
-    mm::PageHold, MYOS_ENDPOINT_MAX_CODE_PAGES>;
+    mm::PageHold, ENDPOINT_MAX_CODE_PAGES>;
 using StackPages = libk::InplaceVector<
-    mm::PageHold, MYOS_ENDPOINT_MAX_STACK_PAGES>;
+    mm::PageHold, ENDPOINT_MAX_STACK_PAGES>;
 
 class Endpoint;
 class Call;
@@ -158,7 +158,7 @@ private:
     Transfer::Specs request_caps_{};
     Transfer::Handles installed_caps_{};
     Transfer transfer_{};
-    isize cancel_status_{MYOS_STATUS_CANCELED};
+    isize cancel_status_{STATUS_CANCELED};
     CpuRegistry* cpus_{};
     usize publishers_{};
     bool cancel_pending_{};
@@ -171,7 +171,7 @@ private:
 class Endpoint final : private libk::noncopyable_nonmovable {
     friend class Activation;
 public:
-    static constexpr usize max_activations = MYOS_ENDPOINT_MAX_ACTIVATIONS;
+    static constexpr usize max_activations = ENDPOINT_MAX_ACTIVATIONS;
 
     Endpoint(
         mm::Pmm& pmm,
@@ -277,7 +277,7 @@ private:
     mm::Slab<Activation, false> activations_;
     mm::Slab<Call, false> calls_;
     Activation* slots_[max_activations]{};
-    Call* call_slots_[MYOS_ENDPOINT_MAX_CALLS]{};
+    Call* call_slots_[ENDPOINT_MAX_CALLS]{};
     object::cleanup cleanup_{};
     usize slot_count_{};
     usize call_count_{};

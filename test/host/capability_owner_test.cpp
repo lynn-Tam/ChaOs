@@ -16,34 +16,34 @@ namespace {
 
 struct FakeBackend final {
     struct Call final {
-        myos::cap::CapRef reference;
+        sys::cap::CapRef reference;
     };
 
     static inline Call calls[32]{};
     static inline size_t call_count{};
-    static inline myos_status_t next_status{MYOS_STATUS_OK};
+    static inline status_t next_status{STATUS_OK};
     static inline size_t fault_count{};
     static inline jmp_buf* fault_target{};
 
     static void reset() noexcept {
         call_count = 0;
-        next_status = MYOS_STATUS_OK;
+        next_status = STATUS_OK;
         fault_count = 0;
         fault_target = nullptr;
     }
 
     [[nodiscard]] static auto close(
-        myos::cap::CapRef reference) noexcept -> myos_status_t {
+        sys::cap::CapRef reference) noexcept -> status_t {
         if (call_count < sizeof(calls) / sizeof(calls[0])) {
             calls[call_count++] = Call{reference};
         }
-        const myos_status_t status = next_status;
-        next_status = MYOS_STATUS_OK;
+        const status_t status = next_status;
+        next_status = STATUS_OK;
         return status;
     }
 
     [[noreturn]] static void ownership_fault(
-        myos_status_t) noexcept {
+        status_t) noexcept {
         ++fault_count;
         if (fault_target != nullptr) {
             longjmp(*fault_target, 1);
@@ -52,40 +52,40 @@ struct FakeBackend final {
     }
 };
 
-using Owner = myos::cap::BasicOwnedCap<FakeBackend>;
-static_assert(myos::cap::CapBackend<FakeBackend>);
+using Owner = sys::cap::BasicOwnedCap<FakeBackend>;
+static_assert(sys::cap::CapBackend<FakeBackend>);
 
 [[nodiscard]] auto call_is(
     size_t index,
-    myos_cap_t selector,
-    myos_cap_t cspace) noexcept -> bool {
+    cap_t selector,
+    cap_t cspace) noexcept -> bool {
     return index < FakeBackend::call_count
         && FakeBackend::calls[index].reference
-            == myos::cap::CapRef{selector, cspace};
+            == sys::cap::CapRef{selector, cspace};
 }
 
 [[nodiscard]] auto test_move_and_release() noexcept -> bool {
     FakeBackend::reset();
     Owner source{{7, 9}};
     Owner moved{std::move(source)};
-    if (source || !moved || moved.reference() != myos::cap::CapRef{7, 9}) {
+    if (source || !moved || moved.reference() != sys::cap::CapRef{7, 9}) {
         return false;
     }
     const auto released = moved.release();
-    return !moved && released == myos::cap::CapRef{7, 9}
+    return !moved && released == sys::cap::CapRef{7, 9}
         && FakeBackend::call_count == 0;
 }
 
 [[nodiscard]] auto test_explicit_failure_retains_ownership() noexcept -> bool {
     FakeBackend::reset();
     Owner owner{{11, 0}};
-    FakeBackend::next_status = MYOS_STATUS_BUSY;
-    if (owner.close() != MYOS_STATUS_BUSY
+    FakeBackend::next_status = STATUS_BUSY;
+    if (owner.close() != STATUS_BUSY
         || !owner
-        || owner.reference() != myos::cap::CapRef{11, 0}) {
+        || owner.reference() != sys::cap::CapRef{11, 0}) {
         return false;
     }
-    return owner.close() == MYOS_STATUS_OK
+    return owner.close() == STATUS_OK
         && !owner
         && FakeBackend::call_count == 2
         && call_is(0, 11, 0)
@@ -98,7 +98,7 @@ static_assert(myos::cap::CapBackend<FakeBackend>);
     FakeBackend::fault_target = &target;
     if (setjmp(target) == 0) {
         Owner owner{{13, 0}};
-        FakeBackend::next_status = MYOS_STATUS_BUSY;
+        FakeBackend::next_status = STATUS_BUSY;
         return false;
     }
     FakeBackend::fault_target = nullptr;

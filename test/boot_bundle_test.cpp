@@ -7,8 +7,8 @@
 namespace {
 
 constexpr usize BundleSize = 200;
-constexpr usize SegmentOffset = MYOS_BOOT_HEADER_SIZE + MYOS_BOOT_MODULE_SIZE;
-constexpr usize NameOffset = SegmentOffset + MYOS_BOOT_SEGMENT_SIZE;
+constexpr usize SegmentOffset = BUNDLE_HEADER_SIZE + BUNDLE_MODULE_SIZE;
+constexpr usize NameOffset = SegmentOffset + BUNDLE_SEGMENT_SIZE;
 constexpr usize ImageOffset = NameOffset + 4;
 
 void write_le(byte* output, usize& cursor, u64 value, usize width) noexcept {
@@ -19,15 +19,15 @@ void write_le(byte* output, usize& cursor, u64 value, usize width) noexcept {
 
 void build_bundle(byte (&bytes)[BundleSize]) noexcept {
     usize cursor{};
-    write_le(bytes, cursor, MYOS_BOOT_MAGIC, 8);
-    write_le(bytes, cursor, MYOS_BOOT_MAJOR, 2);
-    write_le(bytes, cursor, MYOS_BOOT_MINOR, 2);
-    write_le(bytes, cursor, MYOS_BOOT_HEADER_SIZE, 4);
+    write_le(bytes, cursor, BUNDLE_MAGIC, 8);
+    write_le(bytes, cursor, BUNDLE_MAJOR, 2);
+    write_le(bytes, cursor, BUNDLE_MINOR, 2);
+    write_le(bytes, cursor, BUNDLE_HEADER_SIZE, 4);
     write_le(bytes, cursor, BundleSize, 8);
-    write_le(bytes, cursor, MYOS_BOOT_ARCH_RISCV64, 4);
-    write_le(bytes, cursor, MYOS_BOOT_ABI_RISCV_LP64, 4);
+    write_le(bytes, cursor, BUNDLE_ARCH_RISCV64, 4);
+    write_le(bytes, cursor, BUNDLE_ABI_RISCV_LP64, 4);
     write_le(bytes, cursor, 0, 8);
-    write_le(bytes, cursor, MYOS_BOOT_HEADER_SIZE, 8);
+    write_le(bytes, cursor, BUNDLE_HEADER_SIZE, 8);
     write_le(bytes, cursor, 1, 4);
     write_le(bytes, cursor, 0, 4);
     write_le(bytes, cursor, SegmentOffset, 8);
@@ -37,7 +37,7 @@ void build_bundle(byte (&bytes)[BundleSize]) noexcept {
 
     write_le(bytes, cursor, NameOffset, 8);
     write_le(bytes, cursor, 4, 4);
-    write_le(bytes, cursor, MYOS_BOOT_MODULE_BOOTABLE, 4);
+    write_le(bytes, cursor, BUNDLE_MODULE_BOOTABLE, 4);
     write_le(bytes, cursor, ImageOffset, 8);
     write_le(bytes, cursor, 4, 8);
     write_le(bytes, cursor, 0x20'0000, 8);
@@ -53,7 +53,7 @@ void build_bundle(byte (&bytes)[BundleSize]) noexcept {
     write_le(bytes, cursor, mm::page_size, 8);
     write_le(
         bytes, cursor,
-        MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_EXECUTE, 4);
+        BUNDLE_SEGMENT_READ | BUNDLE_SEGMENT_EXECUTE, 4);
     write_le(bytes, cursor, 0, 4);
 
     bytes[cursor++] = 'i';
@@ -117,8 +117,8 @@ bool test_bundle_view_rejects_bad_envelopes(const TestContext&) noexcept {
 bool test_bundle_view_rejects_writable_code(const TestContext&) noexcept {
     byte bytes[BundleSize]{};
     build_bundle(bytes);
-    bytes[SegmentOffset + 40] = MYOS_BOOT_SEGMENT_READ
-        | MYOS_BOOT_SEGMENT_WRITE | MYOS_BOOT_SEGMENT_EXECUTE;
+    bytes[SegmentOffset + 40] = BUNDLE_SEGMENT_READ
+        | BUNDLE_SEGMENT_WRITE | BUNDLE_SEGMENT_EXECUTE;
     const auto parsed = parse_bundle(
         libk::ByteSpan{bytes, sizeof(bytes)});
     return !parsed

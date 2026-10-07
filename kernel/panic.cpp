@@ -1,19 +1,15 @@
+#include <cpu/ipi.hpp>
 #include <panic.hpp>
 #include <console.hpp>
 #include <trace.hpp>
 
-#include <arch/cpu.hpp>
-#include <arch/interrupt.hpp>
-#include <arch/ipi.hpp>
-#include <arch/time.hpp>
+#include <cpu.hpp>
 #include <cpu/local.hpp>
 #include <cpu/registry.hpp>
 #include <cpu/runtime.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
 #include <libk/fmt.hpp>
-#include <arch/console.hpp>
-#include <arch/system.hpp>
 #include <boot/link.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/thread.hpp>
@@ -24,17 +20,13 @@ extern "C" char kernel_text_end[];
 
 static constinit libk::Atomic<bool> claimed{};
 
-static void raw_char(char character) noexcept {
-    arch::console::write(character);
-}
-
 static void raw_text(const char* text) noexcept {
     if (text == nullptr) {
         raw_text("<none>");
         return;
     }
     while (*text != '\0') {
-        raw_char(*text++);
+        arch::putchar(*text++);
     }
 }
 
@@ -46,7 +38,7 @@ static void raw_decimal(u64 value) noexcept {
         value /= 10;
     } while (value != 0);
     while (count != 0) {
-        raw_char(digits[--count]);
+        arch::putchar(digits[--count]);
     }
 }
 
@@ -54,7 +46,7 @@ static void raw_hex(usize value) noexcept {
     constexpr char digits[] = "0123456789abcdef";
     raw_text("0x");
     for (usize shift = sizeof(usize) * 8; shift != 0; shift -= 4) {
-        raw_char(digits[(value >> (shift - 4)) & 0xfU]);
+        arch::putchar(digits[(value >> (shift - 4)) & 0xfU]);
     }
 }
 
@@ -66,12 +58,11 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
     }
     raw_text("site: ");
     raw_text(source.file);
-    raw_char(':');
+    arch::putchar(':');
     raw_decimal(source.line);
-    raw_char('\n');
+    arch::putchar('\n');
 }
 
-/*luna change: extend double-panic projection with entry and canonical target stack facts, reason: distinguish stale target stack state from active-stack publication corruption without changing panic control*/
 [[noreturn]] static void double_panic(
     usize cpu,
     const arch::TrapRegs& snapshot) noexcept {
@@ -79,7 +70,7 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
     const auto* const dispatcher = local.dispatcher();
     Thread* target = dispatcher != nullptr
         ? dispatcher->current() : nullptr;
-    const usize entry_top = arch::active_stack(local.arch_state);
+    const usize entry_top = local.entry.stack;
     raw_text("\nDOUBLE PANIC cpu=");
     raw_decimal(cpu);
     raw_text(" pc=");
@@ -103,15 +94,14 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
     raw_hex(target ? target->home_stack_base() : 0);
     raw_text(" stack_top=");
     raw_hex(target ? target->current_stack_top() : 0);
-    raw_char('\n');
+    arch::putchar('\n');
     arch::halt_current_cpu(arch::HaltReason::Fatal);
 }
 
 static void capture_stack_bounds(
     PanicSlot& slot,
     CpuLocal& cpu,
-    arch::UnwindSeed seed) noexcept {
-    const usize sp = seed.sp;
+    usize sp) noexcept {
     Thread* const thread = cpu.current_thread();
     if (thread != nullptr && sp >= thread->home_stack_base()
         && sp < thread->home_stack_top()) {
@@ -137,7 +127,7 @@ static void capture_stack_bounds(
 static void capture(
     PanicSlot& slot,
     const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
-    arch::CallSiteSnapshot call_site,
+    arch::StackRegs call_site,
     bool interrupts_were_enabled) noexcept {
     slot.reason = reason;
     slot.site = site;
@@ -145,20 +135,17 @@ static void capture(
     if (trap != nullptr) {
         slot.trap = trap->snapshot();
     }
-    slot.call_site = call_site;
+    slot.stack = trap ? slot.trap.stack() : call_site;
     slot.interrupts_enabled = interrupts_were_enabled;
 
-    void* const owner = arch::current_cpu_owner();
+    auto* const owner = arch::local() ? arch::local()->owner : nullptr;
     libk_assert(owner != nullptr);
-    auto& cpu = *static_cast<CpuLocal*>(owner);
+    auto& cpu = *owner;
     slot.registry = cpu.runtime().owner_registry;
     slot.current_thread = reinterpret_cast<usize>(cpu.current_thread());
     slot.active_root = cpu.active_root_ ? 1 : 0;
-    slot.trap_depth = arch::trap_depth();
-    const arch::UnwindSeed seed = slot.has_full_trap
-        ? arch::unwind_seed(slot.trap)
-        : slot.call_site;
-    capture_stack_bounds(slot, cpu, seed);
+    slot.trap_depth = arch::local()->depth;
+    capture_stack_bounds(slot, cpu, slot.stack.sp);
 }
 
 static void print_source(const libk::AssertInfo& source) noexcept {
@@ -211,10 +198,10 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
         console::print<
             "context: call-site\n"
             "pc={:#018x} sp={:#018x} fp={:#018x} ra={:#018x}\n">(
-            slot.call_site.pc,
-            slot.call_site.sp,
-            slot.call_site.frame_pointer,
-            slot.call_site.return_address);
+            slot.stack.pc,
+            slot.stack.sp,
+            slot.stack.fp,
+            slot.stack.ra);
     }
 }
 
@@ -235,13 +222,11 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
 
 static void print_backtrace(const PanicSlot& slot) noexcept {
     console::print<"backtrace:\n">();
-    const arch::UnwindSeed seed = slot.has_full_trap
-        ? arch::unwind_seed(slot.trap)
-        : slot.call_site;
+    const auto& seed = slot.stack;
     if (seed.pc != 0 && in_kernel_text(seed.pc)) {
         console::print<"  #0 {:#018x}\n">(seed.pc);
     }
-    usize frame = seed.frame_pointer;
+    usize frame = seed.fp;
     usize printed = 1;
     bool first_record = true;
     for (usize walked = 1; walked < 32; ++walked) {
@@ -298,8 +283,8 @@ static void request_peer_stops(PanicSlot& owner) noexcept {
             || descriptor->state() != CpuState::Online) {
             continue;
         }
-        arch::request_panic_stop(runtime->local.arch_state);
-        static_cast<void>(arch::send_ipi(descriptor->hardware_id()));
+        __atomic_store_n(&runtime->local.entry.stop, usize{1}, __ATOMIC_RELEASE);
+        static_cast<void>(send_ipi(descriptor->hardware_id()));
     }
 }
 
@@ -348,17 +333,15 @@ static void print_peers(const PanicSlot& owner) noexcept {
         if (id == owner.cpu) {
             console::print<"  cpu {}: owner\n">(id.raw);
         } else if (slot.stopped.load<libk::MemoryOrder::Acquire>()) {
-            const arch::UnwindSeed seed = slot.has_full_trap
-                ? arch::unwind_seed(slot.trap)
-                : slot.call_site;
+            const auto& seed = slot.stack;
             console::print<
                 "  cpu {}: stopped pc={:#018x} sp={:#018x} "
                 "fp={:#018x} ra={:#018x}\n">(
                 id.raw,
                 seed.pc,
                 seed.sp,
-                seed.frame_pointer,
-                seed.return_address);
+                seed.fp,
+                seed.ra);
             print_snapshot(slot);
             print_backtrace(slot);
         } else {
@@ -411,24 +394,24 @@ static void halt_peer(void* ptr) noexcept {
 
 [[noreturn]] static void enter_panic(
     const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
-    arch::PanicContinuation entry) noexcept {
-    const arch::CallSiteSnapshot call_site = arch::capture_call_site();
-    const arch::InterruptState interrupts = arch::disable_interrupts();
-    void* const ptr = arch::panic_slot();
-    const usize top = arch::emergency_stack();
-    if (ptr == nullptr || top == 0) {
+    void (*entry)(void*) noexcept) noexcept {
+    const arch::StackRegs call_site = arch::stack_regs();
+    const bool interrupts = arch::disable_interrupts();
+    auto* const local = arch::local();
+    if (!local || !local->panic || !local->emergency_stack || (local->emergency_stack & 15U)) {
         raw_text("\nEARLY KERNEL PANIC\n");
         raw_text(reason);
-        raw_char('\n');
+        arch::putchar('\n');
         raw_source(site);
         arch::halt_system(arch::HaltAction::Shutdown, arch::HaltReason::Fatal);
     }
-    auto& slot = *static_cast<PanicSlot*>(ptr);
-    if (!arch::enter_emergency()) {
+    auto& slot = *local->panic;
+    if (local->emergency_depth) {
         double_panic(slot.cpu.raw, trap ? trap->snapshot() : arch::TrapRegs{});
     }
-    capture(slot, reason, site, trap, call_site, interrupts.enabled());
-    arch::switch_to_panic_stack(top, &slot, entry);
+    local->emergency_depth = 1;
+    capture(slot, reason, site, trap, call_site, interrupts);
+    arch::switch_stack(local->emergency_stack, &slot, entry);
 }
 
 void panic(const char* reason, const arch::TrapCtx* trap,

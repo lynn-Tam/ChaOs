@@ -161,13 +161,13 @@ template<typename T>
 
         std::uint32_t access{};
         if ((program.p_flags & PF_R) != 0) {
-            access |= MYOS_BOOT_SEGMENT_READ;
+            access |= BUNDLE_SEGMENT_READ;
         }
         if ((program.p_flags & PF_W) != 0) {
-            access |= MYOS_BOOT_SEGMENT_WRITE;
+            access |= BUNDLE_SEGMENT_WRITE;
         }
         if ((program.p_flags & PF_X) != 0) {
-            access |= MYOS_BOOT_SEGMENT_EXECUTE;
+            access |= BUNDLE_SEGMENT_EXECUTE;
         }
         image.segments.push_back(Segment{
             .virtual_address = program.p_vaddr,
@@ -205,7 +205,7 @@ template<typename T>
     std::vector<std::byte> payload;
     for (auto& segment : image.segments) {
         const auto offset = (payload.size() + 4095) & ~std::size_t{4095};
-        const auto stored = (segment.access & MYOS_BOOT_SEGMENT_WRITE) != 0
+        const auto stored = (segment.access & BUNDLE_SEGMENT_WRITE) != 0
             ? segment.file_size : (segment.memory_size + 4095) & ~std::uint64_t{4095};
         if (stored > payload.max_size() - offset)
             throw std::runtime_error("load image is too large");
@@ -216,7 +216,7 @@ template<typename T>
         // The input's stronger congruence has already been checked. A load
         // image needs page congruence; its virtual addresses stay unchanged.
         segment.alignment = 4096;
-        if ((segment.access & MYOS_BOOT_SEGMENT_WRITE) == 0)
+        if ((segment.access & BUNDLE_SEGMENT_WRITE) == 0)
             segment.memory_size = segment.file_size = stored;
     }
     image.bytes = std::move(payload);
@@ -274,11 +274,11 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         names_size += module.name.size();
     }
 
-    const std::size_t modules_offset = MYOS_BOOT_HEADER_SIZE;
+    const std::size_t modules_offset = BUNDLE_HEADER_SIZE;
     const std::size_t segments_offset = modules_offset
-        + modules.size() * MYOS_BOOT_MODULE_SIZE;
+        + modules.size() * BUNDLE_MODULE_SIZE;
     const std::size_t names_offset = segments_offset
-        + segment_count * MYOS_BOOT_SEGMENT_SIZE;
+        + segment_count * BUNDLE_SEGMENT_SIZE;
 
     std::vector<std::size_t> name_offsets;
     std::vector<std::size_t> image_offsets;
@@ -300,13 +300,13 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
 
     std::vector<std::byte> output;
     output.reserve(total_size);
-    append_le(output, MYOS_BOOT_MAGIC, 8);
-    append_le(output, MYOS_BOOT_MAJOR, 2);
-    append_le(output, MYOS_BOOT_MINOR, 2);
-    append_le(output, MYOS_BOOT_HEADER_SIZE, 4);
+    append_le(output, BUNDLE_MAGIC, 8);
+    append_le(output, BUNDLE_MAJOR, 2);
+    append_le(output, BUNDLE_MINOR, 2);
+    append_le(output, BUNDLE_HEADER_SIZE, 4);
     append_le(output, total_size, 8);
-    append_le(output, MYOS_BOOT_ARCH_RISCV64, 4);
-    append_le(output, MYOS_BOOT_ABI_RISCV_LP64, 4);
+    append_le(output, BUNDLE_ARCH_RISCV64, 4);
+    append_le(output, BUNDLE_ABI_RISCV_LP64, 4);
     append_le(output, 0, 8); // required features
     append_le(output, modules_offset, 8);
     append_le(output, modules.size(), 4);
@@ -324,7 +324,7 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         append_le(output, module.name.size(), 4);
         append_le(
             output,
-            module.data ? MYOS_BOOT_MODULE_DATA : MYOS_BOOT_MODULE_BOOTABLE,
+            module.data ? BUNDLE_MODULE_DATA : BUNDLE_MODULE_BOOTABLE,
             4);
         append_le(output, image_offsets[index], 8);
         append_le(

@@ -1,10 +1,10 @@
 #include <expected>
+#include <algorithm>
 #include <optional>
 #include <sched/sc.hpp>
 
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <libk/checked_arithmetic.hpp>
 #include <utility>
 #include <sched/domain.hpp>
 #include <sched/dispatcher.hpp>
@@ -114,12 +114,13 @@ const cap::GrantAttachmentOps Sc::domain_ops_{
 };
 
 Sc::Sc(Config config, time::Instant now) noexcept
-    : config_(config),
-      refills_(config.budget, config.period, config.refill_capacity, now) {
+    : config_(config) {
     libk_assert(valid_config(config_));
+    libk_assert(refills_.try_emplace_back(Refill{now, config_.budget}));
 }
 
 Sc::~Sc() noexcept {
+    libk_assert(!mailed_.load<libk::MemoryOrder::Acquire>() && !mail_hook_.is_linked());
     libk_assert(!active());
     libk_assert(!owner_);
     libk_assert(!auth_);
@@ -131,16 +132,16 @@ Sc::~Sc() noexcept {
 
 auto Sc::available(time::Instant now) const noexcept
     -> time::Duration {
-    return refills_.available(now);
+    u64 total{};
+    for (const auto& r : refills_) {
+        if (r.ready_at > now) break;
+        total += r.amount.ticks();
+    }
+    return time::Duration::from_ticks(total);
 }
 
 auto Sc::eligible(time::Instant now) const noexcept -> bool {
     return !available(now).empty();
-}
-
-auto Sc::next_refill() const noexcept
-    -> std::optional<time::Instant> {
-    return refills_.next();
 }
 
 auto Sc::admit(
@@ -228,7 +229,7 @@ auto Sc::unbind(Dispatcher* owner) noexcept
     if (active() || queued()) {
         return std::unexpected(Error::Active);
     }
-    if (owner == nullptr && (start_.pending() || wake_.pending() || stop_.pending()))
+    if (owner == nullptr && mailed_.load<libk::MemoryOrder::Acquire>())
         return std::unexpected(Error::Active);
     Thread& target = thread();
     if (!target.release_sc(*this, owner)) {
@@ -238,7 +239,7 @@ auto Sc::unbind(Dispatcher* owner) noexcept
     // only after that cut, while owner_ still protects the execution lifetime.
     if (owner) owner->cancel(*this);
     libk_assert(!timer_queued());
-    libk_assert(!start_.pending() && !wake_.pending() && !stop_.pending());
+    libk_assert(!mailed_.load<libk::MemoryOrder::Acquire>());
     object::ref<> lifetime{std::move(owner_)};
     wake_credit_ = false;
     if (auth_) {
@@ -336,8 +337,6 @@ auto Sc::activate(CpuId cpu) noexcept -> bool {
         return false;
     }
     active_cpu_.store<libk::MemoryOrder::Release>(cpu.raw);
-    ++activation_count_;
-    libk_assert(activation_count_ != 0);
     return true;
 }
 
@@ -349,16 +348,31 @@ void Sc::deactivate(CpuId cpu) noexcept {
     libk_assert(deactivated);
 }
 
-void Sc::charge(
-    time::Instant now,
-    time::Duration elapsed) noexcept {
-    const time::Duration overrun = refills_.charge(now, elapsed);
-    if (!overrun.empty()) {
-        const auto total = libk::checked_add(
-            overrun_.ticks(), overrun.ticks());
-        libk_assert(total);
-        overrun_ = time::Duration::from_ticks(*total);
+auto Sc::charge(time::Instant now, time::Duration elapsed) noexcept -> time::Duration {
+    libk_assert(!timer_queued());
+    u64 remaining = elapsed.ticks(), consumed{};
+    while (remaining && !refills_.empty() && refills_.front().ready_at <= now) {
+        auto& r = refills_.front();
+        const u64 n = std::min(remaining, r.amount.ticks());
+        remaining -= n;
+        consumed += n;
+        r.amount = time::Duration::from_ticks(r.amount.ticks() - n);
+        if (r.amount.empty()) refills_.pop_front();
     }
+    if (consumed) {
+        const auto ready = now.checked_add(config_.period);
+        libk_assert(ready);
+        // Total budget is conserved. Merging can delay a refill, never
+        // advance it; sums are bounded by config_.budget, so cannot overflow.
+        if (!refills_.empty() && (refills_.back().ready_at == *ready
+            || refills_.size() == config_.refill_capacity)) {
+            auto& last = refills_.back();
+            libk_assert(last.ready_at <= *ready);
+            last.ready_at = *ready;
+            last.amount = time::Duration::from_ticks(last.amount.ticks() + consumed);
+        } else libk_assert(refills_.try_emplace_back(Refill{*ready, time::Duration::from_ticks(consumed)}));
+    }
+    return time::Duration::from_ticks(remaining);
 }
 
 } // namespace sched

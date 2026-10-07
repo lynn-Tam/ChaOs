@@ -34,7 +34,7 @@ audit_one() {
     rg -q 'attenuation_within_ceiling' "$input" || return 1
     rg -q 'if \(result\.value == 0\)' "$input" || return 1
     rg -q 'Owner owner' "$input" || return 1
-    rg -q 'if \(result\.status != MYOS_STATUS_OK\)' "$input" || return 1
+    rg -q 'if \(result\.status != STATUS_OK\)' "$input" || return 1
     rg -q 'owner\.close\(\)' "$input" || return 1
     rg -q 'Backend::ownership_fault' "$input" || return 1
     rg -q 'adopt\(Space&& source\)' "$input" || return 1
@@ -44,7 +44,7 @@ audit_one() {
     awk '
         /if \(result\.value == 0\)/ { zero = NR }
         /Owner owner/ { owner = NR }
-        /if \(result\.status != MYOS_STATUS_OK\)/ { status = NR }
+        /if \(result\.status != STATUS_OK\)/ { status = NR }
         END { exit !(zero && owner && status && zero < owner && owner < status) }
     ' "$input" || return 1
 
@@ -137,9 +137,9 @@ expect_reject missing-descriptor-check \
 expect_reject missing-result-owner \
     -e '/Owner owner/d'
 expect_reject ignored-nonzero-result-branch \
-    -e 's/if (result\.value == 0)/if (result.status != MYOS_STATUS_OK || result.value == 0)/'
+    -e 's/if (result\.value == 0)/if (result.status != STATUS_OK || result.value == 0)/'
 expect_reject missing-result-close-guard \
-    -e '/if (result\.status != MYOS_STATUS_OK)/d'
+    -e '/if (result\.status != STATUS_OK)/d'
 expect_reject missing-ownership-fault \
     -e '/Backend::ownership_fault/d'
 expect_reject missing-bootstrap-adopt \

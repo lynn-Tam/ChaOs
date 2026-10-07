@@ -1,6 +1,6 @@
 #pragma once
 
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <cpu/local.hpp>
 #include <libk/noncopyable.hpp>

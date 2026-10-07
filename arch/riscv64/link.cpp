@@ -9,12 +9,6 @@ extern char kernel_img_start[];
 extern char kernel_img_end[];
 }
 
-namespace {
-
-[[nodiscard]] auto virtual_address(const char* symbol) noexcept -> usize {
-    return reinterpret_cast<usize>(symbol);
-}
-
 // Low physical linker symbols are outside RISC-V's medany PC-relative reach
 // from the high kernel image. The linker exports page-frame values so this
 // selected-architecture boundary can materialize them without duplicating a
@@ -31,7 +25,7 @@ namespace {
 
 #define LINKER_PHYSICAL(symbol) (LINKER_PFN(symbol) * mm::page_size)
 
-[[nodiscard]] auto page_range(usize first, usize end) noexcept
+[[nodiscard]] static auto page_range(usize first, usize end) noexcept
     -> mm::Pages {
     libk_assert(end > first);
     const auto range = mm::Pages::from_aligned_bytes(
@@ -40,14 +34,12 @@ namespace {
     return *range;
 }
 
-} // namespace
-
 auto kernel_begin() noexcept -> mm::Virt {
-    return mm::Virt{virtual_address(kernel_img_start)};
+    return mm::Virt{reinterpret_cast<usize>(kernel_img_start)};
 }
 
 auto kernel_end() noexcept -> mm::Virt {
-    return mm::Virt{virtual_address(kernel_img_end)};
+    return mm::Virt{reinterpret_cast<usize>(kernel_img_end)};
 }
 
 auto kernel_phys() noexcept -> mm::Phys {

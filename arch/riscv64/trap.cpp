@@ -1,8 +1,7 @@
 #include <trap.hpp>
 #include <algorithm>
-#include <arch/cpu.hpp>
-#include <arch/instruction.hpp>
-#include <arch/riscv64/cpu/csr.hpp>
+#include <cpu.hpp>
+#include <csr.hpp>
 #include <libk/mem.h>
 #include <memory>
 #include <mm/table.hpp>
@@ -35,7 +34,7 @@ bool TrapCtx::load_user_start(const UserStart& s) noexcept {
     frame_->gpr[1] = s.stack.raw();
     std::copy(s.arguments.begin(), s.arguments.end(), frame_->gpr.begin() + 9);
     // User input never supplies supervisor status bits.
-    frame_->sstatus = riscv64::Sstatus::SPIE;
+    frame_->sstatus = csr::Sstatus::SPIE;
     return true;
 }
 
@@ -54,20 +53,20 @@ std::optional<usize> prepare_user_stack(usize top, UserStart start) noexcept {
 
 [[noreturn]] void resume_user(usize top) noexcept {
     auto* f = reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame));
-    libk_assert(mm::is_user(mm::Virt{f->sepc}) && f->sstatus == riscv64::Sstatus::SPIE
+    libk_assert(mm::is_user(mm::Virt{f->sepc}) && f->sstatus == csr::Sstatus::SPIE
                 && (f->gpr[1] & 15) == 0);
     user_return(f);
 }
 
 bool install_trap() noexcept {
-    riscv64::Stvec::install_direct(reinterpret_cast<void*>(&trap_entry));
-    return riscv64::Stvec::base() == reinterpret_cast<usize>(&trap_entry);
+    csr::Stvec::install_direct(reinterpret_cast<void*>(&trap_entry));
+    return csr::Stvec::base() == reinterpret_cast<usize>(&trap_entry);
 }
 } // namespace arch
 
 static auto decode(const arch::TrapFrame& f) noexcept -> trap::Event {
-    using arch::riscv64::Scause;
-    using arch::riscv64::Sstatus;
+    using csr::Scause;
+    using csr::Sstatus;
     using trap::Exception;
     using trap::Perm;
     auto origin = f.sstatus & Sstatus::SPP ? trap::Origin::Kernel : trap::Origin::User;
@@ -105,14 +104,14 @@ static auto decode(const arch::TrapFrame& f) noexcept -> trap::Event {
 extern "C" auto trap_enter(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
     libk_assert(f);
     arch::TrapCtx ctx{*f};
-    if (arch::panic_stop_requested()) panic_stop(ctx);
+    if ((arch::local() && __atomic_load_n(&arch::local()->stop, __ATOMIC_ACQUIRE))) panic_stop(ctx);
     auto event = decode(*f);
     trace::emit(trace::Event::TrapEnter, static_cast<u64>(event.origin()));
     if (event.origin() != trap::Origin::User || event.interrupt()) trap::handle(event, ctx);
     return ctx.frame();
 }
 extern "C" auto trap_exit(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
-    libk_assert(f && arch::trap_depth() == 0);
+    libk_assert(f && arch::local()->depth == 0);
     arch::TrapCtx ctx{*f};
     sync::assert_unlocked();
     trap::on_exit(decode(*f), ctx);

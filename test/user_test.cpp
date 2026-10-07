@@ -2,7 +2,7 @@
 
 #include <boot/link.hpp>
 #include <mm/table.hpp>
-#include <arch/instruction.hpp>
+#include <cpu.hpp>
 #include <trap.hpp>
 #include <cap/cap.hpp>
 #include <uapi/capability.h>
@@ -69,17 +69,17 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
 
 bool test_uapi_values_are_stable_and_not_internal_pointers(
     const TestContext&) noexcept {
-    static_assert(sizeof(cap::Handle) == sizeof(myos_cap_t));
-    static_assert(MYOS_SYS_YIELD != MYOS_SYS_EXIT);
-    static_assert(MYOS_SYS_VM_MAP != MYOS_SYS_VM_PROTECT);
-    static_assert(MYOS_RIGHT_REVOKE == (UINT64_C(1) << 11));
-    static_assert(MYOS_RIGHT_CONNECT == (UINT64_C(1) << 17));
-    static_assert(MYOS_RIGHT_ACK == (UINT64_C(1) << 18));
-    static_assert((MYOS_VM_WRITE & MYOS_VM_READ) == 0);
-    static_assert(MYOS_STATUS_OK == 0 && MYOS_STATUS_INVALID_CAP == -1);
-    static_assert(MYOS_STATUS_BUSY == -7 && MYOS_STATUS_PENDING == -9);
-    static_assert(MYOS_STATUS_REASSERTED == -14);
-    static_assert(MYOS_STATUS_ALREADY_CONNECTED == -15);
+    static_assert(sizeof(cap::Handle) == sizeof(cap_t));
+    static_assert(SYS_YIELD != SYS_EXIT);
+    static_assert(SYS_VM_MAP != SYS_VM_PROTECT);
+    static_assert(RIGHT_REVOKE == (UINT64_C(1) << 11));
+    static_assert(RIGHT_CONNECT == (UINT64_C(1) << 17));
+    static_assert(RIGHT_ACK == (UINT64_C(1) << 18));
+    static_assert((VM_WRITE & VM_READ) == 0);
+    static_assert(STATUS_OK == 0 && STATUS_INVALID_CAP == -1);
+    static_assert(STATUS_BUSY == -7 && STATUS_PENDING == -9);
+    static_assert(STATUS_REASSERTED == -14);
+    static_assert(STATUS_ALREADY_CONNECTED == -15);
     return !cap::Handle::from_raw(0)
         && !cap::Handle::from_raw(1);
 }

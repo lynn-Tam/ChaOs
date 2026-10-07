@@ -6,13 +6,13 @@ repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 project_tmp="$repo_root/.tmp/project"
 mkdir -p "$project_tmp"
 class=$(sed -n '/class UartLoader final {/,/^};/p' "$source")
-helpers=$(printf '%s\n' "$class" | sed -n '/template<typename Lease>/,/myos::cap::CapRef root_vspace_/p')
+helpers=$(printf '%s\n' "$class" | sed -n '/template<typename Lease>/,/sys::cap::CapRef root_vspace_/p')
 
 printf '%s\n' "$class" | rg -q '\[\[nodiscard\]\] auto cleanup\(\) noexcept -> bool'
 printf '%s\n' "$class" | rg -U -q '(?s)close_lease\(scratch_\).*close_lease\(bundle_view_\).*close_task\(\);'
 printf '%s\n' "$helpers" | rg -q 'for \(;;\)'
 printf '%s\n' "$helpers" | rg -q 'retryable\(status\)'
-printf '%s\n' "$helpers" | rg -q 'myos::yield\(\)'
+printf '%s\n' "$helpers" | rg -q 'sys::yield\(\)'
 if printf '%s\n' "$helpers" | rg -q 'attempt < 4|attempt\+\+'; then
     printf '%s\n' '[audit] FAIL: UART cleanup retains bounded silent retry' >&2
     exit 1
@@ -56,7 +56,7 @@ audit_publish() {
     publish_block=$(printf '%s\n' "$class" | sed -n "${publish_start},$((helper_start - 1))p")
     printf '%s\n' "$publish_block" | rg -q 'task_\.lookup\(' || return 1
     printf '%s\n' "$publish_block" | rg -q 'thread_slot_' || return 1
-    printf '%s\n' "$publish_block" | rg -q 'MYOS_OBJECT_KIND_THREAD' || return 1
+    printf '%s\n' "$publish_block" | rg -q 'OBJECT_KIND_THREAD' || return 1
     printf '%s\n' "$publish_block" | rg -q 'execution_start\(' || return 1
 }
 

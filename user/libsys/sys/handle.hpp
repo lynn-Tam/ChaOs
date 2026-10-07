@@ -9,14 +9,14 @@
 #include <sys/syscall.hpp>
 #include <expected>
 
-namespace myos::cap {
+namespace sys::cap {
 
 // A selector plus the CSpace in which that selector is installed.  A zero
 // CSpace is the caller's current CSpace; nonzero values are borrowed manager
 // authorities used only by the remote CAP_CLOSE ABI.
 struct CapRef final {
-    myos_cap_t selector{};
-    myos_cap_t cspace{};
+    cap_t selector{};
+    cap_t cspace{};
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
         return selector != 0;
@@ -27,8 +27,8 @@ struct CapRef final {
 };
 
 template<typename Backend>
-concept CapBackend = requires(CapRef reference, myos_status_t status) {
-    { Backend::close(reference) } -> std::same_as<myos_status_t>;
+concept CapBackend = requires(CapRef reference, status_t status) {
+    { Backend::close(reference) } -> std::same_as<status_t>;
     { Backend::ownership_fault(status) } noexcept;
 };
 
@@ -53,8 +53,8 @@ public:
             return *this;
         }
         if (reference_) {
-            const myos_status_t status = close();
-            if (status != MYOS_STATUS_OK) {
+            const status_t status = close();
+            if (status != STATUS_OK) {
                 Backend::ownership_fault(status);
             }
         }
@@ -69,8 +69,8 @@ public:
         // Destruction is permitted one bounded fallback only.  A failed
         // close cannot be queued or silently discarded without losing the
         // selector, so the backend must fail-stop.
-        const myos_status_t status = Backend::close(reference_);
-        if (status == MYOS_STATUS_OK) {
+        const status_t status = Backend::close(reference_);
+        if (status == STATUS_OK) {
             reference_ = {};
             return;
         }
@@ -85,21 +85,21 @@ public:
         return reference_;
     }
 
-    [[nodiscard]] constexpr auto selector() const noexcept -> myos_cap_t {
+    [[nodiscard]] constexpr auto selector() const noexcept -> cap_t {
         return reference_.selector;
     }
 
-    [[nodiscard]] constexpr auto cspace() const noexcept -> myos_cap_t {
+    [[nodiscard]] constexpr auto cspace() const noexcept -> cap_t {
         return reference_.cspace;
     }
 
     // Explicit close retains the reference on every non-OK result.
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
+    [[nodiscard]] auto close() noexcept -> status_t {
         if (!reference_) {
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         }
-        const myos_status_t status = Backend::close(reference_);
-        if (status == MYOS_STATUS_OK) {
+        const status_t status = Backend::close(reference_);
+        if (status == STATUS_OK) {
             reference_ = {};
         }
         return status;
@@ -114,65 +114,65 @@ private:
     CapRef reference_{};
 };
 
-} // namespace myos::cap
+} // namespace sys::cap
 
-namespace myos::cap {
+namespace sys::cap {
 
 // Capability syscalls and ownership sit above the raw register ABI. All
 // CapRef inputs below are current-CSpace authorities except CAP_CLOSE, whose
 // explicit destination CSpace is represented by CapRef::cspace.
 struct SyscallBackend final {
     [[nodiscard]] static auto close(CapRef reference) noexcept
-        -> myos_status_t {
+        -> status_t {
         if (!reference) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::cap_close(
+        return ::sys::cap_close(
             reference.selector, reference.cspace).status;
     }
 
     [[noreturn]] static void ownership_fault(
-        myos_status_t status) noexcept {
+        status_t status) noexcept {
         static_cast<void>(status);
         __builtin_trap();
     }
 
     [[nodiscard]] static auto resource_create_child(
         CapRef pool,
-        myos_word_t memory,
-        myos_word_t caps,
-        myos_word_t kinds) noexcept -> SysResult {
+        word_t memory,
+        word_t caps,
+        word_t kinds) noexcept -> SysResult {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::resource_create_child(
+        return ::sys::resource_create_child(
             pool.selector, memory, caps, kinds);
     }
 
     [[nodiscard]] static auto resource_close(CapRef pool) noexcept
-        -> myos_status_t {
+        -> status_t {
         if (!current(pool)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::resource_close(pool.selector).status;
+        return ::sys::resource_close(pool.selector).status;
     }
 
-    [[nodiscard]] static auto resource_close_async(CapRef pool, CapRef events, myos_word_t badge) noexcept
-        -> myos_status_t {
-        if (!current(pool) || !current(events)) return MYOS_STATUS_BAD_ARGS;
-        return ::myos::resource_close_async(pool.selector, events.selector, badge).status;
+    [[nodiscard]] static auto resource_close_async(CapRef pool, CapRef events, word_t badge) noexcept
+        -> status_t {
+        if (!current(pool) || !current(events)) return STATUS_BAD_ARGS;
+        return ::sys::resource_close_async(pool.selector, events.selector, badge).status;
     }
 
     [[nodiscard]] static auto typed_delegate(
         CapRef source,
         CapRef destination,
         CapRef descriptor,
-        myos_word_t offset = 0) noexcept -> SysResult {
+        word_t offset = 0) noexcept -> SysResult {
         if (!current(source) || !current(descriptor)
             || destination.cspace != 0) {
             return bad_args();
         }
-        return ::myos::cap_typed_delegate(
+        return ::sys::cap_typed_delegate(
             source.selector,
             destination.selector,
             descriptor.selector,
@@ -182,23 +182,23 @@ struct SyscallBackend final {
     [[nodiscard]] static auto duplicate(
         CapRef source,
         CapRef destination,
-        myos_word_t rights) noexcept -> SysResult {
+        word_t rights) noexcept -> SysResult {
         if (!current(source) || !current(destination)) {
             return bad_args();
         }
-        return ::myos::cap_duplicate(
+        return ::sys::cap_duplicate(
             source.selector, destination.selector, rights);
     }
 
     [[nodiscard]] static auto channel_mint(
         CapRef source,
         CapRef destination,
-        myos_word_t badge,
-        myos_word_t rights) noexcept -> SysResult {
+        word_t badge,
+        word_t rights) noexcept -> SysResult {
         if (!current(source) || !current(destination) || badge == 0) {
             return bad_args();
         }
-        return ::myos::channel_mint(
+        return ::sys::channel_mint(
             source.selector, destination.selector, badge, rights);
     }
 
@@ -207,139 +207,139 @@ struct SyscallBackend final {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::vspace_create(pool.selector);
+        return ::sys::vspace_create(pool.selector);
     }
 
     [[nodiscard]] static auto cspace_create(
         CapRef pool,
-        myos_word_t slots,
-        myos_word_t pages) noexcept -> SysResult {
+        word_t slots,
+        word_t pages) noexcept -> SysResult {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::cspace_create(pool.selector, slots, pages);
+        return ::sys::cspace_create(pool.selector, slots, pages);
     }
 
     [[nodiscard]] static auto memory_create(
         CapRef pool,
-        myos_word_t size,
-        myos_word_t access) noexcept -> SysResult {
+        word_t size,
+        word_t access) noexcept -> SysResult {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::memory_create(pool.selector, size, access);
+        return ::sys::memory_create(pool.selector, size, access);
     }
 
     [[nodiscard]] static auto memory_create_pager(
         CapRef pool,
-        myos_word_t size,
-        myos_word_t access,
+        word_t size,
+        word_t access,
         CapRef pager) noexcept -> SysResult {
         if (!current(pool) || !current(pager)) {
             return bad_args();
         }
-        return ::myos::memory_create_pager(
+        return ::sys::memory_create_pager(
             pool.selector, size, access, pager.selector);
     }
 
     [[nodiscard]] static auto memory_seal(CapRef memory) noexcept
-        -> myos_status_t {
+        -> status_t {
         if (!current(memory)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::memory_seal(memory.selector).status;
+        return ::sys::memory_seal(memory.selector).status;
     }
 
     [[nodiscard]] static auto memory_populate(CapRef memory,
-        myos_word_t page) noexcept -> myos_status_t {
-        if (!current(memory)) return MYOS_STATUS_BAD_ARGS;
-        return ::myos::memory_populate(memory.selector, page).status;
+        word_t page) noexcept -> status_t {
+        if (!current(memory)) return STATUS_BAD_ARGS;
+        return ::sys::memory_populate(memory.selector, page).status;
     }
 
     [[nodiscard]] static auto memory_write(
         void* destination,
         const uint8_t* source,
-        size_t size) noexcept -> myos_status_t {
+        size_t size) noexcept -> status_t {
         // A null source is the bounded zero-fill form used for BSS/tail
         // population.  The destination remains mandatory even for an empty
         // request so callers cannot accidentally turn a bad address into a
         // successful no-op.
         if (destination == nullptr) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
         auto* const bytes = static_cast<uint8_t*>(destination);
         for (size_t index = 0; index < size; ++index) {
             bytes[index] = source == nullptr ? 0 : source[index];
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_slice(
         CapRef vspace,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t access,
-        myos_word_t rights) noexcept -> SysResult {
+        word_t address,
+        word_t size,
+        word_t access,
+        word_t rights) noexcept -> SysResult {
         if (!current(vspace)) {
             return bad_args();
         }
-        return ::myos::vm_slice(
+        return ::sys::vm_slice(
             vspace.selector, address, size, access, rights);
     }
 
     [[nodiscard]] static auto vm_map(
         CapRef region,
         CapRef memory,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t object_page,
-        myos_word_t access) noexcept -> myos_status_t {
+        word_t address,
+        word_t size,
+        word_t object_page,
+        word_t access) noexcept -> status_t {
         if (!current(region) || !current(memory)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::vm_map(
+        return ::sys::vm_map(
             region.selector, memory.selector, address, size,
             object_page, access).status;
     }
 
     [[nodiscard]] static auto vm_unmap(
         CapRef region,
-        myos_word_t address,
-        myos_word_t size) noexcept -> myos_status_t {
+        word_t address,
+        word_t size) noexcept -> status_t {
         if (!current(region)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::vm_unmap(region.selector, address, size).status;
+        return ::sys::vm_unmap(region.selector, address, size).status;
     }
 
     [[nodiscard]] static auto vm_clear(CapRef region) noexcept
-        -> myos_status_t {
+        -> status_t {
         if (!current(region)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::vm_clear(region.selector).status;
+        return ::sys::vm_clear(region.selector).status;
     }
 
     [[nodiscard]] static auto sc_bind(
         CapRef context,
-        CapRef thread) noexcept -> myos_status_t {
+        CapRef thread) noexcept -> status_t {
         if (!current(context) || !current(thread)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::sc_bind(context.selector, thread.selector).status;
+        return ::sys::sc_bind(context.selector, thread.selector).status;
     }
 
     [[nodiscard]] static auto sc_create(
         CapRef pool,
         CapRef domain,
-        myos_word_t budget,
-        myos_word_t period,
-        myos_word_t urgency,
-        myos_word_t home_cpu) noexcept -> SysResult {
+        word_t budget,
+        word_t period,
+        word_t urgency,
+        word_t home_cpu) noexcept -> SysResult {
         if (!current(pool) || !current(domain)) {
             return bad_args();
         }
-        return ::myos::sc_create(
+        return ::sys::sc_create(
             pool.selector, domain.selector, budget, period,
             urgency, home_cpu);
     }
@@ -349,23 +349,23 @@ struct SyscallBackend final {
         CapRef vspace,
         CapRef cspace,
         CapRef descriptor,
-        myos_word_t offset = 0) noexcept -> SysResult {
+        word_t offset = 0) noexcept -> SysResult {
         if (!current(pool) || !current(vspace) || !current(cspace)
             || !current(descriptor)) {
             return bad_args();
         }
-        return ::myos::thread_create(
+        return ::sys::thread_create(
             pool.selector, vspace.selector, cspace.selector,
             descriptor.selector, offset);
     }
 
     [[nodiscard]] static auto notification_create(
         CapRef pool,
-        myos_word_t badge) noexcept -> SysResult {
+        word_t badge) noexcept -> SysResult {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::notification_create(pool.selector, badge);
+        return ::sys::notification_create(pool.selector, badge);
     }
 
     [[nodiscard]] static auto notification_take(
@@ -373,24 +373,24 @@ struct SyscallBackend final {
         if (!current(notification)) {
             return bad_args();
         }
-        return ::myos::notification_take(notification.selector);
+        return ::sys::notification_take(notification.selector);
     }
 
     [[nodiscard]] static auto channel_create(
         CapRef pool,
-        myos_word_t queue,
-        myos_word_t words,
-        myos_word_t caps,
-        myos_word_t relations) noexcept -> SysResult {
+        word_t queue,
+        word_t words,
+        word_t caps,
+        word_t relations) noexcept -> SysResult {
         if (!current(pool)) {
             return bad_args();
         }
-        return ::myos::channel_create(
+        return ::sys::channel_create(
             pool.selector, queue, words, caps, relations);
     }
 
     [[nodiscard]] static auto pager_create(CapRef pool) noexcept -> SysResult {
-        return current(pool) ? ::myos::pager_create(pool.selector) : bad_args();
+        return current(pool) ? ::sys::pager_create(pool.selector) : bad_args();
     }
 
     [[nodiscard]] static auto endpoint_create(
@@ -398,12 +398,12 @@ struct SyscallBackend final {
         CapRef vspace,
         CapRef cspace,
         CapRef descriptor,
-        myos_word_t offset = 0) noexcept -> SysResult {
+        word_t offset = 0) noexcept -> SysResult {
         if (!current(pool) || !current(vspace) || !current(cspace)
             || !current(descriptor)) {
             return bad_args();
         }
-        return ::myos::endpoint_create(
+        return ::sys::endpoint_create(
             pool.selector, vspace.selector, cspace.selector,
             descriptor.selector, offset);
     }
@@ -411,11 +411,11 @@ struct SyscallBackend final {
     [[nodiscard]] static auto exit_bind(
         CapRef target,
         CapRef notification,
-        myos_word_t badge) noexcept -> myos_status_t {
+        word_t badge) noexcept -> status_t {
         if (!current(target) || !current(notification)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        return ::myos::exit_bind(
+        return ::sys::exit_bind(
             target.selector, notification.selector, badge).status;
     }
 
@@ -424,7 +424,7 @@ struct SyscallBackend final {
         if (!current(target)) {
             return bad_args();
         }
-        return ::myos::execution_start(target.selector);
+        return ::sys::execution_start(target.selector);
     }
 
     [[nodiscard]] static auto exit_query(CapRef target) noexcept
@@ -432,7 +432,7 @@ struct SyscallBackend final {
         if (!current(target)) {
             return bad_args();
         }
-        return ::myos::exit_query(target.selector);
+        return ::sys::exit_query(target.selector);
     }
 
 private:
@@ -442,16 +442,16 @@ private:
     }
 
     [[nodiscard]] static constexpr auto bad_args() noexcept -> SysResult {
-        return SysResult{.status = MYOS_STATUS_BAD_ARGS};
+        return SysResult{.status = STATUS_BAD_ARGS};
     }
 };
 
 using OwnedCap = BasicOwnedCap<SyscallBackend>;
 
 
-} // namespace myos::cap
+} // namespace sys::cap
 
-namespace myos {
+namespace sys {
 
 // Owns a task-local region and its capability references. create() additionally
 // owns the new anonymous object; map() only owns the imported capability.
@@ -477,41 +477,41 @@ struct MappedMemory final {
 
     // Return follows PTE invalidation and region retirement. A successful close
     // permits immediate reuse of the virtual range.
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
+    [[nodiscard]] auto close() noexcept -> status_t {
         if (region) {
             const auto status = vm_clear(region.selector()).status;
-            if (status != MYOS_STATUS_OK) return status;
+            if (status != STATUS_OK) return status;
             region = {};
         }
         if (owns_memory_ && memory) {
             const auto status = object_destroy(memory.selector()).status;
-            if (status != MYOS_STATUS_OK) return status;
+            if (status != STATUS_OK) return status;
         }
         memory = {};
         owns_memory_ = false;
         address = 0;
         size = 0;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
-    [[nodiscard]] static auto map(myos_cap_t vspace, cap::OwnedCap&& memory,
-        uintptr_t address, size_t size, myos_word_t access) noexcept -> std::expected<MappedMemory, myos_status_t> {
+    [[nodiscard]] static auto map(cap_t vspace, cap::OwnedCap&& memory,
+        uintptr_t address, size_t size, word_t access) noexcept -> std::expected<MappedMemory, status_t> {
         return map_impl(vspace, std::move(memory), address, size, access, false);
     }
 
     // The source stays immutable; the first write to each page belongs to this mapping.
-    [[nodiscard]] static auto map_private(myos_cap_t vspace, cap::OwnedCap&& source,
-        uintptr_t address, size_t size) noexcept -> std::expected<MappedMemory, myos_status_t> {
+    [[nodiscard]] static auto map_private(cap_t vspace, cap::OwnedCap&& source,
+        uintptr_t address, size_t size) noexcept -> std::expected<MappedMemory, status_t> {
         return map_impl(vspace, std::move(source), address, size,
-            MYOS_VM_READ | MYOS_VM_WRITE, false, MYOS_VM_MAP_PRIVATE);
+            VM_READ | VM_WRITE, false, VM_MAP_PRIVATE);
     }
 
-    [[nodiscard]] static auto create(myos_cap_t pool, myos_cap_t vspace,
-        uintptr_t address, size_t size) noexcept -> std::expected<MappedMemory, myos_status_t> {
-        const auto memory = memory_create(pool, size, MYOS_VM_READ | MYOS_VM_WRITE);
-        if (memory.status != MYOS_STATUS_OK) return std::unexpected(memory.status);
+    [[nodiscard]] static auto create(cap_t pool, cap_t vspace,
+        uintptr_t address, size_t size) noexcept -> std::expected<MappedMemory, status_t> {
+        const auto memory = memory_create(pool, size, VM_READ | VM_WRITE);
+        if (memory.status != STATUS_OK) return std::unexpected(memory.status);
         return map_impl(vspace, cap::OwnedCap{{memory.value, 0}}, address, size,
-            MYOS_VM_READ | MYOS_VM_WRITE, true);
+            VM_READ | VM_WRITE, true);
     }
 
 private:
@@ -519,7 +519,7 @@ private:
 
     void require_close() noexcept {
         const auto status = close();
-        if (status != MYOS_STATUS_OK) cap::SyscallBackend::ownership_fault(status);
+        if (status != STATUS_OK) cap::SyscallBackend::ownership_fault(status);
     }
     void take(MappedMemory& other) noexcept {
         memory = std::move(other.memory);
@@ -528,24 +528,24 @@ private:
         size = std::exchange(other.size, 0);
         owns_memory_ = std::exchange(other.owns_memory_, false);
     }
-    static auto map_impl(myos_cap_t vspace, cap::OwnedCap&& memory,
-        uintptr_t address, size_t size, myos_word_t access,
-        bool owns_memory, myos_word_t flags = 0) noexcept -> std::expected<MappedMemory, myos_status_t> {
+    static auto map_impl(cap_t vspace, cap::OwnedCap&& memory,
+        uintptr_t address, size_t size, word_t access,
+        bool owns_memory, word_t flags = 0) noexcept -> std::expected<MappedMemory, status_t> {
         MappedMemory result;
         result.memory = std::move(memory);
         result.owns_memory_ = owns_memory;
         const auto region = vm_slice(vspace, address, size, access,
-            MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
-        if (region.status != MYOS_STATUS_OK) return std::unexpected(region.status);
+            RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP | RIGHT_DESTROY);
+        if (region.status != STATUS_OK) return std::unexpected(region.status);
         result.region = cap::OwnedCap{{region.value, 0}};
         result.address = address;
         result.size = size;
         const auto mapped = vm_map(region.value, result.memory.selector(), address, size, 0, access | flags);
-        if (mapped.status != MYOS_STATUS_OK)
+        if (mapped.status != STATUS_OK)
             return std::unexpected(mapped.status);
         return result;
     }
 
 };
 
-} // namespace myos
+} // namespace sys

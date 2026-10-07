@@ -6,13 +6,13 @@
 #include <libk/checked_arithmetic.hpp>
 #include <sys/syscall.hpp>
 
-namespace myos {
+namespace sys {
 class Clock final {
     uint64_t frequency_{};
 public:
-    auto open() noexcept -> myos_status_t {
+    auto open() noexcept -> status_t {
         const auto result = clock_frequency();
-        if (result.status == MYOS_STATUS_OK) frequency_ = result.value;
+        if (result.status == STATUS_OK) frequency_ = result.value;
         return result.status;
     }
     auto after_ms(uint64_t milliseconds) const noexcept -> std::optional<uint64_t> {
@@ -22,7 +22,7 @@ public:
         if (!seconds || !fraction) return std::nullopt;
         const auto duration = libk::checked_add(*seconds, *fraction / 1000 + (*fraction % 1000 != 0));
         const auto now = clock_now();
-        return duration && now.status == MYOS_STATUS_OK
+        return duration && now.status == STATUS_OK
             ? libk::checked_add(now.value, *duration) : std::nullopt;
     }
     // Round up so an absolute tick deadline never precedes the requested time.
@@ -34,8 +34,8 @@ public:
         const auto ticks = libk::checked_add(*seconds,
             *fraction / 1'000'000'000 + (*fraction % 1'000'000'000 != 0));
         const auto now = clock_now();
-        return ticks && now.status == MYOS_STATUS_OK
+        return ticks && now.status == STATUS_OK
             ? libk::checked_add(now.value, *ticks) : std::nullopt;
     }
 };
-} // namespace myos
+} // namespace sys

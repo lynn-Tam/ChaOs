@@ -36,8 +36,8 @@ enum class TransferError : u8 {
 // move, and publishes the complete batch in one critical section.
 class Transfer final : private libk::noncopyable {
 public:
-    using Specs = libk::InplaceVector<TransferSpec, MYOS_IPC_MAX_CAPS>;
-    using Handles = libk::InplaceVector<cap::Handle, MYOS_IPC_MAX_CAPS>;
+    using Specs = libk::InplaceVector<TransferSpec, IPC_MAX_CAPS>;
+    using Handles = libk::InplaceVector<cap::Handle, IPC_MAX_CAPS>;
 
     Transfer() noexcept = default;
     Transfer(Transfer&&) noexcept = default;
@@ -96,7 +96,7 @@ private:
 
     cap::CSpace* source_{};
     cap::CSpace* destination_{};
-    libk::InplaceVector<Entry, MYOS_IPC_MAX_CAPS> entries_{};
+    libk::InplaceVector<Entry, IPC_MAX_CAPS> entries_{};
 };
 
 } // namespace ipc

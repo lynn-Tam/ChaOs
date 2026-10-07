@@ -22,3 +22,5 @@ extern const char build_id[];
 [[nodiscard]] auto kernel_phys(mm::Virt address) noexcept
     -> std::optional<mm::Phys>;
 
+
+extern "C" bool boot_guard_ok() noexcept;

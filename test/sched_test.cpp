@@ -1,4 +1,5 @@
 #include <test/test.hpp>
+#include <limits>
 
 #include <libk/manual_lifetime.hpp>
 #include <utility>
@@ -12,8 +13,7 @@
 #include <boot/link.hpp>
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
-#include <sched/queues.hpp>
-#include <sched/refill_queue.hpp>
+#include <sched/sched.hpp>
 #include <task/thread.hpp>
 
 #include <mm/table.hpp>
@@ -24,7 +24,7 @@ struct unregistered final {};
 
 static_assert(object::kind<unregistered> == object::ObjectKind::Invalid);
 
-using sched::RefillQueue;
+using sched::Sc;
 using time::Duration;
 using time::Instant;
 
@@ -45,46 +45,6 @@ constinit libk::ManualLifetime<mm::SpaceWork>
 constinit libk::ManualLifetime<mm::KSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
-
-struct DeadlineProbe final {
-    void fire() noexcept { ++fires; }
-    usize fires{};
-};
-
-bool test_deadline_queue_orders_and_removes_fixed_relations(
-    const TestContext&) noexcept {
-    DeadlineProbe probe{};
-    sched::Deadline first{
-        sched::Deadline::Callback::bind<
-            &DeadlineProbe::fire>(probe)};
-    sched::Deadline second{
-        sched::Deadline::Callback::bind<
-            &DeadlineProbe::fire>(probe)};
-    sched::Deadline later{
-        sched::Deadline::Callback::bind<
-            &DeadlineProbe::fire>(probe)};
-    sched::DeadlineQueue queue{};
-    queue.insert(later, Instant::from_ticks(30));
-    queue.insert(first, Instant::from_ticks(10));
-    queue.insert(second, Instant::from_ticks(10));
-    if (!queue.deadline() || queue.deadline()->ticks() != 10) {
-        return false;
-    }
-    auto* head = queue.front();
-    if (head == nullptr || head == &later) {
-        return false;
-    }
-    queue.remove(*head);
-    if (!queue.deadline() || queue.deadline()->ticks() != 10) {
-        return false;
-    }
-    queue.remove(*queue.front());
-    if (!queue.deadline() || queue.deadline()->ticks() != 30) {
-        return false;
-    }
-    queue.remove(later);
-    return !queue.deadline() && probe.fires == 0;
-}
 
 class SchedStorageGuard final {
 public:
@@ -147,9 +107,8 @@ private:
 };
 
 bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
-    RefillQueue queue{
-        Duration::from_ticks(10), Duration::from_ticks(100), 4,
-        Instant::from_ticks(0)};
+    Sc queue{{.budget=Duration::from_ticks(10), .period=Duration::from_ticks(100),
+              .refill_capacity=4}, Instant::from_ticks(0)};
     if (queue.available(Instant::from_ticks(0)).ticks() != 10) {
         return false;
     }
@@ -174,15 +133,13 @@ bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
 
 bool test_bounded_refill_merge_never_advances_budget(
     const TestContext&) noexcept {
-    RefillQueue queue{
-        Duration::from_ticks(8), Duration::from_ticks(40), 2,
-        Instant::from_ticks(0)};
+    Sc queue{{.budget=Duration::from_ticks(8), .period=Duration::from_ticks(40),
+              .refill_capacity=2}, Instant::from_ticks(0)};
     (void)queue.charge(Instant::from_ticks(1), Duration::from_ticks(2));
     (void)queue.charge(Instant::from_ticks(2), Duration::from_ticks(2));
     (void)queue.charge(Instant::from_ticks(3), Duration::from_ticks(2));
 
-    return queue.size() == 2
-        && queue.available(Instant::from_ticks(40)).ticks() == 2
+    return queue.available(Instant::from_ticks(40)).ticks() == 2
         && queue.available(Instant::from_ticks(41)).ticks() == 2
         && queue.available(Instant::from_ticks(42)).ticks() == 2
         && queue.available(Instant::from_ticks(43)).ticks() == 8;
@@ -194,11 +151,9 @@ bool test_refill_state_space_preserves_sliding_window(
     for (u64 budget = 1; budget <= 4; ++budget) {
         for (u64 period = budget; period <= 8; ++period) {
             for (usize capacity = 1; capacity <= 4; ++capacity) {
-                RefillQueue queue{
-                    Duration::from_ticks(budget),
-                    Duration::from_ticks(period),
-                    capacity,
-                    Instant::from_ticks(0)};
+                Sc queue{{.budget=Duration::from_ticks(budget),
+                          .period=Duration::from_ticks(period),
+                          .refill_capacity=capacity}, Instant::from_ticks(0)};
                 u64 granted[horizon]{};
 
                 for (usize tick = 0; tick < horizon; ++tick) {
@@ -211,7 +166,6 @@ bool test_refill_state_space_preserves_sliding_window(
                     if (overrun.ticks() > demand
                         || demand - overrun.ticks()
                             != (demand < available ? demand : available)
-                        || queue.size() > capacity
                         || queue.available(now).ticks() > budget) {
                         return false;
                     }
@@ -255,7 +209,8 @@ bool test_scheduling_context_config_boundaries(
         && sched::Urgency::make(
             sched::Urgency::level_count - 1)
         && !sched::Urgency::make(
-            sched::Urgency::level_count);
+            sched::Urgency::level_count)
+        && !sched::Urgency::make(256);
 }
 
 bool test_object_store_unpublished_construction_rolls_back(
@@ -633,13 +588,8 @@ bool test_domain_admission_is_conservative_and_transactional(
     if (!storage.initialize()) {
         return false;
     }
-    auto capacity = sched::DomainCapacity::create(
-        *sched_test_pmm, 1);
-    if (!capacity) {
-        return false;
-    }
     auto pending_domain = sched_test_sched->get<sched::Domain>().create(
-        std::move(capacity).value(),
+        usize{1},
         sched::Domain::share_scale,
         100'000U);
     if (!pending_domain) {
@@ -670,7 +620,7 @@ bool test_domain_admission_is_conservative_and_transactional(
     const auto rejected = domain->admit(contexts[2].get(), CpuId{0});
     const bool rejected_cleanly = !rejected
         && rejected.error()
-            == sched::Domain::Error::CapacityExceeded
+            == sched::Domain::Error::Quota
         && !contexts[2]->admitted();
     const bool released = static_cast<bool>(
         domain->unadmit(contexts[0].get()));
@@ -688,6 +638,11 @@ bool test_domain_admission_is_conservative_and_transactional(
             return false;
         }
     }
+    // Scaling must not reject a valid ratio merely because its operands are large.
+    const auto max = std::numeric_limits<u64>::max();
+    Sc wide{{.budget=Duration::from_ticks(max / 2), .period=Duration::from_ticks(max)},
+            Instant::from_ticks(0)};
+    const bool wide_valid = domain->admit(wide, CpuId{0}) && domain->unadmit(wide);
     for (auto& context : contexts) {
         if (!context.retire()) {
             return false;
@@ -701,119 +656,12 @@ bool test_domain_admission_is_conservative_and_transactional(
     sched_test_mm->drain();
     sched_test_sched->drain();
     sched_test_tasks->drain();
-    return result && sched_test_pmm->verify_invariants();
-}
-
-bool test_ready_queue_orders_priority_and_fifo(
-    const TestContext&) noexcept {
-    SchedStorageGuard storage{};
-    if (!storage.initialize()) {
-        return false;
-    }
-    auto capacity = sched::DomainCapacity::create(
-        *sched_test_pmm, 1);
-    if (!capacity) {
-        return false;
-    }
-    auto pending_domain = sched_test_sched->get<sched::Domain>().create(
-        std::move(capacity).value(),
-        sched::Domain::share_scale,
-        0U);
-    if (!pending_domain) {
-        return false;
-    }
-    auto domain = std::move(pending_domain).value().publish();
-
-    object::ref<Thread> threads[3]{};
-    object::ref<sched::Sc> contexts[3]{};
-    constexpr u8 levels[3]{2, 5, 5};
-    for (usize index = 0; index < 3; ++index) {
-        auto stack = mm::Stack::create(*sched_test_kernel);
-        if (!stack) {
-            return false;
-        }
-        auto pending_thread = sched_test_tasks->get<Thread>().create(
-            std::move(stack).value(),
-            Env::kernel(*sched_test_kernel),
-            Thread::KernelStart{unused_thread_entry, nullptr});
-        const auto urgency = sched::Urgency::make(levels[index]);
-        if (!pending_thread || !urgency) {
-            return false;
-        }
-        threads[index] = std::move(pending_thread).value().publish();
-
-        auto pending_context = sched_test_sched->get<sched::Sc>().create(
-            sched::Sc::Config{
-                .budget = Duration::from_ticks(1),
-                .period = Duration::from_ticks(10),
-                .urgency = *urgency,
-            },
-            Instant::from_ticks(0));
-        if (!pending_context) {
-            return false;
-        }
-        contexts[index] = std::move(pending_context).value().publish();
-        auto target = threads[index].clone();
-        if (!target
-            || !domain->admit(contexts[index].get(), CpuId{0})
-            || !contexts[index]->bind(std::move(target).value())) {
-            return false;
-        }
-    }
-
-    bool ordered{};
-    bool membership{};
-    {
-        sched::ReadyQueue queue{};
-        sched::Sc* const low = &contexts[0].get();
-        sched::Sc* const high_first = &contexts[1].get();
-        sched::Sc* const high_second = &contexts[2].get();
-        const auto low_urgency = contexts[0]->urgency();
-        const auto high_urgency = contexts[1]->urgency();
-        queue.enqueue(*low, low_urgency);
-        queue.enqueue(*high_first, high_urgency);
-        queue.enqueue(*high_second, high_urgency);
-
-        ordered = queue.size() == 3
-            && queue.front() == high_first
-            && queue.pop_front(high_urgency) == high_first
-            && queue.front() == high_second
-            && queue.pop_front(high_urgency) == high_second
-            && queue.front() == low
-            && queue.pop_front(low_urgency) == low
-            && queue.empty();
-        queue.enqueue(*low, low_urgency);
-        queue.remove(*low, low_urgency);
-        membership = queue.empty() && !low->queued();
-    }
-
-    for (usize index = 0; index < 3; ++index) {
-        if (!contexts[index]->unbind()
-            || !domain->unadmit(contexts[index].get())
-            || !contexts[index].retire()
-            || !threads[index].retire()) {
-            return false;
-        }
-        contexts[index].reset();
-        threads[index].reset();
-    }
-    if (!domain.retire()) {
-        return false;
-    }
-    domain.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
-    return ordered && membership && sched_test_pmm->verify_invariants();
+    return result && wide_valid && sched_test_pmm->verify_invariants();
 }
 
 } // namespace
 
 void register_sched_tests(TestRegistry& registry) noexcept {
-    (void)registry.add(
-        "sched",
-        "deadline queue orders fixed one-shot relations",
-        test_deadline_queue_orders_and_removes_fixed_relations);
     (void)registry.add(
         "sched",
         "refill ledger conserves budget and reports overrun",
@@ -854,8 +702,4 @@ void register_sched_tests(TestRegistry& registry) noexcept {
         "sched",
         "domain admission rounds conservatively and rolls back failure",
         test_domain_admission_is_conservative_and_transactional);
-    (void)registry.add(
-        "sched",
-        "ReadyQueue chooses highest urgency and preserves FIFO",
-        test_ready_queue_orders_priority_and_fifo);
 }

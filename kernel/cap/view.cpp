@@ -93,13 +93,13 @@ constexpr Rights irq_rights = Rights::of(
 
 [[nodiscard]] static auto valid(Quota limit) noexcept -> bool {
     constexpr u64 valid_kinds =
-        MYOS_OBJECT_KINDS;
+        OBJECT_KINDS;
     return (limit.object_kinds & ~valid_kinds) == 0;
 }
 
 [[nodiscard]] static auto valid(EpLimit limit) noexcept -> bool {
     return (limit.badge & ~limit.fixed) == 0
-        && limit.cap_limit <= MYOS_ENDPOINT_MAX_CAPS;
+        && limit.cap_limit <= ENDPOINT_MAX_CAPS;
 }
 
 [[nodiscard]] static auto valid(ChanLimit limit) noexcept -> bool {
@@ -250,7 +250,7 @@ template<class T>
 
 [[nodiscard]] auto rights_value(u64 raw) noexcept
     -> std::expected<Rights, AttenuationError> {
-    const auto rights = Rights::parse(raw, MYOS_RIGHT_MASK);
+    const auto rights = Rights::parse(raw, RIGHT_MASK);
     return rights
         ? std::expected<Rights, AttenuationError>{(*rights)}
         : std::expected<Rights, AttenuationError>{
@@ -259,30 +259,30 @@ template<class T>
 
 auto decode_attenuation(libk::Span<const byte> bytes) noexcept
     -> std::expected<Attenuation, AttenuationError> {
-    if (bytes.size() != MYOS_CAP_ATTENUATION_SIZE) {
+    if (bytes.size() != CAP_ATTENUATION_SIZE) {
         return std::unexpected(AttenuationError::InvalidSize);
     }
     Attenuation descriptor{
-        .version = read_le<u16>(bytes.data() + MYOS_CAP_ATTENUATION_VERSION_OFFSET),
-        .kind = read_le<u16>(bytes.data() + MYOS_CAP_ATTENUATION_KIND_OFFSET),
-        .size = read_le<u32>(bytes.data() + MYOS_CAP_ATTENUATION_SIZE_OFFSET),
-        .rights = read_le<u64>(bytes.data() + MYOS_CAP_ATTENUATION_RIGHTS_OFFSET),
+        .version = read_le<u16>(bytes.data() + CAP_ATTENUATION_VERSION_OFFSET),
+        .kind = read_le<u16>(bytes.data() + CAP_ATTENUATION_KIND_OFFSET),
+        .size = read_le<u32>(bytes.data() + CAP_ATTENUATION_SIZE_OFFSET),
+        .rights = read_le<u64>(bytes.data() + CAP_ATTENUATION_RIGHTS_OFFSET),
     };
     for (usize index = 0; index < 6; ++index) {
         descriptor.words[index] = read_le<u64>(
-            bytes.data() + MYOS_CAP_ATTENUATION_WORD0_OFFSET
+            bytes.data() + CAP_ATTENUATION_WORD0_OFFSET
             + index * sizeof(u64));
     }
-    if (descriptor.version != MYOS_CAP_ATTENUATION_VERSION_CURRENT) {
+    if (descriptor.version != CAP_ATTENUATION_VERSION_CURRENT) {
         return std::unexpected(AttenuationError::InvalidVersion);
     }
-    if (descriptor.size != MYOS_CAP_ATTENUATION_SIZE) {
+    if (descriptor.size != CAP_ATTENUATION_SIZE) {
         return std::unexpected(AttenuationError::InvalidSize);
     }
     if (!attenuation_kind(descriptor.kind)) {
         return std::unexpected(AttenuationError::InvalidKind);
     }
-    if (!Rights::parse(descriptor.rights, MYOS_RIGHT_MASK)) {
+    if (!Rights::parse(descriptor.rights, RIGHT_MASK)) {
         return std::unexpected(AttenuationError::InvalidRights);
     }
     return (descriptor);
@@ -291,36 +291,36 @@ auto decode_attenuation(libk::Span<const byte> bytes) noexcept
 auto attenuation_kind(u16 raw) noexcept
     -> std::optional<object::ObjectKind> {
     switch (raw) {
-    case MYOS_OBJECT_KIND_IO_SPACE:
+    case OBJECT_KIND_IO_SPACE:
         return object::ObjectKind::IoSpace;
-    case MYOS_OBJECT_KIND_DEVICE:
+    case OBJECT_KIND_DEVICE:
         return object::ObjectKind::Device;
-    case MYOS_OBJECT_KIND_THREAD:
+    case OBJECT_KIND_THREAD:
         return object::ObjectKind::Thread;
-    case MYOS_OBJECT_KIND_SCHED_CONTEXT:
+    case OBJECT_KIND_SCHED_CONTEXT:
         return object::ObjectKind::Sc;
-    case MYOS_OBJECT_KIND_SCHED_DOMAIN:
+    case OBJECT_KIND_SCHED_DOMAIN:
         return object::ObjectKind::Domain;
-    case MYOS_OBJECT_KIND_CSPACE:
+    case OBJECT_KIND_CSPACE:
         return object::ObjectKind::CSpace;
-    case MYOS_OBJECT_KIND_MEMORY:
+    case OBJECT_KIND_MEMORY:
         return object::ObjectKind::Mem;
-    case MYOS_OBJECT_KIND_VSPACE:
+    case OBJECT_KIND_VSPACE:
         return object::ObjectKind::VSpace;
-    case MYOS_OBJECT_KIND_RESOURCE_POOL:
+    case OBJECT_KIND_RESOURCE_POOL:
         return object::ObjectKind::group;
-    case MYOS_OBJECT_KIND_NOTIFICATION:
+    case OBJECT_KIND_NOTIFICATION:
         return object::ObjectKind::Notification;
-    case MYOS_OBJECT_KIND_ENDPOINT:
+    case OBJECT_KIND_ENDPOINT:
         return object::ObjectKind::Endpoint;
-    case MYOS_OBJECT_KIND_CHANNEL:
+    case OBJECT_KIND_CHANNEL:
         return object::ObjectKind::Channel;
-    case MYOS_OBJECT_KIND_PAGER:
+    case OBJECT_KIND_PAGER:
         return object::ObjectKind::Pager;
-    case MYOS_OBJECT_KIND_IRQ:
+    case OBJECT_KIND_IRQ:
         return object::ObjectKind::Irq;
-    case MYOS_OBJECT_KIND_INVALID:
-    case MYOS_OBJECT_KIND_COUNT:
+    case OBJECT_KIND_INVALID:
+    case OBJECT_KIND_COUNT:
         return std::nullopt;
     }
     return std::nullopt;
@@ -437,7 +437,7 @@ auto make_attenuation_ceiling(
     case object::ObjectKind::Endpoint: {
         if (!words_zero(descriptor, 3)
             || (descriptor.words[0] & ~descriptor.words[1]) != 0
-            || descriptor.words[2] > MYOS_ENDPOINT_MAX_CAPS) {
+            || descriptor.words[2] > ENDPOINT_MAX_CAPS) {
             return std::unexpected(AttenuationError::InvalidData);
         }
         const auto cap_limit = usize_value(descriptor.words[2]);
@@ -453,8 +453,8 @@ auto make_attenuation_ceiling(
 
     case object::ObjectKind::Channel: {
         if (!words_zero(descriptor, 3)
-            || (descriptor.words[0] != MYOS_CAP_CHANNEL_SIDE_A
-                && descriptor.words[0] != MYOS_CAP_CHANNEL_SIDE_B)) {
+            || (descriptor.words[0] != CAP_CHANNEL_SIDE_A
+                && descriptor.words[0] != CAP_CHANNEL_SIDE_B)) {
             return std::unexpected(AttenuationError::InvalidData);
         }
         const bool unbound = descriptor.words[1] == 0
@@ -464,7 +464,7 @@ auto make_attenuation_ceiling(
         if (!unbound && !exact) {
             return std::unexpected(AttenuationError::InvalidData);
         }
-        const auto side = descriptor.words[0] == MYOS_CAP_CHANNEL_SIDE_A
+        const auto side = descriptor.words[0] == CAP_CHANNEL_SIDE_A
             ? ChannelSide::A : ChannelSide::B;
         return (View{
             child_rights,

@@ -4,20 +4,20 @@
 #include <sys/storage.hpp>
 
 namespace {
-using namespace myos;
+using namespace sys;
 io::ClientSession sessions[2];
 constexpr uint64_t FileSize = 16397;
-void check(bool condition) { if (!condition) exit(MYOS_STATUS_INTERNAL); }
+void check(bool condition) { if (!condition) exit(STATUS_INTERNAL); }
 }
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
+extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     const auto info = service::bootstrap(address, size);
-    const auto events = service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION);
-    const auto vspace = service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE);
-    const auto directory = service::capability(info, bootstrap::imports::Files);
-    const auto pool = service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
+    const auto events = service::capability(info, BOOT_EVENTS);
+    const auto vspace = service::capability(info, BOOT_VSPACE);
+    const auto directory = service::capability(info, boot::Files);
+    const auto pool = service::capability(info, BOOT_POOL);
     // No descendant exists: completion precedes arming the blocking revoke.
-    const auto disposable = memory_create(pool, 4096, MYOS_VM_READ | MYOS_VM_WRITE);
+    const auto disposable = memory_create(pool, 4096, VM_READ | VM_WRITE);
     service::require(disposable.status);
     cap::OwnedCap temporary{{disposable.value, 0}};
     service::require(cap_revoke(temporary.selector(), false).status);
@@ -26,7 +26,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     uint64_t handles[2]{};
     for (size_t i = 0; i < 2; ++i) {
         uint64_t value{};
-        service::require(sessions[i].connect(directory, pool, service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), events, vspace,
+        service::require(sessions[i].connect(directory, pool, service::capability(info, BOOT_CSPACE), events, vspace,
             0x70000000 + i * 0x100000, value));
         io::ControlMessage list{.operation = static_cast<uint64_t>(files::Control::List)};
         service::require(sessions[i].exchange(list));
@@ -43,22 +43,22 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     for (size_t i = 0; i < 2; ++i) {
         io::ControlMessage request{.operation = static_cast<uint64_t>(files::Control::Map),
             .value = handles[i], .size = 1};
-        request.data[0] = MYOS_VM_READ | MYOS_VM_EXECUTE;
+        request.data[0] = VM_READ | VM_EXECUTE;
         io::ControlPacket packet;
-        check(sessions[i].exchange(request, packet) == MYOS_STATUS_DENIED && packet.count == 0);
+        check(sessions[i].exchange(request, packet) == STATUS_DENIED && packet.count == 0);
         request = {.operation = static_cast<uint64_t>(files::Control::Map), .value = handles[i], .size = 1};
-        request.data[0] = MYOS_VM_READ;
+        request.data[0] = VM_READ;
         service::require(sessions[i].exchange(request, packet));
         check(packet.count == 1 && request.size == 8 && files::file_size(request) == FileSize);
         if (i == 0) identity = request.value;
         else check(identity != 0 && identity == request.value);
         // The response conveys Map-only content authority; it cannot initialize
         // or modify the server's canonical backing object.
-        check(memory_write(packet.capabilities[0].selector(), 0, 0, 1).status == MYOS_STATUS_BAD_RIGHTS);
-        check(mem_trim(packet.capabilities[0].selector(), 0, 1).status == MYOS_STATUS_BAD_RIGHTS);
-        check(mem_writeback(packet.capabilities[0].selector(), 0).status == MYOS_STATUS_BAD_RIGHTS);
+        check(memory_write(packet.capabilities[0].selector(), 0, 0, 1).status == STATUS_BAD_RIGHTS);
+        check(mem_trim(packet.capabilities[0].selector(), 0, 1).status == STATUS_BAD_RIGHTS);
+        check(mem_writeback(packet.capabilities[0].selector(), 0).status == STATUS_BAD_RIGHTS);
         auto mapped = MappedMemory::map(vspace, std::move(packet.capabilities[0]),
-            0x75000000 + i * 0x100000, mapped_size, MYOS_VM_READ);
+            0x75000000 + i * 0x100000, mapped_size, VM_READ);
         check(static_cast<bool>(mapped));
         mappings[i] = std::move(*mapped);
         const auto* bytes = reinterpret_cast<const volatile uint8_t*>(mappings[i].address);
@@ -69,7 +69,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     // initially reads that source, then owns only the pages it changes.
     io::ControlMessage private_request{.operation = static_cast<uint64_t>(files::Control::Map),
         .value = handles[0], .size = 1};
-    private_request.data[0] = MYOS_VM_READ;
+    private_request.data[0] = VM_READ;
     io::ControlPacket private_packet;
     service::require(sessions[0].exchange(private_request, private_packet));
     check(private_packet.count == 1 && private_request.value == identity);
@@ -117,7 +117,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                     check(result == libk::RingResult::Ready);
                     size_t slot{};
                     while (slot < io::QueueDepth && ids[i][slot] != completion.id) ++slot;
-                    check(slot < io::QueueDepth && completion.status == MYOS_STATUS_OK && completion.flags == 0);
+                    check(slot < io::QueueDepth && completion.status == STATUS_OK && completion.flags == 0);
                     const auto offset = offsets[i][slot];
                     const auto available = offset >= FileSize ? 0 : FileSize - offset;
                     const auto expected = available < io::BufferSize ? available : io::BufferSize;
@@ -140,7 +140,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         service::require(sessions[i].exchange(opened));
         check(opened.value != handles[i]);
         closed.value = handles[i];
-        check(sessions[i].exchange(closed) == MYOS_STATUS_NOT_FOUND);
+        check(sessions[i].exchange(closed) == STATUS_NOT_FOUND);
         // Close while reads remain published; acknowledgement ends all admitted
         // downstream access without requiring the caller to consume every CQ.
         for (size_t slot = 0; slot < io::QueueDepth; ++slot) {
@@ -164,12 +164,12 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
         for (size_t i = 0; i < 2; ++i) {
             uint64_t value{};
             service::require(sessions[i].connect(directory, pool,
-                service::capability(info, MYOS_BOOTSTRAP_CAP_CSPACE), events, vspace,
+                service::capability(info, BOOT_CSPACE), events, vspace,
                 0x70000000 + i * 0x100000, value));
             for (size_t byte = 0; byte < io::PayloadSize; ++byte) check(sessions[i].payload()[byte] == 0);
             io::ControlMessage stale{.operation = static_cast<uint64_t>(files::Control::Map), .value = handles[i], .size = 1};
-            stale.data[0] = MYOS_VM_READ;
-            check(sessions[i].exchange(stale) == MYOS_STATUS_NOT_FOUND);
+            stale.data[0] = VM_READ;
+            check(sessions[i].exchange(stale) == STATUS_NOT_FOUND);
             io::ControlMessage opened{.operation = static_cast<uint64_t>(files::Control::Open), .size = 8};
             service::copy(opened.data, "DATA.BIN", 8);
             service::require(sessions[i].exchange(opened));
@@ -186,7 +186,7 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
                 service::require(sessions[i].arm());
                 service::require(notification_wait(events).status);
             }
-            check(completion.status == MYOS_STATUS_OK && completion.bytes == io::BufferSize);
+            check(completion.status == STATUS_OK && completion.bytes == io::BufferSize);
             check(sessions[i].payload()[0] == 13);
         }
         for (auto& session : sessions) service::require(session.close());

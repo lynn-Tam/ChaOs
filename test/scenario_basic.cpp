@@ -1,8 +1,8 @@
 #include <utility>
 #include <test/scenario.hpp>
 
-#include <arch/boot_stack.hpp>
-#include <arch/ipi.hpp>
+#include <boot/link.hpp>
+#include <cpu.hpp>
 #include <state.hpp>
 #include <cpu/runtime.hpp>
 #include <cpu/registry.hpp>
@@ -20,7 +20,7 @@ auto ordinary(const BootInfo& boot) noexcept -> bool {
         && boot.cpu.summary().count != 0
         && boot.timebase_frequency != 0
         && boot.fdt
-        && arch_boot_stack_guard_intact();
+        && boot_guard_ok();
     if (result) {
         console::print<"[scenario] ordinary ok\n">();
     }
@@ -90,94 +90,73 @@ auto trap(CpuRuntime& runtime) noexcept -> bool {
 
 namespace {
 
-struct DispatchState final {
-    libk::Atomic<u32> ran{};
+struct DispatchState {
+    std::array<usize, 3> order{};
+    usize count{};
 };
+struct DispatchArg { DispatchState* state; usize id; };
 
-void dispatch_entry(void* argument) noexcept {
-    auto& state = *static_cast<DispatchState*>(argument);
-    state.ran.store<libk::MemoryOrder::Release>(1);
-    sched::exit_current();
+void dispatch_entry(void* p) noexcept {
+    auto& a = *static_cast<DispatchArg*>(p);
+    sync::Irq irq;
+    a.state->order[a.state->count++] = a.id;
 }
 
 } // namespace
 
 auto dispatch(CpuRuntime& runtime) noexcept -> bool {
-    if (runtime.local.descriptor == nullptr || runtime.kernel == nullptr
-        || runtime.owner_registry == nullptr) {
-        return false;
+    libk_assert(runtime.kernel && runtime.owner_registry && runtime.local.descriptor);
+    auto& k = *runtime.kernel;
+    auto& cpus = *runtime.owner_registry;
+    const auto cpu = runtime.local.descriptor->logical_id();
+    const auto budget = k.clock().duration_from_nanoseconds(1'000'000);
+    const auto period = k.clock().duration_from_nanoseconds(10'000'000);
+    libk_assert(budget && period);
+    DispatchState state;
+    std::array<DispatchArg, 3> args{};
+    std::array<object::ref<Thread>, 3> threads{};
+    std::array<object::ref<sched::Sc>, 3> scs{};
+    constexpr std::array<u8, 3> priority{2, 5, 5};
+    for (usize i = 0; i < threads.size(); ++i) {
+        args[i] = {&state, i};
+        auto stack = mm::Stack::create(k.kernel_vspace());
+        libk_assert(stack);
+        auto t = k.pool<Thread>().create(std::move(*stack), Env::kernel(k.kernel_vspace()),
+                                       Thread::KernelStart{dispatch_entry, &args[i]});
+        libk_assert(t);
+        threads[i] = std::move(*t).publish();
+        auto c = k.pool<sched::Sc>().create(sched::Sc::Config{
+            .budget=*budget, .period=*period, .urgency=*sched::Urgency::make(priority[i])},
+            k.clock().now());
+        libk_assert(c);
+        scs[i] = std::move(*c).publish();
+        auto ref = threads[i].clone();
+        libk_assert(ref && k.kernel_domain().admit(scs[i].get(), cpu)
+                    && scs[i]->bind(std::move(*ref)));
     }
-    KernelState& kernel = *runtime.kernel;
-    auto stack = mm::Stack::create(kernel.kernel_vspace());
-    if (!stack) {
-        return false;
+    // Publish all candidates before dispatch so urgency and equal-priority
+    // FIFO are tested through real context switches, not a queue fixture.
+    const bool enabled = arch::disable_interrupts();
+    for (auto& sc : scs) libk_assert(sched::start(cpus, sc.get()));
+    sched::yield();
+    arch::restore_interrupts(enabled);
+    const auto duration = k.clock().duration_from_nanoseconds(100'000'000);
+    const auto until = duration ? k.clock().now().checked_add(*duration) : std::nullopt;
+    libk_assert(until);
+    for (auto& thread : threads) {
+        while (!thread->stopped() && k.clock().now() < *until) sched::yield();
+        libk_assert(thread->stopped());
     }
-    DispatchState state{};
-    auto pending_thread = kernel.pool<Thread>().create(
-        std::move(stack).value(),
-        Env::kernel(kernel.kernel_vspace()),
-        Thread::KernelStart{dispatch_entry, &state});
-    if (!pending_thread) {
-        return false;
+    const bool ordered = state.count == 3 && state.order == std::array<usize, 3>{1, 2, 0};
+    for (usize i = 0; i < scs.size(); ++i) {
+        libk_assert(!scs[i]->bound() && k.kernel_domain().unadmit(scs[i].get()));
+        libk_assert(scs[i].retire() && threads[i].retire());
+        scs[i].reset();
+        threads[i].reset();
     }
-    auto thread = std::move(pending_thread).value().publish();
-    const auto budget = kernel.clock().duration_from_nanoseconds(1'000'000);
-    const auto period = kernel.clock().duration_from_nanoseconds(10'000'000);
-    if (!budget || !period) {
-        static_cast<void>(thread.retire());
-        thread.reset();
-        kernel.drain_reclaim();
-        return false;
-    }
-    auto pending_context = kernel.pool<sched::Sc>().create(
-        sched::Sc::Config{.budget = *budget, .period = *period},
-        kernel.clock().now());
-    if (!pending_context) {
-        static_cast<void>(thread.retire());
-        thread.reset();
-        kernel.drain_reclaim();
-        return false;
-    }
-    auto context = std::move(pending_context).value().publish();
-    const CpuId cpu = runtime.local.descriptor->logical_id();
-    auto admitted = kernel.kernel_domain().admit(context.get(), cpu);
-    auto target = thread.clone();
-    if (!admitted || !target
-        || !context->bind(std::move(target).value())) {
-        if (context->admitted()) {
-            static_cast<void>(kernel.kernel_domain().unadmit(context.get()));
-        }
-        static_cast<void>(context.retire());
-        context.reset();
-        static_cast<void>(thread.retire());
-        thread.reset();
-        kernel.drain_reclaim();
-        return false;
-    }
-
-    sched::Sc* const binding = &context.get();
-    const bool started = binding != nullptr
-        && static_cast<bool>(sched::start(*runtime.owner_registry, *binding));
-    if (started) {
-        sched::yield();
-    }
-    const bool context_unbound = !context->bound()
-        || static_cast<bool>(context->unbind());
-    const bool unadmitted = static_cast<bool>(
-        kernel.kernel_domain().unadmit(context.get()));
-    const bool context_retired = context.retire();
-    const bool thread_retired = thread.retire();
-    context.reset();
-    thread.reset();
-    kernel.drain_reclaim();
-    const bool result = started
-        && state.ran.load<libk::MemoryOrder::Acquire>() != 0
-        && context_unbound && unadmitted
-        && context_retired && thread_retired;
-    if (result) {
-        console::print<"[scenario] dispatch ok\n">();
-    }
-    return result;
+    k.drain_reclaim();
+    if (ordered) console::print<"[scenario] dispatch ok\n">();
+    return ordered;
 }
 
 } // namespace test::scenario

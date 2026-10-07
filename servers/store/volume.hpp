@@ -11,7 +11,7 @@ extern "C" int lfs_file_map(lfs_t*, lfs_file_t*, lfs_off_t,
     lfs_block_t*, lfs_off_t*, lfs_size_t*);
 extern "C" void lfs_file_drop(lfs_t*, lfs_file_t*);
 
-namespace myos::store {
+namespace sys::store {
 
 // This adapter is the sole owner of the disk geometry and littlefs state.
 // A 4 KiB logical erase is a real full-block overwrite on a sector device;
@@ -19,10 +19,10 @@ namespace myos::store {
 class Volume final : private libk::noncopyable_nonmovable {
 public:
     static constexpr uint32_t BlockSize = 4096;
-    [[nodiscard]] auto open(block::client& backend) noexcept -> myos_status_t {
+    [[nodiscard]] auto open(block::client& backend) noexcept -> status_t {
         backend_ = &backend;
         const uint64_t blocks = backend.capacity() / BlockSize;
-        if (blocks < 8 || blocks > UINT32_MAX) return MYOS_STATUS_BAD_ARGS;
+        if (blocks < 8 || blocks > UINT32_MAX) return STATUS_BAD_ARGS;
         config_ = {};
         config_.context = this;
         config_.read = read;
@@ -41,12 +41,12 @@ public:
         config_.lookahead_buffer = lookahead_;
         const int result = lfs_mount(&fs_, &config_);
         if (failed_) return last_error_;
-        if (result == LFS_ERR_CORRUPT || result == LFS_ERR_NOENT) return MYOS_STATUS_OK;
+        if (result == LFS_ERR_CORRUPT || result == LFS_ERR_NOENT) return STATUS_OK;
         mounted_ = result == 0;
         return status(result);
     }
 
-    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> myos_status_t {
+    [[nodiscard]] auto format(const uint8_t* id = nullptr) noexcept -> status_t {
         if (mounted_) {
             const int unmounted = lfs_unmount(&fs_);
             if (unmounted < 0) return status(unmounted);
@@ -59,29 +59,29 @@ public:
         if (failed_) return last_error_;
         mounted_ = mounted == 0;
         if (mounted < 0) return status(mounted);
-        if (id == nullptr) return MYOS_STATUS_OK;
+        if (id == nullptr) return STATUS_OK;
         const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, VolumeIdSize);
         if (written < 0) return error(written);
         const auto synced = backend_->flush();
-        if (synced != MYOS_STATUS_OK) {
+        if (synced != STATUS_OK) {
             failed_ = true;
             last_error_ = synced;
         }
         return synced;
     }
 
-    [[nodiscard]] auto identity(uint8_t (&id)[VolumeIdSize]) noexcept -> myos_status_t {
-        if (!mounted_) return MYOS_STATUS_BACKING_FAILED;
+    [[nodiscard]] auto identity(uint8_t (&id)[VolumeIdSize]) noexcept -> status_t {
+        if (!mounted_) return STATUS_BACKING_FAILED;
         const auto size = lfs_getattr(&fs_, "/", IdentityAttribute, id, sizeof(id));
-        if (size == LFS_ERR_NOATTR) return MYOS_STATUS_NOT_FOUND;
+        if (size == LFS_ERR_NOATTR) return STATUS_NOT_FOUND;
         if (size < 0) return error(size);
-        return size == sizeof(id) ? MYOS_STATUS_OK : MYOS_STATUS_BACKING_FAILED;
+        return size == sizeof(id) ? STATUS_OK : STATUS_BACKING_FAILED;
     }
 
     // No cursor change or data-cache mutation. The server pins filesystem
     // mutation until all reads using these physical extents have completed.
     [[nodiscard]] auto extent(lfs_file_t& file, uint64_t offset, size_t size) noexcept
-        -> std::expected<io::extent, myos_status_t> {
+        -> std::expected<io::extent, status_t> {
         lfs_block_t block{};
         lfs_off_t off{};
         lfs_size_t bytes = size;
@@ -94,7 +94,7 @@ public:
 
     [[nodiscard]] auto mounted() const noexcept -> bool { return mounted_; }
     [[nodiscard]] auto failed() const noexcept -> bool { return failed_; }
-    [[nodiscard]] auto error(int result) const noexcept -> myos_status_t {
+    [[nodiscard]] auto error(int result) const noexcept -> status_t {
         return failed_ ? last_error_ : status(result);
     }
     [[nodiscard]] auto fs() noexcept -> lfs_t* { return &fs_; }
@@ -103,16 +103,16 @@ private:
     static constexpr uint32_t SectorSize = 512;
     static constexpr uint8_t IdentityAttribute = 1;
 
-    [[nodiscard]] static auto status(int result) noexcept -> myos_status_t {
+    [[nodiscard]] static auto status(int result) noexcept -> status_t {
         switch (result) {
-        case LFS_ERR_OK: return MYOS_STATUS_OK;
-        case LFS_ERR_NOENT: return MYOS_STATUS_NOT_FOUND;
-        case LFS_ERR_NOSPC: case LFS_ERR_NOMEM: return MYOS_STATUS_NO_MEMORY;
-        case LFS_ERR_EXIST: return MYOS_STATUS_BUSY;
+        case LFS_ERR_OK: return STATUS_OK;
+        case LFS_ERR_NOENT: return STATUS_NOT_FOUND;
+        case LFS_ERR_NOSPC: case LFS_ERR_NOMEM: return STATUS_NO_MEMORY;
+        case LFS_ERR_EXIST: return STATUS_BUSY;
         case LFS_ERR_INVAL: case LFS_ERR_NAMETOOLONG: case LFS_ERR_FBIG:
         case LFS_ERR_BADF: case LFS_ERR_ISDIR: case LFS_ERR_NOTDIR:
-        case LFS_ERR_NOTEMPTY: return MYOS_STATUS_BAD_ARGS;
-        default: return MYOS_STATUS_BACKING_FAILED;
+        case LFS_ERR_NOTEMPTY: return STATUS_BAD_ARGS;
+        default: return STATUS_BACKING_FAILED;
         }
     }
 
@@ -122,26 +122,26 @@ private:
         const auto result = op == io::Operation::Read
             ? backend_->read(offset, static_cast<uint8_t*>(data), size)
             : program(offset, data, size);
-        if (result == MYOS_STATUS_OK) return 0;
+        if (result == STATUS_OK) return 0;
         failed_ = true;
         last_error_ = result;
         return LFS_ERR_IO;
     }
-    [[nodiscard]] auto program(uint64_t offset, void* data, size_t size) noexcept -> myos_status_t {
+    [[nodiscard]] auto program(uint64_t offset, void* data, size_t size) noexcept -> status_t {
         // littlefs still runs in one ordered execution. Independent physical
         // writes may remain in flight; overlapping writes/readback and its
         // sync callback establish their actual device dependencies.
         const auto dependency = backend_->dependencies(offset, size);
-        if (dependency != MYOS_STATUS_OK) return dependency;
+        if (dependency != STATUS_OK) return dependency;
         io::Request request{.operation = static_cast<uint64_t>(io::Operation::Write),
             .offset = offset, .length = size};
         for (;;) {
             const auto status = backend_->submit(request, data);
-            if (status != MYOS_STATUS_BUSY) return status;
+            if (status != STATUS_BUSY) return status;
             io::Completion result{};
             const auto taken = backend_->wait(result);
-            if (taken != MYOS_STATUS_OK) return taken;
-            if (result.status != MYOS_STATUS_OK) return result.status;
+            if (taken != STATUS_OK) return taken;
+            if (result.status != STATUS_OK) return result.status;
         }
     }
     [[nodiscard]] static auto self(const lfs_config* config) noexcept -> Volume& {
@@ -168,7 +168,7 @@ private:
         auto& volume = self(config);
         if (volume.failed_) return LFS_ERR_IO;
         const auto status = volume.backend_->flush();
-        if (status == MYOS_STATUS_OK) return 0;
+        if (status == STATUS_OK) return 0;
         volume.failed_ = true;
         volume.last_error_ = status;
         return LFS_ERR_IO;
@@ -181,11 +181,11 @@ private:
     uint8_t write_cache_[BlockSize]{};
     uint8_t lookahead_[SectorSize]{};
     uint8_t erased_[BlockSize]{};
-    myos_status_t last_error_{};
+    status_t last_error_{};
     bool mounted_{};
     bool failed_{};
 public:
     Volume() noexcept { for (auto& byte : erased_) byte = 0xff; }
 };
 
-} // namespace myos::store
+} // namespace sys::store

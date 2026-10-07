@@ -9,7 +9,7 @@
 #include <mm/vspace.hpp>
 #include <mm/kspace.hpp>
 
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
 #include <cpu/local.hpp>
@@ -197,7 +197,7 @@ auto Thread::begin_wait(
 }
 
 void Thread::block() noexcept {
-    libk_assert(!arch::interrupts_enabled() && arch::trap_depth() == 0);
+    libk_assert(!arch::interrupts_enabled() && arch::local()->depth == 0);
     auto& wait = current_wait();
     while (wait.attached()) {
         if (wait.ready()) static_cast<void>(wait.finish());
@@ -270,7 +270,7 @@ void Thread::request_stop(Stop& request) noexcept {
 
 void Thread::finish(
     Exit::Reason reason,
-    myos_status_t status) noexcept {
+    status_t status) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(state_ == State::Exited
@@ -287,12 +287,12 @@ void Thread::finish(
 }
 
 void Thread::finish_stop() noexcept {
-    finish(Exit::Reason::Stop, MYOS_STATUS_CANCELED);
+    finish(Exit::Reason::Stop, STATUS_CANCELED);
 }
 
-void Thread::finish_exit(myos_status_t status) noexcept {
+void Thread::finish_exit(status_t status) noexcept {
     finish(
-        status == MYOS_STATUS_OK
+        status == STATUS_OK
             ? Exit::Reason::Normal : Exit::Reason::Failed,
         status);
 }
@@ -512,7 +512,7 @@ void Thread::finish_retire() noexcept {
 
 void Thread::prepare(usize top) noexcept {
     libk_assert(top >= stack_.base() && top <= stack_.top() && (top & 0xfU) == 0);
-    arch::prepare_context(ctx_, {.stack_top = top, .entry = &Thread::start, .argument = this});
+    ctx_ = arch::Ctx{top, &Thread::start, this};
 }
 
 void Thread::set_state(Thread::State state) noexcept {

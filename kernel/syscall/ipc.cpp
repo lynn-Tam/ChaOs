@@ -22,18 +22,18 @@
 namespace syscall {
 
 [[nodiscard]] static auto status(ipc::NotificationError error) noexcept
-    -> myos_status_t {
+    -> status_t {
     switch (error) {
     case ipc::NotificationError::Closed:
-        return MYOS_STATUS_CLOSED;
+        return STATUS_CLOSED;
     case ipc::NotificationError::Empty:
-        return MYOS_STATUS_RETRY;
+        return STATUS_RETRY;
     case ipc::NotificationError::Busy:
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     case ipc::NotificationError::InvalidBadge:
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     }
-    return MYOS_STATUS_INTERNAL;
+    return STATUS_INTERNAL;
 }
 
 [[nodiscard]] static auto resolve(
@@ -55,11 +55,11 @@ template<usize op>
     const auto* const authority = std::get_if<cap::Badge>(
         &effective.data);
     if (authority == nullptr || authority->badge == 0) {
-        return returned(MYOS_STATUS_INTERNAL);
+        return returned(STATUS_INTERNAL);
     }
     return returned(notification.value()->signal(authority->badge)
-        ? MYOS_STATUS_OK
-        : MYOS_STATUS_CLOSED);
+        ? STATUS_OK
+        : STATUS_CLOSED);
 }
 
 template<usize op>
@@ -71,7 +71,7 @@ template<usize op>
     auto badges = notification.value()->take();
     return badges
         ? Result{
-              MYOS_STATUS_OK,
+              STATUS_OK,
               badges.value().badges,
               Disposition::Return,
               badges.value().sequence}
@@ -89,13 +89,13 @@ template<usize op>
     Thread* const thread = inv.target;
     libk_assert(thread != nullptr);
     if (thread->waiting()) {
-        return returned(MYOS_STATUS_BUSY);
+        return returned(STATUS_BUSY);
     }
     const auto ticks = inv.trap.arg(1);
     const auto deadline = ticks == 0 ? std::optional<time::Instant>{}
         : std::optional<time::Instant>{time::Instant::from_ticks(ticks)};
     auto self = notification.value().reference();
-    if (!self) return returned(MYOS_STATUS_CLOSED);
+    if (!self) return returned(STATUS_CLOSED);
     auto* target = &notification.value().object();
     // Storage survives the wait, while the admission lease must not stall revoke.
     notification.value().reset();
@@ -105,33 +105,33 @@ template<usize op>
 }
 
 [[nodiscard]] static auto endpoint_status(ipc::EndpointError error) noexcept
-    -> myos_status_t {
+    -> status_t {
     switch (error) {
     case ipc::EndpointError::Closed:
-        return MYOS_STATUS_CLOSED;
+        return STATUS_CLOSED;
     case ipc::EndpointError::Busy:
     case ipc::EndpointError::QueueFull:
-        return MYOS_STATUS_WOULD_BLOCK;
+        return STATUS_WOULD_BLOCK;
     case ipc::EndpointError::InvalidConfig:
     case ipc::EndpointError::InvalidCaller:
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     case ipc::EndpointError::DepthExceeded:
     case ipc::EndpointError::BudgetTooLow:
     case ipc::EndpointError::Denied:
-        return MYOS_STATUS_DENIED;
+        return STATUS_DENIED;
     case ipc::EndpointError::GenerationExhausted:
-        return MYOS_STATUS_INTERNAL;
+        return STATUS_INTERNAL;
     case ipc::EndpointError::TransferFailed:
-        return MYOS_STATUS_TRANSFER_FAILED;
+        return STATUS_TRANSFER_FAILED;
     }
-    return MYOS_STATUS_INTERNAL;
+    return STATUS_INTERNAL;
 }
 
 template<usize op>
 [[nodiscard]] auto endpoint_call(Call& inv) noexcept -> Result {
     Thread* const thread = inv.target;
     if (thread == nullptr) {
-        return returned(MYOS_STATUS_INVALID_OP);
+        return returned(STATUS_INVALID_OP);
     }
     auto endpoint = inv.cspace.resolve<ipc::Endpoint>(
         handle_of(inv.trap.arg(0)),
@@ -151,7 +151,7 @@ template<usize op>
         const auto expires = duration
             ? clock.now().checked_add(*duration) : std::nullopt;
         if (!expires) {
-            return returned(MYOS_STATUS_BAD_ARGS);
+            return returned(STATUS_BAD_ARGS);
         }
         deadline = *expires;
     }
@@ -167,7 +167,7 @@ template<usize op>
     if (!entered) {
         return returned(endpoint_status(entered.error()));
     }
-    return Result{MYOS_STATUS_OK, 0, Disposition::Resume};
+    return Result{STATUS_OK, 0, Disposition::Resume};
 }
 
 template<usize op>
@@ -186,7 +186,7 @@ template<usize op>
         status,
         value);
     return replied
-        ? Result{MYOS_STATUS_OK, 0, Disposition::Resume}
+        ? Result{STATUS_OK, 0, Disposition::Resume}
         : returned(endpoint_status(replied.error()));
 }
 
@@ -203,7 +203,7 @@ template<usize op>
         *inv.cpu.dispatcher(),
         static_cast<isize>(inv.trap.arg(0)));
     return aborted
-        ? Result{MYOS_STATUS_OK, 0, Disposition::Resume}
+        ? Result{STATUS_OK, 0, Disposition::Resume}
         : returned(endpoint_status(aborted.error()));
 }
 
@@ -216,7 +216,7 @@ template<usize op>
         return returned(cap_status(endpoint.error()));
     }
     endpoint.value()->close();
-    return returned(MYOS_STATUS_OK);
+    return returned(STATUS_OK);
 }
 
 template<usize op>
@@ -227,9 +227,9 @@ template<usize op>
     const auto rights = rights_of(inv.trap.arg(4));
     const usize cap_limit = inv.trap.arg(3);
     if (!endpoint || !rights || !rights->contains(cap::Right::Call)
-        || cap_limit > MYOS_ENDPOINT_MAX_CAPS) {
+        || cap_limit > ENDPOINT_MAX_CAPS) {
         return returned(!endpoint
-            ? cap_status(endpoint.error()) : MYOS_STATUS_BAD_ARGS);
+            ? cap_status(endpoint.error()) : STATUS_BAD_ARGS);
     }
 
     const cap::EpLimit data{
@@ -244,7 +244,7 @@ template<usize op>
             cap::View{*rights, data},
             cap::View{*rights, data});
         return returned(
-            minted ? MYOS_STATUS_OK : cap_status(minted.error()),
+            minted ? STATUS_OK : cap_status(minted.error()),
             minted ? minted.value().raw() : 0);
     };
     const cap::Handle target = handle_of(inv.trap.arg(1));
@@ -258,33 +258,33 @@ template<usize op>
         : returned(cap_status(dest.error()));
 }
 
-[[nodiscard]] static auto status(ipc::ChannelError error) noexcept -> myos_status_t {
+[[nodiscard]] static auto status(ipc::ChannelError error) noexcept -> status_t {
     switch (error) {
     case ipc::ChannelError::Canceled:
-        return MYOS_STATUS_CANCELED;
+        return STATUS_CANCELED;
     case ipc::ChannelError::InvalidCap:
-        return MYOS_STATUS_INVALID_CAP;
+        return STATUS_INVALID_CAP;
     case ipc::ChannelError::Closed:
-        return MYOS_STATUS_CLOSED;
+        return STATUS_CLOSED;
     case ipc::ChannelError::PeerClosed:
-        return MYOS_STATUS_PEER_CLOSED;
+        return STATUS_PEER_CLOSED;
     case ipc::ChannelError::WouldBlock:
-        return MYOS_STATUS_WOULD_BLOCK;
+        return STATUS_WOULD_BLOCK;
     case ipc::ChannelError::Denied:
-        return MYOS_STATUS_DENIED;
+        return STATUS_DENIED;
     case ipc::ChannelError::Busy:
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     case ipc::ChannelError::ResourceExhausted:
-        return MYOS_STATUS_NO_MEMORY;
+        return STATUS_NO_MEMORY;
     case ipc::ChannelError::TransferFailed:
-        return MYOS_STATUS_TRANSFER_FAILED;
+        return STATUS_TRANSFER_FAILED;
     case ipc::ChannelError::InvalidRelation:
     case ipc::ChannelError::Invalid:
-        return MYOS_STATUS_BAD_ARGS;
+        return STATUS_BAD_ARGS;
     case ipc::ChannelError::GenerationExhausted:
-        return MYOS_STATUS_BUSY;
+        return STATUS_BUSY;
     }
-    return MYOS_STATUS_INTERNAL;
+    return STATUS_INTERNAL;
 }
 
 [[nodiscard]] static auto channel(
@@ -302,7 +302,7 @@ template<usize op>
 
 [[nodiscard]] static auto read_message(
     Call& inv,
-    myos_channel_message& wire) noexcept -> bool {
+    ChanMsg& wire) noexcept -> bool {
     ipc::Buffer* const buffer = message_buffer(inv);
     if (buffer == nullptr) {
         return false;
@@ -314,20 +314,20 @@ template<usize op>
 template<usize op>
 [[nodiscard]] auto channel_send(Call& inv) noexcept -> Result {
     
-    const bool blocking = op == MYOS_SYS_CHANNEL_SEND;
+    const bool blocking = op == SYS_CHANNEL_SEND;
     auto cap = channel(inv, cap::Right::Send);
     if (!cap) {
         return returned(cap_status(cap.error()));
     }
-    myos_channel_message wire{};
+    ChanMsg wire{};
     if (!read_message(inv, wire)
-        || wire.version != MYOS_CHANNEL_VERSION
-        || wire.flags != MYOS_CHANNEL_FLAGS_NONE
+        || wire.version != CHANNEL_VERSION
+        || wire.flags != CHANNEL_FLAGS_NONE
         || wire.reserved != 0
-        || wire.word_count > MYOS_CHANNEL_MAX_WORDS
-        || wire.cap_count > MYOS_CHANNEL_MAX_CAPS
-        || wire.receive_limit > MYOS_CHANNEL_MAX_CAPS) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        || wire.word_count > CHANNEL_MAX_WORDS
+        || wire.cap_count > CHANNEL_MAX_CAPS
+        || wire.receive_limit > CHANNEL_MAX_CAPS) {
+        return returned(STATUS_BAD_ARGS);
     }
     ipc::ChannelSend request{
         .transaction = wire.transaction,
@@ -344,7 +344,7 @@ template<usize op>
     auto sent = cap.value()->send(
         cap.value(), inv.cspace, request);
     if (sent) {
-        return returned(MYOS_STATUS_OK, sent.value());
+        return returned(STATUS_OK, sent.value());
     }
     if (!blocking || sent.error() != ipc::ChannelError::WouldBlock) {
         return returned(status(sent.error()));
@@ -352,7 +352,7 @@ template<usize op>
     Thread* const thread = inv.target;
     CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
     if (thread == nullptr || cpus == nullptr) {
-        return returned(MYOS_STATUS_INVALID_OP);
+        return returned(STATUS_INVALID_OP);
     }
     auto* ch = &cap.value().object();
     const auto handle = handle_of(inv.trap.arg(0));
@@ -363,20 +363,20 @@ template<usize op>
     cap = inv.cspace.resolve<ipc::Channel>(handle, cap::Rights::of(cap::Right::Send));
     if (!cap) return returned(cap_status(cap.error()));
     sent = ch->send(cap.value(), inv.cspace, request, &turn);
-    return sent ? returned(MYOS_STATUS_OK, sent.value()) : returned(status(sent.error()));
+    return sent ? returned(STATUS_OK, sent.value()) : returned(status(sent.error()));
 }
 
 template<usize op>
 [[nodiscard]] auto channel_recv(Call& inv) noexcept -> Result {
     
-    const bool blocking = op == MYOS_SYS_CHANNEL_RECV;
+    const bool blocking = op == SYS_CHANNEL_RECV;
     auto cap = channel(inv, cap::Right::Receive);
     if (!cap) {
         return returned(cap_status(cap.error()));
     }
     ipc::Buffer* const buffer = message_buffer(inv);
     if (buffer == nullptr) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     // Keep the admission lease through dequeue, capability publication, and
     // wire-result publication. A second access here would leave a commit
@@ -384,16 +384,16 @@ template<usize op>
     // consumed but before the result was written.
     auto admitted = buffer->access();
     if (!admitted) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
-    myos_channel_message wire{};
+    ChanMsg wire{};
     if (!admitted.value().read(0, libk::Span<byte>{
             reinterpret_cast<byte*>(&wire), sizeof(wire)})
-        || wire.version != MYOS_CHANNEL_VERSION
-        || wire.flags != MYOS_CHANNEL_FLAGS_NONE
+        || wire.version != CHANNEL_VERSION
+        || wire.flags != CHANNEL_FLAGS_NONE
         || wire.reserved != 0
-        || wire.receive_limit > MYOS_CHANNEL_MAX_CAPS) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        || wire.receive_limit > CHANNEL_MAX_CAPS) {
+        return returned(STATUS_BAD_ARGS);
     }
     ipc::ChannelRecv result{
         .receive_limit = wire.receive_limit,
@@ -408,7 +408,7 @@ template<usize op>
         Thread* const thread = inv.target;
         CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
         if (thread == nullptr || cpus == nullptr) {
-            return returned(MYOS_STATUS_INVALID_OP);
+            return returned(STATUS_INVALID_OP);
         }
         auto* ch = &cap.value().object();
         const auto handle = handle_of(inv.trap.arg(0));
@@ -420,7 +420,7 @@ template<usize op>
         cap = inv.cspace.resolve<ipc::Channel>(handle, cap::Rights::of(cap::Right::Receive));
         if (!cap) return returned(cap_status(cap.error()));
         admitted = buffer->access();
-        if (!admitted) return returned(MYOS_STATUS_BAD_ARGS);
+        if (!admitted) return returned(STATUS_BAD_ARGS);
         received = ch->receive(cap.value(), inv.cspace, result, &turn);
         if (!received) return returned(status(received.error()));
     }
@@ -439,9 +439,9 @@ template<usize op>
     }
     if (!admitted.value().write(0, libk::Span<const byte>{
             reinterpret_cast<const byte*>(&wire), sizeof(wire)})) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
-    return returned(MYOS_STATUS_OK, result.sequence);
+    return returned(STATUS_OK, result.sequence);
 }
 
 template<usize op>
@@ -451,7 +451,7 @@ template<usize op>
         return returned(cap_status(cap.error()));
     }
     auto closed = cap.value()->close(cap.value());
-    return returned(closed ? MYOS_STATUS_OK : status(closed.error()));
+    return returned(closed ? STATUS_OK : status(closed.error()));
 }
 
 template<usize op>
@@ -461,7 +461,7 @@ template<usize op>
     if (condition != ipc::ChannelCondition::Readable
         && condition != ipc::ChannelCondition::Writable
         && condition != ipc::ChannelCondition::PeerClosed) {
-        return returned(MYOS_STATUS_BAD_ARGS);
+        return returned(STATUS_BAD_ARGS);
     }
     const cap::Right right = condition == ipc::ChannelCondition::Writable
         ? cap::Right::Send : cap::Right::Receive;
@@ -476,7 +476,7 @@ template<usize op>
     auto bound = cap.value()->bind(
         cap.value(), notification.value(), condition);
     return bound
-        ? returned(MYOS_STATUS_OK, bound.value())
+        ? returned(STATUS_OK, bound.value())
         : returned(status(bound.error()));
 }
 
@@ -492,7 +492,7 @@ template<usize op>
     }
     auto armed = cap.value()->arm(
         cap.value(), inv.trap.arg(1), inv.trap.arg(2));
-    return armed ? returned(MYOS_STATUS_OK, armed.value()) : returned(status(armed.error()));
+    return armed ? returned(STATUS_OK, armed.value()) : returned(status(armed.error()));
 }
 
 template<usize op>
@@ -504,13 +504,13 @@ template<usize op>
     if (!cap || !dest || !rights) {
         return returned(!cap ? cap_status(cap.error())
             : !dest ? cap_status(dest.error())
-            : MYOS_STATUS_BAD_RIGHTS);
+            : STATUS_BAD_RIGHTS);
     }
     auto installed = cap.value()->mint(
         cap.value(), dest.value().object(),
         inv.trap.arg(2), *rights);
     return installed
-        ? returned(MYOS_STATUS_OK, installed.value().raw())
+        ? returned(STATUS_OK, installed.value().raw())
         : returned(status(installed.error()));
 }
 

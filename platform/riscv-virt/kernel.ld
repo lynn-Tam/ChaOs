@@ -1,4 +1,4 @@
-/* RISC-V kernel image and physical bootstrap layout. */
+/* QEMU virt kernel load addresses and bootstrap layout. */
 ENTRY(_start)
 
 PAGE_SIZE       = 0x1000;
@@ -122,6 +122,9 @@ SECTIONS
     boot_reclaim_end_pfn = boot_reclaim_end / PAGE_SIZE;
     kernel_image_first_pfn = kernel_text_lma_start / PAGE_SIZE;
     kernel_image_end_pfn = kernel_phys_end / PAGE_SIZE;
+
+    /* No runtime unwinder: panic backtraces use frame chains. */
+    /DISCARD/ : { *(.eh_frame .eh_frame.*) }
 }
 
 ASSERT(boot_phys_end <= KERNEL_PHYS_BASE,

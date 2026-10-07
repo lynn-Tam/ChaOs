@@ -1,12 +1,12 @@
 #include <sync.hpp>
 
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 #include <cpu/local.hpp>
 
 namespace sync {
 
 static auto cpu() noexcept -> CpuLocal* {
-    return static_cast<CpuLocal*>(arch::current_cpu_owner());
+    return (arch::local() ? arch::local()->owner : nullptr);
 }
 
 // Early boot runs on one CPU before CpuLocal publication. It still has a

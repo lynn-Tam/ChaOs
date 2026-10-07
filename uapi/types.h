@@ -3,6 +3,6 @@
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
-typedef uintptr_t myos_word_t;
-typedef int32_t myos_status_t;
+typedef uintptr_t word_t;
+typedef int32_t status_t;
 #endif

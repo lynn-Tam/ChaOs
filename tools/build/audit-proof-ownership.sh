@@ -30,7 +30,7 @@ audit_one() {
     if printf '%s\n' "$make_block" | rg -q 'execution_start'; then
         return 1
     fi
-    if printf '%s\n' "$make_block" | rg -q 'myos_cap_t targets'; then
+    if printf '%s\n' "$make_block" | rg -q 'cap_t targets'; then
         return 1
     fi
     printf '%s\n' "$make_block" | rg -q 'targets_\[' || return 1
@@ -54,7 +54,7 @@ audit_one() {
     [ -n "$adopt_rel" ] && [ -n "$close_rel" ] && [ "$adopt_rel" -lt "$close_rel" ] || return 1
     printf '%s\n' "$descriptor_block" | rg -q 'output = produced\.value\(\)' || return 1
 
-    thread_end=$(line 'for \(myos_word_t index = 0; index < thread_count_')
+    thread_end=$(line 'for \(word_t index = 0; index < thread_count_')
     [ -n "$thread_end" ] || return 1
     thread_block=$(sed -n "${make_start},$((thread_end - 1))p" "$source")
     printf '%s\n' "$thread_block" | rg -q 'construct_descriptor' || return 1
@@ -87,16 +87,16 @@ audit_one() {
         | rg -n 'const auto manager = task_\.lookup\(' \
         | head -1 | cut -d: -f1 || true)
     delegate_line=$(printf '%s\n' "$typed_block" \
-        | rg -n 'const auto result = myos::cap_typed_delegate\(' \
+        | rg -n 'const auto result = sys::cap_typed_delegate\(' \
         | head -1 | cut -d: -f1 || true)
     owner_line=$(printf '%s\n' "$typed_block" \
         | rg -n 'typename Task::owner_type owner' \
         | head -1 | cut -d: -f1 || true)
     expected_line=$(printf '%s\n' "$typed_block" \
-        | rg -n 'result\.status != MYOS_STATUS_OK' \
+        | rg -n 'result\.status != STATUS_OK' \
         | head -1 | cut -d: -f1 || true)
     close_line=$(printf '%s\n' "$typed_block" \
-        | rg -n 'const myos_status_t closed = owner\.close\(\)' \
+        | rg -n 'const status_t closed = owner\.close\(\)' \
         | head -1 | cut -d: -f1 || true)
     fault_line=$(printf '%s\n' "$typed_block" \
         | rg -n 'Backend::ownership_fault\(closed\)' \
@@ -115,7 +115,7 @@ audit_one() {
         && [ "$close_line" -lt "$fault_line" ] \
         && [ "$fault_line" -lt "$adopt_line" ] || return 1
     guard_line=$(printf '%s\n' "$typed_block" \
-        | rg -n 'if \(closed != MYOS_STATUS_OK\) \{' \
+        | rg -n 'if \(closed != STATUS_OK\) \{' \
         | head -1 | cut -d: -f1 || true)
     [ -n "$guard_line" ] && [ "$guard_line" -eq "$((fault_line - 1))" ] \
         || return 1
@@ -130,7 +130,7 @@ audit_one() {
     [ "$(printf '%s\n' "$typed_block" \
         | rg -c 'typed_call\(' || true)" -eq 4 ] || return 1
     [ "$(printf '%s\n' "$typed_block" \
-        | rg -c 'myos::cap_typed_delegate\(' || true)" -eq 1 ] || return 1
+        | rg -c 'sys::cap_typed_delegate\(' || true)" -eq 1 ] || return 1
     printf '%s\n' "$typed_block" | rg -q \
         'manager->selector != child_cspace_' || return 1
     printf '%s\n' "$typed_block" | rg -q \
@@ -170,7 +170,7 @@ expect_reject missing-descriptor-adoption \
 expect_reject missing-sc-adoption \
     -e '/const auto context_slot = adopt_local_selector/d'
 expect_reject missing-channel-result \
-    -e '/const auto receiver = myos::channel_mint/,/if (!retain_remote(receiver, receiver_cap))/d'
+    -e '/const auto receiver = sys::channel_mint/,/if (!retain_remote(receiver, receiver_cap))/d'
 expect_reject missing-notification-adoption \
     -e '/const auto notify_s_slot = adopt_local_selector/d'
 expect_reject typed-missing-preflight \
@@ -182,12 +182,12 @@ expect_reject typed-missing-adoption \
 expect_reject typed-missing-site \
     -e '/if (!typed_call(/,+2d'
 expect_reject typed-missing-exact-close \
-    -e '/const myos_status_t closed = owner\.close\(\)/,+5d'
+    -e '/const status_t closed = owner\.close\(\)/,+5d'
 expect_reject typed-missing-close-fault \
     -e '/Backend::ownership_fault\(closed\)/d'
 expect_reject typed-wrong-close-condition \
-    -e 's/closed != MYOS_STATUS_OK/closed == MYOS_STATUS_OK/'
+    -e 's/closed != STATUS_OK/closed == STATUS_OK/'
 expect_reject typed-early-return \
-    -e '/result\.status != MYOS_STATUS_OK/a\                return false;'
+    -e '/result\.status != STATUS_OK/a\                return false;'
 
 printf '%s\n' '[audit] OK: proof construction adopts every cap result before the next fallible action and starts only after source retirement'

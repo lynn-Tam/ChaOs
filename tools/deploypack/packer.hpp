@@ -21,11 +21,11 @@ namespace deploy::host {
 
 struct BootstrapBinding final {
     uint32_t role{};
-    myos::bootstrap::Import imported{};
+    boot::Import imported{};
     constexpr BootstrapBinding(uint32_t fixed) : role(fixed) {}
-    constexpr BootstrapBinding(myos::bootstrap::Import named) : imported(named) {}
+    constexpr BootstrapBinding(boot::Import named) : imported(named) {}
     constexpr auto kind() const -> uint16_t {
-        return role != 0 ? myos_bootstrap_object_kind(role) : imported.kind;
+        return role != 0 ? boot_kind(role) : imported.kind;
     }
 };
 

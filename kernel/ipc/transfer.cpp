@@ -3,7 +3,7 @@
 #include <cap/graph.hpp>
 #include <sync.hpp>
 
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
 #include <libk/memory.hpp>

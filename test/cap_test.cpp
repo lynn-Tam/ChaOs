@@ -32,11 +32,11 @@ using cap::Right;
 using cap::Rights;
 
 // These are wire contracts, including the ordinal-to-mask MM projection.
-static_assert(Rights::of(Right::Inspect).raw() == MYOS_RIGHT_INSPECT);
-static_assert(Rights::parse(MYOS_RIGHT_MASK, MYOS_RIGHT_MASK));
-static_assert(!Rights::parse(u64{1} << 63, MYOS_RIGHT_MASK));
+static_assert(Rights::of(Right::Inspect).raw() == RIGHT_INSPECT);
+static_assert(Rights::parse(RIGHT_MASK, RIGHT_MASK));
+static_assert(!Rights::parse(u64{1} << 63, RIGHT_MASK));
 static_assert(mm::Perms::of(mm::Perm::Read, mm::Perm::Write).raw()
-    == (MYOS_VM_READ | MYOS_VM_WRITE));
+    == (VM_READ | VM_WRITE));
 
 constexpr usize cap_test_page_count = 96;
 alignas(mm::page_size) byte
@@ -81,18 +81,18 @@ void put64(byte* bytes, usize offset, u64 value) noexcept {
 }
 
 void attenuation_bytes(
-    byte (&bytes)[MYOS_CAP_ATTENUATION_SIZE],
+    byte (&bytes)[CAP_ATTENUATION_SIZE],
     u16 kind,
     u64 rights = attenuation_rights.raw()) noexcept {
     for (byte& value : bytes) {
         value = 0;
     }
-    put16(bytes, MYOS_CAP_ATTENUATION_VERSION_OFFSET,
-        MYOS_CAP_ATTENUATION_VERSION_CURRENT);
-    put16(bytes, MYOS_CAP_ATTENUATION_KIND_OFFSET, kind);
-    put32(bytes, MYOS_CAP_ATTENUATION_SIZE_OFFSET,
-        MYOS_CAP_ATTENUATION_SIZE);
-    put64(bytes, MYOS_CAP_ATTENUATION_RIGHTS_OFFSET, rights);
+    put16(bytes, CAP_ATTENUATION_VERSION_OFFSET,
+        CAP_ATTENUATION_VERSION_CURRENT);
+    put16(bytes, CAP_ATTENUATION_KIND_OFFSET, kind);
+    put32(bytes, CAP_ATTENUATION_SIZE_OFFSET,
+        CAP_ATTENUATION_SIZE);
+    put64(bytes, CAP_ATTENUATION_RIGHTS_OFFSET, rights);
 }
 
 struct RevokeProbe final {
@@ -259,7 +259,7 @@ private:
 [[nodiscard]] auto decode_and_check(
     object::ObjectKind kind,
     const View& source,
-    byte (&bytes)[MYOS_CAP_ATTENUATION_SIZE]) noexcept -> bool {
+    byte (&bytes)[CAP_ATTENUATION_SIZE]) noexcept -> bool {
     auto decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
@@ -284,7 +284,7 @@ bool test_typed_attenuation_covers_all_families(
     using cap::VmLimit;
     using object::ObjectKind;
 
-    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
+    byte bytes[CAP_ATTENUATION_SIZE]{};
     const View simple{attenuation_rights, std::monostate{}};
     const ObjectKind simple_kinds[] = {
         ObjectKind::Thread,
@@ -303,11 +303,11 @@ bool test_typed_attenuation_covers_all_families(
         MemLimit{
             mm::ObjectRange{0, 16},
             mm::Perms::of(mm::Perm::Read)}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_MEMORY);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 1);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET,
-        static_cast<u64>(MYOS_VM_READ));
+    attenuation_bytes(bytes, OBJECT_KIND_MEMORY);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 1);
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 2);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
+        static_cast<u64>(VM_READ));
     if (!decode_and_check(ObjectKind::Mem, memory, bytes)) {
         return false;
     }
@@ -317,10 +317,10 @@ bool test_typed_attenuation_covers_all_families(
         VmLimit{
             mm::VRange{mm::Virt{0x1000}, 0x10000},
             mm::Perms::of(mm::Perm::Read)}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_VSPACE);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 0x2000);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 0x2000);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
+    attenuation_bytes(bytes, OBJECT_KIND_VSPACE);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 0x2000);
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 0x2000);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, VM_READ);
     if (!decode_and_check(ObjectKind::VSpace, vspace, bytes)) {
         return false;
     }
@@ -329,52 +329,52 @@ bool test_typed_attenuation_covers_all_families(
         attenuation_rights,
         Quota{
             resource::budget{1024 * 1024, 16},
-            MYOS_OBJECT_KINDS}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_RESOURCE_POOL);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 4096);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 4);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET,
-        (u64{1} << MYOS_OBJECT_KIND_MEMORY));
+            OBJECT_KINDS}};
+    attenuation_bytes(bytes, OBJECT_KIND_RESOURCE_POOL);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 4096);
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 4);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
+        (u64{1} << OBJECT_KIND_MEMORY));
     if (!decode_and_check(ObjectKind::group, pool, bytes)) {
         return false;
     }
 
     const View notification{
         attenuation_rights, Badge{7}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_NOTIFICATION);
+    attenuation_bytes(bytes, OBJECT_KIND_NOTIFICATION);
     if (!decode_and_check(ObjectKind::Notification, notification, bytes)) {
         return false;
     }
 
     const View endpoint{
         attenuation_rights, EpLimit{3, 3, 8}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_ENDPOINT);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, 3);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 3);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, 4);
+    attenuation_bytes(bytes, OBJECT_KIND_ENDPOINT);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 3);
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 3);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, 4);
     if (!decode_and_check(ObjectKind::Endpoint, endpoint, bytes)) {
         return false;
     }
 
     const View channel{
         attenuation_rights, ChanLimit{ChannelSide::Any, 0, 0}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_CHANNEL);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET,
-        MYOS_CAP_CHANNEL_SIDE_A);
+    attenuation_bytes(bytes, OBJECT_KIND_CHANNEL);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET,
+        CAP_CHANNEL_SIDE_A);
     if (!decode_and_check(ObjectKind::Channel, channel, bytes)) {
         return false;
     }
 
     const View pager{
         attenuation_rights};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_PAGER);
+    attenuation_bytes(bytes, OBJECT_KIND_PAGER);
     if (!decode_and_check(ObjectKind::Pager, pager, bytes)) {
         return false;
     }
 
     const View irq{
         attenuation_rights, IrqRoute{4, true}};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_IRQ);
+    attenuation_bytes(bytes, OBJECT_KIND_IRQ);
     return decode_and_check(ObjectKind::Irq, irq, bytes);
 }
 
@@ -385,9 +385,9 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     using cap::MemLimit;
     using object::ObjectKind;
 
-    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
-    bytes[MYOS_CAP_ATTENUATION_VERSION_OFFSET] = 2;
+    byte bytes[CAP_ATTENUATION_SIZE]{};
+    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
+    bytes[CAP_ATTENUATION_VERSION_OFFSET] = 2;
     if (cap::decode_attenuation(
             libk::Span<const byte>{bytes, sizeof(bytes)})) {
         return false;
@@ -397,8 +397,8 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
             libk::Span<const byte>{bytes, sizeof(bytes)})) {
         return false;
     }
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD5_OFFSET, 1);
+    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
+    put64(bytes, CAP_ATTENUATION_WORD5_OFFSET, 1);
     auto decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
@@ -409,10 +409,10 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
             ObjectKind::Thread, simple, decoded.value())) {
         return false;
     }
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_MEMORY);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET, ~u64{});
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 2);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, MYOS_VM_READ);
+    attenuation_bytes(bytes, OBJECT_KIND_MEMORY);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, ~u64{});
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 2);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, VM_READ);
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     const View memory{
@@ -424,11 +424,11 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
                          ObjectKind::Mem, memory, decoded.value())) {
         return false;
     }
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_CHANNEL);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD0_OFFSET,
-        MYOS_CAP_CHANNEL_SIDE_A);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD1_OFFSET, 1);
-    put64(bytes, MYOS_CAP_ATTENUATION_WORD2_OFFSET, ~u64{});
+    attenuation_bytes(bytes, OBJECT_KIND_CHANNEL);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET,
+        CAP_CHANNEL_SIDE_A);
+    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 1);
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, ~u64{});
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     const View channel{
@@ -458,8 +458,8 @@ bool test_typed_delegate_transaction_rolls_back(
     if (!source) {
         return false;
     }
-    byte bytes[MYOS_CAP_ATTENUATION_SIZE]{};
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT);
+    byte bytes[CAP_ATTENUATION_SIZE]{};
+    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT);
     auto decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
@@ -496,7 +496,7 @@ bool test_typed_delegate_transaction_rolls_back(
     }
     const usize full_slots = fixture.one().live_slots();
     const usize full_grants = fixture.graph().live_count();
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT);
+    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT);
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
@@ -508,7 +508,7 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
 
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_THREAD);
+    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
@@ -518,8 +518,8 @@ bool test_typed_delegate_transaction_rolls_back(
         || fixture.graph().live_count() != stable_grants) {
         return false;
     }
-    attenuation_bytes(bytes, MYOS_OBJECT_KIND_SCHED_CONTEXT,
-        static_cast<u64>(MYOS_RIGHT_CONTROL));
+    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT,
+        static_cast<u64>(RIGHT_CONTROL));
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <expected>
+#include <array>
+#include <utility>
 
 
 #include <base/types.hpp>
@@ -8,9 +10,8 @@
 #include <task/thread.hpp>
 #include <libk/noncopyable.hpp>
 #include <optional>
-#include <sched/queues.hpp>
-#include <sched/remote_queue.hpp>
-#include <sched/types.hpp>
+#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <time/clock.hpp>
 #include <uapi/status.h>
 
@@ -45,7 +46,7 @@ public:
     }
     [[nodiscard]] auto id() const noexcept -> CpuId { return id_; }
     [[nodiscard]] auto ready_count() const noexcept -> usize {
-        return ready_.size();
+        return ready_count_;
     }
     [[nodiscard]] auto remaining_budget() const noexcept -> time::Duration;
     [[nodiscard]] auto current_urgency() const noexcept -> Urgency;
@@ -75,7 +76,7 @@ public:
     // target's single terminal claim. Other dispatch reasons ignore it.
     void request_reschedule(
         DispatchReason reason,
-        myos_status_t exit_status) noexcept;
+        status_t exit_status) noexcept;
     void on_timer() noexcept;
     void on_trap_exit() noexcept;
     // Re-publishes the current Thread's derived effective stack and roots
@@ -86,12 +87,16 @@ public:
 
 private:
     friend class Sc;
+    enum Action : u8 { Start = 1, Wake = 2, Stop = 4 };
     void cancel(Sc&) noexcept;
     enum class StopDisposition : u8 {
         Deferred,
         Finalize,
     };
 
+    void enqueue(Sc&) noexcept;
+    void remove(Sc&) noexcept;
+    Sc* select() noexcept;
     void charge_to(time::Instant now) noexcept;
     void enqueue_or_throttle(Sc& sc, time::Instant now) noexcept;
     void process_timers(time::Instant now) noexcept;
@@ -99,12 +104,12 @@ private:
     void dispatch(
         DispatchReason reason,
         time::Instant now,
-        myos_status_t exit_status = MYOS_STATUS_OK) noexcept;
+        status_t exit_status = STATUS_OK) noexcept;
     void commit(
         Sc* candidate,
         DispatchReason reason,
         time::Instant now,
-        myos_status_t exit_status) noexcept;
+        status_t exit_status) noexcept;
     void publish(Thread* target) noexcept;
     void program_deadline(time::Instant now) noexcept;
     void post_switch() noexcept;
@@ -113,15 +118,15 @@ private:
     void finish_exit(
         Thread* target,
         DispatchReason reason = DispatchReason::Exit,
-        myos_status_t exit_status = MYOS_STATUS_OK) noexcept;
+        status_t exit_status = STATUS_OK) noexcept;
     void record_dispatch(
         Thread* outgoing,
         Thread* incoming,
         DispatchReason reason,
         time::Instant now) noexcept;
-    [[nodiscard]] auto post_remote(
-        RemoteRequest& request) noexcept
-        -> WakeResult;
+    void post(Sc&, u8 actions) noexcept;
+    void complete(Sc&) noexcept;
+    [[nodiscard]] auto post_remote(Sc&, u8 actions) noexcept -> WakeResult;
 
     [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
 
@@ -133,15 +138,28 @@ private:
     time::Instant accounted_at_{};
     time::Duration quantum_{};
     std::optional<DispatchReason> pending_{};
-    myos_status_t pending_exit_status_{MYOS_STATUS_OK};
+    status_t pending_exit_status_{STATUS_OK};
     usize preempt_depth_{};
     Thread* handoff_outgoing_{};
     DispatchReason handoff_reason_{DispatchReason::Exit};
-    myos_status_t handoff_exit_status_{MYOS_STATUS_OK};
-    ReadyQueue ready_{};
-    TimerQueue timers_{};
-    DeadlineQueue deadlines_{};
-    RemoteQueue remote_;
+    status_t handoff_exit_status_{STATUS_OK};
+    using Level = libk::IntrusiveList<Sc, &Sc::ready_hook_>;
+    std::array<Level, Urgency::level_count> ready_{};
+    u32 ready_mask_{};
+    usize ready_count_{};
+    template<auto Stamp> struct Earlier {
+        bool operator()(const auto& a, const auto& b) const noexcept {
+            return std::pair{Stamp(a), reinterpret_cast<usize>(&a)}
+                 < std::pair{Stamp(b), reinterpret_cast<usize>(&b)};
+        }
+    };
+    // A throttled ledger is immutable while indexed; no deadline mirror.
+    libk::IntrusiveTree<Sc, &Sc::timer_hook_, Earlier<
+        [](const Sc& sc) { return sc.next_refill(); }>> timers_{};
+    libk::IntrusiveTree<Deadline, &Deadline::hook_, Earlier<
+        [](const Deadline& d) { return d.when_; }>> deadlines_{};
+    sync::Spin mail_lock_{};
+    libk::IntrusiveList<Sc, &Sc::mail_hook_> mail_{};
     bool timer_available_{};
     bool ipi_available_{};
     time::Instant programmed_deadline_{time::Instant::max()};

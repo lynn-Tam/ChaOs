@@ -13,7 +13,7 @@ namespace sched { class Sc; }
 class Wait;
 
 struct WaitResult final {
-    myos_status_t status{MYOS_STATUS_OK};
+    status_t status{STATUS_OK};
     usize value{};
 };
 

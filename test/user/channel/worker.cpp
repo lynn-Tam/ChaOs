@@ -1,13 +1,15 @@
 #include <libk/parse.hpp>
 #include <servers/runtime/service.hpp>
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
+extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
+    using namespace sys;
     const auto info = service::bootstrap(address, size);
-    const auto id = libk::parse<uint64_t>(info.argument(1));
-    if (!id) exit(MYOS_STATUS_BAD_ARGS);
+    boot::Args args;
+    if (!args.decode(arg_data, arg_size)) exit(STATUS_BAD_ARGS);
+    const auto id = libk::parse<uint64_t>(args.argument(1));
+    if (!id) exit(STATUS_BAD_ARGS);
     const service::Message message{.id = *id};
-    service::require(service::send(service::capability(info, bootstrap::imports::Stderr), message).status);
+    service::require(service::send(service::capability(info, boot::Stderr), message).status);
     // No retry: multiple writers must be admitted as ordinary blocking sends.
-    exit(service::send(service::capability(info, bootstrap::imports::Stdout), message).status);
+    exit(service::send(service::capability(info, boot::Stdout), message).status);
 }

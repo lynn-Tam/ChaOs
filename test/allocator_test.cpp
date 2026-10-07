@@ -3,7 +3,7 @@
 
 #include <mm/table.hpp>
 #include <mm/kspace.hpp>
-#include <arch/riscv64/cpu/csr.hpp>
+#include <csr.hpp>
 #include <libk/concepts.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
@@ -209,18 +209,18 @@ static_assert(sv39_pte_representation_contract());
 
 consteval auto satp_representation_contract() noexcept -> bool {
     constexpr usize max_ppn =
-        (usize{1} << arch::riscv64::Satp::PPN_WIDTH) - 1;
+        (usize{1} << csr::Satp::PPN_WIDTH) - 1;
     constexpr usize max_asid =
-        (usize{1} << arch::riscv64::Satp::ASID_WIDTH) - 1;
-    const auto maximum = arch::riscv64::Satp::try_make_sv39(
+        (usize{1} << csr::Satp::ASID_WIDTH) - 1;
+    const auto maximum = csr::Satp::try_make_sv39(
         max_ppn,
         max_asid);
     return maximum
-        && arch::riscv64::Satp::mode(*maximum) == arch::riscv64::Satp::MODE_SV39
-        && arch::riscv64::Satp::ppn(*maximum) == max_ppn
-        && arch::riscv64::Satp::asid(*maximum) == max_asid
-        && !arch::riscv64::Satp::try_make_sv39(max_ppn + 1)
-        && !arch::riscv64::Satp::try_make_sv39(0, max_asid + 1);
+        && csr::Satp::mode(*maximum) == csr::Satp::MODE_SV39
+        && csr::Satp::ppn(*maximum) == max_ppn
+        && csr::Satp::asid(*maximum) == max_asid
+        && !csr::Satp::try_make_sv39(max_ppn + 1)
+        && !csr::Satp::try_make_sv39(0, max_asid + 1);
 }
 
 static_assert(satp_representation_contract());

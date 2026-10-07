@@ -73,7 +73,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
     put(bytes, task + DEPLOY_TASK_EXPORT_COUNT, 1, 4);
     put(bytes, task + DEPLOY_TASK_POOL_MEMORY, 16384, 8);
     put(bytes, task + DEPLOY_TASK_POOL_CAPS, 16, 8);
-    put(bytes, task + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E2_KINDS, 8);
+    put(bytes, task + DEPLOY_TASK_KIND_MASK, RESOURCE_E2_KINDS, 8);
     put(bytes, task + DEPLOY_TASK_CRITICAL_BYTES, 12288, 8);
     put(bytes, task + DEPLOY_TASK_CSPACE_SLOTS, 16, 4);
     put(bytes, task + DEPLOY_TASK_CSPACE_PAGES, 1, 4);
@@ -107,7 +107,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
     put(bytes, stack_mapping + DEPLOY_MAPPING_CRITICAL,
         DEPLOY_CRITICAL_STACK, 2);
     put(bytes, stack_mapping + DEPLOY_MAPPING_ACCESS,
-        MYOS_VM_READ | MYOS_VM_WRITE, 4);
+        VM_READ | VM_WRITE, 4);
     put(bytes, stack_mapping + DEPLOY_MAPPING_ADDRESS, 0x210000, 8);
     put(bytes, stack_mapping + DEPLOY_MAPPING_SIZE, 4096, 8);
 
@@ -126,14 +126,14 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
     put(bytes, bootstrap_mapping + DEPLOY_MAPPING_CRITICAL,
         DEPLOY_CRITICAL_BOOTSTRAP, 2);
     put(bytes, bootstrap_mapping + DEPLOY_MAPPING_ACCESS,
-        MYOS_VM_READ, 4);
+        VM_READ, 4);
     put(bytes, bootstrap_mapping + DEPLOY_MAPPING_ADDRESS, 0x220000, 8);
     put(bytes, bootstrap_mapping + DEPLOY_MAPPING_SIZE, 4096, 8);
 
     const std::size_t object = tables[DEPLOY_TABLE_OBJECT].offset;
     put(bytes, object + DEPLOY_OBJECT_OUTPUT_A, keys[7].packed(), 8);
     put(bytes, object + DEPLOY_OBJECT_KIND,
-        MYOS_OBJECT_KIND_NOTIFICATION, 2);
+        OBJECT_KIND_NOTIFICATION, 2);
     put(bytes, object + DEPLOY_OBJECT_ARG0, 1, 8);
     for (std::size_t field = DEPLOY_OBJECT_REF0;
          field <= DEPLOY_OBJECT_REF3;
@@ -174,7 +174,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
         DEPLOY_ATTENUATION_VERSION_CURRENT, 2);
     put(bytes, import + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_THREAD, 2);
+        OBJECT_KIND_THREAD, 2);
     put(bytes, import + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_SIZE,
         DEPLOY_ATTENUATION_STRIDE, 4);
@@ -189,7 +189,7 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
         DEPLOY_ATTENUATION_VERSION_CURRENT, 2);
     put(bytes, output + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_THREAD, 2);
+        OBJECT_KIND_THREAD, 2);
     put(bytes, output + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_SIZE,
         DEPLOY_ATTENUATION_STRIDE, 4);
@@ -210,27 +210,27 @@ inline auto pack_fixture() -> std::vector<std::uint8_t> {
 inline auto pack_io_test(const char* path) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, "io-test", path, 4 * 1024 * 1024};
-    task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-    task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
+    task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+    task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }
 
 inline auto pack_io_session(const char* server, const char* client) -> std::vector<uint8_t> {
     Manifest manifest;
-    constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
+    constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE;
     {
         Task task{manifest, "block", server, 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+        task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
     }
     {
         Task task{manifest, "io-client", client, 2 * 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.channel(boot::Block, "block.client", 0, 1, RIGHT_SEND);
         task.finish();
     }
     return manifest.finish();
@@ -238,31 +238,31 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
 
 inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vector<uint8_t> {
     Manifest manifest;
-    constexpr auto rights = MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE;
+    constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE;
     {
         Task task{manifest, "block", paths[0], 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
-        task.channel(myos::bootstrap::imports::Block, "block.server", 1, 1, rights);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+        task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
     }
     {
         Task task{manifest, "files", paths[1], 16 * 1024 * 1024};
         task.cspace(1024, 132);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, MYOS_RIGHT_SEND);
-        task.channel(myos::bootstrap::imports::Files, "files.server", 1, 1, MYOS_RIGHT_RECEIVE);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_PAGER | RESOURCE_CHANNEL);
+        task.channel(boot::Block, "block.client", 0, 1, RIGHT_SEND);
+        task.channel(boot::Files, "files.server", 1, 1, RIGHT_RECEIVE);
         task.finish();
     }
     {
         Task task{manifest, "file-client", paths[2], 4 * 1024 * 1024};
         task.cspace(128, 20);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, MYOS_RIGHT_SEND);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.channel(boot::Files, "files.client", 0, 1, RIGHT_SEND);
         if (fault_test) {
-            task.authority(file_fault_test::Ready, "test.ready", MYOS_RIGHT_SIGNAL);
-            task.authority(file_fault_test::Go, "test.go", MYOS_RIGHT_RECEIVE);
+            task.authority(file_fault_test::Ready, "test.ready", RIGHT_SIGNAL);
+            task.authority(file_fault_test::Go, "test.go", RIGHT_RECEIVE);
         }
         task.finish();
     }
@@ -275,32 +275,32 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
     {
         Task task{manifest, "channel-test", coordinator, 8 * 1024 * 1024, true};
         task.cspace(512, 68);
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
         task.finish();
     }
     {
         Task task{manifest, "writer", worker, 1024 * 1024, false, ApplicationBudget};
-        task.channel(myos::bootstrap::imports::Stdout, "data", 0, 1, MYOS_RIGHT_SEND);
-        task.channel(myos::bootstrap::imports::Stderr, "ready", 0, 1, MYOS_RIGHT_SEND);
+        task.channel(boot::Stdout, "data", 0, 1, RIGHT_SEND);
+        task.channel(boot::Stderr, "ready", 0, 1, RIGHT_SEND);
         task.finish();
     }
     {
         Task task{manifest, "provider", provider, 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
-            MYOS_RIGHT_SEND | MYOS_RIGHT_RECEIVE);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        task.channel(boot::Stdout, "handoff", 0, 1,
+            RIGHT_SEND | RIGHT_RECEIVE);
         task.channel_service(channel_test::Provider, "provider.client", 1,
-            MYOS_RIGHT_RECEIVE, MYOS_RIGHT_SEND, 2);
+            RIGHT_RECEIVE, RIGHT_SEND, 2);
         task.finish();
     }
     {
         Task task{manifest, "export-holder", holder, 1024 * 1024};
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
         task.requires_service(2, "provider");
-        task.channel(myos::bootstrap::imports::Stdout, "handoff", 0, 1,
-            MYOS_RIGHT_SEND);
+        task.channel(boot::Stdout, "handoff", 0, 1,
+            RIGHT_SEND);
         task.channel(channel_test::Provider, "provider.client", 0, 1,
-            MYOS_RIGHT_SEND | MYOS_RIGHT_DUPLICATE);
+            RIGHT_SEND | RIGHT_DUPLICATE);
         task.finish();
     }
     return manifest.finish();
@@ -309,10 +309,10 @@ inline auto pack_channel_test(const char* coordinator, const char* worker,
 inline auto pack_denied(const char* name, const char* image) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, name, image, 1024 * 1024, false, ApplicationBudget};
-    task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
-    task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
-    task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
-    task.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "block.device", MYOS_RIGHT_CONNECT);
+    task.authority(boot::Stdout, "stdout", RIGHT_SEND);
+    task.authority(boot::Stderr, "stderr", RIGHT_SEND);
+    task.authority(boot::Stdin, "stdin", RIGHT_RECEIVE);
+    task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }

@@ -40,15 +40,15 @@ enum class ChannelError : u8 {
 };
 
 enum class ChannelCondition : u8 {
-    Readable = MYOS_CHANNEL_READABLE,
-    Writable = MYOS_CHANNEL_WRITABLE,
-    PeerClosed = MYOS_CHANNEL_PEER_CLOSED,
+    Readable = CHANNEL_READABLE,
+    Writable = CHANNEL_WRITABLE,
+    PeerClosed = CHANNEL_PEER_CLOSED,
 };
 
 struct ChannelConfig final {
     usize queue_capacity{16};
-    usize max_words{MYOS_CHANNEL_MAX_WORDS};
-    usize max_caps{MYOS_CHANNEL_MAX_CAPS};
+    usize max_words{CHANNEL_MAX_WORDS};
+    usize max_caps{CHANNEL_MAX_CAPS};
     usize relation_capacity{4};
 };
 
@@ -56,9 +56,9 @@ struct ChannelSend final {
     u64 transaction{};
     u64 tag{};
     usize word_count{};
-    u64 words[MYOS_CHANNEL_MAX_WORDS]{};
+    u64 words[CHANNEL_MAX_WORDS]{};
     usize cap_count{};
-    myos_cap_transfer caps[MYOS_CHANNEL_MAX_CAPS]{};
+    CapXfer caps[CHANNEL_MAX_CAPS]{};
 };
 
 struct ChannelRecv final {
@@ -67,10 +67,10 @@ struct ChannelRecv final {
     u64 sender_badge{};
     u64 sequence{};
     usize word_count{};
-    u64 words[MYOS_CHANNEL_MAX_WORDS]{};
+    u64 words[CHANNEL_MAX_WORDS]{};
     usize cap_count{};
-    usize receive_limit{MYOS_CHANNEL_MAX_CAPS};
-    cap::Handle caps[MYOS_CHANNEL_MAX_CAPS]{};
+    usize receive_limit{CHANNEL_MAX_CAPS};
+    cap::Handle caps[CHANNEL_MAX_CAPS]{};
 };
 
 // A bounded bidirectional queue. Channel owns all queue cells, capability
@@ -149,8 +149,8 @@ private:
         u64 sender_badge{};
         u64 sequence{};
         usize word_count{};
-        u64 words[MYOS_CHANNEL_MAX_WORDS]{};
-        libk::InplaceVector<Escrow, MYOS_CHANNEL_MAX_CAPS> escrows{};
+        u64 words[CHANNEL_MAX_WORDS]{};
+        libk::InplaceVector<Escrow, CHANNEL_MAX_CAPS> escrows{};
     };
 
     struct Relation;
@@ -329,13 +329,13 @@ private:
     void clear_queues() noexcept;
     [[nodiscard]] auto make_escrow(
         cap::CSpace& source,
-        const myos_cap_transfer& spec,
+        const CapXfer& spec,
         Escrow& escrow) noexcept -> std::expected<void, ChannelError>;
     [[nodiscard]] auto commit_escrows(
         Message& message,
         cap::CSpace& destination,
         libk::InplaceVector<cap::CSpace::Reservation,
-            MYOS_CHANNEL_MAX_CAPS>& reservations,
+            CHANNEL_MAX_CAPS>& reservations,
         ChannelRecv& result) noexcept -> CommitResult;
 
     static const cap::GrantAttachmentOps channel_ops_;

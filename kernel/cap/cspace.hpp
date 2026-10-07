@@ -5,7 +5,7 @@
 
 #include <bit>
 
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <cap/cap.hpp>
 #include <cap/grant.hpp>
 #include <libk/assert.hpp>

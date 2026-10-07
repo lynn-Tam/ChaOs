@@ -42,21 +42,21 @@ struct AuthorityId final {
 };
 
 [[nodiscard]] constexpr auto valid_authority_ceiling(
-    const myos_cap_attenuation& ceiling) noexcept -> bool {
+    const CapView& ceiling) noexcept -> bool {
     return attenuation::valid_descriptor(
         ceiling, attenuation::DescriptorForm::Ceiling);
 }
 
 [[nodiscard]] constexpr auto rights_within_ceiling(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling) noexcept -> bool {
+    const CapView& requested,
+    const CapView& ceiling) noexcept -> bool {
     return attenuation::within(
         requested, ceiling, DEPLOY_IMPORT_TYPED_DELEGATE);
 }
 
 [[nodiscard]] constexpr auto attenuation_within_ceiling(
-    const myos_cap_attenuation& requested,
-    const myos_cap_attenuation& ceiling,
+    const CapView& requested,
+    const CapView& ceiling,
     uint16_t mode) noexcept -> bool {
     return attenuation::within(requested, ceiling, mode);
 }
@@ -109,19 +109,19 @@ public:
 
     /* BUSY starts retirement (denies new leases) but retains this token until
      * all existing leases release.  The caller retries the same token. */
-    [[nodiscard]] auto retire() noexcept -> myos_status_t {
+    [[nodiscard]] auto retire() noexcept -> status_t {
         if (!valid()) {
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         }
-        const myos_status_t status = retire_(context_, id_);
-        if (status == MYOS_STATUS_OK) {
+        const status_t status = retire_(context_, id_);
+        if (status == STATUS_OK) {
             clear();
         }
         return status;
     }
 
 private:
-    using RetireFn = myos_status_t (*)(void*, AuthorityId) noexcept;
+    using RetireFn = status_t (*)(void*, AuthorityId) noexcept;
 
     Registration(void* context, AuthorityId id, RetireFn retire) noexcept
         : context_(context), id_(id), retire_(retire), active_(true) {}
@@ -174,17 +174,17 @@ public:
         libk_assert(live_size() == 0);
     }
 
-    [[nodiscard]] auto retire_all() noexcept -> myos_status_t {
+    [[nodiscard]] auto retire_all() noexcept -> status_t {
         for (Registration& registration : entries_) {
             if (!registration.valid()) {
                 continue;
             }
-            const myos_status_t status = registration.retire();
-            if (status != MYOS_STATUS_OK) {
+            const status_t status = registration.retire();
+            if (status != STATUS_OK) {
                 return status;
             }
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] constexpr auto size() const noexcept -> size_t {
@@ -210,9 +210,9 @@ public:
     template<typename Set>
     [[nodiscard]] auto register_source(
         Set& authorities,
-        myos::cap::CapRef source,
+        sys::cap::CapRef source,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<AuthorityId> {
         if (entries_.size() == Capacity) {
             return std::nullopt;
@@ -226,8 +226,8 @@ public:
         if (!adopt(std::move(*registration))) {
             // No lease can exist yet, so exact retirement is immediate.  A
             // failed retirement is an ownership fault rather than a leak.
-            const myos_status_t status = registration->retire();
-            if (status != MYOS_STATUS_OK) {
+            const status_t status = registration->retire();
+            if (status != STATUS_OK) {
                 libk_assert(false);
             }
             return std::nullopt;
@@ -284,9 +284,9 @@ private:
     template<typename Authorities>
     [[nodiscard]] auto register_source(
         Authorities& authorities,
-        myos::cap::CapRef source,
+        sys::cap::CapRef source,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<AuthorityId> {
         return journal_.register_source(
             authorities, source, identity, ceiling);
@@ -298,7 +298,7 @@ private:
         Space& space,
         LocalSlot slot,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<AuthorityId> {
         const auto source = space.lookup(slot, ceiling.kind);
         if (!source) {
@@ -309,9 +309,9 @@ private:
     }
 
     template<typename Space>
-    [[nodiscard]] auto close(Space& space) noexcept -> myos_status_t {
-        const myos_status_t registrations = journal_.retire_all();
-        if (registrations != MYOS_STATUS_OK) {
+    [[nodiscard]] auto close(Space& space) noexcept -> status_t {
+        const status_t registrations = journal_.retire_all();
+        if (registrations != STATUS_OK) {
             return registrations;
         }
         return space.close();
@@ -388,7 +388,7 @@ public:
         Authorities& authorities,
         LocalSlot slot,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<AuthorityId> {
         if (!adopted_) {
             return std::nullopt;
@@ -397,8 +397,8 @@ public:
             authorities, space_, slot, identity, ceiling);
     }
 
-    [[nodiscard]] auto close() noexcept -> myos_status_t {
-        return adopted_ ? owner_.close(space_) : MYOS_STATUS_OK;
+    [[nodiscard]] auto close() noexcept -> status_t {
+        return adopted_ ? owner_.close(space_) : STATUS_OK;
     }
 
     [[nodiscard]] constexpr auto phase() const noexcept -> Phase {
@@ -406,7 +406,7 @@ public:
     }
 
     [[nodiscard]] auto pool() const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        -> std::optional<sys::cap::CapRef> {
         return space_.pool();
     }
 
@@ -420,8 +420,8 @@ public:
 
     [[nodiscard]] auto lookup(
         LocalSlot slot,
-        myos_object_kind_t expected_kind) const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        obj_kind_t expected_kind) const noexcept
+        -> std::optional<sys::cap::CapRef> {
         return space_.lookup(slot, expected_kind);
     }
 
@@ -479,8 +479,8 @@ class AuthoritySet final {
     static_assert(GenerationLimit != 0);
 
     struct Entry final {
-        myos::cap::CapRef source{};
-        myos_cap_attenuation ceiling{};
+        sys::cap::CapRef source{};
+        CapView ceiling{};
         uint64_t identity{};
         uint32_t generation{1};
         size_t leases{};
@@ -529,13 +529,13 @@ public:
             return id_;
         }
 
-        [[nodiscard]] auto source() const noexcept -> myos::cap::CapRef {
-            return valid() ? authorities_->source(id_) : myos::cap::CapRef{};
+        [[nodiscard]] auto source() const noexcept -> sys::cap::CapRef {
+            return valid() ? authorities_->source(id_) : sys::cap::CapRef{};
         }
 
-        [[nodiscard]] auto ceiling() const noexcept -> myos_cap_attenuation {
+        [[nodiscard]] auto ceiling() const noexcept -> CapView {
             return valid() ? authorities_->ceiling(id_)
-                           : myos_cap_attenuation{};
+                           : CapView{};
         }
 
         void release() noexcept {
@@ -575,9 +575,9 @@ public:
 
 private:
     [[nodiscard]] auto register_source(
-        myos::cap::CapRef source,
+        sys::cap::CapRef source,
         uint64_t identity,
-        const myos_cap_attenuation& ceiling) noexcept
+        const CapView& ceiling) noexcept
         -> std::optional<Registration> {
         if (!source || source.cspace != 0
             || !valid_authority_ceiling(ceiling)) {
@@ -627,15 +627,15 @@ public:
     }
 
 private:
-    [[nodiscard]] auto source(AuthorityId id) const noexcept -> myos::cap::CapRef {
+    [[nodiscard]] auto source(AuthorityId id) const noexcept -> sys::cap::CapRef {
         const Entry* entry = checked(id);
-        return entry == nullptr ? myos::cap::CapRef{} : entry->source;
+        return entry == nullptr ? sys::cap::CapRef{} : entry->source;
     }
 
     [[nodiscard]] auto ceiling(AuthorityId id) const noexcept
-        -> myos_cap_attenuation {
+        -> CapView {
         const Entry* entry = checked(id);
-        return entry == nullptr ? myos_cap_attenuation{} : entry->ceiling;
+        return entry == nullptr ? CapView{} : entry->ceiling;
     }
 
     [[nodiscard]] auto lease_valid(AuthorityId id) const noexcept -> bool {
@@ -662,7 +662,7 @@ public:
 private:
     [[nodiscard]] static auto retire_erased(
         void* context,
-        AuthorityId id) noexcept -> myos_status_t {
+        AuthorityId id) noexcept -> status_t {
         return static_cast<AuthoritySet*>(context)->retire(id);
     }
 
@@ -685,14 +685,14 @@ private:
             ? &entry : nullptr;
     }
 
-    [[nodiscard]] auto retire(AuthorityId id) noexcept -> myos_status_t {
+    [[nodiscard]] auto retire(AuthorityId id) noexcept -> status_t {
         Entry* entry = checked(id);
         if (entry == nullptr) {
-            return MYOS_STATUS_INVALID_CAP;
+            return STATUS_INVALID_CAP;
         }
         entry->retiring = true;
         if (entry->leases != 0) {
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
         entry->source = {};
         entry->ceiling = {};
@@ -705,7 +705,7 @@ private:
         } else {
             ++entry->generation;
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] auto release(AuthorityId id) noexcept -> bool {
@@ -737,41 +737,41 @@ enum class ImportMode : uint16_t {
 struct ImportBinding final {
     AuthorityId authority{};
     LocalSlot descriptor{};
-    myos_word_t descriptor_offset{};
+    word_t descriptor_offset{};
     /* Borrowed current-CSpace source for a TaskKey import.  It is valid only
      * until ImportTransaction adopts the destination into the child space. */
-    myos::cap::CapRef source{};
+    sys::cap::CapRef source{};
 };
 
 struct ImportProjection final {
     AuthorityId authority{};
     bool task_key{};
     size_t remote_index{static_cast<size_t>(-1)};
-    myos_cap_t manager{};
-    myos_object_kind_t kind{MYOS_OBJECT_KIND_INVALID};
+    cap_t manager{};
+    obj_kind_t kind{OBJECT_KIND_INVALID};
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
         return (authority.valid() || task_key)
             && remote_index != static_cast<size_t>(-1)
             && manager != 0
-            && kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
+            && kind > OBJECT_KIND_INVALID
+            && kind < OBJECT_KIND_COUNT && ((OBJECT_KINDS >> kind) & 1);
     }
 };
 
 template<typename B>
 concept ImportBackend = requires(
-    myos::cap::CapRef source,
-    myos::cap::CapRef destination,
-    myos::cap::CapRef descriptor,
-    myos_word_t rights,
-    myos_word_t badge) {
+    sys::cap::CapRef source,
+    sys::cap::CapRef destination,
+    sys::cap::CapRef descriptor,
+    word_t rights,
+    word_t badge) {
     { B::duplicate(source, destination, rights) }
-        -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
     { B::typed_delegate(source, destination, descriptor, 0) }
-        -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
     { B::channel_mint(source, destination, badge, rights) }
-        -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
 };
 
 template<typename Space, typename Authorities, size_t BatchMax = 32>
@@ -799,16 +799,16 @@ public:
         uint32_t count,
         const ImportBinding* bindings,
         Authorities& authorities,
-        ImportProjection* outputs) noexcept -> myos_status_t {
+        ImportProjection* outputs) noexcept -> status_t {
         const PlanTask* row = task.row();
         if (row == nullptr || count > BatchMax
             || first > row->imports.count
             || count > row->imports.count - first
             || (count != 0 && (bindings == nullptr || outputs == nullptr))) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
         if (count == 0) {
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         }
 
         std::optional<Lease> leases[BatchMax]{};
@@ -822,16 +822,16 @@ public:
                     : import->source_class
                             != DEPLOY_IMPORT_SOURCE_TASK_KEY
                         || !bindings[index].source)) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
         }
 
         const auto manager = space.lookup(
-            space.manager_slot(), MYOS_OBJECT_KIND_CSPACE);
+            space.manager_slot(), OBJECT_KIND_CSPACE);
         if (!manager || manager->cspace != 0
             || space.remote_size() > Space::remote_capacity()
             || count > Space::remote_capacity() - space.remote_size()) {
-            return MYOS_STATUS_NO_MEMORY;
+            return STATUS_NO_MEMORY;
         }
 
         /* All policy/binding/descriptor checks happen before the first
@@ -839,18 +839,18 @@ public:
          * in preflight and their destructors release local counters. */
         for (uint32_t index = 0; index < count; ++index) {
             const PlanImport& import = *task.import(first + index);
-            myos::cap::CapRef source{};
+            sys::cap::CapRef source{};
             if (import.source_class == DEPLOY_IMPORT_SOURCE_AUTHORITY) {
                 auto lease = authorities.lease(bindings[index].authority);
                 if (!lease) {
-                    return MYOS_STATUS_BUSY;
+                    return STATUS_BUSY;
                 }
                 source = lease->source();
-                const myos_cap_attenuation ceiling = lease->ceiling();
+                const CapView ceiling = lease->ceiling();
                 if (!source || source.cspace != 0
                     || !attenuation_within_ceiling(
                         import.attenuation, ceiling, import.mode)) {
-                    return MYOS_STATUS_DENIED;
+                    return STATUS_DENIED;
                 }
                 leases[index] = std::move(*lease);
             } else {
@@ -861,7 +861,7 @@ public:
                  * remote selectors cannot be used as syscall sources without
                  * introducing a second source-authority ABI. */
                 if (!source || source.cspace != 0) {
-                    return MYOS_STATUS_BAD_ARGS;
+                    return STATUS_BAD_ARGS;
                 }
                 /* No external Authority lease is fabricated for a TaskKey;
                  * its attenuation is still applied by the kernel import
@@ -870,23 +870,23 @@ public:
             if (import.mode == DEPLOY_IMPORT_TYPED_DELEGATE) {
                 if (!bindings[index].descriptor.valid()
                     || bindings[index].descriptor.kind
-                        != MYOS_OBJECT_KIND_MEMORY
+                        != OBJECT_KIND_MEMORY
                     || !space.lookup(
                         bindings[index].descriptor,
-                        MYOS_OBJECT_KIND_MEMORY)
+                        OBJECT_KIND_MEMORY)
                     || bindings[index].descriptor_offset
-                        % MYOS_CAP_ATTENUATION_SIZE != 0
+                        % CAP_ATTENUATION_SIZE != 0
                     || bindings[index].descriptor_offset
-                        > DEPLOY_PAGE_SIZE - MYOS_CAP_ATTENUATION_SIZE) {
-                    return MYOS_STATUS_BAD_ARGS;
+                        > DEPLOY_PAGE_SIZE - CAP_ATTENUATION_SIZE) {
+                    return STATUS_BAD_ARGS;
                 }
             } else if (bindings[index].descriptor.valid()
                        || bindings[index].descriptor_offset != 0) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
             if (import.mode == DEPLOY_IMPORT_CHANNEL_MINT
                 && import.attenuation.words[1] == 0) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
         }
 
@@ -894,11 +894,11 @@ public:
         size_t remote_indices[BatchMax]{};
         for (uint32_t index = 0; index < count; ++index) {
             const PlanImport& import = *task.import(first + index);
-            const myos::cap::CapRef source = import.source_class
+            const sys::cap::CapRef source = import.source_class
                     == DEPLOY_IMPORT_SOURCE_AUTHORITY
                 ? leases[index]->source()
                 : bindings[index].source;
-            myos::SysResult result{};
+            sys::SysResult result{};
             switch (static_cast<ImportMode>(import.mode)) {
             case ImportMode::Duplicate:
                 result = Backend::duplicate(
@@ -907,11 +907,11 @@ public:
             case ImportMode::TypedDelegate: {
                 const auto descriptor = space.lookup(
                     bindings[index].descriptor,
-                    MYOS_OBJECT_KIND_MEMORY);
+                    OBJECT_KIND_MEMORY);
                 if (!descriptor) {
                     return rollback(
                         space, remote_indices, adopted, outputs,
-                        MYOS_STATUS_BAD_ARGS);
+                        STATUS_BAD_ARGS);
                 }
                 result = Backend::typed_delegate(
                     source, manager.value(), descriptor.value(),
@@ -928,11 +928,11 @@ public:
                 // non-call gate and must remain syscall-free.
                 return rollback(
                     space, remote_indices, adopted, outputs,
-                    MYOS_STATUS_BAD_ARGS);
+                    STATUS_BAD_ARGS);
             }
             if (result.value == 0) {
-                const myos_status_t failure = result.status == MYOS_STATUS_OK
-                    ? MYOS_STATUS_INVALID_CAP : result.status;
+                const status_t failure = result.status == STATUS_OK
+                    ? STATUS_INVALID_CAP : result.status;
                 return rollback(
                     space, remote_indices, adopted, outputs, failure);
             }
@@ -941,10 +941,10 @@ public:
              * the syscall reports failure.  Form its exact owner before any
              * rollback branch; an unexpected non-OK result must close that
              * selector or fail-stop rather than leak it. */
-            Owner owner{myos::cap::CapRef{result.value, manager->selector}};
-            if (result.status != MYOS_STATUS_OK) {
-                const myos_status_t closed = owner.close();
-                if (closed != MYOS_STATUS_OK) {
+            Owner owner{sys::cap::CapRef{result.value, manager->selector}};
+            if (result.status != STATUS_OK) {
+                const status_t closed = owner.close();
+                if (closed != STATUS_OK) {
                     Backend::ownership_fault(closed);
                     return rollback(
                         space, remote_indices, adopted, outputs, closed);
@@ -955,15 +955,15 @@ public:
 
             const auto remote = space.adopt_remote_index(std::move(owner));
             if (!remote) {
-                const myos_status_t closed = owner.close();
-                if (closed != MYOS_STATUS_OK) {
+                const status_t closed = owner.close();
+                if (closed != STATUS_OK) {
                     Backend::ownership_fault(closed);
                     return rollback(
                         space, remote_indices, adopted, outputs, closed);
                 }
                 return rollback(
                     space, remote_indices, adopted, outputs,
-                    MYOS_STATUS_NO_MEMORY);
+                    STATUS_NO_MEMORY);
             }
             remote_indices[adopted] = remote.value();
             outputs[adopted] = ImportProjection{
@@ -974,7 +974,7 @@ public:
                     == DEPLOY_IMPORT_SOURCE_TASK_KEY,
                 .remote_index = remote.value(),
                 .manager = manager->selector,
-                .kind = static_cast<myos_object_kind_t>(
+                .kind = static_cast<obj_kind_t>(
                     import.attenuation.kind)};
             ++adopted;
         }
@@ -985,10 +985,10 @@ public:
                 && !leases[index]->valid()) {
                 return rollback(
                     space, remote_indices, adopted, outputs,
-                    MYOS_STATUS_INVALID_CAP);
+                    STATUS_INVALID_CAP);
             }
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
 private:
@@ -1007,7 +1007,7 @@ private:
             return false;
         }
         if (import.mode == DEPLOY_IMPORT_CHANNEL_MINT
-            && import.attenuation.kind != MYOS_OBJECT_KIND_CHANNEL) {
+            && import.attenuation.kind != OBJECT_KIND_CHANNEL) {
             return false;
         }
         return true;
@@ -1018,20 +1018,20 @@ private:
         const size_t* remote_indices,
         size_t adopted,
         ImportProjection* outputs,
-        myos_status_t failure) noexcept -> myos_status_t {
-        myos_status_t rollback_status = MYOS_STATUS_OK;
+        status_t failure) noexcept -> status_t {
+        status_t rollback_status = STATUS_OK;
         for (size_t index = adopted; index != 0; --index) {
-            const myos_status_t status = space.close_remote(
+            const status_t status = space.close_remote(
                 remote_indices[index - 1]);
-            if (rollback_status == MYOS_STATUS_OK
-                && status != MYOS_STATUS_OK) {
+            if (rollback_status == STATUS_OK
+                && status != STATUS_OK) {
                 rollback_status = status;
             }
             if (outputs != nullptr) {
                 outputs[index - 1] = {};
             }
         }
-        return rollback_status == MYOS_STATUS_OK
+        return rollback_status == STATUS_OK
             ? failure : rollback_status;
     }
 };

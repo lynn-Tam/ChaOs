@@ -1,7 +1,7 @@
 /*
  * RISC-V high-half migration.
  *
- * Everything before arch_riscv64_high_entry lives in the physical .boot
+ * Everything before boot_high lives in the physical .boot
  * segment and may address only physical .boot storage or absolute linker LMA
  * symbols.  The transitional root is deliberately not a kernel translation
  * owner: it exists only until KernelVSpace publishes and activates its final
@@ -34,8 +34,7 @@
 
 .section .boot.pgtables, "aw", @nobits
 .balign 4096
-.global arch_riscv64_boot_root
-arch_riscv64_boot_root:
+.Lboot_root:
     .space 4096
 .Lboot_low_l1:
     .space 4096
@@ -55,9 +54,9 @@ boot_stack_top:
 
 .section .text.boot, "ax", @progbits
 .balign 4
-.global arch_early_entry
-.type arch_early_entry, @function
-arch_early_entry:
+.global _start
+.type _start, @function
+_start:
     csrci sstatus, 2
     la sp, .Lphysical_boot_stack_top
 
@@ -75,7 +74,7 @@ arch_early_entry:
     j .Lclear_high_bss
 
 .Lclear_boot_tables:
-    la t0, arch_riscv64_boot_root
+    la t0, .Lboot_root
     la t1, .Lboot_high_l1
     li t2, 4096
     add t1, t1, t2
@@ -87,7 +86,7 @@ arch_early_entry:
 
     /* Keep the entire physical .boot window executable during migration. */
 .Lmap_identity:
-    la t0, arch_riscv64_boot_root
+    la t0, .Lboot_root
     la t1, .Lboot_low_l1
     srli t2, t1, PAGE_SHIFT
     slli t2, t2, 10
@@ -171,14 +170,14 @@ arch_early_entry:
     mv a1, s1
     li t0, KERNEL_VIRT_BASE
     jr t0
-.size arch_early_entry, .-arch_early_entry
+.size _start, .-_start
 
 /* The first high VMA in the image; the physical trampoline jumps here. */
 .section .text.high_entry, "ax", @progbits
 .balign 4
-.global arch_riscv64_high_entry
-.type arch_riscv64_high_entry, @function
-arch_riscv64_high_entry:
+.global boot_high
+.type boot_high, @function
+boot_high:
     la sp, boot_stack_top
 
     la t0, boot_stack_guard
@@ -191,19 +190,19 @@ arch_riscv64_high_entry:
 
     la t0, .Lhigh_park
     csrw stvec, t0
-    call arch_riscv64_high_entry_cpp
+    call boot_enter
 .Lhigh_park:
     csrci sstatus, 2
 1:
     wfi
     j 1b
-.size arch_riscv64_high_entry, .-arch_riscv64_high_entry
+.size boot_high, .-boot_high
 
 .section .text, "ax", @progbits
 .balign 4
-.global arch_boot_stack_guard_intact
-.type arch_boot_stack_guard_intact, @function
-arch_boot_stack_guard_intact:
+.global boot_guard_ok
+.type boot_guard_ok, @function
+boot_guard_ok:
     la t0, boot_stack_guard
     la t1, boot_stack
     li t2, 0x42535441434b4755
@@ -217,4 +216,4 @@ arch_boot_stack_guard_intact:
 .Lboot_guard_bad:
     li a0, 0
     ret
-.size arch_boot_stack_guard_intact, .-arch_boot_stack_guard_intact
+.size boot_guard_ok, .-boot_guard_ok

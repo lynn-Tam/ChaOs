@@ -85,14 +85,14 @@ void Notification::Wait::release() noexcept {
 
 auto Notification::Wait::cancel() noexcept -> bool {
     sync::Lock guard{owner_->receiver_lock_};
-    return ready({MYOS_STATUS_CANCELED, 0});
+    return ready({STATUS_CANCELED, 0});
 }
 
 void Notification::Wait::expire() noexcept {
     bool publish{};
     {
         sync::Lock guard{owner_->receiver_lock_};
-        publish = ready({MYOS_STATUS_TIMED_OUT, 0});
+        publish = ready({STATUS_TIMED_OUT, 0});
     }
     if (publish) relation_.signal();
 }
@@ -122,7 +122,7 @@ auto Notification::signal(u64 badge) noexcept -> bool {
             accepted = true;
             if (!waiters_.empty()) {
                 waiter = &waiters_.front();
-                libk_assert(waiter->ready({MYOS_STATUS_OK,
+                libk_assert(waiter->ready({STATUS_OK,
                     std::exchange(pending_, u64{})}));
             }
         }
@@ -150,19 +150,19 @@ auto Notification::wait(Thread& thread, CpuRegistry& cpus,
     Wait waiter{*this};
     {
         sync::Lock guard{receiver_lock_};
-        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) return {MYOS_STATUS_CLOSED, 0};
+        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) return {STATUS_CLOSED, 0};
         const u64 badges = std::exchange(pending_, u64{});
-        if (badges != 0) return {MYOS_STATUS_OK, badges};
-        if (deadline && !dispatcher.arm(waiter.deadline_, *deadline)) return {MYOS_STATUS_BUSY, 0};
+        if (badges != 0) return {STATUS_OK, badges};
+        if (deadline && !dispatcher.arm(waiter.deadline_, *deadline)) return {STATUS_BUSY, 0};
         if (!thread.begin_wait(waiter.relation_, cpus)) {
             if (waiter.deadline_.armed()) dispatcher.disarm(waiter.deadline_);
-            return {MYOS_STATUS_BUSY, 0};
+            return {STATUS_BUSY, 0};
         }
         waiters_.push_back(waiter);
         ++waiter_count_;
     }
     thread.block();
-    if (thread.stop_requested()) return {MYOS_STATUS_CANCELED, 0};
+    if (thread.stop_requested()) return {STATUS_CANCELED, 0};
     return waiter.result_;
 }
 
@@ -230,7 +230,7 @@ void Notification::retire(object::cleanup&& cleanup) noexcept {
             sync::Lock guard{receiver_lock_};
             if (waiters_.empty()) break;
             waiter = &waiters_.front();
-            libk_assert(waiter->ready({MYOS_STATUS_CLOSED, 0}));
+            libk_assert(waiter->ready({STATUS_CLOSED, 0}));
         }
         waiter->relation_.signal();
     }

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <arch/cpu.hpp>
+#include <cpu.hpp>
 #include <cpu/local.hpp>
 #include <mm/kspace.hpp>
 #include <libk/assert.hpp>
@@ -43,7 +43,7 @@ struct CpuRuntime final : private libk::noncopyable_nonmovable {
     trace::Ring* log{};
     object::ref<Thread> idle_thread{};
     libk::ManualLifetime<sched::Dispatcher> dispatcher_storage{};
-    arch::CpuStartContext start_context{};
+    arch::Start start{};
     CpuRegistry* owner_registry{};
     KernelState* kernel{};
 };

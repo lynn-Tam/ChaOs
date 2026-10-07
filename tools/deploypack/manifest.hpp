@@ -77,7 +77,7 @@ class Task final {
     uint32_t cspace_pages_{};
     uint64_t caps_{};
     bool supervisor_{};
-    uint64_t kinds_{MYOS_RESOURCE_E2_KINDS};
+    uint64_t kinds_{RESOURCE_E2_KINDS};
     uint16_t restart_{DEPLOY_RESTART_NEVER};
     uint16_t readiness_{DEPLOY_READINESS_START};
     uint64_t readiness_timeout_ns_{};
@@ -90,7 +90,7 @@ class Task final {
     void notification(std::string_view suffix, uint64_t badge) {
         auto r = manifest_.row(DEPLOY_TABLE_OBJECT);
         r.u64(DEPLOY_OBJECT_OUTPUT, key(suffix));
-        r.u16(DEPLOY_OBJECT_KIND, MYOS_OBJECT_KIND_NOTIFICATION);
+        r.u16(DEPLOY_OBJECT_KIND, OBJECT_KIND_NOTIFICATION);
         for (auto offset : {DEPLOY_OBJECT_REF0, DEPLOY_OBJECT_REF1,
                             DEPLOY_OBJECT_REF2, DEPLOY_OBJECT_REF3})
             r.u32(offset, DEPLOY_NO_INDEX);
@@ -121,9 +121,9 @@ class Task final {
         r.u16(DEPLOY_IMPORT_MODE, mode);
         r.u16(DEPLOY_IMPORT_SOURCE_CLASS, source_class);
         constexpr auto a = DEPLOY_IMPORT_ATTENUATION;
-        r.u16(a + DEPLOY_ATTENUATION_VERSION, MYOS_CAP_ATTENUATION_VERSION_CURRENT);
+        r.u16(a + DEPLOY_ATTENUATION_VERSION, CAP_ATTENUATION_VERSION_CURRENT);
         r.u16(a + DEPLOY_ATTENUATION_KIND, binding.kind());
-        r.u32(a + DEPLOY_ATTENUATION_SIZE, MYOS_CAP_ATTENUATION_SIZE);
+        r.u32(a + DEPLOY_ATTENUATION_SIZE, CAP_ATTENUATION_SIZE);
         r.u64(a + DEPLOY_ATTENUATION_RIGHTS, rights);
         if (mode == DEPLOY_IMPORT_CHANNEL_MINT) {
             r.u64(a + DEPLOY_ATTENUATION_WORD0, side);
@@ -171,12 +171,12 @@ public:
                   segment == 0 ? DEPLOY_CRITICAL_CODE : DEPLOY_CRITICAL_NONE);
         }
         const auto stack = zero("stack", Stack, StackSize, DEPLOY_CRITICAL_STACK,
-                                MYOS_VM_READ | MYOS_VM_WRITE);
-        bootstrap_ = zero("bootstrap", Bootstrap, 4096, DEPLOY_CRITICAL_BOOTSTRAP, MYOS_VM_READ);
+                                VM_READ | VM_WRITE);
+        bootstrap_ = zero("bootstrap", Bootstrap, 4096, DEPLOY_CRITICAL_BOOTSTRAP, VM_READ);
         const auto ipc = zero("ipc", Ipc, 4096, DEPLOY_CRITICAL_IPC_HEADER,
-                              MYOS_VM_READ | MYOS_VM_WRITE);
+                              VM_READ | VM_WRITE);
         notification("terminal", 1);
-        notification("events", myos::service::EventsBadge);
+        notification("events", sys::service::EventsBadge);
         auto e = manifest_.row(DEPLOY_TABLE_EXECUTION);
         e.u64(DEPLOY_EXECUTION_KEY, key("thread"));
         e.u64(DEPLOY_EXECUTION_SC, key("sc"));
@@ -192,17 +192,17 @@ public:
         e.u64(DEPLOY_EXECUTION_SC_PERIOD, 10'000'000);
         e.u32(DEPLOY_EXECUTION_URGENCY, 8);
         e.u32(DEPLOY_EXECUTION_HOME_CPU, DEPLOY_HOME_CPU_ANY);
-        local(MYOS_BOOTSTRAP_CAP_RESOURCE_POOL, "pool",
-              MYOS_RIGHT_CREATE | (supervisor ? MYOS_RIGHT_SPLIT : 0));
-        local(MYOS_BOOTSTRAP_CAP_VSPACE, "vspace",
-              MYOS_RIGHT_DELEGATE | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
-                  | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
-        local(MYOS_BOOTSTRAP_CAP_CSPACE, "cspace", MYOS_RIGHT_MANAGE);
-        local(MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION, "events",
-              MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE);
+        local(BOOT_POOL, "pool",
+              RIGHT_CREATE | (supervisor ? RIGHT_SPLIT : 0));
+        local(BOOT_VSPACE, "vspace",
+              RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT
+                  | RIGHT_UNMAP | RIGHT_DESTROY);
+        local(BOOT_CSPACE, "cspace", RIGHT_MANAGE);
+        local(BOOT_EVENTS, "events",
+              RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE);
         if (supervisor) {
-            authority(MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN, "domain", MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_CONTROL);
-            authority(MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE, "bundle", MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_MAP | MYOS_RIGHT_INSPECT);
+            authority(BOOT_DOMAIN, "domain", RIGHT_DUPLICATE | RIGHT_CONTROL);
+            authority(BOOT_BUNDLE, "bundle", RIGHT_DUPLICATE | RIGHT_MAP | RIGHT_INSPECT);
         }
     }
     void authority(BootstrapBinding binding, std::string_view source, uint64_t rights) {
@@ -215,12 +215,12 @@ public:
         readiness_ = DEPLOY_READINESS_EXPLICIT;
         readiness_timeout_ns_ = timeout_ns;
         notification("readiness", 1);
-        local(MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION, "readiness", MYOS_RIGHT_SIGNAL);
+        local(BOOT_READY, "readiness", RIGHT_SIGNAL);
     }
     void argument(std::string_view value) {
-        if (argument_count_ == MYOS_BOOTSTRAP_ARG_MAX
-            || arguments_.size() >= MYOS_BOOTSTRAP_ARG_BYTES
-            || value.size() >= MYOS_BOOTSTRAP_ARG_BYTES - arguments_.size()
+        if (argument_count_ == boot::Args::Max
+            || arguments_.size() >= boot::Args::Bytes
+            || value.size() >= boot::Args::Bytes - arguments_.size()
             || value.find('\0') != std::string_view::npos)
             throw std::invalid_argument("task argument exceeds bootstrap envelope");
         arguments_.append(value);
@@ -249,18 +249,18 @@ public:
                          uint64_t server_side, uint64_t server_rights,
                          uint64_t client_rights, uint64_t depth = 16,
                          uint64_t transfers = 0, uint64_t relations = 2) {
-        kinds_ |= MYOS_RESOURCE_CHANNEL;
+        kinds_ |= RESOURCE_CHANNEL;
         auto object = manifest_.row(DEPLOY_TABLE_OBJECT);
         const auto first = key(std::string{label} + ".side0");
         const auto second = key(std::string{label} + ".side1");
         object.u64(DEPLOY_OBJECT_OUTPUT, first);
         object.u64(DEPLOY_OBJECT_OUTPUT_B, second);
-        object.u16(DEPLOY_OBJECT_KIND, MYOS_OBJECT_KIND_CHANNEL);
+        object.u16(DEPLOY_OBJECT_KIND, OBJECT_KIND_CHANNEL);
         for (auto offset : {DEPLOY_OBJECT_REF0, DEPLOY_OBJECT_REF1,
                             DEPLOY_OBJECT_REF2, DEPLOY_OBJECT_REF3})
             object.u32(offset, DEPLOY_NO_INDEX);
         object.u64(DEPLOY_OBJECT_ARG0, depth);
-        object.u64(DEPLOY_OBJECT_ARG1, MYOS_CHANNEL_MAX_WORDS);
+        object.u64(DEPLOY_OBJECT_ARG1, CHANNEL_MAX_WORDS);
         object.u64(DEPLOY_OBJECT_ARG2, transfers);
         object.u64(DEPLOY_OBJECT_ARG3, relations);
         import(binding, server_side == 0 ? first : second, DEPLOY_IMPORT_SOURCE_TASK_KEY,
@@ -270,10 +270,10 @@ public:
         exported.u64(DEPLOY_EXPORT_KEY, manifest_.name(label));
         exported.u16(DEPLOY_EXPORT_CLASS, DEPLOY_EXPORT_PREPARED_KEY);
         constexpr auto a = DEPLOY_EXPORT_CEILING;
-        exported.u16(a + DEPLOY_ATTENUATION_VERSION, MYOS_CAP_ATTENUATION_VERSION_CURRENT);
-        exported.u16(a + DEPLOY_ATTENUATION_KIND, MYOS_OBJECT_KIND_CHANNEL);
-        exported.u32(a + DEPLOY_ATTENUATION_SIZE, MYOS_CAP_ATTENUATION_SIZE);
-        exported.u64(a + DEPLOY_ATTENUATION_RIGHTS, client_rights | MYOS_RIGHT_DUPLICATE);
+        exported.u16(a + DEPLOY_ATTENUATION_VERSION, CAP_ATTENUATION_VERSION_CURRENT);
+        exported.u16(a + DEPLOY_ATTENUATION_KIND, OBJECT_KIND_CHANNEL);
+        exported.u32(a + DEPLOY_ATTENUATION_SIZE, CAP_ATTENUATION_SIZE);
+        exported.u64(a + DEPLOY_ATTENUATION_RIGHTS, client_rights | RIGHT_DUPLICATE);
         exported.u64(a + DEPLOY_ATTENUATION_WORD0, 1 - server_side);
     }
     void finish() {
@@ -317,18 +317,18 @@ inline auto pack_application(const char* name, const char* image,
     access files = access::none, uint64_t budget = ApplicationBudget) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, name, image, 1024 * 1024, false, budget};
-    task.authority(myos::bootstrap::imports::Stdout, "stdout", MYOS_RIGHT_SEND);
-    task.authority(myos::bootstrap::imports::Stderr, "stderr", MYOS_RIGHT_SEND);
-    task.authority(myos::bootstrap::imports::Stdin, "stdin", MYOS_RIGHT_RECEIVE);
+    task.authority(boot::Stdout, "stdout", RIGHT_SEND);
+    task.authority(boot::Stderr, "stderr", RIGHT_SEND);
+    task.authority(boot::Stdin, "stdin", RIGHT_RECEIVE);
     if (files != access::none) {
-        task.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        task.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
         task.cspace(128, 20);
         if (files == access::read)
-            task.authority(myos::bootstrap::imports::VfsRead, "vfs.read.directory", MYOS_RIGHT_SEND);
+            task.authority(boot::VfsRead, "vfs.read.directory", RIGHT_SEND);
         else if (files == access::write)
-            task.authority(myos::bootstrap::imports::Vfs, "vfs.directory", MYOS_RIGHT_SEND);
+            task.authority(boot::Vfs, "vfs.directory", RIGHT_SEND);
         else
-            task.authority(myos::bootstrap::imports::StoreAdmin, "store.admin.directory", MYOS_RIGHT_SEND);
+            task.authority(boot::StoreAdmin, "store.admin.directory", RIGHT_SEND);
     }
     task.finish();
     return manifest.finish();
@@ -341,17 +341,17 @@ inline auto pack_console(char** paths, bool storage = false,
     // Row identities belong to this manifest, not to init or the kernel.
     constexpr uint32_t uart = 0, process = 1, shell = 2, block = 3, files = 4;
     constexpr uint32_t data_block = 5;
-    constexpr auto send = MYOS_RIGHT_SEND;
-    constexpr auto receive = MYOS_RIGHT_RECEIVE;
+    constexpr auto send = RIGHT_SEND;
+    constexpr auto receive = RIGHT_RECEIVE;
     constexpr uint64_t service_budget = 600'000; // 6% per 10 ms period
     {
         Task t{manifest, "uart", paths[0], 1024 * 1024, false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
-        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY, "uart.memory", MYOS_RIGHT_MAP);
-        t.authority(MYOS_BOOTSTRAP_CAP_IRQ, "uart.irq", MYOS_RIGHT_ROUTE | MYOS_RIGHT_OBSERVE | MYOS_RIGHT_ACK);
-        t.channel_service(myos::bootstrap::imports::ConsoleOutput, "console.sender", 1, receive, send);
-        t.channel_service(myos::bootstrap::imports::ConsoleInput, "input.receiver", 0,
-            send, receive | MYOS_RIGHT_DUPLICATE);
+        t.authority(boot::UartMem, "uart.memory", RIGHT_MAP);
+        t.authority(boot::UartIrq, "uart.irq", RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK);
+        t.channel_service(boot::ConsoleOutput, "console.sender", 1, receive, send);
+        t.channel_service(boot::ConsoleInput, "input.receiver", 0,
+            send, receive | RIGHT_DUPLICATE);
         t.finish();
     }
     {
@@ -366,19 +366,19 @@ inline auto pack_console(char** paths, bool storage = false,
         if (storage) t.requires_service(6, "store admin");
         // Four live task authorities, package mappings and stream endpoints.
         t.cspace(512, 68);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
-        t.channel(myos::bootstrap::imports::Vfs, "vfs.client", 0,
-            myos::vfs::WriteDirectory, send | MYOS_RIGHT_DUPLICATE);
-        t.channel(myos::bootstrap::imports::VfsRead, "vfs.client", 0,
-            myos::vfs::ReadDirectory, send | MYOS_RIGHT_DUPLICATE);
-        if (storage) t.channel(myos::bootstrap::imports::StoreAdmin,
-            "store.client", 0, 3, send | MYOS_RIGHT_DUPLICATE);
-        t.channel_service(myos::bootstrap::imports::Process, "process.client", 1,
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.channel(boot::Files, "files.client", 0, 3, send | RIGHT_DUPLICATE);
+        t.channel(boot::Vfs, "vfs.client", 0,
+            sys::vfs::WriteDirectory, send | RIGHT_DUPLICATE);
+        t.channel(boot::VfsRead, "vfs.client", 0,
+            sys::vfs::ReadDirectory, send | RIGHT_DUPLICATE);
+        if (storage) t.channel(boot::StoreAdmin,
+            "store.client", 0, 3, send | RIGHT_DUPLICATE);
+        t.channel_service(boot::Process, "process.client", 1,
             send | receive, send | receive, 16, 0, 3);
-        t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1,
-            receive | MYOS_RIGHT_DUPLICATE);
-        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 1, send | MYOS_RIGHT_DUPLICATE);
+        t.channel(boot::ConsoleInput, "input.receiver", 1, 1,
+            receive | RIGHT_DUPLICATE);
+        t.channel(boot::ConsoleOutput, "console.sender", 0, 1, send | RIGHT_DUPLICATE);
         t.finish();
     }
     {
@@ -388,21 +388,21 @@ inline auto pack_console(char** paths, bool storage = false,
         t.requires_service(uart, "console");
         t.requires_service(process, "process");
         t.cspace(128, 20);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
         if (storage) t.argument("storage");
-        t.channel(myos::bootstrap::imports::Process, "process.client", 0, 1, send | receive);
-        t.channel(myos::bootstrap::imports::ConsoleOutput, "console.sender", 0, 2, send);
-        t.channel(myos::bootstrap::imports::ConsoleInput, "input.receiver", 1, 1, receive);
-        t.channel(myos::bootstrap::imports::ServiceControl, "service.control", 1, 1, send | receive);
+        t.channel(boot::Process, "process.client", 0, 1, send | receive);
+        t.channel(boot::ConsoleOutput, "console.sender", 0, 2, send);
+        t.channel(boot::ConsoleInput, "input.receiver", 1, 1, receive);
+        t.channel(boot::ServiceControl, "service.control", 1, 1, send | receive);
         t.finish();
     }
     {
         Task t{manifest, "block", paths[3], 4 * 1024 * 1024, false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "pci.0008", MYOS_RIGHT_CONNECT);
-        t.channel_service(myos::bootstrap::imports::Block, "block.client", 1, receive, send, 4, 4);
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        t.authority(BOOT_DEVICE, "pci.0008", RIGHT_CONNECT);
+        t.channel_service(boot::Block, "block.client", 1, receive, send, 4, 4);
         t.finish();
     }
     {
@@ -410,18 +410,18 @@ inline auto pack_console(char** paths, bool storage = false,
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.requires_service(block, "block");
         t.cspace(1024, 132);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_PAGER | MYOS_RESOURCE_CHANNEL);
-        t.channel(myos::bootstrap::imports::Block, "block.client", 0, 1, send);
-        t.channel_service(myos::bootstrap::imports::Files, "files.client", 1, receive, send, 8, 4);
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_PAGER | RESOURCE_CHANNEL);
+        t.channel(boot::Block, "block.client", 0, 1, send);
+        t.channel_service(boot::Files, "files.client", 1, receive, send, 8, 4);
         t.finish();
     }
     if (storage) {
         Task t{manifest, "block_data", paths[5], 4 * 1024 * 1024, false, service_budget};
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_IO_SPACE);
-        t.authority(MYOS_BOOTSTRAP_CAP_DEVICE, "pci.0010", MYOS_RIGHT_CONNECT);
-        t.channel_service(myos::bootstrap::imports::Block, "block_data.client", 1,
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_IO_SPACE);
+        t.authority(BOOT_DEVICE, "pci.0010", RIGHT_CONNECT);
+        t.channel_service(boot::Block, "block_data.client", 1,
             receive, send, 4, 4);
         t.finish();
     }
@@ -432,10 +432,10 @@ inline auto pack_console(char** paths, bool storage = false,
         t.explicit_readiness(10'000'000'000);
         t.requires_service(data_block, "data block");
         t.cspace(256, 36);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        t.channel(myos::bootstrap::imports::Block, "block_data.client", 0, 1, send);
-        t.authority(myos::bootstrap::imports::ServiceWake, "service.wake", MYOS_RIGHT_SIGNAL);
-        t.channel_service(myos::bootstrap::imports::Store, "store.client", 1,
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.channel(boot::Block, "block_data.client", 0, 1, send);
+        t.authority(boot::ServiceWake, "service.wake", RIGHT_SIGNAL);
+        t.channel_service(boot::Store, "store.client", 1,
             receive, send, 4, 4);
         t.finish();
     }
@@ -447,11 +447,11 @@ inline auto pack_console(char** paths, bool storage = false,
         t.requires_service(files, "files");
         if (storage) t.requires_service(6, "store");
         t.cspace(256, 36);
-        t.kinds(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL);
-        t.channel(myos::bootstrap::imports::Files, "files.client", 0, 1, send);
-        if (storage) t.channel(myos::bootstrap::imports::Store, "store.client", 0, 2, send);
-        t.authority(myos::bootstrap::imports::ServiceWake, "service.wake", MYOS_RIGHT_SIGNAL);
-        t.channel_service(myos::bootstrap::imports::Vfs, "vfs.client", 1,
+        t.kinds(RESOURCE_E2_KINDS | RESOURCE_CHANNEL);
+        t.channel(boot::Files, "files.client", 0, 1, send);
+        if (storage) t.channel(boot::Store, "store.client", 0, 2, send);
+        t.authority(boot::ServiceWake, "service.wake", RIGHT_SIGNAL);
+        t.channel_service(boot::Vfs, "vfs.client", 1,
             receive, send, 4, 4);
         t.finish();
     }

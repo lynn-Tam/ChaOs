@@ -4,7 +4,7 @@
 #include <sys/start.hpp>
 #include <servers/runtime/service.hpp>
 
-namespace myos::process {
+namespace sys::process {
 
 inline auto named(deploy::ByteView value, const char* name) noexcept -> bool {
     return value.equals({reinterpret_cast<const uint8_t*>(name), service::length(name)});
@@ -17,10 +17,10 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
     if (row.executions.count != 1 || task.execution(0)->model != DEPLOY_EXECUTION_THREAD
         || row.images.count != 1 || row.exports.count != 0 || row.dependencies.count != 0
         || row.pool_memory > 8 * 1024 * 1024 || row.pool_caps > 256
-        || (row.kind_mask & ~(MYOS_RESOURCE_E2_KINDS | MYOS_RESOURCE_CHANNEL)) != 0)
+        || (row.kind_mask & ~(RESOURCE_E2_KINDS | RESOURCE_CHANNEL)) != 0)
         return false;
     for (uint32_t i = 0; i < row.objects.count; ++i)
-        if (task.object(i)->kind != MYOS_OBJECT_KIND_NOTIFICATION) return false;
+        if (task.object(i)->kind != OBJECT_KIND_NOTIFICATION) return false;
     for (uint32_t i = 0; i < row.mappings.count; ++i)
         if (task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
             && task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_ZERO) return false;
@@ -35,23 +35,23 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
         if (binding == nullptr) return false;
         if (binding->kind == 0) {
             const auto name = task.symbol(binding->name);
-            const bootstrap::Import* contract{};
+            const boot::Import* contract{};
             const char* source{};
-            myos_word_t rights = MYOS_RIGHT_SEND;
-            if (named(name, bootstrap::imports::Vfs.name)) {
-                contract = &bootstrap::imports::Vfs; source = "vfs.directory";
-            } else if (named(name, bootstrap::imports::VfsRead.name)) {
-                contract = &bootstrap::imports::VfsRead; source = "vfs.read.directory";
-            } else if (named(name, bootstrap::imports::StoreAdmin.name)
+            word_t rights = RIGHT_SEND;
+            if (named(name, boot::Vfs.name)) {
+                contract = &boot::Vfs; source = "vfs.directory";
+            } else if (named(name, boot::VfsRead.name)) {
+                contract = &boot::VfsRead; source = "vfs.read.directory";
+            } else if (named(name, boot::StoreAdmin.name)
                 && named(package, "mkfs")) {
                 // package is the trusted boot-disk lookup selected by argv[0].
-                contract = &bootstrap::imports::StoreAdmin; source = "store.admin.directory";
-            } else if (named(name, bootstrap::imports::Stdin.name)) {
-                contract = &bootstrap::imports::Stdin; source = "stdin"; rights = MYOS_RIGHT_RECEIVE;
-            } else if (named(name, bootstrap::imports::Stdout.name)) {
-                contract = &bootstrap::imports::Stdout; source = "stdout";
-            } else if (named(name, bootstrap::imports::Stderr.name)) {
-                contract = &bootstrap::imports::Stderr; source = "stderr";
+                contract = &boot::StoreAdmin; source = "store.admin.directory";
+            } else if (named(name, boot::Stdin.name)) {
+                contract = &boot::Stdin; source = "stdin"; rights = RIGHT_RECEIVE;
+            } else if (named(name, boot::Stdout.name)) {
+                contract = &boot::Stdout; source = "stdout";
+            } else if (named(name, boot::Stderr.name)) {
+                contract = &boot::Stderr; source = "stderr";
             }
             if (contract == nullptr || binding->protocol != contract->protocol || binding->major != contract->major
                 || binding->object_kind != contract->kind
@@ -62,23 +62,23 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
         }
         if (imported.source_class != DEPLOY_IMPORT_SOURCE_TASK_KEY) return false;
         const auto source = imported.source;
-        myos_word_t rights{};
+        word_t rights{};
         switch (binding->kind) {
-        case MYOS_BOOTSTRAP_CAP_RESOURCE_POOL:
+        case BOOT_POOL:
             if (source != row.pool_key) return false;
-            rights = MYOS_RIGHT_CREATE;
+            rights = RIGHT_CREATE;
             break;
-        case MYOS_BOOTSTRAP_CAP_VSPACE:
+        case BOOT_VSPACE:
             if (source != row.vspace_key) return false;
-            rights = MYOS_RIGHT_DELEGATE | MYOS_RIGHT_MAP | MYOS_RIGHT_PROTECT
-                | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY;
+            rights = RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT
+                | RIGHT_UNMAP | RIGHT_DESTROY;
             break;
-        case MYOS_BOOTSTRAP_CAP_CSPACE:
+        case BOOT_CSPACE:
             if (source != row.cspace_key) return false;
-            rights = MYOS_RIGHT_MANAGE;
+            rights = RIGHT_MANAGE;
             break;
-        case MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION:
-            rights = MYOS_RIGHT_SIGNAL | MYOS_RIGHT_RECEIVE | MYOS_RIGHT_DUPLICATE;
+        case BOOT_EVENTS:
+            rights = RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE;
             break;
         default: return false;
         }
@@ -86,4 +86,4 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
     }
     return true;
 }
-} // namespace myos::process
+} // namespace sys::process

@@ -13,6 +13,31 @@
 #include <sched/dispatcher.hpp>
 
 namespace test::scenario {
+static auto virt_device_ref(usize index = 0) noexcept -> std::expected<object::ref<>, object::error> {
+    object::ref<> result;
+    auto select = [&](BootCap e, object::ref<>&& ref, cap::View) noexcept {
+        if (e.kind == OBJECT_KIND_DEVICE && index-- == 0) result = std::move(ref);
+        return true;
+    };
+    libk_assert(virt_caps(BootCaps::bind(select)));
+    if (!result) return std::unexpected(object::error::invalid_id);
+    return result;
+}
+static auto virt_device(usize index = 0) noexcept -> io::Device& {
+    auto ref = virt_device_ref(index);
+    libk_assert(ref);
+    // The board retains the identity throughout this scenario.
+    return *static_cast<io::Device*>(ref->get());
+}
+static auto virt_device_count() noexcept -> usize {
+    usize n{};
+    auto count = [&](BootCap e, object::ref<>&&, cap::View) noexcept {
+        n += e.kind == OBJECT_KIND_DEVICE; return true;
+    };
+    libk_assert(virt_caps(BootCaps::bind(count)));
+    return n;
+}
+
 namespace {
 template <typename T> auto read(usize address) noexcept -> T {
     asm volatile("fence iorw, iorw" ::: "memory");

@@ -1,8 +1,6 @@
 #include <trace.hpp>
 
-#include <arch/cpu.hpp>
-#include <arch/interrupt.hpp>
-#include <arch/time.hpp>
+#include <cpu.hpp>
 #include <cpu/runtime.hpp>
 
 namespace trace {
@@ -12,7 +10,7 @@ auto enabled() noexcept -> bool { return TRACE_ENABLED; }
 void emit(Event kind, u64 actor, u64 object, u64 a, u64 b) noexcept {
     if (!enabled()) return;
     const auto irq = arch::disable_interrupts();
-    auto* cpu = static_cast<CpuLocal*>(arch::current_cpu_owner());
+    auto* cpu = (arch::local() ? arch::local()->owner : nullptr);
     auto* log = cpu && cpu->runtime_ ? cpu->runtime_->log : nullptr;
     if (log) {
         const u64 head = log->head.load<libk::MemoryOrder::Relaxed>();

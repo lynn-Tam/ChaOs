@@ -38,24 +38,24 @@ struct FakeBackend final {
 
     struct Call final {
         Op op;
-        myos::cap::CapRef first;
-        myos::cap::CapRef second;
-        myos_word_t address;
-        myos_word_t size;
-        myos_word_t access;
-        myos_word_t rights;
+        sys::cap::CapRef first;
+        sys::cap::CapRef second;
+        word_t address;
+        word_t size;
+        word_t access;
+        word_t rights;
         bool zero;
 
         constexpr Call() noexcept : Call(Op::Close) {}
 
         constexpr Call(
             Op operation,
-            myos::cap::CapRef first_reference = {},
-            myos::cap::CapRef second_reference = {},
-            myos_word_t call_address = 0,
-            myos_word_t call_size = 0,
-            myos_word_t call_access = 0,
-            myos_word_t call_rights = 0,
+            sys::cap::CapRef first_reference = {},
+            sys::cap::CapRef second_reference = {},
+            word_t call_address = 0,
+            word_t call_size = 0,
+            word_t call_access = 0,
+            word_t call_rights = 0,
             bool call_zero = false) noexcept
             : op(operation),
               first(first_reference),
@@ -69,51 +69,51 @@ struct FakeBackend final {
 
     static inline Call calls[256]{};
     static inline size_t call_count{};
-    static inline myos_status_t next_close{MYOS_STATUS_OK};
-    static inline myos_status_t next_child{MYOS_STATUS_OK};
-    static inline myos_status_t next_vspace{MYOS_STATUS_OK};
-    static inline myos_status_t next_cspace{MYOS_STATUS_OK};
-    static inline myos_status_t next_memory{MYOS_STATUS_OK};
-    static inline myos_status_t next_pager_memory{MYOS_STATUS_OK};
-    static inline myos_status_t next_region{MYOS_STATUS_OK};
-    static inline myos_status_t next_map{MYOS_STATUS_OK};
-    static inline myos_status_t next_unmap{MYOS_STATUS_OK};
-    static inline myos_status_t next_destroy{MYOS_STATUS_OK};
-    static inline myos_status_t next_resource_close{MYOS_STATUS_OK};
-    static inline myos_status_t next_seal{MYOS_STATUS_OK};
-    static inline myos_status_t next_write{MYOS_STATUS_OK};
-    static inline myos_status_t map_failure{MYOS_STATUS_BUSY};
-    static inline myos_status_t write_failure{MYOS_STATUS_BUSY};
+    static inline status_t next_close{STATUS_OK};
+    static inline status_t next_child{STATUS_OK};
+    static inline status_t next_vspace{STATUS_OK};
+    static inline status_t next_cspace{STATUS_OK};
+    static inline status_t next_memory{STATUS_OK};
+    static inline status_t next_pager_memory{STATUS_OK};
+    static inline status_t next_region{STATUS_OK};
+    static inline status_t next_map{STATUS_OK};
+    static inline status_t next_unmap{STATUS_OK};
+    static inline status_t next_destroy{STATUS_OK};
+    static inline status_t next_resource_close{STATUS_OK};
+    static inline status_t next_seal{STATUS_OK};
+    static inline status_t next_write{STATUS_OK};
+    static inline status_t map_failure{STATUS_BUSY};
+    static inline status_t write_failure{STATUS_BUSY};
     static inline size_t map_count{};
     static inline size_t fail_map_at{};
     static inline size_t write_count{};
     static inline size_t fail_write_at{};
-    static inline myos_cap_t next_cap{100};
-    static inline myos_cap_t nonzero_memory_failure_cap{};
-    static inline myos_cap_t nonzero_pager_failure_cap{};
-    static inline myos_cap_t nonzero_region_failure_cap{};
-    static inline myos_word_t scratch_address{};
+    static inline cap_t next_cap{100};
+    static inline cap_t nonzero_memory_failure_cap{};
+    static inline cap_t nonzero_pager_failure_cap{};
+    static inline cap_t nonzero_region_failure_cap{};
+    static inline word_t scratch_address{};
     static inline uint8_t snapshots[8][0x4000]{};
     static inline size_t snapshot_count{};
     static inline size_t snapshot_size{};
 
     static void reset() noexcept {
         call_count = 0;
-        next_close = MYOS_STATUS_OK;
-        next_child = MYOS_STATUS_OK;
-        next_vspace = MYOS_STATUS_OK;
-        next_cspace = MYOS_STATUS_OK;
-        next_memory = MYOS_STATUS_OK;
-        next_pager_memory = MYOS_STATUS_OK;
-        next_region = MYOS_STATUS_OK;
-        next_map = MYOS_STATUS_OK;
-        next_unmap = MYOS_STATUS_OK;
-        next_destroy = MYOS_STATUS_OK;
-        next_resource_close = MYOS_STATUS_OK;
-        next_seal = MYOS_STATUS_OK;
-        next_write = MYOS_STATUS_OK;
-        map_failure = MYOS_STATUS_BUSY;
-        write_failure = MYOS_STATUS_BUSY;
+        next_close = STATUS_OK;
+        next_child = STATUS_OK;
+        next_vspace = STATUS_OK;
+        next_cspace = STATUS_OK;
+        next_memory = STATUS_OK;
+        next_pager_memory = STATUS_OK;
+        next_region = STATUS_OK;
+        next_map = STATUS_OK;
+        next_unmap = STATUS_OK;
+        next_destroy = STATUS_OK;
+        next_resource_close = STATUS_OK;
+        next_seal = STATUS_OK;
+        next_write = STATUS_OK;
+        map_failure = STATUS_BUSY;
+        write_failure = STATUS_BUSY;
         map_count = 0;
         fail_map_at = 0;
         write_count = 0;
@@ -132,142 +132,142 @@ struct FakeBackend final {
         }
     }
 
-    [[nodiscard]] static auto consume(myos_status_t& status) noexcept
-        -> myos_status_t {
-        const myos_status_t result = status;
-        status = MYOS_STATUS_OK;
+    [[nodiscard]] static auto consume(status_t& status) noexcept
+        -> status_t {
+        const status_t result = status;
+        status = STATUS_OK;
         return result;
     }
 
     [[nodiscard]] static auto close(
-        myos::cap::CapRef reference) noexcept -> myos_status_t {
+        sys::cap::CapRef reference) noexcept -> status_t {
         record(Call{Op::Close, reference});
         return consume(next_close);
     }
 
-    static void ownership_fault(myos_status_t) noexcept { __builtin_trap(); }
+    static void ownership_fault(status_t) noexcept { __builtin_trap(); }
 
     [[nodiscard]] static auto resource_create_child(
-        myos::cap::CapRef pool,
-        myos_word_t,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
         record(Call{Op::Child, pool});
-        const myos_status_t status = consume(next_child);
-        return {status, status == MYOS_STATUS_OK ? myos_word_t{10} : 0, 0};
+        const status_t status = consume(next_child);
+        return {status, status == STATUS_OK ? word_t{10} : 0, 0};
     }
 
     [[nodiscard]] static auto resource_close(
-        myos::cap::CapRef pool) noexcept -> myos_status_t {
+        sys::cap::CapRef pool) noexcept -> status_t {
         record(Call{Op::ResourceClose, pool});
         return consume(next_resource_close);
     }
 
     [[nodiscard]] static auto vspace_create(
-        myos::cap::CapRef pool) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool) noexcept -> sys::SysResult {
         record(Call{Op::VSpace, pool});
-        const myos_status_t status = consume(next_vspace);
-        return {status, status == MYOS_STATUS_OK ? myos_word_t{11} : 0, 0};
+        const status_t status = consume(next_vspace);
+        return {status, status == STATUS_OK ? word_t{11} : 0, 0};
     }
 
     [[nodiscard]] static auto cspace_create(
-        myos::cap::CapRef pool,
-        myos_word_t,
-        myos_word_t) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t,
+        word_t) noexcept -> sys::SysResult {
         record(Call{Op::CSpace, pool});
-        const myos_status_t status = consume(next_cspace);
-        return {status, status == MYOS_STATUS_OK ? myos_word_t{12} : 0, 0};
+        const status_t status = consume(next_cspace);
+        return {status, status == STATUS_OK ? word_t{12} : 0, 0};
     }
 
     [[nodiscard]] static auto memory_create(
-        myos::cap::CapRef pool,
-        myos_word_t size,
-        myos_word_t access) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t size,
+        word_t access) noexcept -> sys::SysResult {
         record(Call{Op::Memory, pool, {}, 0, size, access});
-        const myos_status_t status = consume(next_memory);
-        if (status != MYOS_STATUS_OK && nonzero_memory_failure_cap != 0) {
-            const myos_cap_t selector = nonzero_memory_failure_cap;
+        const status_t status = consume(next_memory);
+        if (status != STATUS_OK && nonzero_memory_failure_cap != 0) {
+            const cap_t selector = nonzero_memory_failure_cap;
             nonzero_memory_failure_cap = 0;
             return {status, selector, 0};
         }
-        return {status, status == MYOS_STATUS_OK ? next_cap++ : 0, 0};
+        return {status, status == STATUS_OK ? next_cap++ : 0, 0};
     }
 
     [[nodiscard]] static auto memory_create_pager(
-        myos::cap::CapRef pool,
-        myos_word_t size,
-        myos_word_t access,
-        myos::cap::CapRef pager) noexcept -> myos::SysResult {
+        sys::cap::CapRef pool,
+        word_t size,
+        word_t access,
+        sys::cap::CapRef pager) noexcept -> sys::SysResult {
         record(Call{Op::Memory, pool, pager, 0, size, access});
-        const myos_status_t status = consume(next_pager_memory);
-        if (status != MYOS_STATUS_OK && nonzero_pager_failure_cap != 0) {
-            const myos_cap_t selector = nonzero_pager_failure_cap;
+        const status_t status = consume(next_pager_memory);
+        if (status != STATUS_OK && nonzero_pager_failure_cap != 0) {
+            const cap_t selector = nonzero_pager_failure_cap;
             nonzero_pager_failure_cap = 0;
             return {status, selector, 0};
         }
-        return {status, status == MYOS_STATUS_OK ? next_cap++ : 0, 0};
+        return {status, status == STATUS_OK ? next_cap++ : 0, 0};
     }
 
     [[nodiscard]] static auto memory_seal(
-        myos::cap::CapRef memory) noexcept -> myos_status_t {
+        sys::cap::CapRef memory) noexcept -> status_t {
         record(Call{Op::Seal, memory});
         return consume(next_seal);
     }
 
     [[nodiscard]] static auto memory_populate(
-        myos::cap::CapRef, myos_word_t) noexcept -> myos_status_t {
-        return MYOS_STATUS_OK;
+        sys::cap::CapRef, word_t) noexcept -> status_t {
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto memory_write(
         void* destination,
         const uint8_t* source,
-        size_t size) noexcept -> myos_status_t {
+        size_t size) noexcept -> status_t {
         ++write_count;
         record(Call{
             Op::Write,
             {}, {},
-            reinterpret_cast<myos_word_t>(destination),
-            static_cast<myos_word_t>(size), 0, 0, source == nullptr});
+            reinterpret_cast<word_t>(destination),
+            static_cast<word_t>(size), 0, 0, source == nullptr});
         if (fail_write_at != 0 && write_count == fail_write_at) {
             fail_write_at = 0;
             return consume(write_failure);
         }
-        const myos_status_t status = consume(next_write);
-        if (status != MYOS_STATUS_OK) {
+        const status_t status = consume(next_write);
+        if (status != STATUS_OK) {
             return status;
         }
         auto* const bytes = static_cast<uint8_t*>(destination);
         for (size_t index = 0; index < size; ++index) {
             bytes[index] = source == nullptr ? 0 : source[index];
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] static auto vm_slice(
-        myos::cap::CapRef vspace,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t access,
-        myos_word_t rights) noexcept -> myos::SysResult {
+        sys::cap::CapRef vspace,
+        word_t address,
+        word_t size,
+        word_t access,
+        word_t rights) noexcept -> sys::SysResult {
         record(Call{Op::Region, vspace, {}, address, size,
             access, rights});
-        const myos_status_t status = consume(next_region);
-        if (status != MYOS_STATUS_OK && nonzero_region_failure_cap != 0) {
-            const myos_cap_t selector = nonzero_region_failure_cap;
+        const status_t status = consume(next_region);
+        if (status != STATUS_OK && nonzero_region_failure_cap != 0) {
+            const cap_t selector = nonzero_region_failure_cap;
             nonzero_region_failure_cap = 0;
             return {status, selector, 0};
         }
-        return {status, status == MYOS_STATUS_OK ? next_cap++ : 0, 0};
+        return {status, status == STATUS_OK ? next_cap++ : 0, 0};
     }
 
     [[nodiscard]] static auto vm_map(
-        myos::cap::CapRef region,
-        myos::cap::CapRef memory,
-        myos_word_t address,
-        myos_word_t size,
-        myos_word_t object_page,
-        myos_word_t access) noexcept -> myos_status_t {
+        sys::cap::CapRef region,
+        sys::cap::CapRef memory,
+        word_t address,
+        word_t size,
+        word_t object_page,
+        word_t access) noexcept -> status_t {
         ++map_count;
         record(Call{Op::Map, region, memory, address, size,
             access, object_page, 0});
@@ -279,9 +279,9 @@ struct FakeBackend final {
     }
 
     [[nodiscard]] static auto vm_unmap(
-        myos::cap::CapRef region,
-        myos_word_t address,
-        myos_word_t size) noexcept -> myos_status_t {
+        sys::cap::CapRef region,
+        word_t address,
+        word_t size) noexcept -> status_t {
         record(Call{Op::Unmap, region, {}, address, size});
         if (address == scratch_address && snapshot_count
                 < sizeof(snapshots) / sizeof(snapshots[0])) {
@@ -299,7 +299,7 @@ struct FakeBackend final {
     }
 
     [[nodiscard]] static auto vm_clear(
-        myos::cap::CapRef region) noexcept -> myos_status_t {
+        sys::cap::CapRef region) noexcept -> status_t {
         record(Call{Op::Destroy, region});
         return consume(next_destroy);
     }
@@ -407,29 +407,29 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
 }
 
 [[nodiscard]] auto make_bundle() noexcept -> size_t {
-    constexpr size_t modules = MYOS_BOOT_HEADER_SIZE;
-    constexpr size_t segments = modules + MYOS_BOOT_MODULE_SIZE;
-    constexpr size_t name = segments + 2 * MYOS_BOOT_SEGMENT_SIZE;
+    constexpr size_t modules = BUNDLE_HEADER_SIZE;
+    constexpr size_t segments = modules + BUNDLE_MODULE_SIZE;
+    constexpr size_t name = segments + 2 * BUNDLE_SEGMENT_SIZE;
     constexpr size_t image = name + 8;
     constexpr size_t image_size = 0x1003;
     constexpr size_t total = image + image_size;
     for (size_t index = 0; index < total; ++index) {
         bundle_bytes[index] = 0;
     }
-    put_bundle(0, MYOS_BOOT_MAGIC, 8);
-    put_bundle(8, MYOS_BOOT_MAJOR, 2);
-    put_bundle(10, MYOS_BOOT_MINOR, 2);
-    put_bundle(12, MYOS_BOOT_HEADER_SIZE, 4);
+    put_bundle(0, BUNDLE_MAGIC, 8);
+    put_bundle(8, BUNDLE_MAJOR, 2);
+    put_bundle(10, BUNDLE_MINOR, 2);
+    put_bundle(12, BUNDLE_HEADER_SIZE, 4);
     put_bundle(16, total, 8);
-    put_bundle(24, MYOS_BOOT_ARCH_RISCV64, 4);
-    put_bundle(28, MYOS_BOOT_ABI_RISCV_LP64, 4);
+    put_bundle(24, BUNDLE_ARCH_RISCV64, 4);
+    put_bundle(28, BUNDLE_ABI_RISCV_LP64, 4);
     put_bundle(40, modules, 8);
     put_bundle(48, 1, 4);
     put_bundle(56, segments, 8);
     put_bundle(64, 2, 4);
     put_bundle(modules, name, 8);
     put_bundle(modules + 8, 5, 4);
-    put_bundle(modules + 12, MYOS_BOOT_MODULE_BOOTABLE, 4);
+    put_bundle(modules + 12, BUNDLE_MODULE_BOOTABLE, 4);
     put_bundle(modules + 16, image, 8);
     put_bundle(modules + 24, image_size, 8);
     put_bundle(modules + 32, 0x200000, 8);
@@ -443,14 +443,14 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
     put_bundle(segments + 16, 5, 8);
     put_bundle(segments + 24, 0x1000, 8);
     put_bundle(segments + 32, 0x1000, 8);
-    put_bundle(segments + 40, MYOS_BOOT_SEGMENT_EXECUTE, 4);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE, 0x210000, 8);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE + 8, image + 0x1000, 8);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE + 16, 3, 8);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE + 24, 0x2000, 8);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE + 32, 0x1000, 8);
-    put_bundle(segments + MYOS_BOOT_SEGMENT_SIZE + 40,
-        MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_WRITE, 4);
+    put_bundle(segments + 40, BUNDLE_SEGMENT_EXECUTE, 4);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE, 0x210000, 8);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE + 8, image + 0x1000, 8);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE + 16, 3, 8);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE + 24, 0x2000, 8);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE + 32, 0x1000, 8);
+    put_bundle(segments + BUNDLE_SEGMENT_SIZE + 40,
+        BUNDLE_SEGMENT_READ | BUNDLE_SEGMENT_WRITE, 4);
     bundle_bytes[image] = 0xa1;
     bundle_bytes[image + 1] = 0xa2;
     bundle_bytes[image + 2] = 0xa3;
@@ -464,9 +464,9 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
 
 [[nodiscard]] auto make_query_bundle() noexcept -> size_t {
     const size_t total = make_bundle();
-    constexpr size_t module = MYOS_BOOT_HEADER_SIZE;
-    constexpr size_t name = module + MYOS_BOOT_MODULE_SIZE
-        + 2 * MYOS_BOOT_SEGMENT_SIZE;
+    constexpr size_t module = BUNDLE_HEADER_SIZE;
+    constexpr size_t name = module + BUNDLE_MODULE_SIZE
+        + 2 * BUNDLE_SEGMENT_SIZE;
     put_bundle(64, 1, 4);
     put_bundle(module + 8, 4, 4);
     put_bundle(module + 44, 1, 4);
@@ -499,7 +499,7 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
     return FakeBackend::call_count;
 }
 
-[[nodiscard]] auto has_close_selector(myos_cap_t selector) noexcept -> bool {
+[[nodiscard]] auto has_close_selector(cap_t selector) noexcept -> bool {
     for (size_t index = 0; index < FakeBackend::call_count; ++index) {
         const auto& call = FakeBackend::calls[index];
         if (call.op == FakeBackend::Op::Close
@@ -511,7 +511,7 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
 }
 
 [[nodiscard]] auto has_resource_close_selector(
-    myos_cap_t selector) noexcept -> bool {
+    cap_t selector) noexcept -> bool {
     for (size_t index = 0; index < FakeBackend::call_count; ++index) {
         const auto& call = FakeBackend::calls[index];
         if (call.op == FakeBackend::Op::ResourceClose
@@ -532,7 +532,7 @@ void put_bundle(size_t offset, uint64_t value, size_t width) noexcept {
 }
 
 [[nodiscard]] auto materializer_caps_closed() noexcept -> bool {
-    for (myos_cap_t selector = 102;
+    for (cap_t selector = 102;
          selector < FakeBackend::next_cap; ++selector) {
         if (!has_close_selector(selector)) {
             return false;
@@ -547,72 +547,72 @@ template<typename Task>
     Bundle& bundle,
     Scratch& scratch,
     size_t bundle_size,
-    myos_word_t scratch_size = sizeof(scratch_bytes)) noexcept -> bool {
+    word_t scratch_size = sizeof(scratch_bytes)) noexcept -> bool {
     FakeBackend::reset();
-    FakeBackend::scratch_address = reinterpret_cast<myos_word_t>(scratch_bytes);
-    if (task.open({1, 0}, 8192, 64, MYOS_RESOURCE_E7_KINDS, 32, 8)
-            != MYOS_STATUS_OK) {
+    FakeBackend::scratch_address = reinterpret_cast<word_t>(scratch_bytes);
+    if (task.open({1, 0}, 8192, 64, RESOURCE_E7_KINDS, 32, 8)
+            != STATUS_OK) {
         return false;
     }
     const auto vspace = task.lookup(
-        task.vspace_slot(), MYOS_OBJECT_KIND_VSPACE);
+        task.vspace_slot(), OBJECT_KIND_VSPACE);
     const deploy::Window bundle_window{
-        reinterpret_cast<myos_word_t>(bundle_bytes), 0x2000};
+        reinterpret_cast<word_t>(bundle_bytes), 0x2000};
     const deploy::Window scratch_window{
-        reinterpret_cast<myos_word_t>(scratch_bytes), scratch_size};
+        reinterpret_cast<word_t>(scratch_bytes), scratch_size};
     return vspace.has_value()
         && bundle.open(vspace.value(), {2, 0}, bundle_window, bundle_size)
-            == MYOS_STATUS_OK
-        && scratch.open(vspace.value(), scratch_window) == MYOS_STATUS_OK;
+            == STATUS_OK
+        && scratch.open(vspace.value(), scratch_window) == STATUS_OK;
 }
 
 template<typename Task>
 [[nodiscard]] auto close_environment(
     Task& task, Bundle& bundle, Scratch& scratch) noexcept -> bool {
-    myos_status_t status = MYOS_STATUS_INTERNAL;
+    status_t status = STATUS_INTERNAL;
     for (size_t attempt = 0; attempt < 4; ++attempt) {
         status = scratch.close();
-        if (status == MYOS_STATUS_OK) {
+        if (status == STATUS_OK) {
             break;
         }
     }
-    const bool scratch_closed = status == MYOS_STATUS_OK
+    const bool scratch_closed = status == STATUS_OK
         && scratch.phase() == deploy::LeasePhase::Closed;
-    status = MYOS_STATUS_INTERNAL;
+    status = STATUS_INTERNAL;
     for (size_t attempt = 0; attempt < 4; ++attempt) {
         status = bundle.close();
-        if (status == MYOS_STATUS_OK) {
+        if (status == STATUS_OK) {
             break;
         }
     }
-    const bool bundle_closed = status == MYOS_STATUS_OK
+    const bool bundle_closed = status == STATUS_OK
         && bundle.phase() == deploy::LeasePhase::Closed;
-    status = MYOS_STATUS_INTERNAL;
+    status = STATUS_INTERNAL;
     for (size_t attempt = 0; attempt < 4; ++attempt) {
         status = task.close();
-        if (status == MYOS_STATUS_OK) {
+        if (status == STATUS_OK) {
             break;
         }
     }
-    return scratch_closed && bundle_closed && status == MYOS_STATUS_OK
+    return scratch_closed && bundle_closed && status == STATUS_OK
         && task.phase() == deploy::Phase::Closed;
 }
 
 [[nodiscard]] auto test_production_zero_fill() noexcept -> bool {
     uint8_t bytes[4] = {0xcc, 0xcc, 0xcc, 0xcc};
     constexpr uint8_t source[2] = {0x12, 0x34};
-    if (myos::cap::SyscallBackend::memory_write(
-            bytes, source, sizeof(source)) != MYOS_STATUS_OK
+    if (sys::cap::SyscallBackend::memory_write(
+            bytes, source, sizeof(source)) != STATUS_OK
         || bytes[0] != 0x12 || bytes[1] != 0x34) {
         return false;
     }
-    if (myos::cap::SyscallBackend::memory_write(
-            bytes + 2, nullptr, 2) != MYOS_STATUS_OK
+    if (sys::cap::SyscallBackend::memory_write(
+            bytes + 2, nullptr, 2) != STATUS_OK
         || bytes[2] != 0 || bytes[3] != 0) {
         return false;
     }
-    return myos::cap::SyscallBackend::memory_write(
-               nullptr, nullptr, 0) == MYOS_STATUS_BAD_ARGS;
+    return sys::cap::SyscallBackend::memory_write(
+               nullptr, nullptr, 0) == STATUS_BAD_ARGS;
 }
 
 [[nodiscard]] auto test_success_and_order() noexcept -> bool {
@@ -625,13 +625,13 @@ template<typename Task>
     }
     Materializer materializer{task, bundle, scratch};
     Image image{};
-    if (materializer.materialize("proof", image) != MYOS_STATUS_OK
+    if (materializer.materialize("proof", image) != STATUS_OK
         || image.entry != 0x200000
         || image.segments.size() != 2
         || image.segments[0].access
-            != MYOS_VM_EXECUTE
+            != VM_EXECUTE
         || image.segments[1].access
-            != (MYOS_VM_READ | MYOS_VM_WRITE)
+            != (VM_READ | VM_WRITE)
         || count(FakeBackend::Op::Memory) != 2
         || count(FakeBackend::Op::Seal) != 1
         || count(FakeBackend::Op::Write) != 4
@@ -651,28 +651,28 @@ template<typename Task>
     const bool order = memory < write && write < unmap && unmap < seal
         && seal < region && region < map
         && FakeBackend::calls[region].access
-            == MYOS_VM_EXECUTE
+            == VM_EXECUTE
         && FakeBackend::calls[map].access
-            == MYOS_VM_EXECUTE
+            == VM_EXECUTE
         && FakeBackend::calls[memory].access
-            == (MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE);
+            == (VM_READ | VM_WRITE | VM_EXECUTE);
     const auto first_memory = image.segments[0].memory;
     const auto second_memory = image.segments[1].memory;
     const auto first_region = image.segments[0].region;
     const bool live_before_retire =
-        task.lookup(first_memory, MYOS_OBJECT_KIND_MEMORY).has_value()
-        && task.lookup(second_memory, MYOS_OBJECT_KIND_MEMORY).has_value()
+        task.lookup(first_memory, OBJECT_KIND_MEMORY).has_value()
+        && task.lookup(second_memory, OBJECT_KIND_MEMORY).has_value()
         && first(FakeBackend::Op::Close, map) == FakeBackend::call_count;
-    FakeBackend::next_close = MYOS_STATUS_BUSY;
-    const myos_status_t partial = materializer.retire_sources(image);
+    FakeBackend::next_close = STATUS_BUSY;
+    const status_t partial = materializer.retire_sources(image);
     const bool retained_after_failure =
-        partial == MYOS_STATUS_BUSY
-        && task.lookup(first_memory, MYOS_OBJECT_KIND_MEMORY).has_value();
-    const myos_status_t retired_status = materializer.retire_sources(image);
-    const bool retired = retired_status == MYOS_STATUS_OK
-        && !task.lookup(first_memory, MYOS_OBJECT_KIND_MEMORY)
-        && !task.lookup(second_memory, MYOS_OBJECT_KIND_MEMORY)
-        && task.lookup(first_region, MYOS_OBJECT_KIND_VSPACE).has_value();
+        partial == STATUS_BUSY
+        && task.lookup(first_memory, OBJECT_KIND_MEMORY).has_value();
+    const status_t retired_status = materializer.retire_sources(image);
+    const bool retired = retired_status == STATUS_OK
+        && !task.lookup(first_memory, OBJECT_KIND_MEMORY)
+        && !task.lookup(second_memory, OBJECT_KIND_MEMORY)
+        && task.lookup(first_region, OBJECT_KIND_VSPACE).has_value();
     const bool data = FakeBackend::snapshots[0][0] == 0xa1
         && FakeBackend::snapshots[0][4] == 0xa5
         && FakeBackend::snapshots[0][5] == 0
@@ -696,7 +696,7 @@ template<typename Task>
     Materializer materializer{task, bundle, scratch};
     Image image{};
     const bool success = materializer.materialize_stacks(
-        2, 0x400000, 0x2000, 0x1000, image) == MYOS_STATUS_OK
+        2, 0x400000, 0x2000, 0x1000, image) == STATUS_OK
         && image.stacks.size() == 2
         && image.stacks[0].top == 0x401000
         && image.stacks[1].mapping.address == 0x402000
@@ -704,11 +704,11 @@ template<typename Task>
         && count(FakeBackend::Op::Write) == 0
         && task.lookup(
             image.stacks[0].mapping.memory,
-            MYOS_OBJECT_KIND_MEMORY).has_value();
+            OBJECT_KIND_MEMORY).has_value();
     const bool retired = success
-        && materializer.retire_sources(image) == MYOS_STATUS_OK
+        && materializer.retire_sources(image) == STATUS_OK
         && !task.lookup(
-            image.stacks[0].mapping.memory, MYOS_OBJECT_KIND_MEMORY);
+            image.stacks[0].mapping.memory, OBJECT_KIND_MEMORY);
     const bool closed = close_environment(task, bundle, scratch);
     return success && retired && closed && environment_roots_closed()
         && materializer_caps_closed();
@@ -730,15 +730,15 @@ template<typename Task>
         0x500000, bytes, sizeof(bytes), readonly);
     const auto descriptor_status = materializer.materialize_descriptor(
         bytes, sizeof(bytes), descriptor);
-    const bool materialized = readonly_status == MYOS_STATUS_OK
-        && readonly.access == MYOS_VM_READ
+    const bool materialized = readonly_status == STATUS_OK
+        && readonly.access == VM_READ
         && readonly.address == 0x500000
         && readonly.size == DEPLOY_PAGE_SIZE
-        && task.lookup(readonly.region, MYOS_OBJECT_KIND_VSPACE)
+        && task.lookup(readonly.region, OBJECT_KIND_VSPACE)
             .has_value()
-        && !task.lookup(readonly.memory, MYOS_OBJECT_KIND_MEMORY)
-        && descriptor_status == MYOS_STATUS_OK
-        && task.lookup(descriptor, MYOS_OBJECT_KIND_MEMORY).has_value()
+        && !task.lookup(readonly.memory, OBJECT_KIND_MEMORY)
+        && descriptor_status == STATUS_OK
+        && task.lookup(descriptor, OBJECT_KIND_MEMORY).has_value()
         && count(FakeBackend::Op::Memory) == 2
         && count(FakeBackend::Op::Region) == 3
         && count(FakeBackend::Op::Map) == 4
@@ -751,7 +751,7 @@ template<typename Task>
 [[nodiscard]] auto test_stack_failures() noexcept -> bool {
     const size_t bundle_size = make_bundle();
 
-    auto run = [&](auto configure, myos_status_t expected) noexcept -> bool {
+    auto run = [&](auto configure, status_t expected) noexcept -> bool {
         Space task{};
         Bundle bundle{};
         Scratch scratch{};
@@ -761,7 +761,7 @@ template<typename Task>
         configure();
         Materializer materializer{task, bundle, scratch};
         Image image{};
-        const myos_status_t status = materializer.materialize_stacks(
+        const status_t status = materializer.materialize_stacks(
             2, 0x400000, 0x2000, 0x1000, image);
         const bool result = status == expected && image.stacks.empty();
         const bool closed = close_environment(task, bundle, scratch);
@@ -769,18 +769,18 @@ template<typename Task>
             && materializer_caps_closed();
     };
 
-    if (!run([] { FakeBackend::next_memory = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_memory = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_region = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_region = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
     if (!run([] {
             FakeBackend::fail_map_at = FakeBackend::map_count + 1;
-            FakeBackend::map_failure = MYOS_STATUS_BUSY;
-        }, MYOS_STATUS_BUSY)) {
+            FakeBackend::map_failure = STATUS_BUSY;
+        }, STATUS_BUSY)) {
         return false;
     }
     {
@@ -790,15 +790,15 @@ template<typename Task>
         if (!open_environment(task, bundle, scratch, bundle_size)) {
             return false;
         }
-        FakeBackend::next_close = MYOS_STATUS_BUSY;
+        FakeBackend::next_close = STATUS_BUSY;
         Materializer materializer{task, bundle, scratch};
         Image image{};
         const bool deferred =
             materializer.materialize_stacks(
-                2, 0x400000, 0x2000, 0x1000, image) == MYOS_STATUS_OK
+                2, 0x400000, 0x2000, 0x1000, image) == STATUS_OK
             && !image.stacks.empty()
-            && materializer.retire_sources(image) == MYOS_STATUS_BUSY
-            && materializer.retire_sources(image) == MYOS_STATUS_OK;
+            && materializer.retire_sources(image) == STATUS_BUSY
+            && materializer.retire_sources(image) == STATUS_OK;
         const bool closed = close_environment(task, bundle, scratch);
         if (!deferred || !closed || !environment_roots_closed()
             || !materializer_caps_closed()) {
@@ -806,8 +806,8 @@ template<typename Task>
         }
     }
 
-    auto run_invalid = [&](size_t stack_count, myos_word_t base,
-                           myos_word_t stride, myos_word_t size) noexcept
+    auto run_invalid = [&](size_t stack_count, word_t base,
+                           word_t stride, word_t size) noexcept
         -> bool {
         Space task{};
         Bundle bundle{};
@@ -818,14 +818,14 @@ template<typename Task>
         Materializer materializer{task, bundle, scratch};
         Image image{};
         const bool rejected = materializer.materialize_stacks(
-            stack_count, base, stride, size, image) == MYOS_STATUS_BAD_ARGS
+            stack_count, base, stride, size, image) == STATUS_BAD_ARGS
             && image.stacks.empty();
         const bool closed = close_environment(task, bundle, scratch);
         return rejected && closed && environment_roots_closed()
             && materializer_caps_closed();
     };
 
-    const myos_word_t near_end = ~myos_word_t{}
+    const word_t near_end = ~word_t{}
         - (DEPLOY_PAGE_SIZE - 1);
     if (!run_invalid(0, 0x400000, 0x2000, 0x1000)
         || !run_invalid(5, 0x400000, 0x2000, 0x1000)
@@ -845,7 +845,7 @@ template<typename Task>
     Image image{};
     const bool capacity = materializer.materialize_stacks(
             1, 0x400000, 0x2000, 0x1000, image)
-            == MYOS_STATUS_NO_MEMORY
+            == STATUS_NO_MEMORY
         && image.stacks.empty();
     const bool closed = close_environment(task, bundle, scratch);
     return capacity && closed && environment_roots_closed()
@@ -864,13 +864,13 @@ template<typename Task>
             return false;
         }
         const size_t baseline = task.local_cumulative();
-        FakeBackend::next_memory = MYOS_STATUS_BUSY;
+        FakeBackend::next_memory = STATUS_BUSY;
         FakeBackend::nonzero_memory_failure_cap = 700;
         Materializer materializer{task, bundle, scratch};
         Image image{};
         const bool result = materializer.materialize_stacks(
                 1, 0x400000, 0x2000, 0x1000, image)
-                == MYOS_STATUS_BUSY
+                == STATUS_BUSY
             && image.stacks.empty()
             && task.local_cumulative() == baseline
             && has_close_selector(700);
@@ -889,13 +889,13 @@ template<typename Task>
             return false;
         }
         const size_t baseline = task.local_cumulative();
-        FakeBackend::next_region = MYOS_STATUS_BUSY;
+        FakeBackend::next_region = STATUS_BUSY;
         FakeBackend::nonzero_region_failure_cap = 701;
         Materializer materializer{task, bundle, scratch};
         Image image{};
         const bool result = materializer.materialize_stacks(
                 1, 0x400000, 0x2000, 0x1000, image)
-                == MYOS_STATUS_BUSY
+                == STATUS_BUSY
             && image.stacks.empty()
             && task.local_cumulative() == baseline + 1
             && has_close_selector(701);
@@ -914,13 +914,13 @@ template<typename Task>
             return false;
         }
         const size_t baseline = task.local_cumulative();
-        FakeBackend::next_pager_memory = MYOS_STATUS_BUSY;
+        FakeBackend::next_pager_memory = STATUS_BUSY;
         FakeBackend::nonzero_pager_failure_cap = 702;
         Materializer materializer{task, bundle, scratch};
         Image::Mapping mapping{};
         const bool result = materializer.materialize_paged(
-                {77, 0}, 0x600000, 0x1000, MYOS_VM_READ, mapping)
-                == MYOS_STATUS_BUSY
+                {77, 0}, 0x600000, 0x1000, VM_READ, mapping)
+                == STATUS_BUSY
             && !mapping.memory.valid()
             && task.local_cumulative() == baseline
             && has_close_selector(702);
@@ -943,11 +943,11 @@ template<typename Task>
             return false;
         }
         FakeBackend::fail_write_at = failure;
-        FakeBackend::write_failure = MYOS_STATUS_BUSY;
+        FakeBackend::write_failure = STATUS_BUSY;
         Materializer materializer{task, bundle, scratch};
         Image image{};
-        const myos_status_t status = materializer.materialize("proof", image);
-        const bool cleaned = status == MYOS_STATUS_BUSY
+        const status_t status = materializer.materialize("proof", image);
+        const bool cleaned = status == STATUS_BUSY
             && image.segments.empty()
             && scratch.phase() == deploy::LeasePhase::Ready
             && count(FakeBackend::Op::Unmap) == 1;
@@ -963,7 +963,7 @@ template<typename Task>
 [[nodiscard]] auto test_segment_failures() noexcept -> bool {
     const size_t bundle_size = make_bundle();
 
-    auto run = [&](auto configure, myos_status_t expected) noexcept -> bool {
+    auto run = [&](auto configure, status_t expected) noexcept -> bool {
         Space task{};
         Bundle bundle{};
         Scratch scratch{};
@@ -973,47 +973,47 @@ template<typename Task>
         configure();
         Materializer materializer{task, bundle, scratch};
         Image image{};
-        const myos_status_t status = materializer.materialize("proof", image);
+        const status_t status = materializer.materialize("proof", image);
         const bool result = status == expected && image.segments.empty();
         const bool closed = close_environment(task, bundle, scratch);
         return result && closed && environment_roots_closed()
             && materializer_caps_closed();
     };
 
-    if (!run([] { FakeBackend::next_memory = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_memory = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_region = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_region = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_map = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_map = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_write = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_write = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
     if (!run([] {
             FakeBackend::fail_write_at = FakeBackend::write_count + 2;
-            FakeBackend::write_failure = MYOS_STATUS_BUSY;
-        }, MYOS_STATUS_BUSY)) {
+            FakeBackend::write_failure = STATUS_BUSY;
+        }, STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_unmap = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_unmap = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
-    if (!run([] { FakeBackend::next_seal = MYOS_STATUS_BUSY; },
-            MYOS_STATUS_BUSY)) {
+    if (!run([] { FakeBackend::next_seal = STATUS_BUSY; },
+            STATUS_BUSY)) {
         return false;
     }
     if (!run([] {
             FakeBackend::fail_map_at = FakeBackend::map_count + 2;
-            FakeBackend::map_failure = MYOS_STATUS_BUSY;
-        }, MYOS_STATUS_BUSY)) {
+            FakeBackend::map_failure = STATUS_BUSY;
+        }, STATUS_BUSY)) {
         return false;
     }
 
@@ -1026,7 +1026,7 @@ template<typename Task>
     SmallMaterializer materializer{task, bundle, scratch};
     Image image{};
     const bool capacity = materializer.materialize("proof", image)
-            == MYOS_STATUS_NO_MEMORY
+            == STATUS_NO_MEMORY
         && image.segments.empty();
     const bool closed = close_environment(task, bundle, scratch);
     return capacity && closed && environment_roots_closed()
@@ -1039,7 +1039,7 @@ template<typename Task>
         return false;
     }
     const size_t bundle_size = make_query_bundle();
-    const myos::boot::Bundle parsed = myos::boot::Bundle::parse(
+    const boot::Bundle parsed = boot::Bundle::parse(
         bundle_bytes, bundle_size);
     auto lease = fixture.plan.lease();
     if (!parsed || !lease) {
@@ -1053,7 +1053,7 @@ template<typename Task>
     }
     if (deploy::required_scratch_size(
             deploy::TaskPlanView{}, parsed)
-        || deploy::required_scratch_size(task, myos::boot::Bundle{})) {
+        || deploy::required_scratch_size(task, boot::Bundle{})) {
         return false;
     }
 
@@ -1087,15 +1087,15 @@ template<typename Task>
     Image image{};
     Image::Mapping zero{};
     const bool materialized =
-        materializer.materialize("init", image) == MYOS_STATUS_OK
+        materializer.materialize("init", image) == STATUS_OK
         && image.segments.size() == 1
         && materializer.materialize_zero(
                0x400000, *requirement,
-               MYOS_VM_READ | MYOS_VM_WRITE, zero) == MYOS_STATUS_OK
+               VM_READ | VM_WRITE, zero) == STATUS_OK
         && zero.size == *requirement
         && FakeBackend::snapshot_size == sizeof(FakeBackend::snapshots[0]);
     const bool retired = materialized
-        && materializer.retire_sources(image) == MYOS_STATUS_OK;
+        && materializer.retire_sources(image) == STATUS_OK;
     const bool closed = close_environment(task_space, bundle, scratch);
     if (!materialized || !retired || !closed || !environment_roots_closed()
         || !materializer_caps_closed()) {
@@ -1116,8 +1116,8 @@ template<typename Task>
     const bool rejected_zero =
         undersized_materializer.materialize_zero(
             0x400000, *requirement,
-            MYOS_VM_READ | MYOS_VM_WRITE, rejected)
-            == MYOS_STATUS_BAD_ARGS
+            VM_READ | VM_WRITE, rejected)
+            == STATUS_BAD_ARGS
         && undersized_scratch.phase() == deploy::LeasePhase::Ready;
     const bool undersized_closed = close_environment(
         undersized_task, undersized_bundle, undersized_scratch);

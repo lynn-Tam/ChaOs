@@ -6,8 +6,8 @@
 #include <libk/fmt.hpp>
 
 namespace {
-using namespace myos;
-myos_cap_t output;
+using namespace sys;
+cap_t output;
 Clock clock;
 unsigned step{};
 void check(bool condition) noexcept {
@@ -15,7 +15,7 @@ void check(bool condition) noexcept {
     if (condition) return;
     stream::Writer writer{output};
     (void)libk::fmt::format_to<"[process] failed step={}\n">(writer, step);
-    exit(MYOS_STATUS_INTERNAL);
+    exit(STATUS_INTERNAL);
 }
 auto deadline(uint64_t ms) noexcept -> uint64_t {
     const auto value = clock.after_ms(ms);
@@ -27,9 +27,9 @@ auto request(process::op operation, uint64_t id = 0, uint64_t expires = 0) noexc
     if (expires != 0) { result.size = sizeof(expires); service::copy(result.data, &expires, sizeof(expires)); }
     return result;
 }
-auto receive(service::Connection& channel, process::op operation, myos_status_t status) noexcept -> service::Message {
+auto receive(service::Connection& channel, process::op operation, status_t status) noexcept -> service::Message {
     service::Message reply;
-    check(channel.receive(reply).status == MYOS_STATUS_OK);
+    check(channel.receive(reply).status == STATUS_OK);
     if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
         stream::Writer writer{output};
         (void)libk::fmt::format_to<"[process] reply op={} status={} id={}, expected op={} status={}\n">(
@@ -38,55 +38,55 @@ auto receive(service::Connection& channel, process::op operation, myos_status_t 
     check(reply.operation == static_cast<uint64_t>(operation) && reply.status == status);
     return reply;
 }
-auto exchange(service::Connection& channel, service::Message message, myos_status_t status) noexcept -> service::Message {
-    check(channel.send(message).status == MYOS_STATUS_OK);
+auto exchange(service::Connection& channel, service::Message message, status_t status) noexcept -> service::Message {
+    check(channel.send(message).status == STATUS_OK);
     return receive(channel, static_cast<process::op>(message.operation), status);
 }
-auto spawn(service::Connection& channel, const char* ms, myos_status_t status = MYOS_STATUS_OK) noexcept -> uint64_t {
+auto spawn(service::Connection& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
     auto message = request(process::op::Spawn);
-    bootstrap::Arguments args;
+    boot::Args args;
     check(args.append("sleep", 5) && args.append(ms, service::length(ms)));
     message.size = args.data().size;
     service::copy(message.data, args.data().bytes, message.size);
     return exchange(channel, message, status).id;
 }
 void stop(service::Connection& channel, uint64_t id) noexcept {
-    check(exchange(channel, request(process::op::Stop, id), MYOS_STATUS_CANCELED).id == id);
-    exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
+    check(exchange(channel, request(process::op::Stop, id), STATUS_CANCELED).id == id);
+    exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
 }
 }
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
+extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
+    using namespace sys;
     const auto info = service::bootstrap(address, size);
-    output = service::capability(info, bootstrap::imports::ConsoleOutput);
-    check(clock.open() == MYOS_STATUS_OK);
-    service::Connection channel{service::capability(info, bootstrap::imports::Process),
-        service::capability(info, MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION)};
+    output = service::capability(info, boot::ConsoleOutput);
+    check(clock.open() == STATUS_OK);
+    service::Connection channel{service::capability(info, boot::Process),
+        service::capability(info, BOOT_EVENTS)};
 
     const auto first = spawn(channel, "10000");
-    check(channel.send(request(process::op::Wait, first)).status == MYOS_STATUS_OK);
+    check(channel.send(request(process::op::Wait, first)).status == STATUS_OK);
     const auto second = spawn(channel, "10000"); // Must progress while the first Wait is pending.
     check(first != second);
-    check(channel.send(request(process::op::CancelWait, first)).status == MYOS_STATUS_OK);
-    check(receive(channel, process::op::Wait, MYOS_STATUS_CANCELED).id == first);
-    receive(channel, process::op::CancelWait, MYOS_STATUS_OK);
-    exchange(channel, request(process::op::Wait, first, deadline(1)), MYOS_STATUS_TIMED_OUT);
+    check(channel.send(request(process::op::CancelWait, first)).status == STATUS_OK);
+    check(receive(channel, process::op::Wait, STATUS_CANCELED).id == first);
+    receive(channel, process::op::CancelWait, STATUS_OK);
+    exchange(channel, request(process::op::Wait, first, deadline(1)), STATUS_TIMED_OUT);
     stop(channel, second);
-    check(channel.send(request(process::op::Wait, first)).status == MYOS_STATUS_OK);
-    check(channel.send(request(process::op::Stop, first)).status == MYOS_STATUS_OK);
-    receive(channel, process::op::Stop, MYOS_STATUS_OK);
-    receive(channel, process::op::Wait, MYOS_STATUS_CANCELED);
-    exchange(channel, request(process::op::Wait, first), MYOS_STATUS_INVALID_CAP);
+    check(channel.send(request(process::op::Wait, first)).status == STATUS_OK);
+    check(channel.send(request(process::op::Stop, first)).status == STATUS_OK);
+    receive(channel, process::op::Stop, STATUS_OK);
+    receive(channel, process::op::Wait, STATUS_CANCELED);
+    exchange(channel, request(process::op::Wait, first), STATUS_INVALID_CAP);
 
     uint64_t retained[4]{};
     for (auto& id : retained) id = spawn(channel, "1");
-    spawn(channel, "1", MYOS_STATUS_BUSY); // Even completed, unconsumed results retain admission slots.
-    for (auto id : retained) exchange(channel, request(process::op::Wait, id), MYOS_STATUS_OK);
+    spawn(channel, "1", STATUS_BUSY); // Even completed, unconsumed results retain admission slots.
+    for (auto id : retained) exchange(channel, request(process::op::Wait, id), STATUS_OK);
     const auto reused = spawn(channel, "10000");
     for (auto id : retained) {
         check(id != reused);
-        exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
+        exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
     }
     stop(channel, reused);
 
@@ -97,30 +97,30 @@ extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) no
     // removes only the waiter; completion remains consumable exactly once.
     for (unsigned i = 0; i != 16; ++i) {
         const auto id = spawn(channel, "1");
-        check(channel.send(request(process::op::Wait, id, deadline(1))).status == MYOS_STATUS_OK);
+        check(channel.send(request(process::op::Wait, id, deadline(1))).status == STATUS_OK);
         service::Message reply;
-        check(channel.receive(reply).status == MYOS_STATUS_OK && reply.id == id
+        check(channel.receive(reply).status == STATUS_OK && reply.id == id
             && reply.operation == static_cast<uint64_t>(process::op::Wait));
-        check(reply.status == MYOS_STATUS_OK || reply.status == MYOS_STATUS_TIMED_OUT);
-        if (reply.status == MYOS_STATUS_TIMED_OUT)
-            exchange(channel, request(process::op::Wait, id), MYOS_STATUS_OK);
-        exchange(channel, request(process::op::Wait, id), MYOS_STATUS_INVALID_CAP);
-        check(channel.try_receive(reply).status == MYOS_STATUS_WOULD_BLOCK);
+        check(reply.status == STATUS_OK || reply.status == STATUS_TIMED_OUT);
+        if (reply.status == STATUS_TIMED_OUT)
+            exchange(channel, request(process::op::Wait, id), STATUS_OK);
+        exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
+        check(channel.try_receive(reply).status == STATUS_WOULD_BLOCK);
     }
 
     // Pending badges win before deadline admission; a signal after timeout is
     // preserved for the next wait instead of rewriting the prior result.
-    const auto notification = notification_create(service::capability(info, MYOS_BOOTSTRAP_CAP_RESOURCE_POOL), 8);
-    check(notification.status == MYOS_STATUS_OK);
+    const auto notification = notification_create(service::capability(info, BOOT_POOL), 8);
+    check(notification.status == STATUS_OK);
     for (unsigned i = 0; i != 16; ++i) {
-        check(notification_wait(notification.value, deadline(1)).status == MYOS_STATUS_TIMED_OUT);
-        check(notification_signal(notification.value).status == MYOS_STATUS_OK);
+        check(notification_wait(notification.value, deadline(1)).status == STATUS_TIMED_OUT);
+        check(notification_signal(notification.value).status == STATUS_OK);
         const auto signaled = notification_wait(notification.value, 1);
-        check(signaled.status == MYOS_STATUS_OK && signaled.value == 8);
-        check(notification_wait(notification.value, 1).status == MYOS_STATUS_TIMED_OUT);
+        check(signaled.status == STATUS_OK && signaled.value == 8);
+        check(notification_wait(notification.value, 1).status == STATUS_TIMED_OUT);
     }
-    check(object_destroy(notification.value).status == MYOS_STATUS_OK);
-    check(cap_close(notification.value).status == MYOS_STATUS_OK);
+    check(object_destroy(notification.value).status == STATUS_OK);
+    check(cap_close(notification.value).status == STATUS_OK);
     stream::Writer{output}.write("[process] async wait, cancel, retention, deadlines and reuse ok\n");
     exit();
 }

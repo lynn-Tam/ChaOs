@@ -1,7 +1,7 @@
 // CALL(name, number, entry, locus, unit); intentionally reusable.
 
 /*
- * Blocking operations return only after completion. MYOS_STATUS_PENDING is
+ * Blocking operations return only after completion. STATUS_PENDING is
  * reserved for explicitly asynchronous operations. VM edits complete their
  * hardware retirement before returning; there is no user polling barrier.
  */
@@ -96,10 +96,10 @@ CALL(PAGER_BIND, 141, pg_call, Any, Call) /* a0=pager, a1=Notification, a2=badge
 /* Binding starts asynchronously. STATE reports progress; close commits teardown
  * and keeps the device unavailable until BAR/IRQ and DMA retirement complete. */
 CALL(IO_SPACE_BIND, 144, io_call, Any, Call) /* a0=IOSpace, a1=Device, a2=Memory, a3=first page, a4=page count, a5=IOVA */
-CALL(IO_SPACE_STATE, 145, io_call, Any, Call) /* a0=IOSpace; returns myos_io_space_state */
-CALL(IO_SPACE_INFO, 146, io_call, Any, Call) /* a0=IOSpace, a1=registered IPC buffer offset; writes myos_io_info */
+CALL(IO_SPACE_STATE, 145, io_call, Any, Call) /* a0=IOSpace; returns IoState */
+CALL(IO_SPACE_INFO, 146, io_call, Any, Call) /* a0=IOSpace, a1=registered IPC buffer offset; writes IoInfo */
 CALL(IO_SPACE_BAR, 147, io_call, Any, Call) /* a0=IOSpace, a1=BAR index; returns bounded Memory capability */
 CALL(IO_SPACE_IRQ, 148, io_call, Any, Call) /* a0=IOSpace; returns generation Irq capability */
 CALL(IO_SPACE_CLOSE, 149, io_call, Any, Call) /* a0=IOSpace */
-CALL(DEVICE_INFO, 150, io_call, Any, Call) /* a0=Device, a1=registered IPC buffer offset; writes myos_device_info */
+CALL(DEVICE_INFO, 150, io_call, Any, Call) /* a0=Device, a1=registered IPC buffer offset; writes DeviceDesc */
 CALL(IO_SPACE_WATCH, 151, io_call, Any, Call) /* a0=IOSpace, a1=Notification, a2=badge; before bind */

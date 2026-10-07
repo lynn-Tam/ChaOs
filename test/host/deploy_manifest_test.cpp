@@ -34,28 +34,28 @@ using deploy::host::kGoldenSize;
 void put(uint8_t* bytes, size_t offset, uint64_t value, size_t width);
 
 void make_boot_bundle(uint8_t* bytes, size_t& size) {
-    constexpr size_t modules = MYOS_BOOT_HEADER_SIZE;
-    constexpr size_t segments = modules + MYOS_BOOT_MODULE_SIZE;
-    constexpr size_t name = segments + MYOS_BOOT_SEGMENT_SIZE;
+    constexpr size_t modules = BUNDLE_HEADER_SIZE;
+    constexpr size_t segments = modules + BUNDLE_MODULE_SIZE;
+    constexpr size_t name = segments + BUNDLE_SEGMENT_SIZE;
     constexpr size_t image = name + 4;
     size = image + 4;
     for (size_t index = 0; index < size; ++index) {
         bytes[index] = 0;
     }
-    put(bytes, 0, MYOS_BOOT_MAGIC, 8);
-    put(bytes, 8, MYOS_BOOT_MAJOR, 2);
-    put(bytes, 10, MYOS_BOOT_MINOR, 2);
-    put(bytes, 12, MYOS_BOOT_HEADER_SIZE, 4);
+    put(bytes, 0, BUNDLE_MAGIC, 8);
+    put(bytes, 8, BUNDLE_MAJOR, 2);
+    put(bytes, 10, BUNDLE_MINOR, 2);
+    put(bytes, 12, BUNDLE_HEADER_SIZE, 4);
     put(bytes, 16, size, 8);
-    put(bytes, 24, MYOS_BOOT_ARCH_RISCV64, 4);
-    put(bytes, 28, MYOS_BOOT_ABI_RISCV_LP64, 4);
+    put(bytes, 24, BUNDLE_ARCH_RISCV64, 4);
+    put(bytes, 28, BUNDLE_ABI_RISCV_LP64, 4);
     put(bytes, 40, modules, 8);
     put(bytes, 48, 1, 4);
     put(bytes, 56, segments, 8);
     put(bytes, 64, 1, 4);
     put(bytes, modules, name, 8);
     put(bytes, modules + 8, 4, 4);
-    put(bytes, modules + 12, MYOS_BOOT_MODULE_BOOTABLE, 4);
+    put(bytes, modules + 12, BUNDLE_MODULE_BOOTABLE, 4);
     put(bytes, modules + 16, image, 8);
     put(bytes, modules + 24, 4, 8);
     put(bytes, modules + 32, 0x200000, 8);
@@ -71,7 +71,7 @@ void make_boot_bundle(uint8_t* bytes, size_t& size) {
     put(bytes, segments + 24, 0x1000, 8);
     put(bytes, segments + 32, 0x1000, 8);
     put(bytes, segments + 40,
-        MYOS_BOOT_SEGMENT_READ | MYOS_BOOT_SEGMENT_EXECUTE, 4);
+        BUNDLE_SEGMENT_READ | BUNDLE_SEGMENT_EXECUTE, 4);
 }
 
 auto matches_file(const char* path) -> bool {
@@ -279,16 +279,16 @@ void make_two_object_manifest(
 
 void make_endpoint_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
-        bytes, size, MYOS_OBJECT_KIND_ENDPOINT,
+        bytes, size, OBJECT_KIND_ENDPOINT,
         DEPLOY_OBJECT_POST_MAPPING, "endpoint", 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_REF0, 1, 4);
 }
 
 void make_channel_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
-        bytes, size, MYOS_OBJECT_KIND_CHANNEL,
+        bytes, size, OBJECT_KIND_CHANNEL,
         DEPLOY_OBJECT_FLAG_NONE, "channel", 7);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E6_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E6_KINDS, 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000900000046), 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_ARG0, 1, 8);
@@ -298,12 +298,12 @@ void make_channel_manifest(uint8_t* bytes, size_t& size) {
 
 void make_pager_manifest(uint8_t* bytes, size_t& size) {
     make_two_object_manifest(
-        bytes, size, MYOS_OBJECT_KIND_PAGER,
+        bytes, size, OBJECT_KIND_PAGER,
         DEPLOY_OBJECT_EPHEMERAL_TASK, "pager", 5);
     for (size_t i = 0; i < 6; ++i) {
         put(bytes, 0x4e0 + DEPLOY_OBJECT_ARG0 + i * 8, 0, 8);
     }
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E7_KINDS, 8);
 }
 
 auto accepts_golden() -> bool {
@@ -321,22 +321,22 @@ auto accepts_golden() -> bool {
 }
 
 auto checks_import_lookup() -> bool {
-    myos_bootstrap_info info{};
-    info.magic = MYOS_BOOTSTRAP_MAGIC;
-    info.major = MYOS_BOOTSTRAP_MAJOR;
-    info.minor = MYOS_BOOTSTRAP_MINOR;
-    info.size = sizeof(info);
-    info.import_count = 1;
-    const auto requested = myos::bootstrap::imports::Files;
-    auto& entry = info.imports[0];
+    struct Record { BootHdr hdr; BootCap entries[2]; } info{};
+    info.hdr.magic = BOOT_MAGIC;
+    info.hdr.major = BOOT_MAJOR;
+    info.hdr.minor = BOOT_MINOR;
+    info.hdr.size = sizeof(BootHdr) + sizeof(BootCap);
+    info.hdr.count = 1;
+    const auto requested = boot::Files;
+    auto& entry = info.entries[0];
     for (size_t i = 0; requested.name[i] != 0; ++i) entry.name[i] = requested.name[i];
     entry.protocol = requested.protocol;
     entry.major = requested.major;
-    entry.object_kind = requested.kind;
+    entry.kind = requested.kind;
     entry.handle = 42;
-    auto view = myos::bootstrap::BootstrapView::parse(&info, sizeof(info));
+    auto view = boot::BootView::parse(&info, sizeof(info));
     if (!view || view->selector(requested) != 42
-        || view->selector(myos::bootstrap::imports::Block) != 0) return false;
+        || view->selector(boot::Block) != 0) return false;
     auto incompatible = requested;
     ++incompatible.major;
     if (view->selector(incompatible) != 0) return false;
@@ -344,29 +344,26 @@ auto checks_import_lookup() -> bool {
     ++incompatible.minor;
     if (view->selector(incompatible) != 0) return false;
     incompatible = requested;
-    incompatible.kind = MYOS_OBJECT_KIND_MEMORY;
+    incompatible.kind = OBJECT_KIND_MEMORY;
     if (view->selector(incompatible) != 0) return false;
     incompatible = requested;
     ++incompatible.protocol;
     if (view->selector(incompatible) != 0) return false;
-    struct ExtendedBootstrap {
-        myos_bootstrap_info prefix;
-        uint64_t extension;
-    } extended{info, 0};
-    extended.prefix.minor = MYOS_BOOTSTRAP_MINOR + 1;
-    extended.prefix.size = sizeof(extended);
-    if (!myos::bootstrap::BootstrapView::parse(&extended, sizeof(extended))
-        || myos::bootstrap::BootstrapView::parse(&extended, sizeof(info))) return false;
-    info.import_count = 2;
-    info.imports[1] = entry;
-    return !myos::bootstrap::BootstrapView::parse(&info, sizeof(info));
+    // Declared entries must fit the actual mapping, even with a newer minor.
+    info.hdr.minor++;
+    if (!boot::BootView::parse(&info, sizeof(info))) return false;
+    info.hdr.count = 2;
+    if (boot::BootView::parse(&info, sizeof(info))) return false;
+    info.hdr.size = sizeof(info);
+    info.entries[1] = entry;
+    return !boot::BootView::parse(&info, sizeof(info));
 }
 
 auto accepts_boot_bundle_cross_validation() -> bool {
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
     make_boot_bundle(bundle_bytes, bundle_size);
-    const auto bundle = myos::boot::Bundle::parse(bundle_bytes, bundle_size);
+    const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(kGolden, kGoldenSize, workspace);
     return bundle && parsed
@@ -377,7 +374,7 @@ auto rejects_effective_stack_range() -> bool {
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
     make_boot_bundle(bundle_bytes, bundle_size);
-    const auto bundle = myos::boot::Bundle::parse(bundle_bytes, bundle_size);
+    const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     uint8_t bytes[kGoldenSize]{};
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
@@ -501,9 +498,9 @@ auto rejects_endpoint_with_two_executions() -> bool {
     size_t size{};
     make_two_execution_manifest(bytes, size);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        MYOS_RESOURCE_E4_KINDS, 8);
+        RESOURCE_E4_KINDS, 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_KIND,
-        MYOS_OBJECT_KIND_ENDPOINT, 2);
+        OBJECT_KIND_ENDPOINT, 2);
     put(bytes, 0x298 + DEPLOY_OBJECT_FLAGS,
         DEPLOY_OBJECT_POST_MAPPING, 2);
     put(bytes, 0x298 + DEPLOY_OBJECT_REF0, 1, 4);
@@ -515,9 +512,9 @@ auto rejects_missing_notification_relation() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_channel_manifest(bytes, size);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E7_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E7_KINDS, 8);
     put(bytes, 0x480 + DEPLOY_OBJECT_KIND,
-        MYOS_OBJECT_KIND_PAGER, 2);
+        OBJECT_KIND_PAGER, 2);
     put(bytes, 0x480 + DEPLOY_OBJECT_FLAGS,
         DEPLOY_OBJECT_EPHEMERAL_TASK, 2);
     put(bytes, 0x480 + DEPLOY_OBJECT_ARG1, 1, 8);
@@ -529,10 +526,10 @@ auto rejects_multiple_notifications_relation() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_two_object_manifest(
-        bytes, size, MYOS_OBJECT_KIND_NOTIFICATION,
+        bytes, size, OBJECT_KIND_NOTIFICATION,
         DEPLOY_OBJECT_FLAG_NONE, "notify2", 7);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        MYOS_RESOURCE_E2_KINDS, 8);
+        RESOURCE_E2_KINDS, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, size, workspace);
 }
@@ -581,7 +578,7 @@ auto rejects_prepared_key_kind_mismatch() -> bool {
      * namespace-kind mismatch before a DeploymentPlan is constructed. */
     put(bytes, 0x3c8 + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_RESOURCE_POOL, 2);
+        OBJECT_KIND_RESOURCE_POOL, 2);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -591,7 +588,7 @@ auto rejects_kind_mask_denial() -> bool {
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];
     }
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E1_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E1_KINDS, 8);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -612,7 +609,7 @@ auto rejects_wx_mapping() -> bool {
         bytes[index] = kGolden[index];
     }
     put(bytes, 0x1f8 + DEPLOY_MAPPING_ACCESS,
-        MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE, 4);
+        VM_READ | VM_WRITE | VM_EXECUTE, 4);
     ManifestWorkspace workspace{};
     return !ManifestView::parse(bytes, sizeof(bytes), workspace);
 }
@@ -623,11 +620,11 @@ auto rejects_mapping_target_range() -> bool {
         bytes[index] = kGolden[index];
     }
     put(bytes, 0x1f8 + DEPLOY_MAPPING_ADDRESS,
-        MYOS_RISCV64_LOWER_CANONICAL_END, 8);
+        RISCV64_LOWER_CANONICAL_END, 8);
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
     make_boot_bundle(bundle_bytes, bundle_size);
-    const auto bundle = myos::boot::Bundle::parse(bundle_bytes, bundle_size);
+    const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed
@@ -657,9 +654,9 @@ auto rejects_home_cpu() -> bool {
 
 auto accepts_duplicate_typed_kind() -> bool {
     constexpr uint16_t kinds[] = {
-        MYOS_OBJECT_KIND_MEMORY, MYOS_OBJECT_KIND_VSPACE,
-        MYOS_OBJECT_KIND_RESOURCE_POOL, MYOS_OBJECT_KIND_ENDPOINT,
-        MYOS_OBJECT_KIND_CHANNEL, MYOS_OBJECT_KIND_PAGER,
+        OBJECT_KIND_MEMORY, OBJECT_KIND_VSPACE,
+        OBJECT_KIND_RESOURCE_POOL, OBJECT_KIND_ENDPOINT,
+        OBJECT_KIND_CHANNEL, OBJECT_KIND_PAGER,
     };
     for (const uint16_t kind : kinds) {
         uint8_t bytes[kGoldenSize]{};
@@ -690,7 +687,7 @@ void make_typed_import(uint8_t* bytes, uint16_t kind) {
 
 auto accepts_typed_memory_schema() -> bool {
     uint8_t bytes[kGoldenSize]{};
-    make_typed_import(bytes, MYOS_OBJECT_KIND_MEMORY);
+    make_typed_import(bytes, OBJECT_KIND_MEMORY);
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD0,
         1, 8);
@@ -699,26 +696,26 @@ auto accepts_typed_memory_schema() -> bool {
         2, 8);
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD2,
-        MYOS_VM_READ, 8);
+        VM_READ, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_typed_rwx_memory_vspace() -> bool {
     for (const uint16_t kind : {
-             uint16_t{MYOS_OBJECT_KIND_MEMORY},
-             uint16_t{MYOS_OBJECT_KIND_VSPACE}}) {
+             uint16_t{OBJECT_KIND_MEMORY},
+             uint16_t{OBJECT_KIND_VSPACE}}) {
         uint8_t bytes[kGoldenSize]{ };
         make_typed_import(bytes, kind);
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD0,
-            kind == MYOS_OBJECT_KIND_MEMORY ? 1 : 0x1000, 8);
+            kind == OBJECT_KIND_MEMORY ? 1 : 0x1000, 8);
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD1,
-            kind == MYOS_OBJECT_KIND_MEMORY ? 2 : 0x2000, 8);
+            kind == OBJECT_KIND_MEMORY ? 2 : 0x2000, 8);
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD2,
-            MYOS_VM_READ | MYOS_VM_WRITE | MYOS_VM_EXECUTE, 8);
+            VM_READ | VM_WRITE | VM_EXECUTE, 8);
         ManifestWorkspace workspace{};
         if (!ManifestView::parse(bytes, sizeof(bytes), workspace)) {
             return false;
@@ -729,7 +726,7 @@ auto accepts_typed_rwx_memory_vspace() -> bool {
 
 auto accepts_typed_vspace_schema() -> bool {
     uint8_t bytes[kGoldenSize]{};
-    make_typed_import(bytes, MYOS_OBJECT_KIND_VSPACE);
+    make_typed_import(bytes, OBJECT_KIND_VSPACE);
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD0,
         0x1000, 8);
@@ -738,14 +735,14 @@ auto accepts_typed_vspace_schema() -> bool {
         0x2000, 8);
     put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
             + DEPLOY_ATTENUATION_WORD2,
-        MYOS_VM_READ, 8);
+        VM_READ, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_typed_zero_resource_budget() -> bool {
     uint8_t bytes[kGoldenSize]{};
-    make_typed_import(bytes, MYOS_OBJECT_KIND_RESOURCE_POOL);
+    make_typed_import(bytes, OBJECT_KIND_RESOURCE_POOL);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
@@ -753,10 +750,10 @@ auto accepts_typed_zero_resource_budget() -> bool {
 auto accepts_typed_channel_forms() -> bool {
     for (const uint64_t fixed : {uint64_t{0}, UINT64_MAX}) {
         uint8_t bytes[kGoldenSize]{};
-        make_typed_import(bytes, MYOS_OBJECT_KIND_CHANNEL);
+        make_typed_import(bytes, OBJECT_KIND_CHANNEL);
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD0,
-            MYOS_CAP_CHANNEL_SIDE_A, 8);
+            CAP_CHANNEL_SIDE_A, 8);
         put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                 + DEPLOY_ATTENUATION_WORD1,
             fixed == 0 ? 0 : 7, 8);
@@ -779,35 +776,35 @@ auto rejects_typed_schema_mutations() -> bool {
     };
     const Mutation mutations[] = {
         {10, 0, 0},
-        {MYOS_OBJECT_KIND_MEMORY, 3, 1},
-        {MYOS_OBJECT_KIND_MEMORY, 2, MYOS_VM_WRITE},
-        {MYOS_OBJECT_KIND_MEMORY, 2, MYOS_VM_READ | (uint64_t{1} << 8)},
-        {MYOS_OBJECT_KIND_VSPACE, 0, 0x1001},
-        {MYOS_OBJECT_KIND_VSPACE, 1, 0x1001},
-        {MYOS_OBJECT_KIND_VSPACE, 0, UINT64_MAX - 0xfff},
-        {MYOS_OBJECT_KIND_CHANNEL, 1, 1},
+        {OBJECT_KIND_MEMORY, 3, 1},
+        {OBJECT_KIND_MEMORY, 2, VM_WRITE},
+        {OBJECT_KIND_MEMORY, 2, VM_READ | (uint64_t{1} << 8)},
+        {OBJECT_KIND_VSPACE, 0, 0x1001},
+        {OBJECT_KIND_VSPACE, 1, 0x1001},
+        {OBJECT_KIND_VSPACE, 0, UINT64_MAX - 0xfff},
+        {OBJECT_KIND_CHANNEL, 1, 1},
     };
     for (const Mutation mutation : mutations) {
         uint8_t bytes[kGoldenSize]{};
         make_typed_import(bytes, mutation.kind);
-        if (mutation.kind == MYOS_OBJECT_KIND_MEMORY) {
+        if (mutation.kind == OBJECT_KIND_MEMORY) {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD1,
                 1, 8);
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD2,
-                MYOS_VM_READ, 8);
-        } else if (mutation.kind == MYOS_OBJECT_KIND_VSPACE) {
+                VM_READ, 8);
+        } else if (mutation.kind == OBJECT_KIND_VSPACE) {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD1,
                 0x1000, 8);
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD2,
-                MYOS_VM_READ, 8);
-        } else if (mutation.kind == MYOS_OBJECT_KIND_CHANNEL) {
+                VM_READ, 8);
+        } else if (mutation.kind == OBJECT_KIND_CHANNEL) {
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD0,
-                MYOS_CAP_CHANNEL_SIDE_A, 8);
+                CAP_CHANNEL_SIDE_A, 8);
             put(bytes, 0x368 + DEPLOY_IMPORT_ATTENUATION
                     + DEPLOY_ATTENUATION_WORD1,
                 0, 8);
@@ -856,11 +853,11 @@ auto rejects_duplicate_channel_b() -> bool {
         bytes[index] = kGolden[index];
     }
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        MYOS_RESOURCE_E6_KINDS, 8);
+        RESOURCE_E6_KINDS, 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000600000026), 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_KIND,
-        MYOS_OBJECT_KIND_CHANNEL, 2);
+        OBJECT_KIND_CHANNEL, 2);
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG0, 1, 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG1, 1, 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG3, 1, 8);
@@ -876,7 +873,7 @@ auto accepts_prepared_channel_b() -> bool {
         UINT64_C(0x0000000900000046), 8);
     put(bytes, 0x3c8 + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_CHANNEL, 2);
+        OBJECT_KIND_CHANNEL, 2);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, size, workspace).has_value();
 }
@@ -890,7 +887,7 @@ auto accepts_prepared_sc() -> bool {
         UINT64_C(0x0000000200000032), 8);
     put(bytes, 0x3c8 + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_KIND,
-        MYOS_OBJECT_KIND_SCHED_CONTEXT, 2);
+        OBJECT_KIND_SCHED_CONTEXT, 2);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
 }
@@ -907,7 +904,7 @@ auto accepts_endpoint_schema() -> bool {
     uint8_t bytes[1400]{};
     size_t size{};
     make_endpoint_manifest(bytes, size);
-    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, MYOS_RESOURCE_E4_KINDS, 8);
+    put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, RESOURCE_E4_KINDS, 8);
     ManifestWorkspace workspace{};
     return ManifestView::parse(bytes, size, workspace).has_value();
 }
@@ -916,12 +913,12 @@ auto rejects_endpoint_nonresident_source() -> bool {
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
     make_boot_bundle(bundle_bytes, bundle_size);
-    const auto bundle = myos::boot::Bundle::parse(bundle_bytes, bundle_size);
+    const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     uint8_t bytes[1400]{};
     size_t size{};
     make_endpoint_manifest(bytes, size);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
-        MYOS_RESOURCE_E4_KINDS, 8);
+        RESOURCE_E4_KINDS, 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_REF0, 0, 4);
     ManifestWorkspace workspace{};
     auto parsed = ManifestView::parse(bytes, size, workspace);
@@ -1010,28 +1007,28 @@ auto rejects_boot_bundle_alignment() -> bool {
     uint8_t bytes[512]{};
     size_t size{};
     make_boot_bundle(bytes, size);
-    put(bytes, MYOS_BOOT_HEADER_SIZE + 32, 0x201000, 8);
-    put(bytes, MYOS_BOOT_HEADER_SIZE + MYOS_BOOT_MODULE_SIZE,
+    put(bytes, BUNDLE_HEADER_SIZE + 32, 0x201000, 8);
+    put(bytes, BUNDLE_HEADER_SIZE + BUNDLE_MODULE_SIZE,
         0x201000, 8);
-    put(bytes, MYOS_BOOT_HEADER_SIZE + MYOS_BOOT_MODULE_SIZE + 32,
+    put(bytes, BUNDLE_HEADER_SIZE + BUNDLE_MODULE_SIZE + 32,
         0x2000, 8);
-    return !myos::boot::Bundle::parse(bytes, size);
+    return !boot::Bundle::parse(bytes, size);
 }
 
 auto rejects_boot_alignment_upper_bound() -> bool {
     uint8_t bytes[512]{};
     size_t size{};
     make_boot_bundle(bytes, size);
-    put(bytes, MYOS_BOOT_HEADER_SIZE + MYOS_BOOT_MODULE_SIZE + 32,
-        MYOS_RISCV64_LOWER_CANONICAL_END << 1, 8);
-    return !myos::boot::Bundle::parse(bytes, size);
+    put(bytes, BUNDLE_HEADER_SIZE + BUNDLE_MODULE_SIZE + 32,
+        RISCV64_LOWER_CANONICAL_END << 1, 8);
+    return !boot::Bundle::parse(bytes, size);
 }
 
 auto accepts_entry_zero_fallback() -> bool {
     uint8_t bundle_bytes[512]{};
     size_t bundle_size{};
     make_boot_bundle(bundle_bytes, bundle_size);
-    const auto bundle = myos::boot::Bundle::parse(bundle_bytes, bundle_size);
+    const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     uint8_t bytes[kGoldenSize]{};
     for (size_t index = 0; index < kGoldenSize; ++index) {
         bytes[index] = kGolden[index];

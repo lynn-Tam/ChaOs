@@ -1,7 +1,5 @@
-//arch/riscv64/trap/trap.S
-
 #include "arch/riscv64/trap.hpp"
-#include "arch/riscv64/cpu/local_entry.hpp"
+#include "arch/riscv64/cpu_abi.h"
 
 .section .text, "ax", @progbits
 .balign 4
@@ -12,26 +10,26 @@
 trap_entry:
     /*
     The first instructions run before any stack is trusted. sscratch must hold
-    CpuEntryBlock*. csrrw gives us that entry view in t0 while preserving the
+    Entry*. csrrw gives us that entry view in t0 while preserving the
     interrupted t0 value in sscratch long enough to copy it into entry scratch.
     */
     csrrw t0, sscratch, t0
-    sd sp, RISCV64_CPU_ENTRY_SP_OFFSET(t0)
-    sd t1, RISCV64_CPU_ENTRY_T1_OFFSET(t0)
-    sd t2, RISCV64_CPU_ENTRY_T2_OFFSET(t0)
+    sd sp, CPU_ENTRY_SP_OFF(t0)
+    sd t1, CPU_ENTRY_T1_OFF(t0)
+    sd t2, CPU_ENTRY_T2_OFF(t0)
     csrr t1, sscratch
-    sd t1, RISCV64_CPU_ENTRY_T0_OFFSET(t0)
+    sd t1, CPU_ENTRY_T0_OFF(t0)
     csrw sscratch, t0
 
     // Lock profiling and concurrency CPU-live tracking share this one entry
     // timestamp. Capture after borrowed registers are safe, before stack
     // selection and TrapFrame construction add latency.
     rdtime t1
-    sd t1, RISCV64_CPU_ENTRY_TRAP_TICK_OFFSET(t0)
+    sd t1, CPU_ENTRY_TICK_OFF(t0)
 
-    ld t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
+    ld t1, CPU_ENTRY_DEPTH_OFF(t0)
     addi t1, t1, 1
-    sd t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
+    sd t1, CPU_ENTRY_DEPTH_OFF(t0)
 
     /*
     A trap taken while another trap is active no longer trusts the interrupted
@@ -44,26 +42,26 @@ trap_entry:
     /*
     Stack choice is based on previous privilege, not on the trap cause. Kernel
     origin can keep the interrupted kernel-owned sp. User origin must land on a
-    kernel-owned stack supplied through CpuEntryBlock.
+    kernel-owned stack supplied through Entry.
     */
     csrr t1, sstatus
-    andi t2, t1, RISCV64_SSTATUS_SPP_MASK
+    andi t2, t1, SSTATUS_SPP_MASK
     bnez t2, 1f
-    ld sp, RISCV64_CPU_ENTRY_ACTIVE_STACK_TOP_OFFSET(t0)
+    ld sp, CPU_ENTRY_STACK_OFF(t0)
     j 2f
 1:
-    ld sp, RISCV64_CPU_ENTRY_SP_OFFSET(t0)
+    ld sp, CPU_ENTRY_SP_OFF(t0)
 2:
     addi sp, sp, -RISCV64_TRAP_FRAME_SIZE
 
     // The borrowed registers are restored into the TrapFrame from entry scratch.
-    ld t1, RISCV64_CPU_ENTRY_T0_OFFSET(t0)
+    ld t1, CPU_ENTRY_T0_OFF(t0)
     sd t1, T0_OFFSET(sp)
-    ld t1, RISCV64_CPU_ENTRY_T1_OFFSET(t0)
+    ld t1, CPU_ENTRY_T1_OFF(t0)
     sd t1, T1_OFFSET(sp)
-    ld t1, RISCV64_CPU_ENTRY_T2_OFFSET(t0)
+    ld t1, CPU_ENTRY_T2_OFF(t0)
     sd t1, T2_OFFSET(sp)
-    ld t1, RISCV64_CPU_ENTRY_SP_OFFSET(t0)
+    ld t1, CPU_ENTRY_SP_OFF(t0)
     sd t1, SP_OFFSET(sp)
 
     //保存gpr寄存器
@@ -123,12 +121,12 @@ trap_entry:
     call trap_enter
     mv sp, a0
     /*---- 恢复边界 ----*/
-    // sscratch is restored to CpuEntryBlock before C++ runs, so return can update
+    // sscratch is restored to Entry before C++ runs, so return can update
     // trap_depth without depending on any frame-resident temporary register.
     csrr t0, sscratch
-    ld t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
+    ld t1, CPU_ENTRY_DEPTH_OFF(t0)
     addi t1, t1, -1
-    sd t1, RISCV64_CPU_ENTRY_TRAP_DEPTH_OFFSET(t0)
+    sd t1, CPU_ENTRY_DEPTH_OFF(t0)
 
     /*
     The selected TrapFrame remains on its owning stack. A future context
@@ -187,19 +185,19 @@ trap_entry:
     NOTE: sp 必须很晚恢复。因为现在的 sp 是 TrapFrame 基址
           t0 也要很晚恢复。因为它在恢复 CSR 时还被当 scratch 用
     */
-    /*luna change: clear the emergency latch with the still-scratch t0 after trap exit and register restore, reason: preserve every restored user GPR through sret*/
+    /* Clear the latch before restoring t0: sret must preserve every user GPR. */
     csrr t0, sscratch
-    sd zero, RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET(t0)
+    sd zero, CPU_ENTRY_EMERGENCY_DEPTH_OFF(t0)
     ld t0, T0_OFFSET(sp)
     ld sp, SP_OFFSET(sp)
     sret
 
 .Lnested_trap:
-    ld t1, RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET(t0)
+    ld t1, CPU_ENTRY_EMERGENCY_DEPTH_OFF(t0)
     bnez t1, .Ldouble_trap_park
     li t1, 1
-    sd t1, RISCV64_CPU_ENTRY_EMERGENCY_DEPTH_OFFSET(t0)
-    ld sp, RISCV64_CPU_ENTRY_EMERGENCY_STACK_TOP_OFFSET(t0)
+    sd t1, CPU_ENTRY_EMERGENCY_DEPTH_OFF(t0)
+    ld sp, CPU_ENTRY_EMERGENCY_STACK_OFF(t0)
     beqz sp, .Ldouble_trap_park
     j 2b
 

@@ -9,7 +9,7 @@
 #include <servers/deploy/detail/authority.hpp>
 #include <servers/deploy/detail/task.hpp>
 #include <servers/uart/port.hpp>
-#include <uapi/bootstrap.h>
+#include <uapi/start.h>
 #include <uapi/resource.h>
 #include <uapi/status.h>
 #include <uapi/vm.h>
@@ -21,14 +21,14 @@
  * file only orchestrates the already decoded plan and observes the normal
  * ownership/completion paths.
  */
-namespace myos::task_builder_fixture {
+namespace sys::task_builder_fixture {
 extern const uint8_t manifest[];
 extern const size_t manifest_size;
-} // namespace myos::task_builder_fixture
+} // namespace sys::task_builder_fixture
 
 namespace {
 
-using Backend = myos::cap::SyscallBackend;
+using Backend = sys::cap::SyscallBackend;
 using Space = deploy::TaskSpace<
     deploy::kTaskLocalCapacity,
     deploy::kTaskImportRemoteCapacity,
@@ -43,58 +43,58 @@ using Plans = deploy::PlanSet<1>;
 using SourceSpace = deploy::TaskSpace<16, 4, Backend>;
 using Source = deploy::RegisteredSpace<SourceSpace, 2>;
 
-constexpr myos_word_t PageSize = DEPLOY_PAGE_SIZE;
-constexpr myos_word_t BundleAddress = 0x1000'0000;
-constexpr myos_word_t ScratchAddress = 0x1800'0000;
-constexpr myos_word_t ScratchSize = 0x20'0000;
-constexpr myos_word_t UartAddress = 0x3001'0000;
-constexpr myos_word_t ParentMemory = 12 * 1024 * 1024;
-constexpr myos_word_t ParentCaps = 1024;
-constexpr myos_word_t ParentKinds = MYOS_RESOURCE_E7_KINDS;
-constexpr myos_word_t SourceMemory = 128 * 1024;
-constexpr myos_word_t SourceCaps = 128;
-constexpr myos_word_t SourceKinds = MYOS_RESOURCE_E4_KINDS;
-constexpr myos_word_t SourceDomainRights =
-    MYOS_RIGHT_DUPLICATE | MYOS_RIGHT_DELEGATE | MYOS_RIGHT_INSPECT
-    | MYOS_RIGHT_CONTROL | MYOS_RIGHT_DESTROY | MYOS_RIGHT_REVOKE;
+constexpr word_t PageSize = DEPLOY_PAGE_SIZE;
+constexpr word_t BundleAddress = 0x1000'0000;
+constexpr word_t ScratchAddress = 0x1800'0000;
+constexpr word_t ScratchSize = 0x20'0000;
+constexpr word_t UartAddress = 0x3001'0000;
+constexpr word_t ParentMemory = 12 * 1024 * 1024;
+constexpr word_t ParentCaps = 1024;
+constexpr word_t ParentKinds = RESOURCE_E7_KINDS;
+constexpr word_t SourceMemory = 128 * 1024;
+constexpr word_t SourceCaps = 128;
+constexpr word_t SourceKinds = RESOURCE_E4_KINDS;
+constexpr word_t SourceDomainRights =
+    RIGHT_DUPLICATE | RIGHT_DELEGATE | RIGHT_INSPECT
+    | RIGHT_CONTROL | RIGHT_DESTROY | RIGHT_REVOKE;
 
-[[nodiscard]] constexpr auto retryable(myos_status_t status) noexcept -> bool {
-    return status == MYOS_STATUS_BUSY || status == MYOS_STATUS_RETRY;
+[[nodiscard]] constexpr auto retryable(status_t status) noexcept -> bool {
+    return status == STATUS_BUSY || status == STATUS_RETRY;
 }
 
 struct Console final {
-    myos::cap::OwnedCap region{};
-    myos::uart::Port port{0};
+    sys::cap::OwnedCap region{};
+    sys::uart::Port port{0};
     deploy::LeasePhase phase{deploy::LeasePhase::Empty};
 
     [[nodiscard]] auto open(
-        myos::cap::CapRef vspace,
-        myos::cap::CapRef memory) noexcept -> bool {
+        sys::cap::CapRef vspace,
+        sys::cap::CapRef memory) noexcept -> bool {
         if (phase != deploy::LeasePhase::Empty
             && phase != deploy::LeasePhase::Closed) {
             return false;
         }
-        port = myos::uart::Port{0};
-        const myos::SysResult created = myos::vm_slice(
+        port = sys::uart::Port{0};
+        const sys::SysResult created = sys::vm_slice(
             vspace.selector,
             UartAddress,
             PageSize,
-            MYOS_VM_READ | MYOS_VM_WRITE,
-            MYOS_RIGHT_MAP | MYOS_RIGHT_UNMAP | MYOS_RIGHT_DESTROY);
-        if (created.status != MYOS_STATUS_OK || created.value == 0) {
+            VM_READ | VM_WRITE,
+            RIGHT_MAP | RIGHT_UNMAP | RIGHT_DESTROY);
+        if (created.status != STATUS_OK || created.value == 0) {
             return false;
         }
-        region = myos::cap::OwnedCap{
-            myos::cap::CapRef{created.value, 0}};
+        region = sys::cap::OwnedCap{
+            sys::cap::CapRef{created.value, 0}};
         phase = deploy::LeasePhase::Ready;
-        const myos::SysResult mapped_result = myos::vm_map(
+        const sys::SysResult mapped_result = sys::vm_map(
             region.selector(), memory.selector, UartAddress, PageSize, 0,
-            MYOS_VM_READ | MYOS_VM_WRITE);
+            VM_READ | VM_WRITE);
         if (!deploy::committed(mapped_result.status)) {
             return false;
         }
         phase = deploy::LeasePhase::Mapped;
-        port = myos::uart::Port{UartAddress};
+        port = sys::uart::Port{UartAddress};
         port.reset();
         /* The mapping is the authoritative lifetime; a null Port is an
          * invalid observation, but cleanup still owns the committed mapping. */
@@ -107,7 +107,7 @@ struct Console final {
     [[nodiscard]] auto close() noexcept -> bool {
         /* Port is a borrow over the UART mapping.  Invalidate that borrow
          * before the first committed teardown step and never use it again. */
-        port = myos::uart::Port{0};
+        port = sys::uart::Port{0};
         for (;;) {
             switch (phase) {
             case deploy::LeasePhase::Empty:
@@ -116,14 +116,14 @@ struct Console final {
             case deploy::LeasePhase::Mapped:
             case deploy::LeasePhase::Unmapping: {
                 phase = deploy::LeasePhase::Unmapping;
-                const myos_status_t status = myos::vm_unmap(
+                const status_t status = sys::vm_unmap(
                     region.selector(), UartAddress, PageSize).status;
                 if (deploy::committed(status)) {
                     phase = deploy::LeasePhase::Ready;
                     continue;
                 }
                 if (retryable(status)) {
-                    myos::yield();
+                    sys::yield();
                     continue;
                 }
                 Backend::ownership_fault(status);
@@ -131,27 +131,27 @@ struct Console final {
             case deploy::LeasePhase::Ready:
             case deploy::LeasePhase::Destroying: {
                 phase = deploy::LeasePhase::Destroying;
-                const myos_status_t status = myos::vm_clear(
+                const status_t status = sys::vm_clear(
                     region.selector()).status;
                 if (deploy::committed(status)) {
                     phase = deploy::LeasePhase::Closing;
                     continue;
                 }
                 if (retryable(status)) {
-                    myos::yield();
+                    sys::yield();
                     continue;
                 }
                 Backend::ownership_fault(status);
             }
             case deploy::LeasePhase::Closing: {
-                const myos_status_t status = region.close();
-                if (status == MYOS_STATUS_OK) {
+                const status_t status = region.close();
+                if (status == STATUS_OK) {
                     region = {};
                     phase = deploy::LeasePhase::Closed;
                     return true;
                 }
                 if (retryable(status)) {
-                    myos::yield();
+                    sys::yield();
                     continue;
                 }
                 Backend::ownership_fault(status);
@@ -161,20 +161,20 @@ struct Console final {
     }
 
     void text(const char* value) noexcept {
-        myos::uart::Writer writer{port};
+        sys::uart::Writer writer{port};
         writer.write(value);
     }
 
     template<libk::fmt::fixed_string F, typename... Args>
     [[nodiscard]] auto print(const Args&... args) noexcept -> bool {
-        return myos::uart::Printer{
-            myos::uart::Writer{port}}.template print<F>(args...);
+        return sys::uart::Printer{
+            sys::uart::Writer{port}}.template print<F>(args...);
     }
 };
 
 struct Runtime final {
     Console console{};
-    myos::cap::OwnedCap parent{};
+    sys::cap::OwnedCap parent{};
     deploy::MappedBundle<> bundle{};
     deploy::ScratchWindow<> scratch{};
     Source source{};
@@ -188,7 +188,7 @@ struct Runtime final {
     deploy::AuthorityId typed_source{};
     deploy::DeploymentPlan plan{};
     const void* bootstrap{};
-    myos_word_t bootstrap_size{};
+    word_t bootstrap_size{};
     uint32_t cpu_count{};
     bool source_open{};
     bool parent_open{};
@@ -201,49 +201,49 @@ struct Runtime final {
  * kernel owners are explicitly drained by run(). */
 Runtime runtime{};
 
-[[nodiscard]] constexpr auto page_round(myos_word_t size) noexcept
-    -> myos_word_t {
-    return size <= static_cast<myos_word_t>(-1) - (PageSize - 1)
+[[nodiscard]] constexpr auto page_round(word_t size) noexcept
+    -> word_t {
+    return size <= static_cast<word_t>(-1) - (PageSize - 1)
         ? (size + PageSize - 1) & ~(PageSize - 1)
         : 0;
 }
 
 [[nodiscard]] auto drain_task(deploy::TaskId id) noexcept -> bool {
     for (size_t attempt = 0; attempt < 256; ++attempt) {
-        const myos_status_t status = runtime.table.continue_close(id);
-        if (status == MYOS_STATUS_OK) {
+        const status_t status = runtime.table.continue_close(id);
+        if (status == STATUS_OK) {
             return true;
         }
         if (!retryable(status)) {
             return false;
         }
-        myos::yield();
+        sys::yield();
     }
     return false;
 }
 
 [[nodiscard]] auto source_ceiling(
-    myos_object_kind_t kind,
-    myos_word_t rights) noexcept -> myos_cap_attenuation {
-    myos_cap_attenuation value{};
-    value.version = MYOS_CAP_ATTENUATION_VERSION_CURRENT;
+    obj_kind_t kind,
+    word_t rights) noexcept -> CapView {
+    CapView value{};
+    value.version = CAP_ATTENUATION_VERSION_CURRENT;
     value.kind = kind;
-    value.size = MYOS_CAP_ATTENUATION_SIZE;
+    value.size = CAP_ATTENUATION_SIZE;
     value.rights = rights;
-    if (kind == MYOS_OBJECT_KIND_MEMORY) {
+    if (kind == OBJECT_KIND_MEMORY) {
         value.words[0] = 0;
         value.words[1] = 1;
-        value.words[2] = MYOS_VM_READ | MYOS_VM_WRITE;
+        value.words[2] = VM_READ | VM_WRITE;
     }
     return value;
 }
 
 [[nodiscard]] auto setup_source(
-    myos_cap_t root_pool,
-    myos_cap_t root_domain) noexcept -> bool {
+    cap_t root_pool,
+    cap_t root_domain) noexcept -> bool {
     SourceSpace source_space{};
-    const myos_status_t opened = source_space.open(
-            myos::cap::CapRef{root_pool, 0},
+    const status_t opened = source_space.open(
+            sys::cap::CapRef{root_pool, 0},
             SourceMemory,
             SourceCaps,
             SourceKinds,
@@ -251,21 +251,21 @@ Runtime runtime{};
             1);
     static_cast<void>(runtime.console.print<"task-builder-test: source-status={}\n">(
         opened));
-    if (opened != MYOS_STATUS_OK) {
+    if (opened != STATUS_OK) {
         return false;
     }
-    const myos::SysResult duplicated = myos::cap_duplicate(
+    const sys::SysResult duplicated = sys::cap_duplicate(
         root_domain, 0, SourceDomainRights);
     static_cast<void>(runtime.console.print<"task-builder-test: duplicate-status={}\n">(
         duplicated.status));
-    if (duplicated.status != MYOS_STATUS_OK || duplicated.value == 0) {
+    if (duplicated.status != STATUS_OK || duplicated.value == 0) {
         return false;
     }
-    myos::cap::OwnedCap domain_owner{
-        myos::cap::CapRef{duplicated.value, 0}};
+    sys::cap::OwnedCap domain_owner{
+        sys::cap::CapRef{duplicated.value, 0}};
     const auto domain_slot = source_space.adopt_local(
-        myos::cap::OwnedCap{domain_owner.release()},
-        MYOS_OBJECT_KIND_SCHED_DOMAIN);
+        sys::cap::OwnedCap{domain_owner.release()},
+        OBJECT_KIND_SCHED_DOMAIN);
     if (!domain_slot) {
         return false;
     }
@@ -273,18 +273,18 @@ Runtime runtime{};
     if (!source_pool) {
         return false;
     }
-    const myos::SysResult memory = myos::memory_create(
-        source_pool->selector, PageSize, MYOS_VM_READ | MYOS_VM_WRITE);
+    const sys::SysResult memory = sys::memory_create(
+        source_pool->selector, PageSize, VM_READ | VM_WRITE);
     static_cast<void>(runtime.console.print<"task-builder-test: source-memory-status={}\n">(
         memory.status));
-    if (memory.status != MYOS_STATUS_OK || memory.value == 0) {
+    if (memory.status != STATUS_OK || memory.value == 0) {
         return false;
     }
-    myos::cap::OwnedCap memory_owner{
-        myos::cap::CapRef{memory.value, 0}};
+    sys::cap::OwnedCap memory_owner{
+        sys::cap::CapRef{memory.value, 0}};
     const auto memory_slot = source_space.adopt_local(
-        myos::cap::OwnedCap{memory_owner.release()},
-        MYOS_OBJECT_KIND_MEMORY);
+        sys::cap::OwnedCap{memory_owner.release()},
+        OBJECT_KIND_MEMORY);
     if (!memory_slot) {
         return false;
     }
@@ -295,12 +295,12 @@ Runtime runtime{};
         runtime.authorities,
         *domain_slot,
         UINT64_C(0x535441474545444f),
-        source_ceiling(MYOS_OBJECT_KIND_SCHED_DOMAIN, MYOS_RIGHT_MASK));
+        source_ceiling(OBJECT_KIND_SCHED_DOMAIN, RIGHT_MASK));
     const auto memory_id = runtime.source.register_source(
         runtime.authorities,
         *memory_slot,
         UINT64_C(0x5354414745454d45),
-        source_ceiling(MYOS_OBJECT_KIND_MEMORY, MYOS_RIGHT_MASK));
+        source_ceiling(OBJECT_KIND_MEMORY, RIGHT_MASK));
     if (!domain_id || !memory_id) {
         return false;
     }
@@ -311,63 +311,63 @@ Runtime runtime{};
 }
 
 [[nodiscard]] auto setup_views(
-    const myos::bootstrap::BootstrapView& bootstrap) noexcept -> bool {
-    const myos_cap_t root_vspace = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_VSPACE);
-    const myos_cap_t root_bundle = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_BOOT_BUNDLE);
-    const myos_cap_t root_pool = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_RESOURCE_POOL);
-    const myos_cap_t root_domain = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_SCHED_DOMAIN);
-    const myos_cap_t uart_memory = bootstrap.selector(
-        MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY);
+    const boot::BootView& bootstrap) noexcept -> bool {
+    const cap_t root_vspace = bootstrap.selector(
+        BOOT_VSPACE);
+    const cap_t root_bundle = bootstrap.selector(
+        BOOT_BUNDLE);
+    const cap_t root_pool = bootstrap.selector(
+        BOOT_POOL);
+    const cap_t root_domain = bootstrap.selector(
+        BOOT_DOMAIN);
+    const cap_t uart_memory = bootstrap.selector(
+        boot::UartMem);
     if (root_vspace == 0 || root_bundle == 0 || root_pool == 0
         || root_domain == 0 || uart_memory == 0) {
         return false;
     }
     if (!runtime.console.open(
-            myos::cap::CapRef{root_vspace, 0},
-            myos::cap::CapRef{uart_memory, 0})) {
+            sys::cap::CapRef{root_vspace, 0},
+            sys::cap::CapRef{uart_memory, 0})) {
         return false;
     }
     runtime.console.text("task-builder-test: boot-root\n");
 
-    const myos::SysResult parent = Backend::resource_create_child(
-        myos::cap::CapRef{root_pool, 0},
+    const sys::SysResult parent = Backend::resource_create_child(
+        sys::cap::CapRef{root_pool, 0},
         ParentMemory,
         ParentCaps,
         ParentKinds);
     static_cast<void>(runtime.console.print<"task-builder-test: parent-status={}\n">(
         parent.status));
-    if (parent.status != MYOS_STATUS_OK || parent.value == 0) {
+    if (parent.status != STATUS_OK || parent.value == 0) {
         return false;
     }
-    runtime.parent = myos::cap::OwnedCap{
-        myos::cap::CapRef{parent.value, 0}};
+    runtime.parent = sys::cap::OwnedCap{
+        sys::cap::CapRef{parent.value, 0}};
     runtime.parent_open = true;
     runtime.bootstrap = bootstrap.data();
-    runtime.bootstrap_size = sizeof(myos_bootstrap_info);
+    runtime.bootstrap_size = bootstrap.size();
     runtime.cpu_count = bootstrap.cpu_count();
     runtime.console.text("task-builder-test: parent\n");
 
-    const myos_word_t bundle_window = page_round(
+    const word_t bundle_window = page_round(
         bootstrap.bundle_size());
     if (bundle_window == 0
         || runtime.bundle.open(
-               myos::cap::CapRef{root_vspace, 0},
-               myos::cap::CapRef{root_bundle, 0},
+               sys::cap::CapRef{root_vspace, 0},
+               sys::cap::CapRef{root_bundle, 0},
                deploy::Window{BundleAddress, bundle_window},
-               bootstrap.bundle_size()) != MYOS_STATUS_OK) {
+               bootstrap.bundle_size()) != STATUS_OK) {
         return false;
     }
     runtime.bundle_open = true;
     runtime.console.text("task-builder-test: bundle\n");
     if (runtime.scratch.open(
-            myos::cap::CapRef{root_vspace, 0},
+            sys::cap::CapRef{root_vspace, 0},
             deploy::Window{ScratchAddress, ScratchSize},
             deploy::Window{BundleAddress, bundle_window})
-        != MYOS_STATUS_OK) {
+        != STATUS_OK) {
         return false;
     }
     runtime.scratch_open = true;
@@ -377,8 +377,8 @@ Runtime runtime{};
 
 [[nodiscard]] auto decode_plan() noexcept -> bool {
     const auto manifest = deploy::ManifestView::parse(
-        myos::task_builder_fixture::manifest,
-        myos::task_builder_fixture::manifest_size,
+        sys::task_builder_fixture::manifest,
+        sys::task_builder_fixture::manifest_size,
         runtime.manifest_workspace);
     if (!manifest) {
         return false;
@@ -396,7 +396,7 @@ Runtime runtime{};
 [[nodiscard]] auto observe_completion(
     deploy::TaskId id,
     deploy::CloseReason reason,
-    myos_status_t status,
+    status_t status,
     deploy::TaskBuilder<Table, Completions>& builder,
     std::optional<Completions::Receiver>& receiver) noexcept -> bool {
     if (builder.valid() && !builder.fail(reason, status)) {
@@ -420,21 +420,21 @@ Runtime runtime{};
     if (task_index != 3 && task_index != 4) {
         return std::nullopt;
     }
-    const myos::boot::Bundle* const package = runtime.bundle.view();
+    const boot::Bundle* const package = runtime.bundle.view();
     if (package == nullptr) {
         return std::nullopt;
     }
-    myos::boot::Module child{};
+    boot::Module child{};
     if (!package->find("child", child) || child.segment_count() != 2) {
         return std::nullopt;
     }
-    myos::boot::Segment text{};
-    myos::boot::Segment data{};
+    boot::Segment text{};
+    boot::Segment data{};
     if (!child.segment(0, text) || !child.segment(1, data)
-        || (text.access & MYOS_BOOT_SEGMENT_EXECUTE) == 0
-        || (text.access & MYOS_BOOT_SEGMENT_WRITE) != 0
-        || (data.access & MYOS_BOOT_SEGMENT_WRITE) == 0
-        || (data.access & MYOS_BOOT_SEGMENT_EXECUTE) != 0
+        || (text.access & BUNDLE_SEGMENT_EXECUTE) == 0
+        || (text.access & BUNDLE_SEGMENT_WRITE) != 0
+        || (data.access & BUNDLE_SEGMENT_WRITE) == 0
+        || (data.access & BUNDLE_SEGMENT_EXECUTE) != 0
         || text.file_size == 0 || text.memory_size == 0
         || text.memory_size > PageSize
         || data.file_size != sizeof(uint64_t)
@@ -517,11 +517,11 @@ Runtime runtime{};
         .runtime_cpu_count = runtime.cpu_count,
         .bindings = &bindings,
         .workspace = runtime.workspace};
-    const myos_status_t constructed = builder.construct(
+    const status_t constructed = builder.construct(
         input, runtime.authorities);
     static_cast<void>(runtime.console.print<"task-builder-test: cut={} status={}\n">(
         task_index, constructed));
-    if (constructed == MYOS_STATUS_NO_MEMORY) {
+    if (constructed == STATUS_NO_MEMORY) {
         const auto* failed = runtime.table.closing(id);
         if (failed != nullptr) {
             static_cast<void>(runtime.console.print<
@@ -532,12 +532,12 @@ Runtime runtime{};
     }
 
     if (task_index == 4) {
-        if (constructed != MYOS_STATUS_OK || !builder.commit_prepared()) {
+        if (constructed != STATUS_OK || !builder.commit_prepared()) {
             return observe_completion(
                 id,
                 deploy::CloseReason::ConstructionFailure,
-                constructed == MYOS_STATUS_OK
-                    ? MYOS_STATUS_INTERNAL : constructed,
+                constructed == STATUS_OK
+                    ? STATUS_INTERNAL : constructed,
                 builder,
                 receiver);
         }
@@ -550,7 +550,7 @@ Runtime runtime{};
             return false;
         }
         if (!runtime.table.begin_close(
-                id, deploy::CloseReason::Explicit, MYOS_STATUS_OK)
+                id, deploy::CloseReason::Explicit, STATUS_OK)
             || !drain_task(id)) {
             return false;
         }
@@ -558,11 +558,11 @@ Runtime runtime{};
         return result.has_value()
             && result->task == id
             && result->reason == deploy::CloseReason::Explicit
-            && result->status == MYOS_STATUS_OK;
+            && result->status == STATUS_OK;
     }
 
-    const myos_status_t expected = task_index == 0
-        ? MYOS_STATUS_NO_MEMORY : MYOS_STATUS_INVALID_CAP;
+    const status_t expected = task_index == 0
+        ? STATUS_NO_MEMORY : STATUS_INVALID_CAP;
     if (constructed != expected) {
         return false;
     }
@@ -614,7 +614,7 @@ Runtime runtime{};
 
 [[nodiscard]] auto close_source_with_lease() noexcept -> bool {
     auto held = runtime.authorities.lease(runtime.typed_source);
-    if (!held || runtime.source.close() != MYOS_STATUS_BUSY) {
+    if (!held || runtime.source.close() != STATUS_BUSY) {
         return false;
     }
     if (runtime.authorities.lease(runtime.typed_source)) {
@@ -622,15 +622,15 @@ Runtime runtime{};
     }
     held->release();
     for (size_t attempt = 0; attempt < 64; ++attempt) {
-        const myos_status_t status = runtime.source.close();
-        if (status == MYOS_STATUS_OK) {
+        const status_t status = runtime.source.close();
+        if (status == STATUS_OK) {
             runtime.source_open = false;
             return true;
         }
         if (!retryable(status)) {
             return false;
         }
-        myos::yield();
+        sys::yield();
     }
     return false;
 }
@@ -645,7 +645,7 @@ Runtime runtime{};
     }
     if (runtime.scratch_open) {
         runtime.console.text("task-builder-test: diag-cleanup-scratch-start\n");
-        if (runtime.scratch.close() != MYOS_STATUS_OK) {
+        if (runtime.scratch.close() != STATUS_OK) {
             return false;
         }
         runtime.scratch_open = false;
@@ -653,7 +653,7 @@ Runtime runtime{};
     }
     if (runtime.bundle_open) {
         runtime.console.text("task-builder-test: diag-cleanup-bundle-start\n");
-        if (runtime.bundle.close() != MYOS_STATUS_OK) {
+        if (runtime.bundle.close() != STATUS_OK) {
             return false;
         }
         runtime.bundle_open = false;
@@ -661,13 +661,13 @@ Runtime runtime{};
     }
     if (runtime.parent_open) {
         runtime.console.text("task-builder-test: diag-cleanup-parent-start\n");
-        const myos_status_t closed = Backend::resource_close(
+        const status_t closed = Backend::resource_close(
             runtime.parent.reference());
-        if (closed != MYOS_STATUS_OK) {
+        if (closed != STATUS_OK) {
             return false;
         }
         runtime.console.text("task-builder-test: diag-cleanup-parent-close\n");
-        if (runtime.parent.close() != MYOS_STATUS_OK) {
+        if (runtime.parent.close() != STATUS_OK) {
             return false;
         }
         runtime.parent_open = false;
@@ -686,7 +686,7 @@ Runtime runtime{};
 }
 
 [[nodiscard]] auto run(
-    const myos::bootstrap::BootstrapView& bootstrap) noexcept -> bool {
+    const boot::BootView& bootstrap) noexcept -> bool {
     bool complete = setup_views(bootstrap);
     if (complete) {
         complete = decode_plan();
@@ -718,16 +718,16 @@ Runtime runtime{};
 
 } // namespace
 
-extern "C" [[noreturn]] void myos_main(
+extern "C" [[noreturn]] void user_main(
     const void* bootstrap,
-    myos_word_t bootstrap_size) noexcept {
-    const auto info = myos::bootstrap::BootstrapView::parse(
+    word_t bootstrap_size) noexcept {
+    const auto info = boot::BootView::parse(
         bootstrap, bootstrap_size);
     if (!info || info->bundle_size() == 0) {
-        myos::exit();
+        sys::exit();
     }
     if (!run(*info)) {
-        Backend::ownership_fault(MYOS_STATUS_INTERNAL);
+        Backend::ownership_fault(STATUS_INTERNAL);
     }
-    myos::exit();
+    sys::exit();
 }

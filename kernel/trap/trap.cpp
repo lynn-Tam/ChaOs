@@ -33,7 +33,7 @@ static void finish_thread_page_fault(
     mm::Perm access,
     arch::TrapCtx& context,
     sched::Dispatcher& dispatcher) noexcept {
-    myos_status_t status{MYOS_STATUS_PEER_FAULT};
+    status_t status{STATUS_PEER_FAULT};
     switch (kind) {
     case mm::FaultKind::Ready:
     case mm::FaultKind::Materialized:
@@ -48,7 +48,7 @@ static void finish_thread_page_fault(
         return;
     case mm::FaultKind::ResourceExhausted:
     case mm::FaultKind::OutOfMemory: {
-        status = MYOS_STATUS_NO_MEMORY;
+        status = STATUS_NO_MEMORY;
         break;
     }
     default:
@@ -131,7 +131,7 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
                     sched::DispatchReason::Yield);
                 return;
             case syscall::Disposition::Exit:
-                const myos_status_t status = static_cast<myos_status_t>(
+                const status_t status = static_cast<status_t>(
                     context.arg(1));
                 cpu.dispatcher()->request_reschedule(sched::DispatchReason::Exit, status);
                 return;
@@ -172,14 +172,14 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
                 thread != nullptr ? thread->activation() : nullptr;
             frame != nullptr) {
             frame->unwind(
-                context, *cpu.dispatcher(), MYOS_STATUS_PEER_FAULT);
+                context, *cpu.dispatcher(), STATUS_PEER_FAULT);
             return;
         }
         if (thread != nullptr) {
             thread->record_user_fault(event);
             static_cast<void>(thread->exit().claim(
                 Exit::Reason::Fault,
-                MYOS_STATUS_PEER_FAULT,
+                STATUS_PEER_FAULT,
                 0,
                 event.pc(),
                 event.fault_addr()));
@@ -228,7 +228,7 @@ void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
         && (cpu.dispatcher()->current()->stop_requested()
             || thread->cancel_pending())) {
         thread->activation()->unwind(
-            context, *cpu.dispatcher(), MYOS_STATUS_CANCELED);
+            context, *cpu.dispatcher(), STATUS_CANCELED);
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <sys/queue.hpp>
 
-namespace myos::files::fat32 {
+namespace sys::files::fat32 {
 
 inline constexpr size_t SectorSize = 512;
 inline constexpr size_t MaxFiles = 128;
@@ -73,7 +73,7 @@ class Volume final {
 public:
     template<class Reader>
     [[nodiscard]] auto mount(const Geometry& geometry, uint8_t* fat, uint32_t* index,
-        uint8_t* visited, Reader&& read) noexcept -> myos_status_t {
+        uint8_t* visited, Reader&& read) noexcept -> status_t {
         geometry_ = geometry;
         fat_ = fat;
         index_ = index;
@@ -82,11 +82,11 @@ public:
         used_ = 0;
         for (size_t i = 0; i < geometry_.bitmap_bytes(); ++i) visited_[i] = 0;
         auto status = read(geometry_.fat_offset, geometry_.fat_bytes(), fat_);
-        if (status != MYOS_STATUS_OK) return status;
+        if (status != STATUS_OK) return status;
         uint32_t root = geometry_.root;
         // Claim the entire root chain, even the tail after an end marker.
         for (;;) {
-            if (!claim(root)) return MYOS_STATUS_BACKING_FAILED;
+            if (!claim(root)) return STATUS_BACKING_FAILED;
             const uint32_t next = link(root);
             if (end(next)) break;
             root = next;
@@ -98,17 +98,17 @@ public:
             for (size_t offset = 0; offset < geometry_.cluster_bytes && !finished; offset += SectorSize) {
                 uint8_t sector[SectorSize]{};
                 status = read(geometry_.cluster_offset(root) + offset, SectorSize, sector);
-                if (status != MYOS_STATUS_OK) return status;
+                if (status != STATUS_OK) return status;
                 for (size_t position = 0; position < SectorSize; position += 32) {
                     const auto* entry = sector + position;
                     if (entry[0] == 0) { finished = true; break; }
                     if (entry[0] == 0xe5 || entry[11] == 0x0f || (entry[11] & 0x18) != 0) continue;
-                    if (count_ == MaxFiles) return MYOS_STATUS_NO_MEMORY;
+                    if (count_ == MaxFiles) return STATUS_NO_MEMORY;
                     auto& file = files_[count_];
                     file = {};
-                    if (!name(entry, file.name)) return MYOS_STATUS_BACKING_FAILED;
+                    if (!name(entry, file.name)) return STATUS_BACKING_FAILED;
                     for (size_t i = 0; i < count_; ++i)
-                        if (equal(file.name, files_[i].name)) return MYOS_STATUS_BACKING_FAILED;
+                        if (equal(file.name, files_[i].name)) return STATUS_BACKING_FAILED;
                     file.size = u32(entry + 28);
                     starts[count_++] = (uint32_t{u16(entry + 20)} << 16) | u16(entry + 26);
                 }
@@ -123,16 +123,16 @@ public:
             if (cluster == 0 && needed == 0) continue;
             uint32_t length{};
             for (;;) {
-                if (!claim(cluster)) return MYOS_STATUS_BACKING_FAILED;
+                if (!claim(cluster)) return STATUS_BACKING_FAILED;
                 if (length < needed) index_[used_++] = cluster;
                 ++length;
                 const auto next = link(cluster);
                 if (end(next)) break;
                 cluster = next;
             }
-            if (length < needed) return MYOS_STATUS_BACKING_FAILED;
+            if (length < needed) return STATUS_BACKING_FAILED;
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] auto count() const noexcept -> size_t { return count_; }
@@ -222,4 +222,4 @@ private:
     uint32_t used_{};
 };
 
-} // namespace myos::files::fat32
+} // namespace sys::files::fat32

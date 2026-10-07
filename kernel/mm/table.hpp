@@ -7,11 +7,11 @@
 #include <libk/span.hpp>
 #include <mm/pmm.hpp>
 #include <mm/types.hpp>
-#include <mmu/pte.hpp>
+#include <pte.hpp>
 #include <uapi/arch/riscv64/address_space.h>
 
 namespace mm {
-inline constexpr usize UserBegin = MYOS_RISCV64_LOW_GUARD_END;
+inline constexpr usize UserBegin = RISCV64_LOW_GUARD_END;
 inline constexpr usize UserEnd = arch::PtUserEnd;
 inline constexpr usize DirectBegin = arch::PtKernelBegin;
 inline constexpr usize DirectSize = 128ULL * 1024 * 1024 * 1024;

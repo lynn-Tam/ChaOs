@@ -1,6 +1,6 @@
 #include <expected>
 #include <state.hpp>
-#include <arch/interrupt.hpp>
+#include <cpu.hpp>
 #include <cpu/runtime.hpp>
 #include <console.hpp>
 #include <utility>
@@ -49,15 +49,11 @@ KernelState::~KernelState() noexcept {
 }
 
 auto KernelState::initialize_kernel_domain(usize cpu_count) noexcept -> bool {
-    if (kernel_domain_ || cpu_count == 0) {
-        return false;
-    }
-    auto capacity = sched::DomainCapacity::create(pmm(), cpu_count);
-    if (!capacity) {
+    if (kernel_domain_ || cpu_count == 0 || cpu_count > MaxCpus) {
         return false;
     }
     auto pending = pool<sched::Domain>().create(
-        std::move(capacity).value(),
+        cpu_count,
         sched::Domain::share_scale,
         100'000U);
     if (!pending) {

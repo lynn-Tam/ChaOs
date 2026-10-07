@@ -17,7 +17,7 @@
 #include <utility>
 #include <variant>
 #include <servers/deploy/format.h>
-#include <uapi/bootstrap.h>
+#include <uapi/start.h>
 #include <uapi/endpoint.h>
 #include <uapi/thread.h>
 #include <uapi/status.h>
@@ -60,7 +60,7 @@ enum class TaskState : uint8_t {
  * the target is still live (or that no observation has been admitted yet). */
 struct TerminalObservation final {
     uint64_t sequence{};
-    myos_status_t status{};
+    status_t status{};
 
     [[nodiscard]] constexpr auto terminal() const noexcept -> bool {
         return sequence != 0;
@@ -94,8 +94,8 @@ struct SlotProjection final {
     ProjectionKind projection{ProjectionKind::Empty};
     deploy::LocalSlot local{};
     size_t remote_index{};
-    myos_cap_t manager{};
-    myos_object_kind_t kind{MYOS_OBJECT_KIND_INVALID};
+    cap_t manager{};
+    obj_kind_t kind{OBJECT_KIND_INVALID};
     AuthorityId authority{};
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
@@ -105,8 +105,8 @@ struct SlotProjection final {
         return projection == ProjectionKind::Remote
             && remote_index != static_cast<size_t>(-1)
             && manager != 0
-            && kind > MYOS_OBJECT_KIND_INVALID
-            && kind < MYOS_OBJECT_KIND_COUNT && ((MYOS_OBJECT_KINDS >> kind) & 1);
+            && kind > OBJECT_KIND_INVALID
+            && kind < OBJECT_KIND_COUNT && ((OBJECT_KINDS >> kind) & 1);
     }
 };
 
@@ -123,12 +123,12 @@ enum class SourceProjectionKind : uint8_t {
 struct SourceProjection final {
     SourceProjectionKind projection{SourceProjectionKind::Empty};
     LocalSlot local{};
-    myos_object_kind_t kind{MYOS_OBJECT_KIND_INVALID};
+    obj_kind_t kind{OBJECT_KIND_INVALID};
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
         if (projection == SourceProjectionKind::Pool) {
-            return local.pool == 0 && local.kind == MYOS_OBJECT_KIND_INVALID
-                && kind == MYOS_OBJECT_KIND_RESOURCE_POOL;
+            return local.pool == 0 && local.kind == OBJECT_KIND_INVALID
+                && kind == OBJECT_KIND_RESOURCE_POOL;
         }
         return projection == SourceProjectionKind::Local
             && local.valid() && local.kind == kind;
@@ -206,7 +206,7 @@ struct TaskConstructionWorkspace final {
             if (output.authority.valid() || output.task_key
                 || output.remote_index != static_cast<size_t>(-1)
                 || output.manager != 0
-                || output.kind != MYOS_OBJECT_KIND_INVALID) {
+                || output.kind != OBJECT_KIND_INVALID) {
                 return false;
             }
         }
@@ -283,10 +283,10 @@ struct TaskConstructionWorkspace final {
     image_type image{};
     uintptr_t image_entries[DEPLOY_TASK_IMAGE_MAX]{};
     LocalSlot mapping_regions[DEPLOY_TASK_MAPPING_MAX]{};
-    myos_word_t mapping_addresses[DEPLOY_TASK_MAPPING_MAX]{};
-    myos_word_t mapping_sizes[DEPLOY_TASK_MAPPING_MAX]{};
-    myos_word_t mapping_first[DEPLOY_TASK_MAPPING_MAX]{};
-    myos_word_t mapping_access[DEPLOY_TASK_MAPPING_MAX]{};
+    word_t mapping_addresses[DEPLOY_TASK_MAPPING_MAX]{};
+    word_t mapping_sizes[DEPLOY_TASK_MAPPING_MAX]{};
+    word_t mapping_first[DEPLOY_TASK_MAPPING_MAX]{};
+    word_t mapping_access[DEPLOY_TASK_MAPPING_MAX]{};
     bool mapping_done[DEPLOY_TASK_MAPPING_MAX]{};
     ImportProjection imports[kImportBatchMax]{};
     ImportBinding import_bindings[kImportBatchMax]{};
@@ -296,14 +296,14 @@ struct TaskConstructionWorkspace final {
      * projection after this selector is closed. */
     LocalSlot bootstrap_memory{};
     uint8_t import_descriptor_bytes[kImportBatchMax][
-        MYOS_CAP_ATTENUATION_SIZE]{};
+        CAP_ATTENUATION_SIZE]{};
 };
 
 template<typename B, typename Authorities>
 struct TaskConstructionInput final {
     using workspace_type = TaskConstructionWorkspace<Authorities>;
 
-    myos::cap::CapRef parent_pool{};
+    sys::cap::CapRef parent_pool{};
     MappedBundle<B>* bundle{};
     ScratchWindow<B>* scratch{};
     const void* bootstrap{};
@@ -312,40 +312,40 @@ struct TaskConstructionInput final {
     uint32_t runtime_cpu_count{};
     const TaskAuthorityBindings* bindings{};
     ImageSource image_source{};
-    const myos::bootstrap::Arguments* arguments{};
+    const boot::Args* arguments{};
     // Optional observer supplied by a resident supervisor. The accepted
     // selector is moved into TaskSpace; application imports cannot gain rights
     // beyond that selector. The supervisor waits on its own Notification.
-    myos::cap::BasicOwnedCap<B>* terminal_notification{};
+    sys::cap::BasicOwnedCap<B>* terminal_notification{};
     workspace_type& workspace;
 };
 
 template<typename B>
 concept ConstructionBackend = Backend<B>
     && requires(
-        myos::cap::CapRef pool,
-        myos::cap::CapRef vspace,
-        myos::cap::CapRef cspace,
-        myos::cap::CapRef descriptor,
-        myos::cap::CapRef domain,
-        myos::cap::CapRef target,
-        myos::cap::CapRef notification,
-        myos_word_t words) {
+        sys::cap::CapRef pool,
+        sys::cap::CapRef vspace,
+        sys::cap::CapRef cspace,
+        sys::cap::CapRef descriptor,
+        sys::cap::CapRef domain,
+        sys::cap::CapRef target,
+        sys::cap::CapRef notification,
+        word_t words) {
     { B::memory_create_pager(pool, words, words, descriptor) }
-        -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
     { B::sc_create(pool, domain, words, words, words, words) }
-        -> std::same_as<myos::SysResult>;
-    { B::sc_bind(domain, target) } -> std::same_as<myos_status_t>;
+        -> std::same_as<sys::SysResult>;
+    { B::sc_bind(domain, target) } -> std::same_as<status_t>;
     { B::thread_create(pool, vspace, cspace, descriptor, words) }
-        -> std::same_as<myos::SysResult>;
-    { B::notification_create(pool, words) } -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
+    { B::notification_create(pool, words) } -> std::same_as<sys::SysResult>;
     { B::channel_create(pool, words, words, words, words) }
-        -> std::same_as<myos::SysResult>;
-    { B::pager_create(pool) } -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
+    { B::pager_create(pool) } -> std::same_as<sys::SysResult>;
     { B::endpoint_create(pool, vspace, cspace, descriptor, words) }
-        -> std::same_as<myos::SysResult>;
+        -> std::same_as<sys::SysResult>;
     { B::exit_bind(target, notification, words) }
-        -> std::same_as<myos_status_t>;
+        -> std::same_as<status_t>;
 };
 
 struct TaskProjections final {
@@ -392,7 +392,7 @@ struct CompletionId final {
 struct CompletionResult final {
     TaskId task{};
     CloseReason reason{CloseReason::Internal};
-    myos_status_t status{MYOS_STATUS_INTERNAL};
+    status_t status{STATUS_INTERNAL};
 };
 
 template<size_t Capacity = DEPLOY_TASK_MAX,
@@ -841,7 +841,7 @@ public:
         other.readiness_ready_ = false;
         other.accounting_ = ResidentAccounting{};
         other.terminal_sequence_ = 0;
-        other.terminal_status_ = MYOS_STATUS_OK;
+        other.terminal_status_ = STATUS_OK;
     }
 
     auto operator=(TaskRecord&& other) noexcept -> TaskRecord& {
@@ -851,7 +851,7 @@ public:
         if (state_ != TaskState::Reclaimed
             && (space_.phase() != Phase::Closed
                 || registrations_.has_live_registrations())) {
-            backend_type::ownership_fault(MYOS_STATUS_BUSY);
+            backend_type::ownership_fault(STATUS_BUSY);
         }
         id_ = other.id_;
         state_ = other.state_;
@@ -873,7 +873,7 @@ public:
         other.readiness_ready_ = false;
         other.accounting_ = ResidentAccounting{};
         other.terminal_sequence_ = 0;
-        other.terminal_status_ = MYOS_STATUS_OK;
+        other.terminal_status_ = STATUS_OK;
         return *this;
     }
 
@@ -884,11 +884,11 @@ public:
         return state_;
     }
     [[nodiscard]] auto readiness() const noexcept
-        -> myos_deploy_readiness_policy_t {
+        -> deploy_readiness_policy_t {
         const PlanTask* row = plan().row();
         return row == nullptr
             ? DEPLOY_READINESS_EXPLICIT
-            : static_cast<myos_deploy_readiness_policy_t>(row->readiness);
+            : static_cast<deploy_readiness_policy_t>(row->readiness);
     }
     [[nodiscard]] auto ready() const noexcept -> bool {
         if (state_ != TaskState::Running) {
@@ -902,7 +902,7 @@ public:
         return terminal_sequence_;
     }
     [[nodiscard]] constexpr auto terminal_status() const noexcept
-        -> myos_status_t {
+        -> status_t {
         return terminal_status_;
     }
     [[nodiscard]] constexpr auto plan_task_id() const noexcept -> PlanTaskId {
@@ -927,7 +927,7 @@ public:
             || registrations_.has_live_registrations();
     }
 
-    static void ownership_fault(myos_status_t status) noexcept {
+    static void ownership_fault(status_t status) noexcept {
         backend_type::ownership_fault(status);
     }
 
@@ -935,54 +935,54 @@ public:
      * published, already-started targets are external effects and are never
      * rolled back by a later failure. */
     template<typename B = backend_type>
-    requires requires(myos::cap::CapRef target) {
-        { B::execution_start(target) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef target) {
+        { B::execution_start(target) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto start() noexcept -> myos_status_t {
+    [[nodiscard]] auto start() noexcept -> status_t {
         if (state_ != TaskState::Prepared) {
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
         const TaskPlanView task = plan();
         const PlanTask* row = task.row();
         if (row == nullptr || row->executions.count == 0
             || row->executions.count > DEPLOY_TASK_EXECUTION_MAX) {
             if (!transition(TaskState::Failed)) {
-                return MYOS_STATUS_INTERNAL;
+                return STATUS_INTERNAL;
             }
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        myos::cap::CapRef targets[DEPLOY_TASK_EXECUTION_MAX]{};
-        myos_object_kind_t kinds[DEPLOY_TASK_EXECUTION_MAX]{};
+        sys::cap::CapRef targets[DEPLOY_TASK_EXECUTION_MAX]{};
+        obj_kind_t kinds[DEPLOY_TASK_EXECUTION_MAX]{};
         for (uint32_t index = 0; index < row->executions.count; ++index) {
             const PlanExecution* execution = task.execution(index);
             if (execution == nullptr) {
                 static_cast<void>(transition(TaskState::Failed));
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
-            kinds[index] = MYOS_OBJECT_KIND_THREAD;
+            kinds[index] = OBJECT_KIND_THREAD;
             const SlotProjection& projection = projections_.executions[index];
             const auto target = resolve(projection, kinds[index]);
             if (!target) {
                 static_cast<void>(transition(TaskState::Failed));
-                return MYOS_STATUS_INVALID_CAP;
+                return STATUS_INVALID_CAP;
             }
             targets[index] = target.value();
         }
         if (!transition(TaskState::Starting)) {
-            return MYOS_STATUS_INTERNAL;
+            return STATUS_INTERNAL;
         }
         for (uint32_t index = 0; index < row->executions.count; ++index) {
-            const myos::SysResult result = B::execution_start(targets[index]);
-            if (result.status != MYOS_STATUS_OK) {
+            const sys::SysResult result = B::execution_start(targets[index]);
+            if (result.status != STATUS_OK) {
                 static_cast<void>(transition(TaskState::Failed));
                 return result.status;
             }
         }
         if (!transition(TaskState::Running)) {
             static_cast<void>(transition(TaskState::Failed));
-            return MYOS_STATUS_INTERNAL;
+            return STATUS_INTERNAL;
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
 private:
@@ -991,8 +991,8 @@ private:
      * receive immutable projections and accounting snapshots. */
     [[nodiscard]] auto resolve(
         const SlotProjection& projection,
-        myos_object_kind_t expected_kind) const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        obj_kind_t expected_kind) const noexcept
+        -> std::optional<sys::cap::CapRef> {
         /* The readiness relation is a TaskTable-owned operation.  Even if a
          * caller reconstructs the same local slot from a public object view,
          * the generic resolver must not disclose that selector. */
@@ -1016,34 +1016,34 @@ private:
     }
 
     template<typename B = backend_type>
-    requires requires(myos::cap::CapRef notification) {
-        { B::notification_take(notification) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef notification) {
+        { B::notification_take(notification) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto consume_readiness() noexcept -> myos_status_t {
+    [[nodiscard]] auto consume_readiness() noexcept -> status_t {
         if (readiness() != DEPLOY_READINESS_EXPLICIT
             || state_ != TaskState::Running) {
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
         if (readiness_ready_) {
-            return MYOS_STATUS_RETRY;
+            return STATUS_RETRY;
         }
         const auto notification = resolve_readiness();
         if (!notification) {
-            return MYOS_STATUS_INVALID_CAP;
+            return STATUS_INVALID_CAP;
         }
-        const myos::SysResult result = B::notification_take(notification.value());
-        if (result.status != MYOS_STATUS_OK) {
+        const sys::SysResult result = B::notification_take(notification.value());
+        if (result.status != STATUS_OK) {
             return result.status;
         }
         if (result.value == 0) {
-            return MYOS_STATUS_RETRY;
+            return STATUS_RETRY;
         }
         readiness_ready_ = true;
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
     [[nodiscard]] auto terminal_notification() const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        -> std::optional<sys::cap::CapRef> {
         if (state_ != TaskState::Starting && state_ != TaskState::Running
             && state_ != TaskState::Terminating) {
             return std::nullopt;
@@ -1055,21 +1055,21 @@ private:
         }
         const SlotProjection& relation = projections_.relations[0];
         if (!relation.valid()
-            || relation.kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+            || relation.kind != OBJECT_KIND_NOTIFICATION) {
             return std::nullopt;
         }
-        return resolve_internal(relation, MYOS_OBJECT_KIND_NOTIFICATION);
+        return resolve_internal(relation, OBJECT_KIND_NOTIFICATION);
     }
 
 public:
     template<typename B = backend_type>
-    requires requires(myos::cap::CapRef target) {
-        { B::exit_query(target) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef target) {
+        { B::exit_query(target) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto observe_terminal() const noexcept -> myos::SysResult {
+    [[nodiscard]] auto observe_terminal() const noexcept -> sys::SysResult {
         if (state_ != TaskState::Starting && state_ != TaskState::Running
             && state_ != TaskState::Terminating) {
-            return myos::SysResult{.status = MYOS_STATUS_BUSY};
+            return sys::SysResult{.status = STATUS_BUSY};
         }
         const TaskPlanView task = plan();
         const PlanTask* row = task.row();
@@ -1077,17 +1077,17 @@ public:
             /* The current production envelope is single-execution.  A
              * multi-execution aggregation policy needs its own explicit
              * terminal contract and is not guessed here. */
-            return myos::SysResult{.status = MYOS_STATUS_BAD_ARGS};
+            return sys::SysResult{.status = STATUS_BAD_ARGS};
         }
         const PlanExecution* execution = task.execution(0);
         if (execution == nullptr) {
-            return myos::SysResult{.status = MYOS_STATUS_BAD_ARGS};
+            return sys::SysResult{.status = STATUS_BAD_ARGS};
         }
-        const myos_object_kind_t kind =
-            MYOS_OBJECT_KIND_THREAD;
+        const obj_kind_t kind =
+            OBJECT_KIND_THREAD;
         const auto target = resolve(projections_.executions[0], kind);
         if (!target) {
-            return myos::SysResult{.status = MYOS_STATUS_INVALID_CAP};
+            return sys::SysResult{.status = STATUS_INVALID_CAP};
         }
         return B::exit_query(target.value());
     }
@@ -1096,28 +1096,28 @@ public:
      * observations are ignored; only the first accepted sequence chooses the
      * Task result and lifecycle edge. */
     [[nodiscard]] auto consume_terminal(
-        const myos::SysResult& observation) noexcept -> myos_status_t {
-        if (observation.status != MYOS_STATUS_OK) {
+        const sys::SysResult& observation) noexcept -> status_t {
+        if (observation.status != STATUS_OK) {
             return observation.status;
         }
         if (observation.value == 0) {
-            return MYOS_STATUS_RETRY;
+            return STATUS_RETRY;
         }
         if (observation.value <= terminal_sequence_) {
-            return MYOS_STATUS_RETRY;
+            return STATUS_RETRY;
         }
         if (state_ != TaskState::Starting && state_ != TaskState::Running) {
-            return MYOS_STATUS_BUSY;
+            return STATUS_BUSY;
         }
         terminal_sequence_ = observation.value;
-        terminal_status_ = static_cast<myos_status_t>(
+        terminal_status_ = static_cast<status_t>(
             static_cast<int64_t>(observation.value2));
-        if (terminal_status_ == MYOS_STATUS_OK) {
+        if (terminal_status_ == STATUS_OK) {
             return transition(TaskState::Terminating)
-                ? MYOS_STATUS_OK : MYOS_STATUS_INTERNAL;
+                ? STATUS_OK : STATUS_INTERNAL;
         }
         return transition(TaskState::Failed)
-            ? MYOS_STATUS_OK : MYOS_STATUS_INTERNAL;
+            ? STATUS_OK : STATUS_INTERNAL;
     }
 
 private:
@@ -1166,19 +1166,19 @@ private:
     friend class TaskBuilder;
 
     [[nodiscard]] auto resolve_readiness() const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        -> std::optional<sys::cap::CapRef> {
         if (readiness_.projection != ProjectionKind::Local
             || !readiness_.valid()
-            || readiness_.kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+            || readiness_.kind != OBJECT_KIND_NOTIFICATION) {
             return std::nullopt;
         }
-        return space_.lookup(readiness_.local, MYOS_OBJECT_KIND_NOTIFICATION);
+        return space_.lookup(readiness_.local, OBJECT_KIND_NOTIFICATION);
     }
 
     [[nodiscard]] auto resolve_internal(
         const SlotProjection& projection,
-        myos_object_kind_t expected_kind) const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        obj_kind_t expected_kind) const noexcept
+        -> std::optional<sys::cap::CapRef> {
         if (!projection.valid()) {
             return std::nullopt;
         }
@@ -1194,19 +1194,19 @@ private:
 
     [[nodiscard]] auto resolve_source(
         const SourceProjection& projection,
-        myos_object_kind_t expected_kind) const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        obj_kind_t expected_kind) const noexcept
+        -> std::optional<sys::cap::CapRef> {
         if (!projection.valid() || projection.kind != expected_kind) {
             return std::nullopt;
         }
         if (projection.projection == SourceProjectionKind::Pool) {
-            return expected_kind == MYOS_OBJECT_KIND_RESOURCE_POOL
+            return expected_kind == OBJECT_KIND_RESOURCE_POOL
                 ? space_.pool() : std::nullopt;
         }
         return space_.lookup(projection.local, expected_kind);
     }
 
-    [[nodiscard]] auto close_space() noexcept -> myos_status_t {
+    [[nodiscard]] auto close_space() noexcept -> status_t {
         return registrations_.close(space_);
     }
 
@@ -1272,7 +1272,7 @@ private:
     ResidentAccounting accounting_{};
     bool readiness_ready_{};
     uint64_t terminal_sequence_{};
-    myos_status_t terminal_status_{};
+    status_t terminal_status_{};
 };
 
 template<typename Record,
@@ -1309,7 +1309,7 @@ public:
 
         [[nodiscard]] auto begin_close(
             CloseReason reason,
-            myos_status_t status) noexcept -> bool {
+            status_t status) noexcept -> bool {
             /* A normal terminal winner already owns the Terminating edge;
              * preserve that state while entering Closing.  Construction,
              * startup and fatal outcomes are the only paths that first pass
@@ -1334,13 +1334,13 @@ public:
 
         void seal_sender() noexcept { sender_.seal(); }
 
-        [[nodiscard]] auto continue_close() noexcept -> myos_status_t {
-            const myos_status_t status = record_.close_space();
-            if (status != MYOS_STATUS_OK) {
+        [[nodiscard]] auto continue_close() noexcept -> status_t {
+            const status_t status = record_.close_space();
+            if (status != STATUS_OK) {
                 return status;
             }
             return record_.space().phase() == Phase::Closed
-                ? MYOS_STATUS_OK : MYOS_STATUS_BUSY;
+                ? STATUS_OK : STATUS_BUSY;
         }
 
         [[nodiscard]] auto record() noexcept -> Record& { return record_; }
@@ -1464,7 +1464,7 @@ public:
 
         [[nodiscard]] auto fail(
             CloseReason reason,
-            myos_status_t status) noexcept -> bool {
+            status_t status) noexcept -> bool {
             return valid() && table_->move_to_closing(*this, reason, status);
         }
 
@@ -1480,11 +1480,11 @@ public:
                 return;
             }
             if (record().has_resources()) {
-                Record::ownership_fault(MYOS_STATUS_BUSY);
+                Record::ownership_fault(STATUS_BUSY);
                 return;
             }
             if (!table_->cancel_reservation(id_)) {
-                Record::ownership_fault(MYOS_STATUS_BUSY);
+                Record::ownership_fault(STATUS_BUSY);
                 return;
             }
             active_ = false;
@@ -1502,7 +1502,7 @@ public:
     auto operator=(const TaskTable&) -> TaskTable& = delete;
 
     ~TaskTable() noexcept {
-        if (!empty()) Record::ownership_fault(MYOS_STATUS_BUSY);
+        if (!empty()) Record::ownership_fault(STATUS_BUSY);
     }
 
     [[nodiscard]] auto empty() const noexcept -> bool {
@@ -1582,23 +1582,23 @@ public:
     }
 
     template<typename B = typename record_type::backend_type>
-    requires requires(myos::cap::CapRef target) {
-        { B::execution_start(target) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef target) {
+        { B::execution_start(target) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto start(TaskId id) noexcept -> myos_status_t {
+    [[nodiscard]] auto start(TaskId id) noexcept -> status_t {
         Record* const record_ptr = record(id);
         return record_ptr == nullptr
-            ? MYOS_STATUS_INVALID_CAP : record_ptr->template start<B>();
+            ? STATUS_INVALID_CAP : record_ptr->template start<B>();
     }
 
     template<typename B = typename record_type::backend_type>
-    requires requires(myos::cap::CapRef target) {
-        { B::exit_query(target) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef target) {
+        { B::exit_query(target) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto observe_terminal(TaskId id) const noexcept -> myos::SysResult {
+    [[nodiscard]] auto observe_terminal(TaskId id) const noexcept -> sys::SysResult {
         const Record* const record_ptr = record(id);
         return record_ptr == nullptr
-            ? myos::SysResult{.status = MYOS_STATUS_INVALID_CAP}
+            ? sys::SysResult{.status = STATUS_INVALID_CAP}
             : record_ptr->template observe_terminal<B>();
     }
 
@@ -1607,7 +1607,7 @@ public:
      * caller cannot recover readiness or Prepared-export selectors from its
      * immutable projections. */
     [[nodiscard]] auto terminal_notification(TaskId id) const noexcept
-        -> std::optional<myos::cap::CapRef> {
+        -> std::optional<sys::cap::CapRef> {
         const Record* const record_ptr = record(id);
         return record_ptr == nullptr
             ? std::nullopt : record_ptr->terminal_notification();
@@ -1615,21 +1615,21 @@ public:
 
     [[nodiscard]] auto consume_terminal(
         TaskId id,
-        const myos::SysResult& observation) noexcept -> myos_status_t {
+        const sys::SysResult& observation) noexcept -> status_t {
         Record* const record_ptr = record(id);
         return record_ptr == nullptr
-            ? MYOS_STATUS_INVALID_CAP
+            ? STATUS_INVALID_CAP
             : record_ptr->consume_terminal(observation);
     }
 
     template<typename B = typename record_type::backend_type>
-    requires requires(myos::cap::CapRef notification) {
-        { B::notification_take(notification) } -> std::same_as<myos::SysResult>;
+    requires requires(sys::cap::CapRef notification) {
+        { B::notification_take(notification) } -> std::same_as<sys::SysResult>;
     }
-    [[nodiscard]] auto consume_readiness(TaskId id) noexcept -> myos_status_t {
+    [[nodiscard]] auto consume_readiness(TaskId id) noexcept -> status_t {
         Record* const record_ptr = record(id);
         return record_ptr == nullptr
-            ? MYOS_STATUS_INVALID_CAP
+            ? STATUS_INVALID_CAP
             : record_ptr->template consume_readiness<B>();
     }
 
@@ -1666,7 +1666,7 @@ public:
     [[nodiscard]] auto terminate(
         TaskId id,
         CloseReason reason,
-        myos_status_t status) noexcept -> bool {
+        status_t status) noexcept -> bool {
         Slot* const slot = checked_slot(id);
         Record* const record_ptr = record(id);
         if (slot == nullptr || record_ptr == nullptr
@@ -1683,7 +1683,7 @@ public:
     [[nodiscard]] auto begin_close(
         TaskId id,
         CloseReason reason,
-        myos_status_t status) noexcept -> bool {
+        status_t status) noexcept -> bool {
         Slot* slot = checked_slot(id);
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Record) {
             return false;
@@ -1696,21 +1696,21 @@ public:
         return true;
     }
 
-    [[nodiscard]] auto continue_close(TaskId id) noexcept -> myos_status_t {
+    [[nodiscard]] auto continue_close(TaskId id) noexcept -> status_t {
         Slot* slot = checked_slot(id);
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Closing) {
-            return MYOS_STATUS_INVALID_CAP;
+            return STATUS_INVALID_CAP;
         }
         auto* payload = std::get_if<ActiveSlot>(&slot->payload);
         if (payload == nullptr) {
-            return MYOS_STATUS_INVALID_CAP;
+            return STATUS_INVALID_CAP;
         }
-        const myos_status_t status = payload->closing.continue_close();
-        if (status != MYOS_STATUS_OK) {
+        const status_t status = payload->closing.continue_close();
+        if (status != STATUS_OK) {
             return status;
         }
         if (!payload->closing.record().transition(TaskState::Reclaimed)) {
-            return MYOS_STATUS_INTERNAL;
+            return STATUS_INTERNAL;
         }
         const CompletionResult result = payload->closing.result();
         publication_type publication{
@@ -1723,15 +1723,15 @@ public:
             ++slot->generation;
         }
         publication.publish();
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
 
-    void close_events(TaskId id, myos::cap::CapRef events, myos_word_t badge) noexcept {
+    void close_events(TaskId id, sys::cap::CapRef events, word_t badge) noexcept {
         auto* target = record(id);
-        if (target == nullptr) Record::ownership_fault(MYOS_STATUS_INVALID_CAP);
+        if (target == nullptr) Record::ownership_fault(STATUS_INVALID_CAP);
         target->space().close_events(events, badge);
     }
-    void observe_close(TaskId id, myos_word_t badges) noexcept {
+    void observe_close(TaskId id, word_t badges) noexcept {
         if (auto* target = closing(id)) target->record().space().observe_close(badges);
     }
     [[nodiscard]] auto close_waiting(TaskId id) noexcept -> bool {
@@ -1866,7 +1866,7 @@ private:
     [[nodiscard]] auto move_to_closing(
         Reservation& reservation,
         CloseReason reason,
-        myos_status_t status) noexcept -> bool {
+        status_t status) noexcept -> bool {
         Slot* slot = checked_slot(reservation.id_);
         if (slot == nullptr || slot_tag(*slot) != TaskSlotTag::Reserved) {
             return false;
@@ -1965,11 +1965,11 @@ public:
     requires ConstructionBackend<backend_type>
     [[nodiscard]] auto construct(
         const TaskConstructionInput<backend_type, Authorities>& input,
-        Authorities& authorities) noexcept -> myos_status_t {
+        Authorities& authorities) noexcept -> status_t {
         if (!valid() || input.bindings == nullptr || input.runtime_cpu_count == 0
             || input.scratch == nullptr || !input.parent_pool
             || !input.workspace.empty()) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
         using Workspace = TaskConstructionWorkspace<Authorities>;
         Workspace& workspace = input.workspace;
@@ -1982,13 +1982,13 @@ public:
         const TaskPlanView task = record.plan();
         const PlanTask* const row = task.row();
         if (row == nullptr) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
         /* Bootstrap rows own the envelope contents.  A caller-provided byte
-         * snapshot is the legacy path and cannot coexist with that policy. */
+         * snapshot is opaque and cannot coexist with that policy. */
         if (row->bootstraps.count != 0
             && (input.bootstrap != nullptr || input.bootstrap_size != 0)) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
 
         /* Capacity is checked from the same cumulative terms that bound the
@@ -2004,7 +2004,7 @@ public:
             || local_demand > space_type::local_capacity()
             || remote_demand > space_type::remote_capacity()
             || lease_demand > Authorities::lease_capacity()) {
-            return MYOS_STATUS_NO_MEMORY;
+            return STATUS_NO_MEMORY;
         }
 
         /* Plan references are global decoded-table indices while the typed
@@ -2028,48 +2028,48 @@ public:
         for (uint32_t index = 0; index < row->executions.count; ++index) {
             const AuthorityId id = input.bindings->domains[index];
             if (!id.valid()) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
             auto lease = authorities.lease(id);
             if (!lease || !lease->valid()
                 || lease->source().cspace != 0
-                || lease->ceiling().kind != MYOS_OBJECT_KIND_SCHED_DOMAIN) {
-                return MYOS_STATUS_DENIED;
+                || lease->ceiling().kind != OBJECT_KIND_SCHED_DOMAIN) {
+                return STATUS_DENIED;
             }
             workspace.domain_leases[index] = std::move(*lease);
         }
         for (uint32_t index = 0; index < row->mappings.count; ++index) {
             const PlanMapping* const mapping = task.mapping(index);
             if (mapping == nullptr) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
             if (mapping->source != DEPLOY_MAPPING_SOURCE_PAGER) {
                 continue;
             }
             const AuthorityId id = input.bindings->pagers[index];
             if (!id.valid()) {
-                return MYOS_STATUS_BAD_ARGS;
+                return STATUS_BAD_ARGS;
             }
             auto lease = authorities.lease(id);
             if (!lease || !lease->valid()
                 || lease->source().cspace != 0
-                || lease->ceiling().kind != MYOS_OBJECT_KIND_PAGER) {
-                return MYOS_STATUS_DENIED;
+                || lease->ceiling().kind != OBJECT_KIND_PAGER) {
+                return STATUS_DENIED;
             }
             workspace.pager_leases[index] = std::move(*lease);
         }
 
         if (!input.bundle || input.bundle->phase() != LeasePhase::Mapped) {
-            return MYOS_STATUS_BAD_ARGS;
+            return STATUS_BAD_ARGS;
         }
-        const myos_status_t opened_status = record.space().open(
+        const status_t opened_status = record.space().open(
                 input.parent_pool,
-                static_cast<myos_word_t>(row->pool_memory),
-                static_cast<myos_word_t>(row->pool_caps),
-                static_cast<myos_word_t>(row->kind_mask),
-                static_cast<myos_word_t>(row->cspace_slots),
-                static_cast<myos_word_t>(row->cspace_pages));
-        if (opened_status != MYOS_STATUS_OK) {
+                static_cast<word_t>(row->pool_memory),
+                static_cast<word_t>(row->pool_caps),
+                static_cast<word_t>(row->kind_mask),
+                static_cast<word_t>(row->cspace_slots),
+                static_cast<word_t>(row->cspace_pages));
+        if (opened_status != STATUS_OK) {
             /* TaskSpace::open may retain a strong-closeable partial
              * aggregate when a later child operation fails.  Transfer that
              * exact owner through the same table ClosingRecord path used by
@@ -2082,8 +2082,8 @@ public:
             return opened_status;
         }
         bool opened = true;
-        const auto failure = [&](myos_status_t status) noexcept
-            -> myos_status_t {
+        const auto failure = [&](status_t status) noexcept
+            -> status_t {
             /* construction diagnostics are intentionally fail-stop-only in
              * production; host callers observe the returned status. */
             if (!opened) {
@@ -2100,19 +2100,19 @@ public:
         projections.vspace = SlotProjection{
             .projection = ProjectionKind::Local,
             .local = record.space().vspace_slot(),
-            .kind = MYOS_OBJECT_KIND_VSPACE};
+            .kind = OBJECT_KIND_VSPACE};
         projections.cspace = SlotProjection{
             .projection = ProjectionKind::Local,
             .local = record.space().manager_slot(),
-            .kind = MYOS_OBJECT_KIND_CSPACE};
+            .kind = OBJECT_KIND_CSPACE};
 
         const auto pool = record.space().pool();
         const auto vspace = record.resolve_internal(
-            projections.vspace, MYOS_OBJECT_KIND_VSPACE);
+            projections.vspace, OBJECT_KIND_VSPACE);
         const auto cspace = record.resolve_internal(
-            projections.cspace, MYOS_OBJECT_KIND_CSPACE);
+            projections.cspace, OBJECT_KIND_CSPACE);
         if (!pool || !vspace || !cspace) {
-            return failure(MYOS_STATUS_INVALID_CAP);
+            return failure(STATUS_INVALID_CAP);
         }
 
         using Materializer = ImageMaterializer<
@@ -2129,22 +2129,22 @@ public:
             workspace.image_entries;
         LocalSlot (&mapping_regions)[DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_regions;
-        myos_word_t (&mapping_addresses)[DEPLOY_TASK_MAPPING_MAX] =
+        word_t (&mapping_addresses)[DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_addresses;
-        myos_word_t (&mapping_sizes)[DEPLOY_TASK_MAPPING_MAX] =
+        word_t (&mapping_sizes)[DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_sizes;
         auto& mapping_first = workspace.mapping_first;
-        myos_word_t (&mapping_access)[DEPLOY_TASK_MAPPING_MAX] =
+        word_t (&mapping_access)[DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_access;
         bool (&mapping_done)[DEPLOY_TASK_MAPPING_MAX] =
             workspace.mapping_done;
 
         if (typed_imports) {
-            const myos_status_t status = materializer.materialize_descriptor(
+            const status_t status = materializer.materialize_descriptor(
                 &workspace.import_descriptor_bytes[0][0],
                 sizeof(workspace.import_descriptor_bytes),
                 workspace.import_descriptor);
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
         }
@@ -2157,27 +2157,27 @@ public:
                 .kind = slot.kind};
         };
         const auto close_owner = [&](owner_type& owner) noexcept
-            -> myos_status_t {
+            -> status_t {
             if (!owner) {
-                return MYOS_STATUS_OK;
+                return STATUS_OK;
             }
-            const myos_status_t status = owner.close();
-            if (status != MYOS_STATUS_OK) {
+            const status_t status = owner.close();
+            if (status != STATUS_OK) {
                 backend_type::ownership_fault(status);
             }
             return status;
         };
-        const auto adopt_result = [&](myos::SysResult result,
-                                      myos_object_kind_t kind,
+        const auto adopt_result = [&](sys::SysResult result,
+                                      obj_kind_t kind,
                                       LocalSlot& output) noexcept
-            -> myos_status_t {
+            -> status_t {
             output = {};
             if (result.value == 0) {
-                return result.status == MYOS_STATUS_OK
-                    ? MYOS_STATUS_INVALID_CAP : result.status;
+                return result.status == STATUS_OK
+                    ? STATUS_INVALID_CAP : result.status;
             }
-            owner_type owner{myos::cap::CapRef{result.value, 0}};
-            if (result.status != MYOS_STATUS_OK) {
+            owner_type owner{sys::cap::CapRef{result.value, 0}};
+            if (result.status != STATUS_OK) {
                 static_cast<void>(close_owner(owner));
                 return result.status;
             }
@@ -2185,15 +2185,15 @@ public:
                 std::move(owner), kind);
             if (!slot) {
                 static_cast<void>(close_owner(owner));
-                return MYOS_STATUS_NO_MEMORY;
+                return STATUS_NO_MEMORY;
             }
             output = *slot;
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         };
 
         /* Pre-mapping local objects have no references to mappings. */
         LocalSlot relation_notification{};
-        myos_word_t relation_badge{};
+        word_t relation_badge{};
         const auto role_source = [&](uint32_t role,
                                      ByteView& source) noexcept -> bool {
             source = {};
@@ -2227,34 +2227,34 @@ public:
         };
         ByteView service_key{};
         ByteView readiness_key{};
-        if (!role_source(MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION,
+        if (!role_source(BOOT_EVENTS,
                          service_key)
-            || !role_source(MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION,
+            || !role_source(BOOT_READY,
                             readiness_key)) {
-            return failure(MYOS_STATUS_BAD_ARGS);
+            return failure(STATUS_BAD_ARGS);
         }
         for (uint32_t index = 0; index < row->objects.count; ++index) {
             const PlanObject* const object = task.object(index);
             if (object == nullptr) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
-            if (object->kind == MYOS_OBJECT_KIND_ENDPOINT
+            if (object->kind == OBJECT_KIND_ENDPOINT
                 || (object->flags & DEPLOY_OBJECT_POST_MAPPING) != 0) {
                 continue;
             }
             LocalSlot slot{};
-            myos_status_t status = MYOS_STATUS_BAD_ARGS;
+            status_t status = STATUS_BAD_ARGS;
             switch (object->kind) {
-            case MYOS_OBJECT_KIND_NOTIFICATION: {
+            case OBJECT_KIND_NOTIFICATION: {
                 const auto key = task.symbol(object->output);
                 if (input.terminal_notification != nullptr && !key.equals(service_key)
                     && !key.equals(readiness_key)) {
-                    if (!*input.terminal_notification) return failure(MYOS_STATUS_BAD_ARGS);
+                    if (!*input.terminal_notification) return failure(STATUS_BAD_ARGS);
                     const auto adopted = record.space().adopt_local(
-                        std::move(*input.terminal_notification), MYOS_OBJECT_KIND_NOTIFICATION);
-                    if (!adopted) return failure(MYOS_STATUS_NO_MEMORY);
+                        std::move(*input.terminal_notification), OBJECT_KIND_NOTIFICATION);
+                    if (!adopted) return failure(STATUS_NO_MEMORY);
                     slot = *adopted;
-                    status = MYOS_STATUS_OK;
+                    status = STATUS_OK;
                     break;
                 }
                 status = adopt_result(
@@ -2263,24 +2263,24 @@ public:
                     object->kind, slot);
                 break;
             }
-            case MYOS_OBJECT_KIND_CHANNEL: {
-                const myos::SysResult created = backend_type::channel_create(
+            case OBJECT_KIND_CHANNEL: {
+                const sys::SysResult created = backend_type::channel_create(
                     pool.value(), object->args[0], object->args[1],
                     object->args[2], object->args[3]);
                 owner_type first{};
                 owner_type second{};
                 if (created.value != 0) {
-                    first = owner_type{myos::cap::CapRef{created.value, 0}};
+                    first = owner_type{sys::cap::CapRef{created.value, 0}};
                 }
                 if (created.value2 != 0) {
-                    second = owner_type{myos::cap::CapRef{created.value2, 0}};
+                    second = owner_type{sys::cap::CapRef{created.value2, 0}};
                 }
-                if (created.status != MYOS_STATUS_OK
+                if (created.status != STATUS_OK
                     || !first || !second) {
                     static_cast<void>(close_owner(first));
                     static_cast<void>(close_owner(second));
-                    status = created.status == MYOS_STATUS_OK
-                        ? MYOS_STATUS_INVALID_CAP : created.status;
+                    status = created.status == STATUS_OK
+                        ? STATUS_INVALID_CAP : created.status;
                     break;
                 }
                 const auto first_slot = record.space().adopt_local(
@@ -2288,35 +2288,35 @@ public:
                 if (!first_slot) {
                     static_cast<void>(close_owner(first));
                     static_cast<void>(close_owner(second));
-                    status = MYOS_STATUS_NO_MEMORY;
+                    status = STATUS_NO_MEMORY;
                     break;
                 }
                 const auto second_slot = record.space().adopt_local(
                     std::move(second), object->kind);
                 if (!second_slot) {
                     static_cast<void>(close_owner(second));
-                    status = MYOS_STATUS_NO_MEMORY;
+                    status = STATUS_NO_MEMORY;
                     break;
                 }
                 projections.objects[index] = local_projection(*first_slot);
                 projections.object_b[index] = local_projection(*second_slot);
-                status = MYOS_STATUS_OK;
+                status = STATUS_OK;
                 break;
             }
-            case MYOS_OBJECT_KIND_PAGER:
+            case OBJECT_KIND_PAGER:
                 status = adopt_result(
                     backend_type::pager_create(
                         pool.value()),
                     object->kind, slot);
                 break;
             default:
-                status = MYOS_STATUS_BAD_ARGS;
+                status = STATUS_BAD_ARGS;
                 break;
             }
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
-            if (object->kind != MYOS_OBJECT_KIND_CHANNEL) {
+            if (object->kind != OBJECT_KIND_CHANNEL) {
                 projections.objects[index] = local_projection(slot);
             }
         }
@@ -2326,7 +2326,7 @@ public:
          * from the manifest graph rather than from object-row order. */
         for (uint32_t index = 0; index < row->objects.count; ++index) {
             const PlanObject* object = task.object(index);
-            if (object == nullptr || object->kind != MYOS_OBJECT_KIND_NOTIFICATION
+            if (object == nullptr || object->kind != OBJECT_KIND_NOTIFICATION
                 || !projections.objects[index].valid()) {
                 continue;
             }
@@ -2336,13 +2336,13 @@ public:
                 continue;
             }
             if (relation_notification.valid()) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             relation_notification = projections.objects[index].local;
             relation_badge = object->args[0];
         }
         if (row->executions.count != 0 && !relation_notification.valid()) {
-            return failure(MYOS_STATUS_BAD_ARGS);
+            return failure(STATUS_BAD_ARGS);
         }
 
         /* Resolve and install every mapping exactly once. */
@@ -2350,12 +2350,12 @@ public:
              ++image_index) {
             const PlanImage* const image_row = task.image(image_index);
             if (image_row == nullptr) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const ByteView name = task.symbol(image_row->source);
-            const myos_status_t materialized_status =
+            const status_t materialized_status =
                 materializer.materialize(name, image);
-            if (materialized_status != MYOS_STATUS_OK) {
+            if (materialized_status != STATUS_OK) {
                 return failure(materialized_status);
             }
             image_entries[image_index] = image.entry;
@@ -2376,14 +2376,14 @@ public:
                     }
                     ++matches;
                     if (matches != 1 || mapping_done[mapping_index]) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     projections.mappings[mapping_index] = local_projection(
                         image.segments[segment].memory);
                     mapping_regions[mapping_index] =
                         image.segments[segment].region;
                     mapping_addresses[mapping_index] =
-                        static_cast<myos_word_t>(
+                        static_cast<word_t>(
                             image.segments[segment].address);
                     mapping_sizes[mapping_index] = image.segments[segment].size;
                     mapping_first[mapping_index] = image.segments[segment].first;
@@ -2392,7 +2392,7 @@ public:
                     mapping_done[mapping_index] = true;
                 }
                 if (matches != 1) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
             }
             image.clear();
@@ -2405,59 +2405,59 @@ public:
             }
             const PlanMapping* const mapping = task.mapping(mapping_index);
             if (mapping == nullptr) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             typename Image::Mapping materialized{};
-            myos_status_t status = MYOS_STATUS_BAD_ARGS;
+            status_t status = STATUS_BAD_ARGS;
             if (mapping_index == bootstrap_mapping) {
                 if ((input.bootstrap == nullptr && input.bootstrap_size != 0)
                     || input.bootstrap_size > mapping->size) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
                 status = materializer.materialize_zero(
-                    static_cast<myos_word_t>(mapping->address),
-                    static_cast<myos_word_t>(mapping->size),
-                    MYOS_VM_READ,
+                    static_cast<word_t>(mapping->address),
+                    static_cast<word_t>(mapping->size),
+                    VM_READ,
                     materialized);
-                if (status == MYOS_STATUS_OK && input.bootstrap != nullptr
+                if (status == STATUS_OK && input.bootstrap != nullptr
                     && input.bootstrap_size != 0) {
                     status = materializer.write(
                         materialized.memory,
-                        static_cast<myos_word_t>(mapping->size),
+                        static_cast<word_t>(mapping->size),
                         0,
                         input.bootstrap,
                         input.bootstrap_size);
                 }
                 /* A generated production envelope is populated after Imports,
                  * so retain this writable MemoryObject until that point.  A
-                 * caller-supplied legacy snapshot remains closed here. */
-                if (status == MYOS_STATUS_OK && row->bootstraps.count == 0) {
+                 * caller-supplied opaque record remains closed here. */
+                if (status == STATUS_OK && row->bootstraps.count == 0) {
                     status = record.space().close_slot(materialized.memory);
                     materialized.memory = {};
-                } else if (status == MYOS_STATUS_OK) {
+                } else if (status == STATUS_OK) {
                     workspace.bootstrap_memory = materialized.memory;
                 }
             } else if (mapping->source == DEPLOY_MAPPING_SOURCE_ZERO) {
                 status = materializer.materialize_zero(
-                    static_cast<myos_word_t>(mapping->address),
-                    static_cast<myos_word_t>(mapping->size),
-                    static_cast<myos_word_t>(mapping->access),
+                    static_cast<word_t>(mapping->address),
+                    static_cast<word_t>(mapping->size),
+                    static_cast<word_t>(mapping->access),
                     materialized);
             } else if (mapping->source == DEPLOY_MAPPING_SOURCE_PAGER) {
                 if (!workspace.pager_leases[mapping_index]
                     || !workspace.pager_leases[mapping_index]->valid()) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
                 status = materializer.materialize_paged(
                     workspace.pager_leases[mapping_index]->source(),
-                    static_cast<myos_word_t>(mapping->address),
-                    static_cast<myos_word_t>(mapping->size),
-                    static_cast<myos_word_t>(mapping->access),
+                    static_cast<word_t>(mapping->address),
+                    static_cast<word_t>(mapping->size),
+                    static_cast<word_t>(mapping->access),
                     materialized);
             }
-            if (status != MYOS_STATUS_OK || !materialized.region.valid()) {
-                return failure(status == MYOS_STATUS_OK
-                    ? MYOS_STATUS_INVALID_CAP : status);
+            if (status != STATUS_OK || !materialized.region.valid()) {
+                return failure(status == STATUS_OK
+                    ? STATUS_INVALID_CAP : status);
             }
             projections.mappings[mapping_index] = materialized.memory.valid()
                 ? local_projection(materialized.memory)
@@ -2475,7 +2475,7 @@ public:
         for (uint32_t mapping_index = 0;
              mapping_index < row->mappings.count; ++mapping_index) {
             if (!mapping_done[mapping_index]) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
         }
 
@@ -2485,7 +2485,7 @@ public:
             const PlanMapping* const mapping = task.mapping(mapping_index);
             if (mapping == nullptr || mapping->critical
                     > DEPLOY_CRITICAL_IPC_HEADER) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             if (mapping->critical == DEPLOY_CRITICAL_NONE) {
                 continue;
@@ -2497,28 +2497,28 @@ public:
                 accounting.by_class[mapping->critical],
                 static_cast<uint64_t>(mapping_sizes[mapping_index]));
             if (!total || !class_total) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             accounting.total_bytes = *total;
             accounting.by_class[mapping->critical] = *class_total;
             const SlotProjection& projection =
                 projections.mappings[mapping_index];
             if (projection.projection == ProjectionKind::Local
-                && projection.local.kind == MYOS_OBJECT_KIND_MEMORY) {
+                && projection.local.kind == OBJECT_KIND_MEMORY) {
                 for (uint32_t prior = 0; prior < mapping_index; ++prior) {
                     const SlotProjection& previous =
                         projections.mappings[prior];
                     if (previous.projection == ProjectionKind::Local
-                        && previous.local.kind == MYOS_OBJECT_KIND_MEMORY
+                        && previous.local.kind == OBJECT_KIND_MEMORY
                         && previous.local.pool == projection.local.pool
                         && previous.local.index == projection.local.index) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                 }
             }
         }
         if (accounting.total_bytes > row->critical_bytes) {
-            return failure(MYOS_STATUS_NO_MEMORY);
+            return failure(STATUS_NO_MEMORY);
         }
         record.mutable_accounting() = accounting;
 
@@ -2527,32 +2527,32 @@ public:
         for (uint32_t object_index = 0; object_index < row->objects.count;
              ++object_index) {
             const PlanObject* const object = task.object(object_index);
-            if (object == nullptr || object->kind != MYOS_OBJECT_KIND_ENDPOINT) {
+            if (object == nullptr || object->kind != OBJECT_KIND_ENDPOINT) {
                 continue;
             }
             const uint32_t descriptor_mapping = mapping_local(object->refs[0]);
             if (descriptor_mapping == DEPLOY_NO_INDEX) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const PlanMapping* const descriptor_row =
                 task.mapping(descriptor_mapping);
             const auto descriptor_memory = record.resolve_internal(
                 projections.mappings[descriptor_mapping],
-                MYOS_OBJECT_KIND_MEMORY);
+                OBJECT_KIND_MEMORY);
             if (descriptor_row == nullptr || !descriptor_memory
                 || object->args[0] > descriptor_row->size
-                || sizeof(myos_endpoint_desc)
+                || sizeof(EpDesc)
                     > descriptor_row->size - object->args[0]
                 || row->executions.count != 1) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const PlanExecution* const execution = task.execution(0);
             if (execution == nullptr) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             if (execution->image < row->images.first
                 || execution->image >= row->images.first + row->images.count) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const size_t execution_image_index =
                 execution->image - row->images.first;
@@ -2568,7 +2568,7 @@ public:
                         && candidate->source
                             == DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
                         && candidate->image == execution->image
-                        && (mapping_access[index] & MYOS_VM_EXECUTE) != 0
+                        && (mapping_access[index] & VM_EXECUTE) != 0
                         && execution_entry >= mapping_addresses[index]
                         && execution_entry - mapping_addresses[index]
                             < mapping_sizes[index]) {
@@ -2580,26 +2580,26 @@ public:
             const uint32_t stack_mapping_index =
                 mapping_local(execution->stack);
             if (stack_mapping_index == DEPLOY_NO_INDEX) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const auto stack_ref = record.resolve_internal(
                 projections.mappings[stack_mapping_index],
-                MYOS_OBJECT_KIND_MEMORY);
+                OBJECT_KIND_MEMORY);
             if (code_mapping == DEPLOY_NO_INDEX || !stack_ref) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
             const auto code_ref = record.resolve_internal(
                 projections.mappings[code_mapping],
-                MYOS_OBJECT_KIND_MEMORY);
+                OBJECT_KIND_MEMORY);
             const PlanMapping* const stack_row =
                 task.mapping(stack_mapping_index);
             if (!code_ref || stack_row == nullptr
                 || mapping_sizes[code_mapping] == 0) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
-            myos_endpoint_desc descriptor{};
-            descriptor.version = MYOS_ENDPOINT_VERSION;
-            descriptor.flags = MYOS_ENDPOINT_FLAGS_NONE;
+            EpDesc descriptor{};
+            descriptor.version = ENDPOINT_VERSION;
+            descriptor.flags = ENDPOINT_FLAGS_NONE;
             descriptor.entry = execution_entry;
             descriptor.code_memory = code_ref->selector;
             descriptor.code_page = mapping_first[code_mapping];
@@ -2621,15 +2621,15 @@ public:
                 const uint32_t ipc_mapping_index =
                     mapping_local(execution->ipc);
                 if (ipc_mapping_index == DEPLOY_NO_INDEX) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
                 const PlanMapping* const ipc_row =
                     task.mapping(ipc_mapping_index);
                 const auto ipc_ref = record.resolve_internal(
                     projections.mappings[ipc_mapping_index],
-                    MYOS_OBJECT_KIND_MEMORY);
+                    OBJECT_KIND_MEMORY);
                 if (ipc_row == nullptr || !ipc_ref) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
                 descriptor.ipc.memory = ipc_ref->selector;
                 descriptor.ipc.page = mapping_first[ipc_mapping_index];
@@ -2638,13 +2638,13 @@ public:
                     / DEPLOY_PAGE_SIZE;
                 descriptor.ipc_stride = mapping_sizes[ipc_mapping_index];
             }
-            myos_status_t status = materializer.write(
+            status_t status = materializer.write(
                 projections.mappings[descriptor_mapping].local,
-                static_cast<myos_word_t>(descriptor_row->size),
-                static_cast<myos_word_t>(object->args[0]),
+                static_cast<word_t>(descriptor_row->size),
+                static_cast<word_t>(object->args[0]),
                 &descriptor,
                 sizeof(descriptor));
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
             LocalSlot endpoint{};
@@ -2652,10 +2652,10 @@ public:
                 backend_type::endpoint_create(
                     pool.value(), vspace.value(), cspace.value(),
                     descriptor_memory.value(),
-                    static_cast<myos_word_t>(object->args[0])),
-                MYOS_OBJECT_KIND_ENDPOINT,
+                    static_cast<word_t>(object->args[0])),
+                OBJECT_KIND_ENDPOINT,
                 endpoint);
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
             projections.objects[object_index] = local_projection(endpoint);
@@ -2667,7 +2667,7 @@ public:
          * TaskSpace-owned carrier at its batch-local offset.  The phase is
          * declared here but invoked after every constructible TaskKey source
          * (including executions and scheduling contexts) exists. */
-        const auto import_sources = [&]() noexcept -> myos_status_t {
+        const auto import_sources = [&]() noexcept -> status_t {
             uint32_t imported = 0;
             while (imported < row->imports.count) {
             const uint32_t count = row->imports.count - imported
@@ -2685,16 +2685,16 @@ public:
                 for (uint32_t index = 0; index < count; ++index) {
                     const PlanImport* const import = task.import(imported + index);
                     if (import == nullptr) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
-                    myos::cap::encode(
+                    sys::cap::encode(
                         import->attenuation,
                         workspace.import_descriptor_bytes[index]);
                     ImportBinding& binding = workspace.import_bindings[index];
                     binding.authority = input.bindings->imports[imported + index];
                     if (import->source_class == DEPLOY_IMPORT_SOURCE_TASK_KEY) {
                         const ByteView source_key = task.symbol(import->source);
-                        std::optional<myos::cap::CapRef> source{};
+                        std::optional<sys::cap::CapRef> source{};
                         const auto matches = [source_key](ByteView candidate)
                             noexcept -> bool {
                             return source_key.size() != 0
@@ -2706,7 +2706,7 @@ public:
                         const auto consider = [&source, &record, matches](
                             ByteView key,
                             const SlotProjection& projection,
-                            myos_object_kind_t kind) noexcept {
+                            obj_kind_t kind) noexcept {
                             if (source.has_value() || !matches(key)
                                 || projection.kind != kind) {
                                 return;
@@ -2715,28 +2715,28 @@ public:
                         };
                         consider(task.symbol(row->vspace_key),
                                  projections.vspace,
-                                 MYOS_OBJECT_KIND_VSPACE);
+                                 OBJECT_KIND_VSPACE);
                         consider(task.symbol(row->cspace_key),
                                  projections.cspace,
-                                 MYOS_OBJECT_KIND_CSPACE);
+                                 OBJECT_KIND_CSPACE);
                         for (uint32_t mapping = 0;
                              mapping < row->mappings.count && !source; ++mapping) {
                             const PlanMapping* mapping_row = task.mapping(mapping);
                             if (mapping_row == nullptr) {
-                                return failure(MYOS_STATUS_BAD_ARGS);
+                                return failure(STATUS_BAD_ARGS);
                             }
                             consider(task.symbol(mapping_row->produced),
                                      projections.mappings[mapping],
-                                     MYOS_OBJECT_KIND_MEMORY);
+                                     OBJECT_KIND_MEMORY);
                             consider(task.symbol(mapping_row->region),
                                      local_projection(mapping_regions[mapping]),
-                                     MYOS_OBJECT_KIND_VSPACE);
+                                     OBJECT_KIND_VSPACE);
                         }
                         for (uint32_t object = 0;
                              object < row->objects.count && !source; ++object) {
                             const PlanObject* object_row = task.object(object);
                             if (object_row == nullptr) {
-                                return failure(MYOS_STATUS_BAD_ARGS);
+                                return failure(STATUS_BAD_ARGS);
                             }
                             consider(task.symbol(object_row->output),
                                      projections.objects[object],
@@ -2751,63 +2751,63 @@ public:
                             const PlanExecution* execution_row =
                                 task.execution(execution);
                             if (execution_row == nullptr) {
-                                return failure(MYOS_STATUS_BAD_ARGS);
+                                return failure(STATUS_BAD_ARGS);
                             }
                             consider(task.symbol(execution_row->key),
                                      projections.executions[execution],
-                                     MYOS_OBJECT_KIND_THREAD);
+                                     OBJECT_KIND_THREAD);
                             consider(task.symbol(execution_row->sc),
                                      projections.scheduling_contexts[execution],
-                                     MYOS_OBJECT_KIND_SCHED_CONTEXT);
+                                     OBJECT_KIND_SCHED_CONTEXT);
                         }
                         if (!source || source->cspace != 0) {
-                            return failure(MYOS_STATUS_BAD_ARGS);
+                            return failure(STATUS_BAD_ARGS);
                         }
                         binding.source = source.value();
                     }
                     if (import->mode == DEPLOY_IMPORT_TYPED_DELEGATE) {
                         binding.descriptor = workspace.import_descriptor;
                         binding.descriptor_offset =
-                            index * MYOS_CAP_ATTENUATION_SIZE;
+                            index * CAP_ATTENUATION_SIZE;
                     }
                 }
                 if (typed_imports) {
-                    const myos_status_t written = materializer.write(
+                    const status_t written = materializer.write(
                         workspace.import_descriptor,
                         DEPLOY_PAGE_SIZE,
                         0,
                         &workspace.import_descriptor_bytes[0][0],
                         sizeof(workspace.import_descriptor_bytes));
-                    if (written != MYOS_STATUS_OK) {
+                    if (written != STATUS_OK) {
                         return failure(written);
                     }
                 }
-                const myos_status_t status = ImportTransaction<
+                const status_t status = ImportTransaction<
                     space_type, Authorities, kImportBatchMax>::run(
                     record.space(), task, imported, count,
                         workspace.import_bindings, authorities, outputs);
-                if (status != MYOS_STATUS_OK) {
+                if (status != STATUS_OK) {
                     return failure(status);
                 }
                 for (uint32_t index = 0; index < count; ++index) {
                     if (!outputs[index].valid()
                         || !record.install_import_projection(
                             imported + index, outputs[index])) {
-                        return failure(MYOS_STATUS_INVALID_CAP);
+                        return failure(STATUS_INVALID_CAP);
                     }
                 }
                 imported += count;
             }
 
             if (workspace.import_descriptor.valid()) {
-                const myos_status_t closed = record.space().close_slot(
+                const status_t closed = record.space().close_slot(
                     workspace.import_descriptor);
-                if (closed != MYOS_STATUS_OK) {
+                if (closed != STATUS_OK) {
                     return failure(closed);
                 }
                 workspace.import_descriptor = {};
             }
-            return MYOS_STATUS_OK;
+            return STATUS_OK;
         };
 
         /* Bootstrap rows are materialized only after every Import has been
@@ -2817,7 +2817,8 @@ public:
          * extending this to multi-execution requires an explicit ABI for
          * per-execution bootstrap state.  Defer the phase until after target
          * construction so TaskKey sources are complete. */
-        const auto generate_bootstrap = [&]() noexcept -> myos_status_t {
+        size_t arg_offset{}, arg_size{};
+        const auto generate_bootstrap = [&]() noexcept -> status_t {
         uint32_t readiness_roles = 0;
         SlotProjection readiness_source{};
         SlotProjection service_source{};
@@ -2827,7 +2828,7 @@ public:
                 || row->executions.count != 1
                 || input.runtime_cpu_count == 0
                 || !workspace.bootstrap_memory.valid()) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const PlanExecution* const execution = task.execution(0);
             const uint32_t stack_mapping = execution == nullptr
@@ -2837,39 +2838,44 @@ public:
             if (execution == nullptr
                 || stack_mapping == DEPLOY_NO_INDEX
                 || execution_bootstrap != bootstrap_mapping
-                || mapping_sizes[bootstrap_mapping] < sizeof(myos_bootstrap_info)
+                || mapping_sizes[bootstrap_mapping] < sizeof(BootHdr)
                 || !mapping_regions[bootstrap_mapping].valid()
                 || mapping_addresses[stack_mapping] == 0
                 || mapping_sizes[stack_mapping] == 0
                 || execution->stack_top == 0
                 || input.bundle->size() == 0) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
 
-            myos_bootstrap_info info{};
-            info.magic = MYOS_BOOTSTRAP_MAGIC;
-            info.major = MYOS_BOOTSTRAP_MAJOR;
-            info.minor = MYOS_BOOTSTRAP_MINOR;
-            info.size = sizeof(info);
+            BootHdr info{};
+            info.magic = BOOT_MAGIC;
+            info.major = BOOT_MAJOR;
+            info.minor = BOOT_MINOR;
+            info.count = row->bootstraps.count;
+            info.size = sizeof(info) + info.count * sizeof(BootCap);
+            arg_offset = info.size;
+            arg_size = input.arguments ? input.arguments->data().size : 0;
+            if (info.size > mapping_sizes[bootstrap_mapping]
+                || arg_size > mapping_sizes[bootstrap_mapping] - info.size)
+                return failure(STATUS_BAD_ARGS);
 
             info.cpu_count = input.runtime_cpu_count;
             info.stack_base = mapping_addresses[stack_mapping];
             info.stack_size = mapping_sizes[stack_mapping];
             info.boot_bundle_size = input.bundle->size();
-            if (input.arguments != nullptr) info.arguments = input.arguments->data();
 
             for (uint32_t bootstrap = 0;
                  bootstrap < row->bootstraps.count; ++bootstrap) {
                 const PlanBootstrap* const bootstrap_row =
                     task.bootstrap(bootstrap);
                 if (bootstrap_row == nullptr) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
-                const myos_object_kind_t expected_kind =
+                const obj_kind_t expected_kind =
                     bootstrap_row->kind == 0 ? bootstrap_row->object_kind
-                        : myos_bootstrap_object_kind(bootstrap_row->kind);
-                if (expected_kind == MYOS_OBJECT_KIND_INVALID) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                        : boot_kind(bootstrap_row->kind);
+                if (expected_kind == OBJECT_KIND_INVALID) {
+                    return failure(STATUS_BAD_ARGS);
                 }
                 const ByteView destination =
                     task.symbol(bootstrap_row->destination);
@@ -2886,29 +2892,29 @@ public:
                     }
                 }
                 if (destination.size() == 0 || matches != 1) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
                 const PlanImport* const import = task.import(import_index);
                 const SlotProjection& projection =
                     projections.imports[import_index];
                 if (import == nullptr || import->attenuation.kind != expected_kind
                     || projection.kind != expected_kind) {
-                    return failure(MYOS_STATUS_BAD_ARGS);
+                    return failure(STATUS_BAD_ARGS);
                 }
                 if (bootstrap_row->kind
-                        == MYOS_BOOTSTRAP_CAP_READINESS_NOTIFICATION) {
+                        == BOOT_READY) {
                     if (row->readiness != DEPLOY_READINESS_EXPLICIT
                         || ++readiness_roles != 1
                         || import->source_class
                             != DEPLOY_IMPORT_SOURCE_TASK_KEY
                         || import->mode != DEPLOY_IMPORT_DUPLICATE
                         || import->attenuation.rights
-                            != MYOS_RIGHT_SIGNAL) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                            != RIGHT_SIGNAL) {
+                        return failure(STATUS_BAD_ARGS);
                     }
                     const ByteView source_key = task.symbol(import->source);
                     if (source_key.size() == 0) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     size_t source_matches = 0;
                     for (uint32_t object_index = 0;
@@ -2916,7 +2922,7 @@ public:
                         const PlanObject* const object =
                             task.object(object_index);
                         if (object == nullptr
-                            || object->kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+                            || object->kind != OBJECT_KIND_NOTIFICATION) {
                             continue;
                         }
                         const auto consider = [&](ByteView key,
@@ -2935,8 +2941,8 @@ public:
                     }
                     if (source_matches != 1 || !readiness_source.valid()
                         || readiness_source.kind
-                            != MYOS_OBJECT_KIND_NOTIFICATION) {
-                        return failure(MYOS_STATUS_INVALID_CAP);
+                            != OBJECT_KIND_NOTIFICATION) {
+                        return failure(STATUS_INVALID_CAP);
                     }
                     const LocalSlot relation = relation_notification;
                     if (relation.valid()
@@ -2944,19 +2950,19 @@ public:
                         && readiness_source.local.pool == relation.pool
                         && readiness_source.local.index == relation.index
                         && readiness_source.local.kind == relation.kind) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     record.readiness_ = readiness_source;
                 } else if (bootstrap_row->kind
-                               == MYOS_BOOTSTRAP_CAP_SERVICE_NOTIFICATION) {
+                               == BOOT_EVENTS) {
                     if (import->source_class
                             != DEPLOY_IMPORT_SOURCE_TASK_KEY
                         || import->mode != DEPLOY_IMPORT_DUPLICATE) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     const ByteView source_key = task.symbol(import->source);
                     if (source_key.size() == 0) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     size_t source_matches = 0;
                     for (uint32_t object_index = 0;
@@ -2964,7 +2970,7 @@ public:
                         const PlanObject* const object =
                             task.object(object_index);
                         if (object == nullptr
-                            || object->kind != MYOS_OBJECT_KIND_NOTIFICATION) {
+                            || object->kind != OBJECT_KIND_NOTIFICATION) {
                             continue;
                         }
                         const auto consider = [&](ByteView key,
@@ -2983,57 +2989,57 @@ public:
                     }
                     if (source_matches != 1 || !service_source.valid()
                         || service_source.kind
-                            != MYOS_OBJECT_KIND_NOTIFICATION) {
-                        return failure(MYOS_STATUS_INVALID_CAP);
+                            != OBJECT_KIND_NOTIFICATION) {
+                        return failure(STATUS_INVALID_CAP);
                     }
                 }
                 const auto reference = record.resolve_internal(
                     projection, expected_kind);
                 if (!projection.valid() || !reference
                     || reference->cspace == 0) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
-                if (bootstrap_row->kind != 0) {
-                    if (info.cap_count == MYOS_BOOTSTRAP_MAX_CAPS)
-                        return failure(MYOS_STATUS_BAD_ARGS);
-                    info.caps[info.cap_count++] = myos_bootstrap_cap{
-                        .kind = bootstrap_row->kind,
-                        .flags = 0,
-                        .handle = reference->selector};
-                } else {
+                BootCap binding{};
+                binding.role = bootstrap_row->kind;
+                binding.kind = expected_kind;
+                binding.handle = reference->selector;
+                if (!binding.role) {
                     const ByteView name = task.symbol(bootstrap_row->name);
-                    if (info.import_count == MYOS_BOOTSTRAP_MAX_IMPORTS
-                        || name.size() == 0 || name.size() >= MYOS_BOOTSTRAP_IMPORT_NAME_MAX
-                        || bootstrap_row->protocol == 0 || bootstrap_row->major == 0)
-                        return failure(MYOS_STATUS_BAD_ARGS);
-                    auto& binding = info.imports[info.import_count++];
-                    for (size_t i = 0; i < name.size(); ++i)
-                        binding.name[i] = static_cast<char>(name[i]);
+                    if (name.size() == 0 || name.size() >= BOOT_NAME_MAX
+                        || !bootstrap_row->protocol || !bootstrap_row->major)
+                        return failure(STATUS_BAD_ARGS);
+                    for (size_t i = 0; i < name.size(); ++i) binding.name[i] = static_cast<char>(name[i]);
                     binding.protocol = bootstrap_row->protocol;
                     binding.major = bootstrap_row->major;
                     binding.minor = bootstrap_row->minor;
-                    binding.object_kind = expected_kind;
-                    binding.handle = reference->selector;
                 }
+                const auto status = materializer.write(workspace.bootstrap_memory,
+                    mapping_sizes[bootstrap_mapping], sizeof(info) + bootstrap * sizeof(BootCap),
+                    &binding, sizeof(binding));
+                if (status != STATUS_OK) return failure(status);
             }
 
-            myos_status_t status = materializer.write(
+            status_t status = materializer.write(
                 workspace.bootstrap_memory,
                 mapping_sizes[bootstrap_mapping],
                 0,
                 &info,
                 sizeof(info));
-            if (status == MYOS_STATUS_OK) {
+            if (status == STATUS_OK && arg_size) {
+                status = materializer.write(workspace.bootstrap_memory,
+                    mapping_sizes[bootstrap_mapping], arg_offset, input.arguments->data().bytes, arg_size);
+            }
+            if (status == STATUS_OK) {
                 const auto memory = record.space().lookup(
-                    workspace.bootstrap_memory, MYOS_OBJECT_KIND_MEMORY);
+                    workspace.bootstrap_memory, OBJECT_KIND_MEMORY);
                 status = memory
                     ? backend_type::memory_seal(memory.value())
-                    : MYOS_STATUS_INVALID_CAP;
+                    : STATUS_INVALID_CAP;
             }
-            if (status == MYOS_STATUS_OK) {
+            if (status == STATUS_OK) {
                 status = record.space().close_slot(workspace.bootstrap_memory);
             }
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
             workspace.bootstrap_memory = {};
@@ -3045,7 +3051,7 @@ public:
                 != (readiness_roles == 1)
             || (row->readiness != DEPLOY_READINESS_EXPLICIT
                 && record.readiness_.valid())) {
-            return failure(MYOS_STATUS_BAD_ARGS);
+            return failure(STATUS_BAD_ARGS);
         }
         const auto same_local = [](const SlotProjection& left,
                                    const LocalSlot& right) noexcept {
@@ -3062,9 +3068,9 @@ public:
                     && readiness_source.local.pool == service_source.local.pool
                     && readiness_source.local.index == service_source.local.index
                     && readiness_source.local.kind == service_source.local.kind))) {
-            return failure(MYOS_STATUS_BAD_ARGS);
+            return failure(STATUS_BAD_ARGS);
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
         };
 
         /* Executions and their SCs are created before imports.  A descriptor
@@ -3074,7 +3080,7 @@ public:
             const PlanExecution* const execution = task.execution(index);
             if (execution == nullptr || !workspace.domain_leases[index]
                 || !workspace.domain_leases[index]->valid()) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const uint32_t stack_mapping_index = mapping_local(execution->stack);
             const uint32_t bootstrap_mapping_index =
@@ -3083,7 +3089,7 @@ public:
                 || execution->image >= row->images.first + row->images.count
                 || stack_mapping_index == DEPLOY_NO_INDEX
                 || bootstrap_mapping_index == DEPLOY_NO_INDEX) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             const size_t image_index =
                 execution->image - row->images.first;
@@ -3093,21 +3099,21 @@ public:
                 task.mapping(bootstrap_mapping_index);
             const auto stack = record.resolve_internal(
                 projections.mappings[stack_mapping_index],
-                MYOS_OBJECT_KIND_MEMORY);
+                OBJECT_KIND_MEMORY);
             if (stack_mapping == nullptr || bootstrap_mapping == nullptr
                 || !stack) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
             const auto entry = execution->entry != 0
                 ? execution->entry : image_entries[image_index];
             if (entry == 0 || execution->stack_top == 0) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             LocalSlot descriptor_slot{};
-            myos_status_t status = MYOS_STATUS_BAD_ARGS;
+            status_t status = STATUS_BAD_ARGS;
             if (execution->model == DEPLOY_EXECUTION_THREAD) {
-                myos_thread_start descriptor{};
-                descriptor.version = MYOS_THREAD_START_VERSION;
+                ThreadInit descriptor{};
+                descriptor.version = THREAD_START_VERSION;
                 descriptor.flags = 0;
                 descriptor.entry = entry;
                 descriptor.stack = execution->stack_top;
@@ -3115,21 +3121,23 @@ public:
                     bootstrap_mapping_index];
                 descriptor.arguments[1] = mapping_sizes[
                     bootstrap_mapping_index];
+                descriptor.arguments[2] = arg_size ? mapping_addresses[bootstrap_mapping_index] + arg_offset : 0;
+                descriptor.arguments[3] = arg_size;
                 if (execution->ipc != DEPLOY_NO_INDEX) {
                     const uint32_t ipc_mapping_index =
                         mapping_local(execution->ipc);
                     if (ipc_mapping_index == DEPLOY_NO_INDEX) {
-                        return failure(MYOS_STATUS_BAD_ARGS);
+                        return failure(STATUS_BAD_ARGS);
                     }
                     const PlanMapping* const ipc_mapping =
                         task.mapping(ipc_mapping_index);
                     const auto ipc = ipc_mapping == nullptr
-                        ? std::optional<myos::cap::CapRef>{}
+                        ? std::optional<sys::cap::CapRef>{}
                         : record.resolve_internal(
                             projections.mappings[ipc_mapping_index],
-                            MYOS_OBJECT_KIND_MEMORY);
+                            OBJECT_KIND_MEMORY);
                     if (ipc_mapping == nullptr || !ipc) {
-                        return failure(MYOS_STATUS_INVALID_CAP);
+                        return failure(STATUS_INVALID_CAP);
                     }
                     descriptor.ipc.memory = ipc->selector;
                     descriptor.ipc.page = mapping_first[ipc_mapping_index];
@@ -3140,88 +3148,88 @@ public:
                 }
                 status = materializer.materialize_descriptor(
                     &descriptor, sizeof(descriptor), descriptor_slot);
-                if (status == MYOS_STATUS_OK) {
+                if (status == STATUS_OK) {
                     const auto descriptor_ref = record.space().lookup(
-                        descriptor_slot, MYOS_OBJECT_KIND_MEMORY);
+                        descriptor_slot, OBJECT_KIND_MEMORY);
                     status = descriptor_ref
                         ? adopt_result(
                               backend_type::thread_create(
                                   pool.value(), vspace.value(), cspace.value(),
                                   descriptor_ref.value(), 0),
-                              MYOS_OBJECT_KIND_THREAD,
+                              OBJECT_KIND_THREAD,
                               projections.executions[index].local)
-                        : MYOS_STATUS_INVALID_CAP;
+                        : STATUS_INVALID_CAP;
                 }
             } else {
-                status = MYOS_STATUS_BAD_ARGS;
+                status = STATUS_BAD_ARGS;
             }
             if (descriptor_slot.valid()) {
-                const myos_status_t closed =
+                const status_t closed =
                     record.space().close_slot(descriptor_slot);
-                if (status == MYOS_STATUS_OK && closed != MYOS_STATUS_OK) {
+                if (status == STATUS_OK && closed != STATUS_OK) {
                     status = closed;
                 }
             }
-            if (status != MYOS_STATUS_OK
+            if (status != STATUS_OK
                 || !projections.executions[index].local.valid()) {
-                return failure(status == MYOS_STATUS_OK
-                    ? MYOS_STATUS_INVALID_CAP : status);
+                return failure(status == STATUS_OK
+                    ? STATUS_INVALID_CAP : status);
             }
             projections.executions[index] = local_projection(
                 projections.executions[index].local);
             const auto execution_ref = record.resolve_internal(
                 projections.executions[index],
-                static_cast<myos_object_kind_t>(
-                    MYOS_OBJECT_KIND_THREAD));
+                static_cast<obj_kind_t>(
+                    OBJECT_KIND_THREAD));
             const auto create_context = [&](uint32_t cpu) noexcept {
                 return backend_type::sc_create(
                     pool.value(), workspace.domain_leases[index]->source(),
-                    static_cast<myos_word_t>(execution->sc_budget),
-                    static_cast<myos_word_t>(execution->sc_period),
-                    static_cast<myos_word_t>(execution->urgency), cpu);
+                    static_cast<word_t>(execution->sc_budget),
+                    static_cast<word_t>(execution->sc_period),
+                    static_cast<word_t>(execution->urgency), cpu);
             };
-            myos::SysResult context{};
+            sys::SysResult context{};
             if (execution->home_cpu == DEPLOY_HOME_CPU_ANY) {
                 // Distribute independent tasks, then probe each allowed CPU
                 // at most once. The domain remains the admission authority.
                 for (uint32_t attempt = 0; attempt < input.runtime_cpu_count; ++attempt) {
                     const auto cpu = (record.id().slot + index + attempt) % input.runtime_cpu_count;
                     context = create_context(cpu);
-                    if (context.status != MYOS_STATUS_BUSY) break;
+                    if (context.status != STATUS_BUSY) break;
                 }
             } else context = create_context(execution->home_cpu);
             const auto sc = adopt_result(context,
-                MYOS_OBJECT_KIND_SCHED_CONTEXT,
+                OBJECT_KIND_SCHED_CONTEXT,
                 projections.scheduling_contexts[index].local);
-            if (status != MYOS_STATUS_OK || !execution_ref
-                || sc != MYOS_STATUS_OK) {
-                return failure(status != MYOS_STATUS_OK ? status : sc);
+            if (status != STATUS_OK || !execution_ref
+                || sc != STATUS_OK) {
+                return failure(status != STATUS_OK ? status : sc);
             }
             projections.scheduling_contexts[index] = local_projection(
                 projections.scheduling_contexts[index].local);
             const auto sc_ref = record.resolve_internal(
                 projections.scheduling_contexts[index],
-                MYOS_OBJECT_KIND_SCHED_CONTEXT);
+                OBJECT_KIND_SCHED_CONTEXT);
             if (!sc_ref) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
-            const myos_status_t sc_bind_status = backend_type::sc_bind(
+            const status_t sc_bind_status = backend_type::sc_bind(
                 sc_ref.value(), execution_ref.value());
-            if (sc_bind_status != MYOS_STATUS_OK) {
+            if (sc_bind_status != STATUS_OK) {
                 return failure(sc_bind_status);
             }
             if (relation_notification.valid()) {
                 const auto notification = record.resolve_internal(
                     local_projection(relation_notification),
-                    MYOS_OBJECT_KIND_NOTIFICATION);
+                    OBJECT_KIND_NOTIFICATION);
                 if (!notification) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
-                const myos_status_t terminal_status =
+                const status_t terminal_status =
                     backend_type::exit_bind(
                         execution_ref.value(), notification.value(),
                         relation_badge);
-                if (terminal_status != MYOS_STATUS_OK) {
+                if (terminal_status != STATUS_OK) {
                     return failure(terminal_status);
                 }
                 if (index < DEPLOY_TASK_DEPENDENCY_MAX) {
@@ -3231,12 +3239,12 @@ public:
             }
             for (const auto& lease : workspace.domain_leases) {
                 if (lease && !lease->valid()) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
             }
             for (const auto& lease : workspace.pager_leases) {
                 if (lease && !lease->valid()) {
-                    return failure(MYOS_STATUS_INVALID_CAP);
+                    return failure(STATUS_INVALID_CAP);
                 }
             }
         }
@@ -3245,12 +3253,12 @@ public:
          * current CSpace.  Imports adopt their destinations immediately, then
          * the generated bootstrap envelope records only those admitted child
          * selectors. */
-        const myos_status_t import_status = import_sources();
-        if (import_status != MYOS_STATUS_OK) {
+        const status_t import_status = import_sources();
+        if (import_status != STATUS_OK) {
             return import_status;
         }
-        const myos_status_t bootstrap_status = generate_bootstrap();
-        if (bootstrap_status != MYOS_STATUS_OK) {
+        const status_t bootstrap_status = generate_bootstrap();
+        if (bootstrap_status != STATUS_OK) {
             return bootstrap_status;
         }
 
@@ -3262,54 +3270,54 @@ public:
         for (uint32_t object_index = 0; object_index < row->objects.count;
              ++object_index) {
             const PlanObject* const object = task.object(object_index);
-            if (object == nullptr || object->kind != MYOS_OBJECT_KIND_ENDPOINT) {
+            if (object == nullptr || object->kind != OBJECT_KIND_ENDPOINT) {
                 continue;
             }
             const uint32_t descriptor_mapping = mapping_local(object->refs[0]);
             if (descriptor_mapping == DEPLOY_NO_INDEX) {
-                return failure(MYOS_STATUS_BAD_ARGS);
+                return failure(STATUS_BAD_ARGS);
             }
             SlotProjection& mapping_projection =
                 projections.mappings[descriptor_mapping];
             if (mapping_projection.projection != ProjectionKind::Local
                 || mapping_projection.local.kind
-                    != MYOS_OBJECT_KIND_MEMORY) {
+                    != OBJECT_KIND_MEMORY) {
                 continue;
             }
             const LocalSlot region = mapping_regions[descriptor_mapping];
-            if (!region.valid() || region.kind != MYOS_OBJECT_KIND_VSPACE) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+            if (!region.valid() || region.kind != OBJECT_KIND_VSPACE) {
+                return failure(STATUS_INVALID_CAP);
             }
-            const myos_status_t status = record.space().close_slot(
+            const status_t status = record.space().close_slot(
                 mapping_projection.local);
-            if (status != MYOS_STATUS_OK) {
+            if (status != STATUS_OK) {
                 return failure(status);
             }
             mapping_projection = local_projection(region);
         }
 
         if (!workspace.domain_leases[0] && row->executions.count != 0) {
-            return failure(MYOS_STATUS_INVALID_CAP);
+            return failure(STATUS_INVALID_CAP);
         }
         for (const auto& lease : workspace.domain_leases) {
             if (lease && !lease->valid()) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
         }
         for (const auto& lease : workspace.pager_leases) {
             if (lease && !lease->valid()) {
-                return failure(MYOS_STATUS_INVALID_CAP);
+                return failure(STATUS_INVALID_CAP);
             }
         }
         if (row->bootstrap_mapping != DEPLOY_NO_INDEX
             && !projections.bootstrap.valid()) {
-            return failure(MYOS_STATUS_INVALID_CAP);
+            return failure(STATUS_INVALID_CAP);
         }
         if (!bind_exports(record, task)
             || !validate_prepared(record, task)) {
-            return failure(MYOS_STATUS_INVALID_CAP);
+            return failure(STATUS_INVALID_CAP);
         }
-        return MYOS_STATUS_OK;
+        return STATUS_OK;
     }
     [[nodiscard]] auto take_receiver() noexcept
         -> std::optional<receiver_type> {
@@ -3328,7 +3336,7 @@ public:
         record_type& record = reservation_->record();
         const TaskPlanView task = record.plan();
         if (!bind_exports(record, task) || !validate_prepared(record, task)) {
-            const myos_status_t status = MYOS_STATUS_INVALID_CAP;
+            const status_t status = STATUS_INVALID_CAP;
             if (!reservation_->fail(
                     CloseReason::ConstructionFailure, status)) {
                 record_type::ownership_fault(status);
@@ -3339,7 +3347,7 @@ public:
             return false;
         }
         if (!reservation_->commit_prepared()) {
-            const myos_status_t status = MYOS_STATUS_INTERNAL;
+            const status_t status = STATUS_INTERNAL;
             if (!reservation_->fail(
                     CloseReason::ConstructionFailure, status)) {
                 record_type::ownership_fault(status);
@@ -3356,7 +3364,7 @@ public:
 
     [[nodiscard]] auto fail(
         CloseReason reason,
-        myos_status_t status) noexcept -> bool {
+        status_t status) noexcept -> bool {
         if (!valid() || !reservation_->fail(reason, status)) {
             return false;
         }
@@ -3415,7 +3423,7 @@ private:
             if (object == nullptr) {
                 return false;
             }
-            const size_t outputs = object->kind == MYOS_OBJECT_KIND_CHANNEL
+            const size_t outputs = object->kind == OBJECT_KIND_CHANNEL
                 ? 2U : 1U;
             const auto next = libk::checked_add(local, outputs);
             if (!next) {
@@ -3499,9 +3507,9 @@ private:
 
         const auto consider = [](ByteView source, ByteView key,
                                 const SlotProjection& slot,
-                                myos_object_kind_t declared_kind,
+                                obj_kind_t declared_kind,
                                 bool& found,
-                                myos_object_kind_t& declared,
+                                obj_kind_t& declared,
                                 SourceProjection& result) noexcept -> bool {
             if (!key.equals(source)) {
                 return true;
@@ -3535,25 +3543,25 @@ private:
             }
             SourceProjection result{};
             bool found = false;
-            myos_object_kind_t declared_kind = MYOS_OBJECT_KIND_INVALID;
+            obj_kind_t declared_kind = OBJECT_KIND_INVALID;
             const ByteView pool_key = task.symbol(row->pool_key);
             if (pool_key.equals(source)) {
                 found = true;
-                declared_kind = MYOS_OBJECT_KIND_RESOURCE_POOL;
+                declared_kind = OBJECT_KIND_RESOURCE_POOL;
                 result = SourceProjection{
                     .projection = SourceProjectionKind::Pool,
-                    .kind = MYOS_OBJECT_KIND_RESOURCE_POOL};
+                    .kind = OBJECT_KIND_RESOURCE_POOL};
             }
             const auto check_slot = [&](ByteView key,
                                         const SlotProjection& slot,
-                                        myos_object_kind_t kind) noexcept {
+                                        obj_kind_t kind) noexcept {
                 return consider(source, key, slot, kind, found,
                                 declared_kind, result);
             };
             if (!check_slot(task.symbol(row->vspace_key),
-                            projections.vspace, MYOS_OBJECT_KIND_VSPACE)
+                            projections.vspace, OBJECT_KIND_VSPACE)
                 || !check_slot(task.symbol(row->cspace_key),
-                               projections.cspace, MYOS_OBJECT_KIND_CSPACE)) {
+                               projections.cspace, OBJECT_KIND_CSPACE)) {
                 return false;
             }
             for (uint32_t mapping = 0; mapping < row->mappings.count;
@@ -3562,7 +3570,7 @@ private:
                 if (mapping_row == nullptr
                     || !check_slot(task.symbol(mapping_row->produced),
                                    projections.mappings[mapping],
-                                   MYOS_OBJECT_KIND_MEMORY)) {
+                                   OBJECT_KIND_MEMORY)) {
                     return false;
                 }
             }
@@ -3584,10 +3592,10 @@ private:
                 if (execution_row == nullptr
                     || !check_slot(task.symbol(execution_row->key),
                                    projections.executions[execution],
-                                   MYOS_OBJECT_KIND_THREAD)
+                                   OBJECT_KIND_THREAD)
                     || !check_slot(task.symbol(execution_row->sc),
                                    projections.scheduling_contexts[execution],
-                                   MYOS_OBJECT_KIND_SCHED_CONTEXT)) {
+                                   OBJECT_KIND_SCHED_CONTEXT)) {
                     return false;
                 }
             }
@@ -3626,15 +3634,15 @@ private:
         static_cast<void>(typed_imports);
         const TaskProjections& projections = record.projections();
         if (!projections.vspace.valid() || !projections.cspace.valid()
-            || !record.resolve_internal(projections.vspace, MYOS_OBJECT_KIND_VSPACE)
-            || !record.resolve_internal(projections.cspace, MYOS_OBJECT_KIND_CSPACE)) {
+            || !record.resolve_internal(projections.vspace, OBJECT_KIND_VSPACE)
+            || !record.resolve_internal(projections.cspace, OBJECT_KIND_CSPACE)) {
             return false;
         }
         if (row->readiness == DEPLOY_READINESS_EXPLICIT) {
             if (!record.readiness_.valid()
                 || record.readiness_.projection != ProjectionKind::Local
                 || record.readiness_.kind
-                    != MYOS_OBJECT_KIND_NOTIFICATION
+                    != OBJECT_KIND_NOTIFICATION
                 || !record.resolve_readiness()) {
                 return false;
             }
@@ -3671,7 +3679,7 @@ private:
                 || !record.resolve_internal(projections.objects[index], object->kind)) {
                 return false;
             }
-            if (object->kind == MYOS_OBJECT_KIND_CHANNEL
+            if (object->kind == OBJECT_KIND_CHANNEL
                 && (!projections.object_b[index].valid()
                     || !record.resolve_internal(projections.object_b[index], object->kind))) {
                 return false;
@@ -3686,16 +3694,16 @@ private:
         }
         for (uint32_t index = 0; index < row->executions.count; ++index) {
             const PlanExecution* execution = task.execution(index);
-            const myos_object_kind_t execution_kind = execution != nullptr
-                && MYOS_OBJECT_KIND_THREAD;
+            const obj_kind_t execution_kind = execution != nullptr
+                && OBJECT_KIND_THREAD;
             if (execution == nullptr || !projections.executions[index].valid()
                 || !record.resolve_internal(projections.executions[index], execution_kind)
                 || !projections.scheduling_contexts[index].valid()
                 || !record.resolve_internal(projections.scheduling_contexts[index],
-                                   MYOS_OBJECT_KIND_SCHED_CONTEXT)
+                                   OBJECT_KIND_SCHED_CONTEXT)
                 || !projections.relations[index].valid()
                 || !record.resolve_internal(projections.relations[index],
-                                   MYOS_OBJECT_KIND_NOTIFICATION)) {
+                                   OBJECT_KIND_NOTIFICATION)) {
                 return false;
             }
         }
@@ -3756,7 +3764,7 @@ private:
         }
         if (reservation_->valid()
             && reservation_->record().has_resources()) {
-            Table::record_type::ownership_fault(MYOS_STATUS_BUSY);
+            Table::record_type::ownership_fault(STATUS_BUSY);
             return;
         }
         if (receiver_) {
@@ -3764,7 +3772,7 @@ private:
             receiver_.reset();
         }
         if (!reservation_->cancel()) {
-            Table::record_type::ownership_fault(MYOS_STATUS_BUSY);
+            Table::record_type::ownership_fault(STATUS_BUSY);
             return;
         }
         reservation_.reset();

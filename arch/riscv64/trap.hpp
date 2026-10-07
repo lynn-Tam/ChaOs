@@ -64,6 +64,7 @@
 #if !defined(__ASSEMBLER__)
 #include <array>
 #include <base/types.hpp>
+#include <cpu.hpp>
 #include <cstddef>
 #include <libk/assert.hpp>
 #include <mm/types.hpp>
@@ -88,6 +89,7 @@ static_assert(offsetof(TrapFrame, padding) == PADDING_OFFSET);
 struct TrapRegs {
     std::array<usize, 31> gpr{};
     usize pc{}, status{}, cause{}, fault_address{};
+    StackRegs stack() const noexcept { return {pc, gpr[1], gpr[7], gpr[0]}; }
 };
 struct UserStart {
     mm::Virt entry{}, stack{};

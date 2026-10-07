@@ -5,22 +5,22 @@
 
 namespace { deploy::program program; deploy::tasks<1> supervisor; }
 
-extern "C" [[noreturn]] void myos_main(const void* address, myos_word_t size) noexcept {
-    using namespace myos;
+extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
+    using namespace sys;
     const auto info = service::bootstrap(address, size);
-    auto mapping = MappedMemory::map(service::capability(info, MYOS_BOOTSTRAP_CAP_VSPACE),
-        cap::OwnedCap{{service::capability(info, MYOS_BOOTSTRAP_CAP_DEVICE_MEMORY), 0}},
-        0x30010000, 4096, MYOS_VM_READ | MYOS_VM_WRITE);
+    auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
+        cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
+        0x30010000, 4096, VM_READ | VM_WRITE);
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping->address};
     port.reset();
     supervisor.open(info);
     service::require(supervisor.load(program, info));
     service::require(supervisor.add_boot_sources(info));
-    myos_status_t status{};
+    status_t status{};
     auto task = supervisor.launch(program, "channel-test", status);
     if (task) status = supervisor.wait(*task);
-    if (status != MYOS_STATUS_OK) {
+    if (status != STATUS_OK) {
         uart::Printer printer{uart::Writer{port}};
         (void)printer.print<"[channel] failed status={}\n">(status);
         exit(status);

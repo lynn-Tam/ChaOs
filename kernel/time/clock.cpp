@@ -1,6 +1,6 @@
 #include <time/clock.hpp>
 
-#include <arch/time.hpp>
+#include <cpu.hpp>
 #include <libk/assert.hpp>
 
 namespace time {

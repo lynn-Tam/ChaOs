@@ -137,7 +137,7 @@ bool test_endpoint_authority_narrows_badge_and_limits(
     const EpLimit root{
         .badge = 0,
         .fixed = 0,
-        .cap_limit = MYOS_ENDPOINT_MAX_CAPS,
+        .cap_limit = ENDPOINT_MAX_CAPS,
     };
     const EpLimit caller{
         .badge = 0x42,
@@ -301,15 +301,15 @@ static bool test_exit_notification_is_read_only(const TestContext &) noexcept {
     ipc::Notification notification{};
     Exit first{}, second{};
     if (!first.observe(notification, 0x80) || first.observe(notification, 0x40) ||
-        !second.claim(Exit::Reason::Normal, MYOS_STATUS_OK) ||
+        !second.claim(Exit::Reason::Normal, STATUS_OK) ||
         !second.observe(notification, 0x40) ||
-        !first.claim(Exit::Reason::Stop, MYOS_STATUS_CANCELED, 7))
+        !first.claim(Exit::Reason::Stop, STATUS_CANCELED, 7))
         return false;
     const auto event = notification.take();
     const auto result = first.read();
     return event && event.value().badges == 0xc0 && result.reason == Exit::Reason::Stop &&
-           result.status == MYOS_STATUS_CANCELED && result.detail == 7 &&
-           !first.claim(Exit::Reason::Fault, MYOS_STATUS_INTERNAL) && first.published();
+           result.status == STATUS_CANCELED && result.detail == 7 &&
+           !first.claim(Exit::Reason::Fault, STATUS_INTERNAL) && first.published();
 }
 
 void register_ipc_tests(TestRegistry& registry) noexcept {

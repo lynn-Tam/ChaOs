@@ -48,7 +48,6 @@ while [ "$#" -gt 0 ]; do
     shift 2
     continue
   fi
-  # /*luna change: carry an explicit QEMU RAM condition, reason: pressure proof must exercise PMM exhaustion without altering ordinary targets*/
   if [ "$1" = '--memory' ]; then
     memory=$2
     shift 2

@@ -124,7 +124,7 @@ auto Channel::Wait::cancel() noexcept -> bool {
     {
         sync::Lock guard{owner->lock_};
         if (state != State::Awaiting && state != State::Armed) return false;
-        result = WaitResult{MYOS_STATUS_CANCELED, 0};
+        result = WaitResult{STATUS_CANCELED, 0};
         state = State::Done;
         ++references;
     }
@@ -191,11 +191,11 @@ void Channel::bind_sponsor(
 
 auto Channel::open() noexcept -> std::expected<void, ChannelError> {
     if (config_.queue_capacity == 0
-        || config_.queue_capacity > MYOS_CHANNEL_MAX_QUEUE
+        || config_.queue_capacity > CHANNEL_MAX_QUEUE
         || config_.max_words == 0
-        || config_.max_words > MYOS_CHANNEL_MAX_WORDS
-        || config_.max_caps > MYOS_CHANNEL_MAX_CAPS
-        || config_.relation_capacity > MYOS_CHANNEL_MAX_RELATIONS) {
+        || config_.max_words > CHANNEL_MAX_WORDS
+        || config_.max_caps > CHANNEL_MAX_CAPS
+        || config_.relation_capacity > CHANNEL_MAX_RELATIONS) {
         return std::unexpected(ChannelError::Invalid);
     }
     {
@@ -564,7 +564,7 @@ auto Channel::receive(
         }
 
         libk::InplaceVector<cap::CSpace::Reservation,
-            MYOS_CHANNEL_MAX_CAPS> reservations{};
+            CHANNEL_MAX_CAPS> reservations{};
         for (usize index = 0; index < cap_count; ++index) {
             auto reserved = destination.reserve();
             if (!reserved) {
@@ -662,7 +662,7 @@ auto Channel::wait(
     {
         sync::Lock guard{lock_};
         if (!attached) {
-            waiter.result = WaitResult{MYOS_STATUS_INVALID_CAP, 0};
+            waiter.result = WaitResult{STATUS_INVALID_CAP, 0};
             waiter.state = Waiter::State::Done;
             waiter.grant_detaching = true;
             --waiter.references;
@@ -677,11 +677,11 @@ auto Channel::wait(
     // separately by waiter, so release the admission lease before blocking.
     cap.reset();
     thread.block();
-    if (thread.stop_requested() || waiter.result.status == MYOS_STATUS_CANCELED)
+    if (thread.stop_requested() || waiter.result.status == STATUS_CANCELED)
         return std::unexpected(ChannelError::Canceled);
-    if (waiter.result.status == MYOS_STATUS_DENIED)
+    if (waiter.result.status == STATUS_DENIED)
         return std::unexpected(ChannelError::Denied);
-    if (waiter.result.status == MYOS_STATUS_INVALID_CAP)
+    if (waiter.result.status == STATUS_INVALID_CAP)
         return std::unexpected(ChannelError::InvalidCap);
     return {};
 }
@@ -986,7 +986,7 @@ void Channel::waiter_invalidated(
     {
         sync::Lock guard{lock_};
         ++waiter.references;
-        waiter.result = WaitResult{MYOS_STATUS_DENIED, 0};
+        waiter.result = WaitResult{STATUS_DENIED, 0};
         waiter.state = Waiter::State::Done;
     }
     detach_waiter_grant(waiter);
@@ -1242,23 +1242,23 @@ void Channel::clear_queues() noexcept {
 
 auto Channel::make_escrow(
     cap::CSpace& source,
-    const myos_cap_transfer& spec,
+    const CapXfer& spec,
     Escrow& escrow) noexcept -> std::expected<void, ChannelError> {
     std::optional<Escrow::Kind> kind{};
     switch (spec.operation) {
-    case MYOS_CAP_COPY:
+    case CAP_COPY:
         kind.emplace(Escrow::Kind::Copy);
         break;
-    case MYOS_CAP_MOVE:
+    case CAP_MOVE:
         kind.emplace(Escrow::Kind::Move);
         break;
-    case MYOS_CAP_DELEGATE:
+    case CAP_DELEGATE:
         kind.emplace(Escrow::Kind::Delegate);
         break;
     default:
         break;
     }
-    auto rights = cap::Rights::parse(spec.rights, MYOS_RIGHT_MASK);
+    auto rights = cap::Rights::parse(spec.rights, RIGHT_MASK);
     if (!kind || !rights || spec.flags != 0) {
         return std::unexpected(ChannelError::Invalid);
     }
@@ -1332,7 +1332,7 @@ auto Channel::commit_escrows(
     Message& message,
     cap::CSpace& destination,
     libk::InplaceVector<cap::CSpace::Reservation,
-        MYOS_CHANNEL_MAX_CAPS>& reservations,
+        CHANNEL_MAX_CAPS>& reservations,
     ChannelRecv& result) noexcept -> CommitResult {
     if (reservations.size() != message.escrows.size()) {
         return CommitResult::Capacity;
@@ -1341,7 +1341,7 @@ auto Channel::commit_escrows(
     // Keep a lease for every in-flight Grant through the destination commit.
     // A revoke may race the receive after the message was queued; the lease
     // makes the preflight and publication one indivisible admission window.
-    libk::InplaceVector<cap::GrantLease, MYOS_CHANNEL_MAX_CAPS> leases{};
+    libk::InplaceVector<cap::GrantLease, CHANNEL_MAX_CAPS> leases{};
     for (Escrow& escrow : message.escrows) {
         auto acquired = escrow.grant.acquire();
         if (!acquired) {

@@ -5,10 +5,10 @@ source=$1
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 allowed_tmp=$(realpath -m -- \
     "$repo_root/.tmp/project/paged-memory-and-task-supervision/stage-e/unit3-cut-a")
-requested_tmp="${MYOS_PROJECT_TMP:-$allowed_tmp}"
+requested_tmp="${PROJECT_TMP:-$allowed_tmp}"
 case "/$requested_tmp/" in
     */../*)
-        printf '%s\n' '[audit] reject: MYOS_PROJECT_TMP contains ..' >&2
+        printf '%s\n' '[audit] reject: PROJECT_TMP contains ..' >&2
         exit 1
         ;;
 esac
@@ -21,7 +21,7 @@ case "$project_tmp" in
     "$allowed_tmp"|"$allowed_tmp"/*) ;;
     *)
         printf '%s\n' \
-            '[audit] reject: MYOS_PROJECT_TMP escapes the task subtree' >&2
+            '[audit] reject: PROJECT_TMP escapes the task subtree' >&2
         exit 1
         ;;
 esac
@@ -112,7 +112,7 @@ reservation_block=$(sed -n "${reservation_start},$((table_ctor_start - 1))p" \
 printf '%s\n' "$reservation_block" \
     | rg -q 'if \(!table_->cancel_reservation\(id_\)\)'
 printf '%s\n' "$reservation_block" \
-    | rg -q 'Record::ownership_fault\(MYOS_STATUS_BUSY\)'
+    | rg -q 'Record::ownership_fault\(STATUS_BUSY\)'
 if printf '%s\n' "$reservation_block" \
     | rg -q 'static_cast<void>\(table_->cancel_reservation'; then
     exit 1
@@ -123,7 +123,7 @@ builder_block=$(sed -n "${builder_start},\$p" "$source")
 printf '%s\n' "$builder_block" \
     | rg -q 'if \(!reservation_->cancel\(\)\)'
 printf '%s\n' "$builder_block" \
-    | rg -q 'Table::record_type::ownership_fault\(MYOS_STATUS_BUSY\)'
+    | rg -q 'Table::record_type::ownership_fault\(STATUS_BUSY\)'
 
 mutation_dir=$(mktemp -d "$project_tmp/audit-task-transaction.XXXXXX")
 trap 'rm -rf "$mutation_dir"' EXIT HUP INT TERM
@@ -154,6 +154,6 @@ expect_reject public-reserve \
 expect_reject reservation-ignored-failure \
     -e '/if (!table_->cancel_reservation(id_))/a\            static_cast<void>(table_->cancel_reservation(id_));'
 expect_reject reservation-destructor-fault \
-    -e '/Record::ownership_fault(MYOS_STATUS_BUSY);/d'
+    -e '/Record::ownership_fault(STATUS_BUSY);/d'
 
 printf '%s\n' '[audit] OK: Cut A in-place record and finalization order'

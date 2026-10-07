@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <libk/parse.hpp>
 
-namespace myos::store {
+namespace sys::store {
 
 inline constexpr size_t VolumeIdSize = 16;
 
@@ -26,5 +26,5 @@ inline constexpr uint64_t ReadDirectory = 1;
 inline constexpr uint64_t WriteDirectory = 2;
 inline constexpr uint64_t AdminDirectory = 3;
 
-} // namespace myos::store
+} // namespace sys::store
 

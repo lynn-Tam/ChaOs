@@ -150,7 +150,7 @@ struct PlanImport final {
     uint16_t mode{};
     uint16_t selector{};
     uint32_t flags{};
-    myos_cap_attenuation attenuation{};
+    CapView attenuation{};
     uint16_t source_class{};
 };
 
@@ -176,7 +176,7 @@ struct PlanExport final {
     SymbolId key{};
     uint16_t source_class{};
     uint16_t flags{};
-    myos_cap_attenuation ceiling{};
+    CapView ceiling{};
 };
 
 class DeploymentPlan;

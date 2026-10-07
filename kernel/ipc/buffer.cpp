@@ -72,7 +72,7 @@ auto Buffer::bind(
     -> std::expected<Buffer, BufferError> {
     const auto count = virtual_range.page_count();
     if (!memory_ref || !count || *count == 0
-        || *count > MYOS_IPC_BUFFER_MAX_PAGES
+        || *count > IPC_BUFFER_MAX_PAGES
         || object.size() != *count) {
         return std::unexpected(BufferError::Invalid);
     }
@@ -114,7 +114,7 @@ auto Buffer::valid() const noexcept -> bool {
 auto Buffer::lease_pages() const noexcept
     -> std::expected<Leases, mm::MemErr> {
     if (pmm_ == nullptr || memory_ == nullptr || object_.size() == 0
-        || object_.size() > MYOS_IPC_BUFFER_MAX_PAGES) {
+        || object_.size() > IPC_BUFFER_MAX_PAGES) {
         return std::unexpected(mm::MemErr::InvalidState);
     }
     Leases leases{};
