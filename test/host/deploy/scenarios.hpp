@@ -211,7 +211,7 @@ inline auto pack_io_test(const char* path) -> std::vector<uint8_t> {
     Manifest manifest;
     Task task{manifest, "io-test", path, 4 * 1024 * 1024};
     task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
-    task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+    task.authority(BOOT_IO_HOST, "block.host", RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }
@@ -223,7 +223,7 @@ inline auto pack_io_session(const char* server, const char* client) -> std::vect
         Task task{manifest, "block", server, 4 * 1024 * 1024};
         task.cspace(128, 20);
         task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
-        task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+        task.authority(BOOT_IO_HOST, "block.host", RIGHT_CONNECT);
         task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
     }
@@ -243,7 +243,7 @@ inline auto pack_file_session(char** paths, bool fault_test = false) -> std::vec
         Task task{manifest, "block", paths[0], 4 * 1024 * 1024};
         task.cspace(128, 20);
         task.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
-        task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+        task.authority(BOOT_IO_HOST, "block.host", RIGHT_CONNECT);
         task.channel(boot::Block, "block.server", 1, 1, rights);
         task.finish();
     }
@@ -312,7 +312,7 @@ inline auto pack_denied(const char* name, const char* image) -> std::vector<uint
     task.authority(boot::Stdout, "stdout", RIGHT_SEND);
     task.authority(boot::Stderr, "stderr", RIGHT_SEND);
     task.authority(boot::Stdin, "stdin", RIGHT_RECEIVE);
-    task.authority(BOOT_DEVICE, "block.device", RIGHT_CONNECT);
+    task.authority(BOOT_IO_HOST, "block.host", RIGHT_CONNECT);
     task.finish();
     return manifest.finish();
 }

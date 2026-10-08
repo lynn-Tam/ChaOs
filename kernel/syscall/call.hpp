@@ -13,7 +13,7 @@
 
 #include <uapi/abi.h>
 
-struct CpuLocal;
+struct Cpu;
 class Thread;
 
 namespace syscall {
@@ -31,10 +31,11 @@ enum class Disposition : u8 {
 
 
 struct Call final {
-    CpuLocal& cpu;
+    Cpu& cpu;
     Thread* target;
     cap::CSpace& cspace;
     mm::VSpace& vspace;
+    mm::KSpace& kspace;
     arch::TrapCtx& trap;
 };
 
@@ -94,7 +95,6 @@ template<typename Descriptor>
     -> std::optional<mm::Perms>;
 [[nodiscard]] auto range_of(usize base, usize size) noexcept
     -> std::optional<mm::VRange>;
-[[nodiscard]] auto vm_context(CpuLocal& cpu) noexcept -> mm::VmCtx;
 
 #define CALL(name, nr, entry, locus, unit) \
     template<usize op> [[nodiscard]] auto entry(Call&) noexcept -> Result;

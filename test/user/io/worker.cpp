@@ -8,7 +8,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     block::Device device;
     service::require(device.open(service::capability(info, BOOT_POOL),
         service::capability(info, BOOT_VSPACE),
-        service::capability(info, BOOT_DEVICE), events));
+        service::capability(info, BOOT_IO_HOST), events));
     if (device.capacity() != 1024 * 1024) exit(STATUS_BAD_ARGS);
     constexpr size_t Batches = 16;
     uint64_t next_id{};

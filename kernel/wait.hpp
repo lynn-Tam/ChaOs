@@ -7,7 +7,7 @@
 #include <uapi/abi.h>
 #include <sync.hpp>
 
-class CpuRegistry;
+class Cpus;
 namespace sched { class Sc; }
 
 class Wait;
@@ -125,7 +125,7 @@ public:
     [[nodiscard]] auto ready() const noexcept -> bool;
     [[nodiscard]] auto begin(
         Completion& completion,
-        CpuRegistry& cpus,
+        Cpus& cpus,
         sched::Sc& binding) noexcept -> bool;
     [[nodiscard]] auto finish() noexcept -> bool;
     [[nodiscard]] auto cancel() noexcept -> bool;
@@ -143,7 +143,7 @@ private:
     };
 
     Completion* completion_{};
-    CpuRegistry* cpus_{};
+    Cpus* cpus_{};
     sched::Sc* binding_{};
     mutable sync::Spin lock_{};
     libk::Atomic<bool> ready_{};

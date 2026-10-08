@@ -15,7 +15,7 @@
 #include <wait.hpp>
 #include <sched/sched.hpp>
 
-class CpuRegistry;
+class Cpus;
 class Thread;
 
 namespace ipc {
@@ -45,7 +45,7 @@ public:
     [[nodiscard]] auto take() noexcept
         -> std::expected<NotificationTake, NotificationError>;
     // The caller retains object storage until this blocking call returns.
-    [[nodiscard]] auto wait(Thread&, CpuRegistry&, sched::Dispatcher&, std::optional<time::Instant> deadline = std::nullopt) noexcept
+    [[nodiscard]] auto wait(Thread&, Cpus&, sched::Dispatcher&, std::optional<time::Instant> deadline = std::nullopt) noexcept
         -> WaitResult;
     [[nodiscard]] auto bind(
         NotificationSource& source,

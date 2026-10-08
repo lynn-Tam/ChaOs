@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <uapi/boot_bundle.h>
+#include <kernel/boot/load.h>
 
 namespace {
 
@@ -247,7 +248,7 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
 
 [[nodiscard]] auto pack(
     const std::vector<Module>& modules,
-    std::size_t root_index)
+    std::size_t root_index, bool boot)
     -> std::vector<std::byte> {
     if (modules.empty() || root_index >= modules.size()
         || modules.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -370,6 +371,20 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
     if (output.size() != total_size) {
         throw std::runtime_error("internal bundle size mismatch");
     }
+    if (boot) {
+        const auto& root = modules[root_index].image;
+        for (const auto& seg : root.segments) {
+            append_le(output, seg.virtual_address, 8);
+            append_le(output, image_offsets[root_index] + seg.image_offset, 8);
+            append_le(output, seg.file_size, 8);
+            append_le(output, seg.memory_size, 8);
+            append_le(output, seg.access, 8);
+        }
+        append_le(output, BOOT_LOAD_MAGIC, 8);
+        append_le(output, total_size, 8);
+        append_le(output, root.entry, 8);
+        append_le(output, root.segments.size(), 8);
+    }
     return output;
 }
 
@@ -389,15 +404,17 @@ void write_file(const std::string& path, std::span<const std::byte> bytes) {
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "usage: bootpack OUTPUT.BUNDLE ROOT_NAME "
-                     "NAME=INPUT.ELF... data:NAME=INPUT.BIN...\n";
+                     "[--boot] NAME=INPUT.ELF... data:NAME=INPUT.BIN...\n";
         return 2;
     }
     try {
         const std::string_view root_name{argv[2]};
         std::vector<Module> modules;
+        bool boot{};
         std::size_t root_index = std::numeric_limits<std::size_t>::max();
         for (int index = 3; index < argc; ++index) {
             const std::string_view raw_spec{argv[index]};
+            if (raw_spec == "--boot") { boot = true; continue; }
             const bool data = raw_spec.starts_with("data:")
                 || raw_spec.starts_with("DATA:");
             const std::string_view spec = data ? raw_spec.substr(5)
@@ -438,7 +455,7 @@ int main(int argc, char** argv) {
         if (root_index == std::numeric_limits<std::size_t>::max()) {
             throw std::runtime_error("root module is absent");
         }
-        const std::vector<std::byte> bundle = pack(modules, root_index);
+        const std::vector<std::byte> bundle = pack(modules, root_index, boot);
         write_file(argv[1], bundle);
         std::cout << "bootpack: " << modules.size() << " modules, "
                   << bundle.size() << " bytes\n";

@@ -2,7 +2,7 @@
 
 #include <cpu.hpp>
 #include <libk/assert.hpp>
-#include <cpu/local.hpp>
+#include <cpu/cpu.hpp>
 #include <libk/noncopyable.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync.hpp>
@@ -16,7 +16,7 @@ class PreemptGuard final : private libk::noncopyable_nonmovable {
 public:
     PreemptGuard() noexcept {
         sync::Irq irq{};
-        dispatcher_ = current_cpu().dispatcher();
+        dispatcher_ = &current_cpu().dispatcher();
         libk_assert(dispatcher_ != nullptr);
         dispatcher_->disable_preemption();
     }

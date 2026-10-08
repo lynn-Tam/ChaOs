@@ -8,7 +8,7 @@
 #include <cpu.hpp>
 #include <trap.hpp>
 
-class CpuRegistry;
+class Cpus;
 
 struct PanicSlot final {
     libk::Atomic<bool> stopped{};
@@ -18,7 +18,7 @@ struct PanicSlot final {
     libk::AssertInfo site{};
     arch::StackRegs stack{};
     arch::TrapRegs trap{};
-    CpuRegistry* registry{};
+    Cpus* registry{};
     usize current_thread{};
     usize active_root{};
     usize trap_depth{};

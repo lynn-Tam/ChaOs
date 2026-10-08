@@ -9,8 +9,7 @@
 #include <type_traits>
 #include <stddef.h>
 
-struct CpuLocal;
-struct CpuRuntime;
+struct Cpu;
 struct PanicSlot;
 
 namespace arch {
@@ -45,8 +44,8 @@ inline void io_fence() noexcept { asm volatile("fence iorw, iorw" ::: "memory");
 struct Start {
     u32 ready{}, padding{};
     usize hart{}, root{}, stack{};
-    CpuRuntime* runtime{};
-    void (*entry)(CpuRuntime*, usize) noexcept {};
+    void* arg{};
+    void (*entry)(void*, usize) noexcept {};
 };
 // Only scratch is used before a trusted stack exists. Full registers belong
 // to TrapFrame. IRQs must be masked when changing the current stack.
@@ -55,7 +54,7 @@ struct Scratch {
 };
 struct Entry {
     Scratch scratch{};
-    CpuLocal* owner{};
+    Cpu* owner{};
     usize stack{}, depth{}, emergency_stack{};
     PanicSlot* panic{};
     usize emergency_depth{}, stop{};
@@ -69,7 +68,7 @@ static_assert(offsetof(Start, ready) == CPU_START_READY_OFF);
 static_assert(offsetof(Start, hart) == CPU_START_HART_OFF);
 static_assert(offsetof(Start, root) == CPU_START_ROOT_OFF);
 static_assert(offsetof(Start, stack) == CPU_START_STACK_OFF);
-static_assert(offsetof(Start, runtime) == CPU_START_RUNTIME_OFF);
+static_assert(offsetof(Start, arg) == CPU_START_ARG_OFF);
 static_assert(offsetof(Start, entry) == CPU_START_ENTRY_OFF);
 static_assert(offsetof(Entry, owner) == CPU_ENTRY_OWNER_OFF);
 static_assert(offsetof(Entry, stack) == CPU_ENTRY_STACK_OFF);
@@ -91,11 +90,11 @@ bool disable_interrupts() noexcept;
 void enable_interrupts() noexcept;
 void restore_interrupts(bool enabled) noexcept;
 void wait_for_interrupt() noexcept;
-bool secondary_start_available() noexcept;
 auto start_secondary(CpuHwId, usize entry, usize record) noexcept -> std::expected<void, isize>;
 bool ipi_available() noexcept;
 auto send_ipi(CpuHwId) noexcept -> std::expected<void, isize>;
 void enable_ipi() noexcept;
+void enable_ext_irq() noexcept;
 void acknowledge_ipi() noexcept;
 auto read_clock() noexcept -> time::Instant;
 bool timer_available() noexcept;

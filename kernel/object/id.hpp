@@ -7,13 +7,18 @@ namespace object { class group; }
 namespace ipc { class Endpoint; class Channel; class Notification; }
 class Pager;
 namespace irq { class Irq; }
-namespace io { class Device; class Space; }
- class Thread;
+namespace io { class Host; class Space; }
+class Thread;
 namespace sched { class Sc; class Domain; }
 namespace cap { class CSpace; }
 namespace mm { class Mem; class VSpace; }
 
 namespace object {
+
+template <class...> class store;
+using Objects = store<io::Space, irq::Irq, io::Host, mm::VSpace, mm::Mem, Pager,
+                      cap::CSpace, ipc::Endpoint, ipc::Channel, ipc::Notification,
+                      sched::Domain, sched::Sc, Thread, group>;
 
 enum class ObjectKind : u16 {
     Invalid = OBJECT_KIND_INVALID,
@@ -29,7 +34,7 @@ enum class ObjectKind : u16 {
     Channel = OBJECT_KIND_CHANNEL,
     Pager = OBJECT_KIND_PAGER,
     Irq = OBJECT_KIND_IRQ,
-    Device = OBJECT_KIND_DEVICE,
+    Host = OBJECT_KIND_IO_HOST,
     IoSpace = OBJECT_KIND_IO_SPACE,
     Count = OBJECT_KIND_COUNT,
 };
@@ -41,7 +46,7 @@ template<> inline constexpr ObjectKind kind<ipc::Endpoint> = ObjectKind::Endpoin
 template<> inline constexpr ObjectKind kind<ipc::Channel> = ObjectKind::Channel;
 template<> inline constexpr ObjectKind kind<Pager> = ObjectKind::Pager;
 template<> inline constexpr ObjectKind kind<irq::Irq> = ObjectKind::Irq;
-template<> inline constexpr ObjectKind kind<io::Device> = ObjectKind::Device;
+template<> inline constexpr ObjectKind kind<io::Host> = ObjectKind::Host;
 template<> inline constexpr ObjectKind kind<io::Space> = ObjectKind::IoSpace;
 template<> inline constexpr ObjectKind kind<ipc::Notification> = ObjectKind::Notification;
 template<> inline constexpr ObjectKind kind<Thread> = ObjectKind::Thread;

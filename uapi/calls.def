@@ -95,11 +95,9 @@ CALL(PAGER_BIND, 141, pg_call, Any, Call) /* a0=pager, a1=Notification, a2=badge
 
 /* Binding starts asynchronously. STATE reports progress; close commits teardown
  * and keeps the device unavailable until BAR/IRQ and DMA retirement complete. */
-CALL(IO_SPACE_BIND, 144, io_call, Any, Call) /* a0=IOSpace, a1=Device, a2=Memory, a3=first page, a4=page count, a5=IOVA */
+CALL(IO_SPACE_BIND, 144, io_call, Any, Call) /* a0=IOSpace, a1=single-requester Host, a2=Memory, a3=first page, a4=page count, a5=IOVA */
 CALL(IO_SPACE_STATE, 145, io_call, Any, Call) /* a0=IOSpace; returns IoState */
-CALL(IO_SPACE_INFO, 146, io_call, Any, Call) /* a0=IOSpace, a1=registered IPC buffer offset; writes IoInfo */
-CALL(IO_SPACE_BAR, 147, io_call, Any, Call) /* a0=IOSpace, a1=BAR index; returns bounded Memory capability */
+CALL(IO_SPACE_REG, 147, io_call, Any, Call) /* a0=IOSpace, a1=register index; returns bounded Memory capability and byte size */
 CALL(IO_SPACE_IRQ, 148, io_call, Any, Call) /* a0=IOSpace; returns generation Irq capability */
 CALL(IO_SPACE_CLOSE, 149, io_call, Any, Call) /* a0=IOSpace */
-CALL(DEVICE_INFO, 150, io_call, Any, Call) /* a0=Device, a1=registered IPC buffer offset; writes DeviceDesc */
 CALL(IO_SPACE_WATCH, 151, io_call, Any, Call) /* a0=IOSpace, a1=Notification, a2=badge; before bind */

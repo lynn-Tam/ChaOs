@@ -18,14 +18,13 @@
 #include <mm/vspace.hpp>
 #include <object/ref.hpp>
 #include <wait.hpp>
-#include <ipc/transfer.hpp>
+#include <cap/cspace.hpp>
 #include <resource/sponsorship.hpp>
-#include <sched/sched.hpp>
 #include <sched/sched.hpp>
 #include <time/time.hpp>
 #include <uapi/ipc.h>
 
-class CpuRegistry;
+class Cpus;
 class Thread;
 
 namespace sched {
@@ -135,8 +134,7 @@ private:
     [[nodiscard]] auto cancel() noexcept -> bool;
     static void revoke(
         void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
+        cap::GrantWork&& work) noexcept;
     static void grant_done(void* context) noexcept;
     void expire() noexcept;
 
@@ -155,11 +153,11 @@ private:
     usize urgency_{};
     usize badge_{};
     usize receive_limit_{};
-    Transfer::Specs request_caps_{};
-    Transfer::Handles installed_caps_{};
-    Transfer transfer_{};
+    cap::Batch::Specs request_caps_{};
+    cap::Batch::Handles installed_caps_{};
+    cap::Batch transfer_{};
     isize cancel_status_{STATUS_CANCELED};
-    CpuRegistry* cpus_{};
+    Cpus* cpus_{};
     usize publishers_{};
     bool cancel_pending_{};
     State state_{State::Free};
@@ -197,7 +195,7 @@ public:
         Thread& caller,
         arch::TrapCtx& trap,
         sched::Dispatcher& dispatcher,
-        CpuRegistry& cpus,
+        Cpus& cpus,
         const usize (&arguments)[3],
         std::optional<time::Instant> deadline) noexcept
         -> std::expected<void, EndpointError>;
@@ -247,15 +245,15 @@ private:
     [[nodiscard]] auto snapshot_caps(
         const Buffer* buffer,
         usize limit,
-        Transfer::Specs& specs,
+        cap::Batch::Specs& specs,
         usize& receive_limit) noexcept -> bool;
     [[nodiscard]] auto commit_caps(
-        Transfer& transfer,
+        cap::Batch& transfer,
         cap::CSpace& source,
         cap::CSpace& destination,
-        const Transfer::Specs& specs,
+        const cap::Batch::Specs& specs,
         Buffer* receiver,
-        Transfer::Handles& installed) noexcept -> bool;
+        cap::Batch::Handles& installed) noexcept -> bool;
     void close_installed(Call& call) noexcept;
     [[nodiscard]] auto finish_active(
         Activation& activation,

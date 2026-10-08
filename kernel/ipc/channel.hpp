@@ -15,7 +15,7 @@
 #include <sync.hpp>
 #include <uapi/ipc.h>
 
-class CpuRegistry;
+class Cpus;
 class Thread;
 
 namespace ipc {
@@ -233,7 +233,7 @@ public:
     // keeps Wait alive through transfer and result publication.
     [[nodiscard]] auto wait(
         cap::Resolved<Channel>&& cap, Wait& waiter, Wait::Kind kind,
-        Thread& thread, CpuRegistry& cpus) noexcept
+        Thread& thread, Cpus& cpus) noexcept
         -> std::expected<void, ChannelError>;
     [[nodiscard]] auto close(
         cap::Resolved<Channel>& cap) noexcept
@@ -275,22 +275,19 @@ public:
 private:
     static void invalidate(
         void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
+        cap::GrantWork&& work) noexcept;
     static void released(void* context) noexcept;
     void invalidated(GrantLink& link, cap::GrantWork&& work) noexcept;
     void relation_released(Relation& relation) noexcept;
     static void invalidate_side(
         void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
+        cap::GrantWork&& work) noexcept;
     static void release_side(void* context) noexcept;
     void side_invalidated(SideLink& link, cap::GrantWork&& work) noexcept;
     void side_released(SideLink& link) noexcept;
     static void invalidate_waiter(
         void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
+        cap::GrantWork&& work) noexcept;
     static void release_waiter(void* context) noexcept;
     void waiter_invalidated(Waiter& waiter, cap::GrantWork&& work) noexcept;
     void drop_waiter(Waiter& waiter) noexcept;

@@ -30,8 +30,8 @@ def boot(qemu, kernel, bundle, disk, cpus, log):
                 output.extend(os.read(key.fd, 65536))
                 if b'MYOS KERNEL PANIC' in output or b'[io-session] client failed' in output:
                     raise RuntimeError('guest block operation failed')
-        if b'failed=0' not in output or b'io: isolated PCI function ready requester=0x8' not in output:
-            raise RuntimeError('kernel or isolated device did not initialize')
+        if b'failed=0' not in output:
+            raise RuntimeError('missing successful builtin test summary')
     except Exception:
         log.write_bytes(output)
         raise

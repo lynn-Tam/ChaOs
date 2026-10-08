@@ -1,15 +1,15 @@
 #include <expected>
 #include <optional>
-#include <platform/riscv-virt/board.hpp>
 #include <object/pool.hpp>
 #include <boot/info.hpp>
-#include <boot/bundle.hpp>
+#include <boot/load.h>
+#include <libk/byte_reader.hpp>
 #include <cap/cap.hpp>
 #include <cap/cspace.hpp>
 #include <cpu.hpp>
-#include <state.hpp>
+#include <boot/start.hpp>
 #include <console.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/mem.h>
 #include <libk/sync/atomic.hpp>
@@ -25,6 +25,44 @@
 #include <task/env.hpp>
 #include <task/thread.hpp>
 #include <uapi/start.h>
+
+// The kernel loads one execution. Application names and deployment belong to root.
+struct Init {
+    usize entry{}, payload{};
+    libk::ByteSpan loads{};
+};
+
+static auto read_init(libk::ByteSpan bytes) noexcept -> std::optional<Init> {
+    if (bytes.size() < BOOT_LOAD_TRAILER) return {};
+    const auto end = bytes.size() - BOOT_LOAD_TRAILER;
+    libk::ByteReader r{bytes.data() + end, BOOT_LOAD_TRAILER};
+    u64 magic{}, payload{}, entry{}, count{};
+    if (!r.read_le64(magic) || !r.read_le64(payload) || !r.read_le64(entry) ||
+        !r.read_le64(count) || magic != BOOT_LOAD_MAGIC || !payload || payload > end ||
+        !count || count != (end - payload) / BOOT_LOAD_SIZE ||
+        (end - payload) % BOOT_LOAD_SIZE) return {};
+    return Init{entry, payload, bytes.slice(payload, end - payload)};
+}
+
+struct Load {
+    usize va{}, size{};
+    libk::ByteSpan file{};
+    mm::Perms perms{};
+};
+
+static auto read_load(libk::ByteReader& r, libk::ByteSpan payload) noexcept
+    -> std::optional<Load> {
+    u64 va{}, off{}, file{}, size{}, bits{};
+    if (!r.read_le64(va) || !r.read_le64(off) || !r.read_le64(file) ||
+        !r.read_le64(size) || !r.read_le64(bits) || !size || file > size ||
+        off > payload.size() || file > payload.size() - off ||
+        va % mm::page_size || va < mm::UserBegin || va >= mm::UserEnd ||
+        size > mm::UserEnd - va || bits > 7) return {};
+    const auto perms = mm::Perms::from_raw(static_cast<u8>(bits));
+    if (!mm::valid_perms(perms) ||
+        (perms.contains(mm::Perm::Write) && perms.contains(mm::Perm::Execute))) return {};
+    return Load{va, size, payload.slice(off, file), perms};
+}
 
 constexpr usize root_stack_pages = 8;
 constexpr mm::Virt root_ipc_address{BOOT_ROOT_IPC_ADDRESS};
@@ -88,12 +126,12 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
     return mapped && mapped.value().status == mm::VmStatus::Complete;
 }
 
-[[nodiscard]] static auto install_cap(KernelState& kernel, cap::CSpace& cspace,
+[[nodiscard]] static auto install_cap(cap::Graph& grants, cap::CSpace& cspace,
                                       resource::Reservation&& charge, object::ref<>&& object,
                                       cap::Rights rights, cap::Limits limit = {}) noexcept
     -> std::expected<cap::Handle, BootErr> {
     auto grant =
-        kernel.grants().create_root(std::move(charge), std::move(object), cap::View{rights, limit});
+        grants.create_root(std::move(charge), std::move(object), cap::View{rights, limit});
     if (!grant) {
         return std::unexpected(BootErr::CapabilityFailed);
     }
@@ -105,13 +143,13 @@ constexpr mm::Virt root_stack_address{root_info_address.raw() - mm::page_size - 
 // First user thread only. Failure aborts boot; this is not a process service
 // with an unload/retry protocol. Successful publication transfers ownership to
 // capabilities, mappings and the scheduler before these local refs are dropped.
-auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
+auto boot_root(Boot& boot, Cpu& runtime, BootModule module,
                mm::BootPages&& reservation) noexcept -> std::expected<void, BootErr> {
-    auto parent = kernel.clone_root_pool();
+    auto parent = boot.root.clone();
     if (!parent)
         return std::unexpected(BootErr::InvalidState);
     auto pool = std::move(parent).value();
-    auto& pmm = kernel.pmm();
+    auto& pmm = boot.pmm;
 
     if (!pool || !module || !module.physical.is_aligned(mm::page_size) ||
         module.pages.base().base() != module.physical || !reservation ||
@@ -123,12 +161,13 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
     if (!source) {
         return std::unexpected(BootErr::InvalidModule);
     }
-    const auto parsed = parse_bundle(libk::ByteSpan{source.value(), module.size});
+    const auto parsed = read_init(libk::ByteSpan{source.value(), module.size});
     if (!parsed) {
         return std::unexpected(BootErr::InvalidBundle);
     }
 
-    const BootBundle& package = *parsed;
+    const Init& init = *parsed;
+    const libk::ByteSpan payload{source.value(), init.payload};
     object::ref<mm::Mem> bundle_mem;
     {
         auto adopted = pmm.adopt(std::move(reservation));
@@ -150,7 +189,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!sponsorship) {
             return std::unexpected(BootErr::OutOfMemory);
         }
-        auto image = kernel.pool<mm::Mem>().create(std::move(sponsorship).value(), pmm, size,
+        auto image = boot.objects.get<mm::Mem>().create(std::move(sponsorship).value(), pmm, size,
                                                    mm::PhysCfg{{&extent, 1}, std::move(pages)});
         if (!image) {
             return std::unexpected(BootErr::OutOfMemory);
@@ -185,7 +224,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!self)
             return std::unexpected(BootErr::InvalidState);
         auto txn = pool->begin(std::move(*self));
-        if (!txn || !txn->adopt(kernel.grants(), std::move(ref), view))
+        if (!txn || !txn->adopt(boot.grants, std::move(ref), view))
             return std::unexpected(BootErr::CapabilityFailed);
         if (space) {
             auto slots = txn->publish(*space, std::array{view});
@@ -203,7 +242,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         auto charge = reserve(budget);
         if (!charge)
             return false;
-        auto pending = kernel.pool<T>().create(std::move(charge).value(),
+        auto pending = boot.objects.get<T>().create(std::move(charge).value(),
                                                std::forward<decltype(args)>(args)...);
         if (!pending)
             return false;
@@ -217,45 +256,47 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         }
         return true;
     };
-    const CpuId cpu = runtime.local.descriptor->logical_id();
+    const CpuId cpu = runtime.id;
 
-    if (!create(vspace, charge_pages(64), pmm, kernel.kernel_vspace(), kernel.space_work()) ||
+    if (!create(vspace, charge_pages(64), pmm, boot.vm, boot.work) ||
         !create(cspace, charge_pages(17, (mm::page_size - sizeof(BootHdr)) / sizeof(BootCap)), pmm))
         return std::unexpected(BootErr::OutOfMemory);
     {
         const mm::VRange stack_range{root_stack_address, root_stack_size};
         const mm::VRange info_range{root_info_address, mm::page_size};
-        for (usize index = 0; index < package.segment_count(); ++index) {
-            auto decoded = package.segment(index);
-            if (!decoded) {
+        libk::ByteReader loads{init.loads.data(), init.loads.size()};
+        usize end{};
+        bool entry_ok{};
+        while (loads.remaining()) {
+            const auto seg = read_load(loads, payload);
+            if (!seg) return std::unexpected(BootErr::InvalidBundle);
+            const auto size = page_round(seg->size);
+            if (!size || seg->va < end || *size > mm::UserEnd - seg->va)
                 return std::unexpected(BootErr::InvalidBundle);
-            }
-            const BundleSegment segment = decoded.value();
-            const auto size = page_round(segment.memory_size);
-            if (!size) {
-                return std::unexpected(BootErr::InvalidBundle);
-            }
-            const mm::VRange range{mm::Virt{segment.virtual_address}, *size};
+            end = seg->va + *size;
+            entry_ok |= init.entry >= seg->va && init.entry - seg->va < seg->size &&
+                        seg->perms.contains(mm::Perm::Execute);
+            const mm::VRange range{mm::Virt{seg->va}, *size};
             if (range.intersects(stack_range) || range.intersects(info_range) ||
-                range.intersects(mm::VRange{root_ipc_address, mm::page_size})) {
+                range.intersects(mm::VRange{root_ipc_address, mm::page_size}))
                 return std::unexpected(BootErr::InvalidBundle);
-            }
             object::ref<mm::Mem> hold;
             if (!create(hold, charge_pages(1 + *size / mm::page_size), pmm, *size,
-                        mm::AnonCfg{.perms = segment.perms, .eager = true}))
+                        mm::AnonCfg{.perms = seg->perms, .eager = true}))
                 return std::unexpected(BootErr::OutOfMemory);
-            if (!write_memory(kernel.pmm(), hold.get(), segment.file)) {
+            if (!write_memory(boot.pmm, hold.get(), seg->file)) {
                 return std::unexpected(BootErr::OutOfMemory);
             }
-            if (segment.perms.contains(mm::Perm::Execute) && !hold->seal()) {
+            if (seg->perms.contains(mm::Perm::Execute) && !hold->seal()) {
                 return std::unexpected(BootErr::InvalidState);
             }
-            if (!map_memory(vspace.get(), cpu, hold, mm::Virt{segment.virtual_address},
-                            segment.perms)) {
+            if (!map_memory(vspace.get(), cpu, hold, mm::Virt{seg->va},
+                            seg->perms)) {
                 return std::unexpected(BootErr::MappingFailed);
             }
             // The mapping now owns the segment; no boot-side lifetime mirror.
         }
+        if (!entry_ok) return std::unexpected(BootErr::InvalidBundle);
     }
 
     const auto rw = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
@@ -278,7 +319,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!thread_charge || !kernel_stack_charge)
             return std::unexpected(BootErr::OutOfMemory);
         auto stack_capacity = std::move(kernel_stack_charge).value();
-        auto home = mm::Stack::create(kernel.kernel_vspace());
+        auto home = mm::Stack::create(boot.vm);
         auto execution_vspace = vspace.erase();
         auto execution_cspace = cspace.erase();
         if (!home || !execution_vspace || !execution_cspace)
@@ -287,7 +328,7 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!ipc_reference)
             return std::unexpected(BootErr::InvalidState);
         auto ipc_buffer = ipc::Buffer::bind(
-            kernel.pmm(), vspace.get(), std::move(ipc_reference).value(), ipc_mem.get(),
+            boot.pmm, vspace.get(), std::move(ipc_reference).value(), ipc_mem.get(),
             mm::ObjectRange{0, 1}, mm::VRange{root_ipc_address, mm::page_size});
         if (!ipc_buffer)
             return std::unexpected(BootErr::MappingFailed);
@@ -296,11 +337,11 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
                       std::move(ipc_buffer).value());
         if (!execution)
             return std::unexpected(BootErr::InvalidState);
-        auto pending_thread = kernel.pool<Thread>().create(
+        auto pending_thread = boot.objects.get<Thread>().create(
             std::move(thread_charge).value(), std::move(stack_capacity).commit(),
             std::move(home).value(), std::move(execution).value(),
             Thread::UserStart{
-                .entry = mm::Virt{package.entry()},
+                .entry = mm::Virt{init.entry},
                 .stack = mm::Virt{root_stack_address.raw() + root_stack_size},
                 .arguments = {root_info_address.raw(), mm::page_size},
             });
@@ -315,15 +356,15 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
         if (!info_lease)
             return std::unexpected(BootErr::OutOfMemory);
         auto& info_page = *libk::construct_at(
-            reinterpret_cast<BootHdr*>(kernel.pmm().bytes(info_lease.value().page())));
+            reinterpret_cast<BootHdr*>(boot.pmm.bytes(info_lease.value().page())));
         info_page.magic = BOOT_MAGIC;
         info_page.major = BOOT_MAJOR;
         info_page.minor = BOOT_MINOR;
         info_page.size = sizeof(BootHdr);
-        info_page.cpu_count = kernel.cpus().count();
+        info_page.cpu_count = boot.cpus.count();
         info_page.stack_base = root_stack_address.raw();
         info_page.stack_size = root_stack_size;
-        info_page.boot_bundle_size = module.size;
+        info_page.boot_bundle_size = init.payload;
         auto* entries = reinterpret_cast<BootCap*>(&info_page + 1);
         auto publish = [&](BootCap entry, object::ref<>&& ref, cap::View view,
                            bool owned) noexcept -> bool {
@@ -332,10 +373,10 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
             auto installed = [&]() -> std::expected<cap::Handle, BootErr> {
                 if (owned)
                     return own(std::move(ref), view, &cspace.get());
-                auto charge = reserve(kernel.grants().node_charge());
+                auto charge = reserve(boot.grants.node_charge());
                 if (!charge)
                     return std::unexpected(charge.error());
-                return install_cap(kernel, cspace.get(), std::move(*charge), std::move(ref),
+                return install_cap(boot.grants, cspace.get(), std::move(*charge), std::move(ref),
                                    view.rights, view.data);
             }();
             if (!installed)
@@ -382,11 +423,11 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
             .object_kinds = resource_kinds,
         };
 
-        auto borrow = [&](BootCap entry, object::ref<>&& ref, cap::View view) noexcept {
-            return publish(entry, std::move(ref), view, false);
-        };
-        if (!virt_caps(BootCaps::bind(borrow)))
-            return std::unexpected(BootErr::CapabilityFailed);
+        for (const auto& res : boot.resources) {
+            auto ref = res.object.clone();
+            if (!ref || !publish(res.entry, std::move(ref).value(), res.view, false))
+                return std::unexpected(BootErr::CapabilityFailed);
+        }
 
         if (!add_cap(BOOT_VSPACE, vspace.erase(), vspace_rights, vm_limit) ||
             !add_cap(BOOT_CSPACE, cspace.erase(), cspace_rights) ||
@@ -399,24 +440,24 @@ auto boot_root(KernelState& kernel, CpuRuntime& runtime, BootModule module,
             return std::unexpected(BootErr::CapabilityFailed);
         }
 
-        const auto budget = kernel.clock().duration_from_nanoseconds(2'000'000);
-        const auto period = kernel.clock().duration_from_nanoseconds(10'000'000);
+        const auto budget = boot.clock.duration_from_nanoseconds(2'000'000);
+        const auto period = boot.clock.duration_from_nanoseconds(10'000'000);
         const auto urgency = sched::Urgency::make(20);
         if (!budget || !period || !urgency) {
             return std::unexpected(BootErr::SchedulingFailed);
         }
         if (!create(sc, charge_pages(1),
                     sched::Sc::Config{.budget = *budget, .period = *period, .urgency = *urgency},
-                    kernel.clock().now()))
+                    boot.clock.now()))
             return std::unexpected(BootErr::OutOfMemory);
         if (!add_cap(BOOT_SC, sc.erase(), basic_rights) ||
-            !add_cap(BOOT_DOMAIN, kernel.kernel_domain_ref(), basic_rights, {}, false)) {
+            !add_cap(BOOT_DOMAIN, boot.domain.erase(), basic_rights, {}, false)) {
             return std::unexpected(BootErr::CapabilityFailed);
         }
     }
 
     auto target = thread.clone();
-    const auto admitted = kernel.kernel_domain().admit(sc.get(), cpu);
+    const auto admitted = boot.domain.get().admit(sc.get(), cpu);
     if (!admitted || !target || !sc->bind(std::move(target).value())) {
         return std::unexpected(BootErr::SchedulingFailed);
     }

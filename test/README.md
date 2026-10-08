@@ -92,28 +92,15 @@ reported as `[FAIL] group: name`.
 - byte ranges state their page rounding
 - FDT memory reservations stay within their block
 
-## boot-bundle
+## boot and CPU
 
-- valid manifest is a bounded borrowed view
-- bad envelope is rejected before materialization
-- writable executable segment is rejected
-
-## cpu-topology
-
-- sparse IDs and firmware statuses populate canonical descriptors
-- malformed CPU nodes are rejected
-- boot hart matching requires one enabled entry
-- builder rejects duplicate IDs and incomplete population
-- record blocks cross legacy continuous-array thresholds
-- logical CPU namespace has one explicit bound
-- each stack/object allocation failure leaves runtime unpublished
-- runtime metadata exhaustion leaves association unpublished
-- secondary prepare failure preserves the prepared boot CPU
-- prepare publishes one descriptor-backed CpuRuntime
-- lifecycle publication and snapshots derive from canonical states
+- bootpack output is compared with ELF bytes, permissions, BSS and page tails
+- the boot-only load suffix matches the root ELF; filesystem packages omit it
+- real multi-hart runs validate CPU online publication and scheduling
 - shootdown acknowledgement controls detached-page retirement
-- Typed references retain retiring objects until final release
-- Remote scheduler mail coalesces actions and retains work through delivery
+- typed references retain retiring objects until final release
+- remote scheduler mail coalesces actions and retains work through delivery
+- panic probes exercise peer stop and snapshot collection
 
 ## sched
 

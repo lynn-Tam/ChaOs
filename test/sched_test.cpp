@@ -10,7 +10,7 @@
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <mm/pager.hpp>
-#include <boot/link.hpp>
+#include <boot/info.hpp>
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
 #include <sched/sched.hpp>
@@ -37,11 +37,9 @@ alignas(mm::page_size) byte
 constinit libk::ManualLifetime<mm::RegionList> sched_test_memory_map{};
 constinit libk::ManualLifetime<mm::Pmm> sched_test_pmm{};
 constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> sched_test_mm{};
-constinit libk::delegate<void() noexcept> sched_test_notify{};
+constinit libk::ManualLifetime<WorkQueue> sched_work{};
 constinit libk::ManualLifetime<object::store<Thread, object::group>> sched_test_tasks{};
 constinit libk::ManualLifetime<object::store<sched::Domain, sched::Sc>> sched_test_sched{};
-constinit libk::ManualLifetime<mm::SpaceWork>
-    sched_test_vspace_work{};
 constinit libk::ManualLifetime<mm::KSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
@@ -52,7 +50,8 @@ public:
     ~SchedStorageGuard() noexcept { reset(); }
 
     [[nodiscard]] auto initialize() noexcept -> bool {
-        const auto physical = kernel_phys(mm::Virt{
+        (void)sched_work.emplace();
+        const auto physical = boot_layout.phys(mm::Virt{
             reinterpret_cast<usize>(sched_test_ram)});
         if (!physical) {
             return false;
@@ -85,12 +84,11 @@ public:
             reset();
             return false;
         }
-        (void)sched_test_kernel.emplace(*sched_test_pmm, std::move(*builder), kernel_begin().raw());
-        (void)sched_test_vspace_work.emplace();
+        (void)sched_test_kernel.emplace(*sched_test_pmm, std::move(*builder), mm::Virt{boot_layout.va}.raw());
         [[maybe_unused]] auto& memory =
-            sched_test_mm.emplace(*sched_test_pmm, sched_test_notify);
-        (void)sched_test_tasks.emplace(*sched_test_pmm, sched_test_notify);
-        (void)sched_test_sched.emplace(*sched_test_pmm, sched_test_notify);
+            sched_test_mm.emplace(*sched_test_pmm, *sched_work);
+        (void)sched_test_tasks.emplace(*sched_test_pmm, *sched_work);
+        (void)sched_test_sched.emplace(*sched_test_pmm, *sched_work);
         return true;
     }
 
@@ -99,8 +97,8 @@ private:
         sched_test_mm.reset();
         sched_test_sched.reset();
         sched_test_tasks.reset();
-        sched_test_vspace_work.reset();
         sched_test_kernel.reset();
+        sched_work.reset();
         sched_test_pmm.reset();
         sched_test_memory_map.reset();
     }
@@ -337,9 +335,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
     if (pool->sponsorship_count() != 1 || pool->available() == limit) {
         return false;
     }
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     if (pool->sponsorship_count() != 0
         || pool->available() != limit
         || pool->close() != object::group::phase::closed
@@ -348,9 +344,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
     pool.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     return sched_test_pmm->verify_invariants();
 }
 
@@ -423,17 +417,13 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
     memory.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     if (child->close() != object::group::phase::closed
         || !child->can_retire() || !child.retire()) {
         return false;
     }
     child.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     if (parent->available() != parent_limit
         || parent->sponsorship_count() != 0
         || parent->close() != object::group::phase::closed
@@ -441,9 +431,7 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
     parent.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     return sched_test_pmm->verify_invariants();
 }
 
@@ -502,9 +490,7 @@ bool test_resource_pool_close_waits_for_open_transactions(
         return false;
     }
     txn_pool.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
 
     auto pending_reservation_pool = sched_test_tasks->get<object::group>().create(*sched_test_pmm, limit);
     if (!pending_reservation_pool) {
@@ -529,9 +515,7 @@ bool test_resource_pool_close_waits_for_open_transactions(
         return false;
     }
     reservation_pool.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
 
     return sched_test_pmm->verify_invariants();
 }
@@ -653,9 +637,7 @@ bool test_domain_admission_is_conservative_and_transactional(
         return false;
     }
     domain.reset();
-    sched_test_mm->drain();
-    sched_test_sched->drain();
-    sched_test_tasks->drain();
+    while (sched_work->run()) {}
     return result && wide_valid && sched_test_pmm->verify_invariants();
 }
 

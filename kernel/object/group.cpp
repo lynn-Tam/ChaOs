@@ -7,7 +7,7 @@
 #include <sched/sc.hpp>
 #include <task/thread.hpp>
 
-#include <cap/graph.hpp>
+#include <cap/grant.hpp>
 #include <panic.hpp>
 #include <limits>
 #include <utility>
@@ -199,7 +199,7 @@ group::group(mm::Pmm& pmm, budget limit) noexcept
       allocations_(pmm) {}
 
 auto group::allocation_charge() noexcept -> budget {
-    return budget{.memory = cap::GrantGraph::node_charge().memory
+    return budget{.memory = cap::Graph::node_charge().memory
         + decltype(allocations_)::slot_size()};
 }
 
@@ -380,7 +380,7 @@ void group::target_ready(allocation& allocation) noexcept {
 }
 
 void group::close_allocation(allocation& allocation) noexcept {
-    cap::GrantGraph* graph{};
+    cap::Graph* graph{};
     {
         sync::Lock guard{lock_};
         libk_assert(allocation.owner_ == this);
@@ -397,7 +397,7 @@ void group::close_allocation(allocation& allocation) noexcept {
 }
 
 void group::child_closed(allocation& allocation) noexcept {
-    cap::GrantGraph* graph{};
+    cap::Graph* graph{};
     {
         sync::Lock guard{lock_};
         libk_assert(allocation.owner_ == this);
@@ -775,7 +775,7 @@ void allocation::stop() noexcept {
     case object::ObjectKind::Domain:
     case object::ObjectKind::CSpace:
     case object::ObjectKind::IoSpace:
-    case object::ObjectKind::Device:
+    case object::ObjectKind::Host:
     case object::ObjectKind::Mem:
     case object::ObjectKind::VSpace:
     case object::ObjectKind::Notification:
@@ -849,7 +849,7 @@ void group::Txn::Drop::operator()(Data& d) const noexcept {
     d.owner->finish();
 }
 
-auto group::Txn::adopt(cap::GrantGraph& graph, ref<>&& target, cap::View ceiling) noexcept
+auto group::Txn::adopt(cap::Graph& graph, ref<>&& target, cap::View ceiling) noexcept
     -> std::expected<void, cap::GrantError> {
     libk_assert(h_ && h_.get().item && !h_.get().root);
     const auto& d = h_.get();
@@ -865,7 +865,7 @@ void group::Txn::own(ref<>&& target) noexcept {
     h_.get().item->target_ = std::move(target);
 }
 
-auto group::Txn::root(cap::GrantGraph& graph, cap::View ceiling) noexcept
+auto group::Txn::root(cap::Graph& graph, cap::View ceiling) noexcept
     -> std::expected<void, cap::GrantError> {
     libk_assert(h_ && h_.get().item && !h_.get().root);
     auto& item = *h_.get().item;
@@ -894,7 +894,7 @@ auto group::Txn::derive(cap::GrantLease& root, cap::View view) noexcept
     const auto& d = h_.get();
     auto self = d.self.clone();
     if (!self) return std::unexpected(cap::GrantError::InvalidState);
-    auto fee = d.owner->reserve(std::move(*self), cap::GrantGraph::node_charge());
+    auto fee = d.owner->reserve(std::move(*self), cap::Graph::node_charge());
     if (!fee) return std::unexpected(fee.error());
     auto target = d.item->target_.clone();
     if (!target) return std::unexpected(cap::GrantError::InvalidState);

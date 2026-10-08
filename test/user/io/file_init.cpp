@@ -1,3 +1,4 @@
+#include <sys/pci.hpp>
 #include <utility>
 #include <servers/runtime/service.hpp>
 #include <sys/handle.hpp>
@@ -18,6 +19,11 @@ deploy::tasks<TaskCount> supervisor;
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
     const auto info = service::bootstrap(address, size);
+    auto pci = sys::pci::Bus::open(info, 0x3100'0000);
+    if (!pci) exit(pci.error());
+    service::require(pci->configure(0x1042'1af4));
+    auto selected = pci->find(0x1042'1af4, 0);
+    if (!selected) sys::exit(selected.error());
     auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
         cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
         0x30010000, 4096, VM_READ | VM_WRITE);
@@ -28,8 +34,8 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     service::require(supervisor.load(program, info));
     supervisor.open(info);
     service::require(supervisor.add_boot_sources(info));
-    service::require(supervisor.add("block.device", service::initial_device(info),
-        OBJECT_KIND_DEVICE, RIGHT_DUPLICATE | RIGHT_CONNECT));
+    service::require(supervisor.add("block.host", selected->cap.selector(),
+        OBJECT_KIND_IO_HOST, RIGHT_DUPLICATE | RIGHT_CONNECT, selected->rid, 1));
     constexpr const char* sources[][2] = {
         {"block.client", "block.server"}, {"files.client", "files.server"}};
     cap::OwnedCap endpoints[4];

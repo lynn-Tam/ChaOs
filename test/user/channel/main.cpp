@@ -205,7 +205,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             check(arguments.append("writer", 6) && arguments.append(&number, 1));
             status_t status{};
             auto task = supervisor.launch(program, Supervisor::name("writer"), status,
-                {.arguments = &arguments, .terminal_events = terminal.value, .sources = sources});
+                {.arguments = &arguments, .exit_events = terminal.value, .sources = sources});
             require(status); check(static_cast<bool>(task));
             tasks[i] = std::move(*task);
         }

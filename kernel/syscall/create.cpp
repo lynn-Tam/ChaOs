@@ -4,9 +4,9 @@
 #include <syscall/call.hpp>
 
 #include <cap/cap.hpp>
-#include <state.hpp>
-#include <cpu/local.hpp>
-#include <cpu/runtime.hpp>
+#include <object/pool.hpp>
+#include <object/group.hpp>
+#include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/inplace_vector.hpp>
 #include <utility>
@@ -28,27 +28,9 @@
 #include <uapi/cap.h>
 #include <mm/pager.hpp>
 #include <irq/irq.hpp>
+#include <io/space.hpp>
 
 namespace syscall {
-
-static_assert(OBJ_BIT(OBJECT_KIND_THREAD) == (u64{1} << static_cast<u16>(object::ObjectKind::Thread)));
-static_assert(OBJ_BIT(OBJECT_KIND_SCHED_CONTEXT) == (u64{1} << static_cast<u16>(object::ObjectKind::Sc)));
-static_assert(OBJ_BIT(OBJECT_KIND_CSPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::CSpace)));
-static_assert(OBJ_BIT(OBJECT_KIND_MEMORY) == (u64{1} << static_cast<u16>(object::ObjectKind::Mem)));
-static_assert(OBJ_BIT(OBJECT_KIND_VSPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::VSpace)));
-static_assert(OBJ_BIT(OBJECT_KIND_RESOURCE_POOL) == (u64{1} << static_cast<u16>(object::ObjectKind::group)));
-static_assert(OBJ_BIT(OBJECT_KIND_NOTIFICATION) == (u64{1} << static_cast<u16>(object::ObjectKind::Notification)));
-static_assert(OBJ_BIT(OBJECT_KIND_ENDPOINT) == (u64{1} << static_cast<u16>(object::ObjectKind::Endpoint)));
-static_assert(OBJ_BIT(OBJECT_KIND_CHANNEL) == (u64{1} << static_cast<u16>(object::ObjectKind::Channel)));
-static_assert(OBJ_BIT(OBJECT_KIND_PAGER) == (u64{1} << static_cast<u16>(object::ObjectKind::Pager)));
-static_assert(OBJ_BIT(OBJECT_KIND_IRQ) == (u64{1} << static_cast<u16>(object::ObjectKind::Irq)));
-static_assert(OBJ_BIT(OBJECT_KIND_IO_SPACE) == (u64{1} << static_cast<u16>(object::ObjectKind::IoSpace)));
-
-using object::ObjectKind;
-
-[[nodiscard]] static constexpr auto kind_bit(ObjectKind kind) noexcept -> u64 {
-    return u64{1} << static_cast<u16>(kind);
-}
 
 [[nodiscard]] static auto pool_quota(const cap::Resolved<object::group>& pool) noexcept
     -> std::optional<cap::Quota> {
@@ -97,12 +79,11 @@ using object::ObjectKind;
 template <class T, usize N = 1>
 static auto begin_create(Call& inv, cap::Resolved<object::group>& pool, resource::budget limit) noexcept
     -> std::expected<object::group::Txn, status_t> {
-    auto& kernel = *inv.cpu.runtime().kernel;
     const auto quota = pool_quota(pool);
     std::optional<resource::budget> publication = object::group::allocation_charge();
     for (usize i = 0; i < N && publication; ++i)
-        publication = add_budget(*publication, kernel.grants().node_charge());
-    if (!quota || !(quota->object_kinds & kind_bit(object::kind<T>)) || !quota->budget.contains(limit) ||
+        publication = add_budget(*publication, inv.cpu.grants.node_charge());
+    if (!quota || !(quota->object_kinds & OBJ_BIT(static_cast<u16>(object::kind<T>))) || !quota->budget.contains(limit) ||
         !publication || !quota->budget.contains(*publication))
         return std::unexpected(STATUS_DENIED);
     auto txn = begin(pool);
@@ -175,7 +156,7 @@ template<class Pages>
     return STATUS_INTERNAL;
 }
 
-[[nodiscard]] static auto bind_ipc(KernelState& kernel, cap::Resolved<mm::VSpace>& vspace,
+[[nodiscard]] static auto bind_ipc(Call& inv, cap::Resolved<mm::VSpace>& vspace,
                                    cap::Resolved<mm::Mem>& memory,
                                    const IpcBinding& desc) noexcept
     -> std::expected<ipc::Buffer, status_t> {
@@ -196,13 +177,13 @@ template<class Pages>
     if (!reference) {
         return std::unexpected(STATUS_BUSY);
     }
-    auto buffer = ipc::Buffer::bind(kernel.pmm(), vspace.object(), std::move(reference).value(),
+    auto buffer = ipc::Buffer::bind(inv.cpu.objects.pmm(), vspace.object(), std::move(reference).value(),
                                     memory.object(), object, mm::VRange{address, *bytes});
     return buffer ? std::expected<ipc::Buffer, status_t>{(std::move(buffer).value())}
                   : std::unexpected(ipc_error(buffer.error()));
 }
 
-[[nodiscard]] static auto prepare_ipc(Call& inv, KernelState& kernel, cap::Resolved<mm::VSpace>& vspace,
+[[nodiscard]] static auto prepare_ipc(Call& inv, cap::Resolved<mm::VSpace>& vspace,
                                       const IpcBinding& desc) noexcept
     -> std::expected<std::optional<ipc::Buffer>, status_t> {
     if (desc.pages == 0) {
@@ -215,7 +196,7 @@ template<class Pages>
     if (!memory) {
         return std::unexpected(cap_status(memory.error()));
     }
-    auto buffer = bind_ipc(kernel, vspace, memory.value(), desc);
+    auto buffer = bind_ipc(inv, vspace, memory.value(), desc);
     if (!buffer) {
         return std::unexpected(buffer.error());
     }
@@ -223,12 +204,12 @@ template<class Pages>
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
-add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<object::group>& pool,
+add_endpoint_slot(ipc::Endpoint& endpoint, Call& inv, cap::Resolved<object::group>& pool,
                   cap::Resolved<mm::VSpace>& vspace, cap::Resolved<mm::Mem>& stack,
                   cap::Resolved<mm::Mem>* ipc_memory, const EpDesc& desc, usize stack_bytes,
                   usize index) noexcept -> status_t {
     auto capacity = reserve(pool, resource::budget{.memory = mm::Stack::StackBytes});
-    auto kernel_stack = mm::Stack::create(kernel.kernel_vspace());
+    auto kernel_stack = mm::Stack::create(inv.kspace);
     const auto displacement = libk::checked_multiply(index, desc.stack_stride);
     const auto object_page = libk::checked_multiply(index, desc.stack_pages);
     if (!capacity || !kernel_stack || !displacement || !object_page) {
@@ -253,7 +234,7 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
     if (!user_stack) {
         return vm_status(user_stack.error());
     }
-    auto resident = hold_ram<ipc::StackPages>(kernel.pmm(), stack.object(), {*first_page, desc.stack_pages});
+    auto resident = hold_ram<ipc::StackPages>(inv.cpu.objects.pmm(), stack.object(), {*first_page, desc.stack_pages});
     if (!resident) return resident.error();
     const auto top = virtual_base->checked_add(stack_bytes);
     if (!top) {
@@ -273,7 +254,7 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
         IpcBinding binding = desc.ipc;
         binding.address = ipc_address->raw();
         binding.page = *first_ipc_page;
-        auto made = bind_ipc(kernel, vspace, *ipc_memory, binding);
+        auto made = bind_ipc(inv, vspace, *ipc_memory, binding);
         if (!made) {
             return made.error();
         }
@@ -286,7 +267,7 @@ add_endpoint_slot(ipc::Endpoint& endpoint, KernelState& kernel, cap::Resolved<ob
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
-finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& pool,
+finish_endpoint(Call& inv, cap::Resolved<object::group>& pool,
                 cap::Resolved<mm::VSpace>& vspace, cap::Resolved<mm::Mem>& stack,
                 cap::Resolved<mm::Mem>* ipc_memory, const EpDesc& desc, usize stack_bytes,
                 Env&& service, mm::View&& code_view, ipc::CodePages&& resident_code) noexcept -> Result {
@@ -305,7 +286,7 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
     if (!total_charge || !stack_top) {
         return returned(STATUS_BAD_ARGS);
     }
-    const auto budget_floor = kernel.clock().duration_from_nanoseconds(desc.budget_floor_ns);
+    const auto budget_floor = inv.cpu.dispatcher().clock().duration_from_nanoseconds(desc.budget_floor_ns);
     const auto urgency_ceiling = sched::Urgency::make(desc.urgency_ceiling);
     if (!budget_floor || !urgency_ceiling) {
         return returned(STATUS_BAD_ARGS);
@@ -326,7 +307,7 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool, object::pool<ipc::Endpoint>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel.pool<ipc::Endpoint>(), std::move(*fee), kernel.pmm(), std::move(service),
+    auto object = txn->make(inv.cpu.objects.get<ipc::Endpoint>(), std::move(*fee), inv.cpu.objects.pmm(), std::move(service),
                             std::move(code_view), std::move(resident_code), config);
     if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
@@ -339,10 +320,10 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
         .cap_limit = ENDPOINT_MAX_CAPS,
     };
     const auto caps = std::array<cap::View, 1>{cap::View{rights, lim}};
-    if (!txn->root(kernel.grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     for (usize index = 0; index < desc.activation_count; ++index) {
         const status_t added =
-            add_endpoint_slot(obj, kernel, pool, vspace, stack, ipc_memory, desc, stack_bytes, index);
+            add_endpoint_slot(obj, inv, pool, vspace, stack, ipc_memory, desc, stack_bytes, index);
         if (added != STATUS_OK) {
             return returned(added);
         }
@@ -357,7 +338,7 @@ finish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& po
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
-publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& pool,
+publish_endpoint(Call& inv, cap::Resolved<object::group>& pool,
                  cap::Resolved<mm::VSpace>& vspace, cap::Resolved<cap::CSpace>& cspace,
                  const EpDesc& desc) noexcept -> Result {
     if (desc.version != ENDPOINT_VERSION || desc.flags != ENDPOINT_FLAGS_NONE ||
@@ -454,7 +435,7 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
     if (!code_view) {
         return returned(vm_status(code_view.error()));
     }
-    auto resident_code = hold_ram<ipc::CodePages>(kernel.pmm(), code.value().object(), code_object);
+    auto resident_code = hold_ram<ipc::CodePages>(inv.cpu.objects.pmm(), code.value().object(), code_object);
     if (!resident_code) return returned(resident_code.error());
 
     auto vspace_ref = vspace.reference();
@@ -467,14 +448,12 @@ publish_endpoint(Call& inv, KernelState& kernel, cap::Resolved<object::group>& p
         return returned(STATUS_BUSY);
     }
 
-    return finish_endpoint(inv, kernel, pool, vspace, stack.value(), ipc_memory ? &*ipc_memory : nullptr,
+    return finish_endpoint(inv, pool, vspace, stack.value(), ipc_memory ? &*ipc_memory : nullptr,
                            desc, *stack_bytes, std::move(service).value(), std::move(code_view).value(),
                            std::move(*resident_code));
 }
 
 template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
         return returned(cap_status(pool.error()));
@@ -500,7 +479,7 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), *cost);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<ipc::Channel>(), std::move(*fee), kernel->pmm(), config);
+    auto object = txn->make(inv.cpu.objects.get<ipc::Channel>(), std::move(*fee), inv.cpu.objects.pmm(), config);
     if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
     if (!obj.open()) return returned(STATUS_NO_MEMORY);
@@ -512,7 +491,7 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     };
     const auto [ceiling, caps] = std::pair{view(cap::ChannelSide::Any),
                                            std::array{view(cap::ChannelSide::A), view(cap::ChannelSide::B)}};
-    if (!txn->root(kernel->grants(), ceiling)) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, ceiling)) return returned(STATUS_NO_MEMORY);
     auto handles = txn->publish(inv.cspace, caps, [&](cap::GrantRef& grant, usize i) {
         return bool(obj.bind_side_root(grant, i == 0 ? cap::ChannelSide::A : cap::ChannelSide::B));
     });
@@ -520,28 +499,24 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) return returned(cap_status(pool.error()));
     auto txn = begin_create<Pager>(inv, pool.value(), object::pool<Pager>::slot_charge());
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<Pager>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<Pager>(), std::move(*fee));
+    auto object = txn->make(inv.cpu.objects.get<Pager>(), std::move(*fee));
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Attach,
                         cap::Right::Serve, cap::Right::Supply, cap::Right::Fail, cap::Right::WritebackAck,
                         cap::Right::Close, cap::Right::Destroy, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto endpoint_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto vspace = inv.cspace.resolve<mm::VSpace>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Manage));
@@ -552,14 +527,12 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto endpoint_create(Call& i
         return returned(cap_status(error));
     }
     auto snapshot = read_desc<EpDesc>(inv, handle_of(trap.arg(3)), trap.arg(4));
-    return snapshot ? publish_endpoint(inv, *kernel, pool.value(), vspace.value(), cspace.value(),
+    return snapshot ? publish_endpoint(inv, pool.value(), vspace.value(), cspace.value(),
                                        snapshot.value())
                     : returned(snapshot.error());
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Split);
     if (!pool) {
@@ -582,17 +555,15 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto resource_create_child(C
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), *charge);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<object::group>(), std::move(*fee), kernel->pmm(), limit);
+    auto object = txn->make(inv.cpu.objects.get<object::group>(), std::move(*fee), inv.cpu.objects.pmm(), limit);
     if (!object) return returned(STATUS_NO_MEMORY);
     const cap::Quota data{limit, kinds};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     for (usize index = 1; index < 6; ++index)
         if (inv.trap.arg(index) != 0) return returned(STATUS_BAD_ARGS);
     auto pool = resolve_pool(inv, cap::Right::Create);
@@ -602,19 +573,17 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), charge);
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<io::Space>(), std::move(*fee), kernel->pmm(), kernel->io_work(),
-                            kernel->pool<irq::Irq>(), kernel->pool<mm::Mem>(), kernel->grants());
+    auto object = txn->make(inv.cpu.objects.get<io::Space>(), std::move(*fee), inv.cpu.objects.pmm(), inv.cpu.objects.work(),
+                            inv.cpu.objects.get<irq::Irq>(), inv.cpu.objects.get<mm::Mem>(), inv.cpu.grants);
     if (!object) return returned(STATUS_NO_MEMORY);
     constexpr auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
                                             cap::Right::Connect, cap::Right::Close, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
@@ -629,7 +598,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size,
+    auto object = txn->make(inv.cpu.objects.get<mm::Mem>(), std::move(*fee), inv.cpu.objects.pmm(), size,
                             mm::AnonCfg{.perms = *access});
     if (!object) return returned(mem_status(object.error()));
     auto& obj = object->get();
@@ -638,13 +607,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
@@ -669,7 +636,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<mm::Mem>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<mm::Mem>(), std::move(*fee), kernel->pmm(), size,
+    auto object = txn->make(inv.cpu.objects.get<mm::Mem>(), std::move(*fee), inv.cpu.objects.pmm(), size,
                             mm::PagedCfg{std::move(*pg_ref), *access,
                                 (flags & MEMORY_PAGER_PRIVATE) != 0});
     if (!object) return returned(mem_status(object.error()));
@@ -679,13 +646,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Map,
                         cap::Right::Destroy, cap::Right::Manage, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
         return returned(cap_status(pool.error()));
@@ -694,8 +659,8 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<mm::VSpace>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<mm::VSpace>(), std::move(*fee), kernel->pmm(),
-                            kernel->kernel_vspace(), kernel->space_work());
+    auto object = txn->make(inv.cpu.objects.get<mm::VSpace>(), std::move(*fee), inv.cpu.objects.pmm(),
+                            inv.kspace, inv.cpu.objects.work());
     if (!object) return returned(vm_status(object.error()));
     const cap::VmLimit data{
         mm::VRange{mm::Virt{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
@@ -705,13 +670,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
                         cap::Right::Delegate, cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
                         cap::Right::Inspect, cap::Right::Manage, cap::Right::Destroy, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) {
@@ -727,17 +690,15 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<cap::CSpace>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<cap::CSpace>(), std::move(*fee), kernel->pmm(), quota);
+    auto object = txn->make(inv.cpu.objects.get<cap::CSpace>(), std::move(*fee), inv.cpu.objects.pmm(), quota);
     if (!object) return returned(STATUS_NO_MEMORY);
 
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto domain =
@@ -745,8 +706,8 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     if (!pool || !domain) {
         return returned(cap_status(!pool ? pool.error() : domain.error()));
     }
-    const auto budget = kernel->clock().duration_from_nanoseconds(trap.arg(2));
-    const auto period = kernel->clock().duration_from_nanoseconds(trap.arg(3));
+    const auto budget = inv.cpu.dispatcher().clock().duration_from_nanoseconds(trap.arg(2));
+    const auto period = inv.cpu.dispatcher().clock().duration_from_nanoseconds(trap.arg(3));
     const auto urgency = sched::Urgency::make(trap.arg(4));
     const CpuId home{trap.arg(5)};
     if (!budget || !period || !urgency) {
@@ -761,12 +722,12 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<sched::Sc>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<sched::Sc>(), std::move(*fee), config, kernel->clock().now());
+    auto object = txn->make(inv.cpu.objects.get<sched::Sc>(), std::move(*fee), config, inv.cpu.dispatcher().clock().now());
     if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
 
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     auto admitted = obj.admit(domain.value(), home);
     if (!admitted)
         return returned(admitted.error() == sched::Sc::Error::WrongCpu ? STATUS_BAD_ARGS
@@ -803,7 +764,7 @@ struct ThreadStart final {
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
-publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& pool,
+publish_thread(Call& inv, cap::Resolved<object::group>& pool,
                cap::Resolved<mm::VSpace>& vspace, cap::Resolved<cap::CSpace>& cspace, ThreadStart&& start,
                std::optional<ipc::Buffer>&& ipc) noexcept -> Result {
     auto stack_reservation = reserve(pool, resource::budget{.memory = mm::Stack::StackBytes});
@@ -811,7 +772,7 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
         return returned(pool_error(stack_reservation.error()));
     }
     auto stack_capacity = std::move(stack_reservation).value();
-    auto home = mm::Stack::create(kernel.kernel_vspace());
+    auto home = mm::Stack::create(inv.kspace);
     auto address_space = vspace.reference();
     auto capability_space = cspace.reference();
     if (!home || !address_space || !capability_space) {
@@ -830,20 +791,18 @@ publish_thread(Call& inv, KernelState& kernel, cap::Resolved<object::group>& poo
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool, object::pool<Thread>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel.pool<Thread>(), std::move(*fee), std::move(stack_capacity).commit(),
+    auto object = txn->make(inv.cpu.objects.get<Thread>(), std::move(*fee), std::move(stack_capacity).commit(),
                             std::move(home).value(), std::move(env).value(), start.user);
     if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
     const auto rights = basic_rights();
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
-    if (!txn->root(kernel.grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     if (!obj.authorize(vspace, cspace)) return returned(STATUS_BUSY);
     return publication(txn->publish(inv.cspace, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto vspace = inv.cspace.resolve<mm::VSpace>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Manage));
@@ -857,17 +816,15 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv
     if (!start || trap.arg(5) != 0) {
         return returned(start ? STATUS_BAD_ARGS : start.error());
     }
-    auto ipc = prepare_ipc(inv, *kernel, vspace.value(), start.value().ipc);
+    auto ipc = prepare_ipc(inv, vspace.value(), start.value().ipc);
     if (!ipc) {
         return returned(ipc.error());
     }
-    return publish_thread(inv, *kernel, pool.value(), vspace.value(), cspace.value(),
+    return publish_thread(inv, pool.value(), vspace.value(), cspace.value(),
                           std::move(start).value(), std::move(ipc).value());
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Call& inv) noexcept -> Result {
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
     auto pool = resolve_pool(inv, cap::Right::Create);
     const u64 badge = inv.trap.arg(1);
     if (!pool) {
@@ -881,14 +838,14 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Cal
     if (!txn) return returned(txn.error());
     auto fee = reserve(pool.value(), object::pool<ipc::Notification>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = txn->make(kernel->pool<ipc::Notification>(), std::move(*fee));
+    auto object = txn->make(inv.cpu.objects.get<ipc::Notification>(), std::move(*fee));
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Signal,
                         cap::Right::Receive, cap::Right::Destroy, cap::Right::Revoke);
     const cap::Badge lim{badge};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, lim}};
-    if (!txn->root(kernel->grants(), caps[0])) return returned(STATUS_NO_MEMORY);
+    if (!txn->root(inv.cpu.grants, caps[0])) return returned(STATUS_NO_MEMORY);
     return publication(txn->publish(inv.cspace, caps));
 }
 

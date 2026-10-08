@@ -1,14 +1,13 @@
 #include <expected>
 #include <optional>
 #include <ipc/notification.hpp>
-#include <cap/graph.hpp>
+#include <cap/grant.hpp>
 #include <object/ref.hpp>
 #include <ipc/channel.hpp>
 
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <ipc/buffer.hpp>
 #include <limits>
 #include <libk/checked_arithmetic.hpp>
@@ -629,7 +628,7 @@ auto Channel::receive(
 
 auto Channel::wait(
     cap::Resolved<Channel>&& cap, Wait& waiter, Wait::Kind kind,
-    Thread& thread, CpuRegistry& cpus) noexcept
+    Thread& thread, Cpus& cpus) noexcept
     -> std::expected<void, ChannelError> {
     auto reference = cap.reference();
     if (!reference) return std::unexpected(ChannelError::InvalidCap);
@@ -874,23 +873,23 @@ auto Channel::mint(
     if (data == nullptr || !data->unbound() || !effective.rights.contains(rights)) {
         return std::unexpected(ChannelError::Denied);
     }
-    auto reserved = destination.reserve_derivation();
-    if (!reserved) {
-        return std::unexpected(cap_error(reserved.error()));
-    }
+    if (!destination.sponsor_) return std::unexpected(ChannelError::ResourceExhausted);
+    auto slot = destination.reserve();
+    auto charge = destination.reserve_grant();
+    if (!slot || !charge)
+        return std::unexpected(cap_error(!slot ? slot.error() : charge.error()));
     const cap::ChanLimit child_data{
         .side = *side_value,
         .badge = badge,
         .fixed = ~u64{},
     };
     const cap::View ceiling{rights, child_data};
-    auto transaction = std::move(reserved).value();
-    auto child = cap.lease().mint(std::move(transaction.grant_), ceiling);
+    auto child = cap.lease().mint(std::move(*charge), ceiling);
     if (!child) {
         return std::unexpected(ChannelError::Denied);
     }
     auto installed = destination.insert(
-        std::move(transaction.slot_),
+        std::move(*slot),
         std::move(child).value(),
         cap::View{rights, child_data});
     if (!installed) {
@@ -968,9 +967,8 @@ void Channel::drop_waiter(Waiter& waiter) noexcept {
 
 void Channel::invalidate_waiter(
     void* context,
-    cap::GrantWork&& work,
-    cap::GrantInvalidation reason) noexcept {
-    libk_assert(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    cap::GrantWork&& work) noexcept {
+    libk_assert(context != nullptr);
     auto& waiter = *static_cast<Waiter*>(context);
     waiter.owner->waiter_invalidated(waiter, std::move(work));
 }
@@ -996,9 +994,8 @@ void Channel::waiter_invalidated(
 
 void Channel::invalidate(
     void* context,
-    cap::GrantWork&& work,
-    cap::GrantInvalidation reason) noexcept {
-    libk_assert(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    cap::GrantWork&& work) noexcept {
+    libk_assert(context != nullptr);
     auto& link = *static_cast<GrantLink*>(context);
     link.relation->owner->invalidated(link, std::move(work));
 }
@@ -1032,9 +1029,8 @@ void Channel::relation_released(Relation& relation) noexcept {
 
 void Channel::invalidate_side(
     void* context,
-    cap::GrantWork&& work,
-    cap::GrantInvalidation reason) noexcept {
-    libk_assert(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    cap::GrantWork&& work) noexcept {
+    libk_assert(context != nullptr);
     auto& link = *static_cast<SideLink*>(context);
     link.owner->side_invalidated(link, std::move(work));
 }
@@ -1338,45 +1334,20 @@ auto Channel::commit_escrows(
         return CommitResult::Capacity;
     }
 
-    // Keep a lease for every in-flight Grant through the destination commit.
-    // A revoke may race the receive after the message was queued; the lease
-    // makes the preflight and publication one indivisible admission window.
-    libk::InplaceVector<cap::GrantLease, CHANNEL_MAX_CAPS> leases{};
-    for (Escrow& escrow : message.escrows) {
-        auto acquired = escrow.grant.acquire();
-        if (!acquired) {
-            return CommitResult::Invalid;
-        }
-        auto effective = cap::compose(
-            acquired.value().kind(), acquired.value().ceiling(), escrow.view);
-        if (!effective || !leases.try_push_back(std::move(acquired).value())) {
-            return CommitResult::Invalid;
-        }
+    // Keep the queued grants intact until the entire destination commit wins.
+    libk::InplaceVector<cap::CSpace::NewCap, CHANNEL_MAX_CAPS> caps;
+    for (usize i = 0; i < reservations.size(); ++i) {
+        auto& escrow = message.escrows[i];
+        auto grant = escrow.grant.clone();
+        if (!grant) return CommitResult::Invalid;
+        auto cap = destination.prepare(std::move(reservations[i]), std::move(*grant), escrow.view);
+        if (!cap) return CommitResult::Invalid;
+        libk_assert(caps.try_push_back(std::move(*cap)));
     }
-
-    {
-        sync::Lock guard{destination.lock_};
-        if (!destination.accepting_) {
-            return CommitResult::Capacity;
-        }
-        for (usize index = 0; index < reservations.size(); ++index) {
-            const auto handle = reservations[index].handle();
-            auto* const slot = handle ? destination.slot(handle.index()) : nullptr;
-            if (slot == nullptr || slot->generation != handle.generation()
-                || slot->state != cap::CSpace::SlotState::Reserved) {
-                return CommitResult::Capacity;
-            }
-        }
-        for (usize index = 0; index < reservations.size(); ++index) {
-            Escrow& escrow = message.escrows[index];
-            const cap::Handle handle = reservations[index].handle();
-            libk_assert(escrow.grant);
-            auto committed = destination.commit_locked(
-                reservations[index], std::move(escrow.grant), escrow.view);
-            libk_assert(committed);
-            result.caps[index] = handle;
-        }
-    }
+    std::array<cap::Handle, CHANNEL_MAX_CAPS> handles;
+    for (usize i = 0; i < caps.size(); ++i) handles[i] = caps[i].handle();
+    if (!destination.insert(std::span{caps.data(), caps.size()})) return CommitResult::Capacity;
+    for (usize i = 0; i < caps.size(); ++i) result.caps[i] = handles[i];
     for (Escrow& escrow : message.escrows) {
         if (escrow.kind == Escrow::Kind::Move && escrow.source != nullptr) {
             auto refund = escrow.source->escrow_drop(escrow.source_slot);

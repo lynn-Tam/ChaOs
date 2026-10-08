@@ -51,7 +51,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     const auto vspace = service::capability(info, BOOT_VSPACE);
     const auto cspace = service::capability(info, BOOT_CSPACE);
     const auto events = service::capability(info, BOOT_EVENTS);
-    service::require(device.open(pool, vspace, service::capability(info, BOOT_DEVICE), events));
+    service::require(device.open(pool, vspace, service::capability(info, BOOT_IO_HOST), events));
     service::require(directory.open(service::capability(info, boot::Block), events));
     for (size_t i = 0; i < Clients; ++i)
         service::require(clients[i].session.prepare(pool, vspace, cspace,

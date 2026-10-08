@@ -3,9 +3,9 @@
 #include <test/boot.hpp>
 
 #include <cpu.hpp>
-#include <state.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
+#include <boot/start.hpp>
+#include <test/boot.hpp>
+#include <cpu/cpu.hpp>
 #include <console.hpp>
 #include <utility>
 #include <mm/kspace.hpp>
@@ -35,18 +35,16 @@ void remote_entry(void* argument) noexcept {
 }
 
 [[nodiscard]] auto remote_target(
-    CpuRuntime& runtime) noexcept -> CpuRuntime* {
-    if (runtime.owner_registry == nullptr || runtime.local.descriptor == nullptr) {
+    Cpu& runtime) noexcept -> Cpu* {
+    if (runtime.cpus == nullptr) {
         return nullptr;
     }
-    CpuRegistry& cpus = *runtime.owner_registry;
-    const CpuId boot = runtime.local.descriptor->logical_id();
+    Cpus& cpus = *runtime.cpus;
+    const CpuId boot = runtime.id;
     for (usize offset = 1; offset < cpus.count(); ++offset) {
         const CpuId id{(boot.raw + offset) % cpus.count()};
-        const CpuDescriptor* const descriptor = cpus.descriptor(id);
-        CpuRuntime* const candidate = cpus.runtime(id);
-        if (descriptor != nullptr && candidate != nullptr
-            && descriptor->state() == CpuState::Online) {
+        Cpu* const candidate = cpus.get(id);
+        if (candidate != nullptr && candidate->online()) {
             return candidate;
         }
     }
@@ -55,56 +53,56 @@ void remote_entry(void* argument) noexcept {
 
 } // namespace
 
-auto remote(CpuRuntime& runtime) noexcept -> bool {
-    CpuRuntime* const target = remote_target(runtime);
-    if (target == nullptr || runtime.kernel == nullptr) {
+auto remote(Cpu& runtime) noexcept -> bool {
+    Cpu* const target = remote_target(runtime);
+    if (target == nullptr || test::boot == nullptr) {
         return false;
     }
-    KernelState& kernel = *runtime.kernel;
+    Boot& kernel = *test::boot;
     RemoteState state{};
-    auto stack = mm::Stack::create(kernel.kernel_vspace());
+    auto stack = mm::Stack::create(kernel.vm);
     if (!stack) {
         return false;
     }
-    auto pending_thread = kernel.pool<Thread>().create(
+    auto pending_thread = kernel.objects.get<Thread>().create(
         std::move(stack).value(),
-        Env::kernel(kernel.kernel_vspace()),
+        Env::kernel(kernel.vm),
         Thread::KernelStart{remote_entry, &state});
     if (!pending_thread) {
         return false;
     }
     auto thread = std::move(pending_thread).value().publish();
-    const auto budget = kernel.clock().duration_from_nanoseconds(1'000'000);
-    const auto period = kernel.clock().duration_from_nanoseconds(10'000'000);
+    const auto budget = kernel.clock.duration_from_nanoseconds(1'000'000);
+    const auto period = kernel.clock.duration_from_nanoseconds(10'000'000);
     if (!budget || !period) {
         static_cast<void>(thread.retire());
         thread.reset();
-        kernel.drain_reclaim();
+
         return false;
     }
-    auto pending_context = kernel.pool<sched::Sc>().create(
+    auto pending_context = kernel.objects.get<sched::Sc>().create(
         sched::Sc::Config{.budget = *budget, .period = *period},
-        kernel.clock().now());
+        kernel.clock.now());
     if (!pending_context) {
         static_cast<void>(thread.retire());
         thread.reset();
-        kernel.drain_reclaim();
+
         return false;
     }
     auto context = std::move(pending_context).value().publish();
-    auto admitted = kernel.kernel_domain().admit(
-        context.get(), target->local.descriptor->logical_id());
+    auto admitted = kernel.domain.get().admit(
+        context.get(), target->id);
     auto target_ref = thread.clone();
     if (!admitted || !target_ref
         || !context->bind(std::move(target_ref).value())) {
         if (context->admitted()) {
-            static_cast<void>(kernel.kernel_domain().unadmit(context.get()));
+            static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
         static_cast<void>(context.retire());
         context.reset();
         static_cast<void>(thread.retire());
         thread.reset();
-        kernel.drain_reclaim();
+
         return false;
     }
 
@@ -113,10 +111,10 @@ auto remote(CpuRuntime& runtime) noexcept -> bool {
         return false;
     }
     fail_ipis(2);
-    const auto started = sched::start(*runtime.owner_registry, *binding);
+    const auto started = sched::start(*runtime.cpus, *binding);
     fail_ipis(0);
     const auto posted = started
-        ? sched::wake(*runtime.owner_registry, *binding)
+        ? sched::wake(*runtime.cpus, *binding)
         : decltype(started){std::unexpected(
               sched::Dispatcher::WakeError::Unavailable)};
     constexpr usize wait_spins = 1U << 22;
@@ -137,12 +135,12 @@ auto remote(CpuRuntime& runtime) noexcept -> bool {
     const bool released = stopped && !context->bound();
 
     const bool unadmitted = static_cast<bool>(
-        kernel.kernel_domain().unadmit(context.get()));
+        kernel.domain.get().unadmit(context.get()));
     const bool context_retired = context.retire();
     const bool thread_retired = thread.retire();
     context.reset();
     thread.reset();
-    kernel.drain_reclaim();
+
 
     const bool result = started && posted && entered && returned && stopped
         && released && unadmitted

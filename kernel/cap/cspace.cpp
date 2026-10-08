@@ -1,12 +1,14 @@
 #include <expected>
 #include <cap/cspace.hpp>
-#include <cap/graph.hpp>
+#include <cap/grant.hpp>
 
 #include <libk/memory.hpp>
 #include <utility>
 #include <mm/vspace.hpp>
 #include <object/ref.hpp>
 #include <sync.hpp>
+#include <libk/scope_guard.hpp>
+#include <type_traits>
 
 namespace cap {
 
@@ -130,30 +132,11 @@ auto CSpace::reserve_grant() noexcept
     if (sponsor_ == nullptr) {
         return (resource::Reservation{});
     }
-    auto charged = sponsor_->reserve(GrantGraph::node_charge());
+    auto charged = sponsor_->reserve(Graph::node_charge());
     if (!charged) {
         return std::unexpected(CSpaceError::ResourceExhausted);
     }
     return (std::move(charged).value());
-}
-
-auto CSpace::reserve_derivation() noexcept
-    -> std::expected<DerivationReservation, CSpaceError> {
-    // User-visible semantic derivation must never create an uncharged Grant.
-    // Kernel bootstrap uses the lower-level construction path explicitly.
-    if (sponsor_ == nullptr) {
-        return std::unexpected(CSpaceError::ResourceExhausted);
-    }
-    auto slot = reserve();
-    if (!slot) {
-        return std::unexpected(slot.error());
-    }
-    auto grant = reserve_grant();
-    if (!grant) {
-        return std::unexpected(grant.error());
-    }
-    return (DerivationReservation{
-        std::move(slot).value(), std::move(grant).value()});
 }
 
 auto CSpace::insert(
@@ -233,159 +216,102 @@ auto CSpace::close(Handle handle) noexcept
     return {};
 }
 
-auto CSpace::duplicate(
-    Handle source_handle,
-    CSpace& destination,
-    View view) noexcept -> std::expected<Handle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
+auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec) noexcept
+    -> std::expected<Xfer, CSpaceError> {
+    auto source = snapshot(spec.source);
+    if (!source) return std::unexpected(source.error());
+    auto& lease = source->lease;
+    View view = source->view;
+    GrantRef grant;
+    if (spec.op == XferOp::Move) {
+        const auto* rights = std::get_if<Rights>(&spec.limit);
+        if (!rights || !rights->empty()) return std::unexpected(CSpaceError::InvalidDescriptor);
+    } else {
+        const bool derive = spec.op == XferOp::Derive;
+        if (!view.rights.contains(derive ? Right::Delegate : Right::Duplicate))
+            return std::unexpected(CSpaceError::Denied);
+        auto requested = std::visit([&](const auto& limit) noexcept -> std::expected<View, CSpaceError> {
+            using T = std::remove_cvref_t<decltype(limit)>;
+            if constexpr (std::is_same_v<T, Rights>) return View{limit, view.data};
+            else if constexpr (std::is_same_v<T, View>) return limit;
+            else {
+                auto v = make_attenuation_ceiling(lease.kind(), view, limit);
+                return v ? std::expected<View, CSpaceError>{*v}
+                         : std::unexpected(CSpaceError::InvalidDescriptor);
+            }
+        }, spec.limit);
+        if (!requested) return std::unexpected(requested.error());
+        auto valid = compose(lease.kind(), view, *requested);
+        if (!valid) return std::unexpected(policy_error(valid.error()));
+        view = *requested;
+        auto made = [&]() noexcept -> std::expected<GrantRef, CSpaceError> {
+            if (!derive) {
+                auto ref = lease.graph().ref(lease.key());
+                return ref ? std::expected<GrantRef, CSpaceError>{std::move(*ref)}
+                           : std::unexpected(grant_error(ref.error()));
+            }
+            auto charge = reserve_grant();
+            if (!charge) return std::unexpected(charge.error());
+            auto target = lease.clone_target();
+            if (!target) return std::unexpected(CSpaceError::GrantUnavailable);
+            auto child = lease.graph().derive(std::move(*charge), lease, std::move(*target), view);
+            return child ? std::expected<GrantRef, CSpaceError>{std::move(*child)}
+                         : std::unexpected(grant_error(child.error()));
+        }();
+        if (!made) return std::unexpected(made.error());
+        grant = std::move(*made);
     }
-    return duplicate_snapshot(std::move(copied).value(), destination, view);
+    auto slot = dst.reserve();
+    if (!slot) return std::unexpected(slot.error());
+    return Xfer{std::move(*slot), std::move(lease), std::move(grant),
+                spec.source, source->view, view, spec.op};
 }
 
-auto CSpace::duplicate_snapshot(Snapshot&& source, CSpace& destination, View view) noexcept
+auto CSpace::commit_xfers(CSpace& dst, std::span<Xfer> entries) noexcept
+    -> std::expected<void, CSpaceError> {
+    resource::Charge refund;
+    sync::Pair locks{lock_, dst.lock_};
+    if (!dst.accepting_) return std::unexpected(CSpaceError::InvalidState);
+    for (auto& entry : entries) {
+        if (!dst.reserved(entry.slot)) return std::unexpected(CSpaceError::InvalidState);
+        if (entry.op != XferOp::Move) continue;
+        auto* source = slot(entry.source.index());
+        if (!accepting_ || !source || source->generation != entry.source.generation()
+            || source->state != SlotState::Occupied
+            || source->storage.capability.grant.key() != entry.lease.key()
+            || source->storage.capability.view.rights != entry.original.rights
+            || source->storage.capability.view.data != entry.original.data)
+            return std::unexpected(CSpaceError::InvalidState);
+    }
+    for (auto& entry : entries) {
+        Capability cap;
+        if (entry.op == XferOp::Move) {
+            auto* source = slot(entry.source.index());
+            cap = std::move(source->storage.capability);
+            libk::destroy_at(&source->storage.capability);
+            unlink_occupied(entry.source.index(), *source);
+            if (charge_) refund.merge(charge_.split({.caps = 1}));
+            source->state = SlotState::Empty;
+            libk_assert(live_slots_ != 0);
+            --live_slots_;
+            push_free(entry.source.index(), *source);
+        } else cap = Capability{std::move(entry.grant), entry.view};
+        dst.publish(entry.slot, std::move(cap));
+    }
+    locks.release();
+    refund.reset();
+    finish_retire();
+    if (&dst != this) dst.finish_retire();
+    return {};
+}
+
+auto CSpace::transfer(Handle source, CSpace& dst, XferOp op, XferLimit limit) noexcept
     -> std::expected<Handle, CSpaceError> {
-    GrantLease lease = std::move(source.lease);
-    if (!source.view.rights.contains(Right::Duplicate)) {
-        return std::unexpected(CSpaceError::Denied);
-    }
-    auto dst_view = compose(
-        lease.kind(), source.view, view);
-    if (!dst_view) {
-        return std::unexpected(policy_error(dst_view.error()));
-    }
-
-    auto cloned = lease.graph().ref(lease.key());
-    if (!cloned) {
-        return std::unexpected(grant_error(cloned.error()));
-    }
-    auto reserved = destination.reserve();
-    if (!reserved) {
-        return std::unexpected(reserved.error());
-    }
-    Reservation reservation = std::move(reserved).value();
-    GrantRef reference = std::move(cloned).value();
-    return destination.commit(reservation, std::move(reference), view);
-}
-
-auto CSpace::duplicate(
-    Handle source_handle,
-    CSpace& destination,
-    Rights rights) noexcept -> std::expected<Handle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
-    }
-    Snapshot source = std::move(copied).value();
-    const View view{rights, source.view.data};
-    return duplicate_snapshot(std::move(source), destination, view);
-}
-
-auto CSpace::delegate_snapshot(
-    Snapshot&& source,
-    CSpace& destination,
-    View ceiling,
-    View view) noexcept -> std::expected<Handle, CSpaceError> {
-    GrantLease lease = std::move(source.lease);
-    if (!source.view.rights.contains(Right::Delegate)) {
-        return std::unexpected(CSpaceError::Denied);
-    }
-    if (!attenuates(lease.kind(), source.view, ceiling)) {
-        return std::unexpected(CSpaceError::Amplification);
-    }
-    auto child_rights = compose(lease.kind(), ceiling, view);
-    if (!child_rights) {
-        return std::unexpected(policy_error(child_rights.error()));
-    }
-
-    auto target = lease.clone_target();
-    if (!target) {
-        return std::unexpected(CSpaceError::GrantUnavailable);
-    }
-    resource::Reservation grant_charge{};
-    if (sponsor_ != nullptr) {
-        auto charged = sponsor_->reserve(lease.graph().node_charge());
-        if (!charged) {
-            return std::unexpected(CSpaceError::ResourceExhausted);
-        }
-        grant_charge = std::move(charged).value();
-    }
-    auto child = lease.graph().derive(
-        std::move(grant_charge),
-        lease,
-        std::move(target).value(),
-        ceiling);
-    if (!child) {
-        return std::unexpected(grant_error(child.error()));
-    }
-    auto reserved = destination.reserve();
-    if (!reserved) {
-        return std::unexpected(reserved.error());
-    }
-    Reservation reservation = std::move(reserved).value();
-    GrantRef child_ref = std::move(child).value();
-    return destination.commit(reservation, std::move(child_ref), view);
-}
-
-auto CSpace::delegate(
-    Handle source_handle,
-    CSpace& destination,
-    View ceiling,
-    View view) noexcept -> std::expected<Handle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
-    }
-    return delegate_snapshot(
-        std::move(copied).value(), destination, ceiling, view);
-}
-
-auto CSpace::delegate(
-    Handle source_handle,
-    CSpace& destination,
-    Rights rights) noexcept -> std::expected<Handle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
-    }
-    Snapshot source = std::move(copied).value();
-    const View ceiling{rights, source.view.data};
-    return delegate_snapshot(
-        std::move(source),
-        destination,
-        ceiling,
-        View{rights, source.view.data});
-}
-
-auto CSpace::typed_delegate(
-    Handle source_handle,
-    CSpace& destination,
-    const Attenuation& descriptor) noexcept
-    -> std::expected<Handle, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
-    }
-    Snapshot source = std::move(copied).value();
-    const GrantLease& lease = source.lease;
-    if (!source.view.rights.contains(Right::Delegate)) {
-        return std::unexpected(CSpaceError::Denied);
-    }
-    auto ceiling = make_attenuation_ceiling(
-        lease.kind(), source.view, descriptor);
-    if (!ceiling) {
-        return std::unexpected(CSpaceError::InvalidDescriptor);
-    }
-    if (!validate_ceiling(lease.kind(), ceiling.value())
-        || !attenuates(lease.kind(), source.view, ceiling.value())) {
-        return std::unexpected(CSpaceError::Amplification);
-    }
-    return delegate_snapshot(
-        std::move(source),
-        destination,
-        ceiling.value(),
-        View{ceiling.value().rights, ceiling.value().data});
+    auto entry = prepare_xfer(dst, {source, std::move(limit), op});
+    if (!entry) return std::unexpected(entry.error());
+    const auto handle = entry->slot.handle();
+    auto done = commit_xfers(dst, std::span{&*entry, 1});
+    return done ? std::expected<Handle, CSpaceError>{handle} : std::unexpected(done.error());
 }
 
 auto CSpace::revoke(
@@ -436,62 +362,6 @@ auto CSpace::destroy(Handle source_handle) noexcept
         : std::expected<void, CSpaceError>{std::unexpected(grant_error(destroyed.error()))};
 }
 
-auto CSpace::move(
-    Handle source_handle,
-    CSpace& destination) noexcept -> std::expected<Handle, CSpaceError> {
-    auto reserved = destination.reserve();
-    if (!reserved) {
-        return std::unexpected(reserved.error());
-    }
-    Reservation reservation = std::move(reserved).value();
-    const Handle destination_handle = reservation.handle();
-    resource::Charge source_refund{};
-
-    sync::Pair locks{lock_, destination.lock_};
-
-    Slot* const source = source_handle ? slot(source_handle.index()) : nullptr;
-    Slot* const target = destination.slot(destination_handle.index());
-    CSpaceError error = CSpaceError::InvalidHandle;
-    bool transferred{};
-    if (!accepting_) {
-        error = CSpaceError::InvalidState;
-    } else if (source == nullptr
-        || source->generation != source_handle.generation()) {
-        error = CSpaceError::InvalidHandle;
-    } else if (source->state != SlotState::Occupied) {
-        error = CSpaceError::InvalidState;
-    } else if (target == nullptr
-        || target->generation != destination_handle.generation()
-        || target->state != SlotState::Reserved
-        || !destination.accepting_) {
-        error = CSpaceError::InvalidState;
-    } else {
-        libk::construct_at(
-            &target->storage.capability,
-            std::move(source->storage.capability));
-        libk::destroy_at(&source->storage.capability);
-        destination.charge_.merge(std::move(reservation.charge_));
-        if (charge_) source_refund = charge_.split({.caps = 1});
-        target->state = SlotState::Occupied;
-        destination.link_occupied(destination_handle.index(), *target);
-        unlink_occupied(source_handle.index(), *source);
-        source->state = SlotState::Empty;
-        libk_assert(live_slots_ != 0);
-        --live_slots_;
-        push_free(source_handle.index(), *source);
-        reservation.disarm();
-        transferred = true;
-    }
-
-    locks.release();
-    source_refund.reset();
-
-    return transferred
-        ? std::expected<Handle, CSpaceError>{
-              (destination_handle)}
-        : std::expected<Handle, CSpaceError>{std::unexpected(error)};
-}
-
 auto CSpace::snapshot(Handle handle) noexcept
     -> std::expected<Snapshot, CSpaceError> {
     sync::Lock guard{lock_};
@@ -523,14 +393,6 @@ auto CSpace::snapshot(Handle handle) noexcept
     return (Snapshot{std::move(lease), view.value()});
 }
 
-auto CSpace::commit(
-    Reservation& reservation,
-    GrantRef&& grant,
-    View view) noexcept -> std::expected<Handle, CSpaceError> {
-    sync::Lock guard{lock_};
-    return commit_locked(reservation, std::move(grant), view);
-}
-
 auto CSpace::reserved(const Reservation& r) noexcept -> Slot* {
     libk_assert(lock_.held());
     if (r.owner_ != this || !r.handle_) return nullptr;
@@ -547,15 +409,6 @@ void CSpace::publish(Reservation& r, Capability&& cap) noexcept {
     target->state = SlotState::Occupied;
     link_occupied(r.handle_.index(), *target);
     r.disarm();
-}
-
-auto CSpace::commit_locked(Reservation& r, GrantRef&& grant, View view) noexcept
-    -> std::expected<Handle, CSpaceError> {
-    if (!accepting_ || !grant || !reserved(r))
-        return std::unexpected(CSpaceError::InvalidState);
-    const Handle handle = r.handle_;
-    publish(r, Capability{std::move(grant), view});
-    return handle;
 }
 
 void CSpace::rollback(Handle handle) noexcept {
@@ -1054,6 +907,42 @@ auto CSpace::grant_error(GrantError error) noexcept -> CSpaceError {
         return CSpaceError::GenerationExhausted;
     }
     return CSpaceError::GrantUnavailable;
+}
+
+auto Batch::prepare(Batch& batch, CSpace& src, CSpace& dst, const Specs& specs) noexcept
+    -> std::expected<void, CSpaceError> {
+    if (batch.source_ || !batch.empty()) return std::unexpected(CSpaceError::InvalidState);
+    batch.source_ = &src;
+    batch.destination_ = &dst;
+    bool done{};
+    libk::scope_exit rollback{[&]() noexcept { if (!done) batch.abort(); }};
+    for (usize i = 0; i < specs.size(); ++i) {
+        if (specs[i].op == XferOp::Move) {
+            for (usize j = 0; j < i; ++j)
+                if (specs[j].op == XferOp::Move && specs[j].source == specs[i].source)
+                    return std::unexpected(CSpaceError::InvalidHandle);
+        }
+        auto entry = src.prepare_xfer(dst, specs[i]);
+        if (!entry) return std::unexpected(entry.error());
+        libk_assert(batch.entries_.try_push_back(std::move(*entry)));
+    }
+    done = true;
+    return {};
+}
+
+auto Batch::handles() const noexcept -> Handles {
+    Handles result;
+    for (auto& entry : entries_) libk_assert(result.try_push_back(entry.slot.handle()));
+    return result;
+}
+
+auto Batch::commit() noexcept -> std::expected<Handles, CSpaceError> {
+    if (!source_ || !destination_) return std::unexpected(CSpaceError::InvalidState);
+    auto result = handles();
+    auto done = source_->commit_xfers(*destination_, {entries_.data(), entries_.size()});
+    if (!done) return std::unexpected(done.error());
+    abort();
+    return result;
 }
 
 } // namespace cap

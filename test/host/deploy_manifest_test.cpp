@@ -13,7 +13,6 @@
 
 #include "deploy/golden.hpp"
 #include <servers/deploy/format.hpp>
-#include <servers/deploy/detail/plan.hpp>
 
 namespace libk {
 [[noreturn]] void assert_fail(const AssertInfo&) noexcept {
@@ -24,10 +23,10 @@ namespace libk {
 namespace {
 
 using deploy::Error;
-using deploy::ManifestImportRow;
-using deploy::ManifestTaskRow;
+using deploy::ImportRow;
+using deploy::TaskRow;
 using deploy::ManifestWorkspace;
-using deploy::ManifestView;
+using deploy::Manifest;
 using deploy::host::kGolden;
 using deploy::host::kGoldenSize;
 
@@ -76,7 +75,7 @@ void make_boot_bundle(uint8_t* bytes, size_t& size) {
 
 auto matches_file(const char* path) -> bool {
     FILE* const input = fopen(path, "rb");
-    if (input == nullptr) {
+    if (!input) {
         return false;
     }
     size_t index{};
@@ -308,7 +307,7 @@ void make_pager_manifest(uint8_t* bytes, size_t& size) {
 
 auto accepts_golden() -> bool {
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(kGolden, kGoldenSize, workspace);
+    auto parsed = Manifest::parse(kGolden, kGoldenSize, workspace);
     return parsed && parsed.value().task_count() == 1
         && parsed.value().image_count() == 1
         && parsed.value().mapping_count() == 3
@@ -365,7 +364,7 @@ auto accepts_boot_bundle_cross_validation() -> bool {
     make_boot_bundle(bundle_bytes, bundle_size);
     const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(kGolden, kGoldenSize, workspace);
+    auto parsed = Manifest::parse(kGolden, kGoldenSize, workspace);
     return bundle && parsed
         && parsed.value().validate_boot_bundle(bundle, workspace);
 }
@@ -381,19 +380,19 @@ auto rejects_effective_stack_range() -> bool {
     }
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_STACK_TOP, 0x230000, 8);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
+    auto parsed = Manifest::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed
         && !parsed.value().validate_boot_bundle(bundle, workspace);
 }
 
 auto rejects_truncation() -> bool {
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(kGolden, kGoldenSize - 1, workspace);
+    return !Manifest::parse(kGolden, kGoldenSize - 1, workspace);
 }
 
 auto rejects_null() -> bool {
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(nullptr, kGoldenSize, workspace);
+    return !Manifest::parse(nullptr, kGoldenSize, workspace);
 }
 
 auto rejects_table_overlap() -> bool {
@@ -404,7 +403,7 @@ auto rejects_table_overlap() -> bool {
     put(bytes, DEPLOY_HEADER_TABLES + DEPLOY_TABLE_DESC_SIZE,
         0xe0, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_invalid_enum() -> bool {
@@ -414,7 +413,7 @@ auto rejects_invalid_enum() -> bool {
     }
     put(bytes, 0x1a8 + DEPLOY_MAPPING_SOURCE, 9, 2);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_duplicate_key() -> bool {
@@ -425,7 +424,7 @@ auto rejects_duplicate_key() -> bool {
     put(bytes, 0x298 + DEPLOY_OBJECT_OUTPUT_A,
         UINT64_C(0x0000000400000004), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_numeric_key() -> bool {
@@ -435,7 +434,7 @@ auto rejects_numeric_key() -> bool {
     }
     put(bytes, 0x1a8 + DEPLOY_MAPPING_PRODUCED, 4, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_noncanonical_empty_ref() -> bool {
@@ -446,7 +445,7 @@ auto rejects_noncanonical_empty_ref() -> bool {
     put(bytes, 0x298 + DEPLOY_OBJECT_OUTPUT_B,
         UINT64_C(0x0000000000000001), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_invalid_positive_string_ref() -> bool {
@@ -457,7 +456,7 @@ auto rejects_invalid_positive_string_ref() -> bool {
     put(bytes, 0x1a8 + DEPLOY_MAPPING_PRODUCED,
         UINT64_C(0x000000010000004f), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto accepts_external_domain_key() -> bool {
@@ -468,7 +467,7 @@ auto accepts_external_domain_key() -> bool {
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_DOMAIN,
         UINT64_C(0x0000000400000004), 8);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
+    return Manifest::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto rejects_execution_fault_policy() -> bool {
@@ -479,7 +478,7 @@ auto rejects_execution_fault_policy() -> bool {
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_FAULT,
         DEPLOY_EXECUTION_FAULT_ENDPOINT, 2);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_execution_terminal_policy() -> bool {
@@ -490,7 +489,7 @@ auto rejects_execution_terminal_policy() -> bool {
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_TERMINAL,
         DEPLOY_EXECUTION_TERMINAL_ALL_EXIT, 2);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_endpoint_with_two_executions() -> bool {
@@ -505,7 +504,7 @@ auto rejects_endpoint_with_two_executions() -> bool {
         DEPLOY_OBJECT_POST_MAPPING, 2);
     put(bytes, 0x298 + DEPLOY_OBJECT_REF0, 1, 4);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, size, workspace);
+    return !Manifest::parse(bytes, size, workspace);
 }
 
 auto rejects_missing_notification_relation() -> bool {
@@ -519,7 +518,7 @@ auto rejects_missing_notification_relation() -> bool {
         DEPLOY_OBJECT_EPHEMERAL_TASK, 2);
     put(bytes, 0x480 + DEPLOY_OBJECT_ARG1, 1, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, size, workspace);
+    return !Manifest::parse(bytes, size, workspace);
 }
 
 auto rejects_multiple_notifications_relation() -> bool {
@@ -531,7 +530,7 @@ auto rejects_multiple_notifications_relation() -> bool {
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK,
         DEPLOY_BASE_KINDS, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, size, workspace);
+    return !Manifest::parse(bytes, size, workspace);
 }
 
 auto accepts_shared_external_domain() -> bool {
@@ -539,7 +538,7 @@ auto accepts_shared_external_domain() -> bool {
     size_t size{};
     make_two_execution_manifest(bytes, size);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, size, workspace);
+    auto parsed = Manifest::parse(bytes, size, workspace);
     return parsed && parsed.value().execution_count() == 2;
 }
 
@@ -551,7 +550,7 @@ auto rejects_prepared_key_dangling_source() -> bool {
     put(bytes, 0x3c8 + DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000900000046), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_prepared_key_import_destination() -> bool {
@@ -565,7 +564,7 @@ auto rejects_prepared_key_import_destination() -> bool {
     put(bytes, 0x3c8 + DEPLOY_EXPORT_SOURCE,
         UINT64_C(0x0000000600000046), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_prepared_key_kind_mismatch() -> bool {
@@ -575,12 +574,12 @@ auto rejects_prepared_key_kind_mismatch() -> bool {
     }
     /* The source key names the task's Thread, while this structurally valid
      * ceiling advertises a ResourcePool.  Manifest admission must reject the
-     * namespace-kind mismatch before a DeploymentPlan is constructed. */
+     * namespace-kind mismatch during manifest validation. */
     put(bytes, 0x3c8 + DEPLOY_EXPORT_CEILING
             + DEPLOY_ATTENUATION_KIND,
         OBJECT_KIND_RESOURCE_POOL, 2);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_kind_mask_denial() -> bool {
@@ -590,7 +589,7 @@ auto rejects_kind_mask_denial() -> bool {
     }
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS & ~OBJ_BIT(OBJECT_KIND_NOTIFICATION)), 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_notification_badge() -> bool {
@@ -600,7 +599,7 @@ auto rejects_notification_badge() -> bool {
     }
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG0, 0, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_wx_mapping() -> bool {
@@ -611,7 +610,7 @@ auto rejects_wx_mapping() -> bool {
     put(bytes, 0x1f8 + DEPLOY_MAPPING_ACCESS,
         VM_READ | VM_WRITE | VM_EXECUTE, 4);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_mapping_target_range() -> bool {
@@ -626,7 +625,7 @@ auto rejects_mapping_target_range() -> bool {
     make_boot_bundle(bundle_bytes, bundle_size);
     const auto bundle = boot::Bundle::parse(bundle_bytes, bundle_size);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
+    auto parsed = Manifest::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed
         && !parsed.value().validate_boot_bundle(bundle, workspace);
 }
@@ -638,7 +637,7 @@ auto rejects_sc_configuration() -> bool {
     }
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_SC_BUDGET, 0, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_home_cpu() -> bool {
@@ -649,7 +648,7 @@ auto rejects_home_cpu() -> bool {
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_HOME_CPU,
         DEPLOY_CPU_MAX, 4);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto accepts_duplicate_typed_kind() -> bool {
@@ -667,7 +666,7 @@ auto accepts_duplicate_typed_kind() -> bool {
                 + DEPLOY_ATTENUATION_KIND,
             kind, 2);
         ManifestWorkspace workspace{};
-        if (!ManifestView::parse(bytes, sizeof(bytes), workspace)) {
+        if (!Manifest::parse(bytes, sizeof(bytes), workspace)) {
             return false;
         }
     }
@@ -698,7 +697,7 @@ auto accepts_typed_memory_schema() -> bool {
             + DEPLOY_ATTENUATION_WORD2,
         VM_READ, 8);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
+    return Manifest::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_typed_rwx_memory_vspace() -> bool {
@@ -717,7 +716,7 @@ auto accepts_typed_rwx_memory_vspace() -> bool {
                 + DEPLOY_ATTENUATION_WORD2,
             VM_READ | VM_WRITE | VM_EXECUTE, 8);
         ManifestWorkspace workspace{};
-        if (!ManifestView::parse(bytes, sizeof(bytes), workspace)) {
+        if (!Manifest::parse(bytes, sizeof(bytes), workspace)) {
             return false;
         }
     }
@@ -737,14 +736,14 @@ auto accepts_typed_vspace_schema() -> bool {
             + DEPLOY_ATTENUATION_WORD2,
         VM_READ, 8);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
+    return Manifest::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_typed_zero_resource_budget() -> bool {
     uint8_t bytes[kGoldenSize]{};
     make_typed_import(bytes, OBJECT_KIND_RESOURCE_POOL);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
+    return Manifest::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_typed_channel_forms() -> bool {
@@ -761,7 +760,7 @@ auto accepts_typed_channel_forms() -> bool {
                 + DEPLOY_ATTENUATION_WORD2,
             fixed, 8);
         ManifestWorkspace workspace{};
-        if (!ManifestView::parse(bytes, sizeof(bytes), workspace)) {
+        if (!Manifest::parse(bytes, sizeof(bytes), workspace)) {
             return false;
         }
     }
@@ -816,7 +815,7 @@ auto rejects_typed_schema_mutations() -> bool {
             + DEPLOY_ATTENUATION_WORD0 + mutation.word * 8;
         put(bytes, base, mutation.value, 8);
         ManifestWorkspace workspace{};
-        if (ManifestView::parse(bytes, sizeof(bytes), workspace)) {
+        if (Manifest::parse(bytes, sizeof(bytes), workspace)) {
             return false;
         }
     }
@@ -828,7 +827,7 @@ auto accepts_channel_schema() -> bool {
     size_t size{};
     make_channel_manifest(bytes, size);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, size, workspace);
+    auto parsed = Manifest::parse(bytes, size, workspace);
     return parsed.has_value();
 }
 
@@ -840,7 +839,7 @@ auto rejects_channel_zero_scalars() -> bool {
         make_channel_manifest(bytes, size);
         put(bytes, 0x4e0 + field, 0, 8);
         ManifestWorkspace workspace{};
-        if (ManifestView::parse(bytes, size, workspace)) {
+        if (Manifest::parse(bytes, size, workspace)) {
             return false;
         }
     }
@@ -862,7 +861,7 @@ auto rejects_duplicate_channel_b() -> bool {
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG1, 1, 8);
     put(bytes, 0x298 + DEPLOY_OBJECT_ARG3, 1, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto accepts_prepared_channel_b() -> bool {
@@ -875,7 +874,7 @@ auto accepts_prepared_channel_b() -> bool {
             + DEPLOY_ATTENUATION_KIND,
         OBJECT_KIND_CHANNEL, 2);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, size, workspace).has_value();
+    return Manifest::parse(bytes, size, workspace).has_value();
 }
 
 auto accepts_prepared_sc() -> bool {
@@ -889,7 +888,7 @@ auto accepts_prepared_sc() -> bool {
             + DEPLOY_ATTENUATION_KIND,
         OBJECT_KIND_SCHED_CONTEXT, 2);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, sizeof(bytes), workspace).has_value();
+    return Manifest::parse(bytes, sizeof(bytes), workspace).has_value();
 }
 
 auto accepts_pager_schema() -> bool {
@@ -897,7 +896,7 @@ auto accepts_pager_schema() -> bool {
     size_t size{};
     make_pager_manifest(bytes, size);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, size, workspace).has_value();
+    return Manifest::parse(bytes, size, workspace).has_value();
 }
 
 auto accepts_endpoint_schema() -> bool {
@@ -906,7 +905,7 @@ auto accepts_endpoint_schema() -> bool {
     make_endpoint_manifest(bytes, size);
     put(bytes, 0xe0 + DEPLOY_TASK_KIND_MASK, (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
     ManifestWorkspace workspace{};
-    return ManifestView::parse(bytes, size, workspace).has_value();
+    return Manifest::parse(bytes, size, workspace).has_value();
 }
 
 auto rejects_endpoint_nonresident_source() -> bool {
@@ -921,7 +920,7 @@ auto rejects_endpoint_nonresident_source() -> bool {
         (DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_ENDPOINT)), 8);
     put(bytes, 0x4e0 + DEPLOY_OBJECT_REF0, 0, 4);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, size, workspace);
+    auto parsed = Manifest::parse(bytes, size, workspace);
     return bundle && parsed
         && !parsed.value().validate_boot_bundle(bundle, workspace);
 }
@@ -933,7 +932,7 @@ auto rejects_dangling_object_ref() -> bool {
     }
     put(bytes, 0x298 + DEPLOY_OBJECT_REF0, 2, 4);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_critical_overflow() -> bool {
@@ -943,7 +942,7 @@ auto rejects_critical_overflow() -> bool {
     }
     put(bytes, 0xe0 + DEPLOY_TASK_CRITICAL_BYTES, 4096, 8);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_nul_string() -> bool {
@@ -953,7 +952,7 @@ auto rejects_nul_string() -> bool {
     }
     bytes[0x428] = 0;
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_dependency_cycle() -> bool {
@@ -973,7 +972,7 @@ auto rejects_dependency_cycle() -> bool {
     put(bytes, 0x480 + DEPLOY_DEPENDENCY_KIND,
         DEPLOY_DEPENDENCY_REQUIRED, 2);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, sizeof(bytes), workspace);
+    return !Manifest::parse(bytes, sizeof(bytes), workspace);
 }
 
 auto rejects_two_task_required_cycle() -> bool {
@@ -981,7 +980,7 @@ auto rejects_two_task_required_cycle() -> bool {
     size_t size{};
     make_two_task_manifest(bytes, size, false);
     ManifestWorkspace workspace{};
-    return !ManifestView::parse(bytes, size, workspace);
+    return !Manifest::parse(bytes, size, workspace);
 }
 
 auto accepts_optional_dependency_edge() -> bool {
@@ -989,12 +988,9 @@ auto accepts_optional_dependency_edge() -> bool {
     size_t size{};
     make_two_task_manifest(bytes, size, true);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, size, workspace);
+    auto parsed = Manifest::parse(bytes, size, workspace);
     if (!parsed) return false;
-    deploy::PlanSet<1> plans;
-    auto decoded = deploy::DeploymentPlan::decode(parsed.value(), plans);
-    if (!decoded) return false;
-    const auto& plan = decoded.value();
+    const auto& plan = parsed.value();
     uint32_t order[2]{};
     bool provider_failed[2]{false, true};
     bool consumer_failed[2]{true, false};
@@ -1035,7 +1031,7 @@ auto accepts_entry_zero_fallback() -> bool {
     }
     put(bytes, 0x2f8 + DEPLOY_EXECUTION_ENTRY, 0, 8);
     ManifestWorkspace workspace{};
-    auto parsed = ManifestView::parse(bytes, sizeof(bytes), workspace);
+    auto parsed = Manifest::parse(bytes, sizeof(bytes), workspace);
     return bundle && parsed
         && parsed.value().validate_boot_bundle(bundle, workspace);
 }

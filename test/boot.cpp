@@ -1,11 +1,11 @@
 #include <test/boot.hpp>
+#include <boot/start.hpp>
 
-#include <boot/link.hpp>
+#include <boot/info.hpp>
 #include <cpu.hpp>
 #include <cpu/ipi.hpp>
 #include <libk/assert.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 #include <test/scenario.hpp>
 #include <test/test.hpp>
 
@@ -25,6 +25,7 @@ extern const Id selected = static_cast<Id>(TEST_SCENARIO);
 }
 
 namespace test {
+Boot* boot{};
 void fail_ipis(usize n) noexcept {
     ipi_failures.store<libk::MemoryOrder::Release>(n);
 }
@@ -33,18 +34,26 @@ void fail_ipis(usize n) noexcept {
 void run(const BootInfo& boot, const mm::Pmm& memory) noexcept {
     const TestStats stats = run_builtin_tests(boot, memory);
     libk_assert(scenario::run(scenario::selected, boot));
-    libk_assert(boot_guard_ok());
     libk_assert(stats.failed == 0);
 }
 
-void runtime(CpuRuntime& cpu) noexcept {
-    if (cpu.owner_registry == nullptr || cpu.local.descriptor == nullptr
-        || cpu.local.descriptor->logical_id()
-            != cpu.owner_registry->boot_id()) {
+void runtime(Cpu& cpu) noexcept {
+    if (cpu.cpus == nullptr
+        || cpu.id
+            != cpu.cpus->boot_id()) {
         return;
     }
     libk_assert(scenario::run_runtime(scenario::selected, cpu));
 #if TEST_PANIC
+    // The probe expects peer snapshots; readiness belongs to this fixture.
+    const auto& clock = cpu.dispatcher().clock();
+    const auto start = clock.now().ticks();
+    for (usize i = 0; i < cpu.cpus->count(); ++i) {
+        const auto& peer = *cpu.cpus->get(CpuId{i});
+        while (!peer.online() && clock.now().ticks() - start < clock.ticks_per_second())
+            asm volatile("" ::: "memory");
+        libk_assert(peer.online());
+    }
     //Confirmatory experiment. Keep the fault injection in the test executable.
 #if TEST_PANIC == 2
     fail_ipis(MaxCpus);

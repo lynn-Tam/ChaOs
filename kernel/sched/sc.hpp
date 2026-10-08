@@ -157,8 +157,7 @@ private:
 
     static void invalidate_domain(
         void* context,
-        cap::GrantWork&& work,
-        cap::GrantInvalidation reason) noexcept;
+        cap::GrantWork&& work) noexcept;
     static void released_domain(void* context) noexcept;
     void invalidate_domain(cap::GrantWork&& work) noexcept;
     void finish_domain() noexcept;

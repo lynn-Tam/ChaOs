@@ -8,6 +8,6 @@ namespace libk {
 
 auto validate_manifest(const void* bytes, size_t size) -> int {
     static deploy::ManifestWorkspace workspace;
-    const auto parsed = deploy::ManifestView::parse(bytes, size, workspace);
+    const auto parsed = deploy::Manifest::parse(bytes, size, workspace);
     return parsed ? 0 : static_cast<int>(parsed.error());
 }

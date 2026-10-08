@@ -1,16 +1,15 @@
 #include <cpu/ipi.hpp>
 #include <panic.hpp>
+
+extern const char build_id[];
 #include <console.hpp>
 #include <trace.hpp>
 
 #include <cpu.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
 #include <libk/fmt.hpp>
-#include <boot/link.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/thread.hpp>
 
@@ -67,7 +66,7 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
     usize cpu,
     const arch::TrapRegs& snapshot) noexcept {
     auto& local = current_cpu();
-    const auto* const dispatcher = local.dispatcher();
+    const auto* const dispatcher = local.dispatcher_storage ? &*local.dispatcher_storage : nullptr;
     Thread* target = dispatcher != nullptr
         ? dispatcher->current() : nullptr;
     const usize entry_top = local.entry.stack;
@@ -100,19 +99,18 @@ static void raw_source(const libk::AssertInfo& source) noexcept {
 
 static void capture_stack_bounds(
     PanicSlot& slot,
-    CpuLocal& cpu,
+    Cpu& cpu,
     usize sp) noexcept {
-    Thread* const thread = cpu.current_thread();
+    Thread* const thread = cpu.current;
     if (thread != nullptr && sp >= thread->home_stack_base()
         && sp < thread->home_stack_top()) {
         slot.stack_base = thread->home_stack_base();
         slot.stack_top = thread->home_stack_top();
         return;
     }
-    CpuRuntime& runtime = cpu.runtime();
+    Cpu& runtime = cpu;
     const mm::Stack* stacks[] = {
         runtime.init_stack ? &*runtime.init_stack : nullptr,
-        runtime.irq_stack ? &*runtime.irq_stack : nullptr,
         runtime.emergency_stack ? &*runtime.emergency_stack : nullptr,
     };
     for (const mm::Stack* stack : stacks) {
@@ -141,9 +139,9 @@ static void capture(
     auto* const owner = arch::local() ? arch::local()->owner : nullptr;
     libk_assert(owner != nullptr);
     auto& cpu = *owner;
-    slot.registry = cpu.runtime().owner_registry;
-    slot.current_thread = reinterpret_cast<usize>(cpu.current_thread());
-    slot.active_root = cpu.active_root_ ? 1 : 0;
+    slot.registry = cpu.cpus;
+    slot.current_thread = reinterpret_cast<usize>(cpu.current);
+    slot.active_root = cpu.root ? 1 : 0;
     slot.trap_depth = arch::local()->depth;
     capture_stack_bounds(slot, cpu, slot.stack.sp);
 }
@@ -152,15 +150,15 @@ static void print_source(const libk::AssertInfo& source) noexcept {
     if (source.file == nullptr) {
         return;
     }
-    console::print<"site: {}:{}\nfunction: {}\n">(
+    console::raw<"site: {}:{}\nfunction: {}\n">(
         source.file, source.line, source.function);
     if (source.expression != nullptr) {
-        console::print<"expression: {}\n">(source.expression);
+        console::raw<"expression: {}\n">(source.expression);
     }
 }
 
 static void print_snapshot(const PanicSlot& slot) noexcept {
-    console::print<
+    console::raw<
         "cpu: logical={} hart={} trap-depth={} irq-before={}\n"
         "thread={:#x} active-root={}\n">(
         slot.cpu.raw,
@@ -171,7 +169,7 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
         slot.active_root);
     if (slot.has_full_trap) {
         const auto& gpr = slot.trap.gpr;
-        console::print<
+        console::raw<
             "context: full trap frame\n"
             "pc={:#018x} status={:#018x} cause={:#018x} fault={:#018x}\n"
             "ra={:#018x} sp={:#018x} gp={:#018x} tp={:#018x}\n"
@@ -183,7 +181,7 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
             slot.trap.fault_address,
             gpr[0], gpr[1], gpr[2], gpr[3],
             gpr[4], gpr[5], gpr[6], gpr[27], gpr[28], gpr[29], gpr[30]);
-        console::print<
+        console::raw<
             "a0={:#018x} a1={:#018x} a2={:#018x} a3={:#018x} "
                 "a4={:#018x} a5={:#018x} a6={:#018x} a7={:#018x}\n"
             "s0={:#018x} s1={:#018x} s2={:#018x} s3={:#018x} "
@@ -195,7 +193,7 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
             gpr[7], gpr[8], gpr[17], gpr[18], gpr[19], gpr[20],
             gpr[21], gpr[22], gpr[23], gpr[24], gpr[25], gpr[26]);
     } else {
-        console::print<
+        console::raw<
             "context: call-site\n"
             "pc={:#018x} sp={:#018x} fp={:#018x} ra={:#018x}\n">(
             slot.stack.pc,
@@ -221,10 +219,10 @@ static void print_snapshot(const PanicSlot& slot) noexcept {
 }
 
 static void print_backtrace(const PanicSlot& slot) noexcept {
-    console::print<"backtrace:\n">();
+    console::raw<"backtrace:\n">();
     const auto& seed = slot.stack;
     if (seed.pc != 0 && in_kernel_text(seed.pc)) {
-        console::print<"  #0 {:#018x}\n">(seed.pc);
+        console::raw<"  #0 {:#018x}\n">(seed.pc);
     }
     usize frame = seed.fp;
     usize printed = 1;
@@ -234,7 +232,7 @@ static void print_backtrace(const PanicSlot& slot) noexcept {
             || frame < 2 * sizeof(usize)
             || !in_stack(slot, frame - 2 * sizeof(usize),
                 2 * sizeof(usize))) {
-            console::print<"  stopped: invalid frame pointer {:#018x}\n">(
+            console::raw<"  stopped: invalid frame pointer {:#018x}\n">(
                 frame);
             return;
         }
@@ -246,7 +244,7 @@ static void print_backtrace(const PanicSlot& slot) noexcept {
             return;
         }
         if (!in_kernel_text(address)) {
-            console::print<
+            console::raw<
                 "  stopped: return address outside kernel text {:#018x}\n">(
                 address);
             return;
@@ -254,12 +252,12 @@ static void print_backtrace(const PanicSlot& slot) noexcept {
         // A call-site seed names the return PC stored in panic()'s own frame.
         // Walk through that record, but do not report the same PC twice.
         if (!first_record || address != seed.pc) {
-            console::print<"  #{} {:#018x}\n">(printed, address);
+            console::raw<"  #{} {:#018x}\n">(printed, address);
             ++printed;
         }
         first_record = false;
         if (previous <= frame || previous > slot.stack_top) {
-            console::print<"  stopped: invalid previous frame {:#018x}\n">(
+            console::raw<"  stopped: invalid previous frame {:#018x}\n">(
                 previous);
             return;
         }
@@ -268,7 +266,7 @@ static void print_backtrace(const PanicSlot& slot) noexcept {
 }
 
 static void request_peer_stops(PanicSlot& owner) noexcept {
-    CpuRegistry* const registry = owner.registry;
+    Cpus* const registry = owner.registry;
     if (registry == nullptr) {
         return;
     }
@@ -277,19 +275,13 @@ static void request_peer_stops(PanicSlot& owner) noexcept {
         if (id == owner.cpu) {
             continue;
         }
-        const CpuDescriptor* const descriptor = registry->descriptor(id);
-        CpuRuntime* const runtime = registry->runtime(id);
-        if (descriptor == nullptr || runtime == nullptr
-            || descriptor->state() != CpuState::Online) {
-            continue;
-        }
-        __atomic_store_n(&runtime->local.entry.stop, usize{1}, __ATOMIC_RELEASE);
-        static_cast<void>(send_ipi(descriptor->hardware_id()));
+        Cpu* const runtime = registry->get(id);
+        if (runtime) runtime->request_stop();
     }
 }
 
 static void wait_for_peers(const PanicSlot& owner) noexcept {
-    CpuRegistry* const registry = owner.registry;
+    Cpus* const registry = owner.registry;
     if (registry == nullptr) {
         return;
     }
@@ -302,10 +294,8 @@ static void wait_for_peers(const PanicSlot& owner) noexcept {
             if (id == owner.cpu) {
                 continue;
             }
-            const CpuDescriptor* const descriptor = registry->descriptor(id);
-            const CpuRuntime* const runtime = registry->runtime(id);
-            if (descriptor == nullptr || runtime == nullptr
-                || descriptor->state() != CpuState::Online) {
+            const Cpu* const runtime = registry->get(id);
+            if (runtime == nullptr || !runtime->online()) {
                 continue;
             }
             stopped = stopped && runtime->panic != nullptr
@@ -318,23 +308,23 @@ static void wait_for_peers(const PanicSlot& owner) noexcept {
 }
 
 static void print_peers(const PanicSlot& owner) noexcept {
-    CpuRegistry* const registry = owner.registry;
+    Cpus* const registry = owner.registry;
     if (registry == nullptr) {
         return;
     }
-    console::print<"peer cpus:\n">();
+    console::raw<"peer cpus:\n">();
     for (usize index = 0; index < registry->count(); ++index) {
         const CpuId id{index};
-        const CpuRuntime* const runtime = registry->runtime(id);
+        const Cpu* const runtime = registry->get(id);
         if (runtime == nullptr || runtime->panic == nullptr) {
             continue;
         }
         const PanicSlot& slot = *runtime->panic;
         if (id == owner.cpu) {
-            console::print<"  cpu {}: owner\n">(id.raw);
+            console::raw<"  cpu {}: owner\n">(id.raw);
         } else if (slot.stopped.load<libk::MemoryOrder::Acquire>()) {
             const auto& seed = slot.stack;
-            console::print<
+            console::raw<
                 "  cpu {}: stopped pc={:#018x} sp={:#018x} "
                 "fp={:#018x} ra={:#018x}\n">(
                 id.raw,
@@ -345,13 +335,13 @@ static void print_peers(const PanicSlot& owner) noexcept {
             print_snapshot(slot);
             print_backtrace(slot);
         } else {
-            console::print<"  cpu {}: no acknowledgement\n">(id.raw);
+            console::raw<"  cpu {}: no acknowledgement\n">(id.raw);
         }
         trace::Sample e{};
         const auto log = trace::snapshot(*runtime);
         for (u64 n = log.first; n < log.last; ++n) {
             if (log.read(n, e)) {
-                console::print<"    trace {} t={} kind={} actor={:#x} object={:#x} a={:#x} b={:#x}\n">(
+                console::raw<"    trace {} t={} kind={} actor={:#x} object={:#x} a={:#x} b={:#x}\n">(
                     e.seq, e.tick, static_cast<u32>(e.kind), e.actor, e.object, e.a, e.b);
             }
         }
@@ -370,7 +360,7 @@ static void print_peers(const PanicSlot& owner) noexcept {
     request_peer_stops(slot);
     wait_for_peers(slot);
 
-    console::print<
+    console::raw<
         "\n================ MYOS KERNEL PANIC ================\n"
         "build: {}\nreason: {}\n">(
         libk::StrView::from_cstr(build_id), slot.reason);
@@ -378,7 +368,7 @@ static void print_peers(const PanicSlot& owner) noexcept {
     print_snapshot(slot);
     print_backtrace(slot);
     print_peers(slot);
-    console::print<"====================================================\n">();
+    console::raw<"====================================================\n">();
     arch::halt_system(
         arch::HaltAction::Shutdown,
         arch::HaltReason::Panic);

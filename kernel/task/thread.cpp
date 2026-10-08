@@ -12,7 +12,7 @@
 #include <cpu.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/local.hpp>
+#include <cpu/cpu.hpp>
 #include <utility>
 #include <sched/sc.hpp>
 #include <sched/dispatcher.hpp>
@@ -188,7 +188,7 @@ auto Thread::ipc_before(
 
 auto Thread::begin_wait(
     Completion& relation,
-    CpuRegistry& cpus) noexcept -> bool {
+    Cpus& cpus) noexcept -> bool {
     if (sc_ == nullptr) {
         return false;
     }
@@ -201,7 +201,7 @@ void Thread::block() noexcept {
     auto& wait = current_wait();
     while (wait.attached()) {
         if (wait.ready()) static_cast<void>(wait.finish());
-        else current_cpu().dispatcher()->block_current();
+        else current_cpu().dispatcher().block_current();
     }
 }
 
@@ -302,9 +302,8 @@ void Thread::finish_exit(status_t status) noexcept {
     libk_assert(thread != nullptr);
     libk_assert(thread->state_ == Thread::State::Running);
 
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    cpu.dispatcher()->on_context_enter();
+    Cpu& cpu = current_cpu();
+    cpu.dispatcher().on_context_enter();
 
     volatile byte stack_marker{};
     libk_assert(thread->contains_stack(
@@ -356,9 +355,7 @@ void Stop::finish(Thread& target) noexcept {
 }
 
 const cap::GrantAttachmentOps Thread::grant_ops_{
-    .invalidate = [](void* context, cap::GrantWork&& work,
-                     cap::GrantInvalidation reason) noexcept {
-        libk_assert(reason == cap::GrantInvalidation::Revoke);
+    .invalidate = [](void* context, cap::GrantWork&& work) noexcept {
         auto& relation = *static_cast<Root*>(context);
         relation.owner->invalidate(relation, std::move(work));
     },

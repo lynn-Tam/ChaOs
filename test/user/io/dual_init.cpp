@@ -1,3 +1,4 @@
+#include <sys/pci.hpp>
 #include <optional>
 #include <servers/runtime/service.hpp>
 #include <sys/handle.hpp>
@@ -8,20 +9,25 @@ namespace {
 deploy::program program;
 deploy::tasks<2> supervisor;
 
-auto binding(cap_t device) noexcept -> deploy::source {
+auto binding(const sys::pci::Binding& device) noexcept -> deploy::source {
     CapView ceiling{};
     ceiling.version = CAP_ATTENUATION_VERSION_CURRENT;
-    ceiling.kind = OBJECT_KIND_DEVICE;
+    ceiling.kind = OBJECT_KIND_IO_HOST;
     ceiling.size = CAP_ATTENUATION_SIZE;
     ceiling.rights = RIGHT_CONNECT | RIGHT_DUPLICATE;
-    return {"block.device", {device, 0}, ceiling};
+    ceiling.words[0] = device.rid;
+    ceiling.words[1] = 1;
+    return {"block.host", device.cap.reference(), ceiling};
 }
 }
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
     const auto info = service::bootstrap(address, size);
-    if (info.device_count() != 2) exit(STATUS_NOT_FOUND);
+    auto pci = sys::pci::Bus::open(info, 0x3100'0000);
+    if (!pci) exit(pci.error());
+    service::require(pci->configure(0x1042'1af4));
+    if (pci->count(0x1042'1af4) != 2) exit(STATUS_NOT_FOUND);
     auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
         cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
         0x30010000, 4096, VM_READ | VM_WRITE);
@@ -32,8 +38,12 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     supervisor.open(info);
     service::require(supervisor.add_boot_sources(info));
     std::optional<deploy::tasks<2>::handle> tasks[2];
+    std::array<sys::pci::Binding, 2> devices;
     for (size_t i = 0; i < 2; ++i) {
-        const deploy::source source[] = {binding(info.device(i))};
+        auto found = pci->find(0x1042'1af4, i);
+        if (!found) exit(found.error());
+        devices[i] = std::move(*found);
+        const deploy::source source[] = {binding(devices[i])};
         status_t status{};
         tasks[i] = supervisor.launch(program, deploy::tasks<2>::name("io-test"), status,
             {.sources = source});

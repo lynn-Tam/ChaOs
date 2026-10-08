@@ -68,18 +68,8 @@ namespace sys {
     return syscall(SYS_IO_SPACE_STATE, space);
 }
 
-[[nodiscard]] inline auto io_space_info(cap_t space,
-    word_t ipc_offset = 0) noexcept -> SysResult {
-    return syscall(SYS_IO_SPACE_INFO, space, ipc_offset);
-}
-
-[[nodiscard]] inline auto device_info(cap_t device,
-    word_t ipc_offset = 0) noexcept -> SysResult {
-    return syscall(SYS_DEVICE_INFO, device, ipc_offset);
-}
-
-[[nodiscard]] inline auto io_space_bar(cap_t space, word_t index) noexcept -> SysResult {
-    return syscall(SYS_IO_SPACE_BAR, space, index);
+[[nodiscard]] inline auto io_space_reg(cap_t space, word_t index) noexcept -> SysResult {
+    return syscall(SYS_IO_SPACE_REG, space, index);
 }
 
 [[nodiscard]] inline auto io_space_irq(cap_t space) noexcept -> SysResult {

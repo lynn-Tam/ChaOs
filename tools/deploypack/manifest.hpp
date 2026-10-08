@@ -401,7 +401,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
         t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
-        t.authority(BOOT_DEVICE, "pci.0008", RIGHT_CONNECT);
+        t.authority(BOOT_IO_HOST, "block.host", RIGHT_CONNECT);
         t.channel_service(boot::Block, "block.client", 1, receive, send, 4, 4);
         t.finish();
     }
@@ -420,7 +420,7 @@ inline auto pack_console(char** paths, bool storage = false,
         t.restart(DEPLOY_RESTART_ON_FAULT);
         t.cspace(128, 20);
         t.kinds(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_IO_SPACE));
-        t.authority(BOOT_DEVICE, "pci.0010", RIGHT_CONNECT);
+        t.authority(BOOT_IO_HOST, "store.host", RIGHT_CONNECT);
         t.channel_service(boot::Block, "block_data.client", 1,
             receive, send, 4, 4);
         t.finish();

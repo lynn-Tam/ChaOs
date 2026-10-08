@@ -1,13 +1,10 @@
-#include <platform/riscv-virt/board.hpp>
 // kernel/trap/trap.cpp
 // 系统 trap policy 的当前 owner；架构层只提供 Event 和返回现场访问。
 
 #include <panic.hpp>
 
-#include <cpu/local.hpp>
+#include <cpu/cpu.hpp>
 #include <cpu/ipi.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
 #include <console.hpp>
 #include <irq/irq.hpp>
 #include <mm/vspace.hpp>
@@ -39,8 +36,6 @@ static void finish_thread_page_fault(
     case mm::FaultKind::Materialized:
         return;
     case mm::FaultKind::Busy:
-        dispatcher.request_reschedule(sched::DispatchReason::Yield);
-        return;
         dispatcher.request_reschedule(sched::DispatchReason::Yield);
         return;
     case mm::FaultKind::Pending:
@@ -96,17 +91,17 @@ static void finish_thread_page_fault(
 
 void handle(const Event& event, arch::TrapCtx& context) noexcept {
     if (const auto* interrupt = event.interrupt()) {
-        CpuLocal& cpu = current_cpu();
-        libk_assert(cpu.dispatcher() != nullptr);
+        Cpu& cpu = current_cpu();
         switch (interrupt->cause) {
         case Interrupt::Timer:
-            cpu.dispatcher()->on_timer();
+            cpu.dispatcher().on_timer();
             return;
         case Interrupt::Software:
-            handle_ipi(cpu.runtime());
+            handle_ipi(cpu);
             return;
         case Interrupt::External: {
-            virt_irq();
+            libk_assert(cpu.ext_irq);
+            cpu.ext_irq();
             return;
         }
         default:
@@ -117,8 +112,8 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
     if (event.origin() == Origin::User) {
         const auto* exception = event.exception();
         libk_assert(exception != nullptr);
-        CpuLocal& cpu = current_cpu();
-        Thread* const thread = cpu.current_thread();
+        Cpu& cpu = current_cpu();
+        Thread* const thread = cpu.current;
         libk_assert(thread != nullptr
             && thread->env().user_bound());
         if (exception->cause == Exception::Syscall) {
@@ -127,13 +122,13 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
             case syscall::Disposition::Resume:
                 return;
             case syscall::Disposition::Yield:
-                cpu.dispatcher()->request_reschedule(
+                cpu.dispatcher().request_reschedule(
                     sched::DispatchReason::Yield);
                 return;
             case syscall::Disposition::Exit:
                 const status_t status = static_cast<status_t>(
                     context.arg(1));
-                cpu.dispatcher()->request_reschedule(sched::DispatchReason::Exit, status);
+                cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit, status);
                 return;
             }
         }
@@ -152,19 +147,19 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
             case Perm::None:
                 if (thread != nullptr) {
                     thread->record_user_fault(event);
-                    cpu.dispatcher()->request_reschedule(
+                    cpu.dispatcher().request_reschedule(
                         sched::DispatchReason::Exit);
                 }
                 return;
             }
             if (thread != nullptr) {
-                libk_assert(cpu.runtime().owner_registry != nullptr);
+                libk_assert(cpu.cpus != nullptr);
                 const auto address = mm::Virt{event.fault_addr()};
                 const auto kind = thread->env().vspace()->fault(
-                    *thread, mm::VmCtx{.cpus = cpu.runtime().owner_registry,
-                                       .local = cpu.descriptor->logical_id()}, address, access);
+                    *thread, mm::VmCtx{.cpus = cpu.cpus,
+                                       .local = cpu.id}, address, access);
                 if (!thread->stop_requested())
-                    finish_thread_page_fault(*thread, kind, address, access, context, *cpu.dispatcher());
+                    finish_thread_page_fault(*thread, kind, address, access, context, cpu.dispatcher());
                 return;
             }
         }
@@ -172,7 +167,7 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
                 thread != nullptr ? thread->activation() : nullptr;
             frame != nullptr) {
             frame->unwind(
-                context, *cpu.dispatcher(), STATUS_PEER_FAULT);
+                context, cpu.dispatcher(), STATUS_PEER_FAULT);
             return;
         }
         if (thread != nullptr) {
@@ -189,7 +184,7 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
                 event.pc(), event.fault_addr(), thread->user_syscalls(),
                 thread->env().vspace()->active_cpus().size());
         }
-        cpu.dispatcher()->request_reschedule(sched::DispatchReason::Exit);
+        cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit);
         return;
     }
 
@@ -207,9 +202,8 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
 }
 
 void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    Thread* const thread = cpu.current_thread();
+    Cpu& cpu = current_cpu();
+        Thread* const thread = cpu.current;
     libk_assert(thread != nullptr);
     if (event.origin() == Origin::User && event.exception() != nullptr) {
         thread->enter_kernel();
@@ -218,27 +212,27 @@ void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
         });
         handle(event, context);
     }
-    cpu.dispatcher()->on_trap_exit();
-    libk_assert(cpu.current_thread() == thread);
+    cpu.dispatcher().on_trap_exit();
+    libk_assert(cpu.current == thread);
     // A canceled Endpoint frame cannot be popped while its leaf Wait still
     // owns the continuation. Once that relation has completed or canceled,
     // this same owning CPU performs the pending chain unwind.
     while (thread != nullptr && thread->activation() != nullptr
         && !thread->current_wait().attached()
-        && (cpu.dispatcher()->current()->stop_requested()
+        && (cpu.dispatcher().current()->stop_requested()
             || thread->cancel_pending())) {
         thread->activation()->unwind(
-            context, *cpu.dispatcher(), STATUS_CANCELED);
+            context, cpu.dispatcher(), STATUS_CANCELED);
     }
     // A stop request deliberately waits for the subsystem continuation. Once
     // the relation is detached, give the dispatcher one final commit point.
-    cpu.dispatcher()->on_trap_exit();
-    libk_assert(cpu.current_thread() == thread);
+    cpu.dispatcher().on_trap_exit();
+    libk_assert(cpu.current == thread);
 
 }
 
 void on_return() noexcept {
-    if (auto* thread = current_cpu().current_thread()) thread->release_calls();
+    if (auto* thread = current_cpu().current) thread->release_calls();
 }
 
 } // namespace trap

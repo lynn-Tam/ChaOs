@@ -1,20 +1,18 @@
 #include <test/test.hpp>
 
-#include <boot/fdt.hpp>
+#include <platform/fdt.hpp>
 #include <utility>
 #include <boot/info.hpp>
 #include <mm/pmm.hpp>
-#include <boot/link.hpp>
 
 namespace {
 
 bool test_default_bootinfo_is_cleared(const TestContext&) noexcept {
     BootInfo boot{};
-    return !boot.fdt
-        && !boot.transition.valid()
-        && boot.fdt.physical.raw() == 0
-        && boot.fdt.size == 0
-        && !boot.fdt.pages.valid();
+    return !boot.firmware
+        && boot.firmware.physical.raw() == 0
+        && boot.firmware.size == 0
+        && !boot.firmware.pages.valid();
 }
 
 bool test_boot_map_is_valid_and_non_overlapping(const TestContext& ctx) noexcept {
@@ -47,9 +45,9 @@ bool test_boot_map_is_ordered(const TestContext& ctx) noexcept {
 }
 
 bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
-    const auto boot_range = boot_pages();
-    const auto secondary_range = secondary_pages();
-    const auto image_range = kernel_pages();
+    const auto boot_range = boot_layout.entry.pages();
+    const auto secondary_range = boot_layout.secondary.pages();
+    const auto image_range = boot_layout.kernel.pages();
     const auto boot_end = boot_range.limit();
     const auto secondary_end = secondary_range.limit();
     const auto image_end = image_range.limit();
@@ -60,20 +58,20 @@ bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
     bool secondary{};
     bool high_image{};
     for (const auto& region : ctx.memory.regions()) {
-        if (region.kind != mm::Region::Kind::Kernel) {
-            continue;
-        }
         const auto end = region.range.limit();
         if (!end) {
             return false;
         }
         const uintptr_t first = region.range.base().base().raw();
         const uintptr_t last = end->raw() * mm::page_size;
-        boot_entry |= first == boot_range.base().base().raw()
+        boot_entry |= region.kind == mm::Region::Kind::Boot
+            && first == boot_range.base().base().raw()
             && last == boot_end->raw() * mm::page_size;
-        secondary |= first == secondary_range.base().base().raw()
+        secondary |= region.kind == mm::Region::Kind::Kernel
+            && first == secondary_range.base().base().raw()
             && last == secondary_end->raw() * mm::page_size;
-        high_image |= first == image_range.base().base().raw()
+        high_image |= region.kind == mm::Region::Kind::Kernel
+            && first == image_range.base().base().raw()
             && last == image_end->raw() * mm::page_size;
     }
     return boot_entry && secondary && high_image;
@@ -81,7 +79,7 @@ bool test_kernel_image_has_exact_region(const TestContext& ctx) noexcept {
 
 bool test_pre_kernel_ram_is_firmware_reserved(const TestContext& ctx) noexcept {
     const uintptr_t kernel_start =
-        boot_pages().base().base().raw();
+        boot_layout.entry.pages().base().base().raw();
     for (const auto& region : ctx.memory.regions()) {
         if (region.kind != mm::Region::Kind::Firmware) {
             continue;
@@ -93,14 +91,14 @@ bool test_pre_kernel_ram_is_firmware_reserved(const TestContext& ctx) noexcept {
 }
 
 bool test_fdt_pages_are_reclaimable(const TestContext& ctx) noexcept {
-    if (!ctx.boot.fdt) {
+    if (!ctx.boot.firmware) {
         return false;
     }
     for (const auto& region : ctx.memory.regions()) {
         if (region.kind == mm::Region::Kind::Boot
-            && region.range.base() == ctx.boot.fdt.pages.base()
+            && region.range.base() == ctx.boot.firmware.pages.base()
             && region.range.page_count()
-                == ctx.boot.fdt.pages.page_count()) {
+                == ctx.boot.firmware.pages.page_count()) {
             return true;
         }
     }
@@ -108,14 +106,14 @@ bool test_fdt_pages_are_reclaimable(const TestContext& ctx) noexcept {
 }
 
 bool test_transition_pages_are_reclaimable(const TestContext& ctx) noexcept {
-    if (!ctx.boot.transition.valid()) {
+    if (!boot_layout.scratch.pages().valid()) {
         return false;
     }
     for (const auto& region : ctx.memory.regions()) {
         if (region.kind == mm::Region::Kind::Boot
-            && region.range.base() == ctx.boot.transition.base()
+            && region.range.base() == boot_layout.scratch.pages().base()
             && region.range.page_count()
-                == ctx.boot.transition.page_count()) {
+                == boot_layout.scratch.pages().page_count()) {
             return true;
         }
     }

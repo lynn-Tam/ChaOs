@@ -1,6 +1,6 @@
 #include <test/test.hpp>
 
-#include <boot/link.hpp>
+#include <boot/info.hpp>
 #include <mm/table.hpp>
 #include <cpu.hpp>
 #include <trap.hpp>
@@ -26,7 +26,7 @@ bool test_user_start_validates_privilege_inputs(const TestContext&) noexcept {
     arch::UserStart odd = valid;
     odd.entry = mm::Virt{mm::UserBegin + 1};
     arch::UserStart kernel = valid;
-    kernel.entry = kernel_begin();
+    kernel.entry = mm::Virt{boot_layout.va};
     arch::UserStart unaligned_stack = valid;
     unaligned_stack.stack = mm::Virt{mm::UserEnd - 1};
     return arch::valid_user_start(valid)
@@ -49,7 +49,7 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
     auto rejected = arch::prepare_user_stack(
         top,
         arch::UserStart{
-            .entry = kernel_begin(),
+            .entry = mm::Virt{boot_layout.va},
             .stack = valid.stack,
         });
     if (!prepared || *prepared < reinterpret_cast<usize>(home)

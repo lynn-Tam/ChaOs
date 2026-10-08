@@ -1,7 +1,7 @@
 #include <trace.hpp>
 
 #include <cpu.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 
 namespace trace {
 
@@ -11,7 +11,7 @@ void emit(Event kind, u64 actor, u64 object, u64 a, u64 b) noexcept {
     if (!enabled()) return;
     const auto irq = arch::disable_interrupts();
     auto* cpu = (arch::local() ? arch::local()->owner : nullptr);
-    auto* log = cpu && cpu->runtime_ ? cpu->runtime_->log : nullptr;
+    auto* log = cpu ? cpu->log : nullptr;
     if (log) {
         const u64 head = log->head.load<libk::MemoryOrder::Relaxed>();
         auto& slot = log->cells[head % Ring::capacity];
@@ -29,7 +29,7 @@ void emit(Event kind, u64 actor, u64 object, u64 a, u64 b) noexcept {
     arch::restore_interrupts(irq);
 }
 
-auto snapshot(const CpuRuntime& cpu) noexcept -> View {
+auto snapshot(const Cpu& cpu) noexcept -> View {
     const auto* log = cpu.log;
     const u64 last = log ? log->head.load<libk::MemoryOrder::Acquire>() : 0;
     return {log, last > Ring::capacity ? last - Ring::capacity : 0, last};

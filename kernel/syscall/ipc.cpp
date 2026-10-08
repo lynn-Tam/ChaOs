@@ -2,21 +2,19 @@
 #include <optional>
 #include <syscall/call.hpp>
 #include <cap/cap.hpp>
-#include <cpu/local.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 #include <ipc/notification.hpp>
 #include <object/ref.hpp>
 #include <task/thread.hpp>
 #include <uapi/abi.h>
 #include <utility>
-#include <state.hpp>
+#include <object/pool.hpp>
 #include <ipc/endpoint.hpp>
 #include <sched/dispatcher.hpp>
 #include <uapi/ipc.h>
 #include <cap/cspace.hpp>
 #include <ipc/channel.hpp>
 #include <ipc/buffer.hpp>
-#include <cpu/registry.hpp>
 
 namespace syscall {
 
@@ -83,7 +81,7 @@ template<usize op>
     if (!notification) {
         return returned(cap_status(notification.error()));
     }
-    CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
+    Cpus* const cpus = inv.cpu.cpus;
     libk_assert(cpus != nullptr);
     Thread* const thread = inv.target;
     libk_assert(thread != nullptr);
@@ -98,7 +96,7 @@ template<usize op>
     auto* target = &notification.value().object();
     // Storage survives the wait, while the admission lease must not stall revoke.
     notification.value().reset();
-    const auto result = target->wait(*thread, *cpus, *inv.cpu.dispatcher(),
+    const auto result = target->wait(*thread, *cpus, inv.cpu.dispatcher(),
                                      deadline);
     return returned(result.status, result.value);
 }
@@ -145,7 +143,7 @@ template<usize op>
     };
     std::optional<time::Instant> deadline{};
     if (const u64 timeout_ns = inv.trap.arg(4); timeout_ns != 0) {
-        auto& clock = inv.cpu.runtime().kernel->clock();
+        auto& clock = inv.cpu.dispatcher().clock();
         const auto duration = clock.duration_from_nanoseconds(timeout_ns);
         const auto expires = duration
             ? clock.now().checked_add(*duration) : std::nullopt;
@@ -159,8 +157,8 @@ template<usize op>
         std::move(endpoint).value(),
         *thread,
         inv.trap,
-        *inv.cpu.dispatcher(),
-        inv.cpu.runtime().kernel->cpus(),
+        inv.cpu.dispatcher(),
+        *inv.cpu.cpus,
         arguments,
         deadline);
     if (!entered) {
@@ -181,7 +179,7 @@ template<usize op>
     auto replied = activation.endpoint().reply(
         *thread,
         inv.trap,
-        *inv.cpu.dispatcher(),
+        inv.cpu.dispatcher(),
         status,
         value);
     return replied
@@ -199,7 +197,7 @@ template<usize op>
     auto aborted = activation.endpoint().abort(
         *thread,
         inv.trap,
-        *inv.cpu.dispatcher(),
+        inv.cpu.dispatcher(),
         static_cast<isize>(inv.trap.arg(0)));
     return aborted
         ? Result{STATUS_OK, 0, Disposition::Resume}
@@ -237,11 +235,7 @@ template<usize op>
         .cap_limit = cap_limit,
     };
     const auto publish = [&](cap::CSpace& dest) noexcept -> Result {
-        auto minted = inv.cspace.delegate(
-            source,
-            dest,
-            cap::View{*rights, data},
-            cap::View{*rights, data});
+        auto minted = inv.cspace.transfer(source, dest, cap::XferOp::Derive, cap::View{*rights, data});
         return returned(
             minted ? STATUS_OK : cap_status(minted.error()),
             minted ? minted.value().raw() : 0);
@@ -349,7 +343,7 @@ template<usize op>
         return returned(status(sent.error()));
     }
     Thread* const thread = inv.target;
-    CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
+    Cpus* const cpus = inv.cpu.cpus;
     if (thread == nullptr || cpus == nullptr) {
         return returned(STATUS_INVALID_OP);
     }
@@ -405,7 +399,7 @@ template<usize op>
             return returned(status(received.error()));
         }
         Thread* const thread = inv.target;
-        CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
+        Cpus* const cpus = inv.cpu.cpus;
         if (thread == nullptr || cpus == nullptr) {
             return returned(STATUS_INVALID_OP);
         }

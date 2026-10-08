@@ -2,11 +2,13 @@
 
 #include <boot/info.hpp>
 
-struct CpuRuntime;
+struct Cpu;
+struct Boot;
 namespace mm { class Pmm; }
 
 namespace test {
+extern Boot* boot;
 void fail_ipis(usize count) noexcept;
 void run(const BootInfo&, const mm::Pmm&) noexcept;
-void runtime(CpuRuntime&) noexcept;
+void runtime(Cpu&) noexcept;
 }

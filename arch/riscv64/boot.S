@@ -21,6 +21,7 @@
 .equ PAGE_SHIFT,             12
 .equ MEGAPAGE_SHIFT,         21
 .equ GIGAPAGE_SHIFT,         30
+.equ DIRECT_BASE,            0xffffffc000000000
 .equ DIRECT_ROOT_FIRST,      256
 .equ DIRECT_ROOT_COUNT,      128
 .equ KERNEL_ROOT_INDEX,      510
@@ -40,17 +41,6 @@
     .space 4096
 .Lboot_high_l1:
     .space 4096
-
-.section .bootstack, "aw", @nobits
-.balign 16
-.global boot_stack_guard
-boot_stack_guard:
-    .space 256
-.global boot_stack
-boot_stack:
-    .space 3840
-.global boot_stack_top
-boot_stack_top:
 
 .section .text.boot, "ax", @progbits
 .balign 4
@@ -91,16 +81,18 @@ _start:
     srli t2, t1, PAGE_SHIFT
     slli t2, t2, 10
     ori t2, t2, PTE_TABLE
-    li t3, 2
+    la t3, _start
+    srli t3, t3, GIGAPAGE_SHIFT
+    andi t3, t3, 511
     slli t3, t3, 3
     add t3, t0, t3
     sd t2, 0(t3)
 
-    li t2, 0x80200000
-    srli t2, t2, PAGE_SHIFT
-    slli t2, t2, 10
+    la t2, _start
+    srli t2, t2, MEGAPAGE_SHIFT
+    andi t3, t2, 511
+    slli t2, t2, MEGAPAGE_SHIFT - PAGE_SHIFT + 10
     ori t2, t2, PTE_RX
-    li t3, 1
     slli t3, t3, 3
     add t3, t1, t3
     sd t2, 0(t3)
@@ -168,6 +160,9 @@ _start:
 
     mv a0, s0
     mv a1, s1
+    /* Keep the physical stack through its high direct alias. */
+    li t1, DIRECT_BASE
+    add sp, sp, t1
     li t0, KERNEL_VIRT_BASE
     jr t0
 .size _start, .-_start
@@ -178,16 +173,6 @@ _start:
 .global boot_high
 .type boot_high, @function
 boot_high:
-    la sp, boot_stack_top
-
-    la t0, boot_stack_guard
-    la t1, boot_stack
-    li t2, 0x42535441434b4755
-.Lfill_boot_guard:
-    sd t2, 0(t0)
-    addi t0, t0, 8
-    bltu t0, t1, .Lfill_boot_guard
-
     la t0, .Lhigh_park
     csrw stvec, t0
     call boot_enter
@@ -197,23 +182,3 @@ boot_high:
     wfi
     j 1b
 .size boot_high, .-boot_high
-
-.section .text, "ax", @progbits
-.balign 4
-.global boot_guard_ok
-.type boot_guard_ok, @function
-boot_guard_ok:
-    la t0, boot_stack_guard
-    la t1, boot_stack
-    li t2, 0x42535441434b4755
-.Lcheck_boot_guard:
-    ld t3, 0(t0)
-    bne t3, t2, .Lboot_guard_bad
-    addi t0, t0, 8
-    bltu t0, t1, .Lcheck_boot_guard
-    li a0, 1
-    ret
-.Lboot_guard_bad:
-    li a0, 0
-    ret
-.size boot_guard_ok, .-boot_guard_ok

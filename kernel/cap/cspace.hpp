@@ -2,7 +2,6 @@
 
 #include <utility>
 
-
 #include <bit>
 
 #include <cpu.hpp>
@@ -13,6 +12,8 @@
 #include <expected>
 #include <libk/noncopyable.hpp>
 #include <span>
+#include <libk/inplace_vector.hpp>
+#include <uapi/ipc.h>
 #include <sync.hpp>
 #include <mm/pmm.hpp>
 #include <resource/sponsorship.hpp>
@@ -24,7 +25,6 @@ class VSpace;
 class Env;
 
 namespace ipc {
-class Transfer;
 class Channel;
 }
 namespace object {
@@ -33,6 +33,15 @@ struct traits;
 }
 
 namespace cap {
+
+class Batch;
+enum class XferOp : u8 { Copy, Move, Derive };
+using XferLimit = std::variant<Rights, View, Attenuation>;
+struct XferSpec final {
+    Handle source{};
+    XferLimit limit{Rights{}};
+    XferOp op{XferOp::Copy};
+};
 
 enum class CSpaceError : u8 {
     InvalidHandle,
@@ -70,7 +79,7 @@ public:
 
     private:
         friend class CSpace;
-        friend class ipc::Transfer;
+        friend class Batch;
         Reservation(
             CSpace& owner,
             Handle handle,
@@ -107,40 +116,12 @@ public:
         View view_{};
     };
 
-    // Reserves one destination capability slot and one sponsored Grant node
-    // as a single pre-publication unit. Type-specific derivation still lives
-    // in GrantGraph; this class only owns rollback-safe resource capacity.
-    class DerivationReservation final : private libk::noncopyable {
-    public:
-        DerivationReservation(DerivationReservation&&) noexcept = default;
-        auto operator=(DerivationReservation&&) noexcept
-            -> DerivationReservation& = default;
-
-        [[nodiscard]] auto handle() const noexcept -> Handle {
-            return slot_.handle();
-        }
-
-    private:
-        friend class CSpace;
-        friend class ipc::Channel;
-
-        DerivationReservation(
-            Reservation&& slot,
-            resource::Reservation&& grant) noexcept
-            : slot_(std::move(slot)), grant_(std::move(grant)) {}
-
-        Reservation slot_;
-        resource::Reservation grant_;
-    };
-
     explicit CSpace(mm::Pmm& pmm) noexcept;
     CSpace(mm::Pmm& pmm, Quota quota) noexcept;
     ~CSpace() noexcept;
 
     [[nodiscard]] auto reserve() noexcept
         -> std::expected<Reservation, CSpaceError>;
-    [[nodiscard]] auto reserve_derivation() noexcept
-        -> std::expected<DerivationReservation, CSpaceError>;
     [[nodiscard]] auto insert(
         GrantRef&& grant,
         View view) noexcept -> std::expected<Handle, CSpaceError>;
@@ -155,31 +136,8 @@ public:
         -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto close(Handle handle) noexcept
         -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto duplicate(
-        Handle source,
-        CSpace& destination,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto duplicate(
-        Handle source,
-        CSpace& destination,
-        Rights rights) noexcept -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto delegate(
-        Handle source,
-        CSpace& destination,
-        View ceiling,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto delegate(
-        Handle source,
-        CSpace& destination,
-        Rights rights) noexcept -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto typed_delegate(
-        Handle source,
-        CSpace& destination,
-        const Attenuation& descriptor) noexcept
+    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}) noexcept
         -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto move(
-        Handle source,
-        CSpace& destination) noexcept -> std::expected<Handle, CSpaceError>;
     [[nodiscard]] auto revoke(
         Handle source,
         GrantRevoke& completion,
@@ -219,7 +177,7 @@ public:
 private:
     friend class ::mm::VSpace;
     friend class ::Env;
-    friend class ipc::Transfer;
+    friend class Batch;
     friend class ipc::Channel;
     friend struct object::traits<CSpace>;
     static constexpr usize dir_bits = 8;
@@ -284,24 +242,18 @@ private:
 
     [[nodiscard]] auto snapshot(Handle handle) noexcept
         -> std::expected<Snapshot, CSpaceError>;
-    [[nodiscard]] auto duplicate_snapshot(Snapshot&&, CSpace&, View) noexcept
-        -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto delegate_snapshot(
-        Snapshot&& source,
-        CSpace& destination,
-        View ceiling,
-        View view) noexcept
-        -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto commit(
-        Reservation& reservation,
-        GrantRef&& grant,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
-    // Caller holds lock_. Reservation is the operation lease which keeps this
-    // prepared slot valid even after retirement closes new admission.
-    [[nodiscard]] auto commit_locked(
-        Reservation& reservation,
-        GrantRef&& grant,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
+    struct Xfer final {
+        Reservation slot;
+        GrantLease lease;
+        GrantRef grant;
+        Handle source;
+        View original, view;
+        XferOp op;
+    };
+    [[nodiscard]] auto prepare_xfer(CSpace&, const XferSpec&) noexcept
+        -> std::expected<Xfer, CSpaceError>;
+    [[nodiscard]] auto commit_xfers(CSpace&, std::span<Xfer>) noexcept
+        -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto reserved(const Reservation&) noexcept -> Slot*;
     void publish(Reservation&, Capability&&) noexcept;
     void rollback(Handle handle) noexcept;
@@ -358,6 +310,27 @@ private:
     // All table pages and committed selectors share this immutable sponsor.
     // Detached subcharges refund only after the corresponding storage is free.
     resource::Charge charge_{};
+};
+
+// Captured admissions and reserved slots; source moves are revalidated and
+// the complete batch is published under both CSpace locks, or none of it is.
+class Batch final : private libk::noncopyable {
+public:
+    using Specs = libk::InplaceVector<XferSpec, IPC_MAX_CAPS>;
+    using Handles = libk::InplaceVector<Handle, IPC_MAX_CAPS>;
+    Batch() noexcept = default;
+    Batch(Batch&&) noexcept = default;
+    auto operator=(Batch&&) noexcept -> Batch& = default;
+    [[nodiscard]] static auto prepare(Batch&, CSpace&, CSpace&, const Specs&) noexcept
+        -> std::expected<void, CSpaceError>;
+    [[nodiscard]] auto commit() noexcept -> std::expected<Handles, CSpaceError>;
+    [[nodiscard]] auto handles() const noexcept -> Handles;
+    void abort() noexcept { entries_.clear(); source_ = destination_ = nullptr; }
+    [[nodiscard]] auto empty() const noexcept -> bool { return entries_.empty(); }
+private:
+    CSpace* source_{};
+    CSpace* destination_{};
+    libk::InplaceVector<CSpace::Xfer, IPC_MAX_CAPS> entries_;
 };
 
 } // namespace cap

@@ -21,9 +21,8 @@ auto run(
         static_cast<void>(boot);
         return true;
     case Id::Dispatch:
-    case Id::IoLease:
     case Id::WaitPublication:
-        // These scenarios need a published CpuRuntime and run from the
+        // These scenarios need a published Cpu and run from the
         // runtime hook below. Selection itself is validated before bring-up.
         return true;
     }
@@ -32,12 +31,10 @@ auto run(
 
 auto run_runtime(
     Id selected,
-    CpuRuntime& runtime) noexcept -> bool {
+    Cpu& runtime) noexcept -> bool {
     switch (selected) {
     case Id::WaitPublication:
         return wait_publication(runtime);
-    case Id::IoLease:
-        return io_lease(runtime);
     case Id::Dispatch:
         return dispatch(runtime);
     case Id::Trap:

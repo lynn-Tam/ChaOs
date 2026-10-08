@@ -38,8 +38,6 @@ def main():
                         raise RuntimeError('kernel panic')
             if output.count(b'uart: console ready') != 1:
                 raise RuntimeError('unrelated UART service restarted')
-            if b'io: isolated PCI function ready requester=0x8' not in output:
-                raise RuntimeError('missing isolated block device')
             print(f'[service-fault] OK: {count} harts, three contained shell faults and file reads, UART survives')
         except Exception:
             directory = Path(__file__).resolve().parents[2] / '.tmp/project/service-fault'

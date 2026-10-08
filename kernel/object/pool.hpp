@@ -1,4 +1,5 @@
 #pragma once
+#include <work.hpp>
 
 #include <libk/assert.hpp>
 #include <base/slab.hpp>
@@ -70,8 +71,6 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         [[nodiscard]] auto object() const noexcept -> const T* { return reinterpret_cast<const T*>(storage); }
     };
 
-    static_assert(__builtin_offsetof(Slot, anchor) == 0);
-
     static constexpr usize slots_per_page = Storage::capacity();
 
   public:
@@ -116,14 +115,16 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         PendingToken token_{};
     };
 
-    explicit pool(mm::Pmm& pmm, libk::delegate<void() noexcept>& reclaim_notify) noexcept
-        : pmm_(&pmm), cleanup_notify_(&reclaim_notify) {
+    explicit pool(mm::Pmm& pmm, WorkQueue& work) noexcept
+        : pmm_(&pmm), work_(&work), job_(Work::Fn::bind<&pool::run_work>(*this)) {
+        static_assert(__builtin_offsetof(Slot, anchor) == 0);
         static_assert(slots_per_page != 0);
         static_assert(alignof(T) <= mm::page_size);
     }
 
     ~pool() noexcept {
-        drain_reclaim();
+        work_->close(job_);
+        drain();
         libk_assert(storage_.live() == 0);
         while (auto* page = storage_.take_page()) release_page(page);
     }
@@ -207,32 +208,6 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             done.complete();
         }
         return true;
-    }
-
-    // Finalizers run outside the pool lock. Only the designated cleanup executor (or
-    // exclusive test/teardown code) may drain; never hard interrupt or commit.
-    auto drain_reclaim() noexcept -> usize {
-        usize count{};
-        for (;;) {
-            Slot* slot{};
-            {
-                sync::Lock guard{lock_};
-                slot = reclaim_head_;
-                if (slot == nullptr) return count;
-                reclaim_head_ = slot->next_reclaim;
-                slot->next_reclaim = nullptr;
-                slot->anchor.queued_ = false;
-                libk_assert(slot->anchor.phase_ == anchor::phase::retiring);
-                libk_assert(slot->anchor.clean_);
-                libk_assert(slot->anchor.refs_ == 0);
-                slot->anchor.phase_ = anchor::phase::quiescent;
-            }
-            traits<T>::destroy(*slot->object());
-            auto refund = slot->sponsorship.detach();
-            finalize_free(*slot);
-            refund.complete();
-            ++count;
-        }
     }
 
     [[nodiscard]] auto live_count() const noexcept -> usize {
@@ -400,10 +375,34 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return true;
     }
 
-    void notify_cleanup() noexcept {
-        // After queue publication, the slot may already have been destroyed.
-        libk_assert(cleanup_notify_ != nullptr);
-        if (*cleanup_notify_) (*cleanup_notify_)();
+    // Only the worker or exclusive pool teardown runs finalizers.
+    void drain(usize budget = std::numeric_limits<usize>::max()) noexcept {
+        for (usize i = 0; i < budget; ++i) {
+            Slot* slot{};
+            {
+                sync::Lock guard{lock_};
+                slot = reclaim_head_;
+                if (slot == nullptr) return;
+                reclaim_head_ = slot->next_reclaim;
+                slot->next_reclaim = nullptr;
+                slot->anchor.queued_ = false;
+                libk_assert(slot->anchor.phase_ == anchor::phase::retiring);
+                libk_assert(slot->anchor.clean_);
+                libk_assert(slot->anchor.refs_ == 0);
+                slot->anchor.phase_ = anchor::phase::quiescent;
+            }
+            traits<T>::destroy(*slot->object());
+            auto refund = slot->sponsorship.detach();
+            finalize_free(*slot);
+            refund.complete();
+        }
+    }
+
+    void notify_cleanup() noexcept { work_->post(job_); }
+    void run_work() noexcept {
+        drain(8);
+        sync::Lock guard{lock_};
+        if (reclaim_head_) work_->post(job_);
     }
 
     void finalize_free(Slot& slot) noexcept {
@@ -429,7 +428,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     mm::Pmm* pmm_{};
-    libk::delegate<void() noexcept>* cleanup_notify_{};
+    WorkQueue* work_{};
+    Work job_;
     mutable sync::Spin lock_{};
     Storage storage_{};
     Slot* reclaim_head_{};
@@ -438,26 +438,24 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 template <typename T> using pending = typename pool<T>::pending;
 
 // Typed storage only. Construction policy belongs to the payload/caller;
-// every pool borrows the same cleanup notifier from its actual executor.
+// every pool posts finalizers to the same actual worker.
 template <class... Ts> class store {
   public:
-    store(mm::Pmm& pmm, libk::delegate<void() noexcept>& notify) noexcept {
-        ((void)std::get<libk::ManualLifetime<pool<Ts>>>(pools_).emplace(pmm, notify), ...);
+    store(mm::Pmm& pmm, WorkQueue& work) noexcept : pmm_(&pmm), work_(&work) {
+        ((void)std::get<libk::ManualLifetime<pool<Ts>>>(pools_).emplace(pmm, work), ...);
     }
     ~store() noexcept {
-        drain();
+        while (work_->run()) {}
         (std::get<libk::ManualLifetime<pool<Ts>>>(pools_).reset(), ...);
     }
+    auto pmm() noexcept -> mm::Pmm& { return *pmm_; }
+    auto work() noexcept -> WorkQueue& { return *work_; }
     template <class T> auto get() noexcept -> pool<T>& {
         return *std::get<libk::ManualLifetime<pool<T>>>(pools_);
     }
-    auto drain() noexcept -> usize {
-        usize count{};
-        ((count += get<Ts>().drain_reclaim()), ...);
-        return count;
-    }
-
   private:
+    mm::Pmm* pmm_;
+    WorkQueue* work_;
     std::tuple<libk::ManualLifetime<pool<Ts>>...> pools_;
 };
 

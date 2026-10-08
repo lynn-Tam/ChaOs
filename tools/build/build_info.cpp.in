@@ -1,2 +1,4 @@
-#define BUILD_ID "@VCS_TAG@" IMAGE_SUFFIX
-#include <kernel/boot/build_id.cpp>
+#ifndef IMAGE_SUFFIX
+#define IMAGE_SUFFIX ""
+#endif
+extern const char build_id[] = "@VCS_TAG@" IMAGE_SUFFIX;

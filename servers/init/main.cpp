@@ -1,3 +1,4 @@
+#include <sys/pci.hpp>
 #include <servers/runtime/service.hpp>
 #include <servers/deploy/launch.hpp>
 #include <servers/deploy/services.hpp>
@@ -8,6 +9,7 @@ deploy::program program;
 constexpr size_t ServiceCapacity = 8;
 using Supervisor = deploy::tasks<ServiceCapacity, 24>;
 Supervisor supervisor;
+std::array<sys::pci::Binding, 2> bindings;
 
 void report_uart(const boot::BootView& info,
     status_t startup = STATUS_OK,
@@ -41,6 +43,9 @@ void report_uart(const boot::BootView& info,
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     const auto info = sys::service::bootstrap(address, size);
+    auto pci = sys::pci::Bus::open(info, 0x3100'0000);
+    if (!pci) sys::exit(pci.error());
+    sys::service::require(pci->configure(0x1042'1af4));
     report_uart(info);
     sys::service::require(supervisor.load(program, info));
     supervisor.open(info);
@@ -69,16 +74,20 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     sys::service::require(supervisor.add("service.control", control_client.selector(),
         OBJECT_KIND_CHANNEL, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_DUPLICATE, 1));
     sys::service::Connection control{control_root.selector(), events.selector()};
-    for (size_t i = 0; i < info.device_count(); ++i) {
-        const auto* device = info.device_import(i);
-        sys::service::require(supervisor.add(device->name, device->handle,
-            OBJECT_KIND_DEVICE, RIGHT_CONNECT | RIGHT_DUPLICATE));
+    // Assignment belongs to root policy, independent of PCI slot numbering.
+    const char* labels[] = {"block.host", "store.host"};
+    for (size_t i = 0; i < pci->count(0x1042'1af4) && i < std::size(labels); ++i) {
+        auto found = pci->find(0x1042'1af4, i);
+        if (!found) sys::exit(found.error());
+        bindings[i] = std::move(*found);
+        sys::service::require(supervisor.add(labels[i], bindings[i].cap.selector(),
+            OBJECT_KIND_IO_HOST, RIGHT_CONNECT | RIGHT_DUPLICATE, bindings[i].rid, 1));
     }
     deploy::services<ServiceCapacity, 24> services{supervisor, program, events.selector()};
     const auto started = services.start();
     if (started.status != STATUS_OK) {
         const auto task = started.task
-            ? program.plan().symbol(program.plan().task(*started.task)->name)
+            ? program.plan().string(program.plan().task(*started.task)->name)
             : deploy::ByteView{};
         report_uart(info, started.status, task);
     }

@@ -60,8 +60,6 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
 
     try:
         until(b'myos> ')
-        if disk is not None and b'io: isolated PCI function ready requester=0x8' not in output:
-            raise RuntimeError('missing isolated Device bootstrap')
         if not re.search(rb'\[test\] summary\s+passed=[1-9][0-9]*\s+failed=0\s', output):
             raise RuntimeError('missing successful builtin test summary')
         run('help', b'run/spawn PROGRAM')

@@ -21,8 +21,8 @@ def manual(value, name=None):
     assert bool(value['engaged_']), 'uninitialized ' + str(value.type)
     typ = gdb.lookup_type(name) if name else value.type.strip_typedefs().template_argument(0)
     return value['storage_'].address.cast(typ.pointer()).dereference()
-state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
-memory = manual(state['objects_'])
+state = manual(gdb.parse_and_eval("'boot_storage'"), 'Boot')
+memory = state['objects']
 def pool(name):
     def find(value):
         if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
@@ -52,9 +52,9 @@ def live_objects(pool, name):
         page = page['next']
 # Requests now live on virtual kernel stacks. Resolve those addresses through
 # the real kernel page table instead of assuming every payload is a RAM alias.
-layout = manual(state['pmm_'], 'mm::Pmm')['window_']
+layout = state['pmm']['window_']
 delta = int(layout['va']['value_']) - int(layout['pa']['value_'])
-kroot = manual(state['kernel_vspace_'], 'mm::KSpace')['root_']['root_']
+kroot = state['vm']['root_']['root_']
 inferior = gdb.selected_inferior()
 def alias(address, typ):
     table = int(kroot['value_']) << 12

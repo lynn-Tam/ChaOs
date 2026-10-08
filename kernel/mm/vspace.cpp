@@ -3,7 +3,7 @@
 #include <base/types.hpp>
 #include <cap/cspace.hpp>
 #include <cap/grant.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <expected>
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
@@ -186,14 +186,14 @@ void Backing::invalidate_memory(void* ctx, MemWork&& work) noexcept {
     auth.owner_->request_invalidation(auth, std::move(work));
 }
 
-void Backing::released(void* ctx) noexcept { static_cast<Backing*>(ctx)->owner_->schedule_work(); }
+void Backing::released(void* ctx) noexcept { auto& space = *static_cast<Backing*>(ctx)->owner_; space.work_->post(space.job_); }
 
-void Backing::invalidate_grant(void* ctx, cap::GrantWork&& work, cap::GrantInvalidation) noexcept {
+void Backing::invalidate_grant(void* ctx, cap::GrantWork&& work) noexcept {
     auto& auth = *static_cast<Backing*>(ctx);
     auth.owner_->request_invalidation(auth, std::move(work));
 }
 
-auto VSpace::prepare(const object::ref<>& payer, Pmm& pmm, KSpace& kernel, SpaceWork& work) noexcept
+auto VSpace::prepare(const object::ref<>& payer, Pmm& pmm, KSpace& kernel, WorkQueue& work) noexcept
     -> std::expected<Data, VSpaceError> {
     object::ref<> source;
     resource::Charge charge;
@@ -212,7 +212,8 @@ auto VSpace::prepare(const object::ref<>& payer, Pmm& pmm, KSpace& kernel, Space
 
 VSpace::VSpace(Data&& data) noexcept
     : pmm_(data.pmm_), kernel_(data.kernel_), work_(data.work_), payer_(std::move(data.payer_)),
-      mappings_(*pmm_), binding_pool_(*pmm_), pages_(*pmm_), views_(*pmm_), work_open_(true),
+      mappings_(*pmm_), binding_pool_(*pmm_), pages_(*pmm_), views_(*pmm_),
+      job_(Work::Fn::bind<&VSpace::run_work>(*this)),
       table_charge_(std::move(data.charge_)) {
     (void) root_.emplace(std::move(data.root_));
 }
@@ -225,8 +226,7 @@ VSpace::~VSpace() noexcept {
     libk_assert(!editing_ && !draining_ && retired_.empty());
     libk_assert(invalidations_.empty());
     libk_assert(!receipt_ && !cleanup_);
-    libk_assert(!work_hook_.is_linked());
-    libk_assert(!work_open_.load<libk::MemoryOrder::Acquire>());
+
     libk_assert(bindings_ == 0);
     libk_assert(!table_charge_);
 }
@@ -276,7 +276,7 @@ void VSpace::detach_execution() noexcept {
         ready = state_ == VSpaceState::Stopping && bindings_ == 0;
     }
     if (ready) {
-        schedule_work();
+        work_->post(job_);
     }
 }
 
@@ -308,7 +308,7 @@ auto VSpace::commit_flush(Tlb::Edit&& mutation, VmCtx ctx, Flush& retire, resour
         }
         return (VmStatus::Pending);
     }
-    schedule_work();
+    work_->post(job_);
     return (VmStatus::Pending);
 }
 
@@ -365,10 +365,10 @@ void VSpace::finish_bindings() noexcept {
             sync::Lock lock{lock_};
             draining_ = false;
             try_finish_retire();
-            wake = work_open_.load<libk::MemoryOrder::Acquire>() &&
+            wake = state_ != VSpaceState::Quiescent &&
                    (!invalidations_.empty() || !retired_.empty() || state_ == VSpaceState::Stopping);
         }
-        if (wake) schedule_work();
+        if (wake) work_->post(job_);
         finish_waiters();
     }};
     for (;;) {
@@ -489,6 +489,7 @@ void VSpace::retire(object::cleanup&& cleanup) noexcept {
         [[maybe_unused]] auto& retained = cleanup_.emplace(std::move(cleanup));
         if (!root_) {
             libk_assert(layout_.empty() && !receipt_ && !editing_);
+            work_->close(job_);
             state_ = VSpaceState::Quiescent;
             guard.restore();
             complete_cleanup();
@@ -499,7 +500,7 @@ void VSpace::retire(object::cleanup&& cleanup) noexcept {
     if (can_start) {
         static_cast<void>(clear(VmCtx{.local = CpuId{0}}, VRange{Virt{UserBegin}, UserEnd - UserBegin}));
     } else {
-        schedule_work();
+        work_->post(job_);
     }
     complete_cleanup();
 }
@@ -542,7 +543,7 @@ void VSpace::end_edit() noexcept {
                state_ == VSpaceState::Stopping;
     }
     // Submit from actual obligations, after local rollback and outside lock_.
-    if (wake) schedule_work();
+    if (wake) work_->post(job_);
 }
 
 auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, VSpaceError> {
@@ -1454,7 +1455,7 @@ void VSpace::request_invalidation(Backing& auth, MemWork&& work) noexcept {
             invalidations_.push_back(auth);
         }
     }
-    schedule_work();
+    work_->post(job_);
 }
 
 void VSpace::request_invalidation(Backing& auth, cap::GrantWork&& work) noexcept {
@@ -1466,7 +1467,7 @@ void VSpace::request_invalidation(Backing& auth, cap::GrantWork&& work) noexcept
             invalidations_.push_back(auth);
         }
     }
-    schedule_work();
+    work_->post(job_);
 }
 
 auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expected<VmStatus, VSpaceError> {
@@ -1539,12 +1540,11 @@ auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expec
     return committed;
 }
 
-auto VSpace::service(VmCtx ctx) noexcept -> VSpaceServiceResult {
+auto VSpace::step(VmCtx ctx) noexcept -> bool {
 
     Backing* next{};
     bool retire_root{};
     Flush* waiting_flush{};
-    bool settled{};
     bool waiting{};
     resource::Charge refund{};
     {
@@ -1562,13 +1562,13 @@ auto VSpace::service(VmCtx ctx) noexcept -> VSpaceServiceResult {
         libk_assert(ctx.cpus);
         if (waiting_flush->kick(*ctx.cpus)) {
             ipi_retries_ = 0;
-            return VSpaceServiceState::Waiting;
+            return false;
         }
-        if (++ipi_retries_ >= 8) return std::unexpected(VSpaceServiceError::InvariantViolation);
-        return VSpaceServiceState::Retry;
+        libk_assert(++ipi_retries_ < 8);
+        return true;
     }
     if (waiting) {
-        return (VSpaceServiceState::Waiting);
+        return false;
     }
 
     // This drains external Memory/Grant relations and sponsored node storage.
@@ -1584,53 +1584,20 @@ auto VSpace::service(VmCtx ctx) noexcept -> VSpaceServiceResult {
             retire_root = true;
         } else {
             try_finish_retire();
-            settled =
-                !receipt_ && invalidations_.empty() && retired_.empty() && state_ != VSpaceState::Stopping;
         }
     }
     complete_cleanup();
     if (waiting || (next == nullptr && !retire_root)) {
-        return (settled ? VSpaceServiceState::Settled : VSpaceServiceState::Waiting);
+        return false;
     }
-    if (retire_root) {
-        auto started = clear(ctx, VRange{Virt{UserBegin}, UserEnd - UserBegin});
-        if (!started) {
-            if (started.error() == VSpaceError::Busy) {
-                return (VSpaceServiceState::Waiting);
-            }
-
-            return std::unexpected(started.error() == VSpaceError::TranslationCorrupt
-                                       ? VSpaceServiceError::TranslationCorrupt
-                                       : VSpaceServiceError::ResourceExhausted);
-        }
-        if (started.value() == VmStatus::Complete) {
-            finish_bindings();
-        }
-        complete_cleanup();
-        return (started.value() == VmStatus::Complete && !pending() ? VSpaceServiceState::Settled
-                                                                    : VSpaceServiceState::Progress);
-    }
-    auto started = start_invalidation(ctx, *next);
-    if (!started) {
-        if (started.error() == VSpaceError::Busy) return VSpaceServiceState::Waiting;
-        if (started.error() == VSpaceError::BackingFailed) {
-
-            return std::unexpected(VSpaceServiceError::BackingFailed);
-        }
-
-        return std::unexpected(started.error() == VSpaceError::TranslationCorrupt
-                                   ? VSpaceServiceError::TranslationCorrupt
-                                   : VSpaceServiceError::ResourceExhausted);
-    }
-    if (started.value() == VmStatus::Complete) {
-        // Preserve service()'s synchronous-settle contract when the complete
-        // translation made its last auth detachable.  The drain itself
-        // remains outside lock_.
-        finish_bindings();
-    }
+    auto started = retire_root
+        ? clear(ctx, VRange{Virt{UserBegin}, UserEnd - UserBegin})
+        : start_invalidation(ctx, *next);
+    if (!started && started.error() == VSpaceError::Busy) return false;
+    libk_assert(started);
+    if (*started == VmStatus::Complete) finish_bindings();
     complete_cleanup();
-    return (started.value() == VmStatus::Complete && !pending() ? VSpaceServiceState::Settled
-                                                                : VSpaceServiceState::Progress);
+    return *started != VmStatus::Complete || pending();
 }
 
 auto VSpace::pending() const noexcept -> bool {
@@ -1639,13 +1606,7 @@ auto VSpace::pending() const noexcept -> bool {
            state_ == VSpaceState::Stopping;
 }
 
-void VSpace::flush_ready() noexcept { schedule_work(); }
-
-void VSpace::schedule_work() noexcept {
-    libk_assert(work_ != nullptr);
-
-    work_->submit(*this);
-}
+void VSpace::flush_ready() noexcept { work_->post(job_); }
 
 auto VSpace::work_ready() const noexcept -> bool {
     sync::Lock guard{lock_};
@@ -1663,108 +1624,28 @@ void VSpace::try_finish_retire() noexcept {
         return;
     }
     release_root();
-    work_open_.store<libk::MemoryOrder::Release>(false);
+    work_->close(job_);
     state_ = VSpaceState::Quiescent;
 }
 
 void VSpace::complete_cleanup() noexcept {
-    {
-        sync::Lock guard{lock_};
-        if (state_ != VSpaceState::Quiescent || !cleanup_) {
-            return;
-        }
-        libk_assert(!work_open_.load<libk::MemoryOrder::Acquire>());
-    }
-    libk_assert(work_ != nullptr);
-    work_->withdraw(*this);
-
     object::cleanup cleanup{};
     {
         sync::Lock guard{lock_};
-        if (!cleanup_) {
-            return;
-        }
-        libk_assert(state_ == VSpaceState::Quiescent);
+        if (state_ != VSpaceState::Quiescent || !cleanup_) return;
         cleanup = std::move(*cleanup_);
         cleanup_.reset();
     }
     cleanup.complete();
 }
 
-SpaceWork::~SpaceWork() noexcept {
-    libk_assert(!notifier_);
-    libk_assert(queue_.empty());
-}
-
-void SpaceWork::submit(VSpace& space) noexcept {
-    Notifier notifier{};
-    {
-        sync::Lock guard{lock_};
-        if (!space.work_open_.load<libk::MemoryOrder::Acquire>()) {
-            return;
-        }
-        if (space.work_hook_.is_linked()) {
-            return;
-        }
-        queue_.push_back(space);
-        notifier = notifier_;
-    }
-    if (notifier) notifier();
-}
-
-auto SpaceWork::take() noexcept -> VSpace* {
-    sync::Lock guard{lock_};
-    return queue_.empty() ? nullptr : &queue_.pop_front();
-}
-
-void SpaceWork::withdraw(VSpace& space) noexcept {
-    sync::Lock guard{lock_};
-    if (space.work_hook_.is_linked()) {
-        queue_.erase(space);
-    }
-}
-
-auto SpaceWork::run(VmCtx ctx, usize budget) noexcept -> SpaceBatch {
-    libk_assert(budget != 0);
-    usize processed{};
-    usize progressed{};
-    for (usize completed = 0; completed < budget; ++completed) {
-        VSpace* const space = take();
-        if (space == nullptr) {
-            break;
-        }
-        const VSpaceServiceResult result = space->service(ctx);
-        if (!result) {
-            libk_assert(result);
-        }
-        const VSpaceServiceState state = result.value();
-        if (state == VSpaceServiceState::Progress || state == VSpaceServiceState::Settled) {
-            ++progressed;
-        }
-        if (state == VSpaceServiceState::Retry || state == VSpaceServiceState::Progress ||
-            space->work_ready()) {
-            submit(*space);
-        }
-        ++processed;
-    }
-    return SpaceBatch{processed, progressed, pending()};
-}
-
-auto SpaceWork::pending() const noexcept -> bool {
-    sync::Lock guard{lock_};
-    return !queue_.empty();
-}
-
-void SpaceWork::bind_notifier(Notifier notifier) noexcept {
-    libk_assert(notifier);
-    sync::Lock guard{lock_};
-    libk_assert(!notifier_);
-    notifier_ = notifier;
-}
-
-void SpaceWork::unbind_notifier() noexcept {
-    sync::Lock guard{lock_};
-    notifier_.reset();
+void VSpace::run_work() noexcept {
+    VmCtx ctx{};
+    if (auto* entry = arch::local(); entry && entry->owner) {
+        auto& cpu = *entry->owner;
+        ctx = {cpu.cpus, cpu.id};
+    } // Before CPU publication, no hardware root can have remote users.
+    if (step(ctx) || work_ready()) work_->post(job_);
 }
 
 } // namespace mm

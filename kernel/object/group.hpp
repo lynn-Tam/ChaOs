@@ -20,7 +20,7 @@ template <typename T> struct traits;
 }
 
 namespace cap {
-class GrantGraph;
+class Graph;
 }
 
 namespace object {
@@ -46,9 +46,9 @@ class group final : private libk::noncopyable_nonmovable {
         Txn(Txn&&) noexcept = default;
         auto operator=(Txn&&) noexcept -> Txn& = default;
         explicit operator bool() const noexcept { return bool(h_); }
-        auto adopt(cap::GrantGraph&, ref<>&& target, cap::View ceiling) noexcept
+        auto adopt(cap::Graph&, ref<>&& target, cap::View ceiling) noexcept
             -> std::expected<void, cap::GrantError>;
-        auto root(cap::GrantGraph&, cap::View) noexcept -> std::expected<void, cap::GrantError>;
+        auto root(cap::Graph&, cap::View) noexcept -> std::expected<void, cap::GrantError>;
         template <class T, class... Args>
         auto make(pool<T>& storage, resource::Reservation charge, Args&&... args) noexcept {
             using Err = typename decltype(storage.create(std::move(charge),
@@ -139,7 +139,7 @@ class group final : private libk::noncopyable_nonmovable {
     friend class resource::Charge;
     friend class resource::Sponsorship;
     friend class allocation;
-    friend class cap::GrantGraph;
+    friend class cap::Graph;
 
     void bind_sponsor(resource::Sponsorship& sponsor) noexcept {
         libk_assert(sponsor_ == nullptr);
@@ -202,7 +202,7 @@ class allocation final : private libk::noncopyable_nonmovable {
 
   private:
     friend class group;
-    friend class cap::GrantGraph;
+    friend class cap::Graph;
     friend class group::Txn;
 
     void commit() noexcept;
@@ -214,7 +214,7 @@ class allocation final : private libk::noncopyable_nonmovable {
     void child_closed() noexcept;
 
     group* owner_{};
-    cap::GrantGraph* graph_{};
+    cap::Graph* graph_{};
     cap::GrantKey root_{};
     ref<> target_{};
     cap::GrantRevoke revoke_{};

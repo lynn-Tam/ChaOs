@@ -3,10 +3,8 @@
 #include <mm/mem.hpp>
 #include <object/ref.hpp>
 #include <syscall/call.hpp>
-#include <state.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
+#include <object/pool.hpp>
+#include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <limits>
 #include <uapi/abi.h>
@@ -21,7 +19,7 @@
 #include <uapi/mem.h>
 #include <io/space.hpp>
 #include <ipc/buffer.hpp>
-#include <io/device.hpp>
+#include <io/host.hpp>
 #include <uapi/io.h>
 #include <variant>
 #include <sched/dispatcher.hpp>
@@ -32,16 +30,12 @@ namespace syscall {
 
 template<usize op>
 auto clock_now(Call& inv) noexcept -> Result {
-    auto* kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel);
-    return returned(STATUS_OK, kernel->clock().now().ticks());
+    return returned(STATUS_OK, inv.cpu.dispatcher().clock().now().ticks());
 }
 
 template<usize op>
 auto clock_frequency(Call& inv) noexcept -> Result {
-    auto* kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel);
-    return returned(STATUS_OK, kernel->clock().ticks_per_second());
+    return returned(STATUS_OK, inv.cpu.dispatcher().clock().ticks_per_second());
 }
 
 auto cap_status(cap::CSpaceError error) noexcept -> status_t {
@@ -181,14 +175,6 @@ auto range_of(usize base, usize size) noexcept
         : std::nullopt;
 }
 
-auto vm_context(CpuLocal& cpu) noexcept -> mm::VmCtx {
-    libk_assert(cpu.descriptor != nullptr);
-    return mm::VmCtx{
-        .cpus = cpu.runtime().owner_registry,
-        .local = cpu.descriptor->logical_id(),
-    };
-}
-
 [[nodiscard]] auto dest(
     cap::CSpace& current,
     cap::Handle handle) noexcept
@@ -272,8 +258,7 @@ auto cap_call(Call& inv) noexcept -> Result {
             return returned(STATUS_BAD_ARGS);
         }
         if (!target) {
-            auto delegated = cspace.typed_delegate(
-                source, cspace, decoded.value());
+            auto delegated = cspace.transfer(source, cspace, cap::XferOp::Derive, decoded.value());
             return returned(
                 delegated ? STATUS_OK : cap_status(delegated.error()),
                 delegated ? delegated.value().raw() : 0);
@@ -282,8 +267,7 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!resolved) {
             return returned(cap_status(resolved.error()));
         }
-        auto delegated = cspace.typed_delegate(
-            source, resolved.value().object(), decoded.value());
+        auto delegated = cspace.transfer(source, resolved.value().object(), cap::XferOp::Derive, decoded.value());
         return returned(
             delegated ? STATUS_OK : cap_status(delegated.error()),
             delegated ? delegated.value().raw() : 0);
@@ -297,9 +281,8 @@ auto cap_call(Call& inv) noexcept -> Result {
             return returned(STATUS_BAD_ARGS);
         }
         return with_dest(cspace, target, [&](cap::CSpace& out) {
-            return op == SYS_CAP_DUPLICATE
-                ? cspace.duplicate(source, out, *rights)
-                : cspace.delegate(source, out, *rights);
+            return cspace.transfer(source, out,
+                op == SYS_CAP_DUPLICATE ? cap::XferOp::Copy : cap::XferOp::Derive, *rights);
         });
     }
     if constexpr (op == SYS_CAP_MOVE) {
@@ -309,7 +292,7 @@ auto cap_call(Call& inv) noexcept -> Result {
             return returned(STATUS_BAD_ARGS);
         }
         return with_dest(cspace, target, [&](cap::CSpace& out) {
-            return cspace.move(source, out);
+            return cspace.transfer(source, out, cap::XferOp::Move);
         });
     }
     if constexpr (op == SYS_CAP_REVOKE) {
@@ -323,11 +306,11 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!source || trap.arg(1) > 1) {
             return returned(STATUS_BAD_ARGS);
         }
-        libk_assert(inv.cpu.runtime().owner_registry != nullptr);
+        libk_assert(inv.cpu.cpus != nullptr);
         Receipt receipt;
         cap::GrantRevoke done{sync::Latch::Notifier::bind<&Receipt::signal>(receipt)};
         libk_assert(thread->begin_wait(receipt.completion(),
-            *inv.cpu.runtime().owner_registry));
+            *inv.cpu.cpus));
         auto started = cspace.revoke(source, done, trap.arg(1) != 0);
         if (!started) {
             thread->cancel_wait();
@@ -435,7 +418,7 @@ template<usize op>
     if (!ref) return returned(STATUS_BUSY);
     auto& mem = memory->object();
     memory->reset();
-    auto* cpus = inv.cpu.runtime().owner_registry;
+    auto* cpus = inv.cpu.cpus;
     libk_assert(cpus);
     const auto result = [&]() {
         if constexpr (op == SYS_MEM_TRIM) return mem.trim(*thread, *cpus, range);
@@ -467,7 +450,7 @@ template<usize op>
         if (!self) {
             return returned(STATUS_BUSY);
         }
-        CpuRegistry* const cpus = inv.cpu.runtime().owner_registry;
+        Cpus* const cpus = inv.cpu.cpus;
         libk_assert(cpus != nullptr);
         auto& object = pool.value().object();
         if (!thread->begin_wait(receipt.completion(), *cpus)) {
@@ -500,7 +483,7 @@ template<usize op>
     auto dest = notification.value().reference();
     if (!self || !dest) return returned(STATUS_BUSY);
     const auto id = dest.value().id();
-    auto& notifications = inv.cpu.runtime().kernel->pool<ipc::Notification>();
+    auto& notifications = inv.cpu.objects.get<ipc::Notification>();
     const resource::RefundNotifier notifier{&notifications,
         [](void* ctx, usize slot, u64 generation, u64 bits) noexcept {
             // Weak generation identity: a dead inbox drops the delivery. No
@@ -756,6 +739,7 @@ static_assert(static_cast<u8>(io::SpaceState::Faulted) == IO_SPACE_FAULTED);
 
 static auto io_status(io::SpaceError error) noexcept -> status_t {
     switch (error) {
+    case io::SpaceError::Absent: return STATUS_NOT_FOUND;
     case io::SpaceError::InvalidState:
     case io::SpaceError::Busy: return STATUS_BUSY;
     case io::SpaceError::Denied: return STATUS_BAD_RIGHTS;
@@ -771,7 +755,7 @@ static auto io_status(io::SpaceError error) noexcept -> status_t {
 
 [[gnu::noinline]] static auto bind(Call& inv, cap::Resolved<io::Space>& space) noexcept -> Result {
     const auto& trap = inv.trap;
-    auto device = inv.cspace.resolve<io::Device>(handle_of(trap.arg(1)),
+    auto device = inv.cspace.resolve<io::Host>(handle_of(trap.arg(1)),
         cap::Rights::of(cap::Right::Connect));
     auto memory = inv.cspace.resolve<mm::Mem>(handle_of(trap.arg(2)),
         cap::Rights::of(cap::Right::Map));
@@ -796,28 +780,6 @@ static auto watch(Call& inv, io::Space& space) noexcept -> Result {
     return returned(result ? STATUS_OK : io_status(result.error()));
 }
 
-static auto write_info(Call& inv, const io::DeviceInfo& info) noexcept -> Result {
-    auto* buffer = inv.target->ipc_buffer();
-    return returned(buffer && buffer->write(inv.trap.arg(1),
-        {reinterpret_cast<const byte*>(&info), sizeof(info)})
-        ? STATUS_OK : STATUS_BAD_ARGS);
-}
-
-static auto info(Call& inv, io::Space& space) noexcept -> Result {
-    auto snapshot = space.info();
-    if (!snapshot) return returned(io_status(snapshot.error()));
-    snapshot.value().version = IO_INFO_VERSION;
-    snapshot.value().requester = 0; // IO_INFO's second word is reserved.
-    return write_info(inv, snapshot.value());
-}
-
-[[gnu::noinline]] static auto device_info(Call& inv) noexcept -> Result {
-    auto device = inv.cspace.resolve<io::Device>(
-        handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
-    if (!device) return returned(cap_status(device.error()));
-    return write_info(inv, device.value()->info());
-}
-
 static auto install(Call& inv,
     std::expected<cap::GrantRef, io::SpaceError>&& exported) noexcept -> Result {
     if (!exported) return returned(io_status(exported.error()));
@@ -832,8 +794,7 @@ static auto install(Call& inv,
 
 template<usize op>
 auto io_call(Call& inv) noexcept -> Result {
-    if constexpr (op == SYS_DEVICE_INFO) return device_info(inv);
-    const auto right = op == SYS_IO_SPACE_STATE || op == SYS_IO_SPACE_INFO
+    const auto right = op == SYS_IO_SPACE_STATE
         ? cap::Right::Inspect : op == SYS_IO_SPACE_CLOSE ? cap::Right::Close : cap::Right::Connect;
     auto space = inv.cspace.resolve<io::Space>(handle_of(inv.trap.arg(0)),
         cap::Rights::of(right));
@@ -842,8 +803,13 @@ auto io_call(Call& inv) noexcept -> Result {
     case SYS_IO_SPACE_BIND: return bind(inv, space.value());
     case SYS_IO_SPACE_WATCH: return watch(inv, space.value().object());
     case SYS_IO_SPACE_STATE: return returned(STATUS_OK, static_cast<u8>(space.value()->state()));
-    case SYS_IO_SPACE_INFO: return info(inv, space.value().object());
-    case SYS_IO_SPACE_BAR: return install(inv, space.value()->bar(inv.trap.arg(1)));
+    case SYS_IO_SPACE_REG: {
+        auto reg = space.value()->reg(inv.trap.arg(1));
+        if (!reg) return returned(io_status(reg.error()));
+        auto result = install(inv, std::move(reg->first));
+        if (result.status == STATUS_OK) result.value2 = reg->second;
+        return result;
+    }
     case SYS_IO_SPACE_IRQ: return install(inv, space.value()->interrupt());
     case SYS_IO_SPACE_CLOSE:
         space.value()->close();
@@ -881,14 +847,14 @@ auto vm_call(Call& inv) noexcept -> Result {
         std::get_if<cap::VmLimit>(&effective.data);
     libk_assert(where != nullptr);
     mm::VSpace& space = target.value().object();
-    const mm::VmCtx vm = vm_context(inv.cpu);
+    const mm::VmCtx vm = mm::VmCtx{inv.cpu.cpus, inv.cpu.id};
     const auto finish = [&](mm::VmStatus status) noexcept -> status_t {
         if (status == mm::VmStatus::Complete) return STATUS_OK;
         auto reference = target.value().reference();
         libk_assert(reference);
         mm::Fence fence{std::move(reference).value(), space};
         target.value().reset(); // Admission lease cannot block cap revocation.
-        auto* cpus = inv.cpu.runtime().owner_registry;
+        auto* cpus = inv.cpu.cpus;
         libk_assert(cpus && inv.target->begin_wait(fence.completion(), *cpus));
         fence.start();
         inv.target->block();
@@ -959,7 +925,7 @@ auto vm_call(Call& inv) noexcept -> Result {
             return returned(STATUS_BAD_ARGS);
         }
         const cap::View slice{*rights, cap::VmLimit{*range,*access}};
-        auto created = cspace.delegate(vspace_handle,cspace,slice,slice);
+        auto created = cspace.transfer(vspace_handle, cspace, cap::XferOp::Derive, slice);
         return returned(created ? STATUS_OK : cap_status(created.error()),
             created ? created->raw() : 0);
     }
@@ -1017,9 +983,7 @@ template<usize op>
         || binding == nullptr || !binding->startable()) {
         return returned(STATUS_BUSY);
     }
-    KernelState* const kernel = inv.cpu.runtime().kernel;
-    libk_assert(kernel != nullptr);
-    auto started = sched::start(kernel->cpus(), *binding);
+    auto started = sched::start(*inv.cpu.cpus, *binding);
     return returned(started ? STATUS_OK : STATUS_BUSY);
 }
 
@@ -1057,16 +1021,16 @@ static void publish(arch::TrapCtx& ctx, const Result& result) noexcept {
 
 
 auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    Thread* target = cpu.dispatcher()->current();
-    cap::CSpace* const cspace = cpu.cspace();
-    mm::VSpace* const vspace = cpu.vspace();
+    Cpu& cpu = current_cpu();
+    Thread* target = cpu.current;
+    cap::CSpace* const cspace = target ? target->env().cspace() : nullptr;
+    mm::VSpace* const vspace = target ? target->env().vspace() : nullptr;
     libk_assert(target && cspace != nullptr && vspace != nullptr);
 
     target->note_user_syscall();
     ctx.complete_syscall();
-    Call inv{cpu, target, *cspace, *vspace, ctx};
+    Call inv{cpu, target, *cspace, *vspace,
+             *cpu.idle().env().kernel_vspace(), ctx};
     const usize operation = ctx.arg(7);
     const bool leaf = target->activation() != nullptr;
     enum class Locus { Any, Base, Leaf };

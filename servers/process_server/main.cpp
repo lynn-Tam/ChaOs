@@ -2,7 +2,7 @@
 #include <utility>
 #include <servers/process_server/protocol.hpp>
 #include <servers/runtime/service.hpp>
-#include <servers/process_server/image.hpp>
+#include <servers/process_server/elf.hpp>
 #include <servers/process_server/pipe.hpp>
 #include <servers/process_server/policy.hpp>
 #include <sys/start.hpp>
@@ -18,7 +18,7 @@ struct Waiter final { service::Message reply; uint64_t deadline{}; };
 struct Job final {
     files::FileMemory package;
     deploy::program program;
-    process::Image image;
+    process::Elf elf;
     process::Pipe input;
     bool discard{};
     std::optional<Supervisor::handle> child;
@@ -26,7 +26,7 @@ struct Job final {
 
     void release_image() noexcept {
         input.close();
-        image.close();
+        elf.close();
         service::require(program.close());
         package = {};
     }
@@ -73,7 +73,7 @@ auto package_name(const char* name, size_t size, char (&path)[12]) noexcept -> b
     return true;
 }
 auto find(uint64_t token) noexcept -> Job* {
-    for (auto& job : jobs) if (job.child && job.child->token() == token) return &job;
+    for (auto& job : jobs) if (job.child && job.child->key() == token) return &job;
     return nullptr;
 }
 auto spawn(const boot::BootView& info, const service::Message& request,
@@ -128,15 +128,18 @@ auto spawn(const boot::BootView& info, const service::Message& request,
     if (status == STATUS_OK) {
         job->child = supervisor.launch(job->program,
         {reinterpret_cast<const uint8_t*>(name), length}, status,
-        {.image_source = job->image.source(view_descriptor, job->package.memory.selector(), address, job->package.size),
+        {.elf_source = job->elf.source(view_descriptor, job->package.memory.selector(), address, job->package.size),
          .arguments = &arguments,
-         .terminal_events = service::capability(info, BOOT_EVENTS),
+         .exit_events = service::capability(info, BOOT_EVENTS),
          .close_badge = uint64_t{1} << (8 + job - jobs), .sources = sources,
          .admit = process::admit});
     }
     reply.status = status;
-    if (job->child) reply.id = job->child->token();
-    else job->release_image();
+    if (job->child) {
+        // Failed construction still owns teardown; no process handle was published.
+        job->discard = status != STATUS_OK;
+        reply.id = job->child->key();
+    } else job->release_image();
     return reply;
 }
 // A two-stage pipeline is one admission request. Failed second-stage admission
@@ -158,11 +161,18 @@ auto pipeline(const boot::BootView& info, const service::Message& request,
     auto first = request;
     first.size = request.id;
     auto producer = spawn(info, first, input, pipe->writer());
-    if (producer.status != STATUS_OK) { pipe->close(); reply.status = producer.status; return reply; }
     pipe->producer = producer.id;
+    if (producer.status != STATUS_OK) {
+        // A failed build may still hold grants. Keep their source until drain.
+        if (producer.id) pipe->abort();
+        else pipe->close();
+        reply.status = producer.status;
+        return reply;
+    }
     service::Message second{.size = request.size - request.id};
     service::copy(second.data, request.data + request.id, second.size);
     auto consumer = spawn(info, second, pipe->reader());
+    pipe->consumer = consumer.id;
     if (consumer.status != STATUS_OK) {
         pipe->abort();
         auto* job = find(producer.id);
@@ -171,7 +181,6 @@ auto pipeline(const boot::BootView& info, const service::Message& request,
         reply.status = consumer.status;
         return reply;
     }
-    pipe->consumer = consumer.id;
     reply.status = STATUS_OK;
     reply.id = producer.id;
     reply.size = sizeof(consumer.id);
@@ -223,7 +232,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
                 // Ready proves TaskTable has released both the pool and plan.
                 const auto result = supervisor.result(*job.child);
                 if (!result) exit(STATUS_INTERNAL);
-                finish_streams(job.child->token(), result->status);
+                finish_streams(job.child->key(), result->status);
                 job.release_image();
                 if (job.discard) {
                     service::require(supervisor.collect(*job.child).status);
@@ -300,6 +309,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
                     continue;
                 }
                 }
+                if (reply.status != STATUS_OK) reply.id = 0;
                 replies.push(reply);
                 continue;
             }

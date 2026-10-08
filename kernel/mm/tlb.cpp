@@ -1,7 +1,6 @@
 #include <cpu/ipi.hpp>
 #include <cpu.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <mm/tlb.hpp>
 #include <pte.hpp>
 #include <trace.hpp>
@@ -48,7 +47,7 @@ void Flush::ack(CpuId cpu) noexcept {
     }));
 }
 
-bool Flush::kick(CpuRegistry &cpus) const noexcept {
+bool Flush::kick(Cpus &cpus) const noexcept {
     CpuSet pending;
     {
         sync::Lock lock{flush_lock};
@@ -56,9 +55,9 @@ bool Flush::kick(CpuRegistry &cpus) const noexcept {
     }
     bool sent = true;
     pending.for_each([&](CpuId cpu) noexcept {
-        const auto *desc = cpus.descriptor(cpu);
-        libk_assert(desc && cpus.runtime(cpu));
-        if (!send_ipi(desc->hardware_id())) {
+        const auto *target = cpus.get(cpu);
+        libk_assert(target);
+        if (!send_ipi(target->hw)) {
             sent = false;
             trace::emit(trace::Event::KickFail, cpu.raw);
         }
@@ -66,7 +65,7 @@ bool Flush::kick(CpuRegistry &cpus) const noexcept {
     return sent;
 }
 
-bool Tlb::Edit::commit(Flush &flush, CpuRegistry *cpus, CpuId local, bool executable) noexcept {
+bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable) noexcept {
     libk_assert(owner_ && !flush.submitted());
     flush.owner_ = owner_;
     flush.executable_ = executable;
@@ -123,30 +122,30 @@ CpuSet Tlb::active_cpus() const noexcept {
     return active_;
 }
 
-void Root::activate(CpuLocal &cpu) const noexcept {
-    libk_assert(!arch::interrupts_enabled() && cpu.descriptor);
-    const auto id = cpu.descriptor->logical_id();
-    auto *outgoing = cpu.active_tlb_;
+void Root::activate(Cpu &cpu) const noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    const auto id = cpu.id;
+    auto *outgoing = cpu.tlb;
     if (outgoing != state_) state_->enter(id);
     if (outgoing != state_) arch::activate_root(root_);
-    else libk_assert(cpu.active_root_ == root_);
+    else libk_assert(cpu.root == root_);
     // Every entry fences, including a same-root resumption. This replaces
     // version caches and also covers edits committed while this CPU was absent.
     arch::flush_tlb_all();
     arch::sync_instruction_stream();
-    cpu.active_tlb_ = state_;
-    cpu.active_root_ = root_;
+    cpu.tlb = state_;
+    cpu.root = root_;
     if (outgoing && outgoing != state_) outgoing->leave(id);
 }
 
-void Root::adopt(CpuLocal &cpu) const noexcept {
-    libk_assert(!arch::interrupts_enabled() && cpu.descriptor);
-    libk_assert(!cpu.active_tlb_ && !cpu.active_root_ && arch::root_active(root_));
-    state_->enter(cpu.descriptor->logical_id());
+void Root::adopt(Cpu &cpu) const noexcept {
+    libk_assert(!arch::interrupts_enabled());
+    libk_assert(!cpu.tlb && !cpu.root && arch::root_active(root_));
+    state_->enter(cpu.id);
     arch::flush_tlb_all();
     arch::sync_instruction_stream();
-    cpu.active_tlb_ = state_;
-    cpu.active_root_ = root_;
+    cpu.tlb = state_;
+    cpu.root = root_;
 }
 
 void drain_tlb(CpuId cpu) noexcept {

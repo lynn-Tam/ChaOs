@@ -2,6 +2,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <utility>
+#include <sys/handle.hpp>
+#include <servers/deploy/format.h>
 #include <uapi/riscv64.h>
 #include <uapi/boot_bundle.h>
 
@@ -427,3 +430,160 @@ private:
 };
 
 } // namespace boot
+
+namespace deploy {
+[[nodiscard]] constexpr auto committed(status_t status) noexcept -> bool {
+    return status == STATUS_OK || status == STATUS_PENDING;
+}
+
+[[nodiscard]] constexpr auto retryable(status_t status) noexcept -> bool {
+    return status == STATUS_BUSY || status == STATUS_RETRY;
+}
+
+struct Window final {
+    word_t address{};
+    word_t size{};
+
+    /* Mapping callers use this checked rounding operation before constructing
+     * a page-aligned window.  Zero represents overflow or an empty request. */
+    [[nodiscard]] static constexpr auto round_size(word_t value) noexcept
+        -> word_t {
+        constexpr word_t page_size = DEPLOY_PAGE_SIZE;
+        return value <= static_cast<word_t>(-1) - (page_size - 1)
+            ? (value + page_size - 1) & ~(page_size - 1)
+            : 0;
+    }
+
+    [[nodiscard]] constexpr auto valid() const noexcept -> bool {
+        return address != 0 && size != 0
+            && (address % DEPLOY_PAGE_SIZE) == 0
+            && (size % DEPLOY_PAGE_SIZE) == 0
+            && size <= ~word_t{} - address;
+    }
+
+    [[nodiscard]] constexpr auto empty() const noexcept -> bool {
+        return address == 0 && size == 0;
+    }
+
+    [[nodiscard]] constexpr auto end() const noexcept -> word_t {
+        return valid() ? address + size : 0;
+    }
+};
+
+[[nodiscard]] constexpr auto windows_disjoint(
+    Window first, Window second) noexcept -> bool {
+    if (first.empty() || second.empty()) {
+        return true;
+    }
+    if (!first.valid() || !second.valid()) {
+        return false;
+    }
+    return first.end() <= second.address || second.end() <= first.address;
+}
+
+enum class MapState : uint8_t { Empty, Ready, Mapped, Closing, Closed };
+
+template<typename B = sys::cap::SyscallBackend>
+class Map final {
+    using Owner = sys::cap::BasicOwnedCap<B>;
+    Owner region_{};
+    Window window_{};
+    word_t mapped_size_{};
+    MapState state_{};
+public:
+    Map() noexcept = default;
+    Map(const Map&) = delete;
+    auto operator=(const Map&) -> Map& = delete;
+    Map(Map&& other) noexcept
+        : region_(std::move(other.region_)), window_(other.window_),
+          mapped_size_(std::exchange(other.mapped_size_, 0)),
+          state_(std::exchange(other.state_, MapState::Closed)) {}
+    auto operator=(Map&& other) noexcept -> Map& {
+        if (this == &other) return *this;
+        const auto status = close();
+        if (status != STATUS_OK) B::ownership_fault(status);
+        region_ = std::move(other.region_);
+        window_ = other.window_;
+        mapped_size_ = std::exchange(other.mapped_size_, 0);
+        state_ = std::exchange(other.state_, MapState::Closed);
+        return *this;
+    }
+    ~Map() noexcept {
+        const auto status = close();
+        if (status != STATUS_OK) B::ownership_fault(status);
+    }
+    auto open(sys::cap::CapRef root, Window window, Window forbidden = {},
+              word_t perms = VM_READ | VM_WRITE) noexcept -> status_t {
+        if (region_) return STATUS_BUSY;
+        if (!root || root.cspace || !window.valid() || !windows_disjoint(window, forbidden))
+            return STATUS_BAD_ARGS;
+        const auto created = B::vm_slice(root, window.address, window.size, perms,
+                                         RIGHT_MAP | RIGHT_UNMAP | RIGHT_DESTROY);
+        if (created.value) region_ = Owner{{created.value, 0}};
+        if (region_) { window_ = window; state_ = MapState::Ready; }
+        return created.status == STATUS_OK && !region_ ? STATUS_INVALID_CAP : created.status;
+    }
+    auto map(sys::cap::CapRef memory, word_t first, word_t size, word_t perms) noexcept -> status_t {
+        if (state_ != MapState::Ready || !memory || memory.cspace || !size
+            || size % DEPLOY_PAGE_SIZE || size > window_.size
+            || !perms || (perms & ~(VM_READ | VM_WRITE)) || !(perms & VM_READ))
+            return STATUS_BAD_ARGS;
+        const auto status = B::vm_map(region_.reference(), memory, window_.address, size, first, perms);
+        if (!committed(status)) return status;
+        mapped_size_ = size;
+        state_ = MapState::Mapped;
+        return STATUS_OK;
+    }
+    auto unmap() noexcept -> status_t {
+        if (state_ != MapState::Mapped) return STATUS_BAD_ARGS;
+        const auto status = B::vm_unmap(region_.reference(), window_.address, mapped_size_);
+        if (!committed(status)) return status;
+        mapped_size_ = 0;
+        state_ = MapState::Ready;
+        return STATUS_OK;
+    }
+    auto close() noexcept -> status_t {
+        if (!region_) return STATUS_OK;
+        if (mapped()) {
+            const auto status = unmap();
+            if (status != STATUS_OK) return status;
+        }
+        if (state_ == MapState::Ready) {
+            const auto status = B::vm_clear(region_.reference());
+            if (!committed(status)) return status;
+            state_ = MapState::Closing;
+        }
+        const auto status = region_.close();
+        if (status == STATUS_OK) state_ = MapState::Closed;
+        return status;
+    }
+    auto phase() const noexcept -> MapState { return state_; }
+    auto mapped() const noexcept -> bool { return state_ == MapState::Mapped; }
+    auto reusable() const noexcept -> bool { return state_ == MapState::Ready; }
+    auto address() const noexcept -> word_t { return mapped() ? window_.address : 0; }
+};
+
+template<typename B = sys::cap::SyscallBackend>
+class BundleMap final {
+    Map<B> map_{};
+    boot::Bundle view_{};
+    size_t size_{};
+public:
+    auto open(sys::cap::CapRef root, sys::cap::CapRef memory, Window window,
+              size_t size, Window forbidden = {}) noexcept -> status_t {
+        if (!size || size > window.size) return STATUS_BAD_ARGS;
+        auto status = map_.open(root, window, forbidden, VM_READ);
+        if (status != STATUS_OK) return status;
+        status = map_.map(memory, 0, window.size, VM_READ);
+        if (status != STATUS_OK) return status;
+        view_ = boot::Bundle::parse(reinterpret_cast<const void*>(window.address), size);
+        size_ = size;
+        return view_ ? STATUS_OK : STATUS_BAD_ARGS;
+    }
+    auto close() noexcept -> status_t { view_ = {}; return map_.close(); }
+    auto view() const noexcept -> const boot::Bundle* { return map_.mapped() && view_ ? &view_ : nullptr; }
+    auto size() const noexcept -> size_t { return map_.mapped() ? size_ : 0; }
+    auto phase() const noexcept -> MapState { return map_.phase(); }
+};
+
+} // namespace deploy

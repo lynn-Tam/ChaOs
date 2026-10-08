@@ -27,17 +27,6 @@ struct CpuHwId final {
     }
 };
 
-enum class CpuAvail : u8 {
-    Enabled,
-    Disabled,
-    Failed,
-};
-
-struct CpuTopo final {
-    usize count{};
-    usize boot_index{};
-};
-
 class CpuSet final {
 public:
     static constexpr usize Bits = sizeof(u64) * 8;

@@ -15,8 +15,7 @@
 namespace sched {
 
 const cap::GrantAttachmentOps Sc::auth::ops_{
-    .invalidate = [](void* context, cap::GrantWork&& work, cap::GrantInvalidation reason) noexcept {
-        libk_assert(reason == cap::GrantInvalidation::Revoke);
+    .invalidate = [](void* context, cap::GrantWork&& work) noexcept {
         auto& cell = *static_cast<link*>(context);
         cell.owner->invalidate(cell, std::move(work));
     },
@@ -283,9 +282,8 @@ auto Sc::startable() const noexcept -> bool {
 
 void Sc::invalidate_domain(
     void* context,
-    cap::GrantWork&& work,
-    cap::GrantInvalidation reason) noexcept {
-    libk_assert(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    cap::GrantWork&& work) noexcept {
+    libk_assert(context != nullptr);
     static_cast<Sc*>(context)->invalidate_domain(
         std::move(work));
 }

@@ -1,4 +1,5 @@
 #include <expected>
+#include <libk/scope_guard.hpp>
 #include <array>
 #include <optional>
 #include <variant>
@@ -6,15 +7,14 @@
 
 #include <cap/cap.hpp>
 #include <cap/cspace.hpp>
-#include <cap/graph.hpp>
+#include <cap/grant.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <utility>
-#include <ipc/transfer.hpp>
 #include <mm/pmm.hpp>
 #include <object/pool.hpp>
 #include <object/group.hpp>
-#include <boot/link.hpp>
+#include <boot/info.hpp>
 #include <sched/sc.hpp>
 #include <task/thread.hpp>
 #include <uapi/mem.h>
@@ -26,7 +26,7 @@ using cap::CSpace;
 using cap::Attenuation;
 using cap::AttenuationError;
 using cap::GrantError;
-using cap::GrantGraph;
+using cap::Graph;
 using cap::GrantRef;
 using cap::Right;
 using cap::Rights;
@@ -43,16 +43,16 @@ alignas(mm::page_size) byte
     cap_test_ram[cap_test_page_count * mm::page_size]{};
 constinit libk::ManualLifetime<mm::RegionList> cap_test_map{};
 constinit libk::ManualLifetime<mm::Pmm> cap_test_pmm{};
-constinit libk::delegate<void() noexcept> cap_test_notify{};
+constinit libk::ManualLifetime<WorkQueue> cap_work{};
 constinit libk::ManualLifetime<object::pool<sched::Sc>> cap_test_contexts{};
 constinit libk::ManualLifetime<object::pool<object::group>> cap_test_groups{};
 constinit libk::ManualLifetime<object::pool<cap::CSpace>> cap_test_cspaces{};
 
-constinit libk::ManualLifetime<GrantGraph> cap_test_graph{};
+constinit libk::ManualLifetime<Graph> cap_test_graph{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_a{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_b{};
 constinit libk::ManualLifetime<CSpace> cap_test_space_one{};
-constinit libk::ManualLifetime<ipc::Transfer> cap_test_transfer{};
+constinit libk::ManualLifetime<cap::Batch> cap_test_transfer{};
 
 constexpr Rights inspect_rights = Rights::of(Right::Inspect);
 constexpr Rights basic_rights = Rights::of(
@@ -107,7 +107,8 @@ public:
 
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
-        const auto physical = kernel_phys(mm::Virt{
+        (void)cap_work.emplace();
+        const auto physical = boot_layout.phys(mm::Virt{
             reinterpret_cast<usize>(cap_test_ram)});
         if (!physical) {
             return false;
@@ -134,11 +135,11 @@ public:
             return false;
         }
         cap_test_map.reset();
-        (void)cap_test_contexts.emplace(*cap_test_pmm, cap_test_notify);
-        (void)cap_test_groups.emplace(*cap_test_pmm, cap_test_notify);
-        (void)cap_test_cspaces.emplace(*cap_test_pmm, cap_test_notify);
+        (void)cap_test_contexts.emplace(*cap_test_pmm, *cap_work);
+        (void)cap_test_groups.emplace(*cap_test_pmm, *cap_work);
+        (void)cap_test_cspaces.emplace(*cap_test_pmm, *cap_work);
         [[maybe_unused]] auto& graph =
-            cap_test_graph.emplace(*cap_test_pmm);
+            cap_test_graph.emplace(*cap_test_pmm, *cap_work);
         [[maybe_unused]] auto& space_a =
             cap_test_space_a.emplace(*cap_test_pmm);
         [[maybe_unused]] auto& space_b =
@@ -179,7 +180,7 @@ public:
             View{rights});
     }
 
-    [[nodiscard]] auto graph() noexcept -> GrantGraph& {
+    [[nodiscard]] auto graph() noexcept -> Graph& {
         return *cap_test_graph;
     }
     [[nodiscard]] auto a() noexcept -> CSpace& { return *cap_test_space_a; }
@@ -200,11 +201,8 @@ public:
         }
         return targets_[index].erase();
     }
-    void drain() noexcept {
-        cap_test_cspaces->drain_reclaim();
-        cap_test_contexts->drain_reclaim();
-        cap_test_groups->drain_reclaim();
-    }
+    void drain() noexcept { while (cap_work->run()) {} }
+    auto settled_grants() noexcept -> usize { drain(); return graph().live_count(); }
     void drop_retired_target(usize index) noexcept {
         libk_assert(index < 2 && targets_[index]);
         targets_[index].reset();
@@ -236,6 +234,7 @@ private:
             cap_test_space_a->retire();
             cap_test_space_a.reset();
         }
+        if (cap_test_graph) drain();
         cap_test_graph.reset();
         for (auto& target : targets_) {
             if (target) {
@@ -249,6 +248,7 @@ private:
         cap_test_cspaces.reset();
         cap_test_contexts.reset();
         cap_test_groups.reset();
+        cap_work.reset();
         cap_test_pmm.reset();
         cap_test_map.reset();
     }
@@ -466,11 +466,10 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
     const usize before_slots = fixture.b().live_slots();
-    const usize before_grants = fixture.graph().live_count();
-    auto child = fixture.a().typed_delegate(
-        source.value(), fixture.b(), decoded.value());
+    const usize before_grants = fixture.settled_grants();
+    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value());
     if (!child || fixture.b().live_slots() != before_slots + 1
-        || fixture.graph().live_count() != before_grants + 1) {
+        || fixture.settled_grants() != before_grants + 1) {
         return false;
     }
     {
@@ -484,26 +483,24 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
     const usize stable_slots = fixture.b().live_slots();
-    const usize stable_grants = fixture.graph().live_count();
+    const usize stable_grants = fixture.settled_grants();
 
     // Fill the bounded destination so the production transaction derives its
-    // child Grant before destination reservation fails.  GrantGraph and CSpace
+    // child Grant before destination reservation fails.  Graph and CSpace
     // must return to the exact pre-call counts, not merely reject early.
-    auto occupied = fixture.a().duplicate(
-        source.value(), fixture.one(), basic_rights);
+    auto occupied = fixture.a().transfer(source.value(), fixture.one(), cap::XferOp::Copy, basic_rights);
     if (!occupied || fixture.one().live_slots() != 1) {
         return false;
     }
     const usize full_slots = fixture.one().live_slots();
-    const usize full_grants = fixture.graph().live_count();
+    const usize full_grants = fixture.settled_grants();
     attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT);
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
-        || fixture.a().typed_delegate(
-               source.value(), fixture.one(), decoded.value())
+        || fixture.a().transfer(source.value(), fixture.one(), cap::XferOp::Derive, decoded.value())
         || fixture.one().live_slots() != full_slots
-        || fixture.graph().live_count() != full_grants
+        || fixture.settled_grants() != full_grants
         || !fixture.one().close(occupied.value())) {
         return false;
     }
@@ -512,10 +509,9 @@ bool test_typed_delegate_transaction_rolls_back(
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
-        || fixture.a().typed_delegate(
-               source.value(), fixture.b(), decoded.value())
+        || fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value())
         || fixture.b().live_slots() != stable_slots
-        || fixture.graph().live_count() != stable_grants) {
+        || fixture.settled_grants() != stable_grants) {
         return false;
     }
     attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT,
@@ -523,15 +519,13 @@ bool test_typed_delegate_transaction_rolls_back(
     decoded = cap::decode_attenuation(
         libk::Span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
-        || fixture.a().typed_delegate(
-               source.value(), fixture.b(), decoded.value())
+        || fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value())
         || fixture.b().live_slots() != stable_slots
-        || fixture.graph().live_count() != stable_grants) {
+        || fixture.settled_grants() != stable_grants) {
         return false;
     }
     return fixture.a().close(source.value())
-        && !fixture.a().typed_delegate(
-            source.value(), fixture.b(), decoded.value());
+        && !fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value());
 }
 
 bool test_resolve_composes_authority_and_pins_kind(
@@ -572,10 +566,10 @@ bool test_resolve_composes_authority_and_pins_kind(
         auto replaced = fixture.graph().derive(
             resolved.value().lease(), std::move(other).value(), View{inspect_rights});
         if (replaced || replaced.error() != cap::GrantError::InvalidKey
-            || fixture.graph().live_count() != 1) return false;
+            || fixture.settled_grants() != 1) return false;
     }
     return fixture.a().close(handle)
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_duplicate_attenuates_without_splitting_grant(
@@ -593,14 +587,12 @@ bool test_duplicate_attenuates_without_splitting_grant(
     if (!source) {
         return false;
     }
-    auto amplified = fixture.a().duplicate(
-        source.value(), fixture.b(), View{Rights::of(Right::Control)});
+    auto amplified = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Copy, View{Rights::of(Right::Control)});
     if (amplified
         || amplified.error() != cap::CSpaceError::Amplification) {
         return false;
     }
-    auto copy = fixture.a().duplicate(
-        source.value(), fixture.b(), View{inspect_rights});
+    auto copy = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Copy, View{inspect_rights});
     if (!copy) {
         return false;
     }
@@ -621,7 +613,7 @@ bool test_duplicate_attenuates_without_splitting_grant(
     }
     return fixture.b().close(copy.value())
         && fixture.a().close(source.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_delegation_revoke_waits_for_existing_lease(
@@ -640,11 +632,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
     if (!source) {
         return false;
     }
-    auto child = fixture.a().delegate(
-        source.value(),
-        fixture.b(),
-        View{inspect_rights},
-        View{inspect_rights});
+    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, View{inspect_rights});
     if (!child) {
         return false;
     }
@@ -653,6 +641,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
     cap::GrantRevoke completion{
         sync::Latch::Notifier::bind<
             &RevokeProbe::ready>(probe)};
+    libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
     cap::GrantKey child_key{};
     {
         auto active_result = fixture.b().resolve<
@@ -677,6 +666,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
             return false;
         }
     }
+    fixture.drain();
     const auto child_state = fixture.graph().state(child_key);
     if (!completion.complete() || probe.signals != 1
         || child_state
@@ -685,7 +675,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
     }
     return fixture.b().close(child.value())
         && fixture.a().close(source.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexcept {
@@ -700,7 +690,7 @@ bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexce
         }
     };
     static constexpr cap::GrantAttachmentOps ops{
-        .invalidate = [](void* context, cap::GrantWork&& work, cap::GrantInvalidation) noexcept {
+        .invalidate = [](void* context, cap::GrantWork&& work) noexcept {
             static_cast<Probe*>(context)->work = std::move(work);
         },
         .released = [](void* context) noexcept { ++static_cast<Probe*>(context)->releases; },
@@ -711,23 +701,26 @@ bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexce
         auto root = fixture.root(0);
         if (!root) return false;
         cap::GrantRevoke revoke;
+        libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
         Probe probe{ops};
         auto lease = root.value().acquire();
         if (!lease || !lease.value().attach(probe.attachment)) return false;
         lease.value().reset();
         if (order != 0) {
-            if (!fixture.graph().invalidate(root.value().key(), revoke)
-                || !probe.work || !probe.attachment.busy()) return false;
+            if (!fixture.graph().invalidate(root.value().key(), revoke)) return false;
+            fixture.drain();
+            if (!probe.work || !probe.attachment.busy()) return false;
             if (order == 2) probe.work.reset();
         }
         const bool synchronous = probe.attachment.detach();
         if (synchronous != (order != 1) || probe.releases != 0) return false;
         probe.work.reset();
+        fixture.drain();
         if (probe.releases != (order == 1 ? 1U : 0U)
             || probe.attachment.attached() || probe.attachment.busy()
             || (order != 0 && !revoke.complete())) return false;
     }
-    return fixture.graph().live_count() == 0;
+    return fixture.settled_grants() == 0;
 }
 
 bool test_cap_batch_has_one_publication(const TestContext&) noexcept {
@@ -758,7 +751,7 @@ bool test_cap_batch_has_one_publication(const TestContext&) noexcept {
             }
         }
     }
-    return f.graph().live_count() == 0;
+    return f.settled_grants() == 0;
 }
 
 bool test_handles_are_local_and_stale_generation_stays_dead(
@@ -812,7 +805,7 @@ bool test_handles_are_local_and_stale_generation_stays_dead(
     }
     return fixture.a().close(replacement.value())
         && fixture.b().close(handle_b.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_remote_selector_close_is_cspace_exact(
@@ -842,7 +835,7 @@ bool test_remote_selector_close_is_cspace_exact(
     auto stale = fixture.b().close(selector);
     return !stale
         && stale.error() == cap::CSpaceError::InvalidState
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_move_is_transactional_across_cspaces(
@@ -863,7 +856,7 @@ bool test_move_is_transactional_across_cspaces(
     if (!source || !blocker) {
         return false;
     }
-    auto rejected = fixture.a().move(source.value(), fixture.one());
+    auto rejected = fixture.a().transfer(source.value(), fixture.one(), cap::XferOp::Move);
     {
         auto source_live = fixture.a().resolve<
             sched::Sc>(source.value(), inspect_rights);
@@ -876,7 +869,7 @@ bool test_move_is_transactional_across_cspaces(
     if (!fixture.one().close(blocker.value())) {
         return false;
     }
-    auto moved = fixture.a().move(source.value(), fixture.one());
+    auto moved = fixture.a().transfer(source.value(), fixture.one(), cap::XferOp::Move);
     if (!moved) {
         return false;
     }
@@ -891,7 +884,7 @@ bool test_move_is_transactional_across_cspaces(
         }
     }
     return fixture.one().close(moved.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool test_ipc_transfer_commits_copy_and_move_atomically(
@@ -913,20 +906,20 @@ bool test_ipc_transfer_commits_copy_and_move_atomically(
         return false;
     }
 
-    ipc::Transfer::Specs specs{};
-    if (!specs.try_emplace_back(ipc::TransferSpec{
+    cap::Batch::Specs specs{};
+    if (!specs.try_emplace_back(cap::XferSpec{
             .source = copy_source.value(),
-            .rights = inspect_rights,
-            .kind = ipc::TransferKind::Copy,
+            .limit = inspect_rights,
+            .op = cap::XferOp::Copy,
         })
-        || !specs.try_emplace_back(ipc::TransferSpec{
+        || !specs.try_emplace_back(cap::XferSpec{
             .source = move_source.value(),
-            .kind = ipc::TransferKind::Move,
+            .op = cap::XferOp::Move,
         })) {
         return false;
     }
     auto& transfer = cap_test_transfer.emplace();
-    if (!ipc::Transfer::prepare(
+    if (!cap::Batch::prepare(
             transfer, fixture.a(), fixture.b(), specs)) {
         return false;
     }
@@ -956,47 +949,31 @@ bool test_ipc_transfer_commits_copy_and_move_atomically(
     return fixture.b().close(committed.value()[1])
         && fixture.b().close(committed.value()[0])
         && fixture.a().close(copy_source.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
-bool test_ipc_transfer_rolls_back_when_move_source_changes(
-    const TestContext&) noexcept {
-    CapFixture fixture{};
-    if (!fixture.initialize()) {
-        return false;
+bool test_cap_batch_rolls_back(const TestContext&) noexcept {
+    for (bool stop_dst : {false, true}) {
+        CapFixture fixture;
+        if (!fixture.initialize()) return false;
+        auto root = fixture.root(0);
+        if (!root) return false;
+        auto source = fixture.a().insert(std::move(*root), View{inspect_rights});
+        if (!source) return false;
+        cap::Batch::Specs specs;
+        if (!specs.try_push_back(cap::XferSpec{.source = *source, .op = cap::XferOp::Move})) return false;
+        auto& batch = cap_test_transfer.emplace();
+        if (!cap::Batch::prepare(batch, fixture.a(), fixture.b(), specs)) return false;
+        if (stop_dst) fixture.b().retire();
+        else if (!fixture.a().close(*source)) return false;
+        auto rejected = batch.commit();
+        if (rejected || rejected.error() != cap::CSpaceError::InvalidState
+            || fixture.b().live_slots() != 1) return false;
+        cap_test_transfer.reset();
+        if (stop_dst && !fixture.a().close(*source)) return false;
+        if (fixture.b().live_slots() != 0 || fixture.settled_grants() != 0) return false;
     }
-    auto root = fixture.root(0);
-    if (!root) {
-        return false;
-    }
-    auto source = fixture.a().insert(
-        std::move(root).value(), View{inspect_rights});
-    if (!source) {
-        return false;
-    }
-    ipc::Transfer::Specs specs{};
-    if (!specs.try_emplace_back(ipc::TransferSpec{
-            .source = source.value(),
-            .kind = ipc::TransferKind::Move,
-        })) {
-        return false;
-    }
-
-    auto& transfer = cap_test_transfer.emplace();
-    if (!ipc::Transfer::prepare(
-            transfer, fixture.a(), fixture.b(), specs)
-        || !fixture.a().close(source.value())) {
-        return false;
-    }
-    auto rejected = transfer.commit();
-    if (rejected
-        || rejected.error() != ipc::TransferError::SourceChanged
-        || fixture.b().live_slots() != 1) {
-        return false;
-    }
-    cap_test_transfer.reset();
-    return fixture.b().live_slots() == 0
-        && fixture.graph().live_count() == 0;
+    return true;
 }
 
 bool test_cspace_retire_waits_for_reserved_operation(
@@ -1105,19 +1082,17 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         .caps = limit.caps - 1,
     };
     if (!installed || pool->available() != after_install
-        || !space->delegate(
-            installed.value(), fixture.b(), inspect_rights)) {
+        || !space->transfer(installed.value(), fixture.b(), cap::XferOp::Derive, inspect_rights)) {
         return false;
     }
     const resource::budget after_delegate{
-        .memory = after_install.memory - GrantGraph::node_charge().memory,
+        .memory = after_install.memory - Graph::node_charge().memory,
         .caps = after_install.caps,
     };
     if (pool->available() != after_delegate) {
         return false;
     }
-    auto child = space->delegate(
-        installed.value(), fixture.b(), inspect_rights);
+    auto child = space->transfer(installed.value(), fixture.b(), cap::XferOp::Derive, inspect_rights);
     if (!child || !fixture.b().close(child.value())
         || pool->available() != after_delegate) {
         return false;
@@ -1177,16 +1152,16 @@ bool test_attenuated_operations_and_revoke_use_slot_authority(
     if (!source) {
         return false;
     }
-    auto duplicate = fixture.a().duplicate(
-        source.value(), fixture.b(), inspect_rights);
-    auto child = fixture.a().delegate(
-        source.value(), fixture.b(), inspect_rights);
+    auto duplicate = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Copy, inspect_rights);
+    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, inspect_rights);
     if (!duplicate || !child) {
         return false;
     }
     cap::GrantRevoke completion{};
-    if (!fixture.a().revoke(source.value(), completion, false)
-        || !completion.complete()) {
+    libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
+    if (!fixture.a().revoke(source.value(), completion, false)) return false;
+    fixture.drain();
+    if (!completion.complete()) {
         return false;
     }
     auto shared = fixture.b().resolve<sched::Sc>(
@@ -1216,15 +1191,16 @@ bool test_revoked_tombstones_do_not_retain_target(
     if (!source) {
         return false;
     }
-    auto child = fixture.a().delegate(
-        source.value(), fixture.b(), inspect_rights);
+    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, inspect_rights);
     if (!child) {
         return false;
     }
 
     cap::GrantRevoke completion{};
-    if (!fixture.a().revoke(source.value(), completion, true)
-        || !completion.complete()
+    libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
+    if (!fixture.a().revoke(source.value(), completion, true)) return false;
+    fixture.drain();
+    if (!completion.complete()
         || !fixture.retire_target(0)) {
         return false;
     }
@@ -1238,7 +1214,7 @@ bool test_revoked_tombstones_do_not_retain_target(
     return !source_dead && !child_dead
         && fixture.b().close(child.value())
         && fixture.a().close(source.value())
-        && fixture.graph().live_count() == 0;
+        && fixture.settled_grants() == 0;
 }
 
 bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
@@ -1264,7 +1240,7 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
                                         View{Rights::of(Right::Signal)})) return false;
         rejected->reset(); // Private target rollback before any grant exists.
         fixture.drop_retired_target(1);
-        if (pool->available() != limit || fixture.graph().live_count()) return false;
+        if (pool->available() != limit || fixture.settled_grants()) return false;
     }
 
     auto txn_ref = pool.erase();
@@ -1277,7 +1253,7 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
         return false;
     }
     auto child_reservation = pool->reserve(
-        std::move(child_pool_ref).value(), GrantGraph::node_charge());
+        std::move(child_pool_ref).value(), Graph::node_charge());
     auto target_ref = fixture.target_ref(0);
     if (!child_reservation || !target_ref) {
         return false;
@@ -1301,23 +1277,13 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
         return false;
     }
 
-    struct Work final {
-        usize signals{};
-        void wake() noexcept { ++signals; }
-    } work;
-    if (deferred) fixture.graph().bind_work_notifier(GrantGraph::WorkNotifier::bind<&Work::wake>(work));
     txn.value().reset();
-    if (deferred) {
-        const bool retained = work.signals != 0 && fixture.graph().work_pending()
-            && pool->available() != limit;
-        while (fixture.graph().service(1).more) {}
-        fixture.graph().unbind_work_notifier();
-        if (!retained) return false;
-    }
+    if (deferred && (!fixture.graph().work_pending() || pool->available() == limit)) return false;
+    fixture.drain();
     child.value().reset();
     txn.value().reset();
     fixture.drop_retired_target(0);
-    if (fixture.graph().live_count() != 0
+    if (fixture.settled_grants() != 0
         || pool->available() != limit
         || pool->sponsorship_count() != 0
         || pool->close() != object::group::phase::closed
@@ -1358,7 +1324,7 @@ bool test_pool_close_revokes_hidden_allocation_root(
     }
     auto txn = pool->begin(std::move(txn_ref).value());
     auto child_reservation = pool->reserve(
-        std::move(child_pool_ref).value(), GrantGraph::node_charge());
+        std::move(child_pool_ref).value(), Graph::node_charge());
     auto target_ref = fixture.target_ref(0);
     if (!txn || !child_reservation || !target_ref) {
         return false;
@@ -1389,10 +1355,12 @@ bool test_pool_close_revokes_hidden_allocation_root(
     txn.value().commit();
     txn.value().reset();
 
-    if (pool->close() != object::group::phase::closed
+    (void)pool->close();
+    fixture.drain();
+    if (pool->state() != object::group::phase::closed
         || pool->available() != limit
         || pool->sponsorship_count() != 0
-        || fixture.graph().live_count() != 0) {
+        || fixture.settled_grants() != 0) {
         return false;
     }
     auto dead = fixture.a().resolve<sched::Sc>(
@@ -1446,7 +1414,7 @@ bool test_parent_close_recursively_closes_child_pool(
     auto object_reservation = parent->reserve(
         std::move(child_charge_ref).value(), child_charge);
     auto user_reservation = parent->reserve(
-        std::move(user_charge_ref).value(), GrantGraph::node_charge());
+        std::move(user_charge_ref).value(), Graph::node_charge());
     if (!txn || !object_reservation
         || !user_reservation) {
         return false;
@@ -1494,13 +1462,12 @@ bool test_parent_close_recursively_closes_child_pool(
     txn.value().reset();
     child.reset();
 
-    if (parent->close() != object::group::phase::reclaiming) {
-        return false;
-    }
+    (void)parent->close();
+    if (fixture.a().resolve<object::group>(installed.value(), rights)) return false;
     fixture.drain();
     if (parent->state() != object::group::phase::closed
         || parent->available() != parent_limit
-        || fixture.graph().live_count() != 0
+        || fixture.settled_grants() != 0
         || !fixture.a().close(installed.value())
         || !parent.retire()) {
         return false;
@@ -1524,7 +1491,7 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
         auto child_ref = pool.erase();
         if (!txn_ref || !child_ref) return false;
         auto txn = pool->begin(std::move(txn_ref).value());
-        auto child_charge = pool->reserve(std::move(child_ref).value(), GrantGraph::node_charge());
+        auto child_charge = pool->reserve(std::move(child_ref).value(), Graph::node_charge());
         auto target = fixture.target_ref(index);
         if (!txn || !child_charge || !target) return false;
         auto allocation = txn.value().adopt(fixture.graph(), std::move(target).value(), View{rights});
@@ -1545,14 +1512,14 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
     std::optional<cap::Resolved<sched::Sc>> retained{std::move(held).value()};
     if (!fixture.a().destroy(handles[1]) || !fixture.a().destroy(handles[0])) return false;
     // A retained operation delays its own revoke, not the other local close.
-    if (fixture.graph().live_count() != 2 || pool->state() != object::group::phase::open)
+    if (fixture.settled_grants() != 2 || pool->state() != object::group::phase::open)
         return false;
     if (pool->close() != object::group::phase::revoking) return false;
     retained.reset();
     fixture.drop_retired_target(0);
     fixture.drop_retired_target(1);
     if (pool->state() != object::group::phase::closed || pool->available() != limit
-        || fixture.graph().live_count() != 0 || !fixture.a().close(handles[0])
+        || fixture.settled_grants() != 0 || !fixture.a().close(handles[0])
         || !fixture.a().close(handles[1]) || !pool.retire()) return false;
     pool.reset();
     fixture.drain();
@@ -1635,7 +1602,7 @@ void register_cap_tests(TestRegistry& registry) noexcept {
     (void)registry.add(
         "cap",
         "IPC transfer rolls back every reservation after source mutation",
-        test_ipc_transfer_rolls_back_when_move_source_changes);
+        test_cap_batch_rolls_back);
     (void)registry.add(
         "cap",
         "CSpace retirement waits for reserved operations and pinned teardown",

@@ -6,7 +6,7 @@
 class Plic final {
 public:
     Plic() noexcept : routes_(irq::Routes::Enable::bind<&Plic::set>(*this)) {}
-    void start(usize base, usize ctx) noexcept;
+    void start(usize base, usize ctx, u32 count) noexcept;
     void dispatch() noexcept { routes_.dispatch(irq::Routes::Take::bind<&Plic::take>(*this)); }
     auto routes() noexcept -> irq::Routes& { return routes_; }
 private:
@@ -17,18 +17,20 @@ private:
     }
     usize base_{};
     usize ctx_{};
+    u32 count_{};
     irq::Routes routes_;
 };
 
 
-inline void Plic::start(usize base, usize ctx) noexcept {
+inline void Plic::start(usize base, usize ctx, u32 count) noexcept {
     auto setup = [&]() noexcept {
         libk_assert(base_ == 0);
         base_ = base;
         ctx_ = ctx;
+        count_ = count;
         // Register geometry is the PLIC's 1024-bit enable bank, not a software
         // route capacity. Firmware enables cannot leak into this context.
-        for (usize i = 0; i < 32; ++i) *word(0x2000 + ctx_ * 0x80 + i * 4) = 0;
+        for (usize i = 0; i <= count_ / 32; ++i) *word(0x2000 + ctx_ * 0x80 + i * 4) = 0;
         *word(0x200000 + ctx_ * 0x1000) = 0;
         arch::io_fence();
     };
@@ -36,7 +38,7 @@ inline void Plic::start(usize base, usize ctx) noexcept {
 }
 
 inline void Plic::set(u32 id, bool enabled) noexcept {
-    libk_assert(id != 0 && id < 1024);
+    libk_assert(id != 0 && id <= count_);
     if (base_ == 0) return;
     arch::io_fence();
     auto* priority = word(id * 4);

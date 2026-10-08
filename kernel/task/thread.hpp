@@ -25,7 +25,7 @@
 #include <wait.hpp>
 
 class Thread;
-class CpuRegistry;
+class Cpus;
 namespace ipc {
 class Notification;
 class Activation;
@@ -169,7 +169,7 @@ public:
     }
     [[nodiscard]] auto begin_wait(
         Completion& relation,
-        CpuRegistry& cpus) noexcept -> bool;
+        Cpus& cpus) noexcept -> bool;
     void cancel_wait() noexcept;
     // Kernel calls retain their stack until all local transactions have drained.
     void enter_kernel() noexcept { libk_assert(!in_kernel_); in_kernel_ = true; }

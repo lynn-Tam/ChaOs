@@ -1,15 +1,15 @@
 #include <sync.hpp>
 
 #include <cpu.hpp>
-#include <cpu/local.hpp>
+#include <cpu/cpu.hpp>
 
 namespace sync {
 
-static auto cpu() noexcept -> CpuLocal* {
+static auto cpu() noexcept -> Cpu* {
     return (arch::local() ? arch::local()->owner : nullptr);
 }
 
-// Early boot runs on one CPU before CpuLocal publication. It still has a
+// Early boot runs on one CPU before Cpu publication. It still has a
 // distinct nonzero owner, so a locked mutex never looks unowned.
 static auto identity() noexcept -> usize {
     return cpu() ? reinterpret_cast<usize>(cpu()) : 1;

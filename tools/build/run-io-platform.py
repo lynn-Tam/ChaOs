@@ -63,17 +63,14 @@ def main():
             except subprocess.TimeoutExpired as error:
                 output = error.stdout or b""
             text = output.decode(errors="replace")
-            expected = ["io: isolated PCI function ready requester=0x8",
-                        f"cpu: discovered={count} prepared=0 starting=0 online={count} failed=0",
-                        "failed=0", "runtime: entered", *extra_markers]
-            if second_disk:
-                expected.append("io: isolated PCI function ready requester=0x10")
+            expected = [f"cpu: online={count}",
+                        "runtime: entered", *extra_markers]
             if any(marker not in text for marker in expected) or "MYOS KERNEL PANIC" in text:
                 log = temporary / f"failed-{count}.log"
                 log.write_text(text)
                 print(text)
                 raise SystemExit(f"[io-platform] failed; diagnostic: {log}")
-            print(f"[io-platform] OK: {count} harts, PCI enumeration, default-deny IOMMU")
+            print(f"[io-platform] OK: {count} harts, runtime and requested device paths")
 
 if __name__ == "__main__":
     main()

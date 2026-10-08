@@ -11,7 +11,7 @@
 #include <object/pool.hpp>
 #include <object/group.hpp>
 #include <mm/vspace.hpp>
-#include <boot/link.hpp>
+#include <boot/info.hpp>
 
 namespace {
 
@@ -21,11 +21,9 @@ alignas(mm::page_size) byte
     memory_test_ram[memory_test_pages * mm::page_size]{};
 constinit libk::ManualLifetime<mm::RegionList> memory_test_map{};
 constinit libk::ManualLifetime<mm::Pmm> memory_test_pmm{};
-constinit libk::delegate<void() noexcept> memory_test_notify{};
+constinit libk::ManualLifetime<WorkQueue> memory_work{};
 constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_test_mm{};
 
-constinit libk::ManualLifetime<mm::SpaceWork>
-    memory_test_vspace_work{};
 constinit libk::ManualLifetime<mm::Mem> memory_test_object{};
 constinit libk::ManualLifetime<mm::Mem> memory_test_peer{};
 constinit libk::ManualLifetime<mm::Mem> memory_test_staging{};
@@ -40,7 +38,7 @@ struct StagingReset final {
 };
 
 [[nodiscard]] auto page_at(usize offset) noexcept -> mm::Page {
-    const auto physical = kernel_phys(mm::Virt{
+    const auto physical = boot_layout.phys(mm::Virt{
         reinterpret_cast<usize>(memory_test_ram)});
     libk_assert(physical);
     const auto address = physical->checked_add(offset * mm::page_size);
@@ -57,7 +55,8 @@ public:
 
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
-        const auto physical = kernel_phys(mm::Virt{
+        (void)memory_work.emplace();
+        const auto physical = boot_layout.phys(mm::Virt{
             reinterpret_cast<usize>(memory_test_ram)});
         if (!physical) {
             return false;
@@ -87,10 +86,9 @@ public:
             return false;
         }
         memory_test_map.reset();
-        (void)memory_test_vspace_work.emplace();
 
         [[maybe_unused]] auto& memory =
-            memory_test_mm.emplace(*memory_test_pmm, memory_test_notify);
+            memory_test_mm.emplace(*memory_test_pmm, *memory_work);
         return true;
     }
 
@@ -190,11 +188,11 @@ private:
             pager_.reset();
         }
         if (memory_test_mm) {
-            memory_test_mm->drain();
+            while (memory_work->run()) {}
         }
         memory_test_mm.reset();
 
-        memory_test_vspace_work.reset();
+        memory_work.reset();
         memory_test_pmm.reset();
         memory_test_map.reset();
     }
@@ -714,7 +712,7 @@ bool test_object_store_memory_lifecycle_waits_for_page_lease(
         return false;
     }
     pin.reset();
-    fixture.memory().drain();
+    while (memory_work->run()) {}
     return !fixture.memory().get<mm::Mem>().lookup(id)
         && fixture.pmm().verify_invariants();
 }

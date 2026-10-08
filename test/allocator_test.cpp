@@ -12,7 +12,6 @@
 #include <utility>
 #include <mm/pmm.hpp>
 #include <mm/tlb.hpp>
-#include <boot/link.hpp>
 #include <boot/info.hpp>
 
 namespace {
@@ -54,7 +53,7 @@ class PmmFixture : private libk::noncopyable_nonmovable {
         return mm::Pmm::initialize_in(
             storage_, std::move(memory_map), mm::Pmm::Window{
                 .pa = mm::Phys{
-                    kernel_phys(mm::Virt{
+                    boot_layout.phys(mm::Virt{
                         reinterpret_cast<uintptr_t>(test_ram)})->raw()},
                 .va = mm::Virt{
                     reinterpret_cast<uintptr_t>(test_ram)},
@@ -67,7 +66,7 @@ class PmmFixture : private libk::noncopyable_nonmovable {
 };
 
 [[nodiscard]] auto page_at(size_t offset) noexcept -> mm::Page {
-    const auto base = kernel_phys(mm::Virt{
+    const auto base = boot_layout.phys(mm::Virt{
         reinterpret_cast<uintptr_t>(test_ram)});
     libk_assert(base);
     const auto address = base->checked_add(offset * mm::page_size);
@@ -905,7 +904,7 @@ bool test_initial_page_table_unrepresentable_range_rolls_back(
             mm::Region::Kind::Ram})) {
         return false;
     }
-    const auto base = kernel_phys(mm::Virt{
+    const auto base = boot_layout.phys(mm::Virt{
         reinterpret_cast<uintptr_t>(test_ram)});
     libk_assert(base);
     const auto result = mm::Pmm::initialize_in(

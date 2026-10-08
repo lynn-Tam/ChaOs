@@ -4,7 +4,7 @@
 #include <array>
 #include <libk/sync/atomic.hpp>
 
-struct CpuRuntime;
+struct Cpu;
 
 namespace trace {
 
@@ -39,6 +39,6 @@ struct View {
     u64 first{}, last{};
     [[nodiscard]] auto read(u64 seq, Sample&) const noexcept -> bool;
 };
-[[nodiscard]] auto snapshot(const CpuRuntime&) noexcept -> View;
+[[nodiscard]] auto snapshot(const Cpu&) noexcept -> View;
 
 } // namespace trace

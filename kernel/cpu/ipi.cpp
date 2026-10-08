@@ -2,15 +2,14 @@
 
 #include <cpu.hpp>
 #include <libk/assert.hpp>
-#include <cpu/runtime.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <mm/tlb.hpp>
 #include <sched/dispatcher.hpp>
 
-void handle_ipi(CpuRuntime& runtime) noexcept {
+void handle_ipi(Cpu& runtime) noexcept {
     libk_assert(!arch::interrupts_enabled());
     arch::acknowledge_ipi();
-    mm::drain_tlb(runtime.local.descriptor->logical_id());
+    mm::drain_tlb(runtime.id);
     runtime.dispatcher().drain_remote();
 }
 

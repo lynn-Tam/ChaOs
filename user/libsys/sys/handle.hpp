@@ -8,6 +8,7 @@
 #include <uapi/abi.h>
 #include <sys/syscall.hpp>
 #include <expected>
+#include <libk/unique_handle.hpp>
 
 namespace sys::cap {
 
@@ -32,91 +33,38 @@ concept CapBackend = requires(CapRef reference, status_t status) {
     { Backend::ownership_fault(status) } noexcept;
 };
 
-// Backend is deliberately static: production userspace gets a direct syscall
-// call and host tests inject a fixed fake without a vtable, heap or queue.
+// Explicit close can fail and retains ownership; implicit destruction cannot
+// report an error, so a failed close stops the process through the backend.
 template<CapBackend Backend>
 class BasicOwnedCap final {
+    struct Drop {
+        void operator()(CapRef ref) const noexcept {
+            const auto status = Backend::close(ref);
+            if (status != STATUS_OK) Backend::ownership_fault(status);
+        }
+    };
+    struct Empty {
+        static constexpr auto empty() noexcept -> CapRef { return {}; }
+        static constexpr auto is_empty(CapRef ref) noexcept -> bool { return !ref; }
+    };
+    libk::unique_handle<CapRef, Drop, Empty> ref_{};
+
 public:
     constexpr BasicOwnedCap() noexcept = default;
+    constexpr explicit BasicOwnedCap(CapRef ref) noexcept : ref_(ref) {}
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return bool(ref_); }
+    [[nodiscard]] constexpr auto reference() const noexcept -> CapRef { return ref_.get(); }
+    [[nodiscard]] constexpr auto selector() const noexcept -> cap_t { return ref_.get().selector; }
+    [[nodiscard]] constexpr auto cspace() const noexcept -> cap_t { return ref_.get().cspace; }
+    [[nodiscard]] constexpr auto release() noexcept -> CapRef { return ref_.release(); }
 
-    constexpr explicit BasicOwnedCap(CapRef reference) noexcept
-        : reference_(reference) {}
-
-    BasicOwnedCap(const BasicOwnedCap&) = delete;
-    auto operator=(const BasicOwnedCap&) -> BasicOwnedCap& = delete;
-
-    constexpr BasicOwnedCap(BasicOwnedCap&& other) noexcept
-        : reference_(other.release()) {}
-
-    auto operator=(BasicOwnedCap&& other) noexcept -> BasicOwnedCap& {
-        if (this == &other) {
-            return *this;
-        }
-        if (reference_) {
-            const status_t status = close();
-            if (status != STATUS_OK) {
-                Backend::ownership_fault(status);
-            }
-        }
-        reference_ = other.release();
-        return *this;
-    }
-
-    ~BasicOwnedCap() noexcept {
-        if (!reference_) {
-            return;
-        }
-        // Destruction is permitted one bounded fallback only.  A failed
-        // close cannot be queued or silently discarded without losing the
-        // selector, so the backend must fail-stop.
-        const status_t status = Backend::close(reference_);
-        if (status == STATUS_OK) {
-            reference_ = {};
-            return;
-        }
-        Backend::ownership_fault(status);
-    }
-
-    [[nodiscard]] constexpr explicit operator bool() const noexcept {
-        return static_cast<bool>(reference_);
-    }
-
-    [[nodiscard]] constexpr auto reference() const noexcept -> CapRef {
-        return reference_;
-    }
-
-    [[nodiscard]] constexpr auto selector() const noexcept -> cap_t {
-        return reference_.selector;
-    }
-
-    [[nodiscard]] constexpr auto cspace() const noexcept -> cap_t {
-        return reference_.cspace;
-    }
-
-    // Explicit close retains the reference on every non-OK result.
     [[nodiscard]] auto close() noexcept -> status_t {
-        if (!reference_) {
-            return STATUS_OK;
-        }
-        const status_t status = Backend::close(reference_);
-        if (status == STATUS_OK) {
-            reference_ = {};
-        }
+        if (!ref_) return STATUS_OK;
+        const auto status = Backend::close(ref_.get());
+        if (status == STATUS_OK) (void)ref_.release();
         return status;
     }
-
-    // Transfer ownership without invoking the backend.
-    [[nodiscard]] constexpr auto release() noexcept -> CapRef {
-        return std::exchange(reference_, CapRef{});
-    }
-
-private:
-    CapRef reference_{};
 };
-
-} // namespace sys::cap
-
-namespace sys::cap {
 
 // Capability syscalls and ownership sit above the raw register ABI. All
 // CapRef inputs below are current-CSpace authorities except CAP_CLOSE, whose

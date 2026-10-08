@@ -10,9 +10,9 @@ namespace deploy {
 
 // Policy worksets contain desired recovery, never a copy of TaskTable state.
 // One graph owner serializes construction, observation and connection rebinding.
-template<size_t Capacity, size_t Authorities = 16>
+template<size_t Capacity, size_t Sources = 16>
 class services final {
-    using Tasks = tasks<Capacity, Authorities>;
+    using Tasks = tasks<Capacity, Sources>;
     Tasks& supervisor_;
     program& program_;
     sys::Clock clock_{};
@@ -28,20 +28,20 @@ class services final {
 
     auto launch(uint32_t i) noexcept -> status_t {
         const auto& plan = program_.plan();
-        const auto& row = *plan.task(i);
+        const auto row = *plan.task(i);
         const typename Tasks::handle* providers[Capacity]{};
         bool included[Capacity]{};
         size_t count{};
-        for (uint32_t d = 0; d < row.dependencies.count; ++d) {
-            const auto& edge = *plan.dependency(row.dependencies.first + d);
+        for (uint32_t d = 0; d < row.dependency_count; ++d) {
+            const auto edge = *plan.dependency(row.dependency_first + d);
             if (tasks_[edge.target] && !included[edge.target]) {
                 providers[count++] = &*tasks_[edge.target];
                 included[edge.target] = true;
             }
         }
         status_t status{};
-        tasks_[i] = supervisor_.launch(program_, plan.symbol(row.name), status,
-            {.terminal_events = events_, .close_badge = word_t{1} << (i + 1)}, {providers, count});
+        tasks_[i] = supervisor_.launch(program_, plan.string(row.name), status,
+            {.exit_events = events_, .close_badge = word_t{1} << (i + 1)}, {providers, count});
         return status;
     }
 

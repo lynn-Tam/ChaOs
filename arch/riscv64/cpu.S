@@ -27,7 +27,7 @@ secondary_entry:
     /* No physical pointer is read after SATP changes. */
     ld s2, CPU_START_ROOT_OFF(s1)
     ld s3, CPU_START_STACK_OFF(s1)
-    ld s4, CPU_START_RUNTIME_OFF(s1)
+    ld s4, CPU_START_ARG_OFF(s1)
     ld s5, CPU_START_ENTRY_OFF(s1)
     beqz s2, .Lsecondary_park
     beqz s3, .Lsecondary_park

@@ -6,6 +6,8 @@
 #include <libk/checked_arithmetic.hpp>
 #include <expected>
 #include <optional>
+#include <array>
+#include <span>
 #include <uapi/cap.h>
 #include <uapi/ipc.h>
 #include <uapi/start.h>
@@ -20,7 +22,7 @@
  * Userspace admission relation for the public capability attenuation ABI.
  *
  * This is deliberately expressed only in the UAPI descriptor vocabulary.  It
- * is shared by ManifestView and the authority/import path; the kernel
+ * is shared by Manifest and the authority/import path; the kernel
  * still decodes and checks the actual source authority at every syscall.
  */
 
@@ -87,10 +89,12 @@ enum class DescriptorForm : uint8_t {
     case OBJECT_KIND_CSPACE:
     case OBJECT_KIND_NOTIFICATION:
     case OBJECT_KIND_IO_SPACE:
-    case OBJECT_KIND_DEVICE:
     case OBJECT_KIND_IRQ:
     case OBJECT_KIND_PAGER:
         return zero_words(value, 0);
+    case OBJECT_KIND_IO_HOST:
+        return value.words[1] && value.words[0] < 65536
+            && value.words[1] <= 65536 - value.words[0] && zero_words(value, 2);
     case OBJECT_KIND_MEMORY:
         return valid_range(value.words[0], value.words[1])
             && valid_access(value.words[2])
@@ -160,10 +164,12 @@ enum class DescriptorForm : uint8_t {
     case OBJECT_KIND_CSPACE:
     case OBJECT_KIND_NOTIFICATION:
     case OBJECT_KIND_IO_SPACE:
-    case OBJECT_KIND_DEVICE:
     case OBJECT_KIND_IRQ:
     case OBJECT_KIND_PAGER:
         return true;
+    case OBJECT_KIND_IO_HOST:
+        return range_within(ceiling.words[0], ceiling.words[1],
+                            requested.words[0], requested.words[1]);
     case OBJECT_KIND_MEMORY:
     case OBJECT_KIND_VSPACE:
         return range_within(
@@ -262,7 +268,7 @@ public:
         return size_;
     }
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
-        return data_ != nullptr;
+        return bool(data_);
     }
     [[nodiscard]] constexpr auto operator[](size_t index) const noexcept
         -> uint8_t {
@@ -289,17 +295,18 @@ private:
 struct StringRef final {
     uint32_t offset{};
     uint32_t length{};
+    constexpr auto empty() const noexcept -> bool { return length == 0; }
+    constexpr auto operator==(const StringRef&) const noexcept -> bool = default;
 };
 
 static_assert(sizeof(StringRef) == 8);
 
 /*
  * Canonical typed projections of validated wire rows.  These are borrowed
- * views of ManifestView's bytes; DeploymentPlan copies them into its own
- * explicit storage.  Field offsets and widths are owned by ManifestView,
- * not by the decoded-plan layer.
+ * values decoded from immutable Manifest bytes. No secondary row store.
+ * Field offsets and widths belong to this parser.
  */
-struct ManifestTaskRow final {
+struct TaskRow final {
     StringRef name{};
     StringRef pool_key{};
     StringRef vspace_key{};
@@ -335,13 +342,13 @@ struct ManifestTaskRow final {
     StringRef arguments{};
 };
 
-struct ManifestImageRow final {
+struct ImageRow final {
     StringRef source{};
     uint16_t source_kind{};
     uint16_t flags{};
 };
 
-struct ManifestMappingRow final {
+struct MappingRow final {
     StringRef produced{};
     StringRef pager{};
     StringRef region{};
@@ -357,7 +364,7 @@ struct ManifestMappingRow final {
     uint64_t size{};
 };
 
-struct ManifestObjectRow final {
+struct ObjectRow final {
     StringRef output{};
     StringRef output_b{};
     uint16_t kind{};
@@ -366,7 +373,7 @@ struct ManifestObjectRow final {
     uint64_t args[6]{};
 };
 
-struct ManifestExecutionRow final {
+struct ExecutionRow final {
     StringRef key{};
     StringRef sc{};
     StringRef domain{};
@@ -388,7 +395,7 @@ struct ManifestExecutionRow final {
     uint32_t home_cpu{};
 };
 
-struct ManifestImportRow final {
+struct ImportRow final {
     StringRef source{};
     StringRef destination{};
     uint16_t mode{};
@@ -398,7 +405,7 @@ struct ManifestImportRow final {
     uint16_t source_class{};
 };
 
-struct ManifestBootstrapRow final {
+struct BootstrapRow final {
     uint32_t kind{};
     StringRef destination{};
     StringRef name{};
@@ -408,14 +415,14 @@ struct ManifestBootstrapRow final {
     uint16_t object_kind{};
 };
 
-struct ManifestDependencyRow final {
+struct DependencyRow final {
     uint32_t target{DEPLOY_NO_INDEX};
     uint16_t kind{};
     uint16_t flags{};
     StringRef relation{};
 };
 
-struct ManifestExportRow final {
+struct ExportRow final {
     StringRef source{};
     StringRef key{};
     uint16_t source_class{};
@@ -478,8 +485,9 @@ enum class Error : uint16_t {
     InvalidBootBundle,
 };
 
-class ManifestView final {
+class Manifest final {
 public:
+    Manifest() noexcept = default;
     struct Table final {
         size_t offset{};
         uint32_t count{};
@@ -490,9 +498,9 @@ public:
         const void* data,
         size_t size,
         ManifestWorkspace& workspace) noexcept
-        -> std::expected<ManifestView, Error> {
+        -> std::expected<Manifest, Error> {
         workspace.reset();
-        ManifestView result{data, size};
+        Manifest result{data, size};
         if (result.validate(workspace)) {
             return (result);
         }
@@ -599,34 +607,142 @@ public:
 
     [[nodiscard]] auto task_row(
         uint32_t index,
-        ManifestTaskRow& output) const noexcept -> bool;
+        TaskRow& output) const noexcept -> bool;
     [[nodiscard]] auto image_row(
         uint32_t index,
-        ManifestImageRow& output) const noexcept -> bool;
+        ImageRow& output) const noexcept -> bool;
     [[nodiscard]] auto mapping_row(
         uint32_t index,
-        ManifestMappingRow& output) const noexcept -> bool;
+        MappingRow& output) const noexcept -> bool;
     [[nodiscard]] auto object_row(
         uint32_t index,
-        ManifestObjectRow& output) const noexcept -> bool;
+        ObjectRow& output) const noexcept -> bool;
     [[nodiscard]] auto execution_row(
         uint32_t index,
-        ManifestExecutionRow& output) const noexcept -> bool;
+        ExecutionRow& output) const noexcept -> bool;
     [[nodiscard]] auto import_row(
         uint32_t index,
-        ManifestImportRow& output) const noexcept -> bool;
+        ImportRow& output) const noexcept -> bool;
     [[nodiscard]] auto dependency_row(
         uint32_t index,
-        ManifestDependencyRow& output) const noexcept -> bool;
+        DependencyRow& output) const noexcept -> bool;
     [[nodiscard]] auto export_row(
         uint32_t index,
-        ManifestExportRow& output) const noexcept -> bool;
+        ExportRow& output) const noexcept -> bool;
     [[nodiscard]] auto bootstrap_row(
         uint32_t index,
-        ManifestBootstrapRow& output) const noexcept -> bool;
+        BootstrapRow& output) const noexcept -> bool;
+
+    [[nodiscard]] auto task(uint32_t index) const noexcept -> std::optional<TaskRow> {
+        TaskRow row{};
+        if (!task_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto image(uint32_t index) const noexcept -> std::optional<ImageRow> {
+        ImageRow row{};
+        if (!image_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto mapping(uint32_t index) const noexcept -> std::optional<MappingRow> {
+        MappingRow row{};
+        if (!mapping_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto object(uint32_t index) const noexcept -> std::optional<ObjectRow> {
+        ObjectRow row{};
+        if (!object_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto execution(uint32_t index) const noexcept -> std::optional<ExecutionRow> {
+        ExecutionRow row{};
+        if (!execution_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto import(uint32_t index) const noexcept -> std::optional<ImportRow> {
+        ImportRow row{};
+        if (!import_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto dependency(uint32_t index) const noexcept -> std::optional<DependencyRow> {
+        DependencyRow row{};
+        if (!dependency_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto export_record(uint32_t index) const noexcept -> std::optional<ExportRow> {
+        ExportRow row{};
+        if (!export_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto bootstrap(uint32_t index) const noexcept -> std::optional<BootstrapRow> {
+        BootstrapRow row{};
+        if (!bootstrap_row(index, row)) return std::nullopt;
+        return row;
+    }
+    [[nodiscard]] auto find_task(ByteView name) const noexcept -> std::optional<uint32_t> {
+        for (uint32_t i = 0; i < task_count(); ++i)
+            if (task_name(i).equals(name)) return i;
+        return std::nullopt;
+    }
+    template<size_t N>
+    [[nodiscard]] auto find_task(const char (&name)[N]) const noexcept -> std::optional<uint32_t> {
+        return find_task(ByteView{reinterpret_cast<const uint8_t*>(name), N - 1});
+    }
+    // Optional dependencies do not gate startup or enlarge failure boundaries.
+    auto order(std::span<uint32_t> output) const noexcept -> bool {
+        const auto count = task_count();
+        if (count == 0 || output.size() < count) return false;
+        std::array<bool, DEPLOY_TASK_MAX> emitted{};
+        uint32_t written{};
+        while (written < count) {
+            bool progress{};
+            for (uint32_t i = 0; i < count; ++i) {
+                if (emitted[i]) continue;
+                const auto row = *task(i);
+                bool blocked{};
+                for (uint32_t d = 0; d < row.dependency_count; ++d) {
+                    const auto edge = *dependency(row.dependency_first + d);
+                    if (edge.kind == DEPLOY_DEPENDENCY_REQUIRED
+                        && (edge.flags & (DEPLOY_DEPENDENCY_STARTUP | DEPLOY_DEPENDENCY_READINESS))
+                        && !emitted[edge.target]) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+                emitted[i] = true;
+                output[written++] = i;
+                progress = true;
+            }
+            if (!progress) return false;
+        }
+        return true;
+    }
+
+    // Seed failed providers, then find transitive consumers. Reverse order()
+    // supplies the corresponding consumer-before-provider teardown order.
+    auto affected(std::span<bool> failed) const noexcept -> bool {
+        if (failed.size() < task_count()) return false;
+        bool changed;
+        do {
+            changed = false;
+            for (uint32_t i = 0; i < task_count(); ++i) {
+                if (failed[i]) continue;
+                const auto row = *task(i);
+                for (uint32_t d = 0; d < row.dependency_count; ++d) {
+                    const auto edge = *dependency(row.dependency_first + d);
+                    if (edge.kind == DEPLOY_DEPENDENCY_REQUIRED && failed[edge.target]) {
+                        failed[i] = true;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        } while (changed);
+        return true;
+    }
 
 private:
-    constexpr ManifestView(const void* data, size_t size) noexcept
+    constexpr Manifest(const void* data, size_t size) noexcept
         : bytes_{static_cast<const uint8_t*>(data), size} {}
 
     [[nodiscard]] auto fail(Error error) noexcept -> bool {
@@ -1749,7 +1865,7 @@ private:
                     source = &readiness_source;
                     role = &readiness_role;
                 }
-                if (source == nullptr) {
+                if (!source) {
                     continue;
                 }
                 if (*role) {
@@ -1870,7 +1986,7 @@ private:
                           2, attenuation_kind)
                 /* Move remains a reserved wire value while the current
                  * escrow ABI.  Reject it at the canonical manifest-policy
-                 * boundary before DeploymentPlan/Task reservation. */
+                 * boundary before task reservation. */
                 || mode >= DEPLOY_IMPORT_MOVE
                 || source_class > DEPLOY_IMPORT_SOURCE_TASK_KEY
                 || selector != DEPLOY_SELECTOR_ALLOCATED_KEYED
@@ -1933,7 +2049,7 @@ private:
                              DEPLOY_BOOTSTRAP_TAIL, DEPLOY_BOOTSTRAP_STRIDE)) {
                     return fail(Error::InvalidRecord);
                 }
-                ManifestBootstrapRow binding{};
+                BootstrapRow binding{};
                 if (!bootstrap_row(row, binding)) return fail(Error::InvalidRecord);
                 const bool named = kind == 0;
                 const ByteView name = string(binding.name);
@@ -1960,7 +2076,7 @@ private:
                         || (!named && previous_kind == kind)) {
                         return fail(Error::DuplicateKey);
                     }
-                    ManifestBootstrapRow previous_binding{};
+                    BootstrapRow previous_binding{};
                     if (!bootstrap_row(static_cast<uint32_t>(first + previous), previous_binding)
                         || (named && previous_kind == 0
                             && string(previous_binding.name).equals(name)))
@@ -3007,7 +3123,7 @@ namespace manifest_detail {
 
 template<typename T>
 [[nodiscard]] inline auto scalar(
-    const ManifestView& view,
+    const Manifest& view,
     uint32_t table,
     uint32_t index,
     size_t field,
@@ -3022,7 +3138,7 @@ template<typename T>
 }
 
 [[nodiscard]] inline auto string_ref(
-    const ManifestView& view,
+    const Manifest& view,
     uint32_t table,
     uint32_t index,
     size_t field,
@@ -3041,7 +3157,7 @@ template<typename T>
 }
 
 [[nodiscard]] inline auto attenuation(
-    const ManifestView& view,
+    const Manifest& view,
     uint32_t table,
     uint32_t index,
     size_t base,
@@ -3068,9 +3184,9 @@ template<typename T>
 
 } // namespace manifest_detail
 
-inline auto ManifestView::task_row(
+inline auto Manifest::task_row(
     uint32_t index,
-    ManifestTaskRow& output) const noexcept -> bool {
+    TaskRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_TASK, index, DEPLOY_TASK_NAME,
@@ -3172,9 +3288,9 @@ inline auto ManifestView::task_row(
                                       output.arguments);
 }
 
-inline auto ManifestView::image_row(
+inline auto Manifest::image_row(
     uint32_t index,
-    ManifestImageRow& output) const noexcept -> bool {
+    ImageRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_IMAGE, index,
@@ -3186,9 +3302,9 @@ inline auto ManifestView::image_row(
                                    DEPLOY_IMAGE_FLAGS, 2, output.flags);
 }
 
-inline auto ManifestView::mapping_row(
+inline auto Manifest::mapping_row(
     uint32_t index,
-    ManifestMappingRow& output) const noexcept -> bool {
+    MappingRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_MAPPING, index,
@@ -3228,9 +3344,9 @@ inline auto ManifestView::mapping_row(
                                    DEPLOY_MAPPING_SIZE, 8, output.size);
 }
 
-inline auto ManifestView::object_row(
+inline auto Manifest::object_row(
     uint32_t index,
-    ManifestObjectRow& output) const noexcept -> bool {
+    ObjectRow& output) const noexcept -> bool {
     output = {};
     if (!manifest_detail::string_ref(
             *this, DEPLOY_TABLE_OBJECT, index,
@@ -3261,9 +3377,9 @@ inline auto ManifestView::object_row(
     return true;
 }
 
-inline auto ManifestView::execution_row(
+inline auto Manifest::execution_row(
     uint32_t index,
-    ManifestExecutionRow& output) const noexcept -> bool {
+    ExecutionRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_EXECUTION, index,
@@ -3323,9 +3439,9 @@ inline auto ManifestView::execution_row(
                                    output.home_cpu);
 }
 
-inline auto ManifestView::import_row(
+inline auto Manifest::import_row(
     uint32_t index,
-    ManifestImportRow& output) const noexcept -> bool {
+    ImportRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_IMPORT, index,
@@ -3348,9 +3464,9 @@ inline auto ManifestView::import_row(
                DEPLOY_IMPORT_ATTENUATION, output.attenuation);
 }
 
-inline auto ManifestView::dependency_row(
+inline auto Manifest::dependency_row(
     uint32_t index,
-    ManifestDependencyRow& output) const noexcept -> bool {
+    DependencyRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::scalar(
                *this, DEPLOY_TABLE_DEPENDENCY, index,
@@ -3366,9 +3482,9 @@ inline auto ManifestView::dependency_row(
                DEPLOY_DEPENDENCY_RELATION, false, output.relation);
 }
 
-inline auto ManifestView::export_row(
+inline auto Manifest::export_row(
     uint32_t index,
-    ManifestExportRow& output) const noexcept -> bool {
+    ExportRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::string_ref(
                *this, DEPLOY_TABLE_EXPORT, index,
@@ -3387,9 +3503,9 @@ inline auto ManifestView::export_row(
                DEPLOY_EXPORT_CEILING, output.ceiling);
 }
 
-inline auto ManifestView::bootstrap_row(
+inline auto Manifest::bootstrap_row(
     uint32_t index,
-    ManifestBootstrapRow& output) const noexcept -> bool {
+    BootstrapRow& output) const noexcept -> bool {
     output = {};
     return manifest_detail::scalar(
                *this, DEPLOY_TABLE_BOOTSTRAP, index,
@@ -3409,5 +3525,51 @@ inline auto ManifestView::bootstrap_row(
         && manifest_detail::scalar(*this, DEPLOY_TABLE_BOOTSTRAP, index,
                DEPLOY_BOOTSTRAP_OBJECT_KIND, 2, output.object_kind);
 }
+
+
+// Borrows the program's immutable manifest only for synchronous construction.
+struct TaskSpec final {
+    const Manifest* manifest{};
+    uint32_t index{};
+    [[nodiscard]] auto valid() const noexcept -> bool { return manifest && index < manifest->task_count(); }
+    [[nodiscard]] auto row() const noexcept -> std::optional<TaskRow> {
+        return valid() ? manifest->task(index) : std::nullopt;
+    }
+    [[nodiscard]] auto string(StringRef ref) const noexcept -> ByteView {
+        return valid() ? manifest->string(ref) : ByteView{};
+    }
+    [[nodiscard]] auto image(uint32_t i) const noexcept -> std::optional<ImageRow> {
+        const auto task = row();
+        return task && i < task->image_count ? manifest->image(task->image_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto mapping(uint32_t i) const noexcept -> std::optional<MappingRow> {
+        const auto task = row();
+        return task && i < task->mapping_count ? manifest->mapping(task->mapping_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto object(uint32_t i) const noexcept -> std::optional<ObjectRow> {
+        const auto task = row();
+        return task && i < task->object_count ? manifest->object(task->object_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto execution(uint32_t i) const noexcept -> std::optional<ExecutionRow> {
+        const auto task = row();
+        return task && i < task->execution_count ? manifest->execution(task->execution_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto import(uint32_t i) const noexcept -> std::optional<ImportRow> {
+        const auto task = row();
+        return task && i < task->import_count ? manifest->import(task->import_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto dependency(uint32_t i) const noexcept -> std::optional<DependencyRow> {
+        const auto task = row();
+        return task && i < task->dependency_count ? manifest->dependency(task->dependency_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto export_record(uint32_t i) const noexcept -> std::optional<ExportRow> {
+        const auto task = row();
+        return task && i < task->export_count ? manifest->export_record(task->export_first + i) : std::nullopt;
+    }
+    [[nodiscard]] auto bootstrap(uint32_t i) const noexcept -> std::optional<BootstrapRow> {
+        const auto task = row();
+        return task && i < task->bootstrap_count ? manifest->bootstrap(task->bootstrap_first + i) : std::nullopt;
+    }
+};
 
 } // namespace deploy

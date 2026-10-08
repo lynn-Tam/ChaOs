@@ -46,29 +46,25 @@ public:
             if (state.value != IO_SPACE_OPENING) return STATUS_BACKING_FAILED;
             yield();
         }
-        auto result = io_space_info(created.value);
-        if (result.status != STATUS_OK) return result.status;
-        IoInfo info{};
-        service::copy(&info, reinterpret_cast<const void*>(service::IpcAddress), sizeof(info));
-        if (info.version != IO_INFO_VERSION || info.reserved != 0
-            || info.configuration[0] != 0x1042'1af4) return STATUS_BAD_ARGS;
-        for (size_t index = 0; index < 6; ++index) {
-            if (info.bar_sizes[index] == 0) continue;
-            if (info.bar_sizes[index] > BarStride) return STATUS_BAD_ARGS;
-            const auto bar = io_space_bar(created.value, index);
-            if (bar.status != STATUS_OK) return bar.status;
-            const size_t bytes = (info.bar_sizes[index] + 4095) & ~size_t{4095};
-            auto mapped = MappedMemory::map(vspace, cap::OwnedCap{{bar.value, 0}},
-                BarsAddress + index * BarStride, bytes, VM_READ | VM_WRITE);
+        std::array<size_t, IO_REG_COUNT> sizes{};
+        for (size_t i = 0; i < IO_REG_COUNT; ++i) {
+            const auto reg = io_space_reg(created.value, i);
+            if (reg.status == STATUS_NOT_FOUND && i < IO_PCI_CFG) continue;
+            if (reg.status != STATUS_OK) return reg.status;
+            if (!reg.value2 || reg.value2 > BarStride) return STATUS_BAD_ARGS;
+            sizes[i] = reg.value2;
+            auto mapped = MappedMemory::map(vspace, cap::OwnedCap{{reg.value, 0}},
+                BarsAddress + i * BarStride, (sizes[i] + 4095) & ~size_t{4095},
+                i == IO_PCI_CFG ? VM_READ : VM_READ | VM_WRITE);
             if (!mapped) return mapped.error();
-            bars_[index] = std::move(*mapped);
+            regs_[i] = std::move(*mapped);
         }
         const auto interrupt = io_space_irq(created.value);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         interrupt_ = cap::OwnedCap{{interrupt.value, 0}};
-        result = irq_bind(interrupt.value, events, service::EventsBadge);
+        auto result = irq_bind(interrupt.value, events, service::EventsBadge);
         if (result.status != STATUS_OK) return result.status;
-        return configure(info) ? STATUS_OK : STATUS_BACKING_FAILED;
+        return configure(sizes) ? STATUS_OK : STATUS_BACKING_FAILED;
     }
 
     [[nodiscard]] auto capacity() const noexcept -> uint64_t { return sectors_ * BlockSize; }
@@ -224,26 +220,28 @@ private:
         dma_write<uint16_t>(target + 14, next);
     }
 
-    auto configure(const IoInfo& info) noexcept -> bool {
+    auto configure(const std::array<size_t, IO_REG_COUNT>& sizes) noexcept -> bool {
         uintptr_t common{};
         uintptr_t device{};
         size_t notify_size{};
         uint32_t multiplier{};
-        uint8_t cap = info.configuration[0x34 / 4];
+        const auto cfg = regs_[IO_PCI_CFG].address;
+        if (read<uint32_t>(cfg) != 0x1042'1af4) return false;
+        uint8_t cap = read<uint32_t>(cfg + 0x34);
         for (size_t count = 0; cap != 0 && count < 48; ++count) {
             if (cap < 0x40 || cap > 0xfc || cap % 4 != 0) return false;
-            const uint32_t header = info.configuration[cap / 4];
+            const uint32_t header = read<uint32_t>(cfg + cap);
             if ((header & 255) == 9) {
                 const uint8_t type = header >> 24;
                 if (type >= 1 && type <= 4) {
                     if (cap > 0xf0) return false;
-                    const size_t bar = info.configuration[cap / 4 + 1] & 255;
-                    const size_t offset = info.configuration[cap / 4 + 2];
-                    const size_t size = info.configuration[cap / 4 + 3];
+                    const size_t bar = read<uint32_t>(cfg + cap + 4) & 255;
+                    const size_t offset = read<uint32_t>(cfg + cap + 8);
+                    const size_t size = read<uint32_t>(cfg + cap + 12);
                     if (((header >> 16) & 255) < 16 || bar >= 6
-                        || offset > info.bar_sizes[bar] || size > info.bar_sizes[bar] - offset)
+                        || offset > sizes[bar] || size > sizes[bar] - offset)
                         return false;
-                    const uintptr_t address = bars_[bar].address + offset;
+                    const uintptr_t address = regs_[bar].address + offset;
                     if (type == 1) {
                         if (common != 0 || size < 56) return false;
                         common = address;
@@ -251,7 +249,7 @@ private:
                         if (notify_ != 0 || cap > 0xec || ((header >> 16) & 255) < 20) return false;
                         notify_ = address;
                         notify_size = size;
-                        multiplier = info.configuration[cap / 4 + 4];
+                        multiplier = read<uint32_t>(cfg + cap + 16);
                     } else if (type == 3) {
                         if (isr_ != 0 || size < 1) return false;
                         isr_ = address;
@@ -322,7 +320,7 @@ private:
     sys::cap::OwnedCap space_{};
     sys::cap::OwnedCap interrupt_{};
     sys::MappedMemory arena_{};
-    sys::MappedMemory bars_[6]{};
+    sys::MappedMemory regs_[IO_REG_COUNT]{};
 };
 
 } // namespace block

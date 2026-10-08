@@ -6,12 +6,9 @@
 #include <trace.hpp>
 
 #include <cpu.hpp>
-#include <cpu.hpp>
 #include <console.hpp>
 #include <panic.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/runtime.hpp>
+#include <cpu/cpu.hpp>
 #include <sched/sc.hpp>
 #include <sched/domain.hpp>
 #include <sync.hpp>
@@ -23,13 +20,11 @@
 namespace sched {
 
 Dispatcher::Dispatcher(
-    CpuLocal& cpu,
-    CpuId id,
+    Cpu& cpu,
     Thread& idle,
     time::Clock& clock) noexcept
-    : cpu_(&cpu), id_(id), idle_(&idle), clock_(&clock)
+    : cpu_(cpu), idle_(&idle), clock_(&clock)
 {
-    libk_assert(cpu_->dispatcher_ == nullptr);
     libk_assert(idle_->idle());
     libk_assert(idle_->state_ == Thread::State::Prepared);
     const auto quantum = clock_->duration_from_nanoseconds(4'000'000);
@@ -37,15 +32,9 @@ Dispatcher::Dispatcher(
     quantum_ = *quantum;
     timer_available_ = arch::timer_available();
     ipi_available_ = arch::ipi_available();
-    cpu_->dispatcher_ = this;
 }
 
-Dispatcher::~Dispatcher() noexcept {
-
-    if (cpu_ != nullptr && cpu_->dispatcher_ == this) {
-        cpu_->dispatcher_ = nullptr;
-    }
-}
+auto Dispatcher::id() const noexcept -> CpuId { return cpu_.id; }
 
 void Dispatcher::enqueue(Sc& sc) noexcept {
     libk_assert(!sc.queued());
@@ -68,7 +57,7 @@ Sc* Dispatcher::select() noexcept {
 }
 
 auto Dispatcher::current() const noexcept -> Thread* {
-    return cpu_->current_;
+    return cpu_.current;
 }
 
 auto Dispatcher::remaining_budget() const noexcept -> time::Duration {
@@ -85,7 +74,7 @@ auto Dispatcher::arm(
     Deadline& deadline,
     time::Instant when) noexcept -> bool {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == cpu_);
+    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
     if (!timer_available_ || deadline.armed() || !deadline.callback_) {
         return false;
     }
@@ -98,7 +87,7 @@ auto Dispatcher::arm(
 
 void Dispatcher::disarm(Deadline& deadline) noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == cpu_);
+    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
     libk_assert(deadline.owner_ == this);
     deadlines_.erase(deadline);
     deadline.owner_ = nullptr;
@@ -107,20 +96,20 @@ void Dispatcher::disarm(Deadline& deadline) noexcept {
 
 void Dispatcher::publish(Thread* target) noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == cpu_);
+    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
     libk_assert(target);
     const usize stack_top = target->current_stack_top();
     libk_assert(stack_top != 0 && (stack_top & 0xfU) == 0);
 
     Env& roots = target->env();
-    roots.root().activate(*cpu_);
-    cpu_->current_ = target;
-    cpu_->entry.stack = stack_top;
+    roots.root().activate(cpu_);
+    cpu_.current = target;
+    cpu_.entry.stack = stack_top;
 }
 
 [[noreturn]] void Dispatcher::enter_idle() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert(!cpu_->current_);
+    libk_assert(!cpu_.current);
     libk_assert(idle_->state_ == Thread::State::Prepared);
     idle_->set_state(Thread::State::Running);
     accounted_at_ = clock_->now();
@@ -133,14 +122,11 @@ void Dispatcher::publish(Thread* target) noexcept {
 
 void Dispatcher::on_context_enter() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert(cpu_->current_);
-    libk_assert(cpu_->entry.stack
-        == cpu_->current_->current_stack_top());
-    Env& roots = cpu_->current_->env();
-    libk_assert(cpu_->kernel_vspace() == roots.kernel_vspace());
-    libk_assert(cpu_->vspace() == roots.vspace());
-    libk_assert(cpu_->cspace() == roots.cspace());
-    libk_assert(cpu_->active_tlb_
+    libk_assert(cpu_.current);
+    libk_assert(cpu_.entry.stack
+        == cpu_.current->current_stack_top());
+    Env& roots = cpu_.current->env();
+    libk_assert(cpu_.tlb
         == &roots.root().state());
     post_switch();
     if (ipi_available_) {
@@ -156,13 +142,13 @@ void Dispatcher::refresh() noexcept {
     // trap-exit hook (depth 0). Both are owner-CPU, interrupts-off points
     // before the selected user frame is restored.
     libk_assert(arch::local()->depth <= 1);
-    libk_assert(cpu_->current_);
-    publish(cpu_->current_);
+    libk_assert(cpu_.current);
+    publish(cpu_.current);
 }
 
 auto Dispatcher::make_ready(Sc& sc) noexcept -> bool {
     libk_assert(!arch::interrupts_enabled());
-    if (sc.home_cpu() != id_ || sc.queued()) {
+    if (sc.home_cpu() != cpu_.id || sc.queued()) {
         return false;
     }
     Thread* target = &sc.thread();
@@ -204,7 +190,7 @@ auto Dispatcher::accept_wake(
     Sc& sc) noexcept
     -> WakeAcceptance {
     libk_assert(!arch::interrupts_enabled());
-    if (sc.home_cpu() != id_) {
+    if (sc.home_cpu() != cpu_.id) {
         return WakeAcceptance::Rejected;
     }
     Thread& exec = sc.thread();
@@ -238,14 +224,14 @@ auto Dispatcher::accept_wake(
 
 auto Dispatcher::post_wake(
     Sc& sc) noexcept -> WakeResult {
-    if (sc.home_cpu() != id_) {
+    if (sc.home_cpu() != cpu_.id) {
         return std::unexpected(WakeError::WrongCpu);
     }
     return post_remote(sc, Wake);
 }
 
 auto Dispatcher::post_start(Sc& sc) noexcept -> WakeResult {
-    if (sc.home_cpu() != id_) {
+    if (sc.home_cpu() != cpu_.id) {
         return std::unexpected(WakeError::WrongCpu);
     }
     return post_remote(sc, Start);
@@ -286,24 +272,23 @@ auto Dispatcher::kick_remote() noexcept -> WakeResult {
     if (!ipi_available_) {
         return std::unexpected(WakeError::Unavailable);
     }
-    libk_assert(cpu_->descriptor != nullptr);
     for (usize attempt = 0; attempt < 8; ++attempt) {
         {
             sync::Lock guard{mail_lock_};
             if (mail_.empty()) return {};
         }
-        if (send_ipi(cpu_->descriptor->hardware_id())) {
-            trace::emit(trace::Event::Ipi, id_.raw, cpu_->descriptor->hardware_id().raw);
+        if (send_ipi(cpu_.hw)) {
+            trace::emit(trace::Event::Ipi, cpu_.id.raw, cpu_.hw.raw);
             return {};
         }
-        trace::emit(trace::Event::KickFail, id_.raw, cpu_->descriptor->hardware_id().raw, attempt);
+        trace::emit(trace::Event::KickFail, cpu_.id.raw, cpu_.hw.raw, attempt);
     }
     panic("IPI delivery failed");
 }
 
 void Dispatcher::request_stop(Thread& entity) noexcept {
     auto* target = &entity;
-    if ((arch::local() ? arch::local()->owner : nullptr) == cpu_) {
+    if ((arch::local() ? arch::local()->owner : nullptr) == &cpu_) {
         sync::Irq irq{};
         // A target may finish its ordinary exit after the stop owner publishes
         // the terminal transaction but before this owner-CPU call is entered.
@@ -435,7 +420,7 @@ void Dispatcher::yield() noexcept {
 
 void Dispatcher::block_current() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert(cpu_->current_ && !cpu_->current_->idle());
+    libk_assert(cpu_.current && !cpu_.current->idle());
     libk_assert(current_sc_ != nullptr);
     if (current_sc_->wake_credit_) {
         current_sc_->wake_credit_ = false;
@@ -447,7 +432,7 @@ void Dispatcher::block_current() noexcept {
 
 [[noreturn]] void Dispatcher::exit_current() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert(cpu_->current_ && !cpu_->current_->idle());
+    libk_assert(cpu_.current && !cpu_.current->idle());
     dispatch(DispatchReason::Exit, clock_->now());
     libk_assert(false);
     __builtin_unreachable();
@@ -490,12 +475,12 @@ void Dispatcher::on_timer() noexcept {
 void Dispatcher::on_trap_exit() noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(arch::local()->depth == 0);
-    if (cpu_->current_->stop_ready()) {
+    if (cpu_.current->stop_ready()) {
         request_reschedule(DispatchReason::Stop);
     }
     if (!pending_ || preempt_depth_ != 0
         || ((*pending_ == DispatchReason::Stop || *pending_ == DispatchReason::Exit)
-            && cpu_->current_->in_kernel_)) {
+            && cpu_.current->in_kernel_)) {
         return;
     }
     const DispatchReason reason = *pending_;
@@ -529,15 +514,15 @@ void Dispatcher::dispatch(
     status_t exit_status) noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(arch::local()->depth == 0);
-    libk_assert(cpu_->current_);
+    libk_assert(cpu_.current);
     charge_to(now);
     process_timers(now);
 
-    Thread* outgoing = cpu_->current_;
+    Thread* outgoing = cpu_.current;
     Sc* const outgoing_sc = current_sc_;
     if (outgoing_sc != nullptr) {
         Sc& context = *outgoing_sc;
-        context.deactivate(id_);
+        context.deactivate(cpu_.id);
         current_sc_ = nullptr;
         switch (reason) {
         case DispatchReason::Exit:
@@ -583,7 +568,7 @@ void Dispatcher::commit(
     DispatchReason reason,
     time::Instant now,
     status_t exit_status) noexcept {
-    Thread* outgoing = cpu_->current_;
+    Thread* outgoing = cpu_.current;
     Thread* incoming = idle_;
     Sc* incoming_sc{};
 
@@ -591,18 +576,18 @@ void Dispatcher::commit(
         Sc& context = *candidate;
         Thread* target = &candidate->thread();
         Thread& exec = *target;
-        libk_assert(candidate->home_cpu() == id_);
+        libk_assert(candidate->home_cpu() == cpu_.id);
         libk_assert(candidate->queued());
         libk_assert(exec.state_ == Thread::State::Ready);
         libk_assert(exec.sc_ == candidate);
         libk_assert(context.bound());
         libk_assert(context.domain_ != nullptr);
-        libk_assert(context.domain_->allows(id_));
+        libk_assert(context.domain_->allows(cpu_.id));
         libk_assert(context.eligible(now));
 
         remove(*candidate);
 
-        libk_assert(context.activate(id_));
+        libk_assert(context.activate(cpu_.id));
         exec.set_state(Thread::State::Running);
         incoming = target;
         incoming_sc = candidate;
@@ -681,7 +666,7 @@ void Dispatcher::record_dispatch(
 
 void Dispatcher::post_switch() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert(cpu_->current_);
+    libk_assert(cpu_.current);
     Thread* outgoing = handoff_outgoing_;
     const DispatchReason reason = handoff_reason_;
     const status_t exit_status = handoff_exit_status_;
@@ -718,7 +703,7 @@ auto Dispatcher::stop(Thread* target) noexcept
     }
 
     if (exec.state_ == Thread::State::Running) {
-        libk_assert(cpu_->current_ == target);
+        libk_assert(cpu_.current == target);
         request_reschedule(DispatchReason::Stop);
         return StopDisposition::Deferred;
     }
@@ -751,7 +736,7 @@ auto Dispatcher::stop(Thread* target) noexcept
 }
 
 void Dispatcher::cancel(Sc& sc) noexcept {
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == cpu_ && !arch::interrupts_enabled());
+    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_ && !arch::interrupts_enabled());
     sync::Lock guard{mail_lock_};
     if (sc.mail_hook_.is_linked()) mail_.erase(sc);
     else libk_assert(!sc.mailed_.load<libk::MemoryOrder::Relaxed>());
@@ -766,7 +751,7 @@ void Dispatcher::finish_exit(
     libk_assert(!arch::interrupts_enabled());
     Thread& exec = *target;
     libk_assert(exec.state_ == Thread::State::Exited);
-    libk_assert(cpu_->current_ != target);
+    libk_assert(cpu_.current != target);
     // Also covers Stop of a ready exec after frame redirect: its saved
     // kernel stack is now discarded, so every popped stack can be recycled.
     target->release_calls();
@@ -793,32 +778,30 @@ void yield() noexcept {
     // section.  Keep this scheduler boundary raw; the dispatcher itself
     // already requires interrupts to be masked.
     const bool interrupts = arch::disable_interrupts();
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    cpu.dispatcher()->yield();
+    Cpu& cpu = current_cpu();
+    cpu.dispatcher().yield();
     arch::restore_interrupts(interrupts);
 }
 
 void block() noexcept {
     // See yield(): block_current() can hand the stack to another exec.
     const bool interrupts = arch::disable_interrupts();
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    cpu.dispatcher()->block_current();
+    Cpu& cpu = current_cpu();
+    cpu.dispatcher().block_current();
     arch::restore_interrupts(interrupts);
 }
 
 auto wake(
-    CpuRegistry& cpus,
+    Cpus& cpus,
     Sc& sc) noexcept
     -> Dispatcher::WakeResult {
-    CpuRuntime* const target = cpus.runtime(sc.home_cpu());
+    Cpu* const target = cpus.get(sc.home_cpu());
     if (target == nullptr
-        || target->local.descriptor->state() != CpuState::Online) {
+        || !target->online()) {
         return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
 
-    if ((arch::local() ? arch::local()->owner : nullptr) == &target->local) {
+    if ((arch::local() ? arch::local()->owner : nullptr) == target) {
         sync::Irq irq{};
         const Dispatcher::WakeAcceptance accepted =
             target->dispatcher().accept_wake(sc);
@@ -830,14 +813,14 @@ auto wake(
     return target->dispatcher().post_wake(sc);
 }
 
-auto start(CpuRegistry& cpus, Sc& sc) noexcept
+auto start(Cpus& cpus, Sc& sc) noexcept
     -> Dispatcher::WakeResult {
-    CpuRuntime* const target = cpus.runtime(sc.home_cpu());
+    Cpu* const target = cpus.get(sc.home_cpu());
     if (target == nullptr
-        || target->local.descriptor->state() != CpuState::Online) {
+        || !target->online()) {
         return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
-    if ((arch::local() ? arch::local()->owner : nullptr) == &target->local) {
+    if ((arch::local() ? arch::local()->owner : nullptr) == target) {
         sync::Irq irq{};
         const bool accepted = target->dispatcher().make_ready(sc);
         return accepted
@@ -851,9 +834,8 @@ auto start(CpuRegistry& cpus, Sc& sc) noexcept
 [[noreturn]] void exit_current() noexcept {
     [[maybe_unused]] const bool interrupts =
         arch::disable_interrupts();
-    CpuLocal& cpu = current_cpu();
-    libk_assert(cpu.dispatcher() != nullptr);
-    cpu.dispatcher()->exit_current();
+    Cpu& cpu = current_cpu();
+    cpu.dispatcher().exit_current();
 }
 
 } // namespace sched

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <servers/deploy/detail/plan.hpp>
+#include <servers/deploy/format.hpp>
 #include <sys/start.hpp>
 #include <servers/runtime/service.hpp>
 
@@ -12,29 +12,29 @@ inline auto named(deploy::ByteView value, const char* name) noexcept -> bool {
 
 // The scheduling domain is an input to construction, not an application
 // import. Only the explicitly allowed service contracts may cross that boundary.
-inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) noexcept -> bool {
-    const auto& row = *task.row();
-    if (row.executions.count != 1 || task.execution(0)->model != DEPLOY_EXECUTION_THREAD
-        || row.images.count != 1 || row.exports.count != 0 || row.dependencies.count != 0
+inline auto admit(const deploy::TaskSpec& task, deploy::ByteView package) noexcept -> bool {
+    const auto row = *task.row();
+    if (row.execution_count != 1 || task.execution(0)->model != DEPLOY_EXECUTION_THREAD
+        || row.image_count != 1 || row.export_count != 0 || row.dependency_count != 0
         || row.pool_memory > 8 * 1024 * 1024 || row.pool_caps > 256
         || (row.kind_mask & ~(DEPLOY_BASE_KINDS | OBJ_BIT(OBJECT_KIND_CHANNEL))) != 0)
         return false;
-    for (uint32_t i = 0; i < row.objects.count; ++i)
+    for (uint32_t i = 0; i < row.object_count; ++i)
         if (task.object(i)->kind != OBJECT_KIND_NOTIFICATION) return false;
-    for (uint32_t i = 0; i < row.mappings.count; ++i)
+    for (uint32_t i = 0; i < row.mapping_count; ++i)
         if (task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_IMAGE_SEGMENT
             && task.mapping(i)->source != DEPLOY_MAPPING_SOURCE_ZERO) return false;
-    for (uint32_t i = 0; i < row.imports.count; ++i) {
-        const auto& imported = *task.import(i);
-        const deploy::PlanBootstrap* binding{};
-        for (uint32_t b = 0; b < row.bootstraps.count; ++b) {
+    for (uint32_t i = 0; i < row.import_count; ++i) {
+        const auto imported = *task.import(i);
+        std::optional<deploy::BootstrapRow> binding{};
+        for (uint32_t b = 0; b < row.bootstrap_count; ++b) {
             if (task.bootstrap(b)->destination != imported.destination) continue;
-            if (binding != nullptr) return false;
+            if (bool(binding)) return false;
             binding = task.bootstrap(b);
         }
-        if (binding == nullptr) return false;
+        if (!binding) return false;
         if (binding->kind == 0) {
-            const auto name = task.symbol(binding->name);
+            const auto name = task.string(binding->name);
             const boot::Import* contract{};
             const char* source{};
             word_t rights = RIGHT_SEND;
@@ -53,10 +53,10 @@ inline auto admit(const deploy::TaskPlanView& task, deploy::ByteView package) no
             } else if (named(name, boot::Stderr.name)) {
                 contract = &boot::Stderr; source = "stderr";
             }
-            if (contract == nullptr || binding->protocol != contract->protocol || binding->major != contract->major
+            if (!contract || binding->protocol != contract->protocol || binding->major != contract->major
                 || binding->object_kind != contract->kind
                 || imported.source_class != DEPLOY_IMPORT_SOURCE_AUTHORITY
-                || !named(task.symbol(imported.source), source) || imported.attenuation.rights != rights)
+                || !named(task.string(imported.source), source) || imported.attenuation.rights != rights)
                 return false;
             continue;
         }

@@ -6,12 +6,12 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <uapi/cap.h>
+#include <uapi/ipc.h>
+#include <uapi/abi.h>
 
-#ifndef __ASSEMBLER__
-#endif
 
 #define BOOT_MAGIC UINT64_C(0x4d594f53494e4954)
-#define BOOT_MAJOR 2U
+#define BOOT_MAJOR 3U
 #define BOOT_MINOR 0U
 
 enum BootRole {
@@ -24,8 +24,7 @@ enum BootRole {
     BOOT_THREAD = 7,
     BOOT_EVENTS = 10,
     BOOT_READY = 14,
-    BOOT_DEVICE = 21,
-
+    BOOT_IO_HOST = 21,
 };
 
 #ifdef __cplusplus
@@ -50,8 +49,8 @@ enum BootRole {
         return OBJECT_KIND_MEMORY;
     case BOOT_THREAD:
         return OBJECT_KIND_THREAD;
-    case BOOT_DEVICE:
-        return OBJECT_KIND_DEVICE;
+    case BOOT_IO_HOST:
+        return OBJECT_KIND_IO_HOST;
     case BOOT_EVENTS:
         return OBJECT_KIND_NOTIFICATION;
     case BOOT_READY:
@@ -74,6 +73,9 @@ struct BootCap {
     uint16_t reserved;
     cap_t handle;
     char name[BOOT_NAME_MAX];
+    // Physical resource metadata; authority always comes from handle.
+    uint64_t phys;
+    uint64_t bytes;
 };
 
 struct BootHdr {
@@ -90,12 +92,8 @@ struct BootHdr {
 
 #ifdef __cplusplus
 static_assert(sizeof(BootHdr) == 48);
-static_assert(sizeof(BootCap) == 56);
+static_assert(sizeof(BootCap) == 72);
 #endif
-
-#include <stdint.h>
-#include <uapi/ipc.h>
-#include <uapi/abi.h>
 
 #define THREAD_START_VERSION 2U
 

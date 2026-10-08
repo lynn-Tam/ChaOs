@@ -22,6 +22,7 @@ def verify(elf_path, package_path):
     first, count = struct.unpack_from('<II', package, module + 40)
     segments = struct.unpack_from('<Q', package, 56)[0]
     assert count == len(loads) and image % 4096 == 0
+    packed = []
     for i, (address, flags, offset, file_size, memory_size) in enumerate(loads):
         va, source, stored, mapped, alignment, access, reserved = struct.unpack_from(
             '<QQQQQII', package, segments + (first + i) * 48)
@@ -34,6 +35,14 @@ def verify(elf_path, package_path):
         assert image <= source <= source + stored <= image + image_size
         assert package[source:source + file_size] == elf[offset:offset + file_size]
         assert not any(package[source + file_size:source + stored])
+        packed.append((va, source, stored, mapped, access))
+    if package[-32:-24] == b'RVBOOT01':
+        magic, payload, entry, count = struct.unpack_from('<QQQQ', package, len(package) - 32)
+        assert entry == struct.unpack_from('<Q', elf, 24)[0]
+        assert payload == struct.unpack_from('<Q', package, 16)[0]
+        assert len(package) == payload + count * 40 + 32 and count == len(packed)
+        assert [struct.unpack_from('<QQQQQ', package, payload + i * 40)
+                for i in range(count)] == packed
     print('[bootpack] load bytes, permissions, alignment and zero tails match ELF')
 
 if __name__ == '__main__':

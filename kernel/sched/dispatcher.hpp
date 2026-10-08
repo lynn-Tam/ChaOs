@@ -15,8 +15,8 @@
 #include <time/clock.hpp>
 #include <uapi/abi.h>
 
-struct CpuLocal;
-class CpuRegistry;
+struct Cpu;
+class Cpus;
 class Thread;
 
 namespace sched {
@@ -34,17 +34,17 @@ public:
     };
     using WakeResult = std::expected<void, WakeError>;
     Dispatcher(
-        CpuLocal& cpu,
-        CpuId id,
+        Cpu& cpu,
         Thread& idle,
         time::Clock& clock) noexcept;
-    ~Dispatcher() noexcept;
+    ~Dispatcher() noexcept = default;
 
+    auto clock() noexcept -> time::Clock& { return *clock_; }
     [[nodiscard]] auto current() const noexcept -> Thread*;
     [[nodiscard]] auto current_sc() noexcept -> Sc* {
         return current_sc_;
     }
-    [[nodiscard]] auto id() const noexcept -> CpuId { return id_; }
+    [[nodiscard]] auto id() const noexcept -> CpuId;
     [[nodiscard]] auto ready_count() const noexcept -> usize {
         return ready_count_;
     }
@@ -130,8 +130,7 @@ private:
 
     [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
 
-    CpuLocal* cpu_{};
-    CpuId id_{};
+    Cpu& cpu_;
     Thread* idle_{};
     time::Clock* clock_{};
     Sc* current_sc_{};
@@ -168,12 +167,12 @@ private:
 void yield() noexcept;
 void block() noexcept;
 [[nodiscard]] auto wake(
-    CpuRegistry& cpus,
+    Cpus& cpus,
     Sc& sc) noexcept
     -> Dispatcher::WakeResult;
 
 [[nodiscard]] auto start(
-    CpuRegistry& cpus,
+    Cpus& cpus,
     Sc& sc) noexcept -> Dispatcher::WakeResult;
 [[noreturn]] void exit_current() noexcept;
 

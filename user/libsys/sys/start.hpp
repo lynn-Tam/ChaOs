@@ -146,36 +146,22 @@ class BootView final {
                 return sys::cap::CapRef{e.handle, 0};
         return std::nullopt;
     }
-    auto cap(Import req) const noexcept -> std::optional<sys::cap::CapRef> {
+    auto find(Import req) const noexcept -> const BootCap* {
         for (const auto& e : entries())
             if (!e.role && req.name && equal(e.name, req.name)) {
                 if (e.protocol == req.protocol && e.major == req.major && e.minor >= req.minor &&
-                    e.kind == req.kind)
-                    return sys::cap::CapRef{e.handle, 0};
+                    e.kind == req.kind) return &e;
                 break;
             }
-        return std::nullopt;
+        return nullptr;
+    }
+    auto cap(Import req) const noexcept -> std::optional<sys::cap::CapRef> {
+        const auto* e = find(req);
+        return e ? std::optional{sys::cap::CapRef{e->handle, 0}} : std::nullopt;
     }
     template <class T> auto selector(T req) const noexcept -> cap_t {
         const auto ref = cap(req);
         return ref ? ref->selector : 0;
-    }
-    // Identity comes from DEVICE_INFO; labels only enumerate granted devices.
-    auto device_import(size_t ordinal) const noexcept -> const BootCap* {
-        for (const auto& e : entries())
-            if (!e.role && e.kind == OBJECT_KIND_DEVICE) {
-                if (!ordinal--)
-                    return &e;
-            }
-        return nullptr;
-    }
-    auto device_count() const noexcept -> size_t {
-        return std::ranges::count_if(
-            entries(), [](const auto& e) { return !e.role && e.kind == OBJECT_KIND_DEVICE; });
-    }
-    auto device(size_t ordinal) const noexcept -> cap_t {
-        const auto* e = device_import(ordinal);
-        return e ? e->handle : 0;
     }
     auto cpu_count() const noexcept -> uint32_t { return info_ ? info_->cpu_count : 0; }
     auto stack_base() const noexcept -> uintptr_t { return info_ ? info_->stack_base : 0; }
@@ -198,11 +184,6 @@ inline auto capability(const boot::BootView& info, Binding role) noexcept -> cap
         sys::exit(STATUS_INVALID_CAP);
     return cap;
 }
-inline auto initial_device(const boot::BootView& info, size_t ordinal = 0) noexcept -> cap_t {
-    const auto cap = info.device(ordinal);
-    if (cap == 0)
-        sys::exit(STATUS_NOT_FOUND);
-    return cap;
-}
+
 
 } // namespace sys::service

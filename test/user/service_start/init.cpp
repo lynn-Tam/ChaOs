@@ -1,3 +1,4 @@
+#include <sys/pci.hpp>
 #include <servers/runtime/service.hpp>
 #include <servers/deploy/services.hpp>
 #include <servers/deploy/launch.hpp>
@@ -31,6 +32,11 @@ void report(const boot::BootView& info, const char* message,
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
     const auto info = service::bootstrap(address, size);
+    auto pci = sys::pci::Bus::open(info, 0x3100'0000);
+    if (!pci) exit(pci.error());
+    service::require(pci->configure(0x1042'1af4));
+    auto selected = pci->find(0x1042'1af4, 0);
+    if (!selected) sys::exit(selected.error());
     report(info, "[service-start] fixture\n", true);
     service::require(supervisor.load(program, info));
     supervisor.open(info);
@@ -51,10 +57,9 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     cap::OwnedCap control_root{{pair.value, 0}}, control_client{{pair.value2, 0}};
     service::require(supervisor.add("service.control", control_client.selector(),
         OBJECT_KIND_CHANNEL, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_DUPLICATE, 1));
-    const auto block_device = service::initial_device(info);
-    service::require(device_info(block_device).status);
-    service::require(supervisor.add("pci.0008", block_device,
-        OBJECT_KIND_DEVICE, RIGHT_CONNECT | RIGHT_DUPLICATE));
+    const auto block_device = selected->cap.selector();
+    service::require(supervisor.add("block.host", block_device,
+        OBJECT_KIND_IO_HOST, RIGHT_CONNECT | RIGHT_DUPLICATE, selected->rid, 1));
 
     deploy::services<5, 24> services{supervisor, program, events.selector()};
     for (unsigned attempt = 0; attempt != 2; ++attempt) {

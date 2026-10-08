@@ -4,7 +4,6 @@
 
 #include <utility>
 
-
 #include <cap/cap.hpp>
 #include <base/types.hpp>
 #include <libk/key.hpp>
@@ -17,6 +16,17 @@
 #include <sync.hpp>
 #include <wait.hpp>
 
+#include <work.hpp>
+
+#include <base/slab.hpp>
+#include <libk/delegate.hpp>
+#include <mm/pmm.hpp>
+#include <resource/sponsorship.hpp>
+
+namespace object {
+class allocation;
+}
+
 namespace resource {
 class Reservation;
 }
@@ -26,14 +36,10 @@ namespace ipc { class Channel; }
 
 namespace cap {
 
-class GrantGraph;
+class Graph;
 class CSpace;
 class GrantAttachment;
 class GrantRef;
-
-enum class GrantInvalidation : u8 {
-    Revoke,
-};
 
 class GrantWork final : private libk::noncopyable {
 public:
@@ -49,7 +55,7 @@ public:
 
 private:
     friend class CSpace;
-    friend class GrantGraph;
+    friend class Graph;
     explicit GrantWork(GrantAttachment& attachment) noexcept
         : attachment_(&attachment) {}
 
@@ -59,12 +65,11 @@ private:
 struct GrantAttachmentOps final {
     void (*invalidate)(
         void* context,
-        GrantWork&& work,
-        GrantInvalidation reason) noexcept;
+        GrantWork&& work) noexcept;
     void (*released)(void* context) noexcept;
 };
 
-// Embedded in a VMM-facing Backing. GrantGraph indexes it
+// Embedded in a VMM-facing Backing. Graph indexes it
 // non-owningly and never exposes the Grant node to the VMM.
 class GrantAttachment final : private libk::noncopyable_nonmovable {
 public:
@@ -85,7 +90,7 @@ public:
     void reset() noexcept;
 
 private:
-    friend class GrantGraph;
+    friend class Graph;
     friend class GrantWork;
 
     enum class State : u8 {
@@ -99,7 +104,7 @@ private:
     void drop_work() noexcept;
 
     libk::IntrusiveListHook grant_hook_{};
-    GrantGraph* graph_{};
+    Graph* graph_{};
     void* node_{};
     u64 generation_{};
     void* context_{};
@@ -108,7 +113,7 @@ private:
     libk::Atomic<u8> state_{static_cast<u8>(State::Idle)};
 };
 
-using GrantKey = libk::key<GrantGraph>;
+using GrantKey = libk::key<Graph>;
 
 enum class GrantState : u8 {
     Live,
@@ -138,7 +143,7 @@ public:
         return static_cast<bool>(h_);
     }
     [[nodiscard]] auto key() const noexcept -> GrantKey;
-    [[nodiscard]] auto graph() const noexcept -> GrantGraph&;
+    [[nodiscard]] auto graph() const noexcept -> Graph&;
     [[nodiscard]] auto kind() const noexcept -> object::ObjectKind;
     [[nodiscard]] auto get() const noexcept -> void*;
     [[nodiscard]] auto target_live() const noexcept -> bool;
@@ -150,20 +155,20 @@ public:
     void reset() noexcept { h_.reset(); }
 
 private:
-    friend class GrantGraph;
+    friend class Graph;
     friend class mm::VSpace;
     friend class ipc::Channel;
     // Only the object-owned transaction may change its grant's meaning.
     [[nodiscard]] auto mint(resource::Reservation&&, View) const noexcept
         -> std::expected<GrantRef, GrantError>;
     GrantLease(
-        GrantGraph& graph,
+        Graph& graph,
         void* node,
         u64 generation) noexcept
         : h_(Data{&graph, node, generation}) {}
 
     struct Data {
-        GrantGraph* graph{};
+        Graph* graph{};
         void* node{};
         u64 gen{};
         static auto empty() noexcept -> Data { return {}; }
@@ -184,7 +189,7 @@ public:
         return static_cast<bool>(h_);
     }
     [[nodiscard]] auto key() const noexcept -> GrantKey;
-    [[nodiscard]] auto graph() const noexcept -> GrantGraph&;
+    [[nodiscard]] auto graph() const noexcept -> Graph&;
     [[nodiscard]] auto clone() const noexcept
         -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto acquire() const noexcept
@@ -192,15 +197,15 @@ public:
     void reset() noexcept { h_.reset(); }
 
 private:
-    friend class GrantGraph;
+    friend class Graph;
     GrantRef(
-        GrantGraph& graph,
+        Graph& graph,
         void* slot,
         u64 generation) noexcept
         : h_(Data{&graph, slot, generation}) {}
 
     struct Data {
-        GrantGraph* graph{};
+        Graph* graph{};
         void* slot{};
         u64 gen{};
         static auto empty() noexcept -> Data { return {}; }
@@ -228,7 +233,7 @@ public:
     [[nodiscard]] auto arm() noexcept -> bool { return completion_.arm(); }
 
 private:
-    friend class GrantGraph;
+    friend class Graph;
     void initialize(usize pending) noexcept;
     void acknowledge() noexcept;
     sync::Latch completion_;
@@ -281,5 +286,192 @@ private:
     GrantLease lease_;
     View view_{};
 };
+
+class Graph final : private libk::noncopyable_nonmovable {
+public:
+    struct Quota final {
+        usize nodes{4096};
+    };
+
+    explicit Graph(mm::Pmm& pmm, ::WorkQueue& work) noexcept;
+    Graph(mm::Pmm& pmm, ::WorkQueue& work, Quota quota) noexcept;
+    ~Graph() noexcept;
+
+    [[nodiscard]] auto create_root(
+        object::ref<>&& target,
+        View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
+    [[nodiscard]] auto create_root(
+        resource::Reservation&& charge,
+        object::ref<>&& target,
+        View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
+
+    [[nodiscard]] auto derive(
+        const GrantLease& source,
+        object::ref<>&& target,
+        View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
+    [[nodiscard]] auto derive(
+        resource::Reservation&& charge,
+        const GrantLease& source,
+        object::ref<>&& target,
+        View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
+
+    [[nodiscard]] auto ref(GrantKey key) noexcept
+        -> std::expected<GrantRef, GrantError>;
+    [[nodiscard]] auto acquire(GrantKey key) noexcept
+        -> std::expected<GrantLease, GrantError>;
+    [[nodiscard]] auto attach(
+        const GrantLease& source,
+        GrantAttachment& attachment) noexcept
+        -> std::expected<void, GrantError>;
+
+    [[nodiscard]] auto revoke_descendants(
+        GrantKey source,
+        GrantRevoke& completion) noexcept -> std::expected<void, GrantError>;
+    [[nodiscard]] auto invalidate(
+        GrantKey source,
+        GrantRevoke& completion) noexcept -> std::expected<void, GrantError>;
+
+    [[nodiscard]] auto state(GrantKey key) const noexcept
+        -> std::expected<GrantState, GrantError>;
+    [[nodiscard]] auto live_count() const noexcept -> usize;
+    [[nodiscard]] auto work_pending() const noexcept -> bool;
+    [[nodiscard]] static auto node_charge() noexcept
+        -> resource::budget;
+
+private:
+    friend class CSpace;
+    friend class GrantRef;
+    friend class GrantLease;
+    friend class GrantAttachment;
+    friend class object::allocation;
+    friend class object::group;
+
+    struct Slot;
+    using Storage = base::slab<Slot, mm::OwnedPage, mm::page_size>;
+    using PageHeader = typename Storage::page;
+
+    struct Node final {
+        libk::IntrusiveListHook child_hook{};
+        using ChildList = libk::IntrusiveList<Node, &Node::child_hook>;
+        using AttachmentList = libk::IntrusiveList<
+            GrantAttachment,
+            &GrantAttachment::grant_hook_>;
+
+        Node(
+            Slot& owner,
+            object::ref<>&& target_ref,
+            View ceiling,
+            Node* parent_node,
+            resource::Reservation&& charge) noexcept
+            : slot(&owner),
+              target(std::move(target_ref)),
+              ceiling(ceiling),
+              parent(parent_node) {
+            if (charge) {
+                sponsorship.commit(std::move(charge));
+            }
+        }
+
+        Slot* slot{};
+        object::ref<> target{};
+        View ceiling{};
+        Node* parent{};
+        ChildList children{};
+        AttachmentList attachments{};
+        GrantRevoke* revoke{};
+        usize refs{};
+        resource::Sponsorship sponsorship{};
+        object::allocation* allocation{};
+    };
+
+    struct Slot final {
+        PageHeader* page{};
+        Slot* next_free{};
+        libk::IntrusiveListHook work_hook{};
+        libk::Atomic<u64> generation{};
+        libk::Atomic<usize> operations{};
+        libk::Atomic<GrantState> state{GrantState::Revoked};
+        libk::Atomic<bool> work_retained{};
+        libk::Atomic<bool> occupied{};
+        alignas(Node) byte storage[sizeof(Node)]{};
+
+        [[nodiscard]] auto node() noexcept -> Node* {
+            return reinterpret_cast<Node*>(storage);
+        }
+        [[nodiscard]] auto node() const noexcept -> const Node* {
+            return reinterpret_cast<const Node*>(storage);
+        }
+    };
+
+    static constexpr usize operation_closed =
+        usize{1} << (sizeof(usize) * 8 - 1);
+    [[nodiscard]] static constexpr auto operation_count(usize value) noexcept
+        -> usize {
+        return value & ~operation_closed;
+    }
+    [[nodiscard]] static constexpr auto admission_closed(usize value) noexcept
+        -> bool {
+        return (value & operation_closed) != 0;
+    }
+
+    using SlotQueue = libk::IntrusiveList<Slot, &Slot::work_hook>;
+
+    static constexpr usize slots_per_page = Storage::capacity();
+
+    [[nodiscard]] auto create(
+        resource::Reservation&& charge,
+        object::ref<>&& target,
+        View ceiling,
+        Node* parent) noexcept -> std::expected<GrantRef, GrantError>;
+    [[nodiscard]] auto claim_slot() noexcept
+        -> std::expected<Slot*, GrantError>;
+    [[nodiscard]] auto make_page() noexcept
+        -> std::expected<PageHeader*, GrantError>;
+    [[nodiscard]] auto locate(GrantKey key) noexcept -> Node*;
+    [[nodiscard]] auto locate(GrantKey key) const noexcept -> const Node*;
+    [[nodiscard]] auto find(GrantKey key) noexcept -> Node*;
+    [[nodiscard]] auto find(GrantKey key) const noexcept -> const Node*;
+    [[nodiscard]] static auto key_of(const Node& node) noexcept -> GrantKey;
+    [[nodiscard]] auto try_ref(Node& node) noexcept
+        -> std::expected<GrantRef, GrantError>;
+    [[nodiscard]] auto try_acquire(Slot& slot, u64 generation) noexcept
+        -> std::expected<GrantLease, GrantError>;
+    void drop_ref(void* node, u64 generation) noexcept;
+    void drop_lease(void* node, u64 generation) noexcept;
+    void release_operation(Slot& slot) noexcept;
+    void enqueue(Slot& slot) noexcept;
+    void kick_work() noexcept;
+    void run_work() noexcept;
+    auto service(usize budget) noexcept -> bool;
+    [[nodiscard]] auto take_work() noexcept -> Slot*;
+    void service_slot(Slot& slot) noexcept;
+    [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
+    void reclaim(GrantKey key, bool drop_reference) noexcept;
+    [[nodiscard]] auto destroy_target(const GrantLease& source) noexcept -> std::expected<void, GrantError>;
+    void revoke_allocation(object::allocation& allocation) noexcept;
+    void retry_allocations() noexcept;
+    void bind_allocation(GrantKey root, object::allocation& allocation) noexcept;
+    void release_allocation(GrantKey root, const object::allocation* allocation) noexcept;
+    void release_page(PageHeader& page) noexcept;
+    [[nodiscard]] auto revoke(
+        GrantKey source,
+        GrantRevoke& completion,
+        bool include_source) noexcept -> std::expected<void, GrantError>;
+    [[nodiscard]] static auto next(Node& root, Node& node) noexcept -> Node*;
+
+    mm::Pmm* pmm_{};
+    Quota quota_{};
+    mutable sync::Spin lock_{};
+    mutable sync::Spin
+        work_lock_{};
+    SlotQueue work_{};
+    ::WorkQueue& executor_;
+    Work job_;
+    Storage storage_{};
+    object::allocation* revoke_retry_{};
+    usize growing_{};
+};
+
+static_assert(Graph::Quota{}.nodes != 0);
 
 } // namespace cap

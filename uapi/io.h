@@ -14,30 +14,6 @@ enum IoState {
     IO_SPACE_FAULTED = 7,
 };
 
-#define IO_INFO_VERSION 1
-#define DEVICE_INFO_VERSION 1
-
-// Inspectable before binding. Requester identifies the platform function;
-// configuration never includes writable BAR addresses.
-struct DeviceDesc {
-    uint32_t version;
-    uint32_t requester;
-    uint32_t configuration[64];
-    uint64_t bar_sizes[6];
-};
-
-// Discovery snapshot, not live PCI configuration space. BAR address bits are
-// absent; a driver obtains register access through IO_SPACE_BAR capabilities.
-struct IoInfo {
-    uint32_t version;
-    uint32_t reserved;
-    uint32_t configuration[64];
-    uint64_t bar_sizes[6];
-};
-
-#ifdef __cplusplus
-static_assert(sizeof(DeviceDesc) == 312);
-static_assert(sizeof(IoInfo) == 312);
-static_assert(offsetof(DeviceDesc, configuration) == 8);
-static_assert(offsetof(DeviceDesc, bar_sizes) == 264);
-#endif
+// PCI BAR indices 0..5; index 6 exports the function's read-only ECAM page.
+#define IO_PCI_CFG 6U
+#define IO_REG_COUNT 7U

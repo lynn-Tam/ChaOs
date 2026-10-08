@@ -4,7 +4,7 @@
 
 #include <mm/types.hpp>
 
-struct CpuRuntime;
+struct Cpu;
 
 namespace test::scenario {
 
@@ -15,7 +15,6 @@ enum class Id : u16 {
     Trap = 3,
     RemoteDelivery = 4,
     Dispatch = 7,
-    IoLease = 10,
     WaitPublication = 11,
 };
 
@@ -27,14 +26,13 @@ extern const Id selected;
     const BootInfo& boot) noexcept -> bool;
 [[nodiscard]] auto run_runtime(
     Id selected,
-    CpuRuntime& runtime) noexcept -> bool;
+    Cpu& runtime) noexcept -> bool;
 
-[[nodiscard]] auto io_lease(CpuRuntime& runtime) noexcept -> bool;
-[[nodiscard]] auto remote(CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto remote(Cpu& runtime) noexcept -> bool;
 [[nodiscard]] auto ordinary(const BootInfo& boot) noexcept -> bool;
 [[nodiscard]] auto initrd(const BootInfo& boot) noexcept -> bool;
-[[nodiscard]] auto trap(CpuRuntime& runtime) noexcept -> bool;
-[[nodiscard]] auto dispatch(CpuRuntime& runtime) noexcept -> bool;
-[[nodiscard]] auto wait_publication(CpuRuntime& runtime) noexcept -> bool;
+[[nodiscard]] auto trap(Cpu& runtime) noexcept -> bool;
+[[nodiscard]] auto dispatch(Cpu& runtime) noexcept -> bool;
+[[nodiscard]] auto wait_publication(Cpu& runtime) noexcept -> bool;
 
 } // namespace test::scenario

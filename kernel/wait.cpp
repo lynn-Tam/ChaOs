@@ -2,8 +2,7 @@
 #include <trace.hpp>
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <sched/sc.hpp>
 #include <sched/dispatcher.hpp>
 #include <sched/guard.hpp>
@@ -151,7 +150,7 @@ auto Wait::ready() const noexcept -> bool {
 
 auto Wait::begin(
     Completion& completion,
-    CpuRegistry& cpus,
+    Cpus& cpus,
     sched::Sc& binding) noexcept -> bool {
     {
         sync::Lock guard{lock_};
@@ -299,7 +298,7 @@ auto Wait::cancel() noexcept -> bool {
 }
 
 void Wait::wake() noexcept {
-    CpuRegistry* cpus{};
+    Cpus* cpus{};
     sched::Sc* binding{};
     {
         sync::Lock guard{lock_};

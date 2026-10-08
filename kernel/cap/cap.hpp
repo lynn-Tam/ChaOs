@@ -175,6 +175,11 @@ struct IrqRoute final {
         IrqRoute, IrqRoute) noexcept -> bool = default;
 };
 
+struct HostLimit {
+    usize first{}, count{};
+    friend constexpr auto operator==(HostLimit, HostLimit) noexcept -> bool = default;
+};
+
 using Limits = std::variant<
     std::monostate,
     MemLimit,
@@ -183,7 +188,7 @@ using Limits = std::variant<
     Badge,
     EpLimit,
     ChanLimit,
-    IrqRoute>;
+    IrqRoute, HostLimit>;
 
 struct View final {
     Rights rights{};

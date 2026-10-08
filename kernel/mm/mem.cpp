@@ -75,7 +75,7 @@ auto WaitQueue::finish(List& batch, WaitRc rc) noexcept -> WaitClaim {
     return claim;
 }
 
-PageReq::PageReq(Thread& thread, CpuRegistry& cpus) noexcept
+PageReq::PageReq(Thread& thread, Cpus& cpus) noexcept
     : thread_(thread), cpus_(cpus),
       done_(Completion::bind<PageReq, &PageReq::release, &PageReq::cancel>(*this)) {
     relation.arm = &PageReq::arm;
@@ -119,7 +119,7 @@ auto PageReq::cancel() noexcept -> bool {
     return true;
 }
 
-auto Mem::populate(Thread& thread, CpuRegistry& cpus, usize page) noexcept -> std::expected<void, MemErr> {
+auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expected<void, MemErr> {
     for (;;) {
         PageReq req{thread, cpus};
         auto result = materialize(page, &req.relation, &req, &PageReq::publish);
@@ -902,7 +902,7 @@ auto Mem::trim(ObjectRange range, WaitRelation& waiter, void* ctx, WaitRelation:
     return std::unexpected(MemErr::Pending);
 }
 
-auto Mem::trim(Thread& thread, CpuRegistry& cpus, ObjectRange range) noexcept -> std::expected<void, MemErr> {
+auto Mem::trim(Thread& thread, Cpus& cpus, ObjectRange range) noexcept -> std::expected<void, MemErr> {
     PageReq req{thread, cpus};
     auto started = trim(range, req.relation, &req, &PageReq::publish);
     const bool pending = !started && started.error() == MemErr::Pending;

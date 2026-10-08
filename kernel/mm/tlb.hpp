@@ -4,8 +4,8 @@
 #include <mm/pmm.hpp>
 #include <sync.hpp>
 
-class CpuRegistry;
-struct CpuLocal;
+class Cpus;
+struct Cpu;
 
 namespace mm {
 
@@ -33,7 +33,7 @@ class Flush final : private libk::noncopyable_nonmovable {
     usize page_count() const noexcept { return pages_.page_count(); }
     bool release(resource::Charge &refund) noexcept;
     // Failed sends leave the same pending request live; duplicate IPIs are safe.
-    bool kick(CpuRegistry &) const noexcept;
+    bool kick(Cpus &) const noexcept;
 
   private:
     friend class Tlb;
@@ -60,7 +60,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
         Edit(const Edit &) = delete;
         ~Edit() noexcept { abort(); }
         const CpuSet &targets() const noexcept { return owner_->active_; }
-        bool commit(Flush &, CpuRegistry *, CpuId local, bool executable = false) noexcept;
+        bool commit(Flush &, Cpus *, CpuId local, bool executable = false) noexcept;
         void publish_fresh() noexcept;
         void abort() noexcept {
             if (owner_) {
@@ -95,8 +95,8 @@ class Root final {
     constexpr Root(Tlb &state, usize root) noexcept : state_(&state), root_(root) {}
     Tlb &state() const noexcept { return *state_; }
     usize root() const noexcept { return root_; }
-    void activate(CpuLocal &) const noexcept;
-    void adopt(CpuLocal &) const noexcept;
+    void activate(Cpu &) const noexcept;
+    void adopt(Cpu &) const noexcept;
 
   private:
     Tlb *state_{};

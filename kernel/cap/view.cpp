@@ -116,6 +116,14 @@ constexpr Rights irq_rights = Rights::of(
     return limit.source != 0;
 }
 
+static auto valid(HostLimit p) noexcept -> bool {
+    return p.count && p.first < 65536 && p.count <= 65536 - p.first;
+}
+static auto contains(HostLimit a, HostLimit b) noexcept -> bool {
+    return b.first >= a.first && b.first - a.first < a.count
+        && b.count <= a.count - (b.first - a.first);
+}
+
 static auto valid(std::monostate) noexcept -> bool { return true; }
 static auto valid(Badge p) noexcept -> bool { return p.badge != 0; }
 
@@ -150,8 +158,8 @@ static auto select(object::ObjectKind kind, F fn, R missing) noexcept -> R {
     case Kind::IoSpace:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Close, Right::Revoke));
-    case Kind::Device:
-        return fn.template operator()<std::monostate>(Rights::of(
+    case Kind::Host:
+        return fn.template operator()<HostLimit>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Revoke));
     case Kind::Thread:
         return fn.template operator()<std::monostate>(Rights::of(
@@ -293,8 +301,8 @@ auto attenuation_kind(u16 raw) noexcept
     switch (raw) {
     case OBJECT_KIND_IO_SPACE:
         return object::ObjectKind::IoSpace;
-    case OBJECT_KIND_DEVICE:
-        return object::ObjectKind::Device;
+    case OBJECT_KIND_IO_HOST:
+        return object::ObjectKind::Host;
     case OBJECT_KIND_THREAD:
         return object::ObjectKind::Thread;
     case OBJECT_KIND_SCHED_CONTEXT:
@@ -343,7 +351,6 @@ auto make_attenuation_ceiling(
 
     switch (kind) {
     case object::ObjectKind::IoSpace:
-    case object::ObjectKind::Device:
     case object::ObjectKind::Thread:
     case object::ObjectKind::Sc:
     case object::ObjectKind::Domain:
@@ -354,6 +361,12 @@ auto make_attenuation_ceiling(
         }
         return (View{child_rights, std::monostate{}});
 
+    case object::ObjectKind::Host: {
+        const HostLimit limit{descriptor.words[0], descriptor.words[1]};
+        if (!words_zero(descriptor, 2) || !valid(limit))
+            return std::unexpected(AttenuationError::InvalidRange);
+        return View{child_rights, limit};
+    }
     case object::ObjectKind::Mem: {
         if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);

@@ -19,7 +19,7 @@
 #include <wait.hpp>
 
 class Thread;
-class CpuRegistry;
+class Cpus;
 #include <mm/pager.hpp>
 
 #include <mm/types.hpp>
@@ -418,7 +418,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     // callers use the same state transition after retiring those mappings.
     [[nodiscard]] auto seal() noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto query(usize page_index) const noexcept -> std::expected<ContentState, MemErr>;
-    [[nodiscard]] auto populate(Thread&, CpuRegistry&, usize page) noexcept -> std::expected<void, MemErr>;
+    [[nodiscard]] auto populate(Thread&, Cpus&, usize page) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto materialize(usize page_index) noexcept -> std::expected<PageHold, MemErr>;
     [[nodiscard]] auto materialize(usize page_index, WaitRelation* relation, void* owner,
                                    WaitRelation::Publish publish) noexcept -> std::expected<PageHold, MemErr>;
@@ -431,7 +431,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         -> std::expected<void, MemErr>;
     [[nodiscard]] auto trim(ObjectRange, WaitRelation&, void*, WaitRelation::Publish) noexcept
         -> std::expected<void, MemErr>;
-    [[nodiscard]] auto trim(Thread&, CpuRegistry&, ObjectRange) noexcept -> std::expected<void, MemErr>;
+    [[nodiscard]] auto trim(Thread&, Cpus&, ObjectRange) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto writeback(usize page_index) noexcept -> std::expected<void, MemErr>;
     // Initialize a private anonymous page without publishing a CPU mapping.
     // A write is bounded to one page and excludes attachments and page loans.
@@ -514,7 +514,7 @@ class Mem final : private libk::noncopyable_nonmovable {
 // The host installs the thread edge under its lock before linking this request.
 class PageReq final : private libk::noncopyable_nonmovable {
   public:
-    PageReq(Thread&, CpuRegistry&) noexcept;
+    PageReq(Thread&, Cpus&) noexcept;
     auto wait(Mem* = nullptr) noexcept -> WaitRc;
     static void publish(void*, WaitRc) noexcept;
     WaitRelation relation;
@@ -524,7 +524,7 @@ class PageReq final : private libk::noncopyable_nonmovable {
     auto cancel() noexcept -> bool;
     static auto arm(void*) noexcept -> bool;
     Thread& thread_;
-    CpuRegistry& cpus_;
+    Cpus& cpus_;
     Completion done_;
     Mem* mem_{};
     WaitRc result_{WaitRc::Ready};

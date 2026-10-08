@@ -35,8 +35,8 @@ def manual(value, name=None):
     typ = gdb.lookup_type(name) if name else value.type.strip_typedefs().template_argument(0)
     return value['storage_'].address.cast(typ.pointer()).dereference()
 
-state = manual(gdb.parse_and_eval("'(anonymous namespace)::kernel_storage'"), 'KernelState')
-memory = manual(state['objects_'])
+state = manual(gdb.parse_and_eval("'boot_storage'"), 'Boot')
+memory = state['objects']
 def pool(name):
     def find(value):
         if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
@@ -50,7 +50,7 @@ def pool(name):
     result = find(memory['pools_'])
     assert result is not None, name
     return result
-direct = manual(state['pmm_'], 'mm::Pmm')['window_']
+direct = state['pmm']['window_']
 delta = int(direct['va']['value_']) - int(direct['pa']['value_'])
 inferior = gdb.selected_inferior()
 def physical(address, size):

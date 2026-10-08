@@ -3,12 +3,13 @@
 #include <base/types.hpp>
 #include <cpu.hpp>
 #include <libk/fmt.hpp>
+#include <libk/sync/ticket_spin_lock.hpp>
+#include <sync.hpp>
 #include <utility>
 
 namespace console {
 
-// A raw, allocation-free sink shared by ordinary and emergency output.
-// Serialization, if needed, belongs to the caller.
+// Raw allocation-free formatting shared by ordinary and emergency output.
 class Sink final {
 public:
     auto write(char c) noexcept -> bool { arch::putchar(c); return true; }
@@ -19,10 +20,20 @@ public:
 };
 
 template<libk::fmt::fixed_string Format, typename... Args>
-void print(Args&&... arguments) noexcept {
+void raw(Args&&... arguments) noexcept {
     Sink sink{};
     if (!libk::fmt::format_to<Format>(sink, std::forward<Args>(arguments)...))
         sink.write("<format error>\n", 15);
+}
+
+// A leaf lock: firmware output acquires no kernel locks. Mask IRQs so the
+// current CPU cannot reenter it. Panic uses raw after claiming its sole writer,
+// since a stopped peer may retain this lock.
+inline constinit libk::TicketSpinLock mutex;
+template<libk::fmt::fixed_string Format, typename... Args>
+void print(Args&&... arguments) noexcept {
+    sync::Lock guard{mutex};
+    raw<Format>(std::forward<Args>(arguments)...);
 }
 
 } // namespace console

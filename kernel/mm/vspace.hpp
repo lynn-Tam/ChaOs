@@ -1,4 +1,5 @@
 #pragma once
+#include <work.hpp>
 
 #include <base/types.hpp>
 #include <cap/cap.hpp>
@@ -26,7 +27,7 @@
 
 class Env;
 
-class CpuRegistry;
+class Cpus;
 namespace object {
 template <typename T> struct traits;
 }
@@ -225,7 +226,7 @@ class Backing final : private libk::noncopyable_nonmovable {
 
     static void invalidate_memory(void* ctx, MemWork&& work) noexcept;
     static void released(void* ctx) noexcept;
-    static void invalidate_grant(void* ctx, cap::GrantWork&& work, cap::GrantInvalidation reason) noexcept;
+    static void invalidate_grant(void* ctx, cap::GrantWork&& work) noexcept;
 
     static const MemOps memory_ops_;
     static const cap::GrantAttachmentOps grant_ops_;
@@ -247,7 +248,6 @@ class Backing final : private libk::noncopyable_nonmovable {
     libk::IntrusiveListHook retired_hook_{};
 };
 
-class SpaceWork;
 
 enum class VSpaceState : u8 {
     Live,
@@ -280,24 +280,8 @@ enum class VmStatus : u8 {
     Pending,
 };
 
-enum class VSpaceServiceState : u8 {
-    Settled,
-    Progress,
-    Waiting,
-    Retry,
-};
-
-enum class VSpaceServiceError : u8 {
-    ResourceExhausted,
-    BackingFailed,
-    TranslationCorrupt,
-    InvariantViolation,
-};
-
-using VSpaceServiceResult = std::expected<VSpaceServiceState, VSpaceServiceError>;
-
 struct VmCtx final {
-    CpuRegistry* cpus{};
+    Cpus* cpus{};
     CpuId local{};
 };
 
@@ -352,13 +336,13 @@ class VSpace final : private libk::noncopyable_nonmovable {
   public:
     class Data {
         friend class VSpace;
-        Data(Pmm& pmm, KSpace& kernel, SpaceWork& work, object::ref<>&& payer, resource::Charge&& charge,
+        Data(Pmm& pmm, KSpace& kernel, WorkQueue& work, object::ref<>&& payer, resource::Charge&& charge,
              PageTable&& root) noexcept
             : pmm_(&pmm), kernel_(&kernel), work_(&work), payer_(std::move(payer)),
               charge_(std::move(charge)), root_(std::move(root)) {}
         Pmm* pmm_;
         KSpace* kernel_;
-        SpaceWork* work_;
+        WorkQueue* work_;
         object::ref<> payer_;
         resource::Charge charge_;
         PageTable root_;
@@ -367,7 +351,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
         Data(Data&&) noexcept = default;
         Data(const Data&) = delete;
     };
-    static auto prepare(const object::ref<>& payer, Pmm&, KSpace&, SpaceWork&) noexcept
+    static auto prepare(const object::ref<>& payer, Pmm&, KSpace&, WorkQueue&) noexcept
         -> std::expected<Data, VSpaceError>;
     explicit VSpace(Data&&) noexcept;
     ~VSpace() noexcept;
@@ -410,17 +394,12 @@ class VSpace final : private libk::noncopyable_nonmovable {
         -> std::expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto inspect(MapId key) const noexcept -> std::expected<MapInfo, VSpaceError>;
 
-    // Completes remote shootdowns and queued Memory/Grant invalidations.
-    // Background continuation has a distinct retry/wait/fatal contract and
-    // never leaks syscall-facing VSpaceError values to its executor.
-    [[nodiscard]] auto service(VmCtx ctx) noexcept -> VSpaceServiceResult;
     [[nodiscard]] auto pending() const noexcept -> bool;
     void wait_pending(mm::Fence& wait) noexcept;
 
     void retire(object::cleanup&& cleanup) noexcept;
 
   private:
-    friend class SpaceWork;
     friend class Backing;
     friend class ::Env;
     friend class View;
@@ -493,8 +472,9 @@ class VSpace final : private libk::noncopyable_nonmovable {
 
     void try_finish_retire() noexcept;
     void complete_cleanup() noexcept;
+    void run_work() noexcept;
+    [[nodiscard]] auto step(VmCtx ctx) noexcept -> bool;
     void flush_ready() noexcept;
-    void schedule_work() noexcept;
     [[nodiscard]] auto work_ready() const noexcept -> bool;
     [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
@@ -514,7 +494,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
 
     Pmm* pmm_{};
     KSpace* kernel_{};
-    SpaceWork* work_{};
+    WorkQueue* work_{};
     mutable sync::Spin lock_{};
     libk::ManualLifetime<mm::PageTable> root_{};
     Tlb tlb_{};
@@ -531,47 +511,11 @@ class VSpace final : private libk::noncopyable_nonmovable {
     bool draining_{}; // One stack owns external relation detach/refund callbacks.
     libk::ManualLifetime<Receipt> receipt_{};
     libk::ManualLifetime<object::cleanup> cleanup_{};
-    libk::IntrusiveListHook work_hook_{};
-    libk::Atomic<bool> work_open_{false};
+    Work job_{};
     VSpaceState state_{VSpaceState::Live};
     usize bindings_{};
     usize ipi_retries_{};
     resource::Charge table_charge_{};
-};
-
-struct SpaceBatch final {
-    usize processed{};
-    usize progressed{};
-    bool more{};
-};
-
-// Bounded executor index for VSpace continuations. VSpace pending state is the
-// work truth; this queue only says that the state is currently actionable.
-class SpaceWork final : private libk::noncopyable_nonmovable {
-    using Queue = libk::IntrusiveList<VSpace, &VSpace::work_hook_>;
-
-  public:
-    using Notifier = libk::delegate<void() noexcept>;
-
-    SpaceWork() noexcept = default;
-    ~SpaceWork() noexcept;
-
-    void submit(VSpace& space) noexcept;
-    [[nodiscard]] auto run(VmCtx ctx, usize budget) noexcept -> SpaceBatch;
-    [[nodiscard]] auto pending() const noexcept -> bool;
-
-    void bind_notifier(Notifier notifier) noexcept;
-    void unbind_notifier() noexcept;
-
-  private:
-    friend class VSpace;
-
-    [[nodiscard]] auto take() noexcept -> VSpace*;
-    void withdraw(VSpace& space) noexcept;
-
-    mutable sync::Spin lock_{};
-    Queue queue_{};
-    Notifier notifier_{};
 };
 
 } // namespace mm

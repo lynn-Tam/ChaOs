@@ -44,8 +44,6 @@ TestStats TestRegistry::run(const TestContext& ctx) noexcept {
 
 void register_allocator_tests(TestRegistry& registry) noexcept;
 void register_bootinfo_tests(TestRegistry& registry) noexcept;
-void register_boot_bundle_tests(TestRegistry& registry) noexcept;
-void register_cpu_topology_tests(TestRegistry& registry) noexcept;
 void register_libk_tests(TestRegistry& registry) noexcept;
 void register_sync_tests(TestRegistry& registry) noexcept;
 void register_sched_tests(TestRegistry& registry) noexcept;
@@ -61,8 +59,6 @@ void register_builtin_tests(TestRegistry& registry) noexcept {
     register_sync_tests(registry);
     register_allocator_tests(registry);
     register_bootinfo_tests(registry);
-    register_boot_bundle_tests(registry);
-    register_cpu_topology_tests(registry);
     register_sched_tests(registry);
     register_cap_tests(registry);
     register_memory_tests(registry);

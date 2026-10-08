@@ -22,6 +22,7 @@ bool interrupts_enabled() noexcept { return csr::Sstatus::is_interrupts_enabled(
 bool disable_interrupts() noexcept {
     return (csr::Sstatus::read_and_clear_bits(csr::Sstatus::SIE) & csr::Sstatus::SIE) != 0;
 }
+void enable_ext_irq() noexcept { csr::Sie::enable_external(); }
 void enable_interrupts() noexcept { csr::Sstatus::enable_interrupts(); }
 void restore_interrupts(bool enabled) noexcept {
     if (enabled)
@@ -31,7 +32,6 @@ void restore_interrupts(bool enabled) noexcept {
 }
 void wait_for_interrupt() noexcept { asm volatile("wfi" ::: "memory"); }
 void sync_instruction_stream() noexcept { asm volatile("fence.i" ::: "memory"); }
-bool secondary_start_available() noexcept { return sbi::probe(sbi::Ext::Hsm); }
 auto start_secondary(CpuHwId hart, usize entry, usize record) noexcept -> std::expected<void, isize> {
     if (!record || (entry & 3U)) return std::unexpected(sbi::BadAddr);
     auto r = sbi::call(sbi::Ext::Hsm, 0, hart.raw, entry, record);

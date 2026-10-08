@@ -6,8 +6,7 @@
 
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/local.hpp>
-#include <cpu/registry.hpp>
+#include <cpu/cpu.hpp>
 #include <limits>
 #include <libk/mem.h>
 #include <libk/scope_guard.hpp>
@@ -72,9 +71,8 @@ void Call::expire() noexcept {
 
 void Call::revoke(
     void* context,
-    cap::GrantWork&& work,
-    cap::GrantInvalidation reason) noexcept {
-    libk_assert(context != nullptr && reason == cap::GrantInvalidation::Revoke);
+    cap::GrantWork&& work) noexcept {
+    libk_assert(context != nullptr);
     auto& call = *static_cast<Call*>(context);
     call.endpoint_->invalidate_call(call);
     // Call remains attached until its terminal transition. Grant revoke thus
@@ -219,7 +217,7 @@ auto Endpoint::depth(const Thread& thread) const noexcept -> usize {
 auto Endpoint::snapshot_caps(
     const Buffer* buffer,
     usize limit,
-    Transfer::Specs& specs,
+    cap::Batch::Specs& specs,
     usize& receive_limit) noexcept -> bool {
     specs.clear();
     receive_limit = 0;
@@ -240,24 +238,24 @@ auto Endpoint::snapshot_caps(
     for (usize index = 0; index < message.send_count; ++index) {
         const CapXfer& wire = message.send[index];
         const auto rights = cap::Rights::parse(wire.rights, RIGHT_MASK);
-        TransferKind kind{};
+        cap::XferOp kind{};
         switch (wire.operation) {
         case CAP_COPY:
-            kind = TransferKind::Copy;
+            kind = cap::XferOp::Copy;
             break;
         case CAP_MOVE:
-            kind = TransferKind::Move;
+            kind = cap::XferOp::Move;
             break;
         case CAP_DELEGATE:
-            kind = TransferKind::Delegate;
+            kind = cap::XferOp::Derive;
             break;
         default:
             return false;
         }
         const cap::Handle source = cap::Handle::from_raw(wire.source);
         if (wire.flags != 0 || !source || !rights
-            || (kind == TransferKind::Move && !rights->empty())
-            || !specs.try_push_back(TransferSpec{
+            || (kind == cap::XferOp::Move && !rights->empty())
+            || !specs.try_push_back(cap::XferSpec{
                 source, *rights, kind})) {
             return false;
         }
@@ -267,12 +265,12 @@ auto Endpoint::snapshot_caps(
 }
 
 auto Endpoint::commit_caps(
-    Transfer& transfer,
+    cap::Batch& transfer,
     cap::CSpace& source,
     cap::CSpace& destination,
-    const Transfer::Specs& specs,
+    const cap::Batch::Specs& specs,
     Buffer* receiver,
-    Transfer::Handles& installed) noexcept -> bool {
+    cap::Batch::Handles& installed) noexcept -> bool {
     installed.clear();
     if (specs.empty()) {
         if (receiver == nullptr) {
@@ -290,7 +288,7 @@ auto Endpoint::commit_caps(
     if (receiver == nullptr) {
         return false;
     }
-    if (!Transfer::prepare(transfer, source, destination, specs)) {
+    if (!cap::Batch::prepare(transfer, source, destination, specs)) {
         return false;
     }
     auto access = receiver->access();
@@ -300,7 +298,7 @@ auto Endpoint::commit_caps(
     }
     IpcCaps projection{};
     projection.version = IPC_CAPS_VERSION;
-    const Transfer::Handles reserved = transfer.handles();
+    const cap::Batch::Handles reserved = transfer.handles();
     for (usize index = 0; index < reserved.size(); ++index) {
         projection.received[index] = reserved[index].raw();
     }
@@ -338,7 +336,7 @@ auto Endpoint::call(
     Thread& caller,
     arch::TrapCtx& trap,
     sched::Dispatcher& dispatcher,
-    CpuRegistry& cpus,
+    Cpus& cpus,
     const usize (&arguments)[3],
     std::optional<time::Instant> deadline) noexcept
     -> std::expected<void, EndpointError> {
@@ -353,7 +351,7 @@ auto Endpoint::call(
         || !effective.rights.contains(cap::Right::Call)) {
         return std::unexpected(EndpointError::Denied);
     }
-    Transfer::Specs request_caps{};
+    cap::Batch::Specs request_caps{};
     usize receive_limit{};
     if (!snapshot_caps(
             caller.ipc_buffer(), limit->cap_limit,
@@ -740,14 +738,14 @@ auto Endpoint::finish_active(
         dispatcher.disarm(call->deadline_);
     }
 
-    Transfer::Specs reply_caps{};
+    cap::Batch::Specs reply_caps{};
     usize ignored_receive_limit{};
     Buffer* const callee_buffer = activation.ipc_ ? &*activation.ipc_ : nullptr;
     Buffer* const caller_buffer = caller_thread->ipc_before(activation);
     cap::CSpace* const source = service_.cspace();
     cap::CSpace* const destination =
         caller_thread->env_before(activation).cspace();
-    Transfer::Handles reply_handles{};
+    cap::Batch::Handles reply_handles{};
     if (reply && (!snapshot_caps(
             callee_buffer, call->receive_limit_,
             reply_caps, ignored_receive_limit)
@@ -887,9 +885,8 @@ auto Endpoint::cancel_call(Call& call) noexcept -> bool {
         }
     }
     if (complete && call.deadline_.armed()) {
-        CpuLocal& cpu = current_cpu();
-        libk_assert(cpu.dispatcher() != nullptr);
-        cpu.dispatcher()->disarm(call.deadline_);
+        Cpu& cpu = current_cpu();
+        cpu.dispatcher().disarm(call.deadline_);
     }
     return complete;
 }

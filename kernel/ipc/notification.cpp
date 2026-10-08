@@ -5,8 +5,7 @@
 
 #include <libk/assert.hpp>
 #include <base/types.hpp>
-#include <cpu/registry.hpp>
-#include <cpu/local.hpp>
+#include <cpu/cpu.hpp>
 #include <sched/dispatcher.hpp>
 #include <limits>
 #include <utility>
@@ -79,7 +78,7 @@ auto Notification::Wait::ready(WaitResult result) noexcept -> bool {
 }
 
 void Notification::Wait::release() noexcept {
-    if (deadline_.armed()) current_cpu().dispatcher()->disarm(deadline_);
+    if (deadline_.armed()) current_cpu().dispatcher().disarm(deadline_);
     owner_->release_wait();
 }
 
@@ -144,7 +143,7 @@ auto Notification::take() noexcept -> std::expected<NotificationTake, Notificati
     return (NotificationTake{badges, signal_sequence_});
 }
 
-auto Notification::wait(Thread& thread, CpuRegistry& cpus,
+auto Notification::wait(Thread& thread, Cpus& cpus,
                         sched::Dispatcher& dispatcher,
                         std::optional<time::Instant> deadline) noexcept -> WaitResult {
     Wait waiter{*this};
