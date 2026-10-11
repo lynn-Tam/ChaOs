@@ -1,6 +1,6 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
@@ -16,7 +16,7 @@ public:
     explicit Work(Fn fn) noexcept : fn_(fn) {}
 private:
     friend class WorkQueue;
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     Fn fn_{};
 };
 
@@ -81,7 +81,7 @@ public:
     }
 private:
     sync::Spin lock_{};
-    libk::IntrusiveList<Work, &Work::hook_> queue_{};
+    libk::intrusive_list<Work, &Work::hook_> queue_{};
     Work::Fn wake_{};
     bool armed_{}, running_{};
 };

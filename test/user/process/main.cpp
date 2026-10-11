@@ -1,6 +1,5 @@
-#include <servers/process_server/protocol.hpp>
-#include <servers/runtime/service.hpp>
-#include <servers/runtime/output.hpp>
+#include <string.h>
+#include <sys/protocol.hpp>
 #include <sys/channel.hpp>
 #include <sys/clock.hpp>
 #include <libk/fmt.hpp>
@@ -22,13 +21,13 @@ auto deadline(uint64_t ms) noexcept -> uint64_t {
     check(static_cast<bool>(value));
     return *value;
 }
-auto request(process::op operation, uint64_t id = 0, uint64_t expires = 0) noexcept -> service::Message {
-    service::Message result{.operation = static_cast<uint64_t>(operation), .id = id};
-    if (expires != 0) { result.size = sizeof(expires); service::copy(result.data, &expires, sizeof(expires)); }
+auto request(proc::op operation, uint64_t id = 0, uint64_t expires = 0) noexcept -> sys::Message {
+    sys::Message result{.operation = static_cast<uint64_t>(operation), .id = id};
+    if (expires != 0) { result.size = sizeof(expires); ::memcpy(result.data, &expires, sizeof(expires)); }
     return result;
 }
-auto receive(service::Connection& channel, process::op operation, status_t status) noexcept -> service::Message {
-    service::Message reply;
+auto receive(sys::Connection& channel, proc::op operation, status_t status) noexcept -> sys::Message {
+    sys::Message reply;
     check(channel.receive(reply).status == STATUS_OK);
     if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
         stream::Writer writer{output};
@@ -38,55 +37,55 @@ auto receive(service::Connection& channel, process::op operation, status_t statu
     check(reply.operation == static_cast<uint64_t>(operation) && reply.status == status);
     return reply;
 }
-auto exchange(service::Connection& channel, service::Message message, status_t status) noexcept -> service::Message {
+auto exchange(sys::Connection& channel, sys::Message message, status_t status) noexcept -> sys::Message {
     check(channel.send(message).status == STATUS_OK);
-    return receive(channel, static_cast<process::op>(message.operation), status);
+    return receive(channel, static_cast<proc::op>(message.operation), status);
 }
-auto spawn(service::Connection& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
-    auto message = request(process::op::Spawn);
-    boot::Args args;
-    check(args.append("sleep", 5) && args.append(ms, service::length(ms)));
-    message.size = args.data().size;
-    service::copy(message.data, args.data().bytes, message.size);
+auto spawn(sys::Connection& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
+    auto message = request(proc::op::Spawn);
+    boot::args args;
+    check(args.append("sleep", 5) && args.append(ms, ::strlen(ms)));
+    message.size = args.size();
+    ::memcpy(message.data, args.data(), message.size);
     return exchange(channel, message, status).id;
 }
-void stop(service::Connection& channel, uint64_t id) noexcept {
-    check(exchange(channel, request(process::op::Stop, id), STATUS_CANCELED).id == id);
-    exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
+void stop(sys::Connection& channel, uint64_t id) noexcept {
+    check(exchange(channel, request(proc::op::Stop, id), STATUS_CANCELED).id == id);
+    exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
 }
 }
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    output = service::capability(info, boot::ConsoleOutput);
+    const auto info = sys::bootstrap(address, size);
+    output = sys::capability(info, boot::ConsoleOutput);
     check(clock.open() == STATUS_OK);
-    service::Connection channel{service::capability(info, boot::Process),
-        service::capability(info, BOOT_EVENTS)};
+    sys::Connection channel{sys::capability(info, boot::Process),
+        sys::capability(info, BOOT_EVENTS)};
 
     const auto first = spawn(channel, "10000");
-    check(channel.send(request(process::op::Wait, first)).status == STATUS_OK);
+    check(channel.send(request(proc::op::Wait, first)).status == STATUS_OK);
     const auto second = spawn(channel, "10000"); // Must progress while the first Wait is pending.
     check(first != second);
-    check(channel.send(request(process::op::CancelWait, first)).status == STATUS_OK);
-    check(receive(channel, process::op::Wait, STATUS_CANCELED).id == first);
-    receive(channel, process::op::CancelWait, STATUS_OK);
-    exchange(channel, request(process::op::Wait, first, deadline(1)), STATUS_TIMED_OUT);
+    check(channel.send(request(proc::op::CancelWait, first)).status == STATUS_OK);
+    check(receive(channel, proc::op::Wait, STATUS_CANCELED).id == first);
+    receive(channel, proc::op::CancelWait, STATUS_OK);
+    exchange(channel, request(proc::op::Wait, first, deadline(1)), STATUS_TIMED_OUT);
     stop(channel, second);
-    check(channel.send(request(process::op::Wait, first)).status == STATUS_OK);
-    check(channel.send(request(process::op::Stop, first)).status == STATUS_OK);
-    receive(channel, process::op::Stop, STATUS_OK);
-    receive(channel, process::op::Wait, STATUS_CANCELED);
-    exchange(channel, request(process::op::Wait, first), STATUS_INVALID_CAP);
+    check(channel.send(request(proc::op::Wait, first)).status == STATUS_OK);
+    check(channel.send(request(proc::op::Stop, first)).status == STATUS_OK);
+    receive(channel, proc::op::Stop, STATUS_OK);
+    receive(channel, proc::op::Wait, STATUS_CANCELED);
+    exchange(channel, request(proc::op::Wait, first), STATUS_INVALID_CAP);
 
     uint64_t retained[4]{};
     for (auto& id : retained) id = spawn(channel, "1");
     spawn(channel, "1", STATUS_BUSY); // Even completed, unconsumed results retain admission slots.
-    for (auto id : retained) exchange(channel, request(process::op::Wait, id), STATUS_OK);
+    for (auto id : retained) exchange(channel, request(proc::op::Wait, id), STATUS_OK);
     const auto reused = spawn(channel, "10000");
     for (auto id : retained) {
         check(id != reused);
-        exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
+        exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
     }
     stop(channel, reused);
 
@@ -97,20 +96,20 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     // removes only the waiter; completion remains consumable exactly once.
     for (unsigned i = 0; i != 16; ++i) {
         const auto id = spawn(channel, "1");
-        check(channel.send(request(process::op::Wait, id, deadline(1))).status == STATUS_OK);
-        service::Message reply;
+        check(channel.send(request(proc::op::Wait, id, deadline(1))).status == STATUS_OK);
+        sys::Message reply;
         check(channel.receive(reply).status == STATUS_OK && reply.id == id
-            && reply.operation == static_cast<uint64_t>(process::op::Wait));
+            && reply.operation == static_cast<uint64_t>(proc::op::Wait));
         check(reply.status == STATUS_OK || reply.status == STATUS_TIMED_OUT);
         if (reply.status == STATUS_TIMED_OUT)
-            exchange(channel, request(process::op::Wait, id), STATUS_OK);
-        exchange(channel, request(process::op::Wait, id), STATUS_INVALID_CAP);
+            exchange(channel, request(proc::op::Wait, id), STATUS_OK);
+        exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
         check(channel.try_receive(reply).status == STATUS_WOULD_BLOCK);
     }
 
     // Pending badges win before deadline admission; a signal after timeout is
     // preserved for the next wait instead of rewriting the prior result.
-    const auto notification = notification_create(service::capability(info, BOOT_POOL), 8);
+    const auto notification = notification_create(sys::capability(info, BOOT_POOL), 8);
     check(notification.status == STATUS_OK);
     for (unsigned i = 0; i != 16; ++i) {
         check(notification_wait(notification.value, deadline(1)).status == STATUS_TIMED_OUT);

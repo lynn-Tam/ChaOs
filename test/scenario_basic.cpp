@@ -28,7 +28,7 @@ auto ordinary(const BootInfo& boot) noexcept -> bool {
 auto initrd(const BootInfo& boot) noexcept -> bool {
     const bool result = boot.module
         && boot.module->size != 0
-        && boot.module->pages.valid();
+        && boot.module->pages().valid();
     if (result) {
         console::print<"[scenario] initrd ok\n">();
     }
@@ -56,7 +56,7 @@ auto trap(Cpu& runtime) noexcept -> bool {
         return false;
     }
     const u64 before = trace::snapshot(*target).last;
-    if (!arch::send_ipi(target->hw)) {
+    if (!arch::send_ipi(target->hw.raw)) {
         return false;
     }
 
@@ -79,7 +79,7 @@ auto trap(Cpu& runtime) noexcept -> bool {
             console::print<"[scenario] trap ok\n">();
             return true;
         }
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
     return false;
 }
@@ -105,8 +105,8 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
     auto& k = *test::boot;
     auto& cpus = *runtime.cpus;
     const auto cpu = runtime.id;
-    const auto budget = k.clock.duration_from_nanoseconds(1'000'000);
-    const auto period = k.clock.duration_from_nanoseconds(10'000'000);
+    const auto budget = k.clock.ticks<1, time::ms>();
+    const auto period = k.clock.ticks<10, time::ms>();
     libk_assert(budget && period);
     DispatchState state;
     std::array<DispatchArg, 3> args{};
@@ -123,12 +123,12 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
         threads[i] = std::move(*t).publish();
         auto c = k.objects.get<sched::Sc>().create(sched::Sc::Config{
             .budget=*budget, .period=*period, .urgency=*sched::Urgency::make(priority[i])},
-            k.clock.now());
+            k.clock.rd_ticks());
         libk_assert(c);
         scs[i] = std::move(*c).publish();
-        auto ref = threads[i].clone();
+        auto ref = threads[i];
         libk_assert(ref && k.domain.get().admit(scs[i].get(), cpu)
-                    && scs[i]->bind(std::move(*ref)));
+                    && scs[i]->bind(std::move(ref)));
     }
     // Publish all candidates before dispatch so urgency and equal-priority
     // FIFO are tested through real context switches, not a queue fixture.
@@ -136,11 +136,11 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
     for (auto& sc : scs) libk_assert(sched::start(cpus, sc.get()));
     sched::yield();
     arch::restore_interrupts(enabled);
-    const auto duration = k.clock.duration_from_nanoseconds(100'000'000);
-    const auto until = duration ? k.clock.now().checked_add(*duration) : std::nullopt;
+    const auto duration = k.clock.ticks<100, time::ms>();
+    const auto until = duration ? libk::checked_add(k.clock.rd_ticks(), *duration) : std::nullopt;
     libk_assert(until);
     for (auto& thread : threads) {
-        while (!thread->stopped() && k.clock.now() < *until) sched::yield();
+        while (!thread->stopped() && k.clock.rd_ticks() < *until) sched::yield();
         libk_assert(thread->stopped());
     }
     const bool ordered = state.count == 3 && state.order == std::array<usize, 3>{1, 2, 0};

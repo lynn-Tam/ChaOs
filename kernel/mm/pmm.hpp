@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include <base/slab.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
@@ -38,6 +38,10 @@ enum class PmmInitError : uint8_t {
     NoMetadataStorage,
     OutsideWindow,
 };
+
+// Convert firmware RAM banks and overlapping reservations into one inventory.
+// MMIO may not overlap RAM; Boot/Kernel ownership must be backed by RAM.
+auto normalize(RegionList&) noexcept -> std::expected<void, PmmInitError>;
 
 enum class AllocError : uint8_t {
     NoMemory,
@@ -139,8 +143,8 @@ class Pmm {
     using ReclaimResult = std::expected<size_t, BootErr>;
     using AdoptResult = std::expected<PageGroup, BootErr>;
 
-    struct Window { Phys pa{}; Virt va{}; usize size{}; };
-    [[nodiscard]] static auto initialize_in(libk::ManualLifetime<Pmm>& storage, RegionList&& memory_map,
+    struct Window { pa_t pa{}; va_t va{}; usize size{}; };
+    [[nodiscard]] static auto initialize_in(libk::manual_lifetime<Pmm>& storage, RegionList&& memory_map,
                                             Window layout) noexcept -> InitializationResult;
 
     explicit Pmm([[maybe_unused]] ConstructionKey key, RegionList&& memory, Window layout) noexcept
@@ -174,9 +178,9 @@ class Pmm {
         return regions() | std::views::filter([](const Region& r) { return r.is_ram(); }) |
                std::views::transform([](const Region& r) { return r.range; });
     }
-    auto virt(Phys pa, usize size) const noexcept -> std::optional<Virt>;
-    auto phys(Virt va, usize size) const noexcept -> std::optional<Phys>;
-    template<class T> auto ptr(Phys pa, usize count = 1) const noexcept -> std::optional<T*> {
+    auto virt(pa_t pa, usize size) const noexcept -> std::optional<va_t>;
+    auto phys(va_t va, usize size) const noexcept -> std::optional<pa_t>;
+    template<class T> auto ptr(pa_t pa, usize count = 1) const noexcept -> std::optional<T*> {
         const auto size = libk::checked_multiply(sizeof(T), count);
         const auto va = size ? virt(pa, *size) : std::nullopt;
         return va ? std::optional<T*>{reinterpret_cast<T*>(va->raw())} : std::nullopt;
@@ -263,8 +267,8 @@ class Pmm {
     mutable sync::Spin lock_{};
     RegionList memory_{};
     Window window_{};
-    libk::InplaceVector<Arena, max_regions> arenas_{};
-    libk::InplaceVector<ReservationRecord, max_regions> reservations_{};
+    libk::inplace_vector<Arena, max_regions> arenas_{};
+    libk::inplace_vector<ReservationRecord, max_regions> reservations_{};
     size_t outstanding_pages_{};
     size_t outstanding_group_pages_{};
     size_t outstanding_groups_{};

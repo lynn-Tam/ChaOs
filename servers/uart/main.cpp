@@ -1,33 +1,32 @@
 #include <sys/start.hpp>
-#include <servers/uart/protocol.hpp>
-#include <servers/runtime/service.hpp>
+#include <sys/protocol.hpp>
 #include <sys/channel.hpp>
 #include <servers/uart/port.hpp>
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    const auto vspace = service::capability(info, BOOT_VSPACE);
-    const auto device = service::capability(info, boot::UartMem);
-    const auto irq = service::capability(info, boot::UartIrq);
-    const auto events = service::capability(info, BOOT_EVENTS);
-    const auto output = service::capability(info, boot::ConsoleOutput);
-    const auto input = service::capability(info, boot::ConsoleInput);
+    const auto info = sys::bootstrap(address, size);
+    const auto vspace = sys::capability(info, BOOT_VSPACE);
+    const auto device = sys::capability(info, boot::UartMem);
+    const auto irq = sys::capability(info, boot::UartIrq);
+    const auto events = sys::capability(info, BOOT_EVENTS);
+    const auto output = sys::capability(info, boot::ConsoleOutput);
+    const auto input = sys::capability(info, boot::ConsoleInput);
     constexpr uintptr_t base = 0x30010000;
     auto region = vm_slice(vspace, base, 4096, VM_READ | VM_WRITE, RIGHT_MAP);
-    service::require(region.status);
-    service::require(vm_map(region.value, device, base, 4096, 0,
+    sys::require(region.status);
+    sys::require(vm_map(region.value, device, base, 4096, 0,
                             VM_READ | VM_WRITE).status);
-    service::require(irq_bind(irq, events, service::EventsBadge).status);
+    sys::require(irq_bind(irq, events, boot::event_badge).status);
     const auto readable = channel_bind(output, events, CHANNEL_READABLE);
     const auto writable = channel_bind(input, events, CHANNEL_WRITABLE);
-    service::require(readable.status);
-    service::require(writable.status);
+    sys::require(readable.status);
+    sys::require(writable.status);
     uart::Port port{base};
     port.enable_rx();
     port.write("uart: console ready\n");
     bool line_start = true;
-    service::Message pending{};
+    sys::Message pending{};
     bool pending_valid{};
     bool eof_pending{};
     bool carriage_return{};
@@ -36,10 +35,10 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     for (;;) {
         // Bound each drain so sustained output cannot starve receive/IRQ ack.
         for (unsigned count = 0; count < 16; ++count) {
-            service::Message message{};
-            const auto result = service::receive(output, message, false);
+            sys::Message message{};
+            const auto result = sys::receive(output, message, false);
             if (result.status == STATUS_WOULD_BLOCK || result.status == STATUS_BUSY) break;
-            service::require(result.status);
+            sys::require(result.status);
             read_sequence = result.value;
             if (message.operation == static_cast<uint64_t>(console::Operation::Prompt)) {
                 if (!line_start) { port.put('\n'); line_start = true; }
@@ -79,13 +78,13 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             }
         }
         if (pending_valid) {
-            const auto result = service::send(input, pending, false);
+            const auto result = sys::send(input, pending, false);
             if (result.status == STATUS_OK) {
                 write_sequence = result.value;
                 pending = {};
                 pending_valid = false;
             } else if (result.status != STATUS_WOULD_BLOCK && result.status != STATUS_BUSY) {
-                service::require(result.status);
+                sys::require(result.status);
             }
         }
         if (!pending_valid && eof_pending) continue;
@@ -93,18 +92,18 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             const auto observed = irq_observe(irq);
             if (observed.status == STATUS_OK) {
                 const auto status = irq_ack(irq, observed.value2, observed.value).status;
-                if (status != STATUS_REASSERTED) service::require(status);
+                if (status != STATUS_REASSERTED) sys::require(status);
             // BoundIdle has no dispatched delivery to acknowledge.
             } else if (observed.status != STATUS_BUSY
                        && observed.status != STATUS_WOULD_BLOCK
                        && observed.status != STATUS_RETRY) {
-                service::require(observed.status);
+                sys::require(observed.status);
             }
             if (port.rx_ready()) continue;
         }
-        service::require(channel_arm(output, readable.value, read_sequence).status);
+        sys::require(channel_arm(output, readable.value, read_sequence).status);
         if (pending_valid)
-            service::require(channel_arm(input, writable.value, write_sequence).status);
-        service::require(notification_wait(events).status);
+            sys::require(channel_arm(input, writable.value, write_sequence).status);
+        sys::require(notification_wait(events).status);
     }
 }

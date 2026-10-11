@@ -1,6 +1,6 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <resource/budget.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>
@@ -127,7 +127,7 @@ private:
 };
 
 // Owned by the object storage slot: one sponsored object has exactly one primary
-// sponsor and one charge. List links are only a non-owning pool index.
+// sponsor and one charge. The group tracks its outstanding count.
 class Sponsorship final : private libk::noncopyable_nonmovable {
 public:
     Sponsorship() noexcept = default;
@@ -160,8 +160,6 @@ private:
     object::ref<> ref_{};
     budget charge_{};
     RefundNotifier notifier_{};
-    Sponsorship* previous_{};
-    Sponsorship* next_{};
 };
 
 } // namespace resource

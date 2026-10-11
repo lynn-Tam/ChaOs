@@ -7,7 +7,7 @@
 Pager::~Pager() noexcept {
     libk_assert((state_ == State::Open || state_ == State::Closed) && ready_.empty() &&
                 claimed_.empty() && replies_ == 0 && !source_.attached() && !cleanup_ &&
-                pins_.load<libk::MemoryOrder::Relaxed>() == 0);
+                pins_.load(std::memory_order_relaxed) == 0);
 }
 
 auto Pager::state() const noexcept -> State {
@@ -26,13 +26,13 @@ void Pager::settle() noexcept {
 }
 
 void Pager::pin() noexcept {
-    (void)pins_.fetch_add<libk::MemoryOrder::AcqRel>(1);
+    (void)pins_.fetch_add(1, std::memory_order_acq_rel);
 }
 void Pager::unpin() noexcept {
     object::cleanup cleanup;
     {
         sync::Lock guard{lock_};
-        const auto n = pins_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
+        const auto n = pins_.fetch_sub(1, std::memory_order_acq_rel);
         libk_assert(n);
         if (n == 1 && state_ == State::Closed) cleanup = std::move(cleanup_);
     }
@@ -41,7 +41,7 @@ void Pager::unpin() noexcept {
 
 auto Pager::enqueue(Request &r, Req info) noexcept -> bool {
     sync::Lock guard{lock_};
-    if (state_ != State::Open || r.pager || !r.mem->work_open_.load<libk::MemoryOrder::Acquire>())
+    if (state_ != State::Open || r.pager || !r.mem->work_open_.load(std::memory_order_acquire))
         return false;
     r.mem->request_pin();
     pin();
@@ -139,7 +139,7 @@ void Pager::dispose(Reply::Data &d) noexcept {
         {
             sync::Lock guard{lock_};
             if (state_ != State::Forced && state_ != State::Closed &&
-                d.mem->work_open_.load<libk::MemoryOrder::Acquire>()) {
+                d.mem->work_open_.load(std::memory_order_acquire)) {
                 d.request->info.id = 0;
                 ready_.push_back(*d.request);
                 --replies_;
@@ -263,14 +263,12 @@ auto Pager::close(bool force) noexcept -> bool {
 
 void Pager::retire(object::cleanup &&cleanup) noexcept {
     Pin pin{*this};
-    bool force;
     {
         sync::Lock guard{lock_};
         libk_assert(!cleanup_);
         cleanup_ = std::move(cleanup);
-        force = state_ == State::Forced;
     }
-    (void)close(force);
+    (void)close(true);
 }
 
 auto Pager::bind(ipc::Notification &n, u64 badge) noexcept -> std::expected<void, Error> {

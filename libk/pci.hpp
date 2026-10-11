@@ -6,11 +6,11 @@
 #include <optional>
 
 namespace pci {
-struct Bar { uint64_t pa{}, size{}; bool wide{}; };
+struct bar { uint64_t pa{}, size{}; bool wide{}; };
 
 // Configuration protocol only. The caller owns the function and provides
 // the CPU's I/O ordering primitive; no allocation or board addresses live here.
-template<auto fence> struct Cfg {
+template<auto fence> struct cfg {
     uintptr_t base;
     template<class T> auto read(size_t offset) const noexcept -> T {
         fence();
@@ -25,8 +25,8 @@ template<auto fence> struct Cfg {
     }
     // Decode and DMA must be off while probing. Restore every BAR and the
     // original command before returning, including malformed configurations.
-    auto bars() const noexcept -> std::optional<std::array<Bar, 6>> {
-        std::array<Bar, 6> result{};
+    auto bars() const noexcept -> std::optional<std::array<bar, 6>> {
+        std::array<bar, 6> result{};
         const auto command = read<uint16_t>(4);
         write<uint16_t>(4, (command & ~uint16_t{7}) | uint16_t{1 << 10});
         bool valid = true;

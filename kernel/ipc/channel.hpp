@@ -2,7 +2,7 @@
 
 #include <cap/cspace.hpp>
 #include <cap/grant.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <ipc/notification.hpp>
 #include <expected>
 #include <libk/inplace_vector.hpp>
@@ -101,7 +101,7 @@ public:
         Channel* owner{};
         Kind kind{Kind::Send};
         State state{State::Attaching};
-        libk::IntrusiveListHook hook{};
+        libk::intrusive_list_hook hook{};
         // Admission, Completion, cap attachment, and lock-external
         // notifications each own one reference. Protected by Channel::lock_.
         usize references{1};
@@ -142,7 +142,7 @@ private:
     };
 
     struct Message final : private libk::noncopyable {
-        libk::IntrusiveListHook hook{};
+        libk::intrusive_list_hook hook{};
         ChannelSide destination{ChannelSide::A};
         u64 transaction{};
         u64 tag{};
@@ -150,7 +150,7 @@ private:
         u64 sequence{};
         usize word_count{};
         u64 words[CHANNEL_MAX_WORDS]{};
-        libk::InplaceVector<Escrow, CHANNEL_MAX_CAPS> escrows{};
+        libk::inplace_vector<Escrow, CHANNEL_MAX_CAPS> escrows{};
     };
 
     struct Relation;
@@ -183,7 +183,7 @@ private:
         void notification_closed() noexcept;
 
         Channel* owner{};
-        libk::IntrusiveListHook hook{};
+        libk::intrusive_list_hook hook{};
         usize index{};
         NotificationSource source;
         object::ref<Notification> notification{};
@@ -203,7 +203,7 @@ private:
         bool armed{};
     };
 
-    using MessageQueue = libk::IntrusiveList<Message, &Message::hook>;
+    using MessageQueue = libk::intrusive_list<Message, &Message::hook>;
     struct Side final {
         MessageQueue queue{};
         usize occupied{}; // Queued, preparing, or finishing a receive.
@@ -245,6 +245,8 @@ public:
         cap::Resolved<Notification>& notification,
         ChannelCondition condition) noexcept
         -> std::expected<usize, ChannelError>;
+    [[nodiscard]] auto unbind(cap::Resolved<Channel>& cap, usize relation) noexcept
+        -> std::expected<void, ChannelError>;
     [[nodiscard]] auto arm(
         cap::Resolved<Channel>& cap,
         usize relation,
@@ -273,6 +275,8 @@ public:
     }
 
 private:
+    [[nodiscard]] auto bound_relation(cap::Resolved<Channel>& cap, usize id) noexcept
+        -> std::expected<Relation*, ChannelError>; // lock_ held
     static void invalidate(
         void* context,
         cap::GrantWork&& work) noexcept;
@@ -296,7 +300,7 @@ private:
     void abort_relation(Relation& relation) noexcept;
     void detach_side(SideLink& link) noexcept;
     void try_finish_retire() noexcept;
-    using WaitQueue = libk::IntrusiveList<Waiter, &Waiter::hook>;
+    using WaitQueue = libk::intrusive_list<Waiter, &Waiter::hook>;
     [[nodiscard]] auto wait_queue(Waiter::Kind kind, ChannelSide side) noexcept -> WaitQueue&;
     [[nodiscard]] auto owns_turn_locked(
         Waiter::Kind kind, ChannelSide side, const Waiter* reservation) noexcept -> bool;
@@ -331,7 +335,7 @@ private:
     [[nodiscard]] auto commit_escrows(
         Message& message,
         cap::CSpace& destination,
-        libk::InplaceVector<cap::CSpace::Reservation,
+        libk::inplace_vector<cap::CSpace::Reservation,
             CHANNEL_MAX_CAPS>& reservations,
         ChannelRecv& result) noexcept -> CommitResult;
 
@@ -347,7 +351,7 @@ private:
     Side sides_[2]{};
     SideLink side_links_[2];
     mm::Slab<Relation, false> relation_pool_;
-    libk::IntrusiveList<Relation, &Relation::hook> relations_{};
+    libk::intrusive_list<Relation, &Relation::hook> relations_{};
     WaitQueue wait_queues_[2][2]{};
     MessageQueue free_messages_{};
     usize waiter_count_{};

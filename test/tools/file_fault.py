@@ -25,7 +25,7 @@ state = manual(gdb.parse_and_eval("'boot_storage'"), 'Boot')
 memory = state['objects']
 def pool(name):
     def find(value):
-        if value.type.strip_typedefs() == gdb.lookup_type('libk::ManualLifetime<object::pool<%s> >' % name):
+        if value.type.strip_typedefs() == gdb.lookup_type('libk::manual_lifetime<object::pool<%s> >' % name):
             return manual(value, 'object::pool<%s>' % name)
         for f in value.type.fields():
             child = value.cast(f.type) if f.is_base_class else value[f.name]

@@ -1,4 +1,6 @@
 #pragma once
+
+#include <atomic>
 #include <work.hpp>
 #include <libk/unique_handle.hpp>
 
@@ -89,8 +91,8 @@ private:
     cap::Graph& grants_;
     mutable sync::Spin lock_{};
     SpaceState state_{SpaceState::Empty};
-    libk::Atomic<bool> closing_{};
-    libk::Atomic<bool> fault_signal_{};
+    std::atomic<bool> closing_{};
+    std::atomic<bool> fault_signal_{};
     bool faulted_{};
     ipc::NotificationSource fault_source_{};
     object::ref<> self_{};
@@ -101,13 +103,13 @@ private:
     libk::unique_handle<Hw*, Drop> hw_{};
     struct Reg final {
         usize index;
-        libk::IntrusiveListHook hook{};
+        libk::intrusive_list_hook hook{};
         object::ref<mm::Mem> memory{};
         cap::GrantRef grant{};
         cap::GrantRevoke revoke{};
     };
     mm::Slab<Reg, false> reg_store_;
-    libk::IntrusiveList<Reg, &Reg::hook> regs_{};
+    libk::intrusive_list<Reg, &Reg::hook> regs_{};
     object::ref<irq::Irq> interrupt_{};
     cap::GrantRef interrupt_grant_{};
     cap::GrantRevoke interrupt_revoke_{};

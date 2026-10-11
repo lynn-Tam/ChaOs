@@ -1,7 +1,7 @@
 #pragma once
 
 // Move-only RAII wrapper for non-pointer resource handles.
-// EmptyPolicy supplies static empty() and is_empty(handle); DefaultEmptyValue uses T{}.
+// EmptyPolicy supplies static empty() and is_empty(handle); default_empty uses T{}.
 
 #include <concepts>
 #include <libk/concepts.hpp>
@@ -11,7 +11,7 @@
 namespace libk {
 
 template<typename HandleT>
-struct DefaultEmptyValue {
+struct default_empty {
     [[nodiscard]] static constexpr HandleT empty() noexcept(
         std::is_nothrow_default_constructible_v<HandleT>) {
         return HandleT{};
@@ -24,7 +24,7 @@ struct DefaultEmptyValue {
 };
 
 template<typename HandleT, HandleT EmptyValue>
-struct StaticEmptyValue {
+struct static_empty {
     [[nodiscard]] static constexpr HandleT empty() noexcept {
         return EmptyValue;
     }
@@ -38,7 +38,7 @@ struct StaticEmptyValue {
 template<
     typename HandleT,
     typename DeleterT,
-    typename EmptyPolicy = DefaultEmptyValue<HandleT>>
+    typename EmptyPolicy = default_empty<HandleT>>
 class unique_handle {
     static_assert(std::is_move_constructible_v<HandleT>
                   && std::is_move_assignable_v<HandleT>,

@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "libk/string_view.hpp"
+#include <string_view>
 #include "libk/fmt/error.hpp"
 
 namespace libk::fmt {
@@ -67,7 +67,7 @@ constexpr bool checked_add_digit(size_t& value, char c) noexcept {
     return true;
 }
 
-constexpr bool parse_unsigned(StrView text, size_t& pos, size_t& out) noexcept {
+constexpr bool parse_unsigned(std::string_view text, size_t& pos, size_t& out) noexcept {
     if (pos >= text.size() || !is_digit(text[pos])) {
         return false;
     }
@@ -82,7 +82,7 @@ constexpr bool parse_unsigned(StrView text, size_t& pos, size_t& out) noexcept {
     return true;
 }
 
-constexpr errc parse_format_spec(StrView text, size_t& pos, format_spec& spec) noexcept {
+constexpr errc parse_format_spec(std::string_view text, size_t& pos, format_spec& spec) noexcept {
     if (pos >= text.size() || text[pos] == '}') {
         return errc::ok;
     }
@@ -149,7 +149,7 @@ constexpr errc parse_format_spec(StrView text, size_t& pos, format_spec& spec) n
     return errc::ok;
 }
 
-constexpr errc parse_replacement_field(StrView text, size_t& pos, replacement_field& field) noexcept {
+constexpr errc parse_replacement_field(std::string_view text, size_t& pos, replacement_field& field) noexcept {
     field = replacement_field{};
 
     if (pos < text.size() && is_digit(text[pos])) {

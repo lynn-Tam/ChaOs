@@ -1,7 +1,7 @@
 #include <wait.hpp>
 #include <trace.hpp>
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <sched/sc.hpp>
 #include <sched/dispatcher.hpp>
@@ -17,7 +17,7 @@ void Completion::attach(Wait& wait) noexcept {
     libk_assert(!attached());
     wait_ = &wait;
     trace::emit(trace::Event::Attach, reinterpret_cast<u64>(&wait), reinterpret_cast<u64>(this));
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Attached);
+    delivery_.store(Delivery::Attached, std::memory_order_release);
 }
 
 void Completion::signal() noexcept {
@@ -26,20 +26,16 @@ void Completion::signal() noexcept {
     // meets that owner records a durable race.  If cancellation wins its
     // reopen CAS first, this loop simply claims the reattached generation.
     for (;;) {
-        Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
+        Delivery expected = delivery_.load(std::memory_order_acquire);
         if (expected == Delivery::Attached) {
-            if (delivery_.compare_exchange_strong<
-                    libk::MemoryOrder::AcqRel,
-                    libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+            if (delivery_.compare_exchange_strong(expected, Delivery::Claimed, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 break;
             }
             continue;
         }
         if (expected == Delivery::Cancelling) {
-            if (delivery_.compare_exchange_strong<
-                    libk::MemoryOrder::AcqRel,
-                    libk::MemoryOrder::Acquire>(
-                        expected, Delivery::CancelRaced)) {
+            if (delivery_.compare_exchange_strong(
+                        expected, Delivery::CancelRaced, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 return;
             }
             continue;
@@ -55,22 +51,20 @@ void Completion::signal() noexcept {
     trace::emit(trace::Event::Claim, actor, id);
     sched::PreemptGuard preempt;
     wait_->wake();
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Ready);
+    delivery_.store(Delivery::Ready, std::memory_order_release);
     trace::emit(trace::Event::Complete, actor, id);
 
 }
 
 auto Completion::try_claim_finish() noexcept -> FinishClaim {
-    Delivery expected = delivery_.load<libk::MemoryOrder::Acquire>();
+    Delivery expected = delivery_.load(std::memory_order_acquire);
     if (expected == Delivery::Claimed) {
         return FinishClaim::Publishing;
     }
     if (expected != Delivery::Ready) {
         return FinishClaim::Unavailable;
     }
-    if (delivery_.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, Delivery::Claimed)) {
+    if (delivery_.compare_exchange_strong(expected, Delivery::Claimed, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return FinishClaim::Claimed;
     }
     return expected == Delivery::Claimed
@@ -78,11 +72,11 @@ auto Completion::try_claim_finish() noexcept -> FinishClaim {
 }
 
 auto Completion::try_claim_cancel() noexcept -> CancelClaim {
-    const Delivery observed = delivery_.load<libk::MemoryOrder::Acquire>();
+    const Delivery observed = delivery_.load(std::memory_order_acquire);
     if (observed != Delivery::Attached && observed != Delivery::Ready) return CancelClaim::Unavailable;
     Delivery expected = observed;
-    if (!delivery_.compare_exchange_strong<libk::MemoryOrder::AcqRel, libk::MemoryOrder::Acquire>(
-            expected, Delivery::Cancelling)) return CancelClaim::Unavailable;
+    if (!delivery_.compare_exchange_strong(
+            expected, Delivery::Cancelling, std::memory_order_acq_rel, std::memory_order_acquire)) return CancelClaim::Unavailable;
     return observed == Delivery::Ready ? CancelClaim::Published : CancelClaim::Pending;
 }
 
@@ -97,9 +91,7 @@ auto Completion::resolve_cancel(CancelClaim claim) noexcept -> CancelResult {
 
 auto Completion::try_reopen_cancel() noexcept -> bool {
     Delivery expected = Delivery::Cancelling;
-    const bool reopened = delivery_.compare_exchange_strong<
-        libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, Delivery::Attached);
+    const bool reopened = delivery_.compare_exchange_strong(expected, Delivery::Attached, std::memory_order_acq_rel, std::memory_order_acquire);
     if (!reopened) {
         libk_assert(expected == Delivery::CancelRaced);
     }
@@ -107,28 +99,28 @@ auto Completion::try_reopen_cancel() noexcept -> bool {
 }
 
 void Completion::finish_claimed() noexcept {
-    libk_assert(delivery_.load<libk::MemoryOrder::Acquire>() == Delivery::Claimed);
+    libk_assert(delivery_.load(std::memory_order_acquire) == Delivery::Claimed);
     const Ops* const ops = ops_;
     void* const owner = owner_;
     const u64 actor = reinterpret_cast<u64>(owner);
     const u64 id = reinterpret_cast<u64>(this);
     wait_ = nullptr;
     // Final member access: release may destroy this Completion.
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    delivery_.store(Delivery::Detached, std::memory_order_release);
     ops->release(owner);
     trace::emit(trace::Event::Finish, actor, id);
 }
 
 void Completion::finalize_cancel(CancelResult result) noexcept {
     libk_assert(result != CancelResult::Reopen);
-    const Delivery state = delivery_.load<libk::MemoryOrder::Acquire>();
+    const Delivery state = delivery_.load(std::memory_order_acquire);
     libk_assert(state == Delivery::Cancelling || state == Delivery::CancelRaced);
     const Ops* const ops = ops_;
     void* const owner = owner_;
     const u64 actor = reinterpret_cast<u64>(owner);
     const u64 id = reinterpret_cast<u64>(this);
     wait_ = nullptr;
-    delivery_.store<libk::MemoryOrder::Release>(Delivery::Detached);
+    delivery_.store(Delivery::Detached, std::memory_order_release);
     ops->release(owner);
     trace::emit(trace::Event::Cancel, actor, id, static_cast<u64>(result));
 }
@@ -145,7 +137,7 @@ auto Wait::attached() const noexcept -> bool {
 }
 
 auto Wait::ready() const noexcept -> bool {
-    return ready_.load<libk::MemoryOrder::Acquire>();
+    return ready_.load(std::memory_order_acquire);
 }
 
 auto Wait::begin(
@@ -160,7 +152,7 @@ auto Wait::begin(
         completion_ = &completion;
         cpus_ = &cpus;
         binding_ = &binding;
-        ready_.store<libk::MemoryOrder::Relaxed>(false);
+        ready_.store(false, std::memory_order_relaxed);
         completion.attach(*this);
 
         phase_ = EdgePhase::Attached;
@@ -175,7 +167,7 @@ auto Wait::finish() noexcept -> bool {
         sync::Lock guard{lock_};
         if (phase_ != EdgePhase::Attached
             || completion_ == nullptr
-            || !ready_.load<libk::MemoryOrder::Acquire>()) {
+            || !ready_.load(std::memory_order_acquire)) {
             return false;
         }
         completion = completion_;
@@ -219,7 +211,7 @@ auto Wait::finish() noexcept -> bool {
             // same-hart publication cannot self-deadlock, while a remote
             // producer continues independently to Ready.
             libk_assert(claim == Completion::FinishClaim::Publishing);
-            libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+            std::atomic_signal_fence(std::memory_order_seq_cst);
 
         }
     }
@@ -230,7 +222,7 @@ auto Wait::finish() noexcept -> bool {
         completion_ = nullptr;
         cpus_ = nullptr;
         binding_ = nullptr;
-        ready_.store<libk::MemoryOrder::Relaxed>(false);
+        ready_.store(false, std::memory_order_relaxed);
         phase_ = EdgePhase::Detached;
     }
     completion->finish_claimed();
@@ -247,7 +239,7 @@ auto Wait::cancel() noexcept -> bool {
             return false;
         }
         completion = completion_;
-        was_ready = ready_.load<libk::MemoryOrder::Acquire>();
+        was_ready = ready_.load(std::memory_order_acquire);
         // Keep the pointer and its exact edge fields in the container while
         // cancellation resolves policy outside the lock.  Delivery now pins
         // the owner against producer publication and finish.
@@ -269,7 +261,7 @@ auto Wait::cancel() noexcept -> bool {
             // Cancelling -> Attached publication.  A producer can therefore
             // never claim an edge whose Wait fields are only half restored.
             phase_ = EdgePhase::Attached;
-            ready_.store<libk::MemoryOrder::Relaxed>(was_ready);
+            ready_.store(was_ready, std::memory_order_relaxed);
             reopened = completion->try_reopen_cancel();
             if (!reopened) {
                 // The only legal loser is CancelRaced: the producer left a
@@ -290,7 +282,7 @@ auto Wait::cancel() noexcept -> bool {
         completion_ = nullptr;
         cpus_ = nullptr;
         binding_ = nullptr;
-        ready_.store<libk::MemoryOrder::Relaxed>(false);
+        ready_.store(false, std::memory_order_relaxed);
         phase_ = EdgePhase::Detached;
     }
     completion->finalize_cancel(resolution);
@@ -304,7 +296,7 @@ void Wait::wake() noexcept {
         sync::Lock guard{lock_};
         libk_assert(phase_ == EdgePhase::Attached
             && completion_ != nullptr && cpus_ != nullptr);
-        ready_.store<libk::MemoryOrder::Release>(true);
+        ready_.store(true, std::memory_order_release);
         cpus = cpus_;
         binding = binding_;
         libk_assert(binding != nullptr);
@@ -318,6 +310,6 @@ Receipt::Receipt() noexcept
 
 void Receipt::signal() noexcept {
     libk_assert(committed_);
-    done_.store<libk::MemoryOrder::Release>(true);
+    done_.store(true, std::memory_order_release);
     completion_.signal();
 }

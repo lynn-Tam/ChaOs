@@ -10,7 +10,7 @@
 #include <libk/inplace_ring.hpp>
 #include <limits>
 #include <libk/scope_guard.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <utility>
 
 namespace {
@@ -23,21 +23,10 @@ struct MoveOnly {
     auto operator=(MoveOnly&&) -> MoveOnly& = default;
 };
 
-enum class AtomicPhase : uint32_t {
-    Empty,
-    Ready,
-    Online,
-};
-
-struct UnsupportedAtomicValue {
-    uint32_t first;
-    uint32_t second;
-};
-
 struct TreeNode final {
     int key{};
     int tie{};
-    libk::IntrusiveTreeHook hook{};
+    libk::intrusive_tree_hook hook{};
 };
 
 struct TreeLess final {
@@ -49,71 +38,12 @@ struct TreeLess final {
     }
 };
 
-using TestTree = libk::IntrusiveTree<
+using TestTree = libk::intrusive_tree<
     TreeNode, &TreeNode::hook, TreeLess>;
 
-static_assert(libk::AtomicValue<uint8_t>);
-static_assert(libk::AtomicValue<uint16_t>);
-static_assert(libk::AtomicValue<uint32_t>);
-static_assert(libk::AtomicValue<uint64_t>);
-static_assert(libk::AtomicValue<AtomicPhase>);
-static_assert(libk::AtomicValue<int*>);
-static_assert(!libk::AtomicValue<UnsupportedAtomicValue>);
-static_assert(!libk::AtomicValue<volatile uint32_t>);
-static_assert(libk::AtomicHasScalarLayout<uint32_t>);
-static_assert(libk::AtomicHasScalarLayout<int*>);
-static_assert(!std::is_copy_constructible_v<libk::Atomic<uint32_t>>);
-static_assert(!std::is_move_constructible_v<libk::Atomic<uint32_t>>);
-static_assert(std::is_trivially_destructible_v<libk::Atomic<uint32_t>>);
-
-template<typename AtomicType>
-concept HasAcquireLoad = requires(const AtomicType& value) {
-    value.template load<libk::MemoryOrder::Acquire>();
-};
-
-template<typename AtomicType>
-concept HasReleaseLoad = requires(const AtomicType& value) {
-    value.template load<libk::MemoryOrder::Release>();
-};
-
-template<typename AtomicType>
-concept HasReleaseStore = requires(AtomicType& value) {
-    value.template store<libk::MemoryOrder::Release>({});
-};
-
-template<typename AtomicType>
-concept HasAcquireStore = requires(AtomicType& value) {
-    value.template store<libk::MemoryOrder::Acquire>({});
-};
-
-template<typename AtomicType>
-concept HasValidAcqRelCas = requires(
-    AtomicType& value,
-    AtomicPhase& expected) {
-    value.template compare_exchange_strong<
-        libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, AtomicPhase::Online);
-};
-
-template<typename AtomicType>
-concept HasInvalidReleaseAcquireCas = requires(
-    AtomicType& value,
-    AtomicPhase& expected) {
-    value.template compare_exchange_strong<
-        libk::MemoryOrder::Release,
-        libk::MemoryOrder::Acquire>(expected, AtomicPhase::Online);
-};
-
-static_assert(HasAcquireLoad<libk::Atomic<AtomicPhase>>);
-static_assert(!HasReleaseLoad<libk::Atomic<AtomicPhase>>);
-static_assert(HasReleaseStore<libk::Atomic<AtomicPhase>>);
-static_assert(!HasAcquireStore<libk::Atomic<AtomicPhase>>);
-static_assert(HasValidAcqRelCas<libk::Atomic<AtomicPhase>>);
-static_assert(!HasInvalidReleaseAcquireCas<libk::Atomic<AtomicPhase>>);
-
-[[nodiscard]] auto same_text(libk::StrView actual, const char* expected) noexcept
+[[nodiscard]] auto same_text(std::string_view actual, const char* expected) noexcept
     -> bool {
-    return actual == libk::StrView::from_cstr(expected);
+    return actual == std::string_view(expected);
 }
 
 bool test_checked_arithmetic_reports_overflow(const TestContext&) noexcept {
@@ -146,30 +76,6 @@ bool test_checked_arithmetic_reports_overflow(const TestContext&) noexcept {
         && !non_power_align.has_value();
 }
 
-bool test_array_and_string_views_preserve_empty_contracts(
-    const TestContext&) noexcept {
-    std::array<int, 0> empty_array{};
-    std::array<int, 3> values{{4, 5, 6}};
-    const libk::StrView empty{};
-    const libk::StrView text{"kernel"};
-
-    return empty_array.empty()
-        && empty_array.size() == 0
-        && empty_array.begin() == empty_array.end()
-        && !values.empty()
-        && values.size() == 3
-        && values[0] == 4
-        && values[2] == 6
-        && empty.empty()
-        && empty.begin() == nullptr
-        && empty.end() == nullptr
-        && text == "kernel"
-        && text.starts_with("ker")
-        && !text.starts_with("kernel-space")
-        && text.substr(3) == "nel"
-        && text.substr(0, 0).empty();
-}
-
 bool test_byte_reader_failure_is_transactional(
     const TestContext&) noexcept {
     alignas(8) const uint8_t bytes[] = {
@@ -178,10 +84,10 @@ bool test_byte_reader_failure_is_transactional(
         0xff,
     };
 
-    libk::ByteReader reader{bytes, sizeof(bytes)};
+    libk::byte_reader reader{bytes, sizeof(bytes)};
     uint32_t word{};
-    libk::StrView text{};
-    if (!reader.read_be32(word)
+    std::string_view text{};
+    if (!reader.read_be(word)
         || word != UINT32_C(0x01234567)
         || !reader.read_cstr(text)
         || text != "ok"
@@ -190,28 +96,28 @@ bool test_byte_reader_failure_is_transactional(
         return false;
     }
 
-    libk::ByteReader little{bytes, sizeof(bytes)};
+    libk::byte_reader little{bytes, sizeof(bytes)};
     uint16_t half{};
     uint32_t little_word{};
-    if (!little.read_le16(half)
+    if (!little.read_le(half)
         || half != UINT16_C(0x2301)
         || little.offset() != sizeof(uint16_t)
-        || !little.read_le32(little_word)
+        || !little.read_le(little_word)
         || little_word != UINT32_C(0x6b6f6745)) {
         return false;
     }
 
-    libk::ByteReader short_reader{bytes, sizeof(uint32_t)};
+    libk::byte_reader short_reader{bytes, sizeof(uint32_t)};
     uint64_t wide = UINT64_C(0xfeedfacecafebeef);
     const uint8_t* const original_ptr = short_reader.ptr();
-    if (short_reader.read_be64(wide)
+    if (short_reader.read_be(wide)
         || wide != UINT64_C(0xfeedfacecafebeef)
         || short_reader.ptr() != original_ptr
         || short_reader.remaining() != sizeof(uint32_t)) {
         return false;
     }
 
-    libk::ByteSpan output{bytes, 1};
+    std::span<const uint8_t> output{bytes, 1};
     if (short_reader.take_bytes(sizeof(bytes), output)
         || output.data() != bytes
         || output.size() != 1
@@ -219,15 +125,15 @@ bool test_byte_reader_failure_is_transactional(
         return false;
     }
 
-    libk::ByteReader unterminated{bytes, sizeof(uint32_t)};
-    libk::StrView unchanged{"unchanged"};
+    libk::byte_reader unterminated{bytes, sizeof(uint32_t)};
+    std::string_view unchanged{"unchanged"};
     if (unterminated.read_cstr(unchanged)
         || unchanged != "unchanged"
         || unterminated.remaining() != sizeof(uint32_t)) {
         return false;
     }
 
-    libk::ByteReader alignment_failure{bytes, 2};
+    libk::byte_reader alignment_failure{bytes, 2};
     if (!alignment_failure.skip(1)) {
         return false;
     }
@@ -241,7 +147,7 @@ bool test_byte_reader_failure_is_transactional(
         return false;
     }
 
-    libk::ByteReader empty_reader{nullptr, 0};
+    libk::byte_reader empty_reader{nullptr, 0};
     return empty_reader.ptr() == nullptr
         && empty_reader.remaining() == 0
         && empty_reader.align(4)
@@ -251,7 +157,7 @@ bool test_byte_reader_failure_is_transactional(
 
 bool test_inplace_vector_handles_aliasing_and_zero_capacity(
     const TestContext&) noexcept {
-    libk::InplaceVector<int, 0> empty{};
+    libk::inplace_vector<int, 0> empty{};
     if (!empty.empty()
         || empty.data() != nullptr
         || empty.begin() != empty.end()
@@ -259,7 +165,7 @@ bool test_inplace_vector_handles_aliasing_and_zero_capacity(
         return false;
     }
 
-    libk::InplaceVector<int, 5> values{};
+    libk::inplace_vector<int, 5> values{};
     if (!values.try_push_back(1)
         || !values.try_push_back(2)
         || !values.try_push_back(3)) {
@@ -286,11 +192,11 @@ bool test_inplace_vector_handles_aliasing_and_zero_capacity(
         return false;
     }
 
-    libk::InplaceVector<MoveOnly, 2> source{};
+    libk::inplace_vector<MoveOnly, 2> source{};
     if (!source.try_emplace_back(7) || !source.try_emplace_back(9)) {
         return false;
     }
-    libk::InplaceVector<MoveOnly, 2> moved{std::move(source)};
+    libk::inplace_vector<MoveOnly, 2> moved{std::move(source)};
     return source.empty()
         && moved.size() == 2
         && moved[0].value == 7
@@ -299,7 +205,7 @@ bool test_inplace_vector_handles_aliasing_and_zero_capacity(
 
 bool test_inplace_ring_erase_preserves_logical_order(
     const TestContext&) noexcept {
-    libk::InplaceRing<int, 4> plain{};
+    libk::inplace_ring<int, 4> plain{};
     plain.emplace_back(1);
     plain.emplace_back(2);
     plain.emplace_back(3);
@@ -314,7 +220,7 @@ bool test_inplace_ring_erase_preserves_logical_order(
         return false;
     }
 
-    libk::InplaceRing<int, 4> wrapped{};
+    libk::inplace_ring<int, 4> wrapped{};
     wrapped.emplace_back(1);
     wrapped.emplace_back(2);
     wrapped.emplace_back(3);
@@ -366,58 +272,6 @@ bool test_fmt_is_bounded_and_copy_elision_independent(const TestContext&) noexce
     return truncation.error == libk::fmt::errc::output_truncated
         && truncation.produced == 5
         && truncated[3] == '\0';
-}
-
-bool test_atomic_scalar_and_compare_exchange_contract(
-    const TestContext&) noexcept {
-    libk::Atomic<AtomicPhase> phase{AtomicPhase::Empty};
-    phase.store<libk::MemoryOrder::Release>(AtomicPhase::Ready);
-    if (phase.load<libk::MemoryOrder::Acquire>() != AtomicPhase::Ready) {
-        return false;
-    }
-
-    AtomicPhase expected = AtomicPhase::Empty;
-    if (phase.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, AtomicPhase::Online)
-        || expected != AtomicPhase::Ready) {
-        return false;
-    }
-
-    if (!phase.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, AtomicPhase::Online)) {
-        return false;
-    }
-
-    return phase.exchange<libk::MemoryOrder::AcqRel>(AtomicPhase::Empty)
-            == AtomicPhase::Online
-        && phase.load<libk::MemoryOrder::Relaxed>() == AtomicPhase::Empty;
-}
-
-bool test_atomic_inc_sat_contract(const TestContext&) noexcept {
-    libk::Atomic<uint64_t> value{};
-    libk::atomic_inc_sat(value);
-    if (value.load<libk::MemoryOrder::Relaxed>() != 1) {
-        return false;
-    }
-    value.store<libk::MemoryOrder::Relaxed>(UINT64_MAX);
-    libk::atomic_inc_sat(value);
-    return value.load<libk::MemoryOrder::Relaxed>() == UINT64_MAX;
-}
-
-bool test_atomic_ref_uses_borrowed_storage(const TestContext&) noexcept {
-    uint64_t storage{7};
-    libk::AtomicRef value{storage};
-    value.store<libk::MemoryOrder::Release>(11);
-    const uint64_t previous =
-        value.fetch_add<libk::MemoryOrder::Relaxed>(5);
-    uint64_t expected = 16;
-    const bool exchanged = value.compare_exchange_strong<
-        libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, 23);
-    return previous == 11 && exchanged && storage == 23
-        && value.load<libk::MemoryOrder::Acquire>() == 23;
 }
 
 bool test_intrusive_tree_order_and_removal(const TestContext&) noexcept {
@@ -484,10 +338,6 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         test_checked_arithmetic_reports_overflow);
     (void)registry.add(
         "libk",
-        "array and string views preserve empty and bounded contracts",
-        test_array_and_string_views_preserve_empty_contracts);
-    (void)registry.add(
-        "libk",
         "byte reader failures leave cursor and outputs unchanged",
         test_byte_reader_failure_is_transactional);
     (void)registry.add(
@@ -506,18 +356,6 @@ void register_libk_tests(TestRegistry& registry) noexcept {
         "libk",
         "fmt remains bounded and independent of copy elision",
         test_fmt_is_bounded_and_copy_elision_independent);
-    (void)registry.add(
-        "libk",
-        "atomic scalar operations preserve compare-exchange contract",
-        test_atomic_scalar_and_compare_exchange_contract);
-    (void)registry.add(
-        "libk",
-        "atomic increment saturates at the unsigned maximum",
-        test_atomic_inc_sat_contract);
-    (void)registry.add(
-        "libk",
-        "atomic ref synchronizes borrowed scalar storage",
-        test_atomic_ref_uses_borrowed_storage);
     (void)registry.add(
         "libk",
         "intrusive AVL tree preserves ordered unique membership",

@@ -1,9 +1,10 @@
+#include <string.h>
+#include <sys/protocol.hpp>
 #include <utility>
-#include <servers/runtime/service.hpp>
-#include <servers/runtime/queue.hpp>
+#include <sys/channel.hpp>
+#include <sys/queue.hpp>
 #include <sys/start.hpp>
 #include <servers/block/device.hpp>
-#include <sys/queue.hpp>
 
 namespace {
 using namespace sys;
@@ -11,7 +12,7 @@ block::Device device;
 constexpr size_t Clients = 4;
 io::ControlPort directory;
 struct Client final {
-    cap::OwnedCap channel;
+    cap_owner channel;
     io::ServerSession session;
 };
 Client clients[Clients];
@@ -46,20 +47,20 @@ auto validate(const io::Request& request) noexcept -> status_t {
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    const auto pool = service::capability(info, BOOT_POOL);
-    const auto vspace = service::capability(info, BOOT_VSPACE);
-    const auto cspace = service::capability(info, BOOT_CSPACE);
-    const auto events = service::capability(info, BOOT_EVENTS);
-    service::require(device.open(pool, vspace, service::capability(info, BOOT_IO_HOST), events));
-    service::require(directory.open(service::capability(info, boot::Block), events));
+    const auto info = sys::bootstrap(address, size);
+    const auto pool = sys::capability(info, BOOT_POOL);
+    const auto vspace = sys::capability(info, BOOT_VSPACE);
+    const auto cspace = sys::capability(info, BOOT_CSPACE);
+    const auto events = sys::capability(info, BOOT_EVENTS);
+    sys::require(device.open(pool, vspace, sys::capability(info, BOOT_IO_HOST), events, boot::event_badge));
+    sys::require(directory.open(sys::capability(info, boot::Block), events));
     for (size_t i = 0; i < Clients; ++i)
-        service::require(clients[i].session.prepare(pool, vspace, cspace,
+        sys::require(clients[i].session.prepare(pool, vspace, cspace,
             0x70000000 + i * 0x100000, true));
     size_t turn{};
     for (;;) {
         bool again{};
-        service::require(device.acknowledge());
+        sys::require(device.acknowledge());
         for (size_t count = 0; count < Clients; ++count) {
             io::ControlPacket packet;
             const auto status = directory.receive(packet);
@@ -93,7 +94,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             block::Device::Completion completion;
             const auto status = device.take(completion);
             if (status == STATUS_WOULD_BLOCK) break;
-            service::require(status);
+            sys::require(status);
             if (completion.ticket.slot >= io::QueueDepth) exit(STATUS_INTERNAL);
             auto& operation = pending[completion.ticket.slot];
             if (!operation.client || operation.generation != completion.ticket.id) exit(STATUS_INTERNAL);
@@ -105,7 +106,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             if (!session.failed() && !cancelled && completion.status == STATUS_OK
                 && (request->operation == static_cast<uint64_t>(io::Operation::Read)
                     || request->operation == static_cast<uint64_t>(io::Operation::Identify)))
-                service::copy(session.payload() + request->buffer_offset, completion.data, completion.size);
+                ::memcpy(session.payload() + request->buffer_offset, completion.data, completion.size);
             if (session.failed() || !queue.finish(operation.ticket,
                 cancelled ? STATUS_CANCELED : completion.status, cancelled ? 0 : completion.size)) {
                 session.abort();
@@ -201,7 +202,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
                 client.session.reset();
             } else if (client.session.arm() != STATUS_OK) { client.session.abort(); again = true; }
         }
-        service::require(directory.arm());
-        if (!again) service::require(notification_wait(events).status);
+        sys::require(directory.arm());
+        if (!again) sys::require(notification_wait(events).status);
     }
 }

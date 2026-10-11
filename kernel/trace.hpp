@@ -1,8 +1,8 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <array>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 
 struct Cpu;
 
@@ -24,11 +24,11 @@ void emit(Event, u64 actor = 0, u64 object = 0, u64 a = 0, u64 b = 0) noexcept;
 [[nodiscard]] auto enabled() noexcept -> bool;
 struct Ring {
     struct Cell {
-        libk::Atomic<u64> seq{}, tick{}, actor{}, object{}, a{}, b{};
-        libk::Atomic<Event> kind{};
+        std::atomic<u64> seq{}, tick{}, actor{}, object{}, a{}, b{};
+        std::atomic<Event> kind{};
     };
     static constexpr usize capacity = 64;
-    libk::Atomic<u64> head{};
+    std::atomic<u64> head{};
     std::array<Cell, capacity> cells{};
 };
 

@@ -4,14 +4,14 @@
 
 
 #include <third_party/littlefs/lfs.h>
-#include <sys/storage.hpp>
+#include <sys/protocol.hpp>
 
 // Store-private littlefs extension; the caller pins mutation through I/O.
 extern "C" int lfs_file_map(lfs_t*, lfs_file_t*, lfs_off_t,
     lfs_block_t*, lfs_off_t*, lfs_size_t*);
 extern "C" void lfs_file_drop(lfs_t*, lfs_file_t*);
 
-namespace sys::store {
+namespace store {
 
 // This adapter is the sole owner of the disk geometry and littlefs state.
 // A 4 KiB logical erase is a real full-block overwrite on a sector device;
@@ -188,4 +188,4 @@ public:
     Volume() noexcept { for (auto& byte : erased_) byte = 0xff; }
 };
 
-} // namespace sys::store
+} // namespace store

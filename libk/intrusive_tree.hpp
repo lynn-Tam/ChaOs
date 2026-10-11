@@ -13,45 +13,45 @@
 
 namespace libk {
 
-class IntrusiveTreeHook;
+class intrusive_tree_hook;
 
-template<typename T, IntrusiveTreeHook T::* HookMember, typename Compare>
-class IntrusiveTree;
+template<typename T, intrusive_tree_hook T::* HookMember, typename Compare>
+class intrusive_tree;
 
-class IntrusiveTreeHook {
-    template<typename T, IntrusiveTreeHook T::* HookMember, typename Compare>
-    friend class IntrusiveTree;
+class intrusive_tree_hook {
+    template<typename T, intrusive_tree_hook T::* HookMember, typename Compare>
+    friend class intrusive_tree;
 
 public:
-    constexpr IntrusiveTreeHook() noexcept = default;
-    IntrusiveTreeHook(const IntrusiveTreeHook&) = delete;
-    auto operator=(const IntrusiveTreeHook&) -> IntrusiveTreeHook& = delete;
-    IntrusiveTreeHook(IntrusiveTreeHook&&) = delete;
-    auto operator=(IntrusiveTreeHook&&) -> IntrusiveTreeHook& = delete;
+    constexpr intrusive_tree_hook() noexcept = default;
+    intrusive_tree_hook(const intrusive_tree_hook&) = delete;
+    auto operator=(const intrusive_tree_hook&) -> intrusive_tree_hook& = delete;
+    intrusive_tree_hook(intrusive_tree_hook&&) = delete;
+    auto operator=(intrusive_tree_hook&&) -> intrusive_tree_hook& = delete;
 
-    constexpr ~IntrusiveTreeHook() { libk_assert(!linked_); }
+    constexpr ~intrusive_tree_hook() { libk_assert(!linked_); }
 
     [[nodiscard]] constexpr auto is_linked() const noexcept -> bool {
         return linked_;
     }
 
 private:
-    IntrusiveTreeHook* parent_{};
-    IntrusiveTreeHook* left_{};
-    IntrusiveTreeHook* right_{};
+    intrusive_tree_hook* parent_{};
+    intrusive_tree_hook* left_{};
+    intrusive_tree_hook* right_{};
     unsigned height_{1};
     bool linked_{};
 };
 
-template<typename T, IntrusiveTreeHook T::* HookMember, typename Compare>
-class IntrusiveTree {
+template<typename T, intrusive_tree_hook T::* HookMember, typename Compare>
+class intrusive_tree {
     static_assert(std::is_object_v<T> && !std::is_const_v<T>);
 
 public:
-    constexpr IntrusiveTree() noexcept = default;
-    IntrusiveTree(const IntrusiveTree&) = delete;
-    auto operator=(const IntrusiveTree&) -> IntrusiveTree& = delete;
-    constexpr IntrusiveTree(IntrusiveTree&& other)
+    constexpr intrusive_tree() noexcept = default;
+    intrusive_tree(const intrusive_tree&) = delete;
+    auto operator=(const intrusive_tree&) -> intrusive_tree& = delete;
+    constexpr intrusive_tree(intrusive_tree&& other)
         noexcept(std::is_nothrow_move_constructible_v<Compare>)
         : root_(std::exchange(other.root_, nullptr)),
           minimum_(std::exchange(other.minimum_, nullptr)),
@@ -59,8 +59,8 @@ public:
           hook_offset_(std::exchange(other.hook_offset_, 0)),
           offset_known_(std::exchange(other.offset_known_, false)),
           compare_(std::move(other.compare_)) {}
-    constexpr auto operator=(IntrusiveTree&& other)
-        noexcept(std::is_nothrow_move_assignable_v<Compare>) -> IntrusiveTree& {
+    constexpr auto operator=(intrusive_tree&& other)
+        noexcept(std::is_nothrow_move_assignable_v<Compare>) -> intrusive_tree& {
         if (this != &other) {
             clear();
             root_ = std::exchange(other.root_, nullptr);
@@ -73,7 +73,7 @@ public:
         return *this;
     }
 
-    constexpr ~IntrusiveTree() { clear(); }
+    constexpr ~intrusive_tree() { clear(); }
 
     [[nodiscard]] constexpr auto empty() const noexcept -> bool {
         return root_ == nullptr;
@@ -89,13 +89,13 @@ public:
     }
     [[nodiscard]] constexpr auto maximum() noexcept -> T* {
         return const_cast<T*>(
-            static_cast<const IntrusiveTree*>(this)->maximum());
+            static_cast<const intrusive_tree*>(this)->maximum());
     }
     [[nodiscard]] constexpr auto maximum() const noexcept -> const T* {
         if (root_ == nullptr) {
             return nullptr;
         }
-        const IntrusiveTreeHook* node = root_;
+        const intrusive_tree_hook* node = root_;
         while (node->right_ != nullptr) {
             node = node->right_;
         }
@@ -104,13 +104,13 @@ public:
 
     template<typename Key>
     [[nodiscard]] constexpr auto find(const Key& key) noexcept -> T* {
-        return const_cast<T*>(static_cast<const IntrusiveTree*>(this)->find(key));
+        return const_cast<T*>(static_cast<const intrusive_tree*>(this)->find(key));
     }
 
     template<typename Key>
     [[nodiscard]] constexpr auto find(const Key& key) const noexcept
         -> const T* {
-        const IntrusiveTreeHook* node = root_;
+        const intrusive_tree_hook* node = root_;
         while (node != nullptr) {
             const T& value = *value_of(*node);
             if (compare_(key, value)) {
@@ -127,14 +127,14 @@ public:
     template<typename Key>
     [[nodiscard]] constexpr auto lower_bound(const Key& key) noexcept -> T* {
         return const_cast<T*>(
-            static_cast<const IntrusiveTree*>(this)->lower_bound(key));
+            static_cast<const intrusive_tree*>(this)->lower_bound(key));
     }
 
     template<typename Key>
     [[nodiscard]] constexpr auto lower_bound(const Key& key) const noexcept
         -> const T* {
-        const IntrusiveTreeHook* node = root_;
-        const IntrusiveTreeHook* candidate{};
+        const intrusive_tree_hook* node = root_;
+        const intrusive_tree_hook* candidate{};
         while (node != nullptr) {
             const T& value = *value_of(*node);
             if (!compare_(value, key)) {
@@ -149,17 +149,17 @@ public:
 
     [[nodiscard]] constexpr auto next(T& value) noexcept -> T* {
         return const_cast<T*>(
-            static_cast<const IntrusiveTree*>(this)->next(value));
+            static_cast<const intrusive_tree*>(this)->next(value));
     }
 
     [[nodiscard]] constexpr auto next(const T& value) const noexcept
         -> const T* {
-        const IntrusiveTreeHook* node = &hook_of(value);
+        const intrusive_tree_hook* node = &hook_of(value);
         libk_assert(node->linked_);
         if (node->right_ != nullptr) {
             return value_of(*leftmost(*node->right_));
         }
-        const IntrusiveTreeHook* parent = node->parent_;
+        const intrusive_tree_hook* parent = node->parent_;
         while (parent != nullptr && node == parent->right_) {
             node = parent;
             parent = parent->parent_;
@@ -169,21 +169,21 @@ public:
 
     [[nodiscard]] constexpr auto previous(T& value) noexcept -> T* {
         return const_cast<T*>(
-            static_cast<const IntrusiveTree*>(this)->previous(value));
+            static_cast<const intrusive_tree*>(this)->previous(value));
     }
 
     [[nodiscard]] constexpr auto previous(const T& value) const noexcept
         -> const T* {
-        const IntrusiveTreeHook* node = &hook_of(value);
+        const intrusive_tree_hook* node = &hook_of(value);
         libk_assert(node->linked_);
         if (node->left_ != nullptr) {
-            const IntrusiveTreeHook* result = node->left_;
+            const intrusive_tree_hook* result = node->left_;
             while (result->right_ != nullptr) {
                 result = result->right_;
             }
             return value_of(*result);
         }
-        const IntrusiveTreeHook* parent = node->parent_;
+        const intrusive_tree_hook* parent = node->parent_;
         while (parent != nullptr && node == parent->left_) {
             node = parent;
             parent = parent->parent_;
@@ -192,12 +192,12 @@ public:
     }
 
     constexpr void insert(T& value) noexcept {
-        IntrusiveTreeHook& node = hook_of(value);
+        intrusive_tree_hook& node = hook_of(value);
         libk_assert(!node.linked_);
         establish_offset(value);
 
-        IntrusiveTreeHook* parent{};
-        IntrusiveTreeHook** edge = &root_;
+        intrusive_tree_hook* parent{};
+        intrusive_tree_hook** edge = &root_;
         while (*edge != nullptr) {
             parent = *edge;
             T& existing = *value_of(**edge);
@@ -223,20 +223,20 @@ public:
     }
 
     constexpr void erase(T& value) noexcept {
-        IntrusiveTreeHook& node = hook_of(value);
+        intrusive_tree_hook& node = hook_of(value);
         libk_assert(node.linked_);
 
-        IntrusiveTreeHook* rebalance_from{};
+        intrusive_tree_hook* rebalance_from{};
         if (node.left_ == nullptr || node.right_ == nullptr) {
-            IntrusiveTreeHook* child = node.left_ != nullptr
+            intrusive_tree_hook* child = node.left_ != nullptr
                 ? node.left_
                 : node.right_;
             rebalance_from = node.parent_;
             replace(node, child);
         } else {
-            IntrusiveTreeHook* successor = leftmost(*node.right_);
+            intrusive_tree_hook* successor = leftmost(*node.right_);
             if (successor->parent_ != &node) {
-                IntrusiveTreeHook* const old_parent = successor->parent_;
+                intrusive_tree_hook* const old_parent = successor->parent_;
                 replace(*successor, successor->right_);
                 successor->right_ = node.right_;
                 successor->right_->parent_ = successor;
@@ -268,11 +268,11 @@ public:
     }
 
 private:
-    static constexpr auto hook_of(T& value) noexcept -> IntrusiveTreeHook& {
+    static constexpr auto hook_of(T& value) noexcept -> intrusive_tree_hook& {
         return value.*HookMember;
     }
     static constexpr auto hook_of(const T& value) noexcept
-        -> const IntrusiveTreeHook& {
+        -> const intrusive_tree_hook& {
         return value.*HookMember;
     }
 
@@ -288,36 +288,36 @@ private:
         }
     }
 
-    [[nodiscard]] constexpr auto value_of(IntrusiveTreeHook& hook) noexcept
+    [[nodiscard]] constexpr auto value_of(intrusive_tree_hook& hook) noexcept
         -> T* {
         libk_assert(offset_known_);
         auto* bytes = reinterpret_cast<unsigned char*>(&hook);
         return reinterpret_cast<T*>(bytes - hook_offset_);
     }
     [[nodiscard]] constexpr auto value_of(
-        const IntrusiveTreeHook& hook) const noexcept -> const T* {
+        const intrusive_tree_hook& hook) const noexcept -> const T* {
         libk_assert(offset_known_);
         auto* bytes = reinterpret_cast<const unsigned char*>(&hook);
         return reinterpret_cast<const T*>(bytes - hook_offset_);
     }
 
     [[nodiscard]] static constexpr auto height(
-        const IntrusiveTreeHook* node) noexcept -> int {
+        const intrusive_tree_hook* node) noexcept -> int {
         return node == nullptr ? 0 : static_cast<int>(node->height_);
     }
-    static constexpr void update_height(IntrusiveTreeHook& node) noexcept {
+    static constexpr void update_height(intrusive_tree_hook& node) noexcept {
         const int left = height(node.left_);
         const int right = height(node.right_);
         node.height_ = static_cast<unsigned>(
             1 + (left > right ? left : right));
     }
     [[nodiscard]] static constexpr auto balance(
-        const IntrusiveTreeHook& node) noexcept -> int {
+        const intrusive_tree_hook& node) noexcept -> int {
         return height(node.left_) - height(node.right_);
     }
     [[nodiscard]] static constexpr auto leftmost(
-        IntrusiveTreeHook& node) noexcept -> IntrusiveTreeHook* {
-        IntrusiveTreeHook* result = &node;
+        intrusive_tree_hook& node) noexcept -> intrusive_tree_hook* {
+        intrusive_tree_hook* result = &node;
         while (result->left_ != nullptr) {
             result = result->left_;
         }
@@ -325,8 +325,8 @@ private:
     }
 
     constexpr void replace(
-        IntrusiveTreeHook& old_node,
-        IntrusiveTreeHook* replacement) noexcept {
+        intrusive_tree_hook& old_node,
+        intrusive_tree_hook* replacement) noexcept {
         if (old_node.parent_ == nullptr) {
             root_ = replacement;
         } else if (old_node.parent_->left_ == &old_node) {
@@ -340,11 +340,11 @@ private:
         }
     }
 
-    constexpr auto rotate_left(IntrusiveTreeHook& root) noexcept
-        -> IntrusiveTreeHook* {
-        IntrusiveTreeHook* const pivot = root.right_;
+    constexpr auto rotate_left(intrusive_tree_hook& root) noexcept
+        -> intrusive_tree_hook* {
+        intrusive_tree_hook* const pivot = root.right_;
         libk_assert(pivot != nullptr);
-        IntrusiveTreeHook* const parent = root.parent_;
+        intrusive_tree_hook* const parent = root.parent_;
         root.right_ = pivot->left_;
         if (root.right_ != nullptr) {
             root.right_->parent_ = &root;
@@ -364,11 +364,11 @@ private:
         return pivot;
     }
 
-    constexpr auto rotate_right(IntrusiveTreeHook& root) noexcept
-        -> IntrusiveTreeHook* {
-        IntrusiveTreeHook* const pivot = root.left_;
+    constexpr auto rotate_right(intrusive_tree_hook& root) noexcept
+        -> intrusive_tree_hook* {
+        intrusive_tree_hook* const pivot = root.left_;
         libk_assert(pivot != nullptr);
-        IntrusiveTreeHook* const parent = root.parent_;
+        intrusive_tree_hook* const parent = root.parent_;
         root.left_ = pivot->right_;
         if (root.left_ != nullptr) {
             root.left_->parent_ = &root;
@@ -388,7 +388,7 @@ private:
         return pivot;
     }
 
-    constexpr void rebalance(IntrusiveTreeHook* node) noexcept {
+    constexpr void rebalance(intrusive_tree_hook* node) noexcept {
         while (node != nullptr) {
             update_height(*node);
             const int factor = balance(*node);
@@ -407,8 +407,8 @@ private:
         }
     }
 
-    IntrusiveTreeHook* root_{};
-    IntrusiveTreeHook* minimum_{};
+    intrusive_tree_hook* root_{};
+    intrusive_tree_hook* minimum_{};
     size_t size_{};
     ptrdiff_t hook_offset_{};
     bool offset_known_{};

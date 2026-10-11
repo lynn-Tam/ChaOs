@@ -4,7 +4,7 @@
 #include <object/ref.hpp>
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <sched/dispatcher.hpp>
 #include <limits>
@@ -64,7 +64,7 @@ void NotificationSource::reset() noexcept {
 Notification::Wait::Wait(Notification& owner) noexcept
     : owner_(&owner),
       relation_(Completion::bind<Wait, &Wait::release, &Wait::cancel>(*this)),
-      deadline_(sched::Deadline::Callback::bind<&Wait::expire>(*this)) {}
+      deadline_(sched::Deadline::Fn::bind<&Wait::expire>(*this)) {}
 
 Notification::Wait::~Wait() noexcept {
     libk_assert(!hook_.is_linked() && !relation_.attached() && !deadline_.armed());
@@ -97,24 +97,24 @@ void Notification::Wait::expire() noexcept {
 }
 
 Notification::~Notification() noexcept {
-    const Life life = life_.load<libk::MemoryOrder::Acquire>();
+    const Life life = life_.load(std::memory_order_acquire);
     // pool may destroy an unpublished construction directly. A
     // published object reaches destruction only through Closed.
     libk_assert(life == Life::Open || life == Life::Closed);
-    libk_assert(signalers_.load<libk::MemoryOrder::Acquire>() == 0);
-    libk_assert(relations_.load<libk::MemoryOrder::Acquire>() == 0);
+    libk_assert(signalers_.load(std::memory_order_acquire) == 0);
+    libk_assert(relations_.load(std::memory_order_acquire) == 0);
     libk_assert(waiter_count_ == 0 && waiters_.empty() && sources_.empty() && !cleanup_);
 
 }
 
 auto Notification::signal(u64 badge) noexcept -> bool {
-    if (!badge || life_.load<libk::MemoryOrder::Acquire>() != Life::Open) return false;
-    static_cast<void>(signalers_.fetch_add<libk::MemoryOrder::AcqRel>(1));
+    if (!badge || life_.load(std::memory_order_acquire) != Life::Open) return false;
+    static_cast<void>(signalers_.fetch_add(1, std::memory_order_acq_rel));
     bool accepted{};
     Wait* waiter{};
     {
         sync::Lock guard{receiver_lock_};
-        if (life_.load<libk::MemoryOrder::Acquire>() == Life::Open) {
+        if (life_.load(std::memory_order_acquire) == Life::Open) {
             pending_ |= badge;
             libk_assert(signal_sequence_ != std::numeric_limits<u64>::max());
             ++signal_sequence_;
@@ -126,9 +126,9 @@ auto Notification::signal(u64 badge) noexcept -> bool {
             }
         }
     }
-    const usize n = signalers_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
+    const usize n = signalers_.fetch_sub(1, std::memory_order_acq_rel);
     libk_assert(n);
-    if (n == 1 && life_.load<libk::MemoryOrder::Acquire>() != Life::Open) try_finish_retire();
+    if (n == 1 && life_.load(std::memory_order_acquire) != Life::Open) try_finish_retire();
     // waiter_count_ pins the object; the selected result excludes cancellation.
     // Publication is the final access to stack-owned waiter storage.
     if (waiter != nullptr) waiter->relation_.signal();
@@ -137,7 +137,7 @@ auto Notification::signal(u64 badge) noexcept -> bool {
 
 auto Notification::take() noexcept -> std::expected<NotificationTake, NotificationError> {
     sync::Lock guard{receiver_lock_};
-    if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) return std::unexpected(NotificationError::Closed);
+    if (life_.load(std::memory_order_acquire) != Life::Open) return std::unexpected(NotificationError::Closed);
     const auto badges = std::exchange(pending_, u64{});
     if (!badges) return std::unexpected(NotificationError::Empty);
     return (NotificationTake{badges, signal_sequence_});
@@ -145,11 +145,11 @@ auto Notification::take() noexcept -> std::expected<NotificationTake, Notificati
 
 auto Notification::wait(Thread& thread, Cpus& cpus,
                         sched::Dispatcher& dispatcher,
-                        std::optional<time::Instant> deadline) noexcept -> WaitResult {
+                        std::optional<u64> deadline) noexcept -> WaitResult {
     Wait waiter{*this};
     {
         sync::Lock guard{receiver_lock_};
-        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) return {STATUS_CLOSED, 0};
+        if (life_.load(std::memory_order_acquire) != Life::Open) return {STATUS_CLOSED, 0};
         const u64 badges = std::exchange(pending_, u64{});
         if (badges != 0) return {STATUS_OK, badges};
         if (deadline && !dispatcher.arm(waiter.deadline_, *deadline)) return {STATUS_BUSY, 0};
@@ -171,7 +171,7 @@ auto Notification::bind(NotificationSource& source, u64 badge) noexcept
         return std::unexpected(NotificationError::InvalidBadge);
     }
     sync::Lock receiver{receiver_lock_};
-    if (life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
+    if (life_.load(std::memory_order_acquire) != Life::Open) {
         return std::unexpected(NotificationError::Closed);
     }
     sync::Lock source_guard{source.lock_};
@@ -216,8 +216,7 @@ void Notification::retire(object::cleanup&& cleanup) noexcept {
     // The retirement publisher survives wakes, source callbacks and cleanup.
     retain_relation();
     Life expected = Life::Open;
-    libk_assert((life_.compare_exchange_strong<libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, Life::Closing)));
+    libk_assert((life_.compare_exchange_strong(expected, Life::Closing, std::memory_order_acq_rel, std::memory_order_acquire)));
     {
         sync::Lock guard{receiver_lock_};
         libk_assert(!cleanup_);
@@ -253,16 +252,16 @@ void Notification::retire(object::cleanup&& cleanup) noexcept {
 
 void Notification::retain_relation() noexcept {
     const usize previous =
-        relations_.fetch_add<libk::MemoryOrder::AcqRel>(1);
+        relations_.fetch_add(1, std::memory_order_acq_rel);
     libk_assert(previous != static_cast<usize>(-1));
 }
 
 void Notification::release_relation() noexcept {
     const usize previous =
-        relations_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
+        relations_.fetch_sub(1, std::memory_order_acq_rel);
     libk_assert(previous != 0);
     if (previous == 1
-        && life_.load<libk::MemoryOrder::Acquire>() != Life::Open) {
+        && life_.load(std::memory_order_acquire) != Life::Open) {
         try_finish_retire();
     }
 }
@@ -271,14 +270,14 @@ void Notification::try_finish_retire() noexcept {
     object::cleanup cleanup{};
     {
         sync::Lock guard{receiver_lock_};
-        if (life_.load<libk::MemoryOrder::Acquire>() != Life::Closing
-            || signalers_.load<libk::MemoryOrder::Acquire>() != 0
-            || relations_.load<libk::MemoryOrder::Acquire>() != 0
+        if (life_.load(std::memory_order_acquire) != Life::Closing
+            || signalers_.load(std::memory_order_acquire) != 0
+            || relations_.load(std::memory_order_acquire) != 0
             || waiter_count_ != 0 || !sources_.empty()
             || !cleanup_) {
             return;
         }
-        life_.store<libk::MemoryOrder::Release>(Life::Closed);
+        life_.store(Life::Closed, std::memory_order_release);
         cleanup = std::move(cleanup_);
     }
     cleanup.complete();

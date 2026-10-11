@@ -93,7 +93,7 @@ constexpr Rights irq_rights = Rights::of(
 
 [[nodiscard]] static auto valid(Quota limit) noexcept -> bool {
     constexpr u64 valid_kinds =
-        OBJECT_KINDS;
+        OBJ_KINDS;
     return (limit.object_kinds & ~valid_kinds) == 0;
 }
 
@@ -152,47 +152,46 @@ static auto contains(ChanLimit a, ChanLimit b) noexcept -> bool {
 
 // One type/rights dispatch shared by validation and containment.
 template<class F, class R>
-static auto select(object::ObjectKind kind, F fn, R missing) noexcept -> R {
-    using Kind = object::ObjectKind;
+static auto select(ObjKind kind, F fn, R missing) noexcept -> R {
     switch (kind) {
-    case Kind::IoSpace:
+    case ObjIoSpace:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Close, Right::Revoke));
-    case Kind::Host:
+    case ObjHost:
         return fn.template operator()<HostLimit>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Revoke));
-    case Kind::Thread:
+    case ObjThread:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Observe, Right::Revoke));
-    case Kind::Sc:
+    case ObjSc:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Revoke));
-    case Kind::Domain:
+    case ObjDomain:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Revoke));
-    case Kind::CSpace:
+    case ObjCSpace:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Manage, Right::Destroy, Right::Revoke));
-    case Kind::Mem: return fn.template operator()<MemLimit>(memory_rights);
-    case Kind::VSpace: return fn.template operator()<VmLimit>(vspace_rights);
-    case Kind::group: return fn.template operator()<Quota>(resource_rights);
-    case Kind::Notification: return fn.template operator()<Badge>(notification_rights);
-    case Kind::Endpoint: return fn.template operator()<EpLimit>(endpoint_rights);
-    case Kind::Channel: return fn.template operator()<ChanLimit>(channel_rights);
-    case Kind::Pager: return fn.template operator()<std::monostate>(pager_rights);
-    case Kind::Irq: return fn.template operator()<IrqRoute>(irq_rights);
+    case ObjMem: return fn.template operator()<MemLimit>(memory_rights);
+    case ObjVSpace: return fn.template operator()<VmLimit>(vspace_rights);
+    case ObjGroup: return fn.template operator()<Quota>(resource_rights);
+    case ObjNotification: return fn.template operator()<Badge>(notification_rights);
+    case ObjEndpoint: return fn.template operator()<EpLimit>(endpoint_rights);
+    case ObjChannel: return fn.template operator()<ChanLimit>(channel_rights);
+    case ObjPager: return fn.template operator()<std::monostate>(pager_rights);
+    case ObjIrq: return fn.template operator()<IrqRoute>(irq_rights);
     default: return missing;
     }
 }
 
-auto validate_ceiling(object::ObjectKind kind, View ceiling) noexcept -> bool {
+auto validate_ceiling(ObjKind kind, View ceiling) noexcept -> bool {
     return select(kind, [&]<class T>(Rights allowed) noexcept {
         const auto* p = std::get_if<T>(&ceiling.data);
         return allowed.contains(ceiling.rights) && p && valid(*p);
     }, false);
 }
 
-auto compose(object::ObjectKind kind, View ceiling, View view) noexcept
+auto compose(ObjKind kind, View ceiling, View view) noexcept
     -> std::expected<View, PolicyError> {
     using Result = std::expected<View, PolicyError>;
     return select(kind, [&]<class T>(Rights allowed) noexcept -> Result {
@@ -208,7 +207,7 @@ auto compose(object::ObjectKind kind, View ceiling, View view) noexcept
     }, Result{std::unexpected(PolicyError::UnsupportedKind)});
 }
 
-auto attenuates(object::ObjectKind kind, View source, View child) noexcept -> bool {
+auto attenuates(ObjKind kind, View source, View child) noexcept -> bool {
     auto result = compose(kind, source, child);
     return result && result.value().rights == child.rights && result.value().data == child.data;
 }
@@ -265,7 +264,7 @@ template<class T>
               std::unexpected(AttenuationError::InvalidRights)};
 }
 
-auto decode_attenuation(libk::Span<const byte> bytes) noexcept
+auto decode_attenuation(std::span<const byte> bytes) noexcept
     -> std::expected<Attenuation, AttenuationError> {
     if (bytes.size() != CAP_ATTENUATION_SIZE) {
         return std::unexpected(AttenuationError::InvalidSize);
@@ -297,45 +296,13 @@ auto decode_attenuation(libk::Span<const byte> bytes) noexcept
 }
 
 auto attenuation_kind(u16 raw) noexcept
-    -> std::optional<object::ObjectKind> {
-    switch (raw) {
-    case OBJECT_KIND_IO_SPACE:
-        return object::ObjectKind::IoSpace;
-    case OBJECT_KIND_IO_HOST:
-        return object::ObjectKind::Host;
-    case OBJECT_KIND_THREAD:
-        return object::ObjectKind::Thread;
-    case OBJECT_KIND_SCHED_CONTEXT:
-        return object::ObjectKind::Sc;
-    case OBJECT_KIND_SCHED_DOMAIN:
-        return object::ObjectKind::Domain;
-    case OBJECT_KIND_CSPACE:
-        return object::ObjectKind::CSpace;
-    case OBJECT_KIND_MEMORY:
-        return object::ObjectKind::Mem;
-    case OBJECT_KIND_VSPACE:
-        return object::ObjectKind::VSpace;
-    case OBJECT_KIND_RESOURCE_POOL:
-        return object::ObjectKind::group;
-    case OBJECT_KIND_NOTIFICATION:
-        return object::ObjectKind::Notification;
-    case OBJECT_KIND_ENDPOINT:
-        return object::ObjectKind::Endpoint;
-    case OBJECT_KIND_CHANNEL:
-        return object::ObjectKind::Channel;
-    case OBJECT_KIND_PAGER:
-        return object::ObjectKind::Pager;
-    case OBJECT_KIND_IRQ:
-        return object::ObjectKind::Irq;
-    case OBJECT_KIND_INVALID:
-    case OBJECT_KIND_COUNT:
-        return std::nullopt;
-    }
-    return std::nullopt;
+    -> std::optional<ObjKind> {
+    if (raw >= ObjCount || !(OBJ_KINDS & (u64{1} << raw))) return std::nullopt;
+    return static_cast<ObjKind>(raw);
 }
 
 auto make_attenuation_ceiling(
-    object::ObjectKind kind,
+    ObjKind kind,
     const View& source,
     const Attenuation& descriptor) noexcept
     -> std::expected<View, AttenuationError> {
@@ -350,24 +317,24 @@ auto make_attenuation_ceiling(
     const Rights child_rights = rights.value();
 
     switch (kind) {
-    case object::ObjectKind::IoSpace:
-    case object::ObjectKind::Thread:
-    case object::ObjectKind::Sc:
-    case object::ObjectKind::Domain:
-    case object::ObjectKind::CSpace:
-    case object::ObjectKind::Pager:
+    case ObjIoSpace:
+    case ObjThread:
+    case ObjSc:
+    case ObjDomain:
+    case ObjCSpace:
+    case ObjPager:
         if (!words_zero(descriptor, 0)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
         return (View{child_rights, std::monostate{}});
 
-    case object::ObjectKind::Host: {
+    case ObjHost: {
         const HostLimit limit{descriptor.words[0], descriptor.words[1]};
         if (!words_zero(descriptor, 2) || !valid(limit))
             return std::unexpected(AttenuationError::InvalidRange);
         return View{child_rights, limit};
     }
-    case object::ObjectKind::Mem: {
+    case ObjMem: {
         if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -386,7 +353,7 @@ auto make_attenuation_ceiling(
             MemLimit{range, *access}});
     }
 
-    case object::ObjectKind::VSpace: {
+    case ObjVSpace: {
         if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -401,7 +368,7 @@ auto make_attenuation_ceiling(
             return std::unexpected(AttenuationError::InvalidRange);
         }
         const mm::VRange range{
-            mm::Virt{*base}, *size};
+            mm::va_t{*base}, *size};
         if (!range.valid() || range.empty()) {
             return std::unexpected(AttenuationError::InvalidRange);
         }
@@ -410,7 +377,7 @@ auto make_attenuation_ceiling(
             VmLimit{range, *access}});
     }
 
-    case object::ObjectKind::group: {
+    case ObjGroup: {
         if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -422,7 +389,7 @@ auto make_attenuation_ceiling(
                 descriptor.words[2]}});
     }
 
-    case object::ObjectKind::Notification: {
+    case ObjNotification: {
         if (!words_zero(descriptor, 0)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -435,7 +402,7 @@ auto make_attenuation_ceiling(
                   View{child_rights, *upper})};
     }
 
-    case object::ObjectKind::Irq: {
+    case ObjIrq: {
         if (!words_zero(descriptor, 0)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -447,7 +414,7 @@ auto make_attenuation_ceiling(
                   View{child_rights, *upper})};
     }
 
-    case object::ObjectKind::Endpoint: {
+    case ObjEndpoint: {
         if (!words_zero(descriptor, 3)
             || (descriptor.words[0] & ~descriptor.words[1]) != 0
             || descriptor.words[2] > ENDPOINT_MAX_CAPS) {
@@ -464,7 +431,7 @@ auto make_attenuation_ceiling(
                 *cap_limit}});
     }
 
-    case object::ObjectKind::Channel: {
+    case ObjChannel: {
         if (!words_zero(descriptor, 3)
             || (descriptor.words[0] != CAP_CHANNEL_SIDE_A
                 && descriptor.words[0] != CAP_CHANNEL_SIDE_B)) {
@@ -485,8 +452,8 @@ auto make_attenuation_ceiling(
     }
 
 
-    case object::ObjectKind::Invalid:
-    case object::ObjectKind::Count:
+    case ObjInvalid:
+    case ObjCount:
         return std::unexpected(AttenuationError::UnsupportedKind);
     }
     return std::unexpected(AttenuationError::UnsupportedKind);

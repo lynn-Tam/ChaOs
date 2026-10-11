@@ -11,7 +11,7 @@
 
 
 #define BOOT_MAGIC UINT64_C(0x4d594f53494e4954)
-#define BOOT_MAJOR 3U
+#define BOOT_MAJOR 4U
 #define BOOT_MINOR 0U
 
 enum BootRole {
@@ -25,6 +25,8 @@ enum BootRole {
     BOOT_EVENTS = 10,
     BOOT_READY = 14,
     BOOT_IO_HOST = 21,
+    BOOT_FIRMWARE = 22,
+    BOOT_RESOURCE = 23,
 };
 
 #ifdef __cplusplus
@@ -36,46 +38,51 @@ enum BootRole {
 [[nodiscard]] constexpr auto boot_kind(uint32_t kind) noexcept -> obj_kind_t {
     switch (kind) {
     case BOOT_VSPACE:
-        return OBJECT_KIND_VSPACE;
+        return ObjVSpace;
     case BOOT_CSPACE:
-        return OBJECT_KIND_CSPACE;
+        return ObjCSpace;
     case BOOT_POOL:
-        return OBJECT_KIND_RESOURCE_POOL;
+        return ObjGroup;
     case BOOT_DOMAIN:
-        return OBJECT_KIND_SCHED_DOMAIN;
+        return ObjDomain;
     case BOOT_SC:
-        return OBJECT_KIND_SCHED_CONTEXT;
+        return ObjSc;
+    case BOOT_FIRMWARE:
     case BOOT_BUNDLE:
-        return OBJECT_KIND_MEMORY;
+        return ObjMem;
     case BOOT_THREAD:
-        return OBJECT_KIND_THREAD;
+        return ObjThread;
     case BOOT_IO_HOST:
-        return OBJECT_KIND_IO_HOST;
+        return ObjHost;
     case BOOT_EVENTS:
-        return OBJECT_KIND_NOTIFICATION;
+        return ObjNotification;
     case BOOT_READY:
-        return OBJECT_KIND_NOTIFICATION;
+        return ObjNotification;
     default:
-        return OBJECT_KIND_INVALID;
+        return ObjInvalid;
     }
 }
 #endif
 
-// Entries follow the header, with no empty slots. role==0 names a user contract.
-// Selectors name capabilities already installed in the receiving CSpace.
+// role==0 is a userspace contract; BOOT_RESOURCE identifies a firmware node's
+// resource by object kind and index. Metadata never grants hardware access.
 #define BOOT_NAME_MAX 32U
+#define FW_FDT 1U
+struct BootContract {
+    uint32_t protocol;
+    uint16_t major, minor;
+    char name[BOOT_NAME_MAX];
+};
 struct BootCap {
     uint32_t role;
-    uint32_t protocol;
-    uint16_t major;
-    uint16_t minor;
-    uint16_t kind;
-    uint16_t reserved;
+    uint16_t kind, reserved;
     cap_t handle;
-    char name[BOOT_NAME_MAX];
-    // Physical resource metadata; authority always comes from handle.
-    uint64_t phys;
-    uint64_t bytes;
+    union {
+        struct BootContract contract;
+        struct { uint32_t node, index; } resource;
+        struct { uint32_t format; } firmware;
+    };
+    uint64_t phys, bytes;
 };
 
 struct BootHdr {

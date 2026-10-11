@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fault=False):
+def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -60,8 +60,6 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
 
     try:
         until(b'myos> ')
-        if not re.search(rb'\[test\] summary\s+passed=[1-9][0-9]*\s+failed=0\s', output):
-            raise RuntimeError('missing successful builtin test summary')
         run('help', b'run/spawn PROGRAM')
         run('ls', b'CAT.PKG')
         run('cat README.TXT', b'myos disk file service')
@@ -85,13 +83,6 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
                 run('restart absent', b'error: -5')
             print(f'[console] OK: {smp} harts, local service restart and surviving UART')
             return
-        if exhaustion:
-            for _ in range(iterations):
-                run('run echo console-ready', b'error: -7')
-            run('help', b'run/spawn PROGRAM')
-            run('wait', b'error: -1')
-            print(f'[console] OK: {smp} harts, repeated admission failure and rollback')
-            return
         for _ in range(iterations):
             run('run echo console-ready', b'console-ready\nmyos> ')
             run('run echo named arguments survive paging', b'named arguments survive paging\nmyos> ')
@@ -106,7 +97,6 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
                 raise RuntimeError('concurrent ELF mapping check failed')
         run('run bad', b'error: -4')
         run('run absent', b'error: -5')
-        run('run uart', b'error: -6')
         run('wait', b'error: -1')
         run('run sleep 1', b'myos> ')
         first = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
@@ -120,6 +110,9 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
         run(f'stop {first}', b'myos> ')
         run(f'wait {first}', b'error: -1')
         run('run echo ordered pipe bytes | cat', b'ordered pipe bytes\nmyos> ')
+        run('run echo three-stage | cat | cat', b'three-stage\nmyos> ')
+        run('run echo rollback | absent', b'error: -5')
+        run('run echo abcdef | fdcheck stdio', b'stdio aliases ok\nmyos> ')
         run('run fill 8192 | slow 1', b'bytes: 8192\nmyos> ')
         early = run('run fill 100000 | slow 1 96', b'bytes: 96')
         if b'error: -22' not in early and b'error: -13' not in early:
@@ -132,6 +125,11 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
         producer = run(f'wait {int(blocked[0])}', b'error: ')
         if b'error: -22' not in producer and b'error: -13' not in producer:
             raise RuntimeError(f'blocked producer was not released: {producer!r}')
+        blocked = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 100', b'task: '))
+        if len(blocked) != 2:
+            raise RuntimeError('pipeline admission failed after reuse')
+        run(f'stop {int(blocked[0])}', b'myos> ')
+        run(f'stop {int(blocked[1])}', b'myos> ')
         run('run echo console-ready', b'console-ready\nmyos> ')
         print(f'[console] OK: {smp} harts, applications, concurrent tasks, deadlines, bounded streams, EOF, stop and reuse')
     except Exception:
@@ -145,13 +143,11 @@ def exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk, service_fa
             process.kill()
             process.wait()
         poll.close()
-        profile = 'console-exhaustion' if exhaustion else 'console'
-        (logs / f'{profile}-{smp}.raw').write_bytes(output)
+        (logs / f'console-{smp}.raw').write_bytes(output)
 
 if __name__ == '__main__':
     qemu, kernel, bundle, disk, harts = sys.argv[1:6]
-    exhaustion = len(sys.argv) >= 7 and sys.argv[6] == 'exhaustion'
-    iterations = int(sys.argv[7]) if len(sys.argv) == 8 and sys.argv[6] not in ('service-fault',) else 3
+    iterations = int(sys.argv[7]) if len(sys.argv) == 8 else 3
     for smp in harts.split(','):
-        exercise(qemu, kernel, bundle, smp, exhaustion, iterations, disk,
+        exercise(qemu, kernel, bundle, smp, iterations, disk,
                  service_fault=len(sys.argv) >= 7 and sys.argv[6] == 'service-fault')

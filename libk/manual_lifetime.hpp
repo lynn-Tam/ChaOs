@@ -10,19 +10,19 @@
 namespace libk {
 
 template<typename T>
-requires(Object<T> && !std::is_const_v<T>)
-class ManualLifetime{
+requires(std::is_object_v<T> && !std::is_const_v<T>)
+class manual_lifetime{
 public:
-    constexpr ManualLifetime() noexcept = default;
+    constexpr manual_lifetime() noexcept = default;
 
-    ManualLifetime(const ManualLifetime&) = delete;
-    auto operator=(const ManualLifetime&) -> ManualLifetime& = delete;
+    manual_lifetime(const manual_lifetime&) = delete;
+    auto operator=(const manual_lifetime&) -> manual_lifetime& = delete;
 
-    ManualLifetime(ManualLifetime&&) = delete;
-    auto operator=(ManualLifetime&&) -> ManualLifetime& = delete;
+    manual_lifetime(manual_lifetime&&) = delete;
+    auto operator=(manual_lifetime&&) -> manual_lifetime& = delete;
 
     template<typename... Args>
-    requires ConstructibleFrom<T, Args&&...>
+    requires std::constructible_from<T, Args&&...>
     [[nodiscard]] auto emplace(Args&&... args) -> T& {
         libk_assert(!engaged_);
         T* value = libk::construct_at(

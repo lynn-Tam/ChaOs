@@ -1,7 +1,6 @@
 #pragma once
 
 #include <boot/info.hpp>
-#include <libk/inplace_vector.hpp>
 #include <uapi/start.h>
 #include <cap/cspace.hpp>
 #include <cpu/cpu.hpp>
@@ -10,15 +9,8 @@
 #include <ipc/endpoint.hpp>
 #include <ipc/notification.hpp>
 #include <mm/pager.hpp>
-#include <object/group.hpp>
 #include <object/pool.hpp>
 #include <sched/domain.hpp>
-
-struct BootRes {
-    BootCap entry;
-    object::ref<> object;
-    cap::View view;
-};
 
 // Cold ownership only. Runtime code borrows the concrete entities it needs;
 // none of these resources are destroyed while CPUs can still execute.
@@ -33,7 +25,6 @@ struct Boot {
     WorkQueue work;
     object::Objects objects;
     cap::Graph grants;
-    libk::InplaceVector<BootRes, (mm::page_size - sizeof(BootHdr)) / sizeof(BootCap)> resources;
     Cpus cpus;
     object::ref<sched::Domain> domain;
     object::ref<object::group> root;
@@ -49,5 +40,5 @@ enum class BootErr : u8 {
     InvalidModule, InvalidBundle, Ownership, OutOfMemory,
     InvalidState, MappingFailed, CapabilityFailed, SchedulingFailed,
 };
-auto boot_root(Boot&, Cpu&, BootModule, mm::BootPages&&) noexcept
+auto boot_root(Boot&, Cpu&, const BootInfo&, mm::BootPages&&, mm::BootPages&&, HwStart) noexcept
     -> std::expected<void, BootErr>;

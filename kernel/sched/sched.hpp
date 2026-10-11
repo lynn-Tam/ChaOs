@@ -1,12 +1,11 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <optional>
 #include <libk/assert.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/delegate.hpp>
 #include <libk/intrusive_tree.hpp>
-#include <time/time.hpp>
 
 namespace sched {
 
@@ -53,10 +52,10 @@ class Dispatcher;
 // this queue.
 class Deadline final : private libk::noncopyable_nonmovable {
 public:
-    using Callback = libk::delegate<void() noexcept>;
+    using Fn = libk::delegate<void() noexcept>;
 
-    explicit Deadline(Callback callback) noexcept : callback_(callback) {}
-    ~Deadline() noexcept { libk_assert(!armed() && !hook_.is_linked() && callback_); }
+    explicit Deadline(Fn cb) noexcept : cb_(cb) {}
+    ~Deadline() noexcept { libk_assert(!armed() && !hook_.is_linked() && cb_); }
 
     [[nodiscard]] auto armed() const noexcept -> bool {
         return owner_ != nullptr;
@@ -65,10 +64,10 @@ public:
 private:
     friend class Dispatcher;
 
-    libk::IntrusiveTreeHook hook_{};
-    Callback callback_{};
+    libk::intrusive_tree_hook hook_{};
+    Fn cb_{};
     Dispatcher* owner_{};
-    time::Instant when_{};
+    u64 when_{};
 };
 
 } // namespace sched

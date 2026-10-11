@@ -4,12 +4,11 @@
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/scope_guard.hpp>
-#include <libk/span.hpp>
+#include <span>
 #include <utility>
 #include <mm/mem.hpp>
 #include <mm/pager.hpp>
 #include <object/pool.hpp>
-#include <object/group.hpp>
 #include <mm/vspace.hpp>
 #include <boot/info.hpp>
 
@@ -19,14 +18,14 @@ constexpr usize memory_test_pages = 160;
 constexpr usize reserved_pages = 8;
 alignas(mm::page_size) byte
     memory_test_ram[memory_test_pages * mm::page_size]{};
-constinit libk::ManualLifetime<mm::RegionList> memory_test_map{};
-constinit libk::ManualLifetime<mm::Pmm> memory_test_pmm{};
-constinit libk::ManualLifetime<WorkQueue> memory_work{};
-constinit libk::ManualLifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_test_mm{};
+constinit libk::manual_lifetime<mm::RegionList> memory_test_map{};
+constinit libk::manual_lifetime<mm::Pmm> memory_test_pmm{};
+constinit libk::manual_lifetime<WorkQueue> memory_work{};
+constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_test_mm{};
 
-constinit libk::ManualLifetime<mm::Mem> memory_test_object{};
-constinit libk::ManualLifetime<mm::Mem> memory_test_peer{};
-constinit libk::ManualLifetime<mm::Mem> memory_test_staging{};
+constinit libk::manual_lifetime<mm::Mem> memory_test_object{};
+constinit libk::manual_lifetime<mm::Mem> memory_test_peer{};
+constinit libk::manual_lifetime<mm::Mem> memory_test_staging{};
 
 struct StagingReset final {
     ~StagingReset() noexcept {
@@ -38,7 +37,7 @@ struct StagingReset final {
 };
 
 [[nodiscard]] auto page_at(usize offset) noexcept -> mm::Page {
-    const auto physical = boot_layout.phys(mm::Virt{
+    const auto physical = boot_layout.phys(mm::va_t{
         reinterpret_cast<usize>(memory_test_ram)});
     libk_assert(physical);
     const auto address = physical->checked_add(offset * mm::page_size);
@@ -56,14 +55,14 @@ public:
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
         (void)memory_work.emplace();
-        const auto physical = boot_layout.phys(mm::Virt{
+        const auto physical = boot_layout.phys(mm::va_t{
             reinterpret_cast<usize>(memory_test_ram)});
         if (!physical) {
             return false;
         }
         auto& map = memory_test_map.emplace();
         libk_assert(map.try_emplace_back(mm::Region{
-            {*mm::Page::from_base(mm::Phys{0x1000'0000}), 1}, mm::Region::Kind::Mmio}));
+            {*mm::Page::from_base(mm::pa_t{0x1000'0000}), 1}, mm::Region::Kind::Mmio}));
         if (!map.try_emplace_back(mm::Region{
                 mm::Pages{page_at(0), reserved_pages},
                 mm::Region::Kind::Kernel})
@@ -78,7 +77,7 @@ public:
         if (!mm::Pmm::initialize_in(
                 memory_test_pmm, std::move(map), mm::Pmm::Window{
                 .pa = *physical,
-                .va = mm::Virt{
+                .va = mm::va_t{
                     reinterpret_cast<usize>(memory_test_ram)},
                 .size = sizeof(memory_test_ram),
             })) {
@@ -145,7 +144,7 @@ public:
 
     [[nodiscard]] auto pager_ref() noexcept {
         libk_assert(pager_);
-        return pager_.erase();
+        return object::ref<>{pager_};
     }
 
     [[nodiscard]] auto wrong_pager() noexcept -> Pager& {
@@ -153,7 +152,7 @@ public:
         return wrong_pager_.get();
     }
 
-    void keep(object::ref<mm::Mem>&& memory) noexcept {
+    void keep(object::ref<mm::Mem> memory) noexcept {
         libk_assert(!pooled_);
         pooled_ = std::move(memory);
     }
@@ -244,7 +243,7 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
         for (usize index = 1; index < 512; ++index)
             if (root.value()[index] != 0) return false;
         auto middle = pmm.ptr<const u64>(
-            mm::Phys{(root.value()[0] >> 10) << 12}, 512);
+            mm::pa_t{(root.value()[0] >> 10) << 12}, 512);
         if (!middle) return false;
         for (usize index = 0; index < 512; ++index) {
             if (index >= 2) {
@@ -253,7 +252,7 @@ bool test_io_root_isolated_range_and_refund(const TestContext&) noexcept {
             }
             if ((middle.value()[index] & 0x3ff) != 1) return false;
             auto leaves = pmm.ptr<const u64>(
-                mm::Phys{(middle.value()[index] >> 10) << 12}, 512);
+                mm::pa_t{(middle.value()[index] >> 10) << 12}, 512);
             if (!leaves) return false;
             for (usize leaf = 0; leaf < 512; ++leaf) {
                 const u64 expected = leaf == (index == 0 ? 511 : 0)
@@ -383,7 +382,7 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
         mm::Perm::Read, mm::Perm::Execute);
     constexpr auto read_write = mm::Perms::of(
         mm::Perm::Read, mm::Perm::Write);
-    const mm::Page device = *mm::Page::from_base(mm::Phys{0x1000'0000});
+    const mm::Page device = *mm::Page::from_base(mm::pa_t{0x1000'0000});
     const mm::Extent extents[]{
         {
             .object = {0, 2},
@@ -397,7 +396,7 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
         },
     };
 
-    auto memory_ready = fixture.make(3 * mm::page_size, mm::PhysCfg{libk::Span<const mm::Extent>{extents}, {}});
+    auto memory_ready = fixture.make(3 * mm::page_size, mm::PhysCfg{std::span<const mm::Extent>{extents}, {}});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     {
@@ -429,7 +428,7 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
             .perms = read_write,
         },
     };
-    const auto rejected = fixture.make(mm::page_size, mm::PhysCfg{libk::Span<const mm::Extent>{free_extent}, {}});
+    const auto rejected = fixture.make(mm::page_size, mm::PhysCfg{std::span<const mm::Extent>{free_extent}, {}});
     if (rejected
         || rejected.error() != mm::MemErr::OwnershipMismatch) {
         return false;
@@ -448,7 +447,7 @@ bool test_physical_backing_borrows_reserved_and_device_extents(
             .perms = read_write,
         },
     };
-    const auto alias = fixture.make(2 * mm::page_size, mm::PhysCfg{libk::Span<const mm::Extent>{conflicting_extents}, {}});
+    const auto alias = fixture.make(2 * mm::page_size, mm::PhysCfg{std::span<const mm::Extent>{conflicting_extents}, {}});
     if (alias || alias.error() != mm::MemErr::InvalidRange) return false;
     // External physical memory must come from the inventory, not merely
     // lie outside allocator-owned RAM. An arbitrary bus address has no owner.
@@ -473,7 +472,7 @@ bool test_boot_image_distinguishes_borrowed_and_owned_frames(
         },
     };
 
-    auto borrowed_ready = fixture.make(mm::page_size, mm::PhysCfg{libk::Span<const mm::Extent>{borrowed_extent}, {}});
+    auto borrowed_ready = fixture.make(mm::page_size, mm::PhysCfg{std::span<const mm::Extent>{borrowed_extent}, {}});
     if (!borrowed_ready) return false;
     auto& borrowed = **borrowed_ready;
     if (!borrowed_ready) {
@@ -515,7 +514,7 @@ bool test_boot_image_distinguishes_borrowed_and_owned_frames(
         },
     };
 
-    auto image_ready = fixture.make(2 * mm::page_size, mm::PhysCfg{libk::Span<const mm::Extent>{owned_extents}, std::move(owned)});
+    auto image_ready = fixture.make(2 * mm::page_size, mm::PhysCfg{std::span<const mm::Extent>{owned_extents}, std::move(owned)});
     if (!image_ready) return false;
     auto& image = **image_ready;
     if (!image_ready) {
@@ -729,7 +728,7 @@ bool test_pager_backing_donates_owned_page_without_copy(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(2 * mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(2 * mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     const auto pending = memory.materialize(1);
@@ -781,11 +780,11 @@ bool test_pager_supply_moves_staging_owner(
     auto target_pager = fixture.pager_ref();
     auto peer_pager = fixture.pager_ref();
     if (!target_pager) return false;
-    auto target_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(target_pager).value(), access});
+    auto target_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(target_pager), access});
     if (!target_ready) return false;
     auto& target = **target_ready;
     if (!peer_pager) return false;
-    auto peer_ready = fixture.make_peer(mm::page_size, mm::PagedCfg{std::move(peer_pager).value(), access});
+    auto peer_ready = fixture.make_peer(mm::page_size, mm::PagedCfg{std::move(peer_pager), access});
     if (!peer_ready) return false;
     auto& peer = **peer_ready;
     auto staged = mm::Mem::prepare({}, fixture.pmm(), mm::page_size, mm::AnonCfg{.perms = access});
@@ -865,17 +864,14 @@ bool test_two_pager_backings_reject_colliding_claim_owner(
     auto first_pager = fixture.pager_ref();
     auto second_pager = fixture.pager_ref();
     if (!first_pager) return false;
-    auto first_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(first_pager).value(), access});
+    auto first_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(first_pager), access});
     if (!first_ready) return false;
     auto& first = **first_ready;
     if (!second_pager) return false;
-    auto second_ready = fixture.make_peer(mm::page_size, mm::PagedCfg{std::move(second_pager).value(), access});
+    auto second_ready = fixture.make_peer(mm::page_size, mm::PagedCfg{std::move(second_pager), access});
     if (!second_ready) return false;
     auto& second = **second_ready;
-    if (!first_pager || !second_pager
-        || !first_ready
-        || !second_ready
-        || first.materialize(0).error() != mm::MemErr::Pending
+    if (first.materialize(0).error() != mm::MemErr::Pending
         || second.materialize(0).error() != mm::MemErr::Pending) {
         return false;
     }
@@ -932,7 +928,7 @@ bool test_pager_fail_publishes_backing_failure(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     const auto pending = memory.materialize(0);
@@ -974,7 +970,7 @@ bool test_pager_backing_rejects_wrong_pager(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     if (memory.materialize(0).error() != mm::MemErr::Pending) {
@@ -1012,7 +1008,7 @@ bool test_pager_backing_attach_failure_rolls_back(
     if (!pager_ref) {
         return false;
     }
-    const auto initialized = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    const auto initialized = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     return !initialized
         && initialized.error() == mm::MemErr::AttachmentState;
 }
@@ -1029,7 +1025,7 @@ bool test_pager_force_close_publishes_backing_failure(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     if (memory.materialize(0).error() != mm::MemErr::Pending) {
@@ -1053,7 +1049,7 @@ bool test_pager_lease_with_missing_sibling(const TestContext&) noexcept {
 
     auto reference = fixture.pager_ref();
     if (!reference) return false;
-    auto memory_ready = fixture.make(2 * page_size, mm::PagedCfg{std::move(reference).value(), Perms::of(Perm::Read)});
+    auto memory_ready = fixture.make(2 * page_size, mm::PagedCfg{std::move(reference), Perms::of(Perm::Read)});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
@@ -1090,7 +1086,7 @@ bool test_pager_writeback_tracks_new_writes(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
@@ -1144,7 +1140,7 @@ bool test_private_pager_preserves_dirty_content(const TestContext&) noexcept {
 
     auto reference = fixture.pager_ref();
     if (!reference) return false;
-    auto memory_ready = fixture.make(2 * page_size, mm::PagedCfg{std::move(reference).value(), Perms::of(Perm::Read, Perm::Write), true});
+    auto memory_ready = fixture.make(2 * page_size, mm::PagedCfg{std::move(reference), Perms::of(Perm::Read, Perm::Write), true});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire(); });
@@ -1177,7 +1173,7 @@ bool test_pager_forced_close_settles_backing_obligations(
         mm::Perm::Read, mm::Perm::Write);
     auto pager_ref = fixture.pager_ref();
     if (!pager_ref) return false;
-    auto memory_ready = fixture.make(2 * mm::page_size, mm::PagedCfg{std::move(pager_ref).value(), access});
+    auto memory_ready = fixture.make(2 * mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
     if (!memory_ready) return false;
     auto& memory = **memory_ready;
     auto cleanup = libk::on_scope_exit([&memory]() noexcept {
@@ -1247,10 +1243,9 @@ static bool test_pager_requests_follow_mem_lifetime(const TestContext&) noexcept
     auto& pager = f.pager();
     auto ref = f.pager_ref();
     if (!ref) return false;
-    auto mem_ready = f.make(40 * page_size, mm::PagedCfg{std::move(*ref), Perms::of(Perm::Read)});
+    auto mem_ready = f.make(40 * page_size, mm::PagedCfg{std::move(ref), Perms::of(Perm::Read)});
     if (!mem_ready) return false;
     auto& mem = **mem_ready;
-    if (!ref || !mem_ready) return false;
     Pager::Claims worker;
     auto cleanup = libk::on_scope_exit([&]() noexcept { mem.retire(); (void)pager.close(true); });
     for (usize i=0; i<40; ++i)

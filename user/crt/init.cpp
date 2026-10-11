@@ -19,7 +19,7 @@ extern "C" void run_constructors() noexcept {
 }
 
 namespace libk {
-[[noreturn]] void assert_fail(const AssertInfo&) noexcept {
+[[noreturn]] void assert_fail(const assert_info&) noexcept {
     sys::exit();
 }
 } // namespace libk

@@ -1,4 +1,7 @@
+#include <string.h>
 #include <utility>
+#include <variant>
+#include <array>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -9,73 +12,89 @@
 
 #include <sys/start.hpp>
 #include <sys/channel.hpp>
-#include <sys/storage.hpp>
+#include <sys/protocol.hpp>
 
 struct directory {
-    sys::io::ControlMessage batch{};
+    io::ControlMessage batch{};
     char path[81]{};
     uint64_t pos{};
     bool live{}, end{};
 };
 
 namespace {
-cap_t streams[3]{};
-sys::stream::Reader input;
-sys::service::Message input_frame{};
-uint64_t input_offset{};
-bool input_open{}, input_end{};
-constexpr int Fds = 11, Objects = 8;
+constexpr int Fds = 11;
 // VFS and storage-admin sessions precede the per-open sessions.
 constexpr uintptr_t Sessions = 0x76000000, Stride = 0x100000;
-struct open_file {
-    sys::io::ClientSession session;
-    int refs{};
+struct input_stream {
+    sys::cap_owner channel;
+    sys::stream::Reader reader;
+    sys::Message frame{};
+    uint64_t offset{};
 };
-open_file files[Objects];
-int fds[Fds]{};
-sys::store::client vfs;
+struct output_stream { sys::cap_owner channel; };
+struct open_desc {
+    std::variant<std::monostate, input_stream, output_stream, io::ClientSession> data;
+    int refs{}; // fd references and pending completions share this owner.
+    auto queue() noexcept -> io::ClientSession& { return std::get<io::ClientSession>(data); }
+};
+std::array<open_desc, Fds> opened;
+std::array<open_desc*, Fds> fds{};
+io::ClientSession vfs;
 bool connected{};
 cap_t vspace{}, events{};
 cap_t vfs_cap{};
-const void* boot_address{};
-word_t boot_size{};
+cap_t cspace{}, store_admin{};
 cap_t pool{};
-sys::cap::OwnedCap timer;
+sys::cap_owner timer;
 directory dirs[4];
-auto file(int fd) noexcept -> open_file* {
-    if (fd < 3 || fd >= Fds || fds[fd] == 0) return nullptr;
-    return &files[fds[fd] - 1];
+auto desc(int fd) noexcept -> open_desc* {
+    return fd >= 0 && fd < Fds ? fds[fd] : nullptr;
+}
+auto file(int fd) noexcept -> open_desc* {
+    auto* value = desc(fd);
+    return value && std::holds_alternative<io::ClientSession>(value->data) ? value : nullptr;
 }
 auto connect_vfs() noexcept -> status_t {
     if (connected) return STATUS_OK;
     if (!vfs_cap) return STATUS_INVALID_CAP;
-    const auto info = boot::BootView::parse(boot_address, boot_size);
-    if (!info) return STATUS_BAD_ARGS;
-    const auto import = info->selector(boot::Vfs)
-        ? boot::Vfs : boot::VfsRead;
-    const auto status = vfs.connect(*info, import, Sessions);
+    uint64_t value{};
+    const auto status = vfs.connect(vfs_cap, pool, cspace, events,
+        vspace, Sessions, value, true);
     if (status == STATUS_OK) connected = true;
     return status;
 }
 struct pending {
-    open_file* file{};
+    open_desc* file{};
     request_id id{}, wire{};
     int64_t result{};
     bool ready{}, internal{};
 };
-static_assert(IO_DEPTH == sys::io::QueueDepth && IO_LIMIT == sys::io::BufferSize);
+static_assert(IO_DEPTH == io::QueueDepth && IO_LIMIT == io::BufferSize);
 pending requests[IO_DEPTH];
 request_id next_id{};
-auto release(open_file& file) noexcept -> int32_t {
-    return --file.refs ? STATUS_OK : file.session.close();
+auto release(open_desc& value) noexcept -> int32_t {
+    if (value.refs > 1) { --value.refs; return STATUS_OK; }
+    status_t status{};
+    if (auto* input = std::get_if<input_stream>(&value.data)) {
+        status = input->reader.close();
+        if (status != STATUS_OK) return status;
+        status = input->channel.close();
+        if (status != STATUS_OK) return status;
+    } else if (auto* output = std::get_if<output_stream>(&value.data)) {
+        status = output->channel.close();
+        if (status != STATUS_OK) return status;
+    } else status = value.queue().close();
+    value.data.emplace<std::monostate>();
+    value.refs = 0;
+    return status;
 }
-auto enqueue(open_file& file, sys::io::Operation op, void* data, uint64_t size,
+auto enqueue(open_desc& file, io::Operation op, void* data, uint64_t size,
     uint64_t offset, bool implicit, bool internal, pending*& out) noexcept -> int32_t {
     if (next_id == UINT64_MAX || (size && !data)) return STATUS_BAD_ARGS;
     for (auto& item : requests) if (!item.file) {
-        sys::io::Request request{.operation = static_cast<uint64_t>(op),
+        io::Request request{.operation = static_cast<uint64_t>(op),
             .offset = offset, .length = size, .flags = implicit ? 1u : 0u};
-        const auto submitted = file.session.submit(request, data);
+        const auto submitted = file.queue().submit(request, data);
         if (submitted != STATUS_OK) return submitted;
         item = {.file = &file, .id = ++next_id, .wire = request.id, .internal = internal};
         ++file.refs;
@@ -85,9 +104,9 @@ auto enqueue(open_file& file, sys::io::Operation op, void* data, uint64_t size,
     return STATUS_BUSY;
 }
 void pump() noexcept {
-    for (auto& file : files) if (file.refs) {
-        sys::io::Completion result{};
-        while (file.session.completion(result) == STATUS_OK) {
+    for (auto& file : opened) if (std::holds_alternative<io::ClientSession>(file.data)) {
+        io::Completion result{};
+        while (file.queue().completion(result) == STATUS_OK) {
             for (auto& item : requests) if (item.file == &file && item.wire == result.id) {
                 item.result = result.status == STATUS_OK
                     ? static_cast<int64_t>(result.bytes) : result.status;
@@ -98,16 +117,16 @@ void pump() noexcept {
     }
 }
 auto wait() noexcept -> int32_t {
-    for (auto& file : files) if (file.refs && !file.session.requests().error()) {
-        const auto status = file.session.arm();
+    for (auto& file : opened) if (std::holds_alternative<io::ClientSession>(file.data) && !file.queue().requests().error()) {
+        const auto status = file.queue().arm();
         if (status != STATUS_OK) {
-            (void)file.session.requests().fail(status);
+            (void)file.queue().requests().fail(status);
             return STATUS_OK;
         }
     }
     const auto status = sys::notification_wait(events).status;
     if (status != STATUS_OK)
-        for (auto& file : files) if (file.refs) (void)file.session.requests().fail(status);
+        for (auto& file : opened) if (std::holds_alternative<io::ClientSession>(file.data)) (void)file.queue().requests().fail(status);
     return status;
 }
 auto take(pending& item) noexcept -> int64_t {
@@ -117,7 +136,7 @@ auto take(pending& item) noexcept -> int64_t {
     (void)release(*file);
     return result;
 }
-auto drain(open_file* target = nullptr) noexcept -> int32_t {
+auto drain(open_desc* target = nullptr) noexcept -> int32_t {
     for (;;) {
         pump();
         bool active{};
@@ -134,11 +153,11 @@ auto finish(pending& item) noexcept -> int64_t {
         pump();
         if (item.ready) break;
         const auto status = wait();
-        if (status != STATUS_OK) (void)item.file->session.requests().fail(status);
+        if (status != STATUS_OK) (void)item.file->queue().requests().fail(status);
     }
     return take(item);
 }
-auto transfer(open_file& file, sys::io::Operation op, void* data, uint64_t size,
+auto transfer(open_desc& file, io::Operation op, void* data, uint64_t size,
     uint64_t offset, bool explicit_offset) noexcept -> int64_t {
     if (size > INT64_MAX || (size && !data)
         || (explicit_offset && offset > UINT64_MAX - size)) return STATUS_BAD_ARGS;
@@ -161,12 +180,12 @@ auto transfer(open_file& file, sys::io::Operation op, void* data, uint64_t size,
 extern "C" int main(int argc, char** argv);
 
 extern "C" DIR* opendir(const char* path) {
-    if (!path || sys::service::length(path) > 80 || connect_vfs() != STATUS_OK)
+    if (!path || ::strlen(path) > 80 || connect_vfs() != STATUS_OK)
         return nullptr;
     for (auto& dir : dirs) if (!dir.live) {
         dir = {};
-        sys::service::copy(dir.path, path, sys::service::length(path) + 1);
-        if (vfs.list(dir.batch, dir.path) != STATUS_OK) return nullptr;
+        ::memcpy(dir.path, path, ::strlen(path) + 1);
+        if (store::list(vfs, dir.batch, dir.path) != STATUS_OK) return nullptr;
         dir.live = true;
         return &dir;
     }
@@ -180,7 +199,7 @@ extern "C" int32_t readdir(DIR* dir, dirent* entry) {
     while (dir->pos == dir->batch.size) {
         if (dir->end || dir->batch.value == 0) { dir->end = true; return 0; }
         dir->batch = {.value = dir->batch.value};
-        const auto status = vfs.list(dir->batch, dir->path);
+        const auto status = store::list(vfs, dir->batch, dir->path);
         if (status != STATUS_OK) return status;
         dir->pos = 0;
     }
@@ -204,20 +223,26 @@ extern "C" [[noreturn]] void program_start(
     const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
     const auto info = boot::BootView::parse(address, size);
     if (!info) sys::exit(STATUS_BAD_ARGS);
-    streams[STDIN_FILENO] = info->selector(boot::Stdin);
-    streams[STDOUT_FILENO] = info->selector(boot::Stdout);
-    streams[STDERR_FILENO] = info->selector(boot::Stderr);
+    for (int fd = 0; fd < 3; ++fd) {
+        const auto imported = info->selector(fd == 0 ? boot::Stdin : fd == 1 ? boot::Stdout : boot::Stderr);
+        if (!imported) continue;
+        auto& value = opened[fd];
+        if (fd == 0) value.data.emplace<input_stream>().channel = sys::cap_owner{imported};
+        else value.data.emplace<output_stream>().channel = sys::cap_owner{imported};
+        value.refs = 1;
+        fds[fd] = &value;
+    }
     vspace = info->selector(BOOT_VSPACE);
     events = info->selector(BOOT_EVENTS);
     vfs_cap = info->selector(boot::Vfs);
     if (vfs_cap == 0) vfs_cap = info->selector(boot::VfsRead);
-    boot_address = address;
-    boot_size = size;
+    cspace = info->selector(BOOT_CSPACE);
+    store_admin = info->selector(boot::StoreAdmin);
     pool = info->selector(BOOT_POOL);
 
-    boot::Args args;
+    boot::args args;
     if (!args.decode(arg_data, arg_size)) sys::exit(STATUS_BAD_ARGS);
-    char* argv[boot::Args::Max + 1]{};
+    char* argv[boot::args::max + 1]{};
     const auto argc = static_cast<int>(args.count());
     for (int i = 0; i < argc; ++i) argv[i] = const_cast<char*>(args.argument(i));
     sys::exit(main(argc, argv));
@@ -255,7 +280,7 @@ extern "C" int32_t nanosleep(const timespec* delay, timespec* remaining) {
     if (!timer) {
         const auto created = sys::notification_create(pool, 1);
         if (created.status != STATUS_OK) return created.status;
-        timer = sys::cap::OwnedCap{{created.value, 0}};
+        timer = sys::cap_owner{created.value};
     }
     const auto status = sys::notification_wait(timer.selector(), *deadline).status;
     if (status == STATUS_TIMED_OUT) {
@@ -277,49 +302,52 @@ extern "C" int32_t nanosleep(const timespec* delay, timespec* remaining) {
 extern "C" int32_t open(const char* path, uint32_t flags) {
     if (!path || !vfs_cap || (flags & ~(3u | O_CREAT | O_TRUNC | O_EXCL | O_APPEND)) != 0
         || (flags & 3u) == 3u) return STATUS_BAD_ARGS;
-    const uint32_t access = flags & 3u;
-    if (access == O_RDONLY && (flags & (O_CREAT | O_TRUNC | O_EXCL | O_APPEND)))
+    const uint32_t mode = flags & 3u;
+    if (mode == O_RDONLY && (flags & (O_CREAT | O_TRUNC | O_EXCL | O_APPEND)))
         return STATUS_BAD_ARGS;
-    int fd = 3, slot = 0;
+    int fd = 0, slot = 0;
     while (fd < Fds && fds[fd]) ++fd;
-    while (slot < Objects && files[slot].refs) ++slot;
-    if (fd == Fds || slot == Objects) return STATUS_NO_MEMORY;
+    while (slot < Fds && !std::holds_alternative<std::monostate>(opened[slot].data)) ++slot;
+    if (fd == Fds || slot == Fds) return STATUS_NO_MEMORY;
     const auto connected_status = connect_vfs();
     if (connected_status != STATUS_OK) return connected_status;
-    uint64_t backend = access == O_RDONLY ? sys::store::Read
-        : access == O_WRONLY ? sys::store::Write
-        : sys::store::Read | sys::store::Write;
-    if (flags & O_CREAT) backend |= sys::store::Create;
-    if (flags & O_TRUNC) backend |= sys::store::Truncate;
-    if (flags & O_EXCL) backend |= sys::store::Exclusive;
-    if (flags & O_APPEND) backend |= sys::store::Append;
-    sys::cap::OwnedCap object;
+    uint64_t backend = mode == O_RDONLY ? store::Read
+        : mode == O_WRONLY ? store::Write
+        : store::Read | store::Write;
+    if (flags & O_CREAT) backend |= store::Create;
+    if (flags & O_TRUNC) backend |= store::Truncate;
+    if (flags & O_EXCL) backend |= store::Exclusive;
+    if (flags & O_APPEND) backend |= store::Append;
+    sys::cap_owner object;
     uint64_t length{}, expected{};
-    auto status = vfs.open(path, backend, object, length, expected);
+    auto status = store::open(vfs, path, backend, object, length, expected);
     if (status != STATUS_OK) return status;
     uint64_t generation{};
-    status = files[slot].session.adopt(std::move(object), events, vspace,
-        Sessions + (slot + 2) * Stride, generation, access != O_RDONLY);
-    if (status != STATUS_OK) return status;
+    auto& session = opened[slot].data.emplace<io::ClientSession>();
+    status = session.adopt(std::move(object), events, vspace,
+        Sessions + (slot + 2) * Stride, generation, mode != O_RDONLY);
+    if (status != STATUS_OK) { opened[slot].data.emplace<std::monostate>(); return status; }
     if (generation != expected) {
-        (void)files[slot].session.close();
+        (void)session.close();
+        opened[slot].data.emplace<std::monostate>();
         return STATUS_PEER_FAULT;
     }
-    files[slot].refs = 1;
-    fds[fd] = slot + 1;
+    opened[slot].refs = 1;
+    fds[fd] = &opened[slot];
     return fd;
 }
 
 extern "C" int32_t close(int32_t fd) {
-    auto* opened = file(fd);
-    if (!opened) return STATUS_BAD_ARGS;
-    fds[fd] = 0;
-    return release(*opened);
+    auto* value = desc(fd);
+    if (!value) return STATUS_BAD_ARGS;
+    const auto status = release(*value);
+    if (status == STATUS_OK || std::holds_alternative<std::monostate>(value->data)) fds[fd] = nullptr;
+    return status;
 }
 
 extern "C" int32_t mkstemp(char* path) {
     if (!path) return STATUS_BAD_ARGS;
-    const auto size = sys::service::length(path);
+    const auto size = ::strlen(path);
     if (size < 6) return STATUS_BAD_ARGS;
     for (size_t i = size - 6; i < size; ++i)
         if (path[i] != 'X') return STATUS_BAD_ARGS;
@@ -343,51 +371,47 @@ extern "C" int32_t mkstemp(char* path) {
 }
 
 extern "C" int32_t dup(int32_t fd) {
-    auto* opened = file(fd);
-    if (!opened) return STATUS_BAD_ARGS;
-    for (int next = 3; next < Fds; ++next) if (!fds[next]) {
-        fds[next] = fds[fd];
-        ++opened->refs;
+    auto* value = desc(fd);
+    if (!value) return STATUS_BAD_ARGS;
+    for (int next = 0; next < Fds; ++next) if (!fds[next]) {
+        fds[next] = value;
+        ++value->refs;
         return next;
     }
     return STATUS_NO_MEMORY;
 }
 
 extern "C" int64_t read(int32_t fd, void* data, uint64_t size) {
-    if (fd == STDIN_FILENO) {
-        if (size > INT64_MAX || (size && !data)) return STATUS_BAD_ARGS;
-        if (!input_open) {
-            const auto status = input.open(streams[STDIN_FILENO], events);
+    auto* value = desc(fd);
+    if (!value || size > INT64_MAX || (size && !data)) return STATUS_BAD_ARGS;
+    if (auto* input = std::get_if<input_stream>(&value->data)) {
+        if (size == 0) return 0;
+        if (!input->reader) {
+            const auto status = input->reader.open(input->channel.selector(), events);
             if (status != STATUS_OK) return status;
-            input_open = true;
         }
-        if (size == 0 || input_end) return 0;
-        if (input_offset == input_frame.size) {
-            const auto status = input.read(input_frame);
+        if (input->offset == input->frame.size) {
+            const auto status = input->reader.read(input->frame);
             if (status != STATUS_OK) return status;
-            if (input_frame.size == 0) { input_end = true; return 0; }
-            input_offset = 0;
+            input->offset = 0;
         }
-        const auto available = input_frame.size - input_offset;
-        const auto count = size < available ? size : available;
-        sys::service::copy(data, input_frame.data + input_offset, count);
-        input_offset += count;
+        const auto count = std::min(size, input->frame.size - input->offset);
+        ::memcpy(data, input->frame.data + input->offset, count);
+        input->offset += count;
         return count;
     }
-    auto* opened = file(fd);
-    return opened ? transfer(*opened, sys::io::Operation::Read, data, size, 0, false)
-        : STATUS_BAD_ARGS;
+    return file(fd) ? transfer(*value, io::Operation::Read, data, size, 0, false) : STATUS_BAD_ARGS;
 }
 
 extern "C" int64_t pread(int32_t fd, void* data, uint64_t size, uint64_t offset) {
     auto* opened = file(fd);
-    return opened ? transfer(*opened, sys::io::Operation::Read, data, size, offset, true)
+    return opened ? transfer(*opened, io::Operation::Read, data, size, offset, true)
         : STATUS_BAD_ARGS;
 }
 
 extern "C" int64_t pwrite(int32_t fd, const void* data, uint64_t size, uint64_t offset) {
     auto* opened = file(fd);
-    return opened ? transfer(*opened, sys::io::Operation::Write,
+    return opened ? transfer(*opened, io::Operation::Write,
         const_cast<void*>(data), size, offset, true) : STATUS_BAD_ARGS;
 }
 
@@ -397,7 +421,7 @@ extern "C" int32_t submit(const io_request* request, request_id* id) {
     auto* opened = file(request->fd);
     if (!opened) return STATUS_BAD_ARGS;
     pending* item{};
-    const auto status = enqueue(*opened, static_cast<sys::io::Operation>(request->operation),
+    const auto status = enqueue(*opened, static_cast<io::Operation>(request->operation),
         request->data, request->length, request->offset, false, false, item);
     if (status == STATUS_OK) *id = item->id;
     return status;
@@ -426,9 +450,9 @@ extern "C" int32_t cancel(request_id id) {
     pump();
     for (auto& item : requests) if (item.file && item.id == id && !item.internal) {
         if (item.ready) return STATUS_BUSY;
-        sys::io::ControlMessage request{
-            .operation = static_cast<uint64_t>(sys::io::Control::Cancel), .value = item.wire};
-        const auto status = item.file->session.exchange(request);
+        io::ControlMessage request{
+            .operation = static_cast<uint64_t>(io::Control::Cancel), .value = item.wire};
+        const auto status = item.file->queue().exchange(request);
         return status == STATUS_NOT_FOUND ? STATUS_BUSY : status;
     }
     return STATUS_NOT_FOUND;
@@ -437,28 +461,28 @@ extern "C" int32_t cancel(request_id id) {
 extern "C" int32_t fsync(int32_t fd) {
     auto* opened = file(fd);
     if (!opened) return STATUS_BAD_ARGS;
-    if (opened->session.requests().error()) return opened->session.requests().error();
+    if (opened->queue().requests().error()) return opened->queue().requests().error();
     const auto drained = drain(opened);
     if (drained != STATUS_OK) return drained;
-    if (opened->session.requests().error()) return opened->session.requests().error();
-    sys::io::ControlMessage request{
-        .operation = static_cast<uint64_t>(sys::io::Control::Sync)};
-    return opened->session.exchange(request);
+    if (opened->queue().requests().error()) return opened->queue().requests().error();
+    io::ControlMessage request{
+        .operation = static_cast<uint64_t>(io::Control::Sync)};
+    return opened->queue().exchange(request);
 }
 
 extern "C" int32_t sync(void) {
     const auto status = drain();
     if (status != STATUS_OK) return status;
     const auto connected = connect_vfs();
-    return connected == STATUS_OK ? vfs.sync() : connected;
+    return connected == STATUS_OK ? store::sync(vfs) : connected;
 }
 
 extern "C" int32_t fstat(int32_t fd, struct stat* info) {
     auto* opened = file(fd);
     if (!opened || !info) return STATUS_BAD_ARGS;
-    if (opened->session.requests().error()) return opened->session.requests().error();
-    sys::io::ControlMessage request{.operation = static_cast<uint64_t>(sys::io::Control::Stat)};
-    const auto status = opened->session.exchange(request);
+    if (opened->queue().requests().error()) return opened->queue().requests().error();
+    io::ControlMessage request{.operation = static_cast<uint64_t>(io::Control::Stat)};
+    const auto status = opened->queue().exchange(request);
     if (status == STATUS_OK) info->size = request.value;
     return status;
 }
@@ -466,7 +490,7 @@ extern "C" int32_t fstat(int32_t fd, struct stat* info) {
 extern "C" int32_t mkdir(const char* path) {
     if (!path) return STATUS_BAD_ARGS;
     const auto status = connect_vfs();
-    return status == STATUS_OK ? vfs.mkdir(path) : status;
+    return status == STATUS_OK ? store::mkdir(vfs, path) : status;
 }
 
 extern "C" int32_t device_id(uint8_t id[20]) {
@@ -474,8 +498,8 @@ extern "C" int32_t device_id(uint8_t id[20]) {
     const auto status = connect_vfs();
     if (status != STATUS_OK) return status;
     uint8_t bytes[20]{};
-    const auto result = vfs.device_id(bytes);
-    if (result == STATUS_OK) sys::service::copy(id, bytes, sizeof(bytes));
+    const auto result = store::device_id(vfs, bytes);
+    if (result == STATUS_OK) ::memcpy(id, bytes, sizeof(bytes));
     return result;
 }
 
@@ -484,19 +508,19 @@ extern "C" int32_t volume_id(uint8_t id[16]) {
     const auto status = connect_vfs();
     if (status != STATUS_OK) return status;
     uint8_t bytes[16]{};
-    const auto result = vfs.volume_id(bytes);
-    if (result == STATUS_OK) sys::service::copy(id, bytes, sizeof(bytes));
+    const auto result = store::volume_id(vfs, bytes);
+    if (result == STATUS_OK) ::memcpy(id, bytes, sizeof(bytes));
     return result;
 }
 
 extern "C" int32_t format_volume(const uint8_t* id, uint32_t size) {
     if ((size != 0 && size != 16) || (size && !id)) return STATUS_BAD_ARGS;
-    const auto info = boot::BootView::parse(boot_address, boot_size);
-    if (!info) return STATUS_BAD_ARGS;
-    if (!info->selector(boot::StoreAdmin)) return STATUS_DENIED;
-    sys::store::client admin;
-    auto status = admin.connect(*info, boot::StoreAdmin, Sessions + Stride);
-    if (status == STATUS_OK) status = admin.format(size ? id : nullptr);
+    if (!store_admin) return STATUS_DENIED;
+    io::ClientSession admin;
+    uint64_t value{};
+    auto status = admin.connect(store_admin, pool, cspace, events,
+        vspace, Sessions + Stride, value, true);
+    if (status == STATUS_OK) status = store::format(admin, size ? id : nullptr);
     const auto closed = admin.close();
     return status == STATUS_OK ? closed : status;
 }
@@ -504,32 +528,33 @@ extern "C" int32_t format_volume(const uint8_t* id, uint32_t size) {
 extern "C" int32_t unlink(const char* path) {
     if (!path) return STATUS_BAD_ARGS;
     const auto status = connect_vfs();
-    return status == STATUS_OK ? vfs.remove(path) : status;
+    return status == STATUS_OK ? store::remove(vfs, path) : status;
 }
 
 extern "C" int32_t rename(const char* from, const char* to) {
     if (!from || !to) return STATUS_BAD_ARGS;
     const auto status = connect_vfs();
-    return status == STATUS_OK ? vfs.rename(from, to) : status;
+    return status == STATUS_OK ? store::rename(vfs, from, to) : status;
 }
 
 extern "C" int64_t write(int32_t fd, const void* data, uint64_t size) {
     if (auto* opened = file(fd))
-        return transfer(*opened, sys::io::Operation::Write,
+        return transfer(*opened, io::Operation::Write,
             const_cast<void*>(data), size, 0, false);
-    if (fd != STDOUT_FILENO && fd != STDERR_FILENO) return STATUS_BAD_ARGS;
+    auto* value = desc(fd);
+    auto* output = value ? std::get_if<output_stream>(&value->data) : nullptr;
+    if (!output) return STATUS_BAD_ARGS;
     if ((size != 0 && data == nullptr) || size > INT64_MAX) return STATUS_BAD_ARGS;
-    const auto output = streams[fd];
-    if (output == 0) return STATUS_INVALID_CAP;
+
     const auto* bytes = static_cast<const char*>(data);
     uint64_t done{};
     while (done < size) {
-        sys::service::Message message{};
+        sys::Message message{};
         const auto chunk = size - done < sizeof(message.data)
             ? size - done : sizeof(message.data);
         message.size = chunk;
-        sys::service::copy(message.data, bytes + done, chunk);
-        const auto status = sys::service::send(output, message).status;
+        ::memcpy(message.data, bytes + done, chunk);
+        const auto status = sys::send(output->channel.selector(), message).status;
         if (status != STATUS_OK) return done != 0 ? done : status;
         done += chunk;
     }

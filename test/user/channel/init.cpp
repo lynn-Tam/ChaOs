@@ -1,25 +1,31 @@
-#include <servers/runtime/service.hpp>
-#include <sys/handle.hpp>
-#include <servers/deploy/launch.hpp>
+#include <sys/channel.hpp>
+#include <sys/fw.hpp>
+#include <test/user/task.hpp>
 #include <servers/uart/port.hpp>
 
-namespace { deploy::program program; deploy::tasks<1> supervisor; }
+namespace { proc::package program; proc::tasks<1> supervisor; }
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
-        cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
+    const auto info = sys::bootstrap(address, size);
+    auto fw = Firmware::open(info, 0x41000000);
+    if (!fw) exit(fw.error());
+    auto mapping = mapping::map(sys::capability(info, BOOT_VSPACE),
+        cap_owner{fw->console(ObjMem)},
         0x30010000, 4096, VM_READ | VM_WRITE);
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping->address};
     port.reset();
     supervisor.open(info);
-    service::require(supervisor.load(program, info));
-    service::require(supervisor.add_boot_sources(info));
-    status_t status{};
-    auto task = supervisor.launch(program, "channel-test", status);
-    if (task) status = supervisor.wait(*task);
+    open(program, info);
+    const proc::cap_src caps[]{
+        {.role = BOOT_DOMAIN, .cap = info.selector(BOOT_DOMAIN), .limit = word_t{RIGHT_CONTROL | RIGHT_DUPLICATE}},
+        {.role = BOOT_BUNDLE, .cap = info.selector(BOOT_BUNDLE), .limit = word_t{RIGHT_MAP | RIGHT_DELEGATE | RIGHT_DUPLICATE | RIGHT_INSPECT}}};
+    const auto task = start(supervisor, program, "channel-test", {.caps = caps,
+        .resources = {.bytes = 32 * 1024 * 1024, .caps = 2048,
+            .kinds = proc::base_kinds | OBJ_BIT(ObjChannel), .slots = 512, .pages = 68,
+            .pool_perms = RIGHT_CREATE | RIGHT_SPLIT}});
+    const auto status = wait(supervisor, task);
     if (status != STATUS_OK) {
         uart::Printer printer{uart::Writer{port}};
         (void)printer.print<"[channel] failed status={}\n">(status);

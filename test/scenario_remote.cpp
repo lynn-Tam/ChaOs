@@ -4,7 +4,6 @@
 
 #include <cpu.hpp>
 #include <boot/start.hpp>
-#include <test/boot.hpp>
 #include <cpu/cpu.hpp>
 #include <console.hpp>
 #include <utility>
@@ -17,21 +16,21 @@ namespace test::scenario {
 namespace {
 
 struct RemoteState final {
-    libk::Atomic<u32> entered{};
-    libk::Atomic<u32> release{};
-    libk::Atomic<u32> returned{};
+    std::atomic<u32> entered{};
+    std::atomic<u32> release{};
+    std::atomic<u32> returned{};
 };
 
 void remote_entry(void* argument) noexcept {
     auto& state = *static_cast<RemoteState*>(argument);
-    state.entered.store<libk::MemoryOrder::Release>(1);
-    while (state.release.load<libk::MemoryOrder::Acquire>() == 0) {
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+    state.entered.store(1, std::memory_order_release);
+    while (state.release.load(std::memory_order_acquire) == 0) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
     // Thread::start() performs the scheduler Exit commit after this entry
     // returns.  This second marker therefore brackets the production task
     // entry rather than fabricating a local queue completion.
-    state.returned.store<libk::MemoryOrder::Release>(1);
+    state.returned.store(1, std::memory_order_release);
 }
 
 [[nodiscard]] auto remote_target(
@@ -72,8 +71,8 @@ auto remote(Cpu& runtime) noexcept -> bool {
         return false;
     }
     auto thread = std::move(pending_thread).value().publish();
-    const auto budget = kernel.clock.duration_from_nanoseconds(1'000'000);
-    const auto period = kernel.clock.duration_from_nanoseconds(10'000'000);
+    const auto budget = kernel.clock.ticks<1, time::ms>();
+    const auto period = kernel.clock.ticks<10, time::ms>();
     if (!budget || !period) {
         static_cast<void>(thread.retire());
         thread.reset();
@@ -82,7 +81,7 @@ auto remote(Cpu& runtime) noexcept -> bool {
     }
     auto pending_context = kernel.objects.get<sched::Sc>().create(
         sched::Sc::Config{.budget = *budget, .period = *period},
-        kernel.clock.now());
+        kernel.clock.rd_ticks());
     if (!pending_context) {
         static_cast<void>(thread.retire());
         thread.reset();
@@ -92,9 +91,9 @@ auto remote(Cpu& runtime) noexcept -> bool {
     auto context = std::move(pending_context).value().publish();
     auto admitted = kernel.domain.get().admit(
         context.get(), target->id);
-    auto target_ref = thread.clone();
+    auto target_ref = thread;
     if (!admitted || !target_ref
-        || !context->bind(std::move(target_ref).value())) {
+        || !context->bind(std::move(target_ref))) {
         if (context->admitted()) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
@@ -118,20 +117,20 @@ auto remote(Cpu& runtime) noexcept -> bool {
         : decltype(started){std::unexpected(
               sched::Dispatcher::WakeError::Unavailable)};
     constexpr usize wait_spins = 1U << 22;
-    bool entered = state.entered.load<libk::MemoryOrder::Acquire>() != 0;
+    bool entered = state.entered.load(std::memory_order_acquire) != 0;
     for (usize spin = 0; !entered && spin < wait_spins; ++spin) {
-        entered = state.entered.load<libk::MemoryOrder::Acquire>() != 0;
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        entered = state.entered.load(std::memory_order_acquire) != 0;
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
-    state.release.store<libk::MemoryOrder::Release>(1);
+    state.release.store(1, std::memory_order_release);
     // Exited and an empty Sc binding precede the final home-owner release.
     // Observe the real completion cut instead of racing retirement against it.
     bool stopped = thread->stopped();
     for (usize spin = 0; entered && !stopped && spin < wait_spins; ++spin) {
         stopped = thread->stopped();
-        libk::atomic_signal_fence<libk::MemoryOrder::SeqCst>();
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
-    const bool returned = state.returned.load<libk::MemoryOrder::Acquire>() != 0;
+    const bool returned = state.returned.load(std::memory_order_acquire) != 0;
     const bool released = stopped && !context->bound();
 
     const bool unadmitted = static_cast<bool>(

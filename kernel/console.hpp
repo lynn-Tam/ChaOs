@@ -1,9 +1,9 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu.hpp>
 #include <libk/fmt.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <libk/ticket_lock.hpp>
 #include <sync.hpp>
 #include <utility>
 
@@ -29,7 +29,7 @@ void raw(Args&&... arguments) noexcept {
 // A leaf lock: firmware output acquires no kernel locks. Mask IRQs so the
 // current CPU cannot reenter it. Panic uses raw after claiming its sole writer,
 // since a stopped peer may retain this lock.
-inline constinit libk::TicketSpinLock mutex;
+inline constinit libk::ticket_lock mutex;
 template<libk::fmt::fixed_string Format, typename... Args>
 void print(Args&&... arguments) noexcept {
     sync::Lock guard{mutex};

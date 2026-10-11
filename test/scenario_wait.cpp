@@ -19,7 +19,7 @@
 namespace test::scenario {
 namespace {
 struct WaitState final {
-    libk::Atomic<u32> ran{};
+    std::atomic<u32> ran{};
 };
 
 struct DeferredResult final {
@@ -70,23 +70,23 @@ auto cancellation_publication(Thread& thread, Cpus& cpus) noexcept -> bool {
 struct VmPeer final {
     mm::VSpace& space;
     Boot& kernel;
-    libk::Atomic<bool> entered{}, release{}, expired{};
+    std::atomic<bool> entered{}, release{}, expired{};
 };
 
 void vm_peer_entry(void* argument) noexcept {
     auto& peer = *static_cast<VmPeer*>(argument);
-    const auto duration = peer.kernel.clock.duration_from_nanoseconds(1'000'000'000);
+    const auto duration = peer.kernel.clock.ticks<1, time::s>();
     libk_assert(duration);
-    const auto deadline = peer.kernel.clock.now().checked_add(*duration);
+    const auto deadline = libk::checked_add(peer.kernel.clock.rd_ticks(), *duration);
     libk_assert(deadline);
     // Install the real SATP root before withholding its shootdown IPI. Never
     // manufacture an active-cpu bit or acknowledge a ticket from the test.
     sync::Irq interrupts;
     peer.space.root().activate(current_cpu());
-    peer.entered.store<libk::MemoryOrder::Release>(true);
-    while (!peer.release.load<libk::MemoryOrder::Acquire>()) {
-        if (peer.kernel.clock.now() >= *deadline) {
-            peer.expired.store<libk::MemoryOrder::Release>(true);
+    peer.entered.store(true, std::memory_order_release);
+    while (!peer.release.load(std::memory_order_acquire)) {
+        if (peer.kernel.clock.rd_ticks() >= *deadline) {
+            peer.expired.store(true, std::memory_order_release);
             break;
         }
     }
@@ -122,12 +122,12 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
 
     });
     const mm::VmCtx context{&cpus, local};
-    const mm::VRange range{mm::Virt{0x70000000}, mm::page_size};
+    const mm::VRange range{mm::va_t{0x70000000}, mm::page_size};
     const auto access = mm::Perms::of(mm::Perm::Read);
-    auto reference = memory.erase();
+    auto reference = object::ref<>{memory};
     libk_assert(reference);
     auto mapped =
-        space->map(context, {range, {0, 1}, access}, std::move(reference).value(), memory.get(),
+        space->map(context, {range, {0, 1}, access}, std::move(reference), memory.get(),
                    {.range = {0, 1}, .perms = access});
     libk_assert(mapped && mapped.value().status == mm::VmStatus::Complete);
     VmPeer peer{space.get(), kernel};
@@ -138,40 +138,40 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
                                       Thread::KernelStart{vm_peer_entry, &peer});
     libk_assert(thread_pending);
     auto thread = std::move(thread_pending).value().publish();
-    auto budget = kernel.clock.duration_from_nanoseconds(1'000'000);
-    auto period = kernel.clock.duration_from_nanoseconds(10'000'000);
+    auto budget = kernel.clock.ticks<1, time::ms>();
+    auto period = kernel.clock.ticks<10, time::ms>();
     libk_assert(budget && period);
     auto sc_pending = kernel.objects.get<sched::Sc>().create(sched::Sc::Config{.budget = *budget, .period = *period},
-                                                     kernel.clock.now());
+                                                     kernel.clock.rd_ticks());
     libk_assert(sc_pending);
     auto sc = std::move(sc_pending).value().publish();
-    auto clone = thread.clone();
+    auto clone = thread;
     libk_assert(clone && kernel.domain.get().admit(sc.get(), *remote));
-    libk_assert(sc->bind(std::move(clone).value()));
+    libk_assert(sc->bind(std::move(clone)));
     libk_assert(sched::start(cpus, sc.get()));
-    while (!peer.entered.load<libk::MemoryOrder::Acquire>()) sched::yield();
+    while (!peer.entered.load(std::memory_order_acquire)) sched::yield();
     bool passed{};
     {
         sync::Irq interrupts;
         const auto unmapped = space->unmap(context, range);
         libk_assert(unmapped && unmapped.value() == mm::VmStatus::Pending);
-        auto target = space.erase();
+        auto target = object::ref<>{space};
         libk_assert(target);
         auto& current = *current_cpu().current;
-        mm::Fence wait{std::move(target).value(), space.get()};
+        mm::Fence wait{std::move(target), space.get()};
         libk_assert(current.begin_wait(wait.completion(), cpus));
         wait.start();
         libk_assert(space->pending() && !current.current_wait().ready());
-        peer.release.store<libk::MemoryOrder::Release>(true);
-        const auto duration = kernel.clock.duration_from_nanoseconds(1'000'000'000);
+        peer.release.store(true, std::memory_order_release);
+        const auto duration = kernel.clock.ticks<1, time::s>();
         libk_assert(duration);
-        const auto deadline = kernel.clock.now().checked_add(*duration);
+        const auto deadline = libk::checked_add(kernel.clock.rd_ticks(), *duration);
         libk_assert(deadline);
         interrupts.restore();
-        while (!current.current_wait().ready() && kernel.clock.now() < *deadline)
+        while (!current.current_wait().ready() && kernel.clock.rd_ticks() < *deadline)
             sched::yield();
         passed = current.current_wait().ready() && !space->pending() &&
-                 !peer.expired.load<libk::MemoryOrder::Acquire>();
+                 !peer.expired.load(std::memory_order_acquire);
         libk_assert(passed);
         current.cancel_wait();
         libk_assert(!current.current_wait().attached());
@@ -203,9 +203,9 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     auto pg = k.objects.get<Pager>().create();
     if (!pg) return false;
     auto pager = std::move(*pg).publish();
-    auto pg_ref = pager.erase();
+    auto pg_ref = object::ref<>{pager};
     if (!pg_ref) return false;
-    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, page_size, mm::PagedCfg{std::move(*pg_ref), Perms::of(Perm::Read, Perm::Write), false});
+    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, page_size, mm::PagedCfg{std::move(pg_ref), Perms::of(Perm::Read, Perm::Write), false});
     if (!pending) return false;
     auto mem = std::move(*pending).publish();
     auto a = k.objects.get<mm::VSpace>().create(
@@ -234,15 +234,15 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     };
     if (mem->materialize(0).error() != MemErr::Pending || !supply()) return false;
     const VmCtx ctx{&cpus, rt.id};
-    const VRange range{Virt{0x72000000}, page_size};
+    const VRange range{va_t{0x72000000}, page_size};
     const auto perms = Perms::of(Perm::Read, Perm::Write);
     MapId ids[2];
     usize i{};
     for (auto* space : {&first.get(), &second.get()}) {
-        auto ref = mem.erase();
+        auto ref = object::ref<>{mem};
         if (!ref) return false;
         auto map =
-            space->map(ctx, {range, {0, 1}, perms}, std::move(*ref), mem.get(),
+            space->map(ctx, {range, {0, 1}, perms}, std::move(ref), mem.get(),
                        {.range = {0, 1}, .perms = perms});
         if (!map) return false;
         auto fault = space->fault(ctx, range.base(), Perm::Read);
@@ -282,7 +282,7 @@ void wait_entry(void* argument) noexcept {
     auto& cpu = current_cpu();
     const bool passed = cancellation_publication(*cpu.current, *cpu.cpus) &&
                         pending_vm_wait(cpu) && live_trim(cpu);
-    state.ran.store<libk::MemoryOrder::Release>(passed ? 1 : 2);
+    state.ran.store(passed ? 1 : 2, std::memory_order_release);
     sched::exit_current();
 }
 } // namespace
@@ -305,8 +305,8 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
         return false;
     }
     auto thread = std::move(pending_thread).value().publish();
-    const auto budget = kernel.clock.duration_from_nanoseconds(1'000'000);
-    const auto period = kernel.clock.duration_from_nanoseconds(10'000'000);
+    const auto budget = kernel.clock.ticks<1, time::ms>();
+    const auto period = kernel.clock.ticks<10, time::ms>();
     if (!budget || !period) {
         static_cast<void>(thread.retire());
         thread.reset();
@@ -314,7 +314,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
         return false;
     }
     auto pending_context = kernel.objects.get<sched::Sc>().create(
-        sched::Sc::Config{.budget = *budget, .period = *period}, kernel.clock.now());
+        sched::Sc::Config{.budget = *budget, .period = *period}, kernel.clock.rd_ticks());
     if (!pending_context) {
         static_cast<void>(thread.retire());
         thread.reset();
@@ -324,8 +324,8 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     auto context = std::move(pending_context).value().publish();
     const CpuId cpu = runtime.id;
     auto admitted = kernel.domain.get().admit(context.get(), cpu);
-    auto target = thread.clone();
-    if (!admitted || !target || !context->bind(std::move(target).value())) {
+    auto target = thread;
+    if (!admitted || !target || !context->bind(std::move(target))) {
         if (context->admitted()) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
@@ -359,7 +359,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     context.reset();
     thread.reset();
 
-    const bool result = started && state.ran.load<libk::MemoryOrder::Acquire>() == 1 && context_unbound &&
+    const bool result = started && state.ran.load(std::memory_order_acquire) == 1 && context_unbound &&
                         unadmitted && context_retired && thread_retired;
     if (result) console::print<"[scenario] wait publication ok\n">();
     return result;

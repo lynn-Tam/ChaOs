@@ -11,7 +11,6 @@
 #include <cap/cap.hpp>
 #include <task/thread.hpp>
 #include <utility>
-#include <object/group.hpp>
 #include <ipc/notification.hpp>
 #include <resource/sponsorship.hpp>
 #include <irq/irq.hpp>
@@ -30,12 +29,12 @@ namespace syscall {
 
 template<usize op>
 auto clock_now(Call& inv) noexcept -> Result {
-    return returned(STATUS_OK, inv.cpu.dispatcher().clock().now().ticks());
+    return returned(STATUS_OK, inv.cpu.dispatcher().clock().rd_ticks());
 }
 
 template<usize op>
 auto clock_frequency(Call& inv) noexcept -> Result {
-    return returned(STATUS_OK, inv.cpu.dispatcher().clock().ticks_per_second());
+    return returned(STATUS_OK, inv.cpu.dispatcher().clock().rd_freq());
 }
 
 auto cap_status(cap::CSpaceError error) noexcept -> status_t {
@@ -67,7 +66,7 @@ auto read_desc_bytes(
     Call& inv,
     cap::Handle handle,
     usize offset,
-    libk::Span<byte> dest) noexcept
+    std::span<byte> dest) noexcept
     -> std::expected<void, status_t> {
     auto resolved = inv.cspace.resolve<mm::Mem>(
         handle, cap::Rights::of(cap::Right::Inspect));
@@ -167,7 +166,7 @@ auto perms_of(usize raw) noexcept -> std::optional<mm::Perms> {
 
 auto range_of(usize base, usize size) noexcept
     -> std::optional<mm::VRange> {
-    const mm::VRange range{mm::Virt{base}, size};
+    const mm::VRange range{mm::va_t{base}, size};
     return range.valid() && !range.empty()
         && (base & (mm::page_size - 1)) == 0
         && (size & (mm::page_size - 1)) == 0
@@ -248,12 +247,12 @@ auto cap_call(Call& inv) noexcept -> Result {
             inv,
             descriptor,
             trap.arg(3),
-            libk::Span<byte>{bytes, sizeof(bytes)});
+            std::span<byte>{bytes, sizeof(bytes)});
         if (!read) {
             return returned(read.error());
         }
         auto decoded = cap::decode_attenuation(
-            libk::Span<const byte>{bytes, sizeof(bytes)});
+            std::span<const byte>{bytes, sizeof(bytes)});
         if (!decoded) {
             return returned(STATUS_BAD_ARGS);
         }
@@ -462,7 +461,7 @@ template<usize op>
             return returned(STATUS_BUSY);
         }
         receipt.commit();
-        static_cast<void>(object.close());
+        libk_assert(self->destroy());
     }
     thread->block();
     return returned(STATUS_OK);
@@ -489,11 +488,11 @@ template<usize op>
             // Weak generation identity: a dead inbox drops the delivery. No
             // reference can keep an object in the closing subtree alive.
             auto target = static_cast<object::pool<ipc::Notification>*>(ctx)->lookup(
-                {slot, generation, object::ObjectKind::Notification});
+                {slot, generation});
             if (target) static_cast<void>(target.value()->signal(bits));
         }, id.slot, id.generation, badge};
     if (!pool.value()->observe_refund(self.value(), notifier)) return returned(STATUS_BUSY);
-    static_cast<void>(pool.value()->close());
+    libk_assert(self->destroy());
     return returned(STATUS_OK);
 }
 
@@ -568,7 +567,7 @@ static auto pg_claim(Call& inv) noexcept -> Result {
     const auto descriptor = pager_descriptor(request.value());
     if (!access.value().write(
             0,
-            libk::Span<const byte>{
+            std::span<const byte>{
                 reinterpret_cast<const byte*>(&descriptor),
                 sizeof(descriptor)})) {
         static_cast<void>(resolved.value()->requeue(

@@ -17,8 +17,8 @@
 namespace {
 
 
-constinit libk::ManualLifetime<mm::Pmm> primary_memory_storage{};
-constinit libk::ManualLifetime<mm::Pmm> secondary_memory_storage{};
+constinit libk::manual_lifetime<mm::Pmm> primary_memory_storage{};
+constinit libk::manual_lifetime<mm::Pmm> secondary_memory_storage{};
 
 inline constexpr size_t test_pages = 512;
 alignas(mm::page_size) uint8_t test_ram[test_pages * mm::page_size]{};
@@ -26,7 +26,7 @@ alignas(mm::page_size) uint8_t test_ram[test_pages * mm::page_size]{};
 class PmmFixture : private libk::noncopyable_nonmovable {
   public:
     PmmFixture(
-        libk::ManualLifetime<mm::Pmm>& storage,
+        libk::manual_lifetime<mm::Pmm>& storage,
         mm::RegionList&& memory_map) noexcept
         : storage_(storage),
           initialization_(initialize(std::move(memory_map))) {}
@@ -52,21 +52,21 @@ class PmmFixture : private libk::noncopyable_nonmovable {
         -> mm::Pmm::InitializationResult {
         return mm::Pmm::initialize_in(
             storage_, std::move(memory_map), mm::Pmm::Window{
-                .pa = mm::Phys{
-                    boot_layout.phys(mm::Virt{
+                .pa = mm::pa_t{
+                    boot_layout.phys(mm::va_t{
                         reinterpret_cast<uintptr_t>(test_ram)})->raw()},
-                .va = mm::Virt{
+                .va = mm::va_t{
                     reinterpret_cast<uintptr_t>(test_ram)},
                 .size = sizeof(test_ram),
             });
     }
 
-    libk::ManualLifetime<mm::Pmm>& storage_;
+    libk::manual_lifetime<mm::Pmm>& storage_;
     mm::Pmm::InitializationResult initialization_;
 };
 
 [[nodiscard]] auto page_at(size_t offset) noexcept -> mm::Page {
-    const auto base = boot_layout.phys(mm::Virt{
+    const auto base = boot_layout.phys(mm::va_t{
         reinterpret_cast<uintptr_t>(test_ram)});
     libk_assert(base);
     const auto address = base->checked_add(offset * mm::page_size);
@@ -96,10 +96,10 @@ class PmmFixture : private libk::noncopyable_nonmovable {
 
 consteval auto sv39_pte_representation_contract() noexcept -> bool {
     constexpr auto page =
-        mm::Page{0x12345};
+        usize{0x12345};
 
     constexpr auto invalid_page =
-        mm::Page{~uintptr_t{0}};
+        usize{~uintptr_t{0}};
 
     const auto non_leaf =
         arch::Pte::non_leaf(page);
@@ -489,7 +489,7 @@ bool test_exhaustion_preserves_ledger_index_equivalence(const TestContext&) noex
         return false;
     }
     auto& memory = fixture.memory();
-    libk::InplaceVector<mm::OwnedPage, 32> owners{};
+    libk::inplace_vector<mm::OwnedPage, 32> owners{};
     const size_t available = memory.free_page_count();
     for (size_t index = 0; index < available; ++index) {
         auto allocation = memory.allocate_page();
@@ -812,7 +812,7 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
         auto user = mm::PageTable::create(pmm, mm::PageTable::Kind::User, &*kernel);
         auto payload = pmm.allocate_page();
         if (!user || !payload || user->page_count() != 1) return false;
-        auto first = mm::VPage::from_base(mm::Virt{mm::UserBegin});
+        auto first = mm::VPage::from_base(mm::va_t{mm::UserBegin});
         auto next = first->checked_add(1);
         auto distant = first->checked_add(512);
         auto count = user->count();
@@ -837,8 +837,8 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
         if (!usage || usage->accessed || usage->dirty) return false;
         // Simulate the same atomic A/D updates as the hardware walker.
         auto* root = reinterpret_cast<arch::Pte*>(pmm.bytes(user->page()));
-        auto* middle = reinterpret_cast<arch::Pte*>(pmm.bytes(*root[0].load().next_table_page()));
-        auto* leaves = reinterpret_cast<arch::Pte*>(pmm.bytes(*middle[0].load().next_table_page()));
+        auto* middle = reinterpret_cast<arch::Pte*>(pmm.bytes(mm::Page{*root[0].load().next_table_page()}));
+        auto* leaves = reinterpret_cast<arch::Pte*>(pmm.bytes(mm::Page{*middle[0].load().next_table_page()}));
         auto& leaf = leaves[first->raw() & 511];
         leaf.update([](arch::Pte p) noexcept { return p.with_usage(true, true); });
         auto old = user->protect(*first, arch::PtPerm::UserRx);
@@ -856,7 +856,7 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
         if (user->page_count() != 1 || retired.page_count() != 3 || user->query(*first)) return false;
         resource::Charge refund{};
         if (!retired.release(refund)) return false;
-        auto high = mm::VPage::from_base(mm::Virt{mm::DirectBegin});
+        auto high = mm::VPage::from_base(mm::va_t{mm::DirectBegin});
         auto kernel_count = kernel->count();
         if (!kernel_count.include(*high) || !reserve.grow(kernel_count.pages())
             || !kernel->map(*high, payload->page(), arch::PtPerm::Rw, reserve)) return false;
@@ -904,14 +904,14 @@ bool test_initial_page_table_unrepresentable_range_rolls_back(
             mm::Region::Kind::Ram})) {
         return false;
     }
-    const auto base = boot_layout.phys(mm::Virt{
+    const auto base = boot_layout.phys(mm::va_t{
         reinterpret_cast<uintptr_t>(test_ram)});
     libk_assert(base);
     const auto result = mm::Pmm::initialize_in(
         secondary_memory_storage, std::move(map),
         mm::Pmm::Window{
             .pa = *base,
-            .va = mm::Virt{reinterpret_cast<uintptr_t>(test_ram)},
+            .va = mm::va_t{reinterpret_cast<uintptr_t>(test_ram)},
             .size = sizeof(test_ram),
         });
     secondary_memory_storage.reset();

@@ -2,7 +2,7 @@
 #include <mm/kspace.hpp>
 #include <utility>
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <sync.hpp>
@@ -36,7 +36,7 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
     }
 
     auto edit = tlb_.begin();
-    auto va = *VPage::from_base(Virt{base});
+    auto va = *VPage::from_base(va_t{base});
     usize i{};
     auto mapped = root_.map(va, Stack::StackPages, [&] { return pages[i++]; }, PtPerm::Rw);
     if (!mapped) return std::unexpected(mapped.error());
@@ -59,7 +59,7 @@ void KSpace::release_stack(usize base) noexcept {
 }
 
 auto KSpace::stack_link(usize base) noexcept -> usize& {
-    const auto virtual_page = VPage::from_base(Virt{base});
+    const auto virtual_page = VPage::from_base(va_t{base});
     libk_assert(virtual_page);
     auto& editor = root_;
     const auto mapped = editor.query(*virtual_page);

@@ -59,43 +59,43 @@ private:
 // This keeps shifts and bit-pattern arithmetic free from signed-overflow rules.
 inline constexpr unsigned bit_npos = ~0u;
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto bit_digits() noexcept -> unsigned {
     return static_cast<unsigned>(sizeof(T) * __CHAR_BIT__);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto bit(unsigned index) noexcept -> T {
     libk_assert(index < bit_digits<T>());
     return static_cast<T>(T{1} << index);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto has_any(T value, T mask) noexcept -> bool {
     return (value & mask) != T{0};
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto has_all(T value, T mask) noexcept -> bool {
     return (value & mask) == mask;
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto set_bits(T value, T mask) noexcept -> T {
     return static_cast<T>(value | mask);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto clear_bits(T value, T mask) noexcept -> T {
     return static_cast<T>(value & static_cast<T>(~mask));
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto toggle_bits(T value, T mask) noexcept -> T {
     return static_cast<T>(value ^ mask);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto low_mask(unsigned width) noexcept -> T {
     libk_assert(width <= bit_digits<T>());
     if (width == bit_digits<T>()) {
@@ -104,7 +104,7 @@ template<UnsignedIntegral T>
     return static_cast<T>((T{1} << width) - T{1});
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto field_mask(
     unsigned shift,
     unsigned width) noexcept -> T {
@@ -115,7 +115,7 @@ template<UnsignedIntegral T>
         : static_cast<T>(low_mask<T>(width) << shift);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto encode_field(
     T value,
     unsigned shift,
@@ -127,7 +127,7 @@ template<UnsignedIntegral T>
         : static_cast<T>((value & low_mask<T>(width)) << shift);
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto replace_field(
     T original,
     T field_value,
@@ -139,7 +139,7 @@ template<UnsignedIntegral T>
         | encode_field<T>(field_value, shift, width));
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto extract_field(
     T value,
     unsigned shift,
@@ -151,12 +151,12 @@ template<UnsignedIntegral T>
         : static_cast<T>((value >> shift) & low_mask<T>(width));
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto find_first_set(T value) noexcept -> unsigned {
     return value == T{0} ? bit_npos : static_cast<unsigned>(std::countr_zero(value));
 }
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto find_last_set(T value) noexcept -> unsigned {
     return value == T{0}
         ? bit_npos

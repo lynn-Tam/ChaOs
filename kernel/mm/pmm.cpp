@@ -3,7 +3,7 @@
 #include <mm/pmm.hpp>
 #include <optional>
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/memory.hpp>
@@ -11,6 +11,55 @@
 #include <utility>
 
 namespace mm {
+
+auto normalize(RegionList& input) noexcept -> std::expected<void, PmmInitError> {
+    RegionList out;
+    std::optional<Page> at;
+    bool has_ram = false;
+    for (const auto& r : input) {
+        if (!r.valid()) return std::unexpected(PmmInitError::InvalidRegion);
+        if (!at || r.range.base() < *at) at = r.range.base();
+        has_ram |= r.kind == Region::Kind::Ram;
+    }
+    if (!has_ram) return std::unexpected(PmmInitError::NoRam);
+    auto rank = [](Region::Kind k) {
+        return k == Region::Kind::Kernel ? 3 : k == Region::Kind::Firmware ? 2
+             : k == Region::Kind::Boot ? 1 : 0;
+    };
+    while (at) {
+        std::optional<Page> next;
+        unsigned ram = 0, mmio = 0;
+        bool owned = false;
+        auto kind = Region::Kind::Ram;
+        for (const auto& r : input) {
+            for (auto p : {r.range.base(), *r.range.limit()})
+                if (*at < p && (!next || p < *next)) next = p;
+            if (!r.range.contains(*at)) continue;
+            ram += r.kind == Region::Kind::Ram;
+            mmio += r.kind == Region::Kind::Mmio;
+            owned |= r.kind == Region::Kind::Boot || r.kind == Region::Kind::Kernel;
+            if (rank(r.kind) > rank(kind)) kind = r.kind;
+        }
+        if (ram > 1 || mmio > 1 || (mmio && (ram || owned)))
+            return std::unexpected(PmmInitError::OverlappingRegions);
+        if (owned && !ram) return std::unexpected(PmmInitError::InvalidRegion);
+        if (next && (ram || mmio)) {
+            if (mmio) kind = Region::Kind::Mmio;
+            const auto n = next->raw() - at->raw();
+            // Individual reclaimable resources retain their lifetime boundaries.
+            if (!out.empty() && kind != Region::Kind::Boot && out.back().kind == kind
+                && *out.back().range.limit() == *at) {
+                auto& r = out.back().range;
+                r = Pages{r.base(), r.page_count() + n};
+            } else if (!out.try_emplace_back(Region{Pages{*at, n}, kind})) {
+                return std::unexpected(PmmInitError::MetadataOverflow);
+            }
+        }
+        at = next;
+    }
+    input = std::move(out);
+    return {};
+}
 
 OwnedPage::OwnedPage(Pmm& owner, Page page, uint32_t generation) noexcept
     : h_(Data{&owner, page, generation}) {}
@@ -136,7 +185,7 @@ auto BootPages::range() const noexcept -> Pages {
     return h_.get().owner->boot_range(h_.get().id);
 }
 
-auto Pmm::initialize_in(libk::ManualLifetime<Pmm>& storage, RegionList&& memory_map,
+auto Pmm::initialize_in(libk::manual_lifetime<Pmm>& storage, RegionList&& memory_map,
                         Window layout) noexcept -> InitializationResult {
     Pmm& memory = storage.emplace(ConstructionKey{}, std::move(memory_map), layout);
     auto result = memory.initialize();
@@ -311,7 +360,7 @@ bool Pmm::is_ram(Pages r) const noexcept {
     return r.valid() && std::ranges::any_of(arenas_, [&](const Arena& a) { return a.range.contains(r); });
 }
 
-auto Pmm::virt(Phys address, usize size) const noexcept -> std::optional<Virt> {
+auto Pmm::virt(pa_t address, usize size) const noexcept -> std::optional<va_t> {
     auto r = Pages::covering_bytes(address, size);
     if (!r) return std::nullopt;
     if (!is_ram(*r)) return std::nullopt;
@@ -321,7 +370,7 @@ auto Pmm::virt(Phys address, usize size) const noexcept -> std::optional<Virt> {
     return window_.va.checked_add(*offset);
 }
 
-auto Pmm::phys(Virt address, usize size) const noexcept -> std::optional<Phys> {
+auto Pmm::phys(va_t address, usize size) const noexcept -> std::optional<pa_t> {
     auto offset = window_.va.checked_distance_to(address);
     if (!offset || *offset > window_.size || size > window_.size - *offset)
         return std::nullopt;

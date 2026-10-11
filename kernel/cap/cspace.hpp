@@ -1,6 +1,7 @@
 #pragma once
 
 #include <utility>
+#include <array>
 
 #include <bit>
 
@@ -8,7 +9,7 @@
 #include <cap/cap.hpp>
 #include <cap/grant.hpp>
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>
 #include <span>
@@ -134,6 +135,31 @@ public:
     // All slots become visible under one lock, or none do. No allocation here.
     [[nodiscard]] auto insert(std::span<NewCap>) noexcept
         -> std::expected<void, CSpaceError>;
+    using PublishError = std::variant<resource::errc, GrantError, CSpaceError>;
+    template<usize N, class Make, class Bind>
+    auto publish(const std::array<View, N>& views, Make&& make, Bind&& bind) noexcept
+        -> std::expected<std::array<Handle, N>, PublishError> {
+        std::array<NewCap, N> caps;
+        std::array<Handle, N> handles;
+        for (usize i = 0; i < N; ++i) {
+            auto slot = reserve();
+            if (!slot) return std::unexpected(slot.error());
+            auto grant = make(views[i]);
+            if (!grant) return std::unexpected(grant.error());
+            if (!bind(*grant, i)) return std::unexpected(CSpaceError::InvalidState);
+            auto cap = prepare(std::move(*slot), std::move(*grant), views[i]);
+            if (!cap) return std::unexpected(cap.error());
+            handles[i] = cap->handle();
+            caps[i] = std::move(*cap);
+        }
+        auto result = insert(std::span{caps});
+        if (!result) return std::unexpected(result.error());
+        return handles;
+    }
+    template<usize N, class Make>
+    auto publish(const std::array<View, N>& views, Make&& make) noexcept {
+        return publish(views, std::forward<Make>(make), [](auto&, usize) { return true; });
+    }
     [[nodiscard]] auto close(Handle handle) noexcept
         -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}) noexcept
@@ -149,7 +175,7 @@ public:
     [[nodiscard]] auto resolve(
         Handle handle,
         Rights requested) noexcept -> std::expected<Resolved<T>, CSpaceError> {
-        static_assert(object::kind<T> != object::ObjectKind::Invalid);
+        static_assert(object::kind<T> != ObjInvalid);
         auto copied = snapshot(handle);
         if (!copied) {
             return std::unexpected(copied.error());
@@ -170,6 +196,7 @@ public:
     }
 
     void retire() noexcept;
+    void retire(object::cleanup&&) noexcept;
     [[nodiscard]] auto binding_count() const noexcept -> usize;
     [[nodiscard]] auto live_slots() const noexcept -> usize;
     [[nodiscard]] auto table_pages() const noexcept -> usize;
@@ -258,9 +285,9 @@ private:
     void publish(Reservation&, Capability&&) noexcept;
     void rollback(Handle handle) noexcept;
     void finish_retire() noexcept;
+    void complete_cleanup() noexcept;
     [[nodiscard]] auto reserve_grant() noexcept
         -> std::expected<resource::Reservation, CSpaceError>;
-    [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto escrow_move(
         Handle source,
         GrantRef& grant,
@@ -304,6 +331,7 @@ private:
     bool growing_{};
     bool releasing_{};
     bool retired_{};
+    object::cleanup cleanup_{};
     usize bindings_{};
     usize escrows_{};
     resource::Sponsorship* sponsor_{};
@@ -316,8 +344,8 @@ private:
 // the complete batch is published under both CSpace locks, or none of it is.
 class Batch final : private libk::noncopyable {
 public:
-    using Specs = libk::InplaceVector<XferSpec, IPC_MAX_CAPS>;
-    using Handles = libk::InplaceVector<Handle, IPC_MAX_CAPS>;
+    using Specs = libk::inplace_vector<XferSpec, IPC_MAX_CAPS>;
+    using Handles = libk::inplace_vector<Handle, IPC_MAX_CAPS>;
     Batch() noexcept = default;
     Batch(Batch&&) noexcept = default;
     auto operator=(Batch&&) noexcept -> Batch& = default;
@@ -330,7 +358,7 @@ public:
 private:
     CSpace* source_{};
     CSpace* destination_{};
-    libk::InplaceVector<CSpace::Xfer, IPC_MAX_CAPS> entries_;
+    libk::inplace_vector<CSpace::Xfer, IPC_MAX_CAPS> entries_;
 };
 
 } // namespace cap

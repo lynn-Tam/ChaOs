@@ -31,7 +31,7 @@ private:
     void arm_locked(bool armed) noexcept;
     Line line_;
     Handler handler_;
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     bool armed_{};
 };
 
@@ -54,7 +54,7 @@ private:
     void set(u32 id, bool enabled) noexcept { if (enable_) enable_(id, enabled); }
     mutable sync::Spin lock_{};
     Enable enable_{};
-    libk::IntrusiveList<Route, &Route::hook_> routes_{};
+    libk::intrusive_list<Route, &Route::hook_> routes_{};
 };
 
 } // namespace irq

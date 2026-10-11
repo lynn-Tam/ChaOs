@@ -1,4 +1,5 @@
 #pragma once
+#include <string.h>
 
 #include <utility>
 
@@ -13,14 +14,14 @@
 #include <sys/channel.hpp>
 #include <expected>
 
-namespace sys::io {
+namespace io {
 
 inline constexpr uint64_t QueueVersion = 1;
 inline constexpr size_t QueueDepth = 32;
 inline constexpr size_t BufferSize = 4096;
 inline constexpr size_t PayloadSize = QueueDepth * BufferSize;
-using Submissions = libk::SharedRing<8, QueueDepth>;
-using Completions = libk::SharedRing<4, QueueDepth>;
+using Submissions = libk::shared_ring<8, QueueDepth>;
+using Completions = libk::shared_ring<4, QueueDepth>;
 
 // One aligned device read and the file bytes within it.
 struct extent final {
@@ -43,10 +44,10 @@ struct Request final {
     uint64_t length{};
     uint64_t flags{};
 
-    [[nodiscard]] auto encode() const noexcept -> Submissions::Entry {
+    [[nodiscard]] auto encode() const noexcept -> Submissions::value_type {
         return {{id, operation, object, offset, buffer, buffer_offset, length, flags}};
     }
-    [[nodiscard]] static auto decode(const Submissions::Entry& value) noexcept -> Request {
+    [[nodiscard]] static auto decode(const Submissions::value_type& value) noexcept -> Request {
         return {value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7]};
     }
 };
@@ -57,10 +58,10 @@ struct Completion final {
     uint64_t bytes{};
     uint64_t flags{};
 
-    [[nodiscard]] auto encode() const noexcept -> Completions::Entry {
+    [[nodiscard]] auto encode() const noexcept -> Completions::value_type {
         return {{id, static_cast<uint64_t>(status), bytes, flags}};
     }
-    [[nodiscard]] static auto decode(const Completions::Entry& value) noexcept -> Completion {
+    [[nodiscard]] static auto decode(const Completions::value_type& value) noexcept -> Completion {
         return {value[0], __builtin_bit_cast(int64_t, value[1]), value[2], value[3]};
     }
 };
@@ -71,12 +72,12 @@ struct Completion final {
 // payload buffers or capability selectors. Session identity comes from the
 // authenticated control exchange, not an untrusted shared header.
 struct alignas(4096) ClientPage final {
-    Submissions::Data submissions{};
-    Completions::Cursor completions{};
+    Submissions::data submissions{};
+    Completions::cursor completions{};
 };
 struct alignas(4096) ServerPage final {
-    Completions::Data completions{};
-    Submissions::Cursor submissions{};
+    Completions::data completions{};
+    Submissions::cursor submissions{};
 };
 static_assert(sizeof(ClientPage) == 4096 && sizeof(ServerPage) == 4096);
 
@@ -89,28 +90,28 @@ public:
         : submissions_(client.submissions, server.submissions),
           completions_(server.completions, client.completions) {}
 
-    [[nodiscard]] auto submit(Request& request) noexcept -> libk::RingResult {
-        if (next_id_ == UINT64_MAX) return libk::RingResult::Exhausted;
+    [[nodiscard]] auto submit(Request& request) noexcept -> libk::ring_status {
+        if (next_id_ == UINT64_MAX) return libk::ring_status::exhausted;
         Request snapshot = request;
         snapshot.id = next_id_ + 1;
         const auto result = submissions_.push(snapshot.encode());
-        if (result == libk::RingResult::Ready) {
+        if (result == libk::ring_status::ready) {
             request.id = ++next_id_;
         }
         return result;
     }
     [[nodiscard]] auto publish() noexcept -> bool { return submissions_.publish(); }
-    [[nodiscard]] auto take(Completion& completion) noexcept -> libk::RingResult {
-        Completions::Entry entry{};
+    [[nodiscard]] auto take(Completion& completion) noexcept -> libk::ring_status {
+        Completions::value_type entry{};
         const auto result = completions_.pop(entry);
-        if (result == libk::RingResult::Ready) completion = Completion::decode(entry);
+        if (result == libk::ring_status::ready) completion = Completion::decode(entry);
         return result;
     }
     [[nodiscard]] auto release() noexcept -> bool { return completions_.release(); }
 
 private:
-    Submissions::Producer submissions_;
-    Completions::Consumer completions_;
+    Submissions::producer submissions_;
+    Completions::consumer completions_;
     uint64_t next_id_{};
 };
 
@@ -134,8 +135,8 @@ public:
             if (op == Operation::Write && request.length)
                 std::copy_n(static_cast<const uint8_t*>(data), request.length, writable_ + request.buffer_offset);
             const auto status = queue_.submit(request);
-            if (status == libk::RingResult::Full) return STATUS_BUSY;
-            if (status != libk::RingResult::Ready) return fail(STATUS_PEER_FAULT);
+            if (status == libk::ring_status::full) return STATUS_BUSY;
+            if (status != libk::ring_status::ready) return fail(STATUS_PEER_FAULT);
             entries_[slot] = {.request = request, .data = data, .exact = exact};
             return STATUS_OK;
         }
@@ -146,9 +147,9 @@ public:
         for (;;) {
             Completion result{};
             const auto status = queue_.take(result);
-            if (status == libk::RingResult::Empty) return;
+            if (status == libk::ring_status::empty) return;
             auto* entry = find(result.id);
-            if (status != libk::RingResult::Ready || !entry || entry->ready || result.flags
+            if (status != libk::ring_status::ready || !entry || entry->ready || result.flags
                 || result.bytes > entry->request.length
                 || (entry->exact && result.status == STATUS_OK && result.bytes != entry->request.length)) {
                 (void)fail(STATUS_PEER_FAULT);
@@ -232,10 +233,10 @@ public:
         // Every admitted operation reserves its terminal CQ cell until that
         // completion is consumed. Pending storage is therefore also bounded.
         if (retained + active_ == QueueDepth) return Admission::Backpressure;
-        Submissions::Entry wire{};
+        Submissions::value_type wire{};
         const auto result = submissions_.pop(wire);
-        if (result == libk::RingResult::Empty) return Admission::Empty;
-        if (result != libk::RingResult::Ready) return invalid_peer();
+        if (result == libk::ring_status::empty) return Admission::Empty;
+        if (result != libk::ring_status::ready) return invalid_peer();
         const Request request = Request::decode(wire);
         // IDs increase across the entire session, including completed work.
         // This makes delayed cancellation/completion unable to hit a reuse.
@@ -283,7 +284,7 @@ public:
     [[nodiscard]] auto finish(Ticket ticket, int64_t status, uint64_t bytes) noexcept -> bool {
         if (!valid(ticket)) return false;
         const Completion completion{ticket.id, status, bytes, 0};
-        if (completions_.push(completion.encode()) != libk::RingResult::Ready) {
+        if (completions_.push(completion.encode()) != libk::ring_status::ready) {
             stopping_ = true;
             return false;
         }
@@ -322,17 +323,15 @@ private:
         return Admission::InvalidPeer;
     }
 
-    Submissions::Consumer submissions_;
-    Completions::Producer completions_;
+    Submissions::consumer submissions_;
+    Completions::producer completions_;
     Pending pending_[QueueDepth]{};
     uint64_t last_id_{};
     size_t active_{};
     bool stopping_{};
 };
 
-} // namespace sys::io
 
-namespace sys::io {
 
 // Each endpoint has one control reader and one outstanding control exchange.
 // Data submission never uses this Channel's blocking-operation slot.
@@ -349,7 +348,7 @@ static_assert(sizeof(ControlMessage) == CHANNEL_MAX_WORDS * sizeof(word_t));
 
 struct ControlPacket final {
     ControlMessage message{};
-    cap::OwnedCap capabilities[4]{};
+    sys::cap_owner capabilities[4]{};
     size_t count{};
     word_t badge{};
 };
@@ -358,11 +357,11 @@ struct ControlPacket final {
 // the message. Reply backpressure cannot outlive an export's local owner.
 struct ControlReply final {
     ControlMessage message{};
-    cap::OwnedCap capabilities[4]{};
+    sys::cap_owner capabilities[4]{};
     word_t rights[4]{};
     size_t count{};
 
-    auto offer(cap::OwnedCap&& capability, word_t granted) noexcept -> bool {
+    auto offer(sys::cap_owner&& capability, word_t granted) noexcept -> bool {
         if (!capability || count == 4) return false;
         rights[count] = granted;
         capabilities[count++] = std::move(capability);
@@ -373,7 +372,7 @@ struct ControlReply final {
 class ControlPort final : private libk::noncopyable_nonmovable {
 public:
     [[nodiscard]] auto open(cap_t channel, cap_t events) noexcept -> status_t {
-        const auto bound = channel_bind(channel, events, CHANNEL_READABLE);
+        const auto bound = sys::channel_bind(channel, events, CHANNEL_READABLE);
         if (bound.status != STATUS_OK) return bound.status;
         channel_ = channel;
         sequence_ = 0;
@@ -389,23 +388,23 @@ public:
     [[nodiscard]] static auto send_to(cap_t channel, const ControlMessage& message,
         const CapXfer* capabilities = nullptr, size_t count = 0) noexcept -> status_t {
         if (count > 4) return STATUS_BAD_ARGS;
-        auto& wire = *reinterpret_cast<ChanMsg*>(service::IpcAddress);
+        auto& wire = *reinterpret_cast<ChanMsg*>(sys::IpcAddress);
         wire = {};
         wire.version = CHANNEL_VERSION;
         wire.word_count = CHANNEL_MAX_WORDS;
         wire.cap_count = count;
-        service::copy(wire.words, &message, sizeof(message));
+        ::memcpy(wire.words, &message, sizeof(message));
         for (size_t index = 0; index < count; ++index) wire.caps[index] = capabilities[index];
-        return channel_try_send(channel).status;
+        return sys::channel_try_send(channel).status;
     }
 
     [[nodiscard]] auto receive(ControlPacket& packet) noexcept -> status_t {
         packet = {};
-        auto& wire = *reinterpret_cast<ChanMsg*>(service::IpcAddress);
+        auto& wire = *reinterpret_cast<ChanMsg*>(sys::IpcAddress);
         wire = {};
         wire.version = CHANNEL_VERSION;
         wire.receive_limit = 4;
-        const auto received = channel_try_recv(channel_);
+        const auto received = sys::channel_try_recv(channel_);
         if (received.status != STATUS_OK) return received.status;
         sequence_ = received.value;
         packet.badge = wire.sender_badge;
@@ -413,9 +412,9 @@ public:
         // Packet destruction then closes them on all rejection paths.
         packet.count = wire.received_count;
         for (size_t index = 0; index < packet.count; ++index)
-            packet.capabilities[index] = cap::OwnedCap{{wire.received[index], 0}};
+            packet.capabilities[index] = sys::cap_owner{wire.received[index]};
         if (wire.word_count != CHANNEL_MAX_WORDS) return STATUS_BAD_ARGS;
-        service::copy(&packet.message, wire.words, sizeof(packet.message));
+        ::memcpy(&packet.message, wire.words, sizeof(packet.message));
         if (packet.message.version != QueueVersion || packet.message.size > sizeof(packet.message.data))
             return STATUS_BAD_ARGS;
         return STATUS_OK;
@@ -424,7 +423,7 @@ public:
     // Call only after draining control/data work. A sequence mismatch or
     // terminal Channel state retains a hint in the caller's Notification.
     [[nodiscard]] auto arm() noexcept -> status_t {
-        const auto result = channel_arm(channel_, readable_, sequence_);
+        const auto result = sys::channel_arm(channel_, readable_, sequence_);
         if (result.status == STATUS_OK) sequence_ = result.value;
         return result.status;
     }
@@ -435,61 +434,88 @@ private:
     uint64_t sequence_{};
 };
 
-// A service slot owns its three resident MemoryObjects. The service retains
-// writable initialization authority; each client sees only its producer page
-// writable. Revoking that session's export grants precedes buffer reuse.
-class ClientMemory final {
+// Both participants own the same three mappings; only their granted permissions
+// and request obligations differ. Events belong to sessions, not mapped memory.
+class queue_mem final {
+    static constexpr std::array<size_t, 3> sizes{4096, 4096, PayloadSize};
+    std::array<sys::mapping, 3> pages_{};
+    template<class F>
+    auto acquire(F&& make) -> status_t {
+        if (pages_[0].memory) return STATUS_BUSY;
+        std::array<sys::mapping, 3> pages;
+        for (size_t i = 0; i < pages.size(); ++i) {
+            auto page = make(i, sizes[i]);
+            if (!page) return page.error();
+            pages[i] = std::move(*page);
+        }
+        pages_ = std::move(pages);
+        return STATUS_OK;
+    }
 public:
-    [[nodiscard]] auto map(cap_t vspace, uintptr_t address, ControlPacket& packet,
+    auto create(cap_t pool, cap_t vm, uintptr_t address) -> status_t {
+        if (pages_[0].memory) return STATUS_OK;
+        return acquire([&](size_t i, size_t size) {
+            auto page = sys::mapping::create(pool, vm, address + i * 4096, size);
+            if (page) for (size_t n = 0; n < size; n += 4096)
+                *reinterpret_cast<volatile uint8_t*>(page->address + n) = 0;
+            return page;
+        });
+    }
+    auto map(cap_t vm, uintptr_t address, std::span<sys::cap_owner, 3> caps,
+             bool writable_payload) -> status_t {
+        return acquire([&](size_t i, size_t size) {
+            return sys::mapping::map(vm, std::move(caps[i]), address + i * 4096, size,
+                i == 0 || (i == 2 && writable_payload) ? VM_READ | VM_WRITE : VM_READ);
+        });
+    }
+    auto close() -> status_t {
+        for (auto& page : pages_) {
+            const auto s = page.close();
+            if (s != STATUS_OK) return s;
+        }
+        return STATUS_OK;
+    }
+    void initialize() noexcept {
+        libk::construct_at(reinterpret_cast<ClientPage*>(pages_[0].address));
+        libk::construct_at(reinterpret_cast<ServerPage*>(pages_[1].address));
+        // A new client must not observe its predecessor's payload bytes.
+        auto* bytes = payload();
+        for (size_t index = 0; index < PayloadSize; ++index) bytes[index] = 0;
+    }
+
+    [[nodiscard]] auto export_pages(cap_t cspace, sys::cap_owner (&exports)[3],
         bool writable_payload = false) noexcept
         -> status_t {
-        if (packet.count != 4) return STATUS_BAD_ARGS;
-        constexpr size_t sizes[] = {4096, 4096, PayloadSize};
-        MappedMemory mappings[3];
+        // The tail is padding, outside both ring objects. This is private
+        // writable descriptor scratch; peers can only read this page.
+        constexpr size_t scratch = 4096 - CAP_ATTENUATION_SIZE;
+        static_assert(offsetof(ServerPage, submissions) + sizeof(Submissions::cursor) <= scratch);
+        auto& wire = *reinterpret_cast<uint8_t (*)[CAP_ATTENUATION_SIZE]>(
+            pages_[1].address + scratch);
         for (size_t index = 0; index < 3; ++index) {
-            auto memory = MappedMemory::map(vspace, std::move(packet.capabilities[index]),
-                address + index * 4096, sizes[index],
-                index == 0 || (index == 2 && writable_payload)
-                    ? VM_READ | VM_WRITE : VM_READ);
-            if (!memory) return memory.error();
-            mappings[index] = std::move(memory).value();
+            const CapView view{
+                .version = CAP_ATTENUATION_VERSION_CURRENT,
+                .kind = ObjMem,
+                .size = CAP_ATTENUATION_SIZE,
+                .rights = RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE,
+                .words = {0, pages_[index].size / 4096,
+                    index == 0 || (index == 2 && writable_payload)
+                        ? VM_READ | VM_WRITE : VM_READ}};
+            sys::encode_cap(view, wire);
+            const auto exported = sys::cap_typed_delegate(pages_[index].memory.selector(), cspace,
+                pages_[1].memory.selector(), scratch);
+            if (exported.status != STATUS_OK) return exported.status;
+            exports[index] = sys::cap_owner{exported.value};
         }
-        for (size_t index = 0; index < 3; ++index) mappings_[index] = std::move(mappings[index]);
-        event_ = std::move(packet.capabilities[3]);
-        writable_payload_ = writable_payload;
         return STATUS_OK;
     }
 
-    [[nodiscard]] auto close() noexcept -> status_t {
-        for (auto& mapping : mappings_) {
-            const auto status = mapping.close();
-            if (status != STATUS_OK) return status;
-        }
-        event_ = {};
-        writable_payload_ = false;
-        return STATUS_OK;
-    }
-
-    [[nodiscard]] auto client() noexcept -> ClientPage& {
-        return *reinterpret_cast<ClientPage*>(mappings_[0].address);
-    }
-    [[nodiscard]] auto server() const noexcept -> const ServerPage& {
-        return *reinterpret_cast<const ServerPage*>(mappings_[1].address);
-    }
-    [[nodiscard]] auto payload() const noexcept -> const uint8_t* {
-        return reinterpret_cast<const uint8_t*>(mappings_[2].address);
-    }
-    [[nodiscard]] auto writable_payload() noexcept -> uint8_t* {
-        return writable_payload_ ? reinterpret_cast<uint8_t*>(mappings_[2].address) : nullptr;
-    }
-    [[nodiscard]] auto signal() const noexcept -> status_t {
-        return notification_signal(event_.selector()).status;
-    }
-
-private:
-    MappedMemory mappings_[3]{};
-    cap::OwnedCap event_{};
-    bool writable_payload_{};
+    auto client() noexcept -> ClientPage& { return *reinterpret_cast<ClientPage*>(pages_[0].address); }
+    auto client() const noexcept -> const ClientPage& { return *reinterpret_cast<const ClientPage*>(pages_[0].address); }
+    auto server() noexcept -> ServerPage& { return *reinterpret_cast<ServerPage*>(pages_[1].address); }
+    auto server() const noexcept -> const ServerPage& { return *reinterpret_cast<const ServerPage*>(pages_[1].address); }
+    auto payload() noexcept -> uint8_t* { return reinterpret_cast<uint8_t*>(pages_[2].address); }
+    auto payload() const noexcept -> const uint8_t* { return reinterpret_cast<const uint8_t*>(pages_[2].address); }
 };
 
 // Synchronous control is reserved for startup and explicit application calls.
@@ -497,7 +523,7 @@ private:
 // forwarding consumers own their snapshots and use queue() instead.
 class ClientSession final : private libk::noncopyable_nonmovable {
 public:
-    [[nodiscard]] auto adopt(cap::OwnedCap&& channel, cap_t events,
+    [[nodiscard]] auto adopt(sys::cap_owner&& channel, cap_t events,
         cap_t vspace, uintptr_t address, uint64_t& value,
         bool writable_payload = false) noexcept -> status_t {
         if (queue_ || channel_ || !channel) return STATUS_BAD_ARGS;
@@ -505,7 +531,7 @@ public:
         const auto status = open(channel_.selector(), events, vspace, address,
             value, writable_payload);
         if (status != STATUS_OK) {
-            (void)object_destroy(channel_.selector());
+            (void)sys::object_destroy(channel_.selector());
             channel_ = {};
         }
         return status;
@@ -526,12 +552,12 @@ public:
         status = receive(request, packet);
         if (status != STATUS_OK) return status;
         if (packet.message.status != STATUS_OK) return packet.message.status;
-        status = memory_.map(vspace, address, packet, writable_payload);
+        status = map_pages(vspace, address, packet, writable_payload);
         if (status != STATUS_OK) return status;
-        queue_.emplace(memory_.client(), memory_.server());
-        requests_.emplace(*queue_, memory_.payload(), memory_.writable_payload());
+        queue_.emplace(memory_.client(), std::as_const(memory_).server());
+        requests_.emplace(*queue_, std::as_const(memory_).payload(), this->writable_payload());
         value = packet.message.value;
-        return memory_.signal();
+        return sys::notification_signal(peer_event_.selector()).status;
     }
 
     // A directory capability grants only admission. Replies and data belong
@@ -540,18 +566,18 @@ public:
         cap_t vspace, uintptr_t address, uint64_t& value,
         bool writable_payload = false) noexcept -> status_t {
         if (queue_ || channel_) return STATUS_BUSY;
-        const auto pair = channel_create(pool, 1, CHANNEL_MAX_WORDS, 4, 2);
+        const auto pair = sys::channel_create(pool, 1, CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != STATUS_OK) return pair.status;
-        channel_ = cap::OwnedCap{{pair.value, 0}};
-        cap::OwnedCap server{{pair.value2, 0}};
+        channel_ = sys::cap_owner{pair.value};
+        sys::cap_owner server{pair.value2};
         constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE | RIGHT_DUPLICATE;
-        const auto client_endpoint = channel_mint(channel_.selector(), cspace, 1, rights | RIGHT_DESTROY);
-        const auto server_endpoint = channel_mint(server.selector(), cspace, 1, rights);
-        cap::OwnedCap client_fixed, server_fixed;
-        if (client_endpoint.status == STATUS_OK) client_fixed = cap::OwnedCap{{client_endpoint.value, 0}};
-        if (server_endpoint.status == STATUS_OK) server_fixed = cap::OwnedCap{{server_endpoint.value, 0}};
+        const auto client_endpoint = sys::channel_mint(channel_.selector(), cspace, 1, rights | RIGHT_DESTROY);
+        const auto server_endpoint = sys::channel_mint(server.selector(), cspace, 1, rights);
+        sys::cap_owner client_fixed, server_fixed;
+        if (client_endpoint.status == STATUS_OK) client_fixed = sys::cap_owner{client_endpoint.value};
+        if (server_endpoint.status == STATUS_OK) server_fixed = sys::cap_owner{server_endpoint.value};
         if (!client_fixed || !server_fixed) {
-            (void)object_destroy(channel_.selector());
+            (void)sys::object_destroy(channel_.selector());
             channel_ = {};
             return !client_fixed ? client_endpoint.status : server_endpoint.status;
         }
@@ -568,18 +594,18 @@ public:
         ControlPacket packet;
         if (status == STATUS_OK) status = receive(request, packet);
         if (status == STATUS_OK) status = packet.message.status;
-        if (status == STATUS_OK) status = memory_.map(vspace, address, packet, writable_payload);
+        if (status == STATUS_OK) status = map_pages(vspace, address, packet, writable_payload);
         if (status != STATUS_OK) {
-            (void)object_destroy(channel_.selector());
+            (void)sys::object_destroy(channel_.selector());
             channel_ = {};
             const auto closed = memory_.close();
-            if (closed != STATUS_OK) cap::SyscallBackend::ownership_fault(closed);
+            if (closed != STATUS_OK) sys::exit(closed);
             return status;
         }
-        queue_.emplace(memory_.client(), memory_.server());
-        requests_.emplace(*queue_, memory_.payload(), memory_.writable_payload());
+        queue_.emplace(memory_.client(), std::as_const(memory_).server());
+        requests_.emplace(*queue_, std::as_const(memory_).payload(), this->writable_payload());
         value = packet.message.value;
-        return memory_.signal();
+        return sys::notification_signal(peer_event_.selector()).status;
     }
 
     [[nodiscard]] auto close() noexcept -> status_t {
@@ -589,10 +615,12 @@ public:
         requests_.reset();
         queue_.reset();
         const auto unmapped = memory_.close();
-        if (unmapped != STATUS_OK) cap::SyscallBackend::ownership_fault(unmapped);
-        const auto destroyed = object_destroy(channel_.selector()).status;
-        if (destroyed != STATUS_OK) cap::SyscallBackend::ownership_fault(destroyed);
+        if (unmapped != STATUS_OK) sys::exit(unmapped);
+        const auto destroyed = sys::object_destroy(channel_.selector()).status;
+        if (destroyed != STATUS_OK) sys::exit(destroyed);
         channel_ = {};
+        peer_event_ = {};
+        writable_payload_ = false;
         return status;
     }
 
@@ -605,7 +633,7 @@ public:
         status = receive(message, packet);
         if (status != STATUS_OK) return status;
         message = packet.message;
-        status = memory_.signal();
+        status = sys::notification_signal(peer_event_.selector()).status;
         return status == STATUS_OK ? message.status : status;
     }
 
@@ -638,20 +666,30 @@ public:
             const auto status = completion(result, id);
             if (status != STATUS_WOULD_BLOCK || !requests_->next()) return status;
             auto waiting = arm();
-            if (waiting == STATUS_OK) waiting = notification_wait(events_, deadline).status;
+            if (waiting == STATUS_OK) waiting = sys::notification_wait(events_, deadline).status;
             if (waiting != STATUS_OK) (void)requests_->fail(waiting);
         }
     }
-    [[nodiscard]] auto writable_payload() noexcept -> uint8_t* { return memory_.writable_payload(); }
+    [[nodiscard]] auto writable_payload() noexcept -> uint8_t* { return writable_payload_ ? memory_.payload() : nullptr; }
     [[nodiscard]] auto payload() const noexcept -> const uint8_t* { return memory_.payload(); }
     [[nodiscard]] auto flush() noexcept -> status_t {
         const bool submitted = queue_->publish();
         const bool consumed = queue_->release();
-        return submitted || consumed ? memory_.signal() : STATUS_OK;
+        return submitted || consumed ? sys::notification_signal(peer_event_.selector()).status : STATUS_OK;
     }
     [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm(); }
 
 private:
+    auto map_pages(cap_t vm, uintptr_t address, ControlPacket& packet, bool writable) -> status_t {
+        if (packet.count != 4) return STATUS_BAD_ARGS;
+        const auto s = memory_.map(vm, address, std::span{packet.capabilities}.first<3>(), writable);
+        if (s == STATUS_OK) {
+            peer_event_ = std::move(packet.capabilities[3]);
+            writable_payload_ = writable;
+        }
+        return s;
+    }
+
     [[nodiscard]] auto receive(const ControlMessage& request, ControlPacket& packet) noexcept
         -> status_t {
         for (;;) {
@@ -662,14 +700,16 @@ private:
             if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) return status;
             status = control_.arm();
             if (status != STATUS_OK) return status;
-            status = notification_wait(events_).status;
+            status = sys::notification_wait(events_).status;
             if (status != STATUS_OK) return status;
         }
     }
 
-    cap::OwnedCap channel_;
+    sys::cap_owner channel_;
     ControlPort control_;
-    ClientMemory memory_;
+    queue_mem memory_;
+    sys::cap_owner peer_event_;
+    bool writable_payload_{};
     std::optional<ClientQueue> queue_;
     std::optional<io::requests> requests_;
     cap_t events_{};
@@ -718,7 +758,7 @@ class reader final {
         else if (result.status != STATUS_OK) finish(read, result.status);
         else if (result.bytes != flight.extent.size) finish(read, STATUS_PEER_FAULT);
         else {
-            service::copy(read.output + read.done,
+            ::memcpy(read.output + read.done,
                 backend_.payload() + flight.buffer + flight.extent.skip, flight.extent.bytes);
             read.done += flight.extent.bytes;
             if (read.done == read.size) finish(read, STATUS_OK);
@@ -774,5 +814,148 @@ public:
 
 // One lifetime per endpoint. Backend owners stop admission on closing(), end
 // all backend access, then pass close_ready to flush(). The common transport
-// owns page authority, control reply credit and terminal queue publication.
-} // namespace sys::io
+// owns page authority, control reply credit and final queue publication.
+
+class ServerSession final : private libk::noncopyable_nonmovable {
+public:
+    [[nodiscard]] auto prepare(cap_t pool, cap_t vspace,
+        cap_t cspace, uintptr_t address,
+        bool writable_payload = false) noexcept -> status_t {
+        cspace_ = cspace;
+        writable_payload_ = writable_payload;
+        return memory_.create(pool, vspace, address);
+    }
+    [[nodiscard]] auto bind(cap_t channel, cap_t events, uint64_t value = 0) noexcept -> status_t {
+        events_ = events;
+        value_ = value;
+        return control_.open(channel, events);
+    }
+    [[nodiscard]] auto open(cap_t channel, cap_t events, cap_t pool,
+        cap_t vspace, cap_t cspace, uintptr_t address, uint64_t value = 0) noexcept
+        -> status_t {
+        const auto status = prepare(pool, vspace, cspace, address);
+        return status == STATUS_OK ? bind(channel, events, value) : status;
+    }
+
+    void abort() noexcept {
+        closing_ = true;
+        if (queue_) queue_->stop();
+        peer_event_ = {};
+        reply_.reset();
+    }
+    [[nodiscard]] auto done() const noexcept -> bool {
+        if (!closing_ || reply_ || (queue_ && queue_->active() != 0)) return false;
+        for (const auto& exported : exports_) if (exported) return false;
+        return true;
+    }
+    void reset() noexcept {
+        if (!done()) sys::exit(STATUS_BUSY);
+        queue_.reset();
+        peer_event_ = {};
+        closing_ = false;
+    }
+
+    template<class Handler>
+    [[nodiscard]] auto poll(Handler&& application) noexcept -> status_t {
+        if (reply_) return STATUS_OK;
+        ControlPacket packet;
+        const auto status = control_.receive(packet);
+        if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) return STATUS_OK;
+        if (status != STATUS_OK) return status;
+        return accept(packet, std::forward<Handler>(application));
+    }
+
+    template<class Handler>
+    [[nodiscard]] auto accept(ControlPacket& packet, Handler&& application) noexcept -> status_t {
+        if (reply_) return STATUS_BUSY;
+        const auto& message = packet.message;
+        reply_.emplace();
+        reply_->message = ControlMessage{.operation = message.operation, .id = message.id};
+        if (closing_) reply_->message.status = STATUS_CLOSED;
+        else if (message.operation == static_cast<uint64_t>(Control::Open)) {
+            if (queue_ || packet.count != 1 || message.value != QueueDepth || message.size != 0)
+                reply_->message.status = STATUS_BAD_ARGS;
+            else {
+                memory_.initialize();
+                auto created = memory_.export_pages(cspace_, exports_, writable_payload_);
+                if (created != STATUS_OK) return created;
+                for (auto& exported : exports_) {
+                    const auto copied = sys::cap_duplicate(exported.selector(), cspace_, RIGHT_MAP | RIGHT_DUPLICATE);
+                    if (copied.status != STATUS_OK) return copied.status;
+                    if (!reply_->offer(sys::cap_owner{copied.value}, RIGHT_MAP)) return STATUS_INTERNAL;
+                }
+                const auto signal = sys::cap_duplicate(events_, cspace_, RIGHT_SIGNAL | RIGHT_DUPLICATE);
+                if (signal.status != STATUS_OK) return signal.status;
+                if (!reply_->offer(sys::cap_owner{signal.value}, RIGHT_SIGNAL)) return STATUS_INTERNAL;
+                peer_event_ = std::move(packet.capabilities[0]);
+                queue_.emplace(std::as_const(memory_).client(), memory_.server());
+                reply_->message.value = value_;
+            }
+        } else if (packet.count != 0 || !queue_) reply_->message.status = STATUS_BAD_ARGS;
+        else if (message.operation == static_cast<uint64_t>(Control::Cancel)) {
+            Ticket ticket{};
+            reply_->message.status = message.size != 0 ? STATUS_BAD_ARGS
+                : queue_->cancel(message.value, ticket);
+        } else if (message.operation == static_cast<uint64_t>(Control::Close)) {
+            if (message.size != 0) reply_->message.status = STATUS_BAD_ARGS;
+            else {
+                queue_->stop();
+                closing_ = true;
+            }
+        } else application(message, *reply_);
+        return STATUS_OK;
+    }
+
+    [[nodiscard]] auto queue() noexcept -> ServerQueue* { return queue_ ? &*queue_ : nullptr; }
+    [[nodiscard]] auto payload() noexcept -> uint8_t* { return memory_.payload(); }
+    [[nodiscard]] auto closing() const noexcept -> bool { return closing_; }
+    [[nodiscard]] auto failed() const noexcept -> bool { return closing_ && !peer_event_; }
+    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm(); }
+
+    [[nodiscard]] auto flush(bool close_ready) noexcept -> status_t {
+        if (queue_) {
+            // A visible completion also returns its submission credit, so a
+            // client can immediately refill a completed batch.
+            (void)queue_->release();
+            const bool completed = queue_->publish();
+            if (completed && peer_event_) {
+                const auto status = sys::notification_signal(peer_event_.selector()).status;
+                // The peer may revoke its notification while a borrowed I/O
+                // completion is still in flight. Finish the local session.
+                if (status == STATUS_BUSY || status == STATUS_CLOSED
+                    || status == STATUS_INVALID_CAP) abort();
+                else if (status != STATUS_OK) return status;
+            }
+        }
+        if (closing_ && close_ready && (!queue_ || queue_->active() == 0)) {
+            // This is the observable end of peer access, before Close's reply.
+            // The slot's own mappings use their root grants and remain resident.
+            for (auto& exported : exports_) if (exported) {
+                const auto status = sys::cap_revoke(exported.selector(), true).status;
+                if (status != STATUS_OK) return status;
+                exported = {};
+            }
+        }
+        if (!reply_ || (closing_ && (!close_ready || queue_->active() != 0))) return STATUS_OK;
+        CapXfer transfers[4]{};
+        for (size_t index = 0; index < reply_->count; ++index)
+            transfers[index] = {reply_->capabilities[index].selector(), reply_->rights[index], CAP_COPY, 0};
+        const auto status = control_.send(reply_->message, transfers, reply_->count);
+        if (status == STATUS_OK) reply_.reset();
+        return status == STATUS_WOULD_BLOCK || status == STATUS_BUSY ? STATUS_OK : status;
+    }
+
+private:
+    ControlPort control_;
+    queue_mem memory_;
+    std::optional<ServerQueue> queue_;
+    sys::cap_owner peer_event_;
+    sys::cap_owner exports_[3];
+    std::optional<ControlReply> reply_;
+    cap_t events_{}, cspace_{};
+    uint64_t value_{};
+    bool closing_{};
+    bool writable_payload_{};
+};
+
+} // namespace io

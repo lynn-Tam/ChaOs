@@ -8,14 +8,14 @@
 
 namespace ipc {
 
-auto Buffer::Perm::bytes(usize offset, usize size) const noexcept -> libk::Span<const byte> {
+auto Buffer::Perm::bytes(usize offset, usize size) const noexcept -> std::span<const byte> {
     if (pmm_ == nullptr || size == 0 || offset >= size_ || size > size_ - offset
         || size > mm::page_size - offset % mm::page_size) return {};
     return {pmm_->bytes(pages_[offset / mm::page_size].page()) + offset % mm::page_size, size};
 }
 
 auto Buffer::Perm::read(
-    usize offset, libk::Span<byte> output) const noexcept -> bool {
+    usize offset, std::span<byte> output) const noexcept -> bool {
     const auto end = libk::checked_add(offset, output.size());
     if (pmm_ == nullptr || !end || *end > size_) {
         return false;
@@ -39,7 +39,7 @@ auto Buffer::Perm::read(
 }
 
 auto Buffer::Perm::write(
-    usize offset, libk::Span<const byte> input) noexcept -> bool {
+    usize offset, std::span<const byte> input) noexcept -> bool {
     const auto end = libk::checked_add(offset, input.size());
     if (pmm_ == nullptr || !end || *end > size_) {
         return false;
@@ -65,7 +65,7 @@ auto Buffer::Perm::write(
 auto Buffer::bind(
     mm::Pmm& pmm,
     mm::VSpace& vspace,
-    object::ref<>&& memory_ref,
+    object::ref<> memory_ref,
     mm::Mem& memory,
     mm::ObjectRange object,
     mm::VRange virtual_range) noexcept
@@ -147,7 +147,7 @@ auto Buffer::access() const noexcept
 }
 
 auto Buffer::read(
-    usize offset, libk::Span<byte> output) const noexcept -> bool {
+    usize offset, std::span<byte> output) const noexcept -> bool {
     const auto end = libk::checked_add(offset, output.size());
     if (!end || *end > size()) {
         return false;
@@ -160,7 +160,7 @@ auto Buffer::read(
 }
 
 auto Buffer::write(
-    usize offset, libk::Span<const byte> input) noexcept -> bool {
+    usize offset, std::span<const byte> input) noexcept -> bool {
     const auto end = libk::checked_add(offset, input.size());
     if (!end || *end > size()) {
         return false;

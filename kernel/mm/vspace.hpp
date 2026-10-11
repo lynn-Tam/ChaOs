@@ -1,7 +1,7 @@
 #pragma once
 #include <work.hpp>
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cap/cap.hpp>
 #include <cap/grant.hpp>
 #include <expected>
@@ -11,7 +11,7 @@
 #include <libk/intrusive_tree.hpp>
 #include <libk/manual_lifetime.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <mm/kspace.hpp>
 #include <mm/mem.hpp>
 #include <mm/pmm.hpp>
@@ -41,7 +41,7 @@ class VSpace;
 // A committed translation fence retains the accepted identity through drain.
 class Fence final : private libk::noncopyable_nonmovable {
   public:
-    Fence(object::ref<>&& target, mm::VSpace& space) noexcept;
+    Fence(object::ref<> target, mm::VSpace& space) noexcept;
     ~Fence() noexcept;
     auto completion() noexcept -> Completion& { return receipt_.completion(); }
     void start() noexcept;
@@ -51,7 +51,7 @@ class Fence final : private libk::noncopyable_nonmovable {
 
     object::ref<> target_;
     mm::VSpace* space_{};
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     bool ready_{}; // VSpace lock owns selection; Completion owns publication.
     Receipt receipt_;
 };
@@ -73,7 +73,7 @@ class Borrow final : private libk::noncopyable_nonmovable {
         : owner_(&owner), backing_(&backing), range_(req.virtual_range), memory_(std::move(req.memory)),
           object_(req.object), perms_(req.perms) {}
     ~Borrow() noexcept;
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
 
   private:
     friend class VSpace;
@@ -120,7 +120,7 @@ class Map final : private libk::noncopyable_nonmovable {
     auto perms() const noexcept -> Perms { return perms_; }
     auto ceiling() const noexcept -> Perms { return ceiling_; }
     auto object_range() const noexcept -> ObjectRange { return object_; }
-    libk::IntrusiveTreeHook layout_hook_{};
+    libk::intrusive_tree_hook layout_hook_{};
 
   private:
     friend class VSpace;
@@ -133,31 +133,31 @@ class Map final : private libk::noncopyable_nonmovable {
     Perms perms_{};
     Perms ceiling_{};
     Backing* binding_{};
-    libk::IntrusiveListHook backing_hook_{};
+    libk::intrusive_list_hook backing_hook_{};
 };
 
 struct LayoutCmp {
     bool operator()(const Map& a, const Map& b) const noexcept { return a.range().base() < b.range().base(); }
-    bool operator()(Virt a, const Map& b) const noexcept { return a < b.range().base(); }
-    bool operator()(const Map& a, Virt b) const noexcept { return a.range().base() < b; }
+    bool operator()(va_t a, const Map& b) const noexcept { return a < b.range().base(); }
+    bool operator()(const Map& a, va_t b) const noexcept { return a.range().base() < b; }
 };
-using LayoutTree = libk::IntrusiveTree<Map, &Map::layout_hook_, LayoutCmp>;
+using LayoutTree = libk::intrusive_tree<Map, &Map::layout_hook_, LayoutCmp>;
 
 class VSpace;
 
 class MapPage final : private libk::noncopyable_nonmovable {
   public:
-    MapPage(Virt address, usize object_page, PageHold&& source) noexcept
+    MapPage(va_t address, usize object_page, PageHold&& source) noexcept
         : address_(address), object_page_(object_page),
           storage_(std::in_place_type<PageHold>, std::move(source)) {}
 
-    MapPage(Virt address, usize object_page, OwnedPage&& page, resource::Charge&& charge) noexcept
+    MapPage(va_t address, usize object_page, OwnedPage&& page, resource::Charge&& charge) noexcept
         : address_(address), object_page_(object_page),
           storage_(std::in_place_type<Private>, std::move(charge), std::move(page)) {}
 
     ~MapPage() noexcept;
 
-    [[nodiscard]] auto address() const noexcept -> Virt { return address_; }
+    [[nodiscard]] auto address() const noexcept -> va_t { return address_; }
     [[nodiscard]] auto page() const noexcept -> Page {
         if (const auto* p = std::get_if<PageHold>(&storage_)) return p->page();
         return std::get_if<Private>(&storage_)->page.page();
@@ -187,10 +187,10 @@ class MapPage final : private libk::noncopyable_nonmovable {
         return {};
     }
 
-    Virt address_{};
+    va_t address_{};
     usize object_page_{};
     std::variant<PageHold, Private> storage_;
-    libk::IntrusiveTreeHook tree_hook_{};
+    libk::intrusive_tree_hook tree_hook_{};
     MapPage* pending_next_{};
     Backing* binding_{};
 };
@@ -199,20 +199,20 @@ struct MapPageCmp final {
     [[nodiscard]] constexpr auto operator()(const MapPage& lhs, const MapPage& rhs) const noexcept -> bool {
         return lhs.address() < rhs.address();
     }
-    [[nodiscard]] constexpr auto operator()(Virt lhs, const MapPage& rhs) const noexcept -> bool {
+    [[nodiscard]] constexpr auto operator()(va_t lhs, const MapPage& rhs) const noexcept -> bool {
         return lhs < rhs.address();
     }
-    [[nodiscard]] constexpr auto operator()(const MapPage& lhs, Virt rhs) const noexcept -> bool {
+    [[nodiscard]] constexpr auto operator()(const MapPage& lhs, va_t rhs) const noexcept -> bool {
         return lhs.address() < rhs;
     }
 };
 
 class Backing final : private libk::noncopyable_nonmovable {
-    using MappingList = libk::IntrusiveList<Map, &Map::backing_hook_>;
-    using PageTree = libk::IntrusiveTree<MapPage, &MapPage::tree_hook_, MapPageCmp>;
+    using MappingList = libk::intrusive_list<Map, &Map::backing_hook_>;
+    using PageTree = libk::intrusive_tree<MapPage, &MapPage::tree_hook_, MapPageCmp>;
 
   public:
-    Backing(VSpace& owner, object::ref<>&& memory, Mem& object, Perms perms, bool private_write) noexcept;
+    Backing(VSpace& owner, object::ref<> memory, Mem& object, Perms perms, bool private_write) noexcept;
     ~Backing() noexcept;
 
     [[nodiscard]] auto memory() noexcept -> Mem& { return *memory_; }
@@ -238,14 +238,14 @@ class Backing final : private libk::noncopyable_nonmovable {
     bool private_write_{};
     MappingList mappings_{};
     PageTree pages_{};
-    libk::IntrusiveList<Borrow, &Borrow::hook_> views_{};
-    libk::IntrusiveListHook invalidation_hook_{};
+    libk::intrusive_list<Borrow, &Borrow::hook_> views_{};
+    libk::intrusive_list_hook invalidation_hook_{};
     MemLink memory_attachment_;
-    libk::ManualLifetime<cap::GrantAttachment> grant_attachment_{};
-    libk::ManualLifetime<MemWork> memory_work_{};
-    libk::ManualLifetime<cap::GrantWork> grant_work_{};
+    libk::manual_lifetime<cap::GrantAttachment> grant_attachment_{};
+    libk::manual_lifetime<MemWork> memory_work_{};
+    libk::manual_lifetime<cap::GrantWork> grant_work_{};
     bool invalid() const noexcept { return bool(memory_work_) || bool(grant_work_); }
-    libk::IntrusiveListHook retired_hook_{};
+    libk::intrusive_list_hook retired_hook_{};
 };
 
 
@@ -331,12 +331,12 @@ struct MapInfo final {
 };
 
 class VSpace final : private libk::noncopyable_nonmovable {
-    using InvalidationList = libk::IntrusiveList<Backing, &Backing::invalidation_hook_>;
+    using InvalidationList = libk::intrusive_list<Backing, &Backing::invalidation_hook_>;
 
   public:
     class Data {
         friend class VSpace;
-        Data(Pmm& pmm, KSpace& kernel, WorkQueue& work, object::ref<>&& payer, resource::Charge&& charge,
+        Data(Pmm& pmm, KSpace& kernel, WorkQueue& work, object::ref<> payer, resource::Charge&& charge,
              PageTable&& root) noexcept
             : pmm_(&pmm), kernel_(&kernel), work_(&work), payer_(std::move(payer)),
               charge_(std::move(charge)), root_(std::move(root)) {}
@@ -370,7 +370,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto reserve(VRange range, bool guard = false) noexcept -> std::expected<void, VSpaceError>;
     [[nodiscard]] auto clear(VmCtx, VRange) noexcept -> std::expected<VmStatus, VSpaceError>;
 
-    [[nodiscard]] auto map(VmCtx ctx, MapReq request, object::ref<>&& memory, Mem& object,
+    [[nodiscard]] auto map(VmCtx ctx, MapReq request, object::ref<> memory, Mem& object,
                            cap::MemLimit auth) noexcept -> std::expected<MapResult, VSpaceError>;
 
     [[nodiscard]] auto map(VmCtx ctx, cap::VmLimit where, MapReq request, cap::Resolved<Mem>& memory) noexcept
@@ -383,14 +383,14 @@ class VSpace final : private libk::noncopyable_nonmovable {
         -> std::expected<VmStatus, VSpaceError>;
     [[nodiscard]] auto protect(VmCtx ctx, VRange range, Perms perms) noexcept
         -> std::expected<VmStatus, VSpaceError>;
-    [[nodiscard]] auto fault(Thread&, VmCtx, Virt, Perm) noexcept -> FaultKind;
-    [[nodiscard]] auto fault(VmCtx ctx, Virt address, Perm perms, WaitRelation* relation = nullptr,
+    [[nodiscard]] auto fault(Thread&, VmCtx, va_t, Perm) noexcept -> FaultKind;
+    [[nodiscard]] auto fault(VmCtx ctx, va_t address, Perm perms, WaitRelation* relation = nullptr,
                              void* owner = nullptr, WaitRelation::Publish publish = nullptr) noexcept
         -> std::expected<FaultResult, VSpaceError>;
     // Samples the architecture projection of one materialized PTE and folds
     // it into the Mem page truth. When clear is true the selected
     // A/D bits are cleared through the normal translation/shootdown path.
-    [[nodiscard]] auto sample_usage(VmCtx ctx, Virt address, bool clear = false) noexcept
+    [[nodiscard]] auto sample_usage(VmCtx ctx, va_t address, bool clear = false) noexcept
         -> std::expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto inspect(MapId key) const noexcept -> std::expected<MapInfo, VSpaceError>;
 
@@ -418,7 +418,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
         PageGroup pages{};
     };
 
-    [[nodiscard]] auto map_impl(VmCtx ctx, MapReq request, object::ref<>&& memory_ref, Mem& memory,
+    [[nodiscard]] auto map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& memory,
                                 cap::MemLimit mem_auth, Perms vspace_access,
                                 cap::Resolved<Mem>* capability) noexcept
         -> std::expected<MapResult, VSpaceError>;
@@ -447,7 +447,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     void release_page(MapPage& page, resource::Charge& refund) noexcept;
     void finish_bindings() noexcept;
     void finish_waiters() noexcept;
-    libk::IntrusiveList<mm::Fence, &mm::Fence::hook_> waiters_{};
+    libk::intrusive_list<mm::Fence, &mm::Fence::hook_> waiters_{};
 
     void request_invalidation(Backing& auth, MemWork&& work) noexcept;
     void request_invalidation(Backing& auth, cap::GrantWork&& work) noexcept;
@@ -457,7 +457,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto make_fragment(Map& source, VRange range, Perms perms) noexcept
         -> std::expected<Map*, VSpaceError>;
 
-    [[nodiscard]] auto materialize_fault(VmCtx ctx, Map& mapping, Virt page_address, usize object_page,
+    [[nodiscard]] auto materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize object_page,
                                          WaitRelation* relation, void* owner,
                                          WaitRelation::Publish publish) noexcept
         -> std::expected<FaultResult, VSpaceError>;
@@ -476,7 +476,6 @@ class VSpace final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto step(VmCtx ctx) noexcept -> bool;
     void flush_ready() noexcept;
     [[nodiscard]] auto work_ready() const noexcept -> bool;
-    [[nodiscard]] auto prepare_retire() noexcept -> bool;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
     void detach_view(Borrow& relation) noexcept;
@@ -496,7 +495,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     KSpace* kernel_{};
     WorkQueue* work_{};
     mutable sync::Spin lock_{};
-    libk::ManualLifetime<mm::PageTable> root_{};
+    libk::manual_lifetime<mm::PageTable> root_{};
     Tlb tlb_{};
     object::ref<> payer_{};
     Slab<Map> mappings_;
@@ -507,10 +506,10 @@ class VSpace final : private libk::noncopyable_nonmovable {
     bool editing_{};
     LayoutTree layout_{};
     InvalidationList invalidations_{};
-    libk::IntrusiveList<Backing, &Backing::retired_hook_> retired_{};
+    libk::intrusive_list<Backing, &Backing::retired_hook_> retired_{};
     bool draining_{}; // One stack owns external relation detach/refund callbacks.
-    libk::ManualLifetime<Receipt> receipt_{};
-    libk::ManualLifetime<object::cleanup> cleanup_{};
+    libk::manual_lifetime<Receipt> receipt_{};
+    libk::manual_lifetime<object::cleanup> cleanup_{};
     Work job_{};
     VSpaceState state_{VSpaceState::Live};
     usize bindings_{};

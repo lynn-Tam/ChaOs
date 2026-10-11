@@ -4,8 +4,7 @@
 // semantics only; CPU-local runtime state lives behind the selected arch API.
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
-#include "base/types.hpp"
+#include <libk/types.hpp>
 #include <libk/bits.hpp>
 #include <optional>
 

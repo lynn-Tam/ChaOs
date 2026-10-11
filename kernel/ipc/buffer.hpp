@@ -3,11 +3,11 @@
 #include <utility>
 
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <libk/inplace_vector.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/span.hpp>
+#include <span>
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <uapi/ipc.h>
@@ -30,7 +30,7 @@ enum class BufferError : u8 {
 // PageHold only keeps already-authorized backing safe during an operation.
 class Buffer final : private libk::noncopyable {
 public:
-    using Leases = libk::InplaceVector<
+    using Leases = libk::inplace_vector<
         mm::PageHold, IPC_BUFFER_MAX_PAGES>;
 
     class Perm final : private libk::noncopyable {
@@ -39,11 +39,11 @@ public:
         auto operator=(Perm&&) noexcept -> Perm& = default;
 
         // A bounded single-page borrow, valid for this Perm lifetime.
-        [[nodiscard]] auto bytes(usize offset, usize size) const noexcept -> libk::Span<const byte>;
+        [[nodiscard]] auto bytes(usize offset, usize size) const noexcept -> std::span<const byte>;
         [[nodiscard]] auto read(
-            usize offset, libk::Span<byte> output) const noexcept -> bool;
+            usize offset, std::span<byte> output) const noexcept -> bool;
         [[nodiscard]] auto write(
-            usize offset, libk::Span<const byte> input) noexcept -> bool;
+            usize offset, std::span<const byte> input) noexcept -> bool;
 
     private:
         friend class Buffer;
@@ -63,7 +63,7 @@ public:
     [[nodiscard]] static auto bind(
         mm::Pmm& pmm,
         mm::VSpace& vspace,
-        object::ref<>&& memory_ref,
+        object::ref<> memory_ref,
         mm::Mem& memory,
         mm::ObjectRange object,
         mm::VRange virtual_range) noexcept
@@ -78,9 +78,9 @@ public:
         return virtual_;
     }
     [[nodiscard]] auto read(
-        usize offset, libk::Span<byte> output) const noexcept -> bool;
+        usize offset, std::span<byte> output) const noexcept -> bool;
     [[nodiscard]] auto write(
-        usize offset, libk::Span<const byte> input) noexcept -> bool;
+        usize offset, std::span<const byte> input) noexcept -> bool;
     [[nodiscard]] auto access() const noexcept
         -> std::expected<Perm, BufferError>;
     void reset() noexcept;

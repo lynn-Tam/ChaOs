@@ -4,6 +4,8 @@
 #include <uapi/start.h>
 #include <stdint.h>
 #include <optional>
+#include <array>
+#include <string_view>
 #include <span>
 #include <algorithm>
 #include <sys/handle.hpp>
@@ -11,53 +13,41 @@
 
 namespace boot {
 
+inline constexpr word_t event_badge = 2;
+
 // Owned, bounded argument bytes. The wire form uses offsets, never pointers
 // into the sender's address space. argv[0] names the selected application.
-class Args final {
-  public:
-    static constexpr size_t Max = 16, Bytes = 256;
-    struct Data {
-        size_t count{}, size{};
-        size_t offsets[Max]{};
-        char bytes[Bytes]{};
-    };
-
-  private:
-    Data args_{};
-
-  public:
-    auto append(const char* text, size_t size) noexcept -> bool {
-        if (text == nullptr || args_.count == Max || size >= Bytes - args_.size)
-            return false;
-        for (size_t i = 0; i < size; ++i)
-            if (text[i] == 0)
-                return false;
-        args_.offsets[args_.count++] = args_.size;
-        for (size_t i = 0; i < size; ++i)
-            args_.bytes[args_.size++] = text[i];
-        args_.bytes[args_.size++] = 0;
+class args final {
+    std::array<char, 256> bytes_{};
+    size_t size_{};
+public:
+    static constexpr size_t max = 16;
+    auto data() const noexcept -> const char* { return bytes_.data(); }
+    auto size() const noexcept -> size_t { return size_; }
+    auto count() const noexcept -> size_t {
+        return std::count(bytes_.begin(), bytes_.begin() + size_, '\0');
+    }
+    auto append(const char* text, size_t n) noexcept -> bool {
+        if (!text || n >= bytes_.size() - size_ || count() == max
+            || std::find(text, text + n, '\0') != text + n) return false;
+        std::copy_n(text, n, bytes_.begin() + size_);
+        size_ += n;
+        bytes_[size_++] = 0;
         return true;
     }
-    auto decode(const char* bytes, size_t size) noexcept -> bool {
-        args_ = {};
-        if (bytes == nullptr && size != 0)
-            return false;
-        for (size_t first = 0; first < size;) {
-            size_t end = first;
-            while (end < size && bytes[end] != 0)
-                ++end;
-            if (end == size || !append(bytes + first, end - first)) {
-                args_ = {};
-                return false;
-            }
-            first = end + 1;
-        }
+    auto decode(const char* text, size_t n) noexcept -> bool {
+        size_ = 0;
+        if (n > bytes_.size() || (n && (!text || text[n - 1] != 0))
+            || (n && size_t(std::count(text, text + n, '\0')) > max)) return false;
+        if (n) std::copy_n(text, n, bytes_.begin());
+        size_ = n;
         return true;
     }
-    auto data() const noexcept -> const Data& { return args_; }
-    auto count() const noexcept -> size_t { return args_.count; }
-    auto argument(size_t index) const noexcept -> const char* {
-        return index < args_.count ? args_.bytes + args_.offsets[index] : nullptr;
+    auto argument(size_t i) const noexcept -> const char* {
+        const auto end = bytes_.begin() + size_;
+        auto p = bytes_.begin();
+        while (i-- && p != end) p = std::find(p, end, '\0') + 1;
+        return p == end ? nullptr : &*p;
     }
 };
 
@@ -71,39 +61,10 @@ struct Import final {
     uint16_t minor{};
 };
 
-inline constexpr Import UartMem{"uart.memory", 0x55415254, OBJECT_KIND_MEMORY};
-inline constexpr Import UartIrq{"uart.irq", 0x55415254, OBJECT_KIND_IRQ};
-inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, OBJECT_KIND_CHANNEL, 1, 1};
-inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, OBJECT_KIND_CHANNEL};
-inline constexpr Import Stdin{"stdin", 0x5354524d, OBJECT_KIND_CHANNEL};
-inline constexpr Import Stdout{"stdout", 0x5354524d, OBJECT_KIND_CHANNEL};
-inline constexpr Import Stderr{"stderr", 0x5354524d, OBJECT_KIND_CHANNEL};
-inline constexpr Import Process{"process", 0x50524f43, OBJECT_KIND_CHANNEL, 3, 1};
-inline constexpr Import Files{"files", 0x46494c45, OBJECT_KIND_CHANNEL, 3};
-inline constexpr Import FilesRead{"files.read", 0x46494c45, OBJECT_KIND_CHANNEL, 3};
-inline constexpr Import Block{"block", 0x424c4f43, OBJECT_KIND_CHANNEL, 2, 1};
-inline constexpr Import Store{"store", 0x53544f52, OBJECT_KIND_CHANNEL, 1, 1};
-inline constexpr Import StoreRead{"store.read", 0x53544f52, OBJECT_KIND_CHANNEL, 1, 1};
-inline constexpr Import StoreAdmin{"store.admin", 0x53544f52, OBJECT_KIND_CHANNEL, 1, 1};
-inline constexpr Import Vfs{"vfs", 0x56465320, OBJECT_KIND_CHANNEL};
-inline constexpr Import VfsRead{"vfs.read", 0x56465320, OBJECT_KIND_CHANNEL};
-inline constexpr Import ServiceControl{"service.control", 0x53564354, OBJECT_KIND_CHANNEL};
-inline constexpr Import ServiceWake{"service.wake", 0x53564357, OBJECT_KIND_NOTIFICATION};
-inline constexpr Import Pager{"pager", 0x50414745, OBJECT_KIND_PAGER};
-inline constexpr Import TargetMemory{"target.memory", 0x4d454d4f, OBJECT_KIND_MEMORY};
-inline constexpr Import StagingMemory{"staging.memory", 0x4d454d4f, OBJECT_KIND_MEMORY};
-inline constexpr Import StagingRegion{"staging.region", 0x56535043, OBJECT_KIND_VSPACE};
 // Borrowed immutable records; names and protocol labels confer no authority.
 class BootView final {
     const BootHdr* info_{};
     explicit constexpr BootView(const BootHdr* info) noexcept : info_(info) {}
-    static auto equal(const char* a, const char* b) noexcept -> bool {
-        while (*a && *a == *b) {
-            ++a;
-            ++b;
-        }
-        return *a == *b;
-    }
 
   public:
     BootView() noexcept = default;
@@ -123,45 +84,64 @@ class BootView final {
         const auto entries = view.entries();
         for (size_t i = 0; i < entries.size(); ++i) {
             const auto& e = entries[i];
-            if (!e.handle || e.reserved || e.kind == OBJECT_KIND_INVALID ||
-                e.kind >= OBJECT_KIND_COUNT || ((OBJECT_KINDS >> e.kind) & 1) == 0)
+            if (!e.handle || e.reserved || e.kind == ObjInvalid ||
+                e.kind >= ObjCount || ((OBJ_KINDS >> e.kind) & 1) == 0)
                 return std::nullopt;
-            if (e.role
-                    ? (boot_kind(e.role) != e.kind || e.protocol || e.major || e.minor || e.name[0])
-                    : (!e.protocol || !e.major || !e.name[0] || e.name[BOOT_NAME_MAX - 1]))
-                return std::nullopt;
-            for (size_t j = 0; j < i; ++j)
-                if (e.role ? e.role == entries[j].role
-                           : (!entries[j].role && equal(e.name, entries[j].name)))
+            const bool resource = e.role == BOOT_RESOURCE;
+            if (resource) {
+                if (e.kind != ObjMem && e.kind != ObjIrq && e.kind != ObjHost) return std::nullopt;
+            } else if (e.role == BOOT_FIRMWARE) {
+                if (e.kind != ObjMem || !e.firmware.format || !e.bytes) return std::nullopt;
+            } else if (e.role ? (boot_kind(e.role) != e.kind || e.contract.protocol ||
+                                  e.contract.major || e.contract.minor || e.contract.name[0])
+                             : (!e.contract.protocol || !e.contract.major || !e.contract.name[0] ||
+                                  e.contract.name[BOOT_NAME_MAX - 1])) return std::nullopt;
+            for (size_t j = 0; j < i; ++j) {
+                const auto& prev = entries[j];
+                if (resource ? (prev.role == BOOT_RESOURCE && prev.kind == e.kind &&
+                                    prev.resource.node == e.resource.node && prev.resource.index == e.resource.index)
+                             : (e.role ? e.role == prev.role
+                                       : (!prev.role && std::string_view{e.contract.name} == prev.contract.name)))
                     return std::nullopt;
+            }
         }
         return view;
     }
     auto valid() const noexcept -> bool { return info_ != nullptr; }
     auto data() const noexcept -> const void* { return info_; }
     auto size() const noexcept -> size_t { return info_ ? info_->size : 0; }
-    auto cap(uint32_t role) const noexcept -> std::optional<sys::cap::CapRef> {
+    auto cap(uint32_t role) const noexcept -> std::optional<cap_t> {
         for (const auto& e : entries())
             if (e.role == role && role)
-                return sys::cap::CapRef{e.handle, 0};
+                return e.handle;
         return std::nullopt;
+    }
+    auto resource(uint32_t node, obj_kind_t kind, uint32_t index = 0) const noexcept -> const BootCap* {
+        for (const auto& e : entries())
+            if (e.role == BOOT_RESOURCE && e.kind == kind && e.resource.node == node && e.resource.index == index)
+                return &e;
+        return nullptr;
+    }
+    auto record(uint32_t role) const noexcept -> const BootCap* {
+        for (const auto& e : entries()) if (e.role == role) return &e;
+        return nullptr;
     }
     auto find(Import req) const noexcept -> const BootCap* {
         for (const auto& e : entries())
-            if (!e.role && req.name && equal(e.name, req.name)) {
-                if (e.protocol == req.protocol && e.major == req.major && e.minor >= req.minor &&
+            if (!e.role && req.name && std::string_view{e.contract.name} == req.name) {
+                if (e.contract.protocol == req.protocol && e.contract.major == req.major && e.contract.minor >= req.minor &&
                     e.kind == req.kind) return &e;
                 break;
             }
         return nullptr;
     }
-    auto cap(Import req) const noexcept -> std::optional<sys::cap::CapRef> {
+    auto cap(Import req) const noexcept -> std::optional<cap_t> {
         const auto* e = find(req);
-        return e ? std::optional{sys::cap::CapRef{e->handle, 0}} : std::nullopt;
+        return e ? std::optional{e->handle} : std::nullopt;
     }
     template <class T> auto selector(T req) const noexcept -> cap_t {
         const auto ref = cap(req);
-        return ref ? ref->selector : 0;
+        return ref ? *ref : 0;
     }
     auto cpu_count() const noexcept -> uint32_t { return info_ ? info_->cpu_count : 0; }
     auto stack_base() const noexcept -> uintptr_t { return info_ ? info_->stack_base : 0; }
@@ -170,7 +150,7 @@ class BootView final {
 };
 } // namespace boot
 
-namespace sys::service {
+namespace sys {
 inline auto bootstrap(const void* address, word_t size) noexcept -> boot::BootView {
     auto result = boot::BootView::parse(address, size);
     if (!result || result->cpu_count() == 0)
@@ -186,4 +166,4 @@ inline auto capability(const boot::BootView& info, Binding role) noexcept -> cap
 }
 
 
-} // namespace sys::service
+} // namespace sys

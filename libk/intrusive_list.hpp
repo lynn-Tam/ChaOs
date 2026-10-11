@@ -17,39 +17,39 @@
 
 namespace libk {
 
-class IntrusiveListHook;
+class intrusive_list_hook;
 
-template<typename T, IntrusiveListHook T::* HookMember>
-class IntrusiveList;
+template<typename T, intrusive_list_hook T::* HookMember>
+class intrusive_list;
 
-class IntrusiveListHook {
-    template<typename T, IntrusiveListHook T::* HookMember>
-    friend class IntrusiveList;
+class intrusive_list_hook {
+    template<typename T, intrusive_list_hook T::* HookMember>
+    friend class intrusive_list;
 
 public:
-    constexpr IntrusiveListHook() noexcept = default;
+    constexpr intrusive_list_hook() noexcept = default;
 
-    constexpr IntrusiveListHook(const IntrusiveListHook& other) noexcept {
+    constexpr intrusive_list_hook(const intrusive_list_hook& other) noexcept {
         libk_assert(!other.is_linked());
     }
 
-    constexpr IntrusiveListHook(IntrusiveListHook&& other) noexcept {
+    constexpr intrusive_list_hook(intrusive_list_hook&& other) noexcept {
         libk_assert(!other.is_linked());
     }
 
-    constexpr IntrusiveListHook& operator=(const IntrusiveListHook& other) noexcept {
+    constexpr intrusive_list_hook& operator=(const intrusive_list_hook& other) noexcept {
         libk_assert(!is_linked());
         libk_assert(!other.is_linked());
         return *this;
     }
 
-    constexpr IntrusiveListHook& operator=(IntrusiveListHook&& other) noexcept {
+    constexpr intrusive_list_hook& operator=(intrusive_list_hook&& other) noexcept {
         libk_assert(!is_linked());
         libk_assert(!other.is_linked());
         return *this;
     }
 
-    constexpr ~IntrusiveListHook() {
+    constexpr ~intrusive_list_hook() {
         libk_assert(!is_linked());
     }
 
@@ -76,24 +76,24 @@ private:
 #endif
     }
 
-    IntrusiveListHook* previous_ = nullptr;
-    IntrusiveListHook* next_ = nullptr;
+    intrusive_list_hook* previous_ = nullptr;
+    intrusive_list_hook* next_ = nullptr;
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
     const void* owner_ = nullptr;
 #endif
 };
 
-template<typename T, IntrusiveListHook T::* HookMember>
-class IntrusiveList {
+template<typename T, intrusive_list_hook T::* HookMember>
+class intrusive_list {
     static_assert(std::is_object_v<T> && !std::is_const_v<T>,
-                  "IntrusiveList requires a non-const object type");
+                  "intrusive_list requires a non-const object type");
 
     static constexpr ptrdiff_t unknown_offset_ = static_cast<ptrdiff_t>(-1);
 
 public:
     template<bool IsConst>
     class basic_iterator {
-        friend class IntrusiveList;
+        friend class intrusive_list;
         template<bool>
         friend class basic_iterator;
 
@@ -154,7 +154,7 @@ public:
         }
 
     private:
-        using hook_pointer = std::conditional_t<IsConst, const IntrusiveListHook*, IntrusiveListHook*>;
+        using hook_pointer = std::conditional_t<IsConst, const intrusive_list_hook*, intrusive_list_hook*>;
 
         constexpr basic_iterator(hook_pointer hook, ptrdiff_t hook_offset) noexcept
             : hook_(hook), hook_offset_(hook_offset) {}
@@ -166,19 +166,19 @@ public:
     using iterator = basic_iterator<false>;
     using const_iterator = basic_iterator<true>;
 
-    constexpr IntrusiveList() noexcept {
+    constexpr intrusive_list() noexcept {
         sentinel_.initialize_sentinel(this);
     }
 
-    IntrusiveList(const IntrusiveList&) = delete;
-    IntrusiveList& operator=(const IntrusiveList&) = delete;
+    intrusive_list(const intrusive_list&) = delete;
+    intrusive_list& operator=(const intrusive_list&) = delete;
 
-    constexpr IntrusiveList(IntrusiveList&& other) noexcept {
+    constexpr intrusive_list(intrusive_list&& other) noexcept {
         sentinel_.initialize_sentinel(this);
         steal_from(other);
     }
 
-    constexpr IntrusiveList& operator=(IntrusiveList&& other) noexcept {
+    constexpr intrusive_list& operator=(intrusive_list&& other) noexcept {
         if (this == &other) {
             return *this;
         }
@@ -187,7 +187,7 @@ public:
         return *this;
     }
 
-    constexpr ~IntrusiveList() {
+    constexpr ~intrusive_list() {
         clear();
         sentinel_.reset_unlinked();
     }
@@ -240,7 +240,7 @@ public:
     }
 
     [[nodiscard]] constexpr iterator iterator_to(T& value) noexcept {
-        IntrusiveListHook& hook = hook_of(value);
+        intrusive_list_hook& hook = hook_of(value);
         establish_offset(value);
         assert_owned_or_unlinked(hook, false);
         libk_assert(hook.is_linked());
@@ -248,7 +248,7 @@ public:
     }
 
     [[nodiscard]] constexpr const_iterator iterator_to(const T& value) const noexcept {
-        const IntrusiveListHook& hook = hook_of(value);
+        const intrusive_list_hook& hook = hook_of(value);
         libk_assert(hook_offset_ != unknown_offset_);
         assert_owned_or_unlinked(hook, false);
         libk_assert(hook.is_linked());
@@ -256,7 +256,7 @@ public:
     }
 
     constexpr iterator insert(iterator position, T& value) noexcept {
-        IntrusiveListHook& hook = hook_of(value);
+        intrusive_list_hook& hook = hook_of(value);
         establish_offset(value);
         assert_position(position);
         libk_assert(!hook.is_linked());
@@ -279,7 +279,7 @@ public:
 
     constexpr iterator erase(iterator position) noexcept {
         assert_erasable(position);
-        IntrusiveListHook* next = position.hook_->next_;
+        intrusive_list_hook* next = position.hook_->next_;
         unlink(*position.hook_);
         --size_;
         return iterator(next, iterator_offset());
@@ -304,9 +304,9 @@ public:
     }
 
     constexpr void clear() noexcept {
-        IntrusiveListHook* current = sentinel_.next_;
+        intrusive_list_hook* current = sentinel_.next_;
         while (current != &sentinel_) {
-            IntrusiveListHook* next = current->next_;
+            intrusive_list_hook* next = current->next_;
             current->reset_unlinked();
             current = next;
         }
@@ -314,16 +314,16 @@ public:
         size_ = 0;
     }
 
-    constexpr void splice(iterator position, IntrusiveList& other) noexcept {
+    constexpr void splice(iterator position, intrusive_list& other) noexcept {
         assert_position(position);
         if (other.empty() || this == &other) {
             return;
         }
 
         adopt_offset(other);
-        IntrusiveListHook* first = other.sentinel_.next_;
+        intrusive_list_hook* first = other.sentinel_.next_;
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
-        IntrusiveListHook* last = other.sentinel_.previous_;
+        intrusive_list_hook* last = other.sentinel_.previous_;
 #endif
         transfer_before(*position.hook_, *first, other.sentinel_);
 
@@ -337,12 +337,12 @@ public:
 
     constexpr void splice(
         iterator position,
-        IntrusiveList& other,
+        intrusive_list& other,
         iterator element) noexcept {
         assert_position(position);
         other.assert_erasable(element);
 
-        IntrusiveListHook* next = element.hook_->next_;
+        intrusive_list_hook* next = element.hook_->next_;
         if (this == &other
             && (position.hook_ == element.hook_ || position.hook_ == next)) {
             return;
@@ -361,7 +361,7 @@ public:
 
     constexpr void splice(
         iterator position,
-        IntrusiveList& other,
+        intrusive_list& other,
         iterator first,
         iterator last) noexcept {
         size_t count = 0;
@@ -373,7 +373,7 @@ public:
 
     constexpr void splice(
         iterator position,
-        IntrusiveList& other,
+        intrusive_list& other,
         iterator first,
         iterator last,
         size_t count) noexcept {
@@ -390,7 +390,7 @@ public:
 
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
         size_t actual_count = 0;
-        for (IntrusiveListHook* current = first.hook_;
+        for (intrusive_list_hook* current = first.hook_;
              current != last.hook_;
              current = current->next_) {
             libk_assert(current != &other.sentinel_);
@@ -401,9 +401,9 @@ public:
 #endif
 
         adopt_offset(other);
-        IntrusiveListHook* first_hook = first.hook_;
+        intrusive_list_hook* first_hook = first.hook_;
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
-        IntrusiveListHook* last_moved = last.hook_->previous_;
+        intrusive_list_hook* last_moved = last.hook_->previous_;
 #endif
 
         if (this == &other) {
@@ -411,7 +411,7 @@ public:
                 return;
             }
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
-            for (IntrusiveListHook* current = first_hook;
+            for (intrusive_list_hook* current = first_hook;
                  current != last.hook_;
                  current = current->next_) {
                 libk_assert(current != position.hook_);
@@ -432,11 +432,11 @@ public:
     }
 
 private:
-    [[nodiscard]] static constexpr IntrusiveListHook& hook_of(T& value) noexcept {
+    [[nodiscard]] static constexpr intrusive_list_hook& hook_of(T& value) noexcept {
         return value.*HookMember;
     }
 
-    [[nodiscard]] static constexpr const IntrusiveListHook& hook_of(const T& value) noexcept {
+    [[nodiscard]] static constexpr const intrusive_list_hook& hook_of(const T& value) noexcept {
         return value.*HookMember;
     }
 
@@ -451,7 +451,7 @@ private:
         }
     }
 
-    constexpr void adopt_offset(const IntrusiveList& other) noexcept {
+    constexpr void adopt_offset(const intrusive_list& other) noexcept {
         if (other.hook_offset_ == unknown_offset_) {
             return;
         }
@@ -466,14 +466,14 @@ private:
         return hook_offset_ == unknown_offset_ ? 0 : hook_offset_;
     }
 
-    [[nodiscard]] constexpr T& value_from_hook(IntrusiveListHook& hook) noexcept {
+    [[nodiscard]] constexpr T& value_from_hook(intrusive_list_hook& hook) noexcept {
         libk_assert(hook_offset_ != unknown_offset_);
         auto* hook_bytes = reinterpret_cast<unsigned char*>(std::addressof(hook));
         return *reinterpret_cast<T*>(hook_bytes - hook_offset_);
     }
 
     [[nodiscard]] constexpr const T& value_from_hook(
-        const IntrusiveListHook& hook) const noexcept {
+        const intrusive_list_hook& hook) const noexcept {
         libk_assert(hook_offset_ != unknown_offset_);
         auto* hook_bytes = reinterpret_cast<const unsigned char*>(std::addressof(hook));
         return *reinterpret_cast<const T*>(hook_bytes - hook_offset_);
@@ -493,7 +493,7 @@ private:
     }
 
     constexpr void assert_owned_or_unlinked(
-        const IntrusiveListHook& hook,
+        const intrusive_list_hook& hook,
         bool allow_unlinked) const noexcept {
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
         if (hook.is_linked()) {
@@ -508,37 +508,37 @@ private:
     }
 
     static constexpr void link_before(
-        IntrusiveListHook& position,
-        IntrusiveListHook& node) noexcept {
-        IntrusiveListHook* previous = position.previous_;
+        intrusive_list_hook& position,
+        intrusive_list_hook& node) noexcept {
+        intrusive_list_hook* previous = position.previous_;
         node.previous_ = previous;
         node.next_ = &position;
         previous->next_ = &node;
         position.previous_ = &node;
     }
 
-    static constexpr void unlink(IntrusiveListHook& node) noexcept {
-        IntrusiveListHook* previous = node.previous_;
-        IntrusiveListHook* next = node.next_;
+    static constexpr void unlink(intrusive_list_hook& node) noexcept {
+        intrusive_list_hook* previous = node.previous_;
+        intrusive_list_hook* next = node.next_;
         previous->next_ = next;
         next->previous_ = previous;
         node.reset_unlinked();
     }
 
     static constexpr void transfer_before(
-        IntrusiveListHook& position,
-        IntrusiveListHook& first,
-        IntrusiveListHook& last_exclusive) noexcept {
+        intrusive_list_hook& position,
+        intrusive_list_hook& first,
+        intrusive_list_hook& last_exclusive) noexcept {
         if (&first == &last_exclusive || &position == &last_exclusive) {
             return;
         }
 
-        IntrusiveListHook* before_first = first.previous_;
-        IntrusiveListHook* last = last_exclusive.previous_;
+        intrusive_list_hook* before_first = first.previous_;
+        intrusive_list_hook* last = last_exclusive.previous_;
         before_first->next_ = &last_exclusive;
         last_exclusive.previous_ = before_first;
 
-        IntrusiveListHook* before_position = position.previous_;
+        intrusive_list_hook* before_position = position.previous_;
         before_position->next_ = &first;
         first.previous_ = before_position;
         last->next_ = &position;
@@ -547,10 +547,10 @@ private:
 
 #if LIBK_INTRUSIVE_LIST_DEBUG_OWNER
     static constexpr void update_owner_range(
-        IntrusiveListHook& first,
-        IntrusiveListHook& last,
+        intrusive_list_hook& first,
+        intrusive_list_hook& last,
         const void* owner) noexcept {
-        IntrusiveListHook* current = &first;
+        intrusive_list_hook* current = &first;
         for (;;) {
             current->owner_ = owner;
             if (current == &last) {
@@ -561,7 +561,7 @@ private:
     }
 #endif
 
-    constexpr void steal_from(IntrusiveList& other) noexcept {
+    constexpr void steal_from(intrusive_list& other) noexcept {
         hook_offset_ = other.hook_offset_;
         if (other.empty()) {
             size_ = 0;
@@ -582,7 +582,7 @@ private:
 #endif
     }
 
-    IntrusiveListHook sentinel_{};
+    intrusive_list_hook sentinel_{};
     size_t size_ = 0;
     ptrdiff_t hook_offset_ = unknown_offset_;
 };

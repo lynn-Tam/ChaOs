@@ -9,14 +9,15 @@
 
 namespace libk {
 
-template<UnsignedIntegral T>
+template<unsigned_integer T>
 [[nodiscard]] constexpr auto align_up(T value, size_t alignment) noexcept -> T {
     const auto aligned = checked_align_up(value, alignment);
     libk_assert(aligned.has_value());
     return aligned.value();
 }
 
-template<Pointer T>
+template<class T>
+    requires std::is_pointer_v<T>
 [[nodiscard]] auto align_up(T value, size_t alignment) noexcept -> T {
     const auto aligned = checked_align_up(
         reinterpret_cast<uintptr_t>(value), alignment);

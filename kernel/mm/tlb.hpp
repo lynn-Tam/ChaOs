@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <cpu/types.hpp>
 #include <mm/pmm.hpp>
 #include <sync.hpp>
@@ -86,7 +88,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
     friend class Flush;
     mutable sync::Spin lock_{};
     CpuSet active_{};
-    libk::Atomic<usize> retained_{};
+    std::atomic<usize> retained_{};
 };
 
 // Borrowed hardware root, used by both user and shared kernel address spaces.

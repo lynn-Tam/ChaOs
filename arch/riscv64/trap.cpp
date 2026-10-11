@@ -4,11 +4,8 @@
 #include <csr.hpp>
 #include <libk/mem.h>
 #include <memory>
-#include <mm/table.hpp>
-#include <panic.hpp>
-#include <sync.hpp>
-#include <trace.hpp>
-#include <trap/trap.hpp>
+#include <pte.hpp>
+#include <uapi/riscv64.h>
 
 extern "C" void trap_entry();
 extern "C" [[noreturn]] void user_return(arch::TrapFrame*) noexcept;
@@ -22,16 +19,16 @@ void TrapCtx::complete_breakpoint() noexcept {
 }
 
 bool valid_user_start(UserStart s) noexcept {
-    return mm::is_user(s.entry) && (s.entry.raw() & 1) == 0
-        && s.stack.raw() >= mm::UserBegin && s.stack.raw() <= mm::UserEnd
-        && (s.stack.raw() & 15) == 0;
+    return (s.entry >= RISCV64_LOW_GUARD_END && s.entry < PtUserEnd) && (s.entry & 1) == 0
+        && s.stack >= RISCV64_LOW_GUARD_END && s.stack <= PtUserEnd
+        && (s.stack & 15) == 0;
 }
 
 bool TrapCtx::load_user_start(const UserStart& s) noexcept {
     if (!valid_user_start(s)) return false;
     *frame_ = {};
-    frame_->sepc = s.entry.raw();
-    frame_->gpr[1] = s.stack.raw();
+    frame_->sepc = s.entry;
+    frame_->gpr[1] = s.stack;
     std::copy(s.arguments.begin(), s.arguments.end(), frame_->gpr.begin() + 9);
     // User input never supplies supervisor status bits.
     frame_->sstatus = csr::Sstatus::SPIE;
@@ -53,8 +50,8 @@ std::optional<usize> prepare_user_stack(usize top, UserStart start) noexcept {
 
 [[noreturn]] void resume_user(usize top) noexcept {
     auto* f = reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame));
-    libk_assert(mm::is_user(mm::Virt{f->sepc}) && f->sstatus == csr::Sstatus::SPIE
-                && (f->gpr[1] & 15) == 0);
+    libk_assert(valid_user_start({.entry = f->sepc, .stack = f->gpr[1]})
+                && f->sstatus == csr::Sstatus::SPIE);
     user_return(f);
 }
 
@@ -64,58 +61,39 @@ bool install_trap() noexcept {
 }
 } // namespace arch
 
-static auto decode(const arch::TrapFrame& f) noexcept -> trap::Event {
+auto arch::decode(const arch::TrapFrame& f) noexcept -> arch::TrapEvent {
     using csr::Scause;
     using csr::Sstatus;
-    using trap::Exception;
-    using trap::Perm;
-    auto origin = f.sstatus & Sstatus::SPP ? trap::Origin::Kernel : trap::Origin::User;
+    using Cause = TrapEvent::Cause;
+    using Perm = TrapEvent::Perm;
+    const bool user = !(f.sstatus & Sstatus::SPP);
     auto code = Scause::code(f.scause);
     if (Scause::is_interrupt(f.scause)) {
-        auto kind = trap::Interrupt::Unknown;
+        auto kind = Cause::UnknownIrq;
         switch (static_cast<Scause::Interrupt>(code)) {
-        case Scause::Interrupt::SupervisorTimer: kind = trap::Interrupt::Timer; break;
-        case Scause::Interrupt::SupervisorExternal: kind = trap::Interrupt::External; break;
-        case Scause::Interrupt::SupervisorSoftware: kind = trap::Interrupt::Software; break;
+        case Scause::Interrupt::SupervisorTimer: kind = Cause::Timer; break;
+        case Scause::Interrupt::SupervisorExternal: kind = Cause::External; break;
+        case Scause::Interrupt::SupervisorSoftware: kind = Cause::Ipi; break;
         default: break;
         }
-        return trap::Event::interrupt(origin, kind, f.sepc);
+        return {user, f.sepc, 0, kind};
     }
-    Exception kind = Exception::Unknown;
+    Cause kind = Cause::Unknown;
     Perm perm = Perm::None;
     switch (static_cast<Scause::Exception>(code)) {
-    case Scause::Exception::InstructionAddressMisaligned: kind = Exception::Misaligned; perm = Perm::Execute; break;
-    case Scause::Exception::LoadAddressMisaligned: kind = Exception::Misaligned; perm = Perm::Read; break;
-    case Scause::Exception::StoreAddressMisaligned: kind = Exception::Misaligned; perm = Perm::Write; break;
-    case Scause::Exception::InstructionAccessFault: kind = Exception::AccessFault; perm = Perm::Execute; break;
-    case Scause::Exception::LoadAccessFault: kind = Exception::AccessFault; perm = Perm::Read; break;
-    case Scause::Exception::StoreAccessFault: kind = Exception::AccessFault; perm = Perm::Write; break;
-    case Scause::Exception::InstructionPageFault: kind = Exception::PageFault; perm = Perm::Execute; break;
-    case Scause::Exception::LoadPageFault: kind = Exception::PageFault; perm = Perm::Read; break;
-    case Scause::Exception::StorePageFault: kind = Exception::PageFault; perm = Perm::Write; break;
-    case Scause::Exception::IllegalInstruction: kind = Exception::IllegalInstruction; break;
-    case Scause::Exception::Breakpoint: kind = Exception::Breakpoint; break;
-    case Scause::Exception::UserEnvCall: kind = Exception::Syscall; break;
+    case Scause::Exception::InstructionAddressMisaligned: kind = Cause::Misaligned; perm = Perm::Execute; break;
+    case Scause::Exception::LoadAddressMisaligned: kind = Cause::Misaligned; perm = Perm::Read; break;
+    case Scause::Exception::StoreAddressMisaligned: kind = Cause::Misaligned; perm = Perm::Write; break;
+    case Scause::Exception::InstructionAccessFault: kind = Cause::AccessFault; perm = Perm::Execute; break;
+    case Scause::Exception::LoadAccessFault: kind = Cause::AccessFault; perm = Perm::Read; break;
+    case Scause::Exception::StoreAccessFault: kind = Cause::AccessFault; perm = Perm::Write; break;
+    case Scause::Exception::InstructionPageFault: kind = Cause::PageFault; perm = Perm::Execute; break;
+    case Scause::Exception::LoadPageFault: kind = Cause::PageFault; perm = Perm::Read; break;
+    case Scause::Exception::StorePageFault: kind = Cause::PageFault; perm = Perm::Write; break;
+    case Scause::Exception::IllegalInstruction: kind = Cause::Illegal; break;
+    case Scause::Exception::Breakpoint: kind = Cause::Breakpoint; break;
+    case Scause::Exception::UserEnvCall: kind = Cause::Syscall; break;
     default: break;
     }
-    return trap::Event::exception(origin, kind, perm, f.sepc, f.stval);
+    return {user, f.sepc, f.stval, kind, perm};
 }
-
-extern "C" auto trap_enter(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
-    libk_assert(f);
-    arch::TrapCtx ctx{*f};
-    if ((arch::local() && __atomic_load_n(&arch::local()->stop, __ATOMIC_ACQUIRE))) panic_stop(ctx);
-    auto event = decode(*f);
-    trace::emit(trace::Event::TrapEnter, static_cast<u64>(event.origin()));
-    if (event.origin() != trap::Origin::User || event.interrupt()) trap::handle(event, ctx);
-    return ctx.frame();
-}
-extern "C" auto trap_exit(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
-    libk_assert(f && arch::local()->depth == 0);
-    arch::TrapCtx ctx{*f};
-    sync::assert_unlocked();
-    trap::on_exit(decode(*f), ctx);
-    trace::emit(trace::Event::TrapExit);
-    return ctx.frame();
-}
-extern "C" void trap_return(arch::TrapFrame*) noexcept { trap::on_return(); }

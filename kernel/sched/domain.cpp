@@ -2,7 +2,7 @@
 #include <sched/domain.hpp>
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <sched/sc.hpp>
 #include <sync.hpp>
 
@@ -21,8 +21,8 @@ Domain::~Domain() noexcept {
 auto Domain::share_of(const Sc& sc) noexcept -> u32 {
     const auto c = sc.config();
     // Widen before scaling: every valid u64 budget/period ratio is representable.
-    const auto n = static_cast<unsigned __int128>(c.budget.ticks()) * share_scale;
-    return static_cast<u32>((n + c.period.ticks() - 1) / c.period.ticks());
+    const auto n = static_cast<unsigned __int128>(c.budget) * share_scale;
+    return static_cast<u32>((n + c.period - 1) / c.period);
 }
 
 auto Domain::admit(

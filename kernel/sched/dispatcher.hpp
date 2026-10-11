@@ -5,14 +5,15 @@
 #include <utility>
 
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/types.hpp>
 #include <task/thread.hpp>
 #include <libk/noncopyable.hpp>
 #include <optional>
+#include <limits>
 #include <sched/sc.hpp>
 #include <sched/sched.hpp>
-#include <time/clock.hpp>
+#include <time.hpp>
 #include <uapi/abi.h>
 
 struct Cpu;
@@ -48,11 +49,11 @@ public:
     [[nodiscard]] auto ready_count() const noexcept -> usize {
         return ready_count_;
     }
-    [[nodiscard]] auto remaining_budget() const noexcept -> time::Duration;
+    [[nodiscard]] auto remaining_budget() const noexcept -> u64;
     [[nodiscard]] auto current_urgency() const noexcept -> Urgency;
     [[nodiscard]] auto arm(
         Deadline& deadline,
-        time::Instant when) noexcept -> bool;
+        u64 when) noexcept -> bool;
     void disarm(Deadline& deadline) noexcept;
 
     [[noreturn]] void enter_idle() noexcept;
@@ -97,21 +98,21 @@ private:
     void enqueue(Sc&) noexcept;
     void remove(Sc&) noexcept;
     Sc* select() noexcept;
-    void charge_to(time::Instant now) noexcept;
-    void enqueue_or_throttle(Sc& sc, time::Instant now) noexcept;
-    void process_timers(time::Instant now) noexcept;
-    void process_deadlines(time::Instant now) noexcept;
+    void charge_to(u64 now) noexcept;
+    void enqueue_or_throttle(Sc& sc, u64 now) noexcept;
+    void insert(Deadline&, u64) noexcept;
+    void expire(u64 now) noexcept;
     void dispatch(
         DispatchReason reason,
-        time::Instant now,
+        u64 now,
         status_t exit_status = STATUS_OK) noexcept;
     void commit(
         Sc* candidate,
         DispatchReason reason,
-        time::Instant now,
+        u64 now,
         status_t exit_status) noexcept;
     void publish(Thread* target) noexcept;
-    void program_deadline(time::Instant now) noexcept;
+    void set_timer(u64 now) noexcept;
     void post_switch() noexcept;
     [[nodiscard]] auto stop(Thread* target) noexcept
         -> StopDisposition;
@@ -123,7 +124,7 @@ private:
         Thread* outgoing,
         Thread* incoming,
         DispatchReason reason,
-        time::Instant now) noexcept;
+        u64 now) noexcept;
     void post(Sc&, u8 actions) noexcept;
     void complete(Sc&) noexcept;
     [[nodiscard]] auto post_remote(Sc&, u8 actions) noexcept -> WakeResult;
@@ -134,34 +135,30 @@ private:
     Thread* idle_{};
     time::Clock* clock_{};
     Sc* current_sc_{};
-    time::Instant accounted_at_{};
-    time::Duration quantum_{};
+    u64 accounted_at_{};
+    u64 quantum_{};
+    u64 run_until_{std::numeric_limits<u64>::max()};
     std::optional<DispatchReason> pending_{};
     status_t pending_exit_status_{STATUS_OK};
     usize preempt_depth_{};
     Thread* handoff_outgoing_{};
     DispatchReason handoff_reason_{DispatchReason::Exit};
     status_t handoff_exit_status_{STATUS_OK};
-    using Level = libk::IntrusiveList<Sc, &Sc::ready_hook_>;
+    using Level = libk::intrusive_list<Sc, &Sc::ready_hook_>;
     std::array<Level, Urgency::level_count> ready_{};
     u32 ready_mask_{};
     usize ready_count_{};
-    template<auto Stamp> struct Earlier {
+    struct Earlier {
         bool operator()(const auto& a, const auto& b) const noexcept {
-            return std::pair{Stamp(a), reinterpret_cast<usize>(&a)}
-                 < std::pair{Stamp(b), reinterpret_cast<usize>(&b)};
+            return std::pair{a.when_, reinterpret_cast<usize>(&a)}
+                 < std::pair{b.when_, reinterpret_cast<usize>(&b)};
         }
     };
-    // A throttled ledger is immutable while indexed; no deadline mirror.
-    libk::IntrusiveTree<Sc, &Sc::timer_hook_, Earlier<
-        [](const Sc& sc) { return sc.next_refill(); }>> timers_{};
-    libk::IntrusiveTree<Deadline, &Deadline::hook_, Earlier<
-        [](const Deadline& d) { return d.when_; }>> deadlines_{};
+    libk::intrusive_tree<Deadline, &Deadline::hook_, Earlier> deadlines_{};
     sync::Spin mail_lock_{};
-    libk::IntrusiveList<Sc, &Sc::mail_hook_> mail_{};
-    bool timer_available_{};
-    bool ipi_available_{};
-    time::Instant programmed_deadline_{time::Instant::max()};
+    libk::intrusive_list<Sc, &Sc::mail_hook_> mail_{};
+    bool has_timer_{};
+    bool has_ipi_{};
 };
 
 void yield() noexcept;

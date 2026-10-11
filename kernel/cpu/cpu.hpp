@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <cpu.hpp>
 #include <mm/kspace.hpp>
 #include <object/ref.hpp>
@@ -19,7 +21,11 @@ struct Cpu final : private libk::noncopyable_nonmovable {
     Cpu(CpuId id, CpuHwId hw, Cpus& cpus, object::Objects& objects, cap::Graph& grants) noexcept
         : id(id), hw(hw), cpus(&cpus), objects(objects), grants(grants) {}
     ~Cpu() noexcept;
-    auto online() const noexcept -> bool { return online_.load<libk::MemoryOrder::Acquire>(); }
+    static auto local() noexcept -> Cpu* {
+        auto* e = arch::local();
+        return e ? static_cast<Cpu*>(e->owner) : nullptr;
+    }
+    auto online() const noexcept -> bool { return online_.load(std::memory_order_acquire); }
     auto enter() noexcept -> usize;
     void request_stop() noexcept;
     void install(usize hart) noexcept;
@@ -48,7 +54,7 @@ struct Cpu final : private libk::noncopyable_nonmovable {
 private:
     friend class Cpus;
     auto prepare(mm::KSpace& vm, time::Clock& clock, mm::Stack* boot_stack) noexcept -> bool;
-    libk::Atomic<bool> online_{};
+    std::atomic<bool> online_{};
 };
 static_assert(sizeof(Cpu) <= mm::page_size);
 
@@ -71,9 +77,9 @@ private:
     friend struct Cpu;
 
     // RMW publication chains entrants; the last count observes every online CPU.
-    libk::Atomic<usize> online_{};
+    std::atomic<usize> online_{};
     mm::PageGroup pages_;
-    libk::InplaceVector<Cpu*, MaxCpus> cpus_;
+    libk::inplace_vector<Cpu*, MaxCpus> cpus_;
 };
 
 [[nodiscard]] auto current_cpu() noexcept -> Cpu&;

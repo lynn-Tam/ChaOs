@@ -72,7 +72,7 @@ auto Cpu::prepare(mm::KSpace& vm, time::Clock& clock, mm::Stack* boot_stack) noe
         Thread::KernelStart{idle_entry, this}, Thread::Kind::Idle);
     if (!idle) return false;
     idle_thread = std::move(*idle).publish();
-    entry = {.owner = this, .emergency_stack = emergency_stack->top(), .panic = panic};
+    entry = {.owner = this, .emergency_stack = emergency_stack->top()};
     dispatcher_storage.emplace(*this, this->idle(), clock);
     const auto top = boot_stack ? boot_stack->top() : init_stack->top();
     libk_assert(top && !(top & 15U));
@@ -88,15 +88,15 @@ auto Cpu::enter() noexcept -> usize {
     libk_assert(entry.stack == idle().home_stack_top() && !online());
     // Pair with request_stop: a late entrant must observe the stop, or the
     // requester must observe online and send an IPI.
-    online_.store<libk::MemoryOrder::SeqCst>(true);
+    online_.store(true, std::memory_order_seq_cst);
     if (__atomic_load_n(&entry.stop, __ATOMIC_SEQ_CST))
         ::panic("CPU stopped during startup");
-    return cpus->online_.fetch_add<libk::MemoryOrder::AcqRel>(1) + 1;
+    return cpus->online_.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
 void Cpu::request_stop() noexcept {
     __atomic_store_n(&entry.stop, usize{1}, __ATOMIC_SEQ_CST);
-    if (online_.load<libk::MemoryOrder::SeqCst>()) (void)send_ipi(hw);
+    if (online_.load(std::memory_order_seq_cst)) (void)send_ipi(hw);
 }
 
 Cpus::~Cpus() noexcept {
@@ -131,9 +131,9 @@ void Cpus::start() noexcept {
         auto& cpu = *get(CpuId{i});
         // Publish after the entire CPU list and shared kernel state are ready.
         __atomic_store_n(&cpu.start.ready, CPU_START_READY, __ATOMIC_RELEASE);
-        const auto pa = pages_.owner().phys(mm::Virt{reinterpret_cast<usize>(&cpu.start)}, sizeof(cpu.start));
+        const auto pa = pages_.owner().phys(mm::va_t{reinterpret_cast<usize>(&cpu.start)}, sizeof(cpu.start));
         libk_assert(pa);
-        const auto started = arch::start_secondary(cpu.hw, boot_layout.secondary.pa, pa->raw());
+        const auto started = arch::start_secondary(cpu.hw.raw, boot_layout.secondary.pa, pa->raw());
         if (!started)
             console::print<"cpu: start hart={} error={}\n">(cpu.hw.raw, started.error());
     }
@@ -147,7 +147,7 @@ void Cpus::start() noexcept {
 }
 
 auto current_cpu() noexcept -> Cpu& {
-    auto* const entry = arch::local();
-    libk_assert(entry && entry->owner);
-    return *entry->owner;
+    auto* cpu = Cpu::local();
+    libk_assert(cpu);
+    return *cpu;
 }

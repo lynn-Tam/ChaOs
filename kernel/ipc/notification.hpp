@@ -3,13 +3,13 @@
 #include <optional>
 
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cap/grant.hpp>
 #include <ipc/notification_source.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <sync.hpp>
 #include <object/ref.hpp>
 #include <wait.hpp>
@@ -45,7 +45,7 @@ public:
     [[nodiscard]] auto take() noexcept
         -> std::expected<NotificationTake, NotificationError>;
     // The caller retains object storage until this blocking call returns.
-    [[nodiscard]] auto wait(Thread&, Cpus&, sched::Dispatcher&, std::optional<time::Instant> deadline = std::nullopt) noexcept
+    [[nodiscard]] auto wait(Thread&, Cpus&, sched::Dispatcher&, std::optional<u64> deadline = std::nullopt) noexcept
         -> WaitResult;
     [[nodiscard]] auto bind(
         NotificationSource& source,
@@ -76,15 +76,15 @@ private:
         [[nodiscard]] auto ready(WaitResult) noexcept -> bool;
 
         Notification* owner_;
-        libk::IntrusiveListHook hook_{};
+        libk::intrusive_list_hook hook_{};
 
         WaitResult result_{};
         Completion relation_;
         sched::Deadline deadline_;
     };
-    using Waiters = libk::IntrusiveList<Wait, &Wait::hook_>;
+    using Waiters = libk::intrusive_list<Wait, &Wait::hook_>;
 
-    using Sources = libk::IntrusiveList<
+    using Sources = libk::intrusive_list<
         NotificationSource, &NotificationSource::hook_>;
 
     void release_wait() noexcept;
@@ -95,9 +95,9 @@ private:
 
     u64 pending_{};
     u64 signal_sequence_{};
-    libk::Atomic<Life> life_{Life::Open};
-    libk::Atomic<usize> signalers_{};
-    libk::Atomic<usize> relations_{};
+    std::atomic<Life> life_{Life::Open};
+    std::atomic<usize> signalers_{};
+    std::atomic<usize> relations_{};
     mutable sync::Spin
         receiver_lock_{};
     Sources sources_{};

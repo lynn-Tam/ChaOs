@@ -3,8 +3,8 @@
 #include <cstdio>
 
 namespace {
-using namespace sys::io;
-using Result = libk::RingResult;
+using namespace io;
+using Result = libk::ring_status;
 
 struct Session final {
     ClientPage client_page{};
@@ -19,7 +19,7 @@ auto completion_credits() -> bool {
     for (size_t i = 0; i < QueueDepth; ++i) {
         Request request{.operation = static_cast<uint64_t>(Operation::Read),
                         .offset = i * 512, .length = 512};
-        if (session.client.submit(request) != Result::Ready || request.id != i + 1)
+        if (session.client.submit(request) != Result::ready || request.id != i + 1)
             return false;
     }
     if (!session.client.publish()) return false;
@@ -28,7 +28,7 @@ auto completion_credits() -> bool {
     }
     if (!session.server.release()) return false;
     Request extra{.operation = static_cast<uint64_t>(Operation::Read), .length = 512};
-    if (session.client.submit(extra) != Result::Ready || !session.client.publish()) return false;
+    if (session.client.submit(extra) != Result::ready || !session.client.publish()) return false;
     Ticket next{};
     if (session.server.admit(next) != Admission::Backpressure) return false;
 
@@ -40,25 +40,25 @@ auto completion_credits() -> bool {
     if (session.server.active() != 0 || !session.server.publish()
         || session.server.admit(next) != Admission::Backpressure) return false;
     Completion completion{};
-    if (session.client.take(completion) != Result::Ready || completion.id != QueueDepth
+    if (session.client.take(completion) != Result::ready || completion.id != QueueDepth
         || session.server.admit(next) != Admission::Backpressure) return false;
     if (!session.client.release() || session.server.admit(next) != Admission::Ready
         || next.id != QueueDepth + 1) return false;
     if (session.server.finish(tickets[0], 0, 512)) return false;
     if (!session.server.finish(next, 0, 512) || !session.server.publish()) return false;
     for (size_t i = QueueDepth - 1; i != 0; --i) {
-        if (session.client.take(completion) != Result::Ready || completion.id != i
+        if (session.client.take(completion) != Result::ready || completion.id != i
             || completion.bytes != 512 || completion.status != 0) return false;
     }
-    return session.client.take(completion) == Result::Ready
+    return session.client.take(completion) == Result::ready
         && completion.id == QueueDepth + 1
-        && session.client.take(completion) == Result::Empty;
+        && session.client.take(completion) == Result::empty;
 }
 
 auto cancellation_and_close() -> bool {
     Session session{};
     Request request{.operation = static_cast<uint64_t>(Operation::Read), .length = 4096};
-    if (session.client.submit(request) != Result::Ready || !session.client.publish()) return false;
+    if (session.client.submit(request) != Result::ready || !session.client.publish()) return false;
     Ticket ticket{}, cancelled{};
     if (session.server.admit(ticket) != Admission::Ready
         || session.server.cancel(request.id, cancelled) != STATUS_OK
@@ -67,16 +67,16 @@ auto cancellation_and_close() -> bool {
     // Receipt of cancellation has not ended the borrow or produced a result.
     Completion completion{};
     if (session.server.active() != 1 || session.server.request(ticket) == nullptr
-        || session.client.take(completion) != Result::Empty) return false;
+        || session.client.take(completion) != Result::empty) return false;
     if (!session.server.finish(ticket, STATUS_CANCELED, 0)
         || !session.server.publish()
         || session.server.cancel(request.id, cancelled) != STATUS_NOT_FOUND
         || session.server.finish(ticket, 0, 4096)) return false;
-    if (session.client.take(completion) != Result::Ready
+    if (session.client.take(completion) != Result::ready
         || completion.id != request.id || completion.status != STATUS_CANCELED)
         return false;
     if (!session.client.release() || !session.server.release()) return false;
-    if (session.client.submit(request) != Result::Ready || !session.client.publish()
+    if (session.client.submit(request) != Result::ready || !session.client.publish()
         || session.server.admit(cancelled) != Admission::Ready) return false;
     if (session.server.request(ticket) != nullptr || session.server.abandon(cancelled)
         || !session.server.commit(cancelled)
@@ -92,18 +92,18 @@ auto cancellation_and_close() -> bool {
 
 auto hostile_session() -> bool {
     Session session{};
-    Submissions::Producer peer{session.client_page.submissions, session.server_page.submissions};
+    Submissions::producer peer{session.client_page.submissions, session.server_page.submissions};
     Request request{.id = 7, .operation = 1, .offset = 512, .length = 512};
-    if (peer.push(request.encode()) != Result::Ready || !peer.publish()) return false;
+    if (peer.push(request.encode()) != Result::ready || !peer.publish()) return false;
     Ticket ticket{};
     if (session.server.admit(ticket) != Admission::Ready) return false;
     // Mutating shared words after admission cannot change the retained request.
-    session.client_page.submissions.entries[0][3].store<libk::MemoryOrder::Relaxed>(UINT64_MAX);
+    session.client_page.submissions.entries[0][3].store(UINT64_MAX, std::memory_order_relaxed);
     const auto* retained = session.server.request(ticket);
     if (retained == nullptr || retained->offset != 512) return false;
     if (!session.server.release() || !session.server.finish(ticket, 0, 512)
         || !session.server.publish()) return false;
-    if (peer.push(request.encode()) != Result::Ready || !peer.publish()) return false;
+    if (peer.push(request.encode()) != Result::ready || !peer.publish()) return false;
     Ticket duplicate{};
     return session.server.admit(duplicate) == Admission::InvalidPeer
         && session.server.admit(duplicate) == Admission::Closed;

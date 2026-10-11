@@ -13,7 +13,6 @@
 #include <utility>
 #include <mm/pmm.hpp>
 #include <object/pool.hpp>
-#include <object/group.hpp>
 #include <boot/info.hpp>
 #include <sched/sc.hpp>
 #include <task/thread.hpp>
@@ -41,18 +40,18 @@ static_assert(mm::Perms::of(mm::Perm::Read, mm::Perm::Write).raw()
 constexpr usize cap_test_page_count = 96;
 alignas(mm::page_size) byte
     cap_test_ram[cap_test_page_count * mm::page_size]{};
-constinit libk::ManualLifetime<mm::RegionList> cap_test_map{};
-constinit libk::ManualLifetime<mm::Pmm> cap_test_pmm{};
-constinit libk::ManualLifetime<WorkQueue> cap_work{};
-constinit libk::ManualLifetime<object::pool<sched::Sc>> cap_test_contexts{};
-constinit libk::ManualLifetime<object::pool<object::group>> cap_test_groups{};
-constinit libk::ManualLifetime<object::pool<cap::CSpace>> cap_test_cspaces{};
+constinit libk::manual_lifetime<mm::RegionList> cap_test_map{};
+constinit libk::manual_lifetime<mm::Pmm> cap_test_pmm{};
+constinit libk::manual_lifetime<WorkQueue> cap_work{};
+constinit libk::manual_lifetime<object::pool<sched::Sc>> cap_test_contexts{};
+constinit libk::manual_lifetime<object::pool<object::group>> cap_test_groups{};
+constinit libk::manual_lifetime<object::pool<cap::CSpace>> cap_test_cspaces{};
 
-constinit libk::ManualLifetime<Graph> cap_test_graph{};
-constinit libk::ManualLifetime<CSpace> cap_test_space_a{};
-constinit libk::ManualLifetime<CSpace> cap_test_space_b{};
-constinit libk::ManualLifetime<CSpace> cap_test_space_one{};
-constinit libk::ManualLifetime<cap::Batch> cap_test_transfer{};
+constinit libk::manual_lifetime<Graph> cap_test_graph{};
+constinit libk::manual_lifetime<CSpace> cap_test_space_a{};
+constinit libk::manual_lifetime<CSpace> cap_test_space_b{};
+constinit libk::manual_lifetime<CSpace> cap_test_space_one{};
+constinit libk::manual_lifetime<cap::Batch> cap_test_transfer{};
 
 constexpr Rights inspect_rights = Rights::of(Right::Inspect);
 constexpr Rights basic_rights = Rights::of(
@@ -108,7 +107,7 @@ public:
     [[nodiscard]] auto initialize() noexcept -> bool {
         reset();
         (void)cap_work.emplace();
-        const auto physical = boot_layout.phys(mm::Virt{
+        const auto physical = boot_layout.phys(mm::va_t{
             reinterpret_cast<usize>(cap_test_ram)});
         if (!physical) {
             return false;
@@ -127,7 +126,7 @@ public:
         if (!mm::Pmm::initialize_in(
                 cap_test_pmm, std::move(map), mm::Pmm::Window{
                 .pa = *physical,
-                .va = mm::Virt{
+                .va = mm::va_t{
                     reinterpret_cast<usize>(cap_test_ram)},
                 .size = sizeof(cap_test_ram),
             })) {
@@ -151,10 +150,10 @@ public:
         for (usize index = 0; index < 2; ++index) {
             auto pending = cap_test_contexts->create(
                 sched::Sc::Config{
-                    .budget = time::Duration::from_ticks(index + 1),
-                    .period = time::Duration::from_ticks(10),
+                    .budget = index + 1,
+                    .period = 10,
                 },
-                time::Instant::from_ticks(0));
+                0);
             if (!pending) {
                 reset();
                 return false;
@@ -164,6 +163,17 @@ public:
         return true;
     }
 
+    auto pending_target(usize index) noexcept {
+        libk_assert(targets_[index].retire());
+        targets_[index].reset();
+        drain();
+        auto pending = cap_test_contexts->create(sched::Sc::Config{
+            .budget = 1, .period = 10},
+            0);
+        if (pending) targets_[index] = pending->reference();
+        return pending;
+    }
+
     [[nodiscard]] auto root(
         usize target,
         Rights rights = all_context_rights) noexcept
@@ -171,12 +181,12 @@ public:
         if (target >= 2 || !targets_[target]) {
             return std::unexpected(GrantError::InvalidKey);
         }
-        auto reference = targets_[target].erase();
+        auto reference = object::ref<>{targets_[target]};
         if (!reference) {
             return std::unexpected(GrantError::InvalidState);
         }
         return graph().create_root(
-            std::move(reference).value(),
+            std::move(reference),
             View{rights});
     }
 
@@ -192,14 +202,9 @@ public:
         -> sched::Sc& {
         return targets_[index].get();
     }
-    [[nodiscard]] auto target_ref(usize index) noexcept
-        -> std::expected<object::ref<>,
-            object::error> {
-        if (index >= 2 || !targets_[index]) {
-            return std::unexpected(
-                object::error::invalid_id);
-        }
-        return targets_[index].erase();
+    [[nodiscard]] auto target_ref(usize index) noexcept -> object::ref<> {
+        libk_assert(index < 2);
+        return targets_[index];
     }
     void drain() noexcept { while (cap_work->run()) {} }
     auto settled_grants() noexcept -> usize { drain(); return graph().live_count(); }
@@ -257,11 +262,11 @@ private:
 };
 
 [[nodiscard]] auto decode_and_check(
-    object::ObjectKind kind,
+    ObjKind kind,
     const View& source,
     byte (&bytes)[CAP_ATTENUATION_SIZE]) noexcept -> bool {
     auto decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
         return false;
     }
@@ -282,16 +287,15 @@ bool test_typed_attenuation_covers_all_families(
     using cap::Badge;
     using cap::Quota;
     using cap::VmLimit;
-    using object::ObjectKind;
 
     byte bytes[CAP_ATTENUATION_SIZE]{};
     const View simple{attenuation_rights, std::monostate{}};
-    const ObjectKind simple_kinds[] = {
-        ObjectKind::Thread,
-        ObjectKind::Sc,
-        ObjectKind::Domain,
-        ObjectKind::CSpace};
-    for (const ObjectKind kind : simple_kinds) {
+    const ObjKind simple_kinds[] = {
+        ObjThread,
+        ObjSc,
+        ObjDomain,
+        ObjCSpace};
+    for (const ObjKind kind : simple_kinds) {
         attenuation_bytes(bytes, static_cast<u16>(kind));
         if (!decode_and_check(kind, simple, bytes)) {
             return false;
@@ -303,25 +307,25 @@ bool test_typed_attenuation_covers_all_families(
         MemLimit{
             mm::ObjectRange{0, 16},
             mm::Perms::of(mm::Perm::Read)}};
-    attenuation_bytes(bytes, OBJECT_KIND_MEMORY);
+    attenuation_bytes(bytes, ObjMem);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 1);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 2);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
         static_cast<u64>(VM_READ));
-    if (!decode_and_check(ObjectKind::Mem, memory, bytes)) {
+    if (!decode_and_check(ObjMem, memory, bytes)) {
         return false;
     }
 
     const View vspace{
         attenuation_rights,
         VmLimit{
-            mm::VRange{mm::Virt{0x1000}, 0x10000},
+            mm::VRange{mm::va_t{0x1000}, 0x10000},
             mm::Perms::of(mm::Perm::Read)}};
-    attenuation_bytes(bytes, OBJECT_KIND_VSPACE);
+    attenuation_bytes(bytes, ObjVSpace);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 0x2000);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 0x2000);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, VM_READ);
-    if (!decode_and_check(ObjectKind::VSpace, vspace, bytes)) {
+    if (!decode_and_check(ObjVSpace, vspace, bytes)) {
         return false;
     }
 
@@ -329,53 +333,53 @@ bool test_typed_attenuation_covers_all_families(
         attenuation_rights,
         Quota{
             resource::budget{1024 * 1024, 16},
-            OBJECT_KINDS}};
-    attenuation_bytes(bytes, OBJECT_KIND_RESOURCE_POOL);
+            OBJ_KINDS}};
+    attenuation_bytes(bytes, ObjGroup);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 4096);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 4);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
-        (u64{1} << OBJECT_KIND_MEMORY));
-    if (!decode_and_check(ObjectKind::group, pool, bytes)) {
+        (u64{1} << ObjMem));
+    if (!decode_and_check(ObjGroup, pool, bytes)) {
         return false;
     }
 
     const View notification{
         attenuation_rights, Badge{7}};
-    attenuation_bytes(bytes, OBJECT_KIND_NOTIFICATION);
-    if (!decode_and_check(ObjectKind::Notification, notification, bytes)) {
+    attenuation_bytes(bytes, ObjNotification);
+    if (!decode_and_check(ObjNotification, notification, bytes)) {
         return false;
     }
 
     const View endpoint{
         attenuation_rights, EpLimit{3, 3, 8}};
-    attenuation_bytes(bytes, OBJECT_KIND_ENDPOINT);
+    attenuation_bytes(bytes, ObjEndpoint);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 3);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 3);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, 4);
-    if (!decode_and_check(ObjectKind::Endpoint, endpoint, bytes)) {
+    if (!decode_and_check(ObjEndpoint, endpoint, bytes)) {
         return false;
     }
 
     const View channel{
         attenuation_rights, ChanLimit{ChannelSide::Any, 0, 0}};
-    attenuation_bytes(bytes, OBJECT_KIND_CHANNEL);
+    attenuation_bytes(bytes, ObjChannel);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET,
         CAP_CHANNEL_SIDE_A);
-    if (!decode_and_check(ObjectKind::Channel, channel, bytes)) {
+    if (!decode_and_check(ObjChannel, channel, bytes)) {
         return false;
     }
 
     const View pager{
         attenuation_rights};
-    attenuation_bytes(bytes, OBJECT_KIND_PAGER);
-    if (!decode_and_check(ObjectKind::Pager, pager, bytes)) {
+    attenuation_bytes(bytes, ObjPager);
+    if (!decode_and_check(ObjPager, pager, bytes)) {
         return false;
     }
 
     const View irq{
         attenuation_rights, IrqRoute{4, true}};
-    attenuation_bytes(bytes, OBJECT_KIND_IRQ);
-    return decode_and_check(ObjectKind::Irq, irq, bytes);
+    attenuation_bytes(bytes, ObjIrq);
+    return decode_and_check(ObjIrq, irq, bytes);
 }
 
 bool test_typed_attenuation_rejects_malformed_and_amplifying(
@@ -383,64 +387,63 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
     using cap::ChanLimit;
     using cap::ChannelSide;
     using cap::MemLimit;
-    using object::ObjectKind;
 
     byte bytes[CAP_ATTENUATION_SIZE]{};
-    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
+    attenuation_bytes(bytes, ObjThread);
     bytes[CAP_ATTENUATION_VERSION_OFFSET] = 2;
     if (cap::decode_attenuation(
-            libk::Span<const byte>{bytes, sizeof(bytes)})) {
+            std::span<const byte>{bytes, sizeof(bytes)})) {
         return false;
     }
     attenuation_bytes(bytes, 10);
     if (cap::decode_attenuation(
-            libk::Span<const byte>{bytes, sizeof(bytes)})) {
+            std::span<const byte>{bytes, sizeof(bytes)})) {
         return false;
     }
-    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
+    attenuation_bytes(bytes, ObjThread);
     put64(bytes, CAP_ATTENUATION_WORD5_OFFSET, 1);
     auto decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
         return false;
     }
     const View simple{attenuation_rights, std::monostate{}};
     if (cap::make_attenuation_ceiling(
-            ObjectKind::Thread, simple, decoded.value())) {
+            ObjThread, simple, decoded.value())) {
         return false;
     }
-    attenuation_bytes(bytes, OBJECT_KIND_MEMORY);
-    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, ~u64{});
+    attenuation_bytes(bytes, ObjMem);
+    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, ~u64{0});
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 2);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, VM_READ);
     decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     const View memory{
         attenuation_rights,
         MemLimit{
             mm::ObjectRange{0, 16},
             mm::Perms::of(mm::Perm::Read)}};
     if (!decoded || cap::make_attenuation_ceiling(
-                         ObjectKind::Mem, memory, decoded.value())) {
+                         ObjMem, memory, decoded.value())) {
         return false;
     }
-    attenuation_bytes(bytes, OBJECT_KIND_CHANNEL);
+    attenuation_bytes(bytes, ObjChannel);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET,
         CAP_CHANNEL_SIDE_A);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 1);
-    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, ~u64{});
+    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, ~u64{0});
     decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     const View channel{
         attenuation_rights, ChanLimit{ChannelSide::Any, 0, 0}};
     if (!decoded) {
         return false;
     }
     auto channel_ceiling = cap::make_attenuation_ceiling(
-        ObjectKind::Channel, channel, decoded.value());
+        ObjChannel, channel, decoded.value());
     return channel_ceiling
         && !cap::attenuates(
-            ObjectKind::Channel, channel, channel_ceiling.value());
+            ObjChannel, channel, channel_ceiling.value());
 }
 
 bool test_typed_delegate_transaction_rolls_back(
@@ -459,9 +462,9 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
     byte bytes[CAP_ATTENUATION_SIZE]{};
-    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT);
+    attenuation_bytes(bytes, ObjSc);
     auto decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded) {
         return false;
     }
@@ -494,9 +497,9 @@ bool test_typed_delegate_transaction_rolls_back(
     }
     const usize full_slots = fixture.one().live_slots();
     const usize full_grants = fixture.settled_grants();
-    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT);
+    attenuation_bytes(bytes, ObjSc);
     decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
         || fixture.a().transfer(source.value(), fixture.one(), cap::XferOp::Derive, decoded.value())
         || fixture.one().live_slots() != full_slots
@@ -505,19 +508,19 @@ bool test_typed_delegate_transaction_rolls_back(
         return false;
     }
 
-    attenuation_bytes(bytes, OBJECT_KIND_THREAD);
+    attenuation_bytes(bytes, ObjThread);
     decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
         || fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value())
         || fixture.b().live_slots() != stable_slots
         || fixture.settled_grants() != stable_grants) {
         return false;
     }
-    attenuation_bytes(bytes, OBJECT_KIND_SCHED_CONTEXT,
+    attenuation_bytes(bytes, ObjSc,
         static_cast<u64>(RIGHT_CONTROL));
     decoded = cap::decode_attenuation(
-        libk::Span<const byte>{bytes, sizeof(bytes)});
+        std::span<const byte>{bytes, sizeof(bytes)});
     if (!decoded
         || fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, decoded.value())
         || fixture.b().live_slots() != stable_slots
@@ -564,7 +567,7 @@ bool test_resolve_composes_authority_and_pins_kind(
         auto other = fixture.target_ref(1);
         if (!other) return false;
         auto replaced = fixture.graph().derive(
-            resolved.value().lease(), std::move(other).value(), View{inspect_rights});
+            resolved.value().lease(), std::move(other), View{inspect_rights});
         if (replaced || replaced.error() != cap::GrantError::InvalidKey
             || fixture.settled_grants() != 1) return false;
     }
@@ -641,6 +644,8 @@ bool test_delegation_revoke_waits_for_existing_lease(
     cap::GrantRevoke completion{
         sync::Latch::Notifier::bind<
             &RevokeProbe::ready>(probe)};
+    RevokeProbe closed_probe{};
+    cap::GrantRevoke closed{sync::Latch::Notifier::bind<&RevokeProbe::ready>(closed_probe)};
     libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
     cap::GrantKey child_key{};
     {
@@ -659,6 +664,8 @@ bool test_delegation_revoke_waits_for_existing_lease(
             sched::Sc>(child.value(), inspect_rights);
         auto source_live = fixture.a().resolve<
             sched::Sc>(source.value(), inspect_rights);
+        fixture.graph().close(root_key, closed);
+        if (closed.complete() || closed_probe.signals != 0) return false;
         if (rejected
             || rejected.error()
                 != cap::CSpaceError::GrantUnavailable
@@ -668,7 +675,8 @@ bool test_delegation_revoke_waits_for_existing_lease(
     }
     fixture.drain();
     const auto child_state = fixture.graph().state(child_key);
-    if (!completion.complete() || probe.signals != 1
+    if (!closed.complete() || closed_probe.signals != 1
+        || !completion.complete() || probe.signals != 1
         || child_state
         || child_state.error() != GrantError::InvalidKey) {
         return false;
@@ -676,6 +684,28 @@ bool test_delegation_revoke_waits_for_existing_lease(
     return fixture.b().close(child.value())
         && fixture.a().close(source.value())
         && fixture.settled_grants() == 0;
+}
+
+bool test_close_drains_orphan_operation(const TestContext&) noexcept {
+    CapFixture fixture{};
+    if (!fixture.initialize()) return false;
+    auto root = fixture.root(0);
+    if (!root) return false;
+    const auto key = root->key();
+    auto held = root->acquire();
+    if (!held) return false;
+    root->reset();
+    RevokeProbe probe{};
+    cap::GrantRevoke close{sync::Latch::Notifier::bind<&RevokeProbe::ready>(probe)};
+    fixture.graph().close(key, close);
+    if (close.complete() || probe.signals) return false;
+    held->reset();
+    fixture.drain();
+    if (!close.complete() || probe.signals != 1 || fixture.settled_grants()) return false;
+    RevokeProbe stale_probe{};
+    cap::GrantRevoke stale{sync::Latch::Notifier::bind<&RevokeProbe::ready>(stale_probe)};
+    fixture.graph().close(key, stale);
+    return stale.complete() && stale_probe.signals == 1;
 }
 
 bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexcept {
@@ -1050,17 +1080,17 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     constexpr resource::budget object_charge{
         .memory = mm::page_size,
     };
-    auto made_pool = cap_test_groups->create(*cap_test_pmm, limit);
+    auto made_pool = cap_test_groups->create(limit);
     if (!made_pool) {
         return false;
     }
     auto pool = std::move(made_pool).value().publish();
-    auto pool_ref = pool.erase();
+    auto pool_ref = object::ref<>{pool};
     if (!pool_ref) {
         return false;
     }
     auto charged = pool->reserve(
-        std::move(pool_ref).value(), object_charge);
+        std::move(pool_ref), object_charge);
     if (!charged) {
         return false;
     }
@@ -1217,7 +1247,7 @@ bool test_revoked_tombstones_do_not_retain_target(
         && fixture.settled_grants() == 0;
 }
 
-bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
+bool pending_rollback_closes_lineage(bool deferred) noexcept {
     CapFixture fixture{};
     if (!fixture.initialize()) {
         return false;
@@ -1226,43 +1256,55 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    auto pending_pool = cap_test_groups->create(*cap_test_pmm, limit);
+    auto pending_pool = cap_test_groups->create(limit);
     if (!pending_pool) {
         return false;
     }
     auto pool = std::move(pending_pool).value().publish();
     if (!deferred) {
-        auto self = pool.erase();
+        auto self = object::ref<>{pool};
         auto target = fixture.target_ref(1);
         if (!self || !target) return false;
-        auto rejected = pool->begin(std::move(*self));
-        if (!rejected || rejected->adopt(fixture.graph(), std::move(*target),
+        auto fee = pool->reserve(std::move(self), Graph::node_charge());
+        auto rejected = fixture.pending_target(1);
+        if (!fee || !rejected || rejected->root(fixture.graph(), std::move(*fee),
                                         View{Rights::of(Right::Signal)})) return false;
         rejected->reset(); // Private target rollback before any grant exists.
+        fee->reset();
         fixture.drop_retired_target(1);
         if (pool->available() != limit || fixture.settled_grants()) return false;
     }
 
-    auto txn_ref = pool.erase();
-    if (!txn_ref) {
+    auto payer_ref = object::ref<>{pool};
+    if (!payer_ref) {
         return false;
     }
-    auto txn = pool->begin(std::move(txn_ref).value());
-    auto child_pool_ref = pool.erase();
-    if (!txn || !child_pool_ref) {
+    auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
+    auto creation = fixture.pending_target(0);
+    auto child_pool_ref = object::ref<>{pool};
+    if (!creation || !child_pool_ref) {
         return false;
     }
     auto child_reservation = pool->reserve(
-        std::move(child_pool_ref).value(), Graph::node_charge());
+        std::move(child_pool_ref), Graph::node_charge());
     auto target_ref = fixture.target_ref(0);
     if (!child_reservation || !target_ref) {
         return false;
     }
-    auto allocation = txn.value().adopt(fixture.graph(), std::move(target_ref).value(), View{all_context_rights});
+    auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{all_context_rights});
     if (!allocation) {
         return false;
     }
-    auto root_lease = txn.value().acquire();
+    // A pending slot accepts one initial lineage, never a second owner.
+    {
+        auto payer = object::ref<>{pool};
+        if (!payer) return false;
+        auto fee = pool->reserve(std::move(payer), Graph::node_charge());
+        if (!fee) return false;
+        auto duplicate = creation->root(fixture.graph(), std::move(*fee), View{all_context_rights});
+        if (duplicate || duplicate.error() != GrantError::InvalidState) return false;
+    }
+    auto root_lease = allocation.value().acquire();
     auto child_target = fixture.target_ref(0);
     if (!root_lease || !child_target) {
         return false;
@@ -1270,18 +1312,20 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
     auto child = fixture.graph().derive(
         std::move(child_reservation).value(),
         root_lease.value(),
-        std::move(child_target).value(),
+        std::move(child_target),
         View{inspect_rights});
     root_lease.value().reset();
     if (!child) {
         return false;
     }
 
-    txn.value().reset();
+    creation.value().reset();
+    allocation->reset();
     if (deferred && (!fixture.graph().work_pending() || pool->available() == limit)) return false;
     fixture.drain();
     child.value().reset();
-    txn.value().reset();
+    creation.value().reset();
+    allocation->reset();
     fixture.drop_retired_target(0);
     if (fixture.settled_grants() != 0
         || pool->available() != limit
@@ -1295,11 +1339,11 @@ bool allocation_transaction_aborts_complete_lineage(bool deferred) noexcept {
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_allocation_transaction_aborts_complete_lineage(const TestContext&) noexcept {
-    return allocation_transaction_aborts_complete_lineage(false);
+bool test_pending_rollback_closes_lineage(const TestContext&) noexcept {
+    return pending_rollback_closes_lineage(false);
 }
-bool test_allocation_transaction_defers_rollback(const TestContext&) noexcept {
-    return allocation_transaction_aborts_complete_lineage(true);
+bool test_pending_rollback_defers_refund(const TestContext&) noexcept {
+    return pending_rollback_closes_lineage(true);
 }
 
 bool test_pool_close_revokes_hidden_allocation_root(
@@ -1312,28 +1356,29 @@ bool test_pool_close_revokes_hidden_allocation_root(
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    auto pending_pool = cap_test_groups->create(*cap_test_pmm, limit);
+    auto pending_pool = cap_test_groups->create(limit);
     if (!pending_pool) {
         return false;
     }
     auto pool = std::move(pending_pool).value().publish();
-    auto txn_ref = pool.erase();
-    auto child_pool_ref = pool.erase();
-    if (!txn_ref || !child_pool_ref) {
+    auto payer_ref = object::ref<>{pool};
+    auto child_pool_ref = object::ref<>{pool};
+    if (!payer_ref || !child_pool_ref) {
         return false;
     }
-    auto txn = pool->begin(std::move(txn_ref).value());
+    auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
+    auto creation = fixture.pending_target(0);
     auto child_reservation = pool->reserve(
-        std::move(child_pool_ref).value(), Graph::node_charge());
+        std::move(child_pool_ref), Graph::node_charge());
     auto target_ref = fixture.target_ref(0);
-    if (!txn || !child_reservation || !target_ref) {
+    if (!creation || !child_reservation || !target_ref) {
         return false;
     }
-    auto allocation = txn.value().adopt(fixture.graph(), std::move(target_ref).value(), View{all_context_rights});
+    auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{all_context_rights});
     if (!allocation) {
         return false;
     }
-    auto root_lease = txn.value().acquire();
+    auto root_lease = allocation.value().acquire();
     auto child_target = fixture.target_ref(0);
     if (!root_lease || !child_target) {
         return false;
@@ -1341,7 +1386,7 @@ bool test_pool_close_revokes_hidden_allocation_root(
     auto child = fixture.graph().derive(
         std::move(child_reservation).value(),
         root_lease.value(),
-        std::move(child_target).value(),
+        std::move(child_target),
         View{inspect_rights});
     root_lease.value().reset();
     if (!child) {
@@ -1352,8 +1397,10 @@ bool test_pool_close_revokes_hidden_allocation_root(
     if (!installed) {
         return false;
     }
-    txn.value().commit();
-    txn.value().reset();
+    // Close observes a real pending member; publication must drive it again.
+    if (pool->close() != object::group::phase::closing) return false;
+    creation.value().publish().reset();
+    allocation->reset();
 
     (void)pool->close();
     fixture.drain();
@@ -1398,56 +1445,52 @@ bool test_parent_close_recursively_closes_child_pool(
         .caps = child_slot.caps + child_limit.caps,
     };
 
-    auto pending_parent = cap_test_groups->create(*cap_test_pmm, parent_limit);
+    auto pending_parent = cap_test_groups->create(parent_limit);
     if (!pending_parent) {
         return false;
     }
     auto parent = std::move(pending_parent).value().publish();
-    auto txn_ref = parent.erase();
-    auto child_charge_ref = parent.erase();
-    auto user_charge_ref = parent.erase();
-    if (!txn_ref || !child_charge_ref
+    auto payer_ref = object::ref<>{parent};
+    auto child_charge_ref = object::ref<>{parent};
+    auto user_charge_ref = object::ref<>{parent};
+    if (!payer_ref || !child_charge_ref
         || !user_charge_ref) {
         return false;
     }
-    auto txn = parent->begin(std::move(txn_ref).value());
+    auto root_fee = parent->reserve(std::move(payer_ref), Graph::node_charge());
     auto object_reservation = parent->reserve(
-        std::move(child_charge_ref).value(), child_charge);
+        std::move(child_charge_ref), child_charge);
     auto user_reservation = parent->reserve(
-        std::move(user_charge_ref).value(), Graph::node_charge());
-    if (!txn || !object_reservation
+        std::move(user_charge_ref), Graph::node_charge());
+    if (!root_fee || !object_reservation
         || !user_reservation) {
         return false;
     }
-    auto pending_child = cap_test_groups->create(std::move(object_reservation).value(), *cap_test_pmm, child_limit);
+    auto pending_child = cap_test_groups->create(std::move(object_reservation).value(), child_limit);
     if (!pending_child) {
         return false;
     }
-    auto child = std::move(pending_child).value().publish();
-    auto child_ref = child.erase();
-    if (!child_ref) {
-        return false;
-    }
+    auto child = pending_child->reference();
     const auto rights = Rights::of(
         Right::Inspect, Right::Create, Right::Close, Right::Revoke);
     const cap::Quota authority{
         .budget = child_limit,
         .object_kinds = u64{1} << static_cast<u16>(
-            object::ObjectKind::group),
+            ObjGroup),
     };
-    auto allocation = txn.value().adopt(fixture.graph(), std::move(child_ref).value(), View{rights, authority});
+    auto allocation = pending_child->root(fixture.graph(), std::move(*root_fee), View{rights, authority});
     if (!allocation) {
         return false;
     }
-    auto root_lease = txn.value().acquire();
-    auto user_target = child.erase();
+    auto root_lease = allocation.value().acquire();
+    auto user_target = object::ref<>{child};
     if (!root_lease || !user_target) {
         return false;
     }
     auto user_grant = fixture.graph().derive(
         std::move(user_reservation).value(),
         root_lease.value(),
-        std::move(user_target).value(),
+        std::move(user_target),
         View{rights, authority});
     root_lease.value().reset();
     if (!user_grant) {
@@ -1458,8 +1501,8 @@ bool test_parent_close_recursively_closes_child_pool(
     if (!installed) {
         return false;
     }
-    txn.value().commit();
-    txn.value().reset();
+    pending_child->publish().reset();
+    allocation->reset();
     child.reset();
 
     (void)parent->close();
@@ -1481,40 +1524,44 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
     CapFixture fixture{};
     if (!fixture.initialize()) return false;
     constexpr resource::budget limit{.memory = 8 * mm::page_size, .caps = 8};
-    auto pending = cap_test_groups->create(*cap_test_pmm, limit);
+    auto pending = cap_test_groups->create(limit);
     if (!pending) return false;
     auto pool = std::move(pending).value().publish();
     cap::Handle handles[2]{};
     const auto rights = Rights::of(Right::Inspect, Right::Destroy);
     for (usize index = 0; index < 2; ++index) {
-        auto txn_ref = pool.erase();
-        auto child_ref = pool.erase();
-        if (!txn_ref || !child_ref) return false;
-        auto txn = pool->begin(std::move(txn_ref).value());
-        auto child_charge = pool->reserve(std::move(child_ref).value(), Graph::node_charge());
+        auto payer_ref = object::ref<>{pool};
+        auto child_ref = object::ref<>{pool};
+        if (!payer_ref || !child_ref) return false;
+        auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
+        auto creation = fixture.pending_target(index);
+        auto child_charge = pool->reserve(std::move(child_ref), Graph::node_charge());
         auto target = fixture.target_ref(index);
-        if (!txn || !child_charge || !target) return false;
-        auto allocation = txn.value().adopt(fixture.graph(), std::move(target).value(), View{rights});
+        if (!creation || !child_charge || !target) return false;
+        auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{rights});
         if (!allocation) return false;
-        auto lease = txn.value().acquire();
+        auto lease = allocation.value().acquire();
         auto child_target = fixture.target_ref(index);
         if (!lease || !child_target) return false;
         auto child = fixture.graph().derive(std::move(child_charge).value(), lease.value(),
-            std::move(child_target).value(), View{rights});
+            std::move(child_target), View{rights});
         if (!child) return false;
         auto installed = fixture.a().insert(std::move(child).value(), View{rights});
         if (!installed) return false;
         handles[index] = installed.value();
-        txn.value().commit();
+        // Published caps can be used before the creator commits admission.
+        if (index == 0 && !fixture.a().destroy(handles[index])) return false;
+        creation.value().publish().reset();
+        allocation->reset();
     }
     auto held = fixture.a().resolve<sched::Sc>(handles[1], inspect_rights);
     if (!held) return false;
     std::optional<cap::Resolved<sched::Sc>> retained{std::move(held).value()};
-    if (!fixture.a().destroy(handles[1]) || !fixture.a().destroy(handles[0])) return false;
+    if (!fixture.a().destroy(handles[1])) return false;
     // A retained operation delays its own revoke, not the other local close.
     if (fixture.settled_grants() != 2 || pool->state() != object::group::phase::open)
         return false;
-    if (pool->close() != object::group::phase::revoking) return false;
+    if (pool->close() != object::group::phase::closing) return false;
     retained.reset();
     fixture.drop_retired_target(0);
     fixture.drop_retired_target(1);
@@ -1558,7 +1605,7 @@ void register_cap_tests(TestRegistry& registry) noexcept {
     (void)registry.add("cap", "attachment detach transfers callback quiescence exactly once",
         test_attachment_detach_transfers_quiescence_once);
     (void)registry.add("cap", "unpublished allocation rollback survives deferred revoke work",
-        test_allocation_transaction_defers_rollback);
+        test_pending_rollback_defers_refund);
     (void)registry.add(
         "cap",
         "typed attenuation decodes every supported capability family",
@@ -1583,6 +1630,8 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         "cap",
         "delegation revoke blocks new use and drains old leases",
         test_delegation_revoke_waits_for_existing_lease);
+    (void)registry.add("cap", "lineage close drains the last operation after its last cap",
+        test_close_drains_orphan_operation);
     (void)registry.add(
         "cap",
         "handles are CSpace-local and stale generations stay dead",
@@ -1621,15 +1670,15 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         test_revoked_tombstones_do_not_retain_target);
     (void)registry.add(
         "cap",
-        "allocation transaction abort revokes its complete hidden lineage",
-        test_allocation_transaction_aborts_complete_lineage);
+        "pending rollback revokes its complete hidden lineage",
+        test_pending_rollback_closes_lineage);
     (void)registry.add(
         "cap",
-        "ResourcePool close revokes hidden roots without scanning CSpaces",
+        "group close revokes hidden roots without scanning CSpaces",
         test_pool_close_revokes_hidden_allocation_root);
     (void)registry.add(
         "cap",
-        "parent ResourcePool close recursively drains its child pool",
+        "parent group close recursively drains its child pool",
         test_parent_close_recursively_closes_child_pool);
     (void)registry.add(
         "cap",

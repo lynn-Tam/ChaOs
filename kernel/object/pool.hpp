@@ -1,23 +1,137 @@
 #pragma once
-#include <work.hpp>
 
-#include <libk/assert.hpp>
-#include <base/slab.hpp>
-#include <base/types.hpp>
-#include <libk/delegate.hpp>
+#include <utility>
+#include <libk/unique_handle.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>
-#include <libk/unique_handle.hpp>
+#include <sync.hpp>
+#include <object/ref.hpp>
+#include <cap/grant.hpp>
+#include <resource/sponsorship.hpp>
+#include <work.hpp>
+#include <libk/assert.hpp>
+#include <base/slab.hpp>
+#include <libk/types.hpp>
+#include <libk/delegate.hpp>
 #include <limits>
 #include <memory>
-#include <sync.hpp>
-#include <utility>
 #include <tuple>
 #include <libk/manual_lifetime.hpp>
 #include <mm/pmm.hpp>
-#include <object/ref.hpp>
-#include <object/id.hpp>
-#include <resource/sponsorship.hpp>
+
+namespace object {
+template <typename T> struct traits;
+}
+
+namespace cap {
+class Graph;
+}
+
+namespace object {
+
+class Member;
+
+class group final : private libk::noncopyable_nonmovable {
+  public:
+    enum class phase : u8 {
+        open,
+        closing,
+        closed,
+    };
+
+    explicit group(resource::budget limit) noexcept;
+    ~group() noexcept;
+
+    [[nodiscard]] auto reserve(ref<> self, resource::budget charge) noexcept
+        -> std::expected<resource::Reservation, resource::errc>;
+
+    [[nodiscard]] auto limit() const noexcept -> resource::budget;
+    [[nodiscard]] auto available() const noexcept -> resource::budget;
+    [[nodiscard]] auto sponsorship_count() const noexcept -> usize;
+    [[nodiscard]] auto state() const noexcept -> phase;
+    [[nodiscard]] auto close() noexcept -> phase;
+    [[nodiscard]] auto observe_refund(const ref<>& self, resource::RefundNotifier notifier) noexcept -> bool;
+    void retire(cleanup&&) noexcept;
+
+  private:
+    friend struct traits<group>;
+    template<class T> friend class pool;
+    friend class resource::Reservation;
+    friend class resource::Refund;
+    friend class resource::Charge;
+    friend class resource::Sponsorship;
+    friend class Member;
+
+    void bind_sponsor(resource::Sponsorship& sponsor) noexcept {
+        libk_assert(sponsor_ == nullptr);
+        sponsor_ = &sponsor;
+    }
+
+    [[nodiscard]] auto reserve(const resource::Sponsorship& parent, resource::budget charge) noexcept
+        -> std::expected<resource::Reservation, resource::errc>;
+    void cancel(resource::budget amount) noexcept;
+    void commit() noexcept;
+    void commit(Member& member) noexcept;
+    void ready(Member& member) noexcept;
+    void close_member(Member& member) noexcept;
+    void attach(Member& member) noexcept;
+    void detach(Member& member) noexcept;
+    void attach(resource::Sponsorship& sponsorship) noexcept;
+    void detach(resource::Sponsorship& sponsorship) noexcept;
+    void refund(resource::budget amount) noexcept;
+    void service() noexcept;
+    [[nodiscard]] auto closed_locked() const noexcept -> bool;
+
+    mutable sync::Spin lock_{};
+    resource::Sponsorship* sponsor_{};
+    resource::account account_;
+    phase state_{phase::open};
+    Member* members_{};
+    usize sponsorship_count_{};
+    bool servicing_{};
+    cleanup cleanup_{};
+};
+
+// Embedded in the object slot. The initial grant root closes the entire
+// lineage before this member retires its target.
+class Member final : private libk::noncopyable_nonmovable {
+    enum class phase : u8 {
+        empty,
+        pending,
+        live,
+        revoking,
+        revoked,
+        retiring,
+    };
+
+  public:
+    Member() noexcept;
+    ~Member() noexcept;
+
+  private:
+    friend class group;
+    template<class T> friend class pool;
+
+    auto root(cap::Graph&, resource::Reservation&&, ref<>, cap::View) noexcept
+        -> std::expected<cap::GrantRef, cap::GrantError>;
+    void commit() noexcept;
+    void abort() noexcept;
+    void retire() noexcept;
+    void ready() noexcept;
+
+    resource::Sponsorship fee_{};
+    group* owner_{};
+    cap::Graph* graph_{};
+    cap::GrantKey root_{};
+    ref<> target_{};
+    cap::GrantRevoke revoke_{};
+    Member* previous_{};
+    Member* next_{};
+    phase phase_{phase::empty};
+    bool independent_close_{};
+};
+
+} // namespace object
 
 namespace resource {
 class Sponsorship;
@@ -37,14 +151,6 @@ template <typename T> struct traits {
     {
         value.retire(std::move(cleanup));
     }
-    static auto prepare_retire(T& value) noexcept -> bool {
-        if constexpr (requires { value.prepare_retire(); })
-            return value.prepare_retire();
-        else if constexpr (requires { value.can_retire(); })
-            return value.can_retire();
-        else
-            return true;
-    }
     static void bind_sponsor(T& value, resource::Sponsorship& charge) noexcept
         requires requires { value.bind_sponsor(charge); }
     {
@@ -53,7 +159,7 @@ template <typename T> struct traits {
 };
 
 template <typename T> class pool final : private libk::noncopyable_nonmovable {
-    static_assert(kind<T> != ObjectKind::Invalid);
+    static_assert(kind<T> != ObjInvalid);
 
     struct Slot;
     using Storage = base::slab<Slot, mm::OwnedPage, mm::page_size>;
@@ -61,7 +167,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 
     struct Slot final {
         object::anchor anchor{};
-        resource::Sponsorship sponsorship{};
+        libk::manual_lifetime<Member> member{};
         PageHeader* page{};
         Slot* next_free{};
         Slot* next_reclaim{};
@@ -105,7 +211,22 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         [[nodiscard]] auto publish() noexcept -> reference {
             libk_assert(token_);
             Slot* const slot = token_.release();
-            return token_.get_deleter().owner->publish(slot);
+            auto value = pool::reference_of(*slot);
+            if (slot->member->owner_) slot->member->commit();
+            return value;
+        }
+
+        void reset() noexcept { token_.reset(); }
+
+        [[nodiscard]] auto reference() const noexcept -> ref<T> {
+            libk_assert(token_);
+            auto& slot = *token_.get();
+            token_.get_deleter().owner->retain(slot.anchor, slot.anchor.generation_);
+            return pool::reference_of(slot);
+        }
+        auto root(cap::Graph& graph, resource::Reservation&& fee, cap::View view) noexcept
+            -> std::expected<cap::GrantRef, cap::GrantError> {
+            return token_.get()->member->root(graph, std::move(fee), reference(), view);
         }
 
       private:
@@ -158,17 +279,25 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         }
         Slot* const slot = claimed.value();
         std::construct_at(slot->object(), std::forward<Args>(args)...);
+        if constexpr (requires { slot->object()->bind_work(*work_); })
+            slot->object()->bind_work(*work_);
         if (sponsorship) {
-            slot->sponsorship.commit(std::move(sponsorship));
+            slot->member->fee_.commit(std::move(sponsorship));
             if constexpr (requires(T& object, resource::Sponsorship& owner) {
                 traits<T>::bind_sponsor(object, owner);
-            }) traits<T>::bind_sponsor(*slot->object(), slot->sponsorship);
+            }) traits<T>::bind_sponsor(*slot->object(), slot->member->fee_);
+        }
+        {
+            sync::Lock guard{lock_};
+            libk_assert(slot->anchor.phase_ == anchor::phase::constructing);
+            slot->anchor.refs_ = 1;
+            slot->anchor.phase_ = anchor::phase::live;
         }
         return (pending{*this, *slot});
     }
 
   public:
-    [[nodiscard]] auto lookup(ObjectId id) noexcept -> std::expected<reference, error> {
+    [[nodiscard]] auto lookup(Id id) noexcept -> std::expected<reference, error> {
         sync::Lock guard{lock_};
         Slot* const slot = find_slot(id);
         if (slot == nullptr) {
@@ -180,7 +309,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return (reference_of(*slot));
     }
 
-    [[nodiscard]] auto request_retire(ObjectId id) noexcept -> bool {
+    [[nodiscard]] auto request_retire(Id id) noexcept -> bool {
         Slot* slot{};
         {
             sync::Lock guard{lock_};
@@ -189,16 +318,6 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             slot->anchor.phase_ = anchor::phase::retiring;
             libk_assert(slot->anchor.refs_ != std::numeric_limits<usize>::max());
             ++slot->anchor.refs_;
-        }
-        if constexpr (requires(T& value) { traits<T>::prepare_retire(value); }) {
-            if (!traits<T>::prepare_retire(*slot->object())) {
-                sync::Lock guard{lock_};
-                libk_assert(slot->anchor.phase_ == anchor::phase::retiring);
-                libk_assert(slot->anchor.refs_ != 0);
-                --slot->anchor.refs_;
-                slot->anchor.phase_ = anchor::phase::live;
-                return false;
-            }
         }
         cleanup done{slot->anchor, id.generation};
         if constexpr (requires(T& value, cleanup&& token) { traits<T>::retire(value, std::move(token)); }) {
@@ -216,8 +335,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
   private:
-    [[nodiscard]] auto find_slot(ObjectId id) noexcept -> Slot* {
-        if (!id.valid() || id.kind != object::kind<T>) return nullptr;
+    [[nodiscard]] auto find_slot(Id id) noexcept -> Slot* {
+        if (!id.valid()) return nullptr;
         auto* slot = storage_.find(id.slot);
         return slot != nullptr && slot->anchor.generation_ == id.generation ? slot : nullptr;
     }
@@ -234,6 +353,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                     anchor.clean_ = anchor.queued_ = false;
                     anchor.phase_ = anchor::phase::constructing;
                     entry.slot->next_reclaim = nullptr;
+                    (void)entry.slot->member.emplace();
                     return (entry.slot);
                 }
             }
@@ -253,27 +373,10 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return reference{slot.anchor, slot.anchor.generation_};
     }
 
-    [[nodiscard]] auto publish(Slot* slot) noexcept -> reference {
-        libk_assert(slot != nullptr);
-        sync::Lock guard{lock_};
-        libk_assert(slot->anchor.phase_ == anchor::phase::constructing);
-        libk_assert(slot->anchor.refs_ == 0);
-        slot->anchor.refs_ = 1;
-        slot->anchor.phase_ = anchor::phase::live;
-        return reference_of(*slot);
-    }
-
     void rollback(Slot* slot) noexcept {
-        libk_assert(slot != nullptr);
-        {
-            sync::Lock guard{lock_};
-            libk_assert(slot->anchor.phase_ == anchor::phase::constructing);
-            slot->anchor.phase_ = anchor::phase::quiescent;
-        }
-        traits<T>::destroy(*slot->object());
-        auto refund = slot->sponsorship.detach();
-        finalize_free(*slot);
-        refund.complete();
+        auto target = reference_of(*slot);
+        if (slot->member->owner_) slot->member->abort();
+        else libk_assert(target.retire());
     }
 
     [[nodiscard]] static auto slot_of(anchor& anchor) noexcept -> Slot& {
@@ -291,9 +394,12 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return true;
     }
 
-    [[nodiscard]] auto try_ref(anchor& anchor, u64 generation) noexcept -> bool {
+    void retain(anchor& anchor, u64 generation) noexcept {
         sync::Lock guard{lock_};
-        return add_ref_locked(anchor, generation);
+        libk_assert(anchor.generation_ == generation && anchor.refs_ != 0);
+        libk_assert(anchor.phase_ == anchor::phase::live || anchor.phase_ == anchor::phase::retiring);
+        libk_assert(anchor.refs_ != std::numeric_limits<usize>::max());
+        ++anchor.refs_;
     }
 
     void release_ref(anchor& anchor, u64 generation) noexcept {
@@ -322,8 +428,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         if (queued) notify_cleanup();
     }
 
-    [[nodiscard]] static auto anchor_try_ref(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
-        return static_cast<pool*>(owner)->try_ref(anchor, generation);
+    static void anchor_retain(void* owner, anchor& anchor, u64 generation) noexcept {
+        static_cast<pool*>(owner)->retain(anchor, generation);
     }
 
     static auto anchor_live(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
@@ -338,15 +444,26 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] static auto payload(anchor& anchor) noexcept -> void* { return slot_of(anchor).object(); }
 
+    static auto destroy(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
+        auto& storage = *static_cast<pool*>(owner);
+        auto& member = *slot_of(anchor).member;
+        // The grant operation prevents managed-member detach until this call
+        // returns; its target reference also pins the slot.
+        if (member.owner_) {
+            member.owner_->close_member(member);
+            return true;
+        }
+        return storage.request_retire({reinterpret_cast<usize>(&anchor), generation});
+    }
+
     [[nodiscard]] static auto anchor_request_retire(void* owner, anchor& anchor, u64 generation) noexcept
         -> bool {
         if (anchor.generation_ != generation) {
             return false;
         }
-        return static_cast<pool*>(owner)->request_retire(ObjectId{
+        return static_cast<pool*>(owner)->request_retire(Id{
             .slot = reinterpret_cast<usize>(&anchor),
             .generation = generation,
-            .kind = anchor.kind_,
         });
     }
 
@@ -355,10 +472,11 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     inline static constexpr anchor::Ops anchor_ops_{
-        .try_ref = anchor_try_ref,
+        .retain = anchor_retain,
         .live = anchor_live,
         .drop_ref = anchor_drop_ref,
         .payload = payload,
+        .destroy = destroy,
         .request_retire = anchor_request_retire,
         .finish_cleanup = anchor_finish_cleanup,
     };
@@ -392,7 +510,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                 slot->anchor.phase_ = anchor::phase::quiescent;
             }
             traits<T>::destroy(*slot->object());
-            auto refund = slot->sponsorship.detach();
+            auto refund = slot->member->fee_.detach();
             finalize_free(*slot);
             refund.complete();
         }
@@ -413,6 +531,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             libk_assert(storage_.live() != 0 && slot.page->live != 0);
             slot.anchor.phase_ = anchor::phase::free;
             slot.anchor.clean_ = false;
+            slot.member.reset();
             release = storage_.release(slot);
         }
         if (release != nullptr) {
@@ -442,21 +561,21 @@ template <typename T> using pending = typename pool<T>::pending;
 template <class... Ts> class store {
   public:
     store(mm::Pmm& pmm, WorkQueue& work) noexcept : pmm_(&pmm), work_(&work) {
-        ((void)std::get<libk::ManualLifetime<pool<Ts>>>(pools_).emplace(pmm, work), ...);
+        ((void)std::get<libk::manual_lifetime<pool<Ts>>>(pools_).emplace(pmm, work), ...);
     }
     ~store() noexcept {
         while (work_->run()) {}
-        (std::get<libk::ManualLifetime<pool<Ts>>>(pools_).reset(), ...);
+        (std::get<libk::manual_lifetime<pool<Ts>>>(pools_).reset(), ...);
     }
     auto pmm() noexcept -> mm::Pmm& { return *pmm_; }
     auto work() noexcept -> WorkQueue& { return *work_; }
     template <class T> auto get() noexcept -> pool<T>& {
-        return *std::get<libk::ManualLifetime<pool<T>>>(pools_);
+        return *std::get<libk::manual_lifetime<pool<T>>>(pools_);
     }
   private:
     mm::Pmm* pmm_;
     WorkQueue* work_;
-    std::tuple<libk::ManualLifetime<pool<Ts>>...> pools_;
+    std::tuple<libk::manual_lifetime<pool<Ts>>...> pools_;
 };
 
 } // namespace object

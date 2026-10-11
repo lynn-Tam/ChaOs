@@ -39,7 +39,7 @@ auto Space::state() const noexcept -> SpaceState {
 
 auto Space::reg(usize index) noexcept -> std::expected<std::pair<cap::GrantRef, usize>, SpaceError> {
     sync::Lock guard{lock_};
-    if (state_ != SpaceState::Active || closing_.load<libk::MemoryOrder::Acquire>())
+    if (state_ != SpaceState::Active || closing_.load(std::memory_order_acquire))
         return std::unexpected(SpaceError::InvalidState);
     const auto sources = hw_.get()->regs();
     if (index >= sources.size()) return std::unexpected(SpaceError::InvalidRange);
@@ -54,7 +54,7 @@ auto Space::reg(usize index) noexcept -> std::expected<std::pair<cap::GrantRef, 
 
 auto Space::interrupt() noexcept -> std::expected<cap::GrantRef, SpaceError> {
     sync::Lock guard{lock_};
-    if (state_ != SpaceState::Active || closing_.load<libk::MemoryOrder::Acquire>())
+    if (state_ != SpaceState::Active || closing_.load(std::memory_order_acquire))
         return std::unexpected(SpaceError::InvalidState);
     auto grant = interrupt_grant_.clone();
     if (!grant) return std::unexpected(SpaceError::Denied);
@@ -97,7 +97,7 @@ auto Space::bind(object::ref<> self, cap::Resolved<Host>& host, cap::Resolved<mm
     }
     {
         sync::Lock guard{lock_};
-        if (prepared && !closing_.load<libk::MemoryOrder::Acquire>()) {
+        if (prepared && !closing_.load(std::memory_order_acquire)) {
             hw_.get()->open(std::move(*prepared));
             state_ = SpaceState::Opening;
             work_.post(job_);
@@ -110,7 +110,7 @@ auto Space::bind(object::ref<> self, cap::Resolved<Host>& host, cap::Resolved<mm
     {
         sync::Lock guard{lock_};
         state_ = SpaceState::Closing;
-        closing_.store<libk::MemoryOrder::Release>(true);
+        closing_.store(true, std::memory_order_release);
         work_.post(job_);
     }
     return std::unexpected(error ? *error : SpaceError::Cancelled);
@@ -146,7 +146,7 @@ auto Space::prepare(cap::Resolved<Host>& host, usize requester, cap::Resolved<mm
     metadata_ = pmm_.group();
     Pins** tail = &pins_;
     for (usize offset = 0; offset < range.size();) {
-        if (closing_.load<libk::MemoryOrder::Acquire>()) return std::unexpected(SpaceError::Cancelled);
+        if (closing_.load(std::memory_order_acquire)) return std::unexpected(SpaceError::Cancelled);
         auto page = metadata_.allocate();
         if (!page) return std::unexpected(SpaceError::OutOfMemory);
         auto* block = libk::construct_at(reinterpret_cast<Pins*>(metadata_.bytes(page.value())));
@@ -192,9 +192,9 @@ auto Space::prepare_regs() noexcept -> std::expected<void, SpaceError> {
         const auto physical = sources[index];
         const auto perms = physical.perms;
         if (physical.size == 0) continue;
-        if (closing_.load<libk::MemoryOrder::Acquire>()) return std::unexpected(SpaceError::Cancelled);
+        if (closing_.load(std::memory_order_acquire)) return std::unexpected(SpaceError::Cancelled);
         const usize bytes = (physical.size + mm::page_size - 1) & ~(mm::page_size - 1);
-        const auto range = mm::Pages::from_aligned_bytes(mm::Phys{physical.pa}, bytes);
+        const auto range = mm::Pages::from_aligned_bytes(mm::pa_t{physical.pa}, bytes);
         if (!range) return std::unexpected(SpaceError::InvalidRange);
         const mm::Extent extent{.object = {0, bytes / mm::page_size},
                                       .physical = *range,
@@ -219,8 +219,6 @@ auto Space::prepare_regs() noexcept -> std::expected<void, SpaceError> {
         auto& reg = **node;
         regs_.push_back(reg);
         reg.memory = std::move(pending).value().publish();
-        auto target = reg.memory.erase();
-        libk_assert(target);
         // Space's allocation root owns these subordinate objects. Binding
         // excludes cleanup until every constructed object is recorded here.
         // Only Space invalidates this lineage; users may duplicate/delegate.
@@ -228,7 +226,7 @@ auto Space::prepare_regs() noexcept -> std::expected<void, SpaceError> {
                                                 cap::Right::Delegate),
                                 cap::MemLimit{{0, bytes / mm::page_size},
                                               perms}};
-        auto grant = grants_.create_root(std::move(grant_charge), std::move(target).value(), ceiling);
+        auto grant = grants_.create_root(std::move(grant_charge), reg.memory, ceiling);
         if (!grant) return std::unexpected(SpaceError::OutOfMemory);
         reg.grant = std::move(grant).value();
     }
@@ -264,10 +262,8 @@ auto Space::prepare_interrupt() noexcept -> std::expected<void, SpaceError> {
         object_charge ? irqs_.create(std::move(object_charge), source) : irqs_.create(source);
     if (!pending) return std::unexpected(SpaceError::OutOfMemory);
     interrupt_ = std::move(pending).value().publish();
-    auto target = interrupt_.erase();
-    libk_assert(target);
     auto grant =
-        grants_.create_root(std::move(grant_charge), std::move(target).value(),
+        grants_.create_root(std::move(grant_charge), interrupt_,
                             {cap::Rights::of(cap::Right::Inspect, cap::Right::Duplicate, cap::Right::Delegate,
                                              cap::Right::Route, cap::Right::Observe, cap::Right::Ack),
                              cap::IrqRoute{source.id, source.level}});
@@ -290,8 +286,8 @@ auto Space::retire_interrupt() noexcept -> bool {
 
 void Space::stop_host(bool fault) noexcept {
     auto& space = *this;
-    if (fault) space.fault_signal_.store<libk::MemoryOrder::Release>(true);
-    space.closing_.store<libk::MemoryOrder::Release>(true);
+    if (fault) space.fault_signal_.store(true, std::memory_order_release);
+    space.closing_.store(true, std::memory_order_release);
     space.work_.post(space.job_);
 }
 
@@ -300,7 +296,7 @@ void Space::invalidate_memory(void* ctx, mm::MemWork&& work) noexcept {
     sync::Lock guard{space.lock_};
     libk_assert(!space.memory_work_);
     space.memory_work_ = std::move(work);
-    space.closing_.store<libk::MemoryOrder::Release>(true);
+    space.closing_.store(true, std::memory_order_release);
     space.work_.post(space.job_);
 }
 
@@ -309,7 +305,7 @@ void Space::invalidate_host_grant(void* ctx, cap::GrantWork&& work) noexcept {
     sync::Lock guard{space.lock_};
     libk_assert(!space.host_work_);
     space.host_work_ = std::move(work);
-    space.closing_.store<libk::MemoryOrder::Release>(true);
+    space.closing_.store(true, std::memory_order_release);
     space.work_.post(space.job_);
 }
 
@@ -318,7 +314,7 @@ void Space::invalidate_memory_grant(void* ctx, cap::GrantWork&& work) noexcept {
     sync::Lock guard{space.lock_};
     libk_assert(!space.grant_work_);
     space.grant_work_ = std::move(work);
-    space.closing_.store<libk::MemoryOrder::Release>(true);
+    space.closing_.store(true, std::memory_order_release);
     space.work_.post(space.job_);
 }
 
@@ -333,7 +329,7 @@ void Space::close() noexcept {
                    state_ == SpaceState::Failed)
             return;
         else {
-            closing_.store<libk::MemoryOrder::Release>(true);
+            closing_.store(true, std::memory_order_release);
             work_.post(job_);
         }
     }
@@ -345,7 +341,7 @@ void Space::retire(object::cleanup&& cleanup) noexcept {
         sync::Lock guard{lock_};
         if (state_ != SpaceState::Empty && state_ != SpaceState::Closed && state_ != SpaceState::Faulted) {
             cleanup_ = std::move(cleanup);
-            closing_.store<libk::MemoryOrder::Release>(true);
+            closing_.store(true, std::memory_order_release);
             work_.post(job_);
             return;
         }
@@ -370,12 +366,12 @@ auto Space::service() noexcept -> Completion {
     {
         sync::Lock guard{lock_};
         if (state_ == SpaceState::Binding || state_ == SpaceState::Failed) return {};
-        if (fault_signal_.exchange<libk::MemoryOrder::AcqRel>(false)) {
+        if (fault_signal_.exchange(false, std::memory_order_acq_rel)) {
             faulted_ = true;
             state_ = SpaceState::Closing;
             notify_fault = true;
         }
-        close_hardware = closing_.load<libk::MemoryOrder::Acquire>();
+        close_hardware = closing_.load(std::memory_order_acquire);
     }
     if (notify_fault) (void)fault_source_.signal();
     // Only this executor mutates a published lease. poll may release a large
@@ -392,7 +388,7 @@ auto Space::service() noexcept -> Completion {
         hardware = hw_.get()->poll();
     }
     if (hardware == Hw::State::Failed) {
-        closing_.store<libk::MemoryOrder::Release>(true);
+        closing_.store(true, std::memory_order_release);
         if (!close_hardware) {
             const bool regs_done = retire_regs();
             const bool interrupt_done = retire_interrupt();
@@ -410,7 +406,7 @@ auto Space::service() noexcept -> Completion {
     }
     {
         sync::Lock guard{lock_};
-        if (closing_.load<libk::MemoryOrder::Acquire>()) state_ = SpaceState::Closing;
+        if (closing_.load(std::memory_order_acquire)) state_ = SpaceState::Closing;
         if (hw_) {
             if (state_ != SpaceState::Closing) {
                 state_ = hardware == Hw::State::Active ? SpaceState::Active : SpaceState::Opening;
@@ -453,7 +449,7 @@ auto Space::service() noexcept -> Completion {
     interrupt_.reset();
     memory_.reset();
     host_.reset();
-    if (fault_signal_.exchange<libk::MemoryOrder::AcqRel>(false) && !faulted_) {
+    if (fault_signal_.exchange(false, std::memory_order_acq_rel) && !faulted_) {
         faulted_ = true;
         (void)fault_source_.signal();
     }

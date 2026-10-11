@@ -97,7 +97,7 @@ template<typename T>
 
 template<typename Ptr>
 class not_null {
-    static_assert(Pointer<Ptr>, "not_null currently supports raw pointer types");
+    static_assert(std::is_pointer_v<Ptr>, "not_null currently supports raw pointer types");
 
 public:
     using pointer = Ptr;

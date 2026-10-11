@@ -1,6 +1,7 @@
 #include <cpu/ipi.hpp>
 #include <expected>
 #include <bit>
+#include <algorithm>
 #include <utility>
 #include <sched/dispatcher.hpp>
 #include <trace.hpp>
@@ -13,6 +14,7 @@
 #include <sched/domain.hpp>
 #include <sync.hpp>
 #include <libk/checked_arithmetic.hpp>
+#include <libk/scope_guard.hpp>
 #include <limits>
 #include <task/thread.hpp>
 #include <wait.hpp>
@@ -27,11 +29,11 @@ Dispatcher::Dispatcher(
 {
     libk_assert(idle_->idle());
     libk_assert(idle_->state_ == Thread::State::Prepared);
-    const auto quantum = clock_->duration_from_nanoseconds(4'000'000);
-    libk_assert(quantum && !quantum->empty());
+    const auto quantum = clock_->ticks<4, time::ms>();
+    libk_assert(quantum && *quantum != 0);
     quantum_ = *quantum;
-    timer_available_ = arch::timer_available();
-    ipi_available_ = arch::ipi_available();
+    has_timer_ = arch::timer_available();
+    has_ipi_ = arch::ipi_available();
 }
 
 auto Dispatcher::id() const noexcept -> CpuId { return cpu_.id; }
@@ -60,9 +62,9 @@ auto Dispatcher::current() const noexcept -> Thread* {
     return cpu_.current;
 }
 
-auto Dispatcher::remaining_budget() const noexcept -> time::Duration {
+auto Dispatcher::remaining_budget() const noexcept -> u64 {
     libk_assert(current_sc_ != nullptr);
-    return current_sc_->available(clock_->now());
+    return current_sc_->available(clock_->rd_ticks());
 }
 
 auto Dispatcher::current_urgency() const noexcept -> Urgency {
@@ -72,31 +74,36 @@ auto Dispatcher::current_urgency() const noexcept -> Urgency {
 
 auto Dispatcher::arm(
     Deadline& deadline,
-    time::Instant when) noexcept -> bool {
+    u64 when) noexcept -> bool {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
-    if (!timer_available_ || deadline.armed() || !deadline.callback_) {
+    libk_assert(Cpu::local() == &cpu_);
+    if (!has_timer_ || deadline.armed() || !deadline.cb_) {
         return false;
     }
-    deadline.when_ = when;
-    deadlines_.insert(deadline);
-    deadline.owner_ = this;
-    program_deadline(clock_->now());
+    insert(deadline, when);
+    set_timer(clock_->rd_ticks());
     return true;
+}
+
+void Dispatcher::insert(Deadline& d, u64 when) noexcept {
+    libk_assert(!d.armed());
+    d.when_ = when;
+    deadlines_.insert(d);
+    d.owner_ = this;
 }
 
 void Dispatcher::disarm(Deadline& deadline) noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
+    libk_assert(Cpu::local() == &cpu_);
     libk_assert(deadline.owner_ == this);
     deadlines_.erase(deadline);
     deadline.owner_ = nullptr;
-    program_deadline(clock_->now());
+    set_timer(clock_->rd_ticks());
 }
 
 void Dispatcher::publish(Thread* target) noexcept {
     libk_assert(!arch::interrupts_enabled());
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_);
+    libk_assert(Cpu::local() == &cpu_);
     libk_assert(target);
     const usize stack_top = target->current_stack_top();
     libk_assert(stack_top != 0 && (stack_top & 0xfU) == 0);
@@ -112,9 +119,9 @@ void Dispatcher::publish(Thread* target) noexcept {
     libk_assert(!cpu_.current);
     libk_assert(idle_->state_ == Thread::State::Prepared);
     idle_->set_state(Thread::State::Running);
-    accounted_at_ = clock_->now();
+    accounted_at_ = clock_->rd_ticks();
     publish(idle_);
-    program_deadline(accounted_at_);
+    set_timer(accounted_at_);
     Thread* idle = idle_;
     record_dispatch(idle, idle, DispatchReason::Start, accounted_at_);
     arch::enter_ctx(idle_->ctx());
@@ -129,7 +136,7 @@ void Dispatcher::on_context_enter() noexcept {
     libk_assert(cpu_.tlb
         == &roots.root().state());
     post_switch();
-    if (ipi_available_) {
+    if (has_ipi_) {
         arch::enable_ipi();
     }
     arch::enable_interrupts();
@@ -166,20 +173,20 @@ auto Dispatcher::make_ready(Sc& sc) noexcept -> bool {
     if (!target->claim_home(*this)) {
         return false;
     }
-    const time::Instant now = clock_->now();
-    if (sc.timer_queued()) {
+    const u64 now = clock_->rd_ticks();
+    if (sc.refill_.armed()) {
         if (exec.state_ != Thread::State::Throttled) {
             return false;
         }
         if (!context.eligible(now)) {
             return true;
         }
-        timers_.erase(sc);
+        disarm(sc.refill_);
     }
     enqueue_or_throttle(sc, now);
 
     if (exec.state_ == Thread::State::Throttled) {
-        program_deadline(now);
+        set_timer(now);
         return true;
     }
     request_reschedule(DispatchReason::RemoteWake);
@@ -240,8 +247,8 @@ auto Dispatcher::post_start(Sc& sc) noexcept -> WakeResult {
 void Dispatcher::post(Sc& sc, u8 actions) noexcept {
     sync::Lock guard{mail_lock_};
     sc.actions_ |= actions;
-    if (!sc.mailed_.load<libk::MemoryOrder::Relaxed>()) {
-        sc.mailed_.store<libk::MemoryOrder::Release>(true);
+    if (!sc.mailed_.load(std::memory_order_relaxed)) {
+        sc.mailed_.store(true, std::memory_order_release);
         mail_.push_back(sc);
     }
     trace::emit(trace::Event::Post, reinterpret_cast<u64>(&sc), actions);
@@ -249,17 +256,17 @@ void Dispatcher::post(Sc& sc, u8 actions) noexcept {
 
 void Dispatcher::complete(Sc& sc) noexcept {
     sync::Lock guard{mail_lock_};
-    libk_assert(sc.mailed_.load<libk::MemoryOrder::Relaxed>() && !sc.mail_hook_.is_linked());
+    libk_assert(sc.mailed_.load(std::memory_order_relaxed) && !sc.mail_hook_.is_linked());
     if (sc.actions_) mail_.push_back(sc);
-    else sc.mailed_.store<libk::MemoryOrder::Release>(false);
+    else sc.mailed_.store(false, std::memory_order_release);
 }
 
 auto Dispatcher::post_remote(Sc& sc, u8 actions) noexcept -> WakeResult {
-    if (!ipi_available_) return std::unexpected(WakeError::Unavailable);
+    if (!has_ipi_) return std::unexpected(WakeError::Unavailable);
     {
         // Serialize publication with external unbind. The binding keeps both
         // Sc and Thread resident until the home consumer completes its mail.
-        sync::Lock guard{sc.authority_lock_};
+        sync::Lock guard{sc.lock_};
         if (!sc.owner_) return std::unexpected(WakeError::Unavailable);
         sync::Lock target_guard{sc.thread().lock_};
         if (sc.thread().sc_ != &sc) return std::unexpected(WakeError::Unavailable);
@@ -269,7 +276,7 @@ auto Dispatcher::post_remote(Sc& sc, u8 actions) noexcept -> WakeResult {
 }
 
 auto Dispatcher::kick_remote() noexcept -> WakeResult {
-    if (!ipi_available_) {
+    if (!has_ipi_) {
         return std::unexpected(WakeError::Unavailable);
     }
     for (usize attempt = 0; attempt < 8; ++attempt) {
@@ -288,7 +295,7 @@ auto Dispatcher::kick_remote() noexcept -> WakeResult {
 
 void Dispatcher::request_stop(Thread& entity) noexcept {
     auto* target = &entity;
-    if ((arch::local() ? arch::local()->owner : nullptr) == &cpu_) {
+    if (Cpu::local() == &cpu_) {
         sync::Irq irq{};
         // A target may finish its ordinary exit after the stop owner publishes
         // the terminal transaction but before this owner-CPU call is entered.
@@ -302,7 +309,7 @@ void Dispatcher::request_stop(Thread& entity) noexcept {
         return;
     }
 
-    if (!ipi_available_) {
+    if (!has_ipi_) {
         panic("remote stop requires IPI");
     }
 
@@ -364,10 +371,10 @@ void Dispatcher::drain_remote() noexcept {
 
 void Dispatcher::enqueue_or_throttle(
     Sc& sc,
-    time::Instant now) noexcept {
+    u64 now) noexcept {
     Thread& exec = sc.thread();
     Sc& context = sc;
-    libk_assert(!sc.queued() && !sc.timer_queued());
+    libk_assert(!sc.queued() && !sc.refill_.armed());
     if (context.eligible(now)) {
         exec.set_state(Thread::State::Ready);
         enqueue(sc);
@@ -376,64 +383,49 @@ void Dispatcher::enqueue_or_throttle(
     const auto deadline = context.next_refill();
     libk_assert(deadline > now);
     exec.set_state(Thread::State::Throttled);
-    timers_.insert(sc);
+    insert(sc.refill_, deadline);
 }
 
-void Dispatcher::process_timers(time::Instant now) noexcept {
-    for (;;) {
-        Sc* const sc = timers_.minimum();
-        if (!sc || sc->next_refill() > now) return;
-        timers_.erase(*sc);
-        libk_assert(sc->thread().state_
-            == Thread::State::Throttled);
-        enqueue_or_throttle(*sc, now);
-
-    }
-}
-
-void Dispatcher::process_deadlines(time::Instant now) noexcept {
+void Dispatcher::expire(u64 now) noexcept {
+    // Completion callbacks may wake this CPU. Commit only after all due
+    // events are published, never recursively from a callback's guard.
+    ++preempt_depth_;
+    const auto done = libk::on_scope_exit([this]() noexcept { --preempt_depth_; });
     for (;;) {
         Deadline* const deadline = deadlines_.minimum();
         if (!deadline || deadline->when_ > now) return;
         libk_assert(deadline->owner_ == this);
         deadlines_.erase(*deadline);
         deadline->owner_ = nullptr;
-        const Deadline::Callback callback = deadline->callback_;
-        libk_assert(callback);
-        callback();
+        const Deadline::Fn cb = deadline->cb_;
+        libk_assert(cb);
+        cb();
     }
 }
 
-void Dispatcher::charge_to(time::Instant now) noexcept {
-    const auto elapsed = now.elapsed_since(accounted_at_);
-    libk_assert(elapsed);
-    if (current_sc_ != nullptr && !elapsed->empty()) {
-        current_sc_->charge(now, *elapsed);
-    }
+void Dispatcher::charge_to(u64 now) noexcept {
+    libk_assert(now >= accounted_at_);
+    const u64 elapsed = now - accounted_at_;
+    if (current_sc_ && elapsed != 0) current_sc_->charge(now, elapsed);
     accounted_at_ = now;
 }
 
 void Dispatcher::yield() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    dispatch(DispatchReason::Yield, clock_->now());
+    dispatch(DispatchReason::Yield, clock_->rd_ticks());
 }
 
 void Dispatcher::block_current() noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(cpu_.current && !cpu_.current->idle());
     libk_assert(current_sc_ != nullptr);
-    if (current_sc_->wake_credit_) {
-        current_sc_->wake_credit_ = false;
-
-        return;
-    }
-    dispatch(DispatchReason::Block, clock_->now());
+    dispatch(DispatchReason::Block, clock_->rd_ticks());
 }
 
 [[noreturn]] void Dispatcher::exit_current() noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(cpu_.current && !cpu_.current->idle());
-    dispatch(DispatchReason::Exit, clock_->now());
+    dispatch(DispatchReason::Exit, clock_->rd_ticks());
     libk_assert(false);
     __builtin_unreachable();
 }
@@ -464,11 +456,11 @@ void Dispatcher::request_reschedule(
 
 void Dispatcher::on_timer() noexcept {
     libk_assert(!arch::interrupts_enabled());
-    const time::Instant now = clock_->now();
+    const u64 now = clock_->rd_ticks();
 
     charge_to(now);
     arch::mask_timer();
-    process_deadlines(now);
+    expire(now);
     request_reschedule(DispatchReason::Timer);
 }
 
@@ -490,7 +482,7 @@ void Dispatcher::on_trap_exit() noexcept {
         block_current();
         return;
     }
-    dispatch(reason, clock_->now(), exit_status);
+    dispatch(reason, clock_->rd_ticks(), exit_status);
 }
 
 void Dispatcher::disable_preemption() noexcept {
@@ -510,13 +502,19 @@ void Dispatcher::enable_preemption() noexcept {
 
 void Dispatcher::dispatch(
     DispatchReason reason,
-    time::Instant now,
+    u64 now,
     status_t exit_status) noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(arch::local()->depth == 0);
     libk_assert(cpu_.current);
     charge_to(now);
-    process_timers(now);
+    expire(now);
+    // Expiry can complete the current Wait synchronously. Consume its wake
+    // after publication, before committing the previously requested block.
+    if (reason == DispatchReason::Block && std::exchange(current_sc_->wake_credit_, false)) {
+        set_timer(now);
+        return;
+    }
 
     Thread* outgoing = cpu_.current;
     Sc* const outgoing_sc = current_sc_;
@@ -551,7 +549,7 @@ void Dispatcher::dispatch(
     Sc* const candidate = select();
     if (candidate == nullptr && outgoing->idle()) {
         outgoing->set_state(Thread::State::Running);
-        program_deadline(now);
+        set_timer(now);
         record_dispatch(outgoing, outgoing, reason, now);
         return;
     }
@@ -566,7 +564,7 @@ void Dispatcher::dispatch(
 void Dispatcher::commit(
     Sc* candidate,
     DispatchReason reason,
-    time::Instant now,
+    u64 now,
     status_t exit_status) noexcept {
     Thread* outgoing = cpu_.current;
     Thread* incoming = idle_;
@@ -598,8 +596,15 @@ void Dispatcher::commit(
     }
 
     current_sc_ = incoming_sc;
+    run_until_ = std::numeric_limits<u64>::max();
+    if (incoming_sc) {
+        const auto budget = incoming_sc->available(now);
+        const auto end = libk::checked_add(now, std::min(budget, quantum_));
+        libk_assert(end);
+        run_until_ = *end;
+    }
     publish(incoming);
-    program_deadline(now);
+    set_timer(now);
     record_dispatch(outgoing, incoming, reason, now);
 
     if (incoming == outgoing) {
@@ -619,38 +624,21 @@ void Dispatcher::commit(
     post_switch();
 }
 
-void Dispatcher::program_deadline(time::Instant now) noexcept {
-    if (!timer_available_) {
-        programmed_deadline_ = time::Instant::max();
+void Dispatcher::set_timer(u64 now) noexcept {
+    if (!has_timer_) {
         arch::mask_timer();
         return;
     }
 
-    time::Instant deadline = time::Instant::max();
-    if (current_sc_ != nullptr) {
-        const time::Duration budget =
-            current_sc_->available(now);
-        const time::Duration slice = budget < quantum_ ? budget : quantum_;
-        if (slice.empty()) {
-            request_reschedule(DispatchReason::Timer);
-            deadline = now;
-        } else {
-            const auto computed = now.checked_add(slice);
-            libk_assert(computed);
-            deadline = *computed;
-        }
-    }
-    if (const auto* sc = timers_.minimum(); sc && sc->next_refill() < deadline)
-        deadline = sc->next_refill();
-    if (const auto* call = deadlines_.minimum(); call && call->when_ < deadline)
-        deadline = call->when_;
+    // arm/disarm must not extend the current dispatch's execution grant.
+    auto deadline = run_until_;
+    if (current_sc_ && deadline <= now) request_reschedule(DispatchReason::Timer);
+    if (const auto* d = deadlines_.minimum()) deadline = std::min(deadline, d->when_);
+    deadline = std::max(deadline, now);
     const auto programmed = arch::program_timer(deadline);
     if (!programmed) {
-        timer_available_ = false;
-        programmed_deadline_ = time::Instant::max();
+        has_timer_ = false;
         arch::mask_timer();
-    } else {
-        programmed_deadline_ = deadline;
     }
 }
 
@@ -658,7 +646,7 @@ void Dispatcher::record_dispatch(
     Thread* outgoing,
     Thread* incoming,
     DispatchReason reason,
-    time::Instant now) noexcept {
+    u64 now) noexcept {
     trace::emit(trace::Event::Dispatch, outgoing->identity(), incoming->identity(),
                 static_cast<u64>(reason), reinterpret_cast<u64>(current_sc_));
     static_cast<void>(now);
@@ -719,8 +707,8 @@ auto Dispatcher::stop(Thread* target) noexcept
         if (sc->queued()) {
             remove(*sc);
         }
-        if (sc->timer_queued()) {
-            timers_.erase(*sc);
+        if (sc->refill_.armed()) {
+            disarm(sc->refill_);
         }
 
         // A claimed Stop still owns this Sc until complete().
@@ -728,7 +716,7 @@ auto Dispatcher::stop(Thread* target) noexcept
         sc->actions_ = 0;
         if (sc->mail_hook_.is_linked()) {
             mail_.erase(*sc);
-            sc->mailed_.store<libk::MemoryOrder::Release>(false);
+            sc->mailed_.store(false, std::memory_order_release);
         }
     }
     exec.set_state(Thread::State::Exited);
@@ -736,12 +724,12 @@ auto Dispatcher::stop(Thread* target) noexcept
 }
 
 void Dispatcher::cancel(Sc& sc) noexcept {
-    libk_assert((arch::local() ? arch::local()->owner : nullptr) == &cpu_ && !arch::interrupts_enabled());
+    libk_assert(Cpu::local() == &cpu_ && !arch::interrupts_enabled());
     sync::Lock guard{mail_lock_};
     if (sc.mail_hook_.is_linked()) mail_.erase(sc);
-    else libk_assert(!sc.mailed_.load<libk::MemoryOrder::Relaxed>());
+    else libk_assert(!sc.mailed_.load(std::memory_order_relaxed));
     sc.actions_ = 0;
-    sc.mailed_.store<libk::MemoryOrder::Release>(false);
+    sc.mailed_.store(false, std::memory_order_release);
 }
 
 void Dispatcher::finish_exit(
@@ -759,7 +747,7 @@ void Dispatcher::finish_exit(
     object::ref<> lifetime{};
     if (exec.sc_ != nullptr) {
         Sc& sc = *exec.sc_;
-        libk_assert(!sc.queued() && !sc.timer_queued());
+        libk_assert(!sc.queued() && !sc.refill_.armed());
         auto unbound = sc.unbind(this);
         libk_assert(unbound);
         lifetime = std::move(unbound).value();
@@ -801,7 +789,7 @@ auto wake(
         return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
 
-    if ((arch::local() ? arch::local()->owner : nullptr) == target) {
+    if (Cpu::local() == target) {
         sync::Irq irq{};
         const Dispatcher::WakeAcceptance accepted =
             target->dispatcher().accept_wake(sc);
@@ -820,7 +808,7 @@ auto start(Cpus& cpus, Sc& sc) noexcept
         || !target->online()) {
         return std::unexpected(Dispatcher::WakeError::Unavailable);
     }
-    if ((arch::local() ? arch::local()->owner : nullptr) == target) {
+    if (Cpu::local() == target) {
         sync::Irq irq{};
         const bool accepted = target->dispatcher().make_ready(sc);
         return accepted

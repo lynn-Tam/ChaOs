@@ -6,7 +6,7 @@
 #include <ipc/channel.hpp>
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <ipc/buffer.hpp>
 #include <limits>
@@ -183,9 +183,7 @@ Channel::~Channel() noexcept {
 void Channel::bind_sponsor(
     resource::Sponsorship& sponsor) noexcept {
     libk_assert(!payer_);
-    auto source = sponsor.payer().clone();
-    libk_assert(source);
-    payer_ = std::move(*source);
+    payer_ = sponsor.payer();
 }
 
 auto Channel::open() noexcept -> std::expected<void, ChannelError> {
@@ -562,7 +560,7 @@ auto Channel::receive(
             expected_sequence = message.sequence;
         }
 
-        libk::InplaceVector<cap::CSpace::Reservation,
+        libk::inplace_vector<cap::CSpace::Reservation,
             CHANNEL_MAX_CAPS> reservations{};
         for (usize index = 0; index < cap_count; ++index) {
             auto reserved = destination.reserve();
@@ -813,33 +811,46 @@ auto Channel::bind(
     return ((generation << RelBits) | index);
 }
 
+auto Channel::bound_relation(cap::Resolved<Channel>& cap, usize id) noexcept
+    -> std::expected<Relation*, ChannelError> {
+    const usize index = id & RelMask;
+    if (index >= relations_.size()) return std::unexpected(ChannelError::InvalidRelation);
+    auto& relation = relation_at(index);
+    const auto right = relation.condition == ChannelCondition::Writable
+        ? cap::Right::Send : cap::Right::Receive;
+    const auto side = side_for(cap, right);
+    if (!side) return std::unexpected(ChannelError::Denied);
+    if (relation.state != Relation::State::Attached
+        || relation.generation != (id >> RelBits) || relation.side != *side)
+        return std::unexpected(ChannelError::InvalidRelation);
+    return &relation;
+}
+
+auto Channel::unbind(cap::Resolved<Channel>& cap, usize id) noexcept
+    -> std::expected<void, ChannelError> {
+    Relation* relation{};
+    {
+        sync::Lock guard{lock_};
+        auto bound = bound_relation(cap, id);
+        if (!bound) return std::unexpected(bound.error());
+        relation = *bound;
+        relation->state = Relation::State::Detaching;
+    }
+    abort_relation(*relation);
+    return {};
+}
+
 auto Channel::arm(
     cap::Resolved<Channel>& cap,
     usize relation_handle,
     u64 observed) noexcept -> std::expected<u64, ChannelError> {
-    const usize index = relation_handle & RelMask;
-    const u64 generation = relation_handle >> RelBits;
     NotificationSource* signal{};
     u64 sequence{};
     {
         sync::Lock guard{lock_};
-        if (index >= relations_.size()) {
-            return std::unexpected(ChannelError::InvalidRelation);
-        }
-        Relation& relation = relation_at(index);
-        const cap::Right required = relation.condition
-            == ChannelCondition::Writable
-            ? cap::Right::Send : cap::Right::Receive;
-        const auto side_value = side_for(cap, required);
-        if (!side_value) {
-            return std::unexpected(ChannelError::Denied);
-        }
-        const ChannelSide requested_side = *side_value;
-        if (relation.state != Relation::State::Attached
-            || relation.generation != generation
-            || relation.side != requested_side) {
-            return std::unexpected(ChannelError::InvalidRelation);
-        }
+        auto bound = bound_relation(cap, relation_handle);
+        if (!bound) return std::unexpected(bound.error());
+        auto& relation = **bound;
         sequence = sequence_locked(
             relation.side, relation.condition);
         relation.observed = observed;
@@ -1327,7 +1338,7 @@ auto Channel::make_escrow(
 auto Channel::commit_escrows(
     Message& message,
     cap::CSpace& destination,
-    libk::InplaceVector<cap::CSpace::Reservation,
+    libk::inplace_vector<cap::CSpace::Reservation,
         CHANNEL_MAX_CAPS>& reservations,
     ChannelRecv& result) noexcept -> CommitResult {
     if (reservations.size() != message.escrows.size()) {
@@ -1335,7 +1346,7 @@ auto Channel::commit_escrows(
     }
 
     // Keep the queued grants intact until the entire destination commit wins.
-    libk::InplaceVector<cap::CSpace::NewCap, CHANNEL_MAX_CAPS> caps;
+    libk::inplace_vector<cap::CSpace::NewCap, CHANNEL_MAX_CAPS> caps;
     for (usize i = 0; i < reservations.size(); ++i) {
         auto& escrow = message.escrows[i];
         auto grant = escrow.grant.clone();

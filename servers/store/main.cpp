@@ -1,9 +1,11 @@
+#include <string_view>
+#include <string.h>
 #include <utility>
-#include <servers/runtime/service.hpp>
-#include <servers/runtime/queue.hpp>
+#include <sys/channel.hpp>
+#include <sys/queue.hpp>
 #include <servers/store/volume.hpp>
 #include <sys/start.hpp>
-#include <sys/storage.hpp>
+#include <sys/protocol.hpp>
 #include <expected>
 
 namespace {
@@ -145,7 +147,7 @@ auto find(const entry& entry) -> inode* {
 
 struct Open final {
     inode* file{};
-    cap::OwnedCap channel;
+    cap_owner channel;
     io::ServerSession session;
     uint64_t offset{}, generation{};
     bool live{}, busy{};
@@ -157,7 +159,7 @@ struct Open final {
         if (generation == UINT64_MAX) return STATUS_NO_MEMORY;
         const auto pair = channel_create(store_pool, 1, CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != STATUS_OK) return pair.status;
-        cap::OwnedCap client_root{{pair.value, 0}}, server_root{{pair.value2, 0}};
+        cap_owner client_root{pair.value}, server_root{pair.value2};
         constexpr auto common = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE;
         const auto client = channel_mint(client_root.selector(), store_cspace, 1,
             common | RIGHT_DESTROY | RIGHT_DUPLICATE);
@@ -166,8 +168,8 @@ struct Open final {
             (void)object_destroy(client_root.selector());
             return client.status != STATUS_OK ? client.status : server.status;
         }
-        cap::OwnedCap endpoint{{client.value, 0}};
-        channel = cap::OwnedCap{{server.value, 0}};
+        cap_owner endpoint{client.value};
+        channel = cap_owner{server.value};
         auto status = STATUS_OK;
         if (!prepared) {
             status = session.prepare(store_pool, store_vspace, store_cspace,
@@ -230,7 +232,7 @@ struct Open final {
         offset = request.value & store::Append ? length : 0;
         reply.message.value = ++generation;
         reply.message.size = sizeof(length);
-        service::copy(reply.message.data, &length, sizeof(length));
+        ::memcpy(reply.message.data, &length, sizeof(length));
         return STATUS_OK;
     }
 
@@ -326,7 +328,7 @@ auto pump_reads() noexcept -> bool {
 void drain_reads() noexcept {
     while (reading()) {
         (void)pump_reads();
-        if (reading()) service::require(reader.wait());
+        if (reading()) sys::require(reader.wait());
     }
 }
 auto start_read(Open& open, io::Ticket ticket, pending& pending) noexcept -> bool {
@@ -337,7 +339,7 @@ auto start_read(Open& open, io::Ticket ticket, pending& pending) noexcept -> boo
         || !open.readable || !Open::valid(request)
         || offset > LFS_FILE_MAX || request.length > LFS_FILE_MAX - offset
         || (file.flags & (LFS_F_INLINE | LFS_F_WRITING))) return false;
-    service::require(backend.drain_writes());
+    sys::require(backend.drain_writes());
     const auto available = offset < file.ctz.size ? file.ctz.size - offset : 0;
     pending = {.open = &open, .ticket = ticket,
         .read = {.object = reinterpret_cast<uintptr_t>(open.file), .offset = offset,
@@ -349,7 +351,7 @@ auto start_read(Open& open, io::Ticket ticket, pending& pending) noexcept -> boo
 }
 
 struct Client final {
-    cap::OwnedCap channel;
+    cap_owner channel;
     io::ServerSession session;
     bool writable{};
     bool admin{};
@@ -367,7 +369,7 @@ struct Client final {
             if (reply.status == STATUS_BACKING_FAILED) exit(reply.status);
             if (reply.status == STATUS_OK) {
                 reply.size = sizeof(id);
-                service::copy(reply.data, id, sizeof(id));
+                ::memcpy(reply.data, id, sizeof(id));
             }
             return;
         }
@@ -380,7 +382,7 @@ struct Client final {
             if (volume.failed()) exit(volume.error(-1));
             if (reply.status == STATUS_OK) {
                 reply.size = sizeof(id);
-                service::copy(reply.data, id, sizeof(id));
+                ::memcpy(reply.data, id, sizeof(id));
             }
             return;
         }
@@ -446,10 +448,10 @@ struct Client final {
                 if (position < 0) { result = position; break; }
                 result = lfs_dir_read(volume.fs(), &cursor, &entry);
                 if (result <= 0) { reply.value = 0; break; }
-                if (service::equal(entry.name, ".") || service::equal(entry.name, "..")) {
+                if ((std::string_view{entry.name} == ".") || (std::string_view{entry.name} == "..")) {
                     result = 0; continue;
                 }
-                const size_t length = service::length(entry.name);
+                const size_t length = ::strlen(entry.name);
                 if (length > sizeof(reply.data)) { result = LFS_ERR_NAMETOOLONG; break; }
                 const size_t separator = reply.size != 0;
                 if (length + separator > sizeof(reply.data) - reply.size) {
@@ -458,7 +460,7 @@ struct Client final {
                     break;
                 }
                 if (separator) reply.data[reply.size++] = '\0';
-                service::copy(reply.data + reply.size, entry.name, length);
+                ::memcpy(reply.data + reply.size, entry.name, length);
                 reply.size += length;
                 const auto next = lfs_dir_tell(volume.fs(), &cursor);
                 if (next < 0) { result = next; break; }
@@ -479,7 +481,7 @@ struct Client final {
             else {
                 // Rename uses a second NUL-terminated path in the same
                 // immutable control frame, after the first one.
-                const size_t first = service::length(path);
+                const size_t first = ::strlen(path);
                 if (first == 0 || first + 1 >= request.size
                     || request.data[first] != '\0') {
                     reply.status = STATUS_BAD_ARGS; return;
@@ -516,7 +518,7 @@ struct Client final {
     static auto path_from(const io::ControlMessage& request,
         char (&out)[sizeof(io::ControlMessage::data) + 1]) noexcept -> bool {
         if (request.size == 0 || request.size > sizeof(request.data)) return false;
-        service::copy(out, request.data, request.size);
+        ::memcpy(out, request.data, request.size);
         out[request.size] = '\0';
         for (size_t i = 0; i < request.size; ++i)
             if (out[i] == '\0' && request.operation != static_cast<uint64_t>(store::Control::Rename))
@@ -529,39 +531,39 @@ Client clients[Clients];
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    boot::Args args;
+    const auto info = sys::bootstrap(address, size);
+    boot::args args;
     if (!args.decode(arg_data, arg_size)) exit(STATUS_BAD_ARGS);
-    const auto pool = service::capability(info, BOOT_POOL);
-    const auto vspace = service::capability(info, BOOT_VSPACE);
-    const auto cspace = service::capability(info, BOOT_CSPACE);
+    const auto pool = sys::capability(info, BOOT_POOL);
+    const auto vspace = sys::capability(info, BOOT_VSPACE);
+    const auto cspace = sys::capability(info, BOOT_CSPACE);
     store_pool = pool;
     store_cspace = cspace;
     store_vspace = vspace;
-    events = service::capability(info, BOOT_EVENTS);
+    events = sys::capability(info, BOOT_EVENTS);
     if (args.count() > 1) exit(STATUS_BAD_ARGS);
     if (args.count() == 1) {
         const auto* text = args.argument(0);
-        if (!store::parse_volume_id(text, service::length(text), expected_id))
+        if (!store::parse_volume_id(text, ::strlen(text), expected_id))
             exit(STATUS_BAD_ARGS);
         require_id = true;
     }
-    service::require(backend.connect(service::capability(info, boot::Block),
+    sys::require(backend.connect(sys::capability(info, boot::Block),
         pool, cspace, events, vspace, 0x70000000));
-    service::require(volume.open(backend));
+    sys::require(volume.open(backend));
     if (require_id && volume.mounted()) {
         uint8_t actual[store::VolumeIdSize]{};
-        service::require(volume.identity(actual));
+        sys::require(volume.identity(actual));
         if (!expected(actual)) exit(STATUS_DENIED);
     }
-    service::require(directory.open(service::capability(info, boot::Store), events));
+    sys::require(directory.open(sys::capability(info, boot::Store), events));
     for (size_t i = 0; i < Clients; ++i)
-        service::require(clients[i].session.prepare(pool, vspace, cspace,
+        sys::require(clients[i].session.prepare(pool, vspace, cspace,
             0x71000000 + i * 0x100000, true));
-    service::require(notification_signal(
-        service::capability(info, BOOT_READY)).status);
-    service::require(notification_signal(
-        service::capability(info, boot::ServiceWake)).status);
+    sys::require(notification_signal(
+        sys::capability(info, BOOT_READY)).status);
+    sys::require(notification_signal(
+        sys::capability(info, boot::ServiceWake)).status);
     size_t turn{};
     for (;;) {
         bool again = pump_reads();
@@ -681,7 +683,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
                 opened.session.abort(); again = true;
             }
         }
-        service::require(directory.arm());
-        if (!again) service::require(notification_wait(events).status);
+        sys::require(directory.arm());
+        if (!again) sys::require(notification_wait(events).status);
     }
 }

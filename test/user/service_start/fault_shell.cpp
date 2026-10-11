@@ -1,24 +1,25 @@
-#include <servers/runtime/service.hpp>
-#include <servers/runtime/output.hpp>
-#include <sys/storage.hpp>
 #include <sys/channel.hpp>
+#include <sys/protocol.hpp>
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
-    files::Client files;
-    service::require(files.connect(info));
-    files::File file{};
+    const auto info = sys::bootstrap(address, size);
+    io::ClientSession files;
+    uint64_t value{};
+    sys::require(files.connect(sys::capability(info, boot::Files),
+        sys::capability(info, BOOT_POOL), sys::capability(info, BOOT_CSPACE),
+        sys::capability(info, BOOT_EVENTS), sys::capability(info, BOOT_VSPACE), 0x70000000, value));
+    fs::File file{};
     constexpr char path[] = "README.TXT";
-    service::require(files.open(path, sizeof(path) - 1, file));
+    sys::require(fs::open(files, path, sizeof(path) - 1, file));
     size_t read{};
-    service::require(files.read(file, [&](uint64_t, const uint8_t*, size_t bytes) noexcept {
+    sys::require(fs::read(files, file, [&](uint64_t, const uint8_t*, size_t bytes) noexcept {
         read += bytes;
     }));
     if (read != file.size || read == 0) exit(STATUS_INTERNAL);
-    service::require(files.close(file));
-    service::require(files.close());
-    stream::Writer console{service::capability(info, boot::ConsoleOutput)};
+    sys::require(fs::close(files, file));
+    sys::require(files.close());
+    stream::Writer console{sys::capability(info, boot::ConsoleOutput)};
     console.write("[fault-shell] file read before failure\n");
     // This test ELF takes a real user fault. Production services contain no
     // fault trigger or scenario branch.

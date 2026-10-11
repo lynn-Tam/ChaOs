@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <optional>
 #include <sched/sc.hpp>
+#include <cpu/cpu.hpp>
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/checked_arithmetic.hpp>
+#include <libk/types.hpp>
 #include <utility>
 #include <sched/domain.hpp>
 #include <sched/dispatcher.hpp>
@@ -19,12 +21,14 @@ const cap::GrantAttachmentOps Sc::auth::ops_{
         auto& cell = *static_cast<link*>(context);
         cell.owner->invalidate(cell, std::move(work));
     },
-    .released = [](void*) noexcept {},
+    .released = [](void* ctx) noexcept {
+        static_cast<link*>(ctx)->owner->sc_->post_close();
+    },
 };
 
-Sc::auth::auth(Thread& target) noexcept
-    : target_(&target), context_(*this, ops_), target_cap_(*this, ops_),
-      stop_(Stop::Notifier::bind<&auth::release>(*this)) {}
+Sc::auth::auth(Sc& sc, Thread& target) noexcept
+    : sc_(&sc), target_(&target), context_(*this, ops_), target_cap_(*this, ops_),
+      stop_(Stop::Notifier::bind<&auth::stopped>(*this)) {}
 
 Sc::auth::~auth() noexcept {
     release();
@@ -59,7 +63,7 @@ auto Sc::auth::attach(const cap::Resolved<Sc>& context,
 auto Sc::auth::reusable() const noexcept -> bool {
     sync::Lock guard{lock_};
     return ended_ && !attaching_ && publishers_ == 0
-        && (!revoking_ || stop_.complete())
+        && !stop_pending_
         && !context_.attachment.busy() && !target_cap_.attachment.busy();
 }
 
@@ -72,13 +76,25 @@ void Sc::auth::invalidate(link& cell, cap::GrantWork&& work) noexcept {
         cell.work = std::move(work);
         ended = ended_;
         start = !ended && !revoking_;
-        if (start) revoking_ = true;
+        if (start) revoking_ = stop_pending_ = true;
     }
     if (start) stop_.start(*target_);
     if (ended || stop_.complete()) drain(cell);
 }
 
+void Sc::auth::stopped() noexcept {
+    flight publishing{*this};
+    release();
+    sync::Lock guard{lock_};
+    libk_assert(stop_pending_);
+    stop_pending_ = false;
+}
+
 void Sc::auth::release() noexcept {
+    {
+        sync::Lock guard{lock_};
+        if (ended_ && context_.detaching && target_cap_.detaching) return;
+    }
     flight publishing{*this};
     {
         sync::Lock guard{lock_};
@@ -112,50 +128,58 @@ const cap::GrantAttachmentOps Sc::domain_ops_{
     .released = &Sc::released_domain,
 };
 
-Sc::Sc(Config config, time::Instant now) noexcept
+Sc::Sc(Config config, u64 now) noexcept
     : config_(config) {
     libk_assert(valid_config(config_));
     libk_assert(refills_.try_emplace_back(Refill{now, config_.budget}));
 }
 
 Sc::~Sc() noexcept {
-    libk_assert(!mailed_.load<libk::MemoryOrder::Acquire>() && !mail_hook_.is_linked());
+    libk_assert(!mailed_.load(std::memory_order_acquire) && !mail_hook_.is_linked());
     libk_assert(!active());
     libk_assert(!owner_);
-    libk_assert(!auth_);
+    libk_assert(!auth_ && !cleanup_ && !stop_pending_);
+    if (work_) work_->close(close_work_);
     libk_assert(domain_ == nullptr);
-    libk_assert(!domain_authority_.attached() && !domain_authority_.busy());
+    libk_assert(!domain_cap_.attached() && !domain_cap_.busy());
     libk_assert(!domain_work_);
     libk_assert(!domain_stop_.started() || domain_stop_.complete());
 }
 
-auto Sc::available(time::Instant now) const noexcept
-    -> time::Duration {
+void Sc::refill() noexcept {
+    auto& d = current_cpu().dispatcher();
+    libk_assert(home_cpu() == d.id() && thread().state() == Thread::State::Throttled);
+    d.enqueue_or_throttle(*this, d.clock().rd_ticks());
+}
+
+auto Sc::available(u64 now) const noexcept
+    -> u64 {
     u64 total{};
     for (const auto& r : refills_) {
         if (r.ready_at > now) break;
-        total += r.amount.ticks();
+        total += r.amount;
     }
-    return time::Duration::from_ticks(total);
+    return total;
 }
 
-auto Sc::eligible(time::Instant now) const noexcept -> bool {
-    return !available(now).empty();
+auto Sc::eligible(u64 now) const noexcept -> bool {
+    return available(now) != 0;
 }
 
 auto Sc::admit(
     cap::Resolved<Domain>& authority,
     CpuId home_cpu) noexcept -> Result {
-    if (domain_ != nullptr || domain_authority_.attached() || withdrawing_) {
+    sync::Lock guard{lock_};
+    if (domain_ != nullptr || domain_cap_.attached() || withdrawing_) {
         return std::unexpected(Error::AlreadyAdmitted);
     }
-    auto attached = authority.attach(domain_authority_);
+    auto attached = authority.attach(domain_cap_);
     if (!attached) {
         return std::unexpected(Error::InvalidConfig);
     }
     auto admitted = authority.object().admit(*this, home_cpu);
     if (!admitted) {
-        libk_assert(domain_authority_.detach());
+        libk_assert(domain_cap_.detach());
         switch (admitted.error()) {
         case Domain::Error::InvalidCpu:
             return std::unexpected(Error::WrongCpu);
@@ -168,45 +192,41 @@ auto Sc::admit(
     return {};
 }
 
-auto Sc::bind(
-    object::ref<Thread>&& owner) noexcept -> Result {
-    if (!owner || domain_ == nullptr) {
-        return std::unexpected(Error::NotAdmitted);
-    }
-    sync::Lock authority_guard{authority_lock_};
-    if (withdrawing_) {
-        return std::unexpected(Error::Active);
-    }
-    if (owner_) {
-        return std::unexpected(Error::AlreadyBound);
-    }
-    if (!owner->try_bind(*this)) {
-        return std::unexpected(Error::AlreadyBound);
-    }
+auto Sc::bind(object::ref<Thread> owner) noexcept -> Result {
+    sync::Lock guard{lock_};
+    return bind_locked(std::move(owner));
+}
+
+auto Sc::bind_locked(object::ref<Thread> owner) noexcept -> Result {
+    if (!owner || domain_ == nullptr) return std::unexpected(Error::NotAdmitted);
+    if (withdrawing_) return std::unexpected(Error::Active);
+    if (owner_ || !owner->try_bind(*this)) return std::unexpected(Error::AlreadyBound);
     owner_ = std::move(owner);
     return {};
 }
 
 auto Sc::bind_authorized(
-    object::ref<Thread>&& target,
+    object::ref<Thread> target,
     const cap::Resolved<Sc>& context,
     const cap::Resolved<Thread>& thread) noexcept -> Result {
     if (!target || &context.object() != this
         || &thread.object() != &target.get()) {
         return std::unexpected(Error::InvalidConfig);
     }
+    sync::Lock guard{lock_};
+    if (withdrawing_) return std::unexpected(Error::Active);
     if (auth_) {
         if (!auth_->reusable()) {
             return std::unexpected(Error::Active);
         }
         auth_.reset();
     }
-    auto& authority = auth_.emplace(target.get());
+    auto& authority = auth_.emplace(*this, target.get());
     if (!authority.attach(context, thread)) {
         if (auth_->reusable()) auth_.reset();
         return std::unexpected(Error::Active);
     }
-    auto bound = bind(std::move(target));
+    auto bound = bind_locked(std::move(target));
     if (!bound) {
         authority.release();
         if (authority.reusable()) auth_.reset();
@@ -221,62 +241,56 @@ auto Sc::unbind() noexcept
 
 auto Sc::unbind(Dispatcher* owner) noexcept
     -> std::expected<object::ref<>, Error> {
-    sync::Lock authority_guard{authority_lock_};
-    if (!owner_) {
-        return std::unexpected(Error::NotBound);
+    object::ref<> lifetime;
+    auth* binding{};
+    std::optional<auth::flight> publishing;
+    {
+        sync::Lock guard{lock_};
+        if (!owner_) return std::unexpected(Error::NotBound);
+        if (active() || queued()
+            || (owner == nullptr && mailed_.load(std::memory_order_acquire)))
+            return std::unexpected(Error::Active);
+        if (!thread().release_sc(*this, owner)) return std::unexpected(Error::Active);
+        // Cut publication before draining requests; owner_ protects execution
+        // until the home consumer has finished its last queue access.
+        if (owner) owner->cancel(*this);
+        libk_assert(!refill_.armed() && !mailed_.load(std::memory_order_acquire));
+        lifetime = object::ref<>{std::move(owner_)};
+        wake_credit_ = false;
+        if (auth_) {
+            binding = &*auth_;
+            publishing.emplace(*binding);
+        }
     }
-    if (active() || queued()) {
-        return std::unexpected(Error::Active);
-    }
-    if (owner == nullptr && mailed_.load<libk::MemoryOrder::Acquire>())
-        return std::unexpected(Error::Active);
-    Thread& target = thread();
-    if (!target.release_sc(*this, owner)) {
-        return std::unexpected(Error::Active);
-    }
-    // release_sc closes publication under the execution lock. Drain requests
-    // only after that cut, while owner_ still protects the execution lifetime.
-    if (owner) owner->cancel(*this);
-    libk_assert(!timer_queued());
-    libk_assert(!mailed_.load<libk::MemoryOrder::Acquire>());
-    object::ref<> lifetime{std::move(owner_)};
-    wake_credit_ = false;
-    if (auth_) {
-        auth_->release();
-    }
+    // Releasing grant work may synchronously request this Sc's retirement.
+    if (binding) binding->release();
     return lifetime;
 }
 
-auto Sc::prepare_retire() noexcept -> bool {
+void Sc::retire(object::cleanup&& done) noexcept {
     {
-        sync::Lock guard{authority_lock_};
-        if (active() || owner_) {
-            return false;
-        }
+        sync::Lock guard{lock_};
+        libk_assert(!cleanup_);
+        cleanup_ = std::move(done);
         withdrawing_ = true;
     }
-    if (domain_ != nullptr) {
-        Domain* const domain = domain_;
-        if (!domain->unadmit(*this)) {
-            return false;
-        }
-    }
-    if (domain_authority_.attached()) {
-        static_cast<void>(domain_authority_.detach());
-    }
-    domain_work_.reset();
-    if (auth_) {
-        auth_->release();
-        if (!auth_->reusable()) {
-            return false;
-        }
-        auth_.reset();
-    }
-    return !domain_authority_.busy();
+    post_close();
+}
+
+void Sc::stopped() noexcept {
+    sync::Lock guard{lock_};
+    libk_assert(stop_pending_);
+    stop_pending_ = false;
+    post_close();
+}
+
+void Sc::post_close() noexcept {
+    libk_assert(work_);
+    work_->post(close_work_);
 }
 
 auto Sc::startable() const noexcept -> bool {
-    sync::Lock guard{authority_lock_};
+    sync::Lock guard{lock_};
     return domain_ != nullptr && owner_ && !withdrawing_;
 }
 
@@ -288,77 +302,92 @@ void Sc::invalidate_domain(
         std::move(work));
 }
 
-void Sc::released_domain(void* context) noexcept {
-    libk_assert(context != nullptr);
+void Sc::released_domain(void* ctx) noexcept {
+    static_cast<Sc*>(ctx)->post_close();
 }
 
 void Sc::invalidate_domain(cap::GrantWork&& work) noexcept {
-    Thread* target{};
     {
-        sync::Lock guard{authority_lock_};
+        sync::Lock guard{lock_};
         libk_assert(!domain_work_);
         domain_work_ = std::move(work);
         withdrawing_ = true;
+    }
+    post_close();
+}
+
+void Sc::finish_close() noexcept {
+    object::ref<Thread> target;
+    {
+        sync::Lock guard{lock_};
+        if (!withdrawing_) return;
         if (owner_) {
-            target = &thread();
+            if (domain_stop_.started()) return;
+            target = owner_;
+            stop_pending_ = true;
+        } else {
+            if (active() || stop_pending_) return;
+            libk_assert(!queued() && !refill_.armed()
+                && !mailed_.load(std::memory_order_acquire));
         }
     }
     if (target) {
-        if (!domain_stop_.started()) {
-            domain_stop_.start(*target);
-        }
+        domain_stop_.start(target.get());
         return;
     }
-    finish_domain();
-}
-
-void Sc::finish_domain() noexcept {
-    Domain* domain{};
-    {
-        sync::Lock guard{authority_lock_};
-        libk_assert(withdrawing_ && !owner_ && !active());
-        domain = domain_;
-    }
-    if (domain != nullptr) {
-        libk_assert(domain->unadmit(*this));
-    }
-    if (domain_authority_.attached()) {
-        static_cast<void>(domain_authority_.detach());
-    }
+    // Admission is closed and unbind has returned. Grant completion can enter
+    // retire(), so drain relationships outside the Sc lock on this sole runner.
+    if (domain_) libk_assert(domain_->unadmit(*this));
+    if (domain_cap_.attached()) static_cast<void>(domain_cap_.detach());
     domain_work_.reset();
+    if (auth_) {
+        auth_->release();
+        if (!auth_->reusable()) return;
+        auth_.reset();
+    }
+    if (domain_cap_.busy()) return;
+    object::cleanup done;
+    {
+        sync::Lock guard{lock_};
+        done = std::move(cleanup_);
+    }
+    // Finalizers share this runner. Callback publishers have drained before
+    // closing the Work; completing cleanup may enqueue storage reclamation.
+    if (done) {
+        work_->close(close_work_);
+        done.complete();
+    }
 }
 
 auto Sc::activate(CpuId cpu) noexcept -> bool {
-    sync::Lock guard{authority_lock_};
+    sync::Lock guard{lock_};
     if (active() || cpu != home_cpu_ || domain_ == nullptr
         || withdrawing_) {
         return false;
     }
-    active_cpu_.store<libk::MemoryOrder::Release>(cpu.raw);
+    active_cpu_.store(cpu.raw, std::memory_order_release);
     return true;
 }
 
 void Sc::deactivate(CpuId cpu) noexcept {
     usize expected = cpu.raw;
-    const bool deactivated = active_cpu_.compare_exchange_strong<
-        libk::MemoryOrder::AcqRel,
-        libk::MemoryOrder::Acquire>(expected, MaxCpus);
+    const bool deactivated = active_cpu_.compare_exchange_strong(expected, MaxCpus, std::memory_order_acq_rel, std::memory_order_acquire);
     libk_assert(deactivated);
 }
 
-auto Sc::charge(time::Instant now, time::Duration elapsed) noexcept -> time::Duration {
-    libk_assert(!timer_queued());
-    u64 remaining = elapsed.ticks(), consumed{};
+auto Sc::charge(u64 now, u64 elapsed) noexcept -> u64 {
+    libk_assert(!refill_.armed());
+    u64 remaining = elapsed, consumed{};
     while (remaining && !refills_.empty() && refills_.front().ready_at <= now) {
         auto& r = refills_.front();
-        const u64 n = std::min(remaining, r.amount.ticks());
+        const u64 n = std::min(remaining, r.amount);
         remaining -= n;
         consumed += n;
-        r.amount = time::Duration::from_ticks(r.amount.ticks() - n);
-        if (r.amount.empty()) refills_.pop_front();
+        r.amount -= n;
+        if (r.amount == 0) refills_.pop_front();
     }
     if (consumed) {
-        const auto ready = now.checked_add(config_.period);
+        const auto ready = libk::checked_add(now, config_.period);
         libk_assert(ready);
         // Total budget is conserved. Merging can delay a refill, never
         // advance it; sums are bounded by config_.budget, so cannot overflow.
@@ -367,10 +396,10 @@ auto Sc::charge(time::Instant now, time::Duration elapsed) noexcept -> time::Dur
             auto& last = refills_.back();
             libk_assert(last.ready_at <= *ready);
             last.ready_at = *ready;
-            last.amount = time::Duration::from_ticks(last.amount.ticks() + consumed);
-        } else libk_assert(refills_.try_emplace_back(Refill{*ready, time::Duration::from_ticks(consumed)}));
+            last.amount += consumed;
+        } else libk_assert(refills_.try_emplace_back(Refill{*ready, consumed}));
     }
-    return time::Duration::from_ticks(remaining);
+    return remaining;
 }
 
 } // namespace sched

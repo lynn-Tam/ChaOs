@@ -9,7 +9,7 @@ auto PciDma::take_fault() noexcept -> std::optional<io::Fault> { return iommu_.t
 
 auto PciDma::reserve() noexcept -> bool {
     libk_assert((phase_ == Phase::Reserved || phase_ == Phase::Closed) && !root_);
-    const pci::Cfg<arch::io_fence> cfg{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)};
+    const pci::cfg<arch::io_fence> cfg{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)};
     if (cfg.read<u32>(0) != 0x1042'1af4 || (cfg.read<u8>(14) & 0x7f) != 0) return false;
     const auto bars = cfg.bars();
     if (!bars) return false;
@@ -68,8 +68,8 @@ auto PciDma::state() const noexcept -> State {
 }
 
 auto PciDma::deadline(u64 nanoseconds) noexcept -> bool {
-    const auto duration = clock_.duration_from_nanoseconds(nanoseconds);
-    const auto end = duration ? clock_.now().checked_add(*duration)
+    const auto duration = clock_.ticks<time::ns>(nanoseconds);
+    const auto end = duration ? libk::checked_add(clock_.rd_ticks(), *duration)
                               : std::nullopt;
     if (!end) {
         fail();
@@ -92,9 +92,9 @@ void PciDma::reset_device() noexcept {
     // BAR retirement precedes this call. A device-memory read drains prior CPU
     // posted writes while decode is still enabled; virtio reset drains the selected
     // QEMU virtio backend. IOFENCE alone cannot prove backend quiescence.
-    const pci::Cfg<arch::io_fence> cfg{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)};
+    const pci::cfg<arch::io_fence> cfg{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)};
     cfg.write<u16>(4, (cfg.read<u16>(4) & ~u16{4}) | u16{1 << 10});
-    const pci::Cfg<arch::io_fence> status{status_};
+    const pci::cfg<arch::io_fence> status{status_};
     (void)status.read<u8>(0);
     status.write<u8>(0, 0);
     phase_ = Phase::Resetting;
@@ -126,9 +126,9 @@ auto PciDma::poll() noexcept -> State {
             phase_ == Phase::Invalidating ? std::nullopt : std::optional{root_->page()});
         if (completion == Iommu::Step::Failed) fail();
         else if (completion == Iommu::Step::Pending) {
-            if (clock_.now() >= deadline_) fail();
+            if (clock_.rd_ticks() >= deadline_) fail();
         } else if (phase_ == Phase::Opening) {
-            pci::Cfg<arch::io_fence>{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)}
+            pci::cfg<arch::io_fence>{mm::DirectBegin + pci_.cfg.pa + (usize{requester_} << 12)}
                 .write<u16>(4, 6);
             phase_ = Phase::Active;
         } else if (phase_ == Phase::ClosingOpening) reset_device();
@@ -136,8 +136,8 @@ auto PciDma::poll() noexcept -> State {
         break;
     }
     case Phase::Resetting:
-        if (pci::Cfg<arch::io_fence>{status_}.read<u8>(0) != 0) {
-            if (clock_.now() >= deadline_) fail();
+        if (pci::cfg<arch::io_fence>{status_}.read<u8>(0) != 0) {
+            if (clock_.rd_ticks() >= deadline_) fail();
         } else {
             phase_ = Phase::Invalidating;
             static_cast<void>(deadline(1'000'000'000));
@@ -148,7 +148,7 @@ auto PciDma::poll() noexcept -> State {
         if (result == Iommu::Step::Failed) fail();
         else if (result == Iommu::Step::Complete) {
             root_.reset();
-        } else if (clock_.now() >= deadline_) fail();
+        } else if (clock_.rd_ticks() >= deadline_) fail();
         break;
     }
     default: break;

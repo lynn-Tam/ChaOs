@@ -1,11 +1,13 @@
 #pragma once
 
+#include <atomic>
+
 #include <cpu.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/assert.hpp>
 #include <libk/delegate.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/ticket_spin_lock.hpp>
+#include <libk/ticket_lock.hpp>
 #include <utility>
 
 namespace sync {
@@ -19,8 +21,8 @@ public:
     void unlock() noexcept;
     [[nodiscard]] auto held() const noexcept -> bool;
 private:
-    libk::TicketSpinLock mutex_{};
-    libk::Atomic<usize> owner_{};
+    libk::ticket_lock mutex_{};
+    std::atomic<usize> owner_{};
 };
 
 void assert_unlocked() noexcept;
@@ -120,10 +122,10 @@ public:
     }
 
     [[nodiscard]] auto initialized() const noexcept -> bool {
-        return state_.load<libk::MemoryOrder::Acquire>() != State::Empty;
+        return state_.load(std::memory_order_acquire) != State::Empty;
     }
     [[nodiscard]] auto complete() const noexcept -> bool {
-        return state_.load<libk::MemoryOrder::Acquire>() == State::Complete;
+        return state_.load(std::memory_order_acquire) == State::Complete;
     }
     [[nodiscard]] auto notifiable() const noexcept -> bool {
         return static_cast<bool>(notifier_);
@@ -131,20 +133,24 @@ public:
     [[nodiscard]] auto arm() noexcept -> bool {
         libk_assert(initialized() && notifier_);
         State expected = State::Awaiting;
-        if (state_.compare_exchange_strong<
-                libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(expected, State::Armed)) {
+        if (state_.compare_exchange_strong(expected, State::Armed, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return true;
         }
         libk_assert(expected == State::Complete);
         return false;
     }
 
+    // Deliver once whether completion preceded registration or follows it.
+    void notify_when_ready() noexcept {
+        const auto notify = notifier_;
+        if (!arm()) notify();
+    }
+
     void initialize(usize pending) noexcept {
         libk_assert(!initialized());
-        pending_.store<libk::MemoryOrder::Relaxed>(pending);
-        state_.store<libk::MemoryOrder::Release>(
-            pending == 0 ? State::Complete : State::Awaiting);
+        pending_.store(pending, std::memory_order_relaxed);
+        state_.store(
+            pending == 0 ? State::Complete : State::Awaiting, std::memory_order_release);
     }
 
     [[nodiscard]] auto acknowledge() noexcept -> bool {
@@ -159,7 +165,7 @@ public:
         // Release.  The final RMW must acquire that release sequence before
         // invoking the unique terminal owner; this is part of the generic
         // countdown contract, not a diagnostics-only ordering.
-        const usize previous = pending_.fetch_sub<libk::MemoryOrder::AcqRel>(1);
+        const usize previous = pending_.fetch_sub(1, std::memory_order_acq_rel);
         libk_assert(previous != 0);
         if (previous != 1) {
             return false;
@@ -169,8 +175,8 @@ public:
         // Copy the non-owning target before publishing Complete. An awakened
         // owner may release this completion as soon as it observes that state.
         const Notifier notifier = notifier_;
-        const State previous_state = state_.exchange<libk::MemoryOrder::AcqRel>(
-            State::Complete);
+        const State previous_state = state_.exchange(
+            State::Complete, std::memory_order_acq_rel);
         libk_assert(previous_state == State::Awaiting
             || previous_state == State::Armed);
         if (previous_state == State::Armed) {
@@ -189,8 +195,8 @@ private:
     };
 
     Notifier notifier_{};
-    libk::Atomic<usize> pending_{};
-    libk::Atomic<State> state_{State::Empty};
+    std::atomic<usize> pending_{};
+    std::atomic<State> state_{State::Empty};
 };
 
 } // namespace sync

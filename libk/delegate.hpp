@@ -11,11 +11,21 @@
 #include <stdint.h>
 
 #include <libk/assert.hpp>
-#include <libk/detail/callable.hpp>
+#include <functional>
 #include <type_traits>
 #include <utility>
 
 namespace libk {
+namespace detail {
+template<class Fn> union callable_target {
+    void* object;
+    Fn function;
+    constexpr callable_target() noexcept : object(nullptr) {}
+    constexpr explicit callable_target(void* p) noexcept : object(p) {}
+    constexpr explicit callable_target(Fn f) noexcept : function(f) {}
+};
+}
+
 
 template<typename Signature>
 class delegate;
@@ -24,7 +34,7 @@ template<typename R, typename... Args>
 class delegate<R(Args...)> {
 private:
     using function_pointer = R (*)(Args...);
-    using target_type = detail::CallableTarget<function_pointer>;
+    using target_type = detail::callable_target<function_pointer>;
     using stub_type = R (*)(target_type, Args&&...);
 
 public:
@@ -38,7 +48,7 @@ public:
     template<auto Function>
         requires(std::is_pointer_v<decltype(Function)>
                  && std::is_function_v<std::remove_pointer_t<decltype(Function)>>
-                 && detail::InvocableR<R, decltype(Function), Args...>)
+                 && std::is_invocable_r_v<R, decltype(Function), Args...>)
     [[nodiscard]] static constexpr delegate bind() noexcept {
         static_assert(Function != nullptr, "delegate cannot bind a null function");
         delegate result;
@@ -65,7 +75,7 @@ public:
     template<typename F>
         requires (!std::is_same_v<std::remove_cvref_t<F>, delegate>
                   && !std::is_function_v<std::remove_reference_t<F>>
-                  && detail::InvocableR<R, F&, Args...>)
+                  && std::is_invocable_r_v<R, F&, Args...>)
     [[nodiscard]] static constexpr delegate bind(F& function) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
@@ -91,17 +101,17 @@ public:
 
 private:
     static constexpr R invoke_runtime_function(target_type target, Args&&... args)
-        noexcept(noexcept(detail::invoke_r<R>(
+        noexcept(noexcept(std::invoke_r<R>(
             target.function, std::forward<Args>(args)...))) {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             target.function, std::forward<Args>(args)...);
     }
 
     template<auto Function>
     static constexpr R invoke_free(target_type, Args&&... args)
-        noexcept(noexcept(detail::invoke_r<R>(
+        noexcept(noexcept(std::invoke_r<R>(
             Function, std::forward<Args>(args)...))) {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             Function, std::forward<Args>(args)...);
     }
 
@@ -120,10 +130,10 @@ private:
 
     template<typename F>
     static constexpr R invoke_object(target_type target, Args&&... args)
-        noexcept(noexcept(detail::invoke_r<R>(
+        noexcept(noexcept(std::invoke_r<R>(
             *static_cast<F*>(target.object),
             std::forward<Args>(args)...))) {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             *static_cast<F*>(target.object),
             std::forward<Args>(args)...);
     }
@@ -136,7 +146,7 @@ template<typename R, typename... Args>
 class delegate<R(Args...) noexcept> {
 private:
     using function_pointer = R (*)(Args...) noexcept;
-    using target_type = detail::CallableTarget<function_pointer>;
+    using target_type = detail::callable_target<function_pointer>;
     using stub_type = R (*)(target_type, Args&&...) noexcept;
 
 public:
@@ -150,7 +160,7 @@ public:
     template<auto Function>
         requires(std::is_pointer_v<decltype(Function)>
                  && std::is_function_v<std::remove_pointer_t<decltype(Function)>>
-                 && detail::NothrowInvocableR<R, decltype(Function), Args...>)
+                 && std::is_nothrow_invocable_r_v<R, decltype(Function), Args...>)
     [[nodiscard]] static constexpr delegate bind() noexcept {
         static_assert(Function != nullptr, "delegate cannot bind a null function");
         delegate result;
@@ -178,7 +188,7 @@ public:
     template<typename F>
         requires (!std::is_same_v<std::remove_cvref_t<F>, delegate>
                   && !std::is_function_v<std::remove_reference_t<F>>
-                  && detail::NothrowInvocableR<R, F&, Args...>)
+                  && std::is_nothrow_invocable_r_v<R, F&, Args...>)
     [[nodiscard]] static constexpr delegate bind(F& function) noexcept {
         delegate result;
         result.target_ = target_type(const_cast<void*>(
@@ -203,13 +213,13 @@ public:
 
 private:
     static constexpr R invoke_runtime_function(target_type target, Args&&... args) noexcept {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             target.function, std::forward<Args>(args)...);
     }
 
     template<auto Function>
     static constexpr R invoke_free(target_type, Args&&... args) noexcept {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             Function, std::forward<Args>(args)...);
     }
 
@@ -226,7 +236,7 @@ private:
 
     template<typename F>
     static constexpr R invoke_object(target_type target, Args&&... args) noexcept {
-        return detail::invoke_r<R>(
+        return std::invoke_r<R>(
             *static_cast<F*>(target.object),
             std::forward<Args>(args)...);
     }
@@ -353,7 +363,7 @@ public:
     constexpr void operator()(Args... args) const {
         dispatch_guard guard(*this);
         for (size_t index = 0; index < size_; ++index) {
-            entries_[index].callback(detail::multicast_argument<Args>(args)...);
+            entries_[index].callback(args...);
         }
     }
 
@@ -512,7 +522,7 @@ public:
     constexpr void operator()(Args... args) const noexcept {
         dispatch_guard guard(*this);
         for (size_t index = 0; index < size_; ++index) {
-            entries_[index].callback(detail::multicast_argument<Args>(args)...);
+            entries_[index].callback(args...);
         }
     }
 
@@ -553,11 +563,5 @@ private:
     uint64_t next_id_ = 1;
     mutable size_t dispatch_depth_ = 0;
 };
-
-template<typename Signature>
-using fast_delegate = delegate<Signature>;
-
-template<typename Signature, size_t Capacity>
-using MulticastDelegate = multicast_delegate<Signature, Capacity>;
 
 } // namespace libk

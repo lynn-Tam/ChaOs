@@ -1,10 +1,11 @@
 #pragma once
+#include <string_view>
 
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/queue.hpp>
 
-namespace sys::files::fat32 {
+namespace fat32 {
 
 inline constexpr size_t SectorSize = 512;
 inline constexpr size_t MaxFiles = 128;
@@ -108,7 +109,7 @@ public:
                     file = {};
                     if (!name(entry, file.name)) return STATUS_BACKING_FAILED;
                     for (size_t i = 0; i < count_; ++i)
-                        if (equal(file.name, files_[i].name)) return STATUS_BACKING_FAILED;
+                        if (std::string_view{file.name} == files_[i].name) return STATUS_BACKING_FAILED;
                     file.size = u32(entry + 28);
                     starts[count_++] = (uint32_t{u16(entry + 20)} << 16) | u16(entry + 26);
                 }
@@ -177,10 +178,6 @@ public:
 
 private:
     static auto upper(char c) noexcept -> char { return c >= 'a' && c <= 'z' ? c - ('a' - 'A') : c; }
-    static auto equal(const char* a, const char* b) noexcept -> bool {
-        while (*a && *a == *b) { ++a; ++b; }
-        return *a == *b;
-    }
     static auto name(const uint8_t* entry, char (&output)[13]) noexcept -> bool {
         size_t length{};
         for (size_t part = 0; part < 2; ++part) {
@@ -222,4 +219,4 @@ private:
     uint32_t used_{};
 };
 
-} // namespace sys::files::fat32
+} // namespace fat32

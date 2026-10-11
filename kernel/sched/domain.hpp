@@ -1,6 +1,6 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/types.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>

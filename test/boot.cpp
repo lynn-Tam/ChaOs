@@ -10,14 +10,13 @@
 #include <test/test.hpp>
 
 // Test artifacts own their transport faults; the CPU port has no test state.
-static libk::Atomic<usize> ipi_failures{};
+static std::atomic<usize> ipi_failures{};
 bool send_ipi(CpuHwId target) noexcept {
-    usize n = ipi_failures.load<libk::MemoryOrder::Acquire>();
+    usize n = ipi_failures.load(std::memory_order_acquire);
     while (n) {
-        if (ipi_failures.compare_exchange_weak<libk::MemoryOrder::AcqRel,
-                libk::MemoryOrder::Acquire>(n, n - 1)) return false;
+        if (ipi_failures.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel, std::memory_order_acquire)) return false;
     }
-    return static_cast<bool>(arch::send_ipi(target));
+    return static_cast<bool>(arch::send_ipi(target.raw));
 }
 
 namespace test::scenario {
@@ -27,7 +26,7 @@ extern const Id selected = static_cast<Id>(TEST_SCENARIO);
 namespace test {
 Boot* boot{};
 void fail_ipis(usize n) noexcept {
-    ipi_failures.store<libk::MemoryOrder::Release>(n);
+    ipi_failures.store(n, std::memory_order_release);
 }
 
 
@@ -47,10 +46,10 @@ void runtime(Cpu& cpu) noexcept {
 #if TEST_PANIC
     // The probe expects peer snapshots; readiness belongs to this fixture.
     const auto& clock = cpu.dispatcher().clock();
-    const auto start = clock.now().ticks();
+    const auto start = clock.rd_ticks();
     for (usize i = 0; i < cpu.cpus->count(); ++i) {
         const auto& peer = *cpu.cpus->get(CpuId{i});
-        while (!peer.online() && clock.now().ticks() - start < clock.ticks_per_second())
+        while (!peer.online() && clock.rd_ticks() - start < clock.rd_freq())
             asm volatile("" ::: "memory");
         libk_assert(peer.online());
     }

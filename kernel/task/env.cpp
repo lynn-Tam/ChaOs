@@ -8,11 +8,10 @@
 #include <mm/kspace.hpp>
 #include <mm/vspace.hpp>
 #include <object/ref.hpp>
-#include <object/id.hpp>
 
 Env::User::User(
-    object::ref<>&& vspace_owner,
-    object::ref<>&& cspace_owner,
+    object::ref<> vspace_owner,
+    object::ref<> cspace_owner,
     mm::VSpace& address_space,
     cap::CSpace& capability_space) noexcept
     : vspace_ref(std::move(vspace_owner)),
@@ -64,13 +63,13 @@ auto Env::kernel(mm::KSpace& vspace) noexcept
 }
 
 auto Env::user(
-    object::ref<>&& vspace_ref,
-    object::ref<>&& cspace_ref,
+    object::ref<> vspace_ref,
+    object::ref<> cspace_ref,
     std::optional<ipc::Buffer> ipc) noexcept
     -> std::expected<Env, EnvError> {
     if (!vspace_ref || !cspace_ref
-        || vspace_ref.kind() != object::ObjectKind::VSpace
-        || cspace_ref.kind() != object::ObjectKind::CSpace) {
+        || vspace_ref.kind() != ObjVSpace
+        || cspace_ref.kind() != ObjCSpace) {
         return std::unexpected(EnvError::InvalidRoot);
     }
     auto cspace_pin = cspace_ref.as<cap::CSpace>();

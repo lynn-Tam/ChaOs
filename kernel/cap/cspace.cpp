@@ -348,18 +348,17 @@ auto CSpace::destroy(Handle source_handle) noexcept
     if (!source.view.rights.contains(Right::Destroy)) {
         return std::unexpected(CSpaceError::Denied);
     }
-    if (lease.kind() == object::ObjectKind::VSpace) {
+    auto target = lease.clone_target();
+    if (!target) return std::unexpected(CSpaceError::InvalidHandle);
+    if (lease.kind() == ObjVSpace) {
         const auto* limit = std::get_if<VmLimit>(&source.view.data);
-        auto target = lease.clone_target();
-        if (!target) return std::unexpected(CSpaceError::InvalidHandle);
         auto space = target.value().as<mm::VSpace>();
         // Region-local Destroy cannot retire the containing address space.
         if (!space || limit == nullptr || !space.value()->can_destroy_object(*limit))
             return std::unexpected(CSpaceError::Denied);
     }
-    auto destroyed = lease.graph().destroy_target(lease);
-    return destroyed ? std::expected<void, CSpaceError>{}
-        : std::expected<void, CSpaceError>{std::unexpected(grant_error(destroyed.error()))};
+    return target->destroy() ? std::expected<void, CSpaceError>{}
+        : std::unexpected(CSpaceError::GrantUnavailable);
 }
 
 auto CSpace::snapshot(Handle handle) noexcept
@@ -632,21 +631,24 @@ void CSpace::unlink_occupied(usize index, Slot& occupied) noexcept {
     occupied.previous = invalid_index;
 }
 
+void CSpace::retire(object::cleanup&& done) noexcept {
+    {
+        sync::Lock guard{lock_};
+        libk_assert(!cleanup_);
+        cleanup_ = std::move(done);
+    }
+    retire();
+}
+
 void CSpace::retire() noexcept {
-    bool prepare{};
     {
         sync::Lock guard{lock_};
-        prepare = accepting_;
-    }
-    if (prepare) {
-        libk_assert(prepare_retire());
-    }
-    {
-        sync::Lock guard{lock_};
+        accepting_ = false;
         if (retired_) {
+            guard.restore();
+            complete_cleanup();
             return;
         }
-        libk_assert(!accepting_);
     }
 
     for (;;) {
@@ -681,16 +683,6 @@ void CSpace::retire() noexcept {
     finish_retire();
 }
 
-auto CSpace::prepare_retire() noexcept -> bool {
-    sync::Lock guard{lock_};
-    if (!accepting_ || retired_ || releasing_ || bindings_ != 0
-        || escrows_ != 0) {
-        return false;
-    }
-    accepting_ = false;
-    return true;
-}
-
 auto CSpace::attach_execution() noexcept -> bool {
     sync::Lock guard{lock_};
     if (!accepting_ || retired_ || releasing_
@@ -702,9 +694,12 @@ auto CSpace::attach_execution() noexcept -> bool {
 }
 
 void CSpace::detach_execution() noexcept {
-    sync::Lock guard{lock_};
-    libk_assert(bindings_ != 0);
-    --bindings_;
+    {
+        sync::Lock guard{lock_};
+        libk_assert(bindings_ != 0);
+        --bindings_;
+    }
+    finish_retire();
 }
 
 auto CSpace::escrow_move(
@@ -741,7 +736,7 @@ auto CSpace::escrow_restore(
     GrantRef&& grant,
     View view) noexcept -> bool {
     sync::Lock guard{lock_};
-    if (reservation.owner_ != this || !grant) {
+    if (!accepting_ || reservation.owner_ != this || !grant) {
         return false;
     }
     const Handle handle = reservation.handle_;
@@ -810,8 +805,7 @@ void CSpace::finish_retire() noexcept {
     resource::Charge refund{};
     {
         sync::Lock guard{lock_};
-        if (accepting_ || growing_ || live_slots_ != 0 || bindings_ != 0
-            || escrows_ != 0
+        if (accepting_ || growing_ || live_slots_ != 0 || bindings_ != 0 || escrows_ != 0
             || releasing_ || retired_) {
             return;
         }
@@ -863,6 +857,16 @@ void CSpace::finish_retire() noexcept {
         releasing_ = false;
         retired_ = true;
     }
+    complete_cleanup();
+}
+
+void CSpace::complete_cleanup() noexcept {
+    object::cleanup done;
+    {
+        sync::Lock guard{lock_};
+        if (retired_) done = std::move(cleanup_);
+    }
+    if (done) done.complete();
 }
 
 auto CSpace::live_slots() const noexcept -> usize {

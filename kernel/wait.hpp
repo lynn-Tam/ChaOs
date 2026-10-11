@@ -1,9 +1,9 @@
 #pragma once
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <uapi/abi.h>
 #include <sync.hpp>
 
@@ -37,7 +37,7 @@ public:
     ~Completion() noexcept;
 
     [[nodiscard]] auto attached() const noexcept -> bool {
-        return delivery_.load<libk::MemoryOrder::Acquire>()
+        return delivery_.load(std::memory_order_acquire)
             != Delivery::Detached;
     }
     // Publication is narrower than scheduling. It may request a retained wake
@@ -109,7 +109,7 @@ private:
     void* owner_{};
     const Ops* ops_{};
     Wait* wait_{};
-    libk::Atomic<Delivery> delivery_{Delivery::Detached};
+    std::atomic<Delivery> delivery_{Delivery::Detached};
 
 };
 
@@ -146,7 +146,7 @@ private:
     Cpus* cpus_{};
     sched::Sc* binding_{};
     mutable sync::Spin lock_{};
-    libk::Atomic<bool> ready_{};
+    std::atomic<bool> ready_{};
     EdgePhase phase_{EdgePhase::Detached};
 
 };
@@ -162,11 +162,11 @@ public:
     auto completion() noexcept -> Completion& { return completion_; }
 
 private:
-    auto done() const noexcept -> bool { return done_.load<libk::MemoryOrder::Acquire>(); }
+    auto done() const noexcept -> bool { return done_.load(std::memory_order_acquire); }
     auto cancel() noexcept -> bool { return !committed_; }
     void release() noexcept { libk_assert(!committed_ || done()); }
 
-    libk::Atomic<bool> done_{};
+    std::atomic<bool> done_{};
     bool committed_{};
     Completion completion_;
 };

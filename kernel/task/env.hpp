@@ -3,7 +3,7 @@
 #include <utility>
 
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>
 #include <variant>
@@ -54,8 +54,8 @@ class Env final : private libk::noncopyable {
     private:
         friend class Env;
         User(
-            object::ref<>&& vspace_owner,
-            object::ref<>&& cspace_owner,
+            object::ref<> vspace_owner,
+            object::ref<> cspace_owner,
             mm::VSpace& address_space,
             cap::CSpace& capability_space) noexcept;
     };
@@ -71,8 +71,8 @@ public:
     [[nodiscard]] static auto kernel(mm::KSpace& vspace) noexcept
         -> Env;
     [[nodiscard]] static auto user(
-        object::ref<>&& vspace,
-        object::ref<>&& cspace,
+        object::ref<> vspace,
+        object::ref<> cspace,
         std::optional<ipc::Buffer> ipc = std::nullopt) noexcept
         -> std::expected<Env, EnvError>;
 

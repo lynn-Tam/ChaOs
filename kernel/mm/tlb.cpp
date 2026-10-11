@@ -15,7 +15,7 @@ Flush::~Flush() noexcept {
     libk_assert(complete() && !link_);
     pages_.reset();
     fee_.reset();
-    if (owner_) libk_assert(owner_->retained_.fetch_sub<libk::MemoryOrder::Release>(1) != 0);
+    if (owner_) libk_assert(owner_->retained_.fetch_sub(1, std::memory_order_release) != 0);
 }
 
 bool Flush::release(resource::Charge &refund) noexcept {
@@ -24,7 +24,7 @@ bool Flush::release(resource::Charge &refund) noexcept {
     pages_.reset();
     refund = std::move(fee_);
     if (owner_) {
-        libk_assert(owner_->retained_.fetch_sub<libk::MemoryOrder::Release>(1) != 0);
+        libk_assert(owner_->retained_.fetch_sub(1, std::memory_order_release) != 0);
         owner_ = nullptr;
     }
     return true;
@@ -69,7 +69,7 @@ bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable) n
     libk_assert(owner_ && !flush.submitted());
     flush.owner_ = owner_;
     flush.executable_ = executable;
-    static_cast<void>(owner_->retained_.fetch_add<libk::MemoryOrder::Relaxed>(1));
+    static_cast<void>(owner_->retained_.fetch_add(1, std::memory_order_relaxed));
     {
         sync::Lock lock{flush_lock};
         flush.targets_ = flush.pending_ = owner_->active_;
@@ -108,7 +108,7 @@ void Tlb::Edit::publish_fresh() noexcept {
     abort();
 }
 
-Tlb::~Tlb() noexcept { libk_assert(active_.empty() && retained_.load<libk::MemoryOrder::Acquire>() == 0); }
+Tlb::~Tlb() noexcept { libk_assert(active_.empty() && retained_.load(std::memory_order_acquire) == 0); }
 void Tlb::enter(CpuId cpu) noexcept {
     sync::Lock lock{lock_};
     libk_assert(active_.insert(cpu));

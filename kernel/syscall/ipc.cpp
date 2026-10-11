@@ -89,8 +89,8 @@ template<usize op>
         return returned(STATUS_BUSY);
     }
     const auto ticks = inv.trap.arg(1);
-    const auto deadline = ticks == 0 ? std::optional<time::Instant>{}
-        : std::optional<time::Instant>{time::Instant::from_ticks(ticks)};
+    const auto deadline = ticks == 0 ? std::optional<u64>{}
+        : std::optional<u64>{ticks};
     auto self = notification.value().reference();
     if (!self) return returned(STATUS_CLOSED);
     auto* target = &notification.value().object();
@@ -141,12 +141,12 @@ template<usize op>
         inv.trap.arg(2),
         inv.trap.arg(3),
     };
-    std::optional<time::Instant> deadline{};
+    std::optional<u64> deadline{};
     if (const u64 timeout_ns = inv.trap.arg(4); timeout_ns != 0) {
         auto& clock = inv.cpu.dispatcher().clock();
-        const auto duration = clock.duration_from_nanoseconds(timeout_ns);
+        const auto duration = clock.ticks<time::ns>(timeout_ns);
         const auto expires = duration
-            ? clock.now().checked_add(*duration) : std::nullopt;
+            ? libk::checked_add(clock.rd_ticks(), *duration) : std::nullopt;
         if (!expires) {
             return returned(STATUS_BAD_ARGS);
         }
@@ -231,7 +231,7 @@ template<usize op>
 
     const cap::EpLimit data{
         .badge = inv.trap.arg(2),
-        .fixed = ~u64{},
+        .fixed = ~u64{0},
         .cap_limit = cap_limit,
     };
     const auto publish = [&](cap::CSpace& dest) noexcept -> Result {
@@ -300,7 +300,7 @@ template<usize op>
     if (buffer == nullptr) {
         return false;
     }
-    return buffer->read(0, libk::Span<byte>{
+    return buffer->read(0, std::span<byte>{
         reinterpret_cast<byte*>(&wire), sizeof(wire)});
 }
 
@@ -380,7 +380,7 @@ template<usize op>
         return returned(STATUS_BAD_ARGS);
     }
     ChanMsg wire{};
-    if (!admitted.value().read(0, libk::Span<byte>{
+    if (!admitted.value().read(0, std::span<byte>{
             reinterpret_cast<byte*>(&wire), sizeof(wire)})
         || wire.version != CHANNEL_VERSION
         || wire.flags != CHANNEL_FLAGS_NONE
@@ -430,7 +430,7 @@ template<usize op>
     for (usize index = 0; index < result.cap_count; ++index) {
         wire.received[index] = result.caps[index].raw();
     }
-    if (!admitted.value().write(0, libk::Span<const byte>{
+    if (!admitted.value().write(0, std::span<const byte>{
             reinterpret_cast<const byte*>(&wire), sizeof(wire)})) {
         return returned(STATUS_BAD_ARGS);
     }
@@ -482,6 +482,10 @@ template<usize op>
     }
     if (!cap) {
         return returned(cap_status(cap.error()));
+    }
+    if constexpr (op == SYS_CHANNEL_UNBIND) {
+        const auto detached = cap.value()->unbind(cap.value(), inv.trap.arg(1));
+        return returned(detached ? STATUS_OK : status(detached.error()));
     }
     auto armed = cap.value()->arm(
         cap.value(), inv.trap.arg(1), inv.trap.arg(2));

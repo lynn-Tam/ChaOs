@@ -4,7 +4,7 @@
 #include <expected>
 #include <utility>
 #include <libk/inplace_vector.hpp>
-#include <libk/span.hpp>
+#include <span>
 #include <mm/pmm.hpp>
 #include <mm/types.hpp>
 #include <pte.hpp>
@@ -17,7 +17,7 @@ inline constexpr usize DirectBegin = arch::PtKernelBegin;
 inline constexpr usize DirectSize = 128ULL * 1024 * 1024 * 1024;
 inline constexpr usize DirectEnd = DirectBegin + DirectSize;
 inline constexpr usize DynamicBegin = DirectEnd;
-constexpr bool is_user(Virt a) noexcept { return a.raw() >= UserBegin && a.raw() < UserEnd; }
+constexpr bool is_user(va_t a) noexcept { return a.raw() >= UserBegin && a.raw() < UserEnd; }
 static_assert(UserBegin < UserEnd && DirectEnd > DirectBegin);
 using arch::PtPerm;
 enum class PtErr : u8 { BadAddr, BadPhys, NoMemory, Exists, Missing, Corrupt };
@@ -31,7 +31,7 @@ struct PageUsage {
 struct PtRemoved {
     PageUsage usage;
     // Ownership transfers to the caller's retirement batch, after shootdown.
-    libk::InplaceVector<mm::OwnedPage, arch::PtLevels - 1> tables;
+    libk::inplace_vector<mm::OwnedPage, arch::PtLevels - 1> tables;
 };
 
 // Caller serializes tree changes. Hardware may concurrently update leaf A/D.
@@ -97,7 +97,7 @@ class PageTable {
         }
         return {};
     }
-    auto map(mm::Virt va, mm::Pages pages, PtPerm perms) noexcept -> std::expected<void, PtErr> {
+    auto map(mm::va_t va, mm::Pages pages, PtPerm perms) noexcept -> std::expected<void, PtErr> {
         auto first = mm::VPage::from_base(va);
         if (!first || !pages.valid()) return std::unexpected(PtErr::BadAddr);
         usize i{};
@@ -112,12 +112,12 @@ class PageTable {
         if (!pages) return std::unexpected(pages.error());
         auto root = create(pmm, Kind::Io);
         if (!root) return root;
-        auto va = mm::VPage::from_base(mm::Virt{first});
+        auto va = mm::VPage::from_base(mm::va_t{first});
         auto added = root->map(*va, n, std::move(next), writable ? PtPerm::UserRw : PtPerm::UserRo);
         if (!added) return std::unexpected(added.error());
         return root;
     }
-    static auto dma(mm::Pmm &pmm, usize first, libk::Span<const mm::Page> pages, bool writable) noexcept
+    static auto dma(mm::Pmm &pmm, usize first, std::span<const mm::Page> pages, bool writable) noexcept
         -> std::expected<PageTable, PtErr> {
         usize i{};
         return dma(pmm, first, pages.size(), [&]() noexcept { return pages[i++]; }, writable);

@@ -1,6 +1,3 @@
-// kernel/trap/trap.cpp
-// 系统 trap policy 的当前 owner；架构层只提供 Event 和返回现场访问。
-
 #include <panic.hpp>
 
 #include <cpu/cpu.hpp>
@@ -17,17 +14,19 @@
 #if TEST_ENABLED
 #include <test/scenario.hpp>
 #endif
-#include <trap/trap.hpp>
+#include <trap.hpp>
+#include <sync.hpp>
+#include <trace.hpp>
 #include <uapi/abi.h>
 #include <libk/scope_guard.hpp>
 
-namespace trap {
+using Cause = arch::TrapEvent::Cause;
+using Perm = arch::TrapEvent::Perm;
 
-static void finish_thread_page_fault(
+static void finish_fault(
     Thread& thread,
     mm::FaultKind kind,
-    mm::Virt address,
-    mm::Perm access,
+    mm::va_t address,
     arch::TrapCtx& context,
     sched::Dispatcher& dispatcher) noexcept {
     status_t status{STATUS_PEER_FAULT};
@@ -54,52 +53,33 @@ static void finish_thread_page_fault(
         frame->unwind(context, dispatcher, status);
         return;
     }
-    Perm trap_access{Perm::None};
-    switch (access) {
-    case mm::Perm::Read:
-        trap_access = Perm::Read;
-        break;
-    case mm::Perm::Write:
-        trap_access = Perm::Write;
-        break;
-    case mm::Perm::Execute:
-        trap_access = Perm::Execute;
-        break;
-    }
-    const Event event = Event::exception(
-        Origin::User,
-        Exception::PageFault,
-        trap_access,
-        context.pc(),
-        address.raw());
-    thread.record_user_fault(event);
     static_cast<void>(thread.exit().claim(
         Exit::Reason::Fault,
         status,
         0,
-        event.pc(),
-        event.fault_addr()));
+        context.pc(),
+        address.raw()));
     // One-way diagnostic projection; it must never participate in fault policy.
     console::print<
         "user: contained fault pc={:#x} address={:#x} after syscalls={} "
         "active-vspace-cpus={} fault-kind={}\n">(
-        event.pc(), event.fault_addr(), thread.user_syscalls(),
+        context.pc(), address.raw(), thread.user_syscalls(),
         thread.env().vspace()->active_cpus().size(),
         static_cast<u8>(kind));
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
 
-void handle(const Event& event, arch::TrapCtx& context) noexcept {
-    if (const auto* interrupt = event.interrupt()) {
+static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) noexcept {
+    if (event.irq()) {
         Cpu& cpu = current_cpu();
-        switch (interrupt->cause) {
-        case Interrupt::Timer:
+        switch (event.cause) {
+        case Cause::Timer:
             cpu.dispatcher().on_timer();
             return;
-        case Interrupt::Software:
+        case Cause::Ipi:
             handle_ipi(cpu);
             return;
-        case Interrupt::External: {
+        case Cause::External: {
             libk_assert(cpu.ext_irq);
             cpu.ext_irq();
             return;
@@ -109,14 +89,12 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
         }
     }
 
-    if (event.origin() == Origin::User) {
-        const auto* exception = event.exception();
-        libk_assert(exception != nullptr);
+    if (event.user) {
         Cpu& cpu = current_cpu();
         Thread* const thread = cpu.current;
         libk_assert(thread != nullptr
             && thread->env().user_bound());
-        if (exception->cause == Exception::Syscall) {
+        if (event.cause == Cause::Syscall) {
             switch (syscall::handle(context)) {
             case syscall::Disposition::Return:
             case syscall::Disposition::Resume:
@@ -132,92 +110,76 @@ void handle(const Event& event, arch::TrapCtx& context) noexcept {
                 return;
             }
         }
-        if (exception->cause == Exception::PageFault) {
-            mm::Perm access{};
-            switch (exception->access) {
+        if (event.cause == Cause::PageFault) {
+            mm::Perm perm{};
+            switch (event.perm) {
             case Perm::Read:
-                access = mm::Perm::Read;
+                perm = mm::Perm::Read;
                 break;
             case Perm::Write:
-                access = mm::Perm::Write;
+                perm = mm::Perm::Write;
                 break;
             case Perm::Execute:
-                access = mm::Perm::Execute;
+                perm = mm::Perm::Execute;
                 break;
             case Perm::None:
-                if (thread != nullptr) {
-                    thread->record_user_fault(event);
-                    cpu.dispatcher().request_reschedule(
-                        sched::DispatchReason::Exit);
-                }
-                return;
+                libk_assert(false);
+                __builtin_unreachable();
             }
-            if (thread != nullptr) {
-                libk_assert(cpu.cpus != nullptr);
-                const auto address = mm::Virt{event.fault_addr()};
-                const auto kind = thread->env().vspace()->fault(
-                    *thread, mm::VmCtx{.cpus = cpu.cpus,
-                                       .local = cpu.id}, address, access);
-                if (!thread->stop_requested())
-                    finish_thread_page_fault(*thread, kind, address, access, context, cpu.dispatcher());
-                return;
-            }
+            libk_assert(cpu.cpus != nullptr);
+            const auto address = mm::va_t{event.fault_addr};
+            const auto kind = thread->env().vspace()->fault(
+                *thread, mm::VmCtx{.cpus = cpu.cpus,
+                                   .local = cpu.id}, address, perm);
+            if (!thread->stop_requested())
+                finish_fault(*thread, kind, address, context, cpu.dispatcher());
+            return;
         }
-        if (ipc::Activation* const frame =
-                thread != nullptr ? thread->activation() : nullptr;
-            frame != nullptr) {
+        if (ipc::Activation* const frame = thread->activation()) {
             frame->unwind(
                 context, cpu.dispatcher(), STATUS_PEER_FAULT);
             return;
         }
-        if (thread != nullptr) {
-            thread->record_user_fault(event);
-            static_cast<void>(thread->exit().claim(
-                Exit::Reason::Fault,
-                STATUS_PEER_FAULT,
-                0,
-                event.pc(),
-                event.fault_addr()));
-            console::print<
-                "user: contained fault pc={:#x} address={:#x} after syscalls={} "
-                "active-vspace-cpus={}\n">(
-                event.pc(), event.fault_addr(), thread->user_syscalls(),
-                thread->env().vspace()->active_cpus().size());
-        }
+        static_cast<void>(thread->exit().claim(
+            Exit::Reason::Fault,
+            STATUS_PEER_FAULT,
+            0,
+            event.pc,
+            event.fault_addr));
+        console::print<
+            "user: contained fault pc={:#x} address={:#x} after syscalls={} "
+            "active-vspace-cpus={}\n">(
+            event.pc, event.fault_addr, thread->user_syscalls(),
+            thread->env().vspace()->active_cpus().size());
         cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit);
         return;
     }
 
-    if (const auto* exception = event.exception()) {
-        switch (exception->cause) {
-        case Exception::Breakpoint:
-            context.complete_breakpoint();
-            return;
-        default:
-            panic("unhandled trap", &context);
-        }
+    if (event.cause == Cause::Breakpoint) {
+        context.complete_breakpoint();
+        return;
     }
 
     panic("unhandled trap", &context);
 }
 
-void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
+static void leave_trap(const arch::TrapEvent& event, arch::TrapCtx& context) noexcept {
     Cpu& cpu = current_cpu();
-        Thread* const thread = cpu.current;
+    Thread* const thread = cpu.current;
     libk_assert(thread != nullptr);
-    if (event.origin() == Origin::User && event.exception() != nullptr) {
+    if (event.user && !event.irq()) {
         thread->enter_kernel();
         const auto leave = libk::on_scope_exit([thread]() noexcept {
             thread->leave_kernel();
         });
-        handle(event, context);
+        handle_trap(event, context);
     }
     cpu.dispatcher().on_trap_exit();
     libk_assert(cpu.current == thread);
     // A canceled Endpoint frame cannot be popped while its leaf Wait still
     // owns the continuation. Once that relation has completed or canceled,
     // this same owning CPU performs the pending chain unwind.
-    while (thread != nullptr && thread->activation() != nullptr
+    while (thread->activation() != nullptr
         && !thread->current_wait().attached()
         && (cpu.dispatcher().current()->stop_requested()
             || thread->cancel_pending())) {
@@ -231,8 +193,23 @@ void on_exit(const Event& event, arch::TrapCtx& context) noexcept {
 
 }
 
-void on_return() noexcept {
+extern "C" auto trap_enter(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
+    libk_assert(f);
+    arch::TrapCtx ctx{*f};
+    if ((arch::local() && __atomic_load_n(&arch::local()->stop, __ATOMIC_ACQUIRE))) panic_stop(ctx);
+    auto event = arch::decode(*f);
+    trace::emit(trace::Event::TrapEnter, static_cast<u64>(event.user));
+    if (!event.user || event.irq()) handle_trap(event, ctx);
+    return ctx.frame();
+}
+extern "C" auto trap_exit(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
+    libk_assert(f && arch::local()->depth == 0);
+    arch::TrapCtx ctx{*f};
+    sync::assert_unlocked();
+    leave_trap(arch::decode(*f), ctx);
+    trace::emit(trace::Event::TrapExit);
+    return ctx.frame();
+}
+extern "C" void trap_return(arch::TrapFrame*) noexcept {
     if (auto* thread = current_cpu().current) thread->release_calls();
 }
-
-} // namespace trap

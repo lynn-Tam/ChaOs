@@ -18,17 +18,17 @@ bool test_riscv_instruction_size(const TestContext&) noexcept {
 
 bool test_user_start_validates_privilege_inputs(const TestContext&) noexcept {
     const arch::UserStart valid{
-        .entry = mm::Virt{mm::UserBegin},
-        .stack = mm::Virt{mm::UserEnd},
+        .entry = mm::UserBegin,
+        .stack = mm::UserEnd,
     };
     arch::UserStart low = valid;
-    low.entry = mm::Virt{mm::UserBegin - 2};
+    low.entry = mm::UserBegin - 2;
     arch::UserStart odd = valid;
-    odd.entry = mm::Virt{mm::UserBegin + 1};
+    odd.entry = mm::UserBegin + 1;
     arch::UserStart kernel = valid;
-    kernel.entry = mm::Virt{boot_layout.va};
+    kernel.entry = boot_layout.va;
     arch::UserStart unaligned_stack = valid;
-    unaligned_stack.stack = mm::Virt{mm::UserEnd - 1};
+    unaligned_stack.stack = mm::UserEnd - 1;
     return arch::valid_user_start(valid)
         && !arch::valid_user_start(low)
         && !arch::valid_user_start(odd)
@@ -41,15 +41,15 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
     alignas(16) byte home[1024]{};
     const usize top = reinterpret_cast<usize>(home) + sizeof(home);
     const arch::UserStart valid{
-        .entry = mm::Virt{mm::UserBegin},
-        .stack = mm::Virt{mm::UserBegin + mm::page_size},
+        .entry = mm::UserBegin,
+        .stack = mm::UserBegin + mm::page_size,
         .arguments = {1, 2, 3, 4, 5, 6},
     };
     auto prepared = arch::prepare_user_stack(top, valid);
     auto rejected = arch::prepare_user_stack(
         top,
         arch::UserStart{
-            .entry = mm::Virt{boot_layout.va},
+            .entry = boot_layout.va,
             .stack = valid.stack,
         });
     if (!prepared || *prepared < reinterpret_cast<usize>(home)
@@ -60,7 +60,7 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
     for (usize i = 0; i < valid.arguments.size(); ++i)
         if (ctx.arg(i) != valid.arguments[i]) return false;
     ctx.set_result(0, 17);
-    return ctx.pc() == valid.entry.raw() && frame.gpr[1] == valid.stack.raw()
+    return ctx.pc() == valid.entry && frame.gpr[1] == valid.stack
         && frame.gpr[0] == 0 && frame.gpr[30] == 0 && frame.sstatus == 0x20
         && ctx.arg(0) == 17 && saved.gpr[9] == 1;
 

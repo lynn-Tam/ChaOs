@@ -6,38 +6,38 @@
 #include <libk/assert.hpp>
 #include <libk/concepts.hpp>
 #include <libk/memory.hpp>
-#include <libk/span.hpp>
+#include <span>
 #include <type_traits>
 #include <utility>
 
 namespace libk {
 
 template<typename T, size_t Capacity>
-    requires(Object<T> && !std::is_const_v<T>)
-class InplaceVector final {
+    requires(std::is_object_v<T> && !std::is_const_v<T>)
+class inplace_vector final {
 public:
-    InplaceVector() noexcept = default;
+    inplace_vector() noexcept = default;
 
     template<typename... Args>
         requires(
             sizeof...(Args) <= Capacity
-            && (... && ConstructibleFrom<T, Args&&>))
-    explicit InplaceVector(Args&&... arguments)
+            && (... && std::constructible_from<T, Args&&>))
+    explicit inplace_vector(Args&&... arguments)
         noexcept((std::is_nothrow_constructible_v<T, Args&&> && ...)) {
         (static_cast<void>(try_emplace_back(
             std::forward<Args>(arguments))), ...);
     }
 
-    InplaceVector(const InplaceVector&) = delete;
-    auto operator=(const InplaceVector&) -> InplaceVector& = delete;
+    inplace_vector(const inplace_vector&) = delete;
+    auto operator=(const inplace_vector&) -> inplace_vector& = delete;
 
-    InplaceVector(InplaceVector&& other)
+    inplace_vector(inplace_vector&& other)
         noexcept(std::is_nothrow_move_constructible_v<T>) {
         move_from(other);
     }
 
-    auto operator=(InplaceVector&& other)
-        noexcept(std::is_nothrow_move_constructible_v<T>) -> InplaceVector& {
+    auto operator=(inplace_vector&& other)
+        noexcept(std::is_nothrow_move_constructible_v<T>) -> inplace_vector& {
         if (this != &other) {
             clear();
             move_from(other);
@@ -45,7 +45,7 @@ public:
         return *this;
     }
 
-    ~InplaceVector() noexcept { clear(); }
+    ~inplace_vector() noexcept { clear(); }
 
     [[nodiscard]] constexpr auto size() const noexcept -> size_t {
         return size_;
@@ -90,14 +90,14 @@ public:
     }
 
     template<typename U>
-        requires ConstructibleFrom<T, U&&>
+        requires std::constructible_from<T, U&&>
     [[nodiscard]] auto try_push_back(U&& value)
         noexcept(std::is_nothrow_constructible_v<T, U&&>) -> bool {
         return try_emplace_back(std::forward<U>(value));
     }
 
     template<typename... Args>
-        requires ConstructibleFrom<T, Args&&...>
+        requires std::constructible_from<T, Args&&...>
     [[nodiscard]] auto try_emplace_back(Args&&... arguments)
         noexcept(std::is_nothrow_constructible_v<T, Args&&...>) -> bool {
         if (size_ == Capacity) {
@@ -120,9 +120,9 @@ public:
 
     template<typename U>
         requires(
-            ConstructibleFrom<T, U&&>
-            && ConstructibleFrom<T, T&&>
-            && AssignableFrom<T&, T&&>)
+            std::constructible_from<T, U&&>
+            && std::constructible_from<T, T&&>
+            && std::assignable_from<T&, T&&>)
     auto insert(T* position, U&& value)
         noexcept(
             std::is_nothrow_constructible_v<T, U&&>
@@ -149,7 +149,7 @@ public:
     }
 
     auto erase(T* position) noexcept(std::is_nothrow_move_assignable_v<T>) -> T*
-        requires AssignableFrom<T&, T&&> {
+        requires std::assignable_from<T&, T&&> {
         size_t index{};
         libk_assert(position_index(position, false, index));
         for (size_t cursor = index; cursor + 1 < size_; ++cursor) {
@@ -162,8 +162,8 @@ public:
 
     template<typename U>
         requires(
-            ConstructibleFrom<T, U&&>
-            && ConstructibleFrom<T, T&&>)
+            std::constructible_from<T, U&&>
+            && std::constructible_from<T, T&&>)
     void replace(T* position, U&& value)
         noexcept(
             std::is_nothrow_constructible_v<T, U&&>
@@ -182,11 +182,11 @@ public:
         }
     }
 
-    [[nodiscard]] auto span() noexcept -> Span<T> {
-        return Span<T>{data(), size_};
+    [[nodiscard]] auto span() noexcept -> std::span<T> {
+        return std::span<T>{data(), size_};
     }
-    [[nodiscard]] auto span() const noexcept -> Span<const T> {
-        return Span<const T>{data(), size_};
+    [[nodiscard]] auto span() const noexcept -> std::span<const T> {
+        return std::span<const T>{data(), size_};
     }
 
 private:
@@ -226,7 +226,7 @@ private:
         return index <= limit && (allow_end || index < size_);
     }
 
-    void move_from(InplaceVector& other)
+    void move_from(inplace_vector& other)
         noexcept(std::is_nothrow_move_constructible_v<T>) {
         for (size_t index = 0; index < other.size_; ++index) {
             libk::construct_at(ptr_at(index), std::move(other[index]));

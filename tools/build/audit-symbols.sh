@@ -51,7 +51,7 @@ esac
 for archive in "$@"; do
   test -f "$archive" || fail "archive is unavailable: $archive"
   case "$archive" in
-    *libkernel-core.a|*libkernel-entry.a)
+    *libkernel-arch.a|*libkernel-core.a|*libkernel-entry.a)
       if "$nm" -C "$archive" | rg -q 'test::'; then
         fail "test dependency in production mechanism archive: $archive"
       fi

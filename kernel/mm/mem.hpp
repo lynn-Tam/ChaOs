@@ -2,13 +2,13 @@
 
 #include <libk/unique_handle.hpp>
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/types.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/span.hpp>
-#include <libk/sync/atomic.hpp>
+#include <span>
+#include <atomic>
 #include <limits>
 #include <mm/pmm.hpp>
 #include <optional>
@@ -56,20 +56,20 @@ class WaitClaim;
 struct WaitRelation final {
     using Publish = void (*)(void*, WaitRc) noexcept;
 
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     WaitQueue* request{};
     void* owner{};
     Publish publish{};
     bool (*arm)(void*) noexcept {};
     u64 generation{};
-    libk::Atomic<u8> state_{static_cast<u8>(WaitPhase::Detached)};
+    std::atomic<u8> state_{static_cast<u8>(WaitPhase::Detached)};
 
     [[nodiscard]] auto attached() const noexcept -> bool {
-        const auto state = static_cast<WaitPhase>(state_.load<libk::MemoryOrder::Acquire>());
+        const auto state = static_cast<WaitPhase>(state_.load(std::memory_order_acquire));
         return state != WaitPhase::Detached;
     }
     [[nodiscard]] auto state() const noexcept -> WaitPhase {
-        return static_cast<WaitPhase>(state_.load<libk::MemoryOrder::Acquire>());
+        return static_cast<WaitPhase>(state_.load(std::memory_order_acquire));
     }
 
 };
@@ -104,7 +104,7 @@ class WaitClaim final : private libk::noncopyable {
 };
 
 struct WaitQueue final {
-    using List = libk::IntrusiveList<WaitRelation, &WaitRelation::hook_>;
+    using List = libk::intrusive_list<WaitRelation, &WaitRelation::hook_>;
     List waiters{};
     [[nodiscard]] auto attach(WaitRelation&, void*, WaitRelation::Publish) noexcept -> bool;
     [[nodiscard]] auto detach(WaitRelation&, u64 generation) noexcept -> bool;
@@ -266,12 +266,12 @@ class MemLink final : private libk::noncopyable_nonmovable {
 
     void drop_work() noexcept;
 
-    libk::IntrusiveListHook memory_hook_{};
+    libk::intrusive_list_hook memory_hook_{};
     Mem* owner_{};
     void* context_{};
     const MemOps* ops_{};
-    libk::Atomic<usize> work_{};
-    libk::Atomic<u8> state_{static_cast<u8>(State::Idle)};
+    std::atomic<usize> work_{};
+    std::atomic<u8> state_{static_cast<u8>(State::Idle)};
     Perms perms_{};
 };
 
@@ -319,7 +319,7 @@ template<class Extra = std::monostate> class Cache {
         usize index;
         resource::Charge charge;
         OwnedPage resident;
-        libk::IntrusiveTreeHook hook;
+        libk::intrusive_tree_hook hook;
     };
     struct Compare {
         bool operator()(const Node& a, const Node& b) const noexcept { return a.index < b.index; }
@@ -357,7 +357,7 @@ template<class Extra = std::monostate> class Cache {
     Pmm* pmm_;
     Perms perms_;
     mutable sync::Spin tree_lock_;
-    libk::IntrusiveTree<Node, &Node::hook, Compare> nodes_;
+    libk::intrusive_tree<Node, &Node::hook, Compare> nodes_;
     Slab<Node, false, false> rows_;
     [[no_unique_address]] std::conditional_t<is_paged, PagerCfg, std::monostate> cfg_{};
 };
@@ -371,7 +371,7 @@ class Extents {
     Extents(const Extents&) = delete;
     Extents(Extents&&) noexcept;
     ~Extents() noexcept;
-    auto initialize(const object::ref<>&, libk::Span<const Extent>, PageGroup&&) noexcept
+    auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&) noexcept
         -> std::expected<void, MemErr>;
     auto query(usize) const noexcept -> ContentState;
     auto materialize(usize) const noexcept -> std::expected<Frame, MemErr>;
@@ -383,7 +383,7 @@ class Extents {
     PageGroup owned_{};
 };
 
-struct PhysCfg { libk::Span<const Extent> extents; PageGroup owned; };
+struct PhysCfg { std::span<const Extent> extents; PageGroup owned; };
 struct PagedCfg { object::ref<> pager; Perms perms; bool priv{}; };
 
 class Mem final : private libk::noncopyable_nonmovable {
@@ -435,9 +435,9 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto writeback(usize page_index) noexcept -> std::expected<void, MemErr>;
     // Initialize a private anonymous page without publishing a CPU mapping.
     // A write is bounded to one page and excludes attachments and page loans.
-    [[nodiscard]] auto write(usize offset, libk::Span<const byte> input) noexcept
+    [[nodiscard]] auto write(usize offset, std::span<const byte> input) noexcept
         -> std::expected<void, MemErr>;
-    [[nodiscard]] auto read(usize offset, libk::Span<byte> output) noexcept -> std::expected<void, MemErr>;
+    [[nodiscard]] auto read(usize offset, std::span<byte> output) noexcept -> std::expected<void, MemErr>;
 
     [[nodiscard]] auto attach(MemLink& attachment, Perms perms) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
@@ -455,7 +455,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     friend class PageReq;
     friend class VSpace;
 
-    using AttachmentList = libk::IntrusiveList<MemLink, &MemLink::memory_hook_>;
+    using AttachmentList = libk::intrusive_list<MemLink, &MemLink::memory_hook_>;
 
     // Adopts one operation already admitted under lock_. Its scope includes
     // foreign calls and rollback; releasing it may destroy this Mem.
@@ -498,7 +498,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     bool trim_walk_{};
     std::optional<Store> store_{};
     usize operations_{};
-    libk::Atomic<usize> request_pins_{};
+    std::atomic<usize> request_pins_{};
     MemState state_{MemState::Live};
     object::cleanup cleanup_{};
     SealState seal_{SealState::Loadable};
@@ -507,7 +507,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     object::ref<> pager_ref_{};
     bool releasing_{};
     // Closes page request admission before retirement scans the backing.
-    libk::Atomic<bool> work_open_{true};
+    std::atomic<bool> work_open_{true};
 };
 
 // One content completion, owned by the blocked call's stack.

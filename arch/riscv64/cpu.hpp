@@ -1,16 +1,12 @@
 #pragma once
 
 #include "cpu_abi.h"
-#include <base/types.hpp>
-#include <cpu/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <array>
-#include <time/time.hpp>
 #include <type_traits>
 #include <stddef.h>
 
-struct Cpu;
-struct PanicSlot;
 
 namespace arch {
 // Callee-saved state. The selected port defines the layout consumed by cpu.S.
@@ -54,9 +50,8 @@ struct Scratch {
 };
 struct Entry {
     Scratch scratch{};
-    Cpu* owner{};
+    void* owner{};
     usize stack{}, depth{}, emergency_stack{};
-    PanicSlot* panic{};
     usize emergency_depth{}, stop{};
     u64 tick{};
 };
@@ -74,7 +69,6 @@ static_assert(offsetof(Entry, owner) == CPU_ENTRY_OWNER_OFF);
 static_assert(offsetof(Entry, stack) == CPU_ENTRY_STACK_OFF);
 static_assert(offsetof(Entry, depth) == CPU_ENTRY_DEPTH_OFF);
 static_assert(offsetof(Entry, emergency_stack) == CPU_ENTRY_EMERGENCY_STACK_OFF);
-static_assert(offsetof(Entry, panic) == CPU_ENTRY_PANIC_OFF);
 static_assert(offsetof(Entry, emergency_depth) == CPU_ENTRY_EMERGENCY_DEPTH_OFF);
 static_assert(offsetof(Entry, stop) == CPU_ENTRY_STOP_OFF);
 static_assert(offsetof(Entry, tick) == CPU_ENTRY_TICK_OFF);
@@ -90,15 +84,21 @@ bool disable_interrupts() noexcept;
 void enable_interrupts() noexcept;
 void restore_interrupts(bool enabled) noexcept;
 void wait_for_interrupt() noexcept;
-auto start_secondary(CpuHwId, usize entry, usize record) noexcept -> std::expected<void, isize>;
+auto start_secondary(usize hart, usize entry, usize record) noexcept -> std::expected<void, isize>;
 bool ipi_available() noexcept;
-auto send_ipi(CpuHwId) noexcept -> std::expected<void, isize>;
+auto send_ipi(usize hart) noexcept -> std::expected<void, isize>;
 void enable_ipi() noexcept;
 void enable_ext_irq() noexcept;
 void acknowledge_ipi() noexcept;
-auto read_clock() noexcept -> time::Instant;
+// System monotonic counter: common epoch/rate on every hart. SBI timer
+// deadlines and trap-entry timestamps use this same counter domain.
+[[gnu::always_inline]] inline auto read_clock() noexcept -> u64 {
+    u64 ticks;
+    asm volatile("rdtime %0" : "=r"(ticks));
+    return ticks;
+}
 bool timer_available() noexcept;
-auto program_timer(time::Instant) noexcept -> std::expected<void, isize>;
+auto program_timer(u64) noexcept -> std::expected<void, isize>;
 void mask_timer() noexcept;
 // rv64gc instructions are 16 or 32 bits.
 constexpr usize instruction_size(u16 first) noexcept { return (first & 3U) == 3U ? 4 : 2; }

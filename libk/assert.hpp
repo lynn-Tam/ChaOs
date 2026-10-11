@@ -2,14 +2,14 @@
 
 namespace libk {
 
-struct AssertInfo final {
+struct assert_info final {
     const char* expression{};
     const char* file{};
     const char* function{};
     unsigned line{};
 };
 
-[[noreturn]] void assert_fail(const AssertInfo& info) noexcept;
+[[noreturn]] void assert_fail(const assert_info& info) noexcept;
 
 } // namespace libk
 

@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 #include "libk/concepts.hpp"
-#include "libk/string_view.hpp"
+#include <string_view>
 #include "libk/fmt/error.hpp"
 
 namespace libk::fmt {
@@ -50,7 +50,7 @@ public:
     constexpr size_t capacity() const noexcept { return N; }
     constexpr size_t attempted() const noexcept { return attempted_; }
     constexpr bool truncated() const noexcept { return truncated_; }
-    constexpr StrView view() const noexcept { return StrView{data_, size_}; }
+    constexpr std::string_view view() const noexcept { return std::string_view{data_, size_}; }
 
     constexpr bool null_terminate() noexcept {
         if (N == 0) {
@@ -106,7 +106,7 @@ public:
     constexpr size_t capacity() const noexcept { return capacity_; }
     constexpr size_t attempted() const noexcept { return attempted_; }
     constexpr bool truncated() const noexcept { return truncated_; }
-    constexpr StrView view() const noexcept { return StrView{data_, size_}; }
+    constexpr std::string_view view() const noexcept { return std::string_view{data_, size_}; }
 
     constexpr bool null_terminate() noexcept {
         if (capacity_ == 0) {
@@ -220,7 +220,7 @@ public:
         return true;
     }
 
-    constexpr bool write(StrView text) noexcept {
+    constexpr bool write(std::string_view text) noexcept {
         return write(text.data(), text.size());
     }
 

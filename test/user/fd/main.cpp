@@ -31,6 +31,22 @@ int cache() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "stdio") {
+        const int input = dup(STDIN_FILENO), output = dup(STDOUT_FILENO);
+        char text[8]{};
+        if (input < 0 || output < 0 || read(STDIN_FILENO, text, 2) != 2
+            || close(STDIN_FILENO) || close(STDOUT_FILENO)) return 58;
+        std::size_t size = 2;
+        for (;;) {
+            const auto count = read(input, text + size, sizeof(text) - size);
+            if (count < 0 || size == sizeof(text)) return 59;
+            if (!count) break;
+            size += count;
+        }
+        if (std::string_view(text, size) != "abcdef\n" || close(input)) return 60;
+        return write(output, "stdio aliases ok\n", 17) == 17 && !close(output) ? 0 : 61;
+    }
+
     if (argc == 2 && std::string_view(argv[1]) == "admin") {
         if (format_volume(nullptr, 0) != denied) return 56;
         return write(STDOUT_FILENO, "admin denied\n", 13) == 13 ? 0 : 57;

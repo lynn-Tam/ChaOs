@@ -32,9 +32,9 @@ void restore_interrupts(bool enabled) noexcept {
 }
 void wait_for_interrupt() noexcept { asm volatile("wfi" ::: "memory"); }
 void sync_instruction_stream() noexcept { asm volatile("fence.i" ::: "memory"); }
-auto start_secondary(CpuHwId hart, usize entry, usize record) noexcept -> std::expected<void, isize> {
+auto start_secondary(usize hart, usize entry, usize record) noexcept -> std::expected<void, isize> {
     if (!record || (entry & 3U)) return std::unexpected(sbi::BadAddr);
-    auto r = sbi::call(sbi::Ext::Hsm, 0, hart.raw, entry, record);
+    auto r = sbi::call(sbi::Ext::Hsm, 0, hart, entry, record);
     if (!r) return std::unexpected(r.error());
     return {};
 }
@@ -42,14 +42,9 @@ auto start_secondary(CpuHwId hart, usize entry, usize record) noexcept -> std::e
     static_cast<void>(disable_interrupts());
     for (;;) wait_for_interrupt();
 }
-auto read_clock() noexcept -> time::Instant {
-    u64 ticks;
-    asm volatile("rdtime %0" : "=r"(ticks));
-    return time::Instant::from_ticks(ticks);
-}
 bool timer_available() noexcept { return sbi::probe(sbi::Ext::Timer); }
-auto program_timer(time::Instant deadline) noexcept -> std::expected<void, isize> {
-    auto r = sbi::call(sbi::Ext::Timer, 0, deadline.ticks());
+auto program_timer(u64 deadline) noexcept -> std::expected<void, isize> {
+    auto r = sbi::call(sbi::Ext::Timer, 0, deadline);
     if (!r) return std::unexpected(r.error());
     csr::Sie::enable_timer();
     return {};
@@ -58,10 +53,10 @@ void mask_timer() noexcept { csr::Sie::disable_timer(); }
 
 auto ipi_available() noexcept -> bool { return sbi::probe(sbi::Ext::Ipi); }
 
-auto send_ipi(CpuHwId target) noexcept -> std::expected<void, isize> {
+auto send_ipi(usize target) noexcept -> std::expected<void, isize> {
     constexpr usize width = sizeof(usize) * 8;
-    const usize base = target.raw & ~(width - 1);
-    const auto result = sbi::call(sbi::Ext::Ipi, 0, usize{1} << (target.raw - base), base);
+    const usize base = target & ~(width - 1);
+    const auto result = sbi::call(sbi::Ext::Ipi, 0, usize{1} << (target - base), base);
     if (result) return {};
     return std::unexpected(result.error());
 }
@@ -70,13 +65,13 @@ void enable_ipi() noexcept { csr::Sie::enable_software(); }
 
 void acknowledge_ipi() noexcept { csr::Sip::clear_software_pending(); }
 
-auto pt_token(mm::Page root) noexcept -> usize {
-    const auto satp = csr::Satp::try_make_sv39(root.raw());
+auto pt_token(usize ppn) noexcept -> usize {
+    const auto satp = csr::Satp::try_make_sv39(ppn);
     libk_assert(satp);
     return *satp;
 }
 void activate_root(usize satp) noexcept {
-    libk_assert(!csr::Sstatus::is_interrupts_enabled());
+    libk_assert(!interrupts_enabled());
     libk_assert(csr::Satp::mode(satp) == csr::Satp::MODE_SV39);
     csr::Satp::write(satp);
     flush_tlb_all();

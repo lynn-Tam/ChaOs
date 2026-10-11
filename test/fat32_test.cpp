@@ -9,7 +9,7 @@
 } } while (false)
 
 namespace {
-using namespace sys::files::fat32;
+using namespace fat32;
 void put16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 void put32(uint8_t* p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 struct Fixture {

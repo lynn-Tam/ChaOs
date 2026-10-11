@@ -108,12 +108,12 @@ bool test_notification_badge_is_immutable_authority(
     const cap::View ceiling{
         rights, cap::Badge{32}};
     const auto exact = cap::compose(
-        object::ObjectKind::Notification,
+        ObjNotification,
         ceiling,
         cap::View{
             rights, cap::Badge{32}});
     const auto changed = cap::compose(
-        object::ObjectKind::Notification,
+        ObjNotification,
         ceiling,
         cap::View{
             rights, cap::Badge{64}});
@@ -129,7 +129,6 @@ bool test_endpoint_authority_narrows_badge_and_limits(
     using cap::PolicyError;
     using cap::Right;
     using cap::Rights;
-    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Delegate, Right::Call, Right::Inspect);
@@ -144,11 +143,11 @@ bool test_endpoint_authority_narrows_badge_and_limits(
         .cap_limit = 2,
     };
     const auto narrowed = cap::compose(
-        ObjectKind::Endpoint,
+        ObjEndpoint,
         View{rights, root},
         View{rights, caller});
     const auto widened_caps = cap::compose(
-        ObjectKind::Endpoint,
+        ObjEndpoint,
         View{rights, caller},
         View{rights, EpLimit{
             .badge = 0x42,
@@ -156,7 +155,7 @@ bool test_endpoint_authority_narrows_badge_and_limits(
             .cap_limit = 3,
         }});
     const auto changed_badge = cap::compose(
-        ObjectKind::Endpoint,
+        ObjEndpoint,
         View{rights, caller},
         View{rights, EpLimit{
             .badge = 0x43,
@@ -178,7 +177,6 @@ bool test_channel_root_cannot_fix_badge_generically(
     using cap::PolicyError;
     using cap::Right;
     using cap::Rights;
-    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Duplicate, Right::Delegate, Right::Inspect,
@@ -189,7 +187,7 @@ bool test_channel_root_cannot_fix_badge_generically(
         .fixed = 0,
     };
     const auto side = cap::compose(
-        ObjectKind::Channel,
+        ObjChannel,
         View{rights, root},
         View{rights, ChanLimit{
             .side = ChannelSide::A,
@@ -197,7 +195,7 @@ bool test_channel_root_cannot_fix_badge_generically(
             .fixed = 0,
         }});
     const auto exact = cap::compose(
-        ObjectKind::Channel,
+        ObjChannel,
         View{rights, root},
         View{rights, ChanLimit{
             .side = ChannelSide::A,
@@ -216,7 +214,6 @@ bool test_channel_badge_and_side_are_immutable(
     using cap::PolicyError;
     using cap::Right;
     using cap::Rights;
-    using object::ObjectKind;
 
     const auto rights = Rights::of(
         Right::Duplicate, Right::Delegate, Right::Inspect,
@@ -227,10 +224,10 @@ bool test_channel_badge_and_side_are_immutable(
         .fixed = ~u64{},
     };
     const auto same = cap::compose(
-        ObjectKind::Channel,
+        ObjChannel,
         View{rights, exact}, View{rights, exact});
     const auto changed_badge = cap::compose(
-        ObjectKind::Channel,
+        ObjChannel,
         View{rights, exact},
         View{rights, ChanLimit{
             .side = ChannelSide::A,
@@ -238,7 +235,7 @@ bool test_channel_badge_and_side_are_immutable(
             .fixed = ~u64{},
         }});
     const auto changed_side = cap::compose(
-        ObjectKind::Channel,
+        ObjChannel,
         View{rights, exact},
         View{rights, ChanLimit{
             .side = ChannelSide::B,

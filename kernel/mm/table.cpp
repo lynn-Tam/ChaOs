@@ -1,5 +1,4 @@
 #include "table.hpp"
-#include <mm/table.hpp>
 #include <new>
 
 namespace mm {
@@ -12,7 +11,7 @@ static auto decode(Pte pte) noexcept -> PtLeaf {
     const auto page = pte.leaf_page();
     const auto perms = pte.perms();
     libk_assert(page && perms);
-    return {*page, *perms};
+    return {Page{*page}, *perms};
 }
 
 PageTable::PageTable(PageTable &&other) noexcept
@@ -31,7 +30,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
     auto root = pages.allocate();
     if (!root)
         return std::unexpected(PtErr::NoMemory);
-    if (!Pte::non_leaf(*root))
+    if (!Pte::non_leaf(root->raw()))
         return std::unexpected(PtErr::BadPhys);
     PageTable pt{*root, std::move(pages), kind};
     auto *entries = ::new (pt.table(*root)) Pte[arch::Ptes]{};
@@ -44,7 +43,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
             auto branch = pt.tables_.allocate();
             if (!branch)
                 return std::unexpected(PtErr::NoMemory);
-            auto pte = Pte::non_leaf(*branch);
+            auto pte = Pte::non_leaf(branch->raw());
             if (!pte)
                 return std::unexpected(PtErr::BadPhys);
             ::new (pt.table(*branch)) Pte[arch::Ptes]{};
@@ -56,7 +55,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
 
 auto PageTable::cpu_root() const noexcept -> usize {
     libk_assert(*this && kind_ != Kind::Io);
-    return arch::pt_token(root_);
+    return arch::pt_token(root_.raw());
 }
 
 auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> {
@@ -84,7 +83,7 @@ auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> 
             const auto next = entry.next_table_page();
             if (!next)
                 return std::unexpected(PtErr::Corrupt);
-            page = *next;
+            page = Page{*next};
         }
     }
     return w;
@@ -108,7 +107,7 @@ bool PageTable::Count::include(mm::VPage va) noexcept {
 auto PageTable::encode(mm::Page page, PtPerm perms) const noexcept -> std::expected<Pte, PtErr> {
     if (kind_ != Kind::Io && !tables_.owner().covers(Pages{page, 1}))
         return std::unexpected(PtErr::BadPhys);
-    auto pte = Pte::leaf_4k(page, perms, kind_ != Kind::User);
+    auto pte = Pte::leaf_4k(page.raw(), perms, kind_ != Kind::User);
     return pte ? std::expected<Pte, PtErr>{*pte} : std::unexpected(PtErr::BadPhys);
 }
 
@@ -131,7 +130,7 @@ auto PageTable::map(mm::VPage va, mm::Page page, PtPerm perms, mm::PageGroup &re
     // Build the whole missing subtree privately. No partial branch is published.
     for (int level = 0; level < w.missing; ++level) {
         fresh[level] = std::move(*reserve.take());
-        auto parent = Pte::non_leaf(fresh[level].page());
+        auto parent = Pte::non_leaf(fresh[level].page().raw());
         if (!parent)
             return std::unexpected(PtErr::BadPhys);
         auto *entries = ::new (fresh[level].bytes()) Pte[arch::Ptes]{};

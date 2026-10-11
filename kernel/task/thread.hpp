@@ -3,7 +3,7 @@
 #pragma once
 
 #include <trap.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu.hpp>
 #include <array>
 #include <cap/grant.hpp>
@@ -20,8 +20,7 @@
 #include <sync.hpp>
 #include <type_traits>
 #include <variant>
-#include <libk/sync/atomic.hpp>
-#include <trap/event.hpp>
+#include <atomic>
 #include <wait.hpp>
 
 class Thread;
@@ -46,10 +45,10 @@ public:
     ~Stop() noexcept;
 
     [[nodiscard]] auto started() const noexcept -> bool {
-        return phase_.load<libk::MemoryOrder::Acquire>() != Phase::Idle;
+        return phase_.load(std::memory_order_acquire) != Phase::Idle;
     }
     [[nodiscard]] auto complete() const noexcept -> bool {
-        return phase_.load<libk::MemoryOrder::Acquire>() == Phase::Complete;
+        return phase_.load(std::memory_order_acquire) == Phase::Complete;
     }
     void start(Thread&) noexcept;
 
@@ -60,9 +59,9 @@ private:
 
     Notifier notify_{};
     Thread* target_{};
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     enum class Phase : u8 { Idle, Started, Complete };
-    libk::Atomic<Phase> phase_{Phase::Idle};
+    std::atomic<Phase> phase_{Phase::Idle};
 };
 
 class Thread final : private libk::noncopyable_nonmovable {
@@ -155,11 +154,6 @@ public:
         const cap::Resolved<mm::VSpace>& vspace,
         const cap::Resolved<cap::CSpace>& cspace) noexcept
         -> std::expected<void, cap::GrantError>;
-    void record_user_fault(const trap::Event& event) noexcept {
-        user_fault_ = event;
-    }
-    [[nodiscard]] auto user_fault() const noexcept
-        -> const std::optional<trap::Event>& { return user_fault_; }
     void note_user_syscall() noexcept { ++user_syscalls_; }
     [[nodiscard]] auto user_syscalls() const noexcept -> u64 {
         return user_syscalls_;
@@ -183,7 +177,6 @@ public:
     [[nodiscard]] auto claims() noexcept -> Pager::Claims& {
         return claims_;
     }
-    [[nodiscard]] auto prepare_retire() const noexcept -> bool;
     void retire(object::cleanup&&) noexcept;
 
 private:
@@ -237,7 +230,7 @@ private:
     sched::Sc* sc_{};
     sched::Dispatcher* home_{};
     mutable sync::Spin lock_{};
-    libk::IntrusiveList<Stop, &Stop::hook_> stops_{};
+    libk::intrusive_list<Stop, &Stop::hook_> stops_{};
     bool stopping_{};
     bool stopped_{};
 
@@ -254,7 +247,6 @@ private:
     Exit exit_{};
     std::variant<KernelStart, UserStart> start_;
     Kind kind_{Kind::Normal};
-    std::optional<trap::Event> user_fault_{};
     Wait wait_{};
     ipc::Activation* active_{};
     ipc::Activation* retired_{};

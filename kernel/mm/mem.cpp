@@ -8,7 +8,7 @@
 #include <mm/pager.hpp>
 #include <object/ref.hpp>
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/intrusive_tree.hpp>
@@ -39,7 +39,7 @@ auto WaitQueue::attach(WaitRelation& relation, void* owner_context, WaitRelation
     relation.publish = delivery;
     relation.request = this;
     ++relation.generation;
-    relation.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(WaitPhase::Attached));
+    relation.state_.store(static_cast<u8>(WaitPhase::Attached), std::memory_order_release);
     waiters.push_back(relation);
     return true;
 }
@@ -53,12 +53,12 @@ auto WaitQueue::detach(WaitRelation& relation, u64 expected_generation) noexcept
     relation.owner = nullptr;
     relation.publish = nullptr;
     relation.request = nullptr;
-    relation.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(WaitPhase::Detached));
+    relation.state_.store(static_cast<u8>(WaitPhase::Detached), std::memory_order_release);
     return true;
 }
 
 auto WaitQueue::take() noexcept -> List {
-    for (auto& r : waiters) r.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(WaitPhase::Publishing));
+    for (auto& r : waiters) r.state_.store(static_cast<u8>(WaitPhase::Publishing), std::memory_order_release);
     return std::move(waiters);
 }
 
@@ -71,7 +71,7 @@ auto WaitQueue::finish(List& batch, WaitRc rc) noexcept -> WaitClaim {
     r.owner = nullptr;
     r.publish = nullptr;
     r.request = nullptr;
-    r.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(WaitPhase::Detached));
+    r.state_.store(static_cast<u8>(WaitPhase::Detached), std::memory_order_release);
     return claim;
 }
 
@@ -131,7 +131,7 @@ auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expe
     }
 }
 
-[[nodiscard]] auto validate_extents(Pmm& pmm, usize logical_pages, libk::Span<const Extent> extents,
+[[nodiscard]] auto validate_extents(Pmm& pmm, usize logical_pages, std::span<const Extent> extents,
                                     const PageGroup& owned) noexcept -> std::expected<void, MemErr> {
     if (extents.empty()) {
         return std::unexpected(MemErr::InvalidRange);
@@ -337,7 +337,7 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, WaitRelation* relation, 
         Row row;
         for (;;) {
             sync::Lock guard{tree_lock_};
-            if (!owner.work_open_.load<libk::MemoryOrder::Acquire>())
+            if (!owner.work_open_.load(std::memory_order_acquire))
                 return std::unexpected(MemErr::InvalidState);
             auto* n = nodes_.find(index);
             if (!n) {
@@ -397,7 +397,7 @@ auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page) no
     {
         sync::Lock guard{tree_lock_};
         n = nodes_.find(reply->req().page_index);
-        if (!owner.work_open_.load<libk::MemoryOrder::Acquire>() || n->failed || n->resident)
+        if (!owner.work_open_.load(std::memory_order_acquire) || n->failed || n->resident)
             return std::unexpected(MemErr::OwnershipMismatch);
         libk_assert(&n->request == reply->request());
         n->resident = std::move(page);
@@ -513,7 +513,7 @@ Extents::Extents(Extents&& other) noexcept
       owned_(std::move(other.owned_)) {}
 Extents::~Extents() noexcept { reset(); }
 
-auto Extents::initialize(const object::ref<>& payer, libk::Span<const Extent> extents,
+auto Extents::initialize(const object::ref<>& payer, std::span<const Extent> extents,
                          PageGroup&& pages) noexcept -> std::expected<void, MemErr> {
     libk_assert(!head_);
     for (const auto& e : extents) {
@@ -562,23 +562,23 @@ void MemWork::Drop::operator()(Data& d) const noexcept {
 }
 
 MemLink::~MemLink() noexcept {
-    const State current = static_cast<State>(state_.load<libk::MemoryOrder::Acquire>());
+    const State current = static_cast<State>(state_.load(std::memory_order_acquire));
     libk_assert(current == State::Idle || current == State::Detached);
     libk_assert(owner_ == nullptr);
-    libk_assert(work_.load<libk::MemoryOrder::Acquire>() == 0);
+    libk_assert(work_.load(std::memory_order_acquire) == 0);
 }
 
 auto MemLink::attached() const noexcept -> bool {
-    const State current = static_cast<State>(state_.load<libk::MemoryOrder::Acquire>());
+    const State current = static_cast<State>(state_.load(std::memory_order_acquire));
     return current == State::Attached || current == State::Invalidating;
 }
 
-auto MemLink::busy() const noexcept -> bool { return work_.load<libk::MemoryOrder::Acquire>() != 0; }
+auto MemLink::busy() const noexcept -> bool { return work_.load(std::memory_order_acquire) != 0; }
 
 auto MemLink::detach() noexcept -> bool {
     Mem* const owner = owner_;
     if (owner == nullptr) {
-        return static_cast<State>(state_.load<libk::MemoryOrder::Acquire>()) == State::Detached && !busy();
+        return static_cast<State>(state_.load(std::memory_order_acquire)) == State::Detached && !busy();
     }
     return owner->detach(*this);
 }
@@ -588,9 +588,9 @@ void MemLink::drop_work() noexcept {
     // the last work pin and then observes Detached. Sequential consistency is
     // intentional: it forbids both sides from observing the other's old value
     // and thereby losing the final released() notification.
-    const usize previous = work_.fetch_sub<libk::MemoryOrder::SeqCst>(1);
+    const usize previous = work_.fetch_sub(1, std::memory_order_seq_cst);
     libk_assert(previous != 0);
-    if (previous == 1 && static_cast<State>(state_.load<libk::MemoryOrder::SeqCst>()) == State::Detached) {
+    if (previous == 1 && static_cast<State>(state_.load(std::memory_order_seq_cst)) == State::Detached) {
         libk_assert(ops_ != nullptr && ops_->released != nullptr);
         ops_->released(context_);
     }
@@ -633,11 +633,7 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
     -> std::expected<Data, MemErr> {
     if (!bytes || bytes % page_size) return std::unexpected(MemErr::InvalidSize);
     Data d{pmm, bytes / page_size};
-    if (payer) {
-        auto ref = payer.clone();
-        if (!ref) return std::unexpected(MemErr::InvalidState);
-        d.payer_ = std::move(*ref);
-    }
+    d.payer_ = payer;
     auto ready = std::visit([&]<class C>(C& c) noexcept -> std::expected<void, MemErr> {
         if constexpr (std::same_as<C, AnonCfg>) {
             if (!valid_perms(c.perms)) return std::unexpected(MemErr::InvalidAccess);
@@ -886,7 +882,7 @@ auto Mem::trim(ObjectRange range, WaitRelation& waiter, void* ctx, WaitRelation:
         if (range.empty() || !ObjectRange{0, logical_pages_}.contains(range))
             return std::unexpected(MemErr::InvalidRange);
         // No recursive wait for this Pager's own outstanding requests.
-        if (trimming_ || trim_walk_ || request_pins_.load<libk::MemoryOrder::Acquire>())
+        if (trimming_ || trim_walk_ || request_pins_.load(std::memory_order_acquire))
             return std::unexpected(MemErr::Busy);
         if (!trim_waiters_.attach(waiter, ctx, publish)) return std::unexpected(MemErr::Busy);
         operations_ += 2; // The trim and this admitted waiter own separate pins.
@@ -919,7 +915,7 @@ void Mem::finish_trim() noexcept {
     {
         sync::Lock guard{lock_};
         if (!trimming_ || trim_walk_ || operations_ != 1 + trim_waiters_.waiters.size() ||
-            request_pins_.load<libk::MemoryOrder::Acquire>())
+            request_pins_.load(std::memory_order_acquire))
             return;
         trim_walk_ = true;
         range = *trimming_;
@@ -933,7 +929,7 @@ void Mem::finish_trim() noexcept {
         batch = trim_waiters_.take();
         trimming_.reset();
         for (auto& a : attachments_)
-            a.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(MemLink::State::Attached));
+            a.state_.store(static_cast<u8>(MemLink::State::Attached), std::memory_order_release);
         // Completion must expose the final state before any waiter can resume.
         trim_walk_ = false;
         closing = state_ == MemState::Stopping;
@@ -959,7 +955,7 @@ auto Mem::pager_finish(Pager& pager, u64 id, bool fail) noexcept -> std::expecte
     return paged([&](Paged& p) noexcept { return p.finish(*this, pager, id, fail); });
 }
 
-auto Mem::write(usize offset, libk::Span<const byte> input) noexcept -> std::expected<void, MemErr> {
+auto Mem::write(usize offset, std::span<const byte> input) noexcept -> std::expected<void, MemErr> {
     const usize within = offset & (page_size - 1);
     if (input.empty() || input.size() > page_size - within || offset >= size() ||
         input.size() > size() - offset)
@@ -985,7 +981,7 @@ auto Mem::write(usize offset, libk::Span<const byte> input) noexcept -> std::exp
     return {};
 }
 
-auto Mem::read(usize offset, libk::Span<byte> output) noexcept -> std::expected<void, MemErr> {
+auto Mem::read(usize offset, std::span<byte> output) noexcept -> std::expected<void, MemErr> {
     const auto end = libk::checked_add(offset, output.size());
     if (!end || *end > size()) {
         return std::unexpected(MemErr::InvalidRange);
@@ -1027,7 +1023,7 @@ auto Mem::attach(MemLink& attachment, Perms perms) noexcept -> std::expected<voi
     }
     libk_assert(!perms.contains(Perm::Execute) || content_epoch_.raw != 0);
     if (attachment.owner_ != nullptr ||
-        static_cast<MemLink::State>(attachment.state_.load<libk::MemoryOrder::Relaxed>()) !=
+        static_cast<MemLink::State>(attachment.state_.load(std::memory_order_relaxed)) !=
             MemLink::State::Idle ||
         attachment.ops_ == nullptr || attachment.ops_->invalidate == nullptr ||
         attachment.ops_->released == nullptr) {
@@ -1035,7 +1031,7 @@ auto Mem::attach(MemLink& attachment, Perms perms) noexcept -> std::expected<voi
     }
     attachment.owner_ = this;
     attachment.perms_ = perms;
-    attachment.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(MemLink::State::Attached));
+    attachment.state_.store(static_cast<u8>(MemLink::State::Attached), std::memory_order_release);
     attachments_.push_back(attachment);
     return {};
 }
@@ -1057,12 +1053,12 @@ auto Mem::detach(MemLink& attachment) noexcept -> bool {
             return false;
         }
         const auto current =
-            static_cast<MemLink::State>(attachment.state_.load<libk::MemoryOrder::Relaxed>());
+            static_cast<MemLink::State>(attachment.state_.load(std::memory_order_relaxed));
         libk_assert(current == MemLink::State::Attached || current == MemLink::State::Invalidating);
         attachments_.erase(attachment);
         attachment.owner_ = nullptr;
-        attachment.state_.store<libk::MemoryOrder::SeqCst>(static_cast<u8>(MemLink::State::Detached));
-        quiescent = attachment.work_.load<libk::MemoryOrder::SeqCst>() == 0;
+        attachment.state_.store(static_cast<u8>(MemLink::State::Detached), std::memory_order_seq_cst);
+        quiescent = attachment.work_.load(std::memory_order_seq_cst) == 0;
     }
     finish_retire();
     return quiescent;
@@ -1084,7 +1080,7 @@ void Mem::retire(object::cleanup&& cleanup) noexcept {
             if (state_ == MemState::Stopping) return;
             libk_assert(state_ == MemState::Live);
             state_ = MemState::Stopping;
-            work_open_.store<libk::MemoryOrder::Release>(false);
+            work_open_.store(false, std::memory_order_release);
             if (trimming_ || trim_walk_) return;
             ++operations_;
         }
@@ -1106,11 +1102,11 @@ void Mem::invalidate(ObjectRange range) noexcept {
         {
             sync::Lock guard{lock_};
             for (auto& a : attachments_) {
-                if (static_cast<MemLink::State>(a.state_.load<libk::MemoryOrder::Relaxed>()) !=
+                if (static_cast<MemLink::State>(a.state_.load(std::memory_order_relaxed)) !=
                     MemLink::State::Attached)
                     continue;
-                a.state_.store<libk::MemoryOrder::Release>(static_cast<u8>(MemLink::State::Invalidating));
-                (void)a.work_.fetch_add<libk::MemoryOrder::Relaxed>(1);
+                a.state_.store(static_cast<u8>(MemLink::State::Invalidating), std::memory_order_release);
+                (void)a.work_.fetch_add(1, std::memory_order_relaxed);
                 if (!range.empty()) ++operations_;
                 link = &a;
                 work = MemWork{a, range.empty() ? nullptr : this, range};
@@ -1176,7 +1172,7 @@ auto Mem::cancel_fault(WaitRelation& relation, u64 generation) noexcept -> bool 
     return true;
 }
 
-void Mem::request_pin() noexcept { (void)request_pins_.fetch_add<libk::MemoryOrder::AcqRel>(1); }
+void Mem::request_pin() noexcept { (void)request_pins_.fetch_add(1, std::memory_order_acq_rel); }
 void Mem::request_drop() noexcept {
     // An active trim owns a pin, so request retirement cannot destroy it here.
     bool trimming;
@@ -1216,9 +1212,9 @@ void Mem::finish_retire(bool drop_request) noexcept {
     object::cleanup cleanup{};
     {
         sync::Lock guard{lock_};
-        if (drop_request) libk_assert(request_pins_.fetch_sub<libk::MemoryOrder::AcqRel>(1));
+        if (drop_request) libk_assert(request_pins_.fetch_sub(1, std::memory_order_acq_rel));
         if (state_ != MemState::Stopping || operations_ != 0 ||
-            request_pins_.load<libk::MemoryOrder::Acquire>() != 0 || !attachments_.empty() || releasing_) {
+            request_pins_.load(std::memory_order_acquire) != 0 || !attachments_.empty() || releasing_) {
             return;
         }
         releasing_ = true;

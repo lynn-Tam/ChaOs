@@ -6,8 +6,8 @@
 #include <optional>
 #include <trap.hpp>
 #include <cap/cspace.hpp>
-#include <base/types.hpp>
-#include <libk/span.hpp>
+#include <libk/types.hpp>
+#include <span>
 #include <mm/vspace.hpp>
 #include <task/thread.hpp>
 
@@ -66,7 +66,7 @@ struct Result final {
     Call& inv,
     cap::Handle handle,
     usize offset,
-    libk::Span<byte> dest) noexcept
+    std::span<byte> dest) noexcept
     -> std::expected<void, status_t>;
 
 template<typename Descriptor>
@@ -79,7 +79,7 @@ template<typename Descriptor>
         inv,
         handle,
         offset,
-        libk::Span<byte>{reinterpret_cast<byte*>(&descriptor), sizeof(descriptor)});
+        std::span<byte>{reinterpret_cast<byte*>(&descriptor), sizeof(descriptor)});
     if (!read) {
         return std::unexpected(read.error());
     }

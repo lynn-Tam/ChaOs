@@ -56,7 +56,7 @@ audit_publish() {
     publish_block=$(printf '%s\n' "$class" | sed -n "${publish_start},$((helper_start - 1))p")
     printf '%s\n' "$publish_block" | rg -q 'task_\.lookup\(' || return 1
     printf '%s\n' "$publish_block" | rg -q 'thread_slot_' || return 1
-    printf '%s\n' "$publish_block" | rg -q 'OBJECT_KIND_THREAD' || return 1
+    printf '%s\n' "$publish_block" | rg -q 'ObjThread' || return 1
     printf '%s\n' "$publish_block" | rg -q 'execution_start\(' || return 1
 }
 

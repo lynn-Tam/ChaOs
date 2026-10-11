@@ -1,6 +1,6 @@
 #pragma once
 #include <libk/inplace_vector.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <compare>
 #include <concepts>
 #include <optional>
@@ -11,7 +11,7 @@
 
 namespace mm {
 inline constexpr usize page_size = 4096;
-enum class Space { Phys, Virt };
+enum class Space { Pa, Va };
 
 template <Space space, size_t unit = 1> class Addr {
     uintptr_t value_{};
@@ -37,7 +37,7 @@ template <Space space, size_t unit = 1> class Addr {
         if constexpr (unit != 1)
             return value_ <= max();
         else
-            return space == Space::Phys || value_ != 0;
+            return space == Space::Pa || value_ != 0;
     }
     static constexpr auto null() noexcept -> Addr
         requires(unit == 1)
@@ -91,10 +91,10 @@ template <Space space, size_t unit = 1> class Addr {
     }
 };
 
-using Phys = Addr<Space::Phys>;
-using Virt = Addr<Space::Virt>;
-using Page = Addr<Space::Phys, page_size>;
-using VPage = Addr<Space::Virt, page_size>;
+using pa_t = Addr<Space::Pa>;
+using va_t = Addr<Space::Va>;
+using Page = Addr<Space::Pa, page_size>;
+using VPage = Addr<Space::Va, page_size>;
 
 template <class T> class Range {
     T base_{};
@@ -171,7 +171,7 @@ template <class T> class Range {
     static constexpr auto from_bounds(T base, T end) noexcept -> std::optional<Range> {
         return end >= base ? std::optional<Range>{Range{base, raw(end) - raw(base)}} : std::nullopt;
     }
-    static constexpr auto from_aligned_bytes(Phys base, usize bytes) noexcept
+    static constexpr auto from_aligned_bytes(pa_t base, usize bytes) noexcept
         -> std::optional<Range>
         requires std::same_as<T, Page>
     {
@@ -179,7 +179,7 @@ template <class T> class Range {
         Range r{p.value_or(Page{}), bytes / page_size};
         return p && bytes % page_size == 0 && r.valid() ? std::optional<Range>{r} : std::nullopt;
     }
-    static constexpr auto covering_bytes(Phys base, usize bytes) noexcept -> std::optional<Range>
+    static constexpr auto covering_bytes(pa_t base, usize bytes) noexcept -> std::optional<Range>
         requires std::same_as<T, Page>
     {
         auto end = base.checked_add(bytes);
@@ -187,7 +187,7 @@ template <class T> class Range {
              hi = end ? end->aligned_up(page_size) : std::nullopt;
         return bytes && lo && hi ? from_aligned_bytes(*lo, hi->raw() - lo->raw()) : std::nullopt;
     }
-    static constexpr auto contained_bytes(Phys base, usize bytes) noexcept -> std::optional<Range>
+    static constexpr auto contained_bytes(pa_t base, usize bytes) noexcept -> std::optional<Range>
         requires std::same_as<T, Page>
     {
         auto end = base.checked_add(bytes);
@@ -200,7 +200,7 @@ template <class T> class Range {
 };
 
 using Pages = Range<Page>;
-using VRange = Range<Virt>;
+using VRange = Range<va_t>;
 using ObjectRange = Range<usize>;
 class Map;
 using MapId = libk::key<Map>;
@@ -215,7 +215,7 @@ struct Region {
 };
 
 inline constexpr usize max_regions = 32;
-using RegionList = libk::InplaceVector<Region, max_regions>;
+using RegionList = libk::inplace_vector<Region, max_regions>;
 
 
 enum class Perm : u8 {

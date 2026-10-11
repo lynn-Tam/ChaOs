@@ -4,8 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "libk/concepts.hpp"
-#include "libk/string_view.hpp"
+#include <string_view>
 #include "libk/fmt/error.hpp"
 #include "libk/fmt/output.hpp"
 #include "libk/fmt/spec.hpp"
@@ -18,38 +17,6 @@ template<typename T>
 struct formatter {};
 
 namespace detail {
-
-template<typename T>
-struct is_signed_integer : std::false_type {};
-template<> struct is_signed_integer<signed char> : std::true_type {};
-template<> struct is_signed_integer<short> : std::true_type {};
-template<> struct is_signed_integer<int> : std::true_type {};
-template<> struct is_signed_integer<long> : std::true_type {};
-template<> struct is_signed_integer<long long> : std::true_type {};
-
-template<typename T>
-struct is_unsigned_integer : std::false_type {};
-template<> struct is_unsigned_integer<unsigned char> : std::true_type {};
-template<> struct is_unsigned_integer<unsigned short> : std::true_type {};
-template<> struct is_unsigned_integer<unsigned int> : std::true_type {};
-template<> struct is_unsigned_integer<unsigned long> : std::true_type {};
-template<> struct is_unsigned_integer<unsigned long long> : std::true_type {};
-
-template<typename T>
-struct is_char_array : std::false_type {};
-template<size_t N> struct is_char_array<char[N]> : std::true_type {};
-template<size_t N> struct is_char_array<const char[N]> : std::true_type {};
-
-template<typename T>
-struct is_c_string_pointer : std::false_type {};
-template<> struct is_c_string_pointer<char*> : std::true_type {};
-template<> struct is_c_string_pointer<const char*> : std::true_type {};
-
-template<typename T>
-inline constexpr bool is_signed_integer_v = is_signed_integer<std::remove_cvref_t<T>>::value;
-
-template<typename T>
-inline constexpr bool is_unsigned_integer_v = is_unsigned_integer<std::remove_cvref_t<T>>::value;
 
 template<typename T, typename Ctx>
 concept has_custom_formatter = requires(formatter<T> f, const T& value, Ctx& ctx, const format_spec& spec) {
@@ -129,7 +96,7 @@ constexpr bool spec_has_numeric_only_flags(const format_spec& spec) noexcept {
 }
 
 template<typename Ctx>
-constexpr bool write_string(Ctx& ctx, StrView view, const format_spec& spec) noexcept {
+constexpr bool write_string(Ctx& ctx, std::string_view view, const format_spec& spec) noexcept {
     if (spec.type != 0 && spec.type != 's' && spec.type != '?') {
         ctx.fail(errc::bad_spec);
         return false;
@@ -421,12 +388,12 @@ constexpr bool custom_result_ok(R value) noexcept {
 template<typename Sink, typename T>
 constexpr bool format_custom(output_context<Sink>& ctx, const format_spec& spec, const T& value) noexcept {
     formatter<T> f{};
-    using R = decltype(f.format(value, ctx, spec));
-    if constexpr (std::is_void_v<R>) {
+    using result_type = decltype(f.format(value, ctx, spec));
+    if constexpr (std::is_void_v<result_type>) {
         f.format(value, ctx, spec);
         return true;
     } else {
-        const R r = f.format(value, ctx, spec);
+        const result_type r = f.format(value, ctx, spec);
         if (!custom_result_ok(r)) {
             if (ctx.error() == errc::ok) {
                 ctx.fail(errc::bad_spec);
@@ -439,48 +406,48 @@ constexpr bool format_custom(output_context<Sink>& ctx, const format_spec& spec,
 
 template<typename Sink, typename T>
 constexpr bool format_value(output_context<Sink>& ctx, const format_spec& spec, const T& value) noexcept {
-    using Raw = std::remove_reference_t<T>;
-    using Clean = std::remove_cvref_t<T>;
+    using value_type = std::remove_cvref_t<T>;
 
-    if constexpr (has_custom_formatter<Clean, output_context<Sink>>) {
-        return format_custom(ctx, spec, static_cast<const Clean&>(value));
-    } else if constexpr (is_char_array<Raw>::value || is_char_array<Clean>::value) {
+    if constexpr (has_custom_formatter<value_type, output_context<Sink>>) {
+        return format_custom(ctx, spec, static_cast<const value_type&>(value));
+    } else if constexpr (std::is_array_v<value_type>
+        && std::same_as<std::remove_extent_t<value_type>, char>) {
         size_t n = 0;
         while (n < sizeof(value) && value[n] != '\0') {
             ++n;
         }
-        return write_string(ctx, StrView{value, n}, spec);
-    } else if constexpr (std::same_as<Clean, StrView>) {
+        return write_string(ctx, std::string_view{value, n}, spec);
+    } else if constexpr (std::same_as<value_type, std::string_view>) {
         return write_string(ctx, value, spec);
-    } else if constexpr (std::same_as<Clean, bool>) {
+    } else if constexpr (std::same_as<value_type, bool>) {
         if (spec.type == 0 || spec.type == 's' || spec.type == '?') {
-            return write_string(ctx, value ? StrView{"true", 4} : StrView{"false", 5}, spec);
+            return write_string(ctx, value ? std::string_view{"true", 4} : std::string_view{"false", 5}, spec);
         }
         return write_unsigned_number(ctx, value ? 1u : 0u, spec, false);
-    } else if constexpr (std::same_as<Clean, char>) {
+    } else if constexpr (std::same_as<value_type, char>) {
         if (spec.type == 0 || spec.type == 'c' || spec.type == '?') {
             return write_char(ctx, value, spec);
         }
         return write_unsigned_number(ctx, static_cast<unsigned char>(value), spec, false);
-    } else if constexpr (is_c_string_pointer<Clean>::value) {
+    } else if constexpr (std::same_as<value_type, char*> || std::same_as<value_type, const char*>) {
         if (spec.type == 'p') {
             return write_pointer(ctx, static_cast<const void*>(value), spec);
         }
         if (value == nullptr) {
-            return write_string(ctx, StrView{"(null)", 6}, spec);
+            return write_string(ctx, std::string_view{"(null)", 6}, spec);
         }
-        return write_string(ctx, StrView{value, cstr_len(value)}, spec);
-    } else if constexpr (is_signed_integer_v<Clean>) {
+        return write_string(ctx, std::string_view{value, cstr_len(value)}, spec);
+    } else if constexpr (std::signed_integral<value_type> && sizeof(value_type) <= sizeof(int64_t)) {
         const int64_t signed_value = static_cast<int64_t>(value);
         return write_unsigned_number(ctx, signed_abs_to_u64(signed_value), spec, signed_value < 0);
-    } else if constexpr (is_unsigned_integer_v<Clean>) {
+    } else if constexpr (std::unsigned_integral<value_type> && sizeof(value_type) <= sizeof(uint64_t)) {
         return write_unsigned_number(ctx, static_cast<uint64_t>(value), spec, false);
-    } else if constexpr (__is_enum(Clean)) {
-        using Underlying = __underlying_type(Clean);
-        return format_value(ctx, spec, static_cast<Underlying>(value));
-    } else if constexpr (std::is_pointer_v<Clean>) {
+    } else if constexpr (std::is_enum_v<value_type>) {
+        using word = std::underlying_type_t<value_type>;
+        return format_value(ctx, spec, static_cast<word>(value));
+    } else if constexpr (std::is_pointer_v<value_type>) {
         return write_pointer(ctx, static_cast<const void*>(value), spec);
-    } else if constexpr (std::same_as<Clean, decltype(nullptr)>) {
+    } else if constexpr (std::same_as<value_type, decltype(nullptr)>) {
         return write_pointer(ctx, nullptr, spec);
     } else {
         ctx.fail(errc::type_mismatch);
@@ -509,7 +476,7 @@ constexpr bool format_indexed_arg(output_context<Sink>& ctx, size_t target,
 }
 
 template<typename Sink, typename... Args>
-constexpr result vformat_to(Sink& sink, StrView fmt_text, const Args&... args) noexcept {
+constexpr result vformat_to(Sink& sink, std::string_view fmt_text, const Args&... args) noexcept {
     output_context<Sink> ctx{sink};
     size_t next_auto_index = 0;
     enum class index_mode : uint8_t { none, automatic, manual };
@@ -682,29 +649,29 @@ consteval bool static_format_valid() noexcept {
 using detail::fixed_string;
 
 template<typename Sink, typename... Args>
-constexpr result format_to(Sink& sink, StrView fmt_text, const Args&... args) noexcept {
+constexpr result format_to(Sink& sink, std::string_view fmt_text, const Args&... args) noexcept {
     return detail::vformat_to(sink, fmt_text, args...);
 }
 
 template<typename Sink, size_t N, typename... Args>
 constexpr result format_to(Sink& sink, const char (&fmt_text)[N], const Args&... args) noexcept {
-    return detail::vformat_to(sink, StrView{fmt_text, N - 1}, args...);
+    return detail::vformat_to(sink, std::string_view{fmt_text, N - 1}, args...);
 }
 
 template<typename Sink, typename... Args>
 constexpr result format_cstr_to(Sink& sink, const char* fmt_text, const Args&... args) noexcept {
-    return detail::vformat_to(sink, StrView::from_cstr(fmt_text), args...);
+    return detail::vformat_to(sink, std::string_view(fmt_text), args...);
 }
 
 template<detail::fixed_string F, typename Sink, typename... Args>
 constexpr result format_to(Sink& sink, const Args&... args) noexcept {
     static_assert(detail::static_format_valid<F, sizeof...(Args)>(),
         "libk::fmt checked format string is malformed or references a missing argument");
-    return detail::vformat_to(sink, StrView{F.data(), F.size()}, args...);
+    return detail::vformat_to(sink, std::string_view{F.data(), F.size()}, args...);
 }
 
 template<typename... Args>
-constexpr result format_to_n(char* dst, size_t capacity, StrView fmt_text, const Args&... args) noexcept {
+constexpr result format_to_n(char* dst, size_t capacity, std::string_view fmt_text, const Args&... args) noexcept {
     span_buffer buffer{dst, capacity};
     result r = format_to(buffer, fmt_text, args...);
     if (!buffer.null_terminate() && r.error == errc::ok) {
@@ -714,22 +681,22 @@ constexpr result format_to_n(char* dst, size_t capacity, StrView fmt_text, const
 }
 
 template<size_t N, typename... Args>
-constexpr result format_to_n(char (&dst)[N], StrView fmt_text, const Args&... args) noexcept {
+constexpr result format_to_n(char (&dst)[N], std::string_view fmt_text, const Args&... args) noexcept {
     return format_to_n(dst, N, fmt_text, args...);
 }
 
 template<size_t N, size_t M, typename... Args>
 constexpr result format_to_n(char (&dst)[N], const char (&fmt_text)[M], const Args&... args) noexcept {
-    return format_to_n(dst, N, StrView{fmt_text, M - 1}, args...);
+    return format_to_n(dst, N, std::string_view{fmt_text, M - 1}, args...);
 }
 
 template<typename... Args>
 constexpr result format_cstr_to_n(char* dst, size_t capacity, const char* fmt_text, const Args&... args) noexcept {
-    return format_to_n(dst, capacity, StrView::from_cstr(fmt_text), args...);
+    return format_to_n(dst, capacity, std::string_view(fmt_text), args...);
 }
 
 template<typename... Args>
-constexpr result formatted_size(StrView fmt_text, const Args&... args) noexcept {
+constexpr result formatted_size(std::string_view fmt_text, const Args&... args) noexcept {
     counting_sink sink{};
     return format_to(sink, fmt_text, args...);
 }

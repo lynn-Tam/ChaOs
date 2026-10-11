@@ -9,8 +9,17 @@
 #include <uapi/io.h>
 #include <atomic>
 #include <ranges>
-#include "fdt.hpp"
-#include <time/clock.hpp>
+#include <boot/info.hpp>
+#include <time.hpp>
+
+struct FwPci {
+    BootSpan cfg, window;
+    std::span<const uint8_t> routes{}, devices{};
+    std::array<u32, 4> mask{};
+    u32 iommu{};
+    auto irq(u16 rid, u8 pin) const noexcept -> std::optional<u32>;
+    auto device(u16 rid) const noexcept -> std::optional<u16>;
+};
 
 class Iommu;
 
@@ -49,7 +58,7 @@ private:
     // Fault fields are protected by Iommu::lock_; identity links never change.
     std::optional<io::Fault> fault_{};
     bool recovering_{};
-    time::Instant deadline_{};
+    u64 deadline_{};
 };
 
 // The board owns this controller for its entire lifetime. No driver

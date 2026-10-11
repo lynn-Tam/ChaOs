@@ -11,7 +11,7 @@
 
 #include <cpu.hpp>
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <utility>
 #include <sched/sc.hpp>
@@ -209,20 +209,6 @@ void Thread::cancel_wait() noexcept {
     libk_assert(current_wait().cancel());
 }
 
-auto Thread::prepare_retire() const noexcept -> bool {
-    sync::Lock guard{lock_};
-    if (!claims_.empty()) {
-        return false;
-    }
-    return (state_ == State::Prepared
-            || state_ == State::Exited)
-        && sc_ == nullptr && !current_wait().attached()
-        && active_ == nullptr && retired_ == nullptr && !in_kernel_
-        && home_ == nullptr
-        && (env_.kernel_bound()
-            || env_.detached());
-}
-
 void Thread::request_stop(Stop& request) noexcept {
     sched::Dispatcher* home{};
     sched::Sc* context{};
@@ -342,7 +328,7 @@ Stop::~Stop() noexcept {
 void Stop::start(Thread& target) noexcept {
     libk_assert(!started() && target_ == nullptr);
     target_ = &target;
-    phase_.store<libk::MemoryOrder::Release>(Phase::Started);
+    phase_.store(Phase::Started, std::memory_order_release);
     target.request_stop(*this);
 }
 
@@ -350,7 +336,7 @@ void Stop::finish(Thread& target) noexcept {
     libk_assert(started() && !complete() && target_ == &target && !hook_.is_linked());
     target_ = nullptr;
     const Notifier notify = notify_;
-    phase_.store<libk::MemoryOrder::Release>(Phase::Complete);
+    phase_.store(Phase::Complete, std::memory_order_release);
     if (notify) notify();
 }
 
@@ -486,12 +472,17 @@ void Thread::close_grants() noexcept {
 
 void Thread::retire(object::cleanup&& cleanup) noexcept {
     Flight publishing{*this};
+    bool start{};
     {
         sync::Lock guard{grants_lock_};
         libk_assert(!cleanup_);
         cleanup_ = std::move(cleanup);
+        start = !revoking_;
+        revoking_ = true;
     }
-    close_grants();
+    // The same stop owns grant revocation and retirement. It drains execution,
+    // claims and environment roots before close_grants can complete cleanup.
+    if (start) revoke_.start(*this);
 }
 
 void Thread::finish_retire() noexcept {

@@ -15,6 +15,6 @@ void handle_ipi(Cpu& runtime) noexcept {
 
 #if !TEST_ENABLED
 bool send_ipi(CpuHwId target) noexcept {
-    return static_cast<bool>(arch::send_ipi(target));
+    return static_cast<bool>(arch::send_ipi(target.raw));
 }
 #endif

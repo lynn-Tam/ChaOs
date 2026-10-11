@@ -1,11 +1,11 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/unique_handle.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <sync.hpp>
 #include <object/ref.hpp>
 #include <ipc/notification_source.hpp>
@@ -37,7 +37,7 @@ public:
         mm::Mem *mem{};
         Pager *pager{};
         Claims *worker{};
-        libk::IntrusiveListHook route{}, claim{};
+        libk::intrusive_list_hook route{}, claim{};
     };
     enum class Error : u8 { Closed, Busy, Stale, InvalidRange, GenerationExhausted };
     enum class State : u8 { Open, Closing, Forced, Closed };
@@ -94,7 +94,7 @@ private:
         explicit Pin(Pager &p) noexcept : pager_(p) { p.pin(); }
         ~Pin() noexcept { pager_.unpin(); }
     };
-    using Routes = libk::IntrusiveList<Request, &Request::route>;
+    using Routes = libk::intrusive_list<Request, &Request::route>;
     [[nodiscard]] auto enqueue(Request &, Req) noexcept -> bool;
     [[nodiscard]] auto active(const Request &) const noexcept -> bool;
     void cancel(mm::Mem &) noexcept;
@@ -113,7 +113,7 @@ private:
     u64 next_id_{};
     ipc::NotificationSource source_{};
     State state_{State::Open};
-    libk::Atomic<usize> pins_{};
+    std::atomic<usize> pins_{};
     object::cleanup cleanup_{};
 };
 
@@ -121,7 +121,7 @@ private:
 // Mem content -> Pager -> Claims. The exit walk borrows Mem before unlocking.
 class Pager::Claims final {
     friend class Pager;
-    using List = libk::IntrusiveList<Request, &Request::claim>;
+    using List = libk::intrusive_list<Request, &Request::claim>;
     mutable sync::Spin lock_{};
     List list_{};
 

@@ -63,14 +63,32 @@
 
 #if !defined(__ASSEMBLER__)
 #include <array>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu.hpp>
 #include <cstddef>
 #include <libk/assert.hpp>
-#include <mm/types.hpp>
 #include <optional>
 
 namespace arch {
+// Port-independent facts decoded from the saved hardware frame.
+struct TrapEvent {
+    enum class Cause : u8 {
+        Unknown, Breakpoint, Syscall, PageFault, AccessFault, Misaligned, Illegal,
+        UnknownIrq, Timer, External, Ipi,
+    };
+    enum class Perm : u8 { None, Execute, Read, Write };
+    bool user;
+    usize pc, fault_addr;
+    Cause cause;
+    Perm perm{Perm::None};
+    bool irq() const noexcept {
+        switch (cause) {
+        case Cause::UnknownIrq: case Cause::Timer: case Cause::External: case Cause::Ipi:
+            return true;
+        default: return false;
+        }
+    }
+};
 // gpr[x-1] stores x1..x31; x0 is constant. Assembly uses the offsets above.
 struct TrapFrame {
     std::array<usize, 31> gpr;
@@ -92,7 +110,7 @@ struct TrapRegs {
     StackRegs stack() const noexcept { return {pc, gpr[1], gpr[7], gpr[0]}; }
 };
 struct UserStart {
-    mm::Virt entry{}, stack{};
+    usize entry{}, stack{};
     std::array<usize, 6> arguments{};
 };
 
@@ -120,6 +138,7 @@ class TrapCtx {
     TrapFrame* frame_;
 };
 
+auto decode(const TrapFrame&) noexcept -> TrapEvent;
 bool install_trap() noexcept;
 bool valid_user_start(UserStart) noexcept;
 std::optional<TrapFrame*> prepare_user_frame(usize top, UserStart) noexcept;

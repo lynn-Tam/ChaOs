@@ -1,6 +1,6 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <ipc/notification_source.hpp>
 #include <sync.hpp>
 #include <uapi/abi.h>

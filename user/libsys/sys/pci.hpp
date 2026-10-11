@@ -2,61 +2,62 @@
 #include <algorithm>
 #include <libk/pci.hpp>
 #include <sys/handle.hpp>
-#include <sys/start.hpp>
+#include <sys/fw.hpp>
 
 namespace sys::pci {
-inline constexpr boot::Import Config{"pci.cfg", 0x50434920, OBJECT_KIND_MEMORY};
-inline constexpr boot::Import Window{"pci.mmio", 0x50434920, OBJECT_KIND_MEMORY};
-inline constexpr boot::Import Host{"pci.host", 0x50434920, OBJECT_KIND_IO_HOST};
-inline constexpr boot::Import Firmware{"firmware", 0x46445420, OBJECT_KIND_MEMORY};
 inline void fence() noexcept { asm volatile("fence iorw, iorw" ::: "memory"); }
 
-struct Binding { cap::OwnedCap cap; uint16_t rid{}; };
+struct Binding { cap_owner cap; uint16_t rid{}; };
 
 // Root owns discovery, BAR placement and driver selection. Configuration must
 // remain frozen while a derived requester capability has a live DMA session.
 struct Bus {
-    MappedMemory cfg, desc;
+    Firmware firmware;
+    mapping cfg, desc;
     cap_t host{};
     uint64_t next{}, end{};
     static auto open(const boot::BootView& info, uintptr_t address) noexcept -> std::expected<Bus, status_t> {
-        const auto* config = info.find(Config);
-        const auto* window = info.find(Window);
-        if (!config || !window || !info.selector(Host) || !config->bytes || config->bytes % 4096 ||
+        auto firmware = Firmware::open(info, address + 0x10000000);
+        if (!firmware) return std::unexpected(firmware.error());
+        const auto node = firmware->tree.find("pci-host-ecam-generic");
+        const auto* config = node ? info.resource(*node, ObjMem, 0) : nullptr;
+        const auto* window = node ? info.resource(*node, ObjMem, 1) : nullptr;
+        const auto* host = node ? info.resource(*node, ObjHost) : nullptr;
+        if (!config || !window || !host || !config->bytes || config->bytes % 4096 ||
             config->bytes / 4096 > 65536 || !window->bytes ||
             window->phys > UINT64_MAX - window->bytes) return std::unexpected(STATUS_BAD_ARGS);
         const auto copy = cap_duplicate(config->handle, info.selector(BOOT_CSPACE), RIGHT_MAP);
         if (copy.status != STATUS_OK) return std::unexpected(copy.status);
-        auto cfg = MappedMemory::map(info.selector(BOOT_VSPACE), cap::OwnedCap{{copy.value, 0}},
+        auto cfg = mapping::map(info.selector(BOOT_VSPACE), cap_owner{copy.value},
             address, config->bytes, VM_READ | VM_WRITE);
         if (!cfg) return std::unexpected(cfg.error());
-        auto desc = MappedMemory::create(info.selector(BOOT_POOL), info.selector(BOOT_VSPACE),
+        auto desc = mapping::create(info.selector(BOOT_POOL), info.selector(BOOT_VSPACE),
             address + config->bytes, 4096);
         if (!desc) return std::unexpected(desc.error());
-        return Bus{std::move(*cfg), std::move(*desc), info.selector(Host), window->phys, window->phys + window->bytes};
+        return Bus{std::move(*firmware), std::move(*cfg), std::move(*desc), host->handle, window->phys, window->phys + window->bytes};
     }
     auto count(uint32_t id) const noexcept -> size_t {
         size_t count{};
         for (size_t rid = 0; rid < cfg.size / 4096; ++rid)
-            count += ::pci::Cfg<fence>{cfg.address + rid * 4096}.read<uint32_t>(0) == id;
+            count += ::pci::cfg<fence>{cfg.address + rid * 4096}.read<uint32_t>(0) == id;
         return count;
     }
     auto find(uint32_t id, size_t ordinal) noexcept -> std::expected<Binding, status_t> {
         for (size_t rid = 0; rid < cfg.size / 4096; ++rid) {
-            if (::pci::Cfg<fence>{cfg.address + rid * 4096}.read<uint32_t>(0) != id || ordinal--) continue;
-            const CapView view{CAP_ATTENUATION_VERSION_CURRENT, OBJECT_KIND_IO_HOST,
+            if (::pci::cfg<fence>{cfg.address + rid * 4096}.read<uint32_t>(0) != id || ordinal--) continue;
+            const CapView view{CAP_ATTENUATION_VERSION_CURRENT, ObjHost,
                 CAP_ATTENUATION_SIZE, RIGHT_CONNECT | RIGHT_DUPLICATE | RIGHT_DELEGATE | RIGHT_REVOKE,
                 {rid, 1}};
-            cap::encode(view, *reinterpret_cast<uint8_t (*)[CAP_ATTENUATION_SIZE]>(desc.address));
+            encode_cap(view, *reinterpret_cast<uint8_t (*)[CAP_ATTENUATION_SIZE]>(desc.address));
             const auto result = cap_typed_delegate(host, 0, desc.memory.selector(), 0);
             if (result.status != STATUS_OK) return std::unexpected(result.status);
-            return Binding{cap::OwnedCap{{result.value, 0}}, static_cast<uint16_t>(rid)};
+            return Binding{cap_owner{result.value}, static_cast<uint16_t>(rid)};
         }
         return std::unexpected(STATUS_NOT_FOUND);
     }
     auto configure(uint32_t id) noexcept -> status_t {
         for (size_t rid = 0; rid < cfg.size / 4096; ++rid) {
-            const ::pci::Cfg<fence> fn{cfg.address + rid * 4096};
+            const ::pci::cfg<fence> fn{cfg.address + rid * 4096};
             if (fn.read<uint32_t>(0) != id) continue;
             fn.write<uint16_t>(4, 1 << 10);
             const auto bars = fn.bars();

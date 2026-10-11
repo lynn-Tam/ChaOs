@@ -1,9 +1,9 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <source_location>
 #include <libk/assert.hpp>
-#include <libk/sync/atomic.hpp>
+#include <atomic>
 #include <cpu/types.hpp>
 #include <cpu.hpp>
 #include <trap.hpp>
@@ -11,11 +11,11 @@
 class Cpus;
 
 struct PanicSlot final {
-    libk::Atomic<bool> stopped{};
+    std::atomic<bool> stopped{};
     CpuId cpu{};
     CpuHwId hardware{};
     const char* reason{};
-    libk::AssertInfo site{};
+    libk::assert_info site{};
     arch::StackRegs stack{};
     arch::TrapRegs trap{};
     Cpus* registry{};

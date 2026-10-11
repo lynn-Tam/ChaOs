@@ -1,77 +1,65 @@
+#include <sys/protocol.hpp>
 #include <sys/pci.hpp>
-#include <servers/runtime/service.hpp>
+#include <sys/channel.hpp>
 #include <sys/handle.hpp>
-#include <servers/deploy/launch.hpp>
+#include <test/user/task.hpp>
 #include <servers/uart/port.hpp>
 
-namespace { deploy::program program; deploy::tasks<2> supervisor; }
+namespace { proc::package program; proc::tasks<2> supervisor; }
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;
-    const auto info = service::bootstrap(address, size);
+    const auto info = sys::bootstrap(address, size);
     auto pci = sys::pci::Bus::open(info, 0x3100'0000);
     if (!pci) exit(pci.error());
-    service::require(pci->configure(0x1042'1af4));
+    sys::require(pci->configure(0x1042'1af4));
     auto selected = pci->find(0x1042'1af4, 0);
     if (!selected) sys::exit(selected.error());
-    auto mapping = MappedMemory::map(service::capability(info, BOOT_VSPACE),
-        cap::OwnedCap{{service::capability(info, boot::UartMem), 0}},
+    auto mapping = mapping::map(sys::capability(info, BOOT_VSPACE),
+        cap_owner{pci->firmware.console(ObjMem)},
         0x30010000, 4096, VM_READ | VM_WRITE);
     if (!mapping) exit(mapping.error());
     uart::Port port{mapping->address};
     port.reset();
-    service::require(supervisor.load(program, info));
+    open(program, info);
     supervisor.open(info);
-    service::require(supervisor.add_boot_sources(info));
-    service::require(supervisor.add("block.host", selected->cap.selector(),
-        OBJECT_KIND_IO_HOST, RIGHT_DUPLICATE | RIGHT_CONNECT, selected->rid, 1));
-    const auto pair = channel_create(service::capability(info, BOOT_POOL),
+    const auto pair = channel_create(sys::capability(info, BOOT_POOL),
         1, CHANNEL_MAX_WORDS, 4, 2);
-    service::require(pair.status);
-    cap::OwnedCap first{{pair.value, 0}}, second{{pair.value2, 0}};
+    sys::require(pair.status);
+    cap_owner first{pair.value}, second{pair.value2};
     // Exercise the root execution's registered IPC page before clients start.
     // A user mapping alone would leave CHANNEL_TRY_RECV returning BAD_ARGS.
     const auto probe = channel_mint(first.selector(),
-        service::capability(info, BOOT_CSPACE), 1, RIGHT_RECEIVE);
-    service::require(probe.status);
-    cap::OwnedCap probe_owner{{probe.value, 0}};
-    service::Message empty{};
-    if (service::receive(probe_owner.selector(), empty, false).status != STATUS_WOULD_BLOCK)
+        sys::capability(info, BOOT_CSPACE), 1, RIGHT_RECEIVE);
+    sys::require(probe.status);
+    cap_owner probe_owner{probe.value};
+    sys::Message empty{};
+    if (sys::receive(probe_owner.selector(), empty, false).status != STATUS_WOULD_BLOCK)
         exit(STATUS_INTERNAL);
     probe_owner = {};
-    constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_DUPLICATE;
-    service::require(supervisor.add("block.client", pair.value, OBJECT_KIND_CHANNEL, rights, 0));
-    service::require(supervisor.add("block.server", pair.value2, OBJECT_KIND_CHANNEL, rights, 1));
+    const proc::cap_src server_caps[]{host(selected->cap.selector(), selected->rid),
+        input(boot::Block, pair.value2, RIGHT_RECEIVE, 1)};
+    const proc::cap_src client_caps[]{input(boot::Block, pair.value, RIGHT_SEND, 1)};
+    const auto server = start(supervisor, program, "block", {.caps = server_caps, .resources = io_quota});
+    const auto client = start(supervisor, program, "io-client", {.caps = client_caps, .resources = io_quota});
     status_t status{};
-    auto server = supervisor.launch(program, "block", status);
-    if (!server) {
-        uart::Printer printer{uart::Writer{port}};
-        (void)printer.print<"[io-session] server launch failed status={}\n">(status);
-        exit(status);
-    }
-    auto client = supervisor.launch(program, "io-client", status);
-    if (!client) {
-        uart::Printer printer{uart::Writer{port}};
-        (void)printer.print<"[io-session] client launch failed status={}\n">(status);
-        exit(status);
-    }
     for (;;) {
-        auto observed = supervisor.observe(*server);
-        service::require(observed.status);
+        auto observed = supervisor.observe(server);
+        sys::require(observed.status);
         if (observed.value != 0) {
-            status = supervisor.wait(*server);
-            (void)supervisor.stop(*client);
+            status = wait(supervisor, server);
+            (void)stop(supervisor, client);
             uart::Printer printer{uart::Writer{port}};
             (void)printer.print<"[io-session] server failed status={}\n">(status);
             exit(STATUS_INTERNAL);
         }
-        observed = supervisor.observe(*client);
-        service::require(observed.status);
+        observed = supervisor.observe(client);
+        sys::require(observed.status);
         if (observed.value != 0) break;
         yield();
     }
-    status = supervisor.wait(*client);
-    (void)supervisor.stop(*server);
+    status = wait(supervisor, client);
+    (void)stop(supervisor, server);
     if (status != STATUS_OK) {
         uart::Printer printer{uart::Writer{port}};
         (void)printer.print<"[io-session] client failed status={}\n">(status);

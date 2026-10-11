@@ -1,6 +1,6 @@
 #pragma once
 
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
 #include <libk/delegate.hpp>
@@ -27,7 +27,7 @@ private:
     friend class Notification;
 
     mutable sync::Spin lock_{};
-    libk::IntrusiveListHook hook_{};
+    libk::intrusive_list_hook hook_{};
     Closed closed_{};
     Notification* notification_{};
     u64 badge_{};

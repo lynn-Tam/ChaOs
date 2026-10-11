@@ -12,8 +12,7 @@
 #include <string_view>
 #include <vector>
 
-#include <uapi/boot_bundle.h>
-#include <kernel/boot/load.h>
+#include <libk/pkg.hpp>
 
 namespace {
 
@@ -22,8 +21,7 @@ struct Segment final {
     std::uint64_t image_offset{};
     std::uint64_t file_size{};
     std::uint64_t memory_size{};
-    std::uint64_t alignment{};
-    std::uint32_t access{};
+    std::uint32_t perms{};
 };
 
 struct Image final {
@@ -160,23 +158,22 @@ template<typename T>
             throw std::runtime_error("invalid PT_LOAD segment");
         }
 
-        std::uint32_t access{};
+        std::uint32_t perms{};
         if ((program.p_flags & PF_R) != 0) {
-            access |= BUNDLE_SEGMENT_READ;
+            perms |= PKG_SEGMENT_READ;
         }
         if ((program.p_flags & PF_W) != 0) {
-            access |= BUNDLE_SEGMENT_WRITE;
+            perms |= PKG_SEGMENT_WRITE;
         }
         if ((program.p_flags & PF_X) != 0) {
-            access |= BUNDLE_SEGMENT_EXECUTE;
+            perms |= PKG_SEGMENT_EXECUTE;
         }
         image.segments.push_back(Segment{
             .virtual_address = program.p_vaddr,
             .image_offset = program.p_offset,
             .file_size = program.p_filesz,
             .memory_size = program.p_memsz,
-            .alignment = program.p_align,
-            .access = access,
+            .perms = perms,
         });
         if (header.e_entry >= program.p_vaddr
             && header.e_entry - program.p_vaddr < program.p_memsz
@@ -206,7 +203,7 @@ template<typename T>
     std::vector<std::byte> payload;
     for (auto& segment : image.segments) {
         const auto offset = (payload.size() + 4095) & ~std::size_t{4095};
-        const auto stored = (segment.access & BUNDLE_SEGMENT_WRITE) != 0
+        const auto stored = (segment.perms & PKG_SEGMENT_WRITE) != 0
             ? segment.file_size : (segment.memory_size + 4095) & ~std::uint64_t{4095};
         if (stored > payload.max_size() - offset)
             throw std::runtime_error("load image is too large");
@@ -216,8 +213,7 @@ template<typename T>
         segment.image_offset = offset;
         // The input's stronger congruence has already been checked. A load
         // image needs page congruence; its virtual addresses stay unchanged.
-        segment.alignment = 4096;
-        if ((segment.access & BUNDLE_SEGMENT_WRITE) == 0)
+        if ((segment.perms & PKG_SEGMENT_WRITE) == 0)
             segment.memory_size = segment.file_size = stored;
     }
     image.bytes = std::move(payload);
@@ -275,11 +271,11 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         names_size += module.name.size();
     }
 
-    const std::size_t modules_offset = BUNDLE_HEADER_SIZE;
+    const std::size_t modules_offset = PKG_HEADER_SIZE;
     const std::size_t segments_offset = modules_offset
-        + modules.size() * BUNDLE_MODULE_SIZE;
+        + modules.size() * PKG_MODULE_SIZE;
     const std::size_t names_offset = segments_offset
-        + segment_count * BUNDLE_SEGMENT_SIZE;
+        + segment_count * PKG_SEGMENT_SIZE;
 
     std::vector<std::size_t> name_offsets;
     std::vector<std::size_t> image_offsets;
@@ -301,13 +297,13 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
 
     std::vector<std::byte> output;
     output.reserve(total_size);
-    append_le(output, BUNDLE_MAGIC, 8);
-    append_le(output, BUNDLE_MAJOR, 2);
-    append_le(output, BUNDLE_MINOR, 2);
-    append_le(output, BUNDLE_HEADER_SIZE, 4);
+    append_le(output, PKG_MAGIC, 8);
+    append_le(output, PKG_MAJOR, 2);
+    append_le(output, PKG_MINOR, 2);
+    append_le(output, PKG_HEADER_SIZE, 4);
     append_le(output, total_size, 8);
-    append_le(output, BUNDLE_ARCH_RISCV64, 4);
-    append_le(output, BUNDLE_ABI_RISCV_LP64, 4);
+    append_le(output, PKG_ARCH_RISCV64, 4);
+    append_le(output, PKG_ABI_RISCV_LP64, 4);
     append_le(output, 0, 8); // required features
     append_le(output, modules_offset, 8);
     append_le(output, modules.size(), 4);
@@ -325,7 +321,7 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
         append_le(output, module.name.size(), 4);
         append_le(
             output,
-            module.data ? BUNDLE_MODULE_DATA : BUNDLE_MODULE_BOOTABLE,
+            module.data ? PKG_MODULE_DATA : PKG_MODULE_BOOTABLE,
             4);
         append_le(output, image_offsets[index], 8);
         append_le(
@@ -349,9 +345,7 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
                 output, image_offsets[index] + segment.image_offset, 8);
             append_le(output, segment.file_size, 8);
             append_le(output, segment.memory_size, 8);
-            append_le(output, segment.alignment, 8);
-            append_le(output, segment.access, 4);
-            append_le(output, 0, 4);
+            append_le(output, segment.perms, 8);
         }
     }
     for (const Module& module : modules) {
@@ -373,16 +367,13 @@ void pad_to(std::vector<std::byte>& output, std::size_t offset) {
     }
     if (boot) {
         const auto& root = modules[root_index].image;
-        for (const auto& seg : root.segments) {
-            append_le(output, seg.virtual_address, 8);
-            append_le(output, image_offsets[root_index] + seg.image_offset, 8);
-            append_le(output, seg.file_size, 8);
-            append_le(output, seg.memory_size, 8);
-            append_le(output, seg.access, 8);
-        }
+        size_t first{};
+        for (size_t i = 0; i < root_index; ++i)
+            first += modules[i].image.segments.size();
         append_le(output, BOOT_LOAD_MAGIC, 8);
         append_le(output, total_size, 8);
         append_le(output, root.entry, 8);
+        append_le(output, segments_offset + first * PKG_SEGMENT_SIZE, 8);
         append_le(output, root.segments.size(), 8);
     }
     return output;

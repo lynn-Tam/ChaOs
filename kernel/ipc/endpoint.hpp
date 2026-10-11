@@ -6,7 +6,7 @@
 
 #include <trap.hpp>
 #include <cap/grant.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <task/env.hpp>
 #include <libk/inplace_vector.hpp>
 #include <libk/manual_lifetime.hpp>
@@ -21,7 +21,6 @@
 #include <cap/cspace.hpp>
 #include <resource/sponsorship.hpp>
 #include <sched/sched.hpp>
-#include <time/time.hpp>
 #include <uapi/ipc.h>
 
 class Cpus;
@@ -51,13 +50,13 @@ struct EndpointConfig final {
     usize capacity{};
     usize call_capacity{};
     usize max_depth{};
-    time::Duration budget_floor{};
+    u64 budget_floor{};
     sched::Urgency urgency_ceiling{*sched::Urgency::make(0)};
 };
 
-using CodePages = libk::InplaceVector<
+using CodePages = libk::inplace_vector<
     mm::PageHold, ENDPOINT_MAX_CODE_PAGES>;
-using StackPages = libk::InplaceVector<
+using StackPages = libk::inplace_vector<
     mm::PageHold, ENDPOINT_MAX_STACK_PAGES>;
 
 class Endpoint;
@@ -74,7 +73,7 @@ public:
         mm::View&& user_stack,
         std::optional<Buffer>&& ipc,
         StackPages&& resident,
-        mm::Virt user_stack_top) noexcept;
+        mm::va_t user_stack_top) noexcept;
     ~Activation() noexcept;
 
     [[nodiscard]] auto stack() noexcept -> mm::Stack& { return kernel_stack_; }
@@ -102,7 +101,7 @@ private:
     Wait wait_{};
     Activation* previous_{};
     Call* call_{};
-    mm::Virt user_stack_top_{};
+    mm::va_t user_stack_top_{};
 
 };
 
@@ -143,7 +142,7 @@ private:
     Endpoint* endpoint_{};
     Completion completion_;
     sched::Deadline deadline_;
-    libk::ManualLifetime<cap::GrantAttachment> grant_{};
+    libk::manual_lifetime<cap::GrantAttachment> grant_{};
     object::ref<Thread> caller_{};
     arch::TrapFrame* caller_frame_{};
     Activation* activation_{};
@@ -185,7 +184,7 @@ public:
         mm::View&& user_stack,
         std::optional<Buffer>&& ipc,
         StackPages&& resident,
-        mm::Virt user_stack_top) noexcept
+        mm::va_t user_stack_top) noexcept
         -> std::expected<void, EndpointError>;
     [[nodiscard]] auto add_call() noexcept
         -> std::expected<void, EndpointError>;
@@ -197,7 +196,7 @@ public:
         sched::Dispatcher& dispatcher,
         Cpus& cpus,
         const usize (&arguments)[3],
-        std::optional<time::Instant> deadline) noexcept
+        std::optional<u64> deadline) noexcept
         -> std::expected<void, EndpointError>;
     [[nodiscard]] auto reply(
         Thread& caller,

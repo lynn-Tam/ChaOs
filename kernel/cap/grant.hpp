@@ -5,13 +5,12 @@
 #include <utility>
 
 #include <cap/cap.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/key.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <libk/noncopyable.hpp>
-#include <libk/sync/atomic.hpp>
-#include <object/id.hpp>
+#include <atomic>
 #include <object/ref.hpp>
 #include <sync.hpp>
 #include <wait.hpp>
@@ -22,10 +21,6 @@
 #include <libk/delegate.hpp>
 #include <mm/pmm.hpp>
 #include <resource/sponsorship.hpp>
-
-namespace object {
-class allocation;
-}
 
 namespace resource {
 class Reservation;
@@ -103,14 +98,14 @@ private:
 
     void drop_work() noexcept;
 
-    libk::IntrusiveListHook grant_hook_{};
+    libk::intrusive_list_hook grant_hook_{};
     Graph* graph_{};
     void* node_{};
     u64 generation_{};
     void* context_{};
     const GrantAttachmentOps* ops_{};
-    libk::Atomic<usize> work_{};
-    libk::Atomic<u8> state_{static_cast<u8>(State::Idle)};
+    std::atomic<usize> work_{};
+    std::atomic<u8> state_{static_cast<u8>(State::Idle)};
 };
 
 using GrantKey = libk::key<Graph>;
@@ -144,7 +139,7 @@ public:
     }
     [[nodiscard]] auto key() const noexcept -> GrantKey;
     [[nodiscard]] auto graph() const noexcept -> Graph&;
-    [[nodiscard]] auto kind() const noexcept -> object::ObjectKind;
+    [[nodiscard]] auto kind() const noexcept -> ObjKind;
     [[nodiscard]] auto get() const noexcept -> void*;
     [[nodiscard]] auto target_live() const noexcept -> bool;
     [[nodiscard]] auto ceiling() const noexcept -> View;
@@ -222,7 +217,7 @@ public:
     explicit GrantRevoke(
         sync::Latch::Notifier notifier = {}) noexcept
         : completion_(notifier) {}
-    ~GrantRevoke() noexcept = default;
+    ~GrantRevoke() noexcept { libk_assert(!source_.valid()); }
 
     [[nodiscard]] auto initialized() const noexcept -> bool {
         return completion_.initialized();
@@ -236,6 +231,8 @@ private:
     friend class Graph;
     void initialize(usize pending) noexcept;
     void acknowledge() noexcept;
+    GrantKey source_{};
+    GrantRevoke* next_{};
     sync::Latch completion_;
 };
 
@@ -298,21 +295,21 @@ public:
     ~Graph() noexcept;
 
     [[nodiscard]] auto create_root(
-        object::ref<>&& target,
+        object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto create_root(
         resource::Reservation&& charge,
-        object::ref<>&& target,
+        object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto derive(
         const GrantLease& source,
-        object::ref<>&& target,
+        object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive(
         resource::Reservation&& charge,
         const GrantLease& source,
-        object::ref<>&& target,
+        object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto ref(GrantKey key) noexcept
@@ -331,6 +328,10 @@ public:
         GrantKey source,
         GrantRevoke& completion) noexcept -> std::expected<void, GrantError>;
 
+    // Full monotonic close: waits for overlapping revokes, then closes the
+    // remaining lineage. Missing/reclaimed generations are already drained.
+    void close(GrantKey, GrantRevoke&) noexcept;
+
     [[nodiscard]] auto state(GrantKey key) const noexcept
         -> std::expected<GrantState, GrantError>;
     [[nodiscard]] auto live_count() const noexcept -> usize;
@@ -343,23 +344,21 @@ private:
     friend class GrantRef;
     friend class GrantLease;
     friend class GrantAttachment;
-    friend class object::allocation;
-    friend class object::group;
 
     struct Slot;
     using Storage = base::slab<Slot, mm::OwnedPage, mm::page_size>;
     using PageHeader = typename Storage::page;
 
     struct Node final {
-        libk::IntrusiveListHook child_hook{};
-        using ChildList = libk::IntrusiveList<Node, &Node::child_hook>;
-        using AttachmentList = libk::IntrusiveList<
+        libk::intrusive_list_hook child_hook{};
+        using ChildList = libk::intrusive_list<Node, &Node::child_hook>;
+        using AttachmentList = libk::intrusive_list<
             GrantAttachment,
             &GrantAttachment::grant_hook_>;
 
         Node(
             Slot& owner,
-            object::ref<>&& target_ref,
+            object::ref<> target_ref,
             View ceiling,
             Node* parent_node,
             resource::Reservation&& charge) noexcept
@@ -381,18 +380,17 @@ private:
         GrantRevoke* revoke{};
         usize refs{};
         resource::Sponsorship sponsorship{};
-        object::allocation* allocation{};
     };
 
     struct Slot final {
         PageHeader* page{};
         Slot* next_free{};
-        libk::IntrusiveListHook work_hook{};
-        libk::Atomic<u64> generation{};
-        libk::Atomic<usize> operations{};
-        libk::Atomic<GrantState> state{GrantState::Revoked};
-        libk::Atomic<bool> work_retained{};
-        libk::Atomic<bool> occupied{};
+        libk::intrusive_list_hook work_hook{};
+        std::atomic<u64> generation{};
+        std::atomic<usize> operations{};
+        std::atomic<GrantState> state{GrantState::Revoked};
+        std::atomic<bool> work_retained{};
+        std::atomic<bool> occupied{};
         alignas(Node) byte storage[sizeof(Node)]{};
 
         [[nodiscard]] auto node() noexcept -> Node* {
@@ -414,13 +412,13 @@ private:
         return (value & operation_closed) != 0;
     }
 
-    using SlotQueue = libk::IntrusiveList<Slot, &Slot::work_hook>;
+    using SlotQueue = libk::intrusive_list<Slot, &Slot::work_hook>;
 
     static constexpr usize slots_per_page = Storage::capacity();
 
     [[nodiscard]] auto create(
         resource::Reservation&& charge,
-        object::ref<>&& target,
+        object::ref<> target,
         View ceiling,
         Node* parent) noexcept -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto claim_slot() noexcept
@@ -447,11 +445,7 @@ private:
     void service_slot(Slot& slot) noexcept;
     [[nodiscard]] auto detach(GrantAttachment& attachment) noexcept -> bool;
     void reclaim(GrantKey key, bool drop_reference) noexcept;
-    [[nodiscard]] auto destroy_target(const GrantLease& source) noexcept -> std::expected<void, GrantError>;
-    void revoke_allocation(object::allocation& allocation) noexcept;
-    void retry_allocations() noexcept;
-    void bind_allocation(GrantKey root, object::allocation& allocation) noexcept;
-    void release_allocation(GrantKey root, const object::allocation* allocation) noexcept;
+    void retry_revokes() noexcept;
     void release_page(PageHeader& page) noexcept;
     [[nodiscard]] auto revoke(
         GrantKey source,
@@ -468,7 +462,7 @@ private:
     ::WorkQueue& executor_;
     Work job_;
     Storage storage_{};
-    object::allocation* revoke_retry_{};
+    GrantRevoke* revoke_retry_{};
     usize growing_{};
 };
 

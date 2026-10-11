@@ -14,8 +14,8 @@
 namespace libk {
 
 template<typename T, size_t Capacity>
-    requires(Object<T> && !std::is_const_v<T> && Capacity > 0)
-class InplaceRing {
+    requires(std::is_object_v<T> && !std::is_const_v<T> && Capacity > 0)
+class inplace_ring {
 private:
     union slot {
         unsigned char empty_;
@@ -30,11 +30,11 @@ private:
 public:
     template<bool IsConst>
     class basic_iterator {
-        friend class InplaceRing;
+        friend class inplace_ring;
         template<bool>
         friend class basic_iterator;
 
-        using ring_type = std::conditional_t<IsConst, const InplaceRing, InplaceRing>;
+        using ring_type = std::conditional_t<IsConst, const inplace_ring, inplace_ring>;
 
     public:
         using value_type = T;
@@ -88,19 +88,19 @@ public:
     using iterator = basic_iterator<false>;
     using const_iterator = basic_iterator<true>;
 
-    constexpr InplaceRing() noexcept = default;
+    constexpr inplace_ring() noexcept = default;
 
-    constexpr InplaceRing(const InplaceRing& other)
+    constexpr inplace_ring(const inplace_ring& other)
         requires std::is_copy_constructible_v<T> {
         for (const T& value : other) {
             emplace_back(value);
         }
     }
 
-    constexpr InplaceRing(const InplaceRing&)
+    constexpr inplace_ring(const inplace_ring&)
         requires (!std::is_copy_constructible_v<T>) = delete;
 
-    constexpr InplaceRing(InplaceRing&& other)
+    constexpr inplace_ring(inplace_ring&& other)
         noexcept(std::is_nothrow_move_constructible_v<T>)
         requires std::is_move_constructible_v<T> {
         while (!other.empty()) {
@@ -109,10 +109,10 @@ public:
         }
     }
 
-    constexpr InplaceRing(InplaceRing&&)
+    constexpr inplace_ring(inplace_ring&&)
         requires (!std::is_move_constructible_v<T>) = delete;
 
-    constexpr InplaceRing& operator=(const InplaceRing& other)
+    constexpr inplace_ring& operator=(const inplace_ring& other)
         requires std::is_copy_constructible_v<T> {
         if (this == &other) {
             return *this;
@@ -124,10 +124,10 @@ public:
         return *this;
     }
 
-    constexpr InplaceRing& operator=(const InplaceRing&)
+    constexpr inplace_ring& operator=(const inplace_ring&)
         requires (!std::is_copy_constructible_v<T>) = delete;
 
-    constexpr InplaceRing& operator=(InplaceRing&& other)
+    constexpr inplace_ring& operator=(inplace_ring&& other)
         noexcept(std::is_nothrow_move_constructible_v<T>)
         requires std::is_move_constructible_v<T> {
         if (this == &other) {
@@ -141,10 +141,10 @@ public:
         return *this;
     }
 
-    constexpr InplaceRing& operator=(InplaceRing&&)
+    constexpr inplace_ring& operator=(inplace_ring&&)
         requires (!std::is_move_constructible_v<T>) = delete;
 
-    constexpr ~InplaceRing() {
+    constexpr ~inplace_ring() {
         clear();
     }
 
@@ -184,7 +184,7 @@ public:
     }
 
     template<typename... Args>
-        requires ConstructibleFrom<T, Args&&...>
+        requires std::constructible_from<T, Args&&...>
     [[nodiscard]] constexpr T* try_emplace_back(Args&&... args)
         noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         if (full()) {
@@ -199,7 +199,7 @@ public:
     }
 
     template<typename... Args>
-        requires ConstructibleFrom<T, Args&&...>
+        requires std::constructible_from<T, Args&&...>
     constexpr T& emplace_back(Args&&... args)
         noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         T* value = try_emplace_back(std::forward<Args>(args)...);
@@ -208,14 +208,14 @@ public:
     }
 
     template<typename U>
-        requires ConstructibleFrom<T, U&&>
+        requires std::constructible_from<T, U&&>
     [[nodiscard]] constexpr bool try_push_back(U&& value)
         noexcept(std::is_nothrow_constructible_v<T, U&&>) {
         return try_emplace_back(std::forward<U>(value)) != nullptr;
     }
 
     template<typename... Args>
-        requires ConstructibleFrom<T, Args&&...>
+        requires std::constructible_from<T, Args&&...>
     [[nodiscard]] constexpr T* try_emplace_front(Args&&... args)
         noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         if (full()) {
@@ -231,7 +231,7 @@ public:
     }
 
     template<typename... Args>
-        requires ConstructibleFrom<T, Args&&...>
+        requires std::constructible_from<T, Args&&...>
     constexpr T& emplace_front(Args&&... args)
         noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
         T* value = try_emplace_front(std::forward<Args>(args)...);
@@ -240,7 +240,7 @@ public:
     }
 
     template<typename U>
-        requires ConstructibleFrom<T, U&&>
+        requires std::constructible_from<T, U&&>
     [[nodiscard]] constexpr bool try_push_front(U&& value)
         noexcept(std::is_nothrow_constructible_v<T, U&&>) {
         return try_emplace_front(std::forward<U>(value)) != nullptr;
@@ -265,7 +265,7 @@ public:
     }
 
     template<typename U>
-        requires AssignableFrom<U&, T&&>
+        requires std::assignable_from<U&, T&&>
     [[nodiscard]] constexpr bool try_pop_front(U& output)
         noexcept(std::is_nothrow_assignable_v<U&, T&&>) {
         if (empty()) {
@@ -295,7 +295,7 @@ public:
     }
 
     template<typename U>
-        requires AssignableFrom<U&, T&&>
+        requires std::assignable_from<U&, T&&>
     [[nodiscard]] constexpr bool try_pop_back(U& output)
         noexcept(std::is_nothrow_assignable_v<U&, T&&>) {
         if (empty()) {
@@ -331,7 +331,7 @@ public:
     // Erase one logical element while preserving order. Move the shorter
     // side so bounded queues avoid rebuilding their entire storage.
     constexpr iterator erase(iterator position) noexcept
-        requires AssignableFrom<T&, T&&> {
+        requires std::assignable_from<T&, T&&> {
         libk_assert(position.ring_ == this);
         libk_assert(position.logical_index_ < size_);
         const size_t index = position.logical_index_;

@@ -77,7 +77,10 @@ CALL(CHANNEL_BIND, 125, channel_bind, Any, Ipc) /* a0=Channel, a1=Notification, 
 CALL(CHANNEL_ARM, 126, channel_arm, Any, Ipc) /* a0=Channel, a1=relation, a2=sequence */
 CALL(CHANNEL_MINT, 127, channel_mint, Any, Ipc) /* a0=side root, a1=dest CSpace, a2=badge, a3=rights */
 
-/* Canonical kernel monotonic clock; returns ticks or ticks/second. */
+/* One system monotonic domain across CPUs; returns ticks or Hz.
+ * Absolute deadlines use this domain. Device counters are not clock ticks. */
+CALL(CHANNEL_UNBIND, 130, channel_arm, Any, Ipc) /* a0=Channel, a1=relation; leaves the endpoint open */
+
 CALL(CLOCK_NOW, 128, clock_now, Any, Call)
 CALL(CLOCK_FREQUENCY, 129, clock_frequency, Any, Call)
 

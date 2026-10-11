@@ -5,7 +5,7 @@
 #include <task/thread.hpp>
 
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <limits>
 #include <libk/mem.h>
@@ -30,7 +30,7 @@ Activation::Activation(
     mm::View&& user_stack,
     std::optional<Buffer>&& ipc,
     StackPages&& resident,
-    mm::Virt user_stack_top) noexcept
+    mm::va_t user_stack_top) noexcept
     : endpoint_(&endpoint),
       stack_charge_(std::move(stack_charge)),
       kernel_stack_(std::move(kernel_stack)),
@@ -46,7 +46,7 @@ Activation::~Activation() noexcept {
 Call::Call(Endpoint& endpoint) noexcept
     : endpoint_(&endpoint),
       completion_(Completion::bind<Call, &Call::release, &Call::cancel>(*this)),
-      deadline_(sched::Deadline::Callback::bind<&Call::expire>(*this)) {
+      deadline_(sched::Deadline::Fn::bind<&Call::expire>(*this)) {
 
 }
 
@@ -126,9 +126,7 @@ Endpoint::~Endpoint() noexcept {
 void Endpoint::bind_sponsor(
     resource::Sponsorship& sponsor) noexcept {
     libk_assert(!payer_);
-    auto source = sponsor.payer().clone();
-    libk_assert(source);
-    payer_ = std::move(*source);
+    payer_ = sponsor.payer();
 }
 
 auto Endpoint::add_call() noexcept
@@ -152,7 +150,7 @@ auto Endpoint::add_activation(
     mm::View&& user_stack,
     std::optional<Buffer>&& ipc,
     StackPages&& resident,
-    mm::Virt user_stack_top) noexcept
+    mm::va_t user_stack_top) noexcept
     -> std::expected<void, EndpointError> {
     if (state_ != State::Constructing
         || slot_count_ >= config_.capacity
@@ -199,15 +197,9 @@ auto Endpoint::hold(Thread& thread) noexcept
     if (binding == nullptr) {
         return std::unexpected(EndpointError::InvalidCaller);
     }
-    auto reference = binding->reference();
-    if (!reference) {
-        return std::unexpected(EndpointError::InvalidCaller);
-    }
-    auto held = std::move(reference).value().as<Thread>();
-    return held
-        ? std::expected<object::ref<Thread>, EndpointError>{
-              (std::move(held).value())}
-        : std::unexpected(EndpointError::InvalidCaller);
+    auto held = binding->reference();
+    if (!held) return std::unexpected(EndpointError::InvalidCaller);
+    return held;
 }
 
 auto Endpoint::depth(const Thread& thread) const noexcept -> usize {
@@ -225,7 +217,7 @@ auto Endpoint::snapshot_caps(
         return true;
     }
     IpcCaps message{};
-    if (!buffer->read(0, libk::Span<byte>{
+    if (!buffer->read(0, std::span<byte>{
             reinterpret_cast<byte*>(&message), sizeof(message)})
         || message.version != IPC_CAPS_VERSION
         || message.flags != IPC_CAPS_FLAGS_NONE
@@ -282,7 +274,7 @@ auto Endpoint::commit_caps(
         }
         IpcCaps projection{};
         projection.version = IPC_CAPS_VERSION;
-        return access.value().write(0, libk::Span<const byte>{
+        return access.value().write(0, std::span<const byte>{
             reinterpret_cast<const byte*>(&projection), sizeof(projection)});
     }
     if (receiver == nullptr) {
@@ -302,7 +294,7 @@ auto Endpoint::commit_caps(
     for (usize index = 0; index < reserved.size(); ++index) {
         projection.received[index] = reserved[index].raw();
     }
-    if (!access.value().write(0, libk::Span<const byte>{
+    if (!access.value().write(0, std::span<const byte>{
             reinterpret_cast<const byte*>(&projection), sizeof(projection)})) {
         transfer.abort();
         return false;
@@ -311,13 +303,13 @@ auto Endpoint::commit_caps(
     if (!committed) {
         projection = {};
         projection.version = IPC_CAPS_VERSION;
-        static_cast<void>(access.value().write(0, libk::Span<const byte>{
+        static_cast<void>(access.value().write(0, std::span<const byte>{
             reinterpret_cast<const byte*>(&projection), sizeof(projection)}));
         return false;
     }
     installed = std::move(committed).value();
     projection.received_count = static_cast<uint32_t>(installed.size());
-    libk_assert(access.value().write(0, libk::Span<const byte>{
+    libk_assert(access.value().write(0, std::span<const byte>{
         reinterpret_cast<const byte*>(&projection), sizeof(projection)}));
     return true;
 }
@@ -338,7 +330,7 @@ auto Endpoint::call(
     sched::Dispatcher& dispatcher,
     Cpus& cpus,
     const usize (&arguments)[3],
-    std::optional<time::Instant> deadline) noexcept
+    std::optional<u64> deadline) noexcept
     -> std::expected<void, EndpointError> {
     if (&view.object() != this
         || dispatcher.current() != &caller) {
@@ -566,7 +558,7 @@ auto Endpoint::enter(
 
     }
     arch::UserStart entry = config_.entry;
-    entry.stack = activation->user_stack_top_;
+    entry.stack = activation->user_stack_top_.raw();
     for (usize index = 0; index < 3; ++index) {
         entry.arguments[index] = call.arguments_[index];
     }
@@ -1042,8 +1034,8 @@ void Endpoint::reset_call_locked(Call& call) noexcept {
 }
 
 void Endpoint::close() noexcept {
-    libk::InplaceVector<Call*, ENDPOINT_MAX_CALLS> ready{};
-    libk::InplaceVector<Call*, ENDPOINT_MAX_CALLS> cancel{};
+    libk::inplace_vector<Call*, ENDPOINT_MAX_CALLS> ready{};
+    libk::inplace_vector<Call*, ENDPOINT_MAX_CALLS> cancel{};
     bool finish{};
     {
         sync::Lock guard{lock_};

@@ -24,11 +24,11 @@ def verify(elf_path, package_path):
     assert count == len(loads) and image % 4096 == 0
     packed = []
     for i, (address, flags, offset, file_size, memory_size) in enumerate(loads):
-        va, source, stored, mapped, alignment, access, reserved = struct.unpack_from(
-            '<QQQQQII', package, segments + (first + i) * 48)
+        va, source, stored, mapped, access = struct.unpack_from(
+            '<QQQQQ', package, segments + (first + i) * 40)
         writable = flags & 2
         rounded = (memory_size + 4095) & ~4095
-        assert va == address and source % 4096 == 0 and alignment == 4096 and reserved == 0
+        assert va == address and source % 4096 == 0
         assert stored == (file_size if writable else rounded)
         assert mapped == (memory_size if writable else rounded)
         assert access == (bool(flags & 4) | (bool(flags & 2) << 1) | (bool(flags & 1) << 2))
@@ -36,12 +36,12 @@ def verify(elf_path, package_path):
         assert package[source:source + file_size] == elf[offset:offset + file_size]
         assert not any(package[source + file_size:source + stored])
         packed.append((va, source, stored, mapped, access))
-    if package[-32:-24] == b'RVBOOT01':
-        magic, payload, entry, count = struct.unpack_from('<QQQQ', package, len(package) - 32)
+    if package[-40:-32] == b'RVBOOT02':
+        magic, payload, entry, start, count = struct.unpack_from('<QQQQQ', package, len(package) - 40)
         assert entry == struct.unpack_from('<Q', elf, 24)[0]
         assert payload == struct.unpack_from('<Q', package, 16)[0]
-        assert len(package) == payload + count * 40 + 32 and count == len(packed)
-        assert [struct.unpack_from('<QQQQQ', package, payload + i * 40)
+        assert len(package) == payload + 40 and count == len(packed)
+        assert [struct.unpack_from('<QQQQQ', package, start + i * 40)
                 for i in range(count)] == packed
     print('[bootpack] load bytes, permissions, alignment and zero tails match ELF')
 

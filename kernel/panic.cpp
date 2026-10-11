@@ -8,7 +8,7 @@ extern const char build_id[];
 #include <cpu.hpp>
 #include <cpu/cpu.hpp>
 #include <libk/assert.hpp>
-#include <base/types.hpp>
+#include <libk/types.hpp>
 #include <libk/fmt.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/thread.hpp>
@@ -17,7 +17,7 @@ extern const char build_id[];
 extern "C" char kernel_text_start[];
 extern "C" char kernel_text_end[];
 
-static constinit libk::Atomic<bool> claimed{};
+static constinit std::atomic<bool> claimed{};
 
 static void raw_text(const char* text) noexcept {
     if (text == nullptr) {
@@ -51,7 +51,7 @@ static void raw_hex(usize value) noexcept {
 
 
 
-static void raw_source(const libk::AssertInfo& source) noexcept {
+static void raw_source(const libk::assert_info& source) noexcept {
     if (source.file == nullptr) {
         return;
     }
@@ -124,7 +124,7 @@ static void capture_stack_bounds(
 
 static void capture(
     PanicSlot& slot,
-    const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
+    const char* reason, libk::assert_info site, const arch::TrapCtx* trap,
     arch::StackRegs call_site,
     bool interrupts_were_enabled) noexcept {
     slot.reason = reason;
@@ -136,9 +136,7 @@ static void capture(
     slot.stack = trap ? slot.trap.stack() : call_site;
     slot.interrupts_enabled = interrupts_were_enabled;
 
-    auto* const owner = arch::local() ? arch::local()->owner : nullptr;
-    libk_assert(owner != nullptr);
-    auto& cpu = *owner;
+    auto& cpu = current_cpu();
     slot.registry = cpu.cpus;
     slot.current_thread = reinterpret_cast<usize>(cpu.current);
     slot.active_root = cpu.root ? 1 : 0;
@@ -146,7 +144,7 @@ static void capture(
     capture_stack_bounds(slot, cpu, slot.stack.sp);
 }
 
-static void print_source(const libk::AssertInfo& source) noexcept {
+static void print_source(const libk::assert_info& source) noexcept {
     if (source.file == nullptr) {
         return;
     }
@@ -285,7 +283,7 @@ static void wait_for_peers(const PanicSlot& owner) noexcept {
     if (registry == nullptr) {
         return;
     }
-    const u64 start = arch::read_clock().ticks();
+    const u64 start = arch::read_clock();
     constexpr u64 timeout_ticks = 1'000'000;
     for (;;) {
         bool stopped = true;
@@ -299,9 +297,9 @@ static void wait_for_peers(const PanicSlot& owner) noexcept {
                 continue;
             }
             stopped = stopped && runtime->panic != nullptr
-                && runtime->panic->stopped.load<libk::MemoryOrder::Acquire>();
+                && runtime->panic->stopped.load(std::memory_order_acquire);
         }
-        if (stopped || arch::read_clock().ticks() - start >= timeout_ticks) {
+        if (stopped || arch::read_clock() - start >= timeout_ticks) {
             return;
         }
     }
@@ -322,7 +320,7 @@ static void print_peers(const PanicSlot& owner) noexcept {
         const PanicSlot& slot = *runtime->panic;
         if (id == owner.cpu) {
             console::raw<"  cpu {}: owner\n">(id.raw);
-        } else if (slot.stopped.load<libk::MemoryOrder::Acquire>()) {
+        } else if (slot.stopped.load(std::memory_order_acquire)) {
             const auto& seed = slot.stack;
             console::raw<
                 "  cpu {}: stopped pc={:#018x} sp={:#018x} "
@@ -351,10 +349,8 @@ static void print_peers(const PanicSlot& owner) noexcept {
 [[noreturn]] static void panic_on_emergency_stack(void* argument) noexcept {
     auto& slot = *static_cast<PanicSlot*>(argument);
     bool expected{};
-    if (!claimed.compare_exchange_strong<
-            libk::MemoryOrder::AcqRel,
-            libk::MemoryOrder::Acquire>(expected, true)) {
-        slot.stopped.store<libk::MemoryOrder::Release>(true);
+    if (!claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        slot.stopped.store(true, std::memory_order_release);
         arch::halt_current_cpu(arch::HaltReason::PeerStop);
     }
     request_peer_stops(slot);
@@ -363,7 +359,7 @@ static void print_peers(const PanicSlot& owner) noexcept {
     console::raw<
         "\n================ MYOS KERNEL PANIC ================\n"
         "build: {}\nreason: {}\n">(
-        libk::StrView::from_cstr(build_id), slot.reason);
+        std::string_view(build_id), slot.reason);
     print_source(slot.site);
     print_snapshot(slot);
     print_backtrace(slot);
@@ -378,24 +374,25 @@ static void halt_peer(void* ptr) noexcept {
     auto& slot = *static_cast<PanicSlot*>(ptr);
     // Capture is complete before publishing the acknowledgement. This CPU
     // cannot re-enter normal execution after the release store.
-    slot.stopped.store<libk::MemoryOrder::Release>(true);
+    slot.stopped.store(true, std::memory_order_release);
     arch::halt_current_cpu(arch::HaltReason::PeerStop);
 }
 
 [[noreturn]] static void enter_panic(
-    const char* reason, libk::AssertInfo site, const arch::TrapCtx* trap,
+    const char* reason, libk::assert_info site, const arch::TrapCtx* trap,
     void (*entry)(void*) noexcept) noexcept {
     const arch::StackRegs call_site = arch::stack_regs();
     const bool interrupts = arch::disable_interrupts();
     auto* const local = arch::local();
-    if (!local || !local->panic || !local->emergency_stack || (local->emergency_stack & 15U)) {
+    auto* const cpu = Cpu::local();
+    if (!cpu || !cpu->panic || !local->emergency_stack || (local->emergency_stack & 15U)) {
         raw_text("\nEARLY KERNEL PANIC\n");
         raw_text(reason);
         arch::putchar('\n');
         raw_source(site);
         arch::halt_system(arch::HaltAction::Shutdown, arch::HaltReason::Fatal);
     }
-    auto& slot = *local->panic;
+    auto& slot = *cpu->panic;
     if (local->emergency_depth) {
         double_panic(slot.cpu.raw, trap ? trap->snapshot() : arch::TrapRegs{});
     }
@@ -414,7 +411,7 @@ void panic_stop(const arch::TrapCtx& trap) noexcept {
     enter_panic("peer stop", {}, &trap, halt_peer);
 }
 
-void libk::assert_fail(const AssertInfo& info) noexcept {
+void libk::assert_fail(const assert_info& info) noexcept {
     enter_panic("assertion failed", info, nullptr, panic_on_emergency_stack);
 }
 

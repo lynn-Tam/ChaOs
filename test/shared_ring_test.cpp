@@ -7,15 +7,15 @@
 
 namespace {
 
-using Ring = libk::SharedRing<4, 32>;
-using Result = libk::RingResult;
+using Ring = libk::shared_ring<4, 32>;
+using Result = libk::ring_status;
 
 auto batching() -> bool {
-    Ring::Data data{};
-    Ring::Cursor cursor{};
-    Ring::Producer producer{data, cursor};
-    Ring::Consumer consumer{data, cursor};
-    Ring::Entry entry{};
+    Ring::data data{};
+    Ring::cursor cursor{};
+    Ring::producer producer{data, cursor};
+    Ring::consumer consumer{data, cursor};
+    Ring::value_type entry{};
     for (uint64_t round = 0; round < 100; ++round) {
         for (uint64_t i = 0; i < 32; ++i) {
             if (producer.push({{round * 32 + i, i, 42, 77}}) != Result::Ready)
@@ -38,46 +38,46 @@ auto batching() -> bool {
 
 auto invalid_peer() -> bool {
     {
-        Ring::Data data{};
-        Ring::Cursor cursor{};
-        Ring::Producer producer{data, cursor};
+        Ring::data data{};
+        Ring::cursor cursor{};
+        Ring::producer producer{data, cursor};
         // Even a staged descriptor cannot be acknowledged before publication.
         if (producer.push({{1, 2, 3, 4}}) != Result::Ready) return false;
-        cursor.released.store<libk::MemoryOrder::Release>(1);
+        cursor.released.store(1, std::memory_order_release);
         if (producer.refresh() || producer.publish()) return false;
-        cursor.released.store<libk::MemoryOrder::Release>(0);
+        cursor.released.store(0, std::memory_order_release);
         if (producer.push({{}}) != Result::InvalidPeer) return false;
     }
     {
-        Ring::Data data{};
-        Ring::Cursor cursor{};
-        Ring::Consumer consumer{data, cursor};
-        Ring::Entry entry{};
-        data.published.store<libk::MemoryOrder::Release>(UINT64_MAX);
+        Ring::data data{};
+        Ring::cursor cursor{};
+        Ring::consumer consumer{data, cursor};
+        Ring::value_type entry{};
+        data.published.store(UINT64_MAX, std::memory_order_release);
         if (consumer.pop(entry) != Result::InvalidPeer) return false;
-        data.published.store<libk::MemoryOrder::Release>(0);
+        data.published.store(0, std::memory_order_release);
         if (consumer.pop(entry) != Result::InvalidPeer) return false;
     }
     {
-        Ring::Data data{};
-        Ring::Cursor cursor{};
-        Ring::Producer producer{data, cursor};
-        Ring::Consumer consumer{data, cursor};
-        Ring::Entry entry{};
+        Ring::data data{};
+        Ring::cursor cursor{};
+        Ring::producer producer{data, cursor};
+        Ring::consumer consumer{data, cursor};
+        Ring::value_type entry{};
         if (producer.push({{}}) != Result::Ready || !producer.publish()
             || consumer.pop(entry) != Result::Ready || !consumer.release()
             || !producer.refresh()) return false;
-        cursor.released.store<libk::MemoryOrder::Release>(0);
+        cursor.released.store(0, std::memory_order_release);
         if (producer.refresh()) return false;
     }
     {
-        Ring::Data data{};
-        Ring::Cursor cursor{};
-        Ring::Consumer consumer{data, cursor};
-        Ring::Entry entry{};
-        data.published.store<libk::MemoryOrder::Release>(2);
+        Ring::data data{};
+        Ring::cursor cursor{};
+        Ring::consumer consumer{data, cursor};
+        Ring::value_type entry{};
+        data.published.store(2, std::memory_order_release);
         if (consumer.pop(entry) != Result::Ready) return false;
-        data.published.store<libk::MemoryOrder::Release>(1);
+        data.published.store(1, std::memory_order_release);
         if (consumer.pop(entry) != Result::InvalidPeer) return false;
     }
     return true;
@@ -85,8 +85,8 @@ auto invalid_peer() -> bool {
 
 auto concurrent() -> bool {
     constexpr uint64_t count = 200000;
-    Ring::Data data[2]{};
-    Ring::Cursor cursor[2]{};
+    Ring::data data[2]{};
+    Ring::cursor cursor[2]{};
     std::atomic<bool> failed{};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     const auto stopped = [&] {
@@ -95,7 +95,7 @@ auto concurrent() -> bool {
         return failed.load(std::memory_order_relaxed);
     };
     const auto produce = [&](size_t lane) {
-        Ring::Producer producer{data[lane], cursor[lane]};
+        Ring::producer producer{data[lane], cursor[lane]};
         for (uint64_t i = 0; i < count && !stopped();) {
             const auto result = producer.push({{i, ~i, i * 31, lane}});
             if (result == Result::Ready) {
@@ -110,9 +110,9 @@ auto concurrent() -> bool {
         static_cast<void>(producer.publish());
     };
     const auto consume = [&](size_t lane) {
-        Ring::Consumer consumer{data[lane], cursor[lane]};
+        Ring::consumer consumer{data[lane], cursor[lane]};
         for (uint64_t i = 0; i < count && !stopped();) {
-            Ring::Entry entry{};
+            Ring::value_type entry{};
             const auto result = consumer.pop(entry);
             if (result == Result::Ready) {
                 if (entry[0] != i || entry[1] != ~i || entry[2] != i * 31

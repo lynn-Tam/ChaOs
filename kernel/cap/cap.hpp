@@ -7,11 +7,11 @@
 #include <mm/types.hpp>
 #include <resource/budget.hpp>
 #include <expected>
-#include <object/id.hpp>
-#include <base/types.hpp>
+#include <object/ref.hpp>
+#include <libk/types.hpp>
 #include <limits>
 #include <optional>
-#include <libk/span.hpp>
+#include <span>
 
 namespace cap {
 
@@ -204,11 +204,11 @@ enum class PolicyError : u8 {
 };
 
 [[nodiscard]] auto validate_ceiling(
-    object::ObjectKind kind,
+    ObjKind kind,
     View ceiling) noexcept -> bool;
 
 [[nodiscard]] auto compose(
-    object::ObjectKind kind,
+    ObjKind kind,
     View ceiling,
     View view) noexcept -> std::expected<View, PolicyError>;
 
@@ -216,7 +216,7 @@ enum class PolicyError : u8 {
 // actually exercise. This is intentionally stronger than comparing it with
 // the source Grant's original ceiling.
 [[nodiscard]] auto attenuates(
-    object::ObjectKind kind,
+    ObjKind kind,
     View source,
     View child) noexcept -> bool;
 
@@ -240,18 +240,18 @@ struct Attenuation final {
 };
 
 [[nodiscard]] auto decode_attenuation(
-    libk::Span<const byte> bytes) noexcept
+    std::span<const byte> bytes) noexcept
     -> std::expected<Attenuation, AttenuationError>;
 
 [[nodiscard]] auto attenuation_kind(u16 raw) noexcept
-    -> std::optional<object::ObjectKind>;
+    -> std::optional<ObjKind>;
 
 // Convert source-relative words into the existing authority representation.
 // The policy layer remains the final source-relative containment and rights
 // check; this function only performs closed-schema decoding and immutable
 // identity inheritance.
 [[nodiscard]] auto make_attenuation_ceiling(
-    object::ObjectKind kind,
+    ObjKind kind,
     const View& source,
     const Attenuation& descriptor) noexcept
     -> std::expected<View, AttenuationError>;
