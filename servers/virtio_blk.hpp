@@ -5,22 +5,20 @@
 
 
 #include <optional>
-#include <sys/queue.hpp>
-#include <sys/handle.hpp>
-#include <sys/channel.hpp>
-
-namespace block {
+#include <io.hpp>
+#include <cap.hpp>
+#include <ch.hpp>
 
 // One execution owns the split virtqueue. Slots own their descriptor chain
 // and DMA data until used-ring completion; the caller copies returned data
 // before submitting another request in that slot. IOSpace owns device drain.
-class Device final : private libk::noncopyable_nonmovable {
+class blk_dev final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr size_t Depth = io::QueueDepth;
+    static constexpr size_t Depth = io_queue_depth;
     static constexpr size_t BlockSize = 512;
     static constexpr size_t MaxTransfer = 4096;
     struct Completion final {
-        io::Ticket ticket{};
+        io_ticket ticket{};
         status_t status{};
         size_t size{};
         const uint8_t* data{};
@@ -28,11 +26,11 @@ public:
 
     [[nodiscard]] auto open(cap_t pool, cap_t vspace,
         cap_t device, cap_t events, word_t badge) noexcept -> status_t {
-        using namespace sys;
+
         const auto created = sys::io_space_create(pool);
         if (created.status != STATUS_OK) return created.status;
         space_ = cap_owner{created.value};
-        auto arena = mapping::create(pool, vspace, ArenaAddress, ArenaSize);
+        auto arena = vm_area::create(pool, vspace, ArenaAddress, ArenaSize);
         if (!arena) return arena.error();
         arena_ = std::move(*arena);
         const auto watched = sys::io_space_watch(created.value, events, badge);
@@ -45,7 +43,7 @@ public:
             if (state.status != STATUS_OK) return state.status;
             if (state.value == IO_SPACE_ACTIVE) break;
             if (state.value != IO_SPACE_OPENING) return STATUS_BACKING_FAILED;
-            yield();
+            sys::yield();
         }
         std::array<size_t, IO_REG_COUNT> sizes{};
         for (size_t i = 0; i < IO_REG_COUNT; ++i) {
@@ -54,7 +52,7 @@ public:
             if (reg.status != STATUS_OK) return reg.status;
             if (!reg.value2 || reg.value2 > BarStride) return STATUS_BAD_ARGS;
             sizes[i] = reg.value2;
-            auto mapped = mapping::map(vspace, cap_owner{reg.value},
+            auto mapped = vm_area::map(vspace, cap_owner{reg.value},
                 BarsAddress + i * BarStride, (sizes[i] + 4095) & ~size_t{4095},
                 i == IO_PCI_CFG ? VM_READ : VM_READ | VM_WRITE);
             if (!mapped) return mapped.error();
@@ -63,7 +61,7 @@ public:
         const auto interrupt = sys::io_space_irq(created.value);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         interrupt_ = cap_owner{interrupt.value};
-        auto result = irq_bind(interrupt.value, events, badge);
+        auto result = sys::irq_bind(interrupt.value, events, badge);
         if (result.status != STATUS_OK) return result.status;
         return configure(sizes) ? STATUS_OK : STATUS_BACKING_FAILED;
     }
@@ -86,42 +84,42 @@ public:
         }
     }
 
-    [[nodiscard]] auto submit(io::Ticket ticket, io::Operation operation,
+    [[nodiscard]] auto submit(io_ticket ticket, io_operation operation,
         uint64_t offset, size_t size, const uint8_t* source = nullptr) noexcept
         -> status_t {
         if (ticket.slot >= Depth || slots_[ticket.slot].active) return STATUS_BUSY;
-        if (operation == io::Operation::Flush) {
+        if (operation == io_operation::Flush) {
             if (!flush_supported_) return STATUS_INVALID_OP;
             if (offset != 0 || size != 0 || source != nullptr) return STATUS_BAD_ARGS;
-        } else if (operation == io::Operation::Identify) {
+        } else if (operation == io_operation::Identify) {
             if (offset != 0 || size != 20 || source != nullptr) return STATUS_BAD_ARGS;
         } else {
-            if (operation != io::Operation::Read && operation != io::Operation::Write)
+            if (operation != io_operation::Read && operation != io_operation::Write)
                 return STATUS_INVALID_OP;
-            if (operation == io::Operation::Write && (read_only_ || source == nullptr))
+            if (operation == io_operation::Write && (read_only_ || source == nullptr))
                 return STATUS_DENIED;
             if (size == 0 || size > MaxTransfer || size % BlockSize != 0 || offset % BlockSize != 0
                 || offset > capacity() || size > capacity() - offset) return STATUS_BAD_ARGS;
         }
         const size_t slot = ticket.slot;
         const uintptr_t header = ArenaAddress + Headers + slot * 32;
-        const uint32_t type = operation == io::Operation::Read ? 0
-            : operation == io::Operation::Write ? 1
-            : operation == io::Operation::Flush ? 4 : 8;
+        const uint32_t type = operation == io_operation::Read ? 0
+            : operation == io_operation::Write ? 1
+            : operation == io_operation::Flush ? 4 : 8;
         dma_write<uint32_t>(header, type);
         dma_write<uint32_t>(header + 4, 0);
-        dma_write<uint64_t>(header + 8, operation == io::Operation::Read
-            || operation == io::Operation::Write ? offset / BlockSize : 0);
+        dma_write<uint64_t>(header + 8, operation == io_operation::Read
+            || operation == io_operation::Write ? offset / BlockSize : 0);
         dma_write<uint8_t>(header + 16, 0xff);
         const uint16_t head = static_cast<uint16_t>(slot * 3);
         descriptor(head, Iova + Headers + slot * 32, 16, 1, head + 1);
-        if (operation == io::Operation::Flush) {
+        if (operation == io_operation::Flush) {
             descriptor(head + 1, Iova + Headers + slot * 32 + 16, 1, 2, 0);
         } else {
-            if (operation == io::Operation::Write)
+            if (operation == io_operation::Write)
                 ::memcpy(reinterpret_cast<void*>(ArenaAddress + Data + slot * MaxTransfer), source, size);
             descriptor(head + 1, Iova + Data + slot * MaxTransfer, size,
-                operation == io::Operation::Write ? 1 : 3, head + 2);
+                operation == io_operation::Write ? 1 : 3, head + 2);
             descriptor(head + 2, Iova + Headers + slot * 32 + 16, 1, 2, 0);
         }
         dma_write<uint16_t>(ArenaAddress + Available + 4 + (available_ % QueueSize) * 2, head);
@@ -155,8 +153,8 @@ public:
         const auto& slot = slots_[index];
         if (!slot.active) return STATUS_BACKING_FAILED;
         const uint8_t status = dma_read<uint8_t>(ArenaAddress + Headers + index * 32 + 16);
-        const bool returned_data = slot.operation == io::Operation::Read
-            || slot.operation == io::Operation::Identify;
+        const bool returned_data = slot.operation == io_operation::Read
+            || slot.operation == io_operation::Identify;
         const uint32_t expected = returned_data ? static_cast<uint32_t>(slot.size + 1) : 1;
         if (status > 2 || (status == 0 && written != expected)) return STATUS_BACKING_FAILED;
         completion = {slot.ticket, status == 0 ? STATUS_OK
@@ -303,9 +301,9 @@ private:
     }
 
     struct Slot final {
-        io::Ticket ticket{};
+        io_ticket ticket{};
         size_t size{};
-        io::Operation operation{io::Operation::Read};
+        io_operation operation{io_operation::Read};
         bool active{};
     };
     Slot slots_[Depth]{};
@@ -318,10 +316,8 @@ private:
     bool flush_supported_{};
     uintptr_t notify_{};
     uintptr_t isr_{};
-    sys::cap_owner space_{};
-    sys::cap_owner interrupt_{};
-    sys::mapping arena_{};
-    sys::mapping regs_[IO_REG_COUNT]{};
+    cap_owner space_{};
+    cap_owner interrupt_{};
+    vm_area arena_{};
+    vm_area regs_[IO_REG_COUNT]{};
 };
-
-} // namespace block

@@ -1,12 +1,10 @@
 #pragma once
 
-#include <span>
-
 #include <uapi/abi.h>
 #include <uapi/cap.h>
 #include <uapi/ipc.h>
 #include <uapi/io.h>
-#include <uapi/start.h>
+#include <uapi/task.h>
 #include <uapi/mem.h>
 
 namespace sys {
@@ -19,8 +17,6 @@ struct SysResult final {
     word_t value{};
     word_t value2{};
 };
-
-
 
 [[nodiscard]] inline auto call(
     word_t operation,
@@ -509,43 +505,6 @@ inline void yield() noexcept {
         SYS_EXIT, static_cast<word_t>(status));
     for (;;) {
         asm volatile("wfi");
-    }
-}
-
-
-
-// Startup and fail-fast callers use the same process-exit policy.
-inline void require(status_t status) noexcept {
-    if (status != STATUS_OK) sys::exit(status);
-}
-
-using UserEntry = void (*)(word_t, word_t) noexcept;
-
-// Leaves the runtime stack and starts a user-managed continuation on the
-// supplied stack.  The selected architecture provides the narrow register
-// transition; a returning continuation exits the current execution target.
-extern "C" [[noreturn]] void user_enter(
-    UserEntry entry,
-    word_t stack,
-    word_t arg0,
-    word_t arg1) noexcept;
-
-inline void encode_cap(
-    const CapView& value,
-    std::span<uint8_t, CAP_ATTENUATION_SIZE> output) noexcept {
-    const auto put = [&output](
-        size_t offset, uint64_t field, size_t width) noexcept {
-        for (size_t byte = 0; byte < width; ++byte) {
-            output[offset + byte] = static_cast<uint8_t>(field >> (byte * 8));
-        }
-    };
-    put(CAP_ATTENUATION_VERSION_OFFSET, value.version, 2);
-    put(CAP_ATTENUATION_KIND_OFFSET, value.kind, 2);
-    put(CAP_ATTENUATION_SIZE_OFFSET, value.size, 4);
-    put(CAP_ATTENUATION_RIGHTS_OFFSET, value.rights, 8);
-    for (size_t index = 0; index < 6; ++index) {
-        put(CAP_ATTENUATION_WORD0_OFFSET + index * 8,
-            value.words[index], 8);
     }
 }
 

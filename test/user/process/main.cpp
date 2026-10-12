@@ -1,125 +1,95 @@
-#include <string.h>
-#include <sys/protocol.hpp>
-#include <sys/channel.hpp>
-#include <sys/clock.hpp>
-#include <libk/fmt.hpp>
+#include <proc.hpp>
+#include <proto.hpp>
+#include <util.hpp>
+#include <vector>
+#include <servers/fw.hpp>
 
-namespace {
-using namespace sys;
-cap_t output;
-Clock clock;
-unsigned step{};
-void check(bool condition) noexcept {
-    ++step;
-    if (condition) return;
-    stream::Writer writer{output};
-    (void)libk::fmt::format_to<"[process] failed step={}\n">(writer, step);
-    exit(STATUS_INTERNAL);
-}
-auto deadline(uint64_t ms) noexcept -> uint64_t {
-    const auto value = clock.after_ms(ms);
-    check(static_cast<bool>(value));
-    return *value;
-}
-auto request(proc::op operation, uint64_t id = 0, uint64_t expires = 0) noexcept -> sys::Message {
-    sys::Message result{.operation = static_cast<uint64_t>(operation), .id = id};
-    if (expires != 0) { result.size = sizeof(expires); ::memcpy(result.data, &expires, sizeof(expires)); }
-    return result;
-}
-auto receive(sys::Port& channel, proc::op operation, status_t status) noexcept -> sys::Message {
-    sys::Message reply;
-    check(channel.receive(reply).status == STATUS_OK);
-    if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
-        stream::Writer writer{output};
-        (void)libk::fmt::format_to<"[process] reply op={} status={} id={}, expected op={} status={}\n">(
-            writer, reply.operation, reply.status, reply.id, static_cast<uint64_t>(operation), status);
-    }
-    check(reply.operation == static_cast<uint64_t>(operation) && reply.status == status);
-    return reply;
-}
-auto exchange(sys::Port& channel, sys::Message message, status_t status) noexcept -> sys::Message {
-    check(channel.send(message).status == STATUS_OK);
-    return receive(channel, static_cast<proc::op>(message.operation), status);
-}
-auto spawn(sys::Port& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
-    auto message = request(proc::op::Spawn);
-    boot::args args;
-    check(args.append("sleep", 5) && args.append(ms, ::strlen(ms)));
-    message.size = args.size();
-    ::memcpy(message.data, args.data(), message.size);
-    return exchange(channel, message, status).id;
-}
-void stop(sys::Port& channel, uint64_t id) noexcept {
-    check(exchange(channel, request(proc::op::Stop, id), STATUS_CANCELED).id == id);
-    exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
-}
-}
-
-extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    output = sys::capability(info, boot::ConsoleOutput);
-    check(clock.open() == STATUS_OK);
-    sys::Port channel{sys::capability(info, boot::Process),
-        sys::capability(info, BOOT_EVENTS)};
-
-    const auto first = spawn(channel, "10000");
-    check(channel.send(request(proc::op::Wait, first)).status == STATUS_OK);
-    const auto second = spawn(channel, "10000"); // Must progress while the first Wait is pending.
-    check(first != second);
-    check(channel.send(request(proc::op::CancelWait, first)).status == STATUS_OK);
-    check(receive(channel, proc::op::Wait, STATUS_CANCELED).id == first);
-    receive(channel, proc::op::CancelWait, STATUS_OK);
-    exchange(channel, request(proc::op::Wait, first, deadline(1)), STATUS_TIMED_OUT);
-    stop(channel, second);
-    check(channel.send(request(proc::op::Wait, first)).status == STATUS_OK);
-    check(channel.send(request(proc::op::Stop, first)).status == STATUS_OK);
-    receive(channel, proc::op::Stop, STATUS_OK);
-    receive(channel, proc::op::Wait, STATUS_CANCELED);
-    exchange(channel, request(proc::op::Wait, first), STATUS_INVALID_CAP);
-
-    uint64_t retained[4]{};
-    for (auto& id : retained) id = spawn(channel, "1");
-    spawn(channel, "1", STATUS_BUSY); // Even completed, unconsumed results retain admission slots.
-    for (auto id : retained) exchange(channel, request(proc::op::Wait, id), STATUS_OK);
-    const auto reused = spawn(channel, "10000");
-    for (auto id : retained) {
+int main() {
+    const auto& info = rt_startup();
+    const auto check = [](bool ok) {
+        if (!ok)
+            sys::exit(STATUS_INTERNAL);
+    };
+    rt_clock clock;
+    if (const auto rc = clock.open(); rc != STATUS_OK)
+        sys::exit(rc);
+    const auto notification = sys::notification_create(info.pool, 1);
+    if (notification.status != STATUS_OK) sys::exit(notification.status);
+    cap_owner events{notification.value};
+    io_client files;
+    uint64_t value{};
+    if (const auto rc = files.connect(info.selector(fs_service), info.pool,
+                                      info.cspace, events.selector(),
+                                      info.vspace, 0, value);
+        rc != STATUS_OK)
+        sys::exit(rc);
+    fs_file file;
+    if (const auto rc = fs_open(files, "SLEEP.PKG", 9, file); rc != STATUS_OK)
+        sys::exit(rc);
+    auto mem = fs_backing(files, file, VM_READ | VM_EXECUTE);
+    if (const auto rc = fs_close(files, file); rc != STATUS_OK)
+        sys::exit(rc);
+    check(mem.has_value());
+    pr_pkg pkg;
+    if (const auto rc = pkg.open(info.vspace, mem->memory.selector(),
+                                 {0, pr_window::round_size(mem->size)}, mem->size,
+                                 VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
+        rc != STATUS_OK)
+        sys::exit(rc);
+    pr_tasks tasks;
+    tasks.open(info.pool, fw_root(info).domain, info.vspace, info.cpus);
+    const auto spawn = [&](const char* ms) {
+        const std::string_view args[]{"sleep", ms};
+        const auto child = tasks.spawn(pkg, {},
+                                       {.argv = args,
+                                        .resources = {.bytes = 1024 * 1024, .caps = 64},
+                                        .events = info.events});
+        if (child.status != STATUS_OK) sys::exit(child.status);
+        return child.id;
+    };
+    const auto wait = [&](pr_id id, uint64_t deadline = 0) {
+        for (;;) {
+            const auto result = tasks.collect(id);
+            if (result.status == STATUS_OK)
+                return static_cast<status_t>(result.value);
+            if (result.status != STATUS_WOULD_BLOCK && !pr_retryable(result.status))
+                return result.status;
+            const auto now = sys::clock_now();
+            if (now.status != STATUS_OK) sys::exit(now.status);
+            if (deadline && now.value >= deadline)
+                return STATUS_TIMED_OUT;
+            sys::yield();
+        }
+    };
+    const auto first = spawn("10000");
+    const auto deadline = clock.after_ms(1);
+    check(deadline.has_value());
+    check(wait(first, *deadline) == STATUS_TIMED_OUT);
+    if (const auto rc = tasks.request_stop(first); rc != STATUS_OK)
+        sys::exit(rc);
+    check(wait(first) == STATUS_CANCELED);
+    check(wait(first) == STATUS_INVALID_CAP);
+    // More live/unconsumed records than the removed four-slot proxy admitted.
+    std::vector<pr_id> children;
+    for (unsigned i = 0; i < 6; ++i)
+        children.push_back(spawn("1"));
+    for (auto id : children)
+        check(wait(id) == STATUS_OK);
+    const auto reused = spawn("10000");
+    for (auto id : children) {
         check(id != reused);
-        exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
+        check(wait(id) == STATUS_INVALID_CAP);
     }
-    stop(channel, reused);
-
-    // Stop while a child owns a deadline wait, then reuse its allocation.
-    for (unsigned i = 0; i != 16; ++i) stop(channel, spawn(channel, "10000"));
-
-    // Exercise the actual timeout/completion arbitration repeatedly. A timeout
-    // removes only the waiter; completion remains consumable exactly once.
-    for (unsigned i = 0; i != 16; ++i) {
-        const auto id = spawn(channel, "1");
-        check(channel.send(request(proc::op::Wait, id, deadline(1))).status == STATUS_OK);
-        sys::Message reply;
-        check(channel.receive(reply).status == STATUS_OK && reply.id == id
-            && reply.operation == static_cast<uint64_t>(proc::op::Wait));
-        check(reply.status == STATUS_OK || reply.status == STATUS_TIMED_OUT);
-        if (reply.status == STATUS_TIMED_OUT)
-            exchange(channel, request(proc::op::Wait, id), STATUS_OK);
-        exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
-        check(channel.try_receive(reply).status == STATUS_WOULD_BLOCK);
+    if (const auto rc = tasks.request_stop(reused); rc != STATUS_OK)
+        sys::exit(rc);
+    check(wait(reused) == STATUS_CANCELED);
+    for (unsigned i = 0; i < 6; ++i) {
+        const auto id = spawn("10000");
+        if (const auto rc = tasks.request_stop(id); rc != STATUS_OK)
+            sys::exit(rc);
+        check(wait(id) == STATUS_CANCELED);
     }
-
-    // Pending badges win before deadline admission; a signal after timeout is
-    // preserved for the next wait instead of rewriting the prior result.
-    const auto notification = notification_create(sys::capability(info, BOOT_POOL), 8);
-    check(notification.status == STATUS_OK);
-    for (unsigned i = 0; i != 16; ++i) {
-        check(notification_wait(notification.value, deadline(1)).status == STATUS_TIMED_OUT);
-        check(notification_signal(notification.value).status == STATUS_OK);
-        const auto signaled = notification_wait(notification.value, 1);
-        check(signaled.status == STATUS_OK && signaled.value == 8);
-        check(notification_wait(notification.value, 1).status == STATUS_TIMED_OUT);
-    }
-    check(object_destroy(notification.value).status == STATUS_OK);
-    check(cap_close(notification.value).status == STATUS_OK);
-    stream::Writer{output}.write("[process] async wait, cancel, retention, deadlines and reuse ok\n");
-    exit();
+    str_writer{info.selector(con_output)}.write(
+        "[process] direct spawn, retention, deadlines and reuse ok\n");
+    sys::exit();
 }

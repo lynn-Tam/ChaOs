@@ -1,16 +1,18 @@
-#include <sys/protocol.hpp>
+#include <util.hpp>
+#include <proto.hpp>
 #include <libk/parse.hpp>
-#include <sys/channel.hpp>
+#include <ch.hpp>
 
-extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    boot::args args;
-    if (!args.decode(arg_data, arg_size)) exit(STATUS_BAD_ARGS);
-    const auto id = libk::parse<uint64_t>(args.argument(1));
-    if (!id) exit(STATUS_BAD_ARGS);
-    const sys::Message message{.id = *id};
-    sys::require(sys::send(sys::capability(info, boot::Stderr), message).status);
+int main(int argc, char** argv) {
+    if (argc != 2) return STATUS_BAD_ARGS;
+
+    const auto& info = rt_startup();
+    const auto id = libk::parse<uint64_t>(argv[1]);
+    if (!id)
+        sys::exit(STATUS_BAD_ARGS);
+    const ch_msg message{.id = *id};
+    if (const auto rc = ch_send(info.selector(rt_stderr), message).status; rc != STATUS_OK)
+        sys::exit(rc);
     // No retry: multiple writers must be admitted as ordinary blocking sends.
-    exit(sys::send(sys::capability(info, boot::Stdout), message).status);
+    sys::exit(ch_send(info.selector(rt_stdout), message).status);
 }

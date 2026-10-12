@@ -1,19 +1,21 @@
-#include <sys/protocol.hpp>
+#include <util.hpp>
+#include <proto.hpp>
 #include <test/user/channel/export_protocol.hpp>
-#include <sys/channel.hpp>
+#include <ch.hpp>
 
-extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    const auto handoff = sys::capability(info, boot::Stdout);
-    const auto provider = sys::capability(info, channel_test::Provider);
-    sys::require(sys::send_cap(handoff, {.id = 1}, provider, RIGHT_SEND).status);
+int main() {
+
+    const auto& info = rt_startup();
+    const auto handoff = info.selector(rt_stdout);
+    const auto provider = info.selector(ct_provider);
+    if (const auto rc = ch_send_cap(handoff, {.id = 1}, provider, RIGHT_SEND).status;
+        rc != STATUS_OK)
+        sys::exit(rc);
     // Keep the import lineage live while the independent coordinator holds
     // its transferred copy. The coordinator stops this task after the provider
     // generation has retired.
-    const auto parked = notification_create(
-        sys::capability(info, BOOT_POOL), 1);
-    sys::require(parked.status);
-    (void)notification_wait(parked.value);
-    exit(STATUS_INTERNAL);
+    const auto parked = sys::notification_create(info.pool, 1);
+    if (parked.status != STATUS_OK) sys::exit(parked.status);
+    (void) sys::notification_wait(parked.value);
+    sys::exit(STATUS_INTERNAL);
 }

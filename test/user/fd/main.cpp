@@ -1,12 +1,12 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/io.h>
-#include <sys/status.h>
+#include <uapi/abi.h>
 #include <sys/storage.h>
 #include <string_view>
 
-namespace {
-int cache() {
+
+static int cache() {
     char byte{};
     // More distinct dirty inodes than cache slots exercise ordinary writeback
     // pressure. Close preserves accepted contents without demanding durability.
@@ -25,10 +25,10 @@ int cache() {
         const int fd = open(path, O_RDONLY);
         if (fd < 0 || read(fd, &byte, 1) != 1 || byte != 'a' + i || close(fd)) return 53;
     }
-    if (sync()) return 54;
+    if (const auto status = sync(); status) return status;
     return write(STDOUT_FILENO, "fd cache ok\n", 12) == 12 ? 0 : 55;
 }
-}
+
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "stdio") {
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     }
 
     if (argc == 2 && std::string_view(argv[1]) == "admin") {
-        if (format_volume(nullptr, 0) != denied) return 56;
+        if (format_volume(nullptr, 0) != STATUS_DENIED) return 56;
         return write(STDOUT_FILENO, "admin denied\n", 13) == 13 ? 0 : 57;
     }
     if (argc == 2 && std::string_view(argv[1]) == "cache") return cache();
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
     }
     io_request overflow{async, IO_READ, &byte, 1, 0};
     request_id extra{};
-    if (submit(&overflow, &extra) != busy || fsync(async) || cancel(ids[0]) != busy
+    if (submit(&overflow, &extra) != STATUS_BUSY || fsync(async) || cancel(ids[0]) != STATUS_BUSY
         || close(async)) return 33;
     bool seen[IO_DEPTH]{};
     for (unsigned i = 0; i < IO_DEPTH; ++i) {
@@ -167,8 +167,8 @@ int main(int argc, char** argv) {
     io_request denied_write{verify, IO_WRITE, changed, 2, 0};
     if (verify < 0 || pread(verify, changed_read, 2, 0) != 2
         || changed_read[0] != 'Q' || changed_read[1] != 'R'
-        || pwrite(verify, changed, 2, 0) != denied
-        || submit(&denied_write, &extra) != denied || close(verify)) return 44;
+        || pwrite(verify, changed, 2, 0) != STATUS_DENIED
+        || submit(&denied_write, &extra) != STATUS_DENIED || close(verify)) return 44;
     const int inflight = open("/boot/README.TXT", O_RDONLY);
     char head[8][16]{};
     for (unsigned i = 0; i < 8; ++i) {

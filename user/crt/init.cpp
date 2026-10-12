@@ -3,9 +3,9 @@
 #include <libk/assert.hpp>
 #include <sys/syscall.hpp>
 
-namespace {
+
 using Constructor = void (*)();
-}
+
 
 extern "C" Constructor __init_array_start[];
 extern "C" Constructor __init_array_end[];
@@ -18,10 +18,9 @@ extern "C" void run_constructors() noexcept {
     }
 }
 
-namespace libk {
-[[noreturn]] void assert_fail(const assert_info&) noexcept {
+[[noreturn]] void libk::assert_fail(const libk::assert_info&) noexcept {
     sys::exit();
 }
-} // namespace libk
+
 
 extern "C" [[noreturn]] void abort() noexcept { sys::exit(STATUS_INTERNAL); }

@@ -1,47 +1,55 @@
 #pragma once
 
+#include <util.hpp>
+#include <string.h>
+
 #include <array>
+#include <algorithm>
+#include <optional>
+#include <deque>
 #include <span>
 #include <tuple>
+#include <vector>
+#include <string_view>
 #include <variant>
 #include <libk/assert.hpp>
-#include <sys/handle.hpp>
+#include <cap.hpp>
 #include <libk/pkg.hpp>
-#include <sys/start.hpp>
+#include <start.hpp>
 
-namespace proc {
-inline constexpr word_t page_size = 4096;
-inline constexpr auto retryable(status_t s) noexcept -> bool {
+
+inline constexpr word_t pr_page_size = 4096;
+inline constexpr auto pr_retryable(status_t s) noexcept -> bool {
     return s == STATUS_BUSY || s == STATUS_RETRY;
 }
-struct window {
+struct pr_window {
     word_t address{}, size{};
     static constexpr auto round_size(word_t n) noexcept -> word_t {
-        return n <= ~word_t{} - (page_size - 1) ? (n + page_size - 1) & ~(page_size - 1) : 0;
+        return n <= ~word_t{} - (pr_page_size - 1) ? (n + pr_page_size - 1) & ~(pr_page_size - 1) : 0;
     }
     constexpr auto valid() const noexcept -> bool {
-        return address && size && !(address % page_size) && !(size % page_size)
+        return address && size && !(address % pr_page_size) && !(size % pr_page_size)
             && size <= ~word_t{} - address;
     }
-    constexpr auto overlaps(window b) const noexcept -> bool {
+    constexpr auto overlaps(pr_window b) const noexcept -> bool {
         return valid() && b.valid() && address < b.address + b.size && b.address < address + size;
     }
 };
 
-class package {
-    sys::mapping bytes_;
+class pr_pkg {
+    vm_area bytes_;
     libk::pkg_view bundle_{};
     cap_t memory_{};
     word_t flags_{VM_READ};
 public:
-    auto open(cap_t vm, cap_t mem, window w, size_t size, word_t flags = VM_READ) noexcept -> status_t {
+    auto open(cap_t vm, cap_t mem, pr_window w, size_t size, word_t flags = VM_READ) noexcept -> status_t {
         if (!size || size > w.size || !(flags & VM_READ)
             || (flags & ~(VM_READ | VM_EXECUTE | VM_MAP_PRIVATE))) return STATUS_BAD_ARGS;
         auto s = close();
         if (s == STATUS_OK) s = bytes_.open(vm, w.address, w.size, VM_READ);
         if (s == STATUS_OK) s = bytes_.attach(mem, 0, w.size, VM_READ);
         if (s != STATUS_OK) return s;
-        bundle_ = libk::pkg_view::parse(reinterpret_cast<const void*>(w.address), size);
+        bundle_ = libk::pkg_view::parse(reinterpret_cast<const void*>(bytes_.address), size);
         memory_ = mem;
         flags_ = flags;
         return bundle_ ? STATUS_OK : STATUS_BAD_ARGS;
@@ -51,6 +59,7 @@ public:
     auto memory() const noexcept -> cap_t { return memory_; }
     auto flags() const noexcept -> word_t { return flags_; }
     auto address() const noexcept -> word_t { return bytes_.address; }
+    auto entry() const noexcept -> std::optional<libk::pkg_mod> { return bundle_.root(); }
     auto find(std::string_view name) const noexcept -> std::optional<libk::pkg_mod> {
         return bundle_.find(name);
     }
@@ -58,13 +67,13 @@ public:
 
 // Temporary selectors are adopted before any operation that may fail. The
 // task owns their cleanup; VSpace owns committed backing after selectors close.
-class loader {
-    using owner = sys::cap_owner;
+class pr_loader {
+    using owner = cap_owner;
     cap_t pool_, vm_;
-    sys::mapping& scratch_;
-    package& package_;
+    vm_area& scratch_;
+    pr_pkg& package_;
 public:
-    loader(cap_t pool, cap_t vm, sys::mapping& s, package& p)
+    pr_loader(cap_t pool, cap_t vm, vm_area& s, pr_pkg& p)
         : pool_(pool), vm_(vm), scratch_(s), package_(p) {}
     auto adopt(sys::SysResult r) noexcept -> std::expected<owner, status_t> {
         owner cap{r.value};
@@ -79,12 +88,12 @@ public:
         if (offset > size || n > size - offset || (n && !src)) return STATUS_BAD_ARGS;
         const auto* bytes = static_cast<const uint8_t*>(src);
         while (n) {
-            const auto page = offset / page_size;
-            const auto start = offset % page_size;
-            const auto count = std::min(n, size_t{page_size - start});
+            const auto page = offset / pr_page_size;
+            const auto start = offset % pr_page_size;
+            const auto count = std::min(n, size_t{pr_page_size - start});
             auto s = sys::memory_populate(mem, page).status;
             if (s != STATUS_OK) return s;
-            s = scratch_.attach(mem, page, page_size, VM_READ | VM_WRITE);
+            s = scratch_.attach(mem, page, pr_page_size, VM_READ | VM_WRITE);
             if (s != STATUS_OK) return s;
             std::copy_n(bytes, count, reinterpret_cast<uint8_t*>(scratch_.address) + start);
             const auto detached = scratch_.detach();
@@ -94,7 +103,7 @@ public:
         return STATUS_OK;
     }
     auto make_desc(const void* src, size_t n) noexcept -> std::expected<owner, status_t> {
-        const auto size = window::round_size(n);
+        const auto size = pr_window::round_size(n);
         if (!size || !src) return std::unexpected(STATUS_BAD_ARGS);
         auto mem = memory(size);
         if (!mem) return mem;
@@ -104,7 +113,7 @@ public:
     }
     auto install(cap_t mem, word_t address, word_t size, word_t perms,
                  word_t first = 0, word_t flags = 0) noexcept -> status_t {
-        if (!window{address, size}.valid()) return STATUS_BAD_ARGS;
+        if (!pr_window{address, size}.valid()) return STATUS_BAD_ARGS;
         auto region = adopt(sys::vm_slice(vm_, address, size, perms,
             RIGHT_MAP | RIGHT_UNMAP));
         if (!region) return region.error();
@@ -123,13 +132,13 @@ public:
         const auto file = reinterpret_cast<word_t>(seg.file.data());
         if (file < base || file - base > package_.size()
             || seg.file.size() > package_.size() - (file - base)
-            || (file - base) % page_size || seg.file.size() % page_size) return std::unexpected(STATUS_BAD_ARGS);
-        first = (file - base) / page_size;
+            || (file - base) % pr_page_size || seg.file.size() % pr_page_size) return std::unexpected(STATUS_BAD_ARGS);
+        first = (file - base) / pr_page_size;
         const CapView view{.version = CAP_ATTENUATION_VERSION_CURRENT, .kind = ObjMem,
             .size = CAP_ATTENUATION_SIZE, .rights = RIGHT_MAP,
-            .words = {first, seg.file.size() / page_size, (seg.perms & VM_WRITE) ? VM_READ : seg.perms}};
+            .words = {first, seg.file.size() / pr_page_size, (seg.perms & VM_WRITE) ? VM_READ : seg.perms}};
         std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
-        sys::encode_cap(view, wire);
+        cap_encode(view, wire);
         auto desc = make_desc(wire.data(), wire.size());
         if (!desc) return desc;
         return adopt(sys::cap_typed_delegate(package_.memory(), 0, desc->selector()));
@@ -140,7 +149,7 @@ public:
             const auto decoded = mod.segment(i);
             if (!decoded) return STATUS_BAD_ARGS;
             const auto& seg = *decoded;
-            const auto size = window::round_size(seg.size);
+            const auto size = pr_window::round_size(seg.size);
             if (!size) return STATUS_BAD_ARGS;
             if (((seg.perms & VM_EXECUTE) && !(package_.flags() & VM_EXECUTE))
                 || ((seg.perms & VM_WRITE) && !(package_.flags() & VM_MAP_PRIVATE))) {
@@ -154,15 +163,15 @@ public:
                 if (s != STATUS_OK) return s;
                 continue;
             }
-            const auto file_size = seg.file.size() / page_size * page_size;
-            const auto boundary = seg.file.size() % page_size ? page_size : 0;
+            const auto file_size = seg.file.size() / pr_page_size * pr_page_size;
+            const auto boundary = seg.file.size() % pr_page_size ? pr_page_size : 0;
             // At most three disjoint backings: whole file pages, one partial
-            // page, and demand-zero BSS. The package segments remain the layout authority.
+            // page, and demand-zero BSS. The pr_pkg segments remain the pr_layout authority.
             word_t offset = 0;
             while (offset < size) {
                 const bool file = offset < file_size;
                 const bool partial = boundary && offset == file_size;
-                const word_t length = file ? file_size : partial ? page_size : size - offset;
+                const word_t length = file ? file_size : partial ? pr_page_size : size - offset;
                 word_t first{};
                 std::expected<owner, status_t> mem;
                 if (file) {
@@ -195,68 +204,61 @@ public:
     }
 };
 
-inline constexpr word_t base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc)
+inline constexpr word_t pr_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
     | OBJ_BIT(ObjGroup) | OBJ_BIT(ObjNotification);
 
-struct task_id {
+struct pr_id {
     uint32_t slot{}, gen{};
     auto valid() const noexcept -> bool { return gen != 0; }
     auto key() const noexcept -> uint64_t { return (uint64_t{gen} << 32) | slot; }
-    auto operator==(const task_id&) const -> bool = default;
+    auto operator==(const pr_id&) const -> bool = default;
 };
-struct cap_src {
-    uint32_t role{};
-    boot::Import contract{};
+struct pr_cap {
+    rt_req contract{};
+    uint64_t bytes{};
     cap_t cap{};
     std::variant<word_t, CapView> limit{}; // Rights-only duplication or a derived typed view.
     word_t badge{}; // Nonzero requests a Channel endpoint minted by the parent.
 };
-struct quota {
-    word_t bytes{1024 * 1024}, caps{256}, kinds{base_kinds};
+struct pr_quota {
+    word_t bytes{1024 * 1024}, caps{256}, kinds{pr_base_kinds};
     word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE};
 };
-struct schedule {
+struct pr_sched {
     word_t budget{500'000}, period{10'000'000}, urgency{8};
     uint32_t cpu{UINT32_MAX};
 };
-struct layout {
-    window stack{0x40010000, 0x10000};
-    word_t boot{0x40020000};
+struct pr_layout {
+    pr_window stack{0x40010000, 0x10000};
+    word_t bindings{0x40020000};
     // IPC VA is the current runtime ABI, shared by applications and servers.
-    word_t ipc{BOOT_ROOT_IPC_ADDRESS};
+    word_t ipc{0x40000000};
 };
-struct spawn_opts {
-    const boot::args* args{};
-    std::span<const cap_src> caps{};
-    quota resources{};
-    schedule sched{};
-    layout va{};
-    word_t scratch{0x18000000};
+struct pr_opts {
+    std::span<const std::string_view> argv{};
+    std::span<const pr_cap> caps{};
+    pr_quota resources{};
+    pr_sched sched{};
+    pr_layout va{};
     cap_t events{}; // Borrowed parent receive capability; caller keeps it alive.
-    word_t close_badge{};
 };
-struct spawn_result { task_id id{}; status_t status{STATUS_BUSY}; };
-struct task_exit { status_t status{}; };
+struct pr_spawn { pr_id id{}; status_t status{STATUS_BUSY}; };
+struct pr_exit { status_t status{}; };
 
 // One slot owns a task through construction and asynchronous group drain.
 // Exit consumption, rather than process death, releases the slot generation.
-template<size_t Capacity>
-class tasks {
-    using owner = sys::cap_owner;
+class pr_tasks {
+    using owner = cap_owner;
     struct record {
         owner group_, vm_, cs_, thread_, sc_, ended_;
-        cap_t close_events_{};
-        word_t close_badge_{};
-        enum class drain : uint8_t { live, waiting, done };
-        drain drain_{};
         bool running_{}, closing_{};
         status_t result_{};
         ~record() { if (group_) sys::exit(STATUS_BUSY); }
         auto pool() const noexcept -> cap_t { return group_.selector(); }
         auto vspace() const noexcept -> cap_t { return vm_.selector(); }
         auto cspace() const noexcept -> cap_t { return cs_.selector(); }
-        auto open(cap_t parent, const quota& q) noexcept -> status_t {
+        auto open(cap_t parent, const pr_quota& q) noexcept -> status_t {
             const auto g = sys::resource_create_child(parent, q.bytes, q.caps, q.kinds);
             if (g.value) group_ = owner{g.value};
             if (g.status != STATUS_OK || !group_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
@@ -274,161 +276,153 @@ class tasks {
                 const auto status = cap->close();
                 if (status != STATUS_OK) return status;
             }
-            status_t s{};
-            if (drain_ == drain::live) {
-                s = close_events_ ? sys::resource_close_async(pool(), close_events_, close_badge_).status
-                                  : sys::resource_close(pool()).status;
-                if (s != STATUS_OK) return s;
-                drain_ = close_events_ ? drain::waiting : drain::done;
-            }
-            return drain_ == drain::waiting ? STATUS_BUSY : group_.close();
+            const auto status = sys::resource_close(pool()).status;
+            return status == STATUS_OK ? group_.close() : status;
         }
     };
     struct slot {
         uint32_t gen{1};
-        std::variant<std::monostate, record, task_exit> value;
+        std::variant<std::monostate, record, pr_exit> value;
     };
-    std::array<slot, Capacity> slots_{};
+    std::deque<slot> slots_;
     cap_t pool_{}, domain_{};
     uint32_t cpus_{};
     // Synchronous construction only; no task retains these borrowed bytes.
-    alignas(BootCap) std::array<uint8_t, 4096> boot_{};
 
-    auto find(task_id id) noexcept -> slot* {
-        return id.valid() && id.slot < Capacity && slots_[id.slot].gen == id.gen ? &slots_[id.slot] : nullptr;
+    auto find(pr_id id) noexcept -> slot* {
+        return id.valid() && id.slot < slots_.size() && slots_[id.slot].gen == id.gen ? &slots_[id.slot] : nullptr;
     }
-    auto active(task_id id) noexcept -> record* {
+    auto active(pr_id id) noexcept -> record* {
         auto* s = find(id);
         return s ? std::get_if<record>(&s->value) : nullptr;
     }
-    auto build(record& r, task_id id, package& pkg,
-               const libk::pkg_mod& mod, const spawn_opts& o) noexcept -> status_t {
-        if (!cpus_ || !domain_ || !o.va.stack.valid()
-            || !window{o.va.boot, 4096}.valid() || !window{o.va.ipc, 4096}.valid()
-            || o.va.stack.overlaps({o.va.boot, 4096}) || o.va.stack.overlaps({o.va.ipc, 4096})
-            || window{o.va.boot, 4096}.overlaps({o.va.ipc, 4096})) return STATUS_BAD_ARGS;
-        // Layout policy is a caller input, but it cannot overlap an ELF segment.
+    auto build(record& r, pr_id id, pr_pkg& pkg,
+               const libk::pkg_mod& mod, const pr_opts& o) noexcept -> status_t {
+        size_t binding_size = sizeof(rt_bindings) + o.caps.size() * sizeof(rt_binding);
+        for (const auto& src : o.caps) {
+            if (!src.cap || !src.contract.name || !src.contract.kind) return STATUS_BAD_ARGS;
+            const auto name = std::string_view{src.contract.name};
+            if (name.empty() || name.size() > UINT32_MAX - binding_size) return STATUS_BAD_ARGS;
+            binding_size += name.size();
+        }
+        if (binding_size > UINT32_MAX) return STATUS_BAD_ARGS;
+        const pr_window bindings{o.va.bindings, pr_window::round_size(binding_size)};
+        const pr_window ipc_range{o.va.ipc, pr_page_size};
+        if (!cpus_ || !domain_ || !o.va.stack.valid() || !bindings.valid() || !ipc_range.valid() ||
+            o.va.stack.overlaps(bindings) || o.va.stack.overlaps(ipc_range) || bindings.overlaps(ipc_range))
+            return STATUS_BAD_ARGS;
         for (size_t i = 0; i < mod.segment_count(); ++i) {
             const auto decoded = mod.segment(i);
             if (!decoded) return STATUS_BAD_ARGS;
-            const auto& seg = *decoded;
-            const window w{seg.va, window::round_size(seg.size)};
-            if (!w.valid() || w.overlaps(o.va.stack) || w.overlaps({o.va.boot, 4096})
-                || w.overlaps({o.va.ipc, 4096})) return STATUS_BAD_ARGS;
+            const pr_window w{decoded->va, pr_window::round_size(decoded->size)};
+            if (!w.valid() || w.overlaps(o.va.stack) || w.overlaps(bindings) || w.overlaps(ipc_range))
+                return STATUS_BAD_ARGS;
+        }
+        std::vector<std::string_view> argv{o.argv.begin(), o.argv.end()};
+        if (argv.empty()) argv.push_back(mod.name);
+        size_t strings{};
+        for (const auto arg : argv) {
+            if (arg.find('\0') != std::string_view::npos || arg.size() >= o.va.stack.size - strings)
+                return STATUS_BAD_ARGS;
+            strings += arg.size() + 1;
         }
         auto s = r.open(pool_, o.resources);
         if (s != STATUS_OK) return s;
-        sys::mapping scratch;
-        // This mapping belongs to the parent, never to the child pool.
-        s = scratch.open(parent_vm_, o.scratch, page_size);
+        vm_area scratch;
+        s = scratch.open(parent_vm_, 0, pr_page_size);
         if (s != STATUS_OK) return s;
-        loader load{r.pool(), r.vspace(), scratch, pkg};
+        pr_loader load{r.pool(), r.vspace(), scratch, pkg};
         s = load.map(mod);
         if (s != STATUS_OK) return s;
         auto stack = load.anonymous(o.va.stack.address, o.va.stack.size, VM_READ | VM_WRITE);
         if (!stack) return stack.error();
-        auto ipc = load.anonymous(o.va.ipc, 4096, VM_READ | VM_WRITE);
+        auto ipc = load.anonymous(o.va.ipc, pr_page_size, VM_READ | VM_WRITE);
         if (!ipc) return ipc.error();
         s = sys::memory_populate(ipc->selector(), 0).status;
         if (s != STATUS_OK) return s;
-        auto envelope = load.anonymous(o.va.boot, 4096, VM_READ);
-        if (!envelope) return envelope.error();
-        auto events = load.adopt(sys::notification_create(r.pool(), boot::event_badge));
+        auto events = load.adopt(sys::notification_create(r.pool(), rt_event_badge));
         if (!events) return events.error();
         auto ended = load.adopt(o.events ? sys::cap_duplicate(o.events, 0, RIGHT_SIGNAL)
                                         : sys::notification_create(r.pool(), 1));
         if (!ended) return ended.error();
         r.ended_ = std::move(*ended);
-        r.close_events_ = o.close_badge ? o.events : 0;
-        r.close_badge_ = o.close_badge;
-        boot_.fill(0);
-        auto& hdr = *reinterpret_cast<BootHdr*>(boot_.data());
-        hdr = {};
-        hdr.magic = BOOT_MAGIC;
-        hdr.major = BOOT_MAJOR;
-        hdr.minor = BOOT_MINOR;
-        hdr.cpu_count = cpus_;
-        hdr.stack_base = o.va.stack.address;
-        hdr.stack_size = o.va.stack.size;
-        hdr.boot_bundle_size = std::any_of(o.caps.begin(), o.caps.end(),
-            [](const auto& src) { return src.role == BOOT_BUNDLE; }) ? pkg.size() : 0;
-        auto* entries = reinterpret_cast<BootCap*>(boot_.data() + sizeof(hdr));
-        const auto add = [&](BootCap entry, sys::SysResult copied) noexcept -> status_t {
-            if (copied.status != STATUS_OK) return copied.status;
-            if (!copied.value) return STATUS_INVALID_CAP;
-            if (sizeof(hdr) + (hdr.count + 1) * sizeof(BootCap) > boot_.size()) return STATUS_BAD_ARGS;
-            entry.handle = copied.value;
-            entries[hdr.count++] = entry;
-            return STATUS_OK;
-        };
-        const auto local = [&](uint32_t role, cap_t cap, word_t rights) noexcept {
-            BootCap entry{};
-            entry.role = role;
-            entry.kind = boot_kind(role);
-            return add(entry, sys::cap_duplicate(cap, r.cspace(), rights));
-        };
-        for (auto [role, cap, rights] : std::array{
-            std::tuple{uint32_t{BOOT_POOL}, r.pool(), o.resources.pool_perms},
-            std::tuple{uint32_t{BOOT_VSPACE}, r.vspace(), word_t{RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP | RIGHT_DESTROY}},
-            std::tuple{uint32_t{BOOT_CSPACE}, r.cspace(), word_t{RIGHT_MANAGE}},
-            std::tuple{uint32_t{BOOT_EVENTS}, events->selector(), word_t{RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
-            s = local(role, cap, rights);
-            if (s != STATUS_OK) return s;
+        std::vector<AuxEntry> aux{{AT_PAGESZ, pr_page_size}, {AT_ENTRY, mod.entry},
+                                  {AT_SYS_CPUS, cpus_}, {AT_SYS_IPC, o.va.ipc}};
+        for (auto [key, cap, rights] : std::array{
+            std::tuple{AT_SYS_POOL, r.pool(), o.resources.pool_perms},
+            std::tuple{AT_SYS_VSPACE, r.vspace(), word_t{RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP | RIGHT_DESTROY}},
+            std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE}},
+            std::tuple{AT_SYS_EVENTS, events->selector(), word_t{RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
+            const auto copy = sys::cap_duplicate(cap, r.cspace(), rights);
+            if (copy.status != STATUS_OK) return copy.status;
+            aux.push_back({static_cast<word_t>(key), copy.value});
         }
-        // One reusable desc carrier supplies typed derivation and ThreadInit.
-        auto desc = load.memory(4096);
+        auto desc = load.memory(pr_page_size);
         if (!desc) return desc.error();
-        for (const auto& src : o.caps) {
-            if (!src.cap) return STATUS_BAD_ARGS;
-            const auto* view = std::get_if<CapView>(&src.limit);
-            const auto kind = src.role ? boot_kind(src.role) : src.contract.kind;
-            if (view && (view->version != CAP_ATTENUATION_VERSION_CURRENT
-                || view->size != CAP_ATTENUATION_SIZE || view->kind != kind)) return STATUS_BAD_ARGS;
-            const auto rights = view ? view->rights : std::get<word_t>(src.limit);
-            BootCap entry{};
-            entry.role = src.role;
-            entry.kind = kind;
-            if (src.role) {
-                if (!kind) return STATUS_BAD_ARGS;
-            } else {
-                if (!src.contract.name || !kind) return STATUS_BAD_ARGS;
+        if (!o.caps.empty()) {
+            std::vector<uint8_t> data(binding_size);
+            const rt_bindings header{rt_bindings_version, static_cast<uint32_t>(binding_size),
+                                     static_cast<uint32_t>(o.caps.size()), 0};
+            ::memcpy(data.data(), &header, sizeof(header));
+            size_t name_offset = sizeof(header) + o.caps.size() * sizeof(rt_binding);
+            for (size_t i = 0; i < o.caps.size(); ++i) {
+                const auto& src = o.caps[i];
+                const auto* view = std::get_if<CapView>(&src.limit);
+                const auto kind = src.contract.kind;
+                if (view && (view->version != CAP_ATTENUATION_VERSION_CURRENT ||
+                    view->size != CAP_ATTENUATION_SIZE || view->kind != kind)) return STATUS_BAD_ARGS;
+                const auto rights = view ? view->rights : std::get<word_t>(src.limit);
+                sys::SysResult copied;
+                if (src.badge) copied = sys::channel_mint(src.cap, r.cspace(), src.badge, rights);
+                else if (!view) copied = sys::cap_duplicate(src.cap, r.cspace(), rights);
+                else {
+                    std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
+                    cap_encode(*view, wire);
+                    s = load.write(desc->selector(), pr_page_size, 0, wire.data(), wire.size());
+                    if (s != STATUS_OK) return s;
+                    copied = sys::cap_typed_delegate(src.cap, r.cspace(), desc->selector());
+                }
+                if (copied.status != STATUS_OK) return copied.status;
                 const std::string_view name{src.contract.name};
-                if (name.empty() || name.size() >= BOOT_NAME_MAX) return STATUS_BAD_ARGS;
-                entry.contract.protocol = src.contract.protocol;
-                entry.contract.major = src.contract.major;
-                entry.contract.minor = src.contract.minor;
-                std::copy(name.begin(), name.end(), entry.contract.name);
+                const rt_binding entry{copied.value, src.bytes, src.contract.protocol, kind,
+                    src.contract.major, src.contract.minor, 0, static_cast<uint32_t>(name_offset),
+                    static_cast<uint32_t>(name.size())};
+                ::memcpy(data.data() + sizeof(header) + i * sizeof(entry), &entry, sizeof(entry));
+                ::memcpy(data.data() + name_offset, name.data(), name.size());
+                name_offset += name.size();
             }
-            sys::SysResult copied;
-            if (src.badge) copied = sys::channel_mint(src.cap, r.cspace(), src.badge, rights);
-            else if (!view) copied = sys::cap_duplicate(src.cap, r.cspace(), rights);
-            else {
-                std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
-                sys::encode_cap(*view, wire);
-                s = load.write(desc->selector(), 4096, 0, wire.data(), wire.size());
-                if (s != STATUS_OK) return s;
-                copied = sys::cap_typed_delegate(src.cap, r.cspace(), desc->selector());
-            }
-            s = add(entry, copied);
+            auto memory = load.anonymous(bindings.address, bindings.size, VM_READ);
+            if (!memory) return memory.error();
+            s = load.write(memory->selector(), bindings.size, 0, data.data(), data.size());
+            if (s == STATUS_OK) s = sys::memory_seal(memory->selector()).status;
             if (s != STATUS_OK) return s;
+            aux.push_back({AT_SYS_BINDINGS, bindings.address});
+            aux.push_back({AT_SYS_BINDINGS_SIZE, binding_size});
         }
-        hdr.size = sizeof(hdr) + hdr.count * sizeof(BootCap);
-        if (!boot::BootView::parse(boot_.data(), hdr.size)) return STATUS_BAD_ARGS;
-        const auto arg_size = o.args ? o.args->size() : 0;
-        if (arg_size > boot_.size() - hdr.size) return STATUS_BAD_ARGS;
-        s = load.write(envelope->selector(), 4096, 0, boot_.data(), hdr.size);
-        if (s == STATUS_OK && arg_size)
-            s = load.write(envelope->selector(), 4096, hdr.size, o.args->data(), arg_size);
-        if (s == STATUS_OK) s = sys::memory_seal(envelope->selector()).status;
+        aux.push_back({AT_NULL, 0});
+        const auto pointers = (argv.size() + 3) * sizeof(word_t);
+        const auto prefix = pointers + aux.size() * sizeof(AuxEntry);
+        if (prefix > o.va.stack.size || strings > o.va.stack.size - prefix) return STATUS_BAD_ARGS;
+        const auto stack_bytes = (prefix + strings + 15) & ~size_t{15};
+        if (stack_bytes > o.va.stack.size) return STATUS_BAD_ARGS;
+        const auto sp = o.va.stack.address + o.va.stack.size - stack_bytes;
+        std::vector<uint8_t> initial(stack_bytes);
+        auto* words = reinterpret_cast<word_t*>(initial.data());
+        words[0] = argv.size();
+        size_t offset = prefix;
+        for (size_t i = 0; i < argv.size(); ++i) {
+            words[i + 1] = sp + offset;
+            ::memcpy(initial.data() + offset, argv[i].data(), argv[i].size());
+            offset += argv[i].size() + 1;
+        }
+        ::memcpy(initial.data() + pointers, aux.data(), aux.size() * sizeof(AuxEntry));
+        s = load.write(stack->selector(), o.va.stack.size, o.va.stack.size - stack_bytes,
+                       initial.data(), initial.size());
         if (s != STATUS_OK) return s;
         ThreadInit init{};
         init.version = THREAD_START_VERSION;
         init.entry = mod.entry;
-        init.stack = o.va.stack.address + o.va.stack.size;
-        init.arguments[0] = o.va.boot;
-        init.arguments[1] = 4096;
-        init.arguments[2] = arg_size ? o.va.boot + hdr.size : 0;
-        init.arguments[3] = arg_size;
+        init.stack = sp;
         init.ipc = {.memory = ipc->selector(), .page = 0, .address = o.va.ipc, .pages = 1};
         s = load.write(desc->selector(), 4096, 0, &init, sizeof(init));
         if (s != STATUS_OK) return s;
@@ -454,44 +448,44 @@ class tasks {
     }
     cap_t parent_vm_{};
 public:
-    tasks() = default;
-    tasks(const tasks&) = delete;
-    auto operator=(const tasks&) -> tasks& = delete;
-    ~tasks() {
+    pr_tasks() = default;
+    pr_tasks(const pr_tasks&) = delete;
+    auto operator=(const pr_tasks&) -> pr_tasks& = delete;
+    ~pr_tasks() {
         for (const auto& s : slots_) if (!std::holds_alternative<std::monostate>(s.value)) sys::exit(STATUS_BUSY);
     }
-    void open(const boot::BootView& boot) noexcept {
-        pool_ = boot.selector(BOOT_POOL);
-        domain_ = boot.selector(BOOT_DOMAIN);
-        parent_vm_ = boot.selector(BOOT_VSPACE);
-        cpus_ = boot.cpu_count();
+    void open(cap_t pool, cap_t domain, cap_t vm, uint32_t cpus) noexcept {
+        pool_ = pool; domain_ = domain; parent_vm_ = vm; cpus_ = cpus;
     }
-    auto spawn(package& pkg, std::string_view name, const spawn_opts& opts = {}) noexcept -> spawn_result {
-        const auto mod = pkg.find(name);
-        if (!mod || !mod->executable || (opts.close_badge && !opts.events)) return {{}, STATUS_BAD_ARGS};
-        for (uint32_t i = 0; i < Capacity; ++i) {
-            auto& slot = slots_[i];
-            if (!slot.gen || !std::holds_alternative<std::monostate>(slot.value)) continue;
-            const task_id id{i, slot.gen};
-            auto& r = slot.value.template emplace<record>();
-            const auto s = build(r, id, pkg, *mod, opts);
-            if (s != STATUS_OK) { r.closing_ = true; r.result_ = s; (void)poll(id); }
-            return {id, s};
+    auto spawn(pr_pkg& pkg, std::string_view name, const pr_opts& opts = {}) noexcept -> pr_spawn {
+        const auto mod = name.empty() ? pkg.entry() : pkg.find(name);
+        if (!mod || !mod->executable) return {{}, STATUS_BAD_ARGS};
+        uint32_t i = 0;
+        for (; i < slots_.size(); ++i)
+            if (slots_[i].gen && std::holds_alternative<std::monostate>(slots_[i].value)) break;
+        if (i == slots_.size()) {
+            if (slots_.size() == UINT32_MAX) return {{}, STATUS_NO_MEMORY};
+            slots_.emplace_back();
         }
-        return {};
+        auto& slot = slots_[i];
+        const pr_id id{i, slot.gen};
+        auto& r = slot.value.emplace<record>();
+        const auto s = build(r, id, pkg, *mod, opts);
+        if (s != STATUS_OK) { r.closing_ = true; r.result_ = s; (void)poll(id); }
+        return {id, s};
     }
-    auto observe(task_id id) noexcept -> sys::SysResult {
+    auto observe(pr_id id) noexcept -> sys::SysResult {
         auto* r = active(id);
         if (r && r->running_) return sys::exit_query(r->thread_.selector());
         auto* s = find(id);
-        if (s) if (const auto* e = std::get_if<task_exit>(&s->value))
+        if (s) if (const auto* e = std::get_if<pr_exit>(&s->value))
             return {.status = STATUS_OK, .value = 1, .value2 = static_cast<word_t>(e->status)};
         return {.status = STATUS_INVALID_CAP};
     }
-    auto poll(task_id id) noexcept -> status_t {
+    auto poll(pr_id id) noexcept -> status_t {
         auto* s = find(id);
         if (!s) return STATUS_INVALID_CAP;
-        if (std::holds_alternative<task_exit>(s->value)) return STATUS_OK;
+        if (std::holds_alternative<pr_exit>(s->value)) return STATUS_OK;
         auto* r = std::get_if<record>(&s->value);
         if (!r) return STATUS_INVALID_CAP;
         if (!r->closing_) {
@@ -503,13 +497,13 @@ public:
         }
         const auto status = r->close();
         if (status != STATUS_OK) return status;
-        s->value.template emplace<task_exit>(task_exit{r->result_});
+        s->value.template emplace<pr_exit>(pr_exit{r->result_});
         return STATUS_OK;
     }
-    auto request_stop(task_id id) noexcept -> status_t {
+    auto request_stop(pr_id id) noexcept -> status_t {
         auto* s = find(id);
         if (!s) return STATUS_INVALID_CAP;
-        if (std::holds_alternative<task_exit>(s->value)) return STATUS_OK;
+        if (std::holds_alternative<pr_exit>(s->value)) return STATUS_OK;
         auto* r = active(id);
         if (!r) return STATUS_INVALID_CAP;
         if (r->closing_) return STATUS_OK;
@@ -519,27 +513,22 @@ public:
         r->result_ = result.value ? static_cast<status_t>(result.value2) : STATUS_CANCELED;
         return STATUS_OK;
     }
-    void notify(task_id id, word_t badges) noexcept {
+    auto closing_needs_poll(pr_id id) noexcept -> bool {
         auto* r = active(id);
-        if (r && r->drain_ == record::drain::waiting && (badges & r->close_badge_)) r->drain_ = record::drain::done;
+        return r && r->closing_;
     }
-    auto closing_needs_poll(task_id id) noexcept -> bool {
-        auto* r = active(id);
-        return r && r->closing_ && r->drain_ != record::drain::waiting;
-    }
-    auto result(task_id id) noexcept -> std::optional<task_exit> {
+    auto result(pr_id id) noexcept -> std::optional<pr_exit> {
         auto* s = find(id);
-        if (s) if (const auto* e = std::get_if<task_exit>(&s->value)) return *e;
+        if (s) if (const auto* e = std::get_if<pr_exit>(&s->value)) return *e;
         return {};
     }
-    auto collect(task_id id) noexcept -> sys::SysResult {
+    auto collect(pr_id id) noexcept -> sys::SysResult {
         const auto status = poll(id);
         if (status != STATUS_OK) return {.status = status};
         auto* s = find(id);
-        const auto result = std::get<task_exit>(s->value).status;
+        const auto result = std::get<pr_exit>(s->value).status;
         s->value.template emplace<std::monostate>();
         s->gen = s->gen == UINT32_MAX ? 0 : s->gen + 1;
         return {.status = STATUS_OK, .value = static_cast<word_t>(result)};
     }
 };
-} // namespace proc

@@ -22,7 +22,7 @@
 #include <sched/domain.hpp>
 #include <task/thread.hpp>
 #include <uapi/abi.h>
-#include <uapi/start.h>
+#include <uapi/task.h>
 #include <uapi/mem.h>
 #include <uapi/cap.h>
 #include <mm/pager.hpp>

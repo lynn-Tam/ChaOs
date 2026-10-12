@@ -1,18 +1,18 @@
 #pragma once
 
 #include <expected>
+#include <span>
 #include <utility>
 #include <sys/syscall.hpp>
 #include <libk/unique_handle.hpp>
 
-namespace sys {
 
 // Owns a slot in this task's CSpace. The child CSpace owns delivered slots;
 // managers close a remote slot explicitly, while that CSpace is still alive.
 class cap_owner {
     struct drop {
         void operator()(cap_t cap) const noexcept {
-            const auto s = cap_close(cap).status;
+            const auto s = sys::cap_close(cap).status;
             if (s != STATUS_OK) sys::exit(s);
         }
     };
@@ -25,7 +25,7 @@ public:
     auto release() noexcept -> cap_t { return cap_.release(); }
     auto close() noexcept -> status_t {
         if (!cap_) return STATUS_OK;
-        const auto s = cap_close(cap_.get()).status;
+        const auto s = sys::cap_close(cap_.get()).status;
         if (s == STATUS_OK) (void)cap_.release();
         return s;
     }
@@ -34,26 +34,26 @@ public:
 // Owns a VA reservation; repeated attach/detach reuses that reservation.
 // clear waits for the kernel's TLB/borrow drain before the VA is reusable.
 // create additionally owns the backing object; map owns an imported cap only.
-struct mapping {
+struct vm_area {
     cap_owner memory{}, region{};
     uintptr_t address{};
     size_t size{};
 
-    mapping() noexcept = default;
-    mapping(const mapping&) = delete;
-    auto operator=(const mapping&) -> mapping& = delete;
-    mapping(mapping&& other) noexcept { take(other); }
-    auto operator=(mapping&& other) noexcept -> mapping& {
+    vm_area() noexcept = default;
+    vm_area(const vm_area&) = delete;
+    auto operator=(const vm_area&) -> vm_area& = delete;
+    vm_area(vm_area&& other) noexcept { take(other); }
+    auto operator=(vm_area&& other) noexcept -> vm_area& {
         if (this != &other) { require_close(); take(other); }
         return *this;
     }
-    ~mapping() noexcept { require_close(); }
+    ~vm_area() noexcept { require_close(); }
 
     auto open(cap_t vm, uintptr_t va, size_t bytes, word_t perms = VM_READ | VM_WRITE) noexcept -> status_t {
         if (region) return STATUS_BUSY;
         if (!vm || !bytes || (va | bytes) % 4096 || bytes > ~uintptr_t{} - va)
             return STATUS_BAD_ARGS;
-        mapping** link = nullptr;
+        vm_area** link = nullptr;
         if (!va) {
             // The runtime owns this VA arena; fixed boot/device windows live below it.
             va = 0x100000000;
@@ -66,7 +66,7 @@ struct mapping {
             }
             if (va >= 0x2000000000 || bytes > 0x2000000000 - va) return STATUS_NO_MEMORY;
         }
-        const auto r = vm_slice(vm, va, bytes, perms,
+        const auto r = sys::vm_slice(vm, va, bytes, perms,
             RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP | RIGHT_DESTROY);
         if (r.value) {
             region = cap_owner{r.value}; address = va; size = bytes; cleared_ = false;
@@ -80,20 +80,20 @@ struct mapping {
     auto attach(cap_t mem, word_t first, size_t bytes, word_t perms) noexcept -> status_t {
         if (!region || cleared_ || mapped_ || !mem || !bytes || bytes % 4096 || bytes > size)
             return STATUS_BAD_ARGS;
-        const auto s = vm_map(region.selector(), mem, address, bytes, first, perms).status;
+        const auto s = sys::vm_map(region.selector(), mem, address, bytes, first, perms).status;
         if (s == STATUS_OK) mapped_ = bytes;
         return s;
     }
     auto detach() noexcept -> status_t {
         if (!mapped_) return STATUS_OK;
-        const auto s = vm_unmap(region.selector(), address, mapped_).status;
+        const auto s = sys::vm_unmap(region.selector(), address, mapped_).status;
         if (s == STATUS_OK) mapped_ = 0;
         return s;
     }
     auto close() noexcept -> status_t {
         if (region) {
             if (!cleared_) {
-                const auto s = vm_clear(region.selector()).status;
+                const auto s = sys::vm_clear(region.selector()).status;
                 if (s != STATUS_OK) return s;
                 cleared_ = true;
                 mapped_ = 0;
@@ -102,7 +102,7 @@ struct mapping {
             if (s != STATUS_OK) return s;
         }
         if (owns_memory_ && memory) {
-            const auto s = object_destroy(memory.selector()).status;
+            const auto s = sys::object_destroy(memory.selector()).status;
             if (s != STATUS_OK) return s;
             owns_memory_ = false;
         }
@@ -117,27 +117,27 @@ struct mapping {
         return STATUS_OK;
     }
     static auto map(cap_t vm, cap_owner&& mem, uintptr_t va, size_t size, word_t perms)
-        noexcept -> std::expected<mapping, status_t> {
+        noexcept -> std::expected<vm_area, status_t> {
         return map_impl(vm, std::move(mem), va, size, perms, false);
     }
     static auto map_private(cap_t vm, cap_owner&& mem, uintptr_t va, size_t size)
-        noexcept -> std::expected<mapping, status_t> {
+        noexcept -> std::expected<vm_area, status_t> {
         return map_impl(vm, std::move(mem), va, size, VM_READ | VM_WRITE, false, VM_MAP_PRIVATE);
     }
     static auto create(cap_t pool, cap_t vm, uintptr_t va, size_t size)
-        noexcept -> std::expected<mapping, status_t> {
-        const auto r = memory_create(pool, size, VM_READ | VM_WRITE);
+        noexcept -> std::expected<vm_area, status_t> {
+        const auto r = sys::memory_create(pool, size, VM_READ | VM_WRITE);
         if (r.status != STATUS_OK) return std::unexpected(r.status);
         return map_impl(vm, cap_owner{r.value}, va, size, VM_READ | VM_WRITE, true);
     }
 private:
-    inline static mapping* head_{};
-    mapping** link_{};
-    mapping* next_{};
+    inline static vm_area* head_{};
+    vm_area** link_{};
+    vm_area* next_{};
     size_t mapped_{};
     bool cleared_{}, owns_memory_{};
     void require_close() noexcept { const auto s = close(); if (s != STATUS_OK) sys::exit(s); }
-    void take(mapping& b) noexcept {
+    void take(vm_area& b) noexcept {
         memory = std::move(b.memory); region = std::move(b.region);
         link_ = std::exchange(b.link_, nullptr); next_ = std::exchange(b.next_, nullptr);
         if (link_) *link_ = this;
@@ -148,8 +148,8 @@ private:
     }
     static auto map_impl(cap_t vm, cap_owner&& mem, uintptr_t va, size_t size,
                          word_t perms, bool owned, word_t flags = 0)
-        noexcept -> std::expected<mapping, status_t> {
-        mapping result;
+        noexcept -> std::expected<vm_area, status_t> {
+        vm_area result;
         result.memory = std::move(mem); result.owns_memory_ = owned;
         auto s = result.open(vm, va, size, perms);
         if (s == STATUS_OK) s = result.attach(result.memory.selector(), 0, size, perms | flags);
@@ -157,4 +157,3 @@ private:
         return result;
     }
 };
-} // namespace sys

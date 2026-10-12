@@ -61,15 +61,16 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
     try:
         until(b'myos> ')
         run('help', b'run/spawn PROGRAM')
+        run('svc', b'shell running')
         run('ls', b'CAT.PKG')
         run('cat README.TXT', b'myos disk file service')
         run('cat absent.txt', b'error: -5')
         if service_fault:
-            run('restart absent', b'error: -5')
+            run('svc restart absent', b'error: -5')
             baseline = output.count(b'uart: console ready')
             for target in ('files', 'block'):
                 start = len(output)
-                for byte in f'restart {target}\r'.encode():
+                for byte in f'svc restart {target}\r'.encode():
                     process.stdin.write(bytes([byte]))
                     process.stdin.flush()
                     time.sleep(0.003)
@@ -80,7 +81,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
                     raise RuntimeError('unrelated UART service restarted')
                 run('run echo console-ready', b'console-ready\nmyos> ')
                 run('cat README.TXT', b'myos disk file service')
-                run('restart absent', b'error: -5')
+                run('svc restart absent', b'error: -5')
             print(f'[console] OK: {smp} harts, local service restart and surviving UART')
             return
         for _ in range(iterations):
@@ -111,6 +112,15 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         run(f'wait {first}', b'error: -1')
         run('run echo ordered pipe bytes | cat', b'ordered pipe bytes\nmyos> ')
         run('run echo three-stage | cat | cat', b'three-stage\nmyos> ')
+        # Waiting for a producer must also observe its dead, uncollected consumer.
+        short = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 1 96', b'task: '))
+        if len(short) != 2:
+            raise RuntimeError('background pipeline did not return two handles')
+        producer = run(f'wait {int(short[0])}', b'error: ')
+        if b'error: -22' not in producer and b'error: -13' not in producer:
+            raise RuntimeError(f'dead consumer retained its input: {producer!r}')
+        run(f'wait {int(short[1])}', b'myos> ')
+
         run('run echo rollback | absent', b'error: -5')
         run('run echo abcdef | fdcheck stdio', b'stdio aliases ok\nmyos> ')
         run('run fill 8192 | slow 1', b'bytes: 8192\nmyos> ')

@@ -4,13 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace sys::uart {
-
 // A mapped NS16550 port.  The service owns the mapping and the IRQ
 // capability; this class only performs accesses within that mapping.
-class Port final {
+class uart_port final {
 public:
-    explicit Port(uintptr_t mapped_base) noexcept
+    explicit uart_port(uintptr_t mapped_base) noexcept
         : base_(reinterpret_cast<volatile uint8_t*>(mapped_base)) {}
 
     [[nodiscard]] auto valid() const noexcept -> bool {
@@ -109,50 +107,3 @@ private:
 
     volatile uint8_t* base_{};
 };
-
-// Writer is kept as the small print-facing façade used by early services.
-// Port remains the owner of all UART register semantics.
-class Writer final {
-public:
-    explicit Writer(Port port) noexcept : port_(port) {}
-
-    [[nodiscard]] auto valid() const noexcept -> bool { return port_.valid(); }
-    void put(char value) const noexcept { port_.put(value); }
-    void write(const char* text) const noexcept { port_.write(text); }
-    void write(const char* text, size_t size) const noexcept {
-        port_.write(text, size);
-    }
-
-private:
-    Port port_;
-};
-
-class Line final {
-public:
-    explicit Line(Writer writer) noexcept : writer_(writer) {}
-
-    void write(const char* text) const noexcept { writer_.write(text); }
-    void newline() const noexcept { writer_.put('\n'); }
-
-private:
-    Writer writer_;
-};
-
-// Fixed-format, immediate user output.  Formatting stays in libk; this sink
-// only owns the UART transport and never buffers a second log stream.
-class Printer final {
-public:
-    explicit Printer(Writer writer) noexcept : writer_(writer) {}
-
-    void text(const char* value) noexcept { writer_.write(value); }
-
-    template<libk::fmt::fixed_string F, typename... Args>
-    [[nodiscard]] auto print(const Args&... args) noexcept -> bool {
-        return libk::fmt::format_to<F>(writer_, args...).ok();
-    }
-
-private:
-    Writer writer_;
-};
-
-} // namespace sys::uart

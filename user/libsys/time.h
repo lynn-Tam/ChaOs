@@ -1,12 +1,12 @@
 #pragma once
 
+#include_next <time.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct timespec { int64_t tv_sec, tv_nsec; };
 enum { CLOCK_MONOTONIC = 1 };
 
 // Zero on success; a negative status on failure.

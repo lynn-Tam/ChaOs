@@ -1,10 +1,9 @@
 #pragma once
 
-#include <sys/protocol.hpp>
+#include <proto.hpp>
 
-#include <sys/start.hpp>
+#include <start.hpp>
 
-namespace channel_test {
-inline constexpr boot::Import Provider{"provider.channel", 0x50524f56,
+
+inline constexpr rt_req ct_provider{"provider.channel", 0x50524f56,
     ObjChannel};
-}

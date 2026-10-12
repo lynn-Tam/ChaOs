@@ -5,15 +5,15 @@
 #include <libk/fmt.hpp>
 #include <string_view>
 
-namespace {
+
 struct output {
     void write(const char* data, size_t size) { ::write(STDOUT_FILENO, data, size); }
 };
-int print(std::string_view text) {
+static int print(std::string_view text) {
     const auto count = write(STDOUT_FILENO, text.data(), text.size());
     return count < 0 ? count : count == static_cast<int64_t>(text.size()) ? 0 : 1;
 }
-int list(const char* path) {
+static int list(const char* path) {
     auto* dir = opendir(path);
     if (!dir) return 1;
     dirent entry{};
@@ -25,7 +25,7 @@ int list(const char* path) {
     const auto closed = closedir(dir);
     return status < 0 ? status : closed;
 }
-int transfer(int source, int target) {
+static int transfer(int source, int target) {
     char bytes[4096];
     for (;;) {
         const auto size = read(source, bytes, sizeof(bytes));
@@ -34,7 +34,7 @@ int transfer(int source, int target) {
         if (sent != size) return sent < 0 ? sent : 1;
     }
 }
-int copy(const char* from, const char* to) {
+static int copy(const char* from, const char* to) {
     if (std::string_view(*from == '/' ? from + 1 : from)
         == (*to == '/' ? to + 1 : to)) return 1;
     const int source = open(from, O_RDONLY);
@@ -46,7 +46,7 @@ int copy(const char* from, const char* to) {
     const auto closed = close(source);
     return status ? status : closed;
 }
-}
+
 
 int main(int argc, char** argv) {
     if (argc < 2) return print("fs ls [DIR] | cat/stat/touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv/copy OLD NEW | device | volid | sync\n");

@@ -1,11 +1,12 @@
+#include <util.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <new>
-#include <sys/start.hpp>
-#include <sys/handle.hpp>
+#include <start.hpp>
+#include <cap.hpp>
 #include <string.h>
 
-namespace {
+
 // Process-local runtime: allocation and mapping mutation run on its one thread.
 constexpr size_t Align = alignof(std::max_align_t);
 constexpr size_t ChunkSize = 64 * 1024;
@@ -17,16 +18,16 @@ struct alignas(std::max_align_t) Block {
     bool free;
 };
 struct Chunk {
-    sys::mapping map;
+    vm_area map;
     Chunk *prev, *next;
 };
 struct Alloc { Block* block; size_t size; };
-constexpr auto round(size_t n, size_t a) noexcept -> size_t { return (n + a - 1) & ~(a - 1); }
+static constexpr auto round(size_t n, size_t a) noexcept -> size_t { return (n + a - 1) & ~(a - 1); }
 constexpr size_t Header = round(sizeof(Chunk), Align);
-Chunk* chunks;
-cap_t pool, vm;
+static Chunk* chunks;
+static cap_t pool, vm;
 
-auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
+static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
     if (!pool || !alignment || (alignment & (alignment - 1))) return nullptr;
     alignment = std::max(alignment, Align);
     if (alignment > SIZE_MAX - sizeof(Block) - sizeof(Alloc) - Align
@@ -39,7 +40,7 @@ auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
     if (!block) {
         if (need > SIZE_MAX - Header - 4095) return nullptr;
         const auto size = std::max(ChunkSize, round(Header + need, 4096));
-        auto map = sys::mapping::create(pool, vm, 0, size);
+        auto map = vm_area::create(pool, vm, 0, size);
         if (!map) return nullptr;
         auto* c = std::construct_at(reinterpret_cast<Chunk*>(map->address), std::move(*map), nullptr, chunks);
         if (chunks) chunks->prev = c;
@@ -58,12 +59,12 @@ auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
     std::construct_at(reinterpret_cast<Alloc*>(address) - 1, block, n);
     return reinterpret_cast<void*>(address);
 }
-void merge(Block& b) noexcept {
+static void merge(Block& b) noexcept {
     auto* next = b.next;
     b.size += next->size; b.next = next->next;
     if (b.next) b.next->prev = &b;
 }
-void release(void* p) noexcept {
+static void release(void* p) noexcept {
     if (!p) return;
     auto* b = (static_cast<Alloc*>(p) - 1)->block;
     b->free = true;
@@ -78,15 +79,14 @@ void release(void* p) noexcept {
     auto map = std::move(c->map);
     std::destroy_at(c);
 }
-auto checked(size_t n, size_t alignment = Align) -> void* {
+static auto checked(size_t n, size_t alignment = Align) -> void* {
     if (auto* p = allocate(n, alignment)) return p;
     sys::exit(STATUS_NO_MEMORY);
 }
-}
 
-extern "C" void init_heap(const void* address, word_t size) noexcept {
-    const auto info = sys::bootstrap(address, size);
-    pool = info.selector(BOOT_POOL); vm = info.selector(BOOT_VSPACE);
+
+extern "C" void init_heap(cap_t pool_cap, cap_t vm_cap) noexcept {
+    pool = pool_cap; vm = vm_cap;
 }
 extern "C" auto malloc(size_t n) noexcept -> void* { return allocate(n); }
 extern "C" void free(void* p) noexcept { release(p); }
@@ -123,9 +123,8 @@ void operator delete(void* p, std::align_val_t) noexcept { release(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { release(p); }
 void operator delete(void* p, size_t, std::align_val_t) noexcept { release(p); }
 void operator delete[](void* p, size_t, std::align_val_t) noexcept { release(p); }
-namespace std {
-const nothrow_t nothrow{};
-[[noreturn]] void __throw_bad_alloc() { sys::exit(STATUS_NO_MEMORY); }
-[[noreturn]] void __throw_bad_array_new_length() { sys::exit(STATUS_NO_MEMORY); }
-[[noreturn]] void __throw_length_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
-}
+const std::nothrow_t std::nothrow{};
+[[noreturn]] void std::__throw_bad_alloc() { sys::exit(STATUS_NO_MEMORY); }
+[[noreturn]] void std::__throw_bad_array_new_length() { sys::exit(STATUS_NO_MEMORY); }
+[[noreturn]] void std::__throw_logic_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_length_error(const char*) { sys::exit(STATUS_BAD_ARGS); }

@@ -56,7 +56,7 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
                     interaction = len(output)
                     process.stdin.write(keys)
                     process.stdin.flush()
-            if restart or command == "restart store":
+            if restart or command == "svc restart store":
                 until(b"myos native shell", begin)
                 reopened = output.index(b"myos native shell", begin)
                 until(b"myos> ", reopened)
@@ -133,7 +133,7 @@ def main():
                 ("fs ls notes", b"item\n"),
                 ("cat edited", b"editor-persistent"),
                 ("cat fd-async", b"CR"),
-                ("restart store", b"myos native shell"),
+                ("svc restart store", b"myos native shell"),
                 ("fs cat readme", b"myos disk file service"),
                 ("fs mv note renamed", b"myos> "),
                 ("fs rm renamed", b"myos> "),

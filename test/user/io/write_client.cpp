@@ -1,62 +1,72 @@
-#include <sys/protocol.hpp>
-#include <sys/channel.hpp>
-#include <sys/start.hpp>
-#include <sys/queue.hpp>
+#include <util.hpp>
+#include <proto.hpp>
+#include <ch.hpp>
+#include <start.hpp>
+#include <io.hpp>
 
-namespace {
 constexpr uint64_t Offset = 64 * 512;
 constexpr size_t Size = 4096;
 
-auto pattern(size_t index) noexcept -> uint8_t {
+static auto pattern(size_t index) noexcept -> uint8_t {
     return static_cast<uint8_t>((index * 37 + 19) & 255);
 }
-}
 
-extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    const auto pool = sys::capability(info, BOOT_POOL);
-    const auto events = notification_create(pool, 1);
-    sys::require(events.status);
+int main() {
+
+    const auto& info = rt_startup();
+    const auto pool = info.pool;
+    const auto events = sys::notification_create(pool, 1);
+    if (events.status != STATUS_OK) sys::exit(events.status);
     cap_owner event{events.value};
-    io::ClientSession session;
+    io_client session;
     uint64_t capacity{};
-    sys::require(session.connect(sys::capability(info, boot::Block),
-        pool, sys::capability(info, BOOT_CSPACE), event.selector(),
-        sys::capability(info, BOOT_VSPACE), 0x70000000, capacity, true));
+    if (const auto rc = session.connect(info.selector(blk_service), pool, info.cspace,
+                                        event.selector(), info.vspace, 0x70000000,
+                                        capacity, true);
+        rc != STATUS_OK)
+        sys::exit(rc);
     if (capacity < Offset + Size || session.writable_payload() == nullptr)
-        exit(STATUS_BAD_ARGS);
+        sys::exit(STATUS_BAD_ARGS);
 
-    auto run = [&](io::Operation operation, size_t bytes) noexcept {
-        io::Request request{.operation = static_cast<uint64_t>(operation),
-            .offset = operation == io::Operation::Flush ? 0 : Offset,
-            .length = bytes};
+    auto run = [&](io_operation operation, size_t bytes) noexcept {
+        io_cmd request{.operation = static_cast<uint64_t>(operation),
+                       .offset = operation == io_operation::Flush ? 0 : Offset,
+                       .length = bytes};
         if (session.queue().submit(request) != libk::ring_status::ready)
-            exit(STATUS_INTERNAL);
-        sys::require(session.flush());
+            sys::exit(STATUS_INTERNAL);
+        if (const auto rc = session.flush(); rc != STATUS_OK)
+            sys::exit(rc);
         for (;;) {
-            io::Completion completion;
+            io_done completion;
             const auto result = session.queue().take(completion);
             if (result == libk::ring_status::ready) {
-                if (completion.id != request.id || completion.status != STATUS_OK
-                    || completion.bytes != bytes) exit(STATUS_BACKING_FAILED);
-                sys::require(session.flush());
+                if (completion.id != request.id || completion.status != STATUS_OK ||
+                    completion.bytes != bytes)
+                    sys::exit(STATUS_BACKING_FAILED);
+                if (const auto rc = session.flush(); rc != STATUS_OK)
+                    sys::exit(rc);
                 return;
             }
-            if (result != libk::ring_status::empty) exit(STATUS_PEER_FAULT);
-            sys::require(notification_wait(event.selector()).status);
+            if (result != libk::ring_status::empty)
+                sys::exit(STATUS_PEER_FAULT);
+            if (const auto rc = sys::notification_wait(event.selector()).status; rc != STATUS_OK)
+                sys::exit(rc);
         }
     };
 
 #ifndef VERIFY_ONLY
-    for (size_t i = 0; i < Size; ++i) session.writable_payload()[i] = pattern(i);
-    run(io::Operation::Write, Size);
-    run(io::Operation::Flush, 0);
-    for (size_t i = 0; i < Size; ++i) session.writable_payload()[i] = 0;
-#endif
-    run(io::Operation::Read, Size);
     for (size_t i = 0; i < Size; ++i)
-        if (session.payload()[i] != pattern(i)) exit(STATUS_BACKING_FAILED);
-    sys::require(session.close());
-    exit();
+        session.writable_payload()[i] = pattern(i);
+    run(io_operation::Write, Size);
+    run(io_operation::Flush, 0);
+    for (size_t i = 0; i < Size; ++i)
+        session.writable_payload()[i] = 0;
+#endif
+    run(io_operation::Read, Size);
+    for (size_t i = 0; i < Size; ++i)
+        if (session.payload()[i] != pattern(i))
+            sys::exit(STATUS_BACKING_FAILED);
+    if (const auto rc = session.close(); rc != STATUS_OK)
+        sys::exit(rc);
+    sys::exit();
 }

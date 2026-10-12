@@ -7,3 +7,4 @@ option('qemu_smp', type: 'integer', value: 4, min: 1, description: 'Harts used b
 option('qemu_timeout', type: 'string', value: '10s', description: 'Host timeout used by Meson QEMU run targets')
 option('gdb_host', type: 'string', value: '127.0.0.1', description: 'GDB listener host for the debug run target')
 option('gdb_port', type: 'integer', value: 1237, min: 1, max: 65535, description: 'GDB listener port for the debug run target')
+option('newlib_include', type: 'string', value: '/usr/include/newlib', description: 'Target C headers required by userspace C++ containers')

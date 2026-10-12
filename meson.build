@@ -155,19 +155,21 @@ kernel_wait = executable(
   link_args: kernel_link_args, link_language: 'c', build_by_default: false,
 )
 user_common_args = [
-  '-ffreestanding', '-Wall', '-Wextra', '-Werror', '-O2', '-g3',
-  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + root, '-I' + join_paths(root, 'user/libsys'),
+  '-Wall', '-Wextra', '-Werror', '-O2', '-g3',
+  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + root, '-I' + join_paths(root, 'user/libsys'), '-I' + join_paths(root, 'user/include'),
 ]
+user_c_args = user_common_args + ['-ffreestanding']
 user_cpp_args = user_common_args + ['-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit']
-user_cpp_args += [cpp_config_arg]
+# Container headers need the target C declarations; only used runtime symbols link.
+user_cpp_args += [cpp_config_arg, '-idirafter', get_option('newlib_include')]
 user_link_args = ['-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-lgcc', '-Wl,-T,' + join_paths(root, 'user/riscv64/linker.ld')]
 crt = static_library(
-  'crt', files('user/crt/init.cpp', 'user/crt/heap.cpp', 'user/riscv64/context.S', 'libk/mem.c'),
-  c_args: user_common_args, cpp_args: user_cpp_args, pic: false, build_by_default: false,
+  'crt', files('user/crt/init.cpp', 'user/crt/start.cpp', 'user/crt/heap.cpp', 'libk/mem.c'),
+  c_args: user_c_args, cpp_args: user_cpp_args, pic: false, build_by_default: false,
 )
 user_entry = static_library(
   'user-entry', files('user/crt/start.S'),
-  c_args: user_common_args, pic: false, build_by_default: false,
+  c_args: user_c_args, pic: false, build_by_default: false,
 )
 libsys = static_library(
   'sys', files('user/libsys/runtime.cpp'),
@@ -177,7 +179,6 @@ libsys = static_library(
 bins = {}
 foreach name, spec : {
   'init': [files('servers/init.cpp'), false],
-  'proc': [files('servers/proc.cpp'), false],
   'block': [files('servers/block.cpp'), false],
   'files': [files('servers/files.cpp'), false],
   'vfs': [files('servers/vfs.cpp'), false],
@@ -192,83 +193,82 @@ foreach name, spec : {
   'cp': [files('programs/cp.cpp'), true],
   'fs': [files('programs/fs.cpp'), true],
   'edit': [files('programs/edit.cpp'), true],
-  'mkfs': [files('programs/mkfs.cpp'), true],
   'sleep': [files('programs/sleep.cpp'), true],
 }
   bins += {name: executable(name + '.elf', spec[0],
-    c_args: user_common_args, cpp_args: user_cpp_args,
+    c_args: user_c_args, cpp_args: user_cpp_args,
     link_whole: [crt, user_entry] + (spec[1] ? [libsys] : []),
     link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', build_by_default: false)}
 endforeach
 io_init_user = executable(
-  'io-init-test.elf', files('test/user/io/init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'io-init-test.elf', files('test/user/io/init.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 io_worker_user = executable(
-  'io-worker-test.elf', files('test/user/io/worker.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'io-worker-test.elf', files('test/user/io/worker.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 store_user = executable(
   'store.elf', files('servers/store.cpp', 'servers/lfs.c',
     'third_party/littlefs/lfs_util.c'),
-  c_args: user_common_args + ['-I' + join_paths(root, 'user/libsys'),
+  c_args: user_c_args + ['-I' + join_paths(root, 'user/libsys'), '-I' + join_paths(root, 'user/include'),
     '-DLFS_NO_MALLOC', '-DLFS_NO_DEBUG', '-DLFS_NO_WARN',
     '-DLFS_NO_ERROR', '-UNDEBUG'],
-  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'user/libsys'),
+  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'user/libsys'), '-I' + join_paths(root, 'user/include'),
     '-DLFS_NO_MALLOC', '-DLFS_NO_DEBUG', '-DLFS_NO_WARN',
     '-DLFS_NO_ERROR', '-UNDEBUG'],
   link_whole: [crt, user_entry], link_args: user_link_args,
   link_language: 'c', build_by_default: false,
 )
 io_session_init_user = executable(
-  'io-session-init-test.elf', files('test/user/io/session_init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'io-session-init-test.elf', files('test/user/io/session_init.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 io_client_user = executable(
-  'io-client-test.elf', files('test/user/io/client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'io-client-test.elf', files('test/user/io/client.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 block_write_user = executable(
-  'block-write-test.elf', files('test/user/io/write_client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'block-write-test.elf', files('test/user/io/write_client.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 block_verify_user = executable(
-  'block-verify-test.elf', files('test/user/io/write_client.cpp'), c_args: user_common_args,
+  'block-verify-test.elf', files('test/user/io/write_client.cpp'), c_args: user_c_args,
   cpp_args: user_cpp_args + ['-DVERIFY_ONLY'],
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_init_user = executable(
-  'file-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'file-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_client_user = executable(
-  'file-client-test.elf', files('test/user/io/file_client.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'file-client-test.elf', files('test/user/io/file_client.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_failure_init_user = executable(
-  'file-failure-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_common_args,
+  'file-failure-init-test.elf', files('test/user/io/file_init.cpp'), c_args: user_c_args,
   cpp_args: user_cpp_args + ['-DTEST_FILE_FAILURE'],
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_failure_user = executable(
-  'file-failure-test.elf', files('test/user/io/file_failure.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'file-failure-test.elf', files('test/user/io/file_failure.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
 fdcheck_user = executable(
-  'fdcheck.elf', files('test/user/fd/main.cpp'), c_args: user_common_args,
+  'fdcheck.elf', files('test/user/fd/main.cpp'), c_args: user_c_args,
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'user/libsys')],
   link_whole: [crt, user_entry, libsys], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 demand_user = executable(
-  'demand-test.elf', files('test/user/demand/main.cpp'), c_args: user_common_args, cpp_args: user_cpp_args,
+  'demand-test.elf', files('test/user/demand/main.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
 bootpack = executable(
   'bootpack', files('tools/bootpack/main.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys'), '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
 )
 
 shared_ring_test = executable(
@@ -279,22 +279,22 @@ shared_ring_test = executable(
 run_target('check-shared-ring', command: [shared_ring_test])
 io_queue_test = executable(
   'io-queue-test', files('test/io_queue_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys'), '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
 )
 run_target('check-io-queue', command: [io_queue_test])
 fat32_test = executable(
   'fat32-test', files('test/fat32_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys'), '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
 )
 run_target('check-fat32', command: [fat32_test])
 
 boot_bundle_test = executable(
   'boot-bundle-test', files('test/host/boot_bundle_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys'), '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
 )
 syscall_dependency_test = executable(
   'syscall-dependency-test', files('test/host/syscall_dependency_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/libsys'), '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
 )
 
 run_target('test-boot-bundle', command: [boot_bundle_test])
@@ -308,7 +308,7 @@ io_user_bundle = custom_target(
 )
 io_dual_init_user = executable(
   'io-dual-init.elf', files('test/user/io/dual_init.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 io_dual_bundle = custom_target(
@@ -395,10 +395,7 @@ edit_package = custom_target(
   command: [bootpack, '@OUTPUT@', 'edit', 'edit=@INPUT0@'], build_by_default: false,
 )
 
-mkfs_package = custom_target(
-  'mkfs-package', input: [bins['mkfs']], output: 'mkfs.pkg',
-  command: [bootpack, '@OUTPUT@', 'mkfs', 'mkfs=@INPUT0@'], build_by_default: false,
-)
+
 
 sleep_package = custom_target(
   'sleep-package', input: [bins['sleep']], output: 'sleep.pkg',
@@ -416,7 +413,7 @@ disk_entries = {
   'CAT.PKG': cat_package, 'LS.PKG': ls_package,
   'SLOW.PKG': slow_package, 'FILL.PKG': fill_package,
   'PUT.PKG': put_package, 'GET.PKG': get_package, 'CP.PKG': cp_package,
-  'FS.PKG': fs_package, 'EDIT.PKG': edit_package, 'MKFS.PKG': mkfs_package,
+  'FS.PKG': fs_package, 'EDIT.PKG': edit_package,
 }
 disk_inputs = []
 disk_args = [find_program('python3'), files('tools/build/fat-image.py'), '@OUTPUT@']
@@ -454,12 +451,12 @@ file_session_bundle = custom_target(
 )
 file_fault_user = executable(
   'file-fault.elf', files('test/user/io/file_fault.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 file_fault_init_user = executable(
   'file-fault-init.elf', files('test/user/io/file_fault_init.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
@@ -478,12 +475,12 @@ file_failure_bundle = custom_target(
 
 channel_init_user = executable(
   'channel-init.elf', files('test/user/channel/init.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 device_inventory_user = executable(
   'device-inventory.elf', files('test/user/io/device_inventory_init.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 device_inventory_bundle = custom_target(
@@ -493,22 +490,22 @@ device_inventory_bundle = custom_target(
 )
 channel_test_user = executable(
   'channel-test.elf', files('test/user/channel/main.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 channel_worker_user = executable(
   'channel-worker.elf', files('test/user/channel/worker.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 channel_provider_user = executable(
   'channel-provider.elf', files('test/user/channel/provider.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 channel_holder_user = executable(
   'channel-holder.elf', files('test/user/channel/export_holder.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
@@ -519,41 +516,41 @@ channel_test_bundle = custom_target(
 )
 process_client_user = executable(
   'process-client.elf', files('test/user/process/main.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
 process_test_bundle = custom_target(
-  'process-test-bundle', input: [bins['init'], bins['uart'], bins['proc'], process_client_user, bins['block'], bins['files'], bins['vfs']],
+  'process-test-bundle', input: [bins['init'], bins['uart'], process_client_user, bins['block'], bins['files'], bins['vfs']],
   output: 'process-test.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@', 'proc=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@'], build_by_default: false,
+  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@', 'shell=@INPUT2@', 'block=@INPUT3@', 'files=@INPUT4@', 'vfs=@INPUT5@'], build_by_default: false,
 )
 boot_bundle = custom_target(
-  'boot-bundle', input: [bins['init'], bins['uart'], bins['proc'], bins['shell'], bins['block'], bins['files'], bins['vfs']], output: 'boot.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@', 'proc=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@'], build_by_default: false,
+  'boot-bundle', input: [bins['init'], bins['uart'], bins['shell'], bins['block'], bins['files'], bins['vfs']], output: 'boot.bundle',
+  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@', 'shell=@INPUT2@', 'block=@INPUT3@', 'files=@INPUT4@', 'vfs=@INPUT5@'], build_by_default: false,
 )
 run_target('test-boot-load', command: [find_program('python3'),
   files('test/tools/bootpack_image.py'), bins['init'], boot_bundle])
 storage_bundle = custom_target(
-  'storage-bundle', input: [bins['init'], bins['uart'], bins['proc'],
+  'storage-bundle', input: [bins['init'], bins['uart'],
     bins['shell'], bins['block'], bins['files'], store_user, bins['vfs']],
   output: 'storage.bundle',
   command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@',
-    'proc=@INPUT2@', 'shell=@INPUT3@', 'block=@INPUT4@',
-    'files=@INPUT5@', 'block_data=@INPUT4@', 'store=@INPUT6@', 'vfs=@INPUT7@'], build_by_default: false,
+    'shell=@INPUT2@', 'block=@INPUT3@',
+    'files=@INPUT4@', 'store=@INPUT5@', 'vfs=@INPUT6@'], build_by_default: false,
 )
 fault_shell_user = executable(
   'fault-shell.elf', files('test/user/service_start/fault_shell.cpp'),
-  c_args: user_common_args, cpp_args: user_cpp_args,
+  c_args: user_c_args, cpp_args: user_cpp_args,
   link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 
 spontaneous_fault_bundle = custom_target(
   'spontaneous-fault-bundle',
-  input: [bins['init'], bins['uart'], bins['proc'], fault_shell_user, bins['block'], bins['files'], bins['vfs']],
+  input: [bins['init'], bins['uart'], fault_shell_user, bins['block'], bins['files'], bins['vfs']],
   output: 'spontaneous-fault.bundle',
-  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@', 'proc=@INPUT2@',
-    'shell=@INPUT3@', 'block=@INPUT4@', 'files=@INPUT5@', 'vfs=@INPUT6@'], build_by_default: false,
+  command: [bootpack, '@OUTPUT@', 'init', '--boot', 'init=@INPUT0@', 'uart=@INPUT1@',
+    'shell=@INPUT2@', 'block=@INPUT3@', 'files=@INPUT4@', 'vfs=@INPUT5@'], build_by_default: false,
 )
 
 nm = find_program('riscv64-unknown-elf-nm')
@@ -571,7 +568,7 @@ run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 
 run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, bins['init'], bins['proc'], bins['shell'], bins['echo'], bins['cat'], bins['uart'], bins['block'], bins['files']])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, bins['init'], bins['shell'], bins['echo'], bins['cat'], bins['uart'], bins['block'], bins['files']])
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, (trace_enabled ? '1' : '0')])
 objdump = find_program('riscv64-unknown-elf-objdump')
 run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])
@@ -585,7 +582,7 @@ run_target('run-io-user-matrix', command: [find_program('python3'), files('tools
   '[io-user] ok: 32 outstanding, batch completion, task teardown, device reuse'])
 run_target('run-process-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--disk', disk_image, '--timeout', '45',
-  '[process] async wait, cancel, retention, deadlines and reuse ok'])
+  '[process] direct spawn, retention, deadlines and reuse ok'])
 run_target('run-file-session-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', file_session_bundle, '--disk', file_test_disk, '--timeout', '60',
   '[file-session] ok: two sessions, byte reads, 64 outstanding, EOF, handles, close'])

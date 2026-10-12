@@ -1,49 +1,50 @@
-#include <sys/pci.hpp>
+#include <util.hpp>
+#include <servers/pci.hpp>
 #include <optional>
-#include <sys/channel.hpp>
-#include <sys/handle.hpp>
+#include <ch.hpp>
+#include <cap.hpp>
 #include <test/user/task.hpp>
 #include <servers/uart.hpp>
 
-namespace {
-proc::package program;
-proc::tasks<2> supervisor;
+static pr_pkg program;
+static pr_tasks supervisor;
 
+int main() {
 
-}
-
-extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    auto pci = sys::pci::Bus::open(info, 0x3100'0000);
-    if (!pci) exit(pci.error());
-    sys::require(pci->configure(0x1042'1af4));
-    if (pci->count(0x1042'1af4) != 2) exit(STATUS_NOT_FOUND);
-    auto mapping = mapping::map(sys::capability(info, BOOT_VSPACE),
-        cap_owner{pci->firmware.console(ObjMem)},
-        0x30010000, 4096, VM_READ | VM_WRITE);
-    if (!mapping) exit(mapping.error());
-    uart::Port port{mapping->address};
+    const auto& info = rt_startup();
+    auto pci = pci_bus::open(info, 0x3100'0000);
+    if (!pci)
+        sys::exit(pci.error());
+    if (const auto rc = pci->configure(0x1042'1af4); rc != STATUS_OK)
+        sys::exit(rc);
+    if (pci->count(0x1042'1af4) != 2)
+        sys::exit(STATUS_NOT_FOUND);
+    auto mapping =
+        vm_area::map(info.vspace, cap_owner{pci->firmware.console(ObjMem)},
+                     0x30010000, 4096, VM_READ | VM_WRITE);
+    if (!mapping)
+        sys::exit(mapping.error());
+    uart_port port{mapping->address};
     port.reset();
     open(program, info);
-    supervisor.open(info);
-    proc::task_id tasks[2];
-    std::array<sys::pci::Binding, 2> devices;
+    supervisor.open(info.pool, fw_root(info).domain, info.vspace, info.cpus);
+    pr_id tasks[2];
+    std::array<pci_binding, 2> devices;
     for (size_t i = 0; i < 2; ++i) {
         auto found = pci->find(0x1042'1af4, i);
-        if (!found) exit(found.error());
+        if (!found)
+            sys::exit(found.error());
         devices[i] = std::move(*found);
-        const proc::cap_src caps[]{host(devices[i].cap.selector(), devices[i].rid)};
+        const pr_cap caps[]{host(devices[i].cap.selector(), devices[i].rid)};
         tasks[i] = start(supervisor, program, "io-test", {.caps = caps, .resources = io_quota});
     }
     for (size_t i = 0; i < 2; ++i) {
         const auto status = wait(supervisor, tasks[i]);
         if (status != STATUS_OK) {
-            uart::Printer printer{uart::Writer{port}};
-            (void)printer.print<"[io-dual] worker={} status={}\n">(i, status);
-            exit(status);
+            (void) libk::fmt::format_to<"[io-dual] worker={} status={}\n">(port, i, status);
+            sys::exit(status);
         }
     }
     port.write("[io-dual] two devices completed independent DMA and teardown\n");
-    exit();
+    sys::exit();
 }

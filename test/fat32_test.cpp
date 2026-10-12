@@ -9,13 +9,12 @@
 } } while (false)
 
 namespace {
-using namespace fat32;
 void put16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 void put32(uint8_t* p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 struct Fixture {
     std::vector<uint8_t> disk = std::vector<uint8_t>(64 * 1024 * 1024);
-    Geometry geometry{};
-    Volume volume{};
+    fat_geometry geometry{};
+    fat_vol volume{};
     std::vector<uint8_t> fat, visited;
     std::vector<uint32_t> index;
     Fixture() {
@@ -36,7 +35,7 @@ struct Fixture {
                 disk[geometry.cluster_offset(cluster) + i] = (ordinal * 512 + i) % 251;
         }
     }
-    bool parse() { return Geometry::parse(*reinterpret_cast<const uint8_t (*)[512]>(disk.data()), disk.size(), geometry); }
+    bool parse() { return fat_geometry::parse(*reinterpret_cast<const uint8_t (*)[512]>(disk.data()), disk.size(), geometry); }
     void link(uint32_t a, uint32_t b) { put32(disk.data() + geometry.fat_offset + a * 4, b); }
     void entry(size_t i, const char* name, uint32_t cluster, uint32_t size) {
         auto* p = disk.data() + geometry.data_offset + i * 32;

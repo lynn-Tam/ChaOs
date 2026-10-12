@@ -4,22 +4,20 @@
 
 
 #include <third_party/littlefs/lfs.h>
-#include <sys/protocol.hpp>
+#include <proto.hpp>
 
 // Store-private littlefs extension; the caller pins mutation through I/O.
 extern "C" int lfs_file_map(lfs_t*, lfs_file_t*, lfs_off_t,
     lfs_block_t*, lfs_off_t*, lfs_size_t*);
 extern "C" void lfs_file_drop(lfs_t*, lfs_file_t*);
 
-namespace store {
-
 // This adapter is the sole owner of the disk geometry and littlefs state.
 // A 4 KiB logical erase is a real full-block overwrite on a sector device;
 // sync is a real virtio-blk FLUSH. No implicit formatting occurs on mount.
-class Volume final : private libk::noncopyable_nonmovable {
+class st_vol final : private libk::noncopyable_nonmovable {
 public:
     static constexpr uint32_t BlockSize = 4096;
-    [[nodiscard]] auto open(block::client& backend) noexcept -> status_t {
+    [[nodiscard]] auto open(blk_client& backend) noexcept -> status_t {
         backend_ = &backend;
         const uint64_t blocks = backend.capacity() / BlockSize;
         if (blocks < 8 || blocks > UINT32_MAX) return STATUS_BAD_ARGS;
@@ -60,7 +58,7 @@ public:
         mounted_ = mounted == 0;
         if (mounted < 0) return status(mounted);
         if (id == nullptr) return STATUS_OK;
-        const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, VolumeIdSize);
+        const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, st_volume_id_size);
         if (written < 0) return error(written);
         const auto synced = backend_->flush();
         if (synced != STATUS_OK) {
@@ -70,7 +68,7 @@ public:
         return synced;
     }
 
-    [[nodiscard]] auto identity(uint8_t (&id)[VolumeIdSize]) noexcept -> status_t {
+    [[nodiscard]] auto identity(uint8_t (&id)[st_volume_id_size]) noexcept -> status_t {
         if (!mounted_) return STATUS_BACKING_FAILED;
         const auto size = lfs_getattr(&fs_, "/", IdentityAttribute, id, sizeof(id));
         if (size == LFS_ERR_NOATTR) return STATUS_NOT_FOUND;
@@ -81,7 +79,7 @@ public:
     // No cursor change or data-cache mutation. The server pins filesystem
     // mutation until all reads using these physical extents have completed.
     [[nodiscard]] auto extent(lfs_file_t& file, uint64_t offset, size_t size) noexcept
-        -> std::expected<io::extent, status_t> {
+        -> std::expected<io_extent, status_t> {
         lfs_block_t block{};
         lfs_off_t off{};
         lfs_size_t bytes = size;
@@ -89,7 +87,7 @@ public:
         if (result < 0) return std::unexpected(error(result));
         const auto start = off & ~(SectorSize - 1);
         const auto end = (off + bytes + SectorSize - 1) & ~(SectorSize - 1);
-        return io::extent{uint64_t{block} * BlockSize + start, end - start, off - start, bytes};
+        return io_extent{uint64_t{block} * BlockSize + start, end - start, off - start, bytes};
     }
 
     [[nodiscard]] auto mounted() const noexcept -> bool { return mounted_; }
@@ -116,10 +114,10 @@ private:
         }
     }
 
-    [[nodiscard]] auto transfer(io::Operation op, uint64_t offset,
+    [[nodiscard]] auto transfer(io_operation op, uint64_t offset,
         void* data, size_t size) noexcept -> int {
         if (failed_) return LFS_ERR_IO;
-        const auto result = op == io::Operation::Read
+        const auto result = op == io_operation::Read
             ? backend_->read(offset, static_cast<uint8_t*>(data), size)
             : program(offset, data, size);
         if (result == STATUS_OK) return 0;
@@ -133,35 +131,35 @@ private:
         // sync callback establish their actual device dependencies.
         const auto dependency = backend_->dependencies(offset, size);
         if (dependency != STATUS_OK) return dependency;
-        io::Request request{.operation = static_cast<uint64_t>(io::Operation::Write),
+        io_cmd request{.operation = static_cast<uint64_t>(io_operation::Write),
             .offset = offset, .length = size};
         for (;;) {
             const auto status = backend_->submit(request, data);
             if (status != STATUS_BUSY) return status;
-            io::Completion result{};
+            io_done result{};
             const auto taken = backend_->wait(result);
             if (taken != STATUS_OK) return taken;
             if (result.status != STATUS_OK) return result.status;
         }
     }
-    [[nodiscard]] static auto self(const lfs_config* config) noexcept -> Volume& {
-        return *static_cast<Volume*>(config->context);
+    [[nodiscard]] static auto self(const lfs_config* config) noexcept -> st_vol& {
+        return *static_cast<st_vol*>(config->context);
     }
     [[nodiscard]] static auto read(const lfs_config* config, lfs_block_t block,
         lfs_off_t off, void* buffer, lfs_size_t size) noexcept -> int {
-        return self(config).transfer(io::Operation::Read,
+        return self(config).transfer(io_operation::Read,
             uint64_t{block} * BlockSize + off, buffer, size);
     }
     [[nodiscard]] static auto program(const lfs_config* config, lfs_block_t block,
         lfs_off_t off, const void* buffer, lfs_size_t size) noexcept -> int {
-        return self(config).transfer(io::Operation::Write,
+        return self(config).transfer(io_operation::Write,
             uint64_t{block} * BlockSize + off, const_cast<void*>(buffer), size);
     }
     [[nodiscard]] static auto erase(const lfs_config* config, lfs_block_t block) noexcept -> int {
         auto& volume = self(config);
         // Erase is required by littlefs even though virtio-blk has no erase
         // operation. Writing the whole logical block enforces its contract.
-        return volume.transfer(io::Operation::Write, uint64_t{block} * BlockSize,
+        return volume.transfer(io_operation::Write, uint64_t{block} * BlockSize,
             volume.erased_, BlockSize);
     }
     [[nodiscard]] static auto sync(const lfs_config* config) noexcept -> int {
@@ -174,7 +172,7 @@ private:
         return LFS_ERR_IO;
     }
 
-    block::client* backend_{};
+    blk_client* backend_{};
     lfs_config config_{};
     lfs_t fs_{};
     uint8_t read_cache_[BlockSize]{};
@@ -185,7 +183,5 @@ private:
     bool mounted_{};
     bool failed_{};
 public:
-    Volume() noexcept { for (auto& byte : erased_) byte = 0xff; }
+    st_vol() noexcept { for (auto& byte : erased_) byte = 0xff; }
 };
-
-} // namespace store

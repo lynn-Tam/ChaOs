@@ -25,6 +25,7 @@
 #include <task/env.hpp>
 #include <task/thread.hpp>
 #include <uapi/start.h>
+#include <array>
 
 // The kernel loads one execution. Application names and deployment belong to root.
 struct Init {
@@ -64,8 +65,9 @@ static auto read_load(libk::byte_reader& r, std::span<const uint8_t> payload) no
 }
 
 constexpr usize root_stack_pages = 8;
-constexpr mm::va_t root_ipc_address{BOOT_ROOT_IPC_ADDRESS};
+constexpr mm::va_t root_ipc_address{0x40000000};
 constexpr usize root_stack_size = root_stack_pages * mm::page_size;
+constexpr usize root_initial_bytes = 224;
 constexpr mm::va_t root_info_address{mm::UserEnd - 2 * mm::page_size};
 constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - root_stack_size};
 
@@ -246,7 +248,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     const CpuId cpu = runtime.id;
     auto vspace = create.template operator()<mm::VSpace>(charge_pages(64), pmm, boot.vm, boot.work);
     auto cspace = create.template operator()<cap::CSpace>(
-        charge_pages(17, (mm::page_size - sizeof(BootHdr)) / sizeof(BootCap)), pmm);
+        charge_pages(17, (mm::page_size - sizeof(RootInfo)) / sizeof(RootResource) + 9), pmm);
     if (!vspace || !cspace) return std::unexpected(BootErr::OutOfMemory);
     auto& space = cspace->get();
     {
@@ -326,8 +328,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             std::move(home).value(), std::move(execution).value(),
             Thread::UserStart{
                 .entry = init.entry,
-                .stack = root_stack_address.raw() + root_stack_size,
-                .arguments = {root_info_address.raw(), mm::page_size},
+                .stack = root_stack_address.raw() + root_stack_size - root_initial_bytes,
             });
         if (!pending_thread)
             return std::unexpected(BootErr::OutOfMemory);
@@ -354,51 +355,45 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         if (!info_lease)
             return std::unexpected(BootErr::OutOfMemory);
         auto& info_page = *libk::construct_at(
-            reinterpret_cast<BootHdr*>(boot.pmm.bytes(info_lease.value().page())));
-        info_page.magic = BOOT_MAGIC;
-        info_page.major = BOOT_MAJOR;
-        info_page.minor = BOOT_MINOR;
-        info_page.size = sizeof(BootHdr);
-        info_page.cpu_count = boot.cpus.count();
-        info_page.stack_base = root_stack_address.raw();
-        info_page.stack_size = root_stack_size;
-        info_page.boot_bundle_size = init.payload;
-        auto* entries = reinterpret_cast<BootCap*>(&info_page + 1);
-        auto publish = [&](BootCap entry, auto& object, cap::View view) noexcept -> bool {
-            if (sizeof(info_page) + (info_page.count + 1) * sizeof(BootCap) > mm::page_size)
-                return false;
-            auto installed = [&]() -> std::expected<cap::Handle, BootErr> {
-                if constexpr (requires { object.publish(); }) {
-                    entry.kind = object::kind<std::remove_reference_t<decltype(object.get())>>;
-                    return own(object, view, &space);
-                } else {
-                    entry.kind = object.kind();
-                    auto fee = reserve(cap::Graph::node_charge());
-                    if (!fee) return std::unexpected(fee.error());
-                    return install_cap(boot.grants, space, std::move(*fee), object,
-                                       view.rights, view.data);
-                }
-            }();
+            reinterpret_cast<RootInfo*>(boot.pmm.bytes(info_lease.value().page())));
+        info_page.version = ROOT_VERSION;
+        info_page.bytes = sizeof(RootInfo);
+        info_page.bundle_bytes = init.payload;
+        info_page.resources_offset = sizeof(RootInfo);
+        auto* entries = reinterpret_cast<RootResource*>(&info_page + 1);
+        auto install = [&](auto& object, cap::View view) noexcept -> std::expected<cap::Handle, BootErr> {
+            if constexpr (requires { object.publish(); }) {
+                return own(object, view, &space);
+            } else {
+                auto fee = reserve(cap::Graph::node_charge());
+                if (!fee) return std::unexpected(fee.error());
+                return install_cap(boot.grants, space, std::move(*fee), object, view.rights, view.data);
+            }
+        };
+        auto publish = [&](RootResource entry, auto& object, cap::View view) noexcept -> bool {
+            if (info_page.bytes + sizeof(entry) > mm::page_size) return false;
+            entry.kind = object.kind();
+            const auto installed = install(object, view);
             if (!installed) return false;
             entry.handle = installed->raw();
-            libk::construct_at(entries + info_page.count++, entry);
-            info_page.size += sizeof(BootCap);
+            libk::construct_at(entries + info_page.resources_count++, entry);
+            info_page.bytes += sizeof(entry);
             return true;
         };
-        auto add_cap = [&](u32 role, auto& object, cap::Rights rights,
-                           cap::Limits limit = {}) noexcept {
-            BootCap entry{};
-            entry.role = role;
-            return publish(entry, object, {rights, limit});
+        auto add_cap = [&](cap_t& destination, auto& object, cap::Rights rights,
+                           cap::Limits limit = {}) noexcept -> bool {
+            const auto installed = install(object, {rights, limit});
+            if (!installed) return false;
+            destination = installed->raw();
+            return true;
         };
         const auto rights = [](auto... extra) noexcept {
             return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
                 cap::Right::Inspect, cap::Right::Revoke, extra...);
         };
         auto emit_hw = [&](u32 node, u32 index, HwRes resource) noexcept {
-            BootCap entry{};
-            entry.role = BOOT_RESOURCE;
-            entry.resource = {node, index};
+            RootResource entry{};
+            entry.node = node; entry.index = index;
             return std::visit([&](auto value) noexcept {
                 using T = decltype(value);
                 auto emit = [&](auto pending, cap::View view) noexcept {
@@ -436,15 +431,13 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
                                 mm::Perms::of(mm::Perm::Read)};
         auto fw = boot.objects.get<mm::Mem>().create(pmm, pages->page_count() * mm::page_size,
             mm::PhysCfg{{&extent, 1}, std::move(*pages)});
-        BootCap fw_entry{};
-        fw_entry.role = BOOT_FIRMWARE;
-        fw_entry.firmware.format = handoff.fw_format;
-        fw_entry.phys = handoff.firmware.pa;
-        fw_entry.bytes = handoff.firmware.size;
+        info_page.firmware_format = handoff.fw_format;
+        info_page.firmware_offset = handoff.firmware.pa % mm::page_size;
+        info_page.firmware_bytes = handoff.firmware.size;
         if (!fw) return std::unexpected(BootErr::OutOfMemory);
         auto fw_ref = std::move(*fw).publish();
-        if (!publish(fw_entry, fw_ref,
-            {rights(cap::Right::Map), cap::MemLimit{extent.object, extent.perms}}))
+        if (!add_cap(info_page.firmware, fw_ref, rights(cap::Right::Map),
+                     cap::MemLimit{extent.object, extent.perms}))
             return std::unexpected(BootErr::CapabilityFailed);
 
         const auto basic_rights =
@@ -474,21 +467,40 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             .object_kinds = resource_kinds,
         };
 
-        if (!add_cap(BOOT_VSPACE, *vspace, vspace_rights, vm_limit) ||
-            !add_cap(BOOT_CSPACE, *cspace, cspace_rights) ||
-            !add_cap(BOOT_BUNDLE, *bundle_pending,
+        cap_t vm_cap{}, cs_cap{}, pool_cap{}, event_cap{};
+        auto events = create.template operator()<ipc::Notification>(charge_pages(1));
+        if (!events) return std::unexpected(events.error());
+        const auto event_rights = rights(cap::Right::Signal, cap::Right::Receive);
+        const auto installed_event = install(*events, {event_rights, cap::Badge{1}});
+        if (!installed_event) return std::unexpected(installed_event.error());
+        event_cap = installed_event->raw();
+        if (!add_cap(vm_cap, *vspace, vspace_rights, vm_limit) ||
+            !add_cap(cs_cap, *cspace, cspace_rights) ||
+            !add_cap(info_page.bundle, *bundle_pending,
                      cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Map,
-                                     cap::Right::Inspect, cap::Right::Revoke),
-                     bundle_limit) ||
-            !add_cap(BOOT_THREAD, *thread, basic_rights) ||
-            !add_cap(BOOT_POOL, pool, pool_rights, pool_limit)) {
+                                     cap::Right::Inspect, cap::Right::Revoke), bundle_limit) ||
+            !add_cap(info_page.thread, *thread, basic_rights) ||
+            !add_cap(pool_cap, pool, pool_rights, pool_limit) ||
+            !add_cap(info_page.sc, *sc, basic_rights) ||
+            !add_cap(info_page.domain, boot.domain, basic_rights))
             return std::unexpected(BootErr::CapabilityFailed);
-        }
+        const auto sp = root_stack_address.raw() + root_stack_size - root_initial_bytes;
+        alignas(16) std::array<uint8_t, root_initial_bytes> initial{};
+        auto* words = reinterpret_cast<word_t*>(initial.data());
+        words[0] = 1;
+        words[1] = sp + root_initial_bytes - 16;
+        const std::array<AuxEntry, 11> aux{{
+            {AT_PAGESZ, mm::page_size}, {AT_ENTRY, init.entry}, {AT_SYS_POOL, pool_cap},
+            {AT_SYS_VSPACE, vm_cap}, {AT_SYS_CSPACE, cs_cap}, {AT_SYS_EVENTS, event_cap},
+            {AT_SYS_CPUS, boot.cpus.count()}, {AT_SYS_IPC, root_ipc_address.raw()},
+            {AT_SYS_BOOT, root_info_address.raw()}, {AT_SYS_BOOT_SIZE, info_page.bytes}, {AT_NULL, 0}}};
+        ::memcpy(initial.data() + 4 * sizeof(word_t), aux.data(), sizeof(aux));
+        ::memcpy(initial.data() + root_initial_bytes - 16, "init", 5);
+        auto stack_page = stack->materialize(root_stack_pages - 1);
+        if (!stack_page) return std::unexpected(BootErr::OutOfMemory);
+        ::memcpy(boot.pmm.bytes(stack_page->page()) + mm::page_size - root_initial_bytes,
+                     initial.data(), initial.size());
 
-        if (!add_cap(BOOT_SC, *sc, basic_rights) ||
-            !add_cap(BOOT_DOMAIN, boot.domain, basic_rights)) {
-            return std::unexpected(BootErr::CapabilityFailed);
-        }
     }
 
     if (!runtime.dispatcher().make_ready(root_sc))

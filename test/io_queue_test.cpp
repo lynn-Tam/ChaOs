@@ -1,71 +1,70 @@
-#include <sys/queue.hpp>
+#include <io.hpp>
 
 #include <cstdio>
 
 namespace {
-using namespace io;
 using Result = libk::ring_status;
 
 struct Session final {
-    ClientPage client_page{};
-    ServerPage server_page{};
-    ClientQueue client{client_page, server_page};
-    ServerQueue server{client_page, server_page};
+    io_tx_page client_page{};
+    io_rx_page server_page{};
+    io_tx client{client_page, server_page};
+    io_rx server{client_page, server_page};
 };
 
 auto completion_credits() -> bool {
     Session session{};
-    Ticket tickets[QueueDepth]{};
-    for (size_t i = 0; i < QueueDepth; ++i) {
-        Request request{.operation = static_cast<uint64_t>(Operation::Read),
+    io_ticket tickets[io_queue_depth]{};
+    for (size_t i = 0; i < io_queue_depth; ++i) {
+        io_cmd request{.operation = static_cast<uint64_t>(io_operation::Read),
                         .offset = i * 512, .length = 512};
         if (session.client.submit(request) != Result::ready || request.id != i + 1)
             return false;
     }
     if (!session.client.publish()) return false;
-    for (size_t i = 0; i < QueueDepth; ++i) {
-        if (session.server.admit(tickets[i]) != Admission::Ready) return false;
+    for (size_t i = 0; i < io_queue_depth; ++i) {
+        if (session.server.admit(tickets[i]) != io_admission::Ready) return false;
     }
     if (!session.server.release()) return false;
-    Request extra{.operation = static_cast<uint64_t>(Operation::Read), .length = 512};
+    io_cmd extra{.operation = static_cast<uint64_t>(io_operation::Read), .length = 512};
     if (session.client.submit(extra) != Result::ready || !session.client.publish()) return false;
-    Ticket next{};
-    if (session.server.admit(next) != Admission::Backpressure) return false;
+    io_ticket next{};
+    if (session.server.admit(next) != io_admission::Backpressure) return false;
 
     // Complete in reverse order. Every operation already owns its CQ credit;
     // an unread full CQ must retain backpressure even when no backend is busy.
-    for (size_t i = QueueDepth; i != 0; --i) {
+    for (size_t i = io_queue_depth; i != 0; --i) {
         if (!session.server.finish(tickets[i - 1], STATUS_OK, 512)) return false;
     }
     if (session.server.active() != 0 || !session.server.publish()
-        || session.server.admit(next) != Admission::Backpressure) return false;
-    Completion completion{};
-    if (session.client.take(completion) != Result::ready || completion.id != QueueDepth
-        || session.server.admit(next) != Admission::Backpressure) return false;
-    if (!session.client.release() || session.server.admit(next) != Admission::Ready
-        || next.id != QueueDepth + 1) return false;
+        || session.server.admit(next) != io_admission::Backpressure) return false;
+    io_done completion{};
+    if (session.client.take(completion) != Result::ready || completion.id != io_queue_depth
+        || session.server.admit(next) != io_admission::Backpressure) return false;
+    if (!session.client.release() || session.server.admit(next) != io_admission::Ready
+        || next.id != io_queue_depth + 1) return false;
     if (session.server.finish(tickets[0], 0, 512)) return false;
     if (!session.server.finish(next, 0, 512) || !session.server.publish()) return false;
-    for (size_t i = QueueDepth - 1; i != 0; --i) {
+    for (size_t i = io_queue_depth - 1; i != 0; --i) {
         if (session.client.take(completion) != Result::ready || completion.id != i
             || completion.bytes != 512 || completion.status != 0) return false;
     }
     return session.client.take(completion) == Result::ready
-        && completion.id == QueueDepth + 1
+        && completion.id == io_queue_depth + 1
         && session.client.take(completion) == Result::empty;
 }
 
 auto cancellation_and_close() -> bool {
     Session session{};
-    Request request{.operation = static_cast<uint64_t>(Operation::Read), .length = 4096};
+    io_cmd request{.operation = static_cast<uint64_t>(io_operation::Read), .length = 4096};
     if (session.client.submit(request) != Result::ready || !session.client.publish()) return false;
-    Ticket ticket{}, cancelled{};
-    if (session.server.admit(ticket) != Admission::Ready
+    io_ticket ticket{}, cancelled{};
+    if (session.server.admit(ticket) != io_admission::Ready
         || session.server.cancel(request.id, cancelled) != STATUS_OK
         || cancelled.id != ticket.id || cancelled.slot != ticket.slot
         || !session.server.cancelled(ticket) || session.server.commit(ticket)) return false;
     // Receipt of cancellation has not ended the borrow or produced a result.
-    Completion completion{};
+    io_done completion{};
     if (session.server.active() != 1 || session.server.request(ticket) == nullptr
         || session.client.take(completion) != Result::empty) return false;
     if (!session.server.finish(ticket, STATUS_CANCELED, 0)
@@ -77,14 +76,14 @@ auto cancellation_and_close() -> bool {
         return false;
     if (!session.client.release() || !session.server.release()) return false;
     if (session.client.submit(request) != Result::ready || !session.client.publish()
-        || session.server.admit(cancelled) != Admission::Ready) return false;
+        || session.server.admit(cancelled) != io_admission::Ready) return false;
     if (session.server.request(ticket) != nullptr || session.server.abandon(cancelled)
         || !session.server.commit(cancelled)
         || session.server.cancel(request.id, ticket) != STATUS_BUSY
         || session.server.cancelled(cancelled)) return false;
     session.server.stop();
-    Ticket ignored{};
-    return session.server.admit(ignored) == Admission::Closed
+    io_ticket ignored{};
+    return session.server.admit(ignored) == io_admission::Closed
         && !session.server.abandon(ticket)
         && session.server.abandon(cancelled)
         && !session.server.abandon(cancelled) && session.server.active() == 0;
@@ -92,11 +91,11 @@ auto cancellation_and_close() -> bool {
 
 auto hostile_session() -> bool {
     Session session{};
-    Submissions::producer peer{session.client_page.submissions, session.server_page.submissions};
-    Request request{.id = 7, .operation = 1, .offset = 512, .length = 512};
+    io_submissions::producer peer{session.client_page.submissions, session.server_page.submissions};
+    io_cmd request{.id = 7, .operation = 1, .offset = 512, .length = 512};
     if (peer.push(request.encode()) != Result::ready || !peer.publish()) return false;
-    Ticket ticket{};
-    if (session.server.admit(ticket) != Admission::Ready) return false;
+    io_ticket ticket{};
+    if (session.server.admit(ticket) != io_admission::Ready) return false;
     // Mutating shared words after admission cannot change the retained request.
     session.client_page.submissions.entries[0][3].store(UINT64_MAX, std::memory_order_relaxed);
     const auto* retained = session.server.request(ticket);
@@ -104,28 +103,28 @@ auto hostile_session() -> bool {
     if (!session.server.release() || !session.server.finish(ticket, 0, 512)
         || !session.server.publish()) return false;
     if (peer.push(request.encode()) != Result::ready || !peer.publish()) return false;
-    Ticket duplicate{};
-    return session.server.admit(duplicate) == Admission::InvalidPeer
-        && session.server.admit(duplicate) == Admission::Closed;
+    io_ticket duplicate{};
+    return session.server.admit(duplicate) == io_admission::InvalidPeer
+        && session.server.admit(duplicate) == io_admission::Closed;
 }
 
 auto buffered_requests() -> bool {
     Session session{};
-    std::array<uint8_t, PayloadSize> payload{};
-    requests transfers{session.client, payload.data(), payload.data()};
+    std::array<uint8_t, io_payload_size> payload{};
+    io_requests transfers{session.client, payload.data(), payload.data()};
     uint8_t data[8]{}, value = 'W';
-    Request write{.operation = static_cast<uint64_t>(Operation::Write), .length = 1};
-    Request read{.operation = static_cast<uint64_t>(Operation::Read), .length = sizeof(data)};
+    io_cmd write{.operation = static_cast<uint64_t>(io_operation::Write), .length = 1};
+    io_cmd read{.operation = static_cast<uint64_t>(io_operation::Read), .length = sizeof(data)};
     if (transfers.submit(write, &value, true) || transfers.submit(read, data)
         || write.buffer_offset == read.buffer_offset || payload[write.buffer_offset] != value
         || !session.client.publish()) return false;
-    Ticket a{}, b{};
-    if (session.server.admit(a) != Admission::Ready || session.server.admit(b) != Admission::Ready)
+    io_ticket a{}, b{};
+    if (session.server.admit(a) != io_admission::Ready || session.server.admit(b) != io_admission::Ready)
         return false;
     payload[read.buffer_offset] = 'R';
     if (!session.server.finish(b, 0, 1) || !session.server.finish(a, 0, 1)
         || !session.server.publish()) return false;
-    Completion result{};
+    io_done result{};
     if (transfers.take(result, write.id) || result.id != write.id || result.bytes != 1
         || transfers.contains(write.id) || !transfers.contains(read.id)
         || transfers.take(result) || result.id != read.id || result.bytes != 1

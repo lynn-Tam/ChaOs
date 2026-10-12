@@ -108,6 +108,7 @@ public:
         }
         return {};
     }
+    auto root() const noexcept -> std::optional<pkg_mod> { return module(root_); }
     auto root_is(std::string_view name) const noexcept -> bool {
         const auto m = module(root_);
         return m && m->name == name;

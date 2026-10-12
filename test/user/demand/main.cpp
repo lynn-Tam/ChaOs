@@ -1,23 +1,24 @@
 #include <string_view>
-#include <sys/protocol.hpp>
-#include <sys/channel.hpp>
+#include <vector>
+#include <memory>
+#include <proto.hpp>
+#include <ch.hpp>
 #include <libk/parse.hpp>
-#include <sys/clock.hpp>
-#include <sys/handle.hpp>
+#include <util.hpp>
+#include <cap.hpp>
 
-namespace {
 volatile uint8_t initialized[8197]{0x39, 0x82};
 volatile uint8_t zeroed[16397];
-void check(bool value) { if (!value) sys::exit(STATUS_INTERNAL); }
+static void check(bool value) {
+    if (!value)
+        sys::exit(STATUS_INTERNAL);
 }
 
-extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
-    using namespace sys;
-    const auto info = sys::bootstrap(address, size);
-    boot::args args;
-    if (!args.decode(arg_data, arg_size)) exit(STATUS_BAD_ARGS);
-    check((args.count() == 1 || args.count() == 3)
-        && (std::string_view{args.argument(0)} == "demand"));
+int main(int argc, char** argv) {
+
+    const auto& info = rt_startup();
+    check((static_cast<size_t>(argc) == 1 || static_cast<size_t>(argc) == 3) &&
+          (std::string_view{argv[0]} == "demand"));
     for (size_t i = 0; i < sizeof(initialized); ++i) {
         check(initialized[i] == (i == 0 ? 0x39 : i == 1 ? 0x82 : 0));
         initialized[i] = i % 251;
@@ -26,36 +27,58 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
         check(zeroed[i] == 0);
         zeroed[i] = (i + 7) % 251;
     }
-    const auto pool = sys::capability(info, BOOT_POOL);
-    const auto vspace = sys::capability(info, BOOT_VSPACE);
-    auto stress = mapping::create(pool, vspace, 0x28000000, 4096);
-    auto release = mapping::create(pool, vspace, 0x28003000, 4096);
+    const auto pool = info.pool;
+    const auto vspace = info.vspace;
+    auto stress = vm_area::create(pool, vspace, 0x28000000, 4096);
+    auto release = vm_area::create(pool, vspace, 0x28003000, 4096);
     check(stress && release);
     check(*reinterpret_cast<const volatile uint8_t*>(stress.value().address) == 0);
-    for (size_t i = 0; i < sizeof(initialized); ++i) check(initialized[i] == i % 251);
-    for (size_t i = 0; i < sizeof(zeroed); ++i) check(zeroed[i] == (i + 7) % 251);
+    for (size_t i = 0; i < sizeof(initialized); ++i)
+        check(initialized[i] == i % 251);
+    for (size_t i = 0; i < sizeof(zeroed); ++i)
+        check(zeroed[i] == (i + 7) % 251);
     check(*reinterpret_cast<const volatile uint8_t*>(release.value().address) == 0);
-    sys::require(stress.value().close());
-    sys::require(release.value().close());
-    auto reused = mapping::create(pool, vspace, 0x28003000, 4096);
+    if (const auto rc = stress.value().close(); rc != STATUS_OK)
+        sys::exit(rc);
+    if (const auto rc = release.value().close(); rc != STATUS_OK)
+        sys::exit(rc);
+    auto reused = vm_area::create(pool, vspace, 0x28003000, 4096);
     check(reused && *reinterpret_cast<const volatile uint8_t*>(reused.value().address) == 0);
-    sys::require(reused.value().close());
-    stream::Writer{sys::capability(info, boot::Stdout)}
-        .write("[demand] initialized data, BSS, private writes and VM reuse ok\n");
-    if (args.count() == 3) {
-        const auto duration = libk::parse<uint64_t>(args.argument(1));
-        const auto seed = libk::parse<uint64_t>(args.argument(2));
+    if (const auto rc = reused.value().close(); rc != STATUS_OK)
+        sys::exit(rc);
+    // Grow across backing chunks, free fragmented allocations, and reuse quota.
+    // This runs in an ordinary app Group with the production runtime.
+    for (size_t pass = 0; pass < 12; ++pass) {
+        auto first = std::make_unique<uint8_t[]>(73);
+        struct alignas(4096) Page {
+            uint8_t bytes[4096];
+        };
+        auto page = std::make_unique<Page>();
+        check(reinterpret_cast<uintptr_t>(page.get()) % alignof(Page) == 0);
+        std::vector<uint64_t> values;
+        for (size_t i = 0; i < 40'000; ++i)
+            values.push_back(i + pass);
+        first.reset();
+        for (size_t i = 0; i < values.size(); ++i)
+            check(values[i] == i + pass);
+    }
+    str_writer{info.selector(rt_stdout)}.write(
+        "[demand] initialized data, BSS, private writes and VM reuse ok\n");
+    if (static_cast<size_t>(argc) == 3) {
+        const auto duration = libk::parse<uint64_t>(argv[1]);
+        const auto seed = libk::parse<uint64_t>(argv[2]);
         check(duration && seed && *seed > 0 && *seed < 256);
         initialized[0] = *seed;
         zeroed[0] = *seed + 7;
-        Clock clock;
-        sys::require(clock.open());
+        rt_clock clock;
+        if (const auto rc = clock.open(); rc != STATUS_OK)
+            sys::exit(rc);
         const auto deadline = clock.after_ms(*duration);
         check(static_cast<bool>(deadline));
-        stream::Writer{sys::capability(info, boot::Stdout)}.write("[demand] holding private pages\n");
-        check(notification_wait(sys::capability(info, BOOT_EVENTS),
-            *deadline).status == STATUS_TIMED_OUT);
+        str_writer{info.selector(rt_stdout)}.write("[demand] holding private pages\n");
+        check(sys::notification_wait(info.events, *deadline).status ==
+              STATUS_TIMED_OUT);
         check(initialized[0] == *seed && zeroed[0] == static_cast<uint8_t>(*seed + 7));
     }
-    exit();
+    sys::exit();
 }
