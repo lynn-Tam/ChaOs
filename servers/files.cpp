@@ -5,7 +5,7 @@
 #include <sys/channel.hpp>
 #include <sys/queue.hpp>
 #include <sys/start.hpp>
-#include <servers/files/fat32.hpp>
+#include <servers/fat32.hpp>
 #include <sys/protocol.hpp>
 
 // A mount owns one backing per immutable file, shared by all issued views.
@@ -67,7 +67,7 @@ public:
     }
 
     auto export_view(cap_t cspace, cap_t descriptor, word_t access,
-                     io::ControlReply& reply) noexcept
+                     sys::Reply& reply) noexcept
         -> status_t {
         const word_t rights = RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE;
         const CapView view{
@@ -111,7 +111,7 @@ namespace {
 using namespace sys;
 constexpr size_t Clients = 8;
 constexpr size_t Opens = 8;
-io::ControlPort directory;
+sys::Port directory;
 io::ClientSession backend;
 fat32::Volume volume;
 mapping metadata;
@@ -143,7 +143,7 @@ struct Open final {
     bool live{}, busy{}, prepared{};
 
     [[nodiscard]] auto create(size_t index, size_t slot,
-        io::ControlReply& reply) noexcept -> status_t {
+        sys::Reply& reply) noexcept -> status_t {
         if (generation == UINT64_MAX) return STATUS_NO_MEMORY;
         const auto pair = channel_create(files_pool, 1, CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != STATUS_OK) return pair.status;
@@ -167,12 +167,16 @@ struct Open final {
         if (status == STATUS_OK) status = session.bind(channel.selector(), events, generation + 1);
         if (status != STATUS_OK) {
             (void)object_destroy(endpoint.selector());
+            session.abort();
+            if (session.done()) session.reset();
             channel = {};
             return status;
         }
         if (!reply.offer(std::move(endpoint), common | RIGHT_DESTROY
             | RIGHT_DUPLICATE)) {
             (void)object_destroy(endpoint.selector());
+            session.abort();
+            if (session.done()) session.reset();
             channel = {};
             return STATUS_INTERNAL;
         }
@@ -200,7 +204,7 @@ struct Client final {
         return handle.live && handle.generation == value / fs::HandleCount
             ? handle.file : volume.count();
     }
-    void control(const io::ControlMessage& request, io::ControlReply& response) noexcept {
+    void control(const sys::Message& request, sys::Reply& response) noexcept {
         auto& reply = response.message;
         const auto operation = static_cast<fs::Control>(request.operation);
         if (operation == fs::Control::List) {
@@ -372,15 +376,15 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     for (;;) {
         bool again{};
         for (size_t count = 0; count < Clients; ++count) {
-            io::ControlPacket packet;
+            sys::Packet packet;
             const auto status = directory.receive(packet);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
             if (status != STATUS_OK || packet.count != 2) continue;
             cap_owner endpoint = std::move(packet.capabilities[0]);
             if (packet.badge != fs::ReadDirectory && packet.badge != fs::ExecuteDirectory) {
-                const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
+                const sys::Message reply{.operation = packet.message.operation, .id = packet.message.id,
                     .status = STATUS_DENIED};
-                (void)io::ControlPort::send_to(endpoint.selector(), reply);
+                (void)sys::Port::send_to(endpoint.selector(), reply);
                 (void)channel_close(endpoint.selector());
                 continue;
             }
@@ -389,9 +393,9 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
             if (available == nullptr) {
-                const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
+                const sys::Message reply{.operation = packet.message.operation, .id = packet.message.id,
                     .status = STATUS_NO_MEMORY};
-                (void)io::ControlPort::send_to(endpoint.selector(), reply);
+                (void)sys::Port::send_to(endpoint.selector(), reply);
                 (void)channel_close(endpoint.selector());
                 continue;
             }
@@ -400,19 +404,19 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             client.channel = std::move(endpoint);
             const auto bound = client.session.bind(client.channel.selector(), events);
             const auto accepted = bound == STATUS_OK
-                ? client.session.accept(packet, [&](const io::ControlMessage& request, io::ControlReply& reply) {
+                ? client.session.accept(packet, [&](const sys::Message& request, sys::Reply& reply) {
                     client.control(request, reply);
                 }) : bound;
             if (accepted != STATUS_OK) client.session.abort();
         }
         for (auto& client : clients) if (client.channel) {
-            const auto status = client.session.poll([&](const io::ControlMessage& request, io::ControlReply& reply) {
+            const auto status = client.session.poll([&](const sys::Message& request, sys::Reply& reply) {
                 client.control(request, reply);
             });
             if (status != STATUS_OK) { client.session.abort(); again = true; }
         }
         for (auto& open : opens) if (open.live)
-            if (open.session.poll([&](const io::ControlMessage& request, io::ControlReply& reply) {
+            if (open.session.poll([&](const sys::Message& request, sys::Reply& reply) {
                 if (request.operation == static_cast<uint64_t>(io::Control::Stat)
                     && request.size == 0 && request.value == 0) {
                     reply.message.value = volume.file(open.file).size;
@@ -529,8 +533,8 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             if (status != STATUS_OK) { client.session.abort(); again = true; }
             if (client.session.done()) {
                 (void)channel_close(client.channel.selector());
-                client.channel = {};
                 client.session.reset();
+                client.channel = {};
                 for (auto& handle : client.handles) handle.live = false;
             } else {
                 const auto armed = client.session.arm();
@@ -541,8 +545,8 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             if (open.session.flush(true) != STATUS_OK) { open.session.abort(); again = true; }
             if (open.session.done()) {
                 (void)channel_close(open.channel.selector());
-                open.channel = {};
                 open.session.reset();
+                open.channel = {};
                 open.live = false;
             } else if (open.session.arm() != STATUS_OK) {
                 open.session.abort(); again = true;
@@ -550,7 +554,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             if (!open.busy)
                 for (const auto& pending : open.pending) if (pending.waiting) again = true;
         }
-        sys::require(directory.arm());
+        sys::require(directory.arm().status);
         sys::require(backend.arm());
         if (!again) sys::require(notification_wait(events).status);
     }

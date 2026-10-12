@@ -3,7 +3,7 @@
 #include <libk/fmt.hpp>
 #include <algorithm>
 #include <string_view>
-#include <programs/edit/screen.hpp>
+#include <programs/edit.hpp>
 
 namespace {
 struct file {

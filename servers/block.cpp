@@ -4,13 +4,13 @@
 #include <sys/channel.hpp>
 #include <sys/queue.hpp>
 #include <sys/start.hpp>
-#include <servers/block/device.hpp>
+#include <servers/virtio_blk.hpp>
 
 namespace {
 using namespace sys;
 block::Device device;
 constexpr size_t Clients = 4;
-io::ControlPort directory;
+sys::Port directory;
 struct Client final {
     cap_owner channel;
     io::ServerSession session;
@@ -21,7 +21,7 @@ Client clients[Clients];
 struct Pending final { Client* client{}; io::Ticket ticket{}; uint64_t generation{}; };
 Pending pending[io::QueueDepth];
 struct Flush final { Client* client{}; io::Ticket ticket{}; bool submitted{}; } flush;
-void control(const io::ControlMessage&, io::ControlReply& reply) noexcept {
+void control(const sys::Message&, sys::Reply& reply) noexcept {
     reply.message.status = STATUS_INVALID_OP;
 }
 
@@ -62,7 +62,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
         bool again{};
         sys::require(device.acknowledge());
         for (size_t count = 0; count < Clients; ++count) {
-            io::ControlPacket packet;
+            sys::Packet packet;
             const auto status = directory.receive(packet);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
             if (status != STATUS_OK || packet.count != 2) continue;
@@ -72,9 +72,9 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             Client* available{};
             for (auto& client : clients) if (!client.channel) { available = &client; break; }
             if (!available) {
-                const io::ControlMessage reply{.operation = packet.message.operation, .id = packet.message.id,
+                const sys::Message reply{.operation = packet.message.operation, .id = packet.message.id,
                     .status = STATUS_NO_MEMORY};
-                (void)io::ControlPort::send_to(endpoint.selector(), reply);
+                (void)sys::Port::send_to(endpoint.selector(), reply);
                 (void)channel_close(endpoint.selector());
                 continue;
             }
@@ -198,11 +198,11 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             if (client.session.flush(true) != STATUS_OK) { client.session.abort(); again = true; }
             if (client.session.done()) {
                 (void)channel_close(client.channel.selector());
-                client.channel = {};
                 client.session.reset();
+                client.channel = {};
             } else if (client.session.arm() != STATUS_OK) { client.session.abort(); again = true; }
         }
-        sys::require(directory.arm());
+        sys::require(directory.arm().status);
         if (!again) sys::require(notification_wait(events).status);
     }
 }

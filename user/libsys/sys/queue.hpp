@@ -16,7 +16,6 @@
 
 namespace io {
 
-inline constexpr uint64_t QueueVersion = 1;
 inline constexpr size_t QueueDepth = 32;
 inline constexpr size_t BufferSize = 4096;
 inline constexpr size_t PayloadSize = QueueDepth * BufferSize;
@@ -333,107 +332,6 @@ private:
 
 
 
-// Each endpoint has one control reader and one outstanding control exchange.
-// Data submission never uses this Channel's blocking-operation slot.
-struct ControlMessage final {
-    uint64_t version{QueueVersion};
-    uint64_t operation{};
-    uint64_t id{};
-    int64_t status{};
-    uint64_t value{};
-    uint64_t size{};
-    char data[80]{};
-};
-static_assert(sizeof(ControlMessage) == CHANNEL_MAX_WORDS * sizeof(word_t));
-
-struct ControlPacket final {
-    ControlMessage message{};
-    sys::cap_owner capabilities[4]{};
-    size_t count{};
-    word_t badge{};
-};
-
-// A pending reply owns transferred capabilities until the Channel accepts
-// the message. Reply backpressure cannot outlive an export's local owner.
-struct ControlReply final {
-    ControlMessage message{};
-    sys::cap_owner capabilities[4]{};
-    word_t rights[4]{};
-    size_t count{};
-
-    auto offer(sys::cap_owner&& capability, word_t granted) noexcept -> bool {
-        if (!capability || count == 4) return false;
-        rights[count] = granted;
-        capabilities[count++] = std::move(capability);
-        return true;
-    }
-};
-
-class ControlPort final : private libk::noncopyable_nonmovable {
-public:
-    [[nodiscard]] auto open(cap_t channel, cap_t events) noexcept -> status_t {
-        const auto bound = sys::channel_bind(channel, events, CHANNEL_READABLE);
-        if (bound.status != STATUS_OK) return bound.status;
-        channel_ = channel;
-        sequence_ = 0;
-        readable_ = bound.value;
-        return STATUS_OK;
-    }
-
-    [[nodiscard]] auto send(const ControlMessage& message,
-        const CapXfer* capabilities = nullptr, size_t count = 0) noexcept -> status_t {
-        return send_to(channel_, message, capabilities, count);
-    }
-
-    [[nodiscard]] static auto send_to(cap_t channel, const ControlMessage& message,
-        const CapXfer* capabilities = nullptr, size_t count = 0) noexcept -> status_t {
-        if (count > 4) return STATUS_BAD_ARGS;
-        auto& wire = *reinterpret_cast<ChanMsg*>(sys::IpcAddress);
-        wire = {};
-        wire.version = CHANNEL_VERSION;
-        wire.word_count = CHANNEL_MAX_WORDS;
-        wire.cap_count = count;
-        ::memcpy(wire.words, &message, sizeof(message));
-        for (size_t index = 0; index < count; ++index) wire.caps[index] = capabilities[index];
-        return sys::channel_try_send(channel).status;
-    }
-
-    [[nodiscard]] auto receive(ControlPacket& packet) noexcept -> status_t {
-        packet = {};
-        auto& wire = *reinterpret_cast<ChanMsg*>(sys::IpcAddress);
-        wire = {};
-        wire.version = CHANNEL_VERSION;
-        wire.receive_limit = 4;
-        const auto received = sys::channel_try_recv(channel_);
-        if (received.status != STATUS_OK) return received.status;
-        sequence_ = received.value;
-        packet.badge = wire.sender_badge;
-        // Adopt every committed capability even if the message is invalid.
-        // Packet destruction then closes them on all rejection paths.
-        packet.count = wire.received_count;
-        for (size_t index = 0; index < packet.count; ++index)
-            packet.capabilities[index] = sys::cap_owner{wire.received[index]};
-        if (wire.word_count != CHANNEL_MAX_WORDS) return STATUS_BAD_ARGS;
-        ::memcpy(&packet.message, wire.words, sizeof(packet.message));
-        if (packet.message.version != QueueVersion || packet.message.size > sizeof(packet.message.data))
-            return STATUS_BAD_ARGS;
-        return STATUS_OK;
-    }
-
-    // Call only after draining control/data work. A sequence mismatch or
-    // terminal Channel state retains a hint in the caller's Notification.
-    [[nodiscard]] auto arm() noexcept -> status_t {
-        const auto result = sys::channel_arm(channel_, readable_, sequence_);
-        if (result.status == STATUS_OK) sequence_ = result.value;
-        return result.status;
-    }
-
-private:
-    cap_t channel_{};
-    word_t readable_{};
-    uint64_t sequence_{};
-};
-
 // Both participants own the same three mappings; only their granted permissions
 // and request obligations differ. Events belong to sessions, not mapped memory.
 class queue_mem final {
@@ -531,6 +429,7 @@ public:
         const auto status = open(channel_.selector(), events, vspace, address,
             value, writable_payload);
         if (status != STATUS_OK) {
+            sys::require(control_.close());
             (void)sys::object_destroy(channel_.selector());
             channel_ = {};
         }
@@ -544,11 +443,11 @@ public:
         auto status = control_.open(channel, events);
         if (status != STATUS_OK) return status;
         const CapXfer event{events, RIGHT_SIGNAL, CAP_COPY, 0};
-        ControlMessage request{.operation = static_cast<uint64_t>(Control::Open),
+        sys::Message request{.operation = static_cast<uint64_t>(Control::Open),
             .id = ++next_id_, .value = QueueDepth};
-        status = control_.send(request, &event, 1);
+        status = control_.send(request, {&event, 1}, false).status;
         if (status != STATUS_OK) return status;
-        ControlPacket packet;
+        sys::Packet packet;
         status = receive(request, packet);
         if (status != STATUS_OK) return status;
         if (packet.message.status != STATUS_OK) return packet.message.status;
@@ -577,6 +476,7 @@ public:
         if (client_endpoint.status == STATUS_OK) client_fixed = sys::cap_owner{client_endpoint.value};
         if (server_endpoint.status == STATUS_OK) server_fixed = sys::cap_owner{server_endpoint.value};
         if (!client_fixed || !server_fixed) {
+            sys::require(control_.close());
             (void)sys::object_destroy(channel_.selector());
             channel_ = {};
             return !client_fixed ? client_endpoint.status : server_endpoint.status;
@@ -585,17 +485,18 @@ public:
         server = std::move(server_fixed);
         events_ = events;
         auto status = control_.open(channel_.selector(), events);
-        const ControlMessage request{.operation = static_cast<uint64_t>(Control::Open),
+        const sys::Message request{.operation = static_cast<uint64_t>(Control::Open),
             .id = ++next_id_, .value = QueueDepth};
         const CapXfer transfers[]{
             {server.selector(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0},
             {events, RIGHT_SIGNAL, CAP_COPY, 0}};
-        if (status == STATUS_OK) status = ControlPort::send_to(directory, request, transfers, 2);
-        ControlPacket packet;
+        if (status == STATUS_OK) status = sys::Port::send_to(directory, request, transfers, 2);
+        sys::Packet packet;
         if (status == STATUS_OK) status = receive(request, packet);
         if (status == STATUS_OK) status = packet.message.status;
         if (status == STATUS_OK) status = map_pages(vspace, address, packet, writable_payload);
         if (status != STATUS_OK) {
+            sys::require(control_.close());
             (void)sys::object_destroy(channel_.selector());
             channel_ = {};
             const auto closed = memory_.close();
@@ -610,12 +511,13 @@ public:
 
     [[nodiscard]] auto close() noexcept -> status_t {
         if (!queue_ || !channel_) return STATUS_BAD_ARGS;
-        ControlMessage request{.operation = static_cast<uint64_t>(Control::Close)};
+        sys::Message request{.operation = static_cast<uint64_t>(Control::Close)};
         const auto status = requests_->error() ? requests_->error() : exchange(request);
         requests_.reset();
         queue_.reset();
         const auto unmapped = memory_.close();
         if (unmapped != STATUS_OK) sys::exit(unmapped);
+        sys::require(control_.close());
         const auto destroyed = sys::object_destroy(channel_.selector()).status;
         if (destroyed != STATUS_OK) sys::exit(destroyed);
         channel_ = {};
@@ -624,11 +526,11 @@ public:
         return status;
     }
 
-    [[nodiscard]] auto exchange(ControlMessage& message, ControlPacket& packet) noexcept
+    [[nodiscard]] auto exchange(sys::Message& message, sys::Packet& packet) noexcept
         -> status_t {
         if (!queue_ || next_id_ == UINT64_MAX) return STATUS_BAD_ARGS;
         message.id = ++next_id_;
-        auto status = control_.send(message);
+        auto status = control_.send(message, {}, false).status;
         if (status != STATUS_OK) return status;
         status = receive(message, packet);
         if (status != STATUS_OK) return status;
@@ -637,8 +539,8 @@ public:
         return status == STATUS_OK ? message.status : status;
     }
 
-    [[nodiscard]] auto exchange(ControlMessage& message) noexcept -> status_t {
-        ControlPacket packet;
+    [[nodiscard]] auto exchange(sys::Message& message) noexcept -> status_t {
+        sys::Packet packet;
         const auto status = exchange(message, packet);
         return packet.count == 0 ? status : STATUS_PEER_FAULT;
     }
@@ -677,10 +579,10 @@ public:
         const bool consumed = queue_->release();
         return submitted || consumed ? sys::notification_signal(peer_event_.selector()).status : STATUS_OK;
     }
-    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm(); }
+    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
 
 private:
-    auto map_pages(cap_t vm, uintptr_t address, ControlPacket& packet, bool writable) -> status_t {
+    auto map_pages(cap_t vm, uintptr_t address, sys::Packet& packet, bool writable) -> status_t {
         if (packet.count != 4) return STATUS_BAD_ARGS;
         const auto s = memory_.map(vm, address, std::span{packet.capabilities}.first<3>(), writable);
         if (s == STATUS_OK) {
@@ -690,7 +592,7 @@ private:
         return s;
     }
 
-    [[nodiscard]] auto receive(const ControlMessage& request, ControlPacket& packet) noexcept
+    [[nodiscard]] auto receive(const sys::Message& request, sys::Packet& packet) noexcept
         -> status_t {
         for (;;) {
             auto status = control_.receive(packet);
@@ -698,7 +600,7 @@ private:
                 return packet.message.id == request.id && packet.message.operation == request.operation
                     ? STATUS_OK : STATUS_PEER_FAULT;
             if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) return status;
-            status = control_.arm();
+            status = control_.arm().status;
             if (status != STATUS_OK) return status;
             status = sys::notification_wait(events_).status;
             if (status != STATUS_OK) return status;
@@ -706,7 +608,7 @@ private:
     }
 
     sys::cap_owner channel_;
-    ControlPort control_;
+    sys::Port control_;
     queue_mem memory_;
     sys::cap_owner peer_event_;
     bool writable_payload_{};
@@ -850,6 +752,7 @@ public:
     }
     void reset() noexcept {
         if (!done()) sys::exit(STATUS_BUSY);
+        sys::require(control_.close());
         queue_.reset();
         peer_event_ = {};
         closing_ = false;
@@ -858,7 +761,7 @@ public:
     template<class Handler>
     [[nodiscard]] auto poll(Handler&& application) noexcept -> status_t {
         if (reply_) return STATUS_OK;
-        ControlPacket packet;
+        sys::Packet packet;
         const auto status = control_.receive(packet);
         if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) return STATUS_OK;
         if (status != STATUS_OK) return status;
@@ -866,11 +769,11 @@ public:
     }
 
     template<class Handler>
-    [[nodiscard]] auto accept(ControlPacket& packet, Handler&& application) noexcept -> status_t {
+    [[nodiscard]] auto accept(sys::Packet& packet, Handler&& application) noexcept -> status_t {
         if (reply_) return STATUS_BUSY;
         const auto& message = packet.message;
         reply_.emplace();
-        reply_->message = ControlMessage{.operation = message.operation, .id = message.id};
+        reply_->message = sys::Message{.operation = message.operation, .id = message.id};
         if (closing_) reply_->message.status = STATUS_CLOSED;
         else if (message.operation == static_cast<uint64_t>(Control::Open)) {
             if (queue_ || packet.count != 1 || message.value != QueueDepth || message.size != 0)
@@ -910,7 +813,7 @@ public:
     [[nodiscard]] auto payload() noexcept -> uint8_t* { return memory_.payload(); }
     [[nodiscard]] auto closing() const noexcept -> bool { return closing_; }
     [[nodiscard]] auto failed() const noexcept -> bool { return closing_ && !peer_event_; }
-    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm(); }
+    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
 
     [[nodiscard]] auto flush(bool close_ready) noexcept -> status_t {
         if (queue_) {
@@ -937,21 +840,18 @@ public:
             }
         }
         if (!reply_ || (closing_ && (!close_ready || queue_->active() != 0))) return STATUS_OK;
-        CapXfer transfers[4]{};
-        for (size_t index = 0; index < reply_->count; ++index)
-            transfers[index] = {reply_->capabilities[index].selector(), reply_->rights[index], CAP_COPY, 0};
-        const auto status = control_.send(reply_->message, transfers, reply_->count);
+        const auto status = control_.send(*reply_);
         if (status == STATUS_OK) reply_.reset();
         return status == STATUS_WOULD_BLOCK || status == STATUS_BUSY ? STATUS_OK : status;
     }
 
 private:
-    ControlPort control_;
+    sys::Port control_;
     queue_mem memory_;
     std::optional<ServerQueue> queue_;
     sys::cap_owner peer_event_;
     sys::cap_owner exports_[3];
-    std::optional<ControlReply> reply_;
+    std::optional<sys::Reply> reply_;
     cap_t events_{}, cspace_{};
     uint64_t value_{};
     bool closing_{};

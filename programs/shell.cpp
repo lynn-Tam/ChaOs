@@ -151,8 +151,8 @@ auto arguments(char* text, boot::args& output, std::array<size_t, 5>& cuts, size
     }
 }
 
-void command(char* line, sys::Connection& process, stream::Writer& console,
-    cap_t control, cap_t pool, cap_t cspace, cap_t input, cap_t output) {
+void command(char* line, sys::Port& process, stream::Writer& console,
+    cap_t control, cap_t pool, cap_t cspace, cap_t input, cap_t output, cap_t events) {
     while (*line == ' ') ++line;
     char name[128]{};
     char* argument = line;
@@ -177,30 +177,12 @@ void command(char* line, sys::Connection& process, stream::Writer& console,
             return;
         }
         ::memcpy(request.data, argument, request.size);
-        const auto pair = channel_create(pool, 1, CHANNEL_MAX_WORDS, 0, 1);
-        if (pair.status != STATUS_OK) {
-            error(console, pair.status);
-            return;
-        }
-        cap_owner inbox_root{pair.value}, outbox_root{pair.value2};
-        const auto reader = channel_mint(inbox_root.selector(), cspace, 1, RIGHT_RECEIVE);
-        const auto sender = channel_mint(outbox_root.selector(), cspace, 1,
-            RIGHT_SEND | RIGHT_DUPLICATE);
-        cap_owner inbox, outbox;
-        if (reader.status == STATUS_OK) inbox = cap_owner{reader.value};
-        if (sender.status == STATUS_OK) outbox = cap_owner{sender.value};
-        auto status = reader.status != STATUS_OK ? reader.status : sender.status;
+        sys::Rpc rpc;
+        auto status = rpc.open(control, pool, cspace, events);
         if (status == STATUS_OK) {
-            status = sys::send_cap(control, request, outbox.selector(), RIGHT_SEND).status;
-            if (status == STATUS_OK) {
-                console.write("service restart requested\n");
-                sys::Message reply{};
-                status = sys::receive(inbox.selector(), reply).status;
-                if (status == STATUS_OK) status = reply.status;
-            }
+            console.write("service restart requested\n");
+            status = rpc.exchange(request);
         }
-        const auto destroyed = object_destroy(inbox_root.selector()).status;
-        if (destroyed != STATUS_OK) status = destroyed;
         if (status != STATUS_OK && status != STATUS_BUSY) error(console, status);
         return;
     }
@@ -350,7 +332,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
     const auto output = sys::capability(info, boot::ConsoleOutput);
     stream::Writer console{output};
     const auto input = sys::capability(info, boot::ConsoleInput);
-    sys::Connection process{
+    sys::Port process{
         sys::capability(info, boot::Process),
         sys::capability(info, BOOT_EVENTS)};
     storage_available = args.count() == 1 && (std::string_view{args.argument(0)} == "storage");
@@ -365,7 +347,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
             command(line, process, console,
                 sys::capability(info, boot::ServiceControl),
                 sys::capability(info, BOOT_POOL),
-                sys::capability(info, BOOT_CSPACE), input, output);
+                sys::capability(info, BOOT_CSPACE), input, output, info.selector(BOOT_EVENTS));
         prompt(output, "myos> ");
     }
 }

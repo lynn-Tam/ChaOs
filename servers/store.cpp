@@ -3,16 +3,15 @@
 #include <utility>
 #include <sys/channel.hpp>
 #include <sys/queue.hpp>
-#include <servers/store/volume.hpp>
+#include <servers/volume.hpp>
 #include <sys/start.hpp>
 #include <sys/protocol.hpp>
 #include <expected>
 
 namespace {
 using namespace sys;
-constexpr size_t Clients = 4;
 constexpr size_t Opens = 8;
-io::ControlPort directory;
+sys::Port directory;
 block::client backend;
 store::Volume volume;
 cap_t events;
@@ -154,8 +153,8 @@ struct Open final {
     bool prepared{};
     bool readable{}, writable{}, append{};
 
-    [[nodiscard]] auto create(const io::ControlMessage& request, const char* path,
-        size_t slot, io::ControlReply& reply) noexcept -> status_t {
+    [[nodiscard]] auto create(const sys::Message& request, const char* path,
+        size_t slot, sys::Reply& reply) noexcept -> status_t {
         if (generation == UINT64_MAX) return STATUS_NO_MEMORY;
         const auto pair = channel_create(store_pool, 1, CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != STATUS_OK) return pair.status;
@@ -209,9 +208,9 @@ struct Open final {
             reap();
             file = nullptr;
             (void)object_destroy(endpoint.selector());
-            channel = {};
             session.abort();
             if (session.done()) session.reset();
+            channel = {};
             return status;
         }
         if (!reply.offer(std::move(endpoint), common | RIGHT_DESTROY
@@ -219,9 +218,9 @@ struct Open final {
             reap();
             file = nullptr;
             (void)object_destroy(endpoint.selector());
-            channel = {};
             session.abort();
             if (session.done()) session.reset();
+            channel = {};
             return STATUS_INTERNAL;
         }
         live = true;
@@ -236,7 +235,7 @@ struct Open final {
         return STATUS_OK;
     }
 
-    void control(const io::ControlMessage& request, io::ControlReply& reply) noexcept {
+    void control(const sys::Message& request, sys::Reply& reply) noexcept {
         drain_reads();
         if (request.operation == static_cast<uint64_t>(io::Control::Stat)
             && request.size == 0 && request.value == 0) {
@@ -350,183 +349,176 @@ auto start_read(Open& open, io::Ticket ticket, pending& pending) noexcept -> boo
     return true;
 }
 
-struct Client final {
-    cap_owner channel;
-    io::ServerSession session;
-    bool writable{};
-    bool admin{};
+auto path_from(const sys::Message& request,
+    char (&out)[sizeof(sys::Message::data) + 1]) noexcept -> bool {
+    if (request.size == 0 || request.size > sizeof(request.data)) return false;
+    ::memcpy(out, request.data, request.size);
+    out[request.size] = '\0';
+    for (size_t i = 0; i < request.size; ++i)
+        if (out[i] == '\0' && request.operation != static_cast<uint64_t>(store::Control::Rename))
+            return false;
+    return true;
+}
 
-    void control(const io::ControlMessage& request, io::ControlReply& response) noexcept {
-        drain_reads();
-        auto& reply = response.message;
-        const auto operation = static_cast<store::Control>(request.operation);
-        if (operation == store::Control::DeviceId) {
-            if (request.size != 0 || request.value != 0) {
-                reply.status = STATUS_BAD_ARGS; return;
-            }
-            uint8_t id[20]{};
-            reply.status = backend.identify(id);
-            if (reply.status == STATUS_BACKING_FAILED) exit(reply.status);
-            if (reply.status == STATUS_OK) {
-                reply.size = sizeof(id);
-                ::memcpy(reply.data, id, sizeof(id));
-            }
+void control(const sys::Message& request, sys::Reply& response, bool writable, bool admin) noexcept {
+    drain_reads();
+    auto& reply = response.message;
+    const auto operation = static_cast<store::Control>(request.operation);
+    if (operation == store::Control::DeviceId) {
+        if (request.size != 0 || request.value != 0) {
+            reply.status = STATUS_BAD_ARGS; return;
+        }
+        uint8_t id[20]{};
+        reply.status = backend.identify(id);
+        if (reply.status == STATUS_BACKING_FAILED) exit(reply.status);
+        if (reply.status == STATUS_OK) {
+            reply.size = sizeof(id);
+            ::memcpy(reply.data, id, sizeof(id));
+        }
+        return;
+    }
+    if (operation == store::Control::VolumeId) {
+        if (request.size != 0 || request.value != 0) {
+            reply.status = STATUS_BAD_ARGS; return;
+        }
+        uint8_t id[store::VolumeIdSize]{};
+        reply.status = volume.identity(id);
+        if (volume.failed()) exit(volume.error(-1));
+        if (reply.status == STATUS_OK) {
+            reply.size = sizeof(id);
+            ::memcpy(reply.data, id, sizeof(id));
+        }
+        return;
+    }
+    if (operation == store::Control::Format) {
+        if (!admin) { reply.status = STATUS_DENIED; return; }
+        if ((request.size != 0 && request.size != store::VolumeIdSize) || request.value != 0) {
+            reply.status = STATUS_BAD_ARGS; return;
+        }
+        if (require_id && (request.size != store::VolumeIdSize
+            || !expected(reinterpret_cast<const uint8_t*>(request.data)))) {
+            reply.status = STATUS_DENIED; return;
+        }
+        for (const auto& opened : opens)
+            if (opened.live) { reply.status = STATUS_BUSY; return; }
+        for (auto& node : nodes) if (node.open) drop(node);
+        reply.status = volume.format(request.size == 0
+            ? nullptr : reinterpret_cast<const uint8_t*>(request.data));
+        if (volume.failed()) exit(volume.error(-1));
+        return;
+    }
+    if (!volume.mounted()) { reply.status = STATUS_BACKING_FAILED; return; }
+    if (operation == store::Control::Sync) {
+        if (!writable) { reply.status = STATUS_DENIED; return; }
+        if (request.size || request.value) { reply.status = STATUS_BAD_ARGS; return; }
+        for (auto& node : nodes) if (node.open) {
+            reply.status = writeback(node);
+            if (reply.status != STATUS_OK) return;
+        }
+        reply.status = backend.flush();
+        if (reply.status != STATUS_OK) exit(reply.status);
+        reap();
+        return;
+    }
+    if (operation == store::Control::Open) {
+        char path[sizeof(request.data) + 1]{};
+        if (!path_from(request, path) || request.value == 0
+            || (request.value & ~(store::Read | store::Write | store::Create
+                | store::Truncate | store::Exclusive | store::Append)) != 0
+            || ((request.value & (store::Create | store::Truncate | store::Exclusive | store::Append)) != 0
+                && (request.value & store::Write) == 0)) {
+            reply.status = STATUS_BAD_ARGS;
             return;
         }
-        if (operation == store::Control::VolumeId) {
-            if (request.size != 0 || request.value != 0) {
-                reply.status = STATUS_BAD_ARGS; return;
+        const bool write = (request.value & store::Write) != 0;
+        if (write && !writable) { reply.status = STATUS_DENIED; return; }
+        size_t slot{};
+        while (slot < Opens && opens[slot].live) ++slot;
+        reply.status = slot == Opens ? STATUS_NO_MEMORY
+            : opens[slot].create(request, path, slot, response);
+    } else if (operation == store::Control::List) {
+        char path[sizeof(request.data) + 1]{};
+        if (request.value > UINT32_MAX) { reply.status = STATUS_BAD_ARGS; return; }
+        if (request.size == 0) path[0] = '/';
+        else if (!path_from(request, path)) { reply.status = STATUS_BAD_ARGS; return; }
+        lfs_dir_t cursor{};
+        int result = lfs_dir_open(volume.fs(), &cursor, path);
+        const bool opened = result == 0;
+        if (result == 0 && request.value != 0)
+            result = lfs_dir_seek(volume.fs(), &cursor, request.value);
+        lfs_info entry{};
+        while (result == 0) {
+            const auto position = lfs_dir_tell(volume.fs(), &cursor);
+            if (position < 0) { result = position; break; }
+            result = lfs_dir_read(volume.fs(), &cursor, &entry);
+            if (result <= 0) { reply.value = 0; break; }
+            if ((std::string_view{entry.name} == ".") || (std::string_view{entry.name} == "..")) {
+                result = 0; continue;
             }
-            uint8_t id[store::VolumeIdSize]{};
-            reply.status = volume.identity(id);
-            if (volume.failed()) exit(volume.error(-1));
-            if (reply.status == STATUS_OK) {
-                reply.size = sizeof(id);
-                ::memcpy(reply.data, id, sizeof(id));
-            }
-            return;
-        }
-        if (operation == store::Control::Format) {
-            if (!admin) { reply.status = STATUS_DENIED; return; }
-            if ((request.size != 0 && request.size != store::VolumeIdSize) || request.value != 0) {
-                reply.status = STATUS_BAD_ARGS; return;
-            }
-            if (require_id && (request.size != store::VolumeIdSize
-                || !expected(reinterpret_cast<const uint8_t*>(request.data)))) {
-                reply.status = STATUS_DENIED; return;
-            }
-            for (const auto& opened : opens)
-                if (opened.live) { reply.status = STATUS_BUSY; return; }
-            for (auto& node : nodes) if (node.open) drop(node);
-            reply.status = volume.format(request.size == 0
-                ? nullptr : reinterpret_cast<const uint8_t*>(request.data));
-            if (volume.failed()) exit(volume.error(-1));
-            return;
-        }
-        if (!volume.mounted()) { reply.status = STATUS_BACKING_FAILED; return; }
-        if (operation == store::Control::Sync) {
-            if (!writable) { reply.status = STATUS_DENIED; return; }
-            if (request.size || request.value) { reply.status = STATUS_BAD_ARGS; return; }
-            for (auto& node : nodes) if (node.open) {
-                reply.status = writeback(node);
-                if (reply.status != STATUS_OK) return;
-            }
-            reply.status = backend.flush();
-            if (reply.status != STATUS_OK) exit(reply.status);
-            reap();
-            return;
-        }
-        if (operation == store::Control::Open) {
-            char path[sizeof(request.data) + 1]{};
-            if (!path_from(request, path) || request.value == 0
-                || (request.value & ~(store::Read | store::Write | store::Create
-                    | store::Truncate | store::Exclusive | store::Append)) != 0
-                || ((request.value & (store::Create | store::Truncate | store::Exclusive | store::Append)) != 0
-                    && (request.value & store::Write) == 0)) {
-                reply.status = STATUS_BAD_ARGS;
-                return;
-            }
-            const bool write = (request.value & store::Write) != 0;
-            if (write && !writable) { reply.status = STATUS_DENIED; return; }
-            size_t slot{};
-            while (slot < Opens && opens[slot].live) ++slot;
-            reply.status = slot == Opens ? STATUS_NO_MEMORY
-                : opens[slot].create(request, path, slot, response);
-        } else if (operation == store::Control::List) {
-            char path[sizeof(request.data) + 1]{};
-            if (request.value > UINT32_MAX) { reply.status = STATUS_BAD_ARGS; return; }
-            if (request.size == 0) path[0] = '/';
-            else if (!path_from(request, path)) { reply.status = STATUS_BAD_ARGS; return; }
-            lfs_dir_t cursor{};
-            int result = lfs_dir_open(volume.fs(), &cursor, path);
-            const bool opened = result == 0;
-            if (result == 0 && request.value != 0)
-                result = lfs_dir_seek(volume.fs(), &cursor, request.value);
-            lfs_info entry{};
-            while (result == 0) {
-                const auto position = lfs_dir_tell(volume.fs(), &cursor);
-                if (position < 0) { result = position; break; }
-                result = lfs_dir_read(volume.fs(), &cursor, &entry);
-                if (result <= 0) { reply.value = 0; break; }
-                if ((std::string_view{entry.name} == ".") || (std::string_view{entry.name} == "..")) {
-                    result = 0; continue;
-                }
-                const size_t length = ::strlen(entry.name);
-                if (length > sizeof(reply.data)) { result = LFS_ERR_NAMETOOLONG; break; }
-                const size_t separator = reply.size != 0;
-                if (length + separator > sizeof(reply.data) - reply.size) {
-                    reply.value = position;
-                    result = 0;
-                    break;
-                }
-                if (separator) reply.data[reply.size++] = '\0';
-                ::memcpy(reply.data + reply.size, entry.name, length);
-                reply.size += length;
-                const auto next = lfs_dir_tell(volume.fs(), &cursor);
-                if (next < 0) { result = next; break; }
-                reply.value = next;
+            const size_t length = ::strlen(entry.name);
+            if (length > sizeof(reply.data)) { result = LFS_ERR_NAMETOOLONG; break; }
+            const size_t separator = reply.size != 0;
+            if (length + separator > sizeof(reply.data) - reply.size) {
+                reply.value = position;
                 result = 0;
+                break;
             }
-            const int closed = opened ? lfs_dir_close(volume.fs(), &cursor) : 0;
-            reply.status = volume.error(result < 0 ? result : closed);
-        } else if (operation == store::Control::Remove
-            || operation == store::Control::Mkdir
-            || operation == store::Control::Rename) {
-            if (!writable) { reply.status = STATUS_DENIED; return; }
-            char path[sizeof(request.data) + 1]{};
-            if (!path_from(request, path)) { reply.status = STATUS_BAD_ARGS; return; }
-            int result{};
-            if (operation == store::Control::Remove) result = lfs_remove(volume.fs(), path);
-            else if (operation == store::Control::Mkdir) result = lfs_mkdir(volume.fs(), path);
-            else {
-                // Rename uses a second NUL-terminated path in the same
-                // immutable control frame, after the first one.
-                const size_t first = ::strlen(path);
-                if (first == 0 || first + 1 >= request.size
-                    || request.data[first] != '\0') {
+            if (separator) reply.data[reply.size++] = '\0';
+            ::memcpy(reply.data + reply.size, entry.name, length);
+            reply.size += length;
+            const auto next = lfs_dir_tell(volume.fs(), &cursor);
+            if (next < 0) { result = next; break; }
+            reply.value = next;
+            result = 0;
+        }
+        const int closed = opened ? lfs_dir_close(volume.fs(), &cursor) : 0;
+        reply.status = volume.error(result < 0 ? result : closed);
+    } else if (operation == store::Control::Remove
+        || operation == store::Control::Mkdir
+        || operation == store::Control::Rename) {
+        if (!writable) { reply.status = STATUS_DENIED; return; }
+        char path[sizeof(request.data) + 1]{};
+        if (!path_from(request, path)) { reply.status = STATUS_BAD_ARGS; return; }
+        int result{};
+        if (operation == store::Control::Remove) result = lfs_remove(volume.fs(), path);
+        else if (operation == store::Control::Mkdir) result = lfs_mkdir(volume.fs(), path);
+        else {
+            // Rename uses a second NUL-terminated path in the same
+            // immutable control frame, after the first one.
+            const size_t first = ::strlen(path);
+            if (first == 0 || first + 1 >= request.size
+                || request.data[first] != '\0') {
+                reply.status = STATUS_BAD_ARGS; return;
+            }
+            for (size_t i = first + 1; i < request.size; ++i)
+                if (request.data[i] == '\0') {
                     reply.status = STATUS_BAD_ARGS; return;
                 }
-                for (size_t i = first + 1; i < request.size; ++i)
-                    if (request.data[i] == '\0') {
-                        reply.status = STATUS_BAD_ARGS; return;
-                    }
-                const char* target = path + first + 1;
-                const auto source = lookup(path);
-                auto* moved = source ? find(*source) : nullptr;
-                if (!source && source.error() != LFS_ERR_ISDIR) result = source.error();
-                else {
-                    result = lfs_rename(volume.fs(), path, target);
-                    if (result == 0 && moved) {
-                        const auto entry = lookup(target);
-                        if (!entry) result = entry.error();
-                        else {
-                            // littlefs detaches deleted entries, including the
-                            // source of rename. Keep this inode at the new link;
-                            // the replaced inode remains detached.
-                            moved->state.m = entry->dir;
-                            moved->state.id = entry->id;
-                        }
+            const char* target = path + first + 1;
+            const auto source = lookup(path);
+            auto* moved = source ? find(*source) : nullptr;
+            if (!source && source.error() != LFS_ERR_ISDIR) result = source.error();
+            else {
+                result = lfs_rename(volume.fs(), path, target);
+                if (result == 0 && moved) {
+                    const auto entry = lookup(target);
+                    if (!entry) result = entry.error();
+                    else {
+                        // littlefs detaches deleted entries, including the
+                        // source of rename. Keep this inode at the new link;
+                        // the replaced inode remains detached.
+                        moved->state.m = entry->dir;
+                        moved->state.id = entry->id;
                     }
                 }
             }
-            reply.status = volume.error(result);
-        } else reply.status = STATUS_INVALID_OP;
-        if (volume.failed()) exit(volume.error(-1));
-        reap();
-    }
+        }
+        reply.status = volume.error(result);
+    } else reply.status = STATUS_INVALID_OP;
+    if (volume.failed()) exit(volume.error(-1));
+    reap();
+}
 
-    static auto path_from(const io::ControlMessage& request,
-        char (&out)[sizeof(io::ControlMessage::data) + 1]) noexcept -> bool {
-        if (request.size == 0 || request.size > sizeof(request.data)) return false;
-        ::memcpy(out, request.data, request.size);
-        out[request.size] = '\0';
-        for (size_t i = 0; i < request.size; ++i)
-            if (out[i] == '\0' && request.operation != static_cast<uint64_t>(store::Control::Rename))
-                return false;
-        return true;
-    }
-};
-Client clients[Clients];
 } // namespace
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
@@ -557,79 +549,35 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
         if (!expected(actual)) exit(STATUS_DENIED);
     }
     sys::require(directory.open(sys::capability(info, boot::Store), events));
-    for (size_t i = 0; i < Clients; ++i)
-        sys::require(clients[i].session.prepare(pool, vspace, cspace,
-            0x71000000 + i * 0x100000, true));
     sys::require(notification_signal(
         sys::capability(info, BOOT_READY)).status);
     sys::require(notification_signal(
         sys::capability(info, boot::ServiceWake)).status);
-    size_t turn{};
     for (;;) {
         bool again = pump_reads();
-        for (size_t count = 0; count < Clients; ++count) {
-            io::ControlPacket packet;
+        // Bound admission per pass so file completions continue under load.
+        for (size_t count = 0; count < io::QueueDepth; ++count) {
+            sys::Packet packet;
             const auto status = directory.receive(packet);
-            if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
-            if (status != STATUS_OK || packet.count != 2) continue;
-            auto endpoint = std::move(packet.capabilities[0]);
+            if (status == STATUS_WOULD_BLOCK) break;
+            if (status == STATUS_BAD_ARGS || status == STATUS_TRANSFER_FAILED) continue;
+            sys::require(status);
+            if (packet.count != 1) continue;
+            again = true;
+            sys::Reply reply;
+            reply.message = {.operation = packet.message.operation, .id = packet.message.id};
             if (packet.badge != store::ReadDirectory && packet.badge != store::WriteDirectory
-                && packet.badge != store::AdminDirectory) {
-                const io::ControlMessage reply{.operation = packet.message.operation,
-                    .id = packet.message.id, .status = STATUS_DENIED};
-                (void)io::ControlPort::send_to(endpoint.selector(), reply);
-                (void)channel_close(endpoint.selector());
-                continue;
-            }
-            packet.capabilities[0] = std::move(packet.capabilities[1]);
-            packet.count = 1;
-            Client* available{};
-            for (auto& client : clients) if (!client.channel) { available = &client; break; }
-            if (!available) {
-                const io::ControlMessage reply{.operation = packet.message.operation,
-                    .id = packet.message.id, .status = STATUS_NO_MEMORY};
-                (void)io::ControlPort::send_to(endpoint.selector(), reply);
-                (void)channel_close(endpoint.selector());
-                continue;
-            }
-            auto& client = *available;
-            client.writable = packet.badge != store::ReadDirectory;
-            client.admin = packet.badge == store::AdminDirectory;
-            client.channel = std::move(endpoint);
-            const auto bound = client.session.bind(client.channel.selector(), events);
-            const auto accepted = bound == STATUS_OK
-                ? client.session.accept(packet, [&](const io::ControlMessage& request,
-                    io::ControlReply& reply) { client.control(request, reply); }) : bound;
-            if (accepted != STATUS_OK) client.session.abort();
-        }
-        for (auto& client : clients) if (client.channel) {
-            if (client.session.poll([&](const io::ControlMessage& request,
-                io::ControlReply& reply) { again = true; client.control(request, reply); }) != STATUS_OK) {
-                client.session.abort(); again = true;
-            }
+                && packet.badge != store::AdminDirectory) reply.message.status = STATUS_DENIED;
+            else control(packet.message, reply, packet.badge != store::ReadDirectory,
+                packet.badge == store::AdminDirectory);
+            reply.respond(packet.capabilities[0].selector());
         }
         for (auto& opened : opens) if (opened.live) {
-            if (opened.session.poll([&](const io::ControlMessage& request,
-                io::ControlReply& reply) { again = true; opened.control(request, reply); }) != STATUS_OK) {
+            if (opened.session.poll([&](const sys::Message& request,
+                sys::Reply& reply) { again = true; opened.control(request, reply); }) != STATUS_OK) {
                 opened.session.abort(); again = true;
             }
         }
-        for (size_t row = 0; row < io::QueueDepth; ++row)
-            for (size_t n = 0; n < Clients; ++n) {
-                auto& client = clients[(turn + n) % Clients];
-                auto* queue = client.session.queue();
-                if (!client.channel || !queue || client.session.closing()) continue;
-                io::Ticket ticket{};
-                const auto admission = queue->admit(ticket);
-                if (admission == io::Admission::Empty || admission == io::Admission::Backpressure) continue;
-                if (admission != io::Admission::Ready) { client.session.abort(); again = true; continue; }
-                if (!queue->finish(ticket, STATUS_INVALID_OP, 0)) {
-                    client.session.abort();
-                    if (!queue->abandon(ticket)) exit(STATUS_INTERNAL);
-                    again = true;
-                }
-            }
-        turn = (turn + 1) % Clients;
         for (auto& opened : opens) if (opened.live) {
             auto* queue = opened.session.queue();
             if (!queue || opened.session.closing()) continue;
@@ -658,14 +606,6 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
             }
         }
         again |= pump_reads();
-        for (auto& client : clients) if (client.channel) {
-            if (client.session.flush(true) != STATUS_OK) { client.session.abort(); again = true; }
-            if (client.session.done()) {
-                (void)channel_close(client.channel.selector());
-                client.channel = {};
-                client.session.reset();
-            } else if (client.session.arm() != STATUS_OK) { client.session.abort(); again = true; }
-        }
         for (auto& opened : opens) if (opened.live) {
             if (opened.session.flush(true) != STATUS_OK) {
                 opened.session.abort(); again = true;
@@ -676,14 +616,14 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size, const c
                 reap();
                 opened.file = nullptr;
                 (void)channel_close(opened.channel.selector());
-                opened.channel = {};
                 opened.session.reset();
+                opened.channel = {};
                 opened.live = false;
             } else if (opened.session.arm() != STATUS_OK) {
                 opened.session.abort(); again = true;
             }
         }
-        sys::require(directory.arm());
+        sys::require(directory.arm().status);
         if (!again) sys::require(notification_wait(events).status);
     }
 }

@@ -9,19 +9,19 @@
 namespace boot {
 inline constexpr Import UartMem{"uart.memory", 0x55415254, ObjMem};
 inline constexpr Import UartIrq{"uart.irq", 0x55415254, ObjIrq};
-inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, ObjChannel, 1, 1};
-inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, ObjChannel};
-inline constexpr Import Stdin{"stdin", 0x5354524d, ObjChannel};
-inline constexpr Import Stdout{"stdout", 0x5354524d, ObjChannel};
-inline constexpr Import Stderr{"stderr", 0x5354524d, ObjChannel};
-inline constexpr Import Process{"process", 0x50524f43, ObjChannel, 4};
-inline constexpr Import Files{"files", 0x46494c45, ObjChannel, 3};
-inline constexpr Import Block{"block", 0x424c4f43, ObjChannel, 2, 1};
-inline constexpr Import Store{"store", 0x53544f52, ObjChannel, 1, 1};
-inline constexpr Import StoreAdmin{"store.admin", 0x53544f52, ObjChannel, 1, 1};
-inline constexpr Import Vfs{"vfs", 0x56465320, ObjChannel};
-inline constexpr Import VfsRead{"vfs.read", 0x56465320, ObjChannel};
-inline constexpr Import ServiceControl{"service.control", 0x53564354, ObjChannel};
+inline constexpr Import ConsoleOutput{"console.output", 0x434f4e53, ObjChannel, 2, 1};
+inline constexpr Import ConsoleInput{"console.input", 0x434f4e53, ObjChannel, 2};
+inline constexpr Import Stdin{"stdin", 0x5354524d, ObjChannel, 2};
+inline constexpr Import Stdout{"stdout", 0x5354524d, ObjChannel, 2};
+inline constexpr Import Stderr{"stderr", 0x5354524d, ObjChannel, 2};
+inline constexpr Import Process{"process", 0x50524f43, ObjChannel, 5};
+inline constexpr Import Files{"files", 0x46494c45, ObjChannel, 4};
+inline constexpr Import Block{"block", 0x424c4f43, ObjChannel, 3, 1};
+inline constexpr Import Store{"store", 0x53544f52, ObjChannel, 2, 1};
+inline constexpr Import StoreAdmin{"store.admin", 0x53544f52, ObjChannel, 2, 1};
+inline constexpr Import Vfs{"vfs", 0x56465320, ObjChannel, 2};
+inline constexpr Import VfsRead{"vfs.read", 0x56465320, ObjChannel, 2};
+inline constexpr Import ServiceControl{"service.control", 0x53564354, ObjChannel, 2};
 inline constexpr Import ServiceWake{"service.wake", 0x53564357, ObjNotification};
 } // namespace boot
 
@@ -84,7 +84,7 @@ public:
     }
     [[nodiscard]] auto cancel(uint64_t id) noexcept -> status_t {
         if (session_.requests().error()) return session_.requests().error();
-        io::ControlMessage request{.operation = static_cast<uint64_t>(io::Control::Cancel), .value = id};
+        sys::Message request{.operation = static_cast<uint64_t>(io::Control::Cancel), .value = id};
         return session_.exchange(request);
     }
     // Retire a specific dependency without consuming unrelated completions.
@@ -175,13 +175,13 @@ inline auto file_size(const auto& reply) noexcept -> uint64_t {
 struct File final { uint64_t handle{}, size{}; };
 struct FileMemory final { sys::cap_owner memory{}; uint64_t size{}, identity{}; };
 
-[[nodiscard]] inline auto list(io::ClientSession& session, io::ControlMessage& message) noexcept -> status_t {
+[[nodiscard]] inline auto list(io::ClientSession& session, sys::Message& message) noexcept -> status_t {
     message.operation = static_cast<uint64_t>(Control::List);
     message.size = 0;
     return session.exchange(message);
 }
 [[nodiscard]] inline auto open(io::ClientSession& session, const char* path, size_t size, File& file) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Open), .size = size};
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Open), .size = size};
     if (size > sizeof(message.data)) return STATUS_BAD_ARGS;
     ::memcpy(message.data, path, size);
     const auto status = session.exchange(message);
@@ -192,10 +192,10 @@ struct FileMemory final { sys::cap_owner memory{}; uint64_t size{}, identity{}; 
 }
 [[nodiscard]] inline auto open_object(io::ClientSession& session, const char* path, size_t size,
     sys::cap_owner& object, uint64_t& length, uint64_t& generation) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::OpenObject), .size = size};
+    sys::Message message{.operation = static_cast<uint64_t>(Control::OpenObject), .size = size};
     if (size == 0 || size > sizeof(message.data)) return STATUS_BAD_ARGS;
     ::memcpy(message.data, path, size);
-    io::ControlPacket packet;
+    sys::Packet packet;
     const auto status = session.exchange(message, packet);
     if (status != STATUS_OK) return status;
     if (packet.count != 1 || message.size != sizeof(uint64_t) || !message.value)
@@ -206,7 +206,7 @@ struct FileMemory final { sys::cap_owner memory{}; uint64_t size{}, identity{}; 
     return STATUS_OK;
 }
 [[nodiscard]] inline auto close(io::ClientSession& session, File file) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Close), .value = file.handle};
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Close), .value = file.handle};
     return session.exchange(message);
 }
 
@@ -214,10 +214,10 @@ struct FileMemory final { sys::cap_owner memory{}; uint64_t size{}, identity{}; 
     -> std::expected<FileMemory, status_t> {
     if (perms != VM_READ && perms != (VM_READ | VM_EXECUTE))
         return std::unexpected(STATUS_BAD_ARGS);
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Map),
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Map),
         .value = file.handle, .size = 1};
     message.data[0] = perms;
-    io::ControlPacket packet;
+    sys::Packet packet;
     const auto status = session.exchange(message, packet);
     if (status != STATUS_OK) return std::unexpected(status);
     if (packet.count != 1 || message.size != 8 || message.value == 0
@@ -285,37 +285,41 @@ inline constexpr uint64_t ReadDirectory = 1;
 inline constexpr uint64_t WriteDirectory = 2;
 inline constexpr uint64_t AdminDirectory = 3;
 
-[[nodiscard]] inline auto path_data(io::ControlMessage& message,
+[[nodiscard]] inline auto path_data(sys::Message& message,
     const char* path) noexcept -> bool {
     message.size = ::strlen(path);
     if (message.size == 0 || message.size > sizeof(message.data)) return false;
     ::memcpy(message.data, path, message.size);
     return true;
 }
-[[nodiscard]] inline auto path_operation(io::ClientSession& session, Control operation, const char* path) noexcept
+template<class Session>
+[[nodiscard]] inline auto path_operation(Session& session, Control operation, const char* path) noexcept
     -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(operation)};
+    sys::Message message{.operation = static_cast<uint64_t>(operation)};
     if (!path_data(message, path)) return STATUS_BAD_ARGS;
     return session.exchange(message);
 }
 
-[[nodiscard]] inline auto volume_id(io::ClientSession& session, uint8_t (&id)[VolumeIdSize]) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::VolumeId)};
+template<class Session>
+[[nodiscard]] inline auto volume_id(Session& session, uint8_t (&id)[VolumeIdSize]) noexcept -> status_t {
+    sys::Message message{.operation = static_cast<uint64_t>(Control::VolumeId)};
     const auto status = session.exchange(message);
     if (status != STATUS_OK) return status;
     if (message.size != sizeof(id)) return STATUS_PEER_FAULT;
     ::memcpy(id, message.data, sizeof(id));
     return STATUS_OK;
 }
-[[nodiscard]] inline auto device_id(io::ClientSession& session, uint8_t (&id)[20]) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::DeviceId)};
+template<class Session>
+[[nodiscard]] inline auto device_id(Session& session, uint8_t (&id)[20]) noexcept -> status_t {
+    sys::Message message{.operation = static_cast<uint64_t>(Control::DeviceId)};
     const auto status = session.exchange(message);
     if (status != STATUS_OK) return status;
     if (message.size != sizeof(id)) return STATUS_PEER_FAULT;
     ::memcpy(id, message.data, sizeof(id));
     return STATUS_OK;
 }
-[[nodiscard]] inline auto list(io::ClientSession& session, io::ControlMessage& message,
+template<class Session>
+[[nodiscard]] inline auto list(Session& session, sys::Message& message,
     const char* path = nullptr) noexcept -> status_t {
     message.operation = static_cast<uint64_t>(Control::List);
     if (path != nullptr && path[0] != '\0') {
@@ -323,12 +327,13 @@ inline constexpr uint64_t AdminDirectory = 3;
     } else message.size = 0;
     return session.exchange(message);
 }
-[[nodiscard]] inline auto open(io::ClientSession& session, const char* path, uint64_t flags,
+template<class Session>
+[[nodiscard]] inline auto open(Session& session, const char* path, uint64_t flags,
     sys::cap_owner& object, uint64_t& length, uint64_t& generation) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Open),
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Open),
         .value = flags};
     if (!path_data(message, path)) return STATUS_BAD_ARGS;
-    io::ControlPacket packet;
+    sys::Packet packet;
     const auto status = session.exchange(message, packet);
     if (status != STATUS_OK) return status;
     if (packet.count != 1 || message.size != sizeof(length) || !message.value)
@@ -338,18 +343,22 @@ inline constexpr uint64_t AdminDirectory = 3;
     object = std::move(packet.capabilities[0]);
     return STATUS_OK;
 }
-[[nodiscard]] inline auto sync(io::ClientSession& session) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Sync)};
+template<class Session>
+[[nodiscard]] inline auto sync(Session& session) noexcept -> status_t {
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Sync)};
     return session.exchange(message);
 }
-[[nodiscard]] inline auto remove(io::ClientSession& session, const char* path) noexcept -> status_t {
+template<class Session>
+[[nodiscard]] inline auto remove(Session& session, const char* path) noexcept -> status_t {
     return path_operation(session, Control::Remove, path);
 }
-[[nodiscard]] inline auto mkdir(io::ClientSession& session, const char* path) noexcept -> status_t {
+template<class Session>
+[[nodiscard]] inline auto mkdir(Session& session, const char* path) noexcept -> status_t {
     return path_operation(session, Control::Mkdir, path);
 }
-[[nodiscard]] inline auto rename(io::ClientSession& session, const char* from, const char* to) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Rename)};
+template<class Session>
+[[nodiscard]] inline auto rename(Session& session, const char* from, const char* to) noexcept -> status_t {
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Rename)};
     const size_t left = ::strlen(from), right = ::strlen(to);
     if (left == 0 || right == 0 || left + right + 1 > sizeof(message.data))
         return STATUS_BAD_ARGS;
@@ -360,8 +369,9 @@ inline constexpr uint64_t AdminDirectory = 3;
     return session.exchange(message);
 }
 
-[[nodiscard]] inline auto format(io::ClientSession& session, const uint8_t* id = nullptr) noexcept -> status_t {
-    io::ControlMessage message{.operation = static_cast<uint64_t>(Control::Format)};
+template<class Session>
+[[nodiscard]] inline auto format(Session& session, const uint8_t* id = nullptr) noexcept -> status_t {
+    sys::Message message{.operation = static_cast<uint64_t>(Control::Format)};
     if (id != nullptr) {
         message.size = VolumeIdSize;
         ::memcpy(message.data, id, message.size);

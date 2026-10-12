@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#include <servers/files/fat32.hpp>
+#include <servers/fat32.hpp>
 
 #define CHECK(condition) do { if (!(condition)) { \
     std::fprintf(stderr, "fat32: line %d: %s\n", __LINE__, #condition); std::abort(); \

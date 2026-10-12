@@ -60,6 +60,39 @@ void configured_capacity(cap_t pool, cap_t cspace) noexcept {
     for (auto& event : events) expect(object_destroy(event.selector()).status);
 }
 
+// An exported endpoint queued in an abandoned reply has no future holder.
+// Dropping that escrow must notify its provider, even without explicit Close.
+void abandoned_reply(cap_t pool, cap_t cspace, cap_t events) noexcept {
+    Channel provider, reply;
+    expect(provider.open(pool, 1, 0, 1));
+    expect(reply.open(pool, 1, 1, 1));
+    const auto exported = channel_mint(provider.ends[0].selector(), cspace, 1,
+        RIGHT_SEND | RIGHT_DUPLICATE);
+    expect(exported.status);
+    cap_owner endpoint{exported.value};
+    expect(provider.ends[0].close());
+    const auto minted = channel_mint(reply.ends[1].selector(), cspace, 1, RIGHT_SEND);
+    expect(minted.status);
+    cap_owner sender{minted.value};
+    const CapXfer cap{endpoint.selector(), RIGHT_SEND, CAP_COPY, 0};
+    expect(sys::send(sender.selector(), {}, false, {&cap, 1}).status);
+    expect(endpoint.close());
+    Port peer{provider.ends[1].selector(), events};
+    expect(reply.close());
+    Clock clock;
+    expect(clock.open());
+    const auto deadline = clock.after_ms(1'000);
+    check(deadline.has_value());
+    for (;;) {
+        Message msg;
+        const auto r = peer.try_receive(msg);
+        if (r.status == STATUS_PEER_CLOSED) break;
+        check(r.status == STATUS_WOULD_BLOCK);
+        expect(peer.arm().status);
+        expect(notification_wait(events, *deadline).status);
+    }
+}
+
 void stale_channel(cap_t pool, cap_t cspace) noexcept {
     const auto old_pool = resource_create_child(pool, 256 * 1024, 64,
         proc::base_kinds | OBJ_BIT(ObjChannel));
@@ -169,6 +202,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     open(program, info);
     const auto pool = sys::capability(info, BOOT_POOL);
     configured_capacity(pool, sys::capability(info, BOOT_CSPACE));
+    abandoned_reply(pool, info.selector(BOOT_CSPACE), info.selector(BOOT_EVENTS));
     stale_channel(pool, sys::capability(info, BOOT_CSPACE));
     stale_service(pool, sys::capability(info, BOOT_CSPACE));
     Clock clock;

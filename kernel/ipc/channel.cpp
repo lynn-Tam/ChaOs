@@ -67,6 +67,7 @@ const cap::GrantAttachmentOps Channel::notification_ops_{
 const cap::GrantAttachmentOps Channel::side_ops_{
     .invalidate = &Channel::invalidate_side,
     .released = &Channel::release_side,
+    .retain = false,
 };
 
 const cap::GrantAttachmentOps Channel::waiter_ops_{

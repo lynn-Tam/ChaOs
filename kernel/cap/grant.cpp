@@ -604,7 +604,6 @@ void Graph::service_slot(Slot& slot) noexcept {
             slot.state.store(
                 GrantState::Revoked, std::memory_order_release);
             completed = std::exchange(node.revoke, nullptr);
-            libk_assert(completed != nullptr);
             target_ref = std::move(node.target);
         } else if (state == GrantState::Revoking) {
             for (GrantAttachment& candidate : node.attachments) {
@@ -690,21 +689,15 @@ auto Graph::detach(GrantAttachment& attachment) noexcept -> bool {
             node.slot->state.store(
                 GrantState::Revoked, std::memory_order_release);
             completion = std::exchange(node.revoke, nullptr);
-            libk_assert(completion != nullptr);
             target = std::move(node.target);
         }
-        if (node.refs == 0
-            && operation_count(node.slot->operations.load(std::memory_order_acquire)) == 0
-            && node.attachments.empty()
-            && node.children.empty()
+        if (node.refs == 0 && node.children.empty()
             && !node.slot->work_retained.load(std::memory_order_acquire)) {
             reclaimable = &node;
             reclaim_generation = node_generation;
         }
     }
-    if (completion != nullptr) {
-        target.reset();
-    }
+    target.reset();
     if (reclaimable != nullptr) {
         reclaim(GrantKey{
             reinterpret_cast<usize>(
@@ -729,6 +722,7 @@ void Graph::reclaim(
         Node* parent{};
         GrantKey parent_key{};
         Slot* slot{};
+        bool orphaned{};
         {
             sync::Lock guard{lock_};
             Node* const found = locate(current);
@@ -744,25 +738,32 @@ void Graph::reclaim(
                 }
                 --node.refs;
             }
-            if (node.refs != 0
-                || !node.attachments.empty()
-                || !node.children.empty()
-                || node.slot->work_retained.load(std::memory_order_acquire)) {
-                return;
+            if (node.refs != 0 || !node.children.empty()
+                || node.slot->work_retained.load(std::memory_order_acquire)) return;
+            if (!node.attachments.empty()) {
+                for (const auto& attachment : node.attachments)
+                    if (attachment.ops_->retain) return;
+                // No holder can use this branch again. Drain weak observers
+                // through the same worker as explicit revocation, without a waiter.
+                node.slot->operations.fetch_or(operation_closed, std::memory_order_acq_rel);
+                node.slot->state.store(GrantState::Revoking, std::memory_order_release);
+                node.slot->work_retained.store(true, std::memory_order_release);
+                enqueue(*node.slot);
+                orphaned = true;
+            } else {
+                const usize operations = node.slot->operations.fetch_or(operation_closed, std::memory_order_acq_rel);
+                if (operation_count(operations) != 0) return;
+                parent = node.parent;
+                if (parent != nullptr) {
+                    parent_key = key_of(*parent);
+                    parent->children.erase(node);
+                }
+                target = std::move(node.target);
+                slot = node.slot;
             }
-            const usize operations = node.slot->operations.fetch_or(operation_closed, std::memory_order_acq_rel);
-            if (operation_count(operations) != 0) {
-                return;
-            }
-            parent = node.parent;
-            if (parent != nullptr) {
-                parent_key = key_of(*parent);
-                parent->children.erase(node);
-            }
-            target = std::move(node.target);
-            slot = node.slot;
         }
 
+        if (orphaned) { kick_work(); return; }
         target.reset();
         refund = slot->node()->sponsorship.detach();
 

@@ -1,7 +1,7 @@
 #include <sys/start.hpp>
 #include <sys/protocol.hpp>
 #include <sys/channel.hpp>
-#include <servers/uart/port.hpp>
+#include <servers/uart.hpp>
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;

@@ -3,28 +3,14 @@
 #include <sys/task.hpp>
 #include <sys/clock.hpp>
 #include <sys/channel.hpp>
-#include <servers/uart/port.hpp>
+#include <servers/uart.hpp>
 
 using sys::cap_owner;
 using sys::require;
 
 // These are root's system policy, not a loader manifest or kernel object graph.
 // The package selects which services are present; capabilities are wired here.
-struct Link {
-    cap_owner ends[2];
-    auto open(cap_t pool, word_t depth = 4, word_t transfers = 4, word_t relations = 2) -> status_t {
-        for (auto& cap : ends) if (cap) {
-            const auto s = sys::object_destroy(cap.selector()).status;
-            if (s != STATUS_OK) return s;
-            for (auto& end : ends) { const auto c = end.close(); if (c != STATUS_OK) return c; }
-            break;
-        }
-        const auto r = sys::channel_create(pool, depth, CHANNEL_MAX_WORDS, transfers, relations);
-        if (r.value) ends[0] = cap_owner{r.value};
-        if (r.value2) ends[1] = cap_owner{r.value2};
-        return r.status;
-    }
-};
+using Link = sys::Channel;
 struct Unit {
     std::string_view name;
     proc::quota quota;
@@ -71,6 +57,7 @@ static constexpr Edge edges[]{
     {0, 7, boot::ConsoleInput, 1, RIGHT_RECEIVE | RIGHT_DUPLICATE, 1, 1},
 };
 static uint32_t available{};
+static sys::Clock clock;
 static auto deps(size_t i) -> uint32_t {
     uint32_t mask{};
     for (const auto& e : edges) if (e.to == i) mask |= bit(e.from);
@@ -170,9 +157,8 @@ static auto start(size_t i, const boot::BootView& info, const sys::Firmware& fw,
         .resources = u.quota, .sched = {.budget = 600'000}, .events = events, .close_badge = word_t{1} << (i + 1)});
     if (spawned.id.valid()) u.task = spawned.id;
     if (spawned.status != STATUS_OK || !u.ready) return spawned.status;
-    const auto now = sys::clock_now();
-    if (now.status != STATUS_OK || now.value > UINT64_MAX - 10'000'000'000) return STATUS_BAD_ARGS;
-    const auto deadline = now.value + 10'000'000'000;
+    const auto deadline = clock.after_ms(10'000);
+    if (!deadline) return STATUS_BAD_ARGS;
     for (;;) {
         const auto ended = tasks.observe(*u.task);
         if (ended.status != STATUS_OK) return ended.status;
@@ -180,7 +166,7 @@ static auto start(size_t i, const boot::BootView& info, const sys::Firmware& fw,
         const auto ready = sys::notification_take(u.ready_event.selector());
         if (ready.status == STATUS_OK) return STATUS_OK;
         if (ready.status != STATUS_RETRY) return ready.status;
-        const auto wake = sys::notification_wait(events, deadline);
+        const auto wake = sys::notification_wait(events, *deadline);
         if (wake.status != STATUS_OK) return wake.status;
         for (auto& unit : units) if (unit.task) tasks.notify(*unit.task, wake.value);
     }
@@ -197,6 +183,7 @@ static auto affected(uint32_t mask) -> uint32_t {
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     const auto info = sys::bootstrap(address, size);
+    require(clock.open());
     auto pci = sys::pci::Bus::open(info, 0x31000000);
     if (!pci) sys::exit(pci.error());
     require(pci->configure(0x10421af4));
@@ -222,7 +209,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
         1, RIGHT_RECEIVE | RIGHT_SEND);
     require(receiver.status);
     cap_owner control_rx{receiver.value};
-    sys::Connection channel{control_rx.selector(), events.selector()};
+    sys::Port channel{control_rx.selector(), events.selector()};
     uint32_t recovering = available;
     uint64_t retry_at = 0;
     for (;;) {
@@ -231,14 +218,16 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
             require(ended.status);
             if (ended.value) recovering |= affected(bit(i));
         }
-        // Dependents release imported grants before a provider's channels reset.
+        // Start every affected drain before waiting: capability copies in a
+        // sibling can still carry quota charged to the stopped process.
+        // Provider channels reset only after the whole group has drained.
         bool pending = false, poll = false;
         for (size_t i = units.size(); i-- > 0;) if ((recovering & bit(i)) && units[i].task) {
             require(tasks.request_stop(*units[i].task));
             const auto collected = tasks.collect(*units[i].task);
             if (collected.status == STATUS_OK) units[i].task.reset();
             else if (proc::retryable(collected.status) || collected.status == STATUS_WOULD_BLOCK) {
-                pending = true; poll = tasks.closing_needs_poll(*units[i].task); break;
+                pending = true; poll |= tasks.closing_needs_poll(*units[i].task);
             } else sys::exit(collected.status);
         }
         if (recovering && !pending) {
@@ -251,7 +240,9 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
                     if (started != STATUS_OK) {
                         report(info, pci->firmware, started, u.name);
                         recovering |= affected(bit(i));
-                        retry_at = now.value + 100'000'000;
+                        const auto deadline = clock.after_ms(100);
+                        if (!deadline) sys::exit(STATUS_INTERNAL);
+                        retry_at = *deadline;
                         break;
                     }
                     recovering &= ~bit(i);

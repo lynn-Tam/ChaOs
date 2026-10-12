@@ -13,16 +13,13 @@ _start:
     mv s1, a1
     mv s2, a2
     mv s3, a3
+    call init_heap
     call run_constructors
     mv a0, s0
     mv a1, s1
     mv a2, s2
     mv a3, s3
-#ifdef LIBSYS
-    call program_start
-#else
     call user_main
-#endif
 
     /* An accidental return is still the canonical implicit OK exit. */
     li a0, 0 /* STATUS_OK */

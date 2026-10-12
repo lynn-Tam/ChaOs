@@ -15,15 +15,15 @@
 #include <sys/protocol.hpp>
 
 struct directory {
-    io::ControlMessage batch{};
-    char path[81]{};
+    sys::Message batch{};
+    char path[sizeof(sys::Message::data) + 1]{};
     uint64_t pos{};
     bool live{}, end{};
 };
 
 namespace {
 constexpr int Fds = 11;
-// VFS and storage-admin sessions precede the per-open sessions.
+// Each open file owns a data session; directory calls need no mappings.
 constexpr uintptr_t Sessions = 0x76000000, Stride = 0x100000;
 struct input_stream {
     sys::cap_owner channel;
@@ -39,7 +39,7 @@ struct open_desc {
 };
 std::array<open_desc, Fds> opened;
 std::array<open_desc*, Fds> fds{};
-io::ClientSession vfs;
+sys::Rpc vfs;
 bool connected{};
 cap_t vspace{}, events{};
 cap_t vfs_cap{};
@@ -57,9 +57,7 @@ auto file(int fd) noexcept -> open_desc* {
 auto connect_vfs() noexcept -> status_t {
     if (connected) return STATUS_OK;
     if (!vfs_cap) return STATUS_INVALID_CAP;
-    uint64_t value{};
-    const auto status = vfs.connect(vfs_cap, pool, cspace, events,
-        vspace, Sessions, value, true);
+    const auto status = vfs.open(vfs_cap, pool, cspace, events);
     if (status == STATUS_OK) connected = true;
     return status;
 }
@@ -180,7 +178,7 @@ auto transfer(open_desc& file, io::Operation op, void* data, uint64_t size,
 extern "C" int main(int argc, char** argv);
 
 extern "C" DIR* opendir(const char* path) {
-    if (!path || ::strlen(path) > 80 || connect_vfs() != STATUS_OK)
+    if (!path || ::strlen(path) > sizeof(sys::Message::data) || connect_vfs() != STATUS_OK)
         return nullptr;
     for (auto& dir : dirs) if (!dir.live) {
         dir = {};
@@ -219,7 +217,7 @@ extern "C" int32_t closedir(DIR* dir) {
     return STATUS_BAD_ARGS;
 }
 
-extern "C" [[noreturn]] void program_start(
+extern "C" [[noreturn]] void user_main(
     const void* address, word_t size, const char* arg_data, size_t arg_size) noexcept {
     const auto info = boot::BootView::parse(address, size);
     if (!info) sys::exit(STATUS_BAD_ARGS);
@@ -325,7 +323,7 @@ extern "C" int32_t open(const char* path, uint32_t flags) {
     uint64_t generation{};
     auto& session = opened[slot].data.emplace<io::ClientSession>();
     status = session.adopt(std::move(object), events, vspace,
-        Sessions + (slot + 2) * Stride, generation, mode != O_RDONLY);
+        Sessions + slot * Stride, generation, mode != O_RDONLY);
     if (status != STATUS_OK) { opened[slot].data.emplace<std::monostate>(); return status; }
     if (generation != expected) {
         (void)session.close();
@@ -450,7 +448,7 @@ extern "C" int32_t cancel(request_id id) {
     pump();
     for (auto& item : requests) if (item.file && item.id == id && !item.internal) {
         if (item.ready) return STATUS_BUSY;
-        io::ControlMessage request{
+        sys::Message request{
             .operation = static_cast<uint64_t>(io::Control::Cancel), .value = item.wire};
         const auto status = item.file->queue().exchange(request);
         return status == STATUS_NOT_FOUND ? STATUS_BUSY : status;
@@ -465,7 +463,7 @@ extern "C" int32_t fsync(int32_t fd) {
     const auto drained = drain(opened);
     if (drained != STATUS_OK) return drained;
     if (opened->queue().requests().error()) return opened->queue().requests().error();
-    io::ControlMessage request{
+    sys::Message request{
         .operation = static_cast<uint64_t>(io::Control::Sync)};
     return opened->queue().exchange(request);
 }
@@ -481,7 +479,7 @@ extern "C" int32_t fstat(int32_t fd, struct stat* info) {
     auto* opened = file(fd);
     if (!opened || !info) return STATUS_BAD_ARGS;
     if (opened->queue().requests().error()) return opened->queue().requests().error();
-    io::ControlMessage request{.operation = static_cast<uint64_t>(io::Control::Stat)};
+    sys::Message request{.operation = static_cast<uint64_t>(io::Control::Stat)};
     const auto status = opened->queue().exchange(request);
     if (status == STATUS_OK) info->size = request.value;
     return status;
@@ -516,13 +514,9 @@ extern "C" int32_t volume_id(uint8_t id[16]) {
 extern "C" int32_t format_volume(const uint8_t* id, uint32_t size) {
     if ((size != 0 && size != 16) || (size && !id)) return STATUS_BAD_ARGS;
     if (!store_admin) return STATUS_DENIED;
-    io::ClientSession admin;
-    uint64_t value{};
-    auto status = admin.connect(store_admin, pool, cspace, events,
-        vspace, Sessions + Stride, value, true);
-    if (status == STATUS_OK) status = store::format(admin, size ? id : nullptr);
-    const auto closed = admin.close();
-    return status == STATUS_OK ? closed : status;
+    sys::Rpc admin;
+    const auto status = admin.open(store_admin, pool, cspace, events);
+    return status == STATUS_OK ? store::format(admin, size ? id : nullptr) : status;
 }
 
 extern "C" int32_t unlink(const char* path) {

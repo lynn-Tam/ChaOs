@@ -29,10 +29,10 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
         uint64_t value{};
         sys::require(sessions[i].connect(directory, pool, sys::capability(info, BOOT_CSPACE), events, vspace,
             0x70000000 + i * 0x100000, value));
-        io::ControlMessage list{.operation = static_cast<uint64_t>(fs::Control::List)};
+        sys::Message list{.operation = static_cast<uint64_t>(fs::Control::List)};
         sys::require(sessions[i].exchange(list));
         check(list.size != 0 && list.value == 0);
-        io::ControlMessage opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 9};
+        sys::Message opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 9};
         ::memcpy(opened.data, "/data.bin", 9);
         sys::require(sessions[i].exchange(opened));
         check(opened.size == 8 && fs::file_size(opened) == FileSize);
@@ -42,10 +42,10 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     uint64_t identity{};
     constexpr size_t mapped_size = (FileSize + 4095) & ~size_t{4095};
     for (size_t i = 0; i < 2; ++i) {
-        io::ControlMessage request{.operation = static_cast<uint64_t>(fs::Control::Map),
+        sys::Message request{.operation = static_cast<uint64_t>(fs::Control::Map),
             .value = handles[i], .size = 1};
         request.data[0] = VM_READ | VM_EXECUTE;
-        io::ControlPacket packet;
+        sys::Packet packet;
         check(sessions[i].exchange(request, packet) == STATUS_DENIED && packet.count == 0);
         request = {.operation = static_cast<uint64_t>(fs::Control::Map), .value = handles[i], .size = 1};
         request.data[0] = VM_READ;
@@ -68,10 +68,10 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     }
     // Files exports one immutable source to every client. A private mapping
     // initially reads that source, then owns only the pages it changes.
-    io::ControlMessage private_request{.operation = static_cast<uint64_t>(fs::Control::Map),
+    sys::Message private_request{.operation = static_cast<uint64_t>(fs::Control::Map),
         .value = handles[0], .size = 1};
     private_request.data[0] = VM_READ;
-    io::ControlPacket private_packet;
+    sys::Packet private_packet;
     sys::require(sessions[0].exchange(private_request, private_packet));
     check(private_packet.count == 1 && private_request.value == identity);
     auto private_result = mapping::map_private(vspace,
@@ -134,9 +134,9 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
         }
     }
     for (size_t i = 0; i < 2; ++i) {
-        io::ControlMessage closed{.operation = static_cast<uint64_t>(fs::Control::Close), .value = handles[i]};
+        sys::Message closed{.operation = static_cast<uint64_t>(fs::Control::Close), .value = handles[i]};
         sys::require(sessions[i].exchange(closed));
-        io::ControlMessage opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 8};
+        sys::Message opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 8};
         ::memcpy(opened.data, "DATA.BIN", 8);
         sys::require(sessions[i].exchange(opened));
         check(opened.value != handles[i]);
@@ -168,10 +168,10 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
                 sys::capability(info, BOOT_CSPACE), events, vspace,
                 0x70000000 + i * 0x100000, value));
             for (size_t byte = 0; byte < io::PayloadSize; ++byte) check(sessions[i].payload()[byte] == 0);
-            io::ControlMessage stale{.operation = static_cast<uint64_t>(fs::Control::Map), .value = handles[i], .size = 1};
+            sys::Message stale{.operation = static_cast<uint64_t>(fs::Control::Map), .value = handles[i], .size = 1};
             stale.data[0] = VM_READ;
             check(sessions[i].exchange(stale) == STATUS_NOT_FOUND);
-            io::ControlMessage opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 8};
+            sys::Message opened{.operation = static_cast<uint64_t>(fs::Control::Open), .size = 8};
             ::memcpy(opened.data, "DATA.BIN", 8);
             sys::require(sessions[i].exchange(opened));
             handles[i] = opened.value;

@@ -3,7 +3,7 @@
 #include <sys/channel.hpp>
 #include <sys/handle.hpp>
 #include <test/user/task.hpp>
-#include <servers/uart/port.hpp>
+#include <servers/uart.hpp>
 
 namespace {
 proc::package program;

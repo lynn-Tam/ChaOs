@@ -1,7 +1,7 @@
 #include <sys/channel.hpp>
 #include <sys/fw.hpp>
 #include <test/user/task.hpp>
-#include <servers/uart/port.hpp>
+#include <servers/uart.hpp>
 
 namespace { proc::package program; proc::tasks<1> supervisor; }
 

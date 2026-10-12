@@ -159,7 +159,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     sys::require(filesystem.connect(sys::capability(info, boot::Files),
         sys::capability(info, BOOT_POOL), sys::capability(info, BOOT_CSPACE),
         file_events.selector(), sys::capability(info, BOOT_VSPACE), 0x70000000, value));
-    sys::Connection channel{sys::capability(info, boot::Process), events};
+    sys::Port channel{sys::capability(info, boot::Process), events};
     sys::require(channel.enable_writable());
     for (;;) {
         bool closing = false;

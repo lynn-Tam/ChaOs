@@ -1,6 +1,6 @@
 #include <sys/pci.hpp>
-#include <servers/block/device.hpp>
-#include <servers/uart/port.hpp>
+#include <servers/virtio_blk.hpp>
+#include <servers/uart.hpp>
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;

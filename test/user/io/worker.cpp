@@ -1,6 +1,6 @@
 #include <sys/start.hpp>
 #include <sys/channel.hpp>
-#include <servers/block/device.hpp>
+#include <servers/virtio_blk.hpp>
 
 extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcept {
     using namespace sys;

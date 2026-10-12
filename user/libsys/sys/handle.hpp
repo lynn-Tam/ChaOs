@@ -51,11 +51,30 @@ struct mapping {
 
     auto open(cap_t vm, uintptr_t va, size_t bytes, word_t perms = VM_READ | VM_WRITE) noexcept -> status_t {
         if (region) return STATUS_BUSY;
-        if (!vm || !va || !bytes || (va | bytes) % 4096 || bytes > ~uintptr_t{} - va)
+        if (!vm || !bytes || (va | bytes) % 4096 || bytes > ~uintptr_t{} - va)
             return STATUS_BAD_ARGS;
+        mapping** link = nullptr;
+        if (!va) {
+            // The runtime owns this VA arena; fixed boot/device windows live below it.
+            va = 0x100000000;
+            link = &head_;
+            while (*link) {
+                const auto& m = **link;
+                if (bytes <= m.address - va) break;
+                va = m.address + m.size;
+                link = &(*link)->next_;
+            }
+            if (va >= 0x2000000000 || bytes > 0x2000000000 - va) return STATUS_NO_MEMORY;
+        }
         const auto r = vm_slice(vm, va, bytes, perms,
             RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP | RIGHT_DESTROY);
-        if (r.value) { region = cap_owner{r.value}; address = va; size = bytes; cleared_ = false; }
+        if (r.value) {
+            region = cap_owner{r.value}; address = va; size = bytes; cleared_ = false;
+            if (link) {
+                next_ = *link; link_ = link; *link = this;
+                if (next_) next_->link_ = &next_;
+            }
+        }
         return r.status == STATUS_OK && !region ? STATUS_INVALID_CAP : r.status;
     }
     auto attach(cap_t mem, word_t first, size_t bytes, word_t perms) noexcept -> status_t {
@@ -89,6 +108,11 @@ struct mapping {
         }
         const auto s = memory.close();
         if (s != STATUS_OK) return s;
+        if (link_) {
+            *link_ = next_;
+            if (next_) next_->link_ = link_;
+            link_ = nullptr; next_ = nullptr;
+        }
         address = size = 0;
         return STATUS_OK;
     }
@@ -107,11 +131,17 @@ struct mapping {
         return map_impl(vm, cap_owner{r.value}, va, size, VM_READ | VM_WRITE, true);
     }
 private:
+    inline static mapping* head_{};
+    mapping** link_{};
+    mapping* next_{};
     size_t mapped_{};
     bool cleared_{}, owns_memory_{};
     void require_close() noexcept { const auto s = close(); if (s != STATUS_OK) sys::exit(s); }
     void take(mapping& b) noexcept {
         memory = std::move(b.memory); region = std::move(b.region);
+        link_ = std::exchange(b.link_, nullptr); next_ = std::exchange(b.next_, nullptr);
+        if (link_) *link_ = this;
+        if (next_) next_->link_ = &next_;
         address = std::exchange(b.address, 0); size = std::exchange(b.size, 0);
         mapped_ = std::exchange(b.mapped_, 0); cleared_ = b.cleared_;
         owns_memory_ = std::exchange(b.owns_memory_, false);

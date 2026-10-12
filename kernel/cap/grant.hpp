@@ -62,6 +62,9 @@ struct GrantAttachmentOps final {
         void* context,
         GrantWork&& work) noexcept;
     void (*released)(void* context) noexcept;
+    // Persistent mappings retain authority. Protocol-side observers close
+    // when the last capability in their whole branch disappears.
+    bool retain{true};
 };
 
 // Embedded in a VMM-facing Backing. Graph indexes it

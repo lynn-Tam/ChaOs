@@ -26,7 +26,7 @@ auto request(proc::op operation, uint64_t id = 0, uint64_t expires = 0) noexcept
     if (expires != 0) { result.size = sizeof(expires); ::memcpy(result.data, &expires, sizeof(expires)); }
     return result;
 }
-auto receive(sys::Connection& channel, proc::op operation, status_t status) noexcept -> sys::Message {
+auto receive(sys::Port& channel, proc::op operation, status_t status) noexcept -> sys::Message {
     sys::Message reply;
     check(channel.receive(reply).status == STATUS_OK);
     if (reply.operation != static_cast<uint64_t>(operation) || reply.status != status) {
@@ -37,11 +37,11 @@ auto receive(sys::Connection& channel, proc::op operation, status_t status) noex
     check(reply.operation == static_cast<uint64_t>(operation) && reply.status == status);
     return reply;
 }
-auto exchange(sys::Connection& channel, sys::Message message, status_t status) noexcept -> sys::Message {
+auto exchange(sys::Port& channel, sys::Message message, status_t status) noexcept -> sys::Message {
     check(channel.send(message).status == STATUS_OK);
     return receive(channel, static_cast<proc::op>(message.operation), status);
 }
-auto spawn(sys::Connection& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
+auto spawn(sys::Port& channel, const char* ms, status_t status = STATUS_OK) noexcept -> uint64_t {
     auto message = request(proc::op::Spawn);
     boot::args args;
     check(args.append("sleep", 5) && args.append(ms, ::strlen(ms)));
@@ -49,7 +49,7 @@ auto spawn(sys::Connection& channel, const char* ms, status_t status = STATUS_OK
     ::memcpy(message.data, args.data(), message.size);
     return exchange(channel, message, status).id;
 }
-void stop(sys::Connection& channel, uint64_t id) noexcept {
+void stop(sys::Port& channel, uint64_t id) noexcept {
     check(exchange(channel, request(proc::op::Stop, id), STATUS_CANCELED).id == id);
     exchange(channel, request(proc::op::Wait, id), STATUS_INVALID_CAP);
 }
@@ -60,7 +60,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     const auto info = sys::bootstrap(address, size);
     output = sys::capability(info, boot::ConsoleOutput);
     check(clock.open() == STATUS_OK);
-    sys::Connection channel{sys::capability(info, boot::Process),
+    sys::Port channel{sys::capability(info, boot::Process),
         sys::capability(info, BOOT_EVENTS)};
 
     const auto first = spawn(channel, "10000");

@@ -4,19 +4,19 @@
 #include <sys/queue.hpp>
 
 namespace {
-io::ControlPort control;
+sys::Port control;
 io::queue_mem memory;
 sys::cap_owner peer;
 cap_t events;
 
-auto receive() noexcept -> io::ControlPacket {
+auto receive() noexcept -> sys::Packet {
     using namespace sys;
     for (;;) {
-        io::ControlPacket packet;
+        sys::Packet packet;
         const auto status = control.receive(packet);
         if (status == STATUS_OK) return packet;
         if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) exit(status);
-        sys::require(control.arm());
+        sys::require(control.arm().status);
         sys::require(notification_wait(events).status);
     }
 }
@@ -42,7 +42,7 @@ extern "C" [[noreturn]] void user_main(const void* address, word_t size) noexcep
     const CapXfer transfers[]{
         {fixed.selector(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0},
         {events, RIGHT_SIGNAL, CAP_COPY, 0}};
-    sys::require(io::ControlPort::send_to(sys::capability(info, boot::Block),
+    sys::require(sys::Port::send_to(sys::capability(info, boot::Block),
         {.operation = static_cast<uint64_t>(io::Control::Open), .id = 1, .value = io::QueueDepth}, transfers, 2));
     auto opened = receive();
     sys::require(opened.message.status);
