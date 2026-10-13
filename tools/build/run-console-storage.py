@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 def main():
-    qemu, kernel, bundle, boot, data, cpus = sys.argv[1:7]
+    qemu, kernel, bundle, data, cpus = sys.argv[1:6]
     data = Path(data)
     if not data.exists():
         with data.open("xb") as stream:
@@ -14,10 +14,8 @@ def main():
     command = [qemu, "-machine", "virt,iommu-sys=on", "-smp", cpus,
                "-nographic", "-bios", "default", "-kernel", kernel,
                "-initrd", bundle,
-               "-drive", f"if=none,id=boot,format=raw,readonly=on,file={boot}",
-               "-device", "virtio-blk-pci,addr=1,drive=boot,disable-legacy=on,iommu_platform=on",
                "-drive", f"if=none,id=data,format=raw,file={data}",
-               "-device", "virtio-blk-pci,addr=2,drive=data,disable-legacy=on,iommu_platform=on"]
+               "-device", "virtio-blk-pci,addr=1,drive=data,disable-legacy=on,iommu_platform=on"]
     os.execvp(qemu, command)
 
 if __name__ == "__main__":

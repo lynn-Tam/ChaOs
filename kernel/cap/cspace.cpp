@@ -216,7 +216,7 @@ auto CSpace::close(Handle handle) noexcept
     return {};
 }
 
-auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec) noexcept
+auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec, resource::Reservation payment) noexcept
     -> std::expected<Xfer, CSpaceError> {
     auto source = snapshot(spec.source);
     if (!source) return std::unexpected(source.error());
@@ -250,7 +250,9 @@ auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec) noexcept
                 return ref ? std::expected<GrantRef, CSpaceError>{std::move(*ref)}
                            : std::unexpected(grant_error(ref.error()));
             }
-            auto charge = reserve_grant();
+            auto charge = payment
+                ? std::expected<resource::Reservation, CSpaceError>{std::move(payment)}
+                : reserve_grant();
             if (!charge) return std::unexpected(charge.error());
             auto target = lease.clone_target();
             if (!target) return std::unexpected(CSpaceError::GrantUnavailable);
@@ -305,9 +307,9 @@ auto CSpace::commit_xfers(CSpace& dst, std::span<Xfer> entries) noexcept
     return {};
 }
 
-auto CSpace::transfer(Handle source, CSpace& dst, XferOp op, XferLimit limit) noexcept
+auto CSpace::transfer(Handle source, CSpace& dst, XferOp op, XferLimit limit, resource::Reservation payment) noexcept
     -> std::expected<Handle, CSpaceError> {
-    auto entry = prepare_xfer(dst, {source, std::move(limit), op});
+    auto entry = prepare_xfer(dst, {source, std::move(limit), op}, std::move(payment));
     if (!entry) return std::unexpected(entry.error());
     const auto handle = entry->slot.handle();
     auto done = commit_xfers(dst, std::span{&*entry, 1});

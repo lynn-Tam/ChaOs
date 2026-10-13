@@ -34,7 +34,7 @@
 Cpu::~Cpu() noexcept {
     dispatcher_storage.reset();
     if (idle_thread) {
-        libk_assert(idle_thread.retire());
+        libk_assert(idle_thread.destroy());
         idle_thread.reset();
     }
     if (log) std::destroy_at(log);

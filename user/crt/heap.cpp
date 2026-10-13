@@ -128,3 +128,4 @@ const std::nothrow_t std::nothrow{};
 [[noreturn]] void std::__throw_bad_array_new_length() { sys::exit(STATUS_NO_MEMORY); }
 [[noreturn]] void std::__throw_logic_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
 [[noreturn]] void std::__throw_length_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_out_of_range_fmt(const char*, ...) { sys::exit(STATUS_BAD_ARGS); }

@@ -239,7 +239,7 @@ auto Space::retire_regs() noexcept -> bool {
         if (!reg.memory) continue;
         if (reg.grant && !reg.revoke.initialized())
             libk_assert(grants_.invalidate(reg.grant.key(), reg.revoke));
-        (void)reg.memory.retire();
+        (void)reg.memory.destroy();
         if ((reg.revoke.initialized() && !reg.revoke.complete()) ||
             reg.memory->state() != mm::MemState::Retired)
             complete = false;
@@ -280,7 +280,7 @@ auto Space::retire_interrupt() noexcept -> bool {
     // Grant drain excludes a concurrent user bind/ack. close serializes with
     // dispatch, masks the source and detaches its Notification relation.
     (void)interrupt_->close();
-    (void)interrupt_.retire();
+    (void)interrupt_.destroy();
     return interrupt_->closed();
 }
 

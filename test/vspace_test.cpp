@@ -176,13 +176,13 @@ public:
         return cspace_.get();
     }
     [[nodiscard]] auto retire_space() noexcept -> bool {
-        return space_.retire();
+        return space_.destroy();
     }
     [[nodiscard]] auto retire_cspace() noexcept -> bool {
-        return cspace_.retire();
+        return cspace_.destroy();
     }
     [[nodiscard]] auto retire_memory() noexcept -> bool {
-        return memory_.retire();
+        return memory_.destroy();
     }
     [[nodiscard]] auto pmm() noexcept -> mm::Pmm& { return *vspace_test_pmm; }
 
@@ -193,18 +193,18 @@ public:
 private:
     void reset() noexcept {
         if (cspace_) {
-            if (cspace_.live()) libk_assert(cspace_.retire());
+            if (cspace_.live()) libk_assert(cspace_.destroy());
             cspace_.reset();
         }
         if (space_) {
-            if (space_.live()) libk_assert(space_.retire());
+            if (space_.live()) libk_assert(space_.destroy());
             run_work();
             libk_assert(space_->state() == mm::VSpaceState::Quiescent);
             space_.reset();
         }
         if (memory_) {
             if (memory_->state() == mm::MemState::Live) {
-                libk_assert(memory_.retire());
+                libk_assert(memory_.destroy());
             } else {
                 libk_assert(memory_->state() == mm::MemState::Stopping
                     || memory_->state() == mm::MemState::Retired);
@@ -314,7 +314,7 @@ bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noex
     if (!pending_pager) return false;
     auto pager = std::move(pending_pager).value().publish();
     auto close_pager = libk::on_scope_exit([&]() noexcept {
-        libk_assert(pager.retire());
+        libk_assert(pager.destroy());
         pager.reset();
         while (vspace_work->run()) {}
 
@@ -330,7 +330,7 @@ bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noex
     auto cleanup = libk::on_scope_exit([&]() noexcept {
         for (const auto range : ranges)
             (void)fixture.space().unmap(fixture.context(), range);
-        libk_assert(memory.retire());
+        libk_assert(memory.destroy());
         memory.reset();
 
         fixture.run_work();
@@ -665,7 +665,7 @@ bool test_sponsored_table_capacity_follows_retirement(
         return false;
     }
 
-    if (!space.retire()) {
+    if (!space.destroy()) {
         return false;
     }
     fixture.run_work();
@@ -676,7 +676,7 @@ bool test_sponsored_table_capacity_follows_retirement(
 
     if (pool->available() != limit || pool->sponsorship_count() != 0
         || pool->close() != object::group::phase::closed
-        || !pool.retire()) {
+        || !pool.destroy()) {
         return false;
     }
     pool.reset();
@@ -711,7 +711,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
     }
     while (vspace_work->run()) {}
     const bool refunded = pool->available() == limit && pool->sponsorship_count() == 0;
-    const bool closed = pool->close() == object::group::phase::closed && pool.retire();
+    const bool closed = pool->close() == object::group::phase::closed && pool.destroy();
     pool.reset();
 
     return failed && refunded && closed && fixture.pmm().verify_invariants();

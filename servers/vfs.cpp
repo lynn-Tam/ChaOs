@@ -1,255 +1,314 @@
-#include <util.hpp>
+#include <protocols/file.hpp>
+#include <protocols/service.hpp>
+#include <deque>
+#include <memory>
 #include <string_view>
-#include <string.h>
-#include <utility>
-#include <ch.hpp>
-#include <io.hpp>
-#include <proto.hpp>
+#include <string>
+#include <vector>
 
-// The boot mount is read-only and flat. Only this exact component selects it.
-[[nodiscard]] inline auto boot_name(const char* path) noexcept -> const char* {
-    if (path == nullptr)
-        return nullptr;
-    constexpr char prefix[] = "/boot";
-    for (size_t i = 0; i < 5; ++i)
-        if (path[i] != prefix[i])
-            return nullptr;
-    if (path[5] == '\0')
-        return path + 5;
-    return path[5] == '/' ? path + 6 : nullptr;
-}
-
-static ch_port directory;
-static io_client boot_files;
-static ch_rpc data;
-static cap_t events;
-static bool writable_root;
-
-static void control(const ch_msg& request, ch_reply& response, bool writable) noexcept {
-    auto& reply = response.message;
-    const auto operation = static_cast<st_control>(request.operation);
-    char path[sizeof(request.data) + 1]{};
-    if (operation == st_control::Open || operation == st_control::Remove ||
-        operation == st_control::Mkdir || operation == st_control::Rename ||
-        (operation == st_control::List && request.size != 0)) {
-        if (request.size == 0 || request.size > sizeof(request.data)) {
-            reply.status = STATUS_BAD_ARGS;
-            return;
+struct vf_provider {
+    cap_t channel{};
+    word_t writable{}, sequence{};
+    auto open(cap_t cap, cap_t events) -> status_t {
+        if (!cap)
+            return STATUS_OK;
+        const auto bound = sys::channel_bind(cap, events, CHANNEL_WRITABLE);
+        if (bound.status == STATUS_OK) {
+            channel = cap;
+            writable = bound.value;
         }
-        ::memcpy(path, request.data, request.size);
-        for (size_t i = 0; i < request.size; ++i)
-            if (path[i] == '\0' && operation != st_control::Rename) {
-                reply.status = STATUS_BAD_ARGS;
-                return;
-            }
+        return bound.status;
     }
-    if (operation == st_control::Open) {
-        constexpr uint64_t allowed =
+    auto send(const ch_msg& request, cap_owner& reply) -> status_t {
+        const CapXfer transfer{reply.selector(), 0, CAP_MOVE, 0};
+        const auto sent = ch_send(channel, request, false, {&transfer, 1});
+        if (sent.status == STATUS_OK) {
+            sequence = sent.value;
+            (void) reply.release();
+        }
+        if (sent.status == STATUS_WOULD_BLOCK) {
+            const auto armed = sys::channel_arm(channel, writable, sequence);
+            if (armed.status != STATUS_OK)
+                return armed.status;
+            sequence = armed.value;
+        }
+        return sent.status;
+    }
+};
+struct vf_pending {
+    vf_provider* target;
+    ch_msg request;
+    cap_owner reply;
+};
+// Namespace enumeration alone needs to inspect a provider reply, to hide the
+// underlying directory entry covered by the boot mount. Ordinary replies bypass VFS.
+struct vf_list {
+    ch_msg request;
+    cap_owner caller;
+    ch_pair bridge;
+    ch_port receiver;
+    cap_owner sender;
+    std::optional<ch_msg> result;
+    auto prepare(cap_t pool, cap_t space, cap_t events) -> status_t {
+        auto status = receiver.close();
+        if (status == STATUS_OK)
+            status = bridge.open(pool, 1, 0, 1);
+        if (status == STATUS_OK)
+            status = receiver.open(bridge.ends[0].selector(), events);
+        if (status != STATUS_OK)
+            return status;
+        const auto minted =
+            sys::channel_mint(bridge.ends[1].selector(), space, 1, RIGHT_SEND | RIGHT_CLOSE);
+        sender = cap_owner{minted.value};
+        if (minted.status == STATUS_OK)
+            bridge.ends[1] = {};
+        return minted.status;
+    }
+};
+static vf_provider boot, data;
+// Resolve within the granted namespace root, before selecting a mount.
+static auto canonical(std::string_view path) -> std::string {
+    std::vector<std::string_view> parts;
+    while (!path.empty()) {
+        const auto end = path.find('/');
+        const auto part = path.substr(0, end);
+        if (part == "..") {
+            if (!parts.empty())
+                parts.pop_back();
+        } else if (!part.empty() && part != ".")
+            parts.push_back(part);
+        if (end == path.npos)
+            break;
+        path.remove_prefix(end + 1);
+    }
+    std::string result;
+    for (auto part : parts) {
+        if (!result.empty())
+            result += '/';
+        result += part;
+    }
+    return result;
+}
+static auto boot_tail(std::string_view path) -> std::optional<std::string_view> {
+    if (path == "boot")
+        return std::string_view{};
+    if (path.starts_with("boot/"))
+        return path.substr(5);
+    return {};
+}
+static void respond(cap_t reply, const ch_msg& request, status_t status) {
+    ch_reply result;
+    result.message = {.operation = request.operation, .id = request.id, .status = status};
+    result.respond(reply);
+}
+struct vf_route {
+    vf_provider* provider{};
+    bool filter{};
+    status_t status{};
+};
+static auto route(ch_msg& req, bool writable) -> vf_route {
+    const auto op = static_cast<st_control>(req.operation);
+    const auto has_path = op == st_control::Open || op == st_control::Map ||
+                          op == st_control::Remove || op == st_control::Mkdir ||
+                          op == st_control::Rename || (op == st_control::List && req.size);
+    std::string_view path{req.data, req.size};
+    if (has_path && (path.empty() || (op != st_control::Rename && path.find('\0') != path.npos)))
+        return {.status = STATUS_BAD_ARGS};
+    if (op == st_control::Sync || op == st_control::DeviceId || op == st_control::VolumeId) {
+        if (req.size || req.value)
+            return {.status = STATUS_BAD_ARGS};
+        if (op == st_control::Sync && !writable)
+            return {.status = STATUS_DENIED};
+        return data.channel
+                   ? vf_route{&data}
+                   : vf_route{.status = op == st_control::Sync ? STATUS_OK : STATUS_NOT_FOUND};
+    }
+    if (has_path) {
+        const auto cut = path.find('\0');
+        if (op == st_control::Rename && (cut == path.npos || !cut || cut + 1 == path.size() ||
+                                         path.substr(cut + 1).find('\0') != path.npos))
+            return {.status = STATUS_BAD_ARGS};
+        const auto first = canonical(path.substr(0, cut));
+        const auto second =
+            op == st_control::Rename ? canonical(path.substr(cut + 1)) : std::string{};
+        if (op == st_control::Rename && (first.empty() || second.empty()))
+            return {.status = STATUS_BAD_ARGS};
+        req.size = first.size();
+        ::memcpy(req.data, first.data(), first.size());
+        if (op == st_control::Rename) {
+            req.data[req.size++] = '\0';
+            ::memcpy(req.data + req.size, second.data(), second.size());
+            req.size += second.size();
+        }
+        path = {req.data, req.size};
+    }
+    const auto tail = boot_tail(path.substr(0, path.find('\0')));
+    const bool on_boot = tail.has_value() || !data.channel;
+    if (op == st_control::Open) {
+        constexpr auto allowed =
             st_read | st_write | st_create | st_truncate | st_exclusive | st_append;
-        if (request.value == 0 || (request.value & ~allowed) != 0 ||
-            ((request.value & (st_create | st_truncate | st_exclusive | st_append)) != 0 &&
-             (request.value & st_write) == 0)) {
-            reply.status = STATUS_BAD_ARGS;
-            return;
-        }
-        const char* name = boot_name(path);
-        const bool on_boot = name != nullptr || !writable_root;
-        if ((request.value & st_write) != 0 && !writable) {
-            reply.status = STATUS_DENIED;
-            return;
-        }
-        if (on_boot && (request.value != st_read)) {
-            reply.status = STATUS_DENIED;
-            return;
-        }
-        if (on_boot) {
-            name = name != nullptr ? name : path;
-            if (*name == '\0' || ::strlen(name) > sizeof(request.data)) {
-                reply.status = STATUS_BAD_ARGS;
-                return;
+        if (!req.value || (req.value & ~allowed) ||
+            ((req.value & ~(st_read | st_write)) && !(req.value & st_write)))
+            return {.status = STATUS_BAD_ARGS};
+        if ((req.value & st_write) && (!writable || on_boot))
+            return {.status = STATUS_DENIED};
+    } else if (op == st_control::Map) {
+        if (req.value != VM_READ && req.value != (VM_READ | VM_EXECUTE))
+            return {.status = STATUS_BAD_ARGS};
+    } else if (op == st_control::Remove || op == st_control::Mkdir) {
+        if (!writable || on_boot)
+            return {.status = STATUS_DENIED};
+    } else if (op == st_control::Rename) {
+        const auto cut = path.find('\0');
+        if (cut == path.npos || !cut || cut + 1 == path.size() ||
+            path.substr(cut + 1).find('\0') != path.npos)
+            return {.status = STATUS_BAD_ARGS};
+        if (!writable || on_boot || boot_tail(path.substr(cut + 1)))
+            return {.status = STATUS_DENIED};
+    } else if (op == st_control::List) {
+        if (on_boot && tail && !tail->empty())
+            return {.status = STATUS_NOT_FOUND};
+        const bool root = path.empty() || path == "/";
+        if (root && req.value == 0)
+            return {};
+        if (root && req.value == UINT64_MAX)
+            req.value = 0;
+        if (on_boot)
+            req.size = 0;
+        return {on_boot ? &boot : &data, root && !on_boot};
+    } else
+        return {.status = STATUS_INVALID_OP};
+    if (on_boot && tail) {
+        ::memmove(req.data, tail->data(), tail->size());
+        req.size = tail->size();
+    }
+    return {on_boot ? &boot : &data};
+}
+int main() {
+    const auto& env = rt_startup();
+    for (auto [provider, cap] : std::array{std::pair{&boot, env.selector(fs_service)},
+                                           std::pair{&data, env.selector(st_service)}})
+        if (const auto rc = provider->open(cap, env.events); rc != STATUS_OK)
+            sys::exit(rc);
+    ch_port incoming{env.selector(vfs_service), env.events};
+    if (const auto rc = sys::notification_signal(env.selector(sv_ready)).status; rc != STATUS_OK)
+        sys::exit(rc);
+    if (const auto rc = sys::notification_signal(env.selector(sv_wake)).status; rc != STATUS_OK)
+        sys::exit(rc);
+    std::optional<vf_pending> pending;
+    std::deque<std::unique_ptr<vf_list>> lists;
+    for (;;) {
+        bool again{};
+        if (pending) {
+            const auto rc = pending->target->send(pending->request, pending->reply);
+            if (rc != STATUS_WOULD_BLOCK) {
+                if (rc != STATUS_OK)
+                    respond(pending->reply.selector(), pending->request, rc);
+                pending.reset();
+                again = true;
             }
         }
-        cap_owner object;
-        uint64_t length{}, generation{};
-        reply.status =
-            on_boot ? fs_open_object(boot_files, name, ::strlen(name), object, length, generation)
-                    : st_open(data, path, request.value, object, length, generation);
-        if (reply.status != STATUS_OK)
-            return;
-        constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE | RIGHT_DESTROY;
-        if (!response.offer(std::move(object), rights)) {
-            reply.status = STATUS_INTERNAL;
-            return;
-        }
-        reply.value = generation;
-        reply.size = sizeof(length);
-        ::memcpy(reply.data, &length, sizeof(length));
-    } else if (operation == st_control::List) {
-        const char* name = request.size == 0 ? "/" : path;
-        const char* tail = boot_name(name);
-        const bool boot_dir = tail != nullptr || !writable_root;
-        if (boot_dir && tail != nullptr && *tail != '\0') {
-            reply.status = STATUS_NOT_FOUND;
-            return;
-        }
-        const bool root = (std::string_view{name} == "/") || (std::string_view{name} == "");
-        if (root && request.value == 0) {
-            ::memcpy(reply.data, "boot", 4);
-            reply.size = 4;
-            reply.value = UINT64_MAX;
-            return;
-        }
-        const uint64_t cursor = root && request.value == UINT64_MAX ? 0 : request.value;
-        ch_msg entry{.value = cursor};
-        if (boot_dir)
-            reply.status = fs_list(boot_files, entry);
-        else
-            do {
-                reply.status = st_list(data, entry, name);
-                if (reply.status != STATUS_OK || !root)
-                    break;
-                size_t start{};
-                reply.size = 0;
-                while (start < entry.size) {
-                    size_t end = start;
-                    while (end < entry.size && entry.data[end] != '\0')
+        for (auto i = lists.begin(); i != lists.end();) {
+            auto& list = **i;
+            auto rc = STATUS_OK;
+            if (!list.result) {
+                ch_packet packet;
+                rc = list.receiver.receive(packet);
+                if (rc == STATUS_WOULD_BLOCK) {
+                    if (const auto armed = list.receiver.arm().status; armed != STATUS_OK)
+                        sys::exit(armed);
+                    ++i;
+                    continue;
+                }
+                if (rc == STATUS_OK && (packet.count || packet.message.id != list.request.id ||
+                                        packet.message.operation != list.request.operation))
+                    rc = STATUS_PEER_FAULT;
+                list.result = packet.message;
+            }
+            auto& reply = *list.result;
+            if (rc == STATUS_OK && reply.status == STATUS_OK) {
+                size_t start{}, size{};
+                while (start < reply.size) {
+                    auto end = start;
+                    while (end < reply.size && reply.data[end])
                         ++end;
-                    if (end - start != 4 || entry.data[start] != 'b' ||
-                        entry.data[start + 1] != 'o' || entry.data[start + 2] != 'o' ||
-                        entry.data[start + 3] != 't') {
-                        if (reply.size != 0)
-                            reply.data[reply.size++] = '\0';
-                        ::memcpy(reply.data + reply.size, entry.data + start, end - start);
-                        reply.size += end - start;
+                    if (std::string_view{reply.data + start, end - start} != "boot") {
+                        if (size)
+                            reply.data[size++] = '\0';
+                        ::memmove(reply.data + size, reply.data + start, end - start);
+                        size += end - start;
                     }
                     start = end + 1;
                 }
-                if (reply.size != 0 || entry.value == 0)
-                    break;
-                entry = {.value = entry.value};
-            } while (true);
-        if (reply.status == STATUS_OK) {
-            if (boot_dir && entry.size != 0) {
-                reply.size = entry.size;
-                ::memcpy(reply.data, entry.data, reply.size);
-                if (reply.data[reply.size - 1] != '\n') {
-                    reply.status = STATUS_PEER_FAULT;
-                    return;
+                reply.size = size;
+                if (!size && reply.value && !pending) {
+                    list.request.value = reply.value;
+                    rc = list.prepare(env.pool, env.cspace, env.events);
+                    if (rc == STATUS_OK) {
+                        pending.emplace(&data, list.request, std::move(list.sender));
+                        list.result.reset();
+                        again = true;
+                        ++i;
+                        continue;
+                    }
+                } else if (!size && reply.value && pending) {
+                    ++i;
+                    continue;
                 }
-                for (size_t i = 0; i < reply.size; ++i)
-                    if (reply.data[i] == '\n')
-                        reply.data[i] = '\0';
-                --reply.size;
-                reply.value = entry.value;
-            } else {
-                if (!root) {
-                    reply.size = entry.size;
-                    ::memcpy(reply.data, entry.data, reply.size);
-                }
-                reply.value = entry.value;
             }
-        }
-    } else if (operation == st_control::Remove || operation == st_control::Mkdir) {
-        if (!writable || !writable_root || boot_name(path) != nullptr) {
-            reply.status = STATUS_DENIED;
-            return;
-        }
-        reply.status =
-            operation == st_control::Remove ? st_remove(data, path) : st_mkdir(data, path);
-    } else if (operation == st_control::Rename) {
-        const size_t first = ::strlen(path);
-        if (first == 0 || first + 1 >= request.size || request.data[first] != '\0') {
-            reply.status = STATUS_BAD_ARGS;
-            return;
-        }
-        const char* target = path + first + 1;
-        if (*target == '\0' || ::strlen(target) != request.size - first - 1) {
-            reply.status = STATUS_BAD_ARGS;
-            return;
-        }
-        reply.status = !writable || !writable_root || boot_name(path) != nullptr ||
-                               boot_name(target) != nullptr
-                           ? STATUS_DENIED
-                           : st_rename(data, path, target);
-    } else if (operation == st_control::Sync) {
-        if (request.size || request.value)
-            reply.status = STATUS_BAD_ARGS;
-        else if (!writable)
-            reply.status = STATUS_DENIED;
-        else if (writable_root)
-            reply.status = st_sync(data);
-    } else if (operation == st_control::DeviceId || operation == st_control::VolumeId) {
-        if (request.size != 0 || request.value != 0) {
-            reply.status = STATUS_BAD_ARGS;
-            return;
-        }
-        if (!writable_root) {
-            reply.status = STATUS_NOT_FOUND;
-            return;
-        }
-        if (operation == st_control::DeviceId) {
-            uint8_t id[20]{};
-            reply.status = st_device_id(data, id);
-            if (reply.status == STATUS_OK) {
-                reply.size = sizeof(id);
-                ::memcpy(reply.data, id, reply.size);
+            if (rc != STATUS_OK)
+                respond(list.caller.selector(), list.request, rc);
+            else {
+                ch_reply result;
+                result.message = reply;
+                result.respond(list.caller.selector());
             }
-        } else {
-            uint8_t id[st_volume_id_size]{};
-            reply.status = st_volume_id(data, id);
-            if (reply.status == STATUS_OK) {
-                reply.size = sizeof(id);
-                ::memcpy(reply.data, id, reply.size);
-            }
+            i = lists.erase(i);
+            again = true;
         }
-    } else
-        reply.status = STATUS_INVALID_OP;
-}
-
-int main() {
-
-    const auto& info = rt_startup();
-    events = info.events;
-    uint64_t value{};
-    if (const auto rc = boot_files.connect(info.selector(fs_service), info.pool,
-                                           info.cspace, info.events,
-                                           info.vspace, 0x70000000, value);
-        rc != STATUS_OK)
-        sys::exit(rc);
-    writable_root = info.selector(st_service) != 0;
-    if (writable_root)
-        if (const auto rc = data.open(info.selector(st_service), info.pool,
-                                      info.cspace, events);
-            rc != STATUS_OK)
+        if (!pending) {
+            ch_packet packet;
+            const auto rc = incoming.receive(packet);
+            if (rc == STATUS_OK && packet.count == 1) {
+                again = true;
+                auto request = packet.message;
+                const auto plan =
+                    (packet.badge == st_read_directory || packet.badge == st_write_directory)
+                        ? route(request, packet.badge == st_write_directory)
+                        : vf_route{.status = STATUS_DENIED};
+                auto caller = std::move(packet.capabilities[0]);
+                if (plan.status != STATUS_OK)
+                    respond(caller.selector(), request, plan.status);
+                else if (!plan.provider) {
+                    ch_reply reply;
+                    reply.message = {.operation = request.operation, .id = request.id};
+                    if (request.operation == static_cast<uint64_t>(st_control::List)) {
+                        reply.message.size = 4;
+                        reply.message.value = UINT64_MAX;
+                        ::memcpy(reply.message.data, "boot", 4);
+                    }
+                    reply.respond(caller.selector());
+                } else if (plan.filter) {
+                    auto list = std::make_unique<vf_list>();
+                    list->request = request;
+                    list->caller = std::move(caller);
+                    const auto status = list->prepare(env.pool, env.cspace, env.events);
+                    if (status != STATUS_OK)
+                        respond(list->caller.selector(), request, status);
+                    else {
+                        pending.emplace(plan.provider, request, std::move(list->sender));
+                        lists.push_back(std::move(list));
+                    }
+                } else
+                    pending.emplace(plan.provider, request, std::move(caller));
+            } else if (rc != STATUS_OK && rc != STATUS_WOULD_BLOCK && rc != STATUS_BAD_ARGS &&
+                       rc != STATUS_TRANSFER_FAILED)
+                sys::exit(rc);
+        }
+        if (const auto rc = incoming.arm().status; rc != STATUS_OK)
             sys::exit(rc);
-    if (const auto rc = directory.open(info.selector(vfs_service), events); rc != STATUS_OK)
-        sys::exit(rc);
-    if (const auto rc = sys::notification_signal(info.selector(sv_ready)).status; rc != STATUS_OK)
-        sys::exit(rc);
-    if (const auto rc = sys::notification_signal(info.selector(sv_wake)).status;
-        rc != STATUS_OK)
-        sys::exit(rc);
-    for (;;) {
-        ch_packet packet;
-        const auto status = directory.receive(packet);
-        if (status == STATUS_WOULD_BLOCK) {
-            if (const auto rc = directory.arm().status; rc != STATUS_OK)
+        if (!again)
+            if (const auto rc = sys::notification_wait(env.events).status; rc != STATUS_OK)
                 sys::exit(rc);
-            if (const auto rc = sys::notification_wait(events).status; rc != STATUS_OK)
-                sys::exit(rc);
-            continue;
-        }
-        if (status == STATUS_BAD_ARGS || status == STATUS_TRANSFER_FAILED)
-            continue;
-        if (status != STATUS_OK) sys::exit(status);
-        if (packet.count != 1)
-            continue;
-        ch_reply reply;
-        reply.message = {.operation = packet.message.operation, .id = packet.message.id};
-        if (packet.badge != st_read_directory && packet.badge != st_write_directory)
-            reply.message.status = STATUS_DENIED;
-        else
-            control(packet.message, reply, packet.badge == st_write_directory);
-        reply.respond(packet.capabilities[0].selector());
     }
 }

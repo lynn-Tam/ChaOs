@@ -752,7 +752,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
         !mem_auth.range.contains(request.object) || !ceiling.contains(request.perms) ||
         (private_write &&
          (!request.perms.contains(Perm::Write) || !mem_auth.perms.contains(Perm::Read) ||
-          memory.kind() != BackingKind::Pager || memory.seal_state() != SealState::Executable))) {
+          memory.kind() == BackingKind::Physical || memory.seal_state() != SealState::Executable))) {
         return std::unexpected(VSpaceError::InvalidAuthority);
     }
 

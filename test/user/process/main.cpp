@@ -1,8 +1,9 @@
-#include <proc.hpp>
-#include <proto.hpp>
+#include <test/user/task.hpp>
+#include <exec.hpp>
+#include <protocols/file.hpp>
+#include <protocols/stream.hpp>
 #include <util.hpp>
 #include <vector>
-#include <servers/fw.hpp>
 
 int main() {
     const auto& info = rt_startup();
@@ -10,44 +11,32 @@ int main() {
         if (!ok)
             sys::exit(STATUS_INTERNAL);
     };
-    rt_clock clock;
-    if (const auto rc = clock.open(); rc != STATUS_OK)
-        sys::exit(rc);
+
     const auto notification = sys::notification_create(info.pool, 1);
     if (notification.status != STATUS_OK) sys::exit(notification.status);
     cap_owner events{notification.value};
-    io_client files;
-    uint64_t value{};
-    if (const auto rc = files.connect(info.selector(fs_service), info.pool,
-                                      info.cspace, events.selector(),
-                                      info.vspace, 0, value);
-        rc != STATUS_OK)
-        sys::exit(rc);
-    fs_file file;
-    if (const auto rc = fs_open(files, "SLEEP.PKG", 9, file); rc != STATUS_OK)
-        sys::exit(rc);
-    auto mem = fs_backing(files, file, VM_READ | VM_EXECUTE);
-    if (const auto rc = fs_close(files, file); rc != STATUS_OK)
-        sys::exit(rc);
+    ch_rpc files;
+    if(const auto rc=files.open(info.selector(fs_service),info.pool,info.cspace,events.selector());rc!=STATUS_OK) sys::exit(rc);
+    auto mem=fl_map(files,"sleep.elf",VM_READ|VM_EXECUTE);
     check(mem.has_value());
-    pr_pkg pkg;
-    if (const auto rc = pkg.open(info.vspace, mem->memory.selector(),
+    test_image image;
+    if (const auto rc = image.open(info.vspace, mem->memory.selector(),
                                  {0, pr_window::round_size(mem->size)}, mem->size,
                                  VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
         rc != STATUS_OK)
         sys::exit(rc);
-    pr_tasks tasks;
-    tasks.open(info.pool, fw_root(info).domain, info.vspace, info.cpus);
+    test_tasks tasks;
+    tasks.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
     const auto spawn = [&](const char* ms) {
         const std::string_view args[]{"sleep", ms};
-        const auto child = tasks.spawn(pkg, {},
+        const auto child = tasks.spawn(image, {},
                                        {.argv = args,
                                         .resources = {.bytes = 1024 * 1024, .caps = 64},
                                         .events = info.events});
         if (child.status != STATUS_OK) sys::exit(child.status);
         return child.id;
     };
-    const auto wait = [&](pr_id id, uint64_t deadline = 0) {
+    const auto wait = [&](test_id id, uint64_t deadline = 0) {
         for (;;) {
             const auto result = tasks.collect(id);
             if (result.status == STATUS_OK)
@@ -62,7 +51,7 @@ int main() {
         }
     };
     const auto first = spawn("10000");
-    const auto deadline = clock.after_ms(1);
+    const auto deadline = rt_after_ms(1);
     check(deadline.has_value());
     check(wait(first, *deadline) == STATUS_TIMED_OUT);
     if (const auto rc = tasks.request_stop(first); rc != STATUS_OK)
@@ -70,7 +59,7 @@ int main() {
     check(wait(first) == STATUS_CANCELED);
     check(wait(first) == STATUS_INVALID_CAP);
     // More live/unconsumed records than the removed four-slot proxy admitted.
-    std::vector<pr_id> children;
+    std::vector<test_id> children;
     for (unsigned i = 0; i < 6; ++i)
         children.push_back(spawn("1"));
     for (auto id : children)

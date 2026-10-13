@@ -164,7 +164,7 @@ public:
     }
 
     auto pending_target(usize index) noexcept {
-        libk_assert(targets_[index].retire());
+        libk_assert(targets_[index].destroy());
         targets_[index].reset();
         drain();
         auto pending = cap_test_contexts->create(sched::Sc::Config{
@@ -216,7 +216,7 @@ public:
     [[nodiscard]] auto retire_target(usize index) noexcept -> bool {
         libk_assert(index < 2 && targets_[index]);
         const auto id = targets_[index].id();
-        if (!targets_[index].retire()) {
+        if (!targets_[index].destroy()) {
             return false;
         }
         targets_[index].reset();
@@ -243,7 +243,7 @@ private:
         cap_test_graph.reset();
         for (auto& target : targets_) {
             if (target) {
-                libk_assert(target.retire());
+                libk_assert(target.destroy());
                 target.reset();
             }
         }
@@ -1049,7 +1049,7 @@ bool test_cspace_retire_waits_for_reserved_operation(
             return false;
         }
         auto reservation = std::move(reserved).value();
-        if (!held.retire()) {
+        if (!held.destroy()) {
             return false;
         }
         held.reset();
@@ -1139,7 +1139,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     {
         auto reserved = space->reserve();
         if (!reserved || pool->available().caps != limit.caps - 1
-            || !space.retire() || space->table_pages() != 3
+            || !space.destroy() || space->table_pages() != 3
             || pool->close() == object::group::phase::closed) {
             return false;
         }
@@ -1154,7 +1154,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     fixture.drain();
     if (pool->available() != limit || pool->sponsorship_count() != 0
         || pool->close() != object::group::phase::closed
-        || !pool.retire()) {
+        || !pool.destroy()) {
         return false;
     }
     pool.reset();
@@ -1331,7 +1331,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
         || pool->available() != limit
         || pool->sponsorship_count() != 0
         || pool->close() != object::group::phase::closed
-        || !pool.retire()) {
+        || !pool.destroy()) {
         return false;
     }
     pool.reset();
@@ -1416,7 +1416,7 @@ bool test_pool_close_revokes_hidden_allocation_root(
         return false;
     }
     fixture.drop_retired_target(0);
-    if (!pool.retire()) {
+    if (!pool.destroy()) {
         return false;
     }
     pool.reset();
@@ -1512,7 +1512,7 @@ bool test_parent_close_recursively_closes_child_pool(
         || parent->available() != parent_limit
         || fixture.settled_grants() != 0
         || !fixture.a().close(installed.value())
-        || !parent.retire()) {
+        || !parent.destroy()) {
         return false;
     }
     parent.reset();
@@ -1567,7 +1567,7 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
     fixture.drop_retired_target(1);
     if (pool->state() != object::group::phase::closed || pool->available() != limit
         || fixture.settled_grants() != 0 || !fixture.a().close(handles[0])
-        || !fixture.a().close(handles[1]) || !pool.retire()) return false;
+        || !fixture.a().close(handles[1]) || !pool.destroy()) return false;
     pool.reset();
     fixture.drain();
     return cap_test_pmm->verify_invariants();
@@ -1598,9 +1598,42 @@ bool test_destroy_authority_uses_object_anchor_retirement(
     return true;
 }
 
+bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    constexpr resource::budget limit{.memory=8 * mm::page_size, .caps=16};
+    auto made = cap_test_groups->create(limit);
+    if (!made) return false;
+    auto pool = made->publish();
+    auto fee = pool->reserve(pool, object::pool<CSpace>::slot_charge());
+    auto root_fee = pool->reserve(pool, Graph::node_charge());
+    if (!fee || !root_fee) return false;
+    auto object = cap_test_cspaces->create(std::move(*fee), *cap_test_pmm);
+    if (!object) return false;
+    auto root = object->root(fixture.graph(), std::move(*root_fee), View{inspect_rights});
+    if (!root) return false;
+    auto hold = object->publish();
+    root->reset();
+    fixture.drain();
+    // A real internal owner keeps the object live even without a capability.
+    if (!hold.live() || pool->available() == limit) return false;
+    hold.reset();
+    if (pool->available() == limit) return false; // Worker has not reclaimed storage yet.
+    fixture.drain();
+    if (pool->available() != limit || pool->sponsorship_count() ||
+        pool->state() != object::group::phase::open ||
+        pool->close() != object::group::phase::closed || !pool.destroy()) return false;
+    pool.reset();
+    fixture.drain();
+    return cap_test_pmm->verify_invariants();
+}
+
 } // namespace
 
 void register_cap_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("cap", "last owner asynchronously retires and refunds managed storage",
+        test_last_reference_refunds_managed_object);
+
     (void)registry.add("cap", "batch publishes all reserved selectors or none", test_cap_batch_has_one_publication);
     (void)registry.add("cap", "attachment detach transfers callback quiescence exactly once",
         test_attachment_detach_transfers_quiescence_once);

@@ -1,8 +1,8 @@
 #include <string_view>
 #include <vector>
 #include <memory>
-#include <proto.hpp>
-#include <ch.hpp>
+#include <protocols/stream.hpp>
+#include <ipc.hpp>
 #include <libk/parse.hpp>
 #include <util.hpp>
 #include <cap.hpp>
@@ -70,10 +70,8 @@ int main(int argc, char** argv) {
         check(duration && seed && *seed > 0 && *seed < 256);
         initialized[0] = *seed;
         zeroed[0] = *seed + 7;
-        rt_clock clock;
-        if (const auto rc = clock.open(); rc != STATUS_OK)
-            sys::exit(rc);
-        const auto deadline = clock.after_ms(*duration);
+
+        const auto deadline = rt_after_ms(*duration);
         check(static_cast<bool>(deadline));
         str_writer{info.selector(rt_stdout)}.write("[demand] holding private pages\n");
         check(sys::notification_wait(info.events, *deadline).status ==

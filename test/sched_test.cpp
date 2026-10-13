@@ -339,7 +339,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
     first_page.reset();
-    if (!memory.retire()) {
+    if (!memory.destroy()) {
         return false;
     }
     memory.reset();
@@ -353,7 +353,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
     if (pool->sponsorship_count() != 0
         || pool->available() != limit
         || pool->close() != object::group::phase::closed
-        || !pool.retire()) {
+        || !pool.destroy()) {
         return false;
     }
     pool.reset();
@@ -420,13 +420,13 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
     auto memory = std::move(pending_memory).value().publish();
-    if (!child.retire() || child->state() != object::group::phase::closing
+    if (!child.destroy() || child->state() != object::group::phase::closing
         || child->sponsorship_count() != 1
         || parent->sponsorship_count() != 1) {
         return false;
     }
 
-    if (!memory.retire()) {
+    if (!memory.destroy()) {
         return false;
     }
     memory.reset();
@@ -439,7 +439,7 @@ bool test_resource_pool_child_returns_transferred_budget(
     if (parent->available() != parent_limit
         || parent->sponsorship_count() != 0
         || parent->close() != object::group::phase::closed
-        || !parent.retire()) {
+        || !parent.destroy()) {
         return false;
     }
     parent.reset();
@@ -466,7 +466,7 @@ bool test_group_close_waits_for_reservation(const TestContext&) noexcept {
     if (rejected || rejected.error() != resource::errc::closed) return false;
     fee->reset();
     if (group->available() != limit || group->state() != object::group::phase::closed
-        || !group.retire()) return false;
+        || !group.destroy()) return false;
     group.reset();
     while (sched_work->run()) {}
     return sched_test_pmm->verify_invariants();
@@ -580,12 +580,12 @@ bool test_domain_admission_is_conservative_and_transactional(
             0};
     const bool wide_valid = domain->admit(wide, CpuId{0}) && domain->unadmit(wide);
     for (auto& context : contexts) {
-        if (!context.retire()) {
+        if (!context.destroy()) {
             return false;
         }
         context.reset();
     }
-    if (!domain.retire()) {
+    if (!domain.destroy()) {
         return false;
     }
     domain.reset();

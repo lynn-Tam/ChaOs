@@ -1,13 +1,13 @@
 #include <util.hpp>
 #include <servers/pci.hpp>
 #include <optional>
-#include <ch.hpp>
+#include <ipc.hpp>
 #include <cap.hpp>
 #include <test/user/task.hpp>
 #include <servers/uart.hpp>
 
-static pr_pkg program;
-static pr_tasks supervisor;
+static test_image program;
+static test_tasks supervisor;
 
 int main() {
 
@@ -28,7 +28,7 @@ int main() {
     port.reset();
     open(program, info);
     supervisor.open(info.pool, fw_root(info).domain, info.vspace, info.cpus);
-    pr_id tasks[2];
+    test_id tasks[2];
     std::array<pci_binding, 2> devices;
     for (size_t i = 0; i < 2; ++i) {
         auto found = pci->find(0x1042'1af4, i);

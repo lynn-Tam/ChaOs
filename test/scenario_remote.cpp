@@ -74,7 +74,7 @@ auto remote(Cpu& runtime) noexcept -> bool {
     const auto budget = kernel.clock.ticks<1, time::ms>();
     const auto period = kernel.clock.ticks<10, time::ms>();
     if (!budget || !period) {
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -83,7 +83,7 @@ auto remote(Cpu& runtime) noexcept -> bool {
         sched::Sc::Config{.budget = *budget, .period = *period},
         kernel.clock.rd_ticks());
     if (!pending_context) {
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -97,9 +97,9 @@ auto remote(Cpu& runtime) noexcept -> bool {
         if (context->admitted()) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
-        static_cast<void>(context.retire());
+        static_cast<void>(context.destroy());
         context.reset();
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -135,8 +135,8 @@ auto remote(Cpu& runtime) noexcept -> bool {
 
     const bool unadmitted = static_cast<bool>(
         kernel.domain.get().unadmit(context.get()));
-    const bool context_retired = context.retire();
-    const bool thread_retired = thread.retire();
+    const bool context_retired = context.destroy();
+    const bool thread_retired = thread.destroy();
     context.reset();
     thread.reset();
 

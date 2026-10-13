@@ -9,14 +9,12 @@ import sys
 import time
 
 def main():
-    qemu, kernel, bundle, disk, harts = sys.argv[1:6]
+    qemu, kernel, bundle, harts = sys.argv[1:5]
     marker = b'[fault-shell] file read before failure'
     for count in harts.split(','):
         command = [qemu, '-machine', 'virt,iommu-sys=on', '-smp', count,
                    '-nographic', '-bios', 'default', '-kernel', kernel,
-                   '-initrd', bundle,
-                   '-drive', f'if=none,id=disk,format=raw,readonly=on,file={disk}',
-                   '-device', 'virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on']
+                   '-initrd', bundle]
         process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT)
         output = bytearray()
@@ -28,7 +26,7 @@ def main():
                    or output.count(b'user: contained fault') < 3
                    or output.count(b'address=0xe100') < 3):
                 if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError('three service generations did not read the disk')
+                    raise RuntimeError('three service generations did not read the boot file')
                 for key, _ in selector.select(0.1):
                     data = os.read(key.fd, 65536)
                     if not data:

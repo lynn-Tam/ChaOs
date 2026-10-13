@@ -1,13 +1,14 @@
 #include <util.hpp>
-#include <proto.hpp>
+#include <protocols/block.hpp>
+#include <protocols/stream.hpp>
 #include <servers/pci.hpp>
-#include <ch.hpp>
+#include <ipc.hpp>
 #include <cap.hpp>
 #include <test/user/task.hpp>
 #include <servers/uart.hpp>
 
-pr_pkg program;
-pr_tasks supervisor;
+test_image program;
+test_tasks supervisor;
 
 int main() {
 
@@ -42,34 +43,47 @@ int main() {
     if (ch_recv(probe_owner.selector(), empty, false).status != STATUS_WOULD_BLOCK)
         sys::exit(STATUS_INTERNAL);
     probe_owner = {};
-    const pr_cap server_caps[]{host(selected->cap.selector(), selected->rid),
+    const auto storage = sys::resource_create_child(info.pool, 4 * 1024 * 1024, 0, OBJ_BIT(ObjMem));
+    if (storage.status != STATUS_OK) sys::exit(storage.status);
+    cap_owner memory_pool{storage.value};
+    const pr_cap server_caps[]{{.contract=io_memory, .cap=storage.value, .limit=word_t{RIGHT_CREATE}}, host(selected->cap.selector(), selected->rid),
                                input(blk_service, pair.value2, RIGHT_RECEIVE, 1)};
-    const pr_cap client_caps[]{input(blk_service, pair.value, RIGHT_SEND, 1)};
+    ch_pair lifecycle;
+    if (const auto rc = lifecycle.open(info.pool, 1, 0, 1); rc != STATUS_OK) sys::exit(rc);
+    const auto parent = sys::channel_mint(lifecycle.ends[0].selector(), info.cspace, 1,
+                                         RIGHT_SEND | RIGHT_RECEIVE);
+    if (parent.status != STATUS_OK) sys::exit(parent.status);
+    cap_owner parent_end{parent.value};
+    ch_port lifetime{parent.value, info.events};
+    const pr_cap client_caps[]{input(blk_service, pair.value, RIGHT_SEND, 1),
+        input(rt_stdout, lifecycle.ends[1].selector(), RIGHT_SEND | RIGHT_RECEIVE, 1)};
     const auto server =
         start(supervisor, program, "block", {.caps = server_caps, .resources = io_quota});
     const auto client =
         start(supervisor, program, "io-client", {.caps = client_caps, .resources = io_quota});
-    status_t status{};
+    // Keep client mappings live while the entire provider execution drains.
+    ch_msg ready;
     for (;;) {
-        auto observed = supervisor.observe(server);
-        if (observed.status != STATUS_OK) sys::exit(observed.status);
-        if (observed.value != 0) {
-            status = wait(supervisor, server);
-            (void) stop(supervisor, client);
-            (void) libk::fmt::format_to<"[io-session] server failed status={}\n">(port, status);
-            sys::exit(STATUS_INTERNAL);
-        }
-        observed = supervisor.observe(client);
-        if (observed.status != STATUS_OK) sys::exit(observed.status);
-        if (observed.value != 0)
-            break;
+        const auto received = lifetime.try_receive(ready).status;
+        if (received == STATUS_OK) break;
+        if (received != STATUS_WOULD_BLOCK) sys::exit(received);
+        const auto failed = supervisor.observe(client);
+        if (failed.status != STATUS_OK || failed.value) sys::exit(STATUS_INTERNAL);
         sys::yield();
     }
-    status = wait(supervisor, client);
-    (void) stop(supervisor, server);
+    if (ready.id != 100) sys::exit(STATUS_PEER_FAULT);
+    if (const auto rc = stop(supervisor, server); rc != STATUS_OK) sys::exit(rc);
+    if (const auto rc = lifetime.send({.id=101}).status; rc != STATUS_OK) sys::exit(rc);
+    const auto status = wait(supervisor, client);
     if (status != STATUS_OK) {
         (void) libk::fmt::format_to<"[io-session] client failed status={}\n">(port, status);
         sys::exit(status);
+    }
+    for (;;) {
+        const auto retired = sys::resource_close(memory_pool.selector()).status;
+        if (retired == STATUS_OK) break;
+        if (retired != STATUS_BUSY && retired != STATUS_RETRY) sys::exit(retired);
+        sys::yield();
     }
     port.write(
         "[io-session] ok: isolated pages, 32 outstanding, batched completion, cancel, close\n");

@@ -21,6 +21,10 @@
 !/programs/**
 !/uapi/
 !/uapi/**
+!/protocols/
+!/protocols/**
+!/adapters/
+!/adapters/**
 !/user
 !/user/**
 !/libk/

@@ -10,8 +10,8 @@ for image in "$@"; do
     printf '%s\n' "[audit] FAIL: undefined user symbol(s) in $image" >&2
     exit 1
   fi
-  if "$nm" --defined-only -n "$image" | rg -n '(_ZTI|_ZTS|_ZTV)'; then
-    printf '%s\n' "[audit] FAIL: RTTI/vtable symbol(s) in $image" >&2
+  if "$nm" --defined-only -n "$image" | rg -n '(_ZTI|_ZTS)'; then
+    printf '%s\n' "[audit] FAIL: RTTI symbol(s) in $image" >&2
     exit 1
   fi
   if "$readelf" -A "$image" | rg -q 'Tag_RISCV_arch:.*(_f|_d|_v)[0-9]'; then

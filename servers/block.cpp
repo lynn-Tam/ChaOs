@@ -1,20 +1,21 @@
 #include <util.hpp>
 #include <string.h>
-#include <proto.hpp>
+#include <protocols/block.hpp>
 #include <utility>
-#include <ch.hpp>
-#include <io.hpp>
+#include <vector>
+#include <memory>
+#include <ipc.hpp>
+#include <protocols/queue.hpp>
 #include <start.hpp>
 #include <servers/virtio_blk.hpp>
 
 static blk_dev device;
-constexpr size_t Clients = 4;
 static ch_port directory;
 struct Client final {
     cap_owner channel;
     io_server session;
 };
-Client clients[Clients];
+static std::vector<std::unique_ptr<Client>> clients;
 // Device slots and client queue slots have independent lifetimes. Keep the
 // exact client Ticket until hardware returns the corresponding device Ticket.
 struct Pending final {
@@ -60,66 +61,55 @@ int main() {
     const auto vspace = info.vspace;
     const auto cspace = info.cspace;
     const auto events = info.events;
-    if (const auto rc =
-            device.open(pool, vspace, info.selector(io_host), events, rt_event_badge);
+    const auto memory_pool = info.selector(io_memory);
+    if (!memory_pool) sys::exit(STATUS_DENIED);
+    if (const auto rc = device.open(pool, vspace, info.selector(io_host), events, rt_event_badge);
         rc != STATUS_OK)
         sys::exit(rc);
     if (const auto rc = directory.open(info.selector(blk_service), events); rc != STATUS_OK)
         sys::exit(rc);
-    for (size_t i = 0; i < Clients; ++i)
-        if (const auto rc =
-                clients[i].session.prepare(pool, vspace, cspace, 0x70000000 + i * 0x100000, true);
-            rc != STATUS_OK)
-            sys::exit(rc);
     size_t turn{};
     for (;;) {
         bool again{};
         if (const auto rc = device.acknowledge(); rc != STATUS_OK)
             sys::exit(rc);
-        for (size_t count = 0; count < Clients; ++count) {
+        for (size_t count = 0; count < io_queue_depth; ++count) {
             ch_packet packet;
-            const auto status = directory.receive(packet);
-            if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY)
+            const auto received = directory.receive(packet);
+            if (received == STATUS_WOULD_BLOCK || received == STATUS_BUSY)
                 break;
-            if (status != STATUS_OK || packet.count != 2)
+            if (received != STATUS_OK || packet.count != 2)
                 continue;
             auto endpoint = std::move(packet.capabilities[0]);
             packet.capabilities[0] = std::move(packet.capabilities[1]);
             packet.count = 1;
-            Client* available{};
-            for (auto& client : clients)
-                if (!client.channel) {
-                    available = &client;
-                    break;
-                }
-            if (!available) {
+            auto client = std::make_unique<Client>();
+            const auto status = client->session.open(endpoint.selector(), events, memory_pool, vspace,
+                                                     cspace, 0, device.capacity(), true);
+            if (status != STATUS_OK) {
                 const ch_msg reply{.operation = packet.message.operation,
                                    .id = packet.message.id,
-                                   .status = STATUS_NO_MEMORY};
+                                   .status = status};
                 (void) ch_port::send_to(endpoint.selector(), reply);
-                (void) sys::channel_close(endpoint.selector());
                 continue;
             }
-            auto& client = *available;
-            client.channel = std::move(endpoint);
-            const auto bound =
-                client.session.bind(client.channel.selector(), events, device.capacity());
-            if (bound != STATUS_OK || client.session.accept(packet, control) != STATUS_OK)
-                client.session.abort();
+            client->channel = std::move(endpoint);
+            if (client->session.accept(packet, control) != STATUS_OK)
+                client->session.abort();
+            clients.push_back(std::move(client));
         }
         for (auto& client : clients)
-            if (client.channel) {
-                if (client.session.poll(control) != STATUS_OK) {
-                    client.session.abort();
-                    again = true;
-                }
+            if (client->session.poll(control) != STATUS_OK) {
+                client->session.abort();
+                again = true;
             }
         for (size_t count = 0; device.active() && count < io_queue_depth; ++count) {
             blk_dev::Completion completion;
             const auto status = device.take(completion);
             if (status == STATUS_WOULD_BLOCK)
                 break;
-            if (status != STATUS_OK) sys::exit(status);
+            if (status != STATUS_OK)
+                sys::exit(status);
             if (completion.ticket.slot >= io_queue_depth)
                 sys::exit(STATUS_INTERNAL);
             auto& operation = pending[completion.ticket.slot];
@@ -190,10 +180,10 @@ int main() {
         for (size_t row = 0; row < io_queue_depth; ++row) {
             if (flush.client)
                 break;
-            for (size_t n = 0; n < Clients; ++n) {
-                auto& client = clients[(turn + n) % Clients];
+            for (size_t n = 0; n < clients.size(); ++n) {
+                auto& client = *clients[(turn + n) % clients.size()];
                 auto* queue = client.session.queue();
-                if (!client.channel || !queue || client.session.closing())
+                if (!queue || client.session.closing())
                     continue;
                 size_t slot{};
                 while (slot < io_queue_depth &&
@@ -241,25 +231,26 @@ int main() {
                 }
             }
         }
-        turn = (turn + 1) % Clients;
+        turn = clients.empty() ? 0 : (turn + 1) % clients.size();
         device.publish();
-        for (auto& client : clients)
-            if (client.channel) {
-                // Session close drains its DMA and withdraws peer mappings. The
-                // device remains owned by the driver and can serve other clients.
-                if (client.session.flush(true) != STATUS_OK) {
-                    client.session.abort();
-                    again = true;
-                }
-                if (client.session.done()) {
-                    (void) sys::channel_close(client.channel.selector());
-                    client.session.reset();
-                    client.channel = {};
-                } else if (client.session.arm() != STATUS_OK) {
-                    client.session.abort();
-                    again = true;
-                }
+        for (auto& owner : clients) {
+            auto& client = *owner;
+            // Session close drains its DMA and withdraws peer mappings. The
+            // device remains owned by the driver and can serve other clients.
+            if (client.session.flush(true) != STATUS_OK) {
+                client.session.abort();
+                again = true;
             }
+            if (client.session.done()) {
+                (void) sys::channel_close(client.channel.selector());
+                client.session.reset();
+                client.channel = {};
+            } else if (client.session.arm() != STATUS_OK) {
+                client.session.abort();
+                again = true;
+            }
+        }
+        std::erase_if(clients, [](const auto& client) { return !client->channel; });
         if (const auto rc = directory.arm().status; rc != STATUS_OK)
             sys::exit(rc);
         if (!again)

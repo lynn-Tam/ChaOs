@@ -1,11 +1,11 @@
-#include <proto.hpp>
+#include <protocols/stream.hpp>
 #include <utility>
 #include <test/user/channel/export_protocol.hpp>
 #include <util.hpp>
 #include <test/user/task.hpp>
 
-static pr_pkg program;
-using Supervisor = pr_tasks;
+static test_image program;
+using Supervisor = test_tasks;
 Supervisor supervisor;
 unsigned step{};
 static void expect(status_t status) noexcept {
@@ -82,9 +82,8 @@ static void abandoned_reply(cap_t pool, cap_t cspace, cap_t events) noexcept {
     expect(endpoint.close());
     ch_port peer{provider.ends[1].selector(), events};
     expect(reply.close());
-    rt_clock clock;
-    expect(clock.open());
-    const auto deadline = clock.after_ms(1'000);
+
+    const auto deadline = rt_after_ms(1'000);
     check(deadline.has_value());
     for (;;) {
         ch_msg msg;
@@ -166,7 +165,7 @@ static void stale_service(cap_t pool, cap_t cspace) noexcept {
     };
     struct Transfer final {
         cap_owner cap;
-        pr_id holder;
+        test_id holder;
     };
     auto transfer = [&]() noexcept -> Transfer {
         auto exported = next_cap();
@@ -200,17 +199,40 @@ static void stale_service(cap_t pool, cap_t cspace) noexcept {
     destroy(handoff);
 }
 
+// The provider discards its sole reply capability. The caller must observe
+// closure without a synthetic timeout or a retained sender root of its own.
+static void rpc_abandon(const rt_env& env) {
+    ch_pair request;
+    expect(request.open(env.pool, 1, 1, 1));
+    const auto minted = sys::channel_mint(request.ends[0].selector(), env.cspace, 1, RIGHT_SEND);
+    expect(minted.status);
+    cap_owner sender{minted.value};
+    const pr_cap caps[]{input(rt_stdout, request.ends[1].selector(), RIGHT_RECEIVE, 1)};
+    const std::string_view args[]{"provider", "abandon"};
+    const auto child = start(supervisor, program, "provider",
+                             {.argv = args,
+                              .caps = caps,
+                              .resources = {.bytes = 1024 * 1024,
+                                            .caps = 128,
+                                            .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)}});
+    ch_rpc rpc;
+    expect(rpc.open(sender.selector(), env.pool, env.cspace, env.events));
+    ch_msg message{.id = 73};
+    check(rpc.exchange(message) == STATUS_PEER_CLOSED);
+    expect(wait(supervisor, child));
+}
+
 int main() {
     const auto& info = rt_startup();
     supervisor.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
     open(program, info);
     const auto pool = info.pool;
+    rpc_abandon(info);
     configured_capacity(pool, info.cspace);
     abandoned_reply(pool, info.cspace, info.events);
     stale_channel(pool, info.cspace);
     stale_service(pool, info.cspace);
-    rt_clock clock;
-    expect(clock.open());
+
     for (unsigned round = 0; round != 9; ++round) {
         const auto data = sys::channel_create(pool, 1, CHANNEL_MAX_WORDS, 0, 1);
         const auto ready = sys::channel_create(pool, 4, CHANNEL_MAX_WORDS, 0, 1);
@@ -218,14 +240,13 @@ int main() {
         expect(data.status);
         expect(ready.status);
         expect(ended.status);
-        const auto sender =
-            sys::channel_mint(data.value, info.cspace, 99, RIGHT_SEND);
+        const auto sender = sys::channel_mint(data.value, info.cspace, 99, RIGHT_SEND);
         expect(sender.status);
         expect(ch_send(sender.value, {.id = 100}).status);
         expect(sys::cap_close(sender.value).status);
         const pr_cap sources[] = {input(rt_stdout, data.value, RIGHT_SEND, 99),
                                   input(rt_stderr, ready.value, RIGHT_SEND, 1)};
-        pr_id tasks[3];
+        test_id tasks[3];
         for (unsigned i = 0; i != 3; ++i) {
             const char number[]{static_cast<char>('0' + i), 0};
             const std::string_view arguments[]{"writer", number};
@@ -246,7 +267,7 @@ int main() {
         }
         // The data queue is still full. A single-slot implementation makes
         // later senders exit BUSY here instead of retaining all three waits.
-        const auto deadline = clock.after_ms(30);
+        const auto deadline = rt_after_ms(30);
         check(static_cast<bool>(deadline));
         check(sys::notification_wait(ended.value, *deadline).status == STATUS_TIMED_OUT);
         const unsigned mode = round % 3;

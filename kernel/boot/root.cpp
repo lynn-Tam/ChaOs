@@ -2,8 +2,8 @@
 #include <optional>
 #include <object/pool.hpp>
 #include <boot/info.hpp>
-#include <libk/pkg.hpp>
-#include <libk/byte_reader.hpp>
+#include <libk/cpio.hpp>
+#include <libk/elf.hpp>
 #include <cap/cap.hpp>
 #include <cap/cspace.hpp>
 #include <cpu.hpp>
@@ -26,43 +26,7 @@
 #include <task/thread.hpp>
 #include <uapi/start.h>
 #include <array>
-
-// The kernel loads one execution. Application names and deployment belong to root.
-struct Init {
-    usize entry{}, payload{};
-    std::span<const uint8_t> loads{};
-};
-
-static auto read_init(std::span<const uint8_t> bytes) noexcept -> std::optional<Init> {
-    if (bytes.size() < BOOT_LOAD_TRAILER) return {};
-    const auto end = bytes.size() - BOOT_LOAD_TRAILER;
-    libk::byte_reader r{bytes.data() + end, BOOT_LOAD_TRAILER};
-    u64 magic{}, payload{}, entry{}, off{}, count{};
-    if (!r.read_le(magic) || !r.read_le(payload) || !r.read_le(entry) ||
-        !r.read_le(off) || !r.read_le(count) || magic != BOOT_LOAD_MAGIC ||
-        !payload || payload != end || !count || off > payload ||
-        count > (payload - off) / PKG_SEGMENT_SIZE) return {};
-    return Init{entry, payload, bytes.subspan(off, count * PKG_SEGMENT_SIZE)};
-}
-
-struct Load {
-    usize va{}, size{};
-    std::span<const uint8_t> file{};
-    mm::Perms perms{};
-};
-
-static auto read_load(libk::byte_reader& r, std::span<const uint8_t> payload) noexcept
-    -> std::optional<Load> {
-    const auto s = libk::load_seg::read(r);
-    if (!s || !s->size || s->file > s->size || s->off > payload.size() ||
-        s->file > payload.size() - s->off || s->va % mm::page_size ||
-        s->va < mm::UserBegin || s->va >= mm::UserEnd ||
-        s->size > mm::UserEnd - s->va || s->perms > 7) return {};
-    const auto perms = mm::Perms::from_raw(static_cast<u8>(s->perms));
-    if (!mm::valid_perms(perms) ||
-        (perms.contains(mm::Perm::Write) && perms.contains(mm::Perm::Execute))) return {};
-    return Load{s->va, s->size, payload.subspan(s->off, s->file), perms};
-}
+#include <algorithm>
 
 constexpr usize root_stack_pages = 8;
 constexpr mm::va_t root_ipc_address{0x40000000};
@@ -84,29 +48,20 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
     return adjusted ? std::optional<usize>{*adjusted & ~(mm::page_size - 1)} : std::nullopt;
 }
 
-[[nodiscard]] static auto write_memory(mm::Pmm& pmm, mm::Mem& memory, std::span<const uint8_t> bytes) noexcept
+[[nodiscard]] static auto write_memory(mm::Pmm& pmm, mm::Mem& memory, std::span<const uint8_t> bytes, usize offset = 0) noexcept
     -> bool {
-    if (bytes.size() > memory.size()) {
-        return false;
-    }
-    usize copied{};
+    if (offset > memory.size() || bytes.size() > memory.size() - offset) return false;
     for (usize index = 0; index < memory.page_count(); ++index) {
         auto page = memory.materialize(index);
-        if (!page) {
-            return false;
-        }
-        byte* const destination = pmm.bytes(page.value().page());
-        const usize remaining = bytes.size() - copied;
-        const usize amount = remaining < mm::page_size ? remaining : mm::page_size;
-        if (amount != 0) {
-            memcpy(destination, bytes.data() + copied, amount);
-            copied += amount;
-        }
-        if (amount != mm::page_size) {
-            memset(destination + amount, 0, mm::page_size - amount);
-        }
+        if (!page) return false;
+        auto* destination = pmm.bytes(page.value().page());
+        memset(destination, 0, mm::page_size);
+        const auto start = index * mm::page_size;
+        const auto first = std::max(start, offset);
+        const auto end = std::min(start + mm::page_size, offset + bytes.size());
+        if (first < end) memcpy(destination + first - start, bytes.data() + first - offset, end - first);
     }
-    return copied == bytes.size();
+    return true;
 }
 
 [[nodiscard]] static auto map_memory(mm::VSpace& vspace, CpuId cpu, object::ref<mm::Mem>& memory,
@@ -155,13 +110,10 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     if (!source) {
         return std::unexpected(BootErr::InvalidModule);
     }
-    const auto parsed = read_init(std::span<const uint8_t>{source.value(), module.size});
-    if (!parsed) {
-        return std::unexpected(BootErr::InvalidBundle);
-    }
-
-    const Init& init = *parsed;
-    const std::span<const uint8_t> payload{source.value(), init.payload};
+    const auto archive = libk::cpio_view::parse(std::as_bytes(std::span{source.value(), module.size}));
+    const auto file = archive.find("init");
+    const auto init = file ? libk::elf_view::parse(file->data) : libk::elf_view{};
+    if (!init || init.machine() != 243) return std::unexpected(BootErr::InvalidBundle);
     std::optional<object::pending<mm::Mem>> bundle_pending;
     {
         auto adopted = pmm.adopt(std::move(reservation));
@@ -254,17 +206,24 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     {
         const mm::VRange stack_range{root_stack_address, root_stack_size};
         const mm::VRange info_range{root_info_address, mm::page_size};
-        libk::byte_reader loads{init.loads.data(), init.loads.size()};
         usize end{};
         bool entry_ok{};
-        while (loads.remaining()) {
-            const auto seg = read_load(loads, payload);
-            if (!seg) return std::unexpected(BootErr::InvalidBundle);
+        for (size_t i = 0; i < init.segment_count(); ++i) {
+            const auto raw = *init.segment(i);
+            if (raw.type != 1 || !raw.size) continue;
+            const auto skip = raw.va % mm::page_size;
+            struct { usize va, size; std::span<const uint8_t> file; mm::Perms perms; } segment{
+                raw.va - skip, raw.size + skip,
+                {reinterpret_cast<const uint8_t*>(file->data.data()) + raw.offset, raw.file_size},
+                mm::Perms::from_raw(static_cast<u8>(((raw.flags & 4) ? 1 : 0) | ((raw.flags & 2) ? 2 : 0) | ((raw.flags & 1) ? 4 : 0)))};
+            auto* seg = &segment;
+            if (seg->va < mm::UserBegin || seg->va >= mm::UserEnd || !mm::valid_perms(seg->perms))
+                return std::unexpected(BootErr::InvalidBundle);
             const auto size = page_round(seg->size);
             if (!size || seg->va < end || *size > mm::UserEnd - seg->va)
                 return std::unexpected(BootErr::InvalidBundle);
             end = seg->va + *size;
-            entry_ok |= init.entry >= seg->va && init.entry - seg->va < seg->size &&
+            entry_ok |= init.entry() >= seg->va && init.entry() - seg->va < seg->size &&
                         seg->perms.contains(mm::Perm::Execute);
             const mm::VRange range{mm::va_t{seg->va}, *size};
             if (range.intersects(stack_range) || range.intersects(info_range) ||
@@ -274,7 +233,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             if (!create_mem(hold, charge_pages(1 + *size / mm::page_size), pmm, *size,
                         mm::AnonCfg{.perms = seg->perms, .eager = true}))
                 return std::unexpected(BootErr::OutOfMemory);
-            if (!write_memory(boot.pmm, hold.get(), seg->file)) {
+            if (!write_memory(boot.pmm, hold.get(), seg->file, skip)) {
                 return std::unexpected(BootErr::OutOfMemory);
             }
             if (seg->perms.contains(mm::Perm::Execute) && !hold->seal()) {
@@ -327,7 +286,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             std::move(thread_charge).value(), std::move(stack_capacity).commit(),
             std::move(home).value(), std::move(execution).value(),
             Thread::UserStart{
-                .entry = init.entry,
+                .entry = init.entry(),
                 .stack = root_stack_address.raw() + root_stack_size - root_initial_bytes,
             });
         if (!pending_thread)
@@ -358,7 +317,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             reinterpret_cast<RootInfo*>(boot.pmm.bytes(info_lease.value().page())));
         info_page.version = ROOT_VERSION;
         info_page.bytes = sizeof(RootInfo);
-        info_page.bundle_bytes = init.payload;
+        info_page.bundle_bytes = module.size;
         info_page.resources_offset = sizeof(RootInfo);
         auto* entries = reinterpret_cast<RootResource*>(&info_page + 1);
         auto install = [&](auto& object, cap::View view) noexcept -> std::expected<cap::Handle, BootErr> {
@@ -490,7 +449,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         words[0] = 1;
         words[1] = sp + root_initial_bytes - 16;
         const std::array<AuxEntry, 11> aux{{
-            {AT_PAGESZ, mm::page_size}, {AT_ENTRY, init.entry}, {AT_SYS_POOL, pool_cap},
+            {AT_PAGESZ, mm::page_size}, {AT_ENTRY, init.entry()}, {AT_SYS_POOL, pool_cap},
             {AT_SYS_VSPACE, vm_cap}, {AT_SYS_CSPACE, cs_cap}, {AT_SYS_EVENTS, event_cap},
             {AT_SYS_CPUS, boot.cpus.count()}, {AT_SYS_IPC, root_ipc_address.raw()},
             {AT_SYS_BOOT, root_info_address.raw()}, {AT_SYS_BOOT_SIZE, info_page.bytes}, {AT_NULL, 0}}};

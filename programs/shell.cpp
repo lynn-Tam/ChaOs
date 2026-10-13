@@ -2,11 +2,14 @@
 #include <string>
 #include <algorithm>
 #include <deque>
+#include <memory>
 #include <vector>
-#include <proc.hpp>
+#include <exec.hpp>
 #include <string.h>
-#include <proto.hpp>
-#include <ch.hpp>
+#include <protocols/file.hpp>
+#include <protocols/stream.hpp>
+#include <protocols/service.hpp>
+#include <ipc.hpp>
 #include <libk/parse.hpp>
 #include <start.hpp>
 #include <util.hpp>
@@ -102,9 +105,8 @@ struct Pipe {
         return STATUS_OK;
     }
     void close() noexcept {
-        if (active())
-            if (const auto rc = sys::object_destroy(roots[0].selector()).status; rc != STATUS_OK)
-                sys::exit(rc);
+        // Pending End delivery owns its sender independently of the job result.
+        // Dropping pipe roots must not revoke that still-live capability.
         ends[0] = {};
         ends[1] = {};
         roots[0] = {};
@@ -114,9 +116,11 @@ struct Pipe {
 };
 static std::deque<Pipe> pipes;
 // The parent owns tasks. This table adds only shell stream policy to their IDs.
+struct job_spawn { uint64_t id{}; status_t status{STATUS_BUSY}; };
 class Jobs {
     struct Job {
-        pr_id task;
+        uint64_t id;
+        std::unique_ptr<pr_task> task;
         cap_owner output;
         word_t writable{};
         uint64_t sequence{};
@@ -125,50 +129,28 @@ class Jobs {
         bool discard{};
     };
     rt_env info_;
-    pr_tasks tasks_;
+    uint64_t next_id_{};
     std::deque<Job> jobs_;
-    cap_owner files_event_;
-    io_client files_;
-    rt_clock clock_;
+    ch_rpc files_;
 
   public:
     void open(const rt_env& info) {
         info_ = info;
-        if (const auto rc = clock_.open(); rc != STATUS_OK)
-            sys::exit(rc);
-        tasks_.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
-        const auto event = sys::notification_create(info.pool, 1);
-        if (event.status != STATUS_OK) sys::exit(event.status);
-        files_event_ = cap_owner{event.value};
-        uint64_t value{};
-        if (const auto rc = files_.connect(info.selector(fs_service), info.pool,
-                                           info.cspace, files_event_.selector(),
-                                           info.vspace, 0, value);
-            rc != STATUS_OK)
-            sys::exit(rc);
+
+        if (const auto rc = files_.open(info.selector(fs_service), info.pool, info.cspace, info.events); rc != STATUS_OK) sys::exit(rc);
     }
-    auto spawn(std::span<const std::string_view> argv, std::span<const cap_t, 3> stdio, bool end) -> pr_spawn {
+    auto spawn(std::span<const std::string_view> argv, std::span<const cap_t, 3> stdio, bool end) -> job_spawn {
         const std::string_view name{argv[0]};
-        // Bare commands use the boot mount's package suffix; paths are explicit.
+        // Bare commands use the boot mount's ELF suffix; paths are explicit.
         std::string path{name};
-        if (!name.ends_with(".pkg") && !name.ends_with(".PKG"))
-            path += ".PKG";
-        fs_file file;
-        auto s = fs_open(files_, path.data(), path.size(), file);
-        if (s != STATUS_OK)
-            return {{}, s};
-        auto memory = fs_backing(files_, file, VM_READ | VM_EXECUTE);
-        const auto closed = fs_close(files_, file);
-        if (!memory)
-            return {{}, memory.error()};
-        if (closed != STATUS_OK)
-            return {{}, closed};
-        pr_pkg pkg;
-        s = pkg.open(info_.vspace, memory->memory.selector(),
-                     {0, pr_window::round_size(memory->size)}, memory->size,
-                     VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
-        if (s != STATUS_OK)
-            return {{}, s};
+        if (!name.ends_with(".elf") && !name.ends_with(".ELF"))
+            path += ".elf";
+        auto memory = fl_map(files_,path.c_str(),VM_READ|VM_EXECUTE);
+        if(!memory) return {{},memory.error()};
+        status_t s{};
+        auto mapped = vm_area::map(info_.vspace, std::move(memory->memory), 0,
+                                   pr_window::round_size(memory->size), VM_READ);
+        if (!mapped) return {{}, mapped.error()};
         const auto binding = [](rt_req role, cap_t cap, word_t rights) {
             return pr_cap{.contract = role, .cap = cap, .limit = rights};
         };
@@ -194,35 +176,27 @@ class Jobs {
             if (s != STATUS_OK)
                 return {{}, s};
         }
-        const auto child =
-            tasks_.spawn(pkg, {},
-                         {.argv = argv,
-                          .caps = caps,
-                          .resources = {.bytes = 4 * 1024 * 1024,
-                                        .caps = 128,
-                                        .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)},
-                          .events = info_.events});
-        if (child.id.valid())
-            jobs_.push_back(Job{
-                child.id, std::move(output), writable, 0, {}, false, child.status != STATUS_OK});
-        else if (output)
-            if (const auto rc = sys::channel_unbind(output.selector(), writable).status;
-                rc != STATUS_OK)
-                sys::exit(rc);
-        if (child.status == STATUS_OK)
-            latest = child.id.key();
-        return child;
+        if (next_id_ == UINT64_MAX) return {{}, STATUS_NO_MEMORY};
+        auto task = std::make_unique<pr_task>();
+        s = pr_exec(*task, {info_.pool, info_.selector(rt_domain), info_.vspace, static_cast<uint32_t>(info_.cpus)},
+            pr_image{.bytes={reinterpret_cast<const std::byte*>(mapped->address),memory->size},.memory=mapped->memory.selector(),.perms=VM_READ|VM_EXECUTE}, {.argv = argv, .caps = caps,
+                .resources = {.bytes = 4 * 1024 * 1024, .caps = 128,
+                              .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)}, .events = info_.events}, next_id_);
+        const auto id = ++next_id_;
+        jobs_.push_back(Job{id, std::move(task), std::move(output), writable, 0, {}, false, s != STATUS_OK});
+        if (s == STATUS_OK) latest = id;
+        return {id, s};
     }
     void poll() {
         for (auto i = jobs_.begin(); i != jobs_.end();) {
             auto& job = *i;
             if (!job.consumed) {
-                const auto s = tasks_.poll(job.task);
+                const auto s = job.task->poll();
                 if (s == STATUS_OK) {
                     // A dead consumer has no reader, even while its exit result
                     // remains unconsumed. Release backpressured writers now.
                     for (auto& pipe : pipes)
-                        if (pipe.consumer == job.task.key()) {
+                        if (pipe.consumer == job.id) {
                             pipe.consumer = 0;
                             if (const auto rc = sys::channel_close(pipe.roots[0].selector()).status;
                                 rc != STATUS_OK)
@@ -230,9 +204,9 @@ class Jobs {
                         }
                     if (job.output && !job.end)
                         job.end = ch_msg{.operation = static_cast<uint64_t>(str_frame::End),
-                                         .status = tasks_.result(job.task)->status};
+                                         .status = job.task->result()->status};
                     if (job.discard) {
-                        if (const auto rc = tasks_.collect(job.task).status; rc != STATUS_OK)
+                        if (const auto rc = job.task->collect().status; rc != STATUS_OK)
                             sys::exit(rc);
                         job.consumed = true;
                     }
@@ -268,9 +242,9 @@ class Jobs {
         // exit notification. Wake briefly only while such retirement is pending.
         auto wake_at = deadline;
         if (std::any_of(jobs_.begin(), jobs_.end(), [&](const auto& job) {
-                return !job.consumed && tasks_.closing_needs_poll(job.task);
+                return !job.consumed && job.task->closing();
             })) {
-            const auto next = clock_.after_ms(1);
+            const auto next = rt_after_ms(1);
             if (!next)
                 return {.status = STATUS_BAD_ARGS};
             if (!wake_at || *next < wake_at)
@@ -283,11 +257,11 @@ class Jobs {
         for (;;) {
             poll();
             auto i = std::find_if(jobs_.begin(), jobs_.end(),
-                                  [=](const auto& job) { return job.task.key() == id; });
+                                  [=](const auto& job) { return job.id == id; });
             if (i == jobs_.end() || i->discard || i->consumed)
                 return {.status = STATUS_INVALID_CAP};
-            if (tasks_.result(i->task)) {
-                const auto result = tasks_.collect(i->task);
+            if (i->task->result()) {
+                const auto result = i->task->collect();
                 i->consumed = true;
                 for (auto& pipe : pipes)
                     if (pipe.active()) {
@@ -310,7 +284,7 @@ class Jobs {
                     latest = 0;
                     for (const auto& job : jobs_)
                         if (!job.consumed && !job.discard)
-                            latest = job.task.key();
+                            latest = job.id;
                 }
                 return result;
             }
@@ -321,16 +295,16 @@ class Jobs {
     }
     auto stop(uint64_t id) -> sys::SysResult {
         auto i = std::find_if(jobs_.begin(), jobs_.end(),
-                              [=](const auto& job) { return job.task.key() == id; });
+                              [=](const auto& job) { return job.id == id; });
         if (i == jobs_.end() || i->consumed || i->discard)
             return {.status = STATUS_INVALID_CAP};
-        const auto s = tasks_.request_stop(i->task);
+        const auto s = i->task->stop();
         return s == STATUS_OK ? wait(id) : sys::SysResult{.status = s};
     }
     void list(str_writer& console) const {
         for (const auto& job : jobs_)
             if (!job.discard && !job.consumed)
-                (void) libk::fmt::format_to<"task: {}\n">(console, job.task.key());
+                (void) libk::fmt::format_to<"task: {}\n">(console, job.id);
     }
 };
 static Jobs jobs;
@@ -534,10 +508,8 @@ static void command(char* line, str_writer& console, cap_t control, cap_t pool, 
             ++end;
         if (wait && *end) {
             const auto duration = libk::parse<uint64_t>(end);
-            rt_clock clock;
-            if (const auto rc = clock.open(); rc != STATUS_OK)
-                sys::exit(rc);
-            const auto deadline = duration ? clock.after_ms(*duration) : std::nullopt;
+
+            const auto deadline = duration ? rt_after_ms(*duration) : std::nullopt;
             if (!deadline) {
                 console.write("invalid timeout\n");
                 return;
@@ -597,7 +569,7 @@ static void command(char* line, str_writer& console, cap_t control, cap_t pool, 
             status = child.status;
             if (status != STATUS_OK)
                 break;
-            ids[i] = child.id.key();
+            ids[i] = child.id;
             if (links[i])
                 links[i]->consumer = ids[i];
             if (i + 1 < stages)

@@ -24,3 +24,7 @@ extern "C" void run_constructors() noexcept {
 
 
 extern "C" [[noreturn]] void abort() noexcept { sys::exit(STATUS_INTERNAL); }
+
+extern "C" [[noreturn]] void __assert_func(const char*, int, const char*, const char*) {
+    sys::exit(STATUS_INTERNAL);
+}

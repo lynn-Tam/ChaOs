@@ -21,6 +21,7 @@ class Thread;
 namespace object {
 
 class group;
+class Member;
 class anchor;
 // One table binds ABI tags to payload types and their typed storage.
 template<class...> class store;
@@ -67,6 +68,7 @@ private:
     struct Ops final {
         void (*retain)(void*, anchor&, u64) noexcept;
         bool (*live)(void*, anchor&, u64) noexcept;
+        bool (*try_retain)(void*, anchor&, u64) noexcept;
         void (*drop_ref)(void*, anchor&, u64) noexcept;
         void* (*payload)(anchor&) noexcept;
         bool (*destroy)(void*, anchor&, u64) noexcept;
@@ -79,6 +81,7 @@ private:
     template<typename T>
     friend class ref;
     friend class cleanup;
+    friend class Member;
 
     void* owner_{};
     const Ops* ops_{};
@@ -225,9 +228,6 @@ public:
     [[nodiscard]] auto destroy() const noexcept -> bool {
         return anchor_ && anchor_->ops_->destroy(anchor_->owner_, *anchor_, generation_);
     }
-    [[nodiscard]] auto retire() const noexcept -> bool {
-        return anchor_ != nullptr && anchor_->ops_->request_retire(anchor_->owner_, *anchor_, generation_);
-    }
     void reset() noexcept {
         auto* anchor = std::exchange(anchor_, nullptr);
         const auto generation = std::exchange(generation_, u64{});
@@ -235,6 +235,10 @@ public:
     }
 
 private:
+    friend class Member;
+    [[nodiscard]] auto retire() const noexcept -> bool {
+        return anchor_ != nullptr && anchor_->ops_->request_retire(anchor_->owner_, *anchor_, generation_);
+    }
     template<typename> friend class ref;
     template<typename> friend class pool;
     ref(anchor& anchor, u64 generation) noexcept : anchor_(&anchor), generation_(generation) {}

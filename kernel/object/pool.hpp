@@ -118,12 +118,15 @@ class Member final : private libk::noncopyable_nonmovable {
     void abort() noexcept;
     void retire() noexcept;
     void ready() noexcept;
+    void detach() noexcept;
+    auto pin() const noexcept -> ref<>;
 
     resource::Sponsorship fee_{};
     group* owner_{};
     cap::Graph* graph_{};
     cap::GrantKey root_{};
-    ref<> target_{};
+    Id target_{};
+    ref<> hold_{};
     cap::GrantRevoke revoke_{};
     Member* previous_{};
     Member* next_{};
@@ -319,13 +322,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             libk_assert(slot->anchor.refs_ != std::numeric_limits<usize>::max());
             ++slot->anchor.refs_;
         }
-        cleanup done{slot->anchor, id.generation};
-        if constexpr (requires(T& value, cleanup&& token) { traits<T>::retire(value, std::move(token)); }) {
-            traits<T>::retire(*slot->object(), std::move(done));
-        } else {
-            traits<T>::retire(*slot->object());
-            done.complete();
-        }
+        finish_retire(*slot, id.generation);
         return true;
     }
 
@@ -335,6 +332,19 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
   private:
+    void finish_retire(Slot& slot, u64 generation) noexcept {
+        // Group traversal pins live slots before releasing its lock. Once
+        // retirement begins, detach before cleanup can make this slot reusable.
+        slot.member->detach();
+        cleanup done{slot.anchor, generation};
+        if constexpr (requires(T& value, cleanup&& token) { traits<T>::retire(value, std::move(token)); }) {
+            traits<T>::retire(*slot.object(), std::move(done));
+        } else {
+            traits<T>::retire(*slot.object());
+            done.complete();
+        }
+    }
+
     [[nodiscard]] auto find_slot(Id id) noexcept -> Slot* {
         if (!id.valid()) return nullptr;
         auto* slot = storage_.find(id.slot);
@@ -403,15 +413,23 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     void release_ref(anchor& anchor, u64 generation) noexcept {
-        bool queued{};
+        bool queued{}, retire{};
         {
             sync::Lock guard{lock_};
             libk_assert(anchor.owner_ == this && anchor.generation_ == generation);
             libk_assert(anchor.refs_ != 0);
             --anchor.refs_;
-            queued = queue_reclaim_if_ready(slot_of(anchor));
+            if (anchor.refs_ == 0 && anchor.phase_ == anchor::phase::live) {
+                anchor.phase_ = anchor::phase::retiring;
+                ++anchor.refs_; // Cleanup owns the slot until its hook completes.
+                auto& slot = slot_of(anchor);
+                anchor.queued_ = true;
+                slot.next_reclaim = reclaim_head_;
+                reclaim_head_ = &slot;
+                retire = true;
+            } else queued = queue_reclaim_if_ready(slot_of(anchor));
         }
-        if (queued) notify_cleanup();
+        if (retire || queued) notify_cleanup();
     }
 
     void finish_cleanup(anchor& anchor, u64 generation) noexcept {
@@ -436,6 +454,12 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         auto& pool = *static_cast<class pool*>(owner);
         sync::Lock guard{pool.lock_};
         return anchor.generation_ == generation && anchor.phase_ == anchor::phase::live;
+    }
+
+    static auto anchor_try_retain(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
+        auto& storage = *static_cast<pool*>(owner);
+        sync::Lock guard{storage.lock_};
+        return storage.add_ref_locked(anchor, generation);
     }
 
     static void anchor_drop_ref(void* owner, anchor& anchor, u64 generation) noexcept {
@@ -474,6 +498,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     inline static constexpr anchor::Ops anchor_ops_{
         .retain = anchor_retain,
         .live = anchor_live,
+        .try_retain = anchor_try_retain,
         .drop_ref = anchor_drop_ref,
         .payload = payload,
         .destroy = destroy,
@@ -497,6 +522,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     void drain(usize budget = std::numeric_limits<usize>::max()) noexcept {
         for (usize i = 0; i < budget; ++i) {
             Slot* slot{};
+            bool retire{};
             {
                 sync::Lock guard{lock_};
                 slot = reclaim_head_;
@@ -505,9 +531,16 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                 slot->next_reclaim = nullptr;
                 slot->anchor.queued_ = false;
                 libk_assert(slot->anchor.phase_ == anchor::phase::retiring);
-                libk_assert(slot->anchor.clean_);
-                libk_assert(slot->anchor.refs_ == 0);
-                slot->anchor.phase_ = anchor::phase::quiescent;
+                retire = !slot->anchor.clean_;
+                if (retire) libk_assert(slot->anchor.refs_ == 1);
+                else {
+                    libk_assert(slot->anchor.refs_ == 0);
+                    slot->anchor.phase_ = anchor::phase::quiescent;
+                }
+            }
+            if (retire) {
+                finish_retire(*slot, slot->anchor.generation_);
+                continue;
             }
             traits<T>::destroy(*slot->object());
             auto refund = slot->member->fee_.detach();

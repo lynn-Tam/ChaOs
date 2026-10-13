@@ -13,11 +13,11 @@ CALL(EXECUTION_START, 3, thread_start, Any, Call) /* a0=Thread */
 
 CALL(CAP_CLOSE, 16, cap_call, Any, Call) /* a0=selector, a1=dest CSpace (0=current) */
 CALL(CAP_DUPLICATE, 17, cap_call, Any, Call)
-CALL(CAP_DELEGATE, 18, cap_call, Any, Call)
+CALL(CAP_DELEGATE, 18, cap_call, Any, Call) /* a3=optional grant payer Group (0=source CSpace) */
 CALL(CAP_MOVE, 19, cap_call, Any, Call)
 CALL(CAP_REVOKE, 20, cap_call, Any, Call)
 CALL(OBJECT_DESTROY, 21, cap_call, Any, Call)
-CALL(CAP_TYPED_DELEGATE, 22, cap_call, Any, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset */
+CALL(CAP_TYPED_DELEGATE, 22, cap_call, Any, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset, a4=optional grant payer Group (0=source CSpace) */
 
 CALL(VM_MAP, 32, vm_call, Any, Call)
 CALL(VM_UNMAP, 33, vm_call, Any, Call)

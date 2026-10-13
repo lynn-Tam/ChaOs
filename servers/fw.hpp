@@ -1,4 +1,5 @@
 #pragma once
+#include <start.hpp>
 #include <libk/fdt.hpp>
 #include <start.hpp>
 #include <cap.hpp>

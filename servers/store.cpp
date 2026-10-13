@@ -2,19 +2,23 @@
 #include <string_view>
 #include <string.h>
 #include <utility>
-#include <ch.hpp>
-#include <io.hpp>
+#include <ipc.hpp>
+#include <servers/read.hpp>
 #include <servers/volume.hpp>
 #include <start.hpp>
-#include <proto.hpp>
+#include <protocols/file.hpp>
+#include <protocols/block.hpp>
+#include <protocols/service.hpp>
 #include <expected>
+#include <deque>
+#include <memory>
+#include <vector>
 
-constexpr size_t Opens = 8;
 static ch_port directory;
 static blk_client backend;
 static st_vol volume;
 static cap_t events;
-static cap_t store_pool, store_cspace, store_vspace;
+static cap_t store_pool, store_memory, store_cspace, store_vspace;
 static uint8_t expected_id[st_volume_id_size]{};
 static bool require_id{};
 
@@ -25,27 +29,28 @@ static auto expected(const uint8_t* id) noexcept -> bool {
     return true;
 }
 
-struct inode final {
+struct inode final : private libk::noncopyable_nonmovable {
     lfs_file_t state{};
     lfs_file_config config{};
     uint8_t cache[st_vol::BlockSize]{};
     bool open{};
-    size_t refs{};
+    ~inode() {
+        if (open)
+            lfs_file_drop(volume.fs(), &state);
+    }
 };
-inode nodes[Opens];
+static std::vector<std::shared_ptr<inode>> nodes;
 
 static void drain_reads() noexcept;
 
-static void drop(inode& node) noexcept {
-    lfs_file_drop(volume.fs(), &node.state);
-    node.open = false;
-}
 static void reap() noexcept {
-    for (auto& node : nodes)
-        if (node.open && !node.refs &&
-            (!(node.state.flags & (LFS_F_DIRTY | LFS_F_WRITING)) ||
-             node.state.m.pair[0] == UINT32_MAX || node.state.m.pair[1] == UINT32_MAX))
-            drop(node);
+    // The registry retains dirty dormant inodes: littlefs' mlist pins their
+    // uncommitted CTZ blocks. Open descriptions share the same inode identity.
+    std::erase_if(nodes, [](const auto& node) {
+        return node.use_count() == 1 &&
+               (!(node->state.flags & (LFS_F_DIRTY | LFS_F_WRITING)) ||
+                node->state.m.pair[0] == UINT32_MAX || node->state.m.pair[1] == UINT32_MAX);
+    });
 }
 static auto writeback(inode& node) noexcept -> status_t {
     if (node.state.flags & LFS_F_ERRED)
@@ -54,22 +59,6 @@ static auto writeback(inode& node) noexcept -> status_t {
     if (volume.failed())
         sys::exit(status);
     return status;
-}
-static auto allocate() noexcept -> std::expected<inode*, status_t> {
-    for (auto& node : nodes)
-        if (!node.open)
-            return &node;
-    // Cache pressure, rather than close, chooses when a dormant inode writes
-    // back. Its mlist reference pins uncommitted CTZ blocks until then.
-    for (auto& node : nodes)
-        if (!node.refs) {
-            const auto status = writeback(node);
-            if (status != STATUS_OK)
-                return std::unexpected(status);
-            drop(node);
-            return &node;
-        }
-    return std::unexpected(STATUS_NO_MEMORY);
 }
 
 // littlefs updates these references on metadata relocation and deletion.
@@ -90,19 +79,18 @@ static auto lookup(const char* path) -> std::expected<entry, int> {
     lfs_file_drop(volume.fs(), &probe);
     return found;
 }
-static auto find(const entry& entry) -> inode* {
+static auto find(const entry& entry) -> std::shared_ptr<inode> {
     for (auto& node : nodes)
-        if (node.open && node.state.id == entry.id) {
-            const auto& a = node.state.m.pair;
+        if (node->state.id == entry.id) {
+            const auto& a = node->state.m.pair;
             const auto& b = entry.dir.pair;
             if (a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1])
-                return &node;
+                return node;
         }
     return nullptr;
 }
 
-[[nodiscard]] auto open_file(inode& file, const char* path, uint64_t flags,
-                             uint64_t& length) noexcept -> status_t {
+[[nodiscard]] auto open_file(inode& file, const char* path, uint64_t flags) noexcept -> status_t {
     file.config = {};
     file.config.buffer = file.cache;
     const bool write = (flags & st_write) != 0;
@@ -118,13 +106,7 @@ static auto find(const entry& entry) -> inode* {
     const int result = lfs_file_opencfg(volume.fs(), &file.state, path, mode, &file.config);
     if (result < 0)
         return volume.error(result);
-    const auto bytes = lfs_file_size(volume.fs(), &file.state);
-    if (bytes < 0) {
-        lfs_file_drop(volume.fs(), &file.state);
-        return volume.error(bytes);
-    }
     file.open = true;
-    length = bytes;
     return STATUS_OK;
 }
 
@@ -163,18 +145,15 @@ static auto find(const entry& entry) -> inode* {
 }
 
 struct Open final {
-    inode* file{};
+    std::shared_ptr<inode> file;
     cap_owner channel;
     io_server session;
-    uint64_t offset{}, generation{};
-    bool live{}, busy{};
-    bool prepared{};
+    uint64_t offset{};
+    bool busy{};
     bool readable{}, writable{}, append{};
 
-    [[nodiscard]] auto create(const ch_msg& request, const char* path, size_t slot,
-                              ch_reply& reply) noexcept -> status_t {
-        if (generation == UINT64_MAX)
-            return STATUS_NO_MEMORY;
+    [[nodiscard]] auto create(const ch_msg& request, const char* path, ch_reply& reply) noexcept
+        -> status_t {
         const auto pair = sys::channel_create(store_pool, 1, CHANNEL_MAX_WORDS, 4, 2);
         if (pair.status != STATUS_OK)
             return pair.status;
@@ -183,22 +162,12 @@ struct Open final {
         const auto client = sys::channel_mint(client_root.selector(), store_cspace, 1,
                                               common | RIGHT_DESTROY | RIGHT_DUPLICATE);
         const auto server = sys::channel_mint(server_root.selector(), store_cspace, 1, common);
-        if (client.status != STATUS_OK || server.status != STATUS_OK) {
-            (void) sys::object_destroy(client_root.selector());
-            return client.status != STATUS_OK ? client.status : server.status;
-        }
         cap_owner endpoint{client.value};
         channel = cap_owner{server.value};
-        auto status = STATUS_OK;
-        if (!prepared) {
-            status = session.prepare(store_pool, store_vspace, store_cspace,
-                                     0x72000000 + slot * 0x100000, true);
-            if (status == STATUS_OK)
-                prepared = true;
-        }
-        if (status == STATUS_OK)
-            status = session.bind(channel.selector(), events, generation + 1);
-        uint64_t length{};
+        if (client.status != STATUS_OK || server.status != STATUS_OK)
+            return client.status != STATUS_OK ? client.status : server.status;
+        auto status = session.open(channel.selector(), events, store_memory, store_vspace,
+                                   store_cspace, 0, 0, true);
         if (status == STATUS_OK) {
             const auto entry = lookup(path);
             if (!entry && entry.error() != LFS_ERR_NOENT)
@@ -207,57 +176,26 @@ struct Open final {
                 file = find(*entry);
             if (file) {
                 if ((request.value & st_exclusive) && (request.value & st_create))
-                    status = STATUS_BUSY;
+                    status = file_exists;
                 else if (request.value & st_truncate) {
                     const auto result = lfs_file_truncate(volume.fs(), &file->state, 0);
                     status = volume.error(result);
                 }
-                if (status == STATUS_OK) {
-                    const auto bytes = lfs_file_size(volume.fs(), &file->state);
-                    status = volume.error(bytes < 0 ? bytes : 0);
-                    if (status == STATUS_OK)
-                        length = bytes;
-                }
             } else if (status == STATUS_OK) {
-                const auto available = allocate();
-                if (!available)
-                    status = available.error();
-                else {
-                    file = *available;
-                    const auto flags = (request.value & ~(st_read | st_write)) | st_read | st_write;
-                    status = open_file(*file, path, flags, length);
-                }
+                file.reset(new inode);
+                const auto flags = (request.value & ~(st_read | st_write)) | st_read | st_write;
+                status = open_file(*file, path, flags);
+                if (status == STATUS_OK)
+                    nodes.push_back(file);
             }
         }
-        if (status != STATUS_OK) {
-            reap();
-            file = nullptr;
-            (void) sys::object_destroy(endpoint.selector());
-            session.abort();
-            if (session.done())
-                session.reset();
-            channel = {};
+        if (status != STATUS_OK)
             return status;
-        }
-        if (!reply.offer(std::move(endpoint), common | RIGHT_DESTROY | RIGHT_DUPLICATE)) {
-            reap();
-            file = nullptr;
-            (void) sys::object_destroy(endpoint.selector());
-            session.abort();
-            if (session.done())
-                session.reset();
-            channel = {};
+        if (!reply.offer(std::move(endpoint), common | RIGHT_DESTROY | RIGHT_DUPLICATE))
             return STATUS_INTERNAL;
-        }
-        live = true;
-        ++file->refs;
         readable = (request.value & st_read) != 0;
         writable = (request.value & st_write) != 0;
         append = (request.value & st_append) != 0;
-        offset = request.value & st_append ? length : 0;
-        reply.message.value = ++generation;
-        reply.message.size = sizeof(length);
-        ::memcpy(reply.message.data, &length, sizeof(length));
         return STATUS_OK;
     }
 
@@ -295,7 +233,7 @@ struct Open final {
                           request.flags == 1, readable, writable, append);
     }
 };
-Open opens[Opens];
+static std::deque<std::unique_ptr<Open>> opens;
 
 // The ticket retains its endpoint and inode until the device stops accessing
 // the payload. Filesystem mutation is serialized behind these physical reads.
@@ -383,7 +321,7 @@ static auto start_read(Open& open, io_ticket ticket, pending& pending) noexcept 
     const auto available = offset < file.ctz.size ? file.ctz.size - offset : 0;
     pending = {.open = &open,
                .ticket = ticket,
-               .read = {.object = reinterpret_cast<uintptr_t>(open.file),
+               .read = {.object = reinterpret_cast<uintptr_t>(open.file.get()),
                         .offset = offset,
                         .output = open.session.payload() + request.buffer_offset,
                         .size = std::min<uint64_t>(request.length, available),
@@ -456,14 +394,11 @@ static void control(const ch_msg& request, ch_reply& response, bool writable, bo
             reply.status = STATUS_DENIED;
             return;
         }
-        for (const auto& opened : opens)
-            if (opened.live) {
-                reply.status = STATUS_BUSY;
-                return;
-            }
-        for (auto& node : nodes)
-            if (node.open)
-                drop(node);
+        if (!opens.empty()) {
+            reply.status = STATUS_BUSY;
+            return;
+        }
+        nodes.clear();
         reply.status = volume.format(
             request.size == 0 ? nullptr : reinterpret_cast<const uint8_t*>(request.data));
         if (volume.failed())
@@ -483,12 +418,11 @@ static void control(const ch_msg& request, ch_reply& response, bool writable, bo
             reply.status = STATUS_BAD_ARGS;
             return;
         }
-        for (auto& node : nodes)
-            if (node.open) {
-                reply.status = writeback(node);
-                if (reply.status != STATUS_OK)
-                    return;
-            }
+        for (auto& node : nodes) {
+            reply.status = writeback(*node);
+            if (reply.status != STATUS_OK)
+                return;
+        }
         reply.status = backend.flush();
         if (reply.status != STATUS_OK)
             sys::exit(reply.status);
@@ -510,11 +444,10 @@ static void control(const ch_msg& request, ch_reply& response, bool writable, bo
             reply.status = STATUS_DENIED;
             return;
         }
-        size_t slot{};
-        while (slot < Opens && opens[slot].live)
-            ++slot;
-        reply.status =
-            slot == Opens ? STATUS_NO_MEMORY : opens[slot].create(request, path, slot, response);
+        auto opened = std::make_unique<Open>();
+        reply.status = opened->create(request, path, response);
+        if (reply.status == STATUS_OK)
+            opens.push_back(std::move(opened));
     } else if (operation == st_control::List) {
         char path[sizeof(request.data) + 1]{};
         if (request.value > UINT32_MAX) {
@@ -604,7 +537,7 @@ static void control(const ch_msg& request, ch_reply& response, bool writable, bo
                 }
             const char* target = path + first + 1;
             const auto source = lookup(path);
-            auto* moved = source ? find(*source) : nullptr;
+            auto moved = source ? find(*source) : nullptr;
             if (!source && source.error() != LFS_ERR_ISDIR)
                 result = source.error();
             else {
@@ -638,6 +571,8 @@ int main(int argc, char** argv) {
     const auto vspace = info.vspace;
     const auto cspace = info.cspace;
     store_pool = pool;
+    store_memory = info.selector(io_memory);
+    if (!store_memory) sys::exit(STATUS_DENIED);
     store_cspace = cspace;
     store_vspace = vspace;
     events = info.events;
@@ -650,7 +585,7 @@ int main(int argc, char** argv) {
         require_id = true;
     }
     if (const auto rc =
-            backend.connect(info.selector(blk_service), pool, cspace, events, vspace, 0x70000000);
+            backend.connect(info.selector(blk_service), pool, cspace, events, vspace, 0);
         rc != STATUS_OK)
         sys::exit(rc);
     if (const auto rc = volume.open(backend); rc != STATUS_OK)
@@ -666,8 +601,7 @@ int main(int argc, char** argv) {
         sys::exit(rc);
     if (const auto rc = sys::notification_signal(info.selector(sv_ready)).status; rc != STATUS_OK)
         sys::exit(rc);
-    if (const auto rc = sys::notification_signal(info.selector(sv_wake)).status;
-        rc != STATUS_OK)
+    if (const auto rc = sys::notification_signal(info.selector(sv_wake)).status; rc != STATUS_OK)
         sys::exit(rc);
     for (;;) {
         bool again = pump_reads();
@@ -679,7 +613,8 @@ int main(int argc, char** argv) {
                 break;
             if (status == STATUS_BAD_ARGS || status == STATUS_TRANSFER_FAILED)
                 continue;
-            if (status != STATUS_OK) sys::exit(status);
+            if (status != STATUS_OK)
+                sys::exit(status);
             if (packet.count != 1)
                 continue;
             again = true;
@@ -693,75 +628,73 @@ int main(int argc, char** argv) {
                         packet.badge == st_admin_directory);
             reply.respond(packet.capabilities[0].selector());
         }
-        for (auto& opened : opens)
-            if (opened.live) {
-                if (opened.session.poll([&](const ch_msg& request, ch_reply& reply) {
-                        again = true;
-                        opened.control(request, reply);
-                    }) != STATUS_OK) {
+        for (auto& owner : opens) {
+            auto& opened = *owner;
+            if (opened.session.poll([&](const ch_msg& request, ch_reply& reply) {
+                    again = true;
+                    opened.control(request, reply);
+                }) != STATUS_OK) {
+                opened.session.abort();
+                again = true;
+            }
+        }
+        for (auto& owner : opens) {
+            auto& opened = *owner;
+            auto* queue = opened.session.queue();
+            if (!queue || opened.session.closing())
+                continue;
+            for (size_t row = 0; row < io_queue_depth && !opened.busy; ++row) {
+                auto* pending = slot();
+                if (!pending)
+                    break;
+                io_ticket ticket{};
+                const auto admission = queue->admit(ticket);
+                if (admission == io_admission::Empty || admission == io_admission::Backpressure)
+                    break;
+                if (admission != io_admission::Ready) {
                     opened.session.abort();
                     again = true;
+                    break;
                 }
-            }
-        for (auto& opened : opens)
-            if (opened.live) {
-                auto* queue = opened.session.queue();
-                if (!queue || opened.session.closing())
+                if (start_read(opened, ticket, *pending)) {
+                    again = true;
                     continue;
-                for (size_t row = 0; row < io_queue_depth && !opened.busy; ++row) {
-                    auto* pending = slot();
-                    if (!pending)
-                        break;
-                    io_ticket ticket{};
-                    const auto admission = queue->admit(ticket);
-                    if (admission == io_admission::Empty || admission == io_admission::Backpressure)
-                        break;
-                    if (admission != io_admission::Ready) {
-                        opened.session.abort();
-                        again = true;
-                        break;
-                    }
-                    if (start_read(opened, ticket, *pending)) {
-                        again = true;
-                        continue;
-                    }
-                    // Native inline/dirty-cache I/O and mutations retain littlefs'
-                    // cursor/cache ordering and cannot recycle a pinned data block.
-                    drain_reads();
-                    const auto completion = opened.transfer(*queue->request(ticket));
-                    // Nested Block waits share this notification and may consume
-                    // another session's hint. Drain all queues again before sleep.
+                }
+                // Native inline/dirty-cache I/O and mutations retain littlefs'
+                // cursor/cache ordering and cannot recycle a pinned data block.
+                drain_reads();
+                const auto completion = opened.transfer(*queue->request(ticket));
+                // Nested Block waits share this notification and may consume
+                // another session's hint. Drain all queues again before sleep.
+                again = true;
+                if (!queue->finish(ticket, completion.status, completion.bytes)) {
+                    opened.session.abort();
+                    if (!queue->abandon(ticket))
+                        sys::exit(STATUS_INTERNAL);
                     again = true;
-                    if (!queue->finish(ticket, completion.status, completion.bytes)) {
-                        opened.session.abort();
-                        if (!queue->abandon(ticket))
-                            sys::exit(STATUS_INTERNAL);
-                        again = true;
-                        break;
-                    }
+                    break;
                 }
             }
+        }
         again |= pump_reads();
-        for (auto& opened : opens)
-            if (opened.live) {
-                if (opened.session.flush(true) != STATUS_OK) {
-                    opened.session.abort();
-                    again = true;
-                }
-                if (opened.session.done()) {
-                    again = true;
-                    --opened.file->refs;
-                    reap();
-                    opened.file = nullptr;
-                    (void) sys::channel_close(opened.channel.selector());
-                    opened.session.reset();
-                    opened.channel = {};
-                    opened.live = false;
-                } else if (opened.session.arm() != STATUS_OK) {
-                    opened.session.abort();
-                    again = true;
-                }
+        for (auto& owner : opens) {
+            auto& opened = *owner;
+            if (opened.session.flush(true) != STATUS_OK) {
+                opened.session.abort();
+                again = true;
             }
+            if (opened.session.done()) {
+                again = true;
+                (void) sys::channel_close(opened.channel.selector());
+                opened.session.reset();
+                opened.channel = {};
+            } else if (opened.session.arm() != STATUS_OK) {
+                opened.session.abort();
+                again = true;
+            }
+        }
+        std::erase_if(opens, [](const auto& opened) { return !opened->channel; });
+        reap();
         if (const auto rc = directory.arm().status; rc != STATUS_OK)
             sys::exit(rc);
         if (!again)

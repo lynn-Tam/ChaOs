@@ -1,7 +1,7 @@
 #include <util.hpp>
 #include <start.hpp>
-#include <proto.hpp>
-#include <ch.hpp>
+#include <protocols/stream.hpp>
+#include <ipc.hpp>
 #include <servers/uart.hpp>
 
 int main() {

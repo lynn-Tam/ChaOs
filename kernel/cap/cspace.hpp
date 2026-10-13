@@ -162,7 +162,7 @@ public:
     }
     [[nodiscard]] auto close(Handle handle) noexcept
         -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}) noexcept
+    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation payment = {}) noexcept
         -> std::expected<Handle, CSpaceError>;
     [[nodiscard]] auto revoke(
         Handle source,
@@ -277,7 +277,7 @@ private:
         View original, view;
         XferOp op;
     };
-    [[nodiscard]] auto prepare_xfer(CSpace&, const XferSpec&) noexcept
+    [[nodiscard]] auto prepare_xfer(CSpace&, const XferSpec&, resource::Reservation payment = {}) noexcept
         -> std::expected<Xfer, CSpaceError>;
     [[nodiscard]] auto commit_xfers(CSpace&, std::span<Xfer>) noexcept
         -> std::expected<void, CSpaceError>;

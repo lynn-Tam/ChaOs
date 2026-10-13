@@ -94,8 +94,7 @@ reported as `[FAIL] group: name`.
 
 ## boot and CPU
 
-- bootpack output is compared with ELF bytes, permissions, BSS and page tails
-- the boot-only load suffix matches the root ELF; filesystem packages omit it
+- kernel root and userspace exec consume original ELF files; startup uses a standard newc cpio archive
 - real multi-hart runs validate CPU online publication and scheduling
 - shootdown acknowledgement controls detached-page retirement
 - typed references retain retiring objects until final release

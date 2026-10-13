@@ -1,13 +1,15 @@
 #include <util.hpp>
-#include <proto.hpp>
-#include <ch.hpp>
+#include <protocols/block.hpp>
+#include <protocols/stream.hpp>
+#include <ipc.hpp>
 #include <start.hpp>
-#include <io.hpp>
+#include <protocols/queue.hpp>
 
 static ch_port control;
 static io_mem memory;
 static cap_owner peer;
 static cap_t events;
+static std::array<io_client, 5> sessions;
 
 static auto ch_recv() noexcept -> ch_packet {
 
@@ -29,6 +31,27 @@ int main() {
 
     const auto& info = rt_startup();
     events = info.events;
+    // Multiple independent sessions share hardware credits, not client slots.
+    std::array<std::array<uint8_t, 512>, 5> data;
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        uint64_t capacity{};
+        auto status = sessions[i].connect(info.selector(blk_service), info.pool, info.cspace,
+                                         events, info.vspace, 0, capacity);
+        if (status != STATUS_OK) sys::exit(status);
+        if (capacity != 1024 * 1024) sys::exit(STATUS_PEER_FAULT);
+        data[i].fill(0xff);
+        io_cmd request{.operation = static_cast<uint64_t>(io_operation::Read),
+                       .offset = i * 512, .length = 512};
+        status = sessions[i].submit(request, data[i].data(), true);
+        if (status != STATUS_OK) sys::exit(status);
+    }
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        io_done done;
+        if (const auto status = sessions[i].wait(done); status != STATUS_OK) sys::exit(status);
+        if (done.status != STATUS_OK || done.bytes != data[i].size()) sys::exit(STATUS_INTERNAL);
+        for (const auto byte : data[i])
+            if (byte) sys::exit(STATUS_BACKING_FAILED);
+    }
     const auto pair = sys::channel_create(info.pool, 1, CHANNEL_MAX_WORDS, 4, 2);
     if (pair.status != STATUS_OK) sys::exit(pair.status);
     cap_owner client{pair.value}, server{pair.value2};
@@ -180,5 +203,21 @@ int main() {
     if (closed.count != 0 || closed.message.id != 18)
         sys::exit(STATUS_BAD_ARGS);
     if (closed.message.status != STATUS_OK) sys::exit(closed.message.status);
+    const auto coordinator = info.selector(rt_stdout);
+    if (const auto rc = ch_send(coordinator, {.id=100}).status; rc != STATUS_OK) sys::exit(rc);
+    ch_msg stopped;
+    if (const auto rc = ch_recv(coordinator, stopped).status; rc != STATUS_OK) sys::exit(rc);
+    if (stopped.id != 101) sys::exit(STATUS_PEER_FAULT);
+    for (auto& session : sessions) {
+        // Volatile loads cover the whole payload; queue.take also reads the CQ.
+        const volatile uint8_t* bytes = session.payload();
+        for (size_t i = 0; i < io_payload_size; ++i)
+            if (bytes[i]) sys::exit(STATUS_BACKING_FAILED);
+        io_done done;
+        if (session.queue().take(done) != libk::ring_status::empty) sys::exit(STATUS_INTERNAL);
+        ch_msg request{.operation=static_cast<uint64_t>(io_control::Stat)};
+        if (session.exchange(request) != STATUS_PEER_CLOSED) sys::exit(STATUS_INTERNAL);
+        if (session.close() != STATUS_PEER_CLOSED) sys::exit(STATUS_INTERNAL);
+    }
     sys::exit();
 }

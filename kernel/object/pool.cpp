@@ -354,12 +354,15 @@ void group::close_member(Member& member) noexcept {
         libk_assert(member.owner_ == this);
         // The caller's accepted grant lease pins this member before its
         // revoke barrier. A concurrent pool close may already own the request.
-        libk_assert(member.phase_ == Member::phase::pending
-            || member.phase_ == Member::phase::live || member.phase_ == Member::phase::revoking);
+        // A repeated close joins the existing revoke/retirement obligation.
+        if (member.phase_ != Member::phase::pending && member.phase_ != Member::phase::live)
+            return;
         // A capability may be consumed immediately after batch publication.
         // Commit owns the transition out of construction and starts this close.
         if (member.phase_ == Member::phase::pending) member.independent_close_ = true;
         if (member.phase_ == Member::phase::live) {
+            member.hold_ = member.pin();
+            if (!member.hold_) return; // Last-ref retirement will detach it.
             member.independent_close_ = true;
             member.phase_ = Member::phase::revoking;
             graph = member.graph_;
@@ -451,6 +454,10 @@ void group::service() noexcept {
                 if ((closing || entry->independent_close_)
                     && (entry->phase_ == Member::phase::live
                         || entry->phase_ == Member::phase::revoked)) {
+                    if (entry->phase_ == Member::phase::live) {
+                        entry->hold_ = entry->pin();
+                        if (!entry->hold_) continue;
+                    }
                     item = entry;
                     break;
                 }
@@ -491,7 +498,7 @@ void Member::ready() noexcept {
 Member::~Member() noexcept {
     libk_assert(phase_ == phase::empty);
     libk_assert(owner_ == nullptr && graph_ == nullptr && !root_.valid());
-    libk_assert(!target_ && previous_ == nullptr && next_ == nullptr);
+    libk_assert(!target_.valid() && !hold_ && previous_ == nullptr && next_ == nullptr);
     libk_assert(!independent_close_);
 }
 
@@ -504,7 +511,7 @@ void Member::commit() noexcept {
 void Member::abort() noexcept {
     auto* pool = owner_;
     libk_assert(pool);
-    libk_assert(target_);
+    libk_assert(target_.valid());
     if (graph_) {
         {
             sync::Lock guard{pool->lock_};
@@ -517,22 +524,34 @@ void Member::abort() noexcept {
         {
             sync::Lock guard{pool->lock_};
             independent_close_ = true;
+            hold_ = pin();
+            libk_assert(hold_);
             phase_ = phase::revoked;
         }
         pool->service();
     }
 }
 
-void Member::retire() noexcept {
-    libk_assert(owner_ != nullptr && target_);
+auto Member::pin() const noexcept -> ref<> {
+    // The Group lock keeps this embedded member attached while the pool lock
+    // arbitrates admission against last-ref retirement. No pool→Group lock edge.
+    auto* anchor = reinterpret_cast<object::anchor*>(target_.slot);
+    if (!anchor->ops_->try_retain(anchor->owner_, *anchor, target_.generation)) return {};
+    return ref<>{*anchor, target_.generation};
+}
 
-    // Keep this embedded member alive through owner detach.
-    auto target = std::move(target_);
+void Member::retire() noexcept {
+    libk_assert(owner_ && hold_ && phase_ == phase::retiring);
+    auto target = std::move(hold_);
     libk_assert(target.retire());
-    auto* const pool = owner_;
-    pool->detach(*this);
+}
+
+void Member::detach() noexcept {
+    libk_assert(!hold_);
+    if (owner_) owner_->detach(*this);
     graph_ = nullptr;
     root_ = {};
+    target_ = {};
     independent_close_ = false;
     phase_ = phase::empty;
 }
@@ -544,9 +563,9 @@ auto Member::root(cap::Graph& graph, Reservation&& fee, ref<> target, cap::View 
     auto payer = fee.payer().as<group>();
     if (!payer) return std::unexpected(cap::GrantError::InvalidState);
     phase_ = phase::pending;
-    target_ = std::move(target);
+    target_ = target.id();
     payer->get().attach(*this);
-    auto root = graph.create_root(std::move(fee), ref<>{target_}, view);
+    auto root = graph.create_root(std::move(fee), std::move(target), view);
     if (!root) return std::unexpected(root.error());
     graph_ = &graph;
     root_ = root->key();

@@ -20,10 +20,6 @@ struct rt_binding {
 struct rt_bindings { uint32_t version, size, count, reserved; };
 inline constexpr uint32_t rt_bindings_version = 1;
 inline constexpr word_t rt_event_badge = 2;
-inline constexpr rt_req rt_domain{"domain", 0, ObjDomain};
-inline constexpr rt_req rt_image{"image", 0, ObjMem};
-inline constexpr rt_req io_host{"io.host", 0, ObjHost};
-inline constexpr rt_req sv_ready{"ready", 0, ObjNotification};
 
 // CRT validates once. This view only borrows immutable startup mappings.
 struct rt_env {

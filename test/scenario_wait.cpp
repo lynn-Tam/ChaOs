@@ -115,9 +115,9 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
     libk_assert(memory_pending);
     auto memory = std::move(memory_pending).value().publish();
     auto cleanup = libk::on_scope_exit([&]() noexcept {
-        libk_assert(space.retire());
+        libk_assert(space.destroy());
         space.reset();
-        libk_assert(memory.retire());
+        libk_assert(memory.destroy());
         memory.reset();
 
     });
@@ -186,9 +186,9 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
         sched::yield();
     }
     libk_assert(kernel.domain.get().unadmit(sc.get()));
-    libk_assert(sc.retire());
+    libk_assert(sc.destroy());
     sc.reset();
-    libk_assert(thread.retire());
+    libk_assert(thread.destroy());
     thread.reset();
     if (passed) console::print<"[scenario] pending VM wait completed after remote shootdown\n">();
     return passed;
@@ -215,13 +215,13 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     if (!a || !b) return false;
     auto first = std::move(*a).publish(), second = std::move(*b).publish();
     auto cleanup = libk::on_scope_exit([&]() noexcept {
-        (void)first.retire();
-        (void)second.retire();
+        (void)first.destroy();
+        (void)second.destroy();
         first.reset();
         second.reset();
-        (void)mem.retire();
+        (void)mem.destroy();
         mem.reset();
-        (void)pager.retire();
+        (void)pager.destroy();
         pager.reset();
 
     });
@@ -308,7 +308,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     const auto budget = kernel.clock.ticks<1, time::ms>();
     const auto period = kernel.clock.ticks<10, time::ms>();
     if (!budget || !period) {
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -316,7 +316,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     auto pending_context = kernel.objects.get<sched::Sc>().create(
         sched::Sc::Config{.budget = *budget, .period = *period}, kernel.clock.rd_ticks());
     if (!pending_context) {
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -329,9 +329,9 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
         if (context->admitted()) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
-        static_cast<void>(context.retire());
+        static_cast<void>(context.destroy());
         context.reset();
-        static_cast<void>(thread.retire());
+        static_cast<void>(thread.destroy());
         thread.reset();
 
         return false;
@@ -354,8 +354,8 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     }
     while (context->bound()) sched::yield();
     const bool unadmitted = static_cast<bool>(kernel.domain.get().unadmit(context.get()));
-    const bool context_retired = context.retire();
-    const bool thread_retired = thread.retire();
+    const bool context_retired = context.destroy();
+    const bool thread_retired = thread.destroy();
     context.reset();
     thread.reset();
 

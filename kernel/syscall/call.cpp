@@ -205,6 +205,25 @@ template<typename Operation>
 
 
 
+// Slot storage belongs to the destination CSpace. A caller may separately
+// authorize a longer-lived payer for a derived grant's lineage node.
+static auto grant_payment(Call& inv, cap_t payer) noexcept
+    -> std::expected<resource::Reservation, status_t> {
+    if (!payer) return resource::Reservation{};
+    auto pool = inv.cspace.resolve<object::group>(handle_of(payer), cap::Rights::of(cap::Right::Create));
+    if (!pool) return std::unexpected(cap_status(pool.error()));
+    const auto view = pool->view();
+    const auto* quota = std::get_if<cap::Quota>(&view.data);
+    if (!quota || !quota->budget.contains(cap::Graph::node_charge()))
+        return std::unexpected(STATUS_DENIED);
+    auto ref = pool->reference();
+    if (!ref) return std::unexpected(STATUS_BUSY);
+    auto fee = pool->object().reserve(std::move(*ref), cap::Graph::node_charge());
+    if (!fee) return std::unexpected(fee.error() == resource::errc::exhausted
+                                    ? STATUS_NO_MEMORY : STATUS_BUSY);
+    return std::move(*fee);
+}
+
 template<usize op>
 auto cap_call(Call& inv) noexcept -> Result {
     cap::CSpace& cspace = inv.cspace;
@@ -256,8 +275,10 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!decoded) {
             return returned(STATUS_BAD_ARGS);
         }
+        auto fee = grant_payment(inv, trap.arg(4));
+        if (!fee) return returned(fee.error());
         if (!target) {
-            auto delegated = cspace.transfer(source, cspace, cap::XferOp::Derive, decoded.value());
+            auto delegated = cspace.transfer(source, cspace, cap::XferOp::Derive, decoded.value(), std::move(*fee));
             return returned(
                 delegated ? STATUS_OK : cap_status(delegated.error()),
                 delegated ? delegated.value().raw() : 0);
@@ -266,7 +287,7 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!resolved) {
             return returned(cap_status(resolved.error()));
         }
-        auto delegated = cspace.transfer(source, resolved.value().object(), cap::XferOp::Derive, decoded.value());
+        auto delegated = cspace.transfer(source, resolved.value().object(), cap::XferOp::Derive, decoded.value(), std::move(*fee));
         return returned(
             delegated ? STATUS_OK : cap_status(delegated.error()),
             delegated ? delegated.value().raw() : 0);
@@ -279,9 +300,11 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!source || !rights) {
             return returned(STATUS_BAD_ARGS);
         }
+        auto fee = grant_payment(inv, op == SYS_CAP_DELEGATE ? trap.arg(3) : 0);
+        if (!fee) return returned(fee.error());
         return with_dest(cspace, target, [&](cap::CSpace& out) {
             return cspace.transfer(source, out,
-                op == SYS_CAP_DUPLICATE ? cap::XferOp::Copy : cap::XferOp::Derive, *rights);
+                op == SYS_CAP_DUPLICATE ? cap::XferOp::Copy : cap::XferOp::Derive, *rights, std::move(*fee));
         });
     }
     if constexpr (op == SYS_CAP_MOVE) {

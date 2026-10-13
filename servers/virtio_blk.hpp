@@ -5,9 +5,11 @@
 
 
 #include <optional>
-#include <io.hpp>
+#include <protocols/queue.hpp>
 #include <cap.hpp>
-#include <ch.hpp>
+#include <ipc.hpp>
+
+inline constexpr rt_req io_host{"io.host", 0, ObjHost};
 
 // One execution owns the split virtqueue. Slots own their descriptor chain
 // and DMA data until used-ring completion; the caller copies returned data

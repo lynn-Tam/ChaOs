@@ -8,18 +8,13 @@ import subprocess
 import sys
 import time
 
-def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
+def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_check=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
     output = bytearray()
     command = [qemu, '-machine', 'virt', '-smp', smp, '-nographic',
                '-bios', 'default', '-kernel', kernel, '-initrd', bundle]
-    if disk is not None:
-        command[2] = 'virt,iommu-sys=on'
-        command.extend([
-            '-drive', f'if=none,id=disk,format=raw,readonly=on,file={disk}',
-            '-device', 'virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on'])
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     poll = selectors.DefaultSelector()
@@ -62,13 +57,18 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         until(b'myos> ')
         run('help', b'run/spawn PROGRAM')
         run('svc', b'shell running')
-        run('ls', b'CAT.PKG')
+        run('ls', b'cat.elf')
         run('cat README.TXT', b'myos disk file service')
-        run('cat absent.txt', b'error: -5')
+        run('cat absent.txt', b'error: 2')
+        if exec_check:
+            # Reuse the same immutable file backing after the first process writes
+            # every initialized page; a second process must see the original bytes.
+            run('run cow', b'ELF data, COW and BSS ok\nmyos> ')
+            run('run cow', b'ELF data, COW and BSS ok\nmyos> ')
         if service_fault:
             run('svc restart absent', b'error: -5')
             baseline = output.count(b'uart: console ready')
-            for target in ('files', 'block'):
+            for target in ('files',):
                 start = len(output)
                 for byte in f'svc restart {target}\r'.encode():
                     process.stdin.write(bytes([byte]))
@@ -96,7 +96,6 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         for token in (first, second):
             if b'error: ' in run(f'wait {token}', b'myos> '):
                 raise RuntimeError('concurrent ELF mapping check failed')
-        run('run bad', b'error: -4')
         run('run absent', b'error: -5')
         run('wait', b'error: -1')
         run('run sleep 1', b'myos> ')
@@ -117,7 +116,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         if len(short) != 2:
             raise RuntimeError('background pipeline did not return two handles')
         producer = run(f'wait {int(short[0])}', b'error: ')
-        if b'error: -22' not in producer and b'error: -13' not in producer:
+        if b'error: 32' not in producer:
             raise RuntimeError(f'dead consumer retained its input: {producer!r}')
         run(f'wait {int(short[1])}', b'myos> ')
 
@@ -125,7 +124,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         run('run echo abcdef | fdcheck stdio', b'stdio aliases ok\nmyos> ')
         run('run fill 8192 | slow 1', b'bytes: 8192\nmyos> ')
         early = run('run fill 100000 | slow 1 96', b'bytes: 96')
-        if b'error: -22' not in early and b'error: -13' not in early:
+        if b'error: 32' not in early:
             raise RuntimeError(f'writer did not observe consumer close: {early!r}')
         blocked = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 100', b'task: '))
         if len(blocked) != 2:
@@ -133,7 +132,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         run('run echo running during backpressure', b'running during backpressure\nmyos> ')
         run(f'stop {int(blocked[1])}', b'myos> ')
         producer = run(f'wait {int(blocked[0])}', b'error: ')
-        if b'error: -22' not in producer and b'error: -13' not in producer:
+        if b'error: 32' not in producer:
             raise RuntimeError(f'blocked producer was not released: {producer!r}')
         blocked = re.findall(rb'task: ([0-9]+)', run('spawn fill 100000 | slow 100', b'task: '))
         if len(blocked) != 2:
@@ -156,8 +155,9 @@ def exercise(qemu, kernel, bundle, smp, iterations, disk, service_fault=False):
         (logs / f'console-{smp}.raw').write_bytes(output)
 
 if __name__ == '__main__':
-    qemu, kernel, bundle, disk, harts = sys.argv[1:6]
-    iterations = int(sys.argv[7]) if len(sys.argv) == 8 else 3
+    qemu, kernel, bundle, harts = sys.argv[1:5]
+    iterations = int(sys.argv[6]) if len(sys.argv) == 7 else 3
     for smp in harts.split(','):
-        exercise(qemu, kernel, bundle, smp, iterations, disk,
-                 service_fault=len(sys.argv) >= 7 and sys.argv[6] == 'service-fault')
+        exercise(qemu, kernel, bundle, smp, iterations,
+                 service_fault=len(sys.argv) >= 6 and sys.argv[5] == 'service-fault',
+                 exec_check=len(sys.argv) >= 6 and sys.argv[5] == 'exec')

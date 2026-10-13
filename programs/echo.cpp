@@ -1,7 +1,14 @@
+#include <posix.hpp>
+#include <start.hpp>
+#include <protocols/stream.hpp>
 #include <string.h>
 #include <unistd.h>
 
 int main(int argc, char** argv) {
+    const auto& env = rt_startup();
+    if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, 0,
+        {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
+
     for (int i = 1; i < argc; ++i) {
         if (i != 1 && write(STDOUT_FILENO, " ", 1) != 1) return 1;
         const auto size = ::strlen(argv[i]);

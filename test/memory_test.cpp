@@ -175,15 +175,15 @@ private:
             memory_test_peer.reset();
         }
         if (pooled_) {
-            (void)pooled_.retire();
+            (void)pooled_.destroy();
             pooled_.reset();
         }
         if (wrong_pager_) {
-            (void)wrong_pager_.retire();
+            (void)wrong_pager_.destroy();
             wrong_pager_.reset();
         }
         if (pager_) {
-            (void)pager_.retire();
+            (void)pager_.destroy();
             pager_.reset();
         }
         if (memory_test_mm) {
@@ -699,7 +699,7 @@ bool test_object_store_memory_lifecycle_waits_for_page_lease(
         return false;
     }
     auto page = std::move(page_result).value();
-    if (!fixture.pooled().retire()) {
+    if (!fixture.pooled().destroy()) {
         return false;
     }
     fixture.release_pooled();

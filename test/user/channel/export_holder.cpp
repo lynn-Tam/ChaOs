@@ -1,7 +1,7 @@
 #include <util.hpp>
-#include <proto.hpp>
+#include <protocols/stream.hpp>
 #include <test/user/channel/export_protocol.hpp>
-#include <ch.hpp>
+#include <ipc.hpp>
 
 int main() {
 

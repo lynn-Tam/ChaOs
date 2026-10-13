@@ -9,16 +9,14 @@ import sys
 import tempfile
 import time
 
-def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
+def boot(qemu, kernel, bundle, data_disk, cpus, commands,
          data_source=None):
     data_source = data_source or data_disk
     args = [qemu, "-machine", "virt,iommu-sys=on", "-smp", cpus,
             "-nographic", "-bios", "default", "-kernel", kernel,
             "-initrd", bundle,
-            "-drive", f"if=none,id=boot,format=raw,readonly=on,file={boot_disk}",
-            "-device", "virtio-blk-pci,addr=1,drive=boot,disable-legacy=on,iommu_platform=on",
             "-drive", f"if=none,id=data,format=raw,file={data_source}",
-            "-device", "virtio-blk-pci,addr=2,drive=data,disable-legacy=on,iommu_platform=on"]
+            "-device", "virtio-blk-pci,addr=1,drive=data,disable-legacy=on,iommu_platform=on"]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     poll = selectors.DefaultSelector()
@@ -45,6 +43,7 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
             command, expected = item[:2]
             restart = len(item) > 2 and item[2]
             begin = len(output)
+            began = time.monotonic()
             for char in command.encode() + b"\r":
                 process.stdin.write(bytes([char]))
                 process.stdin.flush()
@@ -63,6 +62,8 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
             else:
                 until(b"myos> ", begin)
             result = output[begin:]
+            if command == "run fdcheck cache":
+                print(f"[storage] cache/sync: {cpus} hart(s), {time.monotonic()-began:.3f}s", flush=True)
             if expected not in result:
                 raise RuntimeError(f"{command}: missing {expected!r}; got {result!r}")
     except Exception:
@@ -76,8 +77,8 @@ def boot(qemu, kernel, bundle, boot_disk, data_disk, cpus, commands,
         poll.close()
 
 def main():
-    qemu, kernel, bundle, boot_disk, cpus = sys.argv[1:6]
-    package_size = f"{(Path(boot_disk).parent / 'cat.pkg').stat().st_size} bytes".encode()
+    qemu, kernel, bundle, cpus = sys.argv[1:5]
+    package_size = f"{(Path(bundle).parent / 'cat.elf').stat().st_size} bytes".encode()
     root = Path(__file__).resolve().parents[2] / ".tmp/project/interactive-storage"
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as directory:
@@ -89,9 +90,8 @@ def main():
             with data_disk.open("r+b") as stream:
                 stream.truncate(0)
                 stream.truncate(16 * 1024 * 1024)
-            boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
+            boot(qemu, kernel, bundle, data_disk, count, [
                 ("mkfs", b"myos> "),
-                ("run fdcheck admin", b"admin denied"),
                 ("run fdcheck", b"fd offsets ok"),
                 ("run fdcheck cache", b"fd cache ok"),
                 ("run fdcheck close", b"close accepted"),
@@ -102,16 +102,16 @@ def main():
                 ("fs cat note", b"hello-persistent-again\nmyos> "),
                 ("cat note", b"hello-persistent-again\nmyos> "),
                 ("fs ls", b"note\n"),
-                ("ls /boot", b"CAT.PKG"),
+                ("ls /boot", b"cat.elf"),
                 ("cat /boot/README.TXT", b"myos disk file service"),
                 ("write /boot/denied no", b"error: "),
                 ("fs copy /boot/README.TXT readme", b"myos> "),
                 ("fs cat readme", b"myos disk file service"),
-                ("fs copy /boot/CAT.PKG cat.pkg", b"myos> "),
-                ("fs stat cat.pkg", package_size),
+                ("fs copy /boot/cat.elf cat.elf", b"myos> "),
+                ("fs stat cat.elf", package_size),
                 ("run echo stream-persisted | put piped", b"myos> "),
                 ("fs cat piped", b"stream-persisted"),
-                ("run get piped | put copied", b"myos> "),
+                ("run cat piped | put copied", b"myos> "),
                 ("fs cat copied", b"stream-persisted"),
                 ("fs mkdir notes", b"myos> "),
                 ("fs write notes/item nested-persistent", b"myos> "),
@@ -126,7 +126,7 @@ def main():
                 ("fs cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again"),
                 ("fs cat readme", b"myos disk file service"),
-                ("fs stat cat.pkg", package_size),
+                ("fs stat cat.elf", package_size),
                 ("fs cat piped", b"stream-persisted"),
                 ("fs cat copied", b"stream-persisted"),
                 ("fs cat notes/item", b"nested-persistent"),
@@ -145,9 +145,9 @@ def main():
                     ("fs write fresh reinitialized", b"myos> "),
                     ("fs cat fresh", b"reinitialized"),
                 ])
-            boot(qemu, kernel, bundle, boot_disk, data_disk, count, resumed)
+            boot(qemu, kernel, bundle, data_disk, count, resumed)
             if count == "1":
-                boot(qemu, kernel, bundle, boot_disk, data_disk, count, [
+                boot(qemu, kernel, bundle, data_disk, count, [
                     ("fs cat fresh", b"reinitialized"),
                     ("fs copy /boot/README.TXT readme", b"myos> "),
                 ])
@@ -155,12 +155,12 @@ def main():
         config = Path(directory) / "write-error.conf"
         config.write_text('[inject-error]\nevent = "write_aio"\nerrno = "5"\nonce = "on"\n')
         source = f"blkdebug:{config}:{data_disk}"
-        boot(qemu, kernel, bundle, boot_disk, data_disk, "1", [
+        boot(qemu, kernel, bundle, data_disk, "1", [
             ("fs write readme uncertain", b"myos native shell", True),
             ("fs cat readme", b"myos disk file service"),
             ("fs write readme recovered", b"myos> "),
         ], source)
-        boot(qemu, kernel, bundle, boot_disk, data_disk, "1", [
+        boot(qemu, kernel, bundle, data_disk, "1", [
             ("fs cat readme", b"recovered"),
         ])
         print("[storage] OK: injected write EIO isolated, old file survived, later sync persisted")

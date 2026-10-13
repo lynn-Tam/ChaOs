@@ -14,8 +14,8 @@ Implemented or under active development:
 - capability spaces, derivation, attenuation, revocation, and resource accounting
 - threads, Vprocs, scheduling contexts, timers, and CPU dispatch
 - notifications, channels, endpoints, and asynchronous completion
-- user-space `init`, process supervision, UART, block, read-only FAT32, and writable data-volume services
-- application loading from disk and file-backed demand paging
+- user-space `init`, process supervision, UART, block, immutable initramfs bootfs, and writable data-volume services
+- original ELF loading from a capability-authorized file view
 - an interactive shell and basic user programs
 - PCI, I/O-space, DMA, and IOMMU foundations
 
@@ -41,7 +41,7 @@ tools/build/ninja.sh run-console
 
 The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
 disk, run the shell `mkfs` command once; running it again erases the data volume.
-The data disk is `/`; the read-only FAT32 boot disk is `/boot`. Use `touch note`,
+The data disk is `/`; the immutable initramfs bootfs boot disk is `/boot`. Use `touch note`,
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
 `mkdir dir`, `mv note dir/note`, and `rm dir/note`. `ls /boot` shows boot files;
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the

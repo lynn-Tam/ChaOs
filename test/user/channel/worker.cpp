@@ -1,7 +1,7 @@
 #include <util.hpp>
-#include <proto.hpp>
+#include <protocols/stream.hpp>
 #include <libk/parse.hpp>
-#include <ch.hpp>
+#include <ipc.hpp>
 
 int main(int argc, char** argv) {
     if (argc != 2) return STATUS_BAD_ARGS;

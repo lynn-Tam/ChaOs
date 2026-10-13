@@ -7,7 +7,6 @@ static rt_env startup;
 auto rt_startup() noexcept -> const rt_env& { return startup; }
 extern "C" void init_heap(cap_t pool, cap_t vspace) noexcept;
 extern "C" void run_constructors() noexcept;
-extern "C" void rt_init_io() noexcept __attribute__((weak));
 extern int main(int, char**);
 
 extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
@@ -64,6 +63,5 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
     }
     init_heap(startup.pool, startup.vspace);
     run_constructors();
-    if (rt_init_io) rt_init_io();
     sys::exit(main(argc, argv));
 }

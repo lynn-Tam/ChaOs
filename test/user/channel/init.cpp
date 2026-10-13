@@ -1,10 +1,10 @@
 #include <util.hpp>
-#include <ch.hpp>
+#include <ipc.hpp>
 #include <servers/fw.hpp>
 #include <test/user/task.hpp>
 #include <servers/uart.hpp>
 
- pr_pkg program; pr_tasks supervisor;
+ test_image program; test_tasks supervisor;
 
 int main() {
 

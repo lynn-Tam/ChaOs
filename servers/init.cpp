@@ -1,9 +1,15 @@
-#include <proto.hpp>
+#include <protocols/file.hpp>
+#include <protocols/block.hpp>
+#include <servers/virtio_blk.hpp>
+#include <protocols/stream.hpp>
+#include <protocols/service.hpp>
 #include <servers/pci.hpp>
-#include <proc.hpp>
+#include <exec.hpp>
+#include <libk/cpio.hpp>
 #include <servers/uart.hpp>
 #include <algorithm>
 #include <deque>
+#include <memory>
 #include <vector>
 
 struct sv_svc;
@@ -26,8 +32,8 @@ struct sv_svc {
     std::deque<sv_export> exports;
     std::vector<sv_import> imports;
     bool ready{}, recovering{true};
-    std::optional<pr_id> task;
-    cap_owner ready_event;
+    std::unique_ptr<pr_task> task;
+    cap_owner ready_event, memory_pool;
     auto publish(rt_req contract, word_t depth = 4, word_t transfers = 4,
                  word_t side = 1, word_t rights = RIGHT_RECEIVE) -> sv_export& {
         return exports.emplace_back(this, contract, depth, transfers, 2, side, rights);
@@ -43,9 +49,8 @@ struct sv_svc {
     }
 };
 static std::deque<sv_svc> services;
-static pr_pkg package;
-static pr_tasks tasks;
-static rt_clock clock;
+static vm_area archive_mem;
+static libk::cpio_view archive;
 
 static void report(const rt_env& info, const fw_view& fw, status_t status = STATUS_OK,
                    std::string_view name = {}) {
@@ -114,15 +119,18 @@ static auto start(sv_svc& service, const rt_env& info, cap_t events) -> status_t
         caps.push_back(sv_fixed(sv_ready, created.value, RIGHT_SIGNAL));
         caps.push_back(sv_cap(sv_wake, events, RIGHT_SIGNAL, 0, 0));
     }
-    const auto spawned = tasks.spawn(package, service.image,
+    service.task = std::make_unique<pr_task>();
+    const auto mod = archive.find(service.image);
+    if (!mod) return STATUS_NOT_FOUND;
+    const auto status = pr_exec(*service.task,
+        {info.pool, fw_root(info).domain, info.vspace, static_cast<uint32_t>(info.cpus)}, pr_image{.bytes=mod->data},
         {.argv = service.args, .caps = caps, .resources = service.quota,
          .sched = {.budget = 600'000}, .events = events});
-    if (spawned.id.valid()) service.task = spawned.id;
-    if (spawned.status != STATUS_OK || !service.ready) return spawned.status;
-    const auto deadline = clock.after_ms(10'000);
+    if (status != STATUS_OK || !service.ready) return status;
+    const auto deadline = rt_after_ms(10'000);
     if (!deadline) return STATUS_INTERNAL;
     for (;;) {
-        const auto ended = tasks.observe(*service.task);
+        const auto ended = service.task->observe();
         if (ended.status != STATUS_OK) return ended.status;
         if (ended.value)
             return ended.value2 ? static_cast<status_t>(ended.value2) : STATUS_PEER_FAULT;
@@ -143,15 +151,16 @@ static void recover(sv_svc& failed) {
 }
 int main() {
     const auto& info = rt_startup();
-    if (const auto rc = clock.open(); rc != STATUS_OK) sys::exit(rc);
-    auto pci = pci_bus::open(info, 0x31000000);
-    if (!pci) sys::exit(pci.error());
-    if (const auto rc = pci->configure(0x10421af4); rc != STATUS_OK) sys::exit(rc);
-    report(info, pci->firmware);
-    tasks.open(info.pool, fw_root(info).domain, info.vspace, info.cpus);
-    if (const auto rc = package.open(info.vspace, fw_root(info).bundle,
-            {0, pr_window::round_size(fw_root(info).bundle_bytes)}, fw_root(info).bundle_bytes); rc != STATUS_OK)
-        sys::exit(rc);
+
+    auto firmware = fw_view::open(info, 0);
+    if (!firmware) sys::exit(firmware.error());
+    report(info, *firmware);
+    std::optional<pci_bus> pci;
+    const auto bytes = fw_root(info).bundle_bytes;
+    if (const auto rc = archive_mem.open(info.vspace, 0, pr_window::round_size(bytes), VM_READ); rc != STATUS_OK) sys::exit(rc);
+    if (const auto rc = archive_mem.attach(fw_root(info).bundle, 0, archive_mem.size, VM_READ); rc != STATUS_OK) sys::exit(rc);
+    archive = libk::cpio_view::parse({reinterpret_cast<const std::byte*>(archive_mem.address), bytes});
+    if (!archive) sys::exit(STATUS_BAD_ARGS);
     const auto notification = sys::notification_create(info.pool, 1);
     if (notification.status != STATUS_OK) sys::exit(notification.status);
     cap_owner events{notification.value};
@@ -167,17 +176,24 @@ int main() {
     // Explicit root deployment policy; no service names enter lifecycle code.
     const auto add = [](std::string_view name, std::string_view image, pr_quota quota)
             -> sv_svc& {
-        if (!package.find(image)) sys::exit(STATUS_NOT_FOUND);
+        if (!archive.find(image)) sys::exit(STATUS_NOT_FOUND);
         auto& service = services.emplace_back(name, image, quota);
         service.args.push_back(name);
         return service;
     };
+    // Shared storage is a sibling of each execution, and survives its restart.
+    const auto share = [&](sv_svc& service, word_t bytes) {
+        const auto pool = sys::resource_create_child(info.pool, bytes, 0, OBJ_BIT(ObjMem));
+        if (pool.status != STATUS_OK) sys::exit(pool.status);
+        service.memory_pool = cap_owner{pool.value};
+        service.grants.push_back({.contract=io_memory, .cap=pool.value, .limit=word_t{RIGHT_CREATE}});
+    };
     auto& uart = add("uart", "uart", {.caps = 128,
         .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)});
-    auto memory = sv_cap(uart_mem, pci->firmware.console(ObjMem), RIGHT_MAP, 0, 0);
+    auto memory = sv_cap(uart_mem, firmware->console(ObjMem), RIGHT_MAP, 0, 0);
     std::get<CapView>(memory.limit).words[1] = 1;
     std::get<CapView>(memory.limit).words[2] = VM_READ | VM_WRITE;
-    uart.grants = {memory, sv_cap(uart_irq, pci->firmware.console(ObjIrq),
+    uart.grants = {memory, sv_cap(uart_irq, firmware->console(ObjIrq),
                                  RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK, 0, 0)};
     auto& output = uart.publish(con_output, 16, 0);
     auto& input = uart.publish(con_input, 16, 0, 0, RIGHT_SEND);
@@ -185,6 +201,12 @@ int main() {
     // Image identity is independent of an instance and its device grant.
     std::deque<pci_binding> devices;
     const auto block = [&](std::string_view name, size_t index) -> sv_export& {
+        if (!pci) {
+            auto bus=pci_bus::open(info,0x31000000);
+            if(!bus) sys::exit(bus.error());
+            pci.emplace(std::move(*bus));
+            if(const auto rc=pci->configure(0x10421af4);rc!=STATUS_OK) sys::exit(rc);
+        }
         auto device = pci->find(0x10421af4, index);
         if (!device) sys::exit(device.error());
         auto& binding = devices.emplace_back(std::move(*device));
@@ -192,19 +214,21 @@ int main() {
             .kinds = pr_base_kinds | OBJ_BIT(ObjIoSpace)});
         service.grants.push_back(sv_fixed(io_host, binding.cap.selector(),
                                           RIGHT_CONNECT, binding.rid, 1));
+        share(service, 2 * 1024 * 1024);
         return service.publish(blk_service);
     };
-    auto& boot = block("block", 0);
-    auto& files = add("files", "files", {.bytes = 16 * 1024 * 1024, .caps = 1024,
+    auto& files = add("files", "bootfs", {.bytes = 4 * 1024 * 1024, .caps = 1024,
         .kinds = pr_base_kinds | OBJ_BIT(ObjPager) | OBJ_BIT(ObjChannel),
         .slots = 1024, .pages = 132});
-    files.use(boot, blk_service);
+    files.grants = {{.contract=fs_archive,.bytes=fw_root(info).bundle_bytes,.cap=fw_root(info).bundle,.limit=word_t{RIGHT_MAP}}};
+    share(files, 32 * 1024 * 1024);
     auto& directory = files.publish(fs_service);
     sv_export* storage{};
-    if (package.find("store")) {
-        auto& disk = block("data", 1);
+    if (archive.find("store")) {
+        auto& disk = block("data", 0);
         auto& store = add("store", "store", {.bytes = 8 * 1024 * 1024, .caps = 256,
             .kinds = pr_base_kinds | OBJ_BIT(ObjChannel), .slots = 256, .pages = 36});
+        share(store, 4 * 1024 * 1024);
         store.ready = true;
         store.use(disk, blk_service);
         storage = &store.publish(st_service);
@@ -234,17 +258,19 @@ int main() {
     for (;;) {
         for (auto& service : services)
             if (service.task && !service.recovering) {
-                const auto ended = tasks.observe(*service.task);
+                const auto ended = service.task->observe();
                 if (ended.status != STATUS_OK) sys::exit(ended.status);
                 if (ended.value) recover(service);
             }
         // Initiate every affected drain before waiting: sibling capability
         // copies can carry quota charged to another retiring process.
+        for (auto& service : services)
+            if (service.recovering && service.task)
+                if (const auto rc = service.task->stop(); rc != STATUS_OK) sys::exit(rc);
         bool pending = false;
         for (auto& service : services)
             if (service.recovering && service.task) {
-                if (const auto rc = tasks.request_stop(*service.task); rc != STATUS_OK) sys::exit(rc);
-                const auto collected = tasks.collect(*service.task);
+                const auto collected = service.task->collect();
                 if (collected.status == STATUS_OK) service.task.reset();
                 else if (pr_retryable(collected.status) || collected.status == STATUS_WOULD_BLOCK)
                     pending = true;
@@ -262,9 +288,9 @@ int main() {
                         if (service.recovering && service.runnable()) {
                             const auto status = start(service, info, events.selector());
                             if (status != STATUS_OK) {
-                                report(info, pci->firmware, status, service.name);
+                                report(info, *firmware, status, service.name);
                                 recover(service);
-                                retry_at = clock.after_ms(100).value_or(0);
+                                retry_at = rt_after_ms(100).value_or(0);
                                 if (!retry_at) sys::exit(STATUS_INTERNAL);
                                 break;
                             }
@@ -314,7 +340,7 @@ int main() {
         // Synchronous group close can be BUSY without a notification. Timer
         // polling is restricted to actual retirement, with no fixed badge map.
         if (pending) {
-            const auto poll = clock.after_ms(1);
+            const auto poll = rt_after_ms(1);
             if (!poll) sys::exit(STATUS_INTERNAL);
             if (!deadline || *poll < deadline) deadline = *poll;
         }

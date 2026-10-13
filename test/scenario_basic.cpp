@@ -146,7 +146,7 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
     const bool ordered = state.count == 3 && state.order == std::array<usize, 3>{1, 2, 0};
     for (usize i = 0; i < scs.size(); ++i) {
         libk_assert(!scs[i]->bound() && k.domain.get().unadmit(scs[i].get()));
-        libk_assert(scs[i].retire() && threads[i].retire());
+        libk_assert(scs[i].destroy() && threads[i].destroy());
         scs[i].reset();
         threads[i].reset();
     }
