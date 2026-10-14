@@ -51,8 +51,8 @@ public:
         bool entry{};
         for (size_t i = 0; i < h.phnum; ++i) {
             const auto s = *v.segment(i);
-            // An interpreter or dynamic link table requires a different loader.
-            if (s.type == 2 || s.type == 3) return {};
+            // Dynamic linking and TLS require runtime machinery this loader does not provide.
+            if (s.type == 2 || s.type == 3 || s.type == 7) return {};
             if (s.type != 1) continue;
             if (s.file_size > s.size || s.offset > bytes.size() || s.file_size > bytes.size() - s.offset ||
                 s.size > UINT64_MAX - s.va || (s.flags & ~7u) || (s.flags & 3u) == 3u ||

@@ -281,7 +281,6 @@ bool test_typed_attenuation_covers_all_families(
     const TestContext&) noexcept {
     using cap::ChanLimit;
     using cap::ChannelSide;
-    using cap::EpLimit;
     using cap::IrqRoute;
     using cap::MemLimit;
     using cap::Badge;
@@ -350,16 +349,6 @@ bool test_typed_attenuation_covers_all_families(
         return false;
     }
 
-    const View endpoint{
-        attenuation_rights, EpLimit{3, 3, 8}};
-    attenuation_bytes(bytes, ObjEndpoint);
-    put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 3);
-    put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 3);
-    put64(bytes, CAP_ATTENUATION_WORD2_OFFSET, 4);
-    if (!decode_and_check(ObjEndpoint, endpoint, bytes)) {
-        return false;
-    }
-
     const View channel{
         attenuation_rights, ChanLimit{ChannelSide::Any, 0, 0}};
     attenuation_bytes(bytes, ObjChannel);
@@ -395,7 +384,7 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
             std::span<const byte>{bytes, sizeof(bytes)})) {
         return false;
     }
-    attenuation_bytes(bytes, 10);
+    attenuation_bytes(bytes, ObjCount);
     if (cap::decode_attenuation(
             std::span<const byte>{bytes, sizeof(bytes)})) {
         return false;

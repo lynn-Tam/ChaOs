@@ -1,3 +1,4 @@
+#include <protocols/msg.hpp>
 #include <protocols/stream.hpp>
 #include <utility>
 #include <test/user/channel/export_protocol.hpp>
@@ -40,16 +41,16 @@ static void configured_capacity(cap_t pool, cap_t cspace) noexcept {
     }
     for (unsigned round = 0; round != 3; ++round) {
         for (unsigned i = 0; i != depth; ++i)
-            expect(ch_send(sender.value, {.id = i}, false).status);
-        check(ch_send(sender.value, {.id = depth}, false).status == STATUS_WOULD_BLOCK);
+            expect(msg_send(sender.value, {.value = i}, false).status);
+        check(msg_send(sender.value, {.value = depth}, false).status == STATUS_WOULD_BLOCK);
         for (auto& event : events)
             expect(sys::notification_take(event.selector()).status);
-        ch_msg message;
+        msg_frame message;
         for (unsigned i = 0; i != depth; ++i) {
-            expect(ch_recv(pair.value2, message, false).status);
-            check(message.id == i);
+            expect(msg_recv(pair.value2, message, false).status);
+            check(message.value == i);
         }
-        check(ch_recv(pair.value2, message, false).status == STATUS_WOULD_BLOCK);
+        check(msg_recv(pair.value2, message, false).status == STATUS_WOULD_BLOCK);
         for (unsigned i = 0; i != bindings; ++i) {
             const auto arm = sys::channel_arm(pair.value2, relations[i], 0);
             expect(arm.status);
@@ -57,6 +58,15 @@ static void configured_capacity(cap_t pool, cap_t cspace) noexcept {
             expect(sys::channel_arm(pair.value2, relations[i], arm.value).status);
         }
     }
+    const std::array<word_t, 3> words{17, 23, 41};
+    expect(ch_send(sender.value, words, false, {}, 0x123).status);
+    ch_packet raw;
+    expect(ch_recv(pair.value2, raw, false).status);
+    check(raw.word_count == words.size() && raw.count == 0 && raw.badge == 1 && raw.tag == 0x123);
+    check(std::equal(words.begin(), words.end(), raw.words.begin()));
+    expect(ch_send(sender.value, std::span{words}.first(1), false).status);
+    msg_frame malformed;
+    check(msg_recv(pair.value2, malformed, false).status == STATUS_BAD_ARGS);
     expect(sys::cap_close(sender.value).status);
     destroy(pair);
     for (auto& event : events)
@@ -78,15 +88,15 @@ static void abandoned_reply(cap_t pool, cap_t cspace, cap_t events) noexcept {
     expect(minted.status);
     cap_owner sender{minted.value};
     const CapXfer cap{endpoint.selector(), RIGHT_SEND, CAP_COPY, 0};
-    expect(ch_send(sender.selector(), {}, false, {&cap, 1}).status);
+    expect(msg_send(sender.selector(), {}, false, {&cap, 1}).status);
     expect(endpoint.close());
-    ch_port peer{provider.ends[1].selector(), events};
+    msg_rx peer{provider.ends[1].selector(), events};
     expect(reply.close());
 
     const auto deadline = rt_after_ms(1'000);
     check(deadline.has_value());
     for (;;) {
-        ch_msg msg;
+        msg_frame msg;
         const auto r = peer.try_receive(msg);
         if (r.status == STATUS_PEER_CLOSED)
             break;
@@ -106,10 +116,10 @@ static void stale_channel(cap_t pool, cap_t cspace) noexcept {
     expect(old.status);
     const auto old_sender = sys::channel_mint(old.value, cspace, 1, RIGHT_SEND);
     expect(old_sender.status);
-    expect(ch_send(old_sender.value, {.id = 1}).status);
-    ch_msg message;
-    expect(ch_recv(old.value2, message).status);
-    check(message.id == 1);
+    expect(msg_send(old_sender.value, {.value = 1}).status);
+    msg_frame message;
+    expect(msg_recv(old.value2, message).status);
+    check(message.value == 1);
     expect(sys::resource_close_async(old_pool.value, ended.value, 1).status);
     expect(sys::notification_wait(ended.value).status);
 
@@ -117,13 +127,13 @@ static void stale_channel(cap_t pool, cap_t cspace) noexcept {
     expect(current.status);
     const auto current_sender = sys::channel_mint(current.value, cspace, 1, RIGHT_SEND);
     expect(current_sender.status);
-    check(ch_send(old_sender.value, {.id = 2}, false).status == STATUS_BUSY);
+    check(msg_send(old_sender.value, {.value = 2}, false).status == STATUS_BUSY);
     expect(sys::cap_close(old_sender.value).status);
-    check(ch_send(old_sender.value, {.id = 2}, false).status == STATUS_INVALID_CAP);
-    expect(ch_send(current_sender.value, {.id = 3}).status);
-    expect(ch_recv(current.value2, message).status);
-    check(message.id == 3);
-    check(ch_recv(current.value2, message, false).status == STATUS_WOULD_BLOCK);
+    check(msg_send(old_sender.value, {.value = 2}, false).status == STATUS_INVALID_CAP);
+    expect(msg_send(current_sender.value, {.value = 3}).status);
+    expect(msg_recv(current.value2, message).status);
+    check(message.value == 3);
+    check(msg_recv(current.value2, message, false).status == STATUS_WOULD_BLOCK);
     expect(sys::cap_close(old.value).status);
     expect(sys::cap_close(old.value2).status);
     expect(sys::cap_close(old_pool.value).status);
@@ -143,9 +153,9 @@ static void stale_service(cap_t pool, cap_t cspace) noexcept {
         const auto begin = sys::clock_now();
         expect(begin.status);
         for (;;) {
-            ch_msg message{};
+            msg_frame message{};
             cap_owner received;
-            const auto result = ch_recv_cap(control.value, message, received);
+            const auto result = msg_recv(control.value, message, false, {&received, 1});
             if (result.status == STATUS_WOULD_BLOCK) {
                 const auto now = sys::clock_now();
                 expect(now.status);
@@ -154,7 +164,7 @@ static void stale_service(cap_t pool, cap_t cspace) noexcept {
                 continue;
             }
             expect(result.status);
-            check(message.id == 1 && static_cast<bool>(received));
+            check(message.value == 1 && static_cast<bool>(received));
             return received;
         }
     };
@@ -178,21 +188,21 @@ static void stale_service(cap_t pool, cap_t cspace) noexcept {
 
     auto first = launch();
     auto old = transfer();
-    expect(ch_send(old.cap.selector(), {.id = 41}).status);
-    ch_msg message{};
-    expect(ch_recv(control.value, message).status);
-    check(message.id == 4);
-    expect(ch_send(control.value, {.id = 3}).status);
+    expect(msg_send(old.cap.selector(), {.value = 41}).status);
+    msg_frame message{};
+    expect(msg_recv(control.value, message).status);
+    check(message.value == 4);
+    expect(msg_send(control.value, {.value = 3}).status);
     check(wait(supervisor, first) == STATUS_INTERNAL);
     check(stop(supervisor, old.holder) == STATUS_CANCELED);
 
     auto second = launch();
     auto current = transfer();
-    check(ch_send(old.cap.selector(), {.id = 42}, false).status == STATUS_BUSY);
-    expect(ch_send(current.cap.selector(), {.id = 41}).status);
-    expect(ch_recv(control.value, message).status);
-    check(message.id == 4);
-    expect(ch_send(control.value, {.id = 3}).status);
+    check(msg_send(old.cap.selector(), {.value = 42}, false).status == STATUS_BUSY);
+    expect(msg_send(current.cap.selector(), {.value = 41}).status);
+    expect(msg_recv(control.value, message).status);
+    check(message.value == 4);
+    expect(msg_send(control.value, {.value = 3}).status);
     check(wait(supervisor, second) == STATUS_INTERNAL);
     check(stop(supervisor, current.holder) == STATUS_CANCELED);
     expect(sys::cap_close(control.value).status);
@@ -215,9 +225,9 @@ static void rpc_abandon(const rt_env& env) {
                               .resources = {.bytes = 1024 * 1024,
                                             .caps = 128,
                                             .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)}});
-    ch_rpc rpc;
+    rpc_client rpc;
     expect(rpc.open(sender.selector(), env.pool, env.cspace, env.events));
-    ch_msg message{.id = 73};
+    msg_frame message{.value = 73};
     check(rpc.exchange(message) == STATUS_PEER_CLOSED);
     expect(wait(supervisor, child));
 }
@@ -242,7 +252,7 @@ int main() {
         expect(ended.status);
         const auto sender = sys::channel_mint(data.value, info.cspace, 99, RIGHT_SEND);
         expect(sender.status);
-        expect(ch_send(sender.value, {.id = 100}).status);
+        expect(msg_send(sender.value, {.value = 100}).status);
         expect(sys::cap_close(sender.value).status);
         const pr_cap sources[] = {input(rt_stdout, data.value, RIGHT_SEND, 99),
                                   input(rt_stderr, ready.value, RIGHT_SEND, 1)};
@@ -260,10 +270,10 @@ int main() {
         }
         unsigned entered{};
         for (unsigned i = 0; i != 3; ++i) {
-            ch_msg message;
-            expect(ch_recv(ready.value2, message).status);
-            check(message.id < 3 && !(entered & (1U << message.id)));
-            entered |= 1U << message.id;
+            msg_frame message;
+            expect(msg_recv(ready.value2, message).status);
+            check(message.value < 3 && !(entered & (1U << message.value)));
+            entered |= 1U << message.value;
         }
         // The data queue is still full. A single-slot implementation makes
         // later senders exit BUSY here instead of retaining all three waits.
@@ -276,14 +286,14 @@ int main() {
         if (mode == 2)
             expect(sys::channel_close(data.value2).status);
         else {
-            ch_msg message;
-            expect(ch_recv(data.value2, message).status);
-            check(message.id == 100);
+            msg_frame message;
+            expect(msg_recv(data.value2, message).status);
+            check(message.value == 100);
             unsigned received{};
             for (unsigned i = 0; i != (mode == 1 ? 2U : 3U); ++i) {
-                expect(ch_recv(data.value2, message).status);
-                check(message.id < 3 && !(received & (1U << message.id)));
-                received |= 1U << message.id;
+                expect(msg_recv(data.value2, message).status);
+                check(message.value < 3 && !(received & (1U << message.value)));
+                received |= 1U << message.value;
             }
             check(received == (mode == 1 ? 5U : 7U));
         }

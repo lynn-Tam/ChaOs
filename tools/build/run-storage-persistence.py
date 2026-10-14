@@ -37,11 +37,25 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
                 if b"MYOS KERNEL PANIC" in output or (fault >= 0 and b"\n" in output[fault:]):
                     raise RuntimeError(f"guest fault; tail={output[-2000:]!r}")
 
+    def await_services(expected):
+        deadline = time.monotonic() + 40
+        while True:
+            start = len(output)
+            process.stdin.write(b"svc\r")
+            process.stdin.flush()
+            until(b"myos> ", start)
+            state = output[start:]
+            if all(f"{name} {value}".encode() in state for name, value in expected.items()):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"services did not reach {expected!r}; {state!r}")
+
     try:
         until(b"myos> ", 0)
+        # A responsive shell no longer implies optional storage is ready.
+        await_services({"store": "running", "vfs": "running"})
         for item in commands:
             command, expected = item[:2]
-            restart = len(item) > 2 and item[2]
             begin = len(output)
             began = time.monotonic()
             for char in command.encode() + b"\r":
@@ -55,18 +69,25 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
                     interaction = len(output)
                     process.stdin.write(keys)
                     process.stdin.flush()
-            if restart or command == "svc restart store":
-                until(b"myos native shell", begin)
-                reopened = output.index(b"myos native shell", begin)
-                until(b"myos> ", reopened)
-            else:
-                until(b"myos> ", begin)
+            until(b"myos> ", begin)
             result = output[begin:]
             if command == "run fdcheck cache":
                 print(f"[storage] cache/sync: {cpus} hart(s), {time.monotonic()-began:.3f}s", flush=True)
             if expected not in result:
                 raise RuntimeError(f"{command}: missing {expected!r}; got {result!r}")
+            if len(item) > 2 and item[2]:
+                # Management accepts intent asynchronously; observe real readiness.
+                expected = item[2] if isinstance(item[2], dict) else dict.fromkeys(item[2], "running")
+                await_services(expected)
+
     except Exception:
+        # A fault header can arrive before its diagnostic body.
+        drain = time.monotonic() + 1
+        while process.poll() is None and time.monotonic() < drain:
+            for event, _ in poll.select(0.05):
+                chunk = os.read(event.fd, 65536)
+                if chunk:
+                    output.extend(chunk)
         diagnostic = Path(__file__).resolve().parents[2] / ".tmp/project/interactive-storage/failed-persistence.log"
         diagnostic.parent.mkdir(parents=True, exist_ok=True)
         diagnostic.write_bytes(output)
@@ -78,7 +99,7 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
 
 def main():
     qemu, kernel, bundle, cpus = sys.argv[1:5]
-    package_size = f"{(Path(bundle).parent / 'cat.elf').stat().st_size} bytes".encode()
+    package_size = f"{(Path(bundle).parent / 'cat.run.elf').stat().st_size} bytes".encode()
     root = Path(__file__).resolve().parents[2] / ".tmp/project/interactive-storage"
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as directory:
@@ -99,23 +120,28 @@ def main():
                 ("fs sync", b"myos> "),
                 ("fs write note hello-persistent", b"myos> "),
                 ("fs append note -again", b"myos> "),
-                ("fs cat note", b"hello-persistent-again\nmyos> "),
                 ("cat note", b"hello-persistent-again\nmyos> "),
-                ("fs ls", b"note\n"),
+                ("svc restart block-8", b"service change requested", ["block-8", "store", "vfs"]),
+                ("cat note", b"hello-persistent-again"),
+                ("svc restart devices", b"service change requested", ["devices", "block-8", "store", "vfs"]),
+                ("cat note", b"hello-persistent-again"),
+                ("cat note", b"hello-persistent-again\nmyos> "),
+                ("ls", b"note\n"),
                 ("ls /boot", b"cat.elf"),
                 ("cat /boot/README.TXT", b"myos disk file service"),
                 ("write /boot/denied no", b"error: "),
-                ("fs copy /boot/README.TXT readme", b"myos> "),
-                ("fs cat readme", b"myos disk file service"),
-                ("fs copy /boot/cat.elf cat.elf", b"myos> "),
+                ("cp /boot/README.TXT readme", b"myos> "),
+                ("cat readme", b"myos disk file service"),
+                ("cp /boot/cat.elf cat.elf", b"myos> "),
                 ("fs stat cat.elf", package_size),
-                ("run echo stream-persisted | put piped", b"myos> "),
-                ("fs cat piped", b"stream-persisted"),
-                ("run cat piped | put copied", b"myos> "),
-                ("fs cat copied", b"stream-persisted"),
+                ("run /cat.elf /boot/README.TXT", b"myos disk file service"),
+                ("run echo stream-persisted > piped", b"myos> "),
+                ("cat piped", b"stream-persisted"),
+                ("run cat piped > copied", b"myos> "),
+                ("cat copied", b"stream-persisted"),
                 ("fs mkdir notes", b"myos> "),
                 ("fs write notes/item nested-persistent", b"myos> "),
-                ("fs ls notes", b"item\n"),
+                ("ls notes", b"item\n"),
                 ("edit edited", b"Written", False, [
                     (b"Ctrl+O Save", b"editor-persistent\x0f"),
                     (b"Written", b"\x18"),
@@ -123,45 +149,51 @@ def main():
                 ("cat edited", b"editor-persistent"),
             ])
             resumed = [
-                ("fs cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again"),
-                ("fs cat readme", b"myos disk file service"),
+                ("cat note", b"hello-persistent-again"),
+                ("cat readme", b"myos disk file service"),
                 ("fs stat cat.elf", package_size),
-                ("fs cat piped", b"stream-persisted"),
-                ("fs cat copied", b"stream-persisted"),
-                ("fs cat notes/item", b"nested-persistent"),
-                ("fs ls notes", b"item\n"),
+                ("cat piped", b"stream-persisted"),
+                ("cat copied", b"stream-persisted"),
+                ("cat notes/item", b"nested-persistent"),
+                ("ls notes", b"item\n"),
                 ("cat edited", b"editor-persistent"),
                 ("cat fd-async", b"CR"),
-                ("svc restart store", b"myos native shell"),
-                ("fs cat readme", b"myos disk file service"),
+                ("svc stop store", b"service change requested", {"store": "stopped", "vfs": "running"}),
+                ("cat /boot/README.TXT", b"myos disk file service"),
+                ("run echo storage-offline", b"storage-offline"),
+                ("cat note", b"error: 11"),
+                ("svc start store", b"service change requested", ["store", "vfs"]),
+                ("cat note", b"hello-persistent-again"),
+                ("svc restart store", b"service change requested", ["store", "vfs"]),
+                ("cat readme", b"myos disk file service"),
                 ("fs mv note renamed", b"myos> "),
                 ("fs rm renamed", b"myos> "),
-                ("fs ls", b"readme\n"),
+                ("ls", b"readme\n"),
             ]
             if count == "1":
                 resumed.extend([
                     ("mkfs", b"myos> "),
                     ("fs write fresh reinitialized", b"myos> "),
-                    ("fs cat fresh", b"reinitialized"),
+                    ("cat fresh", b"reinitialized"),
                 ])
             boot(qemu, kernel, bundle, data_disk, count, resumed)
             if count == "1":
                 boot(qemu, kernel, bundle, data_disk, count, [
-                    ("fs cat fresh", b"reinitialized"),
-                    ("fs copy /boot/README.TXT readme", b"myos> "),
+                    ("cat fresh", b"reinitialized"),
+                    ("cp /boot/README.TXT readme", b"myos> "),
                 ])
             print(f"[storage] OK: {count} hart(s), shell writes survive forced QEMU death")
         config = Path(directory) / "write-error.conf"
         config.write_text('[inject-error]\nevent = "write_aio"\nerrno = "5"\nonce = "on"\n')
         source = f"blkdebug:{config}:{data_disk}"
         boot(qemu, kernel, bundle, data_disk, "1", [
-            ("fs write readme uncertain", b"myos native shell", True),
-            ("fs cat readme", b"myos disk file service"),
+            ("fs write readme uncertain", b"error: ", ["store", "vfs"]),
+            ("cat readme", b"myos disk file service"),
             ("fs write readme recovered", b"myos> "),
         ], source)
         boot(qemu, kernel, bundle, data_disk, "1", [
-            ("fs cat readme", b"recovered"),
+            ("cat readme", b"recovered"),
         ])
         print("[storage] OK: injected write EIO isolated, old file survived, later sync persisted")
 

@@ -43,11 +43,6 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
     };
 }
 
-[[nodiscard]] static constexpr auto page_round(usize size) noexcept -> std::optional<usize> {
-    const auto adjusted = libk::checked_add(size, mm::page_size - 1);
-    return adjusted ? std::optional<usize>{*adjusted & ~(mm::page_size - 1)} : std::nullopt;
-}
-
 [[nodiscard]] static auto write_memory(mm::Pmm& pmm, mm::Mem& memory, std::span<const uint8_t> bytes, usize offset = 0) noexcept
     -> bool {
     if (offset > memory.size() || bytes.size() > memory.size() - offset) return false;
@@ -96,7 +91,7 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
 // with an unload/retry protocol. Successful publication transfers ownership to
 // capabilities, mappings and the scheduler before these local refs are dropped.
 auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
-               mm::BootPages&& reservation, mm::BootPages&& firmware, HwStart start) noexcept -> std::expected<void, BootErr> {
+               mm::BootPages&& reservation, mm::BootPages&& firmware) noexcept -> std::expected<void, BootErr> {
     const auto module = *handoff.module;
     auto pool = boot.root;
     auto& pmm = boot.pmm;
@@ -200,52 +195,41 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     const CpuId cpu = runtime.id;
     auto vspace = create.template operator()<mm::VSpace>(charge_pages(64), pmm, boot.vm, boot.work);
     auto cspace = create.template operator()<cap::CSpace>(
-        charge_pages(17, (mm::page_size - sizeof(RootInfo)) / sizeof(RootResource) + 9), pmm);
+        charge_pages(17, 10), pmm);
     if (!vspace || !cspace) return std::unexpected(BootErr::OutOfMemory);
     auto& space = cspace->get();
     {
         const mm::VRange stack_range{root_stack_address, root_stack_size};
         const mm::VRange info_range{root_info_address, mm::page_size};
-        usize end{};
-        bool entry_ok{};
         for (size_t i = 0; i < init.segment_count(); ++i) {
-            const auto raw = *init.segment(i);
-            if (raw.type != 1 || !raw.size) continue;
-            const auto skip = raw.va % mm::page_size;
-            struct { usize va, size; std::span<const uint8_t> file; mm::Perms perms; } segment{
-                raw.va - skip, raw.size + skip,
-                {reinterpret_cast<const uint8_t*>(file->data.data()) + raw.offset, raw.file_size},
-                mm::Perms::from_raw(static_cast<u8>(((raw.flags & 4) ? 1 : 0) | ((raw.flags & 2) ? 2 : 0) | ((raw.flags & 1) ? 4 : 0)))};
-            auto* seg = &segment;
-            if (seg->va < mm::UserBegin || seg->va >= mm::UserEnd || !mm::valid_perms(seg->perms))
+            const auto seg = *init.segment(i);
+            if (seg.type != 1 || !seg.size) continue;
+            const auto skip = seg.va % mm::page_size;
+            const mm::va_t va{seg.va - skip};
+            const auto perms = mm::Perms::from_raw(static_cast<u8>(
+                ((seg.flags & 4) ? 1 : 0) | ((seg.flags & 2) ? 2 : 0) | ((seg.flags & 1) ? 4 : 0)));
+            const auto size = libk::checked_align_up(seg.size + skip, mm::page_size);
+            if (va.raw() < mm::UserBegin || va.raw() >= mm::UserEnd || !size ||
+                *size > mm::UserEnd - va.raw() || !mm::valid_perms(perms))
                 return std::unexpected(BootErr::InvalidBundle);
-            const auto size = page_round(seg->size);
-            if (!size || seg->va < end || *size > mm::UserEnd - seg->va)
-                return std::unexpected(BootErr::InvalidBundle);
-            end = seg->va + *size;
-            entry_ok |= init.entry() >= seg->va && init.entry() - seg->va < seg->size &&
-                        seg->perms.contains(mm::Perm::Execute);
-            const mm::VRange range{mm::va_t{seg->va}, *size};
+            const mm::VRange range{va, *size};
             if (range.intersects(stack_range) || range.intersects(info_range) ||
                 range.intersects(mm::VRange{root_ipc_address, mm::page_size}))
                 return std::unexpected(BootErr::InvalidBundle);
             object::ref<mm::Mem> hold;
             if (!create_mem(hold, charge_pages(1 + *size / mm::page_size), pmm, *size,
-                        mm::AnonCfg{.perms = seg->perms, .eager = true}))
+                        mm::AnonCfg{.perms = perms, .eager = true}))
                 return std::unexpected(BootErr::OutOfMemory);
-            if (!write_memory(boot.pmm, hold.get(), seg->file, skip)) {
+            const std::span bytes{
+                reinterpret_cast<const uint8_t*>(file->data.data()) + seg.offset, seg.file_size};
+            if (!write_memory(boot.pmm, hold.get(), bytes, skip))
                 return std::unexpected(BootErr::OutOfMemory);
-            }
-            if (seg->perms.contains(mm::Perm::Execute) && !hold->seal()) {
+            if (perms.contains(mm::Perm::Execute) && !hold->seal())
                 return std::unexpected(BootErr::InvalidState);
-            }
-            if (!map_memory(vspace->get(), cpu, hold, mm::va_t{seg->va},
-                            seg->perms)) {
+            if (!map_memory(vspace->get(), cpu, hold, va, perms))
                 return std::unexpected(BootErr::MappingFailed);
-            }
             // The mapping now owns the segment; no boot-side lifetime mirror.
         }
-        if (!entry_ok) return std::unexpected(BootErr::InvalidBundle);
     }
 
     const auto rw = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
@@ -318,8 +302,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         info_page.version = ROOT_VERSION;
         info_page.bytes = sizeof(RootInfo);
         info_page.bundle_bytes = module.size;
-        info_page.resources_offset = sizeof(RootInfo);
-        auto* entries = reinterpret_cast<RootResource*>(&info_page + 1);
+        info_page.boot_hart = runtime.hw.raw;
         auto install = [&](auto& object, cap::View view) noexcept -> std::expected<cap::Handle, BootErr> {
             if constexpr (requires { object.publish(); }) {
                 return own(object, view, &space);
@@ -328,16 +311,6 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
                 if (!fee) return std::unexpected(fee.error());
                 return install_cap(boot.grants, space, std::move(*fee), object, view.rights, view.data);
             }
-        };
-        auto publish = [&](RootResource entry, auto& object, cap::View view) noexcept -> bool {
-            if (info_page.bytes + sizeof(entry) > mm::page_size) return false;
-            entry.kind = object.kind();
-            const auto installed = install(object, view);
-            if (!installed) return false;
-            entry.handle = installed->raw();
-            libk::construct_at(entries + info_page.resources_count++, entry);
-            info_page.bytes += sizeof(entry);
-            return true;
         };
         auto add_cap = [&](cap_t& destination, auto& object, cap::Rights rights,
                            cap::Limits limit = {}) noexcept -> bool {
@@ -350,40 +323,10 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
                 cap::Right::Inspect, cap::Right::Revoke, extra...);
         };
-        auto emit_hw = [&](u32 node, u32 index, HwRes resource) noexcept {
-            RootResource entry{};
-            entry.node = node; entry.index = index;
-            return std::visit([&](auto value) noexcept {
-                using T = decltype(value);
-                auto emit = [&](auto pending, cap::View view) noexcept {
-                    if (!pending) return false;
-                    auto ref = std::move(*pending).publish();
-                    return publish(entry, ref, view);
-                };
-                // Hardware belongs to the machine. Its initial grant remains
-                // independent of the root task's reclaimable object group.
-                if constexpr (std::same_as<T, io::Reg>) {
-                    entry.phys = value.pa;
-                    entry.bytes = value.size;
-                    auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{value.pa}, value.size);
-                    if (!pages) return false;
-                    const mm::Extent extent{{0, pages->page_count()}, *pages, value.perms};
-                    return emit(boot.objects.get<mm::Mem>().create(pmm, value.size,
-                        mm::PhysCfg{{&extent, 1}, {}}),
-                        {rights(cap::Right::Map), cap::MemLimit{extent.object, extent.perms}});
-                } else if constexpr (std::same_as<T, irq::Line>) {
-                    return emit(boot.objects.get<irq::Irq>().create(value),
-                        {rights(cap::Right::Route, cap::Right::Observe, cap::Right::Ack,
-                                cap::Right::Close), cap::IrqRoute{value.id, value.level}});
-                } else {
-                    return emit(boot.objects.get<io::Host>().create(*value),
-                        {rights(cap::Right::Connect), cap::HostLimit{0, value->count}});
-                }
-            }, resource);
-        };
-        runtime.ext_irq = start(pmm, boot.clock, HwEmit::bind(emit_hw));
-        if (!runtime.ext_irq) return std::unexpected(BootErr::CapabilityFailed);
-
+        if (!add_cap(info_page.physical, boot.physical,
+                     rights(cap::Right::Create, cap::Right::Control),
+                     cap::PhysLimit{{mm::Page{0}, arch::Pte::PhysicalPages}}))
+            return std::unexpected(BootErr::CapabilityFailed);
         auto pages = pmm.adopt(std::move(firmware));
         if (!pages) return std::unexpected(BootErr::Ownership);
         const mm::Extent extent{{0, pages->page_count()}, handoff.firmware.pages(),

@@ -28,7 +28,6 @@ typedef int32_t status_t;
 #define STATUS_WOULD_BLOCK      -16
 #define STATUS_PEER_FAULT       -17
 #define STATUS_CANCELED         -18
-#define STATUS_PEER_ABORTED      -19
 #define STATUS_TRANSFER_FAILED   -20
 #define STATUS_TIMED_OUT         -21
 #define STATUS_PEER_CLOSED       -22
@@ -36,7 +35,7 @@ typedef int32_t status_t;
 
 #ifndef __ASSEMBLER__
 enum {
-#define CALL(name, nr, entry, locus, unit) SYS_##name = nr,
+#define CALL(name, nr, entry, unit) SYS_##name = nr,
 #include <uapi/calls.def>
 #undef CALL
 };

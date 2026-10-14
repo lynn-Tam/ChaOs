@@ -5,7 +5,6 @@
 #include <cpu/cpu.hpp>
 #include <sched/sc.hpp>
 #include <sched/dispatcher.hpp>
-#include <sched/guard.hpp>
 #include <sync.hpp>
 
 Completion::~Completion() noexcept {
@@ -49,7 +48,7 @@ void Completion::signal() noexcept {
     const u64 actor = reinterpret_cast<u64>(owner_);
     const u64 id = reinterpret_cast<u64>(this);
     trace::emit(trace::Event::Claim, actor, id);
-    sched::PreemptGuard preempt;
+    sync::Irq interrupts;
     wait_->wake();
     delivery_.store(Delivery::Ready, std::memory_order_release);
     trace::emit(trace::Event::Complete, actor, id);
@@ -207,8 +206,8 @@ auto Wait::finish() noexcept -> bool {
             }
             // FinishOwned excludes cancellation and all other finishers;
             // Publishing is the only legal transient state here.  The
-            // BlockingSink producer is pinned on its CPU by PreemptGuard, so
-            // same-hart publication cannot self-deadlock, while a remote
+            // The producer masks IRQs through wake-to-Ready publication, so
+            // a same-hart waiter cannot suspend its own producer; a remote
             // producer continues independently to Ready.
             libk_assert(claim == Completion::FinishClaim::Publishing);
             std::atomic_signal_fence(std::memory_order_seq_cst);

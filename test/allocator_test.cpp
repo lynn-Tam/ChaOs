@@ -828,7 +828,7 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
         const auto available = pmm.free_page_count();
         usize supplied{};
         auto failed = user->map(fresh, 2, [&] {
-            return supplied++ == 0 ? payload->page() : mm::Page{};
+            return supplied++ == 0 ? payload->page() : mm::Page{arch::Pte::PhysicalPages};
         }, arch::PtPerm::UserRw);
         if (failed || failed.error() != mm::PtErr::BadPhys || user->page_count() != 4
             || pmm.free_page_count() != available || user->query(fresh)

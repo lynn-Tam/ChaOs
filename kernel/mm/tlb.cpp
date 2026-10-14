@@ -65,14 +65,23 @@ bool Flush::kick(Cpus &cpus) const noexcept {
     return sent;
 }
 
-bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable) noexcept {
+bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable, bool global) noexcept {
     libk_assert(owner_ && !flush.submitted());
     flush.owner_ = owner_;
     flush.executable_ = executable;
     static_cast<void>(owner_->retained_.fetch_add(1, std::memory_order_relaxed));
     {
         sync::Lock lock{flush_lock};
-        flush.targets_ = flush.pending_ = owner_->active_;
+        flush.targets_ = owner_->active_;
+        if (global) {
+            // Shared kernel branches are cached while user roots are active.
+            // Late CPU entrants fence before using the shared mappings.
+            libk_assert(cpus);
+            flush.targets_ = {};
+            for (usize i = 0; i < cpus->count(); ++i)
+                if (cpus->get(CpuId{i})->online()) (void)flush.targets_.insert(CpuId{i});
+        }
+        flush.pending_ = flush.targets_;
         flush.done_.initialize(flush.pending_.size());
         if (!flush.pending_.empty()) {
             flush.next_ = flushes;

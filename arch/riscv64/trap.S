@@ -114,12 +114,9 @@ trap_entry:
     csrr t0, stval
     sd t0, STVAL_OFFSET(sp)
 
-    // The handler returns the selected user-return frame.  Cross-domain
-    // continuations may replace the interrupted frame before the common exit
-    // hook observes scheduler and wait state.
+    // The interrupted Thread retains this frame on its sole kernel stack.
     mv a0, sp
     call trap_enter
-    mv sp, a0
     /*---- 恢复边界 ----*/
     // sscratch is restored to Entry before C++ runs, so return can update
     // trap_depth without depending on any frame-resident temporary register.
@@ -134,11 +131,6 @@ trap_entry:
     */
     mv a0, sp
     call trap_exit
-    // The selected-arch exit hook may redirect this return to a synthetic
-    // frame on another guarded kernel stack (Endpoint Activation).
-    mv sp, a0
-    mv a0, sp
-    call trap_return
 
 .Lrestore_frame:
     // A newly started Thread reaches this path with interrupts enabled.

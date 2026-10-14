@@ -39,6 +39,7 @@ class Flush final : private libk::noncopyable_nonmovable {
 
   private:
     friend class Tlb;
+    friend class KSpace;
     friend void drain_tlb(CpuId) noexcept;
     void ack(CpuId) noexcept;
     resource::Charge fee_{};
@@ -62,7 +63,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
         Edit(const Edit &) = delete;
         ~Edit() noexcept { abort(); }
         const CpuSet &targets() const noexcept { return owner_->active_; }
-        bool commit(Flush &, Cpus *, CpuId local, bool executable = false) noexcept;
+        bool commit(Flush &, Cpus *, CpuId local, bool executable = false, bool global = false) noexcept;
         void publish_fresh() noexcept;
         void abort() noexcept {
             if (owner_) {

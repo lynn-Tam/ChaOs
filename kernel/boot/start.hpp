@@ -6,7 +6,6 @@
 #include <cpu/cpu.hpp>
 #include <io/space.hpp>
 #include <ipc/channel.hpp>
-#include <ipc/endpoint.hpp>
 #include <ipc/notification.hpp>
 #include <mm/pager.hpp>
 #include <object/pool.hpp>
@@ -28,6 +27,7 @@ struct Boot {
     Cpus cpus;
     object::ref<sched::Domain> domain;
     object::ref<object::group> root;
+    object::ref<mm::Phys> physical;
     struct Worker {
         Cpus& cpus;
         object::ref<sched::Sc> sc{};
@@ -40,5 +40,5 @@ enum class BootErr : u8 {
     InvalidModule, InvalidBundle, Ownership, OutOfMemory,
     InvalidState, MappingFailed, CapabilityFailed, SchedulingFailed,
 };
-auto boot_root(Boot&, Cpu&, const BootInfo&, mm::BootPages&&, mm::BootPages&&, HwStart) noexcept
+auto boot_root(Boot&, Cpu&, const BootInfo&, mm::BootPages&&, mm::BootPages&&) noexcept
     -> std::expected<void, BootErr>;

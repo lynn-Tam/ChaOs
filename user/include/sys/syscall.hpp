@@ -45,35 +45,35 @@ struct SysResult final {
     };
 }
 
-[[nodiscard]] inline auto io_space_create(cap_t pool) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_CREATE, pool);
+[[nodiscard]] inline auto memory_create_physical(cap_t pool, cap_t physical, word_t address,
+                                                  word_t bytes, word_t perms) noexcept -> SysResult {
+    return call(SYS_MEMORY_CREATE_PHYSICAL, pool, physical, address, bytes, perms);
+}
+[[nodiscard]] inline auto irq_controller_create(cap_t pool, cap_t physical, cap_t config,
+                                                word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_IRQ_CONTROLLER_CREATE, pool, physical, config, offset);
+}
+[[nodiscard]] inline auto irq_create(cap_t pool, cap_t controller, word_t source) noexcept -> SysResult {
+    return call(SYS_IRQ_CREATE, pool, controller, source);
 }
 
-[[nodiscard]] inline auto io_space_bind(cap_t space, cap_t device,
-    cap_t memory, word_t first_page, word_t page_count,
-    word_t iova) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_BIND, space, device, memory, first_page, page_count, iova);
+[[nodiscard]] inline auto iommu_create(cap_t pool, cap_t physical, cap_t config, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_IOMMU_CREATE, pool, physical, config, offset);
 }
-
-[[nodiscard]] inline auto io_space_watch(cap_t space, cap_t notification,
-    word_t badge) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_WATCH, space, notification, badge);
+[[nodiscard]] inline auto io_space_create(cap_t pool, cap_t controller, word_t requester) noexcept -> SysResult {
+    return call(SYS_IO_SPACE_CREATE, pool, controller, requester);
 }
-
-[[nodiscard]] inline auto io_space_state(cap_t space) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_STATE, space);
+[[nodiscard]] inline auto io_space_map(cap_t domain, cap_t memory, word_t first, word_t count, word_t iova, word_t perms) noexcept -> SysResult {
+    return call(SYS_IO_SPACE_MAP, domain, memory, first, count, iova, perms);
 }
-
-[[nodiscard]] inline auto io_space_reg(cap_t space, word_t index) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_REG, space, index);
+[[nodiscard]] inline auto io_space_unmap(cap_t domain, word_t iova, word_t count) noexcept -> SysResult {
+    return call(SYS_IO_SPACE_UNMAP, domain, iova, count);
 }
-
-[[nodiscard]] inline auto io_space_irq(cap_t space) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_IRQ, space);
-}
-
-[[nodiscard]] inline auto io_space_close(cap_t space) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_CLOSE, space);
+[[nodiscard]] inline auto io_space_state(cap_t domain) noexcept -> SysResult { return call(SYS_IO_SPACE_STATE, domain); }
+[[nodiscard]] inline auto iommu_state(cap_t ctl) noexcept -> SysResult { return call(SYS_IOMMU_STATE, ctl); }
+[[nodiscard]] inline auto io_space_close(cap_t domain) noexcept -> SysResult { return call(SYS_IO_SPACE_CLOSE, domain); }
+[[nodiscard]] inline auto io_space_watch(cap_t domain, cap_t notice, word_t badge) noexcept -> SysResult {
+    return call(SYS_IO_SPACE_WATCH, domain, notice, badge);
 }
 
 inline void yield() noexcept {
@@ -318,57 +318,6 @@ inline void yield() noexcept {
     cap_t notification,
     word_t deadline = 0) noexcept -> SysResult {
     return call(SYS_NOTIFICATION_WAIT, notification, deadline);
-}
-
-[[nodiscard]] inline auto endpoint_create(
-    cap_t pool,
-    cap_t vspace,
-    cap_t cspace,
-    cap_t descriptor_memory,
-    word_t descriptor_offset = 0) noexcept -> SysResult {
-    return call(
-        SYS_ENDPOINT_CREATE,
-        pool, vspace, cspace, descriptor_memory, descriptor_offset);
-}
-
-[[nodiscard]] inline auto endpoint_mint(
-    cap_t endpoint,
-    cap_t destination_cspace,
-    word_t badge,
-    word_t cap_limit,
-    word_t rights) noexcept -> SysResult {
-    return call(
-        SYS_ENDPOINT_MINT,
-        endpoint, destination_cspace, badge, cap_limit, rights);
-}
-
-[[nodiscard]] inline auto endpoint_call(
-    cap_t endpoint,
-    word_t first = 0,
-    word_t second = 0,
-    word_t third = 0,
-    word_t timeout_ns = 0) noexcept -> SysResult {
-    return call(
-        SYS_ENDPOINT_CALL,
-        endpoint, first, second, third, timeout_ns);
-}
-
-[[nodiscard]] inline auto endpoint_reply(
-    status_t status,
-    word_t value = 0) noexcept -> SysResult {
-    return call(
-        SYS_ENDPOINT_REPLY,
-        static_cast<word_t>(status), value);
-}
-
-[[nodiscard]] inline auto endpoint_abort(
-    word_t detail = 0) noexcept -> SysResult {
-    return call(SYS_ENDPOINT_ABORT, detail);
-}
-
-[[nodiscard]] inline auto endpoint_close(cap_t endpoint) noexcept
-    -> SysResult {
-    return call(SYS_ENDPOINT_CLOSE, endpoint);
 }
 
 [[nodiscard]] inline auto channel_create(

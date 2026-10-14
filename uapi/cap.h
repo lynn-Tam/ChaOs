@@ -22,17 +22,17 @@ enum ObjKind {
     ObjVSpace = 6,
     ObjGroup = 7,
     ObjNotification = 8,
-    /* 9-10 reserved: removed experimental lane and transport. */
-    ObjEndpoint = 11,
-    ObjChannel = 12,
-    ObjPager = 13,
-    ObjIrq = 14,
-    ObjHost = 15,
-    ObjIoSpace = 16,
-    ObjCount = 17,
+    ObjChannel = 9,
+    ObjPager = 10,
+    ObjIrq = 11,
+    ObjIommu = 12,
+    ObjIoSpace = 13,
+    ObjPhys = 14,
+    ObjIrqCtl = 15,
+    ObjCount = 16,
 };
 
-#define OBJ_KINDS (((UINT64_C(1) << ObjCount) - 2) & ~(UINT64_C(3) << 9))
+#define OBJ_KINDS ((UINT64_C(1) << ObjCount) - 2)
 
 typedef uint16_t obj_kind_t;
 
@@ -99,33 +99,32 @@ static_assert(offsetof(CapView, words) == 16);
 #define CAP_CHANNEL_SIDE_A 0U
 #define CAP_CHANNEL_SIDE_B 1U
 
-#define RIGHT_DUPLICATE     (U64_C(1) << 0)
-#define RIGHT_DELEGATE      (U64_C(1) << 1)
-#define RIGHT_RESERVE       (U64_C(1) << 2)
-#define RIGHT_MAP           (U64_C(1) << 4)
-#define RIGHT_UNMAP         (U64_C(1) << 5)
-#define RIGHT_PROTECT       (U64_C(1) << 6)
-#define RIGHT_DESTROY       (U64_C(1) << 7)
-#define RIGHT_INSPECT       (U64_C(1) << 8)
-#define RIGHT_CONTROL       (U64_C(1) << 9)
-#define RIGHT_MANAGE        (U64_C(1) << 10)
-#define RIGHT_REVOKE        (U64_C(1) << 11)
-#define RIGHT_CREATE        (U64_C(1) << 12)
-#define RIGHT_SPLIT         (U64_C(1) << 13)
-#define RIGHT_CLOSE         (U64_C(1) << 14)
-#define RIGHT_SIGNAL        (U64_C(1) << 15)
-#define RIGHT_RECEIVE       (U64_C(1) << 16)
-#define RIGHT_CONNECT       (U64_C(1) << 17)
-#define RIGHT_ACK           (U64_C(1) << 18)
-#define RIGHT_CALL          (U64_C(1) << 19)
-#define RIGHT_SEND          (U64_C(1) << 20)
-#define RIGHT_SERVE         (U64_C(1) << 21)
-#define RIGHT_SUPPLY        (U64_C(1) << 22)
-#define RIGHT_FAIL          (U64_C(1) << 23)
-#define RIGHT_WRITEBACK_ACK (U64_C(1) << 24)
-#define RIGHT_ROUTE         (U64_C(1) << 25)
-#define RIGHT_OBSERVE       (U64_C(1) << 26)
-#define RIGHT_ATTACH        (U64_C(1) << 27)
-#define RIGHT_MASK          ((U64_C(1) << 28) - 1)
+#define RIGHT_DUPLICATE           (U64_C(1) << 0)
+#define RIGHT_DELEGATE            (U64_C(1) << 1)
+#define RIGHT_RESERVE             (U64_C(1) << 2)
+#define RIGHT_MAP                 (U64_C(1) << 3)
+#define RIGHT_UNMAP               (U64_C(1) << 4)
+#define RIGHT_PROTECT             (U64_C(1) << 5)
+#define RIGHT_DESTROY             (U64_C(1) << 6)
+#define RIGHT_INSPECT             (U64_C(1) << 7)
+#define RIGHT_CONTROL             (U64_C(1) << 8)
+#define RIGHT_MANAGE              (U64_C(1) << 9)
+#define RIGHT_REVOKE              (U64_C(1) << 10)
+#define RIGHT_CREATE              (U64_C(1) << 11)
+#define RIGHT_SPLIT               (U64_C(1) << 12)
+#define RIGHT_CLOSE               (U64_C(1) << 13)
+#define RIGHT_SIGNAL              (U64_C(1) << 14)
+#define RIGHT_RECEIVE             (U64_C(1) << 15)
+#define RIGHT_CONNECT             (U64_C(1) << 16)
+#define RIGHT_ACK                 (U64_C(1) << 17)
+#define RIGHT_SEND                (U64_C(1) << 18)
+#define RIGHT_SERVE               (U64_C(1) << 19)
+#define RIGHT_SUPPLY              (U64_C(1) << 20)
+#define RIGHT_FAIL                (U64_C(1) << 21)
+#define RIGHT_WRITEBACK_ACK       (U64_C(1) << 22)
+#define RIGHT_ROUTE               (U64_C(1) << 23)
+#define RIGHT_OBSERVE             (U64_C(1) << 24)
+#define RIGHT_ATTACH              (U64_C(1) << 25)
+#define RIGHT_MASK          ((U64_C(1) << 26) - 1)
 
 #define OBJ_BIT(kind) (U64_C(1) << (kind))

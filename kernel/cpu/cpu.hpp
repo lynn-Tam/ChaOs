@@ -12,6 +12,7 @@
 #include <libk/noncopyable.hpp>
 
 class Cpus;
+namespace irq { class Ctl; }
 namespace cap { class Graph; }
 struct PanicSlot;
 namespace trace { struct Ring; }
@@ -42,7 +43,6 @@ struct Cpu final : private libk::noncopyable_nonmovable {
     Thread* current{};
     mm::Tlb* tlb{};
     usize root{}, locks{};
-    libk::delegate<void() noexcept> ext_irq{};
     std::optional<mm::Stack> init_stack{}, emergency_stack{};
     mm::OwnedPage panic_page{}, trace_page{};
     PanicSlot* panic{};
@@ -67,6 +67,9 @@ public:
     auto add(CpuHwId hw, object::Objects&, cap::Graph&, mm::KSpace&, time::Clock&,
              mm::Stack* boot_stack = nullptr) noexcept -> bool;
     void start() noexcept;
+    void attach_irq(irq::Ctl&) noexcept;
+    void detach_irq(irq::Ctl&) noexcept;
+    void dispatch_irq(CpuId) noexcept;
     auto count() const noexcept -> usize { return cpus_.size(); }
     static constexpr auto boot_id() noexcept -> CpuId { return CpuId{0}; }
     auto get(CpuId id) noexcept -> Cpu* {
@@ -77,6 +80,8 @@ private:
     friend struct Cpu;
 
     // RMW publication chains entrants; the last count observes every online CPU.
+    sync::Spin irq_lock_;
+    irq::Ctl* interrupts_{};
     std::atomic<usize> online_{};
     mm::PageGroup pages_;
     libk::inplace_vector<Cpu*, MaxCpus> cpus_;

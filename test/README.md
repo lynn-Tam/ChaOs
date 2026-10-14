@@ -165,7 +165,6 @@ reported as `[FAIL] group: name`.
 - RISC-V instruction parcels distinguish compressed completion
 - UserStart rejects privilege and canonical-address forgery
 - synthetic first frame lives only on the Thread home stack
-- register ABI values remain explicit UAPI data
 
 ## ipc
 
@@ -173,4 +172,3 @@ reported as `[FAIL] group: name`.
 - Notification source rearm preserves level readiness
 - Notification source has one receiver-owned binding
 - Notification authority cannot rewrite its fixed badge
-- Endpoint authority fixes caller badge and only narrows admission

@@ -43,11 +43,11 @@ auto cancellation_publication(Thread& thread, Cpus& cpus) noexcept -> bool {
         source.ready = true;
         // A real producer may have stored its result and still owe signal().
         // Cancellation must retain its lifetime through that publication gap.
-        if (thread.current_wait().cancel()) return false;
-        if (!thread.current_wait().attached() || source.releases != 0) return false;
+        if (thread.wait().cancel()) return false;
+        if (!thread.wait().attached() || source.releases != 0) return false;
         source.completion.signal();
         thread.cancel_wait();
-        if (thread.current_wait().attached() || source.releases != 1) return false;
+        if (thread.wait().attached() || source.releases != 1) return false;
     }
     {
         DeferredResult source;
@@ -55,14 +55,14 @@ auto cancellation_publication(Thread& thread, Cpus& cpus) noexcept -> bool {
         source.ready = true;
         source.completion.signal();
         thread.cancel_wait();
-        if (thread.current_wait().attached() || source.releases != 1) return false;
+        if (thread.wait().attached() || source.releases != 1) return false;
     }
     {
         DeferredResult source;
         source.cancelable = true;
         if (!thread.begin_wait(source.completion, cpus)) return false;
         thread.cancel_wait();
-        if (thread.current_wait().attached() || source.releases != 1) return false;
+        if (thread.wait().attached() || source.releases != 1) return false;
     }
     return true;
 }
@@ -161,20 +161,20 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
         mm::Fence wait{std::move(target), space.get()};
         libk_assert(current.begin_wait(wait.completion(), cpus));
         wait.start();
-        libk_assert(space->pending() && !current.current_wait().ready());
+        libk_assert(space->pending() && !current.wait().ready());
         peer.release.store(true, std::memory_order_release);
         const auto duration = kernel.clock.ticks<1, time::s>();
         libk_assert(duration);
         const auto deadline = libk::checked_add(kernel.clock.rd_ticks(), *duration);
         libk_assert(deadline);
         interrupts.restore();
-        while (!current.current_wait().ready() && kernel.clock.rd_ticks() < *deadline)
+        while (!current.wait().ready() && kernel.clock.rd_ticks() < *deadline)
             sched::yield();
-        passed = current.current_wait().ready() && !space->pending() &&
+        passed = current.wait().ready() && !space->pending() &&
                  !peer.expired.load(std::memory_order_acquire);
         libk_assert(passed);
         current.cancel_wait();
-        libk_assert(!current.current_wait().attached());
+        libk_assert(!current.wait().attached());
     }
     while (thread->state() != Thread::State::Exited) sched::yield();
     // Exited and an unbound SC precede the dispatcher's final home release.

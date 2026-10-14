@@ -1,19 +1,19 @@
 #pragma once
 
-#include <stddef.h>
 #include <uapi/abi.h>
+#include <uapi/cap.h>
 
-enum IoState {
-    IO_SPACE_EMPTY = 0,
-    IO_SPACE_BINDING = 1,
-    IO_SPACE_OPENING = 2,
-    IO_SPACE_ACTIVE = 3,
-    IO_SPACE_CLOSING = 4,
-    IO_SPACE_CLOSED = 5,
-    IO_SPACE_FAILED = 6,
-    IO_SPACE_FAULTED = 7,
+#define IOMMU_RISCV 1U
+enum IoState { IO_SPACE_PENDING, IO_SPACE_READY, IO_SPACE_CLOSING, IO_SPACE_CLOSED, IO_SPACE_FAILED };
+
+struct IommuConfig {
+    uint32_t protocol, reserved;
+    uint64_t address, bytes;
+    cap_t irq_controller;
+    uint32_t source, device_bits;
 };
 
-// PCI BAR indices 0..5; index 6 exports the function's read-only ECAM page.
-#define IO_PCI_CFG 6U
-#define IO_REG_COUNT 7U
+// Map/unmap are asynchronous. READY acknowledges the last edit; CLOSED
+// acknowledges DMA retirement, not device reset or interconnect quiescence.
+// Unmap consumes exactly a previously submitted IOVA range.
+// Map with IOVA=0 allocates a gap; the result returns its IOVA with PENDING.

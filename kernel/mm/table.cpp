@@ -34,7 +34,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
         return std::unexpected(PtErr::BadPhys);
     PageTable pt{*root, std::move(pages), kind};
     auto *entries = ::new (pt.table(*root)) Pte[arch::Ptes]{};
-    for (usize i = arch::Ptes / 2; i < arch::Ptes && kind != Kind::Io; ++i) {
+    for (usize i = arch::Ptes / 2; i < arch::Ptes; ++i) {
         if (kind == Kind::User) {
             const auto entry = kernel->table(kernel->root_)[i].load();
             libk_assert(entry.next_table_page());
@@ -54,14 +54,13 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
 }
 
 auto PageTable::cpu_root() const noexcept -> usize {
-    libk_assert(*this && kind_ != Kind::Io);
+    libk_assert(*this);
     return arch::pt_token(root_.raw());
 }
 
 auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> {
     const usize addr = va.base().raw();
-    if (!arch::pt_canonical(addr) || (kind_ == Kind::User && !mm::is_user(va.base())) ||
-        (kind_ == Kind::Io && (va.base().raw() == 0 || va.base().raw() >= arch::PtUserEnd)))
+    if (!arch::pt_canonical(addr) || (kind_ == Kind::User && !mm::is_user(va.base())))
         return std::unexpected(PtErr::BadAddr);
     Walk w{};
     auto page = root_;
@@ -105,8 +104,6 @@ bool PageTable::Count::include(mm::VPage va) noexcept {
 }
 
 auto PageTable::encode(mm::Page page, PtPerm perms) const noexcept -> std::expected<Pte, PtErr> {
-    if (kind_ != Kind::Io && !tables_.owner().covers(Pages{page, 1}))
-        return std::unexpected(PtErr::BadPhys);
     auto pte = Pte::leaf_4k(page.raw(), perms, kind_ != Kind::User);
     return pte ? std::expected<Pte, PtErr>{*pte} : std::unexpected(PtErr::BadPhys);
 }
@@ -230,20 +227,6 @@ auto PageTable::user_perms(mm::Perms perms) noexcept -> std::optional<PtPerm> {
     if (perms.contains(mm::Perm::Execute))
         return perms.contains(mm::Perm::Read) ? PtPerm::UserRx : PtPerm::UserX;
     return perms.contains(mm::Perm::Read) ? std::optional{PtPerm::UserRo} : std::nullopt;
-}
-
-auto PageTable::dma_pages(usize first, usize count) noexcept -> std::expected<usize, PtErr> {
-    constexpr usize limit = usize{1} << 38;
-    if (first == 0 || first % mm::page_size != 0 || first >= limit || count == 0 ||
-        count > (limit - first) / mm::page_size)
-        return std::unexpected(PtErr::BadAddr);
-    usize pages = 1;
-    const usize last = first + (count - 1) * mm::page_size;
-    for (int level = 1; level < arch::PtLevels; ++level) {
-        const auto shift = 12 + arch::PtBits * level;
-        pages += (last >> shift) - (first >> shift) + 1;
-    }
-    return pages;
 }
 
 } // namespace mm

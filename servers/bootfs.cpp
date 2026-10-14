@@ -1,78 +1,63 @@
+#include <protocols/msg.hpp>
 #include <protocols/file.hpp>
 #include <libk/cpio.hpp>
 #include <vector>
-#include <deque>
 #include <memory>
 #include <string>
+#include <new>
 
 struct bf_file {
     std::string name;
     std::span<const std::byte> bytes;
-    vm_area backing;
+    fl_memory backing;
 };
 struct bf_open {
+    std::unique_ptr<bf_open> next;
     cap_owner channel;
     io_server session;
     bf_file* file;
     uint64_t offset{};
 };
 static std::vector<bf_file> files;
-static std::deque<std::unique_ptr<bf_open>> opens;
+static std::unique_ptr<bf_open> opens;
 static const rt_env* env;
 static cap_owner descriptor;
 static cap_t memory_pool;
 
-static auto backing(bf_file& f, word_t perms, ch_reply& reply) -> status_t {
+static auto backing(bf_file& f, word_t perms, msg_reply& reply) -> status_t {
     if (f.bytes.empty())
         return STATUS_BAD_ARGS;
     const auto size = (f.bytes.size() + 4095) & ~size_t{4095};
     if (!f.backing.memory) {
-        const auto mem = sys::memory_create(memory_pool, size, VM_READ | VM_WRITE | VM_EXECUTE);
-        if (mem.status != STATUS_OK)
-            return mem.status;
+        fl_memory file{.size = f.bytes.size()};
+        auto status = file.create(memory_pool, VM_READ | VM_WRITE | VM_EXECUTE);
+        if (status != STATUS_OK)
+            return status;
         vm_area prepared;
-        prepared.memory = cap_owner{mem.value};
-        auto status = prepared.open(env->vspace, 0, size, VM_READ | VM_WRITE);
+        status = prepared.open(env->vspace, 0, size, VM_READ | VM_WRITE);
         if (status == STATUS_OK)
-            status = prepared.attach(mem.value, 0, size, VM_READ | VM_WRITE);
+            status = prepared.attach(file.memory.selector(), 0, size, VM_READ | VM_WRITE);
         if (status != STATUS_OK)
             return status;
         ::memcpy(reinterpret_cast<void*>(prepared.address), f.bytes.data(), f.bytes.size());
         status = prepared.detach();
         if (status == STATUS_OK)
-            status = sys::memory_seal(mem.value).status;
+            status = sys::memory_seal(file.memory.selector()).status;
         if (status != STATUS_OK)
             return status;
-        f.backing = std::move(prepared);
+        f.backing = std::move(file);
     }
-    const CapView view{.version = CAP_ATTENUATION_VERSION_CURRENT,
-                       .kind = ObjMem,
-                       .size = CAP_ATTENUATION_SIZE,
-                       .rights = RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE,
-                       .words = {0, size / 4096, perms}};
-    std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
-    cap_encode(view, wire);
-    ::memcpy(reinterpret_cast<void*>(env->ipc), wire.data(), wire.size());
-    auto status = sys::memory_write(descriptor.selector(), 0, 0, wire.size()).status;
-    if (status != STATUS_OK)
-        return status;
-    auto exported =
-        sys::cap_typed_delegate(f.backing.memory.selector(), env->cspace, descriptor.selector(), 0, memory_pool);
-    cap_owner cap{exported.value};
-    if (exported.status != STATUS_OK)
-        return exported.status;
-    if (!reply.offer(std::move(cap), view.rights))
-        return STATUS_INTERNAL;
-    reply.message.value = 1;
-    reply.message.size = sizeof(uint64_t);
-    const uint64_t bytes = f.bytes.size();
-    ::memcpy(reply.message.data, &bytes, sizeof(bytes));
-    return STATUS_OK;
+    return f.backing.offer(*env, descriptor.selector(), memory_pool, perms, reply);
 }
-static void control(const ch_packet& packet, ch_reply& response) {
+
+static void control(const msg_packet& packet, msg_reply& response) {
     const auto& req = packet.message;
     auto& reply = response.message;
-    if (packet.badge != fs_read_directory && packet.badge != fs_execute_directory) {
+    if (const auto status = rt_admit(req.deadline); status != STATUS_OK) {
+        reply.status = status;
+        return;
+    }
+    if (!(packet.badge & fl_read) || (packet.badge & ~(fl_read | fl_exec))) {
         reply.status = STATUS_DENIED;
         return;
     }
@@ -118,7 +103,7 @@ static void control(const ch_packet& packet, ch_reply& response) {
             reply.status = STATUS_BAD_ARGS;
             return;
         }
-        if ((req.value & VM_EXECUTE) && packet.badge != fs_execute_directory) {
+        if ((req.value & VM_EXECUTE) && !(packet.badge & fl_exec)) {
             reply.status = STATUS_DENIED;
             return;
         }
@@ -129,7 +114,11 @@ static void control(const ch_packet& packet, ch_reply& response) {
         reply.status = STATUS_DENIED;
         return;
     }
-    auto open = std::make_unique<bf_open>();
+    auto open = std::unique_ptr<bf_open>{new (std::nothrow) bf_open};
+    if (!open) {
+        reply.status = STATUS_NO_MEMORY;
+        return;
+    }
     open->file = &*found;
     const auto pair = sys::channel_create(env->pool, 1, CHANNEL_MAX_WORDS, 4, 2);
     cap_owner roots[]{cap_owner{pair.value}, cap_owner{pair.value2}};
@@ -160,12 +149,14 @@ static void control(const ch_packet& packet, ch_reply& response) {
         reply.status = STATUS_INTERNAL;
         return;
     }
-    opens.push_back(std::move(open));
+    open->next = std::move(opens);
+    opens = std::move(open);
 }
 int main() {
     env = &rt_startup();
     memory_pool = env->selector(io_memory);
-    if (!memory_pool) sys::exit(STATUS_DENIED);
+    if (!memory_pool)
+        sys::exit(STATUS_DENIED);
     const auto* image = env->find(fs_archive);
     if (!image)
         sys::exit(STATUS_INVALID_CAP);
@@ -185,30 +176,30 @@ int main() {
             break;
         // The exported boot directory is an explicit subtree of the archive.
         if (f->name.starts_with("boot/"))
-            files.emplace_back(std::string{f->name.substr(5)}, f->data, vm_area{});
+            files.emplace_back(std::string{f->name.substr(5)}, f->data, fl_memory{});
     }
     const auto desc = sys::memory_create(env->pool, 4096, VM_READ | VM_WRITE);
     if (desc.status != STATUS_OK)
         sys::exit(desc.status);
     descriptor = cap_owner{desc.value};
-    ch_port directory{env->selector(fs_service), env->events};
+    msg_rx directory{env->selector(fs_service), env->events};
     for (;;) {
         bool again{};
         for (size_t i = 0; i < io_queue_depth; ++i) {
-            ch_packet packet;
+            msg_packet packet;
             const auto rc = directory.receive(packet);
             if (rc == STATUS_WOULD_BLOCK)
                 break;
             if (rc != STATUS_OK || packet.count != 1)
                 continue;
-            ch_reply response;
-            response.message = {.operation = packet.message.operation, .id = packet.message.id};
+            msg_reply response;
+            response.message = {.operation = packet.message.operation,};
             control(packet, response);
             response.respond(packet.capabilities[0].selector());
         }
-        for (auto i = opens.begin(); i != opens.end();) {
-            auto& o = **i;
-            if (o.session.poll([&](const ch_msg& req, ch_reply& response) {
+        for (auto* link = &opens; *link;) {
+            auto& o = **link;
+            if (o.session.poll([&](const msg_frame& req, msg_reply& response) {
                     if (req.size || req.value)
                         response.message.status = STATUS_BAD_ARGS;
                     else if (req.operation == static_cast<uint64_t>(io_control::Stat))
@@ -235,9 +226,14 @@ int main() {
                         continue;
                     }
                     const auto& r = *q->request(ticket);
+                    if (const auto status = rt_admit(r.deadline); status != STATUS_OK) {
+                        if (!q->finish(ticket, status, 0))
+                            sys::exit(STATUS_INTERNAL);
+                        again = true;
+                        continue;
+                    }
                     const bool valid = r.operation == static_cast<uint64_t>(io_operation::Read) &&
-                                       !r.object && !r.buffer && r.flags <= 1 &&
-                                       r.length <= io_buffer_size &&
+                                       r.flags <= 1 && r.length <= io_buffer_size &&
                                        r.buffer_offset <= io_payload_size &&
                                        r.length <= io_payload_size - r.buffer_offset;
                     const auto offset = r.flags ? o.offset : r.offset;
@@ -258,13 +254,14 @@ int main() {
                 o.session.abort();
             if (o.session.done()) {
                 o.session.reset();
-                i = opens.erase(i);
+                auto retired = std::move(*link);
+                *link = std::move(retired->next);
             } else {
                 if (o.session.arm() != STATUS_OK) {
                     o.session.abort();
                     again = true;
                 }
-                ++i;
+                link = &o.next;
             }
         }
         if (const auto rc = directory.arm().status; rc != STATUS_OK)

@@ -1,469 +1,536 @@
-#include <expected>
-#include <optional>
-#include <utility>
-#include <object/pool.hpp>
 #include <io/space.hpp>
+#include <cpu/cpu.hpp>
 #include <ipc/notification.hpp>
-
-#include <io/host.hpp>
-#include <cap/grant.hpp>
-#include <object/ref.hpp>
-#include <mm/mem.hpp>
-#include <sync.hpp>
+#include <memory>
+#include <algorithm>
 
 namespace io {
-static constexpr auto DmaAccess = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
+static constexpr usize Ddtp = 0x10, Cqb = 0x18, Cqh = 0x20, Cqt = 0x24;
+static constexpr usize Fqb = 0x28, Fqh = 0x30, Fqt = 0x34, Cqcsr = 0x48, Fqcsr = 0x4c, Ipsr = 0x54;
+static constexpr u32 On = 1 << 16, Busy = 1 << 17, CqErrors = 7 << 8, FqErrors = 3 << 8;
 
-Space::Space(mm::Pmm& pmm, WorkQueue& work, object::pool<irq::Irq>& irqs, object::pool<mm::Mem>& memory,
-             cap::Graph& grants) noexcept
-    : pmm_(pmm), work_(work), irqs_(irqs), mems_(memory), grants_(grants), reg_store_(pmm) {}
-
-Space::~Space() noexcept {
-    libk_assert(state_ == SpaceState::Empty || state_ == SpaceState::Closed || state_ == SpaceState::Faulted);
-    libk_assert(!self_ && !cleanup_ && !hw_ && !pins_ && !fault_source_.attached());
+template<class T> auto Iommu::read(usize offset) const noexcept -> T {
+    arch::io_fence();
+    const auto value = *reinterpret_cast<volatile const T*>(mapping_.address() + offset);
+    arch::io_fence();
+    return value;
 }
-
-auto Space::watch(ipc::Notification& notification, u64 badge) noexcept -> std::expected<void, SpaceError> {
-    if (badge == 0) return std::unexpected(SpaceError::InvalidRange);
-    sync::Lock guard{lock_};
-    if (state_ != SpaceState::Empty || fault_source_.attached())
-        return std::unexpected(SpaceError::InvalidState);
-    if (!notification.bind(fault_source_, badge)) return std::unexpected(SpaceError::InvalidState);
-    return {};
+template<class T> void Iommu::write(usize offset, T value) noexcept {
+    arch::io_fence();
+    *reinterpret_cast<volatile T*>(mapping_.address() + offset) = value;
+    arch::io_fence();
 }
-
-auto Space::state() const noexcept -> SpaceState {
-    sync::Lock guard{lock_};
-    return state_;
+Iommu::Iommu(mm::Pmm& pmm, mm::KSpace& vm, Cpus& cpus, WorkQueue& work, const time::Clock& clock,
+         object::ref<> payer, mm::Phys::Lease&& claim, object::ref<irq::Ctl> irq_owner,
+         irq::Line line, IommuConfig config) noexcept
+    : vm_(vm), cpus_(cpus), work_(work), clock_(clock), payer_(std::move(payer)),
+      claim_(std::move(claim)), irq_owner_(std::move(irq_owner)),
+      irq_(line, irq::Route::Handler::bind<&Iommu::interrupt>(*this),
+           irq::Route::Stop::bind<&Iommu::disconnected>(*this)), config_(config), storage_(pmm.group()) {}
+Iommu::~Iommu() noexcept { libk_assert(!mapped_ && !domains_ && !cleanup_); }
+auto Iommu::state() const noexcept -> IoState {
+    sync::Lock lock{lock_};
+    if (phase_ == Phase::Failed) return IO_SPACE_FAILED;
+    if (phase_ == Phase::Closed) return IO_SPACE_CLOSED;
+    if (closing_) return IO_SPACE_CLOSING;
+    return phase_ == Phase::Ready ? IO_SPACE_READY : IO_SPACE_PENDING;
 }
-
-auto Space::reg(usize index) noexcept -> std::expected<std::pair<cap::GrantRef, usize>, SpaceError> {
-    sync::Lock guard{lock_};
-    if (state_ != SpaceState::Active || closing_.load(std::memory_order_acquire))
-        return std::unexpected(SpaceError::InvalidState);
-    const auto sources = hw_.get()->regs();
-    if (index >= sources.size()) return std::unexpected(SpaceError::InvalidRange);
-    for (const auto& reg : regs_) {
-        if (reg.index != index) continue;
-        auto grant = reg.grant.clone();
-        if (!grant) return std::unexpected(SpaceError::Denied);
-        return std::pair{std::move(*grant), sources[index].size};
-    }
-    return std::unexpected(SpaceError::Absent);
+auto Iommu::page() noexcept -> std::expected<mm::Page, status_t> {
+    auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+    if (!fee) return std::unexpected(STATUS_NO_MEMORY);
+    auto page = storage_.allocate();
+    if (!page) return std::unexpected(STATUS_NO_MEMORY);
+    std::fill_n(storage_.bytes(*page), mm::page_size, byte{});
+    fee_.merge(std::move(*fee));
+    return *page;
 }
-
-auto Space::interrupt() noexcept -> std::expected<cap::GrantRef, SpaceError> {
-    sync::Lock guard{lock_};
-    if (state_ != SpaceState::Active || closing_.load(std::memory_order_acquire))
-        return std::unexpected(SpaceError::InvalidState);
-    auto grant = interrupt_grant_.clone();
-    if (!grant) return std::unexpected(SpaceError::Denied);
-    return (std::move(grant).value());
-}
-
-auto Space::bind(object::ref<> self, cap::Resolved<Host>& host, cap::Resolved<mm::Mem>& memory,
-                 mm::ObjectRange range, usize first) noexcept -> std::expected<void, SpaceError> {
-    auto pin = self.as<Space>();
-    if (!pin || &pin.value().get() != this) return std::unexpected(SpaceError::Denied);
-    const auto effective = memory.view();
-    const auto* limit = std::get_if<cap::MemLimit>(&effective.data);
-    if (!host.rights().contains(cap::Right::Connect) || !memory.rights().contains(cap::Right::Map) ||
-        limit == nullptr || !limit->range.contains(range) || !limit->perms.contains(DmaAccess))
-        return std::unexpected(SpaceError::Denied);
-    const auto view = host.view();
-    const auto* requesters = std::get_if<cap::HostLimit>(&view.data);
-    if (!requesters || requesters->count != 1) return std::unexpected(SpaceError::Denied);
-    const auto tables = mm::PageTable::dma_pages(first, range.size());
-    if (!tables || !range.within(memory->page_count())) return std::unexpected(SpaceError::InvalidRange);
-    if (memory->kind() != mm::BackingKind::Anonymous) return std::unexpected(SpaceError::UnsupportedMemory);
-    {
-        sync::Lock guard{lock_};
-        if (state_ != SpaceState::Empty) return std::unexpected(SpaceError::InvalidState);
-        self_ = std::move(self);
-        state_ = SpaceState::Binding;
-        work_.open(job_, Work::Fn::bind<&Space::run_work>(*this));
-    }
-    // Binding owns these fields while allocation and page materialization run
-    // with interrupts enabled. Invalidation can only request cancellation and
-    // deposit its exact token; service leaves Binding to this invocation.
-    std::optional<mm::PageTable> prepared{};
-    std::optional<SpaceError> error{};
-    {
-        auto root = prepare(host, requesters->first, memory, range, first, tables.value());
-        if (root)
-            prepared.emplace(std::move(root).value());
-        else
-            error = root.error();
-    }
-    {
-        sync::Lock guard{lock_};
-        if (prepared && !closing_.load(std::memory_order_acquire)) {
-            hw_.get()->open(std::move(*prepared));
-            state_ = SpaceState::Opening;
-            work_.post(job_);
-            return {};
+auto Iommu::context(u32 did, bool create) noexcept -> u64* {
+    // Extended contexts: 6 DID bits per leaf, 9 per directory level.
+    const unsigned levels = config_.device_bits <= 6 ? 0 : config_.device_bits <= 15 ? 1 : 2;
+    auto page = directory_;
+    for (unsigned level = levels; level; --level) {
+        auto* entry = reinterpret_cast<u64*>(storage_.bytes(page)) + ((did >> (6 + 9 * (level - 1))) & 511);
+        auto value = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
+        if (!value) {
+            if (!create) return nullptr;
+            auto child = this->page();
+            if (!child) return nullptr;
+            value = (child->raw() << 10) | 1;
+            __atomic_store_n(entry, value, __ATOMIC_RELEASE);
         }
+        page = mm::Page{value >> 10};
     }
-    // Unpublished tables disappear before service can refund their charge.
-    // Binding keeps the executor out while this potentially large tree frees.
-    prepared.reset();
-    {
-        sync::Lock guard{lock_};
-        state_ = SpaceState::Closing;
-        closing_.store(true, std::memory_order_release);
-        work_.post(job_);
-    }
-    return std::unexpected(error ? *error : SpaceError::Cancelled);
+    return reinterpret_cast<u64*>(storage_.bytes(page)) + (did & 63) * 8;
 }
-
-auto Space::prepare(cap::Resolved<Host>& host, usize requester, cap::Resolved<mm::Mem>& memory, mm::ObjectRange range,
-                    usize first, usize tables) noexcept -> std::expected<mm::PageTable, SpaceError> {
-    auto host_ref = host.reference();
-    auto memory_ref = memory.reference();
-    if (!host_ref || !memory_ref) return std::unexpected(SpaceError::Denied);
-    auto host_hold = std::move(host_ref).value().as<Host>();
-    auto memory_hold = std::move(memory_ref).value().as<mm::Mem>();
-    if (!host_hold || !memory_hold) return std::unexpected(SpaceError::Denied);
-    host_ = std::move(host_hold).value();
-    memory_ = std::move(memory_hold).value();
-    if (!host.attach(host_grant_) || !memory.attach(memory_grant_) ||
-        !memory_->attach(memory_attachment_, DmaAccess))
-        return std::unexpected(SpaceError::Denied);
-    auto lease = host_->acquire(requester, Hw::Stop::bind<&Space::stop_host>(*this));
-    if (!lease) return std::unexpected(lease.error() == BindErr::Busy ? SpaceError::Busy
-        : lease.error() == BindErr::NoMemory ? SpaceError::OutOfMemory : SpaceError::BackingUnavailable);
-    hw_.reset(*lease);
-    auto regs = prepare_regs();
-    if (!regs) return std::unexpected(regs.error());
-    auto interrupt = prepare_interrupt();
-    if (!interrupt) return std::unexpected(interrupt.error());
-    const usize metadata = (range.size() - 1) / Pins::Capacity + 1;
-    if (sponsor_ != nullptr) {
-        auto charge = sponsor_->acquire({.memory = (metadata + tables) * mm::page_size});
-        if (!charge) return std::unexpected(SpaceError::QuotaExceeded);
-        charge_ = std::move(charge).value();
+auto Iommu::open() noexcept -> status_t {
+    const auto range = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, 4096);
+    if (!range || !claim_.covers(*range)) return STATUS_BAD_ARGS;
+    if (!vm_.map(mapping_, *range)) return STATUS_NO_MEMORY;
+    mapped_ = true;
+    const auto caps = read<u64>(0);
+    // Coherent little-endian Sv39, extended contexts, wired interrupts.
+    if ((caps & 0xf0) != 0x10 || !(caps & (u64{1} << 9)) || !(caps & (u64{1} << 22)) ||
+        ((caps >> 28) & 3) == 0 || ((caps >> 28) & 3) == 3 || (read<u32>(8) & 5))
+        return STATUS_INVALID_OP;
+    mm::Page* slots[]{&directory_, &commands_, &faults_};
+    for (auto* slot : slots) {
+        auto allocated = page();
+        if (!allocated) return allocated.error();
+        *slot = *allocated;
     }
-    metadata_ = pmm_.group();
-    Pins** tail = &pins_;
-    for (usize offset = 0; offset < range.size();) {
-        if (closing_.load(std::memory_order_acquire)) return std::unexpected(SpaceError::Cancelled);
-        auto page = metadata_.allocate();
-        if (!page) return std::unexpected(SpaceError::OutOfMemory);
-        auto* block = libk::construct_at(reinterpret_cast<Pins*>(metadata_.bytes(page.value())));
-        *tail = block;
-        tail = &block->next;
-        for (; block->count < Pins::Capacity && offset < range.size(); ++offset) {
-            auto source = memory_->materialize(range.base() + offset);
-            if (!source) {
-                const auto error = source.error();
-                return std::unexpected(error == mm::MemErr::OutOfMemory ? SpaceError::OutOfMemory
-                                       : error == mm::MemErr::ResourceExhausted
-                                           ? SpaceError::QuotaExceeded
-                                           : SpaceError::BackingUnavailable);
+    if (!irq_.connect()) return STATUS_BUSY;
+    work_.open(job_, Work::Fn::bind<&Iommu::progress>(*this));
+    phase_ = Phase::Disabling;
+    deadline_ = clock_.rd_ticks() + clock_.rd_freq();
+    write<u64>(Ddtp, 0);
+    write<u32>(Cqcsr, 0);
+    write<u32>(Fqcsr, 0);
+    work_.post(job_);
+    return STATUS_OK;
+}
+auto Iommu::attach(Space& domain) noexcept -> status_t {
+    sync::Lock lock{lock_};
+    if (phase_ != Phase::Ready || closing_) return STATUS_BUSY;
+    for (auto* d = domains_; d; d = d->next_)
+        if (d->requester_ == domain.requester_) return STATUS_BUSY;
+    for (;;) {
+        bool used{};
+        for (auto* d = domains_; d; d = d->next_) used |= d->pscid_ == domain.pscid_;
+        if (!used) break;
+        if (++domain.pscid_ == (1U << 20)) return STATUS_NO_MEMORY;
+    }
+    if (!context(domain.requester_, true)) return STATUS_NO_MEMORY;
+    domain.next_ = domains_;
+    domains_ = &domain;
+    return STATUS_OK;
+}
+void Iommu::detach(Space& domain) noexcept {
+    sync::Lock lock{lock_};
+    libk_assert(inflight_ != &domain);
+    auto** link = &domains_;
+    while (*link != &domain) link = &(*link)->next_;
+    *link = domain.next_;
+    domain.next_ = nullptr;
+    if (closing_) work_.post(job_);
+}
+auto Iommu::sync(Space& domain, bool enable) noexcept -> status_t {
+    sync::Lock lock{lock_};
+    if (phase_ != Phase::Ready) return STATUS_BACKING_FAILED;
+    if (read<u32>(Cqcsr) & CqErrors) { fail(); return STATUS_BACKING_FAILED; }
+    if (inflight_) {
+        if (read<u32>(Cqh) != tail_) {
+            if (clock_.rd_ticks() >= deadline_) { fail(); return STATUS_BACKING_FAILED; }
+            return STATUS_PENDING;
+        }
+        if (inflight_ != &domain) return STATUS_PENDING;
+        inflight_ = nullptr;
+        return STATUS_OK;
+    }
+    auto* dc = context(domain.requester_, false);
+    libk_assert(dc);
+    __atomic_store_n(&dc[0], u64{0}, __ATOMIC_RELEASE);
+    dc[1] = 0;
+    dc[2] = u64{domain.pscid_} << 12; // unique translation tag per live domain
+    dc[3] = enable ? (u64{8} << 60) | domain.root_.raw() : 0;
+    if (enable) __atomic_store_n(&dc[0], u64{1}, __ATOMIC_RELEASE);
+    auto* commands = reinterpret_cast<u64*>(storage_.bytes(commands_));
+    const u64 batch[]{u64{3} | (u64{1} << 33) | (u64{domain.requester_} << 40),
+                      u64{1}, u64{2} | (u64{1} << 12) | (u64{1} << 13)};
+    for (const auto command : batch) {
+        commands[tail_ * 2] = command;
+        commands[tail_ * 2 + 1] = 0;
+        tail_ = (tail_ + 1) & 255;
+    }
+    inflight_ = &domain;
+    deadline_ = clock_.rd_ticks() + clock_.rd_freq();
+    write<u32>(Cqt, tail_);
+    return STATUS_PENDING;
+}
+void Iommu::fail() noexcept {
+    phase_ = Phase::Failed;
+    // Keep all potentially reachable storage and Claims. Failure is not drain.
+    for (auto* d = domains_; d; d = d->next_) {
+        d->failed_.store(true, std::memory_order_release);
+        work_.post(d->job_);
+    }
+}
+auto Iommu::interrupt() noexcept -> bool {
+    irq_pending_.store(true, std::memory_order_release);
+    work_.post(job_);
+    return false;
+}
+void Iommu::disconnected() noexcept {
+    disconnected_.store(true, std::memory_order_release);
+    work_.post(job_);
+}
+void Iommu::retire(object::cleanup&& cleanup) noexcept {
+    {
+        sync::Lock lock{lock_};
+        closing_ = true;
+        cleanup_ = std::move(cleanup);
+        for (auto* d = domains_; d; d = d->next_) {
+            d->closing_.store(true, std::memory_order_release);
+            work_.post(d->job_);
+        }
+        // Construction can fail before the protocol worker was opened.
+        if (phase_ == Phase::Empty) work_.open(job_, Work::Fn::bind<&Iommu::progress>(*this));
+    }
+    work_.post(job_);
+}
+void Iommu::progress() noexcept {
+    bool rearm{};
+    {
+        sync::Lock lock{lock_};
+        if (disconnected_.load(std::memory_order_acquire)) fail();
+        if (phase_ == Phase::Failed) return;
+        if (phase_ == Phase::Ready && irq_pending_.exchange(false, std::memory_order_acq_rel)) {
+            write<u32>(Ipsr, 3);
+            const auto tail = read<u32>(Fqt), status = read<u32>(Fqcsr);
+            if (tail >= 128 || (status & FqErrors)) { fail(); return; }
+            while (fault_head_ != tail) {
+                const auto* record = reinterpret_cast<volatile const u64*>(storage_.bytes(faults_)) + fault_head_ * 4;
+                const auto did = static_cast<u32>(record[0] >> 40);
+                for (auto* d = domains_; d; d = d->next_) if (d->requester_ == did) {
+                    d->closing_.store(true, std::memory_order_release);
+                    work_.post(d->job_);
+                }
+                fault_head_ = (fault_head_ + 1) & 127;
             }
-            if (!pmm_.is_ram(source.value().page()) ||
-                !source.value().perms().contains(DmaAccess))
-                return std::unexpected(SpaceError::UnsupportedMemory);
-            block->pages[block->count++] = std::move(source).value();
+            write<u32>(Fqh, fault_head_);
+            rearm = true;
         }
-    }
-    Pins* block = pins_;
-    usize index{};
-    auto next = [&]() noexcept {
-        libk_assert(block != nullptr && index < block->count);
-        const auto page = block->pages[index++].page();
-        if (index == block->count) {
-            block = block->next;
-            index = 0;
+        if (closing_ && domains_) return;
+        if (closing_ && phase_ == Phase::Ready) {
+            write<u64>(Ddtp, 0);
+            write<u32>(Cqcsr, 0);
+            write<u32>(Fqcsr, 0);
+            deadline_ = clock_.rd_ticks() + clock_.rd_freq();
+            phase_ = Phase::Stopping;
         }
-        return page;
-    };
-    auto root = mm::PageTable::dma(pmm_, first, range.size(), next, true);
-    if (!root) return std::unexpected(SpaceError::OutOfMemory);
-    libk_assert(root.value().page_count() == tables);
-    return (std::move(root).value());
-}
-
-auto Space::prepare_regs() noexcept -> std::expected<void, SpaceError> {
-    const auto sources = hw_.get()->regs();
-    const object::ref<> unpaid{};
-    const auto& payer = sponsor_ ? sponsor_->payer() : unpaid;
-    for (usize index = 0; index < sources.size(); ++index) {
-        const auto physical = sources[index];
-        const auto perms = physical.perms;
-        if (physical.size == 0) continue;
-        if (closing_.load(std::memory_order_acquire)) return std::unexpected(SpaceError::Cancelled);
-        const usize bytes = (physical.size + mm::page_size - 1) & ~(mm::page_size - 1);
-        const auto range = mm::Pages::from_aligned_bytes(mm::pa_t{physical.pa}, bytes);
-        if (!range) return std::unexpected(SpaceError::InvalidRange);
-        const mm::Extent extent{.object = {0, bytes / mm::page_size},
-                                      .physical = *range,
-                                      .perms = perms};
-        resource::Reservation object_charge{};
-        resource::Reservation grant_charge{};
-        if (sponsor_ != nullptr) {
-            auto memory = sponsor_->reserve(object::pool<mm::Mem>::slot_charge());
-            auto grant = sponsor_->reserve(cap::Graph::node_charge());
-            if (!memory || !grant) return std::unexpected(SpaceError::QuotaExceeded);
-            object_charge = std::move(memory).value();
-            grant_charge = std::move(grant).value();
+        switch (phase_) {
+        case Phase::Empty: phase_ = Phase::Unmapping; break;
+        case Phase::Disabling:
+            if ((read<u64>(Ddtp) & 16) || (read<u32>(Cqcsr) & (On | Busy)) || (read<u32>(Fqcsr) & (On | Busy))) break;
+            if (read<u64>(Ddtp) & 15) { fail(); return; }
+            write<u32>(8, 2);
+            if ((read<u32>(8) & 7) != 2) { fail(); return; }
+            write<u64>(0x2f8, read<u64>(0x2f8) & ~u64{0xff});
+            write<u64>(Cqb, (commands_.raw() << 10) | 7);
+            write<u64>(Fqb, (faults_.raw() << 10) | 6);
+            write<u32>(Cqt, 0);
+            write<u32>(Fqh, 0);
+            write<u32>(Cqcsr, 1);
+            write<u32>(Fqcsr, 1);
+            phase_ = Phase::Queues;
+            break;
+        case Phase::Queues: {
+            const auto cq = read<u32>(Cqcsr), fq = read<u32>(Fqcsr);
+            if ((cq & CqErrors) || (fq & FqErrors)) { fail(); return; }
+            if ((cq | fq) & Busy) break;
+            if (!(cq & On) || !(fq & On)) { fail(); return; }
+            const u64 mode = config_.device_bits <= 6 ? 2 : config_.device_bits <= 15 ? 3 : 4;
+            write<u64>(Ddtp, (directory_.raw() << 10) | mode);
+            phase_ = Phase::Directory;
+            break;
         }
-        auto pending = mems_.create(std::move(object_charge), pmm_, bytes, mm::PhysCfg{{&extent, 1}, {}});
-        if (!pending)
-            return std::unexpected(pending.error() == mm::MemErr::ResourceExhausted
-                                       ? SpaceError::QuotaExceeded
-                                       : SpaceError::OutOfMemory);
-        auto node = reg_store_.create(payer, index);
-        if (!node) return std::unexpected(node.error() == mm::SlabErr::ResourceExhausted
-            ? SpaceError::QuotaExceeded : SpaceError::OutOfMemory);
-        auto& reg = **node;
-        regs_.push_back(reg);
-        reg.memory = std::move(pending).value().publish();
-        // Space's allocation root owns these subordinate objects. Binding
-        // excludes cleanup until every constructed object is recorded here.
-        // Only Space invalidates this lineage; users may duplicate/delegate.
-        const cap::View ceiling{cap::Rights::of(cap::Right::Map, cap::Right::Inspect, cap::Right::Duplicate,
-                                                cap::Right::Delegate),
-                                cap::MemLimit{{0, bytes / mm::page_size},
-                                              perms}};
-        auto grant = grants_.create_root(std::move(grant_charge), reg.memory, ceiling);
-        if (!grant) return std::unexpected(SpaceError::OutOfMemory);
-        reg.grant = std::move(grant).value();
-    }
-    return {};
-}
-
-auto Space::retire_regs() noexcept -> bool {
-    bool complete = true;
-    for (auto& reg : regs_) {
-        if (!reg.memory) continue;
-        if (reg.grant && !reg.revoke.initialized())
-            libk_assert(grants_.invalidate(reg.grant.key(), reg.revoke));
-        (void)reg.memory.destroy();
-        if ((reg.revoke.initialized() && !reg.revoke.complete()) ||
-            reg.memory->state() != mm::MemState::Retired)
-            complete = false;
-    }
-    return complete;
-}
-
-auto Space::prepare_interrupt() noexcept -> std::expected<void, SpaceError> {
-    resource::Reservation object_charge{};
-    resource::Reservation grant_charge{};
-    if (sponsor_ != nullptr) {
-        auto object = sponsor_->reserve(object::pool<irq::Irq>::slot_charge());
-        auto grant = sponsor_->reserve(cap::Graph::node_charge());
-        if (!object || !grant) return std::unexpected(SpaceError::QuotaExceeded);
-        object_charge = std::move(object).value();
-        grant_charge = std::move(grant).value();
-    }
-    const auto source = hw_.get()->irq();
-    auto pending =
-        object_charge ? irqs_.create(std::move(object_charge), source) : irqs_.create(source);
-    if (!pending) return std::unexpected(SpaceError::OutOfMemory);
-    interrupt_ = std::move(pending).value().publish();
-    auto grant =
-        grants_.create_root(std::move(grant_charge), interrupt_,
-                            {cap::Rights::of(cap::Right::Inspect, cap::Right::Duplicate, cap::Right::Delegate,
-                                             cap::Right::Route, cap::Right::Observe, cap::Right::Ack),
-                             cap::IrqRoute{source.id, source.level}});
-    if (!grant) return std::unexpected(SpaceError::OutOfMemory);
-    interrupt_grant_ = std::move(grant).value();
-    return {};
-}
-
-auto Space::retire_interrupt() noexcept -> bool {
-    if (!interrupt_) return true;
-    if (interrupt_grant_ && !interrupt_revoke_.initialized())
-        libk_assert(grants_.invalidate(interrupt_grant_.key(), interrupt_revoke_));
-    if (interrupt_revoke_.initialized() && !interrupt_revoke_.complete()) return false;
-    // Grant drain excludes a concurrent user bind/ack. close serializes with
-    // dispatch, masks the source and detaches its Notification relation.
-    (void)interrupt_->close();
-    (void)interrupt_.destroy();
-    return interrupt_->closed();
-}
-
-void Space::stop_host(bool fault) noexcept {
-    auto& space = *this;
-    if (fault) space.fault_signal_.store(true, std::memory_order_release);
-    space.closing_.store(true, std::memory_order_release);
-    space.work_.post(space.job_);
-}
-
-void Space::invalidate_memory(void* ctx, mm::MemWork&& work) noexcept {
-    auto& space = *static_cast<Space*>(ctx);
-    sync::Lock guard{space.lock_};
-    libk_assert(!space.memory_work_);
-    space.memory_work_ = std::move(work);
-    space.closing_.store(true, std::memory_order_release);
-    space.work_.post(space.job_);
-}
-
-void Space::invalidate_host_grant(void* ctx, cap::GrantWork&& work) noexcept {
-    auto& space = *static_cast<Space*>(ctx);
-    sync::Lock guard{space.lock_};
-    libk_assert(!space.host_work_);
-    space.host_work_ = std::move(work);
-    space.closing_.store(true, std::memory_order_release);
-    space.work_.post(space.job_);
-}
-
-void Space::invalidate_memory_grant(void* ctx, cap::GrantWork&& work) noexcept {
-    auto& space = *static_cast<Space*>(ctx);
-    sync::Lock guard{space.lock_};
-    libk_assert(!space.grant_work_);
-    space.grant_work_ = std::move(work);
-    space.closing_.store(true, std::memory_order_release);
-    space.work_.post(space.job_);
-}
-
-void Space::close() noexcept {
-    bool empty{};
-    {
-        sync::Lock guard{lock_};
-        if (state_ == SpaceState::Empty) {
-            state_ = SpaceState::Closed;
-            empty = true;
-        } else if (state_ == SpaceState::Closed || state_ == SpaceState::Faulted ||
-                   state_ == SpaceState::Failed)
-            return;
-        else {
-            closing_.store(true, std::memory_order_release);
-            work_.post(job_);
+        case Phase::Directory:
+            if (read<u64>(Ddtp) & 16) break;
+            if (read<u64>(Ddtp) != ((directory_.raw() << 10) | (config_.device_bits <= 6 ? 2 : config_.device_bits <= 15 ? 3 : 4))) {
+                fail(); return;
+            }
+            write<u32>(Ipsr, 3);
+            write<u32>(Fqcsr, 3);
+            phase_ = Phase::Ready;
+            break;
+        case Phase::Stopping:
+            if ((read<u64>(Ddtp) & 16) || (read<u32>(Cqcsr) & (On | Busy)) || (read<u32>(Fqcsr) & (On | Busy))) break;
+            if (read<u64>(Ddtp) & 15) { fail(); return; }
+            phase_ = Phase::Unmapping;
+            break;
+        default: break;
         }
+        if (phase_ != Phase::Ready && phase_ != Phase::Unmapping && clock_.rd_ticks() >= deadline_) { fail(); return; }
+        if (phase_ != Phase::Ready && phase_ != Phase::Unmapping) { work_.post(job_); return; }
+        if (phase_ == Phase::Ready) { if (closing_) work_.post(job_); }
     }
-    if (empty) fault_source_.reset();
-}
-
-void Space::retire(object::cleanup&& cleanup) noexcept {
-    {
-        sync::Lock guard{lock_};
-        if (state_ != SpaceState::Empty && state_ != SpaceState::Closed && state_ != SpaceState::Faulted) {
-            cleanup_ = std::move(cleanup);
-            closing_.store(true, std::memory_order_release);
-            work_.post(job_);
-            return;
-        }
-        state_ = SpaceState::Closed;
+    // Route lock never nests inside the controller lock: IRQ dispatch posts work.
+    if (rearm) { irq_.reset(); if (!irq_.connect()) disconnected(); }
+    if (phase_ != Phase::Unmapping) return;
+    irq_.reset();
+    if (mapped_) {
+        if (!flush_) { flush_.emplace(); vm_.unmap(mapping_, *flush_, cpus_, current_cpu().id); }
+        if (!flush_->complete()) { (void)flush_->kick(cpus_); work_.post(job_); return; }
+        vm_.release(mapping_, *flush_);
+        flush_.reset();
+        mapped_ = false;
     }
-    fault_source_.reset();
+    storage_.reset();
+    fee_.reset();
+    { sync::Lock lock{lock_}; phase_ = Phase::Closed; }
+    work_.close(job_);
+    auto cleanup = std::move(cleanup_);
     cleanup.complete();
 }
 
-void Space::free_pages() noexcept {
-    while (pins_ != nullptr) {
-        auto* block = std::exchange(pins_, pins_->next);
-        libk::destroy_at(block);
-    }
-    metadata_.reset();
-    charge_.reset();
+Space::Map::Map(mm::Pmm& pmm, Space& domain, usize iova, usize n) noexcept
+    : owner(domain), first(iova), count(n), pins(pmm) {}
+Space::Map::~Map() noexcept {
+    libk_assert(!mem_link.busy() && !grant.busy());
+    while (pages) { auto* p = pages; pages = p->next; pins.destroy(*p); }
 }
-
-auto Space::service() noexcept -> Completion {
-    bool close_hardware{};
-    bool notify_fault{};
+void Space::Map::invalidate_mem(void* arg, mm::MemWork&& work) noexcept {
+    auto& m = *static_cast<Map*>(arg);
+    sync::Lock lock{m.owner.lock_};
+    m.mem_work = std::move(work);
+    m.owner.close();
+}
+void Space::Map::invalidate_grant(void* arg, cap::GrantWork&& work) noexcept {
+    auto& m = *static_cast<Map*>(arg);
+    sync::Lock lock{m.owner.lock_};
+    m.grant_work = std::move(work);
+    m.owner.close();
+}
+void Space::invalidated(void* arg, cap::GrantWork&& work) noexcept {
+    auto& d = *static_cast<Space*>(arg);
+    sync::Lock lock{d.lock_};
+    d.ctl_work_ = std::move(work);
+    d.close();
+}
+Space::Space(mm::Pmm& pmm, WorkQueue& work, object::ref<> payer, object::ref<Iommu> ctl, u32 requester) noexcept
+    : pmm_(pmm), work_(work), payer_(std::move(payer)), controller_(std::move(ctl)),
+      requester_(requester), maps_(pmm), tables_(pmm.group()) {
+    work_.open(job_, Work::Fn::bind<&Space::progress>(*this));
+}
+Space::~Space() noexcept { libk_assert(!self_ && !mappings_ && !attached_ && !cleanup_); }
+auto Space::open(object::ref<> self, cap::Resolved<Iommu>& controller) noexcept -> status_t {
+    preparing_ = true;
+    libk::scope_exit prepared{[&]() noexcept {
+        { sync::Lock lock{lock_}; preparing_ = false; }
+        work_.post(job_);
+    }};
+    self_ = std::move(self);
+    auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+    if (!fee) return STATUS_NO_MEMORY;
+    auto root = tables_.allocate();
+    if (!root) return STATUS_NO_MEMORY;
+    root_ = *root;
+    fee_ = std::move(*fee);
+    std::fill_n(tables_.bytes(root_), mm::page_size, byte{});
+    if (!controller.attach(ctl_grant_)) return STATUS_CLOSED;
+    const auto result = controller_->attach(*this);
+    if (result != STATUS_OK) return result;
+    attached_ = true;
+    work_.post(job_);
+    return STATUS_OK;
+}
+auto Space::state() const noexcept -> IoState {
+    sync::Lock lock{lock_};
+    switch (phase_) {
+    case Phase::Ready: return closing_.load() ? IO_SPACE_CLOSING : preparing_ ? IO_SPACE_PENDING : IO_SPACE_READY;
+    case Phase::Denying: case Phase::Retiring: return IO_SPACE_CLOSING;
+    case Phase::Closed: return IO_SPACE_CLOSED;
+    case Phase::Failed: return IO_SPACE_FAILED;
+    default: return closing_.load() ? IO_SPACE_CLOSING : IO_SPACE_PENDING;
+    }
+}
+auto Space::watch(ipc::Notification& notice, u64 badge) noexcept -> status_t {
+    sync::Lock lock{lock_};
+    if (!badge || notice_.attached() || !notice.bind(notice_, badge)) return STATUS_BAD_ARGS;
+    return STATUS_OK;
+}
+auto Space::leaf(usize iova, bool create) noexcept -> u64* {
+    auto page = root_;
+    for (int level = 2; level; --level) {
+        auto* entry = reinterpret_cast<u64*>(tables_.bytes(page)) + ((iova >> (12 + 9 * level)) & 511);
+        auto value = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
+        if (!value) {
+            if (!create) return nullptr;
+            auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+            if (!fee) return nullptr;
+            auto child = tables_.allocate();
+            if (!child) return nullptr;
+            fee_.merge(std::move(*fee));
+            std::fill_n(tables_.bytes(*child), mm::page_size, byte{});
+            value = (child->raw() << 10) | 1;
+            __atomic_store_n(entry, value, __ATOMIC_RELEASE);
+        }
+        page = mm::Page{value >> 10};
+    }
+    return reinterpret_cast<u64*>(tables_.bytes(page)) + ((iova >> 12) & 511);
+}
+auto Space::map(cap::Resolved<mm::Mem>& source, mm::ObjectRange range, usize iova, mm::Perms perms) noexcept -> std::expected<usize, status_t> {
+    constexpr usize limit = usize{1} << 38;
+    const auto view = source.view();
+    const auto* authorized = std::get_if<cap::MemLimit>(&view.data);
+    if (!range.valid() || !range.within(source->page_count()) || !authorized || !authorized->range.contains(range) ||
+        !authorized->perms.contains(perms) || !mm::valid_perms(perms) || perms.contains(mm::Perm::Execute) ||
+        !perms.contains(mm::Perm::Read) || source->kind() != mm::BackingKind::Anonymous ||
+        iova % 4096 || iova >= limit || range.size() > (limit - iova) / 4096) return std::unexpected(STATUS_BAD_ARGS);
     {
-        sync::Lock guard{lock_};
-        if (state_ == SpaceState::Binding || state_ == SpaceState::Failed) return {};
-        if (fault_signal_.exchange(false, std::memory_order_acq_rel)) {
-            faulted_ = true;
-            state_ = SpaceState::Closing;
-            notify_fault = true;
-        }
-        close_hardware = closing_.load(std::memory_order_acquire);
-    }
-    if (notify_fault) (void)fault_source_.signal();
-    // Only this executor mutates a published lease. poll may release a large
-    // completed translation tree; callbacks need neither that tree nor a lock
-    // around its destruction, and self_ retains the complete invocation.
-    auto hardware = Hw::State::Closed;
-    if (close_hardware) {
-        const bool regs_done = retire_regs();
-        const bool interrupt_done = retire_interrupt();
-        if (!regs_done || !interrupt_done) return {.more = true};
-    }
-    if (hw_) {
-        if (close_hardware) hw_.get()->close();
-        hardware = hw_.get()->poll();
-    }
-    if (hardware == Hw::State::Failed) {
-        closing_.store(true, std::memory_order_release);
-        if (!close_hardware) {
-            const bool regs_done = retire_regs();
-            const bool interrupt_done = retire_interrupt();
-            if (!regs_done || !interrupt_done) return {.more = true};
-        }
-        {
-            sync::Lock guard{lock_};
-            state_ = SpaceState::Failed;
-            work_.close(job_);
-        }
-        // Hardware drain is unproved: retain the lease, pins and structural
-        // self-reference, but wake the owner so it cannot wait for an IRQ.
-        (void)fault_source_.signal();
-        return {};
-    }
-    {
-        sync::Lock guard{lock_};
-        if (closing_.load(std::memory_order_acquire)) state_ = SpaceState::Closing;
-        if (hw_) {
-            if (state_ != SpaceState::Closing) {
-                state_ = hardware == Hw::State::Active ? SpaceState::Active : SpaceState::Opening;
-                return {.more = state_ == SpaceState::Opening};
+        sync::Lock lock{lock_};
+        if (phase_ != Phase::Ready || preparing_ || closing_.load()) return std::unexpected(STATUS_BUSY);
+        if (!iova) {
+            iova = 4096;
+            for (auto* m = mappings_; m; m = m->next) {
+                if (iova <= m->first && range.size() * 4096 <= m->first - iova) break;
+                iova = std::max(iova, m->first + m->count * 4096);
             }
-            if (hardware != Hw::State::Closed) return {.more = true};
+            if (range.size() > (limit - iova) / 4096) return std::unexpected(STATUS_NO_MEMORY);
         }
-        libk_assert(state_ == SpaceState::Closing);
+        for (auto* m = mappings_; m; m = m->next)
+            if (iova < m->first + m->count * 4096 && m->first < iova + range.size() * 4096) return std::unexpected(STATUS_BUSY);
+        preparing_ = true;
     }
-    // Detach and work release can complete a grant revoke, synchronously
-    // advancing ResourcePool close back into Space::retire(). Keep those
-    // callbacks outside our lock; self_ retains this executor invocation.
-    if (memory_attachment_.attached()) (void)memory_attachment_.detach();
-    if (host_grant_.attached()) (void)host_grant_.detach();
-    if (memory_grant_.attached()) (void)memory_grant_.detach();
-    mm::MemWork memory_work{};
-    cap::GrantWork host_work{};
-    cap::GrantWork grant_work{};
+    auto made = maps_.create(payer_, pmm_, *this, iova, range.size());
+    auto* m = made ? *made : nullptr;
+    status_t result = m ? STATUS_OK : STATUS_NO_MEMORY;
+    if (m) {
+        auto ref = source.reference();
+        auto typed = ref ? std::move(*ref).as<mm::Mem>() : std::expected<object::ref<mm::Mem>, object::error>{std::unexpected(object::error::closed)};
+        if (typed) m->memory = std::move(*typed);
+        if (!m->memory || !source.attach(m->grant) || !source->attach(m->mem_link, perms)) result = STATUS_CLOSED;
+        else {
+            auto** tail = &m->pages;
+            for (usize n = 0; n < range.size() && result == STATUS_OK; ++n) {
+                auto page = source->materialize(range.base() + n);
+                if (!page || !pmm_.is_ram(page->page()) || !page->perms().contains(perms)) result = STATUS_BACKING_FAILED;
+                else {
+                    auto pin = m->pins.create(payer_, std::move(*page));
+                    if (!pin) result = STATUS_NO_MEMORY;
+                    else { *tail = *pin; tail = &(*pin)->next; }
+                }
+            }
+            for (usize n = 0; n < range.size() && result == STATUS_OK; ++n)
+                if (!leaf(iova + n * 4096, true)) result = STATUS_NO_MEMORY;
+        }
+    }
     {
-        sync::Lock guard{lock_};
-        memory_work = std::move(memory_work_);
-        host_work = std::move(host_work_);
-        grant_work = std::move(grant_work_);
+        sync::Lock lock{lock_};
+        // Even failed preparation can have attached invalidation tokens.
+        if (m) {
+            auto** link = &mappings_;
+            while (*link && (*link)->first < iova) link = &(*link)->next;
+            m->next = *link;
+            *link = m;
+        }
+        preparing_ = false;
+        if (closing_.load()) result = STATUS_CLOSED;
+        if (result != STATUS_OK) {
+            if (m) m->removing = true;
+        } else {
+            auto* pin = m->pages;
+            const u64 flags = 1 | 2 | 16 | 64 | (perms.contains(mm::Perm::Write) ? 4 | 128 : 0);
+            for (usize n = 0; n < m->count; ++n, pin = pin->next)
+                __atomic_store_n(leaf(iova + n * 4096, false), (pin->page.page().raw() << 10) | flags, __ATOMIC_RELEASE);
+            phase_ = Phase::Editing;
+        }
     }
-    memory_work.reset();
-    host_work.reset();
-    grant_work.reset();
+    work_.post(job_);
+    return result == STATUS_OK ? std::expected<usize, status_t>{iova} : std::unexpected(result);
+}
+auto Space::unmap(usize first, usize count) noexcept -> status_t {
+    sync::Lock lock{lock_};
+    if (phase_ != Phase::Ready || preparing_ || closing_.load()) return STATUS_BUSY;
+    for (auto* m = mappings_; m; m = m->next) if (m->first == first && m->count == count) {
+        m->removing = true;
+        phase_ = Phase::Editing;
+        for (usize n = 0; n < count; ++n) __atomic_store_n(leaf(first + n * 4096, false), u64{0}, __ATOMIC_RELEASE);
+        work_.post(job_);
+        return STATUS_PENDING;
+    }
+    return STATUS_NOT_FOUND;
+}
+void Space::close() noexcept { closing_.store(true, std::memory_order_release); work_.post(job_); }
+void Space::retire(object::cleanup&& cleanup) noexcept {
     {
-        sync::Lock guard{lock_};
-        if (memory_attachment_.busy() || host_grant_.busy() || memory_grant_.busy()) return {.more = true};
-        // release() drains hardware fault delivery. All other
-        // callbacks are drained above, so no source can enqueue after this.
-        hw_.reset();
-        work_.close(job_);
+        sync::Lock lock{lock_};
+        if (phase_ == Phase::Closed) { cleanup.complete(); return; }
+        cleanup_ = std::move(cleanup);
     }
-    // Potentially many PageHolds: do not free an arena under an IRQ lock.
-    free_pages();
-    while (!regs_.empty()) reg_store_.destroy(regs_.pop_front());
-    interrupt_grant_.reset();
-    interrupt_.reset();
-    memory_.reset();
-    host_.reset();
-    if (fault_signal_.exchange(false, std::memory_order_acq_rel) && !faulted_) {
-        faulted_ = true;
-        (void)fault_source_.signal();
+    close();
+}
+auto Space::release(Map& m) noexcept -> bool {
+    // No hardware can use these pins after the acknowledged invalidation.
+    (void)m.mem_link.detach();
+    (void)m.grant.detach();
+    mm::MemWork memory;
+    cap::GrantWork grant;
+    { sync::Lock lock{lock_}; memory = std::move(m.mem_work); grant = std::move(m.grant_work); }
+    memory.reset();
+    grant.reset();
+    if (m.mem_link.busy() || m.grant.busy()) return false;
+    maps_.destroy(m);
+    return true;
+}
+void Space::progress() noexcept {
+    Map* removed{};
+    bool finish{};
+    {
+        sync::Lock lock{lock_};
+        if (preparing_) return; // The admitted syscall posts after preparation.
+        if (failed_.load(std::memory_order_acquire)) {
+            phase_ = Phase::Failed;
+            (void)notice_.signal();
+            return; // quarantine, including the object cleanup reference
+        }
+        if (!attached_) phase_ = Phase::Retiring;
+        if (phase_ == Phase::Opening || phase_ == Phase::Editing || phase_ == Phase::Denying) {
+            const bool enable = phase_ != Phase::Denying;
+            const auto result = controller_->sync(*this, enable);
+            if (result == STATUS_BACKING_FAILED) { phase_ = Phase::Failed; (void)notice_.signal(); return; }
+            if (result == STATUS_PENDING) { work_.post(job_); return; }
+            phase_ = enable ? Phase::Ready : Phase::Retiring;
+        }
+        if (phase_ == Phase::Ready && closing_.load(std::memory_order_acquire)) {
+            phase_ = Phase::Denying;
+            work_.post(job_);
+            return;
+        }
+        if (phase_ == Phase::Retiring) {
+            for (auto* m = mappings_; m; m = m->next) m->removing = true;
+            (void)ctl_grant_.detach();
+        }
+        auto** link = &mappings_;
+        while (*link) {
+            auto* m = *link;
+            if (!m->removing) { link = &m->next; continue; }
+            *link = m->next;
+            m->next = removed;
+            removed = m;
+        }
+        finish = phase_ == Phase::Retiring && !mappings_;
+        preparing_ = true; // serialize slab destruction with syscall preparation
     }
-    fault_source_.reset();
-    sync::Lock guard{lock_};
-    state_ = faulted_ ? SpaceState::Faulted : SpaceState::Closed;
-    return {std::move(self_), std::move(cleanup_), false};
+    // Callback tokens cannot be released under the relation's owner lock.
+    while (removed) {
+        auto* m = removed;
+        removed = m->next;
+        if (!release(*m)) {
+            sync::Lock lock{lock_};
+            auto** link = &mappings_;
+            while (*link && (*link)->first < m->first) link = &(*link)->next;
+            m->next = *link;
+            *link = m;
+            finish = false;
+            work_.post(job_);
+        }
+    }
+    {
+        sync::Lock lock{lock_};
+        preparing_ = false;
+        if (phase_ == Phase::Ready) (void)notice_.signal();
+    }
+    if (!finish) return;
+    ctl_work_.reset();
+    if (ctl_grant_.busy()) { work_.post(job_); return; }
+    if (attached_) { controller_->detach(*this); attached_ = false; }
+    tables_.reset();
+    fee_.reset();
+    { sync::Lock lock{lock_}; phase_ = Phase::Closed; (void)notice_.signal(); }
+    notice_.reset();
+    work_.close(job_);
+    auto cleanup = std::move(cleanup_);
+    auto self = std::move(self_);
+    if (cleanup) cleanup.complete();
 }
-
-void Space::run_work() noexcept {
-    auto result = service();
-    if (result.more) work_.post(job_);
-    if (result.cleanup) result.cleanup.complete();
-    // result.self is released last, after the queue can no longer touch us.
-}
-
 } // namespace io

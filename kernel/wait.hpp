@@ -113,9 +113,8 @@ private:
 
 };
 
-// One blocking edge owned by a kernel-managed continuation. Thread owns the
-// base edge; an Endpoint Activation overrides it during a cross-domain call.
-// The operation still owns Completion and the dispatcher still owns run state.
+// One Thread-owned blocking edge. The operation owns Completion; the
+// dispatcher owns run state.
 class Wait final : private libk::noncopyable_nonmovable {
 public:
     Wait() noexcept;

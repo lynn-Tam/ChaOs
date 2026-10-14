@@ -1,12 +1,16 @@
 #include <util.hpp>
 #include <start.hpp>
 #include <protocols/stream.hpp>
-#include <ipc.hpp>
+#include <protocols/msg.hpp>
 #include <servers/uart.hpp>
+#include <libk/parse.hpp>
 
-int main() {
+int main(int argc, char** argv) {
 
     const auto& info = rt_startup();
+    if (argc != 2) sys::exit(STATUS_BAD_ARGS);
+    const auto offset = libk::parse<uint64_t>(argv[1]);
+    if (!offset || *offset > 4096 - 8) sys::exit(STATUS_BAD_ARGS);
     const auto vspace = info.vspace;
     const auto device = info.selector(uart_mem);
     const auto irq = info.selector(uart_irq);
@@ -25,11 +29,11 @@ int main() {
     const auto writable = sys::channel_bind(input, events, CHANNEL_WRITABLE);
     if (readable.status != STATUS_OK) sys::exit(readable.status);
     if (writable.status != STATUS_OK) sys::exit(writable.status);
-    uart_port port{base};
+    uart_port port{base + *offset};
     port.enable_rx();
     port.write("uart: console ready\n");
     bool line_start = true;
-    ch_msg pending{};
+    msg_frame pending{};
     bool pending_valid{};
     bool eof_pending{};
     bool carriage_return{};
@@ -38,8 +42,8 @@ int main() {
     for (;;) {
         // Bound each drain so sustained output cannot starve receive/IRQ ack.
         for (unsigned count = 0; count < 16; ++count) {
-            ch_msg message{};
-            const auto result = ch_recv(output, message, false);
+            msg_frame message{};
+            const auto result = msg_recv(output, message, false);
             if (result.status == STATUS_WOULD_BLOCK || result.status == STATUS_BUSY)
                 break;
             if (result.status != STATUS_OK) sys::exit(result.status);
@@ -88,7 +92,7 @@ int main() {
             }
         }
         if (pending_valid) {
-            const auto result = ch_send(input, pending, false);
+            const auto result = msg_send(input, pending, false);
             if (result.status == STATUS_OK) {
                 write_sequence = result.value;
                 pending = {};

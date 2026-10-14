@@ -9,7 +9,6 @@
 #include <uapi/abi.h>
 #include <utility>
 #include <object/pool.hpp>
-#include <ipc/endpoint.hpp>
 #include <sched/dispatcher.hpp>
 #include <uapi/ipc.h>
 #include <cap/cspace.hpp>
@@ -99,156 +98,6 @@ template<usize op>
     const auto result = target->wait(*thread, *cpus, inv.cpu.dispatcher(),
                                      deadline);
     return returned(result.status, result.value);
-}
-
-[[nodiscard]] static auto endpoint_status(ipc::EndpointError error) noexcept
-    -> status_t {
-    switch (error) {
-    case ipc::EndpointError::Closed:
-        return STATUS_CLOSED;
-    case ipc::EndpointError::Busy:
-    case ipc::EndpointError::QueueFull:
-        return STATUS_WOULD_BLOCK;
-    case ipc::EndpointError::InvalidConfig:
-    case ipc::EndpointError::InvalidCaller:
-        return STATUS_BAD_ARGS;
-    case ipc::EndpointError::DepthExceeded:
-    case ipc::EndpointError::BudgetTooLow:
-    case ipc::EndpointError::Denied:
-        return STATUS_DENIED;
-    case ipc::EndpointError::GenerationExhausted:
-        return STATUS_INTERNAL;
-    case ipc::EndpointError::TransferFailed:
-        return STATUS_TRANSFER_FAILED;
-    }
-    return STATUS_INTERNAL;
-}
-
-template<usize op>
-[[nodiscard]] auto endpoint_call(Call& inv) noexcept -> Result {
-    Thread* const thread = inv.target;
-    if (thread == nullptr) {
-        return returned(STATUS_INVALID_OP);
-    }
-    auto endpoint = inv.cspace.resolve<ipc::Endpoint>(
-        handle_of(inv.trap.arg(0)),
-        cap::Rights::of(cap::Right::Call));
-    if (!endpoint) {
-        return returned(cap_status(endpoint.error()));
-    }
-    const usize arguments[3]{
-        inv.trap.arg(1),
-        inv.trap.arg(2),
-        inv.trap.arg(3),
-    };
-    std::optional<u64> deadline{};
-    if (const u64 timeout_ns = inv.trap.arg(4); timeout_ns != 0) {
-        auto& clock = inv.cpu.dispatcher().clock();
-        const auto duration = clock.ticks<time::ns>(timeout_ns);
-        const auto expires = duration
-            ? libk::checked_add(clock.rd_ticks(), *duration) : std::nullopt;
-        if (!expires) {
-            return returned(STATUS_BAD_ARGS);
-        }
-        deadline = *expires;
-    }
-    auto* const object = &endpoint.value().object();
-    auto entered = object->call(
-        std::move(endpoint).value(),
-        *thread,
-        inv.trap,
-        inv.cpu.dispatcher(),
-        *inv.cpu.cpus,
-        arguments,
-        deadline);
-    if (!entered) {
-        return returned(endpoint_status(entered.error()));
-    }
-    return Result{STATUS_OK, 0, Disposition::Resume};
-}
-
-template<usize op>
-[[nodiscard]] auto endpoint_reply(Call& inv) noexcept -> Result {
-    Thread* const thread = inv.target;
-    libk_assert(thread != nullptr);
-    ipc::Activation* const frame = thread->activation();
-    libk_assert(frame != nullptr);
-    auto& activation = *frame;
-    const isize status = static_cast<isize>(inv.trap.arg(0));
-    const usize value = inv.trap.arg(1);
-    auto replied = activation.endpoint().reply(
-        *thread,
-        inv.trap,
-        inv.cpu.dispatcher(),
-        status,
-        value);
-    return replied
-        ? Result{STATUS_OK, 0, Disposition::Resume}
-        : returned(endpoint_status(replied.error()));
-}
-
-template<usize op>
-[[nodiscard]] auto endpoint_abort(Call& inv) noexcept -> Result {
-    Thread* const thread = inv.target;
-    libk_assert(thread != nullptr);
-    ipc::Activation* const frame = thread->activation();
-    libk_assert(frame != nullptr);
-    auto& activation = *frame;
-    auto aborted = activation.endpoint().abort(
-        *thread,
-        inv.trap,
-        inv.cpu.dispatcher(),
-        static_cast<isize>(inv.trap.arg(0)));
-    return aborted
-        ? Result{STATUS_OK, 0, Disposition::Resume}
-        : returned(endpoint_status(aborted.error()));
-}
-
-template<usize op>
-[[nodiscard]] auto endpoint_close(Call& inv) noexcept -> Result {
-    auto endpoint = inv.cspace.resolve<ipc::Endpoint>(
-        handle_of(inv.trap.arg(0)),
-        cap::Rights::of(cap::Right::Close));
-    if (!endpoint) {
-        return returned(cap_status(endpoint.error()));
-    }
-    endpoint.value()->close();
-    return returned(STATUS_OK);
-}
-
-template<usize op>
-[[nodiscard]] auto endpoint_mint(Call& inv) noexcept -> Result {
-    const cap::Handle source = handle_of(inv.trap.arg(0));
-    auto endpoint = inv.cspace.resolve<ipc::Endpoint>(
-        source, cap::Rights::of(cap::Right::Delegate));
-    const auto rights = rights_of(inv.trap.arg(4));
-    const usize cap_limit = inv.trap.arg(3);
-    if (!endpoint || !rights || !rights->contains(cap::Right::Call)
-        || cap_limit > ENDPOINT_MAX_CAPS) {
-        return returned(!endpoint
-            ? cap_status(endpoint.error()) : STATUS_BAD_ARGS);
-    }
-
-    const cap::EpLimit data{
-        .badge = inv.trap.arg(2),
-        .fixed = ~u64{0},
-        .cap_limit = cap_limit,
-    };
-    const auto publish = [&](cap::CSpace& dest) noexcept -> Result {
-        auto minted = inv.cspace.transfer(source, dest, cap::XferOp::Derive, cap::View{*rights, data});
-        return returned(
-            minted ? STATUS_OK : cap_status(minted.error()),
-            minted ? minted.value().raw() : 0);
-    };
-    const cap::Handle target = handle_of(inv.trap.arg(1));
-    if (!target) {
-        return publish(inv.cspace);
-    }
-    auto dest = inv.cspace.resolve<cap::CSpace>(
-        target, cap::Rights::of(cap::Right::Manage));
-    return dest
-        ? publish(dest.value().object())
-        : returned(cap_status(dest.error()));
 }
 
 [[nodiscard]] static auto status(ipc::ChannelError error) noexcept -> status_t {
@@ -515,7 +364,7 @@ template<usize op>
 #define INST_Ipc(entry, nr) template auto entry<nr>(Call&) noexcept -> Result;
 #define INST_Call(entry, nr)
 #define INST_Create(entry, nr)
-#define CALL(name, nr, entry, locus, unit) INST_##unit(entry, nr)
+#define CALL(name, nr, entry, unit) INST_##unit(entry, nr)
 #include <uapi/calls.def>
 #undef CALL
 #undef INST_Call

@@ -18,8 +18,6 @@
 #include <uapi/mem.h>
 #include <io/space.hpp>
 #include <ipc/buffer.hpp>
-#include <io/host.hpp>
-#include <uapi/io.h>
 #include <variant>
 #include <sched/dispatcher.hpp>
 #include <sched/sc.hpp>
@@ -738,8 +736,8 @@ auto exit_call(Call& call) noexcept -> Result {
     auto& record = thread.value()->exit();
     if constexpr (op == SYS_EXIT_QUERY) {
         const auto result = record.read();
-        return returned(STATUS_OK, result.sequence,
-            static_cast<usize>(static_cast<isize>(result.status)));
+        return returned(STATUS_OK, result.has_value(),
+            static_cast<usize>(static_cast<isize>(result.value_or(STATUS_OK))));
     }
     auto notification = call.cspace.resolve<ipc::Notification>(
         handle_of(call.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
@@ -750,94 +748,37 @@ auto exit_call(Call& call) noexcept -> Result {
         ? STATUS_OK : STATUS_BUSY);
 }
 
-static_assert(static_cast<u8>(io::SpaceState::Empty) == IO_SPACE_EMPTY);
-static_assert(static_cast<u8>(io::SpaceState::Binding) == IO_SPACE_BINDING);
-static_assert(static_cast<u8>(io::SpaceState::Opening) == IO_SPACE_OPENING);
-static_assert(static_cast<u8>(io::SpaceState::Active) == IO_SPACE_ACTIVE);
-static_assert(static_cast<u8>(io::SpaceState::Closing) == IO_SPACE_CLOSING);
-static_assert(static_cast<u8>(io::SpaceState::Closed) == IO_SPACE_CLOSED);
-static_assert(static_cast<u8>(io::SpaceState::Failed) == IO_SPACE_FAILED);
-static_assert(static_cast<u8>(io::SpaceState::Faulted) == IO_SPACE_FAULTED);
-
-static auto io_status(io::SpaceError error) noexcept -> status_t {
-    switch (error) {
-    case io::SpaceError::Absent: return STATUS_NOT_FOUND;
-    case io::SpaceError::InvalidState:
-    case io::SpaceError::Busy: return STATUS_BUSY;
-    case io::SpaceError::Denied: return STATUS_BAD_RIGHTS;
-    case io::SpaceError::InvalidRange:
-    case io::SpaceError::UnsupportedMemory: return STATUS_BAD_ARGS;
-    case io::SpaceError::BackingUnavailable: return STATUS_BACKING_FAILED;
-    case io::SpaceError::OutOfMemory:
-    case io::SpaceError::QuotaExceeded: return STATUS_NO_MEMORY;
-    case io::SpaceError::Cancelled: return STATUS_CANCELED;
-    }
-    return STATUS_INTERNAL;
-}
-
-[[gnu::noinline]] static auto bind(Call& inv, cap::Resolved<io::Space>& space) noexcept -> Result {
-    const auto& trap = inv.trap;
-    auto device = inv.cspace.resolve<io::Host>(handle_of(trap.arg(1)),
-        cap::Rights::of(cap::Right::Connect));
-    auto memory = inv.cspace.resolve<mm::Mem>(handle_of(trap.arg(2)),
-        cap::Rights::of(cap::Right::Map));
-    if (!device || !memory) return returned(cap_status(!device ? device.error() : memory.error()));
-    auto self = space.reference();
-    if (!self) return returned(STATUS_CLOSED);
-    auto bound = space->bind(std::move(self).value(), device.value(), memory.value(),
-        {trap.arg(3), trap.arg(4)}, trap.arg(5));
-    return returned(bound ? STATUS_OK : io_status(bound.error()));
-}
-
-static auto watch(Call& inv, io::Space& space) noexcept -> Result {
-    auto notification = inv.cspace.resolve<ipc::Notification>(
-        handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
-    if (!notification) return returned(cap_status(notification.error()));
-    const auto limit = notification.value().view();
-    const auto* data = std::get_if<cap::Badge>(&limit.data);
-    const u64 badge = inv.trap.arg(2);
-    if (data == nullptr || badge == 0 || data->badge != badge)
-        return returned(STATUS_BAD_ARGS);
-    const auto result = space.watch(notification.value().object(), badge);
-    return returned(result ? STATUS_OK : io_status(result.error()));
-}
-
-static auto install(Call& inv,
-    std::expected<cap::GrantRef, io::SpaceError>&& exported) noexcept -> Result {
-    if (!exported) return returned(io_status(exported.error()));
-    auto lease = exported.value().acquire();
-    if (!lease) return returned(STATUS_CLOSED);
-    const auto ceiling = lease.value().ceiling();
-    auto installed = inv.cspace.insert(std::move(exported).value(),
-        {ceiling.rights, ceiling.data});
-    return installed ? returned(STATUS_OK, installed.value().raw())
-                     : returned(cap_status(installed.error()));
-}
-
 template<usize op>
 auto io_call(Call& inv) noexcept -> Result {
-    const auto right = op == SYS_IO_SPACE_STATE
-        ? cap::Right::Inspect : op == SYS_IO_SPACE_CLOSE ? cap::Right::Close : cap::Right::Connect;
-    auto space = inv.cspace.resolve<io::Space>(handle_of(inv.trap.arg(0)),
-        cap::Rights::of(right));
-    if (!space) return returned(cap_status(space.error()));
-    switch (op) {
-    case SYS_IO_SPACE_BIND: return bind(inv, space.value());
-    case SYS_IO_SPACE_WATCH: return watch(inv, space.value().object());
-    case SYS_IO_SPACE_STATE: return returned(STATUS_OK, static_cast<u8>(space.value()->state()));
-    case SYS_IO_SPACE_REG: {
-        auto reg = space.value()->reg(inv.trap.arg(1));
-        if (!reg) return returned(io_status(reg.error()));
-        auto result = install(inv, std::move(reg->first));
-        if (result.status == STATUS_OK) result.value2 = reg->second;
-        return result;
+    const auto handle = handle_of(inv.trap.arg(0));
+    if constexpr (op == SYS_IOMMU_STATE) {
+        auto ctl = inv.cspace.resolve<io::Iommu>(handle, cap::Rights::of(cap::Right::Inspect));
+        return ctl ? returned(STATUS_OK, ctl->object().state()) : returned(cap_status(ctl.error()));
+    } else {
+        constexpr auto right = op == SYS_IO_SPACE_STATE ? cap::Right::Inspect : op == SYS_IO_SPACE_MAP ? cap::Right::Map
+            : op == SYS_IO_SPACE_UNMAP ? cap::Right::Unmap : op == SYS_IO_SPACE_WATCH ? cap::Right::Observe : cap::Right::Close;
+        auto domain = inv.cspace.resolve<io::Space>(handle, cap::Rights::of(right));
+        if (!domain) return returned(cap_status(domain.error()));
+        if constexpr (op == SYS_IO_SPACE_STATE) return returned(STATUS_OK, domain->object().state());
+        if constexpr (op == SYS_IO_SPACE_CLOSE) { domain->object().close(); return returned(STATUS_OK); }
+        if constexpr (op == SYS_IO_SPACE_UNMAP) return returned(domain->object().unmap(inv.trap.arg(1), inv.trap.arg(2)));
+        if constexpr (op == SYS_IO_SPACE_MAP) {
+            auto source = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Map));
+            const auto perms = perms_of(inv.trap.arg(5));
+            if (!source || !perms) return returned(source ? STATUS_BAD_ARGS : cap_status(source.error()));
+            const auto mapped = domain->object().map(*source, {inv.trap.arg(2), inv.trap.arg(3)}, inv.trap.arg(4), *perms);
+            return mapped ? returned(STATUS_PENDING, *mapped) : returned(mapped.error());
+        }
+        if constexpr (op == SYS_IO_SPACE_WATCH) {
+            auto notice = inv.cspace.resolve<ipc::Notification>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
+            if (!notice) return returned(cap_status(notice.error()));
+            const auto view = notice->view();
+            const auto* badge = std::get_if<cap::Badge>(&view.data);
+            if (!badge || !badge->badge || badge->badge != inv.trap.arg(2)) return returned(STATUS_BAD_ARGS);
+            return returned(domain->object().watch(notice->object(), badge->badge));
+        }
     }
-    case SYS_IO_SPACE_IRQ: return install(inv, space.value()->interrupt());
-    case SYS_IO_SPACE_CLOSE:
-        space.value()->close();
-        return returned(STATUS_OK);
-    default: return returned(STATUS_INVALID_OP);
-    }
+    return returned(STATUS_INVALID_OP);
 }
 
 template<usize op>
@@ -1054,25 +995,17 @@ auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
     Call inv{cpu, target, *cspace, *vspace,
              *cpu.idle().env().kernel_vspace(), ctx};
     const usize operation = ctx.arg(7);
-    const bool leaf = target->activation() != nullptr;
-    enum class Locus { Any, Base, Leaf };
     Result outcome{};
     switch (operation) {
-#define CALL(name, nr, entry, locus, unit) \
-    case nr: \
-        outcome = ((Locus::locus == Locus::Base && leaf) \
-            || (Locus::locus == Locus::Leaf && !leaf)) \
-            ? returned(STATUS_INVALID_OP) : entry<nr>(inv); \
-        break;
+#define CALL(name, nr, entry, unit) \
+    case nr: outcome = entry<nr>(inv); break;
 #include <uapi/calls.def>
 #undef CALL
     default:
         outcome = returned(STATUS_INVALID_OP);
         break;
     }
-    if (outcome.disposition != Disposition::Resume) {
-        publish(ctx, outcome);
-    }
+    publish(ctx, outcome);
     return outcome.disposition;
 }
 

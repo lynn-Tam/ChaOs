@@ -90,9 +90,9 @@ static void raw_source(const libk::assert_info& source) noexcept {
     raw_text(" target_id=");
     raw_hex(target ? target->identity() : 0);
     raw_text(" stack_base=");
-    raw_hex(target ? target->home_stack_base() : 0);
+    raw_hex(target ? target->stack_base() : 0);
     raw_text(" stack_top=");
-    raw_hex(target ? target->current_stack_top() : 0);
+    raw_hex(target ? target->stack_top() : 0);
     arch::putchar('\n');
     arch::halt_current_cpu(arch::HaltReason::Fatal);
 }
@@ -102,10 +102,10 @@ static void capture_stack_bounds(
     Cpu& cpu,
     usize sp) noexcept {
     Thread* const thread = cpu.current;
-    if (thread != nullptr && sp >= thread->home_stack_base()
-        && sp < thread->home_stack_top()) {
-        slot.stack_base = thread->home_stack_base();
-        slot.stack_top = thread->home_stack_top();
+    if (thread != nullptr && sp >= thread->stack_base()
+        && sp < thread->stack_top()) {
+        slot.stack_base = thread->stack_base();
+        slot.stack_top = thread->stack_top();
         return;
     }
     Cpu& runtime = cpu;

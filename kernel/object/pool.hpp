@@ -312,6 +312,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return (reference_of(*slot));
     }
 
+  private:
     [[nodiscard]] auto request_retire(Id id) noexcept -> bool {
         Slot* slot{};
         {
@@ -326,6 +327,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         return true;
     }
 
+  public:
     [[nodiscard]] auto live_count() const noexcept -> usize {
         sync::Lock guard{lock_};
         return storage_.live();

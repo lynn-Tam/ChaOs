@@ -114,34 +114,27 @@ struct UserStart {
     std::array<usize, 6> arguments{};
 };
 
-// A typed borrow of the sole return frame; redirection selects another owned stack.
+// A typed borrow of the interrupted Thread's return frame.
 class TrapCtx {
   public:
-    explicit TrapCtx(TrapFrame& f) noexcept : frame_(&f) {}
+    explicit TrapCtx(TrapFrame& f) noexcept : frame_(f) {}
     TrapCtx(const TrapCtx&) = delete;
     auto operator=(const TrapCtx&) -> TrapCtx& = delete;
-    usize pc() const noexcept { return frame_->sepc; }
-    void set_pc(usize pc) noexcept { frame_->sepc = pc; }
+    usize pc() const noexcept { return frame_.sepc; }
     void complete_breakpoint() noexcept;
-    void complete_syscall() noexcept { frame_->sepc += 4; }
-    usize arg(usize i) const noexcept { libk_assert(i < 8); return frame_->gpr[9 + i]; }
-    void set_result(usize i, usize value) noexcept { libk_assert(i < 3); frame_->gpr[9 + i] = value; }
-    void set_return(usize value) noexcept { set_result(0, value); }
-    usize fault_addr() const noexcept { return frame_->stval; }
+    void complete_syscall() noexcept { frame_.sepc += 4; }
+    usize arg(usize i) const noexcept { libk_assert(i < 8); return frame_.gpr[9 + i]; }
+    void set_result(usize i, usize value) noexcept { libk_assert(i < 3); frame_.gpr[9 + i] = value; }
     TrapRegs snapshot() const noexcept {
-        return {frame_->gpr, frame_->sepc, frame_->sstatus, frame_->scause, frame_->stval};
+        return {frame_.gpr, frame_.sepc, frame_.sstatus, frame_.scause, frame_.stval};
     }
-    bool load_user_start(const UserStart&) noexcept;
-    TrapFrame* frame() const noexcept { return frame_; }
-    void redirect(TrapFrame* frame) noexcept { libk_assert(frame); frame_ = frame; }
   private:
-    TrapFrame* frame_;
+    TrapFrame& frame_;
 };
 
 auto decode(const TrapFrame&) noexcept -> TrapEvent;
 bool install_trap() noexcept;
 bool valid_user_start(UserStart) noexcept;
-std::optional<TrapFrame*> prepare_user_frame(usize top, UserStart) noexcept;
 std::optional<usize> prepare_user_stack(usize top, UserStart) noexcept;
 [[noreturn]] void resume_user(usize top) noexcept;
 } // namespace arch

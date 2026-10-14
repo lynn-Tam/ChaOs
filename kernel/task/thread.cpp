@@ -1,6 +1,5 @@
 #include <expected>
 #include <task/thread.hpp>
-#include <ipc/endpoint.hpp>
 
 #include <mm/pager.hpp>
 #include <mm/mem.hpp>
@@ -19,52 +18,28 @@
 #include <sync.hpp>
 #include <wait.hpp>
 
-Thread::Thread(
-    mm::Stack&& home_stack,
-    Env&& roots,
-    KernelStart start,
-    Kind kind) noexcept
-    : stack_(std::move(home_stack)), env_(std::move(roots)),
-      roots_{{{*this}, {*this}}},
-      revoke_(Stop::Notifier::bind<&Thread::close_grants>(*this)),
-      start_(start),
-      kind_(kind) {
+Thread::Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start, Kind kind) noexcept
+    : stack_(std::move(home_stack)), env_(std::move(roots)), roots_{{{*this}, {*this}}},
+      revoke_(Stop::Notifier::bind<&Thread::close_grants>(*this)), start_(start), kind_(kind) {
     libk_assert(env_.kernel_bound());
     libk_assert(start.entry != nullptr);
     prepare(stack_.top());
 }
 
-Thread::Thread(
-    mm::Stack&& home_stack,
-    Env&& roots,
-    UserStart start,
-    Kind kind) noexcept
-    : Thread(
-          resource::Charge{},
-          std::move(home_stack),
-          std::move(roots),
-          start,
-          kind) {}
+Thread::Thread(mm::Stack&& home_stack, Env&& roots, UserStart start, Kind kind) noexcept
+    : Thread(resource::Charge{}, std::move(home_stack), std::move(roots), start, kind) {}
 
-Thread::Thread(
-    resource::Charge&& stack_charge,
-    mm::Stack&& home_stack,
-    Env&& roots,
-    UserStart start,
-    Kind kind) noexcept
-    : stack_charge_(std::move(stack_charge)),
-      stack_(std::move(home_stack)), env_(std::move(roots)),
-      roots_{{{*this}, {*this}}},
-      revoke_(Stop::Notifier::bind<&Thread::close_grants>(*this)),
-      start_(start),
-      kind_(kind) {
+Thread::Thread(resource::Charge&& stack_charge, mm::Stack&& home_stack, Env&& roots,
+               UserStart start, Kind kind) noexcept
+    : stack_charge_(std::move(stack_charge)), stack_(std::move(home_stack)), env_(std::move(roots)),
+      roots_{{{*this}, {*this}}}, revoke_(Stop::Notifier::bind<&Thread::close_grants>(*this)),
+      start_(start), kind_(kind) {
     libk_assert(!idle());
     libk_assert(env_.user_bound());
-    const auto kernel_stack_top = arch::prepare_user_stack(
-        stack_.top(), start);
+    const auto kernel_stack_top = arch::prepare_user_stack(stack_.top(), start);
     libk_assert(kernel_stack_top);
-    libk_assert(!stack_charge_ || stack_charge_.amount() == resource::budget{
-        .memory = mm::Stack::StackBytes});
+    libk_assert(!stack_charge_ ||
+                stack_charge_.amount() == resource::budget{.memory = mm::Stack::StackBytes});
     prepare(*kernel_stack_top);
 }
 
@@ -74,145 +49,44 @@ Thread::~Thread() noexcept {
     libk_assert(state_ != State::Running);
     libk_assert(sc_ == nullptr);
     libk_assert(!wait_.attached());
-    libk_assert(active_ == nullptr && retired_ == nullptr && !in_kernel_);
+    libk_assert(!in_kernel_);
     libk_assert(stops_.empty() && home_ == nullptr);
 }
 
-auto Thread::home_stack_base() const noexcept -> usize {
+auto Thread::stack_base() const noexcept -> usize {
     return stack_.base();
 }
 
-auto Thread::home_stack_top() const noexcept -> usize {
+auto Thread::stack_top() const noexcept -> usize {
     return stack_.top();
 }
 
-auto Thread::current_stack_base() const noexcept -> usize {
-    return active_ != nullptr ? active_->stack().base() : stack_.base();
-}
-
-auto Thread::current_stack_top() const noexcept -> usize {
-    return active_ != nullptr ? active_->stack().top() : stack_.top();
-}
-
-auto Thread::contains_stack(usize address) const noexcept -> bool {
-    if (stack_.contains(address)) {
-        return true;
-    }
-    for (ipc::Activation* frame = active_; frame != nullptr;
-         frame = frame->previous()) {
-        if (frame->stack().contains(address)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-auto Thread::env() noexcept -> Env& {
-    return active_ != nullptr ? active_->env() : env_;
-}
-
-auto Thread::env() const noexcept -> const Env& {
-    return active_ != nullptr ? active_->env() : env_;
-}
-
-auto Thread::ipc_buffer() noexcept -> ipc::Buffer* {
-    return active_ != nullptr ? active_->ipc_buffer() : env_.ipc_buffer();
-}
-
-auto Thread::ipc_buffer() const noexcept -> const ipc::Buffer* {
-    return active_ != nullptr ? active_->ipc_buffer() : env_.ipc_buffer();
-}
-
-auto Thread::current_wait() noexcept -> Wait& {
-    return active_ != nullptr ? active_->wait() : wait_;
-}
-
-auto Thread::current_wait() const noexcept -> const Wait& {
-    return active_ != nullptr ? active_->wait() : wait_;
-}
-
-auto Thread::call_depth() const noexcept -> usize {
-    usize result{};
-    for (ipc::Activation* frame = active_; frame != nullptr;
-         frame = frame->previous()) {
-        ++result;
-    }
-    return result;
-}
-
-auto Thread::cancel_pending() const noexcept -> bool {
-    for (ipc::Activation* frame = active_; frame != nullptr;
-         frame = frame->previous()) {
-        if (frame->cancel_pending()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void Thread::push(ipc::Activation& frame) noexcept {
-    libk_assert(frame.previous_ == nullptr);
-    frame.previous_ = active_;
-    active_ = &frame;
-}
-
-void Thread::pop(ipc::Activation& frame) noexcept {
-    libk_assert(active_ == &frame);
-    active_ = frame.previous_;
-    frame.previous_ = retired_;
-    retired_ = &frame;
-}
-
-void Thread::release_calls() noexcept {
-    while (retired_ != nullptr) {
-        auto* frame = retired_;
-        retired_ = frame->previous_;
-        frame->previous_ = nullptr;
-        frame->release();
-    }
-}
-
-auto Thread::env_before(
-    const ipc::Activation& frame) noexcept -> Env& {
-    libk_assert(active_ == &frame);
-    return frame.previous_ != nullptr
-        ? frame.previous_->env() : env_;
-}
-
-auto Thread::ipc_before(
-    const ipc::Activation& frame) noexcept -> ipc::Buffer* {
-    libk_assert(active_ == &frame);
-    // Each Endpoint activation owns its IPC window independently of its roots.
-    return frame.previous_ != nullptr ? frame.previous_->ipc_buffer() : env_.ipc_buffer();
-}
-
-auto Thread::begin_wait(
-    Completion& relation,
-    Cpus& cpus) noexcept -> bool {
+auto Thread::begin_wait(Completion& relation, Cpus& cpus) noexcept -> bool {
     if (sc_ == nullptr) {
         return false;
     }
-    return current_wait().begin(
-        relation, cpus, *sc_);
+    return wait().begin(relation, cpus, *sc_);
 }
 
 void Thread::block() noexcept {
     libk_assert(!arch::interrupts_enabled() && arch::local()->depth == 0);
-    auto& wait = current_wait();
-    while (wait.attached()) {
-        if (wait.ready()) static_cast<void>(wait.finish());
-        else current_cpu().dispatcher().block_current();
+    auto& edge = wait_;
+    while (edge.attached()) {
+        if (edge.ready())
+            static_cast<void>(edge.finish());
+        else
+            current_cpu().dispatcher().block_current();
     }
 }
 
 void Thread::cancel_wait() noexcept {
-    libk_assert(current_wait().cancel());
+    libk_assert(wait().cancel());
 }
 
 void Thread::request_stop(Stop& request) noexcept {
     sched::Dispatcher* home{};
     sched::Sc* context{};
-    bool finish{};
+    bool done{};
     bool initiate{};
     {
         sync::Lock guard{lock_};
@@ -220,14 +94,13 @@ void Thread::request_stop(Stop& request) noexcept {
         stops_.push_back(request);
         if (stopped_) {
             stops_.erase(request);
-            finish = true;
+            done = true;
         } else if (!stopping_) {
             stopping_ = true;
             initiate = true;
             home = home_;
             if (home == nullptr) {
-                libk_assert(state_ == State::Prepared
-                    || state_ == State::Exited);
+                libk_assert(state_ == State::Prepared || state_ == State::Exited);
                 set_state(State::Exited);
                 if (sc_ != nullptr) {
                     context = sc_;
@@ -235,7 +108,7 @@ void Thread::request_stop(Stop& request) noexcept {
             }
         }
     }
-    if (finish) {
+    if (done) {
         request.finish(*this);
     } else if (!initiate) {
         return;
@@ -250,37 +123,22 @@ void Thread::request_stop(Stop& request) noexcept {
         }
         // Prepared user threads already own execution authority and roots.
         // Complete Stop only after the common terminal path releases them.
-        finish_stop();
+        finish(STATUS_CANCELED);
     }
 }
 
-void Thread::finish(
-    Exit::Reason reason,
-    status_t status) noexcept {
+void Thread::finish(status_t status) noexcept {
     {
         sync::Lock guard{lock_};
-        libk_assert(state_ == State::Exited
-            && sc_ == nullptr);
+        libk_assert(state_ == State::Exited && sc_ == nullptr);
         stopping_ = true;
     }
     claims_.release();
     close_grants();
     env_.detach_user();
-    static_cast<void>(exit_.claim(
-        reason, status));
+    static_cast<void>(exit_.claim(status));
 
     complete();
-}
-
-void Thread::finish_stop() noexcept {
-    finish(Exit::Reason::Stop, STATUS_CANCELED);
-}
-
-void Thread::finish_exit(status_t status) noexcept {
-    finish(
-        status == STATUS_OK
-            ? Exit::Reason::Normal : Exit::Reason::Failed,
-        status);
 }
 
 [[noreturn]] void Thread::start(void* argument) noexcept {
@@ -292,8 +150,7 @@ void Thread::finish_exit(status_t status) noexcept {
     cpu.dispatcher().on_context_enter();
 
     volatile byte stack_marker{};
-    libk_assert(thread->contains_stack(
-        reinterpret_cast<usize>(&stack_marker)));
+    libk_assert(thread->contains_stack(reinterpret_cast<usize>(&stack_marker)));
 
     if (auto* const kernel_start = std::get_if<KernelStart>(&thread->start_)) {
         const KernelStart start = *kernel_start;
@@ -306,18 +163,16 @@ void Thread::finish_exit(status_t status) noexcept {
 
     libk_assert(std::holds_alternative<UserStart>(thread->start_));
     thread->start_ = UserStart{};
-    arch::resume_user(thread->current_stack_top());
+    arch::resume_user(thread->stack_top());
 }
 
 auto Thread::draining() const noexcept -> bool {
-    return in_kernel_ || activation() || retired_
-        || current_wait().attached();
+    return in_kernel_ || wait_.attached();
 }
 
 auto Thread::stop_ready() const noexcept -> bool {
     sync::Lock guard{lock_};
-    return stopping_ && !in_kernel_ && !activation()
-        && !current_wait().attached();
+    return stopping_ && !in_kernel_ && !wait_.attached();
 }
 
 Stop::~Stop() noexcept {
@@ -337,18 +192,21 @@ void Stop::finish(Thread& target) noexcept {
     target_ = nullptr;
     const Notifier notify = notify_;
     phase_.store(Phase::Complete, std::memory_order_release);
-    if (notify) notify();
+    if (notify)
+        notify();
 }
 
 const cap::GrantAttachmentOps Thread::grant_ops_{
-    .invalidate = [](void* context, cap::GrantWork&& work) noexcept {
-        auto& relation = *static_cast<Root*>(context);
-        relation.owner->invalidate(relation, std::move(work));
-    },
-    .released = [](void* context) noexcept {
-        auto& relation = *static_cast<Root*>(context);
-        relation.owner->released(relation);
-    },
+    .invalidate =
+        [](void* context, cap::GrantWork&& work) noexcept {
+            auto& relation = *static_cast<Root*>(context);
+            relation.owner->invalidate(relation, std::move(work));
+        },
+    .released =
+        [](void* context) noexcept {
+            auto& relation = *static_cast<Root*>(context);
+            relation.owner->released(relation);
+        },
 };
 
 Thread::Flight::Flight(Thread& owner) noexcept : owner_(owner) {
@@ -369,8 +227,8 @@ auto Thread::authorize(const cap::Resolved<mm::VSpace>& space,
     Flight publishing{*this};
     {
         sync::Lock guard{grants_lock_};
-        if (attaching_ || grants_closed_ || revoking_
-            || pair[0].phase != Root::Phase::Idle || pair[1].phase != Root::Phase::Idle)
+        if (attaching_ || grants_closed_ || revoking_ || pair[0].phase != Root::Phase::Idle ||
+            pair[1].phase != Root::Phase::Idle)
             return std::unexpected(cap::GrantError::InvalidState);
         attaching_ = true;
         for (auto& relation : pair) {
@@ -382,12 +240,15 @@ auto Thread::authorize(const cap::Resolved<mm::VSpace>& space,
     }
     auto result = space.attach(pair[0].cap);
     const bool first_attached = static_cast<bool>(result);
-    if (result) result = caps.attach(pair[1].cap);
+    if (result)
+        result = caps.attach(pair[1].cap);
     bool accepted{}, closed{};
     {
         sync::Lock guard{grants_lock_};
-        if (!first_attached) unlink(pair[0]);
-        if (!result) unlink(pair[1]);
+        if (!first_attached)
+            unlink(pair[0]);
+        if (!result)
+            unlink(pair[1]);
         accepted = result && !grants_closed_ && !revoking_;
         closed = grants_closed_;
         attaching_ = false;
@@ -396,8 +257,10 @@ auto Thread::authorize(const cap::Resolved<mm::VSpace>& space,
         detach(pair[0]);
         detach(pair[1]);
     }
-    if (closed) close_grants();
-    if (!result) return result;
+    if (closed)
+        close_grants();
+    if (!result)
+        return result;
     return accepted ? std::expected<void, cap::GrantError>{}
                     : std::unexpected(cap::GrantError::InvalidState);
 }
@@ -406,10 +269,12 @@ void Thread::detach(Root& relation) noexcept {
     Flight publishing{*this};
     {
         sync::Lock guard{grants_lock_};
-        if (relation.phase != Root::Phase::Attached) return;
+        if (relation.phase != Root::Phase::Attached)
+            return;
         relation.phase = Root::Phase::Detaching;
     }
-    if (relation.cap.detach()) released(relation);
+    if (relation.cap.detach())
+        released(relation);
 }
 
 void Thread::unlink(Root& relation) noexcept {
@@ -441,10 +306,13 @@ void Thread::invalidate(Root& relation, cap::GrantWork&& work) noexcept {
         relation.work = std::move(work);
         closed = grants_closed_;
         start = !closed && !revoking_;
-        if (start) revoking_ = true;
+        if (start)
+            revoking_ = true;
     }
-    if (start) revoke_.start(*this);
-    if (closed) close_grants();
+    if (start)
+        revoke_.start(*this);
+    if (closed)
+        close_grants();
 }
 
 void Thread::close_grants() noexcept {
@@ -452,7 +320,8 @@ void Thread::close_grants() noexcept {
     {
         sync::Lock guard{grants_lock_};
         grants_closed_ = true;
-        if (attaching_) return;
+        if (attaching_)
+            return;
     }
     for (;;) {
         Root* pending{};
@@ -460,13 +329,22 @@ void Thread::close_grants() noexcept {
         {
             sync::Lock guard{grants_lock_};
             for (auto* relation = grants_; relation; relation = relation->next) {
-                if (relation->phase == Root::Phase::Attached) { pending = relation; break; }
-                if (relation->work) { work = std::move(relation->work); break; }
+                if (relation->phase == Root::Phase::Attached) {
+                    pending = relation;
+                    break;
+                }
+                if (relation->work) {
+                    work = std::move(relation->work);
+                    break;
+                }
             }
         }
-        if (pending != nullptr) detach(*pending);
-        else if (work) work.reset();
-        else break;
+        if (pending != nullptr)
+            detach(*pending);
+        else if (work)
+            work.reset();
+        else
+            break;
     }
 }
 
@@ -482,7 +360,8 @@ void Thread::retire(object::cleanup&& cleanup) noexcept {
     }
     // The same stop owns grant revocation and retirement. It drains execution,
     // claims and environment roots before close_grants can complete cleanup.
-    if (start) revoke_.start(*this);
+    if (start)
+        revoke_.start(*this);
 }
 
 void Thread::finish_retire() noexcept {
@@ -491,8 +370,9 @@ void Thread::finish_retire() noexcept {
         sync::Lock guard{grants_lock_};
         libk_assert(publishers_ != 0);
         --publishers_;
-        if (!cleanup_ || !grants_closed_ || grants_ != nullptr || attaching_ || publishers_ != 0
-            || (revoking_ && !revoke_.complete())) return;
+        if (!cleanup_ || !grants_closed_ || grants_ != nullptr || attaching_ || publishers_ != 0 ||
+            (revoking_ && !revoke_.complete()))
+            return;
         done = std::move(cleanup_);
     }
     done.complete();
@@ -505,7 +385,8 @@ void Thread::prepare(usize top) noexcept {
 
 void Thread::set_state(Thread::State state) noexcept {
     state_ = state;
-    trace::emit(trace::Event::State, identity(), reinterpret_cast<u64>(sc_), static_cast<u64>(state));
+    trace::emit(trace::Event::State, identity(), reinterpret_cast<u64>(sc_),
+                static_cast<u64>(state));
 }
 
 auto Thread::stop_requested() const noexcept -> bool {
@@ -520,7 +401,8 @@ auto Thread::stopped() const noexcept -> bool {
 
 auto Thread::claim_home(sched::Dispatcher& home) noexcept -> bool {
     sync::Lock guard{lock_};
-    if ((home_ != nullptr && home_ != &home) || (stopping_ && home_ == nullptr)) return false;
+    if ((home_ != nullptr && home_ != &home) || (stopping_ && home_ == nullptr))
+        return false;
     home_ = &home;
     return true;
 }
@@ -532,18 +414,19 @@ auto Thread::owned_by(const sched::Dispatcher& home) const noexcept -> bool {
 
 auto Thread::try_bind(sched::Sc& binding) noexcept -> bool {
     sync::Lock guard{lock_};
-    if (idle() || state_ != Thread::State::Prepared || sc_ != nullptr
-        || home_ != nullptr || stopping_ || stopped_) return false;
+    if (idle() || state_ != Thread::State::Prepared || sc_ != nullptr || home_ != nullptr ||
+        stopping_ || stopped_)
+        return false;
     sc_ = &binding;
     return true;
 }
 
-auto Thread::release_sc(sched::Sc& binding,
-                                sched::Dispatcher* owner) noexcept -> bool {
+auto Thread::release_sc(sched::Sc& binding, sched::Dispatcher* owner) noexcept -> bool {
     sync::Lock guard{lock_};
-    if (sc_ != &binding || home_ != owner
-        || state_ == Thread::State::Running || state_ == Thread::State::Ready
-        || state_ == Thread::State::Throttled || (owner != nullptr && state_ != Thread::State::Exited)) return false;
+    if (sc_ != &binding || home_ != owner || state_ == Thread::State::Running ||
+        state_ == Thread::State::Ready || state_ == Thread::State::Throttled ||
+        (owner != nullptr && state_ != Thread::State::Exited))
+        return false;
     sc_ = nullptr;
     return true;
 }
@@ -560,10 +443,10 @@ void Thread::complete() noexcept {
         Stop* request{};
         {
             sync::Lock guard{lock_};
-            if (stops_.empty()) return;
+            if (stops_.empty())
+                return;
             request = &stops_.pop_front();
         }
         request->finish(*this);
     }
 }
-

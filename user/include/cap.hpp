@@ -123,7 +123,13 @@ struct vm_area {
         noexcept -> std::expected<vm_area, status_t> {
         const auto r = sys::memory_create(pool, size, VM_READ | VM_WRITE);
         if (r.status != STATUS_OK) return std::unexpected(r.status);
-        return map_impl(vm, cap_owner{r.value}, va, size, VM_READ | VM_WRITE);
+        cap_owner memory{r.value};
+        // Owned allocation admits physical pages and CPU mappings before use.
+        // Sparse mappings remain available through memory_create + map.
+        for (word_t page = 0; page < size / 4096; ++page)
+            if (const auto status = sys::memory_populate(memory.selector(), page).status;
+                status != STATUS_OK) return std::unexpected(status);
+        return map_impl(vm, std::move(memory), va, size, VM_READ | VM_WRITE);
     }
 private:
     inline static vm_area* head_{};

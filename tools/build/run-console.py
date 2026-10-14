@@ -8,12 +8,12 @@ import subprocess
 import sys
 import time
 
-def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_check=False):
+def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_check=False, missing_storage=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
     output = bytearray()
-    command = [qemu, '-machine', 'virt', '-smp', smp, '-nographic',
+    command = [qemu, '-machine', 'virt,iommu-sys=on' if missing_storage else 'virt', '-smp', smp, '-nographic',
                '-bios', 'default', '-kernel', kernel, '-initrd', bundle]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
@@ -57,8 +57,14 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
         until(b'myos> ')
         run('help', b'run/spawn PROGRAM')
         run('svc', b'shell running')
-        run('ls', b'cat.elf')
-        run('cat README.TXT', b'myos disk file service')
+        run('ls /boot', b'cat.elf')
+        run('cat /boot/README.TXT', b'myos disk file service')
+        if missing_storage:
+            run('svc', b'store starting')
+            run('cat note', b'error: 11')
+            run('run echo boot-without-disk', b'boot-without-disk\nmyos> ')
+            print(f'[console] OK: {smp} harts, IOMMU without disk, shell and /boot usable, data unavailable')
+            return
         run('cat absent.txt', b'error: 2')
         if exec_check:
             # Reuse the same immutable file backing after the first process writes
@@ -68,21 +74,31 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
         if service_fault:
             run('svc restart absent', b'error: -5')
             baseline = output.count(b'uart: console ready')
-            for target in ('files',):
-                start = len(output)
-                for byte in f'svc restart {target}\r'.encode():
-                    process.stdin.write(bytes([byte]))
-                    process.stdin.flush()
-                    time.sleep(0.003)
-                until(b'myos native shell', start)
-                restarted = output.index(b'myos native shell', start)
-                until(b'myos> ', restarted)
-                if output.count(b'uart: console ready') != baseline:
-                    raise RuntimeError('unrelated UART service restarted')
+            shells = output.count(b'myos native shell')
+            job = int(re.search(rb'task: ([0-9]+)', run('spawn sleep 10000', b'task: '))[1])
+
+            def state(target, expected):
+                deadline = time.monotonic() + 10
+                while target.encode() + b' ' + expected not in run('svc', b'shell running'):
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f'{target} did not become {expected!r}')
+                    time.sleep(0.01)
+
+            for target in ('files', 'vfs'):
+                run(f'svc stop {target}', b'service change requested')
+                state(target, b'stopped')
+                run('jobs', str(job).encode())
+                run(f'svc start {target}', b'service change requested')
+                state('vfs', b'running')
+                run('cat /boot/README.TXT', b'myos disk file service')
+                run(f'svc restart {target}', b'service change requested')
+                state('vfs', b'running')
                 run('run echo console-ready', b'console-ready\nmyos> ')
-                run('cat README.TXT', b'myos disk file service')
-                run('svc restart absent', b'error: -5')
-            print(f'[console] OK: {smp} harts, local service restart and surviving UART')
+                run(f'wait {job} 1', b'error: -21')
+            run(f'stop {job}', b'myos> ')
+            if output.count(b'uart: console ready') != baseline or output.count(b'myos native shell') != shells:
+                raise RuntimeError('unrelated UART or reconnecting shell restarted')
+            print(f'[console] OK: {smp} harts, authorized service stop/start/restart, shell/jobs/UART survive')
             return
         for _ in range(iterations):
             run('run echo console-ready', b'console-ready\nmyos> ')
@@ -160,4 +176,5 @@ if __name__ == '__main__':
     for smp in harts.split(','):
         exercise(qemu, kernel, bundle, smp, iterations,
                  service_fault=len(sys.argv) >= 6 and sys.argv[5] == 'service-fault',
-                 exec_check=len(sys.argv) >= 6 and sys.argv[5] == 'exec')
+                 exec_check=len(sys.argv) >= 6 and sys.argv[5] == 'exec',
+                 missing_storage=len(sys.argv) >= 6 and sys.argv[5] == 'missing-storage')

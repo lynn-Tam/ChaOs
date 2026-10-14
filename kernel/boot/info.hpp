@@ -6,10 +6,7 @@
 #include <libk/inplace_vector.hpp>
 #include <optional>
 #include <mm/table.hpp>
-#include <io/host.hpp>
-#include <time.hpp>
 #include <string_view>
-#include <variant>
 
 // Linker-produced facts, independent of board resources and runtime owners.
 // Linker spans are page-aligned; firmware spans may have partial edge pages.
@@ -38,16 +35,11 @@ struct BootInfo final {
     std::optional<BootSpan> module{};
     libk::inplace_vector<CpuHwId, MaxCpus> cpus{};
     u64 timebase_frequency{};
+    mm::RegionList reserved;
 };
 
 // Boot assembles permanent mappings before exposing the hardware root.
 auto kernel_root(mm::Pmm&) noexcept -> std::expected<mm::PageTable, mm::PtErr>;
 
-// Composition belongs to the firmware entry. Resource emission is synchronous;
-// hardware backends and the returned interrupt entry live for the machine lifetime.
-using HwRes = std::variant<io::Reg, irq::Line, io::Bus*>;
-using HwEmit = libk::delegate<bool(u32 node, u32 index, HwRes) noexcept>;
-using ExtIrq = libk::delegate<void() noexcept>;
 using BootRead = bool (*)(BootInfo&, mm::RegionList&, CpuHwId, mm::pa_t) noexcept;
-using HwStart = ExtIrq (*)(mm::Pmm&, const time::Clock&, HwEmit) noexcept;
-[[noreturn]] void boot_start(CpuHwId, mm::pa_t, BootRead, HwStart) noexcept;
+[[noreturn]] void boot_start(CpuHwId, mm::pa_t, BootRead) noexcept;

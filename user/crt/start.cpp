@@ -1,12 +1,14 @@
 #include <start.hpp>
 #include <sys/syscall.hpp>
 #include <climits>
+#include <libk/assert.hpp>
 #include <string.h>
 
 static rt_env startup;
 auto rt_startup() noexcept -> const rt_env& { return startup; }
 extern "C" void init_heap(cap_t pool, cap_t vspace) noexcept;
-extern "C" void run_constructors() noexcept;
+extern "C" void (*__init_array_start[])();
+extern "C" void (*__init_array_end[])();
 extern int main(int, char**);
 
 extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
@@ -62,6 +64,14 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
         }
     }
     init_heap(startup.pool, startup.vspace);
-    run_constructors();
+    for (auto ctor : std::span{__init_array_start, __init_array_end}) ctor();
     sys::exit(main(argc, argv));
+}
+
+[[noreturn]] void libk::assert_fail(const libk::assert_info&) noexcept {
+    sys::exit(STATUS_INTERNAL);
+}
+extern "C" [[noreturn]] void abort() noexcept { sys::exit(STATUS_INTERNAL); }
+extern "C" [[noreturn]] void __assert_func(const char*, int, const char*, const char*) {
+    sys::exit(STATUS_INTERNAL);
 }

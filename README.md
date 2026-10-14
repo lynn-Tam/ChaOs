@@ -12,14 +12,19 @@ Implemented or under active development:
 
 - RV64 boot, SMP, traps, Sv39 virtual memory, and physical memory management
 - capability spaces, derivation, attenuation, revocation, and resource accounting
-- threads, Vprocs, scheduling contexts, timers, and CPU dispatch
-- notifications, channels, endpoints, and asynchronous completion
+- threads, scheduling domains and contexts, timers, and CPU dispatch
+- notifications, channels, and asynchronous completion
 - user-space `init`, process supervision, UART, block, immutable initramfs bootfs, and writable data-volume services
 - original ELF loading from a capability-authorized file view
 - an interactive shell and basic user programs
-- PCI, I/O-space, DMA, and IOMMU foundations
+- runtime firmware discovery, capability-authorized MMIO/IRQ controllers,
+  independent I/O address spaces, and DMA retirement
+- ordinary managed device/driver processes with reset and replacement
 
-The kernel and userspace interfaces are still evolving.
+The kernel and userspace interfaces are still evolving. Hardware support currently
+covers the QEMU `virt` RV64 configuration with PLIC, NS16550 UART, RISC-V IOMMU,
+and modern PCI virtio-block with one data volume. Storage is optional. This does
+not imply arbitrary board, requester-alias, or hotplug support.
 
 ## Build
 
@@ -41,11 +46,12 @@ tools/build/ninja.sh run-console
 
 The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
 disk, run the shell `mkfs` command once; running it again erases the data volume.
-The data disk is `/`; the immutable initramfs bootfs boot disk is `/boot`. Use `touch note`,
+The immutable initramfs is mounted at `/boot`; a configured data disk is mounted at `/`.
+The boot mount and shell remain usable when storage is absent or stopped. Use `touch note`,
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
 `mkdir dir`, `mv note dir/note`, and `rm dir/note`. `ls /boot` shows boot files;
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the
-data disk. `cat` and `ls` are ordinary programs using the userland VFS service;
+data disk. `cat`, `ls`, and `cp` are ordinary programs using the userland VFS service;
 the other file commands launch the ordinary `fs` program, also available as
 `fs COMMAND`. The shell explicitly passes VFS authority when launching applications. Quote names and text containing spaces,
 for example `write "my note" "hello world"`. `edit note` opens a screen editor:
@@ -54,13 +60,17 @@ Ctrl+X (which asks whether to save changes). The buffer grows with the process h
 hands terminal input to a foreground program until it exits; background tasks
 receive EOF instead. Only the trusted shell receives explicit Store Admin authority;
 ordinary `fs` and `edit` cannot format. Programs run by name, for example
-`echo hello | put greeting`. `echo hello > greeting` replaces a file, and
-`echo world >> greeting` appends to it; redirection runs the ordinary `put`
+`echo hello | cat`. `echo hello > greeting` replaces a file, and
+`echo world >> greeting` appends to it; redirection runs ordinary `fs save`
 program through the same two-task pipe. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
 `svc` lists managed service instances; `svc restart NAME` restarts an instance
 and its dependent services. Restart acceptance precedes recovery completion.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
+
+Deployment bundles contain standard ELF files with debug information removed;
+the original ELF files retain symbols beside the build objects. Test workloads
+are included only in test bundles.
 
 Additional test, audit, SMP matrix, debug, and proof targets are defined in `meson.build`.
 
@@ -72,6 +82,8 @@ kernel/     Kernel
 libk/       Freestanding C++ support library
 uapi/       User/kernel ABI
 user/       Userspace runtime and libraries
+protocols/  Service contracts and explicit clients
+adapters/   Optional application ABI adapters
 servers/    Userspace system services
 programs/   User programs
 tools/      Build and image tooling

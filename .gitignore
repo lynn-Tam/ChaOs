@@ -13,8 +13,6 @@
 !/arch/**
 !/kernel/
 !/kernel/**
-!/platform/
-!/platform/**
 !/servers/
 !/servers/**
 !/programs/

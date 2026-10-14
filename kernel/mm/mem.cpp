@@ -132,7 +132,7 @@ auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expe
 }
 
 [[nodiscard]] auto validate_extents(Pmm& pmm, usize logical_pages, std::span<const Extent> extents,
-                                    const PageGroup& owned) noexcept -> std::expected<void, MemErr> {
+                                    const PageGroup& owned, const Phys::Lease& external) noexcept -> std::expected<void, MemErr> {
     if (extents.empty()) {
         return std::unexpected(MemErr::InvalidRange);
     }
@@ -150,7 +150,10 @@ auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expe
             return std::unexpected(MemErr::InvalidAccess);
         }
         const bool ram = pmm.is_ram(extent.physical);
-        if (!pmm.covers(extent.physical)) return std::unexpected(MemErr::NotBacked);
+        if (external) {
+            if (ram || owned || !external.covers(extent.physical))
+                return std::unexpected(MemErr::OwnershipMismatch);
+        } else if (!pmm.covers(extent.physical)) return std::unexpected(MemErr::NotBacked);
         if (!ram && extent.perms.contains(Perm::Execute)) {
             return std::unexpected(MemErr::NotRam);
         }
@@ -510,11 +513,11 @@ auto Cache<Extra>::writeback_locked(Node& n) noexcept -> bool
 Extents::Extents(Pmm& pmm) noexcept : rows_(pmm) {}
 Extents::Extents(Extents&& other) noexcept
     : rows_(std::move(other.rows_)), head_(std::exchange(other.head_, nullptr)),
-      owned_(std::move(other.owned_)) {}
+      owned_(std::move(other.owned_)), external_(std::move(other.external_)) {}
 Extents::~Extents() noexcept { reset(); }
 
 auto Extents::initialize(const object::ref<>& payer, std::span<const Extent> extents,
-                         PageGroup&& pages) noexcept -> std::expected<void, MemErr> {
+                         PageGroup&& pages, Phys::Lease&& external) noexcept -> std::expected<void, MemErr> {
     libk_assert(!head_);
     for (const auto& e : extents) {
         auto row = rows_.create(payer, e);
@@ -527,6 +530,7 @@ auto Extents::initialize(const object::ref<>& payer, std::span<const Extent> ext
         head_ = *row;
     }
     owned_ = std::move(pages);
+    external_ = std::move(external);
     return {};
 }
 
@@ -654,10 +658,10 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
             d.pager_ = std::move(c.pager);
             d.store_.emplace(std::in_place_type<Paged>, pmm, c.perms, &pager->get(), c.priv);
         } else {
-            auto checked = validate_extents(pmm, d.pages_, c.extents, c.owned);
+            auto checked = validate_extents(pmm, d.pages_, c.extents, c.owned, c.external);
             if (!checked) return checked;
             d.store_.emplace(std::in_place_type<Extents>, pmm);
-            auto ready = std::get<Extents>(*d.store_).initialize(d.payer_, c.extents, std::move(c.owned));
+            auto ready = std::get<Extents>(*d.store_).initialize(d.payer_, c.extents, std::move(c.owned), std::move(c.external));
             if (!ready) return ready;
             u8 bits{};
             for (const auto& e : c.extents) bits |= e.perms.raw();

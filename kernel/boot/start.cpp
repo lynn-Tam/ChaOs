@@ -53,13 +53,6 @@ auto kernel_root(mm::Pmm& pmm) noexcept -> std::expected<mm::PageTable, mm::PtEr
         auto installed = root->map(*va, pages, PtPerm::Rw);
         if (!installed) return std::unexpected(installed.error());
     }
-    // MMIO has the same immutable resource inventory, but is not allocatable RAM.
-    for (const auto& region : pmm.regions()) {
-        if (region.is_ram()) continue;
-        const auto pages = region.range;
-        auto installed = root->map(mm::va_t{mm::DirectBegin + pages.base().base().raw()}, pages, PtPerm::Rw);
-        if (!installed) return std::unexpected(installed.error());
-    }
     // Secondaries enter physically; these leaves bridge to their high entry.
     const auto pages = boot_layout.secondary.pages();
     auto installed = root->map(mm::va_t{pages.base().base().raw()}, pages, PtPerm::Rx);
@@ -79,7 +72,6 @@ struct BootStack {
     mm::BootPages scratch, firmware;
     std::optional<mm::BootPages> module;
     mm::Stack stack;
-    HwStart start;
 };
 static constinit libk::manual_lifetime<BootStack> stack_storage{};
 
@@ -153,22 +145,23 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     });
     libk_assert(root);
     boot.root = std::move(*root).publish();
+    boot.vm.fund(boot.root);
 
+    auto physical = boot.objects.get<mm::Phys>().create(boot.pmm, std::move(boot_info.reserved));
+    libk_assert(physical);
+    boot.physical = std::move(*physical).publish();
     auto& runtime = *boot.cpus.get(Cpus::boot_id());
     start_worker(boot, runtime);
     if (boot_info.module) {
         libk_assert(state.module);
         const auto started = boot_root(boot, runtime, boot_info,
-            std::move(*state.module), std::move(state.firmware), state.start);
+            std::move(*state.module), std::move(state.firmware));
         if (!started)
             console::print<"root task failed: {}\n">(static_cast<u8>(started.error()));
         libk_assert(started);
         console::print<"root init: started\n">();
     } else {
-        // Kernel-only runs need the controller, but publish no user resources.
-        auto discard = [](u32, u32, HwRes) noexcept { return true; };
-        runtime.ext_irq = state.start(boot.pmm, boot.clock, HwEmit::bind(discard));
-        libk_assert(runtime.ext_irq && boot.pmm.reclaim(std::move(state.firmware)));
+        libk_assert(boot.pmm.reclaim(std::move(state.firmware)));
     }
     handoff_storage.reset();
     runtime.install(runtime.hw.raw);
@@ -177,7 +170,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     runtime.dispatcher().enter_idle();
 }
 
-[[noreturn]] void boot_start(CpuHwId hart, mm::pa_t pa, BootRead read, HwStart start) noexcept {
+[[noreturn]] void boot_start(CpuHwId hart, mm::pa_t pa, BootRead read) noexcept {
     libk_assert(pa.raw() < mm::DirectSize);
     auto& boot_info = handoff_storage.emplace();
     auto& memory = memory_storage.emplace();
@@ -225,6 +218,6 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
 
     auto stack = mm::Stack::create(vm);
     libk_assert(stack);
-    auto& state = stack_storage.emplace(std::move(*scratch), std::move(*firmware), std::move(module), std::move(*stack), start);
+    auto& state = stack_storage.emplace(std::move(*scratch), std::move(*firmware), std::move(module), std::move(*stack));
     arch::switch_stack(state.stack.top(), &state, continue_init);
 }

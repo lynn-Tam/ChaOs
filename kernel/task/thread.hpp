@@ -27,17 +27,16 @@ class Thread;
 class Cpus;
 namespace ipc {
 class Notification;
-class Activation;
 }
 class Completion;
 
 namespace sched {
 class Sc;
 class Dispatcher;
-}
+} // namespace sched
 // A caller-owned interest in exit cleanup. Completion may destroy it.
 class Stop final {
-public:
+  public:
     using Notifier = libk::delegate<void() noexcept>;
     explicit Stop(Notifier notify = {}) noexcept : notify_(notify) {}
     Stop(const Stop&) = delete;
@@ -52,7 +51,7 @@ public:
     }
     void start(Thread&) noexcept;
 
-private:
+  private:
     friend class Thread;
 
     void finish(Thread&) noexcept;
@@ -65,7 +64,7 @@ private:
 };
 
 class Thread final : private libk::noncopyable_nonmovable {
-public:
+  public:
     enum class State : u8 { Prepared, Ready, Running, Throttled, Blocked, Exited };
 
     enum class Kind : u8 {
@@ -82,42 +81,21 @@ public:
 
     using UserStart = arch::UserStart;
 
-    Thread(
-        mm::Stack&& home_stack,
-        Env&& roots,
-        KernelStart start,
-        Kind kind = Kind::Normal) noexcept;
-    Thread(
-        mm::Stack&& home_stack,
-        Env&& roots,
-        UserStart start,
-        Kind kind = Kind::Normal) noexcept;
-    Thread(
-        resource::Charge&& stack_charge,
-        mm::Stack&& home_stack,
-        Env&& roots,
-        UserStart start,
-        Kind kind = Kind::Normal) noexcept;
+    Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start,
+           Kind kind = Kind::Normal) noexcept;
+    Thread(mm::Stack&& home_stack, Env&& roots, UserStart start, Kind kind = Kind::Normal) noexcept;
+    Thread(resource::Charge&& stack_charge, mm::Stack&& home_stack, Env&& roots, UserStart start,
+           Kind kind = Kind::Normal) noexcept;
     ~Thread() noexcept;
 
-    [[nodiscard]] auto state() const noexcept -> State {
-        return state_;
-    }
-    [[nodiscard]] auto home_stack_base() const noexcept -> usize;
-    [[nodiscard]] auto home_stack_top() const noexcept -> usize;
+    [[nodiscard]] auto state() const noexcept -> State { return state_; }
+    [[nodiscard]] auto stack_base() const noexcept -> usize;
+    [[nodiscard]] auto stack_top() const noexcept -> usize;
     [[nodiscard]] auto kind() const noexcept -> Kind { return kind_; }
-    [[nodiscard]] auto idle() const noexcept -> bool {
-        return kind_ == Kind::Idle;
-    }
-    [[nodiscard]] auto sc() noexcept -> sched::Sc* {
-        return sc_;
-    }
-    [[nodiscard]] auto sc() const noexcept -> const sched::Sc* {
-        return sc_;
-    }
-    [[nodiscard]] auto identity() const noexcept -> usize {
-        return reinterpret_cast<usize>(this);
-    }
+    [[nodiscard]] auto idle() const noexcept -> bool { return kind_ == Kind::Idle; }
+    [[nodiscard]] auto sc() noexcept -> sched::Sc* { return sc_; }
+    [[nodiscard]] auto sc() const noexcept -> const sched::Sc* { return sc_; }
+    [[nodiscard]] auto identity() const noexcept -> usize { return reinterpret_cast<usize>(this); }
     [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return ctx_; }
     [[nodiscard]] auto exit() noexcept -> Exit& { return exit_; }
     [[nodiscard]] auto exit() const noexcept -> const Exit& { return exit_; }
@@ -129,67 +107,48 @@ public:
     [[nodiscard]] auto owned_by(const sched::Dispatcher&) const noexcept -> bool;
     [[nodiscard]] auto try_bind(sched::Sc&) noexcept -> bool;
     [[nodiscard]] auto release_sc(sched::Sc&, sched::Dispatcher*) noexcept -> bool;
-    [[nodiscard]] auto current_stack_base() const noexcept -> usize;
-    [[nodiscard]] auto current_stack_top() const noexcept -> usize;
-    [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool;
-    [[nodiscard]] auto env() noexcept -> Env&;
-    [[nodiscard]] auto env() const noexcept
-        -> const Env&;
-    [[nodiscard]] auto ipc_buffer() noexcept -> ipc::Buffer*;
-    [[nodiscard]] auto ipc_buffer() const noexcept -> const ipc::Buffer*;
-    [[nodiscard]] auto activation() const noexcept -> ipc::Activation* {
-        return active_;
+    [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool {
+        return stack_.contains(address);
     }
-    [[nodiscard]] auto current_wait() noexcept -> Wait&;
-    [[nodiscard]] auto current_wait() const noexcept -> const Wait&;
-    [[nodiscard]] auto call_depth() const noexcept -> usize;
-    [[nodiscard]] auto cancel_pending() const noexcept -> bool;
-    void push(ipc::Activation& frame) noexcept;
-    void pop(ipc::Activation& frame) noexcept;
-    [[nodiscard]] auto env_before(
-        const ipc::Activation& frame) noexcept -> Env&;
-    [[nodiscard]] auto ipc_before(
-        const ipc::Activation& frame) noexcept -> ipc::Buffer*;
-    [[nodiscard]] auto authorize(
-        const cap::Resolved<mm::VSpace>& vspace,
-        const cap::Resolved<cap::CSpace>& cspace) noexcept
+    [[nodiscard]] auto env() noexcept -> Env& { return env_; }
+    [[nodiscard]] auto env() const noexcept -> const Env& { return env_; }
+    [[nodiscard]] auto ipc_buffer() noexcept -> ipc::Buffer* { return env_.ipc_buffer(); }
+    [[nodiscard]] auto ipc_buffer() const noexcept -> const ipc::Buffer* {
+        return env_.ipc_buffer();
+    }
+    [[nodiscard]] auto wait() noexcept -> Wait& { return wait_; }
+    [[nodiscard]] auto wait() const noexcept -> const Wait& { return wait_; }
+    [[nodiscard]] auto authorize(const cap::Resolved<mm::VSpace>& vspace,
+                                 const cap::Resolved<cap::CSpace>& cspace) noexcept
         -> std::expected<void, cap::GrantError>;
     void note_user_syscall() noexcept { ++user_syscalls_; }
-    [[nodiscard]] auto user_syscalls() const noexcept -> u64 {
-        return user_syscalls_;
-    }
-    [[nodiscard]] auto waiting() const noexcept -> bool {
-        return current_wait().attached();
-    }
-    [[nodiscard]] auto begin_wait(
-        Completion& relation,
-        Cpus& cpus) noexcept -> bool;
+    [[nodiscard]] auto user_syscalls() const noexcept -> u64 { return user_syscalls_; }
+    [[nodiscard]] auto waiting() const noexcept -> bool { return wait().attached(); }
+    [[nodiscard]] auto begin_wait(Completion& relation, Cpus& cpus) noexcept -> bool;
     void cancel_wait() noexcept;
     // Kernel calls retain their stack until all local transactions have drained.
-    void enter_kernel() noexcept { libk_assert(!in_kernel_); in_kernel_ = true; }
-    void leave_kernel() noexcept { libk_assert(in_kernel_); in_kernel_ = false; }
+    void enter_kernel() noexcept {
+        libk_assert(!in_kernel_);
+        in_kernel_ = true;
+    }
+    void leave_kernel() noexcept {
+        libk_assert(in_kernel_);
+        in_kernel_ = false;
+    }
     void block() noexcept;
-    // Called only after switching away from every popped frame stack.
-    void release_calls() noexcept;
     // Terminal edge: every outstanding Pager service claim registered by this
     // Thread returns to Published through the requeue owner path. Safe to
     // call more than once; entries clear as they are invalidated.
-    [[nodiscard]] auto claims() noexcept -> Pager::Claims& {
-        return claims_;
-    }
+    [[nodiscard]] auto claims() noexcept -> Pager::Claims& { return claims_; }
     void retire(object::cleanup&&) noexcept;
 
-private:
+  private:
     friend class sched::Dispatcher;
     friend class Stop;
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop(Stop& request) noexcept;
-    void finish(
-        Exit::Reason reason,
-        status_t status) noexcept;
-    void finish_stop() noexcept;
-    void finish_exit(status_t status = STATUS_OK) noexcept;
+    void finish(status_t status) noexcept;
 
     struct Root {
         Root(Thread& owner) noexcept : owner(&owner), cap(this, grant_ops_) {}
@@ -203,12 +162,13 @@ private:
     // Foreign detach/stop/work callbacks may synchronously complete cleanup.
     // Keep the entity resident until the entire publishing call has returned.
     class Flight {
-    public:
+      public:
         explicit Flight(Thread&) noexcept;
         ~Flight() noexcept;
         Flight(const Flight&) = delete;
         auto operator=(const Flight&) -> Flight& = delete;
-    private:
+
+      private:
         Thread& owner_;
     };
     static const cap::GrantAttachmentOps grant_ops_;
@@ -248,8 +208,6 @@ private:
     std::variant<KernelStart, UserStart> start_;
     Kind kind_{Kind::Normal};
     Wait wait_{};
-    ipc::Activation* active_{};
-    ipc::Activation* retired_{};
     bool in_kernel_{};
     Pager::Claims claims_{};
     u64 user_syscalls_{};

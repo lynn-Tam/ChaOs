@@ -27,7 +27,7 @@ enum class EnvError : u8 {
     InvalidBuffer,
 };
 
-// The only owner of one Thread's effective base roots. ref<> keeps root
+// The only owner of one Thread's execution roots. ref<> keeps root
 // storage stable; the root-local execution relation independently prevents
 // retirement while this binding can be scheduled.
 class Env final : private libk::noncopyable {

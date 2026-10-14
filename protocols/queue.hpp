@@ -12,7 +12,7 @@
 #include <libk/memory.hpp>
 #include <optional>
 #include <cap.hpp>
-#include <ipc.hpp>
+#include <protocols/msg.hpp>
 #include <expected>
 
 inline constexpr rt_req io_memory{"io.memory", 0, ObjGroup};
@@ -20,7 +20,7 @@ inline constexpr rt_req io_memory{"io.memory", 0, ObjGroup};
 inline constexpr size_t io_queue_depth = 32;
 inline constexpr size_t io_buffer_size = 4096;
 inline constexpr size_t io_payload_size = io_queue_depth * io_buffer_size;
-using io_submissions = libk::shared_ring<8, io_queue_depth>;
+using io_submissions = libk::shared_ring<7, io_queue_depth>;
 using io_completions = libk::shared_ring<4, io_queue_depth>;
 
 enum class io_operation : uint64_t { Read = 1, Write = 2, Flush = 3, Identify = 4 };
@@ -31,18 +31,17 @@ enum class io_control : uint64_t { Open = 1, Cancel, Close, Sync, Stat };
 struct io_cmd final {
     uint64_t id{};
     uint64_t operation{};
-    uint64_t object{};
     uint64_t offset{};
-    uint64_t buffer{};
     uint64_t buffer_offset{};
     uint64_t length{};
     uint64_t flags{};
+    uint64_t deadline{};
 
     [[nodiscard]] auto encode() const noexcept -> io_submissions::value_type {
-        return {{id, operation, object, offset, buffer, buffer_offset, length, flags}};
+        return {{id, operation, offset, buffer_offset, length, flags, deadline}};
     }
     [[nodiscard]] static auto decode(const io_submissions::value_type& value) noexcept -> io_cmd {
-        return {value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7]};
+        return {value[0], value[1], value[2], value[3], value[4], value[5], value[6]};
     }
 };
 
@@ -389,11 +388,7 @@ class io_mem final {
             return STATUS_OK;
         pool_ = pool;
         return acquire([&](size_t i, size_t size) {
-            auto page = vm_area::create(pool, vm, address ? address + i * 4096 : 0, size);
-            if (page)
-                for (size_t n = 0; n < size; n += 4096)
-                    *reinterpret_cast<volatile uint8_t*>(page->address + n) = 0;
-            return page;
+            return vm_area::create(pool, vm, address ? address + i * 4096 : 0, size);
         });
     }
     auto map(cap_t vm, uintptr_t address, std::span<cap_owner, 3> caps, bool writable_payload)
@@ -440,8 +435,9 @@ class io_mem final {
                                              ? VM_READ | VM_WRITE
                                              : VM_READ}};
             cap_encode(view, wire);
-            const auto exported = sys::cap_typed_delegate(pages_[index].memory.selector(), cspace,
-                                                          pages_[1].memory.selector(), scratch, pool_);
+            const auto exported =
+                sys::cap_typed_delegate(pages_[index].memory.selector(), cspace,
+                                        pages_[1].memory.selector(), scratch, pool_);
             if (exported.status != STATUS_OK)
                 return exported.status;
             exports[index] = cap_owner{exported.value};
@@ -472,115 +468,47 @@ class io_mem final {
 // forwarding consumers own their snapshots and use queue() instead.
 class io_client final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto adopt(cap_owner&& channel, cap_t events, cap_t vspace, uintptr_t address,
-                             uint64_t& value, bool writable_payload = false) noexcept -> status_t {
+    [[nodiscard]] auto adopt(cap_owner&& channel, cap_t pool, cap_t cspace, cap_t events,
+                             cap_t vspace, uintptr_t address, uint64_t& value,
+                             bool writable_payload = false, uint64_t deadline = 0) noexcept
+        -> status_t {
         if (queue_ || channel_ || !channel)
             return STATUS_BAD_ARGS;
         channel_ = std::move(channel);
-        const auto status =
-            open(channel_.selector(), events, vspace, address, value, writable_payload);
-        if (status != STATUS_OK) {
-            if (const auto rc = control_.close(); rc != STATUS_OK)
-                sys::exit(rc);
-            channel_ = {};
-        }
-        return status;
+        return open(channel_.selector(), 0, pool, cspace, events, vspace, address, value,
+                    writable_payload, deadline);
     }
-    [[nodiscard]] auto open(cap_t channel, cap_t events, cap_t vspace, uintptr_t address,
-                            uint64_t& value, bool writable_payload = false) noexcept -> status_t {
-        if (queue_)
-            return STATUS_BAD_ARGS;
-        events_ = events;
-        auto status = control_.open(channel, events);
-        if (status != STATUS_OK)
-            return status;
-        const CapXfer event{events, RIGHT_SIGNAL, CAP_COPY, 0};
-        ch_msg request{.operation = static_cast<uint64_t>(io_control::Open),
-                       .id = ++next_id_,
-                       .value = io_queue_depth};
-        status = control_.send(request, {&event, 1}, false).status;
-        if (status != STATUS_OK)
-            return status;
-        ch_packet packet;
-        status = receive(request, packet);
-        if (status != STATUS_OK)
-            return status;
-        if (packet.message.status != STATUS_OK)
-            return packet.message.status;
-        status = map_pages(vspace, address, packet, writable_payload);
-        if (status != STATUS_OK)
-            return status;
-        queue_.emplace(memory_.client(), std::as_const(memory_).server());
-        requests_.emplace(*queue_, std::as_const(memory_).payload(), this->writable_payload());
-        value = packet.message.value;
-        return sys::notification_signal(peer_event_.selector()).status;
-    }
-
-    // A directory capability grants only admission. Replies and data belong
-    // to the newly created private channel, so clients never share a reader.
     [[nodiscard]] auto connect(cap_t directory, cap_t pool, cap_t cspace, cap_t events,
                                cap_t vspace, uintptr_t address, uint64_t& value,
-                               bool writable_payload = false) noexcept -> status_t {
+                               bool writable_payload = false, uint64_t deadline = 0) noexcept
+        -> status_t {
         if (queue_ || channel_)
             return STATUS_BUSY;
         const auto pair = sys::channel_create(pool, 1, CHANNEL_MAX_WORDS, 4, 2);
-        if (pair.status != STATUS_OK)
-            return pair.status;
         channel_ = cap_owner{pair.value};
         cap_owner server{pair.value2};
-        constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE | RIGHT_DUPLICATE;
-        const auto client_endpoint =
-            sys::channel_mint(channel_.selector(), cspace, 1, rights | RIGHT_DESTROY);
-        const auto server_endpoint = sys::channel_mint(server.selector(), cspace, 1, rights);
-        cap_owner client_fixed, server_fixed;
-        if (client_endpoint.status == STATUS_OK)
-            client_fixed = cap_owner{client_endpoint.value};
-        if (server_endpoint.status == STATUS_OK)
-            server_fixed = cap_owner{server_endpoint.value};
-        if (!client_fixed || !server_fixed) {
-            if (const auto rc = control_.close(); rc != STATUS_OK)
-                sys::exit(rc);
+        if (pair.status != STATUS_OK) {
             channel_ = {};
-            return !client_fixed ? client_endpoint.status : server_endpoint.status;
+            return pair.status;
+        }
+        constexpr auto rights = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE | RIGHT_DUPLICATE;
+        const auto own = sys::channel_mint(channel_.selector(), cspace, 1, rights | RIGHT_DESTROY);
+        cap_owner client_fixed{own.value};
+        const auto peer = sys::channel_mint(server.selector(), cspace, 1, rights);
+        cap_owner server_fixed{peer.value};
+        if (own.status != STATUS_OK || peer.status != STATUS_OK) {
+            channel_ = {};
+            return own.status != STATUS_OK ? own.status : peer.status;
         }
         channel_ = std::move(client_fixed);
-        server = std::move(server_fixed);
-        events_ = events;
-        auto status = control_.open(channel_.selector(), events);
-        const ch_msg request{.operation = static_cast<uint64_t>(io_control::Open),
-                             .id = ++next_id_,
-                             .value = io_queue_depth};
-        const CapXfer transfers[]{
-            {server.selector(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0},
-            {events, RIGHT_SIGNAL, CAP_COPY, 0}};
-        if (status == STATUS_OK)
-            status = ch_port::send_to(directory, request, transfers, 2);
-        ch_packet packet;
-        if (status == STATUS_OK)
-            status = receive(request, packet);
-        if (status == STATUS_OK)
-            status = packet.message.status;
-        if (status == STATUS_OK)
-            status = map_pages(vspace, address, packet, writable_payload);
-        if (status != STATUS_OK) {
-            if (const auto rc = control_.close(); rc != STATUS_OK)
-                sys::exit(rc);
-            channel_ = {};
-            const auto closed = memory_.close();
-            if (closed != STATUS_OK)
-                sys::exit(closed);
-            return status;
-        }
-        queue_.emplace(memory_.client(), std::as_const(memory_).server());
-        requests_.emplace(*queue_, std::as_const(memory_).payload(), this->writable_payload());
-        value = packet.message.value;
-        return sys::notification_signal(peer_event_.selector()).status;
+        return open(directory, server_fixed.selector(), pool, cspace, events, vspace, address,
+                    value, writable_payload, deadline);
     }
 
     [[nodiscard]] auto close() noexcept -> status_t {
         if (!queue_ || !channel_)
             return STATUS_BAD_ARGS;
-        ch_msg request{.operation = static_cast<uint64_t>(io_control::Close)};
+        msg_frame request{.operation = static_cast<uint64_t>(io_control::Close)};
         const auto status = requests_->error() ? requests_->error() : exchange(request);
         requests_.reset();
         queue_.reset();
@@ -595,25 +523,13 @@ class io_client final : private libk::noncopyable_nonmovable {
         return status;
     }
 
-    [[nodiscard]] auto exchange(ch_msg& message, ch_packet& packet) noexcept -> status_t {
-        if (!queue_ || next_id_ == UINT64_MAX)
-            return STATUS_BAD_ARGS;
-        message.id = ++next_id_;
-        auto status = control_.send(message, {}, false).status;
-        if (status != STATUS_OK)
-            return status;
-        status = receive(message, packet);
-        if (status != STATUS_OK)
-            return status;
-        message = packet.message;
-        status = sys::notification_signal(peer_event_.selector()).status;
-        return status == STATUS_OK ? message.status : status;
+    [[nodiscard]] auto exchange(msg_frame& message, msg_packet& packet) noexcept -> status_t {
+        return queue_ ? rpc_.exchange(message, packet) : STATUS_BAD_ARGS;
     }
-
-    [[nodiscard]] auto exchange(ch_msg& message) noexcept -> status_t {
-        ch_packet packet;
+    [[nodiscard]] auto exchange(msg_frame& message) noexcept -> status_t {
+        msg_packet packet;
         const auto status = exchange(message, packet);
-        return packet.count == 0 ? status : STATUS_PEER_FAULT;
+        return packet.count ? STATUS_PEER_FAULT : status;
     }
 
     [[nodiscard]] auto queue() noexcept -> io_tx& { return *queue_; }
@@ -641,6 +557,13 @@ class io_client final : private libk::noncopyable_nonmovable {
         -> status_t {
         if (id && !requests_->contains(id))
             return STATUS_NOT_FOUND;
+        if (deadline) {
+            const auto ready = requests_->take(result, id);
+            if (ready != STATUS_WOULD_BLOCK)
+                return ready;
+            if (const auto status = rt_admit(deadline); status != STATUS_OK)
+                return status;
+        }
         for (;;) {
             const auto status = completion(result, id);
             if (status != STATUS_WOULD_BLOCK || !requests_->next())
@@ -648,6 +571,10 @@ class io_client final : private libk::noncopyable_nonmovable {
             auto waiting = arm();
             if (waiting == STATUS_OK)
                 waiting = sys::notification_wait(events_, deadline).status;
+            // A wait timeout is not a terminal completion. The caller retains
+            // its buffer borrow until completion() returns the real result.
+            if (waiting == STATUS_TIMED_OUT)
+                return waiting;
             if (waiting != STATUS_OK)
                 (void) requests_->fail(waiting);
         }
@@ -665,7 +592,7 @@ class io_client final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
 
   private:
-    auto map_pages(cap_t vm, uintptr_t address, ch_packet& packet, bool writable) -> status_t {
+    auto map_pages(cap_t vm, uintptr_t address, msg_packet& packet, bool writable) -> status_t {
         if (packet.count != 4)
             return STATUS_BAD_ARGS;
         const auto s =
@@ -677,55 +604,66 @@ class io_client final : private libk::noncopyable_nonmovable {
         return s;
     }
 
-    [[nodiscard]] auto receive(const ch_msg& request, ch_packet& packet) noexcept -> status_t {
-        for (;;) {
-            auto status = control_.receive(packet);
-            if (status == STATUS_OK)
-                return packet.message.id == request.id &&
-                               packet.message.operation == request.operation
-                           ? STATUS_OK
-                           : STATUS_PEER_FAULT;
-            if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY)
-                return status;
-            status = control_.arm().status;
-            if (status != STATUS_OK)
-                return status;
-            status = sys::notification_wait(events_).status;
-            if (status != STATUS_OK)
-                return status;
+    auto open(cap_t directory, cap_t server, cap_t pool, cap_t cspace, cap_t events, cap_t vspace,
+              uintptr_t address, uint64_t& value, bool writable, uint64_t deadline) -> status_t {
+        events_ = events;
+        auto status = control_.open(channel_.selector(), events);
+        if (status == STATUS_OK)
+            status = rpc_.open(directory, pool, cspace, events);
+        msg_frame request{.operation = static_cast<uint64_t>(io_control::Open),
+                       .value = io_queue_depth,
+                       .deadline = deadline};
+        std::array<CapXfer, 2> caps{};
+        size_t count{};
+        if (server)
+            caps[count++] = {server, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0};
+        caps[count++] = {events, RIGHT_SIGNAL, CAP_COPY, 0};
+        msg_packet packet;
+        if (status == STATUS_OK)
+            status = rpc_.exchange(request, packet, std::span{caps}.first(count));
+        if (status == STATUS_OK)
+            status = map_pages(vspace, address, packet, writable);
+        if (status == STATUS_OK)
+            status = rpc_.open(channel_.selector(), pool, cspace, events);
+        if (status != STATUS_OK) {
+            if (const auto rc = control_.close(); rc != STATUS_OK)
+                sys::exit(rc);
+            channel_ = {};
+            if (const auto rc = memory_.close(); rc != STATUS_OK)
+                sys::exit(rc);
+            return status;
         }
+        queue_.emplace(memory_.client(), std::as_const(memory_).server());
+        requests_.emplace(*queue_, std::as_const(memory_).payload(), writable_payload());
+        value = packet.message.value;
+        return STATUS_OK;
     }
 
     cap_owner channel_;
-    ch_port control_;
+    msg_rx control_;
+    rpc_client rpc_;
     io_mem memory_;
     cap_owner peer_event_;
     bool writable_payload_{};
     std::optional<io_tx> queue_;
     std::optional<io_requests> requests_;
     cap_t events_{};
-    uint64_t next_id_{};
 };
 
 // The caller retains object identity and output until the final callback.
 class io_server final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto prepare(cap_t pool, cap_t vspace, cap_t cspace, uintptr_t address,
-                               bool writable_payload = false) noexcept -> status_t {
-        cspace_ = cspace;
-        writable_payload_ = writable_payload;
-        return memory_.create(pool, vspace, address);
-    }
-    [[nodiscard]] auto bind(cap_t channel, cap_t events, uint64_t value = 0) noexcept -> status_t {
-        events_ = events;
-        value_ = value;
-        return control_.open(channel, events);
-    }
     [[nodiscard]] auto open(cap_t channel, cap_t events, cap_t pool, cap_t vspace, cap_t cspace,
                             uintptr_t address, uint64_t value = 0,
                             bool writable_payload = false) noexcept -> status_t {
-        const auto status = prepare(pool, vspace, cspace, address, writable_payload);
-        return status == STATUS_OK ? bind(channel, events, value) : status;
+        cspace_ = cspace;
+        writable_payload_ = writable_payload;
+        const auto status = memory_.create(pool, vspace, address);
+        if (status != STATUS_OK)
+            return status;
+        events_ = events;
+        value_ = value;
+        return control_.open(channel, events);
     }
 
     void abort() noexcept {
@@ -734,6 +672,7 @@ class io_server final : private libk::noncopyable_nonmovable {
             queue_->stop();
         peer_event_ = {};
         reply_.reset();
+        reply_to_ = {};
     }
     [[nodiscard]] auto done() const noexcept -> bool {
         if (!closing_ || reply_ || (queue_ && queue_->active() != 0))
@@ -756,7 +695,7 @@ class io_server final : private libk::noncopyable_nonmovable {
     template <class Handler> [[nodiscard]] auto poll(Handler&& application) noexcept -> status_t {
         if (reply_)
             return STATUS_OK;
-        ch_packet packet;
+        msg_packet packet;
         const auto status = control_.receive(packet);
         if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY)
             return STATUS_OK;
@@ -766,41 +705,54 @@ class io_server final : private libk::noncopyable_nonmovable {
     }
 
     template <class Handler>
-    [[nodiscard]] auto accept(ch_packet& packet, Handler&& application) noexcept -> status_t {
+    [[nodiscard]] auto accept(msg_packet& packet, Handler&& application) noexcept -> status_t {
         if (reply_)
             return STATUS_BUSY;
+        if (!packet.count)
+            return STATUS_BAD_ARGS;
         const auto& message = packet.message;
+        reply_to_ = std::move(packet.capabilities[0]);
         reply_.emplace();
-        reply_->message = ch_msg{.operation = message.operation, .id = message.id};
-        if (closing_)
+        reply_->message = msg_frame{.operation = message.operation};
+        const auto admitted = rt_admit(message.deadline);
+        if (admitted != STATUS_OK)
+            reply_->message.status = admitted;
+        else if (closing_)
             reply_->message.status = STATUS_CLOSED;
         else if (message.operation == static_cast<uint64_t>(io_control::Open)) {
-            if (queue_ || packet.count != 1 || message.value != io_queue_depth || message.size != 0)
+            if (queue_ || packet.count != 2 || message.value != io_queue_depth || message.size != 0)
                 reply_->message.status = STATUS_BAD_ARGS;
             else {
+                const auto reject = [&](status_t status) {
+                    reply_->capabilities = {};
+                    reply_->count = 0;
+                    reply_->message.status = status;
+                    closing_ = true;
+                    return STATUS_OK;
+                };
                 memory_.initialize();
                 auto created = memory_.export_pages(cspace_, exports_, writable_payload_);
                 if (created != STATUS_OK)
-                    return created;
+                    return reject(created);
                 for (auto& exported : exports_) {
                     const auto copied = sys::cap_duplicate(exported.selector(), cspace_,
                                                            RIGHT_MAP | RIGHT_DUPLICATE);
                     if (copied.status != STATUS_OK)
-                        return copied.status;
+                        return reject(copied.status);
                     if (!reply_->offer(cap_owner{copied.value}, RIGHT_MAP))
                         return STATUS_INTERNAL;
                 }
                 const auto signal =
                     sys::cap_duplicate(events_, cspace_, RIGHT_SIGNAL | RIGHT_DUPLICATE);
                 if (signal.status != STATUS_OK)
-                    return signal.status;
+                    return reject(signal.status);
                 if (!reply_->offer(cap_owner{signal.value}, RIGHT_SIGNAL))
                     return STATUS_INTERNAL;
-                peer_event_ = std::move(packet.capabilities[0]);
+                peer_event_ = std::move(packet.capabilities[1]);
                 queue_.emplace(std::as_const(memory_).client(), memory_.server());
                 reply_->message.value = value_;
             }
-        } else if (packet.count != 0 || !queue_)
+        } else if (packet.count != 1 || !queue_)
             reply_->message.status = STATUS_BAD_ARGS;
         else if (message.operation == static_cast<uint64_t>(io_control::Cancel)) {
             io_ticket ticket{};
@@ -824,7 +776,7 @@ class io_server final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto failed() const noexcept -> bool { return closing_ && !peer_event_; }
     [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
 
-    [[nodiscard]] auto flush(bool close_ready) noexcept -> status_t {
+    [[nodiscard]] auto flush(bool close_ready, status_t close_status = STATUS_OK) noexcept -> status_t {
         if (queue_) {
             // A visible completion also returns its submission credit, so a
             // client can immediately refill a completed batch.
@@ -852,21 +804,24 @@ class io_server final : private libk::noncopyable_nonmovable {
                     exported = {};
                 }
         }
-        if (!reply_ || (closing_ && (!close_ready || queue_->active() != 0)))
+        if (!reply_ || (closing_ && (!close_ready || (queue_ && queue_->active() != 0))))
             return STATUS_OK;
-        const auto status = control_.send(*reply_);
-        if (status == STATUS_OK)
-            reply_.reset();
-        return status == STATUS_WOULD_BLOCK || status == STATUS_BUSY ? STATUS_OK : status;
+        if (closing_ && close_status != STATUS_OK && reply_->message.status == STATUS_OK)
+            reply_->message.status = close_status;
+        reply_->respond(reply_to_.selector());
+        reply_.reset();
+        reply_to_ = {};
+        return STATUS_OK;
     }
 
   private:
-    ch_port control_;
+    msg_rx control_;
     io_mem memory_;
     std::optional<io_rx> queue_;
     cap_owner peer_event_;
     cap_owner exports_[3];
-    std::optional<ch_reply> reply_;
+    std::optional<msg_reply> reply_;
+    cap_owner reply_to_;
     cap_t events_{}, cspace_{};
     uint64_t value_{};
     bool closing_{};

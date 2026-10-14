@@ -2,6 +2,10 @@
 #include <cap.hpp>
 #include <optional>
 
+inline constexpr auto pr_retryable(status_t s) noexcept -> bool {
+    return s == STATUS_BUSY || s == STATUS_RETRY;
+}
+
 inline constexpr word_t pr_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
     | OBJ_BIT(ObjGroup) | OBJ_BIT(ObjNotification);

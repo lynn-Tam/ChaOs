@@ -9,12 +9,12 @@
 #include <libk/key.hpp>
 #include <type_traits>
 
-namespace ipc { class Endpoint; class Channel; class Notification; }
-namespace irq { class Irq; }
-namespace io { class Host; class Space; }
+namespace ipc { class Channel; class Notification; }
+namespace irq { class Irq; class Ctl; }
+namespace io { class Iommu; class Space; }
 namespace sched { class Sc; class Domain; }
 namespace cap { class CSpace; }
-namespace mm { class Mem; class VSpace; }
+namespace mm { class Mem; class VSpace; class Phys; }
 class Pager;
 class Thread;
 
@@ -34,9 +34,9 @@ template<class... E> struct Catalog {
         return k;
     }();
 };
-using Types = Catalog<Def<io::Space, ObjIoSpace>, Def<irq::Irq, ObjIrq>,
-    Def<io::Host, ObjHost>, Def<mm::VSpace, ObjVSpace>, Def<mm::Mem, ObjMem>,
-    Def<Pager, ObjPager>, Def<cap::CSpace, ObjCSpace>, Def<ipc::Endpoint, ObjEndpoint>,
+using Types = Catalog<Def<io::Space, ObjIoSpace>, Def<irq::Irq, ObjIrq>, Def<irq::Ctl, ObjIrqCtl>,
+    Def<io::Iommu, ObjIommu>, Def<mm::VSpace, ObjVSpace>, Def<mm::Mem, ObjMem>, Def<mm::Phys, ObjPhys>,
+    Def<Pager, ObjPager>, Def<cap::CSpace, ObjCSpace>,
     Def<ipc::Channel, ObjChannel>, Def<ipc::Notification, ObjNotification>,
     Def<sched::Domain, ObjDomain>, Def<sched::Sc, ObjSc>, Def<Thread, ObjThread>, Def<group, ObjGroup>>;
 using Objects = Types::objects;

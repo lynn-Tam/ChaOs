@@ -35,10 +35,10 @@ struct PtRemoved {
 };
 
 // Caller serializes tree changes. Hardware may concurrently update leaf A/D.
-// User roots borrow the kernel's permanent upper branches; DMA roots borrow none.
+// User roots borrow the kernel's permanent upper branches.
 class PageTable {
   public:
-    enum class Kind : u8 { Kernel, User, Io };
+    enum class Kind : u8 { Kernel, User };
     PageTable(const PageTable &) = delete;
     auto operator=(const PageTable &) -> PageTable & = delete;
     PageTable(PageTable &&) noexcept;
@@ -102,25 +102,6 @@ class PageTable {
         if (!first || !pages.valid()) return std::unexpected(PtErr::BadAddr);
         usize i{};
         return map(*first, pages.page_count(), [&] { return *pages.base().checked_add(i++); }, perms);
-    }
-
-    static auto dma_pages(usize first, usize count) noexcept -> std::expected<usize, PtErr>;
-    template <class Source>
-    static auto dma(mm::Pmm &pmm, usize first, usize n, Source next, bool writable) noexcept
-        -> std::expected<PageTable, PtErr> {
-        auto pages = dma_pages(first, n);
-        if (!pages) return std::unexpected(pages.error());
-        auto root = create(pmm, Kind::Io);
-        if (!root) return root;
-        auto va = mm::VPage::from_base(mm::va_t{first});
-        auto added = root->map(*va, n, std::move(next), writable ? PtPerm::UserRw : PtPerm::UserRo);
-        if (!added) return std::unexpected(added.error());
-        return root;
-    }
-    static auto dma(mm::Pmm &pmm, usize first, std::span<const mm::Page> pages, bool writable) noexcept
-        -> std::expected<PageTable, PtErr> {
-        usize i{};
-        return dma(pmm, first, pages.size(), [&]() noexcept { return pages[i++]; }, writable);
     }
 
   private:

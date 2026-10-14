@@ -1,6 +1,9 @@
+#include <protocols/msg.hpp>
 #include <test/user/task.hpp>
 #include <exec.hpp>
 #include <protocols/file.hpp>
+#include <protocols/block.hpp>
+#include <protocols/service.hpp>
 #include <protocols/stream.hpp>
 #include <util.hpp>
 #include <vector>
@@ -13,27 +16,43 @@ int main() {
     };
 
     const auto notification = sys::notification_create(info.pool, 1);
-    if (notification.status != STATUS_OK) sys::exit(notification.status);
+    if (notification.status != STATUS_OK)
+        sys::exit(notification.status);
     cap_owner events{notification.value};
-    ch_rpc files;
-    if(const auto rc=files.open(info.selector(fs_service),info.pool,info.cspace,events.selector());rc!=STATUS_OK) sys::exit(rc);
-    auto mem=fl_map(files,"sleep.elf",VM_READ|VM_EXECUTE);
+    rpc_client directory;
+    if (const auto rc =
+            directory.open(info.selector(sv_service), info.pool, info.cspace, info.events);
+        rc != STATUS_OK)
+        sys::exit(rc);
+    auto endpoint = sv_lookup(directory, vfs_exec);
+    if (!endpoint)
+        sys::exit(endpoint.error());
+    const auto ungranted = sv_lookup(directory, blk_service);
+    check(!ungranted && ungranted.error() == STATUS_NOT_FOUND);
+    auto wrong = vfs_exec;
+    ++wrong.major;
+    const auto mismatch = sv_lookup(directory, wrong);
+    check(!mismatch && mismatch.error() == STATUS_NOT_FOUND);
+    rpc_client files;
+    if (const auto rc = files.open(endpoint->selector(), info.pool, info.cspace, events.selector());
+        rc != STATUS_OK)
+        sys::exit(rc);
+    auto mem = fl_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
     check(mem.has_value());
     test_image image;
-    if (const auto rc = image.open(info.vspace, mem->memory.selector(),
-                                 {0, pr_window::round_size(mem->size)}, mem->size,
-                                 VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
+    if (const auto rc =
+            image.open(info.vspace, mem->memory.selector(), mem->size, VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;
     tasks.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
     const auto spawn = [&](const char* ms) {
         const std::string_view args[]{"sleep", ms};
-        const auto child = tasks.spawn(image, {},
-                                       {.argv = args,
-                                        .resources = {.bytes = 1024 * 1024, .caps = 64},
-                                        .events = info.events});
-        if (child.status != STATUS_OK) sys::exit(child.status);
+        const auto child = tasks.spawn(
+            image, {},
+            {.argv = args, .resources = {.bytes = 1024 * 1024, .caps = 64}, .events = info.events});
+        if (child.status != STATUS_OK)
+            sys::exit(child.status);
         return child.id;
     };
     const auto wait = [&](test_id id, uint64_t deadline = 0) {
@@ -44,7 +63,8 @@ int main() {
             if (result.status != STATUS_WOULD_BLOCK && !pr_retryable(result.status))
                 return result.status;
             const auto now = sys::clock_now();
-            if (now.status != STATUS_OK) sys::exit(now.status);
+            if (now.status != STATUS_OK)
+                sys::exit(now.status);
             if (deadline && now.value >= deadline)
                 return STATUS_TIMED_OUT;
             sys::yield();

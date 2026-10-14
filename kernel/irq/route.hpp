@@ -18,8 +18,10 @@ struct Line final {
 // reset drains dispatch before returning; handlers cannot reenter Routes.
 class Route final : private libk::noncopyable_nonmovable {
 public:
+    using Stop = libk::delegate<void() noexcept>;
     using Handler = libk::delegate<bool() noexcept>;
-    Route(Line line, Handler handler) noexcept : line_(line), handler_(handler) {}
+    Route(Line line, Handler handler, Stop stop = {}) noexcept
+        : line_(line), handler_(handler), stop_(stop) {}
     ~Route() noexcept { reset(); }
     [[nodiscard]] auto connect() noexcept -> bool;
     void reset() noexcept;
@@ -31,6 +33,7 @@ private:
     void arm_locked(bool armed) noexcept;
     Line line_;
     Handler handler_;
+    Stop stop_;
     libk::intrusive_list_hook hook_{};
     bool armed_{};
 };
@@ -48,12 +51,15 @@ public:
     void dispatch(Take take, End end = {}) noexcept;
     using Setup = libk::delegate<void() noexcept>;
     void refresh(Setup setup = {}) noexcept;
+    void close() noexcept;
 private:
     friend class Route;
     friend class Irq;
-    void set(u32 id, bool enabled) noexcept { if (enable_) enable_(id, enabled); }
+    friend class Ctl;
+    void set(u32 id, bool enabled) noexcept { if (!closed_ && enable_) enable_(id, enabled); }
     mutable sync::Spin lock_{};
     Enable enable_{};
+    bool closed_{};
     libk::intrusive_list<Route, &Route::hook_> routes_{};
 };
 

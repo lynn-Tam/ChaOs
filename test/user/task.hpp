@@ -1,11 +1,11 @@
 #pragma once
 
 #include <servers/fw.hpp>
-#include <servers/virtio_blk.hpp>
 
 #include <exec.hpp>
 #include <libk/cpio.hpp>
 #include <libk/elf.hpp>
+#include <libk/checked_arithmetic.hpp>
 #include <ipc.hpp>
 #include <deque>
 #include <memory>
@@ -15,10 +15,10 @@ struct test_image {
     std::span<const std::byte> bytes;
     cap_t memory{};
     word_t perms{};
-    auto open(cap_t vm, cap_t mem, pr_window, size_t size, word_t access = VM_READ) -> status_t {
+    auto open(cap_t vm, cap_t mem, size_t size, word_t access = VM_READ) -> status_t {
         memory = mem;
         perms = access;
-        auto status = mapping.open(vm, 0, pr_window::round_size(size), VM_READ);
+        auto status = mapping.open(vm, 0, libk::checked_align_up(size, 4096).value_or(0), VM_READ);
         if (status == STATUS_OK)
             status = mapping.attach(mem, 0, mapping.size, VM_READ);
         if (status == STATUS_OK)
@@ -100,21 +100,12 @@ inline void open(test_image& image, const rt_env& info) {
     const auto* binding = info.find(rt_image);
     const auto cap = binding ? binding->cap : fw_root(info).bundle;
     const auto size = binding ? binding->bytes : fw_root(info).bundle_bytes;
-    if (const auto rc = image.open(info.vspace, cap, {0, pr_window::round_size(size)}, size);
+    if (const auto rc = image.open(info.vspace, cap, size);
         rc != STATUS_OK)
         sys::exit(rc);
 }
 inline auto input(rt_req contract, cap_t cap, word_t rights, word_t badge = 0) -> pr_cap {
     return {.contract = contract, .cap = cap, .limit = rights, .badge = badge};
-}
-inline auto host(cap_t cap, word_t rid) -> pr_cap {
-    return {.contract = io_host,
-            .cap = cap,
-            .limit = CapView{.version = CAP_ATTENUATION_VERSION_CURRENT,
-                             .kind = ObjHost,
-                             .size = CAP_ATTENUATION_SIZE,
-                             .rights = RIGHT_CONNECT,
-                             .words = {rid, 1}}};
 }
 auto start(test_tasks& tasks, test_image& image, std::string_view name, pr_opts opts = {})
     -> test_id {
@@ -137,10 +128,6 @@ auto stop(test_tasks& tasks, test_id id) -> status_t {
     const auto s = tasks.request_stop(id);
     return s == STATUS_OK ? wait(tasks, id) : s;
 }
-inline constexpr pr_quota io_quota{.bytes = 8 * 1024 * 1024,
-                                   .caps = 256,
-                                   .kinds =
-                                       pr_base_kinds | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjChannel)};
 inline constexpr pr_quota files_quota{.bytes = 16 * 1024 * 1024,
                                       .caps = 1024,
                                       .kinds =

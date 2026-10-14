@@ -48,15 +48,6 @@ constexpr Rights notification_rights = Rights::of(
     Right::Destroy,
     Right::Revoke);
 
-constexpr Rights endpoint_rights = Rights::of(
-    Right::Duplicate,
-    Right::Delegate,
-    Right::Inspect,
-    Right::Call,
-    Right::Close,
-    Right::Destroy,
-    Right::Revoke);
-
 constexpr Rights channel_rights = Rights::of(
     Right::Duplicate,
     Right::Delegate,
@@ -97,11 +88,6 @@ constexpr Rights irq_rights = Rights::of(
     return (limit.object_kinds & ~valid_kinds) == 0;
 }
 
-[[nodiscard]] static auto valid(EpLimit limit) noexcept -> bool {
-    return (limit.badge & ~limit.fixed) == 0
-        && limit.cap_limit <= ENDPOINT_MAX_CAPS;
-}
-
 [[nodiscard]] static auto valid(ChanLimit limit) noexcept -> bool {
     const bool side = limit.side == ChannelSide::A
         || limit.side == ChannelSide::B
@@ -116,10 +102,13 @@ constexpr Rights irq_rights = Rights::of(
     return limit.source != 0;
 }
 
-static auto valid(HostLimit p) noexcept -> bool {
-    return p.count && p.first < 65536 && p.count <= 65536 - p.first;
+static auto valid(PhysLimit p) noexcept -> bool { return p.range.valid(); }
+static auto contains(PhysLimit a, PhysLimit b) noexcept -> bool { return a.range.contains(b.range); }
+
+static auto valid(IndexLimit p) noexcept -> bool {
+    return p.count && p.count <= SIZE_MAX - p.first;
 }
-static auto contains(HostLimit a, HostLimit b) noexcept -> bool {
+static auto contains(IndexLimit a, IndexLimit b) noexcept -> bool {
     return b.first >= a.first && b.first - a.first < a.count
         && b.count <= a.count - (b.first - a.first);
 }
@@ -140,10 +129,6 @@ static auto contains(Quota a, Quota b) noexcept -> bool {
 }
 static auto contains(Badge a, Badge b) noexcept -> bool { return a == b; }
 static auto contains(IrqRoute a, IrqRoute b) noexcept -> bool { return a == b; }
-static auto contains(EpLimit a, EpLimit b) noexcept -> bool {
-    return (b.fixed & a.fixed) == a.fixed && (b.badge & a.fixed) == a.badge
-        && b.cap_limit <= a.cap_limit;
-}
 static auto contains(ChanLimit a, ChanLimit b) noexcept -> bool {
     const bool root = a.side == ChannelSide::Any && a.unbound();
     return (root || a.side == b.side) && (!a.unbound() || b.unbound())
@@ -154,12 +139,18 @@ static auto contains(ChanLimit a, ChanLimit b) noexcept -> bool {
 template<class F, class R>
 static auto select(ObjKind kind, F fn, R missing) noexcept -> R {
     switch (kind) {
+    case ObjPhys:
+        return fn.template operator()<PhysLimit>(Rights::of(
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Control, Right::Revoke));
     case ObjIoSpace:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Close, Right::Revoke));
-    case ObjHost:
-        return fn.template operator()<HostLimit>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Connect, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Map, Right::Unmap, Right::Observe, Right::Close, Right::Destroy, Right::Revoke));
+    case ObjIrqCtl:
+        return fn.template operator()<IndexLimit>(Rights::of(
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Revoke));
+    case ObjIommu:
+        return fn.template operator()<IndexLimit>(Rights::of(
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Revoke));
     case ObjThread:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Observe, Right::Revoke));
@@ -176,7 +167,6 @@ static auto select(ObjKind kind, F fn, R missing) noexcept -> R {
     case ObjVSpace: return fn.template operator()<VmLimit>(vspace_rights);
     case ObjGroup: return fn.template operator()<Quota>(resource_rights);
     case ObjNotification: return fn.template operator()<Badge>(notification_rights);
-    case ObjEndpoint: return fn.template operator()<EpLimit>(endpoint_rights);
     case ObjChannel: return fn.template operator()<ChanLimit>(channel_rights);
     case ObjPager: return fn.template operator()<std::monostate>(pager_rights);
     case ObjIrq: return fn.template operator()<IrqRoute>(irq_rights);
@@ -328,8 +318,15 @@ auto make_attenuation_ceiling(
         }
         return (View{child_rights, std::monostate{}});
 
-    case ObjHost: {
-        const HostLimit limit{descriptor.words[0], descriptor.words[1]};
+    case ObjPhys: {
+        const PhysLimit limit{{mm::Page{descriptor.words[0]}, descriptor.words[1]}};
+        if (!words_zero(descriptor, 2) || !valid(limit))
+            return std::unexpected(AttenuationError::InvalidRange);
+        return View{child_rights, limit};
+    }
+    case ObjIrqCtl:
+    case ObjIommu: {
+        const IndexLimit limit{descriptor.words[0], descriptor.words[1]};
         if (!words_zero(descriptor, 2) || !valid(limit))
             return std::unexpected(AttenuationError::InvalidRange);
         return View{child_rights, limit};
@@ -412,23 +409,6 @@ auto make_attenuation_ceiling(
                   std::unexpected(AttenuationError::InvalidData)}
             : std::expected<View, AttenuationError>{(
                   View{child_rights, *upper})};
-    }
-
-    case ObjEndpoint: {
-        if (!words_zero(descriptor, 3)
-            || (descriptor.words[0] & ~descriptor.words[1]) != 0
-            || descriptor.words[2] > ENDPOINT_MAX_CAPS) {
-            return std::unexpected(AttenuationError::InvalidData);
-        }
-        const auto cap_limit = usize_value(descriptor.words[2]);
-        if (!cap_limit) {
-            return std::unexpected(AttenuationError::InvalidData);
-        }
-        return (View{
-            child_rights,
-            EpLimit{
-                descriptor.words[0], descriptor.words[1],
-                *cap_limit}});
     }
 
     case ObjChannel: {

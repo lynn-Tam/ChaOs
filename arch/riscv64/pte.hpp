@@ -20,6 +20,7 @@ enum class PtPerm : u8 { Ro = 1, Rw = 3, Rx = 5, UserRo = 9, UserRw = 11, UserRx
 // Sv39 encoding takes physical page numbers; no allocator ownership or address policy.
 class Pte {
 public:
+    static constexpr usize PhysicalPages = usize{1} << 44;
     constexpr Pte() noexcept = default;
     static constexpr auto from_raw(u64 bits) noexcept -> Pte { return Pte{bits}; }
     static constexpr auto non_leaf(usize page) noexcept -> std::optional<Pte> {
@@ -89,12 +90,12 @@ public:
 private:
     explicit constexpr Pte(u64 bits) noexcept : bits_(bits) {}
     static constexpr auto encode(usize page) noexcept -> std::optional<u64> {
-        return page <= ((u64{1} << 44) - 1)
+        return page <= (PhysicalPages - 1)
                    ? std::optional{u64(page) << 10}
                    : std::nullopt;
     }
     static constexpr u64 Valid = 1, Rwx = 14, Perm = 30, Global = 32, Accessed = 64, Dirty = 128,
-                         Used = 192, Rsw = 768, Ppn = ((u64{1} << 44) - 1) << 10;
+                         Used = 192, Rsw = 768, Ppn = (PhysicalPages - 1) << 10;
     u64 bits_{};
 };
 static_assert(sizeof(Pte) * Ptes == 4096);

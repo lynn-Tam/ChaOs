@@ -79,12 +79,7 @@ public:
         DispatchReason reason,
         status_t exit_status) noexcept;
     void on_timer() noexcept;
-    void on_trap_exit() noexcept;
-    // Re-publishes the current Thread's derived effective stack and roots
-    // after an Activation push/pop. It does not change target or SC ownership.
-    void refresh() noexcept;
-    void disable_preemption() noexcept;
-    void enable_preemption() noexcept;
+    void resched() noexcept;
 
 private:
     friend class Sc;
@@ -140,7 +135,6 @@ private:
     u64 run_until_{std::numeric_limits<u64>::max()};
     std::optional<DispatchReason> pending_{};
     status_t pending_exit_status_{STATUS_OK};
-    usize preempt_depth_{};
     Thread* handoff_outgoing_{};
     DispatchReason handoff_reason_{DispatchReason::Exit};
     status_t handoff_exit_status_{STATUS_OK};

@@ -121,53 +121,6 @@ bool test_notification_badge_is_immutable_authority(
         && changed.error() == cap::PolicyError::Amplification;
 }
 
-bool test_endpoint_authority_narrows_badge_and_limits(
-    const TestContext&) noexcept {
-    using cap::View;
-    using cap::EpLimit;
-    using cap::View;
-    using cap::PolicyError;
-    using cap::Right;
-    using cap::Rights;
-
-    const auto rights = Rights::of(
-        Right::Delegate, Right::Call, Right::Inspect);
-    const EpLimit root{
-        .badge = 0,
-        .fixed = 0,
-        .cap_limit = ENDPOINT_MAX_CAPS,
-    };
-    const EpLimit caller{
-        .badge = 0x42,
-        .fixed = ~u64{},
-        .cap_limit = 2,
-    };
-    const auto narrowed = cap::compose(
-        ObjEndpoint,
-        View{rights, root},
-        View{rights, caller});
-    const auto widened_caps = cap::compose(
-        ObjEndpoint,
-        View{rights, caller},
-        View{rights, EpLimit{
-            .badge = 0x42,
-            .fixed = ~u64{},
-            .cap_limit = 3,
-        }});
-    const auto changed_badge = cap::compose(
-        ObjEndpoint,
-        View{rights, caller},
-        View{rights, EpLimit{
-            .badge = 0x43,
-            .fixed = ~u64{},
-            .cap_limit = 2,
-        }});
-    return narrowed
-        && std::get<EpLimit>(narrowed.value().data).callable()
-        && !widened_caps && widened_caps.error() == PolicyError::Amplification
-        && !changed_badge && changed_badge.error() == PolicyError::Amplification;
-}
-
 bool test_channel_root_cannot_fix_badge_generically(
     const TestContext&) noexcept {
     using cap::View;
@@ -297,15 +250,14 @@ static bool test_exit_notification_is_read_only(const TestContext &) noexcept {
     ipc::Notification notification{};
     Exit first{}, second{};
     if (!first.observe(notification, 0x80) || first.observe(notification, 0x40) ||
-        !second.claim(Exit::Reason::Normal, STATUS_OK) ||
+        !second.claim(STATUS_OK) ||
         !second.observe(notification, 0x40) ||
-        !first.claim(Exit::Reason::Stop, STATUS_CANCELED, 7))
+        !first.claim(STATUS_CANCELED))
         return false;
     const auto event = notification.take();
     const auto result = first.read();
-    return event && event.value().badges == 0xc0 && result.reason == Exit::Reason::Stop &&
-           result.status == STATUS_CANCELED && result.detail == 7 &&
-           !first.claim(Exit::Reason::Fault, STATUS_INTERNAL) && first.published();
+    return event && event.value().badges == 0xc0 && result == STATUS_CANCELED &&
+           !first.claim(STATUS_INTERNAL) && first.published();
 }
 
 void register_ipc_tests(TestRegistry& registry) noexcept {
@@ -330,10 +282,6 @@ void register_ipc_tests(TestRegistry& registry) noexcept {
         "ipc",
         "Notification authority cannot rewrite its fixed badge",
         test_notification_badge_is_immutable_authority);
-    (void)registry.add(
-        "ipc",
-        "Endpoint authority fixes caller badge and only narrows admission",
-        test_endpoint_authority_narrows_badge_and_limits);
     (void)registry.add(
         "ipc",
         "Channel side root cannot generically choose a sender badge",

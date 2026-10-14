@@ -4,8 +4,43 @@
 #include <ipc/notification_source.hpp>
 #include <expected>
 #include <object/ref.hpp>
+#include <mm/phys.hpp>
+#include <mm/kspace.hpp>
+#include <work.hpp>
+#include <uapi/irq.h>
+
+class Cpus;
 
 namespace irq {
+
+class Ctl final : private libk::noncopyable_nonmovable {
+    friend class ::Cpus;
+public:
+    Ctl(mm::KSpace&, Cpus&, WorkQueue&, mm::Phys::Lease&&, IrqConfig) noexcept;
+    ~Ctl() noexcept;
+    auto open() noexcept -> status_t;
+    auto line(u32) noexcept -> std::expected<Line, status_t>;
+    void retire(object::cleanup&&) noexcept;
+private:
+    void dispatch() noexcept;
+    void set(u32, bool) noexcept;
+    auto take() noexcept -> u32;
+    auto word(usize offset) const noexcept -> volatile u32*;
+    void progress() noexcept;
+    mm::KSpace& vm_;
+    Cpus& cpus_;
+    WorkQueue& work_;
+    mm::Phys::Lease claim_;
+    IrqConfig config_;
+    mm::KMap mapping_;
+    Routes routes_;
+    std::optional<mm::Flush> flush_;
+    object::cleanup cleanup_;
+    Work job_;
+    Ctl* next_{};
+    bool open_{};
+};
+
 
 enum class Error : u8 { InvalidState, Busy, StaleSequence, BadSequence, Closed };
 struct Delivery final {
@@ -18,7 +53,7 @@ struct Delivery final {
 
 class Irq final : private libk::noncopyable_nonmovable {
 public:
-    explicit Irq(Line line) noexcept;
+    explicit Irq(Line line, object::ref<Ctl> owner = {}) noexcept;
     ~Irq() noexcept;
     [[nodiscard]] auto source() const noexcept -> Line { return route_.line_; }
     [[nodiscard]] auto bound() const noexcept -> bool;
@@ -32,6 +67,8 @@ public:
     void retire(object::cleanup&& cleanup) noexcept;
 private:
     [[nodiscard]] auto publish() noexcept -> bool;
+    void controller_closed() noexcept;
+    object::ref<Ctl> owner_;
     Route route_;
     ipc::NotificationSource notice_{};
     u64 generation_{};

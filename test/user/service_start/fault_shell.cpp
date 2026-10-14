@@ -1,32 +1,42 @@
+#include <libk/checked_arithmetic.hpp>
 #include <test/user/task.hpp>
 #include <util.hpp>
 #include <exec.hpp>
-#include <ipc.hpp>
+#include <protocols/msg.hpp>
 #include <protocols/file.hpp>
+#include <protocols/service.hpp>
 #include <protocols/stream.hpp>
 
 int main() {
 
     const auto& info = rt_startup();
-    ch_rpc files;
-    if (const auto rc = files.open(info.selector(fs_service), info.pool, info.cspace, info.events);
+    rpc_client directory;
+    if (const auto rc =
+            directory.open(info.selector(sv_service), info.pool, info.cspace, info.events);
         rc != STATUS_OK)
         sys::exit(rc);
-    auto note = fl_map(files, "README.TXT");
+    auto endpoint = sv_lookup(directory, vfs_exec);
+    if (!endpoint)
+        sys::exit(endpoint.error());
+    rpc_client files;
+    if (const auto rc = files.open(endpoint->selector(), info.pool, info.cspace, info.events);
+        rc != STATUS_OK)
+        sys::exit(rc);
+    auto note = fl_map(files, "/boot/README.TXT");
     if (!note || !note->size)
         sys::exit(STATUS_INTERNAL);
     auto text = vm_area::map(info.vspace, std::move(note->memory), 0,
-                             pr_window::round_size(note->size), VM_READ);
+                             libk::checked_align_up(note->size, 4096).value_or(0), VM_READ);
     if (!text)
         sys::exit(text.error());
     const auto* bytes = reinterpret_cast<volatile const uint8_t*>(text->address);
     for (size_t i = 0; i < note->size; ++i)
         (void) bytes[i];
-    auto source = fl_map(files, "sleep.elf", VM_READ | VM_EXECUTE);
+    auto source = fl_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
     if (!source)
         sys::exit(source.error());
     test_image image;
-    if (const auto rc = image.open(info.vspace, source->memory.selector(), {}, source->size);
+    if (const auto rc = image.open(info.vspace, source->memory.selector(), source->size);
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;

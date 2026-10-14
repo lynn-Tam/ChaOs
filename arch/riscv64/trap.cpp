@@ -14,8 +14,8 @@ namespace arch {
 void TrapCtx::complete_breakpoint() noexcept {
     // Supervisor-only: the executed parcel is mapped; user breakpoints are faults.
     u16 first{};
-    memcpy(&first, reinterpret_cast<const void*>(frame_->sepc), sizeof(first));
-    frame_->sepc += instruction_size(first);
+    memcpy(&first, reinterpret_cast<const void*>(frame_.sepc), sizeof(first));
+    frame_.sepc += instruction_size(first);
 }
 
 bool valid_user_start(UserStart s) noexcept {
@@ -24,28 +24,15 @@ bool valid_user_start(UserStart s) noexcept {
         && (s.stack & 15) == 0;
 }
 
-bool TrapCtx::load_user_start(const UserStart& s) noexcept {
-    if (!valid_user_start(s)) return false;
-    *frame_ = {};
-    frame_->sepc = s.entry;
-    frame_->gpr[1] = s.stack;
-    std::copy(s.arguments.begin(), s.arguments.end(), frame_->gpr.begin() + 9);
-    // User input never supplies supervisor status bits.
-    frame_->sstatus = csr::Sstatus::SPIE;
-    return true;
-}
-
-std::optional<TrapFrame*> prepare_user_frame(usize top, UserStart start) noexcept {
-    if (top < sizeof(TrapFrame) || (top & 15) != 0 || !valid_user_start(start)) return {};
-    auto* f = std::construct_at(reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame)));
-    [[maybe_unused]] bool loaded = TrapCtx{*f}.load_user_start(start);
-    libk_assert(loaded);
-    return f;
-}
-
 std::optional<usize> prepare_user_stack(usize top, UserStart start) noexcept {
-    auto f = prepare_user_frame(top, start);
-    return f ? std::optional{reinterpret_cast<usize>(*f)} : std::nullopt;
+    if (top < sizeof(TrapFrame) || (top & 15) != 0 || !valid_user_start(start)) return {};
+    auto* frame = std::construct_at(reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame)));
+    frame->sepc = start.entry;
+    frame->gpr[1] = start.stack;
+    std::copy(start.arguments.begin(), start.arguments.end(), frame->gpr.begin() + 9);
+    // User input never supplies supervisor status bits.
+    frame->sstatus = csr::Sstatus::SPIE;
+    return reinterpret_cast<usize>(frame);
 }
 
 [[noreturn]] void resume_user(usize top) noexcept {

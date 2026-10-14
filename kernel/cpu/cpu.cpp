@@ -26,8 +26,13 @@
 #endif
         console::print<"runtime: entered\n">();
     }
-    sched::yield();
-    for (;;) arch::wait_for_interrupt();
+    for (;;) {
+        sync::Irq interrupts;
+        cpu.dispatcher().resched();
+        // WFI wakes for a locally enabled interrupt even with global IRQs masked.
+        // Keep the ready check and sleep indivisible; restore delivers the trap.
+        arch::wait_for_interrupt();
+    }
 }
 
 
@@ -85,7 +90,7 @@ auto Cpu::prepare(mm::KSpace& vm, time::Clock& clock, mm::Stack* boot_stack) noe
 
 auto Cpu::enter() noexcept -> usize {
     libk_assert(current == &idle() && idle().state() == Thread::State::Running);
-    libk_assert(entry.stack == idle().home_stack_top() && !online());
+    libk_assert(entry.stack == idle().stack_top() && !online());
     // Pair with request_stop: a late entrant must observe the stop, or the
     // requester must observe online and send an IPI.
     online_.store(true, std::memory_order_seq_cst);
@@ -123,7 +128,7 @@ void Cpu::install(usize hart) noexcept {
     arch::install(entry);
     libk_assert(arch::local() == &entry && arch::install_trap());
     idle().env().kernel_vspace()->root().adopt(*this);
-    if (ext_irq) arch::enable_ext_irq();
+    arch::enable_ext_irq();
 }
 
 void Cpus::start() noexcept {

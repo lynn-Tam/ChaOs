@@ -1,10 +1,15 @@
 #pragma once
+#include <protocols/msg.hpp>
 
 #include <expected>
 
 #include <third_party/littlefs/lfs.h>
 #include <protocols/file.hpp>
-#include <servers/read.hpp>
+// One aligned device read and the file bytes within it.
+struct io_extent final {
+    uint64_t offset{};
+    size_t size{}, skip{}, bytes{};
+};
 
 // Store-private littlefs extension; the caller pins mutation through I/O.
 // One execution owns this queue. Requests retain independent payload slots
@@ -19,8 +24,7 @@ class blk_client final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] auto submit(io_cmd& request, void* data = nullptr) noexcept -> status_t {
         const auto op = static_cast<io_operation>(request.operation);
-        if (request.object || request.buffer || request.flags ||
-            (request.length && !data && op != io_operation::Read))
+        if (request.flags || (request.length && !data && op != io_operation::Read))
             return STATUS_BAD_ARGS;
         if (op == io_operation::Flush) {
             if (request.offset || request.length)
@@ -45,7 +49,7 @@ class blk_client final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto cancel(uint64_t id) noexcept -> status_t {
         if (session_.requests().error())
             return session_.requests().error();
-        ch_msg request{.operation = static_cast<uint64_t>(io_control::Cancel), .value = id};
+        msg_frame request{.operation = static_cast<uint64_t>(io_control::Cancel), .value = id};
         return session_.exchange(request);
     }
     // Retire a specific dependency without consuming unrelated completions.

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <limits>
 #include <mm/pmm.hpp>
+#include <mm/phys.hpp>
 #include <optional>
 #include <sync.hpp>
 #include <utility>
@@ -371,7 +372,7 @@ class Extents {
     Extents(const Extents&) = delete;
     Extents(Extents&&) noexcept;
     ~Extents() noexcept;
-    auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&) noexcept
+    auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&, Phys::Lease&&) noexcept
         -> std::expected<void, MemErr>;
     auto query(usize) const noexcept -> ContentState;
     auto materialize(usize) const noexcept -> std::expected<Frame, MemErr>;
@@ -381,9 +382,10 @@ class Extents {
     Slab<Row, false> rows_;
     Row* head_{};
     PageGroup owned_{};
+    Phys::Lease external_;
 };
 
-struct PhysCfg { std::span<const Extent> extents; PageGroup owned; };
+struct PhysCfg { std::span<const Extent> extents; PageGroup owned; Phys::Lease external{}; };
 struct PagedCfg { object::ref<> pager; Perms perms; bool priv{}; };
 
 class Mem final : private libk::noncopyable_nonmovable {

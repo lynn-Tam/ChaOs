@@ -14,7 +14,6 @@
 #include <sched/domain.hpp>
 #include <sync.hpp>
 #include <libk/checked_arithmetic.hpp>
-#include <libk/scope_guard.hpp>
 #include <limits>
 #include <task/thread.hpp>
 #include <wait.hpp>
@@ -105,7 +104,7 @@ void Dispatcher::publish(Thread* target) noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(Cpu::local() == &cpu_);
     libk_assert(target);
-    const usize stack_top = target->current_stack_top();
+    const usize stack_top = target->stack_top();
     libk_assert(stack_top != 0 && (stack_top & 0xfU) == 0);
 
     Env& roots = target->env();
@@ -131,7 +130,7 @@ void Dispatcher::on_context_enter() noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(cpu_.current);
     libk_assert(cpu_.entry.stack
-        == cpu_.current->current_stack_top());
+        == cpu_.current->stack_top());
     Env& roots = cpu_.current->env();
     libk_assert(cpu_.tlb
         == &roots.root().state());
@@ -140,17 +139,6 @@ void Dispatcher::on_context_enter() noexcept {
         arch::enable_ipi();
     }
     arch::enable_interrupts();
-}
-
-void Dispatcher::refresh() noexcept {
-    libk_assert(!arch::interrupts_enabled());
-    // Endpoint frames change synchronously in the trap handler (depth 1) or
-    // while an asynchronous terminal cause is committed by the common
-    // trap-exit hook (depth 0). Both are owner-CPU, interrupts-off points
-    // before the selected user frame is restored.
-    libk_assert(arch::local()->depth <= 1);
-    libk_assert(cpu_.current);
-    publish(cpu_.current);
 }
 
 auto Dispatcher::make_ready(Sc& sc) noexcept -> bool {
@@ -299,7 +287,7 @@ void Dispatcher::request_stop(Thread& entity) noexcept {
         sync::Irq irq{};
         // A target may finish its ordinary exit after the stop owner publishes
         // the terminal transaction but before this owner-CPU call is entered.
-        // The queued Stop has already been completed by finish_stop() then.
+        // The queued Stop has already been completed by terminal cleanup then.
         if (target->stopped()) {
             return;
         }
@@ -387,10 +375,8 @@ void Dispatcher::enqueue_or_throttle(
 }
 
 void Dispatcher::expire(u64 now) noexcept {
-    // Completion callbacks may wake this CPU. Commit only after all due
-    // events are published, never recursively from a callback's guard.
-    ++preempt_depth_;
-    const auto done = libk::on_scope_exit([this]() noexcept { --preempt_depth_; });
+    // Completion only requests a wake; dispatch remains at the outer boundary.
+    libk_assert(!arch::interrupts_enabled());
     for (;;) {
         Deadline* const deadline = deadlines_.minimum();
         if (!deadline || deadline->when_ > now) return;
@@ -464,39 +450,21 @@ void Dispatcher::on_timer() noexcept {
     request_reschedule(DispatchReason::Timer);
 }
 
-void Dispatcher::on_trap_exit() noexcept {
+void Dispatcher::resched() noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(arch::local()->depth == 0);
-    if (cpu_.current->stop_ready()) {
-        request_reschedule(DispatchReason::Stop);
-    }
-    if (!pending_ || preempt_depth_ != 0
-        || ((*pending_ == DispatchReason::Stop || *pending_ == DispatchReason::Exit)
-            && cpu_.current->in_kernel_)) {
-        return;
-    }
-    const DispatchReason reason = *pending_;
-    const status_t exit_status = pending_exit_status_;
-    pending_.reset();
-    if (reason == DispatchReason::Block) {
-        block_current();
-        return;
-    }
-    dispatch(reason, clock_->rd_ticks(), exit_status);
-}
-
-void Dispatcher::disable_preemption() noexcept {
-    libk_assert(!arch::interrupts_enabled());
-    ++preempt_depth_;
-    libk_assert(preempt_depth_ != 0);
-}
-
-void Dispatcher::enable_preemption() noexcept {
-    libk_assert(!arch::interrupts_enabled());
-    libk_assert(preempt_depth_ != 0);
-    --preempt_depth_;
-    if (preempt_depth_ == 0 && pending_ && arch::local()->depth == 0) {
-        on_trap_exit();
+    // post_switch may finish an exit and publish another local wake after
+    // selecting idle. Consume that intent before returning to the caller.
+    for (;;) {
+        if (cpu_.current->stop_ready()) request_reschedule(DispatchReason::Stop);
+        if (!pending_ ||
+            ((*pending_ == DispatchReason::Stop || *pending_ == DispatchReason::Exit)
+                && cpu_.current->in_kernel_)) return;
+        const auto reason = *pending_;
+        const auto status = pending_exit_status_;
+        pending_.reset();
+        if (reason == DispatchReason::Block) block_current();
+        else dispatch(reason, clock_->rd_ticks(), status);
     }
 }
 
@@ -603,6 +571,8 @@ void Dispatcher::commit(
         libk_assert(end);
         run_until_ = *end;
     }
+    // Check while current and stack bounds still describe the executing thread.
+    sync::assert_unlocked();
     publish(incoming);
     set_timer(now);
     record_dispatch(outgoing, incoming, reason, now);
@@ -618,7 +588,6 @@ void Dispatcher::commit(
     handoff_outgoing_ = outgoing;
     handoff_reason_ = reason;
     handoff_exit_status_ = exit_status;
-    sync::assert_unlocked();
     arch::switch_ctx(
         outgoing->ctx(), incoming->ctx());
     post_switch();
@@ -672,7 +641,7 @@ auto Dispatcher::stop(Thread* target) noexcept
     libk_assert(target->owned_by(*this));
     Thread& exec = *target;
 
-    auto& wait = target->current_wait();
+    auto& wait = target->wait();
     if (wait.attached()) {
         if (!wait.cancel()) return StopDisposition::Deferred;
         if (exec.state_ == Thread::State::Blocked) {
@@ -682,7 +651,7 @@ auto Dispatcher::stop(Thread* target) noexcept
             return StopDisposition::Deferred;
         }
     }
-    if (target->in_kernel_ || target->activation() != nullptr) {
+    if (target->in_kernel_) {
         if (exec.state_ == Thread::State::Blocked) {
             libk_assert(exec.sc_ != nullptr);
             static_cast<void>(accept_wake(*exec.sc_));
@@ -740,9 +709,6 @@ void Dispatcher::finish_exit(
     Thread& exec = *target;
     libk_assert(exec.state_ == Thread::State::Exited);
     libk_assert(cpu_.current != target);
-    // Also covers Stop of a ready exec after frame redirect: its saved
-    // kernel stack is now discarded, so every popped stack can be recycled.
-    target->release_calls();
     libk_assert(!target->draining());
     object::ref<> lifetime{};
     if (exec.sc_ != nullptr) {
@@ -752,19 +718,11 @@ void Dispatcher::finish_exit(
         libk_assert(unbound);
         lifetime = std::move(unbound).value();
     }
-    if (reason == DispatchReason::Stop) {
-        target->finish_stop();
-    } else {
-        target->finish_exit(exit_status);
-    }
+    target->finish(reason == DispatchReason::Stop ? STATUS_CANCELED : exit_status);
 }
 
 void yield() noexcept {
-    // The call may switch away before it returns.  An IrqToken's diagnostic
-    // lifetime is stack-bound, so carrying it across that handoff would make
-    // the next exec look as if this CPU still owned a disabled-IRQ
-    // section.  Keep this scheduler boundary raw; the dispatcher itself
-    // already requires interrupts to be masked.
+    // Restore the caller IRQ state only when its own stack resumes.
     const bool interrupts = arch::disable_interrupts();
     Cpu& cpu = current_cpu();
     cpu.dispatcher().yield();
@@ -772,7 +730,6 @@ void yield() noexcept {
 }
 
 void block() noexcept {
-    // See yield(): block_current() can hand the stack to another exec.
     const bool interrupts = arch::disable_interrupts();
     Cpu& cpu = current_cpu();
     cpu.dispatcher().block_current();

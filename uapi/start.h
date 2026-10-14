@@ -12,25 +12,16 @@ enum {
 };
 struct AuxEntry { word_t type, value; };
 
-#define ROOT_VERSION 1U
+#define ROOT_VERSION 2U
 #define FW_FDT 1U
 // Only the initial root receives this kernel handoff. Ordinary process
 // startup and named service bindings are entirely userspace contracts.
 struct RootInfo {
     uint32_t version, bytes;
-    cap_t domain, thread, sc, bundle;
+    cap_t domain, thread, sc, bundle, physical;
     uint64_t bundle_bytes;
     cap_t firmware;
     uint64_t firmware_bytes;
     uint32_t firmware_offset, firmware_format;
-    uint32_t resources_offset, resources_count;
-};
-// Temporary root-only hardware grants, replaced with device authorization
-// in the device-boundary unit; firmware identity alone grants nothing.
-struct RootResource {
-    uint32_t node, index;
-    uint16_t kind, reserved;
-    uint32_t padding;
-    cap_t handle;
-    uint64_t phys, bytes;
+    uint64_t boot_hart;
 };

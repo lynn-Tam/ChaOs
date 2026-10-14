@@ -13,6 +13,18 @@ namespace mm {
 
 class KSpace;
 
+class KMap final : private libk::noncopyable_nonmovable {
+    friend class KSpace;
+public:
+    ~KMap() noexcept { libk_assert(!owner_); }
+    auto address() const noexcept -> usize { return range_.base().raw(); }
+private:
+    KSpace* owner_{};
+    VRange range_;
+    KMap* next_{};
+    KMap** link_{};
+};
+
 class Stack final {
   public:
     static constexpr usize GuardPages = 1;
@@ -53,6 +65,10 @@ class KSpace final : private libk::noncopyable_nonmovable {
         libk_assert(root_.kind() == PageTable::Kind::Kernel);
     }
 
+    void fund(object::ref<> payer) noexcept { libk_assert(!payer_); payer_ = std::move(payer); }
+    auto map(KMap&, Pages) noexcept -> std::expected<void, PtErr>;
+    void unmap(KMap&, Flush&, Cpus&, CpuId) noexcept;
+    void release(KMap&, const Flush&) noexcept;
     [[nodiscard]] auto cpu_root() const noexcept -> usize { return root_.cpu_root(); }
     [[nodiscard]] auto root() noexcept -> Root { return Root{tlb_, root_.cpu_root()}; }
     [[nodiscard]] auto tlb(this auto& self) noexcept -> decltype(auto) { return (self.tlb_); }
@@ -74,6 +90,9 @@ class KSpace final : private libk::noncopyable_nonmovable {
     usize stack_end_{};
     usize free_stack_{};
     usize stack_leases_{};
+    KMap* devices_{};
+    object::ref<> payer_;
+    resource::Charge table_charge_;
 };
 
 } // namespace mm

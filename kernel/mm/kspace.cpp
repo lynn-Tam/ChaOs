@@ -1,5 +1,6 @@
 #include <expected>
 #include <mm/kspace.hpp>
+#include <resource/sponsorship.hpp>
 #include <utility>
 
 #include <libk/types.hpp>
@@ -11,6 +12,66 @@ namespace mm {
 
 KSpace::~KSpace() noexcept { libk_assert(stack_leases_ == 0); }
 
+auto KSpace::map(KMap& map, Pages pages) noexcept -> std::expected<void, PtErr> {
+    if (map.owner_ || !pages.valid()) return std::unexpected(PtErr::BadAddr);
+    sync::Lock guard{stack_lock_};
+    // Device reservations grow downward; stacks grow upward in the same arena.
+    usize end = stack_end_;
+    auto* link = &devices_;
+    for (; *link; link = &(*link)->next_) {
+        const auto& range = (*link)->range_;
+        if (pages.byte_size() <= end - range.limit()->raw()) break;
+        end = range.base().raw();
+    }
+    if (end < next_stack_base_ || pages.byte_size() > end - next_stack_base_)
+        return std::unexpected(PtErr::NoMemory);
+    const auto va = VPage::from_base(va_t{end - pages.byte_size()});
+    if (!va) return std::unexpected(PtErr::BadAddr);
+    auto count = root_.count();
+    for (usize n = 0; n < pages.page_count(); ++n)
+        if (!count.include(*va->checked_add(n))) return std::unexpected(PtErr::BadAddr);
+    auto fee = count.pages() ? resource::acquire(payer_, {.memory = count.pages() * page_size})
+                             : std::expected<resource::Charge, resource::errc>{resource::Charge{}};
+    if (!fee) return std::unexpected(PtErr::NoMemory);
+    auto edit = tlb_.begin();
+    const auto result = root_.map(va->base(), pages, PtPerm::Rw);
+    if (!result) return result;
+    // This gap has no live translation. Removal drains TLBs before reuse.
+    edit.publish_fresh();
+    table_charge_.merge(std::move(*fee));
+    map.owner_ = this;
+    map.range_ = {va->base(), pages.byte_size()};
+    map.link_ = link;
+    map.next_ = *link;
+    if (map.next_) map.next_->link_ = &map.next_;
+    *link = &map;
+    return {};
+}
+void KSpace::unmap(KMap& map, Flush& flush, Cpus& cpus, CpuId local) noexcept {
+    libk_assert(map.owner_ == this && !flush.submitted());
+    sync::Lock guard{stack_lock_};
+    flush.pages_ = pmm_->group();
+    auto edit = tlb_.begin();
+    for (usize offset = 0; offset < map.range_.size(); offset += page_size) {
+        const auto page = VPage::from_base(va_t{map.address() + offset});
+        auto removed = root_.unmap(*page);
+        libk_assert(removed);
+        for (auto& table : removed->tables)
+            libk_assert(flush.adopt(std::move(table), table_charge_.split({.memory = page_size})));
+    }
+    // Keep the reservation linked until remote CPUs acknowledge the invalidation.
+    (void) edit.commit(flush, &cpus, local, false, true);
+}
+void KSpace::release(KMap& map, const Flush& flush) noexcept {
+    libk_assert(map.owner_ == this && flush.complete());
+    sync::Lock guard{stack_lock_};
+    *map.link_ = map.next_;
+    if (map.next_) map.next_->link_ = map.link_;
+    map.owner_ = nullptr;
+    map.link_ = nullptr;
+    map.next_ = nullptr;
+    map.range_ = {};
+}
 auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
     sync::Lock guard{stack_lock_};
 
@@ -23,7 +84,9 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
 
     const usize base = next_stack_base_;
     const auto slot_end = libk::checked_add(base - Stack::GuardPages * page_size, Stack::SlotBytes);
-    if (!slot_end || *slot_end > stack_end_) {
+    usize device_begin = stack_end_;
+    for (auto* map = devices_; map; map = map->next_) device_begin = map->range_.base().raw();
+    if (!slot_end || *slot_end > device_begin) {
         return std::unexpected(PtErr::BadAddr);
     }
 
@@ -35,6 +98,12 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
         page = *made;
     }
 
+    auto count = root_.count();
+    const auto first = *VPage::from_base(va_t{base});
+    for (usize i = 0; i < Stack::StackPages; ++i) libk_assert(count.include(*first.checked_add(i)));
+    auto fee = count.pages() ? resource::acquire(payer_, {.memory = count.pages() * page_size})
+                             : std::expected<resource::Charge, resource::errc>{resource::Charge{}};
+    if (!fee) return std::unexpected(PtErr::NoMemory);
     auto edit = tlb_.begin();
     auto va = *VPage::from_base(va_t{base});
     usize i{};
@@ -42,6 +111,7 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
     if (!mapped) return std::unexpected(mapped.error());
     edit.publish_fresh();
 
+    table_charge_.merge(std::move(*fee));
     stack_pages_.append(std::move(backing));
     next_stack_base_ = *slot_end + Stack::GuardPages * page_size;
     ++stack_leases_;

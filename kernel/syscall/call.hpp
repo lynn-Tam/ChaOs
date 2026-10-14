@@ -22,7 +22,6 @@ enum class Disposition : u8 {
     Return,
     Yield,
     Exit,
-    Resume,
 };
 
 [[nodiscard]] auto handle(arch::TrapCtx& ctx) noexcept
@@ -96,7 +95,7 @@ template<typename Descriptor>
 [[nodiscard]] auto range_of(usize base, usize size) noexcept
     -> std::optional<mm::VRange>;
 
-#define CALL(name, nr, entry, locus, unit) \
+#define CALL(name, nr, entry, unit) \
     template<usize op> [[nodiscard]] auto entry(Call&) noexcept -> Result;
 #include <uapi/calls.def>
 #undef CALL

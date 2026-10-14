@@ -1,9 +1,9 @@
+#include <protocols/msg.hpp>
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
 #include <protocols/file.hpp>
 #include <protocols/stream.hpp>
-#include <dirent.h>
 #include <unistd.h>
 #include <libk/fmt.hpp>
 #include <string_view>
@@ -16,19 +16,6 @@ static int print(std::string_view text) {
     const auto count = write(STDOUT_FILENO, text.data(), text.size());
     return count < 0 ? count : count == static_cast<int64_t>(text.size()) ? 0 : 1;
 }
-static int list(const char* path) {
-    auto* dir = opendir(path);
-    if (!dir) return 1;
-    int status{};
-    errno = 0;
-    while (auto* entry = readdir(dir)) {
-        if (const auto error = print(entry->d_name)) { status = error; break; }
-        if (const auto error = print("\n")) { status = error; break; }
-    }
-    if (!status && errno) status = -1;
-    const auto closed = closedir(dir);
-    return status < 0 ? status : closed;
-}
 static int transfer(int source, int target) {
     char bytes[4096];
     for (;;) {
@@ -38,19 +25,6 @@ static int transfer(int source, int target) {
         if (sent != size) return sent < 0 ? sent : 1;
     }
 }
-static int copy(const char* from, const char* to) {
-    if (std::string_view(*from == '/' ? from + 1 : from)
-        == (*to == '/' ? to + 1 : to)) return 1;
-    const int source = open(from, O_RDONLY);
-    if (source < 0) return source;
-    const int target = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0);
-    int status = target < 0 ? target : transfer(source, target);
-    if (status == 0) status = fsync(target);
-    if (target >= 0) { const auto closed = close(target); if (!status) status = closed; }
-    const auto closed = close(source);
-    return status ? status : closed;
-}
-
 
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
@@ -59,13 +33,12 @@ int main(int argc, char** argv) {
     if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, directory,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
-    if (argc < 2) return print("fs ls [DIR] | cat/stat/touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv/copy OLD NEW | device | volid | sync\n");
+    if (argc < 2) return print("fs stat/touch FILE | write/append FILE TEXT | save FILE [-a] | mkdir/rm PATH | mv OLD NEW | device | volid | sync\n");
     const std::string_view command = argv[1];
     if (command == "sync" && argc == 2) return px_sync();
-    if (command == "ls" && (argc == 2 || argc == 3)) return list(argc == 3 ? argv[2] : "/");
     if ((command == "device" || command == "volid") && argc == 2) {
         uint8_t id[20]{};
-        ch_rpc service;
+        rpc_client service;
         auto status = service.open(directory, env.pool, env.cspace, env.events);
         if (status == STATUS_OK) {
             if (command == "device") status = st_device_id(service, id);
@@ -80,15 +53,15 @@ int main(int argc, char** argv) {
         return print({text, static_cast<size_t>(2*size+1)});
     }
     if (argc == 4 && command == "mv") return rename(argv[2], argv[3]);
-    if (argc == 4 && command == "copy") return copy(argv[2], argv[3]);
     if (argc == 3 && command == "mkdir") return px_mkdir(argv[2]);
     if (argc == 3 && command == "rm") return unlink(argv[2]);
     const bool writing = argc >= 4 && (command == "write" || command == "append");
-    const bool reading = argc == 3 && (command == "cat" || command == "stat");
+    const bool reading = argc == 3 && command == "stat";
+    const bool saving = command == "save" && (argc == 3 || (argc == 4 && std::string_view{argv[3]} == "-a"));
     const bool touch = argc == 3 && command == "touch";
-    if (!writing && !reading && !touch) return 1;
+    if (!writing && !reading && !touch && !saving) return 1;
     const int flags = reading ? O_RDONLY : O_WRONLY | O_CREAT
-        | (command == "append" ? O_APPEND : touch ? 0 : O_TRUNC);
+        | ((command == "append" || (saving && argc == 4)) ? O_APPEND : touch ? 0 : O_TRUNC);
     const int fd = open(argv[2], flags, 0);
     if (fd < 0) return fd;
     int status{};
@@ -96,7 +69,7 @@ int main(int argc, char** argv) {
         uint64_t size{};
         status = px_size(fd, &size);
         if (!status) { output out; (void)libk::fmt::format_to<"{} bytes\n">(out, size); }
-    } else if (command == "cat") status = transfer(fd, STDOUT_FILENO);
+    } else if (saving) { status = transfer(STDIN_FILENO, fd); if (!status) status = fsync(fd); }
     else if (writing) {
         for (int i = 3; i < argc && !status; ++i) {
             if (i > 3 && write(fd, " ", 1) != 1) { status = 1; break; }

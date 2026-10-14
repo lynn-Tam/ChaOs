@@ -6,6 +6,9 @@
 #include <vector>
 #include <algorithm>
 #include <string.h>
+#include <libk/checked_arithmetic.hpp>
+
+static constexpr word_t page_size = 4096;
 
 // Temporary selectors are adopted before any operation that may fail. The
 // task owns their cleanup; VSpace owns committed backing after selectors close.
@@ -34,13 +37,13 @@ class pr_loader {
             return STATUS_BAD_ARGS;
         const auto* bytes = static_cast<const uint8_t*>(src);
         while (n) {
-            const auto page = offset / pr_page_size;
-            const auto start = offset % pr_page_size;
-            const auto count = std::min(n, size_t{pr_page_size - start});
+            const auto page = offset / page_size;
+            const auto start = offset % page_size;
+            const auto count = std::min(n, size_t{page_size - start});
             auto s = sys::memory_populate(mem, page).status;
             if (s != STATUS_OK)
                 return s;
-            s = scratch_.attach(mem, page, pr_page_size, VM_READ | VM_WRITE);
+            s = scratch_.attach(mem, page, page_size, VM_READ | VM_WRITE);
             if (s != STATUS_OK)
                 return s;
             std::copy_n(bytes, count, reinterpret_cast<uint8_t*>(scratch_.address) + start);
@@ -54,7 +57,7 @@ class pr_loader {
         return STATUS_OK;
     }
     auto make_desc(const void* src, size_t n) noexcept -> std::expected<owner, status_t> {
-        const auto size = pr_window::round_size(n);
+        const auto size = libk::checked_align_up(n, page_size).value_or(0);
         if (!size || !src)
             return std::unexpected(STATUS_BAD_ARGS);
         auto mem = memory(size);
@@ -67,8 +70,6 @@ class pr_loader {
     }
     auto install(cap_t mem, word_t address, word_t size, word_t perms, word_t first = 0,
                  word_t flags = 0) noexcept -> status_t {
-        if (!pr_window{address, size}.valid())
-            return STATUS_BAD_ARGS;
         auto region = adopt(sys::vm_slice(vm_, address, size, perms, RIGHT_MAP | RIGHT_UNMAP));
         if (!region)
             return region.error();
@@ -91,8 +92,8 @@ class pr_loader {
             const auto seg = *elf.segment(i);
             if (seg.type != 1 || !seg.size)
                 continue;
-            const auto skip = seg.va % pr_page_size;
-            const auto size = pr_window::round_size(seg.size + skip);
+            const auto skip = seg.va % page_size;
+            const auto size = libk::checked_align_up(seg.size + skip, page_size).value_or(0);
             const word_t perms = ((seg.flags & 4) ? VM_READ : 0) |
                                  ((seg.flags & 2) ? VM_WRITE : 0) |
                                  ((seg.flags & 1) ? VM_EXECUTE : 0);
@@ -100,9 +101,9 @@ class pr_loader {
             // Partial ELF pages are zeroed allocations, never archive neighbours.
             const bool share = source.memory &&
                                (source.perms & (perms & ~VM_WRITE)) == (perms & ~VM_WRITE) &&
-                               (source.offset + seg.offset) % pr_page_size == skip;
-            const auto first = share ? (skip + pr_page_size - 1) & ~(pr_page_size - 1) : 0;
-            const auto last = share ? (skip + seg.file_size) & ~(pr_page_size - 1) : 0;
+                               (source.offset + seg.offset) % page_size == skip;
+            const auto first = share ? (skip + page_size - 1) & ~(page_size - 1) : 0;
+            const auto last = share ? (skip + seg.file_size) & ~(page_size - 1) : 0;
             word_t offset{};
             while (offset < size) {
                 const bool shared = offset >= first && offset < last;
@@ -112,12 +113,12 @@ class pr_loader {
                 std::expected<owner, status_t> mem;
                 word_t page{};
                 if (shared) {
-                    page = (source.offset + seg.offset + offset - skip) / pr_page_size;
+                    page = (source.offset + seg.offset + offset - skip) / page_size;
                     const CapView view{.version = CAP_ATTENUATION_VERSION_CURRENT,
                                        .kind = ObjMem,
                                        .size = CAP_ATTENUATION_SIZE,
                                        .rights = RIGHT_MAP,
-                                       .words = {page, length / pr_page_size,
+                                       .words = {page, length / page_size,
                                                  (perms & VM_WRITE) ? VM_READ : perms}};
                     std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
                     cap_encode(view, wire);
@@ -163,7 +164,8 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
             return STATUS_BAD_ARGS;
         if (!mod || mod.machine() != 243)
             return STATUS_BAD_ARGS;
-        word_t end{};
+        if (o.caps.size() > (UINT32_MAX - sizeof(rt_bindings)) / sizeof(rt_binding))
+            return STATUS_BAD_ARGS;
         size_t binding_size = sizeof(rt_bindings) + o.caps.size() * sizeof(rt_binding);
         for (const auto& src : o.caps) {
             if (!src.cap || !src.contract.name || !src.contract.kind)
@@ -175,35 +177,33 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         }
         if (binding_size > UINT32_MAX)
             return STATUS_BAD_ARGS;
-        const pr_window bindings{o.va.bindings, pr_window::round_size(binding_size)};
-        const pr_window ipc_range{o.va.ipc, pr_page_size};
-        if (!auth.cpus || !auth.domain || !o.va.stack.valid() || !bindings.valid() ||
-            !ipc_range.valid() || o.va.stack.overlaps(bindings) || o.va.stack.overlaps(ipc_range) ||
-            bindings.overlaps(ipc_range))
-            return STATUS_BAD_ARGS;
+        const auto binding_bytes = libk::checked_align_up(binding_size, page_size).value_or(0);
+        if (!auth.cpus || !auth.domain) return STATUS_BAD_ARGS;
+        std::vector<std::pair<word_t, word_t>> ranges{
+            {o.va.stack, o.va.stack_size}, {o.va.bindings, binding_bytes}, {o.va.ipc, page_size}};
         for (size_t i = 0; i < mod.segment_count(); ++i) {
-            const auto decoded = mod.segment(i);
-            if (!decoded)
-                return STATUS_BAD_ARGS;
-            if (decoded->type != 1 || !decoded->size)
-                continue;
-            const auto skip = decoded->va % pr_page_size;
-            if (decoded->size > UINT64_MAX - skip)
-                return STATUS_BAD_ARGS;
-            const pr_window w{decoded->va - skip, pr_window::round_size(decoded->size + skip)};
-            if (w.address < end)
-                return STATUS_BAD_ARGS;
-            end = w.address + w.size;
-            if (!w.valid() || w.overlaps(o.va.stack) || w.overlaps(bindings) ||
-                w.overlaps(ipc_range))
-                return STATUS_BAD_ARGS;
+            const auto seg = *mod.segment(i);
+            if (seg.type == 1 && seg.size) {
+                const auto skip = seg.va % page_size;
+                ranges.emplace_back(seg.va - skip,
+                    libk::checked_align_up(seg.size + skip, page_size).value_or(0));
+            }
+        }
+        // ELF program headers need not be sorted. Validate the complete layout
+        // before allocating anything in the child, including page envelopes.
+        std::ranges::sort(ranges);
+        word_t end{};
+        for (const auto& [address, size] : ranges) {
+            if (!address || !size || (address | size) % page_size ||
+                address < end || size > UINT64_MAX - address) return STATUS_BAD_ARGS;
+            end = address + size;
         }
         const auto argv = o.argv;
         if (argv.empty())
             return STATUS_BAD_ARGS;
         size_t strings{};
         for (const auto arg : argv) {
-            if (arg.find('\0') != std::string_view::npos || arg.size() >= o.va.stack.size - strings)
+            if (arg.find('\0') != std::string_view::npos || arg.size() >= o.va.stack_size - strings)
                 return STATUS_BAD_ARGS;
             strings += arg.size() + 1;
         }
@@ -211,17 +211,17 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         if (s != STATUS_OK)
             return s;
         vm_area scratch;
-        s = scratch.open(auth.vspace, 0, pr_page_size);
+        s = scratch.open(auth.vspace, 0, page_size);
         if (s != STATUS_OK)
             return s;
         pr_loader load{r.pool(), r.vspace(), scratch};
         s = load.map(mod, image);
         if (s != STATUS_OK)
             return s;
-        auto stack = load.anonymous(o.va.stack.address, o.va.stack.size, VM_READ | VM_WRITE);
+        auto stack = load.anonymous(o.va.stack, o.va.stack_size, VM_READ | VM_WRITE);
         if (!stack)
             return stack.error();
-        auto ipc = load.anonymous(o.va.ipc, pr_page_size, VM_READ | VM_WRITE);
+        auto ipc = load.anonymous(o.va.ipc, page_size, VM_READ | VM_WRITE);
         if (!ipc)
             return ipc.error();
         s = sys::memory_populate(ipc->selector(), 0).status;
@@ -230,7 +230,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         auto events = load.adopt(sys::notification_create(r.pool(), rt_event_badge));
         if (!events)
             return events.error();
-        std::vector<AuxEntry> aux{{AT_PAGESZ, pr_page_size},
+        std::vector<AuxEntry> aux{{AT_PAGESZ, page_size},
                                   {AT_ENTRY, mod.entry()},
                                   {AT_SYS_CPUS, auth.cpus},
                                   {AT_SYS_IPC, o.va.ipc}};
@@ -247,7 +247,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
                 return copy.status;
             aux.push_back({static_cast<word_t>(key), copy.value});
         }
-        auto desc = load.memory(pr_page_size);
+        auto desc = load.memory(page_size);
         if (!desc)
             return desc.error();
         if (!o.caps.empty()) {
@@ -272,7 +272,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
                 else {
                     std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
                     cap_encode(*view, wire);
-                    s = load.write(desc->selector(), pr_page_size, 0, wire.data(), wire.size());
+                    s = load.write(desc->selector(), page_size, 0, wire.data(), wire.size());
                     if (s != STATUS_OK)
                         return s;
                     copied = sys::cap_typed_delegate(src.cap, r.cspace(), desc->selector());
@@ -293,26 +293,26 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
                 ::memcpy(data.data() + name_offset, name.data(), name.size());
                 name_offset += name.size();
             }
-            auto memory = load.anonymous(bindings.address, bindings.size, VM_READ);
+            auto memory = load.anonymous(o.va.bindings, binding_bytes, VM_READ);
             if (!memory)
                 return memory.error();
-            s = load.write(memory->selector(), bindings.size, 0, data.data(), data.size());
+            s = load.write(memory->selector(), binding_bytes, 0, data.data(), data.size());
             if (s == STATUS_OK)
                 s = sys::memory_seal(memory->selector()).status;
             if (s != STATUS_OK)
                 return s;
-            aux.push_back({AT_SYS_BINDINGS, bindings.address});
+            aux.push_back({AT_SYS_BINDINGS, o.va.bindings});
             aux.push_back({AT_SYS_BINDINGS_SIZE, binding_size});
         }
         aux.push_back({AT_NULL, 0});
         const auto pointers = (argv.size() + 3) * sizeof(word_t);
         const auto prefix = pointers + aux.size() * sizeof(AuxEntry);
-        if (prefix > o.va.stack.size || strings > o.va.stack.size - prefix)
+        if (prefix > o.va.stack_size || strings > o.va.stack_size - prefix)
             return STATUS_BAD_ARGS;
         const auto stack_bytes = (prefix + strings + 15) & ~size_t{15};
-        if (stack_bytes > o.va.stack.size)
+        if (stack_bytes > o.va.stack_size)
             return STATUS_BAD_ARGS;
-        const auto sp = o.va.stack.address + o.va.stack.size - stack_bytes;
+        const auto sp = o.va.stack + o.va.stack_size - stack_bytes;
         std::vector<uint8_t> initial(stack_bytes);
         auto* words = reinterpret_cast<word_t*>(initial.data());
         words[0] = argv.size();
@@ -323,7 +323,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
             offset += argv[i].size() + 1;
         }
         ::memcpy(initial.data() + pointers, aux.data(), aux.size() * sizeof(AuxEntry));
-        s = load.write(stack->selector(), o.va.stack.size, o.va.stack.size - stack_bytes,
+        s = load.write(stack->selector(), o.va.stack_size, o.va.stack_size - stack_bytes,
                        initial.data(), initial.size());
         if (s != STATUS_OK)
             return s;

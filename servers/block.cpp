@@ -2,20 +2,22 @@
 #include <string.h>
 #include <protocols/block.hpp>
 #include <utility>
-#include <vector>
+#include <new>
 #include <memory>
-#include <ipc.hpp>
+#include <protocols/msg.hpp>
 #include <protocols/queue.hpp>
 #include <start.hpp>
 #include <servers/virtio_blk.hpp>
+#include <protocols/service.hpp>
 
 static blk_dev device;
-static ch_port directory;
+static msg_rx directory;
 struct Client final {
+    std::unique_ptr<Client> next;
     cap_owner channel;
     io_server session;
 };
-static std::vector<std::unique_ptr<Client>> clients;
+static std::unique_ptr<Client> clients;
 // Device slots and client queue slots have independent lifetimes. Keep the
 // exact client Ticket until hardware returns the corresponding device Ticket.
 struct Pending final {
@@ -29,12 +31,12 @@ struct Flush final {
     io_ticket ticket{};
     bool submitted{};
 } flush;
-static void control(const ch_msg&, ch_reply& reply) noexcept {
+static void control(const msg_frame&, msg_reply& reply) noexcept {
     reply.message.status = STATUS_INVALID_OP;
 }
 
 static auto validate(const io_cmd& request) noexcept -> status_t {
-    if (request.object != 0 || request.buffer != 0 || request.flags != 0)
+    if (request.flags != 0)
         return STATUS_BAD_ARGS;
     if (request.operation == static_cast<uint64_t>(io_operation::Flush))
         return request.offset == 0 && request.length == 0 && request.buffer_offset == 0
@@ -57,48 +59,62 @@ static auto validate(const io_cmd& request) noexcept -> status_t {
 int main() {
 
     const auto& info = rt_startup();
-    const auto pool = info.pool;
     const auto vspace = info.vspace;
     const auto cspace = info.cspace;
     const auto events = info.events;
     const auto memory_pool = info.selector(io_memory);
-    if (!memory_pool) sys::exit(STATUS_DENIED);
-    if (const auto rc = device.open(pool, vspace, info.selector(io_host), events, rt_event_badge);
+    if (!memory_pool)
+        sys::exit(STATUS_DENIED);
+    if (const auto rc = device.open(info);
         rc != STATUS_OK)
         sys::exit(rc);
     if (const auto rc = directory.open(info.selector(blk_service), events); rc != STATUS_OK)
         sys::exit(rc);
-    size_t turn{};
+    if (const auto ready = info.selector(sv_ready)) {
+        if (const auto status = sys::notification_signal(ready).status; status != STATUS_OK) sys::exit(status);
+        if (const auto status = sys::notification_signal(info.selector(sv_wake)).status; status != STATUS_OK) sys::exit(status);
+    }
     for (;;) {
         bool again{};
         if (const auto rc = device.acknowledge(); rc != STATUS_OK)
             sys::exit(rc);
         for (size_t count = 0; count < io_queue_depth; ++count) {
-            ch_packet packet;
+            msg_packet packet;
             const auto received = directory.receive(packet);
             if (received == STATUS_WOULD_BLOCK || received == STATUS_BUSY)
                 break;
-            if (received != STATUS_OK || packet.count != 2)
+            if (received != STATUS_OK || packet.count != 3)
                 continue;
-            auto endpoint = std::move(packet.capabilities[0]);
-            packet.capabilities[0] = std::move(packet.capabilities[1]);
-            packet.count = 1;
-            auto client = std::make_unique<Client>();
-            const auto status = client->session.open(endpoint.selector(), events, memory_pool, vspace,
-                                                     cspace, 0, device.capacity(), true);
+            auto endpoint = std::move(packet.capabilities[1]);
+            packet.capabilities[1] = std::move(packet.capabilities[2]);
+            packet.count = 2;
+            if (const auto status = rt_admit(packet.message.deadline); status != STATUS_OK) {
+                msg_reply reply;
+                reply.message = {.operation = packet.message.operation,
+                                 .status = status};
+                reply.respond(packet.capabilities[0].selector());
+                continue;
+            }
+            auto client = std::unique_ptr<Client>{new (std::nothrow) Client};
+            const auto status = client ? client->session.open(endpoint.selector(), events, memory_pool,
+                                                              vspace, cspace, 0, device.capacity(), true)
+                                       : STATUS_NO_MEMORY;
             if (status != STATUS_OK) {
-                const ch_msg reply{.operation = packet.message.operation,
-                                   .id = packet.message.id,
+                const msg_frame reply{.operation = packet.message.operation,
                                    .status = status};
-                (void) ch_port::send_to(endpoint.selector(), reply);
+                msg_reply response;
+                response.message = reply;
+                response.respond(packet.capabilities[0].selector());
                 continue;
             }
             client->channel = std::move(endpoint);
             if (client->session.accept(packet, control) != STATUS_OK)
                 client->session.abort();
-            clients.push_back(std::move(client));
+            auto* tail = &clients;
+            while (*tail) tail = &(*tail)->next;
+            *tail = std::move(client);
         }
-        for (auto& client : clients)
+        for (auto* client = clients.get(); client; client = client->next.get())
             if (client->session.poll(control) != STATUS_OK) {
                 client->session.abort();
                 again = true;
@@ -148,12 +164,17 @@ int main() {
                         sys::exit(STATUS_INTERNAL);
                 }
                 flush = {};
+            } else if (const auto status = rt_admit(queue.request(flush.ticket)->deadline);
+                       status != STATUS_OK) {
+                if (!queue.finish(flush.ticket, status, 0))
+                    sys::exit(STATUS_INTERNAL);
+                flush = {};
             } else if (device.active() == 0) {
                 size_t slot{};
-                while (slot < io_queue_depth &&
+                while (slot < device.depth() &&
                        (pending[slot].client || pending[slot].generation == UINT64_MAX))
                     ++slot;
-                if (slot != io_queue_depth) {
+                if (slot != device.depth()) {
                     auto& operation = pending[slot];
                     const io_ticket device_ticket{static_cast<uint32_t>(slot),
                                                   ++operation.generation};
@@ -180,16 +201,16 @@ int main() {
         for (size_t row = 0; row < io_queue_depth; ++row) {
             if (flush.client)
                 break;
-            for (size_t n = 0; n < clients.size(); ++n) {
-                auto& client = *clients[(turn + n) % clients.size()];
+            for (auto* owner = clients.get(); owner; owner = owner->next.get()) {
+                auto& client = *owner;
                 auto* queue = client.session.queue();
                 if (!queue || client.session.closing())
                     continue;
                 size_t slot{};
-                while (slot < io_queue_depth &&
+                while (slot < device.depth() &&
                        (pending[slot].client || pending[slot].generation == UINT64_MAX))
                     ++slot;
-                if (slot == io_queue_depth)
+                if (slot == device.depth())
                     break;
                 io_ticket ticket{};
                 const auto admitted = queue->admit(ticket);
@@ -200,7 +221,9 @@ int main() {
                     continue;
                 }
                 const auto& request = *queue->request(ticket);
-                auto status = validate(request);
+                auto status = rt_admit(request.deadline);
+                if (status == STATUS_OK)
+                    status = validate(request);
                 if (status == STATUS_OK &&
                     request.operation == static_cast<uint64_t>(io_operation::Flush)) {
                     flush = {&client, ticket, false};
@@ -231,10 +254,9 @@ int main() {
                 }
             }
         }
-        turn = clients.empty() ? 0 : (turn + 1) % clients.size();
         device.publish();
-        for (auto& owner : clients) {
-            auto& client = *owner;
+        for (auto* link = &clients; *link;) {
+            auto& client = **link;
             // Session close drains its DMA and withdraws peer mappings. The
             // device remains owned by the driver and can serve other clients.
             if (client.session.flush(true) != STATUS_OK) {
@@ -244,17 +266,33 @@ int main() {
             if (client.session.done()) {
                 (void) sys::channel_close(client.channel.selector());
                 client.session.reset();
-                client.channel = {};
+                auto retired = std::move(*link);
+                *link = std::move(retired->next);
+                continue;
             } else if (client.session.arm() != STATUS_OK) {
                 client.session.abort();
                 again = true;
             }
+            link = &client.next;
         }
-        std::erase_if(clients, [](const auto& client) { return !client->channel; });
+        // Rotate ownership instead of keeping a second client index/size.
+        if (clients && clients->next) {
+            auto first = std::move(clients);
+            clients = std::move(first->next);
+            auto* tail = &clients;
+            while (*tail) tail = &(*tail)->next;
+            *tail = std::move(first);
+        }
         if (const auto rc = directory.arm().status; rc != STATUS_OK)
             sys::exit(rc);
-        if (!again)
-            if (const auto rc = sys::notification_wait(events).status; rc != STATUS_OK)
-                sys::exit(rc);
+        if (!again) {
+            const auto deadline =
+                flush.client && !flush.submitted
+                    ? flush.client->session.queue()->request(flush.ticket)->deadline
+                    : 0;
+            const auto status = sys::notification_wait(events, deadline).status;
+            if (status != STATUS_OK && status != STATUS_TIMED_OUT)
+                sys::exit(status);
+        }
     }
 }

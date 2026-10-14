@@ -181,6 +181,59 @@ public:
         uint32_t n;
         return p && read_u32(*p, n) ? std::optional{n} : std::nullopt;
     }
+    static auto read_cells(byte_reader& r, uint32_t count, uint64_t& value) noexcept -> bool {
+        if (count > 2) return false;
+        value = 0;
+        while (count--) {
+            uint32_t word;
+            if (!r.read_be(word)) return false;
+            value = (value << 32) | word;
+        }
+        return true;
+    }
+    auto cell_count(uint32_t node, std::string_view key, uint32_t fallback) const noexcept -> uint32_t {
+        return property(node, key) ? number(node, key).value_or(UINT32_MAX) : fallback;
+    }
+    struct range { uint64_t address{}, size{}; };
+    auto translate(uint32_t bus, range span) const noexcept -> std::optional<range> {
+        while (const auto up = parent(bus)) {
+            const auto ranges = property(bus, "ranges");
+            if (!ranges) return {};
+            if (!ranges->empty()) {
+                byte_reader r{ranges->data(), ranges->size()};
+                bool found{};
+                while (r.remaining()) {
+                    uint64_t child, physical, size;
+                    if (!read_cells(r, cell_count(bus, "#address-cells", 2), child) ||
+                        !read_cells(r, cell_count(*up, "#address-cells", 2), physical) ||
+                        !read_cells(r, cell_count(bus, "#size-cells", 1), size)) return {};
+                    if (span.address < child || span.address - child > size ||
+                        span.size > size - (span.address - child)) continue;
+                    if (physical > UINT64_MAX - (span.address - child)) return {};
+                    span.address = physical + span.address - child;
+                    found = true;
+                    break;
+                }
+                if (!found) return {};
+            }
+            bus = *up;
+        }
+        if (!span.size || span.address > UINT64_MAX - span.size) return {};
+        return span;
+    }
+    auto reg(uint32_t node, size_t index = 0) const noexcept -> std::optional<range> {
+        const auto up = parent(node);
+        const auto regs = property(node, "reg");
+        if (!up || !regs) return {};
+        const auto ac = cell_count(*up, "#address-cells", 2), sc = cell_count(*up, "#size-cells", 1);
+        if (!ac || ac > 2 || !sc || sc > 2) return {};
+        const auto stride = size_t{ac + sc} * 4;
+        if (regs->size() % stride || index >= regs->size() / stride) return {};
+        byte_reader r{regs->data() + index * stride, stride};
+        range result;
+        if (!read_cells(r, ac, result.address) || !read_cells(r, sc, result.size)) return {};
+        return translate(*up, result);
+    }
     auto matches(uint32_t node, std::string_view compatible) const noexcept -> bool {
         const auto p = property(node, "compatible");
         if (!p) return false;

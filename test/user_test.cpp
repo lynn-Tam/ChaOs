@@ -4,10 +4,6 @@
 #include <mm/table.hpp>
 #include <cpu.hpp>
 #include <trap.hpp>
-#include <cap/cap.hpp>
-#include <uapi/cap.h>
-#include <uapi/abi.h>
-#include <uapi/mem.h>
 
 namespace {
 
@@ -66,23 +62,6 @@ bool test_synthetic_user_frame_consumes_home_stack_only(
 
 }
 
-bool test_uapi_values_are_stable_and_not_internal_pointers(
-    const TestContext&) noexcept {
-    static_assert(sizeof(cap::Handle) == sizeof(cap_t));
-    static_assert(SYS_YIELD != SYS_EXIT);
-    static_assert(SYS_VM_MAP != SYS_VM_PROTECT);
-    static_assert(RIGHT_REVOKE == (UINT64_C(1) << 11));
-    static_assert(RIGHT_CONNECT == (UINT64_C(1) << 17));
-    static_assert(RIGHT_ACK == (UINT64_C(1) << 18));
-    static_assert((VM_WRITE & VM_READ) == 0);
-    static_assert(STATUS_OK == 0 && STATUS_INVALID_CAP == -1);
-    static_assert(STATUS_BUSY == -7 && STATUS_PENDING == -9);
-    static_assert(STATUS_REASSERTED == -14);
-    static_assert(STATUS_ALREADY_CONNECTED == -15);
-    return !cap::Handle::from_raw(0)
-        && !cap::Handle::from_raw(1);
-}
-
 } // namespace
 
 void register_user_tests(TestRegistry& registry) noexcept {
@@ -98,8 +77,4 @@ void register_user_tests(TestRegistry& registry) noexcept {
         "user",
         "synthetic first frame lives only on the Thread home stack",
         test_synthetic_user_frame_consumes_home_stack_only);
-    (void)registry.add(
-        "user",
-        "register ABI values remain explicit UAPI data",
-        test_uapi_values_are_stable_and_not_internal_pointers);
 }

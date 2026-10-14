@@ -39,8 +39,15 @@ static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
             if (b->free && b->size >= need) { block = b; break; }
     if (!block) {
         if (need > SIZE_MAX - Header - 4095) return nullptr;
-        const auto size = std::max(ChunkSize, round(Header + need, 4096));
+        const auto minimum = round(Header + need, 4096);
+        auto size = std::max(ChunkSize, minimum);
+        // Return only backed storage. Failed reservations release through RAII;
+        // growth granularity must not reject a smaller admissible allocation.
         auto map = vm_area::create(pool, vm, 0, size);
+        if (!map && size != minimum && map.error() == STATUS_NO_MEMORY) {
+            size = minimum;
+            map = vm_area::create(pool, vm, 0, size);
+        }
         if (!map) return nullptr;
         auto* c = std::construct_at(reinterpret_cast<Chunk*>(map->address), std::move(*map), nullptr, chunks);
         if (chunks) chunks->prev = c;
