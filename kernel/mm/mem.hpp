@@ -374,6 +374,7 @@ class Extents {
     ~Extents() noexcept;
     auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&, Phys::Lease&&) noexcept
         -> std::expected<void, MemErr>;
+    auto managed() const noexcept -> bool { return bool(owned_); }
     auto query(usize) const noexcept -> ContentState;
     auto materialize(usize) const noexcept -> std::expected<Frame, MemErr>;
   private:
@@ -412,6 +413,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto size() const noexcept -> usize { return logical_pages_ * page_size; }
     [[nodiscard]] auto page_count() const noexcept -> usize { return logical_pages_; }
     [[nodiscard]] auto kind() const noexcept -> BackingKind;
+    auto managed() const noexcept -> bool;
     [[nodiscard]] auto state() const noexcept -> MemState;
     [[nodiscard]] auto seal_state() const noexcept -> SealState;
     [[nodiscard]] auto content_epoch() const noexcept -> ContentEpoch;

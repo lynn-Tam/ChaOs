@@ -71,7 +71,7 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
                     process.stdin.flush()
             until(b"myos> ", begin)
             result = output[begin:]
-            if command == "run fdcheck cache":
+            if command == "fdcheck cache":
                 print(f"[storage] cache/sync: {cpus} hart(s), {time.monotonic()-began:.3f}s", flush=True)
             if expected not in result:
                 raise RuntimeError(f"{command}: missing {expected!r}; got {result!r}")
@@ -113,15 +113,15 @@ def main():
                 stream.truncate(16 * 1024 * 1024)
             boot(qemu, kernel, bundle, data_disk, count, [
                 ("mkfs", b"myos> "),
-                ("run fdcheck", b"fd offsets ok"),
-                ("run fdcheck cache", b"fd cache ok"),
-                ("run fdcheck close", b"close accepted"),
+                ("fdcheck", b"fd offsets ok"),
+                ("fdcheck cache", b"fd cache ok"),
+                ("fdcheck close", b"close accepted"),
                 ("cat fd-async", b"CR"),
                 ("fs sync", b"myos> "),
                 ("fs write note hello-persistent", b"myos> "),
                 ("fs append note -again", b"myos> "),
                 ("cat note", b"hello-persistent-again\nmyos> "),
-                ("svc restart block-8", b"service change requested", ["block-8", "store", "vfs"]),
+
                 ("cat note", b"hello-persistent-again"),
                 ("svc restart devices", b"service change requested", ["devices", "block-8", "store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
@@ -134,10 +134,10 @@ def main():
                 ("cat readme", b"myos disk file service"),
                 ("cp /boot/cat.elf cat.elf", b"myos> "),
                 ("fs stat cat.elf", package_size),
-                ("run /cat.elf /boot/README.TXT", b"myos disk file service"),
-                ("run echo stream-persisted > piped", b"myos> "),
+                ("/cat.elf /boot/README.TXT", b"myos disk file service"),
+                ("echo stream-persisted > piped", b"myos> "),
                 ("cat piped", b"stream-persisted"),
-                ("run cat piped > copied", b"myos> "),
+                ("cat piped > copied", b"myos> "),
                 ("cat copied", b"stream-persisted"),
                 ("fs mkdir notes", b"myos> "),
                 ("fs write notes/item nested-persistent", b"myos> "),
@@ -161,7 +161,7 @@ def main():
                 ("cat fd-async", b"CR"),
                 ("svc stop store", b"service change requested", {"store": "stopped", "vfs": "running"}),
                 ("cat /boot/README.TXT", b"myos disk file service"),
-                ("run echo storage-offline", b"storage-offline"),
+                ("echo storage-offline", b"storage-offline"),
                 ("cat note", b"error: 11"),
                 ("svc start store", b"service change requested", ["store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),

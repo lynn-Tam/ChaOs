@@ -689,6 +689,12 @@ Mem::~Mem() noexcept {
     libk_assert(!store_ && !operations_ && attachments_.empty());
 }
 
+auto Mem::managed() const noexcept -> bool {
+    sync::Lock guard{lock_};
+    if (!store_) return false;
+    const auto* physical = std::get_if<Extents>(&*store_);
+    return !physical || physical->managed();
+}
 auto Mem::kind() const noexcept -> BackingKind {
     sync::Lock guard{lock_};
     libk_assert(store_.has_value());

@@ -21,7 +21,7 @@
 // the kernel owns the page generation and the submitted writeback snapshot.
 struct PagerReq {
     uint32_t kind;
-    uint32_t urgency;
+    uint32_t reserved;
     word_t id;
     word_t page_index;
     union {
@@ -38,3 +38,27 @@ struct PagerReq {
 #ifdef __cplusplus
 static_assert(sizeof(PagerReq) == 40);
 #endif
+
+#define VSPACE_LIVE 0U
+#define VSPACE_STOPPING 1U
+#define VSPACE_QUIESCENT 2U
+struct VSpaceInfo {
+    uint32_t version, size;
+    uint64_t mapped, resident;
+    uint32_t state, reserved;
+};
+
+#define VM_RECORD_MAP 0U
+#define VM_RECORD_RESERVED 1U
+#define VM_RECORD_GUARD 2U
+#define VM_RECORD_COUNT 16U
+struct VmRecord {
+    uint64_t address, bytes, resident;
+    uint32_t perms, kind;
+};
+struct VmRecords {
+    uint32_t version, size;
+    uint64_t cursor;
+    uint32_t count, reserved;
+    struct VmRecord records[VM_RECORD_COUNT];
+};

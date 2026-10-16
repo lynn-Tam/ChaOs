@@ -35,8 +35,6 @@ int main(int argc, char** argv) {
     bool line_start = true;
     msg_frame pending{};
     bool pending_valid{};
-    bool eof_pending{};
-    bool carriage_return{};
     uint64_t read_sequence = 0;
     uint64_t write_sequence = 0;
     for (;;) {
@@ -62,33 +60,10 @@ int main(int argc, char** argv) {
             }
         }
         if (!pending_valid) {
-            if (eof_pending) {
-                pending.operation = static_cast<uint64_t>(str_frame::End);
+            uint8_t byte{};
+            while (pending.size < sizeof(pending.data) && port.try_get(byte)) {
+                pending.data[pending.size++] = static_cast<char>(byte);
                 pending_valid = true;
-                eof_pending = false;
-            } else {
-                uint8_t byte{};
-                while (pending.size < sizeof(pending.data) && port.try_get(byte)) {
-                    if (byte == '\n' && carriage_return) {
-                        carriage_return = false;
-                        continue;
-                    }
-                    carriage_return = byte == '\r';
-                    if (carriage_return)
-                        byte = '\n';
-                    if (byte == 4) {
-                        if (pending.size == 0) {
-                            pending.operation = static_cast<uint64_t>(str_frame::End);
-                            pending_valid = true;
-                        } else
-                            eof_pending = true;
-                        break;
-                    }
-                    pending.data[pending.size++] = static_cast<char>(byte);
-                    pending_valid = true;
-                    if (byte == '\n')
-                        break;
-                }
             }
         }
         if (pending_valid) {
@@ -101,8 +76,6 @@ int main(int argc, char** argv) {
                 if (result.status != STATUS_OK) sys::exit(result.status);
             }
         }
-        if (!pending_valid && eof_pending)
-            continue;
         if (!pending_valid) {
             const auto observed = sys::irq_observe(irq);
             if (observed.status == STATUS_OK) {

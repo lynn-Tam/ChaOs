@@ -3,7 +3,7 @@
 #include <libk/assert.hpp>
 #include <libk/types.hpp>
 #include <cpu/cpu.hpp>
-#include <sched/sc.hpp>
+#include <task/thread.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync.hpp>
 
@@ -142,7 +142,7 @@ auto Wait::ready() const noexcept -> bool {
 auto Wait::begin(
     Completion& completion,
     Cpus& cpus,
-    sched::Sc& binding) noexcept -> bool {
+    Thread& binding) noexcept -> bool {
     {
         sync::Lock guard{lock_};
         if (phase_ != EdgePhase::Detached || completion.attached()) {
@@ -290,7 +290,7 @@ auto Wait::cancel() noexcept -> bool {
 
 void Wait::wake() noexcept {
     Cpus* cpus{};
-    sched::Sc* binding{};
+    Thread* binding{};
     {
         sync::Lock guard{lock_};
         libk_assert(phase_ == EdgePhase::Attached

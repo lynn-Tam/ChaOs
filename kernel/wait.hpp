@@ -8,7 +8,7 @@
 #include <sync.hpp>
 
 class Cpus;
-namespace sched { class Sc; }
+class Thread;
 
 class Wait;
 
@@ -125,7 +125,7 @@ public:
     [[nodiscard]] auto begin(
         Completion& completion,
         Cpus& cpus,
-        sched::Sc& binding) noexcept -> bool;
+        Thread& binding) noexcept -> bool;
     [[nodiscard]] auto finish() noexcept -> bool;
     [[nodiscard]] auto cancel() noexcept -> bool;
 
@@ -143,7 +143,7 @@ private:
 
     Completion* completion_{};
     Cpus* cpus_{};
-    sched::Sc* binding_{};
+    Thread* binding_{};
     mutable sync::Spin lock_{};
     std::atomic<bool> ready_{};
     EdgePhase phase_{EdgePhase::Detached};

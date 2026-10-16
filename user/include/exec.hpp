@@ -5,9 +5,6 @@
 #include <span>
 #include <string_view>
 
-inline constexpr rt_req rt_domain{"domain", 0, ObjDomain};
-inline constexpr rt_req rt_image{"image", 0, ObjMem};
-
 // The caller keeps this source mapping and its capability alive through exec.
 // perms records the offered view; the kernel still checks every derived map.
 struct pr_image {
@@ -34,9 +31,8 @@ struct pr_opts {
     std::span<const std::string_view> argv{};
     std::span<const pr_cap> caps{};
     pr_quota resources{};
-    pr_sched sched{};
+    uint32_t cpu{};
     pr_layout va{};
     cap_t events{}; // Borrowed parent receive capability; caller keeps it alive.
 };
-auto pr_exec(pr_task& task, const pr_auth& auth, const pr_image& image, const pr_opts& opts = {},
-             uint32_t first_cpu = 0) noexcept -> status_t;
+auto pr_exec(pr_task& task, const pr_auth& auth, const pr_image& image, const pr_opts& opts = {}) noexcept -> status_t;

@@ -300,13 +300,61 @@ auto VSpace::commit_flush(Tlb::Edit&& mutation, VmCtx ctx, Flush& retire, resour
     return (VmStatus::Pending);
 }
 
+void VSpace::link(Map& map) noexcept {
+    layout_.insert(map);
+    if (map.kind_ == MapKind::Map) mapped_ += map.range_.size();
+}
+void VSpace::unlink(Map& map) noexcept {
+    layout_.erase(map);
+    if (map.kind_ == MapKind::Map) mapped_ -= map.range_.size();
+}
+auto VSpace::info(u64) const noexcept -> VSpaceInfo {
+    sync::Lock guard{lock_};
+    return {.version = 1, .size = sizeof(VSpaceInfo), .mapped = mapped_, .resident = resident_,
+        .state = static_cast<u32>(state_), .reserved = 0};
+}
+
+auto VSpace::inspect(VRange scope, va_t cursor) const noexcept -> std::expected<VmRecords, VSpaceError> {
+    sync::Lock guard{lock_};
+    if (!cursor.raw()) cursor = scope.base();
+    const auto end = scope.limit();
+    if (!end || cursor < scope.base() || cursor >= *end || cursor.raw() % page_size)
+        return std::unexpected(VSpaceError::InvalidRange);
+    VmRecords info{};
+    info.version = 1; info.size = sizeof(info);
+    auto* map = layout_.lower_bound(cursor);
+    if (!map || map->range_.base() > cursor) {
+        auto* previous = map ? layout_.previous(*map) : layout_.maximum();
+        if (previous && previous->range_.contains(VRange{cursor, page_size})) map = previous;
+    }
+    while (map && map->range_.base() < *end && info.count < VM_RECORD_COUNT) {
+        const auto first = std::max(cursor.raw(), map->range_.base().raw());
+        const auto last = std::min({map->range_.limit()->raw(), end->raw(), first + 64 * page_size});
+        auto& row = info.records[info.count++];
+        row.address = first; row.bytes = last - first; row.perms = map->perms_.raw();
+        row.kind = map->kind_ == MapKind::Map ? VM_RECORD_MAP
+            : map->kind_ == MapKind::Reserved ? VM_RECORD_RESERVED : VM_RECORD_GUARD;
+        if (map->binding_ && map->binding_->memory_->managed()) {
+            const auto& pages = map->binding_->pages_;
+            for (auto* page = pages.lower_bound(va_t{first}); page && page->address_.raw() < last; page = pages.next(*page))
+                row.resident += page_size;
+        }
+        cursor = va_t{last};
+        if (cursor == *end) break;
+        if (cursor == *map->range_.limit()) map = layout_.next(*map);
+    }
+    if (map && map->range_.base() < *end && cursor < *end) info.cursor = cursor.raw();
+    return info;
+}
+
 void VSpace::queue_layout(Map& node) noexcept {
     libk_assert(node.pending_next_ == nullptr);
     node.pending_next_ = receipt_->maps;
     receipt_->maps = &node;
 }
 
-void VSpace::queue_page(MapPage& page) noexcept {
+void VSpace::queue_page(MapPage& page, bool removed) noexcept {
+    if (removed && page.binding_->memory_->managed()) { libk_assert(resident_ >= page_size); resident_ -= page_size; }
     libk_assert(page.pending_next_ == nullptr);
     page.pending_next_ = receipt_->pages;
     receipt_->pages = &page;
@@ -429,7 +477,6 @@ auto VSpace::finish_pending(resource::Charge& refund) noexcept -> bool {
         destroy_layout(*node);
     }
     receipt_.reset();
-    for (auto& wait : waiters_) wait.ready_ = true;
     try_finish_retire();
     return true;
 }
@@ -438,7 +485,7 @@ void VSpace::wait_pending(mm::Fence& wait) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(!wait.hook_.is_linked());
-        if (receipt_) {
+        if (receipt_ || editing_ || draining_ || !retired_.empty()) {
             waiters_.push_back(wait);
             return;
         }
@@ -452,7 +499,9 @@ void VSpace::finish_waiters() noexcept {
         mm::Fence* ready{};
         {
             sync::Lock guard{lock_};
+            if (receipt_ || editing_ || draining_ || !retired_.empty()) return;
             for (auto& wait : waiters_) {
+                wait.ready_ = true;
                 if (wait.ready_) {
                     ready = &wait;
                     break;
@@ -532,6 +581,7 @@ void VSpace::end_edit() noexcept {
     }
     // Submit from actual obligations, after local rollback and outside lock_.
     if (wake) work_->post(job_);
+    else finish_waiters();
 }
 
 auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, VSpaceError> {
@@ -546,7 +596,7 @@ auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, V
     auto rollback = libk::scope_exit{[&]() noexcept { mappings_.destroy(*made->object); }};
     sync::Lock lock{lock_};
     if (state_ != VSpaceState::Live) return std::unexpected(VSpaceError::InvalidState);
-    layout_.insert(*made->object);
+    link(*made->object);
     rollback.release();
     return {};
 }
@@ -868,7 +918,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     if (prepared_head == nullptr) {
 
         auth->mappings_.push_back(*mapping);
-        layout_.insert(*mapping);
+        link(*mapping);
         layout.release();
         backing.release();
         return (MapResult{key, VmStatus::Complete});
@@ -877,7 +927,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     auto mutation = tlb_.begin();
 
     auth->mappings_.push_back(*mapping);
-    layout_.insert(*mapping);
+    link(*mapping);
     auto& editor = *root_;
     while (prepared_head != nullptr) {
         MapPage* const page = prepared_head;
@@ -891,6 +941,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
         auto installed = editor.map(*virtual_page, page->page(), *permissions, tables.pages);
         libk_assert(installed);
         auth->pages_.insert(*page);
+        if (memory.managed()) resident_ += page_size;
     }
     commit_tables(tables);
     layout.release();
@@ -1019,7 +1070,7 @@ auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clea
         auto* next = n == last ? nullptr : layout_.next(*n);
         const auto lo = std::max(n->range_.base(), range.base());
         const auto hi = std::min(*n->range_.limit(), *range.limit());
-        layout_.erase(*n);
+        unlink(*n);
         if (n->binding_) {
             const auto offset = (lo.raw() - n->range_.base().raw()) / page_size;
             n->object_ = ObjectRange{n->object_.base() + offset, (hi.raw() - lo.raw()) / page_size};
@@ -1028,7 +1079,7 @@ auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clea
         if (clear) invalidate_views(*n);
         if (perms) {
             n->perms_ = *perms;
-            layout_.insert(*n);
+            link(*n);
         } else {
             queue_layout(*n);
         }
@@ -1064,7 +1115,7 @@ auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clea
     for (auto*& n : tails)
         if (n) {
             if (n->binding_) n->binding_->mappings_.push_back(*n);
-            layout_.insert(*n);
+            link(*n);
             n = nullptr;
         }
     if (!changed) {
@@ -1240,7 +1291,7 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
     auth.pages_.erase(source);
     auth.pages_.insert(*replacement);
     rollback.release();
-    queue_page(source);
+    queue_page(source, false);
     resource::Charge refund{};
     auto committed = commit_flush(std::move(mutation), ctx, retire, refund);
     lock.restore();
@@ -1326,6 +1377,7 @@ auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize
     commit_tables(tables);
     page->pending_next_ = nullptr;
     auth.pages_.insert(*page);
+    if (memory->managed()) resident_ += page_size;
     rollback.release();
     auto& retire = receipt_.emplace(*pmm_, *this).flush;
     resource::Charge refund{};
@@ -1486,7 +1538,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expec
         if (auth.invalidation_hook_.is_linked()) invalidations_.erase(auth);
         for (auto& mapping : auth.mappings_) {
             invalidate_views(mapping);
-            if (mapping.layout_hook_.is_linked()) layout_.erase(mapping);
+            if (mapping.layout_hook_.is_linked()) unlink(mapping);
             queue_layout(mapping);
         }
     }

@@ -86,9 +86,50 @@ inline void yield() noexcept {
     return call(SYS_SC_BIND, context, thread);
 }
 
-[[nodiscard]] inline auto execution_start(cap_t target) noexcept
+[[nodiscard]] inline auto group_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_GROUP_INFO, target, offset);
+}
+[[nodiscard]] inline auto vspace_records(cap_t target, word_t cursor = 0, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_VSPACE_RECORDS, target, offset, cursor);
+}
+
+[[nodiscard]] inline auto vspace_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_VSPACE_INFO, target, offset);
+}
+[[nodiscard]] inline auto cspace_info(cap_t target, cap_t cursor = 0, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_CSPACE_INFO, target, offset, cursor);
+}
+
+[[nodiscard]] inline auto thread_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_THREAD_INFO, target, offset);
+}
+[[nodiscard]] inline auto sc_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_SC_INFO, target, offset);
+}
+[[nodiscard]] inline auto execution_stop(cap_t target) noexcept -> SysResult {
+    return call(SYS_EXECUTION_STOP, target);
+}
+[[nodiscard]] inline auto execution_detach(cap_t target, word_t generation) noexcept -> SysResult {
+    return call(SYS_EXECUTION_DETACH, target, generation);
+}
+[[nodiscard]] inline auto sc_watch(cap_t target, cap_t notice, word_t badge) noexcept -> SysResult {
+    return call(SYS_SC_WATCH, target, notice, badge);
+}
+[[nodiscard]] inline auto execution_watch(cap_t target, cap_t notice, word_t badge) noexcept -> SysResult {
+    return call(SYS_EXECUTION_WATCH, target, notice, badge);
+}
+[[nodiscard]] inline auto sc_configure(cap_t target, word_t budget, word_t period,
+                                      word_t weight, word_t cpus) noexcept -> SysResult {
+    return call(SYS_SC_CONFIGURE, target, budget, period, weight, cpus);
+}
+
+[[nodiscard]] inline auto sc_unbind(cap_t context, word_t generation) noexcept -> SysResult {
+    return call(SYS_SC_UNBIND, context, generation);
+}
+
+[[nodiscard]] inline auto execution_set(cap_t target, bool enabled) noexcept
     -> SysResult {
-    return call(SYS_EXECUTION_START, target);
+    return call(SYS_EXECUTION_SET, target, enabled);
 }
 
 [[nodiscard]] inline auto cap_close(cap_t capability) noexcept
@@ -275,10 +316,10 @@ inline void yield() noexcept {
     cap_t vspace,
     cap_t cspace,
     cap_t start_memory,
-    word_t start_offset = 0) noexcept -> SysResult {
+    word_t start_offset, word_t home_cpu) noexcept -> SysResult {
     return call(
         SYS_THREAD_CREATE,
-        pool, vspace, cspace, start_memory, start_offset);
+        pool, vspace, cspace, start_memory, start_offset, home_cpu);
 }
 
 [[nodiscard]] inline auto sc_create(
@@ -286,11 +327,11 @@ inline void yield() noexcept {
     cap_t domain,
     word_t budget_ns,
     word_t period_ns,
-    word_t urgency,
-    word_t home_cpu) noexcept -> SysResult {
+    word_t weight,
+    word_t cpus) noexcept -> SysResult {
     return call(
         SYS_SC_CREATE,
-        pool, domain, budget_ns, period_ns, urgency, home_cpu);
+        pool, domain, budget_ns, period_ns, weight, cpus);
 }
 
 [[nodiscard]] inline auto notification_create(

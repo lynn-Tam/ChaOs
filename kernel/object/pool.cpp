@@ -257,6 +257,13 @@ auto group::reserve(
     return reserve(parent.ref_, charge);
 }
 
+auto group::info(u64) const noexcept -> GroupInfo {
+    sync::Lock guard{lock_};
+    const auto limit = account_.limit(), available = account_.available();
+    return {.version = 1, .size = sizeof(GroupInfo), .memory_limit = limit.memory,
+        .memory_available = available.memory, .cap_limit = limit.caps, .caps_available = available.caps,
+        .sponsors = sponsorship_count_, .reservations = account_.pending(), .state = static_cast<u32>(state_), .reserved = 0};
+}
 auto group::limit() const noexcept -> budget {
     sync::Lock guard{lock_};
     return account_.limit();

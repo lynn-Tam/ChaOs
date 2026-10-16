@@ -34,9 +34,9 @@ class Member;
 class group final : private libk::noncopyable_nonmovable {
   public:
     enum class phase : u8 {
-        open,
-        closing,
-        closed,
+        open = GROUP_OPEN,
+        closing = GROUP_CLOSING,
+        closed = GROUP_CLOSED,
     };
 
     explicit group(resource::budget limit) noexcept;
@@ -45,6 +45,7 @@ class group final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto reserve(ref<> self, resource::budget charge) noexcept
         -> std::expected<resource::Reservation, resource::errc>;
 
+    auto info(u64) const noexcept -> GroupInfo;
     [[nodiscard]] auto limit() const noexcept -> resource::budget;
     [[nodiscard]] auto available() const noexcept -> resource::budget;
     [[nodiscard]] auto sponsorship_count() const noexcept -> usize;

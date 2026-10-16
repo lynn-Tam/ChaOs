@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, directory,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
-    if (argc < 2) return print("fs stat/touch FILE | write/append FILE TEXT | save FILE [-a] | mkdir/rm PATH | mv OLD NEW | device | volid | sync\n");
+    if (argc < 2) return print("fs stat/create FILE | write/append FILE TEXT | save FILE [-a] | mkdir/rm PATH | mv OLD NEW | device | volid | sync\n");
     const std::string_view command = argv[1];
     if (command == "sync" && argc == 2) return px_sync();
     if ((command == "device" || command == "volid") && argc == 2) {
@@ -58,10 +58,10 @@ int main(int argc, char** argv) {
     const bool writing = argc >= 4 && (command == "write" || command == "append");
     const bool reading = argc == 3 && command == "stat";
     const bool saving = command == "save" && (argc == 3 || (argc == 4 && std::string_view{argv[3]} == "-a"));
-    const bool touch = argc == 3 && command == "touch";
-    if (!writing && !reading && !touch && !saving) return 1;
+    const bool create = argc == 3 && command == "create";
+    if (!writing && !reading && !create && !saving) return 1;
     const int flags = reading ? O_RDONLY : O_WRONLY | O_CREAT
-        | ((command == "append" || (saving && argc == 4)) ? O_APPEND : touch ? 0 : O_TRUNC);
+        | ((command == "append" || (saving && argc == 4)) ? O_APPEND : create ? 0 : O_TRUNC);
     const int fd = open(argv[2], flags, 0);
     if (fd < 0) return fd;
     int status{};

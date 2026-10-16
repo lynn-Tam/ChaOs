@@ -9,6 +9,28 @@
 
 namespace cap {
 
+auto describe(ObjKind kind, View view) noexcept -> CapView {
+    CapView result{.version = CAP_ATTENUATION_VERSION_CURRENT, .kind = kind,
+        .size = sizeof(CapView), .rights = view.rights.raw(), .words = {}};
+    std::visit([&]<class T>(const T& limit) noexcept {
+        auto& w = result.words;
+        if constexpr (std::is_same_v<T, MemLimit> || std::is_same_v<T, VmLimit> || std::is_same_v<T, PhysLimit>) {
+            if constexpr (std::is_same_v<T, MemLimit>) w[0] = limit.range.base();
+            else w[0] = limit.range.base().raw();
+            w[1] = limit.range.size();
+            if constexpr (!std::is_same_v<T, PhysLimit>) w[2] = limit.perms.raw();
+        } else if constexpr (std::is_same_v<T, Quota>) {
+            w[0] = limit.budget.memory; w[1] = limit.budget.caps; w[2] = limit.object_kinds;
+        } else if constexpr (std::is_same_v<T, IndexLimit>) {
+            w[0] = limit.first; w[1] = limit.count;
+        } else if constexpr (std::is_same_v<T, Badge>) w[0] = limit.badge;
+        else if constexpr (std::is_same_v<T, ChanLimit>) {
+            w[0] = static_cast<u64>(limit.side); w[1] = limit.badge; w[2] = limit.fixed;
+        } else if constexpr (std::is_same_v<T, IrqRoute>) { w[0] = limit.source; w[1] = limit.level; }
+    }, view.data);
+    return result;
+}
+
 constexpr Rights memory_rights = Rights::of(
     Right::Duplicate,
     Right::Delegate,
@@ -156,7 +178,7 @@ static auto select(ObjKind kind, F fn, R missing) noexcept -> R {
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Observe, Right::Revoke));
     case ObjSc:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Attach, Right::Destroy, Right::Revoke));
     case ObjDomain:
         return fn.template operator()<std::monostate>(Rights::of(
             Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Revoke));

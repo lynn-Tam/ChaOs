@@ -9,7 +9,19 @@
 CALL(YIELD, 0, yield, Call)
 CALL(EXIT, 1, exit, Call)
 CALL(SC_BIND, 2, sc_bind, Call) /* a0=SC, a1=Thread */
-CALL(EXECUTION_START, 3, thread_start, Call) /* a0=Thread */
+CALL(EXECUTION_SET, 3, execution_set, Call) /* a0=Thread, a1=enabled; returns intent sequence */
+CALL(EXECUTION_DETACH, 9, execution_detach, Call) /* a0=Thread(Control), a1=expected association generation */
+CALL(SC_CONFIGURE, 5, sc_configure, Call) /* a0=SC(Control), a1=budget ns, a2=period ns, a3=weight, a4=CPU mask; unbound only */
+CALL(EXECUTION_WATCH, 6, execution_watch, Call) /* a0=Thread(Inspect), a1=Notification(Receive), a2=badge */
+CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), a1=IPC offset */
+CALL(GROUP_INFO, 10, info_call, Call) /* a0=Group(Inspect), a1=IPC offset */
+CALL(VSPACE_INFO, 11, info_call, Call) /* a0=VSpace(Inspect), a1=IPC offset; whole-space authority */
+CALL(EXECUTION_STOP, 15, execution_stop, Call) /* a0=Thread(Control); irreversible intent, Exit remains observable */
+CALL(SC_WATCH, 14, execution_watch, Call) /* a0=SC(Inspect), a1=Notification(Receive), a2=badge */
+CALL(VSPACE_RECORDS, 13, vm_records, Call) /* a0=VSpace(Inspect), a1=IPC offset, a2=address cursor; bounded records within VmLimit */
+CALL(CSPACE_INFO, 12, cspace_info, Call) /* a0=CSpace(Inspect), a1=IPC offset, a2=cursor */
+CALL(SC_INFO, 8, info_call, Call) /* a0=SC(Inspect), a1=IPC offset */
+CALL(SC_UNBIND, 4, sc_unbind, Call) /* a0=SC, a1=expected association generation */
 
 CALL(CAP_CLOSE, 16, cap_call, Call) /* a0=selector, a1=dest CSpace (0=current) */
 CALL(CAP_DUPLICATE, 17, cap_call, Call)
@@ -37,8 +49,8 @@ CALL(RESOURCE_CREATE_CHILD, 48, resource_create_child, Create) /* a1=memory, a2=
 CALL(MEMORY_CREATE, 49, memory_create, Create) /* a1=bytes, a2=access bits */
 CALL(VSPACE_CREATE, 50, vspace_create, Create)
 CALL(CSPACE_CREATE, 51, cspace_create, Create) /* a1=slot quota, a2=page quota */
-CALL(SC_CREATE, 52, sc_create, Create) /* a1=domain, a2=budget ns, a3=period ns, a4=urgency, a5=cpu */
-CALL(THREAD_CREATE, 53, thread_create, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset */
+CALL(SC_CREATE, 52, sc_create, Create) /* a1=domain, a2=budget ns, a3=period ns, a4=weight, a5=CPU mask */
+CALL(THREAD_CREATE, 53, thread_create, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset, a5=home cpu */
 CALL(NOTIFICATION_CREATE, 54, notification_create, Create) /* a1=immutable signal badge */
 CALL(CHANNEL_CREATE, 58, channel_create, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations */
 CALL(PAGER_CREATE, 59, pager_create, Create) /* a0=ResourcePool */

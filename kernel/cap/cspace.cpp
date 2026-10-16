@@ -12,6 +12,48 @@
 
 namespace cap {
 
+auto CSpace::inspect(Handle cursor) noexcept -> std::expected<CSpaceInfo, CSpaceError> {
+    std::array<GrantRef, CAP_INFO_PAGE> grants;
+    std::array<View, CAP_INFO_PAGE> views;
+    CSpaceInfo info{};
+    info.version = 1; info.size = sizeof(info);
+    {
+        sync::Lock guard{lock_};
+        if (!accepting_) return std::unexpected(CSpaceError::InvalidState);
+        auto index = occupied_head_;
+        if (cursor) {
+            auto* previous = slot(cursor.index());
+            if (!previous || previous->generation != cursor.generation() || previous->state != SlotState::Occupied)
+                return std::unexpected(CSpaceError::InvalidHandle);
+            index = previous->next;
+        }
+        info.slots = live_slots_; info.pages = page_count_;
+        while (index != invalid_index && info.count < CAP_INFO_PAGE) {
+            auto& row = *slot(index);
+            const auto n = info.count++;
+            info.records[n].selector = Handle::make(index, row.generation).raw();
+            info.records[n].state = CAP_INFO_UNAVAILABLE;
+            views[n] = row.storage.capability.view;
+            auto copy = row.storage.capability.grant.clone();
+            if (copy) grants[n] = std::move(*copy);
+            index = row.next;
+        }
+        if (index != invalid_index) info.cursor = info.records[info.count - 1].selector;
+    }
+    // Grant authority is resolved after releasing the CSpace lock. Each record
+    // is a short snapshot, with no object references escaping to the caller.
+    for (usize n = 0; n < info.count; ++n) {
+        if (!grants[n]) continue;
+        auto lease = grants[n].acquire();
+        if (!lease) continue;
+        auto view = compose(lease->kind(), lease->ceiling(), views[n]);
+        if (!view || !lease->target_live()) continue;
+        info.records[n].state = CAP_INFO_VALID;
+        info.records[n].view = describe(lease->kind(), *view);
+    }
+    return info;
+}
+
 CSpace::CSpace(mm::Pmm& pmm) noexcept
     : CSpace(pmm, Quota{}) {}
 

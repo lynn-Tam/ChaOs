@@ -156,8 +156,7 @@ class pr_loader {
     }
 };
 
-auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_opts& o,
-             uint32_t first_cpu) noexcept -> status_t {
+auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_opts& o) noexcept -> status_t {
     const auto mod = libk::elf_view::parse(image.bytes);
     const auto build = [&]() noexcept -> status_t {
         if (image.offset > UINT64_MAX - image.bytes.size())
@@ -178,7 +177,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         if (binding_size > UINT32_MAX)
             return STATUS_BAD_ARGS;
         const auto binding_bytes = libk::checked_align_up(binding_size, page_size).value_or(0);
-        if (!auth.cpus || !auth.domain) return STATUS_BAD_ARGS;
+        if (!auth.cpus || o.cpu >= auth.cpus) return STATUS_BAD_ARGS;
         std::vector<std::pair<word_t, word_t>> ranges{
             {o.va.stack, o.va.stack_size}, {o.va.bindings, binding_bytes}, {o.va.ipc, page_size}};
         for (size_t i = 0; i < mod.segment_count(); ++i) {
@@ -238,8 +237,8 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
              std::array{std::tuple{AT_SYS_POOL, r.pool(), o.resources.pool_perms},
                         std::tuple{AT_SYS_VSPACE, r.vspace(),
                                    word_t{RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP |
-                                          RIGHT_DESTROY}},
-                        std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE}},
+                                          RIGHT_DESTROY | RIGHT_INSPECT}},
+                        std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_EVENTS, events->selector(),
                                    word_t{RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
             const auto copy = sys::cap_duplicate(cap, r.cspace(), rights);
@@ -337,7 +336,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
             return s;
         s = scratch.close();
         return s == STATUS_OK
-                   ? r.start(desc->selector(), auth.domain, auth.cpus, o.sched, o.events, first_cpu)
+                   ? r.prepare(desc->selector(), o.events, o.cpu)
                    : s;
     };
     const auto status = build();

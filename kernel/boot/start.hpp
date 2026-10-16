@@ -9,7 +9,7 @@
 #include <ipc/notification.hpp>
 #include <mm/pager.hpp>
 #include <object/pool.hpp>
-#include <sched/domain.hpp>
+#include <sched/sc.hpp>
 
 // Cold ownership only. Runtime code borrows the concrete entities it needs;
 // none of these resources are destroyed while CPUs can still execute.
@@ -30,9 +30,8 @@ struct Boot {
     object::ref<mm::Phys> physical;
     struct Worker {
         Cpus& cpus;
-        object::ref<sched::Sc> sc{};
         object::ref<Thread> thread{};
-        void operator()() noexcept { libk_assert(sc && sched::wake(cpus, sc.get())); }
+        void operator()() noexcept { libk_assert(thread && sched::wake(cpus, thread.get())); }
     } worker;
 };
 

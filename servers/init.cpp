@@ -4,6 +4,7 @@
 #include <protocols/block.hpp>
 #include <protocols/stream.hpp>
 #include <protocols/service.hpp>
+#include <protocols/manage.hpp>
 #include <servers/fw.hpp>
 #include <servers/devices.hpp>
 #include <charconv>
@@ -41,11 +42,13 @@ struct sv_svc {
     std::vector<pr_cap> grants;
     std::deque<sv_export> exports;
     std::vector<sv_import> imports;
-    bool await_ready{}, desired{true}, registry{}, admin{}, launcher{};
+    bool await_ready{}, desired{true}, registry{}, manage{}, launcher{};
     sv_state state{sv_state::Starting};
-    word_t badge{};
+    word_t badge{}, incarnation{};
     std::unique_ptr<pr_task> task;
     cap_owner ready_event, memory_pool, lifecycle;
+    std::vector<cap_owner> contexts;
+    uint32_t execution_slots{};
     auto publish(rt_req contract, word_t depth = 4, word_t transfers = 4, word_t side = 1,
                  word_t rights = RIGHT_RECEIVE) -> sv_export& {
         return exports.emplace_back(this, contract, depth, transfers, 2, side, rights);
@@ -61,6 +64,9 @@ struct sv_svc {
         });
     }
 };
+static void sv_notify(sv_svc& service) {
+    if (service.lifecycle) (void)msg_send(service.lifecycle.selector(), {}, false);
+}
 static std::deque<std::unique_ptr<sv_svc>> instances;
 static auto services = instances | std::views::transform([](auto& p) -> sv_svc& { return *p; });
 static word_t next_badge{};
@@ -107,12 +113,31 @@ static auto sv_fixed(rt_req contract, cap_t source, word_t rights, word_t first 
                              .words = {first, count, perms}}};
 }
 static auto start(sv_svc& service, const rt_env& info, cap_t events, cap_t registry) -> status_t {
+    ++service.incarnation;
     service.task = std::make_unique<pr_task>();
     auto caps = service.grants;
+    while (service.contexts.size() < service.execution_slots) {
+        const auto sc = sys::sc_create(info.pool, fw_root(info).domain, 0, 0, 1024, (uint64_t{1} << info.cpus) - 1);
+        if (sc.status != STATUS_OK) return sc.status;
+        service.contexts.emplace_back(sc.value);
+    }
+    std::vector<std::string> context_names;
+    context_names.reserve(service.contexts.size());
+    for (size_t i = 0; i < service.contexts.size(); ++i) {
+        context_names.push_back("cpu." + std::to_string(i));
+        caps.push_back({.contract = {context_names.back().c_str(), 0, ObjSc},
+            .cap = service.contexts[i].selector(),
+            .limit = word_t{RIGHT_DUPLICATE | RIGHT_DELEGATE | RIGHT_ATTACH | RIGHT_INSPECT}});
+    }
     for (const auto& grant : service.donations) {
         const auto& spec = grant.spec;
         caps.push_back({.contract={spec.name, spec.protocol, spec.kind, spec.major, spec.minor},
             .bytes=spec.bytes, .cap=grant.cap.selector(), .limit=word_t{spec.rights}});
+    }
+    if (service.manage) {
+        const auto principal = (uint64_t{1} << 63) | (service.badge << 8);
+        caps.push_back(sv_cap(mg_tasks, registry, RIGHT_SEND | RIGHT_DUPLICATE, 1, principal | mg_control));
+        caps.push_back(sv_cap(mg_tasks_view, registry, RIGHT_SEND | RIGHT_DUPLICATE, 1, principal | mg_observe));
     }
     if (service.registry)
         caps.push_back(sv_cap(sv_service, registry, RIGHT_SEND, 1, service.badge));
@@ -141,14 +166,20 @@ static auto start(sv_svc& service, const rt_env& info, cap_t events, cap_t regis
     if (!mod)
         return STATUS_NOT_FOUND;
     std::vector<std::string_view> argv{service.args.begin(), service.args.end()};
-    return pr_exec(*service.task,
-                {info.pool, fw_root(info).domain, info.vspace, static_cast<uint32_t>(info.cpus)},
+    auto status = pr_exec(*service.task,
+                {info.pool, info.vspace, static_cast<uint32_t>(info.cpus)},
                 pr_image{.bytes = mod->data},
                 {.argv = argv,
                  .caps = caps,
                  .resources = service.quota,
-                 .sched = {.budget = 600'000},
                  .events = events});
+    if (status == STATUS_OK) {
+        const auto sc = sys::sc_create(service.task->pool(), fw_root(info).domain, 0, 0, 1024, (uint64_t{1} << info.cpus) - 1);
+        status = sc.status;
+        if (status == STATUS_OK) status = service.task->start(cap_owner{sc.value});
+    }
+    if (status != STATUS_OK) static_cast<void>(service.task->stop(status));
+    return status;
 }
 // Imports and declared component ownership form the deployment DAG.
 static void recover(sv_svc& failed) {
@@ -161,6 +192,99 @@ static void recover(sv_svc& failed) {
             }))
             recover(service);
 }
+static auto sv_depends(const sv_svc& consumer, const sv_svc& provider) -> bool {
+    if (&consumer == &provider) return true;
+    if (consumer.owner && sv_depends(*consumer.owner, provider)) return true;
+    return std::ranges::any_of(consumer.imports, [&](const auto& input) {
+        return input.link == sv_link::Restart && input.source->provider
+            && sv_depends(*input.source->provider, provider);
+    });
+}
+static auto sv_managed(const sv_svc& target, const sv_svc* owner) -> bool {
+    if (!owner) return true;
+    for (auto* parent = target.owner; parent; parent = parent->owner) if (parent == owner) return true;
+    return false;
+}
+static void sv_manage(const msg_packet& packet, msg_reply& response,
+                      sv_svc* owner, sv_svc* observer, bool control) {
+    const auto& request = packet.message;
+    auto& message = response.message;
+    message.status = STATUS_NOT_FOUND;
+    sv_svc* target{};
+    const auto op = static_cast<mg_op>(request.operation);
+    for (auto& service : services)
+        if (sv_managed(service, owner) && (op == mg_op::Tasks ? service.badge > request.value : service.badge == request.value)) {
+            target = &service; break;
+        }
+    if (!target) return;
+    auto& service = *target;
+    const bool allowed = control && (!observer || !sv_depends(*observer, service)) && (!service.owner || owner);
+    if (op == mg_op::Tasks || op == mg_op::Task) {
+        mg_task info{service.badge, service.incarnation, service.owner ? service.owner->badge : 0,
+            UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, static_cast<uint32_t>(service.state),
+            static_cast<uint32_t>(mg_observe | (allowed ? mg_control | mg_close | mg_pause | mg_resume | mg_stop | mg_start | mg_restart : 0)), {}};
+        if (service.task) {
+            if (const auto thread = service.task->info()) {
+                info.runtime = thread->runtime;
+                if (service.state == sv_state::Running && !(thread->flags & THREAD_ENABLED))
+                    info.state = static_cast<uint32_t>(thread->requested == thread->applied
+                        ? mg_state::Suspended : mg_state::Suspending);
+            }
+            if (const auto memory = service.task->memory_info()) info.resident = memory->resident;
+            if (const auto quota = service.task->resource_info()) {
+                info.charged = quota->memory_limit - quota->memory_available; info.limit = quota->memory_limit;
+            }
+        }
+        ::memcpy(info.name, service.name.data(), std::min(service.name.size(), sizeof(info.name) - 1));
+        mg_pack(message, info); message.value = info.id;
+        message.deadline = sys::clock_now().value;
+        return;
+    }
+    if (request.size != sizeof(mg_target)) { message.status = STATUS_BAD_ARGS; return; }
+    mg_target expected; ::memcpy(&expected, request.data, sizeof(expected));
+    if (expected.incarnation != service.incarnation) { message.status = STATUS_STALE; return; }
+    if (op == mg_op::Dependencies) {
+        const auto index = expected.argument;
+        if (index >= service.imports.size()) return;
+        const auto& input = service.imports[index];
+        const auto* provider = input.source->provider;
+        mg_dependency edge{provider && sv_managed(*provider, owner) ? provider->badge : 0,
+            provider && sv_managed(*provider, owner) ? provider->incarnation : 0,
+            input.contract.protocol, input.contract.major, input.contract.minor,
+            input.link == sv_link::Restart ? 1U : 2U, {}};
+        const std::string_view name{input.contract.name};
+        ::memcpy(edge.name, name.data(), std::min(name.size(), sizeof(edge.name) - 1));
+        mg_pack(message, edge); message.value = index + 1; return;
+    }
+    if (op == mg_op::Caps) {
+        if (!service.task) { message.status = STATUS_CLOSED; return; }
+        const auto caps = service.task->capabilities(expected.argument);
+        if (!caps) { message.status = caps.error(); return; }
+        if (!caps->count) return;
+        mg_pack(message, caps->records[0]);
+        message.value = caps->count > 1 || caps->cursor ? caps->records[0].selector : 0;
+        return;
+    }
+    if (!allowed) { message.status = STATUS_DENIED; return; }
+    if (op == mg_op::CloseCap) {
+        message.status = service.task ? sys::cap_close(expected.argument, service.task->cspace()).status : STATUS_CLOSED;
+        if (message.status == STATUS_INVALID_CAP) message.status = STATUS_STALE;
+        return;
+    }
+    if (op != mg_op::Action) { message.status = STATUS_BAD_ARGS; return; }
+    const auto action = static_cast<mg_action>(request.status);
+    if (action == mg_action::Pause || action == mg_action::Resume) {
+        message.status = service.task ? service.task->execution(action == mg_action::Resume).status : STATUS_CLOSED;
+    } else if (action == mg_action::Start || action == mg_action::Stop || action == mg_action::Restart) {
+        service.desired = action != mg_action::Stop;
+        if (action == mg_action::Start) {
+            if (service.state == sv_state::Stopped || service.state == sv_state::Failed) service.state = sv_state::Starting;
+        } else recover(service);
+        sv_notify(service);
+        message.status = STATUS_OK;
+    } else message.status = STATUS_BAD_ARGS;
+}
+
 int main() {
     const auto& info = rt_startup();
 
@@ -288,6 +412,7 @@ int main() {
     if (irq) devices.grants.push_back({.contract=dv_interrupts, .cap=irq->selector(), .limit=word_t{RIGHT_CREATE}});
     if (iommu) devices.grants.push_back({.contract=dv_iommu, .cap=iommu.selector(), .limit=word_t{RIGHT_CREATE}});
     share(devices, 4 * 1024 * 1024);
+    auto& device_management = devices.publish(mg_devices, 8, 1, 1, RIGHT_RECEIVE);
     auto& disk = devices.publish(blk_service, 4, 4, 1, RIGHT_RECEIVE | RIGHT_DUPLICATE);
     disk.provider = nullptr; // The manager selects an actual driver process.
     if (iommu && archive.find("store")) {
@@ -318,8 +443,10 @@ int main() {
                        .slots = 1024,
                        .pages = 132,
                        .pool_perms = RIGHT_CREATE | RIGHT_SPLIT});
-    shell.registry = shell.admin = true;
-    shell.grants = {sv_fixed(rt_domain, fw_root(info).domain, RIGHT_DUPLICATE | RIGHT_CONTROL)};
+    shell.registry = shell.manage = true;
+    shell.execution_slots = 8;
+    shell.use(device_management, mg_devices_view, mg_observe, RIGHT_SEND | RIGHT_DUPLICATE, 0, sv_link::Reconnect);
+    shell.use(device_management, mg_devices, mg_control, RIGHT_SEND | RIGHT_DUPLICATE, 0, sv_link::Reconnect);
     shell.use(mount, vfs_service, fl_read | fl_write, RIGHT_SEND | RIGHT_DUPLICATE, 0,
               sv_link::Reconnect);
     shell.use(mount, vfs_read, fl_read, RIGHT_SEND | RIGHT_DUPLICATE, 0, sv_link::Reconnect);
@@ -349,7 +476,7 @@ int main() {
                     const auto ready = sys::notification_take(service.ready_event.selector());
                     if (ready.status == STATUS_OK) {
                         service.state = sv_state::Running;
-                        if (service.lifecycle) (void)sys::notification_signal(service.lifecycle.selector());
+                        sv_notify(service);
                     }
                     else if (ready.status != STATUS_RETRY) sys::exit(ready.status);
                 }
@@ -387,7 +514,7 @@ int main() {
                 service.ready_event = {};
                 if (service.state == sv_state::Draining)
                     service.state = service.desired && !service.owner ? sv_state::Starting : sv_state::Stopped;
-                if (service.lifecycle) (void)sys::notification_signal(service.lifecycle.selector());
+                sv_notify(service);
             }
         for (auto& service : services)
             if (service.owner && service.state == sv_state::Stopped && !service.lifecycle)
@@ -409,6 +536,7 @@ int main() {
                         const auto status =
                             start(service, info, events.selector(), control.ends[1].selector());
                         service.state = status == STATUS_OK ? (service.await_ready ? sv_state::Starting : sv_state::Running) : sv_state::Failed;
+                        sv_notify(service);
                         if (status != STATUS_OK)
                             report(info, *console, status, service.name);
                         progress = true;
@@ -434,6 +562,17 @@ int main() {
             message.status = STATUS_NOT_FOUND;
             if (const auto status = rt_admit(request.deadline); status != STATUS_OK)
                 message.status = status;
+            else if (request.operation >= static_cast<uint64_t>(mg_op::Tasks)
+                && request.operation <= static_cast<uint64_t>(mg_op::CloseCap)) {
+                if (packet.badge & (uint64_t{1} << 63)) {
+                    const auto observer_id = (packet.badge & ~(uint64_t{1} << 63)) >> 8;
+                    const auto observer = std::ranges::find(services, observer_id, &sv_svc::badge);
+                    if (observer == services.end()) message.status = STATUS_DENIED;
+                    else sv_manage(packet, response, nullptr, &*observer, (packet.badge & 255) == mg_control);
+                } else if (caller != services.end() && (*caller).launcher)
+                    sv_manage(packet, response, &*caller, nullptr, true);
+                else message.status = STATUS_DENIED;
+            }
             else if (caller == services.end() || !(*caller).registry)
                 message.status = STATUS_DENIED;
             else if (request.operation == static_cast<uint64_t>(sv_op::Lookup)) {
@@ -540,12 +679,12 @@ int main() {
                     std::erase_if(instances, [&](const auto& p) { return p.get() == target; });
                     message.status = STATUS_OK;
                 }
-            } else if (!(*caller).admin && !(*caller).launcher)
+            } else if (!(*caller).launcher)
                 message.status = STATUS_DENIED;
             else if (request.operation == static_cast<uint64_t>(sv_op::List)) {
                 const auto found = request.size ? std::ranges::find(services, std::string_view{request.data, request.size}, &sv_svc::name)
                     : request.value < services.size() ? std::next(services.begin(), request.value) : services.end();
-                if (found != services.end() && ((*caller).admin || (*found).owner == &*caller)) {
+                if (found != services.end() && ((*found).owner == &*caller)) {
                     const auto& service = *found;
                     message.status = STATUS_OK;
                     message.value = static_cast<uint64_t>(service.state);
@@ -564,14 +703,14 @@ int main() {
                     message.status = STATUS_BAD_ARGS;
                 else
                     for (auto& service : services)
-                        if (service.name == std::string_view{request.data, request.size} && ((*caller).admin || service.owner == &*caller)) {
+                        if (service.name == std::string_view{request.data, request.size} && (service.owner == &*caller)) {
                             service.desired =
                                 request.operation != static_cast<uint64_t>(sv_op::Stop);
                             if (request.operation == static_cast<uint64_t>(sv_op::Start)) {
                                 if ((service.state == sv_state::Stopped || service.state == sv_state::Failed) &&
                                     (!service.owner || !service.donations.empty())) service.state = sv_state::Starting;
                             } else recover(service);
-                            if (service.lifecycle) (void)sys::notification_signal(service.lifecycle.selector());
+                            sv_notify(service);
                             message.status = STATUS_OK;
                             break;
                         }

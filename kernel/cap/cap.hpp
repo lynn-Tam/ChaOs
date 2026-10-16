@@ -182,6 +182,8 @@ struct View final {
     Limits data{};
 };
 
+auto describe(ObjKind, View) noexcept -> CapView;
+
 enum class PolicyError : u8 {
     UnsupportedKind,
     InvalidRights,

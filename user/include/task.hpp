@@ -1,6 +1,8 @@
 #pragma once
 #include <cap.hpp>
 #include <optional>
+#include <start.hpp>
+#include <string.h>
 
 inline constexpr auto pr_retryable(status_t s) noexcept -> bool {
     return s == STATUS_BUSY || s == STATUS_RETRY;
@@ -14,17 +16,15 @@ struct pr_quota {
     word_t bytes{1024 * 1024}, caps{256}, kinds{pr_base_kinds};
     word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE};
 };
-struct pr_sched {
-    word_t budget{500'000}, period{10'000'000}, urgency{8};
-    uint32_t cpu{UINT32_MAX};
-};
 struct pr_exit { status_t status{}; };
-struct pr_auth { cap_t pool{}, domain{}, vspace{}; uint32_t cpus{}; };
+struct pr_auth { cap_t pool{}, vspace{}; uint32_t cpus{}; };
 
 class pr_task {
     enum class state { New, Running, Closing, Consumed };
     state state_{};
     status_t status_{};
+    bool closing_{};
+    word_t signals_{};
     cap_owner group_, vm_, cs_, thread_, sc_, ended_;
 public:
     pr_task() = default;
@@ -37,6 +37,9 @@ public:
     auto cspace() const noexcept -> cap_t { return cs_.selector(); }
     auto open(cap_t parent, const pr_quota& q) noexcept -> status_t {
         if (state_ != state::New || group_) return STATUS_BUSY;
+        const auto ended = sys::notification_create(parent, 1);
+        if (ended.status != STATUS_OK) return ended.status;
+        ended_ = cap_owner{ended.value};
         const auto g = sys::resource_create_child(parent, q.bytes, q.caps, q.kinds);
         if (g.value) group_ = cap_owner{g.value};
         if (g.status != STATUS_OK || !group_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
@@ -50,39 +53,73 @@ public:
 private:
     auto close() noexcept -> status_t {
         if (!group_) return STATUS_OK;
-        // Child slots belong to its CSpace, retired by group drain.
-        for (auto* cap : {&thread_, &sc_, &ended_, &cs_, &vm_}) {
-            const auto status = cap->close();
+        if (!closing_) {
+            for (auto* cap : {&thread_, &sc_, &cs_, &vm_}) {
+                const auto status = cap->close();
+                if (status != STATUS_OK) return status;
+            }
+            const auto status = sys::resource_close_async(pool(), ended_.selector(), 2).status;
             if (status != STATUS_OK) return status;
+            closing_ = true;
         }
-        const auto status = sys::resource_close(pool()).status;
-        return status == STATUS_OK ? group_.close() : status;
+        const auto ready = sys::notification_take(ended_.selector());
+        if (ready.status == STATUS_OK) signals_ |= ready.value;
+        else if (ready.status != STATUS_RETRY) return ready.status;
+        if (!(signals_ & 2)) return STATUS_WOULD_BLOCK;
+        auto status = group_.close();
+        if (status == STATUS_OK) status = ended_.close();
+        return status;
     }
 
 public:
-    auto start(cap_t desc, cap_t domain, uint32_t cpus, const pr_sched& sched,
-               cap_t events, uint32_t first_cpu = 0) noexcept -> status_t {
-        if (!domain || !cpus || thread_) return STATUS_BAD_ARGS;
-        const auto ended = events ? sys::cap_duplicate(events, 0, RIGHT_SIGNAL)
-                                  : sys::notification_create(pool(), 1);
-        ended_ = cap_owner{ended.value};
-        if (ended.status != STATUS_OK) return ended.status;
-        const auto thread = sys::thread_create(pool(), vspace(), cspace(), desc, 0);
+    auto thread() const noexcept -> cap_t { return thread_.selector(); }
+    auto prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t {
+        if (thread_) return STATUS_BUSY;
+        const auto thread = sys::thread_create(pool(), vspace(), cspace(), desc, 0, cpu);
         thread_ = cap_owner{thread.value};
         if (thread.status != STATUS_OK) return thread.status;
-        status_t status = STATUS_BUSY;
-        for (uint32_t i = 0; i < (sched.cpu == UINT32_MAX ? cpus : 1); ++i) {
-            const auto cpu = sched.cpu == UINT32_MAX ? (first_cpu + i) % cpus : sched.cpu;
-            const auto sc = sys::sc_create(pool(), domain, sched.budget, sched.period, sched.urgency, cpu);
-            sc_ = cap_owner{sc.value};
-            status = sc.status;
-            if (status != STATUS_BUSY) break;
-        }
-        if (status == STATUS_OK) status = sys::sc_bind(sc_.selector(), thread_.selector()).status;
-        if (status == STATUS_OK) status = sys::exit_bind(thread_.selector(), ended_.selector(), 1).status;
-        if (status == STATUS_OK) status = sys::execution_start(thread_.selector()).status;
+        auto status = sys::exit_bind(thread_.selector(), ended_.selector(), 1).status;
+        if (status == STATUS_OK) status = sys::execution_watch(thread_.selector(), events ? events : ended_.selector(), 1).status;
+        return status;
+    }
+    auto start(cap_owner sc) noexcept -> status_t {
+        if (!thread_ || sc_ || !sc) return STATUS_BAD_ARGS;
+        sc_ = std::move(sc);
+        auto status = sys::sc_bind(sc_.selector(), thread_.selector()).status;
+        if (status == STATUS_OK) status = sys::execution_set(thread_.selector(), true).status;
         if (status == STATUS_OK) state_ = state::Running;
         return status;
+    }
+    auto info() const noexcept -> std::expected<ThreadInfo, status_t> {
+        const auto result = sys::thread_info(thread_.selector());
+        if (result.status != STATUS_OK) return std::unexpected(result.status);
+        ThreadInfo info;
+        ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+        return info;
+    }
+    auto memory_info() const noexcept -> std::expected<VSpaceInfo, status_t> {
+        const auto result = sys::vspace_info(vspace());
+        if (result.status != STATUS_OK) return std::unexpected(result.status);
+        VSpaceInfo info;
+        ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+        return info;
+    }
+    auto resource_info() const noexcept -> std::expected<GroupInfo, status_t> {
+        const auto result = sys::group_info(pool());
+        if (result.status != STATUS_OK) return std::unexpected(result.status);
+        GroupInfo info;
+        ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+        return info;
+    }
+    auto capabilities(cap_t cursor) const noexcept -> std::expected<CSpaceInfo, status_t> {
+        const auto result = sys::cspace_info(cspace(), cursor);
+        if (result.status != STATUS_OK) return std::unexpected(result.status);
+        CSpaceInfo info;
+        ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+        return info;
+    }
+    auto execution(bool enabled) noexcept -> sys::SysResult {
+        return sys::execution_set(thread_.selector(), enabled);
     }
     auto observe() noexcept -> sys::SysResult {
         if (state_ == state::Consumed) return {.status = STATUS_INVALID_CAP};
@@ -95,11 +132,15 @@ public:
         if (state_ == state::Closing) return STATUS_OK;
         const auto ended = state_ == state::Running ? sys::exit_query(thread_.selector()) : sys::SysResult{};
         if (ended.status != STATUS_OK) return ended.status;
+        if (thread_) {
+            const auto status = sys::execution_stop(thread_.selector()).status;
+            if (status != STATUS_OK) return status;
+        }
         state_ = state::Closing;
         status_ = ended.value ? static_cast<status_t>(ended.value2) : reason;
-        const auto status = close();
-        return status == STATUS_BUSY || status == STATUS_RETRY ? STATUS_OK : status;
+        return STATUS_OK;
     }
+
     auto poll() noexcept -> status_t {
         if (state_ == state::Consumed) return STATUS_INVALID_CAP;
         if (state_ != state::Closing) {
@@ -108,6 +149,12 @@ public:
             if (!ended.value) return STATUS_WOULD_BLOCK;
             const auto status = stop(static_cast<status_t>(ended.value2));
             if (status != STATUS_OK) return status;
+        }
+        if (thread_ && !closing_) {
+            const auto ended = sys::exit_query(thread_.selector());
+            if (ended.status != STATUS_OK) return ended.status;
+            if (!ended.value) return STATUS_WOULD_BLOCK;
+            status_ = static_cast<status_t>(ended.value2);
         }
         return close();
     }

@@ -2,6 +2,7 @@
 #include <servers/devices.hpp>
 #include <protocols/block.hpp>
 #include <protocols/service.hpp>
+#include <protocols/manage.hpp>
 #include <libk/fdt.hpp>
 #include <libk/pci.hpp>
 #include <vector>
@@ -109,7 +110,8 @@ struct dv_device {
     std::string name;
     cap_owner group, space, irq;
     std::array<vm_area, 6> bars;
-    uint64_t instance{};
+    uint64_t instance{}, incarnation{};
+    std::array<uint64_t, 6> addresses{};
     auto reset(dv_pci cfg) -> status_t {
         cfg.write<uint16_t>(4, 2 | (1 << 10)); // disable bus mastering and INTx
         std::array<std::pair<uintptr_t, size_t>, 6> views;
@@ -130,6 +132,7 @@ struct dv_device {
         return STATUS_OK;
     }
     auto prepare(const rt_env& env, dv_bus& bus) -> status_t {
+        ++incarnation;
         const auto made = sys::resource_create_child(env.pool, 4 * 1024 * 1024, 128,
             OBJ_BIT(ObjMem) | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
         if (made.status != STATUS_OK) return made.status;
@@ -161,6 +164,7 @@ struct dv_device {
             const auto flags = fn->read<uint32_t>(0x10 + n * 4) & 15;
             fn->write<uint32_t>(0x10 + n * 4, static_cast<uint32_t>(address) | flags);
             if (bar.wide) fn->write<uint32_t>(0x14 + n * 4, address >> 32);
+            addresses[n] = *physical;
             const auto mem = sys::memory_create_physical(group.selector(), env.selector(dv_physical), *physical, bytes, VM_READ | VM_WRITE);
             if (mem.status != STATUS_OK) return mem.status;
             auto mapping = vm_area::map(env.vspace, cap_owner{mem.value}, 0, bytes, VM_READ | VM_WRITE);
@@ -193,7 +197,7 @@ struct dv_device {
         ::memcpy(request.data + sizeof(def), name.data(), name.size());
         ::memcpy(request.data + sizeof(def) + name.size(), image.data(), image.size());
         msg_packet reply;
-        const CapXfer notice{changes, RIGHT_SIGNAL, CAP_COPY, 0};
+        const CapXfer notice{changes, RIGHT_SEND, CAP_COPY, 0};
         auto status = root.exchange(request, reply, {&notice, 1});
         if (status != STATUS_OK) return status;
         instance = request.value;
@@ -253,8 +257,13 @@ struct dv_device {
 
 int main() {
     const auto& env = rt_startup();
+    const auto event = sys::notification_create(env.pool, 1);
+    if (event.status != STATUS_OK) sys::exit(event.status);
+    cap_owner replies{event.value};
     rpc_client root;
-    auto status = root.open(env.selector(sv_service), env.pool, env.cspace, env.events);
+    // Reply readiness is local to RPC. It must not retrigger the lifecycle
+    // loop's next query and manufacture an endless stream of reply channels.
+    auto status = root.open(env.selector(sv_service), env.pool, env.cspace, replies.selector());
     if (status != STATUS_OK) sys::exit(status);
     auto boot = vm_area::map(env.vspace, cap_owner{sys::cap_duplicate(env.selector(dv_config), 0, RIGHT_MAP).value}, 0, 4096, VM_READ);
     if (!boot) sys::exit(boot.error());
@@ -297,14 +306,18 @@ int main() {
                     if (!requester || !irq) continue;
                     char name[24] = "block-";
                     const auto text = std::to_chars(name + 6, name + sizeof(name), rid, 16);
-                    device.emplace(rid, *requester, *irq, std::string{name, text.ptr}, cap_owner{}, cap_owner{}, cap_owner{}, std::array<vm_area, 6>{}, 0);
+                    device.emplace(rid, *requester, *irq, std::string{name, text.ptr}, cap_owner{}, cap_owner{}, cap_owner{}, std::array<vm_area, 6>{}, 0, 0, std::array<uint64_t, 6>{});
                 }
             }
         }
     }
-    const auto event = sys::notification_create(env.pool, 1);
-    if (event.status != STATUS_OK) sys::exit(event.status);
-    cap_owner changes{event.value};
+    msg_rx management{env.selector(mg_devices), env.events};
+    ch_pair lifecycle;
+    if (const auto status = lifecycle.open(env.pool, 1, 0); status != STATUS_OK) sys::exit(status);
+    const auto sender = sys::channel_mint(lifecycle.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
+    if (sender.status != STATUS_OK) sys::exit(sender.status);
+    cap_owner changes{sender.value};
+    msg_rx life{lifecycle.ends[0].selector(), env.events};
     bool ready{};
     if (device) {
         status = device->prepare(env, *bus);
@@ -312,6 +325,66 @@ int main() {
         if (status != STATUS_OK) sys::exit(status);
     }
     for (;;) {
+        msg_frame change;
+        while (life.try_receive(change).status == STATUS_OK) {}
+        for (unsigned n = 0; n < 16; ++n) {
+            msg_packet packet;
+            const auto received = management.receive(packet);
+            if (received == STATUS_WOULD_BLOCK) break;
+            if (received != STATUS_OK || packet.count != 1) continue;
+            msg_reply response;
+            auto& message = response.message;
+            const auto& request = packet.message;
+            message.operation = request.operation;
+            message.status = STATUS_NOT_FOUND;
+            if (packet.badge != mg_control && packet.badge != mg_observe) message.status = STATUS_DENIED;
+            else if (device && request.operation == static_cast<uint64_t>(mg_op::Devices) && request.value < uint64_t{device->rid} + 1) {
+                mg_device row{uint64_t{device->rid} + 1, device->incarnation, device->instance, 0, 0,
+                    device->did, device->source, static_cast<uint32_t>(mg_state::Stopped), device->rid, UINT64_MAX,
+                    static_cast<uint32_t>(mg_observe | (packet.badge == mg_control ? mg_control | mg_stop | mg_start | mg_restart : 0)), {}};
+                for (size_t i = 0; i < device->bars.size(); ++i) if (device->bars[i].memory) {
+                    row.mmio = device->addresses[i]; row.bytes = device->bars[i].size; break;
+                }
+                if (device->space) {
+                    const auto io = sys::io_space_state(device->space.selector());
+                    if (io.status == STATUS_OK) row.iospace = io.value;
+                }
+                msg_frame query{.operation = static_cast<uint64_t>(sv_op::List), .size = device->name.size()};
+                ::memcpy(query.data, device->name.data(), query.size);
+                if (root.exchange(query) == STATUS_OK) {
+                    row.state = static_cast<uint32_t>(query.value);
+                    if (row.state == static_cast<uint32_t>(mg_state::Stopped) && device->group)
+                        row.state = static_cast<uint32_t>(mg_state::Draining);
+                    if (row.state == static_cast<uint32_t>(mg_state::Running)) {
+                        const auto cfg = bus->function(device->rid);
+                        if (!cfg || !(cfg->read<uint16_t>(4) & 4) || row.iospace != IO_SPACE_READY)
+                            row.state = static_cast<uint32_t>(mg_state::Starting);
+                    }
+                }
+                ::memcpy(row.name, device->name.data(), std::min(device->name.size(), sizeof(row.name) - 1));
+                mg_pack(message, row); message.value = row.id;
+                message.deadline = sys::clock_now().value;
+            } else if (device && request.operation == static_cast<uint64_t>(mg_op::DeviceAction)) {
+                if (packet.badge != mg_control) message.status = STATUS_DENIED;
+                else if (request.size != sizeof(mg_target)) message.status = STATUS_BAD_ARGS;
+                else {
+                    mg_target expected; ::memcpy(&expected, request.data, sizeof(expected));
+                    if (request.value != uint64_t{device->rid} + 1 || expected.incarnation != device->incarnation) message.status = STATUS_STALE;
+                    else {
+                        const auto action = static_cast<mg_action>(request.status);
+                        const auto op = action == mg_action::Start ? sv_op::Start : action == mg_action::Stop ? sv_op::Stop : sv_op::Restart;
+                        if (action != mg_action::Start && action != mg_action::Stop && action != mg_action::Restart) message.status = STATUS_BAD_ARGS;
+                        else {
+                            msg_frame change{.operation = static_cast<uint64_t>(op), .size = device->name.size()};
+                            ::memcpy(change.data, device->name.data(), change.size);
+                            message.status = root.exchange(change);
+                        }
+                    }
+                }
+            }
+            response.respond(packet.capabilities[0].selector());
+        }
+        (void)management.arm();
         if (device) {
             msg_frame query{.operation=static_cast<uint64_t>(sv_op::List), .size=device->name.size()};
             ::memcpy(query.data, device->name.data(), device->name.size());
@@ -334,7 +407,8 @@ int main() {
                 if (!fn) sys::exit(fn.error());
                 if (device->group && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
                 if (!observed.desired) {
-                    if ((status = sys::notification_wait(changes.selector()).status) != STATUS_OK) sys::exit(status);
+                    (void)management.arm(); (void)life.arm();
+                    if ((status = sys::notification_wait(env.events).status) != STATUS_OK) sys::exit(status);
                     continue;
                 }
                 msg_frame remove{.operation=static_cast<uint64_t>(sv_op::Remove), .value=device->instance};
@@ -348,6 +422,7 @@ int main() {
             if ((status = sys::notification_signal(env.selector(sv_wake)).status) != STATUS_OK) sys::exit(status);
             ready = true;
         }
-        if ((status = sys::notification_wait(changes.selector()).status) != STATUS_OK) sys::exit(status);
+        (void)management.arm(); (void)life.arm();
+        if ((status = sys::notification_wait(env.events).status) != STATUS_OK) sys::exit(status);
     }
 }

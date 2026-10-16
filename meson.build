@@ -62,7 +62,6 @@ core_kernel_sources = files(
   'kernel/irq/irq.cpp',
   'kernel/object/pool.cpp',
   'kernel/sched/sc.cpp',
-  'kernel/sched/domain.cpp',
   'kernel/sched/dispatcher.cpp',
   'kernel/task/thread.cpp',
   'kernel/wait.cpp',
@@ -183,9 +182,11 @@ foreach name, spec : {
   'vfs': [files('servers/vfs.cpp'), false],
   'uart': [files('servers/uart.cpp'), false],
   'shell': [files('programs/shell.cpp'), false],
+  'tasks': [files('programs/tasks.cpp'), false],
   'echo': [files('programs/echo.cpp'), true],
   'slow': [files('test/user/stream/slow.cpp'), true],
   'fill': [files('test/user/stream/fill.cpp'), true],
+  'control-test': [files('test/user/control.cpp'), false],
   'cat': [files('programs/cat.cpp'), true],
   'ls': [files('programs/ls.cpp'), true],
   'cp': [files('programs/cp.cpp'), true],
@@ -199,7 +200,7 @@ foreach name, spec : {
     link_with: ['init','shell'].contains(name) ? [exec] : [],
     link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', build_by_default: false)
-  if ['fill','slow'].contains(name)
+  if ['fill','slow','control-test'].contains(name)
     probes += {name: binary}
   else
     bins += {name: binary}
@@ -328,7 +329,7 @@ endforeach
 
 apps = {'boot/README.TXT': files('programs/README.TXT')[0]}
 test_apps = {'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
-             'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow']}
+             'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test']}
 foreach name, app : bins
   if not ['init','block','devices','bootfs','vfs','uart','shell'].contains(name)
     apps += {'boot/' + name + '.elf': images[name]}
@@ -380,7 +381,7 @@ run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 
 run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, bins['init'], bins['shell'], bins['echo'], bins['cat'], bins['uart'], bins['devices'], bins['block'], bins['bootfs'], store_user])
+run_target('audit-user', command: [sh, audit_user, nm, readelf, bins['init'], bins['shell'], bins['echo'], bins['cat'], bins['uart'], bins['devices'], bins['block'], bins['bootfs'], bins['vfs'], bins['ls'], bins['cp'], bins['fs'], bins['edit'], bins['tasks'], bins['sleep'], store_user])
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, (trace_enabled ? '1' : '0')])
 objdump = find_program('riscv64-unknown-elf-objdump')
 run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])
@@ -406,6 +407,8 @@ run_target('run-console', command: [find_program('python3'),
   depends: [kernel, storage_bundle])
 run_target('run-exec', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel_debug, exec_bundle, '4', 'exec', '1'])
+run_target('run-interactive', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_test_bundle, smp, 'interactive', '1'])
 run_target('run-storage-persistence', command: [find_program('python3'),
   files('tools/build/run-storage-persistence.py'), qemu, kernel_debug,
   storage_test_bundle, '1,2,4'], depends: [kernel_debug, storage_test_bundle])

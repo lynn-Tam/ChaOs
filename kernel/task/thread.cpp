@@ -15,8 +15,10 @@
 #include <utility>
 #include <sched/sc.hpp>
 #include <sched/dispatcher.hpp>
+#include <sched/sc.hpp>
 #include <sync.hpp>
 #include <wait.hpp>
+#include <ipc/notification.hpp>
 
 Thread::Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start, Kind kind) noexcept
     : stack_(std::move(home_stack)), env_(std::move(roots)), roots_{{{*this}, {*this}}},
@@ -44,6 +46,8 @@ Thread::Thread(resource::Charge&& stack_charge, mm::Stack&& home_stack, Env&& ro
 }
 
 Thread::~Thread() noexcept {
+    if (work_) work_->close(finalizer_);
+    changed_.reset();
     libk_assert(!cleanup_ && grants_ == nullptr && !attaching_ && publishers_ == 0);
     libk_assert(!revoke_.started() || revoke_.complete());
     libk_assert(state_ != State::Running);
@@ -62,10 +66,7 @@ auto Thread::stack_top() const noexcept -> usize {
 }
 
 auto Thread::begin_wait(Completion& relation, Cpus& cpus) noexcept -> bool {
-    if (sc_ == nullptr) {
-        return false;
-    }
-    return wait().begin(relation, cpus, *sc_);
+    return wait().begin(relation, cpus, *this);
 }
 
 void Thread::block() noexcept {
@@ -85,7 +86,7 @@ void Thread::cancel_wait() noexcept {
 
 void Thread::request_stop(Stop& request) noexcept {
     sched::Dispatcher* home{};
-    sched::Sc* context{};
+
     bool done{};
     bool initiate{};
     {
@@ -101,10 +102,7 @@ void Thread::request_stop(Stop& request) noexcept {
             home = home_;
             if (home == nullptr) {
                 libk_assert(state_ == State::Prepared || state_ == State::Exited);
-                set_state(State::Exited);
-                if (sc_ != nullptr) {
-                    context = sc_;
-                }
+                state_ = State::Exited;
             }
         }
     }
@@ -115,12 +113,6 @@ void Thread::request_stop(Stop& request) noexcept {
     } else if (home != nullptr) {
         home->request_stop(*this);
     } else {
-        object::ref<> lifetime{};
-        if (context != nullptr) {
-            auto unbound = context->unbind();
-            libk_assert(unbound);
-            lifetime = std::move(unbound).value();
-        }
         // Prepared user threads already own execution authority and roots.
         // Complete Stop only after the common terminal path releases them.
         finish(STATUS_CANCELED);
@@ -132,13 +124,20 @@ void Thread::finish(status_t status) noexcept {
         sync::Lock guard{lock_};
         libk_assert(state_ == State::Exited && sc_ == nullptr);
         stopping_ = true;
+        terminal_status_ = status;
     }
+    if (work_) work_->post(finalizer_);
+    else finalize(); // Exclusive construction rollback without a runtime worker.
+}
+void Thread::finalize() noexcept {
+    Flight publishing{*this};
+    if (work_) work_->close(finalizer_);
     claims_.release();
     close_grants();
     env_.detach_user();
-    static_cast<void>(exit_.claim(status));
-
+    static_cast<void>(exit_.claim(terminal_status_));
     complete();
+    static_cast<void>(changed_.signal());
 }
 
 [[noreturn]] void Thread::start(void* argument) noexcept {
@@ -348,6 +347,18 @@ void Thread::close_grants() noexcept {
     }
 }
 
+void Thread::stop() noexcept {
+    Flight publishing{*this};
+    bool start;
+    {
+        sync::Lock guard{grants_lock_};
+        start = !revoking_;
+        revoking_ = true;
+    }
+    if (start) revoke_.start(*this);
+    static_cast<void>(changed_.signal());
+}
+
 void Thread::retire(object::cleanup&& cleanup) noexcept {
     Flight publishing{*this};
     bool start{};
@@ -384,7 +395,9 @@ void Thread::prepare(usize top) noexcept {
 }
 
 void Thread::set_state(Thread::State state) noexcept {
+    sync::Lock guard{lock_};
     state_ = state;
+    if (state == State::Running && Cpu::local()) accounted_at_ = current_cpu().dispatcher().clock().rd_ticks();
     trace::emit(trace::Event::State, identity(), reinterpret_cast<u64>(sc_),
                 static_cast<u64>(state));
 }
@@ -404,30 +417,77 @@ auto Thread::claim_home(sched::Dispatcher& home) noexcept -> bool {
     if ((home_ != nullptr && home_ != &home) || (stopping_ && home_ == nullptr))
         return false;
     home_ = &home;
+    cpu_ = home.id();
     return true;
 }
 
 auto Thread::owned_by(const sched::Dispatcher& home) const noexcept -> bool {
     sync::Lock guard{lock_};
-    return stopping_ && home_ == &home;
+    return home_ == &home;
 }
 
-auto Thread::try_bind(sched::Sc& binding) noexcept -> bool {
+auto Thread::home_cpu() const noexcept -> CpuId {
     sync::Lock guard{lock_};
-    if (idle() || state_ != Thread::State::Prepared || sc_ != nullptr || home_ != nullptr ||
-        stopping_ || stopped_)
-        return false;
-    sc_ = &binding;
+    libk_assert(home_);
+    return home_->id();
+}
+
+void Thread::refill() noexcept {
+    current_cpu().dispatcher().refresh(*this);
+}
+
+auto Thread::execution(bool enabled) noexcept -> std::optional<u64> {
+    sched::Dispatcher* home;
+    u64 seq;
+    {
+        sync::Lock guard{lock_};
+        if (stopping_ || stopped_ || !home_) return std::nullopt;
+        enabled_ = enabled;
+        seq = ++requested_;
+        home = home_;
+    }
+    home->request_control(*this);
+    return seq;
+}
+
+auto Thread::detach_resource(u64 generation) noexcept -> status_t {
+    sched::Dispatcher* home;
+    {
+        sync::Lock guard{lock_};
+        if (!association_ || generation != association_) return STATUS_STALE;
+        if (stopping_ || stopped_) return STATUS_BUSY;
+        detach_sc_ = true;
+        home = home_;
+    }
+    home->request_control(*this);
+    return STATUS_OK;
+}
+auto Thread::info(u64 now) const noexcept -> ThreadInfo {
+    sync::Lock guard{lock_};
+    const auto runtime = runtime_ + (state_ == State::Running && now > accounted_at_ ? now - accounted_at_ : 0);
+    return {.version = 1, .size = sizeof(ThreadInfo), .requested = requested_, .applied = applied_,
+        .runtime = runtime, .association = association_,
+        .flags = (enabled_ ? THREAD_ENABLED : 0U) | (applied_enabled_ ? THREAD_APPLIED : 0U)
+            | (state_ == State::Running ? THREAD_RUNNING : 0U) | (wait_.attached() ? THREAD_WAITING : 0U)
+            | (sc_ ? THREAD_BOUND : 0U) | (stopping_ ? THREAD_STOPPING : 0U) | (stopped_ ? THREAD_STOPPED : 0U),
+        .cpu = static_cast<u32>(cpu_.raw)};
+}
+auto Thread::observe(ipc::Notification& notice, u64 badge) noexcept -> bool {
+    {
+        sync::Lock guard{lock_};
+        if (!notice.bind(changed_, badge)) return false;
+    }
+    static_cast<void>(changed_.signal());
     return true;
 }
 
-auto Thread::release_sc(sched::Sc& binding, sched::Dispatcher* owner) noexcept -> bool {
+auto Thread::try_bind(object::ref<sched::Sc> binding, u64 generation) noexcept -> bool {
     sync::Lock guard{lock_};
-    if (sc_ != &binding || home_ != owner || state_ == Thread::State::Running ||
-        state_ == Thread::State::Ready || state_ == Thread::State::Throttled ||
-        (owner != nullptr && state_ != Thread::State::Exited))
-        return false;
-    sc_ = nullptr;
+    if (idle() || sc_ || pending_sc_ || stopping_ || stopped_ || !home_
+        || !binding->domain_->allows(home_->id())
+        || !(binding->config_.cpus & (u64{1} << home_->id().raw))) return false;
+    pending_sc_ = std::move(binding);
+    association_ = generation;
     return true;
 }
 

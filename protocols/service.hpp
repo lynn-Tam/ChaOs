@@ -3,7 +3,7 @@
 #include <protocols/msg.hpp>
 #include <string.h>
 
-inline constexpr rt_req sv_service{"service.control", 0x53564354, ObjChannel, 6};
+inline constexpr rt_req sv_service{"service.control", 0x53564354, ObjChannel, 7};
 inline constexpr rt_req sv_wake{"service.wake", 0x53564357, ObjNotification};
 inline constexpr rt_req sv_ready{"ready", 0, ObjNotification};
 enum class sv_op : uint64_t { Restart, List, Lookup, Stop, Start, Define, Grant, Remove, Provide };
@@ -15,6 +15,7 @@ struct sv_query {
 };
 // A trusted component can declare ordinary child services. Root remains their
 // sole task owner; each Grant transfers one explicitly named capability.
+// Define transfers a bounded lifecycle doorbell Channel sender, not a task reference.
 struct sv_define {
     uint64_t bytes, caps, kinds, slots, pages;
     uint16_t name_size, image_size;

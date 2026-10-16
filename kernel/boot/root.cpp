@@ -278,20 +278,16 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         thread.emplace(std::move(*pending_thread));
     }
 
-    const auto budget = boot.clock.ticks<2, time::ms>();
-    const auto period = boot.clock.ticks<10, time::ms>();
-    const auto urgency = sched::Urgency::make(20);
-    if (!budget || !period || !urgency) {
-        return std::unexpected(BootErr::SchedulingFailed);
-    }
     auto sc = create.template operator()<sched::Sc>(charge_pages(1),
-                sched::Sc::Config{.budget = *budget, .period = *period, .urgency = *urgency},
+                sched::Sc::Config{.weight = 2048},
                 boot.clock.rd_ticks());
     if (!sc)
         return std::unexpected(BootErr::OutOfMemory);
     auto& root_sc = sc->get();
-    if (!boot.domain->admit(root_sc, cpu) || !root_sc.bind(thread->reference()))
+    if (!thread->get().claim_home(runtime.dispatcher()) || !boot.domain->admit(root_sc, cpu)
+        || !root_sc.bind(sc->reference(), thread->get()))
         return std::unexpected(BootErr::SchedulingFailed);
+    auto root_thread = thread->reference();
     {
         // Write directly into its backing page, with no second boot-stack copy.
         auto info_lease = info->materialize(0);
@@ -383,7 +379,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
                                      cap::Right::Inspect, cap::Right::Revoke), bundle_limit) ||
             !add_cap(info_page.thread, *thread, basic_rights) ||
             !add_cap(pool_cap, pool, pool_rights, pool_limit) ||
-            !add_cap(info_page.sc, *sc, basic_rights) ||
+            !add_cap(info_page.sc, *sc, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Revoke)) ||
             !add_cap(info_page.domain, boot.domain, basic_rights))
             return std::unexpected(BootErr::CapabilityFailed);
         const auto sp = root_stack_address.raw() + root_stack_size - root_initial_bytes;
@@ -405,7 +401,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
 
     }
 
-    if (!runtime.dispatcher().make_ready(root_sc))
+    if (!root_thread->execution(true))
         return std::unexpected(BootErr::SchedulingFailed);
     return {};
 }

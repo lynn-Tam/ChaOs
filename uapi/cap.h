@@ -128,3 +128,30 @@ static_assert(offsetof(CapView, words) == 16);
 #define RIGHT_MASK          ((U64_C(1) << 26) - 1)
 
 #define OBJ_BIT(kind) (U64_C(1) << (kind))
+
+#ifndef __ASSEMBLER__
+#define GROUP_OPEN 0U
+#define GROUP_CLOSING 1U
+#define GROUP_CLOSED 2U
+struct GroupInfo {
+    uint32_t version, size;
+    uint64_t memory_limit, memory_available, cap_limit, caps_available;
+    uint64_t sponsors, reservations;
+    uint32_t state, reserved;
+};
+#define CAP_INFO_VALID 1U
+#define CAP_INFO_UNAVAILABLE 2U
+#define CAP_INFO_PAGE 16U
+struct CapInfo {
+    cap_t selector;
+    uint32_t state, reserved;
+    struct CapView view;
+};
+struct CSpaceInfo {
+    uint32_t version, size;
+    uint64_t slots, pages;
+    cap_t cursor;
+    uint32_t count, reserved;
+    struct CapInfo records[CAP_INFO_PAGE];
+};
+#endif

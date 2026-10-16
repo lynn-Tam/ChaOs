@@ -195,6 +195,7 @@ public:
             source.view});
     }
 
+    auto inspect(Handle cursor) noexcept -> std::expected<CSpaceInfo, CSpaceError>;
     void retire() noexcept;
     void retire(object::cleanup&&) noexcept;
     [[nodiscard]] auto binding_count() const noexcept -> usize;

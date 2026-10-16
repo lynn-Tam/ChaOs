@@ -208,3 +208,57 @@ class rpc_client final {
         return packet.count ? STATUS_PEER_FAULT : s;
     }
 };
+
+// A single bounded asynchronous request without capability payloads. The reply
+// sender moves exactly once; timeout closes the reply path, not the mutation.
+class rpc_pending {
+    ch_pair reply_;
+    msg_rx input_;
+    cap_owner sender_;
+    cap_t endpoint_{};
+    msg_frame request_{};
+    bool sent_{};
+public:
+    auto active() const noexcept -> bool { return endpoint_ != 0; }
+    auto begin(cap_t endpoint, const rt_env& env, msg_frame request) noexcept -> status_t {
+        if (active() || !endpoint) return STATUS_BUSY;
+        auto status = reply_.open(env.pool, 1, 0, 1);
+        if (status == STATUS_OK) status = input_.open(reply_.ends[0].selector(), env.events);
+        if (status == STATUS_OK) {
+            const auto minted = sys::channel_mint(reply_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_CLOSE);
+            sender_ = cap_owner{minted.value}; status = minted.status;
+        }
+        if (status != STATUS_OK) {
+            (void)input_.close(); sender_ = {}; (void)reply_.close(); return status;
+        }
+        reply_.ends[1] = {};
+        endpoint_ = endpoint; request_ = request; sent_ = false;
+        return STATUS_OK;
+    }
+    auto poll(msg_frame& response) noexcept -> status_t {
+        if (!active()) return STATUS_INVALID_OP;
+        bool completed{};
+        status_t status = rt_admit(request_.deadline);
+        if (status == STATUS_OK && !sent_) {
+            const CapXfer transfer{sender_.selector(), 0, CAP_MOVE, 0};
+            status = msg_send(endpoint_, request_, false, {&transfer, 1}).status;
+            if (status == STATUS_OK) { (void)sender_.release(); sent_ = true; }
+        }
+        if (status == STATUS_OK) {
+            const auto received = input_.try_receive(response);
+            status = received.status;
+            if (status == STATUS_OK) {
+                completed = true;
+                status = response.operation == request_.operation ? static_cast<status_t>(response.status) : STATUS_PEER_FAULT;
+            }
+            else if (status == STATUS_WOULD_BLOCK) (void)input_.arm();
+        }
+        if (!completed && (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY)) return STATUS_WOULD_BLOCK;
+        endpoint_ = 0;
+        const auto closed = input_.close();
+        if (closed != STATUS_OK) return closed;
+        sender_ = {};
+        const auto retired = reply_.close();
+        return status == STATUS_OK ? retired : status;
+    }
+};

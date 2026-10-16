@@ -21,7 +21,7 @@
 #include <variant>
 #include <sched/dispatcher.hpp>
 #include <sched/sc.hpp>
-#include <sched/domain.hpp>
+#include <sched/sc.hpp>
 
 namespace syscall {
 
@@ -554,7 +554,6 @@ template<usize op>
     PagerReq descriptor{};
     descriptor.kind = request.kind == Pager::Kind::PageIn
         ? PAGER_REQUEST_PAGE_IN : PAGER_REQUEST_WRITEBACK;
-    descriptor.urgency = request.urgency;
     descriptor.id = request.id;
     descriptor.page_index = request.page_index;
     if (request.kind == Pager::Kind::PageIn) {
@@ -812,7 +811,7 @@ auto vm_call(Call& inv) noexcept -> Result {
     mm::VSpace& space = target.value().object();
     const mm::VmCtx vm = mm::VmCtx{inv.cpu.cpus, inv.cpu.id};
     const auto finish = [&](mm::VmStatus status) noexcept -> status_t {
-        if (status == mm::VmStatus::Complete) return STATUS_OK;
+        if (status == mm::VmStatus::Complete && !space.pending()) return STATUS_OK;
         auto reference = target.value().reference();
         libk_assert(reference);
         mm::Fence fence{std::move(reference).value(), space};
@@ -906,24 +905,19 @@ auto vm_call(Call& inv) noexcept -> Result {
 [[nodiscard]] static auto bind_target(
     cap::Resolved<sched::Sc>& ctx,
     cap::Resolved<Thread>& target) noexcept -> Result {
-    auto reference = target.reference();
-    if (!reference) {
-        return returned(STATUS_BUSY);
-    }
-    auto hold = std::move(reference).value().as<Thread>();
-    if (!hold) {
-        return returned(STATUS_BUSY);
-    }
-    auto bound = ctx->bind_authorized(
-        std::move(hold).value(), ctx, target);
-    return returned(bound ? STATUS_OK : STATUS_BUSY);
+    auto reference = ctx.reference();
+    if (!reference) return returned(STATUS_BUSY);
+    auto hold = std::move(*reference).as<sched::Sc>();
+    if (!hold) return returned(STATUS_BUSY);
+    auto bound = ctx->bind_authorized(std::move(*hold), target.object(), ctx, target);
+    return returned(bound ? STATUS_OK : STATUS_BUSY, bound ? ctx->generation() : 0);
 }
 
 template<usize op>
 [[nodiscard]] auto sc_bind(Call& inv) noexcept -> Result {
     auto ctx = inv.cspace.resolve<sched::Sc>(
         handle_of(inv.trap.arg(0)),
-        cap::Rights::of(cap::Right::Control));
+        cap::Rights::of(cap::Right::Attach));
     if (!ctx) {
         return returned(cap_status(ctx.error()));
     }
@@ -938,28 +932,103 @@ template<usize op>
 
 }
 
-[[nodiscard]] static auto start_target(
-    Call& inv,
-    cap::Resolved<Thread>& target) noexcept -> Result {
-    sched::Sc* const binding = target->sc();
-    if (target->state() != Thread::State::Prepared
-        || binding == nullptr || !binding->startable()) {
-        return returned(STATUS_BUSY);
-    }
-    auto started = sched::start(*inv.cpu.cpus, *binding);
-    return returned(started ? STATUS_OK : STATUS_BUSY);
+template<usize op>
+[[nodiscard]] auto execution_set(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<Thread>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!target) return returned(cap_status(target.error()));
+    if (inv.trap.arg(1) > 1) return returned(STATUS_BAD_ARGS);
+    const auto sequence = target.value()->execution(inv.trap.arg(1));
+    return returned(sequence ? STATUS_OK : STATUS_BUSY, sequence.value_or(0));
 }
 
 template<usize op>
-[[nodiscard]] auto thread_start(Call& inv) noexcept -> Result {
-    const cap::Handle target = handle_of(inv.trap.arg(0));
-    auto thread = inv.cspace.resolve<Thread>(
-        target, cap::Rights::of(cap::Right::Control));
-    if (thread) {
-        return start_target(inv, thread.value());
-    }
-    return returned(cap_status(thread.error()));
+[[nodiscard]] auto sc_unbind(Call& inv) noexcept -> Result {
+    auto context = inv.cspace.resolve<sched::Sc>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Attach));
+    if (!context) return returned(cap_status(context.error()));
+    const auto result = context.value()->withdraw(inv.trap.arg(1));
+    return returned(result ? STATUS_OK : result.error() == sched::Sc::Error::Stale ? STATUS_STALE : STATUS_BUSY);
+}
 
+template<usize op>
+[[nodiscard]] auto execution_stop(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<Thread>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!target) return returned(cap_status(target.error()));
+    target.value()->stop();
+    return returned(STATUS_OK);
+}
+template<usize op>
+[[nodiscard]] auto execution_detach(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<Thread>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!target) return returned(cap_status(target.error()));
+    return returned(target.value()->detach_resource(inv.trap.arg(1)));
+}
+template<usize op>
+[[nodiscard]] auto info_call(Call& inv) noexcept -> Result {
+    const auto inspect = [&]<class T>() -> Result {
+        auto target = inv.cspace.resolve<T>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+        if (!target) return returned(cap_status(target.error()));
+        if constexpr (std::is_same_v<T, mm::VSpace>) {
+            const auto view = target->view();
+            const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+            if (!limit || limit->range != mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin})
+                return returned(STATUS_DENIED);
+        }
+        const auto info = target.value()->info(inv.cpu.dispatcher().clock().rd_ticks());
+        auto* buffer = inv.target->ipc_buffer();
+        if (!buffer || !buffer->write(inv.trap.arg(1), std::span{reinterpret_cast<const byte*>(&info), sizeof(info)}))
+            return returned(STATUS_BAD_ARGS);
+        return returned(STATUS_OK, sizeof(info));
+    };
+    if constexpr (op == SYS_THREAD_INFO) return inspect.template operator()<Thread>();
+    if constexpr (op == SYS_SC_INFO) return inspect.template operator()<sched::Sc>();
+    if constexpr (op == SYS_GROUP_INFO) return inspect.template operator()<object::group>();
+    if constexpr (op == SYS_VSPACE_INFO) return inspect.template operator()<mm::VSpace>();
+    return returned(STATUS_INVALID_OP);
+}
+template<usize op>
+[[nodiscard]] auto vm_records(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<mm::VSpace>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!target) return returned(cap_status(target.error()));
+    const auto view = target->view();
+    const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+    libk_assert(limit);
+    auto info = target.value()->inspect(limit->range, mm::va_t{inv.trap.arg(2)});
+    if (!info) return returned(vm_status(info.error()));
+    auto* buffer = inv.target->ipc_buffer();
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&*info), sizeof(*info)}))
+        return returned(STATUS_BAD_ARGS);
+    return returned(STATUS_OK, sizeof(*info));
+}
+template<usize op>
+[[nodiscard]] auto cspace_info(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<cap::CSpace>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!target) return returned(cap_status(target.error()));
+    auto info = target.value()->inspect(handle_of(inv.trap.arg(2)));
+    if (!info) return returned(info.error() == cap::CSpaceError::InvalidHandle ? STATUS_STALE : cap_status(info.error()));
+    auto* buffer = inv.target->ipc_buffer();
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&*info), sizeof(*info)}))
+        return returned(STATUS_BAD_ARGS);
+    return returned(STATUS_OK, sizeof(*info));
+}
+template<usize op>
+[[nodiscard]] auto execution_watch(Call& inv) noexcept -> Result {
+    using T = std::conditional_t<op == SYS_SC_WATCH, sched::Sc, Thread>;
+    auto target = inv.cspace.resolve<T>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    auto notice = inv.cspace.resolve<ipc::Notification>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Receive));
+    if (!target || !notice) return returned(cap_status(!target ? target.error() : notice.error()));
+    return returned(target.value()->observe(notice->object(), inv.trap.arg(2)) ? STATUS_OK : STATUS_BUSY);
+}
+template<usize op>
+[[nodiscard]] auto sc_configure(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<sched::Sc>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!target) return returned(cap_status(target.error()));
+    auto& clock = inv.cpu.dispatcher().clock();
+    const auto budget = clock.ticks<time::ns>(inv.trap.arg(1));
+    const auto period = clock.ticks<time::ns>(inv.trap.arg(2));
+    if (!budget || !period || inv.trap.arg(3) > 65535) return returned(STATUS_BAD_ARGS);
+    const sched::Sc::Config config{.budget = *budget, .period = *period, .cpus = inv.trap.arg(4),
+                                  .weight = static_cast<u32>(inv.trap.arg(3))};
+    return returned(target.value()->configure(config, clock.rd_ticks()) ? STATUS_OK : STATUS_BUSY);
 }
 
 

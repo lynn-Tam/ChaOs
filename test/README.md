@@ -105,14 +105,14 @@ reported as `[FAIL] group: name`.
 
 - refill ledger conserves budget and reports overrun
 - bounded refill merge delays but never advances budget
-- refill model preserves every sampled sliding window
-- SC configuration rejects invalid time and urgency bounds
+- bounded refill history and debt survive resource reassignment
+- SC configuration validates optional cap, weight and CPU range
 - Object pool unpublished construction rolls back slab and payload
 - ResourcePool refunds only after sponsored object reclaim
 - child ResourcePool returns its delegated budget after reclaim
 - ResourcePool close waits for construction and budget transactions
 - kernel stacks use guarded reusable virtual slots
-- domain admission rounds conservatively and rolls back failure
+- domain authority bounds CPU placement without bandwidth reservation
 
 ## cap
 

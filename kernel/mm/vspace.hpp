@@ -1,4 +1,5 @@
 #pragma once
+#include <uapi/mem.h>
 #include <work.hpp>
 
 #include <libk/types.hpp>
@@ -250,9 +251,9 @@ class Backing final : private libk::noncopyable_nonmovable {
 
 
 enum class VSpaceState : u8 {
-    Live,
-    Stopping,
-    Quiescent,
+    Live = VSPACE_LIVE,
+    Stopping = VSPACE_STOPPING,
+    Quiescent = VSPACE_QUIESCENT,
 };
 
 enum class VSpaceError : u8 {
@@ -357,6 +358,8 @@ class VSpace final : private libk::noncopyable_nonmovable {
     ~VSpace() noexcept;
 
     [[nodiscard]] auto state() const noexcept -> VSpaceState;
+    auto info(u64) const noexcept -> VSpaceInfo;
+    auto inspect(VRange scope, va_t cursor) const noexcept -> std::expected<VmRecords, VSpaceError>;
     [[nodiscard]] auto can_destroy_object(cap::VmLimit auth) const noexcept -> bool;
     [[nodiscard]] auto root() noexcept -> Root;
     [[nodiscard]] auto active_cpus() const noexcept -> CpuSet { return tlb_.active_cpus(); }
@@ -440,7 +443,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
                                     bool instruction_sync = false) noexcept -> VmStatus;
     [[nodiscard]] auto finish_pending(resource::Charge& refund) noexcept -> bool;
     void queue_layout(Map& node) noexcept;
-    void queue_page(MapPage& page) noexcept;
+    void queue_page(MapPage& page, bool removed = true) noexcept;
     void queue_binding(Backing& auth) noexcept;
     void destroy_layout(Map& node) noexcept;
     void detach_mapping(Map& mapping) noexcept;
@@ -505,6 +508,9 @@ class VSpace final : private libk::noncopyable_nonmovable {
     // One preparer owns layout/backing pointers until its local resources drain.
     bool editing_{};
     LayoutTree layout_{};
+    u64 mapped_{}, resident_{};
+    void link(Map&) noexcept;
+    void unlink(Map&) noexcept;
     InvalidationList invalidations_{};
     libk::intrusive_list<Backing, &Backing::retired_hook_> retired_{};
     bool draining_{}; // One stack owns external relation detach/refund callbacks.

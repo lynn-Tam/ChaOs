@@ -1,4 +1,5 @@
 #include <expected>
+#include <bit>
 #include <array>
 #include <optional>
 #include <syscall/call.hpp>
@@ -18,7 +19,7 @@
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <sched/sc.hpp>
-#include <sched/domain.hpp>
+#include <sched/sc.hpp>
 #include <task/thread.hpp>
 #include <uapi/abi.h>
 #include <uapi/task.h>
@@ -137,7 +138,7 @@ static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
 
 [[nodiscard]] static constexpr auto sc_rights() noexcept -> cap::Rights {
     return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                           cap::Right::Control, cap::Right::Destroy, cap::Right::Revoke);
+                           cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Revoke);
 }
 
 [[nodiscard]] static auto mem_permits(const cap::Resolved<mm::Mem>& memory, mm::ObjectRange range,
@@ -555,12 +556,14 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     }
     const auto budget = inv.cpu.dispatcher().clock().ticks<time::ns>(trap.arg(2));
     const auto period = inv.cpu.dispatcher().clock().ticks<time::ns>(trap.arg(3));
-    const auto urgency = sched::Urgency::make(trap.arg(4));
-    const CpuId home{trap.arg(5)};
-    if (!budget || !period || !urgency) {
+    const auto weight = trap.arg(4);
+    const auto cpus = trap.arg(5);
+    const CpuId home{cpus ? static_cast<usize>(std::countr_zero(cpus)) : MaxCpus};
+    if (!budget || !period || weight > 65535 || !cpus
+        || !domain.value()->allows(CpuId{63U - std::countl_zero(cpus)})) {
         return returned(STATUS_BAD_ARGS);
     }
-    const sched::Sc::Config config{.budget = *budget, .period = *period, .urgency = *urgency};
+    const sched::Sc::Config config{.budget = *budget, .period = *period, .cpus = cpus, .weight = static_cast<u32>(weight)};
     if (!sched::Sc::valid_config(config)) {
         return returned(STATUS_BAD_ARGS);
     }
@@ -647,7 +650,8 @@ publish_thread(Call& inv, cap::Resolved<object::group>& pool,
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    if (!obj.authorize(vspace, cspace)) return returned(STATUS_BUSY);
+    if (!obj.authorize(vspace, cspace)
+        || !obj.claim_home(inv.cpu.cpus->get(CpuId{inv.trap.arg(5)})->dispatcher())) return returned(STATUS_BUSY);
     return publication(publish(inv, *object, *root, pool, caps));
 }
 
@@ -662,7 +666,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv
         return returned(cap_status(error));
     }
     auto start = start_snapshot(inv, handle_of(trap.arg(3)), trap.arg(4));
-    if (!start || trap.arg(5) != 0) {
+    if (!start || !inv.cpu.cpus->get(CpuId{trap.arg(5)})) {
         return returned(start ? STATUS_BAD_ARGS : start.error());
     }
     auto ipc = prepare_ipc(inv, vspace.value(), start.value().ipc);

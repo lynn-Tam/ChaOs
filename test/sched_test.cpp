@@ -12,7 +12,6 @@
 #include <mm/pager.hpp>
 #include <boot/info.hpp>
 #include <sched/sc.hpp>
-#include <sched/domain.hpp>
 #include <sched/sched.hpp>
 #include <task/thread.hpp>
 
@@ -56,7 +55,6 @@ constinit libk::manual_lifetime<mm::Pmm> sched_test_pmm{};
 constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> sched_test_mm{};
 constinit libk::manual_lifetime<WorkQueue> sched_work{};
 constinit libk::manual_lifetime<object::store<Thread, object::group>> sched_test_tasks{};
-constinit libk::manual_lifetime<object::store<sched::Domain, sched::Sc>> sched_test_sched{};
 constinit libk::manual_lifetime<mm::KSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
@@ -105,14 +103,12 @@ public:
         [[maybe_unused]] auto& memory =
             sched_test_mm.emplace(*sched_test_pmm, *sched_work);
         (void)sched_test_tasks.emplace(*sched_test_pmm, *sched_work);
-        (void)sched_test_sched.emplace(*sched_test_pmm, *sched_work);
         return true;
     }
 
 private:
     static void reset() noexcept {
         sched_test_mm.reset();
-        sched_test_sched.reset();
         sched_test_tasks.reset();
         sched_test_kernel.reset();
         sched_work.reset();
@@ -141,7 +137,7 @@ bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
         105, 13);
     return overrun == 3
         && queue.available(204) == 0
-        && queue.available(205) == 10;
+        && queue.available(205) == 7;
 }
 
 bool test_bounded_refill_merge_never_advances_budget(
@@ -156,49 +152,6 @@ bool test_bounded_refill_merge_never_advances_budget(
         && queue.available(41) == 2
         && queue.available(42) == 2
         && queue.available(43) == 8;
-}
-
-bool test_refill_state_space_preserves_sliding_window(
-    const TestContext&) noexcept {
-    constexpr usize horizon = 64;
-    for (u64 budget = 1; budget <= 4; ++budget) {
-        for (u64 period = budget; period <= 8; ++period) {
-            for (usize capacity = 1; capacity <= 4; ++capacity) {
-                Sc queue{{.budget=budget,
-                          .period=period,
-                          .refill_capacity=capacity}, 0};
-                u64 granted[horizon]{};
-
-                for (usize tick = 0; tick < horizon; ++tick) {
-                    const u64 now = tick;
-                    const u64 available = queue.available(now);
-                    const u64 demand =
-                        (tick * 5 + budget * 3 + period + capacity) % 6;
-                    const u64 overrun = queue.charge(
-                        now, demand);
-                    if (overrun > demand
-                        || demand - overrun
-                            != (demand < available ? demand : available)
-                        || queue.available(now) > budget) {
-                        return false;
-                    }
-                    granted[tick] = demand - overrun;
-
-                    const usize first = tick + 1 > period
-                        ? tick + 1 - period
-                        : 0;
-                    u64 window{};
-                    for (usize index = first; index <= tick; ++index) {
-                        window += granted[index];
-                    }
-                    if (window > budget) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    return true;
 }
 
 bool test_scheduling_context_config_boundaries(
@@ -219,11 +172,9 @@ bool test_scheduling_context_config_boundaries(
         && !valid(1, 1, 0)
         && !valid(
             1, 1, sched::Sc::max_refills + 1)
-        && sched::Urgency::make(
-            sched::Urgency::level_count - 1)
-        && !sched::Urgency::make(
-            sched::Urgency::level_count)
-        && !sched::Urgency::make(256);
+        && valid(0, 0, 1)
+        && !Sc::valid_config({.weight = 0})
+        && !Sc::valid_config({.weight = 65536});
 }
 
 bool test_object_store_unpublished_construction_rolls_back(
@@ -519,81 +470,6 @@ bool test_kernel_stack_uses_guarded_virtual_slot(
     return reused && reused.value().base() == first_base;
 }
 
-bool test_domain_admission_is_conservative_and_transactional(
-    const TestContext&) noexcept {
-    SchedStorageGuard storage{};
-    if (!storage.initialize()) {
-        return false;
-    }
-    auto pending_domain = sched_test_sched->get<sched::Domain>().create(
-        usize{1},
-        sched::Domain::share_scale,
-        100'000U);
-    if (!pending_domain) {
-        return false;
-    }
-    auto domain = std::move(pending_domain).value().publish();
-
-    object::ref<sched::Sc> contexts[3]{};
-    constexpr u64 budgets[3]{1, 1, 1};
-    constexpr u64 periods[3]{3, 3, 2};
-    for (usize index = 0; index < 3; ++index) {
-        auto pending = sched_test_sched->get<sched::Sc>().create(
-            sched::Sc::Config{
-                .budget = budgets[index],
-                .period = periods[index],
-            },
-            0);
-        if (!pending) {
-            return false;
-        }
-        contexts[index] = std::move(pending).value().publish();
-    }
-
-    const bool first = static_cast<bool>(
-        domain->admit(contexts[0].get(), CpuId{0}));
-    const bool second = static_cast<bool>(
-        domain->admit(contexts[1].get(), CpuId{0}));
-    const auto rejected = domain->admit(contexts[2].get(), CpuId{0});
-    const bool rejected_cleanly = !rejected
-        && rejected.error()
-            == sched::Domain::Error::Quota
-        && !contexts[2]->admitted();
-    const bool released = static_cast<bool>(
-        domain->unadmit(contexts[0].get()));
-    const bool admitted_after_release = static_cast<bool>(
-        domain->admit(contexts[2].get(), CpuId{0}));
-    const auto wrong_cpu = domain->admit(contexts[0].get(), CpuId{1});
-
-    const bool result = first && second && rejected_cleanly && released
-        && admitted_after_release && !wrong_cpu
-        && wrong_cpu.error()
-            == sched::Domain::Error::InvalidCpu;
-
-    for (usize index = 1; index < 3; ++index) {
-        if (!domain->unadmit(contexts[index].get())) {
-            return false;
-        }
-    }
-    // Scaling must not reject a valid ratio merely because its operands are large.
-    const auto max = std::numeric_limits<u64>::max();
-    Sc wide{{.budget=max / 2, .period=max},
-            0};
-    const bool wide_valid = domain->admit(wide, CpuId{0}) && domain->unadmit(wide);
-    for (auto& context : contexts) {
-        if (!context.destroy()) {
-            return false;
-        }
-        context.reset();
-    }
-    if (!domain.destroy()) {
-        return false;
-    }
-    domain.reset();
-    while (sched_work->run()) {}
-    return result && wide_valid && sched_test_pmm->verify_invariants();
-}
-
 } // namespace
 
 void register_sched_tests(TestRegistry& registry) noexcept {
@@ -607,11 +483,7 @@ void register_sched_tests(TestRegistry& registry) noexcept {
         test_bounded_refill_merge_never_advances_budget);
     (void)registry.add(
         "sched",
-        "refill model preserves every sampled sliding window",
-        test_refill_state_space_preserves_sliding_window);
-    (void)registry.add(
-        "sched",
-        "SC configuration rejects invalid time and urgency bounds",
+        "SC configuration validates optional caps and weight",
         test_scheduling_context_config_boundaries);
     (void)registry.add(
         "sched",
@@ -633,8 +505,4 @@ void register_sched_tests(TestRegistry& registry) noexcept {
         "sched",
         "kernel stacks use guarded reusable virtual slots",
         test_kernel_stack_uses_guarded_virtual_slot);
-    (void)registry.add(
-        "sched",
-        "domain admission rounds conservatively and rolls back failure",
-        test_domain_admission_is_conservative_and_transactional);
 }

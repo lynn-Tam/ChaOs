@@ -93,8 +93,9 @@ auto remote(Cpu& runtime) noexcept -> bool {
         context.get(), target->id);
     auto target_ref = thread;
     if (!admitted || !target_ref
-        || !context->bind(std::move(target_ref))) {
-        if (context->admitted()) {
+        || !thread->claim_home(target->dispatcher())
+        || !context->bind(context, thread.get())) {
+        if (admitted) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
         static_cast<void>(context.destroy());
@@ -110,11 +111,11 @@ auto remote(Cpu& runtime) noexcept -> bool {
         return false;
     }
     fail_ipis(2);
-    const auto started = sched::start(*runtime.cpus, *binding);
+    const auto started = thread->execution(true);
     fail_ipis(0);
     const auto posted = started
-        ? sched::wake(*runtime.cpus, *binding)
-        : decltype(started){std::unexpected(
+        ? sched::wake(*runtime.cpus, thread.get())
+        : sched::Dispatcher::WakeResult{std::unexpected(
               sched::Dispatcher::WakeError::Unavailable)};
     constexpr usize wait_spins = 1U << 22;
     bool entered = state.entered.load(std::memory_order_acquire) != 0;

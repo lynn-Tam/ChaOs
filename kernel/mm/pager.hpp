@@ -30,7 +30,6 @@ public:
         usize first{};
         usize count{1};
         u64 dirty_epoch{};
-        u8 urgency{};
     };
     struct Request {
         Req info{};

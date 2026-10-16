@@ -103,7 +103,6 @@ void dispatch_entry(void* p) noexcept {
 auto dispatch(Cpu& runtime) noexcept -> bool {
     libk_assert(test::boot && runtime.cpus);
     auto& k = *test::boot;
-    auto& cpus = *runtime.cpus;
     const auto cpu = runtime.id;
     const auto budget = k.clock.ticks<1, time::ms>();
     const auto period = k.clock.ticks<10, time::ms>();
@@ -112,7 +111,6 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
     std::array<DispatchArg, 3> args{};
     std::array<object::ref<Thread>, 3> threads{};
     std::array<object::ref<sched::Sc>, 3> scs{};
-    constexpr std::array<u8, 3> priority{2, 5, 5};
     for (usize i = 0; i < threads.size(); ++i) {
         args[i] = {&state, i};
         auto stack = mm::Stack::create(k.vm);
@@ -122,18 +120,18 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
         libk_assert(t);
         threads[i] = std::move(*t).publish();
         auto c = k.objects.get<sched::Sc>().create(sched::Sc::Config{
-            .budget=*budget, .period=*period, .urgency=*sched::Urgency::make(priority[i])},
+            .budget=*budget, .period=*period},
             k.clock.rd_ticks());
         libk_assert(c);
         scs[i] = std::move(*c).publish();
         auto ref = threads[i];
         libk_assert(ref && k.domain.get().admit(scs[i].get(), cpu)
-                    && scs[i]->bind(std::move(ref)));
+                    && threads[i]->claim_home(runtime.dispatcher())
+                    && scs[i]->bind(scs[i], threads[i].get()));
     }
-    // Publish all candidates before dispatch so urgency and equal-priority
-    // FIFO are tested through real context switches, not a queue fixture.
+    // Equal service starts in stable enqueue order through real switches.
     const bool enabled = arch::disable_interrupts();
-    for (auto& sc : scs) libk_assert(sched::start(cpus, sc.get()));
+    for (auto& thread : threads) libk_assert(thread->execution(true));
     sched::yield();
     arch::restore_interrupts(enabled);
     const auto duration = k.clock.ticks<100, time::ms>();
@@ -143,7 +141,7 @@ auto dispatch(Cpu& runtime) noexcept -> bool {
         while (!thread->stopped() && k.clock.rd_ticks() < *until) sched::yield();
         libk_assert(thread->stopped());
     }
-    const bool ordered = state.count == 3 && state.order == std::array<usize, 3>{1, 2, 0};
+    const bool ordered = state.count == 3 && state.order == std::array<usize, 3>{0, 1, 2};
     for (usize i = 0; i < scs.size(); ++i) {
         libk_assert(!scs[i]->bound() && k.domain.get().unadmit(scs[i].get()));
         libk_assert(scs[i].destroy() && threads[i].destroy());

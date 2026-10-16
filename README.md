@@ -47,7 +47,7 @@ tools/build/ninja.sh run-console
 The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
 disk, run the shell `mkfs` command once; running it again erases the data volume.
 The immutable initramfs is mounted at `/boot`; a configured data disk is mounted at `/`.
-The boot mount and shell remain usable when storage is absent or stopped. Use `touch note`,
+The boot mount and shell remain usable when storage is absent or stopped. Use `create note`,
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
 `mkdir dir`, `mv note dir/note`, and `rm dir/note`. `ls /boot` shows boot files;
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the
@@ -56,9 +56,12 @@ the other file commands launch the ordinary `fs` program, also available as
 `fs COMMAND`. The shell explicitly passes VFS authority when launching applications. Quote names and text containing spaces,
 for example `write "my note" "hello world"`. `edit note` opens a screen editor:
 type to insert, move with the arrow keys, save with Ctrl+O, and exit with
-Ctrl+X (which asks whether to save changes). The buffer grows with the process heap. The shell
-hands terminal input to a foreground program until it exits; background tasks
-receive EOF instead. Only the trusted shell receives explicit Store Admin authority;
+Ctrl+X (which asks whether to save changes). The buffer grows with the process heap. The shell brokers terminal input for the foreground pipeline. Ctrl+C terminates
+all its members; Ctrl+Z suspends them. `jobs`, `fg`, `bg`, `kill`, and `wait` manage
+whole pipelines; `COMMAND &` starts one in the background with stdin left open.
+`tasks` displays authorized task, device and capability snapshots; `view tasks`
+opens it with read-only management endpoints. Editors and task views retain state
+and redraw after `fg`. `status` shows the last completed pipeline’s member results. Only the trusted shell receives explicit Store Admin authority;
 ordinary `fs` and `edit` cannot format. Programs run by name, for example
 `echo hello | cat`. `echo hello > greeting` replaces a file, and
 `echo world >> greeting` appends to it; redirection runs ordinary `fs save`

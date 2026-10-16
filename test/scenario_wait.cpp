@@ -147,8 +147,9 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
     auto sc = std::move(sc_pending).value().publish();
     auto clone = thread;
     libk_assert(clone && kernel.domain.get().admit(sc.get(), *remote));
-    libk_assert(sc->bind(std::move(clone)));
-    libk_assert(sched::start(cpus, sc.get()));
+    libk_assert(thread->claim_home(cpus.get(*remote)->dispatcher()));
+    libk_assert(sc->bind(sc, thread.get()));
+    libk_assert(thread->execution(true));
     while (!peer.entered.load(std::memory_order_acquire)) sched::yield();
     bool passed{};
     {
@@ -182,7 +183,6 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
     stopped.start(thread.get());
     while (!stopped.complete()) sched::yield();
     while (sc->bound()) {
-        (void)sc->unbind();
         sched::yield();
     }
     libk_assert(kernel.domain.get().unadmit(sc.get()));
@@ -280,6 +280,12 @@ auto live_trim(Cpu& rt) noexcept -> bool {
 void wait_entry(void* argument) noexcept {
     auto& state = *static_cast<WaitState*>(argument);
     auto& cpu = current_cpu();
+    // The worker's arm/post/block handshake has no Completion to retain its
+    // result. An intervening dispatch must preserve its single wake credit.
+    libk_assert(sched::wake(*cpu.cpus, *cpu.current));
+    sched::yield();
+    sched::block();
+    console::print<"[scenario] wake credit survives dispatch before block\n">();
     const bool passed = cancellation_publication(*cpu.current, *cpu.cpus) &&
                         pending_vm_wait(cpu) && live_trim(cpu);
     state.ran.store(passed ? 1 : 2, std::memory_order_release);
@@ -287,7 +293,155 @@ void wait_entry(void* argument) noexcept {
 }
 } // namespace
 
+// A committed operation owns its completion through suspension and resource recall.
+struct ExecutionWait {
+    Receipt receipt{};
+    Cpus& cpus;
+    bool overrun{};
+    std::atomic<bool> entered{}, returned{};
+};
+static void execution_entry(void* p) noexcept {
+    auto& op = *static_cast<ExecutionWait*>(p);
+    auto& thread = *current_cpu().current;
+    sync::Irq irq;
+    thread.enter_kernel();
+    if (op.overrun) {
+        auto& clock = current_cpu().dispatcher().clock();
+        const auto until = clock.rd_ticks() + *clock.ticks<2, time::ms>();
+        while (clock.rd_ticks() < until) asm volatile("" ::: "memory");
+    }
+    libk_assert(thread.begin_wait(op.receipt.completion(), op.cpus));
+    op.entered.store(true, std::memory_order_release);
+    thread.block();
+    thread.leave_kernel();
+    current_cpu().dispatcher().resched(); // The production return boundary.
+    op.returned.store(true, std::memory_order_release);
+}
+static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
+    auto& k = *test::boot;
+    auto& clock = k.clock;
+    auto wait = [&](auto predicate) noexcept {
+        const auto until = clock.rd_ticks() + clock.rd_freq();
+        while (!predicate() && clock.rd_ticks() < until) sched::yield();
+        libk_assert(predicate());
+    };
+    auto create = [&](ExecutionWait& op, CpuId cpu) noexcept {
+        auto stack = mm::Stack::create(k.vm);
+        libk_assert(stack);
+        auto pending = k.objects.get<Thread>().create(std::move(*stack), Env::kernel(k.vm),
+            Thread::KernelStart{execution_entry, &op});
+        libk_assert(pending);
+        auto thread = pending->publish();
+        wait([&] { return k.cpus.get(cpu)->online(); });
+        libk_assert(thread->claim_home(k.cpus.get(cpu)->dispatcher()));
+        return thread;
+    };
+    for (bool stop : {false, true}) {
+        ExecutionWait op{.cpus = k.cpus, .overrun = !stop};
+        op.receipt.commit();
+        auto thread = create(op, k.cpus.count() > 1 ? CpuId{1} : runtime.id);
+        auto pending = k.objects.get<sched::Sc>().create(sched::Sc::Config{
+            .budget = stop ? 0 : *clock.ticks<1, time::ms>(),
+            .period = stop ? 0 : *clock.ticks<100, time::ms>()}, clock.rd_ticks());
+        libk_assert(pending);
+        auto sc = pending->publish();
+        libk_assert(k.domain->admit(sc.get(), thread->home_cpu()));
+        libk_assert(sc->bind(sc, thread.get()) && thread->execution(true));
+        wait([&] { return op.entered.load(std::memory_order_acquire); });
+        if (!stop) libk_assert(thread->execution(false));
+        const auto generation = sc->generation();
+        if (stop) libk_assert(sc.destroy());
+        else libk_assert(sc->withdraw(generation));
+        wait([&] { return !sc->info(clock.rd_ticks()).bound; });
+        libk_assert(!thread->stop_requested());
+        op.receipt.signal();
+        const auto delay = clock.rd_ticks() + *clock.ticks<5, time::ms>();
+        while (clock.rd_ticks() < delay) sched::yield();
+        libk_assert(!op.returned.load(std::memory_order_acquire));
+        Stop stopped;
+        if (stop) {
+            stopped.start(thread.get());
+            wait([&] { return stopped.complete(); });
+            libk_assert(!op.returned.load(std::memory_order_acquire));
+        } else {
+            const auto debt = sc->info(clock.rd_ticks()).debt;
+            libk_assert(debt != 0);
+            ExecutionWait other{.cpus = k.cpus};
+            auto borrower = create(other, runtime.id);
+            libk_assert(sc->bind(sc, borrower.get()));
+            const auto changed = sc->info(clock.rd_ticks());
+            libk_assert(changed.bound && changed.debt == debt);
+            libk_assert(sc->withdraw(changed.generation));
+            wait([&] { return !sc->info(clock.rd_ticks()).bound; });
+            Stop unused;
+            unused.start(borrower.get());
+            wait([&] { return unused.complete(); });
+            libk_assert(borrower.destroy());
+            libk_assert(sc->bind(sc, thread.get()));
+            libk_assert(thread->detach_resource(generation) == STATUS_STALE); // Old association cannot recall the new one.
+            libk_assert(thread->execution(true));
+            wait([&] { return thread->stopped(); });
+            libk_assert(op.returned.load(std::memory_order_acquire));
+            libk_assert(sc.destroy());
+        }
+        libk_assert(thread.destroy());
+    }
+    console::print<"[scenario] execution lifetime ok: no-SC completion, resume, recall and maintenance Stop\n">();
+    return true;
+}
+
+static void fair_entry(void* p) noexcept {
+    auto& done = *static_cast<std::atomic<bool>*>(p);
+    while (!done.load(std::memory_order_acquire)) asm volatile("" ::: "memory");
+}
+static auto fair_execution(Cpu&) noexcept -> bool {
+    auto& k = *test::boot;
+    if (k.cpus.count() < 2) return true;
+    const CpuId cpu{1};
+    auto& clock = k.clock;
+    std::array<std::atomic<bool>, 3> done{};
+    std::array<object::ref<Thread>, 3> threads;
+    std::array<object::ref<sched::Sc>, 3> resources;
+    for (usize i = 0; i < threads.size(); ++i) {
+        auto stack = mm::Stack::create(k.vm);
+        libk_assert(stack);
+        auto thread = k.objects.get<Thread>().create(std::move(*stack), Env::kernel(k.vm),
+            Thread::KernelStart{fair_entry, &done[i]});
+        libk_assert(thread);
+        threads[i] = thread->publish();
+        libk_assert(threads[i]->claim_home(k.cpus.get(cpu)->dispatcher()));
+        const sched::Sc::Config config{.budget = i == 2 ? *clock.ticks<1, time::ms>() : 0,
+            .period = i == 2 ? *clock.ticks<10, time::ms>() : 0, .weight = i == 1 ? 2048U : 1024U};
+        auto sc = k.objects.get<sched::Sc>().create(config, clock.rd_ticks());
+        libk_assert(sc);
+        resources[i] = sc->publish();
+        libk_assert(k.domain->admit(resources[i].get(), cpu));
+        libk_assert(resources[i]->bind(resources[i], threads[i].get()) && threads[i]->execution(true));
+    }
+    const auto started = clock.rd_ticks();
+    while (clock.rd_ticks() - started < *clock.ticks<300, time::ms>()) sched::yield();
+    std::array<u64, 3> used;
+    for (usize i = 0; i < used.size(); ++i) used[i] = threads[i]->info(clock.rd_ticks()).runtime;
+    const auto elapsed = clock.rd_ticks() - started;
+    libk_assert(used[0] && used[1] * 10 > used[0] * 14 && used[1] * 10 < used[0] * 26);
+    libk_assert(used[2] * 100 < elapsed * 15);
+    done[1].store(true, std::memory_order_release); done[2].store(true, std::memory_order_release);
+    while (!threads[1]->stopped() || !threads[2]->stopped()) sched::yield();
+    const auto before = threads[0]->info(clock.rd_ticks()).runtime;
+    const auto alone = clock.rd_ticks();
+    while (clock.rd_ticks() - alone < *clock.ticks<50, time::ms>()) sched::yield();
+    const auto spare = threads[0]->info(clock.rd_ticks()).runtime - before;
+    libk_assert(spare * 10 > (clock.rd_ticks() - alone) * 7);
+    done[0].store(true, std::memory_order_release);
+    while (!threads[0]->stopped()) sched::yield();
+    for (usize i = 0; i < threads.size(); ++i) libk_assert(threads[i].destroy() && resources[i].destroy());
+    console::print<"[scenario] fair execution ok: weighted={}/{}/{} cap=10% idle capacity consumed\n">(used[0], used[1], used[2]);
+    return true;
+}
+
 auto wait_publication(Cpu& runtime) noexcept -> bool {
+    libk_assert(execution_lifetime(runtime));
+    libk_assert(fair_execution(runtime));
     if (test::boot == nullptr ||
         runtime.cpus == nullptr) {
         return false;
@@ -325,8 +479,8 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     const CpuId cpu = runtime.id;
     auto admitted = kernel.domain.get().admit(context.get(), cpu);
     auto target = thread;
-    if (!admitted || !target || !context->bind(std::move(target))) {
-        if (context->admitted()) {
+    if (!admitted || !target || !thread->claim_home(runtime.dispatcher()) || !context->bind(context, thread.get())) {
+        if (admitted) {
             static_cast<void>(kernel.domain.get().unadmit(context.get()));
         }
         static_cast<void>(context.destroy());
@@ -337,9 +491,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
         return false;
     }
 
-    sched::Sc* const binding = &context.get();
-    const bool started =
-        binding != nullptr && static_cast<bool>(sched::start(*runtime.cpus, *binding));
+    const bool started = thread->execution(true).has_value();
     if (started) {
         // Yield is a scheduling opportunity, not a join. Wait for the real
         // terminal state before unbinding and releasing the test's stack.
@@ -349,7 +501,7 @@ auto wait_publication(Cpu& runtime) noexcept -> bool {
     // objects alive until the asynchronous unbind has actually detached it.
     bool context_unbound = !context->bound();
     while (!context_unbound) {
-        context_unbound = static_cast<bool>(context->unbind());
+        context_unbound = !context->bound();
         if (!context_unbound) sched::yield();
     }
     while (context->bound()) sched::yield();

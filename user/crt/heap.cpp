@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <new>
+#include <string>
 #include <start.hpp>
 #include <cap.hpp>
 #include <string.h>
@@ -136,3 +137,7 @@ const std::nothrow_t std::nothrow{};
 [[noreturn]] void std::__throw_logic_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
 [[noreturn]] void std::__throw_length_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
 [[noreturn]] void std::__throw_out_of_range_fmt(const char*, ...) { sys::exit(STATUS_BAD_ARGS); }
+
+// libstdc++ declares this cold path extern even in the freestanding headers.
+// Instantiate its supplied definition so string overlap keeps STL semantics.
+template void std::basic_string<char>::_M_replace_cold(char*, size_type, const char*, size_type, size_type);

@@ -16,12 +16,15 @@
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <optional>
+#include <sched/sched.hpp>
 #include <mm/pager.hpp>
 #include <sync.hpp>
 #include <type_traits>
 #include <variant>
 #include <atomic>
 #include <wait.hpp>
+#include <uapi/task.h>
+#include <work.hpp>
 
 class Thread;
 class Cpus;
@@ -70,6 +73,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     enum class Kind : u8 {
         Normal,
         Idle,
+        Worker,
     };
 
     using Entry = void (*)(void*) noexcept;
@@ -88,13 +92,11 @@ class Thread final : private libk::noncopyable_nonmovable {
            Kind kind = Kind::Normal) noexcept;
     ~Thread() noexcept;
 
-    [[nodiscard]] auto state() const noexcept -> State { return state_; }
+    [[nodiscard]] auto state() const noexcept -> State { sync::Lock guard{lock_}; return state_; }
     [[nodiscard]] auto stack_base() const noexcept -> usize;
     [[nodiscard]] auto stack_top() const noexcept -> usize;
     [[nodiscard]] auto kind() const noexcept -> Kind { return kind_; }
     [[nodiscard]] auto idle() const noexcept -> bool { return kind_ == Kind::Idle; }
-    [[nodiscard]] auto sc() noexcept -> sched::Sc* { return sc_; }
-    [[nodiscard]] auto sc() const noexcept -> const sched::Sc* { return sc_; }
     [[nodiscard]] auto identity() const noexcept -> usize { return reinterpret_cast<usize>(this); }
     [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return ctx_; }
     [[nodiscard]] auto exit() noexcept -> Exit& { return exit_; }
@@ -105,8 +107,12 @@ class Thread final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto stopped() const noexcept -> bool;
     [[nodiscard]] auto claim_home(sched::Dispatcher&) noexcept -> bool;
     [[nodiscard]] auto owned_by(const sched::Dispatcher&) const noexcept -> bool;
-    [[nodiscard]] auto try_bind(sched::Sc&) noexcept -> bool;
-    [[nodiscard]] auto release_sc(sched::Sc&, sched::Dispatcher*) noexcept -> bool;
+    [[nodiscard]] auto try_bind(object::ref<sched::Sc>, u64 generation) noexcept -> bool;
+    [[nodiscard]] auto home_cpu() const noexcept -> CpuId;
+    [[nodiscard]] auto execution(bool enabled) noexcept -> std::optional<u64>;
+    auto detach_resource(u64 generation) noexcept -> status_t;
+    auto info(u64 now) const noexcept -> ThreadInfo;
+    auto observe(ipc::Notification&, u64 badge) noexcept -> bool;
     [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool {
         return stack_.contains(address);
     }
@@ -140,15 +146,22 @@ class Thread final : private libk::noncopyable_nonmovable {
     // Thread returns to Published through the requeue owner path. Safe to
     // call more than once; entries clear as they are invalidated.
     [[nodiscard]] auto claims() noexcept -> Pager::Claims& { return claims_; }
+    void stop() noexcept;
     void retire(object::cleanup&&) noexcept;
+    void bind_work(WorkQueue& work) noexcept { work_ = &work; }
 
   private:
     friend class sched::Dispatcher;
+    friend class sched::Sc;
     friend class Stop;
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop(Stop& request) noexcept;
     void finish(status_t status) noexcept;
+    void finalize() noexcept;
+    WorkQueue* work_{};
+    Work finalizer_{Work::Fn::bind<&Thread::finalize>(*this)};
+    status_t terminal_status_{};
 
     struct Root {
         Root(Thread& owner) noexcept : owner(&owner), cap(this, grant_ops_) {}
@@ -188,7 +201,24 @@ class Thread final : private libk::noncopyable_nonmovable {
     Env env_;
     State state_{State::Prepared};
     sched::Sc* sc_{};
+    object::ref<sched::Sc> resource_{}, pending_sc_{};
+    bool detach_sc_{};
     sched::Dispatcher* home_{};
+    libk::intrusive_tree_hook ready_hook_{};
+    libk::intrusive_list_hook maintenance_hook_{};
+    u64 service_{}, enqueue_seq_{};
+    libk::intrusive_list_hook mail_hook_{};
+    sched::Deadline refill_{sched::Deadline::Fn::bind<&Thread::refill>(*this)};
+    void refill() noexcept;
+    u8 actions_{};
+    std::atomic<bool> mailed_{};
+    bool wake_credit_{};
+    bool enabled_{}, applied_enabled_{};
+    ipc::NotificationSource changed_{};
+    u64 requested_{}, applied_{};
+    u64 runtime_{}, accounted_at_{};
+    CpuId cpu_{};
+    u64 association_{};
     mutable sync::Spin lock_{};
     libk::intrusive_list<Stop, &Stop::hook_> stops_{};
     bool stopping_{};

@@ -1,366 +1,511 @@
+#include <exec.hpp>
+#include <protocols/file.hpp>
+#include <protocols/service.hpp>
+#include <protocols/manage.hpp>
+#include <protocols/terminal.hpp>
 #include <libk/checked_arithmetic.hpp>
-#include <string_view>
-#include <string>
-#include <algorithm>
+#include <libk/parse.hpp>
+#include <libk/fmt.hpp>
+#include <bit>
 #include <deque>
 #include <memory>
+#include <ranges>
+#include <string>
 #include <vector>
-#include <exec.hpp>
-#include <string.h>
-#include <protocols/file.hpp>
-#include <protocols/stream.hpp>
-#include <protocols/service.hpp>
-#include <protocols/msg.hpp>
-#include <libk/parse.hpp>
-#include <start.hpp>
-#include <util.hpp>
-#include <libk/fmt.hpp>
 
-static void prompt(cap_t output, const char* text) noexcept {
-    msg_frame message{.operation = static_cast<uint64_t>(con_operation::Prompt)};
-    message.size = ::strlen(text);
-    if (message.size > sizeof(message.data))
-        sys::exit(STATUS_BAD_ARGS);
-    ::memcpy(message.data, text, message.size);
-    if (const auto rc = msg_send(output, message).status; rc != STATUS_OK)
-        sys::exit(rc);
-}
-
-enum class LineResult { Line, TooLong, End };
-
-class LineReader final {
-    cap_t input_, events_;
-    str_writer output_;
-
-  public:
-    LineReader(cap_t input, cap_t output, cap_t events) noexcept
-        : input_(input), events_(events), output_(output) {}
-
-    template <class Tasks> auto read(char (&line)[128], Tasks& jobs) noexcept -> LineResult {
-        // The command reader releases its terminal binding before a foreground
-        // application acquires input. Only active readers own readiness state.
-        msg_rx input{input_, events_};
-        size_t used{};
-        bool overflow{};
-        for (;;) {
-            msg_frame message{};
-            jobs.poll();
-            const auto received = input.try_receive(message);
-            if (received.status == STATUS_WOULD_BLOCK) {
-                if (const auto rc = input.arm().status; rc != STATUS_OK)
-                    sys::exit(rc);
-                if (const auto rc = jobs.wait_event().status; rc != STATUS_OK)
-                    sys::exit(rc);
-                continue;
-            }
-            if (received.status != STATUS_OK)
-                sys::exit(received.status);
-            if (message.operation == static_cast<uint64_t>(str_frame::End))
-                return LineResult::End;
-            if (message.operation != static_cast<uint64_t>(str_frame::Data))
-                sys::exit(STATUS_PEER_FAULT);
-            for (size_t i = 0; i < message.size; ++i) {
-                const char byte = message.data[i];
-                if (byte == '\n') {
-                    output_.put('\n');
-                    line[used] = '\0';
-                    return overflow ? LineResult::TooLong : LineResult::Line;
-                }
-                if (byte == '\b' || byte == 127) {
-                    if (used != 0) {
-                        --used;
-                        output_.write("\b \b");
-                    }
-                } else if (byte >= 32 && byte < 127) {
-                    if (used + 1 < sizeof(line)) {
-                        line[used++] = byte;
-                        output_.put(byte);
-                    } else
-                        overflow = true;
-                }
-            }
-        }
-    }
+struct sh_stage {
+    std::unique_ptr<pr_task> task;
+    std::optional<status_t> result;
+    bool end{};
+    cap_owner end_sender;
+};
+enum class sh_state { Running, Suspending, Suspended, Terminating, Done };
+struct sh_job {
+    uint64_t id;
+    std::string command;
+    std::vector<sh_stage> stages;
+    std::vector<std::unique_ptr<ch_pair>> pipes;
+    ch_pair input, output, terminal;
+    cap_owner input_sender, terminal_sender;
+    msg_rx output_rx, terminal_rx;
+    std::deque<msg_frame> pending_input;
+    sh_state state{sh_state::Running};
+    bool fullscreen{}, output_empty{}, background{}, announced{}, read_only{};
+    uint64_t focus{};
 };
 
-static uint64_t latest{};
-struct Pipe {
-    cap_owner roots[2], ends[2];
-    uint64_t producer{}, consumer{};
-    auto active() const noexcept -> bool { return bool(roots[0]); }
-    auto open(cap_t pool, cap_t cspace) noexcept -> status_t {
-        const auto pair = sys::channel_create(pool, 4, CHANNEL_MAX_WORDS, 0, 2);
-        if (pair.value)
-            roots[0] = cap_owner{pair.value};
-        if (pair.value2)
-            roots[1] = cap_owner{pair.value2};
-        if (pair.status != STATUS_OK)
-            return pair.status;
-        for (size_t i = 0; i < 2; ++i) {
-            const auto minted =
-                sys::channel_mint(roots[i].selector(), cspace, 1,
-                                  (i == 0 ? RIGHT_SEND : RIGHT_RECEIVE) | RIGHT_DUPLICATE);
-            if (minted.status != STATUS_OK)
-                return minted.status;
-            ends[i] = cap_owner{minted.value};
+class sh_session {
+    const rt_env& env_;
+    msg_rx input_;
+    rpc_client services_;
+    ch_pair management_;
+    msg_rx management_rx_;
+    std::deque<std::unique_ptr<sh_job>> jobs_;
+    uint64_t next_{}, foreground_{}, focus_{};
+    cap_owner device_control_;
+    struct output { msg_frame frame; uint64_t owner{}, focus{}; };
+    std::deque<output> output_;
+    std::string line_;
+    std::vector<status_t> result_;
+    std::optional<std::string> command_;
+    bool carriage_{}, overflow_{}, screen_{}, reading_{}, prompt_visible_{}, line_start_{true};
+    auto job(uint64_t id) noexcept -> sh_job* {
+        for (auto& job : jobs_) if (job->id == id) return job.get();
+        return nullptr;
+    }
+    auto collect(sh_job& job) -> status_t {
+        result_.clear();
+        for (const auto& stage : job.stages) result_.push_back(stage.result.value_or(STATUS_CANCELED));
+        const auto status = result_.back();
+        const auto id = job.id;
+        std::erase_if(jobs_, [=](const auto& job) { return job->id == id; });
+        return status;
+    }
+    void enqueue(std::string_view text, uint64_t owner = 0, uint64_t focus = 0) {
+        while (!text.empty()) {
+            if (output_.empty() || output_.back().owner != owner || output_.back().focus != focus
+                || output_.back().frame.size == sizeof(msg_frame::data)) {
+                if (output_.size() == 128) return; // Echo/status overflow; child streams stop draining at 64.
+                output_.push_back({{}, owner, focus});
+            }
+            auto& frame = output_.back().frame;
+            const auto count = std::min(text.size(), sizeof(frame.data) - frame.size);
+            ::memcpy(frame.data + frame.size, text.data(), count);
+            frame.size += count; text.remove_prefix(count);
+        }
+    }
+    void focus(sh_job& job, bool gained) {
+        // Supersede pending screen/control text; ordinary job bytes keep order.
+        std::erase_if(output_, [](const auto& output) { return output.focus || !output.owner; });
+        job.focus = ++focus_;
+        // Old queued events can be replaced; old in-flight frames still carry
+        // their old focus sequence and are rejected by the output broker.
+        msg_frame event;
+        while (msg_recv(job.terminal.ends[1].selector(), event, false).status == STATUS_OK) {}
+        event = {.operation = static_cast<uint64_t>(gained ? tm_op::FocusGained : tm_op::FocusLost),
+                 .value = job.focus};
+        event.size = sizeof(tm_default_size);
+        ::memcpy(event.data, &tm_default_size, event.size);
+        (void)msg_send(job.terminal_sender.selector(), event, false);
+        if (gained) { enqueue("\x1b[?1049h\x1b[?25h"); screen_ = true; }
+        else if (screen_) { enqueue("\x1b[?1049l\x1b[?25h"); screen_ = false; }
+    }
+    void leave(sh_job& job) {
+        if (foreground_ != job.id) return;
+        if (job.fullscreen) focus(job, false);
+        foreground_ = 0;
+    }
+    void input(char byte) {
+        if (byte == '\n' && carriage_) { carriage_ = false; return; }
+        carriage_ = byte == '\r';
+        if (carriage_) byte = '\n';
+        auto* target = job(foreground_);
+        if (byte == 3 || byte == 26) {
+            if (target) {
+                leave(*target);
+                if (byte == 3) terminate(*target);
+                else {
+                    target->state = sh_state::Suspending;
+                    target->background = true;
+                    for (auto& stage : target->stages)
+                        if (stage.task) (void)stage.task->execution(false);
+                }
+            } else { line_.clear(); overflow_ = false; enqueue("^C\nmyos> "); }
+            return;
+        }
+        if (target) {
+            if (target->pending_input.size() == 32) { enqueue("\a"); return; }
+            if (byte == 4 && !target->fullscreen)
+                target->pending_input.push_back({.operation = static_cast<uint64_t>(str_frame::End)});
+            else {
+                msg_frame frame{.size = 1}; frame.data[0] = byte;
+                target->pending_input.push_back(frame);
+            }
+            return;
+        }
+        if (command_) return;
+        if (byte == '\n') {
+            enqueue("\n"); line_start_ = true; prompt_visible_ = false;
+            if (overflow_) { enqueue("line too long\nmyos> "); line_.clear(); overflow_ = false; }
+            else { command_ = std::move(line_); line_.clear(); }
+        } else if (byte == '\b' || byte == 127) {
+            if (!line_.empty()) { line_.pop_back(); enqueue("\b \b"); }
+        } else if (byte >= 32 && byte < 127) {
+            if (line_.size() == 127) overflow_ = true;
+            else { line_.push_back(byte); enqueue({&byte, 1}); }
+        }
+    }
+    auto launch(sh_stage& stage, sh_job& job, size_t index, std::span<const std::string_view> argv) -> status_t {
+        std::string path{argv[0]};
+        if (path.find('/') == path.npos) {
+            path = "/boot/" + path;
+            if (!path.ends_with(".elf")) path += ".elf";
+        }
+        auto directory = sv_lookup(services_, vfs_exec);
+        if (!directory) return directory.error();
+        rpc_client files;
+        auto status = files.open(directory->selector(), env_.pool, env_.cspace, env_.events);
+        if (status != STATUS_OK) return status;
+        auto image = fl_map(files, path.c_str(), VM_READ | VM_EXECUTE);
+        if (!image) return image.error();
+        auto mapped = vm_area::map(env_.vspace, std::move(image->memory), 0,
+            libk::checked_align_up(image->size, 4096).value_or(0), VM_READ);
+        if (!mapped) return mapped.error();
+        auto writable = sv_lookup(services_, vfs_service);
+        auto readable = sv_lookup(services_, vfs_read);
+        if (!writable || !readable) return !writable ? writable.error() : readable.error();
+        std::vector<pr_cap> caps{
+            {.contract = rt_stdin, .cap = index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), .limit = word_t{RIGHT_RECEIVE}},
+            {.contract = rt_stdout, .cap = index + 1 < job.stages.size() ? job.pipes[index]->ends[0].selector() : job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
+            {.contract = rt_stderr, .cap = job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
+            {.contract = vfs_service, .cap = writable->selector(), .limit = word_t{RIGHT_SEND}},
+            {.contract = vfs_read, .cap = readable->selector(), .limit = word_t{RIGHT_SEND}},
+        };
+        caps.push_back({.contract = mg_jobs, .cap = management_.ends[1].selector(),
+            .limit = word_t{RIGHT_SEND}, .badge = job.read_only ? mg_observe : mg_control});
+        if (const auto control = env_.selector(job.read_only ? mg_tasks_view : mg_tasks))
+            caps.push_back({.contract = mg_tasks, .cap = control, .limit = word_t{RIGHT_SEND}});
+        if (const auto observer = env_.selector(mg_tasks_view))
+            caps.push_back({.contract = mg_tasks_view, .cap = observer, .limit = word_t{RIGHT_SEND}});
+        if (auto devices = sv_lookup(services_, job.read_only ? mg_devices_view : mg_devices)) {
+            caps.push_back({.contract = mg_devices, .cap = devices->selector(), .limit = word_t{RIGHT_SEND}});
+            // pr_exec copies this endpoint while its slot is alive.
+            device_control_ = std::move(*devices);
+        }
+        if (job.stages.size() == 1)
+            caps.push_back({.contract = tm_service, .cap = job.terminal.ends[1].selector(), .limit = word_t{RIGHT_SEND | RIGHT_RECEIVE}, .badge = 1});
+        cap_t resource{};
+        ScInfo scheduling{};
+        for (uint64_t i = 0;; ++i) {
+            const auto name = "cpu." + std::to_string(i);
+            const auto cap = env_.selector({name.c_str(), 0, ObjSc});
+            if (!cap) break;
+            if (sys::sc_info(cap).status != STATUS_OK) continue;
+            ::memcpy(&scheduling, reinterpret_cast<const void*>(env_.ipc), sizeof(scheduling));
+            if (!scheduling.bound) { resource = cap; break; }
+        }
+        if (!resource) return STATUS_BUSY;
+        auto cpu = static_cast<uint32_t>((job.id + index) % env_.cpus);
+        if (!(scheduling.cpus & (uint64_t{1} << cpu))) cpu = std::countr_zero(scheduling.cpus);
+        stage.task = std::make_unique<pr_task>();
+        status = pr_exec(*stage.task, {env_.pool, env_.vspace, static_cast<uint32_t>(env_.cpus)},
+            {.bytes = {reinterpret_cast<const std::byte*>(mapped->address), image->size},
+             .memory = mapped->memory.selector(), .perms = VM_READ | VM_EXECUTE},
+            {.argv = argv, .caps = caps,
+             .resources = {.bytes = 4 * 1024 * 1024, .caps = 160,
+                .kinds = pr_base_kinds | OBJ_BIT(ObjChannel), .slots = 160, .pages = 24,
+                .pool_perms = RIGHT_CREATE | RIGHT_INSPECT},
+             .cpu = cpu, .events = env_.events});
+        if (status == STATUS_OK) {
+            const auto copy = sys::cap_duplicate(resource, 0, RIGHT_ATTACH | RIGHT_INSPECT);
+            status = copy.status;
+            if (status == STATUS_OK) status = stage.task->start(cap_owner{copy.value});
+        }
+        return status;
+    }
+public:
+    explicit sh_session(const rt_env& env) : env_(env), input_(env.selector(con_input), env.events) {
+        if (const auto status = services_.open(env.selector(sv_service), env.pool, env.cspace, env.events); status != STATUS_OK) sys::exit(status);
+        if (const auto status = management_.open(env.pool, 8, 1); status != STATUS_OK) sys::exit(status);
+        if (const auto status = management_rx_.open(management_.ends[0].selector(), env.events); status != STATUS_OK) sys::exit(status);
+    }
+    void prompt() {
+        if (!line_start_ && !prompt_visible_) enqueue("\n");
+        enqueue("myos> "); enqueue(line_); prompt_visible_ = true;
+    }
+    void terminate(sh_job& job) {
+        job.state = sh_state::Terminating;
+        leave(job);
+        for (auto& stage : job.stages) if (stage.task) (void)stage.task->stop();
+    }
+    void manage(const msg_packet& packet, msg_reply& response) {
+        const auto& request = packet.message;
+        auto& message = response.message;
+        message.status = STATUS_NOT_FOUND;
+        sh_job* target{};
+        sh_stage* stage{};
+        uint64_t id{};
+        const auto op = static_cast<mg_op>(request.operation);
+        for (auto& entry : jobs_) {
+            for (size_t i = 0; i < entry->stages.size(); ++i) {
+                const auto candidate = (entry->id << 8) | i;
+                if (op == mg_op::Tasks ? candidate > request.value : candidate == request.value) {
+                    target = entry.get(); stage = &entry->stages[i]; id = candidate; break;
+                }
+            }
+            if (target) break;
+        }
+        if (!target) return;
+        if (op == mg_op::Tasks || op == mg_op::Task) {
+            constexpr mg_state states[]{mg_state::Running, mg_state::Suspending, mg_state::Suspended, mg_state::Draining, mg_state::Done};
+            mg_task row{id, target->id, target->id, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                static_cast<uint32_t>(states[static_cast<size_t>(target->state)]),
+                static_cast<uint32_t>(mg_observe | (packet.badge == mg_control && target->id != foreground_ ? mg_control | mg_close | mg_pause | mg_resume | mg_stop : 0)), {}};
+            if (stage->task) {
+                if (const auto thread = stage->task->info()) row.runtime = thread->runtime;
+                if (const auto memory = stage->task->memory_info()) row.resident = memory->resident;
+                if (const auto quota = stage->task->resource_info()) {
+                    row.charged = quota->memory_limit - quota->memory_available; row.limit = quota->memory_limit;
+                }
+            }
+            ::memcpy(row.name, target->command.data(), std::min(target->command.size(), sizeof(row.name) - 1));
+            mg_pack(message, row); message.value = id; message.deadline = sys::clock_now().value; return;
+        }
+        if (request.size != sizeof(mg_target)) { message.status = STATUS_BAD_ARGS; return; }
+        mg_target expected; ::memcpy(&expected, request.data, sizeof(expected));
+        if (expected.incarnation != target->id) { message.status = STATUS_STALE; return; }
+        if (op == mg_op::Dependencies) {
+            const auto index = static_cast<size_t>(stage - target->stages.data());
+            const bool upstream = index && expected.argument == 0;
+            if (!upstream && (expected.argument != static_cast<uint64_t>(index != 0) || index + 1 == target->stages.size())) return;
+            mg_dependency edge{(target->id << 8) | (upstream ? index - 1 : index + 1), target->id, 0, 1, 0, 4, {}};
+            const std::string_view name{upstream ? "stdin pipe" : "stdout pipe"};
+            ::memcpy(edge.name, name.data(), name.size());
+            mg_pack(message, edge); message.value = expected.argument + 1; return;
+        }
+        if (op == mg_op::Caps) {
+            if (!stage->task) { message.status = STATUS_CLOSED; return; }
+            auto records = stage->task->capabilities(expected.argument);
+            if (!records) { message.status = records.error(); return; }
+            if (!records->count) return;
+            mg_pack(message, records->records[0]);
+            message.value = records->count > 1 || records->cursor ? records->records[0].selector : 0; return;
+        }
+        if (packet.badge != mg_control || target->id == foreground_) { message.status = STATUS_DENIED; return; }
+        if (op == mg_op::CloseCap) {
+            message.status = stage->task ? sys::cap_close(expected.argument, stage->task->cspace()).status : STATUS_CLOSED;
+            if (message.status == STATUS_INVALID_CAP) message.status = STATUS_STALE;
+            return;
+        }
+        if (op != mg_op::Action || !stage->task) { message.status = STATUS_CLOSED; return; }
+        const auto action = static_cast<mg_action>(request.status);
+        if (action == mg_action::Stop) { terminate(*target); message.status = STATUS_OK; }
+        else if (action == mg_action::Pause || action == mg_action::Resume) {
+            const bool enable = action == mg_action::Resume;
+            if (!enable) leave(*target);
+            target->state = enable ? sh_state::Running : sh_state::Suspending;
+            message.status = STATUS_OK;
+            for (auto& member : target->stages)
+                if (member.task) {
+                    const auto status = member.task->execution(enable).status;
+                    if (status != STATUS_OK) message.status = status;
+                }
+        } else message.status = STATUS_INVALID_OP;
+    }
+    void pump(bool sleep = true) {
+        for (unsigned n = 0; n < 16; ++n) {
+            msg_packet packet;
+            const auto status = management_rx_.receive(packet);
+            if (status == STATUS_WOULD_BLOCK) break;
+            if (status != STATUS_OK || packet.count != 1) continue;
+            msg_reply response;
+            response.message.operation = packet.message.operation;
+            if (packet.badge != mg_observe && packet.badge != mg_control) response.message.status = STATUS_DENIED;
+            else manage(packet, response);
+            response.respond(packet.capabilities[0].selector());
+        }
+        (void)management_rx_.arm();
+        for (auto& entry : jobs_) {
+            auto& job = *entry;
+            bool suspended = true, done = true;
+            for (size_t i = 0; i < job.stages.size(); ++i) {
+                auto& stage = job.stages[i];
+                if (stage.task) {
+                    if (job.state == sh_state::Suspending) {
+                        const auto state = stage.task->info();
+                        suspended &= state && state->requested == state->applied && !(state->flags & THREAD_APPLIED);
+                    }
+                    const auto status = stage.task->poll();
+                    if (status == STATUS_OK) {
+                        const auto result = stage.task->collect();
+                        if (!stage.result) stage.result = static_cast<status_t>(result.value);
+                        stage.task.reset(); stage.end = i + 1 < job.stages.size();
+                        if (i) (void)sys::channel_close(job.pipes[i - 1]->ends[0].selector());
+                    } else if (status != STATUS_WOULD_BLOCK && !pr_retryable(status)) sys::exit(status);
+                }
+                if (stage.end) {
+                    const auto status = msg_send(stage.end_sender.selector(),
+                        {.operation = static_cast<uint64_t>(str_frame::End), .status = *stage.result}, false).status;
+                    if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) stage.end = false;
+                }
+                done &= !stage.task && !stage.end;
+            }
+            if (job.state == sh_state::Suspending && suspended) job.state = sh_state::Suspended;
+            for (unsigned i = 0; i < 16; ++i) {
+                if (foreground_ == job.id && output_.size() >= 64) break;
+                msg_frame frame;
+                const auto status = job.terminal_rx.try_receive(frame).status;
+                if (status == STATUS_WOULD_BLOCK) break;
+                if (status != STATUS_OK) break;
+                if (frame.operation == static_cast<uint64_t>(tm_op::Fullscreen)) {
+                    job.fullscreen = true;
+                    if (foreground_ == job.id) focus(job, true);
+                } else if (frame.operation == static_cast<uint64_t>(tm_op::Frame)
+                    && foreground_ == job.id && frame.value == job.focus && output_.size() < 64)
+                    output_.push_back({frame, job.id, job.focus});
+            }
+            if (done && job.fullscreen && foreground_ == job.id) leave(job);
+            if (!screen_ && output_.size() < 64) {
+                msg_frame frame;
+                const auto status = job.output_rx.try_receive(frame).status;
+                job.output_empty = status == STATUS_WOULD_BLOCK;
+                if (status == STATUS_OK && frame.operation == static_cast<uint64_t>(str_frame::Data)) {
+                    frame.operation = static_cast<uint64_t>(con_operation::Bytes);
+                    const bool background = !foreground_;
+                    if (background && prompt_visible_) { enqueue("\r\x1b[2K"); prompt_visible_ = false; }
+                    output_.push_back({frame, job.id, 0});
+                    line_start_ = frame.size && (frame.data[frame.size - 1] == '\n' || frame.data[frame.size - 1] == '\r');
+                    if (background && line_start_ && reading_) prompt();
+                }
+            }
+            while (!job.pending_input.empty()) {
+                const auto status = msg_send(job.input_sender.selector(), job.pending_input.front(), false).status;
+                if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
+                job.pending_input.pop_front();
+            }
+            if (done && job.output_empty && job.state != sh_state::Done) {
+                leave(job); job.state = sh_state::Done;
+            }
+            if (job.state == sh_state::Done && job.background && !job.announced && reading_ && !foreground_) {
+                libk::fmt::fixed_buffer<96> notice;
+                (void)libk::fmt::format_to<"\r\x1b[2K[{}] Done {}\n">(notice, job.id, job.stages.back().result.value_or(STATUS_CANCELED));
+                enqueue(notice.view()); line_start_ = true; prompt_visible_ = false; prompt(); job.announced = true;
+            }
+            (void)job.terminal_rx.arm();
+            (void)job.output_rx.arm();
+        }
+        for (unsigned i = 0; i < 16; ++i) {
+            msg_frame frame;
+            const auto status = input_.try_receive(frame).status;
+            if (status == STATUS_WOULD_BLOCK) break;
+            if (status != STATUS_OK) sys::exit(status);
+            for (size_t i = 0; i < frame.size; ++i) input(frame.data[i]);
+        }
+        while (!output_.empty()) {
+            auto& next = output_.front();
+            if (next.focus && (next.owner != foreground_ || !job(next.owner) || next.focus != job(next.owner)->focus)) { output_.pop_front(); continue; }
+            next.frame.operation = static_cast<uint64_t>(con_operation::Bytes);
+            const auto status = msg_send(env_.selector(con_output), next.frame, false).status;
+            if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
+            if (status != STATUS_OK) sys::exit(status);
+            output_.pop_front();
+        }
+        (void)input_.arm();
+        if (sleep && !command_) {
+            // A bounded sampling tick also advances asynchronous owner retirement
+            // and output backpressure; readiness handles ordinary idle wakeups.
+            const auto next = rt_after_ms(1);
+            if (next) (void)sys::notification_wait(env_.events, *next);
+        }
+    }
+    auto read() -> std::string {
+        reading_ = true;
+        while (!command_) pump();
+        reading_ = false;
+        auto command = std::move(*command_); command_.reset();
+        return command;
+    }
+    auto spawn(const std::vector<std::string>& words, const std::vector<size_t>& cuts,
+               bool background, std::string_view command, bool read_only = false) -> status_t {
+        auto entry = std::make_unique<sh_job>();
+        auto& job = *entry;
+        job.id = ++next_; job.command = command; job.background = background; job.read_only = read_only;
+        job.stages.resize(cuts.size() - 1);
+        auto status = job.input.open(env_.pool, 8, 0);
+        if (status == STATUS_OK) status = job.output.open(env_.pool, 8, 0);
+        if (status == STATUS_OK) status = job.terminal.open(env_.pool, 8, 0);
+        if (status == STATUS_OK) {
+            const auto input = sys::channel_mint(job.input.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
+            job.input_sender = cap_owner{input.value}; status = input.status;
+        }
+        if (status == STATUS_OK) {
+            const auto terminal = sys::channel_mint(job.terminal.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
+            job.terminal_sender = cap_owner{terminal.value}; status = terminal.status;
+        }
+        if (status == STATUS_OK) status = job.output_rx.open(job.output.ends[1].selector(), env_.events);
+        if (status == STATUS_OK) status = job.terminal_rx.open(job.terminal.ends[0].selector(), env_.events);
+        for (size_t i = 1; i < job.stages.size() && status == STATUS_OK; ++i) {
+            auto& pipe = job.pipes.emplace_back(std::make_unique<ch_pair>());
+            status = pipe->open(env_.pool, 4, 0);
+            if (status == STATUS_OK) {
+                const auto end = sys::channel_mint(pipe->ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
+                job.stages[i - 1].end_sender = cap_owner{end.value}; status = end.status;
+            }
+        }
+        if (status != STATUS_OK) return status;
+        jobs_.push_back(std::move(entry));
+        if (!background) foreground_ = job.id;
+        for (size_t i = 0; i < job.stages.size() && status == STATUS_OK; ++i) {
+            std::vector<std::string_view> argv(words.begin() + cuts[i], words.begin() + cuts[i + 1]);
+            status = launch(job.stages[i], job, i, argv);
+            if (status != STATUS_OK) job.stages[i].result = status;
+        }
+        if (status != STATUS_OK) {
+            terminate(job);
+            while (job.state != sh_state::Done) pump();
+            (void)collect(job);
+            return status;
+        }
+        if (background) {
+            libk::fmt::fixed_buffer<192> started;
+            (void)libk::fmt::format_to<"[{}] Running {}\n">(started, job.id, std::string_view{job.command});
+            enqueue(started.view());
+        }
+        if (!background) {
+            while (foreground_) pump();
+            if (job.state == sh_state::Terminating || std::ranges::all_of(job.stages, [](const auto& stage) { return !stage.task; }))
+                while (job.state != sh_state::Done) pump();
+            if (job.state == sh_state::Done) return collect(job);
         }
         return STATUS_OK;
     }
-    void close() noexcept {
-        // Pending End delivery owns its sender independently of the job result.
-        // Dropping pipe roots must not revoke that still-live capability.
-        ends[0] = {};
-        ends[1] = {};
-        roots[0] = {};
-        roots[1] = {};
-        producer = consumer = 0;
+    auto latest(bool active) const noexcept -> uint64_t {
+        for (const auto& job : jobs_ | std::views::reverse)
+            if (!active || (job->state != sh_state::Done && job->state != sh_state::Terminating)) return job->id;
+        return 0;
     }
-};
-static std::deque<Pipe> pipes;
-// The parent owns tasks. This table adds only shell stream policy to their IDs.
-struct job_spawn {
-    uint64_t id{};
-    status_t status{STATUS_BUSY};
-};
-class Jobs {
-    struct Job {
-        uint64_t id;
-        std::unique_ptr<pr_task> task;
-        cap_owner output;
-        word_t writable{};
-        uint64_t sequence{};
-        std::optional<msg_frame> end;
-        bool consumed{};
-        bool discard{};
-    };
-    rt_env info_;
-    uint64_t next_id_{};
-    std::deque<Job> jobs_;
-    rpc_client services_;
-
-  public:
-    void open(const rt_env& info) {
-        info_ = info;
-
-        if (const auto rc =
-                services_.open(info.selector(sv_service), info.pool, info.cspace, info.events);
-            rc != STATUS_OK)
-            sys::exit(rc);
-    }
-    auto spawn(std::span<const std::string_view> argv, std::span<const cap_t, 3> stdio, bool end)
-        -> job_spawn {
-        const std::string_view name{argv[0]};
-        // Search policy belongs to the shell; explicit paths are unchanged.
-        std::string path{name};
-        if (name.find('/') == name.npos) {
-            path = "/boot/" + path;
-            if (!name.ends_with(".elf"))
-                path += ".elf";
+    auto control(std::string_view operation, uint64_t id, uint64_t deadline = 0) -> status_t {
+        auto* target = job(id);
+        if (!target) return STATUS_NOT_FOUND;
+        if (operation == "kill") terminate(*target);
+        else if (operation == "fg" || operation == "bg") {
+            if (target->state == sh_state::Done || target->state == sh_state::Terminating) return STATUS_CLOSED;
+            if (operation == "fg") { foreground_ = id; if (target->fullscreen) focus(*target, true); }
+            for (auto& stage : target->stages) if (stage.task) (void)stage.task->execution(true);
+            target->state = sh_state::Running;
+            if (operation == "bg") { target->background = true; return STATUS_OK; }
         }
-        auto directory = sv_lookup(services_, vfs_exec);
-        if (!directory)
-            return {{}, directory.error()};
-        rpc_client files;
-        auto connected = files.open(directory->selector(), info_.pool, info_.cspace, info_.events);
-        if (connected != STATUS_OK)
-            return {{}, connected};
-        auto memory = fl_map(files, path.c_str(), VM_READ | VM_EXECUTE);
-        if (!memory)
-            return {{}, memory.error()};
-        status_t s{};
-        auto mapped = vm_area::map(info_.vspace, std::move(memory->memory), 0,
-                                   libk::checked_align_up(memory->size, 4096).value_or(0), VM_READ);
-        if (!mapped)
-            return {{}, mapped.error()};
-        const auto binding = [](rt_req role, cap_t cap, word_t rights) {
-            return pr_cap{.contract = role, .cap = cap, .limit = rights};
-        };
-        auto write_directory = sv_lookup(services_, vfs_service);
-        if (!write_directory)
-            return {{}, write_directory.error()};
-        auto readable = sv_lookup(services_, vfs_read);
-        if (!readable)
-            return {{}, readable.error()};
-        const pr_cap caps[]{
-            binding(rt_stdin, stdio[0], RIGHT_RECEIVE),
-            binding(rt_stdout, stdio[1], RIGHT_SEND),
-            binding(rt_stderr, stdio[2], RIGHT_SEND),
-            binding(vfs_service, write_directory->selector(), RIGHT_SEND),
-            binding(vfs_read, readable->selector(), RIGHT_SEND),
-        };
-        cap_owner output;
-        word_t writable{};
-        if (end) {
-            const auto copy = sys::cap_duplicate(stdio[1], info_.cspace, RIGHT_SEND);
-            s = copy.status;
-            output = cap_owner{copy.value};
-            if (s == STATUS_OK) {
-                const auto bound =
-                    sys::channel_bind(output.selector(), info_.events, CHANNEL_WRITABLE);
-                s = bound.status;
-                writable = bound.value;
-            }
-            if (s != STATUS_OK)
-                return {{}, s};
+        if (operation == "fg") {
+            while (foreground_) pump();
+            if (target->state == sh_state::Terminating || std::ranges::all_of(target->stages, [](const auto& stage) { return !stage.task; }))
+                while (target->state != sh_state::Done) pump();
+            return target->state == sh_state::Done ? collect(*target) : STATUS_OK;
         }
-        if (next_id_ == UINT64_MAX)
-            return {{}, STATUS_NO_MEMORY};
-        auto task = std::make_unique<pr_task>();
-        s = pr_exec(
-            *task,
-            {info_.pool, info_.selector(rt_domain), info_.vspace,
-             static_cast<uint32_t>(info_.cpus)},
-            pr_image{.bytes = {reinterpret_cast<const std::byte*>(mapped->address), memory->size},
-                     .memory = mapped->memory.selector(),
-                     .perms = VM_READ | VM_EXECUTE},
-            {.argv = argv,
-             .caps = caps,
-             .resources = {.bytes = 4 * 1024 * 1024,
-                           .caps = 128,
-                           .kinds = pr_base_kinds | OBJ_BIT(ObjChannel)},
-             .events = info_.events},
-            next_id_);
-        const auto id = ++next_id_;
-        jobs_.push_back(
-            Job{id, std::move(task), std::move(output), writable, 0, {}, false, s != STATUS_OK});
-        if (s == STATUS_OK)
-            latest = id;
-        return {id, s};
-    }
-    void poll() {
-        for (auto i = jobs_.begin(); i != jobs_.end();) {
-            auto& job = *i;
-            if (!job.consumed) {
-                const auto s = job.task->poll();
-                if (s == STATUS_OK) {
-                    // A dead consumer has no reader, even while its exit result
-                    // remains unconsumed. Release backpressured writers now.
-                    for (auto& pipe : pipes)
-                        if (pipe.consumer == job.id) {
-                            pipe.consumer = 0;
-                            if (const auto rc = sys::channel_close(pipe.roots[0].selector()).status;
-                                rc != STATUS_OK)
-                                sys::exit(rc);
-                        }
-                    if (job.output && !job.end)
-                        job.end = msg_frame{.operation = static_cast<uint64_t>(str_frame::End),
-                                         .status = job.task->result()->status};
-                    if (job.discard) {
-                        if (const auto rc = job.task->collect().status; rc != STATUS_OK)
-                            sys::exit(rc);
-                        job.consumed = true;
-                    }
-                } else if (s != STATUS_WOULD_BLOCK && !pr_retryable(s))
-                    if (s != STATUS_OK)
-                        sys::exit(s);
-            }
-            if (job.output && job.end) {
-                const auto sent = msg_send(job.output.selector(), *job.end, false);
-                if (sent.status == STATUS_WOULD_BLOCK) {
-                    const auto armed =
-                        sys::channel_arm(job.output.selector(), job.writable, job.sequence);
-                    if (armed.status != STATUS_OK)
-                        sys::exit(armed.status);
-                    job.sequence = armed.value;
-                } else {
-                    if (sent.status != STATUS_CLOSED && sent.status != STATUS_PEER_CLOSED)
-                        if (sent.status != STATUS_OK)
-                            sys::exit(sent.status);
-                    if (const auto rc =
-                            sys::channel_unbind(job.output.selector(), job.writable).status;
-                        rc != STATUS_OK)
-                        sys::exit(rc);
-                    if (const auto rc = job.output.close(); rc != STATUS_OK)
-                        sys::exit(rc);
-                }
-            }
-            if (job.consumed && !job.output) {
-                i = jobs_.erase(i);
-            } else
-                ++i;
+        while (target->state != sh_state::Done) {
+            if (deadline && sys::clock_now().value >= deadline) return STATUS_TIMED_OUT;
+            pump();
         }
+        const auto result = collect(*target);
+        return operation == "kill" ? STATUS_OK : result;
     }
-    auto wait_event(uint64_t deadline = 0) -> sys::SysResult {
-        // Synchronous group close can await a kernel worker without emitting an
-        // exit notification. Wake briefly only while such retirement is pending.
-        auto wake_at = deadline;
-        if (std::any_of(jobs_.begin(), jobs_.end(),
-                        [&](const auto& job) { return !job.consumed && job.task->closing(); })) {
-            const auto next = rt_after_ms(1);
-            if (!next)
-                return {.status = STATUS_BAD_ARGS};
-            if (!wake_at || *next < wake_at)
-                wake_at = *next;
-        }
-        const auto wake = sys::notification_wait(info_.events, wake_at);
-        return wake.status == STATUS_TIMED_OUT && wake_at != deadline ? sys::SysResult{} : wake;
-    }
-    auto wait(uint64_t id, uint64_t deadline = 0) -> sys::SysResult {
-        for (;;) {
-            poll();
-            auto i = std::find_if(jobs_.begin(), jobs_.end(),
-                                  [=](const auto& job) { return job.id == id; });
-            if (i == jobs_.end() || i->discard || i->consumed)
-                return {.status = STATUS_INVALID_CAP};
-            if (i->task->result()) {
-                const auto result = i->task->collect();
-                i->consumed = true;
-                for (auto& pipe : pipes)
-                    if (pipe.active()) {
-                        if (pipe.producer == id)
-                            pipe.producer = 0;
-                        if (pipe.consumer == id) {
-                            pipe.consumer = 0;
-                            if (const auto rc = sys::channel_close(pipe.roots[0].selector()).status;
-                                rc != STATUS_OK)
-                                sys::exit(rc);
-                        }
-                    }
-                std::erase_if(pipes, [](auto& p) {
-                    if (p.producer || p.consumer)
-                        return false;
-                    p.close();
-                    return true;
-                });
-                if (latest == id) {
-                    latest = 0;
-                    for (const auto& job : jobs_)
-                        if (!job.consumed && !job.discard)
-                            latest = job.id;
-                }
-                return result;
-            }
-            const auto wake = wait_event(deadline);
-            if (wake.status != STATUS_OK)
-                return wake;
-        }
-    }
-    auto stop(uint64_t id) -> sys::SysResult {
-        auto i =
-            std::find_if(jobs_.begin(), jobs_.end(), [=](const auto& job) { return job.id == id; });
-        if (i == jobs_.end() || i->consumed || i->discard)
-            return {.status = STATUS_INVALID_CAP};
-        const auto s = i->task->stop();
-        return s == STATUS_OK ? wait(id) : sys::SysResult{.status = s};
+    void status(str_writer& console) const {
+        for (size_t i = 0; i < result_.size(); ++i)
+            (void)libk::fmt::format_to<"stage {}: {}\n">(console, i + 1, result_[i]);
     }
     void list(str_writer& console) const {
+        constexpr const char* names[]{"Running", "Suspending", "Suspended", "Terminating", "Done"};
         for (const auto& job : jobs_)
-            if (!job.discard && !job.consumed)
-                (void) libk::fmt::format_to<"task: {}\n">(console, job.id);
+            (void)libk::fmt::format_to<"[{}] {} {}\n">(console, job->id, names[static_cast<size_t>(job->state)], std::string_view{job->command});
     }
 };
-static Jobs jobs;
-
-static bool storage_available{};
 
 static void error(str_writer& console, status_t status) {
-    (void) libk::fmt::format_to<"error: {}\n">(console, status);
+    (void)libk::fmt::format_to<"error: {}\n">(console, status);
 }
-
 // Parse one bounded command line into the existing argv wire form. A pipe is
 // syntax only outside quotes; escaped bytes and empty quoted words are data.
 static auto arguments(char* text, std::vector<std::string>& output, std::vector<size_t>& cuts,
-                      char (&target)[128], bool& append_output) noexcept -> bool {
+                      char (&target)[128], bool& append_output, bool& background) noexcept -> bool {
     char word[128]{};
     size_t used{};
     bool present{};
@@ -389,6 +534,11 @@ static auto arguments(char* text, std::vector<std::string>& output, std::vector<
         const char ch = *text++;
         if (ch == '\0')
             return quote == 0 && append() && (!redirect || target_present);
+        if (ch == '&' && quote == 0) {
+            while (*text == ' ') ++text;
+            background = true;
+            return *text == 0 && append() && (!redirect || target_present);
+        }
         if (ch == '\\' && *text != '\0') {
             if (used == sizeof(word))
                 return false;
@@ -430,83 +580,53 @@ static auto arguments(char* text, std::vector<std::string>& output, std::vector<
     }
 }
 
-static void command(char* line, str_writer& console, cap_t control, cap_t pool, cap_t cspace,
-                    cap_t input, cap_t output, cap_t events) {
-    while (*line == ' ')
-        ++line;
-    char name[128]{};
-    char* argument = line;
-    while (*argument != '\0' && *argument != ' ' && *argument != '|' && *argument != '>')
-        ++argument;
-    const size_t name_size = argument - line;
-    ::memcpy(name, line, name_size);
-    line = name;
-    while (*argument == ' ')
-        ++argument;
-    if (*line == '\0')
-        return;
-    if ((std::string_view{line} == "help")) {
-        if (*argument != '\0') {
-            console.write("invalid command line\n");
-            return;
-        }
-        console.write("help | ls [DIR] | cat FILE | mkfs [32_HEX_ID] | edit FILE | run/spawn "
-                      "PROGRAM [ARGS] | jobs | wait [ID] [MS] | stop [ID] | svc "
-                      "[start/stop/restart SERVICE]\n");
-        if (storage_available)
-            console.write("PROGRAM > FILE (replace) | PROGRAM >> FILE (append)\n");
-        if (storage_available)
-            console.write(
-                "touch FILE | write/append FILE TEXT | mkdir/rm PATH | mv OLD NEW | cp SOURCE DEST "
-                "| stat FILE | fs device/volid; / is data, /boot is read-only\n");
+static void command(sh_session& session, std::string text, const rt_env& info) {
+    str_writer console{info.selector(con_output)};
+    const auto split = text.find(' ');
+    const auto name = std::string_view{text}.substr(0, split);
+    const auto tail = split == text.npos ? std::string_view{} : std::string_view{text}.substr(split + 1);
+    std::string argument_copy{tail};
+    char* argument = argument_copy.data();
+    const auto control = info.selector(sv_service), pool = info.pool, cspace = info.cspace, events = info.events;
+    const std::string name_copy{name};
+    const auto line = name_copy.c_str();
+    if (name.empty()) return;
+    if (name == "help") {
+        console.write("PROGRAM [ARGS] [&] | PIPELINE | jobs | status | fg/bg/kill/wait [ID]\n"
+            "view PROGRAM | ls | cat | edit | tasks | mkdir | create | write/append | rm | mv | cp | stat\n"
+            "PROGRAM > FILE | PROGRAM >> FILE | svc [start/stop/restart SERVICE] | mkfs\n"
+            "Ctrl+C terminates the foreground job; Ctrl+Z suspends it.\n");
         return;
     }
     if (std::string_view{line} == "svc") {
         rpc_client rpc;
-        const auto opened = rpc.open(control, pool, cspace, events);
-        if (opened != STATUS_OK) {
-            error(console, opened);
-            return;
-        }
-        if (*argument == '\0') {
-            for (uint64_t index = 0;; ++index) {
-                msg_frame request{.operation = static_cast<uint64_t>(sv_op::List), .value = index};
-                const auto status = rpc.exchange(request);
-                if (status == STATUS_NOT_FOUND)
-                    break;
-                if (status != STATUS_OK) {
-                    error(console, status);
-                    break;
-                }
-                console.write(request.data, request.size);
-                static constexpr const char* states[]{" stopped\n", " draining\n", " starting\n",
-                                                      " running\n", " failed\n"};
-                if (request.value >= std::size(states)) {
-                    error(console, STATUS_PEER_FAULT);
-                    break;
-                }
-                console.write(states[request.value]);
-            }
-        } else {
-            const std::string_view text{argument};
-            const auto split = text.find(' ');
-            const auto verb = text.substr(0, split);
-            const auto op = verb == "restart" ? sv_op::Restart
-                            : verb == "stop"  ? sv_op::Stop
-                                              : sv_op::Start;
-            if ((verb != "restart" && verb != "stop" && verb != "start") || split == text.npos ||
-                split + 1 == text.size() || text.size() - split - 1 > sizeof(msg_frame::data)) {
-                console.write("usage: svc [start/stop/restart SERVICE]\n");
+        auto status = rpc.open(info.selector(mg_tasks), pool, cspace, events);
+        if (status != STATUS_OK) { error(console, status); return; }
+        const auto split = tail.find(' ');
+        const auto verb = tail.substr(0, split);
+        const auto target = split == tail.npos ? std::string_view{} : tail.substr(split + 1);
+        uint64_t cursor{};
+        for (;;) {
+            auto request = mg_request(mg_op::Tasks, cursor);
+            status = rpc.exchange(request);
+            if (status == STATUS_NOT_FOUND) break;
+            if (status != STATUS_OK || request.size != sizeof(mg_task)) { error(console, status); return; }
+            mg_task service; ::memcpy(&service, request.data, sizeof(service));
+            cursor = service.id;
+            if (tail.empty()) {
+                constexpr const char* names[]{"stopped", "draining", "starting", "running", "failed", "suspending", "suspended", "done"};
+                (void)libk::fmt::format_to<"{} {}\n">(console, service.name, names[std::min(service.state, 7U)]);
+            } else if (target == service.name) {
+                const auto action = verb == "start" ? mg_action::Start : verb == "stop" ? mg_action::Stop : mg_action::Restart;
+                if (verb != "start" && verb != "stop" && verb != "restart") { error(console, STATUS_BAD_ARGS); return; }
+                request = mg_request(mg_op::Action, service.id, service.incarnation, 0, action);
+                status = rpc.exchange(request);
+                if (status == STATUS_OK) console.write("service change requested\n");
+                else error(console, status);
                 return;
             }
-            msg_frame request{.operation = static_cast<uint64_t>(op), .size = text.size() - split - 1};
-            ::memcpy(request.data, text.data() + split + 1, request.size);
-            const auto status = rpc.exchange(request);
-            if (status == STATUS_OK)
-                console.write("service change requested\n");
-            if (status != STATUS_OK)
-                error(console, status);
         }
+        if (!tail.empty()) error(console, STATUS_NOT_FOUND);
         return;
     }
     if (std::string_view{line} == "mkfs") {
@@ -542,171 +662,53 @@ static void command(char* line, str_writer& console, cap_t control, cap_t pool, 
             error(console, status);
         return;
     }
-    if ((std::string_view{line} == "jobs")) {
-        if (*argument != '\0') {
-            console.write("invalid command line\n");
-            return;
-        }
-        jobs.list(console);
-        return;
-    }
-    const bool file_command =
-        storage_available &&
-        ((std::string_view{line} == "stat") || (std::string_view{line} == "touch") ||
-         (std::string_view{line} == "write") || (std::string_view{line} == "append") ||
-         (std::string_view{line} == "mkdir") || (std::string_view{line} == "rm") ||
-         (std::string_view{line} == "mv"));
-    const bool explicit_run = (std::string_view{line} == "run");
-    const bool spawn = (std::string_view{line} == "spawn");
-    const bool wait = (std::string_view{line} == "wait");
-    const bool stop = (std::string_view{line} == "stop");
-    const bool run = !spawn && !wait && !stop;
-    uint64_t id = latest, deadline{};
-    if ((wait || stop) && *argument != 0) {
-        char* end = argument;
-        while (*end && *end != ' ')
-            ++end;
-        if (*end)
-            *end++ = 0;
-        const auto parsed = libk::parse<uint64_t>(argument);
-        if (!parsed) {
-            console.write("invalid task\n");
-            return;
-        }
-        id = *parsed;
-        while (*end == ' ')
-            ++end;
-        if (wait && *end) {
-            const auto duration = libk::parse<uint64_t>(end);
-
-            const auto limit = duration ? rt_after_ms(*duration) : std::nullopt;
-            if (!limit) {
-                console.write("invalid timeout\n");
-                return;
+    if (name == "jobs") { session.list(console); return; }
+    if (name == "status") { session.status(console); return; }
+    if (name == "fg" || name == "bg" || name == "kill" || name == "wait") {
+        uint64_t id = session.latest(name == "fg" || name == "bg"), deadline{};
+        if (!tail.empty()) {
+            const auto split = tail.find(' ');
+            const auto number = libk::parse<uint64_t>(tail.substr(0, split));
+            if (!number) { error(console, STATUS_BAD_ARGS); return; }
+            id = *number;
+            if (name == "wait" && split != tail.npos) {
+                const auto duration = libk::parse<uint64_t>(tail.substr(split + 1));
+                const auto time = duration ? rt_after_ms(*duration) : std::nullopt;
+                if (!time) { error(console, STATUS_BAD_ARGS); return; }
+                deadline = *time;
             }
-            deadline = *limit;
         }
-    }
-    if (run || spawn) {
-        std::vector<std::string> words;
-        if (file_command) {
-            words.emplace_back("fs");
-            words.emplace_back(line);
-        } else if (!explicit_run && !spawn)
-            words.emplace_back(line);
-        std::vector<size_t> cuts{0};
-        char target[128]{};
-        bool append_output{};
-        if (!arguments(argument, words, cuts, target, append_output) ||
-            words.size() == cuts.back()) {
-            console.write("invalid command line\n");
-            return;
-        }
-        if (*target) {
-            cuts.push_back(words.size());
-            words.emplace_back("fs");
-            words.emplace_back("save");
-            words.emplace_back(target);
-            if (append_output)
-                words.emplace_back("-a");
-        }
-        cuts.push_back(words.size());
-        const auto stages = cuts.size() - 1;
-        std::vector<Pipe*> links(stages);
-        const size_t first = run ? 1 : 0;
-        status_t status = STATUS_OK;
-        for (size_t i = first; i < stages; ++i) {
-            links[i] = &pipes.emplace_back();
-            status = links[i]->open(pool, cspace);
-            if (status != STATUS_OK)
-                break;
-        }
-        // A background job starts at EOF rather than consuming shell input.
-        if (status == STATUS_OK && !run)
-            status = msg_send(links[0]->ends[0].selector(),
-                             {.operation = static_cast<uint64_t>(str_frame::End)})
-                         .status;
-        std::vector<uint64_t> ids(stages);
-        for (size_t i = 0; i < stages && status == STATUS_OK; ++i) {
-            std::vector<std::string_view> launch;
-            for (size_t j = cuts[i]; j < cuts[i + 1]; ++j)
-                launch.push_back(words[j]);
-            const std::array<cap_t, 3> stdio{
-                i == 0 && run ? input : links[i]->ends[1].selector(),
-                i + 1 == stages ? output : links[i + 1]->ends[0].selector(), output};
-            const auto child = jobs.spawn(launch, stdio, i + 1 < stages);
-            status = child.status;
-            if (status != STATUS_OK)
-                break;
-            ids[i] = child.id;
-            if (links[i])
-                links[i]->consumer = ids[i];
-            if (i + 1 < stages)
-                links[i + 1]->producer = ids[i];
-        }
-        if (status != STATUS_OK) {
-            // Revoke edges first so a partial pipeline cannot remain blocked.
-            for (auto* p : links)
-                if (p && p->active())
-                    if (const auto rc = sys::channel_close(p->roots[0].selector()).status;
-                        rc != STATUS_OK)
-                        sys::exit(rc);
-            for (auto id : ids)
-                if (id)
-                    if (const auto rc = jobs.stop(id).status; rc != STATUS_OK)
-                        sys::exit(rc);
-            std::erase_if(pipes, [](auto& p) {
-                if (p.producer || p.consumer)
-                    return false;
-                p.close();
-                return true;
-            });
-            error(console, status);
-            return;
-        }
-        if (!run) {
-            for (auto id : ids)
-                if (id)
-                    (void) libk::fmt::format_to<"task: {}\n">(console, id);
-            return;
-        }
-        // Reap consumers first: an early consumer exit closes the edge and
-        // wakes a backpressured producer. The parent sends End after the producer has retired.
-        for (size_t i = stages; i-- > 0;) {
-            const auto reply = jobs.wait(ids[i]);
-            if (reply.status != STATUS_OK)
-                sys::exit(reply.status);
-            if (static_cast<status_t>(reply.value) != STATUS_OK)
-                error(console, reply.value);
-        }
+        if (const auto status = session.control(name, id, deadline); status != STATUS_OK) error(console, status);
         return;
     }
-    const auto reply = stop ? jobs.stop(id) : jobs.wait(id, deadline);
-    const auto status =
-        reply.status == STATUS_OK ? static_cast<status_t>(reply.value) : reply.status;
-    if (status != STATUS_OK && !(stop && status == STATUS_CANCELED))
-        error(console, status);
+    const bool read_only = name == "view";
+    if (read_only) text = std::string{tail};
+    bool background{};
+    std::vector<std::string> words;
+    const bool file_command = name == "stat" || name == "create" || name == "write" || name == "append"
+        || name == "mkdir" || name == "rm" || name == "mv";
+    if (file_command) words.emplace_back("fs");
+    std::vector<size_t> cuts{0};
+    char target[128]{};
+    bool append{};
+    if (!arguments(text.data(), words, cuts, target, append, background) || words.size() == cuts.back()) {
+        error(console, STATUS_BAD_ARGS); return;
+    }
+    if (*target) {
+        cuts.push_back(words.size()); words.insert(words.end(), {"fs", "save", target});
+        if (append) words.emplace_back("-a");
+    }
+    cuts.push_back(words.size());
+    if (const auto status = session.spawn(words, cuts, background, text, read_only); status != STATUS_OK) error(console, status);
 }
 
-int main(int argc, char** argv) {
-
+int main() {
     const auto& info = rt_startup();
-    const auto output = info.selector(con_output);
-    str_writer console{output};
-    const auto input = info.selector(con_input);
-    jobs.open(info);
-    storage_available = argc == 2 && (std::string_view{argv[1]} == "storage");
-    console.write("myos native shell\n");
-    prompt(output, "myos> ");
-    LineReader reader{input, output, info.events};
-    char line[128]{};
+    sh_session session{info};
+    str_writer{info.selector(con_output)}.write("myos native shell\n");
+    session.prompt();
     for (;;) {
-        const auto result = reader.read(line, jobs);
-        if (result == LineResult::TooLong)
-            console.write("line too long\n");
-        else if (result == LineResult::Line)
-            command(line, console, info.selector(sv_service), info.pool, info.cspace, input, output,
-                    info.events);
-        prompt(output, "myos> ");
+        command(session, session.read(), info);
+        session.prompt();
     }
 }

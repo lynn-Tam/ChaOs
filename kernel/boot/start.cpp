@@ -88,21 +88,11 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     auto stack = mm::Stack::create(boot.vm);
     libk_assert(stack);
     auto thread = boot.objects.get<Thread>().create(std::move(*stack), Env::kernel(boot.vm),
-        Thread::KernelStart{work_entry, &boot.work});
+        Thread::KernelStart{work_entry, &boot.work}, Thread::Kind::Worker);
     libk_assert(thread);
     boot.worker.thread = std::move(*thread).publish();
-    auto budget = boot.clock.ticks<1, time::ms>();
-    auto period = boot.clock.ticks<10, time::ms>();
-    auto urgency = sched::Urgency::make(31);
-    libk_assert(budget && period && urgency);
-    auto sc = boot.objects.get<sched::Sc>().create(
-        sched::Sc::Config{.budget = *budget, .period = *period, .urgency = *urgency},
-        boot.clock.rd_ticks());
-    libk_assert(sc);
-    boot.worker.sc = std::move(*sc).publish();
-    libk_assert(boot.domain->admit(boot.worker.sc.get(), cpu.id));
-    libk_assert(boot.worker.sc->bind(boot.worker.thread));
-    libk_assert(cpu.dispatcher().make_ready(boot.worker.sc.get()));
+    libk_assert(boot.worker.thread->claim_home(cpu.dispatcher()));
+    libk_assert(boot.worker.thread->execution(true));
     boot.work.bind(Work::Fn::bind(boot.worker));
 }
 
@@ -125,7 +115,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
         if (!boot.cpus.add(hart, boot.objects, boot.grants, boot.vm, boot.clock))
             console::print<"cpu: prepare hart={} failed\n">(hart.raw);
     auto domain = boot.objects.get<sched::Domain>().create(
-        boot.cpus.count(), sched::Domain::share_scale, 100'000U);
+        boot.cpus.count());
     libk_assert(domain);
     boot.domain = std::move(*domain).publish();
 
