@@ -4,13 +4,17 @@
 #include <start.hpp>
 #include <protocols/file.hpp>
 #include <protocols/stream.hpp>
+#include <dirent.h>
 #include <unistd.h>
 #include <libk/fmt.hpp>
+#include <string>
 #include <string_view>
+#include <vector>
 
 
 struct output {
-    void write(const char* data, size_t size) { ::write(STDOUT_FILENO, data, size); }
+    int fd{STDOUT_FILENO};
+    void write(const char* data, size_t size) { ::write(fd, data, size); }
 };
 static int print(std::string_view text) {
     const auto count = write(STDOUT_FILENO, text.data(), text.size());
@@ -26,20 +30,126 @@ static int transfer(int source, int target) {
     }
 }
 
+static int make_dir(const std::string& path, bool parents) {
+    auto make = [parents](const char* name) {
+        const int status = px_mkdir(name);
+        // Existing directories also succeed on a read-only mount with -p.
+        if (parents && (status == file_exists || status == STATUS_DENIED)) {
+            auto* dir = opendir(name);
+            return dir ? closedir(dir) : -1;
+        }
+        return status;
+    };
+    if (parents)
+        for (auto slash = path.find('/', 1); slash != path.npos; slash = path.find('/', slash + 1))
+            if (const int status = make(path.substr(0, slash).c_str())) return status;
+    return make(path.c_str());
+}
+static int remove_path(std::string_view path, bool recursive, bool force) {
+    if (path.empty()) return force ? 0 : -ENOENT;
+    while (path.size() > 1 && path.ends_with('/')) path.remove_suffix(1);
+    const auto name = path.substr(path.find_last_of('/') + 1);
+    char base[sizeof(msg_frame::data) + 1];
+    if (!getcwd(base, sizeof(base))) return -errno;
+    const auto absolute = fl_path(path, base);
+    if (recursive && (absolute == "/" || name == "." || name == "..")) return -EINVAL;
+    struct entry { std::string path; bool visited{}; };
+    std::vector<entry> pending{{absolute}};
+    int result{};
+    while (!pending.empty()) {
+        auto current = std::move(pending.back()); pending.pop_back();
+        if (!current.visited) {
+            if (auto* dir = opendir(current.path.c_str())) {
+                if (!recursive) { closedir(dir); return -EISDIR; }
+                pending.push_back({current.path, true});
+                errno = 0;
+                while (auto* child = readdir(dir)) {
+                    const std::string_view name{child->d_name};
+                    if (name != "." && name != "..") pending.push_back({current.path + "/" + std::string{name}});
+                }
+                const int error = errno;
+                if (closedir(dir) < 0 && !result) result = -errno;
+                if (error && !result) result = -error;
+                continue;
+            }
+            if (errno != ENOTDIR && errno != ENOENT) { if (!result) result = -errno; continue; }
+        }
+        if (unlink(current.path.c_str()) < 0 && !(force && errno == ENOENT) && !result) result = -errno;
+    }
+    return result;
+}
+
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
     auto directory = env.selector(vfs_service);
     if (!directory) directory = env.selector(vfs_read);
-    if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, directory,
+    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, directory,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
-    if (argc < 2) return print("fs stat/create FILE | write/append FILE TEXT | save FILE [-a] | mkdir/rm PATH | mv OLD NEW | device | volid | sync\n");
-    const std::string_view command = argv[1];
+    std::string_view command = argv[0];
+    command.remove_prefix(command.find_last_of('/') + 1);
+    if (command.ends_with(".elf")) command.remove_suffix(4);
+    const bool applet = command == "touch" || command == "mkdir" || command == "rm" || command == "mv";
+    int first = applet ? 1 : 2;
+    if (!applet) {
+        if (argc < 2) return print("fs stat/create FILE | touch FILE... | mkdir [-p] DIR... | write/append FILE TEXT | save FILE [-a] | rm PATH | mv OLD NEW | device | volid | sync\n");
+        command = argv[1];
+    }
+    if (command == "touch" || command == "mkdir" || command == "rm" || command == "mv") {
+        const std::string_view usage = command == "touch" ? "touch [--] FILE...\n"
+            : command == "mkdir" ? "mkdir [-p] [--] DIR...\n"
+            : command == "rm" ? "rm [-rf] [--] PATH...\n" : "mv [--] SOURCE... DEST\n";
+        if (argc == first + 1 && std::string_view{argv[first]} == "--help") return print(usage);
+        bool parents{}, recursive{}, force{};
+        for (; first < argc && argv[first][0] == '-' && argv[first][1]; ++first) {
+            const std::string_view option = argv[first];
+            if (option == "--") { ++first; break; }
+            if (command == "mkdir" && option == "-p") parents = true;
+            else if (command == "rm" && option.find_first_not_of("rRf", 1) == option.npos) {
+                recursive |= option.find_first_of("rR", 1) != option.npos;
+                force |= option.find('f', 1) != option.npos;
+            } else { output err{STDERR_FILENO}; err.write(usage.data(), usage.size()); return 1; }
+        }
+        if (command == "rm" && force && first == argc) return 0;
+        if (first == argc) { output err{STDERR_FILENO}; err.write(usage.data(), usage.size()); return 1; }
+        std::string destination;
+        bool directory{};
+        if (command == "mv") {
+            if (argc - first < 2) { output err{STDERR_FILENO}; err.write(usage.data(), usage.size()); return 1; }
+            destination = argv[--argc];
+            if (auto* dir = opendir(destination.c_str())) { directory = true; closedir(dir); }
+            else if (errno != ENOENT && errno != ENOTDIR) return -errno;
+            if (!directory && argc - first > 1) return -ENOTDIR;
+        }
+        int result{};
+        for (; first < argc; ++first) {
+            int status{};
+            if (command == "mkdir") status = make_dir(argv[first], parents);
+            else if (command == "rm") status = remove_path(argv[first], recursive, force);
+            else if (command == "mv") {
+                std::string_view source{argv[first]};
+                while (source.size() > 1 && source.ends_with('/')) source.remove_suffix(1);
+                auto target = destination;
+                if (directory) target += "/" + std::string{source.substr(source.find_last_of('/') + 1)};
+                if (rename(argv[first], target.c_str()) < 0) status = -errno;
+            }
+            else {
+                const int fd = open(argv[first], O_WRONLY | O_CREAT, 0);
+                status = fd < 0 ? -errno : close(fd) == 0 ? 0 : -errno;
+            }
+            if (status) {
+                output err{STDERR_FILENO};
+                (void)libk::fmt::format_to<"{}: {}: error {}\n">(err, command, argv[first], status);
+                result = 1;
+            }
+        }
+        return result;
+    }
     if (command == "sync" && argc == 2) return px_sync();
     if ((command == "device" || command == "volid") && argc == 2) {
         uint8_t id[20]{};
         rpc_client service;
-        auto status = service.open(directory, env.pool, env.cspace, env.events);
+        auto status = service.open(directory, env.alloc());
         if (status == STATUS_OK) {
             if (command == "device") status = st_device_id(service, id);
             else { uint8_t volume[16]{}; status = st_volume_id(service, volume); std::copy_n(volume, 16, id); }
@@ -52,9 +162,6 @@ int main(int argc, char** argv) {
         text[2*size] = '\n';
         return print({text, static_cast<size_t>(2*size+1)});
     }
-    if (argc == 4 && command == "mv") return rename(argv[2], argv[3]);
-    if (argc == 3 && command == "mkdir") return px_mkdir(argv[2]);
-    if (argc == 3 && command == "rm") return unlink(argv[2]);
     const bool writing = argc >= 4 && (command == "write" || command == "append");
     const bool reading = argc == 3 && command == "stat";
     const bool saving = command == "save" && (argc == 3 || (argc == 4 && std::string_view{argv[3]} == "-a"));

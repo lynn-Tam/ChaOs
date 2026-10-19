@@ -7,6 +7,17 @@ int main(int argc, char** argv) {
 
     const auto& info = rt_startup();
     const auto control = info.selector(rt_stdout);
+    if (argc == 2 && std::string_view{argv[1]} == "echo") {
+        for (size_t i = 0; i < 128; ++i) {
+            msg_frame request;
+            cap_owner reply;
+            const auto received = msg_recv(control, request, true, {&reply, 1});
+            if (received.status != STATUS_OK) return received.status;
+            const auto sent = msg_send(reply.selector(), request, false);
+            if (sent.status != STATUS_OK) return sent.status;
+        }
+        return STATUS_OK;
+    }
     if (argc == 2 && std::string_view{argv[1]} == "abandon") {
         msg_frame request;
         cap_owner reply;
@@ -20,7 +31,7 @@ int main(int argc, char** argv) {
             sys::exit(rc);
         return STATUS_OK;
     }
-    const auto pair = sys::channel_create(info.pool, 4, CHANNEL_MAX_WORDS, 0, 1);
+    const auto pair = sys::channel_create(info.alloc(), 4, CHANNEL_MAX_WORDS, 0);
     if (pair.status != STATUS_OK)
         sys::exit(pair.status);
     const auto sender = sys::channel_mint(pair.value, info.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);

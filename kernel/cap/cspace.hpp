@@ -12,12 +12,13 @@
 #include <libk/types.hpp>
 #include <expected>
 #include <libk/noncopyable.hpp>
+#include <libk/scope_guard.hpp>
 #include <span>
 #include <libk/inplace_vector.hpp>
 #include <uapi/ipc.h>
 #include <sync.hpp>
 #include <mm/pmm.hpp>
-#include <resource/sponsorship.hpp>
+#include <resource/account.hpp>
 
 namespace mm {
 class VSpace;
@@ -81,6 +82,7 @@ public:
     private:
         friend class CSpace;
         friend class Batch;
+        friend class ipc::Channel;
         Reservation(
             CSpace& owner,
             Handle handle,
@@ -99,7 +101,7 @@ public:
         resource::Charge charge_{};
     };
 
-    // Validated admission and reserved storage; no capability is visible yet.
+    // Validated preparation and reserved storage; publication rechecks authority.
     class NewCap {
     public:
         NewCap() noexcept = default;
@@ -109,12 +111,10 @@ public:
 
     private:
         friend class CSpace;
-        NewCap(Reservation&& slot, GrantRef&& grant, GrantLease&& pin, View view) noexcept
-            : slot_(std::move(slot)), grant_(std::move(grant)), pin_(std::move(pin)), view_(view) {}
+        NewCap(Reservation&& slot, Capability&& cap) noexcept
+            : slot_(std::move(slot)), cap_(std::move(cap)) {}
         Reservation slot_;
-        GrantRef grant_;
-        GrantLease pin_;
-        View view_{};
+        Capability cap_;
     };
 
     explicit CSpace(mm::Pmm& pmm) noexcept;
@@ -133,7 +133,10 @@ public:
     [[nodiscard]] auto prepare(Reservation&&, GrantRef&&, View) noexcept
         -> std::expected<NewCap, CSpaceError>;
     // All slots become visible under one lock, or none do. No allocation here.
-    [[nodiscard]] auto insert(std::span<NewCap>) noexcept
+    [[nodiscard]] auto insert(std::span<NewCap>, Graph::Admission = {},
+        std::span<const object::ref<>*> gates = {},
+        libk::delegate<void() noexcept> commit = {},
+        std::span<const Graph::Attach> relations = {}) noexcept
         -> std::expected<void, CSpaceError>;
     using PublishError = std::variant<resource::errc, GrantError, CSpaceError>;
     template<usize N, class Make, class Bind>
@@ -164,10 +167,7 @@ public:
         -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation payment = {}) noexcept
         -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto revoke(
-        Handle source,
-        GrantRevoke& completion,
-        bool include_source) noexcept -> std::expected<void, CSpaceError>;
+    [[nodiscard]] auto revoke(Handle, Source::Context* = nullptr, GrantId selected = {}) noexcept -> std::expected<WaitResult, CSpaceError>;
     [[nodiscard]] auto destroy(Handle source) noexcept
         -> std::expected<void, CSpaceError>;
 
@@ -175,14 +175,14 @@ public:
     [[nodiscard]] auto resolve(
         Handle handle,
         Rights requested) noexcept -> std::expected<Resolved<T>, CSpaceError> {
-        static_assert(object::kind<T> != ObjInvalid);
+        static_assert(std::is_void_v<T> || object::kind<T> != ObjInvalid);
         auto copied = snapshot(handle);
         if (!copied) {
             return std::unexpected(copied.error());
         }
         Snapshot source = std::move(copied).value();
         GrantLease lease = std::move(source.lease);
-        if (lease.kind() != object::kind<T>) {
+        if (!std::is_void_v<T> && lease.kind() != object::kind<T>) {
             return std::unexpected(CSpaceError::WrongKind);
         }
         if (!source.view.rights.contains(requested)) {
@@ -192,10 +192,27 @@ public:
         return (Resolved<T>{
             *this,
             std::move(lease),
-            source.view});
+            source.view, handle, source.token});
     }
 
-    auto inspect(Handle cursor) noexcept -> std::expected<CSpaceInfo, CSpaceError>;
+    template<class Transaction> auto billing(const object::ref<>&, Transaction&& transaction) noexcept
+        -> std::expected<u64, status_t> {
+        {
+            sync::Lock guard{lock_};
+            if (!accepting_ || billing_ || growing_ || preparing_ || escrows_ || releasing_)
+                return std::unexpected(STATUS_BUSY);
+            billing_ = true;
+        }
+        libk::scope_exit resume{[&]() noexcept {
+            { sync::Lock guard{lock_}; billing_ = false; }
+            finish_retire();
+        }};
+        return transaction([&](auto&& visit) { visit(charge_); }, [] {});
+    }
+    auto inspect(GrantQuery, usize depth, GrantRecords&) noexcept -> status_t;
+    auto observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, CSpaceError>;
+    auto inspect(Handle cursor, CSpaceInfo&, u64 epoch = 0) noexcept -> std::expected<void, CSpaceError>;
+    void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; job_.bind(owner); }
     void retire() noexcept;
     void retire(object::cleanup&&) noexcept;
     [[nodiscard]] auto binding_count() const noexcept -> usize;
@@ -213,11 +230,6 @@ private:
     static constexpr u32 invalid_index = ~u32{};
     static constexpr usize max_leaves = dir_entries * dir_entries;
 
-    struct Capability final {
-        GrantRef grant{};
-        View view{};
-    };
-
     enum class SlotState : u8 {
         Empty,
         Reserved,
@@ -226,6 +238,7 @@ private:
     };
 
     struct Slot final {
+        mutable sync::Spin lock;
         union Storage {
             byte empty;
             Capability capability;
@@ -246,7 +259,7 @@ private:
     struct DirPage final {
         explicit DirPage(mm::Page physical) noexcept : page(physical) {}
         mm::Page page{};
-        void* children[dir_entries]{};
+        std::atomic<void*> children[dir_entries]{};
     };
 
     static constexpr usize leaf_bits = std::bit_width(
@@ -266,8 +279,11 @@ private:
     struct Snapshot final {
         GrantLease lease;
         View view;
+        u64 token{};
     };
 
+    auto install(std::span<Capability*>, std::span<Reservation*>, Graph::Admission,
+        std::span<const object::ref<>*>, libk::delegate<void() noexcept>, std::span<const Graph::Attach> = {}) noexcept -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto snapshot(Handle handle) noexcept
         -> std::expected<Snapshot, CSpaceError>;
     struct Xfer final {
@@ -285,27 +301,29 @@ private:
     [[nodiscard]] auto reserved(const Reservation&) noexcept -> Slot*;
     void publish(Reservation&, Capability&&) noexcept;
     void rollback(Handle handle) noexcept;
+    void run_work() noexcept;
+    void release() noexcept;
     void finish_retire() noexcept;
+    void changed() noexcept;
+    void post() noexcept { if (work_) work_->post(job_); }
     void complete_cleanup() noexcept;
     [[nodiscard]] auto reserve_grant() noexcept
         -> std::expected<resource::Reservation, CSpaceError>;
     [[nodiscard]] auto escrow_move(
         Handle source,
-        GrantRef& grant,
-        View& view,
+        Capability& cap,
         Reservation& reservation) noexcept
         -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto escrow_restore(
         Reservation& reservation,
-        GrantRef&& grant,
-        View view) noexcept -> bool;
+        Capability&& cap) noexcept -> bool;
     [[nodiscard]] auto escrow_drop(
         Reservation& reservation) noexcept -> resource::Charge;
     void retain_escrow() noexcept;
     void release_escrow() noexcept;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
-    void bind_sponsor(resource::Sponsorship& sponsor) noexcept;
+    void bind_funding(resource::Funding& funding) noexcept;
     [[nodiscard]] auto grow() noexcept -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto slot(usize index) noexcept -> Slot*;
     [[nodiscard]] auto slot(usize index) const noexcept -> const Slot*;
@@ -321,21 +339,27 @@ private:
     mm::PageGroup pages_;
     Quota quota_{};
     mutable sync::Spin lock_{};
-    DirPage* root_{};
+    std::atomic<DirPage*> root_{};
     u32 free_head_{invalid_index};
     u32 occupied_head_{invalid_index};
     usize next_leaf_{};
     usize page_count_{};
     usize live_slots_{};
+    u64 epoch_{1};
     usize quarantined_slots_{};
-    bool accepting_{true};
-    bool growing_{};
+    std::atomic<bool> accepting_{true};
+    bool growing_{}, billing_{};
+    usize preparing_{};
     bool releasing_{};
     bool retired_{};
     object::cleanup cleanup_{};
+    DirPage* retiring_{};
+    WorkQueue* work_{};
+    Work job_{Work::Fn::bind<&CSpace::run_work>(*this)};
+    bool dirty_{}, advancing_{}, again_{};
     usize bindings_{};
     usize escrows_{};
-    resource::Sponsorship* sponsor_{};
+    resource::Funding* funding_{};
     // All table pages and committed selectors share this immutable sponsor.
     // Detached subcharges refund only after the corresponding storage is free.
     resource::Charge charge_{};

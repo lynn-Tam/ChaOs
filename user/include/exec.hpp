@@ -29,6 +29,7 @@ struct pr_layout {
 };
 struct pr_opts {
     std::span<const std::string_view> argv{};
+    std::span<const std::string_view> envp{};
     std::span<const pr_cap> caps{};
     pr_quota resources{};
     uint32_t cpu{};

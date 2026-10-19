@@ -22,47 +22,87 @@ struct WaitState final {
     std::atomic<u32> ran{};
 };
 
-struct DeferredResult final {
-    bool ready{}, cancelable{};
-    usize releases{};
-    Completion completion{
-        Completion::bind<DeferredResult, &DeferredResult::release, &DeferredResult::cancel>(*this)};
-
-    void release() noexcept { ++releases; }
-    auto cancel() noexcept -> bool { return cancelable && !ready; }
-};
-
 auto cancellation_publication(Thread& thread, Cpus& cpus) noexcept -> bool {
-    // This finite ordering check acts as producer and consumer on one stack.
-    // A trap must not suspend it while its deliberately unpublished wait is
-    // attached; ordinary asynchronous producers run independently of waiters.
     sync::Irq interrupts;
-    {
-        DeferredResult source;
-        if (!thread.begin_wait(source.completion, cpus)) return false;
-        source.ready = true;
-        // A real producer may have stored its result and still owe signal().
-        // Cancellation must retain its lifetime through that publication gap.
-        if (thread.wait().cancel()) return false;
-        if (!thread.wait().attached() || source.releases != 0) return false;
-        source.completion.signal();
-        thread.cancel_wait();
-        if (thread.wait().attached() || source.releases != 1) return false;
+    const Source::Context context{thread, cpus, current_cpu().dispatcher()};
+    Source source;
+    usize releases{}, drains{};
+    Source::Action ready;
+    auto release = [&]() noexcept { ++releases; };
+    auto drain = [&]() noexcept { ++drains; };
+    auto admission = [&](Source::Commit commit, Source::Action, Source::Action done) noexcept {
+        ready = done; commit(Source::Action::bind(drain)); return STATUS_OK;
+    };
+    if (source.await(context, {}, {}, Source::Admission::bind(admission), Source::Action::bind(release)).status != STATUS_PENDING)
+        return false;
+    // Source has claimed a result, but real authority teardown still owes its
+    // ready callback. Stop cannot release or reopen this fixed registration.
+    if (!source.post(1) || drains != 1 || thread.wait().cancel() || releases || thread.wait().ready()) return false;
+    ready(); ready = {};
+    thread.cancel_wait();
+    if (thread.waiting() || releases != 1 || thread.wait().result().value != 1) return false;
+    (void)source.take();
+    if (source.await(context, {}, {}, {}, Source::Action::bind(release)).status != STATUS_PENDING) return false;
+    if (!source.post(1)) return false;
+    thread.cancel_wait();
+    if (thread.waiting() || releases != 2 || thread.wait().result().value != 1) return false;
+    (void)source.take();
+    if (source.await(context, {}, {}, {}, Source::Action::bind(release)).status != STATUS_PENDING) return false;
+    thread.cancel_wait();
+    return !thread.waiting() && releases == 3 && thread.wait().result().status == STATUS_CANCELED;
+}
+
+auto source_wait(Thread& thread, Cpus& cpus) noexcept -> bool {
+    sync::Irq irq;
+    Source source;
+    auto& dispatcher = current_cpu().dispatcher();
+    const auto seen = source.snapshot().sequence;
+    if (source.await({thread, cpus, dispatcher}, {.mask = 0, .seen = seen, .changed = true}).status != STATUS_PENDING)
+        return false;
+    if (!source.update(0)) return false;
+    thread.block();
+    if (thread.wait().result().sequence == seen) return false;
+    if (!source.post(3) || source.take(1).value != 1 || source.take().value != 2) return false;
+    const auto deadline = dispatcher.clock().rd_ticks() + *dispatcher.clock().ticks<1, time::ms>();
+    if (source.await({thread, cpus, dispatcher}, {}, deadline).status != STATUS_PENDING) return false;
+    thread.block();
+    if (thread.wait().result().status != STATUS_TIMED_OUT) return false;
+    if (source.await({thread, cpus, dispatcher}, {}).status != STATUS_PENDING) return false;
+    source.close();
+    thread.block();
+    return source.drained() && thread.wait().result().status == STATUS_CLOSED;
+}
+
+// Crossing the inline publication batch must preserve the same READY history.
+auto source_history(Cpu& runtime) noexcept -> bool {
+    auto& k = *test::boot;
+    Src<SOURCE_READY> source;
+    source.bind_work(k.work, {});
+    std::array<object::ref<Thread>, 9> threads;
+    for (usize i = 0; i < threads.size(); ++i) {
+        auto stack = mm::Stack::create(k.vm); libk_assert(stack);
+        auto made = k.objects.get<Thread>().create(std::move(*stack), Env::kernel(k.vm),
+            Thread::KernelStart{[](void*) noexcept {}, nullptr});
+        libk_assert(made); threads[i] = made->publish();
+        auto& home = runtime.cpus->get(CpuId{i % runtime.cpus->count()})->dispatcher();
+        libk_assert(threads[i]->claim_home(home));
+        libk_assert(source.await({threads[i].get(), *runtime.cpus, home}, {.mask=SOURCE_READY}).status == STATUS_PENDING);
     }
-    {
-        DeferredResult source;
-        if (!thread.begin_wait(source.completion, cpus)) return false;
-        source.ready = true;
-        source.completion.signal();
-        thread.cancel_wait();
-        if (thread.wait().attached() || source.releases != 1) return false;
+    auto ready = source.prepare(SOURCE_READY);
+    libk_assert(source.take().value == SOURCE_READY);
+    source.close(); ready.publish();
+    for (auto& thread : threads) {
+        libk_assert(thread->wait().ready());
+        const auto result = thread->wait().result();
+        libk_assert(result.status == STATUS_OK && result.value == SOURCE_READY);
+        thread->cancel_wait();
     }
-    {
-        DeferredResult source;
-        source.cancelable = true;
-        if (!thread.begin_wait(source.completion, cpus)) return false;
-        thread.cancel_wait();
-        if (thread.wait().attached() || source.releases != 1) return false;
+    while (!source.drained()) sched::yield();
+    libk_assert(source.await({*runtime.current, *runtime.cpus, runtime.dispatcher()}, {}).status == STATUS_CLOSED);
+    for (auto& thread : threads) {
+        libk_assert(thread.destroy());
+        while (thread->state() != Thread::State::Exited) sched::yield();
+        thread.reset();
     }
     return true;
 }
@@ -130,6 +170,8 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
         space->map(context, {range, {0, 1}, access}, std::move(reference), memory.get(),
                    {.range = {0, 1}, .perms = access});
     libk_assert(mapped && mapped.value().status == mm::VmStatus::Complete);
+    const auto materialized = space->fault(context, range.base(), mm::Perm::Read);
+    libk_assert(materialized && materialized->kind == mm::FaultKind::Materialized);
     VmPeer peer{space.get(), kernel};
     auto stack = mm::Stack::create(kernel.vm);
     libk_assert(stack);
@@ -159,9 +201,7 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
         auto target = object::ref<>{space};
         libk_assert(target);
         auto& current = *current_cpu().current;
-        mm::Fence wait{std::move(target), space.get()};
-        libk_assert(current.begin_wait(wait.completion(), cpus));
-        wait.start();
+        libk_assert(space->wait_pending(current, cpus, current_cpu().dispatcher()).status == STATUS_PENDING);
         libk_assert(space->pending() && !current.wait().ready());
         peer.release.store(true, std::memory_order_release);
         const auto duration = kernel.clock.ticks<1, time::s>();
@@ -179,9 +219,8 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
     }
     while (thread->state() != Thread::State::Exited) sched::yield();
     // Exited and an unbound SC precede the dispatcher's final home release.
-    Stop stopped;
-    stopped.start(thread.get());
-    while (!stopped.complete()) sched::yield();
+    thread->stop();
+    while (!thread->stopped()) sched::yield();
     while (sc->bound()) {
         sched::yield();
     }
@@ -205,7 +244,7 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     auto pager = std::move(*pg).publish();
     auto pg_ref = object::ref<>{pager};
     if (!pg_ref) return false;
-    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, page_size, mm::PagedCfg{std::move(pg_ref), Perms::of(Perm::Read, Perm::Write), false});
+    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, 2 * page_size, mm::PagedCfg{std::move(pg_ref), Perms::of(Perm::Read, Perm::Write), false}, object::ref<>{k.domain});
     if (!pending) return false;
     auto mem = std::move(*pending).publish();
     auto a = k.objects.get<mm::VSpace>().create(
@@ -232,9 +271,10 @@ auto live_trim(Cpu& rt) noexcept -> bool {
         memset(page->bytes(), 0x5a, page_size);
         return bool(mem->supply(pager.get(), request->id, std::move(*page)));
     };
-    if (mem->materialize(0).error() != MemErr::Pending || !supply()) return false;
+    if (mem->materialize(0).error() != MemErr::Pending || !supply()
+        || mem->materialize(1).error() != MemErr::Pending || !supply()) return false;
     const VmCtx ctx{&cpus, rt.id};
-    const VRange range{va_t{0x72000000}, page_size};
+    const VRange range{va_t{0x72000000}, 2 * page_size};
     const auto perms = Perms::of(Perm::Read, Perm::Write);
     MapId ids[2];
     usize i{};
@@ -242,17 +282,36 @@ auto live_trim(Cpu& rt) noexcept -> bool {
         auto ref = object::ref<>{mem};
         if (!ref) return false;
         auto map =
-            space->map(ctx, {range, {0, 1}, perms}, std::move(ref), mem.get(),
-                       {.range = {0, 1}, .perms = perms});
+            space->map(ctx, {range, {0, 2}, perms}, std::move(ref), mem.get(),
+                       {.range = {0, 2}, .perms = perms});
         if (!map) return false;
         auto fault = space->fault(ctx, range.base(), Perm::Read);
         if (!fault || fault->kind != FaultKind::Materialized) return false;
+        fault = space->fault(ctx, va_t{range.base().raw() + page_size}, Perm::Read);
+        if (!fault || fault->kind != FaultKind::Materialized) return false;
         ids[i++] = map->mapping;
     }
+    auto borrowed = first->bind_view({.memory = mem, .object = {1, 1},
+        .virtual_range = VRange{va_t{range.base().raw() + page_size}, page_size}});
+    if (!borrowed) return false;
     auto& thread = *current_cpu().current;
-    if (!mem->trim(thread, cpus, {0, 1}) || mem->state() != MemState::Live ||
+    auto trim = [&](ObjectRange selected = {0, 1}) noexcept -> std::expected<void, MemErr> {
+        Source::Context context{thread, cpus, current_cpu().dispatcher()};
+        auto started = mem->trim(selected, context);
+        if (started || started.error() != MemErr::Pending) return started;
+        thread.block(); // This scenario driver is a kernel thread, not a provider.
+        const auto result = thread.wait().result();
+        if (result.status != STATUS_OK) return std::unexpected(MemErr::BackingFailed);
+        if (result.value == MEM_TRIM_BUSY) return std::unexpected(MemErr::Busy);
+        return result.value == MEM_TRIM_DIRTY ? std::expected<void, MemErr>{std::unexpected(MemErr::Dirty)}
+            : std::expected<void, MemErr>{};
+    };
+    if (!trim() || mem->state() != MemState::Live ||
         mem->query(0).value() != ContentState::Zero || !first->inspect(ids[0]) || !second->inspect(ids[1]))
         return false;
+    if (mem->query(1).value() != ContentState::Resident || !borrowed->valid()) return false;
+    auto pinned = trim({1, 1});
+    if (pinned || pinned.error() != MemErr::Busy || !borrowed->valid()) return false;
     // Both old logical Maps survive; a refault is a new real Pager request.
     auto fault = first->fault(ctx, range.base(), Perm::Read);
     if (!fault || fault->kind != FaultKind::Pending || !supply()) return false;
@@ -263,7 +322,7 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     k.pmm.bytes(held->page())[0] = byte{0x6b};
     if (!mem->observe_usage(0, false, true)) return false;
     held->reset();
-    auto dirty = mem->trim(thread, cpus, {0, 1});
+    auto dirty = trim();
     if (dirty || dirty.error() != MemErr::Dirty || mem->query(0).value() != ContentState::Resident ||
         !mem->writeback(0))
         return false;
@@ -272,21 +331,21 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     if (!write || write->kind != Pager::Kind::Writeback || !mem->read(0, {&byte_read, 1}) ||
         byte_read != byte{0x6b} || !mem->pager_finish(pager.get(), write->id, false))
         return false;
-    if (!mem->trim(thread, cpus, {0, 1}) || mem->query(0).value() != ContentState::Zero) return false;
-    console::print<"[scenario] live trim ok: two spaces, refault, dirty writeback\n">();
+    if (!trim() || mem->query(0).value() != ContentState::Zero) return false;
+    console::print<"[scenario] live trim ok: two spaces, partial range, wired Busy, refault, dirty writeback\n">();
     return true;
 }
 
 void wait_entry(void* argument) noexcept {
     auto& state = *static_cast<WaitState*>(argument);
     auto& cpu = current_cpu();
-    // The worker's arm/post/block handshake has no Completion to retain its
+    // The worker's arm/post/block handshake has no user Wait to retain its
     // result. An intervening dispatch must preserve its single wake credit.
     libk_assert(sched::wake(*cpu.cpus, *cpu.current));
     sched::yield();
     sched::block();
     console::print<"[scenario] wake credit survives dispatch before block\n">();
-    const bool passed = cancellation_publication(*cpu.current, *cpu.cpus) &&
+    const bool passed = cancellation_publication(*cpu.current, *cpu.cpus) && source_wait(*cpu.current, *cpu.cpus) &&
                         pending_vm_wait(cpu) && live_trim(cpu);
     state.ran.store(passed ? 1 : 2, std::memory_order_release);
     sched::exit_current();
@@ -295,7 +354,7 @@ void wait_entry(void* argument) noexcept {
 
 // A committed operation owns its completion through suspension and resource recall.
 struct ExecutionWait {
-    Receipt receipt{};
+    Op operation{};
     Cpus& cpus;
     bool overrun{};
     std::atomic<bool> entered{}, returned{};
@@ -310,7 +369,8 @@ static void execution_entry(void* p) noexcept {
         const auto until = clock.rd_ticks() + *clock.ticks<2, time::ms>();
         while (clock.rd_ticks() < until) asm volatile("" ::: "memory");
     }
-    libk_assert(thread.begin_wait(op.receipt.completion(), op.cpus));
+    libk_assert(op.operation.events().await({thread, op.cpus, current_cpu().dispatcher()},
+        {.mask = OP_DONE}).status == STATUS_PENDING);
     op.entered.store(true, std::memory_order_release);
     thread.block();
     thread.leave_kernel();
@@ -338,7 +398,7 @@ static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
     };
     for (bool stop : {false, true}) {
         ExecutionWait op{.cpus = k.cpus, .overrun = !stop};
-        op.receipt.commit();
+        op.operation.accept(); libk_assert(op.operation.commit());
         auto thread = create(op, k.cpus.count() > 1 ? CpuId{1} : runtime.id);
         auto pending = k.objects.get<sched::Sc>().create(sched::Sc::Config{
             .budget = stop ? 0 : *clock.ticks<1, time::ms>(),
@@ -354,14 +414,13 @@ static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
         else libk_assert(sc->withdraw(generation));
         wait([&] { return !sc->info(clock.rd_ticks()).bound; });
         libk_assert(!thread->stop_requested());
-        op.receipt.signal();
+        op.operation.finish();
         const auto delay = clock.rd_ticks() + *clock.ticks<5, time::ms>();
         while (clock.rd_ticks() < delay) sched::yield();
         libk_assert(!op.returned.load(std::memory_order_acquire));
-        Stop stopped;
         if (stop) {
-            stopped.start(thread.get());
-            wait([&] { return stopped.complete(); });
+            thread->stop();
+            wait([&] { return thread->stopped(); });
             libk_assert(!op.returned.load(std::memory_order_acquire));
         } else {
             const auto debt = sc->info(clock.rd_ticks()).debt;
@@ -373,9 +432,8 @@ static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
             libk_assert(changed.bound && changed.debt == debt);
             libk_assert(sc->withdraw(changed.generation));
             wait([&] { return !sc->info(clock.rd_ticks()).bound; });
-            Stop unused;
-            unused.start(borrower.get());
-            wait([&] { return unused.complete(); });
+            borrower->stop();
+            wait([&] { return borrower->stopped(); });
             libk_assert(borrower.destroy());
             libk_assert(sc->bind(sc, thread.get()));
             libk_assert(thread->detach_resource(generation) == STATUS_STALE); // Old association cannot recall the new one.
@@ -439,9 +497,89 @@ static auto fair_execution(Cpu&) noexcept -> bool {
     return true;
 }
 
+struct OrdinaryWork {
+    std::atomic<unsigned> steps{};
+    Work work{Work::Fn::bind<&OrdinaryWork::step>(*this), Work::Fn::bind<&OrdinaryWork::cancel>(*this)};
+    void step() noexcept {
+        const auto end = test::boot->clock.rd_ticks() + *test::boot->clock.ticks<100, time::us>();
+        while (test::boot->clock.rd_ticks() < end) {}
+        steps.fetch_add(1, std::memory_order_release);
+    }
+    void cancel() noexcept {}
+};
+static constinit libk::manual_lifetime<std::array<OrdinaryWork, 8>> ordinary_storage;
+
+static auto domain_execution(Cpu&) noexcept -> bool {
+    auto& k = *test::boot;
+    if (k.cpus.count() < 4) return true;
+    auto& clock = k.clock;
+    const auto mask = (u64{1} << k.cpus.count()) - 1;
+    std::array<object::ref<sched::Domain>, 4> domains;
+    for (usize i = 0; i < domains.size(); ++i) {
+        const sched::Domain::Config config{.cpus=mask,
+            .budget=i == 2 ? *clock.ticks<1, time::ms>() : 0,
+            .period=i == 2 ? *clock.ticks<10, time::ms>() : 0};
+        auto made = k.objects.get<sched::Domain>().create(k.pmm, k.cpus, config);
+        libk_assert(made && made->get().open() == STATUS_OK);
+        domains[i] = made->publish();
+        libk_assert(domains[i]->attach(i == 3 ? domains[2] : k.domain) == STATUS_OK);
+    }
+    std::array<std::atomic<bool>, 6> done{};
+    std::array<object::ref<Thread>, 6> threads;
+    std::array<object::ref<sched::Sc>, 6> contexts;
+    for (usize i = 0; i < threads.size(); ++i) {
+        const CpuId cpu{i < 4 ? 1 : i - 2};
+        auto stack = mm::Stack::create(k.vm);
+        libk_assert(stack);
+        auto t = k.objects.get<Thread>().create(std::move(*stack), Env::kernel(k.vm),
+            Thread::KernelStart{fair_entry, &done[i]});
+        libk_assert(t);
+        threads[i] = t->publish();
+        libk_assert(threads[i]->claim_home(k.cpus.get(cpu)->dispatcher()));
+        auto sc = k.objects.get<sched::Sc>().create(sched::Sc::Config{}, clock.rd_ticks());
+        libk_assert(sc);
+        contexts[i] = sc->publish();
+        libk_assert(domains[i < 3 ? 0 : i == 3 ? 1 : 3]->admit(contexts[i].get(), cpu));
+        libk_assert(contexts[i]->bind(contexts[i], threads[i].get()) && threads[i]->execution(true));
+    }
+    const auto started = clock.rd_ticks();
+    while (clock.rd_ticks() - started < *clock.ticks<300, time::ms>()) sched::yield();
+    std::array<u64, 6> used;
+    for (usize i = 0; i < used.size(); ++i) used[i] = threads[i]->info(clock.rd_ticks()).runtime;
+    const auto elapsed = clock.rd_ticks() - started;
+    const auto many = used[0] + used[1] + used[2];
+    libk_assert(many && used[3] && many * 10 > used[3] * 7 && many * 10 < used[3] * 14);
+
+    libk_assert((used[4] + used[5]) && (used[4] + used[5]) * 100 < elapsed * 16);
+    const auto config = sched::Domain::Config{.cpus=mask, .budget=*clock.ticks<2, time::ms>(),
+        .period=*clock.ticks<20, time::ms>(), .weight=512};
+    const auto sequence = domains[2]->configure(config, &k.domain.get());
+    libk_assert(sequence);
+    while (domains[2]->info(clock.rd_ticks()).applied != *sequence) sched::yield();
+    libk_assert(domains[2]->info(clock.rd_ticks()).status == STATUS_OK);
+    for (auto& flag : done) flag.store(true, std::memory_order_release);
+    for (auto& t : threads) while (!t->stopped()) sched::yield();
+    for (usize i = 0; i < threads.size(); ++i) libk_assert(threads[i].destroy() && contexts[i].destroy());
+    auto& jobs = ordinary_storage.emplace();
+    for (auto& work : jobs) libk_assert(domains[3]->post(work.work) == STATUS_OK);
+    for (auto& work : jobs) while (!work.steps.load(std::memory_order_acquire)) sched::yield();
+    // Closing the ancestor must drain its real child index and every home.
+    for (usize i : {0U, 1U, 2U}) static_cast<void>(domains[i]->close());
+    for (auto& d : domains) {
+        while (d->info(clock.rd_ticks()).phase != DOMAIN_DRAINED) sched::yield();
+        libk_assert(d->info(clock.rd_ticks()).work_runtime || &d == &domains[0] || &d == &domains[1]);
+        libk_assert(d.destroy());
+    }
+    ordinary_storage.reset();
+    console::print<"[scenario] domain execution ok: siblings={}/{} aggregate={}/{} home recall drained\n">(many, used[3], used[4] + used[5], elapsed);
+    return true;
+}
+
 auto wait_publication(Cpu& runtime) noexcept -> bool {
+    libk_assert(source_history(runtime));
     libk_assert(execution_lifetime(runtime));
     libk_assert(fair_execution(runtime));
+    libk_assert(domain_execution(runtime));
     if (test::boot == nullptr ||
         runtime.cpus == nullptr) {
         return false;

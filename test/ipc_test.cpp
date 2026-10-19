@@ -1,4 +1,4 @@
-#include <task/exit.hpp>
+#include <task/thread.hpp>
 #include <irq/irq.hpp>
 #include <test/test.hpp>
 
@@ -8,97 +8,16 @@
 
 namespace {
 
-class TestSource final {
-public:
-    TestSource() noexcept
-        : binding_(ipc::NotificationSource::Closed::bind<&TestSource::closed>(*this)) {}
-
-    ~TestSource() noexcept { binding_.reset(); }
-
-    [[nodiscard]] auto sc() noexcept
-        -> ipc::NotificationSource& {
-        return binding_;
-    }
-
-    void publish() noexcept {
-        ++sequence_;
-        ready_ = true;
-        static_cast<void>(binding_.signal());
-    }
-
-    [[nodiscard]] auto consume() noexcept -> u64 {
-        ready_ = false;
-        return sequence_;
-    }
-
-    void rearm(u64 observed) noexcept {
-        if (ready_ || sequence_ != observed) {
-            static_cast<void>(binding_.signal());
-        }
-    }
-
-    [[nodiscard]] auto was_closed() const noexcept -> bool {
-        return closed_;
-    }
-
-private:
-    void closed() noexcept { closed_ = true; }
-
-    ipc::NotificationSource binding_;
-    u64 sequence_{};
-    bool ready_{};
-    bool closed_{};
-};
-
 bool test_notification_badges_are_coalesced(const TestContext&) noexcept {
     ipc::Notification notification{};
     if (!notification.signal(1) || !notification.signal(2)
         || !notification.signal(1)) {
         return false;
     }
-    const auto first = notification.take();
-    const auto second = notification.take();
-    return first && first.value().badges == 3
-        && first.value().sequence == 3
-        && !second
-        && second.error() == ipc::NotificationError::Empty;
-}
-
-bool test_notification_source_rearm_preserves_level(
-    const TestContext&) noexcept {
-    ipc::Notification notification{};
-    TestSource source{};
-    if (!notification.bind(source.sc(), 4)) {
-        return false;
-    }
-
-    source.publish();
-    const auto initial = notification.take();
-    if (!initial || initial.value().badges != 4) {
-        return false;
-    }
-
-    const u64 observed = source.consume();
-    // A new readiness transition in the consume/rearm window must be
-    // projected again even if an earlier badge was already taken.
-    source.publish();
-    source.rearm(observed);
-    const auto replayed = notification.take();
-    source.sc().reset();
-    return replayed && replayed.value().badges == 4
-        && replayed.value().sequence > initial.value().sequence
-        && !source.sc().attached() && !source.was_closed();
-}
-
-bool test_notification_source_has_one_receiver(const TestContext&) noexcept {
-    ipc::Notification first{};
-    ipc::Notification second{};
-    TestSource source{};
-    const auto attached = first.bind(source.sc(), 8);
-    const auto duplicate = second.bind(source.sc(), 16);
-    source.sc().reset();
-    return attached && !duplicate
-        && duplicate.error() == ipc::NotificationError::Busy;
+    const auto first = notification.events().take();
+    const auto second = notification.events().take();
+    return first.status == STATUS_OK && first.value == 3 && first.sequence == 3
+        && second.status == STATUS_RETRY;
 }
 
 bool test_notification_badge_is_immutable_authority(
@@ -203,81 +122,75 @@ bool test_channel_badge_and_side_are_immutable(
 
 } // namespace
 
-static bool test_irq_sequence_reassert_requires_latest_ack(const TestContext &) noexcept {
-    ipc::Notification notification{};
-    ipc::Notification rebound_notification{};
-    irq::Routes routes{};
+static bool test_irq_sequence_reassert_requires_latest_ack(const TestContext&) noexcept {
+    irq::Routes routes;
     irq::Irq irq{{routes, 10}};
     auto take = []() noexcept -> u32 { return 10; };
-    if (!irq.bind(notification, 0x40)) {
-        return false;
-    }
+    if (!irq.enable(true)) return false;
     routes.dispatch(irq::Routes::Take::bind(take));
     const auto first = irq.delivery();
-    const auto first_notice = notification.take();
+    if (!first || irq.events().snapshot().value != SOURCE_READY) return false;
     routes.dispatch(irq::Routes::Take::bind(take));
     const auto second = irq.delivery();
-    if (!first || !second || !first_notice ||
-        irq.ack(first.value().generation, first.value().sequence)) {
-        return false;
-    }
-    if (!irq.ack(second.value().generation, second.value().sequence) || !notification.take() ||
-        !irq.unbind() || (irq.bound() || irq.pending()) || !irq.bind(notification, 0x40)) {
-        return false;
-    }
+    if (!second || irq.ack(first->generation, first->sequence)
+        || !irq.ack(second->generation, second->sequence) || irq.events().snapshot().value) return false;
     routes.dispatch(irq::Routes::Take::bind(take));
     const auto pending = irq.delivery();
-    if (!pending || !notification.take() || !irq.unbind() || (irq.bound() || !irq.pending())) {
-        return false;
-    }
-    if (!irq.bind(rebound_notification, 0x40) || (!irq.bound() || !irq.pending())) {
-        return false;
-    }
+    if (!pending || !irq.enable(false) || irq.bound() || !irq.pending() || !irq.enable(true)) return false;
     const auto retained = irq.delivery();
-    if (!retained || retained.value().sequence != pending.value().sequence ||
-        retained.value().generation == pending.value().generation || !rebound_notification.take()) {
-        return false;
-    }
-    const auto stale = irq.ack(pending.value().generation, pending.value().sequence);
-    if (stale || stale.error() != irq::Error::StaleSequence) {
-        return false;
-    }
-    return irq.ack(retained.value().generation, retained.value().sequence) && irq.bound() &&
-           !irq.pending() && irq.unbind() && !irq.bound() && !irq.pending();
+    if (!retained || retained->sequence != pending->sequence || retained->generation == pending->generation
+        || irq.events().snapshot().value != SOURCE_READY || irq.ack(pending->generation, pending->sequence)) return false;
+    return bool(irq.ack(retained->generation, retained->sequence)) && !irq.pending() && bool(irq.enable(false));
 }
 
-static bool test_exit_notification_is_read_only(const TestContext &) noexcept {
-    ipc::Notification notification{};
-    Exit first{}, second{};
-    if (!first.observe(notification, 0x80) || first.observe(notification, 0x40) ||
-        !second.claim(STATUS_OK) ||
-        !second.observe(notification, 0x40) ||
-        !first.claim(STATUS_CANCELED))
-        return false;
-    const auto event = notification.take();
-    const auto result = first.read();
-    return event && event.value().badges == 0xc0 && result == STATUS_CANCELED &&
-           !first.claim(STATUS_INTERNAL) && first.published();
+static bool test_exit_result_is_immutable(const TestContext&) noexcept {
+    Thread::Exit result;
+    return result.claim(STATUS_CANCELED) && result.read() == STATUS_CANCELED
+        && !result.claim(STATUS_INTERNAL) && result.published()
+        && result.events().snapshot().value == SOURCE_READY;
 }
 
 void register_ipc_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("ipc", "deferred source preserves pulses and terminal hints",
+        +[](const TestContext&) noexcept -> bool {
+            WorkQueue work;
+            Src<SOURCE_READY> source;
+            source.bind_work(work, {});
+            usize ready{}, closed{};
+            auto receive = [&](WaitResult value) noexcept {
+                if (value.status == STATUS_CLOSED) ++closed;
+                else if (value.status == STATUS_OK && value.value == SOURCE_READY) ++ready;
+            };
+            auto drained = []() noexcept {};
+            const auto deliver = libk::delegate<void(WaitResult) noexcept>::bind(receive);
+            const auto done = Source::Drained::bind(drained);
+            Source::Watch a{deliver, done}, b{deliver, done}, c{deliver, done};
+            libk::scope_exit cleanup{[&]() noexcept {
+                a.detach(); b.detach(); c.detach(); source.close();
+                while (work.run()) {}
+            }};
+            auto install = [](auto commit) noexcept { commit(); return STATUS_OK; };
+            for (auto* watch : {&a, &b, &c})
+                if (source.watch(*watch, {SOURCE_READY}, install) != STATUS_OK) return false;
+            source.post(SOURCE_READY);
+            source.update(0);
+            // Re-arm in place before the queued scan reaches this middle item.
+            if (source.arm(b, {SOURCE_READY}) != STATUS_OK) return false;
+            while (work.run()) {}
+            if (ready != 2 || closed || source.snapshot().value) return false;
+            source.close();
+            while (work.run()) {}
+            return ready == 2 && closed == 3;
+        });
     (void)registry.add("ipc", "IRQ acknowledgement rejects stale sequence",
         test_irq_sequence_reassert_requires_latest_ack);
-    (void)registry.add("ipc", "Exit notification observes one result",
-        test_exit_notification_is_read_only);
+    (void)registry.add("ipc", "Exit result and readiness are immutable",
+        test_exit_result_is_immutable);
 
     (void)registry.add(
         "ipc",
         "Notification ORs badges and one take wins the pending state",
         test_notification_badges_are_coalesced);
-    (void)registry.add(
-        "ipc",
-        "Notification source rearm preserves level readiness",
-        test_notification_source_rearm_preserves_level);
-    (void)registry.add(
-        "ipc",
-        "Notification source has one receiver-owned binding",
-        test_notification_source_has_one_receiver);
     (void)registry.add(
         "ipc",
         "Notification authority cannot rewrite its fixed badge",

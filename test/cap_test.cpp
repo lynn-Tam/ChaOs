@@ -44,7 +44,8 @@ constinit libk::manual_lifetime<mm::RegionList> cap_test_map{};
 constinit libk::manual_lifetime<mm::Pmm> cap_test_pmm{};
 constinit libk::manual_lifetime<WorkQueue> cap_work{};
 constinit libk::manual_lifetime<object::pool<sched::Sc>> cap_test_contexts{};
-constinit libk::manual_lifetime<object::pool<object::group>> cap_test_groups{};
+constinit libk::manual_lifetime<object::pool<resource::Account>> cap_test_accounts{};
+constinit libk::manual_lifetime<object::pool<object::Scope>> cap_test_scopes{};
 constinit libk::manual_lifetime<object::pool<cap::CSpace>> cap_test_cspaces{};
 
 constinit libk::manual_lifetime<Graph> cap_test_graph{};
@@ -94,11 +95,6 @@ void attenuation_bytes(
     put64(bytes, CAP_ATTENUATION_RIGHTS_OFFSET, rights);
 }
 
-struct RevokeProbe final {
-    void ready() noexcept { ++signals; }
-    usize signals{};
-};
-
 class CapFixture final : private libk::noncopyable_nonmovable {
 public:
     CapFixture() noexcept = default;
@@ -135,7 +131,8 @@ public:
         }
         cap_test_map.reset();
         (void)cap_test_contexts.emplace(*cap_test_pmm, *cap_work);
-        (void)cap_test_groups.emplace(*cap_test_pmm, *cap_work);
+        (void)cap_test_accounts.emplace(*cap_test_pmm, *cap_work);
+        (void)cap_test_scopes.emplace(*cap_test_pmm, *cap_work);
         (void)cap_test_cspaces.emplace(*cap_test_pmm, *cap_work);
         [[maybe_unused]] auto& graph =
             cap_test_graph.emplace(*cap_test_pmm, *cap_work);
@@ -146,6 +143,7 @@ public:
         [[maybe_unused]] auto& space_one = cap_test_space_one.emplace(
             *cap_test_pmm,
             CSpace::Quota{.slots = 1, .pages = 3});
+        space_a.bind_work(*cap_work, {}); space_b.bind_work(*cap_work, {}); space_one.bind_work(*cap_work, {});
 
         for (usize index = 0; index < 2; ++index) {
             auto pending = cap_test_contexts->create(
@@ -215,7 +213,7 @@ public:
     }
     [[nodiscard]] auto retire_target(usize index) noexcept -> bool {
         libk_assert(index < 2 && targets_[index]);
-        const auto id = targets_[index].id();
+        const auto id = targets_[index].key();
         if (!targets_[index].destroy()) {
             return false;
         }
@@ -229,21 +227,21 @@ private:
         cap_test_transfer.reset();
         if (cap_test_space_one) {
             cap_test_space_one->retire();
-            cap_test_space_one.reset();
+            drain(); cap_test_space_one.reset();
         }
         if (cap_test_space_b) {
             cap_test_space_b->retire();
-            cap_test_space_b.reset();
+            drain(); cap_test_space_b.reset();
         }
         if (cap_test_space_a) {
             cap_test_space_a->retire();
-            cap_test_space_a.reset();
+            drain(); cap_test_space_a.reset();
         }
         if (cap_test_graph) drain();
         cap_test_graph.reset();
         for (auto& target : targets_) {
             if (target) {
-                libk_assert(target.destroy());
+                if (target.live()) libk_assert(target.destroy());
                 target.reset();
             }
         }
@@ -252,7 +250,8 @@ private:
         }
         cap_test_cspaces.reset();
         cap_test_contexts.reset();
-        cap_test_groups.reset();
+        cap_test_accounts.reset();
+        cap_test_scopes.reset();
         cap_work.reset();
         cap_test_pmm.reset();
         cap_test_map.reset();
@@ -333,12 +332,12 @@ bool test_typed_attenuation_covers_all_families(
         Quota{
             resource::budget{1024 * 1024, 16},
             OBJ_KINDS}};
-    attenuation_bytes(bytes, ObjGroup);
+    attenuation_bytes(bytes, ObjAccount);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 4096);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 4);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
         (u64{1} << ObjMem));
-    if (!decode_and_check(ObjGroup, pool, bytes)) {
+    if (!decode_and_check(ObjAccount, pool, bytes)) {
         return false;
     }
 
@@ -624,17 +623,36 @@ bool test_delegation_revoke_waits_for_existing_lease(
     if (!source) {
         return false;
     }
+    auto sample = fixture.a().observe(*source, {}, Graph::max_depth);
+    if (!sample) return false;
+    WaitResult hint{STATUS_PENDING};
+    auto receive = [&](WaitResult value) noexcept { hint = value; };
+    auto done = []() noexcept {};
+    Source::Watch watch{libk::delegate<void(WaitResult) noexcept>::bind(receive), Source::Drained::bind(done)};
+    libk::scope_exit detached{[&]() noexcept { watch.detach(); fixture.drain(); }};
+    const auto seen = sample->events().snapshot().sequence;
+    if (sample->events().watch(watch, {.mask=0, .seen=seen, .changed=true},
+        [](auto commit) noexcept { commit(); return STATUS_OK; }) != STATUS_OK) return false;
     auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, View{inspect_rights});
     if (!child) {
         return false;
     }
 
-    RevokeProbe probe{};
-    cap::GrantRevoke completion{
-        sync::Latch::Notifier::bind<
-            &RevokeProbe::ready>(probe)};
-    RevokeProbe closed_probe{};
-    cap::GrantRevoke closed{sync::Latch::Notifier::bind<&RevokeProbe::ready>(closed_probe)};
+    fixture.drain();
+    if (hint.status != STATUS_OK || hint.sequence == seen) return false;
+    auto child_sample = fixture.b().observe(*child, {}, Graph::max_depth);
+    if (!child_sample) return false;
+    GrantRecords grants;
+    if (fixture.a().inspect(GrantQuery{source->raw(), 0, 0, 0}, cap::Graph::max_depth, grants) != STATUS_OK
+        || grants.count != 1 || grants.root.grant_id != grants.seed
+        || grants.records[0].parent_id != grants.seed
+        || grants.root.object_id != grants.records[0].object_id) return false;
+    const auto child_id = grants.records[0].grant_id;
+    if (fixture.a().inspect(GrantQuery{source->raw(), child_id, 0, 0}, cap::Graph::max_depth, grants) != STATUS_OK
+        || grants.root.parent_id != grants.seed || grants.root.flags & OBS_BOUNDARY) return false;
+    if (fixture.b().inspect(GrantQuery{child->raw(), grants.seed, 0, 0}, cap::Graph::max_depth, grants) != STATUS_NOT_FOUND)
+        return false; // A child authority cannot follow an outside parent ID.
+    if (fixture.b().observe(*child, cap::GrantId{grants.seed}, Graph::max_depth)) return false;
     libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
     cap::GrantKey child_key{};
     {
@@ -645,17 +663,16 @@ bool test_delegation_revoke_waits_for_existing_lease(
         }
         auto active = std::move(active_result).value();
         child_key = active.grant();
-        if (!fixture.graph().revoke_descendants(root_key, completion)
-            || completion.complete() || !completion.arm()) {
-            return false;
-        }
+        if (fixture.graph().close(child_key).status != STATUS_PENDING
+            || fixture.graph().status(child_key).value == STATE_DRAINED) return false;
         auto rejected = fixture.b().resolve<
             sched::Sc>(child.value(), inspect_rights);
         auto source_live = fixture.a().resolve<
             sched::Sc>(source.value(), inspect_rights);
-        fixture.graph().close(root_key, closed);
-        if (closed.complete() || closed_probe.signals != 0) return false;
-        if (rejected
+        if (fixture.graph().close(root_key).status != STATUS_PENDING
+            || fixture.graph().close(root_key).status != STATUS_PENDING) return false;
+        auto ancestor_rejected = fixture.a().resolve<sched::Sc>(*source, inspect_rights);
+        if (ancestor_rejected || rejected
             || rejected.error()
                 != cap::CSpaceError::GrantUnavailable
             || !source_live) {
@@ -664,12 +681,17 @@ bool test_delegation_revoke_waits_for_existing_lease(
     }
     fixture.drain();
     const auto child_state = fixture.graph().state(child_key);
-    if (!closed.complete() || closed_probe.signals != 1
-        || !completion.complete() || probe.signals != 1
-        || child_state
-        || child_state.error() != GrantError::InvalidKey) {
-        return false;
-    }
+    if (fixture.graph().status(root_key).value != STATE_DRAINED
+        || fixture.graph().status(child_key).value != STATE_DRAINED
+        || !child_state || *child_state != cap::GrantState::Revoked
+        || child_sample->events().snapshot().status != STATUS_CLOSED
+        || sample->events().snapshot().status != STATUS_CLOSED) return false;
+    // Inspecting a still-present tombstone reads metadata without reopening
+    // payload admission or preventing the existing operation from draining.
+    auto terminal = fixture.b().observe(*child, {}, Graph::max_depth);
+    if (!terminal || terminal->events().snapshot().status != STATUS_CLOSED) return false;
+    terminal->reset(); watch.detach(); child_sample->reset(); sample->reset(); fixture.drain();
+    if (fixture.graph().state(child_key)) return false;
     return fixture.b().close(child.value())
         && fixture.a().close(source.value())
         && fixture.settled_grants() == 0;
@@ -681,85 +703,120 @@ bool test_close_drains_orphan_operation(const TestContext&) noexcept {
     auto root = fixture.root(0);
     if (!root) return false;
     const auto key = root->key();
+    auto stale = root->clone();
     auto held = root->acquire();
-    if (!held) return false;
+    if (!stale || !held) return false;
     root->reset();
-    RevokeProbe probe{};
-    cap::GrantRevoke close{sync::Latch::Notifier::bind<&RevokeProbe::ready>(probe)};
-    fixture.graph().close(key, close);
-    if (close.complete() || probe.signals) return false;
+    if (fixture.graph().close(key).status != STATUS_PENDING) return false;
     held->reset();
     fixture.drain();
-    if (!close.complete() || probe.signals != 1 || fixture.settled_grants()) return false;
-    RevokeProbe stale_probe{};
-    cap::GrantRevoke stale{sync::Latch::Notifier::bind<&RevokeProbe::ready>(stale_probe)};
-    fixture.graph().close(key, stale);
-    return stale.complete() && stale_probe.signals == 1;
+    if (fixture.graph().status(key).value != STATE_DRAINED || fixture.settled_grants()
+        || fixture.graph().close(key).status != STATUS_OK) return false;
+    auto replacement = fixture.root(0);
+    if (!replacement || replacement->key().slot != key.slot || replacement->key().generation == key.generation
+        || stale->acquire() || !replacement->acquire()) return false;
+    stale->reset(); // The stale drop must not close the replacement generation.
+    if (!replacement->acquire()) return false;
+    replacement->reset(); fixture.drain();
+    return !fixture.settled_grants();
+
 }
 
 bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexcept {
     struct Probe {
-        cap::GrantWork work;
+        object::LinkWork work;
         usize releases{};
-        cap::GrantAttachment attachment;
-        explicit Probe(const cap::GrantAttachmentOps& ops) noexcept : attachment(this, ops) {}
+        cap::Attachment attachment;
+        explicit Probe(const cap::AttachOps& ops) noexcept : attachment(this, ops) {}
         ~Probe() noexcept {
             if (attachment.attached()) (void)attachment.detach();
             work.reset();
         }
     };
-    static constexpr cap::GrantAttachmentOps ops{
-        .invalidate = [](void* context, cap::GrantWork&& work) noexcept {
+    static constexpr cap::AttachOps ops{
+        .invalidate = [](void* context, object::LinkWork&& work) noexcept {
             static_cast<Probe*>(context)->work = std::move(work);
         },
-        .released = [](void* context) noexcept { ++static_cast<Probe*>(context)->releases; },
+        .released = [](void* context, object::LinkWork&& done) noexcept {
+            ++static_cast<Probe*>(context)->releases; done.reset();
+        },
     };
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    for (unsigned order = 0; order < 3; ++order) {
+    for (unsigned order = 0; order < 4; ++order) {
         auto root = fixture.root(0);
         if (!root) return false;
-        cap::GrantRevoke revoke;
+        const auto key = root->key();
         libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
         Probe probe{ops};
         auto lease = root.value().acquire();
         if (!lease || !lease.value().attach(probe.attachment)) return false;
         lease.value().reset();
         if (order != 0) {
-            if (!fixture.graph().invalidate(root.value().key(), revoke)) return false;
+            if (order == 3) {
+                // Object close must find relationships even on an independent
+                // root, without a Scope or the creator's hidden Grant root.
+                if (!fixture.retire_target(0) || root->acquire()) return false;
+            } else if (fixture.graph().close(key).status != STATUS_PENDING) return false;
             fixture.drain();
             if (!probe.work || !probe.attachment.busy()) return false;
             if (order == 2) probe.work.reset();
         }
         const bool synchronous = probe.attachment.detach();
-        if (synchronous != (order != 1) || probe.releases != 0) return false;
+        if (synchronous != (order == 0 || order == 2) || probe.releases != 0) return false;
         probe.work.reset();
         fixture.drain();
-        if (probe.releases != (order == 1 ? 1U : 0U)
+        if (probe.releases != (order == 1 || order == 3 ? 1U : 0U)
             || probe.attachment.attached() || probe.attachment.busy()
-            || (order != 0 && !revoke.complete())) return false;
+            || ((order == 1 || order == 2) && fixture.graph().status(key).value != STATE_DRAINED)) return false;
     }
     return fixture.settled_grants() == 0;
+}
+
+bool test_weak_link_drains_after_last_reference(const TestContext&) noexcept {
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    struct Probe {
+        object::LinkWork work;
+        usize releases{};
+        object::Link link{this,
+            [](void* p, object::LinkWork&& work) noexcept { static_cast<Probe*>(p)->work = std::move(work); },
+            [](void* p, object::LinkWork&& done) noexcept { ++static_cast<Probe*>(p)->releases; done.reset(); }};
+        ~Probe() noexcept { (void)link.detach(); work.reset(); }
+    } probe;
+    const auto before = cap_test_contexts->live_count();
+    auto pending = cap_test_contexts->create(sched::Sc::Config{}, 0);
+    if (!pending) return false;
+    auto target = pending->publish();
+    if (!probe.link.attach(object::ref<>{target}, [] {}, true)) return false;
+    target.reset(); // No root Grant, business use, or durable observing Ref.
+    fixture.drain();
+    if (!probe.work || cap_test_contexts->live_count() != before + 1 || probe.link.detach()) return false;
+    probe.work.reset();
+    fixture.drain();
+    return probe.releases == 1 && !probe.link.busy() && cap_test_contexts->live_count() == before;
 }
 
 bool test_cap_batch_has_one_publication(const TestContext&) noexcept {
     CapFixture f;
     if (!f.initialize()) return false;
-    for (bool foreign : {true, false}) {
+    for (unsigned mode : {0U, 1U, 2U}) {
         std::array<CSpace::NewCap, 2> caps;
         std::array<cap::Handle, 2> ids;
         for (usize i = 0; i < caps.size(); ++i) {
             auto grant = f.root(i);
-            auto slot = foreign && i == 1 ? f.b().reserve() : f.a().reserve();
+            auto slot = mode == 0 && i == 1 ? f.b().reserve() : f.a().reserve();
             if (!grant || !slot) return false;
             auto cap = f.a().prepare(std::move(*slot), std::move(*grant), View{inspect_rights});
             if (!cap) return false;
             ids[i] = cap->handle();
             caps[i] = std::move(*cap);
         }
+        if (mode == 2 && !f.retire_target(1)) return false;
         auto done = f.a().insert(std::span{caps});
-        if (foreign) {
-            if (done || done.error() != cap::CSpaceError::InvalidState
+        if (mode != 1) {
+            const auto expected = mode == 0 ? cap::CSpaceError::InvalidState : cap::CSpaceError::GrantUnavailable;
+            if (done || done.error() != expected
                 || f.a().resolve<sched::Sc>(ids[0], inspect_rights)) return false;
         } else {
             if (!done) return false;
@@ -972,7 +1029,7 @@ bool test_ipc_transfer_commits_copy_and_move_atomically(
 }
 
 bool test_cap_batch_rolls_back(const TestContext&) noexcept {
-    for (bool stop_dst : {false, true}) {
+    for (unsigned mode : {0U, 1U, 2U}) {
         CapFixture fixture;
         if (!fixture.initialize()) return false;
         auto root = fixture.root(0);
@@ -983,13 +1040,15 @@ bool test_cap_batch_rolls_back(const TestContext&) noexcept {
         if (!specs.try_push_back(cap::XferSpec{.source = *source, .op = cap::XferOp::Move})) return false;
         auto& batch = cap_test_transfer.emplace();
         if (!cap::Batch::prepare(batch, fixture.a(), fixture.b(), specs)) return false;
-        if (stop_dst) fixture.b().retire();
+        if (mode == 1) fixture.b().retire();
+        else if (mode == 2) { if (!fixture.retire_target(0)) return false; }
         else if (!fixture.a().close(*source)) return false;
         auto rejected = batch.commit();
-        if (rejected || rejected.error() != cap::CSpaceError::InvalidState
+        const auto expected = mode == 2 ? cap::CSpaceError::GrantUnavailable : cap::CSpaceError::InvalidState;
+        if (rejected || rejected.error() != expected
             || fixture.b().live_slots() != 1) return false;
         cap_test_transfer.reset();
-        if (stop_dst && !fixture.a().close(*source)) return false;
+        if (mode != 0 && !fixture.a().close(*source)) return false;
         if (fixture.b().live_slots() != 0 || fixture.settled_grants() != 0) return false;
     }
     return true;
@@ -1026,7 +1085,7 @@ bool test_cspace_retire_waits_for_reserved_operation(
         return false;
     }
     auto held = std::move(pending).value().publish();
-    const auto id = held.id();
+    const auto id = held.key();
     auto pin_result = cap_test_cspaces->lookup(id);
     if (!pin_result) {
         return false;
@@ -1041,6 +1100,7 @@ bool test_cspace_retire_waits_for_reserved_operation(
         if (!held.destroy()) {
             return false;
         }
+        fixture.drain();
         held.reset();
         if (pinned->table_pages() != 3) {
             return false;
@@ -1069,7 +1129,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     constexpr resource::budget object_charge{
         .memory = mm::page_size,
     };
-    auto made_pool = cap_test_groups->create(limit);
+    auto made_pool = cap_test_accounts->create(limit);
     if (!made_pool) {
         return false;
     }
@@ -1129,20 +1189,21 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         auto reserved = space->reserve();
         if (!reserved || pool->available().caps != limit.caps - 1
             || !space.destroy() || space->table_pages() != 3
-            || pool->close() == object::group::phase::closed) {
+            || pool->close() == resource::Account::Phase::Drained) {
             return false;
         }
         // Retirement cannot refund a selector or its table while its owner
         // still holds the reservation, even when the sponsor is closing.
     }
+    fixture.drain();
     if (space->table_pages() != 0 || pool->available() != resource::budget{
             .memory = limit.memory - object_charge.memory, .caps = limit.caps}) {
         return false;
     }
     space.reset();
     fixture.drain();
-    if (pool->available() != limit || pool->sponsorship_count() != 0
-        || pool->close() != object::group::phase::closed
+    if (pool->available() != limit || pool->info(0).allocations != 0
+        || pool->close() != resource::Account::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -1172,15 +1233,16 @@ bool test_attenuated_operations_and_revoke_use_slot_authority(
         return false;
     }
     auto duplicate = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Copy, inspect_rights);
-    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, inspect_rights);
+    auto child = fixture.a().transfer(source.value(), fixture.b(), cap::XferOp::Derive, Rights::of(Right::Inspect, Right::Revoke));
     if (!duplicate || !child) {
         return false;
     }
-    cap::GrantRevoke completion{};
     libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
-    if (!fixture.a().revoke(source.value(), completion, false)) return false;
+    cap::GrantKey key{};
+    { auto resolved = fixture.b().resolve<sched::Sc>(*child, inspect_rights); if (!resolved) return false; key = resolved->grant(); }
+    if (!fixture.b().revoke(*child)) return false;
     fixture.drain();
-    if (!completion.complete()) {
+    if (fixture.graph().status(key).value != STATE_DRAINED) {
         return false;
     }
     auto shared = fixture.b().resolve<sched::Sc>(
@@ -1215,11 +1277,12 @@ bool test_revoked_tombstones_do_not_retain_target(
         return false;
     }
 
-    cap::GrantRevoke completion{};
     libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
-    if (!fixture.a().revoke(source.value(), completion, true)) return false;
+    cap::GrantKey key{};
+    { auto resolved = fixture.a().resolve<sched::Sc>(*source, inspect_rights); if (!resolved) return false; key = resolved->grant(); }
+    if (!fixture.a().revoke(*source)) return false;
     fixture.drain();
-    if (!completion.complete()
+    if (fixture.graph().status(key).value != STATE_DRAINED
         || !fixture.retire_target(0)) {
         return false;
     }
@@ -1245,7 +1308,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    auto pending_pool = cap_test_groups->create(limit);
+    auto pending_pool = cap_test_accounts->create(limit);
     if (!pending_pool) {
         return false;
     }
@@ -1310,7 +1373,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
 
     creation.value().reset();
     allocation->reset();
-    if (deferred && (!fixture.graph().work_pending() || pool->available() == limit)) return false;
+    if (deferred && (cap_work->drained() || pool->available() == limit)) return false;
     fixture.drain();
     child.value().reset();
     creation.value().reset();
@@ -1318,8 +1381,8 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     fixture.drop_retired_target(0);
     if (fixture.settled_grants() != 0
         || pool->available() != limit
-        || pool->sponsorship_count() != 0
-        || pool->close() != object::group::phase::closed
+        || pool->info(0).allocations != 0
+        || pool->close() != resource::Account::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -1335,185 +1398,143 @@ bool test_pending_rollback_defers_refund(const TestContext&) noexcept {
     return pending_rollback_closes_lineage(true);
 }
 
-bool test_pool_close_revokes_hidden_allocation_root(
-    const TestContext&) noexcept {
-    CapFixture fixture{};
-    if (!fixture.initialize()) {
-        return false;
-    }
-    constexpr resource::budget limit{
-        .memory = 4 * mm::page_size,
-        .caps = 4,
-    };
-    auto pending_pool = cap_test_groups->create(limit);
-    if (!pending_pool) {
-        return false;
-    }
-    auto pool = std::move(pending_pool).value().publish();
-    auto payer_ref = object::ref<>{pool};
-    auto child_pool_ref = object::ref<>{pool};
-    if (!payer_ref || !child_pool_ref) {
-        return false;
-    }
-    auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
-    auto creation = fixture.pending_target(0);
-    auto child_reservation = pool->reserve(
-        std::move(child_pool_ref), Graph::node_charge());
-    auto target_ref = fixture.target_ref(0);
-    if (!creation || !child_reservation || !target_ref) {
-        return false;
-    }
-    auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{all_context_rights});
-    if (!allocation) {
-        return false;
-    }
-    auto root_lease = allocation.value().acquire();
-    auto child_target = fixture.target_ref(0);
-    if (!root_lease || !child_target) {
-        return false;
-    }
-    auto child = fixture.graph().derive(
-        std::move(child_reservation).value(),
-        root_lease.value(),
-        std::move(child_target),
-        View{inspect_rights});
-    root_lease.value().reset();
-    if (!child) {
-        return false;
-    }
-    auto installed = fixture.a().insert(
-        std::move(child).value(), View{inspect_rights});
-    if (!installed) {
-        return false;
-    }
-    // Close observes a real pending member; publication must drive it again.
-    if (pool->close() != object::group::phase::closing) return false;
-    creation.value().publish().reset();
-    allocation->reset();
-
-    (void)pool->close();
-    fixture.drain();
-    if (pool->state() != object::group::phase::closed
-        || pool->available() != limit
-        || pool->sponsorship_count() != 0
-        || fixture.settled_grants() != 0) {
-        return false;
-    }
-    auto dead = fixture.a().resolve<sched::Sc>(
-        installed.value(), inspect_rights);
-    if (dead || !fixture.a().close(installed.value())) {
-        return false;
-    }
-    fixture.drop_retired_target(0);
-    if (!pool.destroy()) {
-        return false;
-    }
-    pool.reset();
-    fixture.drain();
+bool test_scope_close_is_independent_from_account(const TestContext&) noexcept {
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    constexpr resource::budget limit{8 * mm::page_size, 16};
+    auto new_scope = cap_test_scopes->create();
+    auto new_account = cap_test_accounts->create(limit);
+    if (!new_scope || !new_account) return false;
+    auto scope = new_scope->publish();
+    auto account = new_account->publish();
+    auto owner = object::Scope::reserve(scope);
+    auto fee = account->reserve(account, object::pool<sched::Sc>::slot_charge());
+    auto grant_fee = account->reserve(account, Graph::node_charge());
+    if (!owner || !fee || !grant_fee) return false;
+    auto made = cap_test_contexts->create(std::move(*owner), std::move(*fee), sched::Sc::Config{1, 10}, 0);
+    if (!made) return false;
+    auto root = made->root(fixture.graph(), std::move(*grant_fee), View{inspect_rights});
+    if (!root) return false;
+    const auto id = root->target_id();
+    const auto grant = root->id();
+    auto handle = fixture.a().insert(std::move(*root), View{inspect_rights});
+    auto target = made->publish();
+    if (!handle) return false;
+    auto active = fixture.a().resolve<sched::Sc>(*handle, inspect_rights);
+    if (!active) return false;
+    std::optional<cap::Resolved<sched::Sc>> held{std::move(*active)};
+    if (scope->close() != object::Scope::Phase::Closing
+        || fixture.a().resolve<sched::Sc>(*handle, inspect_rights)
+        || account->state() != resource::Account::Phase::Open
+        || scope->events().snapshot().value != STATE_CLOSING
+        || account->events().snapshot().value != STATE_OPEN) return false;
+    held.reset(); fixture.drain();
+    if (scope->info(0).state != OBJECT_DRAINED || scope->events().snapshot().value != STATE_DRAINED
+        || scope->info(0).members
+        || account->close() != resource::Account::Phase::Closing) return false;
+    CSpaceInfo info;
+    if (!fixture.a().inspect({}, info) || info.count != 1
+        || info.records[0].object_id != id.value || info.records[0].grant_id != grant.value
+        || info.records[0].state != CAP_INFO_UNAVAILABLE) return false;
+    target.reset(); fixture.drain();
+    if (account->available() != limit || account->events().snapshot().value != STATE_DRAINED
+        || account->state() != resource::Account::Phase::Drained
+        || !fixture.a().close(*handle) || !scope.destroy() || !account.destroy()) return false;
+    scope.reset(); account.reset(); fixture.drain();
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_parent_close_recursively_closes_child_pool(
-    const TestContext&) noexcept {
-    CapFixture fixture{};
-    if (!fixture.initialize()) {
-        return false;
-    }
-    constexpr resource::budget parent_limit{
-        .memory = 16 * mm::page_size,
-        .caps = 16,
-    };
-    constexpr resource::budget child_limit{
-        .memory = 4 * mm::page_size,
-        .caps = 4,
-    };
-    constexpr auto child_slot = object::pool<
-        object::group>::slot_charge();
-    constexpr resource::budget child_charge{
-        .memory = child_slot.memory + child_limit.memory,
-        .caps = child_slot.caps + child_limit.caps,
-    };
-
-    auto pending_parent = cap_test_groups->create(parent_limit);
-    if (!pending_parent) {
-        return false;
-    }
-    auto parent = std::move(pending_parent).value().publish();
-    auto payer_ref = object::ref<>{parent};
-    auto child_charge_ref = object::ref<>{parent};
-    auto user_charge_ref = object::ref<>{parent};
-    if (!payer_ref || !child_charge_ref
-        || !user_charge_ref) {
-        return false;
-    }
-    auto root_fee = parent->reserve(std::move(payer_ref), Graph::node_charge());
-    auto object_reservation = parent->reserve(
-        std::move(child_charge_ref), child_charge);
-    auto user_reservation = parent->reserve(
-        std::move(user_charge_ref), Graph::node_charge());
-    if (!root_fee || !object_reservation
-        || !user_reservation) {
-        return false;
-    }
-    auto pending_child = cap_test_groups->create(std::move(object_reservation).value(), child_limit);
-    if (!pending_child) {
-        return false;
-    }
-    auto child = pending_child->reference();
-    const auto rights = Rights::of(
-        Right::Inspect, Right::Create, Right::Close, Right::Revoke);
-    const cap::Quota authority{
-        .budget = child_limit,
-        .object_kinds = u64{1} << static_cast<u16>(
-            ObjGroup),
-    };
-    auto allocation = pending_child->root(fixture.graph(), std::move(*root_fee), View{rights, authority});
-    if (!allocation) {
-        return false;
-    }
-    auto root_lease = allocation.value().acquire();
-    auto user_target = object::ref<>{child};
-    if (!root_lease || !user_target) {
-        return false;
-    }
-    auto user_grant = fixture.graph().derive(
-        std::move(user_reservation).value(),
-        root_lease.value(),
-        std::move(user_target),
-        View{rights, authority});
-    root_lease.value().reset();
-    if (!user_grant) {
-        return false;
-    }
-    auto installed = fixture.a().insert(
-        std::move(user_grant).value(), View{rights, authority});
-    if (!installed) {
-        return false;
-    }
-    pending_child->publish().reset();
-    allocation->reset();
-    child.reset();
-
-    (void)parent->close();
-    if (fixture.a().resolve<object::group>(installed.value(), rights)) return false;
-    fixture.drain();
-    if (parent->state() != object::group::phase::closed
-        || parent->available() != parent_limit
-        || fixture.settled_grants() != 0
-        || !fixture.a().close(installed.value())
-        || !parent.destroy()) {
-        return false;
-    }
-    parent.reset();
-    fixture.drain();
+bool test_scope_adopt_keeps_payer(const TestContext&) noexcept {
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    constexpr resource::budget limit{8 * mm::page_size, 16};
+    auto new_source = cap_test_scopes->create();
+    auto new_destination = cap_test_scopes->create();
+    auto new_account = cap_test_accounts->create(limit);
+    if (!new_source || !new_destination || !new_account) return false;
+    auto source = new_source->publish();
+    auto destination = new_destination->publish();
+    auto account = new_account->publish();
+    auto owner = object::Scope::reserve(source);
+    auto fee = account->reserve(account, object::pool<sched::Sc>::slot_charge());
+    if (!owner || !fee) return false;
+    auto made = cap_test_contexts->create(std::move(*owner), std::move(*fee), sched::Sc::Config{1, 10}, 0);
+    if (!made) return false;
+    auto target = made->publish();
+    const auto charged = account->available();
+    ScopeMembers page;
+    if (source->inspect(source.id(), {}, OBJ_KINDS, page) != STATUS_OK || page.count != 1
+        || page.records[0].object_id != target.id().value || page.records[0].epoch != 1
+        || page.records[0].state != SCOPE_MEMBER_LIVE) return false;
+    const auto old_cursor = page.next;
+    auto facts = source->describe(target.id(), OBJ_KINDS, 1);
+    if (!facts || facts->owner_id != source.id().value || facts->account_id
+        || !(facts->flags & OBS_BOUNDARY) || facts->owner_epoch != 1
+        || !source->contains(target.id(), OBJ_BIT(ObjSc), 1)
+        || source->contains(target.id(), OBJ_BIT(ObjMem), 1)
+        || source->lookup(account.id(), OBJ_KINDS, 64)) return false;
+    if (source->inspect(source.id(), {}, OBJ_BIT(ObjMem), page) != STATUS_OK || page.count) return false;
+    if (source->inspect(destination.id(), old_cursor, OBJ_KINDS, page) != STATUS_STALE) return false;
+    auto adopted = object::Scope::adopt(target, source, destination, 1);
+    if (!adopted || *adopted != 2 || source->info(0).members || destination->info(0).members != 1
+        || account->available() != charged || object::Scope::adopt(target, source, destination, 1)) return false;
+    if (source->contains(target.id(), OBJ_KINDS, 64) || !destination->contains(target.id(), OBJ_KINDS, 1)) return false;
+    if (source->inspect(source.id(), old_cursor, OBJ_KINDS, page) != STATUS_STALE
+        || destination->inspect(destination.id(), {}, OBJ_KINDS, page) != STATUS_OK || page.count != 1
+        || page.records[0].epoch != 2) return false;
+    if (account->close() != resource::Account::Phase::Closing || !target.live()
+        || source->close() != object::Scope::Phase::Drained || !target.admit()) return false;
+    (void)destination->close(); fixture.drain();
+    if (destination->info(0).state != OBJECT_DRAINED || target.live() || account->available() != charged) return false;
+    target.reset(); fixture.drain();
+    if (account->available() != limit || account->state() != resource::Account::Phase::Drained
+        || !source.destroy() || !destination.destroy() || !account.destroy()) return false;
+    source.reset(); destination.reset(); account.reset(); fixture.drain();
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcept {
+bool test_scope_control_payment_cycles(const TestContext&) noexcept {
+    CapFixture fixture;
+    if (!fixture.initialize()) return false;
+    auto made_host = cap_test_scopes->create();
+    if (!made_host) return false;
+    auto host = made_host->publish();
+    auto account = [&]() -> object::ref<resource::Account> {
+        auto owner = object::Scope::reserve(host);
+        if (!owner) return {};
+        auto made = cap_test_accounts->create(std::move(*owner), resource::Reservation{},
+            resource::budget{8 * mm::page_size, 16});
+        return made ? made->publish() : object::ref<resource::Account>{};
+    };
+    auto a = account(), b = account();
+    if (!a || !b) return false;
+    auto scope = [&](object::ref<resource::Account> payer) -> object::ref<object::Scope> {
+        auto owner = object::Scope::reserve(host);
+        auto fee = payer->reserve(payer, object::pool<object::Scope>::slot_charge());
+        if (!owner || !fee) return {};
+        auto made = cap_test_scopes->create(std::move(*owner), std::move(*fee));
+        return made ? made->publish() : object::ref<object::Scope>{};
+    };
+    auto x = scope(b), y = scope(a);
+    if (!x || !y) return false;
+    // Direct self-wait and the two-Scope cycle are both rejected by walking
+    // actual Membership/Funding edges, without restricting ordinary payers.
+    if (object::Scope::adopt(a, host, y, 1)) return false;
+    if (!object::Scope::adopt(a, host, x, 1)) return false;
+    if (object::Scope::adopt(b, host, y, 1)) return false;
+    if (host->info(0).members != 3 || x->info(0).members != 1 || y->info(0).members) return false;
+    (void)host->close();
+    x.reset(); y.reset(); a.reset(); b.reset(); fixture.drain();
+    if (host->info(0).state != OBJECT_DRAINED || !host.destroy()) return false;
+    host.reset(); fixture.drain();
+    return cap_test_pmm->verify_invariants();
+}
+
+bool test_destroy_allocation_progress_and_account_close(const TestContext&) noexcept {
     CapFixture fixture{};
     if (!fixture.initialize()) return false;
     constexpr resource::budget limit{.memory = 8 * mm::page_size, .caps = 8};
-    auto pending = cap_test_groups->create(limit);
+    auto pending = cap_test_accounts->create(limit);
     if (!pending) return false;
     auto pool = std::move(pending).value().publish();
     cap::Handle handles[2]{};
@@ -1548,13 +1569,13 @@ bool test_destroy_allocation_progress_and_pool_close(const TestContext&) noexcep
     std::optional<cap::Resolved<sched::Sc>> retained{std::move(held).value()};
     if (!fixture.a().destroy(handles[1])) return false;
     // A retained operation delays its own revoke, not the other local close.
-    if (fixture.settled_grants() != 2 || pool->state() != object::group::phase::open)
+    if (fixture.settled_grants() != 2 || pool->state() != resource::Account::Phase::Open)
         return false;
-    if (pool->close() != object::group::phase::closing) return false;
+    if (pool->close() != resource::Account::Phase::Closing) return false;
     retained.reset();
     fixture.drop_retired_target(0);
     fixture.drop_retired_target(1);
-    if (pool->state() != object::group::phase::closed || pool->available() != limit
+    if (pool->state() != resource::Account::Phase::Drained || pool->available() != limit
         || fixture.settled_grants() != 0 || !fixture.a().close(handles[0])
         || !fixture.a().close(handles[1]) || !pool.destroy()) return false;
     pool.reset();
@@ -1591,7 +1612,7 @@ bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
     constexpr resource::budget limit{.memory=8 * mm::page_size, .caps=16};
-    auto made = cap_test_groups->create(limit);
+    auto made = cap_test_accounts->create(limit);
     if (!made) return false;
     auto pool = made->publish();
     auto fee = pool->reserve(pool, object::pool<CSpace>::slot_charge());
@@ -1609,9 +1630,9 @@ bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     hold.reset();
     if (pool->available() == limit) return false; // Worker has not reclaimed storage yet.
     fixture.drain();
-    if (pool->available() != limit || pool->sponsorship_count() ||
-        pool->state() != object::group::phase::open ||
-        pool->close() != object::group::phase::closed || !pool.destroy()) return false;
+    if (pool->available() != limit || pool->info(0).allocations ||
+        pool->state() != resource::Account::Phase::Open ||
+        pool->close() != resource::Account::Phase::Drained || !pool.destroy()) return false;
     pool.reset();
     fixture.drain();
     return cap_test_pmm->verify_invariants();
@@ -1626,6 +1647,7 @@ void register_cap_tests(TestRegistry& registry) noexcept {
     (void)registry.add("cap", "batch publishes all reserved selectors or none", test_cap_batch_has_one_publication);
     (void)registry.add("cap", "attachment detach transfers callback quiescence exactly once",
         test_attachment_detach_transfers_quiescence_once);
+    (void)registry.add("cap", "weak Link drains after last Ref", test_weak_link_drains_after_last_reference);
     (void)registry.add("cap", "unpublished allocation rollback survives deferred revoke work",
         test_pending_rollback_defers_refund);
     (void)registry.add(
@@ -1696,16 +1718,18 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         test_pending_rollback_closes_lineage);
     (void)registry.add(
         "cap",
-        "group close revokes hidden roots without scanning CSpaces",
-        test_pool_close_revokes_hidden_allocation_root);
+        "Scope closes accepted work independently of Account refunds",
+        test_scope_close_is_independent_from_account);
     (void)registry.add(
         "cap",
-        "parent group close recursively drains its child pool",
-        test_parent_close_recursively_closes_child_pool);
+        "Adopt changes Scope while preserving payer and lifecycle authority",
+        test_scope_adopt_keeps_payer);
+    (void)registry.add("cap", "Scope rejects direct and cross-Scope control payment cycles",
+        test_scope_control_payment_cycles);
     (void)registry.add(
         "cap",
         "destroy authority enters the target anchor retirement path",
         test_destroy_authority_uses_object_anchor_retirement);
-    (void)registry.add("cap", "local object destruction drains independently and joins pool close",
-        test_destroy_allocation_progress_and_pool_close);
+    (void)registry.add("cap", "local object destruction drains independently and joins Account close",
+        test_destroy_allocation_progress_and_account_close);
 }

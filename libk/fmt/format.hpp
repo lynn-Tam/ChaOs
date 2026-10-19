@@ -417,8 +417,9 @@ constexpr bool format_value(output_context<Sink>& ctx, const format_spec& spec, 
             ++n;
         }
         return write_string(ctx, std::string_view{value, n}, spec);
-    } else if constexpr (std::same_as<value_type, std::string_view>) {
-        return write_string(ctx, value, spec);
+    } else if constexpr (std::convertible_to<const T&, std::string_view>
+                         && !std::is_pointer_v<value_type> && !std::is_array_v<value_type>) {
+        return write_string(ctx, std::string_view{value}, spec);
     } else if constexpr (std::same_as<value_type, bool>) {
         if (spec.type == 0 || spec.type == 's' || spec.type == '?') {
             return write_string(ctx, value ? std::string_view{"true", 4} : std::string_view{"false", 5}, spec);

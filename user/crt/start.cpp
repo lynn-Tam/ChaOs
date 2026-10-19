@@ -3,10 +3,19 @@
 #include <climits>
 #include <libk/assert.hpp>
 #include <string.h>
+#include <vector>
+#include <cstdlib>
 
 static rt_env startup;
+extern "C" { char** environ; }
+static std::vector<void (*)()>* crt_finalizers;
+extern "C" int atexit(void (*function)()) noexcept {
+    if (!crt_finalizers) crt_finalizers = new std::vector<void (*)()>;
+    crt_finalizers->push_back(function);
+    return 0;
+}
 auto rt_startup() noexcept -> const rt_env& { return startup; }
-extern "C" void init_heap(cap_t pool, cap_t vspace) noexcept;
+extern "C" void init_heap(CreateAuth auth, cap_t vspace) noexcept;
 extern "C" void (*__init_array_start[])();
 extern "C" void (*__init_array_end[])();
 extern int main(int, char**);
@@ -17,6 +26,7 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
     auto** argv = reinterpret_cast<char**>(stack);
     if (argv[argc]) sys::exit(STATUS_BAD_ARGS);
     auto** envp = argv + argc + 1;
+    environ = envp;
     while (*envp) ++envp;
     const auto* aux = reinterpret_cast<const AuxEntry*>(envp + 1);
     const std::byte* bindings{};
@@ -26,6 +36,8 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
         switch (aux->type) {
         case AT_PAGESZ: if (aux->value != 4096) sys::exit(STATUS_BAD_ARGS); break;
         case AT_SYS_POOL: startup.pool = aux->value; break;
+        case AT_SYS_SCOPE: startup.scope = aux->value; break;
+        case AT_SYS_DOMAIN: startup.domain = aux->value; break;
         case AT_SYS_VSPACE: startup.vspace = aux->value; break;
         case AT_SYS_CSPACE: startup.cspace = aux->value; break;
         case AT_SYS_EVENTS: startup.events = aux->value; break;
@@ -37,8 +49,8 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
         case AT_SYS_BOOT_SIZE: boot_size = aux->value; break;
         }
     }
-    if (!startup.pool || !startup.vspace || !startup.cspace || !startup.events ||
-        !startup.cpus || !startup.ipc || bool(bindings) != bool(binding_size) ||
+    if (!startup.pool || !startup.scope || !startup.vspace || !startup.cspace || !startup.events ||
+        !startup.cpus || !startup.ipc || !startup.domain || bool(bindings) != bool(binding_size) ||
         bool(boot) != bool(boot_size)) sys::exit(STATUS_BAD_ARGS);
     startup.bindings = {bindings, binding_size};
     startup.boot = {boot, boot_size};
@@ -63,9 +75,17 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
                                              entries[j].name_size}) sys::exit(STATUS_BAD_ARGS);
         }
     }
-    init_heap(startup.pool, startup.vspace);
+    init_heap(startup.alloc(), startup.vspace);
     for (auto ctor : std::span{__init_array_start, __init_array_end}) ctor();
-    sys::exit(main(argc, argv));
+    const auto status = main(argc, argv);
+    if (crt_finalizers) {
+        while (!crt_finalizers->empty()) {
+            const auto function = crt_finalizers->back(); crt_finalizers->pop_back();
+            function();
+        }
+        delete crt_finalizers;
+    }
+    sys::exit(status);
 }
 
 [[noreturn]] void libk::assert_fail(const libk::assert_info&) noexcept {

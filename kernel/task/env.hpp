@@ -8,7 +8,7 @@
 #include <libk/noncopyable.hpp>
 #include <variant>
 #include <optional>
-#include <ipc/buffer.hpp>
+#include <mm/vspace.hpp>
 #include <mm/tlb.hpp>
 #include <object/ref.hpp>
 
@@ -49,7 +49,7 @@ class Env final : private libk::noncopyable {
         object::ref<> cspace_ref{};
         mm::VSpace* vspace{};
         cap::CSpace* cspace{};
-        std::optional<ipc::Buffer> ipc{};
+        std::optional<mm::View> ipc{};
 
     private:
         friend class Env;
@@ -73,7 +73,7 @@ public:
     [[nodiscard]] static auto user(
         object::ref<> vspace,
         object::ref<> cspace,
-        std::optional<ipc::Buffer> ipc = std::nullopt) noexcept
+        std::optional<mm::View> ipc = std::nullopt) noexcept
         -> std::expected<Env, EnvError>;
 
     [[nodiscard]] auto kernel_bound() const noexcept -> bool;
@@ -92,9 +92,9 @@ public:
     [[nodiscard]] auto vspace() const noexcept -> mm::VSpace*;
     [[nodiscard]] auto cspace() const noexcept -> cap::CSpace*;
     [[nodiscard]] auto ipc_buffer() noexcept
-        -> ipc::Buffer*;
+        -> mm::View*;
     [[nodiscard]] auto ipc_buffer() const noexcept
-        -> const ipc::Buffer*;
+        -> const mm::View*;
 
 private:
     explicit Env(Kernel roots) noexcept

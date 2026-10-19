@@ -62,8 +62,8 @@ int main() {
     const auto vspace = info.vspace;
     const auto cspace = info.cspace;
     const auto events = info.events;
-    const auto memory_pool = info.selector(io_memory);
-    if (!memory_pool)
+    const CreateAuth memory_pool{info.selector(io_memory), info.selector(io_scope)};
+    if (!memory_pool.account || !memory_pool.scope)
         sys::exit(STATUS_DENIED);
     if (const auto rc = device.open(info);
         rc != STATUS_OK)
@@ -72,7 +72,6 @@ int main() {
         sys::exit(rc);
     if (const auto ready = info.selector(sv_ready)) {
         if (const auto status = sys::notification_signal(ready).status; status != STATUS_OK) sys::exit(status);
-        if (const auto status = sys::notification_signal(info.selector(sv_wake)).status; status != STATUS_OK) sys::exit(status);
     }
     for (;;) {
         bool again{};
@@ -91,17 +90,17 @@ int main() {
             if (const auto status = rt_admit(packet.message.deadline); status != STATUS_OK) {
                 msg_reply reply;
                 reply.message = {.operation = packet.message.operation,
-                                 .status = status};
+                                 .status = status, .sequence = packet.message.sequence};
                 reply.respond(packet.capabilities[0].selector());
                 continue;
             }
             auto client = std::unique_ptr<Client>{new (std::nothrow) Client};
-            const auto status = client ? client->session.open(endpoint.selector(), events, memory_pool,
+            const auto status = client ? client->session.open(endpoint.selector(), events, memory_pool, info.alloc(),
                                                               vspace, cspace, 0, device.capacity(), true)
                                        : STATUS_NO_MEMORY;
             if (status != STATUS_OK) {
                 const msg_frame reply{.operation = packet.message.operation,
-                                   .status = status};
+                                   .status = status, .sequence = packet.message.sequence};
                 msg_reply response;
                 response.message = reply;
                 response.respond(packet.capabilities[0].selector());
@@ -290,7 +289,7 @@ int main() {
                 flush.client && !flush.submitted
                     ? flush.client->session.queue()->request(flush.ticket)->deadline
                     : 0;
-            const auto status = sys::notification_wait(events, deadline).status;
+            const auto status = ev_wait(events, deadline).status;
             if (status != STATUS_OK && status != STATUS_TIMED_OUT)
                 sys::exit(status);
         }

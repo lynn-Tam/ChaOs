@@ -18,6 +18,8 @@ int fsync(int fd);
 int unlink(const char* path);
 int rename(const char* from, const char* to);
 int mkstemp(char* path);
+int chdir(const char* path);
+char* getcwd(char* buffer, size_t size);
 #ifdef __cplusplus
 }
 #endif

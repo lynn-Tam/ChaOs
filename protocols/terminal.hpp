@@ -76,12 +76,12 @@ public:
             }
             if (const auto status = control_.arm().status; status != STATUS_OK) return status;
             if (!block) return STATUS_WOULD_BLOCK;
-            if (const auto status = sys::notification_wait(events_, deadline).status; status != STATUS_OK) return status;
+            if (const auto status = ev_wait(events_, deadline).status; status != STATUS_OK) return status;
         }
     }
 };
 
-// Shared bounded ANSI batch used by the editor and task view.
+// Bounded ANSI batch for direct terminal clients such as the editor.
 class tm_painter {
     tm_client& output_;
     libk::fmt::fixed_buffer<4096> bytes_;

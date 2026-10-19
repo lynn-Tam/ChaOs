@@ -38,7 +38,7 @@ struct PtRemoved {
 // User roots borrow the kernel's permanent upper branches.
 class PageTable {
   public:
-    enum class Kind : u8 { Kernel, User };
+    enum class Kind : u8 { Kernel, User, Device };
     PageTable(const PageTable &) = delete;
     auto operator=(const PageTable &) -> PageTable & = delete;
     PageTable(PageTable &&) noexcept;
@@ -53,6 +53,9 @@ class PageTable {
     }
     auto cpu_root() const noexcept -> usize;
     auto page_count() const noexcept -> usize { return tables_.page_count(); }
+    // The caller has stopped every hardware user; transfer terminal storage
+    // without walking the tree so its owner can retire a finite batch.
+    auto release() noexcept -> mm::PageGroup { return std::move(tables_); }
 
     // Exact missing-table count for an ordered set under stable serialization.
     class Count {

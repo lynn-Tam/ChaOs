@@ -5,26 +5,6 @@
 #include <string_view>
 #include <new>
 
-// Resolve within the granted namespace root, before selecting a mount.
-static auto canonical(std::span<char> path) -> size_t {
-    std::array<size_t, sizeof(msg_frame::data)> starts{};
-    size_t count{}, size{}, cursor{};
-    while (cursor < path.size()) {
-        const auto begin = cursor;
-        while (cursor < path.size() && path[cursor] != '/') ++cursor;
-        const std::string_view part{path.data() + begin, cursor - begin};
-        if (part == "..") {
-            if (count) size = starts[--count];
-        } else if (!part.empty() && part != ".") {
-            starts[count++] = size;
-            if (size) path[size++] = '/';
-            ::memmove(path.data() + size, part.data(), part.size());
-            size += part.size();
-        }
-        ++cursor;
-    }
-    return size;
-}
 static auto boot_tail(std::string_view path) -> std::optional<std::string_view> {
     if (path == "boot")
         return std::string_view{};
@@ -34,7 +14,7 @@ static auto boot_tail(std::string_view path) -> std::optional<std::string_view> 
 }
 static void respond(cap_t reply, const msg_frame& request, status_t status) {
     msg_reply result;
-    result.message = {.operation = request.operation, .status = status};
+    result.message = {.operation = request.operation, .status = status, .sequence = request.sequence};
     result.respond(reply);
 }
 struct vf_route {
@@ -65,10 +45,10 @@ static auto route(msg_frame& req, word_t perms) -> vf_route {
         if (op == st_control::Rename && (cut == path.npos || !cut || cut + 1 == path.size() ||
                                          path.substr(cut + 1).find('\0') != path.npos))
             return {.status = STATUS_BAD_ARGS};
-        const auto first = canonical(std::span{req.data, cut == path.npos ? req.size : cut});
+        const auto first = fl_normalize(std::span{req.data, cut == path.npos ? req.size : cut});
         if (op == st_control::Rename) {
             auto* second_path = req.data + cut + 1;
-            const auto second = canonical(std::span{second_path, req.size - cut - 1});
+            const auto second = fl_normalize(std::span{second_path, req.size - cut - 1});
             if (!first || !second)
                 return {.status = STATUS_BAD_ARGS};
             req.data[first] = '\0';
@@ -129,20 +109,21 @@ struct vf_request {
     msg_frame request;
     cap_owner caller, provider;
     cap_t target{};
-    word_t writable{}, sequence{};
+    cap_t events{};
+    word_t writable{};
     ch_pair bridge;
     msg_rx receiver;
     cap_owner sender;
 
     ~vf_request() {
         if (writable) {
-            const auto status = sys::channel_unbind(target, writable).status;
+            const auto status = sys::port_unwatch(events, writable).status;
             if (status != STATUS_OK && status != STATUS_BUSY) sys::exit(status);
         }
     }
     auto prepare(const rt_env& env) -> status_t {
         auto status = receiver.close();
-        if (status == STATUS_OK) status = bridge.open(env.pool, 1, 0, 1);
+        if (status == STATUS_OK) status = bridge.open(env.alloc(), 1, 0);
         if (status == STATUS_OK) status = receiver.open(bridge.ends[0].selector(), env.events);
         if (status != STATUS_OK) return status;
         const auto minted =
@@ -165,17 +146,15 @@ struct vf_request {
                 const auto result = msg_send(target, request, false, {&transfer, 1});
                 if (result.status == STATUS_WOULD_BLOCK) {
                     if (!writable) {
-                        const auto bound = sys::channel_bind(target, env.events, CHANNEL_WRITABLE);
+                        const auto bound = sys::port_watch(env.events, target, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_WRITE);
                         if (bound.status != STATUS_OK) return fail(bound.status);
-                        writable = bound.value;
+                        writable = bound.value; events = env.events;
                     }
-                    const auto armed = sys::channel_arm(target, writable, sequence);
+                    const auto armed = sys::port_arm(events, writable);
                     if (armed.status != STATUS_OK) return fail(armed.status);
-                    sequence = armed.value;
                     return false;
                 }
                 if (result.status != STATUS_OK) return fail(result.status);
-                sequence = result.value;
                 (void)reply.release();
                 if (!receiver) return true;
             }
@@ -220,12 +199,10 @@ int main() {
     const auto& env = rt_startup();
     const auto boot = env.selector(fs_service);
     rpc_client registry;
-    if (const auto status = registry.open(env.selector(sv_service), env.pool, env.cspace, env.events);
+    if (const auto status = registry.open(env.selector(sv_service), env.alloc());
         status != STATUS_OK) sys::exit(status);
     msg_rx incoming{env.selector(vfs_service), env.events};
     if (const auto rc = sys::notification_signal(env.selector(sv_ready)).status; rc != STATUS_OK)
-        sys::exit(rc);
-    if (const auto rc = sys::notification_signal(env.selector(sv_wake)).status; rc != STATUS_OK)
         sys::exit(rc);
     std::unique_ptr<vf_request> requests;
     for (;;) {
@@ -263,6 +240,7 @@ int main() {
             else if (!plan.provider || (plan.provider == &st_service && !provider)) {
                 msg_reply reply;
                 reply.message.operation = request.operation;
+                reply.message.sequence = request.sequence;
                 if (!plan.provider && request.operation == static_cast<uint64_t>(st_control::List)) {
                     reply.message.size = 4;
                     reply.message.value = UINT64_MAX;
@@ -294,7 +272,7 @@ int main() {
             for (auto* work = requests.get(); work; work = work->next.get())
                 if (const auto limit = work->request.deadline;
                     limit && (!deadline || limit < deadline)) deadline = limit;
-            const auto status = sys::notification_wait(env.events, deadline).status;
+            const auto status = ev_wait(env.events, deadline).status;
             if (status != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
         }
     }

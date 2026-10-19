@@ -5,6 +5,8 @@
 #include <string_view>
 #include <cstddef>
 
+extern "C" char** environ;
+
 struct rt_req {
     const char* name;
     uint32_t protocol;
@@ -19,11 +21,11 @@ struct rt_binding {
 };
 struct rt_bindings { uint32_t version, size, count, reserved; };
 inline constexpr uint32_t rt_bindings_version = 1;
-inline constexpr word_t rt_event_badge = 2;
 
 // CRT validates once. This view only borrows immutable startup mappings.
 struct rt_env {
-    cap_t pool{}, vspace{}, cspace{}, events{};
+    cap_t pool{}, scope{}, vspace{}, cspace{}, events{}, domain{};
+    auto alloc() const noexcept -> CreateAuth { return {pool, scope}; }
     word_t cpus{}, ipc{};
     std::span<const std::byte> bindings{}, boot{};
     auto find(rt_req req) const noexcept -> const rt_binding* {

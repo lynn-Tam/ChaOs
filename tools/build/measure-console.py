@@ -41,7 +41,7 @@ def run(args, disk, trace=None):
 
     times = {}
     try:
-        until(b"myos> ", 0)
+        until(b"/ > ", 0)
         for label, command, expected in (
             ("echo_cold", "echo baseline", b"baseline"),
             ("echo_hot", "echo baseline", b"baseline"),
@@ -49,7 +49,7 @@ def run(args, disk, trace=None):
             ("cat_hot", "cat /boot/README.TXT", b"myos disk file service"),
             ("ls_cold", "ls", b"boot"),
             ("ls_hot", "ls", b"boot"),
-            ("write", "write phase0 hello", b"myos> "),
+            ("write", "write phase0 hello", b"/ > "),
             ("cat_written", "cat phase0", b"hello"),
         ):
             start = len(output)
@@ -58,7 +58,7 @@ def run(args, disk, trace=None):
                 process.stdin.flush()
                 time.sleep(0.003)
             began = time.monotonic()
-            until(b"myos> ", start)
+            until(b"/ > ", start)
             duration = time.monotonic() - began
             transcript = output[start:]
             if expected not in transcript or b"error: " in transcript:

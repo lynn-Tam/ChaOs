@@ -37,7 +37,7 @@ static int cache() {
     // from this application's read-only Directory grant.
     const auto& env = rt_startup();
     rpc_client directory;
-    if (directory.open(env.selector(vfs_read), env.pool, env.cspace, env.events) != STATUS_OK)
+    if (directory.open(env.selector(vfs_read), env.alloc()) != STATUS_OK)
         return 62;
     const auto denied = fl_map(directory, "/boot/cat.elf", VM_READ | VM_EXECUTE);
     if (denied || denied.error() != STATUS_DENIED)
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     if (!directory)
         directory = env.selector(vfs_read);
     if (const auto rc =
-            px_init(env.pool, env.vspace, env.cspace, env.events, directory,
+            px_init(env.alloc(), env.vspace, env.events, directory,
                     {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)});
         rc != STATUS_OK)
         return rc;

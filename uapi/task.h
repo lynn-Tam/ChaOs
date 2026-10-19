@@ -20,6 +20,9 @@ struct ThreadInit {
 static_assert(sizeof(ThreadInit) == 104);
 #endif
 
+#define SC_BOUND 1U
+#define SC_WITHDRAWING 2U
+
 #define THREAD_ENABLED  (1U << 0)
 #define THREAD_APPLIED  (1U << 1)
 #define THREAD_RUNNING  (1U << 2)
@@ -27,16 +30,32 @@ static_assert(sizeof(ThreadInit) == 104);
 #define THREAD_BOUND    (1U << 4)
 #define THREAD_STOPPING (1U << 5)
 #define THREAD_STOPPED  (1U << 6)
+#define THREAD_MIGRATING (1U << 7)
 
 // All time fields use the monotonic clock's ticks, including SC cap/debt.
 struct ThreadInfo {
     uint32_t version, size;
     uint64_t requested, applied, runtime, association;
     uint32_t flags, cpu;
+    uint64_t home_epoch;
+    uint32_t destination, reserved;
 };
 struct ScInfo {
     uint32_t version, size;
     uint64_t generation, applied, cpus, runtime;
     uint64_t budget, period, available, debt;
     uint32_t weight, bound;
+};
+
+#define DOMAIN_OPEN 0U
+#define DOMAIN_CLOSING 1U
+#define DOMAIN_DRAINED 2U
+#define DOMAIN_CONFIGURING 4U
+struct DomainInfo {
+    uint32_t version, size;
+    uint64_t cpus, budget, period, available, debt, escrow;
+    uint32_t weight, phase;
+    uint64_t requested, applied, runtime, work_runtime;
+    int32_t status;
+    uint32_t reserved;
 };

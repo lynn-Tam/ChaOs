@@ -33,6 +33,8 @@ typedef int32_t status_t;
 #define STATUS_PEER_CLOSED       -22
 #define STATUS_DIRTY             -23
 #define STATUS_STALE             -24
+#define STATUS_TOO_LATE          -25
+#define STATUS_EXHAUSTED         -26
 
 #ifndef __ASSEMBLER__
 enum {

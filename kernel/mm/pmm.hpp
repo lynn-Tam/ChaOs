@@ -17,7 +17,7 @@
 #include <ranges>
 #include <span>
 #include <optional>
-#include <resource/sponsorship.hpp>
+#include <resource/account.hpp>
 #include <sync.hpp>
 #include <type_traits>
 
@@ -379,7 +379,22 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     }
     ~Slab() noexcept {
         libk_assert(storage_.live() == 0 && growing_ == 0);
-        while (auto* page = storage_.take_page()) release_page(*page);
+        while (!drain(8)) {}
+    }
+    // Exclusive terminal ownership: no records or in-flight allocation remain.
+    auto drain(usize budget) noexcept -> bool {
+        for (usize i = 0; i < budget; ++i) {
+            PageHeader* page;
+            {
+                sync::Lock guard{lock_};
+                libk_assert(storage_.live() == 0 && growing_ == 0);
+                page = storage_.take_page();
+            }
+            if (!page) return true;
+            release_page(*page);
+        }
+        sync::Lock guard{lock_};
+        return storage_.pages() == 0;
     }
     using Result = std::conditional_t<Indexed, Entry, T*>;
     template <class... Args> auto create(const object::ref<>& payer, Args&&... args) noexcept -> std::expected<Result, SlabErr> {
@@ -389,6 +404,26 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
         auto* object = std::construct_at(slot->object(), std::forward<Args>(args)...);
         if constexpr (Indexed) return Entry{object, key_of(*object)};
         else return object;
+    }
+    // Reserve real backing and fees before accepting allocation-free work.
+    auto prepay(const object::ref<>& payer, usize nodes) noexcept -> std::expected<void, SlabErr>
+        requires (!Trim) {
+        if (nodes > quota_.nodes) return std::unexpected(SlabErr::QuotaExceeded);
+        const auto pages = quota_for(nodes).pages;
+        for (;;) {
+            {
+                sync::Lock guard{lock_};
+                if (storage_.pages() >= pages) return {};
+                if (storage_.pages() + growing_ >= quota_.pages)
+                    return std::unexpected(SlabErr::QuotaExceeded);
+                ++growing_;
+            }
+            auto made = make_page(payer);
+            sync::Lock guard{lock_};
+            --growing_;
+            if (!made) return std::unexpected(made.error());
+            storage_.add(**made);
+        }
     }
     void destroy(T& object) noexcept {
         auto& slot = slot_of(object);
@@ -422,6 +457,17 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     auto live_count() const noexcept -> usize {
         sync::Lock guard{lock_};
         return storage_.live();
+    }
+    template<class Visit> void each(Visit&& visit) noexcept requires Indexed {
+        sync::Lock guard{lock_};
+        libk_assert(!growing_);
+        for (auto* page = storage_.head(); page; page = page->next)
+            for (auto& slot : Storage::slots(*page)) if (slot.id.occupied) visit(*slot.object());
+    }
+    template<class Visit> void charges(Visit&& visit) noexcept {
+        sync::Lock guard{lock_};
+        libk_assert(!growing_);
+        for (auto* page = storage_.head(); page; page = page->next) visit(page->extra);
     }
 
   private:

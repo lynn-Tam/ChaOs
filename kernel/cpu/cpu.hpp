@@ -41,13 +41,15 @@ struct Cpu final : private libk::noncopyable_nonmovable {
     // Owner-CPU runtime state; other CPUs use explicit events/snapshots.
     arch::Entry entry{};
     Thread* current{};
+    arch::Ctx step_ctx{};
     mm::Tlb* tlb{};
     usize root{}, locks{};
     std::optional<mm::Stack> init_stack{}, emergency_stack{};
     mm::OwnedPage panic_page{}, trace_page{};
     PanicSlot* panic{};
     trace::Ring* log{};
-    object::ref<Thread> idle_thread{};
+    object::ref<Thread> idle_thread{}, worker_thread{};
+    void wake_work() noexcept;
     std::optional<sched::Dispatcher> dispatcher_storage{};
     arch::Start start{};
 
@@ -62,6 +64,7 @@ static_assert(sizeof(Cpu) <= mm::page_size);
 // publication never releases their start data or stacks; a hart may enter late.
 class Cpus final : private libk::noncopyable_nonmovable {
 public:
+    void wake_work(CpuId id) noexcept { get(id)->wake_work(); }
     explicit Cpus(mm::Pmm& pmm) noexcept : pages_(pmm.group()) {}
     ~Cpus() noexcept;
     auto add(CpuHwId hw, object::Objects&, cap::Graph&, mm::KSpace&, time::Clock&,

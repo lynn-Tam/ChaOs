@@ -3,6 +3,7 @@
 #include <libk/types.hpp>
 #include <array>
 #include <bit>
+#include <optional>
 
 // Firmware IDs remain opaque and sparse, while every normalized topology is
 // bounded before it enters kernel initialization.
@@ -44,6 +45,19 @@ public:
         usize n{};
         for (auto w : words_) n += std::popcount(w);
         return n;
+    }
+    [[nodiscard]] constexpr auto pop(CpuId from = {}) noexcept -> std::optional<CpuId> {
+        if (from.raw >= MaxCpus) return {};
+        for (usize i = 0; i <= Words; ++i) {
+            const auto index = (from.raw / Bits + i) % Words;
+            auto bits = words_[index];
+            if (!i) bits &= ~u64{} << (from.raw % Bits);
+            else if (i == Words) bits &= (u64{1} << (from.raw % Bits)) - 1;
+            if (!bits) continue;
+            const CpuId cpu{index * Bits + static_cast<usize>(std::countr_zero(bits))};
+            static_cast<void>(erase(cpu)); return cpu;
+        }
+        return {};
     }
     template<class Fn>
     constexpr void for_each(Fn&& fn) const noexcept {

@@ -58,9 +58,9 @@ core_kernel_sources = files(
   'kernel/io/space.cpp', 'kernel/mm/table.cpp', 'kernel/boot/fdt.cpp',
   'kernel/boot/root.cpp',
   'kernel/cap/view.cpp',  'kernel/cap/grant.cpp',
-  'kernel/cap/cspace.cpp', 'kernel/ipc/notification.cpp', 'kernel/ipc/buffer.cpp', 'kernel/ipc/channel.cpp', 'kernel/mm/pager.cpp',
+  'kernel/cap/cspace.cpp', 'kernel/ipc/port.cpp', 'kernel/ipc/channel.cpp', 'kernel/mm/pager.cpp',
   'kernel/irq/irq.cpp',
-  'kernel/object/pool.cpp',
+  'kernel/object/pool.cpp', 'kernel/resource/account.cpp',
   'kernel/sched/sc.cpp',
   'kernel/sched/dispatcher.cpp',
   'kernel/task/thread.cpp',
@@ -68,7 +68,6 @@ core_kernel_sources = files(
   'kernel/task/env.cpp',
   'kernel/syscall/call.cpp', 'kernel/syscall/create.cpp',
   'kernel/syscall/ipc.cpp',
-  'kernel/task/exit.cpp',
   'kernel/mm/mem.cpp', 'kernel/mm/phys.cpp', 'kernel/mm/vspace.cpp',
   'kernel/mm/kspace.cpp', 'kernel/mm/tlb.cpp',
   'kernel/mm/pmm.cpp',
@@ -172,6 +171,31 @@ posix = static_library(
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'adapters/posix/include')],
   pic: false, build_by_default: false,
 )
+subdir('third_party/ftxui')
+cxx_runtime = static_library('cxx-runtime', files('third_party/libstdcxx/tree.cc', 'third_party/libstdcxx/shared_ptr.cc'),
+  cpp_args: user_cpp_args + ['-ffunction-sections', '-fdata-sections'],
+  pic: false, build_by_default: false)
+math_runtime = static_library('math-runtime', files(
+  'third_party/musl/__math_invalid.c',
+  'third_party/musl/__math_invalidf.c',
+  'third_party/musl/__math_oflow.c',
+  'third_party/musl/__math_oflowf.c',
+  'third_party/musl/__math_uflow.c',
+  'third_party/musl/__math_uflowf.c',
+  'third_party/musl/__math_xflow.c',
+  'third_party/musl/__math_xflowf.c',
+  'third_party/musl/exp2f_data.c',
+  'third_party/musl/exp_data.c',
+  'third_party/musl/fabs.c',
+  'third_party/musl/pow.c',
+  'third_party/musl/pow_data.c',
+  'third_party/musl/powf.c',
+  'third_party/musl/powf_data.c',
+), c_args: user_c_args + ['-ffunction-sections', '-fdata-sections', '-Wno-unused-but-set-variable'],
+  pic: false, build_by_default: false)
+tui = static_library('tui', files('adapters/ftxui/terminal.cpp'),
+  include_directories: ftxui_inc, cpp_args: user_cpp_args,
+  pic: false, build_by_default: false)
 bins = {}
 probes = {}
 foreach name, spec : {
@@ -195,10 +219,11 @@ foreach name, spec : {
   'sleep': [files('programs/sleep.cpp'), true],
 }
   binary = executable(name + '.elf', spec[0],
-    c_args: user_c_args, cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'adapters/posix/include')] : []),
+    c_args: user_c_args, include_directories: name == 'tasks' ? ftxui_inc : [],
+    cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'adapters/posix/include')] : []),
     link_whole: [crt, user_entry] + (spec[1] ? [posix] : []),
-    link_with: ['init','shell'].contains(name) ? [exec] : [],
-    link_args: user_link_args + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
+    link_with: (['init','shell'].contains(name) ? [exec] : []) + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
+    link_args: user_link_args + (name == 'tasks' ? ['-Wl,--gc-sections'] : []) + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', build_by_default: false)
   if ['fill','slow','control-test'].contains(name)
     probes += {name: binary}
@@ -327,7 +352,9 @@ foreach name, elf : bins + probes + {
     build_by_default: false)}
 endforeach
 
-apps = {'boot/README.TXT': files('programs/README.TXT')[0]}
+apps = {'boot/README.TXT': files('programs/README.TXT')[0],
+        'boot/touch.elf': images['fs'], 'boot/mkdir.elf': images['fs'],
+        'boot/rm.elf': images['fs'], 'boot/mv.elf': images['fs']}
 test_apps = {'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
              'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test']}
 foreach name, app : bins
@@ -422,14 +449,14 @@ run_target('run-wait-test-dual', command: [sh, run_qemu, qemu, timeout, '2', ker
   '[scenario] pending VM wait completed after remote shootdown', '[scenario] wait publication ok'])
 
 run_target('run-channel-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
-  qemu, kernel_debug, '1,2,4', '--bundle', channel_test_bundle, '--timeout', '30',
+  qemu, kernel_debug, '1,2,4', '--bundle', channel_test_bundle, '--timeout', '30', '--report', '[channel]',
   '[channel] service generations, stale cap denied, blocked senders, stop and reuse ok'],
   depends: [kernel_debug, channel_test_bundle])
 
 
 run_target('run-io-dual-console-matrix', command: [find_program('python3'),
   files('tools/build/run-io-platform.py'), qemu, kernel, '1,2,4',
-  '--bundle', boot_bundle, '--second-disk', '--timeout', '18', 'myos> '],
+  '--bundle', boot_bundle, '--second-disk', '--timeout', '18', '/ > '],
   depends: [kernel, boot_bundle])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: online=' + smp])
 if get_option('panic_probe') == 1

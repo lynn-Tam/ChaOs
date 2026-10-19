@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <cstdarg>
+#include <cstdlib>
 #include <unistd.h>
 #include <dirent.h>
 #include <posix.hpp>
@@ -90,6 +91,8 @@ static auto px_result(int64_t value) noexcept -> int64_t {
     return -1;
 }
 
+static std::string cwd{"/"};
+
 struct directory {
     msg_frame batch{};
     char path[sizeof(msg_frame::data) + 1]{};
@@ -116,9 +119,7 @@ static std::deque<open_desc> opened{3};
 static std::vector<open_desc*> fds(3);
 static rpc_client dir_rpc;
 static cap_t vspace{}, events{};
-static cap_t cspace{};
-static cap_t pool{};
-static cap_owner timer;
+static CreateAuth pool{};
 static std::deque<std::unique_ptr<directory>> dirs;
 static auto desc(int fd) noexcept -> open_desc* {
     return fd >= 0 && static_cast<size_t>(fd) < fds.size() ? fds[fd] : nullptr;
@@ -204,7 +205,7 @@ static auto wait() noexcept -> int32_t {
                 return STATUS_OK;
             }
         }
-    const auto status = sys::notification_wait(events).status;
+    const auto status = ev_wait(events).status;
     if (status != STATUS_OK)
         for (auto& file : opened)
             if (std::holds_alternative<io_client>(file.data))
@@ -267,12 +268,14 @@ static auto transfer(open_desc& file, io_operation op, void* data, uint64_t size
 }
 
 extern "C" DIR* opendir(const char* path) {
-    if (!path || ::strlen(path) > sizeof(msg_frame::data)) {
+    if (!path || !*path) {
         errno = EINVAL;
         return nullptr;
     }
+    const auto absolute = fl_path(path, cwd);
+    if (absolute.size() > sizeof(msg_frame::data)) { errno = ENAMETOOLONG; return nullptr; }
     auto dir = std::make_unique<directory>();
-    ::memcpy(dir->path, path, ::strlen(path) + 1);
+    ::memcpy(dir->path, absolute.c_str(), absolute.size() + 1);
     const auto status = st_list(dir_rpc, dir->batch, dir->path);
     if (status != STATUS_OK) {
         (void) px_result(status);
@@ -325,16 +328,20 @@ extern "C" int closedir(DIR* dir) {
     return -1;
 }
 
-auto px_init(cap_t alloc, cap_t vm, cap_t space, cap_t wake, cap_t directory,
+auto px_init(CreateAuth alloc, cap_t vm, cap_t wake, cap_t directory,
              std::array<cap_t, 3> streams) noexcept -> status_t {
-    if (pool || !alloc || !vm || !space || !wake)
+    if (pool.account || !alloc.account || !alloc.scope || !vm || !wake)
         return STATUS_BAD_ARGS;
     pool = alloc;
     vspace = vm;
-    cspace = space;
     events = wake;
+    for (auto** value = environ; value && *value; ++value)
+        if (const std::string_view entry{*value}; entry.starts_with("PWD=/")) {
+            cwd = fl_path(entry.substr(4));
+            break;
+        }
     if (directory) {
-        const auto status = dir_rpc.open(directory, pool, cspace, events);
+        const auto status = dir_rpc.open(directory, pool);
         if (status != STATUS_OK) return status;
     }
     for (int fd = 0; fd < 3; ++fd) {
@@ -396,13 +403,7 @@ extern "C" int32_t nanosleep(const timespec* delay, timespec* remaining) {
             *remaining = {};
         return px_result(STATUS_OK);
     }
-    if (!timer) {
-        const auto created = sys::notification_create(pool, 1);
-        if (created.status != STATUS_OK)
-            return px_result(created.status);
-        timer = cap_owner{created.value};
-    }
-    const auto status = sys::notification_wait(timer.selector(), *deadline).status;
+    const auto status = sys::wait_one(events, 0, 0, *deadline).status;
     if (status == STATUS_TIMED_OUT) {
         if (remaining)
             *remaining = {};
@@ -425,6 +426,7 @@ extern "C" int open(const char* path, int flags, ...) {
     if (!path || (flags & ~(3u | O_CREAT | O_TRUNC | O_EXCL | O_APPEND)) != 0 ||
         (flags & 3u) == 3u)
         return px_result(STATUS_BAD_ARGS);
+    if (!*path) return px_result(STATUS_NOT_FOUND);
     if (flags & O_CREAT) {
         va_list args;
         va_start(args, flags);
@@ -459,13 +461,14 @@ extern "C" int open(const char* path, int flags, ...) {
     if (flags & O_APPEND)
         backend |= st_append;
     cap_owner object;
-    auto status = st_open(dir_rpc, path, backend, object);
+    const auto absolute = fl_path(path, cwd);
+    auto status = st_open(dir_rpc, absolute.c_str(), backend, object);
     if (status != STATUS_OK)
         return px_result(status);
     uint64_t value{};
     auto& session = opened[slot].data.emplace<io_client>();
     status =
-        session.adopt(std::move(object), pool, cspace, events, vspace, 0, value, mode != O_RDONLY);
+        session.adopt(std::move(object), pool, events, vspace, 0, value, mode != O_RDONLY);
     if (status != STATUS_OK) {
         opened[slot].data.emplace<std::monostate>();
         return px_result(status);
@@ -667,21 +670,42 @@ extern "C" int32_t px_size(int32_t fd, uint64_t* size) {
 }
 
 extern "C" int32_t px_mkdir(const char* path) {
-    if (!path)
+    if (!path || !*path)
         return STATUS_BAD_ARGS;
-    return st_mkdir(dir_rpc, path);
+    const auto absolute = fl_path(path, cwd);
+    return st_mkdir(dir_rpc, absolute.c_str());
+}
+
+extern "C" int chdir(const char* path) {
+    auto* dir = opendir(path);
+    if (!dir) return -1;
+    const auto absolute = fl_path(path, cwd);
+    const int status = closedir(dir);
+    if (!status) cwd = absolute;
+    return status;
+}
+extern "C" char* getcwd(char* buffer, size_t size) {
+    const auto bytes = cwd.size() + 1;
+    if (!buffer && !size) size = bytes;
+    if (size < bytes) { errno = ERANGE; return nullptr; }
+    if (!buffer) buffer = static_cast<char*>(malloc(size));
+    if (!buffer) { errno = ENOMEM; return nullptr; }
+    ::memcpy(buffer, cwd.c_str(), bytes);
+    return buffer;
 }
 
 extern "C" int32_t unlink(const char* path) {
-    if (!path)
+    if (!path || !*path)
         return px_result(STATUS_BAD_ARGS);
-    return px_result(st_remove(dir_rpc, path));
+    const auto absolute = fl_path(path, cwd);
+    return px_result(st_remove(dir_rpc, absolute.c_str()));
 }
 
 extern "C" int32_t rename(const char* from, const char* to) {
-    if (!from || !to)
+    if (!from || !*from || !to || !*to)
         return px_result(STATUS_BAD_ARGS);
-    return px_result(st_rename(dir_rpc, from, to));
+    const auto source = fl_path(from, cwd), target = fl_path(to, cwd);
+    return px_result(st_rename(dir_rpc, source.c_str(), target.c_str()));
 }
 
 extern "C" ssize_t write(int fd, const void* data, size_t size) {

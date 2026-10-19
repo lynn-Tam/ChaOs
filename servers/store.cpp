@@ -16,7 +16,8 @@ static msg_rx directory;
 static blk_client backend;
 static st_vol volume;
 static cap_t events;
-static cap_t store_pool, store_memory, store_cspace, store_vspace;
+static CreateAuth store_pool, store_memory;
+static cap_t store_cspace, store_vspace;
 static cap_owner descriptor;
 static uint8_t expected_id[st_volume_id_size]{};
 static bool require_id{};
@@ -160,7 +161,7 @@ struct Open final {
 
     [[nodiscard]] auto create(const msg_frame& request, const char* path, msg_reply& reply) noexcept
         -> status_t {
-        const auto pair = sys::channel_create(store_pool, 1, CHANNEL_MAX_WORDS, 4, 2);
+        const auto pair = sys::channel_create(store_pool, 1, CHANNEL_MAX_WORDS, 4);
         if (pair.status != STATUS_OK)
             return pair.status;
         cap_owner client_root{pair.value}, server_root{pair.value2};
@@ -172,7 +173,7 @@ struct Open final {
         channel = cap_owner{server.value};
         if (client.status != STATUS_OK || server.status != STATUS_OK)
             return client.status != STATUS_OK ? client.status : server.status;
-        auto status = session.open(channel.selector(), events, store_memory, store_vspace,
+        auto status = session.open(channel.selector(), events, store_memory, store_pool, store_vspace,
                                    store_cspace, 0, 0, true);
         if (status == STATUS_OK) {
             const auto entry = lookup(path);
@@ -540,7 +541,7 @@ static auto snapshot(const msg_frame& request, msg_reply& response) -> status_t 
         status = sys::memory_seal(result.memory.selector()).status;
     if (status != STATUS_OK)
         return status;
-    return result.offer(rt_startup(), descriptor.selector(), store_memory, request.value, response);
+    return result.offer(rt_startup(), descriptor.selector(), store_memory.account, request.value, response);
 }
 
 static void control(const msg_frame& request, msg_reply& response, word_t perms) noexcept {
@@ -779,12 +780,12 @@ static void control(const msg_frame& request, msg_reply& response, word_t perms)
 int main(int argc, char** argv) {
 
     const auto& info = rt_startup();
-    const auto pool = info.pool;
+    const auto pool = info.alloc();
     const auto vspace = info.vspace;
     const auto cspace = info.cspace;
     store_pool = pool;
-    store_memory = info.selector(io_memory);
-    if (!store_memory)
+    store_memory = {info.selector(io_memory), info.selector(io_scope)};
+    if (!store_memory.account || !store_memory.scope)
         sys::exit(STATUS_DENIED);
     const auto scratch = sys::memory_create(pool, 4096, VM_READ | VM_WRITE);
     descriptor = cap_owner{scratch.value};
@@ -818,8 +819,6 @@ int main(int argc, char** argv) {
         sys::exit(rc);
     if (const auto rc = sys::notification_signal(info.selector(sv_ready)).status; rc != STATUS_OK)
         sys::exit(rc);
-    if (const auto rc = sys::notification_signal(info.selector(sv_wake)).status; rc != STATUS_OK)
-        sys::exit(rc);
     for (;;) {
         bool again = pump_reads();
         // Bound admission per pass so file completions continue under load.
@@ -836,7 +835,7 @@ int main(int argc, char** argv) {
                 continue;
             again = true;
             msg_reply reply;
-            reply.message = {.operation = packet.message.operation,};
+            reply.message = {.operation = packet.message.operation, .sequence = packet.message.sequence};
             if (!(packet.badge & fl_read) ||
                 (packet.badge & ~(fl_read | fl_write | fl_exec | fl_admin)))
                 reply.message.status = STATUS_DENIED;
@@ -938,7 +937,7 @@ int main(int argc, char** argv) {
         if (const auto rc = directory.arm().status; rc != STATUS_OK)
             sys::exit(rc);
         if (!again)
-            if (const auto rc = sys::notification_wait(events).status; rc != STATUS_OK)
+            if (const auto rc = ev_wait(events).status; rc != STATUS_OK)
                 sys::exit(rc);
     }
 }

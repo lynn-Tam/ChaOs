@@ -29,3 +29,12 @@
 !/libk/**
 !/test/
 !/test/**
+
+!/third_party/
+/third_party/*
+!/third_party/ftxui/
+!/third_party/ftxui/**
+!/third_party/libstdcxx/
+!/third_party/libstdcxx/**
+!/third_party/musl/
+!/third_party/musl/**

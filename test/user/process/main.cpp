@@ -15,13 +15,13 @@ int main() {
             sys::exit(STATUS_INTERNAL);
     };
 
-    const auto notification = sys::notification_create(info.pool, 1);
+    const auto notification = sys::port_create(info.alloc(), 8, 4);
     if (notification.status != STATUS_OK)
         sys::exit(notification.status);
     cap_owner events{notification.value};
     rpc_client directory;
     if (const auto rc =
-            directory.open(info.selector(sv_service), info.pool, info.cspace, info.events);
+            directory.open(info.selector(sv_service), info.alloc());
         rc != STATUS_OK)
         sys::exit(rc);
     auto endpoint = sv_lookup(directory, vfs_exec);
@@ -34,7 +34,7 @@ int main() {
     const auto mismatch = sv_lookup(directory, wrong);
     check(!mismatch && mismatch.error() == STATUS_NOT_FOUND);
     rpc_client files;
-    if (const auto rc = files.open(endpoint->selector(), info.pool, info.cspace, events.selector());
+    if (const auto rc = files.open(endpoint->selector(), info.alloc());
         rc != STATUS_OK)
         sys::exit(rc);
     auto mem = fl_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
@@ -45,7 +45,7 @@ int main() {
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;
-    tasks.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
+    tasks.open(info.alloc(), info.selector(rt_domain), info.cpus);
     const auto spawn = [&](const char* ms) {
         const std::string_view args[]{"sleep", ms};
         const auto child = tasks.spawn(

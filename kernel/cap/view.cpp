@@ -21,6 +21,8 @@ auto describe(ObjKind kind, View view) noexcept -> CapView {
             if constexpr (!std::is_same_v<T, PhysLimit>) w[2] = limit.perms.raw();
         } else if constexpr (std::is_same_v<T, Quota>) {
             w[0] = limit.budget.memory; w[1] = limit.budget.caps; w[2] = limit.object_kinds;
+        } else if constexpr (std::is_same_v<T, ScopeLimit>) {
+            w[0] = limit.kinds; w[1] = limit.facets; w[2] = limit.depth;
         } else if constexpr (std::is_same_v<T, IndexLimit>) {
             w[0] = limit.first; w[1] = limit.count;
         } else if constexpr (std::is_same_v<T, Badge>) w[0] = limit.badge;
@@ -38,7 +40,7 @@ constexpr Rights memory_rights = Rights::of(
     Right::Map,
     Right::Destroy,
     Right::Manage,
-    Right::Revoke);
+    Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights vspace_rights = Rights::of(
     Right::Duplicate,
@@ -50,7 +52,7 @@ constexpr Rights vspace_rights = Rights::of(
     Right::Protect,
     Right::Destroy,
     Right::Manage,
-    Right::Revoke);
+    Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights resource_rights = Rights::of(
     Right::Duplicate,
@@ -58,8 +60,11 @@ constexpr Rights resource_rights = Rights::of(
     Right::Inspect,
     Right::Create,
     Right::Split,
-    Right::Close,
-    Right::Revoke);
+    Right::Close, Right::Destroy,
+    Right::Adopt, Right::Rebill, Right::Revoke);
+
+constexpr Rights scope_rights = Rights::of(Right::Duplicate, Right::Delegate, Right::Inspect,
+    Right::Create, Right::Manage, Right::Close, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights notification_rights = Rights::of(
     Right::Duplicate,
@@ -68,7 +73,7 @@ constexpr Rights notification_rights = Rights::of(
     Right::Signal,
     Right::Receive,
     Right::Destroy,
-    Right::Revoke);
+    Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights channel_rights = Rights::of(
     Right::Duplicate,
@@ -78,18 +83,18 @@ constexpr Rights channel_rights = Rights::of(
     Right::Receive,
     Right::Close,
     Right::Destroy,
-    Right::Revoke);
+    Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights pager_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect, Right::Attach,
     Right::Serve,
     Right::Supply, Right::Fail, Right::WritebackAck, Right::Close,
-    Right::Destroy, Right::Revoke);
+    Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke);
 
 constexpr Rights irq_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect, Right::Route,
     Right::Observe, Right::Ack, Right::Control, Right::Close, Right::Destroy,
-    Right::Revoke);
+    Right::Adopt, Right::Rebill, Right::Revoke);
 
 [[nodiscard]] static auto valid(MemLimit limit) noexcept -> bool {
     return limit.range.limit().has_value()
@@ -108,6 +113,13 @@ constexpr Rights irq_rights = Rights::of(
     constexpr u64 valid_kinds =
         OBJ_KINDS;
     return (limit.object_kinds & ~valid_kinds) == 0;
+}
+
+static auto valid(ScopeLimit limit) noexcept -> bool {
+    return !(limit.kinds & ~OBJ_KINDS) && !(limit.facets & ~SCOPE_FACETS) && limit.depth <= 64;
+}
+static auto contains(ScopeLimit a, ScopeLimit b) noexcept -> bool {
+    return !(b.kinds & ~a.kinds) && !(b.facets & ~a.facets) && b.depth <= a.depth;
 }
 
 [[nodiscard]] static auto valid(ChanLimit limit) noexcept -> bool {
@@ -163,34 +175,42 @@ static auto select(ObjKind kind, F fn, R missing) noexcept -> R {
     switch (kind) {
     case ObjPhys:
         return fn.template operator()<PhysLimit>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Control, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Control, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjIoSpace:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Map, Right::Unmap, Right::Observe, Right::Close, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Map, Right::Unmap, Right::Observe, Right::Close, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjIrqCtl:
         return fn.template operator()<IndexLimit>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjIommu:
         return fn.template operator()<IndexLimit>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjThread:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Observe, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Observe, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjSc:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Attach, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Attach, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjDomain:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Create, Right::Close, Right::Control, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjCSpace:
         return fn.template operator()<std::monostate>(Rights::of(
-            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Manage, Right::Destroy, Right::Revoke));
+            Right::Duplicate, Right::Delegate, Right::Inspect, Right::Manage, Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjMem: return fn.template operator()<MemLimit>(memory_rights);
     case ObjVSpace: return fn.template operator()<VmLimit>(vspace_rights);
-    case ObjGroup: return fn.template operator()<Quota>(resource_rights);
+    case ObjAccount: return fn.template operator()<Quota>(resource_rights);
+    case ObjScope: return fn.template operator()<ScopeLimit>(scope_rights);
     case ObjNotification: return fn.template operator()<Badge>(notification_rights);
     case ObjChannel: return fn.template operator()<ChanLimit>(channel_rights);
     case ObjPager: return fn.template operator()<std::monostate>(pager_rights);
+    case ObjIoOp:
+    case ObjVmOp: return fn.template operator()<std::monostate>(Rights::of(
+        Right::Duplicate, Right::Delegate, Right::Inspect, Right::Control, Right::Observe,
+        Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
+    case ObjPort: return fn.template operator()<std::monostate>(Rights::of(
+        Right::Duplicate, Right::Delegate, Right::Inspect, Right::Receive, Right::Manage,
+        Right::Destroy, Right::Adopt, Right::Rebill, Right::Revoke));
     case ObjIrq: return fn.template operator()<IrqRoute>(irq_rights);
     default: return missing;
     }
@@ -335,6 +355,9 @@ auto make_attenuation_ceiling(
     case ObjDomain:
     case ObjCSpace:
     case ObjPager:
+    case ObjVmOp:
+    case ObjIoOp:
+    case ObjPort:
         if (!words_zero(descriptor, 0)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
@@ -396,7 +419,13 @@ auto make_attenuation_ceiling(
             VmLimit{range, *access}});
     }
 
-    case ObjGroup: {
+    case ObjScope: {
+        if (!words_zero(descriptor, 3) || descriptor.words[1] > UINT32_MAX || descriptor.words[2] > 64)
+            return std::unexpected(AttenuationError::InvalidWord);
+        return View{child_rights, ScopeLimit{descriptor.words[0], static_cast<u32>(descriptor.words[1]),
+            static_cast<u32>(descriptor.words[2])}};
+    }
+    case ObjAccount: {
         if (!words_zero(descriptor, 3)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }

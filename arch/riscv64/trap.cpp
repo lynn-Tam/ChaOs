@@ -24,22 +24,19 @@ bool valid_user_start(UserStart s) noexcept {
         && (s.stack & 15) == 0;
 }
 
-std::optional<usize> prepare_user_stack(usize top, UserStart start) noexcept {
-    if (top < sizeof(TrapFrame) || (top & 15) != 0 || !valid_user_start(start)) return {};
-    auto* frame = std::construct_at(reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame)));
-    frame->sepc = start.entry;
-    frame->gpr[1] = start.stack;
-    std::copy(start.arguments.begin(), start.arguments.end(), frame->gpr.begin() + 9);
-    // User input never supplies supervisor status bits.
-    frame->sstatus = csr::Sstatus::SPIE;
-    return reinterpret_cast<usize>(frame);
+bool prepare_user_frame(TrapFrame& frame, UserStart start) noexcept {
+    if (!valid_user_start(start)) return false;
+    frame = {};
+    frame.sepc = start.entry;
+    frame.gpr[1] = start.stack;
+    std::copy(start.arguments.begin(), start.arguments.end(), frame.gpr.begin() + 9);
+    frame.sstatus = csr::Sstatus::SPIE;
+    return true;
 }
 
-[[noreturn]] void resume_user(usize top) noexcept {
-    auto* f = reinterpret_cast<TrapFrame*>(top - sizeof(TrapFrame));
-    libk_assert(valid_user_start({.entry = f->sepc, .stack = f->gpr[1]})
-                && f->sstatus == csr::Sstatus::SPIE);
-    user_return(f);
+[[noreturn]] void resume_user(TrapFrame& frame) noexcept {
+    libk_assert(!(frame.sstatus & (csr::Sstatus::SPP | csr::Sstatus::SIE)));
+    user_return(&frame);
 }
 
 bool install_trap() noexcept {

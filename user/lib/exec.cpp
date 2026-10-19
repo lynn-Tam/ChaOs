@@ -14,11 +14,11 @@ static constexpr word_t page_size = 4096;
 // task owns their cleanup; VSpace owns committed backing after selectors close.
 class pr_loader {
     using owner = cap_owner;
-    cap_t pool_, vm_;
-    vm_area& scratch_;
+    CreateAuth pool_;
+    cap_t vm_;
 
   public:
-    pr_loader(cap_t pool, cap_t vm, vm_area& s) : pool_(pool), vm_(vm), scratch_(s) {}
+    pr_loader(CreateAuth pool, cap_t vm) : pool_(pool), vm_(vm) {}
     auto adopt(sys::SysResult r) noexcept -> std::expected<owner, status_t> {
         owner cap{r.value};
         if (!cap)
@@ -37,19 +37,11 @@ class pr_loader {
             return STATUS_BAD_ARGS;
         const auto* bytes = static_cast<const uint8_t*>(src);
         while (n) {
-            const auto page = offset / page_size;
             const auto start = offset % page_size;
             const auto count = std::min(n, size_t{page_size - start});
-            auto s = sys::memory_populate(mem, page).status;
-            if (s != STATUS_OK)
-                return s;
-            s = scratch_.attach(mem, page, page_size, VM_READ | VM_WRITE);
-            if (s != STATUS_OK)
-                return s;
-            std::copy_n(bytes, count, reinterpret_cast<uint8_t*>(scratch_.address) + start);
-            const auto detached = scratch_.detach();
-            if (detached != STATUS_OK)
-                return detached;
+            ::memcpy(reinterpret_cast<void*>(rt_startup().ipc), bytes, count);
+            const auto status = sys::memory_write(mem, offset, 0, count).status;
+            if (status != STATUS_OK) return status;
             offset += count;
             bytes += count;
             n -= count;
@@ -74,7 +66,7 @@ class pr_loader {
         if (!region)
             return region.error();
         const auto status =
-            sys::vm_map(region->selector(), mem, address, size, first, perms | flags).status;
+            vm_call(pool_, region->selector(), VM_OP_MAP, {mem, address, size, first, perms | flags});
         return status;
     }
     auto anonymous(word_t address, word_t size, word_t perms) noexcept
@@ -201,23 +193,20 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         if (argv.empty())
             return STATUS_BAD_ARGS;
         size_t strings{};
-        for (const auto arg : argv) {
-            if (arg.find('\0') != std::string_view::npos || arg.size() >= o.va.stack_size - strings)
-                return STATUS_BAD_ARGS;
-            strings += arg.size() + 1;
-        }
-        auto s = r.open(auth.pool, o.resources);
+        for (const auto args : {argv, o.envp})
+            for (const auto arg : args) {
+                if (arg.find('\0') != std::string_view::npos || arg.size() >= o.va.stack_size - strings)
+                    return STATUS_BAD_ARGS;
+                strings += arg.size() + 1;
+            }
+        auto s = r.open(auth, o.resources);
         if (s != STATUS_OK)
             return s;
-        vm_area scratch;
-        s = scratch.open(auth.vspace, 0, page_size);
-        if (s != STATUS_OK)
-            return s;
-        pr_loader load{r.pool(), r.vspace(), scratch};
+        pr_loader load{r.alloc(), r.vspace()};
         s = load.map(mod, image);
         if (s != STATUS_OK)
             return s;
-        auto stack = load.anonymous(o.va.stack, o.va.stack_size, VM_READ | VM_WRITE);
+        auto stack = load.memory(o.va.stack_size);
         if (!stack)
             return stack.error();
         auto ipc = load.anonymous(o.va.ipc, page_size, VM_READ | VM_WRITE);
@@ -226,7 +215,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         s = sys::memory_populate(ipc->selector(), 0).status;
         if (s != STATUS_OK)
             return s;
-        auto events = load.adopt(sys::notification_create(r.pool(), rt_event_badge));
+        auto events = load.adopt(sys::port_create(r.alloc(), o.resources.watches, o.resources.hints));
         if (!events)
             return events.error();
         std::vector<AuxEntry> aux{{AT_PAGESZ, page_size},
@@ -235,12 +224,14 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
                                   {AT_SYS_IPC, o.va.ipc}};
         for (auto [key, cap, rights] :
              std::array{std::tuple{AT_SYS_POOL, r.pool(), o.resources.pool_perms},
+                        std::tuple{AT_SYS_DOMAIN, r.domain(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE | RIGHT_DELEGATE}},
+                        std::tuple{AT_SYS_SCOPE, r.scope(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE}},
                         std::tuple{AT_SYS_VSPACE, r.vspace(),
-                                   word_t{RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP |
+                                   word_t{RIGHT_MANAGE | RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP |
                                           RIGHT_DESTROY | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_EVENTS, events->selector(),
-                                   word_t{RIGHT_SIGNAL | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
+                                   word_t{RIGHT_MANAGE | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
             const auto copy = sys::cap_duplicate(cap, r.cspace(), rights);
             if (copy.status != STATUS_OK)
                 return copy.status;
@@ -292,19 +283,21 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
                 ::memcpy(data.data() + name_offset, name.data(), name.size());
                 name_offset += name.size();
             }
-            auto memory = load.anonymous(o.va.bindings, binding_bytes, VM_READ);
+            auto memory = load.memory(binding_bytes);
             if (!memory)
                 return memory.error();
             s = load.write(memory->selector(), binding_bytes, 0, data.data(), data.size());
             if (s == STATUS_OK)
                 s = sys::memory_seal(memory->selector()).status;
+            if (s == STATUS_OK)
+                s = load.install(memory->selector(), o.va.bindings, binding_bytes, VM_READ);
             if (s != STATUS_OK)
                 return s;
             aux.push_back({AT_SYS_BINDINGS, o.va.bindings});
             aux.push_back({AT_SYS_BINDINGS_SIZE, binding_size});
         }
         aux.push_back({AT_NULL, 0});
-        const auto pointers = (argv.size() + 3) * sizeof(word_t);
+        const auto pointers = (argv.size() + o.envp.size() + 3) * sizeof(word_t);
         const auto prefix = pointers + aux.size() * sizeof(AuxEntry);
         if (prefix > o.va.stack_size || strings > o.va.stack_size - prefix)
             return STATUS_BAD_ARGS;
@@ -316,14 +309,20 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         auto* words = reinterpret_cast<word_t*>(initial.data());
         words[0] = argv.size();
         size_t offset = prefix;
-        for (size_t i = 0; i < argv.size(); ++i) {
-            words[i + 1] = sp + offset;
-            ::memcpy(initial.data() + offset, argv[i].data(), argv[i].size());
-            offset += argv[i].size() + 1;
+        size_t pointer = 1;
+        for (const auto args : {argv, o.envp}) {
+            for (const auto arg : args) {
+                words[pointer++] = sp + offset;
+                ::memcpy(initial.data() + offset, arg.data(), arg.size());
+                offset += arg.size() + 1;
+            }
+            ++pointer; // argv/envp each end with a zero pointer.
         }
         ::memcpy(initial.data() + pointers, aux.data(), aux.size() * sizeof(AuxEntry));
         s = load.write(stack->selector(), o.va.stack_size, o.va.stack_size - stack_bytes,
                        initial.data(), initial.size());
+        if (s == STATUS_OK)
+            s = load.install(stack->selector(), o.va.stack, o.va.stack_size, VM_READ | VM_WRITE);
         if (s != STATUS_OK)
             return s;
         ThreadInit init{};
@@ -334,10 +333,7 @@ auto pr_exec(pr_task& r, const pr_auth& auth, const pr_image& image, const pr_op
         s = load.write(desc->selector(), 4096, 0, &init, sizeof(init));
         if (s != STATUS_OK)
             return s;
-        s = scratch.close();
-        return s == STATUS_OK
-                   ? r.prepare(desc->selector(), o.events, o.cpu)
-                   : s;
+        return r.prepare(desc->selector(), o.events, o.cpu);
     };
     const auto status = build();
     if (status != STATUS_OK) {

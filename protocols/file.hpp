@@ -3,6 +3,35 @@
 #include <start.hpp>
 #include <protocols/queue.hpp>
 #include <libk/parse.hpp>
+#include <string>
+
+// Resolve lexical components inside the granted namespace root.
+inline auto fl_normalize(std::span<char> path) -> size_t {
+    size_t size{}, cursor{};
+    while (cursor < path.size()) {
+        const auto begin = cursor;
+        while (cursor < path.size() && path[cursor] != '/') ++cursor;
+        const std::string_view part{path.data() + begin, cursor - begin};
+        if (part == "..") {
+            while (size && path[size - 1] != '/') --size;
+            if (size) --size;
+        } else if (!part.empty() && part != ".") {
+            if (size) path[size++] = '/';
+            ::memmove(path.data() + size, part.data(), part.size());
+            size += part.size();
+        }
+        ++cursor;
+    }
+    return size;
+}
+inline auto fl_path(std::string_view path, std::string_view base = "/") -> std::string {
+    std::string full;
+    if (!path.starts_with('/')) { full = base; full += '/'; }
+    full += path;
+    full.resize(fl_normalize({full.data(), full.size()}));
+    full.insert(0, "/");
+    return full;
+}
 
 inline constexpr rt_req fs_service{"files", 0x46494c45, ObjChannel, 8};
 inline constexpr rt_req st_service{"store", 0x53544f52, ObjChannel, 6};
@@ -18,7 +47,7 @@ struct fl_memory {
     uint64_t size{};
     // Prepopulate while failure can still be returned to the caller. Copying
     // into a demand mapping must not turn shared-budget admission into a fault.
-    auto create(cap_t pool, word_t perms) -> status_t {
+    auto create(CreateAuth pool, word_t perms) -> status_t {
         const auto bytes = (size + 4095) & ~uint64_t{4095};
         const auto created = sys::memory_create(pool, bytes, perms);
         memory = cap_owner{created.value};

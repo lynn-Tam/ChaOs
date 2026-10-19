@@ -65,7 +65,7 @@ auto Env::kernel(mm::KSpace& vspace) noexcept
 auto Env::user(
     object::ref<> vspace_ref,
     object::ref<> cspace_ref,
-    std::optional<ipc::Buffer> ipc) noexcept
+    std::optional<mm::View> ipc) noexcept
     -> std::expected<Env, EnvError> {
     if (!vspace_ref || !cspace_ref
         || vspace_ref.kind() != ObjVSpace
@@ -139,13 +139,13 @@ auto Env::cspace() const noexcept -> cap::CSpace* {
 }
 
 auto Env::ipc_buffer() noexcept
-    -> ipc::Buffer* {
+    -> mm::View* {
     auto* const roots = std::get_if<User>(&roots_);
     return roots != nullptr && roots->ipc ? &*roots->ipc : nullptr;
 }
 
 auto Env::ipc_buffer() const noexcept
-    -> const ipc::Buffer* {
+    -> const mm::View* {
     const auto* const roots = std::get_if<User>(&roots_);
     return roots != nullptr && roots->ipc ? &*roots->ipc : nullptr;
 }

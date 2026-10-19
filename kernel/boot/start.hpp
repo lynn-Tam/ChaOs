@@ -7,6 +7,7 @@
 #include <io/space.hpp>
 #include <ipc/channel.hpp>
 #include <ipc/notification.hpp>
+#include <ipc/port.hpp>
 #include <mm/pager.hpp>
 #include <object/pool.hpp>
 #include <sched/sc.hpp>
@@ -16,7 +17,7 @@
 struct Boot {
     Boot(mm::Pmm& pmm, mm::KSpace& vm, u64 frequency) noexcept
         : pmm(pmm), vm(vm), clock(frequency), objects(pmm, work),
-          grants(pmm, work), cpus(pmm), worker{cpus} {}
+          grants(pmm, work), cpus(pmm) {}
 
     mm::Pmm& pmm;
     mm::KSpace& vm;
@@ -26,13 +27,10 @@ struct Boot {
     cap::Graph grants;
     Cpus cpus;
     object::ref<sched::Domain> domain;
-    object::ref<object::group> root;
+    object::ref<resource::Account> root;
+    object::ref<object::Scope> scope;
     object::ref<mm::Phys> physical;
-    struct Worker {
-        Cpus& cpus;
-        object::ref<Thread> thread{};
-        void operator()() noexcept { libk_assert(thread && sched::wake(cpus, thread.get())); }
-    } worker;
+
 };
 
 enum class BootErr : u8 {

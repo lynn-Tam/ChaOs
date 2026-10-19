@@ -5,53 +5,64 @@
 #include <libk/memory.hpp>
 #include <utility>
 #include <mm/vspace.hpp>
-#include <object/ref.hpp>
+#include <object/pool.hpp>
 #include <sync.hpp>
 #include <libk/scope_guard.hpp>
 #include <type_traits>
 
 namespace cap {
 
-auto CSpace::inspect(Handle cursor) noexcept -> std::expected<CSpaceInfo, CSpaceError> {
-    std::array<GrantRef, CAP_INFO_PAGE> grants;
-    std::array<View, CAP_INFO_PAGE> views;
-    CSpaceInfo info{};
-    info.version = 1; info.size = sizeof(info);
-    {
-        sync::Lock guard{lock_};
-        if (!accepting_) return std::unexpected(CSpaceError::InvalidState);
-        auto index = occupied_head_;
-        if (cursor) {
-            auto* previous = slot(cursor.index());
-            if (!previous || previous->generation != cursor.generation() || previous->state != SlotState::Occupied)
-                return std::unexpected(CSpaceError::InvalidHandle);
-            index = previous->next;
-        }
-        info.slots = live_slots_; info.pages = page_count_;
-        while (index != invalid_index && info.count < CAP_INFO_PAGE) {
-            auto& row = *slot(index);
-            const auto n = info.count++;
-            info.records[n].selector = Handle::make(index, row.generation).raw();
-            info.records[n].state = CAP_INFO_UNAVAILABLE;
-            views[n] = row.storage.capability.view;
-            auto copy = row.storage.capability.grant.clone();
-            if (copy) grants[n] = std::move(*copy);
-            index = row.next;
-        }
-        if (index != invalid_index) info.cursor = info.records[info.count - 1].selector;
+auto CSpace::inspect(Handle cursor, CSpaceInfo& info, u64 epoch) noexcept -> std::expected<void, CSpaceError> {
+    sync::Lock guard{lock_};
+    if (!accepting_ || billing_) return std::unexpected(CSpaceError::InvalidState);
+    if (epoch_ == std::numeric_limits<u64>::max() || (cursor && !epoch) || (epoch && epoch != epoch_))
+        return std::unexpected(CSpaceError::InvalidHandle);
+    auto index = occupied_head_;
+    if (cursor) {
+        auto* previous = slot(cursor.index());
+        if (!previous || previous->generation != cursor.generation() || previous->state != SlotState::Occupied)
+            return std::unexpected(CSpaceError::InvalidHandle);
+        index = previous->next;
     }
-    // Grant authority is resolved after releasing the CSpace lock. Each record
-    // is a short snapshot, with no object references escaping to the caller.
-    for (usize n = 0; n < info.count; ++n) {
-        if (!grants[n]) continue;
-        auto lease = grants[n].acquire();
-        if (!lease) continue;
-        auto view = compose(lease->kind(), lease->ceiling(), views[n]);
-        if (!view || !lease->target_live()) continue;
-        info.records[n].state = CAP_INFO_VALID;
-        info.records[n].view = describe(lease->kind(), *view);
+    info = {};
+    info.version = CSPACE_INFO_VERSION; info.size = sizeof(info);
+    info.slots = live_slots_; info.pages = page_count_; info.epoch = epoch_;
+    while (index != invalid_index && info.count < CAP_INFO_PAGE) {
+        auto& row = *slot(index);
+        const auto& cap = row.storage.capability;
+        auto& record = info.records[info.count++];
+        record.selector = Handle::make(index, row.generation).raw();
+        record.object_id = cap.grant.target_id().value;
+        record.grant_id = cap.grant.id().value;
+        record.state = CAP_INFO_UNAVAILABLE;
+        if (const auto view = cap.grant.graph().view(cap.grant.key(), cap.view)) {
+            record.view = *view;
+            record.state = CAP_INFO_VALID;
+        }
+        index = row.next;
     }
-    return info;
+    if (index != invalid_index) info.cursor = info.records[info.count - 1].selector;
+    return {};
+}
+
+auto CSpace::inspect(GrantQuery query, usize depth, GrantRecords& out) noexcept -> status_t {
+    sync::Lock guard{lock_};
+    auto handle = Handle{query.selector};
+    auto* cell = slot(handle.index());
+    if (!handle || !cell || cell->generation != handle.generation() || cell->state != SlotState::Occupied)
+        return STATUS_STALE;
+    auto& grant = cell->storage.capability.grant;
+    return grant.graph().inspect(grant.key(), query, depth, out);
+}
+
+auto CSpace::observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, CSpaceError> {
+    sync::Lock guard{lock_};
+    auto* cell = seed ? slot(seed.index()) : nullptr;
+    if (!cell || cell->generation != seed.generation() || cell->state != SlotState::Occupied)
+        return std::unexpected(CSpaceError::InvalidHandle);
+    auto& grant = cell->storage.capability.grant;
+    auto lease = grant.graph().observe(grant.key(), selected, depth);
+    return lease ? std::expected<Graph::Sample, CSpaceError>{std::move(*lease)} : std::unexpected(grant_error(lease.error()));
 }
 
 CSpace::CSpace(mm::Pmm& pmm) noexcept
@@ -104,9 +115,18 @@ CSpace::~CSpace() noexcept {
 
 auto CSpace::reserve() noexcept
     -> std::expected<Reservation, CSpaceError> {
+    {
+        sync::Lock guard{lock_};
+        if (!accepting_ || billing_) return std::unexpected(CSpaceError::InvalidState);
+        ++preparing_;
+    }
+    libk::scope_exit prepared{[&]() noexcept {
+        { sync::Lock guard{lock_}; libk_assert(preparing_); --preparing_; }
+        finish_retire();
+    }};
     resource::Charge slot_charge{};
-    if (sponsor_ != nullptr) {
-        auto charged = sponsor_->acquire(resource::budget{.caps = 1});
+    if (funding_ != nullptr) {
+        auto charged = funding_->acquire(resource::budget{.caps = 1});
         if (!charged) {
             return std::unexpected(CSpaceError::ResourceExhausted);
         }
@@ -126,6 +146,7 @@ auto CSpace::reserve() noexcept
                 const u32 index = free_head_;
                 Slot* const available = slot(index);
                 libk_assert(available != nullptr);
+                sync::Lock local{available->lock};
                 libk_assert(available->state == SlotState::Empty);
                 free_head_ = available->next;
                 available->next = invalid_index;
@@ -171,10 +192,10 @@ auto CSpace::reserve() noexcept
 
 auto CSpace::reserve_grant() noexcept
     -> std::expected<resource::Reservation, CSpaceError> {
-    if (sponsor_ == nullptr) {
+    if (funding_ == nullptr) {
         return (resource::Reservation{});
     }
-    auto charged = sponsor_->reserve(Graph::node_charge());
+    auto charged = funding_->reserve(Graph::node_charge());
     if (!charged) {
         return std::unexpected(CSpaceError::ResourceExhausted);
     }
@@ -195,11 +216,7 @@ auto CSpace::insert(
 auto CSpace::prepare(Reservation&& slot, GrantRef&& grant, View view) noexcept
     -> std::expected<NewCap, CSpaceError> {
     if (!grant) return std::unexpected(CSpaceError::GrantUnavailable);
-    auto pin = grant.acquire();
-    if (!pin) return std::unexpected(grant_error(pin.error()));
-    auto valid = compose(pin->kind(), pin->ceiling(), view);
-    if (!valid) return std::unexpected(policy_error(valid.error()));
-    return NewCap{std::move(slot), std::move(grant), std::move(*pin), view};
+    return NewCap{std::move(slot), Capability{std::move(grant), view}};
 }
 
 auto CSpace::insert(Reservation&& slot, GrantRef&& grant, View view) noexcept
@@ -212,25 +229,88 @@ auto CSpace::insert(Reservation&& slot, GrantRef&& grant, View view) noexcept
         : std::unexpected(done.error());
 }
 
-auto CSpace::insert(std::span<NewCap> caps) noexcept
-    -> std::expected<void, CSpaceError> {
-    sync::Lock guard{lock_};
-    if (!accepting_) return std::unexpected(CSpaceError::InvalidState);
-    for (auto& cap : caps) {
-        if (!cap.grant_ || !cap.pin_ || !reserved(cap.slot_))
-            return std::unexpected(CSpaceError::InvalidState);
+auto CSpace::insert(std::span<NewCap> caps, Graph::Admission authority,
+    std::span<const object::ref<>*> gates, libk::delegate<void() noexcept> commit,
+    std::span<const Graph::Attach> relations) noexcept -> std::expected<void, CSpaceError> {
+    if (caps.size() > IPC_MAX_CAPS) return std::unexpected(CSpaceError::InvalidDescriptor);
+    std::array<Capability*, IPC_MAX_CAPS> values;
+    std::array<Reservation*, IPC_MAX_CAPS> slots;
+    for (usize i = 0; i < caps.size(); ++i) { values[i] = &caps[i].cap_; slots[i] = &caps[i].slot_; }
+    return install(std::span{values}.first(caps.size()), std::span{slots}.first(caps.size()), authority, gates, commit, relations);
+}
+
+auto CSpace::install(std::span<Capability*> caps, std::span<Reservation*> reservations, Graph::Admission authority,
+    std::span<const object::ref<>*> gates, libk::delegate<void() noexcept> commit,
+    std::span<const Graph::Attach> relations) noexcept -> std::expected<void, CSpaceError> {
+    libk::scope_exit notify{[&]() noexcept { post(); }};
+    if (caps.size() > IPC_MAX_CAPS || gates.size() > IPC_MAX_CAPS || authority.grants_.size() > IPC_MAX_CAPS
+        || relations.size() > Graph::max_attachments) return std::unexpected(CSpaceError::InvalidDescriptor);
+    std::array<object::Link::Prepared, Graph::max_attachments> prepared;
+    for (usize i = 0; i < relations.size(); ++i) {
+        const auto [grant, attachment, target] = relations[i];
+        if (!attachment || !attachment->ops_ || bool(grant) == bool(target)
+            || (grant && !*grant) || (target && !*target)) return std::unexpected(CSpaceError::InvalidState);
+        auto made = attachment->link_.prepare(grant ? grant->target() : *target, attachment->ops_->observe);
+        if (!made) return std::unexpected(CSpaceError::GrantUnavailable);
+        prepared[i] = std::move(*made);
     }
-    for (auto& cap : caps)
-        publish(cap.slot_, Capability{std::move(cap.grant_), cap.view_});
-    return {};
+    auto* graph = caps.empty() ? authority.graph_ : &caps.front()->grant.graph();
+    for (const auto& relation : relations)
+        if (relation.grant && (!graph || &relation.grant->graph() != graph))
+            return std::unexpected(CSpaceError::InvalidState);
+    if (authority.graph_ && authority.graph_ != graph) return std::unexpected(CSpaceError::InvalidState);
+    std::array<const object::ref<>*, IPC_MAX_CAPS * 3> targets;
+    libk::inplace_vector<const GrantLease*, IPC_MAX_CAPS * 2> grants;
+    usize count{};
+    auto add = [&](const GrantLease& lease) noexcept -> bool {
+        if (&lease.graph() != graph) return false;
+        targets[count++] = &lease.target();
+        return grants.try_push_back(&lease);
+    };
+    for (auto* lease : authority.grants_) if (!lease || !*lease || !add(*lease))
+        return std::unexpected(CSpaceError::GrantUnavailable);
+    std::array<GrantLease, IPC_MAX_CAPS> leases;
+    for (usize i = 0; i < caps.size(); ++i) {
+        auto acquired = caps[i]->grant.acquire();
+        if (!acquired || !compose(acquired->kind(), acquired->ceiling(), caps[i]->view))
+            return std::unexpected(CSpaceError::GrantUnavailable);
+        leases[i] = std::move(*acquired);
+        if (!add(leases[i])) return std::unexpected(CSpaceError::GrantUnavailable);
+    }
+    for (auto* gate : gates) targets[count++] = gate;
+    sync::Lock guard{lock_};
+    if (!accepting_ || billing_ || reservations.size() != caps.size()) return std::unexpected(CSpaceError::InvalidState);
+    std::array<sync::Spin*, IPC_MAX_CAPS> slots;
+    for (usize i = 0; i < caps.size(); ++i) {
+        auto* target = reserved(*reservations[i]);
+        if (!target) return std::unexpected(CSpaceError::InvalidState);
+        slots[i] = &target->lock;
+    }
+    sync::Set local{std::span{slots}.first(caps.size())};
+    auto publish_all = [&] noexcept {
+        for (usize i = 0; i < caps.size(); ++i) publish(*reservations[i], std::move(*caps[i]));
+        if (commit) commit();
+    };
+    const auto participants = std::span{targets}.first(count);
+    // An accepted operation installs its execution relation with its result
+    // selectors and provider index. No hardware or foreign callbacks here.
+    const bool done = !relations.empty()
+        ? bool(graph && graph->attach_commit(relations, std::span{prepared}.first(relations.size()), participants,
+            libk::delegate<void() noexcept>::bind(publish_all), grants.span()))
+        : graph ? graph->admission(grants.span()).publish(participants, publish_all) == STATUS_OK
+                : object::ref<>::publish(participants, publish_all);
+    if (done) for (auto* slot : reservations) charge_.merge(std::move(slot->charge_));
+    return done ? std::expected<void, CSpaceError>{} : std::unexpected(CSpaceError::GrantUnavailable);
 }
 
 auto CSpace::close(Handle handle) noexcept
     -> std::expected<void, CSpaceError> {
-    GrantRef released{};
+    libk::scope_exit notify{[&]() noexcept { post(); }};
+    Capability released{};
     resource::Charge refund{};
     {
         sync::Lock guard{lock_};
+        if (billing_) return std::unexpected(CSpaceError::Contended);
         Slot* const occupied = handle ? slot(handle.index()) : nullptr;
         if (occupied == nullptr
             || occupied->generation != handle.generation()) {
@@ -240,9 +320,10 @@ auto CSpace::close(Handle handle) noexcept
             return std::unexpected(CSpaceError::InvalidState);
         }
 
+        sync::Lock local{occupied->lock};
         Capability& capability = occupied->storage.capability;
         unlink_occupied(handle.index(), *occupied);
-        released = std::move(capability.grant);
+        released = std::move(capability);
         libk::destroy_at(&capability);
         if (charge_) refund = charge_.split({.caps = 1});
         occupied->state = SlotState::Empty;
@@ -252,7 +333,7 @@ auto CSpace::close(Handle handle) noexcept
             push_free(handle.index(), *occupied);
         }
     }
-    released.reset();
+    released = {};
     refund.reset();
     finish_retire();
     return {};
@@ -263,6 +344,7 @@ auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec, resource::Reservati
     auto source = snapshot(spec.source);
     if (!source) return std::unexpected(source.error());
     auto& lease = source->lease;
+    if (source->token && spec.op != XferOp::Move) return std::unexpected(CSpaceError::Denied);
     View view = source->view;
     GrantRef grant;
     if (spec.op == XferOp::Move) {
@@ -288,7 +370,7 @@ auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec, resource::Reservati
         view = *requested;
         auto made = [&]() noexcept -> std::expected<GrantRef, CSpaceError> {
             if (!derive) {
-                auto ref = lease.graph().ref(lease.key());
+                auto ref = lease.clone();
                 return ref ? std::expected<GrantRef, CSpaceError>{std::move(*ref)}
                            : std::unexpected(grant_error(ref.error()));
             }
@@ -313,9 +395,29 @@ auto CSpace::prepare_xfer(CSpace& dst, const XferSpec& spec, resource::Reservati
 
 auto CSpace::commit_xfers(CSpace& dst, std::span<Xfer> entries) noexcept
     -> std::expected<void, CSpaceError> {
+    libk::scope_exit notify{[&]() noexcept { post(); if (&dst != this) dst.post(); }};
+    if (entries.empty()) return {};
+    if (entries.size() > IPC_MAX_CAPS) return std::unexpected(CSpaceError::InvalidDescriptor);
     resource::Charge refund;
     sync::Pair locks{lock_, dst.lock_};
-    if (!dst.accepting_) return std::unexpected(CSpaceError::InvalidState);
+    std::array<sync::Spin*, IPC_MAX_CAPS * 2> slots;
+    usize n{};
+    for (auto& entry : entries) {
+        auto* target = dst.reserved(entry.slot);
+        if (!target) return std::unexpected(CSpaceError::InvalidState);
+        slots[n++] = &target->lock;
+        if (entry.op == XferOp::Move) {
+            auto* source = slot(entry.source.index());
+            if (!source) return std::unexpected(CSpaceError::InvalidHandle);
+            slots[n++] = &source->lock;
+        }
+    }
+    sync::Set local{std::span{slots}.first(n)};
+    // Publication and revoke share the Grant structure boundary. Preparing a
+    // transfer is not authority to publish it after its branch has closed.
+    auto& graph = entries.front().lease.graph();
+    sync::Lock admission{graph.lock_};
+    if (billing_ || !dst.accepting_ || dst.billing_) return std::unexpected(CSpaceError::InvalidState);
     for (auto& entry : entries) {
         if (!dst.reserved(entry.slot)) return std::unexpected(CSpaceError::InvalidState);
         if (entry.op != XferOp::Move) continue;
@@ -327,21 +429,39 @@ auto CSpace::commit_xfers(CSpace& dst, std::span<Xfer> entries) noexcept
             || source->storage.capability.view.data != entry.original.data)
             return std::unexpected(CSpaceError::InvalidState);
     }
-    for (auto& entry : entries) {
+    std::array<const object::ref<>*, IPC_MAX_CAPS> targets;
+    usize count{};
+    for (const auto& entry : entries) {
+        if (&entry.lease.graph() != &graph) return std::unexpected(CSpaceError::GrantUnavailable);
+        const auto* node = graph.find(entry.lease.key());
+        if (!node) return std::unexpected(CSpaceError::GrantUnavailable);
+        targets[count++] = &node->target;
+    }
+    const bool done = object::ref<>::publish(std::span{targets}.first(count), [&] {
+      for (auto& entry : entries) {
         Capability cap;
         if (entry.op == XferOp::Move) {
             auto* source = slot(entry.source.index());
             cap = std::move(source->storage.capability);
             libk::destroy_at(&source->storage.capability);
             unlink_occupied(entry.source.index(), *source);
-            if (charge_) refund.merge(charge_.split({.caps = 1}));
             source->state = SlotState::Empty;
             libk_assert(live_slots_ != 0);
             --live_slots_;
             push_free(entry.source.index(), *source);
         } else cap = Capability{std::move(entry.grant), entry.view};
         dst.publish(entry.slot, std::move(cap));
+      }
+    });
+    if (!done) return std::unexpected(CSpaceError::GrantUnavailable);
+    usize moved{};
+    for (auto& entry : entries) {
+        dst.charge_.merge(std::move(entry.slot.charge_));
+        moved += entry.op == XferOp::Move;
     }
+    if (charge_ && moved) refund = charge_.split({.caps = moved});
+    admission.restore();
+    local.release();
     locks.release();
     refund.reset();
     finish_retire();
@@ -358,27 +478,19 @@ auto CSpace::transfer(Handle source, CSpace& dst, XferOp op, XferLimit limit, re
     return done ? std::expected<Handle, CSpaceError>{handle} : std::unexpected(done.error());
 }
 
-auto CSpace::revoke(
-    Handle source_handle,
-    GrantRevoke& completion,
-    bool include_source) noexcept -> std::expected<void, CSpaceError> {
-    auto copied = snapshot(source_handle);
-    if (!copied) {
-        return std::unexpected(copied.error());
-    }
-    Snapshot source = std::move(copied).value();
-    GrantLease lease = std::move(source.lease);
-    if (!source.view.rights.contains(Right::Revoke)) {
-        return std::unexpected(CSpaceError::Denied);
-    }
-    const GrantKey key = lease.key();
-    auto started = include_source
-        ? lease.graph().invalidate(key, completion)
-        : lease.graph().revoke_descendants(key, completion);
-    return started
-        ? std::expected<void, CSpaceError>{}
-        : std::expected<void, CSpaceError>{
-              std::unexpected(grant_error(started.error()))};
+auto CSpace::revoke(Handle handle, Source::Context* context, GrantId selected) noexcept -> std::expected<WaitResult, CSpaceError> {
+    libk::scope_exit notify{[&]() noexcept { post(); }};
+    sync::Lock guard{lock_};
+    auto* found = handle ? slot(handle.index()) : nullptr;
+    if (!found || found->generation != handle.generation() || found->state != SlotState::Occupied)
+        return std::unexpected(CSpaceError::InvalidHandle);
+    const auto& cap = found->storage.capability;
+    if (!cap.view.rights.contains(Right::Revoke)) return std::unexpected(CSpaceError::Denied);
+    // Slot authority permits only monotonic control of its original lineage.
+    // No payload acquisition or new authorization is performed on a tombstone.
+    const auto result = cap.grant.graph().close(cap.grant.key(), context, selected);
+    if (result.status == STATUS_OK || result.status == STATUS_PENDING) changed();
+    return result;
 }
 
 auto CSpace::destroy(Handle source_handle) noexcept
@@ -405,35 +517,27 @@ auto CSpace::destroy(Handle source_handle) noexcept
         : std::unexpected(CSpaceError::GrantUnavailable);
 }
 
-auto CSpace::snapshot(Handle handle) noexcept
-    -> std::expected<Snapshot, CSpaceError> {
-    sync::Lock guard{lock_};
-    if (!accepting_) {
-        return std::unexpected(CSpaceError::InvalidState);
+auto CSpace::snapshot(Handle handle) noexcept -> std::expected<Snapshot, CSpaceError> {
+    auto* occupied = handle ? slot(handle.index()) : nullptr;
+    if (!occupied) return std::unexpected(CSpaceError::InvalidHandle);
+    // The successful Grant operation is the use-admission point. Slot removal
+    // and MOVE take this same local lock, so no detached key gains new use.
+    std::expected<GrantLease, GrantError> acquired;
+    View original;
+    u64 token{};
+    {
+        sync::Lock guard{occupied->lock};
+        if (!accepting_.load(std::memory_order_acquire)) return std::unexpected(CSpaceError::InvalidState);
+        if (occupied->generation != handle.generation() || occupied->state != SlotState::Occupied)
+            return std::unexpected(CSpaceError::InvalidHandle);
+        acquired = occupied->storage.capability.grant.acquire();
+        original = occupied->storage.capability.view;
+        token = occupied->storage.capability.facet.get().token;
     }
-    Slot* const occupied = handle ? slot(handle.index()) : nullptr;
-    if (occupied == nullptr
-        || occupied->generation != handle.generation()) {
-        return std::unexpected(CSpaceError::InvalidHandle);
-    }
-    if (occupied->state == SlotState::Empty
-        || occupied->state == SlotState::Quarantined) {
-        return std::unexpected(CSpaceError::InvalidHandle);
-    }
-    if (occupied->state != SlotState::Occupied) {
-        return std::unexpected(CSpaceError::InvalidState);
-    }
-    const Capability& capability = occupied->storage.capability;
-    auto acquired = capability.grant.acquire();
-    if (!acquired) {
-        return std::unexpected(grant_error(acquired.error()));
-    }
-    GrantLease lease = std::move(acquired).value();
-    const View original = capability.view;
-    guard.unlock();
-    auto view = compose(lease.kind(), lease.ceiling(), original);
+    if (!acquired) return std::unexpected(grant_error(acquired.error()));
+    auto view = compose(acquired->kind(), acquired->ceiling(), original);
     if (!view) return std::unexpected(policy_error(view.error()));
-    return (Snapshot{std::move(lease), view.value()});
+    return Snapshot{std::move(*acquired), *view, token};
 }
 
 auto CSpace::reserved(const Reservation& r) noexcept -> Slot* {
@@ -448,7 +552,6 @@ void CSpace::publish(Reservation& r, Capability&& cap) noexcept {
     auto* target = reserved(r);
     libk_assert(target && cap.grant);
     libk::construct_at(&target->storage.capability, std::move(cap));
-    charge_.merge(std::move(r.charge_));
     target->state = SlotState::Occupied;
     link_occupied(r.handle_.index(), *target);
     r.disarm();
@@ -459,6 +562,7 @@ void CSpace::rollback(Handle handle) noexcept {
         sync::Lock guard{lock_};
         Slot* const reserved = handle ? slot(handle.index()) : nullptr;
         libk_assert(reserved != nullptr);
+        sync::Lock local{reserved->lock};
         libk_assert(reserved->generation == handle.generation());
         libk_assert(reserved->state == SlotState::Reserved);
         reserved->state = SlotState::Empty;
@@ -484,7 +588,7 @@ auto CSpace::grow() noexcept -> std::expected<void, CSpaceError> {
         leaf_number = next_leaf_;
         high = leaf_number >> dir_bits;
         needs_root = root_ == nullptr;
-        needs_mid = needs_root || root_->children[high] == nullptr;
+        needs_mid = needs_root || root_.load()->children[high] == nullptr;
         required = usize{1} + static_cast<usize>(needs_root)
             + static_cast<usize>(needs_mid);
         if (required > quota_.pages - page_count_) {
@@ -498,8 +602,8 @@ auto CSpace::grow() noexcept -> std::expected<void, CSpaceError> {
     }
 
     resource::Charge capacity{};
-    if (sponsor_ != nullptr) {
-        auto charged = sponsor_->acquire({.memory = required * mm::page_size});
+    if (funding_ != nullptr) {
+        auto charged = funding_->acquire({.memory = required * mm::page_size});
         if (!charged) {
             {
                 sync::Lock guard{lock_};
@@ -580,17 +684,17 @@ auto CSpace::grow() noexcept -> std::expected<void, CSpaceError> {
         libk_assert(growing_);
         if (needs_root) {
             libk_assert(root_ == nullptr);
-            root_ = new_root;
+            root_.store(new_root, std::memory_order_release);
         }
-        auto* mid = static_cast<DirPage*>(root_->children[high]);
+        auto* mid = static_cast<DirPage*>(root_.load()->children[high].load(std::memory_order_acquire));
         if (needs_mid) {
             libk_assert(mid == nullptr);
-            root_->children[high] = new_mid;
+            root_.load()->children[high].store(new_mid, std::memory_order_release);
             mid = new_mid;
         }
         const usize low = leaf_number & (dir_entries - 1);
         libk_assert(mid->children[low] == nullptr);
-        mid->children[low] = new_leaf;
+        mid->children[low].store(new_leaf, std::memory_order_release);
         ++next_leaf_;
         page_count_ += required;
         charge_.merge(std::move(capacity));
@@ -609,22 +713,13 @@ auto CSpace::slot(usize index) noexcept -> Slot* {
 }
 
 auto CSpace::slot(usize index) const noexcept -> const Slot* {
-    if (index > Handle::max_index || root_ == nullptr) {
-        return nullptr;
-    }
-    const usize leaf_number = index >> leaf_bits;
-    if (leaf_number >= next_leaf_) {
-        return nullptr;
-    }
-    const usize high = leaf_number >> dir_bits;
-    const usize low = leaf_number & (dir_entries - 1);
-    const auto* const mid = static_cast<const DirPage*>(
-        root_->children[high]);
-    if (mid == nullptr) {
-        return nullptr;
-    }
-    const auto* const leaf = static_cast<const LeafPage*>(mid->children[low]);
-    return leaf != nullptr ? &leaf->slots[index & (leaf_slots - 1)] : nullptr;
+    // Published pages stay until the actual Env binding / CSpace use drains.
+    auto* root = root_.load(std::memory_order_acquire);
+    if (index > Handle::max_index || !root) return nullptr;
+    const auto leaf_number = index >> leaf_bits;
+    auto* mid = static_cast<const DirPage*>(root->children[leaf_number >> dir_bits].load(std::memory_order_acquire));
+    auto* leaf = mid ? static_cast<const LeafPage*>(mid->children[leaf_number & (dir_entries - 1)].load(std::memory_order_acquire)) : nullptr;
+    return leaf ? &leaf->slots[index & (leaf_slots - 1)] : nullptr;
 }
 
 void CSpace::push_free(usize index, Slot& empty) noexcept {
@@ -636,6 +731,7 @@ void CSpace::push_free(usize index, Slot& empty) noexcept {
 }
 
 void CSpace::link_occupied(usize index, Slot& occupied) noexcept {
+    changed();
     libk_assert(index <= Handle::max_index);
     libk_assert(occupied.state == SlotState::Occupied);
     libk_assert(occupied.next == invalid_index);
@@ -652,6 +748,7 @@ void CSpace::link_occupied(usize index, Slot& occupied) noexcept {
 }
 
 void CSpace::unlink_occupied(usize index, Slot& occupied) noexcept {
+    changed();
     libk_assert(index <= Handle::max_index);
     libk_assert(occupied.state == SlotState::Occupied);
     if (occupied.previous == invalid_index) {
@@ -684,47 +781,56 @@ void CSpace::retire(object::cleanup&& done) noexcept {
     retire();
 }
 
+void CSpace::changed() noexcept {
+    libk_assert(lock_.held());
+    if (epoch_ != std::numeric_limits<u64>::max()) ++epoch_;
+    dirty_ = true;
+}
 void CSpace::retire() noexcept {
+    bool retired;
+    { sync::Lock guard{lock_}; accepting_ = false; retired = retired_; }
+    if (retired) { complete_cleanup(); return; }
+    run_work();
+}
+void CSpace::run_work() noexcept {
+    auto execution = object::ref<>::retain_alive(job_.key());
+    bool dirty, closing;
     {
         sync::Lock guard{lock_};
-        accepting_ = false;
-        if (retired_) {
-            guard.restore();
-            complete_cleanup();
-            return;
-        }
+        if (advancing_) { again_ = true; return; }
+        advancing_ = true; dirty = std::exchange(dirty_, false); closing = !accepting_;
     }
-
-    for (;;) {
-        GrantRef released{};
-        resource::Charge refund{};
-        bool found{};
+    libk::scope_exit leave{[&]() noexcept {
+        sync::Lock guard{lock_};
+        advancing_ = false;
+        const bool again = std::exchange(again_, false);
+        if (!retired_ && (again || dirty_ || (closing && (occupied_head_ != invalid_index || releasing_)))) {
+            libk_assert(work_); post();
+        }
+    }};
+    if (dirty) object::changed(job_.key());
+    if (!closing) return;
+    for (usize step = 0; step < 8; ++step) {
+        Capability released;
+        resource::Charge refund;
         {
             sync::Lock guard{lock_};
-            if (occupied_head_ != invalid_index) {
-                const usize index = occupied_head_;
-                Slot* const current = slot(index);
-                libk_assert(current != nullptr);
-                libk_assert(current->state == SlotState::Occupied);
-                unlink_occupied(index, *current);
-                Capability& capability = current->storage.capability;
-                released = std::move(capability.grant);
-                libk::destroy_at(&capability);
-                if (charge_) refund = charge_.split({.caps = 1});
-                current->state = SlotState::Empty;
-                libk_assert(live_slots_ != 0);
-                --live_slots_;
-                found = true;
-            }
+            if (occupied_head_ == invalid_index) break;
+            const auto index = occupied_head_;
+            auto& current = *slot(index);
+            sync::Lock local{current.lock};
+            unlink_occupied(index, current);
+            auto& cap = current.storage.capability;
+            released = std::move(cap); libk::destroy_at(&cap);
+            if (charge_) refund = charge_.split({.caps=1});
+            current.state = SlotState::Empty;
+            libk_assert(live_slots_); --live_slots_;
         }
-        if (!found) {
-            break;
-        }
-        released.reset();
-        refund.reset();
     }
-
     finish_retire();
+    bool releasing;
+    { sync::Lock guard{lock_}; releasing = releasing_; }
+    if (releasing) release();
 }
 
 auto CSpace::attach_execution() noexcept -> bool {
@@ -748,10 +854,10 @@ void CSpace::detach_execution() noexcept {
 
 auto CSpace::escrow_move(
     Handle source_handle,
-    GrantRef& grant,
-    View& view,
+    Capability& cap,
     Reservation& reservation) noexcept
     -> std::expected<void, CSpaceError> {
+    libk::scope_exit notify{[&]() noexcept { post(); }};
     sync::Lock guard{lock_};
     Slot* const source = source_handle
         ? slot(source_handle.index()) : nullptr;
@@ -764,11 +870,11 @@ auto CSpace::escrow_move(
     if (source->state != SlotState::Occupied) {
         return std::unexpected(CSpaceError::InvalidState);
     }
+    sync::Lock local{source->lock};
     unlink_occupied(source_handle.index(), *source);
     Capability capability = std::move(source->storage.capability);
     libk::destroy_at(&source->storage.capability);
-    grant = std::move(capability.grant);
-    view = capability.view;
+    cap = std::move(capability);
     source->state = SlotState::Reserved;
     reservation = Reservation{*this, source_handle, {}};
     retain_escrow();
@@ -777,10 +883,10 @@ auto CSpace::escrow_move(
 
 auto CSpace::escrow_restore(
     Reservation& reservation,
-    GrantRef&& grant,
-    View view) noexcept -> bool {
+    Capability&& cap) noexcept -> bool {
+    libk::scope_exit notify{[&]() noexcept { post(); }};
     sync::Lock guard{lock_};
-    if (!accepting_ || reservation.owner_ != this || !grant) {
+    if (!accepting_ || reservation.owner_ != this || !cap.grant) {
         return false;
     }
     const Handle handle = reservation.handle_;
@@ -789,8 +895,9 @@ auto CSpace::escrow_restore(
         || target->state != SlotState::Reserved) {
         return false;
     }
+    sync::Lock local{target->lock};
     libk::construct_at(
-        &target->storage.capability, Capability{std::move(grant), view});
+        &target->storage.capability, std::move(cap));
     target->state = SlotState::Occupied;
     link_occupied(handle.index(), *target);
     reservation.disarm();
@@ -809,6 +916,7 @@ auto CSpace::escrow_drop(
         libk_assert(target != nullptr
             && target->generation == handle.generation()
             && target->state == SlotState::Reserved);
+        sync::Lock local{target->lock};
         if (charge_) refund = charge_.split({.caps = 1});
         target->state = SlotState::Empty;
         libk_assert(live_slots_ != 0);
@@ -833,10 +941,10 @@ void CSpace::release_escrow() noexcept {
     --escrows_;
 }
 
-void CSpace::bind_sponsor(
-    resource::Sponsorship& sponsor) noexcept {
-    libk_assert(sponsor_ == nullptr && sponsor);
-    sponsor_ = &sponsor;
+void CSpace::bind_funding(
+    resource::Funding& funding) noexcept {
+    libk_assert(funding_ == nullptr && funding);
+    funding_ = &funding;
 }
 
 auto CSpace::binding_count() const noexcept -> usize {
@@ -845,62 +953,46 @@ auto CSpace::binding_count() const noexcept -> usize {
 }
 
 void CSpace::finish_retire() noexcept {
-    DirPage* root{};
-    resource::Charge refund{};
     {
         sync::Lock guard{lock_};
-        if (accepting_ || growing_ || live_slots_ != 0 || bindings_ != 0 || escrows_ != 0
-            || releasing_ || retired_) {
-            return;
-        }
-        releasing_ = true;
-        root = root_;
+        if (accepting_ || growing_ || preparing_ || billing_ || live_slots_ || bindings_ || escrows_ || releasing_ || retired_) return;
+        releasing_ = true; retiring_ = root_.exchange(nullptr);
         libk_assert(charge_.amount().caps == 0);
-        refund = std::move(charge_);
-        root_ = nullptr;
-        free_head_ = invalid_index;
-        occupied_head_ = invalid_index;
-        next_leaf_ = 0;
-        page_count_ = 0;
+        free_head_ = occupied_head_ = invalid_index;
         quarantined_slots_ = 0;
     }
+    run_work();
+}
 
-    if (root != nullptr) {
-        for (usize high = 0; high < dir_entries; ++high) {
-            auto* const mid = static_cast<DirPage*>(root->children[high]);
-            if (mid == nullptr) {
-                continue;
-            }
-            for (usize low = 0; low < dir_entries; ++low) {
-                auto* const leaf = static_cast<LeafPage*>(mid->children[low]);
-                if (leaf != nullptr) {
-                    const mm::Page page = leaf->page;
-                    libk::destroy_at(leaf);
-                    auto backing = pages_.detach(page);
-                    libk_assert(backing);
-                    backing->reset();
-                }
-            }
-            const mm::Page page = mid->page;
-            libk::destroy_at(mid);
-            auto backing = pages_.detach(page);
-            libk_assert(backing);
-            backing->reset();
+void CSpace::release() noexcept {
+    for (usize step = 0; retiring_ && step < 8; ++step) {
+        mm::Page page;
+        const auto high = next_leaf_ / dir_entries;
+        auto* empty = next_leaf_ % dir_entries == 0 && high < dir_entries
+            ? static_cast<DirPage*>(retiring_->children[high].load()) : nullptr;
+        if (empty) {
+            libk_assert(!empty->children[0]);
+            page = empty->page; retiring_->children[high] = nullptr; libk::destroy_at(empty);
+        } else if (next_leaf_) {
+            const auto index = --next_leaf_;
+            auto* mid = static_cast<DirPage*>(retiring_->children[index / dir_entries].load());
+            auto* leaf = static_cast<LeafPage*>(mid->children[index % dir_entries].load());
+            libk_assert(leaf);
+            page = leaf->page; mid->children[index % dir_entries] = nullptr; libk::destroy_at(leaf);
+        } else {
+            page = retiring_->page; libk::destroy_at(retiring_); retiring_ = nullptr;
         }
-        const mm::Page page = root->page;
-        libk::destroy_at(root);
-        auto backing = pages_.detach(page);
-        libk_assert(backing);
-        backing->reset();
+        auto backing = pages_.detach(page); libk_assert(backing); backing->reset();
+        { sync::Lock guard{lock_}; libk_assert(page_count_); --page_count_; }
     }
-    pages_.reset();
-    refund.reset();
+    if (retiring_) return;
+    pages_.reset(); charge_.reset();
     {
         sync::Lock guard{lock_};
-        libk_assert(releasing_);
-        releasing_ = false;
-        retired_ = true;
+        libk_assert(releasing_ && !page_count_);
+        releasing_ = false; retired_ = true;
     }
+    if (work_) work_->close(job_);
     complete_cleanup();
 }
 

@@ -1,4 +1,4 @@
-// Thread is a stable kernel execution object. Its home stack belongs only to it.
+// User execution keeps only its return frame; kernel threads own their stacks.
 
 #pragma once
 
@@ -7,17 +7,14 @@
 #include <cpu.hpp>
 #include <array>
 #include <cap/grant.hpp>
-#include <task/exit.hpp>
 #include <libk/delegate.hpp>
 #include <mm/kspace.hpp>
-#include <resource/sponsorship.hpp>
 #include <task/env.hpp>
 #include <libk/noncopyable.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
 #include <optional>
 #include <sched/sched.hpp>
-#include <mm/pager.hpp>
 #include <sync.hpp>
 #include <type_traits>
 #include <variant>
@@ -28,46 +25,31 @@
 
 class Thread;
 class Cpus;
-namespace ipc {
-class Notification;
-}
-class Completion;
 
 namespace sched {
 class Sc;
 class Dispatcher;
 } // namespace sched
-// A caller-owned interest in exit cleanup. Completion may destroy it.
-class Stop final {
-  public:
-    using Notifier = libk::delegate<void() noexcept>;
-    explicit Stop(Notifier notify = {}) noexcept : notify_(notify) {}
-    Stop(const Stop&) = delete;
-    auto operator=(const Stop&) -> Stop& = delete;
-    ~Stop() noexcept;
-
-    [[nodiscard]] auto started() const noexcept -> bool {
-        return phase_.load(std::memory_order_acquire) != Phase::Idle;
-    }
-    [[nodiscard]] auto complete() const noexcept -> bool {
-        return phase_.load(std::memory_order_acquire) == Phase::Complete;
-    }
-    void start(Thread&) noexcept;
-
-  private:
-    friend class Thread;
-
-    void finish(Thread&) noexcept;
-
-    Notifier notify_{};
-    Thread* target_{};
-    libk::intrusive_list_hook hook_{};
-    enum class Phase : u8 { Idle, Started, Complete };
-    std::atomic<Phase> phase_{Phase::Idle};
-};
-
 class Thread final : private libk::noncopyable_nonmovable {
   public:
+    class Exit final : private libk::noncopyable_nonmovable {
+        mutable sync::Spin lock_;
+        std::optional<status_t> status_;
+        Src<SOURCE_READY> events_;
+    public:
+        explicit Exit(Source::Drained drained = {}) noexcept : events_(drained) {}
+        auto read() const noexcept -> std::optional<status_t> { sync::Lock guard{lock_}; return status_; }
+        auto published() const noexcept -> bool { return read().has_value(); }
+        auto events() noexcept -> Source& { return events_; }
+        auto claim(status_t status) noexcept -> bool {
+            Source::Publication publication;
+            { sync::Lock guard{lock_};
+              if (status_) return false;
+              status_ = status; publication = events_.prepare(SOURCE_READY, true);
+            }
+            return true;
+        }
+    };
     enum class State : u8 { Prepared, Ready, Running, Throttled, Blocked, Exited };
 
     enum class Kind : u8 {
@@ -87,9 +69,8 @@ class Thread final : private libk::noncopyable_nonmovable {
 
     Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start,
            Kind kind = Kind::Normal) noexcept;
-    Thread(mm::Stack&& home_stack, Env&& roots, UserStart start, Kind kind = Kind::Normal) noexcept;
-    Thread(resource::Charge&& stack_charge, mm::Stack&& home_stack, Env&& roots, UserStart start,
-           Kind kind = Kind::Normal) noexcept;
+    Thread(Env&& roots, UserStart start) noexcept;
+    Thread(Env&& roots, KernelStart step, sched::Domain* payer = nullptr) noexcept;
     ~Thread() noexcept;
 
     [[nodiscard]] auto state() const noexcept -> State { sync::Lock guard{lock_}; return state_; }
@@ -98,7 +79,12 @@ class Thread final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto kind() const noexcept -> Kind { return kind_; }
     [[nodiscard]] auto idle() const noexcept -> bool { return kind_ == Kind::Idle; }
     [[nodiscard]] auto identity() const noexcept -> usize { return reinterpret_cast<usize>(this); }
-    [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return ctx_; }
+    [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return std::get<Kernel>(run_).ctx; }
+    auto payer() noexcept -> object::ref<>;
+    auto transient() const noexcept -> bool { return user() || kind_ == Kind::Worker; }
+    auto user() const noexcept -> bool { return std::holds_alternative<arch::TrapFrame>(run_); }
+    auto frame() noexcept -> arch::TrapFrame& { return std::get<arch::TrapFrame>(run_); }
+    void return_user() noexcept;
     [[nodiscard]] auto exit() noexcept -> Exit& { return exit_; }
     [[nodiscard]] auto exit() const noexcept -> const Exit& { return exit_; }
     [[nodiscard]] auto draining() const noexcept -> bool;
@@ -107,19 +93,24 @@ class Thread final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto stopped() const noexcept -> bool;
     [[nodiscard]] auto claim_home(sched::Dispatcher&) noexcept -> bool;
     [[nodiscard]] auto owned_by(const sched::Dispatcher&) const noexcept -> bool;
-    [[nodiscard]] auto try_bind(object::ref<sched::Sc>, u64 generation) noexcept -> bool;
+
     [[nodiscard]] auto home_cpu() const noexcept -> CpuId;
     [[nodiscard]] auto execution(bool enabled) noexcept -> std::optional<u64>;
+    auto migrate(Cpus&, CpuId, u64 epoch) noexcept -> std::expected<u64, status_t>;
     auto detach_resource(u64 generation) noexcept -> status_t;
+    void links(u64 cursor, LinkRecords& out) const noexcept { roots_.links(out, LINK_ROOT, cursor); }
     auto info(u64 now) const noexcept -> ThreadInfo;
-    auto observe(ipc::Notification&, u64 badge) noexcept -> bool;
+    auto events() noexcept -> Source& { return events_; }
+    void state_changed() noexcept;
+    auto await_authority(const cap::GrantLease&, std::span<const object::ref<>*>,
+        Source::Commit commit, Source::Action revoke, Source::Action ready) noexcept -> status_t;
     [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool {
-        return stack_.contains(address);
+        return !transient() && std::get<Kernel>(run_).stack->contains(address);
     }
     [[nodiscard]] auto env() noexcept -> Env& { return env_; }
     [[nodiscard]] auto env() const noexcept -> const Env& { return env_; }
-    [[nodiscard]] auto ipc_buffer() noexcept -> ipc::Buffer* { return env_.ipc_buffer(); }
-    [[nodiscard]] auto ipc_buffer() const noexcept -> const ipc::Buffer* {
+    [[nodiscard]] auto ipc_buffer() noexcept -> mm::View* { return env_.ipc_buffer(); }
+    [[nodiscard]] auto ipc_buffer() const noexcept -> const mm::View* {
         return env_.ipc_buffer();
     }
     [[nodiscard]] auto wait() noexcept -> Wait& { return wait_; }
@@ -130,9 +121,14 @@ class Thread final : private libk::noncopyable_nonmovable {
     void note_user_syscall() noexcept { ++user_syscalls_; }
     [[nodiscard]] auto user_syscalls() const noexcept -> u64 { return user_syscalls_; }
     [[nodiscard]] auto waiting() const noexcept -> bool { return wait().attached(); }
-    [[nodiscard]] auto begin_wait(Completion& relation, Cpus& cpus) noexcept -> bool;
+    [[nodiscard]] auto begin_wait(Cpus& cpus) noexcept -> bool;
     void cancel_wait() noexcept;
-    // Kernel calls retain their stack until all local transactions have drained.
+    void park(bool result) noexcept { libk_assert(waiting()); return_wait_ = result; }
+    auto wait_result() noexcept -> std::optional<WaitResult> {
+        libk_assert(!waiting());
+        return std::exchange(return_wait_, false) ? std::optional{wait_.result()} : std::nullopt;
+    }
+    // No provider may schedule until its local transactions have drained.
     void enter_kernel() noexcept {
         libk_assert(!in_kernel_);
         in_kernel_ = true;
@@ -142,71 +138,65 @@ class Thread final : private libk::noncopyable_nonmovable {
         in_kernel_ = false;
     }
     void block() noexcept;
-    // Terminal edge: every outstanding Pager service claim registered by this
-    // Thread returns to Published through the requeue owner path. Safe to
-    // call more than once; entries clear as they are invalidated.
-    [[nodiscard]] auto claims() noexcept -> Pager::Claims& { return claims_; }
     void stop() noexcept;
     void retire(object::cleanup&&) noexcept;
-    void bind_work(WorkQueue& work) noexcept { work_ = &work; }
+    void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; finalizer_.bind(owner); roots_.bind(owner); interest_.bind(owner); events_.bind_work(work, owner); exit_.events().bind_work(work, owner); }
 
   private:
+    friend class Wait;
     friend class sched::Dispatcher;
     friend class sched::Sc;
-    friend class Stop;
+    friend class sched::Domain;
+    auto can_bind(const sched::Sc&) const noexcept -> bool;
+    void bind(object::ref<sched::Sc>, u64 generation) noexcept;
 
     [[noreturn]] static void start(void* argument) noexcept;
-    void request_stop(Stop& request) noexcept;
+    void request_stop() noexcept;
     void finish(status_t status) noexcept;
     void finalize() noexcept;
     WorkQueue* work_{};
     Work finalizer_{Work::Fn::bind<&Thread::finalize>(*this)};
     status_t terminal_status_{};
 
-    struct Root {
-        Root(Thread& owner) noexcept : owner(&owner), cap(this, grant_ops_) {}
-        Thread* owner;
-        cap::GrantAttachment cap;
-        cap::GrantWork work{};
-        Root* next{};
-        enum class Phase : u8 { Idle, Attached, Detaching };
-        Phase phase{Phase::Idle};
-    };
-    // Foreign detach/stop/work callbacks may synchronously complete cleanup.
-    // Keep the entity resident until the entire publishing call has returned.
-    class Flight {
-      public:
-        explicit Flight(Thread&) noexcept;
-        ~Flight() noexcept;
-        Flight(const Flight&) = delete;
-        auto operator=(const Flight&) -> Flight& = delete;
-
-      private:
-        Thread& owner_;
-    };
-    static const cap::GrantAttachmentOps grant_ops_;
-    void detach(Root&) noexcept;
-    void released(Root&) noexcept;
-    void invalidate(Root&, cap::GrantWork&&) noexcept;
-    void close_grants() noexcept;
-    void finish_retire() noexcept;
+    void post_finalize() noexcept { if (work_) work_->post(finalizer_); else finalize(); }
+    void sources_drained() noexcept { post_finalize(); }
 
     void set_state(State) noexcept;
-    void prepare(usize top) noexcept;
     void complete() noexcept;
 
-    resource::Charge stack_charge_{};
-    mm::Stack stack_;
-    arch::Ctx ctx_{};
+    // Prepaid short observation authority, separate from environment roots.
+    class Interest {
+        Thread& owner_;
+        mutable sync::Spin lock_;
+        Source::Action revoke_, ready_;
+        bool active_{};
+        cap::Authority<1, false, true> authority_{
+            Source::Action::bind<&Interest::invalidate>(*this), Source::Action::bind<&Interest::complete>(*this)};
+        void invalidate() noexcept;
+        void complete() noexcept;
+        void end() noexcept { static_cast<void>(authority_.close()); }
+    public:
+        explicit Interest(Thread& owner) noexcept : owner_(owner) {}
+        ~Interest() noexcept { libk_assert(!active_); }
+        void bind(object::Key key) noexcept { authority_.bind(key); }
+        auto admit(const cap::GrantLease&, std::span<const object::ref<>*>,
+            Source::Commit, Source::Action, Source::Action) noexcept -> status_t;
+    } interest_{*this};
+
+    struct Kernel { std::optional<mm::Stack> stack; arch::Ctx ctx; KernelStart start; };
+    std::variant<Kernel, arch::TrapFrame> run_;
     Env env_;
     State state_{State::Prepared};
     sched::Sc* sc_{};
     object::ref<sched::Sc> resource_{}, pending_sc_{};
     bool detach_sc_{};
-    sched::Dispatcher* home_{};
-    libk::intrusive_tree_hook ready_hook_{};
+    std::atomic<sched::Dispatcher*> home_{};
+    sched::Dispatcher* destination_{};
+    std::optional<u64> wait_when_;
+    u64 home_epoch_{};
+    bool transferred_{};
+    sched::Node ready_{.thread = this};
     libk::intrusive_list_hook maintenance_hook_{};
-    u64 service_{}, enqueue_seq_{};
     libk::intrusive_list_hook mail_hook_{};
     sched::Deadline refill_{sched::Deadline::Fn::bind<&Thread::refill>(*this)};
     void refill() noexcept;
@@ -214,32 +204,24 @@ class Thread final : private libk::noncopyable_nonmovable {
     std::atomic<bool> mailed_{};
     bool wake_credit_{};
     bool enabled_{}, applied_enabled_{};
-    ipc::NotificationSource changed_{};
+    Src<THREAD_ENABLED | THREAD_APPLIED | THREAD_MIGRATING | THREAD_BOUND | THREAD_STOPPING | THREAD_STOPPED> events_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     u64 requested_{}, applied_{};
     u64 runtime_{}, accounted_at_{};
     CpuId cpu_{};
     u64 association_{};
     mutable sync::Spin lock_{};
-    libk::intrusive_list<Stop, &Stop::hook_> stops_{};
     bool stopping_{};
     bool stopped_{};
 
-    std::array<Root, 2> roots_;
-    Root* grants_{};
-    void unlink(Root&) noexcept;
-    mutable sync::Spin grants_lock_{};
-    Stop revoke_;
+    cap::Authority<2> roots_{cap::Authority<2>::Action::bind<&Thread::stop>(*this),
+        cap::Authority<2>::Action::bind<&Thread::post_finalize>(*this)};
+    std::optional<cap::Authority<2>::Hold> mail_hold_;
     object::cleanup cleanup_{};
-    usize publishers_{};
-    bool attaching_{};
-    bool grants_closed_{};
-    bool revoking_{};
-    Exit exit_{};
-    std::variant<KernelStart, UserStart> start_;
+    Exit exit_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     Kind kind_{Kind::Normal};
+    sched::Domain* work_domain_{};
     Wait wait_{};
-    bool in_kernel_{};
-    Pager::Claims claims_{};
+    bool in_kernel_{}, return_wait_{};
     u64 user_syscalls_{};
 };
 

@@ -1,12 +1,12 @@
 #include <mm/pager.hpp>
 #include <mm/mem.hpp>
-#include <ipc/notification.hpp>
+#include <uapi/ipc.h>
 #include <limits>
 #include <utility>
 
 Pager::~Pager() noexcept {
     libk_assert((state_ == State::Open || state_ == State::Closed) && ready_.empty() &&
-                claimed_.empty() && replies_ == 0 && !source_.attached() && !cleanup_ &&
+                claimed_.empty() && replies_ == 0 && !cleanup_ &&
                 pins_.load(std::memory_order_relaxed) == 0);
 }
 
@@ -34,9 +34,29 @@ void Pager::unpin() noexcept {
         sync::Lock guard{lock_};
         const auto n = pins_.fetch_sub(1, std::memory_order_acq_rel);
         libk_assert(n);
-        if (n == 1 && state_ == State::Closed) cleanup = std::move(cleanup_);
+        if (n == 1 && state_ == State::Closed && events_.drained()) cleanup = std::move(cleanup_);
     }
-    if (cleanup) cleanup.complete();
+    if (cleanup) { work_->close(job_); cleanup.complete(); }
+}
+
+void Pager::complete_cleanup() noexcept {
+    object::cleanup cleanup;
+    {
+        sync::Lock guard{lock_};
+        if (state_ != State::Closed || pins_.load(std::memory_order_acquire) || !events_.drained()) return;
+        cleanup = std::move(cleanup_);
+    }
+    if (cleanup) { work_->close(job_); cleanup.complete(); }
+}
+
+void Pager::refresh() noexcept {
+    Source::Publication publication;
+    {
+        sync::Lock guard{lock_};
+        const u64 bits = (ready_.empty() ? 0 : SOURCE_READY)
+            | (state_ == State::Forced || state_ == State::Closed ? SOURCE_TERMINAL : 0);
+        if (events_.snapshot().value != bits) publication = events_.prepare(bits, true);
+    }
 }
 
 auto Pager::enqueue(Request &r, Req info) noexcept -> bool {
@@ -58,15 +78,7 @@ auto Pager::active(const Request &r) const noexcept -> bool {
 }
 
 void Pager::signal() noexcept {
-    (void)source_.signal();
-}
-
-void Pager::unlink_worker(Request &r) noexcept {
-    if (auto *w = r.worker) {
-        sync::Lock guard{w->lock_};
-        w->list_.erase(r);
-        r.worker = nullptr;
-    }
+    refresh();
 }
 
 auto Pager::take(Request &r) noexcept -> Reply {
@@ -74,12 +86,11 @@ auto Pager::take(Request &r) noexcept -> Reply {
         claimed_.erase(r);
     else
         ready_.erase(r);
-    unlink_worker(r);
     ++replies_;
     return Reply{r};
 }
 
-auto Pager::claim(Claims *worker) noexcept -> std::expected<Req, Error> {
+auto Pager::claim(cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept -> std::expected<Req, Error> {
     Pin pin{*this};
     sync::Lock guard{lock_};
     if (state_ == State::Forced || state_ == State::Closed) return std::unexpected(Error::Closed);
@@ -87,14 +98,11 @@ auto Pager::claim(Claims *worker) noexcept -> std::expected<Req, Error> {
     if (next_id_ == std::numeric_limits<u64>::max())
         return std::unexpected(Error::GenerationExhausted);
     auto &r = ready_.front();
-    ready_.erase(r);
-    r.info.id = ++next_id_;
-    claimed_.push_back(r);
-    if (worker) {
-        sync::Lock claims{worker->lock_};
-        r.worker = worker;
-        worker->list_.push_back(r);
-    }
+    if (authority.publish(gates, [&] noexcept {
+        ready_.erase(r);
+        r.info.id = ++next_id_;
+        claimed_.push_back(r);
+    }) != STATUS_OK) return std::unexpected(Error::Closed);
     return r.info;
 }
 
@@ -107,18 +115,23 @@ auto Pager::reply(u64 id, mm::Mem *mem) noexcept -> std::expected<Reply, Error> 
     return std::unexpected(Error::Stale);
 }
 
-auto Pager::Reply::commit() noexcept -> std::expected<void, Error> {
+auto Pager::Reply::commit(cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates, Source::Action commit, bool fail) noexcept -> std::expected<void, Error> {
     if (!*this) return std::unexpected(Error::Stale);
-    auto d = h_.release();
-    {
-        sync::Lock guard{d.pager->lock_};
-        libk_assert(d.request->pager == d.pager && !d.request->route.is_linked());
+    auto d = h_.get();
+    sync::Lock guard{d.pager->lock_};
+    libk_assert(d.request->pager == d.pager && !d.request->route.is_linked());
+    if (!fail && (d.pager->state_ == State::Forced || d.pager->state_ == State::Closed))
+        return std::unexpected(Error::Closed);
+    if (authority.publish(gates, [&] noexcept {
+        if (commit) commit();
         d.request->pager = nullptr;
         d.request = nullptr;
         libk_assert(d.pager->replies_);
         --d.pager->replies_;
         d.pager->settle();
-    }
+    }) != STATUS_OK) return std::unexpected(Error::Closed);
+    (void)h_.release();
     h_ = libk::unique_handle<Data, Drop, Data>{d};
     return {};
 }
@@ -161,74 +174,31 @@ void Pager::dispose(Reply::Data &d) noexcept {
     unpin(); // May free Pager; no member perms follows.
 }
 
-auto Pager::requeue(u64 id) noexcept -> std::expected<void, Error> {
-    auto r = reply(id);
-    if (!r) return std::unexpected(r.error());
-    return r->abort();
+auto Pager::requeue(u64 id, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates) noexcept -> std::expected<void, Error> {
+    Pin pin{*this};
+    sync::Lock guard{lock_};
+    for (auto& r : claimed_) {
+        if (!id || r.info.id != id) continue;
+        if (authority.publish(gates, [&] noexcept {
+            claimed_.erase(r);
+            r.info.id = 0;
+            ready_.push_back(r);
+        }) != STATUS_OK) return std::unexpected(Error::Closed);
+        return {};
+    }
+    return std::unexpected(Error::Stale);
 }
 
-void Pager::abandon(Request &r, u64 id, Claims &worker) noexcept {
-    bool queued{};
+void Pager::cancel(Request& request) noexcept {
+    Pin pin{*this};
+    Reply reply;
     {
         sync::Lock guard{lock_};
-        if (r.pager != this || r.info.id != id || r.worker != &worker) return;
-        claimed_.erase(r);
-        unlink_worker(r);
-        r.info.id = 0;
-        ready_.push_back(r);
-        queued = true;
+        // A detached Reply already owns the request until its real exit.
+        if (request.pager == this && request.route.is_linked()) reply = take(request);
     }
-    if (queued) signal();
-}
-
-auto Pager::Claims::empty() const noexcept -> bool {
-    sync::Lock guard{lock_};
-    return list_.empty();
-}
-
-void Pager::Claims::release() noexcept {
-    for (;;) {
-        Request *r;
-        Pager *p;
-        mm::Mem *m;
-        u64 id;
-        {
-            sync::Lock guard{lock_};
-            if (list_.empty()) return;
-            r = &list_.front();
-            p = r->pager;
-            m = r->mem;
-            id = r->info.id;
-            // Completion needs this list lock to unlink, so both storage and
-            // transport are still pinned while we acquire the exit-walk borrow.
-            m->request_pin();
-            p->pin();
-        }
-        p->abandon(*r, id, *this);
-        m->request_drop();
-        p->unpin();
-    }
-}
-
-void Pager::cancel(mm::Mem &mem) noexcept {
-    Pin pin{*this};
-    for (;;) {
-        Reply r;
-        {
-            sync::Lock guard{lock_};
-            for (auto *list : {&ready_, &claimed_}) {
-                for (auto &candidate : *list) {
-                    if (candidate.mem == &mem) {
-                        r = take(candidate);
-                        break;
-                    }
-                }
-                if (r) break;
-            }
-        }
-        if (!r) return;
-        mem.cancel_request(r);
-    }
+    if (reply) reply.mem()->cancel_request(reply);
 }
 
 auto Pager::close(bool force) noexcept -> bool {
@@ -240,10 +210,9 @@ auto Pager::close(bool force) noexcept -> bool {
             state_ = State::Forced;
         else if (state_ == State::Open)
             state_ = State::Closing;
-        source_.reset();
         settle();
     }
-    for (;;) {
+    for (usize step = 0; step < 8; ++step) {
         Reply r;
         {
             sync::Lock guard{lock_};
@@ -259,6 +228,15 @@ auto Pager::close(bool force) noexcept -> bool {
         }
         r.mem()->cancel_request(r);
     }
+    bool more{}, done{};
+    {
+        sync::Lock guard{lock_};
+        settle();
+        done = state_ == State::Closed;
+        more = state_ == State::Forced && (!ready_.empty() || !claimed_.empty());
+    }
+    if (more) { libk_assert(work_); work_->post(job_); }
+    return done;
 }
 
 void Pager::retire(object::cleanup &&cleanup) noexcept {
@@ -268,26 +246,6 @@ void Pager::retire(object::cleanup &&cleanup) noexcept {
         libk_assert(!cleanup_);
         cleanup_ = std::move(cleanup);
     }
+    events_.close();
     (void)close(true);
-}
-
-auto Pager::bind(ipc::Notification &n, u64 badge) noexcept -> std::expected<void, Error> {
-    Pin pin{*this};
-    if (!badge) return std::unexpected(Error::InvalidRange);
-    bool ready;
-    {
-        sync::Lock guard{lock_};
-        if (state_ != State::Open || !n.bind(source_, badge)) return std::unexpected(Error::Busy);
-        ready = !ready_.empty();
-    }
-    if (ready) signal();
-    return {};
-}
-
-auto Pager::unbind() noexcept -> bool {
-    Pin pin{*this};
-    sync::Lock guard{lock_};
-    const bool attached = source_.attached();
-    source_.reset();
-    return attached;
 }

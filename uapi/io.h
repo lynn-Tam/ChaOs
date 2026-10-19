@@ -13,7 +13,9 @@ struct IommuConfig {
     uint32_t source, device_bits;
 };
 
-// Map/unmap are asynchronous. READY acknowledges the last edit; CLOSED
-// acknowledges DMA retirement, not device reset or interconnect quiescence.
-// Unmap consumes exactly a previously submitted IOVA range.
-// Map with IOVA=0 allocates a gap; the result returns its IOVA with PENDING.
+// Each accepted edit returns an owned Op. Map with address=0 allocates a gap;
+// its Done result returns the IOVA. Unmap consumes exactly a prior map range.
+// Close is a prepaid coalesced intent; CLOSED proves DMA retirement, not reset.
+#define IO_OP_MAP 1U
+#define IO_OP_UNMAP 2U
+struct IoReq { cap_t memory; uint64_t page, count, address, perms; };

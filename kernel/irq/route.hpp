@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sync.hpp>
+#include <wait.hpp>
 #include <libk/intrusive_list.hpp>
 
 namespace irq {
@@ -18,8 +19,9 @@ struct Line final {
 // reset drains dispatch before returning; handlers cannot reenter Routes.
 class Route final : private libk::noncopyable_nonmovable {
 public:
-    using Stop = libk::delegate<void() noexcept>;
-    using Handler = libk::delegate<bool() noexcept>;
+    using Stop = libk::delegate<Source::Publication() noexcept>;
+    using Delivery = std::pair<bool, Source::Publication>;
+    using Handler = libk::delegate<Delivery() noexcept>;
     Route(Line line, Handler handler, Stop stop = {}) noexcept
         : line_(line), handler_(handler), stop_(stop) {}
     ~Route() noexcept { reset(); }
@@ -35,7 +37,7 @@ private:
     Handler handler_;
     Stop stop_;
     libk::intrusive_list_hook hook_{};
-    bool armed_{};
+    bool armed_{}, stopped_{};
 };
 
 class Routes final : private libk::noncopyable_nonmovable {

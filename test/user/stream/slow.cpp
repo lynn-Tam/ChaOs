@@ -16,7 +16,7 @@ struct output {
 // A paced byte counter; optional LIMIT exits before EOF.
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
-    if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, 0,
+    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, 0,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
     if (argc < 2 || argc > 3) return STATUS_BAD_ARGS;

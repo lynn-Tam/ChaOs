@@ -31,10 +31,19 @@ constinit libk::manual_lifetime<mm::Pmm> vspace_test_pmm{};
 constinit libk::manual_lifetime<mm::KSpace> vspace_test_kernel{};
 constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> vspace_test_mm{};
 constinit libk::manual_lifetime<WorkQueue> vspace_work{};
-constinit libk::manual_lifetime<object::pool<object::group>> vspace_test_groups{};
+constinit libk::manual_lifetime<object::pool<resource::Account>> vspace_test_groups{};
 constinit libk::manual_lifetime<object::pool<cap::CSpace>> vspace_test_cspaces{};
 
 
+
+static auto settled(mm::VSpace& space, std::expected<mm::VmStatus, mm::VSpaceError> result) noexcept
+    -> std::expected<mm::VmStatus, mm::VSpaceError> {
+    if (result) {
+        while (vspace_work->run(8)) {}
+        if (!space.pending()) return mm::VmStatus::Complete;
+    }
+    return result;
+}
 
 class VSpaceFixture final : private libk::noncopyable_nonmovable {
 public:
@@ -116,7 +125,7 @@ public:
     [[nodiscard]] auto map(
         mm::VRange range,
         mm::ObjectRange object,
-        mm::Perms access) noexcept
+        mm::Perms access, bool private_write = false) noexcept
         -> std::expected<mm::MapResult, mm::VSpaceError> {
         auto reference = object::ref<>{memory_};
         if (!reference) {
@@ -124,7 +133,7 @@ public:
         }
         return space_->map(
             context(),
-            mm::MapReq{range, object, access},
+            mm::MapReq{range, object, access, private_write},
             std::move(reference),
             memory_.get(),
             memory_authority(memory_.get().page_count()));
@@ -251,10 +260,10 @@ bool test_semantic_map_protect_and_arbitrary_unmap(
     }
     const mm::VRange middle{
         mm::va_t{0x21000}, 2 * mm::page_size};
-    auto protected_result = fixture.space().protect(
+    auto protected_result = settled(fixture.space(), fixture.space().protect(
         fixture.context(),
         middle,
-        mm::Perms::of(mm::Perm::Read));
+        mm::Perms::of(mm::Perm::Read)));
     if (!protected_result
         || protected_result.value() != mm::VmStatus::Complete) {
         return false;
@@ -264,11 +273,13 @@ bool test_semantic_map_protect_and_arbitrary_unmap(
     auto ready = fixture.space().fault(
         fixture.context(), mm::va_t{0x21000}, mm::Perm::Read);
     if (!denied || denied.value().kind != mm::FaultKind::AccessDenied
-        || !ready || ready.value().kind != mm::FaultKind::Ready) {
+        || !ready || ready.value().kind != mm::FaultKind::Materialized) {
         return false;
     }
-    auto unmapped = fixture.space().unmap(
-        fixture.context(), whole);
+    auto resident = fixture.space().fault(fixture.context(), mm::va_t{0x21000}, mm::Perm::Read);
+    if (!resident || resident->kind != mm::FaultKind::Ready) return false;
+    auto unmapped = settled(fixture.space(), fixture.space().unmap(
+        fixture.context(), whole));
     auto absent = fixture.space().fault(
         fixture.context(), mm::va_t{0x22000}, mm::Perm::Read);
     return unmapped && unmapped.value() == mm::VmStatus::Complete
@@ -296,13 +307,36 @@ bool test_lazy_fault_materialization_and_split_unmap(
         || materialized.value().status != mm::VmStatus::Complete) {
         return false;
     }
-    auto unmapped = fixture.space().unmap(
+    auto unmapped = settled(fixture.space(), fixture.space().unmap(
         fixture.context(),
-        mm::VRange{mm::va_t{0x40000}, mm::page_size});
+        mm::VRange{mm::va_t{0x40000}, mm::page_size}));
     auto second = fixture.space().fault(
         fixture.context(), mm::va_t{0x41000}, mm::Perm::Write);
     return unmapped && unmapped.value() == mm::VmStatus::Complete
         && second && second.value().kind == mm::FaultKind::Materialized;
+}
+
+bool test_batched_edit(const TestContext&) noexcept {
+    VSpaceFixture fixture;
+    if (!fixture.initialize(false, 24)) return false;
+    const mm::va_t base{0x60000};
+    const auto access = mm::Perms::of(mm::Perm::Read, mm::Perm::Write);
+    for (usize i = 0; i < 12; ++i) {
+        const mm::va_t address{base.raw() + i * 2 * mm::page_size};
+        if (!fixture.map({address, 2 * mm::page_size}, {i * 2, 2}, access)) return false;
+        const auto fault = fixture.space().fault(fixture.context(), address, mm::Perm::Write);
+        if (!fault || fault->kind != mm::FaultKind::Materialized) return false;
+    }
+    const mm::VRange whole{base, 24 * mm::page_size};
+    if (!settled(fixture.space(), fixture.space().protect(fixture.context(), whole, mm::Perms::of(mm::Perm::Read))))
+        return false;
+    for (usize i = 0; i < 12; ++i) {
+        const auto denied = fixture.space().fault(fixture.context(), mm::va_t{base.raw() + i * 2 * mm::page_size}, mm::Perm::Write);
+        if (!denied || denied->kind != mm::FaultKind::AccessDenied) return false;
+    }
+    if (!settled(fixture.space(), fixture.space().unmap(fixture.context(), whole))) return false;
+    const auto absent = fixture.space().fault(fixture.context(), base, mm::Perm::Read);
+    return absent && absent->kind == mm::FaultKind::NoMapping && !fixture.space().pending();
 }
 
 bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noexcept {
@@ -329,7 +363,7 @@ bool test_mapping_during_page_in_joins_existing_request(const TestContext&) noex
     const VRange ranges[]{ {va_t{0x40000}, page_size}, {va_t{0x50000}, page_size} };
     auto cleanup = libk::on_scope_exit([&]() noexcept {
         for (const auto range : ranges)
-            (void)fixture.space().unmap(fixture.context(), range);
+            (void)settled(fixture.space(), fixture.space().unmap(fixture.context(), range));
         libk_assert(memory.destroy());
         memory.reset();
 
@@ -393,7 +427,6 @@ bool test_capability_mapping_revokes_after_hardware_retirement(
         return false;
     }
     cap::GrantKey key{};
-    cap::GrantRevoke completion{};
     libk::scope_exit drained{[&]() noexcept { fixture.run_work(); }};
     {
         auto resolved = cspace.resolve<mm::Mem>(
@@ -412,17 +445,17 @@ bool test_capability_mapping_revokes_after_hardware_retirement(
                 mm::Perms::of(mm::Perm::Read)},
             resolved.value());
         if (!mapped
-            || !graph.invalidate(key, completion)
-            || completion.complete()) {
+            || graph.close(key).status != STATUS_PENDING
+            || (graph.status(key).value == STATE_DRAINED)) {
             return false;
         }
         fixture.run_work();
-        if (completion.complete()) {
+        if ((graph.status(key).value == STATE_DRAINED)) {
             return false;
         }
     }
     fixture.run_work();
-    const bool revoked = completion.complete();
+    const bool revoked = (graph.status(key).value == STATE_DRAINED);
     const bool closed = static_cast<bool>(cspace.close(inserted.value()));
     cspace.retire();
     fixture.run_work();
@@ -471,8 +504,7 @@ bool test_memory_retire_invalidates_mapping_projection(
         mm::Perms::of(mm::Perm::Read));
     if (!mapped
         || fixture.memory().attachment_count() != 1
-        || !fixture.retire_memory()
-        || fixture.memory().state() != mm::MemState::Stopping) {
+        || !fixture.retire_memory()) {
         return false;
     }
     fixture.run_work();
@@ -505,10 +537,11 @@ bool test_root_close_waits_for_env(
             || fixture.space().binding_count() != 1
             || fixture.cspace().binding_count() != 1
             || !fixture.retire_space()
-            || !fixture.retire_cspace()
-            || fixture.space().state() != mm::VSpaceState::Stopping) {
+            || !fixture.retire_cspace()) {
             return false;
         }
+        fixture.run_work();
+        if (fixture.space().state() != mm::VSpaceState::Stopping) return false;
         // Closing roots still support lifetime pins, but reject new bindings.
         auto held_vm = fixture.space_ref();
         auto held_caps = fixture.cspace_ref();
@@ -521,6 +554,15 @@ bool test_root_close_waits_for_env(
         && fixture.space().binding_count() == 0
         && fixture.cspace().binding_count() == 0
         && fixture.cspace().table_pages() == 0;
+}
+
+bool test_ipc_binding_rejects_cow(const TestContext&) noexcept {
+    VSpaceFixture fixture;
+    if (!fixture.initialize(true, 1) || !fixture.memory().seal()) return false;
+    const mm::VRange range{mm::va_t{0xc0000}, mm::page_size};
+    if (!fixture.map(range, {0, 1}, mm::Perms::of(mm::Perm::Read, mm::Perm::Write), true)) return false;
+    auto view = fixture.space().bind_view({.memory = fixture.memory_ref(), .object = {0, 1}, .virtual_range = range});
+    return !view && view.error() == mm::VSpaceError::InvalidMapping;
 }
 
 bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
@@ -546,42 +588,44 @@ bool test_ipc_binding_is_validated_and_invalidated_with_mapping(
         if (!vspace || !cspace || !memory) {
             return false;
         }
-        auto ipc = ipc::Buffer::bind(
-            fixture.pmm(),
-            fixture.space(),
-            std::move(memory),
-            fixture.memory(),
-            mm::ObjectRange{0, 1},
-            mm::VRange{whole.base(), mm::page_size});
+        auto ipc = fixture.space().bind_view({.memory = std::move(memory), .object = mm::ObjectRange{0, 1},
+            .virtual_range = mm::VRange{whole.base(), mm::page_size}});
         if (!ipc) {
             return false;
         }
         auto binding = Env::user(
             std::move(vspace),
             std::move(cspace),
-            std::optional<ipc::Buffer>{
+            std::optional<mm::View>{
                 std::move(ipc).value()});
         if (!binding || binding.value().ipc_buffer() == nullptr
             || !binding.value().ipc_buffer()->valid()) {
             return false;
         }
-        auto protected_result = fixture.space().protect(
+        auto protected_result = settled(fixture.space(), fixture.space().protect(
             fixture.context(),
             mm::VRange{whole.base(), mm::page_size},
-            mm::Perms::of(mm::Perm::Read));
-        auto unmapped = fixture.space().unmap(
+            mm::Perms::of(mm::Perm::Read)));
+        auto unmapped = settled(fixture.space(), fixture.space().unmap(
             fixture.context(),
-            mm::VRange{whole.base(), mm::page_size});
+            mm::VRange{whole.base(), mm::page_size}));
         // Splitting away the unborrowed tail keeps the IPC backing stable.
-        auto tail = fixture.space().unmap(fixture.context(),
-            mm::VRange{mm::va_t{whole.base().raw()+mm::page_size},mm::page_size});
+        auto tail = settled(fixture.space(), fixture.space().unmap(fixture.context(),
+            mm::VRange{mm::va_t{whole.base().raw()+mm::page_size},mm::page_size}));
         if (!tail || *tail != mm::VmStatus::Complete || !binding->ipc_buffer()->valid()) return false;
+        auto copying = binding->ipc_buffer()->access();
+        if (!copying) return false;
         if (protected_result
             || protected_result.error() != mm::VSpaceError::Busy
             || unmapped || unmapped.error() != mm::VSpaceError::Busy
             || !fixture.retire_memory()) {
             return false;
         }
+        fixture.run_work();
+        const byte value{0x42};
+        if (binding->ipc_buffer()->valid() || !fixture.space().pending()
+            || !copying->write(0, {&value, 1})) return false;
+        copying.reset(); // The real final copy, not Buffer destruction, resumes retirement.
         fixture.run_work();
         invalidated = !fixture.space().pending()
             && !binding.value().ipc_buffer()->valid()
@@ -628,7 +672,7 @@ bool test_sponsored_table_capacity_follows_retirement(
             - mm::page_size,
     };
     if (pool->available() != root_baseline
-        || pool->sponsorship_count() != 1) {
+        || pool->info(0).allocations != 1) {
         return false;
     }
 
@@ -657,11 +701,11 @@ bool test_sponsored_table_capacity_follows_retirement(
         return false;
     }
 
-    auto unmapped = space->unmap(
-        fixture.context(), range);
+    auto unmapped = settled(space.get(), space->unmap(
+        fixture.context(), range));
     if (!unmapped || unmapped.value() != mm::VmStatus::Complete
         || pool->available() != root_baseline
-        || pool->sponsorship_count() != 1) {
+        || pool->info(0).allocations != 1) {
         return false;
     }
 
@@ -674,8 +718,8 @@ bool test_sponsored_table_capacity_follows_retirement(
     while (vspace_work->run()) {}
 
 
-    if (pool->available() != limit || pool->sponsorship_count() != 0
-        || pool->close() != object::group::phase::closed
+    if (pool->available() != limit || pool->info(0).allocations != 0
+        || pool->close() != resource::Account::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -710,8 +754,8 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
         failed = !space && space.error() == mm::VSpaceError::ResourceExhausted;
     }
     while (vspace_work->run()) {}
-    const bool refunded = pool->available() == limit && pool->sponsorship_count() == 0;
-    const bool closed = pool->close() == object::group::phase::closed && pool.destroy();
+    const bool refunded = pool->available() == limit && pool->info(0).allocations == 0;
+    const bool closed = pool->close() == resource::Account::Phase::Drained && pool.destroy();
     pool.reset();
 
     return failed && refunded && closed && fixture.pmm().verify_invariants();
@@ -720,6 +764,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
 } // namespace
 
 void register_vspace_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("vspace", "owned edits drain multiple layout and PTE batches", test_batched_edit);
     (void)registry.add("vspace", "failed private root initialization drains and refunds", test_private_creation_refunds_failed_root);
     (void)registry.add(
         "vspace",
@@ -747,6 +792,7 @@ void register_vspace_tests(TestRegistry& registry) noexcept {
         "vspace",
         "root cleanup drains effective execution bindings",
         test_root_close_waits_for_env);
+    (void)registry.add("vspace", "IPC binding rejects private COW backing", test_ipc_binding_rejects_cow);
     (void)registry.add(
         "vspace",
         "IPC binding blocks normal edits and follows strong invalidation",

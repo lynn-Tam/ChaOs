@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
         check(zeroed[i] == 0);
         zeroed[i] = (i + 7) % 251;
     }
-    const auto pool = info.pool;
+    const auto pool = info.alloc();
     const auto vspace = info.vspace;
     auto stress = vm_area::create(pool, vspace, 0x28000000, 4096);
     auto release = vm_area::create(pool, vspace, 0x28003000, 4096);
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         const auto deadline = rt_after_ms(*duration);
         check(static_cast<bool>(deadline));
         str_writer{info.selector(rt_stdout)}.write("[demand] holding private pages\n");
-        check(sys::notification_wait(info.events, *deadline).status ==
+        check(ev_wait(info.events, *deadline).status ==
               STATUS_TIMED_OUT);
         check(initialized[0] == *seed && zeroed[0] == static_cast<uint8_t>(*seed + 7));
     }

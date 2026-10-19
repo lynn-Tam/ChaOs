@@ -20,23 +20,23 @@ int main(int argc, char** argv) {
     constexpr uintptr_t base = 0x30010000;
     auto region = sys::vm_slice(vspace, base, 4096, VM_READ | VM_WRITE, RIGHT_MAP);
     if (region.status != STATUS_OK) sys::exit(region.status);
-    if (const auto rc = sys::vm_map(region.value, device, base, 4096, 0, VM_READ | VM_WRITE).status;
+    if (const auto rc = vm_call(region.value, VM_OP_MAP, {device, base, 4096, 0, VM_READ | VM_WRITE});
         rc != STATUS_OK)
         sys::exit(rc);
-    if (const auto rc = sys::irq_bind(irq, events, rt_event_badge).status; rc != STATUS_OK)
+    if (const auto rc = sys::irq_set(irq, true).status; rc != STATUS_OK)
         sys::exit(rc);
-    const auto readable = sys::channel_bind(output, events, CHANNEL_READABLE);
-    const auto writable = sys::channel_bind(input, events, CHANNEL_WRITABLE);
+    const auto readable = sys::port_watch(events, output, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_READ);
+    const auto writable = sys::port_watch(events, input, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_WRITE);
     if (readable.status != STATUS_OK) sys::exit(readable.status);
     if (writable.status != STATUS_OK) sys::exit(writable.status);
+    const auto interrupt = sys::port_watch(events, irq, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_READ);
+    if (interrupt.status != STATUS_OK) sys::exit(interrupt.status);
     uart_port port{base + *offset};
     port.enable_rx();
     port.write("uart: console ready\n");
     bool line_start = true;
     msg_frame pending{};
     bool pending_valid{};
-    uint64_t read_sequence = 0;
-    uint64_t write_sequence = 0;
     for (;;) {
         // Bound each drain so sustained output cannot starve receive/IRQ ack.
         for (unsigned count = 0; count < 16; ++count) {
@@ -45,7 +45,6 @@ int main(int argc, char** argv) {
             if (result.status == STATUS_WOULD_BLOCK || result.status == STATUS_BUSY)
                 break;
             if (result.status != STATUS_OK) sys::exit(result.status);
-            read_sequence = result.value;
             if (message.operation == static_cast<uint64_t>(con_operation::Prompt)) {
                 if (!line_start) {
                     port.put('\n');
@@ -69,7 +68,6 @@ int main(int argc, char** argv) {
         if (pending_valid) {
             const auto result = msg_send(input, pending, false);
             if (result.status == STATUS_OK) {
-                write_sequence = result.value;
                 pending = {};
                 pending_valid = false;
             } else if (result.status != STATUS_WOULD_BLOCK && result.status != STATUS_BUSY) {
@@ -90,14 +88,15 @@ int main(int argc, char** argv) {
             if (port.rx_ready())
                 continue;
         }
-        if (const auto rc = sys::channel_arm(output, readable.value, read_sequence).status;
+        if (const auto rc = sys::port_arm(events, readable.value).status;
             rc != STATUS_OK)
             sys::exit(rc);
         if (pending_valid)
-            if (const auto rc = sys::channel_arm(input, writable.value, write_sequence).status;
+            if (const auto rc = sys::port_arm(events, writable.value).status;
                 rc != STATUS_OK)
                 sys::exit(rc);
-        if (const auto rc = sys::notification_wait(events).status; rc != STATUS_OK)
+        if (const auto rc = sys::port_arm(events, interrupt.value).status; rc != STATUS_OK) sys::exit(rc);
+        if (const auto rc = ev_wait(events).status; rc != STATUS_OK)
             sys::exit(rc);
     }
 }

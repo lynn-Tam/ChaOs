@@ -291,7 +291,7 @@ int main(int argc, char** argv) {
     const auto& env = rt_startup();
     auto directory = env.selector(vfs_service);
     if (!directory) directory = env.selector(vfs_read);
-    if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, directory,
+    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, directory,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
     if (argc != 2) return STATUS_BAD_ARGS;

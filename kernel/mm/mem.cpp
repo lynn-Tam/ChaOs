@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cpu/cpu.hpp>
 #include <expected>
 #include <mm/mem.hpp>
 #include <task/thread.hpp>
@@ -20,116 +22,6 @@
 #include <utility>
 
 namespace mm {
-
-auto WaitClaim::publish() noexcept -> bool {
-    if (!*this) return false;
-    auto d = std::exchange(d_, {});
-    d.publish(d.owner, d.result);
-    return true;
-}
-
-auto WaitQueue::attach(WaitRelation& relation, void* owner_context, WaitRelation::Publish delivery) noexcept
-    -> bool {
-    if (relation.attached() || relation.generation == std::numeric_limits<u64>::max() ||
-        delivery == nullptr) {
-        return false;
-    }
-    if (relation.arm && !relation.arm(owner_context)) return false;
-    relation.owner = owner_context;
-    relation.publish = delivery;
-    relation.request = this;
-    ++relation.generation;
-    relation.state_.store(static_cast<u8>(WaitPhase::Attached), std::memory_order_release);
-    waiters.push_back(relation);
-    return true;
-}
-
-auto WaitQueue::detach(WaitRelation& relation, u64 expected_generation) noexcept -> bool {
-    if (!relation.attached() || relation.request != this || relation.generation != expected_generation ||
-        relation.state() != WaitPhase::Attached || !relation.hook_.is_linked()) {
-        return false;
-    }
-    waiters.erase(relation);
-    relation.owner = nullptr;
-    relation.publish = nullptr;
-    relation.request = nullptr;
-    relation.state_.store(static_cast<u8>(WaitPhase::Detached), std::memory_order_release);
-    return true;
-}
-
-auto WaitQueue::take() noexcept -> List {
-    for (auto& r : waiters) r.state_.store(static_cast<u8>(WaitPhase::Publishing), std::memory_order_release);
-    return std::move(waiters);
-}
-
-auto WaitQueue::finish(List& batch, WaitRc rc) noexcept -> WaitClaim {
-    libk_assert(!batch.empty());
-    auto& r = batch.front();
-    batch.erase(r);
-    libk_assert(r.state() == WaitPhase::Publishing);
-    WaitClaim claim{r.owner, r.publish, rc};
-    r.owner = nullptr;
-    r.publish = nullptr;
-    r.request = nullptr;
-    r.state_.store(static_cast<u8>(WaitPhase::Detached), std::memory_order_release);
-    return claim;
-}
-
-PageReq::PageReq(Thread& thread, Cpus& cpus) noexcept
-    : thread_(thread), cpus_(cpus),
-      done_(Completion::bind<PageReq, &PageReq::release, &PageReq::cancel>(*this)) {
-    relation.arm = &PageReq::arm;
-}
-
-auto PageReq::arm(void* p) noexcept -> bool {
-    auto& req = *static_cast<PageReq*>(p);
-    return req.thread_.begin_wait(req.done_, req.cpus_);
-}
-
-void PageReq::publish(void* p, WaitRc rc) noexcept {
-    auto& req = *static_cast<PageReq*>(p);
-    req.result_ = rc;
-    req.done_.signal();
-}
-
-auto PageReq::wait(Mem* mem) noexcept -> WaitRc {
-    // Only the owning thread drains/cancels its wait. A producer may signal
-    // before this assignment, but cannot release the operation pin.
-    if (!done_.attached()) {
-        libk_assert(!mem);
-        return thread_.stop_requested() ? WaitRc::Canceled : WaitRc::Ready;
-    }
-    mem_ = mem;
-    if (!mem_) done_.signal();
-    thread_.block();
-    return thread_.stop_requested() ? WaitRc::Canceled : result_;
-}
-
-void PageReq::release() noexcept {
-    libk_assert(!relation.attached());
-    if (auto* mem = std::exchange(mem_, nullptr)) mem->release_fault();
-}
-
-auto PageReq::cancel() noexcept -> bool {
-    if (!mem_) return false;
-    const bool removed = mem_->cancel_fault(relation, relation.generation);
-    if (!removed) return false;
-    mem_ = nullptr;
-    result_ = WaitRc::Canceled;
-    return true;
-}
-
-auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expected<void, MemErr> {
-    for (;;) {
-        PageReq req{thread, cpus};
-        auto result = materialize(page, &req.relation, &req, &PageReq::publish);
-        const bool pending = !result && result.error() == MemErr::Pending;
-        const auto rc = req.wait(pending ? this : nullptr);
-        if (rc != WaitRc::Ready && rc != WaitRc::Dirty) return std::unexpected(MemErr::BackingFailed);
-        if (result) return {};
-        if (!pending) return std::unexpected(result.error());
-    }
-}
 
 [[nodiscard]] auto validate_extents(Pmm& pmm, usize logical_pages, std::span<const Extent> extents,
                                     const PageGroup& owned, const Phys::Lease& external) noexcept -> std::expected<void, MemErr> {
@@ -189,8 +81,8 @@ auto Mem::populate(Thread& thread, Cpus& cpus, usize page) noexcept -> std::expe
 // The charge follows the real resident owner. Member order releases the page
 // before refunding its reusable capacity, including partial initialization.
 template<class Extra>
-Cache<Extra>::Cache(Pmm& pmm, Perms perms, Pager* pager, bool priv) noexcept
-    : pmm_(&pmm), perms_(perms), rows_(pmm) {
+Cache<Extra>::Cache(Pmm& pmm, Perms perms, Pager* pager, bool priv, usize capacity) noexcept
+    : pmm_(&pmm), perms_(perms), rows_(pmm, decltype(rows_)::quota_for(capacity)) {
     if constexpr (is_paged) cfg_ = {pager, priv};
 }
 
@@ -201,14 +93,37 @@ Cache<Extra>::Cache(Cache&& other) noexcept
 
 template<class Extra>
 Cache<Extra>::~Cache() noexcept {
-    while (auto* n = nodes_.minimum()) { nodes_.erase(*n); rows_.destroy(*n); }
+    while (!drain()) {}
+}
+
+template<class Extra>
+auto Cache<Extra>::drain() noexcept -> bool {
+    usize remaining = 8;
+    while (remaining) {
+        Node* node;
+        {
+            sync::Lock guard{tree_lock_};
+            node = nodes_.minimum();
+            if (!node) break;
+        }
+        if constexpr (is_paged) {
+            node->completion.close();
+            if (!node->completion.drained()) return false;
+        }
+        { sync::Lock guard{tree_lock_}; nodes_.erase(*node); }
+        rows_.destroy(*node);
+        --remaining;
+    }
+    { sync::Lock guard{tree_lock_}; if (!nodes_.empty()) return false; }
+    return rows_.drain(remaining);
 }
 
 template<class Extra>
 auto Cache<Extra>::make(const object::ref<>& payer, usize i) noexcept -> std::expected<Row, MemErr> {
     auto n = rows_.create(payer, i);
-    if (!n) return std::unexpected(n.error() == SlabErr::ResourceExhausted
-        ? MemErr::ResourceExhausted : MemErr::OutOfMemory);
+    if (!n) return std::unexpected((n.error() == SlabErr::ResourceExhausted || n.error() == SlabErr::QuotaExceeded)
+        ? MemErr::ResourceExhausted : n.error() == SlabErr::GenerationExhausted
+        ? MemErr::GenerationExhausted : MemErr::OutOfMemory);
     return Row{*n, Drop{this}};
 }
 
@@ -238,7 +153,7 @@ auto Cache<Extra>::allocate(const object::ref<>& payer, usize i) noexcept -> std
     {
         sync::Lock guard{tree_lock_};
         if (auto* n = nodes_.find(i))
-            return n->resident ? std::expected<Frame, MemErr>{Frame{n->resident.page(), perms_}}
+            return n->resident ? std::expected<Frame, MemErr>{Frame{n->resident.page(), perms_, &n->pins}}
                                : std::unexpected(MemErr::Busy);
     }
     auto row = make(payer, i);
@@ -253,11 +168,11 @@ auto Cache<Extra>::allocate(const object::ref<>& payer, usize i) noexcept -> std
     n->charge = std::move(*fee);
     sync::Lock guard{tree_lock_};
     if (auto* old = nodes_.find(i))
-        return old->resident ? std::expected<Frame, MemErr>{Frame{old->resident.page(), perms_}}
+        return old->resident ? std::expected<Frame, MemErr>{Frame{old->resident.page(), perms_, &old->pins}}
                              : std::unexpected(MemErr::Busy);
     nodes_.insert(*n);
     (void)row->release();
-    return Frame{n->resident.page(), perms_};
+    return Frame{n->resident.page(), perms_, &n->pins};
 }
 
 template<class Extra>
@@ -295,45 +210,28 @@ auto Cache<Extra>::commit_transfer(usize i) noexcept -> std::expected<void, MemE
 }
 
 template<class Extra>
-void Cache<Extra>::stop(Mem& owner) noexcept
+auto Cache<Extra>::stop(Mem&) noexcept -> bool
     requires is_paged {
-    cfg_.pager->cancel(owner);
-    Node* first;
-    {
-        sync::Lock guard{tree_lock_};
-        first = nodes_.minimum();
-    }
-    for (auto* n = first; n; n = nodes_.next(*n)) {
+    for (usize step = 0; step < 8; ++step) {
+        Node* node;
         {
             sync::Lock guard{tree_lock_};
-            if (n->resident) continue;
-            n->failed = true;
+            node = nodes_.lower_bound(cfg_.stop);
+            if (!node) return true;
+            cfg_.stop = node->index + 1;
+            if (!node->resident) node->failed = true;
         }
-        publish_waiters(*n, WaitRc::Failed);
+        // Retirement retains the cache and excludes trim; this indexed node
+        // survives both the request cancellation and Source callback.
+        cfg_.pager->cancel(node->request);
+        node->completion.close();
     }
+    sync::Lock guard{tree_lock_};
+    return !nodes_.lower_bound(cfg_.stop);
 }
 
 template<class Extra>
-void Cache<Extra>::publish_waiters(Node& n, WaitRc rc) noexcept
-    requires is_paged {
-    WaitQueue::List batch;
-    {
-        sync::Lock guard{tree_lock_};
-        batch = n.waiters.take();
-    }
-    while (!batch.empty()) {
-        WaitClaim claim;
-        {
-            sync::Lock guard{tree_lock_};
-            claim = WaitQueue::finish(batch, rc);
-        }
-        libk_assert(claim.publish());
-    }
-}
-
-template<class Extra>
-auto Cache<Extra>::materialize(Mem& owner, usize index, WaitRelation* relation, void* context,
-                               WaitRelation::Publish publish) noexcept -> std::expected<Frame, MemErr> {
+auto Cache<Extra>::materialize(Mem& owner, usize index, Source::Context* context) noexcept -> std::expected<Frame, MemErr> {
     if constexpr (!is_paged) return allocate(owner.payer_, index);
     else {
         bool queued{};
@@ -349,6 +247,7 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, WaitRelation* relation, 
                     auto made = make(owner.payer_, index);
                     if (!made) return std::unexpected(made.error());
                     row = std::move(*made);
+                    row.get()->completion.bind_work(*owner.work_, owner.job_.key(), Source::Drained::bind<&Mem::post>(owner));
                     continue;
                 }
                 n = row.release();
@@ -356,20 +255,23 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, WaitRelation* relation, 
                 nodes_.insert(*n);
             }
             if (n->resident) {
-                return Frame{.page = n->resident.page(), .perms = perms_};
+                return Frame{.page = n->resident.page(), .perms = perms_, .pins = &n->pins};
             }
             if (n->failed) return std::unexpected(MemErr::BackingFailed);
-            if (relation && !n->waiters.attach(*relation, context, publish))
-                return std::unexpected(MemErr::Busy);
             if (!cfg_.pager->active(n->request)) {
                 queued = cfg_.pager->enqueue(
                     n->request,
                     {.kind = Pager::Kind::PageIn, .page_index = index, .first = index, .count = 1});
                 if (!queued) {
                     n->failed = true;
-                    if (relation) libk_assert(n->waiters.detach(*relation, relation->generation));
                     return std::unexpected(MemErr::BackingFailed);
                 }
+            }
+            if (context) {
+                const auto ready = n->completion.await(*context, {.mask = 1}, {}, {},
+                    Source::Action::bind<&Mem::drop_page>(owner));
+                if (ready.status != STATUS_PENDING)
+                    return std::unexpected(ready.status == STATUS_CLOSED ? MemErr::BackingFailed : MemErr::Busy);
             }
             break;
         }
@@ -380,14 +282,8 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, WaitRelation* relation, 
 }
 
 template<class Extra>
-auto Cache<Extra>::cancel_fault(WaitRelation& relation, u64 generation) noexcept -> bool
-    requires is_paged {
-    sync::Lock guard{tree_lock_};
-    return relation.request && relation.request->detach(relation, generation);
-}
-
-template<class Extra>
-auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page) noexcept
+auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page,
+    cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept
     -> std::expected<void, MemErr>
     requires is_paged {
     if (&pager != cfg_.pager || !page) return std::unexpected(MemErr::OwnershipMismatch);
@@ -395,6 +291,7 @@ auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page) no
     if (!fee) return std::unexpected(fee.error());
     auto reply = pager.reply(id, &owner);
     Node* n;
+    Source::Publication publication;
     if (!reply || reply->req().kind != Pager::Kind::PageIn)
         return std::unexpected(MemErr::OwnershipMismatch);
     {
@@ -403,42 +300,50 @@ auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page) no
         if (!owner.work_open_.load(std::memory_order_acquire) || n->failed || n->resident)
             return std::unexpected(MemErr::OwnershipMismatch);
         libk_assert(&n->request == reply->request());
-        n->resident = std::move(page);
-        n->charge = std::move(*fee);
-        libk_assert(reply->commit());
+        auto install = [&] noexcept {
+            n->resident = std::move(page);
+            n->charge = std::move(*fee);
+        };
+        if (!reply->commit(authority, gates, Source::Action::bind(install)))
+            return std::unexpected(MemErr::InvalidState);
+        publication = n->completion.prepare(1, true);
     }
-    publish_waiters(*n, WaitRc::Ready);
+
     return {};
 }
 
 template<class Extra>
-auto Cache<Extra>::finish(Mem& owner, Pager& pager, u64 id, bool fail) noexcept -> std::expected<void, MemErr>
+auto Cache<Extra>::finish(Mem& owner, Pager& pager, u64 id, bool fail,
+    cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr>
     requires is_paged {
     if (&pager != cfg_.pager) return std::unexpected(MemErr::OwnershipMismatch);
     auto reply = pager.reply(id, &owner);
     if (!reply) return std::unexpected(MemErr::OwnershipMismatch);
     if (!fail && reply->req().kind == Pager::Kind::PageIn) return std::unexpected(MemErr::InvalidState);
-    complete(*reply, fail);
-    return {};
+    return complete(*reply, fail, authority, gates);
 }
 
 template<class Extra>
-void Cache<Extra>::complete(Pager::Reply& reply, bool fail) noexcept
+auto Cache<Extra>::complete(Pager::Reply& reply, bool fail, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr>
     requires is_paged {
     Node* n;
+    Source::Publication publication;
     const bool page_in = reply.req().kind == Pager::Kind::PageIn;
     {
         sync::Lock guard{tree_lock_};
         n = nodes_.find(reply.req().page_index);
         libk_assert(n && &n->request == reply.request());
-        if (reply.req().kind == Pager::Kind::PageIn) {
-            libk_assert(fail && !n->resident);
-            n->failed = true;
-        } else if (fail) n->write_failed = true;
-        else if (n->dirty_epoch == reply.req().dirty_epoch) n->dirty_epoch = 0;
-        libk_assert(reply.commit());
+        auto install = [&] noexcept {
+            if (page_in) { libk_assert(fail && !n->resident); n->failed = true; }
+            else if (fail) n->write_failed = true;
+            else if (n->dirty_epoch == reply.req().dirty_epoch) n->dirty_epoch = 0;
+        };
+        if (!reply.commit(authority, gates, Source::Action::bind(install), fail))
+            return std::unexpected(MemErr::InvalidState);
+        if (page_in) publication = n->completion.prepare(1, true);
     }
-    if (page_in) publish_waiters(*n, WaitRc::Failed);
+    return {};
 }
 
 template<class Extra>
@@ -471,30 +376,37 @@ auto Cache<Extra>::writeback(usize index) noexcept -> std::expected<void, MemErr
 }
 
 template<class Extra>
-auto Cache<Extra>::trim(ObjectRange range) noexcept -> std::expected<void, MemErr>
-    requires is_paged {
-    {
-        sync::Lock guard{tree_lock_};
-        for (auto* n = nodes_.minimum(); n; n = nodes_.next(*n)) {
-            if (!range.contains(n->index)) continue;
-            if (cfg_.pager->active(n->request)) return std::unexpected(MemErr::Busy);
-            if (n->dirty_epoch) return std::unexpected(MemErr::Dirty);
-        }
-    }
-    for (auto* n = nodes_.minimum(); n; n = nodes_.next(*n)) {
-        if (!range.contains(n->index)) continue;
-        OwnedPage page;
-        resource::Charge charge;
+auto Cache<Extra>::trim(ObjectRange range, usize& cursor, bool& removing) noexcept
+    -> std::expected<bool, MemErr> requires is_paged {
+    for (usize step = 0; step < 8; ++step) {
+        Node* n;
         {
             sync::Lock guard{tree_lock_};
-            page = std::move(n->resident);
-            charge = std::move(n->charge);
-            n->failed = false;
+            n = nodes_.lower_bound(cursor);
+            if (!n || !range.contains(n->index)) {
+                if (removing) return true;
+                removing = true; cursor = range.base();
+                return false;
+            }
+            if (!removing) {
+                // Validate the whole range before deleting any page. A wired
+                // registration survives trim; transient loans finish normally.
+                if (n->pins.wired.load(std::memory_order_acquire)) return std::unexpected(MemErr::Busy);
+                if (n->pins.uses.load(std::memory_order_acquire)) return std::unexpected(MemErr::Pending);
+                if (cfg_.pager->active(n->request)) return std::unexpected(MemErr::Busy);
+                if (n->dirty_epoch) return std::unexpected(MemErr::Dirty);
+                cursor = n->index + 1;
+                continue;
+            }
+            cursor = n->index + 1;
         }
-        page.reset();
-        charge.reset();
+        n->completion.close();
+        if (!n->completion.drained()) { cursor = n->index; return false; }
+        { sync::Lock guard{tree_lock_}; nodes_.erase(*n); }
+        // Keep prepaid metadata pages for future faults in this live backing.
+        rows_.destroy(*n);
     }
-    return {};
+    return false;
 }
 
 template<class Extra>
@@ -547,11 +459,21 @@ auto Extents::materialize(usize index) const noexcept -> std::expected<Frame, Me
 }
 
 void Extents::reset() noexcept {
-    owned_.reset();
-    while (head_) {
+    while (!drain()) {}
+}
+
+auto Extents::drain() noexcept -> bool {
+    usize remaining = 8;
+    while (owned_.page_count() && remaining) {
+        --remaining;
+        auto page = owned_.take(); libk_assert(page); page->reset();
+    }
+    while (head_ && remaining) {
+        --remaining;
         auto* row = std::exchange(head_, head_->next);
         rows_.destroy(*row);
     }
+    return !head_ && !owned_.page_count() && rows_.drain(remaining);
 }
 
 auto Extents::find(usize index) const noexcept -> const Extent* {
@@ -561,8 +483,8 @@ auto Extents::find(usize index) const noexcept -> const Extent* {
 }
 void MemWork::Drop::operator()(Data& d) const noexcept {
     auto* pin = d.pin;
-    d.attachment->drop_work();
-    if (pin) pin->drop_page();
+    d.attachment->drop_work(d.terminal);
+    if (pin) pin->drop_work();
 }
 
 MemLink::~MemLink() noexcept {
@@ -587,20 +509,38 @@ auto MemLink::detach() noexcept -> bool {
     return owner->detach(*this);
 }
 
-void MemLink::drop_work() noexcept {
-    // detach() publishes Detached and then observes work_; this side removes
-    // the last work pin and then observes Detached. Sequential consistency is
-    // intentional: it forbids both sides from observing the other's old value
-    // and thereby losing the final released() notification.
-    const usize previous = work_.fetch_sub(1, std::memory_order_seq_cst);
-    libk_assert(previous != 0);
-    if (previous == 1 && static_cast<State>(state_.load(std::memory_order_seq_cst)) == State::Detached) {
-        libk_assert(ops_ != nullptr && ops_->released != nullptr);
-        ops_->released(context_);
+void MemLink::drop_work(bool terminal) noexcept {
+    if (terminal) {
+        {
+            sync::Lock guard{lock_};
+            libk_assert(work_.load() == 1 && static_cast<State>(state_.load()) == State::Releasing);
+            state_.store(static_cast<u8>(State::Detached), std::memory_order_relaxed);
+        }
+        work_.store(0, std::memory_order_release); // Last access: storage may now be reused.
+        return;
     }
+    {
+        sync::Lock guard{lock_};
+        const auto count = work_.load(std::memory_order_relaxed);
+        libk_assert(count);
+        if (count != 1 || static_cast<State>(state_.load()) != State::Detached) {
+            work_.store(count - 1, std::memory_order_release);
+            return;
+        }
+        state_.store(static_cast<u8>(State::Releasing), std::memory_order_release);
+    }
+    MemWork done{*this, nullptr, {}, true};
+    ops_->released(context_, std::move(done));
 }
 
-void PageHold::Drop::operator()(Data& d) const noexcept { d.owner->drop_page(); }
+void PageHold::Drop::operator()(Data& d) const noexcept {
+    if (auto* pins = d.frame.pins) {
+        if (d.wired) libk_assert(pins->wired.fetch_sub(1, std::memory_order_release));
+        libk_assert(pins->uses.fetch_sub(1, std::memory_order_release));
+        // Zero permits live trim to destroy the node containing these counters.
+    }
+    d.owner->drop_page();
+}
 
 PageTransfer::PageTransfer(PageTransfer&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), index_(other.index_), page_(std::move(other.page_)) {}
@@ -633,11 +573,11 @@ void PageTransfer::abort() noexcept {
     page_.reset();
 }
 
-auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config config) noexcept
+auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config config, object::ref<> cpu) noexcept
     -> std::expected<Data, MemErr> {
     if (!bytes || bytes % page_size) return std::unexpected(MemErr::InvalidSize);
     Data d{pmm, bytes / page_size};
-    d.payer_ = payer;
+    d.payer_ = payer; d.cpu_ = std::move(cpu);
     auto ready = std::visit([&]<class C>(C& c) noexcept -> std::expected<void, MemErr> {
         if constexpr (std::same_as<C, AnonCfg>) {
             if (!valid_perms(c.perms)) return std::unexpected(MemErr::InvalidAccess);
@@ -656,7 +596,10 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
             if (pager->get().state() != Pager::State::Open) return std::unexpected(MemErr::AttachmentState);
             d.perms_ = c.perms;
             d.pager_ = std::move(c.pager);
-            d.store_.emplace(std::in_place_type<Paged>, pmm, c.perms, &pager->get(), c.priv);
+            if (!c.credits) return std::unexpected(MemErr::InvalidSize);
+            const auto credits = std::min(c.credits, d.pages_);
+            d.store_.emplace(std::in_place_type<Paged>, pmm, c.perms, &pager->get(), c.priv, credits);
+            if (auto result = std::get<Paged>(*d.store_).prepay(d.payer_, credits); !result) return result;
         } else {
             auto checked = validate_extents(pmm, d.pages_, c.extents, c.owned, c.external);
             if (!checked) return checked;
@@ -675,7 +618,7 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
 
 Mem::Mem(Data&& d) noexcept
     : payer_(std::move(d.payer_)), pmm_(d.pmm_), logical_pages_(d.pages_),
-      store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
+      cpu_(std::move(d.cpu_)), store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
     libk_assert(store_ && logical_pages_);
     if (std::holds_alternative<Extents>(*store_) && perms_.contains(Perm::Execute)) {
         seal_ = SealState::Executable;
@@ -684,9 +627,16 @@ Mem::Mem(Data&& d) noexcept
 }
 
 Mem::~Mem() noexcept {
-    if (state_ == MemState::Live) retire();
-    libk_assert(state_ == MemState::Retired && !cleanup_ && !releasing_);
+    libk_assert(state_ == MemState::Retired && !cleanup_ && !releasing_ && !stopping_ && !scan_);
     libk_assert(!store_ && !operations_ && attachments_.empty());
+}
+
+void Mem::links(u64 cursor, LinkRecords& out) const noexcept {
+    sync::Lock guard{lock_};
+    const auto* physical = store_ ? std::get_if<Extents>(&*store_) : nullptr;
+    backing_.links(out, physical ? LINK_PHYS : LINK_USE, cursor);
+    const auto range = physical ? physical->external() : Pages{};
+    for (auto& row : std::span{out.records, out.count}) { row.first = range.base().raw(); row.bytes = physical ? range.page_count() * page_size : logical_pages_ * page_size; }
 }
 
 auto Mem::managed() const noexcept -> bool {
@@ -759,20 +709,12 @@ auto Mem::query(usize page_index) const noexcept -> std::expected<ContentState, 
     return (result);
 }
 
-auto Mem::materialize(usize page_index) noexcept -> std::expected<PageHold, MemErr> {
-    return materialize_impl(page_index, nullptr, nullptr, nullptr);
-}
-
-auto Mem::materialize(usize page_index, WaitRelation* relation, void* owner,
-                      WaitRelation::Publish publish) noexcept -> std::expected<PageHold, MemErr> {
-    return materialize_impl(page_index, relation, owner, publish);
-}
-
-auto Mem::materialize_impl(usize page_index, WaitRelation* relation, void* owner,
-                           WaitRelation::Publish publish) noexcept -> std::expected<PageHold, MemErr> {
+auto Mem::materialize(usize page_index, Source::Context* context, bool wired) noexcept
+    -> std::expected<PageHold, MemErr> {
     Store* store{};
     {
         sync::Lock guard{lock_};
+        if (billing_) return std::unexpected(MemErr::Busy);
         if (state_ != MemState::Live) {
             return std::unexpected(MemErr::InvalidState);
         }
@@ -781,30 +723,33 @@ auto Mem::materialize_impl(usize page_index, WaitRelation* relation, void* owner
         }
         libk_assert(operations_ != std::numeric_limits<usize>::max());
         if (trimming_) {
-            if (!relation) return std::unexpected(MemErr::Busy);
-            if (!trim_waiters_.attach(*relation, owner, publish)) return std::unexpected(MemErr::Busy);
+            if (!context) return std::unexpected(MemErr::Busy);
+            const auto ready = trim_events_.await(*context, {.mask = ~u64{}}, {}, {},
+                Source::Action::bind<&Mem::drop_page>(*this));
+            if (ready.status != STATUS_PENDING) return std::unexpected(MemErr::Busy);
             ++operations_;
             return std::unexpected(MemErr::Pending);
         }
-        ++operations_;
+        ++operations_; ++preparing_;
         store = &*store_;
     }
     Pin hold{*this};
+    libk::scope_exit preparation{[&]() noexcept { prepared(); }};
 
     auto result = [&]() noexcept -> std::expected<Frame, MemErr> {
         if (auto* data = std::get_if<Paged>(store))
-            return data->materialize(*this, page_index, relation, owner, publish);
-        if (auto* data = std::get_if<Anon>(store)) return data->materialize(*this, page_index, relation, owner, publish);
+            return data->materialize(*this, page_index, context);
+        if (auto* data = std::get_if<Anon>(store)) return data->materialize(*this, page_index, context);
         return std::get_if<Extents>(store)->materialize(page_index);
     }();
-    const bool retained = relation && !result && result.error() == MemErr::Pending;
+    const bool retained = context && !result && result.error() == MemErr::Pending;
     bool live{};
     {
         sync::Lock guard{lock_};
         live = state_ == MemState::Live;
     }
     if (retained) {
-        hold.release(); // The attached fault relation now owns this operation.
+        hold.release(); // The Thread's fixed Source registration owns this operation.
         return std::unexpected(MemErr::Pending);
     }
     if (!result) {
@@ -814,28 +759,31 @@ auto Mem::materialize_impl(usize page_index, WaitRelation* relation, void* owner
         return std::unexpected(MemErr::InvalidState);
     }
     hold.release(); // The installed PTE or caller now owns this operation pin.
-    return (PageHold{*this, result.value()});
+    return (PageHold{*this, result.value(), wired});
 }
 
 auto Mem::begin_transfer(usize page_index) noexcept -> std::expected<PageTransfer, MemErr> {
     Anon* backing{};
     {
         sync::Lock guard{lock_};
+        if (billing_) return std::unexpected(MemErr::Busy);
         if (state_ != MemState::Live || !attachments_.empty() || operations_ != 0 ||
             page_index >= logical_pages_ || !store_) {
             return std::unexpected((!attachments_.empty() || operations_ != 0) ? MemErr::Busy
                                                                                : MemErr::InvalidState);
         }
         libk_assert(operations_ != std::numeric_limits<usize>::max());
-        ++operations_;
+        ++operations_; ++preparing_;
         backing = std::get_if<Anon>(&*store_);
     }
     Pin hold{*this};
+    libk::scope_exit preparation{[&]() noexcept { prepared(); }};
     auto page = backing ? backing->begin_transfer(page_index)
                         : std::expected<OwnedPage, MemErr>{std::unexpected(MemErr::OwnershipMismatch)};
     if (!page) {
         return std::unexpected(page.error());
     }
+    (void)preparation.release(); // Transfer completion still owns allocation preparation.
     hold.release(); // The move-only transfer owns the source operation.
     return (PageTransfer{*this, page_index, std::move(page).value()});
 }
@@ -845,22 +793,25 @@ template <class F> auto Mem::paged(F&& fn, MemErr error) noexcept {
     Paged* backing{};
     {
         sync::Lock guard{lock_};
-        if (state_ != MemState::Live || trimming_ || !store_ ||
+        if (state_ != MemState::Live || billing_ || trimming_ || !store_ ||
             !(backing = std::get_if<Paged>(&*store_)))
             return Result{std::unexpected(error)};
-        ++operations_;
+        ++operations_; ++preparing_;
     }
     Pin hold{*this};
+    libk::scope_exit preparation{[&]() noexcept { prepared(); }};
     return std::forward<F>(fn)(*backing);
 }
 
-auto Mem::supply(Pager& pager, u64 id, OwnedPage&& page) noexcept -> std::expected<void, MemErr> {
-    return paged([&](Paged& p) noexcept { return p.supply(*this, pager, id, std::move(page)); });
+auto Mem::supply(Pager& pager, u64 id, OwnedPage&& page, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
+    return paged([&](Paged& p) noexcept { return p.supply(*this, pager, id, std::move(page), authority, gates); });
 }
 
-auto Mem::supply(Pager& pager, PageTransfer&& transfer, u64 id) noexcept -> std::expected<void, MemErr> {
+auto Mem::supply(Pager& pager, PageTransfer&& transfer, u64 id, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
     if (!transfer || !transfer.page().valid()) return std::unexpected(MemErr::OwnershipMismatch);
-    const auto result = supply(pager, id, std::move(transfer.page_));
+    const auto result = supply(pager, id, std::move(transfer.page_), authority, gates);
     if (result) transfer.commit();
     else transfer.abort();
     return result;
@@ -883,86 +834,53 @@ auto Mem::observe_usage(usize page_index, bool accessed, bool dirty) noexcept ->
     return result;
 }
 
-auto Mem::trim(ObjectRange range, WaitRelation& waiter, void* ctx, WaitRelation::Publish publish) noexcept
-    -> std::expected<void, MemErr> {
+auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates, const cap::GrantLease* grant) noexcept -> std::expected<void, MemErr> {
+    Source::Publication publication;
     {
         sync::Lock guard{lock_};
         if (state_ != MemState::Live || !store_ || !std::get_if<Paged>(&*store_))
             return std::unexpected(MemErr::InvalidState);
         if (range.empty() || !ObjectRange{0, logical_pages_}.contains(range))
             return std::unexpected(MemErr::InvalidRange);
-        // No recursive wait for this Pager's own outstanding requests.
-        if (trimming_ || trim_walk_ || request_pins_.load(std::memory_order_acquire))
+        if (billing_ || trimming_ || advancing_ || request_pins_.load(std::memory_order_acquire))
             return std::unexpected(MemErr::Busy);
-        if (!trim_waiters_.attach(waiter, ctx, publish)) return std::unexpected(MemErr::Busy);
-        operations_ += 2; // The trim and this admitted waiter own separate pins.
-        trimming_ = range;
-        trim_walk_ = true;
+        auto self = object::ref<>::retain_alive(job_.key());
+        auto& op = trim_op_.emplace(object::ref<>{}, Source::Action::bind<&Mem::post>(*this),
+            Source::Action::bind<&Mem::advance>(*this), &ordinary_);
+        op.bind(*work_, job_.key());
+        auto install = [&]() noexcept {
+            publication = trim_events_.prepare(0, true);
+            const auto ready = trim_events_.await(context, {.mask = ~u64{}}, {}, {},
+                Source::Action::bind<&Mem::drop_page>(*this));
+            libk_assert(ready.status == STATUS_PENDING);
+            operations_ += 2;
+            trimming_ = range; trim_phase_ = TrimPhase::Invalidate;
+            trim_cursor_ = range.base(); trim_removing_ = false; trim_status_ = STATUS_OK;
+            scan_ = attachments_.empty() ? nullptr : &attachments_.front();
+        };
+        if (op.start(cpu_, self, authority, gates, Source::Action::bind(install), grant) != STATUS_OK) {
+            trim_op_.reset();
+            return std::unexpected(MemErr::Busy);
+        }
     }
-    invalidate(range);
-    {
-        sync::Lock guard{lock_};
-        trim_walk_ = false;
-    }
-    finish_trim();
+    publication.publish();
+    { sync::Lock guard{lock_}; if (trim_op_) trim_op_->post(); }
     return std::unexpected(MemErr::Pending);
 }
 
-auto Mem::trim(Thread& thread, Cpus& cpus, ObjectRange range) noexcept -> std::expected<void, MemErr> {
-    PageReq req{thread, cpus};
-    auto started = trim(range, req.relation, &req, &PageReq::publish);
-    const bool pending = !started && started.error() == MemErr::Pending;
-    const auto rc = req.wait(pending ? this : nullptr);
-    if (!pending) return started;
-    if (rc == WaitRc::Dirty) return std::unexpected(MemErr::Dirty);
-    if (rc != WaitRc::Ready) return std::unexpected(MemErr::BackingFailed);
-    return {};
-}
-
 void Mem::finish_trim() noexcept {
-    Paged* backing;
-    ObjectRange range;
-    {
-        sync::Lock guard{lock_};
-        if (!trimming_ || trim_walk_ || operations_ != 1 + trim_waiters_.waiters.size() ||
-            request_pins_.load(std::memory_order_acquire))
-            return;
-        trim_walk_ = true;
-        range = *trimming_;
-        backing = std::get_if<Paged>(&*store_);
-    }
-    auto result = backing->trim(range);
-    WaitQueue::List batch;
-    bool closing;
-    {
-        sync::Lock guard{lock_};
-        batch = trim_waiters_.take();
-        trimming_.reset();
-        for (auto& a : attachments_)
-            a.state_.store(static_cast<u8>(MemLink::State::Attached), std::memory_order_release);
-        // Completion must expose the final state before any waiter can resume.
-        trim_walk_ = false;
-        closing = state_ == MemState::Stopping;
-        if (closing) ++operations_;
-    }
-    if (closing) stop();
-    while (!batch.empty()) {
-        WaitClaim claim;
-        {
-            sync::Lock guard{lock_};
-            claim = WaitQueue::finish(batch, result ? WaitRc::Ready : WaitRc::Dirty);
-        }
-        libk_assert(claim.publish());
-    }
-    drop_page(); // This pin retains storage through all detached callbacks.
+    sync::Lock guard{lock_};
+    if (trim_op_) trim_op_->post();
 }
 
 auto Mem::writeback(usize index) noexcept -> std::expected<void, MemErr> {
     return paged([&](Paged& p) noexcept { return p.writeback(index); }, MemErr::NotBacked);
 }
 
-auto Mem::pager_finish(Pager& pager, u64 id, bool fail) noexcept -> std::expected<void, MemErr> {
-    return paged([&](Paged& p) noexcept { return p.finish(*this, pager, id, fail); });
+auto Mem::pager_finish(Pager& pager, u64 id, bool fail, cap::Graph::Admission authority,
+    std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
+    return paged([&](Paged& p) noexcept { return p.finish(*this, pager, id, fail, authority, gates); });
 }
 
 auto Mem::write(usize offset, std::span<const byte> input) noexcept -> std::expected<void, MemErr> {
@@ -1023,7 +941,7 @@ auto Mem::read(usize offset, std::span<byte> output) noexcept -> std::expected<v
 
 auto Mem::attach(MemLink& attachment, Perms perms) noexcept -> std::expected<void, MemErr> {
     sync::Lock guard{lock_};
-    if (state_ != MemState::Live || trimming_ || trim_walk_ || !valid_perms(perms) ||
+    if (state_ != MemState::Live || trimming_ || !valid_perms(perms) ||
         !perms_.contains(perms)) {
         return std::unexpected(MemErr::InvalidState);
     }
@@ -1039,7 +957,9 @@ auto Mem::attach(MemLink& attachment, Perms perms) noexcept -> std::expected<voi
         attachment.ops_->released == nullptr) {
         return std::unexpected(MemErr::AttachmentState);
     }
-    attachment.owner_ = this;
+    const auto id = object::new_id<object::Link>();
+    if (!id.valid()) return std::unexpected(MemErr::GenerationExhausted);
+    attachment.id_ = id; attachment.owner_ = this;
     attachment.perms_ = perms;
     attachment.state_.store(static_cast<u8>(MemLink::State::Attached), std::memory_order_release);
     attachments_.push_back(attachment);
@@ -1065,10 +985,15 @@ auto Mem::detach(MemLink& attachment) noexcept -> bool {
         const auto current =
             static_cast<MemLink::State>(attachment.state_.load(std::memory_order_relaxed));
         libk_assert(current == MemLink::State::Attached || current == MemLink::State::Invalidating);
+        if (scan_ == &attachment) {
+            auto next = ++attachments_.iterator_to(attachment);
+            scan_ = next == attachments_.end() ? nullptr : &*next;
+        }
         attachments_.erase(attachment);
         attachment.owner_ = nullptr;
-        attachment.state_.store(static_cast<u8>(MemLink::State::Detached), std::memory_order_seq_cst);
-        quiescent = attachment.work_.load(std::memory_order_seq_cst) == 0;
+        sync::Lock work{attachment.lock_};
+        attachment.state_.store(static_cast<u8>(MemLink::State::Detached), std::memory_order_release);
+        quiescent = attachment.work_.load(std::memory_order_relaxed) == 0;
     }
     finish_retire();
     return quiescent;
@@ -1091,7 +1016,7 @@ void Mem::retire(object::cleanup&& cleanup) noexcept {
             libk_assert(state_ == MemState::Live);
             state_ = MemState::Stopping;
             work_open_.store(false, std::memory_order_release);
-            if (trimming_ || trim_walk_) return;
+            if (trimming_) return;
             ++operations_;
         }
     }
@@ -1105,39 +1030,141 @@ void Mem::retire(object::cleanup&& cleanup) noexcept {
 
 // Both retirement and live trim publish one work obligation per actual link.
 // Only trim needs an additional Mem pin: retirement already retains its storage.
-void Mem::invalidate(ObjectRange range) noexcept {
-    for (;;) {
-        MemLink* link{};
-        MemWork work;
+auto Mem::invalidate(ObjectRange range, usize limit) noexcept -> bool {
+    for (usize step = 0; step < limit; ++step) {
+        MemLink* link;
+        MemWork work, running;
         {
             sync::Lock guard{lock_};
-            for (auto& a : attachments_) {
-                if (static_cast<MemLink::State>(a.state_.load(std::memory_order_relaxed)) !=
-                    MemLink::State::Attached)
-                    continue;
-                a.state_.store(static_cast<u8>(MemLink::State::Invalidating), std::memory_order_release);
-                (void)a.work_.fetch_add(1, std::memory_order_relaxed);
-                if (!range.empty()) ++operations_;
-                link = &a;
-                work = MemWork{a, range.empty() ? nullptr : this, range};
-                break;
-            }
+            link = scan_;
+            if (!link) return true;
+            auto next = ++attachments_.iterator_to(*link);
+            scan_ = next == attachments_.end() ? nullptr : &*next;
+            if (static_cast<MemLink::State>(link->state_.load(std::memory_order_relaxed)) != MemLink::State::Attached)
+                continue;
+            link->state_.store(static_cast<u8>(MemLink::State::Invalidating), std::memory_order_release);
+            { sync::Lock work{link->lock_}; link->work_.fetch_add(2, std::memory_order_relaxed); }
+            if (!range.empty()) { operations_ += 2; trim_pending_ += 2; }
+            work = MemWork{*link, range.empty() ? nullptr : this, range};
+            running = MemWork{*link, range.empty() ? nullptr : this};
         }
-        if (!link) return;
         link->ops_->invalidate(link->context_, std::move(work));
     }
+    sync::Lock guard{lock_};
+    return !scan_;
 }
 
 void Mem::stop() noexcept {
-    Pin hold{*this};
-
-    invalidate({});
-    Paged* stopped{};
     {
         sync::Lock guard{lock_};
-        stopped = store_ ? std::get_if<Paged>(&*store_) : nullptr;
+        libk_assert(!stopping_);
+        stopping_ = true;
+        scan_ = attachments_.empty() ? nullptr : &attachments_.front();
     }
-    if (stopped) stopped->stop(*this);
+    run_work();
+}
+
+void Mem::run_work() noexcept {
+    {
+        sync::Lock guard{lock_};
+        if (trimming_ && trim_op_->schedule()) return;
+    }
+    advance();
+}
+
+void Mem::advance() noexcept {
+    // Inline retirement and both worker classes share this single provider step.
+    auto execution = object::ref<>::retain_alive(job_.key());
+    {
+        sync::Lock guard{lock_};
+        if (advancing_) { again_ = true; return; }
+        advancing_ = true;
+    }
+    libk::scope_exit leave{[&]() noexcept {
+        sync::Lock guard{lock_};
+        advancing_ = false;
+        if (std::exchange(again_, false)) {
+            if (trim_op_) trim_op_->post(); else post();
+        }
+    }};
+    bool stopping, releasing;
+    std::optional<ObjectRange> range;
+    {
+        sync::Lock guard{lock_};
+        stopping = stopping_; releasing = releasing_; range = trimming_;
+    }
+    if (range) {
+        auto& op = *trim_op_;
+        switch (trim_phase_) {
+        case TrimPhase::Invalidate:
+            if (op.query().sequence == OP_ACCEPTED && !op.commit()) {
+                trim_status_ = STATUS_CANCELED;
+                { sync::Lock guard{lock_}; scan_ = nullptr; }
+                trim_phase_ = TrimPhase::Finish;
+                break;
+            }
+            if (invalidate(*range, 8)) trim_phase_ = TrimPhase::Wait;
+            break;
+        case TrimPhase::Wait: {
+            sync::Lock guard{lock_};
+            if (trim_pending_ || preparing_ || request_pins_.load(std::memory_order_acquire)) return;
+            trim_phase_ = TrimPhase::Pages;
+            break;
+        }
+        case TrimPhase::Pages: {
+            auto result = std::get<Paged>(*store_).trim(*range, trim_cursor_, trim_removing_);
+            if (!result && result.error() == MemErr::Pending) return;
+            if (result && !*result) break;
+            trim_status_ = result ? STATUS_OK : result.error() == MemErr::Dirty ? STATUS_DIRTY : STATUS_BUSY;
+            sync::Lock guard{lock_};
+            scan_ = attachments_.empty() ? nullptr : &attachments_.front();
+            trim_phase_ = TrimPhase::Restore;
+            break;
+        }
+        case TrimPhase::Restore: {
+            sync::Lock guard{lock_};
+            for (usize step = 0; step < 8 && scan_; ++step) {
+                auto* link = scan_;
+                auto next = ++attachments_.iterator_to(*link);
+                scan_ = next == attachments_.end() ? nullptr : &*next;
+                link->state_.store(static_cast<u8>(MemLink::State::Attached), std::memory_order_release);
+            }
+            if (!scan_) trim_phase_ = TrimPhase::Finish;
+            break;
+        }
+        case TrimPhase::Finish: {
+            if (!op.detach()) return;
+            Source::Publication publication;
+            bool closing;
+            {
+                sync::Lock guard{lock_};
+                op.finish(trim_status_);
+                trim_op_.reset();
+                trimming_.reset();
+                publication = trim_events_.prepare(trim_status_ == STATUS_OK ? MEM_TRIM_CLEAN
+                    : trim_status_ == STATUS_DIRTY ? MEM_TRIM_DIRTY
+                    : trim_status_ == STATUS_CANCELED ? MEM_TRIM_CANCELED : MEM_TRIM_BUSY, true);
+                closing = state_ == MemState::Stopping;
+                if (closing) ++operations_;
+            }
+            if (closing) stop();
+            publication.publish();
+            drop_page();
+            return;
+        }
+        }
+        op.post();
+        return;
+    }
+    if (releasing) { release(); return; }
+    if (!stopping) return;
+    if (!invalidate({}, 8)) { post(); return; }
+    Paged* backing;
+    { sync::Lock guard{lock_}; backing = store_ ? std::get_if<Paged>(&*store_) : nullptr; }
+    if (backing && !backing->stop(*this)) { post(); return; }
+    trim_events_.close();
+    { sync::Lock guard{lock_}; stopping_ = false; }
+    drop_page();
 }
 
 void Mem::drop_page() noexcept {
@@ -1145,7 +1172,7 @@ void Mem::drop_page() noexcept {
         sync::Lock guard{lock_};
         libk_assert(operations_ != 0);
         --operations_;
-        if (!trimming_ && !trim_walk_) {
+        if (!trimming_) {
             guard.restore();
             finish_retire();
             return;
@@ -1154,32 +1181,9 @@ void Mem::drop_page() noexcept {
     finish_trim();
 }
 
-void Mem::release_fault() noexcept { drop_page(); }
-
-auto Mem::cancel_fault(WaitRelation& relation, u64 generation) noexcept -> bool {
-    {
-        sync::Lock guard{lock_};
-        if (relation.request == &trim_waiters_) {
-            if (!trim_waiters_.detach(relation, generation)) return false;
-            guard.restore();
-            drop_page();
-            return true;
-        }
-    }
-    Paged* backing{};
-    {
-        sync::Lock guard{lock_};
-        if (!store_ || state_ == MemState::Retired ||
-            std::get_if<Paged>(&*store_) == nullptr) {
-            return false;
-        }
-        backing = std::get_if<Paged>(&*store_);
-    }
-    if (!backing->cancel_fault(relation, generation)) {
-        return false;
-    }
+void Mem::drop_work() noexcept {
+    { sync::Lock guard{lock_}; libk_assert(trim_pending_); --trim_pending_; }
     drop_page();
-    return true;
 }
 
 void Mem::request_pin() noexcept { (void)request_pins_.fetch_add(1, std::memory_order_acq_rel); }
@@ -1201,7 +1205,7 @@ void Mem::cancel_request(Pager::Reply& reply) noexcept {
         p = std::get_if<Paged>(&*store_);
     }
     libk_assert(p);
-    p->complete(reply, true);
+    libk_assert(p->complete(reply, true));
 }
 
 void Mem::finish_transfer(usize page_index, OwnedPage&& page, bool commit) noexcept {
@@ -1212,6 +1216,7 @@ void Mem::finish_transfer(usize page_index, OwnedPage&& page, bool commit) noexc
         backing = std::get_if<Anon>(&*store_);
     }
     Pin hold{*this};
+    libk::scope_exit preparation{[&]() noexcept { prepared(); }};
     libk_assert(backing != nullptr);
     const auto result = commit ? backing->commit_transfer(page_index)
                                : backing->restore_transfer(page_index, std::move(page));
@@ -1219,19 +1224,29 @@ void Mem::finish_transfer(usize page_index, OwnedPage&& page, bool commit) noexc
 }
 
 void Mem::finish_retire(bool drop_request) noexcept {
-    object::cleanup cleanup{};
     {
         sync::Lock guard{lock_};
         if (drop_request) libk_assert(request_pins_.fetch_sub(1, std::memory_order_acq_rel));
-        if (state_ != MemState::Stopping || operations_ != 0 ||
+        if (state_ != MemState::Stopping || operations_ != 0 || preparing_ || billing_ ||
             request_pins_.load(std::memory_order_acquire) != 0 || !attachments_.empty() || releasing_) {
             return;
         }
         releasing_ = true;
     }
+    run_work();
+}
 
-    store_.reset();
+void Mem::release() noexcept {
+    if (!trim_events_.drained()) return;
+    if (store_) {
+        if (!std::visit([](auto& store) noexcept { return store.drain(); }, *store_)) {
+            libk_assert(work_); work_->post(job_); return;
+        }
+        store_.reset(); pager_ref_.reset();
+    }
+    if (!backing_.close()) return;
 
+    object::cleanup cleanup;
     {
         sync::Lock guard{lock_};
         libk_assert(releasing_);
@@ -1240,6 +1255,7 @@ void Mem::finish_retire(bool drop_request) noexcept {
         cleanup = std::move(cleanup_);
     }
 
+    if (work_) work_->close(job_);
     if (cleanup) cleanup.complete();
 }
 

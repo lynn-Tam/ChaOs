@@ -15,7 +15,8 @@
 #include <protocols/msg.hpp>
 #include <expected>
 
-inline constexpr rt_req io_memory{"io.memory", 0, ObjGroup};
+inline constexpr rt_req io_memory{"io.memory", 0, ObjAccount};
+inline constexpr rt_req io_scope{"io.scope", 0, ObjScope};
 
 inline constexpr size_t io_queue_depth = 32;
 inline constexpr size_t io_buffer_size = 4096;
@@ -383,10 +384,10 @@ class io_mem final {
     }
 
   public:
-    auto create(cap_t pool, cap_t vm, uintptr_t address) -> status_t {
+    auto create(CreateAuth pool, cap_t vm, uintptr_t address) -> status_t {
         if (pages_[0].memory)
             return STATUS_OK;
-        pool_ = pool;
+        pool_ = pool.account;
         return acquire([&](size_t i, size_t size) {
             return vm_area::create(pool, vm, address ? address + i * 4096 : 0, size);
         });
@@ -468,23 +469,23 @@ class io_mem final {
 // forwarding consumers own their snapshots and use queue() instead.
 class io_client final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto adopt(cap_owner&& channel, cap_t pool, cap_t cspace, cap_t events,
+    [[nodiscard]] auto adopt(cap_owner&& channel, CreateAuth pool, cap_t events,
                              cap_t vspace, uintptr_t address, uint64_t& value,
                              bool writable_payload = false, uint64_t deadline = 0) noexcept
         -> status_t {
         if (queue_ || channel_ || !channel)
             return STATUS_BAD_ARGS;
         channel_ = std::move(channel);
-        return open(channel_.selector(), 0, pool, cspace, events, vspace, address, value,
+        return open(channel_.selector(), 0, pool, events, vspace, address, value,
                     writable_payload, deadline);
     }
-    [[nodiscard]] auto connect(cap_t directory, cap_t pool, cap_t cspace, cap_t events,
+    [[nodiscard]] auto connect(cap_t directory, CreateAuth pool, cap_t cspace, cap_t events,
                                cap_t vspace, uintptr_t address, uint64_t& value,
                                bool writable_payload = false, uint64_t deadline = 0) noexcept
         -> status_t {
         if (queue_ || channel_)
             return STATUS_BUSY;
-        const auto pair = sys::channel_create(pool, 1, CHANNEL_MAX_WORDS, 4, 2);
+        const auto pair = sys::channel_create(pool, 1, CHANNEL_MAX_WORDS, 4);
         channel_ = cap_owner{pair.value};
         cap_owner server{pair.value2};
         if (pair.status != STATUS_OK) {
@@ -501,7 +502,7 @@ class io_client final : private libk::noncopyable_nonmovable {
             return own.status != STATUS_OK ? own.status : peer.status;
         }
         channel_ = std::move(client_fixed);
-        return open(directory, server_fixed.selector(), pool, cspace, events, vspace, address,
+        return open(directory, server_fixed.selector(), pool, events, vspace, address,
                     value, writable_payload, deadline);
     }
 
@@ -519,6 +520,7 @@ class io_client final : private libk::noncopyable_nonmovable {
             sys::exit(rc);
         channel_ = {};
         peer_event_ = {};
+        if (const auto rc = notice_.close(); rc != STATUS_OK) sys::exit(rc);
         writable_payload_ = false;
         return status;
     }
@@ -545,6 +547,7 @@ class io_client final : private libk::noncopyable_nonmovable {
         return STATUS_OK;
     }
     [[nodiscard]] auto completion(io_done& result, uint64_t id = 0) noexcept -> status_t {
+        (void)notice_.take();
         requests_->poll();
         if (!requests_->error()) {
             const auto status = flush();
@@ -570,7 +573,7 @@ class io_client final : private libk::noncopyable_nonmovable {
                 return status;
             auto waiting = arm();
             if (waiting == STATUS_OK)
-                waiting = sys::notification_wait(events_, deadline).status;
+                waiting = ev_wait(events_, deadline).status;
             // A wait timeout is not a terminal completion. The caller retains
             // its buffer borrow until completion() returns the real result.
             if (waiting == STATUS_TIMED_OUT)
@@ -589,7 +592,10 @@ class io_client final : private libk::noncopyable_nonmovable {
         return submitted || consumed ? sys::notification_signal(peer_event_.selector()).status
                                      : STATUS_OK;
     }
-    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
+    [[nodiscard]] auto arm() noexcept -> status_t {
+        const auto status = notice_.arm();
+        return status == STATUS_OK ? control_.arm().status : status;
+    }
 
   private:
     auto map_pages(cap_t vm, uintptr_t address, msg_packet& packet, bool writable) -> status_t {
@@ -604,12 +610,13 @@ class io_client final : private libk::noncopyable_nonmovable {
         return s;
     }
 
-    auto open(cap_t directory, cap_t server, cap_t pool, cap_t cspace, cap_t events, cap_t vspace,
+    auto open(cap_t directory, cap_t server, CreateAuth pool, cap_t events, cap_t vspace,
               uintptr_t address, uint64_t& value, bool writable, uint64_t deadline) -> status_t {
         events_ = events;
-        auto status = control_.open(channel_.selector(), events);
+        auto status = notice_.open(pool, events);
+        if (status == STATUS_OK) status = control_.open(channel_.selector(), events);
         if (status == STATUS_OK)
-            status = rpc_.open(directory, pool, cspace, events);
+            status = rpc_.open(directory, pool);
         msg_frame request{.operation = static_cast<uint64_t>(io_control::Open),
                        .value = io_queue_depth,
                        .deadline = deadline};
@@ -617,14 +624,14 @@ class io_client final : private libk::noncopyable_nonmovable {
         size_t count{};
         if (server)
             caps[count++] = {server, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_CLOSE, CAP_COPY, 0};
-        caps[count++] = {events, RIGHT_SIGNAL, CAP_COPY, 0};
+        caps[count++] = {notice_.selector(), RIGHT_SIGNAL, CAP_COPY, 0};
         msg_packet packet;
         if (status == STATUS_OK)
             status = rpc_.exchange(request, packet, std::span{caps}.first(count));
         if (status == STATUS_OK)
             status = map_pages(vspace, address, packet, writable);
         if (status == STATUS_OK)
-            status = rpc_.open(channel_.selector(), pool, cspace, events);
+            status = rpc_.open(channel_.selector(), pool);
         if (status != STATUS_OK) {
             if (const auto rc = control_.close(); rc != STATUS_OK)
                 sys::exit(rc);
@@ -644,6 +651,7 @@ class io_client final : private libk::noncopyable_nonmovable {
     rpc_client rpc_;
     io_mem memory_;
     cap_owner peer_event_;
+    ev_notice notice_;
     bool writable_payload_{};
     std::optional<io_tx> queue_;
     std::optional<io_requests> requests_;
@@ -653,7 +661,7 @@ class io_client final : private libk::noncopyable_nonmovable {
 // The caller retains object identity and output until the final callback.
 class io_server final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto open(cap_t channel, cap_t events, cap_t pool, cap_t vspace, cap_t cspace,
+    [[nodiscard]] auto open(cap_t channel, cap_t events, CreateAuth pool, CreateAuth control, cap_t vspace, cap_t cspace,
                             uintptr_t address, uint64_t value = 0,
                             bool writable_payload = false) noexcept -> status_t {
         cspace_ = cspace;
@@ -663,7 +671,8 @@ class io_server final : private libk::noncopyable_nonmovable {
             return status;
         events_ = events;
         value_ = value;
-        return control_.open(channel, events);
+        const auto observed = notice_.open(control, events);
+        return observed == STATUS_OK ? control_.open(channel, events) : observed;
     }
 
     void abort() noexcept {
@@ -689,10 +698,12 @@ class io_server final : private libk::noncopyable_nonmovable {
             sys::exit(rc);
         queue_.reset();
         peer_event_ = {};
+        if (const auto rc = notice_.close(); rc != STATUS_OK) sys::exit(rc);
         closing_ = false;
     }
 
     template <class Handler> [[nodiscard]] auto poll(Handler&& application) noexcept -> status_t {
+        (void)notice_.take();
         if (reply_)
             return STATUS_OK;
         msg_packet packet;
@@ -713,7 +724,7 @@ class io_server final : private libk::noncopyable_nonmovable {
         const auto& message = packet.message;
         reply_to_ = std::move(packet.capabilities[0]);
         reply_.emplace();
-        reply_->message = msg_frame{.operation = message.operation};
+        reply_->message = msg_frame{.operation = message.operation, .sequence = message.sequence};
         const auto admitted = rt_admit(message.deadline);
         if (admitted != STATUS_OK)
             reply_->message.status = admitted;
@@ -743,7 +754,7 @@ class io_server final : private libk::noncopyable_nonmovable {
                         return STATUS_INTERNAL;
                 }
                 const auto signal =
-                    sys::cap_duplicate(events_, cspace_, RIGHT_SIGNAL | RIGHT_DUPLICATE);
+                    sys::cap_duplicate(notice_.selector(), cspace_, RIGHT_SIGNAL | RIGHT_DUPLICATE);
                 if (signal.status != STATUS_OK)
                     return reject(signal.status);
                 if (!reply_->offer(cap_owner{signal.value}, RIGHT_SIGNAL))
@@ -774,7 +785,10 @@ class io_server final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto payload() noexcept -> uint8_t* { return memory_.payload(); }
     [[nodiscard]] auto closing() const noexcept -> bool { return closing_; }
     [[nodiscard]] auto failed() const noexcept -> bool { return closing_ && !peer_event_; }
-    [[nodiscard]] auto arm() noexcept -> status_t { return control_.arm().status; }
+    [[nodiscard]] auto arm() noexcept -> status_t {
+        const auto status = notice_.arm();
+        return status == STATUS_OK ? control_.arm().status : status;
+    }
 
     [[nodiscard]] auto flush(bool close_ready, status_t close_status = STATUS_OK) noexcept -> status_t {
         if (queue_) {
@@ -798,7 +812,7 @@ class io_server final : private libk::noncopyable_nonmovable {
             // The slot's own mappings use their root grants and remain resident.
             for (auto& exported : exports_)
                 if (exported) {
-                    const auto status = sys::cap_revoke(exported.selector(), true).status;
+                    const auto status = sys::cap_revoke(exported.selector()).status;
                     if (status != STATUS_OK)
                         return status;
                     exported = {};
@@ -819,6 +833,7 @@ class io_server final : private libk::noncopyable_nonmovable {
     io_mem memory_;
     std::optional<io_rx> queue_;
     cap_owner peer_event_;
+    ev_notice notice_;
     cap_owner exports_[3];
     std::optional<msg_reply> reply_;
     cap_owner reply_to_;

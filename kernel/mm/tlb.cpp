@@ -21,6 +21,12 @@ Flush::~Flush() noexcept {
 bool Flush::release(resource::Charge &refund) noexcept {
     if (!complete()) return false;
     libk_assert(!refund);
+    for (usize i = 0; i < 8 && pages_.page_count(); ++i) {
+        auto page = pages_.take();
+        if (!page) break;
+        page->reset();
+    }
+    if (pages_.page_count()) return false;
     pages_.reset();
     refund = std::move(fee_);
     if (owner_) {

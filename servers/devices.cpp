@@ -44,7 +44,7 @@ struct dv_bus {
             if (!span || child > UINT64_MAX - bytes) return std::unexpected(STATUS_BAD_ARGS);
             bus.windows.push_back({child, span->address, bytes, child, kind});
         }
-        const auto memory = sys::memory_create_physical(env.pool, env.selector(dv_physical), reg->address, reg->size, VM_READ | VM_WRITE);
+        const auto memory = sys::memory_create_physical(env.alloc(), env.selector(dv_physical), reg->address, reg->size, VM_READ | VM_WRITE);
         if (memory.status != STATUS_OK) return std::unexpected(memory.status);
         bus.ecam = cap_owner{memory.value};
         const auto status = bus.config.open(env.vspace, 0, 1 << 20);
@@ -108,10 +108,13 @@ struct dv_device {
     uint16_t rid;
     uint32_t did, source;
     std::string name;
-    cap_owner group, space, irq;
+    cap_owner account, scope, space, irq;
+    auto alloc() const noexcept -> CreateAuth { return {account.selector(), scope.selector()}; }
     std::array<vm_area, 6> bars;
     uint64_t instance{}, incarnation{};
     std::array<uint64_t, 6> addresses{};
+    dv_device(uint16_t rid, uint32_t did, uint32_t source, std::string name)
+        : rid(rid), did(did), source(source), name(std::move(name)) {}
     auto reset(dv_pci cfg) -> status_t {
         cfg.write<uint16_t>(4, 2 | (1 << 10)); // disable bus mastering and INTx
         std::array<std::pair<uintptr_t, size_t>, 6> views;
@@ -133,10 +136,13 @@ struct dv_device {
     }
     auto prepare(const rt_env& env, dv_bus& bus) -> status_t {
         ++incarnation;
-        const auto made = sys::resource_create_child(env.pool, 4 * 1024 * 1024, 128,
+        const auto made = sys::account_create(env.alloc(), 4 * 1024 * 1024, 128,
             OBJ_BIT(ObjMem) | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
         if (made.status != STATUS_OK) return made.status;
-        group = cap_owner{made.value};
+        account = cap_owner{made.value};
+        const auto owner = sys::scope_create(env.alloc());
+        if (owner.status != STATUS_OK) return owner.status;
+        scope = cap_owner{owner.value};
         auto fn = bus.function(rid);
         if (!fn) return fn.error();
         fn->write<uint16_t>(4, 1 << 10);
@@ -165,7 +171,7 @@ struct dv_device {
             fn->write<uint32_t>(0x10 + n * 4, static_cast<uint32_t>(address) | flags);
             if (bar.wide) fn->write<uint32_t>(0x14 + n * 4, address >> 32);
             addresses[n] = *physical;
-            const auto mem = sys::memory_create_physical(group.selector(), env.selector(dv_physical), *physical, bytes, VM_READ | VM_WRITE);
+            const auto mem = sys::memory_create_physical(alloc(), env.selector(dv_physical), *physical, bytes, VM_READ | VM_WRITE);
             if (mem.status != STATUS_OK) return mem.status;
             auto mapping = vm_area::map(env.vspace, cap_owner{mem.value}, 0, bytes, VM_READ | VM_WRITE);
             if (!mapping) return mapping.error();
@@ -173,10 +179,10 @@ struct dv_device {
         }
         const auto status = reset(*fn);
         if (status != STATUS_OK) return status;
-        const auto interrupt = sys::irq_create(group.selector(), env.selector(dv_interrupts), source);
+        const auto interrupt = sys::irq_create(alloc(), env.selector(dv_interrupts), source);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         irq = cap_owner{interrupt.value};
-        const auto domain = sys::io_space_create(group.selector(), env.selector(dv_iommu), did);
+        const auto domain = sys::io_space_create(alloc(), env.selector(dv_iommu), did);
         if (domain.status != STATUS_OK) return domain.status;
         space = cap_owner{domain.value};
         for (;;) {
@@ -205,7 +211,7 @@ struct dv_device {
             status = sv_grant_cap(root, instance, dv_regs[n], bars[n].memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE, bars[n].size);
             if (status != STATUS_OK) return status;
         }
-        auto config = vm_area::create(env.pool, env.vspace, 0, 4096);
+        auto config = vm_area::create(env.alloc(), env.vspace, 0, 4096);
         if (!config) return config.error();
         const auto fn = bus.function(rid);
         if (!fn) return fn.error();
@@ -218,6 +224,7 @@ struct dv_device {
         if (status == STATUS_OK) status = sv_grant_cap(root, instance, dv_space, space.selector(), RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE | RIGHT_DUPLICATE);
         if (status == STATUS_OK) status = sv_grant_cap(root, instance, dv_irq, irq.selector(), RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE);
         if (status == STATUS_OK) status = sv_grant_cap(root, instance, io_memory, env.selector(io_memory), RIGHT_CREATE);
+        if (status == STATUS_OK) status = sv_grant_cap(root, instance, io_scope, env.selector(io_scope), RIGHT_CREATE);
         if (status != STATUS_OK) return status;
         const std::string_view service{blk_service.name};
         request = {.operation=static_cast<uint64_t>(sv_op::Provide), .value=instance, .size=sizeof(sv_query) + service.size()};
@@ -232,38 +239,36 @@ struct dv_device {
         return root.exchange(request);
     }
     auto retire(dv_pci cfg) -> status_t {
-        auto status = sys::io_space_close(space.selector()).status;
+        auto status = io_close(space.selector());
         if (status != STATUS_OK) return status;
-        for (;;) {
-            const auto state = sys::io_space_state(space.selector());
-            if (state.status != STATUS_OK) return state.status;
-            if (state.value == IO_SPACE_CLOSED) break;
-            if (state.value == IO_SPACE_FAILED) return STATUS_BACKING_FAILED;
-            sys::yield();
-        }
         status = reset(cfg);
         if (status != STATUS_OK) return status;
         for (auto& bar : bars) if ((status = bar.close()) != STATUS_OK) return status;
         space = {}; irq = {};
-        for (;;) {
-            status = sys::resource_close(group.selector()).status;
-            if (status == STATUS_OK) break;
-            if (status != STATUS_BUSY && status != STATUS_RETRY) return status;
-            sys::yield();
-        }
-        return group.close();
+        status = sys::scope_close(scope.selector()).status;
+        if (status != STATUS_OK) return status;
+        status = sys::wait_one(scope.selector(), STATE_DRAINED).status;
+        if (status != STATUS_OK) return status;
+        if ((status = scope.close()) != STATUS_OK) return status;
+        status = sys::account_close(account.selector()).status;
+        if (status != STATUS_OK) return status;
+        status = sys::wait_one(account.selector(), STATE_DRAINED).status;
+        if (status != STATUS_OK) return status;
+        status = sys::object_destroy(account.selector()).status;
+        if (status != STATUS_OK) return status;
+        return account.close();
     }
 };
 
 int main() {
     const auto& env = rt_startup();
-    const auto event = sys::notification_create(env.pool, 1);
+    const auto event = sys::port_create(env.alloc(), 8, 4);
     if (event.status != STATUS_OK) sys::exit(event.status);
     cap_owner replies{event.value};
     rpc_client root;
     // Reply readiness is local to RPC. It must not retrigger the lifecycle
     // loop's next query and manufacture an endless stream of reply channels.
-    auto status = root.open(env.selector(sv_service), env.pool, env.cspace, replies.selector());
+    auto status = root.open(env.selector(sv_service), env.alloc());
     if (status != STATUS_OK) sys::exit(status);
     auto boot = vm_area::map(env.vspace, cap_owner{sys::cap_duplicate(env.selector(dv_config), 0, RIGHT_MAP).value}, 0, 4096, VM_READ);
     if (!boot) sys::exit(boot.error());
@@ -306,14 +311,15 @@ int main() {
                     if (!requester || !irq) continue;
                     char name[24] = "block-";
                     const auto text = std::to_chars(name + 6, name + sizeof(name), rid, 16);
-                    device.emplace(rid, *requester, *irq, std::string{name, text.ptr}, cap_owner{}, cap_owner{}, cap_owner{}, std::array<vm_area, 6>{}, 0, 0, std::array<uint64_t, 6>{});
+                    device.emplace(rid, *requester, *irq, std::string{name, text.ptr});
                 }
             }
         }
     }
     msg_rx management{env.selector(mg_devices), env.events};
+    mg_watch watches{env.events};
     ch_pair lifecycle;
-    if (const auto status = lifecycle.open(env.pool, 1, 0); status != STATUS_OK) sys::exit(status);
+    if (const auto status = lifecycle.open(env.alloc(), 1, 0); status != STATUS_OK) sys::exit(status);
     const auto sender = sys::channel_mint(lifecycle.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
     if (sender.status != STATUS_OK) sys::exit(sender.status);
     cap_owner changes{sender.value};
@@ -331,11 +337,13 @@ int main() {
             msg_packet packet;
             const auto received = management.receive(packet);
             if (received == STATUS_WOULD_BLOCK) break;
-            if (received != STATUS_OK || packet.count != 1) continue;
+            if (received != STATUS_OK) continue;
+            if (packet.count != 1) continue;
+            const auto reply = packet.capabilities[0].selector();
             msg_reply response;
             auto& message = response.message;
             const auto& request = packet.message;
-            message.operation = request.operation;
+            message.operation = request.operation; message.sequence = request.sequence;
             message.status = STATUS_NOT_FOUND;
             if (packet.badge != mg_control && packet.badge != mg_observe) message.status = STATUS_DENIED;
             else if (device && request.operation == static_cast<uint64_t>(mg_op::Devices) && request.value < uint64_t{device->rid} + 1) {
@@ -353,7 +361,7 @@ int main() {
                 ::memcpy(query.data, device->name.data(), query.size);
                 if (root.exchange(query) == STATUS_OK) {
                     row.state = static_cast<uint32_t>(query.value);
-                    if (row.state == static_cast<uint32_t>(mg_state::Stopped) && device->group)
+                    if (row.state == static_cast<uint32_t>(mg_state::Stopped) && device->account)
                         row.state = static_cast<uint32_t>(mg_state::Draining);
                     if (row.state == static_cast<uint32_t>(mg_state::Running)) {
                         const auto cfg = bus->function(device->rid);
@@ -364,6 +372,19 @@ int main() {
                 ::memcpy(row.name, device->name.data(), std::min(device->name.size(), sizeof(row.name) - 1));
                 mg_pack(message, row); message.value = row.id;
                 message.deadline = sys::clock_now().value;
+            } else if (device && (request.operation == static_cast<uint64_t>(mg_op::Caps)
+                || (request.operation >= static_cast<uint64_t>(mg_op::Members) && request.operation <= static_cast<uint64_t>(mg_op::GrantView))
+                || request.operation == static_cast<uint64_t>(mg_op::Changed))) {
+                mg_target expected;
+                if (request.size != sizeof(expected)) message.status = STATUS_BAD_ARGS;
+                else {
+                    ::memcpy(&expected, request.data, sizeof(expected));
+                    if (request.value != uint64_t{device->rid} + 1 || expected.incarnation != device->incarnation) message.status = STATUS_STALE;
+                    else if (!device->scope) message.status = STATUS_CLOSED;
+                    else if (request.operation == static_cast<uint64_t>(mg_op::Changed))
+                        watches.accept(device->scope.selector(), 0, expected, packet.capabilities[0], request, message);
+                    else mg_project(device->scope.selector(), 0, static_cast<mg_op>(request.operation), expected, message);
+                }
             } else if (device && request.operation == static_cast<uint64_t>(mg_op::DeviceAction)) {
                 if (packet.badge != mg_control) message.status = STATUS_DENIED;
                 else if (request.size != sizeof(mg_target)) message.status = STATUS_BAD_ARGS;
@@ -382,8 +403,9 @@ int main() {
                     }
                 }
             }
-            response.respond(packet.capabilities[0].selector());
+            if (request.operation != static_cast<uint64_t>(mg_op::Changed) || message.status != STATUS_PENDING) response.respond(reply);
         }
+        const auto deadline = watches.poll();
         (void)management.arm();
         if (device) {
             msg_frame query{.operation=static_cast<uint64_t>(sv_op::List), .size=device->name.size()};
@@ -399,16 +421,15 @@ int main() {
                 (void)fn->read<uint16_t>(4);
                 if (!ready) {
                     if ((status = sys::notification_signal(env.selector(sv_ready)).status) != STATUS_OK) sys::exit(status);
-                    if ((status = sys::notification_signal(env.selector(sv_wake)).status) != STATUS_OK) sys::exit(status);
                     ready = true;
                 }
             } else if (query.value == static_cast<uint64_t>(sv_state::Stopped)) {
                 const auto fn = bus->function(device->rid);
                 if (!fn) sys::exit(fn.error());
-                if (device->group && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
+                if (device->account && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
                 if (!observed.desired) {
                     (void)management.arm(); (void)life.arm();
-                    if ((status = sys::notification_wait(env.events).status) != STATUS_OK) sys::exit(status);
+                    if ((status = ev_wait(env.events, deadline).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
                     continue;
                 }
                 msg_frame remove{.operation=static_cast<uint64_t>(sv_op::Remove), .value=device->instance};
@@ -419,10 +440,9 @@ int main() {
             }
         } else if (!ready) {
             if ((status = sys::notification_signal(env.selector(sv_ready)).status) != STATUS_OK) sys::exit(status);
-            if ((status = sys::notification_signal(env.selector(sv_wake)).status) != STATUS_OK) sys::exit(status);
             ready = true;
         }
         (void)management.arm(); (void)life.arm();
-        if ((status = sys::notification_wait(env.events).status) != STATUS_OK) sys::exit(status);
+        if ((status = ev_wait(env.events, deadline).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
     }
 }

@@ -7,7 +7,7 @@
 #include <sync.hpp>
 #include <object/ref.hpp>
 #include <cap/grant.hpp>
-#include <resource/sponsorship.hpp>
+#include <resource/account.hpp>
 #include <work.hpp>
 #include <libk/assert.hpp>
 #include <base/slab.hpp>
@@ -29,119 +29,146 @@ class Graph;
 
 namespace object {
 
-class Member;
+class Membership;
+class Transfer;
 
-class group final : private libk::noncopyable_nonmovable {
-  public:
-    enum class phase : u8 {
-        open = GROUP_OPEN,
-        closing = GROUP_CLOSING,
-        closed = GROUP_CLOSED,
-    };
-
-    explicit group(resource::budget limit) noexcept;
-    ~group() noexcept;
-
-    [[nodiscard]] auto reserve(ref<> self, resource::budget charge) noexcept
-        -> std::expected<resource::Reservation, resource::errc>;
-
-    auto info(u64) const noexcept -> GroupInfo;
-    [[nodiscard]] auto limit() const noexcept -> resource::budget;
-    [[nodiscard]] auto available() const noexcept -> resource::budget;
-    [[nodiscard]] auto sponsorship_count() const noexcept -> usize;
-    [[nodiscard]] auto state() const noexcept -> phase;
-    [[nodiscard]] auto close() noexcept -> phase;
-    [[nodiscard]] auto observe_refund(const ref<>& self, resource::RefundNotifier notifier) noexcept -> bool;
-    void retire(cleanup&&) noexcept;
-
-  private:
-    friend struct traits<group>;
-    template<class T> friend class pool;
-    friend class resource::Reservation;
-    friend class resource::Refund;
-    friend class resource::Charge;
-    friend class resource::Sponsorship;
-    friend class Member;
-
-    void bind_sponsor(resource::Sponsorship& sponsor) noexcept {
-        libk_assert(sponsor_ == nullptr);
-        sponsor_ = &sponsor;
-    }
-
-    [[nodiscard]] auto reserve(const resource::Sponsorship& parent, resource::budget charge) noexcept
-        -> std::expected<resource::Reservation, resource::errc>;
-    void cancel(resource::budget amount) noexcept;
-    void commit() noexcept;
-    void commit(Member& member) noexcept;
-    void ready(Member& member) noexcept;
-    void close_member(Member& member) noexcept;
-    void attach(Member& member) noexcept;
-    void detach(Member& member) noexcept;
-    void attach(resource::Sponsorship& sponsorship) noexcept;
-    void detach(resource::Sponsorship& sponsorship) noexcept;
-    void refund(resource::budget amount) noexcept;
-    void service() noexcept;
-    [[nodiscard]] auto closed_locked() const noexcept -> bool;
-
-    mutable sync::Spin lock_{};
-    resource::Sponsorship* sponsor_{};
-    resource::account account_;
-    phase state_{phase::open};
-    Member* members_{};
-    usize sponsorship_count_{};
-    bool servicing_{};
-    cleanup cleanup_{};
-};
-
-// Embedded in the object slot. The initial grant root closes the entire
-// lineage before this member retires its target.
-class Member final : private libk::noncopyable_nonmovable {
-    enum class phase : u8 {
-        empty,
-        pending,
-        live,
-        revoking,
-        revoked,
-        retiring,
-    };
-
-  public:
-    Member() noexcept;
-    ~Member() noexcept;
-
-  private:
-    friend class group;
-    template<class T> friend class pool;
-
-    auto root(cap::Graph&, resource::Reservation&&, ref<>, cap::View) noexcept
-        -> std::expected<cap::GrantRef, cap::GrantError>;
+// This is solely a lifecycle index; fees and authorization live elsewhere.
+class Membership final : private libk::noncopyable_nonmovable {
+    enum class Phase : u8 { Empty, Pending, Live, Retiring };
+    friend class Scope;
+    friend class Control;
+    friend void changed(Key) noexcept;
+    friend class Transfer;
+    template<class> friend class pool;
+    ref<Scope> owner_ref_;
+    Scope* owner_{};
+    Key target_{};
+    libk::intrusive_tree_hook hook_;
+    auto id() const noexcept -> u64 { return reinterpret_cast<anchor*>(target_.slot)->id_.value; }
+    Membership* pending_previous_{};
+    Membership* pending_next_{};
+    u64 epoch_{1};
+    Phase phase_{Phase::Empty};
+    bool close_requested_{}, announced_{};
+    bool queued_{};
+    void dequeue() noexcept;
     void commit() noexcept;
     void abort() noexcept;
-    void retire() noexcept;
-    void ready() noexcept;
     void detach() noexcept;
-    auto pin() const noexcept -> ref<>;
-
-    resource::Sponsorship fee_{};
-    group* owner_{};
-    cap::Graph* graph_{};
-    cap::GrantKey root_{};
-    Id target_{};
-    ref<> hold_{};
-    cap::GrantRevoke revoke_{};
-    Member* previous_{};
-    Member* next_{};
-    phase phase_{phase::empty};
-    bool independent_close_{};
+    auto pin_target() const noexcept -> ref<>;
+    auto close() noexcept -> bool;
+public:
+    Membership() noexcept = default;
+    ~Membership() noexcept { libk_assert(!owner_ && !owner_ref_ && phase_ == Phase::Empty); }
 };
 
-} // namespace object
+class Scope final : private libk::noncopyable_nonmovable {
+public:
+    enum class Phase : u8 { Open = OBJECT_OPEN, Closing = OBJECT_CLOSING, Drained = OBJECT_DRAINED };
+    class Admission {
+        friend class Scope;
+        template<class> friend class pool;
+        ref<Scope> owner_;
+        pin use_;
+        Admission(ref<Scope> owner, pin use) noexcept : owner_(std::move(owner)), use_(std::move(use)) {}
+        auto attach(Membership&, Key) noexcept -> bool;
+    public:
+        Admission() noexcept = default;
+        Admission(Admission&&) noexcept = default;
+        auto operator=(Admission&&) noexcept -> Admission& = default;
+    };
+    static constexpr bool fixed_bill = true;
+    Scope() noexcept { events_.update(STATE_OPEN); }
+    ~Scope() noexcept;
+    static auto reserve(ref<Scope>) noexcept -> std::expected<Admission, error>;
+    auto control() noexcept -> Control& { return control_; }
+    auto events() noexcept -> Source& { return events_; }
+    auto close() noexcept -> Phase;
+    auto info(u64, u64 kinds = OBJ_KINDS) const noexcept -> ScopeInfo;
+    auto inspect(Id source, ScopeCursor, u64 kinds, ScopeMembers&, usize depth = 1) const noexcept -> status_t;
+    // ID lookup borrows storage only within this explicit observation scope.
+    auto lookup(Id, u64 kinds, usize depth) const noexcept -> ref<>;
+    auto describe(Id, u64 kinds, usize depth) const noexcept -> std::expected<ScopeObject, status_t>;
+    auto contains(Id, u64 kinds, usize depth) const noexcept -> bool;
+    void retire(cleanup&&) noexcept;
+    void bind_membership(Membership& member) noexcept { membership_ = &member; }
+    void bind_work(WorkQueue& work, Key owner) noexcept { work_ = &work; job_.bind(owner); events_.bind_work(work, owner); }
+    static auto adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch, cap::Graph::Admission authority = {}) noexcept
+        -> std::expected<u64, status_t>;
+private:
+    friend class Membership;
+    friend class ipc::Port;
+    friend void changed(Key) noexcept;
+    friend class Transfer;
+    friend class Control;
+    template<class> friend class pool;
+    class Flight {
+        Scope& owner_;
+    public:
+        explicit Flight(Scope& owner) noexcept : owner_(owner) { sync::Lock guard{Control::lock}; ++owner_.calls_; }
+        ~Flight() noexcept { owner_.finish_call(true); }
+    };
+    void changed(bool schedule = true) noexcept;
+    void post() noexcept;
+    void service() noexcept;
+    void complete() noexcept { finish_call(false); }
+    void finish_call(bool release) noexcept;
+    auto find(Id, u64 kinds, usize depth) const noexcept -> anchor*;
+    Control control_;
+    Membership* membership_{};
+    struct Compare {
+        bool operator()(const Membership& a, const Membership& b) const noexcept { return a.id() < b.id(); }
+        bool operator()(u64 a, const Membership& b) const noexcept { return a < b.id(); }
+        bool operator()(const Membership& a, u64 b) const noexcept { return a.id() < b; }
+    };
+    libk::intrusive_tree<Membership, &Membership::hook_, Compare> members_;
+    std::array<usize, ObjCount> kinds_{};
+    Membership* scan_{};
+    Membership* pending_{};
+    Phase phase_{Phase::Open};
+    u64 version_{1};
+    bool servicing_{}, dirty_{};
+    usize calls_{};
+    Src<STATE_OPEN | STATE_CLOSING | STATE_DRAINED> events_{Source::Drained::bind<&Scope::complete>(*this)};
+    cleanup cleanup_;
+    WorkQueue* work_{};
+    Work job_{Work::Fn::bind<&Scope::service>(*this)};
+};
 
-namespace resource {
-class Sponsorship;
-}
-
-namespace object {
+// Concrete ownership/payment transaction. The replacement owner reference
+// is prepared here; final commit moves it without cloning under Gate locks.
+class Transfer final : private libk::noncopyable {
+    ref<> target_, source_, destination_;
+    ref<Scope> replacement_;
+    u64 epoch_{};
+    cap::Graph::Admission authority_;
+    auto check() const noexcept -> status_t;
+    void commit() noexcept;
+public:
+    Transfer(ref<> target, ref<Scope> source, ref<Scope> destination, u64 epoch,
+        cap::Graph::Admission authority = {}) noexcept
+        : target_(std::move(target)), source_(source), destination_(destination),
+          replacement_(std::move(destination)), epoch_(epoch), authority_(authority) {}
+    auto validate() const noexcept -> status_t { sync::Lock guard{Control::lock}; return check(); }
+    auto epoch() const noexcept -> u64 { return epoch_; }
+    auto adopt() noexcept -> std::expected<u64, status_t>;
+    template<class Commit> auto publish(std::span<const ref<>*> fees, Commit&& apply) noexcept -> status_t {
+        libk_assert(Control::lock.held());
+        const auto valid = check();
+        if (valid != STATUS_OK) return valid;
+        std::array<const ref<>*, 5> gates;
+        libk_assert(fees.size() <= 3);
+        std::copy(fees.begin(), fees.end(), gates.begin());
+        auto count = fees.size();
+        if (source_) { gates[count++] = &source_; gates[count++] = &destination_; }
+        const auto status = authority_.publish(std::span{gates.data(), count}, [&] { apply(); commit(); });
+        if (status == STATUS_OK && source_) {
+            static_cast<Scope*>(source_.get())->post();
+            static_cast<Scope*>(destination_.get())->post();
+        }
+        return status;
+    }
+};
 
 // Payload hooks own retirement policy. Objects without a hook only need the
 // common lifetime gate and their destructor; the pool has no type whitelist.
@@ -155,12 +182,75 @@ template <typename T> struct traits {
     {
         value.retire(std::move(cleanup));
     }
-    static void bind_sponsor(T& value, resource::Sponsorship& charge) noexcept
-        requires requires { value.bind_sponsor(charge); }
+    static void bind_funding(T& value, resource::Funding& charge) noexcept
+        requires requires { value.bind_funding(charge); }
     {
-        value.bind_sponsor(charge);
+        value.bind_funding(charge);
     }
 };
+
+// The caller pauses its concrete allocation owner before entering this
+// transaction. Scratch and replacement references are paid and prepared
+// outside publication locks; every recorded pointer names a real Charge.
+template<class Visit, class Commit, class Authority>
+auto rebill(mm::Pmm& pmm, resource::Funding& funding, const ref<>& target, const ref<>& from,
+    const ref<>& to, u64 epoch, resource::budget ceiling, Visit&& visit, Commit&& commit, Authority& authority) noexcept
+    -> std::expected<u64, status_t> {
+    if (from.id() == to.id()) return std::unexpected(STATUS_BAD_ARGS);
+    const auto paused = funding.pause(from, epoch);
+    if (paused != STATUS_OK) return std::unexpected(paused);
+    libk::scope_exit resume{[&]() noexcept { funding.resume(); }};
+    struct Change { resource::Charge* target{}; ref<> payer; Change* next{}; };
+    resource::budget total = funding.charge();
+    usize count{};
+    bool valid = true;
+    visit([&](resource::Charge& fee) {
+        if (!fee) return;
+        const auto memory = libk::checked_add(total.memory, fee.amount().memory);
+        const auto caps = libk::checked_add(total.caps, fee.amount().caps);
+        if (fee.payer().id() != from.id() || !memory || !caps || count == std::numeric_limits<usize>::max()) {
+            valid = false; return;
+        }
+        total = {*memory, *caps}; ++count;
+    });
+    if (!valid) return std::unexpected(STATUS_BUSY);
+    const auto bytes = libk::checked_multiply(mm::Slab<Change, false>::quota_for(count).pages, mm::page_size);
+    const auto peak = bytes ? libk::checked_add(total.memory, *bytes) : std::nullopt;
+    if (!peak || !ceiling.contains({*peak, total.caps})) return std::unexpected(STATUS_DENIED);
+    auto account = to.as<resource::Account>();
+    if (!account) return std::unexpected(STATUS_INVALID_CAP);
+    auto reserved = account->get().reserve(to, total);
+    if (!reserved) return std::unexpected(reserved.error() == resource::errc::closed ? STATUS_CLOSED : STATUS_NO_MEMORY);
+    auto payment = std::move(*reserved).commit();
+    mm::Slab<Change, false> scratch{pmm};
+    Change* head{};
+    libk::scope_exit clear{[&]() noexcept {
+        while (head) { auto* item = head; head = head->next; scratch.destroy(*item); }
+    }};
+    for (usize i = 0; i < count; ++i) {
+        auto made = scratch.create(to);
+        if (!made) return std::unexpected(STATUS_NO_MEMORY);
+        (*made)->next = head; head = *made;
+    }
+    auto* entry = head;
+    visit([&](resource::Charge& fee) {
+        if (!fee) return;
+        libk_assert(entry);
+        entry->target = &fee;
+        entry->payer = to;
+        entry = entry->next;
+    });
+    libk_assert(!entry);
+    resource::Refund refund;
+    auto result = funding.reassign(target, from, to, epoch, payment, refund, [&] {
+        for (auto* change = head; change; change = change->next)
+            change->target->reassign(payment, change->payer);
+        commit();
+    }, [&](auto gates, auto&& publish) { return authority.publish(gates, publish); });
+    // One aggregate refund follows the lock boundary. Scratch holds only old
+    // refs after success; failed preparation leaves every owner intact.
+    return result;
+}
 
 template <typename T> class pool final : private libk::noncopyable_nonmovable {
     static_assert(kind<T> != ObjInvalid);
@@ -171,7 +261,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 
     struct Slot final {
         object::anchor anchor{};
-        libk::manual_lifetime<Member> member{};
+        libk::manual_lifetime<Membership> member{};
+        resource::Funding funding;
         PageHeader* page{};
         Slot* next_free{};
         Slot* next_reclaim{};
@@ -230,7 +321,10 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         }
         auto root(cap::Graph& graph, resource::Reservation&& fee, cap::View view) noexcept
             -> std::expected<cap::GrantRef, cap::GrantError> {
-            return token_.get()->member->root(graph, std::move(fee), reference(), view);
+            if (rooted_) return std::unexpected(cap::GrantError::InvalidState);
+            auto root = graph.create_root(std::move(fee), reference(), view);
+            if (root) rooted_ = true;
+            return root;
         }
 
       private:
@@ -238,6 +332,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         pending(pool& pool, Slot& slot) noexcept : token_(&slot, PendingRelease{&pool}) {}
 
         PendingToken token_{};
+        bool rooted_{};
     };
 
     explicit pool(mm::Pmm& pmm, WorkQueue& work) noexcept
@@ -257,6 +352,20 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     template <typename... Args>
     [[nodiscard]] auto create(Args&&... args) noexcept {
         return create(resource::Reservation{}, std::forward<Args>(args)...);
+    }
+
+    template<class... Args>
+    [[nodiscard]] auto create(Scope::Admission&& owner, resource::Reservation&& fee, Args&&... args) noexcept {
+        auto made = create(std::move(fee), std::forward<Args>(args)...);
+        if (made) {
+            auto* slot = made->token_.get();
+            if (!owner.attach(*slot->member, made->reference().key())) {
+                using Err = typename decltype(made)::error_type;
+                if constexpr (std::is_same_v<Err, error>) return decltype(made){std::unexpected(error::closed)};
+                else return decltype(made){std::unexpected(Err::InvalidState)};
+            }
+        }
+        return made;
     }
 
     template <typename... Args>
@@ -283,48 +392,63 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         }
         Slot* const slot = claimed.value();
         std::construct_at(slot->object(), std::forward<Args>(args)...);
-        if constexpr (requires { slot->object()->bind_work(*work_); })
-            slot->object()->bind_work(*work_);
+        if constexpr (requires { slot->object()->control(); }) slot->object()->control().bind(slot->anchor);
+        if constexpr (requires { slot->object()->bind_membership(*slot->member); })
+            slot->object()->bind_membership(*slot->member);
         if (sponsorship) {
-            slot->member->fee_.commit(std::move(sponsorship));
-            if constexpr (requires(T& object, resource::Sponsorship& owner) {
-                traits<T>::bind_sponsor(object, owner);
-            }) traits<T>::bind_sponsor(*slot->object(), slot->member->fee_);
+            slot->funding.commit(std::move(sponsorship));
+            if constexpr (requires { slot->object()->control(); })
+                slot->funding.bind_control(slot->object()->control());
+            if constexpr (requires(T& object, resource::Funding& owner) {
+                traits<T>::bind_funding(object, owner);
+            }) traits<T>::bind_funding(*slot->object(), slot->funding);
         }
         {
             sync::Lock guard{lock_};
             libk_assert(slot->anchor.phase_ == anchor::phase::constructing);
             slot->anchor.refs_ = 1;
+            slot->anchor.membership_ = &*slot->member;
             slot->anchor.phase_ = anchor::phase::live;
         }
+        if constexpr (requires { slot->object()->bind_work(*work_, Key{}); })
+            slot->object()->bind_work(*work_, Key{reinterpret_cast<usize>(&slot->anchor), slot->anchor.generation_});
+        slot->anchor.index(true);
         return (pending{*this, *slot});
     }
 
   public:
-    [[nodiscard]] auto lookup(Id id) noexcept -> std::expected<reference, error> {
+    [[nodiscard]] auto lookup(Key id) noexcept -> std::expected<reference, error> {
         sync::Lock guard{lock_};
         Slot* const slot = find_slot(id);
         if (slot == nullptr) {
             return std::unexpected(error::invalid_id);
         }
-        if (!add_ref_locked(slot->anchor, id.generation)) {
+        if (!slot->anchor.gate_.open() || !add_ref_locked(slot->anchor, id.generation)) {
             return std::unexpected(error::closed);
         }
         return (reference_of(*slot));
     }
 
   private:
-    [[nodiscard]] auto request_retire(Id id) noexcept -> bool {
+    [[nodiscard]] auto request_retire(Key id) noexcept -> bool {
         Slot* slot{};
+        bool start{}, scan{};
         {
             sync::Lock guard{lock_};
             slot = find_slot(id);
-            if (slot == nullptr || slot->anchor.phase_ != anchor::phase::live) return false;
-            slot->anchor.phase_ = anchor::phase::retiring;
-            libk_assert(slot->anchor.refs_ != std::numeric_limits<usize>::max());
-            ++slot->anchor.refs_;
+            if (!slot || slot->anchor.phase_ != anchor::phase::live) return false;
+            auto& anchor = slot->anchor;
+            scan = anchor.gate_.close();
+            anchor.phase_ = anchor::phase::closing;
+            libk_assert(anchor.refs_ != std::numeric_limits<usize>::max());
+            ++anchor.refs_;
+            start = anchor.gate_.empty();
+            if (start) anchor.phase_ = anchor::phase::draining;
         }
-        finish_retire(*slot, id.generation);
+        if (start) finish_retire(*slot, id.generation);
+        else if (scan) {
+            queue_scan(slot->anchor);
+        }
         return true;
     }
 
@@ -336,9 +460,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 
   private:
     void finish_retire(Slot& slot, u64 generation) noexcept {
-        // Group traversal pins live slots before releasing its lock. Once
-        // retirement begins, detach before cleanup can make this slot reusable.
-        slot.member->detach();
+        // Membership remains visible until the payload's real cleanup ACK.
         cleanup done{slot.anchor, generation};
         if constexpr (requires(T& value, cleanup&& token) { traits<T>::retire(value, std::move(token)); }) {
             traits<T>::retire(*slot.object(), std::move(done));
@@ -348,7 +470,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         }
     }
 
-    [[nodiscard]] auto find_slot(Id id) noexcept -> Slot* {
+    [[nodiscard]] auto find_slot(Key id) noexcept -> Slot* {
         if (!id.valid()) return nullptr;
         auto* slot = storage_.find(id.slot);
         return slot != nullptr && slot->anchor.generation_ == id.generation ? slot : nullptr;
@@ -360,10 +482,18 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                 sync::Lock guard{lock_};
                 if (storage_.exhausted()) return std::unexpected(error::exhausted);
                 if (auto entry = storage_.claim(); entry.slot != nullptr) {
+                    const auto id = new_id<anchor>();
+                    if (!id.valid()) {
+                        storage_.release(*entry.slot, false);
+                        return std::unexpected(error::exhausted);
+                    }
+                    entry.slot->anchor.id_ = id;
                     auto& anchor = entry.slot->anchor;
                     anchor.generation_ = entry.generation;
                     anchor.refs_ = 0;
-                    anchor.clean_ = anchor.queued_ = false;
+                    anchor.queued_ = false;
+                    anchor.scanning_ = false;
+                    anchor.gate_.reset();
                     anchor.phase_ = anchor::phase::constructing;
                     entry.slot->next_reclaim = nullptr;
                     (void)entry.slot->member.emplace();
@@ -408,41 +538,74 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     void retain(anchor& anchor, u64 generation) noexcept {
-        sync::Lock guard{lock_};
-        libk_assert(anchor.generation_ == generation && anchor.refs_ != 0);
-        libk_assert(anchor.phase_ == anchor::phase::live || anchor.phase_ == anchor::phase::retiring);
-        libk_assert(anchor.refs_ != std::numeric_limits<usize>::max());
-        ++anchor.refs_;
+        libk_assert(anchor.generation_ == generation);
+        const auto before = anchor.refs_.fetch_add(1, std::memory_order_relaxed);
+        libk_assert(before && before != std::numeric_limits<usize>::max());
     }
 
     void release_ref(anchor& anchor, u64 generation) noexcept {
-        bool queued{}, retire{};
+        auto refs = anchor.refs_.load(std::memory_order_relaxed);
+        while (refs > 1)
+            if (anchor.refs_.compare_exchange_weak(refs, refs - 1,
+                    std::memory_order_release, std::memory_order_relaxed)) return;
+        bool queued{}, retire{}, scan{};
         {
             sync::Lock guard{lock_};
             libk_assert(anchor.owner_ == this && anchor.generation_ == generation);
-            libk_assert(anchor.refs_ != 0);
-            --anchor.refs_;
-            if (anchor.refs_ == 0 && anchor.phase_ == anchor::phase::live) {
-                anchor.phase_ = anchor::phase::retiring;
-                ++anchor.refs_; // Cleanup owns the slot until its hook completes.
+            refs = anchor.refs_.load(std::memory_order_acquire);
+            for (;;) {
+                libk_assert(refs);
+                if (refs == 1 && anchor.phase_ == anchor::phase::live) break;
+                if (anchor.refs_.compare_exchange_weak(refs, refs - 1,
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) break;
+            }
+            if (refs == 1 && anchor.phase_ == anchor::phase::live) {
+                scan = anchor.gate_.close();
+                anchor.phase_ = anchor::phase::closing;
+                // Transfer this last Ref to cleanup without a transient zero:
+                // an installed Link may concurrently retain its pinned storage.
                 auto& slot = slot_of(anchor);
-                anchor.queued_ = true;
-                slot.next_reclaim = reclaim_head_;
-                reclaim_head_ = &slot;
-                retire = true;
+                if (anchor.gate_.empty()) {
+                    anchor.queued_ = true;
+                    slot.next_reclaim = reclaim_head_;
+                    reclaim_head_ = &slot;
+                    retire = true;
+                }
             } else queued = queue_reclaim_if_ready(slot_of(anchor));
+        }
+        if (scan) {
+            queue_scan(anchor);
         }
         if (retire || queued) notify_cleanup();
     }
 
+    void release_use(anchor& anchor, u64 generation) noexcept {
+        if (!anchor.gate_.leave()) return;
+        bool queued{};
+        {
+            sync::Lock guard{lock_};
+            libk_assert(anchor.generation_ == generation);
+            // The zero transition and reclaim decision share the pool lock:
+            // no worker may recycle this slot while this exit still uses it.
+            if (!anchor.gate_.finish_leave()) return;
+            if (anchor.phase_ == anchor::phase::closing && !anchor.queued_) {
+                auto& slot = slot_of(anchor);
+                anchor.queued_ = queued = true;
+                slot.next_reclaim = reclaim_head_;
+                reclaim_head_ = &slot;
+            }
+        }
+        if (queued) notify_cleanup();
+    }
+
     void finish_cleanup(anchor& anchor, u64 generation) noexcept {
+        slot_of(anchor).member->detach();
         bool queued{};
         {
             sync::Lock guard{lock_};
             libk_assert(anchor.owner_ == this && anchor.generation_ == generation);
-            libk_assert(anchor.phase_ == anchor::phase::retiring);
-            libk_assert(!anchor.clean_ && anchor.refs_ != 0);
-            anchor.clean_ = true;
+            libk_assert(anchor.phase_ == anchor::phase::draining && anchor.refs_ != 0);
+            anchor.phase_ = anchor::phase::quiescent;
             --anchor.refs_;
             queued = queue_reclaim_if_ready(slot_of(anchor));
         }
@@ -454,9 +617,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     static auto anchor_live(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
-        auto& pool = *static_cast<class pool*>(owner);
-        sync::Lock guard{pool.lock_};
-        return anchor.generation_ == generation && anchor.phase_ == anchor::phase::live;
+        (void)owner;
+        return anchor.generation_ == generation && anchor.gate_.open();
     }
 
     static auto anchor_try_retain(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
@@ -474,12 +636,12 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     static auto destroy(void* owner, anchor& anchor, u64 generation) noexcept -> bool {
         auto& storage = *static_cast<pool*>(owner);
         auto& member = *slot_of(anchor).member;
+        if (anchor.gate_.close()) {
+            storage.queue_scan(anchor);
+        }
         // The grant operation prevents managed-member detach until this call
         // returns; its target reference also pins the slot.
-        if (member.owner_) {
-            member.owner_->close_member(member);
-            return true;
-        }
+        if (member.close()) return true;
         return storage.request_retire({reinterpret_cast<usize>(&anchor), generation});
     }
 
@@ -488,7 +650,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         if (anchor.generation_ != generation) {
             return false;
         }
-        return static_cast<pool*>(owner)->request_retire(Id{
+        return static_cast<pool*>(owner)->request_retire(Key{
             .slot = reinterpret_cast<usize>(&anchor),
             .generation = generation,
         });
@@ -497,6 +659,17 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     static void anchor_finish_cleanup(void* owner, anchor& anchor, u64 generation) noexcept {
         static_cast<pool*>(owner)->finish_cleanup(anchor, generation);
     }
+
+    static void anchor_release_use(void* owner, anchor& anchor, u64 generation) noexcept {
+        static_cast<pool*>(owner)->release_use(anchor, generation);
+    }
+
+    static auto anchor_control(anchor& anchor) noexcept -> Control* {
+        if constexpr (requires(T& value) { value.control(); }) return &slot_of(anchor).object()->control();
+        else return nullptr;
+    }
+
+    static auto anchor_funding(anchor& anchor) noexcept -> resource::Funding* { return &slot_of(anchor).funding; }
 
     inline static constexpr anchor::Ops anchor_ops_{
         .retain = anchor_retain,
@@ -507,11 +680,14 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         .destroy = destroy,
         .request_retire = anchor_request_retire,
         .finish_cleanup = anchor_finish_cleanup,
+        .release_use = anchor_release_use,
+        .control = anchor_control,
+        .funding = anchor_funding,
     };
 
     [[nodiscard]] auto queue_reclaim_if_ready(Slot& slot) noexcept -> bool {
         anchor& anchor = slot.anchor;
-        if (anchor.phase_ != anchor::phase::retiring || !anchor.clean_ || anchor.refs_ != 0 ||
+        if (anchor.phase_ != anchor::phase::quiescent || anchor.refs_ != 0 ||
             anchor.queued_) {
             return false;
         }
@@ -522,10 +698,22 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     // Only the worker or exclusive pool teardown runs finalizers.
+    void queue_scan(anchor& target) noexcept {
+        {
+            sync::Lock guard{lock_};
+            libk_assert(!target.queued_ && !target.scanning_ && target.refs_ && target.refs_ != std::numeric_limits<usize>::max());
+            ++target.refs_; // The queued scan owns storage as well as its Gate use.
+            target.scanning_ = target.queued_ = true;
+            auto& slot = slot_of(target);
+            slot.next_reclaim = reclaim_head_; reclaim_head_ = &slot;
+        }
+        notify_cleanup();
+    }
+
     void drain(usize budget = std::numeric_limits<usize>::max()) noexcept {
         for (usize i = 0; i < budget; ++i) {
             Slot* slot{};
-            bool retire{};
+            bool retire{}, scan{};
             {
                 sync::Lock guard{lock_};
                 slot = reclaim_head_;
@@ -533,20 +721,35 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                 reclaim_head_ = slot->next_reclaim;
                 slot->next_reclaim = nullptr;
                 slot->anchor.queued_ = false;
-                libk_assert(slot->anchor.phase_ == anchor::phase::retiring);
-                retire = !slot->anchor.clean_;
-                if (retire) libk_assert(slot->anchor.refs_ == 1);
-                else {
-                    libk_assert(slot->anchor.refs_ == 0);
-                    slot->anchor.phase_ = anchor::phase::quiescent;
+                scan = slot->anchor.scanning_;
+                retire = !scan && slot->anchor.phase_ == anchor::phase::closing;
+                if (retire) {
+                    libk_assert(slot->anchor.refs_ && slot->anchor.gate_.empty());
+                    slot->anchor.phase_ = anchor::phase::draining;
+                } else if (!scan) libk_assert(slot->anchor.phase_ == anchor::phase::quiescent && slot->anchor.refs_ == 0);
+            }
+            if (scan) {
+                auto& target = slot->anchor;
+                const auto generation = target.generation_;
+                if (target.gate_.invalidate(8)) {
+                    { sync::Lock guard{lock_}; target.scanning_ = false; }
+                    release_use(target, generation);
+                    release_ref(target, generation);
+                } else {
+                    sync::Lock guard{lock_};
+                    libk_assert(!target.queued_);
+                    target.queued_ = true;
+                    slot->next_reclaim = reclaim_head_; reclaim_head_ = slot;
                 }
+                continue;
             }
             if (retire) {
                 finish_retire(*slot, slot->anchor.generation_);
                 continue;
             }
+            slot->anchor.index(false);
+            auto refund = slot->funding.detach();
             traits<T>::destroy(*slot->object());
-            auto refund = slot->member->fee_.detach();
             finalize_free(*slot);
             refund.complete();
         }
@@ -566,7 +769,6 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             libk_assert(slot.anchor.phase_ == anchor::phase::quiescent);
             libk_assert(storage_.live() != 0 && slot.page->live != 0);
             slot.anchor.phase_ = anchor::phase::free;
-            slot.anchor.clean_ = false;
             slot.member.reset();
             release = storage_.release(slot);
         }
@@ -593,7 +795,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
 template <typename T> using pending = typename pool<T>::pending;
 
 // Typed storage only. Construction policy belongs to the payload/caller;
-// every pool posts finalizers to the same actual worker.
+// pools share finite work steps claimed by the CPU maintenance runners.
 template <class... Ts> class store {
   public:
     store(mm::Pmm& pmm, WorkQueue& work) noexcept : pmm_(&pmm), work_(&work) {

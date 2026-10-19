@@ -50,16 +50,14 @@ struct test_spawn {
 };
 class test_tasks {
     pr_auth auth_;
-    cap_t domain_{};
     std::deque<std::unique_ptr<pr_task>> tasks_;
     auto get(test_id id) -> pr_task* {
         return id.value && id.value <= tasks_.size() ? tasks_[id.value - 1].get() : nullptr;
     }
 
   public:
-    void open(cap_t pool, cap_t domain, cap_t vm, uint32_t cpus) {
-        auth_ = {pool, vm, cpus};
-        domain_ = domain;
+    void open(CreateAuth pool, cap_t domain, uint32_t cpus) {
+        auth_ = {pool, cpus, domain ? domain : rt_startup().domain};
     }
     auto spawn(test_image& image, std::string_view name, const pr_opts& opts = {}) -> test_spawn {
         const auto mod = name.empty() ? image.entry() : image.find(name);
@@ -78,23 +76,13 @@ class test_tasks {
                      .offset = static_cast<uint64_t>(mod->bytes().data() - image.bytes.data()),
                      .perms = image.perms},
             config);
-        if (status == STATUS_OK) {
-            sys::SysResult sc{.status = STATUS_BUSY};
-            if (domain_) sc = sys::sc_create(task->pool(), domain_, 0, 0, 1024, (uint64_t{1} << auth_.cpus) - 1);
-            else for (uint64_t i = 0;; ++i) {
-                const auto name = "cpu." + std::to_string(i);
-                const auto cap = rt_startup().selector({name.c_str(), 0, ObjSc});
-                if (!cap) break;
-                if (sys::sc_info(cap).status != STATUS_OK) continue;
-                ScInfo info;
-                ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
-                if (!info.bound) { sc = sys::cap_duplicate(cap, 0, RIGHT_ATTACH | RIGHT_INSPECT); break; }
-            }
-            status = sc.status;
-            if (status == STATUS_OK) status = task->start(cap_owner{sc.value});
-        }
+        if (status == STATUS_OK) status = task->start();
         if (status != STATUS_OK) static_cast<void>(task->stop(status));
         return {{tasks_.size()}, status};
+    }
+    auto info(test_id id) -> std::expected<ThreadInfo, status_t> {
+        auto* task = get(id);
+        return task ? task->info() : std::unexpected(STATUS_INVALID_CAP);
     }
     auto observe(test_id id) -> sys::SysResult {
         auto* t = get(id);

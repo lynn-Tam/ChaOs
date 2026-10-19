@@ -16,7 +16,7 @@ struct io_extent final {
 // until completion is taken; dependent operations wait for overlapping writes.
 class blk_client final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto connect(cap_t directory, cap_t pool, cap_t cspace, cap_t events,
+    [[nodiscard]] auto connect(cap_t directory, CreateAuth pool, cap_t cspace, cap_t events,
                                cap_t vspace, uintptr_t address) noexcept -> status_t {
         return session_.connect(directory, pool, cspace, events, vspace, address, capacity_, true);
     }

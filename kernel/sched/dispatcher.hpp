@@ -65,6 +65,7 @@ public:
     [[nodiscard]] auto post_wake(Thread&) noexcept -> WakeResult;
     void request_stop(Thread&) noexcept;
     void drain_remote() noexcept;
+    void post(Domain::Local&) noexcept;
     void yield() noexcept;
     void block_current() noexcept;
     [[noreturn]] void exit_current() noexcept;
@@ -79,6 +80,7 @@ public:
 
 private:
     friend class Sc;
+    friend struct Domain::Local;
     enum Action : u8 { Control = 1, Wake = 2, Stop = 4 };
     enum class StopDisposition : u8 {
         Deferred,
@@ -119,6 +121,8 @@ private:
         u64 now) noexcept;
     void post(Thread&, u8 actions) noexcept;
     void complete(Thread&) noexcept;
+    auto migrate(Thread&) noexcept -> bool;
+    object::ref<> departure_;
 
     [[nodiscard]] auto kick_remote() noexcept -> WakeResult;
 
@@ -126,6 +130,16 @@ private:
     Thread* idle_{};
     time::Clock* clock_{};
     Sc* current_sc_{};
+    Node* current_branch_{};
+    Budget::Loan loan_{};
+    struct Ticket { Domain* domain; Budget::Loan loan; };
+    std::array<Ticket, Domain::max_depth> tickets_{};
+    usize ticket_count_{};
+    u64 duration_{};
+    auto reserve(Thread&, u64) noexcept -> bool;
+    void settle(u64) noexcept;
+    void drain_domains() noexcept;
+    u64 loan_elapsed_{};
     u64 accounted_at_{};
     u64 quantum_{};
     u64 run_until_{std::numeric_limits<u64>::max()};
@@ -134,16 +148,12 @@ private:
     Thread* handoff_outgoing_{};
     DispatchReason handoff_reason_{DispatchReason::Exit};
     status_t handoff_exit_status_{STATUS_OK};
-    struct Less {
-        bool operator()(const Thread& a, const Thread& b) const noexcept {
-            return std::pair{a.service_, a.enqueue_seq_} < std::pair{b.service_, b.enqueue_seq_};
-        }
-    };
-    libk::intrusive_tree<Thread, &Thread::ready_hook_, Less> ready_{};
+    Node::Queue ready_;
+    void insert(Node&) noexcept;
+    void erase(Node&) noexcept;
+    void domain_ready(Domain::Local&) noexcept;
     libk::intrusive_list<Thread, &Thread::maintenance_hook_> maintenance_ready_{};
     Sc maintenance_;
-    Deadline maintenance_refill_{Deadline::Fn::bind<&Dispatcher::refill_maintenance>(*this)};
-    void refill_maintenance() noexcept;
     std::atomic<u64> fair_{};
     u64 enqueue_seq_{};
     usize ready_count_{};
@@ -156,6 +166,7 @@ private:
     libk::intrusive_tree<Deadline, &Deadline::hook_, Earlier> deadlines_{};
     sync::Spin mail_lock_{};
     libk::intrusive_list<Thread, &Thread::mail_hook_> mail_{};
+    libk::intrusive_list<Domain::Local, &Domain::Local::mail_hook> domains_{};
     bool has_timer_{};
     bool has_ipi_{};
 };

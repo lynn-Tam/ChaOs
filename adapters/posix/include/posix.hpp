@@ -4,7 +4,7 @@
 #include <array>
 
 // Stream selectors transfer ownership; the directory and core selectors are borrowed.
-auto px_init(cap_t pool, cap_t vm, cap_t cspace, cap_t events,
+auto px_init(CreateAuth pool, cap_t vm, cap_t events,
              cap_t directory, std::array<cap_t, 3> streams) noexcept -> status_t;
 
 // Native extensions: preserve native status values, outside the POSIX ABI.

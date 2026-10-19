@@ -1,12 +1,12 @@
 #pragma once
 
 #include <irq/route.hpp>
-#include <ipc/notification_source.hpp>
 #include <expected>
 #include <object/ref.hpp>
 #include <mm/phys.hpp>
 #include <mm/kspace.hpp>
 #include <work.hpp>
+#include <cap/grant.hpp>
 #include <uapi/irq.h>
 
 class Cpus;
@@ -16,10 +16,15 @@ namespace irq {
 class Ctl final : private libk::noncopyable_nonmovable {
     friend class ::Cpus;
 public:
+    static constexpr bool fixed_bill = true;
     Ctl(mm::KSpace&, Cpus&, WorkQueue&, mm::Phys::Lease&&, IrqConfig) noexcept;
     ~Ctl() noexcept;
     auto open() noexcept -> status_t;
+    void activate() noexcept;
+    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return authority_.admit(std::forward<Publish>(publish)); }
+    void links(u64 cursor, LinkRecords& out) const noexcept;
     auto line(u32) noexcept -> std::expected<Line, status_t>;
+    void bind_work(WorkQueue&, object::Key owner) noexcept { job_.bind(owner); authority_.bind(owner); }
     void retire(object::cleanup&&) noexcept;
 private:
     void dispatch() noexcept;
@@ -27,6 +32,9 @@ private:
     auto take() noexcept -> u32;
     auto word(usize offset) const noexcept -> volatile u32*;
     void progress() noexcept;
+    void post() noexcept { work_.post(job_); }
+    void invalidated() noexcept { auto self = object::ref<>::retain_alive(job_.key()); static_cast<void>(self.destroy()); }
+    cap::Authority<1> authority_{Source::Action::bind<&Ctl::invalidated>(*this), Source::Action::bind<&Ctl::post>(*this)};
     mm::KSpace& vm_;
     Cpus& cpus_;
     WorkQueue& work_;
@@ -38,7 +46,7 @@ private:
     object::cleanup cleanup_;
     Work job_;
     Ctl* next_{};
-    bool open_{};
+    bool open_{}, mapped_{};
 };
 
 
@@ -53,24 +61,33 @@ struct Delivery final {
 
 class Irq final : private libk::noncopyable_nonmovable {
 public:
+    static constexpr bool fixed_bill = true;
     explicit Irq(Line line, object::ref<Ctl> owner = {}) noexcept;
     ~Irq() noexcept;
     [[nodiscard]] auto source() const noexcept -> Line { return route_.line_; }
+    auto events() noexcept -> Source& { return events_; }
+    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return authority_.admit(std::forward<Publish>(publish)); }
+    void bind_work(WorkQueue& work, object::Key key) noexcept { authority_.bind(key); key_ = key; events_.bind_work(work, key); }
+    void links(u64 cursor, LinkRecords& out) const noexcept;
+    [[nodiscard]] auto enable(bool) noexcept -> std::expected<u64, Error>;
     [[nodiscard]] auto bound() const noexcept -> bool;
     [[nodiscard]] auto pending() const noexcept -> bool;
     [[nodiscard]] auto closed() const noexcept -> bool;
-    [[nodiscard]] auto bind(ipc::Notification&, u64 badge) noexcept -> std::expected<void, Error>;
-    [[nodiscard]] auto unbind() noexcept -> bool;
     [[nodiscard]] auto delivery() const noexcept -> std::expected<Delivery, Error>;
     [[nodiscard]] auto ack(u64 generation, u64 sequence) noexcept -> std::expected<void, Error>;
     [[nodiscard]] auto close() noexcept -> bool;
     void retire(object::cleanup&& cleanup) noexcept;
 private:
-    [[nodiscard]] auto publish() noexcept -> bool;
-    void controller_closed() noexcept;
+    [[nodiscard]] auto publish() noexcept -> Route::Delivery;
+    auto controller_closed() noexcept -> Source::Publication;
+    void complete_cleanup() noexcept;
+    void invalidated() noexcept { static_cast<void>(close()); }
     object::ref<Ctl> owner_;
+    object::Key key_;
+    cap::Authority<1> authority_{Source::Action::bind<&Irq::invalidated>(*this), Source::Action::bind<&Irq::complete_cleanup>(*this)};
     Route route_;
-    ipc::NotificationSource notice_{};
+    Src<SOURCE_READY | SOURCE_TERMINAL> events_{Source::Drained::bind<&Irq::complete_cleanup>(*this)};
+    object::cleanup cleanup_;
     u64 generation_{};
     u64 sequence_{};
     bool pending_{};

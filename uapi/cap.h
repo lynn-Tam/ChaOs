@@ -20,7 +20,7 @@ enum ObjKind {
     ObjCSpace = 4,
     ObjMem = 5,
     ObjVSpace = 6,
-    ObjGroup = 7,
+    ObjAccount = 7,
     ObjNotification = 8,
     ObjChannel = 9,
     ObjPager = 10,
@@ -29,7 +29,11 @@ enum ObjKind {
     ObjIoSpace = 13,
     ObjPhys = 14,
     ObjIrqCtl = 15,
-    ObjCount = 16,
+    ObjScope = 16,
+    ObjPort = 17,
+    ObjVmOp = 18,
+    ObjIoOp = 19,
+    ObjCount = 20,
 };
 
 #define OBJ_KINDS ((UINT64_C(1) << ObjCount) - 2)
@@ -125,33 +129,131 @@ static_assert(offsetof(CapView, words) == 16);
 #define RIGHT_ROUTE               (U64_C(1) << 23)
 #define RIGHT_OBSERVE             (U64_C(1) << 24)
 #define RIGHT_ATTACH              (U64_C(1) << 25)
-#define RIGHT_MASK          ((U64_C(1) << 26) - 1)
+#define RIGHT_ADOPT               (U64_C(1) << 26)
+#define RIGHT_REBILL              (U64_C(1) << 27)
+#define RIGHT_MASK          ((U64_C(1) << 28) - 1)
 
 #define OBJ_BIT(kind) (U64_C(1) << (kind))
 
 #ifndef __ASSEMBLER__
-#define GROUP_OPEN 0U
-#define GROUP_CLOSING 1U
-#define GROUP_CLOSED 2U
-struct GroupInfo {
+#define OBJECT_OPEN 0U
+#define OBJECT_CLOSING 1U
+#define OBJECT_DRAINED 2U
+#define STATE_OPEN 1U
+#define STATE_CLOSING 2U
+#define STATE_DRAINED 4U
+struct CreateAuth { cap_t account, scope; };
+#define SCOPE_INFO 1U
+#define SCOPE_MEMBERS 2U
+#define SCOPE_CAPS 4U
+#define SCOPE_LINKS 8U
+#define SCOPE_USAGE 16U
+#define SCOPE_OPS 32U
+#define SCOPE_GRANTS 64U
+#define SCOPE_FACETS 127U
+struct ScopeInfo {
     uint32_t version, size;
-    uint64_t memory_limit, memory_available, cap_limit, caps_available;
-    uint64_t sponsors, reservations;
+    uint64_t members, epoch;
     uint32_t state, reserved;
 };
+// Cursors are bound to one source and one structural version.
+struct ScopeCursor { uint64_t source, version, last; };
+#define SCOPE_MEMBER_PAGE 8U
+#define SCOPE_MEMBER_PENDING 0U
+#define SCOPE_MEMBER_LIVE 1U
+#define SCOPE_MEMBER_CLOSING 2U
+struct ScopeMember {
+    uint64_t object_id, epoch;
+    uint32_t kind, state;
+};
+struct ScopeMembers {
+    uint32_t version, size;
+    struct ScopeCursor next;
+    uint32_t count, more;
+    struct ScopeMember records[SCOPE_MEMBER_PAGE];
+};
+#define OBS_BOUNDARY 1U
+#define LINK_RECORD_PAGE 8U
+#define LINK_LIVE 1U
+#define LINK_INVALIDATING 2U
+#define LINK_DRAINING 3U
+#define LINK_VM 1U
+#define LINK_IO 2U
+#define LINK_ROOT 3U
+#define LINK_BIND 4U
+#define LINK_CPU 5U
+#define LINK_PARENT 6U
+#define LINK_USE 7U
+#define LINK_ROUTE 8U
+#define LINK_PHYS 9U
+struct LinkRecord {
+    uint64_t link_id, object_id, grant_id, first, bytes, offset;
+    uint32_t kind, state, perms, flags;
+};
+struct LinkRecords {
+    uint32_t version, size;
+    uint64_t epoch, cursor;
+    uint32_t count, more;
+    struct LinkRecord records[LINK_RECORD_PAGE];
+};
+#define GRANT_RECORD_PAGE 8U
+#define OBS_TRUNCATED 2U
+struct GrantQuery { cap_t selector; uint64_t selected, last, epoch; };
+struct GrantRecord {
+    uint64_t grant_id, parent_id, object_id;
+    uint32_t state, flags;
+    struct CapView ceiling;
+};
+struct GrantRecords {
+    uint32_t version, size;
+    uint64_t seed, selected, last, epoch;
+    uint32_t count, more, flags, reserved;
+    struct GrantRecord root, records[GRANT_RECORD_PAGE];
+};
+struct ScopeObject {
+    uint32_t version, size;
+    uint64_t object_id, owner_id, owner_epoch, account_id, billing_epoch;
+    uint64_t storage_memory, storage_caps;
+    uint32_t kind, gate, flags, reserved;
+};
+struct ObjectInfo {
+    uint32_t version, size;
+    uint64_t object_id, billing_epoch;
+    uint32_t kind, gate; // Common Object gate; payload-specific state uses typed info.
+};
+struct AccountInfo {
+    uint32_t version, size;
+    uint64_t memory_limit, memory_available, cap_limit, caps_available;
+    uint64_t allocations, reservations;
+    uint32_t state, reserved;
+};
+#define CAP_REVOKE_ASYNC 1U
 #define CAP_INFO_VALID 1U
 #define CAP_INFO_UNAVAILABLE 2U
-#define CAP_INFO_PAGE 16U
+#define CAP_INFO_BOUNDARY 4U
+#define CAP_INFO_PAGE 8U
+#define CSPACE_INFO_VERSION 3U
 struct CapInfo {
     cap_t selector;
+    uint64_t object_id, grant_id;
     uint32_t state, reserved;
     struct CapView view;
 };
+#ifdef __cplusplus
+static_assert(sizeof(CapInfo) == 96);
+static_assert(offsetof(CapInfo, view) == 32);
+#endif
 struct CSpaceInfo {
     uint32_t version, size;
-    uint64_t slots, pages;
+    uint64_t slots, pages, epoch;
     cap_t cursor;
     uint32_t count, reserved;
     struct CapInfo records[CAP_INFO_PAGE];
 };
 #endif
+
+// Operation facts. Cancel requests do not imply the provider is drained.
+#define OP_ACCEPTED  (1U << 0)
+#define OP_COMMITTED (1U << 1)
+#define OP_DRAINING  (1U << 2)
+#define OP_DONE      (1U << 3)

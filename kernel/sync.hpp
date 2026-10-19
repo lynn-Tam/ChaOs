@@ -9,6 +9,9 @@
 #include <libk/noncopyable.hpp>
 #include <libk/ticket_lock.hpp>
 #include <utility>
+#include <algorithm>
+#include <functional>
+#include <span>
 
 namespace sync {
 
@@ -81,6 +84,24 @@ public:
     [[nodiscard]] auto owns_lock() const noexcept -> bool { return mutex_ != nullptr; }
 private:
     M* mutex_{};
+};
+
+// A caller-owned, bounded set. Sort and deduplicate before taking any lock.
+class [[nodiscard]] Set final {
+    Irq irq_;
+    std::span<Spin*> locks_;
+public:
+    explicit Set(std::span<Spin*> locks) noexcept : locks_(locks) {
+        std::ranges::sort(locks_, std::less<Spin*>{});
+        locks_ = locks_.first(std::ranges::unique(locks_).begin() - locks_.begin());
+        for (auto* lock : locks_) lock->lock();
+    }
+    Set(const Set&) = delete;
+    ~Set() { release(); }
+    void release() noexcept {
+        for (auto i = locks_.rbegin(); i != locks_.rend(); ++i) (*i)->unlock();
+        locks_ = {}; irq_.restore();
+    }
 };
 
 class [[nodiscard]] Pair final {

@@ -123,6 +123,7 @@ class TrapCtx {
     usize pc() const noexcept { return frame_.sepc; }
     void complete_breakpoint() noexcept;
     void complete_syscall() noexcept { frame_.sepc += 4; }
+    void retry_syscall() noexcept { frame_.sepc -= 4; }
     usize arg(usize i) const noexcept { libk_assert(i < 8); return frame_.gpr[9 + i]; }
     void set_result(usize i, usize value) noexcept { libk_assert(i < 3); frame_.gpr[9 + i] = value; }
     TrapRegs snapshot() const noexcept {
@@ -135,7 +136,7 @@ class TrapCtx {
 auto decode(const TrapFrame&) noexcept -> TrapEvent;
 bool install_trap() noexcept;
 bool valid_user_start(UserStart) noexcept;
-std::optional<usize> prepare_user_stack(usize top, UserStart) noexcept;
-[[noreturn]] void resume_user(usize top) noexcept;
+bool prepare_user_frame(TrapFrame&, UserStart) noexcept;
+[[noreturn]] void resume_user(TrapFrame&) noexcept;
 } // namespace arch
 #endif

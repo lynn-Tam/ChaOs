@@ -1,5 +1,5 @@
 #pragma once
-#include <cap.hpp>
+#include <ipc.hpp>
 #include <optional>
 #include <start.hpp>
 #include <string.h>
@@ -8,82 +8,118 @@ inline constexpr auto pr_retryable(status_t s) noexcept -> bool {
     return s == STATUS_BUSY || s == STATUS_RETRY;
 }
 
-inline constexpr word_t pr_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc)
+inline constexpr word_t pr_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc) | OBJ_BIT(ObjDomain)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
-    | OBJ_BIT(ObjGroup) | OBJ_BIT(ObjNotification);
+    | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjAccount) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
 
 struct pr_quota {
     word_t bytes{1024 * 1024}, caps{256}, kinds{pr_base_kinds};
     word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE};
+    word_t watches{64}, hints{16};
 };
 struct pr_exit { status_t status{}; };
-struct pr_auth { cap_t pool{}, vspace{}; uint32_t cpus{}; };
+struct pr_auth { CreateAuth alloc{}; uint32_t cpus{}; cap_t domain{}; };
 
 class pr_task {
     enum class state { New, Running, Closing, Consumed };
     state state_{};
     status_t status_{};
     bool closing_{};
-    word_t signals_{};
-    cap_owner group_, vm_, cs_, thread_, sc_, ended_;
+    cap_owner account_, scope_, vm_, cs_, thread_, sc_, domain_;
+    word_t cpus_{};
+    cap_t events_{};
+    std::array<ev_watch, 4> watches_;
 public:
     pr_task() = default;
     pr_task(const pr_task&) = delete;
     auto operator=(const pr_task&) -> pr_task& = delete;
 
-    ~pr_task() { if (group_) sys::exit(STATUS_BUSY); }
-    auto pool() const noexcept -> cap_t { return group_.selector(); }
+    ~pr_task() { if (account_) sys::exit(STATUS_BUSY); }
+    auto pool() const noexcept -> cap_t { return account_.selector(); }
+    auto scope() const noexcept -> cap_t { return scope_.selector(); }
+    auto alloc() const noexcept -> CreateAuth { return {pool(), scope()}; }
     auto vspace() const noexcept -> cap_t { return vm_.selector(); }
+    auto domain() const noexcept -> cap_t { return domain_.selector(); }
     auto cspace() const noexcept -> cap_t { return cs_.selector(); }
-    auto open(cap_t parent, const pr_quota& q) noexcept -> status_t {
-        if (state_ != state::New || group_) return STATUS_BUSY;
-        const auto ended = sys::notification_create(parent, 1);
-        if (ended.status != STATUS_OK) return ended.status;
-        ended_ = cap_owner{ended.value};
-        const auto g = sys::resource_create_child(parent, q.bytes, q.caps, q.kinds);
-        if (g.value) group_ = cap_owner{g.value};
-        if (g.status != STATUS_OK || !group_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
-        const auto v = sys::vspace_create(pool());
+    auto open(const pr_auth& auth, const pr_quota& q) noexcept -> status_t {
+        if (state_ != state::New || account_) return STATUS_BUSY;
+        const auto g = sys::account_create(auth.alloc, q.bytes, q.caps, q.kinds);
+        if (g.value) account_ = cap_owner{g.value};
+        if (g.status != STATUS_OK || !account_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
+        const auto owner = sys::scope_create(auth.alloc);
+        if (owner.value) scope_ = cap_owner{owner.value};
+        if (owner.status != STATUS_OK || !scope_) return owner.status == STATUS_OK ? STATUS_INVALID_CAP : owner.status;
+        cpus_ = auth.cpus >= 64 ? ~word_t{} : (word_t{1} << auth.cpus) - 1;
+        const auto d = sys::domain_create(alloc(), auth.domain, 0, 0, 1024, cpus_);
+        if (d.value) domain_ = cap_owner{d.value};
+        if (d.status != STATUS_OK || !domain_) return d.status == STATUS_OK ? STATUS_INVALID_CAP : d.status;
+        const auto v = sys::vspace_create(alloc());
         if (v.value) vm_ = cap_owner{v.value};
         if (v.status != STATUS_OK || !vm_) return v.status == STATUS_OK ? STATUS_INVALID_CAP : v.status;
-        const auto c = sys::cspace_create(pool(), q.slots, q.pages);
+        const auto c = sys::cspace_create(alloc(), q.slots, q.pages);
         if (c.value) cs_ = cap_owner{c.value};
         return c.status == STATUS_OK && !cs_ ? STATUS_INVALID_CAP : c.status;
     }
 private:
     auto close() noexcept -> status_t {
-        if (!group_) return STATUS_OK;
+        if (!account_) return STATUS_OK;
         if (!closing_) {
-            for (auto* cap : {&thread_, &sc_, &cs_, &vm_}) {
+            if (scope_) {
+                const auto status = sys::scope_close(scope()).status;
+                if (status != STATUS_OK) return status;
+            }
+            closing_ = true;
+            for (auto* cap : {&thread_, &sc_, &cs_, &vm_, &domain_}) {
                 const auto status = cap->close();
                 if (status != STATUS_OK) return status;
             }
-            const auto status = sys::resource_close_async(pool(), ended_.selector(), 2).status;
-            if (status != STATUS_OK) return status;
-            closing_ = true;
         }
-        const auto ready = sys::notification_take(ended_.selector());
-        if (ready.status == STATUS_OK) signals_ |= ready.value;
-        else if (ready.status != STATUS_RETRY) return ready.status;
-        if (!(signals_ & 2)) return STATUS_WOULD_BLOCK;
-        auto status = group_.close();
-        if (status == STATUS_OK) status = ended_.close();
-        return status;
+        if (scope_) {
+            const auto status = sys::source_info(scope());
+            if (status.status != STATUS_OK) return status.status;
+            if (!(status.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
+            const auto closed = scope_.close();
+            if (closed != STATUS_OK) return closed;
+        }
+        const auto ready = sys::source_info(pool());
+        if (ready.status != STATUS_OK) return ready.status;
+        if (ready.value & STATE_OPEN) {
+            const auto status = sys::account_close(pool()).status;
+            return status == STATUS_OK ? STATUS_WOULD_BLOCK : status;
+        }
+        if (!(ready.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
+        const auto destroyed = sys::object_destroy(pool()).status;
+        if (destroyed != STATUS_OK) return destroyed;
+        for (auto& watch : watches_) if (watch) {
+            if (const auto status = watch.close(); status != STATUS_OK) return status;
+        }
+        return account_.close();
     }
 
 public:
     auto thread() const noexcept -> cap_t { return thread_.selector(); }
     auto prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t {
         if (thread_) return STATUS_BUSY;
-        const auto thread = sys::thread_create(pool(), vspace(), cspace(), desc, 0, cpu);
+        const auto thread = sys::thread_create(alloc(), vspace(), cspace(), desc, 0, cpu);
         thread_ = cap_owner{thread.value};
         if (thread.status != STATUS_OK) return thread.status;
-        auto status = sys::exit_bind(thread_.selector(), ended_.selector(), 1).status;
-        if (status == STATUS_OK) status = sys::execution_watch(thread_.selector(), events ? events : ended_.selector(), 1).status;
-        return status;
+        events_ = events;
+        if (!events_) return STATUS_OK;
+        const std::array<cap_t, 4> sources{thread_.selector(), thread_.selector(), scope(), pool()};
+        for (size_t i = 0; i != sources.size(); ++i) {
+            const auto status = watches_[i].open(events_, sources[i], i == 0 ? 0 : i == 1 ? SOURCE_READY : STATE_DRAINED,
+                0, i == 0 ? WATCH_CHANGED : 0, i == 1 ? SOURCE_EXIT : SOURCE_STATE);
+            if (status != STATUS_OK) return status;
+        }
+        return STATUS_OK;
     }
-    auto start(cap_owner sc) noexcept -> status_t {
-        if (!thread_ || sc_ || !sc) return STATUS_BAD_ARGS;
+    auto start(cap_owner sc = {}) noexcept -> status_t {
+        if (!thread_ || sc_) return STATUS_BAD_ARGS;
+        if (!sc) {
+            const auto created = sys::sc_create(alloc(), domain(), 0, 0, 1024, cpus_);
+            if (created.status != STATUS_OK) return created.status;
+            sc = cap_owner{created.value};
+        }
         sc_ = std::move(sc);
         auto status = sys::sc_bind(sc_.selector(), thread_.selector()).status;
         if (status == STATUS_OK) status = sys::execution_set(thread_.selector(), true).status;
@@ -104,17 +140,10 @@ public:
         ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
         return info;
     }
-    auto resource_info() const noexcept -> std::expected<GroupInfo, status_t> {
-        const auto result = sys::group_info(pool());
+    auto resource_info() const noexcept -> std::expected<AccountInfo, status_t> {
+        const auto result = sys::account_info(pool());
         if (result.status != STATUS_OK) return std::unexpected(result.status);
-        GroupInfo info;
-        ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
-        return info;
-    }
-    auto capabilities(cap_t cursor) const noexcept -> std::expected<CSpaceInfo, status_t> {
-        const auto result = sys::cspace_info(cspace(), cursor);
-        if (result.status != STATUS_OK) return std::unexpected(result.status);
-        CSpaceInfo info;
+        AccountInfo info;
         ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
         return info;
     }
@@ -124,6 +153,12 @@ public:
     auto observe() noexcept -> sys::SysResult {
         if (state_ == state::Consumed) return {.status = STATUS_INVALID_CAP};
         if (state_ == state::Closing) return {.status = STATUS_OK, .value = 1, .value2 = static_cast<word_t>(status_)};
+        if (state_ == state::Running && watches_[0]) {
+            const auto fact = sys::source_info(thread_.selector());
+            if (fact.status != STATUS_OK) return fact;
+            const auto armed = watches_[0].arm(fact.value2);
+            if (armed.status != STATUS_OK) return armed;
+        }
         return state_ == state::Running ? sys::exit_query(thread_.selector()) : sys::SysResult{.status = STATUS_WOULD_BLOCK};
     }
     // Initiate stopping before callers wait for any sibling to finish retirement.
@@ -158,8 +193,11 @@ public:
         }
         return close();
     }
-    auto result() const noexcept -> std::optional<pr_exit> { return state_ == state::Closing && !group_ ? std::optional{pr_exit{status_}} : std::nullopt; }
-    auto closing() const noexcept -> bool { return state_ == state::Closing && bool(group_); }
+    auto result() const noexcept -> std::optional<pr_exit> { return state_ == state::Closing && !account_ ? std::optional{pr_exit{status_}} : std::nullopt; }
+    // Only a partially built execution can lack a real retirement doorbell.
+    auto polling() const noexcept -> bool {
+        return state_ == state::Closing && account_ && !(watches_[1] && watches_[2] && watches_[3]);
+    }
     auto collect() noexcept -> sys::SysResult {
         const auto status = poll();
         if (status != STATUS_OK) return {.status = status};

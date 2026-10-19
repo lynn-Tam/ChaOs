@@ -37,7 +37,7 @@ static void finish_fault(
         dispatcher.request_reschedule(sched::DispatchReason::Yield);
         return;
     case mm::FaultKind::Pending:
-        libk_assert(false);
+        thread.park(false);
         return;
     case mm::FaultKind::ResourceExhausted:
     case mm::FaultKind::OutOfMemory: {
@@ -83,8 +83,13 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
         libk_assert(thread != nullptr
             && thread->env().user_bound());
         if (event.cause == Cause::Syscall) {
-            switch (syscall::handle(context)) {
+            const auto disposition = syscall::handle(context);
+            switch (disposition) {
             case syscall::Disposition::Return:
+                return;
+            case syscall::Disposition::Park:
+            case syscall::Disposition::Retry:
+                thread->park(disposition == syscall::Disposition::Park);
                 return;
             case syscall::Disposition::Yield:
                 cpu.dispatcher().request_reschedule(
@@ -140,7 +145,8 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
     panic("unhandled trap", &context);
 }
 
-static void leave_trap(const arch::TrapEvent& event, arch::TrapCtx& context) noexcept {
+static auto leave_trap(const arch::TrapEvent& event, arch::TrapFrame& frame) noexcept -> arch::TrapFrame* {
+    arch::TrapCtx context{frame};
     Cpu& cpu = current_cpu();
     Thread* const thread = cpu.current;
     libk_assert(thread != nullptr);
@@ -151,8 +157,14 @@ static void leave_trap(const arch::TrapEvent& event, arch::TrapCtx& context) noe
         });
         handle_trap(event, context);
     }
+    if (event.user) {
+        thread->frame() = frame;
+        thread->return_user();
+        return &thread->frame();
+    }
     cpu.dispatcher().resched();
     libk_assert(cpu.current == thread);
+    return &frame;
 }
 
 extern "C" void trap_enter(arch::TrapFrame* f) noexcept {
@@ -163,10 +175,10 @@ extern "C" void trap_enter(arch::TrapFrame* f) noexcept {
     trace::emit(trace::Event::TrapEnter, static_cast<u64>(event.user));
     if (!event.user || event.irq()) handle_trap(event, ctx);
 }
-extern "C" void trap_exit(arch::TrapFrame* f) noexcept {
+extern "C" auto trap_exit(arch::TrapFrame* f) noexcept -> arch::TrapFrame* {
     libk_assert(f && arch::local()->depth == 0);
-    arch::TrapCtx ctx{*f};
     sync::assert_unlocked();
-    leave_trap(arch::decode(*f), ctx);
+    auto* frame = leave_trap(arch::decode(*f), *f);
     trace::emit(trace::Event::TrapExit);
+    return frame;
 }

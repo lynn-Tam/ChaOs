@@ -14,13 +14,16 @@ def main():
     timeout = 5
     fail_sector = None
     second_disk = False
-    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--second-disk"):
+    report = None
+    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--second-disk", "--report"):
         option = extra_markers.pop(0)
         if option == "--second-disk":
             second_disk = True
             continue
         value = extra_markers.pop(0)
-        if option == "--bundle":
+        if option == "--report":
+            report = value
+        elif option == "--bundle":
             bundle = value
         elif option == "--disk":
             disk_image = value
@@ -70,6 +73,9 @@ def main():
                 log.write_text(text)
                 print(text)
                 raise SystemExit(f"[io-platform] failed; diagnostic: {log}")
+            if report:
+                for line in text.splitlines():
+                    if line.startswith(report): print(line)
             print(f"[io-platform] OK: {count} harts, runtime and requested device paths")
 
 if __name__ == "__main__":

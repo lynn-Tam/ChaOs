@@ -78,22 +78,19 @@ static constinit libk::manual_lifetime<BootStack> stack_storage{};
 [[noreturn]] static void work_entry(void* arg) noexcept {
     auto& work = *static_cast<WorkQueue*>(arg);
     for (;;) {
-        (void)work.run();
-        if (work.arm()) sched::block();
+        (void)work.run(1);
+        if (work.arm(current_cpu().id)) sched::block();
         else sched::yield();
     }
 }
 
 static void start_worker(Boot& boot, Cpu& cpu) noexcept {
-    auto stack = mm::Stack::create(boot.vm);
-    libk_assert(stack);
-    auto thread = boot.objects.get<Thread>().create(std::move(*stack), Env::kernel(boot.vm),
-        Thread::KernelStart{work_entry, &boot.work}, Thread::Kind::Worker);
+    auto thread = boot.objects.get<Thread>().create(Env::kernel(boot.vm),
+        Thread::KernelStart{work_entry, &boot.work});
     libk_assert(thread);
-    boot.worker.thread = std::move(*thread).publish();
-    libk_assert(boot.worker.thread->claim_home(cpu.dispatcher()));
-    libk_assert(boot.worker.thread->execution(true));
-    boot.work.bind(Work::Fn::bind(boot.worker));
+    cpu.worker_thread = std::move(*thread).publish();
+    libk_assert(cpu.worker_thread->claim_home(cpu.dispatcher()));
+    libk_assert(cpu.worker_thread->execution(true));
 }
 
 [[noreturn]] static void continue_init(void* argument) noexcept {
@@ -114,9 +111,9 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     for (auto hart : boot_info.cpus.span() | std::views::drop(1))
         if (!boot.cpus.add(hart, boot.objects, boot.grants, boot.vm, boot.clock))
             console::print<"cpu: prepare hart={} failed\n">(hart.raw);
-    auto domain = boot.objects.get<sched::Domain>().create(
-        boot.cpus.count());
+    auto domain = boot.objects.get<sched::Domain>().create(boot.pmm, boot.cpus, sched::Domain::Config{});
     libk_assert(domain);
+    libk_assert(domain->get().open() == STATUS_OK);
     boot.domain = std::move(*domain).publish();
 
     // This is capacity deliberately withheld from userspace commitments. It
@@ -128,7 +125,12 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
         + system_pages_per_cpu * boot.cpus.count();
     const usize free_pages = boot.pmm.free_page_count();
     libk_assert(free_pages > system_pages);
-    auto root = boot.objects.get<object::group>().create(resource::budget{
+    auto scope = boot.objects.get<object::Scope>().create();
+    libk_assert(scope);
+    boot.scope = std::move(*scope).publish();
+    auto owner = object::Scope::reserve(boot.scope);
+    libk_assert(owner);
+    auto root = boot.objects.get<resource::Account>().create(std::move(*owner), resource::Reservation{}, resource::budget{
         .memory = static_cast<u64>(free_pages - system_pages)
             * mm::page_size,
         .caps = 4096,
@@ -141,7 +143,8 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     libk_assert(physical);
     boot.physical = std::move(*physical).publish();
     auto& runtime = *boot.cpus.get(Cpus::boot_id());
-    start_worker(boot, runtime);
+    boot.work.bind(WorkQueue::Wake::bind<&Cpus::wake_work>(boot.cpus));
+    for (usize id = 0; id < boot.cpus.count(); ++id) start_worker(boot, *boot.cpus.get(CpuId{id}));
     if (boot_info.module) {
         libk_assert(state.module);
         const auto started = boot_root(boot, runtime, boot_info,

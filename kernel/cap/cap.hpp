@@ -96,6 +96,8 @@ enum class Right : u64 {
     Route = RIGHT_ROUTE,
     Observe = RIGHT_OBSERVE,
     Attach = RIGHT_ATTACH,
+    Adopt = RIGHT_ADOPT,
+    Rebill = RIGHT_REBILL,
 };
 
 using Rights = libk::enum_flags<Right>;
@@ -116,6 +118,12 @@ struct Quota final {
     [[nodiscard]] friend constexpr auto operator==(
         Quota, Quota) noexcept
         -> bool = default;
+};
+
+struct ScopeLimit final {
+    u64 kinds{OBJ_KINDS};
+    u32 facets{SCOPE_FACETS}, depth{64};
+    friend constexpr auto operator==(ScopeLimit, ScopeLimit) noexcept -> bool = default;
 };
 
 struct Badge final {
@@ -175,7 +183,7 @@ using Limits = std::variant<
     Quota,
     Badge,
     ChanLimit,
-    IrqRoute, IndexLimit>;
+    IrqRoute, IndexLimit, ScopeLimit>;
 
 struct View final {
     Rights rights{};

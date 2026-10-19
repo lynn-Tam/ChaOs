@@ -1,6 +1,6 @@
 #include <expected>
 #include <mm/kspace.hpp>
-#include <resource/sponsorship.hpp>
+#include <resource/account.hpp>
 #include <utility>
 
 #include <libk/types.hpp>

@@ -57,13 +57,13 @@ struct fw_view {
                 context = index;
             }
         }
-        auto config = vm_area::create(env.pool, env.vspace, 0, 4096);
+        auto config = vm_area::create(env.alloc(), env.vspace, 0, 4096);
         if (!config) return std::unexpected(config.error());
         if (!context) return std::unexpected(STATUS_BAD_ARGS);
         const auto* data = std::construct_at(reinterpret_cast<IrqConfig*>(config->address),
             IRQ_PLIC, *count, pr->address, pr->size, *context, 0U, 0U);
         (void)data;
-        const auto control = sys::irq_controller_create(env.pool, fw_root(env).physical,
+        const auto control = sys::irq_controller_create(env.alloc(), fw_root(env).physical,
                                                        config->memory.selector());
         if (control.status != STATUS_OK) return std::unexpected(control.status);
         return cap_owner{control.value};
@@ -93,13 +93,13 @@ struct fw_console {
         if (parent != plic_id || !interrupts || !libk::fdt::read_u32(*interrupts, source))
             return std::unexpected(STATUS_BAD_ARGS);
         fw_console result;
-        const auto irq = sys::irq_create(env.pool, controller, source);
+        const auto irq = sys::irq_create(env.alloc(), controller, source);
         if (irq.status != STATUS_OK) return std::unexpected(irq.status);
         result.irq = cap_owner{irq.value};
         result.offset = ur->address % 4096;
         if (ur->size > SIZE_MAX - result.offset - 4095) return std::unexpected(STATUS_BAD_ARGS);
         const auto bytes = (result.offset + ur->size + 4095) & ~size_t{4095};
-        const auto mem = sys::memory_create_physical(env.pool, fw_root(env).physical,
+        const auto mem = sys::memory_create_physical(env.alloc(), fw_root(env).physical,
                                       ur->address - result.offset, bytes, VM_READ | VM_WRITE);
         if (mem.status != STATUS_OK) return std::unexpected(mem.status);
         result.memory = cap_owner{mem.value};

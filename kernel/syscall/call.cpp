@@ -12,15 +12,16 @@
 #include <task/thread.hpp>
 #include <utility>
 #include <ipc/notification.hpp>
-#include <resource/sponsorship.hpp>
+#include <ipc/port.hpp>
+#include <ipc/channel.hpp>
+#include <resource/account.hpp>
 #include <irq/irq.hpp>
 #include <mm/pager.hpp>
 #include <uapi/mem.h>
 #include <io/space.hpp>
-#include <ipc/buffer.hpp>
+#include <mm/vspace.hpp>
 #include <variant>
 #include <sched/dispatcher.hpp>
-#include <sched/sc.hpp>
 #include <sched/sc.hpp>
 
 namespace syscall {
@@ -111,36 +112,6 @@ auto read_desc_bytes(
     }
 }
 
-auto vm_status(mm::VSpaceError error) noexcept -> status_t {
-    switch (error) {
-    case mm::VSpaceError::InvalidAuthority:
-    case mm::VSpaceError::InvalidAccess:
-        return STATUS_BAD_RIGHTS;
-    case mm::VSpaceError::InvalidRegion:
-    case mm::VSpaceError::InvalidMapping:
-    case mm::VSpaceError::NotMapped:
-        return STATUS_NOT_FOUND;
-    case mm::VSpaceError::InvalidRange:
-    case mm::VSpaceError::Overlap:
-    case mm::VSpaceError::NotRam:
-        return STATUS_BAD_ARGS;
-    case mm::VSpaceError::OutOfMemory:
-    case mm::VSpaceError::QuotaExceeded:
-    case mm::VSpaceError::GenerationExhausted:
-    case mm::VSpaceError::ResourceExhausted:
-        return STATUS_NO_MEMORY;
-    case mm::VSpaceError::InvalidState:
-    case mm::VSpaceError::Busy:
-    case mm::VSpaceError::GrantUnavailable:
-        return STATUS_BUSY;
-    case mm::VSpaceError::BackingFailed:
-        return STATUS_BACKING_FAILED;
-    case mm::VSpaceError::TranslationCorrupt:
-        libk_assert(false);
-        __builtin_unreachable();
-    }
-    return STATUS_INTERNAL;
-}
 
 
 
@@ -208,7 +179,7 @@ template<typename Operation>
 static auto grant_payment(Call& inv, cap_t payer) noexcept
     -> std::expected<resource::Reservation, status_t> {
     if (!payer) return resource::Reservation{};
-    auto pool = inv.cspace.resolve<object::group>(handle_of(payer), cap::Rights::of(cap::Right::Create));
+    auto pool = inv.cspace.resolve<resource::Account>(handle_of(payer), cap::Rights::of(cap::Right::Create));
     if (!pool) return std::unexpected(cap_status(pool.error()));
     const auto view = pool->view();
     const auto* quota = std::get_if<cap::Quota>(&view.data);
@@ -298,7 +269,10 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!source || !rights) {
             return returned(STATUS_BAD_ARGS);
         }
-        auto fee = grant_payment(inv, op == SYS_CAP_DELEGATE ? trap.arg(3) : 0);
+        auto fee = [&]() -> std::expected<resource::Reservation, status_t> {
+            if constexpr (op == SYS_CAP_DELEGATE) return grant_payment(inv, trap.arg(3));
+            else return resource::Reservation{};
+        }();
         if (!fee) return returned(fee.error());
         return with_dest(cspace, target, [&](cap::CSpace& out) {
             return cspace.transfer(source, out,
@@ -316,30 +290,21 @@ auto cap_call(Call& inv) noexcept -> Result {
         });
     }
     if constexpr (op == SYS_CAP_REVOKE) {
-        if (thread == nullptr) {
-            return returned(STATUS_INVALID_OP);
+        if (!thread || thread->waiting()) return returned(STATUS_BUSY);
+        if (trap.arg(2) & ~u64{CAP_REVOKE_ASYNC}) return returned(STATUS_BAD_ARGS);
+        std::optional<cap::Resolved<cap::CSpace>> destination;
+        auto* owner = &cspace;
+        if (trap.arg(1)) {
+            auto target = dest(cspace, handle_of(trap.arg(1)));
+            if (!target) return returned(cap_status(target.error()));
+            destination = std::move(*target); owner = &destination->object();
         }
-        if (thread->waiting()) {
-            return returned(STATUS_BUSY);
-        }
-        const cap::Handle source = handle_of(trap.arg(0));
-        if (!source || trap.arg(1) > 1) {
-            return returned(STATUS_BAD_ARGS);
-        }
-        libk_assert(inv.cpu.cpus != nullptr);
-        Receipt receipt;
-        cap::GrantRevoke done{sync::Latch::Notifier::bind<&Receipt::signal>(receipt)};
-        libk_assert(thread->begin_wait(receipt.completion(),
-            *inv.cpu.cpus));
-        auto started = cspace.revoke(source, done, trap.arg(1) != 0);
-        if (!started) {
-            thread->cancel_wait();
-            return returned(cap_status(started.error()));
-        }
-        receipt.commit();
-        if (!done.arm()) receipt.signal();
-        thread->block();
-        return returned(STATUS_OK);
+        Source::Context context{*thread, *inv.cpu.cpus, inv.cpu.dispatcher()};
+        auto result = owner->revoke(handle_of(trap.arg(0)), trap.arg(2) & CAP_REVOKE_ASYNC ? nullptr : &context,
+            cap::GrantId{trap.arg(3)});
+        if (!result) return returned(cap_status(result.error()));
+        if (result->status == STATUS_PENDING && !(trap.arg(2) & CAP_REVOKE_ASYNC)) return {STATUS_PENDING, 0, Disposition::Park};
+        return returned(result->status, result->value, result->sequence);
     }
     if constexpr (op == SYS_OBJECT_DESTROY) {
         auto destroyed = cspace.destroy(handle_of(trap.arg(0)));
@@ -437,84 +402,285 @@ template<usize op>
     auto ref = memory->reference();
     if (!ref) return returned(STATUS_BUSY);
     auto& mem = memory->object();
-    memory->reset();
     auto* cpus = inv.cpu.cpus;
     libk_assert(cpus);
     const auto result = [&]() {
-        if constexpr (op == SYS_MEM_TRIM) return mem.trim(*thread, *cpus, range);
+        if constexpr (op == SYS_MEM_TRIM) {
+            Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
+            std::array<const cap::GrantLease*, 1> grants{&memory->lease()};
+            std::array<const object::ref<>*, 1> gates{&*ref};
+            return mem.trim(range, context, inv.cpu.grants.admission(grants), gates, &memory->lease());
+        }
         else if constexpr (op == SYS_MEM_WRITEBACK) return mem.writeback(page);
-        else return mem.populate(*thread, *cpus, page);
+        else {
+            Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
+            const auto page_result = mem.materialize(page, &context);
+            return page_result ? std::expected<void, mm::MemErr>{} : std::unexpected(page_result.error());
+        }
     }();
+    if constexpr (op == SYS_MEMORY_POPULATE)
+        if (!result && result.error() == mm::MemErr::Pending) return {STATUS_PENDING, 0, Disposition::Retry};
+    if constexpr (op == SYS_MEM_TRIM)
+        if (!result && result.error() == mm::MemErr::Pending) return {STATUS_PENDING, 0, Disposition::Park};
     return returned(thread->stop_requested() ? STATUS_CANCELED
                     : result ? STATUS_OK : mem_status(result.error()));
 }
 
 template<usize op>
-[[nodiscard]] auto resource_close(Call& inv) noexcept -> Result {
-    Thread* const thread = inv.target;
-    if (thread == nullptr) {
-        return returned(STATUS_INVALID_OP);
-    }
-    if (thread->waiting()) {
-        return returned(STATUS_BUSY);
-    }
-    Receipt receipt;
-    {
-        auto pool = inv.cspace.resolve<object::group>(
-            handle_of(inv.trap.arg(0)),
-            cap::Rights::of(cap::Right::Close));
-        if (!pool) {
-            return returned(cap_status(pool.error()));
-        }
-        auto self = pool.value().reference();
-        if (!self) {
-            return returned(STATUS_BUSY);
-        }
-        Cpus* const cpus = inv.cpu.cpus;
-        libk_assert(cpus != nullptr);
-        auto& object = pool.value().object();
-        if (!thread->begin_wait(receipt.completion(), *cpus)) {
-            return returned(STATUS_BUSY);
-        }
-        if (!object.observe_refund(self.value(),
-            resource::RefundNotifier::bind<&Receipt::signal>(receipt))) {
-            thread->cancel_wait();
-            return returned(STATUS_BUSY);
-        }
-        receipt.commit();
-        libk_assert(self->destroy());
-    }
-    thread->block();
-    return returned(STATUS_OK);
+[[nodiscard]] auto scope_close(Call& inv) noexcept -> Result {
+    auto scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
+    if (!scope) return returned(cap_status(scope.error()));
+    return returned(STATUS_OK, static_cast<u64>(scope.value()->close()));
 }
 
 template<usize op>
-[[nodiscard]] auto resource_close_async(Call& inv) noexcept -> Result {
-    auto pool = inv.cspace.resolve<object::group>(
+[[nodiscard]] auto scope_members(Call& inv) noexcept -> Result {
+    auto scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!scope) return returned(cap_status(scope.error()));
+    const auto view = scope->view();
+    const auto* limit = std::get_if<cap::ScopeLimit>(&view.data);
+    if (!limit || !limit->depth || !(limit->facets & SCOPE_MEMBERS)) return returned(STATUS_DENIED);
+    auto source = scope->reference();
+    if (!source) return returned(STATUS_BUSY);
+    ScopeMembers page;
+    const auto status = scope.value()->inspect(source->id(),
+        {inv.trap.arg(2), inv.trap.arg(3), inv.trap.arg(4)}, limit->kinds, page, limit->depth);
+    if (status != STATUS_OK) return returned(status);
+    auto* buffer = inv.target->ipc_buffer();
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&page), sizeof(page)}))
+        return returned(STATUS_BAD_ARGS);
+    return returned(STATUS_OK, sizeof(page));
+}
+
+template<usize op>
+[[nodiscard]] auto scope_query(Call& inv) noexcept -> Result {
+    auto source = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!source) return returned(cap_status(source.error()));
+    const auto view = source->view();
+    const auto* limit = std::get_if<cap::ScopeLimit>(&view.data);
+    const auto facet = inv.trap.arg(2);
+    if (!limit || !std::has_single_bit(facet) || !(limit->facets & facet)) return returned(STATUS_DENIED);
+    auto& scope = source->object();
+    const object::Id id{inv.trap.arg(1)};
+    auto write = [&](const auto& record) noexcept -> Result {
+        // Membership may change while a typed provider samples its own lock.
+        if (!scope.contains(id, limit->kinds, limit->depth)) return returned(STATUS_STALE);
+        auto* buffer = inv.target->ipc_buffer();
+        if (!buffer || !buffer->write(inv.trap.arg(5), {reinterpret_cast<const byte*>(&record), sizeof(record)}))
+            return returned(STATUS_BAD_ARGS);
+        return returned(STATUS_OK, sizeof(record));
+    };
+    if (facet == SCOPE_INFO) {
+        auto info = scope.describe(id, limit->kinds, limit->depth);
+        return info ? write(*info) : returned(info.error());
+    }
+    auto target = scope.lookup(id, limit->kinds, limit->depth);
+    if (!target) return returned(STATUS_NOT_FOUND);
+    if (facet == SCOPE_MEMBERS) {
+        auto group = target.as<object::Scope>();
+        if (!group) return returned(STATUS_INVALID_OP);
+        ScopeMembers page;
+        const auto cursor = inv.trap.arg(3) || inv.trap.arg(4)
+            ? ScopeCursor{id.value, inv.trap.arg(4), inv.trap.arg(3)} : ScopeCursor{};
+        const auto status = group->get().inspect(id, cursor, limit->kinds, page, limit->depth);
+        if (status != STATUS_OK) return returned(status);
+        auto* end = std::remove_if(page.records, page.records + page.count, [&](const ScopeMember& row) noexcept {
+            return !scope.contains(object::Id{row.object_id}, limit->kinds, limit->depth);
+        });
+        page.count = end - page.records;
+        return write(page);
+    }
+    if (facet == SCOPE_CAPS) {
+        auto space = target.as<cap::CSpace>();
+        if (!space) return returned(STATUS_INVALID_OP);
+        CSpaceInfo page;
+        auto sampled = space->get().inspect(handle_of(inv.trap.arg(3)), page, inv.trap.arg(4));
+        if (!sampled) return returned(sampled.error() == cap::CSpaceError::InvalidHandle ? STATUS_STALE : cap_status(sampled.error()));
+        for (auto& row : std::span{page.records, page.count}) {
+            if (row.object_id && !scope.contains(object::Id{row.object_id}, limit->kinds, limit->depth)) {
+                row.object_id = row.grant_id = 0; row.state |= CAP_INFO_BOUNDARY;
+            }
+        }
+        return write(page);
+    }
+    if (facet == SCOPE_LINKS) {
+        LinkRecords page;
+        status_t status = STATUS_INVALID_OP;
+        if (auto space = target.as<mm::VSpace>()) status = space->get().links(inv.trap.arg(3), inv.trap.arg(4), page);
+        else if (auto space = target.as<io::Space>()) status = space->get().links(inv.trap.arg(3), inv.trap.arg(4), page);
+        else {
+            page = {}; page.version = 1; page.size = sizeof(page);
+            status = object::Types::visit(target.kind(), [&]<class T>() noexcept -> status_t {
+                auto& value = *static_cast<T*>(target.get());
+                if constexpr (requires { value.links(inv.trap.arg(3), page); }) value.links(inv.trap.arg(3), page);
+                else if constexpr (requires { value.op(); }) value.op().links(inv.trap.arg(3), page);
+                else return STATUS_INVALID_OP;
+                return page.epoch == UINT64_MAX || (inv.trap.arg(4) && inv.trap.arg(4) != page.epoch) ? STATUS_STALE : STATUS_OK;
+            }, STATUS_INVALID_OP);
+        }
+        if (status != STATUS_OK) return returned(status);
+        for (auto& row : std::span{page.records, page.count}) {
+            if (row.object_id && !scope.contains(object::Id{row.object_id}, limit->kinds, limit->depth)) {
+                row.object_id = row.grant_id = 0; row.flags |= OBS_BOUNDARY;
+            } else if (!(limit->facets & SCOPE_GRANTS)) row.grant_id = 0;
+        }
+        return write(page);
+    }
+    if (facet == SCOPE_GRANTS) {
+        auto space = target.as<cap::CSpace>();
+        if (!space) return returned(STATUS_INVALID_OP);
+        GrantQuery query;
+        auto* buffer = inv.target->ipc_buffer();
+        if (!buffer || !buffer->read(inv.trap.arg(5), {reinterpret_cast<byte*>(&query), sizeof(query)}))
+            return returned(STATUS_BAD_ARGS);
+        GrantRecords page;
+        const auto status = space->get().inspect(query, limit->depth, page);
+        if (status != STATUS_OK) return returned(status);
+        auto clip = [&](GrantRecord& row) noexcept {
+            if (row.object_id && !scope.contains(object::Id{row.object_id}, limit->kinds, limit->depth)) {
+                row.object_id = 0; row.flags |= OBS_BOUNDARY;
+            }
+        };
+        clip(page.root);
+        for (auto& row : std::span{page.records, page.count}) clip(row);
+        return write(page);
+    }
+    if (facet == SCOPE_USAGE) {
+        if (auto account = target.as<resource::Account>()) return write(account->get().info(0));
+        if (auto domain = target.as<sched::Domain>()) return write(domain->get().info(0));
+        return returned(STATUS_INVALID_OP);
+    }
+    if (facet == SCOPE_OPS) {
+        return object::Types::visit(target.kind(), [&]<class T>() noexcept -> Result {
+            if constexpr (requires(T& value) { value.op(); }) {
+                const auto result = static_cast<T*>(target.get())->op().query();
+                if (!scope.contains(id, limit->kinds, limit->depth)) return returned(STATUS_STALE);
+                return returned(result.status, result.value, result.sequence);
+            } else return returned(STATUS_INVALID_OP);
+        }, returned(STATUS_INVALID_OP));
+    }
+    return returned(STATUS_INVALID_OP);
+}
+
+static auto whole(const object::ref<>& target, const cap::View& view) noexcept -> bool {
+    if (target.kind() == ObjVSpace) {
+        const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+        return limit && limit->range == mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin};
+    }
+    if (target.kind() == ObjMem) {
+        const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+        return limit && limit->range == mm::ObjectRange{0, static_cast<mm::Mem*>(target.get())->page_count()};
+    }
+    return true;
+}
+
+template<usize op>
+[[nodiscard]] auto scope_adopt(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Adopt));
+    auto source = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Manage));
+    auto destination = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Create));
+    if (!target) return returned(cap_status(target.error()));
+    if (!source) return returned(cap_status(source.error()));
+    if (!destination) return returned(cap_status(destination.error()));
+    auto object = target->reference();
+    auto from = source->reference();
+    auto to = destination->reference();
+    if (!object || !from || !to) return returned(STATUS_BUSY);
+    const auto source_view = source->view(), destination_view = destination->view();
+    const auto* a = std::get_if<cap::ScopeLimit>(&source_view.data);
+    const auto* b = std::get_if<cap::ScopeLimit>(&destination_view.data);
+    if (!a || !b || !(a->kinds & b->kinds & OBJ_BIT(object->kind()))) return returned(STATUS_DENIED);
+    if (!whole(*object, target->view())) return returned(STATUS_DENIED);
+    std::array<const cap::GrantLease*, 3> grants{&target->lease(), &source->lease(), &destination->lease()};
+    auto authority = target->lease().graph().admission(std::span{grants});
+    auto result = object::Scope::adopt(*object, std::move(*from).as<object::Scope>().value(),
+        std::move(*to).as<object::Scope>().value(), inv.trap.arg(3), authority);
+    if (result) return returned(STATUS_OK, *result);
+    return returned(result.error());
+}
+
+template<usize op>
+[[nodiscard]] auto object_info(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
+    if (!target) return returned(cap_status(target.error()));
+    const auto view = target->view();
+    if (const auto* scope = std::get_if<cap::ScopeLimit>(&view.data); scope && !(scope->facets & SCOPE_INFO))
+        return returned(STATUS_DENIED);
+    auto object = target->reference();
+    if (!object) return returned(STATUS_BUSY);
+    const ObjectInfo info{1, sizeof(ObjectInfo), object->id().value, object->funding()->epoch(),
+        static_cast<u32>(object->kind()), object->live() ? OBJECT_OPEN : OBJECT_CLOSING};
+    auto* buffer = inv.target->ipc_buffer();
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&info), sizeof(info)}))
+        return returned(STATUS_BAD_ARGS);
+    return returned(STATUS_OK, sizeof(info));
+}
+
+template<usize op>
+[[nodiscard]] auto object_rebill(Call& inv) noexcept -> Result {
+    const bool adopt = inv.trap.arg(4) || inv.trap.arg(5) || inv.trap.arg(6);
+    if (adopt && (!inv.trap.arg(4) || !inv.trap.arg(5) || !inv.trap.arg(6))) return returned(STATUS_BAD_ARGS);
+    const auto rights = adopt ? cap::Rights::of(cap::Right::Rebill, cap::Right::Adopt) : cap::Rights::of(cap::Right::Rebill);
+    auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), rights);
+    auto old = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Rebill));
+    auto next = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Create));
+    if (!target) return returned(cap_status(target.error()));
+    if (!old) return returned(cap_status(old.error()));
+    if (!next) return returned(cap_status(next.error()));
+    auto object = target->reference(), from = old->reference(), to = next->reference();
+    if (!object || !from || !to) return returned(STATUS_BUSY);
+    const auto next_view = next->view();
+    const auto* limit = std::get_if<cap::Quota>(&next_view.data);
+    if (!limit || !(limit->object_kinds & OBJ_BIT(object->kind()))) return returned(STATUS_DENIED);
+    if (!whole(*object, target->view())) return returned(STATUS_DENIED);
+    std::optional<cap::Resolved<object::Scope>> source, destination;
+    object::ref<object::Scope> source_owner, destination_owner;
+    std::array<const cap::GrantLease*, 5> grants{&target->lease(), &old->lease(), &next->lease(), nullptr, nullptr};
+    if (adopt) {
+        auto from_scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(4)), cap::Rights::of(cap::Right::Manage));
+        auto to_scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(5)), cap::Rights::of(cap::Right::Create));
+        if (!from_scope) return returned(cap_status(from_scope.error()));
+        if (!to_scope) return returned(cap_status(to_scope.error()));
+        const auto a = from_scope->view(), b = to_scope->view();
+        if (!(std::get<cap::ScopeLimit>(a.data).kinds & std::get<cap::ScopeLimit>(b.data).kinds & OBJ_BIT(object->kind())))
+            return returned(STATUS_DENIED);
+        auto source_ref = from_scope->reference(), destination_ref = to_scope->reference();
+        if (!source_ref || !destination_ref) return returned(STATUS_BUSY);
+        source_owner = std::move(*source_ref).as<object::Scope>().value();
+        destination_owner = std::move(*destination_ref).as<object::Scope>().value();
+        source.emplace(std::move(*from_scope)); destination.emplace(std::move(*to_scope));
+        grants[3] = &source->lease(); grants[4] = &destination->lease();
+    }
+    object::Transfer authority{*object, std::move(source_owner), std::move(destination_owner), inv.trap.arg(6),
+        target->lease().graph().admission(std::span{grants.data(), adopt ? usize{5} : usize{3}})};
+    const auto valid = authority.validate();
+    if (valid != STATUS_OK) return returned(valid);
+    auto result = object::Types::visit(object->kind(), [&]<class T>() -> std::expected<u64, status_t> {
+        auto typed = object->as<T>();
+        libk_assert(typed);
+        auto& funding = *object->funding();
+        auto transaction = [&](auto&& visit, auto&& commit) {
+            return object::rebill(inv.cpu.objects.pmm(), funding, *object, *from, *to,
+                inv.trap.arg(3), limit->budget, visit, commit, authority);
+        };
+        if constexpr (requires { typed->get().billing(*to, transaction); })
+            return typed->get().billing(*to, transaction);
+        else if constexpr (requires { T::fixed_bill; }) {
+            static_assert(T::fixed_bill);
+            return object::rebill(inv.cpu.objects.pmm(), funding, *object, *from, *to,
+                inv.trap.arg(3), limit->budget, [](auto&&) {}, [] {}, authority);
+        } else return std::unexpected(STATUS_INVALID_OP);
+    }, std::expected<u64, status_t>{std::unexpected(STATUS_INVALID_OP)});
+    return result ? returned(STATUS_OK, *result, authority.epoch()) : returned(result.error());
+}
+
+template<usize op>
+[[nodiscard]] auto account_close(Call& inv) noexcept -> Result {
+    auto account = inv.cspace.resolve<resource::Account>(
         handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
-    // Receive authority owns the dest inbox and may choose its event
-    // bits. A borrowed Signal capability cannot inject arbitrary badges.
-    auto notification = inv.cspace.resolve<ipc::Notification>(
-        handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Receive));
-    if (!pool || !notification) return returned(cap_status(!pool ? pool.error() : notification.error()));
-    const auto badge = inv.trap.arg(2);
-    if (badge == 0) return returned(STATUS_BAD_ARGS);
-    auto self = pool.value().reference();
-    auto dest = notification.value().reference();
-    if (!self || !dest) return returned(STATUS_BUSY);
-    const auto id = dest.value().id();
-    auto& notifications = inv.cpu.objects.get<ipc::Notification>();
-    const resource::RefundNotifier notifier{&notifications,
-        [](void* ctx, usize slot, u64 generation, u64 bits) noexcept {
-            // Weak generation identity: a dead inbox drops the delivery. No
-            // reference can keep an object in the closing subtree alive.
-            auto target = static_cast<object::pool<ipc::Notification>*>(ctx)->lookup(
-                {slot, generation});
-            if (target) static_cast<void>(target.value()->signal(bits));
-        }, id.slot, id.generation, badge};
-    if (!pool.value()->observe_refund(self.value(), notifier)) return returned(STATUS_BUSY);
-    libk_assert(self->destroy());
-    return returned(STATUS_OK);
+    if (!account) return returned(cap_status(account.error()));
+    const auto phase = account->object().close();
+    return returned(STATUS_OK, static_cast<u32>(phase));
 }
 
 [[nodiscard]] static auto pager_error(Pager::Error error) noexcept -> status_t {
@@ -580,7 +746,11 @@ static auto pg_claim(Call& inv) noexcept -> Result {
     if (!access) {
         return returned(STATUS_RETRY);
     }
-    const auto request = resolved.value()->claim(&inv.target->claims());
+    auto storage = resolved->reference();
+    if (!storage) return returned(STATUS_CLOSED);
+    const cap::GrantLease* grants[]{&resolved->lease()};
+    const object::ref<>* gates[]{&*storage};
+    const auto request = resolved.value()->claim(resolved->lease().graph().admission(grants), gates);
     if (!request) {
         return returned(pager_error(request.error()));
     }
@@ -603,14 +773,23 @@ static auto pg_finish(Call& inv) noexcept -> Result {
     auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)), cap::Rights::of(right));
     if (!pager) return returned(cap_status(pager.error()));
     if constexpr (op == SYS_PAGER_REQUEUE) {
-        const auto result = pager.value()->requeue(inv.trap.arg(1));
+        auto storage = pager->reference();
+        if (!storage) return returned(STATUS_CLOSED);
+        const cap::GrantLease* grants[]{&pager->lease()};
+        const object::ref<>* gates[]{&*storage};
+        const auto result = pager.value()->requeue(inv.trap.arg(1), pager->lease().graph().admission(grants), gates);
         return result ? returned(STATUS_OK) : returned(pager_error(result.error()));
     }
     auto memory = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)),
         cap::Rights::of(cap::Right::Manage));
     if (!memory) return returned(cap_status(memory.error()));
+    auto pager_ref = pager->reference();
+    auto memory_ref = memory->reference();
+    if (!pager_ref || !memory_ref) return returned(STATUS_CLOSED);
+    const cap::GrantLease* grants[]{&pager->lease(), &memory->lease()};
+    const object::ref<>* gates[]{&*pager_ref, &*memory_ref};
     const auto result = memory.value()->pager_finish(pager.value().object(), inv.trap.arg(2),
-        op == SYS_PAGER_FAIL);
+        op == SYS_PAGER_FAIL, pager->lease().graph().admission(grants), gates);
     return result ? returned(STATUS_OK) : returned(mem_status(result.error()));
 }
 
@@ -627,61 +806,26 @@ static auto pg_supply(Call& inv) noexcept -> Result {
     }
     auto transfer = source.value()->begin_transfer(inv.trap.arg(3));
     if (!transfer) return returned(mem_status(transfer.error()));
+    auto pager_ref = pager->reference();
+    auto target_ref = target->reference();
+    auto source_ref = source->reference();
+    if (!pager_ref || !target_ref || !source_ref) return returned(STATUS_CLOSED);
+    const cap::GrantLease* grants[]{&pager->lease(), &target->lease(), &source->lease()};
+    const object::ref<>* gates[]{&*pager_ref, &*target_ref, &*source_ref};
     auto supplied = target.value()->supply(pager.value().object(), std::move(*transfer),
-        inv.trap.arg(4));
+        inv.trap.arg(4), pager->lease().graph().admission(grants), gates);
     return supplied ? returned(STATUS_OK)
                     : returned(mem_status(supplied.error()));
 }
 
-static auto pg_bind(Call& inv) noexcept -> Result {
-    auto pager = inv.cspace.resolve<Pager>(
-        handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Serve));
-    auto notification = inv.cspace.resolve<ipc::Notification>(
-        handle_of(inv.trap.arg(1)),
-        cap::Rights::of(cap::Right::Signal));
-    if (!pager || !notification) {
-        return returned(cap_status(!pager ? pager.error() : notification.error()));
-    }
-    const auto limit = notification.value().view();
-    const auto* const data = std::get_if<cap::Badge>(
-        &limit.data);
-    const u64 badge = inv.trap.arg(2);
-    if (data == nullptr || badge == 0 || badge != data->badge) {
-        return returned(STATUS_BAD_ARGS);
-    }
-    const auto result = pager.value()->bind(notification.value().object(), badge);
-    return result ? returned(STATUS_OK)
-                  : returned(pager_error(result.error()));
-}
-
-static auto irq_bind(Call& inv) noexcept -> Result {
-    auto irq = inv.cspace.resolve<irq::Irq>(
-        handle_of(inv.trap.arg(0)),
-        cap::Rights::of(cap::Right::Route));
-    auto notification = inv.cspace.resolve<ipc::Notification>(
-        handle_of(inv.trap.arg(1)),
-        cap::Rights::of(cap::Right::Signal));
-    if (!irq || !notification) {
-        return returned(cap_status(!irq ? irq.error() : notification.error()));
-    }
-    const auto limit = notification.value().view();
-    const auto* const notification_data =
-        std::get_if<cap::Badge>(&limit.data);
-    const u64 badge = inv.trap.arg(2);
-    if (notification_data == nullptr || badge == 0
-        || badge != notification_data->badge) {
-        return returned(STATUS_BAD_ARGS);
-    }
-    const auto result = irq.value()->bind(
-        notification.value().object(), badge);
-    return result ? returned(STATUS_OK)
-                  : returned(irq_error(result.error()));
-}
-
 template<usize op>
 static auto irq_call(Call& inv) noexcept -> Result {
-    if constexpr (op == SYS_IRQ_BIND) {
-        return irq_bind(inv);
+    if constexpr (op == SYS_IRQ_SET) {
+        if (inv.trap.arg(1) > 1) return returned(STATUS_BAD_ARGS);
+        auto irq = inv.cspace.resolve<irq::Irq>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Route));
+        if (!irq) return returned(cap_status(irq.error()));
+        const auto result = irq->object().enable(inv.trap.arg(1));
+        return result ? returned(STATUS_OK, *result) : returned(irq_error(result.error()));
     }
     if constexpr (op != SYS_IRQ_OBSERVE
         && op != SYS_IRQ_ACK) {
@@ -721,9 +865,6 @@ auto pg_call(Call& inv) noexcept -> Result {
     if constexpr (op == SYS_PAGER_SUPPLY) {
         return pg_supply(inv);
     }
-    if constexpr (op == SYS_PAGER_BIND) {
-        return pg_bind(inv);
-    }
     return irq_call<op>(inv);
 }
 
@@ -732,19 +873,9 @@ auto exit_call(Call& call) noexcept -> Result {
     auto thread = call.cspace.resolve<Thread>(handle_of(call.trap.arg(0)),
         cap::Rights::of(cap::Right::Observe));
     if (!thread) return returned(cap_status(thread.error()));
-    auto& record = thread.value()->exit();
-    if constexpr (op == SYS_EXIT_QUERY) {
-        const auto result = record.read();
-        return returned(STATUS_OK, result.has_value(),
-            static_cast<usize>(static_cast<isize>(result.value_or(STATUS_OK))));
-    }
-    auto notification = call.cspace.resolve<ipc::Notification>(
-        handle_of(call.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
-    if (!notification) return returned(cap_status(notification.error()));
-    const auto badge = call.trap.arg(2);
-    if (!badge) return returned(STATUS_BAD_ARGS);
-    return returned(record.observe(notification.value().object(), badge)
-        ? STATUS_OK : STATUS_BUSY);
+    const auto result = thread.value()->exit().read();
+    return returned(STATUS_OK, result.has_value(),
+        static_cast<usize>(static_cast<isize>(result.value_or(STATUS_OK))));
 }
 
 template<usize op>
@@ -754,30 +885,27 @@ auto io_call(Call& inv) noexcept -> Result {
         auto ctl = inv.cspace.resolve<io::Iommu>(handle, cap::Rights::of(cap::Right::Inspect));
         return ctl ? returned(STATUS_OK, ctl->object().state()) : returned(cap_status(ctl.error()));
     } else {
-        constexpr auto right = op == SYS_IO_SPACE_STATE ? cap::Right::Inspect : op == SYS_IO_SPACE_MAP ? cap::Right::Map
-            : op == SYS_IO_SPACE_UNMAP ? cap::Right::Unmap : op == SYS_IO_SPACE_WATCH ? cap::Right::Observe : cap::Right::Close;
+        constexpr auto right = op == SYS_IO_SPACE_STATE ? cap::Right::Inspect : cap::Right::Close;
         auto domain = inv.cspace.resolve<io::Space>(handle, cap::Rights::of(right));
         if (!domain) return returned(cap_status(domain.error()));
         if constexpr (op == SYS_IO_SPACE_STATE) return returned(STATUS_OK, domain->object().state());
         if constexpr (op == SYS_IO_SPACE_CLOSE) { domain->object().close(); return returned(STATUS_OK); }
-        if constexpr (op == SYS_IO_SPACE_UNMAP) return returned(domain->object().unmap(inv.trap.arg(1), inv.trap.arg(2)));
-        if constexpr (op == SYS_IO_SPACE_MAP) {
-            auto source = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Map));
-            const auto perms = perms_of(inv.trap.arg(5));
-            if (!source || !perms) return returned(source ? STATUS_BAD_ARGS : cap_status(source.error()));
-            const auto mapped = domain->object().map(*source, {inv.trap.arg(2), inv.trap.arg(3)}, inv.trap.arg(4), *perms);
-            return mapped ? returned(STATUS_PENDING, *mapped) : returned(mapped.error());
-        }
-        if constexpr (op == SYS_IO_SPACE_WATCH) {
-            auto notice = inv.cspace.resolve<ipc::Notification>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Signal));
-            if (!notice) return returned(cap_status(notice.error()));
-            const auto view = notice->view();
-            const auto* badge = std::get_if<cap::Badge>(&view.data);
-            if (!badge || !badge->badge || badge->badge != inv.trap.arg(2)) return returned(STATUS_BAD_ARGS);
-            return returned(domain->object().watch(notice->object(), badge->badge));
-        }
+
     }
     return returned(STATUS_INVALID_OP);
+}
+
+template<usize op> auto op_call(Call& inv) noexcept -> Result {
+    auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), cap::Rights::of(
+        op == SYS_OP_QUERY ? cap::Right::Inspect : cap::Right::Control));
+    if (!target) return returned(cap_status(target.error()));
+    return object::Types::visit(target->lease().kind(), [&]<class T>() noexcept -> Result {
+        if constexpr (requires(T& value) { value.op(); }) {
+            auto& value = *static_cast<T*>(target->lease().get());
+            if constexpr (op == SYS_OP_CANCEL) return returned(value.op().cancel());
+            else { const auto r = value.op().query(); return returned(r.status, r.value, r.sequence); }
+        } else return returned(STATUS_INVALID_OP);
+    }, returned(STATUS_INVALID_OP));
 }
 
 template<usize op>
@@ -785,17 +913,7 @@ auto vm_call(Call& inv) noexcept -> Result {
     arch::TrapCtx& trap = inv.trap;
     cap::CSpace& cspace = inv.cspace;
     const cap::Handle vspace_handle = handle_of(trap.arg(0));
-    const cap::Right required = op == SYS_VM_MAP
-        ? cap::Right::Map
-        : op == SYS_VM_UNMAP
-            ? cap::Right::Unmap
-            : op == SYS_VM_PROTECT
-                ? cap::Right::Protect
-                : op == SYS_VM_SLICE
-                    ? cap::Right::Delegate
-                    : op == SYS_VM_CLEAR
-                        ? cap::Right::Destroy
-                        : cap::Right::Reserve;
+    const auto required = op == SYS_VM_SLICE ? cap::Right::Delegate : cap::Right::Reserve;
     if (!vspace_handle) {
         return returned(STATUS_BAD_ARGS);
     }
@@ -809,76 +927,9 @@ auto vm_call(Call& inv) noexcept -> Result {
         std::get_if<cap::VmLimit>(&effective.data);
     libk_assert(where != nullptr);
     mm::VSpace& space = target.value().object();
-    const mm::VmCtx vm = mm::VmCtx{inv.cpu.cpus, inv.cpu.id};
-    const auto finish = [&](mm::VmStatus status) noexcept -> status_t {
-        if (status == mm::VmStatus::Complete && !space.pending()) return STATUS_OK;
-        auto reference = target.value().reference();
-        libk_assert(reference);
-        mm::Fence fence{std::move(reference).value(), space};
-        target.value().reset(); // Admission lease cannot block cap revocation.
-        auto* cpus = inv.cpu.cpus;
-        libk_assert(cpus && inv.target->begin_wait(fence.completion(), *cpus));
-        fence.start();
-        inv.target->block();
-        return STATUS_OK;
-    };
-
-
-    if constexpr (op == SYS_VM_CLEAR) {
-        auto destroyed = space.clear(vm, where->range);
-        return returned(destroyed
-            ? finish(destroyed.value())
-            : vm_status(destroyed.error()));
-    }
-    if constexpr (op == SYS_VM_MAP) {
-        const cap::Handle memory_handle = handle_of(trap.arg(1));
-        const auto range = range_of(trap.arg(2), trap.arg(3));
-        const usize flags = trap.arg(5);
-        const auto access = perms_of(flags & (VM_READ | VM_WRITE | VM_EXECUTE));
-        if (!memory_handle || !range || !access
-            || (flags & ~(VM_READ | VM_WRITE | VM_EXECUTE
-                | VM_MAP_PRIVATE)) != 0) {
-            return returned(STATUS_BAD_ARGS);
-        }
-        auto memory = cspace.resolve<mm::Mem>(
-            memory_handle, cap::Rights::of(cap::Right::Map));
-        if (!memory) {
-            return returned(cap_status(memory.error()));
-        }
-        const usize pages = range->size() / mm::page_size;
-        auto mapped = space.map(
-            vm,
-            *where,
-            mm::MapReq{
-                *range,
-                mm::ObjectRange{trap.arg(4), pages},
-                *access, (flags & VM_MAP_PRIVATE) != 0},
-            memory.value());
-        memory.value().reset();
-        return returned(mapped
-            ? finish(mapped.value().status)
-            : vm_status(mapped.error()));
-    }
-
     const auto range = range_of(trap.arg(1), trap.arg(2));
     if (!range) {
         return returned(STATUS_BAD_ARGS);
-    }
-    if constexpr (op == SYS_VM_UNMAP) {
-        auto unmapped = space.unmap(vm, *where, *range);
-        return returned(unmapped
-            ? finish(unmapped.value())
-            : vm_status(unmapped.error()));
-    }
-    if constexpr (op == SYS_VM_PROTECT) {
-        const auto access = perms_of(trap.arg(3));
-        if (!access) {
-            return returned(STATUS_BAD_ARGS);
-        }
-        auto protected_range = space.protect(vm, *where, *range, *access);
-        return returned(protected_range
-            ? finish(protected_range.value())
-            : vm_status(protected_range.error()));
     }
     if constexpr (op == SYS_VM_SLICE) {
         const auto access = perms_of(trap.arg(3));
@@ -897,7 +948,7 @@ auto vm_call(Call& inv) noexcept -> Result {
             ? space.reserve(*range)
             : space.reserve(*range,true);
         return returned(
-            reserved ? STATUS_OK : vm_status(reserved.error()));
+            reserved ? STATUS_OK : mm::status(reserved.error()));
     }
     return returned(STATUS_INVALID_OP);
 }
@@ -964,6 +1015,14 @@ template<usize op>
 }
 template<usize op>
 [[nodiscard]] auto info_call(Call& inv) noexcept -> Result {
+    const auto write = [&](const auto& info) noexcept -> Result {
+        auto* buffer = inv.target->ipc_buffer();
+        if (!buffer || !buffer->write(inv.trap.arg(1), std::span{reinterpret_cast<const byte*>(&info), sizeof(info)}))
+            return returned(STATUS_BAD_ARGS);
+        return returned(STATUS_OK, sizeof(info));
+    };
+    if constexpr (op == SYS_THREAD_INFO)
+        if (!inv.trap.arg(0)) return write(inv.target->info(inv.cpu.dispatcher().clock().rd_ticks()));
     const auto inspect = [&]<class T>() -> Result {
         auto target = inv.cspace.resolve<T>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
         if (!target) return returned(cap_status(target.error()));
@@ -973,15 +1032,24 @@ template<usize op>
             if (!limit || limit->range != mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin})
                 return returned(STATUS_DENIED);
         }
-        const auto info = target.value()->info(inv.cpu.dispatcher().clock().rd_ticks());
-        auto* buffer = inv.target->ipc_buffer();
-        if (!buffer || !buffer->write(inv.trap.arg(1), std::span{reinterpret_cast<const byte*>(&info), sizeof(info)}))
-            return returned(STATUS_BAD_ARGS);
-        return returned(STATUS_OK, sizeof(info));
+        if constexpr (std::is_same_v<T, object::Scope>) {
+            const auto view = target->view();
+            const auto* limit = std::get_if<cap::ScopeLimit>(&view.data);
+            if (!limit || !(limit->facets & SCOPE_INFO)) return returned(STATUS_DENIED);
+        }
+        const auto info = [&] {
+            if constexpr (std::is_same_v<T, object::Scope>) {
+                const auto view = target->view();
+                return target.value()->info(0, std::get<cap::ScopeLimit>(view.data).kinds);
+            } else return target.value()->info(inv.cpu.dispatcher().clock().rd_ticks());
+        }();
+        return write(info);
     };
     if constexpr (op == SYS_THREAD_INFO) return inspect.template operator()<Thread>();
+    if constexpr (op == SYS_DOMAIN_INFO) return inspect.template operator()<sched::Domain>();
     if constexpr (op == SYS_SC_INFO) return inspect.template operator()<sched::Sc>();
-    if constexpr (op == SYS_GROUP_INFO) return inspect.template operator()<object::group>();
+    if constexpr (op == SYS_SCOPE_INFO) return inspect.template operator()<object::Scope>();
+    if constexpr (op == SYS_ACCOUNT_INFO) return inspect.template operator()<resource::Account>();
     if constexpr (op == SYS_VSPACE_INFO) return inspect.template operator()<mm::VSpace>();
     return returned(STATUS_INVALID_OP);
 }
@@ -993,7 +1061,7 @@ template<usize op>
     const auto* limit = std::get_if<cap::VmLimit>(&view.data);
     libk_assert(limit);
     auto info = target.value()->inspect(limit->range, mm::va_t{inv.trap.arg(2)});
-    if (!info) return returned(vm_status(info.error()));
+    if (!info) return returned(mm::status(info.error()));
     auto* buffer = inv.target->ipc_buffer();
     if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&*info), sizeof(*info)}))
         return returned(STATUS_BAD_ARGS);
@@ -1003,21 +1071,64 @@ template<usize op>
 [[nodiscard]] auto cspace_info(Call& inv) noexcept -> Result {
     auto target = inv.cspace.resolve<cap::CSpace>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
     if (!target) return returned(cap_status(target.error()));
-    auto info = target.value()->inspect(handle_of(inv.trap.arg(2)));
-    if (!info) return returned(info.error() == cap::CSpaceError::InvalidHandle ? STATUS_STALE : cap_status(info.error()));
+    CSpaceInfo info;
+    const auto result = target.value()->inspect(handle_of(inv.trap.arg(2)), info, inv.trap.arg(3));
+    if (!result) return returned(result.error() == cap::CSpaceError::InvalidHandle ? STATUS_STALE : cap_status(result.error()));
     auto* buffer = inv.target->ipc_buffer();
-    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&*info), sizeof(*info)}))
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&info), sizeof(info)}))
         return returned(STATUS_BAD_ARGS);
-    return returned(STATUS_OK, sizeof(*info));
+    return returned(STATUS_OK, sizeof(info));
 }
 template<usize op>
-[[nodiscard]] auto execution_watch(Call& inv) noexcept -> Result {
-    using T = std::conditional_t<op == SYS_SC_WATCH, sched::Sc, Thread>;
-    auto target = inv.cspace.resolve<T>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Inspect));
-    auto notice = inv.cspace.resolve<ipc::Notification>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Receive));
-    if (!target || !notice) return returned(cap_status(!target ? target.error() : notice.error()));
-    return returned(target.value()->observe(notice->object(), inv.trap.arg(2)) ? STATUS_OK : STATUS_BUSY);
+[[nodiscard]] auto execution_move(Call& inv) noexcept -> Result {
+    std::optional<cap::Resolved<Thread>> target;
+    auto* thread = inv.target;
+    if (inv.trap.arg(0)) {
+        auto resolved = inv.cspace.resolve<Thread>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+        if (!resolved) return returned(cap_status(resolved.error()));
+        target = std::move(*resolved); thread = &target->object();
+    }
+    const auto result = thread->migrate(*inv.cpu.cpus, CpuId{inv.trap.arg(1)}, inv.trap.arg(2));
+    return result ? returned(STATUS_OK, *result) : returned(result.error());
 }
+
+template<usize op>
+[[nodiscard]] auto domain_configure(Call& inv) noexcept -> Result {
+    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!domain) return returned(cap_status(domain.error()));
+    auto& clock = inv.cpu.dispatcher().clock();
+    const auto budget = clock.ticks<time::ns>(inv.trap.arg(1));
+    const auto period = clock.ticks<time::ns>(inv.trap.arg(2));
+    if (!budget || !period || inv.trap.arg(3) > 65535) return returned(STATUS_BAD_ARGS);
+    std::optional<cap::Resolved<sched::Domain>> parent;
+    if (inv.trap.arg(5)) {
+        auto resolved = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(5)), cap::Rights::of(cap::Right::Control));
+        if (!resolved) return returned(cap_status(resolved.error()));
+        parent = std::move(*resolved);
+    }
+    const sched::Domain::Config config{.cpus=inv.trap.arg(4), .budget=*budget, .period=*period,
+        .weight=static_cast<u32>(inv.trap.arg(3))};
+    const auto result = domain.value()->configure(config, parent ? &parent->object() : nullptr);
+    return result ? returned(STATUS_OK, *result) : returned(result.error());
+}
+
+template<usize op>
+[[nodiscard]] auto domain_move(Call& inv) noexcept -> Result {
+    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    auto parent = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
+    if (!domain) return returned(cap_status(domain.error()));
+    if (!parent) return returned(cap_status(parent.error()));
+    const auto result = domain->object().reparent(*domain, *parent);
+    return result ? returned(STATUS_OK, *result) : returned(result.error());
+}
+
+template<usize op>
+[[nodiscard]] auto domain_close(Call& inv) noexcept -> Result {
+    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
+    if (!domain) return returned(cap_status(domain.error()));
+    return returned(STATUS_OK, domain.value()->close());
+}
+
 template<usize op>
 [[nodiscard]] auto sc_configure(Call& inv) noexcept -> Result {
     auto target = inv.cspace.resolve<sched::Sc>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
@@ -1074,7 +1185,8 @@ auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
         outcome = returned(STATUS_INVALID_OP);
         break;
     }
-    publish(ctx, outcome);
+    if (outcome.disposition == Disposition::Retry) ctx.retry_syscall();
+    else publish(ctx, outcome);
     return outcome.disposition;
 }
 

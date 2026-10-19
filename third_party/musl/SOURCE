@@ -1,0 +1,8 @@
+musl v1.2.5 math routines, https://git.musl-libc.org/cgit/musl/
+Only pow/powf and their real tables/error routines are linked.
+libm.h adds the private visibility macro supplied by musl features.h.
+fp_arch.h is the upstream generic implementation (soft float target).
+License and copyrights: COPYRIGHT and individual source headers.
+libm.h uses compiler byte-order constants instead of musl endian.h and omits
+an unrelated signgam declaration conflicting with the target C headers.
+The table headers use libm.h for private visibility instead of musl features.h.

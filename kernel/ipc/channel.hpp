@@ -3,7 +3,6 @@
 #include <cap/cspace.hpp>
 #include <cap/grant.hpp>
 #include <libk/types.hpp>
-#include <ipc/notification.hpp>
 #include <expected>
 #include <libk/inplace_vector.hpp>
 #include <libk/intrusive_list.hpp>
@@ -15,12 +14,7 @@
 #include <sync.hpp>
 #include <uapi/ipc.h>
 
-class Cpus;
-class Thread;
-
 namespace ipc {
-
-class Buffer;
 
 using ChannelSide = cap::ChannelSide;
 
@@ -33,112 +27,42 @@ enum class ChannelError : u8 {
     Busy,
     ResourceExhausted,
     TransferFailed,
-    InvalidRelation,
     GenerationExhausted,
     Canceled,
+    Abandoned,
     InvalidCap,
-};
-
-enum class ChannelCondition : u8 {
-    Readable = CHANNEL_READABLE,
-    Writable = CHANNEL_WRITABLE,
-    PeerClosed = CHANNEL_PEER_CLOSED,
 };
 
 struct ChannelConfig final {
     usize queue_capacity{16};
     usize max_words{CHANNEL_MAX_WORDS};
     usize max_caps{CHANNEL_MAX_CAPS};
-    usize relation_capacity{4};
-};
-
-struct ChannelSend final {
-    u64 transaction{};
-    u64 tag{};
-    usize word_count{};
-    u64 words[CHANNEL_MAX_WORDS]{};
-    usize cap_count{};
-    CapXfer caps[CHANNEL_MAX_CAPS]{};
-};
-
-struct ChannelRecv final {
-    u64 transaction{};
-    u64 tag{};
-    u64 sender_badge{};
-    u64 sequence{};
-    usize word_count{};
-    u64 words[CHANNEL_MAX_WORDS]{};
-    usize cap_count{};
-    usize receive_limit{CHANNEL_MAX_CAPS};
-    cap::Handle caps[CHANNEL_MAX_CAPS]{};
 };
 
 // A bounded bidirectional queue. Channel owns all queue cells, capability
-// escrow, readiness relations, and protocol-close state; Notification only
-// receives level/sequence hints through NotificationSource.
+// escrow and protocol-close state. Endpoint readiness has independent
+// read/write sources; subscriptions belong to the receiving Port.
 class Channel final : private libk::noncopyable_nonmovable {
 public:
-    struct Wait final : private libk::noncopyable_nonmovable {
-        enum class Kind : u8 {
-            Send,
-            Receive,
-        };
-        enum class State : u8 {
-            Attaching,
-            Awaiting,
-            Armed,
-            Ready,
-            Done,
-        };
-
-        explicit Wait(Channel& owner) noexcept;
-        ~Wait() noexcept;
-
-
-        void release() noexcept;
-        [[nodiscard]] auto cancel() noexcept -> bool;
-
-        Channel* owner{};
-        Kind kind{Kind::Send};
-        State state{State::Attaching};
-        libk::intrusive_list_hook hook{};
-        // Admission, Completion, cap attachment, and lock-external
-        // notifications each own one reference. Protected by Channel::lock_.
-        usize references{1};
-        bool admitted{};
-        bool grant_detaching{};
-        ChannelSide side{ChannelSide::A};
-        WaitResult result{};
-        object::ref<> channel_ref{};
-        cap::GrantAttachment grant_attachment;
-        Completion completion;
-    };
+    void bind_work(WorkQueue& work, object::Key key) noexcept {
+        for (auto& side : sides_) { side.rx.bind_work(work, key); side.tx.bind_work(work, key); }
+    }
+    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+        -> std::expected<u64, status_t> {
+        { sync::Lock guard{lock_}; if (!opened_) return std::unexpected(STATUS_BUSY); }
+        object::ref<> payer{to};
+        return transaction([&](auto&& visit) { messages_.charges(visit); },
+            [&] { std::swap(payer_, payer); });
+    }
 
 private:
-    using Waiter = Wait;
-    enum class CommitResult : u8 {
-        Committed,
-        Capacity,
-        Invalid,
-    };
-
     struct Escrow final : private libk::noncopyable {
-        enum class Kind : u8 {
-            Copy,
-            Delegate,
-            Move,
-        };
-
         Escrow() noexcept = default;
         Escrow(Escrow&&) noexcept = default;
         auto operator=(Escrow&&) noexcept -> Escrow& = default;
 
-        cap::CSpace* source{};
         cap::CSpace::Reservation source_slot{};
-        cap::GrantRef grant{};
-        cap::View view{};
-        cap::Handle source_handle{};
-        Kind kind{Kind::Copy};
+        cap::Capability cap{};
     };
 
     struct Message final : private libk::noncopyable {
@@ -148,21 +72,10 @@ private:
         u64 tag{};
         u64 sender_badge{};
         u64 sequence{};
+        std::optional<ChannelError> error;
         usize word_count{};
         u64 words[CHANNEL_MAX_WORDS]{};
         libk::inplace_vector<Escrow, CHANNEL_MAX_CAPS> escrows{};
-    };
-
-    struct Relation;
-
-    struct GrantLink final : private libk::noncopyable_nonmovable {
-        GrantLink(Relation& relation, bool channel) noexcept;
-        ~GrantLink() noexcept = default;
-
-        Relation* relation{};
-        bool channel{};
-        cap::GrantAttachment attachment;
-        cap::GrantWork work{};
     };
 
     struct SideLink final : private libk::noncopyable_nonmovable {
@@ -171,44 +84,25 @@ private:
 
         Channel* owner{};
         ChannelSide side{ChannelSide::A};
-        cap::GrantAttachment attachment;
-        cap::GrantWork work{};
-    };
-
-    struct Relation final : private libk::noncopyable_nonmovable {
-        Relation() noexcept;
-        ~Relation() noexcept;
-
-        void closed() noexcept;
-        void notification_closed() noexcept;
-
-        Channel* owner{};
-        libk::intrusive_list_hook hook{};
-        usize index{};
-        NotificationSource source;
-        object::ref<Notification> notification{};
-        GrantLink channel_link;
-        GrantLink notification_link;
-        ChannelSide side{ChannelSide::A};
-        ChannelCondition condition{ChannelCondition::Readable};
-        u64 generation{};
-        u64 observed{};
-        enum class State : u8 {
-            Idle,
-            Attaching,
-            Attached,
-            Detaching,
-        };
-        State state{State::Idle};
-        bool armed{};
+        cap::Attachment attachment;
+        object::LinkWork work{};
     };
 
     using MessageQueue = libk::intrusive_list<Message, &Message::hook>;
     struct Side final {
-        MessageQueue queue{};
+        explicit Side(Channel& owner) noexcept
+            : rx(Source::Drained::bind<&Channel::try_finish_retire>(owner)),
+              tx(Source::Drained::bind<&Channel::try_finish_retire>(owner)) { tx.update(SOURCE_READY); }
+        Src<SOURCE_READY | SOURCE_TERMINAL> rx, tx;
+        mutable sync::Spin lock;
+        MessageQueue queue{}, free;
         usize occupied{}; // Queued, preparing, or finishing a receive.
-        u64 sequence[3]{};
-        bool closed{};
+        u64 sequence{}, generation{};
+        Message* call{};
+        bool call_done{};
+        u64 readable{};
+        std::atomic<u64> writable{SOURCE_READY};
+        bool sender_closed{}, receiver_closed{};
     };
 
 public:
@@ -220,37 +114,19 @@ public:
     [[nodiscard]] auto send(
         cap::Resolved<Channel>& cap,
         cap::CSpace& source,
-        const ChannelSend& request,
-        Wait* turn = nullptr) noexcept
+        const ChanMsg& request) noexcept
         -> std::expected<u64, ChannelError>;
+    auto call(cap::Resolved<Channel>&, cap::CSpace&, const ChanMsg&, cap::Resolved<Channel>&) noexcept -> std::expected<u64, ChannelError>;
+    auto cancel(cap::Resolved<Channel>&, u64 token, bool discard) noexcept -> bool;
     [[nodiscard]] auto receive(
         cap::Resolved<Channel>& cap,
         cap::CSpace& destination,
-        ChannelRecv& result,
-        Wait* turn = nullptr) noexcept
-        -> std::expected<void, ChannelError>;
-    // Reserve the fair queue turn. The caller owns request/result storage and
-    // keeps Wait alive through transfer and result publication.
-    [[nodiscard]] auto wait(
-        cap::Resolved<Channel>&& cap, Wait& waiter, Wait::Kind kind,
-        Thread& thread, Cpus& cpus) noexcept
+        ChanMsg& result) noexcept
         -> std::expected<void, ChannelError>;
     [[nodiscard]] auto close(
         cap::Resolved<Channel>& cap) noexcept
         -> std::expected<void, ChannelError>;
     [[nodiscard]] auto close(ChannelSide side) noexcept -> bool;
-
-    [[nodiscard]] auto bind(
-        cap::Resolved<Channel>& cap,
-        cap::Resolved<Notification>& notification,
-        ChannelCondition condition) noexcept
-        -> std::expected<usize, ChannelError>;
-    [[nodiscard]] auto unbind(cap::Resolved<Channel>& cap, usize relation) noexcept
-        -> std::expected<void, ChannelError>;
-    [[nodiscard]] auto arm(
-        cap::Resolved<Channel>& cap,
-        usize relation,
-        u64 observed) noexcept -> std::expected<u64, ChannelError>;
 
     [[nodiscard]] auto mint(
         cap::Resolved<Channel>& cap,
@@ -265,48 +141,35 @@ public:
         cap::GrantRef& root,
         ChannelSide side) noexcept -> bool;
 
-    void bind_sponsor(resource::Sponsorship& sponsor) noexcept;
+    void bind_funding(resource::Funding& sponsor) noexcept;
     void retire(object::cleanup&& cleanup) noexcept;
 
     [[nodiscard]] auto side_state(ChannelSide side) const noexcept
         -> bool;
+    auto events(ChannelSide side, bool write) noexcept -> Source& {
+        return write ? this->side(peer(side)).tx : this->side(side).rx;
+    }
     [[nodiscard]] auto config() const noexcept -> ChannelConfig {
         return config_;
     }
 
 private:
-    [[nodiscard]] auto bound_relation(cap::Resolved<Channel>& cap, usize id) noexcept
-        -> std::expected<Relation*, ChannelError>; // lock_ held
-    static void invalidate(
-        void* context,
-        cap::GrantWork&& work) noexcept;
-    static void released(void* context) noexcept;
-    void invalidated(GrantLink& link, cap::GrantWork&& work) noexcept;
-    void relation_released(Relation& relation) noexcept;
+    class Flight {
+        Channel& owner_;
+    public:
+        explicit Flight(Channel& owner) noexcept : owner_(owner) { sync::Lock guard{owner.lock_}; ++owner.calls_; }
+        ~Flight() noexcept { owner_.finish_call(); }
+    };
+    void finish_call() noexcept;
     static void invalidate_side(
         void* context,
-        cap::GrantWork&& work) noexcept;
-    static void release_side(void* context) noexcept;
-    void side_invalidated(SideLink& link, cap::GrantWork&& work) noexcept;
-    void side_released(SideLink& link) noexcept;
-    static void invalidate_waiter(
-        void* context,
-        cap::GrantWork&& work) noexcept;
-    static void release_waiter(void* context) noexcept;
-    void waiter_invalidated(Waiter& waiter, cap::GrantWork&& work) noexcept;
-    void drop_waiter(Waiter& waiter) noexcept;
-    void detach_waiter_grant(Waiter& waiter) noexcept;
-    void finish_waiter(Waiter& waiter) noexcept;
-    void abort_relation(Relation& relation) noexcept;
+        object::LinkWork&& work) noexcept;
+    static void release_side(void* context, object::LinkWork&&) noexcept;
+    void side_invalidated(SideLink& link, object::LinkWork&& work) noexcept;
+    void side_released(SideLink&, object::LinkWork&&) noexcept;
     void detach_side(SideLink& link) noexcept;
+    auto take_cleanup() noexcept -> object::cleanup;
     void try_finish_retire() noexcept;
-    using WaitQueue = libk::intrusive_list<Waiter, &Waiter::hook>;
-    [[nodiscard]] auto wait_queue(Waiter::Kind kind, ChannelSide side) noexcept -> WaitQueue&;
-    [[nodiscard]] auto owns_turn_locked(
-        Waiter::Kind kind, ChannelSide side, const Waiter* reservation) noexcept -> bool;
-    [[nodiscard]] auto waiter_ready_locked(
-        const Waiter& waiter) noexcept -> bool;
-    [[nodiscard]] auto arm_waiter(Waiter& waiter) noexcept -> bool;
     [[nodiscard]] auto side(ChannelSide value) noexcept -> Side&;
     [[nodiscard]] auto side(ChannelSide value) const noexcept -> const Side&;
     [[nodiscard]] auto side_index(ChannelSide value) const noexcept -> usize;
@@ -315,19 +178,16 @@ private:
         const cap::Resolved<Channel>& cap,
         cap::Right right) const noexcept
         -> std::optional<ChannelSide>;
-    [[nodiscard]] auto ready_locked(
-        ChannelSide side,
-        ChannelCondition condition) const noexcept -> bool;
-    [[nodiscard]] auto sequence_locked(
-        ChannelSide side,
-        ChannelCondition condition) const noexcept -> u64;
-    void notify_ready();
-    void detach_relation(Relation& relation) noexcept;
-    void finish_relation(Relation& relation) noexcept;
-    void discard_message(Message& message) noexcept;
-    [[nodiscard]] auto relation_at(usize index) noexcept -> Relation&;
+    void readiness_locked(Side&, std::span<Source::Publication, 2>) noexcept;
+    void discard_message(Message& message, bool committed = false) noexcept;
+    void discard_escrows(std::span<Escrow>, bool committed = false) noexcept;
     void release_message(Message& message) noexcept;
     void clear_queues() noexcept;
+    [[nodiscard]] auto send_caps(cap::Resolved<Channel>&, cap::CSpace&, const ChanMsg&, cap::Capability* = nullptr) noexcept -> std::expected<u64, ChannelError>;
+    [[nodiscard]] auto enqueue(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>) noexcept -> std::expected<u64, ChannelError>;
+    auto reply(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>) noexcept -> std::expected<u64, ChannelError>;
+    auto complete(u64 token, ChannelError, bool discard = false) noexcept -> bool;
+    static void abandon(cap::Capability::Facet&) noexcept;
     [[nodiscard]] auto make_escrow(
         cap::CSpace& source,
         const CapXfer& spec,
@@ -337,26 +197,20 @@ private:
         cap::CSpace& destination,
         libk::inplace_vector<cap::CSpace::Reservation,
             CHANNEL_MAX_CAPS>& reservations,
-        ChannelRecv& result) noexcept -> CommitResult;
+        ChanMsg& result, cap::Graph::Admission,
+        std::span<const object::ref<>*> gates, Source::Action commit) noexcept
+        -> std::expected<void, ChannelError>;
 
-    static const cap::GrantAttachmentOps channel_ops_;
-    static const cap::GrantAttachmentOps notification_ops_;
-    static const cap::GrantAttachmentOps side_ops_;
-    static const cap::GrantAttachmentOps waiter_ops_;
+    static const cap::AttachOps side_ops_;
 
     ChannelConfig config_{};
     object::ref<> payer_{};
     mm::Slab<Message, false> messages_;
     mutable sync::Spin lock_{};
-    Side sides_[2]{};
+    Side sides_[2];
     SideLink side_links_[2];
-    mm::Slab<Relation, false> relation_pool_;
-    libk::intrusive_list<Relation, &Relation::hook> relations_{};
-    WaitQueue wait_queues_[2][2]{};
-    MessageQueue free_messages_{};
-    usize waiter_count_{};
-    bool opened_{};
-    bool closing_{};
+    usize calls_{};
+    std::atomic<bool> opened_{}, closing_{};
     object::cleanup cleanup_{};
 };
 

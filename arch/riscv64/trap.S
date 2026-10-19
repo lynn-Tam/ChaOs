@@ -113,8 +113,9 @@ trap_entry:
     sd t0, SCAUSE_OFFSET(sp)
     csrr t0, stval
     sd t0, STVAL_OFFSET(sp)
+    sd zero, PADDING_OFFSET(sp)
 
-    // The interrupted Thread retains this frame on its sole kernel stack.
+    // User traps land on the CPU transient stack.
     mv a0, sp
     call trap_enter
     /*---- 恢复边界 ----*/
@@ -125,15 +126,13 @@ trap_entry:
     addi t1, t1, -1
     sd t1, CPU_ENTRY_DEPTH_OFF(t0)
 
-    /*
-    The selected TrapFrame remains on its owning stack. A future context
-    switch may resume at this call site before restoring this same frame.
-    */
+    // C++ returns the selected frame after all provider transactions drain.
     mv a0, sp
     call trap_exit
+    mv sp, a0
 
 .Lrestore_frame:
-    // A newly started Thread reaches this path with interrupts enabled.
+    // IRQs remain masked until the selected frame has been restored.
     // Restoring sepc and sstatus must be indivisible: an interrupt between
     // those writes would replace the user PC with a supervisor return PC.
     csrci sstatus, 2
@@ -236,7 +235,7 @@ trap_entry:
 .hidden user_return
 .type user_return, @function
 user_return:
-    // a0 names the synthetic TrapFrame built on the Thread home stack.
+    // a0 names the return frame stored in the user Thread.
     mv sp, a0
     j .Lrestore_frame
 .size user_return, .-user_return

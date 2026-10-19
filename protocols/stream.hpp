@@ -50,7 +50,7 @@ class str_reader final {
             const auto armed = input_.arm();
             if (armed.status != STATUS_OK)
                 return armed.status;
-            const auto wake = sys::notification_wait(events_);
+            const auto wake = ev_wait(events_);
             if (wake.status != STATUS_OK)
                 return wake.status;
         }

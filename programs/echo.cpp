@@ -6,7 +6,7 @@
 
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
-    if (const auto rc = px_init(env.pool, env.vspace, env.cspace, env.events, 0,
+    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, 0,
         {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
 
     for (int i = 1; i < argc; ++i) {

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <new>
+#include <functional>
 #include <string>
 #include <start.hpp>
 #include <cap.hpp>
@@ -26,10 +27,12 @@ struct Alloc { Block* block; size_t size; };
 static constexpr auto round(size_t n, size_t a) noexcept -> size_t { return (n + a - 1) & ~(a - 1); }
 constexpr size_t Header = round(sizeof(Chunk), Align);
 static Chunk* chunks;
-static cap_t pool, vm;
+static Chunk* spare;
+static CreateAuth pool;
+static cap_t vm;
 
 static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
-    if (!pool || !alignment || (alignment & (alignment - 1))) return nullptr;
+    if (!pool.account || !pool.scope || !alignment || (alignment & (alignment - 1))) return nullptr;
     alignment = std::max(alignment, Align);
     if (alignment > SIZE_MAX - sizeof(Block) - sizeof(Alloc) - Align
         || n > SIZE_MAX - alignment - sizeof(Block) - sizeof(Alloc) - Align) return nullptr;
@@ -62,6 +65,7 @@ static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
         if (block->next) block->next->prev = tail;
         block->next = tail; block->size = need;
     }
+    if (block->chunk == spare) spare = nullptr;
     block->free = false;
     const auto address = round(reinterpret_cast<uintptr_t>(block) + sizeof(Block) + sizeof(Alloc), alignment);
     std::construct_at(reinterpret_cast<Alloc*>(address) - 1, block, n);
@@ -80,6 +84,9 @@ static void release(void* p) noexcept {
     if (b->prev && b->prev->free) { b = b->prev; merge(*b); }
     if (b->prev || b->next) return;
     auto* c = b->chunk;
+    // One ordinary chunk bounds retained capacity and avoids mmap/Op churn
+    // for short-lived STL allocations. Larger idle mappings return at once.
+    if (!spare && c->map.size <= ChunkSize) { spare = c; return; }
     if (c->prev) c->prev->next = c->next;
     else chunks = c->next;
     if (c->next) c->next->prev = c->prev;
@@ -93,7 +100,7 @@ static auto checked(size_t n, size_t alignment = Align) -> void* {
 }
 
 
-extern "C" void init_heap(cap_t pool_cap, cap_t vm_cap) noexcept {
+extern "C" void init_heap(CreateAuth pool_cap, cap_t vm_cap) noexcept {
     pool = pool_cap; vm = vm_cap;
 }
 extern "C" auto malloc(size_t n) noexcept -> void* { return allocate(n); }
@@ -141,3 +148,5 @@ const std::nothrow_t std::nothrow{};
 // libstdc++ declares this cold path extern even in the freestanding headers.
 // Instantiate its supplied definition so string overlap keeps STL semantics.
 template void std::basic_string<char>::_M_replace_cold(char*, size_type, const char*, size_type, size_type);
+
+[[noreturn]] void std::__throw_bad_function_call() { sys::exit(STATUS_BAD_ARGS); }

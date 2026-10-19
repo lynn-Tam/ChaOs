@@ -32,25 +32,22 @@ bool test_user_start_validates_privilege_inputs(const TestContext&) noexcept {
         && !arch::valid_user_start(unaligned_stack);
 }
 
-bool test_synthetic_user_frame_consumes_home_stack_only(
+bool test_synthetic_user_frame(
     const TestContext&) noexcept {
-    alignas(16) byte home[1024]{};
-    const usize top = reinterpret_cast<usize>(home) + sizeof(home);
+    arch::TrapFrame frame{};
     const arch::UserStart valid{
         .entry = mm::UserBegin,
         .stack = mm::UserBegin + mm::page_size,
         .arguments = {1, 2, 3, 4, 5, 6},
     };
-    auto prepared = arch::prepare_user_stack(top, valid);
-    auto rejected = arch::prepare_user_stack(
-        top,
+    auto prepared = arch::prepare_user_frame(frame, valid);
+    auto rejected = arch::prepare_user_frame(
+        frame,
         arch::UserStart{
             .entry = boot_layout.va,
             .stack = valid.stack,
         });
-    if (!prepared || *prepared < reinterpret_cast<usize>(home)
-        || *prepared >= top || (*prepared & 15) != 0 || rejected) return false;
-    auto& frame = *reinterpret_cast<arch::TrapFrame*>(*prepared);
+    if (!prepared || rejected) return false;
     arch::TrapCtx ctx{frame};
     const auto saved = ctx.snapshot();
     for (usize i = 0; i < valid.arguments.size(); ++i)
@@ -75,6 +72,6 @@ void register_user_tests(TestRegistry& registry) noexcept {
         test_user_start_validates_privilege_inputs);
     (void)registry.add(
         "user",
-        "synthetic first frame lives only on the Thread home stack",
-        test_synthetic_user_frame_consumes_home_stack_only);
+        "synthetic user frame preserves register and privilege contract",
+        test_synthetic_user_frame);
 }

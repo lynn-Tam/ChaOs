@@ -20,6 +20,8 @@ namespace syscall {
 
 enum class Disposition : u8 {
     Return,
+    Park,
+    Retry,
     Yield,
     Exit,
 };
@@ -85,8 +87,6 @@ template<typename Descriptor>
     return (descriptor);
 }
 [[nodiscard]] auto mem_status(mm::MemErr error) noexcept -> status_t;
-[[nodiscard]] auto vm_status(mm::VSpaceError error) noexcept
-    -> status_t;
 [[nodiscard]] auto handle_of(usize raw) noexcept -> cap::Handle;
 [[nodiscard]] auto rights_of(usize raw) noexcept
     -> std::optional<cap::Rights>;

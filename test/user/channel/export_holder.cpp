@@ -14,9 +14,6 @@ int main() {
     // Keep the import lineage live while the independent coordinator holds
     // its transferred copy. The coordinator stops this task after the provider
     // generation has retired.
-    const auto parked = sys::notification_create(info.pool, 1);
-    if (parked.status != STATUS_OK)
-        sys::exit(parked.status);
-    (void) sys::notification_wait(parked.value);
+    (void)sys::wait_one(info.events, 0);
     sys::exit(STATUS_INTERNAL);
 }

@@ -17,6 +17,8 @@ class Phys final : private libk::noncopyable_nonmovable {
         libk::intrusive_list_hook hook;
     };
 public:
+    // External claims are separately funded leases, not Phys-owned RAM.
+    static constexpr bool fixed_bill = true;
     class Lease {
         friend class Phys;
         struct Data {
@@ -31,6 +33,8 @@ public:
     public:
         Lease() noexcept = default;
         explicit operator bool() const noexcept { return bool(lease_); }
+        void reset() noexcept { lease_.reset(); }
+        auto range() const noexcept -> Pages { return lease_ ? lease_.get().claim->range : Pages{}; }
         auto covers(Pages range) const noexcept -> bool {
             return lease_ && lease_.get().claim->range.contains(range);
         }

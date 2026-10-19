@@ -12,14 +12,14 @@ int main() {
     const auto& info = rt_startup();
     rpc_client directory;
     if (const auto rc =
-            directory.open(info.selector(sv_service), info.pool, info.cspace, info.events);
+            directory.open(info.selector(sv_service), info.alloc());
         rc != STATUS_OK)
         sys::exit(rc);
     auto endpoint = sv_lookup(directory, vfs_exec);
     if (!endpoint)
         sys::exit(endpoint.error());
     rpc_client files;
-    if (const auto rc = files.open(endpoint->selector(), info.pool, info.cspace, info.events);
+    if (const auto rc = files.open(endpoint->selector(), info.alloc());
         rc != STATUS_OK)
         sys::exit(rc);
     auto note = fl_map(files, "/boot/README.TXT");
@@ -40,7 +40,7 @@ int main() {
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;
-    tasks.open(info.pool, info.selector(rt_domain), info.vspace, info.cpus);
+    tasks.open(info.alloc(), info.selector(rt_domain), info.cpus);
     const std::string_view args[]{"sleep", "10000"};
     const auto child = tasks.spawn(
         image, {},

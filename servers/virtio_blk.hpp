@@ -34,8 +34,9 @@ public:
             RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE);
         if (space.status != STATUS_OK) return space.status;
         space_ = cap_owner{space.value};
-        const auto watched = sys::io_space_watch(space.value, info.events, rt_event_badge);
+        const auto watched = sys::port_watch(info.events, space.value, 0, 0, 0, WATCH_CHANGED);
         if (watched.status != STATUS_OK) return watched.status;
+        events_ = info.events; space_watch_ = watched.value;
         for (size_t i = 0; i < dv_regs.size(); ++i) {
             const auto* binding = info.find(dv_regs[i]);
             if (!binding && i < 6) continue;
@@ -51,8 +52,11 @@ public:
         const auto interrupt = sys::cap_duplicate(info.selector(dv_irq), info.cspace, RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         interrupt_ = cap_owner{interrupt.value};
-        const auto bound = sys::irq_bind(interrupt.value, info.events, rt_event_badge);
+        const auto bound = sys::irq_set(interrupt.value, true);
         if (bound.status != STATUS_OK) return bound.status;
+        const auto interrupt_watch = sys::port_watch(events_, interrupt.value, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_READ);
+        if (interrupt_watch.status != STATUS_OK) return interrupt_watch.status;
+        irq_watch_ = interrupt_watch.value;
         return configure(info);
     }
 
@@ -63,15 +67,7 @@ public:
     // After close starts, BAR/IRQ views may be revoked. Do not submit,
     // observe or acknowledge again; only the IOSpace state remains usable.
     [[nodiscard]] auto close() noexcept -> status_t {
-        const auto closed = sys::io_space_close(space_.selector());
-        if (closed.status != STATUS_OK) return closed.status;
-        for (;;) {
-            const auto state = sys::io_space_state(space_.selector());
-            if (state.status != STATUS_OK) return state.status;
-            if (state.value == IO_SPACE_CLOSED) return STATUS_OK;
-            if (state.value == IO_SPACE_FAILED) return STATUS_BACKING_FAILED;
-            sys::yield();
-        }
+        return io_close(space_.selector());
     }
 
     [[nodiscard]] auto submit(io_ticket ticket, io_operation operation,
@@ -162,15 +158,20 @@ public:
         const auto state = sys::io_space_state(space_.selector());
         if (state.status != STATUS_OK) return state.status;
         if (state.value != IO_SPACE_READY) return STATUS_BACKING_FAILED;
+        const auto fact = sys::source_info(space_.selector());
+        if (fact.status != STATUS_OK) return fact.status;
+        if (const auto status = sys::port_arm(events_, space_watch_, fact.value2).status; status != STATUS_OK) return status;
         const auto delivered = sys::irq_observe(interrupt_.selector());
-        if (delivered.status == STATUS_BUSY) return STATUS_OK;
+        if (delivered.status == STATUS_BUSY) return sys::port_arm(events_, irq_watch_).status;
         if (delivered.status != STATUS_OK) return delivered.status;
         (void)read<uint8_t>(isr_); // clear the device's level before unmasking PLIC
         const auto result = sys::irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
-        return result.status;
+        return result.status == STATUS_OK ? sys::port_arm(events_, irq_watch_).status : result.status;
     }
 
 private:
+    cap_t events_{};
+    word_t irq_watch_{}, space_watch_{};
     size_t depth_{}, available_offset_{}, used_offset_{}, headers_{}, data_{};
     uint16_t queue_size_{};
     uint64_t iova_{};
@@ -247,19 +248,13 @@ private:
         headers_ = (used_offset_ + 6 + queue_size_ * 8 + 4095) & ~size_t{4095};
         data_ = (headers_ + depth_ * 32 + 4095) & ~size_t{4095};
         const auto bytes = data_ + depth_ * MaxTransfer;
-        auto arena = vm_area::create(info.pool, info.vspace, 0, bytes);
+        auto arena = vm_area::create(info.alloc(), info.vspace, 0, bytes);
         if (!arena) return arena.error();
         arena_ = std::move(*arena);
-        const auto mapping = sys::io_space_map(space_.selector(), arena_.memory.selector(), 0, bytes / 4096, 0, VM_READ | VM_WRITE);
-        if (mapping.status != STATUS_PENDING) return mapping.status;
+        const auto mapping = io_call(info.alloc(), space_.selector(), IO_OP_MAP,
+            {arena_.memory.selector(), 0, bytes / 4096, 0, VM_READ | VM_WRITE});
+        if (mapping.status != STATUS_OK) return mapping.status;
         iova_ = mapping.value;
-        for (;;) {
-            const auto state = sys::io_space_state(space_.selector());
-            if (state.status != STATUS_OK) return state.status;
-            if (state.value == IO_SPACE_READY) break;
-            if (state.value != IO_SPACE_PENDING) return STATUS_BACKING_FAILED;
-            sys::yield();
-        }
         write<uint16_t>(common + 24, queue_size_);
         write<uint16_t>(common + 26, 0xffff);
         write<uint64_t>(common + 32, iova_);

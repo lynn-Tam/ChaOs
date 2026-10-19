@@ -1,582 +1,421 @@
-#include <expected>
 #include <object/pool.hpp>
 
-
-#include <cap/grant.hpp>
-#include <panic.hpp>
-#include <limits>
-#include <utility>
-#include <object/ref.hpp>
-#include <sync.hpp>
-
-namespace resource {
-account::~account() noexcept { libk_assert(drained()); }
-
-auto account::reserve(budget amount) noexcept -> bool {
-    if (!available_.contains(amount)) return false;
-    libk_assert(pending_ != std::numeric_limits<usize>::max());
-    available_.memory -= amount.memory;
-    available_.caps -= amount.caps;
-    ++pending_;
-    return true;
-}
-
-void account::commit() noexcept {
-    libk_assert(pending_ != 0);
-    --pending_;
-}
-
-void account::cancel(budget amount) noexcept {
-    refund(amount);
-    commit();
-}
-
-void account::refund(budget amount) noexcept {
-    libk_assert(limit_.memory - available_.memory >= amount.memory);
-    libk_assert(limit_.caps - available_.caps >= amount.caps);
-    available_.memory += amount.memory;
-    available_.caps += amount.caps;
-}
-
-
-Reservation::Reservation(Reservation&& other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      charge_(std::exchange(other.charge_, budget{})) {}
-
-auto Reservation::operator=(Reservation&& other) noexcept -> Reservation& {
-    if (this != &other) {
-        reset();
-        owner_ = std::exchange(other.owner_, nullptr);
-        ref_ = std::move(other.ref_);
-        charge_ = std::exchange(other.charge_, budget{});
-    }
-    return *this;
-}
-
-Reservation::~Reservation() noexcept { reset(); }
-
-Refund::Refund(Refund&& other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      charge_(std::exchange(other.charge_, budget{})),
-      notifier_(std::exchange(other.notifier_, RefundNotifier{})) {}
-
-auto Refund::operator=(Refund&& other) noexcept -> Refund& {
-    if (this != &other) {
-        complete();
-        owner_ = std::exchange(other.owner_, nullptr);
-        ref_ = std::move(other.ref_);
-        charge_ = std::exchange(other.charge_, budget{});
-        notifier_ = std::exchange(other.notifier_, RefundNotifier{});
-    }
-    return *this;
-}
-
-Refund::~Refund() noexcept { complete(); }
-
-Charge::Charge(Charge&& other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      amount_(std::exchange(other.amount_, budget{})) {}
-
-auto Charge::operator=(Charge&& other) noexcept -> Charge& {
-    if (this != &other) {
-        reset();
-        owner_ = std::exchange(other.owner_, nullptr);
-        ref_ = std::move(other.ref_);
-        amount_ = std::exchange(other.amount_, budget{});
-    }
-    return *this;
-}
-
-Charge::~Charge() noexcept { reset(); }
-
-void Reservation::reset() noexcept {
-    if (!owner_) { libk_assert(!ref_ && charge_.empty()); return; }
-    libk_assert(ref_);
-    owner_->cancel(charge_);
-    owner_ = nullptr;
-    charge_ = {};
-    ref_.reset();
-}
-
-auto Reservation::commit() && noexcept -> Charge {
-    libk_assert(owner_ && ref_ && !charge_.empty());
-    owner_->commit();
-    Charge result;
-    result.owner_ = std::exchange(owner_, nullptr);
-    result.ref_ = std::move(ref_);
-    result.amount_ = std::exchange(charge_, budget{});
-    return result;
-}
-
-void Refund::complete() noexcept {
-    if (!owner_) { libk_assert(!ref_ && charge_.empty() && !notifier_); return; }
-    libk_assert(ref_);
-    owner_->refund(charge_);
-    owner_ = nullptr;
-    charge_ = {};
-    ref_.reset();
-    const auto notify = std::exchange(notifier_, RefundNotifier{});
-    if (notify) notify();
-}
-
-auto Charge::split(budget part) noexcept -> Charge {
-    libk_assert(owner_ && ref_ && amount_.contains(part) && !part.empty());
-    if (part == amount_) return Charge{std::move(*this)};
-    amount_.memory -= part.memory;
-    amount_.caps -= part.caps;
-    Charge result;
-    result.owner_ = owner_;
-    result.ref_ = ref_;
-    result.amount_ = part;
-    return result;
-}
-
-void Charge::merge(Charge&& other) noexcept {
-    if (!other) return;
-    if (!*this) { *this = std::move(other); return; }
-    libk_assert(owner_ == other.owner_ && ref_.id() == other.ref_.id());
-    libk_assert(std::numeric_limits<u64>::max() - amount_.memory >= other.amount_.memory);
-    libk_assert(std::numeric_limits<u64>::max() - amount_.caps >= other.amount_.caps);
-    amount_.memory += other.amount_.memory;
-    amount_.caps += other.amount_.caps;
-    other.owner_ = nullptr;
-    other.amount_ = {};
-    other.ref_.reset();
-}
-
-void Charge::reset() noexcept {
-    if (!owner_) { libk_assert(!ref_ && amount_.empty()); return; }
-    libk_assert(ref_ && !amount_.empty());
-    owner_->refund(amount_);
-    owner_ = nullptr;
-    amount_ = {};
-    ref_.reset();
-}
-
-Sponsorship::~Sponsorship() noexcept {
-    libk_assert(!owner_ && !ref_ && charge_.empty());
-    libk_assert(!notifier_);
-}
-
-void Sponsorship::commit(Reservation&& reservation) noexcept {
-    libk_assert(!owner_ && !ref_ && reservation);
-    owner_ = std::exchange(reservation.owner_, nullptr);
-    ref_ = std::move(reservation.ref_);
-    charge_ = std::exchange(reservation.charge_, budget{});
-    owner_->attach(*this);
-}
-
-auto Sponsorship::reserve(budget charge) const noexcept
-    -> std::expected<Reservation, errc> {
-    if (!owner_) return std::unexpected(errc::invalid);
-    return owner_->reserve(*this, charge);
-}
-
-auto acquire(const object::ref<>& payer, budget amount) noexcept
-    -> std::expected<Charge, errc> {
-    if (!payer) return Charge{};
-    auto owner = payer.as<object::group>();
-    if (!owner) return std::unexpected(errc::invalid);
-    auto reserved = owner->get().reserve(payer, amount);
-    if (!reserved) return std::unexpected(reserved.error());
-    return std::move(*reserved).commit();
-}
-
-auto Sponsorship::acquire(budget amount) const noexcept
-    -> std::expected<Charge, errc> {
-    if (!owner_) return std::unexpected(errc::invalid);
-    return resource::acquire(ref_, amount);
-}
-
-auto Sponsorship::detach() noexcept -> Refund {
-    if (!owner_) return {};
-    owner_->detach(*this);
-    Refund refund;
-    refund.owner_ = std::exchange(owner_, nullptr);
-    refund.ref_ = std::move(ref_);
-    refund.charge_ = std::exchange(charge_, budget{});
-    refund.notifier_ = std::exchange(notifier_, RefundNotifier{});
-    return refund;
-}
-
-auto Sponsorship::observe_refund(RefundNotifier notifier) noexcept -> bool {
-    if (!owner_ || !notifier || notifier_) return false;
-    notifier_ = notifier;
-    return true;
-}
-
-} // namespace resource
-
 namespace object {
-using resource::budget;
-using resource::errc;
-using resource::Reservation;
-using resource::Sponsorship;
-using resource::RefundNotifier;
 
-group::group(budget limit) noexcept : account_(limit) {}
-
-
-group::~group() noexcept {
-    libk_assert(members_ == nullptr);
-    libk_assert(sponsorship_count_ == 0);
-    libk_assert(state_ == phase::closed);
-    libk_assert(!servicing_);
-    libk_assert(!cleanup_);
+constinit libk::manual_lifetime<anchor::Index> anchor::ids_;
+void anchor::index(bool insert) noexcept {
+    sync::Lock guard{Control::lock};
+    if (!ids_) (void)ids_.emplace();
+    if (insert) ids_->insert(*this);
+    else ids_->erase(*this);
 }
 
-auto group::reserve(
-    ref<> self,
-    budget charge) noexcept -> std::expected<Reservation, errc> {
-    auto pin = self.as<group>();
-    if (!pin || &pin.value().get() != this) {
-        return std::unexpected(errc::invalid);
+auto Scope::find(Id id, u64 kinds, usize depth) const noexcept -> anchor* {
+    libk_assert(Control::lock.held());
+    auto* target = anchor::ids_ ? anchor::ids_->find(id.value) : nullptr;
+    if (!target) return nullptr;
+    if (reinterpret_cast<usize>(target) == job_.key().slot) return target;
+    if (!(kinds & OBJ_BIT(target->kind_))) return nullptr;
+    auto* member = target->membership_;
+    for (usize level = 0; member && level < depth; ++level) {
+        if (member->owner_ == this) return target;
+        member = member->owner_ ? member->owner_->membership_ : nullptr;
     }
+    return nullptr;
+}
+auto Scope::lookup(Id id, u64 kinds, usize depth) const noexcept -> ref<> {
+    sync::Lock guard{Control::lock};
+    auto* target = find(id, kinds, depth);
+    return target ? ref<>::retain_alive({reinterpret_cast<usize>(target), target->generation_}) : ref<>{};
+}
+auto Scope::contains(Id id, u64 kinds, usize depth) const noexcept -> bool {
+    sync::Lock guard{Control::lock};
+    return find(id, kinds, depth) != nullptr;
+}
 
-    {
-        sync::Lock guard{lock_};
-        if (state_ != phase::open) {
-            return std::unexpected(errc::closed);
+
+auto Scope::describe(Id id, u64 kinds, usize depth) const noexcept -> std::expected<ScopeObject, status_t> {
+    sync::Lock guard{Control::lock};
+    auto* target = find(id, kinds, depth);
+    if (!target) return std::unexpected(STATUS_NOT_FOUND);
+    ScopeObject out{};
+    out.version = 1; out.size = sizeof(out); out.object_id = id.value;
+    if (auto* member = target->membership_) {
+        out.owner_id = member->owner_ref_.id().value; out.owner_epoch = member->epoch_;
+    }
+    if (auto* fee = target->ops_->funding(*target)) {
+        out.account_id = fee->ref_.id().value; out.billing_epoch = fee->epoch_;
+        out.storage_memory = fee->charge_.memory; out.storage_caps = fee->charge_.caps;
+    }
+    auto clip = [&](u64& endpoint) noexcept {
+        if (endpoint && !find(Id{endpoint}, kinds, depth)) { endpoint = 0; out.flags |= OBS_BOUNDARY; }
+    };
+    clip(out.owner_id); clip(out.account_id);
+    out.kind = target->kind_; out.gate = target->gate_.open() ? OBJECT_OPEN : OBJECT_CLOSING;
+    return out;
+}
+
+// Walk actual parents, rather than indexing every controlled descendant.
+// Membership, Funding and the delegation Charge remain the only authorities.
+void Control::edges(Control*& pending, u64 epoch) noexcept {
+    if (!owner_) return;
+    if (auto* member = owner_->membership_; member && member->owner_)
+        push(pending, &member->owner_->control_, epoch);
+    if (auto* fee = owner_->ops_->funding(*owner_); fee && fee->owner_)
+        push(pending, &fee->owner_->control_, epoch);
+    if (owner_->kind_ == ObjAccount) {
+        auto& account = *static_cast<resource::Account*>(owner_->ops_->payload(*owner_));
+        if (account.delegation_.owner_) push(pending, &account.delegation_.owner_->control_, epoch);
+    }
+}
+
+Scope::~Scope() noexcept {
+    libk_assert(members_.empty() && !scan_ && !pending_ && !servicing_ && !cleanup_ && !calls_);
+}
+
+auto Scope::reserve(ref<Scope> owner) noexcept -> std::expected<Admission, error> {
+    if (!owner) return std::unexpected(error::invalid_id);
+    auto use = owner.admit();
+    if (!use) return std::unexpected(error::closed);
+    return Admission{std::move(owner), std::move(use)};
+}
+
+auto Scope::Admission::attach(Membership& member, Key target) noexcept -> bool {
+    if (!owner_ || !use_) return false;
+    auto& scope = owner_.get();
+    sync::Lock guard{Control::lock};
+    if (scope.phase_ != Phase::Open || scope.version_ == std::numeric_limits<u64>::max()) return false;
+    auto* anchor = reinterpret_cast<object::anchor*>(target.slot);
+    if (auto* control = anchor->ops_->control(*anchor)) {
+        auto cycle = scope.control_.reaches(*control);
+        if (!cycle || *cycle) return false;
+    }
+    const auto attached = use_.publish([&] {
+        libk_assert(!member.owner_ && member.phase_ == Membership::Phase::Empty);
+        member.owner_ = &scope;
+        member.owner_ref_ = std::move(owner_);
+        member.target_ = target;
+        member.phase_ = Membership::Phase::Pending;
+        scope.members_.insert(member);
+        ++scope.kinds_[anchor->kind_];
+    });
+    if (attached) scope.changed();
+    return attached;
+}
+
+auto Scope::info(u64, u64 kinds) const noexcept -> ScopeInfo {
+    sync::Lock guard{Control::lock};
+    usize count{};
+    for (usize kind = 1; kind < ObjCount; ++kind) if (kinds & OBJ_BIT(kind)) count += kinds_[kind];
+    return {.version=1, .size=sizeof(ScopeInfo), .members=count, .epoch=version_,
+        .state=static_cast<u32>(phase_), .reserved=0};
+}
+
+auto Scope::inspect(Id source, ScopeCursor cursor, u64 kinds, ScopeMembers& out, usize depth) const noexcept -> status_t {
+    sync::Lock guard{Control::lock};
+    if (version_ == std::numeric_limits<u64>::max()
+        || ((cursor.source || cursor.version || cursor.last)
+            && (cursor.source != source.value || cursor.version != version_))) return STATUS_STALE;
+    out = {};
+    out.version = 1; out.size = sizeof(out); out.next = {source.value, version_, 0};
+    usize level = 1;
+    const Membership* member = depth ? members_.minimum() : nullptr;
+    auto next = [&](const Membership* current) noexcept -> const Membership* {
+        auto* target = reinterpret_cast<anchor*>(current->target_.slot);
+        if (target->kind_ == ObjScope && level < depth) {
+            auto& child = *static_cast<const Scope*>(target->ops_->payload(*target));
+            if (auto* first = child.members_.minimum()) { ++level; return first; }
         }
-        if (!account_.reserve(charge)) {
-            return std::unexpected(errc::exhausted);
+        while (current) {
+            const auto* owner = current->owner_;
+            if (auto* sibling = owner->members_.next(*current)) return sibling;
+            if (owner == this) return nullptr;
+            current = owner->membership_; --level;
+        }
+        return nullptr;
+    };
+    if (cursor.last) {
+        auto* target = anchor::ids_ ? anchor::ids_->find(cursor.last) : nullptr;
+        member = target ? target->membership_ : nullptr;
+        auto* ancestor = member;
+        level = 1;
+        while (ancestor && ancestor->owner_ != this && level <= depth) {
+            ancestor = ancestor->owner_ ? ancestor->owner_->membership_ : nullptr; ++level;
+        }
+        if (!ancestor || level > depth) return STATUS_STALE;
+        member = next(member);
+    }
+    // Real tree DFS; the last examined member resumes even a sparse filter.
+    for (usize scanned = 0; member && scanned < SCOPE_MEMBER_PAGE; ++scanned) {
+        auto* target = reinterpret_cast<anchor*>(member->target_.slot);
+        out.next.last = target->id_.value;
+        if (kinds & OBJ_BIT(target->kind_)) {
+            out.records[out.count++] = {target->id_.value, member->epoch_, static_cast<u32>(target->kind_),
+                !target->gate_.open() || member->phase_ == Membership::Phase::Retiring
+                    ? SCOPE_MEMBER_CLOSING : member->phase_ == Membership::Phase::Pending
+                    ? SCOPE_MEMBER_PENDING : SCOPE_MEMBER_LIVE};
+        }
+        member = next(member);
+    }
+    out.more = member != nullptr;
+    if (!out.more) out.next.last = 0;
+    return STATUS_OK;
+}
+
+auto Scope::close() noexcept -> Phase {
+    Flight flight{*this};
+    Source::Publication publication;
+    {
+        sync::Lock guard{Control::lock};
+        if (phase_ == Phase::Open) {
+            phase_ = Phase::Closing;
+            scan_ = members_.minimum();
+            publication = events_.prepare(STATE_CLOSING, true);
         }
     }
-
-    Reservation reservation{};
-    reservation.owner_ = this;
-    reservation.ref_ = std::move(self);
-    reservation.charge_ = charge;
-    return reservation;
+    publication.publish();
+    service();
+    sync::Lock guard{Control::lock};
+    return phase_;
 }
 
-auto group::reserve(
-    const Sponsorship& parent,
-    budget charge) noexcept -> std::expected<Reservation, errc> {
-    if (parent.owner_ != this) return std::unexpected(errc::invalid);
-    return reserve(parent.ref_, charge);
+void Scope::retire(cleanup&& done) noexcept {
+    Flight flight{*this};
+    { sync::Lock guard{Control::lock}; libk_assert(!cleanup_); cleanup_ = std::move(done); }
+    (void)close();
 }
 
-auto group::info(u64) const noexcept -> GroupInfo {
-    sync::Lock guard{lock_};
-    const auto limit = account_.limit(), available = account_.available();
-    return {.version = 1, .size = sizeof(GroupInfo), .memory_limit = limit.memory,
-        .memory_available = available.memory, .cap_limit = limit.caps, .caps_available = available.caps,
-        .sponsors = sponsorship_count_, .reservations = account_.pending(), .state = static_cast<u32>(state_), .reserved = 0};
-}
-auto group::limit() const noexcept -> budget {
-    sync::Lock guard{lock_};
-    return account_.limit();
-}
-
-auto group::available() const noexcept -> budget {
-    sync::Lock guard{lock_};
-    return account_.available();
-}
-
-auto group::sponsorship_count() const noexcept -> usize {
-    sync::Lock guard{lock_};
-    return sponsorship_count_;
-}
-
-auto group::state() const noexcept -> phase {
-    sync::Lock guard{lock_};
-    return state_;
-}
-
-auto group::close() noexcept -> phase {
+auto Membership::close() noexcept -> bool {
+    ref<Scope> owner;
     {
-        sync::Lock guard{lock_};
-        if (state_ == phase::open) {
-            state_ = phase::closing;
+        sync::Lock guard{Control::lock};
+        if (!owner_) return false;
+        close_requested_ = true;
+        if (!queued_ && !announced_) {
+            queued_ = true;
+            pending_next_ = owner_->pending_;
+            if (pending_next_) pending_next_->pending_previous_ = this;
+            owner_->pending_ = this;
         }
+        owner = owner_ref_;
     }
-
-    service();
-    return state();
+    owner->service();
+    return true;
 }
 
-auto group::observe_refund(
-    const ref<>& self,
-    RefundNotifier notifier) noexcept -> bool {
-    auto pin = self.as<group>();
-    if (!pin || &pin.value().get() != this) {
-        return false;
-    }
-    // The operation pin prevents sponsorship detach; this lock arbitrates
-    // concurrent blocking/asynchronous observers of the same one-shot close.
-    sync::Lock guard{lock_};
-    return sponsor_ != nullptr && sponsor_->observe_refund(notifier);
+void changed(Key key) noexcept {
+    if (!key.valid()) return;
+    sync::Lock guard{Control::lock};
+    auto& target = *reinterpret_cast<anchor*>(key.slot);
+    libk_assert(target.generation_ == key.generation);
+    auto* member = target.membership_;
+    if (member && member->owner_) member->owner_->changed();
 }
 
-void group::retire(cleanup&& done) noexcept {
+void Scope::changed(bool schedule) noexcept {
+    libk_assert(Control::lock.held());
+    auto* scope = this;
+    for (usize depth = 0; scope && depth < 64; ++depth) {
+        if (scope->version_ != std::numeric_limits<u64>::max()) ++scope->version_;
+        scope->dirty_ = true;
+        if (schedule && scope->work_) scope->work_->post(scope->job_);
+        scope = scope->membership_ ? scope->membership_->owner_ : nullptr;
+    }
+}
+
+void Scope::post() noexcept {
+    libk_assert(Control::lock.held());
+    auto* scope = this;
+    for (usize depth = 0; scope && depth < 64; ++depth) {
+        if (scope->dirty_ && scope->work_) scope->work_->post(scope->job_);
+        scope = scope->membership_ ? scope->membership_->owner_ : nullptr;
+    }
+}
+
+void Scope::service() noexcept {
+    Flight flight{*this};
+    Source::Publication changed;
     {
-        sync::Lock guard{lock_};
-        libk_assert(!cleanup_);
-        cleanup_ = std::move(done);
-        if (state_ == phase::open) state_ = phase::closing;
-    }
-    service();
-}
-
-void group::cancel(budget amount) noexcept {
-    {
-        sync::Lock guard{lock_};
-        account_.cancel(amount);
-    }
-    service();
-}
-
-void group::commit() noexcept {
-    {
-        sync::Lock guard{lock_};
-        account_.commit();
-    }
-    service();
-}
-
-void group::commit(Member& member) noexcept {
-    {
-        sync::Lock guard{lock_};
-        libk_assert(member.owner_ == this && member.phase_ == Member::phase::pending);
-        member.phase_ = Member::phase::live;
-    }
-    service();
-}
-
-void group::ready(Member& member) noexcept {
-    {
-        sync::Lock guard{lock_};
-        libk_assert(member.owner_ == this);
-        libk_assert(member.phase_ == Member::phase::revoking);
-        member.phase_ = Member::phase::revoked;
-    }
-    service();
-}
-
-void group::close_member(Member& member) noexcept {
-    cap::Graph* graph{};
-    {
-        sync::Lock guard{lock_};
-        libk_assert(member.owner_ == this);
-        // The caller's accepted grant lease pins this member before its
-        // revoke barrier. A concurrent pool close may already own the request.
-        // A repeated close joins the existing revoke/retirement obligation.
-        if (member.phase_ != Member::phase::pending && member.phase_ != Member::phase::live)
-            return;
-        // A capability may be consumed immediately after batch publication.
-        // Commit owns the transition out of construction and starts this close.
-        if (member.phase_ == Member::phase::pending) member.independent_close_ = true;
-        if (member.phase_ == Member::phase::live) {
-            member.hold_ = member.pin();
-            if (!member.hold_) return; // Last-ref retirement will detach it.
-            member.independent_close_ = true;
-            member.phase_ = Member::phase::revoking;
-            graph = member.graph_;
-        }
-    }
-    if (graph != nullptr) graph->close(member.root_, member.revoke_);
-}
-
-void group::attach(Member& member) noexcept {
-    sync::Lock guard{lock_};
-    // The accepted root Reservation covers this publication window. Pending
-    // members stay in the list until publication or rollback, including close.
-    libk_assert(state_ == phase::open || state_ == phase::closing);
-    libk_assert(member.owner_ == nullptr);
-    libk_assert(member.previous_ == nullptr && member.next_ == nullptr);
-    member.owner_ = this;
-    member.next_ = members_;
-    if (members_ != nullptr) {
-        members_->previous_ = &member;
-    }
-    members_ = &member;
-}
-
-void group::detach(Member& member) noexcept {
-    libk_assert(member.owner_ == this);
-    {
-        sync::Lock guard{lock_};
-        if (member.previous_ != nullptr) {
-            member.previous_->next_ = member.next_;
-        } else {
-            libk_assert(members_ == &member);
-            members_ = member.next_;
-        }
-        if (member.next_ != nullptr) {
-            member.next_->previous_ = member.previous_;
-        }
-        member.previous_ = nullptr;
-        member.next_ = nullptr;
-        member.owner_ = nullptr;
-    }
-    service();
-}
-
-void group::attach(Sponsorship& sponsorship) noexcept {
-    libk_assert(sponsorship.owner_ == this);
-    sync::Lock guard{lock_};
-    ++sponsorship_count_;
-    account_.commit();
-}
-
-void group::detach(Sponsorship& sponsorship) noexcept {
-    libk_assert(sponsorship.owner_ == this);
-    sync::Lock guard{lock_};
-    libk_assert(sponsorship_count_ != 0);
-    --sponsorship_count_;
-    // Refund, after the real storage reuse boundary, drives close work.
-}
-
-void group::refund(budget amount) noexcept {
-    {
-        sync::Lock guard{lock_};
-        account_.refund(amount);
-    }
-    service();
-}
-
-auto group::closed_locked() const noexcept -> bool {
-    libk_assert(lock_.held());
-    return members_ == nullptr
-        && sponsorship_count_ == 0
-        && account_.drained();
-}
-
-void group::service() noexcept {
-    {
-        sync::Lock guard{lock_};
+        sync::Lock guard{Control::lock};
         if (servicing_) return;
         servicing_ = true;
+        if (std::exchange(dirty_, false)) changed = events_.prepare(u64{1} << static_cast<u32>(phase_), true);
     }
-    for (;;) {
-        Member* item{};
-        cleanup done{};
-        Member::phase step{};
+    changed.publish();
+    for (usize step = 0; step < 8; ++step) {
+        ref<> target;
+        bool retire{};
+        Source::Publication publication;
+        bool retiring{};
         {
-            sync::Lock guard{lock_};
-            const bool closing = state_ == phase::closing
-                && account_.pending() == 0;
-            for (auto* entry = members_; entry; entry = entry->next_) {
-                if ((closing || entry->independent_close_)
-                    && (entry->phase_ == Member::phase::live
-                        || entry->phase_ == Member::phase::revoked)) {
-                    if (entry->phase_ == Member::phase::live) {
-                        entry->hold_ = entry->pin();
-                        if (!entry->hold_) continue;
-                    }
-                    item = entry;
-                    break;
-                }
+            sync::Lock guard{Control::lock};
+            auto* member = pending_ ? pending_ : scan_;
+            if (member) {
+                if (scan_ == member) scan_ = members_.next(*member);
+                member->dequeue();
+                if (!member->announced_ && member->phase_ != Membership::Phase::Retiring)
+                    target = member->pin_target();
             }
-            if (closing && closed_locked()) state_ = phase::closed;
-            if (item) {
-                step = item->phase_;
-                switch (step) {
-                case Member::phase::live: item->phase_ = Member::phase::revoking; break;
-                case Member::phase::revoked: item->phase_ = Member::phase::retiring; break;
-                default: libk_assert(false);
-                }
-            } else {
+            if (target) {
+                member->announced_ = true;
+                retire = member->phase_ == Membership::Phase::Live;
+                if (retire) { member->phase_ = Membership::Phase::Retiring; this->changed(); }
+            }
+            if (!member) {
                 servicing_ = false;
-                if (state_ == phase::closed) done = std::move(cleanup_);
+                if (phase_ == Phase::Closing && members_.empty()) {
+                    phase_ = Phase::Drained;
+                    publication = events_.prepare(STATE_DRAINED, true);
+                }
+                retiring = phase_ == Phase::Drained && bool(cleanup_);
             }
         }
-        // Claim and completion share lock_. Callbacks may drive this loop but
-        // never execute an owner or graph operation while that lock is held.
-        if (!item) {
-            if (done) done.complete();
-            return;
+        publication.publish();
+        if (!target) {
+            if (retiring) events_.close();
+            sync::Lock guard{Control::lock};
+            if (!servicing_) return;
+            continue;
         }
-        if (step == Member::phase::live) item->graph_->close(item->root_, item->revoke_);
-        else item->retire();
+        // Announce close to every pending constructor too; it must fail final
+        // publication, then leave its preallocated membership during rollback.
+        if (retire) (void)target.retire();
+        else (void)target.destroy();
     }
-}
-
-Member::Member() noexcept
-    : revoke_(sync::Latch::Notifier::bind<
-          &Member::ready>(*this)) {}
-
-void Member::ready() noexcept {
-    libk_assert(owner_ != nullptr && revoke_.complete());
-    owner_->ready(*this);
-}
-
-Member::~Member() noexcept {
-    libk_assert(phase_ == phase::empty);
-    libk_assert(owner_ == nullptr && graph_ == nullptr && !root_.valid());
-    libk_assert(!target_.valid() && !hold_ && previous_ == nullptr && next_ == nullptr);
-    libk_assert(!independent_close_);
-}
-
-void Member::commit() noexcept {
-    libk_assert(graph_ != nullptr && root_.valid());
-    libk_assert(owner_ != nullptr);
-    owner_->commit(*this);
-}
-
-void Member::abort() noexcept {
-    auto* pool = owner_;
-    libk_assert(pool);
-    libk_assert(target_.valid());
-    if (graph_) {
-        {
-            sync::Lock guard{pool->lock_};
-            independent_close_ = true;
-        }
-        commit();
-    } else {
-        // No grant lineage was published: retire the private target directly.
-        // The same member owns callbacks until its resources are reusable.
-        {
-            sync::Lock guard{pool->lock_};
-            independent_close_ = true;
-            hold_ = pin();
-            libk_assert(hold_);
-            phase_ = phase::revoked;
-        }
-        pool->service();
+    bool more{};
+    {
+        sync::Lock guard{Control::lock};
+        servicing_ = false;
+        more = dirty_ || scan_ || pending_ || (phase_ == Phase::Closing && members_.empty());
     }
+    if (more) { libk_assert(work_); work_->post(job_); }
 }
 
-auto Member::pin() const noexcept -> ref<> {
-    // The Group lock keeps this embedded member attached while the pool lock
-    // arbitrates admission against last-ref retirement. No pool→Group lock edge.
+void Scope::finish_call(bool release) noexcept {
+    cleanup done;
+    {
+        sync::Lock guard{Control::lock};
+        if (release) { libk_assert(calls_); --calls_; }
+        if (calls_ || servicing_ || phase_ != Phase::Drained || !cleanup_ || !events_.drained()) return;
+        done = std::move(cleanup_);
+    }
+    if (done) { work_->close(job_); done.complete(); }
+}
+
+auto Transfer::check() const noexcept -> status_t {
+    libk_assert(Control::lock.held());
+    if (!target_) return STATUS_INVALID_CAP;
+    if (!source_ && !destination_) return STATUS_OK;
+    if (!source_ || !destination_) return STATUS_BAD_ARGS;
+    auto* member = target_.membership();
+    auto& source = *static_cast<Scope*>(source_.get());
+    auto& destination = *static_cast<Scope*>(destination_.get());
+    if (!member || member->owner_ != &source || member->epoch_ != epoch_) return STATUS_STALE;
+    if (!target_.live() || source.phase_ != Scope::Phase::Open || destination.phase_ != Scope::Phase::Open
+        || member->phase_ != Membership::Phase::Live || member->close_requested_) return STATUS_CLOSED;
+    if (member->epoch_ == std::numeric_limits<u64>::max()
+        || source.version_ == std::numeric_limits<u64>::max()
+        || destination.version_ == std::numeric_limits<u64>::max()) return STATUS_NO_MEMORY;
+    if (target_.kind() == ObjScope && static_cast<Scope*>(target_.get())->phase_ != Scope::Phase::Open)
+        return STATUS_CLOSED;
+    if (&source != &destination) if (auto* control = target_.control()) {
+        auto cycle = destination.control_.reaches(*control);
+        if (!cycle) return STATUS_NO_MEMORY;
+        if (*cycle) return STATUS_DENIED;
+    }
+    return STATUS_OK;
+}
+
+void Transfer::commit() noexcept {
+    libk_assert(Control::lock.held());
+    if (!source_ || source_.id() == destination_.id()) return;
+    auto& member = *target_.membership();
+    auto& source = *static_cast<Scope*>(source_.get());
+    auto& destination = *static_cast<Scope*>(destination_.get());
+    source.members_.erase(member);
+    --source.kinds_[target_.kind()]; source.changed(false);
+    destination.members_.insert(member);
+    ++destination.kinds_[target_.kind()];
+    member.owner_ = &destination;
+    std::swap(member.owner_ref_, replacement_);
+    epoch_ = ++member.epoch_;
+    destination.changed(false);
+}
+
+auto Transfer::adopt() noexcept -> std::expected<u64, status_t> {
+    if (!source_ || !destination_) return std::unexpected(STATUS_BAD_ARGS);
+    sync::Lock guard{Control::lock};
+    std::array<const ref<>*, 1> gates{&target_};
+    const auto status = publish(std::span{gates}, [] {});
+    return status == STATUS_OK ? std::expected<u64, status_t>{epoch_} : std::unexpected(status);
+}
+
+auto Scope::adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch,
+    cap::Graph::Admission authority) noexcept -> std::expected<u64, status_t> {
+    Transfer transaction{target, std::move(source), std::move(destination), epoch, authority};
+    return transaction.adopt();
+}
+
+auto Membership::pin_target() const noexcept -> ref<> {
     auto* anchor = reinterpret_cast<object::anchor*>(target_.slot);
     if (!anchor->ops_->try_retain(anchor->owner_, *anchor, target_.generation)) return {};
     return ref<>{*anchor, target_.generation};
 }
 
-void Member::retire() noexcept {
-    libk_assert(owner_ && hold_ && phase_ == phase::retiring);
-    auto target = std::move(hold_);
-    libk_assert(target.retire());
+void Membership::commit() noexcept {
+    ref<Scope> owner;
+    bool closing{};
+    {
+        sync::Lock guard{Control::lock};
+        libk_assert(owner_ && phase_ == Phase::Pending);
+        phase_ = Phase::Live; owner_->changed();
+        closing = close_requested_ || owner_->phase_ != Scope::Phase::Open;
+        if (closing) announced_ = false;
+        owner = owner_ref_;
+    }
+    if (closing) (void)close();
+    else owner->service();
 }
 
-void Member::detach() noexcept {
-    libk_assert(!hold_);
-    if (owner_) owner_->detach(*this);
-    graph_ = nullptr;
-    root_ = {};
-    target_ = {};
-    independent_close_ = false;
-    phase_ = phase::empty;
+void Membership::abort() noexcept {
+    {
+        sync::Lock guard{Control::lock};
+        libk_assert(owner_ && phase_ == Phase::Pending);
+        phase_ = Phase::Live; owner_->changed();
+        close_requested_ = true;
+        announced_ = false;
+    }
+    (void)close();
 }
 
-auto Member::root(cap::Graph& graph, Reservation&& fee, ref<> target, cap::View view) noexcept
-    -> std::expected<cap::GrantRef, cap::GrantError> {
-    if (!fee || owner_ || phase_ != phase::empty)
-        return std::unexpected(cap::GrantError::InvalidState);
-    auto payer = fee.payer().as<group>();
-    if (!payer) return std::unexpected(cap::GrantError::InvalidState);
-    phase_ = phase::pending;
-    target_ = target.id();
-    payer->get().attach(*this);
-    auto root = graph.create_root(std::move(fee), std::move(target), view);
-    if (!root) return std::unexpected(root.error());
-    graph_ = &graph;
-    root_ = root->key();
-    return root;
+void Membership::dequeue() noexcept {
+    libk_assert(Control::lock.held());
+    if (!queued_) return;
+    if (pending_previous_) pending_previous_->pending_next_ = pending_next_;
+    else owner_->pending_ = pending_next_;
+    if (pending_next_) pending_next_->pending_previous_ = pending_previous_;
+    pending_previous_ = pending_next_ = nullptr;
+    queued_ = false;
+}
+
+void Membership::detach() noexcept {
+    ref<Scope> owner;
+    {
+        sync::Lock guard{Control::lock};
+        if (!owner_) return;
+        auto& scope = *owner_;
+        if (scope.scan_ == this) scope.scan_ = scope.members_.next(*this);
+        dequeue();
+        scope.members_.erase(*this);
+        auto* anchor = reinterpret_cast<object::anchor*>(target_.slot);
+        libk_assert(scope.kinds_[anchor->kind_]);
+        --scope.kinds_[anchor->kind_];
+        scope.changed();
+        owner = std::move(owner_ref_);
+        owner_ = nullptr; target_ = {};
+        phase_ = Phase::Empty; close_requested_ = announced_ = false;
+    }
+    owner->service();
 }
 
 } // namespace object

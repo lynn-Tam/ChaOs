@@ -34,7 +34,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
         return std::unexpected(PtErr::BadPhys);
     PageTable pt{*root, std::move(pages), kind};
     auto *entries = ::new (pt.table(*root)) Pte[arch::Ptes]{};
-    for (usize i = arch::Ptes / 2; i < arch::Ptes; ++i) {
+    for (usize i = arch::Ptes / 2; kind != Kind::Device && i < arch::Ptes; ++i) {
         if (kind == Kind::User) {
             const auto entry = kernel->table(kernel->root_)[i].load();
             libk_assert(entry.next_table_page());
@@ -54,13 +54,13 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
 }
 
 auto PageTable::cpu_root() const noexcept -> usize {
-    libk_assert(*this);
+    libk_assert(*this && kind_ != Kind::Device);
     return arch::pt_token(root_.raw());
 }
 
 auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> {
     const usize addr = va.base().raw();
-    if (!arch::pt_canonical(addr) || (kind_ == Kind::User && !mm::is_user(va.base())))
+    if (!arch::pt_canonical(addr) || (kind_ != Kind::Kernel && !mm::is_user(va.base())))
         return std::unexpected(PtErr::BadAddr);
     Walk w{};
     auto page = root_;

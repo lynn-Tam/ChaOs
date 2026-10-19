@@ -36,6 +36,10 @@
 }
 
 
+void Cpu::wake_work() noexcept {
+    libk_assert(worker_thread && sched::wake(*cpus, worker_thread.get()));
+}
+
 Cpu::~Cpu() noexcept {
     dispatcher_storage.reset();
     if (idle_thread) {

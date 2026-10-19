@@ -1,90 +1,102 @@
 // CALL(name, number, entry, unit); intentionally reusable.
 
-/*
- * Blocking operations return only after completion. STATUS_PENDING is
- * reserved for explicitly asynchronous operations. VM edits complete their
- * hardware retirement before returning; there is no user polling barrier.
- */
-
 CALL(YIELD, 0, yield, Call)
 CALL(EXIT, 1, exit, Call)
 CALL(SC_BIND, 2, sc_bind, Call) /* a0=SC, a1=Thread */
+CALL(EXECUTION_MOVE, 25, execution_move, Call) /* a0=Thread(Control), 0=current; a1=home CPU, a2=expected home epoch; returns accepted epoch */
 CALL(EXECUTION_SET, 3, execution_set, Call) /* a0=Thread, a1=enabled; returns intent sequence */
 CALL(EXECUTION_DETACH, 9, execution_detach, Call) /* a0=Thread(Control), a1=expected association generation */
 CALL(SC_CONFIGURE, 5, sc_configure, Call) /* a0=SC(Control), a1=budget ns, a2=period ns, a3=weight, a4=CPU mask; unbound only */
-CALL(EXECUTION_WATCH, 6, execution_watch, Call) /* a0=Thread(Inspect), a1=Notification(Receive), a2=badge */
-CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), a1=IPC offset */
-CALL(GROUP_INFO, 10, info_call, Call) /* a0=Group(Inspect), a1=IPC offset */
+CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), 0=current; a1=IPC offset */
+CALL(ACCOUNT_INFO, 10, info_call, Call) /* a0=Account(Inspect), a1=IPC offset */
 CALL(VSPACE_INFO, 11, info_call, Call) /* a0=VSpace(Inspect), a1=IPC offset; whole-space authority */
 CALL(EXECUTION_STOP, 15, execution_stop, Call) /* a0=Thread(Control); irreversible intent, Exit remains observable */
-CALL(SC_WATCH, 14, execution_watch, Call) /* a0=SC(Inspect), a1=Notification(Receive), a2=badge */
 CALL(VSPACE_RECORDS, 13, vm_records, Call) /* a0=VSpace(Inspect), a1=IPC offset, a2=address cursor; bounded records within VmLimit */
-CALL(CSPACE_INFO, 12, cspace_info, Call) /* a0=CSpace(Inspect), a1=IPC offset, a2=cursor */
+CALL(CSPACE_INFO, 12, cspace_info, Call) /* a0=CSpace(Inspect), a1=IPC offset, a2=cursor, a3=structural epoch (0=first page) */
 CALL(SC_INFO, 8, info_call, Call) /* a0=SC(Inspect), a1=IPC offset */
 CALL(SC_UNBIND, 4, sc_unbind, Call) /* a0=SC, a1=expected association generation */
 
 CALL(CAP_CLOSE, 16, cap_call, Call) /* a0=selector, a1=dest CSpace (0=current) */
 CALL(CAP_DUPLICATE, 17, cap_call, Call)
-CALL(CAP_DELEGATE, 18, cap_call, Call) /* a3=optional grant payer Group (0=source CSpace) */
+CALL(CAP_DELEGATE, 18, cap_call, Call) /* a3=optional grant payer Account (0=source CSpace) */
 CALL(CAP_MOVE, 19, cap_call, Call)
-CALL(CAP_REVOKE, 20, cap_call, Call)
+CALL(CAP_REVOKE, 20, cap_call, Call) /* a0=branch(Revoke), a1=CSpace(0=current), a2=ASYNC, a3=descendant Grant ID(0=root); monotonic close */
 CALL(OBJECT_DESTROY, 21, cap_call, Call)
-CALL(CAP_TYPED_DELEGATE, 22, cap_call, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset, a4=optional grant payer Group (0=source CSpace) */
+CALL(CAP_TYPED_DELEGATE, 22, cap_call, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset, a4=optional grant payer Account (0=source CSpace) */
 
-CALL(VM_MAP, 32, vm_call, Call)
-CALL(VM_UNMAP, 33, vm_call, Call)
-CALL(VM_PROTECT, 34, vm_call, Call)
+CALL(VM_SUBMIT, 32, vm_submit, Create) /* a0=Account, a1=VSpace, a2=VM operation, a3=IPC offset, a6=Scope; PENDING + Op */
+CALL(OP_QUERY, 33, op_call, Call) /* a0=Op(Inspect); result, value, phase */
+CALL(OP_CANCEL, 34, op_call, Call) /* a0=Op(Control); TOO_LATE after commit */
 CALL(VM_SLICE, 35, vm_call, Call)
 CALL(VM_RESERVE, 36, vm_call, Call)
 CALL(VM_GUARD, 37, vm_call, Call)
-CALL(VM_CLEAR, 38, vm_call, Call)
 
 /*
  * Typed construction ABI:
- *   a0: ResourcePool capability
+ *   a0: Account capability; a6: Scope capability
  *   a1-a3: type-specific scalar configuration
  * Returns a0=status and a1=new capability in the caller's CSpace.
  */
-CALL(RESOURCE_CREATE_CHILD, 48, resource_create_child, Create) /* a1=memory, a2=caps, a3=kind mask */
+CALL(ACCOUNT_CREATE, 48, account_create, Create) /* a1=memory, a2=caps, a3=kind mask */
 CALL(MEMORY_CREATE, 49, memory_create, Create) /* a1=bytes, a2=access bits */
 CALL(VSPACE_CREATE, 50, vspace_create, Create)
 CALL(CSPACE_CREATE, 51, cspace_create, Create) /* a1=slot quota, a2=page quota */
+CALL(DOMAIN_CREATE, 6, domain_create, Create) /* a1=parent(Create), a2=budget ns, a3=period ns, a4=weight, a5=CPU mask */
+CALL(DOMAIN_CLOSE, 14, domain_close, Call) /* a0=Domain(Close); prepaid intent */
+CALL(DOMAIN_CONFIGURE, 24, domain_configure, Call) /* a0=Domain(Control), a1=B ns, a2=T ns, a3=weight, a4=CPU mask, a5=parent(Control) for increase; returns sequence */
+CALL(DOMAIN_INFO, 23, info_call, Call)
+CALL(DOMAIN_MOVE, 26, domain_move, Call) /* a0=Domain(Control), a1=new parent(Create); returns sequence */
 CALL(SC_CREATE, 52, sc_create, Create) /* a1=domain, a2=budget ns, a3=period ns, a4=weight, a5=CPU mask */
 CALL(THREAD_CREATE, 53, thread_create, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset, a5=home cpu */
 CALL(NOTIFICATION_CREATE, 54, notification_create, Create) /* a1=immutable signal badge */
 CALL(CHANNEL_CREATE, 58, channel_create, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations */
 CALL(PAGER_CREATE, 59, pager_create, Create) /* a0=ResourcePool */
-CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Create) /* a1=bytes, a2=access, a3=pager */
+CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Create) /* a1=bytes, a2=access, a3=pager, a4=flags, a5=prepaid page records */
 CALL(MEMORY_CREATE_PHYSICAL, 55, memory_create_physical, Create) /* a0=pool, a1=Phys(Create), a2=PA, a3=bytes, a4=perms */
 CALL(IRQ_CONTROLLER_CREATE, 56, irq_controller_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
 CALL(IRQ_CREATE, 57, irq_create, Create) /* a0=pool, a1=controller(Create), a2=source */
 CALL(IOMMU_CREATE, 60, iommu_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
 CALL(IO_SPACE_CREATE, 62, io_space_create, Create) /* a0=pool, a1=controller(Create), a2=requester */
 
+CALL(SCOPE_CREATE, 63, scope_create, Create) /* a0=Account, a6=parent Scope */
+CALL(SCOPE_CLOSE, 71, scope_close, Call)
+CALL(SCOPE_INFO, 72, info_call, Call)
+CALL(SCOPE_MEMBERS, 73, scope_members, Call) /* a0=Scope(Inspect), a1=IPC offset, a2-a4=cursor */
+CALL(OBJECT_INFO, 76, object_info, Call) /* a0=object(Inspect), a1=IPC offset */
+CALL(OBJECT_REBILL, 75, object_rebill, Call) /* a0=object(Rebill), a1=old Account(Rebill), a2=new Account(Create), a3=billing epoch; optional a4=source Scope(Manage), a5=destination Scope(Create), a6=member epoch; returns billing/member epochs */
+CALL(SCOPE_ADOPT, 74, scope_adopt, Call) /* a0=object(Adopt), a1=source(Manage), a2=destination(Create), a3=member epoch */
+
 CALL(MEMORY_SEAL, 64, memory_seal, Call) /* a0=MemoryObject */
-CALL(RESOURCE_CLOSE, 65, resource_close, Call) /* a0=child ResourcePool */
-CALL(MEM_TRIM, 70, mem_call, Call) /* Manage Mem, a1=first page, a2=count; drains PTE/TLB/borrows, DIRTY requires writeback */
+CALL(ACCOUNT_CLOSE, 65, account_close, Call) /* a0=Account; OK=close intent accepted, value=state */
+CALL(MEM_TRIM, 70, mem_call, Call) /* Manage Mem, a1=first page, a2=count; fixed Wait on trim Source; result=CLEAN/DIRTY/BUSY/CANCELED after actual drain */
 CALL(MEM_WRITEBACK, 69, mem_call, Call) /* Manage Mem, a1=page; emits a Pager writeback request */
 CALL(MEMORY_POPULATE, 67, mem_call, Call) /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
-CALL(RESOURCE_CLOSE_ASYNC, 68, resource_close_async, Call) /* a0=pool, a1=Notification (Receive), a2=nonzero completion badge; OK=accepted */
 CALL(MEMORY_WRITE, 66, memory_write, Call) /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; private anonymous single-page initialization */
 
 CALL(NOTIFICATION_SIGNAL, 80, notification_signal, Ipc) /* a0=Notification; badge is in cap */
 CALL(NOTIFICATION_TAKE, 81, notification_take, Ipc) /* a0=Notification */
-CALL(NOTIFICATION_WAIT, 82, notification_wait, Ipc) /* a0=Notification, a1=absolute monotonic deadline ticks (0=infinite) */
+CALL(WAIT_ONE, 83, source_call, Ipc) /* a0=source, a1=facet, a2=condition, a3=seen, a4=deadline, a5=flags */
+CALL(PORT_CREATE, 84, port_create, Create) /* a1=Watch capacity, a2=queued hint capacity */
+CALL(PORT_WATCH, 85, port_watch, Ipc) /* a0=Port, a1=source, a2=facet, a3=condition, a4=seen, a5=key, a6=flags */
+CALL(PORT_ARM, 86, port_call, Ipc) /* a0=Port, a1=watch_gen, a2=seen; registered condition stays fixed */
+CALL(PORT_UNWATCH, 87, port_call, Ipc) /* a0=Port, a1=watch_gen */
+CALL(PORT_TAKE, 88, port_call, Ipc) /* a0=Port, a1=IPC offset; PortEvent */
+CALL(PORT_RECORDS, 89, port_call, Ipc) /* a0=Port, a1=IPC offset, a2=epoch, a3=last watch_gen */
+CALL(PORT_RESYNC, 90, port_call, Ipc) /* a0=Port, a1=complete rescan epoch */
+CALL(GRANT_SOURCE, 93, grant_source, Ipc) /* a0=Scope(Inspect grants), a1=member CSpace ID, a2=seed selector, a3=selected Grant ID; condition/sequence */
+CALL(PORT_GRANT, 94, grant_source, Ipc) /* a0=Scope(Inspect grants), a1=member CSpace ID, a2=seed selector, a3=selected Grant ID, a4=Port(Manage), a5=seen, a6=key; WATCH_CHANGED */
+CALL(IRQ_SET, 92, pg_call, Call) /* a0=Irq(Route), a1=enabled; value=route generation */
+CALL(SOURCE_INFO, 91, source_call, Ipc) /* a0=source, a1=facet; condition/sequence */
 
 CALL(CHANNEL_TRY_SEND, 120, channel_send, Ipc) /* a0=Channel, message in IPC buffer */
 CALL(CHANNEL_TRY_RECV, 121, channel_recv, Ipc) /* a0=Channel, message in IPC buffer */
-CALL(CHANNEL_SEND, 122, channel_send, Ipc) /* ThreadBlocking send */
-CALL(CHANNEL_RECV, 123, channel_recv, Ipc) /* ThreadBlocking receive */
+CALL(CHANNEL_CALL, 122, channel_send, Ipc) /* a0=request endpoint, a1=reply sender root; IPC request; value=call token */
+CALL(CHANNEL_CANCEL, 123, channel_cancel, Ipc) /* a0=reply receiver (Receive|Close), a1=call token, a2=CHANNEL_DISCARD or 0 */
 CALL(CHANNEL_CLOSE, 124, channel_close, Ipc) /* a0=Channel */
-CALL(CHANNEL_BIND, 125, channel_bind, Ipc) /* a0=Channel, a1=Notification, a2=condition */
-CALL(CHANNEL_ARM, 126, channel_arm, Ipc) /* a0=Channel, a1=relation, a2=sequence */
 CALL(CHANNEL_MINT, 127, channel_mint, Ipc) /* a0=side root, a1=dest CSpace, a2=badge, a3=rights */
 
 /* One system monotonic domain across CPUs; returns ticks or Hz.
  * Absolute deadlines use this domain. Device counters are not clock ticks. */
-CALL(CHANNEL_UNBIND, 130, channel_arm, Ipc) /* a0=Channel, a1=relation; leaves the endpoint open */
 
 CALL(CLOCK_NOW, 128, clock_now, Call)
 CALL(CLOCK_FREQUENCY, 129, clock_frequency, Call)
@@ -93,17 +105,14 @@ CALL(PAGER_CLAIM, 131, pg_call, Call) /* a0=pager; writes the tagged request to 
 CALL(PAGER_REQUEUE, 132, pg_call, Call) /* a0=pager, a1=request id */
 CALL(PAGER_COMPLETE, 133, pg_call, Call) /* a0=pager, a1=target memory, a2=request id */
 CALL(PAGER_FAIL, 134, pg_call, Call) /* a0=pager, a1=target memory, a2=request id */
-CALL(IRQ_BIND, 135, pg_call, Call) /* a0=irq, a1=notification, a2=badge */
 CALL(IRQ_OBSERVE, 136, pg_call, Call) /* a0=irq */
 CALL(IRQ_ACK, 137, pg_call, Call) /* a0=irq, a1=generation, a2=sequence */
 CALL(PAGER_SUPPLY, 138, pg_call, Call) /* a0=pager, a1=target memory, a2=staging memory, a3=source page, a4=request id */
 CALL(EXIT_QUERY, 139, exit_call, Call) /* a0=Thread; returns finished/status */
-CALL(EXIT_BIND, 140, exit_call, Call) /* a0=Thread, a1=Notification, a2=badge */
-CALL(PAGER_BIND, 141, pg_call, Call) /* a0=pager, a1=Notification, a2=badge */
 
-CALL(IO_SPACE_MAP, 144, io_call, Call) /* a0=domain, a1=Memory, a2=first page, a3=count, a4=IOVA, a5=perms */
+CALL(IO_SUBMIT, 144, io_submit, Create) /* a0=Account, a1=IOSpace, a2=IO operation, a3=IPC offset, a6=Scope; PENDING + Op */
 CALL(IO_SPACE_STATE, 145, io_call, Call) /* a0=domain; IoState */
 CALL(IOMMU_STATE, 146, io_call, Call) /* a0=controller; IoState */
-CALL(IO_SPACE_UNMAP, 147, io_call, Call) /* a0=domain, a1=IOVA, a2=page count */
 CALL(IO_SPACE_CLOSE, 149, io_call, Call) /* a0=domain; commits deny and retirement */
-CALL(IO_SPACE_WATCH, 151, io_call, Call) /* a0=domain, a1=Notification, a2=badge */
+
+CALL(SCOPE_QUERY, 150, scope_query, Call) /* a0=Scope(Inspect), a1=Object ID, a2=facet, a3=cursor, a4=epoch, a5=IPC offset; typed result */

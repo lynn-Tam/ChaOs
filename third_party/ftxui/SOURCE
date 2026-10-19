@@ -1,0 +1,9 @@
+FTXUI v7.0.3
+https://github.com/ArthurSonzogni/FTXUI
+f921fad208912747c17d129a8ef75ec7624b6eec
+
+Vendored screen/dom/component sources; hosted App and task runners excluded.
+FTXUI_MYOS patches: terminal size/traits from native protocol, Screen::Print
+uses ft_print, standalone component mouse capture. Native event loop and
+callback/animation scheduling live in adapters/ftxui.
+Selection uses std::string append instead of stringstream with identical text semantics.

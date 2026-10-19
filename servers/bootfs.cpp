@@ -22,7 +22,7 @@ static std::vector<bf_file> files;
 static std::unique_ptr<bf_open> opens;
 static const rt_env* env;
 static cap_owner descriptor;
-static cap_t memory_pool;
+static CreateAuth memory_pool;
 
 static auto backing(bf_file& f, word_t perms, msg_reply& reply) -> status_t {
     if (f.bytes.empty())
@@ -47,7 +47,7 @@ static auto backing(bf_file& f, word_t perms, msg_reply& reply) -> status_t {
             return status;
         f.backing = std::move(file);
     }
-    return f.backing.offer(*env, descriptor.selector(), memory_pool, perms, reply);
+    return f.backing.offer(*env, descriptor.selector(), memory_pool.account, perms, reply);
 }
 
 static void control(const msg_packet& packet, msg_reply& response) {
@@ -120,7 +120,7 @@ static void control(const msg_packet& packet, msg_reply& response) {
         return;
     }
     open->file = &*found;
-    const auto pair = sys::channel_create(env->pool, 1, CHANNEL_MAX_WORDS, 4, 2);
+    const auto pair = sys::channel_create(env->alloc(), 1, CHANNEL_MAX_WORDS, 4);
     cap_owner roots[]{cap_owner{pair.value}, cap_owner{pair.value2}};
     cap_owner client;
     auto status = pair.status;
@@ -138,7 +138,7 @@ static void control(const msg_packet& packet, msg_reply& response) {
         status = c.status;
     }
     if (status == STATUS_OK)
-        status = open->session.open(open->channel.selector(), env->events, memory_pool, env->vspace,
+        status = open->session.open(open->channel.selector(), env->events, memory_pool, env->alloc(), env->vspace,
                                     env->cspace, 0, 0);
     if (status != STATUS_OK) {
         reply.status = status;
@@ -154,8 +154,8 @@ static void control(const msg_packet& packet, msg_reply& response) {
 }
 int main() {
     env = &rt_startup();
-    memory_pool = env->selector(io_memory);
-    if (!memory_pool)
+    memory_pool = {env->selector(io_memory), env->selector(io_scope)};
+    if (!memory_pool.account || !memory_pool.scope)
         sys::exit(STATUS_DENIED);
     const auto* image = env->find(fs_archive);
     if (!image)
@@ -178,7 +178,7 @@ int main() {
         if (f->name.starts_with("boot/"))
             files.emplace_back(std::string{f->name.substr(5)}, f->data, fl_memory{});
     }
-    const auto desc = sys::memory_create(env->pool, 4096, VM_READ | VM_WRITE);
+    const auto desc = sys::memory_create(env->alloc(), 4096, VM_READ | VM_WRITE);
     if (desc.status != STATUS_OK)
         sys::exit(desc.status);
     descriptor = cap_owner{desc.value};
@@ -193,7 +193,7 @@ int main() {
             if (rc != STATUS_OK || packet.count != 1)
                 continue;
             msg_reply response;
-            response.message = {.operation = packet.message.operation,};
+            response.message = {.operation = packet.message.operation, .sequence = packet.message.sequence};
             control(packet, response);
             response.respond(packet.capabilities[0].selector());
         }
@@ -267,7 +267,7 @@ int main() {
         if (const auto rc = directory.arm().status; rc != STATUS_OK)
             sys::exit(rc);
         if (!again)
-            if (const auto rc = sys::notification_wait(env->events).status; rc != STATUS_OK)
+            if (const auto rc = ev_wait(env->events).status; rc != STATUS_OK)
                 sys::exit(rc);
     }
 }

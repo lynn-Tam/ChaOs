@@ -4,6 +4,8 @@
 #include <span>
 #include <utility>
 #include <sys/syscall.hpp>
+#include <start.hpp>
+#include <string.h>
 #include <libk/unique_handle.hpp>
 
 
@@ -30,6 +32,33 @@ public:
         return s;
     }
 };
+
+// Accepted effects and cleanup survive the caller. Waiting is a userspace
+// composition over the common Op source, independent of provider type.
+inline auto op_wait(sys::SysResult submitted) noexcept -> sys::SysResult {
+    if (submitted.status != STATUS_PENDING) return submitted;
+    cap_owner op{submitted.value};
+    const auto waited = sys::wait_one(op.selector(), OP_DONE);
+    return waited.status == STATUS_OK ? sys::op_query(op.selector()) : waited;
+}
+inline auto vm_call(CreateAuth auth, cap_t space, word_t kind, VmReq request = {}) noexcept -> status_t {
+    ::memcpy(reinterpret_cast<void*>(rt_startup().ipc), &request, sizeof(request));
+    return op_wait(sys::vm_submit(auth, space, kind)).status;
+}
+inline auto vm_call(cap_t space, word_t kind, VmReq request = {}) noexcept -> status_t {
+    return vm_call(rt_startup().alloc(), space, kind, request);
+}
+inline auto io_call(CreateAuth auth, cap_t space, word_t kind, IoReq request) noexcept -> sys::SysResult {
+    ::memcpy(reinterpret_cast<void*>(rt_startup().ipc), &request, sizeof(request));
+    return op_wait(sys::io_submit(auth, space, kind));
+}
+inline auto io_close(cap_t space) noexcept -> status_t {
+    const auto requested = sys::io_space_close(space);
+    if (requested.status != STATUS_OK) return requested.status;
+    const auto done = sys::wait_one(space, (word_t{1} << IO_SPACE_CLOSED) | (word_t{1} << IO_SPACE_FAILED));
+    return done.status != STATUS_OK ? done.status : done.value & (word_t{1} << IO_SPACE_FAILED)
+        ? STATUS_BACKING_FAILED : STATUS_OK;
+}
 
 // Owns a VA reservation; repeated attach/detach reuses that reservation.
 // clear waits for the kernel's TLB/borrow drain before the VA is reusable.
@@ -80,20 +109,20 @@ struct vm_area {
     auto attach(cap_t mem, word_t first, size_t bytes, word_t perms) noexcept -> status_t {
         if (!region || cleared_ || mapped_ || !mem || !bytes || bytes % 4096 || bytes > size)
             return STATUS_BAD_ARGS;
-        const auto s = sys::vm_map(region.selector(), mem, address, bytes, first, perms).status;
+        const auto s = vm_call(region.selector(), VM_OP_MAP, {mem, address, bytes, first, perms});
         if (s == STATUS_OK) mapped_ = bytes;
         return s;
     }
     auto detach() noexcept -> status_t {
         if (!mapped_) return STATUS_OK;
-        const auto s = sys::vm_unmap(region.selector(), address, mapped_).status;
+        const auto s = vm_call(region.selector(), VM_OP_UNMAP, {0, address, mapped_, 0, 0});
         if (s == STATUS_OK) mapped_ = 0;
         return s;
     }
     auto close() noexcept -> status_t {
         if (region) {
             if (!cleared_) {
-                const auto s = sys::vm_clear(region.selector()).status;
+                const auto s = vm_call(region.selector(), VM_OP_CLEAR);
                 if (s != STATUS_OK) return s;
                 cleared_ = true;
                 mapped_ = 0;
@@ -119,7 +148,7 @@ struct vm_area {
         noexcept -> std::expected<vm_area, status_t> {
         return map_impl(vm, std::move(mem), va, size, VM_READ | VM_WRITE, VM_MAP_PRIVATE);
     }
-    static auto create(cap_t pool, cap_t vm, uintptr_t va, size_t size)
+    static auto create(CreateAuth pool, cap_t vm, uintptr_t va, size_t size)
         noexcept -> std::expected<vm_area, status_t> {
         const auto r = sys::memory_create(pool, size, VM_READ | VM_WRITE);
         if (r.status != STATUS_OK) return std::unexpected(r.status);
