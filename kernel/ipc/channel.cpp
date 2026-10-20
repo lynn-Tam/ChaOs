@@ -230,6 +230,7 @@ auto Channel::send(
             // GrantLease already owns the invocation and object use. Only new
             // capabilities/relations need a late Graph/Gate installation cut.
             auto& message = target.free.pop_front();
+            message.called = false;
             message.transaction = request.transaction; message.tag = request.tag;
             message.sender_badge = auth->badge; message.word_count = request.word_count;
             std::copy_n(request.words, request.word_count, message.words);
@@ -258,14 +259,14 @@ auto Channel::send_caps(cap::Resolved<Channel>& cap, cap::CSpace& source, const 
             return std::unexpected(made.error());
         }
     }
-    auto sent = cap.token() ? this->reply(cap, request, staging.span()) : enqueue(cap, request, staging.span());
+    auto sent = cap.token() ? this->reply(cap, request, staging.span()) : enqueue(cap, request, staging.span(), reply_cap != nullptr);
     if (sent) staging.clear();
     // An unaccepted CALL owns rollback, not an abandoned invocation.
     else if (reply_cap) staging.front().cap.disarm();
     return sent;
 }
 
-auto Channel::enqueue(cap::Resolved<Channel>& cap, const ChanMsg& request, std::span<Escrow> escrows) noexcept -> std::expected<u64, ChannelError> {
+auto Channel::enqueue(cap::Resolved<Channel>& cap, const ChanMsg& request, std::span<Escrow> escrows, bool called) noexcept -> std::expected<u64, ChannelError> {
     auto& target = side(peer(*side_for(cap, cap::Right::Send)));
     // Preparation does not authorize a later publication through a closed Gate.
     std::array<cap::GrantLease, CHANNEL_MAX_CAPS> leases;
@@ -290,6 +291,7 @@ auto Channel::enqueue(cap::Resolved<Channel>& cap, const ChanMsg& request, std::
         const auto count = escrows.size() + 1;
         auto commit = [&] noexcept {
             auto& cell = target.free.pop_front();
+            cell.called = called;
             cell.transaction = request.transaction; cell.tag = request.tag;
             cell.sender_badge = std::get<cap::ChanLimit>(cap.view().data).badge; cell.word_count = request.word_count;
             std::copy_n(request.words, request.word_count, cell.words);
@@ -338,7 +340,7 @@ auto Channel::call(cap::Resolved<Channel>& request_cap, cap::CSpace& source,
         if (direction.generation == UINT64_MAX / 2) return std::unexpected(ChannelError::GenerationExhausted);
         token = (++direction.generation << 1) | channel.side_index(receiver);
         direction.call = &direction.free.pop_front(); direction.call_done = false;
-        direction.call->error.reset(); ++direction.occupied;
+        direction.call->error.reset(); direction.call->called = false; ++direction.occupied;
         channel.readiness_locked(direction, publications);
     }
     for (auto& publication : publications) publication.publish();
@@ -421,6 +423,7 @@ auto Channel::reply(cap::Resolved<Channel>& cap, const ChanMsg& request,
         }
         auto commit = [&]() noexcept {
             auto& message = *direction.call;
+            message.called = false;
             message.transaction = request.transaction; message.tag = request.tag;
             message.word_count = request.word_count; message.sender_badge = 0;
             std::copy_n(request.words, request.word_count, message.words);
@@ -446,6 +449,7 @@ auto Channel::receive(
     if (!value) return std::unexpected(ChannelError::Denied);
     auto& current = side(*value);
     auto copy = [](const Message& message, ChanMsg& received) noexcept {
+        received.flags = message.called ? CHANNEL_FLAG_CALL : CHANNEL_FLAGS_NONE;
         received.transaction = message.transaction; received.tag = message.tag;
         received.sender_badge = message.sender_badge; received.word_count = message.word_count;
         std::copy_n(message.words, message.word_count, received.words);

@@ -244,7 +244,7 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     auto pager = std::move(*pg).publish();
     auto pg_ref = object::ref<>{pager};
     if (!pg_ref) return false;
-    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, 2 * page_size, mm::PagedCfg{std::move(pg_ref), Perms::of(Perm::Read, Perm::Write), false}, object::ref<>{k.domain});
+    auto pending = k.objects.get<mm::Mem>().create({}, k.pmm, 2 * page_size, mm::PagedCfg{std::move(pg_ref), Perms::of(Perm::Read, Perm::Write), false});
     if (!pending) return false;
     auto mem = std::move(*pending).publish();
     auto a = k.objects.get<mm::VSpace>().create(

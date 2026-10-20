@@ -1,8 +1,9 @@
-#include <exec.hpp>
-#include <protocols/file.hpp>
-#include <protocols/service.hpp>
-#include <protocols/manage.hpp>
-#include <protocols/terminal.hpp>
+#include <vm.hpp>
+#include <proc.hpp>
+#include <lib/fs/fs.hpp>
+
+#include <lib/mgr/mgr.hpp>
+#include <lib/term/term.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/parse.hpp>
 #include <libk/fmt.hpp>
@@ -14,7 +15,7 @@
 #include <vector>
 
 struct sh_stage {
-    std::unique_ptr<pr_task> task;
+    std::unique_ptr<proc_task> task;
     std::optional<status_t> result;
     bool end{};
     cap_owner end_sender;
@@ -26,11 +27,14 @@ struct sh_job {
     std::string command;
     std::vector<sh_stage> stages;
     std::vector<std::unique_ptr<ch_pair>> pipes;
-    ch_pair input, output, terminal;
-    cap_owner input_sender, terminal_sender;
+    ch_pair input, output;
+    ubus_object terminal;
+    cap_owner input_sender, terminal_sender, terminal_connector;
+    ev_watch terminal_ready;
+    std::optional<ubus_msg> focus_event;
     ev_watch input_ready;
-    msg_rx output_rx, terminal_rx;
-    std::deque<msg_frame> pending_input;
+    ubus_rx output_rx;
+    std::deque<str_chunk> pending_input;
     sh_state state{sh_state::Running};
     bool fullscreen{}, output_empty{}, background{}, announced{}, read_only{};
     uint64_t focus{};
@@ -38,15 +42,13 @@ struct sh_job {
 
 class sh_session {
     const rt_env& env_;
-    msg_rx input_;
-    rpc_client services_;
-    ch_pair management_;
-    msg_rx management_rx_;
-    mg_watch watches_;
+    ubus_rx input_;
+    ubus_conn bus_, publisher_;
+    ubus_object management_{"myos.manager"};
+    mgr_wait watches_;
     std::deque<std::unique_ptr<sh_job>> jobs_;
     uint64_t next_{}, foreground_{}, focus_{};
-    cap_owner device_control_;
-    struct output { msg_frame frame; uint64_t owner{}, focus{}; };
+    struct output { str_chunk frame; uint64_t owner{}, focus{}; };
     std::deque<output> output_;
     ev_watch output_ready_;
     std::string line_;
@@ -69,7 +71,7 @@ class sh_session {
     void enqueue(std::string_view text, uint64_t owner = 0, uint64_t focus = 0) {
         while (!text.empty()) {
             if (output_.empty() || output_.back().owner != owner || output_.back().focus != focus
-                || output_.back().frame.size == sizeof(msg_frame::data)) {
+                || output_.back().frame.size == sizeof(str_chunk::data)) {
                 if (output_.size() == 128) return; // Echo/status overflow; child streams stop draining at 64.
                 output_.push_back({{}, owner, focus});
             }
@@ -85,13 +87,10 @@ class sh_session {
         job.focus = ++focus_;
         // Old queued events can be replaced; old in-flight frames still carry
         // their old focus sequence and are rejected by the output broker.
-        msg_frame event;
-        while (msg_recv(job.terminal.ends[1].selector(), event, false).status == STATUS_OK) {}
-        event = {.operation = static_cast<uint64_t>(gained ? tm_op::FocusGained : tm_op::FocusLost),
-                 .value = job.focus};
-        event.size = sizeof(tm_default_size);
-        ::memcpy(event.data, &tm_default_size, event.size);
-        (void)msg_send(job.terminal_sender.selector(), event, false);
+        ubus_msg event;
+        event.data.put("focus", job.focus).put("focused", gained).put("rows", uint64_t{tm_default_size.rows})
+            .put("columns", uint64_t{tm_default_size.columns});
+        job.focus_event.emplace(std::move(event));
         if (gained) { enqueue("\x1b[?1049h\x1b[?25h"); screen_ = true; }
         else if (screen_) { enqueue("\x1b[?1049l\x1b[?25h"); screen_ = false; }
     }
@@ -121,9 +120,9 @@ class sh_session {
         if (target) {
             if (target->pending_input.size() == 32) { enqueue("\a"); return; }
             if (byte == 4 && !target->fullscreen)
-                target->pending_input.push_back({.operation = static_cast<uint64_t>(str_frame::End)});
+                target->pending_input.push_back({});
             else {
-                msg_frame frame{.size = 1}; frame.data[0] = byte;
+                str_chunk frame{.size = 1}; frame.data[0] = byte;
                 target->pending_input.push_back(frame);
             }
             return;
@@ -145,60 +144,57 @@ class sh_session {
         if (path.find('/') == path.npos) {
             path = "/boot/" + path;
             if (!path.ends_with(".elf")) path += ".elf";
-        } else path = fl_path(path, cwd_);
-        auto directory = sv_lookup(services_, vfs_exec);
-        if (!directory) return directory.error();
-        rpc_client files;
-        auto status = files.open(directory->selector(), env_.alloc());
+        } else path = fs_path(path, cwd_);
+        ubus_conn files;
+        auto status = files.connect(bus_, "exec", "myos.files", 1, 1);
         if (status != STATUS_OK) return status;
-        auto image = fl_map(files, path.c_str(), VM_READ | VM_EXECUTE);
+        auto image = fs_map(files, path, VM_READ | VM_EXECUTE);
         if (!image) return image.error();
-        auto mapped = vm_area::map(env_.vspace, std::move(image->memory), 0,
+        auto mapped = vm_area::map(rt_vm(), std::move(image->memory), 0,
             libk::checked_align_up(image->size, 4096).value_or(0), VM_READ);
         if (!mapped) return mapped.error();
-        auto writable = sv_lookup(services_, vfs_service);
-        auto readable = sv_lookup(services_, vfs_read);
-        if (!writable || !readable) return !writable ? writable.error() : readable.error();
-        std::vector<pr_cap> caps{
-            {.contract = rt_stdin, .cap = index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), .limit = word_t{RIGHT_RECEIVE}},
-            {.contract = rt_stdout, .cap = index + 1 < job.stages.size() ? job.pipes[index]->ends[0].selector() : job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
-            {.contract = rt_stderr, .cap = job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
-            {.contract = vfs_service, .cap = writable->selector(), .limit = word_t{RIGHT_SEND}},
-            {.contract = vfs_read, .cap = readable->selector(), .limit = word_t{RIGHT_SEND}},
+        const auto directory = env_.selector(job.read_only ? mgr_read_bus : ubus_directory);
+        auto jobs = management_.connector(job.read_only ? word_t{mgr_observe} : word_t{mgr_observe | mgr_control});
+        if (!jobs) return jobs.error();
+        std::vector<proc_cap> caps{
+            {.key = rt_stdin, .cap = index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), .limit = word_t{RIGHT_RECEIVE}},
+            {.key = rt_stdout, .cap = index + 1 < job.stages.size() ? job.pipes[index]->ends[0].selector() : job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
+            {.key = rt_stderr, .cap = job.output.ends[0].selector(), .limit = word_t{RIGHT_SEND}, .badge = 1},
+            {.key = ubus_directory, .cap = directory, .limit = word_t{RIGHT_SEND | RIGHT_DUPLICATE}},
+            {.key = mgr_jobs, .cap = jobs->selector(), .limit = word_t{RIGHT_SEND | RIGHT_DUPLICATE}}
         };
-        caps.push_back({.contract = mg_jobs, .cap = management_.ends[1].selector(),
-            .limit = word_t{RIGHT_SEND}, .badge = job.read_only ? mg_observe : mg_control});
-        if (const auto control = env_.selector(job.read_only ? mg_tasks_view : mg_tasks))
-            caps.push_back({.contract = mg_tasks, .cap = control, .limit = word_t{RIGHT_SEND}});
-        if (const auto observer = env_.selector(mg_tasks_view))
-            caps.push_back({.contract = mg_tasks_view, .cap = observer, .limit = word_t{RIGHT_SEND}});
-        if (auto devices = sv_lookup(services_, job.read_only ? mg_devices_view : mg_devices)) {
-            caps.push_back({.contract = mg_devices, .cap = devices->selector(), .limit = word_t{RIGHT_SEND}});
-            // pr_exec copies this endpoint while its slot is alive.
-            device_control_ = std::move(*devices);
-        }
         if (job.stages.size() == 1)
-            caps.push_back({.contract = tm_service, .cap = job.terminal.ends[1].selector(), .limit = word_t{RIGHT_SEND | RIGHT_RECEIVE}, .badge = 1});
+            caps.push_back({.key = tm_service, .cap = job.terminal_connector.selector(), .limit = word_t{RIGHT_SEND | RIGHT_DUPLICATE}});
         const auto cpu = static_cast<uint32_t>((job.id + index) % env_.cpus);
         const std::string pwd = "PWD=" + cwd_;
         const std::array<std::string_view, 1> environment{pwd};
-        stage.task = std::make_unique<pr_task>();
-        status = pr_exec(*stage.task, {env_.alloc(), static_cast<uint32_t>(env_.cpus), env_.domain},
-            {.bytes = {reinterpret_cast<const std::byte*>(mapped->address), image->size},
-             .memory = mapped->memory.selector(), .perms = VM_READ | VM_EXECUTE},
-            {.argv = argv, .envp = environment, .caps = caps,
-             .resources = {.bytes = 4 * 1024 * 1024, .caps = 160,
-                .kinds = pr_base_kinds | OBJ_BIT(ObjChannel), .slots = 160, .pages = 24,
-                .pool_perms = RIGHT_CREATE | RIGHT_INSPECT},
-             .cpu = cpu, .events = env_.events});
+        stage.task = std::make_unique<proc_task>();
+        const proc_auth auth{env_.alloc(), static_cast<uint32_t>(env_.cpus), env_.domain};
+        const proc_quota quota{.bytes=4 * 1024 * 1024, .caps=160,
+            .kinds=proc_base_kinds | OBJ_BIT(ObjChannel), .slots=160, .pages=24,
+            .pool_perms=RIGHT_CREATE | RIGHT_INSPECT};
+        status = stage.task->open(auth, quota);
+        if (status != STATUS_OK) return status;
+        auto publication = mgr_view(publisher_, "job" + std::to_string(job.id) + "-" + std::to_string(index),
+            ubus_all, stage.task->scope(), 4);
+        if (!publication) return publication.error();
+        caps.push_back({.key=ubus_publisher, .cap=publication->selector(), .limit=word_t{RIGHT_SEND | RIGHT_DUPLICATE}});
+        status = proc_spawn(*stage.task, auth,
+            {.bytes={reinterpret_cast<const std::byte*>(mapped->address), image->size},
+             .memory=mapped->memory.selector(), .offset=image->offset, .perms=VM_READ | VM_EXECUTE},
+            {.argv=argv, .envp=environment, .caps=caps, .resources=quota, .cpu=cpu, .events=env_.events});
         if (status == STATUS_OK) status = stage.task->start();
         return status;
     }
 public:
-    explicit sh_session(const rt_env& env) : env_(env), input_(env.selector(con_input), env.events), watches_(env.events) {
-        if (const auto status = services_.open(env.selector(sv_service), env.alloc()); status != STATUS_OK) sys::exit(status);
-        if (const auto status = management_.open(env.alloc(), 8, 1); status != STATUS_OK) sys::exit(status);
-        if (const auto status = management_rx_.open(management_.ends[0].selector(), env.events); status != STATUS_OK) sys::exit(status);
+    explicit sh_session(const rt_env& env) : env_(env) {
+        if (const auto status = input_.open(env.selector(rt_stdin), env.events); status != STATUS_OK) sys::exit(status);
+        if (const auto status = bus_.bind(env.selector(ubus_directory)); status != STATUS_OK) sys::exit(status);
+        if (const auto status = publisher_.bind(env.selector(ubus_publisher)); status != STATUS_OK) sys::exit(status);
+        for (const auto name : {"List", "Inspect", "Changed", "Action", "CloseCap", "Revoke"})
+            if (const auto status = mgr_method(management_, name, [this, name](auto& q, auto& r) { return manage(name, q, r); });
+                status != STATUS_OK) sys::exit(status);
+        if (const auto status = management_.open(); status != STATUS_OK) sys::exit(status);
     }
     void prompt() {
         if (!line_start_ && !prompt_visible_) enqueue("\n");
@@ -207,14 +203,12 @@ public:
     auto cwd() const noexcept -> const std::string& { return cwd_; }
     auto cd(std::string_view path) -> status_t {
         if (path.empty()) return STATUS_BAD_ARGS;
-        auto directory = sv_lookup(services_, vfs_read);
-        if (!directory) return directory.error();
-        rpc_client files;
-        auto status = files.open(directory->selector(), env_.alloc());
+        ubus_conn files;
+        auto status = files.connect(bus_, "read", "myos.files", 1, 1);
         if (status != STATUS_OK) return status;
-        const auto target = fl_path(path, cwd_);
-        msg_frame request;
-        status = st_list(files, request, target.c_str());
+        const auto target = fs_path(path, cwd_);
+        ubus_data page;
+        status = fs_list(files, target, page);
         if (status == STATUS_OK) cwd_ = target;
         return status;
     }
@@ -223,104 +217,61 @@ public:
         leave(job);
         for (auto& stage : job.stages) if (stage.task) (void)stage.task->stop();
     }
-    void manage(msg_packet& packet, msg_reply& response, cap_owner& reply) {
-        const auto& request = packet.message;
-        auto& message = response.message;
-        message.status = STATUS_NOT_FOUND;
-        sh_job* target{};
-        sh_stage* stage{};
-        uint64_t id{};
-        const auto op = static_cast<mg_op>(request.operation);
-        for (auto& entry : jobs_) {
-            for (size_t i = 0; i < entry->stages.size(); ++i) {
-                const auto candidate = (entry->id << 8) | i;
-                if (op == mg_op::Tasks ? candidate > request.value : candidate == request.value) {
-                    target = entry.get(); stage = &entry->stages[i]; id = candidate; break;
-                }
+    auto manage(std::string_view method, ubus_request& request, ubus_msg& response) -> status_t {
+        if (method == "List") {
+            ubus_data items{ubus_type::Array};
+            constexpr std::array<std::string_view, 5> states{"running", "suspending", "suspended", "draining", "done"};
+            for (const auto& job : jobs_) for (size_t i = 0; i < job->stages.size(); ++i) {
+                auto row = mgr_row(job->stages[i].task.get(), (job->id << 8) | i, job->id, job->command,
+                    states[static_cast<size_t>(job->state)], (request.facet() & mgr_control) && job->id != foreground_);
+                row.put("job", job->id).put("member", i + 1); items.push(row);
             }
-            if (target) break;
+            response.data.put("items", items).put("epoch", next_); return STATUS_OK;
         }
-        if (!target) return;
-        if (op == mg_op::Tasks || op == mg_op::Task) {
-            constexpr mg_state states[]{mg_state::Running, mg_state::Suspending, mg_state::Suspended, mg_state::Draining, mg_state::Done};
-            mg_task row{id, target->id, target->id, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
-                static_cast<uint32_t>(states[static_cast<size_t>(target->state)]),
-                static_cast<uint32_t>(mg_observe | (packet.badge == mg_control && target->id != foreground_ ? mg_control | mg_close | mg_pause | mg_resume | mg_stop : 0)), static_cast<uint32_t>(stage - target->stages.data() + 1), {}};
-            if (stage->task) {
-                if (const auto thread = stage->task->info()) row.runtime = thread->runtime;
-                if (const auto memory = stage->task->memory_info()) row.resident = memory->resident;
-                if (const auto quota = stage->task->resource_info()) {
-                    row.charged = quota->memory_limit - quota->memory_available; row.limit = quota->memory_limit;
+        const auto id = *request.data["id"].as<uint64_t>();
+        auto* target = job(id >> 8);
+        const auto index = id & 255;
+        if (!target || index >= target->stages.size()) return STATUS_NOT_FOUND;
+        if (request.data["gen"].as<uint64_t>() != target->id) return STATUS_STALE;
+        auto& stage = target->stages[index];
+        if (!stage.task) return STATUS_CLOSED;
+        if (method == "Changed") return watches_.accept(stage.task->scope(), stage.task->cspace(), request, response);
+        if (method == "Inspect") {
+            if (request.data["facet"].as<std::string_view>() == "dependencies") {
+                ubus_data items{ubus_type::Array};
+                for (const auto peer : {index ? index - 1 : UINT64_MAX, index + 1 < target->stages.size() ? index + 1 : UINT64_MAX}) if (peer != UINT64_MAX) {
+                    ubus_data edge; edge.put("id", (target->id << 8) | peer).put("gen", target->id)
+                        .put("name", peer < index ? "stdin pipe" : "stdout pipe"); items.push(edge);
                 }
+                response.data.put("items", items); return STATUS_OK;
             }
-            ::memcpy(row.name, target->command.data(), std::min(target->command.size(), sizeof(row.name) - 1));
-            mg_pack(message, row); message.value = id; message.deadline = sys::clock_now().value; return;
+            return mgr_inspect(stage.task->scope(), stage.task->cspace(), request.data.view(), response);
         }
-        if (request.size != sizeof(mg_target)) { message.status = STATUS_BAD_ARGS; return; }
-        mg_target expected; ::memcpy(&expected, request.data, sizeof(expected));
-        if (expected.incarnation != target->id) { message.status = STATUS_STALE; return; }
-        if (op == mg_op::Dependencies) {
-            const auto index = static_cast<size_t>(stage - target->stages.data());
-            const bool upstream = index && expected.argument == 0;
-            if (!upstream && (expected.argument != static_cast<uint64_t>(index != 0) || index + 1 == target->stages.size())) return;
-            mg_dependency edge{(target->id << 8) | (upstream ? index - 1 : index + 1), target->id, 0, 1, 0, 4, {}};
-            const std::string_view name{upstream ? "stdin pipe" : "stdout pipe"};
-            ::memcpy(edge.name, name.data(), name.size());
-            mg_pack(message, edge); message.value = expected.argument + 1; return;
-        }
-        if (op == mg_op::Caps || (op >= mg_op::Members && op <= mg_op::GrantView)) {
-            if (!stage->task) { message.status = STATUS_CLOSED; return; }
-            mg_project(stage->task->scope(), stage->task->cspace(), op, expected, message);
-            return;
-        }
-        if (op == mg_op::Changed) {
-            if (!stage->task) { message.status = STATUS_CLOSED; return; }
-            watches_.accept(stage->task->scope(), stage->task->cspace(), expected, reply, request, message); return;
-        }
-        if (packet.badge != mg_control || target->id == foreground_) { message.status = STATUS_DENIED; return; }
-        if (op == mg_op::Revoke) {
-            message.status = stage->task ? sys::cap_revoke(expected.selector, stage->task->cspace(), CAP_REVOKE_ASYNC, expected.selected).status : STATUS_CLOSED;
-            if (message.status == STATUS_INVALID_CAP) message.status = STATUS_STALE;
-            return;
-        }
-        if (op == mg_op::CloseCap) {
-            message.status = stage->task ? sys::cap_close(expected.argument, stage->task->cspace()).status : STATUS_CLOSED;
-            if (message.status == STATUS_INVALID_CAP) message.status = STATUS_STALE;
-            return;
-        }
-        if (op != mg_op::Action || !stage->task) { message.status = STATUS_CLOSED; return; }
-        const auto action = static_cast<mg_action>(request.status);
-        if (action == mg_action::Stop) { terminate(*target); message.status = STATUS_OK; }
-        else if (action == mg_action::Pause || action == mg_action::Resume) {
-            const bool enable = action == mg_action::Resume;
-            if (!enable) leave(*target);
-            target->state = enable ? sh_state::Running : sh_state::Suspending;
-            message.status = STATUS_OK;
-            for (auto& member : target->stages)
-                if (member.task) {
-                    const auto status = member.task->execution(enable).status;
-                    if (status != STATUS_OK) message.status = status;
-                }
-        } else message.status = STATUS_INVALID_OP;
+        if (target->id == foreground_) return STATUS_DENIED;
+        if (method == "CloseCap") return sys::cap_close(*request.data["selector"].as<cap_t>(), stage.task->cspace()).status;
+        if (method == "Revoke") return mgr_revoke(stage.task->cspace(), request.data.view(), response);
+        if (method != "Action") return STATUS_INVALID_OP;
+        const auto action = *request.data["action"].as<std::string_view>();
+        if (action == "stop") { terminate(*target); return STATUS_OK; }
+        if (action != "pause" && action != "resume") return STATUS_BAD_ARGS;
+        const bool enabled = action == "resume";
+        if (!enabled) leave(*target);
+        target->state = enabled ? sh_state::Running : sh_state::Suspending;
+        for (auto& member : target->stages) if (member.task)
+            if (const auto status = member.task->execution(enabled).status; status != STATUS_OK) return status;
+        return STATUS_OK;
     }
     void pump(bool sleep = true) {
         bool polling{}, progress{};
         for (unsigned n = 0; n < 16; ++n) {
-            msg_packet packet;
-            const auto status = management_rx_.receive(packet);
+            const auto status = management_.poll();
             if (status == STATUS_WOULD_BLOCK) break;
-            if (status != STATUS_OK) continue;
+            if (status != STATUS_OK) sys::exit(status);
             progress = true;
-            if (packet.count != 1) continue;
-            const auto reply = packet.capabilities[0].selector();
-            msg_reply response;
-            response.message.operation = packet.message.operation; response.message.sequence = packet.message.sequence;
-            if (packet.badge != mg_observe && packet.badge != mg_control) response.message.status = STATUS_DENIED;
-            else manage(packet, response, packet.capabilities[0]);
-            if (packet.message.operation != static_cast<uint64_t>(mg_op::Changed) || response.message.status != STATUS_PENDING) response.respond(reply);
         }
-        auto deadline = watches_.poll();
-        (void)management_rx_.arm();
+        watches_.poll();
+        auto deadline = watches_.deadline();
+        if (const auto status = management_.arm(); status != STATUS_OK) sys::exit(status);
         for (auto& entry : jobs_) {
             auto& job = *entry;
             bool suspended = true, done = true;
@@ -338,12 +289,11 @@ public:
                         if (!stage.result) stage.result = static_cast<status_t>(result.value);
                         stage.task.reset(); stage.end = i + 1 < job.stages.size();
                         if (i) (void)sys::channel_close(job.pipes[i - 1]->ends[0].selector());
-                    } else if (status != STATUS_WOULD_BLOCK && !pr_retryable(status)) sys::exit(status);
+                    } else if (status != STATUS_WOULD_BLOCK && !proc_retryable(status)) sys::exit(status);
                     else polling |= stage.task->polling();
                 }
                 if (stage.end) {
-                    const auto status = msg_send(stage.end_sender.selector(),
-                        {.operation = static_cast<uint64_t>(str_frame::End), .status = *stage.result}, false).status;
+                    const auto status = str_send(stage.end_sender.selector(), {.status = *stage.result}, false);
                     if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                         const auto armed = stage.end_ready ? stage.end_ready.arm().status
                             : stage.end_ready.open(env_.events, stage.end_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
@@ -358,26 +308,31 @@ public:
             if (job.state == sh_state::Suspending && suspended) { job.state = sh_state::Suspended; progress = true; }
             for (unsigned i = 0; i < 16; ++i) {
                 if (foreground_ == job.id && output_.size() >= 64) break;
-                msg_frame frame;
-                const auto status = job.terminal_rx.try_receive(frame).status;
+                const auto status = job.terminal.poll();
                 if (status == STATUS_WOULD_BLOCK) break;
                 if (status != STATUS_OK) break;
                 progress = true;
-                if (frame.operation == static_cast<uint64_t>(tm_op::Fullscreen)) {
-                    job.fullscreen = true;
-                    if (foreground_ == job.id) focus(job, true);
-                } else if (frame.operation == static_cast<uint64_t>(tm_op::Frame)
-                    && foreground_ == job.id && frame.value == job.focus && output_.size() < 64)
-                    output_.push_back({frame, job.id, job.focus});
+            }
+            if (job.focus_event && job.terminal_sender) {
+                const auto status = ubus_send(job.terminal_sender.selector(), *job.focus_event, false);
+                if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
+                    const auto armed = job.terminal_ready ? job.terminal_ready.arm().status
+                        : job.terminal_ready.open(env_.events, job.terminal_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                    if (armed != STATUS_OK) sys::exit(armed);
+                } else {
+                    job.focus_event.reset();
+                    if (const auto closed = job.terminal_ready.close(); closed != STATUS_OK) sys::exit(closed);
+                    if (status != STATUS_OK) job.terminal_sender = {};
+                    progress = true;
+                }
             }
             if (done && job.fullscreen && foreground_ == job.id) leave(job);
             if (!screen_ && output_.size() < 64) {
-                msg_frame frame;
-                const auto status = job.output_rx.try_receive(frame).status;
+                str_chunk frame;
+                const auto status = str_receive(job.output_rx, frame);
                 job.output_empty = status == STATUS_WOULD_BLOCK || status == STATUS_CLOSED || status == STATUS_PEER_CLOSED;
                 progress |= status == STATUS_OK;
-                if (status == STATUS_OK && frame.operation == static_cast<uint64_t>(str_frame::Data)) {
-                    frame.operation = static_cast<uint64_t>(con_operation::Bytes);
+                if (status == STATUS_OK && frame.size) {
                     const bool background = !foreground_;
                     if (background && prompt_visible_) { enqueue("\r\x1b[2K"); prompt_visible_ = false; }
                     output_.push_back({frame, job.id, 0});
@@ -386,7 +341,7 @@ public:
                 }
             }
             while (!job.pending_input.empty()) {
-                const auto status = msg_send(job.input_sender.selector(), job.pending_input.front(), false).status;
+                const auto status = str_send(job.input_sender.selector(), job.pending_input.front(), false);
                 if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                     const auto armed = job.input_ready ? job.input_ready.arm().status
                         : job.input_ready.open(env_.events, job.input_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
@@ -405,12 +360,10 @@ public:
                 (void)libk::fmt::format_to<"\r\x1b[2K[{}] Done {}\n">(notice, job.id, job.stages.back().result.value_or(STATUS_CANCELED));
                 enqueue(notice.view()); line_start_ = true; prompt_visible_ = false; prompt(); job.announced = true;
             }
-            (void)job.terminal_rx.arm();
-            (void)job.output_rx.arm();
         }
         for (unsigned i = 0; i < 16; ++i) {
-            msg_frame frame;
-            const auto status = input_.try_receive(frame).status;
+            str_chunk frame;
+            const auto status = str_receive(input_, frame);
             if (status == STATUS_WOULD_BLOCK) break;
             if (status != STATUS_OK) sys::exit(status);
             progress = true;
@@ -419,11 +372,10 @@ public:
         while (!output_.empty()) {
             auto& next = output_.front();
             if (next.focus && (next.owner != foreground_ || !job(next.owner) || next.focus != job(next.owner)->focus)) { output_.pop_front(); continue; }
-            next.frame.operation = static_cast<uint64_t>(con_operation::Bytes);
-            const auto status = msg_send(env_.selector(con_output), next.frame, false).status;
+            const auto status = str_send(env_.selector(rt_stdout), next.frame, false);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                 const auto armed = output_ready_ ? output_ready_.arm().status
-                    : output_ready_.open(env_.events, env_.selector(con_output), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                    : output_ready_.open(env_.events, env_.selector(rt_stdout), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
                 if (armed != STATUS_OK) sys::exit(armed);
                 break;
             }
@@ -433,6 +385,7 @@ public:
         if (output_.empty())
             if (const auto status = output_ready_.close(); status != STATUS_OK) sys::exit(status);
         (void)input_.arm();
+        for (auto& entry : jobs_) { (void)entry->terminal.arm(); (void)entry->output_rx.arm(); }
         if (sleep && !command_ && !progress) {
             // Successful executions use Exit/Scope/Account notifications.
             if (polling) {
@@ -457,17 +410,35 @@ public:
         job.stages.resize(cuts.size() - 1);
         auto status = job.input.open(env_.alloc(), 8, 0);
         if (status == STATUS_OK) status = job.output.open(env_.alloc(), 8, 0);
-        if (status == STATUS_OK) status = job.terminal.open(env_.alloc(), 8, 0);
+        if (status == STATUS_OK) status = job.terminal.open(8);
         if (status == STATUS_OK) {
             const auto input = sys::channel_mint(job.input.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
             job.input_sender = cap_owner{input.value}; status = input.status;
         }
+        if (status == STATUS_OK) status = job.terminal.add("Fullscreen", {{"events", ubus_type::Cap}}, {},
+            [this, &job](auto& request, auto&) {
+                auto endpoint = request.take(request.data["events"]);
+                const auto state = sys::source_info(endpoint.selector(), SOURCE_WRITE);
+                if (state.status != STATUS_OK || (state.value & SOURCE_TERMINAL)) return STATUS_BAD_ARGS;
+                if (const auto status = job.terminal_ready.close(); status != STATUS_OK) return status;
+                job.terminal_sender = std::move(endpoint); job.fullscreen = true;
+                if (foreground_ == job.id) focus(job, true);
+                return STATUS_OK;
+            });
+        if (status == STATUS_OK) status = job.terminal.add("Frame", {{"focus", ubus_type::U64}, {"data", ubus_type::Bytes, false, sizeof(str_chunk::data)}}, {},
+            [this, &job](auto& request, auto&) {
+                if (foreground_ != job.id || request.data["focus"].template as<uint64_t>() != job.focus) return STATUS_STALE;
+                if (output_.size() >= 64) return STATUS_BUSY;
+                str_chunk frame;
+                const auto bytes = *request.data["data"].template as<std::span<const std::byte>>();
+                frame.size = bytes.size(); ::memcpy(frame.data, bytes.data(), frame.size);
+                output_.push_back({frame, job.id, job.focus}); return STATUS_OK;
+            }, 0, true);
         if (status == STATUS_OK) {
-            const auto terminal = sys::channel_mint(job.terminal.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
-            job.terminal_sender = cap_owner{terminal.value}; status = terminal.status;
+            auto connector = job.terminal.connector();
+            if (!connector) status = connector.error(); else job.terminal_connector = std::move(*connector);
         }
         if (status == STATUS_OK) status = job.output_rx.open(job.output.ends[1].selector(), env_.events);
-        if (status == STATUS_OK) status = job.terminal_rx.open(job.terminal.ends[0].selector(), env_.events);
         for (size_t i = 1; i < job.stages.size() && status == STATUS_OK; ++i) {
             auto& pipe = job.pipes.emplace_back(std::make_unique<ch_pair>());
             status = pipe->open(env_.alloc(), 4, 0);
@@ -625,14 +596,12 @@ static auto arguments(char* text, std::vector<std::string>& output, std::vector<
 }
 
 static void command(sh_session& session, std::string text, const rt_env& info) {
-    str_writer console{info.selector(con_output)};
+    str_writer console{info.selector(rt_stdout)};
     const auto split = text.find(' ');
     const auto name = std::string_view{text}.substr(0, split);
     const auto tail = split == text.npos ? std::string_view{} : std::string_view{text}.substr(split + 1);
     std::string argument_copy{tail};
     char* argument = argument_copy.data();
-    const auto control = info.selector(sv_service);
-    const auto pool = info.alloc();
     const std::string name_copy{name};
     const auto line = name_copy.c_str();
     if (name.empty()) return;
@@ -644,38 +613,38 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
         return;
     }
     if (std::string_view{line} == "svc") {
-        rpc_client rpc;
-        auto status = rpc.open(info.selector(mg_tasks), pool);
+        ubus_conn bus;
+        auto status = bus.bind(info.selector(ubus_directory));
         if (status != STATUS_OK) { error(console, status); return; }
         const auto split = tail.find(' ');
         const auto verb = tail.substr(0, split);
         const auto target = split == tail.npos ? std::string_view{} : tail.substr(split + 1);
-        uint64_t cursor{};
-        for (;;) {
-            auto request = mg_request(mg_op::Tasks, cursor);
-            status = rpc.exchange(request);
-            if (status == STATUS_NOT_FOUND) break;
-            if (status != STATUS_OK || request.size != sizeof(mg_task)) { error(console, status); return; }
-            mg_task service; ::memcpy(&service, request.data, sizeof(service));
-            cursor = service.id;
-            if (tail.empty()) {
-                constexpr const char* names[]{"stopped", "draining", "starting", "running", "failed", "suspending", "suspended", "done"};
-                (void)libk::fmt::format_to<"{} {}\n">(console, service.name, names[std::min(service.state, 7U)]);
-            } else if (target == service.name) {
-                const auto action = verb == "start" ? mg_action::Start : verb == "stop" ? mg_action::Stop : mg_action::Restart;
-                if (verb != "start" && verb != "stop" && verb != "restart") { error(console, STATUS_BAD_ARGS); return; }
-                request = mg_request(mg_op::Action, service.id, service.incarnation, 0, action);
-                status = rpc.exchange(request);
-                if (status == STATUS_OK) console.write("service change requested\n");
-                else error(console, status);
-                return;
+        for (const auto role : {"system", "session", "devices"}) {
+            ubus_conn manager;
+            status = manager.connect(bus, role, "myos.manager", 1, 1);
+            if (status != STATUS_OK) { error(console, status); continue; }
+            ubus_msg response;
+            status = manager.invoke("List", {}, response);
+            if (status != STATUS_OK) { error(console, status); continue; }
+            for (const auto service : response.data["items"].values()) {
+                const auto service_name = service["name"].as<std::string_view>().value_or("?");
+                if (tail.empty()) {
+                    (void)libk::fmt::format_to<"{} {}\n">(console, service_name, service["state"].as<std::string_view>().value_or("?"));
+                } else if (target == service_name) {
+                    if (verb != "start" && verb != "stop" && verb != "restart") { error(console, STATUS_BAD_ARGS); return; }
+                    ubus_msg request, result;
+                    request.data.put("id", service["id"]).put("gen", service["gen"]).put("action", verb);
+                    status = manager.invoke("Action", std::move(request), result);
+                    if (status == STATUS_OK) console.write("service change requested\n"); else error(console, status);
+                    return;
+                }
             }
         }
         if (!tail.empty()) error(console, STATUS_NOT_FOUND);
         return;
     }
     if (std::string_view{line} == "mkfs") {
-        uint8_t id[st_volume_id_size]{};
+        uint8_t id[fs_volume_id_size]{};
         const std::string_view text{argument};
         if (!text.empty()) {
             if (text.size() != 2 * sizeof(id)) {
@@ -691,18 +660,10 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
                 id[i] = *byte;
             }
         }
-        rpc_client directory, admin;
-        auto status = directory.open(control, pool);
-        auto endpoint = status == STATUS_OK
-                            ? sv_lookup(directory, st_admin)
-                            : std::expected<cap_owner, status_t>{std::unexpected(status)};
-        if (!endpoint) {
-            error(console, endpoint.error());
-            return;
-        }
-        status = admin.open(endpoint->selector(), pool);
-        if (status == STATUS_OK)
-            status = st_format(admin, text.empty() ? nullptr : id);
+        ubus_conn directory, admin;
+        auto status = directory.bind(info.selector(ubus_directory));
+        if (status == STATUS_OK) status = admin.connect(directory, "store.admin", "myos.files", 1, 1);
+        if (status == STATUS_OK) status = fs_format(admin, text.empty() ? std::span<const uint8_t>{} : std::span<const uint8_t>{id});
         if (status != STATUS_OK)
             error(console, status);
         return;
@@ -763,7 +724,7 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
 int main() {
     const auto& info = rt_startup();
     sh_session session{info};
-    str_writer{info.selector(con_output)}.write("myos native shell\n");
+    str_writer{info.selector(rt_stdout)}.write("myos native shell\n");
     session.prompt();
     for (;;) {
         command(session, session.read(), info);

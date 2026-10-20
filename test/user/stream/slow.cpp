@@ -1,6 +1,6 @@
 #include <posix.hpp>
 #include <start.hpp>
-#include <protocols/stream.hpp>
+#include <lib/stream/stream.hpp>
 #include <unistd.h>
 #include <time.h>
 #include <uapi/abi.h>
@@ -15,9 +15,7 @@ struct output {
 
 // A paced byte counter; optional LIMIT exits before EOF.
 int main(int argc, char** argv) {
-    const auto& env = rt_startup();
-    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, 0,
-        {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
+    if (const auto rc = px_init(); rc != STATUS_OK) return rc;
 
     if (argc < 2 || argc > 3) return STATUS_BAD_ARGS;
     uint64_t args[]{0, UINT64_MAX};

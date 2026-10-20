@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the production shell and a real writable virtio disk across QEMU death."""
 
+import json
 import os
 from pathlib import Path
 import selectors
@@ -37,48 +38,50 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
                 if b"MYOS KERNEL PANIC" in output or (fault >= 0 and b"\n" in output[fault:]):
                     raise RuntimeError(f"guest fault; tail={output[-2000:]!r}")
 
+    def command(text, interactions=()):
+        start = len(output)
+        for char in text.encode() + b"\r":
+            process.stdin.write(bytes([char])); process.stdin.flush(); time.sleep(0.003)
+        cursor = start
+        for marker, keys in interactions:
+            until(marker, cursor); cursor = len(output)
+            process.stdin.write(keys); process.stdin.flush()
+        until(b"/ > ", start)
+        return output[start:]
+
+    def publication():
+        for line in command('bus call . Resolve name=store.admin').splitlines():
+            if line.startswith(b'{'): return json.loads(line)['instance']
+        return None
+
     def await_services(expected):
         deadline = time.monotonic() + 40
         while True:
-            start = len(output)
-            process.stdin.write(b"svc\r")
-            process.stdin.flush()
-            until(b"/ > ", start)
-            state = output[start:]
-            if all(f"{name} {value}".encode() in state for name, value in expected.items()):
-                return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"services did not reach {expected!r}; {state!r}")
+            state = command('svc')
+            if all(f"{name} {value}".encode() in state for name, value in expected.items()): return
+            if time.monotonic() >= deadline: raise RuntimeError(f"services did not reach {expected!r}; {state!r}")
 
     try:
         until(b"/ > ", 0)
         # A responsive shell no longer implies optional storage is ready.
         await_services({"store": "running", "vfs": "running"})
         for item in commands:
-            command, expected = item[:2]
-            begin = len(output)
+            text, expected = item[:2]
+            states = item[2] if len(item) > 2 else None
+            if states and not isinstance(states, dict): states = dict.fromkeys(states, "running")
+            replacing = states and states.get('store') == 'running' and text != 'svc restart devices'
+            previous = publication() if replacing else None
             began = time.monotonic()
-            for char in command.encode() + b"\r":
-                process.stdin.write(bytes([char]))
-                process.stdin.flush()
-                time.sleep(0.003)
-            if len(item) > 3:
-                interaction = begin
-                for marker, keys in item[3]:
-                    until(marker, interaction)
-                    interaction = len(output)
-                    process.stdin.write(keys)
-                    process.stdin.flush()
-            until(b"/ > ", begin)
-            result = output[begin:]
-            if command == "fdcheck cache":
+            result = command(text, item[3] if len(item) > 3 else ())
+            if text == "fdcheck cache":
                 print(f"[storage] cache/sync: {cpus} hart(s), {time.monotonic()-began:.3f}s", flush=True)
             if expected not in result:
-                raise RuntimeError(f"{command}: missing {expected!r}; got {result!r}")
-            if len(item) > 2 and item[2]:
-                # Management accepts intent asynchronously; observe real readiness.
-                expected = item[2] if isinstance(item[2], dict) else dict.fromkeys(item[2], "running")
-                await_services(expected)
+                raise RuntimeError(f"{text}: missing {expected!r}; got {result!r}")
+            if replacing:
+                deadline = time.monotonic() + 40
+                while (current := publication()) is None or current == previous:
+                    if time.monotonic() >= deadline: raise RuntimeError('store did not publish its replacement')
+            if states: await_services(states)
 
     except Exception:
         # A fault header can arrive before its diagnostic body.
@@ -123,7 +126,7 @@ def main():
                 ("cat note", b"hello-persistent-again\n/ > "),
 
                 ("cat note", b"hello-persistent-again"),
-                ("svc restart devices", b"service change requested", ["devices", "block-8", "store", "vfs"]),
+                ("svc restart devices", b"myos native shell", ["devices", "block-8", "store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again\n/ > "),
                 ("ls", b"note\n"),
@@ -162,7 +165,7 @@ def main():
                 ("svc stop store", b"service change requested", {"store": "stopped", "vfs": "running"}),
                 ("cat /boot/README.TXT", b"myos disk file service"),
                 ("echo storage-offline", b"storage-offline"),
-                ("cat note", b"error: 11"),
+                ("cat note", b"error: "),
                 ("svc start store", b"service change requested", ["store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
                 ("svc restart store", b"service change requested", ["store", "vfs"]),

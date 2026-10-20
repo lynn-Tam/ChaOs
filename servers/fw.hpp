@@ -1,35 +1,33 @@
+#include <vm.hpp>
 #pragma once
 #include <start.hpp>
 #include <libk/fdt.hpp>
 #include <cap.hpp>
 #include <uapi/irq.h>
 
-inline auto fw_root(const rt_env& env) noexcept -> const RootInfo& {
-    if (env.boot.size() != sizeof(RootInfo) ||
-        reinterpret_cast<uintptr_t>(env.boot.data()) % alignof(RootInfo)) sys::exit(STATUS_BAD_ARGS);
-    const auto& root = *reinterpret_cast<const RootInfo*>(env.boot.data());
-    if (root.version != ROOT_VERSION || root.bytes != sizeof(root)) sys::exit(STATUS_BAD_ARGS);
-    return root;
-}
 struct fw_view {
     vm_area memory;
     libk::fdt tree;
-    static auto open(const rt_env& env, uintptr_t address = 0) noexcept -> std::expected<fw_view, status_t> {
-        const auto& root = fw_root(env);
-        if (!root.firmware || root.firmware_format != FW_FDT || root.firmware_bytes > SIZE_MAX - 8190)
+    static auto open(const rt_env& env, cap_t firmware, size_t firmware_bytes, uint32_t firmware_offset,
+                     uint32_t firmware_format, uintptr_t address = 0) noexcept -> std::expected<fw_view, status_t> {
+        if (!firmware || firmware_format != FW_FDT || firmware_bytes > SIZE_MAX - 8190)
             return std::unexpected(STATUS_BAD_ARGS);
-        const auto offset = root.firmware_offset;
-        const auto bytes = (offset + root.firmware_bytes + 4095) & ~uint64_t{4095};
-        const auto cap = sys::cap_duplicate(root.firmware, env.cspace, RIGHT_MAP);
+        const auto offset = firmware_offset;
+        const auto bytes = (offset + firmware_bytes + 4095) & ~uint64_t{4095};
+        const auto cap = sys::cap_duplicate(firmware, env.cspace, RIGHT_MAP);
         if (cap.status != STATUS_OK) return std::unexpected(cap.status);
-        auto memory = vm_area::map(env.vspace, cap_owner{cap.value}, address, bytes, VM_READ);
+        auto memory = vm_area::map(rt_vm(), cap_owner{cap.value}, address, bytes, VM_READ);
         if (!memory) return std::unexpected(memory.error());
         const auto tree = libk::fdt::open(std::span{
-            reinterpret_cast<const uint8_t*>(memory->address + offset), size_t(root.firmware_bytes)});
+            reinterpret_cast<const uint8_t*>(memory->address + offset), size_t(firmware_bytes)});
         if (!tree) return std::unexpected(STATUS_BAD_ARGS);
         return fw_view{std::move(*memory), *tree};
     }
-    auto irq(const rt_env& env) const noexcept -> std::expected<cap_owner, status_t> {
+    static auto open(const rt_env& env, uintptr_t address = 0) noexcept -> std::expected<fw_view, status_t> {
+        const auto& root = rt_root();
+        return open(env, root.firmware, root.firmware_bytes, root.firmware_offset, root.firmware_format, address);
+    }
+    auto irq(const rt_env& env, cap_t physical, uint64_t boot_hart) const noexcept -> std::expected<cap_owner, status_t> {
         const auto plic = tree.find("sifive,plic-1.0.0");
         if (!plic) return std::unexpected(STATUS_NOT_FOUND);
         const auto pr = tree.reg(*plic);
@@ -52,21 +50,24 @@ struct fw_view {
             libk::byte_reader cr{reg->data(), reg->size()};
             uint64_t hart;
             if (!libk::fdt::read_cells(cr, reg->size() / 4, hart)) return std::unexpected(STATUS_BAD_ARGS);
-            if (hart == fw_root(env).boot_hart && interrupt == 9) {
+            if (hart == boot_hart && interrupt == 9) {
                 if (context) return std::unexpected(STATUS_BAD_ARGS);
                 context = index;
             }
         }
-        auto config = vm_area::create(env.alloc(), env.vspace, 0, 4096);
+        auto config = vm_area::create(env.alloc(), rt_vm(), 0, 4096);
         if (!config) return std::unexpected(config.error());
         if (!context) return std::unexpected(STATUS_BAD_ARGS);
         const auto* data = std::construct_at(reinterpret_cast<IrqConfig*>(config->address),
             IRQ_PLIC, *count, pr->address, pr->size, *context, 0U, 0U);
         (void)data;
-        const auto control = sys::irq_controller_create(env.alloc(), fw_root(env).physical,
+        const auto control = sys::irq_controller_create(env.alloc(), physical,
                                                        config->memory.selector());
         if (control.status != STATUS_OK) return std::unexpected(control.status);
         return cap_owner{control.value};
+    }
+    auto irq(const rt_env& env) const noexcept -> std::expected<cap_owner, status_t> {
+        return irq(env, rt_root().physical, rt_root().boot_hart);
     }
 };
 
@@ -74,7 +75,7 @@ struct fw_view {
 struct fw_console {
     cap_owner memory, irq;
     size_t offset{};
-    static auto open(const rt_env& env, const libk::fdt& tree, cap_t controller) noexcept
+    static auto open(const rt_env& env, const libk::fdt& tree, cap_t controller, cap_t physical) noexcept
         -> std::expected<fw_console, status_t> {
         const auto chosen = tree.child(tree.root(), "chosen");
         const auto property = chosen ? tree.property(*chosen, "stdout-path") : std::nullopt;
@@ -99,10 +100,13 @@ struct fw_console {
         result.offset = ur->address % 4096;
         if (ur->size > SIZE_MAX - result.offset - 4095) return std::unexpected(STATUS_BAD_ARGS);
         const auto bytes = (result.offset + ur->size + 4095) & ~size_t{4095};
-        const auto mem = sys::memory_create_physical(env.alloc(), fw_root(env).physical,
+        const auto mem = sys::memory_create_physical(env.alloc(), physical,
                                       ur->address - result.offset, bytes, VM_READ | VM_WRITE);
         if (mem.status != STATUS_OK) return std::unexpected(mem.status);
         result.memory = cap_owner{mem.value};
         return result;
     }
+    static auto open(const rt_env& env, const libk::fdt& tree, cap_t controller) noexcept
+        -> std::expected<fw_console, status_t> { return open(env, tree, controller, rt_root().physical); }
+
 };

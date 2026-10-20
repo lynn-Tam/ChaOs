@@ -1,3 +1,5 @@
+#include <libk/noncopyable.hpp>
+#include <vm.hpp>
 #pragma once
 #include <string.h>
 
@@ -5,7 +7,7 @@
 
 
 #include <optional>
-#include <protocols/queue.hpp>
+#include <lib/io/io.hpp>
 #include <cap.hpp>
 #include <ipc.hpp>
 #include <servers/devices.hpp>
@@ -44,7 +46,7 @@ public:
             const auto reg = sys::cap_duplicate(binding->cap, info.cspace, RIGHT_MAP);
             if (reg.status != STATUS_OK) return reg.status;
             sizes_[i] = binding->bytes;
-            auto mapped = vm_area::map(info.vspace, cap_owner{reg.value}, 0,
+            auto mapped = vm_area::map(rt_vm(), cap_owner{reg.value}, 0,
                 (binding->bytes + 4095) & ~size_t{4095}, i == 6 ? VM_READ : VM_READ | VM_WRITE);
             if (!mapped) return mapped.error();
             regs_[i] = std::move(*mapped);
@@ -248,7 +250,7 @@ private:
         headers_ = (used_offset_ + 6 + queue_size_ * 8 + 4095) & ~size_t{4095};
         data_ = (headers_ + depth_ * 32 + 4095) & ~size_t{4095};
         const auto bytes = data_ + depth_ * MaxTransfer;
-        auto arena = vm_area::create(info.alloc(), info.vspace, 0, bytes);
+        auto arena = vm_area::create(info.alloc(), rt_vm(), 0, bytes);
         if (!arena) return arena.error();
         arena_ = std::move(*arena);
         const auto mapping = io_call(info.alloc(), space_.selector(), IO_OP_MAP,

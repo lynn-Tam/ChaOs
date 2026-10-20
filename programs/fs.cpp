@@ -1,9 +1,8 @@
-#include <protocols/msg.hpp>
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
-#include <protocols/file.hpp>
-#include <protocols/stream.hpp>
+#include <lib/fs/fs.hpp>
+#include <lib/stream/stream.hpp>
 #include <dirent.h>
 #include <unistd.h>
 #include <libk/fmt.hpp>
@@ -34,7 +33,7 @@ static int make_dir(const std::string& path, bool parents) {
     auto make = [parents](const char* name) {
         const int status = px_mkdir(name);
         // Existing directories also succeed on a read-only mount with -p.
-        if (parents && (status == file_exists || status == STATUS_DENIED)) {
+        if (parents && (status == fs_exists || status == STATUS_DENIED)) {
             auto* dir = opendir(name);
             return dir ? closedir(dir) : -1;
         }
@@ -49,9 +48,10 @@ static int remove_path(std::string_view path, bool recursive, bool force) {
     if (path.empty()) return force ? 0 : -ENOENT;
     while (path.size() > 1 && path.ends_with('/')) path.remove_suffix(1);
     const auto name = path.substr(path.find_last_of('/') + 1);
-    char base[sizeof(msg_frame::data) + 1];
-    if (!getcwd(base, sizeof(base))) return -errno;
-    const auto absolute = fl_path(path, base);
+    auto* base = getcwd(nullptr, 0);
+    if (!base) return -errno;
+    const auto absolute = fs_path(path, base);
+    free(base);
     if (recursive && (absolute == "/" || name == "." || name == "..")) return -EINVAL;
     struct entry { std::string path; bool visited{}; };
     std::vector<entry> pending{{absolute}};
@@ -81,10 +81,7 @@ static int remove_path(std::string_view path, bool recursive, bool force) {
 
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
-    auto directory = env.selector(vfs_service);
-    if (!directory) directory = env.selector(vfs_read);
-    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, directory,
-        {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
+    if (const auto rc = px_init(); rc != STATUS_OK) return rc;
 
     std::string_view command = argv[0];
     command.remove_prefix(command.find_last_of('/') + 1);
@@ -148,11 +145,12 @@ int main(int argc, char** argv) {
     if (command == "sync" && argc == 2) return px_sync();
     if ((command == "device" || command == "volid") && argc == 2) {
         uint8_t id[20]{};
-        rpc_client service;
-        auto status = service.open(directory, env.alloc());
+        ubus_conn bus, service;
+        auto status = bus.bind(env.selector(ubus_directory));
+        if (status == STATUS_OK) status = service.connect(bus, "files", "myos.files", 1, 1);
         if (status == STATUS_OK) {
-            if (command == "device") status = st_device_id(service, id);
-            else { uint8_t volume[16]{}; status = st_volume_id(service, volume); std::copy_n(volume, 16, id); }
+            if (command == "device") status = fs_id(service, "DeviceId", id);
+            else { uint8_t volume[16]{}; status = fs_id(service, "VolumeId", volume); std::copy_n(volume, 16, id); }
         }
         if (status) return status;
         constexpr char digits[] = "0123456789abcdef";

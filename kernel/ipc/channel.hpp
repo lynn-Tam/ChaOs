@@ -68,6 +68,7 @@ private:
     struct Message final : private libk::noncopyable {
         libk::intrusive_list_hook hook{};
         ChannelSide destination{ChannelSide::A};
+        bool called{};
         u64 transaction{};
         u64 tag{};
         u64 sender_badge{};
@@ -184,7 +185,7 @@ private:
     void release_message(Message& message) noexcept;
     void clear_queues() noexcept;
     [[nodiscard]] auto send_caps(cap::Resolved<Channel>&, cap::CSpace&, const ChanMsg&, cap::Capability* = nullptr) noexcept -> std::expected<u64, ChannelError>;
-    [[nodiscard]] auto enqueue(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>) noexcept -> std::expected<u64, ChannelError>;
+    [[nodiscard]] auto enqueue(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>, bool called) noexcept -> std::expected<u64, ChannelError>;
     auto reply(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>) noexcept -> std::expected<u64, ChannelError>;
     auto complete(u64 token, ChannelError, bool discard = false) noexcept -> bool;
     static void abandon(cap::Capability::Facet&) noexcept;

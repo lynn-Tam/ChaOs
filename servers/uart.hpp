@@ -1,3 +1,4 @@
+#include <start.hpp>
 #pragma once
 
 #include <libk/fmt.hpp>
@@ -107,3 +108,6 @@ private:
 
     volatile uint8_t* base_{};
 };
+
+inline constexpr rt_key uart_mem{"uart.memory", ObjMem};
+inline constexpr rt_key uart_irq{"uart.irq", ObjIrq};

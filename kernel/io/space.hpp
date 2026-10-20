@@ -124,6 +124,8 @@ private:
     auto disconnected() noexcept -> Source::Publication;
     void progress() noexcept;
     void advance() noexcept;
+    void complete() noexcept;
+    void close() noexcept; // Caller holds lock_; propagates the one close transition.
     void post() noexcept { work_.post(job_); }
     void invalidated() noexcept;
     cap::Authority<2> authority_{Source::Action::bind<&Iommu::invalidated>(*this), Source::Action::bind<&Iommu::post>(*this)};

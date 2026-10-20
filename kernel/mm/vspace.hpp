@@ -7,6 +7,7 @@
 #include <cap/cap.hpp>
 #include <cap/grant.hpp>
 #include <expected>
+#include <type_traits>
 #include <libk/assert.hpp>
 #include <libk/delegate.hpp>
 #include <libk/intrusive_list.hpp>
@@ -89,10 +90,15 @@ class View final {
         libk::unique_handle<Borrow*, Drop> h_;
         explicit Access(Borrow& borrow) noexcept : h_(&borrow) {}
         auto copy(usize offset, std::span<byte>, bool write) const noexcept -> bool;
+        auto region(usize offset, usize size, Perm) const noexcept -> std::span<byte>;
     public:
         Access(Access&&) noexcept = default;
         auto operator=(Access&&) noexcept -> Access& = default;
-        auto bytes(usize offset, usize size) const noexcept -> std::span<const byte>;
+        template<Perm Mode = Perm::Read>
+        auto bytes(usize offset, usize size) const noexcept -> std::span<std::conditional_t<Mode == Perm::Write, byte, const byte>> {
+            static_assert(Mode == Perm::Read || Mode == Perm::Write);
+            return region(offset, size, Mode);
+        }
         auto read(usize offset, std::span<byte> output) const noexcept -> bool { return copy(offset, output, false); }
         auto write(usize offset, std::span<const byte> input) const noexcept -> bool {
             return copy(offset, {const_cast<byte*>(input.data()), input.size()}, true);

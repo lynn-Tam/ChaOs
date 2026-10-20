@@ -1,10 +1,11 @@
+#include <libk/noncopyable.hpp>
 #pragma once
-#include <protocols/msg.hpp>
+#include <lib/io/io.hpp>
 
 #include <expected>
 
 #include <third_party/littlefs/lfs.h>
-#include <protocols/file.hpp>
+#include <lib/fs/fs.hpp>
 // One aligned device read and the file bytes within it.
 struct io_extent final {
     uint64_t offset{};
@@ -16,15 +17,17 @@ struct io_extent final {
 // until completion is taken; dependent operations wait for overlapping writes.
 class blk_client final : private libk::noncopyable_nonmovable {
   public:
-    [[nodiscard]] auto connect(cap_t directory, CreateAuth pool, cap_t cspace, cap_t events,
-                               cap_t vspace, uintptr_t address) noexcept -> status_t {
-        return session_.connect(directory, pool, cspace, events, vspace, address, capacity_, true);
+    [[nodiscard]] auto connect(ubus_conn& directory) -> status_t {
+        ubus_msg response;
+        const auto status = directory.invoke("Open", {}, response);
+        if (status != STATUS_OK) return status;
+        return session_.open(response.take(response.data["handle"]), true, &capacity_);
     }
     [[nodiscard]] auto capacity() const noexcept -> uint64_t { return capacity_; }
 
     [[nodiscard]] auto submit(io_cmd& request, void* data = nullptr) noexcept -> status_t {
-        const auto op = static_cast<io_operation>(request.operation);
-        if (request.flags || (request.length && !data && op != io_operation::Read))
+        const auto op = request.operation;
+        if (request.sequential || (request.length && !data && op != io_operation::Read))
             return STATUS_BAD_ARGS;
         if (op == io_operation::Flush) {
             if (request.offset || request.length)
@@ -42,15 +45,13 @@ class blk_client final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto completion(io_done& result, uint64_t id = 0) noexcept -> status_t {
         return session_.completion(result, id);
     }
-    [[nodiscard]] auto payload() const noexcept -> const uint8_t* { return session_.payload(); }
+    [[nodiscard]] auto copy(uint64_t offset, std::span<std::byte> output) const -> status_t { return session_.copy(offset, output); }
+    [[nodiscard]] auto error() -> status_t { return session_.error(); }
     [[nodiscard]] auto wait(io_done& result, uint64_t id = 0) noexcept -> status_t {
         return session_.wait(result, id);
     }
     [[nodiscard]] auto cancel(uint64_t id) noexcept -> status_t {
-        if (session_.requests().error())
-            return session_.requests().error();
-        msg_frame request{.operation = static_cast<uint64_t>(io_control::Cancel), .value = id};
-        return session_.exchange(request);
+        return session_.cancel(id);
     }
     // Retire a specific dependency without consuming unrelated completions.
     [[nodiscard]] auto wait(uint64_t id) noexcept -> status_t {
@@ -60,11 +61,11 @@ class blk_client final : private libk::noncopyable_nonmovable {
     }
     // Read results belong to their reader; barriers retire only filesystem writes.
     [[nodiscard]] auto drain_writes() noexcept -> status_t {
-        auto status = session_.requests().error();
+        auto status = session_.error();
         uint64_t after{};
-        while (const auto* request = session_.requests().next(after)) {
+        while (const auto* request = session_.next(after)) {
             after = request->id;
-            if (request->operation != static_cast<uint64_t>(io_operation::Write))
+            if (request->operation != io_operation::Write)
                 continue;
             const auto result = wait(after);
             if (status == STATUS_OK)
@@ -74,16 +75,16 @@ class blk_client final : private libk::noncopyable_nonmovable {
     }
     [[nodiscard]] auto dependencies(uint64_t offset, size_t size) noexcept -> status_t {
         uint64_t after{};
-        while (const auto* request = session_.requests().next(after)) {
+        while (const auto* request = session_.next(after)) {
             after = request->id;
-            if (request->operation == static_cast<uint64_t>(io_operation::Write) &&
+            if (request->operation == io_operation::Write &&
                 request->offset < offset + size && offset < request->offset + request->length) {
                 const auto status = wait(after);
                 if (status != STATUS_OK)
                     return status;
             }
         }
-        return session_.requests().error();
+        return session_.error();
     }
     [[nodiscard]] auto read(uint64_t offset, uint8_t* data, size_t size) noexcept -> status_t {
         if ((!data && size) || size % 512 || offset % 512 || offset > capacity_ ||
@@ -115,7 +116,7 @@ class blk_client final : private libk::noncopyable_nonmovable {
   private:
     [[nodiscard]] auto command(io_operation op, uint64_t offset, void* data, size_t size) noexcept
         -> status_t {
-        io_cmd request{.operation = static_cast<uint64_t>(op), .offset = offset, .length = size};
+        io_cmd request{.operation = op, .offset = offset, .length = size};
         const auto status = submit(request, data);
         return status == STATUS_OK ? wait(request.id) : status;
     }
@@ -182,7 +183,7 @@ class st_vol final : private libk::noncopyable_nonmovable {
             return status(mounted);
         if (id == nullptr)
             return STATUS_OK;
-        const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, st_volume_id_size);
+        const int written = lfs_setattr(&fs_, "/", IdentityAttribute, id, fs_volume_id_size);
         if (written < 0)
             return error(written);
         const auto synced = backend_->flush();
@@ -193,7 +194,7 @@ class st_vol final : private libk::noncopyable_nonmovable {
         return synced;
     }
 
-    [[nodiscard]] auto identity(uint8_t (&id)[st_volume_id_size]) noexcept -> status_t {
+    [[nodiscard]] auto identity(uint8_t (&id)[fs_volume_id_size]) noexcept -> status_t {
         if (!mounted_)
             return STATUS_BACKING_FAILED;
         const auto size = lfs_getattr(&fs_, "/", IdentityAttribute, id, sizeof(id));
@@ -237,24 +238,24 @@ class st_vol final : private libk::noncopyable_nonmovable {
         case LFS_ERR_NOENT:
             return STATUS_NOT_FOUND;
         case LFS_ERR_NOSPC:
-            return file_no_space;
+            return fs_no_space;
         case LFS_ERR_NOMEM:
             return STATUS_NO_MEMORY;
         case LFS_ERR_EXIST:
-            return file_exists;
+            return fs_exists;
         case LFS_ERR_INVAL:
         case LFS_ERR_BADF:
             return STATUS_BAD_ARGS;
         case LFS_ERR_NAMETOOLONG:
-            return file_name_long;
+            return fs_name_long;
         case LFS_ERR_FBIG:
-            return file_too_large;
+            return fs_too_large;
         case LFS_ERR_ISDIR:
-            return file_is_dir;
+            return fs_is_dir;
         case LFS_ERR_NOTDIR:
-            return file_not_dir;
+            return fs_not_dir;
         case LFS_ERR_NOTEMPTY:
-            return file_not_empty;
+            return fs_not_empty;
         default:
             return STATUS_BACKING_FAILED;
         }
@@ -280,7 +281,7 @@ class st_vol final : private libk::noncopyable_nonmovable {
         const auto dependency = backend_->dependencies(offset, size);
         if (dependency != STATUS_OK)
             return dependency;
-        io_cmd request{.operation = static_cast<uint64_t>(io_operation::Write),
+        io_cmd request{.operation = io_operation::Write,
                        .offset = offset,
                        .length = size};
         for (;;) {

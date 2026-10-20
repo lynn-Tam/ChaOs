@@ -491,7 +491,7 @@ static auto publish_memory(Call& inv, cap::Resolved<resource::Account>& pool, us
     auto fee = reserve(pool, object::pool<mm::Mem>::slot_charge());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<mm::Mem>(inv, std::move(*fee), inv.cpu.objects.pmm(), size,
-                                                       std::move(config), inv.target->payer());
+                                                       std::move(config));
     if (!object) return returned(mem_status(object.error()));
     const cap::MemLimit data{{0, object->get().page_count()}, access};
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,

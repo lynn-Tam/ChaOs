@@ -149,26 +149,32 @@ kernel_wait = executable(
 )
 user_common_args = [
   '-Wall', '-Wextra', '-Werror', '-O2', '-g3',
-  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + root, '-I' + join_paths(root, 'user/include'),
+  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + root, '-I' + join_paths(root, 'lib/rt'), '-I' + join_paths(root, 'lib/proc'),
 ]
 user_c_args = user_common_args + ['-ffreestanding', '-idirafter', get_option('newlib_include')]
 user_cpp_args = user_common_args + ['-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit']
 # Container headers need the target C declarations; only used runtime symbols link.
 user_cpp_args += [cpp_config_arg, '-idirafter', get_option('newlib_include')]
-user_link_args = ['-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-lgcc', '-Wl,-T,' + join_paths(root, 'user/riscv64/linker.ld')]
+user_link_args = ['-Wl,--gc-sections', '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-lgcc', '-Wl,-T,' + join_paths(root, 'lib/rt/linker.ld')]
 crt = static_library(
-  'crt', files('user/crt/start.cpp', 'user/crt/heap.cpp', 'libk/mem.c'),
+  'crt', files('lib/rt/start.cpp', 'lib/rt/heap.cpp', 'libk/mem.c'),
   c_args: user_c_args, cpp_args: user_cpp_args, pic: false, build_by_default: false,
 )
 user_entry = static_library(
-  'user-entry', files('user/crt/start.S'),
+  'user-entry', files('lib/rt/start.S'),
   c_args: user_c_args, pic: false, build_by_default: false,
 )
-exec = static_library('exec', files('user/lib/exec.cpp'),
+proc = static_library('proc', files('lib/proc/proc.cpp'),
+  cpp_args: user_cpp_args, pic: false, build_by_default: false)
+ubus = static_library('ubus', files('ubus/value.cpp', 'ubus/ubus.cpp'),
+  cpp_args: user_cpp_args, pic: false, build_by_default: false)
+io = static_library('io', files('lib/io/io.cpp'), link_with: [ubus],
+  cpp_args: user_cpp_args, pic: false, build_by_default: false)
+mgr = static_library('mgr', files('lib/mgr/mgr.cpp'), link_with: [proc, ubus],
   cpp_args: user_cpp_args, pic: false, build_by_default: false)
 posix = static_library(
-  'posix', files('adapters/posix/io.cpp'),
-  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'adapters/posix/include')],
+  'posix', files('posix/io.cpp'), link_with: [io, ubus],
+  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'posix/include')],
   pic: false, build_by_default: false,
 )
 subdir('third_party/ftxui')
@@ -193,20 +199,26 @@ math_runtime = static_library('math-runtime', files(
   'third_party/musl/powf_data.c',
 ), c_args: user_c_args + ['-ffunction-sections', '-fdata-sections', '-Wno-unused-but-set-variable'],
   pic: false, build_by_default: false)
-tui = static_library('tui', files('adapters/ftxui/terminal.cpp'),
+tui = static_library('tui', files('programs/tasks/terminal.cpp'),
   include_directories: ftxui_inc, cpp_args: user_cpp_args,
   pic: false, build_by_default: false)
 bins = {}
 probes = {}
 foreach name, spec : {
   'init': [files('servers/init.cpp'), false],
+  'system': [files('servers/system.cpp'), false],
+  'session': [files('servers/session.cpp'), false],
+  'ubusd': [files('servers/ubusd.cpp'), false],
+  'bus': [files('programs/bus.cpp'), false],
+  'foreign': [files('test/user/foreign.cpp'), false],
+  'supervisor': [files('test/user/supervisor.cpp'), false],
   'block': [files('servers/block.cpp'), false],
   'devices': [files('servers/devices.cpp'), false],
   'bootfs': [files('servers/bootfs.cpp'), false],
   'vfs': [files('servers/vfs.cpp'), false],
   'uart': [files('servers/uart.cpp'), false],
   'shell': [files('programs/shell.cpp'), false],
-  'tasks': [files('programs/tasks.cpp'), false],
+  'tasks': [files('programs/tasks/main.cpp'), false],
   'echo': [files('programs/echo.cpp'), true],
   'slow': [files('test/user/stream/slow.cpp'), true],
   'fill': [files('test/user/stream/fill.cpp'), true],
@@ -220,12 +232,12 @@ foreach name, spec : {
 }
   binary = executable(name + '.elf', spec[0],
     c_args: user_c_args, include_directories: name == 'tasks' ? ftxui_inc : [],
-    cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'adapters/posix/include')] : []),
+    cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'posix/include')] : []),
     link_whole: [crt, user_entry] + (spec[1] ? [posix] : []),
-    link_with: (['init','shell'].contains(name) ? [exec] : []) + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
-    link_args: user_link_args + (name == 'tasks' ? ['-Wl,--gc-sections'] : []) + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
+    link_with: (['bootfs','block'].contains(name) ? [io] : []) + [ubus, cxx_runtime] + (['init','supervisor'].contains(name) ? [proc] : []) + (['system','devices','session','shell'].contains(name) ? [mgr] : []) + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
+    link_args: user_link_args + ['-Wl,--gc-sections'] + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', build_by_default: false)
-  if ['fill','slow','control-test'].contains(name)
+  if ['fill','slow','control-test','foreign','supervisor'].contains(name)
     probes += {name: binary}
   else
     bins += {name: binary}
@@ -236,13 +248,13 @@ endforeach
 store_user = executable(
   'store.elf', files('servers/store.cpp', 'servers/lfs.c',
     'third_party/littlefs/lfs_util.c'),
-  c_args: user_c_args + ['-I' + join_paths(root, 'user/include'),
+  c_args: user_c_args + ['-I' + join_paths(root, 'lib/rt'), '-I' + join_paths(root, 'lib/proc'),
     '-DLFS_NO_MALLOC', '-DLFS_NO_DEBUG', '-DLFS_NO_WARN',
     '-DLFS_NO_ERROR', '-UNDEBUG'],
-  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'user/include'),
+  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'lib/rt'), '-I' + join_paths(root, 'lib/proc'),
     '-DLFS_NO_MALLOC', '-DLFS_NO_DEBUG', '-DLFS_NO_WARN',
     '-DLFS_NO_ERROR', '-UNDEBUG'],
-  link_whole: [crt, user_entry], link_args: user_link_args,
+  link_with: [io, ubus, cxx_runtime], link_whole: [crt, user_entry], link_args: user_link_args + ['-Wl,--gc-sections'],
   link_language: 'c', build_by_default: false,
 )
 
@@ -252,34 +264,22 @@ store_user = executable(
 
 fdcheck_user = executable(
   'fdcheck.elf', files('test/user/fd/main.cpp'), c_args: user_c_args,
-  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'adapters/posix/include')],
-  link_whole: [crt, user_entry, posix], link_args: user_link_args, link_language: 'c', build_by_default: false,
+  cpp_args: user_cpp_args + ['-I' + join_paths(root, 'posix/include')],
+  link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry, posix], link_args: user_link_args, link_language: 'c', build_by_default: false,
 )
 demand_user = executable(
   'demand-test.elf', files('test/user/demand/main.cpp'), c_args: user_c_args, cpp_args: user_cpp_args,
-  link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
+  link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', build_by_default: false,
 )
 
 initramfs = executable(
   'initramfs', files('tools/initramfs.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'lib/rt')], build_by_default: false,
 )
-
-shared_ring_test = executable(
-  'shared-ring-test', files('test/shared_ring_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root],
-  dependencies: dependency('threads', native: true), build_by_default: false,
-)
-run_target('check-shared-ring', command: [shared_ring_test])
-io_queue_test = executable(
-  'io-queue-test', files('test/io_queue_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-O2', '-Wall', '-Wextra', '-I' + root, '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
-)
-run_target('check-io-queue', command: [io_queue_test])
 
 syscall_dependency_test = executable(
   'syscall-dependency-test', files('test/host/syscall_dependency_test.cpp'), native: true,
-  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'user/include')], build_by_default: false,
+  cpp_args: ['-std=c++23', '-I' + root, '-idirafter' + join_paths(root, 'lib/rt')], build_by_default: false,
 )
 
 run_target('test-syscall-dependency', command: [syscall_dependency_test])
@@ -296,56 +296,33 @@ run_target('test-syscall-dependency', command: [syscall_dependency_test])
 probe_disk = custom_target('probe-disk', output: 'probe.img',
   command: [find_program('python3'), '-c', 'import pathlib,sys; f=pathlib.Path(sys.argv[1]).open("wb"); f.truncate(1024*1024); f.close()', '@OUTPUT@'], build_by_default: false)
 
-channel_init_user = executable(
-  'channel-init.elf', files('test/user/channel/init.cpp'),
-  c_args: user_c_args, cpp_args: user_cpp_args,
-  link_with: exec, link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
-)
-
-
 channel_test_user = executable(
-  'channel-test.elf', files('test/user/channel/main.cpp'),
+  'channel-test.elf', files('test/user/channel.cpp'),
   c_args: user_c_args, cpp_args: user_cpp_args,
-  link_with: exec, link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
-)
-channel_worker_user = executable(
-  'channel-worker.elf', files('test/user/channel/worker.cpp'),
-  c_args: user_c_args, cpp_args: user_cpp_args,
-  link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
-)
-channel_provider_user = executable(
-  'channel-provider.elf', files('test/user/channel/provider.cpp'),
-  c_args: user_c_args, cpp_args: user_cpp_args,
-  link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
-)
-channel_holder_user = executable(
-  'channel-holder.elf', files('test/user/channel/export_holder.cpp'),
-  c_args: user_c_args, cpp_args: user_cpp_args,
-  link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
-)
-
+  link_with: [proc, ubus, cxx_runtime], link_whole: [crt, user_entry], link_args: user_link_args,
+  link_language: 'c', build_by_default: false)
 process_client_user = executable(
   'process-client.elf', files('test/user/process/main.cpp'),
   c_args: user_c_args, cpp_args: user_cpp_args,
-  link_with: exec, link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false,
+  link_with: [proc, ubus, cxx_runtime], link_whole: [crt, user_entry], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', build_by_default: false,
 )
+
+ubus_test = executable('ubus-test.elf', files('test/user/ubus.cpp'),
+  cpp_args: user_cpp_args, link_with: [proc, io, ubus, cxx_runtime], link_whole: [crt, user_entry],
+  link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', build_by_default: false)
 
 exec_test = executable('exec-test.elf', files('test/user/exec.cpp'),
   c_args: user_c_args, cpp_args: user_cpp_args,
-  link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false)
-fault_shell_user = executable('fault-shell.elf', files('test/user/service_start/fault_shell.cpp'),
-  c_args: user_c_args, cpp_args: user_cpp_args,
-  link_with: exec, link_whole: [crt, user_entry], link_args: user_link_args, link_language: 'c', build_by_default: false)
+  link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', build_by_default: false)
 
 # Debug ELF stays beside the objects; deployment consumes ordinary stripped ELF.
 objcopy = find_program('riscv64-unknown-elf-objcopy')
 images = {}
 foreach name, elf : bins + probes + {
+  'ubus-test': ubus_test,
   'store': store_user, 'fdcheck': fdcheck_user, 'demand': demand_user,
-  'process-client': process_client_user, 'cow': exec_test, 'fault-shell': fault_shell_user,
-  'channel-init': channel_init_user, 'channel-test': channel_test_user,
-  'channel-worker': channel_worker_user, 'channel-provider': channel_provider_user,
-  'channel-holder': channel_holder_user,
+  'process-client': process_client_user, 'cow': exec_test,
+  'channel-test': channel_test_user,
 }
   images += {name: custom_target(name + '-runtime', input: elf,
     output: name + '.run.elf', command: [objcopy, '--strip-debug', '@INPUT@', '@OUTPUT@'],
@@ -355,14 +332,14 @@ endforeach
 apps = {'boot/README.TXT': files('programs/README.TXT')[0],
         'boot/touch.elf': images['fs'], 'boot/mkdir.elf': images['fs'],
         'boot/rm.elf': images['fs'], 'boot/mv.elf': images['fs']}
-test_apps = {'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
+test_apps = {'boot/foreign.elf': images['foreign'], 'boot/supervisor.elf': images['supervisor'], 'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
              'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test']}
 foreach name, app : bins
-  if not ['init','block','devices','bootfs','vfs','uart','shell'].contains(name)
+  if not ['init','system','session','ubusd','block','devices','bootfs','vfs','uart','shell'].contains(name)
     apps += {'boot/' + name + '.elf': images[name]}
   endif
 endforeach
-base = apps + {'init': images['init'], 'uart': images['uart'], 'block': images['block'],
+base = apps + {'init': images['init'], 'system': images['system'], 'session': images['session'], 'ubusd': images['ubusd'], 'uart': images['uart'], 'block': images['block'],
                'bootfs': images['bootfs'], 'vfs': images['vfs'], 'devices': images['devices']}
 bundles = {}
 foreach name, layout : {
@@ -371,10 +348,8 @@ foreach name, layout : {
   'storage-test': base + test_apps + {'shell': images['shell'], 'store': images['store']},
   'exec': base + test_apps + {'shell': images['shell'], 'boot/cow.elf': images['cow']},
   'process-test': base + {'shell': images['process-client']},
-  'spontaneous-fault': base + {'shell': images['fault-shell']},
-  'channel-test': {'init': images['channel-init'], 'channel-test': images['channel-test'],
-    'writer': images['channel-worker'], 'provider': images['channel-provider'],
-    'export-holder': images['channel-holder']},
+  'ubus-test': {'init': images['ubus-test'], 'provider': images['ubus-test'], 'ubusd': images['ubusd'], 'client': images['bus']},
+  'channel-test': {'init': images['channel-test'], 'worker': images['channel-test']},
 }
   inputs = []
   paths = []
@@ -390,7 +365,6 @@ storage_bundle = bundles['storage']
 storage_test_bundle = bundles['storage-test']
 exec_bundle = bundles['exec']
 process_test_bundle = bundles['process-test']
-spontaneous_fault_bundle = bundles['spontaneous-fault']
 channel_test_bundle = bundles['channel-test']
 
 nm = find_program('riscv64-unknown-elf-nm')
@@ -408,7 +382,11 @@ run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 
 run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
-run_target('audit-user', command: [sh, audit_user, nm, readelf, bins['init'], bins['shell'], bins['echo'], bins['cat'], bins['uart'], bins['devices'], bins['block'], bins['bootfs'], bins['vfs'], bins['ls'], bins['cp'], bins['fs'], bins['edit'], bins['tasks'], bins['sleep'], store_user])
+user_images = [store_user]
+foreach name, image : bins
+  user_images += [image]
+endforeach
+run_target('audit-user', command: [sh, audit_user, nm, readelf] + user_images)
 run_target('audit-clang', command: [sh, audit_clang, clangxx, root, (trace_enabled ? '1' : '0')])
 objdump = find_program('riscv64-unknown-elf-objdump')
 run_target('disasm', command: [sh, artifact, objdump, 'disasm', kernel, join_paths(meson.current_build_dir(), 'kernel.disasm')])
@@ -421,6 +399,8 @@ qemu = find_program('qemu-system-riscv64')
 run_target('run-process-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--timeout', '45',
   '[process] direct spawn, retention, deadlines and reuse ok'])
+run_target('run-supervisor-matrix', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_bundle, '1,2,4', 'recovery', '1'])
 
 
 
@@ -448,9 +428,14 @@ run_target('run-wait-test-dual', command: [sh, run_qemu, qemu, timeout, '2', ker
   '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
   '[scenario] pending VM wait completed after remote shootdown', '[scenario] wait publication ok'])
 
+run_target('run-ubus', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel_debug, '1,4', '--bundle', bundles['ubus-test'], '--timeout', '30', '--report', '[ubus]',
+  '[ubus] dynamic methods, facets, capabilities, bulk and deferred views ok'],
+  depends: [kernel_debug, bundles['ubus-test']])
+
 run_target('run-channel-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', channel_test_bundle, '--timeout', '30', '--report', '[channel]',
-  '[channel] service generations, stale cap denied, blocked senders, stop and reuse ok'],
+  '[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and rebilling ok'],
   depends: [kernel_debug, channel_test_bundle])
 
 

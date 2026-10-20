@@ -278,11 +278,14 @@ bool test_semantic_map_protect_and_arbitrary_unmap(
     }
     auto resident = fixture.space().fault(fixture.context(), mm::va_t{0x21000}, mm::Perm::Read);
     if (!resident || resident->kind != mm::FaultKind::Ready) return false;
+    auto hole = settled(fixture.space(), fixture.space().unmap(fixture.context(), middle));
+    if (!hole) return false;
     auto unmapped = settled(fixture.space(), fixture.space().unmap(
         fixture.context(), whole));
+    auto repeated = settled(fixture.space(), fixture.space().unmap(fixture.context(), whole));
     auto absent = fixture.space().fault(
         fixture.context(), mm::va_t{0x22000}, mm::Perm::Read);
-    return unmapped && unmapped.value() == mm::VmStatus::Complete
+    return repeated && unmapped && unmapped.value() == mm::VmStatus::Complete
         && absent && absent.value().kind == mm::FaultKind::NoMapping;
 }
 

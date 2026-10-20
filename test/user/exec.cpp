@@ -1,4 +1,4 @@
-#include <protocols/stream.hpp>
+#include <lib/stream/stream.hpp>
 #include <array>
 
 alignas(4096) static std::array<uint8_t, 8193> data = [] {

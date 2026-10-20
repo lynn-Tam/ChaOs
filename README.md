@@ -13,7 +13,8 @@ Implemented or under active development:
 - RV64 boot, SMP, traps, Sv39 virtual memory, and physical memory management
 - capability spaces, derivation, attenuation, revocation, and resource accounting
 - threads, scheduling domains and contexts, timers, and CPU dispatch
-- notifications, channels, and asynchronous completion
+- notifications, MCMP channels, native CALL/Reply, and asynchronous completion
+- ubus dynamic discovery, self-described methods and a common capability-aware value codec
 - user-space `init`, process supervision, UART, block, immutable initramfs bootfs, and writable data-volume services
 - original ELF loading from a capability-authorized file view
 - an interactive shell and basic user programs
@@ -53,7 +54,7 @@ The boot mount and shell remain usable when storage is absent or stopped. Use `c
 `cat /boot/README.TXT` reads one; `cp /boot/README.TXT readme` copies it to the
 data disk. `cat`, `ls`, and `cp` are ordinary programs using the userland VFS service;
 the other file commands launch the ordinary `fs` program, also available as
-`fs COMMAND`. The shell explicitly passes VFS authority when launching applications. Quote names and text containing spaces,
+`fs COMMAND`. Applications resolve files through their explicitly granted bus view. Quote names and text containing spaces,
 for example `write "my note" "hello world"`. `edit note` opens a screen editor:
 type to insert, move with the arrow keys, save with Ctrl+O, and exit with
 Ctrl+X (which asks whether to save changes). The buffer grows with the process heap. The shell brokers terminal input for the foreground pipeline. Ctrl+C terminates
@@ -67,9 +68,19 @@ ordinary `fs` and `edit` cannot format. Programs run by name, for example
 `echo world >> greeting` appends to it; redirection runs ordinary `fs save`
 program through the same two-task pipe. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
-`svc` lists managed service instances; `svc restart NAME` restarts an instance
-and its dependent services. Restart acceptance precedes recovery completion.
+`svc` lists supervised children; `svc restart NAME` changes their owner’s desired state.
+Acceptance precedes recovery and publication. Registry or subsystem manager loss rebuilds
+the owned root subtree; old business endpoints close and accepted mutations are never replayed.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
+
+`init` owns one root execution. `system`, `devices`, `session`, and shell jobs use
+recursive process/resource ownership; the independent `ubusd` directory knows no
+executable names or business methods. Ordinary programs publish their own endpoints
+in a delegated domain and call each other directly after Bind. All methods share
+one value codec and derive Describe and validation from the same method table.
+`bus list`, `bus describe NAME`, and `bus call NAME METHOD FIELD=VALUE` work without
+a service SDK. `bus call session Spawn name=example program=/path/to/program` starts
+an installed package dynamically; its publications appear below `providers/example/`.
 
 Deployment bundles contain standard ELF files with debug information removed;
 the original ELF files retain symbols beside the build objects. Test workloads
@@ -84,9 +95,9 @@ arch/       Architecture-specific kernel code
 kernel/     Kernel
 libk/       Freestanding C++ support library
 uapi/       User/kernel ABI
-user/       Userspace runtime and libraries
-protocols/  Service contracts and explicit clients
-adapters/   Optional application ABI adapters
+lib/        Native runtime, process construction and optional semantic clients
+ubus/       Common values, dynamic methods, discovery and direct RPC
+posix/      Explicit C/POSIX subset adapter
 servers/    Userspace system services
 programs/   User programs
 tools/      Build and image tooling

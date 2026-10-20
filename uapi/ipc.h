@@ -62,6 +62,7 @@ static_assert(sizeof(CapXfer) == 24);
 
 #define CHANNEL_VERSION 1U
 #define CHANNEL_FLAGS_NONE 0U
+#define CHANNEL_FLAG_CALL 1U /* receive-only: cap[0] is the kernel Reply facet */
 #define CHANNEL_DISCARD 1U
 // CALL creates a kernel-only, movable, single-use reply facet as received[0].
 // CANCEL races reply at the reserved result cell; DISCARD releases that result.

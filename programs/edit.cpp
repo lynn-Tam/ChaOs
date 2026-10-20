@@ -1,8 +1,8 @@
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
-#include <protocols/file.hpp>
-#include <protocols/terminal.hpp>
+#include <lib/fs/fs.hpp>
+#include <lib/term/term.hpp>
 #include <unistd.h>
 #include <uapi/abi.h>
 #include <libk/fmt.hpp>
@@ -289,10 +289,7 @@ public:
 
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
-    auto directory = env.selector(vfs_service);
-    if (!directory) directory = env.selector(vfs_read);
-    if (const auto rc = px_init(env.alloc(), env.vspace, env.events, directory,
-        {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)}); rc != STATUS_OK) return rc;
+    if (const auto rc = px_init(); rc != STATUS_OK) return rc;
 
     if (argc != 2) return STATUS_BAD_ARGS;
     tm_client terminal;

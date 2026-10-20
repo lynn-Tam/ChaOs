@@ -1,8 +1,8 @@
 #pragma once
+#include <vm.hpp>
 
-#include <servers/fw.hpp>
 
-#include <exec.hpp>
+#include <proc.hpp>
 #include <libk/cpio.hpp>
 #include <libk/elf.hpp>
 #include <libk/checked_arithmetic.hpp>
@@ -11,8 +11,7 @@
 #include <memory>
 #include <string>
 
-inline constexpr rt_req rt_domain{"domain", 0, ObjDomain};
-inline constexpr rt_req rt_image{"image", 0, ObjMem};
+inline constexpr rt_key rt_image{"image", ObjMem};
 
 struct test_image {
     vm_area mapping;
@@ -22,7 +21,8 @@ struct test_image {
     auto open(cap_t vm, cap_t mem, size_t size, word_t access = VM_READ) -> status_t {
         memory = mem;
         perms = access;
-        auto status = mapping.open(vm, 0, libk::checked_align_up(size, 4096).value_or(0), VM_READ);
+        if (vm != rt_vm().space) return STATUS_BAD_ARGS;
+        auto status = mapping.open(rt_vm(), 0, libk::checked_align_up(size, 4096).value_or(0), VM_READ);
         if (status == STATUS_OK)
             status = mapping.attach(mem, 0, mapping.size, VM_READ);
         if (status == STATUS_OK)
@@ -49,9 +49,9 @@ struct test_spawn {
     status_t status;
 };
 class test_tasks {
-    pr_auth auth_;
-    std::deque<std::unique_ptr<pr_task>> tasks_;
-    auto get(test_id id) -> pr_task* {
+    proc_auth auth_;
+    std::deque<std::unique_ptr<proc_task>> tasks_;
+    auto get(test_id id) -> proc_task* {
         return id.value && id.value <= tasks_.size() ? tasks_[id.value - 1].get() : nullptr;
     }
 
@@ -59,19 +59,19 @@ class test_tasks {
     void open(CreateAuth pool, cap_t domain, uint32_t cpus) {
         auth_ = {pool, cpus, domain ? domain : rt_startup().domain};
     }
-    auto spawn(test_image& image, std::string_view name, const pr_opts& opts = {}) -> test_spawn {
+    auto spawn(test_image& image, std::string_view name, const proc_opts& opts = {}) -> test_spawn {
         const auto mod = name.empty() ? image.entry() : image.find(name);
         if (!mod || !bool(*mod))
             return {{}, STATUS_BAD_ARGS};
-        auto& task = tasks_.emplace_back(std::make_unique<pr_task>());
+        auto& task = tasks_.emplace_back(std::make_unique<proc_task>());
         auto config = opts;
         const std::string_view arg = name.empty() ? "test" : name;
         if (config.argv.empty())
             config.argv = {&arg, 1};
         config.cpu = (tasks_.size() - 1) % auth_.cpus;
-        auto status = pr_exec(
+        auto status = proc_spawn(
             *task, auth_,
-            pr_image{.bytes = mod->bytes(),
+            proc_image{.bytes = mod->bytes(),
                      .memory = image.memory,
                      .offset = static_cast<uint64_t>(mod->bytes().data() - image.bytes.data()),
                      .perms = image.perms},
@@ -109,16 +109,16 @@ class test_tasks {
 
 inline void open(test_image& image, const rt_env& info) {
     const auto* binding = info.find(rt_image);
-    const auto cap = binding ? binding->cap : fw_root(info).bundle;
-    const auto size = binding ? binding->bytes : fw_root(info).bundle_bytes;
+    const auto cap = binding ? binding->cap : rt_root().bundle;
+    const auto size = binding ? binding->bytes : rt_root().bundle_bytes;
     if (const auto rc = image.open(info.vspace, cap, size);
         rc != STATUS_OK)
         sys::exit(rc);
 }
-inline auto input(rt_req contract, cap_t cap, word_t rights, word_t badge = 0) -> pr_cap {
-    return {.contract = contract, .cap = cap, .limit = rights, .badge = badge};
+inline auto input(rt_key contract, cap_t cap, word_t rights, word_t badge = 0) -> proc_cap {
+    return {.key = contract, .cap = cap, .limit = rights, .badge = badge};
 }
-auto start(test_tasks& tasks, test_image& image, std::string_view name, pr_opts opts = {})
+auto start(test_tasks& tasks, test_image& image, std::string_view name, proc_opts opts = {})
     -> test_id {
     const auto result = tasks.spawn(image, name, opts);
     if (result.status != STATUS_OK)
@@ -130,7 +130,7 @@ auto wait(test_tasks& tasks, test_id id) -> status_t {
         const auto result = tasks.collect(id);
         if (result.status == STATUS_OK)
             return static_cast<status_t>(result.value);
-        if (!pr_retryable(result.status) && result.status != STATUS_WOULD_BLOCK)
+        if (!proc_retryable(result.status) && result.status != STATUS_WOULD_BLOCK)
             return result.status;
         sys::yield();
     }
@@ -139,9 +139,3 @@ auto stop(test_tasks& tasks, test_id id) -> status_t {
     const auto s = tasks.request_stop(id);
     return s == STATUS_OK ? wait(tasks, id) : s;
 }
-inline constexpr pr_quota files_quota{.bytes = 16 * 1024 * 1024,
-                                      .caps = 1024,
-                                      .kinds =
-                                          pr_base_kinds | OBJ_BIT(ObjPager) | OBJ_BIT(ObjChannel),
-                                      .slots = 1024,
-                                      .pages = 132};

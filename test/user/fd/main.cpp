@@ -1,9 +1,9 @@
-#include <protocols/msg.hpp>
+#include <vm.hpp>
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
-#include <protocols/file.hpp>
-#include <protocols/stream.hpp>
+#include <lib/fs/fs.hpp>
+#include <lib/stream/stream.hpp>
 #include <unistd.h>
 #include <uapi/abi.h>
 #include <string_view>
@@ -36,25 +36,24 @@ static int cache() {
     // Native Map sees accepted content without Sync, and cannot gain Execute
     // from this application's read-only Directory grant.
     const auto& env = rt_startup();
-    rpc_client directory;
-    if (directory.open(env.selector(vfs_read), env.alloc()) != STATUS_OK)
-        return 62;
-    const auto denied = fl_map(directory, "/boot/cat.elf", VM_READ | VM_EXECUTE);
+    ubus_conn bus, directory;
+    if (bus.bind(env.selector(ubus_directory)) != STATUS_OK || directory.connect(bus, "read", "myos.files", 1, 1) != STATUS_OK) return 62;
+    const auto denied = fs_map(directory, "/boot/cat.elf", VM_READ | VM_EXECUTE);
     if (denied || denied.error() != STATUS_DENIED)
         return 63;
     const int file = open("fd-map", O_RDWR | O_CREAT | O_TRUNC, 0);
     if (file < 0 || write(file, "old", 3) != 3)
         return 64;
-    auto first = fl_map(directory, "fd-map");
+    auto first = fs_map(directory, "fd-map");
     if (!first || first->size != 3)
         return 65;
-    auto old = vm_area::map(env.vspace, std::move(first->memory), 0, 4096, VM_READ);
+    auto old = vm_area::map(rt_vm(), std::move(first->memory), 0, 4096, VM_READ);
     if (!old || pwrite(file, "new", 3, 0) != 3)
         return 66;
-    auto second = fl_map(directory, "fd-map");
+    auto second = fs_map(directory, "fd-map");
     if (!second || second->size != 3)
         return 67;
-    auto fresh = vm_area::map(env.vspace, std::move(second->memory), 0, 4096, VM_READ);
+    auto fresh = vm_area::map(rt_vm(), std::move(second->memory), 0, 4096, VM_READ);
     if (!fresh || close(file))
         return 68;
     const auto* before = reinterpret_cast<const uint8_t*>(old->address);
@@ -70,13 +69,8 @@ static int cache() {
 }
 
 int main(int argc, char** argv) {
-    const auto& env = rt_startup();
-    auto directory = env.selector(vfs_service);
-    if (!directory)
-        directory = env.selector(vfs_read);
     if (const auto rc =
-            px_init(env.alloc(), env.vspace, env.events, directory,
-                    {env.selector(rt_stdin), env.selector(rt_stdout), env.selector(rt_stderr)});
+            px_init();
         rc != STATUS_OK)
         return rc;
 

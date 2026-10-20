@@ -346,7 +346,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     class Data {
         friend class Mem;
         Data(Pmm& pmm, usize pages) noexcept : pmm_(&pmm), pages_(pages) {}
-        object::ref<> payer_, pager_, cpu_;
+        object::ref<> payer_, pager_;
         Pmm* pmm_;
         usize pages_;
         Perms perms_;
@@ -355,7 +355,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         Data(Data&&) noexcept = default;
         Data(const Data&) = delete;
     };
-    static auto prepare(const object::ref<>& payer, Pmm&, usize, Config, object::ref<> cpu = {}) noexcept
+    static auto prepare(const object::ref<>& payer, Pmm&, usize, Config) noexcept
         -> std::expected<Data, MemErr>;
     explicit Mem(Data&&) noexcept;
     ~Mem() noexcept;
@@ -410,8 +410,8 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto trim(ObjectRange, Source::Context&, cap::Graph::Admission = {},
         std::span<const object::ref<>*> gates = {}, const cap::GrantLease* grant = nullptr) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto writeback(usize page_index) noexcept -> std::expected<void, MemErr>;
-    // Initialize a private anonymous page without publishing a CPU mapping.
-    // A write is bounded to one page and excludes attachments and page loans.
+    // Bounded anonymous RAM access pins storage, independent of CPU mappings;
+    // seal and view permissions still exclude writes to immutable content.
     [[nodiscard]] auto write(usize offset, std::span<const byte> input) noexcept
         -> std::expected<void, MemErr>;
     [[nodiscard]] auto read(usize offset, std::span<byte> output) noexcept -> std::expected<void, MemErr>;
@@ -483,7 +483,6 @@ class Mem final : private libk::noncopyable_nonmovable {
     bool trim_removing_{};
     status_t trim_status_{};
     std::optional<Op> trim_op_;
-    object::ref<> cpu_;
     bool advancing_{}, again_{};
     std::optional<Store> store_{};
     usize operations_{}, preparing_{}, trim_pending_{};

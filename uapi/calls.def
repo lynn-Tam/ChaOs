@@ -71,7 +71,8 @@ CALL(ACCOUNT_CLOSE, 65, account_close, Call) /* a0=Account; OK=close intent acce
 CALL(MEM_TRIM, 70, mem_call, Call) /* Manage Mem, a1=first page, a2=count; fixed Wait on trim Source; result=CLEAN/DIRTY/BUSY/CANCELED after actual drain */
 CALL(MEM_WRITEBACK, 69, mem_call, Call) /* Manage Mem, a1=page; emits a Pager writeback request */
 CALL(MEMORY_POPULATE, 67, mem_call, Call) /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
-CALL(MEMORY_WRITE, 66, memory_write, Call) /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; private anonymous single-page initialization */
+CALL(MEMORY_WRITE, 66, memory_copy, Call) /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; Map + Write view, anonymous RAM, at most one page */
+CALL(MEMORY_READ, 68, memory_copy, Call) /* a0=Memory(Map), a1=byte offset, a2=IPC offset, a3=bytes (1..4096), within one source page; bounded copy */
 
 CALL(NOTIFICATION_SIGNAL, 80, notification_signal, Ipc) /* a0=Notification; badge is in cap */
 CALL(NOTIFICATION_TAKE, 81, notification_take, Ipc) /* a0=Notification */

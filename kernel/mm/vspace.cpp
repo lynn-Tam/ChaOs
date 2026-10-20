@@ -705,10 +705,10 @@ auto View::access() const noexcept -> std::optional<Access> {
     return {};
 }
 
-auto View::Access::bytes(usize offset, usize count) const noexcept -> std::span<const byte> {
+auto View::Access::region(usize offset, usize count, Perm mode) const noexcept -> std::span<byte> {
     const auto& borrow = *h_.get();
     const auto size = borrow.object_.size() * page_size;
-    if (!borrow.perms_.contains(Perm::Read) || !count || offset >= size || count > size - offset
+    if (!borrow.perms_.contains(mode) || !count || offset >= size || count > size - offset
         || count > page_size - offset % page_size) return {};
     return {borrow.owner_->pmm_->bytes(borrow.pages_[offset / page_size].page()) + offset % page_size, count};
 }
@@ -1056,13 +1056,16 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
         switch (edit.phase) {
         case E::Scan:
             if (!map || map->range_.base() >= *edit.range.limit()) {
-                if (!edit.clear && edit.covered < *edit.range.limit()) {
+                if (!edit.clear && edit.perms && edit.covered < *edit.range.limit()) {
                     mutation->abort(); return fail(VSpaceError::NotMapped);
                 }
                 edit.phase = E::Prepare;
                 break;
             }
-            if (!edit.clear && (!map->binding_ || map->range_.base() > edit.covered)) {
+            // Unmap is idempotent over holes, including mappings already removed
+            // by grant revocation. Protect still requires complete coverage;
+            // neither operation may destroy a reserved or guarded VA region.
+            if (!edit.clear && (!map->binding_ || (edit.perms && map->range_.base() > edit.covered))) {
                 mutation->abort(); return fail(VSpaceError::NotMapped);
             }
             if (map->binding_ && map->binding_->invalid() && !edit.clear) {

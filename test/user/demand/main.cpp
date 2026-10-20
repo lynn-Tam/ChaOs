@@ -1,7 +1,8 @@
+#include <vm.hpp>
 #include <string_view>
 #include <vector>
 #include <memory>
-#include <protocols/stream.hpp>
+#include <lib/stream/stream.hpp>
 #include <ipc.hpp>
 #include <libk/parse.hpp>
 #include <util.hpp>
@@ -28,10 +29,16 @@ int main(int argc, char** argv) {
         zeroed[i] = (i + 7) % 251;
     }
     const auto pool = info.alloc();
-    const auto vspace = info.vspace;
-    auto stress = vm_area::create(pool, vspace, 0x28000000, 4096);
-    auto release = vm_area::create(pool, vspace, 0x28003000, 4096);
+    auto stress = vm_area::create(pool, rt_vm(), 0x28000000, 4096);
+    auto release = vm_area::create(pool, rt_vm(), 0x28003000, 4096);
     check(stress && release);
+    auto conflict = vm_area::create(pool, rt_vm(), stress->address, 4096);
+    check(!conflict);
+    // Existing ELF pages are outside the arena's allocation records. A failed
+    // map must not clear the executable page from which this check is running.
+    const auto code = reinterpret_cast<uintptr_t>(&main) & ~uintptr_t{4095};
+    auto occupied = vm_area::create(pool, rt_vm(), code, 4096);
+    check(!occupied);
     check(*reinterpret_cast<const volatile uint8_t*>(stress.value().address) == 0);
     for (size_t i = 0; i < sizeof(initialized); ++i)
         check(initialized[i] == i % 251);
@@ -42,7 +49,7 @@ int main(int argc, char** argv) {
         sys::exit(rc);
     if (const auto rc = release.value().close(); rc != STATUS_OK)
         sys::exit(rc);
-    auto reused = vm_area::create(pool, vspace, 0x28003000, 4096);
+    auto reused = vm_area::create(pool, rt_vm(), 0x28003000, 4096);
     check(reused && *reinterpret_cast<const volatile uint8_t*>(reused.value().address) == 0);
     if (const auto rc = reused.value().close(); rc != STATUS_OK)
         sys::exit(rc);

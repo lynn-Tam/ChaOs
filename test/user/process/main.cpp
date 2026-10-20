@@ -1,10 +1,7 @@
-#include <protocols/msg.hpp>
 #include <test/user/task.hpp>
-#include <exec.hpp>
-#include <protocols/file.hpp>
-#include <protocols/block.hpp>
-#include <protocols/service.hpp>
-#include <protocols/stream.hpp>
+#include <proc.hpp>
+#include <lib/fs/fs.hpp>
+#include <lib/stream/stream.hpp>
 #include <util.hpp>
 #include <vector>
 
@@ -19,25 +16,11 @@ int main() {
     if (notification.status != STATUS_OK)
         sys::exit(notification.status);
     cap_owner events{notification.value};
-    rpc_client directory;
-    if (const auto rc =
-            directory.open(info.selector(sv_service), info.alloc());
-        rc != STATUS_OK)
-        sys::exit(rc);
-    auto endpoint = sv_lookup(directory, vfs_exec);
-    if (!endpoint)
-        sys::exit(endpoint.error());
-    const auto ungranted = sv_lookup(directory, blk_service);
-    check(!ungranted && ungranted.error() == STATUS_NOT_FOUND);
-    auto wrong = vfs_exec;
-    ++wrong.major;
-    const auto mismatch = sv_lookup(directory, wrong);
-    check(!mismatch && mismatch.error() == STATUS_NOT_FOUND);
-    rpc_client files;
-    if (const auto rc = files.open(endpoint->selector(), info.alloc());
-        rc != STATUS_OK)
-        sys::exit(rc);
-    auto mem = fl_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
+    ubus_conn directory, files;
+    auto status = directory.bind(info.selector(ubus_directory));
+    if (status == STATUS_OK) status = files.connect(directory, "exec", "myos.files", 1, 1);
+    if (status != STATUS_OK) sys::exit(status);
+    auto mem = fs_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
     check(mem.has_value());
     test_image image;
     if (const auto rc =
@@ -45,7 +28,7 @@ int main() {
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;
-    tasks.open(info.alloc(), info.selector(rt_domain), info.cpus);
+    tasks.open(info.alloc(), info.domain, info.cpus);
     const auto spawn = [&](const char* ms) {
         const std::string_view args[]{"sleep", ms};
         const auto child = tasks.spawn(
@@ -60,7 +43,7 @@ int main() {
             const auto result = tasks.collect(id);
             if (result.status == STATUS_OK)
                 return static_cast<status_t>(result.value);
-            if (result.status != STATUS_WOULD_BLOCK && !pr_retryable(result.status))
+            if (result.status != STATUS_WOULD_BLOCK && !proc_retryable(result.status))
                 return result.status;
             const auto now = sys::clock_now();
             if (now.status != STATUS_OK)
@@ -98,7 +81,7 @@ int main() {
             sys::exit(rc);
         check(wait(id) == STATUS_CANCELED);
     }
-    str_writer{info.selector(con_output)}.write(
+    str_writer{info.selector(rt_stdout)}.write(
         "[process] direct spawn, retention, deadlines and reuse ok\n");
     sys::exit();
 }

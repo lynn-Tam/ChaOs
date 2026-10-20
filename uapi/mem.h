@@ -22,7 +22,7 @@
 
 // Accepted operations keep their own lifetime; closing the result slot does not cancel.
 #define VM_OP_MAP 1U
-#define VM_OP_UNMAP 2U
+#define VM_OP_UNMAP 2U /* holes are already unmapped; reservations/guards require CLEAR */
 #define VM_OP_PROTECT 3U
 #define VM_OP_CLEAR 4U
 struct VmReq {

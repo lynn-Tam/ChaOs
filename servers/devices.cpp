@@ -1,14 +1,11 @@
-#include <protocols/msg.hpp>
+#include <lib/mgr/mgr.hpp>
+#include <lib/fs/fs.hpp>
+#include <lib/stream/stream.hpp>
 #include <servers/devices.hpp>
-#include <protocols/block.hpp>
-#include <protocols/service.hpp>
-#include <protocols/manage.hpp>
-#include <libk/fdt.hpp>
+#include <servers/fw.hpp>
+#include <servers/uart.hpp>
 #include <libk/pci.hpp>
-#include <vector>
 #include <charconv>
-#include <task.hpp>
-#include <string>
 
 static void dv_fence() noexcept { asm volatile("fence iorw, iorw" ::: "memory"); }
 using dv_pci = pci::cfg<dv_fence>;
@@ -47,7 +44,7 @@ struct dv_bus {
         const auto memory = sys::memory_create_physical(env.alloc(), env.selector(dv_physical), reg->address, reg->size, VM_READ | VM_WRITE);
         if (memory.status != STATUS_OK) return std::unexpected(memory.status);
         bus.ecam = cap_owner{memory.value};
-        const auto status = bus.config.open(env.vspace, 0, 1 << 20);
+        const auto status = bus.config.open(rt_vm(), 0, 1 << 20);
         if (status != STATUS_OK) return std::unexpected(status);
         return bus;
     }
@@ -111,7 +108,6 @@ struct dv_device {
     cap_owner account, scope, space, irq;
     auto alloc() const noexcept -> CreateAuth { return {account.selector(), scope.selector()}; }
     std::array<vm_area, 6> bars;
-    uint64_t instance{}, incarnation{};
     std::array<uint64_t, 6> addresses{};
     dv_device(uint16_t rid, uint32_t did, uint32_t source, std::string name)
         : rid(rid), did(did), source(source), name(std::move(name)) {}
@@ -134,10 +130,9 @@ struct dv_device {
         // IOMMU fencing alone would not establish this device-side fact.
         return STATUS_OK;
     }
-    auto prepare(const rt_env& env, dv_bus& bus) -> status_t {
-        ++incarnation;
-        const auto made = sys::account_create(env.alloc(), 4 * 1024 * 1024, 128,
-            OBJ_BIT(ObjMem) | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
+    auto prepare(const rt_env& env, dv_bus& bus, cap_t interrupts, cap_t iommu) -> status_t {
+        const auto made = sys::account_create(env.alloc(), 12 * 1024 * 1024, 512,
+            proc_base_kinds | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
         if (made.status != STATUS_OK) return made.status;
         account = cap_owner{made.value};
         const auto owner = sys::scope_create(env.alloc());
@@ -173,16 +168,16 @@ struct dv_device {
             addresses[n] = *physical;
             const auto mem = sys::memory_create_physical(alloc(), env.selector(dv_physical), *physical, bytes, VM_READ | VM_WRITE);
             if (mem.status != STATUS_OK) return mem.status;
-            auto mapping = vm_area::map(env.vspace, cap_owner{mem.value}, 0, bytes, VM_READ | VM_WRITE);
+            auto mapping = vm_area::map(rt_vm(), cap_owner{mem.value}, 0, bytes, VM_READ | VM_WRITE);
             if (!mapping) return mapping.error();
             bars[n] = std::move(*mapping);
         }
         const auto status = reset(*fn);
         if (status != STATUS_OK) return status;
-        const auto interrupt = sys::irq_create(alloc(), env.selector(dv_interrupts), source);
+        const auto interrupt = sys::irq_create(alloc(), interrupts, source);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         irq = cap_owner{interrupt.value};
-        const auto domain = sys::io_space_create(alloc(), env.selector(dv_iommu), did);
+        const auto domain = sys::io_space_create(alloc(), iommu, did);
         if (domain.status != STATUS_OK) return domain.status;
         space = cap_owner{domain.value};
         for (;;) {
@@ -193,50 +188,29 @@ struct dv_device {
             sys::yield();
         }
     }
-    auto deploy(const rt_env& env, dv_bus& bus, rpc_client& root, cap_t changes) -> status_t {
-        constexpr std::string_view image = "block";
-        sv_define def{8 * 1024 * 1024, 256, pr_base_kinds | OBJ_BIT(ObjChannel), 256, 36,
-                      static_cast<uint16_t>(name.size()), image.size(), 1};
-        msg_frame request{.operation=static_cast<uint64_t>(sv_op::Define), .size=sizeof(def) + name.size() + image.size()};
-        if (request.size > sizeof(request.data)) return STATUS_BAD_ARGS;
-        ::memcpy(request.data, &def, sizeof(def));
-        ::memcpy(request.data + sizeof(def), name.data(), name.size());
-        ::memcpy(request.data + sizeof(def) + name.size(), image.data(), image.size());
-        msg_packet reply;
-        const CapXfer notice{changes, RIGHT_SEND, CAP_COPY, 0};
-        auto status = root.exchange(request, reply, {&notice, 1});
-        if (status != STATUS_OK) return status;
-        instance = request.value;
-        for (size_t n = 0; n < bars.size(); ++n) if (bars[n].memory) {
-            status = sv_grant_cap(root, instance, dv_regs[n], bars[n].memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE, bars[n].size);
-            if (status != STATUS_OK) return status;
-        }
-        auto config = vm_area::create(env.alloc(), env.vspace, 0, 4096);
+    auto deploy(const rt_env& env, dv_bus& bus, mgr& owner, mgr_child& driver) -> status_t {
+        driver.grants.clear(); driver.owned.clear();
+        driver.auth = proc_auth{alloc(), static_cast<uint32_t>(env.cpus), env.domain};
+        driver.scope = scope.selector();
+        for (size_t n = 0; n < bars.size(); ++n) if (bars[n].memory)
+            driver.grants.push_back({.key=dv_regs[n], .bytes=bars[n].size,
+                .cap=bars[n].memory.selector(), .limit=word_t{RIGHT_MAP | RIGHT_DUPLICATE}});
+        auto config = vm_area::create(env.alloc(), rt_vm(), 0, 4096);
         if (!config) return config.error();
         const auto fn = bus.function(rid);
         if (!fn) return fn.error();
-        // The driver consumes immutable transport metadata, never ECAM authority.
+        // Immutable transport metadata, never ECAM authority.
         for (size_t offset = 0; offset < 256; offset += 4)
             *reinterpret_cast<uint32_t*>(config->address + offset) = fn->read<uint32_t>(offset);
-        status = config->detach();
+        auto status = config->detach();
         if (status == STATUS_OK) status = sys::memory_seal(config->memory.selector()).status;
-        if (status == STATUS_OK) status = sv_grant_cap(root, instance, dv_regs[6], config->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE, 4096);
-        if (status == STATUS_OK) status = sv_grant_cap(root, instance, dv_space, space.selector(), RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE | RIGHT_DUPLICATE);
-        if (status == STATUS_OK) status = sv_grant_cap(root, instance, dv_irq, irq.selector(), RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE);
-        if (status == STATUS_OK) status = sv_grant_cap(root, instance, io_memory, env.selector(io_memory), RIGHT_CREATE);
-        if (status == STATUS_OK) status = sv_grant_cap(root, instance, io_scope, env.selector(io_scope), RIGHT_CREATE);
         if (status != STATUS_OK) return status;
-        const std::string_view service{blk_service.name};
-        request = {.operation=static_cast<uint64_t>(sv_op::Provide), .value=instance, .size=sizeof(sv_query) + service.size()};
-        const sv_query contract{blk_service.protocol, blk_service.major, blk_service.minor};
-        ::memcpy(request.data, &contract, sizeof(contract));
-        ::memcpy(request.data + sizeof(contract), service.data(), service.size());
-        if ((status = root.exchange(request, reply)) != STATUS_OK) return status;
-        if (reply.count != 1) return STATUS_PEER_FAULT;
-        if ((status = sv_grant_cap(root, instance, blk_service, reply.capabilities[0].selector(), RIGHT_RECEIVE)) != STATUS_OK) return status;
-        request = {.operation=static_cast<uint64_t>(sv_op::Start), .size=name.size()};
-        ::memcpy(request.data, name.data(), name.size());
-        return root.exchange(request);
+        driver.owned.push_back({dv_regs[6].name, std::move(config->memory), RIGHT_MAP | RIGHT_DUPLICATE, ObjMem, 4096});
+        driver.grants.push_back({.key=dv_space, .cap=space.selector(),
+            .limit=word_t{RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE | RIGHT_DUPLICATE}});
+        driver.grants.push_back({.key=dv_irq, .cap=irq.selector(),
+            .limit=word_t{RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE}});
+        return owner.start(driver);
     }
     auto retire(dv_pci cfg) -> status_t {
         auto status = io_close(space.selector());
@@ -262,28 +236,80 @@ struct dv_device {
 
 int main() {
     const auto& env = rt_startup();
-    const auto event = sys::port_create(env.alloc(), 8, 4);
-    if (event.status != STATUS_OK) sys::exit(event.status);
-    cap_owner replies{event.value};
-    rpc_client root;
-    // Reply readiness is local to RPC. It must not retrigger the lifecycle
-    // loop's next query and manufacture an endless stream of reply channels.
-    auto status = root.open(env.selector(sv_service), env.alloc());
-    if (status != STATUS_OK) sys::exit(status);
-    auto boot = vm_area::map(env.vspace, cap_owner{sys::cap_duplicate(env.selector(dv_config), 0, RIGHT_MAP).value}, 0, 4096, VM_READ);
+    const auto* input = env.find(dv_config);
+    if (!input || !input->bytes || input->bytes > 4096) sys::exit(STATUS_BAD_ARGS);
+    const auto copied = sys::cap_duplicate(input->cap, env.cspace, RIGHT_MAP);
+    if (copied.status != STATUS_OK) sys::exit(copied.status);
+    auto boot = vm_area::map(rt_vm(), cap_owner{copied.value}, 0, 4096, VM_READ);
     if (!boot) sys::exit(boot.error());
-    const auto config = *reinterpret_cast<const dv_boot*>(boot->address);
-    if (config.firmware_format != FW_FDT || config.firmware_bytes > SIZE_MAX - 8190) sys::exit(STATUS_BAD_ARGS);
-    auto firmware = vm_area::map(env.vspace, cap_owner{sys::cap_duplicate(env.selector(dv_firmware), 0, RIGHT_MAP).value},
-        0, (config.firmware_offset + config.firmware_bytes + 4095) & ~size_t{4095}, VM_READ);
+    const ubus_value config{{reinterpret_cast<const std::byte*>(boot->address), input->bytes}};
+    if (!config.valid()) sys::exit(STATUS_BAD_ARGS);
+    const auto source = config["firmware"];
+    const auto size = source["size"].as<uint64_t>(), hart = source["hart"].as<uint64_t>();
+    const auto offset = source["offset"].as<uint32_t>(), format = source["format"].as<uint32_t>();
+    if (!size || !offset || !format || !hart) sys::exit(STATUS_BAD_ARGS);
+    auto firmware = fw_view::open(env, env.selector(dv_firmware), *size, *offset, *format);
     if (!firmware) sys::exit(firmware.error());
-    const auto tree = libk::fdt::open(std::span{reinterpret_cast<const uint8_t*>(firmware->address + config.firmware_offset), size_t{config.firmware_bytes}});
-    if (!tree) sys::exit(STATUS_BAD_ARGS);
-    const auto pci = tree->find("pci-host-ecam-generic");
+    const auto& tree = firmware->tree;
+    auto irq = firmware->irq(env, env.selector(dv_physical), *hart);
+    if (!irq && irq.error() != STATUS_NOT_FOUND) sys::exit(irq.error());
+    auto console = irq ? fw_console::open(env, tree, irq->selector(), env.selector(dv_physical))
+        : std::expected<fw_console, status_t>{std::unexpected(STATUS_NOT_FOUND)};
+    if (!console && console.error() != STATUS_NOT_FOUND) sys::exit(console.error());
+    if (!console) console = fw_console{};
+    cap_owner iommu;
+    if (const auto node = tree.find("riscv,iommu"); node && irq) {
+        const auto reg = tree.reg(*node);
+        const auto interrupts = tree.property(*node, "interrupts");
+        const auto plic = tree.find("sifive,plic-1.0.0");
+        uint32_t source{};
+        libk::byte_reader sources{interrupts ? interrupts->data() : nullptr, interrupts ? interrupts->size() : 0};
+        if (!reg || !plic || !sources.read_be(source) ||
+            tree.number(*node, "interrupt-parent") != tree.number(*plic, "phandle")) sys::exit(STATUS_BAD_ARGS);
+        auto config = vm_area::create(env.alloc(), rt_vm(), 0, 4096);
+        if (!config) sys::exit(config.error());
+        std::construct_at(reinterpret_cast<IommuConfig*>(config->address), IOMMU_RISCV, 0U,
+                         reg->address, reg->size, irq->selector(), source, 24U);
+        const auto ctl = sys::iommu_create(env.alloc(), env.selector(dv_physical), config->memory.selector());
+        if (ctl.status != STATUS_OK) sys::exit(ctl.status);
+        iommu = cap_owner{ctl.value};
+        for (;;) {
+            const auto state = sys::iommu_state(iommu.selector());
+            if (state.status != STATUS_OK || state.value == IO_SPACE_FAILED) sys::exit(STATUS_BACKING_FAILED);
+            if (state.value == IO_SPACE_READY) break;
+            sys::yield();
+        }
+    }
+
+    const auto* bundle = env.find(fs_archive);
+    if (!bundle) sys::exit(STATUS_INVALID_CAP);
+    proc_archive archive;
+    auto status = archive.open(bundle->cap, bundle->bytes);
+    if (status != STATUS_OK) sys::exit(status);
+    mgr owner{[&](auto name) { return archive.image(name); }};
+    if ((status = owner.open()) != STATUS_OK) sys::exit(status);
+    if ((status = owner.directory(env.selector(ubus_publisher), env.selector(ubus_directory))) != STATUS_OK) sys::exit(status);
+    ubus_conn publisher;
+    if ((status = publisher.bind(env.selector(ubus_publisher))) != STATUS_OK) sys::exit(status);
+    if (console->memory) {
+        auto& uart = owner.add("uart", "uart", {.bytes=1024 * 1024, .caps=128,
+            .kinds=proc_base_kinds | OBJ_BIT(ObjChannel)});
+        uart.await_ready = false;
+        uart.grants = {
+            {.key=uart_mem, .cap=console->memory.selector(), .limit=word_t{RIGHT_MAP}},
+            {.key=uart_irq, .cap=console->irq.selector(), .limit=word_t{RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK}},
+            {.key=rt_stdin, .cap=env.selector(rt_stdin), .limit=word_t{RIGHT_RECEIVE}},
+            {.key=rt_stdout, .cap=env.selector(rt_stdout), .limit=word_t{RIGHT_SEND}}
+        };
+        char offset[24]; const auto encoded = std::to_chars(offset, offset + sizeof(offset), console->offset);
+        uart.args.emplace_back(offset, encoded.ptr);
+        if ((status = owner.start(uart)) != STATUS_OK) sys::exit(status);
+    }
+    const auto pci = tree.find("pci-host-ecam-generic");
     std::optional<dv_bus> bus;
     std::optional<dv_device> device;
-    if (pci && env.selector(dv_iommu)) {
-        auto opened = dv_bus::open(env, *tree, *pci);
+    if (pci && iommu.selector()) {
+        auto opened = dv_bus::open(env, tree, *pci);
         if (!opened) sys::exit(opened.error());
         bus.emplace(std::move(*opened));
         // bus-range bounds config access; only the root and configured bridges
@@ -316,133 +342,57 @@ int main() {
             }
         }
     }
-    msg_rx management{env.selector(mg_devices), env.events};
-    mg_watch watches{env.events};
-    ch_pair lifecycle;
-    if (const auto status = lifecycle.open(env.alloc(), 1, 0); status != STATUS_OK) sys::exit(status);
-    const auto sender = sys::channel_mint(lifecycle.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
-    if (sender.status != STATUS_OK) sys::exit(sender.status);
-    cap_owner changes{sender.value};
-    msg_rx life{lifecycle.ends[0].selector(), env.events};
-    bool ready{};
+
+    mgr_child* driver{};
     if (device) {
-        status = device->prepare(env, *bus);
-        if (status == STATUS_OK) status = device->deploy(env, *bus, root, changes.selector());
+        driver = &owner.add(device->name, "block", {.bytes=8 * 1024 * 1024, .caps=256,
+            .kinds=proc_base_kinds | OBJ_BIT(ObjChannel), .slots=256, .pages=36});
+        // Hardware capabilities remain with this owner through driver drain.
+        status = device->prepare(env, *bus, irq->selector(), iommu.selector());
+        if (status == STATUS_OK) status = device->deploy(env, *bus, owner, *driver);
         if (status != STATUS_OK) sys::exit(status);
     }
+    for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 2>{{
+        {"control", mgr_observe | mgr_control}, {"view", mgr_observe}}})
+        if (const auto published = owner.object().publish(publisher, name, rights); !published) sys::exit(published.error());
+    bool ready{}, quiesced{};
+    uint64_t published_generation{};
     for (;;) {
-        msg_frame change;
-        while (life.try_receive(change).status == STATUS_OK) {}
-        for (unsigned n = 0; n < 16; ++n) {
-            msg_packet packet;
-            const auto received = management.receive(packet);
-            if (received == STATUS_WOULD_BLOCK) break;
-            if (received != STATUS_OK) continue;
-            if (packet.count != 1) continue;
-            const auto reply = packet.capabilities[0].selector();
-            msg_reply response;
-            auto& message = response.message;
-            const auto& request = packet.message;
-            message.operation = request.operation; message.sequence = request.sequence;
-            message.status = STATUS_NOT_FOUND;
-            if (packet.badge != mg_control && packet.badge != mg_observe) message.status = STATUS_DENIED;
-            else if (device && request.operation == static_cast<uint64_t>(mg_op::Devices) && request.value < uint64_t{device->rid} + 1) {
-                mg_device row{uint64_t{device->rid} + 1, device->incarnation, device->instance, 0, 0,
-                    device->did, device->source, static_cast<uint32_t>(mg_state::Stopped), device->rid, UINT64_MAX,
-                    static_cast<uint32_t>(mg_observe | (packet.badge == mg_control ? mg_control | mg_stop | mg_start | mg_restart : 0)), {}};
-                for (size_t i = 0; i < device->bars.size(); ++i) if (device->bars[i].memory) {
-                    row.mmio = device->addresses[i]; row.bytes = device->bars[i].size; break;
-                }
-                if (device->space) {
-                    const auto io = sys::io_space_state(device->space.selector());
-                    if (io.status == STATUS_OK) row.iospace = io.value;
-                }
-                msg_frame query{.operation = static_cast<uint64_t>(sv_op::List), .size = device->name.size()};
-                ::memcpy(query.data, device->name.data(), query.size);
-                if (root.exchange(query) == STATUS_OK) {
-                    row.state = static_cast<uint32_t>(query.value);
-                    if (row.state == static_cast<uint32_t>(mg_state::Stopped) && device->account)
-                        row.state = static_cast<uint32_t>(mg_state::Draining);
-                    if (row.state == static_cast<uint32_t>(mg_state::Running)) {
-                        const auto cfg = bus->function(device->rid);
-                        if (!cfg || !(cfg->read<uint16_t>(4) & 4) || row.iospace != IO_SPACE_READY)
-                            row.state = static_cast<uint32_t>(mg_state::Starting);
-                    }
-                }
-                ::memcpy(row.name, device->name.data(), std::min(device->name.size(), sizeof(row.name) - 1));
-                mg_pack(message, row); message.value = row.id;
-                message.deadline = sys::clock_now().value;
-            } else if (device && (request.operation == static_cast<uint64_t>(mg_op::Caps)
-                || (request.operation >= static_cast<uint64_t>(mg_op::Members) && request.operation <= static_cast<uint64_t>(mg_op::GrantView))
-                || request.operation == static_cast<uint64_t>(mg_op::Changed))) {
-                mg_target expected;
-                if (request.size != sizeof(expected)) message.status = STATUS_BAD_ARGS;
-                else {
-                    ::memcpy(&expected, request.data, sizeof(expected));
-                    if (request.value != uint64_t{device->rid} + 1 || expected.incarnation != device->incarnation) message.status = STATUS_STALE;
-                    else if (!device->scope) message.status = STATUS_CLOSED;
-                    else if (request.operation == static_cast<uint64_t>(mg_op::Changed))
-                        watches.accept(device->scope.selector(), 0, expected, packet.capabilities[0], request, message);
-                    else mg_project(device->scope.selector(), 0, static_cast<mg_op>(request.operation), expected, message);
-                }
-            } else if (device && request.operation == static_cast<uint64_t>(mg_op::DeviceAction)) {
-                if (packet.badge != mg_control) message.status = STATUS_DENIED;
-                else if (request.size != sizeof(mg_target)) message.status = STATUS_BAD_ARGS;
-                else {
-                    mg_target expected; ::memcpy(&expected, request.data, sizeof(expected));
-                    if (request.value != uint64_t{device->rid} + 1 || expected.incarnation != device->incarnation) message.status = STATUS_STALE;
-                    else {
-                        const auto action = static_cast<mg_action>(request.status);
-                        const auto op = action == mg_action::Start ? sv_op::Start : action == mg_action::Stop ? sv_op::Stop : sv_op::Restart;
-                        if (action != mg_action::Start && action != mg_action::Stop && action != mg_action::Restart) message.status = STATUS_BAD_ARGS;
-                        else {
-                            msg_frame change{.operation = static_cast<uint64_t>(op), .size = device->name.size()};
-                            ::memcpy(change.data, device->name.data(), change.size);
-                            message.status = root.exchange(change);
-                        }
-                    }
-                }
-            }
-            if (request.operation != static_cast<uint64_t>(mg_op::Changed) || message.status != STATUS_PENDING) response.respond(reply);
-        }
-        const auto deadline = watches.poll();
-        (void)management.arm();
-        if (device) {
-            msg_frame query{.operation=static_cast<uint64_t>(sv_op::List), .size=device->name.size()};
-            ::memcpy(query.data, device->name.data(), device->name.size());
-            if ((status = root.exchange(query)) != STATUS_OK || query.size != sizeof(sv_status)) sys::exit(status);
-            sv_status observed;
-            ::memcpy(&observed, query.data, sizeof(observed));
-            if (query.value == static_cast<uint64_t>(sv_state::Failed)) sys::exit(STATUS_BACKING_FAILED);
-            if (query.value == static_cast<uint64_t>(sv_state::Running)) {
-                auto fn = bus->function(device->rid);
-                if (!fn) sys::exit(fn.error());
-                fn->write<uint16_t>(4, 6); // queue setup and IOSpace admission have completed
-                (void)fn->read<uint16_t>(4);
-                if (!ready) {
-                    if ((status = sys::notification_signal(env.selector(sv_ready)).status) != STATUS_OK) sys::exit(status);
-                    ready = true;
-                }
-            } else if (query.value == static_cast<uint64_t>(sv_state::Stopped)) {
+        if (driver && driver->task && !quiesced) {
+            const auto ended = driver->task->observe();
+            if (ended.status != STATUS_OK) return ended.status;
+            if (ended.value || driver->state == "draining") {
+                if ((status = driver->task->stop()) != STATUS_OK) sys::exit(status);
+                if ((status = io_close(device->space.selector())) != STATUS_OK) sys::exit(status);
                 const auto fn = bus->function(device->rid);
                 if (!fn) sys::exit(fn.error());
-                if (device->account && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
-                if (!observed.desired) {
-                    (void)management.arm(); (void)life.arm();
-                    if ((status = ev_wait(env.events, deadline).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
-                    continue;
-                }
-                msg_frame remove{.operation=static_cast<uint64_t>(sv_op::Remove), .value=device->instance};
-                if ((status = root.exchange(remove)) != STATUS_OK) sys::exit(status);
-                if ((status = device->prepare(env, *bus)) != STATUS_OK) sys::exit(status);
-                if ((status = device->deploy(env, *bus, root, changes.selector())) != STATUS_OK) sys::exit(status);
-                continue;
+                if ((status = device->reset(*fn)) != STATUS_OK) sys::exit(status);
+                quiesced = true;
             }
-        } else if (!ready) {
-            if ((status = sys::notification_signal(env.selector(sv_ready)).status) != STATUS_OK) sys::exit(status);
+        }
+        if ((status = owner.poll()) != STATUS_OK) sys::exit(status);
+        if (driver && !driver->task) {
+            const auto fn = bus->function(device->rid);
+            if (!fn) sys::exit(fn.error());
+            driver->grants.clear(); driver->owned.clear();
+            if (device->account && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
+            if (driver->desired) {
+                if ((status = device->prepare(env, *bus, irq->selector(), iommu.selector())) != STATUS_OK) sys::exit(status);
+                if ((status = device->deploy(env, *bus, owner, *driver)) != STATUS_OK) sys::exit(status);
+                quiesced = false; continue;
+            }
+        }
+        if (driver && driver->state == "running" && published_generation != driver->gen) {
+            const auto fn = bus->function(device->rid);
+            if (!fn) sys::exit(fn.error());
+            fn->write<uint16_t>(4, 6); (void)fn->read<uint16_t>(4);
+            if ((status = mgr_role(publisher, "block", device->name + "/block")) != STATUS_OK) sys::exit(status);
+            published_generation = driver->gen;
+        }
+        if (!ready && (!driver || driver->state == "running")) {
+            if ((status = sys::notification_signal(env.selector(ubus_ready)).status) != STATUS_OK) sys::exit(status);
             ready = true;
         }
-        (void)management.arm(); (void)life.arm();
-        if ((status = ev_wait(env.events, deadline).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
+        if ((status = ev_wait(env.events, owner.deadline()).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
     }
 }

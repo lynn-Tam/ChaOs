@@ -103,7 +103,7 @@ auto Iommu::activate() noexcept -> status_t {
     return status;
 }
 void Iommu::invalidated() noexcept {
-    { sync::Lock guard{lock_}; closing_ = true; }
+    { sync::Lock guard{lock_}; close(); }
     auto self = object::ref<>::retain_alive(job_.key());
     static_cast<void>(self.destroy()); post();
 }
@@ -198,16 +198,21 @@ auto Iommu::disconnected() noexcept -> Source::Publication {
 void Iommu::retire(object::cleanup&& cleanup) noexcept {
     {
         sync::Lock lock{lock_};
-        closing_ = true;
+        close();
         cleanup_ = std::move(cleanup);
-        for (auto* d = domains_; d; d = d->next_) {
-            d->closing_.store(true, std::memory_order_release);
-            work_.post(d->job_);
-        }
         // Construction can fail before the protocol worker was opened.
         if (phase_ == Phase::Empty) work_.open(job_, Work::Fn::bind<&Iommu::progress>(*this));
     }
     work_.post(job_);
+}
+void Iommu::close() noexcept {
+    libk_assert(lock_.held());
+    if (closing_) return;
+    closing_ = true;
+    for (auto* d = domains_; d; d = d->next_) {
+        d->closing_.store(true, std::memory_order_release);
+        work_.post(d->job_);
+    }
 }
 void Iommu::progress() noexcept {
     const auto phase = initialization_.query().sequence;
@@ -215,16 +220,23 @@ void Iommu::progress() noexcept {
     advance();
 }
 void Iommu::advance() noexcept {
+    bool closed;
     { sync::Lock guard{lock_};
       if (advancing_) { post(); return; }
       advancing_ = true;
+      closed = phase_ == Phase::Closed;
     }
     libk::scope_exit advanced{[&]() noexcept { sync::Lock guard{lock_}; advancing_ = false; }};
+    // Authority invalidation can finish hardware shutdown before the pool's
+    // retire hook delivers its cleanup owner. Closed is terminal in either case.
+    if (closed) { complete(); return; }
     bool rearm{};
     {
         sync::Lock lock{lock_};
         if (billing_) return;
-        if (disconnected_.load(std::memory_order_acquire)) fail();
+        // Losing interrupt delivery requests shutdown; controller completion is
+        // polled and does not depend on that IRQ route remaining connected.
+        if (disconnected_.load(std::memory_order_acquire) || initialization_.canceled()) close();
         if (phase_ == Phase::Failed) return;
         if (phase_ == Phase::Ready && irq_pending_.exchange(false, std::memory_order_acq_rel)) {
             write<u32>(Ipsr, 3);
@@ -242,7 +254,6 @@ void Iommu::advance() noexcept {
             write<u32>(Fqh, fault_head_);
             rearm = true;
         }
-        closing_ |= initialization_.canceled();
         if (phase_ == Phase::Prepared) {
             if (!closing_) return;
             phase_ = Phase::Unmapping;
@@ -276,13 +287,13 @@ void Iommu::advance() noexcept {
             if ((cq & CqErrors) || (fq & FqErrors)) { fail(); return; }
             if ((cq | fq) & Busy) break;
             if (!(cq & On) || !(fq & On)) { fail(); return; }
-            if (!initialization_.commit()) { closing_ = true; work_.post(job_); return; }
+            if (!initialization_.commit()) { close(); work_.post(job_); return; }
             const u64 mode = config_.device_bits <= 6 ? 2 : config_.device_bits <= 15 ? 3 : 4;
             auto commit = [&]() noexcept {
                 write<u64>(Ddtp, (directory_.raw() << 10) | mode);
                 phase_ = Phase::Directory;
             };
-            if (!authority_.publish(Source::Action::bind(commit))) { closing_ = true; post(); return; }
+            if (!authority_.publish(Source::Action::bind(commit))) { close(); post(); return; }
             break;
         }
         case Phase::Directory:
@@ -335,8 +346,13 @@ void Iommu::advance() noexcept {
     claim_.reset();
     if (!authority_.close()) return;
     { sync::Lock lock{lock_}; phase_ = Phase::Closed; }
+    complete();
+}
+void Iommu::complete() noexcept {
+    object::cleanup cleanup;
+    { sync::Lock lock{lock_}; cleanup = std::move(cleanup_); }
+    if (!cleanup) return;
     work_.close(job_);
-    auto cleanup = std::move(cleanup_);
     cleanup.complete();
 }
 

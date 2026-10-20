@@ -1,20 +1,11 @@
-#include <util.hpp>
-#include <string.h>
-#include <protocols/block.hpp>
-#include <utility>
-#include <new>
-#include <memory>
-#include <protocols/msg.hpp>
-#include <protocols/queue.hpp>
-#include <start.hpp>
+#include <lib/io/io.hpp>
 #include <servers/virtio_blk.hpp>
-#include <protocols/service.hpp>
+#include <memory>
 
 static blk_dev device;
-static msg_rx directory;
+static ubus_object directory{"myos.block"};
 struct Client final {
     std::unique_ptr<Client> next;
-    cap_owner channel;
     io_server session;
 };
 static std::unique_ptr<Client> clients;
@@ -25,29 +16,26 @@ struct Pending final {
     io_ticket ticket{};
     uint64_t generation{};
 };
-Pending pending[io_queue_depth];
+static Pending pending[io_queue_depth];
 struct Flush final {
     Client* client{};
     io_ticket ticket{};
     bool submitted{};
-} flush;
-static void control(const msg_frame&, msg_reply& reply) noexcept {
-    reply.message.status = STATUS_INVALID_OP;
-}
-
+};
+static Flush flush;
 static auto validate(const io_cmd& request) noexcept -> status_t {
-    if (request.flags != 0)
+    if (request.sequential)
         return STATUS_BAD_ARGS;
-    if (request.operation == static_cast<uint64_t>(io_operation::Flush))
+    if (request.operation == io_operation::Flush)
         return request.offset == 0 && request.length == 0 && request.buffer_offset == 0
                    ? STATUS_OK
                    : STATUS_BAD_ARGS;
-    if (request.operation == static_cast<uint64_t>(io_operation::Identify))
+    if (request.operation == io_operation::Identify)
         return request.offset == 0 && request.length == 20 && request.buffer_offset == 0
                    ? STATUS_OK
                    : STATUS_BAD_ARGS;
-    if (request.operation != static_cast<uint64_t>(io_operation::Read) &&
-        request.operation != static_cast<uint64_t>(io_operation::Write))
+    if (request.operation != io_operation::Read &&
+        request.operation != io_operation::Write)
         return STATUS_BAD_ARGS;
     if (request.length == 0 || request.length > io_buffer_size ||
         request.buffer_offset > io_payload_size ||
@@ -56,65 +44,46 @@ static auto validate(const io_cmd& request) noexcept -> status_t {
     return STATUS_OK;
 }
 
-int main() {
+static auto open(ubus_request&, ubus_msg& response) -> status_t {
+    auto client = std::make_unique<Client>();
+    const auto status = client->session.open(device.capacity(), io_read | io_write);
+    if (status != STATUS_OK) return status;
+    auto handle = client->session.object().handle(0, RIGHT_SEND);
+    if (!handle) return handle.error();
+    response.data.cap("handle", *response.give(std::move(*handle)));
+    client->next = std::move(clients); clients = std::move(client);
+    return STATUS_OK;
+}
 
+int main() {
     const auto& info = rt_startup();
-    const auto vspace = info.vspace;
-    const auto cspace = info.cspace;
     const auto events = info.events;
-    const CreateAuth memory_pool{info.selector(io_memory), info.selector(io_scope)};
-    if (!memory_pool.account || !memory_pool.scope)
-        sys::exit(STATUS_DENIED);
-    if (const auto rc = device.open(info);
-        rc != STATUS_OK)
-        sys::exit(rc);
-    if (const auto rc = directory.open(info.selector(blk_service), events); rc != STATUS_OK)
-        sys::exit(rc);
-    if (const auto ready = info.selector(sv_ready)) {
-        if (const auto status = sys::notification_signal(ready).status; status != STATUS_OK) sys::exit(status);
+    auto status = device.open(info);
+    if (status != STATUS_OK) return status;
+    status = directory.add("Open", {}, {{"handle", ubus_type::Cap}}, open);
+    if (status == STATUS_OK) status = directory.open();
+    if (status != STATUS_OK) return status;
+    ubus_conn publisher;
+    status = publisher.bind(info.selector(ubus_publisher));
+    if (status != STATUS_OK) return status;
+    const auto published = directory.publish(publisher, "block");
+    if (!published) return published.error();
+    if (const auto ready = info.selector(ubus_ready)) {
+        status = sys::notification_signal(ready).status;
+        if (status != STATUS_OK) return status;
     }
     for (;;) {
         bool again{};
         if (const auto rc = device.acknowledge(); rc != STATUS_OK)
             sys::exit(rc);
         for (size_t count = 0; count < io_queue_depth; ++count) {
-            msg_packet packet;
-            const auto received = directory.receive(packet);
-            if (received == STATUS_WOULD_BLOCK || received == STATUS_BUSY)
-                break;
-            if (received != STATUS_OK || packet.count != 3)
-                continue;
-            auto endpoint = std::move(packet.capabilities[1]);
-            packet.capabilities[1] = std::move(packet.capabilities[2]);
-            packet.count = 2;
-            if (const auto status = rt_admit(packet.message.deadline); status != STATUS_OK) {
-                msg_reply reply;
-                reply.message = {.operation = packet.message.operation,
-                                 .status = status, .sequence = packet.message.sequence};
-                reply.respond(packet.capabilities[0].selector());
-                continue;
-            }
-            auto client = std::unique_ptr<Client>{new (std::nothrow) Client};
-            const auto status = client ? client->session.open(endpoint.selector(), events, memory_pool, info.alloc(),
-                                                              vspace, cspace, 0, device.capacity(), true)
-                                       : STATUS_NO_MEMORY;
-            if (status != STATUS_OK) {
-                const msg_frame reply{.operation = packet.message.operation,
-                                   .status = status, .sequence = packet.message.sequence};
-                msg_reply response;
-                response.message = reply;
-                response.respond(packet.capabilities[0].selector());
-                continue;
-            }
-            client->channel = std::move(endpoint);
-            if (client->session.accept(packet, control) != STATUS_OK)
-                client->session.abort();
-            auto* tail = &clients;
-            while (*tail) tail = &(*tail)->next;
-            *tail = std::move(client);
+            const auto status = directory.poll();
+            if (status == STATUS_WOULD_BLOCK) break;
+            if (status != STATUS_OK) return status;
+            again = true;
         }
         for (auto* client = clients.get(); client; client = client->next.get())
-            if (client->session.poll(control) != STATUS_OK) {
+            if (client->session.poll() != STATUS_OK) {
                 client->session.abort();
                 again = true;
             }
@@ -137,8 +106,8 @@ int main() {
                 sys::exit(STATUS_INTERNAL);
             const bool cancelled = queue.cancelled(operation.ticket);
             if (!session.failed() && !cancelled && completion.status == STATUS_OK &&
-                (request->operation == static_cast<uint64_t>(io_operation::Read) ||
-                 request->operation == static_cast<uint64_t>(io_operation::Identify)))
+                (request->operation == io_operation::Read ||
+                 request->operation == io_operation::Identify))
                 ::memcpy(session.payload() + request->buffer_offset, completion.data,
                          completion.size);
             if (session.failed() ||
@@ -213,7 +182,7 @@ int main() {
                     break;
                 io_ticket ticket{};
                 const auto admitted = queue->admit(ticket);
-                if (admitted == io_admission::Empty || admitted == io_admission::Backpressure)
+                if (admitted == io_admission::Empty)
                     continue;
                 if (admitted != io_admission::Ready) {
                     client.session.abort();
@@ -224,7 +193,7 @@ int main() {
                 if (status == STATUS_OK)
                     status = validate(request);
                 if (status == STATUS_OK &&
-                    request.operation == static_cast<uint64_t>(io_operation::Flush)) {
+                    request.operation == io_operation::Flush) {
                     flush = {&client, ticket, false};
                     again = true;
                     break;
@@ -233,7 +202,7 @@ int main() {
                 if (status == STATUS_OK) {
                     const io_ticket device_ticket{static_cast<uint32_t>(slot),
                                                   ++operation.generation};
-                    const auto kind = static_cast<io_operation>(request.operation);
+                    const auto kind = request.operation;
                     const auto* source = kind == io_operation::Write
                                              ? client.session.payload() + request.buffer_offset
                                              : nullptr;
@@ -241,8 +210,7 @@ int main() {
                         device.submit(device_ticket, kind, request.offset, request.length, source);
                 }
                 if (status == STATUS_OK) {
-                    if (request.operation == static_cast<uint64_t>(io_operation::Write) &&
-                        !queue->commit(ticket))
+                    if (!queue->commit(ticket))
                         sys::exit(STATUS_INTERNAL);
                     operation.client = &client;
                     operation.ticket = ticket;
@@ -263,14 +231,9 @@ int main() {
                 again = true;
             }
             if (client.session.done()) {
-                (void) sys::channel_close(client.channel.selector());
-                client.session.reset();
                 auto retired = std::move(*link);
                 *link = std::move(retired->next);
                 continue;
-            } else if (client.session.arm() != STATUS_OK) {
-                client.session.abort();
-                again = true;
             }
             link = &client.next;
         }
@@ -282,7 +245,7 @@ int main() {
             while (*tail) tail = &(*tail)->next;
             *tail = std::move(first);
         }
-        if (const auto rc = directory.arm().status; rc != STATUS_OK)
+        if (const auto rc = directory.arm(); rc != STATUS_OK)
             sys::exit(rc);
         if (!again) {
             const auto deadline =

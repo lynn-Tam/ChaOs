@@ -354,32 +354,29 @@ template<usize op>
 }
 
 template<usize op>
-[[nodiscard]] auto memory_write(Call& inv) noexcept -> Result {
-    auto memory = inv.cspace.resolve<mm::Mem>(
-        handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Manage));
+[[nodiscard]] auto memory_copy(Call& inv) noexcept -> Result {
+    constexpr bool write = op == SYS_MEMORY_WRITE;
+    auto memory = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Map));
     if (!memory) return returned(cap_status(memory.error()));
-    const usize offset = inv.trap.arg(1);
-    const usize source = inv.trap.arg(2);
-    const usize size = inv.trap.arg(3);
-    if (size == 0 || size > mm::page_size - (offset & (mm::page_size - 1)))
-        return returned(STATUS_BAD_ARGS);
-    const auto effective = memory.value().view();
+    const usize offset = inv.trap.arg(1), aperture = inv.trap.arg(2), size = inv.trap.arg(3);
+    if (!size || size > mm::page_size - offset % mm::page_size) return returned(STATUS_BAD_ARGS);
+    const auto effective = memory->view();
     const auto* limit = std::get_if<cap::MemLimit>(&effective.data);
-    if (limit == nullptr
-        || !limit->range.contains(mm::ObjectRange{offset / mm::page_size, 1})
-        || !limit->perms.contains(mm::Perm::Write))
-        return returned(STATUS_BAD_RIGHTS);
+    if (!limit || !limit->range.contains(mm::ObjectRange{offset / mm::page_size, 1})
+        || !limit->perms.contains(write ? mm::Perm::Write : mm::Perm::Read)) return returned(STATUS_BAD_RIGHTS);
     auto* buffer = inv.target->ipc_buffer();
-    if (buffer == nullptr) return returned(STATUS_BAD_ARGS);
+    if (!buffer) return returned(STATUS_BAD_ARGS);
     auto access = buffer->access();
     if (!access) return returned(STATUS_RETRY);
-    // The source lease pins bytes without acquiring locks during the copy.
-    // A dest aliased by this IPC mapping is rejected by write(), which
-    // requires private storage with no attachments or other page leases.
-    const auto bytes = access.value().bytes(source, size);
+    const auto bytes = access->bytes<write ? mm::Perm::Read : mm::Perm::Write>(aperture, size);
     if (bytes.empty()) return returned(STATUS_BAD_ARGS);
-    auto written = memory.value()->write(offset, bytes);
-    return returned(written ? STATUS_OK : mem_status(written.error()));
+    // Both page leases survive this one bounded, alias-safe copy. No stack
+    // snapshot or revocable userspace mapping is needed in either direction.
+    const auto result = [&] {
+        if constexpr (write) return memory.value()->write(offset, bytes);
+        else return memory.value()->read(offset, bytes);
+    }();
+    return returned(result ? STATUS_OK : mem_status(result.error()));
 }
 
 template<usize op>

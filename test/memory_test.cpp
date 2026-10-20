@@ -540,7 +540,7 @@ bool test_reverse_attachment_drives_destroy_invalidation(
         && fixture.pmm().free_page_count() == free_before;
 }
 
-bool test_private_memory_initialization(const TestContext&) noexcept {
+bool test_memory_byte_access(const TestContext&) noexcept {
     MemoryFixture fixture{};
     if (!fixture.initialize()) return false;
 
@@ -557,13 +557,17 @@ bool test_private_memory_initialization(const TestContext&) noexcept {
     if (memory.write(page_size - 1, {data, sizeof(data)})) return false;
     {
         auto loan = memory.materialize(0);
-        if (!loan || memory.write(0, {data, sizeof(data)}) || memory.begin_transfer(0)) return false;
+        if (!loan || !memory.write(0, {data, sizeof(data)}) || memory.begin_transfer(0)
+            || fixture.pmm().bytes(loan->page())[0] != data[0]) return false;
+        auto* bytes = fixture.pmm().bytes(loan->page());
+        if (!memory.read(0, {bytes + 1, sizeof(data)}) || bytes[1] != data[0] || bytes[2] != data[1]
+            || !memory.write(0, {data, sizeof(data)})) return false;
     }
     FakeMapping reader{};
     if (!memory.attach(reader.attachment, Perms::of(Perm::Read))) return false;
     const auto while_mapped = memory.write(0, {data, sizeof(data)});
-    if (while_mapped || while_mapped.error() != MemErr::Busy
-        || !reader.attachment.detach()) return false;
+    if (!while_mapped || !memory.read(0, {output, sizeof(output)})
+        || output[0] != data[0] || output[1] != data[1] || !reader.attachment.detach()) return false;
     {
         auto transfer = memory.begin_transfer(0);
         if (!transfer || fixture.pmm().bytes(transfer.value().page())[17] != data[0]) return false;
@@ -1265,8 +1269,8 @@ static bool test_pager_requests_follow_mem_lifetime(const TestContext&) noexcept
 
 void register_memory_tests(TestRegistry& registry) noexcept {
     (void)registry.add("memory", "Mem and Pager session own requests through requeue and actual Reply retirement", test_pager_requests_follow_mem_lifetime);
-    (void)registry.add("memory", "private page initialization excludes loans, mappings and sealed content",
-        test_private_memory_initialization);
+    (void)registry.add("memory", "byte access pins RAM across mappings and loans while seal excludes writes",
+        test_memory_byte_access);
     (void)registry.add(
         "memory",
         "anonymous sparse pages own zeroed resident frames",

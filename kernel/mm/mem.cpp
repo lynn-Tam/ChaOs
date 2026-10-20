@@ -573,11 +573,11 @@ void PageTransfer::abort() noexcept {
     page_.reset();
 }
 
-auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config config, object::ref<> cpu) noexcept
+auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config config) noexcept
     -> std::expected<Data, MemErr> {
     if (!bytes || bytes % page_size) return std::unexpected(MemErr::InvalidSize);
     Data d{pmm, bytes / page_size};
-    d.payer_ = payer; d.cpu_ = std::move(cpu);
+    d.payer_ = payer;
     auto ready = std::visit([&]<class C>(C& c) noexcept -> std::expected<void, MemErr> {
         if constexpr (std::same_as<C, AnonCfg>) {
             if (!valid_perms(c.perms)) return std::unexpected(MemErr::InvalidAccess);
@@ -618,7 +618,7 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
 
 Mem::Mem(Data&& d) noexcept
     : payer_(std::move(d.payer_)), pmm_(d.pmm_), logical_pages_(d.pages_),
-      cpu_(std::move(d.cpu_)), store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
+      store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
     libk_assert(store_ && logical_pages_);
     if (std::holds_alternative<Extents>(*store_) && perms_.contains(Perm::Execute)) {
         seal_ = SealState::Executable;
@@ -837,6 +837,7 @@ auto Mem::observe_usage(usize page_index, bool accessed, bool dirty) noexcept ->
 auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admission authority,
     std::span<const object::ref<>*> gates, const cap::GrantLease* grant) noexcept -> std::expected<void, MemErr> {
     Source::Publication publication;
+    auto cpu = context.thread.payer();
     {
         sync::Lock guard{lock_};
         if (state_ != MemState::Live || !store_ || !std::get_if<Paged>(&*store_))
@@ -859,7 +860,9 @@ auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admissio
             trim_cursor_ = range.base(); trim_removing_ = false; trim_status_ = STATUS_OK;
             scan_ = attachments_.empty() ? nullptr : &attachments_.front();
         };
-        if (op.start(cpu_, self, authority, gates, Source::Action::bind(install), grant) != STATUS_OK) {
+        // Execution is sponsored by this operation's caller, never permanently
+        // by whoever created the transferable memory object.
+        if (op.start(std::move(cpu), self, authority, gates, Source::Action::bind(install), grant) != STATUS_OK) {
             trim_op_.reset();
             return std::unexpected(MemErr::Busy);
         }
@@ -893,18 +896,16 @@ auto Mem::write(usize offset, std::span<const byte> input) noexcept -> std::expe
         if (state_ != MemState::Live || std::get_if<Anon>(&*store_) == nullptr ||
             seal_ != SealState::Loadable || !perms_.contains(Perm::Write))
             return std::unexpected(MemErr::InvalidAccess);
-        if (!attachments_.empty() || operations_ != 0) return std::unexpected(MemErr::Busy);
     }
     auto lease = materialize(offset / page_size);
     if (!lease) return std::unexpected(lease.error());
     {
         sync::Lock guard{lock_};
-        // Allocation happened without the lock. Recheck publication and
-        // sealing before the bounded copy; our lease is the sole operation.
+        // The page lease pins storage; the lock serializes this bounded write
+        // with sealing. Read-only mappings do not make mutable RAM immutable.
         if (state_ != MemState::Live || seal_ != SealState::Loadable)
             return std::unexpected(MemErr::InvalidAccess);
-        if (!attachments_.empty() || operations_ != 1) return std::unexpected(MemErr::Busy);
-        memcpy(pmm_->bytes(lease.value().page()) + within, input.data(), input.size());
+        memmove(pmm_->bytes(lease.value().page()) + within, input.data(), input.size());
     }
     return {};
 }
@@ -933,7 +934,7 @@ auto Mem::read(usize offset, std::span<byte> output) noexcept -> std::expected<v
         const usize remaining = output.size() - copied;
         const usize amount = remaining < available ? remaining : available;
         const byte* const source = pmm_->bytes(lease.value().page()) + page_offset;
-        memcpy(output.data() + copied, source, amount);
+        memmove(output.data() + copied, source, amount);
         copied += amount;
     }
     return {};

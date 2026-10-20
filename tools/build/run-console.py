@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the production console through ordinary serial bytes."""
+import json
 import os
 from pathlib import Path
 import re
@@ -9,7 +10,7 @@ import sys
 import time
 import tempfile
 
-def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_check=False, missing_storage=False, disk=None, persisted=False):
+def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -74,6 +75,12 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
             if all(f'{name} {value}'.encode() in state for name, value in expected.items()): return
             if time.monotonic() > end: raise RuntimeError(f'state did not reach {expected}: {state!r}')
 
+    def instance(name):
+        transcript = run(f'bus call . Resolve name={name}', b'/ > ')
+        for line in transcript.splitlines():
+            if line.startswith(b'{'): return json.loads(line)['instance']
+        return None
+
     def suspend(command):
         start = len(output); send(command.encode() + b'\r'); time.sleep(0.15); send(b'\x1a')
         until(b'/ > ', start)
@@ -82,6 +89,17 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
 
     try:
         until(b'/ > ')
+        if recovery:
+            for name in ('ubusd', 'session', 'devices'):
+                run('sleep 10000 &', b'Running')
+                start = len(output); send(f'svc stop {name}\r'.encode())
+                until(b'myos native shell\n', start)
+                boundary = output.index(b'myos native shell\n', start) + len(b'myos native shell\n')
+                until(b'/ > ', boundary)
+                run('cat /boot/README.TXT', b'myos disk file service')
+                if b'Running' in run('jobs', b'/ > '): raise RuntimeError('old job survived subtree replacement')
+            print(f'[supervisor] OK: {smp} harts, registry/session/devices loss, owned subtree drain and root budget reuse')
+            return
         run('help', b'PROGRAM [ARGS]')
         run('svc', b'shell running')
         run('ls /boot', b'cat.elf')
@@ -118,13 +136,6 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
         if exec_check:
             run('cow', b'ELF data, COW and BSS ok')
             run('cow', b'ELF data, COW and BSS ok')
-        if service_fault:
-            for name in ('files', 'vfs'):
-                run(f'svc stop {name}', b'service change requested')
-                states({name: 'stopped'})
-                run(f'svc start {name}', b'service change requested')
-                states({'vfs': 'running'})
-            run('cat /boot/README.TXT', b'myos disk file service')
         if disk:
             states({'store': 'running'})
             run('mkfs', b'/ > ')
@@ -204,33 +215,49 @@ def exercise(qemu, kernel, bundle, smp, iterations, service_fault=False, exec_ch
             send(b'X\x0f'); until(b'Save failed:', start)
             send(b'\x18'); until(b'Save changes?', start); send(b'n'); until(b'/ > ', start)
             run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/account stats ok')
+        if exec_check or disk:
+            program = '/boot/foreign.elf'
+            if disk:
+                run('cp /boot/foreign.elf package', b'/ > ')
+                program = '/package'
+            run(f'bus call session Spawn name=foreign program={program}', b'"gen"')
+            run('bus wait providers/foreign/math', b'/ > ')
+            run('bus describe providers/foreign/math', b'"Add"')
+            run('bus call providers/foreign/math Add a=11 b=31', b'"sum":42')
+        if disk:
+            store_instance = instance('store.admin')
+            if store_instance is None: raise RuntimeError('missing store publication')
         start = len(output); send(b'tasks\r'); until(b'myos tasks', start)
         until(b'shell', start); until(b'Running', start)
-        send(b'fshell\r3'); until(b'Slot', start); until(b'Grant', start); until(b'Live', start)
-        send(b'l'); time.sleep(0.3); send(b'\x1b[F'); until(b'Deploy', start)
+        send(b'fshell\r3'); until(b'Slot', start); until(b'Grant', start); until(b'Valid', start)
+        send(b'l'); time.sleep(0.3); send(b'\x1b[F'); until(b'deployment', start)
+        start = len(output); send(b'h'); until(b'Slot', start)
         start = len(output); send(b'\x1b[Hv'); until(b'| grants', start)
         start = len(output); send(b'v'); until(b'| objects', start); until(b'Domain', start)
-        start = len(output); send(b'\r'); until(b'parent', start); until(b'boundary', start)
+        start = len(output); send(b'\r'); until(b'link_id', start); until(b'flags', start)
         send(b'hh')
         send(b'1'); send(b'\x1a'); until(b'/ > ', start)
         state = run('jobs', b'Suspend'); token = int(re.findall(rb'\[(\d+)\]', state)[-1])
         start = len(output); send(f'fg {token}\r'.encode()); until(b'myos tasks', start)
         if disk:
-            send(b'2'); until(b'block-8', start)
+            send(b'2fblock\r'); until(b'block-8', start)
             time.sleep(0.6)
             mark = len(output); send(b'3'); until(b'| objects', mark); until(b'IRQ', mark)
-            send(b'2'); time.sleep(0.6)
+            send(b'2fblock\r'); time.sleep(0.6)
             mark = len(output); send(b'x'); until(b'Stopped', mark)
             mark = len(output); send(b's'); until(b'Running', mark)
         send(b'q'); until(b'/ > ', start)
         start = len(output); send(b'view tasks\r'); until(b'myos tasks', start)
         time.sleep(0.5); send(b'q'); until(b'/ > ', start)
         if disk:
+            deadline = time.monotonic() + 20
+            while (current := instance('store.admin')) is None or current == store_instance:
+                if time.monotonic() >= deadline: raise RuntimeError('store did not republish after device replacement')
             states({'store': 'running'})
             run('cat note', b'hello-again')
             run('fs sync', b'/ > ')
         if missing_storage: run('cat note', b'error: ')
-        print(f'[interactive] OK: {smp} harts, pipelines, Ctrl+C/Z, focus, typed management and file/device interaction')
+        print(f'[interactive] OK: {smp} harts, pipelines, Ctrl+C/Z, focus, dynamic management and file/device interaction')
     except Exception:
         sys.stdout.buffer.write(output)
         raise
@@ -249,14 +276,13 @@ if __name__ == '__main__':
     mode = sys.argv[5] if len(sys.argv) >= 6 else ''
     iterations = int(sys.argv[6]) if len(sys.argv) >= 7 else 1
     for smp in harts.split(','):
-        if mode == 'interactive':
+        if mode in ('interactive', 'recovery'):
             temporary = Path(__file__).resolve().parents[2] / '.tmp/project/interactive-storage'
             temporary.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=temporary) as directory:
                 disk = Path(directory) / 'data.img'
                 with disk.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                exercise(qemu, kernel, bundle, smp, iterations, disk=disk)
-                exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
+                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery')
+                if mode == 'interactive': exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
         else:
-            exercise(qemu, kernel, bundle, smp, iterations, service_fault=mode == 'service-fault',
-                     exec_check=mode == 'exec', missing_storage=mode == 'missing-storage')
+            exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage')

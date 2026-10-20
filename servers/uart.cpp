@@ -1,7 +1,7 @@
+#include <vm.hpp>
 #include <util.hpp>
 #include <start.hpp>
-#include <protocols/stream.hpp>
-#include <protocols/msg.hpp>
+#include <lib/stream/stream.hpp>
 #include <servers/uart.hpp>
 #include <libk/parse.hpp>
 
@@ -15,8 +15,8 @@ int main(int argc, char** argv) {
     const auto device = info.selector(uart_mem);
     const auto irq = info.selector(uart_irq);
     const auto events = info.events;
-    const auto output = info.selector(con_output);
-    const auto input = info.selector(con_input);
+    const auto output = info.selector(rt_stdin);
+    const auto input = info.selector(rt_stdout);
     constexpr uintptr_t base = 0x30010000;
     auto region = sys::vm_slice(vspace, base, 4096, VM_READ | VM_WRITE, RIGHT_MAP);
     if (region.status != STATUS_OK) sys::exit(region.status);
@@ -34,28 +34,19 @@ int main(int argc, char** argv) {
     uart_port port{base + *offset};
     port.enable_rx();
     port.write("uart: console ready\n");
-    bool line_start = true;
-    msg_frame pending{};
+    str_chunk pending{};
     bool pending_valid{};
     for (;;) {
         // Bound each drain so sustained output cannot starve receive/IRQ ack.
         for (unsigned count = 0; count < 16; ++count) {
-            msg_frame message{};
-            const auto result = msg_recv(output, message, false);
-            if (result.status == STATUS_WOULD_BLOCK || result.status == STATUS_BUSY)
-                break;
-            if (result.status != STATUS_OK) sys::exit(result.status);
-            if (message.operation == static_cast<uint64_t>(con_operation::Prompt)) {
-                if (!line_start) {
-                    port.put('\n');
-                    line_start = true;
-                }
-            } else if (message.operation != static_cast<uint64_t>(con_operation::Bytes)) {
-                continue;
-            }
+            ubus_msg event;
+            const auto status = ubus_receive_event(output, event);
+            if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) break;
+            if (status != STATUS_OK) sys::exit(status);
+            str_chunk message;
+            if (str_decode(event, message) != STATUS_OK) continue;
             for (size_t i = 0; i < message.size; ++i) {
                 port.put(message.data[i]);
-                line_start = message.data[i] == '\n' || message.data[i] == '\r';
             }
         }
         if (!pending_valid) {
@@ -66,13 +57,11 @@ int main(int argc, char** argv) {
             }
         }
         if (pending_valid) {
-            const auto result = msg_send(input, pending, false);
-            if (result.status == STATUS_OK) {
+            const auto status = str_send(input, pending, false);
+            if (status == STATUS_OK) {
                 pending = {};
                 pending_valid = false;
-            } else if (result.status != STATUS_WOULD_BLOCK && result.status != STATUS_BUSY) {
-                if (result.status != STATUS_OK) sys::exit(result.status);
-            }
+            } else if (status != STATUS_WOULD_BLOCK && status != STATUS_BUSY) sys::exit(status);
         }
         if (!pending_valid) {
             const auto observed = sys::irq_observe(irq);
