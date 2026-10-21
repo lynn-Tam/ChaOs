@@ -59,7 +59,7 @@ constexpr Rights resource_rights = Rights::of(
     Right::Delegate,
     Right::Inspect,
     Right::Create,
-    Right::Split,
+    Right::Control, Right::Split,
     Right::Close, Right::Destroy,
     Right::Adopt, Right::Rebill, Right::Revoke);
 

@@ -672,6 +672,35 @@ template<usize op>
 }
 
 template<usize op>
+[[nodiscard]] auto account_resize(Call& inv) noexcept -> Result {
+    auto account = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!account) return returned(cap_status(account.error()));
+    const auto view = account->view();
+    const auto& limit = std::get<cap::Quota>(view.data);
+    const resource::budget target{inv.trap.arg(1), inv.trap.arg(2)};
+    if (!limit.budget.contains(target)) return returned(STATUS_DENIED);
+    auto self = account->reference();
+    if (!self) return returned(STATUS_BUSY);
+    std::optional<cap::Resolved<resource::Account>> sponsor;
+    object::ref<> payer;
+    resource::budget ceiling;
+    std::array<const cap::GrantLease*, 2> grants{&account->lease(), nullptr};
+    if (inv.trap.arg(3)) {
+        auto resolved = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(3)), cap::Rights::of(cap::Right::Split));
+        if (!resolved) return returned(cap_status(resolved.error()));
+        auto ref = resolved->reference();
+        if (!ref) return returned(STATUS_BUSY);
+        payer = std::move(*ref);
+        ceiling = std::get<cap::Quota>(resolved->view().data).budget;
+        sponsor.emplace(std::move(*resolved));
+        grants[1] = &sponsor->lease();
+    }
+    auto authority = inv.cpu.grants.admission(std::span{grants.data(), sponsor ? 2u : 1u});
+    return returned(account->object().resize(*self, target, payer, ceiling,
+        [&](auto gates, auto&& commit) { return authority.publish(gates, commit); }));
+}
+
+template<usize op>
 [[nodiscard]] auto account_close(Call& inv) noexcept -> Result {
     auto account = inv.cspace.resolve<resource::Account>(
         handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));

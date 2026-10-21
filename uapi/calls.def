@@ -8,6 +8,7 @@ CALL(EXECUTION_SET, 3, execution_set, Call) /* a0=Thread, a1=enabled; returns in
 CALL(EXECUTION_DETACH, 9, execution_detach, Call) /* a0=Thread(Control), a1=expected association generation */
 CALL(SC_CONFIGURE, 5, sc_configure, Call) /* a0=SC(Control), a1=budget ns, a2=period ns, a3=weight, a4=CPU mask; unbound only */
 CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), 0=current; a1=IPC offset */
+CALL(ACCOUNT_RESIZE, 77, account_resize, Call) /* a0=Account(Control), a1=memory, a2=caps, a3=actual sponsor(Split), optional for shrink */
 CALL(ACCOUNT_INFO, 10, info_call, Call) /* a0=Account(Inspect), a1=IPC offset */
 CALL(VSPACE_INFO, 11, info_call, Call) /* a0=VSpace(Inspect), a1=IPC offset; whole-space authority */
 CALL(EXECUTION_STOP, 15, execution_stop, Call) /* a0=Thread(Control); irreversible intent, Exit remains observable */
@@ -37,7 +38,7 @@ CALL(VM_GUARD, 37, vm_call, Call)
  *   a1-a3: type-specific scalar configuration
  * Returns a0=status and a1=new capability in the caller's CSpace.
  */
-CALL(ACCOUNT_CREATE, 48, account_create, Create) /* a1=memory, a2=caps, a3=kind mask */
+CALL(ACCOUNT_CREATE, 48, account_create, Create) /* a1=initial memory, a2=initial caps, a3=kind mask, a4-a5=ceilings (both zero: initial) */
 CALL(MEMORY_CREATE, 49, memory_create, Create) /* a1=bytes, a2=access bits */
 CALL(VSPACE_CREATE, 50, vspace_create, Create)
 CALL(CSPACE_CREATE, 51, cspace_create, Create) /* a1=slot quota, a2=page quota */

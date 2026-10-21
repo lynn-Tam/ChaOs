@@ -2,7 +2,8 @@
 #include <string_view>
 #include <vector>
 #include <memory>
-#include <lib/stream/stream.hpp>
+#include <posix.hpp>
+#include <unistd.h>
 #include <ipc.hpp>
 #include <libk/parse.hpp>
 #include <util.hpp>
@@ -16,6 +17,7 @@ static void check(bool value) {
 }
 
 int main(int argc, char** argv) {
+    if (const auto status = px_init(); status != STATUS_OK) return status;
 
     const auto& info = rt_startup();
     check((static_cast<size_t>(argc) == 1 || static_cast<size_t>(argc) == 3) &&
@@ -82,8 +84,8 @@ int main(int argc, char** argv) {
     }
     check(count && count < pressure.size());
     for (auto& allocation : pressure) allocation.reset();
-    str_writer{info.selector(rt_stdout)}.write(
-        "[demand] initialized data, BSS, private writes and VM reuse ok\n");
+    constexpr std::string_view message{"[demand] initialized data, BSS, private writes and VM reuse ok\n"};
+    check(write(STDOUT_FILENO, message.data(), message.size()) == int64_t(message.size()));
     if (static_cast<size_t>(argc) == 3) {
         const auto duration = libk::parse<uint64_t>(argv[1]);
         const auto seed = libk::parse<uint64_t>(argv[2]);
@@ -93,7 +95,8 @@ int main(int argc, char** argv) {
 
         const auto deadline = rt_after_ms(*duration);
         check(static_cast<bool>(deadline));
-        str_writer{info.selector(rt_stdout)}.write("[demand] holding private pages\n");
+        constexpr std::string_view holding{"[demand] holding private pages\n"};
+        check(write(STDOUT_FILENO, holding.data(), holding.size()) == int64_t(holding.size()));
         check(ev_wait(info.events, *deadline).status ==
               STATUS_TIMED_OUT);
         check(initialized[0] == *seed && zeroed[0] == static_cast<uint8_t>(*seed + 7));

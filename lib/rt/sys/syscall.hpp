@@ -299,8 +299,12 @@ inline void yield() noexcept {
     CreateAuth auth,
     word_t memory,
     word_t caps,
-    word_t kinds) noexcept -> SysResult {
-    return call(SYS_ACCOUNT_CREATE, auth.account, memory, caps, kinds, 0, 0, auth.scope);
+    word_t kinds, word_t max_memory = 0, word_t max_caps = 0) noexcept -> SysResult {
+    return call(SYS_ACCOUNT_CREATE, auth.account, memory, caps, kinds, max_memory, max_caps, auth.scope);
+}
+
+[[nodiscard]] inline auto account_resize(cap_t account, word_t memory, word_t caps, cap_t sponsor = 0) noexcept -> SysResult {
+    return call(SYS_ACCOUNT_RESIZE, account, memory, caps, sponsor);
 }
 
 [[nodiscard]] inline auto account_close(cap_t pool) noexcept

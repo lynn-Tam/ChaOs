@@ -1,11 +1,12 @@
-#include <test/user/task.hpp>
+#include "../task.hpp"
 #include <proc.hpp>
-#include <lib/fs/fs.hpp>
-#include <lib/stream/stream.hpp>
+#include <posix.hpp>
+#include <unistd.h>
 #include <util.hpp>
 #include <vector>
 
 int main() {
+    if (const auto status = px_init(); status != STATUS_OK) return status;
     const auto& info = rt_startup();
     const auto check = [](bool ok) {
         if (!ok)
@@ -17,14 +18,18 @@ int main() {
         sys::exit(notification.status);
     cap_owner events{notification.value};
     ubus_conn directory, files;
-    auto status = directory.bind(info.selector(ubus_directory));
-    if (status == STATUS_OK) status = files.connect(directory, "exec", "myos.files", 1, 1);
+    auto status = directory.bind(info.environment);
+    ubus_msg query, response; query.data.put("name", "exec");
+    if (status == STATUS_OK) status = directory.invoke("Get", std::move(query), response);
+    if (status == STATUS_OK) status = files.bind(response.capability(response.data["connector"]));
     if (status != STATUS_OK) sys::exit(status);
-    auto mem = fs_map(files, "/boot/sleep.elf", VM_READ | VM_EXECUTE);
-    check(mem.has_value());
+    query = {}; query.data.put("path", "/boot/sleep.elf").put("perms", word_t{VM_READ | VM_EXECUTE});
+    check(files.invoke("Map", std::move(query), response) == STATUS_OK);
+    const auto buffer = response.data["buffer"].as<ubus_buffer>(); check(bool(buffer));
+    auto memory = response.take(response.data["buffer"]);
     test_image image;
     if (const auto rc =
-            image.open(info.vspace, mem->memory.selector(), mem->size, VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
+            image.open(info.vspace, memory.selector(), buffer->size, VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
         rc != STATUS_OK)
         sys::exit(rc);
     test_tasks tasks;
@@ -81,7 +86,7 @@ int main() {
             sys::exit(rc);
         check(wait(id) == STATUS_CANCELED);
     }
-    str_writer{info.selector(rt_stdout)}.write(
-        "[process] direct spawn, retention, deadlines and reuse ok\n");
+    constexpr std::string_view message{"[process] direct spawn, retention, deadlines and reuse ok\n"};
+    check(write(STDOUT_FILENO, message.data(), message.size()) == int64_t(message.size()));
     sys::exit();
 }

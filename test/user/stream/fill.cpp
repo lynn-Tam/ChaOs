@@ -1,6 +1,5 @@
 #include <posix.hpp>
 #include <start.hpp>
-#include <lib/stream/stream.hpp>
 #include <unistd.h>
 #include <cerrno>
 #include <uapi/abi.h>

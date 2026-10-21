@@ -74,4 +74,4 @@ ftxui = static_library('ftxui', files(
   'src/ftxui/screen/terminal.cpp',
 ), include_directories: ftxui_inc,
   cpp_args: user_cpp_args + ['-DFTXUI_MYOS', '-ffunction-sections', '-fdata-sections'],
-  pic: false, build_by_default: false)
+  pic: false, implicit_include_directories: false, build_by_default: false)

@@ -3,6 +3,7 @@
 #include <start.hpp>
 #include <expected>
 #include <algorithm>
+#include <memory>
 #include <string.h>
 
 inline auto vm_call(CreateAuth auth, cap_t space, word_t kind, VmReq request = {}) noexcept -> status_t {
@@ -125,9 +126,9 @@ struct vm_area {
         noexcept -> std::expected<vm_area, status_t> {
         return map(arena, std::move(memory), va, size, VM_READ | VM_WRITE | VM_MAP_PRIVATE);
     }
-    static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size)
+    static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size, word_t perms = VM_READ | VM_WRITE)
         noexcept -> std::expected<vm_area, status_t> {
-        const auto result = sys::memory_create(auth, size, VM_READ | VM_WRITE);
+        const auto result = sys::memory_create(auth, size, perms);
         cap_owner memory{result.value};
         if (result.status != STATUS_OK) return std::unexpected(result.status);
         for (size_t page = 0; page < size / 4096; ++page)
@@ -149,3 +150,20 @@ private:
         mapped_ = std::exchange(other.mapped_, 0);
     }
 };
+
+// Native, explicitly funded object storage. The object dies before its mapping;
+// the allocation's Account and the provider-owned Scope remain independent.
+template<class T> struct vm_delete {
+    vm_area storage;
+    void operator()(T* object) noexcept { std::destroy_at(object); storage = {}; }
+};
+template<class T> using vm_ptr = std::unique_ptr<T, vm_delete<T>>;
+template<class T, class... Args>
+auto vm_new(CreateAuth auth, Args&&... args) noexcept -> std::expected<vm_ptr<T>, status_t> {
+    constexpr size_t bytes = (sizeof(T) + (alignof(T) > 4096 ? alignof(T) - 1 : 0) + 4095) & ~size_t{4095};
+    auto storage = vm_area::create(auth, rt_vm(), 0, bytes);
+    if (!storage) return std::unexpected(storage.error());
+    const auto address = (storage->address + alignof(T) - 1) & ~uintptr_t{alignof(T) - 1};
+    auto* object = std::construct_at(reinterpret_cast<T*>(address), std::forward<Args>(args)...);
+    return vm_ptr<T>{object, vm_delete<T>{std::move(*storage)}};
+}

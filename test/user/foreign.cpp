@@ -12,10 +12,13 @@ int main() {
     if (status == STATUS_OK) status = object.open();
     if (status != STATUS_OK) return status;
     ubus_conn publisher;
-    status = publisher.bind(rt_startup().selector(ubus_publisher));
+    status = publisher.bind(rt_startup().environment);
     if (status != STATUS_OK) return status;
-    const auto published = object.publish(publisher, "math");
-    if (!published) return published.error();
+    auto connector = object.connector(); if (!connector) return connector.error();
+    ubus_msg request, response;
+    request.data.put("name", "math").put("interface", "example.math").put("version", uint64_t{1})
+        .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    status = publisher.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     for (;;) {
         status = object.poll();
         if (status == STATUS_WOULD_BLOCK) status = ev_wait(rt_startup().events).status;

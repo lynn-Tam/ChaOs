@@ -13,12 +13,13 @@ inline constexpr auto proc_retryable(status_t s) noexcept -> bool {
 
 inline constexpr word_t proc_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc) | OBJ_BIT(ObjDomain)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
-    | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjAccount) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
+    | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjAccount) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
 
 struct proc_quota {
     word_t bytes{1024 * 1024}, caps{256}, kinds{proc_base_kinds};
-    word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE};
+    word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE | RIGHT_INSPECT};
     word_t watches{64}, hints{16};
+    word_t max_bytes{}, max_caps{}; // Zero keeps that dimension's initial ceiling.
 };
 struct proc_exit { status_t status{}; };
 struct proc_auth { CreateAuth alloc{}; uint32_t cpus{}; cap_t domain{}; };
@@ -37,7 +38,13 @@ public:
     proc_task(const proc_task&) = delete;
     auto operator=(const proc_task&) -> proc_task& = delete;
 
-    ~proc_task() { if (account_) sys::exit(STATUS_BUSY); }
+    ~proc_task() {
+        // Normal owners retain this handle through poll/collect. If the owner
+        // releases it early, native Scope/Account cleanup owns the remaining
+        // work; destruction neither waits nor chooses a process exit policy.
+        if (scope_) (void)sys::scope_close(scope());
+        if (account_) (void)sys::account_close(pool());
+    }
     auto pool() const noexcept -> cap_t { return account_.selector(); }
     auto scope() const noexcept -> cap_t { return scope_.selector(); }
     auto alloc() const noexcept -> CreateAuth { return {pool(), scope()}; }
@@ -46,7 +53,7 @@ public:
     auto cspace() const noexcept -> cap_t { return cs_.selector(); }
     auto open(const proc_auth& auth, const proc_quota& q) noexcept -> status_t {
         if (state_ != state::New || account_) return STATUS_BUSY;
-        const auto g = sys::account_create(auth.alloc, q.bytes, q.caps, q.kinds);
+        const auto g = sys::account_create(auth.alloc, q.bytes, q.caps, q.kinds, q.max_bytes ? q.max_bytes : q.bytes, q.max_caps ? q.max_caps : q.caps);
         if (g.value) account_ = cap_owner{g.value};
         if (g.status != STATUS_OK || !account_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
         const auto owner = sys::scope_create(auth.alloc);
@@ -224,23 +231,15 @@ struct proc_image {
     word_t perms{VM_READ};
 };
 
-struct proc_cap {
-    rt_key key{};
-    uint64_t bytes{};
-    std::variant<cap_t, cap_owner*> cap{}; // Borrow/copy, or consume an owned capability.
-    std::variant<word_t, CapView> limit{}; // Rights-only duplication or a derived typed view.
-    word_t badge{}; // Nonzero requests a Channel endpoint minted by the parent.
-};
 struct proc_layout {
     word_t stack{0x40010000}, stack_size{0x10000};
-    word_t bindings{0x40020000};
     // Launcher defaults; the actual IPC VA travels in ThreadInit and auxv.
     word_t ipc{0x40000000};
 };
 struct proc_opts {
     std::span<const std::string_view> argv{};
     std::span<const std::string_view> envp{};
-    std::span<const proc_cap> caps{};
+    cap_t environment{}; // Opaque, copied into the child; no business startup bindings.
     proc_quota resources{};
     uint32_t cpu{};
     proc_layout va{};

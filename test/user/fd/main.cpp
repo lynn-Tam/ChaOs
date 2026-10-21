@@ -2,11 +2,20 @@
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
-#include <lib/fs/fs.hpp>
-#include <lib/stream/stream.hpp>
+#include <ubus/ubus.hpp>
 #include <unistd.h>
 #include <uapi/abi.h>
 #include <string_view>
+
+struct fd_image { cap_owner memory; uint64_t size; };
+static auto fd_map(ubus_conn& files, std::string_view path, word_t perms = VM_READ) -> std::expected<fd_image, status_t> {
+    ubus_msg request, response; request.data.put("path", path).put("perms", perms);
+    const auto status = files.invoke("Map", std::move(request), response);
+    if (status != STATUS_OK) return std::unexpected(status);
+    const auto buffer = response.data["buffer"].as<ubus_buffer>();
+    if (!buffer || buffer->offset) return std::unexpected(STATUS_PEER_FAULT);
+    return fd_image{response.take(response.data["buffer"]), buffer->size};
+}
 
 static int cache() {
     char byte{};
@@ -37,20 +46,23 @@ static int cache() {
     // from this application's read-only Directory grant.
     const auto& env = rt_startup();
     ubus_conn bus, directory;
-    if (bus.bind(env.selector(ubus_directory)) != STATUS_OK || directory.connect(bus, "read", "myos.files", 1, 1) != STATUS_OK) return 62;
-    const auto denied = fs_map(directory, "/boot/cat.elf", VM_READ | VM_EXECUTE);
+    if (bus.bind(env.environment) != STATUS_OK) return 62;
+    ubus_msg query, response; query.data.put("name", "read");
+    if (bus.invoke("Get", std::move(query), response) != STATUS_OK
+        || directory.bind(response.capability(response.data["connector"])) != STATUS_OK) return 62;
+    const auto denied = fd_map(directory, "/boot/cat.elf", VM_READ | VM_EXECUTE);
     if (denied || denied.error() != STATUS_DENIED)
         return 63;
     const int file = open("fd-map", O_RDWR | O_CREAT | O_TRUNC, 0);
     if (file < 0 || write(file, "old", 3) != 3)
         return 64;
-    auto first = fs_map(directory, "fd-map");
+    auto first = fd_map(directory, "fd-map");
     if (!first || first->size != 3)
         return 65;
     auto old = vm_area::map(rt_vm(), std::move(first->memory), 0, 4096, VM_READ);
     if (!old || pwrite(file, "new", 3, 0) != 3)
         return 66;
-    auto second = fs_map(directory, "fd-map");
+    auto second = fd_map(directory, "fd-map");
     if (!second || second->size != 3)
         return 67;
     auto fresh = vm_area::map(rt_vm(), std::move(second->memory), 0, 4096, VM_READ);

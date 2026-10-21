@@ -435,14 +435,16 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto account_create(Call& in
         return returned(cap_status(pool.error()));
     }
     const resource::budget limit{.memory = trap.arg(1), .caps = trap.arg(2)};
+    const resource::budget ceiling = trap.arg(4) || trap.arg(5)
+        ? resource::budget{trap.arg(4), trap.arg(5)} : limit;
     const u64 kinds = trap.arg(3);
     const auto parent = pool_quota(pool.value());
-    if (!parent || !parent->budget.contains(limit) || (kinds & ~parent->object_kinds) != 0 || kinds == 0) {
+    if (!parent || !ceiling.contains(limit) || !parent->budget.contains(ceiling) || (kinds & ~parent->object_kinds) != 0 || kinds == 0) {
         return returned(STATUS_DENIED);
     }
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Create,
-                        cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                        cap::Right::Control, cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
     auto admission = check_create<resource::Account>(inv, pool.value(), limit);
     if (!admission) return returned(admission.error());
     auto fee = reserve(pool.value(), object::pool<resource::Account>::slot_charge());
@@ -455,7 +457,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto account_create(Call& in
     }
     auto object = construct<resource::Account>(inv, std::move(*fee), limit, std::move(delegation));
     if (!object) return returned(STATUS_NO_MEMORY);
-    const cap::Quota data{limit, kinds};
+    const cap::Quota data{ceiling, kinds};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);

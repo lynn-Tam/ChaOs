@@ -13,16 +13,10 @@
 !/arch/**
 !/kernel/
 !/kernel/**
-!/servers/
-!/servers/**
-!/programs/
-!/programs/**
 !/uapi/
 !/uapi/**
 !/lib/
 !/lib/**
-!/posix/
-!/posix/**
 !/ubus/
 !/ubus/**
 !/libk/
@@ -38,3 +32,8 @@
 !/third_party/libstdcxx/**
 !/third_party/musl/
 !/third_party/musl/**
+
+!/apps/
+!/apps/**
+!/mgr/
+!/mgr/**

@@ -183,6 +183,8 @@ public:
     }
     ~Account() noexcept;
     auto reserve(object::ref<> self, budget amount) noexcept -> std::expected<Reservation, errc>;
+    template<class Publish> auto resize(const object::ref<>& self, budget target,
+        const object::ref<>& sponsor, budget ceiling, Publish&& publish) noexcept -> status_t;
     auto info(u64) const noexcept -> AccountInfo;
     auto limit() const noexcept -> budget;
     auto available() const noexcept -> budget;
@@ -215,6 +217,71 @@ private:
     usize calls_{};
     object::cleanup cleanup_;
 };
+
+// Cold transfer of unused capacity. Funding and delegation are the sole
+// lineage facts; reserve/refund retain their existing local cost.
+template<class Publish>
+auto Account::resize(const object::ref<>& self, budget target, const object::ref<>& sponsor,
+    budget ceiling, Publish&& publish) noexcept -> status_t {
+    if (self.get() != this) return STATUS_BAD_ARGS;
+    auto* funding = self.funding();
+    object::ref<> parent;
+    {
+        sync::Lock structure{object::Control::lock};
+        if (!funding || !funding->owner_) return STATUS_DENIED;
+        parent = funding->ref_;
+    }
+    // Prepare the possible zero-to-nonzero Charge before the commit locks.
+    object::ref<> prepared = parent, released;
+    auto& payer = *static_cast<Account*>(parent.get());
+    Source::Publication publication;
+    bool changed{};
+    libk::scope_exit notify{[&]() noexcept {
+        publication.publish();
+        if (changed) { payer.service(); service(); object::changed(self.key()); }
+    }};
+    sync::Lock structure{object::Control::lock};
+    if (funding->ref_.id() != parent.id()) return STATUS_STALE;
+    if (funding->rebilling_) return STATUS_BUSY;
+    auto* first = self.id().value < parent.id().value ? this : &payer;
+    auto* second = first == this ? &payer : this;
+    sync::Lock first_lock{first->lock_};
+    sync::Lock second_lock{second->lock_};
+    if (billing_ || finishing_) return STATUS_BUSY;
+    if (phase_ == Phase::Drained) return STATUS_CLOSED;
+    libk_assert((limit_.empty() && !delegation_) ||
+        (delegation_.owner_ == &payer && delegation_.amount_ == limit_));
+    const budget committed{limit_.memory - available_.memory, limit_.caps - available_.caps};
+    if (!target.contains(committed)) return STATUS_BUSY;
+    const budget up{target.memory > limit_.memory ? target.memory - limit_.memory : 0,
+        target.caps > limit_.caps ? target.caps - limit_.caps : 0};
+    const budget down{target.memory < limit_.memory ? limit_.memory - target.memory : 0,
+        target.caps < limit_.caps ? limit_.caps - target.caps : 0};
+    const bool grow = !up.empty();
+    if (grow) {
+        if (phase_ != Phase::Open || payer.phase_ != Phase::Open) return STATUS_CLOSED;
+        if (sponsor.id() != parent.id() || !ceiling.contains(up)) return STATUS_DENIED;
+        if (!payer.available_.contains(up)) return STATUS_NO_MEMORY;
+    }
+    std::array<const object::ref<>*, 2> gates{&self, &parent};
+    const auto result = publish(std::span{gates.data(), grow ? 2u : 1u}, [&] {
+        payer.available_.memory = payer.available_.memory - up.memory + down.memory;
+        payer.available_.caps = payer.available_.caps - up.caps + down.caps;
+        available_ = {target.memory - committed.memory, target.caps - committed.caps};
+        limit_ = target;
+        if (target.empty()) {
+            released = std::move(delegation_.ref_);
+            delegation_.owner_ = nullptr;
+        } else if (!delegation_) {
+            delegation_.owner_ = &payer;
+            delegation_.ref_ = std::move(prepared);
+        }
+        delegation_.amount_ = target;
+        publication = events_.prepare(static_cast<u32>(phase_) == OBJECT_OPEN ? STATE_OPEN : STATE_CLOSING, true);
+        changed = true;
+    });
+    return result;
+}
 
 template<class Commit, class Publish>
 auto Funding::reassign(const object::ref<>& target, const object::ref<>& from, const object::ref<>& to,

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import selectors
 import subprocess
+import struct
 import sys
 import time
 import tempfile
@@ -76,7 +77,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             if time.monotonic() > end: raise RuntimeError(f'state did not reach {expected}: {state!r}')
 
     def instance(name):
-        transcript = run(f'bus call . Resolve name={name}', b'/ > ')
+        transcript = run(f'bus call . Get name={name}', b'/ > ')
         for line in transcript.splitlines():
             if line.startswith(b'{'): return json.loads(line)['instance']
         return None
@@ -90,15 +91,40 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
     try:
         until(b'/ > ')
         if recovery:
-            for name in ('ubusd', 'session', 'devices'):
-                run('sleep 10000 &', b'Running')
-                start = len(output); send(f'svc stop {name}\r'.encode())
-                until(b'myos native shell\n', start)
-                boundary = output.index(b'myos native shell\n', start) + len(b'myos native shell\n')
-                until(b'/ > ', boundary)
-                run('cat /boot/README.TXT', b'myos disk file service')
-                if b'Running' in run('jobs', b'/ > '): raise RuntimeError('old job survived subtree replacement')
-            print(f'[supervisor] OK: {smp} harts, registry/session/devices loss, owned subtree drain and root budget reuse')
+            def managers():
+                text = run('bus call system List', b'"items"')
+                return {item['name']: item['gen'] for line in text.splitlines() if line.startswith(b'{')
+                        for item in json.loads(line)['items']}
+            export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
+            exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
+            run(f'bus call session Configure name=foreign program=/boot/foreign.elf exports=^{exports}', b'"gen":0')
+            run('bus call foreign/math Add a=11 b=31', b'"sum":42')
+            before = managers()
+            # Persist a default package's desired state, then recover its fresh
+            # grants when the enclosing manager is replaced below.
+            start = len(output); send(b'svc restart shell\r')
+            until(b'myos native shell\n', start); until(b'/ > ', output.index(b'myos native shell\n', start))
+            if managers() != before: raise RuntimeError('shell replacement changed its parent or siblings')
+            run('bus call foreign/math Add a=20 b=22', b'"sum":42')
+            run('sleep 10000 &', b'Running')
+            start = len(output); send(b'svc restart session\r')
+            until(b'myos native shell\n', start); until(b'/ > ', output.index(b'myos native shell\n', start))
+            after = managers()
+            if after['session'] == before['session'] or after['boot'] != before['boot'] or after['devices'] != before['devices']:
+                raise RuntimeError('session replacement escaped its ownership boundary')
+            if b'Running' in run('jobs', b'/ > '): raise RuntimeError('old job survived session replacement')
+            run('bus call foreign/math Add a=19 b=23', b'"sum":42')
+            run('sleep 10000 &', b'Running')
+            mark = len(output); run('svc restart devices', b'service change requested')
+            until(b'uart: console ready\n', mark)
+            run('bus describe devices', b'"List"')
+            current = managers()
+            if current['devices'] == after['devices'] or current['session'] != after['session'] or current['boot'] != after['boot']:
+                raise RuntimeError('device replacement escaped its ownership boundary')
+            run('jobs', b'Running')
+            run('cat /boot/README.TXT', b'myos disk file service')
+            run('bus call foreign/math Add a=21 b=21', b'"sum":42')
+            print(f'[supervisor] OK: {smp} harts, branch isolation, dynamic recipe checkpoint and lazy reactivation')
             return
         run('help', b'PROGRAM [ARGS]')
         run('svc', b'shell running')
@@ -220,10 +246,14 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             if disk:
                 run('cp /boot/foreign.elf package', b'/ > ')
                 program = '/package'
-            run(f'bus call session Spawn name=foreign program={program}', b'"gen"')
-            run('bus wait providers/foreign/math', b'/ > ')
-            run('bus describe providers/foreign/math', b'"Add"')
-            run('bus call providers/foreign/math Add a=11 b=31', b'"sum":42')
+            # Public Array(String("math")); the independently linked client
+            # consumes the same Value bytes as every peer, with no service SDK.
+            export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
+            exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
+            run(f'bus call session Configure name=foreign program={program} exports=^{exports}', b'"gen":0')
+            run('bus wait foreign/math', b'/ > ')
+            run('bus describe foreign/math', b'"Add"')
+            run('bus call foreign/math Add a=11 b=31', b'"sum":42')
         if disk:
             store_instance = instance('store.admin')
             if store_instance is None: raise RuntimeError('missing store publication')
@@ -234,6 +264,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         start = len(output); send(b'h'); until(b'Slot', start)
         start = len(output); send(b'\x1b[Hv'); until(b'| grants', start)
         start = len(output); send(b'v'); until(b'| objects', start); until(b'Domain', start)
+        send(b'fVSpace\r'); time.sleep(0.3)
         start = len(output); send(b'\r'); until(b'link_id', start); until(b'flags', start)
         send(b'hh')
         send(b'1'); send(b'\x1a'); until(b'/ > ', start)
@@ -244,7 +275,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             time.sleep(0.6)
             mark = len(output); send(b'3'); until(b'| objects', mark); until(b'IRQ', mark)
             send(b'2fblock\r'); time.sleep(0.6)
-            mark = len(output); send(b'x'); until(b'Stopped', mark)
+            mark = len(output); send(b'x'); until(b'Idle', mark)
             mark = len(output); send(b's'); until(b'Running', mark)
         send(b'q'); until(b'/ > ', start)
         start = len(output); send(b'view tasks\r'); until(b'myos tasks', start)

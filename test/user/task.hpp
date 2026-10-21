@@ -1,5 +1,6 @@
 #pragma once
 #include <vm.hpp>
+#include <ubus/ubus.hpp>
 
 
 #include <proc.hpp>
@@ -11,7 +12,6 @@
 #include <memory>
 #include <string>
 
-inline constexpr rt_key rt_image{"image", ObjMem};
 
 struct test_image {
     vm_area mapping;
@@ -108,15 +108,11 @@ class test_tasks {
 };
 
 inline void open(test_image& image, const rt_env& info) {
-    const auto* binding = info.find(rt_image);
-    const auto cap = binding ? binding->cap : rt_root().bundle;
-    const auto size = binding ? binding->bytes : rt_root().bundle_bytes;
+    const auto cap = rt_root().bundle;
+    const auto size = rt_root().bundle_bytes;
     if (const auto rc = image.open(info.vspace, cap, size);
         rc != STATUS_OK)
         sys::exit(rc);
-}
-inline auto input(rt_key contract, cap_t cap, word_t rights, word_t badge = 0) -> proc_cap {
-    return {.key = contract, .cap = cap, .limit = rights, .badge = badge};
 }
 auto start(test_tasks& tasks, test_image& image, std::string_view name, proc_opts opts = {})
     -> test_id {

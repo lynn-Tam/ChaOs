@@ -1,13 +1,12 @@
-#include <test/user/task.hpp>
+#include "task.hpp"
 #include <util.hpp>
-#include <servers/uart.hpp>
-#include <servers/fw.hpp>
+#include "../../apps/uart/uart.hpp"
+#include "../../apps/devices/fw.hpp"
 #include <libk/fmt.hpp>
 #include <source_location>
 #include <libk/parse.hpp>
 
 static uart_port* output;
-inline constexpr rt_key ct_data{"data", ObjChannel};
 static void expect(status_t status, std::source_location at = std::source_location::current()) {
     if (status == STATUS_OK) return;
     if (output) (void)libk::fmt::format_to<"[channel] failed {} status={}\n">(*output, at.line(), status);
@@ -182,6 +181,45 @@ static void rebill_memory(const rt_env& env) {
     }
 }
 
+static void resize_account(const rt_env& env) {
+    const auto made = sys::account_create(env.alloc(), 0, 0, OBJ_BIT(ObjMem), 256 * 1024, 64);
+    expect(made.status); cap_owner account{made.value};
+    auto info = [&] {
+        expect(sys::account_info(account.selector()).status);
+        return *reinterpret_cast<const AccountInfo*>(env.ipc);
+    };
+    expect(sys::object_info(account.selector()).status);
+    const auto id = reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id;
+    check(sys::account_resize(account.selector(), 128 * 1024, 32).status == STATUS_DENIED);
+    expect(sys::account_resize(account.selector(), 128 * 1024, 32, env.pool).status);
+    const auto mem = sys::memory_create({account.selector(), env.scope}, 8192, VM_READ | VM_WRITE);
+    expect(mem.status);
+    auto area = vm_area::map(rt_vm(), cap_owner{mem.value}, 0, 8192, VM_READ | VM_WRITE);
+    check(bool(area));
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(area->address);
+    bytes[0] = 0x5a;
+    const auto before = info();
+    check(sys::account_resize(account.selector(), 0, 0).status == STATUS_BUSY);
+    check(sys::account_resize(account.selector(), 512 * 1024, 32, env.pool).status == STATUS_DENIED);
+    expect(sys::account_resize(account.selector(), 192 * 1024, 24, env.pool).status);
+    const auto after = info();
+    check(after.memory_available == before.memory_available + 64 * 1024
+        && after.caps_available + 8 == before.caps_available && bytes[0] == 0x5a);
+    bytes[4096] = 0xa5; // A new page still uses the same Account after growth.
+    expect(sys::object_info(account.selector()).status);
+    check(reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id == id);
+    const auto current = info();
+    const auto used = current.memory_limit - current.memory_available;
+    expect(sys::account_close(account.selector()).status);
+    expect(sys::account_resize(account.selector(), used, current.cap_limit - current.caps_available).status);
+    check(info().state == OBJECT_CLOSING && bytes[0] == 0x5a && bytes[4096] == 0xa5);
+    check(sys::account_resize(account.selector(), 192 * 1024, 32, env.pool).status == STATUS_CLOSED);
+    expect(area->close());
+    expect(sys::wait_one(account.selector(), STATE_DRAINED).status);
+    check(sys::account_resize(account.selector(), 0, 0).status == STATUS_CLOSED);
+    expect(sys::object_destroy(account.selector()).status);
+}
+
 static void port_events(const rt_env& env) {
     const auto created = sys::port_create(env.alloc(), 3, 1);
     expect(created.status);
@@ -246,11 +284,14 @@ static void port_events(const rt_env& env) {
 int main(int argc, char** argv) {
     const auto& env = rt_startup();
     if (argc > 1) {
+        ubus_conn environment; expect(environment.bind(env.environment));
+        ubus_msg setup; expect(environment.invoke("Receive", {}, setup));
+        const auto destination = setup.capability(setup.data["message"]["data"]);
         const auto number = libk::parse<uint64_t>(argv[1]); check(number.has_value());
         for (word_t i = 0; i < 512; ++i) {
             std::array<word_t, CHANNEL_MAX_WORDS> words;
             for (size_t n = 0; n < words.size(); ++n) words[n] = (*number << 48) | (i << 16) | n;
-            expect(ch_send(env.selector(ct_data), words, true).status);
+            expect(ch_send(destination, words, true).status);
         }
         return STATUS_OK;
     }
@@ -260,20 +301,36 @@ int main(int argc, char** argv) {
     const auto copied = sys::cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(copied.status);
     auto mapping = vm_area::map(rt_vm(), cap_owner{copied.value}, 0, 4096, VM_READ | VM_WRITE); check(bool(mapping));
     uart_port port{mapping->address + console->offset}; port.reset(); output = &port;
-    capacity(env); replies(env); rebill_memory(env); port_events(env);
+    capacity(env); replies(env); rebill_memory(env); resize_account(env); port_events(env);
     test_image image; open(image, env);
     test_tasks tasks; tasks.open(env.alloc(), rt_root().domain, env.cpus);
     ch_pair data; expect(data.open(env.alloc(), 32, 0));
-    const proc_cap grant = input(ct_data, data.ends[0].selector(), RIGHT_SEND, 1);
+    const auto sender = sys::channel_mint(data.ends[0].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
+    expect(sender.status); cap_owner destination{sender.value};
+    ubus_object environment{"fixture"};
+    expect(environment.add("Receive", {}, {{"message", ubus_type::Record}}, [&](auto&, auto& response) {
+        ubus_data message; message.cap("data", *response.attach(destination.selector(), RIGHT_SEND));
+        response.data.put("message", message); return STATUS_OK;
+    }));
+    expect(environment.open()); auto connector = environment.connector(); check(bool(connector));
     std::array<test_id, 4> children;
     for (size_t i = 0; i < children.size(); ++i) {
         const auto number = std::to_string(i); const std::array<std::string_view, 2> args{"producer", number};
-        const auto child = tasks.spawn(image, "worker", {.argv=args, .caps={&grant, 1}, .events=env.events});
+        const auto child = tasks.spawn(image, "worker", {.argv=args, .environment=connector->selector(), .events=env.events});
         expect(child.status); children[i] = child.id;
     }
+    ch_rx input; expect(input.open(data.ends[1].selector(), env.events));
     std::array<size_t, 4> seen{};
     for (size_t count = 0; count < children.size() * 512; ++count) {
-        ch_packet packet; expect(ch_recv(data.ends[1].selector(), packet, true).status);
+        ch_packet packet;
+        for (;;) {
+            const auto status = input.receive(packet);
+            if (status == STATUS_OK) break;
+            check(status == STATUS_WOULD_BLOCK);
+            const auto received = environment.poll();
+            if (received != STATUS_WOULD_BLOCK) expect(received);
+            else expect(ev_wait(env.events).status);
+        }
         const auto producer = packet.words[0] >> 48, index = (packet.words[0] >> 16) & 0xffff'ffff;
         check(producer < seen.size() && index == seen[producer]++ && packet.word_count == CHANNEL_MAX_WORDS);
         for (size_t n = 0; n < packet.word_count; ++n) check(packet.words[n] == ((producer << 48) | (index << 16) | n));

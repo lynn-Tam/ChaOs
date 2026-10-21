@@ -29,7 +29,7 @@ not imply arbitrary board, requester-alias, or hotplug support.
 
 ## Build
 
-Requirements include Meson, Ninja, QEMU, Python 3, ccache, and a `riscv64-unknown-elf` GCC toolchain.
+Requirements include Meson, Ninja, QEMU, Python 3, ccache, host json-c, and a `riscv64-unknown-elf` GCC toolchain.
 
 ```sh
 CCACHE_DIR=build/ccache meson setup build/riscv64 \
@@ -69,18 +69,26 @@ ordinary `fs` and `edit` cannot format. Programs run by name, for example
 program through the same two-task pipe. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
 `svc` lists supervised children; `svc restart NAME` changes their owner’s desired state.
-Acceptance precedes recovery and publication. Registry or subsystem manager loss rebuilds
-the owned root subtree; old business endpoints close and accepted mutations are never replayed.
+Acceptance precedes recovery and publication. Replacement drains only the owning
+branch; old business endpoints close and accepted business mutations are never replayed.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
 
-`init` owns one root execution. `system`, `devices`, `session`, and shell jobs use
-recursive process/resource ownership; the independent `ubusd` directory knows no
-executable names or business methods. Ordinary programs publish their own endpoints
-in a delegated domain and call each other directly after Bind. All methods share
-one value codec and derive Describe and validation from the same method table.
-`bus list`, `bus describe NAME`, and `bus call NAME METHOD FIELD=VALUE` work without
-a service SDK. `bus call session Spawn name=example program=/path/to/program` starts
-an installed package dynamically; its publications appear below `providers/example/`.
+`init` supervises one root manager through the same `mgr` mechanism used by the
+root/session managers, device program and shell. Programs receive one opaque
+environment capability, then request objects, receive delegated capabilities or
+publish their own endpoints through ordinary IPC. Get can activate an idle
+configured provider and waits for its actual publication. Bind and business calls
+go directly to that provider. No global registry or business SDK is required.
+
+`bus list`, `bus describe NAME`, and `bus call NAME METHOD FIELD=VALUE` use the
+same Value codec, actual method descriptions and capability transport as any
+other application. `bus call session Configure name=example program=/package`
+installs a lazy deployment; Configure accepts explicit exports and routes.
+`Spawn` also requests an execution. Published objects can be found as
+`example/EXPORT` in the authorized local environment. A manager commits dynamic
+configuration snapshots to its direct parent before acknowledging changes;
+recovery preserves recipes and applies the explicit restart policy. Consumed
+linear capabilities are never duplicated or replayed.
 
 Deployment bundles contain standard ELF files with debug information removed;
 the original ELF files retain symbols beside the build objects. Test workloads
@@ -95,11 +103,11 @@ arch/       Architecture-specific kernel code
 kernel/     Kernel
 libk/       Freestanding C++ support library
 uapi/       User/kernel ABI
-lib/        Native runtime, process construction and optional semantic clients
+lib/        Native runtime/syscall SDK and ELF construction only
 ubus/       Common values, dynamic methods, discovery and direct RPC
-posix/      Explicit C/POSIX subset adapter
-servers/    Userspace system services
-programs/   User programs
+mgr/        Recursive environments, activation and deployment ownership
+apps/       Peer userspace programs, including managers and drivers
+apps/posix/ Explicit C/POSIX subset adapter
 tools/      Build and image tooling
 test/       Tests and validation workloads
 ```

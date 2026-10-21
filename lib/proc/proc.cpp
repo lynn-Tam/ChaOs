@@ -36,18 +36,7 @@ class proc_loader {
         -> status_t {
         if (offset > size || n > size - offset || (n && !src))
             return STATUS_BAD_ARGS;
-        const auto* bytes = static_cast<const uint8_t*>(src);
-        while (n) {
-            const auto start = offset % page_size;
-            const auto count = std::min(n, size_t{page_size - start});
-            ::memcpy(reinterpret_cast<void*>(rt_startup().ipc), bytes, count);
-            const auto status = sys::memory_write(mem, offset, 0, count).status;
-            if (status != STATUS_OK) return status;
-            offset += count;
-            bytes += count;
-            n -= count;
-        }
-        return STATUS_OK;
+        return mem_write(mem, offset, {reinterpret_cast<const std::byte*>(src), n});
     }
     auto make_desc(const void* src, size_t n) noexcept -> std::expected<owner, status_t> {
         const auto size = libk::checked_align_up(n, page_size).value_or(0);
@@ -156,24 +145,9 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
             return STATUS_BAD_ARGS;
         if (!mod || mod.machine() != 243)
             return STATUS_BAD_ARGS;
-        if (o.caps.size() > (UINT32_MAX - sizeof(rt_bindings)) / sizeof(rt_binding))
-            return STATUS_BAD_ARGS;
-        size_t binding_size = sizeof(rt_bindings) + o.caps.size() * sizeof(rt_binding);
-        for (const auto& src : o.caps) {
-            if ((std::holds_alternative<cap_t>(src.cap) ? !std::get<cap_t>(src.cap) : !std::get<cap_owner*>(src.cap) || !*std::get<cap_owner*>(src.cap))
-                || !src.key.name || !src.key.kind)
-                return STATUS_BAD_ARGS;
-            const auto name = std::string_view{src.key.name};
-            if (name.empty() || name.size() > UINT32_MAX - binding_size)
-                return STATUS_BAD_ARGS;
-            binding_size += name.size();
-        }
-        if (binding_size > UINT32_MAX)
-            return STATUS_BAD_ARGS;
-        const auto binding_bytes = libk::checked_align_up(binding_size, page_size).value_or(0);
         if (!auth.cpus || o.cpu >= auth.cpus) return STATUS_BAD_ARGS;
         std::vector<std::pair<word_t, word_t>> ranges{
-            {o.va.stack, o.va.stack_size}, {o.va.bindings, binding_bytes}, {o.va.ipc, page_size}};
+            {o.va.stack, o.va.stack_size}, {o.va.ipc, page_size}};
         for (size_t i = 0; i < mod.segment_count(); ++i) {
             const auto seg = *mod.segment(i);
             if (seg.type == 1 && seg.size) {
@@ -242,66 +216,10 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
         auto desc = load.memory(page_size);
         if (!desc)
             return desc.error();
-        if (!o.caps.empty()) {
-            std::vector<uint8_t> data(binding_size);
-            const rt_bindings header{rt_bindings_version, static_cast<uint32_t>(binding_size),
-                                     static_cast<uint32_t>(o.caps.size()), 0};
-            ::memcpy(data.data(), &header, sizeof(header));
-            size_t name_offset = sizeof(header) + o.caps.size() * sizeof(rt_binding);
-            for (size_t i = 0; i < o.caps.size(); ++i) {
-                const auto& src = o.caps[i];
-                const auto* view = std::get_if<CapView>(&src.limit);
-                const auto kind = src.key.kind;
-                if (view && (view->version != CAP_ATTENUATION_VERSION_CURRENT ||
-                             view->size != CAP_ATTENUATION_SIZE || view->kind != kind))
-                    return STATUS_BAD_ARGS;
-                const auto rights = view ? view->rights : std::get<word_t>(src.limit);
-                sys::SysResult copied;
-                const auto owned = std::get_if<cap_owner*>(&src.cap);
-                const auto source = owned ? (*owned)->selector() : std::get<cap_t>(src.cap);
-                if (owned) {
-                    // Native Move preserves the exact view; Copy/Delegate
-                    // attenuate a borrowed source. Release only on commit.
-                    if (view || rights || src.badge) return STATUS_BAD_ARGS;
-                    copied = sys::cap_move(source, r.cspace());
-                    if (copied.status == STATUS_OK) (void)(*owned)->release();
-                } else if (src.badge)
-                    copied = sys::channel_mint(source, r.cspace(), src.badge, rights);
-                else if (!view)
-                    copied = sys::cap_duplicate(source, r.cspace(), rights);
-                else {
-                    std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
-                    cap_encode(*view, wire);
-                    s = load.write(desc->selector(), page_size, 0, wire.data(), wire.size());
-                    if (s != STATUS_OK)
-                        return s;
-                    copied = sys::cap_typed_delegate(source, r.cspace(), desc->selector());
-                }
-                if (copied.status != STATUS_OK)
-                    return copied.status;
-                const std::string_view name{src.key.name};
-                const rt_binding entry{copied.value,
-                                       src.bytes,
-                                       kind,
-                                       0,
-                                       static_cast<uint32_t>(name_offset),
-                                       static_cast<uint32_t>(name.size())};
-                ::memcpy(data.data() + sizeof(header) + i * sizeof(entry), &entry, sizeof(entry));
-                ::memcpy(data.data() + name_offset, name.data(), name.size());
-                name_offset += name.size();
-            }
-            auto memory = load.memory(binding_bytes);
-            if (!memory)
-                return memory.error();
-            s = load.write(memory->selector(), binding_bytes, 0, data.data(), data.size());
-            if (s == STATUS_OK)
-                s = sys::memory_seal(memory->selector()).status;
-            if (s == STATUS_OK)
-                s = load.install(memory->selector(), o.va.bindings, binding_bytes, VM_READ);
-            if (s != STATUS_OK)
-                return s;
-            aux.push_back({AT_SYS_BINDINGS, o.va.bindings});
-            aux.push_back({AT_SYS_BINDINGS_SIZE, binding_size});
+        if (o.environment) {
+            const auto copy = sys::cap_duplicate(o.environment, r.cspace(), RIGHT_SEND | RIGHT_DUPLICATE);
+            if (copy.status != STATUS_OK) return copy.status;
+            aux.push_back({AT_SYS_ENV, copy.value});
         }
         aux.push_back({AT_NULL, 0});
         const auto pointers = (argv.size() + o.envp.size() + 3) * sizeof(word_t);

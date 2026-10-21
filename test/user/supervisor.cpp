@@ -1,49 +1,57 @@
-#include <proc.hpp>
-#include <lib/fs/fs.hpp>
+#include <mgr/mgr.hpp>
 #include <util.hpp>
-
-static constexpr rt_key proof{"proof", ObjChannel}, ready{"ready", ObjNotification}, crash{"crash", ObjNotification};
 
 int main(int argc, char**) {
     const auto& env = rt_startup();
+    ubus_conn parent;
+    auto status = parent.bind(env.environment); if (status != STATUS_OK) return status;
+    ubus_msg setup;
+    status = parent.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
+    const auto message = setup.data["message"];
     if (argc == 2) {
-        const std::array<word_t, 1> message{42};
-        auto status = ch_send(env.selector(proof), message).status;
-        if (status == STATUS_OK) status = sys::notification_signal(env.selector(ready)).status;
-        if (status != STATUS_OK) sys::exit(status);
+        if (const auto proof = setup.capability(message["proof"])) {
+            const std::array<word_t, 1> words{42};
+            status = ch_send(proof, words).status;
+            if (status == STATUS_OK) status = sys::notification_signal(setup.capability(message["ready"])).status;
+            if (status != STATUS_OK) return status;
+        }
         for (;;) (void)ev_wait(env.events);
     }
-    ubus_conn bus, files;
-    auto status = bus.bind(env.selector(ubus_directory));
-    if (status == STATUS_OK) status = files.connect(bus, "exec", "myos.files", 1, 1);
-    if (status != STATUS_OK) sys::exit(status);
-    auto source = fs_map(files, "/boot/supervisor.elf", VM_READ | VM_EXECUTE);
-    if (!source) sys::exit(source.error());
-    auto memory = vm_area::map(rt_vm(), std::move(source->memory), 0,
-        (source->size + 4095) & ~size_t{4095}, VM_READ);
-    if (!memory) sys::exit(memory.error());
-    ev_notice signal;
-    if ((status = signal.open(env.alloc(), env.events)) != STATUS_OK) sys::exit(status);
-    cap_owner sender{env.selector(proof)};
-    const std::array grants{
-        proc_cap{.key=proof, .cap=&sender},
-        proc_cap{.key=ready, .cap=signal.selector(), .limit=word_t{RIGHT_SIGNAL}}
-    };
-    const std::array<std::string_view, 2> args{"supervisor", "child"};
-    proc_task child;
-    status = proc_spawn(child, {env.alloc(), static_cast<uint32_t>(env.cpus), env.domain},
-        {.bytes={reinterpret_cast<const std::byte*>(memory->address), source->size},
-         .memory=memory->memory.selector(), .offset=source->offset, .perms=VM_READ | VM_EXECUTE},
-        {.argv=args, .caps=grants, .resources={.bytes=1024 * 1024, .caps=64, .slots=64, .pages=12}, .events=env.events});
-    if (status == STATUS_OK) status = child.start();
-    if (status != STATUS_OK) sys::exit(status);
-    const auto deadline = *rt_after_ms(2000);
-    while (signal.take().status == STATUS_WOULD_BLOCK) {
-        if ((status = signal.arm()) == STATUS_OK) status = ev_wait(env.events, deadline).status;
-        if (status != STATUS_OK) sys::exit(status);
+    ubus_conn files;
+    ubus_msg query, response; query.data.put("name", "exec");
+    status = parent.invoke("Get", std::move(query), response);
+    if (status == STATUS_OK) status = files.bind(response.capability(response.data["connector"]));
+    if (status != STATUS_OK) return status;
+    query = {}; query.data.put("path", "/boot/supervisor.elf").put("perms", word_t{VM_READ | VM_EXECUTE});
+    status = files.invoke("Map", std::move(query), response); if (status != STATUS_OK) return status;
+    const auto buffer = response.data["buffer"].as<ubus_buffer>(); if (!buffer) return STATUS_PEER_FAULT;
+    auto memory = vm_area::map(rt_vm(), response.take(response.data["buffer"]), 0,
+        (buffer->offset + buffer->size + 4095) & ~size_t{4095}, VM_READ);
+    if (!memory) return memory.error();
+    mgr owner{[&](mgr_child&) -> std::expected<proc_image, status_t> {
+        return proc_image{.bytes={reinterpret_cast<const std::byte*>(memory->address + buffer->offset), size_t(buffer->size)},
+            .memory=memory->memory.selector(), .offset=buffer->offset, .perms=VM_READ | VM_EXECUTE};
+    }};
+    status = owner.open(); if (status != STATUS_OK) return status;
+    ev_notice ready;
+    status = ready.open(env.alloc(), env.events); if (status != STATUS_OK) return status;
+    auto& child = owner.add("descendant", "self", {.bytes=1024 * 1024, .caps=96, .slots=96, .pages=16});
+    child.args.push_back("hold");
+    child.setup.data.cap("proof", *child.setup.give(setup.take(message["proof"])))
+        .cap("ready", *child.setup.attach(ready.selector(), RIGHT_SIGNAL));
+    status = owner.start(child); if (status != STATUS_OK) return status;
+    const auto crash = setup.capability(message["crash"]);
+    ev_watch crashed;
+    status = crashed.open(env.events, crash, SOURCE_READY); if (status != STATUS_OK) return status;
+    bool running{};
+    for (;;) {
+        status = owner.poll(); if (status != STATUS_OK) return status;
+        if (!running) { running = ready.take().status == STATUS_OK; if (!running) (void)ready.arm(); }
+        if (running && sys::notification_take(crash).status == STATUS_OK) break;
+        status = ev_wait(env.events, owner.deadline()).status;
+        if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
     }
-    if ((status = sys::wait_one(env.selector(crash), 1, 0, deadline).status) != STATUS_OK) sys::exit(status);
-    // Abrupt supervisor failure: intentionally skip every child destructor and
-    // leave a live descendant. Its owner must close and drain the whole subtree.
+    // Deliberately skip destructors with a live descendant: native ownership
+    // must retire the subtree even when its userspace manager disappears.
     sys::exit(STATUS_INTERNAL);
 }

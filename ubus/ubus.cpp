@@ -22,6 +22,23 @@ auto ubus_msg::give(cap_owner cap) -> std::optional<size_t> {
 void ubus_msg::commit() {
     for (size_t i = 0; i < count; ++i) if (transfers[i].operation == CAP_MOVE) (void)caps[i].release();
 }
+void ubus_msg::forward() {
+    for (size_t i = 0; i < count; ++i)
+        if (caps[i]) transfers[i] = {caps[i].selector(), 0, CAP_MOVE, 0};
+}
+auto ubus_msg::clone() const -> std::expected<ubus_msg, status_t> {
+    ubus_msg copy; copy.data = data; copy.status = status; copy.tag = tag; copy.deadline = deadline;
+    for (size_t i = 0; i < count; ++i) {
+        const auto source = caps[i] ? caps[i].selector() : transfers[i].source;
+        const auto view = cap_info(source);
+        if (!view) return std::unexpected(view.error());
+        const auto rights = transfers[i].rights ? transfers[i].rights : view->view.rights;
+        const auto duplicated = sys::cap_duplicate(source, rt_startup().cspace, rights);
+        if (duplicated.status != STATUS_OK) return std::unexpected(duplicated.status);
+        (void)copy.offer(cap_owner{duplicated.value}, rights);
+    }
+    return copy;
+}
 static auto ubus_index(ubus_value value) -> std::optional<size_t> {
     if (const auto slice = value.as<ubus_buffer>()) return slice->cap;
     if (value.type() != ubus_type::Cap || value.data().size() != sizeof(uint64_t)) return {};
@@ -34,6 +51,31 @@ auto ubus_msg::capability(ubus_value value) const -> cap_t {
 auto ubus_msg::take(ubus_value value) -> cap_owner {
     const auto index = ubus_index(value);
     return index && *index < count ? std::move(caps[*index]) : cap_owner{};
+}
+auto ubus_msg::slice(ubus_value value) const -> std::expected<ubus_msg, status_t> {
+    ubus_msg selected;
+    if (!selected.data.assign(value.bytes())) return std::unexpected(STATUS_BAD_ARGS);
+    std::array<size_t, CHANNEL_MAX_CAPS> indices; indices.fill(SIZE_MAX);
+    const auto visit = [&](auto&& self, ubus_value field) -> status_t {
+        if (field.type() == ubus_type::Cap || field.type() == ubus_type::Buffer) {
+            const auto original = ubus_index(field);
+            if (!original || *original >= count) return STATUS_BAD_ARGS;
+            auto& index = indices[*original];
+            if (index == SIZE_MAX) {
+                index = selected.count++;
+                selected.transfers[index] = transfers[*original];
+                selected.transfers[index].source = caps[*original] ? caps[*original].selector() : transfers[*original].source;
+            }
+            const uint64_t rebased = index;
+            ::memcpy(const_cast<std::byte*>(field.data().data()), &rebased, sizeof(rebased));
+        } else for (const auto child : field.values()) {
+            const auto status = self(self, child); if (status != STATUS_OK) return status;
+        }
+        return STATUS_OK;
+    };
+    const auto status = visit(visit, selected.data.view());
+    if (status != STATUS_OK) return std::unexpected(status);
+    return selected;
 }
 static auto ubus_caps_valid(ubus_value value, size_t count) -> bool {
     if (value.type() == ubus_type::Cap) return ubus_index(value).value_or(SIZE_MAX) < count;
@@ -207,20 +249,22 @@ static auto ubus_schema_check(ubus_schema& schema, bool unnamed = false, size_t 
     }
     return true;
 }
-auto ubus_request::respond(ubus_msg response) -> status_t {
+auto ubus_request::respond(ubus_msg response, bool* committed) -> status_t {
+    if (committed) *committed = false;
     if (!reply) return STATUS_INVALID_OP;
+    bool original = true;
     if (response.status == STATUS_OK && method && (!response.data.valid() || !ubus_matches(response.data.view(), method->output))) {
-        response = {}; response.status = STATUS_INTERNAL;
+        response = {}; response.status = STATUS_INTERNAL; original = false;
     }
     ubus_wire wire;
     const auto encoded = wire.encode(response, ubus_reply, CHANNEL_MAX_CAPS);
     if (encoded != STATUS_OK) {
-        response = {}; response.status = encoded;
+        response = {}; response.status = encoded; original = false;
         (void)wire.encode(response, ubus_reply, CHANNEL_MAX_CAPS);
     }
     const auto status = ch_send(reply.selector(), std::span{wire.words}.first(wire.size), false,
         std::span{wire.caps}.first(wire.count)).status;
-    if (status == STATUS_OK) response.commit();
+    if (status == STATUS_OK) { response.commit(); if (committed) *committed = original; }
     reply = {};
     return status == STATUS_CANCELED || status == STATUS_STALE || status == STATUS_CLOSED
         || status == STATUS_PEER_CLOSED ? STATUS_OK : status;
@@ -260,8 +304,34 @@ auto ubus_object::add(std::string name, ubus_schema input, ubus_schema output, u
     methods_.push_back(std::make_shared<ubus_method>(std::move(name), std::move(input), std::move(output), std::move(handler), required, notify));
     return STATUS_OK;
 }
-auto ubus_object::open(size_t depth) -> status_t {
-    auto status = channel_.open(rt_startup().alloc(), depth, CHANNEL_MAX_CAPS);
+ubus_object::~ubus_object() {
+    if (const auto status = close(); status != STATUS_OK) sys::exit(status);
+}
+auto ubus_object::close() -> status_t {
+    if (const auto status = input_.close(); status != STATUS_OK) return status;
+    if (const auto status = closing_.close(); status != STATUS_OK) return status;
+    if (scope_) {
+        // Scope owns the transport. Drop local slots before closing it, so the
+        // pair never tries to destroy a member already retiring with its Scope.
+        for (auto& end : channel_.ends) if (const auto status = end.close(); status != STATUS_OK) return status;
+        const auto status = sys::scope_close(scope_.selector()).status; if (status != STATUS_OK) return status;
+        if (const auto status = scope_.close(); status != STATUS_OK) return status;
+    } else if (const auto status = channel_.close(); status != STATUS_OK) return status;
+    return budget_.close();
+}
+auto ubus_object::open(size_t depth, cap_t account) -> status_t {
+    auto alloc = rt_startup().alloc();
+    if (account) {
+        const auto cap = sys::cap_duplicate(account, rt_startup().cspace, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
+        if (cap.status != STATUS_OK) return cap.status;
+        budget_ = cap_owner{cap.value};
+        const auto scope = sys::scope_create(alloc); if (scope.status != STATUS_OK) return scope.status;
+        scope_ = cap_owner{scope.value};
+        const auto status = closing_.open(rt_startup().events, account, STATE_CLOSING | STATE_DRAINED);
+        if (status != STATUS_OK) return status;
+        alloc = {budget_.selector(), scope_.selector()};
+    }
+    auto status = channel_.open(alloc, depth, CHANNEL_MAX_CAPS);
     if (status == STATUS_OK) status = input_.open(endpoint(), rt_startup().events);
     return status;
 }
@@ -283,17 +353,6 @@ auto ubus_object::handle(word_t facet, word_t rights) -> std::expected<cap_owner
     if (status != STATUS_OK) return std::unexpected(status);
     sealed_ = true;
     return result;
-}
-auto ubus_object::publish(ubus_conn& directory, std::string_view name, word_t facet) -> std::expected<uint64_t, status_t> {
-    auto endpoint = connector(facet);
-    if (!endpoint) return std::unexpected(endpoint.error());
-    ubus_msg request, response;
-    request.data.put("name", name).put("interface", interface_).put("version", version_);
-    request.data.cap("connector", *request.offer(std::move(*endpoint), RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE));
-    const auto status = directory.invoke("Publish", std::move(request), response);
-    if (status != STATUS_OK) return std::unexpected(status);
-    const auto instance = response.data["instance"].as<uint64_t>();
-    return instance ? std::expected<uint64_t, status_t>{*instance} : std::unexpected(STATUS_PEER_FAULT);
 }
 auto ubus_object::bind(ubus_request& request) -> status_t {
     const auto input = request.data.view();
@@ -320,6 +379,12 @@ auto ubus_object::bind(ubus_request& request) -> status_t {
 auto ubus_object::poll() -> status_t {
     ubus_request request;
     const auto status = input_.receive(request);
+    if (status == STATUS_WOULD_BLOCK && budget_) {
+        const auto state = sys::source_info(budget_.selector());
+        if (state.status == STATUS_BUSY || state.status == STATUS_RETRY) return STATUS_WOULD_BLOCK;
+        if (state.status != STATUS_OK) return STATUS_CLOSED;
+        if (!(state.value & STATE_OPEN)) return STATUS_CLOSED;
+    }
     if (status == STATUS_WOULD_BLOCK) return status;
     if (status != STATUS_OK) {
         if (request.reply) { ubus_msg error; error.status = status; (void)request.respond(std::move(error)); }
@@ -345,22 +410,37 @@ auto ubus_object::poll() -> status_t {
     }
     return request.reply ? request.respond(std::move(response)) : STATUS_OK;
 }
-auto ubus_conn::connect(ubus_conn& directory, std::string_view name, std::string_view interface, uint64_t minimum, uint64_t maximum) -> status_t {
-    ubus_msg request, response; request.data.put("name", name);
-    const auto status = directory.invoke("Resolve", std::move(request), response);
-    if (status != STATUS_OK) return status;
-    auto connector = response.take(response.data["connector"]);
-    return connector ? bind(connector.selector(), interface, minimum, maximum) : STATUS_BAD_ARGS;
+auto ubus_conn::begin_bind(cap_t connector, std::string_view interface, uint64_t minimum,
+                           uint64_t maximum, uint64_t features, uint64_t deadline) -> status_t {
+    if (call_.active()) return STATUS_BUSY;
+    ubus_msg request; request.tag = 1; request.deadline = deadline;
+    request.data.put("interface", interface).put("minimum", minimum).put("maximum", maximum).put("features", features);
+    const auto status = call_.begin(connector, std::move(request));
+    if (status == STATUS_OK) binding_.emplace(std::string{interface}, minimum, maximum, features);
+    return status;
+}
+auto ubus_conn::bound(ubus_msg& response) -> status_t {
+    auto pending = std::move(*binding_); binding_.reset();
+    if (response.status != STATUS_OK) return response.status;
+    return install(response.take(response.data["endpoint"]), response.data["object"], pending.interface,
+        pending.minimum, pending.maximum, pending.features);
+}
+auto ubus_conn::poll_bind() -> status_t {
+    if (!binding_) return STATUS_INVALID_OP;
+    ubus_msg response;
+    const auto status = call_.poll(response);
+    if (status == STATUS_OK) return bound(response);
+    if (status != STATUS_WOULD_BLOCK) binding_.reset();
+    return status;
 }
 auto ubus_conn::bind(cap_t connector, std::string_view interface, uint64_t minimum,
                      uint64_t maximum, uint64_t features) -> status_t {
-    ubus_msg request, response; request.tag = 1;
-    request.data.put("interface", interface).put("minimum", minimum).put("maximum", maximum).put("features", features);
-    auto status = call_.begin(connector, std::move(request));
-    if (status == STATUS_OK) status = call_.wait(response);
-    if (status == STATUS_OK) status = response.status;
+    auto status = begin_bind(connector, interface, minimum, maximum, features);
     if (status != STATUS_OK) return status;
-    return install(response.take(response.data["endpoint"]), response.data["object"], interface, minimum, maximum, features);
+    ubus_msg response;
+    status = call_.wait(response);
+    if (status == STATUS_OK) return bound(response);
+    binding_.reset(); return status;
 }
 auto ubus_conn::install(cap_owner endpoint, ubus_value object, std::string_view interface,
                         uint64_t minimum, uint64_t maximum, uint64_t features) -> status_t {
@@ -390,6 +470,7 @@ auto ubus_conn::state() const -> status_t {
     return source.status != STATUS_OK ? source.status : source.value & SOURCE_TERMINAL ? STATUS_PEER_CLOSED : STATUS_OK;
 }
 auto ubus_conn::close() -> status_t {
+    binding_.reset();
     const auto status = call_.cancel();
     if (status != STATUS_OK) return status;
     const auto unwatch = peer_.close();

@@ -1,11 +1,13 @@
-#include <lib/mgr/mgr.hpp>
-#include <lib/stream/stream.hpp>
+#include <ubus/ubus.hpp>
+#include <posix.hpp>
+#include <unistd.h>
 #include <libk/fmt.hpp>
 #include <source_location>
 
+struct ct_output { void write(const char* data, size_t size) { (void)::write(STDOUT_FILENO, data, size); } };
 static void check(bool value, std::source_location at = std::source_location::current()) {
     if (value) return;
-    str_writer output{rt_startup().selector(rt_stdout)};
+    ct_output output;
     (void)libk::fmt::format_to<"[control] failed line {}\n">(output, at.line());
     sys::exit(STATUS_INTERNAL);
 }
@@ -24,16 +26,28 @@ static auto action(ubus_conn& owner, ubus_value row, std::string_view name, bool
     request.data.put("id", row["id"]).put("gen", *row["gen"].as<uint64_t>() + uint64_t(stale)).put("action", name);
     return owner.invoke("Action", std::move(request), response);
 }
-static void stopped(ubus_conn& owner, std::string_view name) {
+static void stopped(ubus_conn& owner, std::string_view name, std::string_view state = "idle") {
     const auto deadline = *rt_after_ms(2000);
-    while (find(owner, name)["state"].as<std::string_view>() != "stopped")
+    while (find(owner, name)["state"].as<std::string_view>() != state)
         check(rt_admit(deadline) == STATUS_OK);
 }
+static auto running(ubus_conn& owner, std::string_view name, uint64_t previous = 0, bool delivered = false) -> ubus_data {
+    const auto deadline = *rt_after_ms(2000);
+    for (;;) {
+        auto row = find(owner, name);
+        if (row["state"].as<std::string_view>() == "running" && row["gen"].as<uint64_t>().value_or(0) > previous
+            && (!delivered || row["delivered"].as<bool>().value_or(false))) return row;
+        check(rt_admit(deadline) == STATUS_OK);
+    }
+}
 int main() {
+    if (const auto status = px_init(); status != STATUS_OK) return status;
     const auto& env = rt_startup();
     ubus_conn bus, owner;
-    check(bus.bind(env.selector(ubus_directory)) == STATUS_OK);
-    check(owner.connect(bus, "session", "myos.manager", 1, 1) == STATUS_OK);
+    check(bus.bind(env.environment) == STATUS_OK);
+    ubus_msg lookup, connected; lookup.data.put("name", "session");
+    check(bus.invoke("Get", std::move(lookup), connected) == STATUS_OK);
+    check(owner.bind(connected.capability(connected.data["connector"])) == STATUS_OK);
     const auto shell = find(owner, "shell");
     check(shell["runtime"].as<uint64_t>().has_value());
     check(shell["charged"].as<uint64_t>().value_or(0) > 0);
@@ -60,8 +74,8 @@ int main() {
     query = {};
     query.data.put("name", "control-sleep").put("program", "/boot/sleep.elf").put("argv", args);
     check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
-    const auto child = find(owner, "control-sleep");
-    ubus_conn watcher; check(watcher.connect(bus, "session", "myos.manager", 1, 1) == STATUS_OK);
+    const auto child = running(owner, "control-sleep");
+    ubus_conn watcher; check(watcher.bind(connected.capability(connected.data["connector"])) == STATUS_OK);
     query = {}; query.data.put("id", child["id"]).put("gen", child["gen"]).put("epoch", uint64_t{0});
     check(watcher.invoke("Changed", std::move(query), response) == STATUS_OK);
     const auto epoch = *response.data["epoch"].as<uint64_t>();
@@ -71,13 +85,19 @@ int main() {
     check(action(owner, child.view(), "stop") == STATUS_OK);
     for (;;) {
         const auto status = watcher.poll(response);
-        if (status == STATUS_OK) { check(response.status == STATUS_CLOSED); break; }
+        if (status == STATUS_OK) {
+            if (response.status == STATUS_CLOSED) break;
+            check(response.status == STATUS_OK && response.data["epoch"].as<uint64_t>() != epoch);
+            query = {}; query.data.put("id", child["id"]).put("gen", child["gen"])
+                .put("epoch", response.data["epoch"]); query.deadline = *rt_after_ms(2000);
+            const auto next = watcher.begin("Changed", std::move(query)); check(next == STATUS_OK);
+            continue;
+        }
         check(status == STATUS_WOULD_BLOCK); check(ev_wait(env.events, *rt_after_ms(2000)).status == STATUS_OK);
     }
     stopped(owner, "control-sleep");
-    query = {}; query.data.put("name", "control-sleep");
-    check(owner.invoke("Activate", std::move(query), response) == STATUS_OK);
-    const auto replaced = find(owner, "control-sleep");
+    check(action(owner, child.view(), "start") == STATUS_OK);
+    const auto replaced = running(owner, "control-sleep", *child["gen"].as<uint64_t>());
     check(*replaced["gen"].as<uint64_t>() > *child["gen"].as<uint64_t>());
     check(action(owner, child.view(), "stop") == STATUS_STALE);
     check(action(owner, replaced.view(), "stop") == STATUS_OK);
@@ -87,23 +107,23 @@ int main() {
     check(minted.status == STATUS_OK);
     cap_owner sender{minted.value};
     check(channel.ends[1].close() == STATUS_OK);
-    query = {}; ubus_data caps, item;
-    item.cap("cap", *query.give(std::move(sender))).put("rights", uint64_t{RIGHT_SEND});
-    caps.put("unused", item);
+    query = {}; ubus_data setup;
+    setup.cap("unused", *query.give(std::move(sender)));
     ch_pair revocable; check(revocable.open(env.alloc(), 1, 0) == STATUS_OK);
     const auto branch = sys::channel_mint(revocable.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE);
     check(branch.status == STATUS_OK); cap_owner branch_cap{branch.value};
-    check(revocable.ends[1].close() == STATUS_OK); item = {};
-    item.cap("cap", *query.attach(branch.value, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE))
-        .put("rights", uint64_t{RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE}); caps.put("revocable", item);
-    query.data.put("name", "linear-sleep").put("program", "/boot/sleep.elf").put("argv", args).put("caps", caps);
+    check(revocable.ends[1].close() == STATUS_OK);
+    setup.cap("revocable", *query.attach(branch.value, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE));
+    ubus_data hold{ubus_type::Array}; hold.push("hold");
+    query.data.put("name", "linear-sleep").put("program", "/boot/supervisor.elf").put("argv", hold).put("setup", setup);
     check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
-    const auto linear = find(owner, "linear-sleep");
+    const auto linear = running(owner, "linear-sleep", 0, true);
     query = {}; query.data.put("id", linear["id"]).put("gen", linear["gen"]).put("facet", "caps");
     check(owner.invoke("Inspect", std::move(query), response) == STATUS_OK);
     cap_t selector{};
     for (const auto cap : response.data["items"].values())
-        if (cap["kind"].as<uint64_t>() == ObjChannel && (cap["rights"].as<uint64_t>().value_or(0) & RIGHT_REVOKE))
+        if (cap["kind"].as<uint64_t>() == ObjChannel
+            && cap["rights"].as<uint64_t>() == (RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE))
             selector = *cap["selector"].as<cap_t>();
     check(selector != 0);
     query = {}; query.data.put("id", linear["id"]).put("gen", linear["gen"]).put("selector", selector);
@@ -122,22 +142,21 @@ int main() {
         ch_pair proof; check(proof.open(env.alloc(), 1, 0) == STATUS_OK);
         const auto cap = sys::channel_mint(proof.ends[1].selector(), env.cspace, 1, RIGHT_SEND);
         check(cap.status == STATUS_OK); check(proof.ends[1].close() == STATUS_OK);
-        query = {}; caps = {}; item = {};
-        item.cap("cap", *query.give(cap_owner{cap.value})).put("rights", uint64_t{RIGHT_SEND});
-        caps.put("proof", item);
+        query = {}; setup = {};
+        setup.cap("proof", *query.give(cap_owner{cap.value}));
         const auto created = sys::notification_create(env.alloc(), 1); check(created.status == STATUS_OK);
-        cap_owner crash{created.value}; item = {};
-        item.cap("cap", *query.attach(crash.selector(), RIGHT_RECEIVE | RIGHT_DUPLICATE)).put("rights", uint64_t{RIGHT_RECEIVE | RIGHT_DUPLICATE});
-        caps.put("crash", item);
+        cap_owner crash{created.value};
+        setup.cap("crash", *query.attach(crash.selector(), RIGHT_RECEIVE | RIGHT_DUPLICATE));
         ubus_data resources; resources.put("children", true);
-        query.data.put("name", name).put("program", "/boot/supervisor.elf").put("caps", caps).put("resources", resources);
+        query.data.put("name", name).put("program", "/boot/supervisor.elf").put("setup", setup).put("resources", resources);
+        ubus_data routes, upstream; upstream.put("parent", true); routes.put("*", upstream); query.data.put("routes", routes);
         check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
         check(sys::wait_one(proof.ends[0].selector(), SOURCE_READY, 0, *rt_after_ms(2000), 0, SOURCE_READ).status == STATUS_OK);
         ch_packet message; const auto received = ch_recv(proof.ends[0].selector(), message, false).status;
         if (received != STATUS_OK) {
-            stopped(owner, name);
+            stopped(owner, name, "failed");
             const auto row = find(owner, name);
-            str_writer output{env.selector(rt_stdout)};
+            ct_output output;
             (void)libk::fmt::format_to<"[control] subtree receive={} exit={}\n">(output, received, row["result"].as<int64_t>().value_or(0));
         }
         check(received == STATUS_OK);
@@ -145,9 +164,11 @@ int main() {
         check(!(sys::source_info(proof.ends[0].selector(), SOURCE_READ).value & SOURCE_TERMINAL));
         check(sys::notification_signal(crash.selector()).status == STATUS_OK);
         check(sys::wait_one(proof.ends[0].selector(), SOURCE_TERMINAL, 0, *rt_after_ms(2000), 0, SOURCE_READ).status == STATUS_OK);
-        stopped(owner, name);
+        stopped(owner, name, "failed");
+        check(find(owner, name)["result"].as<int64_t>() == STATUS_INTERNAL);
     }
-    str_writer output{env.selector(rt_stdout)};
-    output.write("[control] scoped badges, stale instances/cursors and real VM/account stats ok\n");
+    ct_output output;
+    constexpr std::string_view marker{"[control] scoped badges, stale instances/cursors and real VM/account stats ok\n"};
+    output.write(marker.data(), marker.size());
     return STATUS_OK;
 }

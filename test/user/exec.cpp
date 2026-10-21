@@ -1,4 +1,5 @@
-#include <lib/stream/stream.hpp>
+#include <posix.hpp>
+#include <unistd.h>
 #include <array>
 
 alignas(4096) static std::array<uint8_t, 8193> data = [] {
@@ -9,6 +10,7 @@ alignas(4096) static std::array<uint8_t, 8193> data = [] {
 }();
 alignas(4096) static uint8_t zero[4097];
 int main() {
+    if (const auto status = px_init(); status != STATUS_OK) return status;
     volatile auto* initialized = data.data();
     volatile auto* bss = zero;
     for (size_t i = 0; i < data.size(); ++i)
@@ -21,6 +23,7 @@ int main() {
         initialized[i] = 0;
     for (size_t i = 0; i < sizeof(zero); ++i)
         bss[i] = 1;
-    str_writer{rt_startup().selector(rt_stdout)}.write("ELF data, COW and BSS ok\n");
+    constexpr std::string_view message{"ELF data, COW and BSS ok\n"};
+    if (write(STDOUT_FILENO, message.data(), message.size()) != int64_t(message.size())) return STATUS_BACKING_FAILED;
     return 0;
 }

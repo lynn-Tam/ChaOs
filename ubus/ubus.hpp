@@ -22,6 +22,10 @@ struct ubus_msg {
     auto offer(cap_owner cap, word_t rights) -> std::optional<size_t>;
     auto give(cap_owner cap) -> std::optional<size_t>;
     void commit();
+    void forward(); // Move owned received capabilities on the next successful send.
+    auto clone() const -> std::expected<ubus_msg, status_t>;
+    // Select a value and its referenced capabilities, borrowing source slots.
+    auto slice(ubus_value) const -> std::expected<ubus_msg, status_t>;
     auto capability(ubus_value value) const -> cap_t;
     auto take(ubus_value value) -> cap_owner;
 };
@@ -43,7 +47,7 @@ struct ubus_request : ubus_msg {
     cap_owner reply;
     auto facet() const -> word_t { return badge >= 2 && !(badge & 1) ? (badge - 2) / 2 : 0; }
     std::shared_ptr<const ubus_method> method;
-    auto respond(ubus_msg response = {}) -> status_t;
+    auto respond(ubus_msg response = {}, bool* committed = nullptr) -> status_t;
 };
 using ubus_handler = std::function<status_t(ubus_request&, ubus_msg&)>;
 struct ubus_method {
@@ -100,6 +104,8 @@ class ubus_conn;
 // a table means replacing the object; old capabilities retain their old object.
 class ubus_object {
     ch_pair channel_;
+    cap_owner budget_, scope_;
+    ev_watch closing_;
     ubus_rx input_;
     std::vector<std::shared_ptr<const ubus_method>> methods_;
     std::string interface_;
@@ -112,24 +118,28 @@ public:
         : interface_(std::move(interface)), version_(version), features_(features) {}
     auto add(std::string name, ubus_schema input, ubus_schema output, ubus_handler handler,
              word_t required = 0, bool notify = false) -> status_t;
-    auto open(size_t depth = 16) -> status_t;
+    ~ubus_object();
+    auto close() -> status_t;
+    auto open(size_t depth = 16, cap_t account = 0) -> status_t;
     auto connector(word_t facet = 0) -> std::expected<cap_owner, status_t>;
     // A returned object releases mint authority: its last remote handle closes
     // the sending side, so the owner can drain and reclaim the object.
     auto handle(word_t facet = 0, word_t rights = RIGHT_SEND | RIGHT_DUPLICATE) -> std::expected<cap_owner, status_t>;
-    auto publish(ubus_conn& directory, std::string_view name, word_t facet = 0) -> std::expected<uint64_t, status_t>;
     auto poll() -> status_t;
     auto arm() -> status_t { return input_.arm(); }
     auto endpoint() const -> cap_t { return channel_.ends[0].selector(); }
 };
 
 // Connections cache the authorized description returned by Bind. Every call,
-// including SDK convenience functions, uses the same values and native engine.
+// using public values, uses the same values and native engine.
 class ubus_conn {
     cap_owner endpoint_;
     ev_watch peer_;
     ubus_data description_;
     ubus_call call_;
+    struct binding { std::string interface; uint64_t minimum, maximum, features; };
+    std::optional<binding> binding_;
+    auto bound(ubus_msg&) -> status_t;
     auto install(cap_owner, ubus_value, std::string_view, uint64_t, uint64_t, uint64_t) -> status_t;
 public:
     auto active() const -> bool { return call_.active(); }
@@ -138,8 +148,9 @@ public:
     auto release() -> std::expected<cap_owner, status_t>;
     auto adopt(cap_owner endpoint, std::string_view interface = {}, uint64_t minimum = 0,
                uint64_t maximum = UINT64_MAX, uint64_t features = 0) -> status_t;
-    auto connect(ubus_conn& directory, std::string_view name, std::string_view interface = {},
-                 uint64_t minimum = 0, uint64_t maximum = UINT64_MAX) -> status_t;
+    auto begin_bind(cap_t connector, std::string_view interface = {}, uint64_t minimum = 0,
+                    uint64_t maximum = UINT64_MAX, uint64_t features = 0, uint64_t deadline = 0) -> status_t;
+    auto poll_bind() -> status_t;
     auto bind(cap_t connector, std::string_view interface = {}, uint64_t minimum = 0,
               uint64_t maximum = UINT64_MAX, uint64_t features = 0) -> status_t;
     auto description() const -> ubus_value { return description_.view(); }
@@ -152,13 +163,124 @@ public:
     auto cancel() -> status_t { return call_.cancel(); }
 };
 
-// Bootstrap injects capabilities and scalar resources, never service contracts.
-inline constexpr rt_key ubus_boot{"bus.boot", ObjChannel};
-inline constexpr rt_key ubus_owner{"bus.owner", ObjScope};
-inline constexpr rt_key ubus_directory{"bus", ObjChannel};
-enum ubus_right : uint64_t {
-    ubus_list = 1, ubus_resolve = 2, ubus_publish = 4, ubus_manage = 8,
-    ubus_view = 16, ubus_wait = 32, ubus_all = 63
+
+// Bounded deferred calls with application-owned payloads. The queue knows no
+// operation names or data layout; completion is the ordinary public Reply.
+struct ubus_ticket { size_t slot{}; uint64_t id{}; };
+enum class ubus_admission { Ready, Empty, Closed };
+template<class T, size_t Capacity> class ubus_queue {
+    struct entry { uint64_t id{}; T data{}; ubus_request call; bool admitted{}, committed{}, cancelled{}; };
+    std::array<entry, Capacity> entries_;
+    uint64_t last_{};
+    size_t active_{};
+    bool stopping_{};
+    auto valid(ubus_ticket ticket) const -> bool {
+        return ticket.slot < Capacity && ticket.id && entries_[ticket.slot].id == ticket.id;
+    }
+public:
+    auto accept(uint64_t id, T data, ubus_request& call) -> status_t {
+        if (stopping_) return STATUS_CLOSED;
+        if (id <= last_) return STATUS_STALE;
+        for (auto& entry : entries_) if (!entry.id) {
+            entry.id = id; entry.data = std::move(data); entry.call = std::move(call);
+            last_ = id; ++active_; return STATUS_PENDING;
+        }
+        return STATUS_BUSY;
+    }
+    auto admit(ubus_ticket& ticket) -> ubus_admission {
+        if (stopping_) return ubus_admission::Closed;
+        entry* first{};
+        for (auto& entry : entries_) if (entry.id && !entry.admitted && (!first || entry.id < first->id)) first = &entry;
+        if (!first) return ubus_admission::Empty;
+        first->admitted = true; ticket = {size_t(first - entries_.data()), first->id}; return ubus_admission::Ready;
+    }
+    auto request(ubus_ticket ticket) const -> const T* { return valid(ticket) ? &entries_[ticket.slot].data : nullptr; }
+    auto call(ubus_ticket ticket) -> ubus_request* { return valid(ticket) ? &entries_[ticket.slot].call : nullptr; }
+    auto cancel(uint64_t id) -> status_t {
+        for (auto& entry : entries_) if (id && entry.id == id) {
+            if (entry.committed) return STATUS_BUSY;
+            entry.cancelled = true; return STATUS_OK;
+        }
+        return STATUS_NOT_FOUND;
+    }
+    auto commit(ubus_ticket ticket) -> bool {
+        if (!valid(ticket) || entries_[ticket.slot].cancelled) return false;
+        const auto peer = sys::source_info(entries_[ticket.slot].call.reply.selector(), SOURCE_WRITE);
+        if (peer.status != STATUS_OK || (peer.value & SOURCE_TERMINAL)) return false;
+        entries_[ticket.slot].committed = true; return true;
+    }
+    auto cancelled(ubus_ticket ticket) const -> bool { return valid(ticket) && entries_[ticket.slot].cancelled; }
+    auto finish(ubus_ticket ticket, ubus_msg result) -> bool {
+        if (!valid(ticket)) return false;
+        (void)entries_[ticket.slot].call.respond(std::move(result));
+        entries_[ticket.slot] = {}; --active_; return true;
+    }
+    auto abandon(ubus_ticket ticket) -> bool {
+        if (!stopping_ || !valid(ticket)) return false;
+        entries_[ticket.slot] = {}; --active_; return true;
+    }
+    void stop() {
+        stopping_ = true;
+        for (size_t i = 0; i < Capacity; ++i) {
+            auto& entry = entries_[i];
+            if (!entry.id) continue;
+            if (!entry.admitted) { ubus_msg result; result.status = STATUS_CANCELED; (void)finish({i, entry.id}, std::move(result)); }
+            else if (!entry.committed) entry.cancelled = true;
+        }
+    }
+    auto active() const -> size_t { return active_; }
+    auto sequence() const -> uint64_t { return last_; }
 };
-inline constexpr rt_key ubus_publisher{"bus.publish", ObjChannel};
-inline constexpr rt_key ubus_ready{"ready", ObjNotification};
+
+// A bounded set of outgoing calls. Applications supply only their local
+// metadata and message construction; transport, ordering and deadlines stay here.
+template<class T, size_t Capacity> class ubus_batch {
+    struct entry { uint64_t id{}; T data{}; ubus_call call; status_t failure{}; };
+    std::array<std::unique_ptr<entry>, Capacity> entries_;
+public:
+    template<class Build> auto submit(uint64_t id, T data, ubus_conn& peer,
+        std::string_view method, Build&& build, bool drain = true) -> status_t {
+        if (!id || contains(id)) return STATUS_BAD_ARGS;
+        const auto token = peer.token(method); if (!token) return STATUS_INVALID_OP;
+        for (const auto& item : entries_)
+            if (item && item->id && !item->call.sent()) return STATUS_BUSY;
+        for (size_t i = 0; i < Capacity; ++i) if (!entries_[i] || !entries_[i]->id) {
+            auto& slot = entries_[i]; if (!slot) slot = std::make_unique<entry>();
+            ubus_msg message;
+            auto status = build(i, data, message); if (status != STATUS_OK) return status;
+            message.tag = *token;
+            status = slot->call.begin(peer.endpoint(), std::move(message), drain);
+            if (status != STATUS_OK) return status;
+            slot->id = id; slot->failure = 0; slot->data = std::move(data); return STATUS_OK;
+        }
+        return STATUS_BUSY;
+    }
+    auto completion(T& data, ubus_msg& response, uint64_t id = 0) -> status_t {
+        for (auto& item : entries_) if (item && item->id && (!id || item->id == id)) {
+            const auto status = item->failure ? item->failure : item->call.poll(response);
+            if (status == STATUS_WOULD_BLOCK) continue;
+            if (status != STATUS_OK) response.status = status;
+            data = std::move(item->data); item->id = 0; return STATUS_OK;
+        }
+        return STATUS_WOULD_BLOCK;
+    }
+    auto next(uint64_t after = 0) const -> const T* {
+        const entry* first{};
+        for (const auto& item : entries_) if (item && item->id > after && (!first || item->id < first->id)) first = item.get();
+        return first ? &first->data : nullptr;
+    }
+    auto contains(uint64_t id) const -> bool {
+        return std::ranges::any_of(entries_, [&](const auto& item) { return item && item->id == id && id; });
+    }
+    auto deadline() const -> uint64_t {
+        uint64_t due{};
+        for (const auto& item : entries_) if (item && item->id) {
+            const auto deadline = item->call.deadline();
+            if (deadline != UINT64_MAX && deadline && (!due || deadline < due)) due = deadline;
+        }
+        return due;
+    }
+    void abort(status_t status = STATUS_CANCELED) {
+        for (auto& item : entries_) if (item && item->id) { (void)item->call.cancel(); item->failure = status; }
+    }
+};

@@ -1,0 +1,285 @@
+{
+  "objects": {
+    "input": {
+      "kind": "Channel"
+    },
+    "output": {
+      "kind": "Channel"
+    },
+    "images": {
+      "kind": "Account",
+      "bytes": 20971520,
+      "caps": 0,
+      "kinds": 32
+    },
+    "image.scope": {
+      "kind": "Scope"
+    }
+  },
+  "routes": {
+    "boot": {
+      "child": "boot",
+      "name": "files"
+    },
+    "store": {
+      "child": "store",
+      "name": "files"
+    },
+    "files": {
+      "child": "vfs",
+      "name": "files"
+    },
+    "read": {
+      "child": "vfs",
+      "name": "read"
+    },
+    "exec": {
+      "child": "vfs",
+      "name": "exec"
+    },
+    "system": {
+      "manager": 3
+    },
+    "system.view": {
+      "manager": 1
+    },
+    "devices": {
+      "child": "devices",
+      "name": "control"
+    },
+    "devices.view": {
+      "child": "devices",
+      "name": "view"
+    },
+    "session": {
+      "child": "session",
+      "name": "control"
+    },
+    "session.view": {
+      "child": "session",
+      "name": "view"
+    },
+    "store.admin": {
+      "child": "store",
+      "name": "admin"
+    },
+    "*": {
+      "local": true
+    }
+  },
+  "children": [
+    {
+      "name": "boot",
+      "program": "bootfs",
+      "resources": {
+        "bytes": 4194304,
+        "caps": 512
+      },
+      "exports": [
+        "files"
+      ],
+      "setup": {
+        "archive": {
+          "$ref": "archive"
+        },
+        "image.pool": {
+          "$ref": "images",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
+        },
+        "image.scope": {
+          "$ref": "image.scope",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
+        }
+      }
+    },
+    {
+      "name": "devices",
+      "program": "devices",
+      "start": true,
+      "restart": true,
+      "resources": {
+        "bytes": 20971520,
+        "caps": 768,
+        "children": true,
+        "kinds": {
+          "$const": "OBJ_KINDS"
+        }
+      },
+      "exports": [
+        "block",
+        "control",
+        "view"
+      ],
+      "setup": {
+        "archive": {
+          "$ref": "archive"
+        },
+        "firmware": {
+          "$ref": "firmware"
+        },
+        "physical": {
+          "$ref": "physical"
+        },
+        "format": {
+          "$ref": "format"
+        },
+        "hart": {
+          "$ref": "hart"
+        },
+        "stdin": {
+          "$ref": "output.1",
+          "rights": {
+            "$const": "RIGHT_RECEIVE | RIGHT_DUPLICATE"
+          }
+        },
+        "stdout": {
+          "$ref": "input.1",
+          "rights": {
+            "$const": "RIGHT_SEND | RIGHT_DUPLICATE"
+          },
+          "badge": 1
+        }
+      }
+    },
+    {
+      "name": "vfs",
+      "program": "vfs",
+      "resources": {
+        "bytes": 4194304,
+        "caps": 256
+      },
+      "exports": [
+        "files",
+        "read",
+        "exec",
+        "admin"
+      ],
+      "setup": {
+        "mounts": [
+          {
+            "path": "/",
+            "service": "store",
+            "read_only": false,
+            "optional": true
+          },
+          {
+            "path": "/boot",
+            "service": "boot",
+            "read_only": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "store",
+      "program": "store",
+      "optional": true,
+      "resources": {
+        "bytes": 8388608,
+        "caps": 256
+      },
+      "exports": [
+        "files",
+        "admin"
+      ],
+      "routes": {
+        "block": {
+          "child": "devices",
+          "name": "block"
+        }
+      },
+      "setup": {
+        "image.pool": {
+          "$ref": "images",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
+        },
+        "image.scope": {
+          "$ref": "image.scope",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
+        }
+      },
+      "restart": true
+    },
+    {
+      "name": "session",
+      "program": "mgr",
+      "start": true,
+      "restart": true,
+      "resources": {
+        "bytes": 41943040,
+        "caps": 1408,
+        "children": true
+      },
+      "exports": [
+        "control",
+        "view"
+      ],
+      "setup": {
+        "archive": {
+          "$ref": "archive"
+        },
+        "stdin": {
+          "$ref": "input.0",
+          "rights": {
+            "$const": "RIGHT_RECEIVE | RIGHT_DUPLICATE"
+          }
+        },
+        "stdout": {
+          "$ref": "output.0",
+          "rights": {
+            "$const": "RIGHT_SEND | RIGHT_DUPLICATE"
+          },
+          "badge": 1
+        },
+        "config": {
+          "$literal": {
+            "routes": {
+              "*": {
+                "parent": true,
+                "local": true
+              },
+              "session": {
+                "manager": 3
+              },
+              "session.view": {
+                "manager": 1
+              }
+            },
+            "children": [
+              {
+                "name": "shell",
+                "program": "shell",
+                "start": true,
+                "restart": true,
+                "resources": {
+                  "bytes": 33554432,
+                  "caps": 1024,
+                  "children": true
+                },
+                "exports": [
+                  "*"
+                ],
+                "setup": {
+                  "stdin": {
+                    "$ref": "stdin"
+                  },
+                  "stdout": {
+                    "$ref": "stdout"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

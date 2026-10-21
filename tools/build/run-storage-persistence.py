@@ -47,10 +47,11 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
             until(marker, cursor); cursor = len(output)
             process.stdin.write(keys); process.stdin.flush()
         until(b"/ > ", start)
+        if text == "svc restart devices": until(b"uart: console ready\n", start)
         return output[start:]
 
     def publication():
-        for line in command('bus call . Resolve name=store.admin').splitlines():
+        for line in command('bus call . Get name=store.admin').splitlines():
             if line.startswith(b'{'): return json.loads(line)['instance']
         return None
 
@@ -64,12 +65,14 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
     try:
         until(b"/ > ", 0)
         # A responsive shell no longer implies optional storage is ready.
+        command("bus wait store.admin")
+        command("bus wait files")
         await_services({"store": "running", "vfs": "running"})
         for item in commands:
             text, expected = item[:2]
             states = item[2] if len(item) > 2 else None
             if states and not isinstance(states, dict): states = dict.fromkeys(states, "running")
-            replacing = states and states.get('store') == 'running' and text != 'svc restart devices'
+            replacing = text == 'svc restart store'
             previous = publication() if replacing else None
             began = time.monotonic()
             result = command(text, item[3] if len(item) > 3 else ())
@@ -126,7 +129,7 @@ def main():
                 ("cat note", b"hello-persistent-again\n/ > "),
 
                 ("cat note", b"hello-persistent-again"),
-                ("svc restart devices", b"myos native shell", ["devices", "block-8", "store", "vfs"]),
+                ("svc restart devices", b"service change requested", ["devices", "block-8", "store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again\n/ > "),
                 ("ls", b"note\n"),
@@ -162,10 +165,10 @@ def main():
                 ("ls notes", b"item\n"),
                 ("cat edited", b"editor-persistent"),
                 ("cat fd-async", b"CR"),
-                ("svc stop store", b"service change requested", {"store": "stopped", "vfs": "running"}),
+                ("svc stop store", b"service change requested", {"store": "idle", "vfs": "running"}),
                 ("cat /boot/README.TXT", b"myos disk file service"),
                 ("echo storage-offline", b"storage-offline"),
-                ("cat note", b"error: "),
+                ("cat note", b"hello-persistent-again"),
                 ("svc start store", b"service change requested", ["store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
                 ("svc restart store", b"service change requested", ["store", "vfs"]),
