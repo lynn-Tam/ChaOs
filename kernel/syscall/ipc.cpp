@@ -9,7 +9,7 @@
 #include <task/thread.hpp>
 #include <uapi/abi.h>
 #include <utility>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <sched/dispatcher.hpp>
 #include <uapi/ipc.h>
 #include <cap/cspace.hpp>
@@ -35,12 +35,12 @@ template<usize op>
     }
     const cap::View effective =
         notification.value().view();
-    const auto* const authority = std::get_if<cap::Badge>(
+    const auto* const badge = std::get_if<cap::Badge>(
         &effective.data);
-    if (authority == nullptr || authority->badge == 0) {
+    if (badge == nullptr || badge->badge == 0) {
         return returned(STATUS_INTERNAL);
     }
-    return returned(notification.value()->signal(authority->badge)
+    return returned(notification.value()->signal(badge->badge)
         ? STATUS_OK
         : STATUS_CLOSED);
 }
@@ -232,9 +232,9 @@ static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> So
             return &static_cast<object::Scope*>(reference->get())->events();
         return nullptr;
     }
-    if (reference->kind() == ObjAccount && cap.rights().contains(cap::Right::Inspect)
+    if (reference->kind() == ObjQuota && cap.rights().contains(cap::Right::Inspect)
         && !(mask & ~(STATE_OPEN | STATE_CLOSING | STATE_DRAINED)))
-        return &static_cast<resource::Account*>(reference->get())->events();
+        return &static_cast<resource::Quota*>(reference->get())->events();
     if (!cap.rights().contains(cap::Right::Receive)) return nullptr;
     if (reference->kind() == ObjNotification)
         return &static_cast<ipc::Notification*>(reference->get())->events();
@@ -249,11 +249,11 @@ template<usize op> auto port_watch(Call& inv) noexcept -> Result {
     if (!port || !target) return returned(cap_status(!port ? port.error() : target.error()));
     // Ports aggregate sources and are directly waitable. Nested aggregation
     // would introduce recursive hint publication and source/receiver cycles.
-    if (target->lease().kind() == ObjPort) return returned(STATUS_INVALID_OP);
+    if (target->pin().kind() == ObjPort) return returned(STATUS_INVALID_OP);
     if (inv.trap.arg(6) & ~WATCH_CHANGED) return returned(STATUS_BAD_ARGS);
     auto* event = source(*target, inv.trap.arg(2), inv.trap.arg(3));
     if (!event) return returned(STATUS_DENIED);
-    auto watch = port->object().watch(*port, target->lease(), *event, inv.trap.arg(2), inv.trap.arg(5),
+    auto watch = port->object().watch(*port, target->pin(), *event, inv.trap.arg(2), inv.trap.arg(5),
         {.mask = inv.trap.arg(3), .seen = inv.trap.arg(4), .changed = bool(inv.trap.arg(6) & WATCH_CHANGED)}, {});
     return watch ? returned(STATUS_OK, *watch) : returned(watch.error());
 }
@@ -281,7 +281,7 @@ template<usize op> auto grant_source(Call& inv) noexcept -> Result {
     } else {
         auto port = inv.cspace.resolve<ipc::Port>(handle_of(inv.trap.arg(4)), cap::Rights::of(cap::Right::Manage));
         if (!port) return returned(cap_status(port.error()));
-        auto watch = port->object().watch(*port, owner->lease(), source, SOURCE_GRANT, inv.trap.arg(6),
+        auto watch = port->object().watch(*port, owner->pin(), source, SOURCE_GRANT, inv.trap.arg(6),
             {.mask=0, .seen=inv.trap.arg(5), .changed=true}, {&owner->object(), id, *limit});
         return watch ? returned(STATUS_OK, *watch) : returned(watch.error());
     }
@@ -333,7 +333,7 @@ template<usize op> auto source_call(Call& inv) noexcept -> Result {
     const auto deadline = inv.trap.arg(4) ? std::optional<u64>{inv.trap.arg(4)} : std::nullopt;
     std::array<const object::ref<>*, 1> gates{&*storage};
     auto admit = [&](Source::Commit commit, Source::Action revoke, Source::Action ready) noexcept {
-        return inv.target->await_authority(target->lease(), gates, commit, revoke, ready);
+        return inv.target->await_grant(target->pin(), gates, commit, revoke, ready);
     };
     auto ready = event->await({*inv.target, *inv.cpu.cpus, inv.cpu.dispatcher()}, {.mask = mask,
         .seen = inv.trap.arg(3), .changed = bool(inv.trap.arg(5) & WATCH_CHANGED)}, deadline,

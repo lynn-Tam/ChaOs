@@ -1,6 +1,6 @@
 #include <cpu/cpu.hpp>
 #include <cpu/ipi.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <boot/info.hpp>
 #include <trap.hpp>
 #include <console.hpp>

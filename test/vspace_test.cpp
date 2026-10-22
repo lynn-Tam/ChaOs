@@ -1,6 +1,6 @@
 #include <expected>
 #include <optional>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <test/test.hpp>
 
 #include <mm/table.hpp>
@@ -31,7 +31,7 @@ constinit libk::manual_lifetime<mm::Pmm> vspace_test_pmm{};
 constinit libk::manual_lifetime<mm::KSpace> vspace_test_kernel{};
 constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> vspace_test_mm{};
 constinit libk::manual_lifetime<WorkQueue> vspace_work{};
-constinit libk::manual_lifetime<object::pool<resource::Account>> vspace_test_groups{};
+constinit libk::manual_lifetime<object::pool<resource::Quota>> vspace_test_groups{};
 constinit libk::manual_lifetime<object::pool<cap::CSpace>> vspace_test_cspaces{};
 
 
@@ -646,7 +646,7 @@ bool test_sponsored_table_capacity_follows_retirement(
         return false;
     }
 
-    constexpr resource::budget limit{
+    constexpr resource::Budget limit{
         .memory = 16 * mm::page_size,
     };
     auto pending_pool = vspace_test_groups->create(limit);
@@ -659,7 +659,7 @@ bool test_sponsored_table_capacity_follows_retirement(
         return false;
     }
     constexpr auto fixed =
-        object::pool<mm::VSpace>::slot_charge();
+        object::pool<mm::VSpace>::slot_usage();
     auto reserved = pool->reserve(std::move(pool_ref), fixed);
     if (!reserved) {
         return false;
@@ -670,7 +670,7 @@ bool test_sponsored_table_capacity_follows_retirement(
     }
     auto space = std::move(pending_space).value().publish();
 
-    const resource::budget root_baseline{
+    const resource::Budget root_baseline{
         .memory = limit.memory - fixed.memory
             - mm::page_size,
     };
@@ -722,7 +722,7 @@ bool test_sponsored_table_capacity_follows_retirement(
 
 
     if (pool->available() != limit || pool->info(0).allocations != 0
-        || pool->close() != resource::Account::Phase::Drained
+        || pool->close() != resource::Quota::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -737,9 +737,9 @@ bool test_sponsored_table_capacity_follows_retirement(
 bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
     VSpaceFixture fixture;
     if (!fixture.initialize(true, 1)) return false;
-    const auto fee = cap::Graph::node_charge();
-    const auto slot = object::pool<mm::VSpace>::slot_charge();
-    const resource::budget limit{fee.memory + slot.memory, fee.caps + slot.caps};
+    const auto fee = cap::Graph::node_usage();
+    const auto slot = object::pool<mm::VSpace>::slot_usage();
+    const resource::Budget limit{fee.memory + slot.memory, fee.caps + slot.caps};
     auto pending = vspace_test_groups->create(limit);
     if (!pending) return false;
     auto pool = std::move(*pending).publish();
@@ -748,9 +748,9 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
         auto self = object::ref<>{pool};
         if (!self) return false;
         auto admission = pool->reserve(std::move(self), fee);
-        auto sponsor = object::ref<>{pool};
-        if (!admission || !sponsor) return false;
-        auto charge = pool->reserve(std::move(sponsor), slot);
+        auto source = object::ref<>{pool};
+        if (!admission || !source) return false;
+        auto charge = pool->reserve(std::move(source), slot);
         if (!charge) return false;
         auto space = vspace_test_mm->get<mm::VSpace>().create(std::move(*charge),
             fixture.pmm(), *vspace_test_kernel, *vspace_work);
@@ -758,7 +758,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
     }
     while (vspace_work->run()) {}
     const bool refunded = pool->available() == limit && pool->info(0).allocations == 0;
-    const bool closed = pool->close() == resource::Account::Phase::Drained && pool.destroy();
+    const bool closed = pool->close() == resource::Quota::Phase::Drained && pool.destroy();
     pool.reset();
 
     return failed && refunded && closed && fixture.pmm().verify_invariants();

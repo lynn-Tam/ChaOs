@@ -4,6 +4,7 @@
 #include <libk/cpio.hpp>
 #include <ipc.hpp>
 #include <optional>
+#include <vector>
 #include <start.hpp>
 #include <string.h>
 
@@ -13,11 +14,11 @@ inline constexpr auto proc_retryable(status_t s) noexcept -> bool {
 
 inline constexpr word_t proc_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc) | OBJ_BIT(ObjDomain)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
-    | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjAccount) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
+    | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjQuota) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
 
 struct proc_quota {
     word_t bytes{1024 * 1024}, caps{256}, kinds{proc_base_kinds};
-    word_t slots{128}, pages{20}, pool_perms{RIGHT_CREATE | RIGHT_INSPECT};
+    word_t slots{128}, pages{20}, quota_perms{RIGHT_CREATE | RIGHT_INSPECT};
     word_t watches{64}, hints{16};
     word_t max_bytes{}, max_caps{}; // Zero keeps that dimension's initial ceiling.
 };
@@ -29,9 +30,12 @@ class proc_task {
     state state_{};
     status_t status_{};
     bool closing_{};
-    cap_owner account_, scope_, vm_, cs_, thread_, sc_, domain_;
+    cap_owner quota_, scope_, vm_, cs_, thread_, sc_, domain_;
     word_t cpus_{};
     cap_t events_{};
+    mutable uint64_t cpu_at_{};
+    mutable status_t cpu_status_{};
+    mutable std::pair<uint64_t, std::vector<uint64_t>> cpu_;
     std::array<ev_watch, 4> watches_;
 public:
     proc_task() = default;
@@ -40,22 +44,22 @@ public:
 
     ~proc_task() {
         // Normal owners retain this handle through poll/collect. If the owner
-        // releases it early, native Scope/Account cleanup owns the remaining
+        // releases it early, native Scope/Quota cleanup owns the remaining
         // work; destruction neither waits nor chooses a process exit policy.
         if (scope_) (void)sys::scope_close(scope());
-        if (account_) (void)sys::account_close(pool());
+        if (quota_) (void)sys::quota_close(quota());
     }
-    auto pool() const noexcept -> cap_t { return account_.selector(); }
+    auto quota() const noexcept -> cap_t { return quota_.selector(); }
     auto scope() const noexcept -> cap_t { return scope_.selector(); }
-    auto alloc() const noexcept -> CreateAuth { return {pool(), scope()}; }
+    auto alloc() const noexcept -> CreateAuth { return {quota(), scope()}; }
     auto vspace() const noexcept -> cap_t { return vm_.selector(); }
     auto domain() const noexcept -> cap_t { return domain_.selector(); }
     auto cspace() const noexcept -> cap_t { return cs_.selector(); }
     auto open(const proc_auth& auth, const proc_quota& q) noexcept -> status_t {
-        if (state_ != state::New || account_) return STATUS_BUSY;
-        const auto g = sys::account_create(auth.alloc, q.bytes, q.caps, q.kinds, q.max_bytes ? q.max_bytes : q.bytes, q.max_caps ? q.max_caps : q.caps);
-        if (g.value) account_ = cap_owner{g.value};
-        if (g.status != STATUS_OK || !account_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
+        if (state_ != state::New || quota_) return STATUS_BUSY;
+        const auto g = sys::quota_create(auth.alloc, q.bytes, q.caps, q.kinds, q.max_bytes ? q.max_bytes : q.bytes, q.max_caps ? q.max_caps : q.caps);
+        if (g.value) quota_ = cap_owner{g.value};
+        if (g.status != STATUS_OK || !quota_) return g.status == STATUS_OK ? STATUS_INVALID_CAP : g.status;
         const auto owner = sys::scope_create(auth.alloc);
         if (owner.value) scope_ = cap_owner{owner.value};
         if (owner.status != STATUS_OK || !scope_) return owner.status == STATUS_OK ? STATUS_INVALID_CAP : owner.status;
@@ -72,7 +76,7 @@ public:
     }
 private:
     auto close() noexcept -> status_t {
-        if (!account_) return STATUS_OK;
+        if (!quota_) return STATUS_OK;
         if (!closing_) {
             if (scope_) {
                 const auto status = sys::scope_close(scope()).status;
@@ -91,23 +95,23 @@ private:
             const auto closed = scope_.close();
             if (closed != STATUS_OK) return closed;
         }
-        const auto ready = sys::source_info(pool());
+        const auto ready = sys::source_info(quota());
         if (ready.status != STATUS_OK) return ready.status;
         if (ready.value & STATE_OPEN) {
-            const auto status = sys::account_close(pool()).status;
+            const auto status = sys::quota_close(quota()).status;
             return status == STATUS_OK ? STATUS_WOULD_BLOCK : status;
         }
         if (!(ready.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
-        const auto destroyed = sys::object_destroy(pool()).status;
+        const auto destroyed = sys::object_destroy(quota()).status;
         if (destroyed != STATUS_OK) return destroyed;
         for (auto& watch : watches_) if (watch) {
             if (const auto status = watch.close(); status != STATUS_OK) return status;
         }
-        return account_.close();
+        return quota_.close();
     }
 
 public:
-    auto thread() const noexcept -> cap_t { return thread_.selector(); }
+    auto initial_thread() const noexcept -> cap_t { return thread_.selector(); }
     auto closing() const noexcept -> bool { return state_ == state::Closing; }
     auto prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t {
         if (thread_) return STATUS_BUSY;
@@ -116,7 +120,7 @@ public:
         if (thread.status != STATUS_OK) return thread.status;
         events_ = events;
         if (!events_) return STATUS_OK;
-        const std::array<cap_t, 4> sources{thread_.selector(), thread_.selector(), scope(), pool()};
+        const std::array<cap_t, 4> sources{thread_.selector(), thread_.selector(), scope(), quota()};
         for (size_t i = 0; i != sources.size(); ++i) {
             const auto status = watches_[i].open(events_, sources[i], i == 0 ? 0 : i == 1 ? SOURCE_READY : STATE_DRAINED,
                 0, i == 0 ? WATCH_CHANGED : 0, i == 1 ? SOURCE_EXIT : SOURCE_STATE);
@@ -137,7 +141,7 @@ public:
         if (status == STATUS_OK) state_ = state::Running;
         return status;
     }
-    auto info() const noexcept -> std::expected<ThreadInfo, status_t> {
+    auto initial_info() const noexcept -> std::expected<ThreadInfo, status_t> {
         if (!thread_) return std::unexpected(STATUS_CLOSED);
         const auto result = sys::thread_info(thread_.selector());
         if (result.status != STATUS_OK) return std::unexpected(result.status);
@@ -145,6 +149,7 @@ public:
         ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
         return info;
     }
+    auto cpu_info() const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t>;
     auto memory_info() const noexcept -> std::expected<VSpaceInfo, status_t> {
         const auto result = sys::vspace_info(vspace());
         if (result.status != STATUS_OK) return std::unexpected(result.status);
@@ -152,16 +157,18 @@ public:
         ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
         return info;
     }
-    auto resource_info() const noexcept -> std::expected<AccountInfo, status_t> {
-        const auto result = sys::account_info(pool());
+    auto resource_info() const noexcept -> std::expected<QuotaInfo, status_t> {
+        const auto result = sys::quota_info(quota());
         if (result.status != STATUS_OK) return std::unexpected(result.status);
-        AccountInfo info;
+        QuotaInfo info;
         ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
         return info;
     }
-    auto execution(bool enabled) noexcept -> sys::SysResult {
+    auto initial_execution(bool enabled) noexcept -> sys::SysResult {
         return sys::execution_set(thread_.selector(), enabled);
     }
+    // The current CRT ends the program when its initial thread returns. Other
+    // threads remain owned by Scope and are retired together, never sampled here.
     auto observe() noexcept -> sys::SysResult {
         if (state_ == state::Consumed) return {.status = STATUS_INVALID_CAP};
         if (state_ == state::Closing) return {.status = STATUS_OK, .value = 1, .value2 = static_cast<word_t>(status_)};
@@ -205,10 +212,10 @@ public:
         }
         return close();
     }
-    auto result() const noexcept -> std::optional<proc_exit> { return state_ == state::Closing && !account_ ? std::optional{proc_exit{status_}} : std::nullopt; }
+    auto result() const noexcept -> std::optional<proc_exit> { return state_ == state::Closing && !quota_ ? std::optional{proc_exit{status_}} : std::nullopt; }
     // Only a partially built execution can lack a real retirement doorbell.
     auto polling() const noexcept -> bool {
-        return state_ == state::Closing && account_ && !(watches_[1] && watches_[2] && watches_[3]);
+        return state_ == state::Closing && quota_ && !(watches_[1] && watches_[2] && watches_[3]);
     }
     auto collect() noexcept -> sys::SysResult {
         const auto status = poll();

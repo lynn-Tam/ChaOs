@@ -61,7 +61,7 @@ public:
         }
         return block;
     }
-    // The owner has drained all slots and detached any charge in extra.
+    // The owner has drained all slots and detached any usage in extra.
     static auto dispose(page& block) noexcept -> Backing {
         for (auto& slot : slots(block)) std::destroy_at(&slot);
         auto backing = std::move(block.backing);

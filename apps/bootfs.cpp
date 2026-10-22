@@ -22,7 +22,7 @@ static auto map(ubus_request& request, ubus_msg& response) -> status_t {
     auto* file = find(*request.data["path"].as<std::string_view>()); if (!file) return STATUS_NOT_FOUND;
     const auto size = (std::max(file->bytes.size(), size_t{1}) + 4095) & ~size_t{4095};
     if (!file->backing.memory) {
-        auto backing = vm_area::create(images, rt_vm(), 0, size, VM_READ | VM_WRITE | VM_EXECUTE);
+        auto backing = vm_area::create(images, rt_vm(), 0, size, VM_READ | VM_WRITE | VM_EXECUTE, VM_READ | VM_WRITE);
         if (!backing) return backing.error();
         ::memcpy(reinterpret_cast<void*>(backing->address), file->bytes.data(), file->bytes.size());
         auto status = backing->detach();
@@ -32,7 +32,7 @@ static auto map(ubus_request& request, ubus_msg& response) -> status_t {
     }
     const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
         .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, .words={0, size / 4096, perms}};
-    auto exported = descriptor.derive(file->backing.memory.selector(), view, images.account);
+    auto exported = descriptor.derive(file->backing.memory.selector(), view, images.quota);
     if (!exported) return exported.error();
     const auto index = response.offer(std::move(*exported), view.rights); if (!index) return STATUS_NO_MEMORY;
     response.data.put("buffer", ubus_buffer{*index, 0, file->bytes.size()}); return STATUS_OK;
@@ -42,7 +42,7 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
     auto* file = find(*request.data["path"].as<std::string_view>()); if (!file) return STATUS_NOT_FOUND;
     if (opens.size() >= 64) return STATUS_EXHAUSTED;
     const auto budget = request.capability(request.data["budget"]);
-    auto storage = vm_new<bf_open>({budget ? budget : rt_startup().pool, rt_startup().scope});
+    auto storage = vm_new<bf_open>({budget ? budget : rt_startup().quota, rt_startup().scope});
     if (!storage) return storage.error();
     auto opened = std::move(*storage); opened->file = file;
     auto& object = opened->object;
@@ -93,7 +93,7 @@ int main() {
     ubus_msg setup;
     status = parent.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     const auto message = setup.data["message"];
-    images = {setup.capability(message["image.pool"]), setup.capability(message["image.scope"])};
+    images = {setup.capability(message["image.quota"]), setup.capability(message["image.scope"])};
     const auto buffer = message["archive"].as<ubus_buffer>(); if (!buffer || buffer->offset) return STATUS_BAD_ARGS;
     auto mapping = vm_area::map(rt_vm(), setup.take(message["archive"]), 0, (buffer->size + 4095) & ~size_t{4095}, VM_READ);
     if (!mapping) return mapping.error();

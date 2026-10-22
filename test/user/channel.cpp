@@ -76,9 +76,9 @@ static void replies(const rt_env& env) {
     check(ch_recv(response.ends[0].selector(), packet, false).status == STATUS_PEER_FAULT);
     expect(sys::object_destroy(event.selector()).status);
 }
-static void rebill_memory(const rt_env& env) {
-    const auto first = sys::account_create(env.alloc(), 128 * 1024, 32, OBJ_BIT(ObjMem) | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjScope));
-    const auto second = sys::account_create(env.alloc(), 128 * 1024, 32, OBJ_BIT(ObjMem) | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjScope));
+static void reassign_memory(const rt_env& env) {
+    const auto first = sys::quota_create(env.alloc(), 128 * 1024, 32, OBJ_BIT(ObjMem) | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjScope));
+    const auto second = sys::quota_create(env.alloc(), 128 * 1024, 32, OBJ_BIT(ObjMem) | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjScope));
     expect(first.status); expect(second.status);
     cap_owner a{first.value}, b{second.value};
     const auto from = sys::scope_create(env.alloc()), to = sys::scope_create(env.alloc());
@@ -97,9 +97,9 @@ static void rebill_memory(const rt_env& env) {
     bytes[0] = 0x5a;
     check(sys::memory_read(area->memory.selector(), 4090, 0, 16).status == STATUS_BAD_ARGS);
     check(sys::memory_write(area->memory.selector(), 4090, 0, 16).status == STATUS_BAD_ARGS);
-    auto balance = [&](cap_t account) {
-        expect(sys::account_info(account).status);
-        AccountInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
+    auto balance = [&](cap_t quota) {
+        expect(sys::quota_info(quota).status);
+        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
         return info.memory_available;
     };
     auto identity = [&](cap_t object) {
@@ -108,18 +108,18 @@ static void rebill_memory(const rt_env& env) {
         return info;
     };
     const auto original = identity(area->memory.selector());
-    check(original.billing_epoch == 1 && members(source.selector()).count == 1
+    check(original.quota_epoch == 1 && members(source.selector()).count == 1
         && members(destination.selector()).count == 0);
     const auto before_a = balance(a.selector()), before_b = balance(b.selector());
-    const auto empty = sys::account_create(env.alloc(), 0, 0, OBJ_BIT(ObjMem));
+    const auto empty = sys::quota_create(env.alloc(), 0, 0, OBJ_BIT(ObjMem));
     expect(empty.status);
     cap_owner denied{empty.value};
-    check(sys::object_rebill(area->memory.selector(), a.selector(), denied.selector(), 1,
+    check(sys::object_reassign(area->memory.selector(), a.selector(), denied.selector(), 1,
         source.selector(), destination.selector(), 1).status == STATUS_DENIED);
-    check(identity(area->memory.selector()).billing_epoch == 1 && members(source.selector()).count == 1
+    check(identity(area->memory.selector()).quota_epoch == 1 && members(source.selector()).count == 1
         && members(destination.selector()).count == 0 && balance(a.selector()) == before_a);
     expect(denied.close());
-    const auto moved = sys::object_rebill(area->memory.selector(), a.selector(), b.selector(), 1,
+    const auto moved = sys::object_reassign(area->memory.selector(), a.selector(), b.selector(), 1,
         source.selector(), destination.selector(), 1);
     expect(moved.status); check(moved.value == 2 && moved.value2 == 2 && bytes[0] == 0x5a);
     const auto membership = members(destination.selector());
@@ -128,10 +128,10 @@ static void rebill_memory(const rt_env& env) {
     expect(sys::scope_close(source.selector()).status);
     expect(source.close());
     const auto current = identity(area->memory.selector());
-    check(current.object_id == original.object_id && current.billing_epoch == moved.value);
+    check(current.object_id == original.object_id && current.quota_epoch == moved.value);
     const auto after_a = balance(a.selector()), after_b = balance(b.selector());
     check(after_a > before_a && before_b - after_b == after_a - before_a);
-    check(sys::object_rebill(area->memory.selector(), a.selector(), b.selector(), 1).status == STATUS_STALE);
+    check(sys::object_reassign(area->memory.selector(), a.selector(), b.selector(), 1).status == STATUS_STALE);
     bytes[4096] = 0xa5;
     check(bytes[0] == 0x5a && balance(a.selector()) == after_a && balance(b.selector()) < after_b);
     const auto created = sys::cspace_create({a.selector(), env.scope}, 8, 3);
@@ -143,12 +143,12 @@ static void rebill_memory(const rt_env& env) {
     const auto copied = sys::cap_duplicate(signal.selector(), space.selector(), RIGHT_SIGNAL);
     expect(copied.status);
     const auto old_balance = balance(a.selector()), new_balance = balance(b.selector());
-    expect(sys::object_rebill(space.selector(), a.selector(), b.selector(), 1).status);
+    expect(sys::object_reassign(space.selector(), a.selector(), b.selector(), 1).status);
     check(balance(a.selector()) > old_balance && balance(b.selector()) < new_balance);
     expect(sys::cap_close(copied.value, space.selector()).status);
-    auto cap_balance = [&](cap_t account) {
-        expect(sys::account_info(account).status);
-        AccountInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
+    auto cap_balance = [&](cap_t quota) {
+        expect(sys::quota_info(quota).status);
+        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
         return info.caps_available;
     };
     const auto caps_a = cap_balance(a.selector()), caps_b = cap_balance(b.selector());
@@ -159,11 +159,11 @@ static void rebill_memory(const rt_env& env) {
     const auto scope = sys::scope_create({a.selector(), env.scope});
     expect(scope.status);
     cap_owner owner{scope.value};
-    const auto child = sys::account_create({env.pool, owner.selector()}, 128 * 1024, 32, OBJ_BIT(ObjScope));
+    const auto child = sys::quota_create({env.quota, owner.selector()}, 128 * 1024, 32, OBJ_BIT(ObjScope));
     expect(child.status);
     cap_owner cycle{child.value};
     const auto parent_balance = balance(a.selector()), child_balance = balance(cycle.selector());
-    check(sys::object_rebill(owner.selector(), a.selector(), cycle.selector(), 1).status == STATUS_DENIED);
+    check(sys::object_reassign(owner.selector(), a.selector(), cycle.selector(), 1).status == STATUS_DENIED);
     check(balance(a.selector()) == parent_balance && balance(cycle.selector()) == child_balance);
     expect(sys::scope_close(owner.selector()).status);
     expect(owner.close()); expect(cycle.close());
@@ -172,52 +172,52 @@ static void rebill_memory(const rt_env& env) {
     expect(area->close());
 
     // Grant nodes remain independently charged to A until the memory's old
-    // capability lineage drains; Rebill transfers only its allocation owner.
-    for (auto* account : {&a, &b}) {
-        expect(sys::account_close(account->selector()).status);
-        expect(sys::wait_one(account->selector(), STATE_DRAINED).status);
-        expect(sys::object_destroy(account->selector()).status);
-        expect(account->close());
+    // capability lineage drains; Reassign transfers only its allocation owner.
+    for (auto* quota : {&a, &b}) {
+        expect(sys::quota_close(quota->selector()).status);
+        expect(sys::wait_one(quota->selector(), STATE_DRAINED).status);
+        expect(sys::object_destroy(quota->selector()).status);
+        expect(quota->close());
     }
 }
 
-static void resize_account(const rt_env& env) {
-    const auto made = sys::account_create(env.alloc(), 0, 0, OBJ_BIT(ObjMem), 256 * 1024, 64);
-    expect(made.status); cap_owner account{made.value};
+static void resize_quota(const rt_env& env) {
+    const auto made = sys::quota_create(env.alloc(), 0, 0, OBJ_BIT(ObjMem), 256 * 1024, 64);
+    expect(made.status); cap_owner quota{made.value};
     auto info = [&] {
-        expect(sys::account_info(account.selector()).status);
-        return *reinterpret_cast<const AccountInfo*>(env.ipc);
+        expect(sys::quota_info(quota.selector()).status);
+        return *reinterpret_cast<const QuotaInfo*>(env.ipc);
     };
-    expect(sys::object_info(account.selector()).status);
+    expect(sys::object_info(quota.selector()).status);
     const auto id = reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id;
-    check(sys::account_resize(account.selector(), 128 * 1024, 32).status == STATUS_DENIED);
-    expect(sys::account_resize(account.selector(), 128 * 1024, 32, env.pool).status);
-    const auto mem = sys::memory_create({account.selector(), env.scope}, 8192, VM_READ | VM_WRITE);
+    check(sys::quota_resize(quota.selector(), 128 * 1024, 32).status == STATUS_DENIED);
+    expect(sys::quota_resize(quota.selector(), 128 * 1024, 32, env.quota).status);
+    const auto mem = sys::memory_create({quota.selector(), env.scope}, 8192, VM_READ | VM_WRITE);
     expect(mem.status);
     auto area = vm_area::map(rt_vm(), cap_owner{mem.value}, 0, 8192, VM_READ | VM_WRITE);
     check(bool(area));
     auto* bytes = reinterpret_cast<volatile uint8_t*>(area->address);
     bytes[0] = 0x5a;
     const auto before = info();
-    check(sys::account_resize(account.selector(), 0, 0).status == STATUS_BUSY);
-    check(sys::account_resize(account.selector(), 512 * 1024, 32, env.pool).status == STATUS_DENIED);
-    expect(sys::account_resize(account.selector(), 192 * 1024, 24, env.pool).status);
+    check(sys::quota_resize(quota.selector(), 0, 0).status == STATUS_BUSY);
+    check(sys::quota_resize(quota.selector(), 512 * 1024, 32, env.quota).status == STATUS_DENIED);
+    expect(sys::quota_resize(quota.selector(), 192 * 1024, 24, env.quota).status);
     const auto after = info();
     check(after.memory_available == before.memory_available + 64 * 1024
         && after.caps_available + 8 == before.caps_available && bytes[0] == 0x5a);
-    bytes[4096] = 0xa5; // A new page still uses the same Account after growth.
-    expect(sys::object_info(account.selector()).status);
+    bytes[4096] = 0xa5; // A new page still uses the same Quota after growth.
+    expect(sys::object_info(quota.selector()).status);
     check(reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id == id);
     const auto current = info();
     const auto used = current.memory_limit - current.memory_available;
-    expect(sys::account_close(account.selector()).status);
-    expect(sys::account_resize(account.selector(), used, current.cap_limit - current.caps_available).status);
+    expect(sys::quota_close(quota.selector()).status);
+    expect(sys::quota_resize(quota.selector(), used, current.cap_limit - current.caps_available).status);
     check(info().state == OBJECT_CLOSING && bytes[0] == 0x5a && bytes[4096] == 0xa5);
-    check(sys::account_resize(account.selector(), 192 * 1024, 32, env.pool).status == STATUS_CLOSED);
+    check(sys::quota_resize(quota.selector(), 192 * 1024, 32, env.quota).status == STATUS_CLOSED);
     expect(area->close());
-    expect(sys::wait_one(account.selector(), STATE_DRAINED).status);
-    check(sys::account_resize(account.selector(), 0, 0).status == STATUS_CLOSED);
-    expect(sys::object_destroy(account.selector()).status);
+    expect(sys::wait_one(quota.selector(), STATE_DRAINED).status);
+    check(sys::quota_resize(quota.selector(), 0, 0).status == STATUS_CLOSED);
+    expect(sys::object_destroy(quota.selector()).status);
 }
 
 static void port_events(const rt_env& env) {
@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
     const auto copied = sys::cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(copied.status);
     auto mapping = vm_area::map(rt_vm(), cap_owner{copied.value}, 0, 4096, VM_READ | VM_WRITE); check(bool(mapping));
     uart_port port{mapping->address + console->offset}; port.reset(); output = &port;
-    capacity(env); replies(env); rebill_memory(env); resize_account(env); port_events(env);
+    capacity(env); replies(env); reassign_memory(env); resize_quota(env); port_events(env);
     test_image image; open(image, env);
     test_tasks tasks; tasks.open(env.alloc(), rt_root().domain, env.cpus);
     ch_pair data; expect(data.open(env.alloc(), 32, 0));
@@ -340,6 +340,6 @@ int main(int argc, char** argv) {
         if (result.status == STATUS_OK) { expect(static_cast<status_t>(result.value)); break; }
         check(result.status == STATUS_WOULD_BLOCK || proc_retryable(result.status)); sys::yield();
     }
-    port.write("[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and rebilling ok\n");
+    port.write("[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and reassigning ok\n");
     for (;;) sys::yield();
 }

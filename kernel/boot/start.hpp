@@ -9,7 +9,7 @@
 #include <ipc/notification.hpp>
 #include <ipc/port.hpp>
 #include <mm/pager.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <sched/sc.hpp>
 
 // Cold ownership only. Runtime code borrows the concrete entities it needs;
@@ -27,7 +27,7 @@ struct Boot {
     cap::Graph grants;
     Cpus cpus;
     object::ref<sched::Domain> domain;
-    object::ref<resource::Account> root;
+    object::ref<resource::Quota> root;
     object::ref<object::Scope> scope;
     object::ref<mm::Phys> physical;
 

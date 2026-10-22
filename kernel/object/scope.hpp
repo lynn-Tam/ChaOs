@@ -7,7 +7,7 @@
 #include <sync.hpp>
 #include <object/ref.hpp>
 #include <cap/grant.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 #include <work.hpp>
 #include <libk/assert.hpp>
 #include <base/slab.hpp>
@@ -32,7 +32,7 @@ namespace object {
 class Membership;
 class Transfer;
 
-// This is solely a lifecycle index; fees and authorization live elsewhere.
+// This is solely a lifecycle index; dependencies and authorization live elsewhere.
 class Membership final : private libk::noncopyable_nonmovable {
     enum class Phase : u8 { Empty, Pending, Live, Retiring };
     friend class Scope;
@@ -77,7 +77,7 @@ public:
         Admission(Admission&&) noexcept = default;
         auto operator=(Admission&&) noexcept -> Admission& = default;
     };
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     Scope() noexcept { events_.update(STATE_OPEN); }
     ~Scope() noexcept;
     static auto reserve(ref<Scope>) noexcept -> std::expected<Admission, error>;
@@ -93,7 +93,7 @@ public:
     void retire(cleanup&&) noexcept;
     void bind_membership(Membership& member) noexcept { membership_ = &member; }
     void bind_work(WorkQueue& work, Key owner) noexcept { work_ = &work; job_.bind(owner); events_.bind_work(work, owner); }
-    static auto adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch, cap::Graph::Admission authority = {}) noexcept
+    static auto adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch, cap::Graph::Admission admission = {}) noexcept
         -> std::expected<u64, status_t>;
 private:
     friend class Membership;
@@ -135,33 +135,33 @@ private:
     Work job_{Work::Fn::bind<&Scope::service>(*this)};
 };
 
-// Concrete ownership/payment transaction. The replacement owner reference
+// Concrete ownership/quota transaction. The replacement owner reference
 // is prepared here; final commit moves it without cloning under Gate locks.
 class Transfer final : private libk::noncopyable {
     ref<> target_, source_, destination_;
     ref<Scope> replacement_;
     u64 epoch_{};
-    cap::Graph::Admission authority_;
+    cap::Graph::Admission admission_;
     auto check() const noexcept -> status_t;
     void commit() noexcept;
 public:
     Transfer(ref<> target, ref<Scope> source, ref<Scope> destination, u64 epoch,
-        cap::Graph::Admission authority = {}) noexcept
+        cap::Graph::Admission admission = {}) noexcept
         : target_(std::move(target)), source_(source), destination_(destination),
-          replacement_(std::move(destination)), epoch_(epoch), authority_(authority) {}
+          replacement_(std::move(destination)), epoch_(epoch), admission_(admission) {}
     auto validate() const noexcept -> status_t { sync::Lock guard{Control::lock}; return check(); }
     auto epoch() const noexcept -> u64 { return epoch_; }
     auto adopt() noexcept -> std::expected<u64, status_t>;
-    template<class Commit> auto publish(std::span<const ref<>*> fees, Commit&& apply) noexcept -> status_t {
+    template<class Commit> auto publish(std::span<const ref<>*> dependencies, Commit&& apply) noexcept -> status_t {
         libk_assert(Control::lock.held());
         const auto valid = check();
         if (valid != STATUS_OK) return valid;
         std::array<const ref<>*, 5> gates;
-        libk_assert(fees.size() <= 3);
-        std::copy(fees.begin(), fees.end(), gates.begin());
-        auto count = fees.size();
+        libk_assert(dependencies.size() <= 3);
+        std::copy(dependencies.begin(), dependencies.end(), gates.begin());
+        auto count = dependencies.size();
         if (source_) { gates[count++] = &source_; gates[count++] = &destination_; }
-        const auto status = authority_.publish(std::span{gates.data(), count}, [&] { apply(); commit(); });
+        const auto status = admission_.publish(std::span{gates.data(), count}, [&] { apply(); commit(); });
         if (status == STATUS_OK && source_) {
             static_cast<Scope*>(source_.get())->post();
             static_cast<Scope*>(destination_.get())->post();
@@ -182,33 +182,33 @@ template <typename T> struct traits {
     {
         value.retire(std::move(cleanup));
     }
-    static void bind_funding(T& value, resource::Funding& charge) noexcept
-        requires requires { value.bind_funding(charge); }
+    static void bind_allocation(T& value, resource::Allocation& usage) noexcept
+        requires requires { value.bind_allocation(usage); }
     {
-        value.bind_funding(charge);
+        value.bind_allocation(usage);
     }
 };
 
 // The caller pauses its concrete allocation owner before entering this
 // transaction. Scratch and replacement references are paid and prepared
-// outside publication locks; every recorded pointer names a real Charge.
-template<class Visit, class Commit, class Authority>
-auto rebill(mm::Pmm& pmm, resource::Funding& funding, const ref<>& target, const ref<>& from,
-    const ref<>& to, u64 epoch, resource::budget ceiling, Visit&& visit, Commit&& commit, Authority& authority) noexcept
+// outside publication locks; every recorded pointer names a real Usage.
+template<class Visit, class Commit, class Transaction>
+auto reassign(mm::Pmm& pmm, resource::Allocation& allocation, const ref<>& target, const ref<>& from,
+    const ref<>& to, u64 epoch, resource::Budget ceiling, Visit&& visit, Commit&& commit, Transaction& transaction) noexcept
     -> std::expected<u64, status_t> {
     if (from.id() == to.id()) return std::unexpected(STATUS_BAD_ARGS);
-    const auto paused = funding.pause(from, epoch);
+    const auto paused = allocation.pause(from, epoch);
     if (paused != STATUS_OK) return std::unexpected(paused);
-    libk::scope_exit resume{[&]() noexcept { funding.resume(); }};
-    struct Change { resource::Charge* target{}; ref<> payer; Change* next{}; };
-    resource::budget total = funding.charge();
+    libk::scope_exit resume{[&]() noexcept { allocation.resume(); }};
+    struct Change { resource::Usage* target{}; ref<> quota; Change* next{}; };
+    resource::Budget total = allocation.usage();
     usize count{};
     bool valid = true;
-    visit([&](resource::Charge& fee) {
-        if (!fee) return;
-        const auto memory = libk::checked_add(total.memory, fee.amount().memory);
-        const auto caps = libk::checked_add(total.caps, fee.amount().caps);
-        if (fee.payer().id() != from.id() || !memory || !caps || count == std::numeric_limits<usize>::max()) {
+    visit([&](resource::Usage& usage) {
+        if (!usage) return;
+        const auto memory = libk::checked_add(total.memory, usage.amount().memory);
+        const auto caps = libk::checked_add(total.caps, usage.amount().caps);
+        if (usage.quota().id() != from.id() || !memory || !caps || count == std::numeric_limits<usize>::max()) {
             valid = false; return;
         }
         total = {*memory, *caps}; ++count;
@@ -217,11 +217,11 @@ auto rebill(mm::Pmm& pmm, resource::Funding& funding, const ref<>& target, const
     const auto bytes = libk::checked_multiply(mm::Slab<Change, false>::quota_for(count).pages, mm::page_size);
     const auto peak = bytes ? libk::checked_add(total.memory, *bytes) : std::nullopt;
     if (!peak || !ceiling.contains({*peak, total.caps})) return std::unexpected(STATUS_DENIED);
-    auto account = to.as<resource::Account>();
-    if (!account) return std::unexpected(STATUS_INVALID_CAP);
-    auto reserved = account->get().reserve(to, total);
+    auto quota = to.as<resource::Quota>();
+    if (!quota) return std::unexpected(STATUS_INVALID_CAP);
+    auto reserved = quota->get().reserve(to, total);
     if (!reserved) return std::unexpected(reserved.error() == resource::errc::closed ? STATUS_CLOSED : STATUS_NO_MEMORY);
-    auto payment = std::move(*reserved).commit();
+    auto replacement = std::move(*reserved).commit();
     mm::Slab<Change, false> scratch{pmm};
     Change* head{};
     libk::scope_exit clear{[&]() noexcept {
@@ -233,21 +233,21 @@ auto rebill(mm::Pmm& pmm, resource::Funding& funding, const ref<>& target, const
         (*made)->next = head; head = *made;
     }
     auto* entry = head;
-    visit([&](resource::Charge& fee) {
-        if (!fee) return;
+    visit([&](resource::Usage& usage) {
+        if (!usage) return;
         libk_assert(entry);
-        entry->target = &fee;
-        entry->payer = to;
+        entry->target = &usage;
+        entry->quota = to;
         entry = entry->next;
     });
     libk_assert(!entry);
-    resource::Refund refund;
-    auto result = funding.reassign(target, from, to, epoch, payment, refund, [&] {
+    resource::Release release;
+    auto result = allocation.reassign(target, from, to, epoch, replacement, release, [&] {
         for (auto* change = head; change; change = change->next)
-            change->target->reassign(payment, change->payer);
+            change->target->reassign(replacement, change->quota);
         commit();
-    }, [&](auto gates, auto&& publish) { return authority.publish(gates, publish); });
-    // One aggregate refund follows the lock boundary. Scratch holds only old
+    }, [&](auto gates, auto&& publish) { return transaction.publish(gates, publish); });
+    // One aggregate release follows the lock boundary. Scratch holds only old
     // refs after success; failed preparation leaves every owner intact.
     return result;
 }
@@ -262,7 +262,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     struct Slot final {
         object::anchor anchor{};
         libk::manual_lifetime<Membership> member{};
-        resource::Funding funding;
+        resource::Allocation allocation;
         PageHeader* page{};
         Slot* next_free{};
         Slot* next_reclaim{};
@@ -275,8 +275,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     static constexpr usize slots_per_page = Storage::capacity();
 
   public:
-    [[nodiscard]] static constexpr auto slot_charge() noexcept -> resource::budget {
-        return resource::budget{.memory = sizeof(Slot)};
+    [[nodiscard]] static constexpr auto slot_usage() noexcept -> resource::Budget {
+        return resource::Budget{.memory = sizeof(Slot)};
     }
 
   private:
@@ -319,10 +319,10 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             token_.get_deleter().owner->retain(slot.anchor, slot.anchor.generation_);
             return pool::reference_of(slot);
         }
-        auto root(cap::Graph& graph, resource::Reservation&& fee, cap::View view) noexcept
+        auto root(cap::Graph& graph, resource::Reservation&& usage, cap::View view) noexcept
             -> std::expected<cap::GrantRef, cap::GrantError> {
             if (rooted_) return std::unexpected(cap::GrantError::InvalidState);
-            auto root = graph.create_root(std::move(fee), reference(), view);
+            auto root = graph.create_root(std::move(usage), reference(), view);
             if (root) rooted_ = true;
             return root;
         }
@@ -355,8 +355,8 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     template<class... Args>
-    [[nodiscard]] auto create(Scope::Admission&& owner, resource::Reservation&& fee, Args&&... args) noexcept {
-        auto made = create(std::move(fee), std::forward<Args>(args)...);
+    [[nodiscard]] auto create(Scope::Admission&& owner, resource::Reservation&& usage, Args&&... args) noexcept {
+        auto made = create(std::move(usage), std::forward<Args>(args)...);
         if (made) {
             auto* slot = made->token_.get();
             if (!owner.attach(*slot->member, made->reference().key())) {
@@ -369,22 +369,22 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
     }
 
     template <typename... Args>
-    [[nodiscard]] auto create(resource::Reservation&& charge, Args&&... args) noexcept {
-        if constexpr (requires { T::prepare(charge.payer(), std::forward<Args>(args)...); }) {
-            auto data = T::prepare(charge.payer(), std::forward<Args>(args)...);
+    [[nodiscard]] auto create(resource::Reservation&& usage, Args&&... args) noexcept {
+        if constexpr (requires { T::prepare(usage.quota(), std::forward<Args>(args)...); }) {
+            auto data = T::prepare(usage.quota(), std::forward<Args>(args)...);
             using Err = typename decltype(data)::error_type;
             using Result = std::expected<pending, Err>;
             if (!data) return Result{std::unexpected(data.error())};
-            auto made = construct(std::move(charge), std::move(*data));
+            auto made = construct(std::move(usage), std::move(*data));
             if (!made) return Result{std::unexpected(made.error() == error::exhausted
                 ? Err::GenerationExhausted : Err::OutOfMemory)};
             return Result{std::move(*made)};
-        } else return construct(std::move(charge), std::forward<Args>(args)...);
+        } else return construct(std::move(usage), std::forward<Args>(args)...);
     }
 
   private:
     template <typename... Args>
-    auto construct(resource::Reservation&& sponsorship, Args&&... args) noexcept
+    auto construct(resource::Reservation&& reservation, Args&&... args) noexcept
         -> std::expected<pending, error> {
         auto claimed = claim_slot();
         if (!claimed) {
@@ -395,13 +395,13 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         if constexpr (requires { slot->object()->control(); }) slot->object()->control().bind(slot->anchor);
         if constexpr (requires { slot->object()->bind_membership(*slot->member); })
             slot->object()->bind_membership(*slot->member);
-        if (sponsorship) {
-            slot->funding.commit(std::move(sponsorship));
+        if (reservation) {
+            slot->allocation.commit(std::move(reservation));
             if constexpr (requires { slot->object()->control(); })
-                slot->funding.bind_control(slot->object()->control());
-            if constexpr (requires(T& object, resource::Funding& owner) {
-                traits<T>::bind_funding(object, owner);
-            }) traits<T>::bind_funding(*slot->object(), slot->funding);
+                slot->allocation.bind_control(slot->object()->control());
+            if constexpr (requires(T& object, resource::Allocation& owner) {
+                traits<T>::bind_allocation(object, owner);
+            }) traits<T>::bind_allocation(*slot->object(), slot->allocation);
         }
         {
             sync::Lock guard{lock_};
@@ -669,7 +669,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         else return nullptr;
     }
 
-    static auto anchor_funding(anchor& anchor) noexcept -> resource::Funding* { return &slot_of(anchor).funding; }
+    static auto anchor_allocation(anchor& anchor) noexcept -> resource::Allocation* { return &slot_of(anchor).allocation; }
 
     inline static constexpr anchor::Ops anchor_ops_{
         .retain = anchor_retain,
@@ -682,7 +682,7 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
         .finish_cleanup = anchor_finish_cleanup,
         .release_use = anchor_release_use,
         .control = anchor_control,
-        .funding = anchor_funding,
+        .allocation = anchor_allocation,
     };
 
     [[nodiscard]] auto queue_reclaim_if_ready(Slot& slot) noexcept -> bool {
@@ -748,10 +748,10 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
                 continue;
             }
             slot->anchor.index(false);
-            auto refund = slot->funding.detach();
+            auto release = slot->allocation.detach();
             traits<T>::destroy(*slot->object());
             finalize_free(*slot);
-            refund.complete();
+            release.complete();
         }
     }
 

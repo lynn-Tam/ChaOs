@@ -5,7 +5,7 @@
 #include <syscall/call.hpp>
 
 #include <cap/cap.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <libk/inplace_vector.hpp>
@@ -31,27 +31,27 @@
 
 namespace syscall {
 
-[[nodiscard]] static auto pool_quota(const cap::Resolved<resource::Account>& pool) noexcept
-    -> std::optional<cap::Quota> {
+[[nodiscard]] static auto pool_quota(const cap::Resolved<resource::Quota>& pool) noexcept
+    -> std::optional<cap::QuotaLimit> {
     const cap::View effective = pool.view();
-    const auto* const lim = std::get_if<cap::Quota>(&effective.data);
-    return lim != nullptr ? std::optional<cap::Quota>{*lim} : std::nullopt;
+    const auto* const lim = std::get_if<cap::QuotaLimit>(&effective.data);
+    return lim != nullptr ? std::optional<cap::QuotaLimit>{*lim} : std::nullopt;
 }
 
-[[nodiscard]] static auto add_budget(resource::budget first, resource::budget second) noexcept
-    -> std::optional<resource::budget> {
+[[nodiscard]] static auto add_budget(resource::Budget first, resource::Budget second) noexcept
+    -> std::optional<resource::Budget> {
     const auto memory = libk::checked_add(first.memory, second.memory);
     const auto caps = libk::checked_add(first.caps, second.caps);
-    return memory && caps ? std::optional<resource::budget>{resource::budget{*memory, *caps}} : std::nullopt;
+    return memory && caps ? std::optional<resource::Budget>{resource::Budget{*memory, *caps}} : std::nullopt;
 }
 
-[[nodiscard]] static auto reserve(cap::Resolved<resource::Account>& pool, resource::budget charge) noexcept
+[[nodiscard]] static auto reserve(cap::Resolved<resource::Quota>& pool, resource::Budget usage) noexcept
     -> std::expected<resource::Reservation, resource::errc> {
     auto reference = pool.reference();
     if (!reference) {
         return std::unexpected(resource::errc::invalid);
     }
-    return pool->reserve(std::move(reference).value(), charge);
+    return pool->reserve(std::move(reference).value(), usage);
 }
 
 [[nodiscard]] static auto pool_error(resource::errc error) noexcept -> status_t {
@@ -85,7 +85,7 @@ static auto construct(Call& inv, resource::Reservation&& fee, Args&&... args) no
 }
 
 template <class T, usize N = 1>
-static auto check_create(Call& inv, cap::Resolved<resource::Account>& pool, resource::budget limit) noexcept
+static auto check_create(Call& inv, cap::Resolved<resource::Quota>& pool, resource::Budget limit) noexcept
     -> std::expected<resource::Reservation, status_t> {
     auto owner = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(6)), cap::Rights::of(cap::Right::Create));
     if (!owner) return std::unexpected(cap_status(owner.error()));
@@ -94,13 +94,13 @@ static auto check_create(Call& inv, cap::Resolved<resource::Account>& pool, reso
     if (!range || !(range->kinds & OBJ_BIT(static_cast<u16>(object::kind<T>))))
         return std::unexpected(STATUS_DENIED);
     const auto quota = pool_quota(pool);
-    std::optional<resource::budget> publication = cap::Graph::node_charge();
+    std::optional<resource::Budget> publication = cap::Graph::node_usage();
     for (usize i = 0; N > 1 && i < N && publication; ++i)
-        publication = add_budget(*publication, inv.cpu.grants.node_charge());
+        publication = add_budget(*publication, inv.cpu.grants.node_usage());
     if (!quota || !(quota->object_kinds & OBJ_BIT(static_cast<u16>(object::kind<T>))) || !quota->budget.contains(limit) ||
         !publication || !quota->budget.contains(*publication))
         return std::unexpected(STATUS_DENIED);
-    auto admission = reserve(pool, cap::Graph::node_charge());
+    auto admission = reserve(pool, cap::Graph::node_usage());
     if (!admission) return std::unexpected(pool_error(admission.error()));
     return std::move(*admission);
 }
@@ -125,7 +125,7 @@ static auto publication(std::expected<std::array<cap::Handle, N>, cap::CSpace::P
 
 template<class Pending, usize N, class Bind>
 static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
-                    cap::Resolved<resource::Account>& pool, const std::array<cap::View, N>& views,
+                    cap::Resolved<resource::Quota>& pool, const std::array<cap::View, N>& views,
                     Bind&& bind) noexcept {
     using Result = std::expected<std::array<cap::Handle, N>, cap::CSpace::PublishError>;
     if constexpr (N == 1) {
@@ -135,15 +135,15 @@ static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
         if (handles) object.publish().reset();
         return handles;
     }
-    auto lease = root.acquire();
-    if (!lease) return Result{std::unexpected(lease.error())};
+    auto pin = root.acquire();
+    if (!pin) return Result{std::unexpected(pin.error())};
     auto handles = inv.cspace.publish(views, [&](cap::View view)
         -> std::expected<cap::GrantRef, cap::CSpace::PublishError> {
-        auto fee = reserve(pool, cap::Graph::node_charge());
+        auto fee = reserve(pool, cap::Graph::node_usage());
         if (!fee) return std::unexpected(fee.error());
-        auto target = lease->clone_target();
+        auto target = pin->clone_target();
         if (!target) return std::unexpected(cap::GrantError::InvalidState);
-        auto grant = inv.cpu.grants.derive(std::move(*fee), *lease, std::move(*target), view);
+        auto grant = inv.cpu.grants.derive(std::move(*fee), *pin, std::move(*target), view);
         if (!grant) return std::unexpected(grant.error());
         return std::move(*grant);
     }, std::forward<Bind>(bind));
@@ -153,7 +153,7 @@ static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
 
 template<class Pending, usize N>
 static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
-                    cap::Resolved<resource::Account>& pool, const std::array<cap::View, N>& views) noexcept {
+                    cap::Resolved<resource::Quota>& pool, const std::array<cap::View, N>& views) noexcept {
     return publish(inv, object, root, pool, views, [](auto&, usize) { return true; });
 }
 
@@ -161,7 +161,7 @@ static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
 // Grant/Gate boundary. Hardware activation follows while the creator pins it.
 template<class Pending, usize N>
 static auto publish_bound(Call& inv, Pending& object, cap::GrantRef& root, cap::View view,
-                          std::array<const cap::GrantLease*, N> grants) noexcept -> Result {
+                          std::array<const cap::GrantPin*, N> grants) noexcept -> Result {
     auto slot = inv.cspace.reserve();
     if (!slot) return returned(cap_status(slot.error()));
     auto prepared = inv.cspace.prepare(std::move(*slot), std::move(root), view);
@@ -180,18 +180,18 @@ static auto publish_bound(Call& inv, Pending& object, cap::GrantRef& root, cap::
 }
 
 [[nodiscard]] static auto resolve_pool(Call& inv, cap::Right right) noexcept
-    -> std::expected<cap::Resolved<resource::Account>, cap::CSpaceError> {
-    return inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(0)), cap::Rights::of(right));
+    -> std::expected<cap::Resolved<resource::Quota>, cap::CSpaceError> {
+    return inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(0)), cap::Rights::of(right));
 }
 
 [[nodiscard]] static constexpr auto basic_rights() noexcept -> cap::Rights {
     return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                           cap::Right::Control, cap::Right::Observe, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                           cap::Right::Control, cap::Right::Observe, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
 }
 
 [[nodiscard]] static constexpr auto sc_rights() noexcept -> cap::Rights {
     return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                           cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                           cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
 }
 
 [[nodiscard]] static auto mem_permits(const cap::Resolved<mm::Mem>& memory, mm::ObjectRange range,
@@ -250,21 +250,21 @@ static auto publish_bound(Call& inv, Pending& object, cap::GrantRef& root, cap::
 
 template<class T, class Provider, class Run>
 [[gnu::noinline]] static auto submit_op(Call& inv, cap::Resolved<Provider>& target,
-    std::span<const cap::GrantLease*> extra, Run&& run) noexcept -> Result {
-    auto account = resolve_pool(inv, cap::Right::Create);
+    std::span<const cap::GrantPin*> extra, Run&& run) noexcept -> Result {
+    auto quota = resolve_pool(inv, cap::Right::Create);
     auto owner = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(6)), cap::Rights::of(cap::Right::Create));
-    if (!account || !owner) return returned(cap_status(!account ? account.error() : owner.error()));
-    auto admission = check_create<T>(inv, *account, object::pool<T>::slot_charge());
+    if (!quota || !owner) return returned(cap_status(!quota ? quota.error() : owner.error()));
+    auto admission = check_create<T>(inv, *quota, object::pool<T>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*account, object::pool<T>::slot_charge());
+    auto fee = reserve(*quota, object::pool<T>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
-    auto provider = target.reference(), payer = account->reference(), scope = owner->reference();
-    if (!provider || !payer || !scope) return returned(STATUS_CLOSED);
+    auto provider = target.reference(), quota_ref = quota->reference(), scope = owner->reference();
+    if (!provider || !quota_ref || !scope) return returned(STATUS_CLOSED);
     auto object = construct<T>(inv, std::move(*fee), *provider);
     if (!object) return returned(STATUS_NO_MEMORY);
-    auto cpu = inv.target->payer();
+    auto cpu = inv.target->cpu_domain();
     if (!cpu) return returned(STATUS_DENIED);
-    object->get().op().payer(std::move(cpu));
+    object->get().op().cpu_domain(std::move(cpu));
     const cap::View result_view{cap::Rights::from_raw(basic_rights().raw() | RIGHT_OBSERVE), std::monostate{}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), result_view);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -274,16 +274,16 @@ template<class T, class Provider, class Run>
     if (!prepared) return returned(cap_status(prepared.error()));
     const auto handle = prepared->handle();
     object::ref<> execution = object->reference();
-    std::array<const cap::GrantLease*, IPC_MAX_CAPS> grants{&target.lease(), &account->lease(), &owner->lease()};
+    std::array<const cap::GrantPin*, IPC_MAX_CAPS> grants{&target.pin(), &quota->pin(), &owner->pin()};
     libk_assert(extra.size() <= grants.size() - 3);
     std::copy(extra.begin(), extra.end(), grants.begin() + 3);
-    std::array<const object::ref<>*, 3> gates{&*provider, &*payer, &*scope};
-    auto publish = [&](Source::Action install, std::span<const cap::GrantLease*> dependencies) noexcept {
+    std::array<const object::ref<>*, 3> gates{&*provider, &*quota_ref, &*scope};
+    auto publish = [&](Source::Action install, std::span<const cap::GrantPin*> dependencies) noexcept {
         const auto count = 3 + extra.size();
         libk_assert(dependencies.size() <= grants.size() - count);
         std::copy(dependencies.begin(), dependencies.end(), grants.begin() + count);
         return object->get().op().accept(install, [&](std::span<cap::Attachment*> cells, const object::ref<>& cpu, Source::Action commit) noexcept {
-            const cap::Graph::Attach relations[]{{&target.lease(), cells[0]}, {nullptr, cells[1], &cpu}};
+            const cap::Graph::Attach relations[]{{&target.pin(), cells[0]}, {nullptr, cells[1], &cpu}};
             return inv.cspace.insert(std::span{&*prepared, 1},
                 inv.cpu.grants.admission(std::span{grants}.first(count + dependencies.size())), gates, commit,
                 relations) ? STATUS_OK : STATUS_CLOSED;
@@ -322,7 +322,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
         if (!resolved) return returned(cap_status(resolved.error()));
         memory.emplace(std::move(*resolved));
     }
-    std::array<const cap::GrantLease*, 1> extra{memory ? &memory->lease() : &target->lease()};
+    std::array<const cap::GrantPin*, 1> extra{memory ? &memory->pin() : &target->pin()};
     return submit_op<mm::VmOp>(inv, *target, extra, [&](Op::Submission submission) noexcept -> status_t {
         const mm::VmCtx ctx{inv.cpu.cpus, inv.cpu.id, submission};
         auto& space = target->object();
@@ -357,7 +357,7 @@ template<usize op> [[gnu::noinline]] auto io_submit(Call& inv) noexcept -> Resul
         if (!resolved) return returned(cap_status(resolved.error()));
         memory.emplace(std::move(*resolved));
     }
-    std::array<const cap::GrantLease*, 1> extra{memory ? &memory->lease() : &target->lease()};
+    std::array<const cap::GrantPin*, 1> extra{memory ? &memory->pin() : &target->pin()};
     return submit_op<io::IoOp>(inv, *target, extra, [&](Op::Submission submission) noexcept -> status_t {
         if (kind == IO_OP_UNMAP) return target->object().unmap(submission, request.address, request.count);
         auto mapped = target->object().map(submission, *memory, {request.page, request.count}, request.address, *perms);
@@ -382,12 +382,12 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     }
     const auto bytes = ipc::Channel::storage_bytes(config);
     const auto cost =
-        bytes ? add_budget(object::pool<ipc::Channel>::slot_charge(), resource::budget{.memory = *bytes})
+        bytes ? add_budget(object::pool<ipc::Channel>::slot_usage(), resource::Budget{.memory = *bytes})
               : std::nullopt;
     if (!cost) return returned(STATUS_BAD_ARGS);
     auto admission = check_create<ipc::Channel, 2>(inv, pool.value(), *cost);
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<ipc::Channel>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<ipc::Channel>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<ipc::Channel>(inv, std::move(*fee), inv.cpu.objects.pmm(), config);
     if (!object) return returned(STATUS_NO_MEMORY);
@@ -395,7 +395,7 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     if (!obj.open()) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Send,
-                        cap::Right::Receive, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                        cap::Right::Receive, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto view = [&](cap::ChannelSide side) {
         return cap::View{rights, cap::ChanLimit{.side = side, .badge = 0, .fixed = 0}};
     };
@@ -412,31 +412,31 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv) noexcept -> Result {
     auto pool = resolve_pool(inv, cap::Right::Create);
     if (!pool) return returned(cap_status(pool.error()));
-    auto admission = check_create<Pager>(inv, pool.value(), object::pool<Pager>::slot_charge());
+    auto admission = check_create<Pager>(inv, pool.value(), object::pool<Pager>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<Pager>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<Pager>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<Pager>(inv, std::move(*fee));
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Attach,
                         cap::Right::Serve, cap::Right::Supply, cap::Right::Fail, cap::Right::WritebackAck,
-                        cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                        cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
     return publication(publish(inv, *object, *root, pool.value(), caps));
 }
 
-template <usize op> [[gnu::noinline]] [[nodiscard]] auto account_create(Call& inv) noexcept -> Result {
+template <usize op> [[gnu::noinline]] [[nodiscard]] auto quota_create(Call& inv) noexcept -> Result {
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Split);
     if (!pool) {
         return returned(cap_status(pool.error()));
     }
-    const resource::budget limit{.memory = trap.arg(1), .caps = trap.arg(2)};
-    const resource::budget ceiling = trap.arg(4) || trap.arg(5)
-        ? resource::budget{trap.arg(4), trap.arg(5)} : limit;
+    const resource::Budget limit{.memory = trap.arg(1), .caps = trap.arg(2)};
+    const resource::Budget ceiling = trap.arg(4) || trap.arg(5)
+        ? resource::Budget{trap.arg(4), trap.arg(5)} : limit;
     const u64 kinds = trap.arg(3);
     const auto parent = pool_quota(pool.value());
     if (!parent || !ceiling.contains(limit) || !parent->budget.contains(ceiling) || (kinds & ~parent->object_kinds) != 0 || kinds == 0) {
@@ -444,20 +444,20 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto account_create(Call& in
     }
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Create,
-                        cap::Right::Control, cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
-    auto admission = check_create<resource::Account>(inv, pool.value(), limit);
+                        cap::Right::Control, cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
+    auto admission = check_create<resource::Quota>(inv, pool.value(), limit);
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<resource::Account>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<resource::Quota>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
-    resource::Charge delegation;
+    resource::Usage delegation;
     if (!limit.empty()) {
         auto reserved = reserve(pool.value(), limit);
         if (!reserved) return returned(pool_error(reserved.error()));
         delegation = std::move(*reserved).commit();
     }
-    auto object = construct<resource::Account>(inv, std::move(*fee), limit, std::move(delegation));
+    auto object = construct<resource::Quota>(inv, std::move(*fee), limit, std::move(delegation));
     if (!object) return returned(STATUS_NO_MEMORY);
-    const cap::Quota data{ceiling, kinds};
+    const cap::QuotaLimit data{ceiling, kinds};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -465,16 +465,16 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto account_create(Call& in
 }
 
 template<usize op> [[nodiscard]] auto scope_create(Call& inv) noexcept -> Result {
-    auto account = resolve_pool(inv, cap::Right::Create);
-    if (!account) return returned(cap_status(account.error()));
-    auto admission = check_create<object::Scope>(inv, *account, object::pool<object::Scope>::slot_charge());
+    auto quota = resolve_pool(inv, cap::Right::Create);
+    if (!quota) return returned(cap_status(quota.error()));
+    auto admission = check_create<object::Scope>(inv, *quota, object::pool<object::Scope>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*account, object::pool<object::Scope>::slot_charge());
+    auto fee = reserve(*quota, object::pool<object::Scope>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto scope = construct<object::Scope>(inv, std::move(*fee));
     if (!scope) return returned(STATUS_CLOSED);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-        cap::Right::Create, cap::Right::Manage, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+        cap::Right::Create, cap::Right::Manage, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     auto parent = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(6)), cap::Rights::of(cap::Right::Create));
     if (!parent) return returned(cap_status(parent.error()));
     const auto parent_view = parent->view();
@@ -483,21 +483,21 @@ template<usize op> [[nodiscard]] auto scope_create(Call& inv) noexcept -> Result
     const auto caps = std::array{cap::View{rights, cap::ScopeLimit{.kinds=limit->kinds}}};
     auto root = scope->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    return publication(publish(inv, *scope, *root, *account, caps));
+    return publication(publish(inv, *scope, *root, *quota, caps));
 }
 
-static auto publish_memory(Call& inv, cap::Resolved<resource::Account>& pool, usize size,
-                           mm::Perms access, mm::Mem::Config config, const cap::GrantLease* dependency = nullptr) noexcept -> Result {
-    auto admission = check_create<mm::Mem>(inv, pool, object::pool<mm::Mem>::slot_charge());
+static auto publish_memory(Call& inv, cap::Resolved<resource::Quota>& pool, usize size,
+                           mm::Perms access, mm::Mem::Config config, const cap::GrantPin* dependency = nullptr) noexcept -> Result {
+    auto admission = check_create<mm::Mem>(inv, pool, object::pool<mm::Mem>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool, object::pool<mm::Mem>::slot_charge());
+    auto fee = reserve(pool, object::pool<mm::Mem>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<mm::Mem>(inv, std::move(*fee), inv.cpu.objects.pmm(), size,
                                                        std::move(config));
     if (!object) return returned(mem_status(object.error()));
     const cap::MemLimit data{{0, object->get().page_count()}, access};
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
-        cap::Right::Inspect, cap::Right::Map, cap::Right::Destroy, cap::Right::Manage, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+        cap::Right::Inspect, cap::Right::Map, cap::Right::Destroy, cap::Right::Manage, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -527,20 +527,20 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     auto reference = pager->reference();
     if (!reference) return returned(STATUS_BUSY);
     return publish_memory(inv, *pool, size, *access,
-                          mm::PagedCfg{std::move(*reference), *access, bool(flags & MEMORY_PAGER_PRIVATE), credits}, &pager->lease());
+                          mm::PagedCfg{std::move(*reference), *access, bool(flags & MEMORY_PAGER_PRIVATE), credits}, &pager->pin());
 }
-static auto physical_claim(cap::Resolved<mm::Phys>& physical, cap::Resolved<resource::Account>& pool,
-                           usize address, usize bytes) noexcept -> std::expected<mm::Phys::Lease, status_t> {
+static auto physical_claim(cap::Resolved<mm::Phys>& physical, cap::Resolved<resource::Quota>& pool,
+                           usize address, usize bytes) noexcept -> std::expected<mm::Phys::Claim, status_t> {
     const auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{address}, bytes);
     const auto view = physical.view();
     const auto* limit = std::get_if<cap::PhysLimit>(&view.data);
     if (!pages || !limit || !limit->range.contains(*pages)) return std::unexpected(STATUS_DENIED);
     auto owner = physical.reference();
-    auto payer = pool.reference();
-    if (!owner || !payer) return std::unexpected(STATUS_BUSY);
+    auto quota = pool.reference();
+    if (!owner || !quota) return std::unexpected(STATUS_BUSY);
     auto typed = std::move(*owner).as<mm::Phys>();
     if (!typed) return std::unexpected(STATUS_INVALID_CAP);
-    return physical.object().claim(std::move(*typed), *payer, *pages);
+    return physical.object().claim(std::move(*typed), *quota, *pages);
 }
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_physical(Call& inv) noexcept -> Result {
     auto pool = resolve_pool(inv, cap::Right::Create);
@@ -555,7 +555,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_physical(
     if (!claim) return returned(claim.error());
     const auto pages = *mm::Pages::from_aligned_bytes(mm::pa_t{address}, size);
     const mm::Extent extent{{0, pages.page_count()}, pages, *access};
-    return publish_memory(inv, *pool, size, *access, mm::PhysCfg{{&extent, 1}, {}, std::move(*claim)}, &physical->lease());
+    return publish_memory(inv, *pool, size, *access, mm::PhysCfg{{&extent, 1}, {}, std::move(*claim)}, &physical->pin());
 }
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_controller_create(Call& inv) noexcept -> Result {
     auto pool = resolve_pool(inv, cap::Right::Create);
@@ -566,14 +566,14 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_controller_create(C
         !inv.cpu.cpus->get(CpuId{config->cpu}) || config->context > (SIZE_MAX - 0x200008) / 0x1000 ||
         config->bytes < 0x200008 + config->context * 0x1000 || inv.trap.arg(4) || inv.trap.arg(5))
         return returned(STATUS_BAD_ARGS);
-    constexpr auto charge = object::pool<irq::Ctl>::slot_charge();
-    auto admission = check_create<irq::Ctl>(inv, *pool, charge);
+    constexpr auto usage = object::pool<irq::Ctl>::slot_usage();
+    auto admission = check_create<irq::Ctl>(inv, *pool, usage);
     if (!admission) return returned(admission.error());
     auto physical = inv.cspace.resolve<mm::Phys>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Control));
     if (!physical) return returned(cap_status(physical.error()));
     auto claim = physical_claim(*physical, *pool, config->address, config->bytes);
     if (!claim) return returned(claim.error());
-    auto fee = reserve(*pool, charge);
+    auto fee = reserve(*pool, usage);
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<irq::Ctl>(inv, std::move(*fee), inv.kspace, *inv.cpu.cpus,
                                 inv.cpu.objects.work(), std::move(*claim), *config);
@@ -583,11 +583,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_controller_create(C
     const auto status = object->get().open();
     if (status != STATUS_OK) return returned(status);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                                       cap::Right::Create, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                                       cap::Right::Create, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, cap::IndexLimit{1, config->sources}}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&physical->lease()});
+    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&physical->pin()});
     if (result.status == STATUS_OK) { object->get().activate(); object->publish().reset(); }
     return result;
 }
@@ -602,9 +602,9 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_create(Call& inv) n
         return returned(STATUS_DENIED);
     auto line = controller->object().line(id);
     if (!line) return returned(line.error());
-    auto admission = check_create<irq::Irq>(inv, *pool, object::pool<irq::Irq>::slot_charge());
+    auto admission = check_create<irq::Irq>(inv, *pool, object::pool<irq::Irq>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*pool, object::pool<irq::Irq>::slot_charge());
+    auto fee = reserve(*pool, object::pool<irq::Irq>::slot_usage());
     auto owner = controller->reference();
     if (!fee || !owner) return returned(STATUS_NO_MEMORY);
     auto typed = std::move(*owner).as<irq::Ctl>();
@@ -612,11 +612,11 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_create(Call& inv) n
     auto object = construct<irq::Irq>(inv, std::move(*fee), *line, std::move(*typed));
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-        cap::Right::Route, cap::Right::Observe, cap::Right::Ack, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+        cap::Right::Route, cap::Right::Observe, cap::Right::Ack, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, cap::IrqRoute{u32(id), true}}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&controller->lease()});
+    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&controller->pin()});
     if (result.status == STATUS_OK) object->publish().reset();
     return result;
 }
@@ -635,33 +635,33 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto iommu_create(Call& inv)
     if (!limit || cfg->source < limit->first || cfg->source - limit->first >= limit->count) return returned(STATUS_DENIED);
     auto line = irq->object().line(cfg->source);
     if (!line) return returned(line.error());
-    constexpr auto charge = object::pool<io::Iommu>::slot_charge();
-    auto admission = check_create<io::Iommu>(inv, *pool, charge);
+    constexpr auto usage = object::pool<io::Iommu>::slot_usage();
+    auto admission = check_create<io::Iommu>(inv, *pool, usage);
     if (!admission) return returned(admission.error());
     auto physical = inv.cspace.resolve<mm::Phys>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Control));
     if (!physical) return returned(cap_status(physical.error()));
     auto claim = physical_claim(*physical, *pool, cfg->address, cfg->bytes);
     if (!claim) return returned(claim.error());
-    auto fee = reserve(*pool, charge);
-    auto payer = pool->reference();
+    auto fee = reserve(*pool, usage);
+    auto quota = pool->reference();
     auto owner = irq->reference();
-    if (!fee || !payer || !owner) return returned(STATUS_NO_MEMORY);
+    if (!fee || !quota || !owner) return returned(STATUS_NO_MEMORY);
     auto typed = std::move(*owner).as<irq::Ctl>();
     if (!typed) return returned(STATUS_INVALID_CAP);
     auto object = construct<io::Iommu>(inv, std::move(*fee), inv.cpu.objects.pmm(), inv.kspace,
-        *inv.cpu.cpus, inv.cpu.objects.work(), inv.cpu.dispatcher().clock(), std::move(*payer),
+        *inv.cpu.cpus, inv.cpu.objects.work(), inv.cpu.dispatcher().clock(), std::move(*quota),
         std::move(*claim), std::move(*typed), *line, *cfg);
     if (!object) return returned(STATUS_NO_MEMORY);
     auto opening = object->reference().admit();
     if (!opening) return returned(STATUS_CLOSED);
-    const auto status = object->get().open(inv.target->payer());
+    const auto status = object->get().open(inv.target->cpu_domain());
     if (status != STATUS_OK) return returned(status);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                                       cap::Right::Create, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                                       cap::Right::Create, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, cap::IndexLimit{0, usize{1} << cfg->device_bits}}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&physical->lease(), &irq->lease()});
+    auto result = publish_bound(inv, *object, *root, caps[0], std::array{&physical->pin(), &irq->pin()});
     if (result.status == STATUS_OK) {
         const auto activated = object->get().activate();
         if (activated != STATUS_OK) {
@@ -683,22 +683,22 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto io_space_create(Call& i
     if (!limit || requester < limit->first || requester - limit->first >= limit->count || requester >= (usize{1} << 24))
         return returned(STATUS_DENIED);
     for (usize n = 3; n < 6; ++n) if (inv.trap.arg(n)) return returned(STATUS_BAD_ARGS);
-    constexpr auto charge = object::pool<io::Space>::slot_charge();
-    auto admission = check_create<io::Space>(inv, *pool, charge);
+    constexpr auto usage = object::pool<io::Space>::slot_usage();
+    auto admission = check_create<io::Space>(inv, *pool, usage);
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*pool, charge);
-    auto payer = pool->reference();
+    auto fee = reserve(*pool, usage);
+    auto quota = pool->reference();
     auto owner = ctl->reference();
-    if (!fee || !payer || !owner) return returned(STATUS_NO_MEMORY);
+    if (!fee || !quota || !owner) return returned(STATUS_NO_MEMORY);
     auto typed = std::move(*owner).as<io::Iommu>();
     if (!typed) return returned(STATUS_INVALID_CAP);
     auto object = construct<io::Space>(inv, std::move(*fee), inv.cpu.objects.pmm(),
-        inv.cpu.objects.work(), std::move(*payer), std::move(*typed), u32(requester));
+        inv.cpu.objects.work(), std::move(*quota), std::move(*typed), u32(requester));
     if (!object) return returned(STATUS_NO_MEMORY);
-    const auto status = object->get().open(object->reference(), *ctl, inv.target->payer());
+    const auto status = object->get().open(object->reference(), *ctl, inv.target->cpu_domain());
     if (status != STATUS_OK) return returned(status);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-        cap::Right::Map, cap::Right::Unmap, cap::Right::Observe, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+        cap::Right::Map, cap::Right::Unmap, cap::Right::Observe, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -710,9 +710,9 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
     if (!pool) {
         return returned(cap_status(pool.error()));
     }
-    auto admission = check_create<mm::VSpace>(inv, pool.value(), object::pool<mm::VSpace>::slot_charge());
+    auto admission = check_create<mm::VSpace>(inv, pool.value(), object::pool<mm::VSpace>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<mm::VSpace>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<mm::VSpace>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<mm::VSpace>(inv, std::move(*fee), inv.cpu.objects.pmm(),
                             inv.kspace, inv.cpu.objects.work());
@@ -723,7 +723,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto vspace_create(Call& inv
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve,
                         cap::Right::Delegate, cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
-                        cap::Right::Inspect, cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                        cap::Right::Inspect, cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -741,10 +741,10 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
         return returned(STATUS_BAD_ARGS);
     }
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                                        cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
-    auto admission = check_create<cap::CSpace>(inv, pool.value(), object::pool<cap::CSpace>::slot_charge());
+                                        cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
+    auto admission = check_create<cap::CSpace>(inv, pool.value(), object::pool<cap::CSpace>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<cap::CSpace>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<cap::CSpace>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<cap::CSpace>(inv, std::move(*fee), inv.cpu.objects.pmm(), quota);
     if (!object) return returned(STATUS_NO_MEMORY);
@@ -756,30 +756,30 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto domain_create(Call& inv) noexcept -> Result {
-    auto account = resolve_pool(inv, cap::Right::Create);
+    auto quota = resolve_pool(inv, cap::Right::Create);
     auto parent = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
-    if (!account || !parent) return returned(cap_status(!account ? account.error() : parent.error()));
+    if (!quota || !parent) return returned(cap_status(!quota ? quota.error() : parent.error()));
     const auto budget = inv.cpu.dispatcher().clock().ticks<time::ns>(inv.trap.arg(2));
     const auto period = inv.cpu.dispatcher().clock().ticks<time::ns>(inv.trap.arg(3));
     if (!budget || !period || inv.trap.arg(4) > 65535) return returned(STATUS_BAD_ARGS);
     const sched::Domain::Config config{.cpus=inv.trap.arg(5), .budget=*budget, .period=*period,
         .weight=static_cast<u32>(inv.trap.arg(4))};
     if (!sched::Domain::valid_config(config)) return returned(STATUS_BAD_ARGS);
-    auto admission = check_create<sched::Domain>(inv, *account, object::pool<sched::Domain>::slot_charge());
+    auto admission = check_create<sched::Domain>(inv, *quota, object::pool<sched::Domain>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*account, object::pool<sched::Domain>::slot_charge());
+    auto fee = reserve(*quota, object::pool<sched::Domain>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<sched::Domain>(inv, std::move(*fee), inv.cpu.objects.pmm(), *inv.cpu.cpus, config);
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto opened = object->get().open();
     if (opened != STATUS_OK) return returned(opened);
     const auto caps = std::array{cap::View{cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Create,
-        cap::Right::Close, cap::Right::Control, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke)}};
+        cap::Right::Close, cap::Right::Control, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke)}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
     const auto attached = object->get().attach(*parent);
     if (attached != STATUS_OK) return returned(attached);
-    return publication(publish(inv, *object, *root, *account, caps));
+    return publication(publish(inv, *object, *root, *quota, caps));
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) noexcept -> Result {
@@ -804,9 +804,9 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
         return returned(STATUS_BAD_ARGS);
     }
     const auto rights = sc_rights();
-    auto admission = check_create<sched::Sc>(inv, pool.value(), object::pool<sched::Sc>::slot_charge());
+    auto admission = check_create<sched::Sc>(inv, pool.value(), object::pool<sched::Sc>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<sched::Sc>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<sched::Sc>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<sched::Sc>(inv, std::move(*fee), config, inv.cpu.dispatcher().clock().rd_ticks());
     if (!object) return returned(STATUS_NO_MEMORY);
@@ -851,7 +851,7 @@ struct ThreadStart final {
 }
 
 [[gnu::noinline]] [[nodiscard]] static auto
-publish_thread(Call& inv, cap::Resolved<resource::Account>& pool,
+publish_thread(Call& inv, cap::Resolved<resource::Quota>& pool,
                cap::Resolved<mm::VSpace>& vspace, cap::Resolved<cap::CSpace>& cspace, ThreadStart&& start,
                std::optional<mm::View>&& ipc) noexcept -> Result {
     auto address_space = vspace.reference();
@@ -865,9 +865,9 @@ publish_thread(Call& inv, cap::Resolved<resource::Account>& pool,
         return returned(STATUS_BUSY);
     }
 
-    auto admission = check_create<Thread>(inv, pool, object::pool<Thread>::slot_charge());
+    auto admission = check_create<Thread>(inv, pool, object::pool<Thread>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool, object::pool<Thread>::slot_charge());
+    auto fee = reserve(pool, object::pool<Thread>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<Thread>(inv, std::move(*fee), std::move(env).value(), start.user);
     if (!object) return returned(STATUS_NO_MEMORY);
@@ -876,7 +876,7 @@ publish_thread(Call& inv, cap::Resolved<resource::Account>& pool,
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    if (!obj.authorize(vspace, cspace)
+    if (!obj.bind_roots(vspace, cspace)
         || !obj.claim_home(inv.cpu.cpus->get(CpuId{inv.trap.arg(5)})->dispatcher())) return returned(STATUS_BUSY);
     return publication(publish(inv, *object, *root, pool, caps));
 }
@@ -908,16 +908,16 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto port_create(Call& inv) 
     if (!pool) return returned(cap_status(pool.error()));
     const ipc::Port::Config config{inv.trap.arg(1), inv.trap.arg(2)};
     const auto bytes = ipc::Port::storage_bytes(config);
-    const auto cost = bytes ? add_budget(object::pool<ipc::Port>::slot_charge(), {.memory = *bytes}) : std::nullopt;
+    const auto cost = bytes ? add_budget(object::pool<ipc::Port>::slot_usage(), {.memory = *bytes}) : std::nullopt;
     if (!cost) return returned(STATUS_BAD_ARGS);
     auto admission = check_create<ipc::Port>(inv, *pool, *cost);
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*pool, object::pool<ipc::Port>::slot_charge());
+    auto fee = reserve(*pool, object::pool<ipc::Port>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<ipc::Port>(inv, std::move(*fee), inv.cpu.objects.pmm(), config);
     if (!object || object->get().open() != STATUS_OK) return returned(STATUS_NO_MEMORY);
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-        cap::Right::Receive, cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+        cap::Right::Receive, cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const std::array<cap::View, 1> views{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), views[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -934,15 +934,15 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Cal
         return returned(STATUS_BAD_ARGS);
     }
     auto admission =
-        check_create<ipc::Notification>(inv, pool.value(), object::pool<ipc::Notification>::slot_charge());
+        check_create<ipc::Notification>(inv, pool.value(), object::pool<ipc::Notification>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(pool.value(), object::pool<ipc::Notification>::slot_charge());
+    auto fee = reserve(pool.value(), object::pool<ipc::Notification>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<ipc::Notification>(inv, std::move(*fee));
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Signal,
-                        cap::Right::Receive, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                        cap::Right::Receive, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const cap::Badge lim{badge};
     const auto caps = std::array<cap::View, 1>{cap::View{rights, lim}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);

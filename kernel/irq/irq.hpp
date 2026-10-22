@@ -16,15 +16,15 @@ namespace irq {
 class Ctl final : private libk::noncopyable_nonmovable {
     friend class ::Cpus;
 public:
-    static constexpr bool fixed_bill = true;
-    Ctl(mm::KSpace&, Cpus&, WorkQueue&, mm::Phys::Lease&&, IrqConfig) noexcept;
+    static constexpr bool fixed_usage = true;
+    Ctl(mm::KSpace&, Cpus&, WorkQueue&, mm::Phys::Claim&&, IrqConfig) noexcept;
     ~Ctl() noexcept;
     auto open() noexcept -> status_t;
     void activate() noexcept;
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return authority_.admit(std::forward<Publish>(publish)); }
+    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
     void links(u64 cursor, LinkRecords& out) const noexcept;
     auto line(u32) noexcept -> std::expected<Line, status_t>;
-    void bind_work(WorkQueue&, object::Key owner) noexcept { job_.bind(owner); authority_.bind(owner); }
+    void bind_work(WorkQueue&, object::Key owner) noexcept { job_.bind(owner); bindings_.bind(owner); }
     void retire(object::cleanup&&) noexcept;
 private:
     void dispatch() noexcept;
@@ -34,11 +34,11 @@ private:
     void progress() noexcept;
     void post() noexcept { work_.post(job_); }
     void invalidated() noexcept { auto self = object::ref<>::retain_alive(job_.key()); static_cast<void>(self.destroy()); }
-    cap::Authority<1> authority_{Source::Action::bind<&Ctl::invalidated>(*this), Source::Action::bind<&Ctl::post>(*this)};
+    cap::Bindings<1> bindings_{Source::Action::bind<&Ctl::invalidated>(*this), Source::Action::bind<&Ctl::post>(*this)};
     mm::KSpace& vm_;
     Cpus& cpus_;
     WorkQueue& work_;
-    mm::Phys::Lease claim_;
+    mm::Phys::Claim claim_;
     IrqConfig config_;
     mm::KMap mapping_;
     Routes routes_;
@@ -61,13 +61,13 @@ struct Delivery final {
 
 class Irq final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     explicit Irq(Line line, object::ref<Ctl> owner = {}) noexcept;
     ~Irq() noexcept;
     [[nodiscard]] auto source() const noexcept -> Line { return route_.line_; }
     auto events() noexcept -> Source& { return events_; }
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return authority_.admit(std::forward<Publish>(publish)); }
-    void bind_work(WorkQueue& work, object::Key key) noexcept { authority_.bind(key); key_ = key; events_.bind_work(work, key); }
+    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
+    void bind_work(WorkQueue& work, object::Key key) noexcept { bindings_.bind(key); key_ = key; events_.bind_work(work, key); }
     void links(u64 cursor, LinkRecords& out) const noexcept;
     [[nodiscard]] auto enable(bool) noexcept -> std::expected<u64, Error>;
     [[nodiscard]] auto bound() const noexcept -> bool;
@@ -84,7 +84,7 @@ private:
     void invalidated() noexcept { static_cast<void>(close()); }
     object::ref<Ctl> owner_;
     object::Key key_;
-    cap::Authority<1> authority_{Source::Action::bind<&Irq::invalidated>(*this), Source::Action::bind<&Irq::complete_cleanup>(*this)};
+    cap::Bindings<1> bindings_{Source::Action::bind<&Irq::invalidated>(*this), Source::Action::bind<&Irq::complete_cleanup>(*this)};
     Route route_;
     Src<SOURCE_READY | SOURCE_TERMINAL> events_{Source::Drained::bind<&Irq::complete_cleanup>(*this)};
     object::cleanup cleanup_;

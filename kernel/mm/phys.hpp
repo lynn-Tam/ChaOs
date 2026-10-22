@@ -11,46 +11,46 @@ namespace mm {
 // All attenuated physical authorities share this one external-range registry.
 // PMM remains authoritative for RAM and boot reservations.
 class Phys final : private libk::noncopyable_nonmovable {
-    struct Claim {
-        explicit Claim(Pages range) noexcept : range(range) {}
+    struct Entry {
+        explicit Entry(Pages range) noexcept : range(range) {}
         Pages range;
         libk::intrusive_list_hook hook;
     };
 public:
-    // External claims are separately funded leases, not Phys-owned RAM.
-    static constexpr bool fixed_bill = true;
-    class Lease {
+    // Each external range claim has its own quota usage; Phys does not own the RAM.
+    static constexpr bool fixed_usage = true;
+    class Claim {
         friend class Phys;
         struct Data {
             object::ref<Phys> owner;
-            Claim* claim{};
+            Entry* claim{};
             static auto empty() noexcept -> Data { return {}; }
             static auto is_empty(const Data& d) noexcept -> bool { return !d.claim; }
         };
         struct Drop { void operator()(Data&) const noexcept; };
-        libk::unique_handle<Data, Drop, Data> lease_;
-        Lease(object::ref<Phys>&&, Claim*) noexcept;
+        libk::unique_handle<Data, Drop, Data> entry_;
+        Claim(object::ref<Phys>&&, Entry*) noexcept;
     public:
-        Lease() noexcept = default;
-        explicit operator bool() const noexcept { return bool(lease_); }
-        void reset() noexcept { lease_.reset(); }
-        auto range() const noexcept -> Pages { return lease_ ? lease_.get().claim->range : Pages{}; }
+        Claim() noexcept = default;
+        explicit operator bool() const noexcept { return bool(entry_); }
+        void reset() noexcept { entry_.reset(); }
+        auto range() const noexcept -> Pages { return entry_ ? entry_.get().claim->range : Pages{}; }
         auto covers(Pages range) const noexcept -> bool {
-            return lease_ && lease_.get().claim->range.contains(range);
+            return entry_ && entry_.get().claim->range.contains(range);
         }
     };
     explicit Phys(Pmm& pmm, RegionList&& reserved) noexcept
         : pmm_(pmm), reserved_(std::move(reserved)), storage_(pmm) {}
     ~Phys() noexcept { libk_assert(claims_.empty()); }
-    auto claim(object::ref<Phys>, const object::ref<>& payer, Pages) noexcept
-        -> std::expected<Lease, status_t>;
+    auto claim(object::ref<Phys>, const object::ref<>& quota, Pages) noexcept
+        -> std::expected<Claim, status_t>;
 private:
-    void release(Claim*) noexcept;
+    void release(Entry*) noexcept;
     Pmm& pmm_;
     RegionList reserved_;
-    Slab<Claim, false> storage_;
+    Slab<Entry, false> storage_;
     sync::Spin lock_;
-    libk::intrusive_list<Claim, &Claim::hook> claims_;
+    libk::intrusive_list<Entry, &Entry::hook> claims_;
 };
 
 } // namespace mm

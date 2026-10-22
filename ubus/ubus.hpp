@@ -110,17 +110,22 @@ class ubus_object {
     std::vector<std::shared_ptr<const ubus_method>> methods_;
     std::string interface_;
     uint64_t version_, features_;
+    std::function<status_t(word_t, std::string_view)> access_;
     bool sealed_{};
     auto describe(word_t facet) const -> ubus_data;
     auto bind(ubus_request&) -> status_t;
 public:
-    explicit ubus_object(std::string interface = {}, uint64_t version = 1, uint64_t features = 0)
-        : interface_(std::move(interface)), version_(version), features_(features) {}
+    // The same side-effect-free policy governs Describe and invocation. Empty
+    // method names check the lifetime of a bound authority, including Bind.
+    explicit ubus_object(std::string interface = {}, uint64_t version = 1, uint64_t features = 0,
+                         std::function<status_t(word_t, std::string_view)> access = {})
+        : interface_(std::move(interface)), version_(version), features_(features), access_(std::move(access)) {}
     auto add(std::string name, ubus_schema input, ubus_schema output, ubus_handler handler,
              word_t required = 0, bool notify = false) -> status_t;
     ~ubus_object();
     auto close() -> status_t;
-    auto open(size_t depth = 16, cap_t account = 0) -> status_t;
+    auto open(size_t depth = 16, cap_t quota = 0, cap_owner scope = {}) -> status_t;
+    auto scope() const -> cap_t { return scope_.selector(); }
     auto connector(word_t facet = 0) -> std::expected<cap_owner, status_t>;
     // A returned object releases mint authority: its last remote handle closes
     // the sending side, so the owner can drain and reclaim the object.

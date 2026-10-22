@@ -49,24 +49,24 @@ struct SysResult final {
 
 [[nodiscard]] inline auto memory_create_physical(CreateAuth auth, cap_t physical, word_t address,
                                                   word_t bytes, word_t perms) noexcept -> SysResult {
-    return call(SYS_MEMORY_CREATE_PHYSICAL, auth.account, physical, address, bytes, perms, 0, auth.scope);
+    return call(SYS_MEMORY_CREATE_PHYSICAL, auth.quota, physical, address, bytes, perms, 0, auth.scope);
 }
 [[nodiscard]] inline auto irq_controller_create(CreateAuth auth, cap_t physical, cap_t config,
                                                 word_t offset = 0) noexcept -> SysResult {
-    return call(SYS_IRQ_CONTROLLER_CREATE, auth.account, physical, config, offset, 0, 0, auth.scope);
+    return call(SYS_IRQ_CONTROLLER_CREATE, auth.quota, physical, config, offset, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto irq_create(CreateAuth auth, cap_t controller, word_t source) noexcept -> SysResult {
-    return call(SYS_IRQ_CREATE, auth.account, controller, source, 0, 0, 0, auth.scope);
+    return call(SYS_IRQ_CREATE, auth.quota, controller, source, 0, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto iommu_create(CreateAuth auth, cap_t physical, cap_t config, word_t offset = 0) noexcept -> SysResult {
-    return call(SYS_IOMMU_CREATE, auth.account, physical, config, offset, 0, 0, auth.scope);
+    return call(SYS_IOMMU_CREATE, auth.quota, physical, config, offset, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto io_space_create(CreateAuth auth, cap_t controller, word_t requester) noexcept -> SysResult {
-    return call(SYS_IO_SPACE_CREATE, auth.account, controller, requester, 0, 0, 0, auth.scope);
+    return call(SYS_IO_SPACE_CREATE, auth.quota, controller, requester, 0, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto io_submit(CreateAuth auth, cap_t space, word_t kind, word_t offset = 0) noexcept -> SysResult {
-    return call(SYS_IO_SUBMIT, auth.account, space, kind, offset, 0, 0, auth.scope);
+    return call(SYS_IO_SUBMIT, auth.quota, space, kind, offset, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto io_space_state(cap_t domain) noexcept -> SysResult { return call(SYS_IO_SPACE_STATE, domain); }
 [[nodiscard]] inline auto iommu_state(cap_t ctl) noexcept -> SysResult { return call(SYS_IOMMU_STATE, ctl); }
@@ -86,7 +86,7 @@ inline void yield() noexcept {
 }
 
 [[nodiscard]] inline auto scope_create(CreateAuth auth) noexcept -> SysResult {
-    return call(SYS_SCOPE_CREATE, auth.account, 0, 0, 0, 0, 0, auth.scope);
+    return call(SYS_SCOPE_CREATE, auth.quota, 0, 0, 0, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto scope_close(cap_t scope) noexcept -> SysResult { return call(SYS_SCOPE_CLOSE, scope); }
 [[nodiscard]] inline auto scope_info(cap_t scope, word_t offset = 0) noexcept -> SysResult {
@@ -108,13 +108,13 @@ inline void yield() noexcept {
     return call(SYS_OBJECT_INFO, target, offset);
 }
 
-[[nodiscard]] inline auto object_rebill(cap_t object, cap_t old_account, cap_t new_account, word_t epoch,
+[[nodiscard]] inline auto object_reassign(cap_t object, cap_t old_quota, cap_t new_quota, word_t epoch,
     cap_t source = 0, cap_t destination = 0, word_t member_epoch = 0) noexcept -> SysResult {
-    return call(SYS_OBJECT_REBILL, object, old_account, new_account, epoch, source, destination, member_epoch);
+    return call(SYS_OBJECT_REASSIGN, object, old_quota, new_quota, epoch, source, destination, member_epoch);
 }
 
-[[nodiscard]] inline auto account_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
-    return call(SYS_ACCOUNT_INFO, target, offset);
+[[nodiscard]] inline auto quota_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_QUOTA_INFO, target, offset);
 }
 [[nodiscard]] inline auto vspace_records(cap_t target, word_t cursor = 0, word_t offset = 0) noexcept -> SysResult {
     return call(SYS_VSPACE_RECORDS, target, offset, cursor);
@@ -176,22 +176,22 @@ inline void yield() noexcept {
     cap_t source,
     cap_t destination_cspace,
     word_t rights,
-    cap_t payer = 0) noexcept -> SysResult {
+    cap_t quota = 0) noexcept -> SysResult {
     return call(
-        SYS_CAP_DELEGATE, source, destination_cspace, rights, payer);
+        SYS_CAP_DELEGATE, source, destination_cspace, rights, quota);
 }
 
 [[nodiscard]] inline auto cap_typed_delegate(
     cap_t source,
     cap_t destination_cspace,
     cap_t descriptor_memory,
-    word_t descriptor_offset = 0, cap_t payer = 0) noexcept -> SysResult {
+    word_t descriptor_offset = 0, cap_t quota = 0) noexcept -> SysResult {
     return call(
         SYS_CAP_TYPED_DELEGATE,
         source,
         destination_cspace,
         descriptor_memory,
-        descriptor_offset, payer);
+        descriptor_offset, quota);
 }
 
 [[nodiscard]] inline auto cap_move(
@@ -209,7 +209,7 @@ inline void yield() noexcept {
     CreateAuth auth,
     word_t size,
     word_t access) noexcept -> SysResult {
-    return call(SYS_MEMORY_CREATE, auth.account, size, access, 0, 0, 0, auth.scope);
+    return call(SYS_MEMORY_CREATE, auth.quota, size, access, 0, 0, 0, auth.scope);
 }
 
 // Data is snapshotted from the registered IPC buffer. The destination must
@@ -243,11 +243,11 @@ inline void yield() noexcept {
     word_t access,
     cap_t pager,
     word_t flags = 0, word_t credits = 64) noexcept -> SysResult {
-    return call(SYS_MEMORY_CREATE_PAGER, auth.account, size, access, pager, flags, credits, auth.scope);
+    return call(SYS_MEMORY_CREATE_PAGER, auth.quota, size, access, pager, flags, credits, auth.scope);
 }
 
 [[nodiscard]] inline auto pager_create(CreateAuth auth) noexcept -> SysResult {
-    return call(SYS_PAGER_CREATE, auth.account, 0, 0, 0, 0, 0, auth.scope);
+    return call(SYS_PAGER_CREATE, auth.quota, 0, 0, 0, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto pager_claim(cap_t pager) noexcept -> SysResult {
@@ -295,33 +295,33 @@ inline void yield() noexcept {
     return call(SYS_MEMORY_SEAL, memory);
 }
 
-[[nodiscard]] inline auto account_create(
+[[nodiscard]] inline auto quota_create(
     CreateAuth auth,
     word_t memory,
     word_t caps,
     word_t kinds, word_t max_memory = 0, word_t max_caps = 0) noexcept -> SysResult {
-    return call(SYS_ACCOUNT_CREATE, auth.account, memory, caps, kinds, max_memory, max_caps, auth.scope);
+    return call(SYS_QUOTA_CREATE, auth.quota, memory, caps, kinds, max_memory, max_caps, auth.scope);
 }
 
-[[nodiscard]] inline auto account_resize(cap_t account, word_t memory, word_t caps, cap_t sponsor = 0) noexcept -> SysResult {
-    return call(SYS_ACCOUNT_RESIZE, account, memory, caps, sponsor);
+[[nodiscard]] inline auto quota_resize(cap_t quota, word_t memory, word_t caps, cap_t source = 0) noexcept -> SysResult {
+    return call(SYS_QUOTA_RESIZE, quota, memory, caps, source);
 }
 
-[[nodiscard]] inline auto account_close(cap_t pool) noexcept
+[[nodiscard]] inline auto quota_close(cap_t pool) noexcept
     -> SysResult {
-    return call(SYS_ACCOUNT_CLOSE, pool);
+    return call(SYS_QUOTA_CLOSE, pool);
 }
 
 [[nodiscard]] inline auto vspace_create(CreateAuth auth) noexcept
     -> SysResult {
-    return call(SYS_VSPACE_CREATE, auth.account, 0, 0, 0, 0, 0, auth.scope);
+    return call(SYS_VSPACE_CREATE, auth.quota, 0, 0, 0, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto cspace_create(
     CreateAuth auth,
     word_t slots,
     word_t pages) noexcept -> SysResult {
-    return call(SYS_CSPACE_CREATE, auth.account, slots, pages, 0, 0, 0, auth.scope);
+    return call(SYS_CSPACE_CREATE, auth.quota, slots, pages, 0, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto thread_create(
@@ -330,12 +330,12 @@ inline void yield() noexcept {
     cap_t cspace,
     cap_t start_memory,
     word_t start_offset, word_t home_cpu) noexcept -> SysResult {
-    return call(SYS_THREAD_CREATE, auth.account, vspace, cspace, start_memory, start_offset, home_cpu, auth.scope);
+    return call(SYS_THREAD_CREATE, auth.quota, vspace, cspace, start_memory, start_offset, home_cpu, auth.scope);
 }
 
 [[nodiscard]] inline auto domain_create(CreateAuth auth, cap_t parent, word_t budget_ns,
     word_t period_ns, word_t weight, word_t cpus) noexcept -> SysResult {
-    return call(SYS_DOMAIN_CREATE, auth.account, parent, budget_ns, period_ns, weight, cpus, auth.scope);
+    return call(SYS_DOMAIN_CREATE, auth.quota, parent, budget_ns, period_ns, weight, cpus, auth.scope);
 }
 [[nodiscard]] inline auto domain_configure(cap_t domain, word_t budget_ns, word_t period_ns,
     word_t weight, word_t cpus, cap_t parent = 0) noexcept -> SysResult {
@@ -354,13 +354,13 @@ inline void yield() noexcept {
     word_t period_ns,
     word_t weight,
     word_t cpus) noexcept -> SysResult {
-    return call(SYS_SC_CREATE, auth.account, domain, budget_ns, period_ns, weight, cpus, auth.scope);
+    return call(SYS_SC_CREATE, auth.quota, domain, budget_ns, period_ns, weight, cpus, auth.scope);
 }
 
 [[nodiscard]] inline auto notification_create(
     CreateAuth auth,
     word_t badge) noexcept -> SysResult {
-    return call(SYS_NOTIFICATION_CREATE, auth.account, badge, 0, 0, 0, 0, auth.scope);
+    return call(SYS_NOTIFICATION_CREATE, auth.quota, badge, 0, 0, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto notification_signal(
@@ -381,7 +381,7 @@ inline void yield() noexcept {
     return call(SYS_WAIT_ONE, source, facet, mask, seen, deadline, flags);
 }
 [[nodiscard]] inline auto port_create(CreateAuth auth, word_t watches, word_t queue) noexcept -> SysResult {
-    return call(SYS_PORT_CREATE, auth.account, watches, queue, 0, 0, 0, auth.scope);
+    return call(SYS_PORT_CREATE, auth.quota, watches, queue, 0, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto port_watch(cap_t port, cap_t source, word_t mask, word_t seen,
     word_t key, word_t flags = 0, word_t facet = SOURCE_STATE) noexcept -> SysResult {
@@ -414,7 +414,7 @@ inline void yield() noexcept {
     word_t queue_capacity,
     word_t max_words,
     word_t max_caps) noexcept -> SysResult {
-    return call(SYS_CHANNEL_CREATE, auth.account, queue_capacity, max_words, max_caps, 0, 0, auth.scope);
+    return call(SYS_CHANNEL_CREATE, auth.quota, queue_capacity, max_words, max_caps, 0, 0, auth.scope);
 }
 
 [[nodiscard]] inline auto channel_try_send(cap_t channel) noexcept
@@ -476,7 +476,7 @@ inline void yield() noexcept {
 }
 
 [[nodiscard]] inline auto vm_submit(CreateAuth auth, cap_t space, word_t kind, word_t offset = 0) noexcept -> SysResult {
-    return call(SYS_VM_SUBMIT, auth.account, space, kind, offset, 0, 0, auth.scope);
+    return call(SYS_VM_SUBMIT, auth.quota, space, kind, offset, 0, 0, auth.scope);
 }
 [[nodiscard]] inline auto op_query(cap_t op) noexcept -> SysResult { return call(SYS_OP_QUERY, op); }
 [[nodiscard]] inline auto op_cancel(cap_t op) noexcept -> SysResult { return call(SYS_OP_CANCEL, op); }

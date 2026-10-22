@@ -4,6 +4,10 @@
 #include <charconv>
 
 static cap_t dv_phys;
+struct dv_record {
+    std::string id, name, type, location;
+    std::shared_ptr<mgr_child> driver;
+};
 
 static auto grant(mgr_child& child, std::string_view name, cap_t source, word_t rights, uint64_t bytes = 0) -> status_t {
     auto* message = child.inbox.empty() ? &child.setup : &child.inbox.back();
@@ -115,8 +119,8 @@ struct dv_device {
     uint16_t rid;
     uint32_t did, source;
     std::string name;
-    cap_owner account, scope, space, irq;
-    auto alloc() const noexcept -> CreateAuth { return {account.selector(), scope.selector()}; }
+    cap_owner quota, scope, space, irq;
+    auto alloc() const noexcept -> CreateAuth { return {quota.selector(), scope.selector()}; }
     std::array<vm_area, 6> bars;
     std::array<uint64_t, 6> addresses{};
     dv_device(uint16_t rid, uint32_t did, uint32_t source, std::string name)
@@ -144,11 +148,11 @@ struct dv_device {
         const auto boundary = sys::scope_create(env.alloc());
         if (boundary.status != STATUS_OK) return boundary.status;
         driver.scope = cap_owner{boundary.value};
-        const CreateAuth deployment{env.pool, driver.scope.selector()};
-        const auto made = sys::account_create(deployment, 12 * 1024 * 1024, 512,
+        const CreateAuth deployment{env.quota, driver.scope.selector()};
+        const auto made = sys::quota_create(deployment, 12 * 1024 * 1024, 512,
             proc_base_kinds | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
         if (made.status != STATUS_OK) return made.status;
-        account = cap_owner{made.value};
+        quota = cap_owner{made.value};
         const auto owner = sys::scope_create(deployment);
         if (owner.status != STATUS_OK) return owner.status;
         scope = cap_owner{owner.value};
@@ -233,13 +237,13 @@ struct dv_device {
         status = sys::wait_one(scope.selector(), STATE_DRAINED).status;
         if (status != STATUS_OK) return status;
         if ((status = scope.close()) != STATUS_OK) return status;
-        status = sys::account_close(account.selector()).status;
+        status = sys::quota_close(quota.selector()).status;
         if (status != STATUS_OK) return status;
-        status = sys::wait_one(account.selector(), STATE_DRAINED).status;
+        status = sys::wait_one(quota.selector(), STATE_DRAINED).status;
         if (status != STATUS_OK) return status;
-        status = sys::object_destroy(account.selector()).status;
+        status = sys::object_destroy(quota.selector()).status;
         if (status != STATUS_OK) return status;
-        return account.close();
+        return quota.close();
     }
 };
 
@@ -293,10 +297,11 @@ int main() {
     status = archive.open(setup.capability(message["archive"]), bundle->size); if (status != STATUS_OK) return status;
     std::optional<dv_bus> bus;
     std::optional<dv_device> device;
-    mgr_child* driver{};
+    std::shared_ptr<mgr_child> driver;
+    std::vector<dv_record> records;
     bool quiesced{};
     mgr owner{[&](mgr_child& child) -> std::expected<proc_image, status_t> {
-        if (&child == driver && !device->account) {
+        if (&child == driver.get() && !device->quota) {
             auto status = device->prepare(env, *bus, irq->selector(), iommu.selector(), child);
             if (status == STATUS_OK) status = device->handoff(env, *bus, child);
             if (status != STATUS_OK) return std::unexpected(status);
@@ -306,12 +311,13 @@ int main() {
     }};
     status = owner.open(); if (status != STATUS_OK) return status;
     if (console->memory) {
-        auto& uart = owner.add("uart", "uart", {.bytes=1024 * 1024, .caps=128});
+        auto& uart = owner.add("uart", "/boot/uart.elf", {.bytes=1024 * 1024, .caps=128});
         status = grant(uart, "registers", console->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE, 4096);
         if (status == STATUS_OK) status = grant(uart, "irq", console->irq.selector(), RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE);
         if (status == STATUS_OK) status = grant(uart, "stdin", setup.capability(message["stdin"]), RIGHT_RECEIVE | RIGHT_DUPLICATE);
         if (status == STATUS_OK) status = grant(uart, "stdout", setup.capability(message["stdout"]), RIGHT_SEND | RIGHT_DUPLICATE);
         uart.setup.data.put("offset", console->offset); uart.desired = uart.restart = true;
+        records.push_back({"uart", "Serial port", "Serial", "Firmware", owner.find(uart.id)});
         if (status == STATUS_OK) status = owner.start(uart);
         if (status != STATUS_OK) return status;
     }
@@ -340,6 +346,12 @@ int main() {
                         if (secondary && secondary >= bus->first && secondary <= subordinate && subordinate <= bus->last &&
                             std::ranges::find(buses, secondary) == buses.end()) buses.push_back(secondary);
                     }
+                    char key[24] = "pci-";
+                    const auto end = std::to_chars(key + 4, key + sizeof(key), rid, 16);
+                    const auto bridge = (fn->read<uint32_t>(8) >> 24) == 0x06;
+                    records.push_back({std::string{key, end.ptr}, identity == 0x1042'1af4 ? "Virtio block" : bridge ? "PCI bridge" : "PCI device",
+                        identity == 0x1042'1af4 ? "Storage" : bridge ? "Bridge" : "Other",
+                        "PCI " + std::to_string(id) + ":" + std::to_string(slot) + "." + std::to_string(n), {}});
                     if (identity != 0x1042'1af4 || device) continue;
                     const auto requester = bus->requester(rid), irq = bus->interrupt(rid, fn->read<uint8_t>(0x3d));
                     if (!requester || !irq) continue;
@@ -352,21 +364,51 @@ int main() {
     }
 
     if (device) {
-        driver = &owner.add(device->name, "block", {.bytes=8 * 1024 * 1024, .caps=256,
-            .slots=256, .pages=36});
+        driver = owner.find(owner.add(device->name, "/boot/block.elf", {.bytes=8 * 1024 * 1024, .caps=256,
+            .slots=256, .pages=36}).id);
+        for (auto& record : records) {
+            char key[24] = "pci-"; const auto end = std::to_chars(key + 4, key + sizeof(key), device->rid, 16);
+            if (record.id == std::string_view{key, end.ptr}) record.driver = driver;
+        }
         driver->exports.push("block"); driver->restart = true;
         // Hardware capabilities remain with this owner through driver drain.
         status = owner.start(*driver);
         if (status != STATUS_OK) sys::exit(status);
     }
-    for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 2>{{
-        {"control", mgr_observe | mgr_control}, {"view", mgr_observe}}}) {
-        auto connector = owner.object().connector(rights); if (!connector) return connector.error();
-        ubus_msg request, response; request.data.put("name", name).put("interface", "ubus.environment").put("version", uint64_t{1})
-            .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
-        status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
-    }
+    status = owner.attach(parent); if (status != STATUS_OK) return status;
     uint64_t published_generation{}, publication{};
+    ubus_object inventory{"myos.devices"};
+    status = inventory.add("List", {}, {{"items", ubus_type::Array}}, [&](auto&, ubus_msg& response) -> status_t {
+        ubus_data items{ubus_type::Array};
+        for (const auto& record : records) {
+            ubus_data row;
+            std::string_view state = "Detected";
+            if (const auto& child = record.driver; child && owner.find(child->id)) {
+                state = child->state == "failed" ? "Failed" : !child->task ? "Stopped"
+                    : child->state == "draining" ? "Stopping" : child == driver
+                    ? published_generation == child->gen && !quiesced ? "Ready" : "Starting" : "In use";
+                const auto program = child->image.substr(child->image.find_last_of('/') + 1);
+                row.put("driver", program.ends_with(".elf") ? program.substr(0, program.size() - 4) : program);
+                auto problem = child->state == "failed" ? child->result : STATUS_OK;
+                if (child == driver && child->task && device->space) {
+                    const auto io = sys::io_space_state(device->space.selector());
+                    if (io.status != STATUS_OK || io.value == IO_SPACE_FAILED) { state = "Failed"; problem = STATUS_BACKING_FAILED; }
+                    else if (io.value != IO_SPACE_READY) state = io.value == IO_SPACE_PENDING ? "Starting" : "Stopping";
+                }
+                if (problem) row.put("error", int64_t(problem));
+            } else row.put("driver", "--");
+            row.put("id", record.id).put("name", record.name).put("type", record.type).put("location", record.location).put("state", state);
+            items.push(row);
+        }
+        response.data.put("items", items); return STATUS_OK;
+    });
+    if (status == STATUS_OK) status = inventory.open();
+    if (status != STATUS_OK) return status;
+    auto listing = inventory.connector(); if (!listing) return listing.error();
+    ubus_msg announce, accepted;
+    announce.data.put("name", "inventory").put("interface", "myos.devices").put("version", uint64_t{1})
+        .cap("connector", *announce.attach(listing->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    status = parent.invoke("Publish", std::move(announce), accepted); if (status != STATUS_OK) return status;
     for (;;) {
         if (driver && driver->task && !quiesced) {
             const auto ended = driver->task->observe();
@@ -381,11 +423,15 @@ int main() {
             }
         }
         if ((status = owner.poll()) != STATUS_OK) sys::exit(status);
+        for (size_t count = 0; count < 8; ++count) {
+            status = inventory.poll(); if (status == STATUS_WOULD_BLOCK) break;
+            if (status != STATUS_OK) return status;
+        }
         if (driver && !driver->task) {
             const auto fn = bus->function(device->rid);
             if (!fn) sys::exit(fn.error());
             driver->setup = {}; driver->inbox.clear();
-            if (device->account && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
+            if (device->quota && (status = device->retire(*fn)) != STATUS_OK) sys::exit(status);
             if (driver->scope) {
                 status = sys::scope_close(driver->scope.selector()).status;
                 if (status == STATUS_OK) status = sys::wait_one(driver->scope.selector(), STATE_DRAINED).status;

@@ -352,8 +352,8 @@ public:
         const auto size = response.data["size"].as<uint64_t>(); if (!size || *size > (UINT64_MAX - 2 * 1024 * 1024) / 4) return STATUS_BAD_ARGS;
         next_ = response.data["sequence"].as<uint64_t>().value_or(0);
         const auto need = (*size * 4 + 2 * 1024 * 1024 + 4095) & ~uint64_t{4095};
-        status = sys::account_info(rt_startup().pool).status; if (status != STATUS_OK) return status;
-        const auto budget = *reinterpret_cast<const AccountInfo*>(rt_startup().ipc);
+        status = sys::quota_info(rt_startup().quota).status; if (status != STATUS_OK) return status;
+        const auto budget = *reinterpret_cast<const QuotaInfo*>(rt_startup().ipc);
         if (need > budget.memory_limit) {
             ubus_msg request; request.data.put("bytes", need).put("caps", budget.cap_limit);
             status = environment.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
@@ -391,8 +391,34 @@ int main(int argc, char** argv) {
     status = environment.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     ed_terminal terminal;
     status = terminal.open(env, setup); if (status != STATUS_OK) return status;
+    uint64_t loan{};
+    const auto cleanup = libk::on_scope_exit([&]() noexcept {
+        if (loan) { ubus_msg request, response; request.data.put("action", "close").put("loan", loan);
+            (void)environment.invoke("Resource", std::move(request), response); }
+    });
+    auto object = setup.take(setup.data["message"]["document"]);
+    if (!object) {
+        ubus_msg request, response; request.data.put("name", "files");
+        status = environment.invoke("Get", std::move(request), response); if (status != STATUS_OK) return status;
+        ubus_conn files; status = files.bind(response.capability(response.data["connector"])); if (status != STATUS_OK) return status;
+        request = {}; request.data.put("action", "lend").put("bytes", uint64_t{192 * 1024}).put("caps", uint64_t{0})
+            .put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
+        status = environment.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
+        loan = *response.data["loan"].as<uint64_t>(); auto budget = response.take(response.data["quota"]);
+        std::string path{argv[1]};
+        if (!path.starts_with('/')) {
+            std::string_view base{"/"};
+            for (auto** entry = environ; entry && *entry; ++entry)
+                if (std::string_view{*entry}.starts_with("PWD=")) base = std::string_view{*entry}.substr(4);
+            path = std::string{base} + "/" + path;
+        }
+        request = {}; request.data.put("path", path)
+            .cap("budget", *request.attach(budget.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
+        status = files.invoke("Document", std::move(request), response); if (status != STATUS_OK) return status;
+        object = response.take(response.data["handle"]);
+    }
     ed_file document;
-    status = document.open(setup.take(setup.data["message"]["document"])); if (status != STATUS_OK) return status;
+    status = document.open(std::move(object)); if (status != STATUS_OK) return status;
     ed_buffer text;
     status = document.load(text, environment);
     if (status == STATUS_OK) {

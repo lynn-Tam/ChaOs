@@ -82,7 +82,7 @@ class test_tasks {
     }
     auto info(test_id id) -> std::expected<ThreadInfo, status_t> {
         auto* task = get(id);
-        return task ? task->info() : std::unexpected(STATUS_INVALID_CAP);
+        return task ? task->initial_info() : std::unexpected(STATUS_INVALID_CAP);
     }
     auto observe(test_id id) -> sys::SysResult {
         auto* t = get(id);

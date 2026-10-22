@@ -97,7 +97,7 @@ enum class Right : u64 {
     Observe = RIGHT_OBSERVE,
     Attach = RIGHT_ATTACH,
     Adopt = RIGHT_ADOPT,
-    Rebill = RIGHT_REBILL,
+    Reassign = RIGHT_REASSIGN,
 };
 
 using Rights = libk::enum_flags<Right>;
@@ -111,12 +111,12 @@ struct Limit final {
 using MemLimit = Limit<mm::ObjectRange>;
 using VmLimit = Limit<mm::VRange>;
 
-struct Quota final {
-    resource::budget budget{};
+struct QuotaLimit final {
+    resource::Budget budget{};
     u64 object_kinds{};
 
     [[nodiscard]] friend constexpr auto operator==(
-        Quota, Quota) noexcept
+        QuotaLimit, QuotaLimit) noexcept
         -> bool = default;
 };
 
@@ -180,7 +180,7 @@ using Limits = std::variant<
     MemLimit,
     PhysLimit,
     VmLimit,
-    Quota,
+    QuotaLimit,
     Badge,
     ChanLimit,
     IrqRoute, IndexLimit, ScopeLimit>;

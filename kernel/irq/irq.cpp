@@ -102,7 +102,7 @@ Irq::Irq(Line line, object::ref<Ctl> owner) noexcept
 Irq::~Irq() noexcept { (void)close(); }
 
 void Irq::links(u64 cursor, LinkRecords& out) const noexcept {
-    authority_.links(out, LINK_ROUTE, cursor);
+    bindings_.links(out, LINK_ROUTE, cursor);
     for (auto& row : std::span{out.records, out.count}) { row.first = route_.line_.id; row.bytes = 1; }
 }
 
@@ -136,7 +136,7 @@ auto Irq::enable(bool enabled) noexcept -> std::expected<u64, Error> {
         return generation_;
     };
     auto commit = [&]() noexcept { result = apply(); };
-    if (!authority_.publish(Source::Action::bind(commit))) return std::unexpected(Error::Closed);
+    if (!bindings_.publish(Source::Action::bind(commit))) return std::unexpected(Error::Closed);
     if (result) object::changed(key_);
     return result;
 }
@@ -181,7 +181,7 @@ auto Irq::ack(u64 generation, u64 sequence) noexcept -> std::expected<void, Erro
         return {};
     };
     auto commit = [&]() noexcept { result = apply(); };
-    if (!authority_.publish(Source::Action::bind(commit))) return std::unexpected(Error::Closed);
+    if (!bindings_.publish(Source::Action::bind(commit))) return std::unexpected(Error::Closed);
     return result;
 }
 
@@ -194,7 +194,7 @@ auto Irq::close() noexcept -> bool {
         publication = events_.prepare(SOURCE_TERMINAL, true);
     }
     if (changed) object::changed(key_);
-    static_cast<void>(authority_.close());
+    static_cast<void>(bindings_.close());
     return true;
 }
 
@@ -208,14 +208,14 @@ void Irq::retire(object::cleanup&& cleanup) noexcept {
             closed_ = true;
         publication = events_.prepare(SOURCE_TERMINAL, true);
     }
-    static_cast<void>(authority_.close());
+    static_cast<void>(bindings_.close());
     // The terminal publication keeps cleanup blocked through this call.
     events_.close();
 }
 
 void Irq::complete_cleanup() noexcept {
     object::cleanup cleanup;
-    if (!events_.drained() || !authority_.drained()) return;
+    if (!events_.drained() || !bindings_.drained()) return;
     {
         sync::Lock guard{route_.line_.routes.lock_};
         cleanup = std::move(cleanup_);
@@ -226,7 +226,7 @@ void Irq::complete_cleanup() noexcept {
 } // namespace irq
 
 namespace irq {
-Ctl::Ctl(mm::KSpace& vm, Cpus& cpus, WorkQueue& work, mm::Phys::Lease&& claim, IrqConfig config) noexcept
+Ctl::Ctl(mm::KSpace& vm, Cpus& cpus, WorkQueue& work, mm::Phys::Claim&& claim, IrqConfig config) noexcept
     : vm_(vm), cpus_(cpus), work_(work), claim_(std::move(claim)), config_(config),
       routes_(Routes::Enable::bind<&Ctl::set>(*this)) {}
 Ctl::~Ctl() noexcept { libk_assert(!open_ && !mapped_ && !cleanup_); }
@@ -251,10 +251,10 @@ void Ctl::activate() noexcept {
         { sync::Lock guard{routes_.lock_}; open_ = true; }
         cpus_.attach_irq(*this);
     };
-    static_cast<void>(authority_.publish(Source::Action::bind(commit)));
+    static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
 }
 void Ctl::links(u64 cursor, LinkRecords& out) const noexcept {
-    authority_.links(out, LINK_PHYS, cursor);
+    bindings_.links(out, LINK_PHYS, cursor);
     for (auto& row : std::span{out.records, out.count}) { row.first = config_.address; row.bytes = config_.bytes; }
 }
 auto Ctl::line(u32 id) noexcept -> std::expected<Line, status_t> {
@@ -300,7 +300,7 @@ void Ctl::progress() noexcept {
         flush_.reset(); mapped_ = false; open_ = false;
     }
     claim_.reset();
-    if (!authority_.close()) return;
+    if (!bindings_.close()) return;
     work_.close(job_);
     auto cleanup = std::move(cleanup_);
     cleanup.complete();

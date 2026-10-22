@@ -24,7 +24,7 @@ namespace irq { class Irq; class Ctl; }
 namespace io { class Iommu; class Space; class IoOp; }
 namespace sched { class Sc; class Domain; }
 namespace cap { class CSpace; }
-namespace resource { class Account; class Funding; struct budget; }
+namespace resource { class Quota; class Allocation; struct Budget; }
 namespace mm { class Mem; class VSpace; class VmOp; class Phys; }
 class Pager;
 class Thread;
@@ -55,7 +55,7 @@ using Types = Catalog<Def<mm::VmOp, ObjVmOp>, Def<io::IoOp, ObjIoOp>, Def<io::Sp
     Def<io::Iommu, ObjIommu>, Def<mm::VSpace, ObjVSpace>, Def<mm::Mem, ObjMem>, Def<mm::Phys, ObjPhys>,
     Def<Pager, ObjPager>, Def<cap::CSpace, ObjCSpace>,
     Def<ipc::Channel, ObjChannel>, Def<ipc::Notification, ObjNotification>, Def<ipc::Port, ObjPort>,
-    Def<sched::Domain, ObjDomain>, Def<sched::Sc, ObjSc>, Def<Thread, ObjThread>, Def<resource::Account, ObjAccount>, Def<Scope, ObjScope>>;
+    Def<sched::Domain, ObjDomain>, Def<sched::Sc, ObjSc>, Def<Thread, ObjThread>, Def<resource::Quota, ObjQuota>, Def<Scope, ObjScope>>;
 using Objects = Types::objects;
 template<class T> inline constexpr ObjKind kind = Types::kind<T>;
 // Storage keys stay private to kernel owners; public identities never encode
@@ -146,8 +146,8 @@ enum class error : u8 {
     wrong_type,
 };
 
-// Scratch for traversing actual control ownership/payment indices. No graph
-// edges or fee totals are stored here; the structure lock serializes walks.
+// Scratch for traversing actual control ownership/quota indices. No graph
+// edges or usage totals are stored here; the structure lock serializes walks.
 class Control final {
 public:
     inline static sync::Spin lock;
@@ -204,7 +204,7 @@ private:
         void (*finish_cleanup)(void*, anchor&, u64) noexcept;
         void (*release_use)(void*, anchor&, u64) noexcept;
         Control* (*control)(anchor&) noexcept;
-        resource::Funding* (*funding)(anchor&) noexcept;
+        resource::Allocation* (*allocation)(anchor&) noexcept;
     };
 
     template<typename T>
@@ -290,7 +290,7 @@ private:
 
 // A reference protects storage, not permission or operation admission. New
 // Weak lookup requires Live; retirement may run while existing owners remain.
-// Payload methods and capability leases enforce their own operation contract.
+// Payload methods and capability pins enforce their own operation contract.
 template<typename T>
 class ref final {
 public:
@@ -414,7 +414,7 @@ public:
     [[nodiscard]] auto destroy() const noexcept -> bool {
         return anchor_ && anchor_->ops_->destroy(anchor_->owner_, *anchor_, generation_);
     }
-    auto funding() const noexcept -> resource::Funding* { return anchor_ ? anchor_->ops_->funding(*anchor_) : nullptr; }
+    auto allocation() const noexcept -> resource::Allocation* { return anchor_ ? anchor_->ops_->allocation(*anchor_) : nullptr; }
     auto control() const noexcept -> Control* { return anchor_ ? anchor_->ops_->control(*anchor_) : nullptr; }
     void reset() noexcept {
         auto* anchor = std::exchange(anchor_, nullptr);
@@ -472,15 +472,15 @@ template<class T> auto ref<T>::admit() const noexcept -> pin {
 
 class LinkWork final : private libk::noncopyable {
     Link* link_{};
-    bool terminal_{};
+    bool final_release_{};
     friend class Link;
     friend class Gate;
-    explicit LinkWork(Link& link, bool terminal = false) noexcept : link_(&link), terminal_(terminal) {}
+    explicit LinkWork(Link& link, bool final_release = false) noexcept : link_(&link), final_release_(final_release) {}
 public:
     LinkWork() noexcept = default;
-    LinkWork(LinkWork&& other) noexcept : link_(std::exchange(other.link_, nullptr)), terminal_(other.terminal_) {}
+    LinkWork(LinkWork&& other) noexcept : link_(std::exchange(other.link_, nullptr)), final_release_(other.final_release_) {}
     auto operator=(LinkWork&& other) noexcept -> LinkWork& {
-        if (this != &other) { reset(); link_ = std::exchange(other.link_, nullptr); terminal_ = other.terminal_; }
+        if (this != &other) { reset(); link_ = std::exchange(other.link_, nullptr); final_release_ = other.final_release_; }
         return *this;
     }
     ~LinkWork() noexcept { reset(); }
@@ -668,7 +668,7 @@ private:
 
 inline void LinkWork::reset() noexcept {
     if (auto* link = std::exchange(link_, nullptr)) {
-        if (terminal_) link->finish_work();
+        if (final_release_) link->finish_work();
         else link->drop_work();
     }
 }

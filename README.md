@@ -11,7 +11,7 @@ ChaOs currently targets RV64 on QEMU `virt`. The ABI is unstable and the system 
 Implemented or under active development:
 
 - RV64 boot, SMP, traps, Sv39 virtual memory, and physical memory management
-- capability spaces, derivation, attenuation, revocation, and resource accounting
+- capability spaces, derivation, attenuation, revocation, and resource quota management
 - threads, scheduling domains and contexts, timers, and CPU dispatch
 - notifications, MCMP channels, native CALL/Reply, and asynchronous completion
 - ubus dynamic discovery, self-described methods and a common capability-aware value codec
@@ -58,23 +58,27 @@ the other file commands launch the ordinary `fs` program, also available as
 for example `write "my note" "hello world"`. `edit note` opens a screen editor:
 type to insert, move with the arrow keys, save with Ctrl+O, and exit with
 Ctrl+X (which asks whether to save changes). The buffer grows with the process heap. The shell brokers terminal input for the foreground pipeline. Ctrl+C terminates
-all its members; Ctrl+Z suspends them. `jobs`, `fg`, `bg`, `kill`, and `wait` manage
+all its members; Ctrl+Z pauses their initial threads under the current single-thread runtime contract. `jobs`, `fg`, `bg`, `kill`, and `wait` manage
 whole pipelines; `COMMAND &` starts one in the background with stdin left open.
-`tasks` displays authorized task, device and capability snapshots; `view tasks`
-opens it with read-only management endpoints. Editors and task views retain state
-and redraw after `fg`. `status` shows the last completed pipeline’s member results. Only the trusted shell receives explicit Store Admin authority;
-ordinary `fs` and `edit` cannot format. Programs run by name, for example
+`tasks` shows programs and discovered devices; `view tasks`
+opens it with read-only management endpoints. `tasks` has Programs and Devices pages;
+use Tab or 1/2 to switch. The program list shows executable names, state, CPU and
+resident memory. Enter opens details, `a` opens available actions, `/` searches,
+and Esc returns. Sorting (`s`), the ownership tree (`t`), stopped programs (`h`),
+and pausing display updates (Space) are optional. Raw kernel objects and capability
+mutation are not part of this interface. Editors and task views retain state
+and redraw after `fg`. `status` shows the last completed pipeline’s member results. Launch configuration explicitly grants the formatting command a Store Admin route; ordinary applications and `edit` receive their own restricted file views. Programs run by name, for example
 `echo hello | cat`. `echo hello > greeting` replaces a file, and
 `echo world >> greeting` appends to it; redirection runs ordinary `fs save`
 program through the same two-task pipe. Successful commands return to the prompt without
 an extra status line; failures print `error: STATUS`.
-`svc` lists supervised children; `svc restart NAME` changes their owner’s desired state.
+`svc` lists the explicitly granted namespace. `svc restart PATH` and `svc remove PATH` act through its owner; `svc spawn PATH PROGRAM [ARGS]` creates a deployment in that namespace, independently of the caller and alongside existing programs.
 Acceptance precedes recovery and publication. Replacement drains only the owning
 branch; old business endpoints close and accepted business mutations are never replayed.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
 
 `init` supervises one root manager through the same `mgr` mechanism used by the
-root/session managers, device program and shell. Programs receive one opaque
+configured manager instances, device program and shell. Programs receive one opaque
 environment capability, then request objects, receive delegated capabilities or
 publish their own endpoints through ordinary IPC. Get can activate an idle
 configured provider and waits for its actual publication. Bind and business calls
@@ -82,13 +86,13 @@ go directly to that provider. No global registry or business SDK is required.
 
 `bus list`, `bus describe NAME`, and `bus call NAME METHOD FIELD=VALUE` use the
 same Value codec, actual method descriptions and capability transport as any
-other application. `bus call session Configure name=example program=/package`
+other application. `bus call @control Configure name=example program=/package`
 installs a lazy deployment; Configure accepts explicit exports and routes.
 `Spawn` also requests an execution. Published objects can be found as
 `example/EXPORT` in the authorized local environment. A manager commits dynamic
 configuration snapshots to its direct parent before acknowledging changes;
 recovery preserves recipes and applies the explicit restart policy. Consumed
-linear capabilities are never duplicated or replayed.
+linear capabilities are never duplicated or replayed. Lookup and Delegate return bounded namespace/deployment/execution capabilities; Close invalidates existing bindings and descendants. Read-only capabilities cannot resize resources or activate providers. Management roots are attached independently of business publication. Basic observation does not grant native object diagnostics; those require a separate explicit diagnostic permission. `debug bus call @control Inspect ...` is an optional configured diagnostic launch. Device inventory comes from its owner, and observational `Get activate=false` only resolves existing publications.
 
 Deployment bundles contain standard ELF files with debug information removed;
 the original ELF files retain symbols beside the build objects. Test workloads

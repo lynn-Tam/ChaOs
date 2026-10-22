@@ -37,7 +37,7 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
     for (; aux->type != AT_NULL; ++aux) {
         switch (aux->type) {
         case AT_PAGESZ: if (aux->value != 4096) sys::exit(STATUS_BAD_ARGS); break;
-        case AT_SYS_POOL: startup.pool = aux->value; break;
+        case AT_SYS_QUOTA: startup.quota = aux->value; break;
         case AT_SYS_SCOPE: startup.scope = aux->value; break;
         case AT_SYS_DOMAIN: startup.domain = aux->value; break;
         case AT_SYS_VSPACE: startup.vspace = aux->value; break;
@@ -50,7 +50,7 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
         case AT_SYS_BOOT_SIZE: boot_size = aux->value; break;
         }
     }
-    if (!startup.pool || !startup.scope || !startup.vspace || !startup.cspace || !startup.events ||
+    if (!startup.quota || !startup.scope || !startup.vspace || !startup.cspace || !startup.events ||
         !startup.cpus || !startup.ipc || !startup.domain ||
         bool(boot) != bool(boot_size)) sys::exit(STATUS_BAD_ARGS);
     startup.boot = {boot, boot_size};

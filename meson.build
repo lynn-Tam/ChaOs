@@ -60,7 +60,7 @@ core_kernel_sources = files(
   'kernel/cap/view.cpp',  'kernel/cap/grant.cpp',
   'kernel/cap/cspace.cpp', 'kernel/ipc/port.cpp', 'kernel/ipc/channel.cpp', 'kernel/mm/pager.cpp',
   'kernel/irq/irq.cpp',
-  'kernel/object/pool.cpp', 'kernel/resource/account.cpp',
+  'kernel/object/scope.cpp', 'kernel/resource/quota.cpp',
   'kernel/sched/sc.cpp',
   'kernel/sched/dispatcher.cpp',
   'kernel/task/thread.cpp',
@@ -220,6 +220,7 @@ foreach name, spec : {
   'init': [files('apps/init.cpp'), false],
   'mgr': [files('apps/mgr/main.cpp'), false],
   'bus': [files('apps/bus.cpp'), false],
+  'svc': [files('apps/svc.cpp'), false],
   'foreign': [files('test/user/foreign.cpp'), false],
   'supervisor': [files('test/user/supervisor.cpp'), false],
   'block': [files('apps/block/main.cpp'), false],
@@ -232,7 +233,7 @@ foreach name, spec : {
   'echo': [files('apps/echo.cpp'), true],
   'slow': [files('test/user/stream/slow.cpp'), true],
   'fill': [files('test/user/stream/fill.cpp'), true],
-  'control-test': [files('test/user/control.cpp'), true],
+  'control-test': [files('test/user/control.cpp'), false],
   'cat': [files('apps/cat.cpp'), true],
   'ls': [files('apps/ls.cpp'), true],
   'cp': [files('apps/cp.cpp'), true],
@@ -294,6 +295,11 @@ syscall_dependency_test = executable(
 
 run_target('test-syscall-dependency', command: [syscall_dependency_test])
 
+value_test = executable('value-test', files('test/host/value_test.cpp', 'ubus/value.cpp'), native: true,
+  cpp_args: ['-std=c++23', '-I' + root, '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'],
+  link_args: ['-fsanitize=address,undefined'], build_by_default: false)
+run_target('test-value', command: [value_test])
+
 probe_disk = custom_target('probe-disk', output: 'probe.img',
   command: [find_program('python3'), '-c', 'import pathlib,sys; f=pathlib.Path(sys.argv[1]).open("wb"); f.truncate(1024*1024); f.close()', '@OUTPUT@'], build_by_default: false)
 
@@ -340,19 +346,18 @@ apps = {'boot/README.TXT': files('apps/README.TXT')[0],
 test_apps = {'boot/foreign.elf': images['foreign'], 'boot/supervisor.elf': images['supervisor'], 'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
              'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test']}
 foreach name, app : bins
-  if not ['init','mgr','block','devices','bootfs','vfs','uart','shell'].contains(name)
+  if name != 'init'
     apps += {'boot/' + name + '.elf': images[name]}
   endif
 endforeach
-base = apps + {'init': images['init'], 'mgr': images['mgr'], 'mgr.config': mgr_config, 'uart': images['uart'], 'block': images['block'],
-               'bootfs': images['bootfs'], 'vfs': images['vfs'], 'devices': images['devices']}
+base = apps + {'init': images['init'], 'mgr.config': mgr_config}
 bundles = {}
 foreach name, layout : {
-  'boot': base + {'shell': images['shell']},
-  'storage': base + {'shell': images['shell'], 'store': images['store']},
-  'storage-test': base + test_apps + {'shell': images['shell'], 'store': images['store']},
-  'exec': base + test_apps + {'shell': images['shell'], 'boot/cow.elf': images['cow']},
-  'process-test': base + {'shell': images['process-client']},
+  'boot': base,
+  'storage': base + {'boot/store.elf': images['store']},
+  'storage-test': base + test_apps + {'boot/store.elf': images['store']},
+  'exec': base + test_apps + {'boot/cow.elf': images['cow']},
+  'process-test': base + {'boot/shell.elf': images['process-client']},
   'ubus-test': {'init': images['ubus-test'], 'provider': images['ubus-test'], 'client': images['bus']},
   'channel-test': {'init': images['channel-test'], 'worker': images['channel-test']},
   'mgr-test': {'init': images['mgr-test'], 'worker': images['mgr-test']},
@@ -405,6 +410,8 @@ qemu = find_program('qemu-system-riscv64')
 run_target('run-process-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--timeout', '45',
   '[process] direct spawn, retention, deadlines and reuse ok'])
+run_target('run-model-matrix', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_test_bundle, '1,2,4', 'control'])
 run_target('run-supervisor-matrix', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel, storage_test_bundle, '1,2,4', 'recovery', '1'])
 
@@ -442,7 +449,7 @@ run_target('run-mgr', command: [find_program('python3'), files('tools/build/run-
   '[mgr] environment, lazy Get, direct RPC, linear Receive, Resource and native drain ok'])
 run_target('run-channel-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', channel_test_bundle, '--timeout', '30', '--report', '[channel]',
-  '[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and rebilling ok'],
+  '[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and reassigning ok'],
   depends: [kernel_debug, channel_test_bundle])
 
 run_target('run-io-dual-console-matrix', command: [find_program('python3'),

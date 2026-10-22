@@ -47,12 +47,12 @@ public:
     void bind_work(WorkQueue& work, object::Key key) noexcept {
         for (auto& side : sides_) { side.rx.bind_work(work, key); side.tx.bind_work(work, key); }
     }
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         { sync::Lock guard{lock_}; if (!opened_) return std::unexpected(STATUS_BUSY); }
-        object::ref<> payer{to};
+        object::ref<> quota{to};
         return transaction([&](auto&& visit) { messages_.charges(visit); },
-            [&] { std::swap(payer_, payer); });
+            [&] { std::swap(quota_, quota); });
     }
 
 private:
@@ -142,7 +142,7 @@ public:
         cap::GrantRef& root,
         ChannelSide side) noexcept -> bool;
 
-    void bind_funding(resource::Funding& sponsor) noexcept;
+    void bind_allocation(resource::Allocation& source) noexcept;
     void retire(object::cleanup&& cleanup) noexcept;
 
     [[nodiscard]] auto side_state(ChannelSide side) const noexcept
@@ -205,7 +205,7 @@ private:
     static const cap::AttachOps side_ops_;
 
     ChannelConfig config_{};
-    object::ref<> payer_{};
+    object::ref<> quota_{};
     mm::Slab<Message, false> messages_;
     mutable sync::Spin lock_{};
     Side sides_[2];

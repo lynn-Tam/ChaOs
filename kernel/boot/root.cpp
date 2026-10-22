@@ -1,6 +1,6 @@
 #include <expected>
 #include <optional>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <boot/info.hpp>
 #include <libk/cpio.hpp>
 #include <libk/elf.hpp>
@@ -36,8 +36,8 @@ constexpr mm::va_t root_info_address{mm::UserEnd - 2 * mm::page_size};
 constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - root_stack_size};
 
 [[nodiscard]] static constexpr auto charge_pages(usize pages, u64 caps = 0) noexcept
-    -> resource::budget {
-    return resource::budget{
+    -> resource::Budget {
+    return resource::Budget{
         .memory = static_cast<u64>(pages) * mm::page_size,
         .caps = caps,
     };
@@ -74,11 +74,11 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
 }
 
 [[nodiscard]] static auto install_cap(cap::Graph& grants, cap::CSpace& cspace,
-                                      resource::Reservation&& charge, object::ref<> object,
+                                      resource::Reservation&& usage, object::ref<> object,
                                       cap::Rights rights, cap::Limits limit = {}) noexcept
     -> std::expected<cap::Handle, BootErr> {
     auto grant =
-        grants.create_root(std::move(charge), std::move(object), cap::View{rights, limit});
+        grants.create_root(std::move(usage), std::move(object), cap::View{rights, limit});
     if (!grant) {
         return std::unexpected(BootErr::CapabilityFailed);
     }
@@ -122,13 +122,13 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             .physical = module.pages(),
             .perms = mm::Perms::of(mm::Perm::Read),
         };
-        auto sponsorship = pool->reserve(pool, charge_pages(1));
-        if (!sponsorship) {
+        auto reservation = pool->reserve(pool, charge_pages(1));
+        if (!reservation) {
             return std::unexpected(BootErr::OutOfMemory);
         }
         auto scope = object::Scope::reserve(boot.scope);
         if (!scope) return std::unexpected(BootErr::InvalidState);
-        auto image = boot.objects.get<mm::Mem>().create(std::move(*scope), std::move(sponsorship).value(), pmm, size,
+        auto image = boot.objects.get<mm::Mem>().create(std::move(*scope), std::move(reservation).value(), pmm, size,
                                                    mm::PhysCfg{{&extent, 1}, std::move(pages)});
         if (!image) {
             return std::unexpected(BootErr::OutOfMemory);
@@ -139,8 +139,8 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
 
     object::ref<mm::Mem> stack, info, ipc_mem;
     auto reserve =
-        [&](resource::budget charge) noexcept -> std::expected<resource::Reservation, BootErr> {
-        auto reserved = pool->reserve(pool, charge);
+        [&](resource::Budget usage) noexcept -> std::expected<resource::Reservation, BootErr> {
+        auto reserved = pool->reserve(pool, usage);
         return reserved
                    ? std::expected<resource::Reservation, BootErr>{(std::move(reserved).value())}
                    : std::expected<resource::Reservation, BootErr>{
@@ -151,21 +151,21 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     // maps or capability slots. Private boot pages need the same protocol.
     auto own = [&](auto& pending, cap::View view,
                    cap::CSpace* space = nullptr) noexcept -> std::expected<cap::Handle, BootErr> {
-        auto fee = reserve(cap::Graph::node_charge());
+        auto fee = reserve(cap::Graph::node_usage());
         if (!fee) return std::unexpected(fee.error());
         auto root = pending.root(boot.grants, std::move(*fee), view);
         if (!root) return std::unexpected(BootErr::CapabilityFailed);
         cap::Handle handle;
         if (space) {
-            auto lease = root->acquire();
-            if (!lease) return std::unexpected(BootErr::CapabilityFailed);
+            auto pin = root->acquire();
+            if (!pin) return std::unexpected(BootErr::CapabilityFailed);
             auto slots = space->publish(std::array{view}, [&](cap::View child)
                 -> std::expected<cap::GrantRef, cap::CSpace::PublishError> {
-                auto fee = reserve(cap::Graph::node_charge());
+                auto fee = reserve(cap::Graph::node_usage());
                 if (!fee) return std::unexpected(resource::errc::exhausted);
-                auto target = lease->clone_target();
+                auto target = pin->clone_target();
                 if (!target) return std::unexpected(cap::GrantError::InvalidState);
-                auto grant = boot.grants.derive(std::move(*fee), *lease, std::move(*target), child);
+                auto grant = boot.grants.derive(std::move(*fee), *pin, std::move(*target), child);
                 if (!grant) return std::unexpected(grant.error());
                 return std::move(*grant);
             });
@@ -177,18 +177,18 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     };
 
     // Keep construction/publication scratch in bounded cold steps.
-    auto create = [&]<class T> [[gnu::noinline]] (resource::budget budget, auto&&... args) noexcept
+    auto create = [&]<class T> [[gnu::noinline]] (resource::Budget budget, auto&&... args) noexcept
         -> std::expected<object::pending<T>, BootErr> {
-        auto charge = reserve(budget);
-        if (!charge) return std::unexpected(charge.error());
+        auto usage = reserve(budget);
+        if (!usage) return std::unexpected(usage.error());
         auto scope = object::Scope::reserve(boot.scope);
         if (!scope) return std::unexpected(BootErr::InvalidState);
-        auto result = boot.objects.get<T>().create(std::move(*scope), std::move(*charge),
+        auto result = boot.objects.get<T>().create(std::move(*scope), std::move(*usage),
             std::forward<decltype(args)>(args)...);
         if (!result) return std::unexpected(BootErr::OutOfMemory);
         return std::move(*result);
     };
-    auto create_mem = [&] [[gnu::noinline]] (object::ref<mm::Mem>& dst, resource::budget budget,
+    auto create_mem = [&] [[gnu::noinline]] (object::ref<mm::Mem>& dst, resource::Budget budget,
                           auto&&... args) noexcept {
         auto result = create.template operator()<mm::Mem>(budget,
             std::forward<decltype(args)>(args)...);
@@ -253,7 +253,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
 
     auto create_thread = [&] [[gnu::noinline]] () noexcept
         -> std::expected<object::pending<Thread>, BootErr> {
-        auto thread_charge = reserve(object::pool<Thread>::slot_charge());
+        auto thread_charge = reserve(object::pool<Thread>::slot_usage());
         if (!thread_charge) return std::unexpected(BootErr::OutOfMemory);
         auto ipc_buffer = vspace->get().bind_view({.memory = ipc_mem, .object = mm::ObjectRange{0, 1},
             .virtual_range = mm::VRange{root_ipc_address, mm::page_size}});
@@ -304,7 +304,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             if constexpr (requires { object.publish(); }) {
                 return own(object, view, &space);
             } else {
-                auto fee = reserve(cap::Graph::node_charge());
+                auto fee = reserve(cap::Graph::node_usage());
                 if (!fee) return std::unexpected(fee.error());
                 return install_cap(boot.grants, space, std::move(*fee), object, view.rights, view.data);
             }
@@ -318,7 +318,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         };
         const auto rights = [](auto... extra) noexcept {
             return cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
-                cap::Right::Inspect, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke, extra...);
+                cap::Right::Inspect, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke, extra...);
         };
         if (!add_cap(info_page.physical, boot.physical,
                      rights(cap::Right::Create, cap::Right::Control),
@@ -341,17 +341,17 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
 
         const auto basic_rights =
             cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                            cap::Right::Control, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                            cap::Right::Control, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const auto pool_rights = cap::Rights::of(
             cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Create,
-            cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+            cap::Right::Split, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const auto cspace_rights =
             cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
-                            cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+                            cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const auto vspace_rights = cap::Rights::of(
             cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve, cap::Right::Map,
             cap::Right::Unmap, cap::Right::Destroy, cap::Right::Protect, cap::Right::Inspect,
-            cap::Right::Manage, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke);
+            cap::Right::Manage, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const cap::VmLimit vm_limit{
             .range = mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
             .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
@@ -361,13 +361,13 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             .perms = mm::Perms::of(mm::Perm::Read),
         };
         constexpr u64 resource_kinds = OBJ_KINDS;
-        const cap::Quota pool_limit{
+        const cap::QuotaLimit pool_limit{
             .budget = pool->limit(),
             .object_kinds = resource_kinds,
         };
 
         cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{};
-        auto events = create.template operator()<ipc::Port>(object::pool<ipc::Port>::slot_charge(), pmm, ipc::Port::Config{128, 16});
+        auto events = create.template operator()<ipc::Port>(object::pool<ipc::Port>::slot_usage(), pmm, ipc::Port::Config{128, 16});
         if (!events) return std::unexpected(events.error());
         if (events->get().open() != STATUS_OK) return std::unexpected(BootErr::OutOfMemory);
         const auto event_rights = rights(cap::Right::Manage, cap::Right::Receive, cap::Right::Inspect);
@@ -378,13 +378,13 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             !add_cap(cs_cap, *cspace, cspace_rights) ||
             !add_cap(info_page.bundle, *bundle_pending,
                      cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Map,
-                                     cap::Right::Inspect, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke), bundle_limit) ||
+                                     cap::Right::Inspect, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke), bundle_limit) ||
             !add_cap(info_page.thread, *thread, basic_rights) ||
             !add_cap(pool_cap, pool, pool_rights, pool_limit) ||
             !add_cap(scope_cap, boot.scope, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
                 cap::Right::Inspect, cap::Right::Create, cap::Right::Manage, cap::Right::Close,
-                cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke), cap::ScopeLimit{}) ||
-            !add_cap(info_page.sc, *sc, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Rebill, cap::Right::Revoke)) ||
+                cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke), cap::ScopeLimit{}) ||
+            !add_cap(info_page.sc, *sc, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke)) ||
             !add_cap(info_page.domain, boot.domain, cap::Rights::from_raw(basic_rights.raw() | RIGHT_CREATE | RIGHT_CLOSE)))
             return std::unexpected(BootErr::CapabilityFailed);
         const auto sp = root_stack_address.raw() + root_stack_size - root_initial_bytes;
@@ -399,7 +399,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             std::construct_at(reinterpret_cast<AuxEntry*>(initial + 4 * sizeof(word_t)) + i, type, value);
         };
         aux(0, AT_PAGESZ, mm::page_size); aux(1, AT_ENTRY, init.entry());
-        aux(2, AT_SYS_POOL, pool_cap); aux(3, AT_SYS_VSPACE, vm_cap);
+        aux(2, AT_SYS_QUOTA, pool_cap); aux(3, AT_SYS_VSPACE, vm_cap);
         aux(4, AT_SYS_CSPACE, cs_cap); aux(5, AT_SYS_EVENTS, event_cap);
         aux(6, AT_SYS_CPUS, boot.cpus.count()); aux(7, AT_SYS_IPC, root_ipc_address.raw());
         aux(8, AT_SYS_BOOT, root_info_address.raw()); aux(9, AT_SYS_BOOT_SIZE, info_page.bytes);

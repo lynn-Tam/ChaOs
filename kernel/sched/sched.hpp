@@ -54,7 +54,7 @@ public:
 private:
     struct Refill { u64 ready, amount; };
     void mature(u64 now) noexcept;
-    void account(u64 now, u64 elapsed) noexcept;
+    void record(u64 now, u64 elapsed) noexcept;
     mutable sync::Spin lock_;
     u64 amount_{}, period_{}, escrow_{}, generation_{1};
     u64 refill_tail_{}, refill_fraction_{};

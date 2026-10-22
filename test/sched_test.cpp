@@ -6,7 +6,7 @@
 #include <utility>
 #include <mm/kspace.hpp>
 #include <mm/pmm.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <mm/pager.hpp>
@@ -54,7 +54,7 @@ constinit libk::manual_lifetime<mm::RegionList> sched_test_memory_map{};
 constinit libk::manual_lifetime<mm::Pmm> sched_test_pmm{};
 constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> sched_test_mm{};
 constinit libk::manual_lifetime<WorkQueue> sched_work{};
-constinit libk::manual_lifetime<object::store<Thread, resource::Account>> sched_test_tasks{};
+constinit libk::manual_lifetime<object::store<Thread, resource::Quota>> sched_test_tasks{};
 constinit libk::manual_lifetime<mm::KSpace> sched_test_kernel{};
 
 void unused_thread_entry(void*) noexcept {}
@@ -238,15 +238,15 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
 
-    constexpr resource::budget limit{
+    constexpr resource::Budget limit{
         .memory = 3 * mm::page_size,
         .caps = 4,
     };
-    constexpr resource::budget charge{
+    constexpr resource::Budget charge{
         .memory = mm::page_size,
         .caps = 1,
     };
-    auto pending_pool = sched_test_tasks->get<resource::Account>().create(limit);
+    auto pending_pool = sched_test_tasks->get<resource::Quota>().create(limit);
     if (!pending_pool) {
         return false;
     }
@@ -262,7 +262,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         auto reserved = pool->reserve(std::move(self), charge);
         if (!reserved
             || pool->available()
-                != resource::budget{
+                != resource::Budget{
                     .memory = limit.memory - charge.memory,
                     .caps = limit.caps - charge.caps}) {
             return false;
@@ -285,7 +285,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
     auto memory = std::move(pending_memory).value().publish();
-    const resource::budget after_backing{
+    const resource::Budget after_backing{
         .memory = limit.memory - charge.memory,
         .caps = limit.caps - charge.caps,
     };
@@ -322,7 +322,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
     while (sched_work->run()) {}
     if (pool->info(0).allocations != 0
         || pool->available() != limit
-        || pool->close() != resource::Account::Phase::Drained
+        || pool->close() != resource::Quota::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -338,20 +338,20 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
 
-    constexpr resource::budget parent_limit{
+    constexpr resource::Budget parent_limit{
         .memory = 16 * mm::page_size,
         .caps = 16,
     };
-    constexpr resource::budget child_limit{
+    constexpr resource::Budget child_limit{
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
     // The child owns its delegated budget. Its pool capacity is a
     // separate parent-funded cost and returns with the child object.
-    constexpr resource::budget transfer{
+    constexpr resource::Budget transfer{
         .memory = mm::page_size,
     };
-    auto pending_parent = sched_test_tasks->get<resource::Account>().create(parent_limit);
+    auto pending_parent = sched_test_tasks->get<resource::Quota>().create(parent_limit);
     if (!pending_parent) {
         return false;
     }
@@ -367,14 +367,14 @@ bool test_resource_pool_child_returns_transferred_budget(
     }
     auto delegation = parent->reserve(parent, child_limit);
     if (!delegation) return false;
-    auto pending_child = sched_test_tasks->get<resource::Account>().create(std::move(child_charge).value(), child_limit,
+    auto pending_child = sched_test_tasks->get<resource::Quota>().create(std::move(child_charge).value(), child_limit,
         std::move(*delegation).commit());
     if (!pending_child) {
         return false;
     }
     auto child = std::move(pending_child).value().publish();
 
-    constexpr resource::budget object_charge{
+    constexpr resource::Budget object_charge{
         .memory = mm::page_size,
         .caps = 1,
     };
@@ -394,7 +394,7 @@ bool test_resource_pool_child_returns_transferred_budget(
     auto memory = std::move(pending_memory).value().publish();
     if (!child.destroy()) return false;
     while (sched_work->run()) {}
-    if (child->state() != resource::Account::Phase::Closing
+    if (child->state() != resource::Quota::Phase::Closing
         || child->info(0).allocations != 1
         || parent->info(0).allocations != 1) {
         return false;
@@ -405,14 +405,14 @@ bool test_resource_pool_child_returns_transferred_budget(
     }
     memory.reset();
     while (sched_work->run()) {}
-    if (child->state() != resource::Account::Phase::Drained) {
+    if (child->state() != resource::Quota::Phase::Drained) {
         return false;
     }
     child.reset();
     while (sched_work->run()) {}
     if (parent->available() != parent_limit
         || parent->info(0).allocations != 0
-        || parent->close() != resource::Account::Phase::Drained
+        || parent->close() != resource::Quota::Phase::Drained
         || !parent.destroy()) {
         return false;
     }
@@ -424,22 +424,22 @@ bool test_resource_pool_child_returns_transferred_budget(
 bool test_group_close_waits_for_reservation(const TestContext&) noexcept {
     SchedStorageGuard storage{};
     if (!storage.initialize()) return false;
-    constexpr resource::budget limit{.memory = 2 * mm::page_size, .caps = 2};
-    constexpr resource::budget charge{.memory = mm::page_size, .caps = 1};
-    auto pending = sched_test_tasks->get<resource::Account>().create(limit);
+    constexpr resource::Budget limit{.memory = 2 * mm::page_size, .caps = 2};
+    constexpr resource::Budget charge{.memory = mm::page_size, .caps = 1};
+    auto pending = sched_test_tasks->get<resource::Quota>().create(limit);
     if (!pending) return false;
     auto group = pending->publish();
-    auto payer = object::ref<>{group};
-    if (!payer) return false;
-    auto fee = group->reserve(std::move(payer), charge);
-    if (!fee || group->close() != resource::Account::Phase::Closing) return false;
+    auto quota = object::ref<>{group};
+    if (!quota) return false;
+    auto fee = group->reserve(std::move(quota), charge);
+    if (!fee || group->close() != resource::Quota::Phase::Closing) return false;
     // An accepted reservation may finish; closing rejects new admission.
-    payer = object::ref<>{group};
-    if (!payer) return false;
-    auto rejected = group->reserve(std::move(payer), charge);
+    quota = object::ref<>{group};
+    if (!quota) return false;
+    auto rejected = group->reserve(std::move(quota), charge);
     if (rejected || rejected.error() != resource::errc::closed) return false;
     fee->reset();
-    if (group->available() != limit || group->state() != resource::Account::Phase::Drained
+    if (group->available() != limit || group->state() != resource::Quota::Phase::Drained
         || !group.destroy()) return false;
     group.reset();
     while (sched_work->run()) {}

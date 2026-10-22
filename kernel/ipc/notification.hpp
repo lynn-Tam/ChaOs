@@ -7,7 +7,7 @@ namespace ipc {
 
 class Notification final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     auto events() noexcept -> Source& { return events_; }
     void bind_work(WorkQueue& work, object::Key key) noexcept { events_.bind_work(work, key); }
     ~Notification() noexcept { libk_assert(!cleanup_); }

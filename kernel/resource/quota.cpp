@@ -1,97 +1,97 @@
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 #include <limits>
 
 namespace resource {
 
 Reservation::Reservation(Reservation&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      charge_(std::exchange(other.charge_, budget{})) {}
+      usage_(std::exchange(other.usage_, Budget{})) {}
 
 auto Reservation::operator=(Reservation&& other) noexcept -> Reservation& {
     if (this != &other) {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        charge_ = std::exchange(other.charge_, budget{});
+        usage_ = std::exchange(other.usage_, Budget{});
     }
     return *this;
 }
 
 Reservation::~Reservation() noexcept { reset(); }
 
-Refund::Refund(Refund&& other) noexcept
+Release::Release(Release&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      charge_(std::exchange(other.charge_, budget{})) {}
+      usage_(std::exchange(other.usage_, Budget{})) {}
 
-auto Refund::operator=(Refund&& other) noexcept -> Refund& {
+auto Release::operator=(Release&& other) noexcept -> Release& {
     if (this != &other) {
         complete();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        charge_ = std::exchange(other.charge_, budget{});
+        usage_ = std::exchange(other.usage_, Budget{});
     }
     return *this;
 }
 
-Refund::~Refund() noexcept { complete(); }
+Release::~Release() noexcept { complete(); }
 
-Charge::Charge(Charge&& other) noexcept
+Usage::Usage(Usage&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      amount_(std::exchange(other.amount_, budget{})) {}
+      amount_(std::exchange(other.amount_, Budget{})) {}
 
-auto Charge::operator=(Charge&& other) noexcept -> Charge& {
+auto Usage::operator=(Usage&& other) noexcept -> Usage& {
     if (this != &other) {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        amount_ = std::exchange(other.amount_, budget{});
+        amount_ = std::exchange(other.amount_, Budget{});
     }
     return *this;
 }
 
-Charge::~Charge() noexcept { reset(); }
+Usage::~Usage() noexcept { reset(); }
 
 void Reservation::reset() noexcept {
-    if (!owner_) { libk_assert(!ref_ && charge_.empty()); return; }
+    if (!owner_) { libk_assert(!ref_ && usage_.empty()); return; }
     libk_assert(ref_);
-    owner_->cancel(charge_);
+    owner_->cancel(usage_);
     owner_ = nullptr;
-    charge_ = {};
+    usage_ = {};
     ref_.reset();
 }
 
-auto Reservation::commit() && noexcept -> Charge {
-    libk_assert(owner_ && ref_ && !charge_.empty());
+auto Reservation::commit() && noexcept -> Usage {
+    libk_assert(owner_ && ref_ && !usage_.empty());
     owner_->commit();
-    Charge result;
+    Usage result;
     result.owner_ = std::exchange(owner_, nullptr);
     result.ref_ = std::move(ref_);
-    result.amount_ = std::exchange(charge_, budget{});
+    result.amount_ = std::exchange(usage_, Budget{});
     return result;
 }
 
-void Refund::complete() noexcept {
-    if (!owner_) { libk_assert(!ref_ && charge_.empty()); return; }
+void Release::complete() noexcept {
+    if (!owner_) { libk_assert(!ref_ && usage_.empty()); return; }
     libk_assert(ref_);
-    owner_->refund(charge_);
+    owner_->release(usage_);
     owner_ = nullptr;
-    charge_ = {};
+    usage_ = {};
     ref_.reset();
 }
 
-auto Charge::split(budget part) noexcept -> Charge {
+auto Usage::split(Budget part) noexcept -> Usage {
     libk_assert(owner_ && ref_ && amount_.contains(part) && !part.empty());
-    if (part == amount_) return Charge{std::move(*this)};
+    if (part == amount_) return Usage{std::move(*this)};
     amount_.memory -= part.memory;
     amount_.caps -= part.caps;
-    Charge result;
+    Usage result;
     result.owner_ = owner_;
     result.ref_ = ref_;
     result.amount_ = part;
     return result;
 }
 
-void Charge::merge(Charge&& other) noexcept {
+void Usage::merge(Usage&& other) noexcept {
     if (!other) return;
     if (!*this) { *this = std::move(other); return; }
     libk_assert(owner_ == other.owner_ && ref_.id() == other.ref_.id());
@@ -104,101 +104,101 @@ void Charge::merge(Charge&& other) noexcept {
     other.ref_.reset();
 }
 
-void Charge::reset() noexcept {
+void Usage::reset() noexcept {
     if (!owner_) { libk_assert(!ref_ && amount_.empty()); return; }
     libk_assert(ref_ && !amount_.empty());
-    owner_->refund(amount_);
+    owner_->release(amount_);
     owner_ = nullptr;
     amount_ = {};
     ref_.reset();
 }
 
-Funding::~Funding() noexcept {
-    libk_assert(!owner_ && !ref_ && charge_.empty());
-    libk_assert(!control_ && !rebilling_);
+Allocation::~Allocation() noexcept {
+    libk_assert(!owner_ && !ref_ && usage_.empty());
+    libk_assert(!control_ && !reassigning_);
 }
 
-void Funding::commit(Reservation&& reservation) noexcept {
-    libk_assert(!owner_ && !ref_ && reservation && !rebilling_);
+void Allocation::commit(Reservation&& reservation) noexcept {
+    libk_assert(!owner_ && !ref_ && reservation && !reassigning_);
     epoch_ = 1;
     owner_ = std::exchange(reservation.owner_, nullptr);
     ref_ = std::move(reservation.ref_);
-    charge_ = std::exchange(reservation.charge_, budget{});
+    usage_ = std::exchange(reservation.usage_, Budget{});
     owner_->attach(*this);
 }
 
-auto Funding::reserve(budget charge) const noexcept -> std::expected<Reservation, errc> {
-    object::ref<> payer;
-    Account* owner;
+auto Allocation::reserve(Budget usage) const noexcept -> std::expected<Reservation, errc> {
+    object::ref<> quota;
+    Quota* owner;
     {
         sync::Lock guard{object::Control::lock};
-        if (!owner_ || rebilling_) return std::unexpected(errc::closed);
-        payer = ref_; owner = owner_;
+        if (!owner_ || reassigning_) return std::unexpected(errc::closed);
+        quota = ref_; owner = owner_;
     }
-    return owner->reserve(std::move(payer), charge);
+    return owner->reserve(std::move(quota), usage);
 }
 
-auto acquire(const object::ref<>& payer, budget amount) noexcept
-    -> std::expected<Charge, errc> {
-    if (!payer) return Charge{};
-    auto owner = payer.as<Account>();
+auto acquire(const object::ref<>& quota, Budget amount) noexcept
+    -> std::expected<Usage, errc> {
+    if (!quota) return Usage{};
+    auto owner = quota.as<Quota>();
     if (!owner) return std::unexpected(errc::invalid);
-    auto reserved = owner->get().reserve(payer, amount);
+    auto reserved = owner->get().reserve(quota, amount);
     if (!reserved) return std::unexpected(reserved.error());
     return std::move(*reserved).commit();
 }
 
-auto Funding::acquire(budget amount) const noexcept
-    -> std::expected<Charge, errc> {
+auto Allocation::acquire(Budget amount) const noexcept
+    -> std::expected<Usage, errc> {
     auto reservation = reserve(amount);
     if (!reservation) return std::unexpected(reservation.error());
     return std::move(*reservation).commit();
 }
 
-auto Funding::pause(const object::ref<>& payer, u64 epoch) noexcept -> status_t {
+auto Allocation::pause(const object::ref<>& quota, u64 epoch) noexcept -> status_t {
     sync::Lock guard{object::Control::lock};
-    if (!owner_ || ref_.id() != payer.id() || epoch_ != epoch) return STATUS_STALE;
-    if (rebilling_) return STATUS_BUSY;
-    rebilling_ = true;
+    if (!owner_ || ref_.id() != quota.id() || epoch_ != epoch) return STATUS_STALE;
+    if (reassigning_) return STATUS_BUSY;
+    reassigning_ = true;
     return STATUS_OK;
 }
-void Funding::resume() noexcept {
+void Allocation::resume() noexcept {
     sync::Lock guard{object::Control::lock};
-    libk_assert(rebilling_);
-    rebilling_ = false;
+    libk_assert(reassigning_);
+    reassigning_ = false;
 }
 
-void Funding::bind_control(object::Control& target) noexcept {
+void Allocation::bind_control(object::Control& target) noexcept {
     sync::Lock guard{object::Control::lock};
     libk_assert(owner_ && !control_);
     control_ = &target;
 }
 
-auto Funding::detach() noexcept -> Refund {
+auto Allocation::detach() noexcept -> Release {
     if (!owner_) return {};
     {
         sync::Lock guard{object::Control::lock};
         control_ = nullptr;
     }
     owner_->detach(*this);
-    Refund refund;
-    refund.owner_ = std::exchange(owner_, nullptr);
-    refund.ref_ = std::move(ref_);
-    refund.charge_ = std::exchange(charge_, budget{});
-    return refund;
+    Release release;
+    release.owner_ = std::exchange(owner_, nullptr);
+    release.ref_ = std::move(ref_);
+    release.usage_ = std::exchange(usage_, Budget{});
+    return release;
 }
 
-Account::Account(budget limit, Charge delegation) noexcept
+Quota::Quota(Budget limit, Usage delegation) noexcept
     : limit_(limit), available_(limit), delegation_(std::move(delegation)) {
     events_.update(STATE_OPEN);
 }
 
-Account::~Account() noexcept {
-    libk_assert(pending_ == 0 && allocations_ == 0 && available_ == limit_ && !cleanup_ && !finishing_ && !billing_ && !calls_);
+Quota::~Quota() noexcept {
+    libk_assert(pending_ == 0 && allocations_ == 0 && available_ == limit_ && !cleanup_ && !finishing_ && !reassigning_ && !calls_);
 }
 
-auto Account::reserve(object::ref<> self, budget amount) noexcept -> std::expected<Reservation, errc> {
-    auto typed = self.as<Account>();
+auto Quota::reserve(object::ref<> self, Budget amount) noexcept -> std::expected<Reservation, errc> {
+    auto typed = self.as<Quota>();
     if (!typed || &typed->get() != this || amount.empty()) return std::unexpected(errc::invalid);
     {
         sync::Lock guard{lock_};
@@ -214,19 +214,19 @@ auto Account::reserve(object::ref<> self, budget amount) noexcept -> std::expect
     Reservation reserved;
     reserved.owner_ = this;
     reserved.ref_ = std::move(self);
-    reserved.charge_ = amount;
+    reserved.usage_ = amount;
     return reserved;
 }
-auto Account::limit() const noexcept -> budget { sync::Lock guard{lock_}; return limit_; }
-auto Account::available() const noexcept -> budget { sync::Lock guard{lock_}; return available_; }
-auto Account::state() const noexcept -> Phase { sync::Lock guard{lock_}; return phase_; }
-auto Account::info(u64) const noexcept -> AccountInfo {
+auto Quota::limit() const noexcept -> Budget { sync::Lock guard{lock_}; return limit_; }
+auto Quota::available() const noexcept -> Budget { sync::Lock guard{lock_}; return available_; }
+auto Quota::state() const noexcept -> Phase { sync::Lock guard{lock_}; return phase_; }
+auto Quota::info(u64) const noexcept -> QuotaInfo {
     sync::Lock guard{lock_};
-    return {.version=1, .size=sizeof(AccountInfo), .memory_limit=limit_.memory,
+    return {.version=1, .size=sizeof(QuotaInfo), .memory_limit=limit_.memory,
         .memory_available=available_.memory, .cap_limit=limit_.caps, .caps_available=available_.caps,
         .allocations=allocations_, .reservations=pending_, .state=static_cast<u32>(phase_), .reserved=0};
 }
-void Account::cancel(budget amount) noexcept {
+void Quota::cancel(Budget amount) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(pending_ && limit_.memory - available_.memory >= amount.memory
@@ -237,20 +237,20 @@ void Account::cancel(budget amount) noexcept {
     }
     service();
 }
-void Account::commit() noexcept {
+void Quota::commit() noexcept {
     { sync::Lock guard{lock_}; libk_assert(pending_); --pending_; }
     service();
 }
-void Account::attach(Funding&) noexcept {
+void Quota::attach(Allocation&) noexcept {
     sync::Lock guard{lock_};
     libk_assert(pending_ && allocations_ != std::numeric_limits<usize>::max());
     --pending_; ++allocations_;
 }
-void Account::detach(Funding&) noexcept {
+void Quota::detach(Allocation&) noexcept {
     sync::Lock guard{lock_};
     libk_assert(allocations_); --allocations_;
 }
-void Account::refund(budget amount) noexcept {
+void Quota::release(Budget amount) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(limit_.memory - available_.memory >= amount.memory
@@ -260,16 +260,16 @@ void Account::refund(budget amount) noexcept {
     }
     service();
 }
-auto Account::close() noexcept -> Phase {
+auto Quota::close() noexcept -> Phase {
     service(true);
     return state();
 }
-void Account::retire(object::cleanup&& cleanup) noexcept {
+void Quota::retire(object::cleanup&& cleanup) noexcept {
     service(true, std::move(cleanup));
 }
-void Account::service(bool close, object::cleanup cleanup) noexcept {
+void Quota::service(bool close, object::cleanup cleanup) noexcept {
     Source::Publication publication;
-    Charge delegation;
+    Usage delegation;
     bool finish{};
     {
         sync::Lock structure{object::Control::lock};
@@ -280,7 +280,7 @@ void Account::service(bool close, object::cleanup cleanup) noexcept {
             phase_ = Phase::Closing;
             publication = events_.prepare(STATE_CLOSING, true);
         }
-        if (phase_ == Phase::Closing && !finishing_ && !billing_ && pending_ == 0 && available_ == limit_) {
+        if (phase_ == Phase::Closing && !finishing_ && !reassigning_ && pending_ == 0 && available_ == limit_) {
             finishing_ = finish = true;
             delegation = std::move(delegation_);
         }
@@ -310,7 +310,7 @@ void Account::service(bool close, object::cleanup cleanup) noexcept {
     if (done) done.complete();
 }
 
-void Account::complete_cleanup() noexcept {
+void Quota::complete_cleanup() noexcept {
     object::cleanup cleanup;
     {
         sync::Lock guard{lock_};

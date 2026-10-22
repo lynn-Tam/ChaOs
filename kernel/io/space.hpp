@@ -56,7 +56,7 @@ class IoOp final : private libk::noncopyable_nonmovable {
     Op state_;
     Receipt receipt_;
     MapTree retired_;
-    resource::Charge tables_fee_;
+    resource::Usage tables_fee_;
     mm::PageGroup pages_;
     usize value_{};
     status_t result_{STATUS_OK};
@@ -73,7 +73,7 @@ class IoOp final : private libk::noncopyable_nonmovable {
     };
     std::optional<Edit> edit_;
 public:
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     explicit IoOp(object::ref<>) noexcept;
     IoOp(Space&, bool) noexcept;
     ~IoOp() noexcept { libk_assert(retired_.empty() && !tables_fee_ && !pages_.page_count() && !edit_ && !receipt_.submitted); }
@@ -87,28 +87,28 @@ class Iommu final : private libk::noncopyable_nonmovable {
     friend class Space;
 public:
     Iommu(mm::Pmm&, mm::KSpace&, Cpus&, WorkQueue&, const time::Clock&,
-        object::ref<>, mm::Phys::Lease&&, object::ref<irq::Ctl>, irq::Line, IommuConfig) noexcept;
+        object::ref<>, mm::Phys::Claim&&, object::ref<irq::Ctl>, irq::Line, IommuConfig) noexcept;
     ~Iommu() noexcept;
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
-            if (phase_ != Phase::Ready || closing_ || billing_ || inflight_) return std::unexpected(STATUS_BUSY);
-            billing_ = true;
+            if (phase_ != Phase::Ready || closing_ || reassigning_ || inflight_) return std::unexpected(STATUS_BUSY);
+            reassigning_ = true;
         }
         libk::scope_exit resume{[&]() noexcept {
-            { sync::Lock guard{lock_}; billing_ = false; }
+            { sync::Lock guard{lock_}; reassigning_ = false; }
             work_.post(job_);
         }};
-        object::ref<> payer{to};
-        return transaction([&](auto&& visit) { visit(fee_); }, [&] { std::swap(payer_, payer); });
+        object::ref<> quota{to};
+        return transaction([&](auto&& visit) { visit(fee_); }, [&] { std::swap(quota_, quota); });
     }
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return authority_.admit(std::forward<Publish>(publish)); }
+    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
     auto activate() noexcept -> status_t;
     void links(u64 cursor, LinkRecords& out) const noexcept;
     auto open(object::ref<> cpu) noexcept -> status_t;
     auto state() const noexcept -> IoState;
-    void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); initialization_.bind(work, owner); authority_.bind(owner); }
+    void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); initialization_.bind(work, owner); bindings_.bind(owner); }
     void retire(object::cleanup&&) noexcept;
 private:
     enum class Phase : u8 { Empty, Prepared, Disabling, Queues, Directory, Ready, Stopping, Unmapping, Closed, Failed };
@@ -128,20 +128,20 @@ private:
     void close() noexcept; // Caller holds lock_; propagates the one close transition.
     void post() noexcept { work_.post(job_); }
     void invalidated() noexcept;
-    cap::Authority<2> authority_{Source::Action::bind<&Iommu::invalidated>(*this), Source::Action::bind<&Iommu::post>(*this)};
+    cap::Bindings<2> bindings_{Source::Action::bind<&Iommu::invalidated>(*this), Source::Action::bind<&Iommu::post>(*this)};
     Op initialization_{{}, Source::Action::bind<&Iommu::post>(*this), Source::Action::bind<&Iommu::advance>(*this)};
     mm::KSpace& vm_;
     Cpus& cpus_;
     WorkQueue& work_;
     const time::Clock& clock_;
-    object::ref<> payer_;
-    mm::Phys::Lease claim_;
+    object::ref<> quota_;
+    mm::Phys::Claim claim_;
     object::ref<irq::Ctl> irq_owner_;
     irq::Route irq_;
     IommuConfig config_;
     mm::KMap mapping_;
     mm::PageGroup storage_;
-    resource::Charge fee_;
+    resource::Usage fee_;
     mm::Page directory_{}, commands_{}, faults_{};
     mutable sync::Spin lock_;
     Phase phase_{Phase::Empty};
@@ -150,7 +150,7 @@ private:
     u32 tail_{}, fault_head_{};
     u64 deadline_{};
     std::atomic<bool> irq_pending_{}, disconnected_{};
-    bool closing_{}, mapped_{}, billing_{}, advancing_{};
+    bool closing_{}, mapped_{}, reassigning_{}, advancing_{};
     object::cleanup cleanup_;
     std::optional<mm::Flush> flush_;
     Work job_;
@@ -165,7 +165,7 @@ class Space final : private libk::noncopyable_nonmovable {
 public:
     Space(mm::Pmm&, WorkQueue&, object::ref<>, object::ref<Iommu>, u32) noexcept;
     ~Space() noexcept;
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
@@ -177,11 +177,11 @@ public:
             { sync::Lock guard{lock_}; preparing_ = false; }
             work_.post(job_);
         }};
-        object::ref<> payer{to};
+        object::ref<> quota{to};
         return transaction([&](auto&& visit) {
             visit(fee_); maps_.charges(visit);
             for (auto* map = mappings_.minimum(); map; map = mappings_.next(*map)) map->pins.charges(visit);
-        }, [&] { std::swap(payer_, payer); });
+        }, [&] { std::swap(quota_, quota); });
     }
     auto open(object::ref<>, cap::Resolved<Iommu>&, object::ref<> cpu) noexcept -> status_t;
     auto map(Op::Submission, cap::Resolved<mm::Mem>&, mm::ObjectRange, usize, mm::Perms) noexcept -> std::expected<usize, status_t>;
@@ -206,7 +206,7 @@ private:
     inline static const cap::AttachOps ctl_ops_{invalidated, released};
     mm::Pmm& pmm_;
     WorkQueue& work_;
-    object::ref<> payer_, self_;
+    object::ref<> quota_, self_;
     object::ref<Iommu> controller_;
     u32 requester_, pscid_{};
     Space* next_{};
@@ -214,7 +214,7 @@ private:
     MapTree mappings_;
     u64 map_epoch_{1}, observed_epoch_{};
     libk::manual_lifetime<mm::PageTable> root_;
-    resource::Charge fee_;
+    resource::Usage fee_;
     mutable sync::Spin lock_;
     enum class Phase : u8 { Opening, Ready, Closing, Closed, Failed };
     Phase phase_{Phase::Opening};

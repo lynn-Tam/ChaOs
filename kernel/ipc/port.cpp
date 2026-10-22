@@ -1,10 +1,10 @@
 #include <ipc/port.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <libk/checked_arithmetic.hpp>
 
 namespace ipc {
 
-const cap::AttachOps Port::authority_ops_{
+const cap::AttachOps Port::attach_ops_{
     .invalidate = [](void* p, object::LinkWork&& work) noexcept {
         auto& watch = *static_cast<Watch*>(p);
         watch.owner.close(watch, false, std::move(work));
@@ -27,7 +27,7 @@ const cap::AttachOps Port::authority_ops_{
 };
 
 Port::Watch::Watch(Port& port) noexcept
-    : owner(port), authority(this, authority_ops_),
+    : owner(port), attachment(this, attach_ops_),
       source(libk::delegate<void(WaitResult) noexcept>::bind<&Watch::deliver>(*this),
              Source::Drained::bind<&Watch::drained>(*this)) {}
 void Port::Watch::deliver(WaitResult result) noexcept {
@@ -59,7 +59,7 @@ auto Port::storage_bytes(Config config) noexcept -> std::optional<usize> {
 auto Port::open() noexcept -> status_t {
     if (!storage_bytes(config_) || opened_) return STATUS_BAD_ARGS;
     while (watches_.size() < config_.watches) {
-        auto made = storage_.create(payer_, *this);
+        auto made = storage_.create(quota_, *this);
         if (!made) return STATUS_NO_MEMORY;
         watches_.push_back(**made); free_.push_back(**made);
     }
@@ -77,7 +77,7 @@ auto Port::update() noexcept -> Source::Publication {
     return ready_.prepare(bits, true);
 }
 
-auto Port::watch(cap::Resolved<Port>& port, const cap::GrantLease& grant, Source& source,
+auto Port::watch(cap::Resolved<Port>& port, const cap::GrantPin& grant, Source& source,
     u32 facet, u64 key, Source::Condition condition, Bound bound) noexcept -> std::expected<u64, status_t> {
     Flight flight{*this};
     auto target = grant.clone_target(), receiver = port.reference();
@@ -96,7 +96,7 @@ auto Port::watch(cap::Resolved<Port>& port, const cap::GrantLease& grant, Source
             .key = key, .watch_gen = id, .sequence = 0, .condition = 0, .facet = facet, .flags = 0};
         index_.insert(*cell);
     }
-    std::array<const cap::GrantLease*, 2> grants{&grant, &port.lease()};
+    std::array<const cap::GrantPin*, 2> grants{&grant, &port.pin()};
     std::array<const object::ref<>*, 2> gates{&*target, &*receiver};
     const auto admission = grant.graph().admission(grants);
     const auto status = source.watch(cell->source, condition, [&](auto&& register_source) noexcept {
@@ -108,7 +108,7 @@ auto Port::watch(cap::Resolved<Port>& port, const cap::GrantLease& grant, Source
         sync::Lock guard{lock_};
         if (closing_) return STATUS_CLOSED;
         auto commit = [&]() noexcept { register_source(); cell->state = Watch::State::Live; changed(); };
-        auto attached = admission.attach(grant, cell->authority, gates, libk::delegate<void() noexcept>::bind(commit));
+        auto attached = admission.attach(grant, cell->attachment, gates, libk::delegate<void() noexcept>::bind(commit));
         return attached ? STATUS_OK : STATUS_CLOSED;
     });
     if (status != STATUS_OK) {
@@ -120,7 +120,7 @@ auto Port::watch(cap::Resolved<Port>& port, const cap::GrantLease& grant, Source
 }
 
 auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
-    std::expected<cap::GrantLease, cap::GrantError> grant = std::unexpected(cap::GrantError::InvalidState);
+    std::expected<cap::GrantPin, cap::GrantError> grant = std::unexpected(cap::GrantError::InvalidState);
     Watch* watch;
     Source* source;
     Source::Pin pin;
@@ -132,7 +132,7 @@ auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
         watch = find(id);
         if (!watch) return STATUS_STALE;
         if (watch->state != Watch::State::Live) return STATUS_CLOSED;
-        grant = watch->authority.acquire();
+        grant = watch->attachment.acquire();
         source = watch->source.source();
         pin = source->retain();
         condition = watch->condition;
@@ -167,7 +167,7 @@ auto Port::emit(Watch& watch, WaitResult result) noexcept -> bool {
             || (watch.event.flags & PORT_EVENT_CLOSED);
         if (!terminal && (watch.state != Watch::State::Live || watch.event.sequence > result.sequence)) return false;
         watch.event.sequence = std::max(watch.event.sequence, result.sequence);
-        // A Source flight already owns this hint, even if authority closes
+        // A Source flight already owns this hint, even if attachment closes
         // before its callback reaches the Port. Keep closure and real readiness.
         watch.event.condition = result.value | (terminal
             && (watch.queue.is_linked() || watch.pending > acknowledged_) ? watch.event.condition : 0);
@@ -215,7 +215,7 @@ void Port::finish(Watch& watch) noexcept {
             detach = !std::exchange(watch.detach_started, true);
             work = std::move(watch.work);
         }
-        const auto done = detach && watch.authority.detach();
+        const auto done = detach && watch.attachment.detach();
         work.reset();
         Source::Publication publication;
         bool again;
@@ -226,11 +226,11 @@ void Port::finish(Watch& watch) noexcept {
             watch.finishing = false;
             again = bool(watch.work);
             if (!again) {
-                if (watch.calls || !watch.grant_done || watch.authority.busy()) return;
+                if (watch.calls || !watch.grant_done || watch.attachment.busy()) return;
                 watch.state = Watch::State::Terminal;
                 if (watch.erase || closing_) {
                     if (watch.queue.is_linked()) queue_.erase(watch);
-                    watch.authority.reset();
+                    watch.attachment.reset();
                     watch.state = Watch::State::Free; index_.erase(watch); free_.push_back(watch);
                     watch.source_done = watch.detach_started = watch.grant_done = watch.erase = false;
                     watch.pending = 0;

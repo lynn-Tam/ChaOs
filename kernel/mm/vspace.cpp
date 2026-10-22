@@ -62,7 +62,7 @@ VmOp::VmOp(object::ref<> provider) noexcept
     : owner_(static_cast<VSpace*>(provider.get())),
       state_(std::move(provider), Source::Action::bind<&VSpace::flush_ready>(*owner_), Source::Action::bind<&VSpace::advance>(*owner_)),
       flush_(*owner_->pmm_, sync::Latch::Notifier::bind<&VSpace::flush_ready>(*owner_)) {}
-VmOp::~VmOp() noexcept { libk_assert(!maps_ && !pages_ && retired_.empty() && !refund_ && !edit_); }
+VmOp::~VmOp() noexcept { libk_assert(!maps_ && !pages_ && retired_.empty() && !release_ && !edit_); }
 
 auto VmOp::drain_pages() noexcept -> bool {
     libk_assert(owner_->lock_.held());
@@ -70,7 +70,7 @@ auto VmOp::drain_pages() noexcept -> bool {
     if (edit_ && !edit_->batch) return false;
     if (!flush_.complete()) return false;
     if (!released_) {
-        if (!flush_.release(refund_)) { owner_->flush_ready(); return false; }
+        if (!flush_.release(release_)) { owner_->flush_ready(); return false; }
         released_ = true;
         if (!edit_) state_.drain();
     }
@@ -78,7 +78,7 @@ auto VmOp::drain_pages() noexcept -> bool {
     while (pages_ && remaining) {
         --remaining;
         auto* page = pages_; pages_ = page->pending_next_;
-        owner_->release_page(*page, refund_);
+        owner_->release_page(*page, release_);
     }
     while (maps_ && remaining) {
         --remaining;
@@ -91,7 +91,7 @@ auto VmOp::drain_pages() noexcept -> bool {
 }
 
 auto VmOp::finish() noexcept -> bool {
-    refund_.reset(); // Physical storage was released before its capacity refund.
+    release_.reset(); // Physical storage was released before its capacity release.
     return state_.detach();
 }
 
@@ -284,26 +284,26 @@ void Backing::invalidate_grant(void* ctx, object::LinkWork&& work) noexcept {
     auth.owner_->request_invalidation(auth, std::move(work));
 }
 
-auto VSpace::prepare(const object::ref<>& payer, Pmm& pmm, KSpace& kernel, WorkQueue& work) noexcept
+auto VSpace::prepare(const object::ref<>& quota, Pmm& pmm, KSpace& kernel, WorkQueue& work) noexcept
     -> std::expected<Data, VSpaceError> {
     object::ref<> source;
-    resource::Charge charge;
-    if (payer) {
-        source = payer;
-        auto acquired = resource::acquire(source, resource::budget{.memory = page_size});
+    resource::Usage usage;
+    if (quota) {
+        source = quota;
+        auto acquired = resource::acquire(source, resource::Budget{.memory = page_size});
         if (!acquired) return std::unexpected(VSpaceError::ResourceExhausted);
-        charge = std::move(*acquired);
+        usage = std::move(*acquired);
     }
     auto root = PageTable::create(pmm, PageTable::Kind::User, &kernel.pages());
     if (!root) return std::unexpected(VSpaceError::OutOfMemory);
-    return Data{pmm, kernel, work, std::move(source), std::move(charge), std::move(*root)};
+    return Data{pmm, kernel, work, std::move(source), std::move(usage), std::move(*root)};
 }
 
 VSpace::VSpace(Data&& data) noexcept
-    : pmm_(data.pmm_), kernel_(data.kernel_), work_(data.work_), payer_(std::move(data.payer_)),
+    : pmm_(data.pmm_), kernel_(data.kernel_), work_(data.work_), quota_(std::move(data.quota_)),
       mappings_(*pmm_), binding_pool_(*pmm_), pages_(*pmm_), views_(*pmm_),
       job_(Work::Fn::bind<&VSpace::run_work>(*this)),
-      table_charge_(std::move(data.charge_)) {
+      table_charge_(std::move(data.usage_)) {
     (void) root_.emplace(std::move(data.root_));
 }
 
@@ -324,10 +324,10 @@ void VSpace::release_root() noexcept {
     const usize pages = root_->page_count();
     root_.reset();
     if (!table_charge_) {
-        libk_assert(!payer_);
+        libk_assert(!quota_);
         return;
     }
-    const resource::budget expected{
+    const resource::Budget expected{
         .memory = static_cast<u64>(pages) * page_size,
     };
     libk_assert(table_charge_.amount() == expected);
@@ -496,9 +496,9 @@ void VSpace::destroy_layout(Map& node) noexcept {
         mappings_.destroy(node);
 }
 
-void VSpace::release_page(MapPage& page, resource::Charge& refund) noexcept {
+void VSpace::release_page(MapPage& page, resource::Usage& release) noexcept {
     page.binding_ = nullptr;
-    refund.merge(page.take_charge());
+    release.merge(page.take_charge());
     pages_.destroy(page);
 }
 
@@ -671,7 +671,7 @@ auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, V
         if (!admitted) return std::unexpected(admitted.error());
     }
     Edit edit{this};
-    auto made = mappings_.create(payer_, range, guard ? MapKind::Guard : MapKind::Reserved);
+    auto made = mappings_.create(quota_, range, guard ? MapKind::Guard : MapKind::Reserved);
     if (!made) return std::unexpected(node_error(made.error()));
     auto rollback = libk::scope_exit{[&]() noexcept { mappings_.destroy(*made->object); }};
     sync::Lock lock{lock_};
@@ -771,7 +771,7 @@ auto VSpace::bind_view(ViewReq&& request) noexcept -> std::expected<View, VSpace
     }
 
     Edit edit{this};
-    auto made = views_.create(payer_, *this, *mapping->binding_, std::move(request));
+    auto made = views_.create(quota_, *this, *mapping->binding_, std::move(request));
     if (!made) return std::unexpected(node_error(made.error()));
     Borrow* const relation = made->object;
     auto rollback = libk::scope_exit{[&]() noexcept { views_.destroy(*relation); }};
@@ -822,19 +822,19 @@ auto VSpace::reserve_tables(MapPage* pages) noexcept -> std::expected<TableReser
         }
     }
     const usize count = plan.pages();
-    resource::Charge charge{};
-    if (payer_ && count != 0) {
+    resource::Usage usage{};
+    if (quota_ && count != 0) {
         const auto bytes = libk::checked_multiply<u64>(static_cast<u64>(count), static_cast<u64>(page_size));
         if (!bytes) {
             return std::unexpected(VSpaceError::ResourceExhausted);
         }
-        auto acquired = resource::acquire(payer_, resource::budget{
+        auto acquired = resource::acquire(quota_, resource::Budget{
                                                       .memory = bytes.value(),
                                                   });
         if (!acquired) {
             return std::unexpected(VSpaceError::ResourceExhausted);
         }
-        charge = std::move(acquired).value();
+        usage = std::move(acquired).value();
     }
 
     PageGroup reserve = pmm_->group();
@@ -842,27 +842,27 @@ auto VSpace::reserve_tables(MapPage* pages) noexcept -> std::expected<TableReser
         return std::unexpected(VSpaceError::OutOfMemory);
     }
     return (TableReserve{
-        std::move(charge),
+        std::move(usage),
         std::move(reserve),
     });
 }
 
 void VSpace::commit_tables(TableReserve& reserve) noexcept {
-    if (reserve.charge) {
-        const resource::budget charged = reserve.charge.amount();
+    if (reserve.usage) {
+        const resource::Budget charged = reserve.usage.amount();
         libk_assert(charged.caps == 0 && charged.memory % page_size == 0);
         const usize total = static_cast<usize>(charged.memory / page_size);
         libk_assert(total >= reserve.pages.page_count());
         const usize consumed = total - reserve.pages.page_count();
         if (consumed != 0) {
-            table_charge_.merge(reserve.charge.split(resource::budget{
+            table_charge_.merge(reserve.usage.split(resource::Budget{
                 .memory = static_cast<u64>(consumed) * page_size,
             }));
         }
     }
     // Unconsumed prepared pages return to PMM before their capacity token.
     reserve.pages.reset();
-    reserve.charge.reset();
+    reserve.usage.reset();
 }
 
 void VSpace::retire_table(Flush& retire, OwnedPage&& page) noexcept {
@@ -870,10 +870,10 @@ void VSpace::retire_table(Flush& retire, OwnedPage&& page) noexcept {
         libk_assert(retire.adopt(std::move(page)));
         return;
     }
-    auto charge = table_charge_.split(resource::budget{
+    auto usage = table_charge_.split(resource::Budget{
         .memory = page_size,
     });
-    libk_assert(retire.adopt(std::move(page), std::move(charge)));
+    libk_assert(retire.adopt(std::move(page), std::move(usage)));
 }
 
 auto VSpace::map(VmCtx ctx, MapReq request, object::ref<> ref, Mem& mem, cap::MemLimit auth) noexcept
@@ -925,7 +925,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     }
 
     auto backing_entry =
-        binding_pool_.create(payer_, *this, std::move(memory_ref), memory, request.perms, private_write);
+        binding_pool_.create(quota_, *this, std::move(memory_ref), memory, request.perms, private_write);
     if (!backing_entry) {
         return std::unexpected(node_error(backing_entry.error()));
     }
@@ -953,7 +953,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     }
 
     auto mapping_entry =
-        mappings_.create(payer_, request.virtual_range, request.object, request.perms, ceiling, *auth);
+        mappings_.create(quota_, request.virtual_range, request.object, request.perms, ceiling, *auth);
     if (!mapping_entry) {
         return std::unexpected(node_error(mapping_entry.error()));
     }
@@ -1027,7 +1027,7 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
     if (editing_ || draining_) return VmStatus::Pending;
     if (edit.batch) {
         if (!op.flushed_ || !op.retired_.empty()) return VmStatus::Pending;
-        op.refund_.reset();
+        op.release_.reset();
         std::destroy_at(&op.flush_);
         std::construct_at(&op.flush_, *pmm_, sync::Latch::Notifier::bind<&VSpace::flush_ready>(*this));
         op.released_ = op.flushed_ = edit.batch = false;
@@ -1209,11 +1209,11 @@ auto VSpace::make_fragment(Map& source, VRange range, Perms perms) noexcept
     -> std::expected<Map*, VSpaceError> {
     auto made =
         source.binding_
-            ? mappings_.create(payer_, range,
+            ? mappings_.create(quota_, range,
                                ObjectRange{source.object_.base() + *source.range_.page_offset(range.base()),
                                            *range.page_count()},
                                perms, source.ceiling_, *source.binding_)
-            : mappings_.create(payer_, range, source.kind_);
+            : mappings_.create(quota_, range, source.kind_);
     if (!made) return std::unexpected(node_error(made.error()));
     made->object->key_ = made->key;
     return made->object;
@@ -1316,19 +1316,19 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
     -> std::expected<FaultResult, VSpaceError> {
     Edit editing{this};
     if (!pmm_->is_ram(source.page())) return std::unexpected(VSpaceError::NotRam);
-    resource::Charge charge{};
-    if (payer_) {
-        auto acquired = resource::acquire(payer_, resource::budget{.memory = page_size});
+    resource::Usage usage{};
+    if (quota_) {
+        auto acquired = resource::acquire(quota_, resource::Budget{.memory = page_size});
         if (!acquired) return std::unexpected(VSpaceError::ResourceExhausted);
-        charge = std::move(acquired).value();
+        usage = std::move(acquired).value();
     }
     auto allocated = pmm_->allocate_page();
     if (!allocated) return std::unexpected(VSpaceError::OutOfMemory);
     OwnedPage private_page = std::move(allocated).value();
     memcpy(private_page.bytes(), pmm_->bytes(source.page()), page_size);
 
-    auto made = pages_.create(payer_, source.address_, source.object_page_, std::move(private_page),
-                              std::move(charge));
+    auto made = pages_.create(quota_, source.address_, source.object_page_, std::move(private_page),
+                              std::move(usage));
     if (!made) return std::unexpected(node_error(made.error()));
     MapPage* const replacement = made.value().object;
     const usize object_page = source.object_page_;
@@ -1408,7 +1408,7 @@ auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize
         return std::unexpected(VSpaceError::InvalidAccess);
     }
 
-    auto made = pages_.create(payer_, page_address, object_page, std::move(source));
+    auto made = pages_.create(quota_, page_address, object_page, std::move(source));
     if (!made) {
         return std::unexpected(node_error(made.error()));
     }
@@ -1588,7 +1588,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expec
         }
         queue_binding(auth);
         lock.restore();
-        // Relation detach and sponsored storage refund are external callbacks.
+        // Relation detach and sponsored storage release are external callbacks.
         // The auth is indexed in the active operation, so the
         // unlocked drain can safely finish it without making lock_ reentrant.
         finish_bindings();

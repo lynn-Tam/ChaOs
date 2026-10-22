@@ -29,7 +29,7 @@ class Cpus;
 
 #include <mm/types.hpp>
 #include <object/ref.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 
 namespace object {
 template <typename T> struct traits;
@@ -150,23 +150,23 @@ class MemWork final {
     friend class MemLink;
     struct Data {
         MemLink* attachment{};
-        Mem* pin{};
+        Mem* lease{};
         ObjectRange range{};
-        bool terminal{};
+        bool final_release{};
         static auto empty() noexcept -> Data { return {}; }
         static bool is_empty(const Data& d) noexcept { return !d.attachment; }
     };
     struct Drop {
         void operator()(Data&) const noexcept;
     };
-    explicit MemWork(MemLink& a, Mem* pin = nullptr, ObjectRange r = {}, bool terminal = false) noexcept
-        : h_(Data{&a, pin, r, terminal}) {}
+    explicit MemWork(MemLink& a, Mem* lease = nullptr, ObjectRange r = {}, bool final_release = false) noexcept
+        : h_(Data{&a, lease, r, final_release}) {}
     libk::unique_handle<Data, Drop, Data> h_{};
 };
 
 struct MemOps final {
     void (*invalidate)(void* context, MemWork&& work) noexcept;
-    void (*released)(void* context, MemWork&& terminal) noexcept;
+    void (*released)(void* context, MemWork&& done) noexcept;
 };
 
 // Embedded in a Map and indexed non-owningly by Mem. The Map
@@ -194,7 +194,7 @@ class MemLink final : private libk::noncopyable_nonmovable {
         Releasing,
     };
 
-    void drop_work(bool terminal) noexcept;
+    void drop_work(bool final_release) noexcept;
 
     libk::intrusive_list_hook memory_hook_{};
     Mem* owner_{};
@@ -207,7 +207,7 @@ class MemLink final : private libk::noncopyable_nonmovable {
     Perms perms_{};
 };
 
-// Owns one Mem operation pin through the caller or installed PTE lifetime.
+// Owns one Mem operation lease through the caller or installed PTE lifetime.
 class PageHold final : private libk::noncopyable {
   public:
     PageHold() noexcept = default;
@@ -255,7 +255,7 @@ template<class Extra = std::monostate> class Cache {
     struct Node : Extra {
         explicit Node(usize i) noexcept : index(i) {}
         usize index;
-        resource::Charge charge;
+        resource::Usage usage;
         OwnedPage resident;
         Frame::Pins pins;
         libk::intrusive_tree_hook hook;
@@ -274,13 +274,13 @@ template<class Extra = std::monostate> class Cache {
     Cache(Cache&&) noexcept;
     ~Cache() noexcept;
     auto drain() noexcept -> bool;
-    auto prepay(const object::ref<>& payer, usize count) noexcept -> std::expected<void, MemErr> requires is_paged {
-        const auto result = rows_.prepay(payer, count);
+    auto prepay(const object::ref<>& quota, usize count) noexcept -> std::expected<void, MemErr> requires is_paged {
+        const auto result = rows_.prepay(quota, count);
         return result ? std::expected<void, MemErr>{} : std::unexpected(MemErr::ResourceExhausted);
     }
     template<class Visit> void charges(Visit&& visit) noexcept {
         sync::Lock guard{tree_lock_};
-        for (auto* node = nodes_.minimum(); node; node = nodes_.next(*node)) visit(node->charge);
+        for (auto* node = nodes_.minimum(); node; node = nodes_.next(*node)) visit(node->usage);
         rows_.charges(visit);
     }
     auto query(usize) const noexcept -> ContentState;
@@ -300,7 +300,7 @@ template<class Extra = std::monostate> class Cache {
     auto trim(ObjectRange, usize& cursor, bool& removing) noexcept -> std::expected<bool, MemErr> requires is_paged;
   private:
     auto make(const object::ref<>&, usize) noexcept -> std::expected<Row, MemErr>;
-    static auto charge_page(const object::ref<>&) noexcept -> std::expected<resource::Charge, MemErr>;
+    static auto charge_page(const object::ref<>&) noexcept -> std::expected<resource::Usage, MemErr>;
     auto writeback_locked(Node&) noexcept -> bool requires is_paged;
     Pmm* pmm_;
     Perms perms_;
@@ -320,7 +320,7 @@ class Extents {
     Extents(Extents&&) noexcept;
     ~Extents() noexcept;
     auto drain() noexcept -> bool;
-    auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&, Phys::Lease&&) noexcept
+    auto initialize(const object::ref<>&, std::span<const Extent>, PageGroup&&, Phys::Claim&&) noexcept
         -> std::expected<void, MemErr>;
     template<class Visit> void charges(Visit&& visit) noexcept { rows_.charges(visit); }
     auto managed() const noexcept -> bool { return bool(owned_); }
@@ -333,10 +333,10 @@ class Extents {
     Slab<Row, false> rows_;
     Row* head_{};
     PageGroup owned_{};
-    Phys::Lease external_;
+    Phys::Claim external_;
 };
 
-struct PhysCfg { std::span<const Extent> extents; PageGroup owned; Phys::Lease external{}; };
+struct PhysCfg { std::span<const Extent> extents; PageGroup owned; Phys::Claim external{}; };
 struct PagedCfg { object::ref<> pager; Perms perms; bool priv{}; usize credits{64}; };
 
 class Mem final : private libk::noncopyable_nonmovable {
@@ -346,7 +346,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     class Data {
         friend class Mem;
         Data(Pmm& pmm, usize pages) noexcept : pmm_(&pmm), pages_(pages) {}
-        object::ref<> payer_, pager_;
+        object::ref<> quota_, pager_;
         Pmm* pmm_;
         usize pages_;
         Perms perms_;
@@ -355,7 +355,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         Data(Data&&) noexcept = default;
         Data(const Data&) = delete;
     };
-    static auto prepare(const object::ref<>& payer, Pmm&, usize, Config) noexcept
+    static auto prepare(const object::ref<>& quota, Pmm&, usize, Config) noexcept
         -> std::expected<Data, MemErr>;
     explicit Mem(Data&&) noexcept;
     ~Mem() noexcept;
@@ -364,22 +364,22 @@ class Mem final : private libk::noncopyable_nonmovable {
         trim_events_.bind_work(work, owner, Source::Drained::bind<&Mem::post>(*this));
     }
 
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
-            if (state_ != MemState::Live || billing_ || preparing_ || trimming_ || releasing_
+            if (state_ != MemState::Live || reassigning_ || preparing_ || trimming_ || releasing_
                 || request_pins_.load(std::memory_order_acquire)) return std::unexpected(STATUS_BUSY);
-            billing_ = true;
+            reassigning_ = true;
         }
         libk::scope_exit resume{[&]() noexcept {
-            { sync::Lock guard{lock_}; billing_ = false; }
+            { sync::Lock guard{lock_}; reassigning_ = false; }
             finish_retire();
         }};
-        object::ref<> payer{to};
+        object::ref<> quota{to};
         return transaction([&](auto&& visit) {
             std::visit([&](auto& store) { store.charges(visit); }, *store_);
-        }, [&] { std::swap(payer_, payer); });
+        }, [&] { std::swap(quota_, quota); });
     }
     template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return backing_.admit(std::forward<Publish>(publish)); }
     void links(u64 cursor, LinkRecords& out) const noexcept;
@@ -408,7 +408,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto observe_usage(usize page_index, bool accessed, bool dirty) noexcept
         -> std::expected<void, MemErr>;
     [[nodiscard]] auto trim(ObjectRange, Source::Context&, cap::Graph::Admission = {},
-        std::span<const object::ref<>*> gates = {}, const cap::GrantLease* grant = nullptr) noexcept -> std::expected<void, MemErr>;
+        std::span<const object::ref<>*> gates = {}, const cap::GrantPin* grant = nullptr) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto writeback(usize page_index) noexcept -> std::expected<void, MemErr>;
     // Bounded anonymous RAM access pins storage, independent of CPU mappings;
     // seal and view permissions still exclude writes to immutable content.
@@ -468,8 +468,8 @@ class Mem final : private libk::noncopyable_nonmovable {
     void request_drop() noexcept;
     void cancel_request(Pager::Reply&) noexcept;
     void invalidated() noexcept { auto self = object::ref<>::retain_alive(job_.key()); static_cast<void>(self.destroy()); }
-    cap::Authority<1> backing_{Source::Action::bind<&Mem::invalidated>(*this), Source::Action::bind<&Mem::post>(*this)};
-    object::ref<> payer_{};
+    cap::Bindings<1> backing_{Source::Action::bind<&Mem::invalidated>(*this), Source::Action::bind<&Mem::post>(*this)};
+    object::ref<> quota_{};
     Pmm* pmm_{};
     usize logical_pages_{};
     mutable sync::Spin lock_{};
@@ -486,7 +486,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     bool advancing_{}, again_{};
     std::optional<Store> store_{};
     usize operations_{}, preparing_{}, trim_pending_{};
-    bool billing_{};
+    bool reassigning_{};
     std::atomic<usize> request_pins_{};
     MemState state_{MemState::Live};
     object::cleanup cleanup_{};

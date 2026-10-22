@@ -18,7 +18,7 @@
 #include <uapi/ipc.h>
 #include <sync.hpp>
 #include <mm/pmm.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 
 namespace mm {
 class VSpace;
@@ -86,10 +86,10 @@ public:
         Reservation(
             CSpace& owner,
             Handle handle,
-            resource::Charge&& charge) noexcept
+            resource::Usage&& usage) noexcept
             : owner_(&owner),
               handle_(handle),
-              charge_(std::move(charge)) {}
+              usage_(std::move(usage)) {}
         void reset() noexcept;
         void disarm() noexcept {
             owner_ = nullptr;
@@ -98,10 +98,10 @@ public:
 
         CSpace* owner_{};
         Handle handle_{};
-        resource::Charge charge_{};
+        resource::Usage usage_{};
     };
 
-    // Validated preparation and reserved storage; publication rechecks authority.
+    // Validated preparation and reserved storage; publication rechecks admission.
     class NewCap {
     public:
         NewCap() noexcept = default;
@@ -165,7 +165,7 @@ public:
     }
     [[nodiscard]] auto close(Handle handle) noexcept
         -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation payment = {}) noexcept
+    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation reservation = {}) noexcept
         -> std::expected<Handle, CSpaceError>;
     [[nodiscard]] auto revoke(Handle, Source::Context* = nullptr, GrantId selected = {}) noexcept -> std::expected<WaitResult, CSpaceError>;
     [[nodiscard]] auto destroy(Handle source) noexcept
@@ -181,33 +181,33 @@ public:
             return std::unexpected(copied.error());
         }
         Snapshot source = std::move(copied).value();
-        GrantLease lease = std::move(source.lease);
-        if (!std::is_void_v<T> && lease.kind() != object::kind<T>) {
+        GrantPin pin = std::move(source.pin);
+        if (!std::is_void_v<T> && pin.kind() != object::kind<T>) {
             return std::unexpected(CSpaceError::WrongKind);
         }
         if (!source.view.rights.contains(requested)) {
             return std::unexpected(CSpaceError::Denied);
         }
-        if (!lease.target_live()) return std::unexpected(CSpaceError::GrantUnavailable);
+        if (!pin.target_live()) return std::unexpected(CSpaceError::GrantUnavailable);
         return (Resolved<T>{
             *this,
-            std::move(lease),
+            std::move(pin),
             source.view, handle, source.token});
     }
 
-    template<class Transaction> auto billing(const object::ref<>&, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>&, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
-            if (!accepting_ || billing_ || growing_ || preparing_ || escrows_ || releasing_)
+            if (!accepting_ || reassigning_ || growing_ || preparing_ || escrows_ || releasing_)
                 return std::unexpected(STATUS_BUSY);
-            billing_ = true;
+            reassigning_ = true;
         }
         libk::scope_exit resume{[&]() noexcept {
-            { sync::Lock guard{lock_}; billing_ = false; }
+            { sync::Lock guard{lock_}; reassigning_ = false; }
             finish_retire();
         }};
-        return transaction([&](auto&& visit) { visit(charge_); }, [] {});
+        return transaction([&](auto&& visit) { visit(usage_); }, [] {});
     }
     auto inspect(GrantQuery, usize depth, GrantRecords&) noexcept -> status_t;
     auto observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, CSpaceError>;
@@ -277,7 +277,7 @@ private:
 
     // The slot view is validated once while acquiring its grant admission.
     struct Snapshot final {
-        GrantLease lease;
+        GrantPin pin;
         View view;
         u64 token{};
     };
@@ -288,13 +288,13 @@ private:
         -> std::expected<Snapshot, CSpaceError>;
     struct Xfer final {
         Reservation slot;
-        GrantLease lease;
+        GrantPin pin;
         GrantRef grant;
         Handle source;
         View original, view;
         XferOp op;
     };
-    [[nodiscard]] auto prepare_xfer(CSpace&, const XferSpec&, resource::Reservation payment = {}) noexcept
+    [[nodiscard]] auto prepare_xfer(CSpace&, const XferSpec&, resource::Reservation reservation = {}) noexcept
         -> std::expected<Xfer, CSpaceError>;
     [[nodiscard]] auto commit_xfers(CSpace&, std::span<Xfer>) noexcept
         -> std::expected<void, CSpaceError>;
@@ -318,12 +318,12 @@ private:
         Reservation& reservation,
         Capability&& cap) noexcept -> bool;
     [[nodiscard]] auto escrow_drop(
-        Reservation& reservation) noexcept -> resource::Charge;
+        Reservation& reservation) noexcept -> resource::Usage;
     void retain_escrow() noexcept;
     void release_escrow() noexcept;
     [[nodiscard]] auto attach_execution() noexcept -> bool;
     void detach_execution() noexcept;
-    void bind_funding(resource::Funding& funding) noexcept;
+    void bind_allocation(resource::Allocation& allocation) noexcept;
     [[nodiscard]] auto grow() noexcept -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto slot(usize index) noexcept -> Slot*;
     [[nodiscard]] auto slot(usize index) const noexcept -> const Slot*;
@@ -348,7 +348,7 @@ private:
     u64 epoch_{1};
     usize quarantined_slots_{};
     std::atomic<bool> accepting_{true};
-    bool growing_{}, billing_{};
+    bool growing_{}, reassigning_{};
     usize preparing_{};
     bool releasing_{};
     bool retired_{};
@@ -359,10 +359,10 @@ private:
     bool dirty_{}, advancing_{}, again_{};
     usize bindings_{};
     usize escrows_{};
-    resource::Funding* funding_{};
-    // All table pages and committed selectors share this immutable sponsor.
-    // Detached subcharges refund only after the corresponding storage is free.
-    resource::Charge charge_{};
+    resource::Allocation* allocation_{};
+    // All table pages and committed selectors share this immutable source.
+    // Detached usage tokens release only after the corresponding storage is free.
+    resource::Usage usage_{};
 };
 
 // Captured admissions and reserved slots; source moves are revalidated and

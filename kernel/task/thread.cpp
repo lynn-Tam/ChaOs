@@ -29,9 +29,9 @@ Thread::Thread(Env&& roots, UserStart start) noexcept
     libk_assert(env_.user_bound() && arch::prepare_user_frame(frame(), start));
 }
 
-Thread::Thread(Env&& roots, KernelStart step, sched::Domain* payer) noexcept
+Thread::Thread(Env&& roots, KernelStart step, sched::Domain* quota) noexcept
     : run_(std::in_place_type<Kernel>, std::nullopt, arch::Ctx{}, step),
-      env_(std::move(roots)), kind_(Kind::Worker), work_domain_(payer) {
+      env_(std::move(roots)), kind_(Kind::Worker), work_domain_(quota) {
     libk_assert(env_.kernel_bound() && step.entry);
 }
 
@@ -53,18 +53,18 @@ auto Thread::stack_top() const noexcept -> usize {
     return transient() ? 0 : std::get<Kernel>(run_).stack->top();
 }
 
-auto Thread::Interest::admit(const cap::GrantLease& grant, std::span<const object::ref<>*> gates,
+auto Thread::Interest::admit(const cap::GrantPin& grant, std::span<const object::ref<>*> gates,
     Source::Commit commit, Source::Action revoke, Source::Action ready) noexcept -> status_t {
-    std::optional<decltype(authority_.hold())> publishing;
+    std::optional<decltype(bindings_.hold())> publishing;
     sync::Lock guard{lock_};
-    if (active_ || !authority_.reset()) return STATUS_BUSY;
+    if (active_ || !bindings_.reset()) return STATUS_BUSY;
     // Another CPU may finish immediately after registration. Its last drain
     // callback must run after the enclosing Interest publication unlocks.
-    publishing.emplace(authority_.hold());
+    publishing.emplace(bindings_.hold());
     revoke_ = revoke; ready_ = ready;
-    const cap::GrantLease* grants[]{&grant};
+    const cap::GrantPin* grants[]{&grant};
     auto install = [&]() noexcept { active_ = true; commit(Source::Action::bind<&Interest::end>(*this)); };
-    const auto status = authority_.attach(grants, gates, Source::Action::bind(install));
+    const auto status = bindings_.attach(grants, gates, Source::Action::bind(install));
     if (status != STATUS_OK) revoke_ = ready_ = {};
     return status;
 }
@@ -77,13 +77,13 @@ void Thread::Interest::complete() noexcept {
     auto publishing = owner_.roots_.hold();
     Source::Action ready;
     { sync::Lock guard{lock_};
-      if (!active_ || !authority_.drained()) return;
+      if (!active_ || !bindings_.drained()) return;
       active_ = false; revoke_ = {}; ready = std::exchange(ready_, {});
     }
     if (ready) ready(); // Last Interest access; the fixed Wait may be reused.
 }
 
-auto Thread::await_authority(const cap::GrantLease& grant, std::span<const object::ref<>*> gates,
+auto Thread::await_grant(const cap::GrantPin& grant, std::span<const object::ref<>*> gates,
     Source::Commit commit, Source::Action revoke, Source::Action ready) noexcept -> status_t {
     return interest_.admit(grant, gates, commit, revoke, ready);
 }
@@ -128,7 +128,7 @@ void Thread::finish(status_t status) noexcept {
         sync::Lock guard{lock_};
         libk_assert(state_ == State::Exited && sc_ == nullptr);
         stopping_ = true;
-        terminal_status_ = status;
+        exit_status_ = status;
     }
     if (work_) work_->post(finalizer_);
     else finalize(); // Exclusive construction rollback without a runtime worker.
@@ -140,7 +140,7 @@ void Thread::finalize() noexcept {
         auto publishing = roots_.hold();
         static_cast<void>(roots_.close());
         env_.detach_user();
-        static_cast<void>(exit_.claim(terminal_status_));
+        static_cast<void>(exit_.claim(exit_status_));
         complete(); state_changed();
     }
     { sync::Lock guard{lock_}; if (!cleanup_) return; }
@@ -205,14 +205,14 @@ auto Thread::stop_ready() const noexcept -> bool {
     return stopping_ && !in_kernel_ && !wait_.attached();
 }
 
-auto Thread::authorize(const cap::Resolved<mm::VSpace>& space,
+auto Thread::bind_roots(const cap::Resolved<mm::VSpace>& space,
                        const cap::Resolved<cap::CSpace>& caps) noexcept
     -> std::expected<void, cap::GrantError> {
     if (state_ != State::Prepared || sc_ != nullptr || !env_.user_bound())
         return std::unexpected(cap::GrantError::InvalidState);
     auto self = object::ref<>::retain_alive(finalizer_.key());
     const object::ref<>* gates[]{&self};
-    const cap::GrantLease* grants[]{&space.lease(), &caps.lease()};
+    const cap::GrantPin* grants[]{&space.pin(), &caps.pin()};
     return roots_.attach(grants, gates) == STATUS_OK ? std::expected<void, cap::GrantError>{}
         : std::unexpected(cap::GrantError::InvalidState);
 }
@@ -243,7 +243,7 @@ void Thread::state_changed() noexcept {
 void Thread::set_state(Thread::State state) noexcept {
     sync::Lock guard{lock_};
     state_ = state;
-    if (state == State::Running && Cpu::local()) accounted_at_ = current_cpu().dispatcher().clock().rd_ticks();
+    if (state == State::Running && Cpu::local()) recorded_at_ = current_cpu().dispatcher().clock().rd_ticks();
     trace::emit(trace::Event::State, identity(), reinterpret_cast<u64>(sc_),
                 static_cast<u64>(state));
 }
@@ -258,7 +258,7 @@ auto Thread::stopped() const noexcept -> bool {
     return stopped_;
 }
 
-auto Thread::payer() noexcept -> object::ref<> {
+auto Thread::cpu_domain() noexcept -> object::ref<> {
     if (work_domain_) return object::ref<>::retain_alive(work_domain_->close_work_.key());
     object::ref<sched::Sc> context;
     { sync::Lock guard{lock_}; context = resource_; }
@@ -341,7 +341,7 @@ auto Thread::detach_resource(u64 generation) noexcept -> status_t {
 }
 auto Thread::info(u64 now) const noexcept -> ThreadInfo {
     sync::Lock guard{lock_};
-    const auto runtime = runtime_ + (state_ == State::Running && now > accounted_at_ ? now - accounted_at_ : 0);
+    const auto runtime = runtime_ + (state_ == State::Running && now > recorded_at_ ? now - recorded_at_ : 0);
     return {.version = 2, .size = sizeof(ThreadInfo), .requested = requested_, .applied = applied_,
         .runtime = runtime, .association = association_,
         .flags = (enabled_ ? THREAD_ENABLED : 0U) | (applied_enabled_ ? THREAD_APPLIED : 0U)

@@ -70,7 +70,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start,
            Kind kind = Kind::Normal) noexcept;
     Thread(Env&& roots, UserStart start) noexcept;
-    Thread(Env&& roots, KernelStart step, sched::Domain* payer = nullptr) noexcept;
+    Thread(Env&& roots, KernelStart step, sched::Domain* quota = nullptr) noexcept;
     ~Thread() noexcept;
 
     [[nodiscard]] auto state() const noexcept -> State { sync::Lock guard{lock_}; return state_; }
@@ -80,7 +80,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto idle() const noexcept -> bool { return kind_ == Kind::Idle; }
     [[nodiscard]] auto identity() const noexcept -> usize { return reinterpret_cast<usize>(this); }
     [[nodiscard]] auto ctx() noexcept -> arch::Ctx& { return std::get<Kernel>(run_).ctx; }
-    auto payer() noexcept -> object::ref<>;
+    auto cpu_domain() noexcept -> object::ref<>;
     auto transient() const noexcept -> bool { return user() || kind_ == Kind::Worker; }
     auto user() const noexcept -> bool { return std::holds_alternative<arch::TrapFrame>(run_); }
     auto frame() noexcept -> arch::TrapFrame& { return std::get<arch::TrapFrame>(run_); }
@@ -102,7 +102,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     auto info(u64 now) const noexcept -> ThreadInfo;
     auto events() noexcept -> Source& { return events_; }
     void state_changed() noexcept;
-    auto await_authority(const cap::GrantLease&, std::span<const object::ref<>*>,
+    auto await_grant(const cap::GrantPin&, std::span<const object::ref<>*>,
         Source::Commit commit, Source::Action revoke, Source::Action ready) noexcept -> status_t;
     [[nodiscard]] auto contains_stack(usize address) const noexcept -> bool {
         return !transient() && std::get<Kernel>(run_).stack->contains(address);
@@ -115,7 +115,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     }
     [[nodiscard]] auto wait() noexcept -> Wait& { return wait_; }
     [[nodiscard]] auto wait() const noexcept -> const Wait& { return wait_; }
-    [[nodiscard]] auto authorize(const cap::Resolved<mm::VSpace>& vspace,
+    [[nodiscard]] auto bind_roots(const cap::Resolved<mm::VSpace>& vspace,
                                  const cap::Resolved<cap::CSpace>& cspace) noexcept
         -> std::expected<void, cap::GrantError>;
     void note_user_syscall() noexcept { ++user_syscalls_; }
@@ -156,7 +156,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     void finalize() noexcept;
     WorkQueue* work_{};
     Work finalizer_{Work::Fn::bind<&Thread::finalize>(*this)};
-    status_t terminal_status_{};
+    status_t exit_status_{};
 
     void post_finalize() noexcept { if (work_) work_->post(finalizer_); else finalize(); }
     void sources_drained() noexcept { post_finalize(); }
@@ -170,16 +170,16 @@ class Thread final : private libk::noncopyable_nonmovable {
         mutable sync::Spin lock_;
         Source::Action revoke_, ready_;
         bool active_{};
-        cap::Authority<1, false, true> authority_{
+        cap::Bindings<1, false, true> bindings_{
             Source::Action::bind<&Interest::invalidate>(*this), Source::Action::bind<&Interest::complete>(*this)};
         void invalidate() noexcept;
         void complete() noexcept;
-        void end() noexcept { static_cast<void>(authority_.close()); }
+        void end() noexcept { static_cast<void>(bindings_.close()); }
     public:
         explicit Interest(Thread& owner) noexcept : owner_(owner) {}
         ~Interest() noexcept { libk_assert(!active_); }
-        void bind(object::Key key) noexcept { authority_.bind(key); }
-        auto admit(const cap::GrantLease&, std::span<const object::ref<>*>,
+        void bind(object::Key key) noexcept { bindings_.bind(key); }
+        auto admit(const cap::GrantPin&, std::span<const object::ref<>*>,
             Source::Commit, Source::Action, Source::Action) noexcept -> status_t;
     } interest_{*this};
 
@@ -206,16 +206,16 @@ class Thread final : private libk::noncopyable_nonmovable {
     bool enabled_{}, applied_enabled_{};
     Src<THREAD_ENABLED | THREAD_APPLIED | THREAD_MIGRATING | THREAD_BOUND | THREAD_STOPPING | THREAD_STOPPED> events_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     u64 requested_{}, applied_{};
-    u64 runtime_{}, accounted_at_{};
+    u64 runtime_{}, recorded_at_{};
     CpuId cpu_{};
     u64 association_{};
     mutable sync::Spin lock_{};
     bool stopping_{};
     bool stopped_{};
 
-    cap::Authority<2> roots_{cap::Authority<2>::Action::bind<&Thread::stop>(*this),
-        cap::Authority<2>::Action::bind<&Thread::post_finalize>(*this)};
-    std::optional<cap::Authority<2>::Hold> mail_hold_;
+    cap::Bindings<2> roots_{cap::Bindings<2>::Action::bind<&Thread::stop>(*this),
+        cap::Bindings<2>::Action::bind<&Thread::post_finalize>(*this)};
+    std::optional<cap::Bindings<2>::Hold> mail_hold_;
     object::cleanup cleanup_{};
     Exit exit_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     Kind kind_{Kind::Normal};

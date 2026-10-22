@@ -3,7 +3,7 @@
 #include <mm/mem.hpp>
 #include <object/ref.hpp>
 #include <syscall/call.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <limits>
@@ -14,7 +14,7 @@
 #include <ipc/notification.hpp>
 #include <ipc/port.hpp>
 #include <ipc/channel.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 #include <irq/irq.hpp>
 #include <mm/pager.hpp>
 #include <uapi/mem.h>
@@ -74,11 +74,11 @@ auto read_desc_bytes(
     }
     auto& source = resolved.value();
     const cap::View effective = source.view();
-    const auto* const authority = std::get_if<cap::MemLimit>(
+    const auto* const limit = std::get_if<cap::MemLimit>(
         &effective.data);
     const auto end = libk::checked_add(offset, dest.size());
-    if (authority == nullptr || !end
-        || !authority->perms.contains(mm::Perm::Read)) {
+    if (limit == nullptr || !end
+        || !limit->perms.contains(mm::Perm::Read)) {
         return std::unexpected(STATUS_DENIED);
     }
     const auto rounded = libk::checked_add(
@@ -88,7 +88,7 @@ auto read_desc_bytes(
     }
     const usize first = offset / mm::page_size;
     const usize last = *rounded / mm::page_size;
-    if (!authority->range.contains(mm::ObjectRange{
+    if (!limit->range.contains(mm::ObjectRange{
             first, last - first})) {
         return std::unexpected(STATUS_DENIED);
     }
@@ -175,19 +175,19 @@ template<typename Operation>
 
 
 // Slot storage belongs to the destination CSpace. A caller may separately
-// authorize a longer-lived payer for a derived grant's lineage node.
-static auto grant_payment(Call& inv, cap_t payer) noexcept
+// authorize a longer-lived quota for a derived grant's lineage node.
+static auto reserve_grant(Call& inv, cap_t quota) noexcept
     -> std::expected<resource::Reservation, status_t> {
-    if (!payer) return resource::Reservation{};
-    auto pool = inv.cspace.resolve<resource::Account>(handle_of(payer), cap::Rights::of(cap::Right::Create));
+    if (!quota) return resource::Reservation{};
+    auto pool = inv.cspace.resolve<resource::Quota>(handle_of(quota), cap::Rights::of(cap::Right::Create));
     if (!pool) return std::unexpected(cap_status(pool.error()));
     const auto view = pool->view();
-    const auto* quota = std::get_if<cap::Quota>(&view.data);
-    if (!quota || !quota->budget.contains(cap::Graph::node_charge()))
+    const auto* limit = std::get_if<cap::QuotaLimit>(&view.data);
+    if (!limit || !limit->budget.contains(cap::Graph::node_usage()))
         return std::unexpected(STATUS_DENIED);
     auto ref = pool->reference();
     if (!ref) return std::unexpected(STATUS_BUSY);
-    auto fee = pool->object().reserve(std::move(*ref), cap::Graph::node_charge());
+    auto fee = pool->object().reserve(std::move(*ref), cap::Graph::node_usage());
     if (!fee) return std::unexpected(fee.error() == resource::errc::exhausted
                                     ? STATUS_NO_MEMORY : STATUS_BUSY);
     return std::move(*fee);
@@ -244,7 +244,7 @@ auto cap_call(Call& inv) noexcept -> Result {
         if (!decoded) {
             return returned(STATUS_BAD_ARGS);
         }
-        auto fee = grant_payment(inv, trap.arg(4));
+        auto fee = reserve_grant(inv, trap.arg(4));
         if (!fee) return returned(fee.error());
         if (!target) {
             auto delegated = cspace.transfer(source, cspace, cap::XferOp::Derive, decoded.value(), std::move(*fee));
@@ -270,7 +270,7 @@ auto cap_call(Call& inv) noexcept -> Result {
             return returned(STATUS_BAD_ARGS);
         }
         auto fee = [&]() -> std::expected<resource::Reservation, status_t> {
-            if constexpr (op == SYS_CAP_DELEGATE) return grant_payment(inv, trap.arg(3));
+            if constexpr (op == SYS_CAP_DELEGATE) return reserve_grant(inv, trap.arg(3));
             else return resource::Reservation{};
         }();
         if (!fee) return returned(fee.error());
@@ -370,7 +370,7 @@ template<usize op>
     if (!access) return returned(STATUS_RETRY);
     const auto bytes = access->bytes<write ? mm::Perm::Read : mm::Perm::Write>(aperture, size);
     if (bytes.empty()) return returned(STATUS_BAD_ARGS);
-    // Both page leases survive this one bounded, alias-safe copy. No stack
+    // Both page pins survive this one bounded, alias-safe copy. No stack
     // snapshot or revocable userspace mapping is needed in either direction.
     const auto result = [&] {
         if constexpr (write) return memory.value()->write(offset, bytes);
@@ -404,9 +404,9 @@ template<usize op>
     const auto result = [&]() {
         if constexpr (op == SYS_MEM_TRIM) {
             Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
-            std::array<const cap::GrantLease*, 1> grants{&memory->lease()};
+            std::array<const cap::GrantPin*, 1> grants{&memory->pin()};
             std::array<const object::ref<>*, 1> gates{&*ref};
-            return mem.trim(range, context, inv.cpu.grants.admission(grants), gates, &memory->lease());
+            return mem.trim(range, context, inv.cpu.grants.admission(grants), gates, &memory->pin());
         }
         else if constexpr (op == SYS_MEM_WRITEBACK) return mem.writeback(page);
         else {
@@ -543,7 +543,8 @@ template<usize op>
         return write(page);
     }
     if (facet == SCOPE_USAGE) {
-        if (auto account = target.as<resource::Account>()) return write(account->get().info(0));
+        if (auto thread = target.as<Thread>()) return write(thread->get().info(inv.cpu.dispatcher().clock().rd_ticks()));
+        if (auto quota = target.as<resource::Quota>()) return write(quota->get().info(0));
         if (auto domain = target.as<sched::Domain>()) return write(domain->get().info(0));
         return returned(STATUS_INVALID_OP);
     }
@@ -588,10 +589,10 @@ template<usize op>
     const auto* b = std::get_if<cap::ScopeLimit>(&destination_view.data);
     if (!a || !b || !(a->kinds & b->kinds & OBJ_BIT(object->kind()))) return returned(STATUS_DENIED);
     if (!whole(*object, target->view())) return returned(STATUS_DENIED);
-    std::array<const cap::GrantLease*, 3> grants{&target->lease(), &source->lease(), &destination->lease()};
-    auto authority = target->lease().graph().admission(std::span{grants});
+    std::array<const cap::GrantPin*, 3> grants{&target->pin(), &source->pin(), &destination->pin()};
+    auto admission = target->pin().graph().admission(std::span{grants});
     auto result = object::Scope::adopt(*object, std::move(*from).as<object::Scope>().value(),
-        std::move(*to).as<object::Scope>().value(), inv.trap.arg(3), authority);
+        std::move(*to).as<object::Scope>().value(), inv.trap.arg(3), admission);
     if (result) return returned(STATUS_OK, *result);
     return returned(result.error());
 }
@@ -605,7 +606,7 @@ template<usize op>
         return returned(STATUS_DENIED);
     auto object = target->reference();
     if (!object) return returned(STATUS_BUSY);
-    const ObjectInfo info{1, sizeof(ObjectInfo), object->id().value, object->funding()->epoch(),
+    const ObjectInfo info{1, sizeof(ObjectInfo), object->id().value, object->allocation()->epoch(),
         static_cast<u32>(object->kind()), object->live() ? OBJECT_OPEN : OBJECT_CLOSING};
     auto* buffer = inv.target->ipc_buffer();
     if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&info), sizeof(info)}))
@@ -614,25 +615,25 @@ template<usize op>
 }
 
 template<usize op>
-[[nodiscard]] auto object_rebill(Call& inv) noexcept -> Result {
+[[nodiscard]] auto object_reassign(Call& inv) noexcept -> Result {
     const bool adopt = inv.trap.arg(4) || inv.trap.arg(5) || inv.trap.arg(6);
     if (adopt && (!inv.trap.arg(4) || !inv.trap.arg(5) || !inv.trap.arg(6))) return returned(STATUS_BAD_ARGS);
-    const auto rights = adopt ? cap::Rights::of(cap::Right::Rebill, cap::Right::Adopt) : cap::Rights::of(cap::Right::Rebill);
+    const auto rights = adopt ? cap::Rights::of(cap::Right::Reassign, cap::Right::Adopt) : cap::Rights::of(cap::Right::Reassign);
     auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), rights);
-    auto old = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Rebill));
-    auto next = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Create));
+    auto old = inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Reassign));
+    auto next = inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Create));
     if (!target) return returned(cap_status(target.error()));
     if (!old) return returned(cap_status(old.error()));
     if (!next) return returned(cap_status(next.error()));
     auto object = target->reference(), from = old->reference(), to = next->reference();
     if (!object || !from || !to) return returned(STATUS_BUSY);
     const auto next_view = next->view();
-    const auto* limit = std::get_if<cap::Quota>(&next_view.data);
+    const auto* limit = std::get_if<cap::QuotaLimit>(&next_view.data);
     if (!limit || !(limit->object_kinds & OBJ_BIT(object->kind()))) return returned(STATUS_DENIED);
     if (!whole(*object, target->view())) return returned(STATUS_DENIED);
     std::optional<cap::Resolved<object::Scope>> source, destination;
     object::ref<object::Scope> source_owner, destination_owner;
-    std::array<const cap::GrantLease*, 5> grants{&target->lease(), &old->lease(), &next->lease(), nullptr, nullptr};
+    std::array<const cap::GrantPin*, 5> grants{&target->pin(), &old->pin(), &next->pin(), nullptr, nullptr};
     if (adopt) {
         auto from_scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(4)), cap::Rights::of(cap::Right::Manage));
         auto to_scope = inv.cspace.resolve<object::Scope>(handle_of(inv.trap.arg(5)), cap::Rights::of(cap::Right::Create));
@@ -646,66 +647,66 @@ template<usize op>
         source_owner = std::move(*source_ref).as<object::Scope>().value();
         destination_owner = std::move(*destination_ref).as<object::Scope>().value();
         source.emplace(std::move(*from_scope)); destination.emplace(std::move(*to_scope));
-        grants[3] = &source->lease(); grants[4] = &destination->lease();
+        grants[3] = &source->pin(); grants[4] = &destination->pin();
     }
-    object::Transfer authority{*object, std::move(source_owner), std::move(destination_owner), inv.trap.arg(6),
-        target->lease().graph().admission(std::span{grants.data(), adopt ? usize{5} : usize{3}})};
-    const auto valid = authority.validate();
+    object::Transfer admission{*object, std::move(source_owner), std::move(destination_owner), inv.trap.arg(6),
+        target->pin().graph().admission(std::span{grants.data(), adopt ? usize{5} : usize{3}})};
+    const auto valid = admission.validate();
     if (valid != STATUS_OK) return returned(valid);
     auto result = object::Types::visit(object->kind(), [&]<class T>() -> std::expected<u64, status_t> {
         auto typed = object->as<T>();
         libk_assert(typed);
-        auto& funding = *object->funding();
+        auto& allocation = *object->allocation();
         auto transaction = [&](auto&& visit, auto&& commit) {
-            return object::rebill(inv.cpu.objects.pmm(), funding, *object, *from, *to,
-                inv.trap.arg(3), limit->budget, visit, commit, authority);
+            return object::reassign(inv.cpu.objects.pmm(), allocation, *object, *from, *to,
+                inv.trap.arg(3), limit->budget, visit, commit, admission);
         };
-        if constexpr (requires { typed->get().billing(*to, transaction); })
-            return typed->get().billing(*to, transaction);
-        else if constexpr (requires { T::fixed_bill; }) {
-            static_assert(T::fixed_bill);
-            return object::rebill(inv.cpu.objects.pmm(), funding, *object, *from, *to,
-                inv.trap.arg(3), limit->budget, [](auto&&) {}, [] {}, authority);
+        if constexpr (requires { typed->get().reassign_usage(*to, transaction); })
+            return typed->get().reassign_usage(*to, transaction);
+        else if constexpr (requires { T::fixed_usage; }) {
+            static_assert(T::fixed_usage);
+            return object::reassign(inv.cpu.objects.pmm(), allocation, *object, *from, *to,
+                inv.trap.arg(3), limit->budget, [](auto&&) {}, [] {}, admission);
         } else return std::unexpected(STATUS_INVALID_OP);
     }, std::expected<u64, status_t>{std::unexpected(STATUS_INVALID_OP)});
-    return result ? returned(STATUS_OK, *result, authority.epoch()) : returned(result.error());
+    return result ? returned(STATUS_OK, *result, admission.epoch()) : returned(result.error());
 }
 
 template<usize op>
-[[nodiscard]] auto account_resize(Call& inv) noexcept -> Result {
-    auto account = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
-    if (!account) return returned(cap_status(account.error()));
-    const auto view = account->view();
-    const auto& limit = std::get<cap::Quota>(view.data);
-    const resource::budget target{inv.trap.arg(1), inv.trap.arg(2)};
+[[nodiscard]] auto quota_resize(Call& inv) noexcept -> Result {
+    auto quota = inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    if (!quota) return returned(cap_status(quota.error()));
+    const auto view = quota->view();
+    const auto& limit = std::get<cap::QuotaLimit>(view.data);
+    const resource::Budget target{inv.trap.arg(1), inv.trap.arg(2)};
     if (!limit.budget.contains(target)) return returned(STATUS_DENIED);
-    auto self = account->reference();
+    auto self = quota->reference();
     if (!self) return returned(STATUS_BUSY);
-    std::optional<cap::Resolved<resource::Account>> sponsor;
-    object::ref<> payer;
-    resource::budget ceiling;
-    std::array<const cap::GrantLease*, 2> grants{&account->lease(), nullptr};
+    std::optional<cap::Resolved<resource::Quota>> source;
+    object::ref<> source_ref;
+    resource::Budget ceiling;
+    std::array<const cap::GrantPin*, 2> grants{&quota->pin(), nullptr};
     if (inv.trap.arg(3)) {
-        auto resolved = inv.cspace.resolve<resource::Account>(handle_of(inv.trap.arg(3)), cap::Rights::of(cap::Right::Split));
+        auto resolved = inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(3)), cap::Rights::of(cap::Right::Split));
         if (!resolved) return returned(cap_status(resolved.error()));
         auto ref = resolved->reference();
         if (!ref) return returned(STATUS_BUSY);
-        payer = std::move(*ref);
-        ceiling = std::get<cap::Quota>(resolved->view().data).budget;
-        sponsor.emplace(std::move(*resolved));
-        grants[1] = &sponsor->lease();
+        source_ref = std::move(*ref);
+        ceiling = std::get<cap::QuotaLimit>(resolved->view().data).budget;
+        source.emplace(std::move(*resolved));
+        grants[1] = &source->pin();
     }
-    auto authority = inv.cpu.grants.admission(std::span{grants.data(), sponsor ? 2u : 1u});
-    return returned(account->object().resize(*self, target, payer, ceiling,
-        [&](auto gates, auto&& commit) { return authority.publish(gates, commit); }));
+    auto admission = inv.cpu.grants.admission(std::span{grants.data(), source ? 2u : 1u});
+    return returned(quota->object().resize(*self, target, source_ref, ceiling,
+        [&](auto gates, auto&& commit) { return admission.publish(gates, commit); }));
 }
 
 template<usize op>
-[[nodiscard]] auto account_close(Call& inv) noexcept -> Result {
-    auto account = inv.cspace.resolve<resource::Account>(
+[[nodiscard]] auto quota_close(Call& inv) noexcept -> Result {
+    auto quota = inv.cspace.resolve<resource::Quota>(
         handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
-    if (!account) return returned(cap_status(account.error()));
-    const auto phase = account->object().close();
+    if (!quota) return returned(cap_status(quota.error()));
+    const auto phase = quota->object().close();
     return returned(STATUS_OK, static_cast<u32>(phase));
 }
 
@@ -774,9 +775,9 @@ static auto pg_claim(Call& inv) noexcept -> Result {
     }
     auto storage = resolved->reference();
     if (!storage) return returned(STATUS_CLOSED);
-    const cap::GrantLease* grants[]{&resolved->lease()};
+    const cap::GrantPin* grants[]{&resolved->pin()};
     const object::ref<>* gates[]{&*storage};
-    const auto request = resolved.value()->claim(resolved->lease().graph().admission(grants), gates);
+    const auto request = resolved.value()->claim(resolved->pin().graph().admission(grants), gates);
     if (!request) {
         return returned(pager_error(request.error()));
     }
@@ -801,9 +802,9 @@ static auto pg_finish(Call& inv) noexcept -> Result {
     if constexpr (op == SYS_PAGER_REQUEUE) {
         auto storage = pager->reference();
         if (!storage) return returned(STATUS_CLOSED);
-        const cap::GrantLease* grants[]{&pager->lease()};
+        const cap::GrantPin* grants[]{&pager->pin()};
         const object::ref<>* gates[]{&*storage};
-        const auto result = pager.value()->requeue(inv.trap.arg(1), pager->lease().graph().admission(grants), gates);
+        const auto result = pager.value()->requeue(inv.trap.arg(1), pager->pin().graph().admission(grants), gates);
         return result ? returned(STATUS_OK) : returned(pager_error(result.error()));
     }
     auto memory = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)),
@@ -812,10 +813,10 @@ static auto pg_finish(Call& inv) noexcept -> Result {
     auto pager_ref = pager->reference();
     auto memory_ref = memory->reference();
     if (!pager_ref || !memory_ref) return returned(STATUS_CLOSED);
-    const cap::GrantLease* grants[]{&pager->lease(), &memory->lease()};
+    const cap::GrantPin* grants[]{&pager->pin(), &memory->pin()};
     const object::ref<>* gates[]{&*pager_ref, &*memory_ref};
     const auto result = memory.value()->pager_finish(pager.value().object(), inv.trap.arg(2),
-        op == SYS_PAGER_FAIL, pager->lease().graph().admission(grants), gates);
+        op == SYS_PAGER_FAIL, pager->pin().graph().admission(grants), gates);
     return result ? returned(STATUS_OK) : returned(mem_status(result.error()));
 }
 
@@ -836,10 +837,10 @@ static auto pg_supply(Call& inv) noexcept -> Result {
     auto target_ref = target->reference();
     auto source_ref = source->reference();
     if (!pager_ref || !target_ref || !source_ref) return returned(STATUS_CLOSED);
-    const cap::GrantLease* grants[]{&pager->lease(), &target->lease(), &source->lease()};
+    const cap::GrantPin* grants[]{&pager->pin(), &target->pin(), &source->pin()};
     const object::ref<>* gates[]{&*pager_ref, &*target_ref, &*source_ref};
     auto supplied = target.value()->supply(pager.value().object(), std::move(*transfer),
-        inv.trap.arg(4), pager->lease().graph().admission(grants), gates);
+        inv.trap.arg(4), pager->pin().graph().admission(grants), gates);
     return supplied ? returned(STATUS_OK)
                     : returned(mem_status(supplied.error()));
 }
@@ -925,9 +926,9 @@ template<usize op> auto op_call(Call& inv) noexcept -> Result {
     auto target = inv.cspace.resolve<void>(handle_of(inv.trap.arg(0)), cap::Rights::of(
         op == SYS_OP_QUERY ? cap::Right::Inspect : cap::Right::Control));
     if (!target) return returned(cap_status(target.error()));
-    return object::Types::visit(target->lease().kind(), [&]<class T>() noexcept -> Result {
+    return object::Types::visit(target->pin().kind(), [&]<class T>() noexcept -> Result {
         if constexpr (requires(T& value) { value.op(); }) {
-            auto& value = *static_cast<T*>(target->lease().get());
+            auto& value = *static_cast<T*>(target->pin().get());
             if constexpr (op == SYS_OP_CANCEL) return returned(value.op().cancel());
             else { const auto r = value.op().query(); return returned(r.status, r.value, r.sequence); }
         } else return returned(STATUS_INVALID_OP);
@@ -986,7 +987,7 @@ auto vm_call(Call& inv) noexcept -> Result {
     if (!reference) return returned(STATUS_BUSY);
     auto hold = std::move(*reference).as<sched::Sc>();
     if (!hold) return returned(STATUS_BUSY);
-    auto bound = ctx->bind_authorized(std::move(*hold), target.object(), ctx, target);
+    auto bound = ctx->bind(std::move(*hold), target.object(), ctx, target);
     return returned(bound ? STATUS_OK : STATUS_BUSY, bound ? ctx->generation() : 0);
 }
 
@@ -1075,7 +1076,7 @@ template<usize op>
     if constexpr (op == SYS_DOMAIN_INFO) return inspect.template operator()<sched::Domain>();
     if constexpr (op == SYS_SC_INFO) return inspect.template operator()<sched::Sc>();
     if constexpr (op == SYS_SCOPE_INFO) return inspect.template operator()<object::Scope>();
-    if constexpr (op == SYS_ACCOUNT_INFO) return inspect.template operator()<resource::Account>();
+    if constexpr (op == SYS_QUOTA_INFO) return inspect.template operator()<resource::Quota>();
     if constexpr (op == SYS_VSPACE_INFO) return inspect.template operator()<mm::VSpace>();
     return returned(STATUS_INVALID_OP);
 }

@@ -23,7 +23,7 @@ static blk_flush flush;
 
 static auto open(ubus_request& request, ubus_msg& response) -> status_t {
     const auto budget = request.capability(request.data["budget"]);
-    auto storage = vm_new<blk_client>({budget ? budget : rt_startup().pool, rt_startup().scope});
+    auto storage = vm_new<blk_client>({budget ? budget : rt_startup().quota, rt_startup().scope});
     if (!storage) return storage.error();
     auto client = std::move(*storage);
     auto& object = client->object;

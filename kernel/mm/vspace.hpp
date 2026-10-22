@@ -26,7 +26,7 @@
 #include <utility>
 #include <variant>
 
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 
 class Env;
 
@@ -176,9 +176,9 @@ class MapPage final : private libk::noncopyable_nonmovable {
         : address_(address), object_page_(object_page),
           storage_(std::in_place_type<PageHold>, std::move(source)) {}
 
-    MapPage(va_t address, usize object_page, OwnedPage&& page, resource::Charge&& charge) noexcept
+    MapPage(va_t address, usize object_page, OwnedPage&& page, resource::Usage&& usage) noexcept
         : address_(address), object_page_(object_page),
-          storage_(std::in_place_type<Private>, std::move(charge), std::move(page)) {}
+          storage_(std::in_place_type<Private>, std::move(usage), std::move(page)) {}
 
     ~MapPage() noexcept;
 
@@ -202,14 +202,14 @@ class MapPage final : private libk::noncopyable_nonmovable {
     friend class Backing;
 
     // An installed PTE retains its actual PageHold until TLB drain.
-    // A private COW page owns its frame and charge.
+    // A private COW page owns its frame and usage.
     struct Private {
-        resource::Charge charge;
+        resource::Usage usage;
         OwnedPage page;
     };
 
-    auto take_charge() noexcept -> resource::Charge {
-        if (auto* p = std::get_if<Private>(&storage_)) return std::move(p->charge);
+    auto take_charge() noexcept -> resource::Usage {
+        if (auto* p = std::get_if<Private>(&storage_)) return std::move(p->usage);
         return {};
     }
 
@@ -368,7 +368,7 @@ class VmOp final : private libk::noncopyable_nonmovable {
     friend class VSpace;
     using Retired = libk::intrusive_list<Backing, &Backing::retired_hook_>;
 public:
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     VmOp(Pmm&, VSpace&) noexcept;
     explicit VmOp(object::ref<>) noexcept;
     ~VmOp() noexcept;
@@ -386,7 +386,7 @@ private:
     Map* maps_{};
     MapPage* pages_{};
     Retired retired_;
-    resource::Charge refund_;
+    resource::Usage release_;
     bool released_{}, flushed_{};
     std::optional<VSpaceError> error_;
     struct Edit {
@@ -408,28 +408,28 @@ class VSpace final : private libk::noncopyable_nonmovable {
   public:
     class Data {
         friend class VSpace;
-        Data(Pmm& pmm, KSpace& kernel, WorkQueue& work, object::ref<> payer, resource::Charge&& charge,
+        Data(Pmm& pmm, KSpace& kernel, WorkQueue& work, object::ref<> quota, resource::Usage&& usage,
              PageTable&& root) noexcept
-            : pmm_(&pmm), kernel_(&kernel), work_(&work), payer_(std::move(payer)),
-              charge_(std::move(charge)), root_(std::move(root)) {}
+            : pmm_(&pmm), kernel_(&kernel), work_(&work), quota_(std::move(quota)),
+              usage_(std::move(usage)), root_(std::move(root)) {}
         Pmm* pmm_;
         KSpace* kernel_;
         WorkQueue* work_;
-        object::ref<> payer_;
-        resource::Charge charge_;
+        object::ref<> quota_;
+        resource::Usage usage_;
         PageTable root_;
 
       public:
         Data(Data&&) noexcept = default;
         Data(const Data&) = delete;
     };
-    static auto prepare(const object::ref<>& payer, Pmm&, KSpace&, WorkQueue&) noexcept
+    static auto prepare(const object::ref<>& quota, Pmm&, KSpace&, WorkQueue&) noexcept
         -> std::expected<Data, VSpaceError>;
     explicit VSpace(Data&&) noexcept;
     ~VSpace() noexcept;
     void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); settled_.bind_work(work, owner); }
 
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
@@ -440,14 +440,14 @@ class VSpace final : private libk::noncopyable_nonmovable {
             { sync::Lock guard{lock_}; editing_ = false; }
             work_->post(job_);
         }};
-        object::ref<> payer{to};
+        object::ref<> quota{to};
         return transaction([&](auto&& visit) {
             visit(table_charge_);
             pages_.each([&](MapPage& page) {
-                if (auto* owned = std::get_if<MapPage::Private>(&page.storage_)) visit(owned->charge);
+                if (auto* owned = std::get_if<MapPage::Private>(&page.storage_)) visit(owned->usage);
             });
             mappings_.charges(visit); binding_pool_.charges(visit); pages_.charges(visit); views_.charges(visit);
-        }, [&] { std::swap(payer_, payer); });
+        }, [&] { std::swap(quota_, quota); });
     }
     [[nodiscard]] auto state() const noexcept -> VSpaceState;
     auto info(u64) const noexcept -> VSpaceInfo;
@@ -502,16 +502,16 @@ class VSpace final : private libk::noncopyable_nonmovable {
     friend class Borrow;
     friend struct object::traits<VSpace>;
 
-    // Transaction-local table capacity.  charge is declared before pages so
+    // Transaction-local table capacity.  usage is declared before pages so
     // physical ownership is released first during reverse destruction.
     struct TableReserve final {
-        TableReserve(resource::Charge&& table_charge, PageGroup&& table_pages) noexcept
-            : charge(std::move(table_charge)), pages(std::move(table_pages)) {}
+        TableReserve(resource::Usage&& table_charge, PageGroup&& table_pages) noexcept
+            : usage(std::move(table_charge)), pages(std::move(table_pages)) {}
 
         TableReserve(TableReserve&&) noexcept = default;
         auto operator=(TableReserve&&) noexcept -> TableReserve& = default;
 
-        resource::Charge charge{};
+        resource::Usage usage{};
         PageGroup pages{};
     };
 
@@ -541,7 +541,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     void queue_binding(Backing& auth) noexcept;
     void destroy_layout(Map& node) noexcept;
     void detach_mapping(Map& mapping) noexcept;
-    void release_page(MapPage& page, resource::Charge& refund) noexcept;
+    void release_page(MapPage& page, resource::Usage& release) noexcept;
     void finish_bindings() noexcept;
     auto pending_locked() const noexcept -> bool;
     void settle() noexcept;
@@ -584,7 +584,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     mutable sync::Spin lock_{};
     libk::manual_lifetime<mm::PageTable> root_{};
     Tlb tlb_{};
-    object::ref<> payer_{};
+    object::ref<> quota_{};
     Slab<Map> mappings_;
     Slab<Backing> binding_pool_;
     Slab<MapPage> pages_;
@@ -597,7 +597,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     void link(Map&) noexcept;
     void unlink(Map&) noexcept;
     InvalidationList invalidations_{};
-    bool draining_{}; // One stack owns external relation detach/refund callbacks.
+    bool draining_{}; // One stack owns external relation detach/release callbacks.
     libk::manual_lifetime<VmOp> control_;
     VmOp* active_{};
     Borrow* waiting_view_{};
@@ -609,7 +609,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     VSpaceState state_{VSpaceState::Live};
     usize bindings_{};
     usize ipi_retries_{};
-    resource::Charge table_charge_{};
+    resource::Usage table_charge_{};
 };
 
 } // namespace mm

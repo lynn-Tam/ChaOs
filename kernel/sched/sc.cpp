@@ -44,7 +44,7 @@ auto Budget::reserve(u64 now, u64 limit) noexcept -> Loan {
     balance_ -= static_cast<__int128>(amount); escrow_ += amount;
     return {amount, generation_};
 }
-void Budget::account(u64 now, u64 elapsed) noexcept {
+void Budget::record(u64 now, u64 elapsed) noexcept {
     libk_assert(lock_.held());
     mature(now);
     if (!amount_ || !elapsed) return;
@@ -70,11 +70,11 @@ void Budget::settle(Loan loan, u64 now, u64 elapsed) noexcept {
     sync::Lock guard{lock_};
     libk_assert(loan.generation == generation_ && loan.amount <= escrow_);
     balance_ += static_cast<__int128>(loan.amount); escrow_ -= loan.amount;
-    account(now, elapsed);
+    record(now, elapsed);
 }
 auto Budget::consume(u64 now, u64 elapsed) noexcept -> u64 {
     sync::Lock guard{lock_};
-    account(now, elapsed);
+    record(now, elapsed);
     return balance_ < 0 ? static_cast<u64>(-balance_) : 0;
 }
 auto Budget::configure(u64 amount, u64 period, usize capacity, u64 now) noexcept -> bool {
@@ -125,7 +125,7 @@ Domain::Domain(mm::Pmm& pmm, Cpus& cpus, Config config) noexcept
     libk_assert(count_ && valid_config(config_));
 }
 Domain::~Domain() noexcept {
-    libk_assert(!contexts_ && !ops_ && !children_ && !parent_ && !next_parent_ && !pending_children_ && parent_auth_[0].drained() && parent_auth_[1].drained() && !pending_mail_ && !cleanup_);
+    libk_assert(!contexts_ && !ops_ && !children_ && !parent_ && !next_parent_ && !pending_children_ && parent_binding_[0].drained() && parent_binding_[1].drained() && !pending_mail_ && !cleanup_);
     if (work_) work_->close(close_work_);
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu]) {
         libk_assert(!nodes_[cpu]->active && nodes_[cpu]->node.ready.empty() && !nodes_[cpu]->node.hook.is_linked());
@@ -134,7 +134,7 @@ Domain::~Domain() noexcept {
 }
 auto Domain::open() noexcept -> status_t {
     static_assert(MaxCpus * sizeof(Local*) <= mm::page_size);
-    auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+    auto fee = resource::acquire(quota_, {.memory = mm::page_size});
     if (!fee) return STATUS_NO_MEMORY;
     auto page = pmm_.allocate_page();
     if (!page) return STATUS_NO_MEMORY;
@@ -143,7 +143,7 @@ auto Domain::open() noexcept -> status_t {
     std::ranges::fill(nodes_, nullptr);
     ordinary_.bind(WorkQueue::Wake::bind<&Domain::wake_work>(*this));
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) {
-        auto made = locals_.create(payer_, *this, CpuId{cpu});
+        auto made = locals_.create(quota_, *this, CpuId{cpu});
         if (!made) return STATUS_NO_MEMORY;
         nodes_[cpu] = *made;
         libk_assert(nodes_[cpu]->worker.claim_home(cpus_.get(CpuId{cpu})->dispatcher()));
@@ -167,21 +167,21 @@ auto Domain::post(Work& work) noexcept -> status_t {
     auto ticket = object::ref<>::retain_alive(work.key());
     std::optional<CpuId> wake;
     { sync::Lock guard{tree_lock_};
-      if (!authorized()) return STATUS_CLOSED;
+      if (!lineage_admitting()) return STATUS_CLOSED;
       wake = ordinary_.enqueue(work, std::move(ticket));
     }
     ordinary_.wake(wake); return STATUS_OK;
 }
-auto Domain::attach(cap::Resolved<Domain>& authority) noexcept -> status_t {
-    auto parent = authority.reference();
+auto Domain::attach(cap::Resolved<Domain>& parent_cap) noexcept -> status_t {
+    auto parent = parent_cap.reference();
     if (!parent) return STATUS_CLOSED;
-    const auto& grant = authority.lease();
+    const auto& grant = parent_cap.pin();
     return attach(std::move(*parent).as<Domain>().value(), &grant);
 }
-auto Domain::attach(object::ref<Domain> parent, const cap::GrantLease* grant) noexcept -> status_t {
+auto Domain::attach(object::ref<Domain> parent, const cap::GrantPin* grant) noexcept -> status_t {
     auto self = object::ref<>::retain_alive(close_work_.key());
     sync::Lock guard{tree_lock_};
-    if (!parent || parent_ || !parent->ancestors_open() || phase_ != DOMAIN_OPEN
+    if (!parent || parent_ || !parent->lineage_open() || phase_ != DOMAIN_OPEN
         || parent->depth() >= max_depth || (config_.cpus & ~parent->config_.cpus)) return STATUS_BAD_ARGS;
     const object::ref<> target{parent};
     const object::ref<>* gates[]{&self, &target};
@@ -192,8 +192,8 @@ auto Domain::attach(object::ref<Domain> parent, const cap::GrantLease* grant) no
         for (usize cpu = 0; cpu < nodes_.size(); ++cpu) nodes_[cpu]->node.parent = &parent_->local(CpuId{cpu}).node;
     };
     if (grant) {
-        const cap::GrantLease* grants[]{grant};
-        return parent_auth_[parent_slot_].attach(grants, gates, cap::Authority<1>::Action::bind(commit));
+        const cap::GrantPin* grants[]{grant};
+        return parent_binding_[parent_slot_].attach(grants, gates, cap::Bindings<1>::Action::bind(commit));
     }
     return object::ref<>::publish(gates, commit) ? STATUS_OK : STATUS_CLOSED;
 }
@@ -203,13 +203,13 @@ auto Domain::depth() const noexcept -> usize {
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr) ++result;
     return result;
 }
-auto Domain::ancestors_open() const noexcept -> bool {
+auto Domain::lineage_open() const noexcept -> bool {
     libk_assert(tree_lock_.held());
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr)
         if (!node->accepting()) return false;
     return true;
 }
-auto Domain::authorized() const noexcept -> bool {
+auto Domain::lineage_admitting() const noexcept -> bool {
     libk_assert(tree_lock_.held());
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr)
         if (node->phase_ == DOMAIN_CLOSING || node->phase_ == DOMAIN_DRAINED
@@ -224,9 +224,9 @@ void Domain::unstage() noexcept {
     if (pending_next_) pending_next_->pending_prev_ = pending_prev_;
     pending_prev_ = pending_next_ = nullptr;
 }
-auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& authority) noexcept
+auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& parent_cap) noexcept
     -> std::expected<u64, status_t> {
-    auto target = authority.reference();
+    auto target = parent_cap.reference();
     auto storage = self.reference();
     auto scan = object::ref<Domain>::retain_alive(close_work_.key());
     if (!target || !storage) return std::unexpected(STATUS_CLOSED);
@@ -234,16 +234,16 @@ auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& 
     Source::Publication publication;
     u64 sequence;
     { sync::Lock guard{tree_lock_};
-      if (!parent_ || !ancestors_open() || pending_mail_ || !parent->ancestors_open())
+      if (!parent_ || !lineage_open() || pending_mail_ || !parent->lineage_open())
           return std::unexpected(STATUS_BUSY);
       if (&parent.get() == &parent_.get()) return requested_;
       if (config_.cpus & ~parent->config_.cpus) return std::unexpected(STATUS_BAD_ARGS);
       for (auto* node = &parent.get(); node; node = node->parent_ ? &node->parent_.get() : nullptr)
           if (node == this) return std::unexpected(STATUS_BAD_ARGS);
       if (requested_ == std::numeric_limits<u64>::max()) return std::unexpected(STATUS_EXHAUSTED);
-      auto& member = parent_auth_[1 - parent_slot_];
+      auto& member = parent_binding_[1 - parent_slot_];
       if (!member.reset()) return std::unexpected(STATUS_BUSY);
-      const cap::GrantLease* grants[]{&self.lease(), &authority.lease()};
+      const cap::GrantPin* grants[]{&self.pin(), &parent_cap.pin()};
       const object::ref<> destination{parent};
       const object::ref<>* gates[]{&*storage, &destination};
       auto commit = [&]() noexcept {
@@ -257,10 +257,10 @@ auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& 
           phase_.store(DOMAIN_CONFIGURING, std::memory_order_release);
       };
       const auto status = member.admit([&](auto cells, auto install) noexcept {
-          const cap::Graph::Attach item{&authority.lease(), cells[0]};
-          return self.lease().graph().admission(grants).attach(std::span{&item, 1}, gates, install)
+          const cap::Graph::Attach item{&parent_cap.pin(), cells[0]};
+          return self.pin().graph().admission(grants).attach(std::span{&item, 1}, gates, install)
               ? STATUS_OK : STATUS_CLOSED;
-      }, ParentAuth::Action::bind(commit));
+      }, ParentBinding::Action::bind(commit));
       if (status != STATUS_OK) return std::unexpected(status);
       publication = events_.prepare(DOMAIN_CONFIGURING, true);
     }
@@ -304,14 +304,14 @@ auto Domain::finish_move() noexcept -> bool {
     }
     bool failed;
     { sync::Lock guard{tree_lock_}; failed = config_status_ != STATUS_PENDING; }
-    if (!parent_auth_[failed ? 1 - parent_slot_ : parent_slot_].close()) return true;
+    if (!parent_binding_[failed ? 1 - parent_slot_ : parent_slot_].close()) return true;
     Source::Publication publication;
     object::ref<Domain> old;
     bool changed{};
     { sync::Lock guard{tree_lock_};
       if (phase_ != DOMAIN_CONFIGURING) return true;
       if (!failed && scan_version_ != tree_version_) { post_close(); return true; }
-      if (!next_parent_->ancestors_open() || parent_auth_[1 - parent_slot_].revoked()) {
+      if (!next_parent_->lineage_open() || parent_binding_[1 - parent_slot_].revoked()) {
           // Old membership may already have drained. Do not reopen an
           // execution domain without a valid parent authorization.
           guard.restore(); static_cast<void>(close()); return true;
@@ -365,17 +365,17 @@ auto Domain::close() noexcept -> u32 {
     if (changed) notify(true);
     post_close(); return phase_.load();
 }
-auto Domain::configure(Config config, Domain* authority) noexcept -> std::expected<u64, status_t> {
+auto Domain::configure(Config config, Domain* parent) noexcept -> std::expected<u64, status_t> {
     u64 sequence;
     Source::Publication publication;
     { sync::Lock guard{tree_lock_};
       if (!valid_config(config)) return std::unexpected(STATUS_BAD_ARGS);
-      if (!ancestors_open() || pending_mail_) return std::unexpected(STATUS_BUSY);
+      if (!lineage_open() || pending_mail_) return std::unexpected(STATUS_BUSY);
       if (requested_ == std::numeric_limits<u64>::max()) return std::unexpected(STATUS_EXHAUSTED);
       if (parent_ && (config.cpus & ~parent_->config_.cpus)) return std::unexpected(STATUS_BAD_ARGS);
       const bool increase = config.weight > config_.weight || (config.cpus & ~config_.cpus)
           || (config_.budget && (!config.budget || config.budget > config_.budget || config.period < config_.period));
-      if (increase && parent_ && authority != &parent_.get()) return std::unexpected(STATUS_DENIED);
+      if (increase && parent_ && parent != &parent_.get()) return std::unexpected(STATUS_DENIED);
       for (auto* child = children_; child; child = child->next_)
           if (child->config_.cpus & ~config.cpus) return std::unexpected(STATUS_BUSY);
       // CPU removal follows actual SC migration/unbinding, never implicit
@@ -460,7 +460,7 @@ void Domain::finish_close() noexcept {
       for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && (!nodes_[cpu]->stopped || !nodes_[cpu]->worker.stopped())) return;
       if (!ordinary_.drained()) return;
     }
-    if (!parent_auth_[0].close() || !parent_auth_[1].close()) return;
+    if (!parent_binding_[0].close() || !parent_binding_[1].close()) return;
     object::ref<Domain> staged, scan;
     { sync::Lock guard{tree_lock_};
       scan = std::move(scan_);
@@ -497,7 +497,7 @@ auto Domain::admit(Sc& sc, CpuId cpu) noexcept -> Result {
 }
 auto Domain::admit_locked(Sc& sc, CpuId cpu) noexcept -> Result {
     libk_assert(tree_lock_.held());
-    if (!ancestors_open()) return std::unexpected(Error::Busy);
+    if (!lineage_open()) return std::unexpected(Error::Busy);
     if (!allows_locked(cpu) || !(sc.config_.cpus & (u64{1} << cpu.raw))) return std::unexpected(Error::InvalidCpu);
     sc.config_.cpus &= config_.cpus;
     if (sc.domain_) return std::unexpected(Error::Busy);
@@ -530,12 +530,12 @@ Sc::Sc(Config config, u64 now) noexcept
 }
 Sc::~Sc() noexcept {
     libk_assert(!owner_ && !cleanup_ && !domain_);
-    libk_assert(domain_auth_.drained());
+    libk_assert(domain_binding_.drained());
     if (work_) work_->close(close_work_);
 }
 auto Sc::available(u64 now) const noexcept -> u64 { return budget_.info(now).available; }
 auto Sc::next_refill() const noexcept -> u64 { return budget_.next_refill(); }
-void Sc::account(u64 elapsed) noexcept {
+void Sc::record(u64 elapsed) noexcept {
     sync::Lock guard{lock_};
     runtime_ += elapsed;
     const auto scaled = static_cast<unsigned __int128>(elapsed) * 1024 + fraction_;
@@ -543,7 +543,7 @@ void Sc::account(u64 elapsed) noexcept {
     fraction_ = static_cast<u64>(scaled % config_.weight);
 }
 auto Sc::charge(u64 now, u64 elapsed) noexcept -> u64 {
-    account(elapsed);
+    record(elapsed);
     return budget_.consume(now, elapsed);
 }
 void Sc::locate(Dispatcher& d) noexcept {
@@ -589,20 +589,20 @@ void Sc::state_changed() noexcept {
     }
     if (changed) object::changed(close_work_.key());
 }
-auto Sc::admit(cap::Resolved<Domain>& authority, CpuId cpu) noexcept -> Result {
-    auto target = authority.reference();
+auto Sc::admit(cap::Resolved<Domain>& parent_cap, CpuId cpu) noexcept -> Result {
+    auto target = parent_cap.reference();
     auto self = object::ref<>::retain_alive(close_work_.key());
     if (!target) return std::unexpected(Error::NotAdmitted);
     sync::Lock guard{lock_};
     sync::Lock topology{Domain::tree_lock_};
-    auto& domain = authority.object();
-    if (domain_ || withdrawing_ || !domain.ancestors_open()) return std::unexpected(Error::AlreadyAdmitted);
+    auto& domain = parent_cap.object();
+    if (domain_ || withdrawing_ || !domain.lineage_open()) return std::unexpected(Error::AlreadyAdmitted);
     if (!domain.allows_locked(cpu) || !(config_.cpus & (u64{1} << cpu.raw))) return std::unexpected(Error::WrongCpu);
     const object::ref<>* gates[]{&self, &*target};
-    const auto& grant = authority.lease();
-    const cap::GrantLease* grants[]{&grant};
+    const auto& grant = parent_cap.pin();
+    const cap::GrantPin* grants[]{&grant};
     auto commit = [&]() noexcept { libk_assert(domain.admit_locked(*this, cpu)); };
-    if (domain_auth_.attach(grants, gates, cap::Authority<1>::Action::bind(commit)) != STATUS_OK)
+    if (domain_binding_.attach(grants, gates, cap::Bindings<1>::Action::bind(commit)) != STATUS_OK)
         return std::unexpected(Error::NotAdmitted);
     return {};
 }
@@ -633,7 +633,7 @@ auto Sc::bind(object::ref<Sc> self, Thread& target) noexcept -> Result {
     if (result) home->request_control(target);
     return result;
 }
-auto Sc::bind_authorized(object::ref<Sc> self, Thread& target,
+auto Sc::bind(object::ref<Sc> self, Thread& target,
     const cap::Resolved<Sc>& context, const cap::Resolved<Thread>& thread) noexcept -> Result {
     Dispatcher* home;
     { sync::Lock guard{lock_};
@@ -643,9 +643,9 @@ auto Sc::bind_authorized(object::ref<Sc> self, Thread& target,
           || !target.can_bind(*this) || !binding_.reset()) return std::unexpected(Error::AlreadyBound);
       auto domain = object::ref<>::retain_alive(domain_->close_work_.key());
       const object::ref<>* gates[]{&domain};
-      const cap::GrantLease* grants[]{&context.lease(), &thread.lease()};
+      const cap::GrantPin* grants[]{&context.pin(), &thread.pin()};
       auto commit = [&]() noexcept { libk_assert(bind_locked(std::move(self), target)); };
-      if (binding_.attach(grants, gates, cap::Authority<2>::Action::bind(commit)) != STATUS_OK)
+      if (binding_.attach(grants, gates, cap::Bindings<2>::Action::bind(commit)) != STATUS_OK)
           return std::unexpected(Error::Active);
       home = target.home_;
     }
@@ -701,7 +701,7 @@ void Sc::finish_close() noexcept {
     }
     if (!drain_binding()) return;
     { sync::Lock guard{lock_}; if (owner_ || !withdrawing_) return; }
-    if (!domain_auth_.close()) return;
+    if (!domain_binding_.close()) return;
     { sync::Lock guard{lock_}; if (domain_) libk_assert(domain_->unadmit(*this)); }
     bool retiring;
     { sync::Lock guard{lock_}; retiring = bool(cleanup_); }
@@ -713,13 +713,13 @@ void Sc::finish_close() noexcept {
 
 } // namespace sched
 
-// Accepted work keeps its original CPU payer independently of the submitting
+// Accepted work keeps its original CPU quota independently of the submitting
 // Thread/SC. Both the provider and this Domain link share final Gate admission.
 auto Op::admit_cpu(Publish publish) noexcept -> status_t {
     auto domain = cpu_.as<sched::Domain>();
     if (!domain) return STATUS_BAD_ARGS;
     sync::Lock guard{sched::Domain::tree_lock_};
-    if (!domain->get().authorized()) return STATUS_CLOSED;
+    if (!domain->get().lineage_admitting()) return STATUS_CLOSED;
     const auto status = publish();
     if (status != STATUS_OK) return status;
     auto& owner = domain->get();
@@ -740,7 +740,7 @@ auto Op::schedule() noexcept -> bool {
         sync::Lock topology{sched::Domain::tree_lock_};
         sync::Lock guard{lock_};
         if (cpu_.id() != cpu.id() || phase_ == OP_DONE || phase_ == OP_DRAINING || safety_ || canceled_
-            || !owner.authorized()) return false;
+            || !owner.lineage_admitting()) return false;
         wake = owner.ordinary_.enqueue(*runner_, std::move(ticket));
     }
     owner.ordinary_.wake(wake);
@@ -797,19 +797,19 @@ auto Op::commit() noexcept -> bool {
     auto publish = [&]() noexcept {
         sync::Lock guard{lock_};
         libk_assert(phase_ == OP_ACCEPTED);
-        if (canceled_ || safety_ || (domain && !domain->get().authorized())) return;
+        if (canceled_ || safety_ || (domain && !domain->get().lineage_admitting())) return;
         phase_ = OP_COMMITTED; committed = true;
     };
-    (void)authority_.publish(Source::Action::bind(publish));
+    (void)bindings_.publish(Source::Action::bind(publish));
     return committed;
 }
 
 auto Op::start(object::ref<> cpu, const object::ref<>& self, cap::Graph::Admission admission,
-    std::span<const object::ref<>*> gates, Source::Action install, const cap::GrantLease* provider_grant) noexcept -> status_t {
-    payer(std::move(cpu));
+    std::span<const object::ref<>*> gates, Source::Action install, const cap::GrantPin* provider_grant) noexcept -> status_t {
+    cpu_domain(std::move(cpu));
     auto admitted = [&]() noexcept {
         auto commit = [&]() noexcept { accept(); if (install) install(); };
-        return authority_.admit([&](std::span<cap::Attachment*> cells, Source::Action publish) noexcept {
+        return bindings_.admit([&](std::span<cap::Attachment*> cells, Source::Action publish) noexcept {
             const cap::Graph::Attach items[]{{provider_grant, cells[0], provider_grant ? nullptr : &self},
                 {nullptr, cells[1], &cpu_}};
             return admission.attach(items, gates, publish) ? STATUS_OK : STATUS_CLOSED;

@@ -100,7 +100,7 @@ private:
     void schedule() noexcept;
     auto scan(Pin&) noexcept -> bool;
     auto observed(Condition, u64) const noexcept -> std::optional<WaitResult>;
-    auto terminal(const Watch&) const noexcept -> WaitResult;
+    auto closed_result(const Watch&) const noexcept -> WaitResult;
 protected:
     void history(std::span<u64> values, u64 mask) noexcept { raised_ = values.data(); mask_ = mask; }
 private:

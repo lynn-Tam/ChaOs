@@ -65,7 +65,7 @@ class KSpace final : private libk::noncopyable_nonmovable {
         libk_assert(root_.kind() == PageTable::Kind::Kernel);
     }
 
-    void fund(object::ref<> payer) noexcept { libk_assert(!payer_); payer_ = std::move(payer); }
+    void fund(object::ref<> quota) noexcept { libk_assert(!quota_); quota_ = std::move(quota); }
     auto map(KMap&, Pages) noexcept -> std::expected<void, PtErr>;
     void unmap(KMap&, Flush&, Cpus&, CpuId) noexcept;
     void release(KMap&, const Flush&) noexcept;
@@ -91,8 +91,8 @@ class KSpace final : private libk::noncopyable_nonmovable {
     usize free_stack_{};
     usize stack_leases_{};
     KMap* devices_{};
-    object::ref<> payer_;
-    resource::Charge table_charge_;
+    object::ref<> quota_;
+    resource::Usage table_charge_;
 };
 
 } // namespace mm

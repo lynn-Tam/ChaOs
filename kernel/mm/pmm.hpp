@@ -17,7 +17,7 @@
 #include <ranges>
 #include <span>
 #include <optional>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 #include <sync.hpp>
 #include <type_traits>
 
@@ -340,7 +340,7 @@ struct SlabQuota {
 // The domain serializes payload perms; this pool owns only storage and ids.
 template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     struct Slot;
-    using Storage = base::slab<Slot, OwnedPage, page_size, resource::Charge>;
+    using Storage = base::slab<Slot, OwnedPage, page_size, resource::Usage>;
     using PageHeader = typename Storage::page;
     struct Id {
         u64 generation{};
@@ -397,8 +397,8 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
         return storage_.pages() == 0;
     }
     using Result = std::conditional_t<Indexed, Entry, T*>;
-    template <class... Args> auto create(const object::ref<>& payer, Args&&... args) noexcept -> std::expected<Result, SlabErr> {
-        auto claimed = claim(payer);
+    template <class... Args> auto create(const object::ref<>& quota, Args&&... args) noexcept -> std::expected<Result, SlabErr> {
+        auto claimed = claim(quota);
         if (!claimed) return std::unexpected(claimed.error());
         auto* slot = claimed.value();
         auto* object = std::construct_at(slot->object(), std::forward<Args>(args)...);
@@ -406,7 +406,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
         else return object;
     }
     // Reserve real backing and fees before accepting allocation-free work.
-    auto prepay(const object::ref<>& payer, usize nodes) noexcept -> std::expected<void, SlabErr>
+    auto prepay(const object::ref<>& quota, usize nodes) noexcept -> std::expected<void, SlabErr>
         requires (!Trim) {
         if (nodes > quota_.nodes) return std::unexpected(SlabErr::QuotaExceeded);
         const auto pages = quota_for(nodes).pages;
@@ -418,7 +418,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
                     return std::unexpected(SlabErr::QuotaExceeded);
                 ++growing_;
             }
-            auto made = make_page(payer);
+            auto made = make_page(quota);
             sync::Lock guard{lock_};
             --growing_;
             if (!made) return std::unexpected(made.error());
@@ -478,7 +478,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
     static auto slot_of(T& object) noexcept -> Slot& {
         return const_cast<Slot&>(slot_of(std::as_const(object)));
     }
-    auto claim(const object::ref<>& payer) noexcept -> std::expected<Slot*, SlabErr> {
+    auto claim(const object::ref<>& quota) noexcept -> std::expected<Slot*, SlabErr> {
         for (;;) {
             {
                 sync::Lock guard{lock_};
@@ -492,7 +492,7 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
                     return std::unexpected(SlabErr::QuotaExceeded);
                 ++growing_;
             }
-            auto made = make_page(payer);
+            auto made = make_page(quota);
             sync::Lock guard{lock_};
             libk_assert(growing_ != 0);
             --growing_;
@@ -500,21 +500,21 @@ template <class T, bool Indexed = true, bool Trim = true> class Slab final {
             storage_.add(*made.value());
         }
     }
-    auto make_page(const object::ref<>& payer) noexcept -> std::expected<PageHeader*, SlabErr> {
-        auto charge = resource::acquire(payer, {.memory = page_size});
-        if (!charge) return std::unexpected(SlabErr::ResourceExhausted);
+    auto make_page(const object::ref<>& quota) noexcept -> std::expected<PageHeader*, SlabErr> {
+        auto usage = resource::acquire(quota, {.memory = page_size});
+        if (!usage) return std::unexpected(SlabErr::ResourceExhausted);
         auto backing = pmm_->allocate_page();
         if (!backing) return std::unexpected(SlabErr::OutOfMemory);
         auto* page = Storage::make(std::move(backing).value(), [](Slot&) noexcept {});
-        page->extra = std::move(*charge);
+        page->extra = std::move(*usage);
         return (page);
     }
     static void release_page(PageHeader& page) noexcept {
         libk_assert(page.live == 0);
-        auto charge = std::move(page.extra);
+        auto usage = std::move(page.extra);
         auto backing = Storage::dispose(page);
         backing.reset();
-        charge.reset();
+        usage.reset();
     }
 
     Pmm* pmm_;

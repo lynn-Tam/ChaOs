@@ -140,7 +140,7 @@ private:
     void settle(u64) noexcept;
     void drain_domains() noexcept;
     u64 loan_elapsed_{};
-    u64 accounted_at_{};
+    u64 recorded_at_{};
     u64 quantum_{};
     u64 run_until_{std::numeric_limits<u64>::max()};
     std::optional<DispatchReason> pending_{};

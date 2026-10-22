@@ -30,7 +30,12 @@ static auto append(ubus_data& data, std::string_view name, ubus_value value, ubu
         if (!source) return STATUS_BAD_ARGS;
         const auto cap = source->capability(value);
         const auto info = cap_info(cap); if (!info) return info.error();
-        const auto index = out.attach(cap, info->view.rights); if (!index) return STATUS_NO_MEMORY;
+        std::optional<size_t> index;
+        for (size_t i = 0; i < out.count; ++i)
+            if (out.transfers[i].source == cap && out.transfers[i].rights == info->view.rights
+                && out.transfers[i].operation == CAP_COPY) { index = i; break; }
+        if (!index) index = out.attach(cap, info->view.rights);
+        if (!index) return STATUS_NO_MEMORY;
         if (const auto buffer = value.as<ubus_buffer>()) data.put(name, ubus_buffer{*index, buffer->offset, buffer->size});
         else data.cap(name, *index);
     } else if (value.type() == ubus_type::Record || value.type() == ubus_type::Array) {
@@ -57,13 +62,13 @@ int main() {
         auto owned = value.clone(); if (!owned) return owned.error();
         context.emplace(std::string{field.name()}, std::move(*owned));
     }
-    const auto archive_ref = context.find("archive");
-    if (archive_ref == context.end()) return STATUS_NOT_FOUND;
-    const auto buffer = archive_ref->second.data["value"].as<ubus_buffer>();
-    if (!buffer || buffer->offset) return STATUS_BAD_ARGS;
     proc_archive archive;
-    status = archive.open(archive_ref->second.capability(archive_ref->second.data["value"]), buffer->size);
-    if (status != STATUS_OK) return status;
+    if (const auto found = context.find("archive"); found != context.end()) {
+        const auto buffer = found->second.data["value"].as<ubus_buffer>();
+        if (!buffer || buffer->offset) return STATUS_BAD_ARGS;
+        status = archive.open(found->second.capability(found->second.data["value"]), buffer->size);
+        if (status != STATUS_OK) return status;
+    }
     ubus_data config;
     const ubus_msg* config_source{};
     if (const auto found = context.find("config"); found != context.end()) {
@@ -72,30 +77,6 @@ int main() {
     } else {
         const auto file = archive.files.find("mgr.config");
         if (!file || !config.assign(file->data)) return STATUS_BAD_ARGS;
-    }
-    std::deque<std::unique_ptr<ch_pair>> channels;
-    for (const auto object : config["objects"].values()) {
-        const auto kind = object["kind"].as<std::string_view>(); if (!kind) return STATUS_BAD_ARGS;
-        if (*kind == "Channel") {
-            auto pair = std::make_unique<ch_pair>();
-            status = pair->open(env.alloc(), object["depth"].as<uint64_t>().value_or(16), object["caps"].as<uint64_t>().value_or(0));
-            if (status != STATUS_OK) return status;
-            for (size_t side = 0; side < 2; ++side) {
-                ubus_msg value; value.data.cap("value", *value.attach(pair->ends[side].selector(), ~uint64_t{}));
-                const auto info = cap_info(pair->ends[side].selector()); if (!info) return info.error();
-                value.transfers[0].rights = info->view.rights;
-                auto owned = value.clone(); if (!owned) return owned.error();
-                context.emplace(std::string{object.name()} + "." + std::to_string(side), std::move(*owned));
-            }
-            channels.push_back(std::move(pair));
-        } else {
-            const auto made = *kind == "Account" ? sys::account_create(env.alloc(),
-                object["bytes"].as<uint64_t>().value_or(0), object["caps"].as<uint64_t>().value_or(0),
-                object["kinds"].as<uint64_t>().value_or(OBJ_KINDS)) : *kind == "Scope" ? sys::scope_create(env.alloc()) : sys::SysResult{.status=STATUS_BAD_ARGS};
-            if (made.status != STATUS_OK) return made.status;
-            ubus_msg value; value.data.cap("value", *value.give(cap_owner{made.value}));
-            context.emplace(std::string{object.name()}, std::move(value));
-        }
     }
     struct loading {
         enum phase { LocalBind, LocalGet, ParentBind, ParentGet, FilesBind, Map } step{};
@@ -158,6 +139,36 @@ int main() {
     }};
     self = &owner;
     status = owner.open(); if (status != STATUS_OK) return status;
+    std::deque<std::unique_ptr<ch_pair>> channels;
+    for (const auto object : config["objects"].values()) {
+        const auto kind = object["kind"].as<std::string_view>(); if (!kind) return STATUS_BAD_ARGS;
+        if (*kind == "Manager") {
+            const auto rights = object["rights"].as<uint64_t>();
+            if (!rights || !*rights || (*rights & ~(mgr_observe | mgr_control | mgr_create | mgr_debug))) return STATUS_BAD_ARGS;
+            auto cap = owner.connector(*rights); if (!cap) return cap.error();
+            ubus_msg value; value.data.cap("value", *value.offer(std::move(*cap), RIGHT_SEND | RIGHT_DUPLICATE));
+            context.emplace(std::string{object.name()}, std::move(value));
+        } else if (*kind == "Channel") {
+            auto pair = std::make_unique<ch_pair>();
+            status = pair->open(env.alloc(), object["depth"].as<uint64_t>().value_or(16), object["caps"].as<uint64_t>().value_or(0));
+            if (status != STATUS_OK) return status;
+            for (size_t side = 0; side < 2; ++side) {
+                ubus_msg value; value.data.cap("value", *value.attach(pair->ends[side].selector(), ~uint64_t{}));
+                const auto info = cap_info(pair->ends[side].selector()); if (!info) return info.error();
+                value.transfers[0].rights = info->view.rights;
+                auto owned = value.clone(); if (!owned) return owned.error();
+                context.emplace(std::string{object.name()} + "." + std::to_string(side), std::move(*owned));
+            }
+            channels.push_back(std::move(pair));
+        } else {
+            const auto made = *kind == "Quota" ? sys::quota_create(env.alloc(),
+                object["bytes"].as<uint64_t>().value_or(0), object["caps"].as<uint64_t>().value_or(0),
+                object["kinds"].as<uint64_t>().value_or(OBJ_KINDS)) : *kind == "Scope" ? sys::scope_create(env.alloc()) : sys::SysResult{.status=STATUS_BAD_ARGS};
+            if (made.status != STATUS_OK) return made.status;
+            ubus_msg value; value.data.cap("value", *value.give(cap_owner{made.value}));
+            context.emplace(std::string{object.name()}, std::move(value));
+        }
+    }
     const auto recipe_for = [&](ubus_value child) -> std::expected<ubus_msg, status_t> {
         ubus_msg recipe;
         for (const auto field : child.values()) {
@@ -180,10 +191,11 @@ int main() {
     if (status != STATUS_OK) return status;
     for (const auto child : config["children"].values()) {
         const auto name = child["name"].as<std::string_view>().value_or("");
-        if (auto* installed = owner.find(name)) {
+        if (auto installed = owner.find(name)) {
             if (installed->recipe["$package"]) installed->origin.put("name", name).put("program", installed->image).put("$package", name);
             continue;
         }
+        if (owner.known(name)) continue;
         const auto program = child["program"].as<std::string_view>();
         if (!program) return STATUS_BAD_ARGS;
         if (child["optional"].as<bool>().value_or(false) && !archive.image(*program)) continue;
@@ -191,13 +203,7 @@ int main() {
         const auto installed = owner.configure(std::move(*recipe)); if (!installed) return installed.error();
         (*installed)->origin.put("name", name).put("program", *program).put("$package", name);
     }
-    if (parent.token("Publish")) for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 2>{{{"control", mgr_observe | mgr_control}, {"view", mgr_observe}}}) {
-        auto connector = owner.object().connector(rights); if (!connector) return connector.error();
-        ubus_msg request, response; request.data.put("name", name).put("interface", "ubus.environment").put("version", uint64_t{1})
-            .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
-        status = parent.invoke("Publish", std::move(request), response);
-        if (status != STATUS_OK) return status;
-    }
+    status = owner.attach(parent); if (status != STATUS_OK) return status;
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) return status;
         status = ev_wait(env.events, owner.deadline()).status;

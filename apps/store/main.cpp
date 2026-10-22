@@ -565,7 +565,7 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
     if (size <= 0)
         return size < 0 ? volume.error(size) : STATUS_BAD_ARGS;
     const auto bytes = (uint64_t(size) + 4095) & ~uint64_t{4095};
-    auto made = vm_area::create(store_memory, rt_vm(), 0, bytes, VM_READ | VM_WRITE | (perms & VM_EXECUTE));
+    auto made = vm_area::create(store_memory, rt_vm(), 0, bytes, VM_READ | VM_WRITE | (perms & VM_EXECUTE), VM_READ | VM_WRITE);
     if (!made) return made.error();
     auto staging = std::move(*made);
     status_t status = STATUS_OK;
@@ -592,7 +592,7 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
         return status;
     const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
         .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, .words={0, bytes / 4096, perms}};
-    auto exported = descriptor.derive(staging.memory.selector(), view, store_memory.account);
+    auto exported = descriptor.derive(staging.memory.selector(), view, store_memory.quota);
     if (!exported) return exported.error();
     const auto index = response.offer(std::move(*exported), view.rights); if (!index) return STATUS_NO_MEMORY;
     response.data.put("buffer", ubus_buffer{*index, 0, uint64_t(size)}); return STATUS_OK;
@@ -642,7 +642,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
             || ((flags & ~(st_read | st_write)) && !(flags & st_write))) return STATUS_BAD_ARGS;
         if ((flags & st_write) && !(request.facet() & st_modify)) return STATUS_DENIED;
         const auto budget = request.capability(request.data["budget"]);
-        auto storage = vm_new<st_open>({budget ? budget : rt_startup().pool, rt_startup().scope});
+        auto storage = vm_new<st_open>({budget ? budget : rt_startup().quota, rt_startup().scope});
         if (!storage) return storage.error();
         auto opened = std::move(*storage);
         if (method == "Document") opened->document = path;
@@ -723,8 +723,8 @@ int main(int argc, char** argv) {
     ubus_msg setup;
     status = bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     const auto message = setup.data["message"];
-    store_memory = {setup.capability(message["image.pool"]), setup.capability(message["image.scope"])};
-    if (!store_memory.account || !store_memory.scope) return STATUS_DENIED;
+    store_memory = {setup.capability(message["image.quota"]), setup.capability(message["image.scope"])};
+    if (!store_memory.quota || !store_memory.scope) return STATUS_DENIED;
     ubus_msg query, response; query.data.put("name", "block");
     status = bus.invoke("Get", std::move(query), response);
     if (status == STATUS_OK) status = block.bind(response.capability(response.data["connector"]), "myos.block", 1, 1);
@@ -732,7 +732,7 @@ int main(int argc, char** argv) {
         query = {}; query.data.put("action", "lend").put("bytes", uint64_t{192 * 1024}).put("caps", uint64_t{0})
             .put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
         status = bus.invoke("Resource", std::move(query), response);
-        if (status == STATUS_OK) status = backend.connect(block, response.capability(response.data["account"]));
+        if (status == STATUS_OK) status = backend.connect(block, response.capability(response.data["quota"]));
     }
     if (status == STATUS_OK) status = volume.open(backend);
     if (status != STATUS_OK) return status;

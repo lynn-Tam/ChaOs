@@ -175,7 +175,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
                     return STATUS_BAD_ARGS;
                 strings += arg.size() + 1;
             }
-        auto s = r.pool() ? STATUS_OK : r.open(auth, o.resources);
+        auto s = r.quota() ? STATUS_OK : r.open(auth, o.resources);
         if (s != STATUS_OK)
             return s;
         proc_loader load{r.alloc(), r.vspace()};
@@ -199,7 +199,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
                                   {AT_SYS_CPUS, auth.cpus},
                                   {AT_SYS_IPC, o.va.ipc}};
         for (auto [key, cap, rights] :
-             std::array{std::tuple{AT_SYS_POOL, r.pool(), o.resources.pool_perms},
+             std::array{std::tuple{AT_SYS_QUOTA, r.quota(), o.resources.quota_perms},
                         std::tuple{AT_SYS_DOMAIN, r.domain(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE | RIGHT_DELEGATE}},
                         std::tuple{AT_SYS_SCOPE, r.scope(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE}},
                         std::tuple{AT_SYS_VSPACE, r.vspace(),
@@ -279,7 +279,62 @@ auto proc_archive::open(cap_t cap, size_t bytes) -> status_t {
     return files ? STATUS_OK : STATUS_BAD_ARGS;
 }
 auto proc_archive::image(std::string_view name) const -> std::expected<proc_image, status_t> {
+    while (name.starts_with('/')) name.remove_prefix(1);
     const auto file = files.find(name);
     if (!file) return std::unexpected(STATUS_NOT_FOUND);
     return proc_image{.bytes=file->data};
+}
+
+// Samples execution threads, not the scheduling descendants funded by them.
+// Native membership/version checks bound the snapshot; the caller discards an
+// interval when the actual thread set changes. Quotaing remains native.
+auto proc_task::cpu_info() const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t> {
+    const auto now = sys::clock_now().value;
+    // Coalesce observers into one sample per second. The timestamp travels with
+    // the data; a cached sample is never relabeled with a newer clock value.
+    if (cpu_at_ && now - cpu_at_ < sys::clock_frequency().value) {
+        if (cpu_status_ != STATUS_OK) return std::unexpected(cpu_status_);
+        return cpu_;
+    }
+    cpu_at_ = now;
+    const auto collect = [&]() -> std::expected<std::vector<uint64_t>, status_t> {
+        const auto ipc = reinterpret_cast<void*>(rt_startup().ipc);
+        const auto identity = sys::object_info(vspace());
+        if (identity.status != STATUS_OK) return std::unexpected(identity.status);
+        const auto vm = reinterpret_cast<const ObjectInfo*>(ipc)->object_id;
+        std::vector<std::array<uint64_t, 2>> threads;
+        ScopeCursor cursor{};
+        for (size_t pages = 0;; ++pages) {
+            if (pages == 128) return std::unexpected(STATUS_EXHAUSTED);
+            const auto scan = sys::scope_members(scope(), cursor);
+            if (scan.status != STATUS_OK) return std::unexpected(scan.status);
+            ScopeMembers page; ::memcpy(&page, ipc, sizeof(page));
+            for (const auto& member : std::span{page.records, page.count}) {
+                if (member.kind != ObjThread) continue;
+                const auto linked = sys::scope_query(scope(), member.object_id, SCOPE_LINKS);
+                if (linked.status != STATUS_OK) return std::unexpected(linked.status);
+                LinkRecords links; ::memcpy(&links, ipc, sizeof(links));
+                if (links.more) return std::unexpected(STATUS_EXHAUSTED);
+                if (std::ranges::none_of(std::span{links.records, links.count}, [&](const auto& link) {
+                    return link.kind == LINK_ROOT && link.object_id == vm;
+                })) continue;
+                const auto sampled = sys::scope_query(scope(), member.object_id, SCOPE_USAGE);
+                if (sampled.status != STATUS_OK) return std::unexpected(sampled.status);
+                threads.push_back({member.object_id, reinterpret_cast<const ThreadInfo*>(ipc)->runtime});
+            }
+            cursor = page.next;
+            if (!page.more) break;
+        }
+        const auto final = sys::scope_info(scope());
+        if (final.status != STATUS_OK) return std::unexpected(final.status);
+        if (reinterpret_cast<const ScopeInfo*>(ipc)->epoch != cursor.version) return std::unexpected(STATUS_STALE);
+        std::ranges::sort(threads);
+        std::vector<uint64_t> result; result.reserve(threads.size() * 2);
+        for (const auto& thread : threads) result.insert(result.end(), thread.begin(), thread.end());
+        return result;
+    };
+    auto result = collect(); cpu_status_ = result ? STATUS_OK : result.error();
+    if (!result) return std::unexpected(result.error());
+    cpu_ = {sys::clock_now().value, std::move(*result)};
+    return cpu_;
 }

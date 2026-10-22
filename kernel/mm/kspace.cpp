@@ -1,6 +1,6 @@
 #include <expected>
 #include <mm/kspace.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 #include <utility>
 
 #include <libk/types.hpp>
@@ -30,8 +30,8 @@ auto KSpace::map(KMap& map, Pages pages) noexcept -> std::expected<void, PtErr> 
     auto count = root_.count();
     for (usize n = 0; n < pages.page_count(); ++n)
         if (!count.include(*va->checked_add(n))) return std::unexpected(PtErr::BadAddr);
-    auto fee = count.pages() ? resource::acquire(payer_, {.memory = count.pages() * page_size})
-                             : std::expected<resource::Charge, resource::errc>{resource::Charge{}};
+    auto fee = count.pages() ? resource::acquire(quota_, {.memory = count.pages() * page_size})
+                             : std::expected<resource::Usage, resource::errc>{resource::Usage{}};
     if (!fee) return std::unexpected(PtErr::NoMemory);
     auto edit = tlb_.begin();
     const auto result = root_.map(va->base(), pages, PtPerm::Rw);
@@ -101,8 +101,8 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
     auto count = root_.count();
     const auto first = *VPage::from_base(va_t{base});
     for (usize i = 0; i < Stack::StackPages; ++i) libk_assert(count.include(*first.checked_add(i)));
-    auto fee = count.pages() ? resource::acquire(payer_, {.memory = count.pages() * page_size})
-                             : std::expected<resource::Charge, resource::errc>{resource::Charge{}};
+    auto fee = count.pages() ? resource::acquire(quota_, {.memory = count.pages() * page_size})
+                             : std::expected<resource::Usage, resource::errc>{resource::Usage{}};
     if (!fee) return std::unexpected(PtErr::NoMemory);
     auto edit = tlb_.begin();
     auto va = *VPage::from_base(va_t{base});

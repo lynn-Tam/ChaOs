@@ -56,7 +56,7 @@ static auto sh_path(std::string_view path, std::string_view base = "/") -> std::
 }
 
 struct sh_stage {
-    mgr_child* child{};
+    std::shared_ptr<mgr_child> child;
     auto task() const -> proc_task* { return child ? child->task.get() : nullptr; }
     std::optional<status_t> result;
     bool end{};
@@ -64,7 +64,7 @@ struct sh_stage {
     ev_watch end_ready;
 };
 enum class sh_state { Running, Suspending, Suspended, Terminating, Done };
-struct sh_job {
+struct sh_pipeline {
     uint64_t id;
     std::string command;
     std::vector<sh_stage> stages;
@@ -78,11 +78,12 @@ struct sh_job {
     ubus_rx output_rx;
     std::deque<sh_chunk> pending_input;
     sh_state state{sh_state::Running};
-    bool fullscreen{}, output_empty{}, background{}, announced{}, read_only{};
-    uint64_t focus{}, document_loan{};
+    bool fullscreen{}, output_empty{}, background{}, announced{};
+    std::string profile;
+    uint64_t focus{};
 };
 
-class sh_session {
+class sh_shell {
     const rt_env& env_;
     ubus_rx input_;
     ubus_conn bus_;
@@ -90,9 +91,7 @@ class sh_session {
     vm_area source_;
     cap_t input_cap_{}, output_cap_{};
     mgr owner_{[this](mgr_child& child) { return image(child.image); }};
-    ubus_object management_{"myos.manager"};
-    mgr_wait watches_;
-    std::deque<std::unique_ptr<sh_job>> jobs_;
+    std::deque<std::unique_ptr<sh_pipeline>> pipelines_;
     uint64_t next_{}, foreground_{}, focus_{};
     struct output { sh_chunk frame; uint64_t owner{}, focus{}; };
     std::deque<output> output_;
@@ -102,11 +101,11 @@ class sh_session {
     std::vector<status_t> result_;
     std::optional<std::string> command_;
     bool carriage_{}, overflow_{}, screen_{}, reading_{}, prompt_visible_{}, line_start_{true};
-    auto job(uint64_t id) noexcept -> sh_job* {
-        for (auto& job : jobs_) if (job->id == id) return job.get();
+    auto job(uint64_t id) noexcept -> sh_pipeline* {
+        for (auto& job : pipelines_) if (job->id == id) return job.get();
         return nullptr;
     }
-    auto collect(sh_job& job) -> status_t {
+    auto collect(sh_pipeline& job) -> status_t {
         result_.clear();
         for (const auto& stage : job.stages) result_.push_back(stage.result.value_or(STATUS_CANCELED));
         const auto status = result_.back();
@@ -114,18 +113,13 @@ class sh_session {
         for (auto& stage : job.stages) if (stage.child) {
             for (;;) {
                 const auto status = owner_.erase(stage.child->id);
-                if (status == STATUS_OK) break;
+                if (status == STATUS_OK || status == STATUS_NOT_FOUND) break;
                 if (status != STATUS_WOULD_BLOCK) sys::exit(status);
                 pump();
             }
             stage.child = nullptr;
         }
-        if (job.document_loan) {
-            ubus_msg request, response; request.data.put("action", "close").put("loan", job.document_loan);
-            const auto returned = bus_.invoke("Resource", std::move(request), response);
-            if (returned != STATUS_OK) return returned;
-        }
-        std::erase_if(jobs_, [=](const auto& job) { return job->id == id; });
+        std::erase_if(pipelines_, [=](const auto& job) { return job->id == id; });
         return status;
     }
     void enqueue(std::string_view text, uint64_t owner = 0, uint64_t focus = 0) {
@@ -141,7 +135,7 @@ class sh_session {
             frame.size += count; text.remove_prefix(count);
         }
     }
-    void focus(sh_job& job, bool gained) {
+    void focus(sh_pipeline& job, bool gained) {
         // Supersede pending screen/control text; ordinary job bytes keep order.
         std::erase_if(output_, [](const auto& output) { return output.focus || !output.owner; });
         job.focus = ++focus_;
@@ -154,7 +148,7 @@ class sh_session {
         if (gained) { enqueue("\x1b[?1049h\x1b[?25h"); screen_ = true; }
         else if (screen_) { enqueue("\x1b[?1049l\x1b[?25h"); screen_ = false; }
     }
-    void leave(sh_job& job) {
+    void leave(sh_pipeline& job) {
         if (foreground_ != job.id) return;
         if (job.fullscreen) focus(job, false);
         foreground_ = 0;
@@ -172,7 +166,7 @@ class sh_session {
                     target->state = sh_state::Suspending;
                     target->background = true;
                     for (auto& stage : target->stages)
-                        if (stage.task()) (void)stage.task()->execution(false);
+                        if (stage.task()) (void)stage.task()->initial_execution(false);
                 }
             } else { line_.clear(); overflow_ = false; enqueue("^C\n"); line_start_ = true; prompt_visible_ = false; prompt(); }
             return;
@@ -215,19 +209,34 @@ class sh_session {
         return proc_image{.bytes={reinterpret_cast<const std::byte*>(source_.address + buffer->offset), size_t(buffer->size)},
             .memory=source_.memory.selector(), .offset=buffer->offset, .perms=VM_READ | VM_EXECUTE};
     }
-    auto launch(sh_stage& stage, sh_job& job, size_t index, std::span<const std::string_view> argv) -> status_t {
-        std::string path{argv[0]};
+    auto launch(sh_stage& stage, sh_pipeline& job, size_t index, std::span<const std::string_view> argv) -> status_t {
+        const auto config = setup_.data["message"];
+        const auto profile = config["profiles"][job.profile];
+        auto policy = profile["commands"][argv[0]];
+        if (!policy) policy = config["commands"][argv[0]];
+        std::string path{policy["program"].as<std::string_view>().value_or(argv[0])};
         if (path.find('/') == path.npos) { path = "/boot/" + path; if (!path.ends_with(".elf")) path += ".elf"; }
         else path = sh_path(path, cwd_);
-        auto& child = owner_.add("job" + std::to_string(job.id) + "." + std::to_string(index), path,
-            {.bytes=4 * 1024 * 1024, .caps=160, .slots=256, .pages=36,
-                .pool_perms=RIGHT_CREATE | RIGHT_INSPECT, .max_bytes=16 * 1024 * 1024, .max_caps=256});
-        stage.child = &child; child.args.assign(argv.begin(), argv.end()); child.env = {"PWD=" + cwd_};
-        child.cpu = (job.id + index) % env_.cpus; child.exports.push("*");
-        ubus_data parent; parent.put("parent", true); child.routes.put("*", parent);
-        if (job.read_only) for (const auto& [name, alias] : std::array<std::pair<std::string_view, std::string_view>, 4>{{
-            {"files", "read"}, {"system", "system.view"}, {"session", "session.view"}, {"devices", "devices.view"}}}) {
-            ubus_data rule; rule.put("parent", alias); child.routes.put(name, rule);
+        const auto base = path.substr(path.find_last_of('/') + 1);
+        const auto limits = policy["resources"];
+        const auto caps = limits["caps"].as<uint64_t>().value_or(160);
+        const auto bytes = limits["bytes"].as<uint64_t>().value_or(4 * 1024 * 1024);
+        auto& child = owner_.add(base + "." + std::to_string(job.id) + "." + std::to_string(index), path,
+            {.bytes=bytes, .caps=caps, .slots=std::max<uint64_t>(256, caps), .pages=(std::max<uint64_t>(256, caps) + 7) / 8 + 4,
+                .quota_perms=RIGHT_CREATE | RIGHT_INSPECT,
+                .watches=limits["watches"].as<uint64_t>().value_or(64), .hints=limits["hints"].as<uint64_t>().value_or(16), .max_bytes=std::max<uint64_t>(bytes, 16 * 1024 * 1024), .max_caps=std::max<uint64_t>(caps, 256)});
+        stage.child = owner_.find(child.id); child.args.clear();
+        if (policy["argv"]) for (const auto arg : policy["argv"].values()) child.args.emplace_back(*arg.as<std::string_view>());
+        else child.args = {std::string{argv[0]}};
+        for (const auto arg : argv.subspan(1)) child.args.emplace_back(arg);
+        child.env = {"PWD=" + cwd_};
+        child.cpu = (job.id + index) % env_.cpus;
+        auto routes = profile["routes"]; if (!routes) routes = policy["routes"]; if (!routes) routes = config["routes"];
+        if (routes && !child.routes.assign(routes.bytes())) return STATUS_BAD_ARGS;
+        const auto delivery = profile ? profile["commands"][argv[0]]["setup"] : policy["setup"];
+        if (delivery) {
+            auto message = setup_.slice(delivery); if (!message) return message.error();
+            child.setup = std::move(*message);
         }
         for (const auto& [name, source, rights, badge] : std::array{
             std::tuple{"stdin", index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), word_t{RIGHT_RECEIVE}, word_t{0}},
@@ -237,51 +246,30 @@ class sh_session {
             if (copy.status != STATUS_OK) return copy.status;
             child.setup.data.cap(name, *child.setup.give(cap_owner{copy.value}));
         }
-        auto jobs = management_.connector(job.read_only ? word_t{mgr_observe} : word_t{mgr_observe | mgr_control});
-        if (!jobs) return jobs.error();
-        child.setup.data.cap("jobs", *child.setup.offer(std::move(*jobs), RIGHT_SEND | RIGHT_DUPLICATE));
         if (job.stages.size() == 1) {
             const auto cap = sys::cap_duplicate(job.terminal_connector.selector(), env_.cspace, RIGHT_SEND | RIGHT_DUPLICATE);
             if (cap.status != STATUS_OK) return cap.status;
             child.setup.data.cap("terminal", *child.setup.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE));
         }
-        if (path.ends_with("/edit.elf") && argv.size() == 2) {
-            ubus_msg query, reply; query.data.put("name", job.read_only ? "read" : "files");
-            auto status = bus_.invoke("Get", std::move(query), reply);
-            ubus_conn files; if (status == STATUS_OK) status = files.bind(reply.capability(reply.data["connector"]));
-            if (status != STATUS_OK) return status;
-            query = {}; query.data.put("action", "lend").put("bytes", uint64_t{192 * 1024}).put("caps", uint64_t{0})
-                .put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
-            status = bus_.invoke("Resource", std::move(query), reply); if (status != STATUS_OK) return status;
-            job.document_loan = *reply.data["loan"].as<uint64_t>();
-            auto budget = reply.take(reply.data["account"]);
-            query = {}; query.data.put("path", sh_path(argv[1], cwd_))
-                .cap("budget", *query.attach(budget.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
-            status = files.invoke("Document", std::move(query), reply); if (status != STATUS_OK) return status;
-            auto document = reply.take(reply.data["handle"]); if (!document) return STATUS_PEER_FAULT;
-            child.setup.data.cap("document", *child.setup.give(std::move(document)));
-        }
         return owner_.start(child);
     }
 
 public:
-    explicit sh_session(const rt_env& env) : env_(env) {
+    explicit sh_shell(const rt_env& env) : env_(env) {
         auto status = bus_.bind(env.environment); if (status != STATUS_OK) sys::exit(status);
         status = bus_.invoke("Receive", {}, setup_); if (status != STATUS_OK) sys::exit(status);
         input_cap_ = setup_.capability(setup_.data["message"]["stdin"]);
         output_cap_ = setup_.capability(setup_.data["message"]["stdout"]);
         status = input_.open(input_cap_, env.events); if (status != STATUS_OK) sys::exit(status);
         status = owner_.open(); if (status != STATUS_OK) sys::exit(status);
-        for (const auto name : {"List", "Inspect", "Changed", "Action", "CloseCap", "Revoke"})
-            if (const auto status = mgr_method(management_, name, [this, name](auto& q, auto& r) { return manage(name, q, r); });
-                status != STATUS_OK) sys::exit(status);
-        if (const auto status = management_.open(); status != STATUS_OK) sys::exit(status);
+        if (const auto status = owner_.attach(bus_); status != STATUS_OK) sys::exit(status);
     }
     void prompt() {
         if (!line_start_ && !prompt_visible_) enqueue("\n");
         enqueue(cwd_); enqueue(" > "); enqueue(line_); prompt_visible_ = true;
     }
     auto output() const -> cap_t { return output_cap_; }
+    auto profile(std::string_view name) const -> bool { return bool(setup_.data["message"]["profiles"][name]); }
     auto cwd() const noexcept -> const std::string& { return cwd_; }
     auto cd(std::string_view path) -> status_t {
         if (path.empty()) return STATUS_BAD_ARGS;
@@ -296,76 +284,23 @@ public:
         if (status == STATUS_OK) cwd_ = target;
         return status;
     }
-    void terminate(sh_job& job) {
+    void terminate(sh_pipeline& job) {
         job.state = sh_state::Terminating;
         leave(job);
         for (auto& stage : job.stages) if (stage.task()) (void)stage.task()->stop();
     }
-    auto manage(std::string_view method, ubus_request& request, ubus_msg& response) -> status_t {
-        if (method == "List") {
-            ubus_data items{ubus_type::Array};
-            constexpr std::array<std::string_view, 5> states{"running", "suspending", "suspended", "draining", "done"};
-            for (const auto& job : jobs_) for (size_t i = 0; i < job->stages.size(); ++i) {
-                auto row = mgr_row(job->stages[i].task(), (job->id << 8) | i, job->id, job->command,
-                    states[static_cast<size_t>(job->state)], (request.facet() & mgr_control) && job->id != foreground_);
-                row.put("job", job->id).put("member", i + 1); items.push(row);
-            }
-            response.data.put("items", items).put("epoch", next_); return STATUS_OK;
-        }
-        const auto id = *request.data["id"].as<uint64_t>();
-        auto* target = job(id >> 8);
-        const auto index = id & 255;
-        if (!target || index >= target->stages.size()) return STATUS_NOT_FOUND;
-        if (request.data["gen"].as<uint64_t>() != target->id) return STATUS_STALE;
-        auto& stage = target->stages[index];
-        if (!stage.task()) return STATUS_CLOSED;
-        if (method == "Changed") return watches_.accept(stage.task()->scope(), stage.task()->cspace(), request, response);
-        if (method == "Inspect") {
-            if (request.data["facet"].as<std::string_view>() == "dependencies") {
-                ubus_data items{ubus_type::Array};
-                for (const auto peer : {index ? index - 1 : UINT64_MAX, index + 1 < target->stages.size() ? index + 1 : UINT64_MAX}) if (peer != UINT64_MAX) {
-                    ubus_data edge; edge.put("id", (target->id << 8) | peer).put("gen", target->id)
-                        .put("name", peer < index ? "stdin pipe" : "stdout pipe"); items.push(edge);
-                }
-                response.data.put("items", items); return STATUS_OK;
-            }
-            return mgr_inspect(stage.task()->scope(), stage.task()->cspace(), request.data.view(), response);
-        }
-        if (target->id == foreground_) return STATUS_DENIED;
-        if (method == "CloseCap") return sys::cap_close(*request.data["selector"].as<cap_t>(), stage.task()->cspace()).status;
-        if (method == "Revoke") return mgr_revoke(stage.task()->cspace(), request.data.view(), response);
-        if (method != "Action") return STATUS_INVALID_OP;
-        const auto action = *request.data["action"].as<std::string_view>();
-        if (action == "stop") { terminate(*target); return STATUS_OK; }
-        if (action != "pause" && action != "resume") return STATUS_BAD_ARGS;
-        const bool enabled = action == "resume";
-        if (!enabled) leave(*target);
-        target->state = enabled ? sh_state::Running : sh_state::Suspending;
-        for (auto& member : target->stages) if (member.task())
-            if (const auto status = member.task()->execution(enabled).status; status != STATUS_OK) return status;
-        return STATUS_OK;
-    }
     void pump(bool sleep = true) {
         bool polling{}, progress{};
-        for (unsigned n = 0; n < 16; ++n) {
-            const auto status = management_.poll();
-            if (status == STATUS_WOULD_BLOCK) break;
-            if (status != STATUS_OK) sys::exit(status);
-            progress = true;
-        }
         if (const auto status = owner_.poll(); status != STATUS_OK) sys::exit(status);
-        watches_.poll();
-        auto deadline = watches_.deadline();
-        const auto managed = owner_.deadline(); if (managed && (!deadline || managed < deadline)) deadline = managed;
-        if (const auto status = management_.arm(); status != STATUS_OK) sys::exit(status);
-        for (auto& entry : jobs_) {
+        auto deadline = owner_.deadline();
+        for (auto& entry : pipelines_) {
             auto& job = *entry;
             bool suspended = true, done = true;
             for (size_t i = 0; i < job.stages.size(); ++i) {
                 auto& stage = job.stages[i];
                 if (stage.task()) {
                     if (job.state == sh_state::Suspending) {
-                        const auto state = stage.task()->info();
+                        const auto state = stage.task()->initial_info();
                         suspended &= state && state->requested == state->applied && !(state->flags & THREAD_APPLIED);
                     }
                     polling |= stage.task()->polling();
@@ -467,9 +402,9 @@ public:
         if (output_.empty())
             if (const auto status = output_ready_.close(); status != STATUS_OK) sys::exit(status);
         (void)input_.arm();
-        for (auto& entry : jobs_) { (void)entry->terminal.arm(); (void)entry->output_rx.arm(); }
+        for (auto& entry : pipelines_) { (void)entry->terminal.arm(); (void)entry->output_rx.arm(); }
         if (sleep && !command_ && !progress) {
-            // Successful executions use Exit/Scope/Account notifications.
+            // Successful executions use Exit/Scope/Quota notifications.
             if (polling) {
                 const auto next = rt_after_ms(1).value_or(0);
                 if (next && (!deadline || next < deadline)) deadline = next;
@@ -485,10 +420,10 @@ public:
         return command;
     }
     auto spawn(const std::vector<std::string>& words, const std::vector<size_t>& cuts,
-               bool background, std::string_view command, bool read_only = false) -> status_t {
-        auto entry = std::make_unique<sh_job>();
+               bool background, std::string_view command, std::string_view profile = {}) -> status_t {
+        auto entry = std::make_unique<sh_pipeline>();
         auto& job = *entry;
-        job.id = ++next_; job.command = command; job.background = background; job.read_only = read_only;
+        job.id = ++next_; job.command = command; job.background = background; job.profile = profile;
         job.stages.resize(cuts.size() - 1);
         auto status = job.input.open(env_.alloc(), 8, 0);
         if (status == STATUS_OK) status = job.output.open(env_.alloc(), 8, 0);
@@ -530,7 +465,7 @@ public:
             }
         }
         if (status != STATUS_OK) return status;
-        jobs_.push_back(std::move(entry));
+        pipelines_.push_back(std::move(entry));
         if (!background) foreground_ = job.id;
         for (size_t i = 0; i < job.stages.size() && status == STATUS_OK; ++i) {
             std::vector<std::string_view> argv(words.begin() + cuts[i], words.begin() + cuts[i + 1]);
@@ -557,7 +492,7 @@ public:
         return STATUS_OK;
     }
     auto latest(bool active) const noexcept -> uint64_t {
-        for (const auto& job : jobs_ | std::views::reverse)
+        for (const auto& job : pipelines_ | std::views::reverse)
             if (!active || (job->state != sh_state::Done && job->state != sh_state::Terminating)) return job->id;
         return 0;
     }
@@ -568,7 +503,7 @@ public:
         else if (operation == "fg" || operation == "bg") {
             if (target->state == sh_state::Done || target->state == sh_state::Terminating) return STATUS_CLOSED;
             if (operation == "fg") { foreground_ = id; if (target->fullscreen) focus(*target, true); }
-            for (auto& stage : target->stages) if (stage.task()) (void)stage.task()->execution(true);
+            for (auto& stage : target->stages) if (stage.task()) (void)stage.task()->initial_execution(true);
             target->state = sh_state::Running;
             if (operation == "bg") { target->background = true; return STATUS_OK; }
         }
@@ -591,7 +526,7 @@ public:
     }
     void list(sh_writer& console) const {
         constexpr const char* names[]{"Running", "Suspending", "Suspended", "Terminating", "Done"};
-        for (const auto& job : jobs_)
+        for (const auto& job : pipelines_)
             (void)libk::fmt::format_to<"[{}] {} {}\n">(console, job->id, names[static_cast<size_t>(job->state)], std::string_view{job->command});
     }
 };
@@ -677,88 +612,20 @@ static auto arguments(char* text, std::vector<std::string>& output, std::vector<
     }
 }
 
-static void command(sh_session& session, std::string text, const rt_env& info) {
-    sh_writer console{session.output()};
+static void command(sh_shell& shell, std::string text) {
+    sh_writer console{shell.output()};
     const auto split = text.find(' ');
     const auto name = std::string_view{text}.substr(0, split);
     const auto tail = split == text.npos ? std::string_view{} : std::string_view{text}.substr(split + 1);
-    std::string argument_copy{tail};
-    char* argument = argument_copy.data();
-    const std::string name_copy{name};
-    const auto line = name_copy.c_str();
     if (name.empty()) return;
     if (name == "help") {
         console.write("PROGRAM [ARGS] [&] | PIPELINE | jobs | status | fg/bg/kill/wait [ID]\n"
             "cd [DIR] | pwd | ls | cat | edit | tasks | touch | mkdir [-p] | rm [-rf] | mv | cp | stat\n"
-            "PROGRAM > FILE | PROGRAM >> FILE | svc [start/stop/restart SERVICE] | mkfs\n"
+            "PROGRAM > FILE | PROGRAM >> FILE | svc [start/stop/restart/remove PATH] | mkfs\n"
             "Ctrl+C terminates the foreground job; Ctrl+Z suspends it.\n");
         return;
     }
-    if (std::string_view{line} == "svc") {
-        ubus_conn bus;
-        auto status = bus.bind(info.environment);
-        if (status != STATUS_OK) { error(console, status); return; }
-        const auto split = tail.find(' ');
-        const auto verb = tail.substr(0, split);
-        const auto target = split == tail.npos ? std::string_view{} : tail.substr(split + 1);
-        for (const auto role : {"system", "session", "devices"}) {
-            ubus_conn manager;
-            ubus_msg query, ready; query.data.put("name", role);
-            status = bus.invoke("Get", std::move(query), ready);
-            if (status == STATUS_OK) status = manager.bind(ready.capability(ready.data["connector"]));
-            if (status != STATUS_OK) { error(console, status); continue; }
-            ubus_msg response;
-            status = manager.invoke("List", {}, response);
-            if (status != STATUS_OK) { error(console, status); continue; }
-            for (const auto service : response.data["items"].values()) {
-                const auto service_name = service["name"].as<std::string_view>().value_or("?");
-                if (tail.empty()) {
-                    (void)libk::fmt::format_to<"{} {}">(console, service_name, service["state"].as<std::string_view>().value_or("?"));
-                    if (const auto result = service["result"].as<int64_t>(); result && *result)
-                        (void)libk::fmt::format_to<" result={}">(console, *result);
-                    console.write("\n");
-                } else if (target == service_name) {
-                    if (verb != "start" && verb != "stop" && verb != "restart") { error(console, STATUS_BAD_ARGS); return; }
-                    ubus_msg request, result;
-                    request.data.put("id", service["id"]).put("gen", service["gen"]).put("action", verb);
-                    status = manager.invoke("Action", std::move(request), result);
-                    if (status == STATUS_OK) console.write("service change requested\n"); else error(console, status);
-                    return;
-                }
-            }
-        }
-        if (!tail.empty()) error(console, STATUS_NOT_FOUND);
-        return;
-    }
-    if (std::string_view{line} == "mkfs") {
-        uint8_t id[16]{};
-        const std::string_view text{argument};
-        if (!text.empty()) {
-            if (text.size() != 2 * sizeof(id)) {
-                error(console, STATUS_BAD_ARGS);
-                return;
-            }
-            for (size_t i = 0; i < sizeof(id); ++i) {
-                const auto byte = libk::parse<uint8_t>(text.substr(2 * i, 2), 16);
-                if (!byte) {
-                    error(console, STATUS_BAD_ARGS);
-                    return;
-                }
-                id[i] = *byte;
-            }
-        }
-        ubus_conn directory, admin;
-        auto status = directory.bind(info.environment);
-        ubus_msg query, ready; query.data.put("name", "store.admin");
-        if (status == STATUS_OK) status = directory.invoke("Get", std::move(query), ready);
-        if (status == STATUS_OK) status = admin.bind(ready.capability(ready.data["connector"]), "myos.files", 1, 1);
-        ubus_msg request, result; if (!text.empty()) request.data.put("id", std::as_bytes(std::span{id}));
-        if (status == STATUS_OK) status = admin.invoke("Format", std::move(request), result);
-        if (status != STATUS_OK)
-            error(console, status);
-        return;
-    }
-    if (name == "jobs") { session.list(console); return; }
+    if (name == "jobs") { shell.list(console); return; }
     if (name == "cd" || name == "pwd") {
         std::vector<std::string> words;
         std::vector<size_t> cuts{0};
@@ -768,14 +635,14 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
             || *target || background || words.size() > (name == "cd" ? 2U : 1U)) {
             error(console, STATUS_BAD_ARGS); return;
         }
-        if (name == "pwd") { console.write(session.cwd().c_str()); console.write("\n"); }
-        else if (const auto status = session.cd(words.size() == 1 ? "/" : std::string_view{words[1]}); status != STATUS_OK)
+        if (name == "pwd") { console.write(shell.cwd().c_str()); console.write("\n"); }
+        else if (const auto status = shell.cd(words.size() == 1 ? "/" : std::string_view{words[1]}); status != STATUS_OK)
             error(console, status);
         return;
     }
-    if (name == "status") { session.status(console); return; }
+    if (name == "status") { shell.status(console); return; }
     if (name == "fg" || name == "bg" || name == "kill" || name == "wait") {
-        uint64_t id = session.latest(name == "fg" || name == "bg"), deadline{};
+        uint64_t id = shell.latest(name == "fg" || name == "bg"), deadline{};
         if (!tail.empty()) {
             const auto split = tail.find(' ');
             const auto number = libk::parse<uint64_t>(tail.substr(0, split));
@@ -788,15 +655,13 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
                 deadline = *time;
             }
         }
-        if (const auto status = session.control(name, id, deadline); status != STATUS_OK) error(console, status);
+        if (const auto status = shell.control(name, id, deadline); status != STATUS_OK) error(console, status);
         return;
     }
-    const bool read_only = name == "view";
-    if (read_only) text = std::string{tail};
+    const std::string profile = shell.profile(name) ? std::string{name} : "";
+    if (!profile.empty()) text = std::string{tail};
     bool background{};
     std::vector<std::string> words;
-    const bool file_command = name == "stat" || name == "create" || name == "write" || name == "append";
-    if (file_command) words.emplace_back("fs");
     std::vector<size_t> cuts{0};
     char target[128]{};
     bool append{};
@@ -808,16 +673,16 @@ static void command(sh_session& session, std::string text, const rt_env& info) {
         if (append) words.emplace_back("-a");
     }
     cuts.push_back(words.size());
-    if (const auto status = session.spawn(words, cuts, background, text, read_only); status != STATUS_OK) error(console, status);
+    if (const auto status = shell.spawn(words, cuts, background, text, profile); status != STATUS_OK) error(console, status);
 }
 
 int main() {
     const auto& info = rt_startup();
-    sh_session session{info};
-    sh_writer{session.output()}.write("myos native shell\n");
-    session.prompt();
+    sh_shell shell{info};
+    sh_writer{shell.output()}.write("myos native shell\n");
+    shell.prompt();
     for (;;) {
-        command(session, session.read(), info);
-        session.prompt();
+        command(shell, shell.read());
+        shell.prompt();
     }
 }

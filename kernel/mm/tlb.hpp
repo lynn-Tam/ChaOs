@@ -27,13 +27,13 @@ class Flush final : private libk::noncopyable_nonmovable {
     bool executable() const noexcept { return executable_; }
     const CpuSet &targets() const noexcept { return targets_; }
     bool adopt(OwnedPage &&page) noexcept { return pages_.attach(std::move(page)); }
-    bool adopt(OwnedPage &&page, resource::Charge &&fee) noexcept {
-        if (fee.amount() != resource::budget{.memory = page_size} || !adopt(std::move(page))) return false;
+    bool adopt(OwnedPage &&page, resource::Usage &&fee) noexcept {
+        if (fee.amount() != resource::Budget{.memory = page_size} || !adopt(std::move(page))) return false;
         fee_.merge(std::move(fee));
         return true;
     }
     usize page_count() const noexcept { return pages_.page_count(); }
-    bool release(resource::Charge &refund) noexcept;
+    bool release(resource::Usage &release) noexcept;
     // Failed sends leave the same pending request live; duplicate IPIs are safe.
     bool kick(Cpus &) const noexcept;
 
@@ -42,7 +42,7 @@ class Flush final : private libk::noncopyable_nonmovable {
     friend class KSpace;
     friend void drain_tlb(CpuId) noexcept;
     void ack(CpuId) noexcept;
-    resource::Charge fee_{};
+    resource::Usage fee_{};
     PageGroup pages_{};
     sync::Latch done_;
     Tlb *owner_{};

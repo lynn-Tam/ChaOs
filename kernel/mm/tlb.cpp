@@ -18,9 +18,9 @@ Flush::~Flush() noexcept {
     if (owner_) libk_assert(owner_->retained_.fetch_sub(1, std::memory_order_release) != 0);
 }
 
-bool Flush::release(resource::Charge &refund) noexcept {
+bool Flush::release(resource::Usage &release) noexcept {
     if (!complete()) return false;
-    libk_assert(!refund);
+    libk_assert(!release);
     for (usize i = 0; i < 8 && pages_.page_count(); ++i) {
         auto page = pages_.take();
         if (!page) break;
@@ -28,7 +28,7 @@ bool Flush::release(resource::Charge &refund) noexcept {
     }
     if (pages_.page_count()) return false;
     pages_.reset();
-    refund = std::move(fee_);
+    release = std::move(fee_);
     if (owner_) {
         libk_assert(owner_->retained_.fetch_sub(1, std::memory_order_release) != 0);
         owner_ = nullptr;

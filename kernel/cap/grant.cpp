@@ -31,7 +31,7 @@ void Attachment::reset() noexcept {
 auto Attachment::detach() noexcept -> bool {
     return graph_ ? graph_->detach(*this) : link_.detach();
 }
-auto Attachment::acquire() const noexcept -> std::expected<GrantLease, GrantError> {
+auto Attachment::acquire() const noexcept -> std::expected<GrantPin, GrantError> {
     if (!graph_) return std::unexpected(GrantError::InvalidState);
     if (!node_) return std::unexpected(GrantError::InvalidState);
     return graph_->try_acquire(*static_cast<Graph::Node*>(node_)->slot, generation_);
@@ -49,13 +49,13 @@ auto Attachment::id() const noexcept -> GrantId {
 }
 
 Graph::Graph(mm::Pmm& pmm, ::WorkQueue& work) noexcept
-    : Graph(pmm, work, Quota{}) {}
+    : Graph(pmm, work, QuotaLimit{}) {}
 
-Graph::Graph(mm::Pmm& pmm, ::WorkQueue& work, Quota quota) noexcept
+Graph::Graph(mm::Pmm& pmm, ::WorkQueue& work, QuotaLimit quota) noexcept
     : pmm_(&pmm),
       quota_(quota), executor_(work), job_(Work::Fn::bind<&Graph::run_work>(*this)) {}
 
-auto GrantLease::key() const noexcept -> GrantKey {
+auto GrantPin::key() const noexcept -> GrantKey {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     const auto& node = *static_cast<const Graph::Node*>(d.node);
@@ -64,50 +64,50 @@ auto GrantLease::key() const noexcept -> GrantKey {
     return Graph::key_of(node);
 }
 
-auto GrantLease::id() const noexcept -> GrantId {
+auto GrantPin::id() const noexcept -> GrantId {
     return static_cast<const Graph::Node*>(h_.get().node)->slot->id;
 }
 
-auto GrantLease::graph() const noexcept -> Graph& {
+auto GrantPin::graph() const noexcept -> Graph& {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     return *d.graph;
 }
 
-auto GrantLease::kind() const noexcept -> ObjKind {
+auto GrantPin::kind() const noexcept -> ObjKind {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     return static_cast<const Graph::Node*>(d.node)->target.kind();
 }
 
-auto GrantLease::get() const noexcept -> void* {
+auto GrantPin::get() const noexcept -> void* {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     // Revocation and reclamation cannot move Node::target until operations=0.
     return static_cast<const Graph::Node*>(d.node)->target.get();
 }
 
-auto GrantLease::target_live() const noexcept -> bool {
+auto GrantPin::target_live() const noexcept -> bool {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     return static_cast<const Graph::Node*>(d.node)->target.live();
 }
 
-auto GrantLease::target_id() const noexcept -> object::Id {
+auto GrantPin::target_id() const noexcept -> object::Id {
     return static_cast<const Graph::Node*>(h_.get().node)->target.id();
 }
 
-auto GrantLease::ceiling() const noexcept -> View {
+auto GrantPin::ceiling() const noexcept -> View {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
     return static_cast<const Graph::Node*>(d.node)->ceiling;
 }
 
-auto GrantLease::target() const noexcept -> const object::ref<>& {
+auto GrantPin::target() const noexcept -> const object::ref<>& {
     return static_cast<const Graph::Node*>(h_.get().node)->target;
 }
 
-auto GrantLease::clone_target() const noexcept
+auto GrantPin::clone_target() const noexcept
     -> std::expected<object::ref<>, object::error> {
     const auto& d = h_.get();
     libk_assert(d.graph != nullptr);
@@ -116,7 +116,7 @@ auto GrantLease::clone_target() const noexcept
     return target;
 }
 
-auto GrantLease::attach(Attachment& attachment) const noexcept
+auto GrantPin::attach(Attachment& attachment) const noexcept
     -> std::expected<void, GrantError> {
     const auto& d = h_.get();
     if (d.graph == nullptr) {
@@ -125,18 +125,18 @@ auto GrantLease::attach(Attachment& attachment) const noexcept
     return d.graph->attach(*this, attachment);
 }
 
-auto GrantLease::mint(resource::Reservation&& charge, View ceiling) const noexcept
+auto GrantPin::mint(resource::Reservation&& usage, View ceiling) const noexcept
     -> std::expected<GrantRef, GrantError> {
     const auto& d = h_.get();
     if (!d.graph) return std::unexpected(GrantError::InvalidKey);
     auto* parent = static_cast<Graph::Node*>(d.node);
     if (!validate_ceiling(parent->target.kind(), ceiling))
         return std::unexpected(GrantError::RightsViolation);
-    return d.graph->create(std::move(charge), object::ref<>{parent->target}, ceiling, parent);
+    return d.graph->create(std::move(usage), object::ref<>{parent->target}, ceiling, parent);
 }
 
-void GrantLease::Drop::operator()(Data& d) const noexcept {
-    d.graph->drop_lease(d.node, d.gen);
+void GrantPin::Drop::operator()(Data& d) const noexcept {
+    d.graph->drop_pin(d.node, d.gen);
 }
 
 auto GrantRef::key() const noexcept -> GrantKey {
@@ -165,7 +165,7 @@ auto GrantRef::clone() const noexcept
 }
 
 auto GrantRef::acquire() const noexcept
-    -> std::expected<GrantLease, GrantError> {
+    -> std::expected<GrantPin, GrantError> {
     const auto& d = h_.get();
     if (d.graph == nullptr) {
         return std::unexpected(GrantError::InvalidKey);
@@ -193,26 +193,26 @@ auto Graph::create_root(
 }
 
 auto Graph::create_root(
-    resource::Reservation&& charge,
+    resource::Reservation&& usage,
     object::ref<> target,
     View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
     if (!target || !validate_ceiling(target.kind(), ceiling)) {
         return std::unexpected(GrantError::RightsViolation);
     }
     return create(
-        std::move(charge), std::move(target), ceiling, nullptr);
+        std::move(usage), std::move(target), ceiling, nullptr);
 }
 
 auto Graph::derive(
-    const GrantLease& source,
+    const GrantPin& source,
     object::ref<> target,
     View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
     return derive({}, source, std::move(target), ceiling);
 }
 
 auto Graph::derive(
-    resource::Reservation&& charge,
-    const GrantLease& source,
+    resource::Reservation&& usage,
+    const GrantPin& source,
     object::ref<> target,
     View ceiling) noexcept -> std::expected<GrantRef, GrantError> {
     if (source.h_.get().graph != this || !target) {
@@ -233,11 +233,11 @@ auto Graph::derive(
         return std::unexpected(GrantError::RightsViolation);
     }
     return create(
-        std::move(charge), std::move(target), ceiling, parent);
+        std::move(usage), std::move(target), ceiling, parent);
 }
 
 auto Graph::create(
-    resource::Reservation&& charge,
+    resource::Reservation&& usage,
     object::ref<> target,
     View ceiling,
     Node* parent) noexcept -> std::expected<GrantRef, GrantError> {
@@ -259,7 +259,7 @@ auto Graph::create(
         std::move(target),
         ceiling,
         parent,
-        std::move(charge));
+        std::move(usage));
 
     object::ref<> returned{};
     bool rejected{};
@@ -286,7 +286,7 @@ auto Graph::create(
     }
     if (rejected) {
         returned = std::move(node->target);
-        auto refund = node->funding.detach();
+        auto release = node->allocation.detach();
         libk::destroy_at(node);
         {
             sync::Lock guard{lock_};
@@ -296,7 +296,7 @@ auto Graph::create(
             static_cast<void>(storage_.release(*slot, false));
         }
         returned.reset();
-        refund.complete();
+        release.complete();
         return std::unexpected(GrantError::InvalidState);
     }
     if (parent) { object::changed(target_key); kick_work(); }
@@ -387,7 +387,7 @@ auto Graph::ref(GrantKey key) noexcept -> std::expected<GrantRef, GrantError> {
         : std::expected<GrantRef, GrantError>{std::unexpected(GrantError::InvalidKey)};
 }
 
-auto GrantLease::clone() const noexcept -> std::expected<GrantRef, GrantError> {
+auto GrantPin::clone() const noexcept -> std::expected<GrantRef, GrantError> {
     const auto& d = h_.get();
     if (!d.graph) return std::unexpected(GrantError::InvalidKey);
     return d.graph->try_ref(*static_cast<Graph::Node*>(d.node)->slot, d.gen);
@@ -419,7 +419,7 @@ auto Graph::valid(Node& node) noexcept -> bool {
 }
 
 auto Graph::acquire(GrantKey key) noexcept
-    -> std::expected<GrantLease, GrantError> {
+    -> std::expected<GrantPin, GrantError> {
     sync::Lock guard{lock_};
     Node* const node = find(key);
     if (!node) return std::unexpected(GrantError::InvalidKey);
@@ -438,7 +438,7 @@ auto Graph::observe(GrantKey seed_key, GrantId selected, usize depth) noexcept -
 }
 
 auto Graph::try_acquire(Slot& slot, u64 generation) noexcept
-    -> std::expected<GrantLease, GrantError> {
+    -> std::expected<GrantPin, GrantError> {
     auto operations = slot.operations.load(std::memory_order_relaxed);
     for (;;) {
         if (admission_closed(operations)) return std::unexpected(GrantError::InvalidState);
@@ -459,14 +459,14 @@ auto Graph::try_acquire(Slot& slot, u64 generation) noexcept
         release_operation(slot);
         return std::unexpected(GrantError::InvalidState);
     }
-    if (valid(node)) return GrantLease{*this, &node, generation, std::move(use)};
+    if (valid(node)) return GrantPin{*this, &node, generation, std::move(use)};
     use.reset();
     release_operation(slot);
     return std::unexpected(GrantError::InvalidState);
 }
 
 auto Graph::acquire_locked(Slot& slot, u64 generation) noexcept
-    -> std::expected<GrantLease, GrantError> {
+    -> std::expected<GrantPin, GrantError> {
     libk_assert(lock_.held());
     if (slot.generation.load(std::memory_order_relaxed) != generation
         || !slot.occupied.load(std::memory_order_relaxed)
@@ -482,12 +482,12 @@ auto Graph::acquire_locked(Slot& slot, u64 generation) noexcept
                 std::memory_order_acquire, std::memory_order_relaxed)) break;
     }
     slot.node()->validated.store(slot.node()->root->epoch.load(std::memory_order_relaxed), std::memory_order_release);
-    return GrantLease{*this, slot.node(), generation, std::move(use)};
+    return GrantPin{*this, slot.node(), generation, std::move(use)};
 }
 
-auto Graph::attach(const GrantLease& source, Attachment& attachment) noexcept
+auto Graph::attach(const GrantPin& source, Attachment& attachment) noexcept
     -> std::expected<void, GrantError> {
-    std::array<const GrantLease*, 1> grants{&source};
+    std::array<const GrantPin*, 1> grants{&source};
     return admission(grants).attach(source, attachment, {}, {});
 }
 
@@ -528,7 +528,7 @@ auto Graph::Admission::attach(std::span<const Attach> items,
     return graph_->attach_commit(items, std::span{prepared}.first(items.size()), gates, commit, grants_);
 }
 
-auto Graph::publish(std::span<const GrantLease*> grants, libk::delegate<bool() noexcept> commit) noexcept -> bool {
+auto Graph::publish(std::span<const GrantPin*> grants, libk::delegate<bool() noexcept> commit) noexcept -> bool {
     std::array<sync::Spin*, IPC_MAX_CAPS * 2> locks;
     if (grants.size() > locks.size()) return false;
     for (usize i = 0; i < grants.size(); ++i) {
@@ -545,7 +545,7 @@ auto Graph::publish(std::span<const GrantLease*> grants, libk::delegate<bool() n
 
 auto Graph::attach_commit(std::span<const Attach> items, std::span<object::Link::Prepared> prepared,
     std::span<const object::ref<>*> gates, libk::delegate<void() noexcept> commit,
-    std::span<const GrantLease*> grants) noexcept -> std::expected<void, GrantError> {
+    std::span<const GrantPin*> grants) noexcept -> std::expected<void, GrantError> {
     libk_assert(items.size() <= max_attachments && items.size() == prepared.size());
     std::array<sync::Spin*, max_attachments * 3> locks;
     usize lock_count{};
@@ -609,7 +609,7 @@ void Graph::drop_ref(void* raw, u64 generation) noexcept {
     reclaim(GrantKey{reinterpret_cast<usize>(raw), generation}, true);
 }
 
-void Graph::drop_lease(void* raw, u64 generation) noexcept {
+void Graph::drop_pin(void* raw, u64 generation) noexcept {
     libk_assert(raw != nullptr);
     auto& node = *static_cast<Node*>(raw);
     libk_assert(node.slot->generation.load(std::memory_order_acquire)
@@ -815,7 +815,7 @@ void Graph::reclaim(
     bool drop = drop_reference;
     while (current.valid()) {
         object::ref<> target{};
-        resource::Refund refund{};
+        resource::Release release{};
         Node* parent{};
         GrantKey parent_key{};
         Slot* slot{};
@@ -875,7 +875,7 @@ void Graph::reclaim(
                 }
                 target = std::move(node.target);
                 slot = node.slot;
-                // Claim finalization before dropping the lock. Refunds and
+                // Claim finalization before dropping the lock. Releases and
                 // target release can reenter the graph; stale holders must
                 // not unlink this node or claim its storage a second time.
                 slot->state.store(GrantState::Revoked, std::memory_order_release);
@@ -888,7 +888,7 @@ void Graph::reclaim(
         if (parent) kick_work();
         if (parent && target) object::changed(target.key());
         target.reset();
-        refund = slot->node()->funding.detach();
+        release = slot->node()->allocation.detach();
 
         {
             sync::Lock guard{lock_};
@@ -896,7 +896,7 @@ void Graph::reclaim(
             libk_assert(!slot->occupied.load(std::memory_order_acquire));
             static_cast<void>(storage_.release(*slot, false));
         }
-        refund.complete();
+        release.complete();
         // A non-empty child list itself prevents parent reclamation; it does
         // not need a second synthetic reference count.
         current = parent_key;
@@ -961,8 +961,8 @@ auto Graph::live_count() const noexcept -> usize {
     return storage_.live();
 }
 
-auto Graph::node_charge() noexcept -> resource::budget {
-    return resource::budget{.memory = sizeof(Slot)};
+auto Graph::node_usage() noexcept -> resource::Budget {
+    return resource::Budget{.memory = sizeof(Slot)};
 }
 
 void Graph::changed(Node& node) noexcept {

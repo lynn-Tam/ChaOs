@@ -6,7 +6,7 @@
 // System V initial-stack auxv. The SYS keys are this OS's extension.
 enum {
     AT_NULL = 0, AT_PAGESZ = 6, AT_ENTRY = 9,
-    AT_SYS_POOL = 0x6000, AT_SYS_VSPACE, AT_SYS_CSPACE, AT_SYS_EVENTS,
+    AT_SYS_QUOTA = 0x6000, AT_SYS_VSPACE, AT_SYS_CSPACE, AT_SYS_EVENTS,
     AT_SYS_CPUS, AT_SYS_IPC, AT_SYS_ENV,
     AT_SYS_BOOT, AT_SYS_BOOT_SIZE, AT_SYS_SCOPE, AT_SYS_DOMAIN,
 };

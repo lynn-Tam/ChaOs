@@ -4,7 +4,7 @@
 #include <optional>
 #include <cap/grant.hpp>
 #include <object/ref.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <ipc/channel.hpp>
 
 #include <libk/assert.hpp>
@@ -80,10 +80,10 @@ Channel::~Channel() noexcept {
     libk_assert(!opened_ || closing_);
 }
 
-void Channel::bind_funding(
-    resource::Funding& sponsor) noexcept {
-    libk_assert(!payer_);
-    payer_ = sponsor.payer();
+void Channel::bind_allocation(
+    resource::Allocation& source) noexcept {
+    libk_assert(!quota_);
+    quota_ = source.quota();
 }
 
 auto Channel::open() noexcept -> std::expected<void, ChannelError> {
@@ -106,7 +106,7 @@ auto Channel::open() noexcept -> std::expected<void, ChannelError> {
     for (usize i = 0; i < 2; ++i) {
         auto& queue = sides_[i];
         while (queue.free.size() < config_.queue_capacity) {
-            auto made = messages_.create(payer_);
+            auto made = messages_.create(quota_);
             if (!made) return std::unexpected(ChannelError::ResourceExhausted);
             made.value()->destination = i ? ChannelSide::B : ChannelSide::A;
             queue.free.push_back(*made.value());
@@ -227,7 +227,7 @@ auto Channel::send(
         {
             sync::Lock guard{target.lock};
             if (const auto error = available()) return std::unexpected(*error);
-            // GrantLease already owns the invocation and object use. Only new
+            // GrantPin already owns the invocation and object use. Only new
             // capabilities/relations need a late Graph/Gate installation cut.
             auto& message = target.free.pop_front();
             message.called = false;
@@ -269,15 +269,15 @@ auto Channel::send_caps(cap::Resolved<Channel>& cap, cap::CSpace& source, const 
 auto Channel::enqueue(cap::Resolved<Channel>& cap, const ChanMsg& request, std::span<Escrow> escrows, bool called) noexcept -> std::expected<u64, ChannelError> {
     auto& target = side(peer(*side_for(cap, cap::Right::Send)));
     // Preparation does not authorize a later publication through a closed Gate.
-    std::array<cap::GrantLease, CHANNEL_MAX_CAPS> leases;
-    std::array<const cap::GrantLease*, CHANNEL_MAX_CAPS + 1> grants;
+    std::array<cap::GrantPin, CHANNEL_MAX_CAPS> pins;
+    std::array<const cap::GrantPin*, CHANNEL_MAX_CAPS + 1> grants;
     std::array<const object::ref<>*, CHANNEL_MAX_CAPS + 1> gates;
-    grants[0] = &cap.lease(); gates[0] = &cap.lease().target();
+    grants[0] = &cap.pin(); gates[0] = &cap.pin().target();
     for (usize i = 0; i < escrows.size(); ++i) {
-        auto lease = escrows[i].cap.grant.acquire();
-        if (!lease) return std::unexpected(ChannelError::TransferFailed);
-        leases[i] = std::move(*lease);
-        grants[i + 1] = &leases[i]; gates[i + 1] = &leases[i].target();
+        auto pin = escrows[i].cap.grant.acquire();
+        if (!pin) return std::unexpected(ChannelError::TransferFailed);
+        pins[i] = std::move(*pin);
+        grants[i + 1] = &pins[i]; gates[i + 1] = &pins[i].target();
     }
     Source::Publication publications[2];
     u64 sequence{};
@@ -299,7 +299,7 @@ auto Channel::enqueue(cap::Resolved<Channel>& cap, const ChanMsg& request, std::
             cell.sequence = sequence = ++target.sequence;
             ++target.occupied; target.queue.push_back(cell);
         };
-        const bool admitted = cap.lease().graph().admission(std::span{grants}.first(count))
+        const bool admitted = cap.pin().graph().admission(std::span{grants}.first(count))
             .publish(std::span{gates}.first(count), commit) == STATUS_OK;
         if (!admitted) return std::unexpected(ChannelError::InvalidCap);
         readiness_locked(target, publications);
@@ -312,8 +312,8 @@ auto Channel::call(cap::Resolved<Channel>& request_cap, cap::CSpace& source,
     const ChanMsg& request, cap::Resolved<Channel>& transport) noexcept -> std::expected<u64, ChannelError> {
     const auto sender = side_for(request_cap, cap::Right::Send);
     const auto effective = request_cap.view();
-    const auto* authority = std::get_if<cap::ChanLimit>(&effective.data);
-    if (!sender || request_cap.token() || !authority || !authority->exact()
+    const auto* limit = std::get_if<cap::ChanLimit>(&effective.data);
+    if (!sender || request_cap.token() || !limit || !limit->exact()
         || request.word_count > config_.max_words || request.cap_count >= config_.max_caps)
         return std::unexpected(ChannelError::Invalid);
     if (!side(peer(*sender)).writable.load(std::memory_order_acquire))
@@ -323,7 +323,7 @@ auto Channel::call(cap::Resolved<Channel>& request_cap, cap::CSpace& source,
     if (!reply_side || transport.token() || !transport.rights().contains(cap::Right::Send))
         return std::unexpected(ChannelError::Denied);
     if (&channel == this && *reply_side == *sender) return std::unexpected(ChannelError::Invalid);
-    auto grant = transport.lease().clone();
+    auto grant = transport.pin().clone();
     auto reference = transport.reference();
     if (!grant || !reference) return std::unexpected(ChannelError::InvalidCap);
     auto typed = std::move(*reference).as<Channel>();
@@ -393,16 +393,16 @@ auto Channel::cancel(cap::Resolved<Channel>& cap, u64 token, bool discard) noexc
 
 auto Channel::reply(cap::Resolved<Channel>& cap, const ChanMsg& request,
     std::span<Escrow> escrows) noexcept -> std::expected<u64, ChannelError> {
-    std::array<cap::GrantLease, CHANNEL_MAX_CAPS> leases;
-    std::array<const cap::GrantLease*, CHANNEL_MAX_CAPS + 1> grants;
+    std::array<cap::GrantPin, CHANNEL_MAX_CAPS> pins;
+    std::array<const cap::GrantPin*, CHANNEL_MAX_CAPS + 1> grants;
     std::array<const object::ref<>*, CHANNEL_MAX_CAPS + 1> gates;
-    grants[0] = &cap.lease();
-    gates[0] = &cap.lease().target();
+    grants[0] = &cap.pin();
+    gates[0] = &cap.pin().target();
     for (usize i = 0; i < escrows.size(); ++i) {
         auto acquired = escrows[i].cap.grant.acquire();
         if (!acquired) return std::unexpected(ChannelError::TransferFailed);
-        leases[i] = std::move(*acquired); grants[i + 1] = &leases[i];
-        gates[i + 1] = &leases[i].target();
+        pins[i] = std::move(*acquired); grants[i + 1] = &pins[i];
+        gates[i + 1] = &pins[i].target();
     }
     auto& source = cap.source();
     auto* slot = source.slot(cap.selector().index());
@@ -433,7 +433,7 @@ auto Channel::reply(cap::Resolved<Channel>& cap, const ChanMsg& request,
             return true;
         };
         if (escrows.empty()) commit();
-        else if (cap.lease().graph().admission(std::span{grants}.first(escrows.size() + 1))
+        else if (cap.pin().graph().admission(std::span{grants}.first(escrows.size() + 1))
             .publish(std::span{gates}.first(escrows.size() + 1), commit) != STATUS_OK)
             return std::unexpected(ChannelError::TransferFailed);
         readiness_locked(direction, publications);
@@ -486,8 +486,8 @@ auto Channel::receive(
     }
     auto reference = cap.reference();
     if (!reference) return std::unexpected(ChannelError::InvalidCap);
-    const cap::GrantLease* grants[]{&cap.lease()};
-    const auto authority = cap.lease().graph().admission(grants);
+    const cap::GrantPin* grants[]{&cap.pin()};
+    const auto admission = cap.pin().graph().admission(grants);
     const object::ref<>* gates[]{&*reference};
     libk::inplace_vector<cap::CSpace::Reservation, CHANNEL_MAX_CAPS> reservations;
     for (usize i = 0; i < count; ++i) {
@@ -509,10 +509,10 @@ auto Channel::receive(
             if (current.call == consumed) { current.call = nullptr; current.call_done = false; }
         };
         const auto commit = commit_escrows(message, destination, reservations, result,
-            authority, gates, Source::Action::bind(dequeue));
+            admission, gates, Source::Action::bind(dequeue));
         if (!commit) {
             if (commit.error() != ChannelError::TransferFailed) return std::unexpected(commit.error());
-            if (authority.publish(gates, dequeue) != STATUS_OK)
+            if (admission.publish(gates, dequeue) != STATUS_OK)
                 return std::unexpected(ChannelError::InvalidCap);
         } else transferred = true;
         readiness_locked(current, publications);
@@ -577,18 +577,18 @@ auto Channel::mint(
     if (data == nullptr || !data->unbound() || !effective.rights.contains(rights)) {
         return std::unexpected(ChannelError::Denied);
     }
-    if (!destination.funding_) return std::unexpected(ChannelError::ResourceExhausted);
+    if (!destination.allocation_) return std::unexpected(ChannelError::ResourceExhausted);
     auto slot = destination.reserve();
-    auto charge = destination.reserve_grant();
-    if (!slot || !charge)
-        return std::unexpected(cap_error(!slot ? slot.error() : charge.error()));
+    auto usage = destination.reserve_grant();
+    if (!slot || !usage)
+        return std::unexpected(cap_error(!slot ? slot.error() : usage.error()));
     const cap::ChanLimit child_data{
         .side = *side_value,
         .badge = badge,
         .fixed = ~u64{},
     };
     const cap::View ceiling{rights, child_data};
-    auto child = cap.lease().mint(std::move(*charge), ceiling);
+    auto child = cap.pin().mint(std::move(*usage), ceiling);
     if (!child) {
         return std::unexpected(ChannelError::Denied);
     }
@@ -721,8 +721,8 @@ void Channel::discard_escrows(std::span<Escrow> escrows, bool committed) noexcep
     for (auto& escrow : escrows) {
         if (auto* source = escrow.source_slot.owner_) {
             if (committed || !source->escrow_restore(escrow.source_slot, std::move(escrow.cap))) {
-                auto refund = source->escrow_drop(escrow.source_slot);
-                refund.reset();
+                auto release = source->escrow_drop(escrow.source_slot);
+                release.reset();
             }
         }
         escrow.cap = {};
@@ -791,7 +791,7 @@ auto Channel::make_escrow(
         return std::unexpected(cap_error(copied.error()));
     }
     auto snapshot = std::move(copied).value();
-    cap::GrantLease lease = std::move(snapshot.lease);
+    cap::GrantPin pin = std::move(snapshot.pin);
     if (snapshot.token && *kind != Kind::Move) return std::unexpected(ChannelError::Denied);
     switch (*kind) {
     case Kind::Copy: {
@@ -799,8 +799,8 @@ auto Channel::make_escrow(
             return std::unexpected(ChannelError::Denied);
         }
         const cap::View view{*rights, snapshot.view.data};
-        auto valid = cap::compose(lease.kind(), snapshot.view, view);
-        auto grant = lease.clone();
+        auto valid = cap::compose(pin.kind(), snapshot.view, view);
+        auto grant = pin.clone();
         if (!valid || !grant) {
             return std::unexpected(ChannelError::Denied);
         }
@@ -811,18 +811,18 @@ auto Channel::make_escrow(
     case Kind::Delegate: {
         const cap::View ceiling{*rights, snapshot.view.data};
         if (!snapshot.view.rights.contains(cap::Right::Delegate)
-            || !cap::attenuates(lease.kind(), snapshot.view, ceiling)) {
+            || !cap::attenuates(pin.kind(), snapshot.view, ceiling)) {
             return std::unexpected(ChannelError::Denied);
         }
-        auto charge = source.reserve_grant();
-        auto target = lease.clone_target();
-        auto valid = cap::compose(lease.kind(), ceiling,
+        auto usage = source.reserve_grant();
+        auto target = pin.clone_target();
+        auto valid = cap::compose(pin.kind(), ceiling,
             cap::View{*rights, snapshot.view.data});
-        if (!charge || !target || !valid) {
+        if (!usage || !target || !valid) {
             return std::unexpected(ChannelError::ResourceExhausted);
         }
-        auto child = lease.graph().derive(
-            std::move(charge).value(), lease,
+        auto child = pin.graph().derive(
+            std::move(usage).value(), pin,
             std::move(target).value(), ceiling);
         if (!child) {
             return std::unexpected(ChannelError::ResourceExhausted);
@@ -851,7 +851,7 @@ auto Channel::make_escrow(
 auto Channel::commit_escrows(
     Message& message, cap::CSpace& destination,
     libk::inplace_vector<cap::CSpace::Reservation, CHANNEL_MAX_CAPS>& reservations,
-    ChanMsg& result, cap::Graph::Admission authority,
+    ChanMsg& result, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates, Source::Action commit) noexcept
     -> std::expected<void, ChannelError> {
     libk_assert(reservations.size() == message.escrows.size());
@@ -863,7 +863,7 @@ auto Channel::commit_escrows(
         result.received[i] = reservations[i].handle().raw();
     }
     auto done = destination.install(std::span{values}.first(reservations.size()),
-        std::span{slots}.first(reservations.size()), authority, gates, commit);
+        std::span{slots}.first(reservations.size()), admission, gates, commit);
     if (!done) return std::unexpected(done.error() == cap::CSpaceError::GrantUnavailable
         ? ChannelError::TransferFailed : cap_error(done.error()));
     return {};

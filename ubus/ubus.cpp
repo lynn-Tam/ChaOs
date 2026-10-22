@@ -284,7 +284,7 @@ auto ubus_object::describe(word_t facet) const -> ubus_data {
     ubus_data methods{ubus_type::Array};
     for (size_t i = 0; i < methods_.size(); ++i) {
         const auto& method = *methods_[i];
-        if ((facet & method.required) != method.required) continue;
+        if ((facet & method.required) != method.required || (access_ && access_(facet, method.name) != STATUS_OK)) continue;
         ubus_data item;
         item.put("name", method.name).put("token", i + 2).put("input", ubus_fields(method.input)).put("output", ubus_fields(method.output)).put("notify", method.notify);
         methods.push(item);
@@ -319,18 +319,23 @@ auto ubus_object::close() -> status_t {
     } else if (const auto status = channel_.close(); status != STATUS_OK) return status;
     return budget_.close();
 }
-auto ubus_object::open(size_t depth, cap_t account) -> status_t {
+auto ubus_object::open(size_t depth, cap_t quota, cap_owner scope) -> status_t {
+    if (endpoint()) return STATUS_BUSY;
+    scope_ = std::move(scope);
     auto alloc = rt_startup().alloc();
-    if (account) {
-        const auto cap = sys::cap_duplicate(account, rt_startup().cspace, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
+    if (quota) {
+        const auto cap = sys::cap_duplicate(quota, rt_startup().cspace, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
         if (cap.status != STATUS_OK) return cap.status;
         budget_ = cap_owner{cap.value};
-        const auto scope = sys::scope_create(alloc); if (scope.status != STATUS_OK) return scope.status;
-        scope_ = cap_owner{scope.value};
-        const auto status = closing_.open(rt_startup().events, account, STATE_CLOSING | STATE_DRAINED);
+        if (!scope_) {
+            const auto scope = sys::scope_create(alloc); if (scope.status != STATUS_OK) return scope.status;
+            scope_ = cap_owner{scope.value};
+        }
+        const auto status = closing_.open(rt_startup().events, quota, STATE_CLOSING | STATE_DRAINED);
         if (status != STATUS_OK) return status;
-        alloc = {budget_.selector(), scope_.selector()};
+        alloc.quota = budget_.selector();
     }
+    if (scope_) alloc.scope = scope_.selector();
     auto status = channel_.open(alloc, depth, CHANNEL_MAX_CAPS);
     if (status == STATUS_OK) status = input_.open(endpoint(), rt_startup().events);
     return status;
@@ -360,7 +365,9 @@ auto ubus_object::bind(ubus_request& request) -> status_t {
     const auto minimum = input["minimum"].as<uint64_t>(), maximum = input["maximum"].as<uint64_t>();
     const auto features = input["features"].as<uint64_t>();
     ubus_msg response;
+    const auto authorized = access_ ? access_(request.badge / 2, {}) : STATUS_OK;
     if (const auto admitted = rt_admit(request.deadline); admitted != STATUS_OK) response.status = admitted;
+    else if (authorized != STATUS_OK) response.status = authorized;
     else if (!interface || !minimum || !maximum || !features || (!interface->empty() && *interface != interface_)
         || *minimum > version_ || *maximum < version_ || (*features & features_) != *features) response.status = STATUS_BAD_ARGS;
     else {
@@ -395,11 +402,13 @@ auto ubus_object::poll() -> status_t {
     response.status = rt_admit(request.deadline);
     const auto facet = request.badge >= 2 ? (request.badge - 2) / 2 : 0;
     if (!request.badge || (request.badge & 1)) response.status = STATUS_BAD_RIGHTS;
+    else if (access_ && access_(facet, {}) != STATUS_OK) response.status = STATUS_CLOSED;
     else if (!request.tag) response.data = describe(facet);
     else if (request.tag < 2 || request.tag - 2 >= methods_.size()) response.status = STATUS_INVALID_OP;
     else if (response.status == STATUS_OK) {
         request.method = methods_[request.tag - 2];
         if ((facet & request.method->required) != request.method->required) response.status = STATUS_BAD_RIGHTS;
+        else if (access_ && access_(facet, request.method->name) != STATUS_OK) response.status = STATUS_DENIED;
         else if (!request.reply && !request.method->notify) response.status = STATUS_BAD_ARGS;
         else if (!ubus_matches(request.data.view(), request.method->input)) response.status = STATUS_BAD_ARGS;
         else {

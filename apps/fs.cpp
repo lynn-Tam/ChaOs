@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <libk/fmt.hpp>
+#include <libk/parse.hpp>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -154,6 +155,24 @@ int main(int argc, char** argv) {
             }
         }
         return result;
+    }
+    if (command == "format") {
+        if (argc != 2 && argc != 3) return STATUS_BAD_ARGS;
+        ubus_conn bus, admin; ubus_msg request, response; request.data.put("name", "admin");
+        auto status = bus.bind(env.environment);
+        if (status == STATUS_OK) status = bus.invoke("Get", std::move(request), response);
+        if (status == STATUS_OK) status = admin.bind(response.capability(response.data["connector"]));
+        request = {};
+        if (argc == 3) {
+            const std::string_view text{argv[2]}; if (text.size() != 32) return STATUS_BAD_ARGS;
+            std::array<std::byte, 16> id{};
+            for (size_t i = 0; i < id.size(); ++i) {
+                const auto byte = libk::parse<uint8_t>(text.substr(i * 2, 2), 16); if (!byte) return STATUS_BAD_ARGS;
+                id[i] = std::byte{*byte};
+            }
+            request.data.put("id", std::span<const std::byte>{id});
+        }
+        return status == STATUS_OK ? admin.invoke("Format", std::move(request), response) : status;
     }
     if (command == "sync" && argc == 2) return px_sync();
     if ((command == "device" || command == "volid") && argc == 2) {

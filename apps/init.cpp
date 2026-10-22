@@ -10,13 +10,13 @@ int main() {
     if (status != STATUS_OK) return status;
     mgr owner{[&](mgr_child& child) { return archive.image(child.image); }};
     status = owner.open(); if (status != STATUS_OK) return status;
-    const auto queried = sys::account_info(env.pool);
+    const auto queried = sys::quota_info(env.quota);
     if (queried.status != STATUS_OK) return queried.status;
-    const auto budget = *reinterpret_cast<const AccountInfo*>(env.ipc);
+    const auto budget = *reinterpret_cast<const QuotaInfo*>(env.ipc);
     if (budget.memory_available < 8 * 1024 * 1024 || budget.caps_available < 256) return STATUS_NO_MEMORY;
-    auto& child = owner.add("root", "mgr",
+    auto& child = owner.add("root", "/boot/mgr.elf",
         {.bytes=budget.memory_available - 4 * 1024 * 1024, .caps=budget.caps_available - 128,
-         .kinds=OBJ_KINDS, .slots=1024, .pages=132, .pool_perms=RIGHT_CREATE | RIGHT_SPLIT | RIGHT_INSPECT});
+         .kinds=OBJ_KINDS, .slots=1024, .pages=132, .quota_perms=RIGHT_CREATE | RIGHT_SPLIT | RIGHT_INSPECT});
     child.args = {"mgr"}; child.desired = child.restart = true; child.exports.push("*");
     child.setup.data.put("archive", ubus_buffer{*child.setup.attach(root.bundle, RIGHT_MAP | RIGHT_DUPLICATE), 0, root.bundle_bytes})
         .put("firmware", ubus_buffer{*child.setup.attach(root.firmware, RIGHT_MAP | RIGHT_DUPLICATE), root.firmware_offset, root.firmware_bytes})

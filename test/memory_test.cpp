@@ -8,7 +8,7 @@
 #include <utility>
 #include <mm/mem.hpp>
 #include <mm/pager.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <mm/vspace.hpp>
 #include <boot/info.hpp>
 
@@ -649,32 +649,32 @@ bool test_object_store_memory_lifecycle_waits_for_page_lease(
     if (!pin_result) {
         return false;
     }
-    auto pin = std::move(pin_result).value();
-    auto page_result = pin->materialize(0);
+    auto lease = std::move(pin_result).value();
+    auto page_result = lease->materialize(0);
     if (!page_result) {
         return false;
     }
     auto page = std::move(page_result).value();
-    auto operation = pin.admit();
+    auto operation = lease.admit();
     if (!operation) return false;
     if (!fixture.pooled().destroy()) {
         return false;
     }
     fixture.release_pooled();
     bool published{};
-    if (pin.live() || pin.admit() || pin->state() != mm::MemState::Live
+    if (lease.live() || lease.admit() || lease->state() != mm::MemState::Live
         || operation.publish([&] { published = true; }) || published) return false;
     operation.reset();
     while (memory_work->run()) {}
-    if (pin->state() != mm::MemState::Stopping) {
+    if (lease->state() != mm::MemState::Stopping) {
         return false;
     }
     page.reset();
     while (memory_work->run()) {}
-    if (pin->state() != mm::MemState::Retired) {
+    if (lease->state() != mm::MemState::Retired) {
         return false;
     }
-    pin.reset();
+    lease.reset();
     while (memory_work->run()) {}
     if (fixture.memory().get<mm::Mem>().lookup(id)) return false;
     auto next = fixture.memory().get<mm::Mem>().create({}, fixture.pmm(), mm::page_size, mm::AnonCfg{});

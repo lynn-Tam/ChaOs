@@ -33,7 +33,7 @@ static CreateAuth pool;
 static vm_arena* vm;
 
 static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
-    if (!pool.account || !pool.scope || !alignment || (alignment & (alignment - 1))) return nullptr;
+    if (!pool.quota || !pool.scope || !alignment || (alignment & (alignment - 1))) return nullptr;
     alignment = std::max(alignment, Align);
     if (alignment > SIZE_MAX - sizeof(Block) - sizeof(Alloc) - Align
         || n > SIZE_MAX - alignment - sizeof(Block) - sizeof(Alloc) - Align) return nullptr;

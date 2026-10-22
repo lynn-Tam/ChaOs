@@ -130,7 +130,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     boot.scope = std::move(*scope).publish();
     auto owner = object::Scope::reserve(boot.scope);
     libk_assert(owner);
-    auto root = boot.objects.get<resource::Account>().create(std::move(*owner), resource::Reservation{}, resource::budget{
+    auto root = boot.objects.get<resource::Quota>().create(std::move(*owner), resource::Reservation{}, resource::Budget{
         .memory = static_cast<u64>(free_pages - system_pages)
             * mm::page_size,
         .caps = 4096,

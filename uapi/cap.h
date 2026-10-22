@@ -20,7 +20,7 @@ enum ObjKind {
     ObjCSpace = 4,
     ObjMem = 5,
     ObjVSpace = 6,
-    ObjAccount = 7,
+    ObjQuota = 7,
     ObjNotification = 8,
     ObjChannel = 9,
     ObjPager = 10,
@@ -130,7 +130,7 @@ static_assert(offsetof(CapView, words) == 16);
 #define RIGHT_OBSERVE             (U64_C(1) << 24)
 #define RIGHT_ATTACH              (U64_C(1) << 25)
 #define RIGHT_ADOPT               (U64_C(1) << 26)
-#define RIGHT_REBILL              (U64_C(1) << 27)
+#define RIGHT_REASSIGN              (U64_C(1) << 27)
 #define RIGHT_MASK          ((U64_C(1) << 28) - 1)
 
 #define OBJ_BIT(kind) (U64_C(1) << (kind))
@@ -142,7 +142,7 @@ static_assert(offsetof(CapView, words) == 16);
 #define STATE_OPEN 1U
 #define STATE_CLOSING 2U
 #define STATE_DRAINED 4U
-struct CreateAuth { cap_t account, scope; };
+struct CreateAuth { cap_t quota, scope; };
 #define SCOPE_INFO 1U
 #define SCOPE_MEMBERS 2U
 #define SCOPE_CAPS 4U
@@ -212,16 +212,16 @@ struct GrantRecords {
 };
 struct ScopeObject {
     uint32_t version, size;
-    uint64_t object_id, owner_id, owner_epoch, account_id, billing_epoch;
+    uint64_t object_id, owner_id, owner_epoch, quota_id, quota_epoch;
     uint64_t storage_memory, storage_caps;
     uint32_t kind, gate, flags, reserved;
 };
 struct ObjectInfo {
     uint32_t version, size;
-    uint64_t object_id, billing_epoch;
+    uint64_t object_id, quota_epoch;
     uint32_t kind, gate; // Common Object gate; payload-specific state uses typed info.
 };
-struct AccountInfo {
+struct QuotaInfo {
     uint32_t version, size;
     uint64_t memory_limit, memory_available, cap_limit, caps_available;
     uint64_t allocations, reservations;

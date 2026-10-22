@@ -261,7 +261,7 @@ void Source::close() noexcept {
             waiter.result_ = *observed(waiter.condition_, waiter.armed_at_);
         }
         publication.ready_ = std::move(waiters_);
-        for (auto& watch : watches_) hint(watch, terminal(watch), publication);
+        for (auto& watch : watches_) hint(watch, closed_result(watch), publication);
     }
 }
 
@@ -277,7 +277,7 @@ auto Source::observed(Condition condition, u64 armed) const noexcept -> std::opt
     return closed_ ? std::optional{WaitResult{STATUS_CLOSED, 0, version_}} : std::nullopt;
 }
 
-auto Source::terminal(const Watch& watch) const noexcept -> WaitResult {
+auto Source::closed_result(const Watch& watch) const noexcept -> WaitResult {
     const auto ready = watch.armed_ ? observed(watch.condition_, watch.armed_at_)->value
         : (watch.state_.load(std::memory_order_acquire) & ~Watch::registered) ? watch.pending_.value : 0;
     return {STATUS_CLOSED, ready, version_};
@@ -306,7 +306,7 @@ auto Source::scan(Pin& unpin) noexcept -> bool {
                 } else { (void)waiters_.pop_front(); waiters_.push_back(waiter); }
             } else if (!watches_.empty() && watches_.front().scanned_ != scan_version_) {
                 auto& watch = watches_.pop_front(); watch.scanned_ = scan_version_; watches_.push_back(watch);
-                if (closed_) hint(watch, terminal(watch), publication);
+                if (closed_) hint(watch, closed_result(watch), publication);
                 else if (watch.armed_) if (const auto result = observed(watch.condition_, watch.armed_at_)) hint(watch, *result, publication);
             } else break;
         }

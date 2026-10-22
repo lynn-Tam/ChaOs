@@ -22,7 +22,7 @@
 #include <base/slab.hpp>
 #include <libk/delegate.hpp>
 #include <mm/pmm.hpp>
-#include <resource/account.hpp>
+#include <resource/quota.hpp>
 
 namespace resource {
 class Reservation;
@@ -37,14 +37,14 @@ class Graph;
 class CSpace;
 class Attachment;
 class GrantRef;
-class GrantLease;
+class GrantPin;
 enum class GrantError : u8;
 
 struct AttachOps final {
     void (*invalidate)(
         void* context,
         object::LinkWork&& work) noexcept;
-    // The terminal ticket stays busy until the owner has secured its own
+    // The final-release ticket stays busy until the owner has secured its own
     // callback lifetime; releasing it permits relation storage reuse.
     void (*released)(void* context, object::LinkWork&& done) noexcept;
     // Persistent mappings retain authority. Protocol-side observers close
@@ -73,14 +73,14 @@ public:
     // A detached attachment is a reusable relation cell. The graph edge must
     // already be gone and all invalidation work drained before resetting it.
     void reset() noexcept;
-    auto acquire() const noexcept -> std::expected<GrantLease, GrantError>;
+    auto acquire() const noexcept -> std::expected<GrantPin, GrantError>;
     auto id() const noexcept -> object::identity<Graph>;
     auto record(u32 kind) const noexcept -> LinkRecord;
 
 private:
     friend class Graph;
     friend class CSpace;
-    template<usize, bool, bool> friend class Authority;
+    template<usize, bool, bool> friend class Bindings;
 
     libk::intrusive_list_hook grant_hook_{};
     Graph* graph_{};
@@ -113,12 +113,12 @@ enum class GrantError : u8 {
 
 // An acquired invocation may finish while revoke drains its operations.
 // Publishing new capabilities or persistent relations still needs Admission.
-class GrantLease final : private libk::noncopyable {
+class GrantPin final : private libk::noncopyable {
 public:
-    GrantLease() noexcept = default;
-    GrantLease(GrantLease&&) noexcept = default;
-    auto operator=(GrantLease&&) noexcept -> GrantLease& = default;
-    ~GrantLease() noexcept = default;
+    GrantPin() noexcept = default;
+    GrantPin(GrantPin&&) noexcept = default;
+    auto operator=(GrantPin&&) noexcept -> GrantPin& = default;
+    ~GrantPin() noexcept = default;
 
     [[nodiscard]] explicit operator bool() const noexcept {
         return static_cast<bool>(h_);
@@ -146,7 +146,7 @@ private:
     // Only the object-owned transaction may change its grant's meaning.
     [[nodiscard]] auto mint(resource::Reservation&&, View) const noexcept
         -> std::expected<GrantRef, GrantError>;
-    GrantLease(
+    GrantPin(
         Graph& graph,
         void* node,
         u64 generation, object::pin&& use) noexcept
@@ -181,7 +181,7 @@ public:
     [[nodiscard]] auto clone() const noexcept
         -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto acquire() const noexcept
-        -> std::expected<GrantLease, GrantError>;
+        -> std::expected<GrantPin, GrantError>;
     void reset() noexcept { h_.reset(); }
 
 private:
@@ -232,11 +232,11 @@ public:
     Resolved(Resolved&&) noexcept = default;
     auto operator=(Resolved&&) noexcept -> Resolved& = default;
 
-    [[nodiscard]] auto object() noexcept -> std::add_lvalue_reference_t<T> requires (!std::is_void_v<T>) { return *static_cast<T*>(lease_.get()); }
-    [[nodiscard]] auto object() const noexcept -> std::add_lvalue_reference_t<const T> requires (!std::is_void_v<T>) { return *static_cast<T*>(lease_.get()); }
-    [[nodiscard]] auto operator->() noexcept -> T* { return static_cast<T*>(lease_.get()); }
+    [[nodiscard]] auto object() noexcept -> std::add_lvalue_reference_t<T> requires (!std::is_void_v<T>) { return *static_cast<T*>(pin_.get()); }
+    [[nodiscard]] auto object() const noexcept -> std::add_lvalue_reference_t<const T> requires (!std::is_void_v<T>) { return *static_cast<T*>(pin_.get()); }
+    [[nodiscard]] auto operator->() noexcept -> T* { return static_cast<T*>(pin_.get()); }
     [[nodiscard]] auto operator->() const noexcept -> const T* {
-        return static_cast<T*>(lease_.get());
+        return static_cast<T*>(pin_.get());
     }
     [[nodiscard]] auto rights() const noexcept -> Rights {
         return view_.rights;
@@ -245,36 +245,36 @@ public:
         return view_;
     }
     [[nodiscard]] auto grant() const noexcept -> GrantKey {
-        return lease_.key();
+        return pin_.key();
     }
     [[nodiscard]] auto reference() const noexcept
         -> std::expected<object::ref<>, object::error> {
-        return lease_.clone_target();
+        return pin_.clone_target();
     }
     [[nodiscard]] auto attach(Attachment& attachment) const noexcept
         -> std::expected<void, GrantError> {
-        return lease_.attach(attachment);
+        return pin_.attach(attachment);
     }
-    [[nodiscard]] auto lease() const noexcept -> const GrantLease& { return lease_; }
+    [[nodiscard]] auto pin() const noexcept -> const GrantPin& { return pin_; }
     auto token() const noexcept -> u64 { return token_; }
     auto selector() const noexcept -> Handle { return selector_; }
-    void reset() noexcept { lease_.reset(); }
+    void reset() noexcept { pin_.reset(); }
     [[nodiscard]] auto source() const noexcept -> CSpace& { return *source_; }
 
 private:
     friend class CSpace;
     Resolved(
         CSpace& source,
-        GrantLease&& lease,
+        GrantPin&& pin,
         View view, Handle selector, u64 token) noexcept
         : source_(&source), selector_(selector), token_(token),
-          lease_(std::move(lease)),
+          pin_(std::move(pin)),
           view_(view) {}
 
     CSpace* source_{};
     Handle selector_;
     u64 token_{};
-    GrantLease lease_;
+    GrantPin pin_;
     View view_{};
 };
 
@@ -292,19 +292,19 @@ public:
         void reset() noexcept { auto pin = std::exchange(pin_, {}); source_ = nullptr; if (pin) pin(false); }
         auto events() const noexcept -> Source& { libk_assert(source_); return *source_; }
     };
-    struct Attach { const GrantLease* grant{}; Attachment* attachment{}; const object::ref<>* target{}; };
+    struct Attach { const GrantPin* grant{}; Attachment* attachment{}; const object::ref<>* target{}; };
     static constexpr usize max_attachments = IPC_MAX_CAPS;
     class Admission {
         friend class Graph;
         friend class CSpace;
         Graph* graph_{};
-        std::span<const GrantLease*> grants_;
-        Admission(Graph& graph, std::span<const GrantLease*> grants) noexcept : graph_(&graph), grants_(grants) {}
+        std::span<const GrantPin*> grants_;
+        Admission(Graph& graph, std::span<const GrantPin*> grants) noexcept : graph_(&graph), grants_(grants) {}
     public:
         Admission() noexcept = default; // Trusted internal calls carry no Grant authority.
         auto attach(std::span<const Attach>, std::span<const object::ref<>*> gates,
             libk::delegate<void() noexcept> commit) const noexcept -> std::expected<void, GrantError>;
-        auto attach(const GrantLease& grant, Attachment& attachment, std::span<const object::ref<>*> gates,
+        auto attach(const GrantPin& grant, Attachment& attachment, std::span<const object::ref<>*> gates,
             libk::delegate<void() noexcept> commit) const noexcept -> std::expected<void, GrantError> {
             const Attach item{&grant, &attachment}; return attach(std::span{&item, 1}, gates, commit);
         }
@@ -322,41 +322,41 @@ public:
             return status;
         }
     };
-    auto admission(std::span<const GrantLease*> grants) noexcept -> Admission { return {*this, grants}; }
+    auto admission(std::span<const GrantPin*> grants) noexcept -> Admission { return {*this, grants}; }
     // Ancestor checks are bounded; installed attachments do not walk this path.
     static constexpr u16 max_depth = 64;
-    struct Quota final {
+    struct QuotaLimit final {
         usize nodes{4096};
     };
 
     explicit Graph(mm::Pmm& pmm, ::WorkQueue& work) noexcept;
-    Graph(mm::Pmm& pmm, ::WorkQueue& work, Quota quota) noexcept;
+    Graph(mm::Pmm& pmm, ::WorkQueue& work, QuotaLimit quota) noexcept;
     ~Graph() noexcept;
 
     [[nodiscard]] auto create_root(
         object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto create_root(
-        resource::Reservation&& charge,
+        resource::Reservation&& usage,
         object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto derive(
-        const GrantLease& source,
+        const GrantPin& source,
         object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto derive(
-        resource::Reservation&& charge,
-        const GrantLease& source,
+        resource::Reservation&& usage,
+        const GrantPin& source,
         object::ref<> target,
         View ceiling) noexcept -> std::expected<GrantRef, GrantError>;
 
     [[nodiscard]] auto ref(GrantKey key) noexcept
         -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto acquire(GrantKey key) noexcept
-        -> std::expected<GrantLease, GrantError>;
+        -> std::expected<GrantPin, GrantError>;
     [[nodiscard]] auto attach(
-        const GrantLease& source,
+        const GrantPin& source,
         Attachment& attachment) noexcept
         -> std::expected<void, GrantError>;
 
@@ -372,19 +372,19 @@ public:
         -> std::expected<GrantState, GrantError>;
     [[nodiscard]] auto live_count() const noexcept -> usize;
     [[nodiscard]] auto work_pending() const noexcept -> bool;
-    [[nodiscard]] static auto node_charge() noexcept
-        -> resource::budget;
+    [[nodiscard]] static auto node_usage() noexcept
+        -> resource::Budget;
 
 private:
     friend class CSpace;
     friend class GrantRef;
-    friend class GrantLease;
+    friend class GrantPin;
     friend class Attachment;
 
-    auto publish(std::span<const GrantLease*>, libk::delegate<bool() noexcept>) noexcept -> bool;
+    auto publish(std::span<const GrantPin*>, libk::delegate<bool() noexcept>) noexcept -> bool;
     auto attach_commit(std::span<const Attach>, std::span<object::Link::Prepared>,
         std::span<const object::ref<>*>, libk::delegate<void() noexcept>,
-        std::span<const GrantLease*> = {}) noexcept -> std::expected<void, GrantError>;
+        std::span<const GrantPin*> = {}) noexcept -> std::expected<void, GrantError>;
     struct Slot;
     using Storage = base::slab<Slot, mm::OwnedPage, mm::page_size>;
     using PageHeader = typename Storage::page;
@@ -408,7 +408,7 @@ private:
             object::ref<> target_ref,
             View ceiling,
             Node* parent_node,
-            resource::Reservation&& charge) noexcept
+            resource::Reservation&& usage) noexcept
             : graph(&graph), slot(&owner),
               kind(target_ref.kind()), target(std::move(target_ref)),
               ceiling(ceiling),
@@ -416,8 +416,8 @@ private:
               depth(parent_node ? parent_node->depth + 1 : 0) {
             events.bind_work(graph.executor_, {}, {}, Source::Pin::bind<&Node::publisher>(*this));
             events.update(0);
-            if (charge) {
-                funding.commit(std::move(charge));
+            if (usage) {
+                allocation.commit(std::move(usage));
             }
         }
 
@@ -442,7 +442,7 @@ private:
         void publisher(bool) noexcept;
         void release_wait() noexcept;
         usize refs{};
-        resource::Funding funding{};
+        resource::Allocation allocation{};
         object::Link lifetime{this, &Graph::invalidate_object, &Graph::release_object};
         object::LinkWork object_work;
     };
@@ -487,7 +487,7 @@ private:
     static constexpr usize slots_per_page = Storage::capacity();
 
     [[nodiscard]] auto create(
-        resource::Reservation&& charge,
+        resource::Reservation&& usage,
         object::ref<> target,
         View ceiling,
         Node* parent) noexcept -> std::expected<GrantRef, GrantError>;
@@ -504,10 +504,10 @@ private:
     [[nodiscard]] auto try_ref(Slot& slot, u64 generation) noexcept
         -> std::expected<GrantRef, GrantError>;
     [[nodiscard]] auto try_acquire(Slot& slot, u64 generation) noexcept
-        -> std::expected<GrantLease, GrantError>;
-    auto acquire_locked(Slot&, u64 generation) noexcept -> std::expected<GrantLease, GrantError>;
+        -> std::expected<GrantPin, GrantError>;
+    auto acquire_locked(Slot&, u64 generation) noexcept -> std::expected<GrantPin, GrantError>;
     void drop_ref(void* node, u64 generation) noexcept;
-    void drop_lease(void* node, u64 generation) noexcept;
+    void drop_pin(void* node, u64 generation) noexcept;
     void release_operation(Slot& slot) noexcept;
     void enqueue(Slot& slot) noexcept;
     void kick_work() noexcept;
@@ -523,7 +523,7 @@ private:
     void release_page(PageHeader& page) noexcept;
 
     mm::Pmm* pmm_{};
-    Quota quota_{};
+    QuotaLimit quota_{};
     mutable sync::Spin lock_{};
     mutable sync::Spin
         work_lock_{};
@@ -535,20 +535,20 @@ private:
     usize growing_{};
 };
 
-static_assert(Graph::Quota{}.nodes != 0);
+static_assert(Graph::QuotaLimit{}.nodes != 0);
 
 // Fixed admission members share one publisher/drain boundary. Domain state
 // remains in the owner; this only owns its actual Grant relations and callbacks.
 template<usize N, bool Retain = true, bool Observe = false>
-class Authority final : private libk::noncopyable_nonmovable {
+class Bindings final : private libk::noncopyable_nonmovable {
     static_assert(N && N <= Graph::max_attachments);
 public:
     using Action = libk::delegate<void() noexcept>;
     class Hold final : private libk::noncopyable {
-        Authority* owner_{};
+        Bindings* owner_{};
         object::ref<> storage_;
-        friend class Authority;
-        explicit Hold(Authority& owner) noexcept
+        friend class Bindings;
+        explicit Hold(Bindings& owner) noexcept
             : owner_(&owner), storage_(object::ref<>::retain_alive(owner.key_)) {
             sync::Lock guard{owner.lock_}; ++owner.calls_;
         }
@@ -558,11 +558,11 @@ public:
     };
 private:
     struct Cell {
-        explicit Cell(Authority& owner) noexcept : owner(owner), attachment(this, ops_) {}
-        Authority& owner;
+        explicit Cell(Bindings& owner) noexcept : owner(owner), attachment(this, ops_) {}
+        Bindings& owner;
         Attachment attachment;
         object::LinkWork work;
-        bool used{}, detaching{}, terminal{true};
+        bool used{}, detaching{}, released{true};
     };
     inline static const AttachOps ops_{
         .invalidate = [](void* p, object::LinkWork&& work) noexcept {
@@ -572,7 +572,7 @@ private:
             auto& cell = *static_cast<Cell*>(p);
             auto publishing = cell.owner.hold();
             done.reset();
-            sync::Lock guard{cell.owner.lock_}; cell.terminal = true;
+            sync::Lock guard{cell.owner.lock_}; cell.released = true;
         },
         .retain = Retain, .observe = Observe,
     };
@@ -586,19 +586,19 @@ private:
     enum class Phase : u8 { Idle, Live, Closing, Closed } phase_{};
     bool revoked_{};
     template<usize... I>
-    Authority(Action invalidate, Action drained, std::index_sequence<I...>) noexcept
+    Bindings(Action invalidate, Action drained, std::index_sequence<I...>) noexcept
         : cells_{((void)I, Cell{*this})...}, invalidate_(invalidate), drained_(drained) {}
-    auto terminal() const noexcept -> bool {
+    auto released() const noexcept -> bool {
         libk_assert(lock_.held());
         return std::ranges::all_of(cells_, [](const auto& cell) {
-            return cell.terminal && !cell.work && !cell.attachment.attached() && !cell.attachment.busy();
+            return cell.released && !cell.work && !cell.attachment.attached() && !cell.attachment.busy();
         });
     }
     void release() noexcept {
         Action drained;
         { sync::Lock guard{lock_};
           libk_assert(calls_);
-          if (--calls_ == 0 && (phase_ == Phase::Closing || phase_ == Phase::Closed) && terminal()) {
+          if (--calls_ == 0 && (phase_ == Phase::Closing || phase_ == Phase::Closed) && released()) {
               if (phase_ != Phase::Closed) changed();
               phase_ = Phase::Closed; drained = drained_;
           }
@@ -618,9 +618,9 @@ private:
         if (closing) static_cast<void>(close()); // Also drain late invalidations.
     }
 public:
-    Authority(Action invalidate, Action drained) noexcept
-        : Authority(invalidate, drained, std::make_index_sequence<N>{}) {}
-    ~Authority() noexcept { sync::Lock guard{lock_}; libk_assert(!calls_ && terminal()); }
+    Bindings(Action invalidate, Action drained) noexcept
+        : Bindings(invalidate, drained, std::make_index_sequence<N>{}) {}
+    ~Bindings() noexcept { sync::Lock guard{lock_}; libk_assert(!calls_ && released()); }
     auto key() const noexcept -> object::Key { return key_; }
     void bind(object::Key key) noexcept { libk_assert(!key_.valid()); key_ = key; }
     auto hold() noexcept -> Hold { return Hold{*this}; }
@@ -638,7 +638,7 @@ public:
         if (phase_ == Phase::Idle) return true;
         if (phase_ != Phase::Closed || calls_) return false;
         for (auto& cell : cells_) {
-            cell.attachment.reset(); cell.used = cell.detaching = false; cell.terminal = true;
+            cell.attachment.reset(); cell.used = cell.detaching = false; cell.released = true;
         }
         revoked_ = false; phase_ = Phase::Idle; changed(); return true;
     }
@@ -651,12 +651,12 @@ public:
         for (usize i = 0; i < N; ++i) cells[i] = &cells_[i].attachment;
         auto install = [&]() noexcept {
             phase_ = Phase::Live; changed();
-            for (auto& cell : cells_) { cell.used = true; cell.terminal = false; }
+            for (auto& cell : cells_) { cell.used = true; cell.released = false; }
             if (commit) commit();
         };
         return std::forward<Publish>(publish)(std::span{cells}, Action::bind(install));
     }
-    auto attach(std::span<const GrantLease*> grants, std::span<const object::ref<>*> gates = {},
+    auto attach(std::span<const GrantPin*> grants, std::span<const object::ref<>*> gates = {},
         Action commit = {}) noexcept -> status_t {
         if (grants.size() != N || !grants.front() || !*grants.front()) return STATUS_BAD_ARGS;
         return admit([&](std::span<Attachment*> cells, Action install) noexcept {
@@ -693,9 +693,9 @@ public:
     auto publish(Action commit) noexcept -> bool requires (!Observe) {
         auto publishing = hold();
         std::array<object::ref<>, N> targets;
-        std::array<GrantLease, N> leases;
+        std::array<GrantPin, N> pins;
         std::array<const object::ref<>*, N> gates;
-        libk::inplace_vector<const GrantLease*, N> grants;
+        libk::inplace_vector<const GrantPin*, N> grants;
         sync::Lock guard{lock_};
         if (phase_ == Phase::Idle) { commit(); return true; }
         if (phase_ != Phase::Live || revoked_) return false;
@@ -705,11 +705,11 @@ public:
             if (!targets[i]) return false;
             gates[i] = &targets[i];
             if (attachment.graph_) {
-                auto lease = attachment.acquire();
-                if (!lease) return false;
-                leases[i] = std::move(*lease);
-                if (!grants.empty() && &leases[i].graph() != &grants.front()->graph()) return false;
-                (void)grants.try_emplace_back(&leases[i]);
+                auto pin = attachment.acquire();
+                if (!pin) return false;
+                pins[i] = std::move(*pin);
+                if (!grants.empty() && &pins[i].graph() != &grants.front()->graph()) return false;
+                (void)grants.try_emplace_back(&pins[i]);
             }
         }
         if (grants.empty()) return object::ref<>::publish(gates, commit);
@@ -725,7 +725,7 @@ public:
                 bool detach;
                 { sync::Lock guard{lock_}; detach = cell.used && !std::exchange(cell.detaching, true); }
                 if (detach && cell.attachment.detach()) {
-                    sync::Lock guard{lock_}; cell.terminal = true;
+                    sync::Lock guard{lock_}; cell.released = true;
                 }
             }
             for (auto& cell : cells_) {

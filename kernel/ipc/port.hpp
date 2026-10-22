@@ -22,7 +22,7 @@ private:
         Port& owner;
         libk::intrusive_list_hook hook, queue;
         libk::intrusive_tree_hook index;
-        cap::Attachment authority;
+        cap::Attachment attachment;
         object::LinkWork work;
         Source::Watch source;
         PortEvent event{};
@@ -47,15 +47,15 @@ public:
     static auto storage_bytes(Config) noexcept -> std::optional<usize>;
     auto open() noexcept -> status_t;
     void bind_work(WorkQueue& work, object::Key key) noexcept { work_ = &work; job_.bind(key); ready_.bind_work(work, key); }
-    void bind_funding(resource::Funding& funding) noexcept { payer_ = funding.payer(); }
-    template<class Transaction> auto billing(const object::ref<>& to, Transaction&& transaction) noexcept
+    void bind_allocation(resource::Allocation& allocation) noexcept { quota_ = allocation.quota(); }
+    template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
         { sync::Lock guard{lock_}; if (!opened_) return std::unexpected(STATUS_BUSY); }
-        object::ref<> payer{to};
-        return transaction([&](auto&& visit) { storage_.charges(visit); }, [&] { std::swap(payer_, payer); });
+        object::ref<> quota{to};
+        return transaction([&](auto&& visit) { storage_.charges(visit); }, [&] { std::swap(quota_, quota); });
     }
     auto events() noexcept -> Source& { return ready_; }
-    auto watch(cap::Resolved<Port>&, const cap::GrantLease&, Source&, u32 facet, u64 key,
+    auto watch(cap::Resolved<Port>&, const cap::GrantPin&, Source&, u32 facet, u64 key,
                Source::Condition, Bound) noexcept -> std::expected<u64, status_t>;
     auto arm(u64 id, u64 seen) noexcept -> status_t;
     auto unwatch(u64 id) noexcept -> status_t;
@@ -70,7 +70,7 @@ private:
         explicit Flight(Port& owner) noexcept : owner_(owner) { sync::Lock guard{owner.lock_}; ++owner.calls_; }
         ~Flight() noexcept { owner_.finish_call(true); }
     };
-    static const cap::AttachOps authority_ops_;
+    static const cap::AttachOps attach_ops_;
     void close(Watch&, bool erase, object::LinkWork = {}) noexcept;
     void finish(Watch&) noexcept;
     auto emit(Watch&, WaitResult) noexcept -> bool;
@@ -81,7 +81,7 @@ private:
     auto find(u64) noexcept -> Watch*;
     auto update() noexcept -> Source::Publication;
     Config config_;
-    object::ref<> payer_;
+    object::ref<> quota_;
     mm::Slab<Watch, false> storage_;
     Watches watches_;
     Queue queue_, free_;

@@ -8,8 +8,8 @@ CALL(EXECUTION_SET, 3, execution_set, Call) /* a0=Thread, a1=enabled; returns in
 CALL(EXECUTION_DETACH, 9, execution_detach, Call) /* a0=Thread(Control), a1=expected association generation */
 CALL(SC_CONFIGURE, 5, sc_configure, Call) /* a0=SC(Control), a1=budget ns, a2=period ns, a3=weight, a4=CPU mask; unbound only */
 CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), 0=current; a1=IPC offset */
-CALL(ACCOUNT_RESIZE, 77, account_resize, Call) /* a0=Account(Control), a1=memory, a2=caps, a3=actual sponsor(Split), optional for shrink */
-CALL(ACCOUNT_INFO, 10, info_call, Call) /* a0=Account(Inspect), a1=IPC offset */
+CALL(QUOTA_RESIZE, 77, quota_resize, Call) /* a0=Quota(Control), a1=memory, a2=caps, a3=actual source(Split), optional for shrink */
+CALL(QUOTA_INFO, 10, info_call, Call) /* a0=Quota(Inspect), a1=IPC offset */
 CALL(VSPACE_INFO, 11, info_call, Call) /* a0=VSpace(Inspect), a1=IPC offset; whole-space authority */
 CALL(EXECUTION_STOP, 15, execution_stop, Call) /* a0=Thread(Control); irreversible intent, Exit remains observable */
 CALL(VSPACE_RECORDS, 13, vm_records, Call) /* a0=VSpace(Inspect), a1=IPC offset, a2=address cursor; bounded records within VmLimit */
@@ -19,13 +19,13 @@ CALL(SC_UNBIND, 4, sc_unbind, Call) /* a0=SC, a1=expected association generation
 
 CALL(CAP_CLOSE, 16, cap_call, Call) /* a0=selector, a1=dest CSpace (0=current) */
 CALL(CAP_DUPLICATE, 17, cap_call, Call)
-CALL(CAP_DELEGATE, 18, cap_call, Call) /* a3=optional grant payer Account (0=source CSpace) */
+CALL(CAP_DELEGATE, 18, cap_call, Call) /* a3=optional grant quota Quota (0=source CSpace) */
 CALL(CAP_MOVE, 19, cap_call, Call)
 CALL(CAP_REVOKE, 20, cap_call, Call) /* a0=branch(Revoke), a1=CSpace(0=current), a2=ASYNC, a3=descendant Grant ID(0=root); monotonic close */
 CALL(OBJECT_DESTROY, 21, cap_call, Call)
-CALL(CAP_TYPED_DELEGATE, 22, cap_call, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset, a4=optional grant payer Account (0=source CSpace) */
+CALL(CAP_TYPED_DELEGATE, 22, cap_call, Call) /* a0=source, a1=dest CSpace (0=current), a2=descriptor MemoryObject, a3=byte offset, a4=optional grant quota Quota (0=source CSpace) */
 
-CALL(VM_SUBMIT, 32, vm_submit, Create) /* a0=Account, a1=VSpace, a2=VM operation, a3=IPC offset, a6=Scope; PENDING + Op */
+CALL(VM_SUBMIT, 32, vm_submit, Create) /* a0=Quota, a1=VSpace, a2=VM operation, a3=IPC offset, a6=Scope; PENDING + Op */
 CALL(OP_QUERY, 33, op_call, Call) /* a0=Op(Inspect); result, value, phase */
 CALL(OP_CANCEL, 34, op_call, Call) /* a0=Op(Control); TOO_LATE after commit */
 CALL(VM_SLICE, 35, vm_call, Call)
@@ -34,11 +34,11 @@ CALL(VM_GUARD, 37, vm_call, Call)
 
 /*
  * Typed construction ABI:
- *   a0: Account capability; a6: Scope capability
+ *   a0: Quota capability; a6: Scope capability
  *   a1-a3: type-specific scalar configuration
  * Returns a0=status and a1=new capability in the caller's CSpace.
  */
-CALL(ACCOUNT_CREATE, 48, account_create, Create) /* a1=initial memory, a2=initial caps, a3=kind mask, a4-a5=ceilings (both zero: initial) */
+CALL(QUOTA_CREATE, 48, quota_create, Create) /* a1=initial memory, a2=initial caps, a3=kind mask, a4-a5=ceilings (both zero: initial) */
 CALL(MEMORY_CREATE, 49, memory_create, Create) /* a1=bytes, a2=access bits */
 CALL(VSPACE_CREATE, 50, vspace_create, Create)
 CALL(CSPACE_CREATE, 51, cspace_create, Create) /* a1=slot quota, a2=page quota */
@@ -59,16 +59,16 @@ CALL(IRQ_CREATE, 57, irq_create, Create) /* a0=pool, a1=controller(Create), a2=s
 CALL(IOMMU_CREATE, 60, iommu_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
 CALL(IO_SPACE_CREATE, 62, io_space_create, Create) /* a0=pool, a1=controller(Create), a2=requester */
 
-CALL(SCOPE_CREATE, 63, scope_create, Create) /* a0=Account, a6=parent Scope */
+CALL(SCOPE_CREATE, 63, scope_create, Create) /* a0=Quota, a6=parent Scope */
 CALL(SCOPE_CLOSE, 71, scope_close, Call)
 CALL(SCOPE_INFO, 72, info_call, Call)
 CALL(SCOPE_MEMBERS, 73, scope_members, Call) /* a0=Scope(Inspect), a1=IPC offset, a2-a4=cursor */
 CALL(OBJECT_INFO, 76, object_info, Call) /* a0=object(Inspect), a1=IPC offset */
-CALL(OBJECT_REBILL, 75, object_rebill, Call) /* a0=object(Rebill), a1=old Account(Rebill), a2=new Account(Create), a3=billing epoch; optional a4=source Scope(Manage), a5=destination Scope(Create), a6=member epoch; returns billing/member epochs */
+CALL(OBJECT_REASSIGN, 75, object_reassign, Call) /* a0=object(Reassign), a1=old Quota(Reassign), a2=new Quota(Create), a3=quota epoch; optional a4=source Scope(Manage), a5=destination Scope(Create), a6=member epoch; returns quota/member epochs */
 CALL(SCOPE_ADOPT, 74, scope_adopt, Call) /* a0=object(Adopt), a1=source(Manage), a2=destination(Create), a3=member epoch */
 
 CALL(MEMORY_SEAL, 64, memory_seal, Call) /* a0=MemoryObject */
-CALL(ACCOUNT_CLOSE, 65, account_close, Call) /* a0=Account; OK=close intent accepted, value=state */
+CALL(QUOTA_CLOSE, 65, quota_close, Call) /* a0=Quota; OK=close intent accepted, value=state */
 CALL(MEM_TRIM, 70, mem_call, Call) /* Manage Mem, a1=first page, a2=count; fixed Wait on trim Source; result=CLEAN/DIRTY/BUSY/CANCELED after actual drain */
 CALL(MEM_WRITEBACK, 69, mem_call, Call) /* Manage Mem, a1=page; emits a Pager writeback request */
 CALL(MEMORY_POPULATE, 67, mem_call, Call) /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
@@ -112,7 +112,7 @@ CALL(IRQ_ACK, 137, pg_call, Call) /* a0=irq, a1=generation, a2=sequence */
 CALL(PAGER_SUPPLY, 138, pg_call, Call) /* a0=pager, a1=target memory, a2=staging memory, a3=source page, a4=request id */
 CALL(EXIT_QUERY, 139, exit_call, Call) /* a0=Thread; returns finished/status */
 
-CALL(IO_SUBMIT, 144, io_submit, Create) /* a0=Account, a1=IOSpace, a2=IO operation, a3=IPC offset, a6=Scope; PENDING + Op */
+CALL(IO_SUBMIT, 144, io_submit, Create) /* a0=Quota, a1=IOSpace, a2=IO operation, a3=IPC offset, a6=Scope; PENDING + Op */
 CALL(IO_SPACE_STATE, 145, io_call, Call) /* a0=domain; IoState */
 CALL(IOMMU_STATE, 146, io_call, Call) /* a0=controller; IoState */
 CALL(IO_SPACE_CLOSE, 149, io_call, Call) /* a0=domain; commits deny and retirement */

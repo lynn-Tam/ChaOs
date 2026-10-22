@@ -3,6 +3,32 @@
 #include "../../apps/uart/uart.hpp"
 #include <libk/fmt.hpp>
 
+static auto vm_permissions() -> status_t {
+    const auto& env = rt_startup();
+    auto readonly = vm_area::create(env.alloc(), rt_vm(), 0, 4096, VM_READ);
+    auto writable = vm_area::create(env.alloc(), rt_vm(), 0, 4096);
+    auto staging = vm_area::create(env.alloc(), rt_vm(), 0, 4096, VM_READ | VM_WRITE | VM_EXECUTE, VM_READ | VM_WRITE);
+    if (!readonly || !writable || !staging) return STATUS_INTERNAL;
+    if (*reinterpret_cast<const volatile uint64_t*>(readonly->address) != 0) return STATUS_INTERNAL;
+    *reinterpret_cast<volatile uint64_t*>(writable->address) = 42;
+    if (*reinterpret_cast<const volatile uint64_t*>(writable->address) != 42) return STATUS_INTERNAL;
+    const auto info = sys::object_info(env.vspace); if (info.status != STATUS_OK) return info.status;
+    const auto object = reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id;
+    uint64_t cursor{}, epoch{}; size_t found{};
+    do {
+        const auto status = sys::scope_query(env.scope, object, SCOPE_LINKS, cursor, epoch);
+        if (status.status != STATUS_OK) return status.status;
+        const auto page = *reinterpret_cast<const LinkRecords*>(env.ipc);
+        for (const auto& link : std::span{page.records, page.count}) if (link.kind == LINK_VM) {
+            for (const auto& [area, perms] : std::array<std::pair<vm_area*, word_t>, 3>{{
+                {&*readonly, VM_READ}, {&*writable, VM_READ | VM_WRITE}, {&*staging, VM_READ | VM_WRITE}}})
+                if (link.first == area->address) { if (link.perms != perms) return STATUS_INTERNAL; ++found; }
+        }
+        cursor = page.cursor; epoch = page.epoch;
+    } while (cursor);
+    if (found != 3 || vm_area::create(env.alloc(), rt_vm(), 0, 4096, VM_READ, VM_READ | VM_WRITE)) return STATUS_INTERNAL;
+    return STATUS_OK;
+}
 static auto worker(std::string_view role) -> status_t {
     const auto& env = rt_startup();
     ubus_conn parent;
@@ -27,8 +53,8 @@ static auto worker(std::string_view role) -> status_t {
         request.data.put("bytes", uint64_t{5 * 1024 * 1024}).put("caps", uint64_t{300});
         status = parent.invoke("Resource", std::move(request), response);
         if (status != STATUS_OK) return status;
-        status = sys::account_info(env.pool).status;
-        if (status != STATUS_OK || reinterpret_cast<const AccountInfo*>(env.ipc)->memory_limit != 5 * 1024 * 1024) return STATUS_INTERNAL;
+        status = sys::quota_info(env.quota).status;
+        if (status != STATUS_OK || reinterpret_cast<const QuotaInfo*>(env.ipc)->memory_limit != 5 * 1024 * 1024) return STATUS_INTERNAL;
         ubus_conn concurrent; status = concurrent.bind(env.environment); if (status != STATUS_OK) return status;
         request = {}; request.data.put("name", "calculator");
         status = parent.begin("Get", std::move(request)); if (status != STATUS_OK) return status;
@@ -52,19 +78,19 @@ static auto worker(std::string_view role) -> status_t {
             .put("max_bytes", uint64_t{128 * 1024}).put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
         status = parent.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
         const auto number = *response.data["loan"].as<uint64_t>();
-        auto account = response.take(response.data["account"]);
-        const auto grant = cap_info(account.selector());
+        auto quota = response.take(response.data["quota"]);
+        const auto grant = cap_info(quota.selector());
         if (!grant || grant->view.rights != (RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
-        request = {}; request.data.cap("account", *request.attach(account.selector(), grant->view.rights));
+        request = {}; request.data.cap("quota", *request.attach(quota.selector(), grant->view.rights));
         status = calculator.invoke("Borrow", std::move(request), response); if (status != STATUS_OK) return status;
         ubus_conn borrowed; status = borrowed.adopt(response.take(response.data["handle"])); if (status != STATUS_OK) return status;
-        status = sys::account_info(account.selector()).status; if (status != STATUS_OK) return status;
-        const auto first = *reinterpret_cast<const AccountInfo*>(env.ipc);
+        status = sys::quota_info(quota.selector()).status; if (status != STATUS_OK) return status;
+        const auto first = *reinterpret_cast<const QuotaInfo*>(env.ipc);
         if (first.memory_available >= first.memory_limit) return STATUS_INTERNAL;
         request = {}; request.data.put("loan", number).put("bytes", uint64_t{128 * 1024}).put("caps", uint64_t{0});
         status = parent.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
-        status = sys::account_info(account.selector()).status; if (status != STATUS_OK) return status;
-        const auto resized = *reinterpret_cast<const AccountInfo*>(env.ipc);
+        status = sys::quota_info(quota.selector()).status; if (status != STATUS_OK) return status;
+        const auto resized = *reinterpret_cast<const QuotaInfo*>(env.ipc);
         if (resized.memory_limit != 128 * 1024 || resized.memory_available != first.memory_available + 64 * 1024) return STATUS_INTERNAL;
         status = borrowed.invoke("Ping", {}, response);
         if (status != STATUS_OK || response.data["value"].as<uint64_t>() != 42) return STATUS_INTERNAL;
@@ -75,27 +101,51 @@ static auto worker(std::string_view role) -> status_t {
     const auto gate = setup.capability(setup.data["message"]["gate"]);
     status = sys::wait_one(gate, SOURCE_READY).status; if (status != STATUS_OK) return status;
     if (sys::notification_take(gate).status != STATUS_OK) return STATUS_INTERNAL;
+    // A root has one native lifetime boundary, independent of business names.
+    ubus_object old, root;
+    for (auto* object : {&old, &root}) {
+        const auto scope = sys::scope_create(env.alloc()); if (scope.status != STATUS_OK) return scope.status;
+        status = object->open(1, 0, cap_owner{scope.value}); if (status != STATUS_OK) return status;
+    }
+    auto view = old.connector(1), control = old.connector(3), replacement = root.connector(1);
+    if (!view || !control || !replacement) return STATUS_INTERNAL;
+    const auto attach = [&](uint64_t version, cap_t read, cap_t write, cap_t scope) {
+        ubus_msg q, r; q.data.put("version", version).cap("observe", *q.attach(read, RIGHT_SEND | RIGHT_DUPLICATE))
+            .cap("scope", *q.attach(scope, RIGHT_INSPECT | RIGHT_DUPLICATE));
+        if (write) q.data.cap("manage", *q.attach(write, RIGHT_SEND | RIGHT_DUPLICATE));
+        return parent.invoke("Attach", std::move(q), r);
+    };
+    if (attach(0, view->selector(), control->selector(), root.scope()) != STATUS_NOT_FOUND) return STATUS_INTERNAL;
+    if (attach(0, view->selector(), control->selector(), old.scope()) != STATUS_OK) return STATUS_INTERNAL;
+    if (attach(1, replacement->selector(), 0, root.scope()) != STATUS_BUSY) return STATUS_INTERNAL;
+    const auto retained = sys::cap_duplicate(old.scope(), env.cspace, RIGHT_INSPECT | RIGHT_DUPLICATE);
+    if (retained.status != STATUS_OK) return retained.status;
+    cap_owner boundary{retained.value};
+    if (old.close() != STATUS_OK) return STATUS_INTERNAL;
+    status = sys::wait_one(boundary.selector(), STATE_DRAINED).status; if (status != STATUS_OK) return status;
+    if (attach(0, replacement->selector(), 0, root.scope()) != STATUS_STALE) return STATUS_INTERNAL;
+    if (attach(1, replacement->selector(), 0, root.scope()) != STATUS_OK) return STATUS_INTERNAL;
     ubus_object object{"fixture.unknown"};
     std::unique_ptr<ubus_object> borrowed;
     vm_area funded;
-    cap_owner funded_account;
-    ev_watch funding_closing;
+    cap_owner funded_quota;
+    ev_watch allocation_closing;
     status = object.add("Sum", {{"x", ubus_type::U64}, {"y", ubus_type::U64}}, {{"value", ubus_type::U64}},
         [](auto& q, auto& r) { r.data.put("value", *q.data["x"].template as<uint64_t>() + *q.data["y"].template as<uint64_t>()); return STATUS_OK; });
-    if (status == STATUS_OK) status = object.add("Borrow", {{"account", ubus_type::Cap}}, {{"handle", ubus_type::Cap}}, [&](auto& q, auto& r) {
-        const auto account = q.capability(q.data["account"]);
-        const auto copied = sys::cap_duplicate(account, env.cspace, RIGHT_INSPECT);
+    if (status == STATUS_OK) status = object.add("Borrow", {{"quota", ubus_type::Cap}}, {{"handle", ubus_type::Cap}}, [&](auto& q, auto& r) {
+        const auto quota = q.capability(q.data["quota"]);
+        const auto copied = sys::cap_duplicate(quota, env.cspace, RIGHT_INSPECT);
         if (copied.status != STATUS_OK) return copied.status;
-        funded_account = cap_owner{copied.value};
-        const auto watched = funding_closing.open(env.events, account, STATE_CLOSING | STATE_DRAINED);
+        funded_quota = cap_owner{copied.value};
+        const auto watched = allocation_closing.open(env.events, quota, STATE_CLOSING | STATE_DRAINED);
         if (watched != STATUS_OK) return watched;
-        auto memory = vm_area::create({account, env.scope}, rt_vm(), 0, 4096); if (!memory) return memory.error();
+        auto memory = vm_area::create({quota, env.scope}, rt_vm(), 0, 4096); if (!memory) return memory.error();
         funded = std::move(*memory); *reinterpret_cast<uint64_t*>(funded.address) = 42;
         borrowed = std::make_unique<ubus_object>();
         auto status = borrowed->add("Ping", {}, {{"value", ubus_type::U64}}, [&](auto&, auto& result) {
             result.data.put("value", *reinterpret_cast<const uint64_t*>(funded.address)); return STATUS_OK;
         });
-        if (status == STATUS_OK) status = borrowed->open(4, account);
+        if (status == STATUS_OK) status = borrowed->open(4, quota);
         if (status != STATUS_OK) return status;
         auto handle = borrowed->handle(0, RIGHT_SEND); if (!handle) return handle.error();
         r.data.cap("handle", *r.give(std::move(*handle))); return STATUS_OK;
@@ -104,6 +154,12 @@ static auto worker(std::string_view role) -> status_t {
     if (status != STATUS_OK) return status;
     auto connector = object.connector(); if (!connector) return connector.error();
     ubus_msg request, response;
+    request.data.put("name", "probe").cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
+    request = {}; request.data.put("instance", response.data["instance"]);
+    status = parent.invoke("Withdraw", std::move(request), response); if (status != STATUS_OK) return status;
+    if (attach(2, replacement->selector(), 0, root.scope()) != STATUS_BUSY) return STATUS_INTERNAL;
+    request = {};
     request.data.put("name", "answer").put("interface", "fixture.unknown").put("version", uint64_t{1})
         .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
     status = parent.invoke("Publish", std::move(request), response);
@@ -118,10 +174,10 @@ static auto worker(std::string_view role) -> status_t {
             else if (polled != STATUS_OK && polled != STATUS_WOULD_BLOCK) return polled;
             else progress |= polled == STATUS_OK;
         }
-        if (funded_account) {
-            const auto state = sys::source_info(funded_account.selector());
+        if (funded_quota) {
+            const auto state = sys::source_info(funded_quota.selector());
             if (state.status != STATUS_OK || !(state.value & STATE_OPEN)) {
-                funded = {}; (void)funding_closing.close(); funded_account = {}; progress = true;
+                funded = {}; (void)allocation_closing.close(); funded_quota = {}; progress = true;
             }
         }
         if (!progress) { status = ev_wait(env.events).status; if (status != STATUS_OK) return status; }
@@ -129,6 +185,7 @@ static auto worker(std::string_view role) -> status_t {
 }
 int main(int argc, char** argv) {
     if (argc > 1) return worker(argv[1]);
+    if (const auto status = vm_permissions(); status != STATUS_OK) return status;
     const auto& env = rt_startup();
     auto firmware = fw_view::open(env); if (!firmware) return firmware.error();
     auto irq = firmware->irq(env); if (!irq) return irq.error();
@@ -143,7 +200,7 @@ int main(int argc, char** argv) {
     mgr owner{[&](mgr_child& child) { return archive.image(child.image); }};
     status = owner.open(); if (status != STATUS_OK) return status;
     auto& rejected = owner.add("rejected", "worker");
-    rejected.auth.alloc.account = 0;
+    rejected.auth.alloc.quota = 0;
     status = owner.start(rejected);
     if (status == STATUS_OK || status == STATUS_WOULD_BLOCK || rejected.desired
         || rejected.state != "failed" || rejected.result != status) return STATUS_INTERNAL;
@@ -157,9 +214,9 @@ int main(int argc, char** argv) {
         || incomplete.desired || incomplete.state != "draining") return STATUS_INTERNAL;
     auto& provider = owner.add("provider", "worker", {.bytes=4 * 1024 * 1024, .caps=256,
         .slots=256, .pages=36});
-    provider.args.push_back("provider"); provider.exports.push("answer");
+    provider.args.push_back("provider"); provider.exports.push("answer").push("probe");
     auto& client = owner.add("client", "worker", {.bytes=4 * 1024 * 1024, .caps=256,
-        .slots=256, .pages=36, .pool_perms=RIGHT_CREATE | RIGHT_INSPECT, .max_bytes=8 * 1024 * 1024, .max_caps=384});
+        .slots=256, .pages=36, .quota_perms=RIGHT_CREATE | RIGHT_INSPECT, .max_bytes=8 * 1024 * 1024, .max_caps=384});
     client.args.push_back("client");
     ubus_data route; route.put("child", "provider").put("name", "answer"); client.routes.put("calculator", route);
     const auto notice = sys::notification_create(env.alloc(), 1); if (notice.status != STATUS_OK) return notice.status;
@@ -169,7 +226,7 @@ int main(int argc, char** argv) {
     const auto gated = sys::notification_create(env.alloc(), 1); if (gated.status != STATUS_OK) return gated.status;
     cap_owner gate{gated.value};
     client.setup.data.cap("gate", *client.setup.attach(gate.selector(), RIGHT_SIGNAL));
-    (void)client.setup.attach(env.pool, RIGHT_INSPECT | RIGHT_DUPLICATE); // Owner-private, absent from delivered data.
+    (void)client.setup.attach(env.quota, RIGHT_INSPECT | RIGHT_DUPLICATE); // Owner-private, absent from delivered data.
 
     provider.setup.data.cap("gate", *provider.setup.attach(gate.selector(), RIGHT_RECEIVE));
     status = owner.start(client); if (status != STATUS_OK) return status;
@@ -178,7 +235,7 @@ int main(int argc, char** argv) {
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) { out.write("[mgr] failed poll\n"); return status; }
         if (!done && !client.task) {
-            if (client.result != STATUS_OK || !provider.gen || sys::notification_take(signal.selector()).status != STATUS_OK) {
+            if (client.result != STATUS_OK || provider.root_version != 2 || !provider.observe || !provider.gen || sys::notification_take(signal.selector()).status != STATUS_OK) {
                 (void)libk::fmt::format_to<"[mgr] failed execution: client={} provider-gen={} provider-state={} provider-result={}\n">(out, client.result, provider.gen, provider.state, provider.result); return STATUS_INTERNAL;
             }
             status = owner.action(provider, "stop"); if (status != STATUS_OK) return status; done = true;
@@ -197,7 +254,7 @@ int main(int argc, char** argv) {
             if (incomplete.desired || incomplete.state != "failed" || incomplete.result != failure) return STATUS_INTERNAL;
             if (cycle_a->result != STATUS_DENIED || cycle_b->result != STATUS_DENIED) return STATUS_INTERNAL;
             out.write("[mgr] environment, lazy Get, direct RPC, linear Receive, Resource and native drain ok\n");
-            out.write("[mgr] cross-branch Account funding, growth, exit drain and activation cycle rejection ok\n");
+            out.write("[mgr] cross-branch Quota allocation, growth, exit drain and activation cycle rejection ok\n");
             for (;;) sys::yield();
         }
         status = ev_wait(env.events, owner.deadline()).status;

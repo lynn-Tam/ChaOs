@@ -1,4 +1,4 @@
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 
 namespace object {
 
@@ -43,29 +43,29 @@ auto Scope::describe(Id id, u64 kinds, usize depth) const noexcept -> std::expec
     if (auto* member = target->membership_) {
         out.owner_id = member->owner_ref_.id().value; out.owner_epoch = member->epoch_;
     }
-    if (auto* fee = target->ops_->funding(*target)) {
-        out.account_id = fee->ref_.id().value; out.billing_epoch = fee->epoch_;
-        out.storage_memory = fee->charge_.memory; out.storage_caps = fee->charge_.caps;
+    if (auto* fee = target->ops_->allocation(*target)) {
+        out.quota_id = fee->ref_.id().value; out.quota_epoch = fee->epoch_;
+        out.storage_memory = fee->usage_.memory; out.storage_caps = fee->usage_.caps;
     }
     auto clip = [&](u64& endpoint) noexcept {
         if (endpoint && !find(Id{endpoint}, kinds, depth)) { endpoint = 0; out.flags |= OBS_BOUNDARY; }
     };
-    clip(out.owner_id); clip(out.account_id);
+    clip(out.owner_id); clip(out.quota_id);
     out.kind = target->kind_; out.gate = target->gate_.open() ? OBJECT_OPEN : OBJECT_CLOSING;
     return out;
 }
 
 // Walk actual parents, rather than indexing every controlled descendant.
-// Membership, Funding and the delegation Charge remain the only authorities.
+// Membership, Allocation and the delegation Usage remain the only authorities.
 void Control::edges(Control*& pending, u64 epoch) noexcept {
     if (!owner_) return;
     if (auto* member = owner_->membership_; member && member->owner_)
         push(pending, &member->owner_->control_, epoch);
-    if (auto* fee = owner_->ops_->funding(*owner_); fee && fee->owner_)
+    if (auto* fee = owner_->ops_->allocation(*owner_); fee && fee->owner_)
         push(pending, &fee->owner_->control_, epoch);
-    if (owner_->kind_ == ObjAccount) {
-        auto& account = *static_cast<resource::Account*>(owner_->ops_->payload(*owner_));
-        if (account.delegation_.owner_) push(pending, &account.delegation_.owner_->control_, epoch);
+    if (owner_->kind_ == ObjQuota) {
+        auto& quota = *static_cast<resource::Quota*>(owner_->ops_->payload(*owner_));
+        if (quota.delegation_.owner_) push(pending, &quota.delegation_.owner_->control_, epoch);
     }
 }
 
@@ -351,8 +351,8 @@ auto Transfer::adopt() noexcept -> std::expected<u64, status_t> {
 }
 
 auto Scope::adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch,
-    cap::Graph::Admission authority) noexcept -> std::expected<u64, status_t> {
-    Transfer transaction{target, std::move(source), std::move(destination), epoch, authority};
+    cap::Graph::Admission admission) noexcept -> std::expected<u64, status_t> {
+    Transfer transaction{target, std::move(source), std::move(destination), epoch, admission};
     return transaction.adopt();
 }
 

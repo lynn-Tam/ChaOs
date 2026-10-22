@@ -11,7 +11,7 @@ import sys
 import time
 import tempfile
 
-def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False):
+def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -69,6 +69,13 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         for byte in data:
             process.stdin.write(bytes([byte])); process.stdin.flush(); time.sleep(0.003)
 
+    def capture(name):
+        # Preserve the real terminal stream at a stable visual checkpoint.
+        end = time.monotonic() + 0.25
+        while time.monotonic() < end:
+            for key, _ in poll.select(0.02): output.extend(os.read(key.fd, 65536))
+        (logs / f'tasks-{name}.raw').write_bytes(output)
+
     def states(expected):
         end = time.monotonic() + 20
         while True:
@@ -90,36 +97,41 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
 
     try:
         until(b'/ > ')
+        if control:
+            run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/quota stats ok')
+            run('svc', b'survivor running')
+            run('svc remove survivor', b'service change requested')
+            print(f'[model] OK: {smp} harts, scoped authority, delegation, deletion and retirement')
+            return
         if recovery:
             def managers():
-                text = run('bus call system List', b'"items"')
+                text = run('bus call @control List', b'"items"')
                 return {item['name']: item['gen'] for line in text.splitlines() if line.startswith(b'{')
                         for item in json.loads(line)['items']}
             export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
             exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
-            run(f'bus call session Configure name=foreign program=/boot/foreign.elf exports=^{exports}', b'"gen":0')
+            run(f'bus call @control Configure name=foreign program=/boot/foreign.elf exports=^{exports}', b'"gen":0')
             run('bus call foreign/math Add a=11 b=31', b'"sum":42')
             before = managers()
-            # Persist a default package's desired state, then recover its fresh
-            # grants when the enclosing manager is replaced below.
+            # Replace only the actual owner, without a redundant session wrapper.
+            run('sleep 10000 &', b'Running')
             start = len(output); send(b'svc restart shell\r')
             until(b'myos native shell\n', start); until(b'/ > ', output.index(b'myos native shell\n', start))
-            if managers() != before: raise RuntimeError('shell replacement changed its parent or siblings')
-            run('bus call foreign/math Add a=20 b=22', b'"sum":42')
-            run('sleep 10000 &', b'Running')
-            start = len(output); send(b'svc restart session\r')
-            until(b'myos native shell\n', start); until(b'/ > ', output.index(b'myos native shell\n', start))
             after = managers()
-            if after['session'] == before['session'] or after['boot'] != before['boot'] or after['devices'] != before['devices']:
-                raise RuntimeError('session replacement escaped its ownership boundary')
-            if b'Running' in run('jobs', b'/ > '): raise RuntimeError('old job survived session replacement')
+            if after['shell'] == before['shell'] or any(after[n] != before[n] for n in before if n != 'shell'):
+                raise RuntimeError('shell replacement escaped its ownership boundary')
+            if b'Running' in run('jobs', b'/ > '): raise RuntimeError('old pipeline survived owner replacement')
             run('bus call foreign/math Add a=19 b=23', b'"sum":42')
+
+            run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/quota stats ok')
+            run('svc', b'survivor running')
+            run('svc remove survivor', b'service change requested')
             run('sleep 10000 &', b'Running')
             mark = len(output); run('svc restart devices', b'service change requested')
             until(b'uart: console ready\n', mark)
-            run('bus describe devices', b'"List"')
+            run('svc', b'devices/uart running')
             current = managers()
-            if current['devices'] == after['devices'] or current['session'] != after['session'] or current['boot'] != after['boot']:
+            if current['devices'] == after['devices'] or current['shell'] != after['shell'] or current['boot'] != after['boot']:
                 raise RuntimeError('device replacement escaped its ownership boundary')
             run('jobs', b'Running')
             run('cat /boot/README.TXT', b'myos disk file service')
@@ -240,7 +252,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             start = len(output); send(b'edit /boot/README.TXT\r'); until(b'Ctrl+O Save', start)
             send(b'X\x0f'); until(b'Save failed:', start)
             send(b'\x18'); until(b'Save changes?', start); send(b'n'); until(b'/ > ', start)
-            run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/account stats ok')
+            run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/quota stats ok')
         if exec_check or disk:
             program = '/boot/foreign.elf'
             if disk:
@@ -250,36 +262,59 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             # consumes the same Value bytes as every peer, with no service SDK.
             export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
             exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
-            run(f'bus call session Configure name=foreign program={program} exports=^{exports}', b'"gen":0')
+            run(f'bus call @control Configure name=foreign program={program} exports=^{exports}', b'"gen":0')
             run('bus wait foreign/math', b'/ > ')
             run('bus describe foreign/math', b'"Add"')
             run('bus call foreign/math Add a=11 b=31', b'"sum":42')
         if disk:
             store_instance = instance('store.admin')
             if store_instance is None: raise RuntimeError('missing store publication')
-        start = len(output); send(b'tasks\r'); until(b'myos tasks', start)
+        start = len(output); send(b'tasks\r'); until(b'TASKS', start)
         until(b'shell', start); until(b'Running', start)
-        send(b'fshell\r3'); until(b'Slot', start); until(b'Grant', start); until(b'Valid', start)
-        send(b'l'); time.sleep(0.3); send(b'\x1b[F'); until(b'deployment', start)
-        start = len(output); send(b'h'); until(b'Slot', start)
-        start = len(output); send(b'\x1b[Hv'); until(b'| grants', start)
-        start = len(output); send(b'v'); until(b'| objects', start); until(b'Domain', start)
-        send(b'fVSpace\r'); time.sleep(0.3)
-        start = len(output); send(b'\r'); until(b'link_id', start); until(b'flags', start)
-        send(b'hh')
-        send(b'1'); send(b'\x1a'); until(b'/ > ', start)
-        state = run('jobs', b'Suspend'); token = int(re.findall(rb'\[(\d+)\]', state)[-1])
-        start = len(output); send(f'fg {token}\r'.encode()); until(b'myos tasks', start)
+        # The task list uses program names, not shell deployment identifiers.
+        time.sleep(1.2)
+        capture('programs')
+        mark = len(output); send(b'?'); until(b'Keys', mark)
+        send(b'\x1b'); time.sleep(0.15)
+        mark = len(output); send(b't'); until(b'Tree', mark); send(b'ts')
+        send(b'/uart\r'); until(b'uart', start)
+        mark = len(output); send(b'\r'); until(b'Program', mark); until(b'/boot/uart.elf', mark)
+        capture('details')
+        send(b'\x1b'); time.sleep(0.15)
+        send(b'\x1b'); time.sleep(0.15)  # Clear the filter.
+        send(b' '); until(b'Paused', start); send(b' ')
+        mark = len(output); send(b'2'); until(b'Serial port', mark); until(b'In use', mark)
+        capture('devices')
+        send(b'\r'); until(b'Firmware', mark)
+        send(b'\x1b'); time.sleep(0.15)
         if disk:
-            send(b'2fblock\r'); until(b'block-8', start)
-            time.sleep(0.6)
-            mark = len(output); send(b'3'); until(b'| objects', mark); until(b'IRQ', mark)
-            send(b'2fblock\r'); time.sleep(0.6)
-            mark = len(output); send(b'x'); until(b'Idle', mark)
-            mark = len(output); send(b's'); until(b'Running', mark)
+            until(b'Virtio block', mark); until(b'Ready', mark)
+            mark = len(output); send(b'/virtio\r\r'); until(b'PCI 0:1.0', mark)
+            send(b'\x1b'); time.sleep(0.15); send(b'\x1b'); time.sleep(0.15)
+        send(b'1'); time.sleep(0.2)
+        send(b'\x1a'); until(b'/ > ', start)
+        state = run('jobs', b'Suspend'); token = int(re.findall(rb'\[(\d+)\]', state)[-1])
+        start = len(output); send(f'fg {token}\r'.encode()); until(b'TASKS', start)
+        if disk:
+            send(b'/block\r'); time.sleep(0.3)
+            mark = len(output); send(b'a'); until(b'End program', mark)
+            send(b'\r'); until(b'End program?', mark); send(b'\r')
+            # Stopped deployments are an explicit filter, not running programs.
+            send(b'h'); until(b'Stopped', mark)
+            # Observing devices neither removes the device nor restarts its driver.
+            mark = len(output); send(b'2'); until(b'Virtio block', mark); until(b'Stopped', mark)
+            mark = len(output); send(b'\r'); until(b'Location', mark)
+            if b'Problem' in output[mark:]: raise RuntimeError('intentional stop reported as device failure')
+            send(b'\x1b'); time.sleep(0.15); send(b'1'); send(b'/block\r'); time.sleep(0.3)
+            mark = len(output); send(b'a'); until(b'Start', mark)
+            # A prior list repaint can contain other running programs. Wait
+            # for this action's reply before checking the filtered row again.
+            mark = len(output); send(b'\r'); until(b'Requested', mark); until(b'Running', mark)
         send(b'q'); until(b'/ > ', start)
-        start = len(output); send(b'view tasks\r'); until(b'myos tasks', start)
-        time.sleep(0.5); send(b'q'); until(b'/ > ', start)
+        start = len(output); send(b'view tasks\r'); until(b'TASKS', start)
+        until(b'Running', start); time.sleep(0.3)
+        mark = len(output); send(b'a'); until(b'Read only', mark)
+        send(b'q'); until(b'/ > ', start)
         if disk:
             deadline = time.monotonic() + 20
             while (current := instance('store.admin')) is None or current == store_instance:
@@ -307,13 +342,13 @@ if __name__ == '__main__':
     mode = sys.argv[5] if len(sys.argv) >= 6 else ''
     iterations = int(sys.argv[6]) if len(sys.argv) >= 7 else 1
     for smp in harts.split(','):
-        if mode in ('interactive', 'recovery'):
+        if mode in ('interactive', 'recovery', 'control'):
             temporary = Path(__file__).resolve().parents[2] / '.tmp/project/interactive-storage'
             temporary.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=temporary) as directory:
                 disk = Path(directory) / 'data.img'
                 with disk.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery')
+                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery', control=mode == 'control')
                 if mode == 'interactive': exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
         else:
-            exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage')
+            exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage', control=mode == 'control')

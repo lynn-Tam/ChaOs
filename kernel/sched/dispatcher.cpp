@@ -64,11 +64,11 @@ void Dispatcher::publish(Thread* target) noexcept {
     libk_assert(!cpu_.current);
     libk_assert(idle_->state_ == Thread::State::Prepared);
     idle_->set_state(Thread::State::Running);
-    accounted_at_ = clock_->rd_ticks();
+    recorded_at_ = clock_->rd_ticks();
     publish(idle_);
-    set_timer(accounted_at_);
+    set_timer(recorded_at_);
     Thread* idle = idle_;
-    record_dispatch(idle, idle, DispatchReason::Start, accounted_at_);
+    record_dispatch(idle, idle, DispatchReason::Start, recorded_at_);
     arch::enter_ctx(idle_->ctx());
 }
 
@@ -403,7 +403,7 @@ auto Dispatcher::migrate(Thread& t) noexcept -> bool {
     return true;
 }
 void Dispatcher::complete(Thread& t) noexcept {
-    std::optional<cap::Authority<2>::Hold> publishing;
+    std::optional<cap::Bindings<2>::Hold> publishing;
     { sync::Lock guard{mail_lock_};
       libk_assert(!t.mail_hook_.is_linked());
       if (!t.actions_) {
@@ -479,14 +479,14 @@ auto Dispatcher::remaining_budget() const noexcept -> u64 {
     return (current_sc_ || current_branch_) && run_until_ > now ? run_until_ - now : 0;
 }
 void Dispatcher::charge_to(u64 now) noexcept {
-    const auto elapsed = now - accounted_at_;
+    const auto elapsed = now - recorded_at_;
     if (current_sc_ || current_branch_) {
-        if (current_sc_) current_sc_->account(elapsed);
+        if (current_sc_) current_sc_->record(elapsed);
         loan_elapsed_ += elapsed;
         {
             sync::Lock guard{cpu_.current->lock_};
             cpu_.current->runtime_ += elapsed;
-            cpu_.current->accounted_at_ = now;
+            cpu_.current->recorded_at_ = now;
         }
         auto* child = &cpu_.current->ready_;
         if (current_sc_) child->service = current_sc_->service_;
@@ -512,7 +512,7 @@ void Dispatcher::charge_to(u64 now) noexcept {
             next = std::min(next, maintenance_.service_);
         fair_.store(std::max(fair_.load(), next));
     }
-    accounted_at_ = now;
+    recorded_at_ = now;
 }
 void Dispatcher::yield() noexcept {
     drain_remote();
@@ -610,7 +610,7 @@ void Dispatcher::dispatch(DispatchReason reason, u64 now, status_t status) noexc
     // Refresh may cross a refill boundary. Select and commit against a sample
     // after those updates, never an older time than the queued eligibility.
     now = clock_->rd_ticks();
-    accounted_at_ = now;
+    recorded_at_ = now;
     auto* candidate = select(now);
     if (!candidate && outgoing.idle()) { set_timer(now); return; }
     commit(candidate, reason, now, status);
@@ -621,7 +621,7 @@ void Dispatcher::commit(Thread* candidate, DispatchReason reason, u64 now, statu
     Thread* incoming = candidate ? candidate : idle_;
     if (candidate) {
         remove(*candidate);
-        // Reserve fixes the payer and path. A concurrent Stop may change the
+        // Reserve fixes the quota and path. A concurrent Stop may change the
         // next admission, but cannot move this outstanding loan to maintenance.
         libk_assert(duration_ && ((current_sc_ && loan_.generation) || current_branch_));
         for (auto* branch = current_branch_; branch; branch = branch->parent)

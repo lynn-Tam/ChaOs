@@ -7,13 +7,29 @@
       "kind": "Channel"
     },
     "images": {
-      "kind": "Account",
+      "kind": "Quota",
       "bytes": 20971520,
       "caps": 0,
       "kinds": 32
     },
     "image.scope": {
       "kind": "Scope"
+    },
+    "observe": {
+      "kind": "Manager",
+      "rights": 1
+    },
+    "control": {
+      "kind": "Manager",
+      "rights": 3
+    },
+    "create": {
+      "kind": "Manager",
+      "rights": 4
+    },
+    "debug": {
+      "kind": "Manager",
+      "rights": 11
     }
   },
   "routes": {
@@ -37,40 +53,15 @@
       "child": "vfs",
       "name": "exec"
     },
-    "system": {
-      "manager": 3
-    },
-    "system.view": {
-      "manager": 1
-    },
-    "devices": {
+    "hardware": {
       "child": "devices",
-      "name": "control"
-    },
-    "devices.view": {
-      "child": "devices",
-      "name": "view"
-    },
-    "session": {
-      "child": "session",
-      "name": "control"
-    },
-    "session.view": {
-      "child": "session",
-      "name": "view"
-    },
-    "store.admin": {
-      "child": "store",
-      "name": "admin"
-    },
-    "*": {
-      "local": true
+      "name": "inventory"
     }
   },
   "children": [
     {
       "name": "boot",
-      "program": "bootfs",
+      "program": "/boot/bootfs.elf",
       "resources": {
         "bytes": 4194304,
         "caps": 512
@@ -82,7 +73,7 @@
         "archive": {
           "$ref": "archive"
         },
-        "image.pool": {
+        "image.quota": {
           "$ref": "images",
           "rights": {
             "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
@@ -98,7 +89,7 @@
     },
     {
       "name": "devices",
-      "program": "devices",
+      "program": "/boot/devices.elf",
       "start": true,
       "restart": true,
       "resources": {
@@ -111,8 +102,7 @@
       },
       "exports": [
         "block",
-        "control",
-        "view"
+        "inventory"
       ],
       "setup": {
         "archive": {
@@ -147,7 +137,7 @@
     },
     {
       "name": "vfs",
-      "program": "vfs",
+      "program": "/boot/vfs.elf",
       "resources": {
         "bytes": 4194304,
         "caps": 256
@@ -176,7 +166,7 @@
     },
     {
       "name": "store",
-      "program": "store",
+      "program": "/boot/store.elf",
       "optional": true,
       "resources": {
         "bytes": 8388608,
@@ -193,7 +183,7 @@
         }
       },
       "setup": {
-        "image.pool": {
+        "image.quota": {
           "$ref": "images",
           "rights": {
             "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
@@ -209,23 +199,19 @@
       "restart": true
     },
     {
-      "name": "session",
-      "program": "mgr",
+      "name": "shell",
+      "program": "/boot/shell.elf",
       "start": true,
       "restart": true,
       "resources": {
-        "bytes": 41943040,
-        "caps": 1408,
+        "bytes": 33554432,
+        "caps": 1024,
         "children": true
       },
       "exports": [
-        "control",
-        "view"
+        "*"
       ],
       "setup": {
-        "archive": {
-          "$ref": "archive"
-        },
         "stdin": {
           "$ref": "input.0",
           "rights": {
@@ -239,45 +225,242 @@
           },
           "badge": 1
         },
-        "config": {
-          "$literal": {
+        "routes": {
+          "files": {
+            "parent": "files"
+          },
+          "read": {
+            "parent": "read"
+          },
+          "exec": {
+            "parent": "exec"
+          },
+          "hardware": {
+            "parent": "hardware"
+          }
+        },
+        "commands": {
+          "tasks": {
+            "setup": {
+              "scope": {
+                "$ref": "control"
+              },
+              "scope.name": "system",
+              "devices": "hardware"
+            },
             "routes": {
-              "*": {
-                "parent": true,
-                "local": true
+              "hardware": {
+                "parent": "hardware"
+              }
+            }
+          },
+          "svc": {
+            "setup": {
+              "scope": {
+                "$ref": "control"
               },
-              "session": {
-                "manager": 3
+              "scope.name": "system"
+            }
+          },
+          "bus": {
+            "setup": {
+              "control": {
+                "$ref": "control"
               },
-              "session.view": {
-                "manager": 1
+              "observe": {
+                "$ref": "observe"
+              },
+              "create": {
+                "$ref": "create"
               }
             },
-            "children": [
-              {
-                "name": "shell",
-                "program": "shell",
-                "start": true,
-                "restart": true,
-                "resources": {
-                  "bytes": 33554432,
-                  "caps": 1024,
-                  "children": true
-                },
-                "exports": [
-                  "*"
-                ],
+            "routes": {
+              "*": {
+                "parent": true
+              }
+            }
+          },
+          "control-test": {
+            "setup": {
+              "control": {
+                "$ref": "debug"
+              },
+              "observe": {
+                "$ref": "observe"
+              },
+              "create": {
+                "$ref": "create"
+              }
+            },
+            "routes": {
+              "*": {
+                "parent": true
+              }
+            },
+            "resources": {
+              "bytes": 8388608,
+              "caps": 768,
+              "watches": 128
+            }
+          },
+          "fs": {
+            "routes": {
+              "files": {
+                "parent": "files"
+              },
+              "read": {
+                "parent": "read"
+              },
+              "exec": {
+                "parent": "exec"
+              },
+              "admin": {
+                "parent": "store.admin"
+              }
+            }
+          },
+          "mkfs": {
+            "program": "fs",
+            "argv": [
+              "fs",
+              "format"
+            ],
+            "routes": {
+              "files": {
+                "parent": "files"
+              },
+              "read": {
+                "parent": "read"
+              },
+              "exec": {
+                "parent": "exec"
+              },
+              "admin": {
+                "parent": "store.admin"
+              }
+            }
+          },
+          "stat": {
+            "program": "fs",
+            "argv": [
+              "fs",
+              "stat"
+            ]
+          },
+          "create": {
+            "program": "fs",
+            "argv": [
+              "fs",
+              "create"
+            ]
+          },
+          "write": {
+            "program": "fs",
+            "argv": [
+              "fs",
+              "write"
+            ]
+          },
+          "append": {
+            "program": "fs",
+            "argv": [
+              "fs",
+              "append"
+            ]
+          }
+        },
+        "profiles": {
+          "view": {
+            "routes": {
+              "files": {
+                "parent": "read"
+              },
+              "read": {
+                "parent": "read"
+              },
+              "exec": {
+                "parent": "exec"
+              },
+              "hardware": {
+                "parent": "hardware"
+              }
+            },
+            "commands": {
+              "tasks": {
                 "setup": {
-                  "stdin": {
-                    "$ref": "stdin"
+                  "scope": {
+                    "$ref": "observe"
                   },
-                  "stdout": {
-                    "$ref": "stdout"
+                  "scope.name": "system",
+                  "devices": "hardware"
+                }
+              },
+              "svc": {
+                "setup": {
+                  "scope": {
+                    "$ref": "observe"
+                  },
+                  "scope.name": "system"
+                }
+              },
+              "bus": {
+                "setup": {
+                  "observe": {
+                    "$ref": "observe"
                   }
                 }
               }
-            ]
+            }
+          },
+          "debug": {
+            "routes": {
+              "*": {
+                "parent": true
+              }
+            },
+            "commands": {
+              "bus": {
+                "setup": {
+                  "control": {
+                    "$ref": "debug"
+                  }
+                }
+              }
+            }
           }
+        }
+      },
+      "routes": {
+        "boot": {
+          "child": "boot",
+          "name": "files"
+        },
+        "store": {
+          "child": "store",
+          "name": "files"
+        },
+        "files": {
+          "child": "vfs",
+          "name": "files"
+        },
+        "read": {
+          "child": "vfs",
+          "name": "read"
+        },
+        "exec": {
+          "child": "vfs",
+          "name": "exec"
+        },
+        "*": {
+          "local": true
+        },
+        "store.admin": {
+          "child": "store",
+          "name": "admin"
+        },
+        "hardware": {
+          "child": "devices",
+          "name": "inventory"
         }
       }
     }

@@ -91,7 +91,7 @@ inline void cap_encode(const CapView& value,
 class cap_desc {
     cap_owner memory_;
 public:
-    auto derive(cap_t source, const CapView& view, cap_t payer = 0) -> std::expected<cap_owner, status_t> {
+    auto derive(cap_t source, const CapView& view, cap_t quota = 0) -> std::expected<cap_owner, status_t> {
         if (!memory_) {
             const auto created = sys::memory_create(rt_startup().alloc(), 4096, VM_READ | VM_WRITE);
             if (created.status != STATUS_OK) return std::unexpected(created.status);
@@ -101,7 +101,7 @@ public:
         cap_encode(view, bytes);
         const auto status = mem_write(memory_.selector(), 0, std::as_bytes(std::span{bytes}));
         if (status != STATUS_OK) return std::unexpected(status);
-        const auto delegated = sys::cap_typed_delegate(source, rt_startup().cspace, memory_.selector(), 0, payer);
+        const auto delegated = sys::cap_typed_delegate(source, rt_startup().cspace, memory_.selector(), 0, quota);
         if (delegated.status != STATUS_OK) return std::unexpected(delegated.status);
         return cap_owner{delegated.value};
     }

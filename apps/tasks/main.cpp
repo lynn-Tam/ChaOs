@@ -1,246 +1,470 @@
 #include "terminal.hpp"
 #include <ftxui/component/component.hpp>
-#include <ftxui/component/component_options.hpp>
 #include <ftxui/dom/elements.hpp>
-#include <charconv>
 
-static constexpr std::array<std::string_view, ObjCount> ts_kinds{
-    "?", "Thread", "SC", "Domain", "CSpace", "Mem", "VSpace", "Account", "Notify",
-    "Channel", "Pager", "IRQ", "IOMMU", "IOSpace", "Phys", "IRQ ctl", "Scope", "Port", "VM Op", "IO Op"};
-static auto ts_text(ubus_value value) -> std::string {
-    if (const auto text = value.as<std::string_view>()) return std::string{*text};
-    if (const auto number = value.as<uint64_t>()) return std::to_string(*number);
-    if (const auto number = value.as<int64_t>()) return std::to_string(*number);
-    if (const auto flag = value.as<bool>()) return *flag ? "yes" : "no";
-    if (const auto words = value.vector<uint64_t>()) {
-        std::string result{"["};
-        for (const auto word : *words) { if (result.size() > 1) result += ","; result += std::to_string(word); }
-        return result + "]";
+static auto ts_text(ubus_value v) -> std::string { return std::string{v.as<std::string_view>().value_or("")}; }
+static auto ts_num(ubus_value v) -> uint64_t { return v.as<uint64_t>().value_or(0); }
+static auto ts_flag(ubus_value v) -> bool { return v.as<bool>().value_or(false); }
+static auto ts_bytes(uint64_t n) -> std::string {
+    if (n < 1024) return std::to_string(n) + " B";
+    if (n < 1024 * 1024) return std::to_string(n / 1024) + " KiB";
+    return std::to_string(n / (1024 * 1024)) + "." + std::to_string(n % (1024 * 1024) * 10 / (1024 * 1024)) + " MiB";
+}
+static auto ts_match(std::string text, std::string query) -> bool {
+    for (auto* value : {&text, &query}) for (auto& c : *value) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return query.empty() || text.find(query) != text.npos;
+}
+static auto ts_percent(uint64_t n) -> std::string { return std::to_string(n / 10) + "." + std::to_string(n % 10) + "%"; }
+static auto ts_error(status_t s) -> std::string {
+    switch (s) {
+    case STATUS_DENIED: case STATUS_BAD_RIGHTS: return "Permission denied";
+    case STATUS_CLOSED: case STATUS_PEER_CLOSED: case STATUS_INVALID_CAP: return "Connection lost";
+    case STATUS_STALE: return "Program changed; try again";
+    case STATUS_TIMED_OUT: return "Not available right now";
+    case STATUS_NOT_FOUND: return "Not available";
+    case STATUS_BUSY: return "Busy; try again";
+    case STATUS_NO_MEMORY: case STATUS_EXHAUSTED: return "Resource limit reached";
+    case STATUS_BACKING_FAILED: return "Storage error";
+    default: return "Failed (" + std::to_string(s) + ")";
     }
-    if (value.type() == ubus_type::Record) {
-        std::string result;
-        for (const auto field : value.values()) {
-            if (!result.empty()) result += "  ";
-            result += std::string{field.name()} + "=";
-            if (field.name() == "kind") result += ts_kinds[std::min<uint64_t>(field.as<uint64_t>().value_or(0), ObjCount - 1)];
-            else result += ts_text(field);
-        }
+}
+static auto ts_name(ubus_value row) -> std::string {
+    auto name = ts_text(row["program"]);
+    if (name.empty()) return ts_text(row["name"]);
+    name.erase(0, name.find_last_of('/') == name.npos ? 0 : name.find_last_of('/') + 1);
+    if (name.ends_with(".elf")) name.resize(name.size() - 4);
+    return name;
+}
+static auto ts_state(ubus_value row) -> std::string {
+    const auto state = ts_text(row["state"]);
+    if (state == "idle") return ts_num(row["gen"]) ? "Stopped" : "On demand";
+    if (state == "running") return "Running";
+    if (state == "starting" || state == "loading") return "Starting";
+    if (state == "draining") return "Stopping";
+    if (state == "failed") return "Failed";
+    if (state == "done") return "Exited";
+    return "Unknown";
+}
+struct ts_scope;
+struct ts_item {
+    std::weak_ptr<ts_scope> owner;
+    std::shared_ptr<ts_scope> children;
+    ubus_data data;
+    std::string key, path;
+    uint64_t serial{}, tick{};
+    std::vector<uint64_t> threads;
+    std::optional<uint64_t> cpu;
+    std::deque<uint64_t> history, memory;
+    bool expanded{true};
+};
+struct ts_scope {
+    cap_owner cap;
+    ubus_conn connection;
+    std::weak_ptr<ts_item> parent;
+    std::vector<std::shared_ptr<ts_item>> items;
+    std::string path, error;
+    uint64_t identity{};
+    bool attempted{};
+};
+class ts_view {
+    ft_terminal terminal_;
+    ubus_msg setup_;
+    std::shared_ptr<ts_scope> root_{std::make_shared<ts_scope>()};
+    ubus_conn environment_, devices_;
+    cap_owner device_cap_;
+    std::vector<ubus_data> devices_data_;
+    std::vector<std::pair<std::shared_ptr<ts_item>, size_t>> rows_;
+    std::string selection_, device_selection_, filter_, notice_, device_error_;
+    uint64_t serial_{}, refresh_{};
+    size_t scan_{};
+    int page_{}, sort_{}, menu_{}, choice_{};
+    bool tree_{}, all_{}, detail_{}, search_{}, help_{}, frozen_{}, devices_loaded_{}, dirty_{true}, quit_{};
+    ubus_data details_;
+    ftxui::Component input_, ui_;
+    enum op { Bind, List, Children, Detail, DeviceGet, DeviceBind, Devices, Action };
+    struct query {
+        op kind{};
+        std::shared_ptr<ts_scope> scope;
+        std::shared_ptr<ts_item> item;
+        ubus_msg message;
+        uint64_t gen{}, version{};
+    };
+    std::optional<query> active_, intent_;
+    std::shared_ptr<ts_item> target_;
+    uint64_t target_gen_{}, target_version_{};
+    std::vector<std::string> actions_;
+
+    auto scopes() const -> std::vector<std::shared_ptr<ts_scope>> {
+        std::vector<std::shared_ptr<ts_scope>> result{root_};
+        for (size_t i = 0; i < result.size() && result.size() < 32; ++i)
+            for (const auto& item : result[i]->items) if (item->children && result.size() < 32) result.push_back(item->children);
         return result;
     }
-    return "?";
-}
-struct ts_owner { std::string name; ubus_conn connection; };
-struct ts_row { size_t owner; ubus_data data; };
-struct ts_nav { std::string facet{"caps"}; uint64_t object{}, selector{}, selected{}; };
-class ts_view {
-    const rt_env& env_;
-    ft_terminal terminal_;
-    ubus_conn bus_;
-    ubus_msg setup_;
-    std::array<ts_owner, 4> owners_{{{"system", {}}, {"session", {}}, {"jobs", {}}, {"devices", {}}}};
-    std::vector<ts_row> rows_, incoming_;
-    std::vector<std::string> labels_, tabs_{"1 Tasks", "2 Devices", "3 Topology"};
-    std::vector<size_t> visible_;
-    std::optional<ts_row> target_;
-    ts_nav nav_;
-    std::vector<ts_nav> history_;
-    ubus_data detail_;
-    std::string filter_, notice_{"Native facts sampled through the owning manager"};
-    int page_{}, selected_{};
-    size_t scan_{};
-    uint64_t refresh_{}, generation_{}, pending_generation_{};
-    bool pending_{}, scanning_{}, dirty_{true}, filtering_{}, detail_next_{};
-    std::optional<ubus_msg> action_;
-    std::string action_method_;
-    size_t action_owner_{};
-    bool acting_{};
-    ftxui::Component list_, input_, ui_;
-
-    auto selected() -> ts_row* {
-        return selected_ >= 0 && size_t(selected_) < visible_.size() ? &rows_[visible_[selected_]] : nullptr;
+    auto selected() const -> std::shared_ptr<ts_item> {
+        for (const auto& scope : scopes()) for (const auto& item : scope->items) if (item->key == selection_) return item;
+        return {};
     }
-    void labels() {
-        labels_.clear(); visible_.clear();
-        for (size_t i = 0; i < rows_.size(); ++i) {
-            const auto row = rows_[i].data.view();
-            auto text = ts_text(row);
-            if (page_ != 2) {
-                auto state = ts_text(row["state"]);
-                if (!state.empty() && state[0] >= 'a' && state[0] <= 'z') state[0] -= 'a' - 'A';
-                text = ts_text(row["name"]) + "  " + state + "  id=" + ts_text(row["id"])
-                    + "  RAM=" + std::to_string(row["resident"].as<uint64_t>().value_or(0) / 1024) + " KiB";
-            } else if (row["selector"]) {
-                const auto kind = row["kind"].as<uint64_t>().value_or(0);
-                text = "Slot " + ts_text(row["selector"]) + "  " + std::string{ts_kinds[std::min<uint64_t>(kind, ObjCount - 1)]}
-                    + "  Grant " + ts_text(row["grant_id"]) + "  Object " + ts_text(row["object_id"])
-                    + (row["state"].as<uint64_t>().value_or(0) & CAP_INFO_VALID ? "  Valid" : "  Unavailable");
+    auto device_rows() const -> std::vector<ubus_value> {
+        std::vector<ubus_value> rows;
+        for (const auto& row : devices_data_) if (ts_match(ts_text(row["name"]) + " " + ts_text(row["type"]), filter_)) rows.push_back(row.view());
+        return rows;
+    }
+    auto device() const -> ubus_value {
+        for (const auto row : device_rows()) if (ts_text(row["id"]) == device_selection_) return row;
+        return {};
+    }
+    void rebuild() {
+        dirty_ = true;
+        if (page_) {
+            const auto rows = device_rows();
+            if (rows.empty()) device_selection_.clear();
+            else if (!device()) device_selection_ = ts_text(rows.front()["id"]);
+            return;
+        }
+        rows_.clear(); const auto& needle = filter_;
+        const auto match = [&](const ts_item& item) {
+            const auto state = ts_text(item.data["state"]);
+            return (all_ || state == "running" || state == "draining" || state == "starting" || state == "loading" || state == "failed")
+                && ts_match(ts_name(item.data.view()) + " " + item.path, needle);
+        };
+        const auto compare = [&](const auto& a, const auto& b) {
+            if (sort_ == 1 && a->cpu != b->cpu) return a->cpu > b->cpu;
+            if (sort_ == 2 && ts_num(a->data["resident"]) != ts_num(b->data["resident"])) return ts_num(a->data["resident"]) > ts_num(b->data["resident"]);
+            const auto x = ts_name(a->data.view()), y = ts_name(b->data.view());
+            return x != y ? x < y : a->serial < b->serial;
+        };
+        const auto visit = [&](auto&& self, const std::shared_ptr<ts_scope>& scope, size_t depth) -> void {
+            auto items = scope->items; std::ranges::stable_sort(items, compare);
+            for (const auto& item : items) {
+                if (match(*item)) rows_.push_back({item, tree_ ? depth : 0});
+                if (item->children && depth < 16 && (!tree_ || item->expanded || !needle.empty())) self(self, item->children, depth + 1);
             }
-            if (filter_.empty() || text.find(filter_) != text.npos) { labels_.push_back(std::move(text)); visible_.push_back(i); }
+        };
+        visit(visit, root_, 0);
+        if (!tree_) std::ranges::stable_sort(rows_, [&](const auto& a, const auto& b) { return compare(a.first, b.first); });
+        if (rows_.empty()) selection_.clear();
+        if (!rows_.empty() && std::ranges::none_of(rows_, [&](const auto& row) { return row.first->key == selection_; })) selection_ = rows_.front().first->key;
+        dirty_ = true;
+    }
+    auto inspect(op kind, const std::shared_ptr<ts_item>& item) -> query {
+        query q; q.kind = kind; q.scope = item->owner.lock(); q.item = item;
+        q.gen = ts_num(item->data["gen"]); q.version = ts_num(item->data["root_version"]);
+        q.message.data.put("id", item->data["id"]).put("gen", q.gen).put("facet", kind == Children ? "children" : "overview");
+        return q;
+    }
+    auto connection(query& q) -> ubus_conn& {
+        return q.kind == DeviceGet ? environment_ : q.kind == DeviceBind || q.kind == Devices ? devices_ : q.scope->connection;
+    }
+    void begin(query q) {
+        q.message.deadline = rt_after_ms(800).value_or(0);
+        const auto status = q.kind == Bind || q.kind == DeviceBind
+            ? connection(q).begin_bind(q.kind == Bind ? q.scope->cap.selector() : device_cap_.selector(), q.kind == Bind ? "ubus.environment" : "myos.devices", 1, 1, 0, q.message.deadline)
+            : connection(q).begin(q.kind == List || q.kind == Devices ? "List" : q.kind == DeviceGet ? "Get" : q.kind == Action ? "Action" : "Inspect", std::move(q.message));
+        if (status == STATUS_OK) active_ = std::move(q);
+        else {
+            if (q.scope && (q.kind == Bind || q.kind == List || q.kind == Children)) q.scope->error = ts_error(status);
+            else notice_ = ts_error(status);
+            refresh_ = rt_after_ms(1000).value_or(0); dirty_ = true;
         }
-        selected_ = std::clamp(selected_, 0, std::max(0, int(labels_.size()) - 1)); dirty_ = true;
-    }
-    void refresh() { ++generation_; refresh_ = 0; scanning_ = false; detail_next_ = page_ == 2 && nav_.object; dirty_ = true; }
-    auto connect(size_t owner) -> status_t {
-        auto& endpoint = owners_[owner];
-        if (endpoint.connection.endpoint()) return STATUS_OK;
-        if (endpoint.name == "jobs") return endpoint.connection.bind(setup_.capability(setup_.data["message"]["jobs"]));
-        ubus_msg request, response; request.data.put("name", endpoint.name);
-        const auto status = bus_.invoke("Get", std::move(request), response);
-        return status == STATUS_OK ? endpoint.connection.bind(response.capability(response.data["connector"])) : status;
-    }
-    void query() {
-        if (pending_) return;
-        const auto now = sys::clock_now().value;
-        if (!action_ && !scanning_ && now < refresh_) return;
-        if (!scanning_) { incoming_.clear(); scan_ = page_ == 0 ? 0 : page_ == 1 ? 3 : target_ ? target_->owner : 4; scanning_ = true; }
-        if (scan_ >= owners_.size()) { rows_ = std::move(incoming_); scanning_ = false; refresh_ = rt_after_ms(500).value_or(0); labels(); return; }
-        const auto owner = action_ ? action_owner_ : scan_;
-        auto status = connect(owner);
-        ubus_msg request; std::string_view method = "List";
-        if (action_) { request = std::move(*action_); action_.reset(); method = action_method_; acting_ = true; }
-        else if (page_ == 2 && target_) {
-            method = "Inspect";
-            request.data.put("id", target_->data["id"]).put("gen", target_->data["gen"])
-                .put("facet", detail_next_ ? "info" : nav_.facet).put("object", nav_.object);
-            if (nav_.selector) request.data.put("selector", nav_.selector);
-            if (nav_.selected) request.data.put("selected", nav_.selected);
-        }
-        request.deadline = rt_after_ms(200).value_or(0);
-        if (status == STATUS_OK) status = owners_[owner].connection.begin(method, std::move(request));
-        if (status != STATUS_OK) { notice_ = "request failed: " + std::to_string(status); if (!acting_) advance(); else acting_ = false; dirty_ = true; return; }
-        pending_ = true; pending_generation_ = generation_;
-    }
-    void advance() {
-        if (page_ == 0 && scan_ < 2) ++scan_;
-        else { rows_ = std::move(incoming_); scanning_ = false; refresh_ = rt_after_ms(500).value_or(0); labels(); }
-
     }
     void reply() {
-        if (!pending_) return;
-        const auto owner = acting_ ? action_owner_ : scan_;
+        if (!active_) return;
         ubus_msg response;
-        auto status = owners_[owner].connection.poll(response);
-        if (status == STATUS_WOULD_BLOCK) return;
-        pending_ = false;
-        if (status == STATUS_OK) status = response.status;
-        if (acting_) { acting_ = false; notice_ = "action: " + std::to_string(status); refresh(); return; }
-        if (pending_generation_ != generation_) return;
+        auto& q = *active_;
+        const auto code = q.kind == Bind || q.kind == DeviceBind ? connection(q).poll_bind() : connection(q).poll(response);
+        if (code == STATUS_WOULD_BLOCK) return;
+        const auto status = code == STATUS_OK ? response.status : code;
+        auto done = std::move(q); active_.reset();
         if (status != STATUS_OK) {
-            notice_ = status == STATUS_STALE ? "snapshot changed; refreshing" : "request: " + std::to_string(status);
-            if (status == STATUS_PEER_CLOSED || status == STATUS_CLOSED || status == STATUS_INVALID_CAP) (void)owners_[owner].connection.close();
-            if (status == STATUS_STALE) refresh(); else advance();
+            if (done.kind == List || done.kind == Bind) done.scope->error = ts_error(status);
+            else if (done.kind == Children && done.item) {
+                auto child = std::make_shared<ts_scope>(); child->parent = done.item; child->path = done.item->path;
+                child->error = ts_error(status); child->attempted = true; done.item->children = std::move(child);
+            } else if (done.kind == Devices || done.kind == DeviceGet || done.kind == DeviceBind) {
+                device_error_ = ts_error(status); devices_data_.clear(); devices_.close(); device_cap_ = {};
+            } else notice_ = ts_error(status);
             dirty_ = true; return;
         }
-        if (detail_next_) {
-            for (const auto row : response.data["items"].values()) { (void)detail_.assign(row.bytes()); break; }
-            detail_next_ = false; return;
-        }
-        for (const auto row : response.data["items"].values()) {
-            ubus_data copy;
-            if (copy.assign(row.bytes())) incoming_.push_back({owner, std::move(copy)});
-        }
-
-        advance();
+        if (done.item && ((selected() != done.item && done.kind == Detail) || ts_num(done.item->data["gen"]) != done.gen)) return;
+        if (done.kind == List) {
+            auto& scope = *done.scope; scope.error.clear();
+            const auto identity = ts_num(response.data["owner"]);
+            if (identity != scope.identity) scope.items.clear();
+            scope.identity = identity;
+            size_t retained{};
+            for (const auto& other : scopes()) if (other != done.scope) retained += other->items.size();
+            std::vector<std::shared_ptr<ts_item>> incoming;
+            for (const auto row : response.data["items"].values()) {
+                if (incoming.size() >= std::min(size_t{128}, size_t{256} - std::min(retained, size_t{256}))) { scope.error = "List limit reached"; notice_ = scope.error; break; }
+                const auto found = std::ranges::find_if(scope.items, [&](const auto& item) { return ts_num(item->data["id"]) == ts_num(row["id"]); });
+                auto item = found == scope.items.end() ? std::make_shared<ts_item>() : *found;
+                if (!item->serial) item->serial = ++serial_;
+                if (!ts_flag(row["children"]) || item->data["root_version"].as<uint64_t>() != row["root_version"].as<uint64_t>()) item->children.reset();
+                if (item->data["gen"].as<uint64_t>() != row["gen"].as<uint64_t>()) { item->tick = 0; item->threads.clear(); item->history.clear(); item->memory.clear(); item->children.reset(); }
+                item->owner = done.scope; item->key = std::to_string(identity) + ":" + std::to_string(ts_num(row["id"]));
+                item->path = scope.path + "/" + ts_text(row["name"]);
+                const auto samples = row["cpu"].vector<uint64_t>(); const auto tick = ts_num(row["sampled"]);
+                if (tick != item->tick || !samples) item->cpu.reset();
+                if (samples) {
+                    bool same = item->tick && tick > item->tick && item->threads.size() == samples->size(); uint64_t elapsed{};
+                    for (size_t i = 0; same && i + 1 < samples->size(); i += 2) {
+                        same = item->threads[i] == (*samples)[i] && item->threads[i + 1] <= (*samples)[i + 1];
+                        if (same) elapsed += (*samples)[i + 1] - item->threads[i + 1];
+                    }
+                    if (same) { item->cpu = elapsed * 1000 / (tick - item->tick) / rt_startup().cpus; item->history.push_back(*item->cpu); if (item->history.size() > 40) item->history.pop_front(); }
+                    item->threads.assign(samples->begin(), samples->end()); item->tick = tick;
+                } else { item->threads.clear(); item->tick = 0; }
+                if (row["resident"]) { item->memory.push_back(ts_num(row["resident"])); if (item->memory.size() > 40) item->memory.pop_front(); }
+                item->data.assign(row.bytes()); incoming.push_back(std::move(item));
+            }
+            scope.items = std::move(incoming); rebuild();
+        } else if (done.kind == Children && done.item && done.item->data["root_version"].as<uint64_t>() == done.version) {
+            auto child = std::make_shared<ts_scope>(); child->parent = done.item; child->path = done.item->path;
+            child->cap = response.take(response.data["connector"]);
+            if (child->cap) done.item->children = std::move(child);
+        } else if (done.kind == Detail) {
+            details_.assign(response.data["items"][size_t{0}].bytes()); dirty_ = true;
+        } else if (done.kind == DeviceGet) { device_cap_ = response.take(response.data["connector"]); device_error_.clear(); refresh_ = 0; }
+        else if (done.kind == DeviceBind) refresh_ = 0;
+        else if (done.kind == Devices) {
+            devices_data_.clear(); device_error_.clear(); devices_loaded_ = true;
+            for (const auto row : response.data["items"].values()) { if (devices_data_.size() == 128) { notice_ = "Device list limit reached"; break; } ubus_data data; data.assign(row.bytes()); devices_data_.push_back(std::move(data)); }
+            rebuild();
+        } else if (done.kind == Action) { notice_ = "Requested"; refresh_ = 0; scan_ = 0; dirty_ = true; }
     }
-    void navigate(ts_nav next) { history_.push_back(nav_); nav_ = std::move(next); filter_.clear(); selected_ = 0; refresh(); }
-    void action(std::string method, const ts_row& task, ubus_data params = {}) {
-        if (!task.data["control"].as<bool>().value_or(false)) { notice_ = "Read-only authority"; dirty_ = true; return; }
-        ubus_msg request; request.data = std::move(params);
-        request.data.put("id", task.data["id"]).put("gen", task.data["gen"]);
-        action_.emplace(std::move(request)); action_method_ = std::move(method); action_owner_ = task.owner;
+    void next() {
+        if (active_ || !terminal_.focused()) return;
+        if (intent_) { auto q = std::move(*intent_); intent_.reset(); begin(std::move(q)); return; }
+        if (frozen_ || menu_ || sys::clock_now().value < refresh_) return;
+        if (page_ == 1) {
+            refresh_ = rt_after_ms(1000).value_or(0);
+            query q;
+            if (!device_cap_) {
+                const auto name = setup_.data["message"]["devices"].as<std::string_view>();
+                if (!name) { device_error_ = "No device access"; dirty_ = true; return; }
+                q.kind = DeviceGet; q.message.data.put("name", *name).put("activate", false);
+            } else q.kind = devices_.endpoint() ? Devices : DeviceBind;
+            begin(std::move(q)); return;
+        }
+        auto sources = scopes();
+        for (const auto& scope : sources) {
+            for (auto p = scope->parent.lock(); p; p = p->owner.lock() ? p->owner.lock()->parent.lock() : nullptr)
+                if (scope->identity && p->owner.lock() && p->owner.lock()->identity == scope->identity) { scope->error = "Repeated reference"; break; }
+            if (!scope->error.empty()) continue;
+            if (!scope->connection.endpoint() && !scope->attempted) { scope->attempted = true; query q; q.kind = Bind; q.scope = scope; begin(std::move(q)); return; }
+            for (const auto& item : scope->items) if (ts_flag(item->data["children"]) && !item->children) {
+                if (sources.size() == 32) { notice_ = "View limit reached"; continue; }
+                begin(inspect(Children, item)); return;
+            }
+        }
+        if (scan_ >= sources.size()) {
+            scan_ = 0; refresh_ = rt_after_ms(1000).value_or(0);
+            if (detail_) if (auto item = selected()) intent_ = inspect(Detail, item);
+            return;
+        }
+        auto scope = sources[scan_++];
+        if (scope->error.empty() && scope->connection.endpoint()) { query q; q.kind = List; q.scope = scope; begin(std::move(q)); }
     }
-    void key(const ftxui::Event& event) {
-        if (filtering_) {
-            if (event == ftxui::Event::Return || event == ftxui::Event::Escape) { filtering_ = false; list_->TakeFocus(); }
-            else { input_->OnEvent(event); labels(); }
-            dirty_ = true; return;
+    void move(int delta) {
+        if (menu_ == 2) return;
+        if (menu_) { choice_ = std::clamp(choice_ + delta, 0, std::max(0, int(actions_.size()) - 1)); }
+        else if (page_ == 0) {
+            const auto found = std::ranges::find_if(rows_, [&](const auto& row) { return row.first->key == selection_; });
+            if (!rows_.empty()) selection_ = rows_[std::clamp(int(found - rows_.begin()) + delta, 0, int(rows_.size()) - 1)].first->key;
+        } else {
+            std::vector<std::string> ids; for (const auto row : device_rows()) ids.push_back(ts_text(row["id"]));
+            const auto found = std::ranges::find(ids, device_selection_);
+            if (!ids.empty()) device_selection_ = ids[std::clamp(int(found - ids.begin()) + delta, 0, int(ids.size()) - 1)];
         }
-        const auto ch = event.is_character() && event.character().size() == 1 ? event.character()[0] : 0;
-        auto* row = selected();
-        if (ch >= '1' && ch <= '3') {
-            if (ch == '3' && page_ != 2 && row) { target_ = *row; nav_ = {page_ == 1 ? "members" : "caps"}; history_.clear(); }
-            page_ = ch - '1'; filter_.clear(); selected_ = 0; refresh(); return;
+        notice_.clear(); dirty_ = true;
+    }
+    void actions() {
+        actions_.clear(); choice_ = 0; target_ = selected();
+        if (page_ || !target_) { notice_ = "No actions"; return; }
+        if (const auto scope = target_->owner.lock(); !scope || !scope->error.empty()) { notice_ = "Not available"; return; }
+        target_gen_ = ts_num(target_->data["gen"]); target_version_ = ts_num(target_->data["config"]);
+        for (const auto value : target_->data["actions"].values()) {
+            const auto verb = ts_text(value); if (verb == "stop" || verb == "start" || verb == "restart") actions_.push_back(verb);
         }
-        if (ch == 'f' || ch == '/') { filtering_ = true; input_->TakeFocus(); dirty_ = true; return; }
-        if (event == ftxui::Event::CtrlL) { refresh(); return; }
-        if (page_ == 2) {
-            if (ch == 'h') { if (history_.empty()) page_ = 0; else { nav_ = history_.back(); history_.pop_back(); } refresh(); return; }
-            if (ch == 'v') {
-                if (nav_.facet == "caps") {
-                    if (!row || !row->data["selector"]) return;
-                    navigate({"grants", nav_.object, *row->data["selector"].as<uint64_t>(), 0});
-                } else navigate({nav_.facet == "grants" ? "members" : "caps"});
-                return;
-            }
-            if (ch == 'l') { navigate({"dependencies"}); return; }
-            if (ch == 't') { navigate({"usage", nav_.object}); return; }
-            if (ch == 'a' || ch == 'w') {
-                const auto object = detail_[ch == 'a' ? "account_id" : "owner_id"].as<uint64_t>();
-                if (object && *object) navigate({"info", *object});
-                return;
-            }
-            if (event == ftxui::Event::Return && row) {
-                const auto object = row->data["object_id"].as<uint64_t>();
-                const auto kind = row->data["kind"].as<uint64_t>().value_or(0);
-                if (object && *object) navigate({kind == ObjCSpace ? "caps" : kind == ObjScope ? "members"
-                    : kind == ObjAccount ? "usage" : "links", *object});
-                return;
-            }
-            if ((ch == 'x' || ch == 'b') && row && target_) {
-                ubus_data request;
-                const auto selector = ch == 'x' ? row->data["selector"].as<uint64_t>() : std::optional{nav_.selector};
-                if (!selector || !*selector) return;
-                request.put("selector", *selector);
-                if (ch == 'b') request.put("selected", row->data["grant_id"].as<uint64_t>().value_or(0));
-                action(ch == 'x' ? "CloseCap" : "Revoke", *target_, std::move(request)); return;
-            }
-            if (ch == 'r') { refresh(); return; }
-        } else if (row && (ch == 'p' || ch == 'c' || ch == 'x' || ch == 's' || ch == 'r')) {
-            ubus_data request; request.put("action", ch == 'p' ? "pause" : ch == 'c' ? "resume" : ch == 'x' ? "stop" : ch == 's' ? "start" : "restart");
-            action("Action", *row, std::move(request)); return;
+        if (actions_.empty()) { notice_ = ts_flag(target_->data["control"]) ? "No actions" : "Read only"; return; }
+        menu_ = 1;
+    }
+    void key(const ftxui::Event& e) {
+        dirty_ = true; notice_.clear();
+        if (search_) {
+            if (e == ftxui::Event::Escape) { search_ = false; filter_.clear(); }
+            else if (e == ftxui::Event::Return) search_ = false;
+            else input_->OnEvent(e);
+            rebuild(); return;
         }
-        list_->OnEvent(event); dirty_ = true;
+        if (e == ftxui::Event::Escape) {
+            if (menu_) { menu_ = 0; target_.reset(); }
+            else if (help_) help_ = false;
+            else if (detail_) detail_ = false;
+            else if (!filter_.empty()) { filter_.clear(); rebuild(); }
+            else quit_ = true;
+            return;
+        }
+        if (e == ftxui::Event::ArrowUp) { move(-1); return; }
+        if (e == ftxui::Event::ArrowDown) { move(1); return; }
+        if (e == ftxui::Event::Return) {
+            if (menu_) {
+                const auto verb = actions_[choice_];
+                if (menu_ == 1 && verb != "start") { menu_ = 2; return; }
+                if (auto scope = target_->owner.lock()) {
+                    query q; q.kind = Action; q.scope = scope; q.item = target_; q.gen = target_gen_;
+                    q.message.data.put("id", target_->data["id"]).put("gen", target_gen_).put("version", target_version_).put("action", verb); intent_ = std::move(q);
+                }
+                menu_ = 0; target_.reset();
+            } else if (!help_) { detail_ = true; details_ = {}; if (!page_) if (auto item = selected()) intent_ = inspect(Detail, item); }
+            return;
+        }
+        if (menu_ || help_) { if (e == ftxui::Event::Character('q')) { menu_ = 0; help_ = false; } return; }
+        if (e == ftxui::Event::Character('q')) { quit_ = true; return; }
+        if (e == ftxui::Event::Character('?')) { help_ = true; return; }
+        if (e == ftxui::Event::Character('a')) { actions(); return; }
+        if (e == ftxui::Event::Character('/')) { search_ = true; return; }
+        if (e == ftxui::Event::Character(' ')) { frozen_ = !frozen_; return; }
+        if (e == ftxui::Event::Character('r')) {
+            refresh_ = 0; scan_ = 0;
+            for (const auto& scope : scopes()) {
+                scope->error.clear(); scope->attempted = false;
+                for (const auto& item : scope->items) if (item->children && !item->children->error.empty()) item->children.reset();
+            }
+            return;
+        }
+        if (e == ftxui::Event::Character('1') || e == ftxui::Event::Character('2') || e == ftxui::Event::Tab) {
+            page_ = e == ftxui::Event::Tab ? 1 - page_ : e == ftxui::Event::Character('1') ? 0 : 1;
+            detail_ = false; filter_.clear(); notice_.clear(); refresh_ = 0; scan_ = 0; rebuild(); return;
+        }
+        if (!page_ && !detail_) {
+            if (e == ftxui::Event::Character('s')) sort_ = (sort_ + 1) % 3;
+            if (e == ftxui::Event::Character('t')) tree_ = !tree_;
+            if (e == ftxui::Event::Character('h')) all_ = !all_;
+            if (auto item = selected(); item && (e == ftxui::Event::ArrowLeft || e == ftxui::Event::ArrowRight)) item->expanded = e == ftxui::Event::ArrowRight;
+            rebuild();
+        }
+    }
+    auto line(std::string name, std::string state, std::string a, std::string b) -> ftxui::Element {
+        using namespace ftxui;
+        Elements parts{text(name) | flex, text(state) | size(WIDTH, EQUAL, 12)};
+        if (terminal_.columns() >= 64) parts.push_back(text(a) | align_right | size(WIDTH, EQUAL, page_ ? 16 : 9));
+        parts.push_back(text(b) | align_right | size(WIDTH, EQUAL, 12)); return hbox(parts);
+    }
+    auto field(std::string name, std::string value) -> ftxui::Element {
+        using namespace ftxui;
+        return hbox({text(name) | dim | size(WIDTH, EQUAL, 12), text(value) | flex});
     }
     auto render() -> ftxui::Element {
         using namespace ftxui;
-        std::string title = "myos tasks | " + tabs_[page_];
-        if (page_ == 2) title += " | " + (nav_.facet == "members" ? std::string{"objects"} : nav_.facet == "dependencies" ? std::string{"deployment"} : nav_.facet) + (target_ ? " | " + ts_text(target_->data["name"]) : "");
-        auto footer = page_ == 2 ? "v view  Enter object  h back  a account  w owner  t usage  l deployment  x Close  b Revoke"
-            : "p pause  c continue  x stop  s start  r restart";
-        return vbox({text(title) | bold, separator(), filtering_ ? input_->Render() : text("/ filter  1/2/3 page  q quit") | dim,
-            list_->Render() | vscroll_indicator | frame | flex, separator(),
-            paragraph(selected() ? ts_text(selected()->data.view()) : ts_text(detail_.view())) | dim, text(notice_), text(footer)}) | border;
+        const auto tab = [&](std::string label, bool active) { return text(" " + label + " ") | (active ? inverted : dim); };
+        Elements parts{hbox({text(" TASKS ") | bold, tab("1 Programs", !page_), tab("2 Devices", page_), filler(), text(frozen_ ? "Paused " : root_->path.substr(root_->path.find_last_of('/') + 1) + " ") | dim}), separator()};
+        if (help_) {
+            parts.push_back(vbox({text("Keys") | bold, text(""), field("Up/Down", "Select"), field("Left/Right", "Collapse / expand"), field("Enter", "Details"), field("a", "Actions"), field("/", "Search"), field("s", "Sort by name, CPU, memory"), field("t", "Tree / list"), field("h", "Include stopped programs"), field("Space", "Pause updates"), field("r", "Refresh"), field("Esc", "Back"), field("q", "Quit"), text(""), field("CPU", "100% = all cores"), field("Memory", "Resident memory")}) | flex);
+        } else if (detail_) {
+            Elements body;
+            if (page_) {
+                const auto row = device();
+                body = {text(ts_text(row["name"])) | bold, text(""), field("Status", ts_text(row["state"])), field("Type", ts_text(row["type"])), field("Driver", ts_text(row["driver"])), field("Location", ts_text(row["location"]))};
+                if (!row) body = {text(device_error_.empty() ? "Device not available" : device_error_) | dim};
+                if (row["error"]) body.push_back(field("Problem", ts_error(static_cast<status_t>(row["error"].as<int64_t>().value_or(0)))));
+            } else if (const auto item = selected()) {
+                const auto row = details_["gen"].as<uint64_t>() == item->data["gen"].as<uint64_t>() && details_["program"] ? details_.view() : item->data.view();
+                body = {text(ts_name(row)) | bold, text(""), field("Status", ts_state(item->data.view())), field("Program", ts_text(row["program"]))};
+                std::string args; for (const auto arg : row["argv"].values()) { if (!args.empty()) args += ' '; args += ts_text(arg); }
+                if (!args.empty()) body.push_back(field("Command", args));
+                body.push_back(text(""));
+                const auto chart = [&](const std::deque<uint64_t>& samples, uint64_t minimum) {
+                    return graph([&samples, minimum](int width, int height) {
+                        std::vector<int> bars(width, -1);
+                        const auto peak = samples.empty() ? minimum : std::max(minimum, *std::ranges::max_element(samples));
+                        for (int x = 0; x < width; ++x) {
+                            const auto slot = size_t(x) * 40 / width + samples.size();
+                            if (slot < 40 || !samples[slot - 40]) continue;
+                            bars[x] = std::max(0, int(samples[slot - 40] * height / peak) - 1);
+                        }
+                        return bars;
+                    }) | size(HEIGHT, EQUAL, 3);
+                };
+                body.push_back(field("CPU", item->cpu ? ts_percent(*item->cpu) : "--"));
+                body.push_back(chart(item->history, 1000) | color(Color::Cyan));
+                body.push_back(field("Memory", item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--"));
+                body.push_back(chart(item->memory, 1) | dim);
+                body.push_back(text("")); body.push_back(field("Location", item->path));
+                if (const auto result = row["result"].as<int64_t>(); ts_text(item->data["state"]) == "failed" && result && *result) body.push_back(field("Last error", ts_error(static_cast<status_t>(*result))));
+            } else body.push_back(text("Program ended") | dim);
+            parts.push_back(vbox(body) | flex);
+        } else {
+            if (search_) parts.push_back(input_->Render());
+            else if (!filter_.empty()) parts.push_back(text("Search: " + filter_) | dim);
+            else if (!page_ && (all_ || tree_)) parts.push_back(text(std::string{tree_ ? "Tree" : "List"} + (all_ ? "  /  All programs" : "")) | dim);
+            parts.push_back(page_ ? line("Device", "Status", "Type", "Driver") | dim
+                : line("Name" + std::string{sort_ == 0 ? " ↑" : ""}, "Status", sort_ == 1 ? "CPU ↓" : "CPU", sort_ == 2 ? "Memory ↓" : "Memory") | dim);
+            parts.push_back(separator()); Elements rows;
+            if (page_) {
+                for (const auto row : device_rows()) {
+                    auto entry = line(ts_text(row["name"]), ts_text(row["state"]), ts_text(row["type"]), ts_text(row["driver"]));
+                    if (ts_text(row["id"]) == device_selection_) entry = entry | inverted | focus;
+                    rows.push_back(entry);
+                }
+                if (rows.empty()) rows.push_back(text(device_error_.empty() ? devices_loaded_ ? "No devices" : "Loading..." : device_error_) | dim);
+            } else {
+                for (const auto& [item, depth] : rows_) {
+                    auto name = ts_name(item->data.view());
+                    if (std::ranges::count_if(rows_, [&](const auto& row) { return ts_name(row.first->data.view()) == name; }) > 1) name += " #" + std::to_string(item->serial);
+                    name = std::string(depth * 2, ' ') + (tree_ && ts_flag(item->data["children"]) ? item->expanded ? "- " : "+ " : "") + name;
+                    const auto scope = item->owner.lock(); const bool current = scope && scope->error.empty();
+                    auto entry = line(name, current ? ts_state(item->data.view()) : "Unavailable", current && item->cpu ? ts_percent(*item->cpu) : "--", current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--");
+                    if (ts_text(item->data["state"]) == "failed") entry |= color(Color::Red);
+                    if (item->key == selection_) entry = entry | inverted | focus;
+                    rows.push_back(entry);
+                }
+                if (rows.empty()) rows.push_back(text(root_->error.empty() ? root_->identity ? "No programs" : "Loading..." : root_->error) | dim);
+            }
+            parts.push_back(vbox(rows) | vscroll_indicator | yframe | flex);
+        }
+        if (!notice_.empty()) parts.push_back(text(notice_) | color(Color::Yellow));
+        parts.push_back(separator());
+        parts.push_back(text(help_ ? " Esc Back" : page_ ? detail_ ? " Esc Back    q Quit" : " Enter Details    / Search    ? Help    q Quit" : detail_ ? " Esc Back    a Actions    q Quit" : " Enter Details    a Actions    / Search    ? Help    q Quit") | dim);
+        auto result = vbox(parts);
+        if (menu_) {
+            const auto label = [](const std::string& verb) { return verb == "stop" ? "End program" : verb == "restart" ? "Restart" : "Start"; };
+            Elements box{text(ts_name(target_->data.view())) | bold, text("")};
+            if (menu_ == 2) {
+                box.push_back(text(std::string{label(actions_[choice_])} + "?"));
+                if (ts_flag(target_->data["children"])) box.push_back(text("Includes its child programs.") | dim);
+                box.push_back(text("")); box.push_back(text("Enter Confirm   Esc Cancel") | dim);
+            } else for (size_t i = 0; i < actions_.size(); ++i) box.push_back(text(label(actions_[i])) | (int(i) == choice_ ? inverted : nothing));
+            result = dbox({result, vbox(box) | border | clear_under | bgcolor(Color::Black) | size(WIDTH, EQUAL, std::min(40, int(terminal_.columns()) - 4)) | center});
+        }
+        return result;
     }
 public:
-    explicit ts_view(const rt_env& env) : env_(env) {
-        list_ = ftxui::Menu(&labels_, &selected_);
-        input_ = ftxui::Input(&filter_, "filter");
-        ui_ = ftxui::Renderer(ftxui::Container::Vertical({input_, list_}), [this] { return render(); });
-        list_->TakeFocus();
-    }
+    ts_view() { input_ = ftxui::Input(&filter_, "Search"); ui_ = ftxui::Renderer([this] { return render(); }); }
     auto run() -> status_t {
-        auto status = bus_.bind(env_.environment);
-        if (status == STATUS_OK) status = bus_.invoke("Receive", {}, setup_);
-        if (status == STATUS_OK) status = terminal_.open(env_, setup_);
+        const auto& env = rt_startup();
+        auto status = environment_.bind(env.environment);
+        if (status == STATUS_OK) status = environment_.invoke("Receive", {}, setup_);
+        if (status == STATUS_OK) status = terminal_.open(env, setup_);
         if (status != STATUS_OK) return status;
-        for (;;) {
-            reply(); query(); reply();
-            for (size_t count = 0; !pending_ && !scanning_ && count < 64; ++count) {
-                const auto input = terminal_.read();
-                if (!input) return input.error();
-                dirty_ |= terminal_.redraw();
-                if (!*input) break;
-                if (!filtering_ && **input == ftxui::Event::Character('q')) return STATUS_OK;
-                key(**input);
-                if (!refresh_ || action_) break;
+        root_->cap = setup_.take(setup_.data["message"]["scope"]);
+        root_->path = "/" + ts_text(setup_.data["message"]["scope.name"]);
+        if (!root_->cap) { root_->error = "No program access"; root_->attempted = true; }
+        while (!quit_) {
+            reply();
+            for (size_t count = 0; count < 64; ++count) {
+                const auto e = terminal_.read(); if (!e) return e.error();
+                dirty_ |= terminal_.redraw(); if (!*e) break; key(**e);
             }
-            if (terminal_.focused() && refresh_ && !pending_ && !scanning_ && std::exchange(dirty_, false))
-                if ((status = terminal_.present(ui_)) != STATUS_OK) return status;
-            if (!pending_ && (action_ || scanning_ || sys::clock_now().value >= refresh_)) continue;
-            const auto next = pending_ ? rt_after_ms(20).value_or(0) : refresh_;
-            status = terminal_.wait(next);
-            if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
+            if (quit_) break;
+            next(); reply();
+            if (terminal_.focused() && std::exchange(dirty_, false)) { status = terminal_.present(ui_); if (status != STATUS_OK) return status; }
+            if (!active_ && terminal_.focused() && (intent_ || (!frozen_ && !menu_ && sys::clock_now().value >= refresh_))) continue;
+            auto deadline = active_ ? rt_after_ms(50).value_or(0) : frozen_ || menu_ || !terminal_.focused() ? 0 : refresh_;
+            if (const auto parser = terminal_.deadline(); parser && (!deadline || parser < deadline)) deadline = parser;
+            status = terminal_.wait(deadline); if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
         }
+        return STATUS_OK;
     }
 };
-int main() { return ts_view{rt_startup()}.run(); }
+int main() { return ts_view{}.run(); }

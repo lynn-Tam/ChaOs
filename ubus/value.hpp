@@ -48,7 +48,8 @@ struct ubus_range {
     auto end() const noexcept -> std::default_sentinel_t { return {}; }
 };
 
-// A view borrows one received packet or builder. No field owns a heap tree.
+// A view borrows one received packet or builder; builder mutation invalidates
+// retained views. Passing a current view into its own builder copies a snapshot.
 class ubus_value {
     std::span<const std::byte> bytes_{};
     ubus_head head_{};

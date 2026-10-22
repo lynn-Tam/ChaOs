@@ -20,7 +20,7 @@ template<class> class Cache;
 // session and owns ready/claimed indexes; worker exit does not abandon a claim.
 class Pager final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr bool fixed_bill = true;
+    static constexpr bool fixed_usage = true;
     enum class Kind : u8 { PageIn, Writeback };
     struct Req {
         u64 id{};

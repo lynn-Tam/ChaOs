@@ -90,7 +90,7 @@ auto Pager::take(Request &r) noexcept -> Reply {
     return Reply{r};
 }
 
-auto Pager::claim(cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept -> std::expected<Req, Error> {
+auto Pager::claim(cap::Graph::Admission admission, std::span<const object::ref<>*> gates) noexcept -> std::expected<Req, Error> {
     Pin pin{*this};
     sync::Lock guard{lock_};
     if (state_ == State::Forced || state_ == State::Closed) return std::unexpected(Error::Closed);
@@ -98,7 +98,7 @@ auto Pager::claim(cap::Graph::Admission authority, std::span<const object::ref<>
     if (next_id_ == std::numeric_limits<u64>::max())
         return std::unexpected(Error::GenerationExhausted);
     auto &r = ready_.front();
-    if (authority.publish(gates, [&] noexcept {
+    if (admission.publish(gates, [&] noexcept {
         ready_.erase(r);
         r.info.id = ++next_id_;
         claimed_.push_back(r);
@@ -115,7 +115,7 @@ auto Pager::reply(u64 id, mm::Mem *mem) noexcept -> std::expected<Reply, Error> 
     return std::unexpected(Error::Stale);
 }
 
-auto Pager::Reply::commit(cap::Graph::Admission authority,
+auto Pager::Reply::commit(cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates, Source::Action commit, bool fail) noexcept -> std::expected<void, Error> {
     if (!*this) return std::unexpected(Error::Stale);
     auto d = h_.get();
@@ -123,7 +123,7 @@ auto Pager::Reply::commit(cap::Graph::Admission authority,
     libk_assert(d.request->pager == d.pager && !d.request->route.is_linked());
     if (!fail && (d.pager->state_ == State::Forced || d.pager->state_ == State::Closed))
         return std::unexpected(Error::Closed);
-    if (authority.publish(gates, [&] noexcept {
+    if (admission.publish(gates, [&] noexcept {
         if (commit) commit();
         d.request->pager = nullptr;
         d.request = nullptr;
@@ -174,13 +174,13 @@ void Pager::dispose(Reply::Data &d) noexcept {
     unpin(); // May free Pager; no member perms follows.
 }
 
-auto Pager::requeue(u64 id, cap::Graph::Admission authority,
+auto Pager::requeue(u64 id, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates) noexcept -> std::expected<void, Error> {
     Pin pin{*this};
     sync::Lock guard{lock_};
     for (auto& r : claimed_) {
         if (!id || r.info.id != id) continue;
-        if (authority.publish(gates, [&] noexcept {
+        if (admission.publish(gates, [&] noexcept {
             claimed_.erase(r);
             r.info.id = 0;
             ready_.push_back(r);

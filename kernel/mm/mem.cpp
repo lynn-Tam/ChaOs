@@ -24,7 +24,7 @@
 namespace mm {
 
 [[nodiscard]] auto validate_extents(Pmm& pmm, usize logical_pages, std::span<const Extent> extents,
-                                    const PageGroup& owned, const Phys::Lease& external) noexcept -> std::expected<void, MemErr> {
+                                    const PageGroup& owned, const Phys::Claim& external) noexcept -> std::expected<void, MemErr> {
     if (extents.empty()) {
         return std::unexpected(MemErr::InvalidRange);
     }
@@ -78,8 +78,8 @@ namespace mm {
     return {};
 }
 
-// The charge follows the real resident owner. Member order releases the page
-// before refunding its reusable capacity, including partial initialization.
+// The usage follows the real resident owner. Member order releases the page
+// before reallocation its reusable capacity, including partial initialization.
 template<class Extra>
 Cache<Extra>::Cache(Pmm& pmm, Perms perms, Pager* pager, bool priv, usize capacity) noexcept
     : pmm_(&pmm), perms_(perms), rows_(pmm, decltype(rows_)::quota_for(capacity)) {
@@ -119,8 +119,8 @@ auto Cache<Extra>::drain() noexcept -> bool {
 }
 
 template<class Extra>
-auto Cache<Extra>::make(const object::ref<>& payer, usize i) noexcept -> std::expected<Row, MemErr> {
-    auto n = rows_.create(payer, i);
+auto Cache<Extra>::make(const object::ref<>& quota, usize i) noexcept -> std::expected<Row, MemErr> {
+    auto n = rows_.create(quota, i);
     if (!n) return std::unexpected((n.error() == SlabErr::ResourceExhausted || n.error() == SlabErr::QuotaExceeded)
         ? MemErr::ResourceExhausted : n.error() == SlabErr::GenerationExhausted
         ? MemErr::GenerationExhausted : MemErr::OutOfMemory);
@@ -128,8 +128,8 @@ auto Cache<Extra>::make(const object::ref<>& payer, usize i) noexcept -> std::ex
 }
 
 template<class Extra>
-auto Cache<Extra>::charge_page(const object::ref<>& payer) noexcept -> std::expected<resource::Charge, MemErr> {
-    auto reserved = resource::acquire(payer, {.memory = page_size});
+auto Cache<Extra>::charge_page(const object::ref<>& quota) noexcept -> std::expected<resource::Usage, MemErr> {
+    auto reserved = resource::acquire(quota, {.memory = page_size});
     if (!reserved) return std::unexpected(reserved.error() == resource::errc::exhausted
         ? MemErr::ResourceExhausted : MemErr::InvalidState);
     return std::move(*reserved);
@@ -148,7 +148,7 @@ auto Cache<Extra>::query(usize i) const noexcept -> ContentState {
 }
 
 template<class Extra>
-auto Cache<Extra>::allocate(const object::ref<>& payer, usize i) noexcept -> std::expected<Frame, MemErr>
+auto Cache<Extra>::allocate(const object::ref<>& quota, usize i) noexcept -> std::expected<Frame, MemErr>
     requires (!is_paged) {
     {
         sync::Lock guard{tree_lock_};
@@ -156,16 +156,16 @@ auto Cache<Extra>::allocate(const object::ref<>& payer, usize i) noexcept -> std
             return n->resident ? std::expected<Frame, MemErr>{Frame{n->resident.page(), perms_, &n->pins}}
                                : std::unexpected(MemErr::Busy);
     }
-    auto row = make(payer, i);
+    auto row = make(quota, i);
     if (!row) return std::unexpected(row.error());
-    auto fee = charge_page(payer);
+    auto fee = charge_page(quota);
     if (!fee) return std::unexpected(fee.error());
     auto page = pmm_->allocate_page();
     if (!page) return std::unexpected(MemErr::OutOfMemory);
     memset(page->bytes(), 0, page_size);
     auto* n = row->get();
     n->resident = std::move(*page);
-    n->charge = std::move(*fee);
+    n->usage = std::move(*fee);
     sync::Lock guard{tree_lock_};
     if (auto* old = nodes_.find(i))
         return old->resident ? std::expected<Frame, MemErr>{Frame{old->resident.page(), perms_, &old->pins}}
@@ -232,7 +232,7 @@ auto Cache<Extra>::stop(Mem&) noexcept -> bool
 
 template<class Extra>
 auto Cache<Extra>::materialize(Mem& owner, usize index, Source::Context* context) noexcept -> std::expected<Frame, MemErr> {
-    if constexpr (!is_paged) return allocate(owner.payer_, index);
+    if constexpr (!is_paged) return allocate(owner.quota_, index);
     else {
         bool queued{};
         Row row;
@@ -244,7 +244,7 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, Source::Context* context
             if (!n) {
                 if (!row) {
                     guard.restore();
-                    auto made = make(owner.payer_, index);
+                    auto made = make(owner.quota_, index);
                     if (!made) return std::unexpected(made.error());
                     row = std::move(*made);
                     row.get()->completion.bind_work(*owner.work_, owner.job_.key(), Source::Drained::bind<&Mem::post>(owner));
@@ -283,11 +283,11 @@ auto Cache<Extra>::materialize(Mem& owner, usize index, Source::Context* context
 
 template<class Extra>
 auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page,
-    cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept
+    cap::Graph::Admission admission, std::span<const object::ref<>*> gates) noexcept
     -> std::expected<void, MemErr>
     requires is_paged {
     if (&pager != cfg_.pager || !page) return std::unexpected(MemErr::OwnershipMismatch);
-    auto fee = charge_page(owner.payer_);
+    auto fee = charge_page(owner.quota_);
     if (!fee) return std::unexpected(fee.error());
     auto reply = pager.reply(id, &owner);
     Node* n;
@@ -302,9 +302,9 @@ auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page,
         libk_assert(&n->request == reply->request());
         auto install = [&] noexcept {
             n->resident = std::move(page);
-            n->charge = std::move(*fee);
+            n->usage = std::move(*fee);
         };
-        if (!reply->commit(authority, gates, Source::Action::bind(install)))
+        if (!reply->commit(admission, gates, Source::Action::bind(install)))
             return std::unexpected(MemErr::InvalidState);
         publication = n->completion.prepare(1, true);
     }
@@ -314,17 +314,17 @@ auto Cache<Extra>::supply(Mem& owner, Pager& pager, u64 id, OwnedPage&& page,
 
 template<class Extra>
 auto Cache<Extra>::finish(Mem& owner, Pager& pager, u64 id, bool fail,
-    cap::Graph::Admission authority, std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr>
+    cap::Graph::Admission admission, std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr>
     requires is_paged {
     if (&pager != cfg_.pager) return std::unexpected(MemErr::OwnershipMismatch);
     auto reply = pager.reply(id, &owner);
     if (!reply) return std::unexpected(MemErr::OwnershipMismatch);
     if (!fail && reply->req().kind == Pager::Kind::PageIn) return std::unexpected(MemErr::InvalidState);
-    return complete(*reply, fail, authority, gates);
+    return complete(*reply, fail, admission, gates);
 }
 
 template<class Extra>
-auto Cache<Extra>::complete(Pager::Reply& reply, bool fail, cap::Graph::Admission authority,
+auto Cache<Extra>::complete(Pager::Reply& reply, bool fail, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr>
     requires is_paged {
     Node* n;
@@ -339,7 +339,7 @@ auto Cache<Extra>::complete(Pager::Reply& reply, bool fail, cap::Graph::Admissio
             else if (fail) n->write_failed = true;
             else if (n->dirty_epoch == reply.req().dirty_epoch) n->dirty_epoch = 0;
         };
-        if (!reply.commit(authority, gates, Source::Action::bind(install), fail))
+        if (!reply.commit(admission, gates, Source::Action::bind(install), fail))
             return std::unexpected(MemErr::InvalidState);
         if (page_in) publication = n->completion.prepare(1, true);
     }
@@ -428,11 +428,11 @@ Extents::Extents(Extents&& other) noexcept
       owned_(std::move(other.owned_)), external_(std::move(other.external_)) {}
 Extents::~Extents() noexcept { reset(); }
 
-auto Extents::initialize(const object::ref<>& payer, std::span<const Extent> extents,
-                         PageGroup&& pages, Phys::Lease&& external) noexcept -> std::expected<void, MemErr> {
+auto Extents::initialize(const object::ref<>& quota, std::span<const Extent> extents,
+                         PageGroup&& pages, Phys::Claim&& external) noexcept -> std::expected<void, MemErr> {
     libk_assert(!head_);
     for (const auto& e : extents) {
-        auto row = rows_.create(payer, e);
+        auto row = rows_.create(quota, e);
         if (!row) {
             reset();
             return std::unexpected(row.error() == SlabErr::ResourceExhausted ? MemErr::ResourceExhausted
@@ -482,9 +482,9 @@ auto Extents::find(usize index) const noexcept -> const Extent* {
     return nullptr;
 }
 void MemWork::Drop::operator()(Data& d) const noexcept {
-    auto* pin = d.pin;
-    d.attachment->drop_work(d.terminal);
-    if (pin) pin->drop_work();
+    auto* lease = d.lease;
+    d.attachment->drop_work(d.final_release);
+    if (lease) lease->drop_work();
 }
 
 MemLink::~MemLink() noexcept {
@@ -509,8 +509,8 @@ auto MemLink::detach() noexcept -> bool {
     return owner->detach(*this);
 }
 
-void MemLink::drop_work(bool terminal) noexcept {
-    if (terminal) {
+void MemLink::drop_work(bool final_release) noexcept {
+    if (final_release) {
         {
             sync::Lock guard{lock_};
             libk_assert(work_.load() == 1 && static_cast<State>(state_.load()) == State::Releasing);
@@ -573,11 +573,11 @@ void PageTransfer::abort() noexcept {
     page_.reset();
 }
 
-auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config config) noexcept
+auto Mem::prepare(const object::ref<>& quota, Pmm& pmm, usize bytes, Config config) noexcept
     -> std::expected<Data, MemErr> {
     if (!bytes || bytes % page_size) return std::unexpected(MemErr::InvalidSize);
     Data d{pmm, bytes / page_size};
-    d.payer_ = payer;
+    d.quota_ = quota;
     auto ready = std::visit([&]<class C>(C& c) noexcept -> std::expected<void, MemErr> {
         if constexpr (std::same_as<C, AnonCfg>) {
             if (!valid_perms(c.perms)) return std::unexpected(MemErr::InvalidAccess);
@@ -586,7 +586,7 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
             if (c.eager) {
                 auto& cache = std::get<Anon>(*d.store_);
                 for (usize i = 0; i < d.pages_; ++i) {
-                    auto page = cache.allocate(d.payer_, i);
+                    auto page = cache.allocate(d.quota_, i);
                     if (!page) return std::unexpected(page.error());
                 }
             }
@@ -599,12 +599,12 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
             if (!c.credits) return std::unexpected(MemErr::InvalidSize);
             const auto credits = std::min(c.credits, d.pages_);
             d.store_.emplace(std::in_place_type<Paged>, pmm, c.perms, &pager->get(), c.priv, credits);
-            if (auto result = std::get<Paged>(*d.store_).prepay(d.payer_, credits); !result) return result;
+            if (auto result = std::get<Paged>(*d.store_).prepay(d.quota_, credits); !result) return result;
         } else {
             auto checked = validate_extents(pmm, d.pages_, c.extents, c.owned, c.external);
             if (!checked) return checked;
             d.store_.emplace(std::in_place_type<Extents>, pmm);
-            auto ready = std::get<Extents>(*d.store_).initialize(d.payer_, c.extents, std::move(c.owned), std::move(c.external));
+            auto ready = std::get<Extents>(*d.store_).initialize(d.quota_, c.extents, std::move(c.owned), std::move(c.external));
             if (!ready) return ready;
             u8 bits{};
             for (const auto& e : c.extents) bits |= e.perms.raw();
@@ -617,7 +617,7 @@ auto Mem::prepare(const object::ref<>& payer, Pmm& pmm, usize bytes, Config conf
 }
 
 Mem::Mem(Data&& d) noexcept
-    : payer_(std::move(d.payer_)), pmm_(d.pmm_), logical_pages_(d.pages_),
+    : quota_(std::move(d.quota_)), pmm_(d.pmm_), logical_pages_(d.pages_),
       store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
     libk_assert(store_ && logical_pages_);
     if (std::holds_alternative<Extents>(*store_) && perms_.contains(Perm::Execute)) {
@@ -714,7 +714,7 @@ auto Mem::materialize(usize page_index, Source::Context* context, bool wired) no
     Store* store{};
     {
         sync::Lock guard{lock_};
-        if (billing_) return std::unexpected(MemErr::Busy);
+        if (reassigning_) return std::unexpected(MemErr::Busy);
         if (state_ != MemState::Live) {
             return std::unexpected(MemErr::InvalidState);
         }
@@ -758,7 +758,7 @@ auto Mem::materialize(usize page_index, Source::Context* context, bool wired) no
     if (!live) {
         return std::unexpected(MemErr::InvalidState);
     }
-    hold.release(); // The installed PTE or caller now owns this operation pin.
+    hold.release(); // The installed PTE or caller now owns this operation lease.
     return (PageHold{*this, result.value(), wired});
 }
 
@@ -766,7 +766,7 @@ auto Mem::begin_transfer(usize page_index) noexcept -> std::expected<PageTransfe
     Anon* backing{};
     {
         sync::Lock guard{lock_};
-        if (billing_) return std::unexpected(MemErr::Busy);
+        if (reassigning_) return std::unexpected(MemErr::Busy);
         if (state_ != MemState::Live || !attachments_.empty() || operations_ != 0 ||
             page_index >= logical_pages_ || !store_) {
             return std::unexpected((!attachments_.empty() || operations_ != 0) ? MemErr::Busy
@@ -793,7 +793,7 @@ template <class F> auto Mem::paged(F&& fn, MemErr error) noexcept {
     Paged* backing{};
     {
         sync::Lock guard{lock_};
-        if (state_ != MemState::Live || billing_ || trimming_ || !store_ ||
+        if (state_ != MemState::Live || reassigning_ || trimming_ || !store_ ||
             !(backing = std::get_if<Paged>(&*store_)))
             return Result{std::unexpected(error)};
         ++operations_; ++preparing_;
@@ -803,15 +803,15 @@ template <class F> auto Mem::paged(F&& fn, MemErr error) noexcept {
     return std::forward<F>(fn)(*backing);
 }
 
-auto Mem::supply(Pager& pager, u64 id, OwnedPage&& page, cap::Graph::Admission authority,
+auto Mem::supply(Pager& pager, u64 id, OwnedPage&& page, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
-    return paged([&](Paged& p) noexcept { return p.supply(*this, pager, id, std::move(page), authority, gates); });
+    return paged([&](Paged& p) noexcept { return p.supply(*this, pager, id, std::move(page), admission, gates); });
 }
 
-auto Mem::supply(Pager& pager, PageTransfer&& transfer, u64 id, cap::Graph::Admission authority,
+auto Mem::supply(Pager& pager, PageTransfer&& transfer, u64 id, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
     if (!transfer || !transfer.page().valid()) return std::unexpected(MemErr::OwnershipMismatch);
-    const auto result = supply(pager, id, std::move(transfer.page_), authority, gates);
+    const auto result = supply(pager, id, std::move(transfer.page_), admission, gates);
     if (result) transfer.commit();
     else transfer.abort();
     return result;
@@ -834,17 +834,17 @@ auto Mem::observe_usage(usize page_index, bool accessed, bool dirty) noexcept ->
     return result;
 }
 
-auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admission authority,
-    std::span<const object::ref<>*> gates, const cap::GrantLease* grant) noexcept -> std::expected<void, MemErr> {
+auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admission admission,
+    std::span<const object::ref<>*> gates, const cap::GrantPin* grant) noexcept -> std::expected<void, MemErr> {
     Source::Publication publication;
-    auto cpu = context.thread.payer();
+    auto cpu = context.thread.cpu_domain();
     {
         sync::Lock guard{lock_};
         if (state_ != MemState::Live || !store_ || !std::get_if<Paged>(&*store_))
             return std::unexpected(MemErr::InvalidState);
         if (range.empty() || !ObjectRange{0, logical_pages_}.contains(range))
             return std::unexpected(MemErr::InvalidRange);
-        if (billing_ || trimming_ || advancing_ || request_pins_.load(std::memory_order_acquire))
+        if (reassigning_ || trimming_ || advancing_ || request_pins_.load(std::memory_order_acquire))
             return std::unexpected(MemErr::Busy);
         auto self = object::ref<>::retain_alive(job_.key());
         auto& op = trim_op_.emplace(object::ref<>{}, Source::Action::bind<&Mem::post>(*this),
@@ -862,7 +862,7 @@ auto Mem::trim(ObjectRange range, Source::Context& context, cap::Graph::Admissio
         };
         // Execution is sponsored by this operation's caller, never permanently
         // by whoever created the transferable memory object.
-        if (op.start(std::move(cpu), self, authority, gates, Source::Action::bind(install), grant) != STATUS_OK) {
+        if (op.start(std::move(cpu), self, admission, gates, Source::Action::bind(install), grant) != STATUS_OK) {
             trim_op_.reset();
             return std::unexpected(MemErr::Busy);
         }
@@ -881,9 +881,9 @@ auto Mem::writeback(usize index) noexcept -> std::expected<void, MemErr> {
     return paged([&](Paged& p) noexcept { return p.writeback(index); }, MemErr::NotBacked);
 }
 
-auto Mem::pager_finish(Pager& pager, u64 id, bool fail, cap::Graph::Admission authority,
+auto Mem::pager_finish(Pager& pager, u64 id, bool fail, cap::Graph::Admission admission,
     std::span<const object::ref<>*> gates) noexcept -> std::expected<void, MemErr> {
-    return paged([&](Paged& p) noexcept { return p.finish(*this, pager, id, fail, authority, gates); });
+    return paged([&](Paged& p) noexcept { return p.finish(*this, pager, id, fail, admission, gates); });
 }
 
 auto Mem::write(usize offset, std::span<const byte> input) noexcept -> std::expected<void, MemErr> {
@@ -1001,7 +1001,7 @@ auto Mem::detach(MemLink& attachment) noexcept -> bool {
 }
 
 // The cleanup token retains object storage until backing work, mappings, and
-// leases have drained. The retirement walk itself owns an operation pin: a
+// pins have drained. The retirement walk itself owns an operation lease: a
 // synchronous withdrawal callback must not finish cleanup beneath this walk.
 void Mem::retire(object::cleanup&& cleanup) noexcept {
     bool retired{};
@@ -1030,7 +1030,7 @@ void Mem::retire(object::cleanup&& cleanup) noexcept {
 }
 
 // Both retirement and live trim publish one work obligation per actual link.
-// Only trim needs an additional Mem pin: retirement already retains its storage.
+// Only trim needs an additional Mem lease: retirement already retains its storage.
 auto Mem::invalidate(ObjectRange range, usize limit) noexcept -> bool {
     for (usize step = 0; step < limit; ++step) {
         MemLink* link;
@@ -1189,7 +1189,7 @@ void Mem::drop_work() noexcept {
 
 void Mem::request_pin() noexcept { (void)request_pins_.fetch_add(1, std::memory_order_acq_rel); }
 void Mem::request_drop() noexcept {
-    // An active trim owns a pin, so request retirement cannot destroy it here.
+    // An active trim owns a lease, so request retirement cannot destroy it here.
     bool trimming;
     {
         sync::Lock guard{lock_};
@@ -1228,7 +1228,7 @@ void Mem::finish_retire(bool drop_request) noexcept {
     {
         sync::Lock guard{lock_};
         if (drop_request) libk_assert(request_pins_.fetch_sub(1, std::memory_order_acq_rel));
-        if (state_ != MemState::Stopping || operations_ != 0 || preparing_ || billing_ ||
+        if (state_ != MemState::Stopping || operations_ != 0 || preparing_ || reassigning_ ||
             request_pins_.load(std::memory_order_acquire) != 0 || !attachments_.empty() || releasing_) {
             return;
         }

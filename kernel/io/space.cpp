@@ -21,9 +21,9 @@ template<class T> void Iommu::write(usize offset, T value) noexcept {
     arch::io_fence();
 }
 Iommu::Iommu(mm::Pmm& pmm, mm::KSpace& vm, Cpus& cpus, WorkQueue& work, const time::Clock& clock,
-         object::ref<> payer, mm::Phys::Lease&& claim, object::ref<irq::Ctl> irq_owner,
+         object::ref<> quota, mm::Phys::Claim&& claim, object::ref<irq::Ctl> irq_owner,
          irq::Line line, IommuConfig config) noexcept
-    : vm_(vm), cpus_(cpus), work_(work), clock_(clock), payer_(std::move(payer)),
+    : vm_(vm), cpus_(cpus), work_(work), clock_(clock), quota_(std::move(quota)),
       claim_(std::move(claim)), irq_owner_(std::move(irq_owner)),
       irq_(line, irq::Route::Handler::bind<&Iommu::interrupt>(*this),
            irq::Route::Stop::bind<&Iommu::disconnected>(*this)), config_(config), storage_(pmm.group()) {}
@@ -36,7 +36,7 @@ auto Iommu::state() const noexcept -> IoState {
     return phase_ == Phase::Ready ? IO_SPACE_READY : IO_SPACE_PENDING;
 }
 auto Iommu::page() noexcept -> std::expected<mm::Page, status_t> {
-    auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+    auto fee = resource::acquire(quota_, {.memory = mm::page_size});
     if (!fee) return std::unexpected(STATUS_NO_MEMORY);
     auto page = storage_.allocate();
     if (!page) return std::unexpected(STATUS_NO_MEMORY);
@@ -98,7 +98,7 @@ auto Iommu::activate() noexcept -> status_t {
         write<u32>(Fqcsr, 0);
         status = STATUS_OK;
     };
-    static_cast<void>(authority_.publish(Source::Action::bind(commit)));
+    static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
     if (status == STATUS_OK) post();
     return status;
 }
@@ -108,7 +108,7 @@ void Iommu::invalidated() noexcept {
     static_cast<void>(self.destroy()); post();
 }
 void Iommu::links(u64 cursor, LinkRecords& out) const noexcept {
-    authority_.links(out, LINK_PHYS, cursor);
+    bindings_.links(out, LINK_PHYS, cursor);
     for (auto& row : std::span{out.records, out.count}) {
         if (row.object_id == irq_owner_.id().value) { row.kind = LINK_ROUTE; row.first = config_.source; row.bytes = 1; }
         else { row.first = config_.address; row.bytes = config_.bytes; }
@@ -116,7 +116,7 @@ void Iommu::links(u64 cursor, LinkRecords& out) const noexcept {
 }
 auto Iommu::attach(Space& domain) noexcept -> status_t {
     sync::Lock lock{lock_};
-    if (phase_ != Phase::Ready || closing_ || billing_) return STATUS_BUSY;
+    if (phase_ != Phase::Ready || closing_ || reassigning_) return STATUS_BUSY;
     for (auto* d = domains_; d; d = d->next_)
         if (d->requester_ == domain.requester_) return STATUS_BUSY;
     for (;;) {
@@ -142,7 +142,7 @@ void Iommu::detach(Space& domain) noexcept {
 auto Iommu::sync(IoOp::Receipt& receipt, bool enable) noexcept -> status_t {
     auto& domain = *receipt.owner;
     sync::Lock lock{lock_};
-    if (billing_) return STATUS_PENDING;
+    if (reassigning_) return STATUS_PENDING;
     if (phase_ != Phase::Ready) return STATUS_BACKING_FAILED;
     if (read<u32>(Cqcsr) & CqErrors) { fail(); return STATUS_BACKING_FAILED; }
     if (inflight_) {
@@ -227,13 +227,13 @@ void Iommu::advance() noexcept {
       closed = phase_ == Phase::Closed;
     }
     libk::scope_exit advanced{[&]() noexcept { sync::Lock guard{lock_}; advancing_ = false; }};
-    // Authority invalidation can finish hardware shutdown before the pool's
+    // Binding invalidation can finish hardware shutdown before the pool's
     // retire hook delivers its cleanup owner. Closed is terminal in either case.
     if (closed) { complete(); return; }
     bool rearm{};
     {
         sync::Lock lock{lock_};
-        if (billing_) return;
+        if (reassigning_) return;
         // Losing interrupt delivery requests shutdown; controller completion is
         // polled and does not depend on that IRQ route remaining connected.
         if (disconnected_.load(std::memory_order_acquire) || initialization_.canceled()) close();
@@ -293,7 +293,7 @@ void Iommu::advance() noexcept {
                 write<u64>(Ddtp, (directory_.raw() << 10) | mode);
                 phase_ = Phase::Directory;
             };
-            if (!authority_.publish(Source::Action::bind(commit))) { close(); post(); return; }
+            if (!bindings_.publish(Source::Action::bind(commit))) { close(); post(); return; }
             break;
         }
         case Phase::Directory:
@@ -319,7 +319,7 @@ void Iommu::advance() noexcept {
     // Route lock never nests inside the controller lock: IRQ dispatch posts work.
     if (rearm) {
         auto commit = [&]() noexcept { irq_.reset(); if (!irq_.connect()) disconnected(); };
-        static_cast<void>(authority_.publish(Source::Action::bind(commit)));
+        static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
     }
     if (phase_ == Phase::Ready && initialization_.query().sequence != OP_DONE) {
         if (!initialization_.detach()) { post(); return; }
@@ -344,7 +344,7 @@ void Iommu::advance() noexcept {
         initialization_.finish(STATUS_CANCELED);
     }
     claim_.reset();
-    if (!authority_.close()) return;
+    if (!bindings_.close()) return;
     { sync::Lock lock{lock_}; phase_ = Phase::Closed; }
     complete();
 }
@@ -377,7 +377,7 @@ auto Space::accept(Op::Submission ctx, bool commit) noexcept -> status_t {
         operation_ = std::move(*ctx.execution);
         active_ = static_cast<IoOp*>(operation_.get());
     };
-    std::array<const cap::GrantLease*, 1> grants{&*controller};
+    std::array<const cap::GrantPin*, 1> grants{&*controller};
     const auto status = ctx.publish(Source::Action::bind(install), grants);
     if (status != STATUS_OK) return status;
     return !commit || active_->state_.commit() ? STATUS_OK : STATUS_CANCELED;
@@ -415,8 +415,8 @@ void Space::invalidated(void* arg, object::LinkWork&& work) noexcept {
     d.ctl_work_ = std::move(work);
     d.close();
 }
-Space::Space(mm::Pmm& pmm, WorkQueue& work, object::ref<> payer, object::ref<Iommu> ctl, u32 requester) noexcept
-    : pmm_(pmm), work_(work), payer_(std::move(payer)), controller_(std::move(ctl)),
+Space::Space(mm::Pmm& pmm, WorkQueue& work, object::ref<> quota, object::ref<Iommu> ctl, u32 requester) noexcept
+    : pmm_(pmm), work_(work), quota_(std::move(quota)), controller_(std::move(ctl)),
       requester_(requester), maps_(pmm) {
     work_.open(job_, Work::Fn::bind<&Space::progress>(*this));
 }
@@ -428,7 +428,7 @@ auto Space::open(object::ref<> self, cap::Resolved<Iommu>& controller, object::r
         work_.post(job_);
     }};
     self_ = std::move(self);
-    auto fee = resource::acquire(payer_, {.memory = mm::page_size});
+    auto fee = resource::acquire(quota_, {.memory = mm::page_size});
     if (!fee) return STATUS_NO_MEMORY;
     auto root = mm::PageTable::create(pmm_, mm::PageTable::Kind::Device);
     if (!root) return STATUS_NO_MEMORY;
@@ -488,7 +488,7 @@ auto Space::map(Op::Submission ctx, cap::Resolved<mm::Mem>& source, mm::ObjectRa
     }
     // Only these fixed preparations need the caller's Resolved capability.
     // Everything that may yield belongs to the accepted operation.
-    auto made = maps_.create(payer_, pmm_, *this, iova ? iova : mm::UserBegin, range.size());
+    auto made = maps_.create(quota_, pmm_, *this, iova ? iova : mm::UserBegin, range.size());
     status_t result = made ? STATUS_OK : STATUS_NO_MEMORY;
     if (made) {
         op->edit_->mapping = *made;
@@ -563,7 +563,7 @@ void Space::advance_edit(IoOp& op) noexcept {
         case E::Pin: {
             auto page = map->memory->materialize(edit.range.base() + edit.position);
             if (!page || !pmm_.is_ram(page->page()) || !page->perms().contains(edit.perms)) { fail(STATUS_BACKING_FAILED); return; }
-            auto pin = map->pins.create(payer_, std::move(*page), edit.position);
+            auto pin = map->pins.create(quota_, std::move(*page), edit.position);
             if (!pin) { fail(STATUS_NO_MEMORY); return; }
             guard.emplace(lock_);
             (*pin)->next = map->pages; map->pages = *pin;
@@ -582,7 +582,7 @@ void Space::advance_edit(IoOp& op) noexcept {
         }
         case E::Reserve:
             if (edit.tables) {
-                auto fee = resource::acquire(payer_, {.memory=mm::page_size});
+                auto fee = resource::acquire(quota_, {.memory=mm::page_size});
                 if (!fee || !op.pages_.allocate()) { fail(STATUS_NO_MEMORY); return; }
                 op.tables_fee_.merge(std::move(*fee)); --edit.tables;
             } else {

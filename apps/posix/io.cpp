@@ -572,9 +572,9 @@ extern "C" int open(const char* path, int flags, ...) {
         status = dir_bus.invoke("Resource", std::move(query), reply);
         if (status != STATUS_OK) return px_result(status);
         loan = *reply.data["loan"].as<uint64_t>();
-        auto account = reply.take(reply.data["account"]);
+        auto quota = reply.take(reply.data["quota"]);
         query = {}; query.data.put("path", absolute).put("flags", backend)
-            .cap("budget", *query.attach(account.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
+            .cap("budget", *query.attach(quota.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
         status = dir_rpc.invoke("Open", std::move(query), reply); object = reply.take(reply.data["handle"]);
         if (status == STATUS_OK && !object) status = STATUS_PEER_FAULT;
     }

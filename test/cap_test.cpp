@@ -12,7 +12,7 @@
 #include <libk/noncopyable.hpp>
 #include <utility>
 #include <mm/pmm.hpp>
-#include <object/pool.hpp>
+#include <object/scope.hpp>
 #include <boot/info.hpp>
 #include <sched/sc.hpp>
 #include <task/thread.hpp>
@@ -44,7 +44,7 @@ constinit libk::manual_lifetime<mm::RegionList> cap_test_map{};
 constinit libk::manual_lifetime<mm::Pmm> cap_test_pmm{};
 constinit libk::manual_lifetime<WorkQueue> cap_work{};
 constinit libk::manual_lifetime<object::pool<sched::Sc>> cap_test_contexts{};
-constinit libk::manual_lifetime<object::pool<resource::Account>> cap_test_accounts{};
+constinit libk::manual_lifetime<object::pool<resource::Quota>> cap_test_quotas{};
 constinit libk::manual_lifetime<object::pool<object::Scope>> cap_test_scopes{};
 constinit libk::manual_lifetime<object::pool<cap::CSpace>> cap_test_cspaces{};
 
@@ -131,7 +131,7 @@ public:
         }
         cap_test_map.reset();
         (void)cap_test_contexts.emplace(*cap_test_pmm, *cap_work);
-        (void)cap_test_accounts.emplace(*cap_test_pmm, *cap_work);
+        (void)cap_test_quotas.emplace(*cap_test_pmm, *cap_work);
         (void)cap_test_scopes.emplace(*cap_test_pmm, *cap_work);
         (void)cap_test_cspaces.emplace(*cap_test_pmm, *cap_work);
         [[maybe_unused]] auto& graph =
@@ -250,7 +250,7 @@ private:
         }
         cap_test_cspaces.reset();
         cap_test_contexts.reset();
-        cap_test_accounts.reset();
+        cap_test_quotas.reset();
         cap_test_scopes.reset();
         cap_work.reset();
         cap_test_pmm.reset();
@@ -283,7 +283,7 @@ bool test_typed_attenuation_covers_all_families(
     using cap::IrqRoute;
     using cap::MemLimit;
     using cap::Badge;
-    using cap::Quota;
+    using cap::QuotaLimit;
     using cap::VmLimit;
 
     byte bytes[CAP_ATTENUATION_SIZE]{};
@@ -329,15 +329,15 @@ bool test_typed_attenuation_covers_all_families(
 
     const View pool{
         attenuation_rights,
-        Quota{
-            resource::budget{1024 * 1024, 16},
+        QuotaLimit{
+            resource::Budget{1024 * 1024, 16},
             OBJ_KINDS}};
-    attenuation_bytes(bytes, ObjAccount);
+    attenuation_bytes(bytes, ObjQuota);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 4096);
     put64(bytes, CAP_ATTENUATION_WORD1_OFFSET, 4);
     put64(bytes, CAP_ATTENUATION_WORD2_OFFSET,
         (u64{1} << ObjMem));
-    if (!decode_and_check(ObjAccount, pool, bytes)) {
+    if (!decode_and_check(ObjQuota, pool, bytes)) {
         return false;
     }
 
@@ -555,7 +555,7 @@ bool test_resolve_composes_authority_and_pins_kind(
         auto other = fixture.target_ref(1);
         if (!other) return false;
         auto replaced = fixture.graph().derive(
-            resolved.value().lease(), std::move(other), View{inspect_rights});
+            resolved.value().pin(), std::move(other), View{inspect_rights});
         if (replaced || replaced.error() != cap::GrantError::InvalidKey
             || fixture.settled_grants() != 1) return false;
     }
@@ -749,9 +749,9 @@ bool test_attachment_detach_transfers_quiescence_once(const TestContext&) noexce
         const auto key = root->key();
         libk::scope_exit drained{[&]() noexcept { fixture.drain(); }};
         Probe probe{ops};
-        auto lease = root.value().acquire();
-        if (!lease || !lease.value().attach(probe.attachment)) return false;
-        lease.value().reset();
+        auto pin = root.value().acquire();
+        if (!pin || !pin.value().attach(probe.attachment)) return false;
+        pin.value().reset();
         if (order != 0) {
             if (order == 3) {
                 // Object close must find relationships even on an independent
@@ -1122,14 +1122,14 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         return false;
     }
 
-    constexpr resource::budget limit{
+    constexpr resource::Budget limit{
         .memory = 8 * mm::page_size,
         .caps = 8,
     };
-    constexpr resource::budget object_charge{
+    constexpr resource::Budget object_charge{
         .memory = mm::page_size,
     };
-    auto made_pool = cap_test_accounts->create(limit);
+    auto made_pool = cap_test_quotas->create(limit);
     if (!made_pool) {
         return false;
     }
@@ -1155,7 +1155,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     }
     auto installed = space->insert(
         std::move(root).value(), View{basic_rights});
-    const resource::budget after_install{
+    const resource::Budget after_install{
         .memory = limit.memory - object_charge.memory
             - 3 * mm::page_size,
         .caps = limit.caps - 1,
@@ -1164,8 +1164,8 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         || !space->transfer(installed.value(), fixture.b(), cap::XferOp::Derive, inspect_rights)) {
         return false;
     }
-    const resource::budget after_delegate{
-        .memory = after_install.memory - Graph::node_charge().memory,
+    const resource::Budget after_delegate{
+        .memory = after_install.memory - Graph::node_usage().memory,
         .caps = after_install.caps,
     };
     if (pool->available() != after_delegate) {
@@ -1189,21 +1189,21 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         auto reserved = space->reserve();
         if (!reserved || pool->available().caps != limit.caps - 1
             || !space.destroy() || space->table_pages() != 3
-            || pool->close() == resource::Account::Phase::Drained) {
+            || pool->close() == resource::Quota::Phase::Drained) {
             return false;
         }
         // Retirement cannot refund a selector or its table while its owner
-        // still holds the reservation, even when the sponsor is closing.
+        // still holds the reservation, even when the source is closing.
     }
     fixture.drain();
-    if (space->table_pages() != 0 || pool->available() != resource::budget{
+    if (space->table_pages() != 0 || pool->available() != resource::Budget{
             .memory = limit.memory - object_charge.memory, .caps = limit.caps}) {
         return false;
     }
     space.reset();
     fixture.drain();
     if (pool->available() != limit || pool->info(0).allocations != 0
-        || pool->close() != resource::Account::Phase::Drained
+        || pool->close() != resource::Quota::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -1304,11 +1304,11 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     if (!fixture.initialize()) {
         return false;
     }
-    constexpr resource::budget limit{
+    constexpr resource::Budget limit{
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
-    auto pending_pool = cap_test_accounts->create(limit);
+    auto pending_pool = cap_test_quotas->create(limit);
     if (!pending_pool) {
         return false;
     }
@@ -1317,7 +1317,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
         auto self = object::ref<>{pool};
         auto target = fixture.target_ref(1);
         if (!self || !target) return false;
-        auto fee = pool->reserve(std::move(self), Graph::node_charge());
+        auto fee = pool->reserve(std::move(self), Graph::node_usage());
         auto rejected = fixture.pending_target(1);
         if (!fee || !rejected || rejected->root(fixture.graph(), std::move(*fee),
                                         View{Rights::of(Right::Signal)})) return false;
@@ -1327,18 +1327,18 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
         if (pool->available() != limit || fixture.settled_grants()) return false;
     }
 
-    auto payer_ref = object::ref<>{pool};
-    if (!payer_ref) {
+    auto quota_ref = object::ref<>{pool};
+    if (!quota_ref) {
         return false;
     }
-    auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
+    auto root_fee = pool->reserve(std::move(quota_ref), Graph::node_usage());
     auto creation = fixture.pending_target(0);
     auto child_pool_ref = object::ref<>{pool};
     if (!creation || !child_pool_ref) {
         return false;
     }
     auto child_reservation = pool->reserve(
-        std::move(child_pool_ref), Graph::node_charge());
+        std::move(child_pool_ref), Graph::node_usage());
     auto target_ref = fixture.target_ref(0);
     if (!child_reservation || !target_ref) {
         return false;
@@ -1349,9 +1349,9 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     }
     // A pending slot accepts one initial lineage, never a second owner.
     {
-        auto payer = object::ref<>{pool};
-        if (!payer) return false;
-        auto fee = pool->reserve(std::move(payer), Graph::node_charge());
+        auto quota = object::ref<>{pool};
+        if (!quota) return false;
+        auto fee = pool->reserve(std::move(quota), Graph::node_usage());
         if (!fee) return false;
         auto duplicate = creation->root(fixture.graph(), std::move(*fee), View{all_context_rights});
         if (duplicate || duplicate.error() != GrantError::InvalidState) return false;
@@ -1382,7 +1382,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     if (fixture.settled_grants() != 0
         || pool->available() != limit
         || pool->info(0).allocations != 0
-        || pool->close() != resource::Account::Phase::Drained
+        || pool->close() != resource::Quota::Phase::Drained
         || !pool.destroy()) {
         return false;
     }
@@ -1398,18 +1398,18 @@ bool test_pending_rollback_defers_refund(const TestContext&) noexcept {
     return pending_rollback_closes_lineage(true);
 }
 
-bool test_scope_close_is_independent_from_account(const TestContext&) noexcept {
+bool test_scope_close_is_independent_from_quota(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::budget limit{8 * mm::page_size, 16};
+    constexpr resource::Budget limit{8 * mm::page_size, 16};
     auto new_scope = cap_test_scopes->create();
-    auto new_account = cap_test_accounts->create(limit);
-    if (!new_scope || !new_account) return false;
+    auto new_quota = cap_test_quotas->create(limit);
+    if (!new_scope || !new_quota) return false;
     auto scope = new_scope->publish();
-    auto account = new_account->publish();
+    auto quota = new_quota->publish();
     auto owner = object::Scope::reserve(scope);
-    auto fee = account->reserve(account, object::pool<sched::Sc>::slot_charge());
-    auto grant_fee = account->reserve(account, Graph::node_charge());
+    auto fee = quota->reserve(quota, object::pool<sched::Sc>::slot_usage());
+    auto grant_fee = quota->reserve(quota, Graph::node_usage());
     if (!owner || !fee || !grant_fee) return false;
     auto made = cap_test_contexts->create(std::move(*owner), std::move(*fee), sched::Sc::Config{1, 10}, 0);
     if (!made) return false;
@@ -1425,92 +1425,92 @@ bool test_scope_close_is_independent_from_account(const TestContext&) noexcept {
     std::optional<cap::Resolved<sched::Sc>> held{std::move(*active)};
     if (scope->close() != object::Scope::Phase::Closing
         || fixture.a().resolve<sched::Sc>(*handle, inspect_rights)
-        || account->state() != resource::Account::Phase::Open
+        || quota->state() != resource::Quota::Phase::Open
         || scope->events().snapshot().value != STATE_CLOSING
-        || account->events().snapshot().value != STATE_OPEN) return false;
+        || quota->events().snapshot().value != STATE_OPEN) return false;
     held.reset(); fixture.drain();
     if (scope->info(0).state != OBJECT_DRAINED || scope->events().snapshot().value != STATE_DRAINED
         || scope->info(0).members
-        || account->close() != resource::Account::Phase::Closing) return false;
+        || quota->close() != resource::Quota::Phase::Closing) return false;
     CSpaceInfo info;
     if (!fixture.a().inspect({}, info) || info.count != 1
         || info.records[0].object_id != id.value || info.records[0].grant_id != grant.value
         || info.records[0].state != CAP_INFO_UNAVAILABLE) return false;
     target.reset(); fixture.drain();
-    if (account->available() != limit || account->events().snapshot().value != STATE_DRAINED
-        || account->state() != resource::Account::Phase::Drained
-        || !fixture.a().close(*handle) || !scope.destroy() || !account.destroy()) return false;
-    scope.reset(); account.reset(); fixture.drain();
+    if (quota->available() != limit || quota->events().snapshot().value != STATE_DRAINED
+        || quota->state() != resource::Quota::Phase::Drained
+        || !fixture.a().close(*handle) || !scope.destroy() || !quota.destroy()) return false;
+    scope.reset(); quota.reset(); fixture.drain();
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_scope_adopt_keeps_payer(const TestContext&) noexcept {
+bool test_scope_adopt_keeps_quota(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::budget limit{8 * mm::page_size, 16};
+    constexpr resource::Budget limit{8 * mm::page_size, 16};
     auto new_source = cap_test_scopes->create();
     auto new_destination = cap_test_scopes->create();
-    auto new_account = cap_test_accounts->create(limit);
-    if (!new_source || !new_destination || !new_account) return false;
+    auto new_quota = cap_test_quotas->create(limit);
+    if (!new_source || !new_destination || !new_quota) return false;
     auto source = new_source->publish();
     auto destination = new_destination->publish();
-    auto account = new_account->publish();
+    auto quota = new_quota->publish();
     auto owner = object::Scope::reserve(source);
-    auto fee = account->reserve(account, object::pool<sched::Sc>::slot_charge());
+    auto fee = quota->reserve(quota, object::pool<sched::Sc>::slot_usage());
     if (!owner || !fee) return false;
     auto made = cap_test_contexts->create(std::move(*owner), std::move(*fee), sched::Sc::Config{1, 10}, 0);
     if (!made) return false;
     auto target = made->publish();
-    const auto charged = account->available();
+    const auto charged = quota->available();
     ScopeMembers page;
     if (source->inspect(source.id(), {}, OBJ_KINDS, page) != STATUS_OK || page.count != 1
         || page.records[0].object_id != target.id().value || page.records[0].epoch != 1
         || page.records[0].state != SCOPE_MEMBER_LIVE) return false;
     const auto old_cursor = page.next;
     auto facts = source->describe(target.id(), OBJ_KINDS, 1);
-    if (!facts || facts->owner_id != source.id().value || facts->account_id
+    if (!facts || facts->owner_id != source.id().value || facts->quota_id
         || !(facts->flags & OBS_BOUNDARY) || facts->owner_epoch != 1
         || !source->contains(target.id(), OBJ_BIT(ObjSc), 1)
         || source->contains(target.id(), OBJ_BIT(ObjMem), 1)
-        || source->lookup(account.id(), OBJ_KINDS, 64)) return false;
+        || source->lookup(quota.id(), OBJ_KINDS, 64)) return false;
     if (source->inspect(source.id(), {}, OBJ_BIT(ObjMem), page) != STATUS_OK || page.count) return false;
     if (source->inspect(destination.id(), old_cursor, OBJ_KINDS, page) != STATUS_STALE) return false;
     auto adopted = object::Scope::adopt(target, source, destination, 1);
     if (!adopted || *adopted != 2 || source->info(0).members || destination->info(0).members != 1
-        || account->available() != charged || object::Scope::adopt(target, source, destination, 1)) return false;
+        || quota->available() != charged || object::Scope::adopt(target, source, destination, 1)) return false;
     if (source->contains(target.id(), OBJ_KINDS, 64) || !destination->contains(target.id(), OBJ_KINDS, 1)) return false;
     if (source->inspect(source.id(), old_cursor, OBJ_KINDS, page) != STATUS_STALE
         || destination->inspect(destination.id(), {}, OBJ_KINDS, page) != STATUS_OK || page.count != 1
         || page.records[0].epoch != 2) return false;
-    if (account->close() != resource::Account::Phase::Closing || !target.live()
+    if (quota->close() != resource::Quota::Phase::Closing || !target.live()
         || source->close() != object::Scope::Phase::Drained || !target.admit()) return false;
     (void)destination->close(); fixture.drain();
-    if (destination->info(0).state != OBJECT_DRAINED || target.live() || account->available() != charged) return false;
+    if (destination->info(0).state != OBJECT_DRAINED || target.live() || quota->available() != charged) return false;
     target.reset(); fixture.drain();
-    if (account->available() != limit || account->state() != resource::Account::Phase::Drained
-        || !source.destroy() || !destination.destroy() || !account.destroy()) return false;
-    source.reset(); destination.reset(); account.reset(); fixture.drain();
+    if (quota->available() != limit || quota->state() != resource::Quota::Phase::Drained
+        || !source.destroy() || !destination.destroy() || !quota.destroy()) return false;
+    source.reset(); destination.reset(); quota.reset(); fixture.drain();
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_scope_control_payment_cycles(const TestContext&) noexcept {
+bool test_scope_control_quota_cycles(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
     auto made_host = cap_test_scopes->create();
     if (!made_host) return false;
     auto host = made_host->publish();
-    auto account = [&]() -> object::ref<resource::Account> {
+    auto quota = [&]() -> object::ref<resource::Quota> {
         auto owner = object::Scope::reserve(host);
         if (!owner) return {};
-        auto made = cap_test_accounts->create(std::move(*owner), resource::Reservation{},
-            resource::budget{8 * mm::page_size, 16});
-        return made ? made->publish() : object::ref<resource::Account>{};
+        auto made = cap_test_quotas->create(std::move(*owner), resource::Reservation{},
+            resource::Budget{8 * mm::page_size, 16});
+        return made ? made->publish() : object::ref<resource::Quota>{};
     };
-    auto a = account(), b = account();
+    auto a = quota(), b = quota();
     if (!a || !b) return false;
-    auto scope = [&](object::ref<resource::Account> payer) -> object::ref<object::Scope> {
+    auto scope = [&](object::ref<resource::Quota> quota) -> object::ref<object::Scope> {
         auto owner = object::Scope::reserve(host);
-        auto fee = payer->reserve(payer, object::pool<object::Scope>::slot_charge());
+        auto fee = quota->reserve(quota, object::pool<object::Scope>::slot_usage());
         if (!owner || !fee) return {};
         auto made = cap_test_scopes->create(std::move(*owner), std::move(*fee));
         return made ? made->publish() : object::ref<object::Scope>{};
@@ -1518,7 +1518,7 @@ bool test_scope_control_payment_cycles(const TestContext&) noexcept {
     auto x = scope(b), y = scope(a);
     if (!x || !y) return false;
     // Direct self-wait and the two-Scope cycle are both rejected by walking
-    // actual Membership/Funding edges, without restricting ordinary payers.
+    // actual Membership/Allocation edges, without restricting ordinary quotas.
     if (object::Scope::adopt(a, host, y, 1)) return false;
     if (!object::Scope::adopt(a, host, x, 1)) return false;
     if (object::Scope::adopt(b, host, y, 1)) return false;
@@ -1530,30 +1530,30 @@ bool test_scope_control_payment_cycles(const TestContext&) noexcept {
     return cap_test_pmm->verify_invariants();
 }
 
-bool test_destroy_allocation_progress_and_account_close(const TestContext&) noexcept {
+bool test_destroy_allocation_progress_and_quota_close(const TestContext&) noexcept {
     CapFixture fixture{};
     if (!fixture.initialize()) return false;
-    constexpr resource::budget limit{.memory = 8 * mm::page_size, .caps = 8};
-    auto pending = cap_test_accounts->create(limit);
+    constexpr resource::Budget limit{.memory = 8 * mm::page_size, .caps = 8};
+    auto pending = cap_test_quotas->create(limit);
     if (!pending) return false;
     auto pool = std::move(pending).value().publish();
     cap::Handle handles[2]{};
     const auto rights = Rights::of(Right::Inspect, Right::Destroy);
     for (usize index = 0; index < 2; ++index) {
-        auto payer_ref = object::ref<>{pool};
+        auto quota_ref = object::ref<>{pool};
         auto child_ref = object::ref<>{pool};
-        if (!payer_ref || !child_ref) return false;
-        auto root_fee = pool->reserve(std::move(payer_ref), Graph::node_charge());
+        if (!quota_ref || !child_ref) return false;
+        auto root_fee = pool->reserve(std::move(quota_ref), Graph::node_usage());
         auto creation = fixture.pending_target(index);
-        auto child_charge = pool->reserve(std::move(child_ref), Graph::node_charge());
+        auto child_charge = pool->reserve(std::move(child_ref), Graph::node_usage());
         auto target = fixture.target_ref(index);
         if (!creation || !child_charge || !target) return false;
         auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{rights});
         if (!allocation) return false;
-        auto lease = allocation.value().acquire();
+        auto pin = allocation.value().acquire();
         auto child_target = fixture.target_ref(index);
-        if (!lease || !child_target) return false;
-        auto child = fixture.graph().derive(std::move(child_charge).value(), lease.value(),
+        if (!pin || !child_target) return false;
+        auto child = fixture.graph().derive(std::move(child_charge).value(), pin.value(),
             std::move(child_target), View{rights});
         if (!child) return false;
         auto installed = fixture.a().insert(std::move(child).value(), View{rights});
@@ -1569,13 +1569,13 @@ bool test_destroy_allocation_progress_and_account_close(const TestContext&) noex
     std::optional<cap::Resolved<sched::Sc>> retained{std::move(held).value()};
     if (!fixture.a().destroy(handles[1])) return false;
     // A retained operation delays its own revoke, not the other local close.
-    if (fixture.settled_grants() != 2 || pool->state() != resource::Account::Phase::Open)
+    if (fixture.settled_grants() != 2 || pool->state() != resource::Quota::Phase::Open)
         return false;
-    if (pool->close() != resource::Account::Phase::Closing) return false;
+    if (pool->close() != resource::Quota::Phase::Closing) return false;
     retained.reset();
     fixture.drop_retired_target(0);
     fixture.drop_retired_target(1);
-    if (pool->state() != resource::Account::Phase::Drained || pool->available() != limit
+    if (pool->state() != resource::Quota::Phase::Drained || pool->available() != limit
         || fixture.settled_grants() != 0 || !fixture.a().close(handles[0])
         || !fixture.a().close(handles[1]) || !pool.destroy()) return false;
     pool.reset();
@@ -1611,12 +1611,12 @@ bool test_destroy_authority_uses_object_anchor_retirement(
 bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::budget limit{.memory=8 * mm::page_size, .caps=16};
-    auto made = cap_test_accounts->create(limit);
+    constexpr resource::Budget limit{.memory=8 * mm::page_size, .caps=16};
+    auto made = cap_test_quotas->create(limit);
     if (!made) return false;
     auto pool = made->publish();
-    auto fee = pool->reserve(pool, object::pool<CSpace>::slot_charge());
-    auto root_fee = pool->reserve(pool, Graph::node_charge());
+    auto fee = pool->reserve(pool, object::pool<CSpace>::slot_usage());
+    auto root_fee = pool->reserve(pool, Graph::node_usage());
     if (!fee || !root_fee) return false;
     auto object = cap_test_cspaces->create(std::move(*fee), *cap_test_pmm);
     if (!object) return false;
@@ -1631,8 +1631,8 @@ bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     if (pool->available() == limit) return false; // Worker has not reclaimed storage yet.
     fixture.drain();
     if (pool->available() != limit || pool->info(0).allocations ||
-        pool->state() != resource::Account::Phase::Open ||
-        pool->close() != resource::Account::Phase::Drained || !pool.destroy()) return false;
+        pool->state() != resource::Quota::Phase::Open ||
+        pool->close() != resource::Quota::Phase::Drained || !pool.destroy()) return false;
     pool.reset();
     fixture.drain();
     return cap_test_pmm->verify_invariants();
@@ -1672,7 +1672,7 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         test_duplicate_attenuates_without_splitting_grant);
     (void)registry.add(
         "cap",
-        "delegation revoke blocks new use and drains old leases",
+        "delegation revoke blocks new use and drains old pins",
         test_delegation_revoke_waits_for_existing_lease);
     (void)registry.add("cap", "lineage close drains the last operation after its last cap",
         test_close_drains_orphan_operation);
@@ -1718,18 +1718,18 @@ void register_cap_tests(TestRegistry& registry) noexcept {
         test_pending_rollback_closes_lineage);
     (void)registry.add(
         "cap",
-        "Scope closes accepted work independently of Account refunds",
-        test_scope_close_is_independent_from_account);
+        "Scope closes accepted work independently of Quota refunds",
+        test_scope_close_is_independent_from_quota);
     (void)registry.add(
         "cap",
-        "Adopt changes Scope while preserving payer and lifecycle authority",
-        test_scope_adopt_keeps_payer);
-    (void)registry.add("cap", "Scope rejects direct and cross-Scope control payment cycles",
-        test_scope_control_payment_cycles);
+        "Adopt changes Scope while preserving quota and lifecycle authority",
+        test_scope_adopt_keeps_quota);
+    (void)registry.add("cap", "Scope rejects direct and cross-Scope control/quota cycles",
+        test_scope_control_quota_cycles);
     (void)registry.add(
         "cap",
         "destroy authority enters the target anchor retirement path",
         test_destroy_authority_uses_object_anchor_retirement);
-    (void)registry.add("cap", "local object destruction drains independently and joins Account close",
-        test_destroy_allocation_progress_and_account_close);
+    (void)registry.add("cap", "local object destruction drains independently and joins Quota close",
+        test_destroy_allocation_progress_and_quota_close);
 }

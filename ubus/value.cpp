@@ -66,6 +66,10 @@ ubus_data::ubus_data(ubus_type type) {
     const ubus_head head{sizeof(ubus_head), type, 0};
     ::memcpy(bytes_.data(), &head, sizeof(head));
 }
+static auto ubus_overlap(std::span<const std::byte> a, std::span<const std::byte> b) -> bool {
+    const auto x = reinterpret_cast<uintptr_t>(a.data()), y = reinterpret_cast<uintptr_t>(b.data());
+    return !a.empty() && !b.empty() && (x >= y ? x - y < b.size() : y - x < a.size());
+}
 void ubus_data::append(std::string_view name, ubus_type type, std::span<const std::byte> data,
                        std::span<const std::byte> extra) {
     if (bytes_.empty()) {
@@ -73,9 +77,9 @@ void ubus_data::append(std::string_view name, ubus_type type, std::span<const st
         bytes_.assign(empty.begin(), empty.end());
     }
     const auto prefix = sizeof(ubus_head) + ubus_align(name.size()) + extra.size();
-    if (failed_ || name.size() > UINT16_MAX || data.size() > UINT32_MAX - prefix
+    if (failed_ || name.size() > UINT16_MAX || prefix > UINT32_MAX || data.size() > UINT32_MAX - prefix
         || bytes_.size() > UINT32_MAX - ubus_align(prefix + data.size())) { failed_ = true; return; }
-    size_t offset = sizeof(ubus_head);
+    size_t offset = sizeof(ubus_head) + ubus_align(view().name().size());
     if (view().type() == ubus_type::Record) {
         for (const auto child : view().values()) {
             if (name == child.name()) { failed_ = true; return; }
@@ -86,18 +90,33 @@ void ubus_data::append(std::string_view name, ubus_type type, std::span<const st
     else { failed_ = true; return; }
     const ubus_head head{static_cast<uint32_t>(prefix + data.size()), type, static_cast<uint16_t>(name.size())};
     const auto oldsize = bytes_.size(), amount = ubus_align(head.bytes);
+    // Insertion can overwrite borrowed input even when capacity does not grow.
+    std::span<const std::byte> inputs[]{std::as_bytes(std::span{name}), data, extra};
+    size_t saved_size{};
+    for (const auto input : inputs) if (ubus_overlap(input, bytes_)) saved_size += input.size();
+    std::vector<std::byte> saved(saved_size);
+    size_t cursor{};
+    for (auto& input : inputs) if (ubus_overlap(input, bytes_)) {
+        ::memcpy(saved.data() + cursor, input.data(), input.size());
+        input = std::span{saved}.subspan(cursor, input.size()); cursor += input.size();
+    }
+    name = {reinterpret_cast<const char*>(inputs[0].data()), inputs[0].size()};
+    data = inputs[1]; extra = inputs[2];
     bytes_.resize(oldsize + amount);
     ::memmove(bytes_.data() + offset + amount, bytes_.data() + offset, oldsize - offset);
     ::memset(bytes_.data() + offset, 0, amount);
     ::memcpy(bytes_.data() + offset, &head, sizeof(head));
-    ::memcpy(bytes_.data() + offset + sizeof(head), name.data(), name.size());
-    ::memcpy(bytes_.data() + offset + prefix - extra.size(), extra.data(), extra.size());
-    ::memcpy(bytes_.data() + offset + prefix, data.data(), data.size());
+    if (!name.empty()) ::memcpy(bytes_.data() + offset + sizeof(head), name.data(), name.size());
+    if (!extra.empty()) ::memcpy(bytes_.data() + offset + prefix - extra.size(), extra.data(), extra.size());
+    if (!data.empty()) ::memcpy(bytes_.data() + offset + prefix, data.data(), data.size());
     const auto size = static_cast<uint32_t>(bytes_.size());
     ::memcpy(bytes_.data(), &size, sizeof(size));
 }
 auto ubus_data::assign(std::span<const std::byte> bytes) -> bool {
     const ubus_value value{bytes};
     if (!value.valid() || value.bytes().size() != bytes.size()) { failed_ = true; return false; }
-    bytes_.assign(bytes.begin(), bytes.end()); failed_ = false; return true;
+    if (ubus_overlap(bytes, bytes_)) {
+        ::memmove(bytes_.data(), bytes.data(), bytes.size()); bytes_.resize(bytes.size());
+    } else bytes_.assign(bytes.begin(), bytes.end());
+    failed_ = false; return true;
 }

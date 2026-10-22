@@ -126,15 +126,19 @@ struct vm_area {
         noexcept -> std::expected<vm_area, status_t> {
         return map(arena, std::move(memory), va, size, VM_READ | VM_WRITE | VM_MAP_PRIVATE);
     }
-    static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size, word_t perms = VM_READ | VM_WRITE)
+    static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size, word_t memory_perms, word_t map_perms)
         noexcept -> std::expected<vm_area, status_t> {
-        const auto result = sys::memory_create(auth, size, perms);
+        const auto result = sys::memory_create(auth, size, memory_perms);
         cap_owner memory{result.value};
         if (result.status != STATUS_OK) return std::unexpected(result.status);
         for (size_t page = 0; page < size / 4096; ++page)
             if (const auto status = sys::memory_populate(memory.selector(), page).status;
                 status != STATUS_OK) return std::unexpected(status);
-        return map(arena, std::move(memory), va, size, VM_READ | VM_WRITE);
+        return map(arena, std::move(memory), va, size, map_perms);
+    }
+    static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size, word_t perms = VM_READ | VM_WRITE)
+        noexcept -> std::expected<vm_area, status_t> {
+        return create(auth, arena, va, size, perms, perms);
     }
 private:
     vm_area** link_{};
@@ -152,7 +156,7 @@ private:
 };
 
 // Native, explicitly funded object storage. The object dies before its mapping;
-// the allocation's Account and the provider-owned Scope remain independent.
+// the allocation's Quota and the provider-owned Scope remain independent.
 template<class T> struct vm_delete {
     vm_area storage;
     void operator()(T* object) noexcept { std::destroy_at(object); storage = {}; }

@@ -854,7 +854,7 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
                 if (!retired.adopt(std::move(page))) return false;
         }
         if (user->page_count() != 1 || retired.page_count() != 3 || user->query(*first)) return false;
-        resource::Charge refund{};
+        resource::Usage refund{};
         if (!retired.release(refund)) return false;
         auto high = mm::VPage::from_base(mm::va_t{mm::DirectBegin});
         auto kernel_count = kernel->count();
