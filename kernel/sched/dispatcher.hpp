@@ -119,7 +119,7 @@ private:
         Thread* incoming,
         DispatchReason reason,
         u64 now) noexcept;
-    void post(Thread&, u8 actions) noexcept;
+    auto post(Thread&, u8 actions) noexcept -> bool;
     void complete(Thread&) noexcept;
     auto migrate(Thread&) noexcept -> bool;
     object::ref<> departure_;
@@ -169,6 +169,7 @@ private:
     libk::intrusive_list<Domain::Local, &Domain::Local::mail_hook> domains_{};
     bool has_timer_{};
     bool has_ipi_{};
+    std::optional<u64> timer_;
 };
 
 void yield() noexcept;

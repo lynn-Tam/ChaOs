@@ -153,8 +153,7 @@
           {
             "path": "/",
             "service": "store",
-            "read_only": false,
-            "optional": true
+            "read_only": false
           },
           {
             "path": "/boot",

@@ -81,7 +81,10 @@ static auto worker(std::string_view role) -> status_t {
         auto quota = response.take(response.data["quota"]);
         const auto grant = cap_info(quota.selector());
         if (!grant || grant->view.rights != (RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
-        request = {}; request.data.cap("quota", *request.attach(quota.selector(), grant->view.rights));
+        request = {};
+        const auto quota_idx = request.attach(quota.selector(), grant->view.rights);
+        if (!quota_idx) return quota_idx.error();
+        request.data.cap("quota", *quota_idx);
         status = calculator.invoke("Borrow", std::move(request), response); if (status != STATUS_OK) return status;
         ubus_conn borrowed; status = borrowed.adopt(response.take(response.data["handle"])); if (status != STATUS_OK) return status;
         status = sys::quota_info(quota.selector()).status; if (status != STATUS_OK) return status;
@@ -110,9 +113,18 @@ static auto worker(std::string_view role) -> status_t {
     auto view = old.connector(1), control = old.connector(3), replacement = root.connector(1);
     if (!view || !control || !replacement) return STATUS_INTERNAL;
     const auto attach = [&](uint64_t version, cap_t read, cap_t write, cap_t scope) {
-        ubus_msg q, r; q.data.put("version", version).cap("observe", *q.attach(read, RIGHT_SEND | RIGHT_DUPLICATE))
-            .cap("scope", *q.attach(scope, RIGHT_INSPECT | RIGHT_DUPLICATE));
-        if (write) q.data.cap("manage", *q.attach(write, RIGHT_SEND | RIGHT_DUPLICATE));
+        ubus_msg q, r;
+        const auto observe_idx = q.attach(read, RIGHT_SEND | RIGHT_DUPLICATE);
+        if (!observe_idx) return observe_idx.error();
+        const auto scope_idx = q.attach(scope, RIGHT_INSPECT | RIGHT_DUPLICATE);
+        if (!scope_idx) return scope_idx.error();
+        q.data.put("version", version).cap("observe", *observe_idx)
+            .cap("scope", *scope_idx);
+        if (write) {
+            const auto manage_idx = q.attach(write, RIGHT_SEND | RIGHT_DUPLICATE);
+            if (!manage_idx) return manage_idx.error();
+            q.data.cap("manage", *manage_idx);
+        }
         return parent.invoke("Attach", std::move(q), r);
     };
     if (attach(0, view->selector(), control->selector(), root.scope()) != STATUS_NOT_FOUND) return STATUS_INTERNAL;
@@ -148,20 +160,26 @@ static auto worker(std::string_view role) -> status_t {
         if (status == STATUS_OK) status = borrowed->open(4, quota);
         if (status != STATUS_OK) return status;
         auto handle = borrowed->handle(0, RIGHT_SEND); if (!handle) return handle.error();
-        r.data.cap("handle", *r.give(std::move(*handle))); return STATUS_OK;
+        const auto handle_idx = r.give(std::move(*handle));
+        if (!handle_idx) return handle_idx.error();
+        r.data.cap("handle", *handle_idx); return STATUS_OK;
     });
     if (status == STATUS_OK) status = object.open();
     if (status != STATUS_OK) return status;
     auto connector = object.connector(); if (!connector) return connector.error();
     ubus_msg request, response;
-    request.data.put("name", "probe").cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!peer_idx) return peer_idx.error();
+    request.data.put("name", "probe").cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     request = {}; request.data.put("instance", response.data["instance"]);
     status = parent.invoke("Withdraw", std::move(request), response); if (status != STATUS_OK) return status;
     if (attach(2, replacement->selector(), 0, root.scope()) != STATUS_BUSY) return STATUS_INTERNAL;
     request = {};
+    const auto publish_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!publish_idx) return publish_idx.error();
     request.data.put("name", "answer").put("interface", "fixture.unknown").put("version", uint64_t{1})
-        .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+        .cap("connector", *publish_idx);
     status = parent.invoke("Publish", std::move(request), response);
     if (status != STATUS_OK) return status;
     for (;;) {
@@ -203,7 +221,7 @@ int main(int argc, char** argv) {
     rejected.auth.alloc.quota = 0;
     status = owner.start(rejected);
     if (status == STATUS_OK || status == STATUS_WOULD_BLOCK || rejected.desired
-        || rejected.state != "failed" || rejected.result != status) return STATUS_INTERNAL;
+        || rejected.state != mgr_state::Failed || rejected.result != status) return STATUS_INTERNAL;
     rejected.auth.alloc = env.alloc();
     if (owner.poll() != STATUS_OK || rejected.task || rejected.desired) return STATUS_INTERNAL;
     status = owner.erase(rejected.id); if (status != STATUS_OK) return status;
@@ -211,7 +229,7 @@ int main(int argc, char** argv) {
     incomplete.restart = true;
     const auto failure = owner.start(incomplete);
     if (failure == STATUS_OK || failure == STATUS_WOULD_BLOCK || !incomplete.task
-        || incomplete.desired || incomplete.state != "draining") return STATUS_INTERNAL;
+        || incomplete.desired || incomplete.state != mgr_state::Draining) return STATUS_INTERNAL;
     auto& provider = owner.add("provider", "worker", {.bytes=4 * 1024 * 1024, .caps=256,
         .slots=256, .pages=36});
     provider.args.push_back("provider"); provider.exports.push("answer").push("probe");
@@ -222,13 +240,19 @@ int main(int argc, char** argv) {
     const auto notice = sys::notification_create(env.alloc(), 1); if (notice.status != STATUS_OK) return notice.status;
     cap_owner signal{notice.value};
     const auto linear = sys::cap_duplicate(signal.selector(), env.cspace, RIGHT_SIGNAL); if (linear.status != STATUS_OK) return linear.status;
-    client.setup.data.cap("signal", *client.setup.give(cap_owner{linear.value}));
+    const auto signal_idx = client.setup.give(cap_owner{linear.value});
+    if (!signal_idx) return signal_idx.error();
+    client.setup.data.cap("signal", *signal_idx);
     const auto gated = sys::notification_create(env.alloc(), 1); if (gated.status != STATUS_OK) return gated.status;
     cap_owner gate{gated.value};
-    client.setup.data.cap("gate", *client.setup.attach(gate.selector(), RIGHT_SIGNAL));
+    const auto gate_idx = client.setup.attach(gate.selector(), RIGHT_SIGNAL);
+    if (!gate_idx) return gate_idx.error();
+    client.setup.data.cap("gate", *gate_idx);
     (void)client.setup.attach(env.quota, RIGHT_INSPECT | RIGHT_DUPLICATE); // Owner-private, absent from delivered data.
 
-    provider.setup.data.cap("gate", *provider.setup.attach(gate.selector(), RIGHT_RECEIVE));
+    const auto rx_idx = provider.setup.attach(gate.selector(), RIGHT_RECEIVE);
+    if (!rx_idx) return rx_idx.error();
+    provider.setup.data.cap("gate", *rx_idx);
     status = owner.start(client); if (status != STATUS_OK) return status;
     bool done{}, cycling{};
     mgr_child *cycle_a{}, *cycle_b{};
@@ -236,7 +260,7 @@ int main(int argc, char** argv) {
         status = owner.poll(); if (status != STATUS_OK) { out.write("[mgr] failed poll\n"); return status; }
         if (!done && !client.task) {
             if (client.result != STATUS_OK || provider.root_version != 2 || !provider.observe || !provider.gen || sys::notification_take(signal.selector()).status != STATUS_OK) {
-                (void)libk::fmt::format_to<"[mgr] failed execution: client={} provider-gen={} provider-state={} provider-result={}\n">(out, client.result, provider.gen, provider.state, provider.result); return STATUS_INTERNAL;
+                (void)libk::fmt::format_to<"[mgr] failed execution: client={} provider-gen={} provider-state={} provider-result={}\n">(out, client.result, provider.gen, mgr_state_name(provider.state), provider.result); return STATUS_INTERNAL;
             }
             status = owner.action(provider, "stop"); if (status != STATUS_OK) return status; done = true;
         }
@@ -251,7 +275,7 @@ int main(int argc, char** argv) {
             cycling = true;
         }
         if (cycling && !cycle_a->task && !cycle_b->task && !incomplete.task) {
-            if (incomplete.desired || incomplete.state != "failed" || incomplete.result != failure) return STATUS_INTERNAL;
+            if (incomplete.desired || incomplete.state != mgr_state::Failed || incomplete.result != failure) return STATUS_INTERNAL;
             if (cycle_a->result != STATUS_DENIED || cycle_b->result != STATUS_DENIED) return STATUS_INTERNAL;
             out.write("[mgr] environment, lazy Get, direct RPC, linear Receive, Resource and native drain ok\n");
             out.write("[mgr] cross-branch Quota allocation, growth, exit drain and activation cycle rejection ok\n");

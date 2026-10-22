@@ -50,7 +50,7 @@ auto kernel_root(mm::Pmm& pmm) noexcept -> std::expected<mm::PageTable, mm::PtEr
     for (auto pages : pmm.ram()) {
         auto va = pmm.virt(pages.base().base(), pages.page_count() * mm::page_size);
         libk_assert(va);
-        auto installed = root->map(*va, pages, PtPerm::Rw);
+        auto installed = root->map_direct(*va, pages);
         if (!installed) return std::unexpected(installed.error());
     }
     // Secondaries enter physically; these leaves bridge to their high entry.
@@ -206,7 +206,8 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     auto root = kernel_root(pmm);
     libk_assert(root);
     auto& vm = vm_storage.emplace(pmm, std::move(*root), boot_layout.va);
-    arch::activate_root(vm.cpu_root());
+    arch::load_root(vm.cpu_root());
+    arch::flush_tlb_all();
     console::print<"kernel vspace: active\n">();
 
     auto stack = mm::Stack::create(vm);

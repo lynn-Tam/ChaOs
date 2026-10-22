@@ -79,6 +79,16 @@ int main() {
     check(lease.invoke("Close", {}, result) == STATUS_OK);
     check(lease.invoke("List", {}, result) == STATUS_CLOSED);
     check(descendant.invoke("List", {}, result) == STATUS_CLOSED);
+    // Closing the last handle reclaims independent grants, including Bind's
+    // retained connection. A live bound connection survives the original slot.
+    for (size_t i = 0; i < 160; ++i) {
+        check(readonly.invoke("Delegate", {}, result) == STATUS_OK);
+        ubus_conn temporary;
+        check(temporary.bind(result.capability(result.data["connector"])) == STATUS_OK);
+        result = {};
+        check(temporary.invoke("List", {}, result) == STATUS_OK);
+        check(temporary.close() == STATUS_OK);
+    }
     // Numeric routing directives cannot manufacture namespace authority.
     permission = {}; ubus_data routes, escape;
     escape.put("manager", uint64_t{3}); routes.put("escape", escape);
@@ -200,12 +210,16 @@ int main() {
     cap_owner sender{minted.value};
     check(channel.ends[1].close() == STATUS_OK);
     query = {}; ubus_data setup;
-    setup.cap("unused", *query.give(std::move(sender)));
+    const auto unused_idx = query.give(std::move(sender));
+    if (!unused_idx) return unused_idx.error();
+    setup.cap("unused", *unused_idx);
     ch_pair revocable; check(revocable.open(env.alloc(), 1, 0) == STATUS_OK);
     const auto branch_grant = sys::channel_mint(revocable.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE);
     check(branch_grant.status == STATUS_OK); cap_owner branch_cap{branch_grant.value};
     check(revocable.ends[1].close() == STATUS_OK);
-    setup.cap("revocable", *query.attach(branch_grant.value, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE));
+    const auto grant_idx = query.attach(branch_grant.value, RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE);
+    if (!grant_idx) return grant_idx.error();
+    setup.cap("revocable", *grant_idx);
     ubus_data hold{ubus_type::Array}; hold.push("hold");
     query.data.put("name", "linear-sleep").put("program", "/boot/supervisor.elf").put("argv", hold).put("setup", setup);
     check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
@@ -237,7 +251,9 @@ int main() {
     foreign.put("name", "foreign").put("program", "/boot/foreign.elf").put("restart", true);
     ubus_data exports{ubus_type::Array}; exports.push("math"); foreign.put("exports", exports); recipes.push(foreign);
     config.put("children", recipes); branch_setup.put("config", config);
-    route_exec.cap("connector", *query.attach(executable.selector(), RIGHT_SEND | RIGHT_DUPLICATE)); branch_routes.put("exec", route_exec);
+    const auto exec_idx = query.attach(executable.selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!exec_idx) return exec_idx.error();
+    route_exec.cap("connector", *exec_idx); branch_routes.put("exec", route_exec);
     limits.put("bytes", uint64_t{16 * 1024 * 1024}).put("caps", uint64_t{512}).put("children", true);
     query.data.put("name", "branch").put("program", "/boot/mgr.elf").put("setup", branch_setup).put("routes", branch_routes).put("resources", limits);
     check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
@@ -291,13 +307,20 @@ int main() {
         const auto cap = sys::channel_mint(proof.ends[1].selector(), env.cspace, 1, RIGHT_SEND);
         check(cap.status == STATUS_OK); check(proof.ends[1].close() == STATUS_OK);
         query = {}; setup = {};
-        setup.cap("proof", *query.give(cap_owner{cap.value}));
+        const auto proof_idx = query.give(cap_owner{cap.value});
+        if (!proof_idx) return proof_idx.error();
+        setup.cap("proof", *proof_idx);
         const auto created = sys::notification_create(env.alloc(), 1); check(created.status == STATUS_OK);
         cap_owner crash{created.value};
-        setup.cap("crash", *query.attach(crash.selector(), RIGHT_RECEIVE | RIGHT_DUPLICATE));
+        const auto crash_idx = query.attach(crash.selector(), RIGHT_RECEIVE | RIGHT_DUPLICATE);
+        if (!crash_idx) return crash_idx.error();
+        setup.cap("crash", *crash_idx);
         ubus_data resources; resources.put("children", true);
         query.data.put("name", name).put("program", "/boot/supervisor.elf").put("setup", setup).put("resources", resources);
-        ubus_data routes, upstream; upstream.cap("connector", *query.attach(executable.selector(), RIGHT_SEND | RIGHT_DUPLICATE)); routes.put("exec", upstream); query.data.put("routes", routes);
+        ubus_data routes, upstream;
+        const auto exec_idx = query.attach(executable.selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+        if (!exec_idx) return exec_idx.error();
+        upstream.cap("connector", *exec_idx); routes.put("exec", upstream); query.data.put("routes", routes);
         check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
         const auto ready = sys::wait_one(proof.ends[0].selector(), SOURCE_READY, 0, *rt_after_ms(2000), 0, SOURCE_READ).status;
         if (ready != STATUS_OK) { const auto facts = find(owner, name); ct_output output;

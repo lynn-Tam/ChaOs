@@ -589,10 +589,13 @@ template<usize op>
     const auto* b = std::get_if<cap::ScopeLimit>(&destination_view.data);
     if (!a || !b || !(a->kinds & b->kinds & OBJ_BIT(object->kind()))) return returned(STATUS_DENIED);
     if (!whole(*object, target->view())) return returned(STATUS_DENIED);
+    const auto check = inv.target->check_control(inv.cpu.objects.pmm(), *to, *object, 0);
+    if (!check) return {check.error(), 0, check.error() == STATUS_PENDING ? Disposition::Continue : Disposition::Return};
+    if (check->reachable) return returned(STATUS_DENIED);
     std::array<const cap::GrantPin*, 3> grants{&target->pin(), &source->pin(), &destination->pin()};
     auto admission = target->pin().graph().admission(std::span{grants});
     auto result = object::Scope::adopt(*object, std::move(*from).as<object::Scope>().value(),
-        std::move(*to).as<object::Scope>().value(), inv.trap.arg(3), admission);
+        std::move(*to).as<object::Scope>().value(), inv.trap.arg(3), admission, &*check);
     if (result) return returned(STATUS_OK, *result);
     return returned(result.error());
 }
@@ -649,8 +652,18 @@ template<usize op>
         source.emplace(std::move(*from_scope)); destination.emplace(std::move(*to_scope));
         grants[3] = &source->pin(); grants[4] = &destination->pin();
     }
+    std::optional<object::Control::Check> scope_check;
+    if (adopt) {
+        const auto check = inv.target->check_control(inv.cpu.objects.pmm(), destination_owner, *object, 0);
+        if (!check) return {check.error(), 0, check.error() == STATUS_PENDING ? Disposition::Continue : Disposition::Return};
+        if (check->reachable) return returned(STATUS_DENIED);
+        scope_check = *check;
+    }
+    const auto quota_check = inv.target->check_control(inv.cpu.objects.pmm(), *to, *object, 1);
+    if (!quota_check) return {quota_check.error(), 0, quota_check.error() == STATUS_PENDING ? Disposition::Continue : Disposition::Return};
+    if (quota_check->reachable) return returned(STATUS_DENIED);
     object::Transfer admission{*object, std::move(source_owner), std::move(destination_owner), inv.trap.arg(6),
-        target->pin().graph().admission(std::span{grants.data(), adopt ? usize{5} : usize{3}})};
+        target->pin().graph().admission(std::span{grants.data(), adopt ? usize{5} : usize{3}}), scope_check ? &*scope_check : nullptr};
     const auto valid = admission.validate();
     if (valid != STATUS_OK) return returned(valid);
     auto result = object::Types::visit(object->kind(), [&]<class T>() -> std::expected<u64, status_t> {
@@ -659,14 +672,14 @@ template<usize op>
         auto& allocation = *object->allocation();
         auto transaction = [&](auto&& visit, auto&& commit) {
             return object::reassign(inv.cpu.objects.pmm(), allocation, *object, *from, *to,
-                inv.trap.arg(3), limit->budget, visit, commit, admission);
+                inv.trap.arg(3), limit->budget, visit, commit, admission, &*quota_check);
         };
         if constexpr (requires { typed->get().reassign_usage(*to, transaction); })
             return typed->get().reassign_usage(*to, transaction);
         else if constexpr (requires { T::fixed_usage; }) {
             static_assert(T::fixed_usage);
             return object::reassign(inv.cpu.objects.pmm(), allocation, *object, *from, *to,
-                inv.trap.arg(3), limit->budget, [](auto&&) {}, [] {}, admission);
+                inv.trap.arg(3), limit->budget, [](auto&&) {}, [] {}, admission, &*quota_check);
         } else return std::unexpected(STATUS_INVALID_OP);
     }, std::expected<u64, status_t>{std::unexpected(STATUS_INVALID_OP)});
     return result ? returned(STATUS_OK, *result, admission.epoch()) : returned(result.error());
@@ -1106,6 +1119,14 @@ template<usize op>
         return returned(STATUS_BAD_ARGS);
     return returned(STATUS_OK, sizeof(info));
 }
+template<usize op> auto cap_info(Call& inv) noexcept -> Result {
+    const auto info = inv.cspace.inspect(handle_of(inv.trap.arg(0)));
+    if (!info) return returned(cap_status(info.error()));
+    auto* buffer = inv.target->ipc_buffer();
+    if (!buffer || !buffer->write(inv.trap.arg(1), {reinterpret_cast<const byte*>(&*info), sizeof(*info)}))
+        return returned(STATUS_BAD_ARGS);
+    return returned(STATUS_OK, sizeof(*info));
+}
 template<usize op>
 [[nodiscard]] auto execution_move(Call& inv) noexcept -> Result {
     std::optional<cap::Resolved<Thread>> target;
@@ -1203,7 +1224,8 @@ auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
              *cpu.idle().env().kernel_vspace(), ctx};
     const usize operation = ctx.arg(7);
     Result outcome{};
-    switch (operation) {
+    if (const auto status = target->control_status()) outcome = returned(*status);
+    else switch (operation) {
 #define CALL(name, nr, entry, unit) \
     case nr: outcome = entry<nr>(inv); break;
 #include <uapi/calls.def>
@@ -1212,7 +1234,9 @@ auto handle(arch::TrapCtx& ctx) noexcept -> Disposition {
         outcome = returned(STATUS_INVALID_OP);
         break;
     }
-    if (outcome.disposition == Disposition::Retry) ctx.retry_syscall();
+    if (outcome.disposition != Disposition::Continue && !target->finish_control(outcome.status))
+        outcome.disposition = Disposition::Continue;
+    if (outcome.disposition == Disposition::Retry || outcome.disposition == Disposition::Continue) ctx.retry_syscall();
     else publish(ctx, outcome);
     return outcome.disposition;
 }

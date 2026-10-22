@@ -392,7 +392,12 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     auto object = construct<ipc::Channel>(inv, std::move(*fee), inv.cpu.objects.pmm(), config);
     if (!object) return returned(STATUS_NO_MEMORY);
     auto& obj = object->get();
-    if (!obj.open()) return returned(STATUS_NO_MEMORY);
+    const auto ready = obj.open();
+    if (ready != STATUS_OK && ready != STATUS_PENDING) return returned(ready);
+    if (ready == STATUS_PENDING) {
+        const auto status = obj.op().start(inv.target->cpu_domain(), object->reference());
+        if (status != STATUS_OK) return returned(status);
+    }
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Send,
                         cap::Right::Receive, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
@@ -406,7 +411,9 @@ template <usize op> [[nodiscard]] auto channel_create(Call& inv) noexcept -> Res
     auto handles = publish(inv, *object, *root, pool.value(), caps, [&](cap::GrantRef& grant, usize i) {
         return bool(obj.bind_side_root(grant, i == 0 ? cap::ChannelSide::A : cap::ChannelSide::B));
     });
-    return publication(std::move(handles));
+    auto result = publication(std::move(handles));
+    if (result.status == STATUS_OK && ready == STATUS_PENDING) { obj.op().publish(); obj.op().post(); result.status = STATUS_PENDING; }
+    return result;
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv) noexcept -> Result {
@@ -495,18 +502,25 @@ static auto publish_memory(Call& inv, cap::Resolved<resource::Quota>& pool, usiz
     auto object = construct<mm::Mem>(inv, std::move(*fee), inv.cpu.objects.pmm(), size,
                                                        std::move(config));
     if (!object) return returned(mem_status(object.error()));
+    auto& obj = object->get();
+    const bool pending = !obj.op().query().sequence;
+    if (pending) {
+        const auto status = obj.op().start(inv.target->cpu_domain(), object->reference());
+        if (status != STATUS_OK) return returned(status);
+    }
     const cap::MemLimit data{{0, object->get().page_count()}, access};
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
         cap::Right::Inspect, cap::Right::Map, cap::Right::Destroy, cap::Right::Manage, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights, data}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
+    Result result;
     if (dependency) {
-        auto result = publish_bound(inv, *object, *root, caps[0], std::array{dependency});
+        result = publish_bound(inv, *object, *root, caps[0], std::array{dependency});
         if (result.status == STATUS_OK) object->publish().reset();
-        return result;
-    }
-    return publication(publish(inv, *object, *root, pool, caps));
+    } else result = publication(publish(inv, *object, *root, pool, caps));
+    if (result.status == STATUS_OK && pending) { obj.op().publish(); obj.op().post(); result.status = STATUS_PENDING; }
+    return result;
 }
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create(Call& inv) noexcept -> Result {
     auto pool = resolve_pool(inv, cap::Right::Create);
@@ -915,13 +929,22 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto port_create(Call& inv) 
     auto fee = reserve(*pool, object::pool<ipc::Port>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
     auto object = construct<ipc::Port>(inv, std::move(*fee), inv.cpu.objects.pmm(), config);
-    if (!object || object->get().open() != STATUS_OK) return returned(STATUS_NO_MEMORY);
+    if (!object) return returned(STATUS_NO_MEMORY);
+    auto& obj = object->get();
+    const auto ready = obj.open();
+    if (ready != STATUS_OK && ready != STATUS_PENDING) return returned(ready);
+    if (ready == STATUS_PENDING) {
+        const auto status = obj.op().start(inv.target->cpu_domain(), object->reference());
+        if (status != STATUS_OK) return returned(status);
+    }
     const auto rights = cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect,
         cap::Right::Receive, cap::Right::Manage, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const std::array<cap::View, 1> views{cap::View{rights}};
     auto root = object->root(inv.cpu.grants, std::move(*admission), views[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
-    return publication(publish(inv, *object, *root, *pool, views));
+    auto result = publication(publish(inv, *object, *root, *pool, views));
+    if (result.status == STATUS_OK && ready == STATUS_PENDING) { obj.op().publish(); obj.op().post(); result.status = STATUS_PENDING; }
+    return result;
 }
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto notification_create(Call& inv) noexcept -> Result {

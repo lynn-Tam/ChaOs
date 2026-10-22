@@ -57,16 +57,103 @@ auto Scope::describe(Id id, u64 kinds, usize depth) const noexcept -> std::expec
 
 // Walk actual parents, rather than indexing every controlled descendant.
 // Membership, Allocation and the delegation Usage remain the only authorities.
-void Control::edges(Control*& pending, u64 epoch) noexcept {
-    if (!owner_) return;
-    if (auto* member = owner_->membership_; member && member->owner_)
-        push(pending, &member->owner_->control_, epoch);
-    if (auto* fee = owner_->ops_->allocation(*owner_); fee && fee->owner_)
-        push(pending, &fee->owner_->control_, epoch);
-    if (owner_->kind_ == ObjQuota) {
-        auto& quota = *static_cast<resource::Quota*>(owner_->ops_->payload(*owner_));
-        if (quota.delegation_.owner_) push(pending, &quota.delegation_.owner_->control_, epoch);
+auto Control::id() const noexcept -> u64 { return owner_ ? owner_->id_.value : 0; }
+auto Control::key() const noexcept -> Key { return {reinterpret_cast<usize>(owner_), owner_->generation_}; }
+auto Control::parent(usize index) const noexcept -> Control* {
+    libk_assert(lock.held());
+    if (!owner_) return nullptr;
+    if (index == 0) {
+        auto* member = owner_->membership_;
+        return member && member->owner_ ? &member->owner_->control_ : nullptr;
     }
+    if (index == 1) {
+        auto* fee = owner_->ops_->allocation(*owner_);
+        return fee && fee->owner_ ? &fee->owner_->control_ : nullptr;
+    }
+    if (index == 2 && owner_->kind_ == ObjQuota) {
+        auto& quota = *static_cast<resource::Quota*>(owner_->ops_->payload(*owner_));
+        return quota.delegation_.owner_ ? &quota.delegation_.owner_->control_ : nullptr;
+    }
+    return nullptr;
+}
+void Control::edges(Control*& pending, u64 epoch) noexcept {
+    for (usize i = 0; i < 3; ++i) push(pending, parent(i), epoch);
+}
+auto Control::checked(const Check& check, const Control& destination) const noexcept -> std::expected<bool, error> {
+    libk_assert(lock.held());
+    if (check.from != id() || check.to != destination.id() || check.version != version_)
+        return std::unexpected(error::stale);
+    return check.reachable;
+}
+auto ControlScan::probe(const ref<>& from, const ref<>& to) noexcept -> std::expected<Control::Check, status_t> {
+    sync::Lock guard{Control::lock};
+    auto* source = from.control(); auto* target = to.control();
+    if (!source || !target) return Control::Check{};
+    const auto result = source->reaches(*target);
+    if (!result) return std::unexpected(result.error() == error::pending ? STATUS_PENDING : STATUS_NO_MEMORY);
+    return Control::Check{source->id(), target->id(), Control::version_, *result};
+}
+void ControlScan::pop() noexcept {
+    auto* frame = top_; top_ = frame->previous; frames_.destroy(*frame);
+}
+auto ControlScan::drain() noexcept -> bool {
+    for (usize i = 0; i < 64 && top_; ++i) pop();
+    if (top_) return false;
+    goal_.reset(); return true;
+}
+auto ControlScan::check(const ref<>& from, const ref<>& to, usize slot) noexcept
+    -> std::expected<Control::Check, status_t> {
+    libk_assert(slot < checks_.size());
+    auto& check = checks_[slot];
+    if (check.version && (selected_ != slot || (!top_ && status_ != STATUS_PENDING))) {
+        sync::Lock guard{Control::lock};
+        if (check.from != from.id().value || check.to != to.id().value || check.version != Control::version_)
+            return std::unexpected(STATUS_STALE);
+        return status_ == STATUS_OK || selected_ != slot ? std::expected<Control::Check, status_t>{check}
+            : std::unexpected(status_);
+    }
+    if (!check.version) {
+        if (top_) {
+            const auto ready = probe(from, to);
+            if (!ready) return std::unexpected(ready.error() == STATUS_PENDING ? STATUS_STALE : ready.error());
+            check = *ready; return ready;
+        }
+        auto made = frames_.create(quota_, from, nullptr);
+        if (!made) return std::unexpected(STATUS_NO_MEMORY);
+        top_ = *made; goal_ = to; selected_ = slot; status_ = STATUS_PENDING;
+        sync::Lock guard{Control::lock};
+        if (Control::visits_ == ~u64{}) return std::unexpected(STATUS_NO_MEMORY);
+        visit_ = ++Control::visits_;
+        check = {from.id().value, to.id().value, Control::version_, false};
+    }
+    for (usize step = 0; step < 64 && top_; ++step) {
+        if (status_ != STATUS_PENDING) { pop(); continue; }
+        ref<> parent;
+        bool done{};
+        {
+            sync::Lock guard{Control::lock};
+            if (check.version != Control::version_) { status_ = STATUS_STALE; continue; }
+            auto& node = *top_->value.control();
+            if (!top_->next) {
+                if (&node == goal_.control()) { check.reachable = true; status_ = STATUS_OK; continue; }
+                if (node.visited_ == visit_) done = true;
+                else node.visited_ = visit_;
+            }
+            if (top_->next == 3) done = true;
+            if (!done) if (auto* next = node.parent(top_->next++))
+                parent = ref<>::retain_alive(next->key());
+        }
+        if (done) pop();
+        else if (parent) {
+            auto made = frames_.create(quota_, std::move(parent), top_);
+            if (!made) status_ = STATUS_NO_MEMORY;
+            else top_ = *made;
+        }
+    }
+    if (top_) return std::unexpected(STATUS_PENDING);
+    goal_.reset();
+    if (status_ == STATUS_PENDING) status_ = STATUS_OK;
+    return status_ == STATUS_OK ? std::expected<Control::Check, status_t>{check} : std::unexpected(status_);
 }
 
 Scope::~Scope() noexcept {
@@ -86,10 +173,8 @@ auto Scope::Admission::attach(Membership& member, Key target) noexcept -> bool {
     sync::Lock guard{Control::lock};
     if (scope.phase_ != Phase::Open || scope.version_ == std::numeric_limits<u64>::max()) return false;
     auto* anchor = reinterpret_cast<object::anchor*>(target.slot);
-    if (auto* control = anchor->ops_->control(*anchor)) {
-        auto cycle = scope.control_.reaches(*control);
-        if (!cycle || *cycle) return false;
-    }
+    // This unpublished target cannot already be an ancestor of its owner.
+
     const auto attached = use_.publish([&] {
         libk_assert(!member.owner_ && member.phase_ == Membership::Phase::Empty);
         member.owner_ = &scope;
@@ -97,6 +182,7 @@ auto Scope::Admission::attach(Membership& member, Key target) noexcept -> bool {
         member.target_ = target;
         member.phase_ = Membership::Phase::Pending;
         scope.members_.insert(member);
+        if (anchor->ops_->control(*anchor)) Control::changed();
         ++scope.kinds_[anchor->kind_];
     });
     if (attached) scope.changed();
@@ -172,9 +258,10 @@ auto Scope::close() noexcept -> Phase {
             scan_ = members_.minimum();
             publication = events_.prepare(STATE_CLOSING, true);
         }
+        if (work_) post();
     }
     publication.publish();
-    service();
+    if (!work_) service();
     sync::Lock guard{Control::lock};
     return phase_;
 }
@@ -198,8 +285,9 @@ auto Membership::close() noexcept -> bool {
             owner_->pending_ = this;
         }
         owner = owner_ref_;
+        if (owner->work_) owner->post();
     }
-    owner->service();
+    if (!owner->work_) owner->service();
     return true;
 }
 
@@ -227,7 +315,7 @@ void Scope::post() noexcept {
     libk_assert(Control::lock.held());
     auto* scope = this;
     for (usize depth = 0; scope && depth < 64; ++depth) {
-        if (scope->dirty_ && scope->work_) scope->work_->post(scope->job_);
+        if ((scope == this || scope->dirty_) && scope->work_) scope->work_->post(scope->job_);
         scope = scope->membership_ ? scope->membership_->owner_ : nullptr;
     }
 }
@@ -319,8 +407,9 @@ auto Transfer::check() const noexcept -> status_t {
     if (target_.kind() == ObjScope && static_cast<Scope*>(target_.get())->phase_ != Scope::Phase::Open)
         return STATUS_CLOSED;
     if (&source != &destination) if (auto* control = target_.control()) {
-        auto cycle = destination.control_.reaches(*control);
-        if (!cycle) return STATUS_NO_MEMORY;
+        auto cycle = control_check_ ? destination.control_.checked(*control_check_, *control) : destination.control_.reaches(*control);
+        if (!cycle) return cycle.error() == error::stale ? STATUS_STALE
+            : cycle.error() == error::pending ? STATUS_PENDING : STATUS_NO_MEMORY;
         if (*cycle) return STATUS_DENIED;
     }
     return STATUS_OK;
@@ -335,6 +424,7 @@ void Transfer::commit() noexcept {
     source.members_.erase(member);
     --source.kinds_[target_.kind()]; source.changed(false);
     destination.members_.insert(member);
+    if (target_.control()) Control::changed();
     ++destination.kinds_[target_.kind()];
     member.owner_ = &destination;
     std::swap(member.owner_ref_, replacement_);
@@ -351,8 +441,8 @@ auto Transfer::adopt() noexcept -> std::expected<u64, status_t> {
 }
 
 auto Scope::adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch,
-    cap::Graph::Admission admission) noexcept -> std::expected<u64, status_t> {
-    Transfer transaction{target, std::move(source), std::move(destination), epoch, admission};
+    cap::Graph::Admission admission, const Control::Check* check) noexcept -> std::expected<u64, status_t> {
+    Transfer transaction{target, std::move(source), std::move(destination), epoch, admission, check};
     return transaction.adopt();
 }
 
@@ -372,9 +462,10 @@ void Membership::commit() noexcept {
         closing = close_requested_ || owner_->phase_ != Scope::Phase::Open;
         if (closing) announced_ = false;
         owner = owner_ref_;
+        if (!closing && owner->work_) owner->post();
     }
     if (closing) (void)close();
-    else owner->service();
+    else if (!owner->work_) owner->service();
 }
 
 void Membership::abort() noexcept {
@@ -412,10 +503,11 @@ void Membership::detach() noexcept {
         --scope.kinds_[anchor->kind_];
         scope.changed();
         owner = std::move(owner_ref_);
+        if (owner->work_) owner->post();
         owner_ = nullptr; target_ = {};
         phase_ = Phase::Empty; close_requested_ = announced_ = false;
     }
-    owner->service();
+    if (!owner->work_) owner->service();
 }
 
 } // namespace object

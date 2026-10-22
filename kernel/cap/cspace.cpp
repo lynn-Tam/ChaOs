@@ -12,6 +12,21 @@
 
 namespace cap {
 
+auto CSpace::inspect(Handle handle) noexcept -> std::expected<CapInfo, CSpaceError> {
+    auto* cell = handle ? slot(handle.index()) : nullptr;
+    if (!cell) return std::unexpected(CSpaceError::InvalidHandle);
+    sync::Lock guard{cell->lock};
+    if (!accepting_ || cell->generation != handle.generation() || cell->state != SlotState::Occupied)
+        return std::unexpected(CSpaceError::InvalidHandle);
+    const auto& cap = cell->storage.capability;
+    CapInfo info{.selector = handle.raw(), .object_id = cap.grant.target_id().value,
+        .grant_id = cap.grant.id().value, .state = CAP_INFO_UNAVAILABLE, .reserved = {}, .view = {}};
+    if (const auto view = cap.grant.graph().view(cap.grant.key(), cap.view)) {
+        info.view = *view; info.state = CAP_INFO_VALID;
+    }
+    return info;
+}
+
 auto CSpace::inspect(Handle cursor, CSpaceInfo& info, u64 epoch) noexcept -> std::expected<void, CSpaceError> {
     sync::Lock guard{lock_};
     if (!accepting_ || reassigning_) return std::unexpected(CSpaceError::InvalidState);
@@ -55,14 +70,14 @@ auto CSpace::inspect(GrantQuery query, usize depth, GrantRecords& out) noexcept 
     return grant.graph().inspect(grant.key(), query, depth, out);
 }
 
-auto CSpace::observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, CSpaceError> {
+auto CSpace::observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t> {
     sync::Lock guard{lock_};
     auto* cell = seed ? slot(seed.index()) : nullptr;
     if (!cell || cell->generation != seed.generation() || cell->state != SlotState::Occupied)
-        return std::unexpected(CSpaceError::InvalidHandle);
+        return std::unexpected(STATUS_INVALID_CAP);
     auto& grant = cell->storage.capability.grant;
     auto sample = grant.graph().observe(grant.key(), selected, depth);
-    return sample ? std::expected<Graph::Sample, CSpaceError>{std::move(*sample)} : std::unexpected(grant_error(sample.error()));
+    return sample ? std::expected<Graph::Sample, status_t>{std::move(*sample)} : std::unexpected(STATUS_NOT_FOUND);
 }
 
 CSpace::CSpace(mm::Pmm& pmm) noexcept

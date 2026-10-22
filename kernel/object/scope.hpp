@@ -1,4 +1,5 @@
 #pragma once
+#include <mm/slab.hpp>
 
 #include <utility>
 #include <libk/unique_handle.hpp>
@@ -28,6 +29,30 @@ class Graph;
 }
 
 namespace object {
+
+// A rare large ancestor check keeps a DFS stack charged to the calling task.
+// Every step releases locks; versioned results are consumed at the actual commit.
+class ControlScan {
+    struct Frame {
+        Frame(ref<> value, Frame* previous) noexcept : value(std::move(value)), previous(previous) {}
+        ref<> value;
+        Frame* previous;
+        usize next{};
+    };
+    mm::Slab<Frame, false> frames_;
+    ref<> quota_, goal_;
+    Frame* top_{};
+    std::array<Control::Check, 2> checks_{};
+    usize selected_{2};
+    u64 visit_{};
+    status_t status_{STATUS_PENDING};
+    void pop() noexcept;
+public:
+    ControlScan(mm::Pmm& pmm, ref<> quota) noexcept : frames_(pmm, {~usize{}, ~usize{}}), quota_(std::move(quota)) {}
+    static auto probe(const ref<>&, const ref<>&) noexcept -> std::expected<Control::Check, status_t>;
+    auto check(const ref<>&, const ref<>&, usize) noexcept -> std::expected<Control::Check, status_t>;
+    auto drain() noexcept -> bool;
+};
 
 class Membership;
 class Transfer;
@@ -93,7 +118,7 @@ public:
     void retire(cleanup&&) noexcept;
     void bind_membership(Membership& member) noexcept { membership_ = &member; }
     void bind_work(WorkQueue& work, Key owner) noexcept { work_ = &work; job_.bind(owner); events_.bind_work(work, owner); }
-    static auto adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch, cap::Graph::Admission admission = {}) noexcept
+    static auto adopt(const ref<>& target, ref<Scope> source, ref<Scope> destination, u64 epoch, cap::Graph::Admission admission = {}, const Control::Check* check = nullptr) noexcept
         -> std::expected<u64, status_t>;
 private:
     friend class Membership;
@@ -142,13 +167,14 @@ class Transfer final : private libk::noncopyable {
     ref<Scope> replacement_;
     u64 epoch_{};
     cap::Graph::Admission admission_;
+    const Control::Check* control_check_{};
     auto check() const noexcept -> status_t;
     void commit() noexcept;
 public:
     Transfer(ref<> target, ref<Scope> source, ref<Scope> destination, u64 epoch,
-        cap::Graph::Admission admission = {}) noexcept
+        cap::Graph::Admission admission = {}, const Control::Check* check = nullptr) noexcept
         : target_(std::move(target)), source_(source), destination_(destination),
-          replacement_(std::move(destination)), epoch_(epoch), admission_(admission) {}
+          replacement_(std::move(destination)), epoch_(epoch), admission_(admission), control_check_(check) {}
     auto validate() const noexcept -> status_t { sync::Lock guard{Control::lock}; return check(); }
     auto epoch() const noexcept -> u64 { return epoch_; }
     auto adopt() noexcept -> std::expected<u64, status_t>;
@@ -194,7 +220,7 @@ template <typename T> struct traits {
 // outside publication locks; every recorded pointer names a real Usage.
 template<class Visit, class Commit, class Transaction>
 auto reassign(mm::Pmm& pmm, resource::Allocation& allocation, const ref<>& target, const ref<>& from,
-    const ref<>& to, u64 epoch, resource::Budget ceiling, Visit&& visit, Commit&& commit, Transaction& transaction) noexcept
+    const ref<>& to, u64 epoch, resource::Budget ceiling, Visit&& visit, Commit&& commit, Transaction& transaction, const Control::Check* check = nullptr) noexcept
     -> std::expected<u64, status_t> {
     if (from.id() == to.id()) return std::unexpected(STATUS_BAD_ARGS);
     const auto paused = allocation.pause(from, epoch);
@@ -246,7 +272,7 @@ auto reassign(mm::Pmm& pmm, resource::Allocation& allocation, const ref<>& targe
         for (auto* change = head; change; change = change->next)
             change->target->reassign(replacement, change->quota);
         commit();
-    }, [&](auto gates, auto&& publish) { return transaction.publish(gates, publish); });
+    }, [&](auto gates, auto&& publish) { return transaction.publish(gates, publish); }, check);
     // One aggregate release follows the lock boundary. Scratch holds only old
     // refs after success; failed preparation leaves every owner intact.
     return result;

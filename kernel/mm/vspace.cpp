@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <algorithm>
 #include <array>
 #include <libk/types.hpp>
@@ -62,7 +63,7 @@ VmOp::VmOp(object::ref<> provider) noexcept
     : owner_(static_cast<VSpace*>(provider.get())),
       state_(std::move(provider), Source::Action::bind<&VSpace::flush_ready>(*owner_), Source::Action::bind<&VSpace::advance>(*owner_)),
       flush_(*owner_->pmm_, sync::Latch::Notifier::bind<&VSpace::flush_ready>(*owner_)) {}
-VmOp::~VmOp() noexcept { libk_assert(!maps_ && !pages_ && retired_.empty() && !release_ && !edit_); }
+VmOp::~VmOp() noexcept { libk_assert(!maps_ && !pages_ && retired_.empty() && permits_.empty() && !release_ && !edit_); }
 
 auto VmOp::drain_pages() noexcept -> bool {
     libk_assert(owner_->lock_.held());
@@ -86,6 +87,17 @@ auto VmOp::drain_pages() noexcept -> bool {
         owner_->destroy_layout(*map);
     }
     if (pages_ || maps_) { owner_->flush_ready(); return false; }
+    // Permission reservations include every old hardware translation until
+    // its receipt drains. Only the final batch may surrender that permission.
+    if (!edit_) while (remaining && !permits_.empty()) {
+        --remaining;
+        auto& binding = permits_.pop_front();
+        u8 bits{};
+        for (const auto& map : binding.mappings_) bits |= map.perms_.raw();
+        if (bits) libk_assert(binding.memory_->protect(binding.memory_attachment_,
+            binding.private_write_ ? Perms::of(Perm::Read) : Perms::from_raw(bits)));
+    }
+    if (!edit_ && !permits_.empty()) { owner_->flush_ready(); return false; }
     flushed_ = true;
     return true;
 }
@@ -135,9 +147,9 @@ auto VSpace::fault(Thread& thread, VmCtx ctx, va_t address, Perm perm) noexcept 
         sync::Lock guard{lock_};
         auto* map = find(VRange{va_t{address.raw() & ~(page_size - 1)}, page_size});
         if (map && map->kind_ == MapKind::Map && map->perms_.contains(perm)) {
-            auto& backing = *map->binding_;
-            if (backing.memory_work_ && !backing.memory_work_->range().empty()) {
-                source = backing.memory_ref_;
+            auto& binding = *map->binding_;
+            if (binding.memory_work_ && !binding.memory_work_->range().empty()) {
+                source = binding.memory_ref_;
                 index = map->object_.base() + (address.raw() - map->range_.base().raw()) / page_size;
             }
         }
@@ -201,21 +213,21 @@ MapPage::~MapPage() noexcept {
     libk_assert(binding_ == nullptr);
 }
 
-const MemOps Backing::memory_ops_{
-    .invalidate = &Backing::invalidate_memory,
-    .released = &Backing::released,
+const MemOps Binding::memory_ops_{
+    .invalidate = &Binding::invalidate_memory,
+    .released = &Binding::released,
 };
 
-const cap::AttachOps Backing::grant_ops_{
-    .invalidate = &Backing::invalidate_grant,
-    .released = &Backing::released,
+const cap::AttachOps Binding::grant_ops_{
+    .invalidate = &Binding::invalidate_grant,
+    .released = &Binding::released,
 };
 
-Backing::Backing(VSpace& owner, object::ref<> memory, Mem& object, Perms perms, bool private_write) noexcept
-    : owner_(&owner), memory_ref_(std::move(memory)), memory_(&object), perms_(perms),
+Binding::Binding(VSpace& owner, object::ref<> memory, Mem& object, bool private_write) noexcept
+    : owner_(&owner), memory_ref_(std::move(memory)), memory_(&object),
       private_write_(private_write), memory_attachment_(this, memory_ops_) {}
 
-Backing::~Backing() noexcept {
+Binding::~Binding() noexcept {
     libk_assert(mappings_.empty());
     libk_assert(views_.empty());
     libk_assert(pages_.empty());
@@ -227,11 +239,11 @@ Backing::~Backing() noexcept {
     }
 }
 
-auto Backing::attach_memory() noexcept -> std::expected<void, MemErr> {
-    return memory_->attach(memory_attachment_, private_write_ ? Perms::of(Perm::Read) : perms_);
+auto Binding::attach_memory(Perms perms) noexcept -> std::expected<void, MemErr> {
+    return memory_->attach(memory_attachment_, private_write_ ? Perms::of(Perm::Read) : perms);
 }
 
-auto Backing::detach() noexcept -> bool {
+auto Binding::detach() noexcept -> bool {
     static_cast<void>(memory_attachment_.detach());
     if (grant_attachment_) static_cast<void>(grant_attachment_->detach());
     MemWork mem;
@@ -255,32 +267,32 @@ auto Backing::detach() noexcept -> bool {
     return drained();
 }
 
-bool Backing::drained() const noexcept {
+bool Binding::drained() const noexcept {
     return !memory_attachment_.attached() && !memory_attachment_.busy() &&
            (!grant_attachment_ || (!grant_attachment_->attached() && !grant_attachment_->busy()));
 }
 
-void Backing::invalidate_memory(void* ctx, MemWork&& work) noexcept {
-    auto& auth = *static_cast<Backing*>(ctx);
+void Binding::invalidate_memory(void* ctx, MemWork&& work) noexcept {
+    auto& auth = *static_cast<Binding*>(ctx);
     auth.owner_->request_invalidation(auth, std::move(work));
 }
 
-void Backing::released(void* ctx, MemWork&& done) noexcept {
-    auto& space = *static_cast<Backing*>(ctx)->owner_;
+void Binding::released(void* ctx, MemWork&& done) noexcept {
+    auto& space = *static_cast<Binding*>(ctx)->owner_;
     sync::Lock guard{space.lock_};
     done.reset();
     space.work_->post(space.job_);
 }
 
-void Backing::released(void* ctx, object::LinkWork&& done) noexcept {
-    auto& space = *static_cast<Backing*>(ctx)->owner_;
+void Binding::released(void* ctx, object::LinkWork&& done) noexcept {
+    auto& space = *static_cast<Binding*>(ctx)->owner_;
     sync::Lock guard{space.lock_};
     done.reset();
     space.work_->post(space.job_);
 }
 
-void Backing::invalidate_grant(void* ctx, object::LinkWork&& work) noexcept {
-    auto& auth = *static_cast<Backing*>(ctx);
+void Binding::invalidate_grant(void* ctx, object::LinkWork&& work) noexcept {
+    auto& auth = *static_cast<Binding*>(ctx);
     auth.owner_->request_invalidation(auth, std::move(work));
 }
 
@@ -374,7 +386,7 @@ auto VSpace::can_destroy_object(cap::VmLimit auth) const noexcept -> bool {
 
 auto VSpace::root() noexcept -> Root {
     libk_assert(root_);
-    return Root{tlb_, root_->cpu_root()};
+    return Root{tlb_, root_->cpu_root(), &kernel_->root().state()};
 }
 
 auto VSpace::commit_flush(Tlb::Edit&& mutation, VmCtx ctx, Flush& retire,
@@ -414,11 +426,11 @@ auto VSpace::links(u64 cursor, u64 epoch, LinkRecords& out) const noexcept -> st
     auto* map = layout_.lower_bound(va_t{cursor ? cursor : UserBegin});
     for (usize scanned = 0; map && scanned < LINK_RECORD_PAGE; ++scanned) {
         out.cursor = map->range_.limit()->raw();
-        if (auto* backing = map->binding_) {
-            out.records[out.count++] = {backing->memory_attachment_.id(), backing->memory_ref_.id().value,
-                backing->grant_attachment_ ? backing->grant_attachment_->id().value : 0,
+        if (auto* binding = map->binding_) {
+            out.records[out.count++] = {binding->memory_attachment_.id(), binding->memory_ref_.id().value,
+                binding->grant_attachment_ ? binding->grant_attachment_->id().value : 0,
                 map->range_.base().raw(), map->range_.size(), map->object_.base() * page_size,
-                LINK_VM, backing->invalid() ? LINK_INVALIDATING : LINK_LIVE, map->perms_.raw(), 0};
+                LINK_VM, binding->invalid() ? LINK_INVALIDATING : LINK_LIVE, map->perms_.raw(), 0};
         }
         map = layout_.next(*map);
     }
@@ -473,19 +485,23 @@ void VSpace::queue_page(MapPage& page, bool removed) noexcept {
     active_->pages_ = &page;
 }
 
-void VSpace::queue_binding(Backing& auth) noexcept {
+void VSpace::queue_binding(Binding& auth) noexcept {
     if (!auth.retired_hook_.is_linked()) transaction().retired_.push_back(auth);
 }
 
 void VSpace::detach_mapping(Map& mapping) noexcept {
-    Backing& auth = *mapping.binding_;
-    if (mapping.backing_hook_.is_linked()) {
+    Binding& auth = *mapping.binding_;
+    if (mapping.binding_hook_.is_linked()) {
         auth.mappings_.erase(mapping);
     }
 
     mappings_.destroy(mapping);
     if (auth.mappings_.empty()) {
         queue_binding(auth);
+    } else if (!auth.private_write_) {
+        u8 bits{};
+        for (const auto& map : auth.mappings_) bits |= map.perms_.raw();
+        libk_assert(auth.memory_->protect(auth.memory_attachment_, Perms::from_raw(bits)));
     }
 }
 
@@ -557,7 +573,7 @@ void VSpace::finish_bindings() noexcept {
         work.reset();
     }
     for (usize step = 0; step < 8; ++step) {
-        Backing* auth{};
+        Binding* auth{};
         {
             sync::Lock guard{lock_};
             if (!active_ || !active_->flushed_ || active_->retired_.empty()) return;
@@ -801,12 +817,12 @@ void VSpace::detach_view(Borrow& borrow) noexcept {
         released = std::move(borrow.pages_);
         if (waiting_view_ == &borrow) { waiting_view_ = nullptr; flush_ready(); }
         if (active_ && active_->edit_ && active_->edit_->view == &borrow) {
-            auto& list = borrow.backing_->views_;
+            auto& list = borrow.binding_->views_;
             auto next = ++list.iterator_to(borrow);
             active_->edit_->view = next == list.end() ? nullptr : &*next;
         }
-        if (borrow.hook_.is_linked()) borrow.backing_->views_.erase(borrow);
-        borrow.backing_ = nullptr;
+        if (borrow.hook_.is_linked()) borrow.binding_->views_.erase(borrow);
+        borrow.binding_ = nullptr;
     }
     views_.destroy(borrow);
 }
@@ -908,7 +924,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     const usize count = *page_count;
     const bool private_write = request.private_write;
     const Perms ceiling = vspace_access.intersect(
-        private_write ? Perms::from_raw(mem_auth.perms.raw() | static_cast<u8>(Perm::Write))
+        private_write ? Perms::of(Perm::Read, Perm::Write)
                       : mem_auth.perms);
     const bool invalid_access = !valid_perms(request.perms) || (request.perms.contains(Perm::Write) &&
                                                                 request.perms.contains(Perm::Execute));
@@ -924,14 +940,14 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
         return std::unexpected(VSpaceError::InvalidAuthority);
     }
 
-    auto backing_entry =
-        binding_pool_.create(quota_, *this, std::move(memory_ref), memory, request.perms, private_write);
-    if (!backing_entry) {
-        return std::unexpected(node_error(backing_entry.error()));
+    auto binding_entry =
+        binding_pool_.create(quota_, *this, std::move(memory_ref), memory, private_write);
+    if (!binding_entry) {
+        return std::unexpected(node_error(binding_entry.error()));
     }
-    Backing* const auth = backing_entry.value().object;
+    Binding* const auth = binding_entry.value().object;
 
-    auto backing = libk::scope_exit{[&]() noexcept {
+    auto binding = libk::scope_exit{[&]() noexcept {
         {
             sync::Lock lock{lock_};
             queue_binding(*auth);
@@ -939,13 +955,13 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
         finish_bindings();
     }};
 
-    auto memory_attached = auth->attach_memory();
+    auto memory_attached = auth->attach_memory(request.perms);
     if (!memory_attached) {
         // attach() failed before relation publication.
         return std::unexpected(memory_error(memory_attached.error()));
     }
     if (capability != nullptr) {
-        auto& attachment = auth->grant_attachment_.emplace(auth, Backing::grant_ops_);
+        auto& attachment = auth->grant_attachment_.emplace(auth, Binding::grant_ops_);
         auto grant_attached = capability->attach(attachment);
         if (!grant_attached) {
             return std::unexpected(VSpaceError::GrantUnavailable);
@@ -970,7 +986,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     if (auto accepted = accept(ctx); !accepted) return std::unexpected(accepted.error());
     auth->mappings_.push_back(*mapping);
     link(*mapping);
-    layout.release(); backing.release();
+    layout.release(); binding.release();
     return MapResult{key, VmStatus::Complete};
 }
 
@@ -1074,6 +1090,14 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
             if (edit.perms && !map->ceiling_.contains(*edit.perms)) {
                 mutation->abort(); return fail(VSpaceError::InvalidAccess);
             }
+            if (map->binding_ && edit.perms) {
+                auto& binding = *map->binding_;
+                const auto perms = binding.private_write_ ? Perms::of(Perm::Read) : *edit.perms;
+                const auto reserved = binding.memory_->protect(binding.memory_attachment_,
+                    Perms::from_raw(binding.memory_attachment_.perms().raw() | perms.raw()));
+                if (!reserved) { mutation->abort(); return fail(memory_error(reserved.error())); }
+                if (!binding.perms_hook_.is_linked()) op.permits_.push_back(binding);
+            }
             if (!edit.first) edit.first = map;
             edit.last = map;
             edit.covered = *map->range_.limit();
@@ -1153,7 +1177,7 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
                     }
                     waiting_view_ = nullptr;
                     released = std::move(view->pages_);
-                    list.erase(*view); view->backing_ = nullptr;
+                    list.erase(*view); view->binding_ = nullptr;
                     step = 8; // Release one bounded resident borrow outside lock_.
                 }
                 edit.view = next == list.end() ? nullptr : &*next;
@@ -1188,17 +1212,19 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
             }
             break;
         }
-        case E::Done:
+        case E::Done: {
+            const bool executable = edit.perms && edit.perms->contains(Perm::Execute);
             op.edit_.reset();
-            if (changed) return commit_flush(std::move(*mutation), ctx, op.flush_);
+            if (changed) return commit_flush(std::move(*mutation), ctx, op.flush_, executable);
             mutation->abort();
             return op.drain_pages() ? VmStatus::Complete : VmStatus::Pending;
+        }
         }
     }
     // Only application batches create receipts. Validation has no effects.
     if (edit.phase >= VmOp::Edit::Apply) {
         edit.batch = true;
-        if (changed) return commit_flush(std::move(*mutation), ctx, op.flush_);
+        if (changed) return commit_flush(std::move(*mutation), ctx, op.flush_, edit.perms && edit.perms->contains(Perm::Execute));
         mutation->abort();
         (void)op.drain_pages();
     }
@@ -1294,6 +1320,12 @@ auto VSpace::fault(VmCtx ctx, va_t address, Perm perms, Source::Context* context
                     break;
                 }
 
+                const auto vp = VPage::from_base(page_range.base());
+                const auto touched = root_->touch(*vp, perms);
+                if (!touched) return std::unexpected(VSpaceError::TranslationCorrupt);
+                // Svade traps on A/D=0. A valid leaf can also be hidden by a
+                // stale negative translation; both require a local fence.
+                arch::flush_tlb_all();
                 return (FaultResult{
                     .kind = FaultKind::Ready,
                     .mapping = mapping->key_,
@@ -1340,7 +1372,7 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
     }};
 
     sync::Lock lock{lock_};
-    Backing& auth = *mapping.binding_;
+    Binding& auth = *mapping.binding_;
     if (state_ != VSpaceState::Live || auth.invalid()) {
         lock.restore();
         return std::unexpected(VSpaceError::Busy);
@@ -1375,7 +1407,7 @@ auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize
                                Source::Context* context) noexcept
     -> std::expected<FaultResult, VSpaceError> {
     Edit editing{this};
-    Backing& auth = *mapping.binding_;
+    Binding& auth = *mapping.binding_;
     auto fail = [&](FaultKind kind) -> std::expected<FaultResult, VSpaceError> {
         return (FaultResult{
             .kind = kind,
@@ -1486,7 +1518,7 @@ auto VSpace::sample_usage(VmCtx ctx, va_t address, bool clear) noexcept
     if (!offset) {
         return fail(VSpaceError::InvalidRange);
     }
-    Backing& auth = *mapping->binding_;
+    Binding& auth = *mapping->binding_;
     MapPage* const mapped = auth.pages_.find(page_range.base());
     if (mapped == nullptr) {
         return fail(VSpaceError::NotMapped);
@@ -1546,7 +1578,7 @@ auto VSpace::inspect(MapId key) const noexcept -> std::expected<MapInfo, VSpaceE
     });
 }
 
-void VSpace::request_invalidation(Backing& auth, MemWork&& work) noexcept {
+void VSpace::request_invalidation(Binding& auth, MemWork&& work) noexcept {
     {
         sync::Lock guard{lock_};
         if (active_ && active_->edit_) active_->edit_->stale = true;
@@ -1560,7 +1592,7 @@ void VSpace::request_invalidation(Backing& auth, MemWork&& work) noexcept {
     work_->post(job_);
 }
 
-void VSpace::request_invalidation(Backing& auth, object::LinkWork&& work) noexcept {
+void VSpace::request_invalidation(Binding& auth, object::LinkWork&& work) noexcept {
     {
         sync::Lock guard{lock_};
         if (active_ && active_->edit_) active_->edit_->stale = true;
@@ -1574,7 +1606,7 @@ void VSpace::request_invalidation(Backing& auth, object::LinkWork&& work) noexce
     work_->post(job_);
 }
 
-auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expected<VmStatus, VSpaceError> {
+auto VSpace::start_invalidation(VmCtx ctx, Binding& auth) noexcept -> std::expected<VmStatus, VSpaceError> {
     Borrow::Pages released;
     sync::Lock lock{lock_};
     if (active_ || editing_ || draining_) {
@@ -1601,7 +1633,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expec
         if (!view.idle()) { waiting_view_ = &view; return VmStatus::Pending; }
         waiting_view_ = nullptr;
         released = std::move(view.pages_);
-        auth.views_.erase(view); view.backing_ = nullptr;
+        auth.views_.erase(view); view.binding_ = nullptr;
         return VmStatus::Pending;
     }
     auto mutation = tlb_.begin();
@@ -1633,7 +1665,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Backing& auth) noexcept -> std::expec
     }
     if (keep_maps) auth.trim_scanned_ = !page;
     else if (auth.pages_.empty()) {
-        // No Map can retire its Backing before all installed pages and
+        // No Map can retire its Binding before all installed pages and
         // borrowed consumers have left. Each batch owns a separate receipt.
         if (auth.views_.empty()) {
             for (auto& mapping : auth.mappings_) {
@@ -1675,7 +1707,7 @@ auto VSpace::step(VmCtx ctx) noexcept -> bool {
         complete_cleanup();
         return work_ready();
     }
-    Backing* next{};
+    Binding* next{};
     bool retire_root{};
     Flush* waiting_flush{};
     bool waiting{};

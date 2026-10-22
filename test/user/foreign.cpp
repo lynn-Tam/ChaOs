@@ -16,8 +16,10 @@ int main() {
     if (status != STATUS_OK) return status;
     auto connector = object.connector(); if (!connector) return connector.error();
     ubus_msg request, response;
+    const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!peer_idx) return peer_idx.error();
     request.data.put("name", "math").put("interface", "example.math").put("version", uint64_t{1})
-        .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+        .cap("connector", *peer_idx);
     status = publisher.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     for (;;) {
         status = object.poll();

@@ -1,4 +1,6 @@
 #pragma once
+#include <mm/slab.hpp>
+#include <op.hpp>
 
 #include <cap/grant.hpp>
 #include <mm/pmm.hpp>
@@ -46,7 +48,8 @@ public:
     ~Port() noexcept;
     static auto storage_bytes(Config) noexcept -> std::optional<usize>;
     auto open() noexcept -> status_t;
-    void bind_work(WorkQueue& work, object::Key key) noexcept { work_ = &work; job_.bind(key); ready_.bind_work(work, key); }
+    auto op() noexcept -> Op& { return initialization_; }
+    void bind_work(WorkQueue& work, object::Key key) noexcept { work_ = &work; job_.bind(key); initialization_.bind(work, key); ready_.bind_work(work, key); }
     void bind_allocation(resource::Allocation& allocation) noexcept { quota_ = allocation.quota(); }
     template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
@@ -90,10 +93,15 @@ private:
     Src<PORT_READABLE | PORT_OVERFLOW> ready_{Source::Drained::bind<&Port::complete>(*this)};
     u64 version_{1}, acknowledged_{}, scan_{}, readiness_{};
     usize calls_{};
+    bool advancing_{};
     bool opened_{}, closing_{}, overflow_{}, scanned_{};
     object::cleanup cleanup_;
     WorkQueue* work_{};
+    void post() noexcept { work_->post(job_); }
+    void advance() noexcept;
     Work job_{Work::Fn::bind<&Port::run_work>(*this)};
+    status_t init_status_{STATUS_PENDING};
+    Op initialization_{{}, Source::Action::bind<&Port::post>(*this), Source::Action::bind<&Port::advance>(*this)};
 };
 
 } // namespace ipc

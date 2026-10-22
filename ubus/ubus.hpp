@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-// Maximum control body for version 1; bulk data belongs in BufferSlice.
+// Maximum control body for version 2; bulk data belongs in BufferSlice.
 inline constexpr size_t ubus_body_limit = 1u << 20;
 
 // Transport capabilities are separate from value indices. A message owns all
@@ -18,9 +18,9 @@ struct ubus_msg {
     size_t count{};
     status_t status{};
     word_t tag{}, badge{}, deadline{};
-    auto attach(cap_t cap, word_t rights) -> std::optional<size_t>;
-    auto offer(cap_owner cap, word_t rights) -> std::optional<size_t>;
-    auto give(cap_owner cap) -> std::optional<size_t>;
+    auto attach(cap_t cap, word_t rights) -> std::expected<size_t, status_t>;
+    auto offer(cap_owner&& cap, word_t rights) -> std::expected<size_t, status_t>;
+    auto give(cap_owner&& cap) -> std::expected<size_t, status_t>;
     void commit();
     void forward(); // Move owned received capabilities on the next successful send.
     auto clone() const -> std::expected<ubus_msg, status_t>;
@@ -45,7 +45,7 @@ struct ubus_method;
 
 struct ubus_request : ubus_msg {
     cap_owner reply;
-    auto facet() const -> word_t { return badge >= 2 && !(badge & 1) ? (badge - 2) / 2 : 0; }
+    auto facet() const -> word_t { return badge ? badge - 1 : 0; }
     std::shared_ptr<const ubus_method> method;
     auto respond(ubus_msg response = {}, bool* committed = nullptr) -> status_t;
 };
@@ -59,12 +59,13 @@ struct ubus_method {
 };
 
 // Wire storage outlives a blocked native send. Its body capability is simply
-// another common carrier, never a second serialization format.
+// another common carrier, never a second serialization format. RPC bodies
+// may be reused for the same endpoint after its reply; decoding copies them.
 struct ubus_wire {
     std::array<word_t, CHANNEL_MAX_WORDS> words{};
     std::array<CapXfer, CHANNEL_MAX_CAPS> caps{};
     cap_owner body;
-    size_t size{}, count{};
+    size_t size{}, count{}, capacity{};
     auto encode(const ubus_msg&, uint16_t kind, size_t maxcaps) -> status_t;
 };
 
@@ -88,6 +89,7 @@ class ubus_call {
     rpc_op rpc_;
     ubus_wire wire_;
     ubus_msg message_;
+    cap_t peer_{};
 public:
     auto active() const noexcept -> bool { return rpc_.active(); }
     auto sent() const noexcept -> bool { return rpc_.sent(); }
@@ -133,16 +135,17 @@ public:
     auto poll() -> status_t;
     auto arm() -> status_t { return input_.arm(); }
     auto endpoint() const -> cap_t { return channel_.ends[0].selector(); }
+    auto issuer() const -> cap_t { return channel_.ends[1].selector(); }
 };
 
-// Connections cache the authorized description returned by Bind. Every call,
-// using public values, uses the same values and native engine.
+// Bind negotiates a description and retains the same grant as its connector.
+// No second endpoint identity outlives or bypasses that grant's revocation.
 class ubus_conn {
     cap_owner endpoint_;
     ev_watch peer_;
     ubus_data description_;
     ubus_call call_;
-    struct binding { std::string interface; uint64_t minimum, maximum, features; };
+    struct binding { std::string interface; uint64_t minimum, maximum, features; cap_owner endpoint; };
     std::optional<binding> binding_;
     auto bound(ubus_msg&) -> status_t;
     auto install(cap_owner, ubus_value, std::string_view, uint64_t, uint64_t, uint64_t) -> status_t;

@@ -18,9 +18,15 @@ int main() {
         {.bytes=budget.memory_available - 4 * 1024 * 1024, .caps=budget.caps_available - 128,
          .kinds=OBJ_KINDS, .slots=1024, .pages=132, .quota_perms=RIGHT_CREATE | RIGHT_SPLIT | RIGHT_INSPECT});
     child.args = {"mgr"}; child.desired = child.restart = true; child.exports.push("*");
-    child.setup.data.put("archive", ubus_buffer{*child.setup.attach(root.bundle, RIGHT_MAP | RIGHT_DUPLICATE), 0, root.bundle_bytes})
-        .put("firmware", ubus_buffer{*child.setup.attach(root.firmware, RIGHT_MAP | RIGHT_DUPLICATE), root.firmware_offset, root.firmware_bytes})
-        .cap("physical", *child.setup.attach(root.physical, RIGHT_CREATE | RIGHT_CONTROL | RIGHT_DUPLICATE))
+    const auto archive_idx = child.setup.attach(root.bundle, RIGHT_MAP | RIGHT_DUPLICATE);
+    if (!archive_idx) return archive_idx.error();
+    const auto firmware_idx = child.setup.attach(root.firmware, RIGHT_MAP | RIGHT_DUPLICATE);
+    if (!firmware_idx) return firmware_idx.error();
+    const auto phys_idx = child.setup.attach(root.physical, RIGHT_CREATE | RIGHT_CONTROL | RIGHT_DUPLICATE);
+    if (!phys_idx) return phys_idx.error();
+    child.setup.data.put("archive", ubus_buffer{*archive_idx, 0, root.bundle_bytes})
+        .put("firmware", ubus_buffer{*firmware_idx, root.firmware_offset, root.firmware_bytes})
+        .cap("physical", *phys_idx)
         .put("format", root.firmware_format).put("hart", root.boot_hart);
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) return status;

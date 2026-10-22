@@ -227,6 +227,6 @@ class ch_pair final {
         const auto r = sys::channel_create(pool, depth, words, transfers);
         ends[0] = cap_owner{r.value};
         ends[1] = cap_owner{r.value2};
-        return r.status;
+        return r.status == STATUS_PENDING ? op_wait(ends[0].selector()).status : r.status;
     }
 };

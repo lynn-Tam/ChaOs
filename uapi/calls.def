@@ -18,6 +18,7 @@ CALL(SC_INFO, 8, info_call, Call) /* a0=SC(Inspect), a1=IPC offset */
 CALL(SC_UNBIND, 4, sc_unbind, Call) /* a0=SC, a1=expected association generation */
 
 CALL(CAP_CLOSE, 16, cap_call, Call) /* a0=selector, a1=dest CSpace (0=current) */
+CALL(CAP_INFO, 27, cap_info, Call) /* a0=local selector, a1=IPC offset; CapInfo */
 CALL(CAP_DUPLICATE, 17, cap_call, Call)
 CALL(CAP_DELEGATE, 18, cap_call, Call) /* a3=optional grant quota Quota (0=source CSpace) */
 CALL(CAP_MOVE, 19, cap_call, Call)
@@ -50,9 +51,9 @@ CALL(DOMAIN_MOVE, 26, domain_move, Call) /* a0=Domain(Control), a1=new parent(Cr
 CALL(SC_CREATE, 52, sc_create, Create) /* a1=domain, a2=budget ns, a3=period ns, a4=weight, a5=CPU mask */
 CALL(THREAD_CREATE, 53, thread_create, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset, a5=home cpu */
 CALL(NOTIFICATION_CREATE, 54, notification_create, Create) /* a1=immutable signal badge */
-CALL(CHANNEL_CREATE, 58, channel_create, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations */
+CALL(CHANNEL_CREATE, 58, channel_create, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations; PENDING returns both ends, SOURCE_OP observes initialization */
 CALL(PAGER_CREATE, 59, pager_create, Create) /* a0=ResourcePool */
-CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Create) /* a1=bytes, a2=access, a3=pager, a4=flags, a5=prepaid page records */
+CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Create) /* a1=bytes, a2=access, a3=pager, a4=flags, a5=prepaid page records; PENDING returns Mem, SOURCE_OP observes initialization */
 CALL(MEMORY_CREATE_PHYSICAL, 55, memory_create_physical, Create) /* a0=pool, a1=Phys(Create), a2=PA, a3=bytes, a4=perms */
 CALL(IRQ_CONTROLLER_CREATE, 56, irq_controller_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
 CALL(IRQ_CREATE, 57, irq_create, Create) /* a0=pool, a1=controller(Create), a2=source */
@@ -78,7 +79,7 @@ CALL(MEMORY_READ, 68, memory_copy, Call) /* a0=Memory(Map), a1=byte offset, a2=I
 CALL(NOTIFICATION_SIGNAL, 80, notification_signal, Ipc) /* a0=Notification; badge is in cap */
 CALL(NOTIFICATION_TAKE, 81, notification_take, Ipc) /* a0=Notification */
 CALL(WAIT_ONE, 83, source_call, Ipc) /* a0=source, a1=facet, a2=condition, a3=seen, a4=deadline, a5=flags */
-CALL(PORT_CREATE, 84, port_create, Create) /* a1=Watch capacity, a2=queued hint capacity */
+CALL(PORT_CREATE, 84, port_create, Create) /* a1=Watch capacity, a2=queued hint capacity; PENDING returns Port, SOURCE_OP observes initialization */
 CALL(PORT_WATCH, 85, port_watch, Ipc) /* a0=Port, a1=source, a2=facet, a3=condition, a4=seen, a5=key, a6=flags */
 CALL(PORT_ARM, 86, port_call, Ipc) /* a0=Port, a1=watch_gen, a2=seen; registered condition stays fixed */
 CALL(PORT_UNWATCH, 87, port_call, Ipc) /* a0=Port, a1=watch_gen */

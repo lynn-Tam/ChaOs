@@ -69,7 +69,9 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
     if (status == STATUS_OK) status = object.open(32, request.capability(request.data["budget"]));
     if (status != STATUS_OK) return status;
     auto handle = object.handle(0, RIGHT_SEND); if (!handle) return handle.error();
-    response.data.cap("handle", *response.give(std::move(*handle)));
+    const auto handle_idx = response.give(std::move(*handle));
+    if (!handle_idx) return handle_idx.error();
+    response.data.cap("handle", *handle_idx);
     opens.push_back(std::move(opened)); return STATUS_OK;
 }
 static auto list(ubus_request& request, ubus_msg& response) -> status_t {
@@ -112,8 +114,11 @@ int main() {
             {{"epoch", ubus_type::U64}, {"items", ubus_type::Array}, {"cursor", ubus_type::Record, true}}, list, 1)}) if (status != STATUS_OK) return status;
     status = directory.open(); if (status != STATUS_OK) return status;
     auto connector = directory.connector(1 | 4); if (!connector) return connector.error();
-    ubus_msg publication, result; publication.data.put("name", "files").put("interface", "myos.files").put("version", uint64_t{1})
-        .cap("connector", *publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    ubus_msg publication, result;
+    const auto peer_idx = publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!peer_idx) return peer_idx.error();
+    publication.data.put("name", "files").put("interface", "myos.files").put("version", uint64_t{1})
+        .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(publication), result); if (status != STATUS_OK) return status;
     for (;;) {
         bool progress{};

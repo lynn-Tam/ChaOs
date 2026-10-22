@@ -210,8 +210,9 @@ public:
         return transaction([&](auto&& visit) { visit(usage_); }, [] {});
     }
     auto inspect(GrantQuery, usize depth, GrantRecords&) noexcept -> status_t;
-    auto observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, CSpaceError>;
+    auto observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t>;
     auto inspect(Handle cursor, CSpaceInfo&, u64 epoch = 0) noexcept -> std::expected<void, CSpaceError>;
+    auto inspect(Handle) noexcept -> std::expected<CapInfo, CSpaceError>;
     void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; job_.bind(owner); }
     void retire() noexcept;
     void retire(object::cleanup&&) noexcept;

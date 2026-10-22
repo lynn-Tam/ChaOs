@@ -10,12 +10,13 @@ enum class Ext : usize {
     Hsm = 0x48534d,
     Timer = 0x54494d45,
     Ipi = 0x735049,
+    Rfence = 0x52464e43,
     Reset = 0x53525354,
     Console = 0x4442434e,
     PutChar = 1,
 };
 inline constexpr isize Unsupported = -2, Invalid = -3, BadAddr = -5, Available = -6, Started = -7;
-auto call(Ext, usize fn, usize a0 = 0, usize a1 = 0, usize a2 = 0) noexcept -> std::expected<usize, isize>;
+auto call(Ext, usize fn, usize a0 = 0, usize a1 = 0, usize a2 = 0, usize a3 = 0) noexcept -> std::expected<usize, isize>;
 inline bool probe(Ext ext) noexcept {
     auto r = call(Ext::Base, 3, static_cast<usize>(ext));
     return r && *r != 0;

@@ -99,6 +99,7 @@ private:
     friend class WorkQueue;
     void schedule() noexcept;
     auto scan(Pin&) noexcept -> bool;
+    auto collect(Publication&, usize budget) noexcept -> bool;
     auto observed(Condition, u64) const noexcept -> std::optional<WaitResult>;
     auto closed_result(const Watch&) const noexcept -> WaitResult;
 protected:

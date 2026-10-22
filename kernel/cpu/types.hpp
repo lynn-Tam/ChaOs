@@ -7,7 +7,7 @@
 
 // Firmware IDs remain opaque and sparse, while every normalized topology is
 // bounded before it enters kernel initialization.
-inline constexpr usize MaxCpus = 256;
+inline constexpr usize MaxCpus = 64;
 
 struct CpuId final {
     usize raw{};

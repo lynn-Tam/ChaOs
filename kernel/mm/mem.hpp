@@ -1,4 +1,5 @@
 #pragma once
+#include <mm/slab.hpp>
 #include <uapi/mem.h>
 
 #include <libk/unique_handle.hpp>
@@ -179,6 +180,8 @@ class MemLink final : private libk::noncopyable_nonmovable {
     auto id() const noexcept -> u64 { return id_.value; }
     [[nodiscard]] auto attached() const noexcept -> bool;
     [[nodiscard]] auto busy() const noexcept -> bool;
+    // Its consumer serializes permission changes through Mem::protect.
+    auto perms() const noexcept -> Perms { return perms_; }
     // Returns true when no MemWork still pins the Map relation.
     [[nodiscard]] auto detach() noexcept -> bool;
 
@@ -274,9 +277,9 @@ template<class Extra = std::monostate> class Cache {
     Cache(Cache&&) noexcept;
     ~Cache() noexcept;
     auto drain() noexcept -> bool;
-    auto prepay(const object::ref<>& quota, usize count) noexcept -> std::expected<void, MemErr> requires is_paged {
+    auto prepay(const object::ref<>& quota, usize count) noexcept -> std::expected<bool, MemErr> requires is_paged {
         const auto result = rows_.prepay(quota, count);
-        return result ? std::expected<void, MemErr>{} : std::unexpected(MemErr::ResourceExhausted);
+        return result ? std::expected<bool, MemErr>{*result} : std::unexpected(MemErr::ResourceExhausted);
     }
     template<class Visit> void charges(Visit&& visit) noexcept {
         sync::Lock guard{tree_lock_};
@@ -348,7 +351,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         Data(Pmm& pmm, usize pages) noexcept : pmm_(&pmm), pages_(pages) {}
         object::ref<> quota_, pager_;
         Pmm* pmm_;
-        usize pages_;
+        usize pages_, prepay_{};
         Perms perms_;
         std::optional<Store> store_;
       public:
@@ -359,8 +362,9 @@ class Mem final : private libk::noncopyable_nonmovable {
         -> std::expected<Data, MemErr>;
     explicit Mem(Data&&) noexcept;
     ~Mem() noexcept;
+    auto op() noexcept -> Op& { return initialization_; }
     void bind_work(WorkQueue& work, object::Key owner) noexcept {
-        work_ = &work; job_.bind(owner); ordinary_.bind(owner); backing_.bind(owner);
+        work_ = &work; initialization_.bind(work, owner); job_.bind(owner); ordinary_.bind(owner); backing_.bind(owner);
         trim_events_.bind_work(work, owner, Source::Drained::bind<&Mem::post>(*this));
     }
 
@@ -368,7 +372,7 @@ class Mem final : private libk::noncopyable_nonmovable {
         -> std::expected<u64, status_t> {
         {
             sync::Lock guard{lock_};
-            if (state_ != MemState::Live || reassigning_ || preparing_ || trimming_ || releasing_
+            if (state_ != MemState::Live || !work_open_.load(std::memory_order_acquire) || reassigning_ || preparing_ || trimming_ || releasing_
                 || request_pins_.load(std::memory_order_acquire)) return std::unexpected(STATUS_BUSY);
             reassigning_ = true;
         }
@@ -417,6 +421,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto read(usize offset, std::span<byte> output) noexcept -> std::expected<void, MemErr>;
 
     [[nodiscard]] auto attach(MemLink& attachment, Perms perms) noexcept -> std::expected<void, MemErr>;
+    auto protect(MemLink&, Perms) noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto attachment_count() const noexcept -> usize;
     void retire(object::cleanup&& cleanup = {}) noexcept;
 
@@ -471,7 +476,7 @@ class Mem final : private libk::noncopyable_nonmovable {
     cap::Bindings<1> backing_{Source::Action::bind<&Mem::invalidated>(*this), Source::Action::bind<&Mem::post>(*this)};
     object::ref<> quota_{};
     Pmm* pmm_{};
-    usize logical_pages_{};
+    usize logical_pages_{}, prepay_{};
     mutable sync::Spin lock_{};
     AttachmentList attachments_{};
     MemLink* scan_{};
@@ -497,6 +502,8 @@ class Mem final : private libk::noncopyable_nonmovable {
     bool releasing_{}, stopping_{};
     WorkQueue* work_{};
     Work job_{Work::Fn::bind<&Mem::run_work>(*this)};
+    status_t init_status_{STATUS_PENDING};
+    Op initialization_{{}, Source::Action::bind<&Mem::post>(*this), Source::Action::bind<&Mem::advance>(*this)};
     Work ordinary_{Work::Fn::bind<&Mem::advance>(*this), Work::Fn::bind<&Mem::post>(*this)};
     // Closes page request admission before retirement scans the backing.
     std::atomic<bool> work_open_{true};

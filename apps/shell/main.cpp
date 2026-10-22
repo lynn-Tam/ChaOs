@@ -86,7 +86,7 @@ struct sh_pipeline {
 class sh_shell {
     const rt_env& env_;
     ubus_rx input_;
-    ubus_conn bus_;
+    ubus_conn bus_, files_;
     ubus_msg setup_;
     vm_area source_;
     cap_t input_cap_{}, output_cap_{};
@@ -194,20 +194,19 @@ class sh_shell {
         }
     }
     auto image(std::string_view path) -> std::expected<proc_image, status_t> {
-        ubus_conn files;
-        ubus_msg query, response; query.data.put("name", "exec");
-        auto status = bus_.invoke("Get", std::move(query), response);
-        if (status == STATUS_OK) status = files.bind(response.capability(response.data["connector"]), "myos.files", 1, 1);
-        if (status != STATUS_OK) return std::unexpected(status);
+        ubus_msg query, response;
+        auto status = files_.state();
+        if (status != STATUS_OK) {
+            if (const auto closed = files_.close(); closed != STATUS_OK) return std::unexpected(closed);
+            query.data.put("name", "exec");
+            status = bus_.invoke("Get", std::move(query), response);
+            if (status == STATUS_OK) status = files_.bind(response.capability(response.data["connector"]), "myos.files", 1, 1);
+            if (status != STATUS_OK) return std::unexpected(status);
+        }
         query = {}; query.data.put("path", path).put("perms", word_t{VM_READ | VM_EXECUTE});
-        status = files.invoke("Map", std::move(query), response); if (status != STATUS_OK) return std::unexpected(status);
+        status = files_.invoke("Map", std::move(query), response); if (status != STATUS_OK) return std::unexpected(status);
         const auto buffer = response.data["buffer"].as<ubus_buffer>(); if (!buffer) return std::unexpected(STATUS_PEER_FAULT);
-        auto mapped = vm_area::map(rt_vm(), response.take(response.data["buffer"]), 0,
-            libk::checked_align_up(buffer->offset + buffer->size, 4096).value_or(0), VM_READ);
-        if (!mapped) return std::unexpected(mapped.error());
-        source_ = std::move(*mapped);
-        return proc_image{.bytes={reinterpret_cast<const std::byte*>(source_.address + buffer->offset), size_t(buffer->size)},
-            .memory=source_.memory.selector(), .offset=buffer->offset, .perms=VM_READ | VM_EXECUTE};
+        return proc_image::map(source_, response.take(response.data["buffer"]), buffer->offset, buffer->size, VM_READ | VM_EXECUTE);
     }
     auto launch(sh_stage& stage, sh_pipeline& job, size_t index, std::span<const std::string_view> argv) -> status_t {
         const auto config = setup_.data["message"];
@@ -244,12 +243,16 @@ class sh_shell {
             std::tuple{"stderr", job.output.ends[0].selector(), word_t{RIGHT_SEND}, word_t{1}}}) {
             const auto copy = badge ? sys::channel_mint(source, env_.cspace, badge, rights) : sys::cap_duplicate(source, env_.cspace, rights);
             if (copy.status != STATUS_OK) return copy.status;
-            child.setup.data.cap(name, *child.setup.give(cap_owner{copy.value}));
+            const auto cap_idx = child.setup.give(cap_owner{copy.value});
+            if (!cap_idx) return cap_idx.error();
+            child.setup.data.cap(name, *cap_idx);
         }
         if (job.stages.size() == 1) {
             const auto cap = sys::cap_duplicate(job.terminal_connector.selector(), env_.cspace, RIGHT_SEND | RIGHT_DUPLICATE);
             if (cap.status != STATUS_OK) return cap.status;
-            child.setup.data.cap("terminal", *child.setup.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE));
+            const auto term_idx = child.setup.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE);
+            if (!term_idx) return term_idx.error();
+            child.setup.data.cap("terminal", *term_idx);
         }
         return owner_.start(child);
     }

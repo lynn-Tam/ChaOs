@@ -7,12 +7,13 @@
 #include <libk/assert.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <sync.hpp>
+#include <cpu/cpu.hpp>
 
 namespace mm {
 
 KSpace::~KSpace() noexcept { libk_assert(stack_leases_ == 0); }
 
-auto KSpace::map(KMap& map, Pages pages) noexcept -> std::expected<void, PtErr> {
+auto KSpace::map(KMap& map, Pages pages, Cpus& cpus, CpuId local) noexcept -> std::expected<void, PtErr> {
     if (map.owner_ || !pages.valid()) return std::unexpected(PtErr::BadAddr);
     sync::Lock guard{stack_lock_};
     // Device reservations grow downward; stacks grow upward in the same arena.
@@ -37,7 +38,7 @@ auto KSpace::map(KMap& map, Pages pages) noexcept -> std::expected<void, PtErr> 
     const auto result = root_.map(va->base(), pages, PtPerm::Rw);
     if (!result) return result;
     // This gap has no live translation. Removal drains TLBs before reuse.
-    edit.publish_fresh();
+    edit.publish_local();
     table_charge_.merge(std::move(*fee));
     map.owner_ = this;
     map.range_ = {va->base(), pages.byte_size()};
@@ -45,6 +46,13 @@ auto KSpace::map(KMap& map, Pages pages) noexcept -> std::expected<void, PtErr> 
     map.next_ = *link;
     if (map.next_) map.next_->link_ = &map.next_;
     *link = &map;
+    guard.restore();
+    // Firmware services machine-mode fence requests independently of S-mode
+    // locks/IRQs. No KSpace or Tlb lock crosses this publication barrier.
+    for (usize i = 0; i < cpus.count(); ++i) {
+        const auto* cpu = cpus.get(CpuId{i});
+        if (cpu->id != local && cpu->online()) libk_assert(arch::flush_remote(cpu->hw.raw));
+    }
     return {};
 }
 void KSpace::unmap(KMap& map, Flush& flush, Cpus& cpus, CpuId local) noexcept {
@@ -109,7 +117,7 @@ auto KSpace::acquire_stack() noexcept -> std::expected<usize, PtErr> {
     usize i{};
     auto mapped = root_.map(va, Stack::StackPages, [&] { return pages[i++]; }, PtPerm::Rw);
     if (!mapped) return std::unexpected(mapped.error());
-    edit.publish_fresh();
+    edit.publish_local();
 
     table_charge_.merge(std::move(*fee));
     stack_pages_.append(std::move(backing));

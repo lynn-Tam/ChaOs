@@ -1,20 +1,22 @@
 #include "ubus.hpp"
 #include <algorithm>
 
+static constexpr uint16_t ubus_version = 2;
 static constexpr uint16_t ubus_invoke = 1, ubus_reply = 2, ubus_event = 3, ubus_oneway = 4, ubus_bulk = 0x8000;
 struct ubus_envelope { uint16_t version, kind; uint32_t bytes; int64_t status; uint64_t deadline; };
 static_assert(sizeof(ubus_envelope) == 24);
 
-auto ubus_msg::attach(cap_t cap, word_t rights) -> std::optional<size_t> {
-    if (!cap || count == transfers.size()) return {};
+auto ubus_msg::attach(cap_t cap, word_t rights) -> std::expected<size_t, status_t> {
+    if (!cap) return std::unexpected(STATUS_INVALID_CAP);
+    if (count == transfers.size()) return std::unexpected(STATUS_NO_MEMORY);
     transfers[count] = {cap, rights, CAP_COPY, 0}; return count++;
 }
-auto ubus_msg::offer(cap_owner cap, word_t rights) -> std::optional<size_t> {
+auto ubus_msg::offer(cap_owner&& cap, word_t rights) -> std::expected<size_t, status_t> {
     const auto index = attach(cap.selector(), rights);
     if (index) caps[*index] = std::move(cap);
     return index;
 }
-auto ubus_msg::give(cap_owner cap) -> std::optional<size_t> {
+auto ubus_msg::give(cap_owner&& cap) -> std::expected<size_t, status_t> {
     const auto index = offer(std::move(cap), 0);
     if (index) transfers[*index].operation = CAP_MOVE;
     return index;
@@ -35,7 +37,8 @@ auto ubus_msg::clone() const -> std::expected<ubus_msg, status_t> {
         const auto rights = transfers[i].rights ? transfers[i].rights : view->view.rights;
         const auto duplicated = sys::cap_duplicate(source, rt_startup().cspace, rights);
         if (duplicated.status != STATUS_OK) return std::unexpected(duplicated.status);
-        (void)copy.offer(cap_owner{duplicated.value}, rights);
+        const auto index = copy.offer(cap_owner{duplicated.value}, rights);
+        if (!index) return std::unexpected(index.error());
     }
     return copy;
 }
@@ -84,22 +87,25 @@ static auto ubus_caps_valid(ubus_value value, size_t count) -> bool {
     return true;
 }
 auto ubus_wire::encode(const ubus_msg& message, uint16_t kind, size_t maxcaps) -> status_t {
-    body = {}; size = count = 0; words.fill(0);
+    size = count = 0; words.fill(0);
     const auto bytes = message.data.bytes();
     if (bytes.size() > ubus_body_limit || !message.data.valid() || !ubus_caps_valid(message.data.view(), message.count)
         || message.count > maxcaps) return STATUS_BAD_ARGS;
     const bool bulk = bytes.size() > sizeof(words) - sizeof(ubus_envelope);
     if (bulk && message.count == maxcaps) return STATUS_NO_MEMORY;
     if (bulk) {
-        const auto created = sys::memory_create(rt_startup().alloc(), ubus_align((bytes.size() + 4095) & ~size_t{4095}), VM_READ | VM_WRITE);
-        if (created.status != STATUS_OK) return created.status;
-        body = cap_owner{created.value};
+        const auto capacity = ubus_align((bytes.size() + 4095) & ~size_t{4095});
+        if (!body || this->capacity < capacity) {
+            const auto created = sys::memory_create(rt_startup().alloc(), capacity, VM_READ | VM_WRITE);
+            if (created.status != STATUS_OK) return created.status;
+            body = cap_owner{created.value}; this->capacity = capacity;
+        }
         const auto status = mem_write(body.selector(), 0, bytes);
         if (status != STATUS_OK) return status;
         caps[count++] = {body.selector(), RIGHT_MAP | RIGHT_DUPLICATE, CAP_COPY, 0};
     } else ::memcpy(reinterpret_cast<std::byte*>(words.data()) + sizeof(ubus_envelope), bytes.data(), bytes.size());
     std::copy_n(message.transfers.begin(), message.count, caps.begin() + count); count += message.count;
-    const ubus_envelope envelope{1, static_cast<uint16_t>(kind | (bulk ? ubus_bulk : 0)),
+    const ubus_envelope envelope{ubus_version, static_cast<uint16_t>(kind | (bulk ? ubus_bulk : 0)),
         static_cast<uint32_t>(bytes.size()), message.status, message.deadline};
     ::memcpy(words.data(), &envelope, sizeof(envelope));
     size = bulk ? sizeof(envelope) / 8 : ubus_align(sizeof(envelope) + bytes.size()) / 8;
@@ -116,7 +122,7 @@ static auto ubus_decode(ch_packet packet, ubus_msg& result, cap_owner* reply = n
     if (packet.word_count < sizeof(ubus_envelope) / 8) return STATUS_PEER_FAULT;
     ubus_envelope envelope; ::memcpy(&envelope, packet.words.data(), sizeof(envelope));
     const auto kind = envelope.kind & ~ubus_bulk;
-    if (envelope.version != 1 || (reply ? kind != (packet.called ? ubus_invoke : ubus_oneway) : packet.called || (kind != ubus_reply && kind != ubus_event))
+    if (envelope.version != ubus_version || (reply ? kind != (packet.called ? ubus_invoke : ubus_oneway) : packet.called || (kind != ubus_reply && kind != ubus_event))
         || envelope.bytes < sizeof(ubus_head) || !std::in_range<status_t>(envelope.status)) return STATUS_PEER_FAULT;
     std::span<std::byte> bytes;
     if (envelope.kind & ubus_bulk) {
@@ -178,6 +184,7 @@ auto ubus_rx::receive(ubus_msg& message) -> status_t {
 }
 auto ubus_call::begin(cap_t endpoint, ubus_msg message, bool drain) -> status_t {
     if (rpc_.active()) return STATUS_BUSY;
+    if (peer_ != endpoint) { wire_ = {}; peer_ = endpoint; }
     message_ = std::move(message);
     const auto& pending = message_;
     const auto status = wire_.encode(pending, ubus_invoke, CHANNEL_MAX_CAPS - 1);
@@ -193,12 +200,17 @@ auto ubus_call::poll(ubus_msg& result) -> status_t {
     const auto status = rpc_.poll(packet);
     if (rpc_.sent()) message_.commit();
     if (status == STATUS_WOULD_BLOCK) return status;
-    message_ = {}; wire_ = {};
-    return status == STATUS_OK ? ubus_decode(std::move(packet), result) : status;
+    message_ = {};
+    const auto decoded = status == STATUS_OK ? ubus_decode(std::move(packet), result) : status;
+    // A reply retires this peer's read of the request. Keep at most one page;
+    // cancellation/errors discard it so an unfinished reader sees its old body.
+    if (decoded != STATUS_OK || wire_.capacity > 4096) wire_ = {};
+    return decoded;
 }
 auto ubus_call::cancel() -> status_t {
     const auto status = rpc_.cancel();
-    if (status == STATUS_OK) { message_ = {}; wire_ = {}; }
+    wire_ = {};
+    if (status == STATUS_OK) message_ = {};
     return status;
 }
 auto ubus_call::wait(ubus_msg& result) -> status_t {
@@ -341,17 +353,17 @@ auto ubus_object::open(size_t depth, cap_t quota, cap_owner scope) -> status_t {
     return status;
 }
 auto ubus_object::connector(word_t facet) -> std::expected<cap_owner, status_t> {
-    if (facet > (UINT64_MAX - 2) / 2 || !endpoint()) return std::unexpected(STATUS_BAD_ARGS);
+    if (facet > UINT64_MAX - 1 || !endpoint()) return std::unexpected(STATUS_BAD_ARGS);
     sealed_ = true;
-    const auto cap = sys::channel_mint(channel_.ends[1].selector(), rt_startup().cspace, facet * 2 + 1,
+    const auto cap = sys::channel_mint(channel_.ends[1].selector(), rt_startup().cspace, facet + 1,
         RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE);
     if (cap.status != STATUS_OK) return std::unexpected(cap.status);
     return cap_owner{cap.value};
 }
 auto ubus_object::handle(word_t facet, word_t rights) -> std::expected<cap_owner, status_t> {
-    if (facet > (UINT64_MAX - 2) / 2 || !channel_.ends[1]) return std::unexpected(STATUS_BAD_ARGS);
+    if (facet > UINT64_MAX - 1 || !channel_.ends[1]) return std::unexpected(STATUS_BAD_ARGS);
     const auto minted = sys::channel_mint(channel_.ends[1].selector(), rt_startup().cspace,
-        facet * 2 + 2, rights);
+        facet + 1, rights);
     if (minted.status != STATUS_OK) return std::unexpected(minted.status);
     cap_owner result{minted.value};
     const auto status = channel_.ends[1].close();
@@ -365,21 +377,13 @@ auto ubus_object::bind(ubus_request& request) -> status_t {
     const auto minimum = input["minimum"].as<uint64_t>(), maximum = input["maximum"].as<uint64_t>();
     const auto features = input["features"].as<uint64_t>();
     ubus_msg response;
-    const auto authorized = access_ ? access_(request.badge / 2, {}) : STATUS_OK;
+    const auto authorized = access_ ? access_(request.facet(), {}) : STATUS_OK;
     if (const auto admitted = rt_admit(request.deadline); admitted != STATUS_OK) response.status = admitted;
     else if (authorized != STATUS_OK) response.status = authorized;
     else if (!interface || !minimum || !maximum || !features || (!interface->empty() && *interface != interface_)
         || *minimum > version_ || *maximum < version_ || (*features & features_) != *features) response.status = STATUS_BAD_ARGS;
     else {
-        const auto facet = request.badge / 2;
-        // +2 keeps all business badges nonzero; connector uses the odd value.
-        const auto cap = sys::channel_mint(channel_.ends[1].selector(), rt_startup().cspace,
-            facet * 2 + 2, RIGHT_SEND | RIGHT_DUPLICATE);
-        if (cap.status != STATUS_OK) response.status = cap.status;
-        else {
-            response.data.put("object", describe(facet));
-            response.data.cap("endpoint", *response.give(cap_owner{cap.value}));
-        }
+        response.data = describe(request.facet());
     }
     return request.respond(std::move(response));
 }
@@ -397,11 +401,11 @@ auto ubus_object::poll() -> status_t {
         if (request.reply) { ubus_msg error; error.status = status; (void)request.respond(std::move(error)); }
         return status == STATUS_PEER_FAULT || status == STATUS_BAD_ARGS || status == STATUS_BAD_RIGHTS || status == STATUS_NO_MEMORY ? STATUS_OK : status;
     }
-    if ((request.badge & 1) && request.tag == 1) return request.reply ? bind(request) : STATUS_OK;
+    if (request.tag == 1) return request.reply ? bind(request) : STATUS_OK;
     ubus_msg response;
     response.status = rt_admit(request.deadline);
-    const auto facet = request.badge >= 2 ? (request.badge - 2) / 2 : 0;
-    if (!request.badge || (request.badge & 1)) response.status = STATUS_BAD_RIGHTS;
+    const auto facet = request.facet();
+    if (!request.badge) response.status = STATUS_BAD_RIGHTS;
     else if (access_ && access_(facet, {}) != STATUS_OK) response.status = STATUS_CLOSED;
     else if (!request.tag) response.data = describe(facet);
     else if (request.tag < 2 || request.tag - 2 >= methods_.size()) response.status = STATUS_INVALID_OP;
@@ -422,16 +426,19 @@ auto ubus_object::poll() -> status_t {
 auto ubus_conn::begin_bind(cap_t connector, std::string_view interface, uint64_t minimum,
                            uint64_t maximum, uint64_t features, uint64_t deadline) -> status_t {
     if (call_.active()) return STATUS_BUSY;
+    const auto duplicated = sys::cap_duplicate(connector, rt_startup().cspace, RIGHT_SEND | RIGHT_DUPLICATE);
+    if (duplicated.status != STATUS_OK) return duplicated.status;
+    cap_owner endpoint{duplicated.value};
     ubus_msg request; request.tag = 1; request.deadline = deadline;
     request.data.put("interface", interface).put("minimum", minimum).put("maximum", maximum).put("features", features);
     const auto status = call_.begin(connector, std::move(request));
-    if (status == STATUS_OK) binding_.emplace(std::string{interface}, minimum, maximum, features);
+    if (status == STATUS_OK) binding_.emplace(std::string{interface}, minimum, maximum, features, std::move(endpoint));
     return status;
 }
 auto ubus_conn::bound(ubus_msg& response) -> status_t {
     auto pending = std::move(*binding_); binding_.reset();
     if (response.status != STATUS_OK) return response.status;
-    return install(response.take(response.data["endpoint"]), response.data["object"], pending.interface,
+    return install(std::move(pending.endpoint), response.data.view(), pending.interface,
         pending.minimum, pending.maximum, pending.features);
 }
 auto ubus_conn::poll_bind() -> status_t {

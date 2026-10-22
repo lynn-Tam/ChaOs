@@ -10,6 +10,7 @@
 #include <libk/delegate.hpp>
 #include <mm/kspace.hpp>
 #include <task/env.hpp>
+#include <object/scope.hpp>
 #include <libk/noncopyable.hpp>
 #include <expected>
 #include <libk/intrusive_list.hpp>
@@ -118,6 +119,10 @@ class Thread final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto bind_roots(const cap::Resolved<mm::VSpace>& vspace,
                                  const cap::Resolved<cap::CSpace>& cspace) noexcept
         -> std::expected<void, cap::GrantError>;
+    auto check_control(mm::Pmm&, const object::ref<>& from, const object::ref<>& to, usize slot)
+        noexcept -> std::expected<object::Control::Check, status_t>;
+    auto finish_control(status_t = STATUS_CANCELED) noexcept -> bool;
+    auto control_status() const noexcept -> std::optional<status_t> { return control_status_; }
     void note_user_syscall() noexcept { ++user_syscalls_; }
     [[nodiscard]] auto user_syscalls() const noexcept -> u64 { return user_syscalls_; }
     [[nodiscard]] auto waiting() const noexcept -> bool { return wait().attached(); }
@@ -184,6 +189,8 @@ class Thread final : private libk::noncopyable_nonmovable {
     } interest_{*this};
 
     struct Kernel { std::optional<mm::Stack> stack; arch::Ctx ctx; KernelStart start; };
+    std::optional<object::ControlScan> control_scan_;
+    std::optional<status_t> control_status_;
     std::variant<Kernel, arch::TrapFrame> run_;
     Env env_;
     State state_{State::Prepared};

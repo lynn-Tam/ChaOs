@@ -37,8 +37,12 @@ int main(int argc, char**) {
     status = ready.open(env.alloc(), env.events); if (status != STATUS_OK) return status;
     auto& child = owner.add("descendant", "self", {.bytes=1024 * 1024, .caps=96, .slots=96, .pages=16});
     child.args.push_back("hold");
-    child.setup.data.cap("proof", *child.setup.give(setup.take(message["proof"])))
-        .cap("ready", *child.setup.attach(ready.selector(), RIGHT_SIGNAL));
+    const auto proof_idx = child.setup.give(setup.take(message["proof"]));
+    if (!proof_idx) return proof_idx.error();
+    const auto ready_idx = child.setup.attach(ready.selector(), RIGHT_SIGNAL);
+    if (!ready_idx) return ready_idx.error();
+    child.setup.data.cap("proof", *proof_idx)
+        .cap("ready", *ready_idx);
     status = owner.start(child); if (status != STATUS_OK) return status;
     const auto crash = setup.capability(message["crash"]);
     ev_watch crashed;

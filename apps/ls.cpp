@@ -3,6 +3,7 @@
 #include <start.hpp>
 #include <dirent.h>
 #include <unistd.h>
+#include <string>
 
 int main(int argc, char** argv) {
     if (const auto rc = px_init(); rc != STATUS_OK) return rc;
@@ -13,10 +14,8 @@ int main(int argc, char** argv) {
     int status{};
     errno = 0;
     while (auto* entry = readdir(dir)) {
-        uint64_t size{};
-        while (entry->d_name[size]) ++size;
-        if (write(STDOUT_FILENO, entry->d_name, size) != static_cast<int64_t>(size)
-            || write(STDOUT_FILENO, "\n", 1) != 1) { status = -1; break; }
+        const std::string line = std::string{entry->d_name} + '\n';
+        if (write(STDOUT_FILENO, line.data(), line.size()) != static_cast<int64_t>(line.size())) { status = -1; break; }
     }
     if (!status && errno) status = -1;
     const auto closed = closedir(dir);

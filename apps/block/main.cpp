@@ -55,7 +55,9 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
         })}) if (status != STATUS_OK) return status;
     auto status = object.open(blk_dev::Depth, request.capability(request.data["budget"])); if (status != STATUS_OK) return status;
     auto handle = object.handle(0, RIGHT_SEND); if (!handle) return handle.error();
-    response.data.cap("handle", *response.give(std::move(*handle)));
+    const auto handle_idx = response.give(std::move(*handle));
+    if (!handle_idx) return handle_idx.error();
+    response.data.cap("handle", *handle_idx);
     client->next = std::move(clients); clients = std::move(client); return STATUS_OK;
 }
 static auto slot() -> size_t {
@@ -81,8 +83,11 @@ int main() {
     if (status == STATUS_OK) status = directory.open();
     if (status != STATUS_OK) return status;
     auto connector = directory.connector(); if (!connector) return connector.error();
-    ubus_msg publication, response; publication.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
-        .cap("connector", *publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+    ubus_msg publication, response;
+    const auto peer_idx = publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!peer_idx) return peer_idx.error();
+    publication.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
+        .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(publication), response); if (status != STATUS_OK) return status;
     for (;;) {
         bool again{};

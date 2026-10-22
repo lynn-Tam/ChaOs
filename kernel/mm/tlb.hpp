@@ -4,6 +4,7 @@
 
 #include <cpu/types.hpp>
 #include <mm/pmm.hpp>
+#include <resource/quota.hpp>
 #include <sync.hpp>
 
 class Cpus;
@@ -12,6 +13,15 @@ struct Cpu;
 namespace mm {
 
 class Tlb;
+
+// Hardware tags are CPU-local. Collisions discard one tag, never another CPU's
+// allocation. Stable identities prevent a recycled Tlb address reviving a tag.
+struct TlbCache {
+    struct Entry { u64 id{}, version{}, executable{}; };
+    std::array<Entry, 32> entries{};
+    usize count{};
+    u64 kernel_version{};
+};
 
 // One stable owner for an invalidation and its detached physical pages.
 // The caller keeps this object until complete(), even if its waiter exits.
@@ -64,7 +74,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
         ~Edit() noexcept { abort(); }
         const CpuSet &targets() const noexcept { return owner_->active_; }
         bool commit(Flush &, Cpus *, CpuId local, bool executable = false, bool global = false) noexcept;
-        void publish_fresh() noexcept;
+        void publish_local() noexcept;
         void abort() noexcept {
             if (owner_) {
                 lock_.restore();
@@ -78,6 +88,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
         Tlb *owner_{};
         sync::Lock<sync::Spin> lock_;
     };
+    Tlb() noexcept;
     ~Tlb() noexcept;
     void enter(CpuId) noexcept;
     void leave(CpuId) noexcept;
@@ -86,7 +97,10 @@ class Tlb final : private libk::noncopyable_nonmovable {
 
   private:
     friend class Edit;
+    friend class Root;
     friend class Flush;
+    const u64 id_;
+    std::atomic<u64> version_{1}, executable_{1};
     mutable sync::Spin lock_{};
     CpuSet active_{};
     std::atomic<usize> retained_{};
@@ -95,7 +109,8 @@ class Tlb final : private libk::noncopyable_nonmovable {
 // Borrowed hardware root, used by both user and shared kernel address spaces.
 class Root final {
   public:
-    constexpr Root(Tlb &state, usize root) noexcept : state_(&state), root_(root) {}
+    constexpr Root(Tlb &state, usize root, Tlb* shared = nullptr) noexcept
+        : state_(&state), shared_(shared ? shared : &state), root_(root) {}
     Tlb &state() const noexcept { return *state_; }
     usize root() const noexcept { return root_; }
     void activate(Cpu &) const noexcept;
@@ -103,6 +118,7 @@ class Root final {
 
   private:
     Tlb *state_{};
+    Tlb *shared_{};
     usize root_{};
 };
 

@@ -20,8 +20,12 @@ struct Sample {
     Event kind{};
 };
 
+[[nodiscard]] inline constexpr auto enabled() noexcept -> bool { return TRACE_ENABLED; }
+#if TRACE_ENABLED
 void emit(Event, u64 actor = 0, u64 object = 0, u64 a = 0, u64 b = 0) noexcept;
-[[nodiscard]] auto enabled() noexcept -> bool;
+#else
+inline void emit(Event, u64 = 0, u64 = 0, u64 = 0, u64 = 0) noexcept {}
+#endif
 struct Ring {
     struct Cell {
         std::atomic<u64> seq{}, tick{}, actor{}, object{}, a{}, b{};

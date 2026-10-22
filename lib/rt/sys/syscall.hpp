@@ -126,6 +126,9 @@ inline void yield() noexcept {
 [[nodiscard]] inline auto cspace_info(cap_t target, cap_t cursor = 0, word_t offset = 0, word_t epoch = 0) noexcept -> SysResult {
     return call(SYS_CSPACE_INFO, target, offset, cursor, epoch);
 }
+[[nodiscard]] inline auto cap_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
+    return call(SYS_CAP_INFO, target, offset);
+}
 
 [[nodiscard]] inline auto thread_info(cap_t target, word_t offset = 0) noexcept -> SysResult {
     return call(SYS_THREAD_INFO, target, offset);

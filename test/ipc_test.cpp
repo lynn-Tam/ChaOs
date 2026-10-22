@@ -151,7 +151,7 @@ static bool test_exit_result_is_immutable(const TestContext&) noexcept {
 }
 
 void register_ipc_tests(TestRegistry& registry) noexcept {
-    (void)registry.add("ipc", "deferred source preserves pulses and terminal hints",
+    (void)registry.add("ipc", "bounded source preserves inline and deferred pulses",
         +[](const TestContext&) noexcept -> bool {
             WorkQueue work;
             Src<SOURCE_READY> source;
@@ -164,23 +164,26 @@ void register_ipc_tests(TestRegistry& registry) noexcept {
             auto drained = []() noexcept {};
             const auto deliver = libk::delegate<void(WaitResult) noexcept>::bind(receive);
             const auto done = Source::Drained::bind(drained);
-            Source::Watch a{deliver, done}, b{deliver, done}, c{deliver, done};
+            std::array<std::optional<Source::Watch>, 20> watches;
+            for (auto& watch : watches) watch.emplace(deliver, done);
             libk::scope_exit cleanup{[&]() noexcept {
-                a.detach(); b.detach(); c.detach(); source.close();
+                for (auto& watch : watches) watch->detach();
+                source.close();
                 while (work.run()) {}
             }};
             auto install = [](auto commit) noexcept { commit(); return STATUS_OK; };
-            for (auto* watch : {&a, &b, &c})
+            for (auto& watch : watches)
                 if (source.watch(*watch, {SOURCE_READY}, install) != STATUS_OK) return false;
             source.post(SOURCE_READY);
+            if (ready != 8) return false;
             source.update(0);
             // Re-arm in place before the queued scan reaches this middle item.
-            if (source.arm(b, {SOURCE_READY}) != STATUS_OK) return false;
+            if (source.arm(*watches[18], {SOURCE_READY}) != STATUS_OK) return false;
             while (work.run()) {}
-            if (ready != 2 || closed || source.snapshot().value) return false;
+            if (ready != 19 || closed || source.snapshot().value) return false;
             source.close();
             while (work.run()) {}
-            return ready == 2 && closed == 3;
+            return ready == 19 && closed == watches.size();
         });
     (void)registry.add("ipc", "IRQ acknowledgement rejects stale sequence",
         test_irq_sequence_reassert_requires_latest_ack);

@@ -346,36 +346,33 @@ class ts_view {
         }
     }
     auto line(std::string name, std::string state, std::string a, std::string b) -> ftxui::Element {
-        using namespace ftxui;
-        Elements parts{text(name) | flex, text(state) | size(WIDTH, EQUAL, 12)};
-        if (terminal_.columns() >= 64) parts.push_back(text(a) | align_right | size(WIDTH, EQUAL, page_ ? 16 : 9));
-        parts.push_back(text(b) | align_right | size(WIDTH, EQUAL, 12)); return hbox(parts);
+        ftxui::Elements parts{ftxui::text(name) | ftxui::flex, ftxui::text(state) | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 12)};
+        if (terminal_.columns() >= 64) parts.push_back(ftxui::text(a) | ftxui::align_right | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, page_ ? 16 : 9));
+        parts.push_back(ftxui::text(b) | ftxui::align_right | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 12)); return ftxui::hbox(parts);
     }
     auto field(std::string name, std::string value) -> ftxui::Element {
-        using namespace ftxui;
-        return hbox({text(name) | dim | size(WIDTH, EQUAL, 12), text(value) | flex});
+        return ftxui::hbox({ftxui::text(name) | ftxui::dim | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 12), ftxui::text(value) | ftxui::flex});
     }
     auto render() -> ftxui::Element {
-        using namespace ftxui;
-        const auto tab = [&](std::string label, bool active) { return text(" " + label + " ") | (active ? inverted : dim); };
-        Elements parts{hbox({text(" TASKS ") | bold, tab("1 Programs", !page_), tab("2 Devices", page_), filler(), text(frozen_ ? "Paused " : root_->path.substr(root_->path.find_last_of('/') + 1) + " ") | dim}), separator()};
+        const auto tab = [&](std::string label, bool active) { return ftxui::text(" " + label + " ") | (active ? ftxui::inverted : ftxui::dim); };
+        ftxui::Elements parts{ftxui::hbox({ftxui::text(" TASKS ") | ftxui::bold, tab("1 Programs", !page_), tab("2 Devices", page_), ftxui::filler(), ftxui::text(frozen_ ? "Paused " : root_->path.substr(root_->path.find_last_of('/') + 1) + " ") | ftxui::dim}), ftxui::separator()};
         if (help_) {
-            parts.push_back(vbox({text("Keys") | bold, text(""), field("Up/Down", "Select"), field("Left/Right", "Collapse / expand"), field("Enter", "Details"), field("a", "Actions"), field("/", "Search"), field("s", "Sort by name, CPU, memory"), field("t", "Tree / list"), field("h", "Include stopped programs"), field("Space", "Pause updates"), field("r", "Refresh"), field("Esc", "Back"), field("q", "Quit"), text(""), field("CPU", "100% = all cores"), field("Memory", "Resident memory")}) | flex);
+            parts.push_back(ftxui::vbox({ftxui::text("Keys") | ftxui::bold, ftxui::text(""), field("Up/Down", "Select"), field("Left/Right", "Collapse / expand"), field("Enter", "Details"), field("a", "Actions"), field("/", "Search"), field("s", "Sort by name, CPU, memory"), field("t", "Tree / list"), field("h", "Include stopped programs"), field("Space", "Pause updates"), field("r", "Refresh"), field("Esc", "Back"), field("q", "Quit"), ftxui::text(""), field("CPU", "100% = all cores"), field("Memory", "Resident memory")}) | ftxui::flex);
         } else if (detail_) {
-            Elements body;
+            ftxui::Elements body;
             if (page_) {
                 const auto row = device();
-                body = {text(ts_text(row["name"])) | bold, text(""), field("Status", ts_text(row["state"])), field("Type", ts_text(row["type"])), field("Driver", ts_text(row["driver"])), field("Location", ts_text(row["location"]))};
-                if (!row) body = {text(device_error_.empty() ? "Device not available" : device_error_) | dim};
+                body = {ftxui::text(ts_text(row["name"])) | ftxui::bold, ftxui::text(""), field("Status", ts_text(row["state"])), field("Type", ts_text(row["type"])), field("Driver", ts_text(row["driver"])), field("Location", ts_text(row["location"]))};
+                if (!row) body = {ftxui::text(device_error_.empty() ? "Device not available" : device_error_) | ftxui::dim};
                 if (row["error"]) body.push_back(field("Problem", ts_error(static_cast<status_t>(row["error"].as<int64_t>().value_or(0)))));
             } else if (const auto item = selected()) {
                 const auto row = details_["gen"].as<uint64_t>() == item->data["gen"].as<uint64_t>() && details_["program"] ? details_.view() : item->data.view();
-                body = {text(ts_name(row)) | bold, text(""), field("Status", ts_state(item->data.view())), field("Program", ts_text(row["program"]))};
+                body = {ftxui::text(ts_name(row)) | ftxui::bold, ftxui::text(""), field("Status", ts_state(item->data.view())), field("Program", ts_text(row["program"]))};
                 std::string args; for (const auto arg : row["argv"].values()) { if (!args.empty()) args += ' '; args += ts_text(arg); }
                 if (!args.empty()) body.push_back(field("Command", args));
-                body.push_back(text(""));
+                body.push_back(ftxui::text(""));
                 const auto chart = [&](const std::deque<uint64_t>& samples, uint64_t minimum) {
-                    return graph([&samples, minimum](int width, int height) {
+                    return ftxui::graph([&samples, minimum](int width, int height) {
                         std::vector<int> bars(width, -1);
                         const auto peak = samples.empty() ? minimum : std::max(minimum, *std::ranges::max_element(samples));
                         for (int x = 0; x < width; ++x) {
@@ -384,30 +381,30 @@ class ts_view {
                             bars[x] = std::max(0, int(samples[slot - 40] * height / peak) - 1);
                         }
                         return bars;
-                    }) | size(HEIGHT, EQUAL, 3);
+                    }) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, 3);
                 };
                 body.push_back(field("CPU", item->cpu ? ts_percent(*item->cpu) : "--"));
-                body.push_back(chart(item->history, 1000) | color(Color::Cyan));
+                body.push_back(chart(item->history, 1000) | ftxui::color(ftxui::Color::Cyan));
                 body.push_back(field("Memory", item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--"));
-                body.push_back(chart(item->memory, 1) | dim);
-                body.push_back(text("")); body.push_back(field("Location", item->path));
+                body.push_back(chart(item->memory, 1) | ftxui::dim);
+                body.push_back(ftxui::text("")); body.push_back(field("Location", item->path));
                 if (const auto result = row["result"].as<int64_t>(); ts_text(item->data["state"]) == "failed" && result && *result) body.push_back(field("Last error", ts_error(static_cast<status_t>(*result))));
-            } else body.push_back(text("Program ended") | dim);
-            parts.push_back(vbox(body) | flex);
+            } else body.push_back(ftxui::text("Program ended") | ftxui::dim);
+            parts.push_back(ftxui::vbox(body) | ftxui::flex);
         } else {
             if (search_) parts.push_back(input_->Render());
-            else if (!filter_.empty()) parts.push_back(text("Search: " + filter_) | dim);
-            else if (!page_ && (all_ || tree_)) parts.push_back(text(std::string{tree_ ? "Tree" : "List"} + (all_ ? "  /  All programs" : "")) | dim);
-            parts.push_back(page_ ? line("Device", "Status", "Type", "Driver") | dim
-                : line("Name" + std::string{sort_ == 0 ? " ↑" : ""}, "Status", sort_ == 1 ? "CPU ↓" : "CPU", sort_ == 2 ? "Memory ↓" : "Memory") | dim);
-            parts.push_back(separator()); Elements rows;
+            else if (!filter_.empty()) parts.push_back(ftxui::text("Search: " + filter_) | ftxui::dim);
+            else if (!page_ && (all_ || tree_)) parts.push_back(ftxui::text(std::string{tree_ ? "Tree" : "List"} + (all_ ? "  /  All programs" : "")) | ftxui::dim);
+            parts.push_back(page_ ? line("Device", "Status", "Type", "Driver") | ftxui::dim
+                : line("Name" + std::string{sort_ == 0 ? " ↑" : ""}, "Status", sort_ == 1 ? "CPU ↓" : "CPU", sort_ == 2 ? "Memory ↓" : "Memory") | ftxui::dim);
+            parts.push_back(ftxui::separator()); ftxui::Elements rows;
             if (page_) {
                 for (const auto row : device_rows()) {
                     auto entry = line(ts_text(row["name"]), ts_text(row["state"]), ts_text(row["type"]), ts_text(row["driver"]));
-                    if (ts_text(row["id"]) == device_selection_) entry = entry | inverted | focus;
+                    if (ts_text(row["id"]) == device_selection_) entry = entry | ftxui::inverted | ftxui::focus;
                     rows.push_back(entry);
                 }
-                if (rows.empty()) rows.push_back(text(device_error_.empty() ? devices_loaded_ ? "No devices" : "Loading..." : device_error_) | dim);
+                if (rows.empty()) rows.push_back(ftxui::text(device_error_.empty() ? devices_loaded_ ? "No devices" : "Loading..." : device_error_) | ftxui::dim);
             } else {
                 for (const auto& [item, depth] : rows_) {
                     auto name = ts_name(item->data.view());
@@ -415,27 +412,27 @@ class ts_view {
                     name = std::string(depth * 2, ' ') + (tree_ && ts_flag(item->data["children"]) ? item->expanded ? "- " : "+ " : "") + name;
                     const auto scope = item->owner.lock(); const bool current = scope && scope->error.empty();
                     auto entry = line(name, current ? ts_state(item->data.view()) : "Unavailable", current && item->cpu ? ts_percent(*item->cpu) : "--", current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--");
-                    if (ts_text(item->data["state"]) == "failed") entry |= color(Color::Red);
-                    if (item->key == selection_) entry = entry | inverted | focus;
+                    if (ts_text(item->data["state"]) == "failed") entry |= ftxui::color(ftxui::Color::Red);
+                    if (item->key == selection_) entry = entry | ftxui::inverted | ftxui::focus;
                     rows.push_back(entry);
                 }
-                if (rows.empty()) rows.push_back(text(root_->error.empty() ? root_->identity ? "No programs" : "Loading..." : root_->error) | dim);
+                if (rows.empty()) rows.push_back(ftxui::text(root_->error.empty() ? root_->identity ? "No programs" : "Loading..." : root_->error) | ftxui::dim);
             }
-            parts.push_back(vbox(rows) | vscroll_indicator | yframe | flex);
+            parts.push_back(ftxui::vbox(rows) | ftxui::vscroll_indicator | ftxui::yframe | ftxui::flex);
         }
-        if (!notice_.empty()) parts.push_back(text(notice_) | color(Color::Yellow));
-        parts.push_back(separator());
-        parts.push_back(text(help_ ? " Esc Back" : page_ ? detail_ ? " Esc Back    q Quit" : " Enter Details    / Search    ? Help    q Quit" : detail_ ? " Esc Back    a Actions    q Quit" : " Enter Details    a Actions    / Search    ? Help    q Quit") | dim);
-        auto result = vbox(parts);
+        if (!notice_.empty()) parts.push_back(ftxui::text(notice_) | ftxui::color(ftxui::Color::Yellow));
+        parts.push_back(ftxui::separator());
+        parts.push_back(ftxui::text(help_ ? " Esc Back" : page_ ? detail_ ? " Esc Back    q Quit" : " Enter Details    / Search    ? Help    q Quit" : detail_ ? " Esc Back    a Actions    q Quit" : " Enter Details    a Actions    / Search    ? Help    q Quit") | ftxui::dim);
+        auto result = ftxui::vbox(parts);
         if (menu_) {
             const auto label = [](const std::string& verb) { return verb == "stop" ? "End program" : verb == "restart" ? "Restart" : "Start"; };
-            Elements box{text(ts_name(target_->data.view())) | bold, text("")};
+            ftxui::Elements box{ftxui::text(ts_name(target_->data.view())) | ftxui::bold, ftxui::text("")};
             if (menu_ == 2) {
-                box.push_back(text(std::string{label(actions_[choice_])} + "?"));
-                if (ts_flag(target_->data["children"])) box.push_back(text("Includes its child programs.") | dim);
-                box.push_back(text("")); box.push_back(text("Enter Confirm   Esc Cancel") | dim);
-            } else for (size_t i = 0; i < actions_.size(); ++i) box.push_back(text(label(actions_[i])) | (int(i) == choice_ ? inverted : nothing));
-            result = dbox({result, vbox(box) | border | clear_under | bgcolor(Color::Black) | size(WIDTH, EQUAL, std::min(40, int(terminal_.columns()) - 4)) | center});
+                box.push_back(ftxui::text(std::string{label(actions_[choice_])} + "?"));
+                if (ts_flag(target_->data["children"])) box.push_back(ftxui::text("Includes its child programs.") | ftxui::dim);
+                box.push_back(ftxui::text("")); box.push_back(ftxui::text("Enter Confirm   Esc Cancel") | ftxui::dim);
+            } else for (size_t i = 0; i < actions_.size(); ++i) box.push_back(ftxui::text(label(actions_[i])) | (int(i) == choice_ ? ftxui::inverted : ftxui::nothing));
+            result = ftxui::dbox({result, ftxui::vbox(box) | ftxui::border | ftxui::clear_under | ftxui::bgcolor(ftxui::Color::Black) | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, std::min(40, int(terminal_.columns()) - 4)) | ftxui::center});
         }
         return result;
     }

@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <expected>
 #include <test/test.hpp>
 
@@ -118,15 +119,15 @@ consteval auto sv39_pte_representation_contract() noexcept -> bool {
     }
 
     const auto leaf =
-        arch::Pte::leaf_4k(
+        arch::Pte::leaf(
             page,
             arch::PtPerm::Rw);
     const auto user_rx =
-        arch::Pte::leaf_4k(
+        arch::Pte::leaf(
             page,
             arch::PtPerm::UserRx);
     const auto user_rw =
-        arch::Pte::leaf_4k(
+        arch::Pte::leaf(
             page,
             arch::PtPerm::UserRw);
 
@@ -199,7 +200,7 @@ consteval auto sv39_pte_representation_contract() noexcept -> bool {
         && !write_without_read.is_leaf()
         && !write_without_read.is_non_leaf()
         && !arch::Pte::non_leaf(invalid_page)
-        && !arch::Pte::leaf_4k(
+        && !arch::Pte::leaf(
             invalid_page,
             arch::PtPerm::Rw);
 }
@@ -871,6 +872,26 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
     return pmm.free_page_count() == free && pmm.verify_invariants();
 }
 
+bool test_direct_large_leaf(const TestContext&) noexcept {
+    PmmFixture fixture{primary_memory_storage, make_available_map(384)};
+    if (!fixture) return false;
+    auto& pmm = fixture.memory();
+    const auto free = pmm.free_page_count();
+    {
+        auto table = mm::PageTable::create(pmm, mm::PageTable::Kind::Kernel);
+        constexpr mm::Page physical{0x20000};
+        const mm::va_t address{mm::DirectBegin + physical.base().raw()};
+        const auto first = *mm::VPage::from_base(address);
+        if (!table || !table->map_direct(address, mm::Pages{physical, 513}) || table->page_count() != 258) return false;
+        const auto last = table->query(*first.checked_add(511)), tail = table->query(*first.checked_add(512));
+        if (!last || last->page != *physical.checked_add(511) || last->pages != 512
+            || !tail || tail->pages != 1 || tail->page != *physical.checked_add(512)) return false;
+        if (table->unmap(first) || table->protect(first, arch::PtPerm::Ro)) return false;
+        if (!table->query(first) || !table->unmap(*first.checked_add(512))) return false;
+    }
+    return pmm.free_page_count() == free && pmm.verify_invariants();
+}
+
 bool test_initial_page_table_exhaustion_rolls_back(
     const TestContext&) noexcept {
     PmmFixture fixture{
@@ -1002,6 +1023,7 @@ bool test_node_key_survives_page_reuse(const TestContext&) noexcept {
 
 void register_allocator_tests(TestRegistry& registry) noexcept {
     (void)registry.add("pmm", "page tables share, reserve and retire actual frames", test_tables_share_reserve_and_retire);
+    (void)registry.add("pmm", "direct map uses permanent large leaves", test_direct_large_leaf);
     (void)registry.add("slab", "returning a page cannot resurrect an old node key", test_node_key_survives_page_reuse);
     (void)registry.add("pmm", "owned page destruction releases its frame", test_allocate_owner_releases_on_destruction);
     (void)registry.add("pmm", "move transfers the only release authority", test_owned_page_move_transfers_release_authority);

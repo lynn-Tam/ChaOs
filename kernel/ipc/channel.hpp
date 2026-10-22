@@ -1,4 +1,6 @@
 #pragma once
+#include <mm/slab.hpp>
+#include <op.hpp>
 
 #include <cap/cspace.hpp>
 #include <cap/grant.hpp>
@@ -44,7 +46,9 @@ struct ChannelConfig final {
 // read/write sources; subscriptions belong to the receiving Port.
 class Channel final : private libk::noncopyable_nonmovable {
 public:
+    auto op() noexcept -> Op& { return initialization_; }
     void bind_work(WorkQueue& work, object::Key key) noexcept {
+        work_ = &work; job_.bind(key); initialization_.bind(work, key);
         for (auto& side : sides_) { side.rx.bind_work(work, key); side.tx.bind_work(work, key); }
     }
     template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
@@ -111,7 +115,7 @@ public:
     Channel(mm::Pmm& pmm, ChannelConfig config = {}) noexcept;
     ~Channel() noexcept;
 
-    [[nodiscard]] auto open() noexcept -> std::expected<void, ChannelError>;
+    [[nodiscard]] auto open() noexcept -> status_t;
     [[nodiscard]] auto send(
         cap::Resolved<Channel>& cap,
         cap::CSpace& source,
@@ -169,7 +173,6 @@ private:
     void side_invalidated(SideLink& link, object::LinkWork&& work) noexcept;
     void side_released(SideLink&, object::LinkWork&&) noexcept;
     void detach_side(SideLink& link) noexcept;
-    auto take_cleanup() noexcept -> object::cleanup;
     void try_finish_retire() noexcept;
     [[nodiscard]] auto side(ChannelSide value) noexcept -> Side&;
     [[nodiscard]] auto side(ChannelSide value) const noexcept -> const Side&;
@@ -183,7 +186,10 @@ private:
     void discard_message(Message& message, bool committed = false) noexcept;
     void discard_escrows(std::span<Escrow>, bool committed = false) noexcept;
     void release_message(Message& message) noexcept;
-    void clear_queues() noexcept;
+    auto clear_queues(usize budget) noexcept -> bool;
+    void post() noexcept { work_->post(job_); }
+    void run_work() noexcept;
+    void advance() noexcept;
     [[nodiscard]] auto send_caps(cap::Resolved<Channel>&, cap::CSpace&, const ChanMsg&, cap::Capability* = nullptr) noexcept -> std::expected<u64, ChannelError>;
     [[nodiscard]] auto enqueue(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>, bool called) noexcept -> std::expected<u64, ChannelError>;
     auto reply(cap::Resolved<Channel>&, const ChanMsg&, std::span<Escrow>) noexcept -> std::expected<u64, ChannelError>;
@@ -211,6 +217,11 @@ private:
     Side sides_[2];
     SideLink side_links_[2];
     usize calls_{};
+    bool advancing_{};
+    WorkQueue* work_{};
+    Work job_{Work::Fn::bind<&Channel::run_work>(*this)};
+    status_t init_status_{STATUS_PENDING};
+    Op initialization_{{}, Source::Action::bind<&Channel::post>(*this), Source::Action::bind<&Channel::advance>(*this)};
     std::atomic<bool> opened_{}, closing_{};
     object::cleanup cleanup_{};
 };

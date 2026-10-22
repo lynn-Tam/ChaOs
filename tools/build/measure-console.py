@@ -11,15 +11,18 @@ import subprocess
 import time
 
 def run(args, disk, trace=None):
+    # The bootstrap device policy selects the first PCI block function.
+    # Match production console/storage: writable data first, probe second.
     command = [args.qemu, "-machine", "virt,iommu-sys=on", "-smp", str(args.smp),
                "-nographic", "-bios", "default", "-kernel", args.kernel,
                "-initrd", args.bundle,
                "-drive", f"if=none,id=boot,format=raw,readonly=on,file={args.boot}",
-               "-device", "virtio-blk-pci,addr=1,drive=boot,disable-legacy=on,iommu_platform=on",
+               "-device", "virtio-blk-pci,addr=2,drive=boot,disable-legacy=on,iommu_platform=on",
                "-drive", f"if=none,id=data,format=raw,file={disk}",
-               "-device", "virtio-blk-pci,addr=2,drive=data,disable-legacy=on,iommu_platform=on"]
+               "-device", "virtio-blk-pci,addr=1,drive=data,disable-legacy=on,iommu_platform=on"]
     if trace is not None:
         command += ["-trace", f"enable=virtio_blk_*,file={trace}"]
+    boot_started = time.monotonic()
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     poll = selectors.DefaultSelector()
@@ -41,23 +44,31 @@ def run(args, disk, trace=None):
 
     times = {}
     try:
+        until(b"uart: console ready", 0)
+        times["uart_ready"] = time.monotonic() - boot_started
         until(b"/ > ", 0)
+        times["shell_ready"] = time.monotonic() - boot_started
         for label, command, expected in (
             ("echo_cold", "echo baseline", b"baseline"),
             ("echo_hot", "echo baseline", b"baseline"),
+            ("boot_ls_cold", "ls /boot", b"cat.elf"),
+            ("boot_ls_hot", "ls /boot", b"cat.elf"),
+            ("boot_deps", "svc", b"store idle"),
             ("cat_cold", "cat /boot/README.TXT", b"myos disk file service"),
             ("cat_hot", "cat /boot/README.TXT", b"myos disk file service"),
             ("ls_cold", "ls", b"boot"),
             ("ls_hot", "ls", b"boot"),
-            ("write", "write phase0 hello", b"/ > "),
+            ("write", "fs write phase0 hello", b"/ > "),
             ("cat_written", "cat phase0", b"hello"),
         ):
             start = len(output)
-            for byte in command.encode() + b"\r":
+            for byte in command.encode():
                 process.stdin.write(bytes([byte]))
                 process.stdin.flush()
                 time.sleep(0.003)
             began = time.monotonic()
+            process.stdin.write(b"\r")
+            process.stdin.flush()
             until(b"/ > ", start)
             duration = time.monotonic() - began
             transcript = output[start:]

@@ -236,6 +236,8 @@ struct proc_image {
     cap_t memory{};
     uint64_t offset{};
     word_t perms{VM_READ};
+    static auto map(vm_area&, cap_owner, uint64_t offset, uint64_t size, word_t perms = VM_READ)
+        -> std::expected<proc_image, status_t>;
 };
 
 struct proc_layout {

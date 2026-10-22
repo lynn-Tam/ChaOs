@@ -91,6 +91,7 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
             case syscall::Disposition::Retry:
                 thread->park(disposition == syscall::Disposition::Park);
                 return;
+            case syscall::Disposition::Continue:
             case syscall::Disposition::Yield:
                 cpu.dispatcher().request_reschedule(
                     sched::DispatchReason::Yield);

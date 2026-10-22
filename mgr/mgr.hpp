@@ -6,10 +6,15 @@
 #include <map>
 
 inline constexpr word_t mgr_observe = 1, mgr_control = 2, mgr_create = 4, mgr_debug = 8;
+enum class mgr_state { Idle, Loading, Running, Draining, Failed };
+inline constexpr auto mgr_state_name(mgr_state state) -> std::string_view {
+    constexpr std::string_view names[]{"idle", "loading", "running", "draining", "failed"};
+    return names[std::to_underlying(state)];
+}
 // One deployment owns its environment, immutable recipe and current execution.
 // Scope is always owned, never an optional external lifetime patch.
 struct mgr_child {
-    uint64_t id{}, gen{}, version{1}, environment{}, quota{32};
+    uint64_t id{}, gen{}, version{1}, environment{}, capacity{32};
     std::string name, image;
     std::vector<std::string> args, env;
     uint32_t cpu{};
@@ -28,7 +33,7 @@ struct mgr_child {
     std::deque<ubus_msg> inbox;
     bool received{}, desired{}, restart{}, relaunch{}, removing{}, reusable{true};
     std::unique_ptr<proc_task> task;
-    std::string_view state{"idle"};
+    mgr_state state{mgr_state::Idle};
     status_t result{};
 };
 
@@ -53,7 +58,7 @@ class mgr {
     struct loan {
         uint64_t source{}, gen{}, authority{};
         cap_owner quota;
-        ev_watch drained;
+        ev_watch drained{};
     };
     std::map<uint64_t, loan> loans_;
     uint64_t next_loan_{};
@@ -62,16 +67,18 @@ class mgr {
     std::deque<std::shared_ptr<mgr_child>> children_;
     std::map<uint64_t, publication> publications_;
     std::vector<std::unique_ptr<pending>> pending_;
-    struct view {
+    struct facet {
         uint64_t parent{}, target{}, run{};
         word_t rights{};
         bool closed{};
+        uint64_t grant{};
+        ev_watch drained{};
     };
-    std::map<word_t, view> views_;
-    ubus_object object_{"ubus.environment", 1, 0,
+    std::map<word_t, facet> facets_;
+    ubus_object object_{"ubus.environment", 2, 0,
         [this](word_t facet, std::string_view method) { return access(facet, method); }};
-    uint64_t next_{}, next_environment_{3}, next_publication_{}, identity_{}, epoch_{1}, deadline_{};
-    size_t max_pending_{128};
+    uint64_t next_{}, next_badge_{3}, next_publication_{}, identity_{}, cspace_id_{}, epoch_{1}, deadline_{};
+    size_t capacity_{128};
     std::function<std::expected<proc_image, status_t>(mgr_child&)> load_;
     auto environment(word_t) -> mgr_child*;
     auto live(word_t) -> bool;

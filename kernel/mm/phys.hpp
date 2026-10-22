@@ -1,4 +1,5 @@
 #pragma once
+#include <mm/slab.hpp>
 
 #include <mm/pmm.hpp>
 #include <object/ref.hpp>

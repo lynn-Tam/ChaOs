@@ -254,7 +254,9 @@ struct st_open final {
         if (status != STATUS_OK) return status;
         auto handle = object.handle(0, RIGHT_SEND);
         if (!handle) return handle.error();
-        reply.data.cap("handle", *reply.give(std::move(*handle)));
+        const auto handle_idx = reply.give(std::move(*handle));
+        if (!handle_idx) return handle_idx.error();
+        reply.data.cap("handle", *handle_idx);
         return STATUS_OK;
     }
 
@@ -770,8 +772,11 @@ int main(int argc, char** argv) {
     for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 2>{{
         {"files", st_lookup | st_modify | st_execute}, {"admin", st_admin}}}) {
         auto connector = directory.connector(rights); if (!connector) return connector.error();
-        ubus_msg request, response; request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
-            .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+        ubus_msg request, response;
+        const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+        if (!peer_idx) return peer_idx.error();
+        request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
+            .cap("connector", *peer_idx);
         status = bus.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     }
     for (;;) {

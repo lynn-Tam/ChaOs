@@ -1424,10 +1424,11 @@ bool test_scope_close_is_independent_from_quota(const TestContext&) noexcept {
     if (!active) return false;
     std::optional<cap::Resolved<sched::Sc>> held{std::move(*active)};
     if (scope->close() != object::Scope::Phase::Closing
-        || fixture.a().resolve<sched::Sc>(*handle, inspect_rights)
         || quota->state() != resource::Quota::Phase::Open
         || scope->events().snapshot().value != STATE_CLOSING
         || quota->events().snapshot().value != STATE_OPEN) return false;
+    fixture.drain(); // Closure propagates in finite work; accepted pins still drain.
+    if (fixture.a().resolve<sched::Sc>(*handle, inspect_rights)) return false;
     held.reset(); fixture.drain();
     if (scope->info(0).state != OBJECT_DRAINED || scope->events().snapshot().value != STATE_DRAINED
         || scope->info(0).members
@@ -1483,7 +1484,9 @@ bool test_scope_adopt_keeps_quota(const TestContext&) noexcept {
         || destination->inspect(destination.id(), {}, OBJ_KINDS, page) != STATUS_OK || page.count != 1
         || page.records[0].epoch != 2) return false;
     if (quota->close() != resource::Quota::Phase::Closing || !target.live()
-        || source->close() != object::Scope::Phase::Drained || !target.admit()) return false;
+        || source->close() != object::Scope::Phase::Closing || !target.admit()) return false;
+    fixture.drain();
+    if (source->info(0).state != OBJECT_DRAINED || !target.live()) return false;
     (void)destination->close(); fixture.drain();
     if (destination->info(0).state != OBJECT_DRAINED || target.live() || quota->available() != charged) return false;
     target.reset(); fixture.drain();

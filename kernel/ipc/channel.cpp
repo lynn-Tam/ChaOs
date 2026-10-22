@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <algorithm>
 #include <array>
 #include <expected>
@@ -69,9 +70,7 @@ Channel::Channel(mm::Pmm& pmm, ChannelConfig config) noexcept
 
 Channel::~Channel() noexcept {
     libk_assert(!cleanup_ && !calls_);
-    clear_queues();
-    for (auto& side : sides_) while (!side.free.empty())
-        messages_.destroy(side.free.pop_front());
+    for (const auto& side : sides_) libk_assert(side.queue.empty() && side.free.empty());
     libk_assert(messages_.live_count() == 0);
     for (SideLink& link : side_links_) {
         libk_assert(!link.attachment.attached() && !link.attachment.busy());
@@ -86,38 +85,44 @@ void Channel::bind_allocation(
     quota_ = source.quota();
 }
 
-auto Channel::open() noexcept -> std::expected<void, ChannelError> {
+auto Channel::open() noexcept -> status_t {
     if (config_.queue_capacity == 0
         || config_.queue_capacity > CHANNEL_MAX_QUEUE
         || config_.max_words == 0
         || config_.max_words > CHANNEL_MAX_WORDS
         || config_.max_caps > CHANNEL_MAX_CAPS) {
-        return std::unexpected(ChannelError::Invalid);
+        return STATUS_BAD_ARGS;
     }
     {
         sync::Lock guard{lock_};
         if (opened_) {
-            return std::unexpected(ChannelError::Busy);
+            return STATUS_BUSY;
         }
     }
 
     // Creation pays for every message cell. Operational paths only
     // move intrusive links and never grow backing storage.
+    usize budget = 64;
     for (usize i = 0; i < 2; ++i) {
         auto& queue = sides_[i];
         while (queue.free.size() < config_.queue_capacity) {
+            if (!budget) return STATUS_PENDING;
+            --budget;
             auto made = messages_.create(quota_);
-            if (!made) return std::unexpected(ChannelError::ResourceExhausted);
+            if (!made) return STATUS_NO_MEMORY;
             made.value()->destination = i ? ChannelSide::B : ChannelSide::A;
-            queue.free.push_back(*made.value());
+            sync::Lock guard{queue.lock}; queue.free.push_back(*made.value());
         }
     }
     sync::Lock guard{lock_};
     if (opened_) {
-        return std::unexpected(ChannelError::Busy);
+        return STATUS_BUSY;
     }
-    opened_ = true;
-    return {};
+    if (!initialization_.query().sequence) {
+        opened_ = true; guard.restore();
+        initialization_.accept(); initialization_.finish();
+    }
+    return STATUS_OK;
 }
 
 auto Channel::bind_side_root(
@@ -612,7 +617,6 @@ void Channel::retire(object::cleanup&& cleanup) noexcept {
     }
     static_cast<void>(close(ChannelSide::A));
     static_cast<void>(close(ChannelSide::B));
-    clear_queues();
     for (auto& side : sides_) { side.rx.close(); side.tx.close(); }
     for (SideLink& link : side_links_) {
         detach_side(link);
@@ -661,16 +665,12 @@ void Channel::side_invalidated(
 
 void Channel::side_released(SideLink& link, object::LinkWork&& terminal) noexcept {
     Flight flight{*this};
-    object::cleanup done;
     {
         sync::Lock guard{lock_};
         terminal.reset();
-        if (!link.attachment.attached() && !link.attachment.busy()) {
-            link.attachment.reset();
+        if (!link.attachment.attached() && !link.attachment.busy()) link.attachment.reset();
     }
-    done = take_cleanup();
-    }
-    if (done) done.complete();
+    try_finish_retire();
 }
 
 
@@ -684,33 +684,72 @@ void Channel::detach_side(SideLink& link) noexcept {
     }
 }
 
-auto Channel::take_cleanup() noexcept -> object::cleanup {
-    libk_assert(lock_.held());
-    if (!cleanup_ || !closing_
-        || calls_) {
-        return {};
-    }
-    for (const auto& side : sides_) if (!side.rx.drained() || !side.tx.drained()) return {};
-    for (const SideLink& link : side_links_) {
-        if (link.attachment.attached() || link.attachment.busy()
-            || link.work) {
-            return {};
-        }
-    }
-    return std::move(cleanup_);
-}
-
-
 void Channel::finish_call() noexcept {
-    object::cleanup done;
-    { sync::Lock guard{lock_}; libk_assert(calls_); --calls_; done = take_cleanup(); }
-    if (done) done.complete();
+    { sync::Lock guard{lock_}; libk_assert(calls_); --calls_; }
+    try_finish_retire();
 }
 
 void Channel::try_finish_retire() noexcept {
+    bool retiring;
+    { sync::Lock guard{lock_}; retiring = bool(cleanup_); }
+    if (retiring) post();
+}
+
+void Channel::run_work() noexcept {
+    const auto phase = initialization_.query().sequence;
+    if (phase && phase != OP_DONE && initialization_.schedule()) return;
+    advance();
+}
+
+void Channel::advance() noexcept {
+    bool retiring;
+    {
+        sync::Lock guard{lock_};
+        if (advancing_) { post(); return; }
+        retiring = bool(cleanup_);
+        if (retiring && calls_) return;
+        advancing_ = true;
+    }
+    libk::scope_exit advanced{[&]() noexcept { sync::Lock guard{lock_}; advancing_ = false; }};
+    const auto phase = initialization_.query().sequence;
+    if (phase && phase != OP_DONE) {
+        if (retiring) (void)initialization_.cancel();
+        if (init_status_ == STATUS_PENDING) {
+            init_status_ = initialization_.canceled() ? STATUS_CANCELED : open();
+            if (init_status_ == STATUS_PENDING) { initialization_.post(); return; }
+            if (init_status_ == STATUS_OK) {
+                if (initialization_.commit()) opened_ = true;
+                else init_status_ = STATUS_CANCELED;
+            }
+        }
+        if (!initialization_.detach()) { initialization_.post(); return; }
+        initialization_.finish(init_status_);
+        if (retiring) post();
+        return;
+    }
+    if (!retiring) return;
+    if (!clear_queues(8)) { post(); return; }
     object::cleanup done;
-    { sync::Lock guard{lock_}; done = take_cleanup(); }
-    if (done) done.complete();
+    {
+        sync::Lock guard{lock_};
+        if (!cleanup_ || calls_) return;
+        for (const auto& side : sides_) if (!side.rx.drained() || !side.tx.drained()) return;
+        for (const SideLink& link : side_links_) {
+            if (link.attachment.attached() || link.attachment.busy()
+                || link.work) {
+                return;
+            }
+        }
+        done = std::move(cleanup_);
+    }
+    usize budget = 8;
+    for (auto& side : sides_) while (budget && !side.free.empty()) { --budget; messages_.destroy(side.free.pop_front()); }
+    if (messages_.live_count() || !messages_.drain(8)) {
+        { sync::Lock guard{lock_}; cleanup_ = std::move(done); }
+        post(); return;
+    }
+    work_->close(job_);
+    initialization_.retire(std::move(done));
 }
 
 void Channel::discard_message(Message& message, bool committed) noexcept {
@@ -742,7 +781,7 @@ void Channel::release_message(Message& message) noexcept {
     for (auto& publication : publications) publication.publish();
 }
 
-void Channel::clear_queues() noexcept {
+auto Channel::clear_queues(usize budget) noexcept -> bool {
     for (usize side_index_value = 0; side_index_value < 2; ++side_index_value) {
         for (;;) {
             Message* message{};
@@ -752,6 +791,8 @@ void Channel::clear_queues() noexcept {
                 if (current.queue.empty()) {
                     break;
                 }
+                if (!budget) return false;
+                --budget;
                 message = &current.queue.pop_front();
                 if (current.call == message) { current.call = nullptr; current.call_done = false; }
             }
@@ -760,6 +801,7 @@ void Channel::clear_queues() noexcept {
             release_message(*message);
         }
     }
+    return true;
 }
 
 auto Channel::make_escrow(

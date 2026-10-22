@@ -53,8 +53,7 @@ void Dispatcher::publish(Thread* target) noexcept {
     const usize stack_top = target->transient() ? cpu_.init_stack->top() : target->stack_top();
     libk_assert(stack_top != 0 && (stack_top & 0xfU) == 0);
 
-    Env& roots = target->env();
-    roots.root().activate(cpu_);
+    target->env().root().activate(cpu_);
     cpu_.current = target;
     cpu_.entry.stack = stack_top;
 }
@@ -160,14 +159,16 @@ void Dispatcher::domain_ready(Domain::Local& local) noexcept {
 }
 void Dispatcher::post(Domain::Local& local) noexcept {
     auto ticket = object::ref<>::retain_alive(local.owner.close_work_.key());
+    bool queued{};
     { sync::Lock guard{mail_lock_};
       if (!local.mailed) {
           local.mailed = true; local.ticket = std::move(ticket);
           local.owner.pending_mail_.fetch_add(1, std::memory_order_relaxed);
           domains_.push_back(local);
+          queued = true;
       }
     }
-    static_cast<void>(kick_remote());
+    if (queued) static_cast<void>(kick_remote());
 }
 void Dispatcher::drain_domains() noexcept {
     libk_assert(arch::local()->depth == 0);
@@ -221,7 +222,7 @@ auto Dispatcher::reserve(Thread& candidate, u64 now) noexcept -> bool {
             return false;
         }
     }
-    loan_ = sc ? sc->budget_.reserve(now, duration) : Budget::Loan{};
+    loan_ = sc && sc->config_.budget ? sc->budget_.reserve(now, duration) : Budget::Loan{};
     duration_ = sc && sc->config_.budget ? loan_.amount : duration;
     libk_assert(duration_);
     current_sc_ = sc; current_branch_ = branch;
@@ -229,13 +230,13 @@ auto Dispatcher::reserve(Thread& candidate, u64 now) noexcept -> bool {
 }
 void Dispatcher::settle(u64 now) noexcept {
     const auto elapsed = std::exchange(loan_elapsed_, 0);
-    if (current_sc_) current_sc_->budget_.settle(std::exchange(loan_, {}), now, elapsed);
+    if (current_sc_ && loan_.generation) current_sc_->budget_.settle(std::exchange(loan_, {}), now, elapsed);
     while (ticket_count_) {
         const auto ticket = tickets_[--ticket_count_];
-        ticket.domain->budget_.settle(ticket.loan, now, elapsed);
+        const bool available = ticket.domain->budget_.settle(ticket.loan, now, elapsed);
         // A CPU blocked solely by outstanding escrow needs a real return
         // event; an arbitrary timer retry could spend the same credit twice.
-        if (ticket.domain->accepting() && ticket.domain->budget_.info(now).available) ticket.domain->notify();
+        if (ticket.domain->accepting() && available) ticket.domain->notify();
     }
 }
 auto Dispatcher::select(u64 now) noexcept -> Thread* {
@@ -328,7 +329,7 @@ void Dispatcher::refresh(Thread& t) noexcept {
     }
 }
 void Dispatcher::request_control(Thread& t) noexcept {
-    post(t, Control); static_cast<void>(kick_remote());
+    if (post(t, Control)) static_cast<void>(kick_remote());
 }
 auto Dispatcher::accept_wake(Thread& t) noexcept -> WakeAcceptance {
     if (t.home_.load(std::memory_order_acquire) != this) { post(t, Wake); return WakeAcceptance::Accepted; }
@@ -343,7 +344,7 @@ auto Dispatcher::accept_wake(Thread& t) noexcept -> WakeAcceptance {
     t.wake_credit_ = true;
     return WakeAcceptance::Accepted;
 }
-void Dispatcher::post(Thread& t, u8 actions) noexcept {
+auto Dispatcher::post(Thread& t, u8 actions) noexcept -> bool {
     Dispatcher* destination;
     { sync::Lock guard{mail_lock_};
       destination = t.home_.load(std::memory_order_acquire);
@@ -351,13 +352,15 @@ void Dispatcher::post(Thread& t, u8 actions) noexcept {
           t.actions_ |= actions;
           if (!t.mailed_.exchange(true, std::memory_order_acq_rel)) {
               t.mail_hold_.emplace(t.roots_.hold()); mail_.push_back(t);
+              return true;
           }
-          return;
+          return false;
       }
     }
     // A stale route carries only intent. The new home alone mutates execution
     // state; the old mailbox lock serializes this check with ownership transfer.
-    if (destination) { destination->post(t, actions); static_cast<void>(destination->kick_remote()); }
+    if (destination && destination->post(t, actions)) static_cast<void>(destination->kick_remote());
+    return false;
 }
 auto Dispatcher::migrate(Thread& t) noexcept -> bool {
     Dispatcher* destination;
@@ -399,7 +402,7 @@ auto Dispatcher::migrate(Thread& t) noexcept -> bool {
         if (ready) enqueue(t);
         return false;
     }
-    destination->post(t, Control); static_cast<void>(destination->kick_remote());
+    if (destination->post(t, Control)) static_cast<void>(destination->kick_remote());
     return true;
 }
 void Dispatcher::complete(Thread& t) noexcept {
@@ -421,14 +424,13 @@ auto Dispatcher::kick_remote() noexcept -> WakeResult {
     panic("IPI delivery failed");
 }
 auto Dispatcher::post_wake(Thread& t) noexcept -> WakeResult {
-    post(t, Wake);
-    return kick_remote();
+    return post(t, Wake) ? kick_remote() : WakeResult{};
 }
 void Dispatcher::request_stop(Thread& t) noexcept {
     // Even local Stop is mailed: callbacks can retire their target at return.
-    post(t, Stop);
+    const bool queued = post(t, Stop);
     if (Cpu::local() == &cpu_) { sync::Irq irq{}; drain_remote(); }
-    else static_cast<void>(kick_remote());
+    else if (queued) static_cast<void>(kick_remote());
 }
 void Dispatcher::drain_remote() noexcept {
     for (;;) {
@@ -555,6 +557,7 @@ void Dispatcher::on_timer() noexcept {
     const u64 now = clock_->rd_ticks();
 
     charge_to(now);
+    timer_.reset();
     arch::mask_timer();
     expire(now);
     request_reschedule(DispatchReason::Timer);
@@ -623,7 +626,7 @@ void Dispatcher::commit(Thread* candidate, DispatchReason reason, u64 now, statu
         remove(*candidate);
         // Reserve fixes the quota and path. A concurrent Stop may change the
         // next admission, but cannot move this outstanding loan to maintenance.
-        libk_assert(duration_ && ((current_sc_ && loan_.generation) || current_branch_));
+        libk_assert(duration_ && (current_sc_ || current_branch_));
         for (auto* branch = current_branch_; branch; branch = branch->parent)
             branch->domain->local(id()).active.store(true, std::memory_order_release);
         candidate->set_state(Thread::State::Running);
@@ -660,8 +663,11 @@ void Dispatcher::set_timer(u64 now) noexcept {
     if ((current_sc_ || current_branch_) && deadline <= now) request_reschedule(DispatchReason::Timer);
     if (const auto* d = deadlines_.minimum()) deadline = std::min(deadline, d->when_);
     deadline = std::max(deadline, now);
+    if (timer_ == deadline) return;
     const auto programmed = arch::program_timer(deadline);
-    if (!programmed) {
+    if (programmed) timer_ = deadline;
+    else {
+        timer_.reset();
         has_timer_ = false;
         arch::mask_timer();
     }

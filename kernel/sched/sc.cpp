@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <sched/sc.hpp>
 #include <op.hpp>
 #include <sched/dispatcher.hpp>
@@ -66,11 +67,12 @@ void Budget::record(u64 now, u64 elapsed) noexcept {
         auto& last = refills_.back(); last.ready = std::max(last.ready, ready); last.amount += elapsed;
     } else libk_assert(refills_.try_emplace_back(Refill{ready, elapsed}));
 }
-void Budget::settle(Loan loan, u64 now, u64 elapsed) noexcept {
+auto Budget::settle(Loan loan, u64 now, u64 elapsed) noexcept -> bool {
     sync::Lock guard{lock_};
     libk_assert(loan.generation == generation_ && loan.amount <= escrow_);
     balance_ += static_cast<__int128>(loan.amount); escrow_ -= loan.amount;
     record(now, elapsed);
+    return !amount_ || balance_ > 0;
 }
 auto Budget::consume(u64 now, u64 elapsed) noexcept -> u64 {
     sync::Lock guard{lock_};

@@ -48,7 +48,7 @@ public:
     auto info(u64 now) const noexcept -> Info;
     auto next_refill() const noexcept -> u64;
     auto reserve(u64 now, u64 limit) noexcept -> Loan;
-    void settle(Loan, u64 now, u64 elapsed) noexcept;
+    auto settle(Loan, u64 now, u64 elapsed) noexcept -> bool;
     auto consume(u64 now, u64 elapsed) noexcept -> u64;
     auto configure(u64 amount, u64 period, usize capacity, u64 now) noexcept -> bool;
 private:

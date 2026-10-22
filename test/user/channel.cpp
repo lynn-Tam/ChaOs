@@ -37,6 +37,51 @@ static void capacity(const rt_env& env) {
         }
     }
 }
+static void initialization(const rt_env& env) {
+    const auto made = sys::port_create(env.alloc(), 257, 1);
+    check(made.status == STATUS_PENDING);
+    cap_owner port{made.value};
+    expect(op_wait(port.selector()).status);
+    check(sys::source_info(port.selector()).value == 0);
+    expect(sys::object_destroy(port.selector()).status);
+    const auto abandoned = sys::port_create(env.alloc(), 257, 1);
+    check(abandoned.status == STATUS_PENDING); cap_owner partial_port{abandoned.value};
+    expect(sys::object_destroy(partial_port.selector()).status);
+    const auto server = sys::pager_create(env.alloc());
+    expect(server.status); cap_owner pager{server.value};
+    const auto memory = sys::memory_create_pager(env.alloc(), 1024 * 4096, VM_READ | VM_WRITE, pager.selector(), 0, 1024);
+    check(memory.status == STATUS_PENDING);
+    cap_owner backing{memory.value};
+    expect(op_wait(backing.selector()).status);
+    expect(sys::object_destroy(backing.selector()).status);
+    const auto canceled = sys::memory_create_pager(env.alloc(), 1024 * 4096, VM_READ | VM_WRITE, pager.selector(), 0, 1024);
+    check(canceled.status == STATUS_PENDING); cap_owner partial_mem{canceled.value};
+    expect(sys::object_destroy(partial_mem.selector()).status);
+    expect(sys::object_destroy(pager.selector()).status);
+    // Destroying unpublished initialization cancels its remaining domain work.
+    const auto partial = sys::channel_create(env.alloc(), 129, CHANNEL_MAX_WORDS, 0);
+    check(partial.status == STATUS_PENDING);
+    cap_owner a{partial.value}, b{partial.value2};
+    expect(sys::object_destroy(a.selector()).status);
+}
+static void control_paths(const rt_env& env) {
+    std::array<cap_owner, 96> scopes;
+    cap_t parent = env.scope;
+    for (auto& scope : scopes) {
+        const auto created = sys::scope_create({env.quota, parent});
+        expect(created.status); scope = cap_owner{created.value}; parent = scope.selector();
+    }
+    const auto created = sys::scope_create(env.alloc());
+    expect(created.status); cap_owner moved{created.value};
+    const auto adopted = sys::scope_adopt(moved.selector(), env.scope, parent, 1);
+    expect(adopted.status);
+    check(sys::scope_adopt(scopes[0].selector(), env.scope, moved.selector(), 1).status == STATUS_DENIED);
+    const auto loan = sys::quota_create({env.quota, parent}, 65536, 64, OBJ_KINDS);
+    expect(loan.status); cap_owner quota{loan.value};
+    expect(sys::object_reassign(moved.selector(), env.quota, quota.selector(), 1).status);
+    expect(sys::scope_close(scopes[0].selector()).status);
+    expect(sys::wait_one(scopes[0].selector(), STATE_DRAINED).status);
+}
 static void replies(const rt_env& env) {
     ch_pair request, response, handoff;
     expect(request.open(env.alloc(), 1, 2)); expect(response.open(env.alloc(), 1, 2));
@@ -301,7 +346,7 @@ int main(int argc, char** argv) {
     const auto copied = sys::cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(copied.status);
     auto mapping = vm_area::map(rt_vm(), cap_owner{copied.value}, 0, 4096, VM_READ | VM_WRITE); check(bool(mapping));
     uart_port port{mapping->address + console->offset}; port.reset(); output = &port;
-    capacity(env); replies(env); reassign_memory(env); resize_quota(env); port_events(env);
+    capacity(env); initialization(env); control_paths(env); replies(env); reassign_memory(env); resize_quota(env); port_events(env);
     test_image image; open(image, env);
     test_tasks tasks; tasks.open(env.alloc(), rt_root().domain, env.cpus);
     ch_pair data; expect(data.open(env.alloc(), 32, 0));
@@ -309,7 +354,10 @@ int main(int argc, char** argv) {
     expect(sender.status); cap_owner destination{sender.value};
     ubus_object environment{"fixture"};
     expect(environment.add("Receive", {}, {{"message", ubus_type::Record}}, [&](auto&, auto& response) {
-        ubus_data message; message.cap("data", *response.attach(destination.selector(), RIGHT_SEND));
+        ubus_data message;
+        const auto data_idx = response.attach(destination.selector(), RIGHT_SEND);
+        if (!data_idx) return data_idx.error();
+        message.cap("data", *data_idx);
         response.data.put("message", message); return STATUS_OK;
     }));
     expect(environment.open()); auto connector = environment.connector(); check(bool(connector));

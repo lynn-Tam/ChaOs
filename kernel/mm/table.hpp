@@ -8,10 +8,9 @@
 #include <mm/pmm.hpp>
 #include <mm/types.hpp>
 #include <pte.hpp>
-#include <uapi/riscv64.h>
 
 namespace mm {
-inline constexpr usize UserBegin = RISCV64_LOW_GUARD_END;
+inline constexpr usize UserBegin = arch::PtUserBegin;
 inline constexpr usize UserEnd = arch::PtUserEnd;
 inline constexpr usize DirectBegin = arch::PtKernelBegin;
 inline constexpr usize DirectSize = 128ULL * 1024 * 1024 * 1024;
@@ -24,6 +23,7 @@ enum class PtErr : u8 { BadAddr, BadPhys, NoMemory, Exists, Missing, Corrupt };
 struct PtLeaf {
     mm::Page page;
     PtPerm perms;
+    usize pages{1};
 };
 struct PageUsage {
     bool accessed{}, dirty{};
@@ -60,7 +60,7 @@ class PageTable {
     // Exact missing-table count for an ordered set under stable serialization.
     class Count {
       public:
-        bool include(mm::VPage) noexcept;
+        bool include(mm::VPage, int leaf_level = 0) noexcept;
         auto pages() const noexcept -> usize { return pages_; }
 
       private:
@@ -76,6 +76,7 @@ class PageTable {
     auto query(mm::VPage) const noexcept -> std::expected<PtLeaf, PtErr>;
     auto usage(mm::VPage) const noexcept -> std::expected<PageUsage, PtErr>;
     auto clear_usage(mm::VPage) noexcept -> std::expected<PageUsage, PtErr>;
+    auto touch(mm::VPage, Perm) noexcept -> std::expected<bool, PtErr>;
     auto protect(mm::VPage, PtPerm) noexcept -> std::expected<PageUsage, PtErr>;
     auto replace(mm::VPage, mm::Page, PtPerm) noexcept -> std::expected<PageUsage, PtErr>;
     auto unmap(mm::VPage) noexcept -> std::expected<PtRemoved, PtErr>;
@@ -100,6 +101,8 @@ class PageTable {
         }
         return {};
     }
+    // Permanent direct map construction. On failure the unpublished tree is discarded.
+    auto map_direct(mm::va_t, mm::Pages) noexcept -> std::expected<void, PtErr>;
     auto map(mm::va_t va, mm::Pages pages, PtPerm perms) noexcept -> std::expected<void, PtErr> {
         auto first = mm::VPage::from_base(va);
         if (!first || !pages.valid()) return std::unexpected(PtErr::BadAddr);
@@ -113,8 +116,9 @@ class PageTable {
     struct Walk {
         std::array<mm::Page, arch::PtLevels> pages{};
         std::array<arch::Pte *, arch::PtLevels> entries{};
-        int missing{-1};
+        int missing{-1}, level{};
     };
+    auto map_level(mm::VPage, mm::Page, PtPerm, mm::PageGroup&, int) noexcept -> std::expected<void, PtErr>;
     auto walk(mm::VPage) const noexcept -> std::expected<Walk, PtErr>;
     auto leaf(mm::VPage) const noexcept -> std::expected<arch::Pte *, PtErr>;
     auto table(mm::Page) const noexcept -> arch::Pte *;

@@ -146,7 +146,7 @@ public:
     auto pause(const object::ref<>& quota, u64 epoch) noexcept -> status_t;
     void resume() noexcept;
     template<class Commit, class Publish> auto reassign(const object::ref<>& target, const object::ref<>& from,
-        const object::ref<>& to, u64 epoch, Usage& replacement, Release& release, Commit&&, Publish&&) noexcept
+        const object::ref<>& to, u64 epoch, Usage& replacement, Release& release, Commit&&, Publish&&, const object::Control::Check* check = nullptr) noexcept
         -> std::expected<u64, status_t>;
     [[nodiscard]] auto detach() noexcept -> Release;
 
@@ -285,7 +285,7 @@ auto Quota::resize(const object::ref<>& self, Budget target, const object::ref<>
 
 template<class Commit, class Publish>
 auto Allocation::reassign(const object::ref<>& target, const object::ref<>& from, const object::ref<>& to,
-    u64 epoch, Usage& replacement, Release& release, Commit&& commit, Publish&& publish) noexcept -> std::expected<u64, status_t> {
+    u64 epoch, Usage& replacement, Release& release, Commit&& commit, Publish&& publish, const object::Control::Check* check) noexcept -> std::expected<u64, status_t> {
     auto old_quota = from.as<Quota>(), new_quota = to.as<Quota>();
     if (!old_quota || !new_quota || from.id() == to.id()) return std::unexpected(STATUS_BAD_ARGS);
     auto& old = old_quota->get();
@@ -296,8 +296,9 @@ auto Allocation::reassign(const object::ref<>& target, const object::ref<>& from
     if (!reassigning_ || owner_ != &old || epoch_ != epoch) return std::unexpected(STATUS_STALE);
     if (epoch_ == std::numeric_limits<u64>::max()) return std::unexpected(STATUS_NO_MEMORY);
     if (control_) {
-        auto cycle = next.control_.reaches(*control_);
-        if (!cycle) return std::unexpected(STATUS_NO_MEMORY);
+        auto cycle = check ? next.control_.checked(*check, *control_) : next.control_.reaches(*control_);
+        if (!cycle) return std::unexpected(cycle.error() == object::error::stale ? STATUS_STALE
+            : cycle.error() == object::error::pending ? STATUS_PENDING : STATUS_NO_MEMORY);
         if (*cycle) return std::unexpected(STATUS_DENIED);
     }
     auto* first = from.id().value < to.id().value ? &old : &next;
@@ -315,6 +316,7 @@ auto Allocation::reassign(const object::ref<>& target, const object::ref<>& from
         release.owner_ = owner_; release.ref_ = std::move(ref_); release.usage_ = replacement.amount_;
         owner_ = replacement.owner_;
         ref_ = std::move(replacement.ref_);
+        if (control_) object::Control::changed();
         commit();
         replacement.owner_ = nullptr; replacement.amount_ = {};
         ++epoch_;

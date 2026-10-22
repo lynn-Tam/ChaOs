@@ -153,15 +153,7 @@ void PageGroup::append(PageGroup&& src) noexcept {
     owner_->append(*this, src);
 }
 
-auto PageGroup::grow(size_t n) noexcept -> bool {
-    if (n == 0) return true;
-    auto pending = owner().group();
-    for (usize i = 0; i < n; ++i) {
-        if (!pending.allocate()) return false;
-    }
-    append(std::move(pending));
-    return true;
-}
+auto PageGroup::grow(size_t n) noexcept -> bool { return owner().grow(*this, n); }
 
 auto PageGroup::detach(Page page) noexcept -> std::optional<OwnedPage> {
     libk_assert(owner_);
@@ -326,7 +318,7 @@ auto Pmm::initialize() noexcept -> InitializationResult {
     for (auto& arena : arenas_) {
         for (size_t offset = arena.range.page_count(); offset > 0; --offset) {
             const usize index{offset - 1};
-            if (descriptor_at(arena, index).state == State::Free) {
+            if (descriptor_at(arena, index).state() == State::Free) {
                 push_free(arena, index);
             }
         }
@@ -456,7 +448,7 @@ auto Pmm::page_from(usize id) noexcept -> Page {
 }
 
 auto Pmm::next_group_id() noexcept -> usize {
-    libk_assert(next_group_id_ != std::numeric_limits<size_t>::max());
+    libk_assert(next_group_id_ < (Nil >> 2));
     return usize{next_group_id_++};
 }
 
@@ -480,7 +472,7 @@ auto Pmm::find_arena(Page page) const noexcept -> const Arena* {
 
 auto Pmm::push_free(Arena& arena, usize index) noexcept -> void {
     Desc& descriptor = descriptor_at(arena, index);
-    libk_assert(descriptor.state == State::Free);
+    libk_assert(descriptor.state() == State::Free);
     descriptor.next = arena.free_head;
     arena.free_head = index;
     ++arena.free_count;
@@ -492,7 +484,7 @@ auto Pmm::pop_free(Arena& arena) noexcept -> usize {
     }
     const usize index = arena.free_head;
     Desc& descriptor = descriptor_at(arena, index);
-    libk_assert(descriptor.state == State::Free);
+    libk_assert(descriptor.state() == State::Free);
     arena.free_head = descriptor.next;
     descriptor.next = Nil;
     --arena.free_count;
@@ -553,6 +545,28 @@ auto Pmm::allocate_page_into(PageGroup& group) noexcept -> GroupAllocateResult {
     return std::unexpected(AllocError::NoMemory);
 }
 
+auto Pmm::grow(PageGroup& group, usize n) noexcept -> bool {
+    sync::Lock guard{lock_};
+    libk_assert(group.owner_.get() == this);
+    usize available{};
+    for (const auto& arena : arenas_) available += arena.free_count;
+    if (n > available) return false;
+    for (auto& arena : arenas_) {
+        const auto count = std::min(n, arena.free_count);
+        for (usize i = 0; i < count; ++i) {
+            const auto index = pop_free(arena);
+            auto& desc = descriptor_at(arena, index);
+            const auto page = page_at(arena, index);
+            desc = Desc::group(group.id_, group.head_, desc.gen);
+            group.head_ = global_frame_id_of(page);
+        }
+        group.page_count_ += count; outstanding_pages_ += count; outstanding_group_pages_ += count;
+        n -= count;
+        if (!n) break;
+    }
+    return true;
+}
+
 void Pmm::append(PageGroup& dst, PageGroup& src) noexcept {
     sync::Lock guard{lock_};
     libk_assert(dst.owner_.get() == this && src.owner_.get() == this);
@@ -562,8 +576,8 @@ void Pmm::append(PageGroup& dst, PageGroup& src) noexcept {
         Arena* const arena = find_arena(page);
         libk_assert(arena != nullptr);
         Desc& d = descriptor_at(*arena, index_of(*arena, page));
-        libk_assert(d.state == State::Group && d.owner == src.id_);
-        d.owner = dst.id_;
+        libk_assert(d.state() == State::Group && d.owner() == src.id_);
+        d.relabel(dst.id_);
         const usize next = d.next;
         if (next == Nil) d.next = dst.head_;
         index = next;
@@ -587,8 +601,8 @@ auto Pmm::detach_page(PageGroup& group, Page page) noexcept -> std::optional<Own
         Arena* const arena = find_arena(current_page);
         libk_assert(arena != nullptr);
         Desc& descriptor = descriptor_at(*arena, index_of(*arena, current_page));
-        libk_assert(descriptor.state == State::Group);
-        libk_assert(descriptor.owner == group.id_);
+        libk_assert(descriptor.state() == State::Group);
+        libk_assert(descriptor.owner() == group.id_);
 
         if (current_page == page) {
             const usize next = descriptor.next;
@@ -630,8 +644,8 @@ auto Pmm::detach_group_head(PageGroup& group) noexcept -> std::optional<OwnedPag
     Arena* const arena = find_arena(page);
     libk_assert(arena != nullptr);
     Desc& descriptor = descriptor_at(*arena, index_of(*arena, page));
-    libk_assert(descriptor.state == State::Group);
-    libk_assert(descriptor.owner == group.id_);
+    libk_assert(descriptor.state() == State::Group);
+    libk_assert(descriptor.owner() == group.id_);
 
     const usize next = descriptor.next;
     uint32_t generation = descriptor.gen + 1;
@@ -660,7 +674,7 @@ auto Pmm::attach_page(PageGroup& group, OwnedPage& page) noexcept -> bool {
         return false;
     }
     Desc& descriptor = descriptor_at(*arena, index_of(*arena, page.h_.get().page));
-    if (descriptor.state != State::Single || descriptor.gen != page.h_.get().gen) {
+    if (descriptor.state() != State::Single || descriptor.gen != page.h_.get().gen) {
         return false;
     }
 
@@ -673,13 +687,12 @@ auto Pmm::attach_page(PageGroup& group, OwnedPage& page) noexcept -> bool {
 }
 
 auto Pmm::group_contains(const PageGroup& group, Page page) const noexcept -> bool {
-    sync::Lock guard{lock_};
     libk_assert(group.owner_.get() == this);
     const auto* arena = find_arena(page);
     if (!arena) return false;
     const auto& desc = descriptor_at(*arena, index_of(*arena, page));
     // The descriptor is the ownership authority; the chain is only the group's release index.
-    return desc.state == State::Group && desc.owner == group.id_;
+    return desc.owns(group.id_);
 }
 
 auto Pmm::release(Page page, uint32_t generation) noexcept -> void {
@@ -688,7 +701,7 @@ auto Pmm::release(Page page, uint32_t generation) noexcept -> void {
     libk_assert(arena != nullptr);
     const usize index = index_of(*arena, page);
     Desc& descriptor = descriptor_at(*arena, index);
-    libk_assert(descriptor.state == State::Single);
+    libk_assert(descriptor.state() == State::Single);
     libk_assert(descriptor.gen == generation);
     descriptor = Desc::free(generation);
     --outstanding_pages_;
@@ -711,8 +724,8 @@ auto Pmm::release_group_head(PageGroup& group) noexcept -> void {
     const usize index = index_of(*arena, page);
     Desc& descriptor = descriptor_at(*arena, index);
 
-    libk_assert(descriptor.state == State::Group);
-    libk_assert(descriptor.owner == group.id_);
+    libk_assert(descriptor.state() == State::Group);
+    libk_assert(descriptor.owner() == group.id_);
 
     const usize next = descriptor.next;
     const uint32_t generation = descriptor.gen;
@@ -792,7 +805,7 @@ auto Pmm::reclaim(BootPages&& reservation) noexcept -> ReclaimResult {
             return std::unexpected(BootErr::InvalidReservation);
         }
         const Desc& descriptor = descriptor_at(*arena, index_of(*arena, page));
-        if (descriptor.state != State::Reserved || descriptor.owner != id) {
+        if (descriptor.state() != State::Reserved || descriptor.owner() != id) {
             return std::unexpected(BootErr::InvalidReservation);
         }
     }
@@ -830,7 +843,7 @@ auto Pmm::adopt(BootPages&& reservation) noexcept -> AdoptResult {
             return std::unexpected(BootErr::InvalidReservation);
         }
         const Desc& descriptor = descriptor_at(*arena, index_of(*arena, page));
-        if (descriptor.state != State::Reserved || descriptor.owner != reservation_id) {
+        if (descriptor.state() != State::Reserved || descriptor.owner() != reservation_id) {
             return std::unexpected(BootErr::InvalidReservation);
         }
     }
@@ -882,7 +895,7 @@ auto Pmm::state_of(Page page) const noexcept -> QueryResult {
     if (arena == nullptr) {
         return std::unexpected(QueryError::NotManaged);
     }
-    return (public_state_of(descriptor_at(*arena, index_of(*arena, page)).state));
+    return (public_state_of(descriptor_at(*arena, index_of(*arena, page)).state()));
 }
 
 auto Pmm::page_count() const noexcept -> size_t {
@@ -926,7 +939,7 @@ auto Pmm::stats() const noexcept -> PmmStats {
     for (const auto& arena : arenas_) {
         result.metadata_pages += arena.descriptor_storage.page_count();
         for (size_t offset = 0; offset < arena.range.page_count(); ++offset) {
-            switch (descriptor_at(arena, usize{offset}).state) {
+            switch (descriptor_at(arena, usize{offset}).state()) {
             case State::Reserved:
                 ++result.reserved_pages;
                 break;
@@ -957,7 +970,7 @@ auto Pmm::verify(const Arena& arena) const noexcept -> bool {
             return false;
         }
         const Desc& descriptor = descriptor_at(arena, current);
-        if (descriptor.state != State::Free) {
+        if (descriptor.state() != State::Free) {
             return false;
         }
         current = descriptor.next;
@@ -967,7 +980,7 @@ auto Pmm::verify(const Arena& arena) const noexcept -> bool {
     size_t free = 0;
     for (size_t offset = 0; offset < arena.range.page_count(); ++offset) {
         const Desc& descriptor = descriptor_at(arena, usize{offset});
-        if (descriptor.state == State::Free) {
+        if (descriptor.state() == State::Free) {
             ++free;
         }
     }
@@ -999,7 +1012,7 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
         }
         for (const Page page : arena.descriptor_storage) {
             const Arena* owner = find_arena(page);
-            if (owner == nullptr || descriptor_at(*owner, index_of(*owner, page)).state != State::Reserved) {
+            if (owner == nullptr || descriptor_at(*owner, index_of(*owner, page)).state() != State::Reserved) {
                 return false;
             }
         }
@@ -1007,13 +1020,13 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
         for (size_t offset = 0; offset < arena.range.page_count(); ++offset) {
             const Desc& descriptor = descriptor_at(arena, usize{offset});
 
-            if (descriptor.state == State::Single) {
+            if (descriptor.state() == State::Single) {
                 if (descriptor.gen == 0) {
                     return false;
                 }
                 ++allocated;
-            } else if (descriptor.state == State::Group) {
-                if ((descriptor.owner == Nil)) {
+            } else if (descriptor.state() == State::Group) {
+                if ((descriptor.owner() == Nil)) {
                     return false;
                 }
                 if ((descriptor.next != Nil)) {
@@ -1023,14 +1036,14 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
                         return false;
                     }
                     const Desc& next = descriptor_at(*next_arena, index_of(*next_arena, next_page));
-                    if (next.state != State::Group || next.owner != descriptor.owner) {
+                    if (next.state() != State::Group || next.owner() != descriptor.owner()) {
                         return false;
                     }
                 }
                 ++allocated;
                 ++grouped;
-            } else if (descriptor.state == State::Reserved && (descriptor.owner != Nil)) {
-                const usize reservation = descriptor.owner;
+            } else if (descriptor.state() == State::Reserved && (descriptor.owner() != Nil)) {
+                const usize reservation = descriptor.owner();
                 if (reservation >= reservations_.size() ||
                     reservations_[reservation].state == ReservationState::Consumed) {
                     return false;
@@ -1063,7 +1076,7 @@ auto Pmm::verify_invariants_unlocked() const noexcept -> bool {
                 return false;
             }
             const Desc& descriptor = descriptor_at(*arena, index_of(*arena, page));
-            if (descriptor.state != State::Reserved || descriptor.owner != usize{id}) {
+            if (descriptor.state() != State::Reserved || descriptor.owner() != usize{id}) {
                 return false;
             }
         }

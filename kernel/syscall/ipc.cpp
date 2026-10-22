@@ -182,6 +182,13 @@ template<usize op>
 static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> Source* {
     auto reference = cap.reference();
     if (!reference) return nullptr;
+    if (facet == SOURCE_OP && cap.rights().contains(cap::Right::Inspect)
+        && !(mask & ~(OP_ACCEPTED | OP_COMMITTED | OP_DRAINING | OP_DONE))) {
+        return object::Types::visit(reference->kind(), [&]<class T>() noexcept -> Source* {
+            if constexpr (requires(T& value) { value.op(); }) return &static_cast<T*>(reference->get())->op().events();
+            else return nullptr;
+        }, static_cast<Source*>(nullptr));
+    }
     if (reference->kind() == ObjChannel) {
         const auto view = cap.view();
         const auto* side = std::get_if<cap::ChanLimit>(&view.data);
@@ -198,15 +205,6 @@ static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> So
             && !(mask & ~(THREAD_ENABLED | THREAD_APPLIED | THREAD_BOUND | THREAD_STOPPING | THREAD_STOPPED)))
             return &thread.events();
         return nullptr;
-    }
-    if (facet == SOURCE_STATE && cap.rights().contains(cap::Right::Observe)
-        && !(mask & ~(OP_ACCEPTED | OP_COMMITTED | OP_DRAINING | OP_DONE))) {
-        auto* events = object::Types::visit(reference->kind(), [&]<class T>() noexcept -> Source* {
-            if constexpr (requires(T& value) { value.op(); })
-                return &static_cast<T*>(reference->get())->op().events();
-            else return nullptr;
-        }, static_cast<Source*>(nullptr));
-        if (events) return events;
     }
     if (reference->kind() == ObjDomain && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Inspect)
         && !(mask & ~(DOMAIN_CLOSING | DOMAIN_DRAINED | DOMAIN_CONFIGURING)))
@@ -249,7 +247,7 @@ template<usize op> auto port_watch(Call& inv) noexcept -> Result {
     if (!port || !target) return returned(cap_status(!port ? port.error() : target.error()));
     // Ports aggregate sources and are directly waitable. Nested aggregation
     // would introduce recursive hint publication and source/receiver cycles.
-    if (target->pin().kind() == ObjPort) return returned(STATUS_INVALID_OP);
+    if (target->pin().kind() == ObjPort && inv.trap.arg(2) != SOURCE_OP) return returned(STATUS_INVALID_OP);
     if (inv.trap.arg(6) & ~WATCH_CHANGED) return returned(STATUS_BAD_ARGS);
     auto* event = source(*target, inv.trap.arg(2), inv.trap.arg(3));
     if (!event) return returned(STATUS_DENIED);
@@ -270,7 +268,7 @@ template<usize op> auto grant_source(Call& inv) noexcept -> Result {
     auto space = target.as<cap::CSpace>();
     if (!space) return returned(STATUS_INVALID_OP);
     auto selected = space->get().observe(handle_of(inv.trap.arg(2)), cap::GrantId{inv.trap.arg(3)}, limit->depth);
-    if (!selected) return returned(cap_status(selected.error()));
+    if (!selected) return returned(selected.error());
     // A metadata sample cannot follow an object after it leaves this scope.
     if (!owner->object().contains(id, limit->kinds, limit->depth)) return returned(STATUS_STALE);
     auto& source = selected->events();

@@ -94,8 +94,11 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
         forwarded.data.put("flags", *request.data["flags"].as<uint64_t>());
     }
     if (method == "Document") forwarded.data.put("writable", bool((request.facet() & vf_modify) && !mount->second.read_only));
-    if (const auto budget = request.data["budget"]) forwarded.data.cap("budget",
-        *forwarded.attach(request.capability(budget), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
+    if (const auto budget = request.data["budget"]) {
+        const auto index = forwarded.attach(request.capability(budget), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
+        if (!index) return index.error();
+        forwarded.data.cap("budget", *index);
+    }
     auto status = connect(mount->second);
     if (status != STATUS_OK) return status;
     status = invoke(mount->second, method, std::move(forwarded), result);
@@ -105,8 +108,9 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
         const auto value = response.data[method == "Map" ? "buffer" : "handle"];
         auto cap = result.take(value);
         if (!cap || result.count != 1) return STATUS_PEER_FAULT;
-        if (method == "Map") (void)response.offer(std::move(cap), RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE);
-        else (void)response.give(std::move(cap));
+        const auto index = method == "Map" ? response.offer(std::move(cap), RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE)
+            : response.give(std::move(cap));
+        if (!index) return index.error();
     }
     return STATUS_OK;
 }
@@ -174,11 +178,6 @@ int main() {
         const auto read_only = config["read_only"].as<bool>();
         if (!path || !service || !read_only) return STATUS_BAD_ARGS;
         vf_mount mount{std::string{*service}, *read_only, 0, {}};
-        if (config["optional"].as<bool>().value_or(false)) {
-            status = connect(mount);
-            if (status == STATUS_NOT_FOUND) continue;
-            if (status != STATUS_OK) return status;
-        }
         mounts.emplace(vf_path(*path), std::move(mount));
     }
     for (const auto result : {
@@ -207,8 +206,11 @@ int main() {
     for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 4>{{
         {"files", vf_lookup | vf_modify}, {"read", vf_lookup}, {"exec", vf_lookup | vf_execute}, {"admin", vf_admin}}}) {
         auto connector = directory.connector(rights); if (!connector) return connector.error();
-        ubus_msg request, response; request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
-            .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+        ubus_msg request, response;
+        const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+        if (!peer_idx) return peer_idx.error();
+        request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
+            .cap("connector", *peer_idx);
         status = bus.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     }
     for (;;) {

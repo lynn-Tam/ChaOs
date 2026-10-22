@@ -54,7 +54,7 @@ struct AttachOps final {
     bool observe{};
 };
 
-// Embedded in a VMM-facing Backing. Graph indexes it
+// Embedded in a VMM-facing Binding. Graph indexes it
 // non-owningly and never exposes the Grant node to the VMM.
 class Attachment final : private libk::noncopyable_nonmovable {
 public:

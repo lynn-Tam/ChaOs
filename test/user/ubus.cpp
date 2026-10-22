@@ -64,7 +64,10 @@ static auto provider() -> int {
     expect(object.open());
     auto connector = object.connector(); check(connector.has_value());
     check(object.add("late", {}, {}, [](auto&, auto&) { return STATUS_OK; }) == STATUS_BUSY);
-    ubus_msg ready; ready.data.cap("connector", *ready.offer(std::move(*connector), RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE));
+    ubus_msg ready;
+    const auto peer_idx = ready.offer(std::move(*connector), RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE);
+    if (!peer_idx) return peer_idx.error();
+    ready.data.cap("connector", *peer_idx);
     expect(ubus_send(destination, ready));
     while (!done) {
         const auto status = object.poll();
@@ -87,9 +90,21 @@ int main(int argc, char**) {
     ch_pair handoff; expect(handoff.open(env.alloc(), 1, 2));
     const auto minted = sys::channel_mint(handoff.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
     expect(minted.status); cap_owner sender{minted.value};
+    {
+        ubus_msg full;
+        for (size_t i = 0; i < CHANNEL_MAX_CAPS; ++i) check(full.attach(sender.selector(), RIGHT_SEND).has_value());
+        const auto kept = sys::cap_duplicate(sender.selector(), env.cspace, RIGHT_SEND);
+        expect(kept.status); cap_owner owned{kept.value};
+        const auto failed = full.give(std::move(owned));
+        check(!failed && failed.error() == STATUS_NO_MEMORY && owned.selector() == kept.value);
+        check(cap_info(owned.selector()).has_value());
+    }
     ubus_object environment{"fixture"};
     expect(environment.add("Receive", {}, {{"message", ubus_type::Record}}, [&](auto&, auto& response) {
-        ubus_data message; message.cap("handoff", *response.attach(sender.selector(), RIGHT_SEND));
+        ubus_data message;
+        const auto handoff_idx = response.attach(sender.selector(), RIGHT_SEND);
+        if (!handoff_idx) return handoff_idx.error();
+        message.cap("handoff", *handoff_idx);
         response.data.put("message", message); return STATUS_OK;
     }));
     expect(environment.open()); auto endpoint = environment.connector(); check(bool(endpoint));
@@ -142,10 +157,16 @@ int main(int argc, char**) {
     check(connection.invoke("shape", std::move(request), response) == STATUS_BAD_ARGS);
     auto notice = sys::notification_create(env.alloc(), 7); expect(notice.status);
     cap_owner notice_owner{notice.value};
-    request = {}; request.data.cap("notice", *request.attach(notice.value, RIGHT_SIGNAL));
+    request = {};
+    const auto notice_idx = request.attach(notice.value, RIGHT_SIGNAL);
+    if (!notice_idx) return notice_idx.error();
+    request.data.cap("notice", *notice_idx);
     expect(connection.invoke("signal", std::move(request), response));
     check(sys::notification_take(notice.value).value == 7);
-    request = {}; request.data.cap("notice", *request.attach(notice.value, RIGHT_SIGNAL));
+    request = {};
+    const auto cancel_idx = request.attach(notice.value, RIGHT_SIGNAL);
+    if (!cancel_idx) return cancel_idx.error();
+    request.data.cap("notice", *cancel_idx);
     request.data.put("text", large);
     expect(connection.notify("notify", std::move(request)));
     expect(sys::wait_one(notice.value, 7).status);

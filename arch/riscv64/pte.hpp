@@ -2,17 +2,23 @@
 
 #include <libk/types.hpp>
 #include <optional>
+#include <uapi/riscv64.h>
 
 namespace arch {
 inline constexpr int PtLevels = 3, PtBits = 9;
 inline constexpr usize Ptes = usize{1} << PtBits;
+inline constexpr usize PtUserBegin = RISCV64_LOW_GUARD_END;
 inline constexpr usize PtUserEnd = usize{1} << (12 + PtBits * PtLevels - 1);
 inline constexpr usize PtKernelBegin = ~(PtUserEnd - 1);
 constexpr bool pt_canonical(usize addr) noexcept {
     return addr < PtUserEnd || addr >= PtKernelBegin;
 }
 auto pt_token(usize ppn) noexcept -> usize;
-void activate_root(usize satp) noexcept;
+void load_root(usize satp) noexcept;
+auto asid_mask() noexcept -> usize;
+auto tagged_root(usize satp, usize asid) noexcept -> usize;
+void flush_tlb(usize asid) noexcept;
+bool flush_remote(usize hart) noexcept;
 bool root_active(usize satp) noexcept;
 void flush_tlb_all() noexcept;
 enum class PtPerm : u8 { Ro = 1, Rw = 3, Rx = 5, UserRo = 9, UserRw = 11, UserRx = 13, UserX = 12 };
@@ -28,7 +34,7 @@ public:
         return ppn ? std::optional{Pte{*ppn | Valid}} : std::nullopt;
     }
     // PBMT stays zero: CPU accesses inherit platform PMAs. No cache override API.
-    static constexpr auto leaf_4k(usize page, PtPerm perms, bool warm = true) noexcept
+    static constexpr auto leaf(usize page, PtPerm perms, bool warm = true) noexcept
         -> std::optional<Pte> {
         auto ppn = encode(page);
         return ppn ? std::optional{Pte{*ppn | (u64(perms) << 1) | Valid | (warm ? Used : 0)}}
@@ -80,6 +86,7 @@ public:
     constexpr bool has_permissions(PtPerm perms) const noexcept {
         return leaf_page() && (bits_ & Perm) == (u64(perms) << 1);
     }
+    constexpr auto with_global() const noexcept -> Pte { return Pte{bits_ | Global}; }
     constexpr auto with_permissions(PtPerm perms) const noexcept -> Pte {
         return Pte{(bits_ & ~Perm) | (u64(perms) << 1)};
     }

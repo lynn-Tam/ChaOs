@@ -201,20 +201,8 @@ auto Source::prepare(u64 bits, bool replace) noexcept -> Publication {
             if (bits_ & (u64{1} << std::countr_zero(remaining))) raised_[index] = version_;
     }
     Publication publication{*this};
-    const usize limit = work_ && raised_ ? 8 : std::numeric_limits<usize>::max();
-    usize scanned{};
-    for (auto it = waiters_.begin(); it != waiters_.end() && scanned++ < limit;) {
-        auto& waiter = *it++;
-        if (!matches(waiter.condition_)) continue;
-        libk_assert(waiter.deliver(result(waiter.condition_)));
-        publication.ready_.push_back(waiter);
-    }
-    if (work_ && raised_) {
-        publication.deferred_ = !waiters_.empty() || !watches_.empty();
-        return publication;
-    }
-    for (auto& watch : watches_)
-        if (watch.armed_ && matches(watch.condition_)) hint(watch, result(watch.condition_), publication);
+    scan_version_ = version_;
+    publication.deferred_ = collect(publication, work_ && raised_ ? 8 : std::numeric_limits<usize>::max());
     return publication;
 }
 
@@ -247,21 +235,8 @@ void Source::close() noexcept {
         closed_at_ = version_++;
         ++publishers_;
         publication = Publication{*this};
-        if (work_ && raised_) {
-            for (usize n = 0; n < 8 && !waiters_.empty(); ++n) {
-                auto& waiter = waiters_.front();
-                libk_assert(waiter.deliver(*observed(waiter.condition_, waiter.armed_at_)));
-                publication.ready_.push_back(waiter);
-            }
-            publication.deferred_ = !waiters_.empty() || !watches_.empty();
-            return;
-        }
-        for (auto& waiter : waiters_) {
-            waiter.queued_ = false;
-            waiter.result_ = *observed(waiter.condition_, waiter.armed_at_);
-        }
-        publication.ready_ = std::move(waiters_);
-        for (auto& watch : watches_) hint(watch, closed_result(watch), publication);
+        scan_version_ = version_;
+        publication.deferred_ = collect(publication, work_ && raised_ ? 8 : std::numeric_limits<usize>::max());
     }
 }
 
@@ -293,23 +268,35 @@ void Source::schedule() noexcept {
     work_->queue_source(*this);
 }
 
+// One traversal for inline delivery, terminal publication and deferred tails.
+// Split a finite budget between both registration kinds; rotate unready entries.
+auto Source::collect(Publication& publication, usize budget) noexcept -> bool {
+    const auto wait_budget = watches_.empty() ? budget : budget / 2;
+    usize used{};
+    while (used < wait_budget && !waiters_.empty() && waiters_.front().scanned_ != scan_version_) {
+        ++used;
+        auto& waiter = waiters_.front(); waiter.scanned_ = scan_version_;
+        if (const auto ready = observed(waiter.condition_, waiter.armed_at_)) {
+            libk_assert(waiter.deliver(*ready)); publication.ready_.push_back(waiter);
+        } else { (void)waiters_.pop_front(); waiters_.push_back(waiter); }
+    }
+    while (used < budget && !watches_.empty() && watches_.front().scanned_ != scan_version_) {
+        ++used;
+        auto& watch = watches_.pop_front(); watch.scanned_ = scan_version_; watches_.push_back(watch);
+        if (closed_) hint(watch, closed_result(watch), publication);
+        else if (watch.armed_) if (const auto ready = observed(watch.condition_, watch.armed_at_))
+            hint(watch, *ready, publication);
+    }
+    return (!waiters_.empty() && waiters_.front().scanned_ != scan_version_)
+        || (!watches_.empty() && watches_.front().scanned_ != scan_version_);
+}
+
 auto Source::scan(Pin& unpin) noexcept -> bool {
     Publication publication;
     {
         sync::Lock guard{lock_};
         ++publishers_; publication = Publication{*this};
-        for (usize step = 0; step < 8; ++step) {
-            if (!waiters_.empty() && waiters_.front().scanned_ != scan_version_) {
-                auto& waiter = waiters_.front(); waiter.scanned_ = scan_version_;
-                if (const auto result = observed(waiter.condition_, waiter.armed_at_)) {
-                    libk_assert(waiter.deliver(*result)); publication.ready_.push_back(waiter);
-                } else { (void)waiters_.pop_front(); waiters_.push_back(waiter); }
-            } else if (!watches_.empty() && watches_.front().scanned_ != scan_version_) {
-                auto& watch = watches_.pop_front(); watch.scanned_ = scan_version_; watches_.push_back(watch);
-                if (closed_) hint(watch, closed_result(watch), publication);
-                else if (watch.armed_) if (const auto result = observed(watch.condition_, watch.armed_at_)) hint(watch, *result, publication);
-            } else break;
-        }
+        (void)collect(publication, 8);
     }
     publication.publish();
     sync::Lock guard{lock_};

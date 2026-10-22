@@ -237,7 +237,7 @@ auto Ctl::open() noexcept -> status_t {
     const auto bytes = (0x200008 + config_.context * 0x1000 + 4095) & ~usize{4095};
     const auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, bytes);
     if (!pages || !claim_.covers(*pages)) return STATUS_BAD_ARGS;
-    if (!vm_.map(mapping_, *pages)) return STATUS_NO_MEMORY;
+    if (!vm_.map(mapping_, *pages, cpus_, current_cpu().id)) return STATUS_NO_MEMORY;
     mapped_ = true;
     work_.open(job_, Work::Fn::bind<&Ctl::progress>(*this));
     return STATUS_OK;

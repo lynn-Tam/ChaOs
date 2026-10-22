@@ -7,6 +7,7 @@
 #include <libk/unique_handle.hpp>
 #include <mm/table.hpp>
 #include <mm/tlb.hpp>
+#include <resource/quota.hpp>
 #include <sync.hpp>
 
 namespace mm {
@@ -66,7 +67,7 @@ class KSpace final : private libk::noncopyable_nonmovable {
     }
 
     void fund(object::ref<> quota) noexcept { libk_assert(!quota_); quota_ = std::move(quota); }
-    auto map(KMap&, Pages) noexcept -> std::expected<void, PtErr>;
+    auto map(KMap&, Pages, Cpus&, CpuId) noexcept -> std::expected<void, PtErr>;
     void unmap(KMap&, Flush&, Cpus&, CpuId) noexcept;
     void release(KMap&, const Flush&) noexcept;
     [[nodiscard]] auto cpu_root() const noexcept -> usize { return root_.cpu_root(); }

@@ -65,7 +65,7 @@ auto Iommu::context(u32 did, bool create) noexcept -> u64* {
 auto Iommu::open(object::ref<> cpu) noexcept -> status_t {
     const auto range = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, 4096);
     if (!range || !claim_.covers(*range)) return STATUS_BAD_ARGS;
-    if (!vm_.map(mapping_, *range)) return STATUS_NO_MEMORY;
+    if (!vm_.map(mapping_, *range, cpus_, current_cpu().id)) return STATUS_NO_MEMORY;
     mapped_ = true;
     const auto caps = read<u64>(0);
     // Coherent little-endian Sv39, extended contexts, wired interrupts.

@@ -5,10 +5,8 @@
 
 namespace trace {
 
-auto enabled() noexcept -> bool { return TRACE_ENABLED; }
-
+#if TRACE_ENABLED
 void emit(Event kind, u64 actor, u64 object, u64 a, u64 b) noexcept {
-    if (!enabled()) return;
     const auto irq = arch::disable_interrupts();
     auto* cpu = Cpu::local();
     auto* log = cpu ? cpu->log : nullptr;
@@ -28,6 +26,8 @@ void emit(Event kind, u64 actor, u64 object, u64 a, u64 b) noexcept {
     }
     arch::restore_interrupts(irq);
 }
+
+#endif
 
 auto snapshot(const Cpu& cpu) noexcept -> View {
     const auto* log = cpu.log;

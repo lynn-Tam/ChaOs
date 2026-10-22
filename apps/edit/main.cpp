@@ -31,7 +31,9 @@ public:
         const auto sender = sys::channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
         if (sender.status != STATUS_OK) return sender.status;
         ubus_msg request, response;
-        request.data.cap("events", *request.offer(cap_owner{sender.value}, RIGHT_SEND));
+        const auto events_idx = request.offer(cap_owner{sender.value}, RIGHT_SEND);
+        if (!events_idx) return events_idx.error();
+        request.data.cap("events", *events_idx);
         return control_.invoke("Fullscreen", std::move(request), response);
     }
     auto write(const char* data, size_t size) -> status_t {
@@ -362,8 +364,10 @@ public:
         uint64_t offset{};
         for (;;) {
             ubus_msg request;
+            const auto buffer_idx = request.attach(buffer->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE);
+            if (!buffer_idx) return buffer_idx.error();
             request.data.put("id", ++next_).put("offset", offset)
-                .put("buffer", ubus_buffer{*request.attach(buffer->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE), 0, 4096});
+                .put("buffer", ubus_buffer{*buffer_idx, 0, 4096});
             status = document_.invoke("Read", std::move(request), response); if (status != STATUS_OK) return status;
             const auto count = response.data["bytes"].as<uint64_t>(); if (!count || *count > 4096) return STATUS_PEER_FAULT;
             if (!*count) return STATUS_OK;
@@ -377,7 +381,9 @@ public:
         ::memcpy(reinterpret_cast<void*>(buffer->address), text.before(), text.cursor());
         ::memcpy(reinterpret_cast<void*>(buffer->address + text.cursor()), text.after(), text.after_size());
         ubus_msg request, response;
-        request.data.put("buffer", ubus_buffer{*request.attach(buffer->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE), 0, text.size()});
+        const auto buffer_idx = request.attach(buffer->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE);
+        if (!buffer_idx) return buffer_idx.error();
+        request.data.put("buffer", ubus_buffer{*buffer_idx, 0, text.size()});
         return document_.invoke("Save", std::move(request), response);
     }
 };
@@ -412,8 +418,11 @@ int main(int argc, char** argv) {
                 if (std::string_view{*entry}.starts_with("PWD=")) base = std::string_view{*entry}.substr(4);
             path = std::string{base} + "/" + path;
         }
-        request = {}; request.data.put("path", path)
-            .cap("budget", *request.attach(budget.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
+        request = {};
+        const auto budget_idx = request.attach(budget.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
+        if (!budget_idx) return budget_idx.error();
+        request.data.put("path", path)
+            .cap("budget", *budget_idx);
         status = files.invoke("Document", std::move(request), response); if (status != STATUS_OK) return status;
         object = response.take(response.data["handle"]);
     }

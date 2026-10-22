@@ -68,7 +68,7 @@ def main():
             text = output.decode(errors="replace")
             expected = [f"cpu: online={count}",
                         "runtime: entered", *extra_markers]
-            if any(marker not in text for marker in expected) or "MYOS KERNEL PANIC" in text:
+            if any(marker not in text for marker in expected) or "MYOS KERNEL PANIC" in text or "DOUBLE PANIC" in text:
                 log = temporary / f"failed-{count}.log"
                 log.write_text(text)
                 print(text)

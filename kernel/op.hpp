@@ -143,6 +143,7 @@ public:
         { sync::Lock guard{lock_}; libk_assert(!cleanup_); cleanup_ = std::move(done); phase = phase_; }
         if (!phase) { libk_assert(bindings_.close()); finish(STATUS_CANCELED); }
         else if (phase != OP_DONE) { (void)cancel(); return; }
-        events_.close();
+        if (events_.drained()) cleanup();
+        else events_.close();
     }
 };

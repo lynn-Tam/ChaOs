@@ -172,6 +172,7 @@ void Allocation::bind_control(object::Control& target) noexcept {
     sync::Lock guard{object::Control::lock};
     libk_assert(owner_ && !control_);
     control_ = &target;
+    object::Control::changed();
 }
 
 auto Allocation::detach() noexcept -> Release {

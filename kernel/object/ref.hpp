@@ -144,12 +144,21 @@ enum class error : u8 {
     invalid_id,
     closed,
     wrong_type,
+    pending,
+    stale,
 };
 
 // Scratch for traversing actual control ownership/quota indices. No graph
 // edges or usage totals are stored here; the structure lock serializes walks.
+class ControlScan;
 class Control final {
+    friend class ControlScan;
 public:
+    struct Check { u64 from{}, to{}, version{}; bool reachable{}; };
+    static void changed() noexcept { libk_assert(lock.held()); libk_assert(++version_); }
+    auto id() const noexcept -> u64;
+    auto key() const noexcept -> Key;
+    auto checked(const Check&, const Control&) const noexcept -> std::expected<bool, error>;
     inline static sync::Spin lock;
     void bind(anchor& owner) noexcept { libk_assert(!owner_); owner_ = &owner; }
     static void push(Control*& pending, Control* node, u64 epoch) noexcept {
@@ -158,12 +167,12 @@ public:
     }
     auto reaches(Control& destination) noexcept -> std::expected<bool, error> {
         libk_assert(lock.held());
-        static u64 epoch{};
-        if (epoch == std::numeric_limits<u64>::max()) return std::unexpected(error::exhausted);
-        const auto visit = ++epoch;
+        if (visits_ == std::numeric_limits<u64>::max()) return std::unexpected(error::exhausted);
+        const auto visit = ++visits_;
         Control* pending{};
         push(pending, this, visit);
-        while (pending) {
+        for (usize step = 0; pending; ++step) {
+            if (step == 64) return std::unexpected(error::pending);
             auto* node = pending; pending = node->next_;
             if (node == &destination) return true;
             node->edges(pending, visit);
@@ -171,6 +180,8 @@ public:
         return false;
     }
 private:
+    inline static u64 version_{1}, visits_{};
+    auto parent(usize) const noexcept -> Control*;
     void edges(Control*&, u64) noexcept;
     anchor* owner_{};
     Control* next_{};

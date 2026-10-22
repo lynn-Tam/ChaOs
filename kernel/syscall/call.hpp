@@ -22,6 +22,7 @@ enum class Disposition : u8 {
     Return,
     Park,
     Retry,
+    Continue,
     Yield,
     Exit,
 };

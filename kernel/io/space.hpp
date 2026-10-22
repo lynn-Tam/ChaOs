@@ -1,4 +1,5 @@
 #pragma once
+#include <mm/slab.hpp>
 
 #include <cap/grant.hpp>
 #include <op.hpp>

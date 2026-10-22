@@ -36,15 +36,10 @@ public:
 };
 
 inline auto cap_info(cap_t cap) -> std::expected<CapInfo, status_t> {
-    cap_t cursor{}; uint64_t epoch{};
-    do {
-        const auto status = sys::cspace_info(rt_startup().cspace, cursor, 0, epoch).status;
-        if (status != STATUS_OK) return std::unexpected(status);
-        CSpaceInfo page; ::memcpy(&page, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(page));
-        for (const auto& entry : std::span{page.records, page.count}) if (entry.selector == cap) return entry;
-        cursor = page.cursor; epoch = page.epoch;
-    } while (cursor);
-    return std::unexpected(STATUS_INVALID_CAP);
+    const auto status = sys::cap_info(cap).status;
+    if (status != STATUS_OK) return std::unexpected(status);
+    CapInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+    return info;
 }
 
 // Bounded copies through this thread's IPC aperture. No foreign VA lease is
@@ -109,9 +104,16 @@ public:
 
 // Accepted effects and cleanup survive the caller. Waiting is a userspace
 // composition over the common Op source, independent of provider type.
+inline auto op_wait(cap_t op) noexcept -> sys::SysResult {
+    for (;;) {
+        const auto result = sys::op_query(op);
+        if (result.value2 == OP_DONE || result.status != STATUS_PENDING) return result;
+        const auto waited = sys::wait_one(op, OP_DONE, 0, 0, 0, SOURCE_OP);
+        if (waited.status != STATUS_OK && waited.status != STATUS_CLOSED) return waited;
+    }
+}
 inline auto op_wait(sys::SysResult submitted) noexcept -> sys::SysResult {
     if (submitted.status != STATUS_PENDING) return submitted;
     cap_owner op{submitted.value};
-    const auto waited = sys::wait_one(op.selector(), OP_DONE);
-    return waited.status == STATUS_OK ? sys::op_query(op.selector()) : waited;
+    return op_wait(op.selector());
 }

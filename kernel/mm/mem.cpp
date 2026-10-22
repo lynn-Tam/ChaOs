@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <algorithm>
 #include <cpu/cpu.hpp>
 #include <expected>
@@ -599,7 +600,9 @@ auto Mem::prepare(const object::ref<>& quota, Pmm& pmm, usize bytes, Config conf
             if (!c.credits) return std::unexpected(MemErr::InvalidSize);
             const auto credits = std::min(c.credits, d.pages_);
             d.store_.emplace(std::in_place_type<Paged>, pmm, c.perms, &pager->get(), c.priv, credits);
-            if (auto result = std::get<Paged>(*d.store_).prepay(d.quota_, credits); !result) return result;
+            const auto result = std::get<Paged>(*d.store_).prepay(d.quota_, credits);
+            if (!result) return std::unexpected(result.error());
+            if (!*result) d.prepay_ = credits;
         } else {
             auto checked = validate_extents(pmm, d.pages_, c.extents, c.owned, c.external);
             if (!checked) return checked;
@@ -617,9 +620,11 @@ auto Mem::prepare(const object::ref<>& quota, Pmm& pmm, usize bytes, Config conf
 }
 
 Mem::Mem(Data&& d) noexcept
-    : quota_(std::move(d.quota_)), pmm_(d.pmm_), logical_pages_(d.pages_),
+    : quota_(std::move(d.quota_)), pmm_(d.pmm_), logical_pages_(d.pages_), prepay_(d.prepay_),
       store_(std::move(d.store_)), perms_(d.perms_), pager_ref_(std::move(d.pager_)) {
     libk_assert(store_ && logical_pages_);
+    if (prepay_) work_open_.store(false, std::memory_order_relaxed);
+    else { initialization_.accept(); initialization_.finish(); }
     if (std::holds_alternative<Extents>(*store_) && perms_.contains(Perm::Execute)) {
         seal_ = SealState::Executable;
         content_epoch_ = {1};
@@ -714,10 +719,8 @@ auto Mem::materialize(usize page_index, Source::Context* context, bool wired) no
     Store* store{};
     {
         sync::Lock guard{lock_};
-        if (reassigning_) return std::unexpected(MemErr::Busy);
-        if (state_ != MemState::Live) {
-            return std::unexpected(MemErr::InvalidState);
-        }
+        if (state_ != MemState::Live) return std::unexpected(MemErr::InvalidState);
+        if (!work_open_.load(std::memory_order_acquire) || reassigning_) return std::unexpected(MemErr::Busy);
         if (page_index >= logical_pages_) {
             return std::unexpected(MemErr::InvalidRange);
         }
@@ -940,9 +943,25 @@ auto Mem::read(usize offset, std::span<byte> output) noexcept -> std::expected<v
     return {};
 }
 
+auto Mem::protect(MemLink& link, Perms perms) noexcept -> std::expected<void, MemErr> {
+    sync::Lock guard{lock_};
+    if (link.owner_ != this || !valid_perms(perms) || !perms_.contains(perms))
+        return std::unexpected(MemErr::InvalidAccess);
+    // Shrinking a drained consumer is valid even during invalidation. Raising
+    // permissions shares the same admission cut as sealing and new links.
+    if (!link.perms_.contains(perms) &&
+        (state_ != MemState::Live || trimming_ ||
+         static_cast<MemLink::State>(link.state_.load()) != MemLink::State::Attached ||
+         (perms.contains(Perm::Execute) && seal_ != SealState::Executable) ||
+         (perms.contains(Perm::Write) && seal_ != SealState::Loadable)))
+        return std::unexpected(MemErr::InvalidAccess);
+    link.perms_ = perms;
+    return {};
+}
+
 auto Mem::attach(MemLink& attachment, Perms perms) noexcept -> std::expected<void, MemErr> {
     sync::Lock guard{lock_};
-    if (state_ != MemState::Live || trimming_ || !valid_perms(perms) ||
+    if (state_ != MemState::Live || !work_open_.load(std::memory_order_acquire) || trimming_ || !valid_perms(perms) ||
         !perms_.contains(perms)) {
         return std::unexpected(MemErr::InvalidState);
     }
@@ -1022,7 +1041,7 @@ void Mem::retire(object::cleanup&& cleanup) noexcept {
         }
     }
     if (retired) {
-        if (cleanup) cleanup.complete();
+        if (cleanup) initialization_.retire(std::move(cleanup));
         return;
     }
 
@@ -1066,6 +1085,8 @@ void Mem::stop() noexcept {
 }
 
 void Mem::run_work() noexcept {
+    const auto phase = initialization_.query().sequence;
+    if (phase && phase != OP_DONE && initialization_.schedule()) return;
     {
         sync::Lock guard{lock_};
         if (trimming_ && trim_op_->schedule()) return;
@@ -1088,6 +1109,26 @@ void Mem::advance() noexcept {
             if (trim_op_) trim_op_->post(); else post();
         }
     }};
+    if (const auto phase = initialization_.query().sequence; phase && phase != OP_DONE) {
+        if (init_status_ == STATUS_PENDING) {
+            init_status_ = STATUS_CANCELED;
+            if (!initialization_.canceled()) {
+                const auto ready = std::get<Paged>(*store_).prepay(quota_, prepay_);
+                if (ready && !*ready) { init_status_ = STATUS_PENDING; initialization_.post(); return; }
+                init_status_ = ready ? STATUS_OK : STATUS_NO_MEMORY;
+                if (ready) {
+                    if (initialization_.commit()) {
+                        sync::Lock guard{lock_}; prepay_ = 0;
+                        work_open_.store(state_ == MemState::Live, std::memory_order_release);
+                    } else init_status_ = STATUS_CANCELED;
+                }
+            }
+        }
+        if (!initialization_.detach()) { initialization_.post(); return; }
+        initialization_.finish(init_status_);
+        { sync::Lock guard{lock_}; if (stopping_) post(); }
+        return;
+    }
     bool stopping, releasing;
     std::optional<ObjectRange> range;
     {
@@ -1257,7 +1298,7 @@ void Mem::release() noexcept {
     }
 
     if (work_) work_->close(job_);
-    if (cleanup) cleanup.complete();
+    initialization_.retire(std::move(cleanup));
 }
 
 } // namespace mm

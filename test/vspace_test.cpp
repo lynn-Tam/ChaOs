@@ -17,10 +17,6 @@
 #include <boot/info.hpp>
 #include <task/env.hpp>
 
-//Confirmatory experiment.
-// Exit condition: retained as the permanent semantic/PTE/revocation contract
-// once D5-D6 are integrated into the runtime dispatcher and syscall tests.
-
 namespace {
 
 constexpr usize vspace_test_page_count = 384;
@@ -50,7 +46,8 @@ public:
     VSpaceFixture() noexcept = default;
     ~VSpaceFixture() noexcept { reset(); }
 
-    [[nodiscard]] auto initialize(bool eager, usize pages = 4) noexcept
+    [[nodiscard]] auto initialize(bool eager, usize pages = 4,
+        mm::Perms perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write)) noexcept
         -> bool {
         reset();
         (void)vspace_work.emplace();
@@ -98,8 +95,7 @@ public:
         (void)vspace_test_groups.emplace(*vspace_test_pmm, *vspace_work);
         (void)vspace_test_cspaces.emplace(*vspace_test_pmm, *vspace_work);
         auto memory = mm.get<mm::Mem>().create({}, *vspace_test_pmm, pages * mm::page_size, mm::AnonCfg{
-                .perms = mm::Perms::of(
-                    mm::Perm::Read, mm::Perm::Write),
+                .perms = perms,
                 .eager = eager,
             });
         if (!memory) {
@@ -239,6 +235,42 @@ private:
     object::ref<mm::Mem> memory_{};
     object::ref<cap::CSpace> cspace_{};
 };
+
+bool test_protect_seal(const TestContext&) noexcept {
+    using mm::Perm;
+    using mm::Perms;
+    const auto rwx = Perms::of(Perm::Read, Perm::Write, Perm::Execute);
+    const auto ro = Perms::of(Perm::Read);
+    const auto rw = Perms::of(Perm::Read, Perm::Write);
+    const auto rx = Perms::of(Perm::Read, Perm::Execute);
+    const mm::VRange range{mm::va_t{0x30000}, mm::page_size};
+    VSpaceFixture f;
+    for (bool resident : {false, true}) {
+        if (!f.initialize(true, 1, rwx)) return false;
+        auto mapped = f.space().map(f.context(), {range, {0, 1}, ro}, f.memory_ref(),
+            f.memory(), {{0, 1}, rwx});
+        if (!mapped) return false;
+        if (resident && !f.space().fault(f.context(), range.base(), Perm::Read)) return false;
+        auto protect = [&](Perms perms) {
+            auto result = f.space().protect(f.context(), range, perms);
+            f.run_work();
+            return result.has_value() && !f.space().pending();
+        };
+        // Executing loadable contents is forbidden even if no PTE exists yet.
+        if (protect(rx) || !protect(rw)) return false;
+        if (f.memory().seal()) return false;
+        if (!protect(ro) || !f.memory().seal()) return false;
+        if (protect(rw) || !protect(rx)) return false;
+        auto executable = f.space().fault(f.context(), range.base(), Perm::Execute);
+        auto denied = f.space().fault(f.context(), range.base(), Perm::Write);
+        if (!executable || !denied || denied->kind != mm::FaultKind::AccessDenied) return false;
+        // Exercise software A/D handling on an installed user leaf.
+        auto ready = f.space().fault(f.context(), range.base(), Perm::Read);
+        auto usage = f.space().sample_usage(f.context(), range.base());
+        if (!ready || !usage || !usage->accessed) return false;
+    }
+    return true;
+}
 
 bool test_semantic_map_protect_and_arbitrary_unmap(
     const TestContext&) noexcept {
@@ -767,6 +799,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
 } // namespace
 
 void register_vspace_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("vspace", "protect preserves sealing and retired permissions", test_protect_seal);
     (void)registry.add("vspace", "owned edits drain multiple layout and PTE batches", test_batched_edit);
     (void)registry.add("vspace", "failed private root initialization drains and refunds", test_private_creation_refunds_failed_root);
     (void)registry.add(

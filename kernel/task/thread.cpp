@@ -133,9 +133,26 @@ void Thread::finish(status_t status) noexcept {
     if (work_) work_->post(finalizer_);
     else finalize(); // Exclusive construction rollback without a runtime worker.
 }
+auto Thread::check_control(mm::Pmm& pmm, const object::ref<>& from, const object::ref<>& to, usize slot)
+    noexcept -> std::expected<object::Control::Check, status_t> {
+    if (!to.control()) return object::Control::Check{};
+    if (!control_scan_) {
+        auto result = object::ControlScan::probe(from, to);
+        if (result || result.error() != STATUS_PENDING) return result;
+        auto self = object::ref<>::retain_alive(finalizer_.key());
+        control_scan_.emplace(pmm, self.allocation()->quota());
+    }
+    return control_scan_->check(from, to, slot);
+}
+auto Thread::finish_control(status_t status) noexcept -> bool {
+    if (control_scan_ && !control_scan_->drain()) { control_status_ = status; return false; }
+    control_scan_.reset(); control_status_.reset(); return true;
+}
+
 void Thread::finalize() noexcept {
     bool finish;
     { sync::Lock guard{lock_}; if (state_ != State::Exited) return; finish = !stopped_; }
+    if (!finish_control()) { post_finalize(); return; }
     if (finish) {
         auto publishing = roots_.hold();
         static_cast<void>(roots_.close());

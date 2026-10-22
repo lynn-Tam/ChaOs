@@ -5,7 +5,8 @@ nm=$1
 ar=$2
 image=$3
 scenario_policy=$4
-shift 4
+trace_enabled=$5
+shift 5
 
 fail() {
   printf '%s\n' "[audit] FAIL: $*" >&2
@@ -36,7 +37,11 @@ printf '%s\n' '[audit] checking panic/assert and console providers...'
   | rg -q 'arch::putchar\(' \
   || fail 'kernel console provider is not linked'
 
-"$nm" -C --defined-only -n "$image" | rg -q 'trace::emit\(' || fail 'event recorder is not linked'
+if [ "$trace_enabled" = 1 ]; then
+  "$nm" -C --defined-only -n "$image" | rg -q 'trace::emit\(' || fail 'event recorder is not linked'
+else
+  if "$nm" -C "$image" | rg -q 'trace::emit\('; then fail 'disabled event recorder survived compilation'; fi
+fi
 
 case "$scenario_policy" in
   none)

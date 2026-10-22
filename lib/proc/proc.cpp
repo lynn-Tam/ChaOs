@@ -11,6 +11,18 @@
 
 static constexpr word_t page_size = 4096;
 
+auto proc_image::map(vm_area& source, cap_owner memory, uint64_t offset, uint64_t size, word_t perms)
+    -> std::expected<proc_image, status_t> {
+    const auto end = libk::checked_add(offset, size);
+    const auto bytes = end ? libk::checked_align_up(*end, page_size).value_or(0) : 0;
+    if (!size || !bytes) return std::unexpected(STATUS_BAD_ARGS);
+    auto mapping = vm_area::map(rt_vm(), std::move(memory), 0, bytes, VM_READ);
+    if (!mapping) return std::unexpected(mapping.error());
+    source = std::move(*mapping);
+    return proc_image{.bytes={reinterpret_cast<const std::byte*>(source.address + offset), size_t(size)},
+        .memory=source.memory.selector(), .offset=offset, .perms=perms};
+}
+
 // Temporary selectors are adopted before any operation that may fail. The
 // task owns their cleanup; VSpace owns committed backing after selectors close.
 class proc_loader {
@@ -22,6 +34,7 @@ class proc_loader {
     proc_loader(CreateAuth pool, cap_t vm) : pool_(pool), vm_(vm) {}
     auto adopt(sys::SysResult r) noexcept -> std::expected<owner, status_t> {
         owner cap{r.value};
+        if (r.status == STATUS_PENDING) r.status = op_wait(cap.selector()).status;
         if (!cap)
             return std::unexpected(r.status == STATUS_OK ? STATUS_INVALID_CAP : r.status);
         if (r.status != STATUS_OK)

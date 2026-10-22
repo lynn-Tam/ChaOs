@@ -30,12 +30,12 @@ static auto append(ubus_data& data, std::string_view name, ubus_value value, ubu
         if (!source) return STATUS_BAD_ARGS;
         const auto cap = source->capability(value);
         const auto info = cap_info(cap); if (!info) return info.error();
-        std::optional<size_t> index;
+        std::expected<size_t, status_t> index = std::unexpected(STATUS_NOT_FOUND);
         for (size_t i = 0; i < out.count; ++i)
             if (out.transfers[i].source == cap && out.transfers[i].rights == info->view.rights
                 && out.transfers[i].operation == CAP_COPY) { index = i; break; }
         if (!index) index = out.attach(cap, info->view.rights);
-        if (!index) return STATUS_NO_MEMORY;
+        if (!index) return index.error();
         if (const auto buffer = value.as<ubus_buffer>()) data.put(name, ubus_buffer{*index, buffer->offset, buffer->size});
         else data.cap(name, *index);
     } else if (value.type() == ubus_type::Record || value.type() == ubus_type::Array) {
@@ -126,12 +126,8 @@ int main() {
                 } else if (load.step == loading::FilesBind) load.step = loading::Map;
                 else {
                     const auto buffer = response.data["buffer"].as<ubus_buffer>(); if (!buffer) return fail(STATUS_PEER_FAULT);
-                    auto mapped = vm_area::map(rt_vm(), response.take(response.data["buffer"]), 0,
-                        (buffer->offset + buffer->size + 4095) & ~size_t{4095}, VM_READ);
-                    if (!mapped) return fail(mapped.error());
-                    child.source = std::move(*mapped);
-                    return proc_image{.bytes={reinterpret_cast<const std::byte*>(child.source.address + buffer->offset), size_t(buffer->size)},
-                        .memory=child.source.memory.selector(), .offset=buffer->offset, .perms=VM_READ | VM_EXECUTE};
+                    return proc_image::map(child.source, response.take(response.data["buffer"]),
+                        buffer->offset, buffer->size, VM_READ | VM_EXECUTE);
                 }
             }
         };
@@ -146,14 +142,20 @@ int main() {
             const auto rights = object["rights"].as<uint64_t>();
             if (!rights || !*rights || (*rights & ~(mgr_observe | mgr_control | mgr_create | mgr_debug))) return STATUS_BAD_ARGS;
             auto cap = owner.connector(*rights); if (!cap) return cap.error();
-            ubus_msg value; value.data.cap("value", *value.offer(std::move(*cap), RIGHT_SEND | RIGHT_DUPLICATE));
+            ubus_msg value;
+            const auto cap_idx = value.offer(std::move(*cap), RIGHT_SEND | RIGHT_DUPLICATE);
+            if (!cap_idx) return cap_idx.error();
+            value.data.cap("value", *cap_idx);
             context.emplace(std::string{object.name()}, std::move(value));
         } else if (*kind == "Channel") {
             auto pair = std::make_unique<ch_pair>();
             status = pair->open(env.alloc(), object["depth"].as<uint64_t>().value_or(16), object["caps"].as<uint64_t>().value_or(0));
             if (status != STATUS_OK) return status;
             for (size_t side = 0; side < 2; ++side) {
-                ubus_msg value; value.data.cap("value", *value.attach(pair->ends[side].selector(), ~uint64_t{}));
+                ubus_msg value;
+                const auto cap_idx = value.attach(pair->ends[side].selector(), ~uint64_t{});
+                if (!cap_idx) return cap_idx.error();
+                value.data.cap("value", *cap_idx);
                 const auto info = cap_info(pair->ends[side].selector()); if (!info) return info.error();
                 value.transfers[0].rights = info->view.rights;
                 auto owned = value.clone(); if (!owned) return owned.error();
@@ -165,7 +167,10 @@ int main() {
                 object["bytes"].as<uint64_t>().value_or(0), object["caps"].as<uint64_t>().value_or(0),
                 object["kinds"].as<uint64_t>().value_or(OBJ_KINDS)) : *kind == "Scope" ? sys::scope_create(env.alloc()) : sys::SysResult{.status=STATUS_BAD_ARGS};
             if (made.status != STATUS_OK) return made.status;
-            ubus_msg value; value.data.cap("value", *value.give(cap_owner{made.value}));
+            ubus_msg value;
+            const auto cap_idx = value.give(cap_owner{made.value});
+            if (!cap_idx) return cap_idx.error();
+            value.data.cap("value", *cap_idx);
             context.emplace(std::string{object.name()}, std::move(value));
         }
     }

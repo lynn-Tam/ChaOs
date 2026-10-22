@@ -4,12 +4,17 @@
 #include <mm/tlb.hpp>
 #include <pte.hpp>
 #include <trace.hpp>
+#include <bit>
+#include <algorithm>
 
 namespace mm {
 // Requests themselves provide storage; no per-CPU bounded queue or reserve
 // protocol. The lock serializes publication with each consumer's fence.
 static constinit sync::Spin flush_lock;
 static constinit Flush *flushes{};
+static constinit std::atomic<u64> next_id{1};
+
+Tlb::Tlb() noexcept : id_(next_id.fetch_add(1, std::memory_order_relaxed)) { libk_assert(id_); }
 
 Flush::~Flush() noexcept {
     libk_assert(complete() && !link_);
@@ -73,6 +78,8 @@ bool Flush::kick(Cpus &cpus) const noexcept {
 
 bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable, bool global) noexcept {
     libk_assert(owner_ && !flush.submitted());
+    libk_assert(owner_->version_.fetch_add(1, std::memory_order_release) != ~u64{});
+    if (executable) libk_assert(owner_->executable_.fetch_add(1, std::memory_order_release) != ~u64{});
     flush.owner_ = owner_;
     flush.executable_ = executable;
     static_cast<void>(owner_->retained_.fetch_add(1, std::memory_order_relaxed));
@@ -115,10 +122,11 @@ bool Tlb::Edit::commit(Flush &flush, Cpus *cpus, CpuId local, bool executable, b
     return complete;
 }
 
-void Tlb::Edit::publish_fresh() noexcept {
-    // Only monotonically allocated addresses with permanent backing use this
-    // path. It cannot publish a reused VA or a replacement physical page.
+void Tlb::Edit::publish_local() noexcept {
+    // Stacks are consumed after Root admission. Shared KMaps additionally
+    // complete a remote architectural fence before exposing their address.
     libk_assert(owner_);
+    libk_assert(owner_->version_.fetch_add(1, std::memory_order_release) != ~u64{});
     arch::flush_tlb_all();
     abort();
 }
@@ -139,28 +147,33 @@ CpuSet Tlb::active_cpus() const noexcept {
 
 void Root::activate(Cpu &cpu) const noexcept {
     libk_assert(!arch::interrupts_enabled());
-    const auto id = cpu.id;
-    auto *outgoing = cpu.tlb;
-    if (outgoing != state_) state_->enter(id);
-    if (outgoing != state_) arch::activate_root(root_);
+    auto* outgoing = cpu.tlb;
+    sync::Lock guard{state_->lock_};
+    if (outgoing != state_) libk_assert(state_->active_.insert(cpu.id));
+    auto& cache = cpu.translations;
+    const auto slot = cache.count ? state_->id_ & (cache.count - 1) : 0;
+    const auto asid = cache.count ? slot + 1 : 0;
+    auto& seen = cache.entries[slot];
+    const auto version = state_->version_.load(std::memory_order_acquire);
+    const auto executable = state_->executable_.load(std::memory_order_acquire);
+    const auto shared = shared_->version_.load(std::memory_order_acquire);
+    if (outgoing != state_) arch::load_root(arch::tagged_root(root_, asid));
     else libk_assert(cpu.root == root_);
-    // Every entry fences, including a same-root resumption. This replaces
-    // version caches and also covers edits committed while this CPU was absent.
-    arch::flush_tlb_all();
-    arch::sync_instruction_stream();
-    cpu.tlb = state_;
-    cpu.root = root_;
-    if (outgoing && outgoing != state_) outgoing->leave(id);
+    if (cache.kernel_version != shared || (!cache.count && outgoing != state_)) arch::flush_tlb_all();
+    else if (seen.id != state_->id_ || seen.version != version) arch::flush_tlb(asid);
+    if (seen.id != state_->id_ || seen.executable != executable) arch::sync_instruction_stream();
+    seen = {state_->id_, version, executable};
+    cache.kernel_version = shared;
+    cpu.tlb = state_; cpu.root = root_;
+    guard.restore();
+    if (outgoing && outgoing != state_) outgoing->leave(cpu.id);
 }
 
 void Root::adopt(Cpu &cpu) const noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(!cpu.tlb && !cpu.root && arch::root_active(root_));
-    state_->enter(cpu.id);
-    arch::flush_tlb_all();
-    arch::sync_instruction_stream();
-    cpu.tlb = state_;
-    cpu.root = root_;
+    cpu.translations.count = std::bit_floor(std::min(arch::asid_mask(), cpu.translations.entries.size()));
+    activate(cpu);
 }
 
 void drain_tlb(CpuId cpu) noexcept {

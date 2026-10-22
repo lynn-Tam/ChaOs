@@ -43,6 +43,7 @@ struct Cpu final : private libk::noncopyable_nonmovable {
     Thread* current{};
     arch::Ctx step_ctx{};
     mm::Tlb* tlb{};
+    mm::TlbCache translations{};
     usize root{}, locks{};
     std::optional<mm::Stack> init_stack{}, emergency_stack{};
     mm::OwnedPage panic_page{}, trace_page{};

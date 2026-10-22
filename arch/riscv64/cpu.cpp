@@ -70,12 +70,28 @@ auto pt_token(usize ppn) noexcept -> usize {
     libk_assert(satp);
     return *satp;
 }
-void activate_root(usize satp) noexcept {
+void load_root(usize satp) noexcept {
     libk_assert(!interrupts_enabled());
     libk_assert(csr::Satp::mode(satp) == csr::Satp::MODE_SV39);
     csr::Satp::write(satp);
-    flush_tlb_all();
     libk_assert(csr::Satp::read() == satp);
+}
+auto tagged_root(usize satp, usize asid) noexcept -> usize { return satp | (asid << 44); }
+auto asid_mask() noexcept -> usize {
+    const auto root = csr::Satp::read();
+    csr::Satp::write(tagged_root(root, 0xffff));
+    const auto mask = (csr::Satp::read() >> 44) & 0xffff;
+    csr::Satp::write(root);
+    flush_tlb_all();
+    return mask;
+}
+void flush_tlb(usize asid) noexcept {
+    asm volatile("sfence.vma x0, %0" :: "r"(asid) : "memory");
+}
+bool flush_remote(usize hart) noexcept {
+    constexpr usize width = sizeof(usize) * 8;
+    const usize base = hart & ~(width - 1);
+    return bool(sbi::call(sbi::Ext::Rfence, 1, usize{1} << (hart - base), base, 0, 0));
 }
 bool root_active(usize satp) noexcept {
     return csr::Satp::read() == satp;

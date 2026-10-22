@@ -1,5 +1,5 @@
 option('profile', type: 'combo', choices: ['kernel', 'test'], value: 'kernel', description: 'Debug-image workflow and metadata selection; kernel-core is shared')
-option('trace', type: 'boolean', value: true, description: 'Bounded per-CPU event history')
+option('trace', type: 'boolean', value: false, description: 'Bounded per-CPU event history')
 option('panic_probe', type: 'integer', value: 0, min: 0, max: 2, description: 'kernel_debug.elf panic probe selector')
 option('scenario', type: 'combo', choices: ['off', 'ordinary', 'initrd', 'trap', 'remote', 'dispatch'], value: 'off', description: 'kernel_debug.elf test scenario selector')
 option('build_id', type: 'string', value: 'auto', description: 'Image metadata only; does not select module objects')

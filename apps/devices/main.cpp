@@ -384,12 +384,12 @@ int main() {
             ubus_data row;
             std::string_view state = "Detected";
             if (const auto& child = record.driver; child && owner.find(child->id)) {
-                state = child->state == "failed" ? "Failed" : !child->task ? "Stopped"
-                    : child->state == "draining" ? "Stopping" : child == driver
+                state = child->state == mgr_state::Failed ? "Failed" : !child->task ? "Stopped"
+                    : child->state == mgr_state::Draining ? "Stopping" : child == driver
                     ? published_generation == child->gen && !quiesced ? "Ready" : "Starting" : "In use";
                 const auto program = child->image.substr(child->image.find_last_of('/') + 1);
                 row.put("driver", program.ends_with(".elf") ? program.substr(0, program.size() - 4) : program);
-                auto problem = child->state == "failed" ? child->result : STATUS_OK;
+                auto problem = child->state == mgr_state::Failed ? child->result : STATUS_OK;
                 if (child == driver && child->task && device->space) {
                     const auto io = sys::io_space_state(device->space.selector());
                     if (io.status != STATUS_OK || io.value == IO_SPACE_FAILED) { state = "Failed"; problem = STATUS_BACKING_FAILED; }
@@ -406,14 +406,16 @@ int main() {
     if (status != STATUS_OK) return status;
     auto listing = inventory.connector(); if (!listing) return listing.error();
     ubus_msg announce, accepted;
+    const auto peer_idx = announce.attach(listing->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+    if (!peer_idx) return peer_idx.error();
     announce.data.put("name", "inventory").put("interface", "myos.devices").put("version", uint64_t{1})
-        .cap("connector", *announce.attach(listing->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+        .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(announce), accepted); if (status != STATUS_OK) return status;
     for (;;) {
         if (driver && driver->task && !quiesced) {
             const auto ended = driver->task->observe();
             if (ended.status != STATUS_OK) return ended.status;
-            if (ended.value || driver->state == "draining") {
+            if (ended.value || driver->state == mgr_state::Draining) {
                 if ((status = driver->task->stop()) != STATUS_OK) sys::exit(status);
                 if ((status = io_close(device->space.selector())) != STATUS_OK) sys::exit(status);
                 const auto fn = bus->function(device->rid);
@@ -455,8 +457,11 @@ int main() {
                     status = parent.invoke("Withdraw", std::move(request), response);
                     if (status != STATUS_OK && status != STATUS_NOT_FOUND) return status;
                 }
-                request = {}; request.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
-                    .cap("connector", *request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE));
+                request = {};
+                const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
+                if (!peer_idx) return peer_idx.error();
+                request.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
+                    .cap("connector", *peer_idx);
                 status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
                 publication = response.data["instance"].as<uint64_t>().value_or(0); published_generation = driver->gen;
             }

@@ -131,9 +131,6 @@ struct vm_area {
         const auto result = sys::memory_create(auth, size, memory_perms);
         cap_owner memory{result.value};
         if (result.status != STATUS_OK) return std::unexpected(result.status);
-        for (size_t page = 0; page < size / 4096; ++page)
-            if (const auto status = sys::memory_populate(memory.selector(), page).status;
-                status != STATUS_OK) return std::unexpected(status);
         return map(arena, std::move(memory), va, size, map_perms);
     }
     static auto create(CreateAuth auth, vm_arena& arena, uintptr_t va, size_t size, word_t perms = VM_READ | VM_WRITE)

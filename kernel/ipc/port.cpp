@@ -1,3 +1,4 @@
+#include <mm/slab.hpp>
 #include <ipc/port.hpp>
 #include <object/scope.hpp>
 #include <libk/checked_arithmetic.hpp>
@@ -58,12 +59,15 @@ auto Port::storage_bytes(Config config) noexcept -> std::optional<usize> {
 }
 auto Port::open() noexcept -> status_t {
     if (!storage_bytes(config_) || opened_) return STATUS_BAD_ARGS;
+    usize budget = 64;
     while (watches_.size() < config_.watches) {
+        if (!budget) return STATUS_PENDING;
+        --budget;
         auto made = storage_.create(quota_, *this);
         if (!made) return STATUS_NO_MEMORY;
         watches_.push_back(**made); free_.push_back(**made);
     }
-    opened_ = true;
+    if (!initialization_.query().sequence) { opened_ = true; initialization_.accept(); initialization_.finish(); }
     return STATUS_OK;
 }
 auto Port::find(u64 id) noexcept -> Watch* {
@@ -87,7 +91,7 @@ auto Port::watch(cap::Resolved<Port>& port, const cap::GrantPin& grant, Source& 
     Watch* cell{};
     {
         sync::Lock guard{lock_};
-        if (closing_) return std::unexpected(STATUS_CLOSED);
+        if (!opened_ || closing_) return std::unexpected(STATUS_CLOSED);
         if (!free_.empty()) cell = &free_.pop_front();
         if (!cell) return std::unexpected(STATUS_NO_MEMORY);
         cell->state = Watch::State::Prepared;
@@ -312,6 +316,36 @@ void Port::finish_call(bool release) noexcept {
     if (post) work_->post(job_);
 }
 void Port::run_work() noexcept {
+    const auto phase = initialization_.query().sequence;
+    if (phase && phase != OP_DONE && initialization_.schedule()) return;
+    advance();
+}
+
+void Port::advance() noexcept {
+    bool retiring;
+    {
+        sync::Lock guard{lock_};
+        if (advancing_) { post(); return; }
+        advancing_ = true; retiring = closing_;
+    }
+    libk::scope_exit advanced{[&]() noexcept { sync::Lock guard{lock_}; advancing_ = false; }};
+    const auto phase = initialization_.query().sequence;
+    if (phase && phase != OP_DONE) {
+        if (retiring) (void)initialization_.cancel();
+        if (init_status_ == STATUS_PENDING) {
+            init_status_ = initialization_.canceled() ? STATUS_CANCELED : open();
+            if (init_status_ == STATUS_PENDING) { initialization_.post(); return; }
+            if (init_status_ == STATUS_OK) {
+                if (initialization_.commit()) { sync::Lock guard{lock_}; opened_ = true; }
+                else init_status_ = STATUS_CANCELED;
+            }
+        }
+        if (!initialization_.detach()) { initialization_.post(); return; }
+        initialization_.finish(init_status_);
+        if (retiring) post();
+        return;
+    }
+    if (!retiring) return;
     for (usize step = 0; step < 8; ++step) {
         Watch* watch;
         {
@@ -337,7 +371,7 @@ void Port::run_work() noexcept {
     if (!watches_.empty() || !storage_.drain(8)) { work_->post(job_); return; }
     object::cleanup cleanup;
     { sync::Lock guard{lock_}; cleanup = std::move(cleanup_); }
-    work_->close(job_); cleanup.complete();
+    work_->close(job_); initialization_.retire(std::move(cleanup));
 }
 
 } // namespace ipc

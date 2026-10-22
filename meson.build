@@ -30,7 +30,8 @@ cpp_config_dir = '/usr/lib/riscv64-unknown-elf/include/c++/' + meson.get_compile
 cpp_config_arg = '-I' + cpp_config_dir
 kernel_common_args = [
   '-ffreestanding', '-Wall', '-Wextra', '-O2', '-g3',
-  '-march=rv64gc', '-mabi=lp64d', '-mcmodel=medany', '-msmall-data-limit=0',
+  '-DTRACE_ENABLED=' + (trace_enabled ? '1' : '0'),
+  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0',
   '-I' + root,
   '-I' + join_paths(root, 'arch/riscv64'),
 ]
@@ -45,7 +46,7 @@ freestanding_cpp_args = [
 kernel_cpp_args = kernel_common_args + freestanding_cpp_args
 arch_cpp_args = arch_common_args + freestanding_cpp_args
 kernel_link_args = [
-  '-march=rv64gc', '-mabi=lp64d', '-nostdlib', '-lgcc',
+  '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-lgcc',
   '-Wl,-T,' + join_paths(root, 'arch/riscv64/kernel.ld'),
 ]
 
@@ -77,7 +78,7 @@ core_kernel_sources = files(
 arch = static_library('kernel-arch', arch_sources, c_args: arch_common_args, cpp_args: arch_cpp_args, pic: false)
 core = static_library('kernel-core', core_kernel_sources, c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 trace = static_library('kernel-trace', files('kernel/trace.cpp'),
-  c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DTRACE_ENABLED=' + (trace_enabled ? '1' : '0')], pic: false)
+  c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 sync = static_library('kernel-sync', files('kernel/sync.cpp'),
   c_args: kernel_c_args, cpp_args: kernel_cpp_args, pic: false)
 panic = static_library('kernel-panic', files('kernel/panic.cpp'),
@@ -389,8 +390,8 @@ audit_clang = files('tools/build/audit-clang.sh')
 run_qemu = files('tools/build/run-qemu.sh')
 artifact = files('tools/build/artifact.sh')
 
-run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 'none', arch, core, entry, trace, sync, panic])
-run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
+run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 'none', (trace_enabled ? '1' : '0'), arch, core, entry, trace, sync, panic])
+run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', (trace_enabled ? '1' : '0'), arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
 user_images = [store_user]

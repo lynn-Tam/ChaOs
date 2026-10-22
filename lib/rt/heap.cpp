@@ -46,8 +46,8 @@ static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
         if (need > SIZE_MAX - Header - 4095) return nullptr;
         const auto minimum = round(Header + need, 4096);
         auto size = std::max(ChunkSize, minimum);
-        // Return only backed storage. Failed reservations release through RAII;
-        // growth granularity must not reject a smaller admissible allocation.
+        // Anonymous pages materialize on touch; smaller VA gaps can still
+        // satisfy a request when the preferred chunk cannot be reserved.
         auto map = vm_area::create(pool, *vm, 0, size);
         if (!map && size != minimum && map.error() == STATUS_NO_MEMORY) {
             size = minimum;

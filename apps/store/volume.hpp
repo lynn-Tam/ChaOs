@@ -26,7 +26,9 @@ class st_device {
 public:
     auto connect(ubus_conn& directory, cap_t budget) -> status_t {
         ubus_msg request, response;
-        request.data.cap("budget", *request.attach(budget, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE));
+        const auto budget_idx = request.attach(budget, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
+        if (!budget_idx) return budget_idx.error();
+        request.data.cap("budget", *budget_idx);
         auto status = directory.invoke("Open", std::move(request), response); if (status != STATUS_OK) return status;
         status = peer_.adopt(response.take(response.data["handle"])); if (status != STATUS_OK) return status;
         status = peer_.invoke("Stat", {}, response); if (status != STATUS_OK) return status;

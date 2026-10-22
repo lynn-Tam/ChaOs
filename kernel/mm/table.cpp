@@ -7,11 +7,12 @@ static bool addr_is_kernel(VPage va) noexcept {
     return va.base().raw() >= arch::PtKernelBegin;
 }
 
-static auto decode(Pte pte) noexcept -> PtLeaf {
+static auto decode(Pte pte, VPage va, int level) noexcept -> PtLeaf {
     const auto page = pte.leaf_page();
     const auto perms = pte.perms();
     libk_assert(page && perms);
-    return {Page{*page}, *perms};
+    const usize pages = usize{1} << (arch::PtBits * level);
+    return {Page{*page + (va.raw() & (pages - 1))}, *perms, pages};
 }
 
 PageTable::PageTable(PageTable &&other) noexcept
@@ -47,7 +48,7 @@ auto PageTable::create(mm::Pmm &pmm, Kind kind, const PageTable *kernel) noexcep
             if (!pte)
                 return std::unexpected(PtErr::BadPhys);
             ::new (pt.table(*branch)) Pte[arch::Ptes]{};
-            entries[i].store(*pte);
+            entries[i].store(pte->with_global());
         }
     }
     return pt;
@@ -75,27 +76,28 @@ auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> 
             w.missing = level;
             break;
         }
-        if (level == 0) {
-            if (!entry.leaf_page())
+        if (entry.is_leaf()) {
+            const auto physical = entry.leaf_page();
+            if (!physical || (*physical & ((usize{1} << (arch::PtBits * level)) - 1)))
                 return std::unexpected(PtErr::Corrupt);
-        } else {
-            const auto next = entry.next_table_page();
-            if (!next)
-                return std::unexpected(PtErr::Corrupt);
-            page = Page{*next};
+            w.level = level;
+            break;
         }
+        const auto next = entry.next_table_page();
+        if (!level || !next) return std::unexpected(PtErr::Corrupt);
+        page = Page{*next};
     }
     return w;
 }
 
-bool PageTable::Count::include(mm::VPage va) noexcept {
+bool PageTable::Count::include(mm::VPage va, int leaf_level) noexcept {
     if (previous_ != ~usize{} && va.raw() <= previous_)
         return false;
     const auto w = table_->walk(va);
     if (!w)
         return false;
     // Missing descendants appear once per distinct prefix, even across gaps.
-    for (int level = w->missing; level > 0; --level)
+    for (int level = w->missing; level > leaf_level; --level)
         if (previous_ == ~usize{} ||
             (previous_ >> (arch::PtBits * level)) != (va.raw() >> (arch::PtBits * level)))
             ++pages_;
@@ -104,12 +106,19 @@ bool PageTable::Count::include(mm::VPage va) noexcept {
 }
 
 auto PageTable::encode(mm::Page page, PtPerm perms) const noexcept -> std::expected<Pte, PtErr> {
-    auto pte = Pte::leaf_4k(page.raw(), perms, kind_ != Kind::User);
+    auto pte = Pte::leaf(page.raw(), perms, kind_ != Kind::User);
     return pte ? std::expected<Pte, PtErr>{*pte} : std::unexpected(PtErr::BadPhys);
 }
 
 auto PageTable::map(mm::VPage va, mm::Page page, PtPerm perms, mm::PageGroup &reserve) noexcept
     -> std::expected<void, PtErr> {
+    return map_level(va, page, perms, reserve, 0);
+}
+
+auto PageTable::map_level(VPage va, Page page, PtPerm perms, PageGroup& reserve, int leaf_level) noexcept
+    -> std::expected<void, PtErr> {
+    const auto mask = (usize{1} << (arch::PtBits * leaf_level)) - 1;
+    if ((va.raw() | page.raw()) & mask) return std::unexpected(PtErr::BadAddr);
     const auto entry = encode(page, perms);
     if (!entry)
         return std::unexpected(entry.error());
@@ -117,15 +126,15 @@ auto PageTable::map(mm::VPage va, mm::Page page, PtPerm perms, mm::PageGroup &re
     if (!walked)
         return std::unexpected(walked.error());
     const auto &w = *walked;
-    if (w.missing < 0)
+    if (w.missing < leaf_level)
         return std::unexpected(PtErr::Exists);
-    if (reserve.page_count() < usize(w.missing))
+    if (reserve.page_count() < usize(w.missing - leaf_level))
         return std::unexpected(PtErr::NoMemory);
     libk_assert(&reserve.owner() == &tables_.owner());
     std::array<mm::OwnedPage, arch::PtLevels - 1> fresh{};
     auto link = *entry;
     // Build the whole missing subtree privately. No partial branch is published.
-    for (int level = 0; level < w.missing; ++level) {
+    for (int level = leaf_level; level < w.missing; ++level) {
         fresh[level] = std::move(*reserve.take());
         auto parent = Pte::non_leaf(fresh[level].page().raw());
         if (!parent)
@@ -134,9 +143,30 @@ auto PageTable::map(mm::VPage va, mm::Page page, PtPerm perms, mm::PageGroup &re
         entries[(va.raw() >> (arch::PtBits * level)) & (arch::Ptes - 1)].store(link);
         link = *parent;
     }
-    for (int level = 0; level < w.missing; ++level)
+    for (int level = leaf_level; level < w.missing; ++level)
         libk_assert(tables_.attach(std::move(fresh[level])));
     w.entries[w.missing]->store(link);
+    return {};
+}
+
+auto PageTable::map_direct(va_t address, Pages pages) noexcept -> std::expected<void, PtErr> {
+    const auto first = VPage::from_base(address);
+    if (kind_ != Kind::Kernel || !first || !pages.valid()
+        || address.raw() < DirectBegin || address.raw() >= DirectEnd
+        || pages.byte_size() > DirectEnd - address.raw()) return std::unexpected(PtErr::BadAddr);
+    constexpr usize large = usize{1} << arch::PtBits;
+    auto reserve = tables_.owner().group();
+    for (usize i = 0; i < pages.page_count();) {
+        const auto va = *first->checked_add(i);
+        const auto pa = *pages.base().checked_add(i);
+        const int level = !((va.raw() | pa.raw()) & (large - 1)) && pages.page_count() - i >= large ? 1 : 0;
+        auto plan = count();
+        if (!plan.include(va, level)) return std::unexpected(PtErr::BadAddr);
+        if (!reserve.grow(plan.pages())) return std::unexpected(PtErr::NoMemory);
+        auto result = map_level(va, pa, PtPerm::Rw, reserve, level);
+        if (!result) return result;
+        i += level ? large : 1;
+    }
     return {};
 }
 
@@ -146,14 +176,15 @@ auto PageTable::leaf(mm::VPage va) const noexcept -> std::expected<Pte *, PtErr>
         return std::unexpected(w.error());
     if (w->missing >= 0)
         return std::unexpected(PtErr::Missing);
+    if (w->level) return std::unexpected(PtErr::BadAddr);
     return w->entries[0];
 }
 
 auto PageTable::query(mm::VPage va) const noexcept -> std::expected<PtLeaf, PtErr> {
-    const auto entry = leaf(va);
-    if (!entry)
-        return std::unexpected(entry.error());
-    return decode((*entry)->load());
+    const auto w = walk(va);
+    if (!w) return std::unexpected(w.error());
+    if (w->missing >= 0) return std::unexpected(PtErr::Missing);
+    return decode(w->entries[w->level]->load(), va, w->level);
 }
 
 auto PageTable::usage(mm::VPage va) const noexcept -> std::expected<PageUsage, PtErr> {
@@ -162,6 +193,17 @@ auto PageTable::usage(mm::VPage va) const noexcept -> std::expected<PageUsage, P
         return std::unexpected(entry.error());
     const auto pte = (*entry)->load();
     return PageUsage{pte.accessed(), pte.dirty()};
+}
+
+auto PageTable::touch(mm::VPage va, Perm mode) noexcept -> std::expected<bool, PtErr> {
+    const auto entry = leaf(va);
+    if (!entry) return std::unexpected(entry.error());
+    const auto pte = (*entry)->load();
+    if (!(static_cast<u8>(*pte.perms()) & static_cast<u8>(mode)))
+        return std::unexpected(PtErr::BadAddr);
+    if (pte.accessed() && (mode != Perm::Write || pte.dirty())) return false;
+    (*entry)->update([&](Pte p) { return p.with_usage(true, p.dirty() || mode == Perm::Write); });
+    return true;
 }
 
 auto PageTable::clear_usage(mm::VPage va) noexcept -> std::expected<PageUsage, PtErr> {
@@ -199,6 +241,7 @@ auto PageTable::unmap(mm::VPage va) noexcept -> std::expected<PtRemoved, PtErr> 
     const auto &w = *walked;
     if (w.missing >= 0)
         return std::unexpected(PtErr::Missing);
+    if (w.level) return std::unexpected(PtErr::BadAddr);
     const auto old = w.entries[0]->exchange(Pte{});
     PtRemoved result{{old.accessed(), old.dirty()}, {}};
     for (int level = 0; level < arch::PtLevels - 1; ++level) {

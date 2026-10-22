@@ -8,7 +8,7 @@ trace_flag=$3
 cd "$root"
 find arch/riscv64 platform kernel libk -name '*.cpp' -type f -print | sort | while IFS= read -r source; do
   "$clangxx" --target=riscv64-unknown-elf \
-    -DTRACE_ENABLED="$trace_flag" -ffreestanding -Wall -Wextra -O2 -g3 -march=rv64gc -mabi=lp64d \
+    -DTRACE_ENABLED="$trace_flag" -ffreestanding -Wall -Wextra -O2 -g3 -march=rv64imac_zicsr_zifencei -mabi=lp64 \
     -mcmodel=medany -msmall-data-limit=0 -I . -I kernel \
     -I arch/riscv64 -std=gnu++2b -fno-exceptions -fno-rtti \
     -fno-threadsafe-statics -fno-use-cxa-atexit -fsyntax-only "$source"

@@ -28,7 +28,9 @@ class ft_terminal final {
         const auto sender = sys::channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
         if (sender.status != STATUS_OK) return sender.status;
         ubus_msg request, response;
-        request.data.cap("events", *request.offer(cap_owner{sender.value}, RIGHT_SEND));
+        const auto events_idx = request.offer(cap_owner{sender.value}, RIGHT_SEND);
+        if (!events_idx) return events_idx.error();
+        request.data.cap("events", *events_idx);
         return control_.invoke("Fullscreen", std::move(request), response);
     }
     auto write(const char* data, size_t size) -> status_t {

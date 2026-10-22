@@ -2,13 +2,14 @@
 #include <cpu.hpp>
 
 namespace sbi {
-auto call(Ext ext, usize fn, usize x, usize y, usize z) noexcept -> std::expected<usize, isize> {
+auto call(Ext ext, usize fn, usize x, usize y, usize z, usize w) noexcept -> std::expected<usize, isize> {
     register isize a0 asm("a0") = static_cast<isize>(x);
     register usize a1 asm("a1") = y;
     register usize a2 asm("a2") = z;
+    register usize a3 asm("a3") = w;
     register usize a6 asm("a6") = fn;
     register usize a7 asm("a7") = static_cast<usize>(ext);
-    asm volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a2), "r"(a6), "r"(a7) : "memory");
+    asm volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a2), "r"(a3), "r"(a6), "r"(a7) : "memory");
     if (a0) return std::unexpected(static_cast<isize>(a0));
     return static_cast<usize>(a1);
 }

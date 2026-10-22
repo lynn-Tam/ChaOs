@@ -369,7 +369,9 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{};
         auto events = create.template operator()<ipc::Port>(object::pool<ipc::Port>::slot_usage(), pmm, ipc::Port::Config{128, 16});
         if (!events) return std::unexpected(events.error());
-        if (events->get().open() != STATUS_OK) return std::unexpected(BootErr::OutOfMemory);
+        status_t ready;
+        do { ready = events->get().open(); } while (ready == STATUS_PENDING);
+        if (ready != STATUS_OK) return std::unexpected(BootErr::OutOfMemory);
         const auto event_rights = rights(cap::Right::Manage, cap::Right::Receive, cap::Right::Inspect);
         const auto installed_event = install(*events, {event_rights});
         if (!installed_event) return std::unexpected(installed_event.error());
