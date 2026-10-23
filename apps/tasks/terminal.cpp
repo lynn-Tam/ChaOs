@@ -19,7 +19,6 @@ auto ft_terminal::open(const rt_env& env, const ubus_msg& setup) -> status_t {
     quirks.SetColorSupport(ftxui::Terminal::Palette16);
     quirks.SetComponentAscii(true);
     ftxui::Terminal::SetQuirks(quirks);
-    animated_ = sys::clock_now().value;
     return STATUS_OK;
 }
 auto ft_terminal::wait(uint64_t deadline) -> status_t {
@@ -33,7 +32,7 @@ auto ft_terminal::read() -> std::expected<std::optional<ftxui::Event>, status_t>
         const auto byte = read_byte(0, false);
         if (byte == STATUS_WOULD_BLOCK) break;
         if (byte < 0) return std::unexpected(byte);
-        if (byte == 12) { frame_.clear(); redraw_ = true; continue; }
+        if (byte == 12) { if (const auto status = reset(); status != STATUS_OK) return std::unexpected(status); continue; }
         received = true;
         input_at_ = rt_after_ms(50).value_or(UINT64_MAX);
         parser_.Add(static_cast<char>(byte));
@@ -47,17 +46,9 @@ auto ft_terminal::read() -> std::expected<std::optional<ftxui::Event>, status_t>
     auto event = std::move(events_.front()); events_.pop_front();
     return std::optional{std::move(event)};
 }
-void ft_terminal::animate() {
-    if (!animate_at_) animate_at_ = rt_after_ms(16).value_or(0);
-}
 auto ft_terminal::present(const ftxui::Component& component) -> status_t {
     if (!focused()) return STATUS_OK;
-    if (animate_at_ && sys::clock_now().value >= animate_at_) {
-        animate_at_ = 0;
-        ftxui::animation::Params params{ftxui::animation::Duration{float(sys::clock_now().value - animated_) / float(sys::clock_frequency().value)}};
-        animated_ = sys::clock_now().value;
-        component->OnAnimation(params);
-    }
+    if (!pending_.empty()) return STATUS_WOULD_BLOCK;
     ftxui::Terminal::SetFallbackSize({static_cast<int>(columns()), static_cast<int>(rows())});
     auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(columns()), ftxui::Dimension::Fixed(rows()));
     ftxui::Render(screen, component->Render());
@@ -80,15 +71,42 @@ auto ft_terminal::present(const ftxui::Component& component) -> status_t {
         }
     }
     if (output.empty()) return STATUS_OK;
-    const auto status = write(output);
-    if (status == STATUS_OK) frame_ = std::move(frame);
-    return status;
+    pending_ = std::move(output); next_frame_ = std::move(frame);
+    return STATUS_OK;
+}
+auto ft_terminal::flush() -> status_t {
+    for (size_t budget = 0; sent_ < pending_.size() && budget < 8; ++budget) {
+        const auto count = std::min(pending_.size() - sent_, size_t{56});
+        ubus_msg frame;
+        frame.data.put("focus", focus_).put("data", std::as_bytes(std::span{pending_.data() + sent_, count}));
+        const auto status = control_.notify("Frame", std::move(frame), false);
+        if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
+            const auto armed = writable_ ? writable_.arm().status : writable_.open(port_, control_.endpoint(),
+                SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+            return armed == STATUS_OK ? STATUS_WOULD_BLOCK : armed;
+        }
+        if (status != STATUS_OK) return status;
+        sent_ += count;
+    }
+    if (sent_ < pending_.size()) return STATUS_PENDING;
+    if (!pending_.empty()) { frame_ = std::move(next_frame_); pending_.clear(); sent_ = 0; }
+    return writable_.close();
+}
+// Upstream Screen::Print is synchronous; the native event loop uses present/flush.
+void ft_terminal::print(std::string_view text) {
+    for (;;) {
+        const auto status = flush();
+        if (status == STATUS_OK) break;
+        if (status == STATUS_PENDING) continue;
+        if (status != STATUS_WOULD_BLOCK) sys::exit(status);
+        if (const auto ready = wait(); ready != STATUS_OK) sys::exit(ready);
+    }
+    frame_.clear(); (void)write(text);
 }
 void ft_print(std::string_view text) {
     if (!ft_active) sys::exit(STATUS_INVALID_OP);
     ft_active->print(text);
 }
-// These are the upstream standalone-component semantics. Native dispatch and
-// animation scheduling belong to the explicit terminal session above.
+// Standalone components execute closures directly; this session has no animations.
 void ftxui::App::PostEventOrExecute(ftxui::Closure closure) { if (closure) closure(); }
-void ftxui::animation::RequestAnimationFrame() { if (ft_active) ft_active->animate(); }
+void ftxui::animation::RequestAnimationFrame() {}

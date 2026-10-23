@@ -357,7 +357,7 @@ static void print_peers(const PanicSlot& owner) noexcept {
     wait_for_peers(slot);
 
     console::raw<
-        "\n================ MYOS KERNEL PANIC ================\n"
+        "\n================ KERNEL PANIC ================\n"
         "build: {}\nreason: {}\n">(
         std::string_view(build_id), slot.reason);
     print_source(slot.site);

@@ -39,7 +39,7 @@ def run(args, disk, trace=None):
                 if not chunk:
                     raise RuntimeError("QEMU serial closed")
                 output.extend(chunk)
-                if b"MYOS KERNEL PANIC" in output or b"user: contained fault" in output:
+                if b"KERNEL PANIC" in output or b"user: contained fault" in output:
                     raise RuntimeError(f"guest fault; serial tail: {output[-1000:]!r}")
 
     times = {}
@@ -54,8 +54,8 @@ def run(args, disk, trace=None):
             ("boot_ls_cold", "ls /boot", b"cat.elf"),
             ("boot_ls_hot", "ls /boot", b"cat.elf"),
             ("boot_deps", "svc", b"store idle"),
-            ("cat_cold", "cat /boot/README.TXT", b"myos disk file service"),
-            ("cat_hot", "cat /boot/README.TXT", b"myos disk file service"),
+            ("cat_cold", "cat /boot/README.TXT", b"Disk file service"),
+            ("cat_hot", "cat /boot/README.TXT", b"Disk file service"),
             ("ls_cold", "ls", b"boot"),
             ("ls_hot", "ls", b"boot"),
             ("write", "fs write phase0 hello", b"/ > "),

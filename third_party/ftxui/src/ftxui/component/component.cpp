@@ -252,7 +252,7 @@ void ComponentBase::TakeFocus() {
 /// them. It represents a component taking priority over others.
 /// @param event The event
 CapturedMouse ComponentBase::CaptureMouse(const Event& event) {  // NOLINT
-#if defined(FTXUI_MYOS)
+#if defined(FTXUI_FREESTANDING)
   (void)event; // Native backend dispatches components without a hosted App.
 #else
   if (event.screen_) {

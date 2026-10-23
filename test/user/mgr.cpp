@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         || rejected.state != mgr_state::Failed || rejected.result != status) return STATUS_INTERNAL;
     rejected.auth.alloc = env.alloc();
     if (owner.poll() != STATUS_OK || rejected.task || rejected.desired) return STATUS_INTERNAL;
-    status = owner.erase(rejected.id); if (status != STATUS_OK) return status;
+    status = owner.erase(rejected.child_id); if (status != STATUS_OK) return status;
     auto& incomplete = owner.add("incomplete", "worker", {.bytes=4096});
     incomplete.restart = true;
     const auto failure = owner.start(incomplete);
@@ -259,8 +259,8 @@ int main(int argc, char** argv) {
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) { out.write("[mgr] failed poll\n"); return status; }
         if (!done && !client.task) {
-            if (client.result != STATUS_OK || provider.root_version != 2 || !provider.observe || !provider.gen || sys::notification_take(signal.selector()).status != STATUS_OK) {
-                (void)libk::fmt::format_to<"[mgr] failed execution: client={} provider-gen={} provider-state={} provider-result={}\n">(out, client.result, provider.gen, mgr_state_name(provider.state), provider.result); return STATUS_INTERNAL;
+            if (client.result != STATUS_OK || provider.root_version != 2 || !provider.observe || !provider.run_id || sys::notification_take(signal.selector()).status != STATUS_OK) {
+                (void)libk::fmt::format_to<"[mgr] failed execution: client={} provider-run={} provider-state={} provider-result={}\n">(out, client.result, provider.run_id, mgr_state_name(provider.state), provider.result); return STATUS_INTERNAL;
             }
             status = owner.action(provider, "stop"); if (status != STATUS_OK) return status; done = true;
         }

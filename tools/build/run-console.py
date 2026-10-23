@@ -37,7 +37,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
                 if not chunk:
                     raise RuntimeError('QEMU closed serial')
                 output.extend(chunk)
-                if b'MYOS KERNEL PANIC' in output or b'user: contained fault' in output:
+                if b'KERNEL PANIC' in output or b'user: contained fault' in output:
                     # Preserve the diagnostic body before stopping QEMU.
                     drain_until = time.monotonic() + 5
                     while process.poll() is None and time.monotonic() < drain_until:
@@ -106,17 +106,18 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         if recovery:
             def managers():
                 text = run('bus call @control List', b'"items"')
-                return {item['name']: item['gen'] for line in text.splitlines() if line.startswith(b'{')
+                return {item['name']: item['run_id'] for line in text.splitlines() if line.startswith(b'{')
                         for item in json.loads(line)['items']}
             export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
             exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
-            run(f'bus call @control Configure name=foreign program=/boot/foreign.elf exports=^{exports}', b'"gen":0')
+            run(f'bus call @control Configure name=foreign program=/boot/foreign.elf exports=^{exports}', b'"run_id":0')
             run('bus call foreign/math Add a=11 b=31', b'"sum":42')
             before = managers()
             # Replace only the actual owner, without a redundant session wrapper.
             run('sleep 10000 &', b'Running')
             start = len(output); send(b'svc restart shell\r')
-            until(b'myos native shell\n', start); until(b'/ > ', output.index(b'myos native shell\n', start))
+            echo = b'svc restart shell\n'; until(echo, start)
+            until(b'/ > ', output.index(echo, start) + len(echo))
             after = managers()
             if after['shell'] == before['shell'] or any(after[n] != before[n] for n in before if n != 'shell'):
                 raise RuntimeError('shell replacement escaped its ownership boundary')
@@ -134,17 +135,17 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             if current['devices'] == after['devices'] or current['shell'] != after['shell'] or current['boot'] != after['boot']:
                 raise RuntimeError('device replacement escaped its ownership boundary')
             run('jobs', b'Running')
-            run('cat /boot/README.TXT', b'myos disk file service')
+            run('cat /boot/README.TXT', b'Disk file service')
             run('bus call foreign/math Add a=21 b=21', b'"sum":42')
             print(f'[supervisor] OK: {smp} harts, branch isolation, dynamic recipe checkpoint and lazy reactivation')
             return
         run('help', b'PROGRAM [ARGS]')
         run('svc', b'shell running')
         run('ls /boot', b'cat.elf')
-        run('cat /boot/README.TXT', b'myos disk file service')
+        run('cat /boot/README.TXT', b'Disk file service')
         if persisted:
-            states({'store': 'running'})
             run('cat note', b'hello-again')
+            states({'store': 'running'})
             run('cat notes/item', b'nested')
             run('cat edited', b'editor-retained')
             run('stat empty', b'0 bytes')
@@ -175,8 +176,8 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             run('cow', b'ELF data, COW and BSS ok')
             run('cow', b'ELF data, COW and BSS ok')
         if disk:
-            states({'store': 'running'})
             run('mkfs', b'/ > ')
+            states({'store': 'running'})
             run('create note', b'/ > ')
             run('write note hello', b'/ > ')
             run('create note', b'/ > ')  # Must preserve existing content.
@@ -262,7 +263,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             # consumes the same Value bytes as every peer, with no service SDK.
             export = struct.pack('<IHH', 12, 5, 0) + b'math' + bytes(4)
             exports = (struct.pack('<IHH', 24, 7, 0) + export).hex()
-            run(f'bus call @control Configure name=foreign program={program} exports=^{exports}', b'"gen":0')
+            run(f'bus call @control Configure name=foreign program={program} exports=^{exports}', b'"run_id":0')
             run('bus wait foreign/math', b'/ > ')
             run('bus describe foreign/math', b'"Add"')
             run('bus call foreign/math Add a=11 b=31', b'"sum":42')
@@ -279,6 +280,8 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         mark = len(output); send(b't'); until(b'Tree', mark); send(b'ts')
         send(b'/uart\r'); until(b'uart', start)
         mark = len(output); send(b'\r'); until(b'Program', mark); until(b'/boot/uart.elf', mark)
+        until(b'Elapsed', mark)
+        until(re.compile(rb'[0-9]+:[0-9]{2}:[0-9]{2}'), mark)
         capture('details')
         send(b'\x1b'); time.sleep(0.15)
         send(b'\x1b'); time.sleep(0.15)  # Clear the filter.

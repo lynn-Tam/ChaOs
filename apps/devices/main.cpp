@@ -317,7 +317,7 @@ int main() {
         if (status == STATUS_OK) status = grant(uart, "stdin", setup.capability(message["stdin"]), RIGHT_RECEIVE | RIGHT_DUPLICATE);
         if (status == STATUS_OK) status = grant(uart, "stdout", setup.capability(message["stdout"]), RIGHT_SEND | RIGHT_DUPLICATE);
         uart.setup.data.put("offset", console->offset); uart.desired = uart.restart = true;
-        records.push_back({"uart", "Serial port", "Serial", "Firmware", owner.find(uart.id)});
+        records.push_back({"uart", "Serial port", "Serial", "Firmware", owner.find(uart.child_id)});
         if (status == STATUS_OK) status = owner.start(uart);
         if (status != STATUS_OK) return status;
     }
@@ -365,7 +365,7 @@ int main() {
 
     if (device) {
         driver = owner.find(owner.add(device->name, "/boot/block.elf", {.bytes=8 * 1024 * 1024, .caps=256,
-            .slots=256, .pages=36}).id);
+            .slots=256, .pages=36}).child_id);
         for (auto& record : records) {
             char key[24] = "pci-"; const auto end = std::to_chars(key + 4, key + sizeof(key), device->rid, 16);
             if (record.id == std::string_view{key, end.ptr}) record.driver = driver;
@@ -376,17 +376,17 @@ int main() {
         if (status != STATUS_OK) sys::exit(status);
     }
     status = owner.attach(parent); if (status != STATUS_OK) return status;
-    uint64_t published_generation{}, publication{};
-    ubus_object inventory{"myos.devices"};
+    uint64_t published_run{}, publication{};
+    ubus_object inventory{"io.devices"};
     status = inventory.add("List", {}, {{"items", ubus_type::Array}}, [&](auto&, ubus_msg& response) -> status_t {
         ubus_data items{ubus_type::Array};
         for (const auto& record : records) {
             ubus_data row;
             std::string_view state = "Detected";
-            if (const auto& child = record.driver; child && owner.find(child->id)) {
+            if (const auto& child = record.driver; child && owner.find(child->child_id)) {
                 state = child->state == mgr_state::Failed ? "Failed" : !child->task ? "Stopped"
                     : child->state == mgr_state::Draining ? "Stopping" : child == driver
-                    ? published_generation == child->gen && !quiesced ? "Ready" : "Starting" : "In use";
+                    ? published_run == child->run_id && !quiesced ? "Ready" : "Starting" : "In use";
                 const auto program = child->image.substr(child->image.find_last_of('/') + 1);
                 row.put("driver", program.ends_with(".elf") ? program.substr(0, program.size() - 4) : program);
                 auto problem = child->state == mgr_state::Failed ? child->result : STATUS_OK;
@@ -408,7 +408,7 @@ int main() {
     ubus_msg announce, accepted;
     const auto peer_idx = announce.attach(listing->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
     if (!peer_idx) return peer_idx.error();
-    announce.data.put("name", "inventory").put("interface", "myos.devices").put("version", uint64_t{1})
+    announce.data.put("name", "inventory").put("interface", "io.devices").put("version", uint64_t{1})
         .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(announce), accepted); if (status != STATUS_OK) return status;
     for (;;) {
@@ -445,7 +445,7 @@ int main() {
                 quiesced = false; continue;
             }
         }
-        if (driver && driver->task && published_generation != driver->gen) {
+        if (driver && driver->task && published_run != driver->run_id) {
             auto connector = owner.lookup(device->name + "/block");
             if (!connector && connector.error() != STATUS_NOT_FOUND) return connector.error();
             if (connector) {
@@ -460,10 +460,10 @@ int main() {
                 request = {};
                 const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
                 if (!peer_idx) return peer_idx.error();
-                request.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
+                request.data.put("name", "block").put("interface", "io.block").put("version", uint64_t{1})
                     .cap("connector", *peer_idx);
                 status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
-                publication = response.data["instance"].as<uint64_t>().value_or(0); published_generation = driver->gen;
+                publication = response.data["instance"].as<uint64_t>().value_or(0); published_run = driver->run_id;
             }
         }
         if ((status = ev_wait(env.events, owner.deadline()).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);

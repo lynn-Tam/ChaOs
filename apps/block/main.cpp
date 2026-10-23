@@ -1,7 +1,7 @@
 #include "virtio.hpp"
 
 static blk_dev device;
-static ubus_object directory{"myos.block"};
+static ubus_object directory{"io.block"};
 struct blk_cmd { blk_op kind; uint64_t offset{}; ubus_buffer buffer{}; uint64_t deadline{}; };
 struct blk_client {
     vm_ptr<blk_client> next;
@@ -86,7 +86,7 @@ int main() {
     ubus_msg publication, response;
     const auto peer_idx = publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
     if (!peer_idx) return peer_idx.error();
-    publication.data.put("name", "block").put("interface", "myos.block").put("version", uint64_t{1})
+    publication.data.put("name", "block").put("interface", "io.block").put("version", uint64_t{1})
         .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(publication), response); if (status != STATUS_OK) return status;
     for (;;) {

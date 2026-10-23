@@ -28,7 +28,7 @@ static auto find(ubus_conn& owner, std::string_view name) -> ubus_data {
 }
 static auto action(ubus_conn& owner, ubus_value row, std::string_view name, bool stale = false) -> status_t {
     ubus_msg request, response;
-    request.data.put("id", row["id"]).put("gen", *row["gen"].as<uint64_t>() + uint64_t(stale)).put("action", name);
+    request.data.put("child_id", row["child_id"]).put("run_id", *row["run_id"].as<uint64_t>() + uint64_t(stale)).put("action", name);
     return owner.invoke("Action", std::move(request), response);
 }
 static void stopped(ubus_conn& owner, std::string_view name, std::string_view state = "idle") {
@@ -40,12 +40,12 @@ static auto running(ubus_conn& owner, std::string_view name, uint64_t previous =
     const auto deadline = *rt_after_ms(2000);
     for (;;) {
         auto row = find(owner, name);
-        if (row["state"].as<std::string_view>() == "running" && row["gen"].as<uint64_t>().value_or(0) > previous
+        if (row["state"].as<std::string_view>() == "running" && row["run_id"].as<uint64_t>().value_or(0) > previous
             && (!delivered || row["delivered"].as<bool>().value_or(false))) return row;
         if (rt_admit(deadline) != STATUS_OK) {
             ct_output output;
-            (void)libk::fmt::format_to<"[control] {} state={} gen={} previous={} result={}\n">(output, name,
-                row["state"].as<std::string_view>().value_or("?"), row["gen"].as<uint64_t>().value_or(0), previous, row["result"].as<int64_t>().value_or(0));
+            (void)libk::fmt::format_to<"[control] {} state={} run_id={} previous={} result={}\n">(output, name,
+                row["state"].as<std::string_view>().value_or("?"), row["run_id"].as<uint64_t>().value_or(0), previous, row["result"].as<int64_t>().value_or(0));
             check(false);
         }
     }
@@ -99,14 +99,14 @@ int main() {
     check(creator.invoke("Configure", std::move(permission), result) == STATUS_EXHAUSTED);
     const auto shell = find(owner, "shell");
     ubus_msg hidden, denied;
-    hidden.data.put("id", shell["id"]).put("gen", shell["gen"]).put("facet", "caps");
+    hidden.data.put("child_id", shell["child_id"]).put("run_id", shell["run_id"]).put("facet", "caps");
     check(readonly.invoke("Inspect", std::move(hidden), denied) == STATUS_DENIED);
     {
         hidden = {}; hidden.data.put("rights", uint64_t{3});
         check(owner.invoke("Delegate", std::move(hidden), denied) == STATUS_OK);
         ubus_conn ordinary; check(ordinary.bind(denied.capability(denied.data["connector"])) == STATUS_OK);
         check(!ordinary.token("CloseCap") && !ordinary.token("Revoke"));
-        hidden = {}; hidden.data.put("id", shell["id"]).put("gen", shell["gen"]).put("facet", "caps");
+        hidden = {}; hidden.data.put("child_id", shell["child_id"]).put("run_id", shell["run_id"]).put("facet", "caps");
         check(ordinary.invoke("Inspect", std::move(hidden), denied) == STATUS_DENIED);
         check(ordinary.invoke("Close", {}, denied) == STATUS_OK);
     }
@@ -124,10 +124,10 @@ int main() {
     check(owner.invoke("Configure", std::move(query), response) == STATUS_OK);
     query = {}; query.data.put("name", "no-activation/probe").put("activate", false);
     check(owner.invoke("Get", std::move(query), response) == STATUS_NOT_FOUND);
-    auto idle = find(owner, "no-activation"); check(idle["gen"].as<uint64_t>() == 0);
-    query = {}; query.data.put("id", idle["id"]).put("gen", idle["gen"]).put("version", idle["config"]).put("action", "remove");
+    auto idle = find(owner, "no-activation"); check(idle["run_id"].as<uint64_t>() == 0);
+    query = {}; query.data.put("child_id", idle["child_id"]).put("run_id", idle["run_id"]).put("version", idle["config"]).put("action", "remove");
     check(owner.invoke("Action", std::move(query), response) == STATUS_OK);
-    query = {}; query.data.put("id", shell["id"]).put("gen", shell["gen"]).put("facet", "caps");
+    query = {}; query.data.put("child_id", shell["child_id"]).put("run_id", shell["run_id"]).put("facet", "caps");
     check(owner.invoke("Inspect", std::move(query), response) == STATUS_OK);
     bool found{};
     for (const auto cap : response.data["items"].values()) {
@@ -138,7 +138,7 @@ int main() {
     }
     check(found);
     query = {};
-    query.data.put("id", shell["id"]).put("gen", shell["gen"]).put("facet", "caps")
+    query.data.put("child_id", shell["child_id"]).put("run_id", shell["run_id"]).put("facet", "caps")
         .put("cursor", uint64_t{1}).put("epoch", UINT64_MAX);
     check(owner.invoke("Inspect", std::move(query), response) == STATUS_STALE);
 
@@ -150,16 +150,16 @@ int main() {
     ubus_conn scoped;
     check(scoped.bind(response.capability(response.data["connector"])) == STATUS_OK);
     const auto child = running(owner, "control-sleep");
-    query = {}; query.data.put("id", shell["id"]).put("facet", "overview");
+    query = {}; query.data.put("child_id", shell["child_id"]).put("facet", "overview");
     check(scoped.invoke("Inspect", std::move(query), response) == STATUS_DENIED);
     query = {}; query.data.put("execution", true).put("rights", uint64_t{1});
     check(scoped.invoke("Delegate", std::move(query), response) == STATUS_OK);
     ubus_conn execution; check(execution.bind(response.capability(response.data["connector"])) == STATUS_OK);
     ubus_conn watcher; check(watcher.bind(control) == STATUS_OK);
-    query = {}; query.data.put("id", child["id"]).put("gen", child["gen"]).put("epoch", uint64_t{0});
+    query = {}; query.data.put("child_id", child["child_id"]).put("run_id", child["run_id"]).put("epoch", uint64_t{0});
     check(watcher.invoke("Changed", std::move(query), response) == STATUS_OK);
     const auto epoch = *response.data["epoch"].as<uint64_t>();
-    query = {}; query.data.put("id", child["id"]).put("gen", child["gen"]).put("epoch", epoch);
+    query = {}; query.data.put("child_id", child["child_id"]).put("run_id", child["run_id"]).put("epoch", epoch);
     query.deadline = *rt_after_ms(2000);
     check(watcher.begin("Changed", std::move(query)) == STATUS_OK);
     check(action(owner, child.view(), "stop") == STATUS_OK);
@@ -168,7 +168,7 @@ int main() {
         if (status == STATUS_OK) {
             if (response.status == STATUS_CLOSED) break;
             check(response.status == STATUS_OK && response.data["epoch"].as<uint64_t>() != epoch);
-            query = {}; query.data.put("id", child["id"]).put("gen", child["gen"])
+            query = {}; query.data.put("child_id", child["child_id"]).put("run_id", child["run_id"])
                 .put("epoch", response.data["epoch"]); query.deadline = *rt_after_ms(2000);
             const auto next = watcher.begin("Changed", std::move(query)); check(next == STATUS_OK);
             continue;
@@ -177,15 +177,15 @@ int main() {
     }
     stopped(owner, "control-sleep");
     check(action(owner, child.view(), "start") == STATUS_OK);
-    const auto replaced = running(owner, "control-sleep", *child["gen"].as<uint64_t>());
-    check(*replaced["gen"].as<uint64_t>() > *child["gen"].as<uint64_t>());
+    const auto replaced = running(owner, "control-sleep", *child["run_id"].as<uint64_t>());
+    check(*replaced["run_id"].as<uint64_t>() > *child["run_id"].as<uint64_t>());
     query = {}; query.data.put("facet", "overview");
     check(execution.invoke("Inspect", std::move(query), response) == STATUS_CLOSED);
     check(scoped.invoke("Inspect", {}, response) == STATUS_BAD_ARGS); // Still live across generations.
     check(action(owner, child.view(), "stop") == STATUS_STALE);
     check(action(owner, replaced.view(), "stop") == STATUS_OK);
     stopped(owner, "control-sleep");
-    query = {}; query.data.put("action", "remove").put("gen", replaced["gen"]).put("version", replaced["config"]);
+    query = {}; query.data.put("action", "remove").put("run_id", replaced["run_id"]).put("version", replaced["config"]);
     check(scoped.invoke("Action", std::move(query), response) == STATUS_OK);
     for (;;) {
         query = {}; query.data.put("facet", "overview");
@@ -199,10 +199,10 @@ int main() {
     query = {}; query.data.put("name", "created-peer").put("program", "/boot/sleep.elf").put("argv", args);
     check(creator.invoke("Spawn", std::move(query), response) == STATUS_OK);
     ubus_conn peer; check(peer.bind(response.capability(response.data["connector"])) == STATUS_OK);
-    query = {}; query.data.put("id", shell["id"]).put("facet", "overview");
+    query = {}; query.data.put("child_id", shell["child_id"]).put("facet", "overview");
     check(peer.invoke("Inspect", std::move(query), response) == STATUS_DENIED);
     const auto created = running(owner, "created-peer");
-    query = {}; query.data.put("gen", created["gen"]).put("action", "remove").put("version", created["config"]);
+    query = {}; query.data.put("run_id", created["run_id"]).put("action", "remove").put("version", created["config"]);
     check(peer.invoke("Action", std::move(query), response) == STATUS_OK);
     ch_pair channel; check(channel.open(env.alloc(), 1, 0) == STATUS_OK);
     const auto minted = sys::channel_mint(channel.ends[1].selector(), env.cspace, 1, RIGHT_SEND);
@@ -224,7 +224,7 @@ int main() {
     query.data.put("name", "linear-sleep").put("program", "/boot/supervisor.elf").put("argv", hold).put("setup", setup);
     check(owner.invoke("Spawn", std::move(query), response) == STATUS_OK);
     const auto linear = running(owner, "linear-sleep", 0, true);
-    query = {}; query.data.put("id", linear["id"]).put("gen", linear["gen"]).put("facet", "caps");
+    query = {}; query.data.put("child_id", linear["child_id"]).put("run_id", linear["run_id"]).put("facet", "caps");
     check(owner.invoke("Inspect", std::move(query), response) == STATUS_OK);
     cap_t selector{};
     for (const auto cap : response.data["items"].values())
@@ -232,7 +232,7 @@ int main() {
             && cap["rights"].as<uint64_t>() == (RIGHT_SEND | RIGHT_DUPLICATE | RIGHT_REVOKE))
             selector = *cap["selector"].as<cap_t>();
     check(selector != 0);
-    query = {}; query.data.put("id", linear["id"]).put("gen", linear["gen"]).put("selector", selector);
+    query = {}; query.data.put("child_id", linear["child_id"]).put("run_id", linear["run_id"]).put("selector", selector);
     check(owner.invoke("Revoke", std::move(query), response) == STATUS_OK);
     check(response.data["state"].as<uint64_t>().value_or(0) & (STATE_CLOSING | STATE_DRAINED));
     check(sys::wait_one(revocable.ends[0].selector(), SOURCE_TERMINAL, 0, *rt_after_ms(1000), 0, SOURCE_READ).status == STATUS_OK);
@@ -262,14 +262,14 @@ int main() {
     const auto attach = [&] {
         const auto deadline = *rt_after_ms(2000);
         for (;;) {
-            query = {}; query.data.put("id", root["id"]).put("facet", "children");
+            query = {}; query.data.put("child_id", root["child_id"]).put("facet", "children");
             const auto status = owner.invoke("Inspect", std::move(query), response);
             if (status == STATUS_OK) { check(branch.close() == STATUS_OK); check(branch.bind(response.capability(response.data["connector"])) == STATUS_OK); return; }
             check(status == STATUS_NOT_FOUND && rt_admit(deadline) == STATUS_OK);
         }
     };
     attach();
-    auto child_foreign = find(branch, "foreign"); check(child_foreign["gen"].as<uint64_t>() == 0);
+    auto child_foreign = find(branch, "foreign"); check(child_foreign["run_id"].as<uint64_t>() == 0);
     const auto connect = [&] {
         query = {}; query.data.put("name", "foreign/math");
         check(branch.invoke("Get", std::move(query), response) == STATUS_OK);
@@ -283,16 +283,16 @@ int main() {
     query = {}; query.data.put("name", "nested").put("program", "/boot/sleep.elf").put("argv", args);
     check(branch.invoke("Spawn", std::move(query), response) == STATUS_OK);
     check(action(owner, root.view(), "restart") == STATUS_OK);
-    auto fresh_root = running(owner, "branch", *root["gen"].as<uint64_t>()); attach();
+    auto fresh_root = running(owner, "branch", *root["run_id"].as<uint64_t>()); attach();
     (void)running(branch, "foreign"); connect();
-    check(find(branch, "nested")["gen"].as<uint64_t>() == 0); // One-shot execution is not replayed.
+    check(find(branch, "nested")["run_id"].as<uint64_t>() == 0); // One-shot execution is not replayed.
     child_foreign = find(branch, "foreign");
-    query = {}; query.data.put("id", child_foreign["id"]).put("gen", child_foreign["gen"]).put("version", child_foreign["config"]).put("action", "remove");
+    query = {}; query.data.put("child_id", child_foreign["child_id"]).put("run_id", child_foreign["run_id"]).put("version", child_foreign["config"]).put("action", "remove");
     check(branch.invoke("Action", std::move(query), response) == STATUS_OK);
     check(action(owner, fresh_root.view(), "restart") == STATUS_OK);
-    fresh_root = running(owner, "branch", *fresh_root["gen"].as<uint64_t>()); attach();
+    fresh_root = running(owner, "branch", *fresh_root["run_id"].as<uint64_t>()); attach();
     query = {}; query.data.put("name", "foreign"); check(branch.invoke("Lookup", std::move(query), response) == STATUS_NOT_FOUND);
-    query = {}; query.data.put("id", fresh_root["id"]).put("gen", fresh_root["gen"]).put("version", fresh_root["config"]).put("action", "remove");
+    query = {}; query.data.put("child_id", fresh_root["child_id"]).put("run_id", fresh_root["run_id"]).put("version", fresh_root["config"]).put("action", "remove");
     check(owner.invoke("Action", std::move(query), response) == STATUS_OK); check(branch.close() == STATUS_OK);
     for (const auto deadline = *rt_after_ms(2000);;) {
         query = {}; query.data.put("name", "branch");

@@ -14,7 +14,8 @@ inline constexpr auto mgr_state_name(mgr_state state) -> std::string_view {
 // One deployment owns its environment, immutable recipe and current execution.
 // Scope is always owned, never an optional external lifetime patch.
 struct mgr_child {
-    uint64_t id{}, gen{}, version{1}, environment{}, capacity{32};
+    // child_id is local to this manager; run_id is the execution Scope object ID.
+    uint64_t child_id{}, run_id{}, version{1}, environment{}, capacity{32};
     std::string name, image;
     std::vector<std::string> args, env;
     uint32_t cpu{};
@@ -25,7 +26,7 @@ struct mgr_child {
     ubus_data routes, exports{ubus_type::Array}, recipe, origin;
     ubus_msg setup;
     cap_owner observe, manage, root_scope;
-    uint64_t root_version{};
+    uint64_t root_version{}, started{};
     vm_area source;
     std::function<std::expected<proc_image, status_t>()> loading;
     struct snapshot { uint64_t version{}; bool replayable{}, active{}; ubus_msg recipe; };
@@ -39,14 +40,14 @@ struct mgr_child {
 
 class mgr {
     struct publication {
-        uint64_t id{}, owner{}, gen{}, version{};
+        uint64_t id{}, owner{}, run_id{}, version{};
         std::string name, interface;
         cap_owner connector;
         ev_watch terminal;
     };
     struct pending {
         enum kind { Get, Receive, Send, Changed, Configure, Spawn, Action } operation{};
-        uint64_t source{}, environment{}, version{}, provider{}, provider_version{}, gen{}, epoch{}, authority{};
+        uint64_t source{}, environment{}, version{}, provider{}, provider_version{}, run_id{}, epoch{}, authority{};
         std::string name;
         ubus_request request;
         ubus_msg staged;
@@ -56,7 +57,7 @@ class mgr {
         bool introduced{};
     };
     struct loan {
-        uint64_t source{}, gen{}, authority{};
+        uint64_t source{}, run_id{}, authority{};
         cap_owner quota;
         ev_watch drained{};
     };
@@ -68,14 +69,14 @@ class mgr {
     std::map<uint64_t, publication> publications_;
     std::vector<std::unique_ptr<pending>> pending_;
     struct facet {
-        uint64_t parent{}, target{}, run{};
+        uint64_t parent{}, target{}, run_id{};
         word_t rights{};
         bool closed{};
         uint64_t grant{};
         ev_watch drained{};
     };
     std::map<word_t, facet> facets_;
-    ubus_object object_{"ubus.environment", 2, 0,
+    ubus_object object_{"ubus.environment", 3, 0,
         [this](word_t facet, std::string_view method) { return access(facet, method); }};
     uint64_t next_{}, next_badge_{3}, next_publication_{}, identity_{}, cspace_id_{}, epoch_{1}, deadline_{};
     size_t capacity_{128};
@@ -84,7 +85,7 @@ class mgr {
     auto live(word_t) -> bool;
     auto descends(word_t, word_t) const -> bool;
     auto access(word_t, std::string_view) -> status_t;
-    auto issue(word_t parent, word_t rights, uint64_t target = 0, uint64_t run = 0, bool independent = false) -> std::expected<cap_owner, status_t>;
+    auto issue(word_t parent, word_t rights, uint64_t target = 0, uint64_t run_id = 0, bool independent = false) -> std::expected<cap_owner, status_t>;
     auto admit(const ubus_request&) -> status_t;
     auto request(std::string_view, ubus_request&, ubus_msg&) -> status_t;
     auto resolve(mgr_child*, std::string_view, ubus_msg&, pending*) -> status_t;

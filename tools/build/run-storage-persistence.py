@@ -35,7 +35,7 @@ def boot(qemu, kernel, bundle, data_disk, cpus, commands,
                     raise RuntimeError("QEMU serial closed")
                 output.extend(chunk)
                 fault = output.find(b"user: contained fault")
-                if b"MYOS KERNEL PANIC" in output or (fault >= 0 and b"\n" in output[fault:]):
+                if b"KERNEL PANIC" in output or (fault >= 0 and b"\n" in output[fault:]):
                     raise RuntimeError(f"guest fault; tail={output[-2000:]!r}")
 
     def command(text, interactions=()):
@@ -134,13 +134,13 @@ def main():
                 ("cat note", b"hello-persistent-again\n/ > "),
                 ("ls", b"note\n"),
                 ("ls /boot", b"cat.elf"),
-                ("cat /boot/README.TXT", b"myos disk file service"),
+                ("cat /boot/README.TXT", b"Disk file service"),
                 ("write /boot/denied no", b"error: "),
                 ("cp /boot/README.TXT readme", b"/ > "),
-                ("cat readme", b"myos disk file service"),
+                ("cat readme", b"Disk file service"),
                 ("cp /boot/cat.elf cat.elf", b"/ > "),
                 ("fs stat cat.elf", package_size),
-                ("/cat.elf /boot/README.TXT", b"myos disk file service"),
+                ("/cat.elf /boot/README.TXT", b"Disk file service"),
                 ("echo stream-persisted > piped", b"/ > "),
                 ("cat piped", b"stream-persisted"),
                 ("cat piped > copied", b"/ > "),
@@ -157,7 +157,7 @@ def main():
             resumed = [
                 ("cat note", b"hello-persistent-again"),
                 ("cat note", b"hello-persistent-again"),
-                ("cat readme", b"myos disk file service"),
+                ("cat readme", b"Disk file service"),
                 ("fs stat cat.elf", package_size),
                 ("cat piped", b"stream-persisted"),
                 ("cat copied", b"stream-persisted"),
@@ -166,13 +166,13 @@ def main():
                 ("cat edited", b"editor-persistent"),
                 ("cat fd-async", b"CR"),
                 ("svc stop store", b"service change requested", {"store": "idle", "vfs": "running"}),
-                ("cat /boot/README.TXT", b"myos disk file service"),
+                ("cat /boot/README.TXT", b"Disk file service"),
                 ("echo storage-offline", b"storage-offline"),
                 ("cat note", b"hello-persistent-again"),
                 ("svc start store", b"service change requested", ["store", "vfs"]),
                 ("cat note", b"hello-persistent-again"),
                 ("svc restart store", b"service change requested", ["store", "vfs"]),
-                ("cat readme", b"myos disk file service"),
+                ("cat readme", b"Disk file service"),
                 ("fs mv note renamed", b"/ > "),
                 ("fs rm renamed", b"/ > "),
                 ("ls", b"readme\n"),
@@ -195,7 +195,7 @@ def main():
         source = f"blkdebug:{config}:{data_disk}"
         boot(qemu, kernel, bundle, data_disk, "1", [
             ("fs write readme uncertain", b"error: ", ["store", "vfs"]),
-            ("cat readme", b"myos disk file service"),
+            ("cat readme", b"Disk file service"),
             ("fs write readme recovered", b"/ > "),
         ], source)
         boot(qemu, kernel, bundle, data_disk, "1", [

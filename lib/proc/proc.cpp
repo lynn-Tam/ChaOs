@@ -51,18 +51,6 @@ class proc_loader {
             return STATUS_BAD_ARGS;
         return mem_write(mem, offset, {reinterpret_cast<const std::byte*>(src), n});
     }
-    auto make_desc(const void* src, size_t n) noexcept -> std::expected<owner, status_t> {
-        const auto size = libk::checked_align_up(n, page_size).value_or(0);
-        if (!size || !src)
-            return std::unexpected(STATUS_BAD_ARGS);
-        auto mem = memory(size);
-        if (!mem)
-            return mem;
-        const auto s = write(mem->selector(), size, 0, src, n);
-        if (s != STATUS_OK)
-            return std::unexpected(s);
-        return mem;
-    }
     auto install(cap_t mem, word_t address, word_t size, word_t perms, word_t first = 0,
                  word_t flags = 0) noexcept -> status_t {
         auto region = adopt(sys::vm_slice(vm_, address, size, perms, RIGHT_MAP | RIGHT_UNMAP));
@@ -105,43 +93,27 @@ class proc_loader {
                 const auto length = shared                           ? last - offset
                                     : offset < first && first < last ? first - offset
                                                                      : size - offset;
-                std::expected<owner, status_t> mem;
+                owner mem;
+                cap_t cap = source.memory;
                 word_t page{};
                 if (shared) {
+                    // Map's range and slice ceiling already attenuate this
+                    // backing. The installed relation retains its grant.
                     page = (source.offset + seg.offset + offset - skip) / page_size;
-                    const CapView view{.version = CAP_ATTENUATION_VERSION_CURRENT,
-                                       .kind = ObjMem,
-                                       .size = CAP_ATTENUATION_SIZE,
-                                       .rights = RIGHT_MAP,
-                                       .words = {page, length / page_size,
-                                                 (perms & VM_WRITE) ? VM_READ : perms}};
-                    std::array<uint8_t, CAP_ATTENUATION_SIZE> wire{};
-                    cap_encode(view, wire);
-                    auto desc = make_desc(wire.data(), wire.size());
-                    if (!desc)
-                        return desc.error();
-                    mem = adopt(sys::cap_typed_delegate(source.memory, 0, desc->selector()));
                 } else {
-                    mem = memory(length, perms | VM_READ | VM_WRITE);
-                    if (mem) {
-                        const auto begin = std::max(offset, skip);
-                        const auto end = std::min(offset + length, skip + seg.file_size);
-                        auto status =
-                            begin < end
-                                ? write(mem->selector(), length, begin - offset,
-                                        elf.bytes().data() + seg.offset + begin - skip, end - begin)
-                                : STATUS_OK;
-                        if (status == STATUS_OK && (perms & VM_EXECUTE))
-                            status = sys::memory_seal(mem->selector()).status;
-                        if (status != STATUS_OK)
-                            return status;
-                    }
+                    auto made = memory(length, perms | VM_READ | VM_WRITE);
+                    if (!made) return made.error();
+                    mem = std::move(*made); cap = mem.selector();
+                    const auto begin = std::max(offset, skip);
+                    const auto end = std::min(offset + length, skip + seg.file_size);
+                    auto status = begin < end
+                        ? write(cap, length, begin - offset, elf.bytes().data() + seg.offset + begin - skip, end - begin)
+                        : STATUS_OK;
+                    if (status == STATUS_OK && (perms & VM_EXECUTE)) status = sys::memory_seal(cap).status;
+                    if (status != STATUS_OK) return status;
                 }
-                if (!mem)
-                    return mem.error();
-                const auto status =
-                    install(mem->selector(), seg.va - skip + offset, length, perms, page,
-                            shared && (perms & VM_WRITE) ? VM_MAP_PRIVATE : 0);
+                const auto status = install(cap, seg.va - skip + offset, length, perms, page,
+                    shared && (perms & VM_WRITE) ? VM_MAP_PRIVATE : 0);
                 if (status != STATUS_OK)
                     return status;
                 offset += length;

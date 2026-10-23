@@ -112,7 +112,7 @@ class sh_shell {
         const auto id = job.id;
         for (auto& stage : job.stages) if (stage.child) {
             for (;;) {
-                const auto status = owner_.erase(stage.child->id);
+                const auto status = owner_.erase(stage.child->child_id);
                 if (status == STATUS_OK || status == STATUS_NOT_FOUND) break;
                 if (status != STATUS_WOULD_BLOCK) sys::exit(status);
                 pump();
@@ -200,7 +200,7 @@ class sh_shell {
             if (const auto closed = files_.close(); closed != STATUS_OK) return std::unexpected(closed);
             query.data.put("name", "exec");
             status = bus_.invoke("Get", std::move(query), response);
-            if (status == STATUS_OK) status = files_.bind(response.capability(response.data["connector"]), "myos.files", 1, 1);
+            if (status == STATUS_OK) status = files_.bind(response.capability(response.data["connector"]), "io.files", 1, 1);
             if (status != STATUS_OK) return std::unexpected(status);
         }
         query = {}; query.data.put("path", path).put("perms", word_t{VM_READ | VM_EXECUTE});
@@ -224,7 +224,7 @@ class sh_shell {
             {.bytes=bytes, .caps=caps, .slots=std::max<uint64_t>(256, caps), .pages=(std::max<uint64_t>(256, caps) + 7) / 8 + 4,
                 .quota_perms=RIGHT_CREATE | RIGHT_INSPECT,
                 .watches=limits["watches"].as<uint64_t>().value_or(64), .hints=limits["hints"].as<uint64_t>().value_or(16), .max_bytes=std::max<uint64_t>(bytes, 16 * 1024 * 1024), .max_caps=std::max<uint64_t>(caps, 256)});
-        stage.child = owner_.find(child.id); child.args.clear();
+        stage.child = owner_.find(child.child_id); child.args.clear();
         if (policy["argv"]) for (const auto arg : policy["argv"].values()) child.args.emplace_back(*arg.as<std::string_view>());
         else child.args = {std::string{argv[0]}};
         for (const auto arg : argv.subspan(1)) child.args.emplace_back(arg);
@@ -279,7 +279,7 @@ public:
         ubus_conn files;
         ubus_msg query, reply; query.data.put("name", "read");
         auto status = bus_.invoke("Get", std::move(query), reply);
-        if (status == STATUS_OK) status = files.bind(reply.capability(reply.data["connector"]), "myos.files", 1, 1);
+        if (status == STATUS_OK) status = files.bind(reply.capability(reply.data["connector"]), "io.files", 1, 1);
         if (status != STATUS_OK) return status;
         const auto target = sh_path(path, cwd_);
         query = {}; query.data.put("path", target);
@@ -347,12 +347,13 @@ public:
                 }
             }
             if (done && job.fullscreen && foreground_ == job.id) leave(job);
-            if (!screen_ && output_.size() < 64) {
+            for (unsigned i = 0; !screen_ && output_.size() < 64 && i < 16; ++i) {
                 sh_chunk frame;
                 const auto status = sh_receive(job.output_rx, frame);
                 job.output_empty = status == STATUS_WOULD_BLOCK || status == STATUS_CLOSED || status == STATUS_PEER_CLOSED;
-                progress |= status == STATUS_OK;
-                if (status == STATUS_OK && frame.size) {
+                if (status != STATUS_OK) break;
+                progress = true;
+                if (frame.size) {
                     const bool background = !foreground_;
                     if (background && prompt_visible_) { enqueue("\r\x1b[2K"); prompt_visible_ = false; }
                     output_.push_back({frame, job.id, 0});
@@ -682,7 +683,6 @@ static void command(sh_shell& shell, std::string text) {
 int main() {
     const auto& info = rt_startup();
     sh_shell shell{info};
-    sh_writer{shell.output()}.write("myos native shell\n");
     shell.prompt();
     for (;;) {
         command(shell, shell.read());

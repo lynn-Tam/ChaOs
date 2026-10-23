@@ -245,7 +245,7 @@ static auto files() -> status_t {
     }
     ubus_msg request, response; request.data.put("name", "files");
     const auto status = dir_bus.invoke("Get", std::move(request), response);
-    return status == STATUS_OK ? dir_rpc.bind(response.capability(response.data["connector"]), "myos.files", 1, 1) : status;
+    return status == STATUS_OK ? dir_rpc.bind(response.capability(response.data["connector"]), "io.files", 1, 1) : status;
 }
 static std::deque<std::unique_ptr<directory>> dirs;
 static auto desc(int fd) noexcept -> open_desc* {

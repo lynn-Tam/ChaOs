@@ -25,7 +25,7 @@ static auto st_path(std::string_view path, std::string_view base = "/") -> std::
     result.resize(size); result.insert(0, "/"); return result;
 }
 
-static ubus_object directory{"myos.files"};
+static ubus_object directory{"io.files"};
 static uint64_t epoch{1};
 static st_device backend;
 static st_vol volume;
@@ -729,7 +729,7 @@ int main(int argc, char** argv) {
     if (!store_memory.quota || !store_memory.scope) return STATUS_DENIED;
     ubus_msg query, response; query.data.put("name", "block");
     status = bus.invoke("Get", std::move(query), response);
-    if (status == STATUS_OK) status = block.bind(response.capability(response.data["connector"]), "myos.block", 1, 1);
+    if (status == STATUS_OK) status = block.bind(response.capability(response.data["connector"]), "io.block", 1, 1);
     if (status == STATUS_OK) {
         query = {}; query.data.put("action", "lend").put("bytes", uint64_t{192 * 1024}).put("caps", uint64_t{0})
             .put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
         ubus_msg request, response;
         const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
         if (!peer_idx) return peer_idx.error();
-        request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
+        request.data.put("name", name).put("interface", "io.files").put("version", uint64_t{1})
             .cap("connector", *peer_idx);
         status = bus.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     }

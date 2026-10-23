@@ -1,5 +1,5 @@
 project(
-  'myos',
+  'os',
   ['c', 'cpp'],
   version: '0.1.0',
   default_options: ['c_std=gnu11', 'cpp_std=gnu++23', 'buildtype=plain', 'b_ndebug=true', 'b_pie=false', 'b_staticpic=false'],
@@ -434,10 +434,10 @@ run_target('run-storage-persistence', command: [find_program('python3'),
 run_target('run-debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug])
 run_target('debug', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel_debug, '-S', '-gdb', 'tcp:' + get_option('gdb_host') + ':' + get_option('gdb_port').to_string()])
 run_target('run-wait-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_wait, 'marker',
-  '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
+  '--exact-failed-zero', '--forbid', 'KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
   '[scenario] wait publication ok'])
 run_target('run-wait-test-dual', command: [sh, run_qemu, qemu, timeout, '2', kernel_wait, 'marker',
-  '--exact-failed-zero', '--forbid', 'MYOS KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
+  '--exact-failed-zero', '--forbid', 'KERNEL PANIC', '--stop-when', '[scenario] wait publication ok',
   '[scenario] pending VM wait completed after remote shootdown', '[scenario] wait publication ok'])
 
 run_target('run-ubus', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
@@ -459,9 +459,9 @@ run_target('run-io-dual-console-matrix', command: [find_program('python3'),
   depends: [kernel, boot_bundle])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: online=' + smp])
 if get_option('panic_probe') == 1
-  run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'MYOS KERNEL PANIC', 'context: call-site', 'expression: false'])
+  run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'KERNEL PANIC', 'context: call-site', 'expression: false'])
 elif get_option('panic_probe') == 2
-  run_target('run-panic-degraded-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', 'MYOS KERNEL PANIC', 'no acknowledgement'])
+  run_target('run-panic-degraded-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', 'KERNEL PANIC', 'no acknowledgement'])
 endif
 scenario_marker = ''
 if scenario_name == 'ordinary'

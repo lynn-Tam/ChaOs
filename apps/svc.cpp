@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
             (void)libk::fmt::format_to<"{} {}\n">(output, full, row["state"].as<std::string_view>().value_or("unknown"));
             if (row["children"].as<bool>().value_or(false)) {
                 ubus_msg request, nested;
-                request.data.put("id", row["id"]).put("gen", row["gen"]).put("facet", "children");
+                request.data.put("child_id", row["child_id"]).put("run_id", row["run_id"]).put("facet", "children");
                 status = connection.invoke("Inspect", std::move(request), nested); if (status != STATUS_OK) return status;
                 ubus_conn child; status = child.bind(nested.capability(nested.data["connector"])); if (status != STATUS_OK) return status;
                 status = self(self, child, full, depth + 1); if (status != STATUS_OK) return status;
@@ -60,14 +60,14 @@ int main(int argc, char** argv) {
         ubus_conn target; status = target.bind(cap.selector()); if (status != STATUS_OK) return status;
         request = {}; request.data.put("facet", "overview");
         status = target.invoke("Inspect", std::move(request), response); if (status != STATUS_OK) return status;
-        const auto gen = response.data["items"][size_t{0}]["gen"].as<uint64_t>(); if (!gen) return STATUS_PEER_FAULT;
+        const auto run_id = response.data["items"][size_t{0}]["run_id"].as<uint64_t>(); if (!run_id) return STATUS_PEER_FAULT;
         if (slash == path.npos) {
-            request = {}; request.data.put("action", verb).put("gen", *gen).put("version", response.data["items"][size_t{0}]["config"]);
+            request = {}; request.data.put("action", verb).put("run_id", *run_id).put("version", response.data["items"][size_t{0}]["config"]);
             status = target.invoke("Action", std::move(request), response);
             if (status == STATUS_OK) { constexpr std::string_view text{"service change requested\n"}; output.write(text.data(), text.size()); }
             return status;
         }
-        request = {}; request.data.put("facet", "children").put("gen", *gen);
+        request = {}; request.data.put("facet", "children").put("run_id", *run_id);
         status = target.invoke("Inspect", std::move(request), response); if (status != STATUS_OK) return status;
         cap = response.take(response.data["connector"]);
         status = owner.close(); if (status == STATUS_OK) status = owner.bind(cap.selector()); if (status != STATUS_OK) return status;

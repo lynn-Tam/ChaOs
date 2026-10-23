@@ -27,7 +27,7 @@ struct vf_mount {
 static std::map<std::string, vf_mount, std::less<>> mounts;
 static uint64_t epoch{1}, next_binding{};
 static ubus_conn bus;
-static ubus_object directory{"myos.files"};
+static ubus_object directory{"io.files"};
 
 static auto route(std::string_view path) -> decltype(mounts.begin()) {
     auto result = mounts.end();
@@ -53,7 +53,7 @@ static auto connect(vf_mount& mount, uint64_t generation = 0) -> status_t {
     auto connection = std::make_unique<ubus_conn>();
     ubus_msg query, reply; query.data.put("name", mount.service);
     auto status = bus.invoke("Get", std::move(query), reply);
-    if (status == STATUS_OK) status = connection->bind(reply.capability(reply.data["connector"]), "myos.files", 1, 1);
+    if (status == STATUS_OK) status = connection->bind(reply.capability(reply.data["connector"]), "io.files", 1, 1);
     if (status != STATUS_OK) return status;
     mount.connection = std::move(connection); mount.generation = ++next_binding;
     return STATUS_OK;
@@ -209,7 +209,7 @@ int main() {
         ubus_msg request, response;
         const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
         if (!peer_idx) return peer_idx.error();
-        request.data.put("name", name).put("interface", "myos.files").put("version", uint64_t{1})
+        request.data.put("name", name).put("interface", "io.files").put("version", uint64_t{1})
             .cap("connector", *peer_idx);
         status = bus.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     }

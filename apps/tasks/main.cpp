@@ -14,6 +14,13 @@ static auto ts_match(std::string text, std::string query) -> bool {
     for (auto* value : {&text, &query}) for (auto& c : *value) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
     return query.empty() || text.find(query) != text.npos;
 }
+static auto ts_duration(uint64_t seconds) -> std::string {
+    const auto days = seconds / 86400; seconds %= 86400;
+    const auto minutes = seconds / 60 % 60, remainder = seconds % 60;
+    return (days ? std::to_string(days) + "d " : "") + std::to_string(seconds / 3600)
+        + (minutes < 10 ? ":0" : ":") + std::to_string(minutes)
+        + (remainder < 10 ? ":0" : ":") + std::to_string(remainder);
+}
 static auto ts_percent(uint64_t n) -> std::string { return std::to_string(n / 10) + "." + std::to_string(n % 10) + "%"; }
 static auto ts_error(status_t s) -> std::string {
     switch (s) {
@@ -37,7 +44,7 @@ static auto ts_name(ubus_value row) -> std::string {
 }
 static auto ts_state(ubus_value row) -> std::string {
     const auto state = ts_text(row["state"]);
-    if (state == "idle") return ts_num(row["gen"]) ? "Stopped" : "On demand";
+    if (state == "idle") return ts_num(row["run_id"]) ? "Stopped" : "On demand";
     if (state == "running") return "Running";
     if (state == "starting" || state == "loading") return "Starting";
     if (state == "draining") return "Stopping";
@@ -50,20 +57,33 @@ struct ts_item {
     std::weak_ptr<ts_scope> owner;
     std::shared_ptr<ts_scope> children;
     ubus_data data;
+    std::optional<std::string> command;
     std::string key, path;
     uint64_t serial{}, tick{};
     std::vector<uint64_t> threads;
     std::optional<uint64_t> cpu;
-    std::deque<uint64_t> history, memory;
+
     bool expanded{true};
 };
+static void ts_sample(ts_item& item, ubus_value row) {
+    const auto samples = row["cpu"].vector<uint64_t>(); const auto tick = ts_num(row["sampled"]);
+    if (!samples) { item.cpu.reset(); item.threads.clear(); item.tick = 0; return; }
+    if (tick <= item.tick) return;
+    bool same = item.tick && item.threads.size() == samples->size(); uint64_t elapsed{};
+    for (size_t i = 0; same && i + 1 < samples->size(); i += 2) {
+        same = item.threads[i] == (*samples)[i] && item.threads[i + 1] <= (*samples)[i + 1];
+        if (same) elapsed += (*samples)[i + 1] - item.threads[i + 1];
+    }
+    item.cpu = same ? std::optional{elapsed * 1000 / (tick - item.tick) / rt_startup().cpus} : std::nullopt;
+    item.threads.assign(samples->begin(), samples->end()); item.tick = tick;
+}
 struct ts_scope {
     cap_owner cap;
     ubus_conn connection;
     std::weak_ptr<ts_item> parent;
     std::vector<std::shared_ptr<ts_item>> items;
     std::string path, error;
-    uint64_t identity{};
+    uint64_t identity{}, round{};
     bool attempted{};
 };
 class ts_view {
@@ -75,11 +95,9 @@ class ts_view {
     std::vector<ubus_data> devices_data_;
     std::vector<std::pair<std::shared_ptr<ts_item>, size_t>> rows_;
     std::string selection_, device_selection_, filter_, notice_, device_error_;
-    uint64_t serial_{}, refresh_{};
-    size_t scan_{};
+    uint64_t serial_{}, refresh_{}, round_{}, device_round_{}, frequency_{}, now_{};
     int page_{}, sort_{}, menu_{}, choice_{};
     bool tree_{}, all_{}, detail_{}, search_{}, help_{}, frozen_{}, devices_loaded_{}, dirty_{true}, quit_{};
-    ubus_data details_;
     ftxui::Component input_, ui_;
     enum op { Bind, List, Children, Detail, DeviceGet, DeviceBind, Devices, Action };
     struct query {
@@ -87,11 +105,12 @@ class ts_view {
         std::shared_ptr<ts_scope> scope;
         std::shared_ptr<ts_item> item;
         ubus_msg message;
-        uint64_t gen{}, version{};
+        uint64_t run_id{}, version{};
     };
-    std::optional<query> active_, intent_;
+    std::vector<query> active_;
+    std::optional<query> intent_;
     std::shared_ptr<ts_item> target_;
-    uint64_t target_gen_{}, target_version_{};
+    uint64_t target_run_{}, target_version_{};
     std::vector<std::string> actions_;
 
     auto scopes() const -> std::vector<std::shared_ptr<ts_scope>> {
@@ -148,8 +167,8 @@ class ts_view {
     }
     auto inspect(op kind, const std::shared_ptr<ts_item>& item) -> query {
         query q; q.kind = kind; q.scope = item->owner.lock(); q.item = item;
-        q.gen = ts_num(item->data["gen"]); q.version = ts_num(item->data["root_version"]);
-        q.message.data.put("id", item->data["id"]).put("gen", q.gen).put("facet", kind == Children ? "children" : "overview");
+        q.run_id = ts_num(item->data["run_id"]); q.version = ts_num(item->data["root_version"]);
+        q.message.data.put("child_id", item->data["child_id"]).put("run_id", q.run_id).put("facet", kind == Children ? "children" : "overview");
         return q;
     }
     auto connection(query& q) -> ubus_conn& {
@@ -157,24 +176,34 @@ class ts_view {
     }
     void begin(query q) {
         q.message.deadline = rt_after_ms(800).value_or(0);
+        if (connection(q).active()) return;
+        const uint64_t version = q.kind == Bind ? 3 : 1;
         const auto status = q.kind == Bind || q.kind == DeviceBind
-            ? connection(q).begin_bind(q.kind == Bind ? q.scope->cap.selector() : device_cap_.selector(), q.kind == Bind ? "ubus.environment" : "myos.devices", 1, 1, 0, q.message.deadline)
+            ? connection(q).begin_bind(q.kind == Bind ? q.scope->cap.selector() : device_cap_.selector(), q.kind == Bind ? "ubus.environment" : "io.devices", version, version, 0, q.message.deadline)
             : connection(q).begin(q.kind == List || q.kind == Devices ? "List" : q.kind == DeviceGet ? "Get" : q.kind == Action ? "Action" : "Inspect", std::move(q.message));
-        if (status == STATUS_OK) active_ = std::move(q);
+        if (status == STATUS_OK) active_.push_back(std::move(q));
         else {
             if (q.scope && (q.kind == Bind || q.kind == List || q.kind == Children)) q.scope->error = ts_error(status);
             else notice_ = ts_error(status);
-            refresh_ = rt_after_ms(1000).value_or(0); dirty_ = true;
+            dirty_ = true;
         }
     }
-    void reply() {
-        if (!active_) return;
-        ubus_msg response;
-        auto& q = *active_;
-        const auto code = q.kind == Bind || q.kind == DeviceBind ? connection(q).poll_bind() : connection(q).poll(response);
-        if (code == STATUS_WOULD_BLOCK) return;
-        const auto status = code == STATUS_OK ? response.status : code;
-        auto done = std::move(q); active_.reset();
+    auto poll() -> bool {
+        bool changed{};
+        for (auto it = active_.begin(); it != active_.end();) {
+            ubus_msg response;
+            auto& q = *it;
+            const auto code = q.kind == Bind || q.kind == DeviceBind ? connection(q).poll_bind() : connection(q).poll(response);
+            if (code == STATUS_WOULD_BLOCK) { ++it; continue; }
+            const auto status = code == STATUS_OK ? response.status : code;
+            auto done = std::move(q); it = active_.erase(it);
+            changed = true;
+            reply(std::move(done), status, std::move(response));
+        }
+        return changed;
+    }
+    void reply(query done, status_t status, ubus_msg response) {
+        if (done.item && ts_num(done.item->data["run_id"]) != done.run_id) return;
         if (status != STATUS_OK) {
             if (done.kind == List || done.kind == Bind) done.scope->error = ts_error(status);
             else if (done.kind == Children && done.item) {
@@ -185,7 +214,6 @@ class ts_view {
             } else notice_ = ts_error(status);
             dirty_ = true; return;
         }
-        if (done.item && ((selected() != done.item && done.kind == Detail) || ts_num(done.item->data["gen"]) != done.gen)) return;
         if (done.kind == List) {
             auto& scope = *done.scope; scope.error.clear();
             const auto identity = ts_num(response.data["owner"]);
@@ -196,74 +224,83 @@ class ts_view {
             std::vector<std::shared_ptr<ts_item>> incoming;
             for (const auto row : response.data["items"].values()) {
                 if (incoming.size() >= std::min(size_t{128}, size_t{256} - std::min(retained, size_t{256}))) { scope.error = "List limit reached"; notice_ = scope.error; break; }
-                const auto found = std::ranges::find_if(scope.items, [&](const auto& item) { return ts_num(item->data["id"]) == ts_num(row["id"]); });
+                const auto found = std::ranges::find_if(scope.items, [&](const auto& item) { return ts_num(item->data["child_id"]) == ts_num(row["child_id"]); });
                 auto item = found == scope.items.end() ? std::make_shared<ts_item>() : *found;
                 if (!item->serial) item->serial = ++serial_;
                 if (!ts_flag(row["children"]) || item->data["root_version"].as<uint64_t>() != row["root_version"].as<uint64_t>()) item->children.reset();
-                if (item->data["gen"].as<uint64_t>() != row["gen"].as<uint64_t>()) { item->tick = 0; item->threads.clear(); item->history.clear(); item->memory.clear(); item->children.reset(); }
-                item->owner = done.scope; item->key = std::to_string(identity) + ":" + std::to_string(ts_num(row["id"]));
+                if (item->data["run_id"].as<uint64_t>() != row["run_id"].as<uint64_t>()) { item->tick = 0; item->threads.clear(); item->children.reset(); }
+                if (item->data["run_id"].as<uint64_t>() != row["run_id"].as<uint64_t>()
+                    || item->data["config"].as<uint64_t>() != row["config"].as<uint64_t>()) item->command.reset();
+                item->owner = done.scope; item->key = std::to_string(identity) + ":" + std::to_string(ts_num(row["child_id"]));
                 item->path = scope.path + "/" + ts_text(row["name"]);
-                const auto samples = row["cpu"].vector<uint64_t>(); const auto tick = ts_num(row["sampled"]);
-                if (tick != item->tick || !samples) item->cpu.reset();
-                if (samples) {
-                    bool same = item->tick && tick > item->tick && item->threads.size() == samples->size(); uint64_t elapsed{};
-                    for (size_t i = 0; same && i + 1 < samples->size(); i += 2) {
-                        same = item->threads[i] == (*samples)[i] && item->threads[i + 1] <= (*samples)[i + 1];
-                        if (same) elapsed += (*samples)[i + 1] - item->threads[i + 1];
-                    }
-                    if (same) { item->cpu = elapsed * 1000 / (tick - item->tick) / rt_startup().cpus; item->history.push_back(*item->cpu); if (item->history.size() > 40) item->history.pop_front(); }
-                    item->threads.assign(samples->begin(), samples->end()); item->tick = tick;
-                } else { item->threads.clear(); item->tick = 0; }
-                if (row["resident"]) { item->memory.push_back(ts_num(row["resident"])); if (item->memory.size() > 40) item->memory.pop_front(); }
+                ts_sample(*item, row);
                 item->data.assign(row.bytes()); incoming.push_back(std::move(item));
             }
             scope.items = std::move(incoming); rebuild();
+            if (detail_ && !page_ && !intent_) if (auto item = selected(); item && !item->command
+                && std::ranges::none_of(active_, [&](const auto& q) { return q.kind == Detail && q.item == item; })) intent_ = inspect(Detail, item);
         } else if (done.kind == Children && done.item && done.item->data["root_version"].as<uint64_t>() == done.version) {
             auto child = std::make_shared<ts_scope>(); child->parent = done.item; child->path = done.item->path;
             child->cap = response.take(response.data["connector"]);
             if (child->cap) done.item->children = std::move(child);
         } else if (done.kind == Detail) {
-            details_.assign(response.data["items"][size_t{0}].bytes()); dirty_ = true;
-        } else if (done.kind == DeviceGet) { device_cap_ = response.take(response.data["connector"]); device_error_.clear(); refresh_ = 0; }
-        else if (done.kind == DeviceBind) refresh_ = 0;
+            const auto row = response.data["items"][size_t{0}];
+            if (row["config"].as<uint64_t>() != done.item->data["config"].as<uint64_t>()) return;
+            ts_sample(*done.item, row);
+            for (const auto field : {"resident", "started"}) if (row[field]) done.item->data.put(field, row[field]);
+            std::string command;
+            for (const auto arg : row["argv"].values()) { if (!command.empty()) command += ' '; command += ts_text(arg); }
+            done.item->command = std::move(command); dirty_ = true;
+        } else if (done.kind == DeviceGet) { device_cap_ = response.take(response.data["connector"]); device_error_.clear(); device_round_ = 0; }
+        else if (done.kind == DeviceBind) device_round_ = 0;
         else if (done.kind == Devices) {
             devices_data_.clear(); device_error_.clear(); devices_loaded_ = true;
             for (const auto row : response.data["items"].values()) { if (devices_data_.size() == 128) { notice_ = "Device list limit reached"; break; } ubus_data data; data.assign(row.bytes()); devices_data_.push_back(std::move(data)); }
             rebuild();
-        } else if (done.kind == Action) { notice_ = "Requested"; refresh_ = 0; scan_ = 0; dirty_ = true; }
+        } else if (done.kind == Action) { notice_ = "Requested"; refresh_ = 0; dirty_ = true; }
     }
     void next() {
-        if (active_ || !terminal_.focused()) return;
-        if (intent_) { auto q = std::move(*intent_); intent_.reset(); begin(std::move(q)); return; }
-        if (frozen_ || menu_ || sys::clock_now().value < refresh_) return;
+        if (!terminal_.focused()) return;
+        if (intent_ && !connection(*intent_).active()) { auto q = std::move(*intent_); intent_.reset(); begin(std::move(q)); }
+        if (frozen_ || menu_) return;
+        const auto now = sys::clock_now().value;
+        if (now >= refresh_) {
+            refresh_ = refresh_ ? refresh_ + ((now - refresh_) / frequency_ + 1) * frequency_ : now + frequency_;
+            ++round_; if (detail_) dirty_ = true;
+        }
         if (page_ == 1) {
-            refresh_ = rt_after_ms(1000).value_or(0);
+            if (environment_.active() || devices_.active()) return;
             query q;
             if (!device_cap_) {
+                if (device_round_ == round_) return;
+                device_round_ = round_;
                 const auto name = setup_.data["message"]["devices"].as<std::string_view>();
                 if (!name) { device_error_ = "No device access"; dirty_ = true; return; }
                 q.kind = DeviceGet; q.message.data.put("name", *name).put("activate", false);
-            } else q.kind = devices_.endpoint() ? Devices : DeviceBind;
+            } else if (!devices_.endpoint()) q.kind = DeviceBind;
+            else {
+                if (device_round_ == round_) return;
+                device_round_ = round_; q.kind = Devices;
+            }
             begin(std::move(q)); return;
         }
-        auto sources = scopes();
-        for (const auto& scope : sources) {
+        for (const auto& scope : scopes()) {
             for (auto p = scope->parent.lock(); p; p = p->owner.lock() ? p->owner.lock()->parent.lock() : nullptr)
                 if (scope->identity && p->owner.lock() && p->owner.lock()->identity == scope->identity) { scope->error = "Repeated reference"; break; }
-            if (!scope->error.empty()) continue;
-            if (!scope->connection.endpoint() && !scope->attempted) { scope->attempted = true; query q; q.kind = Bind; q.scope = scope; begin(std::move(q)); return; }
+            if (!scope->error.empty() || scope->connection.active()) continue;
+            query q; q.scope = scope;
+            if (!scope->connection.endpoint()) {
+                if (!scope->attempted) { scope->attempted = true; q.kind = Bind; begin(std::move(q)); }
+                continue;
+            }
+            if (scope->round != round_) {
+                scope->round = round_; q.kind = List; begin(std::move(q)); continue;
+            }
             for (const auto& item : scope->items) if (ts_flag(item->data["children"]) && !item->children) {
-                if (sources.size() == 32) { notice_ = "View limit reached"; continue; }
-                begin(inspect(Children, item)); return;
+                if (scopes().size() == 32) { notice_ = "View limit reached"; continue; }
+                begin(inspect(Children, item)); break;
             }
         }
-        if (scan_ >= sources.size()) {
-            scan_ = 0; refresh_ = rt_after_ms(1000).value_or(0);
-            if (detail_) if (auto item = selected()) intent_ = inspect(Detail, item);
-            return;
-        }
-        auto scope = sources[scan_++];
-        if (scope->error.empty() && scope->connection.endpoint()) { query q; q.kind = List; q.scope = scope; begin(std::move(q)); }
     }
     void move(int delta) {
         if (menu_ == 2) return;
@@ -276,13 +313,14 @@ class ts_view {
             const auto found = std::ranges::find(ids, device_selection_);
             if (!ids.empty()) device_selection_ = ids[std::clamp(int(found - ids.begin()) + delta, 0, int(ids.size()) - 1)];
         }
+        if (detail_ && !page_) if (auto item = selected(); item && !item->command) intent_ = inspect(Detail, item);
         notice_.clear(); dirty_ = true;
     }
     void actions() {
         actions_.clear(); choice_ = 0; target_ = selected();
         if (page_ || !target_) { notice_ = "No actions"; return; }
         if (const auto scope = target_->owner.lock(); !scope || !scope->error.empty()) { notice_ = "Not available"; return; }
-        target_gen_ = ts_num(target_->data["gen"]); target_version_ = ts_num(target_->data["config"]);
+        target_run_ = ts_num(target_->data["run_id"]); target_version_ = ts_num(target_->data["config"]);
         for (const auto value : target_->data["actions"].values()) {
             const auto verb = ts_text(value); if (verb == "stop" || verb == "start" || verb == "restart") actions_.push_back(verb);
         }
@@ -312,11 +350,11 @@ class ts_view {
                 const auto verb = actions_[choice_];
                 if (menu_ == 1 && verb != "start") { menu_ = 2; return; }
                 if (auto scope = target_->owner.lock()) {
-                    query q; q.kind = Action; q.scope = scope; q.item = target_; q.gen = target_gen_;
-                    q.message.data.put("id", target_->data["id"]).put("gen", target_gen_).put("version", target_version_).put("action", verb); intent_ = std::move(q);
+                    query q; q.kind = Action; q.scope = scope; q.item = target_; q.run_id = target_run_;
+                    q.message.data.put("child_id", target_->data["child_id"]).put("run_id", target_run_).put("version", target_version_).put("action", verb); intent_ = std::move(q);
                 }
                 menu_ = 0; target_.reset();
-            } else if (!help_) { detail_ = true; details_ = {}; if (!page_) if (auto item = selected()) intent_ = inspect(Detail, item); }
+            } else if (!help_) { detail_ = true; if (!page_) if (auto item = selected(); item && !item->command) intent_ = inspect(Detail, item); }
             return;
         }
         if (menu_ || help_) { if (e == ftxui::Event::Character('q')) { menu_ = 0; help_ = false; } return; }
@@ -326,7 +364,7 @@ class ts_view {
         if (e == ftxui::Event::Character('/')) { search_ = true; return; }
         if (e == ftxui::Event::Character(' ')) { frozen_ = !frozen_; return; }
         if (e == ftxui::Event::Character('r')) {
-            refresh_ = 0; scan_ = 0;
+            refresh_ = 0;
             for (const auto& scope : scopes()) {
                 scope->error.clear(); scope->attempted = false;
                 for (const auto& item : scope->items) if (item->children && !item->children->error.empty()) item->children.reset();
@@ -335,7 +373,7 @@ class ts_view {
         }
         if (e == ftxui::Event::Character('1') || e == ftxui::Event::Character('2') || e == ftxui::Event::Tab) {
             page_ = e == ftxui::Event::Tab ? 1 - page_ : e == ftxui::Event::Character('1') ? 0 : 1;
-            detail_ = false; filter_.clear(); notice_.clear(); refresh_ = 0; scan_ = 0; rebuild(); return;
+            detail_ = false; filter_.clear(); notice_.clear(); refresh_ = 0; rebuild(); return;
         }
         if (!page_ && !detail_) {
             if (e == ftxui::Event::Character('s')) sort_ = (sort_ + 1) % 3;
@@ -366,28 +404,21 @@ class ts_view {
                 if (!row) body = {ftxui::text(device_error_.empty() ? "Device not available" : device_error_) | ftxui::dim};
                 if (row["error"]) body.push_back(field("Problem", ts_error(static_cast<status_t>(row["error"].as<int64_t>().value_or(0)))));
             } else if (const auto item = selected()) {
-                const auto row = details_["gen"].as<uint64_t>() == item->data["gen"].as<uint64_t>() && details_["program"] ? details_.view() : item->data.view();
-                body = {ftxui::text(ts_name(row)) | ftxui::bold, ftxui::text(""), field("Status", ts_state(item->data.view())), field("Program", ts_text(row["program"]))};
-                std::string args; for (const auto arg : row["argv"].values()) { if (!args.empty()) args += ' '; args += ts_text(arg); }
-                if (!args.empty()) body.push_back(field("Command", args));
-                body.push_back(ftxui::text(""));
-                const auto chart = [&](const std::deque<uint64_t>& samples, uint64_t minimum) {
-                    return ftxui::graph([&samples, minimum](int width, int height) {
-                        std::vector<int> bars(width, -1);
-                        const auto peak = samples.empty() ? minimum : std::max(minimum, *std::ranges::max_element(samples));
-                        for (int x = 0; x < width; ++x) {
-                            const auto slot = size_t(x) * 40 / width + samples.size();
-                            if (slot < 40 || !samples[slot - 40]) continue;
-                            bars[x] = std::max(0, int(samples[slot - 40] * height / peak) - 1);
-                        }
-                        return bars;
-                    }) | ftxui::size(ftxui::HEIGHT, ftxui::EQUAL, 3);
-                };
-                body.push_back(field("CPU", item->cpu ? ts_percent(*item->cpu) : "--"));
-                body.push_back(chart(item->history, 1000) | ftxui::color(ftxui::Color::Cyan));
-                body.push_back(field("Memory", item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--"));
-                body.push_back(chart(item->memory, 1) | ftxui::dim);
-                body.push_back(ftxui::text("")); body.push_back(field("Location", item->path));
+                const auto row = item->data.view();
+                const auto scope = item->owner.lock(); const bool current = scope && scope->error.empty();
+                body = {ftxui::hbox({ftxui::text(ts_name(row)) | ftxui::bold | ftxui::flex,
+                    ftxui::text(current ? ts_state(item->data.view()) : "Unavailable") | ftxui::dim}),
+                    ftxui::text(""), field("Program", ts_text(row["program"]))};
+                if (item->command && !item->command->empty()) body.push_back(field("Command", *item->command));
+                const auto age = item->data["started"].as<uint64_t>();
+                ftxui::Elements labels, values;
+                for (const auto text : {"CPU", "Memory", "Elapsed"}) labels.push_back(ftxui::text(text) | ftxui::dim | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, terminal_.columns() / 3));
+                for (const auto& text : std::array<std::string, 3>{
+                    current && item->cpu ? ts_percent(*item->cpu) : "--",
+                    current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--",
+                    current && age && now_ >= *age ? ts_duration((now_ - *age) / frequency_) : "--"})
+                    values.push_back(ftxui::text(text) | ftxui::bold | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, terminal_.columns() / 3));
+                body.insert(body.begin() + 2, {ftxui::hbox(labels), ftxui::hbox(values), ftxui::separator()});
                 if (const auto result = row["result"].as<int64_t>(); ts_text(item->data["state"]) == "failed" && result && *result) body.push_back(field("Last error", ts_error(static_cast<status_t>(*result))));
             } else body.push_back(ftxui::text("Program ended") | ftxui::dim);
             parts.push_back(ftxui::vbox(body) | ftxui::flex);
@@ -408,7 +439,6 @@ class ts_view {
             } else {
                 for (const auto& [item, depth] : rows_) {
                     auto name = ts_name(item->data.view());
-                    if (std::ranges::count_if(rows_, [&](const auto& row) { return ts_name(row.first->data.view()) == name; }) > 1) name += " #" + std::to_string(item->serial);
                     name = std::string(depth * 2, ' ') + (tree_ && ts_flag(item->data["children"]) ? item->expanded ? "- " : "+ " : "") + name;
                     const auto scope = item->owner.lock(); const bool current = scope && scope->error.empty();
                     auto entry = line(name, current ? ts_state(item->data.view()) : "Unavailable", current && item->cpu ? ts_percent(*item->cpu) : "--", current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--");
@@ -440,6 +470,7 @@ public:
     ts_view() { input_ = ftxui::Input(&filter_, "Search"); ui_ = ftxui::Renderer([this] { return render(); }); }
     auto run() -> status_t {
         const auto& env = rt_startup();
+        frequency_ = sys::clock_frequency().value;
         auto status = environment_.bind(env.environment);
         if (status == STATUS_OK) status = environment_.invoke("Receive", {}, setup_);
         if (status == STATUS_OK) status = terminal_.open(env, setup_);
@@ -448,18 +479,27 @@ public:
         root_->path = "/" + ts_text(setup_.data["message"]["scope.name"]);
         if (!root_->cap) { root_->error = "No program access"; root_->attempted = true; }
         while (!quit_) {
-            reply();
             for (size_t count = 0; count < 64; ++count) {
                 const auto e = terminal_.read(); if (!e) return e.error();
                 dirty_ |= terminal_.redraw(); if (!*e) break; key(**e);
             }
             if (quit_) break;
-            next(); reply();
-            if (terminal_.focused() && std::exchange(dirty_, false)) { status = terminal_.present(ui_); if (status != STATUS_OK) return status; }
-            if (!active_ && terminal_.focused() && (intent_ || (!frozen_ && !menu_ && sys::clock_now().value >= refresh_))) continue;
-            auto deadline = active_ ? rt_after_ms(50).value_or(0) : frozen_ || menu_ || !terminal_.focused() ? 0 : refresh_;
-            if (const auto parser = terminal_.deadline(); parser && (!deadline || parser < deadline)) deadline = parser;
-            status = terminal_.wait(deadline); if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
+            if (!frozen_) now_ = sys::clock_now().value;
+            bool progress = poll(); next(); progress |= poll();
+            if (terminal_.focused() && dirty_) {
+                status = terminal_.present(ui_);
+                if (status == STATUS_OK) dirty_ = false;
+                else if (status != STATUS_WOULD_BLOCK) return status;
+            }
+            const auto sent = terminal_.flush();
+            if (sent != STATUS_OK && sent != STATUS_PENDING && sent != STATUS_WOULD_BLOCK) return sent;
+            if (sent == STATUS_PENDING || progress || (sent == STATUS_OK && terminal_.focused() && dirty_)) continue;
+            auto deadline = frozen_ || menu_ || !terminal_.focused() ? uint64_t{0} : refresh_;
+            const auto limit = [&](uint64_t when) { if (when && (!deadline || when < deadline)) deadline = when; };
+            for (const auto& q : active_) limit(q.message.deadline);
+            limit(terminal_.deadline());
+            status = terminal_.wait(deadline);
+            if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
         }
         return STATUS_OK;
     }

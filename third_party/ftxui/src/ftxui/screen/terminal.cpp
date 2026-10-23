@@ -18,7 +18,7 @@
 #endif
 
 #include <windows.h>
-#elif !defined(FTXUI_MYOS)
+#elif !defined(FTXUI_FREESTANDING)
 #include <sys/ioctl.h>  // for winsize, ioctl, TIOCGWINSZ
 #include <unistd.h>     // for STDOUT_FILENO
 #endif
@@ -50,7 +50,7 @@ Terminal::Quirks& GetQuirksInternal() {
 }
 
 Dimensions& FallbackSize() {
-#if defined(FTXUI_MYOS) || defined(__EMSCRIPTEN__)
+#if defined(FTXUI_FREESTANDING) || defined(__EMSCRIPTEN__)
   // This dimension was chosen arbitrarily to be able to display:
   // https://arthursonzogni.com/FTXUI/examples
   // This will have to be improved when someone has time to implement and need
@@ -98,7 +98,7 @@ bool ContainsAny(std::string_view s,
 }
 
 Terminal::Color ComputeColorSupportInternal() {
-#if defined(FTXUI_MYOS)
+#if defined(FTXUI_FREESTANDING)
   return Terminal::Palette16;
 #else
   static const std::vector<int> empty_capabilities;
@@ -228,7 +228,7 @@ Color TerminalInfo::ComputeColorSupport() const {
 
   // 0. User preference. See https://no-color.org.
   const char* no_color = nullptr;
-#if !defined(FTXUI_MYOS)
+#if !defined(FTXUI_FREESTANDING)
   no_color = std::getenv("NO_COLOR");
 #endif  // NOLINT
   if (no_color != nullptr && no_color[0] != '\0') {
@@ -236,7 +236,7 @@ Color TerminalInfo::ComputeColorSupport() const {
   }
 
   // 1. Platform specific overrides.
-#if defined(FTXUI_MYOS) || defined(__EMSCRIPTEN__)
+#if defined(FTXUI_FREESTANDING) || defined(__EMSCRIPTEN__)
   return Terminal::Color::TrueColor;
 #endif
 #if defined(_WIN32)
@@ -257,7 +257,7 @@ Color TerminalInfo::ComputeColorSupport() const {
 
   // Check WT_SESSION for Windows Terminal (e.g. when running under WSL).
   const char* wt_session = nullptr;
-#if !defined(FTXUI_MYOS)
+#if !defined(FTXUI_FREESTANDING)
   wt_session = std::getenv("WT_SESSION");
 #endif  // NOLINT
   if (wt_session != nullptr && wt_session[0] != '\0') {
@@ -320,7 +320,7 @@ Color TerminalInfo::ComputeColorSupport() const {
 /// @return The terminal size.
 /// @ingroup screen
 Dimensions Size() {
-#if defined(FTXUI_MYOS) || defined(__EMSCRIPTEN__)
+#if defined(FTXUI_FREESTANDING) || defined(__EMSCRIPTEN__)
   // This dimension was chosen arbitrarily to be able to display:
   // https://arthursonzogni.com/FTXUI/examples
   // This will have to be improved when someone has time to implement and need

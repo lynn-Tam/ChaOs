@@ -3,7 +3,7 @@
 // the LICENSE file.
 #include <cstddef>  // for size_t
 #include <cstdint>
-#if !defined(FTXUI_MYOS)
+#if !defined(FTXUI_FREESTANDING)
 #include <iostream>  // for cout, flush
 #else
 #include <string_view>
@@ -489,7 +489,7 @@ void Screen::ToString(std::string& ss) const {
 
 // Print the Screen to the terminal.
 void Screen::Print() const {
-#if defined(FTXUI_MYOS)
+#if defined(FTXUI_FREESTANDING)
   ::ft_print(ToString());
 #else
   std::cout << ToString() << '\0' << std::flush;

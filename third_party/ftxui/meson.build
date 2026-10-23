@@ -73,5 +73,5 @@ ftxui = static_library('ftxui', files(
   'src/ftxui/component/window.cpp',
   'src/ftxui/screen/terminal.cpp',
 ), include_directories: ftxui_inc,
-  cpp_args: user_cpp_args + ['-DFTXUI_MYOS', '-ffunction-sections', '-fdata-sections'],
+  cpp_args: user_cpp_args + ['-DFTXUI_FREESTANDING', '-ffunction-sections', '-fdata-sections'],
   pic: false, implicit_include_directories: false, build_by_default: false)

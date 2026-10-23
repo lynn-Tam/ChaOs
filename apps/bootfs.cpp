@@ -8,7 +8,7 @@ static std::vector<bf_file> files;
 static std::vector<vm_ptr<bf_open>> opens;
 static CreateAuth images;
 static cap_desc descriptor;
-static ubus_object directory{"myos.files"};
+static ubus_object directory{"io.files"};
 
 static auto find(std::string_view path) -> bf_file* {
     while (path.starts_with('/')) path.remove_prefix(1);
@@ -117,7 +117,7 @@ int main() {
     ubus_msg publication, result;
     const auto peer_idx = publication.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
     if (!peer_idx) return peer_idx.error();
-    publication.data.put("name", "files").put("interface", "myos.files").put("version", uint64_t{1})
+    publication.data.put("name", "files").put("interface", "io.files").put("version", uint64_t{1})
         .cap("connector", *peer_idx);
     status = parent.invoke("Publish", std::move(publication), result); if (status != STATUS_OK) return status;
     for (;;) {

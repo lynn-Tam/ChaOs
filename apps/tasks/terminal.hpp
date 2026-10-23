@@ -18,6 +18,13 @@ class ft_terminal final {
     struct { uint16_t rows{24}, columns{80}; } size_;
     status_t status_{};
     std::deque<unsigned char> bytes_;
+    ev_watch writable_;
+    std::string frame_, next_frame_, pending_;
+    size_t sent_{};
+    auto reset() -> status_t {
+        frame_.clear(); next_frame_.clear(); pending_.clear(); sent_ = 0; redraw_ = true;
+        return writable_.close();
+    }
     auto open_session(const rt_env& env, const ubus_msg& setup) -> status_t {
         port_ = env.events;
         auto status = control_.bind(setup.capability(setup.data["message"]["terminal"]));
@@ -58,6 +65,7 @@ class ft_terminal final {
                 if (!focus || !focused) return STATUS_PEER_FAULT;
                 if (*focus < focus_) continue;
                 focus_ = *focus; focused_ = *focused;
+                if (const auto reset_status = reset(); reset_status != STATUS_OK) return reset_status;
                 if (focused_) {
                     const auto rows = event.data["rows"].as<uint16_t>(), columns = event.data["columns"].as<uint16_t>();
                     if (!rows || !columns || *rows < 8 || *columns < 24) return STATUS_PEER_FAULT;
@@ -85,24 +93,21 @@ class ft_terminal final {
     }
 
     std::deque<ftxui::Event> events_;
-    uint64_t input_at_{}, animated_{}, animate_at_{};
+    uint64_t input_at_{};
     ftxui::TerminalInputParser parser_{[this](ftxui::Event e) { input_at_ = 0; events_.push_back(std::move(e)); }};
     bool redraw_{true};
-    std::string frame_;
 public:
     ft_terminal() = default;
     ~ft_terminal();
     auto open(const rt_env&, const ubus_msg&) -> status_t;
     auto read() -> std::expected<std::optional<ftxui::Event>, status_t>;
     auto present(const ftxui::Component&) -> status_t;
+    auto flush() -> status_t;
     auto wait(uint64_t deadline = 0) -> status_t;
     auto focused() const -> bool { return focused_; }
     auto rows() const -> size_t { return size_.rows; }
     auto columns() const -> size_t { return size_.columns; }
     auto redraw() -> bool { return std::exchange(redraw_, false); }
-    auto deadline() const -> uint64_t {
-        return input_at_ && animate_at_ ? std::min(input_at_, animate_at_) : std::max(input_at_, animate_at_);
-    }
-    void animate();
-    void print(std::string_view text) { frame_.clear(); (void)write(text); }
+    auto deadline() const -> uint64_t { return input_at_; }
+    void print(std::string_view);
 };
