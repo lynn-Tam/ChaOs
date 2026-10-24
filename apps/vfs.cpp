@@ -216,6 +216,6 @@ int main() {
     for (;;) {
         status = directory.poll();
         if (status != STATUS_OK && status != STATUS_WOULD_BLOCK) return status;
-        if (status == STATUS_WOULD_BLOCK && (status = ev_wait(env.events).status) != STATUS_OK) return status;
+        if (status == STATUS_WOULD_BLOCK && (status = ev_wait(rt_events()).status) != STATUS_OK) return status;
     }
 }

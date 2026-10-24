@@ -71,7 +71,7 @@ static auto provider() -> int {
     expect(ubus_send(destination, ready));
     while (!done) {
         const auto status = object.poll();
-        if (status == STATUS_WOULD_BLOCK) expect(ev_wait(rt_startup().events).status);
+        if (status == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status);
         else expect(status);
     }
     return STATUS_OK;
@@ -85,6 +85,27 @@ int main(int argc, char**) {
     const auto mapped = sys::cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(mapped.status);
     auto mapping = vm_area::map(rt_vm(), cap_owner{mapped.value}, 0, 4096, VM_READ | VM_WRITE); check(mapping.has_value());
     uart_port output{mapping->address + console->offset}; output.reset(); diagnostic = &output;
+    // A caller may retire its Reply before dequeue or after deferral.
+    // Neither transition retires the service that owns the request queue.
+    {
+        std::optional<ubus_request> held;
+        ubus_object local;
+        expect(local.add("hold", {}, {}, [&](auto& request, auto&) {
+            held.emplace(std::move(request)); return STATUS_PENDING;
+        }));
+        expect(local.open()); auto peer = local.connector(); check(bool(peer));
+        const auto submit = [&](ubus_call& call) {
+            ubus_msg request; request.tag = 2;
+            expect(call.begin(peer->selector(), std::move(request))); expect(call.commit());
+        };
+        { ubus_call canceled; submit(canceled); }
+        expect(local.poll()); check(!held);
+        { ubus_call canceled; submit(canceled); expect(local.poll()); check(bool(held)); }
+        expect(held->respond({})); held.reset();
+        ubus_call live; submit(live); expect(local.poll()); check(bool(held));
+        expect(held->respond({})); held.reset();
+        ubus_msg response; expect(live.poll(response)); expect(response.status);
+    }
     test_image image; open(image, env);
     test_tasks tasks; tasks.open(env.alloc(), rt_root().domain, env.cpus);
     ch_pair handoff; expect(handoff.open(env.alloc(), 1, 2));
@@ -111,14 +132,14 @@ int main(int argc, char**) {
     const std::string_view argv[]{"provider", "--provider"};
     const auto child = start(tasks, image, "provider", {.argv=argv, .environment=endpoint->selector(),
         .resources={.bytes=8 * 1024 * 1024, .caps=512, .slots=512, .pages=68}});
-    ubus_rx handoff_rx; expect(handoff_rx.open(handoff.ends[0].selector(), env.events));
+    ubus_rx handoff_rx; expect(handoff_rx.open(handoff.ends[0].selector(), rt_events()));
     ubus_msg ready;
     for (;;) {
         const auto status = handoff_rx.receive(ready);
         if (status == STATUS_OK) break;
         check(status == STATUS_WOULD_BLOCK);
         const auto received = environment.poll();
-        if (received == STATUS_WOULD_BLOCK) expect(ev_wait(env.events).status); else expect(received);
+        if (received == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status); else expect(received);
     }
     auto connector = ready.take(ready.data["connector"]); check(bool(connector));
     ubus_conn connection;
@@ -177,7 +198,7 @@ int main(int argc, char**) {
     // frame and raw packet have gone away, exercising owned deferred views.
     ubus_conn other; expect(other.bind(connector.selector()));
     expect(other.invoke("finish", {}, response));
-    while (connection.poll(response) == STATUS_WOULD_BLOCK) expect(ev_wait(env.events).status);
+    while (connection.poll(response) == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status);
     check(response.data["text"].as<std::string_view>() == large);
     request = {}; request.data.put("text", large);
     expect(connection.begin("defer", std::move(request)));
@@ -192,5 +213,5 @@ int main(int argc, char**) {
     expect(other.invoke("stop", {}, response));
     expect(wait(tasks, child));
     output.write("[ubus] dynamic methods, facets, capabilities, bulk and deferred views ok\n");
-    sys::exit();
+    return STATUS_OK;
 }

@@ -80,10 +80,6 @@ class test_tasks {
         if (status != STATUS_OK) static_cast<void>(task->stop(status));
         return {{tasks_.size()}, status};
     }
-    auto info(test_id id) -> std::expected<ThreadInfo, status_t> {
-        auto* task = get(id);
-        return task ? task->initial_info() : std::unexpected(STATUS_INVALID_CAP);
-    }
     auto observe(test_id id) -> sys::SysResult {
         auto* t = get(id);
         return t ? t->observe() : sys::SysResult{.status = STATUS_INVALID_CAP};

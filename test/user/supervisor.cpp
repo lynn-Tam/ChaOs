@@ -15,7 +15,7 @@ int main(int argc, char**) {
             if (status == STATUS_OK) status = sys::notification_signal(setup.capability(message["ready"])).status;
             if (status != STATUS_OK) return status;
         }
-        for (;;) (void)ev_wait(env.events);
+        for (;;) (void)ev_wait(rt_events());
     }
     ubus_conn files;
     ubus_msg query, response; query.data.put("name", "exec");
@@ -34,7 +34,7 @@ int main(int argc, char**) {
     }};
     status = owner.open(); if (status != STATUS_OK) return status;
     ev_notice ready;
-    status = ready.open(env.alloc(), env.events); if (status != STATUS_OK) return status;
+    status = ready.open(env.alloc(), rt_events()); if (status != STATUS_OK) return status;
     auto& child = owner.add("descendant", "self", {.bytes=1024 * 1024, .caps=96, .slots=96, .pages=16});
     child.args.push_back("hold");
     const auto proof_idx = child.setup.give(setup.take(message["proof"]));
@@ -46,13 +46,13 @@ int main(int argc, char**) {
     status = owner.start(child); if (status != STATUS_OK) return status;
     const auto crash = setup.capability(message["crash"]);
     ev_watch crashed;
-    status = crashed.open(env.events, crash, SOURCE_READY); if (status != STATUS_OK) return status;
+    status = crashed.open(rt_events(), crash, SOURCE_READY); if (status != STATUS_OK) return status;
     bool running{};
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) return status;
         if (!running) { running = ready.take().status == STATUS_OK; if (!running) (void)ready.arm(); }
         if (running && sys::notification_take(crash).status == STATUS_OK) break;
-        status = ev_wait(env.events, owner.deadline()).status;
+        status = ev_wait(rt_events(), owner.deadline()).status;
         if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
     }
     // Deliberately skip destructors with a live descendant: native ownership

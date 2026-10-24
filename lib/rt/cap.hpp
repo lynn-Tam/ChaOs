@@ -38,7 +38,7 @@ public:
 inline auto cap_info(cap_t cap) -> std::expected<CapInfo, status_t> {
     const auto status = sys::cap_info(cap).status;
     if (status != STATUS_OK) return std::unexpected(status);
-    CapInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(info));
+    CapInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_current().ipc), sizeof(info));
     return info;
 }
 
@@ -49,7 +49,7 @@ inline auto mem_read(cap_t cap, uint64_t offset, std::span<std::byte> output) ->
         const auto size = std::min(output.size(), size_t{4096} - size_t(offset % 4096));
         const auto status = sys::memory_read(cap, offset, 0, size).status;
         if (status != STATUS_OK) return status;
-        ::memmove(output.data(), reinterpret_cast<const void*>(rt_startup().ipc), size);
+        ::memmove(output.data(), reinterpret_cast<const void*>(rt_current().ipc), size);
         offset += size; output = output.subspan(size);
     }
     return STATUS_OK;
@@ -57,7 +57,7 @@ inline auto mem_read(cap_t cap, uint64_t offset, std::span<std::byte> output) ->
 inline auto mem_write(cap_t cap, uint64_t offset, std::span<const std::byte> input) -> status_t {
     while (!input.empty()) {
         const auto size = std::min(input.size(), size_t{4096} - size_t(offset % 4096));
-        ::memmove(reinterpret_cast<void*>(rt_startup().ipc), input.data(), size);
+        ::memmove(reinterpret_cast<void*>(rt_current().ipc), input.data(), size);
         const auto status = sys::memory_write(cap, offset, 0, size).status;
         if (status != STATUS_OK) return status;
         offset += size; input = input.subspan(size);

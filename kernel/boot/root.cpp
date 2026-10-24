@@ -31,7 +31,7 @@
 constexpr usize root_stack_pages = 8;
 constexpr mm::va_t root_ipc_address{0x40000000};
 constexpr usize root_stack_size = root_stack_pages * mm::page_size;
-constexpr usize root_initial_bytes = 256;
+constexpr usize root_initial_bytes = 320;
 constexpr mm::va_t root_info_address{mm::UserEnd - 2 * mm::page_size};
 constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - root_stack_size};
 
@@ -405,7 +405,8 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         aux(4, AT_SYS_CSPACE, cs_cap); aux(5, AT_SYS_EVENTS, event_cap);
         aux(6, AT_SYS_CPUS, boot.cpus.count()); aux(7, AT_SYS_IPC, root_ipc_address.raw());
         aux(8, AT_SYS_BOOT, root_info_address.raw()); aux(9, AT_SYS_BOOT_SIZE, info_page.bytes);
-        aux(10, AT_SYS_SCOPE, scope_cap); aux(11, AT_SYS_DOMAIN, info_page.domain); aux(12, AT_NULL, 0);
+        aux(10, AT_SYS_SCOPE, scope_cap); aux(11, AT_SYS_DOMAIN, info_page.domain); aux(12, AT_SYS_STACK, root_stack_address.raw()); aux(13, AT_SYS_STACK_SIZE, root_stack_size);
+        aux(14, AT_NULL, 0);
         ::memcpy(initial + root_initial_bytes - 16, "init", 5);
         return {};
     };

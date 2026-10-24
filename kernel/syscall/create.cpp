@@ -323,7 +323,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
         memory.emplace(std::move(*resolved));
     }
     std::array<const cap::GrantPin*, 1> extra{memory ? &memory->pin() : &target->pin()};
-    return submit_op<mm::VmOp>(inv, *target, extra, [&](Op::Submission submission) noexcept -> status_t {
+    const auto outcome = submit_op<mm::VmOp>(inv, *target, extra, [&](Op::Submission submission) noexcept -> status_t {
         const mm::VmCtx ctx{inv.cpu.cpus, inv.cpu.id, submission};
         auto& space = target->object();
         std::expected<mm::VmStatus, mm::VSpaceError> result;
@@ -336,6 +336,9 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
         else result = space.clear(ctx, *range);
         return result ? STATUS_OK : mm::status(result.error());
     });
+    if (outcome.status != STATUS_RETRY) return outcome;
+    return vm_wait(inv, target->object());
+
 }
 
 template<usize op> [[gnu::noinline]] auto io_submit(Call& inv) noexcept -> Result {
@@ -910,9 +913,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv
         return returned(start ? STATUS_BAD_ARGS : start.error());
     }
     auto ipc = prepare_ipc(inv, vspace.value(), start.value().ipc);
-    if (!ipc) {
-        return returned(ipc.error());
-    }
+    if (!ipc) return ipc.error() == STATUS_RETRY ? vm_wait(inv, vspace->object()) : returned(ipc.error());
     return publish_thread(inv, pool.value(), vspace.value(), cspace.value(),
                           std::move(start).value(), std::move(ipc).value());
 }

@@ -15,7 +15,7 @@ int main() {
     const auto vspace = info.vspace;
     const auto device = setup.capability(message["registers"]);
     const auto irq = setup.capability(message["irq"]);
-    const auto events = info.events;
+    const auto events = rt_events();
     const auto output = setup.capability(message["stdin"]);
     const auto input = setup.capability(message["stdout"]);
     constexpr uintptr_t base = 0x30010000;

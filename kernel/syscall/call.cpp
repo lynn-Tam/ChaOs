@@ -55,8 +55,9 @@ auto cap_status(cap::CSpaceError error) noexcept -> status_t {
         return STATUS_NO_MEMORY;
     case cap::CSpaceError::InvalidState:
     case cap::CSpaceError::Contended:
-    case cap::CSpaceError::GrantUnavailable:
         return STATUS_BUSY;
+    case cap::CSpaceError::GrantUnavailable:
+        return STATUS_CLOSED;
     }
     return STATUS_INTERNAL;
 }
@@ -987,8 +988,8 @@ auto vm_call(Call& inv) noexcept -> Result {
         auto reserved = op == SYS_VM_RESERVE
             ? space.reserve(*range)
             : space.reserve(*range,true);
-        return returned(
-            reserved ? STATUS_OK : mm::status(reserved.error()));
+        if (!reserved && reserved.error() == mm::VSpaceError::Contended) return vm_wait(inv, space);
+        return returned(reserved ? STATUS_OK : mm::status(reserved.error()));
     }
     return returned(STATUS_INVALID_OP);
 }
@@ -1144,6 +1145,11 @@ template<usize op>
 [[nodiscard]] auto domain_configure(Call& inv) noexcept -> Result {
     auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
     if (!domain) return returned(cap_status(domain.error()));
+    if constexpr (op == SYS_DOMAIN_EXECUTION) {
+        if (inv.trap.arg(1) > 1) return returned(STATUS_BAD_ARGS);
+        const auto result = domain.value()->configure({}, nullptr, bool(inv.trap.arg(1)));
+        return result ? returned(STATUS_OK, *result) : returned(result.error());
+    }
     auto& clock = inv.cpu.dispatcher().clock();
     const auto budget = clock.ticks<time::ns>(inv.trap.arg(1));
     const auto period = clock.ticks<time::ns>(inv.trap.arg(2));
@@ -1201,6 +1207,13 @@ auto exit(Call& inv) noexcept -> Result {
     const auto status = static_cast<status_t>(inv.trap.arg(0));
     return Result{STATUS_OK,
         static_cast<usize>(static_cast<isize>(status)), Disposition::Exit};
+}
+
+auto vm_wait(Call& inv, mm::VSpace& space) noexcept -> Result {
+    // Replay preserves this thread's registers/IPC and revalidates authority.
+    const auto ready = space.wait_pending(*inv.target, *inv.cpu.cpus, inv.cpu.dispatcher());
+    if (ready.status == STATUS_PENDING) return {STATUS_PENDING, 0, Disposition::Retry};
+    return ready.status == STATUS_OK ? Result{STATUS_RETRY, 0, Disposition::Continue} : returned(ready.status);
 }
 
 static void publish(arch::TrapCtx& ctx, const Result& result) noexcept {

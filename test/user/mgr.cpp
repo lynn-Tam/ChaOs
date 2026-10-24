@@ -13,12 +13,12 @@ static auto vm_permissions() -> status_t {
     *reinterpret_cast<volatile uint64_t*>(writable->address) = 42;
     if (*reinterpret_cast<const volatile uint64_t*>(writable->address) != 42) return STATUS_INTERNAL;
     const auto info = sys::object_info(env.vspace); if (info.status != STATUS_OK) return info.status;
-    const auto object = reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id;
+    const auto object = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
     uint64_t cursor{}, epoch{}; size_t found{};
     do {
         const auto status = sys::scope_query(env.scope, object, SCOPE_LINKS, cursor, epoch);
         if (status.status != STATUS_OK) return status.status;
-        const auto page = *reinterpret_cast<const LinkRecords*>(env.ipc);
+        const auto page = *reinterpret_cast<const LinkRecords*>(rt_current().ipc);
         for (const auto& link : std::span{page.records, page.count}) if (link.kind == LINK_VM) {
             for (const auto& [area, perms] : std::array<std::pair<vm_area*, word_t>, 3>{{
                 {&*readonly, VM_READ}, {&*writable, VM_READ | VM_WRITE}, {&*staging, VM_READ | VM_WRITE}}})
@@ -54,7 +54,7 @@ static auto worker(std::string_view role) -> status_t {
         status = parent.invoke("Resource", std::move(request), response);
         if (status != STATUS_OK) return status;
         status = sys::quota_info(env.quota).status;
-        if (status != STATUS_OK || reinterpret_cast<const QuotaInfo*>(env.ipc)->memory_limit != 5 * 1024 * 1024) return STATUS_INTERNAL;
+        if (status != STATUS_OK || reinterpret_cast<const QuotaInfo*>(rt_current().ipc)->memory_limit != 5 * 1024 * 1024) return STATUS_INTERNAL;
         ubus_conn concurrent; status = concurrent.bind(env.environment); if (status != STATUS_OK) return status;
         request = {}; request.data.put("name", "calculator");
         status = parent.begin("Get", std::move(request)); if (status != STATUS_OK) return status;
@@ -62,11 +62,11 @@ static auto worker(std::string_view role) -> status_t {
         status = concurrent.begin("Get", std::move(request)); if (status != STATUS_OK) return status;
         status = sys::notification_signal(setup.capability(setup.data["message"]["gate"])).status;
         if (status != STATUS_OK) return status;
-        while ((status = parent.poll(response)) == STATUS_WOULD_BLOCK) if (const auto rc = ev_wait(env.events).status; rc != STATUS_OK) return rc;
+        while ((status = parent.poll(response)) == STATUS_WOULD_BLOCK) if (const auto rc = ev_wait(rt_events()).status; rc != STATUS_OK) return rc;
         if (status != STATUS_OK || response.status != STATUS_OK) return status != STATUS_OK ? status : response.status;
         const auto instance = response.data["instance"].as<uint64_t>();
         ubus_msg second;
-        while ((status = concurrent.poll(second)) == STATUS_WOULD_BLOCK) if (const auto rc = ev_wait(env.events).status; rc != STATUS_OK) return rc;
+        while ((status = concurrent.poll(second)) == STATUS_WOULD_BLOCK) if (const auto rc = ev_wait(rt_events()).status; rc != STATUS_OK) return rc;
         if (status != STATUS_OK || second.status != STATUS_OK || second.data["instance"].as<uint64_t>() != instance) return STATUS_INTERNAL;
         ubus_conn calculator;
         status = calculator.bind(response.capability(response.data["connector"]), "fixture.unknown");
@@ -88,18 +88,18 @@ static auto worker(std::string_view role) -> status_t {
         status = calculator.invoke("Borrow", std::move(request), response); if (status != STATUS_OK) return status;
         ubus_conn borrowed; status = borrowed.adopt(response.take(response.data["handle"])); if (status != STATUS_OK) return status;
         status = sys::quota_info(quota.selector()).status; if (status != STATUS_OK) return status;
-        const auto first = *reinterpret_cast<const QuotaInfo*>(env.ipc);
+        const auto first = *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
         if (first.memory_available >= first.memory_limit) return STATUS_INTERNAL;
         request = {}; request.data.put("loan", number).put("bytes", uint64_t{128 * 1024}).put("caps", uint64_t{0});
         status = parent.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
         status = sys::quota_info(quota.selector()).status; if (status != STATUS_OK) return status;
-        const auto resized = *reinterpret_cast<const QuotaInfo*>(env.ipc);
+        const auto resized = *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
         if (resized.memory_limit != 128 * 1024 || resized.memory_available != first.memory_available + 64 * 1024) return STATUS_INTERNAL;
         status = borrowed.invoke("Ping", {}, response);
         if (status != STATUS_OK || response.data["value"].as<uint64_t>() != 42) return STATUS_INTERNAL;
         // No explicit Return: owner must close the budget after this execution
         // exits, while the live provider drains its independently scoped state.
-        sys::exit(STATUS_OK);
+        return STATUS_OK;
     }
     const auto gate = setup.capability(setup.data["message"]["gate"]);
     status = sys::wait_one(gate, SOURCE_READY).status; if (status != STATUS_OK) return status;
@@ -149,7 +149,7 @@ static auto worker(std::string_view role) -> status_t {
         const auto copied = sys::cap_duplicate(quota, env.cspace, RIGHT_INSPECT);
         if (copied.status != STATUS_OK) return copied.status;
         funded_quota = cap_owner{copied.value};
-        const auto watched = allocation_closing.open(env.events, quota, STATE_CLOSING | STATE_DRAINED);
+        const auto watched = allocation_closing.open(rt_events(), quota, STATE_CLOSING | STATE_DRAINED);
         if (watched != STATUS_OK) return watched;
         auto memory = vm_area::create({quota, env.scope}, rt_vm(), 0, 4096); if (!memory) return memory.error();
         funded = std::move(*memory); *reinterpret_cast<uint64_t*>(funded.address) = 42;
@@ -198,7 +198,7 @@ static auto worker(std::string_view role) -> status_t {
                 funded = {}; (void)allocation_closing.close(); funded_quota = {}; progress = true;
             }
         }
-        if (!progress) { status = ev_wait(env.events).status; if (status != STATUS_OK) return status; }
+        if (!progress) { status = ev_wait(rt_events()).status; if (status != STATUS_OK) return status; }
     }
 }
 int main(int argc, char** argv) {
@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
             out.write("[mgr] cross-branch Quota allocation, growth, exit drain and activation cycle rejection ok\n");
             for (;;) sys::yield();
         }
-        status = ev_wait(env.events, owner.deadline()).status;
+        status = ev_wait(rt_events(), owner.deadline()).status;
         if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
     }
 }

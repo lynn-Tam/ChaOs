@@ -51,11 +51,13 @@ struct ScInfo {
 #define DOMAIN_CLOSING 1U
 #define DOMAIN_DRAINED 2U
 #define DOMAIN_CONFIGURING 4U
+#define DOMAIN_ENABLED 1U
+#define DOMAIN_REQUESTED_ENABLED 2U
 struct DomainInfo {
     uint32_t version, size;
     uint64_t cpus, budget, period, available, debt, escrow;
     uint32_t weight, phase;
     uint64_t requested, applied, runtime, work_runtime;
     int32_t status;
-    uint32_t reserved;
+    uint32_t flags;
 };

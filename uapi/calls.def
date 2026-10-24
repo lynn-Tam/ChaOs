@@ -119,3 +119,5 @@ CALL(IOMMU_STATE, 146, io_call, Call) /* a0=controller; IoState */
 CALL(IO_SPACE_CLOSE, 149, io_call, Call) /* a0=domain; commits deny and retirement */
 
 CALL(SCOPE_QUERY, 150, scope_query, Call) /* a0=Scope(Inspect), a1=Object ID, a2=facet, a3=cursor, a4=epoch, a5=IPC offset; typed result */
+
+CALL(DOMAIN_EXECUTION, 151, domain_configure, Call) /* a0=Domain(Control), a1=enabled; returns intent sequence */

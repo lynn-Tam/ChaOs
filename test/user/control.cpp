@@ -173,7 +173,7 @@ int main() {
             const auto next = watcher.begin("Changed", std::move(query)); check(next == STATUS_OK);
             continue;
         }
-        check(status == STATUS_WOULD_BLOCK); check(ev_wait(env.events, *rt_after_ms(2000)).status == STATUS_OK);
+        check(status == STATUS_WOULD_BLOCK); check(ev_wait(rt_events(), *rt_after_ms(2000)).status == STATUS_OK);
     }
     stopped(owner, "control-sleep");
     check(action(owner, child.view(), "start") == STATUS_OK);
@@ -363,7 +363,7 @@ int main() {
                 (void)libk::fmt::format_to<"[control] quota status={} epoch={} expected={}\n">(output, response.status, response.data["epoch"].as<uint64_t>().value_or(0), version); }
             check(response.status == STATUS_EXHAUSTED); break;
         }
-        check(status == STATUS_WOULD_BLOCK); check(ev_wait(env.events, *rt_after_ms(2000)).status == STATUS_OK);
+        check(status == STATUS_WOULD_BLOCK); check(ev_wait(rt_events(), *rt_after_ms(2000)).status == STATUS_OK);
     }
     waiting.clear(); (void)list(readonly);
     check(creator.bind(initial.capability(initial.data["message"]["create"])) == STATUS_OK);

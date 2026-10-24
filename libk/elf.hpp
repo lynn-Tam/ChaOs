@@ -49,16 +49,29 @@ public:
             h.phoff > bytes.size() || h.phnum > (bytes.size() - h.phoff) / sizeof(elf_seg)) return {};
         v.bytes_ = bytes;
         bool entry{};
+        std::optional<elf_seg> tls;
         for (size_t i = 0; i < h.phnum; ++i) {
             const auto s = *v.segment(i);
-            // Dynamic linking and TLS require runtime machinery this loader does not provide.
-            if (s.type == 2 || s.type == 3 || s.type == 7) return {};
-            if (s.type != 1) continue;
+            // Static TLS is initialized by the CRT; dynamic images remain unsupported.
+            if (s.type == 2 || s.type == 3) return {};
+            if (s.type == 7) { if (tls) return {}; tls = s; }
+            if (s.type != 1 && s.type != 7) continue;
             if (s.file_size > s.size || s.offset > bytes.size() || s.file_size > bytes.size() - s.offset ||
                 s.size > UINT64_MAX - s.va || (s.flags & ~7u) || (s.flags & 3u) == 3u ||
                 (s.align > 1 && ((s.align & (s.align - 1)) ||
                     (s.va & (s.align - 1)) != (s.offset & (s.align - 1))))) return {};
-            entry |= (s.flags & 1) && h.entry >= s.va && h.entry - s.va < s.size;
+            entry |= s.type == 1 && (s.flags & 1) && h.entry >= s.va && h.entry - s.va < s.size;
+        }
+        if (tls && tls->file_size) {
+            bool mapped{};
+            for (size_t i = 0; i < h.phnum; ++i) {
+                const auto s = *v.segment(i);
+                if (s.type != 1 || !(s.flags & 4) || tls->va < s.va || tls->offset < s.offset) continue;
+                const auto offset = tls->va - s.va;
+                mapped |= offset == tls->offset - s.offset && offset <= s.file_size
+                    && tls->file_size <= s.file_size - offset;
+            }
+            if (!mapped) return {};
         }
         return entry ? v : elf_view{};
     }

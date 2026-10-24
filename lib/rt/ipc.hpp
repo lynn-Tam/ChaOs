@@ -25,7 +25,7 @@ inline auto ev_wait(cap_t port, word_t deadline = 0) noexcept -> sys::SysResult 
         if (status.status == STATUS_STALE) return {.status = STATUS_OK};
         if (status.status != STATUS_OK) return status;
         PortRecords page;
-        ::memcpy(&page, reinterpret_cast<const void*>(rt_startup().ipc), sizeof(page));
+        ::memcpy(&page, reinterpret_cast<const void*>(rt_current().ipc), sizeof(page));
         epoch = page.epoch;
         if (!page.more) break;
         last = page.next;
@@ -131,7 +131,7 @@ inline auto ch_send(cap_t channel, std::span<const word_t> words, bool block = t
                     std::span<const CapXfer> caps = {}, word_t tag = 0, cap_t reply = 0) noexcept -> sys::SysResult {
     if (words.size() > CHANNEL_MAX_WORDS || caps.size() > CHANNEL_MAX_CAPS)
         return {.status = STATUS_BAD_ARGS};
-    auto& wire = *reinterpret_cast<ChanMsg*>(rt_startup().ipc);
+    auto& wire = *reinterpret_cast<ChanMsg*>(rt_current().ipc);
     ::memset(&wire, 0, offsetof(ChanMsg, words));
     wire.version = CHANNEL_VERSION;
     wire.word_count = words.size();
@@ -145,7 +145,7 @@ inline auto ch_recv(cap_t channel, ch_packet& packet, bool block = true,
                     size_t capacity = CHANNEL_MAX_CAPS) noexcept -> sys::SysResult {
     if (capacity > CHANNEL_MAX_CAPS) return {.status = STATUS_BAD_ARGS};
     packet = {};
-    auto& wire = *reinterpret_cast<ChanMsg*>(rt_startup().ipc);
+    auto& wire = *reinterpret_cast<ChanMsg*>(rt_current().ipc);
     ::memset(&wire, 0, offsetof(ChanMsg, words));
     wire.version = CHANNEL_VERSION;
     wire.receive_limit = capacity;

@@ -131,7 +131,7 @@ static void reassign_memory(const rt_env& env) {
     cap_owner source{from.value}, destination{to.value};
     auto members = [&](cap_t scope) {
         expect(sys::scope_members(scope).status);
-        ScopeMembers page; ::memcpy(&page, reinterpret_cast<const void*>(env.ipc), sizeof(page));
+        ScopeMembers page; ::memcpy(&page, reinterpret_cast<const void*>(rt_current().ipc), sizeof(page));
         return page;
     };
     const auto memory = sys::memory_create({a.selector(), source.selector()}, 8192, VM_READ | VM_WRITE);
@@ -144,12 +144,12 @@ static void reassign_memory(const rt_env& env) {
     check(sys::memory_write(area->memory.selector(), 4090, 0, 16).status == STATUS_BAD_ARGS);
     auto balance = [&](cap_t quota) {
         expect(sys::quota_info(quota).status);
-        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
+        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_current().ipc), sizeof(info));
         return info.memory_available;
     };
     auto identity = [&](cap_t object) {
         expect(sys::object_info(object).status);
-        ObjectInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
+        ObjectInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_current().ipc), sizeof(info));
         return info;
     };
     const auto original = identity(area->memory.selector());
@@ -193,7 +193,7 @@ static void reassign_memory(const rt_env& env) {
     expect(sys::cap_close(copied.value, space.selector()).status);
     auto cap_balance = [&](cap_t quota) {
         expect(sys::quota_info(quota).status);
-        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(env.ipc), sizeof(info));
+        QuotaInfo info; ::memcpy(&info, reinterpret_cast<const void*>(rt_current().ipc), sizeof(info));
         return info.caps_available;
     };
     const auto caps_a = cap_balance(a.selector()), caps_b = cap_balance(b.selector());
@@ -231,10 +231,10 @@ static void resize_quota(const rt_env& env) {
     expect(made.status); cap_owner quota{made.value};
     auto info = [&] {
         expect(sys::quota_info(quota.selector()).status);
-        return *reinterpret_cast<const QuotaInfo*>(env.ipc);
+        return *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
     };
     expect(sys::object_info(quota.selector()).status);
-    const auto id = reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id;
+    const auto id = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
     check(sys::quota_resize(quota.selector(), 128 * 1024, 32).status == STATUS_DENIED);
     expect(sys::quota_resize(quota.selector(), 128 * 1024, 32, env.quota).status);
     const auto mem = sys::memory_create({quota.selector(), env.scope}, 8192, VM_READ | VM_WRITE);
@@ -252,7 +252,7 @@ static void resize_quota(const rt_env& env) {
         && after.caps_available + 8 == before.caps_available && bytes[0] == 0x5a);
     bytes[4096] = 0xa5; // A new page still uses the same Quota after growth.
     expect(sys::object_info(quota.selector()).status);
-    check(reinterpret_cast<const ObjectInfo*>(env.ipc)->object_id == id);
+    check(reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id == id);
     const auto current = info();
     const auto used = current.memory_limit - current.memory_available;
     expect(sys::quota_close(quota.selector()).status);
@@ -290,14 +290,14 @@ static void port_events(const rt_env& env) {
     expect(sys::port_arm(port.selector(), first.value).status);
     check(sys::source_info(port.selector()).value2 == ready.value2);
     expect(sys::port_records(port.selector()).status);
-    auto records = *reinterpret_cast<const PortRecords*>(env.ipc);
+    auto records = *reinterpret_cast<const PortRecords*>(rt_current().ipc);
     check(records.count == 2 && !records.more && records.events[0].source_id != records.events[1].source_id);
     check((records.events[0].flags & PORT_EVENT_PENDING) && (records.events[1].flags & PORT_EVENT_PENDING));
     expect(sys::port_take(port.selector()).status);
-    check(reinterpret_cast<const PortEvent*>(env.ipc)->key == 11 || reinterpret_cast<const PortEvent*>(env.ipc)->key == 22);
+    check(reinterpret_cast<const PortEvent*>(rt_current().ipc)->key == 11 || reinterpret_cast<const PortEvent*>(rt_current().ipc)->key == 22);
     check(sys::port_resync(port.selector(), records.epoch).status == STATUS_STALE);
     expect(sys::port_records(port.selector()).status);
-    records = *reinterpret_cast<const PortRecords*>(env.ipc);
+    records = *reinterpret_cast<const PortRecords*>(rt_current().ipc);
     expect(sys::port_resync(port.selector(), records.epoch).status);
     check(sys::source_info(port.selector()).value == 0);
     for (auto& notice : notices) expect(sys::notification_take(notice.selector()).status);
@@ -309,7 +309,7 @@ static void port_events(const rt_env& env) {
     for (;;) {
         expect(sys::wait_one(port.selector(), PORT_READABLE | PORT_OVERFLOW, 0, *deadline).status);
         expect(sys::port_take(port.selector()).status);
-        const auto event = *reinterpret_cast<const PortEvent*>(env.ipc);
+        const auto event = *reinterpret_cast<const PortEvent*>(rt_current().ipc);
         check(event.key == 11);
         if (event.flags & PORT_EVENT_CLOSED) break;
     }
@@ -317,8 +317,8 @@ static void port_events(const rt_env& env) {
     expect(sys::cap_revoke(branch.selector()).status);
     expect(sys::wait_one(port.selector(), PORT_READABLE, 0, *deadline).status);
     expect(sys::port_take(port.selector()).status);
-    check(reinterpret_cast<const PortEvent*>(env.ipc)->key == 22 &&
-        (reinterpret_cast<const PortEvent*>(env.ipc)->flags & PORT_EVENT_CLOSED));
+    check(reinterpret_cast<const PortEvent*>(rt_current().ipc)->key == 22 &&
+        (reinterpret_cast<const PortEvent*>(rt_current().ipc)->flags & PORT_EVENT_CLOSED));
     expect(sys::notification_signal(notices[1].selector()).status); // Original Grant and object remain live.
     expect(sys::port_unwatch(port.selector(), first.value).status);
     expect(sys::port_unwatch(port.selector(), second.value).status);
@@ -364,10 +364,10 @@ int main(int argc, char** argv) {
     std::array<test_id, 4> children;
     for (size_t i = 0; i < children.size(); ++i) {
         const auto number = std::to_string(i); const std::array<std::string_view, 2> args{"producer", number};
-        const auto child = tasks.spawn(image, "worker", {.argv=args, .environment=connector->selector(), .events=env.events});
+        const auto child = tasks.spawn(image, "worker", {.argv=args, .environment=connector->selector(), .events=rt_events()});
         expect(child.status); children[i] = child.id;
     }
-    ch_rx input; expect(input.open(data.ends[1].selector(), env.events));
+    ch_rx input; expect(input.open(data.ends[1].selector(), rt_events()));
     std::array<size_t, 4> seen{};
     for (size_t count = 0; count < children.size() * 512; ++count) {
         ch_packet packet;
@@ -377,7 +377,7 @@ int main(int argc, char** argv) {
             check(status == STATUS_WOULD_BLOCK);
             const auto received = environment.poll();
             if (received != STATUS_WOULD_BLOCK) expect(received);
-            else expect(ev_wait(env.events).status);
+            else expect(ev_wait(rt_events()).status);
         }
         const auto producer = packet.words[0] >> 48, index = (packet.words[0] >> 16) & 0xffff'ffff;
         check(producer < seen.size() && index == seen[producer]++ && packet.word_count == CHANNEL_MAX_WORDS);

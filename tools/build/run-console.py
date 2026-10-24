@@ -11,7 +11,7 @@ import sys
 import time
 import tempfile
 
-def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False):
+def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False, threads=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -89,14 +89,33 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             if line.startswith(b'{'): return json.loads(line)['instance']
         return None
 
-    def suspend(command):
-        start = len(output); send(command.encode() + b'\r'); time.sleep(0.15); send(b'\x1a')
+    def suspend(command, ready=None):
+        start = len(output); send(command.encode() + b'\r')
+        if ready: until(ready, start)
+        else: time.sleep(0.15)
+        send(b'\x1a')
         until(b'/ > ', start)
         state = run('jobs', b'Suspend')
         return int(re.findall(rb'\[(\d+)\]', state)[-1])
 
     try:
         until(b'/ > ')
+        if threads:
+            run('thread-test', b'[threads] pthread, TLS errno, cleanup, shared fd and parallel RPC ok')
+            run('thread-test last', b'[threads] initial thread exit preserves argv, fd and workers')
+            run('thread-test exit', b'error: 23')
+            run('thread-test fault', b'error: -12')
+            token = suspend('thread-test hold', b'[threads] ready')
+            mark = len(output); send(f'fg {token}\r'.encode()); time.sleep(0.15); send(b'q')
+            until(b'/ > ', mark)
+            token = suspend('thread-test hold | cat', b'[threads] ready')
+            run(f'bg {token}', b'/ > ')
+            run(f'kill {token}', b'/ > ')
+            run('mkfs', b'/ > '); states({'store': 'running'})
+            run('thread-test write', b'[threads] sequential writes and parallel explicit offsets ok')
+            run('echo thread-scope-retired', b'thread-scope-retired\n/ > ')
+            print(f'[threads] OK: {smp} harts, normal/main/worker exit, faults, Ctrl+Z/fg/bg, pipelines and shared file writes')
+            return
         if control:
             run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/quota stats ok')
             run('svc', b'survivor running')
@@ -345,13 +364,13 @@ if __name__ == '__main__':
     mode = sys.argv[5] if len(sys.argv) >= 6 else ''
     iterations = int(sys.argv[6]) if len(sys.argv) >= 7 else 1
     for smp in harts.split(','):
-        if mode in ('interactive', 'recovery', 'control'):
+        if mode in ('interactive', 'recovery', 'control', 'threads'):
             temporary = Path(__file__).resolve().parents[2] / '.tmp/project/interactive-storage'
             temporary.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=temporary) as directory:
                 disk = Path(directory) / 'data.img'
                 with disk.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery', control=mode == 'control')
+                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery', control=mode == 'control', threads=mode == 'threads')
                 if mode == 'interactive': exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
         else:
             exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage', control=mode == 'control')

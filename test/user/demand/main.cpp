@@ -97,9 +97,9 @@ int main(int argc, char** argv) {
         check(static_cast<bool>(deadline));
         constexpr std::string_view holding{"[demand] holding private pages\n"};
         check(write(STDOUT_FILENO, holding.data(), holding.size()) == int64_t(holding.size()));
-        check(ev_wait(info.events, *deadline).status ==
+        check(ev_wait(rt_events(), *deadline).status ==
               STATUS_TIMED_OUT);
         check(initialized[0] == *seed && zeroed[0] == static_cast<uint8_t>(*seed + 7));
     }
-    sys::exit();
+    return STATUS_OK;
 }

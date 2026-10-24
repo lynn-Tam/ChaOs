@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     const auto deadline = rt_after_ms(*milliseconds);
     if (!deadline) return STATUS_BAD_ARGS;
     for (;;) {
-        const auto status = ev_wait(rt_startup().events, *deadline).status;
+        const auto status = ev_wait(rt_events(), *deadline).status;
         if (status != STATUS_OK) return status == STATUS_TIMED_OUT ? STATUS_OK : status;
     }
 }

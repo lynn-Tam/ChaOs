@@ -343,9 +343,9 @@ auto Domain::finish_move() noexcept -> bool {
 auto Domain::info(u64 now) const noexcept -> DomainInfo {
     sync::Lock guard{tree_lock_};
     const auto b = budget_.info(now);
-    return {.version=2, .size=sizeof(DomainInfo), .cpus=config_.cpus, .budget=config_.budget,
+    return {.version=3, .size=sizeof(DomainInfo), .cpus=config_.cpus, .budget=config_.budget,
         .period=config_.period, .available=b.available, .debt=b.debt, .escrow=b.escrow,
-        .weight=config_.weight, .phase=phase_.load(), .requested=requested_, .applied=applied_, .runtime=runtime_.load(), .work_runtime=work_runtime_.load(), .status=config_status_, .reserved=0};
+        .weight=config_.weight, .phase=phase_.load(), .requested=requested_, .applied=applied_, .runtime=runtime_.load(), .work_runtime=work_runtime_.load(), .status=config_status_, .flags=(config_.enabled ? DOMAIN_ENABLED : 0U) | ((pending_config_ ? pending_config_->enabled : config_.enabled) ? DOMAIN_REQUESTED_ENABLED : 0U)};
 }
 void Domain::notify(bool all) noexcept {
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && (all || nodes_[cpu]->waiting.exchange(false, std::memory_order_acq_rel)))
@@ -367,12 +367,14 @@ auto Domain::close() noexcept -> u32 {
     if (changed) notify(true);
     post_close(); return phase_.load();
 }
-auto Domain::configure(Config config, Domain* parent) noexcept -> std::expected<u64, status_t> {
+auto Domain::configure(Config config, Domain* parent, std::optional<bool> enabled) noexcept -> std::expected<u64, status_t> {
     u64 sequence;
     Source::Publication publication;
     { sync::Lock guard{tree_lock_};
+      if (enabled) { config = config_; config.enabled = *enabled; }
+      else config.enabled = config_.enabled;
       if (!valid_config(config)) return std::unexpected(STATUS_BAD_ARGS);
-      if (!lineage_open() || pending_mail_) return std::unexpected(STATUS_BUSY);
+      if (!lineage_open()) return std::unexpected(STATUS_BUSY);
       if (requested_ == std::numeric_limits<u64>::max()) return std::unexpected(STATUS_EXHAUSTED);
       if (parent_ && (config.cpus & ~parent_->config_.cpus)) return std::unexpected(STATUS_BAD_ARGS);
       const bool increase = config.weight > config_.weight || (config.cpus & ~config_.cpus)

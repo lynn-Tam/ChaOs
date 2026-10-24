@@ -116,7 +116,7 @@ void Dispatcher::insert(Node& node) noexcept {
     queue.insert(node);
     if (node.parent && !node.parent->hook.is_linked()) {
         auto& local = node.parent->domain->local(id());
-        if (!local.refill.armed() && !local.stopped && local.owner.accepting()) insert(*node.parent);
+        if (!local.refill.armed() && !local.stopped && local.owner.accepting() && local.owner.config_.enabled) insert(*node.parent);
     }
 }
 void Dispatcher::erase(Node& node) noexcept {
@@ -131,7 +131,7 @@ void Dispatcher::erase(Node& node) noexcept {
 void Dispatcher::domain_ready(Domain::Local& local) noexcept {
     libk_assert(local.cpu == id() && !arch::interrupts_enabled());
     local.waiting.store(false, std::memory_order_release);
-    if (!local.owner.accepting()) {
+    if (!local.owner.accepting() || !local.owner.config_.enabled) {
         if (local.refill.armed()) disarm(local.refill);
         if (local.node.hook.is_linked()) erase(local.node);
         libk_assert(!local.active);
@@ -195,7 +195,7 @@ auto Dispatcher::reserve(Thread& candidate, u64 now) noexcept -> bool {
     auto duration = quantum_;
     for (usize i = depth; i; --i) {
         auto& domain = *path[i - 1]->domain;
-        bool blocked = !domain.accepting();
+        bool blocked = !domain.accepting() || !domain.config_.enabled;
         if (!blocked && domain.config_.budget) {
             // Capped ancestors share one ledger across all homes. Larger
             // earlier reservations remain escrow until this real boundary.
@@ -213,7 +213,7 @@ auto Dispatcher::reserve(Thread& candidate, u64 now) noexcept -> bool {
         if (blocked) {
             auto& local = domain.local(id());
             if (local.node.hook.is_linked()) erase(local.node);
-            if (domain.accepting() && !local.refill.armed()) {
+            if (domain.accepting() && domain.config_.enabled && !local.refill.armed()) {
                 const auto when = domain.budget_.next_refill();
                 if (when != std::numeric_limits<u64>::max()) insert(local.refill, when);
             }

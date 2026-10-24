@@ -466,6 +466,6 @@ int main() {
                 publication = response.data["instance"].as<uint64_t>().value_or(0); published_run = driver->run_id;
             }
         }
-        if ((status = ev_wait(env.events, owner.deadline()).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
+        if ((status = ev_wait(rt_events(), owner.deadline()).status) != STATUS_OK && status != STATUS_TIMED_OUT) sys::exit(status);
     }
 }

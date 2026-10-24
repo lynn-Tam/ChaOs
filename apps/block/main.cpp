@@ -118,7 +118,7 @@ int main() {
             if (client.failed || client.queue.cancelled(operation.ticket)) status = STATUS_CANCELED;
             if (status == STATUS_OK && (command->kind == blk_op::Read || command->kind == blk_op::Identify)) {
                 if (completion.size > command->buffer.size) return STATUS_INTERNAL;
-                ::memcpy(reinterpret_cast<void*>(env.ipc), completion.data, completion.size);
+                ::memcpy(reinterpret_cast<void*>(rt_current().ipc), completion.data, completion.size);
                 auto* call = client.queue.call(operation.ticket);
                 status = sys::memory_write(call->capability(call->data["buffer"]), command->buffer.offset, 0, completion.size).status;
             }
@@ -157,7 +157,7 @@ int main() {
                     status = sys::memory_read(call->capability(call->data["buffer"]), command.buffer.offset, 0, command.buffer.size).status;
                 }
                 if (status == STATUS_OK) status = device.submit({index, ++operation.gen}, command.kind,
-                    command.offset, command.buffer.size, command.kind == blk_op::Write ? reinterpret_cast<const uint8_t*>(env.ipc) : nullptr);
+                    command.offset, command.buffer.size, command.kind == blk_op::Write ? reinterpret_cast<const uint8_t*>(rt_current().ipc) : nullptr);
                 if (status == STATUS_OK) { operation.client = client; operation.ticket = ticket; }
                 else client->finish(ticket, status);
                 again = true;
@@ -178,7 +178,7 @@ int main() {
         status = directory.arm(); if (status != STATUS_OK) return status;
         if (!again) {
             const auto due = flush.client && !flush.submitted ? flush.client->queue.request(flush.ticket)->deadline : 0;
-            status = ev_wait(env.events, due).status;
+            status = ev_wait(rt_events(), due).status;
             if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
         }
     }

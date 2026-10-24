@@ -41,6 +41,8 @@ auto status(VSpaceError error) noexcept -> status_t {
         return STATUS_NO_MEMORY;
     case VSpaceError::Canceled:
         return STATUS_CANCELED;
+    case VSpaceError::Contended:
+        return STATUS_RETRY;
     case VSpaceError::ResourceExhausted:
         return STATUS_NO_MEMORY;
     case VSpaceError::InvalidState:
@@ -659,7 +661,8 @@ auto VSpace::overlap(VRange range) noexcept -> Map* {
 }
 
 auto VSpace::begin_edit(VRange range, bool empty) noexcept -> std::expected<void, VSpaceError> {
-    if (state_ != VSpaceState::Live || editing_ || draining_ || active_) return std::unexpected(VSpaceError::Busy);
+    if (state_ != VSpaceState::Live) return std::unexpected(VSpaceError::InvalidState);
+    if (editing_ || draining_ || active_) return std::unexpected(VSpaceError::Contended);
     if (!valid_user_range(range)) return std::unexpected(VSpaceError::InvalidRange);
     if (empty && overlap(range)) return std::unexpected(VSpaceError::Overlap);
     editing_ = true;
@@ -1018,7 +1021,7 @@ auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clea
         if (!valid_user_range(range)) return std::unexpected(VSpaceError::InvalidRange);
         if (state_ != VSpaceState::Live && !(clear && state_ == VSpaceState::Stopping))
             return std::unexpected(VSpaceError::InvalidState);
-        if (editing_ || draining_ || active_) return std::unexpected(VSpaceError::Busy);
+        if (editing_ || draining_ || active_) return std::unexpected(ctx.submission.publish ? VSpaceError::Contended : VSpaceError::Busy);
         if (!ctx.submission.publish && !clear && advancing_) return std::unexpected(VSpaceError::Busy);
         if (auto accepted = accept(ctx, false); !accepted) return std::unexpected(accepted.error());
         auto& op = transaction();
@@ -1262,6 +1265,7 @@ auto VSpace::clear(VmCtx ctx, VRange range) noexcept -> std::expected<VmStatus, 
 auto fault_kind(VSpaceError error) noexcept -> FaultKind {
     switch (error) {
     case VSpaceError::Busy:
+    case VSpaceError::Contended:
         return FaultKind::Busy;
     case VSpaceError::OutOfMemory:
         return FaultKind::OutOfMemory;

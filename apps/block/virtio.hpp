@@ -42,9 +42,9 @@ public:
             RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE);
         if (space.status != STATUS_OK) return space.status;
         space_ = cap_owner{space.value};
-        const auto watched = sys::port_watch(info.events, space.value, 0, 0, 0, WATCH_CHANGED);
+        const auto watched = sys::port_watch(rt_events(), space.value, 0, 0, 0, WATCH_CHANGED);
         if (watched.status != STATUS_OK) return watched.status;
-        events_ = info.events; space_watch_ = watched.value;
+        events_ = rt_events(); space_watch_ = watched.value;
         for (size_t i = 0; i < std::size(regs_); ++i) {
             const auto name = i == 6 ? std::string{"pci.config"} : "bar" + std::to_string(i);
             const auto [cap, value] = resource(name);

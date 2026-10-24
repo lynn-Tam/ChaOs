@@ -61,6 +61,8 @@ struct Result final {
     return Result{status, value, Disposition::Return, value2};
 }
 
+[[nodiscard]] auto vm_wait(Call&, mm::VSpace&) noexcept -> Result;
+
 [[nodiscard]] auto cap_status(cap::CSpaceError error) noexcept
     -> status_t;
 

@@ -38,7 +38,7 @@ int main() {
         const std::string_view args[]{"sleep", ms};
         const auto child = tasks.spawn(
             image, {},
-            {.argv = args, .resources = {.bytes = 1024 * 1024, .caps = 64}, .events = info.events});
+            {.argv = args, .resources = {.bytes = 1024 * 1024, .caps = 64}, .events = rt_events()});
         if (child.status != STATUS_OK)
             sys::exit(child.status);
         return child.id;
@@ -88,5 +88,5 @@ int main() {
     }
     constexpr std::string_view message{"[process] direct spawn, retention, deadlines and reuse ok\n"};
     check(write(STDOUT_FILENO, message.data(), message.size()) == int64_t(message.size()));
-    sys::exit();
+    return STATUS_OK;
 }

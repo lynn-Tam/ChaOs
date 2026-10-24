@@ -95,6 +95,7 @@ public:
     auto sent() const noexcept -> bool { return rpc_.sent(); }
     auto deadline() const noexcept -> word_t { return rpc_.deadline(); }
     auto begin(cap_t endpoint, ubus_msg message, bool drain = false) -> status_t;
+    auto commit() -> status_t;
     auto poll(ubus_msg&) -> status_t;
     auto wait(ubus_msg&) -> status_t;
     auto cancel() -> status_t;

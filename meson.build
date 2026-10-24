@@ -159,16 +159,19 @@ foreach layer, directories : {'base': ['uapi', 'libk'], 'ubus': ['ubus'], 'mgr':
 endforeach
 user_exports = join_paths(meson.current_build_dir(), 'include')
 user_common_args = [
-  '-Wall', '-Wextra', '-Werror', '-O2', '-g3',
+  '-Wall', '-Wextra', '-Werror', '-O2', '-g3', '-ffunction-sections', '-fdata-sections',
   '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + join_paths(user_exports, 'base'), '-I' + join_paths(root, 'lib/rt'),
 ]
 user_c_args = user_common_args + ['-ffreestanding', '-idirafter', get_option('newlib_include')]
-user_cpp_args = user_common_args + ['-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit']
+user_cxx_config = join_paths(meson.current_build_dir(), 'include/cxx')
+run_command(find_program('python3'), files('tools/build/cxx-config.py'), cpp_config_dir,
+  user_cxx_config, files('third_party/libstdcxx/gthr.h'), check: true)
+user_cpp_args = user_common_args + ['-fno-exceptions', '-fno-rtti']
 # Container headers need the target C declarations; only used runtime symbols link.
-user_cpp_args += [cpp_config_arg, '-idirafter', get_option('newlib_include')]
+user_cpp_args += ['-I' + user_cxx_config, cpp_config_arg, '-idirafter', get_option('newlib_include')]
 user_link_args = ['-Wl,--gc-sections', '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-nostdlib', '-lgcc', '-Wl,-T,' + join_paths(root, 'lib/rt/linker.ld')]
 crt = static_library(
-  'crt', files('lib/rt/start.cpp', 'lib/rt/heap.cpp', 'libk/mem.c'),
+  'crt', files('lib/rt/start.cpp', 'lib/rt/heap.cpp', 'lib/rt/sync.cpp', 'lib/rt/thread.cpp', 'libk/mem.c'),
   c_args: user_c_args, cpp_args: user_cpp_args, pic: false, implicit_include_directories: false, build_by_default: false,
 )
 user_entry = static_library(
@@ -186,12 +189,13 @@ mgr = static_library('mgr', files('mgr/mgr.cpp'), dependencies: [proc_dep, ubus_
 mgr_dep = declare_dependency(link_with: mgr, dependencies: [proc_dep, ubus_dep],
   compile_args: ['-I' + join_paths(user_exports, 'mgr')])
 posix = static_library(
-  'posix', files('apps/posix/io.cpp'), dependencies: [ubus_dep],
+  'posix', files('apps/posix/io.cpp', 'apps/posix/pthread.cpp'), dependencies: [ubus_dep],
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   pic: false, implicit_include_directories: false, build_by_default: false,
 )
 subdir('third_party/ftxui')
-cxx_runtime = static_library('cxx-runtime', files('third_party/libstdcxx/tree.cc', 'third_party/libstdcxx/shared_ptr.cc'),
+cxx_runtime = static_library('cxx-runtime', files('third_party/libstdcxx/tree.cc', 'third_party/libstdcxx/shared_ptr.cc',
+  'third_party/libstdcxx/thread.cc', 'third_party/libstdcxx/mutex.cc', 'third_party/libstdcxx/condition_variable.cc'),
   cpp_args: user_cpp_args + ['-ffunction-sections', '-fdata-sections'],
   pic: false, implicit_include_directories: false, build_by_default: false)
 math_runtime = static_library('math-runtime', files(
@@ -235,6 +239,7 @@ foreach name, spec : {
   'slow': [files('test/user/stream/slow.cpp'), true],
   'fill': [files('test/user/stream/fill.cpp'), true],
   'control-test': [files('test/user/control.cpp'), false],
+  'thread-test': [files('test/user/thread.cpp'), true],
   'cat': [files('apps/cat.cpp'), true],
   'ls': [files('apps/ls.cpp'), true],
   'cp': [files('apps/cp.cpp'), true],
@@ -243,14 +248,14 @@ foreach name, spec : {
   'sleep': [files('apps/sleep.cpp'), false],
 }
   binary = executable(name + '.elf', spec[0],
-    dependencies: [ubus_dep] + (['init','mgr','devices','shell','supervisor'].contains(name) ? [mgr_dep] : []),
+    dependencies: [ubus_dep] + (name == 'thread-test' ? [proc_dep] : []) + (['init','mgr','devices','shell','supervisor'].contains(name) ? [mgr_dep] : []),
     c_args: user_c_args, include_directories: name == 'tasks' ? ftxui_inc : [],
     cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'apps/posix/include')] : []),
     link_whole: [crt, user_entry] + (spec[1] ? [posix] : []),
     link_with: [ubus, cxx_runtime] + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
     link_args: user_link_args + ['-Wl,--gc-sections'] + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', implicit_include_directories: false, build_by_default: false)
-  if ['fill','slow','control-test','foreign','supervisor'].contains(name)
+  if ['fill','slow','control-test','thread-test','foreign','supervisor'].contains(name)
     probes += {name: binary}
   else
     bins += {name: binary}
@@ -345,7 +350,7 @@ apps = {'boot/README.TXT': files('apps/README.TXT')[0],
         'boot/touch.elf': images['fs'], 'boot/mkdir.elf': images['fs'],
         'boot/rm.elf': images['fs'], 'boot/mv.elf': images['fs']}
 test_apps = {'boot/foreign.elf': images['foreign'], 'boot/supervisor.elf': images['supervisor'], 'boot/fdcheck.elf': images['fdcheck'], 'boot/demand.elf': images['demand'],
-             'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test']}
+             'boot/fill.elf': images['fill'], 'boot/slow.elf': images['slow'], 'boot/control-test.elf': images['control-test'], 'boot/thread-test.elf': images['thread-test']}
 foreach name, app : bins
   if name != 'init'
     apps += {'boot/' + name + '.elf': images[name]}
@@ -359,6 +364,7 @@ foreach name, layout : {
   'storage-test': base + test_apps + {'boot/store.elf': images['store']},
   'exec': base + test_apps + {'boot/cow.elf': images['cow']},
   'process-test': base + {'boot/shell.elf': images['process-client']},
+  'thread-test': base + test_apps + {'boot/shell.elf': images['thread-test']},
   'ubus-test': {'init': images['ubus-test'], 'provider': images['ubus-test'], 'client': images['bus']},
   'channel-test': {'init': images['channel-test'], 'worker': images['channel-test']},
   'mgr-test': {'init': images['mgr-test'], 'worker': images['mgr-test']},
@@ -411,6 +417,11 @@ qemu = find_program('qemu-system-riscv64')
 run_target('run-process-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
   qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--timeout', '45',
   '[process] direct spawn, retention, deadlines and reuse ok'])
+run_target('run-thread-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
+  qemu, kernel, '1,2,4', '--bundle', bundles['thread-test'], '--timeout', '45',
+  '[threads] execution pause, resume, paused retirement and admission rollback ok'])
+run_target('run-thread-console', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_test_bundle, '4', 'threads'])
 run_target('run-model-matrix', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel, storage_test_bundle, '1,2,4', 'control'])
 run_target('run-supervisor-matrix', command: [find_program('python3'), files('tools/build/run-console.py'),

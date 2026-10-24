@@ -7,10 +7,15 @@
 extern "C" {
 #endif
 
-enum { CLOCK_MONOTONIC = 1 };
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 4
+#endif
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 1
+#endif
 
 // Zero on success; -1 with errno on failure.
-int32_t clock_gettime(int32_t clock, struct timespec* time);
+int clock_gettime(clockid_t clock, struct timespec* time);
 int32_t nanosleep(const struct timespec* delay, struct timespec* remaining);
 
 #ifdef __cplusplus

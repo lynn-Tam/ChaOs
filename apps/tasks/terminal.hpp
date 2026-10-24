@@ -26,7 +26,7 @@ class ft_terminal final {
         return writable_.close();
     }
     auto open_session(const rt_env& env, const ubus_msg& setup) -> status_t {
-        port_ = env.events;
+        port_ = rt_events();
         auto status = control_.bind(setup.capability(setup.data["message"]["terminal"]));
         if (status == STATUS_OK) status = subscription_.open(env.alloc(), 8, 0);
         if (status == STATUS_OK) status = focus_events_.open(subscription_.ends[0].selector(), port_);

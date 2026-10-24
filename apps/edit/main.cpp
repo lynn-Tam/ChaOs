@@ -22,7 +22,7 @@ class ed_terminal {
     std::deque<unsigned char> bytes_;
 public:
     auto open(const rt_env& env, const ubus_msg& setup) -> status_t {
-        port_ = env.events;
+        port_ = rt_events();
         auto status = control_.bind(setup.capability(setup.data["message"]["terminal"]));
         if (status == STATUS_OK) status = subscription_.open(env.alloc(), 8, 0);
         if (status == STATUS_OK) status = events_.open(subscription_.ends[0].selector(), port_);
@@ -355,7 +355,7 @@ public:
         next_ = response.data["sequence"].as<uint64_t>().value_or(0);
         const auto need = (*size * 4 + 2 * 1024 * 1024 + 4095) & ~uint64_t{4095};
         status = sys::quota_info(rt_startup().quota).status; if (status != STATUS_OK) return status;
-        const auto budget = *reinterpret_cast<const QuotaInfo*>(rt_startup().ipc);
+        const auto budget = *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
         if (need > budget.memory_limit) {
             ubus_msg request; request.data.put("bytes", need).put("caps", budget.cap_limit);
             status = environment.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;

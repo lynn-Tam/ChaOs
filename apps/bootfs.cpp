@@ -134,6 +134,6 @@ int main() {
             if (status != STATUS_OK && status != STATUS_WOULD_BLOCK) return status;
             progress |= status == STATUS_OK; ++it;
         }
-        if (!progress && (status = ev_wait(env.events).status) != STATUS_OK) return status;
+        if (!progress && (status = ev_wait(rt_events()).status) != STATUS_OK) return status;
     }
 }

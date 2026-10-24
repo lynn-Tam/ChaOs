@@ -711,7 +711,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
 
 int main(int argc, char** argv) {
     const auto& info = rt_startup();
-    events = info.events;
+    events = rt_events();
     if (argc > 2) return STATUS_BAD_ARGS;
     if (argc == 2) {
         const std::string_view text{argv[1]}; if (text.size() != sizeof(expected_id) * 2) return STATUS_BAD_ARGS;

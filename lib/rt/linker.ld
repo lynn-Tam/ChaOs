@@ -6,6 +6,7 @@ PHDRS
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
+    tls PT_TLS FLAGS(4);
 }
 
 SECTIONS
@@ -31,10 +32,20 @@ SECTIONS
         *(.data .data.*)
         *(.sdata .sdata.*)
         *(.got .got.*)
-        *(.tdata .tdata.*)
-        *(.tbss .tbss.*)
         PROVIDE(__global_pointer$ = . + 0x800);
     } :data
+
+    .tdata : ALIGN(16) {
+        __tls_start = .;
+        *(.tdata .tdata.*)
+        __tls_data_end = .;
+    } :data :tls
+    .tbss (NOLOAD) : {
+        *(.tbss .tbss.*)
+        __tls_end = .;
+    } :data :tls
+    __tls_size = __tls_end - __tls_start;
+    __tls_align = MAX(16, MAX(ALIGNOF(.tdata), ALIGNOF(.tbss)));
 
     .bss (NOLOAD) : ALIGN(0x1000) {
         *(.bss .bss.*)

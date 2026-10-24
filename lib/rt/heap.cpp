@@ -1,4 +1,6 @@
 #include <vm.hpp>
+#include <mutex>
+#include <sync.hpp>
 #include <util.hpp>
 #include <algorithm>
 #include <cstddef>
@@ -10,7 +12,8 @@
 #include <string.h>
 
 
-// Process-local runtime: allocation and mapping mutation run on its one thread.
+// Heap metadata precedes VA leases in the lock order; parking never allocates.
+static constinit rt_mutex heap_mutex;
 constexpr size_t Align = alignof(std::max_align_t);
 constexpr size_t ChunkSize = 64 * 1024;
 struct Chunk;
@@ -33,6 +36,7 @@ static CreateAuth pool;
 static vm_arena* vm;
 
 static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
+    std::lock_guard lock{heap_mutex};
     if (!pool.quota || !pool.scope || !alignment || (alignment & (alignment - 1))) return nullptr;
     alignment = std::max(alignment, Align);
     if (alignment > SIZE_MAX - sizeof(Block) - sizeof(Alloc) - Align
@@ -79,6 +83,7 @@ static void merge(Block& b) noexcept {
 }
 static void release(void* p) noexcept {
     if (!p) return;
+    std::lock_guard lock{heap_mutex};
     auto* b = (static_cast<Alloc*>(p) - 1)->block;
     b->free = true;
     if (b->next && b->next->free) merge(*b);

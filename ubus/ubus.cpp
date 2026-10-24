@@ -189,11 +189,16 @@ auto ubus_call::begin(cap_t endpoint, ubus_msg message, bool drain) -> status_t 
     const auto& pending = message_;
     const auto status = wire_.encode(pending, ubus_invoke, CHANNEL_MAX_CAPS - 1);
     if (status != STATUS_OK) { message_ = {}; wire_ = {}; return status; }
-    const auto submitted = rpc_.begin(endpoint, rt_startup().alloc(), rt_startup().events,
+    const auto submitted = rpc_.begin(endpoint, rt_startup().alloc(), rt_events(),
         std::span{wire_.words}.first(wire_.size), std::span{wire_.caps}.first(wire_.count), pending.tag, pending.deadline, drain);
     if (rpc_.sent()) message_.commit();
     if (submitted != STATUS_OK) { message_ = {}; wire_ = {}; }
     return submitted;
+}
+auto ubus_call::commit() -> status_t {
+    const auto status = rpc_.commit();
+    if (rpc_.sent()) message_.commit();
+    return status;
 }
 auto ubus_call::poll(ubus_msg& result) -> status_t {
     ch_packet packet;
@@ -343,13 +348,13 @@ auto ubus_object::open(size_t depth, cap_t quota, cap_owner scope) -> status_t {
             const auto scope = sys::scope_create(alloc); if (scope.status != STATUS_OK) return scope.status;
             scope_ = cap_owner{scope.value};
         }
-        const auto status = closing_.open(rt_startup().events, quota, STATE_CLOSING | STATE_DRAINED);
+        const auto status = closing_.open(rt_events(), quota, STATE_CLOSING | STATE_DRAINED);
         if (status != STATUS_OK) return status;
         alloc.quota = budget_.selector();
     }
     if (scope_) alloc.scope = scope_.selector();
     auto status = channel_.open(alloc, depth, CHANNEL_MAX_CAPS);
-    if (status == STATUS_OK) status = input_.open(endpoint(), rt_startup().events);
+    if (status == STATUS_OK) status = input_.open(endpoint(), rt_events());
     return status;
 }
 auto ubus_object::connector(word_t facet) -> std::expected<cap_owner, status_t> {
@@ -399,7 +404,9 @@ auto ubus_object::poll() -> status_t {
     if (status == STATUS_WOULD_BLOCK) return status;
     if (status != STATUS_OK) {
         if (request.reply) { ubus_msg error; error.status = status; (void)request.respond(std::move(error)); }
-        return status == STATUS_PEER_FAULT || status == STATUS_BAD_ARGS || status == STATUS_BAD_RIGHTS || status == STATUS_NO_MEMORY ? STATUS_OK : status;
+        // RECEIVE consumed this message even when an attached grant retired.
+        return status == STATUS_PEER_FAULT || status == STATUS_TRANSFER_FAILED || status == STATUS_BAD_ARGS
+            || status == STATUS_BAD_RIGHTS || status == STATUS_NO_MEMORY ? STATUS_OK : status;
     }
     if (request.tag == 1) return request.reply ? bind(request) : STATUS_OK;
     ubus_msg response;
@@ -468,7 +475,7 @@ auto ubus_conn::install(cap_owner endpoint, ubus_value object, std::string_view 
         || (!interface.empty() && *actual != interface) || (*supported & features) != features
         || object["methods"].type() != ubus_type::Array || !description.assign(object.bytes())) return STATUS_PEER_FAULT;
     ev_watch peer;
-    const auto watched = peer.open(rt_startup().events, endpoint.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+    const auto watched = peer.open(rt_events(), endpoint.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
     if (watched != STATUS_OK) return watched;
     peer_ = std::move(peer); endpoint_ = std::move(endpoint); description_ = std::move(description); return STATUS_OK;
 }

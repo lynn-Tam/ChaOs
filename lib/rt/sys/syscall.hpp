@@ -344,6 +344,9 @@ inline void yield() noexcept {
     word_t weight, word_t cpus, cap_t parent = 0) noexcept -> SysResult {
     return call(SYS_DOMAIN_CONFIGURE, domain, budget_ns, period_ns, weight, cpus, parent);
 }
+[[nodiscard]] inline auto domain_execution(cap_t domain, bool enabled) noexcept -> SysResult {
+    return call(SYS_DOMAIN_EXECUTION, domain, enabled);
+}
 [[nodiscard]] inline auto domain_move(cap_t domain, cap_t parent) noexcept -> SysResult { return call(SYS_DOMAIN_MOVE, domain, parent); }
 [[nodiscard]] inline auto domain_close(cap_t domain) noexcept -> SysResult { return call(SYS_DOMAIN_CLOSE, domain); }
 [[nodiscard]] inline auto domain_info(cap_t domain, word_t offset = 0) noexcept -> SysResult {

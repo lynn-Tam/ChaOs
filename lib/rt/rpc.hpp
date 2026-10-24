@@ -89,4 +89,14 @@ public:
         return sys::wait_one(token_ ? reply_.ends[0].selector() : endpoint_,
             SOURCE_READY | SOURCE_TERMINAL, 0, token_ && drain_ ? 0 : deadline_, 0, token_ ? SOURCE_READ : SOURCE_WRITE).status;
     }
+    auto commit() noexcept -> status_t {
+        while (active() && !sent()) {
+            auto status = rt_admit(deadline_);
+            if (status == STATUS_OK) status = send();
+            if (status != STATUS_WOULD_BLOCK) return status;
+            status = wait();
+            if (status != STATUS_OK) return status;
+        }
+        return active() ? STATUS_OK : STATUS_INVALID_OP;
+    }
 };

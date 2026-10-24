@@ -13,7 +13,7 @@ auto ft_terminal::open(const rt_env& env, const ubus_msg& setup) -> status_t {
     if (ft_active) return STATUS_BUSY;
     const auto status = open_session(env, setup);
     if (status != STATUS_OK) return status;
-    port_ = env.events;
+    port_ = rt_events();
     ft_active = this;
     auto quirks = ftxui::Terminal::GetQuirks();
     quirks.SetColorSupport(ftxui::Terminal::Palette16);

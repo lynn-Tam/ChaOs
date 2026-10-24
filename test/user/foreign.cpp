@@ -23,7 +23,7 @@ int main() {
     status = publisher.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     for (;;) {
         status = object.poll();
-        if (status == STATUS_WOULD_BLOCK) status = ev_wait(rt_startup().events).status;
+        if (status == STATUS_WOULD_BLOCK) status = ev_wait(rt_events()).status;
         if (status != STATUS_OK) return status;
     }
 }

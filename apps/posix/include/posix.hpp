@@ -27,7 +27,8 @@ struct io_completion {
 };
 
 // Explicit offsets never change the open object's implicit offset. Each request
-// transfers at most IO_LIMIT bytes. Keep data alive until completion is taken.
+// transfers at most IO_LIMIT bytes. Submission, cancellation and completion
+// belong to the same thread; keep data alive until its completion is taken.
 int32_t px_submit(const struct io_request* request, request_id* id);
 // Returns 1 for a result, 0 if none is ready, or a negative error.
 int32_t px_completion(struct io_completion* result, uint32_t flags);

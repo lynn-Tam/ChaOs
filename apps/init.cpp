@@ -12,7 +12,7 @@ int main() {
     status = owner.open(); if (status != STATUS_OK) return status;
     const auto queried = sys::quota_info(env.quota);
     if (queried.status != STATUS_OK) return queried.status;
-    const auto budget = *reinterpret_cast<const QuotaInfo*>(env.ipc);
+    const auto budget = *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
     if (budget.memory_available < 8 * 1024 * 1024 || budget.caps_available < 256) return STATUS_NO_MEMORY;
     auto& child = owner.add("root", "/boot/mgr.elf",
         {.bytes=budget.memory_available - 4 * 1024 * 1024, .caps=budget.caps_available - 128,
@@ -30,7 +30,7 @@ int main() {
         .put("format", root.firmware_format).put("hart", root.boot_hart);
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) return status;
-        status = ev_wait(env.events, owner.deadline()).status;
+        status = ev_wait(rt_events(), owner.deadline()).status;
         if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
     }
 }

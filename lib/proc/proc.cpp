@@ -9,6 +9,189 @@
 #include <string.h>
 #include <libk/checked_arithmetic.hpp>
 
+proc_task::~proc_task() {
+    (void)stop();
+    if (quota_) (void)sys::quota_close(quota());
+}
+auto proc_task::open(const proc_auth& auth, const proc_quota& q) noexcept -> status_t {
+    if (state_ != state::New || quota_) return STATUS_BUSY;
+    const auto quota = sys::quota_create(auth.alloc, q.bytes, q.caps, q.kinds,
+        q.max_bytes ? q.max_bytes : q.bytes, q.max_caps ? q.max_caps : q.caps);
+    quota_ = cap_owner{quota.value};
+    if (quota.status != STATUS_OK) return quota.status;
+    const auto scope = sys::scope_create(auth.alloc); scope_ = cap_owner{scope.value};
+    if (scope.status != STATUS_OK) return scope.status;
+    cpus_ = auth.cpus >= 64 ? ~word_t{} : (word_t{1} << auth.cpus) - 1;
+    const auto domain = sys::domain_create(alloc(), auth.domain, 0, 0, 1024, cpus_); domain_ = cap_owner{domain.value};
+    if (domain.status != STATUS_OK) return domain.status;
+    const auto vm = sys::vspace_create(alloc()); vm_ = cap_owner{vm.value};
+    if (vm.status != STATUS_OK) return vm.status;
+    const auto cs = sys::cspace_create(alloc(), q.slots, q.pages); cs_ = cap_owner{cs.value};
+    if (cs.status != STATUS_OK) return cs.status;
+    thread_limit_ = q.threads;
+    return lifecycle_.open(alloc(), 4, 2, 3);
+}
+auto proc_task::supervise(cap_owner cap, word_t role, bool reap) -> status_t {
+    if (!reap && threads_.size() >= thread_limit_) return STATUS_EXHAUSTED;
+    auto status = sys::object_info(cap.selector()).status;
+    if (status != STATUS_OK) return status;
+    const auto object = *reinterpret_cast<const ObjectInfo*>(rt_current().ipc);
+    if (object.kind != ObjThread) return STATUS_BAD_ARGS;
+    const auto found = std::ranges::find_if(threads_, [&](const auto& t) { return t.id == object.object_id; });
+    if (reap) {
+        const auto ended = sys::exit_query(cap.selector());
+        if (ended.status != STATUS_OK) return ended.status;
+        if (!ended.value) return STATUS_WOULD_BLOCK;
+        if (ended.value2) return static_cast<status_t>(ended.value2);
+        if (found != threads_.end()) {
+            if (found->id == initial_id_) { (void)thread_.close(); (void)sc_.close(); }
+            threads_.erase(found);
+        }
+        return STATUS_OK;
+    }
+    if (found != threads_.end()) return STATUS_BAD_ARGS;
+    status = sys::scope_query(scope(), object.object_id, SCOPE_LINKS).status;
+    if (status != STATUS_OK) return status;
+    const auto links = *reinterpret_cast<const LinkRecords*>(rt_current().ipc);
+    if (std::ranges::none_of(std::span{links.records, links.count}, [&](const auto& r) { return r.kind == LINK_ROOT && r.object_id == vm_id_; })) return STATUS_DENIED;
+    observer record{.thread=std::move(cap), .exit={}, .id=object.object_id, .role=role};
+    if (events_) status = record.exit.open(events_, record.thread.selector(), SOURCE_READY, 0, 0, SOURCE_EXIT);
+    if (status == STATUS_OK) threads_.push_back(std::move(record));
+    return status;
+}
+auto proc_task::prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t {
+    if (thread_) return STATUS_BUSY;
+    const auto thread = sys::thread_create(alloc(), vspace(), cspace(), desc, 0, cpu); thread_ = cap_owner{thread.value};
+    if (thread.status != STATUS_OK) return thread.status;
+    const auto sc = sys::sc_create(alloc(), domain(), 0, 0, 1024, cpus_); sc_ = cap_owner{sc.value};
+    if (sc.status != STATUS_OK) return sc.status;
+    auto status = sys::sc_bind(sc_.selector(), thread_.selector()).status;
+    if (status != STATUS_OK) return status;
+    events_ = events;
+    status = sys::object_info(vspace()).status;
+    if (status != STATUS_OK) return status;
+    vm_id_ = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
+    const auto copy = sys::cap_duplicate(thread_.selector(), rt_startup().cspace, RIGHT_OBSERVE | RIGHT_INSPECT);
+    if (copy.status != STATUS_OK) return copy.status;
+    status = supervise(cap_owner{copy.value}, 2);
+    if (status != STATUS_OK) return status;
+    initial_id_ = threads_.back().id;
+    if (events_) {
+        const std::array<cap_t, 4> sources{domain(), lifecycle_.ends[0].selector(), scope(), quota()};
+        for (size_t i = 0; i < sources.size(); ++i) {
+            status = watches_[i].open(events_, sources[i], i == 0 ? 0 : i == 1 ? SOURCE_READY | SOURCE_TERMINAL : STATE_DRAINED,
+                0, i == 0 ? WATCH_CHANGED : 0, i == 1 ? SOURCE_READ : SOURCE_STATE);
+            if (status != STATUS_OK) return status;
+        }
+    }
+    return STATUS_OK;
+}
+auto proc_task::start() noexcept -> status_t {
+    if (!thread_ || state_ != state::New) return STATUS_BAD_ARGS;
+    const auto status = sys::execution_set(thread_.selector(), true).status;
+    if (status == STATUS_OK) state_ = state::Running;
+    return status;
+}
+auto proc_task::execution_info() const noexcept -> std::expected<DomainInfo, status_t> {
+    const auto status = sys::domain_info(domain()).status;
+    if (status != STATUS_OK) return std::unexpected(status);
+    return *reinterpret_cast<const DomainInfo*>(rt_current().ipc);
+}
+auto proc_task::memory_info() const noexcept -> std::expected<VSpaceInfo, status_t> {
+    const auto status = sys::vspace_info(vspace()).status;
+    if (status != STATUS_OK) return std::unexpected(status);
+    return *reinterpret_cast<const VSpaceInfo*>(rt_current().ipc);
+}
+auto proc_task::resource_info() const noexcept -> std::expected<QuotaInfo, status_t> {
+    const auto status = sys::quota_info(quota()).status;
+    if (status != STATUS_OK) return std::unexpected(status);
+    return *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
+}
+auto proc_task::observe() noexcept -> sys::SysResult {
+    if (state_ == state::Consumed) return {.status=STATUS_INVALID_CAP};
+    if (state_ == state::Closing) return {.status=STATUS_OK, .value=1, .value2=static_cast<word_t>(status_)};
+    if (state_ != state::Running) return {.status=STATUS_WOULD_BLOCK};
+    for (;;) {
+        ch_packet packet;
+        const auto received = ch_recv(lifecycle_.ends[0].selector(), packet, false).status;
+        if (received == STATUS_WOULD_BLOCK) break;
+        if (received != STATUS_OK) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
+        if (packet.word_count != 3 || packet.words[0] != rt_life_version) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
+        if (packet.words[1] == rt_life_exit && !packet.called && !packet.count)
+            return {.status=STATUS_OK, .value=1, .value2=packet.words[2]};
+        status_t status = STATUS_BAD_ARGS;
+        if ((packet.words[1] == rt_life_register || packet.words[1] == rt_life_reap) && packet.called && packet.count == 2 && packet.words[2] <= 1)
+            status = supervise(std::move(packet.capabilities[1]), packet.words[2], packet.words[1] == rt_life_reap);
+        if (packet.called && packet.count) {
+            const word_t reply[] = {word_t(status)};
+            const auto sent = ch_send(packet.capabilities[0].selector(), reply, false).status;
+            if (sent != STATUS_OK && sent != STATUS_STALE && sent != STATUS_CLOSED && sent != STATUS_PEER_CLOSED) return {.status=sent};
+        }
+    }
+    if (events_) {
+        const auto status = watches_[1].arm().status;
+        if (status != STATUS_OK) return {.status=status};
+    }
+    for (auto it = threads_.begin(); it != threads_.end();) {
+        const auto exited = sys::exit_query(it->thread.selector());
+        if (exited.status != STATUS_OK) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
+        if (exited.value) {
+            if (exited.value2 || it->role == 1) return {.status=STATUS_OK, .value=1, .value2=exited.value2 ? exited.value2 : word_t(STATUS_INTERNAL)};
+            if (it->id == initial_id_) { (void)thread_.close(); (void)sc_.close(); }
+            it = threads_.erase(it);
+        } else {
+            if (events_) { const auto status = it->exit.arm().status; if (status != STATUS_OK) return {.status=status}; }
+            ++it;
+        }
+    }
+    return {.status=STATUS_OK};
+}
+auto proc_task::stop(status_t reason) noexcept -> status_t {
+    if (state_ == state::Consumed) return STATUS_INVALID_CAP;
+    if (state_ == state::Closing) return STATUS_OK;
+    state_ = state::Closing; status_ = reason;
+    const auto watch = watches_[1].close(); if (watch != STATUS_OK) return watch;
+    const auto life = lifecycle_.close(); if (life != STATUS_OK) return life;
+    threads_.clear();
+    for (auto* cap : {&thread_, &sc_}) { const auto status = cap->close(); if (status != STATUS_OK) return status; }
+    return scope_ ? sys::scope_close(scope()).status : STATUS_OK;
+}
+auto proc_task::close() noexcept -> status_t {
+    if (!quota_) return STATUS_OK;
+    if (!closing_) {
+        for (auto* cap : {&cs_, &vm_, &domain_}) { const auto status = cap->close(); if (status != STATUS_OK) return status; }
+        closing_ = true;
+    }
+    if (scope_) {
+        const auto facts = sys::source_info(scope());
+        if (facts.status != STATUS_OK) return facts.status;
+        if (!(facts.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
+        const auto closed = scope_.close(); if (closed != STATUS_OK) return closed;
+    }
+    const auto facts = sys::source_info(quota());
+    if (facts.status != STATUS_OK) return facts.status;
+    if (facts.value & STATE_OPEN) { const auto status = sys::quota_close(quota()).status; return status == STATUS_OK ? STATUS_WOULD_BLOCK : status; }
+    if (!(facts.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
+    const auto destroyed = sys::object_destroy(quota()).status; if (destroyed != STATUS_OK) return destroyed;
+    for (auto& watch : watches_) { const auto status = watch.close(); if (status != STATUS_OK) return status; }
+    return quota_.close();
+}
+auto proc_task::poll() noexcept -> status_t {
+    if (state_ == state::Consumed) return STATUS_INVALID_CAP;
+    if (state_ != state::Closing) {
+        const auto ended = observe();
+        if (ended.status != STATUS_OK) return ended.status;
+        if (!ended.value) return STATUS_WOULD_BLOCK;
+        const auto status = stop(static_cast<status_t>(ended.value2)); if (status != STATUS_OK) return status;
+    }
+    return close();
+}
+auto proc_task::collect() noexcept -> sys::SysResult {
+    const auto status = poll(); if (status != STATUS_OK) return {.status=status};
+    state_ = state::Consumed;
+    return {.status=STATUS_OK, .value=static_cast<word_t>(status_)};
+}
+
 static constexpr word_t page_size = 4096;
 
 auto proc_image::map(vm_area& source, cap_owner memory, uint64_t offset, uint64_t size, word_t perms)
@@ -131,8 +314,19 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
         if (!mod || mod.machine() != 243)
             return STATUS_BAD_ARGS;
         if (!auth.cpus || o.cpu >= auth.cpus) return STATUS_BAD_ARGS;
+        if (!o.va.stack_size || o.va.stack_size % page_size) return STATUS_BAD_ARGS;
+        word_t stack_size = o.va.stack_size;
+        for (size_t i = 0; i < mod.segment_count(); ++i) {
+            const auto seg = *mod.segment(i);
+            if (seg.type != 7) continue;
+            const auto tls = libk::checked_add(seg.size, std::max(word_t{16}, seg.align) - 1);
+            const auto total = tls ? libk::checked_add(stack_size, *tls) : std::nullopt;
+            const auto aligned = total ? libk::checked_align_up(*total, page_size) : std::nullopt;
+            if (!aligned) return STATUS_BAD_ARGS;
+            stack_size = *aligned;
+        }
         std::vector<std::pair<word_t, word_t>> ranges{
-            {o.va.stack, o.va.stack_size}, {o.va.ipc, page_size}};
+            {o.va.stack, stack_size}, {o.va.ipc, page_size}};
         for (size_t i = 0; i < mod.segment_count(); ++i) {
             const auto seg = *mod.segment(i);
             if (seg.type == 1 && seg.size) {
@@ -167,7 +361,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
         s = load.map(mod, image);
         if (s != STATUS_OK)
             return s;
-        auto stack = load.memory(o.va.stack_size);
+        auto stack = load.memory(stack_size);
         if (!stack)
             return stack.error();
         auto ipc = load.anonymous(o.va.ipc, page_size, VM_READ | VM_WRITE);
@@ -182,9 +376,13 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
         std::vector<AuxEntry> aux{{AT_PAGESZ, page_size},
                                   {AT_ENTRY, mod.entry()},
                                   {AT_SYS_CPUS, auth.cpus},
-                                  {AT_SYS_IPC, o.va.ipc}};
+                                  {AT_SYS_IPC, o.va.ipc},
+                                  {AT_SYS_STACK, o.va.stack}, {AT_SYS_STACK_SIZE, stack_size},
+                                  {AT_SYS_THREAD, 0}, {AT_SYS_SC, 0}};
         for (auto [key, cap, rights] :
-             std::array{std::tuple{AT_SYS_QUOTA, r.quota(), o.resources.quota_perms},
+             std::array{std::tuple{AT_SYS_STACK_MEM, stack->selector(), word_t{RIGHT_DESTROY | RIGHT_MAP | RIGHT_INSPECT}},
+                        std::tuple{AT_SYS_IPC_MEM, ipc->selector(), word_t{RIGHT_DESTROY | RIGHT_MAP | RIGHT_INSPECT}},
+                        std::tuple{AT_SYS_QUOTA, r.quota(), o.resources.quota_perms},
                         std::tuple{AT_SYS_DOMAIN, r.domain(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE | RIGHT_DELEGATE}},
                         std::tuple{AT_SYS_SCOPE, r.scope(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE}},
                         std::tuple{AT_SYS_VSPACE, r.vspace(),
@@ -192,7 +390,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
                                           RIGHT_DESTROY | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_EVENTS, events->selector(),
-                                   word_t{RIGHT_MANAGE | RIGHT_RECEIVE | RIGHT_DUPLICATE}}}) {
+                                   word_t{RIGHT_MANAGE | RIGHT_RECEIVE | RIGHT_DUPLICATE | RIGHT_DESTROY}}}) {
             const auto copy = sys::cap_duplicate(cap, r.cspace(), rights);
             if (copy.status != STATUS_OK)
                 return copy.status;
@@ -206,16 +404,19 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
             if (copy.status != STATUS_OK) return copy.status;
             aux.push_back({AT_SYS_ENV, copy.value});
         }
+        const auto lifecycle = sys::channel_mint(r.lifecycle(), r.cspace(), 1, RIGHT_SEND | RIGHT_DUPLICATE);
+        if (lifecycle.status != STATUS_OK) return lifecycle.status;
+        aux.push_back({AT_SYS_LIFECYCLE, lifecycle.value});
         aux.push_back({AT_NULL, 0});
         const auto pointers = (argv.size() + o.envp.size() + 3) * sizeof(word_t);
         const auto prefix = pointers + aux.size() * sizeof(AuxEntry);
-        if (prefix > o.va.stack_size || strings > o.va.stack_size - prefix)
+        if (prefix > stack_size || strings > stack_size - prefix)
             return STATUS_BAD_ARGS;
-        const auto stack_bytes = (prefix + strings + 15) & ~size_t{15};
-        if (stack_bytes > o.va.stack_size)
+        const auto initial_bytes = (prefix + strings + 15) & ~size_t{15};
+        if (initial_bytes > stack_size)
             return STATUS_BAD_ARGS;
-        const auto sp = o.va.stack + o.va.stack_size - stack_bytes;
-        std::vector<uint8_t> initial(stack_bytes);
+        const auto sp = o.va.stack + stack_size - initial_bytes;
+        std::vector<uint8_t> initial(initial_bytes);
         auto* words = reinterpret_cast<word_t*>(initial.data());
         words[0] = argv.size();
         size_t offset = prefix;
@@ -229,10 +430,10 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
             ++pointer; // argv/envp each end with a zero pointer.
         }
         ::memcpy(initial.data() + pointers, aux.data(), aux.size() * sizeof(AuxEntry));
-        s = load.write(stack->selector(), o.va.stack_size, o.va.stack_size - stack_bytes,
+        s = load.write(stack->selector(), stack_size, stack_size - initial_bytes,
                        initial.data(), initial.size());
         if (s == STATUS_OK)
-            s = load.install(stack->selector(), o.va.stack, o.va.stack_size, VM_READ | VM_WRITE);
+            s = load.install(stack->selector(), o.va.stack, stack_size, VM_READ | VM_WRITE);
         if (s != STATUS_OK)
             return s;
         ThreadInit init{};
@@ -243,7 +444,17 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
         s = load.write(desc->selector(), 4096, 0, &init, sizeof(init));
         if (s != STATUS_OK)
             return s;
-        return r.prepare(desc->selector(), o.events, o.cpu);
+        s = r.prepare(desc->selector(), o.events, o.cpu);
+        if (s != STATUS_OK) return s;
+        for (auto [key, cap, rights] : std::array{
+            std::tuple{AT_SYS_THREAD, r.initial_thread(), word_t{RIGHT_OBSERVE | RIGHT_INSPECT | RIGHT_DESTROY | RIGHT_DUPLICATE}},
+            std::tuple{AT_SYS_SC, r.initial_sc(), word_t{RIGHT_DESTROY | RIGHT_INSPECT}}}) {
+            const auto copy = sys::cap_duplicate(cap, r.cspace(), rights);
+            if (copy.status != STATUS_OK) return copy.status;
+            for (auto& item : aux) if (item.type == word_t(key)) item.value = copy.value;
+        }
+        return load.write(stack->selector(), stack_size, stack_size - initial_bytes + pointers,
+            aux.data(), aux.size() * sizeof(AuxEntry));
     };
     const auto status = build();
     if (status != STATUS_OK) {
@@ -283,7 +494,7 @@ auto proc_task::cpu_info() const -> std::expected<std::pair<uint64_t, std::vecto
     }
     cpu_at_ = now;
     const auto collect = [&]() -> std::expected<std::vector<uint64_t>, status_t> {
-        const auto ipc = reinterpret_cast<void*>(rt_startup().ipc);
+        const auto ipc = reinterpret_cast<void*>(rt_current().ipc);
         const auto identity = sys::object_info(vspace());
         if (identity.status != STATUS_OK) return std::unexpected(identity.status);
         const auto vm = reinterpret_cast<const ObjectInfo*>(ipc)->object_id;

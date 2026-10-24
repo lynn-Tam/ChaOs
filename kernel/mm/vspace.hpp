@@ -295,6 +295,7 @@ enum class VSpaceError : u8 {
     Overlap,
     NotMapped,
     Busy,
+    Contended,
     OutOfMemory,
     QuotaExceeded,
     GenerationExhausted,

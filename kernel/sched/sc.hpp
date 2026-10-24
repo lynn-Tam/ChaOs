@@ -18,7 +18,7 @@ class Sc;
 class Domain final : private libk::noncopyable_nonmovable {
 public:
     static constexpr usize max_depth = 32;
-    struct Config { u64 cpus{}, budget{}, period{}; u32 weight{1024}; };
+    struct Config { u64 cpus{}, budget{}, period{}; u32 weight{1024}; bool enabled{true}; };
     enum class Error : u8 { NotAdmitted, InvalidCpu, Busy };
     static auto valid_config(Config c) noexcept -> bool {
         return c.cpus && c.weight && c.weight <= 65535
@@ -56,7 +56,7 @@ public:
     auto attach(object::ref<Domain>, const cap::GrantPin* = nullptr) noexcept -> status_t;
     auto close() noexcept -> u32;
     auto reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& parent) noexcept -> std::expected<u64, status_t>;
-    auto configure(Config, Domain* parent) noexcept -> std::expected<u64, status_t>;
+    auto configure(Config, Domain* parent, std::optional<bool> enabled = {}) noexcept -> std::expected<u64, status_t>;
     void links(u64 cursor, LinkRecords& out) const noexcept {
         parent_binding_[0].links(out, LINK_PARENT, cursor); parent_binding_[1].links(out, LINK_PARENT, cursor);
     }

@@ -35,6 +35,7 @@ typedef int32_t status_t;
 #define STATUS_STALE             -24
 #define STATUS_TOO_LATE          -25
 #define STATUS_EXHAUSTED         -26
+#define STATUS_DEADLOCK          -27
 
 #ifndef __ASSEMBLER__
 enum {

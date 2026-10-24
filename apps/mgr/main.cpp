@@ -211,7 +211,7 @@ int main() {
     status = owner.attach(parent); if (status != STATUS_OK) return status;
     for (;;) {
         status = owner.poll(); if (status != STATUS_OK) return status;
-        status = ev_wait(env.events, owner.deadline()).status;
+        status = ev_wait(rt_events(), owner.deadline()).status;
         if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
     }
 }

@@ -87,7 +87,7 @@ public:
         for (;;) {
             const auto status = completion(result, id); if (status != STATUS_WOULD_BLOCK) return status;
             if (!calls_.next()) return STATUS_NOT_FOUND;
-            const auto wake = ev_wait(rt_startup().events, calls_.deadline()).status; if (wake != STATUS_OK) return wake;
+            const auto wake = ev_wait(rt_events(), calls_.deadline()).status; if (wake != STATUS_OK) return wake;
         }
     }
     auto wait(uint64_t id) -> status_t { st_done result; const auto status = wait(result, id); return status == STATUS_OK ? result.status : status; }
